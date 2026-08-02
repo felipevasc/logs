@@ -2273,7 +2273,11 @@ function renderFilterTabs() {
   const bar = $("#filter-tabs");
   bar.innerHTML = "";
   const c = activeCase();
-  if (!c) { bar.hidden = true; return; }
+  if (!c) {
+    bar.hidden = true;
+    updateFilterTabsLayout();
+    return;
+  }
   const saved = savedFilters();
   bar.hidden = false;
   for (const f of saved) {
@@ -2315,7 +2319,16 @@ function renderFilterTabs() {
     }, { title: "Nova visualizacao", placeholder: "ex.: Somente erros" });
   };
   bar.appendChild(add);
+  updateFilterTabsLayout();
   refreshFilterTabCounts();
+}
+
+// As abas ficam fixas acima da barra de status. Reserva-se a mesma altura no
+// espaço de trabalho para que elas nunca cubram tabela, botões ou rolagem.
+function updateFilterTabsLayout() {
+  const bar = $("#filter-tabs");
+  const height = bar && !bar.hidden ? Math.ceil(bar.getBoundingClientRect().height) : 0;
+  document.documentElement.style.setProperty("--filter-tabs-h", `${height}px`);
 }
 
 let filterCountsTimer = null;
@@ -4844,7 +4857,10 @@ function bind() {
   let resizeTimer;
   window.addEventListener("resize", () => {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => { if (state.loaded) refresh(); }, 250);
+    resizeTimer = setTimeout(() => {
+      updateFilterTabsLayout();
+      if (state.loaded) refresh();
+    }, 250);
   });
 
   bindKeyboard();

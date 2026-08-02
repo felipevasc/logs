@@ -538,12 +538,14 @@ select { appearance: auto; cursor: pointer; }
   padding: 4px 6px 4px 9px; height: 26px;
   background: var(--accent-soft); color: var(--accent);
   border: 1px solid transparent; border-radius: 999px;
+  box-sizing: border-box; min-width: 0;
   font-size: 12px; font-weight: 600; white-space: nowrap;
 }
+.chip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 html[data-theme="light"] .chip { color: var(--accent-strong); }
 .chip .x {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 16px; height: 16px; border: none; border-radius: 50%;
+  flex: 0 0 16px; width: 16px; height: 16px; border: none; border-radius: 50%;
   background: transparent; color: inherit; cursor: pointer; font-size: 10px;
 }
 .chip .x:hover { background: rgba(0,0,0,0.2); color: #fff; }
@@ -1295,7 +1297,12 @@ html[data-theme="light"] .chip { color: var(--accent-strong); }
 /* ===========================================================================
    Bancada de investigação: quatro bordas
    ========================================================================== */
-:root { --workbar-h: 34px; --context-rail-w: 52px; }
+:root {
+  --workbar-h: 34px;
+  --context-rail-w: 52px;
+  --filter-tabs-h: 0px;
+  --workspace-bottom-h: calc(var(--workbar-h) + var(--filter-tabs-h));
+}
 
 body { overflow: hidden; }
 .topbar {
@@ -1324,7 +1331,7 @@ body { overflow: hidden; }
 .shell {
   margin: 0;
   margin-right: var(--context-rail-w);
-  height: calc(100vh - var(--topbar-h) - var(--workbar-h));
+  height: calc(100vh - var(--topbar-h) - var(--workspace-bottom-h));
   grid-template-columns: var(--workspace-side-w) minmax(0, 1fr);
 }
 .shell.side-collapsed { grid-template-columns: 46px minmax(0, 1fr); }
@@ -1419,18 +1426,18 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 .vtab { border-radius: 6px 6px 0 0; }
 
 #view-analysis, #view-stations, #view-dashboard, #view-cube {
-  height: calc(100vh - var(--topbar-h) - var(--workbar-h));
+  height: calc(100vh - var(--topbar-h) - var(--workspace-bottom-h));
   margin: 0 var(--context-rail-w) 0 0;
   padding: 16px 20px 0;
   background:
     radial-gradient(900px 460px at 100% -10%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 70%),
     var(--bg-0);
 }
-.drawer { top: var(--topbar-h); right: var(--context-rail-w); bottom: var(--workbar-h); width: min(580px, calc(100vw - var(--context-rail-w))); }
-.drawer-scrim { top: var(--topbar-h); right: var(--context-rail-w); bottom: var(--workbar-h); }
+.drawer { top: var(--topbar-h); right: var(--context-rail-w); bottom: var(--workspace-bottom-h); width: min(580px, calc(100vw - var(--context-rail-w))); }
+.drawer-scrim { top: var(--topbar-h); right: var(--context-rail-w); bottom: var(--workspace-bottom-h); }
 
 .context-rail {
-  position: fixed; top: var(--topbar-h); right: 0; bottom: var(--workbar-h); z-index: 56;
+  position: fixed; top: var(--topbar-h); right: 0; bottom: var(--workspace-bottom-h); z-index: 56;
   width: var(--context-rail-w); display: flex; flex-direction: column; align-items: center; gap: 7px;
   padding: 10px 6px; background: color-mix(in srgb, var(--bg-1) 92%, transparent);
   border-left: 1px solid var(--border); backdrop-filter: blur(14px);
@@ -1668,7 +1675,7 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 
 /* Fonte aberta separada da exploracao: o topo sempre volta a esta tela. */
 #view-artifact-source {
-  height: calc(100vh - var(--topbar-h));
+  height: calc(100vh - var(--topbar-h) - var(--workspace-bottom-h));
   margin-right: var(--context-rail-w, 48px);
   padding: clamp(26px, 8vh, 86px) 24px 34px;
   display: grid;
@@ -2051,7 +2058,7 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 
 /* ===================== ABAS DE FILTROS SALVOS ===================== */
 .filter-tabs {
-  position: fixed; left: 0; right: 0; bottom: var(--workbar-h, 26px); z-index: 60;
+  position: fixed; left: 0; right: var(--context-rail-w); bottom: var(--workbar-h, 26px); z-index: 60;
   display: flex; align-items: center; gap: 4px; padding: 4px 10px;
   background: var(--bg-1); border-top: 1px solid var(--border);
   overflow-x: auto; scrollbar-width: thin;
@@ -2079,7 +2086,7 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 
 /* ===================== TRILHA: layout + timeline ===================== */
 #view-trail {
-  height: calc(100vh - var(--topbar-h) - var(--nav-h));
+  height: calc(100vh - var(--topbar-h) - var(--workspace-bottom-h));
   margin: 0; padding: 20px 24px 0; background: var(--bg-0);
   display: flex; flex-direction: column; overflow: hidden;
 }
