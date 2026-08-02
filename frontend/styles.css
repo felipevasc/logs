@@ -2037,7 +2037,14 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 
 /* ===================== ANALISAR TRILHA ===================== */
 .trail-panel { display: flex; flex-direction: column; }
-.trail-title { font-weight: 700; color: var(--text-0); display: inline-flex; gap: 7px; align-items: center; }
+.trail-title { font-weight: 700; color: var(--text-0); display: inline-flex; gap: 7px; align-items: center; flex-shrink: 0; }
+.trail-title + #trail-info {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .trail-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-1); cursor: pointer; }
 .trail-toggle input { width: auto; accent-color: var(--accent); }
 .trail-scroll { flex: 1; overflow: auto; padding: 14px 18px; display: flex; flex-direction: column; gap: 8px; }
@@ -2087,7 +2094,7 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 /* ===================== TRILHA: layout + timeline ===================== */
 #view-trail {
   height: calc(100vh - var(--topbar-h) - var(--workspace-bottom-h));
-  margin: 0; padding: 20px 24px 0; background: var(--bg-0);
+  margin: 0 var(--context-rail-w) 0 0; padding: 20px 24px 0; background: var(--bg-0);
   display: flex; flex-direction: column; overflow: hidden;
 }
 #view-trail[hidden] { display: none; }
