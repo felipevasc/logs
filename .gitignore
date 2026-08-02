@@ -1,0 +1,14 @@
+node_modules/
+frontend/node_modules/
+scripts/preview/node_modules/
+src-tauri/target/
+src-tauri/gen/
+dev.log
+scripts/screenshot.png
+frontend/dist/
+.playwright-cli/
+output/
+scripts/preview/output/
+scripts/preview/patch-*.py
+exemplos/grande.jsonl
+kimi-export-session_*.md

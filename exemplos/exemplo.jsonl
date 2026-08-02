@@ -1,0 +1,12 @@
+{"timestamp":"2024-01-31T08:00:01Z","level":"info","code":"100","source":"api-pagamentos","message":"Serviço iniciado","version":"1.4.2"}
+{"timestamp":"2024-01-31T08:01:12Z","level":"info","code":"210","source":"api-pagamentos","message":"Pagamento autorizado","valor":150.90,"cliente":"empresa-a"}
+{"timestamp":"2024-01-31T08:02:45Z","level":"warning","code":"310","source":"api-pagamentos","message":"Latência alta no gateway","latencia_ms":820,"gateway":"provedor-1"}
+{"timestamp":"2024-01-31T08:03:10Z","level":"error","code":"410","source":"api-pagamentos","message":"Falha ao autorizar pagamento","valor":980.00,"cliente":"empresa-b","motivo":"cartao_recusado"}
+{"timestamp":"2024-01-31T08:05:22Z","level":"info","code":"210","source":"api-pagamentos","message":"Pagamento autorizado","valor":75.00,"cliente":"empresa-c"}
+{"timestamp":"2024-01-31T08:07:01Z","level":"error","code":"420","source":"api-pagamentos","message":"Timeout no gateway","latencia_ms":5000,"gateway":"provedor-2"}
+{"timestamp":"2024-01-31T08:09:33Z","level":"warning","code":"310","source":"api-pagamentos","message":"Latência alta no gateway","latencia_ms":940,"gateway":"provedor-1"}
+{"timestamp":"2024-01-31T08:12:00Z","level":"info","code":"210","source":"api-pagamentos","message":"Pagamento autorizado","valor":230.40,"cliente":"empresa-a"}
+{"timestamp":"2024-01-31T08:15:47Z","level":"critical","code":"500","source":"api-pagamentos","message":"Conexão com banco de dados perdida","tentativas":3}
+{"timestamp":"2024-01-31T08:16:02Z","level":"info","code":"220","source":"api-pagamentos","message":"Conexão com banco restabelecida"}
+{"timestamp":"2024-01-31T08:20:19Z","level":"info","code":"210","source":"api-pagamentos","message":"Pagamento autorizado","valor":49.90,"cliente":"empresa-b"}
+{"timestamp":"2024-01-31T08:25:00Z","level":"debug","code":"110","source":"api-pagamentos","message":"Health check executado","duracao_ms":12}

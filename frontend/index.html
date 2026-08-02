@@ -1,0 +1,914 @@
+<!doctype html>
+<html lang="pt-BR" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Visualizador de Logs</title>
+  <link rel="stylesheet" href="vendor/fa/css/all.min.css" />
+  <link rel="stylesheet" href="vendor/uplot/uPlot.min.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- ===================== CONTEXTO GLOBAL ===================== -->
+  <header class="topbar">
+    <div id="context-summary" class="context-summary">Carregue um artefato para começar.</div>
+    <div class="topbar-right">
+      <div class="topbar-case" aria-label="Caso ativo">
+        <i class="fas fa-briefcase topbar-case-icon" aria-hidden="true"></i>
+        <span class="topbar-case-label">Caso</span>
+        <select id="case-select" class="case-select" title="Trocar Caso ativo" aria-label="Caso ativo"></select>
+        <input id="case-name-input" type="text" placeholder="Nome do Caso" hidden />
+        <button id="btn-new-case" class="icon-btn" type="button" title="Novo Caso"><i class="fas fa-plus"></i></button>
+        <button id="btn-case-menu" class="icon-btn" type="button" title="Opções do Caso"><i class="fas fa-ellipsis"></i></button>
+      </div>
+      <button id="btn-codes" class="icon-btn" type="button" title="Catálogo de códigos"><i class="fas fa-book"></i></button>
+      <button id="btn-theme" class="icon-btn" type="button" title="Alternar tema claro/escuro"><i class="fas fa-sun"></i></button>
+    </div>
+  </header>
+
+  <main id="view-artifact-source" class="artifact-source-view" hidden>
+    <section class="artifact-source-card" id="source-load-card" hidden>
+      <div class="artifact-source-head">
+        <span class="eyebrow">Artefato</span>
+        <h1>Abrir fonte</h1>
+        <p>Escolha um arquivo ou um canal do Windows para iniciar a análise.</p>
+        <button id="btn-source-back" class="btn ghost small" type="button" hidden>
+          <i class="fas fa-arrow-left"></i> Voltar para a lista de arquivos
+        </button>
+      </div>
+      <div id="artifact-source-host"></div>
+    </section>
+    <section class="drive-card" id="drive-card">
+      <div class="drive-head">
+        <span class="eyebrow">Arquivos do Caso</span>
+        <span id="drive-count" class="muted small"></span>
+        <div class="spacer"></div>
+        <button id="btn-drive-add" class="btn primary small" type="button">
+          <i class="fas fa-plus"></i> Adicionar arquivos
+        </button>
+      </div>
+      <div class="drive-table-wrap">
+        <table id="drive-table">
+          <thead>
+            <tr><th></th><th>Nome</th><th>Tipo</th><th>Arquivos</th><th>Eventos</th><th>Carregado</th><th></th>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div id="drive-empty" class="drive-empty" hidden>
+          <i class="fas fa-folder-open"></i>
+          <p>Nenhum arquivo neste Caso ainda.</p>
+          <button id="btn-drive-add-empty" class="btn primary" type="button">
+            <i class="fas fa-plus"></i> Carregar primeiro arquivo
+          </button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ===================== OVERLAY DE CARREGAMENTO ===================== -->
+  <div id="load-overlay" class="load-overlay" hidden>
+    <div class="load-stage">
+      <div class="load-anim" aria-hidden="true">
+        <div class="load-ring"></div>
+        <div class="load-doc"><i class="fas fa-file-lines"></i><span class="load-scan"></span></div>
+        <span class="load-bit b1"></span><span class="load-bit b2"></span><span class="load-bit b3"></span>
+      </div>
+      <div id="load-phase" class="load-phase">Preparando…</div>
+      <div id="load-volume" class="load-volume"></div>
+      <div id="load-eta" class="load-eta"></div>
+      <div class="load-bar"><div id="load-bar-fill"></div></div>
+      <ol id="load-steps" class="load-steps"></ol>
+    </div>
+  </div>
+
+  <div class="shell">
+    <!-- ===================== SIDEBAR ===================== -->
+    <aside class="side" id="workspace-side">
+      <button id="btn-side-toggle" class="side-toggle" type="button" title="Recolher painel esquerdo"><i class="fas fa-panel-left"></i></button>
+      <section id="source-panel" class="side-block source-panel">
+        <div class="side-title">Fontes</div>
+        <div class="seg">
+          <button id="src-btn-file" class="seg-btn active" type="button">
+            <i class="fas fa-file-lines"></i> Arquivo
+          </button>
+          <button id="src-btn-eventlog" class="seg-btn" type="button">
+            <i class="fas fa-server"></i> Event Log
+          </button>
+        </div>
+
+        <div id="src-file" class="src-body">
+          <div class="fld">
+            <label>Caminho do arquivo</label>
+            <div class="path-row">
+              <input id="file-path" type="text" placeholder="C:\logs\app.jsonl" spellcheck="false" />
+              <button class="icon-btn" id="btn-browse" type="button" title="Escolher arquivo">
+                <i class="fas fa-folder-open"></i>
+              </button>
+            </div>
+          </div>
+          <div class="fld">
+            <label>Formato</label>
+            <div class="path-row">
+              <select id="file-format"></select>
+              <button class="icon-btn" id="btn-new-format" type="button" title="Criar formato">
+                <i class="fas fa-plus"></i>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div id="src-eventlog" class="src-body" hidden>
+          <div class="fld">
+            <label>Canal</label>
+            <div class="path-row">
+              <select id="channel"></select>
+              <button class="icon-btn" id="btn-refresh-channels" type="button" title="Recarregar canais">
+                <i class="fas fa-rotate"></i>
+              </button>
+            </div>
+          </div>
+          <div class="fld">
+            <label>Máximo de eventos</label>
+            <input id="max-events" type="number" value="5000" min="100" max="100000" step="100" />
+          </div>
+        </div>
+
+        <button id="btn-load" class="btn primary block" type="button">
+          <i class="fas fa-play"></i> Carregar
+        </button>
+        <button id="btn-merge" class="btn ghost block" type="button" disabled title="Importa o arquivo/canal somando aos eventos já carregados">
+          <i class="fas fa-code-merge"></i> Unir ao conjunto atual
+        </button>
+        <button id="btn-clear" class="btn ghost block" type="button">
+          <i class="fas fa-trash-can"></i> Limpar
+        </button>
+        <div id="load-status" class="load-status"></div>
+
+        <button class="ts-toggle" id="ts-open" type="button">
+          <i class="fas fa-clock"></i> Configurar data/hora…
+        </button>
+      </section>
+
+      <section class="side-block filters-block">
+        <div class="side-title">Filtros</div>
+        <div class="search-box">
+          <i class="fas fa-search"></i>
+          <input id="quick-search" type="text" placeholder="Buscar nas mensagens…" spellcheck="false" />
+        </div>
+        <div class="filter-actions">
+          <button id="btn-add-filter" class="btn ghost small" type="button"><i class="fas fa-plus"></i> Filtro</button>
+          <button id="btn-clear-filters" class="btn ghost small" type="button" hidden>Limpar</button>
+        </div>
+        <div id="chips" class="chips side-chips chips-sync"></div>
+      </section>
+
+      <section class="side-block explore-block">
+        <div class="side-title">Explorar</div>
+        <div id="explore-tree" class="explore-tree explore-tree-sync" data-tree-scope="dataset"><p class="muted small">Carregue uma fonte para explorar.</p></div>
+      </section>
+
+      <section class="side-block station-shortcuts">
+        <div class="side-title">Estações</div>
+        <div id="station-list-side" class="station-list-side"><p class="muted small">Sem estação no caso.</p></div>
+        <button id="btn-open-stations" class="btn ghost small block" type="button"><i class="fas fa-server"></i> Ver estações</button>
+      </section>
+    </aside>
+
+    <!-- ===================== CONTEÚDO ===================== -->
+    <main class="content">
+      <div class="hist-panel" hidden>
+        <div id="chart" class="chart"></div>
+        <div id="levels-mini" class="levels-mini"></div>
+      </div>
+
+      <div class="viewbar">
+        <button id="btn-back-drive" class="btn ghost small" type="button" title="Voltar para a lista de arquivos">
+          <i class="fas fa-arrow-left"></i> Arquivos
+        </button>
+        <div class="vtabs">
+          <button id="tabbtn-table" class="vtab active" type="button">
+            <i class="fas fa-table-list"></i> Eventos
+          </button>
+          <button id="tabbtn-group" class="vtab" type="button">
+            <i class="fas fa-layer-group"></i> Agrupamento
+          </button>
+          <button id="tabbtn-dashboard" class="vtab" type="button">
+            <i class="fas fa-chart-pie"></i> Painéis
+          </button>
+          <button id="tabbtn-cube" class="vtab" type="button">
+            <i class="fas fa-cube"></i> Cubo
+          </button>
+        </div>
+        <div class="spacer"></div>
+        <span id="result-count" class="result-count"></span>
+        <button id="btn-colpicker" class="btn ghost small" type="button">
+          <i class="fas fa-table-columns"></i> Colunas
+        </button>
+      </div>
+
+      <section id="tab-table" class="table-panel">
+        <div class="table-scroll">
+          <table id="events-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+          <div id="empty-state" class="empty-state" hidden>
+            <i class="fas fa-inbox"></i>
+            <p></p>
+          </div>
+        </div>
+        <div class="pager">
+          <button class="icon-btn" id="pg-prev" type="button" title="Página anterior">
+            <i class="fas fa-angle-left"></i>
+          </button>
+          <span id="pg-label">—</span>
+          <button class="icon-btn" id="pg-next" type="button" title="Próxima página">
+            <i class="fas fa-angle-right"></i>
+          </button>
+          <div class="spacer"></div>
+          <label class="pager-size">por página
+            <select id="page-size">
+              <option>50</option>
+              <option selected>100</option>
+              <option>250</option>
+              <option>500</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section id="tab-group" class="group-panel" hidden>
+        <div class="group-editor">
+          <div class="fld inline">
+            <label>Agrupar por</label>
+            <select id="group-col"></select>
+          </div>
+          <div id="agg-list" class="agg-list"></div>
+          <div class="group-actions">
+            <button class="btn ghost small" id="btn-add-agg" type="button">
+              <i class="fas fa-plus"></i> Agregação
+            </button>
+            <button class="btn primary small" id="btn-run-group" type="button">
+              <i class="fas fa-play"></i> Agrupar
+            </button>
+          </div>
+        </div>
+        <p class="muted small group-hint">Clique em uma linha para filtrar.</p>
+        <div class="table-scroll">
+          <table id="group-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- ===================== TELA DO CASO ===================== -->
+  <main id="view-analysis" hidden>
+    <aside class="view-side">
+      <section class="side-block filters-block">
+        <div class="side-title">Filtros ativos</div>
+        <div class="chips side-chips chips-sync"></div>
+      </section>
+      <section class="side-block explore-block">
+        <div class="side-title">Explorar</div>
+        <div class="explore-tree explore-tree-sync" data-tree-scope="case"><p class="muted small">Sem dados.</p></div>
+      </section>
+    </aside>
+    <section id="tab-analysis" class="group-panel">
+      <div class="analysis-toolbar">
+        <div class="seg small-seg case-view-tabs" role="tablist" aria-label="Visualizações do Caso">
+          <button class="seg-btn active" data-view="overview" type="button"><i class="fas fa-table-cells-large"></i> Visão geral</button>
+          <button class="seg-btn" data-view="items" type="button"><i class="fas fa-layer-group"></i> Itens</button>
+          <button class="seg-btn" data-view="timeline" type="button"><i class="fas fa-timeline"></i> Linha do tempo</button>
+          <button class="seg-btn" data-view="vtimeline" type="button"><i class="fas fa-list"></i> Linha vertical</button>
+          <button class="seg-btn" data-view="data" type="button"><i class="fas fa-database"></i> Dados do Caso</button>
+        </div>
+        <span class="muted small case-toolbar-count" id="analysis-count"></span>
+        <div class="spacer"></div>
+        <button id="btn-case-dashboard" class="btn ghost small" type="button"><i class="fas fa-chart-pie"></i> Painéis</button>
+        <button class="btn ghost small" id="btn-manual-event" type="button">
+          <i class="fas fa-plus"></i> Evento manual
+        </button>
+        <button class="btn ghost small" id="btn-analysis-clear" type="button">
+          <i class="fas fa-trash-can"></i> Limpar itens
+        </button>
+      </div>
+      <div id="manual-form" class="manual-form" hidden>
+        <input id="mf-name" type="text" placeholder="Nome do evento" />
+        <input id="mf-desc" type="text" placeholder="Descrição (opcional)" />
+        <label>Início <input id="mf-start" type="datetime-local" step="1" /></label>
+        <label>Fim <input id="mf-end" type="datetime-local" step="1" /></label>
+        <button class="btn primary small" id="mf-save" type="button">Adicionar</button>
+        <button class="btn ghost small" id="mf-cancel" type="button">Cancelar</button>
+      </div>
+      <div id="analysis-list" class="analysis-list"></div>
+    </section>
+  </main>
+
+  <!-- ===================== TELA DE ESTAÇÕES ===================== -->
+  <main id="view-stations" hidden>
+    <section class="group-panel">
+      <div class="analysis-toolbar">
+        <span class="muted small" id="stations-count"></span>
+        <div class="spacer"></div>
+        <span class="muted small">Estações são vinculadas ao adicionar itens ao Caso.</span>
+      </div>
+      <div id="stations-list" class="analysis-list"></div>
+    </section>
+  </main>
+
+  <!-- ===================== TELA DE DASHBOARD ===================== -->
+  <main id="view-dashboard" hidden>
+    <aside class="view-side">
+      <section class="side-block filters-block">
+        <div class="side-title">Filtros ativos</div>
+        <div class="chips side-chips chips-sync"></div>
+      </section>
+      <section class="side-block explore-block">
+        <div class="side-title">Explorar</div>
+        <div class="explore-tree explore-tree-sync" data-tree-scope="case"><p class="muted small">Sem dados.</p></div>
+      </section>
+    </aside>
+    <section class="group-panel">
+      <div class="analysis-toolbar">
+        <span class="muted small" id="dash-info"></span>
+        <div class="spacer"></div>
+        <button class="icon-btn" id="btn-dash-compact" type="button" title="Alternar modo compacto">
+          <i class="fas fa-compress"></i>
+        </button>
+        <button class="btn ghost small" id="btn-dash-refresh" type="button">
+          <i class="fas fa-rotate"></i> Recalcular
+        </button>
+        <button class="btn primary small" id="btn-dash-add" type="button">
+          <i class="fas fa-plus"></i> Gráfico
+        </button>
+      </div>
+      <div id="dash-grid" class="dash-grid"></div>
+    </section>
+  </main>
+
+  <!-- ===================== TELA DO CUBO ===================== -->
+  <main id="view-cube" hidden>
+    <aside class="view-side">
+      <section class="side-block filters-block">
+        <div class="side-title">Filtros ativos</div>
+        <div class="chips side-chips chips-sync"></div>
+      </section>
+      <section class="side-block explore-block">
+        <div class="side-title">Explorar</div>
+        <div class="explore-tree explore-tree-sync" data-tree-scope="case"><p class="muted small">Sem dados.</p></div>
+      </section>
+    </aside>
+    <section class="group-panel cube-panel">
+      <div class="cube-fields">
+        <div class="side-title">Campos</div>
+        <div id="cube-info" class="cube-scope"></div>
+        <p class="cube-hint">Arraste um campo para uma área ou use <i class="fas fa-plus" aria-hidden="true"></i>.</p>
+        <div id="cube-field-list" class="cube-field-list"></div>
+      </div>
+      <div class="cube-main">
+        <div class="cube-zones">
+          <div class="cube-zone" data-zone="rows">
+            <span class="cube-zone-label">Linhas</span>
+            <div class="cube-zone-items" id="cz-rows"></div>
+          </div>
+          <div class="cube-zone" data-zone="cols">
+            <span class="cube-zone-label">Colunas</span>
+            <div class="cube-zone-items" id="cz-cols"></div>
+          </div>
+          <div class="cube-zone" data-zone="values">
+            <span class="cube-zone-label">Valores</span>
+            <div class="cube-zone-items" id="cz-values"></div>
+          </div>
+          <div class="cube-actions">
+            <button class="btn ghost small" id="btn-cube-clear" type="button">
+              <i class="fas fa-trash-can"></i> Limpar
+            </button>
+          </div>
+        </div>
+        <div class="cube-result-area">
+          <aside id="cube-view-rail" class="cube-view-rail" aria-label="Visualizações do Cubo">
+            <div id="cube-view-list" class="cube-view-list"></div>
+            <span class="cube-view-separator" aria-hidden="true"></span>
+            <button id="btn-cube-add-table" class="cube-view-btn" type="button" title="Nova tabela" aria-label="Nova tabela"><i class="fas fa-table"></i><i class="fas fa-plus cube-view-plus"></i></button>
+            <button id="btn-cube-chart" class="cube-view-btn" type="button" title="Novo gráfico" aria-label="Novo gráfico"><i class="fas fa-chart-column"></i><i class="fas fa-plus cube-view-plus"></i></button>
+          </aside>
+          <div class="cube-output">
+            <div id="cube-table-view" class="table-scroll cube-table-wrap">
+              <table id="cube-table">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <section id="cube-chart-view" class="cube-chart-view" hidden></section>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ===================== TELA: ANALISAR TRILHA ===================== -->
+  <main id="view-trail" hidden>
+    <section class="group-panel trail-panel">
+      <div class="analysis-toolbar">
+        <button id="btn-trail-back" class="btn ghost small" type="button">
+          <i class="fas fa-arrow-left"></i> Eventos
+        </button>
+        <span class="trail-title"><i class="fas fa-route"></i> Trilha do evento</span>
+        <span id="trail-info" class="muted small"></span>
+        <div class="spacer"></div>
+        <label class="trail-toggle"><input id="trail-only-case" type="checkbox" /> Exibir apenas do caso</label>
+        <label class="trail-toggle"><input id="trail-unfiltered" type="checkbox" /> Exibir logs não filtrados</label>
+      </div>
+      <div class="trail-scroll">
+        <button id="trail-more-before" class="btn ghost small block" type="button">
+          <i class="fas fa-angle-up"></i> Carregar mais antes
+        </button>
+        <div id="trail-list"></div>
+        <button id="trail-more-after" class="btn ghost small block" type="button">
+          <i class="fas fa-angle-down"></i> Carregar mais depois
+        </button>
+      </div>
+    </section>
+  </main>
+
+  <!-- ===================== ABAS DE FILTROS SALVOS ===================== -->
+  <div id="filter-tabs" class="filter-tabs" hidden></div>
+
+  <!-- ===================== MODAL: DATA/HORA ===================== -->
+  <div id="ts-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h3>Data/hora dos eventos</h3>
+        <div class="spacer"></div>
+        <button class="icon-btn" id="ts-help-btn" type="button" title="Como funciona">
+          <i class="fas fa-circle-info"></i>
+        </button>
+        <button class="icon-btn" id="ts-close" type="button" title="Fechar">
+          <i class="fas fa-xmark"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="ts-help" class="fmt-help" hidden>
+          <p><strong>Como montar a data/hora:</strong></p>
+          <p>1. <strong>Fontes</strong> — clique nos campos na ordem em que eles formam a data.
+          <code>arquivo</code> e <code>caminho</code> são o nome e o caminho do arquivo (a data pode
+          estar neles, ex.: <code>server.log.2026-06-24</code>); <code>linha</code> é a linha inteira do log.</p>
+          <p>2. <strong>Regex</strong> (opcional) — isole a parte da data. Os <strong>grupos entre
+          parênteses</strong> ficam destacados no texto de exemplo: grupo 1 em azul, 2 em verde, 3 em âmbar.</p>
+          <p>3. <strong>Montagem</strong> (opcional) — remonte os grupos com <code>\1</code>, <code>\2</code>…
+          ou <code>$1</code>, <code>$2</code>… na ordem que o formato espera.<br>
+          Ex.: texto <code>24/06/2026 08:00</code> com regex <code>(\d+)/(\d+)/(\d+)</code> e montagem
+          <code>$3-$2-$1</code> vira <code>2026-06-24</code>.</p>
+          <p>4. <strong>Formato</strong> — como interpretar o resultado. Se só houver hora, use o
+          <strong>Complemento</strong> para informar a data.</p>
+        </div>
+        <div class="fld">
+          <label>Fonte(s) da data/hora (ordem)</label>
+          <div id="ts-sources" class="ts-sources"></div>
+        </div>
+        <div class="fld">
+          <label>Texto de exemplo (campos concatenados)</label>
+          <pre id="ts-example" class="code-pane ts-example">—</pre>
+        </div>
+        <div class="fld">
+          <label>Regras de extração (OU — a primeira que reconhecer a data vence)</label>
+          <div id="ts-rules" class="dv-rules"></div>
+          <button id="ts-add-rule" class="btn ghost small" type="button">
+            <i class="fas fa-plus"></i> Adicionar regra (OU)
+          </button>
+        </div>
+        <div class="fld" hidden>
+          <input id="ts-regex" type="hidden" />
+          <input id="ts-template" type="hidden" />
+          <pre id="ts-assembled" class="code-pane ts-assembled" hidden></pre>
+        </div>
+        <div class="fld">
+          <label>Formato</label>
+          <select id="ts-format"></select>
+          <input id="ts-format-custom" type="text" spellcheck="false" hidden placeholder="%Y-%m-%d %H:%M:%S%.f" />
+        </div>
+        <div class="fld">
+          <label>Complemento (data, se só houver hora)</label>
+          <input id="ts-complement" type="text" spellcheck="false" placeholder="2026-06-24 (opcional)" />
+        </div>
+        <div class="fmt-test-row">
+          <button class="btn ghost small" id="ts-test" type="button">
+            <i class="fas fa-vial"></i> Testar
+          </button>
+          <button class="btn ghost small" id="ts-reset" type="button" title="Voltar à inferência automática">
+            <i class="fas fa-rotate-left"></i> Redefinir
+          </button>
+          <button class="btn primary small" id="ts-apply" type="button">Aplicar</button>
+        </div>
+        <div id="ts-test-result" class="fmt-test-result"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: EDITOR DE GRÁFICO ===================== -->
+  <div id="chart-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h3>Configurar gráfico</h3>
+        <button class="icon-btn" id="cp-close" type="button" title="Fechar">
+          <i class="fas fa-xmark"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="fld"><label>Título</label><input id="cp-title" type="text" /></div>
+        <div class="fld"><label>Base</label>
+          <select id="cp-chart">
+            <option value="time">Série temporal</option>
+            <option value="terms">Ranking de valores</option>
+          </select>
+        </div>
+        <div class="fld"><label>Métrica</label>
+          <select id="cp-metric">
+            <option value="count">contagem</option>
+            <option value="sum">soma</option>
+            <option value="avg">média</option>
+            <option value="min">mínimo</option>
+            <option value="max">máximo</option>
+            <option value="distinct">distintos</option>
+          </select>
+        </div>
+        <div class="fld"><label>Campo</label><select id="cp-field"></select></div>
+        <div class="fld"><label>Agrupar por (séries)</label><select id="cp-split"></select></div>
+        <div class="fld"><label>Intervalo</label>
+          <select id="cp-interval">
+            <option value="">automático</option>
+            <option value="60000">minuto</option>
+            <option value="3600000">hora</option>
+            <option value="86400000">dia</option>
+            <option value="604800000">semana</option>
+            <option value="2592000000">mês</option>
+          </select>
+        </div>
+        <div class="fld"><label>Visualização</label>
+          <select id="cp-type">
+            <option value="line">linha</option>
+            <option value="bar">barras</option>
+            <option value="donut">rosca</option>
+            <option value="gauge">velocímetro</option>
+            <option value="radar">radar</option>
+            <option value="heatmap">mapa de calor</option>
+            <option value="kpi">indicador</option>
+          </select>
+          <p id="cp-type-hint" class="muted small chart-type-hint"></p>
+        </div>
+        <div class="modal-actions">
+          <button class="btn ghost" id="cp-cancel" type="button">Cancelar</button>
+          <button class="btn primary" id="cp-apply" type="button">Aplicar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="cube-chart-modal" class="modal-overlay" hidden>
+    <div class="modal cube-chart-modal">
+      <div class="modal-head">
+        <h3 id="cube-chart-modal-title">Novo gráfico do Cubo</h3>
+        <button class="icon-btn" id="cube-chart-close" type="button" title="Fechar"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div class="modal-body">
+        <p class="muted small">O gráfico guarda uma fotografia da tabela atual. Alterações futuras na tabela não mudam este gráfico sem uma atualização manual.</p>
+        <div class="fld"><label>Nome</label><input id="cube-chart-name" type="text" placeholder="ex.: Eventos por nível" /></div>
+        <div class="fld"><label>Medida</label><select id="cube-chart-measure"></select></div>
+        <div class="fld"><label>Coluna do Cubo</label><select id="cube-chart-column"></select></div>
+        <div class="fld"><label>Visualizacao</label>
+          <div class="seg" id="cube-chart-type">
+            <button class="seg-btn active" data-type="bar" type="button"><i class="fas fa-chart-bar"></i> Barras</button>
+            <button class="seg-btn" data-type="donut" type="button"><i class="fas fa-chart-pie"></i> Rosca</button>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn ghost" id="cube-chart-cancel" type="button">Cancelar</button>
+          <button class="btn primary" id="cube-chart-apply" type="button">Criar gráfico</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="format-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h3>Novo formato de log</h3>
+        <div class="spacer"></div>
+        <button class="icon-btn" id="fmt-help-btn" type="button" title="Como funciona">
+          <i class="fas fa-circle-question"></i>
+        </button>
+        <button class="icon-btn" id="format-close" type="button" title="Fechar">
+          <i class="fas fa-xmark"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="fmt-help" class="fmt-help" hidden>
+          <p><strong>Como definir um formato:</strong> cada linha do arquivo vira um evento.
+          Você diz como extrair os campos de duas formas:</p>
+          <p><strong>Regex</strong> — uma expressão com <em>grupos nomeados</em>. Nomes reservados:
+          <code>timestamp</code>, <code>level</code>, <code>code</code>, <code>source</code>,
+          <code>message</code>; os demais nomes viram colunas.<br>
+          Ex.: <code>\[(?<timestamp>[^\]]+)\] (?<level>\w+) (?<message>.*)</code></p>
+          <p><strong>Delimitado</strong> — as colunas são separadas por um caractere (vírgula,
+          pipe, tab…). Informe os nomes dos campos <em>na ordem das colunas</em>, usando os
+          nomes reservados onde couber.<br>
+          Ex.: <code>timestamp, level, code, message, latency_ms</code> com separador vírgula.</p>
+          <p class="muted">Dica: cole uma linha real do seu log em "Teste" e ajuste até o
+          resultado ficar certo antes de salvar.</p>
+        </div>
+        <div class="fld">
+          <label>Nome do formato</label>
+          <input id="fmt-name" type="text" placeholder="ex.: app-erp" spellcheck="false" />
+        </div>
+        <div class="fld">
+          <label>Modo</label>
+          <div class="seg" id="fmt-kind-seg">
+            <button class="seg-btn active" data-kind="regex" type="button">Regex</button>
+            <button class="seg-btn" data-kind="delimited" type="button">Delimitado</button>
+          </div>
+        </div>
+        <div class="fld" id="fmt-regex-fld">
+          <label>Regex (uma linha de log)</label>
+          <textarea id="fmt-pattern" class="codes-editor" rows="4" spellcheck="false"
+            placeholder="\[(?<timestamp>[^\]]+)\] (?<level>\w+) (?<message>.*)"></textarea>
+        </div>
+        <div id="fmt-delim-fld" hidden>
+          <div class="fld">
+            <label>Separador</label>
+            <select id="fmt-separator">
+              <option value=",">vírgula ( , )</option>
+              <option value=";">ponto e vírgula ( ; )</option>
+              <option value="|">pipe ( | )</option>
+              <option value="	">tab</option>
+              <option value=" ">espaço</option>
+            </select>
+          </div>
+          <div class="fld">
+            <label>Campos (na ordem, separados por vírgula)</label>
+            <input id="fmt-fields" type="text" spellcheck="false"
+              placeholder="timestamp, level, code, message, latency_ms" />
+          </div>
+        </div>
+        <div class="fld">
+          <label>Teste (cole linhas reais do log)</label>
+          <textarea id="fmt-sample" class="codes-editor" rows="3" spellcheck="false"
+            placeholder="Cole aqui 1-3 linhas reais do arquivo"></textarea>
+        </div>
+        <div class="fmt-test-row">
+          <button class="btn ghost small" id="fmt-test" type="button">
+            <i class="fas fa-vial"></i> Testar
+          </button>
+          <div id="fmt-test-result" class="fmt-test-result"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn ghost" id="format-cancel" type="button">Cancelar</button>
+          <button class="btn primary" id="format-save" type="button">
+            <i class="fas fa-floppy-disk"></i> Salvar
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: CAMPO DERIVADO ===================== -->
+  <div id="derive-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h3>Novo campo a partir da seleção</h3>
+        <button class="icon-btn" id="derive-close" type="button" title="Fechar">
+          <i class="fas fa-xmark"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p class="muted small">Trecho selecionado em <strong id="dv-source-label"></strong>:</p>
+        <pre id="dv-selected" class="code-pane dv-selected"></pre>
+        <div class="fld">
+          <label>Nome do novo campo</label>
+          <input id="dv-name" type="text" placeholder="ex.: usuario" spellcheck="false" />
+        </div>
+        <div class="fld">
+          <label>Extraído de</label>
+          <select id="dv-source"></select>
+        </div>
+        <div class="fld">
+          <label>Como extrair (sugestões — clique para usar)</label>
+          <div id="dv-suggestions" class="dv-suggestions"></div>
+        </div>
+        <div class="fld">
+          <label>Regras de extração (OU — a primeira que capturar vence)</label>
+          <div id="dv-rules" class="dv-rules"></div>
+          <button id="dv-add-rule" class="btn ghost small" type="button">
+            <i class="fas fa-plus"></i> Adicionar regra (OU)
+          </button>
+        </div>
+        <div class="fld">
+          <label>Resultado no valor atual</label>
+          <pre id="dv-preview" class="code-pane dv-preview">—</pre>
+        </div>
+        <div class="modal-actions">
+          <button class="btn ghost" id="derive-delete" type="button" hidden>
+            <i class="fas fa-trash-can"></i> Excluir
+          </button>
+          <button class="btn ghost" id="derive-cancel" type="button">Cancelar</button>
+          <button class="btn primary" id="derive-save" type="button">
+            <i class="fas fa-floppy-disk"></i> Criar campo
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== MENU CONTEXTUAL DIREITO ===================== -->
+  <aside id="context-rail" class="context-rail" aria-label="Ações do contexto">
+    <button id="btn-right-artifact" class="context-rail-btn" type="button" title="Visualizar artefato" aria-label="Visualizar artefato"><i class="fas fa-table-list"></i></button>
+    <button id="btn-right-case" class="context-rail-btn" type="button" title="Abrir Caso ativo" aria-label="Abrir Caso ativo"><i class="fas fa-briefcase"></i><span id="analysis-badge" class="badge-n" hidden>0</span></button>
+    <button id="btn-right-stations" class="context-rail-btn" type="button" title="Abrir estações do Caso" aria-label="Abrir estações do Caso"><i class="fas fa-server"></i></button>
+    <span class="context-rail-separator" aria-hidden="true"></span>
+    <button id="btn-right-inspect" class="context-rail-btn" type="button" title="Abrir inspetor da seleção" aria-label="Abrir inspetor da seleção"><i class="fas fa-circle-info"></i></button>
+    <span class="context-rail-separator" aria-hidden="true"></span>
+    <button id="btn-right-dashboard" class="context-rail-btn" type="button" title="Abrir Painéis deste contexto" aria-label="Abrir Painéis deste contexto"><i class="fas fa-chart-pie"></i></button>
+    <button id="btn-right-cube" class="context-rail-btn" type="button" title="Abrir Cubo do Caso" aria-label="Abrir Cubo do Caso"><i class="fas fa-cube"></i></button>
+  </aside>
+
+  <!-- ===================== OPERAÇÕES ===================== -->
+  <footer id="workbar" class="workbar" aria-live="polite">
+    <div class="workbar-main">
+      <span id="workbar-idle-icon" class="fas fa-circle-check"></span>
+      <span id="workbar-spin" class="workbar-spin" hidden aria-hidden="true"></span>
+      <span id="workbar-label">Nenhuma fonte carregada</span>
+    </div>
+    <div id="workbar-progress" class="workbar-progress" hidden><span id="workbar-progress-fill"></span></div>
+    <span id="workbar-detail" class="workbar-detail"></span>
+    <button id="workbar-cancel" class="icon-btn" type="button" title="Cancelar operação" hidden><i class="fas fa-xmark"></i></button>
+  </footer>
+
+  <!-- ===================== INSPECTOR CONTEXTUAL ===================== -->
+  <aside id="drawer" class="drawer" hidden>
+    <div class="drawer-head">
+      <div id="drawer-badges" class="drawer-badges"></div>
+      <div class="drawer-actions">
+        <button class="icon-btn" id="dr-prev" type="button" title="Evento anterior ( ← )">
+          <i class="fas fa-angle-left"></i>
+        </button>
+        <button class="icon-btn" id="dr-next" type="button" title="Próximo evento ( → )">
+          <i class="fas fa-angle-right"></i>
+        </button>
+        <button class="icon-btn" id="dr-copy" type="button" title="Copiar JSON">
+          <i class="fas fa-copy"></i>
+        </button>
+        <button class="icon-btn" id="dr-close" type="button" title="Fechar ( Esc )">
+          <i class="fas fa-xmark"></i>
+        </button>
+      </div>
+    </div>
+    <div class="drawer-tabs">
+      <button class="dtab active" data-pane="overview" type="button">Visão geral</button>
+      <button class="dtab" data-pane="json" type="button">JSON</button>
+      <button class="dtab" data-pane="raw" type="button">Bruto</button>
+    </div>
+    <div class="drawer-body">
+      <div id="pane-overview"></div>
+      <pre id="pane-json" class="code-pane" hidden></pre>
+      <pre id="pane-raw" class="code-pane" hidden></pre>
+    </div>
+  </aside>
+  <div id="drawer-scrim" class="drawer-scrim" hidden></div>
+
+  <!-- ===================== POPOVER: NOVO FILTRO ===================== -->
+  <div id="filter-pop" class="popover" hidden>
+    <div class="pop-title">Novo filtro</div>
+    <select id="fp-col"></select>
+    <select id="fp-op"></select>
+    <input id="fp-val" type="text" placeholder="valor" spellcheck="false" />
+    <input id="fp-val2" type="text" placeholder="até" spellcheck="false" hidden />
+    <div class="pop-actions">
+      <button class="btn ghost small" id="fp-cancel" type="button">Cancelar</button>
+      <button class="btn primary small" id="fp-apply" type="button">Aplicar</button>
+    </div>
+  </div>
+
+  <!-- ===================== POPOVER: COLUNAS ===================== -->
+  <div id="col-pop" class="popover" hidden>
+    <div class="pop-title">Colunas visíveis</div>
+    <div id="col-list" class="col-list"></div>
+  </div>
+
+  <!-- ===================== POPOVER: NOME DO GRUPO ===================== -->
+  <div id="name-pop" class="popover" hidden>
+    <div class="pop-title">Nome do agrupamento</div>
+    <input id="np-val" type="text" placeholder="ex.: Janela de falhas do gateway" spellcheck="false" />
+    <div class="pop-actions">
+      <button class="btn ghost small" id="np-cancel" type="button">Cancelar</button>
+      <button class="btn primary small" id="np-ok" type="button">Enviar</button>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: CÓDIGOS ===================== -->
+  <div id="codes-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h3>Catálogo de códigos</h3>
+        <button class="icon-btn" id="codes-close" type="button" title="Fechar">
+          <i class="fas fa-xmark"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p class="muted small">
+          <code>fonte → código → nome/descrição</code>; <code>"*"</code> vale para todas as fontes.
+          Arquivo: <code id="codes-path"></code>
+        </p>
+        <div class="sys-catalog">
+          <span>
+            Catálogo do sistema: <strong id="sys-count">—</strong> códigos extraídos dos
+            providers desta máquina. Suas entradas acima têm prioridade.
+          </span>
+          <button class="btn ghost small" id="btn-harvest" type="button">
+            <i class="fas fa-rotate"></i> Atualizar do sistema
+          </button>
+        </div>
+        <textarea id="codes-editor" spellcheck="false"></textarea>
+        <div class="modal-actions">
+          <button class="btn ghost" id="codes-cancel" type="button">Cancelar</button>
+          <button class="btn primary" id="codes-save" type="button">
+            <i class="fas fa-floppy-disk"></i> Salvar
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== ADICIONAR AO CASO ===================== -->
+  <div id="case-add-modal" class="modal-overlay" hidden>
+    <div class="modal compact-modal">
+      <div class="modal-head">
+        <h3>Adicionar ao caso</h3>
+        <button id="case-add-close" class="icon-btn" type="button" title="Fechar"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div class="modal-body">
+        <p id="case-add-summary" class="muted small"></p>
+        <div class="fld">
+          <label>Estação relacionada</label>
+          <select id="case-add-station"></select>
+        </div>
+        <button id="case-add-new-station" class="btn ghost small" type="button"><i class="fas fa-plus"></i> Nova estação</button>
+        <div id="case-add-station-form" class="inline-station-form" hidden>
+          <input id="case-add-station-name" type="text" placeholder="Nome da estação" />
+          <input id="case-add-station-host" type="text" placeholder="Host ou IP (opcional)" />
+          <input id="case-add-station-notes" type="text" placeholder="Nota técnica (opcional)" />
+        </div>
+        <div class="modal-actions">
+          <button id="case-add-cancel" class="btn ghost" type="button">Cancelar</button>
+          <button id="case-add-confirm" class="btn primary" type="button">Adicionar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== CONTEXTO TÉCNICO DO ITEM ===================== -->
+  <div id="case-item-modal" class="modal-overlay" hidden>
+    <div class="modal compact-modal">
+      <div class="modal-head">
+        <h3>Contexto técnico</h3>
+        <button id="case-item-close" class="icon-btn" type="button" title="Fechar"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div class="modal-body">
+        <div class="fld"><label>Relevância</label>
+          <select id="case-item-relevance"><option value="normal">Normal</option><option value="importante">Importante</option><option value="crítico">Crítico</option></select>
+        </div>
+        <div class="fld"><label>Tags (separadas por vírgula)</label><input id="case-item-tags" type="text" placeholder="ex.: autenticação, falha" /></div>
+        <div class="fld"><label>Nota técnica</label><textarea id="case-item-note" rows="5" placeholder="Contexto, hipótese ou observação útil."></textarea></div>
+        <div class="modal-actions"><button id="case-item-cancel" class="btn ghost" type="button">Cancelar</button><button id="case-item-save" class="btn primary" type="button">Salvar</button></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: COMENTÁRIO DO EVENTO ===================== -->
+  <div id="comment-modal" class="modal-overlay" hidden>
+    <div class="modal compact-modal">
+      <div class="modal-head">
+        <h3>Comentário do evento</h3>
+        <button id="cm-close" class="icon-btn" type="button" title="Fechar"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div class="modal-body">
+        <div class="fld">
+          <label>Texto (visível na coluna Comentário)</label>
+          <textarea id="cm-text" rows="4" placeholder="Observação sobre este evento…"></textarea>
+        </div>
+        <div class="modal-actions">
+          <button id="cm-remove" class="btn ghost" type="button" hidden><i class="fas fa-trash-can"></i> Remover</button>
+          <button id="cm-cancel" class="btn ghost" type="button">Cancelar</button>
+          <button id="cm-save" class="btn primary" type="button"><i class="fas fa-floppy-disk"></i> Salvar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-area"></div>
+
+  <script src="vendor/uplot/uPlot.iife.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+2024-01-31 08:00:01 INFO Servidor web iniciado na porta 8080
+2024-01-31 08:01:15 INFO Requisição GET /api/usuarios concluída em 45ms
+2024-01-31 08:02:30 WARN Cache expirado para chave "sessao:9182"
+2024-01-31 08:03:44 ERROR Falha ao conectar no banco: timeout após 3000ms
+2024-01-31 08:04:02 INFO Nova tentativa de conexão com o banco
+2024-01-31 08:04:05 INFO Conexão com o banco restabelecida
+2024-01-31 08:10:12 WARN Uso de memória acima de 85%
+2024-01-31 08:15:56 ERROR Exceção não tratada no worker 3: NullReferenceException
+2024-01-31 08:16:01 INFO Worker 3 reiniciado com sucesso
+2024-01-31 08:30:00 DEBUG Rotina de limpeza de sessões executada: 128 removidas
+2024-01-31 09:00:00 INFO Backup diário agendado iniciado
+2024-01-31 09:12:43 INFO Backup diário concluído (2,3 GB)

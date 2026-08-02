@@ -1,0 +1,356 @@
+{
+  "*": {
+    "1000": { "name": "Erro de aplicação", "description": "Uma aplicação falhou ou foi encerrada inesperadamente." },
+    "1001": { "name": "Relatório de erros", "description": "O Windows Error Reporting registrou uma falha." },
+    "1002": { "name": "Aplicação travada", "description": "O programa parou de responder e foi encerrado." }
+  },
+  "api-pagamentos": {
+    "100": { "name": "Serviço iniciado", "description": "O serviço foi iniciado e está pronto para receber requisições." },
+    "110": { "name": "Health check", "description": "Verificação periódica de saúde do serviço." },
+    "210": { "name": "Pagamento autorizado", "description": "Uma transação de pagamento foi autorizada pelo gateway." },
+    "220": { "name": "Banco restabelecido", "description": "A conexão com o banco de dados foi restabelecida." },
+    "310": { "name": "Latência alta", "description": "O gateway de pagamento respondeu acima do limite aceitável." },
+    "410": { "name": "Pagamento recusado", "description": "A autorização do pagamento foi negada." },
+    "420": { "name": "Timeout no gateway", "description": "O gateway de pagamento não respondeu dentro do tempo limite." },
+    "500": { "name": "Banco indisponível", "description": "A conexão com o banco de dados foi perdida." }
+  },
+  "EventLog": {
+    "104": { "name": "Log limpo", "description": "Um arquivo de log de eventos foi limpo." },
+    "6005": { "name": "Log iniciado", "description": "O serviço de log de eventos iniciou — indica boot do sistema." },
+    "6006": { "name": "Desligamento limpo", "description": "O log de eventos foi parado — desligamento normal do sistema." },
+    "6008": { "name": "Desligamento anormal", "description": "O desligamento anterior do sistema foi inesperado." },
+    "6009": { "name": "Versão do sistema", "description": "Registra a versão do Windows no boot." },
+    "6013": { "name": "Tempo de atividade", "description": "Registro periódico de uptime do sistema." }
+  },
+  "Service Control Manager": {
+    "7000": { "name": "Serviço não iniciou", "description": "Um serviço falhou ao iniciar — não respondeu ou erro na inicialização." },
+    "7001": { "name": "Dependência falhou", "description": "Um serviço falhou porque um serviço do qual depende não iniciou." },
+    "7009": { "name": "Timeout de serviço", "description": "Tempo esgotado esperando a conexão com um serviço." },
+    "7011": { "name": "Serviço não respondeu", "description": "Tempo esgotado esperando resposta de transação de um serviço." },
+    "7022": { "name": "Serviço travou ao iniciar", "description": "Um serviço ficou paralisado durante a inicialização." },
+    "7023": { "name": "Serviço terminou com erro", "description": "Um serviço foi encerrado com um erro específico." },
+    "7024": { "name": "Serviço terminou com erro", "description": "Um serviço foi encerrado com erro específico do serviço." },
+    "7026": { "name": "Driver não carregou", "description": "Falha ao carregar um driver de boot ou de sistema." },
+    "7031": { "name": "Serviço caiu", "description": "Um serviço terminou inesperadamente; ações de recuperação foram agendadas." },
+    "7032": { "name": "Recuperação falhou", "description": "As ações corretivas após a queda de um serviço falharam." },
+    "7034": { "name": "Serviço terminou inesperado", "description": "Um serviço foi encerrado de forma inesperada." },
+    "7035": { "name": "Controle de serviço enviado", "description": "Um comando de controle (iniciar/parar) foi enviado a um serviço." },
+    "7036": { "name": "Estado de serviço mudou", "description": "Um serviço entrou em execução ou foi parado." },
+    "7040": { "name": "Inicialização alterada", "description": "O tipo de inicialização de um serviço foi alterado (automático/manual/desabilitado)." },
+    "7045": { "name": "Serviço instalado", "description": "Um novo serviço foi instalado no sistema." }
+  },
+  "Microsoft-Windows-Kernel-Power": {
+    "41": { "name": "Desligamento inesperado", "description": "O sistema reiniciou sem desligamento limpo — queda de energia, travamento ou reset." },
+    "42": { "name": "Entrando em suspensão", "description": "O sistema está entrando em suspensão ou hibernação." },
+    "107": { "name": "Retorno de suspensão", "description": "O sistema retomou de um estado de baixa energia." },
+    "109": { "name": "Transição de energia", "description": "O firmware iniciou uma transição de energia do sistema." },
+    "131": { "name": "Suspensão moderna", "description": "Entrada em modo de espera conectado (Modern Standby)." },
+    "506": { "name": "Suspensão moderna ativa", "description": "O sistema entrou em espera conectado." },
+    "507": { "name": "Saiu de suspensão moderna", "description": "O sistema saiu do modo de espera conectado." }
+  },
+  "Microsoft-Windows-Kernel-General": {
+    "1": { "name": "Fuso/horário alterado", "description": "A hora ou o fuso horário do sistema foi alterado." },
+    "12": { "name": "Sistema iniciado", "description": "O sistema operacional foi iniciado." },
+    "13": { "name": "Sistema desligado", "description": "O sistema operacional foi desligado." },
+    "15": { "name": "Hive do registro carregado", "description": "Uma seção do registro foi carregada." },
+    "16": { "name": "Coleta de diagnóstico", "description": "O histórico de acesso a chaves do registro foi atualizado." }
+  },
+  "Microsoft-Windows-Kernel-Boot": {
+    "20": { "name": "Shutdown anterior com erro", "description": "O último desligamento do sistema não foi concluído com êxito." },
+    "25": { "name": "Menu de boot usado", "description": "O carregador usou um menu de opções avançadas de inicialização." },
+    "27": { "name": "Tipo de boot", "description": "Registra o tipo de inicialização (normal, modo seguro etc.)." },
+    "29": { "name": "Boot rápido falhou", "description": "A inicialização rápida (Fast Startup) falhou." },
+    "30": { "name": "Falha na hibernação", "description": "O sistema falhou ao entrar em hibernação." },
+    "32": { "name": "Boot limpo", "description": "O boot foi concluído sem dados de hibernação (desligamento total)." }
+  },
+  "User32": {
+    "1074": { "name": "Desligamento solicitado", "description": "Um processo ou usuário iniciou o desligamento/reinício do sistema." },
+    "1076": { "name": "Motivo do desligamento", "description": "Registra o motivo informado para um desligamento inesperado." }
+  },
+  "Application Error": {
+    "1000": { "name": "Erro de aplicação", "description": "Uma aplicação falhou — módulo e exceção constam nos dados do evento." }
+  },
+  "Application Hang": {
+    "1002": { "name": "Aplicação travada", "description": "O programa parou de interagir com o Windows e foi encerrado." }
+  },
+  "Windows Error Reporting": {
+    "1001": { "name": "Relatório de erros", "description": "Falha de aplicação ou do sistema registrada com detalhes (bucket WER)." }
+  },
+  "Microsoft-Windows-WER-SystemErrorReporting": {
+    "1001": { "name": "Tela azul (bugcheck)", "description": "O computador reiniciou após uma falha grave do sistema (BSOD)." }
+  },
+  "MsiInstaller": {
+    "1007": { "name": "Componente instalado", "description": "A instalação de um componente foi concluída." },
+    "1033": { "name": "Produto instalado", "description": "A instalação de um produto foi concluída com êxito." },
+    "1034": { "name": "Produto removido", "description": "A remoção de um produto foi concluída com êxito." },
+    "1035": { "name": "Produto reconfigurado", "description": "A reconfiguração de um produto foi concluída." },
+    "11707": { "name": "Instalação com êxito", "description": "A operação de instalação terminou com êxito." }
+  },
+  "Microsoft-Windows-RestartManager": {
+    "10000": { "name": "Reinício agendado", "description": "Aplicativos serão reiniciados para concluir uma instalação/atualização." },
+    "10001": { "name": "Sessão finalizada", "description": "Uma sessão do usuário foi encerrada para permitir instalação/atualização." }
+  },
+  "Microsoft-Windows-Security-Auditing": {
+    "1102": { "name": "Log de segurança limpo", "description": "O log de auditoria de segurança foi limpo — evento sensível, investigue." },
+    "4611": { "name": "Logon confiável registrado", "description": "Um processo de logon foi registrado como confiável." },
+    "4616": { "name": "Hora do sistema alterada", "description": "A data/hora do sistema foi alterada." },
+    "4624": { "name": "Logon bem-sucedido", "description": "Uma conta fez logon com sucesso." },
+    "4625": { "name": "Falha de logon", "description": "Tentativa de logon com credenciais inválidas — senha errada ou conta bloqueada." },
+    "4634": { "name": "Logoff", "description": "Uma sessão de logon foi encerrada." },
+    "4647": { "name": "Logoff pelo usuário", "description": "O usuário iniciou o logoff da sessão." },
+    "4648": { "name": "Logon com credenciais explícitas", "description": "Logon usando credenciais informadas manualmente (ex.: runas)." },
+    "4672": { "name": "Privilégios administrativos", "description": "Privilégios especiais (admin) atribuídos a um novo logon." },
+    "4688": { "name": "Processo criado", "description": "Um novo processo foi criado — registra programa e linha de comando." },
+    "4689": { "name": "Processo encerrado", "description": "Um processo foi finalizado." },
+    "4697": { "name": "Serviço instalado", "description": "Um serviço foi instalado no sistema — evento sensível, investigue origem." },
+    "4698": { "name": "Tarefa agendada criada", "description": "Uma tarefa agendada foi criada." },
+    "4699": { "name": "Tarefa agendada excluída", "description": "Uma tarefa agendada foi excluída." },
+    "4700": { "name": "Tarefa agendada habilitada", "description": "Uma tarefa agendada foi habilitada." },
+    "4701": { "name": "Tarefa agendada desabilitada", "description": "Uma tarefa agendada foi desabilitada." },
+    "4702": { "name": "Tarefa agendada alterada", "description": "Uma tarefa agendada foi atualizada." },
+    "4720": { "name": "Usuário criado", "description": "Uma conta de usuário foi criada." },
+    "4722": { "name": "Usuário habilitado", "description": "Uma conta de usuário foi habilitada." },
+    "4723": { "name": "Troca de senha tentada", "description": "Uma conta tentou alterar a própria senha." },
+    "4724": { "name": "Senha redefinida", "description": "A senha de uma conta foi redefinida por um administrador." },
+    "4725": { "name": "Usuário desabilitado", "description": "Uma conta de usuário foi desabilitada." },
+    "4726": { "name": "Usuário excluído", "description": "Uma conta de usuário foi excluída." },
+    "4727": { "name": "Grupo global criado", "description": "Um grupo global de segurança foi criado." },
+    "4728": { "name": "Membro adicionado a grupo", "description": "Um usuário foi adicionado a um grupo global." },
+    "4732": { "name": "Membro adicionado a grupo local", "description": "Um usuário foi adicionado a um grupo local (ex.: Administradores)." },
+    "4733": { "name": "Membro removido de grupo local", "description": "Um usuário foi removido de um grupo local." },
+    "4738": { "name": "Usuário alterado", "description": "Atributos de uma conta de usuário foram modificados." },
+    "4740": { "name": "Conta bloqueada", "description": "Uma conta foi bloqueada por excesso de tentativas de logon." },
+    "4756": { "name": "Membro adicionado a grupo universal", "description": "Um usuário foi adicionado a um grupo universal." },
+    "4768": { "name": "Ticket Kerberos solicitado", "description": "Um TGT Kerberos foi solicitado (autenticação de domínio)." },
+    "4769": { "name": "Ticket de serviço solicitado", "description": "Um ticket de serviço Kerberos foi solicitado." },
+    "4770": { "name": "Ticket de serviço renovado", "description": "Um ticket de serviço Kerberos foi renovado." },
+    "4771": { "name": "Pré-autenticação falhou", "description": "A pré-autenticação Kerberos falhou — geralmente senha incorreta." },
+    "4776": { "name": "Validação de credenciais", "description": "O computador validou credenciais de uma conta (NTLM)." },
+    "4778": { "name": "Sessão RDP reconectada", "description": "Uma sessão de área de trabalho remota foi reconectada." },
+    "4779": { "name": "Sessão RDP desconectada", "description": "Uma sessão de área de trabalho remota foi desconectada." },
+    "4797": { "name": "Conta consultada", "description": "Foi feita uma consulta a contas locais em branco." },
+    "4798": { "name": "Grupos locais enumerados", "description": "A lista de grupos locais de um usuário foi consultada." },
+    "4799": { "name": "Grupo local enumerado", "description": "Os membros de um grupo local foram consultados." },
+    "4800": { "name": "Estação bloqueada", "description": "A estação de trabalho foi bloqueada." },
+    "4801": { "name": "Estação desbloqueada", "description": "A estação de trabalho foi desbloqueada." },
+    "4802": { "name": "Proteção de tela ativada", "description": "A proteção de tela foi exibida." },
+    "4803": { "name": "Proteção de tela encerrada", "description": "A proteção de tela foi dispensada." },
+    "4907": { "name": "Auditoria de objeto alterada", "description": "As configurações de auditoria de um objeto foram modificadas." },
+    "4946": { "name": "Regra de firewall criada", "description": "Uma regra foi adicionada ao Firewall do Windows." },
+    "4947": { "name": "Regra de firewall alterada", "description": "Uma regra do Firewall do Windows foi modificada." },
+    "4948": { "name": "Regra de firewall excluída", "description": "Uma regra do Firewall do Windows foi excluída." },
+    "5152": { "name": "Pacote bloqueado (WFP)", "description": "A plataforma de filtragem do Windows bloqueou um pacote de rede." },
+    "5156": { "name": "Conexão permitida (WFP)", "description": "A plataforma de filtragem permitiu uma conexão de rede." },
+    "5157": { "name": "Conexão bloqueada (WFP)", "description": "A plataforma de filtragem bloqueou uma conexão de rede." },
+    "5379": { "name": "Credencial lida", "description": "Credenciais do Gerenciador de Credenciais foram lidas." }
+  },
+  "Microsoft-Windows-TaskScheduler": {
+    "100": { "name": "Tarefa iniciada", "description": "O Agendador de Tarefas iniciou uma tarefa." },
+    "101": { "name": "Tarefa falhou", "description": "Uma tarefa agendada falhou ao iniciar ou executar." },
+    "102": { "name": "Tarefa concluída", "description": "Uma tarefa agendada foi concluída." },
+    "103": { "name": "Ação falhou", "description": "A ação de uma tarefa falhou durante a execução." },
+    "106": { "name": "Tarefa registrada", "description": "Uma tarefa foi registrada no Agendador." },
+    "107": { "name": "Tarefa registrada (atualizada)", "description": "O registro de uma tarefa foi atualizado." },
+    "108": { "name": "Conflito de tarefa", "description": "Uma tarefa não iniciou por conflito com outra instância." },
+    "110": { "name": "Tarefa disparada", "description": "Uma tarefa foi disparada por um gatilho." },
+    "111": { "name": "Tarefa finalizada inesperada", "description": "Uma tarefa foi finalizada inesperadamente." },
+    "118": { "name": "Tarefa disparada pelo computador", "description": "Tarefa iniciada por evento do sistema." },
+    "119": { "name": "Tarefa disparada pelo usuário", "description": "Tarefa iniciada manualmente por um usuário." },
+    "140": { "name": "Tarefa atualizada", "description": "O registro de uma tarefa foi atualizado." },
+    "141": { "name": "Tarefa excluída", "description": "O registro de uma tarefa foi excluído." },
+    "142": { "name": "Tarefa desabilitada", "description": "Uma tarefa foi desabilitada." },
+    "200": { "name": "Ação iniciada", "description": "A ação definida na tarefa começou a executar." },
+    "201": { "name": "Ação concluída", "description": "A ação da tarefa terminou com código de retorno." },
+    "202": { "name": "Ação falhou", "description": "A ação da tarefa não pôde ser concluída." }
+  },
+  "Microsoft-Windows-WindowsUpdateClient": {
+    "1": { "name": "Busca de atualizações", "description": "O Windows Update iniciou uma verificação de atualizações." },
+    "4": { "name": "Download iniciado", "description": "O download de atualizações foi iniciado." },
+    "19": { "name": "Atualização instalada", "description": "Uma atualização do Windows foi instalada com sucesso." },
+    "20": { "name": "Falha ao instalar atualização", "description": "A instalação de uma atualização do Windows falhou." },
+    "25": { "name": "Atualizações encontradas", "description": "A verificação encontrou atualizações disponíveis." },
+    "43": { "name": "Atualização baixada", "description": "Uma atualização foi baixada e está pronta para instalar." },
+    "44": { "name": "Download concluído", "description": "O download das atualizações foi concluído." }
+  },
+  "Microsoft-Windows-Bits-Client": {
+    "3": { "name": "Transferência criada", "description": "Um trabalho de transferência BITS foi criado." },
+    "4": { "name": "Transferência concluída", "description": "Um trabalho de transferência BITS terminou de baixar." },
+    "5": { "name": "Transferência com erro", "description": "Um trabalho de transferência BITS encontrou um erro." },
+    "59": { "name": "Transferência iniciada", "description": "Um trabalho BITS começou a transferir arquivos." },
+    "60": { "name": "Transferência interrompida", "description": "Um trabalho BITS parou de transferir arquivos." }
+  },
+  "Microsoft-Windows-DistributedCOM": {
+    "10010": { "name": "Servidor COM não respondeu", "description": "Um servidor COM não se registrou dentro do tempo limite." },
+    "10015": { "name": "Acesso COM negado", "description": "Permissão insuficiente para ativar um servidor COM." },
+    "10016": { "name": "Permissão COM negada", "description": "Configuração de permissões impediu a ativação de um componente COM." }
+  },
+  "Disk": {
+    "7": { "name": "Bloco defeituoso", "description": "O disco rígido tem um bloco defeituoso — sinal de falha iminente." },
+    "11": { "name": "Erro de controladora", "description": "O driver detectou erro na controladora de disco." },
+    "51": { "name": "Erro de paginação", "description": "Erro no disco durante uma operação de paginação de memória." },
+    "153": { "name": "Tentativa de E/S repetida", "description": "Uma operação de E/S no disco precisou ser repetida — possível problema de disco." }
+  },
+  "Ntfs": {
+    "55": { "name": "Corrupção no volume", "description": "Estrutura do sistema de arquivos corrompida — execute chkdsk." },
+    "98": { "name": "Volume desmontado", "description": "Um volume NTFS foi desmontado." },
+    "140": { "name": "Transação falhou", "description": "Falha ao gravar dados em uma transação do NTFS." }
+  },
+  "volmgr": {
+    "46": { "name": "Despejo de memória falhou", "description": "Não foi possível criar o arquivo de despejo de memória após falha." },
+    "161": { "name": "Despejo criado", "description": "Um despejo de memória foi criado após falha do sistema." },
+    "162": { "name": "Despejo apagado", "description": "O despejo de memória foi excluído por falta de espaço." }
+  },
+  "Microsoft-Windows-WHEA-Logger": {
+    "1": { "name": "Erro fatal de hardware", "description": "Erro de hardware irrecuperável detectado — causa comum de telas azuis." },
+    "17": { "name": "Erros de hardware corrigidos", "description": "Muitos erros de hardware corrigidos — possível componente degradando." },
+    "18": { "name": "Erro de hardware corrigido", "description": "Um erro de hardware foi corrigido pelo sistema." },
+    "19": { "name": "Erro corrigido (cache)", "description": "Erro corrigido reportado pela CPU/chipset." },
+    "47": { "name": "Erros repetidos de hardware", "description": "Erros de hardware recorrentes sem recuperação — investigue componente." }
+  },
+  "Microsoft-Windows-GroupPolicy": {
+    "1129": { "name": "GPO sem conexão", "description": "Aplicação de política de grupo falhou por falta de conexão com o domínio." },
+    "1085": { "name": "Extensão de GPO falhou", "description": "Uma extensão de política de grupo não pôde ser aplicada." },
+    "4016": { "name": "Extensão de GPO iniciada", "description": "O processamento de uma extensão de política começou." },
+    "5016": { "name": "Extensão de GPO concluída", "description": "O processamento de uma extensão de política terminou com êxito." },
+    "5017": { "name": "Extensão de GPO concluída (aviso)", "description": "Extensão de política processada com avisos." },
+    "7016": { "name": "Extensão de GPO com erro", "description": "Extensão de política concluída com erros." },
+    "7017": { "name": "Extensão de GPO falhou", "description": "O processamento de uma extensão de política falhou." }
+  },
+  "Microsoft-Windows-Time-Service": {
+    "35": { "name": "Horário sincronizado", "description": "O relógio foi sincronizado com o servidor NTP." },
+    "36": { "name": "Sincronização falhou", "description": "Não foi possível sincronizar o relógio com o servidor NTP." },
+    "37": { "name": "NTP alcançado", "description": "O servidor NTP voltou a responder." },
+    "129": { "name": "Servidor NTP indisponível", "description": "Servidor de horário não respondeu — usando relógio local." },
+    "142": { "name": "Relógio fora de sincronia", "description": "O serviço de horário parou de anunciar como fonte confiável." }
+  },
+  "Netlogon": {
+    "5719": { "name": "Domínio indisponível", "description": "Não foi possível contactar um controlador de domínio." },
+    "5722": { "name": "Canal seguro falhou", "description": "A autenticação do canal seguro com o domínio falhou." },
+    "5783": { "name": "Erro RPC no domínio", "description": "Erros de RPC ao contatar o controlador de domínio." }
+  },
+  "LsaSrv": {
+    "40960": { "name": "Erro de autenticação", "description": "Erro no subsistema de segurança ao autenticar — verifique canal seguro." },
+    "40961": { "name": "Canal seguro não restaurado", "description": "Não foi possível restabelecer o canal seguro com o domínio." }
+  },
+  "Schannel": {
+    "36871": { "name": "Erro TLS interno", "description": "Erro fatal ao criar credencial TLS de cliente/servidor." },
+    "36874": { "name": "Handshake TLS falhou", "description": "Falha no handshake TLS — certificado ou protocolo incompatível." },
+    "36876": { "name": "Certificado remoto inválido", "description": "O certificado do servidor remoto não pôde ser validado." },
+    "36887": { "name": "Alerta fatal TLS recebido", "description": "Um alerta fatal foi recebido do ponto remoto durante a conexão TLS." },
+    "36888": { "name": "Alerta fatal TLS enviado", "description": "Um alerta fatal foi gerado ao estabelecer conexão TLS." }
+  },
+  "Microsoft-Windows-Security-Kerberos": {
+    "3": { "name": "Erro Kerberos", "description": "Erro Kerberos ao validar ticket — verifique relógio e SPNs." },
+    "4": { "name": "Erro Kerberos (cripto)", "description": "Erro de criptografia Kerberos — possível SPN duplicado ou senha dessincronizada." },
+    "5": { "name": "Erro Kerberos recebido", "description": "Um erro Kerberos foi recebido do controlador de domínio." },
+    "100": { "name": "Credencial Kerberos renovada", "description": "Uma credencial Kerberos foi renovada." },
+    "101": { "name": "Credencial Kerberos removida", "description": "Uma credencial Kerberos foi removida do cache." }
+  },
+  "Microsoft-Windows-TerminalServices-LocalSessionManager": {
+    "21": { "name": "Logon RDP", "description": "Uma sessão de área de trabalho remota fez logon com sucesso." },
+    "22": { "name": "Shell RDP iniciado", "description": "O shell da sessão remota foi iniciado." },
+    "23": { "name": "Logoff RDP", "description": "Uma sessão remota fez logoff." },
+    "24": { "name": "Sessão RDP desconectada", "description": "Uma sessão remota foi desconectada." },
+    "25": { "name": "Sessão RDP reconectada", "description": "Uma sessão remota foi reconectada." },
+    "39": { "name": "Sessão desconectada por usuário", "description": "Uma sessão foi desconectada por outra sessão de usuário." },
+    "40": { "name": "Sessão desconectada com erro", "description": "Uma sessão foi desconectada devido a um erro." }
+  },
+  "Microsoft-Windows-Windows Defender": {
+    "1006": { "name": "Malware detectado", "description": "O Defender encontrou malware ou software potencialmente indesejado." },
+    "1007": { "name": "Ação de proteção executada", "description": "O Defender executou ação (quarentena/remoção) contra uma ameaça." },
+    "1008": { "name": "Ação de proteção falhou", "description": "O Defender encontrou uma ameaça mas a ação corretiva falhou." },
+    "1009": { "name": "Item restaurado", "description": "O Defender restaurou um item da quarentena." },
+    "1013": { "name": "Histórico de detecções", "description": "Resumo de itens detectados pelo Defender." },
+    "1116": { "name": "Malware detectado", "description": "O Defender detectou malware ou software potencialmente indesejado." },
+    "1117": { "name": "Ameaça remediada", "description": "O Defender executou ação de remediação contra uma ameaça." },
+    "1118": { "name": "Remediação falhou", "description": "A remediação de uma ameaça pelo Defender falhou." },
+    "1119": { "name": "Erro crítico do Defender", "description": "O Defender encontrou um erro crítico durante a proteção." },
+    "5001": { "name": "Proteção em tempo real desligada", "description": "A proteção em tempo real do Defender foi desabilitada." },
+    "5007": { "name": "Configuração do Defender alterada", "description": "Uma configuração do Defender foi modificada." },
+    "5010": { "name": "Verificação desligada", "description": "A verificação de spyware/PUA foi desabilitada." }
+  },
+  "Microsoft-Windows-Windows Firewall With Advanced Security": {
+    "2003": { "name": "Regra de firewall alterada", "description": "Uma regra do Firewall do Windows foi modificada." },
+    "2004": { "name": "Regra de firewall criada", "description": "Uma regra foi adicionada ao Firewall do Windows." },
+    "2005": { "name": "Regra de firewall excluída", "description": "Uma regra do Firewall do Windows foi excluída." },
+    "2006": { "name": "Regra de firewall não aplicada", "description": "Uma regra não pôde ser carregada pelo Firewall." }
+  },
+  "Microsoft-Windows-PowerShell": {
+    "400": { "name": "Motor PowerShell iniciado", "description": "O estado do motor do PowerShell mudou para disponível." },
+    "403": { "name": "Motor PowerShell parado", "description": "O estado do motor do PowerShell mudou para parado." },
+    "600": { "name": "Provedor PowerShell iniciado", "description": "Um provedor do PowerShell foi iniciado." },
+    "4103": { "name": "Comando executado", "description": "Um comando do PowerShell foi executado (log de módulo)." },
+    "4104": { "name": "Script executado", "description": "Um bloco de script do PowerShell foi executado — útil para auditoria." }
+  },
+  "Microsoft-Windows-WinRM": {
+    "91": { "name": "Sessão WinRM criada", "description": "Uma sessão de gerenciamento remoto foi criada." },
+    "132": { "name": "Requisição WinRM recebida", "description": "O serviço WinRM recebeu uma requisição de gerenciamento." },
+    "142": { "name": "Operação WinRM negada", "description": "Uma operação do WinRM foi negada." },
+    "168": { "name": "Autenticação WinRM falhou", "description": "Falha de autenticação em uma conexão WinRM." }
+  },
+  "volsnap": {
+    "33": { "name": "Cópia de sombra removida", "description": "Cópias de sombra antigas foram excluídas por falta de espaço." },
+    "35": { "name": "Cópia de sombra abortada", "description": "Uma cópia de sombra foi abortada por limite de tempo ou espaço." },
+    "36": { "name": "Cópia de sombra perdida", "description": "Cópias de sombra foram excluídas porque o armazenamento de diferenças encheu." }
+  },
+  "VSS": {
+    "8193": { "name": "Erro do VSS", "description": "Erro no serviço de Cópia de Sombra de Volume — backups podem falhar." },
+    "12293": { "name": "Erro ao chamar rotina VSS", "description": "Erro ao executar rotina do VSS — verifique writers de backup." }
+  },
+  "Microsoft-Windows-PrintService": {
+    "307": { "name": "Documento impresso", "description": "Um documento foi enviado à impressora com sucesso." },
+    "312": { "name": "Impressão excluída", "description": "Um documento foi removido da fila de impressão." },
+    "808": { "name": "Falha ao imprimir", "description": "O spooler falhou ao processar um trabalho de impressão." }
+  },
+  "Microsoft-Windows-User Profiles Service": {
+    "1509": { "name": "Perfil não copiado", "description": "Parte do perfil do usuário não pôde ser copiada — possível perfil temporário." },
+    "1511": { "name": "Perfil temporário", "description": "O usuário foi conectado com um perfil temporário." },
+    "1515": { "name": "Perfil com backup", "description": "O perfil foi restaurado a partir de um backup." },
+    "1530": { "name": "Registro em uso no logoff", "description": "Arquivos do registro do usuário ainda estavam em uso durante o logoff." }
+  },
+  "Microsoft-Windows-WLAN-AutoConfig": {
+    "8001": { "name": "Wi-Fi conectado", "description": "Conectado com sucesso a uma rede sem fio." },
+    "8002": { "name": "Wi-Fi desconectado", "description": "Desconectado de uma rede sem fio." },
+    "8003": { "name": "Falha na conexão Wi-Fi", "description": "Falha ao conectar em uma rede sem fio." },
+    "11001": { "name": "Associação Wi-Fi iniciada", "description": "Iniciada a associação a um ponto de acesso sem fio." },
+    "11004": { "name": "Associação Wi-Fi falhou", "description": "A associação à rede sem fio falhou." },
+    "11005": { "name": "Autenticação Wi-Fi falhou", "description": "A autenticação na rede sem fio falhou — verifique senha/certificado." },
+    "11006": { "name": "Wi-Fi conectado", "description": "A conexão sem fio foi estabelecida com sucesso." },
+    "11010": { "name": "Sem resposta do ponto de acesso", "description": "O ponto de acesso não respondeu durante a conexão." }
+  },
+  "Microsoft-Windows-Dhcp-Client": {
+    "1001": { "name": "IP atribuído", "description": "Um endereço IP foi atribuído à interface de rede pelo DHCP." },
+    "1003": { "name": "Renovação de IP pendente", "description": "A renovação do endereço IP está pendente." },
+    "50036": { "name": "Erro no DHCP", "description": "Erro de comunicação com o servidor DHCP." },
+    "50037": { "name": "DHCP sem resposta", "description": "O servidor DHCP não respondeu — IP pode ter sido perdido." }
+  },
+  "Microsoft-Windows-DNS-Client": {
+    "1014": { "name": "Resolução de DNS falhou", "description": "Não foi possível resolver um nome — servidores DNS não responderam." }
+  },
+  "Tcpip": {
+    "4201": { "name": "Interface de rede ativa", "description": "Uma interface de rede foi ativada." },
+    "4202": { "name": "Interface de rede desativada", "description": "Uma interface de rede foi desativada." }
+  },
+  "Netbt": {
+    "4311": { "name": "Conflito de nome NetBIOS", "description": "Outro computador na rede reivindicou o mesmo nome NetBIOS." },
+    "4319": { "name": "Nome duplicado na rede", "description": "Foi detectado um nome duplicado na rede TCP/IP." }
+  },
+  "Microsoft-Windows-Security-SPP": {
+    "902": { "name": "Licença em avaliação", "description": "O período de avaliação da licença do Windows está ativo." },
+    "903": { "name": "Licença notificada", "description": "Notificação sobre o estado de ativação da licença." },
+    "1003": { "name": "Licença adquirida", "description": "A licença foi adquirida/ativada com sucesso." },
+    "8198": { "name": "Ativação agendada", "description": "A tarefa de ativação da licença foi executada." },
+    "8200": { "name": "Licença alterada", "description": "O estado da licença do produto foi alterado." },
+    "16384": { "name": "Verificação de licença", "description": "A verificação agendada do estado da licença foi executada." }
+  },
+  "Microsoft-Windows-Kernel-EventTracing": {
+    "2": { "name": "Sessão de rastreio iniciada", "description": "Uma sessão de rastreio de eventos (ETW) foi iniciada." },
+    "3": { "name": "Sessão de rastreio parada", "description": "Uma sessão de rastreio de eventos (ETW) foi encerrada." },
+    "4": { "name": "Erro no arquivo de rastreio", "description": "O arquivo de log de uma sessão ETW atingiu o tamanho máximo." }
+  },
+  "Microsoft-Windows-DriverFrameworks-UserMode": {
+    "10100": { "name": "Driver carregado", "description": "Um driver de modo de usuário foi carregado." },
+    "10110": { "name": "Problema com dispositivo", "description": "Um dispositivo apresentou problema — driver pode ser reiniciado." },
+    "10111": { "name": "Dispositivo offline", "description": "Um dispositivo ficou offline por problema no driver." }
+  }
+}

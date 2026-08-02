@@ -1,0 +1,8 @@
+Jan 31 08:00:01 srv-app-01 sshd[2211]: Accepted password for felip from 192.168.1.50 port 51122 ssh2
+Jan 31 08:01:15 srv-app-01 systemd[1]: Started Daily apt download activities.
+Jan 31 08:02:30 srv-app-01 sshd[2211]: pam_unix(sshd:session): session closed for user felip
+Jan 31 08:03:44 srv-db-01 postgres[992]: ERROR: relation "pagamentos" does not exist at character 15
+Jan 31 08:04:02 srv-db-01 postgres[992]: WARNING: there is no transaction in progress
+Jan 31 08:05:56 srv-app-01 kernel: [12345.678901] EXT4-fs (sda1): mounted filesystem with ordered data mode
+Jan 31 08:07:12 srv-app-01 cron[1050]: (root) CMD (run-parts /etc/cron.hourly)
+Jan 31 08:10:00 srv-app-01 sshd[2309]: Failed password for invalid user admin from 45.90.12.3 port 61022 ssh2

@@ -1,0 +1,8 @@
+192.168.1.10 - - [31/Jan/2024:08:00:01 -0300] "GET /api/usuarios HTTP/1.1" 200 1234 "-" "Mozilla/5.0"
+192.168.1.11 - admin [31/Jan/2024:08:01:15 -0300] "POST /api/login HTTP/1.1" 401 89 "https://app.exemplo.com/login" "curl/8.0"
+10.0.0.5 - - [31/Jan/2024:08:02:30 -0300] "GET /static/logo.png HTTP/1.1" 304 0 "-" "Mozilla/5.0"
+192.168.1.10 - - [31/Jan/2024:08:03:44 -0300] "GET /api/pedidos/9182 HTTP/1.1" 500 512 "-" "Mozilla/5.0"
+192.168.1.12 - - [31/Jan/2024:08:04:02 -0300] "GET /api/pedidos HTTP/1.1" 200 4521 "-" "PostmanRuntime/7.32"
+10.0.0.8 - - [31/Jan/2024:08:05:56 -0300] "DELETE /api/usuarios/77 HTTP/1.1" 403 201 "-" "python-requests/2.31"
+192.168.1.10 - - [31/Jan/2024:08:07:12 -0300] "GET /api/health HTTP/1.1" 200 15 "-" "kube-probe/1.28"
+192.168.1.15 - - [31/Jan/2024:08:10:00 -0300] "GET /api/relatorios HTTP/1.1" 404 340 "-" "Mozilla/5.0"

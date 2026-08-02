@@ -1,0 +1,15 @@
+{
+  "name": "loginsight",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "prepare:frontend": "node scripts/prepare-frontend.mjs",
+    "dev": "npm run prepare:frontend && tauri dev",
+    "build": "npm run prepare:frontend && tauri build",
+    "icon": "tauri icon"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

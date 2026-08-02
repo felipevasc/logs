@@ -1,0 +1,6 @@
+CEF:0|Fortinet|FortiGate|7.2.4|000123|SSH login failed|8|src=45.90.12.3 dst=10.0.0.1 spt=61022 dpt=22 act=blocked msg=Failed password for admin
+CEF:0|Fortinet|FortiGate|7.2.4|000124|Connection allowed|3|src=192.168.1.10 dst=10.0.0.1 spt=51100 dpt=443 act=allowed
+CEF:0|CrowdStrike|Falcon|6.58|CS-9921|Suspicious process execution|9|src=10.0.0.15 suser=felip fname=powershell.exe msg=Encoded command detected
+CEF:0|Fortinet|FortiGate|7.2.4|000125|Port scan detected|7|src=103.77.2.8 dst=10.0.0.1 act=blocked msg=TCP SYN scan from external host
+CEF:0|PaloAlto|PAN-OS|11.0|THRT-4410|DNS tunneling suspicion|6|src=10.0.0.22 dst=8.8.8.8 proto=udp dpt=53 msg=Long TXT query sequence
+CEF:0|Fortinet|FortiGate|7.2.4|000124|Connection allowed|3|src=192.168.1.11 dst=10.0.0.2 spt=52210 dpt=443 act=allowed
