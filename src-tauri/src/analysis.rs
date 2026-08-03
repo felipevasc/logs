@@ -226,7 +226,7 @@ pub fn profile_fields(events: &[Event], columns: &[String]) -> Vec<FieldProfile>
 
 // ------------------------------------------------------------------ séries
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 pub struct SeriesSpec {
     pub chart: String, // "time" | "terms"
     pub metric: String, // count | sum | avg | min | max | distinct
@@ -503,7 +503,7 @@ pub fn compute_series(events: &[Event], spec: &SeriesSpec) -> SeriesResult {
 
 // ------------------------------------------------------------------ pivô OLAP
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 pub struct PivotSpec {
     pub rows: Vec<String>,
     pub cols: Vec<String>,

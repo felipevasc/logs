@@ -234,6 +234,12 @@ window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
   setWorkbar(payload.phase || "Processando", volume, progress, !!payload.cancellable);
 }).catch(() => {});
 
+// live-refresh quando uma tool MCP muta o estado do backend
+window.__TAURI__.event?.listen("mcp-state-changed", ({ payload }) => {
+  if (!payload?.kind) return;
+  handleMcpStateChanged(payload.kind).catch(() => {});
+}).catch(() => {});
+
 function artifactIdFromSource(source) {
   if (source.kind === "file") return `file:${(source.paths?.length ? source.paths : [source.path]).join("+")}`;
   return `eventlog:${source.channel}`;
@@ -477,13 +483,92 @@ function toast(msg, type = "info") {
   setTimeout(() => t.remove(), 4200);
 }
 
+// ------------------------------------------------------------------ indicador global
+// Qualquer invoke não-silent que demore mais que ~320ms acende um spinner discreto
+// na topbar; chamadas silent (tree_aggs, profile_fields de fundo, cases_save…) são
+// tratadas como bastidor e nunca acendem o indicador.
+const activity = { count: 0, timer: null };
+const ACTIVITY_DELAY = 320;
+
+function activityShow() {
+  const ind = $("#activity-indicator");
+  if (!ind) return;
+  ind.hidden = false;
+  requestAnimationFrame(() => ind.classList.add("show"));
+}
+
+function activityHide() {
+  const ind = $("#activity-indicator");
+  if (!ind) return;
+  ind.classList.remove("show");
+  setTimeout(() => { if (!activity.count) ind.hidden = true; }, 180);
+}
+
 async function api(cmd, args = {}, opts = {}) {
+  const track = !opts.silent;
+  if (track) {
+    activity.count++;
+    if (activity.count === 1) activity.timer = setTimeout(activityShow, ACTIVITY_DELAY);
+  }
   try {
     return await invoke(cmd, args);
   } catch (e) {
     if (!opts.silent) toast(String(e), "err");
     throw e;
+  } finally {
+    if (track) {
+      activity.count--;
+      if (activity.count === 0) {
+        clearTimeout(activity.timer);
+        activity.timer = null;
+        activityHide();
+      }
+    }
   }
+}
+
+// ------------------------------------------------------------------ helpers de espera
+// botão em estado "trabalhando": desabilita e mostra spinner; o retorno restaura
+function btnBusy(btn, text) {
+  if (!btn) return () => {};
+  const prev = { html: btn.innerHTML, disabled: btn.disabled };
+  btn.disabled = true;
+  btn.innerHTML = `<i class="fas fa-circle-notch spin"></i> ${esc(text)}`;
+  return () => { btn.disabled = prev.disabled; btn.innerHTML = prev.html; };
+}
+
+// overlay de espera sobre uma área; aparece só se a operação passar de ~250ms
+function areaLoading(container, text = "Consultando…") {
+  if (!container) return { done() {} };
+  let ov = null;
+  const timer = setTimeout(() => {
+    ov = el("div", "area-loading");
+    ov.innerHTML = `<i class="fas fa-circle-notch spin"></i><span>${esc(text)}</span>`;
+    container.appendChild(ov);
+    requestAnimationFrame(() => ov?.classList.add("show"));
+  }, 250);
+  return {
+    done() {
+      clearTimeout(timer);
+      if (!ov) return;
+      ov.classList.remove("show");
+      const elRef = ov;
+      ov = null;
+      setTimeout(() => elRef.remove(), 160);
+    },
+  };
+}
+
+// spinner discreto no título "Explorar" enquanto as contagens da árvore são recalculadas
+function treeSpin(on) {
+  document.querySelectorAll(".explore-block .side-title").forEach((title) => {
+    title.querySelector(".tree-spin")?.remove();
+    if (on) {
+      const s = el("span", "tree-spin");
+      s.innerHTML = '<i class="fas fa-circle-notch spin"></i>';
+      title.appendChild(s);
+    }
+  });
 }
 
 function fmtTs(ms) {
@@ -1211,6 +1296,8 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
     return;
   }
   const version = ++treeAggVersion[scope];
+  const spinTimer = setTimeout(() => treeSpin(true), 250);
+  const spinDone = () => { clearTimeout(spinTimer); treeSpin(false); };
   let res;
   try {
     res = await api("tree_aggs", {
@@ -1218,7 +1305,8 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
       filters,
       ...(scope === "case" ? { caseEvents: caseEvents() } : {}),
     }, { silent: true });
-  } catch { return; }
+  } catch { spinDone(); return; }
+  spinDone();
   if (version !== treeAggVersion[scope]) return;
   const map = {};
   for (const [col, agg] of res || []) {
@@ -1425,6 +1513,10 @@ async function refresh() {
   if (!state.loaded) return;
   const filters = backendFilters();
   const version = ++state.refreshVersion;
+  // evita cliques duplos na paginação enquanto a consulta está no ar
+  $("#pg-prev").disabled = true;
+  $("#pg-next").disabled = true;
+  const loading = areaLoading($("#tab-table"), "Consultando…");
   startOperation("explore", "Atualizando exploração", "Lendo eventos e calculando recortes");
   let snapshot;
   try {
@@ -1436,10 +1528,17 @@ async function refresh() {
       limit: state.pageSize,
     });
   } catch (e) {
-    if (version === state.refreshVersion) finishOperation("Falha ao atualizar", String(e));
+    loading.done();
+    if (version === state.refreshVersion) {
+      // devolve os botões da paginação ao estado correto
+      const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
+      $("#pg-prev").disabled = state.page === 0;
+      $("#pg-next").disabled = state.page >= pages - 1;
+      finishOperation("Falha ao atualizar", String(e));
+    }
     return;
   }
-  if (version !== state.refreshVersion) return;
+  if (version !== state.refreshVersion) { loading.done(); return; }
   const { query: qr, stats, sources: srcAgg, codes: codeAgg } = snapshot;
   state.total = qr.total;
   state.rows = qr.rows;
@@ -1467,6 +1566,7 @@ async function refresh() {
   if (state.activeDatasetTab === "dashboard") renderDashboard("dataset");
   else if (state.activeDatasetTab === "cube") runCube();
   else if (state.activeDatasetTab === "group") runGroup();
+  loading.done();
   finishOperation("Exploração atualizada", `${fmtNum(qr.total)} eventos no recorte atual`);
 }
 
@@ -1821,6 +1921,7 @@ async function applyTsConfig() {
   if (!paths.length) { toast("Carregue um arquivo primeiro.", "info"); return; }
   const cfg = buildTsConfig();
   const empty = cfg.sources.length === 0 || !cfg.format;
+  const done = btnBusy($("#ts-apply"), "Aplicando…");
   // status detalhado: passos + progresso por linha + resultado
   showLoadOverlay("Aplicando configuração de data/hora");
   try {
@@ -1834,6 +1935,8 @@ async function applyTsConfig() {
   } catch (e) {
     hideLoadOverlay(false);
     toast(`Falha ao aplicar data/hora: ${e}`, "err");
+  } finally {
+    done();
   }
 }
 
@@ -4003,8 +4106,24 @@ function currentIndex() {
 }
 
 async function openDetail(id) {
+  showDetailLoading();
   const ev = await api("event_detail", { id });
   if (ev) showDetail(ev);
+}
+
+// abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
+function showDetailLoading() {
+  $("#drawer-badges").innerHTML = "";
+  const wait = el("div", "loading-inline drawer-loading");
+  wait.innerHTML = '<i class="fas fa-circle-notch spin"></i> Carregando…';
+  $("#pane-overview").innerHTML = "";
+  $("#pane-overview").appendChild(wait);
+  $("#pane-json").hidden = true;
+  $("#pane-raw").hidden = true;
+  $("#drawer").hidden = false;
+  $("#drawer-scrim").hidden = false;
+  $("#btn-right-inspect").classList.add("active");
+  switchDetailTab("overview");
 }
 
 function openContextInspector(title, subtitle, overview) {
@@ -4221,6 +4340,7 @@ function renderAggs() {
 async function runGroup() {
   if (!state.loaded) { toast("Carregue uma fonte de dados primeiro.", "info"); return; }
   startOperation("group", "Calculando agrupamento", `Agrupando por ${colLabel(state.groupCol)}`);
+  const loading = areaLoading($("#tab-group"), "Agrupando…");
   let res;
   try {
     res = await api("aggregate_events", {
@@ -4229,9 +4349,11 @@ async function runGroup() {
       filters: backendFilters(),
     });
   } catch (error) {
+    loading.done();
     finishOperation("Falha ao agrupar", String(error));
     return;
   }
+  loading.done();
 
   const thead = $("#group-table thead");
   const tbody = $("#group-table tbody");
@@ -4479,6 +4601,304 @@ async function saveCodes() {
   } catch { /* toast de erro já exibido */ }
 }
 
+// ------------------------------------------------------------------ configurações / MCP
+// tools que alteram o estado do app (exibem o selo "altera dados" na aba MCP)
+const MCP_MUTATING_TOOLS = new Set([
+  "load_file", "load_files", "load_event_log", "clear_events",
+  "save_custom_format", "set_ts_config",
+  "save_derived_field", "delete_derived_field",
+  "save_codes", "harvest_codes", "cases_save",
+]);
+const MCP_CATEGORY_ORDER = [
+  "Fontes", "Consulta", "Análise", "Formatos", "Data/Hora",
+  "Campos derivados", "Códigos", "Casos", "Outros",
+];
+
+function mcpToolCategory(name) {
+  if (/^(load_|clear_events|source_summary)/.test(name)) return "Fontes";
+  if (/format/.test(name)) return "Formatos";
+  if (/ts_config|timestamp/.test(name)) return "Data/Hora";
+  if (/derived/.test(name)) return "Campos derivados";
+  if (/code|harvest/.test(name)) return "Códigos";
+  if (/^cases?_/.test(name)) return "Casos";
+  if (/^(query|count|event_detail|stats|explore|trail|list_channels)/.test(name)) return "Consulta";
+  if (/^(aggregate|profile|compute|pivot|tree)/.test(name)) return "Análise";
+  return "Outros";
+}
+
+function copyTextButton(text, label = "Copiar") {
+  const btn = el("button", "icon-btn");
+  btn.type = "button";
+  btn.title = label;
+  btn.innerHTML = '<i class="fas fa-copy"></i>';
+  btn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast("Copiado.", "ok");
+    } catch (e) {
+      toast(`Não foi possível copiar: ${e}`, "err");
+    }
+  };
+  return btn;
+}
+
+function mcpSnippet(title, code) {
+  const box = el("div", "mcp-snippet");
+  const head = el("div", "mcp-snippet-head");
+  head.appendChild(el("span", "", title));
+  head.appendChild(copyTextButton(code));
+  box.appendChild(head);
+  box.appendChild(el("pre", "", code));
+  return box;
+}
+
+function switchSettingsTab(tab) {
+  document.querySelectorAll("#settings-modal .settings-tab").forEach((b) =>
+    b.classList.toggle("active", b.dataset.settingsTab === tab));
+  document.querySelectorAll("#settings-modal .settings-pane").forEach((p) => {
+    p.hidden = p.id !== `settings-pane-${tab}`;
+  });
+}
+
+async function openSettings(tab = "mcp") {
+  $("#settings-modal").hidden = false;
+  switchSettingsTab(tab);
+  if (tab === "mcp") await renderMcpPane();
+}
+
+async function renderMcpPane() {
+  const pane = $("#settings-pane-mcp");
+  pane.innerHTML = "";
+  let status = null;
+  try { status = await api("mcp_status", {}, { silent: true }); } catch { status = null; }
+  if (!status) {
+    pane.appendChild(el("p", "muted small",
+      "Não foi possível consultar o status do servidor MCP nesta versão do aplicativo."));
+    return;
+  }
+
+  // ---- status
+  const box = el("div", "mcp-status");
+  const rowStatus = el("div", "mcp-status-row");
+  rowStatus.appendChild(el("i", "fas fa-server"));
+  if (status.running) {
+    rowStatus.appendChild(el("span", "mcp-badge on", "Servidor ativo"));
+  } else {
+    rowStatus.appendChild(el("span", "mcp-badge off", status.enabled ? "Servidor parado" : "Servidor desativado"));
+  }
+  if (status.running && status.port) rowStatus.appendChild(el("span", "muted small", `porta ${status.port}`));
+  box.appendChild(rowStatus);
+
+  if (status.running && status.url) {
+    const rowUrl = el("div", "mcp-status-row");
+    rowUrl.appendChild(el("span", "mcp-mono", status.url));
+    rowUrl.appendChild(copyTextButton(status.url, "Copiar URL"));
+    box.appendChild(rowUrl);
+  }
+  if (!status.enabled) {
+    box.appendChild(el("p", "mcp-note",
+      "Servidor MCP desativado — edite o mcp.json definindo \"enabled\": true e reinicie o aplicativo."));
+  } else if (!status.running) {
+    box.appendChild(el("p", "mcp-note",
+      "O MCP está habilitado, mas o servidor não está em execução — reinicie o aplicativo."));
+  } else {
+    box.appendChild(el("p", "mcp-note",
+      "O LogInsight precisa estar aberto para o MCP funcionar: o estado (eventos, casos e configurações) vive no aplicativo."));
+  }
+  pane.appendChild(box);
+
+  pane.appendChild(el("p", "muted small",
+    "MCP (Model Context Protocol) permite que assistentes de IA (VS Code/Copilot, opencode, Claude Code, Cursor) " +
+    "usem o LogInsight como ferramenta: eles enxergam e operam os mesmos dados que você vê na tela — " +
+    "mudanças feitas pela IA aparecem aqui na hora."));
+
+  if (status.enabled) {
+    // ---- como configurar
+    const port = status.port || 39117;
+    const url = status.url || `http://127.0.0.1:${port}/mcp`;
+    const fldConfig = el("div", "fld");
+    fldConfig.appendChild(el("label", "", "Como configurar"));
+    fldConfig.appendChild(mcpSnippet("VS Code (mcp.json)",
+      JSON.stringify({ servers: { loginsight: { type: "http", url } } }, null, 2)));
+    fldConfig.appendChild(mcpSnippet("opencode (opencode.json)",
+      JSON.stringify({ mcp: { loginsight: { type: "remote", url, enabled: true } } }, null, 2)));
+    fldConfig.appendChild(mcpSnippet("Claude Code (terminal)",
+      `claude mcp add --transport http loginsight ${url}`));
+    fldConfig.appendChild(el("p", "muted small",
+      "Outros clientes: qualquer cliente MCP com suporte a HTTP (streamable HTTP) pode apontar direto para a URL acima; " +
+      `clientes só-stdio podem usar uma ponte, ex.: npx mcp-remote ${url}`));
+    const adv = el("div", "mcp-status");
+    const advRow = el("div", "mcp-status-row");
+    advRow.appendChild(el("span", "muted small", "Config avançada:"));
+    advRow.appendChild(el("span", "mcp-mono", status.config_path || "mcp.json"));
+    if (status.config_path) advRow.appendChild(copyTextButton(status.config_path, "Copiar caminho"));
+    adv.appendChild(advRow);
+    adv.appendChild(el("p", "mcp-note",
+      'Conteúdo: {"enabled": true, "port": 39117} — alterações no mcp.json só valem após reiniciar o aplicativo.'));
+    fldConfig.appendChild(adv);
+    pane.appendChild(fldConfig);
+
+    // ---- ferramentas
+    const tools = Array.isArray(status.tools) ? status.tools : [];
+    const fldTools = el("div", "fld");
+    fldTools.appendChild(el("label", "", `Ferramentas disponíveis (${tools.length})`));
+    fldTools.appendChild(el("p", "muted small",
+      'As ferramentas com o selo "altera dados" modificam o estado do app — a tela é atualizada automaticamente.'));
+    const groups = new Map();
+    for (const tool of tools) {
+      const cat = mcpToolCategory(tool.name || "");
+      if (!groups.has(cat)) groups.set(cat, []);
+      groups.get(cat).push(tool);
+    }
+    for (const cat of MCP_CATEGORY_ORDER) {
+      const items = groups.get(cat);
+      if (!items?.length) continue;
+      const group = el("div", "mcp-tool-group");
+      group.appendChild(el("div", "mcp-tool-group-title", cat));
+      for (const tool of items) {
+        const row = el("div", "mcp-tool");
+        const head = el("div", "mcp-tool-head");
+        head.appendChild(el("span", "mcp-tool-name", tool.name || ""));
+        if (MCP_MUTATING_TOOLS.has(tool.name)) head.appendChild(el("span", "mcp-tool-badge", "altera dados"));
+        row.appendChild(head);
+        if (tool.description) row.appendChild(el("div", "mcp-tool-desc", tool.description));
+        group.appendChild(row);
+      }
+      fldTools.appendChild(group);
+    }
+    if (!tools.length) fldTools.appendChild(el("p", "muted small", "Nenhuma ferramenta registrada."));
+    pane.appendChild(fldTools);
+  }
+}
+
+// ------------------------------------------------------------------ live-refresh via MCP
+async function handleMcpStateChanged(kind) {
+  if (kind === "source") {
+    await mcpRefreshSource();
+    toast("Fonte de dados atualizada via MCP.", "info");
+    return;
+  }
+  if (kind === "cases") {
+    await mcpReloadCases();
+    toast("Casos atualizados via MCP.", "info");
+    return;
+  }
+  // codes / derived / ts_config / formats: recarrega painéis abertos e reconsulta a view
+  try {
+    if (kind === "codes" && !$("#codes-modal").hidden) {
+      $("#codes-editor").value = await api("get_codes", {}, { silent: true });
+      updateSysCount();
+    } else if (kind === "derived") {
+      await loadDerivedFields();
+    } else if (kind === "ts_config") {
+      if (state.currentArtifact?.kind === "file") await loadTsConfig(state.currentArtifact.path);
+      updateTsExample();
+    } else if (kind === "formats") {
+      await loadFormatOptions();
+    }
+  } catch { /* painel permanece como estava */ }
+  // eventos são re-enriquecidos/re-derivados no backend: reconsulta a view ativa
+  if (state.loaded) {
+    await refresh();
+    api("profile_fields", { filters: [] }, { silent: true })
+      .then((profiles) => { state.datasetProfiles = profiles; renderExploreTree(); })
+      .catch(() => {});
+  }
+  toast("Configurações atualizadas via MCP.", "info");
+}
+
+// a fonte de eventos mudou no backend (load/clear via MCP): refaz o pós-load lógico da UI
+async function mcpRefreshSource() {
+  // resume a fonte atual no backend; fallback: deriva as colunas dos perfis (vazio = fonte limpa)
+  let columns = [];
+  let count = null;
+  let sourceDesc = "";
+  let profiles = null;
+  let summary = null;
+  try { summary = await api("source_summary", {}, { silent: true }); } catch { summary = null; }
+  if (summary && typeof summary.count === "number") {
+    columns = summary.columns || [];
+    count = summary.count;
+    sourceDesc = summary.source_desc || "";
+  } else {
+    try { profiles = (await api("profile_fields", { filters: [] }, { silent: true })) || []; }
+    catch { profiles = []; }
+    columns = profiles.map((p) => p.name);
+    if (!columns.length) count = 0;
+  }
+  if (count === 0) {
+    await clearData();
+    switchView("source");
+    return;
+  }
+  state.columns = columns;
+  state.visibleCols = (state.visibleCols || []).filter((col) => state.columns.includes(col));
+  if (!state.visibleCols.length) {
+    state.visibleCols = ["timestamp", "level", "code", "name", "message"].filter((col) => state.columns.includes(col));
+  }
+  // mesmo recorte limpo de um load manual: filtros e paginação recomeçam
+  state.filters = [];
+  state.quick = "";
+  $("#quick-search").value = "";
+  state.page = 0;
+  state.loaded = true;
+  state.datasetDashboard = null;
+  state.datasetCube = null;
+  state.caseProfiles = {};
+  fillColumnControls();
+  renderChips();
+  $("#btn-merge").disabled = false;
+  // rótulo da fonte carregada pelo MCP (sem registrar no drive do Caso: a spec de origem é externa)
+  if (sourceDesc) {
+    if (state.currentArtifact) {
+      state.currentArtifact.label = sourceDesc;
+      if (count != null) state.currentArtifact.count = count;
+    } else {
+      state.currentArtifact = {
+        id: "mcp:externo",
+        label: sourceDesc,
+        kind: "file",
+        path: "",
+        count: count || 0,
+        loadedAt: Date.now(),
+        source: null,
+      };
+    }
+    state.currentOrigin = sourceDesc;
+  }
+  await refresh();
+  $("#load-status").textContent = `${fmtNum(count ?? state.total)} eventos`;
+  $("#load-status").className = "load-status ok";
+  // perfis dos campos alimentam a árvore de exploração
+  if (profiles) {
+    state.datasetProfiles = profiles;
+    renderExploreTree();
+  } else {
+    api("profile_fields", { filters: [] }, { silent: true })
+      .then((p) => { state.datasetProfiles = p; renderExploreTree(); })
+      .catch(() => {});
+  }
+  updateContextBar();
+  // se a UI estava fora da exploração do artefato, leva o usuário aos dados
+  if (state.activeContext === "artifact" && document.querySelector(".shell").hidden) switchView("viz");
+}
+
+// cases.json mudou fora do app: relê e substitui o estado em memória (sem regravar)
+async function mcpReloadCases() {
+  let loaded = null;
+  try { loaded = await api("cases_load", {}, { silent: true }); } catch { return; }
+  if (!loaded || !Array.isArray(loaded.cases)) return;
+  state.cases = normalizeCaseStore(loaded);
+  // sessões de artefatos foram derivadas do estado anterior dos casos
+  state.artifactSessions = new Map();
+  renderCaseBar();
+  updateAnalysisBadge();
+  if (activeCase()) {
+    restoreCaseWorkspace();
+    await syncActiveCaseArtifacts();
+  }
+}
+
 // ------------------------------------------------------------------ teclado
 function bindKeyboard() {
   document.addEventListener("keydown", (e) => {
@@ -4494,6 +4914,7 @@ function bindKeyboard() {
       $("#col-pop").hidden = true;
       $("#name-pop").hidden = true;
       $("#codes-modal").hidden = true;
+      $("#settings-modal").hidden = true;
       $("#format-modal").hidden = true;
       $("#derive-modal").hidden = true;
       $("#chart-modal").hidden = true;
@@ -4852,6 +5273,15 @@ function bind() {
     if (e.target === $("#codes-modal")) $("#codes-modal").hidden = true;
   });
 
+  $("#btn-settings").onclick = () => openSettings();
+  $("#settings-close").onclick = () => { $("#settings-modal").hidden = true; };
+  $("#settings-modal").addEventListener("click", (e) => {
+    if (e.target === $("#settings-modal")) $("#settings-modal").hidden = true;
+  });
+  document.querySelectorAll("#settings-modal .settings-tab").forEach((b) => {
+    b.onclick = () => switchSettingsTab(b.dataset.settingsTab);
+  });
+
   $("#btn-theme").onclick = toggleTheme;
 
   let resizeTimer;
@@ -5106,7 +5536,9 @@ async function renderDashboard(scope = state.analyticsScope) {
     head.append(edit, del);
     card.appendChild(head);
     const body = el("div", "dash-card-body");
-    body.appendChild(el("span", "muted small", "calculando…"));
+    const wait = el("span", "loading-inline");
+    wait.innerHTML = '<i class="fas fa-circle-notch spin"></i> calculando…';
+    body.appendChild(wait);
     card.appendChild(body);
     grid.appendChild(card);
     tasks.push(renderChartCard(body, spec, scope).catch(() => { body.innerHTML = '<span class="muted small">erro ao calcular</span>'; }));
@@ -5765,6 +6197,7 @@ async function runCube() {
     renderCubeViews();
     return;
   }
+  const loading = areaLoading(document.querySelector(".cube-output"), "Calculando Cubo…");
   try {
     updateOperation("Calculando Cubo", "Agregando dimensões e valores", 58);
     const res = await api("pivot", {
@@ -5781,6 +6214,8 @@ async function runCube() {
     renderCubeViews();
   } catch (error) {
     finishOperation("Falha ao calcular Cubo", String(error));
+  } finally {
+    loading.done();
   }
 }
 

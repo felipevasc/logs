@@ -253,7 +253,7 @@
   // ---------------------------------------------------------------- comandos
   const handlers = {
     list_channels: () => ["Application", "System", "Security"],
-    list_formats: () => [{ id: "auto", name: "Automático (inferir)" }],
+    list_formats: () => [{ id: "auto", name: "Automático (inferir)" }, { id: "wildfly", name: "WildFly" }],
     list_derived_fields: () => derivedFields.map((f) => ({ ...f })),
     delete_derived_field: ({ name }) => {
       const i = derivedFields.findIndex((f) => f.name === name);
@@ -357,7 +357,55 @@
       }
       return null;
     },
-    clear_events: () => null,
+    clear_events: () => { events.length = 0; COLUMNS = []; return null; },
+    source_summary: () => ({
+      count: events.length,
+      columns: events.length ? [...COLUMNS] : [],
+      source_desc: events.length ? loadedParts.join(" + ") : "",
+      source_names: events.length ? [...loadedParts] : [],
+    }),
+    mcp_status: () => ({
+      enabled: true,
+      running: true,
+      port: 39117,
+      url: "http://127.0.0.1:39117/mcp",
+      config_path: "C:\\mock\\LogInsight\\mcp.json",
+      tools: [
+        { name: "load_file", description: "Carrega um arquivo de log como fonte atual (muta estado)" },
+        { name: "load_files", description: "Carrega vários arquivos unidos em uma única fonte (muta estado)" },
+        { name: "load_event_log", description: "Carrega eventos de um canal do Event Log do Windows (muta estado)" },
+        { name: "list_channels", description: "Lista os canais disponíveis do Event Log do Windows" },
+        { name: "clear_events", description: "Descarta a fonte de eventos carregada (muta estado)" },
+        { name: "source_summary", description: "Resumo da fonte carregada: contagem, colunas e descrição" },
+        { name: "query_events", description: "Consulta eventos com filtros, ordenação e paginação" },
+        { name: "event_detail", description: "Retorna um evento completo pelo id (inclui a linha bruta)" },
+        { name: "explore_snapshot", description: "Recorte do explorador: linhas, histograma e facetas em uma chamada" },
+        { name: "aggregate_events", description: "Agrega eventos por coluna (count, sum, avg, min, max, ...)" },
+        { name: "trail_events", description: "Trilha temporal em torno de um evento (N antes, N depois)" },
+        { name: "count_filtered", description: "Conta quantos eventos passam nos filtros" },
+        { name: "tree_aggs", description: "Contagens por valor de várias colunas (árvore de exploração)" },
+        { name: "stats_events", description: "Histograma temporal e distribuição por nível" },
+        { name: "profile_fields", description: "Perfil estatístico dos campos do recorte filtrado" },
+        { name: "compute_series", description: "Séries para gráficos: temporal ou ranking de termos" },
+        { name: "pivot", description: "Tabela dinâmica (pivô OLAP) sobre o recorte filtrado" },
+        { name: "list_formats", description: "Lista os formatos de log disponíveis (ids para load_file)" },
+        { name: "save_custom_format", description: "Cria/atualiza um formato customizado (muta estado)" },
+        { name: "test_parse", description: "Testa um formato customizado contra linhas de exemplo" },
+        { name: "get_ts_config", description: "Retorna a config de data/hora salva para um arquivo" },
+        { name: "set_ts_config", description: "Grava/remove config de data/hora e reaplica na fonte (muta estado)" },
+        { name: "test_ts_config", description: "Testa uma config de data/hora nos primeiros eventos" },
+        { name: "list_derived_fields", description: "Lista os campos derivados configurados" },
+        { name: "save_derived_field", description: "Cria/atualiza um campo derivado por regex (muta estado)" },
+        { name: "delete_derived_field", description: "Remove um campo derivado (muta estado)" },
+        { name: "get_codes", description: "Retorna o catálogo de códigos do usuário" },
+        { name: "get_codes_path", description: "Caminho do arquivo codes.json em disco" },
+        { name: "save_codes", description: "Substitui o catálogo de códigos e re-enriquece eventos (muta estado)" },
+        { name: "harvest_codes", description: "Reextrai o catálogo de eventos do sistema operacional (muta estado)" },
+        { name: "system_codes_count", description: "Quantidade de códigos no catálogo extraído do sistema" },
+        { name: "cases_load", description: "Carrega os casos de análise persistidos" },
+        { name: "cases_save", description: "Persiste os casos de análise (muta estado)" },
+      ],
+    }),
     load_file: ({ merge } = {}) => {
       if (merge && !merged) appendFirewallBatch();
       return {
@@ -448,6 +496,12 @@
   const delay = (ms) => new Promise((r) => setTimeout(r, ms));
   const listeners = {};
   const emitMock = (name, payload) => (listeners[name] || []).forEach((cb) => cb({ payload }));
+  // dispara o evento de mudança de estado via MCP (teste do live-refresh):
+  // window.__mockMcpEmit("source" | "cases" | "codes" | "derived" | "ts_config" | "formats")
+  window.__mockMcpEmit = (kind) => {
+    if (kind === "source" && !merged) appendFirewallBatch(); // simula outra fonte carregada via MCP
+    emitMock("mcp-state-changed", { kind });
+  };
   // simula a indexação de um arquivo com progresso granular
   async function simulateLoad(label, total) {
     for (let done = 0; done < total; done += 900) {

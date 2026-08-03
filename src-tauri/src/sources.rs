@@ -355,12 +355,19 @@ fn detect_format(bytes: &[u8]) -> &'static str {
     let mut n = 0usize;
     let (mut json, mut s3164, mut s5424, mut apache, mut fw, mut log4j, mut logfmt, mut wildfly) =
         (0, 0, 0, 0, 0, 0, 0, 0);
+    // linhas de corpo de stacktrace Java contam como evidência de log4j/wildfly
+    // (arquivos com muitos stacktraces teriam poucas linhas de cabeçalho)
+    let mut stack = 0usize;
     let mut csv_hint = false;
     let mut csv_checked = false;
     let mut w3c_hint = false;
     for (li, line_b) in bytes.split(|&b| b == b'\n').take(60).enumerate() {
         let line = std::str::from_utf8(line_b).unwrap_or("").trim();
         if line.is_empty() {
+            continue;
+        }
+        if is_stacktrace_line(line) {
+            stack += 1;
             continue;
         }
         if line.starts_with('#') {
@@ -396,7 +403,7 @@ fn detect_format(bytes: &[u8]) -> &'static str {
             apache += 1;
         } else if re_log4j().is_match(line) {
             log4j += 1;
-        } else if re_wildfly().is_match(line) {
+        } else if re_wildfly().is_match(line) || re_jboss().is_match(line) {
             wildfly += 1;
         } else if re_syslog3164().is_match(line) {
             if line.contains("SRC=") || line.contains("PROTO=") || line.contains("DPT=") {
@@ -426,9 +433,9 @@ fn detect_format(bytes: &[u8]) -> &'static str {
         "apache"
     } else if fw > half {
         "firewall"
-    } else if wildfly > half {
+    } else if wildfly > half || (wildfly > 0 && wildfly + stack > half) {
         "wildfly"
-    } else if log4j > half {
+    } else if log4j > half || (log4j > 0 && log4j + stack > half) {
         "log4j"
     } else if s3164 > half {
         "syslog3164"
@@ -481,33 +488,149 @@ fn re_wildfly() -> &'static regex::Regex {
     })
 }
 
+/// JBoss EAP 7 (com data): `2026-07-08 00:00:00,000 WARN  [br.app.Classe] (thread) mensagem`
+fn re_jboss() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})\s+(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\s+\[([^\]]+)\]\s+\(([^)]*)\)\s+(.*)$").unwrap()
+    })
+}
+
+/// Âncoras genéricas de "início de evento": timestamp no começo da linha.
+/// Usadas quando o arquivo não casa nenhum regex estruturado conhecido.
+fn re_anchor_datetime() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}").unwrap())
+}
+
+fn re_anchor_time() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^\d{2}:\d{2}:\d{2}[,.]\d{3}").unwrap())
+}
+
+fn re_anchor_date() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}\s").unwrap())
+}
+
+/// Aprende o padrão de início de evento do próprio arquivo (formatos Java
+/// multi-linha): tenta os regexes estruturados (log4j, JBoss com data,
+/// WildFly só-hora) e, na falta deles, âncoras genéricas de timestamp no
+/// começo da linha. Um candidato só é aceito se casar >= 2 linhas da
+/// amostra — sem padrão confiável retorna None e cada linha vira um evento
+/// (nunca cola o arquivo inteiro num evento único).
+fn detect_entry_start(bytes: &[u8]) -> Option<regex::Regex> {
+    let sample: Vec<&str> = bytes
+        .split(|&b| b == b'\n')
+        .take(2_000)
+        .filter_map(|l| std::str::from_utf8(l).ok())
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    [
+        re_log4j(),
+        re_jboss(),
+        re_wildfly(),
+        re_anchor_datetime(),
+        re_anchor_time(),
+        re_anchor_date(),
+    ]
+    .into_iter()
+    .find(|re| sample.iter().filter(|line| re.is_match(line)).count() >= 2)
+    .cloned()
+}
+
+
+/// Linha típica de corpo de stacktrace Java (continuação de evento log4j/wildfly).
+/// Recebe a linha já trimada.
+fn is_stacktrace_line(t: &str) -> bool {
+    t.starts_with("at ")
+        || t.starts_with("Caused by:")
+        || t.starts_with("Suppressed:")
+        || (t.starts_with("...") && t.ends_with(" more"))
+}
+
+/// Extrai evidências do corpo multi-linha de um evento Java (stacktrace):
+/// - frames `at ...` viram fields["stacktrace"] (array de strings, sem indentação)
+/// - a primeira linha não-`at` que parece exceção vira fields["exception"]
+///   (cobre "java.lang.X: msg" e "Caused by: java.lang.X: msg")
+fn extract_java_body(ev: &mut Event, body: &str) {
+    if body.is_empty() {
+        return;
+    }
+    let mut frames: Vec<Value> = Vec::new();
+    let mut exception: Option<String> = None;
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("at ") {
+            frames.push(Value::from(t));
+        } else if exception.is_none() && (t.contains("Exception") || t.contains("Error")) {
+            exception = Some(t.to_string());
+        }
+    }
+    if !frames.is_empty() {
+        ev.fields.insert("stacktrace".into(), Value::Array(frames));
+    }
+    if let Some(ex) = exception {
+        ev.fields.insert("exception".into(), Value::from(ex));
+    }
+}
+
 /// WildFly/JBoss: `00:00:00,001 WARN  [br.app.Classe] (EJB default - 4) mensagem`
 /// Só tem hora — a data costuma estar no nome do arquivo (server.log.2026-06-24),
 /// resolvida pela configuração de data/hora (TsConfig).
-fn parse_wildfly(line: &str) -> Option<Event> {
-    let c = re_wildfly().captures(line)?;
+/// `block` pode ser multi-linha (cabeçalho + stacktrace): os campos vêm da
+/// primeira linha; o corpo alimenta `stacktrace`/`exception`; `raw` é o bloco.
+fn parse_wildfly(block: &str) -> Option<Event> {
+    let (head, body) = block.split_once('\n').unwrap_or((block, ""));
+    let c = re_wildfly().captures(head.trim_end_matches('\r'))?;
     let mut ev = Event::empty();
-    ev.raw = line.to_string();
+    ev.raw = block.to_string();
     ev.fields.insert("hora_linha".into(), Value::from(c[1].to_string()));
     ev.level = normalize_level(&c[2]);
     ev.source = c[3].to_string();
     ev.fields.insert("logger".into(), Value::from(c[3].to_string()));
     ev.fields.insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
+    extract_java_body(&mut ev, body);
     Some(ev)
 }
 
-/// Log4j/Logback: `2024-01-31 08:00:01,123 INFO [thread] com.app.Classe - mensagem`
-fn parse_log4j(line: &str) -> Option<Event> {
-    let c = re_log4j().captures(line)?;
+/// JBoss EAP 7 com data completa: mesmos campos do WildFly, mas o
+/// timestamp da linha já tem data — preenche `timestamp` direto.
+fn parse_jboss(block: &str) -> Option<Event> {
+    let (head, body) = block.split_once('\n').unwrap_or((block, ""));
+    let c = re_jboss().captures(head.trim_end_matches('\r'))?;
     let mut ev = Event::empty();
-    ev.raw = line.to_string();
+    ev.raw = block.to_string();
+    ev.timestamp = parse_timestamp(&c[1].replace(',', "."));
+    ev.level = normalize_level(&c[2]);
+    ev.source = c[3].to_string();
+    ev.fields.insert("logger".into(), Value::from(c[3].to_string()));
+    ev.fields.insert("thread".into(), Value::from(c[4].to_string()));
+    ev.message = c[5].to_string();
+    extract_java_body(&mut ev, body);
+    Some(ev)
+}
+
+
+/// Log4j/Logback: `2024-01-31 08:00:01,123 INFO [thread] com.app.Classe - mensagem`
+/// Mesmo tratamento multi-linha de `parse_wildfly`.
+fn parse_log4j(block: &str) -> Option<Event> {
+    let (head, body) = block.split_once('\n').unwrap_or((block, ""));
+    let c = re_log4j().captures(head.trim_end_matches('\r'))?;
+    let mut ev = Event::empty();
+    ev.raw = block.to_string();
     ev.timestamp = parse_timestamp(&c[1].replace(',', "."));
     ev.level = normalize_level(&c[2]);
     ev.fields.insert("thread".into(), Value::from(c[3].to_string()));
     ev.fields.insert("logger".into(), Value::from(c[4].to_string()));
     ev.source = c[4].to_string();
     ev.message = c[5].to_string();
+    extract_java_body(&mut ev, body);
     Some(ev)
 }
 
@@ -741,7 +864,7 @@ fn looks_like_csv_header(line: &str) -> bool {
 /// `regex`: opcional, extrai o texto da data (2 grupos = data + hora).
 /// `format`: padrão chrono, "epoch_ms" ou "epoch_s".
 /// `complement`: data literal ("2026-06-24") quando o formato só tem hora.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct TsConfig {
     #[serde(default)]
     pub sources: Vec<String>,
@@ -762,7 +885,7 @@ pub struct TsConfig {
 }
 
 /// Uma alternativa de extração de data/hora (regex + montagem opcional).
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct TsRule {
     #[serde(default)]
     pub regex: Option<String>,
@@ -806,7 +929,7 @@ impl TsConfig {
 }
 
 /// Uma regra de extração: regex + modelo + condição.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct DerivedRule {
     pub pattern: String,
     /// modelo do valor com grupos da regex ("$1 - $2"); vazio = 1º grupo
@@ -1157,10 +1280,16 @@ pub fn parse_line(
         "syslog5424" => parse_syslog5424(&text).unwrap_or_else(|| event_from_text(&text)),
         "apache" => parse_apache(&text).unwrap_or_else(|| event_from_text(&text)),
         "firewall" => parse_firewall(&text).unwrap_or_else(|| event_from_text(&text)),
-        "wildfly" => parse_wildfly(&text).unwrap_or_else(|| event_from_text(&text)),
+        "wildfly" => parse_wildfly(&text)
+            .or_else(|| parse_jboss(&text))
+            .or_else(|| parse_log4j(&text))
+            .unwrap_or_else(|| event_from_text(&text)),
         "cef" => parse_cef(&text).unwrap_or_else(|| event_from_text(&text)),
         "leef" => parse_leef(&text).unwrap_or_else(|| event_from_text(&text)),
-        "log4j" => parse_log4j(&text).unwrap_or_else(|| event_from_text(&text)),
+        "log4j" => parse_log4j(&text)
+            .or_else(|| parse_jboss(&text))
+            .or_else(|| parse_wildfly(&text))
+            .unwrap_or_else(|| event_from_text(&text)),
         "logfmt" => parse_logfmt(&text).unwrap_or_else(|| event_from_text(&text)),
         "csv" => parse_csv_line(&text, header).unwrap_or_else(|| event_from_text(&text)),
         "w3c" => parse_w3c(&text, header).unwrap_or_else(|| event_from_text(&text)),
@@ -1305,6 +1434,34 @@ fn meta_for_line(
     m
 }
 
+/// Adiciona uma linha ao índice. Em formatos multi-linha (`start_re`), uma
+/// linha que NÃO casa o padrão de início é continuação (corpo de stacktrace):
+/// estende o `len` do evento anterior em vez de virar evento próprio.
+/// Continuações antes do primeiro evento viram linhas soltas (o comportamento
+/// normal de uma linha qualquer).
+#[allow(clippy::too_many_arguments)]
+fn push_meta(
+    lines: &mut Vec<LineMeta>,
+    line: &[u8],
+    offset: u64,
+    fmt: &str,
+    custom: Option<&CustomParse>,
+    header: &[String],
+    start_re: Option<&regex::Regex>,
+) {
+    if let Some(re) = start_re {
+        let text = std::str::from_utf8(line).unwrap_or("");
+        if !re.is_match(text) {
+            if let Some(last) = lines.last_mut() {
+                let end = offset as usize + line.len();
+                last.len = (end - last.offset as usize) as u32;
+                return;
+            }
+        }
+    }
+    lines.push(meta_for_line(line, offset, fmt, custom, header));
+}
+
 /// Indexa um arquivo inteiro em uma única passada, guardando apenas
 /// metadados compactos por linha (~32 bytes/linha).
 pub fn index_file(
@@ -1357,6 +1514,12 @@ pub fn index_file(
     let mut offset = 0usize;
     let mut first_line = true;
     let mut last_report = 0usize;
+    // Formatos multi-linha (stacktrace Java): linha que casa o padrão do
+    // formato inicia um evento; as demais estendem o evento anterior.
+    let start_re: Option<regex::Regex> = match fmt {
+        "log4j" | "wildfly" => detect_entry_start(&mmap),
+        _ => None,
+    };
     for nl in memchr::memchr_iter(b'\n', &mmap) {
         let raw = &mmap[offset..nl];
         let line = if raw.last() == Some(&b'\r') {
@@ -1367,7 +1530,7 @@ pub fn index_file(
         if !line.is_empty() {
             let skip = (fmt == "csv" && first_line) || (fmt == "w3c" && line[0] == b'#');
             if !skip {
-                lines.push(meta_for_line(line, offset as u64, fmt, custom.as_ref(), &header));
+                push_meta(&mut lines, line, offset as u64, fmt, custom.as_ref(), &header, start_re.as_ref());
             }
         }
         first_line = false;
@@ -1382,7 +1545,7 @@ pub fn index_file(
     if offset < mmap.len() {
         let line = &mmap[offset..];
         if !line.is_empty() {
-            lines.push(meta_for_line(line, offset as u64, fmt, custom.as_ref(), &header));
+            push_meta(&mut lines, line, offset as u64, fmt, custom.as_ref(), &header, start_re.as_ref());
         }
     }
 

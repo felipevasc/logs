@@ -1,4 +1,5 @@
 mod analysis;
+mod mcp;
 mod model;
 mod query;
 mod sources;
@@ -32,7 +33,7 @@ pub struct AppState {
 }
 
 #[derive(Serialize)]
-struct LoadSummary {
+pub(crate) struct LoadSummary {
     count: usize,
     columns: Vec<String>,
     source_desc: String,
@@ -49,8 +50,10 @@ struct OperationProgress {
     cancellable: bool,
 }
 
+/// Emite progresso para a UI quando há uma janela (comandos Tauri e chamadas
+/// MCP passam o handle; chamadas sem UI passam `None` e viram no-op).
 fn emit_progress(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     operation: &str,
     phase: &str,
     completed: usize,
@@ -58,6 +61,7 @@ fn emit_progress(
     unit: &str,
     cancellable: bool,
 ) {
+    let Some(app) = app else { return };
     let _ = app.emit("operation-progress", OperationProgress {
         operation: operation.into(),
         phase: phase.into(),
@@ -68,12 +72,26 @@ fn emit_progress(
     });
 }
 
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     #[cfg(windows)]
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
     #[cfg(not(windows))]
     let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(base).join("LogInsight")
+}
+
+/// Move trabalho pesado para uma thread blocking do runtime, mantendo os
+/// comandos Tauri async (a thread principal/webview não congela). O closure
+/// captura o AppHandle e resolve `app.state::<AppState>()` lá dentro, pois
+/// `State<'_, T>` não pode ser movido para um closure 'static.
+async fn offload<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 const CATALOG_VERSION: u32 = 3;
@@ -135,7 +153,7 @@ fn load_system_codes(path: &PathBuf) -> CodesConfig {
 }
 
 /// Materializa todos os eventos da fonte atual (para união com outra fonte).
-fn materialize_current(state: &State<AppState>) -> Vec<Event> {
+fn materialize_current(state: &AppState) -> Vec<Event> {
     let source = state.source.read();
     match &*source {
         SourceData::Memory(evs) => evs.clone(),
@@ -151,7 +169,7 @@ fn materialize_current(state: &State<AppState>) -> Vec<Event> {
     }
 }
 
-fn store_events(state: &State<AppState>, mut evs: Vec<Event>, source_desc: String) -> LoadSummary {
+fn store_events(state: &AppState, mut evs: Vec<Event>, source_desc: String) -> LoadSummary {
     let codes = state.codes.read().clone();
     let system = state.system_codes.read().clone();
     let derived = state.derived.read();
@@ -172,40 +190,53 @@ fn store_events(state: &State<AppState>, mut evs: Vec<Event>, source_desc: Strin
 }
 
 #[tauri::command]
-fn list_channels() -> Result<Vec<String>, String> {
-    sources::list_channels()
+async fn list_channels() -> Result<Vec<String>, String> {
+    offload(sources::list_channels).await?
 }
 
 #[tauri::command]
-fn load_event_log(
+async fn load_event_log(
     channel: String,
     max_events: usize,
     merge: Option<bool>,
-    state: State<AppState>,
     app: AppHandle,
 ) -> Result<LoadSummary, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        load_event_log_impl(state.inner(), &channel, max_events, merge, Some(&app))
+    })
+    .await?
+}
+
+pub(crate) fn load_event_log_impl(
+    state: &AppState,
+    channel: &str,
+    max_events: usize,
+    merge: Option<bool>,
+    app: Option<&AppHandle>,
+) -> Result<LoadSummary, String> {
     let max_events = max_events.clamp(1, 100_000);
-    emit_progress(&app, "carregamento", "Lendo Event Log", 0, max_events, "eventos", false);
-    let evs = sources::read_channel(&channel, max_events)?;
-    emit_progress(&app, "carregamento", "Enriquecendo eventos", evs.len(), max_events, "eventos", false);
+    emit_progress(app, "carregamento", "Lendo Event Log", 0, max_events, "eventos", false);
+    let evs = sources::read_channel(channel, max_events)?;
+    emit_progress(app, "carregamento", "Enriquecendo eventos", evs.len(), max_events, "eventos", false);
     let desc = format!("Event Log: {channel}");
     let summary = if merge.unwrap_or(false) && !matches!(&*state.source.read(), SourceData::None) {
-        let mut all = materialize_current(&state);
+        let mut all = materialize_current(state);
         all.extend(evs);
         let mut names = state.source_names.read().clone();
         names.push(desc);
         let desc = names.join(" + ");
         *state.source_names.write() = names;
-        store_events_merged(&state, all, desc)
+        store_events_merged(state, all, desc)
     } else {
-        store_events(&state, evs, desc)
+        store_events(state, evs, desc)
     };
-    emit_progress(&app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
+    emit_progress(app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
     Ok(summary)
 }
 
 /// igual a store_events, mas preserva a lista de fontes unidas (já atualizada pelo chamador)
-fn store_events_merged(state: &State<AppState>, evs: Vec<Event>, source_desc: String) -> LoadSummary {
+fn store_events_merged(state: &AppState, evs: Vec<Event>, source_desc: String) -> LoadSummary {
     let names = state.source_names.read().clone();
     let summary = store_events(state, evs, source_desc);
     *state.source_names.write() = names;
@@ -213,7 +244,7 @@ fn store_events_merged(state: &State<AppState>, evs: Vec<Event>, source_desc: St
 }
 
 /// Indexa um arquivo aplicando formato customizado e config de data/hora salva.
-fn index_source_file(path: &str, format: &str, app: &AppHandle) -> Result<sources::FileIndex, String> {
+fn index_source_file(path: &str, format: &str, app: Option<&AppHandle>) -> Result<sources::FileIndex, String> {
     let custom = if let Some(name) = format.strip_prefix("custom:") {
         let f = custom_formats()
             .into_iter()
@@ -237,19 +268,32 @@ fn index_source_file(path: &str, format: &str, app: &AppHandle) -> Result<source
 }
 
 #[tauri::command]
-fn load_file(
+async fn load_file(
     path: String,
     format: String,
     merge: Option<bool>,
-    state: State<AppState>,
     app: AppHandle,
 ) -> Result<LoadSummary, String> {
-    emit_progress(&app, "carregamento", "Preparando arquivo", 0, 0, "linhas", false);
-    let idx = index_source_file(&path, &format, &app)?;
-    emit_progress(&app, "carregamento", "Indexando linhas", idx.lines.len(), idx.lines.len(), "linhas", false);
+    offload(move || {
+        let state = app.state::<AppState>();
+        load_file_impl(state.inner(), &path, &format, merge, Some(&app))
+    })
+    .await?
+}
+
+pub(crate) fn load_file_impl(
+    state: &AppState,
+    path: &str,
+    format: &str,
+    merge: Option<bool>,
+    app: Option<&AppHandle>,
+) -> Result<LoadSummary, String> {
+    emit_progress(app, "carregamento", "Preparando arquivo", 0, 0, "linhas", false);
+    let idx = index_source_file(path, format, app)?;
+    emit_progress(app, "carregamento", "Indexando linhas", idx.lines.len(), idx.lines.len(), "linhas", false);
     if merge.unwrap_or(false) && !matches!(&*state.source.read(), SourceData::None) {
         // união: materializa a fonte atual + o novo arquivo em uma única fonte em memória
-        let mut all = materialize_current(&state);
+        let mut all = materialize_current(state);
         all.extend(analysis::materialize_indexed(
             &idx,
             &[],
@@ -262,8 +306,8 @@ fn load_file(
         names.push(format!("Arquivo: {path}"));
         let desc = names.join(" + ");
         *state.source_names.write() = names;
-        let summary = store_events_merged(&state, all, desc);
-        emit_progress(&app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
+        let summary = store_events_merged(state, all, desc);
+        emit_progress(app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
         return Ok(summary);
     }
     let summary = LoadSummary {
@@ -273,29 +317,42 @@ fn load_file(
     };
     *state.source.write() = SourceData::Indexed(idx);
     *state.source_names.write() = vec![summary.source_desc.clone()];
-    emit_progress(&app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
+    emit_progress(app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
     Ok(summary)
 }
 
 #[tauri::command]
-fn load_files(
+async fn load_files(
     paths: Vec<String>,
     format: String,
     merge: Option<bool>,
-    state: State<AppState>,
     app: AppHandle,
+) -> Result<LoadSummary, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        load_files_impl(state.inner(), &paths, &format, merge, Some(&app))
+    })
+    .await?
+}
+
+pub(crate) fn load_files_impl(
+    state: &AppState,
+    paths: &[String],
+    format: &str,
+    merge: Option<bool>,
+    app: Option<&AppHandle>,
 ) -> Result<LoadSummary, String> {
     if paths.is_empty() {
         return Err("Nenhum arquivo selecionado.".into());
     }
     let merge = merge.unwrap_or(false) && !matches!(&*state.source.read(), SourceData::None);
-    let mut all = if merge { materialize_current(&state) } else { vec![] };
+    let mut all = if merge { materialize_current(state) } else { vec![] };
     let mut names = if merge { state.source_names.read().clone() } else { vec![] };
-    for path in &paths {
-        emit_progress(&app, "carregamento", "Preparando arquivo", 0, 0, "linhas", false);
-        let idx = index_source_file(path, &format, &app)?;
+    for path in paths {
+        emit_progress(app, "carregamento", "Preparando arquivo", 0, 0, "linhas", false);
+        let idx = index_source_file(path, format, app)?;
         emit_progress(
-            &app,
+            app,
             "carregamento",
             "Indexando linhas",
             idx.lines.len(),
@@ -315,8 +372,8 @@ fn load_files(
     }
     let desc = names.join(" + ");
     *state.source_names.write() = names;
-    let summary = store_events_merged(&state, all, desc);
-    emit_progress(&app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
+    let summary = store_events_merged(state, all, desc);
+    emit_progress(app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
     Ok(summary)
 }
 
@@ -326,7 +383,7 @@ fn ts_configs_path() -> PathBuf {
     config_dir().join("ts_configs.json")
 }
 
-fn load_ts_config(path: &str) -> Option<sources::TsConfig> {
+pub(crate) fn load_ts_config(path: &str) -> Option<sources::TsConfig> {
     let map: std::collections::HashMap<String, sources::TsConfig> =
         std::fs::read_to_string(ts_configs_path())
             .ok()
@@ -340,11 +397,23 @@ fn get_ts_config(path: String) -> Option<sources::TsConfig> {
 }
 
 #[tauri::command]
-fn set_ts_config(
+async fn set_ts_config(
     path: String,
     config: Option<sources::TsConfig>,
-    state: State<AppState>,
     app: AppHandle,
+) -> Result<(), String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        set_ts_config_impl(state.inner(), &path, config, Some(&app))
+    })
+    .await?
+}
+
+pub(crate) fn set_ts_config_impl(
+    state: &AppState,
+    path: &str,
+    config: Option<sources::TsConfig>,
+    app: Option<&AppHandle>,
 ) -> Result<(), String> {
     // persiste por caminho de arquivo
     let mut map: std::collections::HashMap<String, sources::TsConfig> =
@@ -354,10 +423,10 @@ fn set_ts_config(
             .unwrap_or_default();
     match &config {
         Some(c) => {
-            map.insert(path.clone(), c.clone());
+            map.insert(path.to_string(), c.clone());
         }
         None => {
-            map.remove(&path);
+            map.remove(path);
         }
     }
     let text = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
@@ -370,7 +439,7 @@ fn set_ts_config(
             if idx.path == path {
                 idx.ts_config = compiled;
                 sources::retimestamp_index(idx, Some(&|done, total| {
-                    emit_progress(&app, "data/hora", "Recalculando timestamps", done, total, "linhas", false);
+                    emit_progress(app, "data/hora", "Recalculando timestamps", done, total, "linhas", false);
                 }));
             }
         }
@@ -386,10 +455,10 @@ fn set_ts_config(
                     }
                 }
                 if i % 4096 == 0 {
-                    emit_progress(&app, "data/hora", "Recalculando timestamps", i, total, "eventos", false);
+                    emit_progress(app, "data/hora", "Recalculando timestamps", i, total, "eventos", false);
                 }
             }
-            emit_progress(&app, "data/hora", "Data/hora aplicada", total, total, "eventos", false);
+            emit_progress(app, "data/hora", "Data/hora aplicada", total, total, "eventos", false);
         }
         SourceData::None => {}
     }
@@ -397,9 +466,20 @@ fn set_ts_config(
 }
 
 #[tauri::command]
-fn test_ts_config(
+async fn test_ts_config(
     config: sources::TsConfig,
-    state: State<AppState>,
+    app: AppHandle,
+) -> Result<Vec<(String, String)>, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        test_ts_config_impl(state.inner(), config)
+    })
+    .await?
+}
+
+pub(crate) fn test_ts_config_impl(
+    state: &AppState,
+    config: sources::TsConfig,
 ) -> Result<Vec<(String, String)>, String> {
     let source = state.source.read();
     let cc = config.compile()?;
@@ -493,6 +573,10 @@ fn load_derived() -> Vec<sources::CompiledDerived> {
 
 #[tauri::command]
 fn list_derived_fields(state: State<AppState>) -> Vec<sources::DerivedField> {
+    list_derived_fields_impl(state.inner())
+}
+
+pub(crate) fn list_derived_fields_impl(state: &AppState) -> Vec<sources::DerivedField> {
     let defs: Vec<sources::DerivedFieldCompat> = std::fs::read_to_string(derived_path())
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -521,11 +605,24 @@ fn list_derived_fields(state: State<AppState>) -> Vec<sources::DerivedField> {
 }
 
 #[tauri::command]
-fn save_derived_field(
+async fn save_derived_field(
     name: String,
     source: String,
     rules: Vec<sources::DerivedRule>,
-    state: State<AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        save_derived_field_impl(state.inner(), &name, &source, rules)
+    })
+    .await?
+}
+
+pub(crate) fn save_derived_field_impl(
+    state: &AppState,
+    name: &str,
+    source: &str,
+    rules: Vec<sources::DerivedRule>,
 ) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("Informe um nome para o campo.".into());
@@ -553,16 +650,16 @@ fn save_derived_field(
         defs.into_iter().map(|d| d.normalize()).collect();
     defs.retain(|d| d.name != name);
     defs.push(sources::DerivedField {
-        name: name.clone(),
-        source: source.clone(),
+        name: name.to_string(),
+        source: source.to_string(),
         rules,
     });
     let text = serde_json::to_string_pretty(&defs).map_err(|e| e.to_string())?;
     std::fs::write(derived_path(), text).map_err(|e| e.to_string())?;
     state.derived.write().retain(|d| d.name != name);
     state.derived.write().push(sources::CompiledDerived {
-        name,
-        source,
+        name: name.to_string(),
+        source: source.to_string(),
         rules: compiled,
     });
     // fonte em memória (união/Event Log): aplica já; indexada aplica por linha sob demanda
@@ -576,7 +673,15 @@ fn save_derived_field(
 }
 
 #[tauri::command]
-fn delete_derived_field(name: String, state: State<AppState>) -> Result<(), String> {
+async fn delete_derived_field(name: String, app: AppHandle) -> Result<(), String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        delete_derived_field_impl(state.inner(), &name)
+    })
+    .await?
+}
+
+pub(crate) fn delete_derived_field_impl(state: &AppState, name: &str) -> Result<(), String> {
     let defs: Vec<sources::DerivedFieldCompat> = std::fs::read_to_string(derived_path())
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -590,21 +695,31 @@ fn delete_derived_field(name: String, state: State<AppState>) -> Result<(), Stri
     // remove o campo dos eventos em memória imediatamente
     if let SourceData::Memory(evs) = &mut *state.source.write() {
         for ev in evs.iter_mut() {
-            ev.fields.remove(&name);
+            ev.fields.remove(name);
         }
     }
     Ok(())
 }
 
 #[tauri::command]
-fn test_parse(
+async fn test_parse(
     kind: String,
     pattern: String,
     separator: String,
     fields: Vec<String>,
     sample: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let cp = build_custom_parse(&kind, &pattern, &separator, &fields)?;
+    offload(move || test_parse_impl(&kind, &pattern, &separator, &fields, &sample)).await?
+}
+
+pub(crate) fn test_parse_impl(
+    kind: &str,
+    pattern: &str,
+    separator: &str,
+    fields: &[String],
+    sample: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let cp = build_custom_parse(kind, pattern, separator, fields)?;
     let mut out = Vec::new();
     for line in sample.lines().filter(|l| !l.trim().is_empty()).take(5) {
         let ev = sources::parse_line(line.as_bytes(), "custom", Some(&cp), &[]);
@@ -670,13 +785,17 @@ fn custom_formats() -> Vec<CustomFormat> {
 }
 
 #[derive(serde::Serialize)]
-struct FormatInfo {
+pub(crate) struct FormatInfo {
     id: String,
     name: String,
 }
 
 #[tauri::command]
 fn list_formats() -> Vec<FormatInfo> {
+    list_formats_impl()
+}
+
+pub(crate) fn list_formats_impl() -> Vec<FormatInfo> {
     let mut v: Vec<FormatInfo> = [
         ("auto", "Automático (inferir)"),
         ("jsonl", "JSON / Elastic (ECS)"),
@@ -687,6 +806,7 @@ fn list_formats() -> Vec<FormatInfo> {
         ("cef", "CEF (ArcSight)"),
         ("leef", "LEEF (QRadar)"),
         ("log4j", "Log4j / Logback"),
+        ("wildfly", "WildFly / JBoss"),
         ("logfmt", "Logfmt (key=value)"),
         ("csv", "CSV (com cabeçalho)"),
         ("w3c", "IIS / W3C"),
@@ -708,24 +828,34 @@ fn list_formats() -> Vec<FormatInfo> {
 }
 
 #[tauri::command]
-fn save_custom_format(
+async fn save_custom_format(
     name: String,
     kind: String,
     pattern: String,
     separator: String,
     fields: Vec<String>,
 ) -> Result<(), String> {
+    offload(move || save_custom_format_impl(&name, &kind, &pattern, &separator, fields)).await?
+}
+
+pub(crate) fn save_custom_format_impl(
+    name: &str,
+    kind: &str,
+    pattern: &str,
+    separator: &str,
+    fields: Vec<String>,
+) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("Informe um nome para o formato.".into());
     }
-    build_custom_parse(&kind, &pattern, &separator, &fields)?; // valida
+    build_custom_parse(kind, pattern, separator, &fields)?; // valida
     let mut fmts = custom_formats();
     fmts.retain(|f| f.name != name);
     fmts.push(CustomFormat {
-        name,
-        kind,
-        pattern,
-        separator,
+        name: name.to_string(),
+        kind: kind.to_string(),
+        pattern: pattern.to_string(),
+        separator: separator.to_string(),
         fields,
     });
     let text = serde_json::to_string_pretty(&fmts).map_err(|e| e.to_string())?;
@@ -734,18 +864,76 @@ fn save_custom_format(
 
 #[tauri::command]
 fn clear_events(state: State<AppState>) {
+    clear_events_impl(state.inner())
+}
+
+pub(crate) fn clear_events_impl(state: &AppState) {
     *state.source.write() = SourceData::None;
     state.source_names.write().clear();
 }
 
+/// Resumo da fonte carregada no momento (para MCP/UI saberem o que há no app).
+#[derive(Serialize)]
+pub(crate) struct SourceSummary {
+    count: usize,
+    columns: Vec<String>,
+    source_desc: String,
+    source_names: Vec<String>,
+}
+
 #[tauri::command]
-fn query_events(
+async fn source_summary(app: AppHandle) -> Result<SourceSummary, String> {
+    // Memory: a descoberta de colunas varre até 20k eventos — offload também.
+    offload(move || {
+        let state = app.state::<AppState>();
+        source_summary_impl(state.inner())
+    })
+    .await
+}
+
+pub(crate) fn source_summary_impl(state: &AppState) -> SourceSummary {
+    let source_names = state.source_names.read().clone();
+    let source = state.source.read();
+    let (count, columns, source_desc) = match &*source {
+        SourceData::None => (0, vec![], String::new()),
+        SourceData::Memory(evs) => (evs.len(), all_columns(evs), source_names.join(" + ")),
+        SourceData::Indexed(idx) => (
+            idx.lines.len(),
+            idx.columns.clone(),
+            format!("Arquivo: {}", idx.path),
+        ),
+    };
+    SourceSummary {
+        count,
+        columns,
+        source_desc,
+        source_names,
+    }
+}
+
+#[tauri::command]
+async fn query_events(
     filters: Vec<query::Filter>,
     sort_column: String,
     sort_dir: String,
     offset: usize,
     limit: usize,
-    state: State<AppState>,
+    app: AppHandle,
+) -> Result<query::QueryResult, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        query_events_impl(state.inner(), filters, &sort_column, &sort_dir, offset, limit)
+    })
+    .await
+}
+
+pub(crate) fn query_events_impl(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    sort_column: &str,
+    sort_dir: &str,
+    offset: usize,
+    limit: usize,
 ) -> query::QueryResult {
     let source = state.source.read();
     let codes = state.codes.read();
@@ -754,10 +942,10 @@ fn query_events(
     let limit = limit.clamp(1, 2_000);
     match &*source {
         SourceData::Memory(events) => {
-            query::query(events, &filters, &sort_column, &sort_dir, offset, limit)
+            query::query(events, &filters, sort_column, sort_dir, offset, limit)
         }
         SourceData::Indexed(idx) => query::query_indexed(
-            idx, &filters, &sort_column, &sort_dir, offset, limit, &codes, &system, &derived,
+            idx, &filters, sort_column, sort_dir, offset, limit, &codes, &system, &derived,
         ),
         SourceData::None => query::QueryResult {
             total: 0,
@@ -767,16 +955,31 @@ fn query_events(
 }
 
 #[tauri::command]
-fn explore_snapshot(
+async fn explore_snapshot(
     filters: Vec<query::Filter>,
     sort_column: String,
     sort_dir: String,
     offset: usize,
     limit: usize,
-    state: State<AppState>,
     app: AppHandle,
+) -> Result<query::ExplorerSnapshot, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        explore_snapshot_impl(state.inner(), filters, &sort_column, &sort_dir, offset, limit, Some(&app))
+    })
+    .await
+}
+
+pub(crate) fn explore_snapshot_impl(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    sort_column: &str,
+    sort_dir: &str,
+    offset: usize,
+    limit: usize,
+    app: Option<&AppHandle>,
 ) -> query::ExplorerSnapshot {
-    emit_progress(&app, "exploração", "Aplicando filtros", 0, 0, "eventos", false);
+    emit_progress(app, "exploração", "Aplicando filtros", 0, 0, "eventos", false);
     let source = state.source.read();
     let codes = state.codes.read();
     let system = state.system_codes.read();
@@ -784,10 +987,10 @@ fn explore_snapshot(
     let limit = limit.clamp(1, 2_000);
     let snapshot = match &*source {
         SourceData::Memory(events) => query::explore(
-            events, &filters, &sort_column, &sort_dir, offset, limit,
+            events, &filters, sort_column, sort_dir, offset, limit,
         ),
         SourceData::Indexed(idx) => query::explore_indexed(
-            idx, &filters, &sort_column, &sort_dir, offset, limit, &codes, &system, &derived,
+            idx, &filters, sort_column, sort_dir, offset, limit, &codes, &system, &derived,
         ),
         SourceData::None => query::ExplorerSnapshot {
             query: query::QueryResult { total: 0, rows: vec![] },
@@ -797,7 +1000,7 @@ fn explore_snapshot(
         },
     };
     emit_progress(
-        &app,
+        app,
         "exploração",
         "Recorte calculado",
         snapshot.query.total,
@@ -809,27 +1012,41 @@ fn explore_snapshot(
 }
 
 #[tauri::command]
-fn aggregate_events(
+async fn aggregate_events(
     group_column: String,
     aggs: Vec<query::AggSpec>,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
-    state: State<AppState>,
+    app: AppHandle,
+) -> Result<query::AggResult, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        aggregate_events_impl(state.inner(), &group_column, aggs, filters, case_events)
+    })
+    .await
+}
+
+pub(crate) fn aggregate_events_impl(
+    state: &AppState,
+    group_column: &str,
+    aggs: Vec<query::AggSpec>,
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
 ) -> query::AggResult {
     // eventos do Caso: aplica os filtros recebidos e agrega sobre o recorte
     if let Some(events) = case_events {
         let indices = query::filtered_indices(&events, &filters);
         let filtered: Vec<Event> = indices.into_iter().map(|i| events[i].clone()).collect();
-        return query::aggregate(&filtered, &[], &group_column, &aggs);
+        return query::aggregate(&filtered, &[], group_column, &aggs);
     }
     let source = state.source.read();
     let codes = state.codes.read();
     let system = state.system_codes.read();
     let derived = state.derived.read();
     match &*source {
-        SourceData::Memory(events) => query::aggregate(events, &filters, &group_column, &aggs),
+        SourceData::Memory(events) => query::aggregate(events, &filters, group_column, &aggs),
         SourceData::Indexed(idx) => {
-            query::aggregate_indexed(idx, &filters, &group_column, &aggs, &codes, &system, &derived)
+            query::aggregate_indexed(idx, &filters, group_column, &aggs, &codes, &system, &derived)
         }
         SourceData::None => query::AggResult {
             columns: vec![],
@@ -841,7 +1058,7 @@ fn aggregate_events(
 /// Agregações da árvore de exploração em uma única chamada:
 /// contagens por valor de cada coluna, com o filtro da própria coluna excluído.
 #[derive(serde::Serialize)]
-struct TrailResult {
+pub(crate) struct TrailResult {
     events: Vec<Event>,
     before_available: usize,
     after_available: usize,
@@ -870,13 +1087,28 @@ fn trail_from_events(events: &[Event], filters: &[query::Filter], center_id: usi
 
 /// Trilha temporal de um evento no artefato ou no conjunto do Caso.
 #[tauri::command]
-fn trail_events(
+async fn trail_events(
     center_id: usize,
     before: usize,
     after: usize,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
-    state: State<AppState>,
+    app: AppHandle,
+) -> Result<TrailResult, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        trail_events_impl(state.inner(), center_id, before, after, filters, case_events)
+    })
+    .await
+}
+
+pub(crate) fn trail_events_impl(
+    state: &AppState,
+    center_id: usize,
+    before: usize,
+    after: usize,
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
 ) -> TrailResult {
     if let Some(events) = case_events {
         return trail_from_events(&events, &filters, center_id, before, after);
@@ -918,10 +1150,22 @@ fn trail_events(
 
 /// Contagem simples de eventos que passam nos filtros (abas de filtros salvos).
 #[tauri::command]
-fn count_filtered(
+async fn count_filtered(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
-    state: State<AppState>,
+    app: AppHandle,
+) -> Result<usize, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        count_filtered_impl(state.inner(), filters, case_events)
+    })
+    .await
+}
+
+pub(crate) fn count_filtered_impl(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
 ) -> usize {
     if let Some(events) = case_events {
         return query::filtered_indices(&events, &filters).len();
@@ -942,11 +1186,24 @@ fn count_filtered(
 }
 
 #[tauri::command]
-fn tree_aggs(
+async fn tree_aggs(
     columns: Vec<String>,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
-    state: State<AppState>,
+    app: AppHandle,
+) -> Result<Vec<(String, query::AggResult)>, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        tree_aggs_impl(state.inner(), columns, filters, case_events)
+    })
+    .await
+}
+
+pub(crate) fn tree_aggs_impl(
+    state: &AppState,
+    columns: Vec<String>,
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
 ) -> Vec<(String, query::AggResult)> {
     if let Some(events) = case_events {
         return query::multi_count(&events, &filters, &columns);
@@ -967,7 +1224,15 @@ fn tree_aggs(
 }
 
 #[tauri::command]
-fn stats_events(filters: Vec<query::Filter>, state: State<AppState>) -> query::Stats {
+async fn stats_events(filters: Vec<query::Filter>, app: AppHandle) -> Result<query::Stats, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        stats_events_impl(state.inner(), filters)
+    })
+    .await
+}
+
+pub(crate) fn stats_events_impl(state: &AppState, filters: Vec<query::Filter>) -> query::Stats {
     let source = state.source.read();
     let codes = state.codes.read();
     let system = state.system_codes.read();
@@ -984,7 +1249,15 @@ fn stats_events(filters: Vec<query::Filter>, state: State<AppState>) -> query::S
 }
 
 #[tauri::command]
-fn event_detail(id: usize, state: State<AppState>) -> Option<Event> {
+async fn event_detail(id: usize, app: AppHandle) -> Result<Option<Event>, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        event_detail_impl(state.inner(), id)
+    })
+    .await
+}
+
+pub(crate) fn event_detail_impl(state: &AppState, id: usize) -> Option<Event> {
     let source = state.source.read();
     match &*source {
         SourceData::Memory(events) => events.get(id).cloned(),
@@ -1010,7 +1283,7 @@ fn event_detail(id: usize, state: State<AppState>) -> Option<Event> {
 const ANALYSIS_CAP: usize = 50_000;
 
 fn work_events(
-    state: &State<AppState>,
+    state: &AppState,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
 ) -> Vec<Event> {
@@ -1053,48 +1326,102 @@ fn work_columns(evs: &[Event]) -> Vec<String> {
 }
 
 #[tauri::command]
-fn profile_fields(
+async fn profile_fields(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
-    state: State<AppState>,
+    app: AppHandle,
+) -> Result<Vec<analysis::FieldProfile>, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        profile_fields_impl(state.inner(), filters, case_events)
+    })
+    .await
+}
+
+pub(crate) fn profile_fields_impl(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
 ) -> Vec<analysis::FieldProfile> {
-    let evs = work_events(&state, filters, case_events);
+    let evs = work_events(state, filters, case_events);
     let columns = work_columns(&evs);
     analysis::profile_fields(&evs, &columns)
 }
 
 #[tauri::command]
-fn compute_series(
+async fn compute_series(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     spec: analysis::SeriesSpec,
-    state: State<AppState>,
+    app: AppHandle,
+) -> Result<analysis::SeriesResult, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        compute_series_impl(state.inner(), filters, case_events, spec)
+    })
+    .await
+}
+
+pub(crate) fn compute_series_impl(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
+    spec: analysis::SeriesSpec,
 ) -> analysis::SeriesResult {
-    let evs = work_events(&state, filters, case_events);
+    let evs = work_events(state, filters, case_events);
     analysis::compute_series(&evs, &spec)
 }
 
 #[tauri::command]
-fn pivot(
+async fn pivot(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     spec: analysis::PivotSpec,
-    state: State<AppState>,
+    app: AppHandle,
+) -> Result<analysis::PivotResult, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        pivot_impl(state.inner(), filters, case_events, spec)
+    })
+    .await
+}
+
+pub(crate) fn pivot_impl(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
+    spec: analysis::PivotSpec,
 ) -> analysis::PivotResult {
-    let evs = work_events(&state, filters, case_events);
+    let evs = work_events(state, filters, case_events);
     analysis::pivot(&evs, &spec)
 }
 
 #[tauri::command]
-fn get_codes(state: State<AppState>) -> String {
+async fn get_codes(app: AppHandle) -> Result<String, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        get_codes_impl(state.inner())
+    })
+    .await
+}
+
+pub(crate) fn get_codes_impl(state: &AppState) -> String {
     serde_json::to_string_pretty(&*state.codes.read()).unwrap_or_default()
 }
 
 #[tauri::command]
-fn save_codes(text: String, state: State<AppState>) -> Result<(), String> {
+async fn save_codes(text: String, app: AppHandle) -> Result<(), String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        save_codes_impl(state.inner(), &text)
+    })
+    .await?
+}
+
+pub(crate) fn save_codes_impl(state: &AppState, text: &str) -> Result<(), String> {
     let cfg: CodesConfig =
-        serde_json::from_str(&text).map_err(|e| format!("JSON inválido: {e}"))?;
-    std::fs::write(&state.codes_path, &text).map_err(|e| format!("Falha ao gravar: {e}"))?;
+        serde_json::from_str(text).map_err(|e| format!("JSON inválido: {e}"))?;
+    std::fs::write(&state.codes_path, text).map_err(|e| format!("Falha ao gravar: {e}"))?;
     *state.codes.write() = cfg;
     // Re-enriquece eventos em memória (fontes indexadas enriquecem sob demanda).
     let codes = state.codes.read().clone();
@@ -1110,14 +1437,22 @@ fn save_codes(text: String, state: State<AppState>) -> Result<(), String> {
 }
 
 #[derive(serde::Serialize)]
-struct HarvestSummary {
+pub(crate) struct HarvestSummary {
     count: usize,
     sources: usize,
 }
 
 /// Extrai (ou reextrai) o catálogo completo de eventos do sistema operacional.
 #[tauri::command]
-fn harvest_codes(state: State<AppState>) -> Result<HarvestSummary, String> {
+async fn harvest_codes(app: AppHandle) -> Result<HarvestSummary, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        harvest_codes_impl(state.inner())
+    })
+    .await?
+}
+
+pub(crate) fn harvest_codes_impl(state: &AppState) -> Result<HarvestSummary, String> {
     let (cfg, count) = sources::harvest_system_codes()?;
     let sources = cfg.sources.len();
     if let Ok(text) = serde_json::to_string(&cfg) {
@@ -1139,6 +1474,10 @@ fn harvest_codes(state: State<AppState>) -> Result<HarvestSummary, String> {
 
 #[tauri::command]
 fn system_codes_count(state: State<AppState>) -> usize {
+    system_codes_count_impl(state.inner())
+}
+
+pub(crate) fn system_codes_count_impl(state: &AppState) -> usize {
     state
         .system_codes
         .read()
@@ -1166,6 +1505,10 @@ fn read_cases_file(path: &PathBuf) -> Option<serde_json::Value> {
 
 #[tauri::command]
 fn cases_load() -> serde_json::Value {
+    cases_load_impl()
+}
+
+pub(crate) fn cases_load_impl() -> serde_json::Value {
     read_cases_file(&cases_path())
         .or_else(|| read_cases_file(&cases_backup_path()))
         .unwrap_or_else(|| serde_json::json!({ "active": null, "cases": [] }))
@@ -1173,6 +1516,10 @@ fn cases_load() -> serde_json::Value {
 
 #[tauri::command]
 fn cases_save(data: serde_json::Value, state: State<AppState>) -> Result<(), String> {
+    cases_save_impl(state.inner(), data)
+}
+
+pub(crate) fn cases_save_impl(state: &AppState, data: serde_json::Value) -> Result<(), String> {
     let _store_guard = state.case_store_lock.lock();
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1202,6 +1549,12 @@ fn cases_save(data: serde_json::Value, state: State<AppState>) -> Result<(), Str
 #[tauri::command]
 fn get_codes_path(state: State<AppState>) -> String {
     state.codes_path.display().to_string()
+}
+
+/// Status do servidor MCP embutido (para a tela de configurações).
+#[tauri::command]
+fn mcp_status(mcp: State<mcp::McpState>) -> mcp::McpStatus {
+    mcp::status(&mcp)
 }
 
 /// Relança o aplicativo com privilégios de administrador (UAC) e encerra
@@ -1247,6 +1600,7 @@ pub fn run() {
     let codes = load_codes(&codes_path);
     let system_codes_path = config_dir().join("system_codes.json");
     let system_codes = load_system_codes(&system_codes_path);
+    let (mcp_enabled, mcp_port, mcp_config_path) = mcp::load_config();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1260,7 +1614,8 @@ pub fn run() {
             codes_path,
             system_codes_path,
         })
-        .setup(|app| {
+        .manage(mcp::McpState::new(mcp_enabled, mcp_port, mcp_config_path))
+        .setup(move |app| {
             // Primeira execução: extrai o catálogo do sistema em background
             // (leva ~20s e não pode bloquear a abertura da janela).
             let state = app.state::<AppState>();
@@ -1277,6 +1632,13 @@ pub fn run() {
                     }
                 });
             }
+            // Servidor MCP embutido (loopback) para automação por agentes.
+            if mcp_enabled {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    mcp::serve(handle, mcp_port).await;
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1285,6 +1647,7 @@ pub fn run() {
             load_file,
             load_files,
             clear_events,
+            source_summary,
             query_events,
             explore_snapshot,
             aggregate_events,
@@ -1313,6 +1676,7 @@ pub fn run() {
             profile_fields,
             compute_series,
             pivot,
+            mcp_status,
         ])
         .run(tauri::generate_context!())
         .expect("erro ao iniciar o LogInsight");

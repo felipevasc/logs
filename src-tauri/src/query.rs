@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Filter {
     pub column: String,
     pub op: String,
@@ -76,7 +76,7 @@ pub struct ExplorerSnapshot {
     pub codes: AggResult,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 pub struct AggSpec {
     pub func: String,
     pub column: String,

@@ -12,3 +12,4 @@ scripts/preview/output/
 scripts/preview/patch-*.py
 exemplos/grande.jsonl
 kimi-export-session_*.md
+src-tauri/target-fix/

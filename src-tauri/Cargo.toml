@@ -3,7 +3,7 @@ name = "loginsight"
 version = "0.1.0"
 description = "Visualizador e analisador de logs"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.88"
 
 [lib]
 name = "loginsight_lib"
@@ -24,6 +24,10 @@ parking_lot = "0.12"
 memmap2 = "0.9"
 memchr = "2"
 rayon = "1"
+rmcp = { version = "3.1", features = ["transport-streamable-http-server"] }
+schemars = "1.0"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["net", "rt", "sync"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
