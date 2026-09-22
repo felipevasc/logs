@@ -25,6 +25,7 @@ const OPS = [
   ["not_equals", "diferente de"],
   ["starts_with", "começa com"],
   ["regex", "regex"],
+  ["pattern", "padrão"],
   ["gt", ">"],
   ["gte", "≥"],
   ["lt", "<"],
@@ -206,12 +207,12 @@ function mirrorLoadOverlay(label, detail, progress) {
 
 function startOperation(kind, label, detail = "") {
   state.activeOperation = { kind, cancelled: false };
-  setWorkbar(label, detail, 8, false);
+  setWorkbar(label, detail, 8, true);
 }
 
 function updateOperation(label, detail = "", progress = 52) {
   if (!state.activeOperation) return;
-  setWorkbar(label, detail, progress, false);
+  setWorkbar(label, detail, progress, true);
 }
 
 function finishOperation(label, detail = "") {
@@ -236,11 +237,13 @@ window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
 
 // live-refresh quando uma tool MCP muta o estado do backend
 window.__TAURI__.event?.listen("mcp-state-changed", ({ payload }) => {
+  state.explorerCache = null;
   if (!payload?.kind) return;
   handleMcpStateChanged(payload.kind).catch(() => {});
 }).catch(() => {});
 
 function artifactIdFromSource(source) {
+  if (source.kind === "bundle") return `bundle:${source.members.map(artifactIdFromSource).join("|")}`;
   if (source.kind === "file") return `file:${(source.paths?.length ? source.paths : [source.path]).join("+")}`;
   return `eventlog:${source.channel}`;
 }
@@ -264,6 +267,7 @@ function sourceSpecFromArtifact(artifact) {
 }
 
 function applySourceSpec(source) {
+  if (source.kind === "bundle") { applySourceSpec(source.members.at(-1)); return; }
   setSource(source.kind);
   if (source.kind === "file") {
     const paths = source.paths?.length ? source.paths : [source.path].filter(Boolean);
@@ -511,6 +515,8 @@ async function api(cmd, args = {}, opts = {}) {
     if (activity.count === 1) activity.timer = setTimeout(activityShow, ACTIVITY_DELAY);
   }
   try {
+    if (args.filters?.length) await invoke("validate_filters", { filters: args.filters });
+    if (/^(load_|clear_|set_|save_|delete_|harvest_)/.test(cmd)) state.explorerCache = null;
     return await invoke(cmd, args);
   } catch (e) {
     if (!opts.silent) toast(String(e), "err");
@@ -657,14 +663,14 @@ function cellValue(ev, col) {
 
 function autoVisibleCols() {
   const hasValue = (col) => state.rows.some((ev) => String(cellValue(ev, col) ?? "").trim() !== "");
-  const preferred = ["timestamp", "source", "level", "code", "name", "message"];
+  const preferred = ["timestamp", "level", "source", "message"];
   const visible = preferred.filter((col) => state.columns.includes(col) && hasValue(col));
   // data/hora é sempre a primeira coluna, mesmo ainda não configurada (células vazias)
   if (!visible.includes("timestamp") && state.columns.includes("timestamp")) visible.unshift("timestamp");
   const extra = state.columns
     .filter((col) => !preferred.includes(col) && hasValue(col))
     .slice(0, 2);
-  state.visibleCols = [...visible, ...extra];
+  state.visibleCols = visible;
   if (!state.visibleCols.length && state.columns.includes("message")) state.visibleCols = ["message"];
   if (!state.visibleCols.length) state.visibleCols = state.columns.slice(0, 1);
   fillColumnControls();
@@ -746,7 +752,7 @@ async function loadData(requestedSource = null, options = {}) {
   showLoadOverlay();
   skeletonRows();
   try {
-    const source = requestedSource ? { ...requestedSource } : sourceSpecFromControls();
+    let source = requestedSource ? { ...requestedSource } : sourceSpecFromControls();
     if (source.kind === "file") {
       source.paths = source.paths?.filter(Boolean)?.length
         ? source.paths
@@ -764,10 +770,17 @@ async function loadData(requestedSource = null, options = {}) {
       : ensureCase();
     if (!c || state.cases.active !== c.id) return;
     const version = options.version ?? ++state.artifactSwitchVersion;
+    let merge = !!options.merge;
+    if (merge && state.currentArtifact?.source) {
+      const members = [state.currentArtifact.source, source].flatMap(s => s.kind === "bundle" ? s.members : [s]);
+      source = { kind: "bundle", members, path: members[0].path || members[0].channel };
+      merge = false;
+    }
     applySourceSpec(source);
-    const merge = !!options.merge;
     let summary;
-    if (source.kind === "file") {
+    if (source.kind === "bundle") {
+      summary = await api("load_bundle", { members: source.members.map(s => s.kind === "file" ? { ...s, paths: s.paths?.length ? s.paths : [s.path], format: s.format || "auto" } : { ...s, maxEvents: s.maxEvents || 5000 }) }, { silent: true });
+    } else if (source.kind === "file") {
       summary = source.paths.length > 1
         ? await api("load_files", { paths: source.paths, format: source.format || "auto", merge }, { silent: true })
         : await api("load_file", { path: source.path, format: source.format || "auto", merge }, { silent: true });
@@ -783,7 +796,7 @@ async function loadData(requestedSource = null, options = {}) {
     state.columns = summary.columns;
     const savedArtifact = c.artifacts?.find((a) => a.id === artifactIdFromSource(source));
     state.visibleCols = savedArtifact?.visibleCols?.filter((col) => summary.columns.includes(col));
-    if (!state.visibleCols?.length) state.visibleCols = ["timestamp", "level", "code", "name", "message"];
+    if (!state.visibleCols?.length) state.visibleCols = ["timestamp", "level", "source", "message"];
     state.colWidths = { ...(savedArtifact?.colWidths || {}) };
     if (options.restoreCurrentFilters) restoreCurrentSavedFilter();
     else {
@@ -807,7 +820,7 @@ async function loadData(requestedSource = null, options = {}) {
       id: artifactIdFromSource(source),
       label: summary.source_desc,
       kind: source.kind,
-      path: source.kind === "file" ? source.path : source.channel,
+      path: source.kind === "eventlog" ? source.channel : source.path,
       count: summary.count,
       loadedAt: Date.now(),
       source,
@@ -833,11 +846,14 @@ async function loadData(requestedSource = null, options = {}) {
     api("profile_fields", { filters: [] }, { silent: true })
       .then((profiles) => { state.datasetProfiles = profiles; renderExploreTree(); })
       .catch(() => {});
-    autoVisibleCols();
+    if (!savedArtifact?.visibleCols?.length) autoVisibleCols();
     updateTsExample();
     updateContextBar();
     finishOperation("Artefato pronto", `${fmtNum(state.total)} eventos disponíveis`);
     hideLoadOverlay(true);
+    await window.Workspace?.loaded();
+    if (document.body.dataset.page === "summary") await window.Workspace?.showPage("summary");
+    return true;
   } catch (e) {
     if (String(e).includes("ELEVATION_REQUIRED")) {
       status.textContent = "Este canal exige permissão de administrador.";
@@ -854,8 +870,10 @@ async function loadData(requestedSource = null, options = {}) {
       status.classList.add("err");
       toast(String(e), "err");
     }
-    renderTable({ total: 0, rows: [] });
+    if (state.loaded) await refresh();
+    else renderTable({ total: 0, rows: [] });
     finishOperation("Falha ao carregar artefato", "Tente revisar a fonte ou o formato.");
+    return false;
   } finally {
     if (state.loadOverlay) hideLoadOverlay(false); // cobre cancelamento/erro
     btn.disabled = false;
@@ -1193,9 +1211,10 @@ function jsMatchFilter(ev, f) {
   const low = hay.toLowerCase();
   const needle = String(f.value ?? "").toLowerCase();
   if (f.op === "regex") {
-    try { return new RegExp(f.value, "i").test(hay); } catch { return low.includes(needle); }
+    try { return new RegExp(f.value).test(hay); } catch { return false; }
   }
   switch (f.op) {
+    case "pattern": return hay.split("\n")[0].replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b|\b(?:\d{1,3}\.){3}\d{1,3}\b|\b0x[0-9a-f]+\b|\b\d+(?:[.,]\d+)?\b/gi, "‹…›").slice(0,400) === f.value;
     case "contains": return low.includes(needle);
     case "not_contains": return !low.includes(needle);
     case "equals": return low === String(f.value ?? "").trim().toLowerCase();
@@ -1348,14 +1367,16 @@ function renderExploreTreeInto(box, scope) {
   const byName = Object.fromEntries((profiles || []).map((p) => [p.name, p]));
 
   // nó raiz: todos os campos; clique inspeciona, funil abre o filtro avançado
-  const fieldKids = columns.map((column) => {
+  const favorites = state.favoriteFields || [];
+  const fieldKids = [...columns].sort((a,b) => Number(favorites.includes(b)) - Number(favorites.includes(a))).map((column) => {
     const profile = byName[column];
     const kind = profile?.kind || (column === "timestamp" ? "time" : "text");
     const row = el("div", "field-row");
+    row.dataset.field = `${column} ${colLabel(column)}`.toLocaleLowerCase();
     if (hasColFilter(column)) row.classList.add("has-filter");
     const main = el("button", "field-item");
     main.innerHTML = `<i class="fas ${FIELD_KIND_ICONS[kind] || "fa-font"}"></i><span>${esc(colLabel(column))}</span><small>${profile?.cardinality ? fmtNum(profile.cardinality) : ""}</small>`;
-    main.title = `Inspecionar campo: ${colLabel(column)}`;
+    main.title = `Inspecionar campo: ${colLabel(column)}${profile?.sampled_events ? ` · perfil de ${fmtNum(profile.sampled_events)} eventos amostrados` : ""}`;
     main.onclick = () => showFieldInspector(column);
     const adv = el("button", "icon-btn field-adv-btn");
     adv.innerHTML = '<i class="fas fa-filter"></i>';
@@ -1366,9 +1387,17 @@ function renderExploreTreeInto(box, scope) {
       $("#fp-col").value = column;
     };
     row.append(main, adv);
+    const favorite = el("button", "icon-btn field-favorite");
+    favorite.innerHTML = `<i class="${favorites.includes(column) ? "fas" : "far"} fa-star"></i>`;
+    favorite.setAttribute("aria-label", `${favorites.includes(column) ? "Desafixar" : "Fixar"} ${colLabel(column)}`);
+    favorite.title = favorite.getAttribute("aria-label");
+    favorite.onclick = () => { state.favoriteFields = favorites.includes(column) ? favorites.filter(c => c !== column) : [...favorites, column]; localStorage.setItem("workspace.fields", JSON.stringify(state.favoriteFields)); renderExploreTree(); };
+    row.append(favorite);
     return row;
   });
-  box.appendChild(treeNode({ id: `fields-${scope}`, icon: "fa-table-columns", label: "Campos", meta: String(columns.length), kids: fieldKids }));
+  const searchFields = el("input", "field-search"); searchFields.type = "search"; searchFields.placeholder = "Buscar campo…"; searchFields.setAttribute("aria-label", "Buscar campo");
+  searchFields.oninput = () => fieldKids.forEach(row => row.hidden = !row.dataset.field.includes(searchFields.value.toLocaleLowerCase()));
+  box.appendChild(treeNode({ id: `fields-${scope}`, icon: "fa-table-columns", label: "Campos", meta: String(columns.length), kids: [searchFields, ...fieldKids] }));
 
   // campos customizados (regex): gerenciáveis, com edição
   if (state.derivedFields?.length) {
@@ -1520,13 +1549,17 @@ async function refresh() {
   startOperation("explore", "Atualizando exploração", "Lendo eventos e calculando recortes");
   let snapshot;
   try {
-    snapshot = await api("explore_snapshot", {
+    const cacheKey = JSON.stringify([filters, state.currentArtifact?.loadedAt]);
+    const cached = state.explorerCache?.key === cacheKey ? state.explorerCache.snapshot : null;
+    const result = await api(cached ? "query_events" : "explore_snapshot", {
       filters,
       sortColumn: state.sortCol,
       sortDir: state.sortDir,
       offset: state.page * state.pageSize,
       limit: state.pageSize,
     });
+    snapshot = cached ? { ...cached, query: result } : result;
+    if (version === state.refreshVersion) state.explorerCache = { key: cacheKey, snapshot };
   } catch (e) {
     loading.done();
     if (version === state.refreshVersion) {
@@ -1567,7 +1600,8 @@ async function refresh() {
   else if (state.activeDatasetTab === "cube") runCube();
   else if (state.activeDatasetTab === "group") runGroup();
   loading.done();
-  finishOperation("Exploração atualizada", `${fmtNum(qr.total)} eventos no recorte atual`);
+  finishOperation("Pronto", `${fmtNum(qr.total)} eventos no recorte`);
+  window.Workspace?.onRefresh();
 }
 
 function scheduleRefresh() {
@@ -1860,6 +1894,8 @@ function tsFormatValue() {
 
 function buildTsConfig() {
   return {
+    timezone_offset_minutes: $("#ts-zone").value === "" ? null : Number($("#ts-zone").value),
+    clock_adjustment_ms: Number($("#ts-clock").value || 0) * 1000,
     sources: state.tsSources,
     rules: collectTsRules(),
     format: tsFormatValue(),
@@ -1868,12 +1904,15 @@ function buildTsConfig() {
 }
 
 async function loadTsConfig(path) {
+  $("#ts-zone").value = ""; $("#ts-clock").value = "0";
   state.tsSources = [];
   $("#ts-regex").value = "";
   $("#ts-complement").value = "";
   try {
     const cfg = await api("get_ts_config", { path }, { silent: true });
     if (cfg) {
+      $("#ts-zone").value = cfg.timezone_offset_minutes == null ? "" : String(cfg.timezone_offset_minutes);
+      $("#ts-clock").value = String((cfg.clock_adjustment_ms || 0) / 1000);
       state.tsSources = cfg.sources || [];
       $("#ts-rules").innerHTML = "";
       const rules = cfg.rules?.length ? cfg.rules : [{ regex: cfg.regex, template: cfg.template }];
@@ -1895,7 +1934,7 @@ async function testTsConfig() {
   const box = $("#ts-test-result");
   box.innerHTML = "";
   try {
-    const rows = await api("test_ts_config", { config: buildTsConfig() }, { silent: true });
+    const rows = await api("test_ts_config", { config: buildTsConfig(), path: tsConfigPath() }, { silent: true });
     for (const [entrada, resultado] of rows) {
       const row = el("div", "tr-row");
       const ok = !resultado.includes("não reconhecido");
@@ -1909,7 +1948,11 @@ async function testTsConfig() {
 }
 
 // todos os arquivos do conjunto atual (união), ou o caminho do campo
+function tsConfigPath() { return state.tsEditingPath || state.currentArtifact?.path || $("#file-path").value.split(";")[0].trim(); }
 function tsConfigPaths() {
+  if (state.tsEditingPath) return [state.tsEditingPath];
+  const members = state.currentArtifact?.source?.members;
+  if (members) return members.flatMap(s => s.kind === "file" ? (s.paths?.length ? s.paths : [s.path]) : []);
   const fromSource = state.currentArtifact?.source?.paths?.filter(Boolean);
   if (fromSource?.length) return fromSource;
   const single = tsConfigPath();
@@ -2662,21 +2705,23 @@ function createStation({ name, host = "", notes = "" }) {
 let casesSaveQueue = Promise.resolve();
 let caseSaveErrorShown = false;
 
+let caseSaveTimer = null;
+let caseSaveWaiters = [];
 function saveCases() {
-  // Cada alteracao captura um retrato completo do Caso e entra em uma fila.
-  // Assim uma escrita antiga nao pode terminar depois e sobrescrever uma nova.
-  const snapshot = JSON.parse(JSON.stringify(state.cases));
-  casesSaveQueue = casesSaveQueue
-    .catch(() => {})
-    .then(() => api("cases_save", { data: snapshot }, { silent: true }))
-    .then(() => { caseSaveErrorShown = false; })
-    .catch((error) => {
-      if (!caseSaveErrorShown) {
-        caseSaveErrorShown = true;
-        toast(`Nao foi possivel salvar o Caso em disco: ${error}`, "err");
-      }
-    });
-  return casesSaveQueue;
+  clearTimeout(caseSaveTimer);
+  const result = new Promise((resolve, reject) => caseSaveWaiters.push({ resolve, reject }));
+  // Autosave is coalesced, while callers can still await durable persistence.
+  caseSaveTimer = setTimeout(() => {
+    const waiters = caseSaveWaiters.splice(0);
+    const snapshot = JSON.parse(JSON.stringify({ ...state.cases, schemaVersion: 2 }));
+    casesSaveQueue = casesSaveQueue.catch(() => {}).then(() => api("cases_save", { data: { ...snapshot, revision: state.cases.revision } }, { silent: true }))
+      .then(result => { if (result?.revision != null) state.cases.revision = result.revision; caseSaveErrorShown = false; waiters.forEach(w => w.resolve(true)); })
+      .catch(error => {
+        if (!caseSaveErrorShown) { caseSaveErrorShown = true; toast(`Não foi possível salvar: ${error}`, "err"); }
+        waiters.forEach(w => w.resolve(false));
+      });
+  }, 200);
+  return result;
 }
 
 function defaultCaseWorkspace() {
@@ -2771,7 +2816,7 @@ function normalizeCaseStore(loaded) {
     workspace: normalizeCaseWorkspace(raw.workspace),
   }));
   const active = cases.some((item) => item.id === loaded?.active) ? loaded.active : (cases[0]?.id || null);
-  return { active, cases };
+  return { active, cases, schemaVersion: loaded?.schemaVersion || 2, revision: loaded?.revision };
 }
 function activeCase() {
   return state.cases.cases.find((c) => c.id === state.cases.active) || null;
@@ -4035,7 +4080,7 @@ function renderChart(stats) {
       ],
       series: [
         {},
-        { stroke: "#2f6fed", width: 1.5, fill: isLight() ? "rgba(47,111,237,0.18)" : "rgba(47,111,237,0.28)", points: { show: false } },
+        { stroke: isLight() ? "#14745c" : "#83e3c3", width: 1.5, fill: isLight() ? "rgba(20,116,92,0.12)" : "rgba(131,227,195,0.1)", points: { show: false } },
       ],
       hooks: {
         setSelect: [
@@ -4065,7 +4110,8 @@ function fillColumnControls() {
   renderAggs();
 }
 
-function openTsModal() {
+function openTsModal(path = null) {
+  state.tsEditingPath = typeof path === "string" ? path : null;
   if (!document.querySelector("#ts-rules .dv-rule")) tsAddRule();
   updateTsExample();
   $("#ts-modal").hidden = false;
@@ -4191,12 +4237,16 @@ function showStationInspector(station) {
   openContextInspector("Estação", station.name, overview);
 }
 
-function showDetail(ev) {
+function showDetail(ev, sourceSpec = null) {
   state.detailId = ev.id;
   state.currentDetailEv = ev;
+  state.detailSourceSpec = sourceSpec;
+  const follow = $("#ws-detail-follow"), context = $("#ws-detail-context");
+  if (follow) follow.hidden = !["trace_id", "trace.id", "request_id", "requestId", "correlation_id", "session_id"].some(key => ev.fields?.[key]);
+  if (context) context.hidden = ev.timestamp == null;
 
-  $("#dr-prev").hidden = false;
-  $("#dr-next").hidden = false;
+  $("#dr-prev").hidden = !!sourceSpec;
+  $("#dr-next").hidden = !!sourceSpec;
   $("#dr-copy").hidden = false;
   document.querySelectorAll("#drawer .dtab").forEach((tab) => { tab.hidden = false; });
 
@@ -4479,9 +4529,10 @@ function showSourceMode(mode) {
 }
 
 function switchView(which) {
+  window.Workspace?.onView(which);
   if (which === "source") showSourceMode("list");
   state.activeContext = which === "estacoes" ? "station"
-    : ((which === "viz" || which === "source" || which === "trail") ? "artifact" : "case");
+    : ((which === "viz" || which === "source" || which === "trail" || which === "workspace") ? "artifact" : "case");
   if (["caso", "estacoes", "case-dashboard", "case-cube", "trail"].includes(which)) {
     saveCaseWorkspace(which);
   }
@@ -4505,7 +4556,7 @@ function switchView(which) {
   if (which === "estacoes") renderStations();
   if (which === "case-dashboard") openDashboard("case");
   if (which === "case-cube") openCube("case");
-  if (which === "viz") switchTab(state.activeDatasetTab);
+  if (which === "viz") { switchTab(state.activeDatasetTab); requestAnimationFrame(() => { const box = $("#chart"); if (chart && box.clientWidth > 0) chart.setSize({ width: box.clientWidth - 4, height: 96 }); }); }
   updateContextBar();
 }
 
@@ -4688,6 +4739,9 @@ async function renderMcpPane() {
   }
   if (status.running && status.port) rowStatus.appendChild(el("span", "muted small", `porta ${status.port}`));
   box.appendChild(rowStatus);
+  const toggle = el("button", "btn ghost small", status.enabled ? "Desativar integração" : "Ativar integração");
+  toggle.onclick = async () => { toggle.disabled = true; try { await api("mcp_configure", { enabled: !status.enabled }); await renderMcpPane(); } finally { toggle.disabled = false; } };
+  box.appendChild(toggle);
 
   if (status.running && status.url) {
     const rowUrl = el("div", "mcp-status-row");
@@ -4697,7 +4751,7 @@ async function renderMcpPane() {
   }
   if (!status.enabled) {
     box.appendChild(el("p", "mcp-note",
-      "Servidor MCP desativado — edite o mcp.json definindo \"enabled\": true e reinicie o aplicativo."));
+      "Ative para conectar um cliente aos logs e às investigações deste aplicativo."));
   } else if (!status.running) {
     box.appendChild(el("p", "mcp-note",
       "O MCP está habilitado, mas o servidor não está em execução — reinicie o aplicativo."));
@@ -4716,17 +4770,17 @@ async function renderMcpPane() {
     // ---- como configurar
     const port = status.port || 39117;
     const url = status.url || `http://127.0.0.1:${port}/mcp`;
+    const headers = { Authorization: `Bearer ${status.token || ""}` };
     const fldConfig = el("div", "fld");
     fldConfig.appendChild(el("label", "", "Como configurar"));
     fldConfig.appendChild(mcpSnippet("VS Code (mcp.json)",
-      JSON.stringify({ servers: { loginsight: { type: "http", url } } }, null, 2)));
+      JSON.stringify({ servers: { loginsight: { type: "http", url, headers } } }, null, 2)));
     fldConfig.appendChild(mcpSnippet("opencode (opencode.json)",
-      JSON.stringify({ mcp: { loginsight: { type: "remote", url, enabled: true } } }, null, 2)));
+      JSON.stringify({ mcp: { loginsight: { type: "remote", url, headers, enabled: true } } }, null, 2)));
     fldConfig.appendChild(mcpSnippet("Claude Code (terminal)",
-      `claude mcp add --transport http loginsight ${url}`));
+      `claude mcp add --transport http loginsight ${url} --header "Authorization: Bearer ${status.token || ""}"`));
     fldConfig.appendChild(el("p", "muted small",
-      "Outros clientes: qualquer cliente MCP com suporte a HTTP (streamable HTTP) pode apontar direto para a URL acima; " +
-      `clientes só-stdio podem usar uma ponte, ex.: npx mcp-remote ${url}`));
+      "Use a URL local e o cabeçalho Authorization no seu cliente. A chave permite consultar e alterar os dados abertos."));
     const adv = el("div", "mcp-status");
     const advRow = el("div", "mcp-status-row");
     advRow.appendChild(el("span", "muted small", "Config avançada:"));
@@ -5316,7 +5370,7 @@ switchView("source");
       state.cases = normalizeCaseStore(loaded);
       saveCases();
     }
-  } catch { /* mantém vazio */ }
+  } catch (error) { toast(`Não foi possível abrir as investigações: ${error}`, "err"); }
   renderCaseBar();
   updateAnalysisBadge();
   if (activeCase()) {
@@ -5385,11 +5439,13 @@ function caseEventsCompute() {
     if (state.stationAnalyticsId && item.stationId !== state.stationAnalyticsId) continue;
     for (const row of item.rows || []) {
       if (!Number.isInteger(row.id)) continue;
-      const key = [row.id, row.timestamp, row.source, row.code, row.message].join("\u001f");
+      const key = row.event_ref || [row.fields?.caminho || item.artifactId || item.origin, row.id, row.timestamp, row.source, row.code, row.message].join("\u001f");
       if (seen.has(key)) continue;
       seen.add(key);
       events.push({
-        id: row.id,
+        id: events.length,
+        event_ref: row.event_ref || "",
+        parse_status: row.parse_status || "",
         timestamp: row.timestamp ?? null,
         source: row.source || "",
         level: row.level || "",
@@ -5397,7 +5453,7 @@ function caseEventsCompute() {
         name: row.name || "",
         description: row.description || "",
         message: row.message || "",
-        raw: "",
+        raw: row.raw || "",
         fields: row.fields || {},
       });
     }
@@ -6205,6 +6261,7 @@ async function runCube() {
       spec: { rows: cube.rows, cols: cube.cols, values: cube.values, limit_rows: 2000 },
     });
     if (version !== cubeState.requestVersion || scope !== state.analyticsScope || cube.id !== activeCube(scope).id) return;
+    if (res.complete === false) toast(`Resultado parcial: ${fmtNum(res.processed_events)} eventos analisados. Reduza as dimensões ou o período.`, "info");
     cubeState.result = res;
     cubeState.results.set(resultKey, res);
     cube.lastSchemaSignature = cubeSchemaSignature(cube);
@@ -6637,7 +6694,7 @@ function legacyRenderCubeTable(cube, res) {
   tbody.appendChild(trt);
   if (res.truncated) {
     const tr = el("tr");
-    const td = el("td", "muted small", "… resultado truncado em 2.000 linhas");
+    const td = el("td", "muted small", res.complete === false ? `Resultado parcial: ${fmtNum(res.processed_events)} eventos analisados. Reduza as dimensões ou o período.` : "Exibição limitada a 2.000 linhas; totais calculados sobre o recorte completo.");
     td.colSpan = 1 + nCols * res.value_names.length;
     tr.appendChild(td);
     tbody.appendChild(tr);
@@ -6802,7 +6859,7 @@ function renderCubeTable(cube, res) {
   tbody.appendChild(total);
   if (res.truncated) {
     const tr = el("tr");
-    const td = el("td", "muted small", "... resultado truncado em 2.000 linhas");
+    const td = el("td", "muted small", res.complete === false ? `Resultado parcial: ${fmtNum(res.processed_events)} eventos analisados. Reduza as dimensões ou o período.` : "Exibição limitada a 2.000 linhas; totais calculados sobre o recorte completo.");
     td.colSpan = dimensionCount + nCols * nValues;
     tr.appendChild(td);
     tbody.appendChild(tr);

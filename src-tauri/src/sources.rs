@@ -1,6 +1,8 @@
-use crate::model::{label_class, CodesConfig, Event, LineMeta, STANDARD_COLUMNS, LV_CRIT, LV_DEBUG, LV_ERR, LV_INFO, LV_OTHER, LV_TRACE, LV_WARN};
+use crate::model::{
+    label_class, CodesConfig, Event, LineMeta, LV_CRIT, LV_DEBUG, LV_ERR, LV_INFO, LV_OTHER,
+    LV_TRACE, LV_WARN, STANDARD_COLUMNS,
+};
 use chrono::Datelike;
-use rayon::prelude::*;
 use serde_json::{Map, Value};
 
 /// Interpreta data/hora "naive" (sem fuso) como horário LOCAL da máquina.
@@ -90,9 +92,8 @@ fn event_from_json(mut map: Map<String, Value>, raw: &str) -> Event {
 
     // ECS (Elastic Common Schema): campos aninhados conhecidos (pré-extraídos
     // para não misturar borrows mutáveis/imutáveis do mapa)
-    let nested = |obj: &str, key: &str| -> Option<Value> {
-        map.get(obj).and_then(|o| o.get(key)).cloned()
-    };
+    let nested =
+        |obj: &str, key: &str| -> Option<Value> { map.get(obj).and_then(|o| o.get(key)).cloned() };
     let ecs_ts = map.get("@timestamp").cloned();
     let ecs_level = nested("log", "level");
     let ecs_code = nested("event", "code");
@@ -103,7 +104,11 @@ fn event_from_json(mut map: Map<String, Value>, raw: &str) -> Event {
     }
     map.remove("@timestamp");
     if let Some(v) = take_key(&mut map, LEVEL_KEYS).or(ecs_level) {
-        ev.level = normalize_level(v.as_str().unwrap_or_default());
+        ev.level = normalize_level(
+            &v.as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| v.to_string()),
+        );
     }
     if let Some(v) = take_key(&mut map, CODE_KEYS).or(ecs_code) {
         ev.code = match &v {
@@ -115,7 +120,10 @@ fn event_from_json(mut map: Map<String, Value>, raw: &str) -> Event {
         ev.source = v.as_str().unwrap_or_default().to_string();
     }
     if let Some(v) = take_key(&mut map, MSG_KEYS) {
-        ev.message = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+        ev.message = v
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| v.to_string());
     }
     if ev.message.is_empty() {
         ev.message = raw.chars().take(500).collect();
@@ -137,6 +145,7 @@ fn event_from_json(mut map: Map<String, Value>, raw: &str) -> Event {
 
 fn event_from_text(line: &str) -> Event {
     let mut ev = Event::empty();
+    ev.parse_status = "text".into();
     ev.raw = line.to_string();
     ev.message = line.to_string();
 
@@ -197,7 +206,8 @@ fn re_syslog3164() -> &'static regex::Regex {
 fn re_syslog5424() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"^(?:<(\d+)>)?1\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+\S+\s+(.*)$").unwrap()
+        regex::Regex::new(r"^(?:<(\d+)>)?1\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+\S+\s+(.*)$")
+            .unwrap()
     })
 }
 
@@ -210,9 +220,18 @@ fn re_apache() -> &'static regex::Regex {
 
 fn month_num(mon: &str) -> Option<u32> {
     Some(match mon {
-        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4,
-        "May" => 5, "Jun" => 6, "Jul" => 7, "Aug" => 8,
-        "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
         _ => return None,
     })
 }
@@ -237,7 +256,8 @@ fn parse_syslog3164(line: &str) -> Option<Event> {
     ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6]);
     ev.source = c[7].to_string();
     let proc = c[8].to_string();
-    ev.fields.insert("process".into(), Value::from(proc.clone()));
+    ev.fields
+        .insert("process".into(), Value::from(proc.clone()));
     if let Some(pid) = c.get(9) {
         ev.fields.insert("pid".into(), Value::from(pid.as_str()));
     }
@@ -252,9 +272,12 @@ fn parse_syslog5424(line: &str) -> Option<Event> {
     ev.raw = line.to_string();
     ev.timestamp = parse_timestamp(&c[2]);
     ev.source = c[3].to_string();
-    ev.fields.insert("app".into(), Value::from(c[4].to_string()));
-    ev.fields.insert("pid".into(), Value::from(c[5].to_string()));
-    ev.fields.insert("msgid".into(), Value::from(c[6].to_string()));
+    ev.fields
+        .insert("app".into(), Value::from(c[4].to_string()));
+    ev.fields
+        .insert("pid".into(), Value::from(c[5].to_string()));
+    ev.fields
+        .insert("msgid".into(), Value::from(c[6].to_string()));
     ev.message = c[7].to_string();
     ev.level = crate::model::class_label(text_level_class(c[7].as_bytes())).to_string();
     Some(ev)
@@ -270,18 +293,23 @@ fn parse_apache(line: &str) -> Option<Event> {
     }
     ev.source = c[1].to_string(); // IP do cliente
     if &c[3] != "-" {
-        ev.fields.insert("user".into(), Value::from(c[3].to_string()));
+        ev.fields
+            .insert("user".into(), Value::from(c[3].to_string()));
     }
-    ev.fields.insert("method".into(), Value::from(c[5].to_string()));
-    ev.fields.insert("path".into(), Value::from(c[6].to_string()));
-    ev.fields.insert("protocol".into(), Value::from(c[7].to_string()));
+    ev.fields
+        .insert("method".into(), Value::from(c[5].to_string()));
+    ev.fields
+        .insert("path".into(), Value::from(c[6].to_string()));
+    ev.fields
+        .insert("protocol".into(), Value::from(c[7].to_string()));
     ev.code = c[8].to_string(); // status HTTP
     ev.level = match c[8].chars().next() {
         Some('5') => "Erro".into(),
         Some('4') => "Aviso".into(),
         _ => "Informação".into(),
     };
-    ev.fields.insert("size".into(), Value::from(c[9].to_string()));
+    ev.fields
+        .insert("size".into(), Value::from(c[9].to_string()));
     if let Some(r) = c.get(10) {
         ev.fields.insert("referer".into(), Value::from(r.as_str()));
     }
@@ -304,10 +332,16 @@ fn parse_firewall(line: &str) -> Option<Event> {
     ev.raw = line.to_string();
     ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6]);
     ev.source = c[7].to_string();
-    ev.fields.insert("process".into(), Value::from(c[8].to_string()));
+    ev.fields
+        .insert("process".into(), Value::from(c[8].to_string()));
     for (key, name) in [
-        ("SRC=", "src"), ("DST=", "dst"), ("PROTO=", "proto"),
-        ("SPT=", "spt"), ("DPT=", "dpt"), ("IN=", "iface_in"), ("OUT=", "iface_out"),
+        ("SRC=", "src"),
+        ("DST=", "dst"),
+        ("PROTO=", "proto"),
+        ("SPT=", "spt"),
+        ("DPT=", "dpt"),
+        ("IN=", "iface_in"),
+        ("OUT=", "iface_out"),
     ] {
         if let Some(v) = kv(key) {
             ev.fields.insert(name.into(), Value::from(v));
@@ -319,7 +353,11 @@ fn parse_firewall(line: &str) -> Option<Event> {
             break;
         }
     }
-    ev.level = if ev.code == "DROP" || ev.code == "REJECT" { "Aviso".into() } else { "Informação".into() };
+    ev.level = if ev.code == "DROP" || ev.code == "REJECT" {
+        "Aviso".into()
+    } else {
+        "Informação".into()
+    };
     ev.message = msg;
     Some(ev)
 }
@@ -389,7 +427,9 @@ fn detect_format(bytes: &[u8]) -> &'static str {
                 csv_hint = bytes
                     .split(|&b| b == b'\n')
                     .nth(li + 1)
-                    .map(|l2| l2.iter().filter(|&&b| b == b',').count() == line.matches(',').count())
+                    .map(|l2| {
+                        l2.iter().filter(|&&b| b == b',').count() == line.matches(',').count()
+                    })
                     .unwrap_or(false);
                 continue;
             }
@@ -540,7 +580,6 @@ fn detect_entry_start(bytes: &[u8]) -> Option<regex::Regex> {
     .cloned()
 }
 
-
 /// Linha típica de corpo de stacktrace Java (continuação de evento log4j/wildfly).
 /// Recebe a linha já trimada.
 fn is_stacktrace_line(t: &str) -> bool {
@@ -589,11 +628,14 @@ fn parse_wildfly(block: &str) -> Option<Event> {
     let c = re_wildfly().captures(head.trim_end_matches('\r'))?;
     let mut ev = Event::empty();
     ev.raw = block.to_string();
-    ev.fields.insert("hora_linha".into(), Value::from(c[1].to_string()));
+    ev.fields
+        .insert("hora_linha".into(), Value::from(c[1].to_string()));
     ev.level = normalize_level(&c[2]);
     ev.source = c[3].to_string();
-    ev.fields.insert("logger".into(), Value::from(c[3].to_string()));
-    ev.fields.insert("thread".into(), Value::from(c[4].to_string()));
+    ev.fields
+        .insert("logger".into(), Value::from(c[3].to_string()));
+    ev.fields
+        .insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
     Some(ev)
@@ -609,13 +651,14 @@ fn parse_jboss(block: &str) -> Option<Event> {
     ev.timestamp = parse_timestamp(&c[1].replace(',', "."));
     ev.level = normalize_level(&c[2]);
     ev.source = c[3].to_string();
-    ev.fields.insert("logger".into(), Value::from(c[3].to_string()));
-    ev.fields.insert("thread".into(), Value::from(c[4].to_string()));
+    ev.fields
+        .insert("logger".into(), Value::from(c[3].to_string()));
+    ev.fields
+        .insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
     Some(ev)
 }
-
 
 /// Log4j/Logback: `2024-01-31 08:00:01,123 INFO [thread] com.app.Classe - mensagem`
 /// Mesmo tratamento multi-linha de `parse_wildfly`.
@@ -626,8 +669,10 @@ fn parse_log4j(block: &str) -> Option<Event> {
     ev.raw = block.to_string();
     ev.timestamp = parse_timestamp(&c[1].replace(',', "."));
     ev.level = normalize_level(&c[2]);
-    ev.fields.insert("thread".into(), Value::from(c[3].to_string()));
-    ev.fields.insert("logger".into(), Value::from(c[4].to_string()));
+    ev.fields
+        .insert("thread".into(), Value::from(c[3].to_string()));
+    ev.fields
+        .insert("logger".into(), Value::from(c[4].to_string()));
     ev.source = c[4].to_string();
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
@@ -644,11 +689,21 @@ fn parse_logfmt(line: &str) -> Option<Event> {
     ev.raw = line.to_string();
     for cap in kvs {
         let key = cap[1].to_lowercase();
-        let val = cap.get(3).map(|m| m.as_str()).unwrap_or_else(|| cap[2].trim_matches('"'));
+        let val = cap
+            .get(3)
+            .map(|m| m.as_str())
+            .unwrap_or_else(|| cap[2].trim_matches('"'));
         match key.as_str() {
             "ts" | "time" | "timestamp" => {
-                ev.timestamp = parse_timestamp(val)
-                    .or_else(|| val.parse::<f64>().ok().map(|f| if f > 1e12 { f as i64 } else { (f * 1000.0) as i64 }));
+                ev.timestamp = parse_timestamp(val).or_else(|| {
+                    val.parse::<f64>().ok().map(|f| {
+                        if f > 1e12 {
+                            f as i64
+                        } else {
+                            (f * 1000.0) as i64
+                        }
+                    })
+                });
             }
             "level" | "lvl" | "severity" => ev.level = normalize_level(val),
             "msg" | "message" => ev.message = val.to_string(),
@@ -678,7 +733,8 @@ fn parse_cef(line: &str) -> Option<Event> {
     ev.raw = line.to_string();
     ev.fields.insert("vendor".into(), Value::from(parts[1]));
     ev.source = parts[2].to_string();
-    ev.fields.insert("product_version".into(), Value::from(parts[3]));
+    ev.fields
+        .insert("product_version".into(), Value::from(parts[3]));
     ev.code = parts[4].to_string();
     ev.message = parts[5].to_string();
     let sev: u32 = parts[6].trim().parse().unwrap_or(0);
@@ -693,8 +749,15 @@ fn parse_cef(line: &str) -> Option<Event> {
         let v = v.as_str();
         match k {
             "rt" | "start" | "end" => {
-                ev.timestamp = parse_timestamp(v)
-                    .or_else(|| v.parse::<f64>().ok().map(|f| if f > 1e12 { f as i64 } else { (f * 1000.0) as i64 }));
+                ev.timestamp = parse_timestamp(v).or_else(|| {
+                    v.parse::<f64>().ok().map(|f| {
+                        if f > 1e12 {
+                            f as i64
+                        } else {
+                            (f * 1000.0) as i64
+                        }
+                    })
+                });
             }
             "msg" => ev.message = format!("{} — {}", ev.message, v),
             other => {
@@ -718,15 +781,23 @@ fn parse_leef(line: &str) -> Option<Event> {
     ev.raw = line.to_string();
     ev.fields.insert("vendor".into(), Value::from(parts[1]));
     ev.source = parts[2].to_string();
-    ev.fields.insert("product_version".into(), Value::from(parts[3]));
+    ev.fields
+        .insert("product_version".into(), Value::from(parts[3]));
     ev.code = parts[4].to_string();
     for (k, v) in parse_kv_pairs(parts[5]) {
         let k = k.as_str();
         let v = v.as_str();
         match k {
             "devTime" | "rt" | "start" => {
-                ev.timestamp = parse_timestamp(v)
-                    .or_else(|| v.parse::<f64>().ok().map(|f| if f > 1e12 { f as i64 } else { (f * 1000.0) as i64 }));
+                ev.timestamp = parse_timestamp(v).or_else(|| {
+                    v.parse::<f64>().ok().map(|f| {
+                        if f > 1e12 {
+                            f as i64
+                        } else {
+                            (f * 1000.0) as i64
+                        }
+                    })
+                });
             }
             "msg" => ev.message = v.to_string(),
             "sev" => {
@@ -792,7 +863,13 @@ fn event_from_columns(vals: Vec<String>, header: &[String], raw: &str) -> Event 
         if TS_KEYS.contains(&hl.as_str()) {
             if ev.timestamp.is_none() {
                 ev.timestamp = parse_timestamp(v).or_else(|| {
-                    v.parse::<f64>().ok().map(|f| if f > 1e12 { f as i64 } else { (f * 1000.0) as i64 })
+                    v.parse::<f64>().ok().map(|f| {
+                        if f > 1e12 {
+                            f as i64
+                        } else {
+                            (f * 1000.0) as i64
+                        }
+                    })
                 });
             }
         } else if hl == "date" {
@@ -850,7 +927,8 @@ fn looks_like_csv_header(line: &str) -> bool {
             let c = c.trim();
             !c.is_empty()
                 && c.len() <= 32
-                && c.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ' '))
+                && c.chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ' '))
                 && c.chars().filter(|ch| ch.is_whitespace()).count() <= 2
         })
 }
@@ -866,6 +944,10 @@ fn looks_like_csv_header(line: &str) -> bool {
 /// `complement`: data literal ("2026-06-24") quando o formato só tem hora.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct TsConfig {
+    #[serde(default)]
+    pub timezone_offset_minutes: Option<i32>,
+    #[serde(default)]
+    pub clock_adjustment_ms: i64,
     #[serde(default)]
     pub sources: Vec<String>,
     #[serde(default)]
@@ -895,6 +977,8 @@ pub struct TsRule {
 
 /// TsConfig com as regexes já compiladas.
 pub struct CompiledTsConfig {
+    pub timezone_offset_minutes: Option<i32>,
+    pub clock_adjustment_ms: i64,
     pub sources: Vec<String>,
     pub format: String,
     pub complement: Option<String>,
@@ -904,8 +988,17 @@ pub struct CompiledTsConfig {
 
 impl TsConfig {
     pub fn compile(&self) -> Result<CompiledTsConfig, String> {
+        if self
+            .timezone_offset_minutes
+            .is_some_and(|v| !(-840..=840).contains(&v))
+        {
+            return Err("Fuso inválido.".into());
+        }
         let raw: Vec<TsRule> = if self.rules.is_empty() {
-            vec![TsRule { regex: self.regex.clone(), template: self.template.clone() }]
+            vec![TsRule {
+                regex: self.regex.clone(),
+                template: self.template.clone(),
+            }]
         } else {
             self.rules.clone()
         };
@@ -920,6 +1013,8 @@ impl TsConfig {
             rules.push((re, r.template));
         }
         Ok(CompiledTsConfig {
+            timezone_offset_minutes: self.timezone_offset_minutes,
+            clock_adjustment_ms: self.clock_adjustment_ms,
             sources: self.sources.clone(),
             format: self.format.clone(),
             complement: self.complement.clone(),
@@ -974,7 +1069,11 @@ impl DerivedFieldCompat {
                 filter: self.filter,
             });
         }
-        DerivedField { name: self.name, source: self.source, rules }
+        DerivedField {
+            name: self.name,
+            source: self.source,
+            rules,
+        }
     }
 }
 
@@ -994,7 +1093,9 @@ pub struct CompiledDerived {
 /// tentadas em ordem (OU): a primeira que extrai valor não vazio vence.
 pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
     for d in derived {
-        let Some(val) = ev.col_str(&d.source) else { continue }; // owned: liberado para inserir o campo
+        let Some(val) = ev.col_str(&d.source) else {
+            continue;
+        }; // owned: liberado para inserir o campo
         for r in &d.rules {
             if let Some(f) = &r.filter {
                 if !crate::query::matches_filter(ev, f) {
@@ -1024,12 +1125,13 @@ pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
 }
 
 /// Como interpretar um formato customizado.
+#[derive(Clone)]
 pub enum CustomParse {
     Regex(regex::Regex),
     Delimited { sep: char, fields: Vec<String> },
 }
 
-pub struct FileIndex {
+pub struct FilePart {
     pub path: String,
     pub file_name: String,
     pub format: String,
@@ -1037,14 +1139,76 @@ pub struct FileIndex {
     pub ts_config: Option<CompiledTsConfig>,
     pub header: Vec<String>,
     pub mmap: memmap2::Mmap,
+    pub base: u64,
+    pub identity: String,
+}
+
+pub struct FileIndex {
+    pub parts: Vec<FilePart>,
     pub lines: Vec<LineMeta>,
     pub columns: Vec<String>,
+    pub time_order: std::sync::OnceLock<Vec<usize>>,
+}
+
+// Single-source configuration remains available to the existing format editor.
+impl std::ops::Deref for FileIndex {
+    type Target = FilePart;
+    fn deref(&self) -> &FilePart {
+        &self.parts[0]
+    }
+}
+impl std::ops::DerefMut for FileIndex {
+    fn deref_mut(&mut self) -> &mut FilePart {
+        &mut self.parts[0]
+    }
+}
+impl FileIndex {
+    pub fn part_at(&self, i: usize) -> &FilePart {
+        let offset = self.lines[i].offset;
+        &self.parts[self
+            .parts
+            .partition_point(|p| p.base <= offset)
+            .saturating_sub(1)]
+    }
+    pub fn append(&mut self, mut other: FileIndex) {
+        let base = self
+            .parts
+            .last()
+            .map(|p| p.base + p.mmap.len() as u64 + 1)
+            .unwrap_or(0);
+        for p in &mut other.parts {
+            p.base += base;
+        }
+        for m in &mut other.lines {
+            m.offset += base;
+        }
+        self.parts.append(&mut other.parts);
+        self.lines.append(&mut other.lines);
+        for c in other.columns {
+            if !self.columns.contains(&c) {
+                self.columns.push(c);
+            }
+        }
+        self.time_order.take();
+    }
+    pub fn bytes_len(&self) -> u64 {
+        self.parts.iter().map(|p| p.mmap.len() as u64).sum()
+    }
+    pub fn ordered(&self) -> &[usize] {
+        self.time_order.get_or_init(|| {
+            let mut order: Vec<usize> = (0..self.lines.len()).collect();
+            order.sort_unstable_by_key(|&i| (self.lines[i].ts, i));
+            order
+        })
+    }
 }
 
 pub fn line_bytes(idx: &FileIndex, i: usize) -> &[u8] {
     let m = &idx.lines[i];
-    let end = (m.offset as usize + m.len as usize).min(idx.mmap.len());
-    &idx.mmap[m.offset as usize..end]
+    let part = idx.part_at(i);
+    let start = (m.offset - part.base) as usize;
+    let end = (start + m.len as usize).min(part.mmap.len());
+    &part.mmap[start..end]
 }
 
 fn file_name_of(path: &str) -> String {
@@ -1073,6 +1237,9 @@ fn parse_with_format(s: &str, fmt: &str, complement: Option<&str>) -> Option<i64
         &[s]
     };
     for cand in candidates {
+        if let Ok(dt) = chrono::DateTime::parse_from_str(cand, fmt) {
+            return Some(dt.timestamp_millis());
+        }
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(cand, fmt) {
             return Some(naive_to_ms(dt));
         }
@@ -1128,8 +1295,22 @@ fn ts_from_joined(joined: &str, cc: &CompiledTsConfig) -> Option<i64> {
             },
             None => joined.trim().to_string(),
         };
-        if let Some(ts) = parse_with_format(&candidate, &cc.format, cc.complement.as_deref()) {
-            return Some(ts);
+        if let Some(mut ts) = parse_with_format(&candidate, &cc.format, cc.complement.as_deref()) {
+            if let Some(minutes) = cc.timezone_offset_minutes {
+                if !cc.format.contains("%z")
+                    && !cc.format.contains("%:z")
+                    && !cc.format.starts_with("epoch")
+                {
+                    use chrono::TimeZone;
+                    let local_offset = chrono::Local
+                        .timestamp_millis_opt(ts)
+                        .single()
+                        .map(|d| d.offset().local_minus_utc())
+                        .unwrap_or(0);
+                    ts += (local_offset as i64 - minutes as i64 * 60) * 1000;
+                }
+            }
+            return ts.checked_add(cc.clock_adjustment_ms);
         }
         // parse falhou: próxima regra
     }
@@ -1157,7 +1338,7 @@ pub fn apply_ts_config_event(ev: &mut Event, cc: &CompiledTsConfig) {
     }
 }
 
-pub fn apply_ts_config(ev: &mut Event, cc: &CompiledTsConfig, idx: &FileIndex, line: &str) {
+pub fn apply_ts_config(ev: &mut Event, cc: &CompiledTsConfig, idx: &FilePart, line: &str) {
     if cc.sources.is_empty() {
         return;
     }
@@ -1179,58 +1360,36 @@ pub fn apply_ts_config(ev: &mut Event, cc: &CompiledTsConfig, idx: &FileIndex, l
 
 /// Recalcula o timestamp de todas as linhas do índice com a TsConfig atual.
 /// Chamado ao aplicar/alterar a configuração de data/hora.
-pub fn retimestamp_index(idx: &mut FileIndex, progress: Option<&(dyn Fn(usize, usize) + Sync)>) {
-    let Some(cc) = idx.ts_config.take() else {
-        return;
-    };
+pub fn retimestamp_index(
+    idx: &mut FileIndex,
+    progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+) -> Result<(), String> {
     let total = idx.lines.len();
-    let done = std::sync::atomic::AtomicUsize::new(0);
-    let file_name = idx.file_name.clone();
-    let needs_line = cc.sources.iter().any(|s| s == "linha");
-    let needs_parse = cc
-        .sources
-        .iter()
-        .any(|s| !matches!(s.as_str(), "arquivo" | "caminho" | "linha"));
-    // Passo 1 (paralelo): recomputa o timestamp de cada linha.
-    let stamps: Vec<Option<i64>> = idx
-        .lines
-        .par_iter()
-        .with_min_len(4096)
-        .map(|m| {
-            let end = (m.offset as usize + m.len as usize).min(idx.mmap.len());
-            let bytes = &idx.mmap[m.offset as usize..end];
-            let mut ev = if needs_parse {
-                let mut e = parse_line(bytes, &idx.format, idx.custom.as_ref(), &idx.header);
-                e.fields
-                    .entry("arquivo".to_string())
-                    .or_insert_with(|| Value::from(file_name.clone()));
-                e
-            } else {
-                Event::empty()
-            };
-            let line;
-            if needs_line {
-                line = String::from_utf8_lossy(bytes).into_owned();
-                apply_ts_config(&mut ev, &cc, idx, &line);
-            } else {
-                apply_ts_config(&mut ev, &cc, idx, "");
-            }
+    let mut timestamps = Vec::with_capacity(total);
+    for i in 0..total {
+        if i % 2048 == 0 {
+            crate::operations::check()?;
             if let Some(cb) = progress {
-                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if n % 4096 == 0 || n == total {
-                    cb(n, total);
-                }
+                cb(i, total);
             }
-            ev.timestamp
-        })
-        .collect();
-    // Passo 2 (sequencial): aplica os timestamps calculados.
-    for (m, ts) in idx.lines.iter_mut().zip(stamps) {
-        if let Some(ts) = ts {
-            m.ts = ts;
         }
+        let part = idx.part_at(i);
+        let bytes = line_bytes(idx, i);
+        let mut ev = parse_line(bytes, &part.format, part.custom.as_ref(), &part.header);
+        if let Some(cc) = &part.ts_config {
+            apply_ts_config(&mut ev, cc, part, &String::from_utf8_lossy(bytes));
+        }
+        timestamps.push(ev.timestamp.unwrap_or(0));
     }
-    idx.ts_config = Some(cc);
+    crate::operations::check()?;
+    for (line, timestamp) in idx.lines.iter_mut().zip(timestamps) {
+        line.ts = timestamp;
+    }
+    idx.time_order.take();
+    if let Some(cb) = progress {
+        cb(total, total);
+    }
+    Ok(())
 }
 
 /// Materializa um evento completo a partir da linha indexada.
@@ -1241,27 +1400,46 @@ pub fn event_at(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Event {
+    let part = idx.part_at(i);
     let bytes = line_bytes(idx, i);
-    let mut ev = parse_line(bytes, &idx.format, idx.custom.as_ref(), &idx.header);
+    let mut ev = parse_line(bytes, &part.format, part.custom.as_ref(), &part.header);
     ev.id = i;
+    if ev.event_ref.is_empty() {
+        ev.event_ref = format!("{}:{}", part.identity, idx.lines[i].offset - part.base);
+    }
     ev.enrich(codes, system);
     ev.fields
-        .entry("arquivo".to_string())
-        .or_insert_with(|| Value::from(idx.file_name.clone()));
+        .insert("arquivo".into(), Value::from(part.file_name.clone()));
     ev.fields
-        .entry("caminho".to_string())
-        .or_insert_with(|| Value::from(idx.path.clone()));
-    if let Some(cc) = &idx.ts_config {
-        // A String da linha só é materializada quando a TsConfig a utiliza.
-        if cc.sources.iter().any(|s| s == "linha") {
-            let line = String::from_utf8_lossy(bytes).into_owned();
-            apply_ts_config(&mut ev, cc, idx, &line);
-        } else {
-            apply_ts_config(&mut ev, cc, idx, "");
-        }
+        .insert("caminho".into(), Value::from(part.path.clone()));
+    if let Some(cc) = &part.ts_config {
+        apply_ts_config(&mut ev, cc, part, &String::from_utf8_lossy(bytes));
     }
+    normalize_fields(&mut ev);
     apply_derived(&mut ev, derived);
     ev
+}
+
+pub fn normalize_fields(ev: &mut Event) {
+    for (canonical, aliases) in [
+        ("host", &["host.name", "hostname", "computer"][..]),
+        ("service", &["service.name", "app", "application"][..]),
+        (
+            "client_ip",
+            &["ip_cliente", "src", "c-ip", "remote_addr"][..],
+        ),
+        ("trace_id", &["trace.id", "traceId", "TraceId"][..]),
+        (
+            "request_id",
+            &["requestId", "request.id", "correlation_id"][..],
+        ),
+    ] {
+        if !ev.fields.contains_key(canonical) {
+            if let Some(v) = aliases.iter().find_map(|key| ev.fields.get(*key)).cloned() {
+                ev.fields.insert(canonical.into(), v);
+            }
+        }
+    }
 }
 
 pub fn parse_line(
@@ -1271,7 +1449,10 @@ pub fn parse_line(
     header: &[String],
 ) -> Event {
     let text = String::from_utf8_lossy(bytes);
-    match format {
+    let mut ev = match format {
+        "snapshot" => {
+            serde_json::from_str::<Event>(&text).unwrap_or_else(|_| event_from_text(&text))
+        }
         "jsonl" => match serde_json::from_str::<Value>(&text) {
             Ok(Value::Object(map)) => event_from_json(map, &text),
             _ => event_from_text(&text),
@@ -1294,7 +1475,9 @@ pub fn parse_line(
         "csv" => parse_csv_line(&text, header).unwrap_or_else(|| event_from_text(&text)),
         "w3c" => parse_w3c(&text, header).unwrap_or_else(|| event_from_text(&text)),
         "custom" => match custom {
-            Some(CustomParse::Regex(re)) => parse_custom(&text, re).unwrap_or_else(|| event_from_text(&text)),
+            Some(CustomParse::Regex(re)) => {
+                parse_custom(&text, re).unwrap_or_else(|| event_from_text(&text))
+            }
             Some(CustomParse::Delimited { sep, fields }) => {
                 let vals: Vec<String> = text.split(*sep).map(|s| s.trim().to_string()).collect();
                 event_from_columns(vals, fields, &text)
@@ -1302,7 +1485,12 @@ pub fn parse_line(
             None => event_from_text(&text),
         },
         _ => event_from_text(&text),
+    };
+    if ev.parse_status == "text" && format != "text" {
+        ev.parse_status = "unparsed".into();
     }
+    normalize_fields(&mut ev);
+    ev
 }
 
 /// Extrai a fatia (início, fim) do valor de uma chave JSON de primeiro nível
@@ -1359,28 +1547,9 @@ fn find_json_value(line: &[u8], keys: &[&str]) -> Option<(usize, usize)> {
     None
 }
 
-fn bytes_to_ms(v: &[u8]) -> Option<i64> {
-    let s = std::str::from_utf8(v).ok()?.trim();
-    if let Ok(f) = s.parse::<f64>() {
-        if f > 1e12 {
-            return Some(f as i64);
-        }
-        if f > 1e9 {
-            return Some((f * 1000.0) as i64);
-        }
-        return None;
-    }
-    parse_timestamp(s)
-}
-
-fn level_class_of(v: &[u8]) -> u8 {
-    let norm = normalize_level(std::str::from_utf8(v).unwrap_or_default());
-    label_class(&norm).unwrap_or(LV_OTHER)
-}
-
 fn text_level_class(line: &[u8]) -> u8 {
     let head = String::from_utf8_lossy(&line[..line.len().min(48)]).to_uppercase();
-    for (kw, class) in [
+    for (word, class) in [
         ("CRITICAL", LV_CRIT),
         ("FATAL", LV_CRIT),
         ("ERROR", LV_ERR),
@@ -1389,7 +1558,7 @@ fn text_level_class(line: &[u8]) -> u8 {
         ("DEBUG", LV_DEBUG),
         ("TRACE", LV_TRACE),
     ] {
-        if head.contains(kw) {
+        if head.contains(word) {
             return class;
         }
     }
@@ -1408,28 +1577,17 @@ fn meta_for_line(
         len: line.len() as u32,
         ..Default::default()
     };
+    let ev = parse_line(line, format, custom, header);
+    m.ts = ev.timestamp.unwrap_or(0);
+    m.level = label_class(&ev.level).unwrap_or(LV_OTHER);
+    // Offset is an optimization only; non-JSON codes are resolved from the event.
     if format == "jsonl" {
-        if let Some((a, b)) = find_json_value(line, TS_KEYS) {
-            m.ts = bytes_to_ms(&line[a..b]).unwrap_or(0);
-        }
-        if let Some((a, b)) = find_json_value(line, LEVEL_KEYS) {
-            m.level = level_class_of(&line[a..b]);
-        }
         if let Some((a, b)) = find_json_value(line, CODE_KEYS) {
-            m.code_off = a as u32;
-            m.code_len = (b - a).min(u16::MAX as usize) as u16;
+            if line.get(a..b) == Some(ev.code.as_bytes()) && b - a <= u16::MAX as usize {
+                m.code_off = a as u32;
+                m.code_len = (b - a) as u16;
+            }
         }
-    } else if format == "text" {
-        let head = String::from_utf8_lossy(&line[..line.len().min(48)]);
-        if let Some((ts, _)) = extract_leading_ts(&head) {
-            m.ts = ts;
-        }
-        m.level = text_level_class(line);
-    } else {
-        // demais formatos: parse leve da linha para extrair os metadados
-        let ev = parse_line(line, format, custom, header);
-        m.ts = ev.timestamp.unwrap_or(0);
-        m.level = label_class(&ev.level).unwrap_or(LV_OTHER);
     }
     m
 }
@@ -1481,7 +1639,7 @@ pub fn index_file(
 
     let fmt = if format == "auto" {
         detect_format(&mmap).to_string()
-    } else if format == "custom" {
+    } else if format == "custom" || format.starts_with("custom:") {
         "custom".to_string()
     } else {
         format.to_string()
@@ -1493,7 +1651,10 @@ pub fn index_file(
     if fmt == "csv" {
         if let Some(first) = mmap.split(|&b| b == b'\n').next() {
             let first = String::from_utf8_lossy(first).trim().to_string();
-            header = split_csv(&first).iter().map(|s| s.trim().to_string()).collect();
+            header = split_csv(&first)
+                .iter()
+                .map(|s| s.trim().to_string())
+                .collect();
         }
     } else if fmt == "w3c" {
         for line in mmap.split(|&b| b == b'\n').take(20) {
@@ -1510,7 +1671,7 @@ pub fn index_file(
     let total_lines = progress
         .map(|_| memchr::memchr_iter(b'\n', &mmap).count() + 1)
         .unwrap_or(0);
-    let mut lines: Vec<LineMeta> = Vec::with_capacity(mmap.len() / 48 + 16);
+    let mut lines: Vec<LineMeta> = Vec::with_capacity((mmap.len() / 160).min(1_000_000) + 16);
     let mut offset = 0usize;
     let mut first_line = true;
     let mut last_report = 0usize;
@@ -1520,7 +1681,10 @@ pub fn index_file(
         "log4j" | "wildfly" => detect_entry_start(&mmap),
         _ => None,
     };
-    for nl in memchr::memchr_iter(b'\n', &mmap) {
+    for (physical_line, nl) in memchr::memchr_iter(b'\n', &mmap).enumerate() {
+        if physical_line % 2048 == 0 {
+            crate::operations::check()?;
+        }
         let raw = &mmap[offset..nl];
         let line = if raw.last() == Some(&b'\r') {
             &raw[..raw.len() - 1]
@@ -1530,7 +1694,15 @@ pub fn index_file(
         if !line.is_empty() {
             let skip = (fmt == "csv" && first_line) || (fmt == "w3c" && line[0] == b'#');
             if !skip {
-                push_meta(&mut lines, line, offset as u64, fmt, custom.as_ref(), &header, start_re.as_ref());
+                push_meta(
+                    &mut lines,
+                    line,
+                    offset as u64,
+                    fmt,
+                    custom.as_ref(),
+                    &header,
+                    start_re.as_ref(),
+                );
             }
         }
         first_line = false;
@@ -1545,14 +1717,23 @@ pub fn index_file(
     if offset < mmap.len() {
         let line = &mmap[offset..];
         if !line.is_empty() {
-            push_meta(&mut lines, line, offset as u64, fmt, custom.as_ref(), &header, start_re.as_ref());
+            push_meta(
+                &mut lines,
+                line,
+                offset as u64,
+                fmt,
+                custom.as_ref(),
+                &header,
+                start_re.as_ref(),
+            );
         }
     }
 
     // Descoberta de colunas: amostra das primeiras 2.000 linhas.
     let mut columns: Vec<String> = STANDARD_COLUMNS.iter().map(|s| s.to_string()).collect();
     let mut extra = std::collections::HashSet::new();
-    for i in 0..lines.len().min(2_000) {
+    for sample in 0..lines.len().min(4_000) {
+        let i = sample * lines.len() / lines.len().min(4_000);
         let m = &lines[i];
         let ev = parse_line(
             &mmap[m.offset as usize..(m.offset as usize + m.len as usize)],
@@ -1575,16 +1756,22 @@ pub fn index_file(
         }
     }
 
+    let identity = crate::index_cache::identity(path, &mmap);
     Ok(FileIndex {
-        path: path.into(),
-        file_name: file_name_of(path),
-        format: fmt.into(),
-        custom,
-        ts_config: saved_ts,
-        header,
-        mmap,
+        parts: vec![FilePart {
+            path: path.into(),
+            file_name: file_name_of(path),
+            format: fmt.into(),
+            custom,
+            ts_config: saved_ts,
+            header,
+            mmap,
+            base: 0,
+            identity,
+        }],
         lines,
         columns,
+        time_order: std::sync::OnceLock::new(),
     })
 }
 
@@ -1617,45 +1804,79 @@ pub fn list_channels() -> Result<Vec<String>, String> {
 }
 
 #[cfg(windows)]
-pub fn read_channel(channel: &str, max_events: usize) -> Result<Vec<Event>, String> {
+pub fn visit_channel(
+    channel: &str,
+    max_events: usize,
+    mut visit: impl FnMut(Event) -> Result<(), String>,
+) -> Result<usize, String> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::EventLog::*;
-
-    unsafe {
-        let path = HSTRING::from(channel);
-        let flags = EvtQueryChannelPath.0 | EvtQueryReverseDirection.0;
-        let query = EvtQuery(None, PCWSTR(path.as_ptr()), PCWSTR::null(), flags).map_err(|e| {
-            // 0x80070005 = E_ACCESSDENIED (canal exige administrador, ex.: Security)
-            if e.code().0 as u32 == 0x80070005 {
-                "ELEVATION_REQUIRED".to_string()
-            } else {
-                e.message()
-            }
-        })?;
-
-        let mut events = Vec::new();
-        let mut batch = [0isize; 64];
-        'outer: loop {
-            let mut returned: u32 = 0;
-            if EvtNext(query, &mut batch, 0, 0, &mut returned).is_err() || returned == 0 {
-                break;
-            }
-            for &raw_h in &batch[..returned as usize] {
-                let h = EVT_HANDLE(raw_h);
-                if let Some(xml) = render_event_xml(h) {
-                    if let Some(ev) = parse_event_xml(&xml) {
-                        events.push(ev);
-                    }
-                }
-                let _ = EvtClose(h);
-                if events.len() >= max_events {
-                    break 'outer;
-                }
+    struct Handle(EVT_HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = EvtClose(self.0);
             }
         }
-        let _ = EvtClose(query);
-        Ok(events)
     }
+    unsafe {
+        let path = HSTRING::from(channel);
+        let file = std::path::Path::new(channel).is_file();
+        let flags = if file {
+            EvtQueryFilePath.0
+        } else {
+            EvtQueryChannelPath.0
+        } | EvtQueryReverseDirection.0;
+        let query = Handle(
+            EvtQuery(None, PCWSTR(path.as_ptr()), PCWSTR::null(), flags).map_err(|e| {
+                if e.code().0 as u32 == 0x80070005 {
+                    "ELEVATION_REQUIRED".into()
+                } else {
+                    e.message()
+                }
+            })?,
+        );
+        let mut count = 0;
+        let mut batch = [0isize; 64];
+        while count < max_events {
+            crate::operations::check()?;
+            let mut returned = 0;
+            if let Err(error) = EvtNext(query.0, &mut batch, 0, 0, &mut returned) {
+                if error.code().0 as u32 == 0x80070103 {
+                    break;
+                }
+                return Err(error.message());
+            }
+            if returned == 0 {
+                break;
+            }
+            // Own every returned handle before parsing, so errors and cancellation close the batch.
+            let handles: Vec<Handle> = batch[..returned as usize]
+                .iter()
+                .map(|h| Handle(EVT_HANDLE(*h)))
+                .collect();
+            for handle in handles {
+                if count >= max_events {
+                    continue;
+                }
+                crate::operations::check()?;
+                let xml = render_event_xml(handle.0)
+                    .ok_or("Não foi possível ler um evento do Windows.")?;
+                let event = parse_event_xml(&xml).ok_or("Evento Windows com XML inválido.")?;
+                visit(event)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+}
+#[cfg(not(windows))]
+pub fn visit_channel(
+    _channel: &str,
+    _max_events: usize,
+    _visit: impl FnMut(Event) -> Result<(), String>,
+) -> Result<usize, String> {
+    Err("Leitura do Event Log só está disponível no Windows.".into())
 }
 
 #[cfg(windows)]
@@ -1708,16 +1929,12 @@ fn parse_event_xml(xml: &str) -> Option<Event> {
         }
     }
     if let Some(n) = system.children().find(|n| n.has_tag_name("Computer")) {
-        ev.fields.insert(
-            "computer".into(),
-            Value::from(n.text().unwrap_or_default()),
-        );
+        ev.fields
+            .insert("computer".into(), Value::from(n.text().unwrap_or_default()));
     }
     if let Some(n) = system.children().find(|n| n.has_tag_name("Channel")) {
-        ev.fields.insert(
-            "channel".into(),
-            Value::from(n.text().unwrap_or_default()),
-        );
+        ev.fields
+            .insert("channel".into(), Value::from(n.text().unwrap_or_default()));
     }
 
     // Corpo do evento: EventData (Data name=valor) ou UserData.
@@ -1733,7 +1950,10 @@ fn parse_event_xml(xml: &str) -> Option<Event> {
             }
         }
     } else if let Some(ud) = root.children().find(|n| n.has_tag_name("UserData")) {
-        for d in ud.descendants().filter(|n| n.is_element() && n.children().all(|c| c.is_text())) {
+        for d in ud
+            .descendants()
+            .filter(|n| n.is_element() && n.children().all(|c| c.is_text()))
+        {
             let text = d.text().unwrap_or_default().trim();
             if !text.is_empty() {
                 parts.push(format!("{}={text}", d.tag_name().name()));
@@ -1745,11 +1965,6 @@ fn parse_event_xml(xml: &str) -> Option<Event> {
         ev.message = "(evento sem dados)".into();
     }
     Some(ev)
-}
-
-#[cfg(not(windows))]
-pub fn read_channel(_channel: &str, _max_events: usize) -> Result<Vec<Event>, String> {
-    Err("Leitura do Event Log só está disponível no Windows.".into())
 }
 
 // --------------------------------------------- catálogo do sistema (harvest)
@@ -1778,9 +1993,19 @@ fn short_name(msg: &str) -> String {
         }
     }
     let out = out.trim().trim_end_matches('.').trim().to_string();
-    let mut out = if out.is_empty() { "Evento do sistema".to_string() } else { out };
+    let mut out = if out.is_empty() {
+        "Evento do sistema".to_string()
+    } else {
+        out
+    };
     if out.chars().count() > 72 {
-        out = out.chars().take(72).collect::<String>().trim_end().to_string() + "…";
+        out = out
+            .chars()
+            .take(72)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+            + "…";
     }
     out
 }
@@ -1825,7 +2050,15 @@ unsafe fn event_message(
         return None; // evento sem mensagem associada
     }
     let mut used: u32 = 0;
-    let _ = EvtFormatMessage(meta, None, msg_id, None, EvtFormatMessageId.0 as u32, None, &mut used);
+    let _ = EvtFormatMessage(
+        meta,
+        None,
+        msg_id,
+        None,
+        EvtFormatMessageId.0 as u32,
+        None,
+        &mut used,
+    );
     if used == 0 {
         return None;
     }
@@ -1923,6 +2156,7 @@ pub fn harvest_system_codes() -> Result<(crate::model::CodesConfig, usize), Stri
 #[cfg(all(test, windows))]
 mod tests {
     #[test]
+    #[ignore = "Requires installed Windows providers; run explicitly as an integration check."]
     fn harvest_extracts_events() {
         let (cfg, total) = super::harvest_system_codes().expect("harvest falhou");
         eprintln!("fontes: {}, eventos: {}", cfg.sources.len(), total);
@@ -1930,6 +2164,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Set BENCH_FILE to a local workload and run explicitly."]
     fn bench_index_e_consulta() {
         use crate::model::CodesConfig;
         use crate::query;
@@ -1962,7 +2197,11 @@ mod tests {
             &codes,
             &[],
         );
-        eprintln!("QUERY contains(message=timeout): {} resultados em {:?}", r.total, t1.elapsed());
+        eprintln!(
+            "QUERY contains(message=timeout): {} resultados em {:?}",
+            r.total,
+            t1.elapsed()
+        );
         let t2 = std::time::Instant::now();
         let r2 = query::query_indexed(
             &idx,
@@ -1975,18 +2214,30 @@ mod tests {
             &codes,
             &[],
         );
-        eprintln!("QUERY regex(_all): {} resultados em {:?}", r2.total, t2.elapsed());
+        eprintln!(
+            "QUERY regex(_all): {} resultados em {:?}",
+            r2.total,
+            t2.elapsed()
+        );
         let t3 = std::time::Instant::now();
         let a = query::aggregate_indexed(
             &idx,
             &[],
             "level",
-            &[query::AggSpec { func: "count".into(), column: "*".into(), alias: "n".into() }],
+            &[query::AggSpec {
+                func: "count".into(),
+                column: "*".into(),
+                alias: "n".into(),
+            }],
             &codes,
             &codes,
             &[],
         );
-        eprintln!("AGG group by level: {} grupos em {:?}", a.rows.len(), t3.elapsed());
+        eprintln!(
+            "AGG group by level: {} grupos em {:?}",
+            a.rows.len(),
+            t3.elapsed()
+        );
         assert!(idx.lines.len() > 0);
     }
 
@@ -1998,7 +2249,10 @@ mod tests {
         assert_eq!(ev.level, "Erro");
         assert_eq!(ev.fields.get("src").unwrap(), "45.90.1.2");
         // LEEF
-        let ev = super::parse_leef("LEEF:1.0|Microsoft|MSExchange|2016|15345|src=10.1.1.9 sev=6 msg=Mail delivered").unwrap();
+        let ev = super::parse_leef(
+            "LEEF:1.0|Microsoft|MSExchange|2016|15345|src=10.1.1.9 sev=6 msg=Mail delivered",
+        )
+        .unwrap();
         assert_eq!(ev.code, "15345");
         assert_eq!(ev.level, "Aviso");
         assert_eq!(ev.message, "Mail delivered");
@@ -2008,18 +2262,25 @@ mod tests {
         assert!(ev.timestamp.unwrap() > 0);
         assert_eq!(ev.fields.get("thread").unwrap(), "http-nio-8080-exec-3");
         // logfmt
-        let ev = super::parse_logfmt("ts=2024-01-31T08:00:01Z level=error code=42 host=srv-01 msg=\"falha no disco\" io=123").unwrap();
+        let ev = super::parse_logfmt(
+            "ts=2024-01-31T08:00:01Z level=error code=42 host=srv-01 msg=\"falha no disco\" io=123",
+        )
+        .unwrap();
         assert_eq!(ev.level, "Erro");
         assert_eq!(ev.code, "42");
         assert_eq!(ev.source, "srv-01");
         assert_eq!(ev.message, "falha no disco");
         // csv
         let header = super::split_csv("timestamp,level,code,message,latency_ms");
-        let ev = super::parse_csv_line("2024-01-31 08:00:01,error,500,falha geral,820", &header).unwrap();
+        let ev = super::parse_csv_line("2024-01-31 08:00:01,error,500,falha geral,820", &header)
+            .unwrap();
         assert_eq!(ev.code, "500");
         assert_eq!(ev.fields.get("latency_ms").unwrap(), "820");
         // w3c
-        let header: Vec<String> = "date time s-ip cs-method cs-uri-stem sc-status".split(' ').map(|s| s.into()).collect();
+        let header: Vec<String> = "date time s-ip cs-method cs-uri-stem sc-status"
+            .split(' ')
+            .map(|s| s.into())
+            .collect();
         let ev = super::parse_w3c("2024-01-31 08:00:01 10.0.0.9 GET /api/x 500", &header).unwrap();
         assert_eq!(ev.source, "10.0.0.9");
         assert_eq!(ev.code, "500");
@@ -2029,7 +2290,10 @@ mod tests {
         assert_eq!(super::detect_format(b"LEEF:1.0|V|P|1|2|k=v\n"), "leef");
         assert_eq!(super::detect_format(b"2024-01-31 08:00:01,123 INFO [t] com.x.Y - msg\n2024-01-31 08:00:02,123 WARN [t] com.x.Y - msg2\n2024-01-31 08:00:03,123 ERROR [t] com.x.Y - msg3\n"), "log4j");
         assert_eq!(super::detect_format(b"ts=1 level=info msg=a x=1\nts=2 level=info msg=b x=2\nts=3 level=info msg=c x=3\n"), "logfmt");
-        assert_eq!(super::detect_format(b"timestamp,level,message\n2024-01-31,info,ok\n"), "csv");
+        assert_eq!(
+            super::detect_format(b"timestamp,level,message\n2024-01-31,info,ok\n"),
+            "csv"
+        );
         assert_eq!(super::detect_format(b"#Software: IIS\n#Fields: date time s-ip cs-method\n2024-01-31 08:00:01 10.0.0.1 GET\n"), "w3c");
     }
 }

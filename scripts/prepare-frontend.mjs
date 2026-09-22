@@ -9,6 +9,6 @@ const output = resolve(source, "dist");
 rmSync(output, { recursive: true, force: true });
 mkdirSync(output, { recursive: true });
 
-for (const item of ["index.html", "app.js", "styles.css", "vendor"]) {
+for (const item of ["index.html", "app.js", "workspace.js", "styles.css", "workspace.css", "vendor"]) {
   cpSync(resolve(source, item), resolve(output, item), { recursive: true });
 }

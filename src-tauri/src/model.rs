@@ -17,6 +17,11 @@ pub const STANDARD_COLUMNS: &[&str] = &[
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub id: usize,
+    /// Stable source/version/record identity; independent of result ordering.
+    #[serde(default)]
+    pub event_ref: String,
+    #[serde(default)]
+    pub parse_status: String,
     /// Epoch em milissegundos (UTC). `None` quando a linha não tem data reconhecível.
     pub timestamp: Option<i64>,
     pub source: String,
@@ -34,6 +39,8 @@ impl Event {
     pub fn empty() -> Self {
         Event {
             id: 0,
+            event_ref: String::new(),
+            parse_status: "parsed".into(),
             timestamp: None,
             source: String::new(),
             level: "Informação".into(),

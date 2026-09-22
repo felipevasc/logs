@@ -150,6 +150,8 @@
     const hay = f.column === "_all" ? ev.message : colStr(ev, f.column);
     const v = f.value ?? "";
     switch (f.op) {
+      case "pattern": return patternOf(ev.message) === v;
+      case "regex": return new RegExp(v).test(hay);
       case "contains": return hay.toLowerCase().includes(v.toLowerCase());
       case "not_contains": return !hay.toLowerCase().includes(v.toLowerCase());
       case "equals": return hay.toLowerCase() === String(v).trim().toLowerCase();
@@ -251,7 +253,35 @@
   }
 
   // ---------------------------------------------------------------- comandos
+  const patternOf = text => String(text).split("\n")[0].replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b|\b(?:\d{1,3}\.){3}\d{1,3}\b|\b0x[0-9a-f]+\b|\b\d+(?:[.,]\d+)?\b/gi, "‹…›").slice(0,400);
+  function overviewFor(rows) {
+    const times=rows.map(r=>r.timestamp).filter(t=>t!=null), start=times.length?Math.min(...times):0,end=times.length?Math.max(...times):0,width=Math.max(1000,Math.floor((end-start)/90)+1);
+    const buckets=Array.from({length:times.length?Math.floor((end-start)/width)+1:0},(_,i)=>({timestamp:start+i*width,count:0,errors:0}));
+    const patterns=new Map();let errors=0,warnings=0;
+    for(const e of rows){const err=["Erro","Crítico"].includes(e.level);errors+=err;warnings+=e.level==="Aviso";if(e.timestamp!=null){const b=buckets[Math.floor((e.timestamp-start)/width)];b.count++;b.errors+=err;}
+      const key=patternOf(e.message),p=patterns.get(key)||{pattern:key,count:0,errors:0,first:e.timestamp,last:e.timestamp,example:e};p.count++;p.errors+=err;p.first=Math.min(p.first,e.timestamp);p.last=Math.max(p.last,e.timestamp);patterns.set(key,p);}
+    const list=[...patterns.values()].sort((a,b)=>b.count-a.count);
+    const failure=list.find(p=>p.errors);
+    return {total:rows.length,errors,warnings,undated:rows.length-times.length,start:times.length?start:null,end:times.length?end:null,buckets,levels:Object.fromEntries(countBy(rows,"level")),sources:countBy(rows,"source"),patterns:list.slice(0,80),patterns_limited:false,complete:true,latency:null,
+      findings:failure?[{kind:"pattern",title:"Falha recorrente",detail:`${failure.errors} ocorrências · ${failure.pattern}`,start:failure.first,end:failure.last,event_id:failure.example.id}]:[]};
+  }
+  let mcpEnabled = true;
   const handlers = {
+    mcp_configure: ({ enabled }) => { mcpEnabled = enabled; return handlers.mcp_status(); },
+    validate_filters: ({filters}) => { for(const f of filters||[]) if(f.op==="regex") new RegExp(f.value); return null; },
+    cancel_operation: () => null,
+    expand_paths: ({paths}) => paths,
+    export_events: ({filters}) => applyFilters(filters).length,
+    export_document: () => null,
+    dataset_overview: ({filters}) => overviewFor(applyFilters(filters)),
+    list_sources: () => [{id:"mock-app",name:"application.jsonl",path:"C:\\mock\\mock.jsonl",format:"jsonl",bytes:2400000,count:events.length,undated:0,start:now-86400000,end:now,sampled:200,unparsed:0}],
+    compare_periods: ({filters,before,after}) => {
+      const rows=applyFilters(filters),a=rows.filter(e=>e.timestamp>=before.start&&e.timestamp<=before.end),b=rows.filter(e=>e.timestamp>=after.start&&e.timestamp<=after.end);
+      const groups=new Map();for(const [which,list] of [["before",a],["after",b]])for(const e of list){const k=patternOf(e.message),g=groups.get(k)||{pattern:k,before:0,after:0,example:e};g[which]++;groups.set(k,g);}
+      const changes=[...groups.values()].map(g=>({...g,before_rate:g.before/Math.max(1,a.length),after_rate:g.after/Math.max(1,b.length),delta:g.after/Math.max(1,b.length)-g.before/Math.max(1,a.length)})).sort((a,b)=>Math.abs(b.delta)-Math.abs(a.delta));
+      return {before_total:a.length,after_total:b.length,before_errors:a.filter(e=>["Erro","Crítico"].includes(e.level)).length,after_errors:b.filter(e=>["Erro","Crítico"].includes(e.level)).length,changes:changes.slice(0,100),limited:false};
+    },
+
     list_channels: () => ["Application", "System", "Security"],
     list_formats: () => [{ id: "auto", name: "Automático (inferir)" }, { id: "wildfly", name: "WildFly" }],
     list_derived_fields: () => derivedFields.map((f) => ({ ...f })),
@@ -365,8 +395,9 @@
       source_names: events.length ? [...loadedParts] : [],
     }),
     mcp_status: () => ({
-      enabled: true,
-      running: true,
+      enabled: mcpEnabled,
+      running: mcpEnabled,
+      token: "preview-key",
       port: 39117,
       url: "http://127.0.0.1:39117/mcp",
       config_path: "C:\\mock\\LogInsight\\mcp.json",
@@ -420,6 +451,7 @@
       return handlers.load_file();
     },
     load_event_log: () => handlers.load_file(),
+    load_bundle: ({ members }) => handlers.load_files({ paths: members.flatMap(s => s.paths || [s.path || s.channel]), merge: false }),
     event_detail: ({ id }) => events.find((e) => e.id === id) || null,
     query_events: ({ filters, offset, limit }) => {
       const rows = applyFilters(filters);
@@ -538,6 +570,7 @@
       },
     },
     dialog: {
+      save: () => Promise.resolve("C:\\mock\\export.jsonl"),
       open: (opts = {}) => Promise.resolve(opts.multiple
         ? ["C:\\mock\\mock.jsonl", "C:\\mock\\firewall.log"]
         : "C:\\mock\\mock.jsonl"),

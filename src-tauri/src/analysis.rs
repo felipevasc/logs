@@ -1,8 +1,6 @@
 //! Motor analítico: perfil de campos, séries para gráficos e pivô OLAP.
-use crate::model::{CodesConfig, Event};
-use rayon::prelude::*;
-use crate::query::{AggSpec, Filter};
-use crate::sources::{CompiledDerived, FileIndex};
+use crate::model::Event;
+use crate::query::AggSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -12,8 +10,8 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, PartialEq, Debug, Serialize)]
 pub enum UnitKind {
     Number,
-    Bytes,   // KB/MB/GB (x1024)
-    Bits,    // kbps/mbps (x1000, em bits)
+    Bytes, // KB/MB/GB (x1024)
+    Bits,  // kbps/mbps (x1000, em bits)
     DurationMs,
     None,
 }
@@ -65,6 +63,7 @@ fn split_num_unit(s: &str) -> (&str, &str) {
 #[derive(Serialize)]
 pub struct FieldProfile {
     name: String,
+    pub sampled_events: usize,
     kind: String, // time | number | bytes | bits | duration | category | text
     cardinality: usize,
     /// quantidade de valores vazios na amostra (vira a opção "(vazio)" na árvore)
@@ -79,7 +78,13 @@ const PROFILE_SAMPLE: usize = 3_000;
 
 fn is_ip(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
-    parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u8>().is_ok())
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 3
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u8>().is_ok()
+        })
         || (s.contains(':') && s.len() >= 3 && s.chars().all(|c| c.is_ascii_hexdigit() || c == ':'))
 }
 
@@ -175,6 +180,7 @@ impl FieldProfileBuilder {
         top.truncate(10);
         FieldProfile {
             name: name.to_string(),
+            sampled_events: self.total + self.empty,
             kind: kind.to_string(),
             cardinality,
             empty: self.empty,
@@ -194,13 +200,10 @@ fn collect_values(events: &[Event], columns: &[String]) -> HashMap<String, Vec<S
         }
     }
     // Amostra: primeiros PROFILE_SAMPLE eventos; extrai todas as colunas de uma vez.
-    for ev in events.iter().take(PROFILE_SAMPLE) {
+    for sample in 0..events.len().min(PROFILE_SAMPLE) {
+        let ev = &events[sample * events.len() / events.len().min(PROFILE_SAMPLE)];
         for (col, vals) in map.iter_mut() {
-            if let Some(s) = ev.col_str(col) {
-                if !s.is_empty() {
-                    vals.push(s);
-                }
-            }
+            vals.push(ev.col_str(col).unwrap_or_default());
         }
     }
     map
@@ -228,7 +231,7 @@ pub fn profile_fields(events: &[Event], columns: &[String]) -> Vec<FieldProfile>
 
 #[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 pub struct SeriesSpec {
-    pub chart: String, // "time" | "terms"
+    pub chart: String,  // "time" | "terms"
     pub metric: String, // count | sum | avg | min | max | distinct
     #[serde(default)]
     pub field: Option<String>, // campo numérico da métrica (None = count)
@@ -264,7 +267,7 @@ struct MetricAcc {
     n: u64,
     min: Option<f64>,
     max: Option<f64>,
-    distinct: std::collections::HashSet<String>,
+    distinct: crate::distinct::Counter,
 }
 
 impl MetricAcc {
@@ -292,10 +295,7 @@ impl MetricAcc {
             }
             _ => {
                 if let Some(f) = field {
-                    if let Some((n, _)) = ev
-                        .col_str(f)
-                        .and_then(|s| parse_num_unit(&s))
-                    {
+                    if let Some((n, _)) = ev.col_str(f).and_then(|s| parse_num_unit(&s)) {
                         self.sum += n;
                         self.n += 1;
                         self.min = Some(self.min.map(|m: f64| m.min(n)).unwrap_or(n));
@@ -354,19 +354,34 @@ fn unit_name(u: UnitKind) -> String {
 }
 
 pub fn compute_series(events: &[Event], spec: &SeriesSpec) -> SeriesResult {
+    compute_series_stream(|| events.iter().cloned(), spec)
+}
+
+pub fn compute_series_stream<F, I>(events: F, spec: &SeriesSpec) -> SeriesResult
+where
+    F: Fn() -> I,
+    I: Iterator<Item = Event>,
+{
     let limit = spec.limit.unwrap_or(10);
     let field = spec.field.as_deref();
     let unit = match (spec.unit.as_deref(), field) {
         (Some(u), _) if u != "auto" => u.to_string(),
         (Some(_), None) | (None, None) => "number".to_string(),
-        (_, Some(f)) => unit_name(dominant_unit(events, f, 500)),
+        (_, Some(f)) => unit_name(dominant_unit(
+            &events().take(500).collect::<Vec<_>>(),
+            f,
+            500,
+        )),
     };
 
     // splits: top N valores do campo de split
     let splits: Vec<String> = match &spec.split {
         Some(col) => {
             let mut counts: HashMap<String, i64> = HashMap::new();
-            for ev in events {
+            for ev in events() {
+                if crate::operations::cancelled() {
+                    break;
+                }
                 if let Some(v) = ev.col_str(col) {
                     if !v.is_empty() {
                         *counts.entry(v).or_default() += 1;
@@ -380,39 +395,34 @@ pub fn compute_series(events: &[Event], spec: &SeriesSpec) -> SeriesResult {
         None => vec![],
     };
     let split_names: Vec<String> = if splits.is_empty() {
-        vec![spec
-            .field
-            .clone()
-            .unwrap_or_else(|| "eventos".into())]
+        vec![spec.field.clone().unwrap_or_else(|| "eventos".into())]
     } else {
         splits.clone()
     };
 
     if spec.chart == "terms" {
         // ranking de valores de `field_key` (ou da métrica se count)
-        let key_field = spec
-            .field
-            .clone()
-            .unwrap_or_else(|| "level".into());
+        let key_field = spec.field.clone().unwrap_or_else(|| "level".into());
         let metric_field = if spec.metric == "count" || spec.metric == "distinct" {
             spec.field.as_deref()
         } else {
             field
         };
         let mut accs: HashMap<String, MetricAcc> = HashMap::new();
-        for ev in events {
+        for ev in events() {
+            if crate::operations::cancelled() {
+                break;
+            }
             let key = ev
                 .col_str(&key_field)
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "(vazio)".into());
             accs.entry(key)
                 .or_insert_with(|| MetricAcc::new(&spec.metric))
-                .push(ev, metric_field.map(|_| field.unwrap_or(&key_field)));
+                .push(&ev, metric_field.map(|_| field.unwrap_or(&key_field)));
         }
-        let mut items: Vec<(String, f64)> = accs
-            .iter()
-            .map(|(k, a)| (k.clone(), a.value()))
-            .collect();
+        let mut items: Vec<(String, f64)> =
+            accs.iter().map(|(k, a)| (k.clone(), a.value())).collect();
         items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         items.truncate(limit);
         return SeriesResult {
@@ -428,8 +438,12 @@ pub fn compute_series(events: &[Event], spec: &SeriesSpec) -> SeriesResult {
     }
 
     // série temporal
-    let tss: Vec<i64> = events.iter().filter_map(|ev| ev.timestamp).collect();
-    if tss.is_empty() {
+    let bounds = events()
+        .filter_map(|ev| ev.timestamp)
+        .fold(None, |acc: Option<(i64, i64)>, t| {
+            Some(acc.map(|(a, b)| (a.min(t), b.max(t))).unwrap_or((t, t)))
+        });
+    if bounds.is_none() {
         return SeriesResult {
             kind: "time".into(),
             unit,
@@ -438,14 +452,25 @@ pub fn compute_series(events: &[Event], spec: &SeriesSpec) -> SeriesResult {
             series: vec![],
         };
     }
-    let (tmin, tmax) = (*tss.iter().min().unwrap(), *tss.iter().max().unwrap());
-    let interval = spec.interval_ms.unwrap_or_else(|| {
+    let (tmin, tmax) = bounds.unwrap();
+    let interval = spec.interval_ms.filter(|n| *n > 0).unwrap_or_else(|| {
         let span = (tmax - tmin).max(1);
         // ~60 buckets; escolhe intervalo "redondo"
         let target = span / 60;
         for nice in [
-            1_000i64, 5_000, 15_000, 60_000, 300_000, 900_000, 1_800_000, 3_600_000,
-            21_600_000, 43_200_000, 86_400_000, 604_800_000, 2_592_000_000,
+            1_000i64,
+            5_000,
+            15_000,
+            60_000,
+            300_000,
+            900_000,
+            1_800_000,
+            3_600_000,
+            21_600_000,
+            43_200_000,
+            86_400_000,
+            604_800_000,
+            2_592_000_000,
         ] {
             if target <= nice {
                 return nice;
@@ -453,12 +478,15 @@ pub fn compute_series(events: &[Event], spec: &SeriesSpec) -> SeriesResult {
         }
         2_592_000_000
     });
+    let interval = interval.max((tmax.saturating_sub(tmin) / 2000).max(1));
     let n_buckets = ((tmax - tmin) / interval + 2) as usize;
 
-    let mut accs: Vec<HashMap<String, MetricAcc>> = (0..n_buckets)
-        .map(|_| HashMap::new())
-        .collect();
-    for ev in events {
+    let mut accs: Vec<HashMap<String, MetricAcc>> =
+        (0..n_buckets).map(|_| HashMap::new()).collect();
+    for ev in events() {
+        if crate::operations::cancelled() {
+            break;
+        }
         let Some(t) = ev.timestamp else { continue };
         let b = ((t - tmin) / interval) as usize;
         if b >= n_buckets {
@@ -478,7 +506,7 @@ pub fn compute_series(events: &[Event], spec: &SeriesSpec) -> SeriesResult {
         accs[b]
             .entry(name)
             .or_insert_with(|| MetricAcc::new(&spec.metric))
-            .push(ev, field);
+            .push(&ev, field);
     }
 
     SeriesResult {
@@ -527,9 +555,14 @@ pub struct PivotResult {
     /// totais[i][v]
     totals: Vec<Vec<Value>>,
     truncated: bool,
+    complete: bool,
+    processed_events: usize,
 }
 
 pub fn pivot(events: &[Event], spec: &PivotSpec) -> PivotResult {
+    pivot_stream(events.iter().cloned(), spec)
+}
+pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> PivotResult {
     let value_names: Vec<String> = spec
         .values
         .iter()
@@ -544,7 +577,7 @@ pub fn pivot(events: &[Event], spec: &PivotSpec) -> PivotResult {
 
     enum Acc {
         Count(u64),
-        CountDistinct(std::collections::HashSet<String>),
+        CountDistinct(crate::distinct::Counter),
         Num(f64, u64, f64, f64), // sum, n, min, max
         Str(Vec<String>),
     }
@@ -562,9 +595,7 @@ pub fn pivot(events: &[Event], spec: &PivotSpec) -> PivotResult {
                 Acc::Count(n) => *n += 1,
                 Acc::CountDistinct(set) => {
                     if let Some(s) = s {
-                        if set.len() < 50_000 {
-                            set.insert(s);
-                        }
+                        set.insert(s);
                     }
                 }
                 Acc::Num(sum, n, min, max) => {
@@ -627,24 +658,32 @@ pub fn pivot(events: &[Event], spec: &PivotSpec) -> PivotResult {
     let mut path_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     let n_vals = spec.values.len().max(1);
 
-    let acc_cell = |cells: &mut HashMap<(String, usize), Vec<Acc>>,
-                        path: String,
-                        col: usize,
-                        ev: &Event| {
-        let accs = cells
-            .entry((path, col))
-            .or_insert_with(|| spec.values.iter().map(|a| Acc::new(&a.func)).collect());
-        for (i, a) in spec.values.iter().enumerate() {
-            let num = ev
-                .col_str(&a.column)
-                .and_then(|s| parse_num_unit(&s).map(|(n, _)| n));
-            let s = ev.col_str(&a.column);
-            accs[i].push(num, s);
-        }
-        let _ = n_vals;
-    };
+    let acc_cell =
+        |cells: &mut HashMap<(String, usize), Vec<Acc>>, path: String, col: usize, ev: &Event| {
+            let accs = cells
+                .entry((path, col))
+                .or_insert_with(|| spec.values.iter().map(|a| Acc::new(&a.func)).collect());
+            for (i, a) in spec.values.iter().enumerate() {
+                let num = ev
+                    .col_str(&a.column)
+                    .and_then(|s| parse_num_unit(&s).map(|(n, _)| n));
+                let s = ev.col_str(&a.column);
+                accs[i].push(num, s);
+            }
+            let _ = n_vals;
+        };
 
+    let mut budget_reached = false;
+    let mut processed_events = 0;
     for ev in events {
+        if crate::operations::cancelled() {
+            break;
+        }
+        if cells.len() > 100_000 || col_keys.len() >= 200 {
+            budget_reached = true;
+            break;
+        }
+        processed_events += 1;
         // chave de coluna
         let col_key = if spec.cols.is_empty() {
             "(total)".to_string()
@@ -681,15 +720,17 @@ pub fn pivot(events: &[Event], spec: &PivotSpec) -> PivotResult {
             })
             .collect();
         if full.is_empty() {
-            acc_cell(&mut cells, "(total)".into(), ci, ev);
-            continue;
+            acc_cell(&mut cells, "(total)".into(), ci, &ev);
+            if paths.is_empty() {
+                paths.push(vec!["(total)".into()]);
+            }
         }
         for depth in 1..=full.len() {
             let path = full[..depth].join("\u{1f}");
             if path_set.insert(path.clone()) {
                 paths.push(full[..depth].to_vec());
             }
-            acc_cell(&mut cells, path, ci, ev);
+            acc_cell(&mut cells, path, ci, &ev);
         }
         // totais por coluna
         let taccs = totals
@@ -710,7 +751,7 @@ pub fn pivot(events: &[Event], spec: &PivotSpec) -> PivotResult {
         let jb = b.join("\u{1f}").to_lowercase();
         ja.cmp(&jb)
     });
-    let truncated = paths.len() > spec.limit_rows;
+    let truncated = budget_reached || paths.len() > spec.limit_rows;
     paths.truncate(spec.limit_rows);
 
     let cells_out: Vec<Vec<Vec<Value>>> = paths
@@ -755,29 +796,7 @@ pub fn pivot(events: &[Event], spec: &PivotSpec) -> PivotResult {
         cells: cells_out,
         totals: totals_out,
         truncated,
+        complete: !budget_reached,
+        processed_events,
     }
-}
-
-// ------------------------------------------------------------------ entrada
-
-/// Resolve os eventos de trabalho (memória ou índice) para os comandos.
-pub fn materialize_memory(events: &[Event], filters: &[Filter]) -> Vec<Event> {
-    let idx = crate::query::filtered_indices(events, filters);
-    idx.into_iter().map(|i| events[i].clone()).collect()
-}
-
-pub fn materialize_indexed(
-    idx: &FileIndex,
-    filters: &[Filter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-    cap: usize,
-) -> Vec<Event> {
-    let matched = crate::query::indexed_matches(idx, filters, codes, system, derived);
-    matched
-        .into_par_iter()
-        .take(cap)
-        .map(|i| crate::sources::event_at(idx, i, codes, system, derived))
-        .collect()
 }

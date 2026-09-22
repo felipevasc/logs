@@ -3,12 +3,47 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Visualizador de Logs</title>
+  <title>LogInsight</title>
   <link rel="stylesheet" href="vendor/fa/css/all.min.css" />
   <link rel="stylesheet" href="vendor/uplot/uPlot.min.css" />
   <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="workspace.css" />
 </head>
 <body>
+  <nav class="workspace-nav" aria-label="Navegação principal">
+    <a class="workspace-brand" href="#" aria-label="LogInsight — Resumo"><span class="brand-mark"><b></b><b></b><b></b></span>LogInsight</a>
+    <button class="nav-import" id="ws-open"><i class="fas fa-plus"></i> Abrir logs</button>
+    <div class="nav-pages">
+      <button data-page="summary" class="selected"><i class="fas fa-chart-simple"></i>Resumo</button>
+      <button data-page="explore"><i class="fas fa-magnifying-glass"></i>Explorar</button>
+      <button data-page="compare"><i class="fas fa-code-compare"></i>Comparar</button>
+      <button data-page="evidence"><i class="fas fa-bookmark"></i>Evidências<span id="ws-evidence-count"></span></button>
+    </div>
+    <div class="nav-bottom">
+      <button data-page="sources"><i class="fas fa-layer-group"></i>Fontes<span id="ws-source-count"></span></button>
+      <button id="ws-export"><i class="fas fa-arrow-up-from-bracket"></i>Exportar</button>
+      <button id="ws-preferences"><i class="fas fa-sliders"></i>Configurações</button>
+    </div>
+  </nav>
+  <main id="workspace-home" class="workspace-page">
+    <div class="page-heading"><div><h1 id="ws-title">Resumo</h1><span id="ws-subtitle" class="subtle"></span></div><div class="page-actions"><button id="ws-clear-scope" class="btn ghost small" hidden>Limpar filtros</button><button id="ws-reload" class="btn ghost small" title="Atualizar análise"><i class="fas fa-rotate"></i> Atualizar</button></div></div>
+    <div id="ws-empty" class="import-empty">
+      <div class="file-glyph"><i class="fas fa-file-lines"></i><span>+</span></div>
+      <h2>Abra seus logs.</h2>
+      <p>Arraste arquivos ou uma pasta para começar.</p>
+      <div class="empty-actions"><button id="ws-empty-open" class="btn primary"><i class="fas fa-folder-open"></i> Escolher arquivos</button><button id="ws-folder" class="btn ghost">Abrir pasta</button></div>
+      <button id="ws-windows" class="text-button">Windows Event Log <i class="fas fa-arrow-right"></i></button>
+      <span class="supported-formats">JSONL · Syslog · Java · CSV · IIS · CEF · GZ</span>
+    </div>
+    <div id="ws-content" hidden></div>
+  </main>
+  <div id="ws-export-modal" class="modal-overlay" hidden>
+    <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="ws-export-title">
+      <div class="modal-head"><h3 id="ws-export-title">Exportar</h3><button class="icon-btn" id="ws-export-close" aria-label="Fechar"><i class="fas fa-xmark"></i></button></div>
+      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="report">Evidências · Markdown</option><option value="case">Investigação · JSON</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask" checked> Ocultar senhas e tokens reconhecidos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
+    </div>
+  </div>
+  <div id="ws-drop" hidden><i class="fas fa-arrow-down-to-bracket"></i><strong>Solte os logs aqui</strong></div>
 
   <!-- ===================== CONTEXTO GLOBAL ===================== -->
   <header class="topbar">
@@ -491,6 +526,8 @@
           <input id="ts-template" type="hidden" />
           <pre id="ts-assembled" class="code-pane ts-assembled" hidden></pre>
         </div>
+        <div class="fld"><label for="ts-zone">Fuso do arquivo</label><select id="ts-zone"><option value="">Local da máquina</option><option value="0">UTC</option><option value="-180">UTC−03:00 · Brasília</option><option value="-240">UTC−04:00</option><option value="-300">UTC−05:00</option><option value="60">UTC+01:00</option><option value="120">UTC+02:00</option><option value="180">UTC+03:00</option></select></div>
+        <div class="fld"><label for="ts-clock">Ajuste do relógio (segundos)</label><input id="ts-clock" type="number" value="0" step="0.001"></div>
         <div class="fld">
           <label>Formato</label>
           <select id="ts-format"></select>
@@ -934,5 +971,6 @@
 
   <script src="vendor/uplot/uPlot.iife.min.js"></script>
   <script src="app.js"></script>
+  <script src="workspace.js"></script>
 </body>
 </html>

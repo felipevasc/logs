@@ -1,14 +1,21 @@
 mod analysis;
+mod case_store;
+mod distinct;
+mod index_cache;
+mod insights;
 mod mcp;
 mod model;
+mod operations;
 mod query;
+#[cfg(test)]
+mod regression_tests;
 mod sources;
+mod workspace;
 
 use model::{CodesConfig, Event, STANDARD_COLUMNS};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -62,17 +69,24 @@ fn emit_progress(
     cancellable: bool,
 ) {
     let Some(app) = app else { return };
-    let _ = app.emit("operation-progress", OperationProgress {
-        operation: operation.into(),
-        phase: phase.into(),
-        completed,
-        total,
-        unit: unit.into(),
-        cancellable,
-    });
+    let _ = app.emit(
+        "operation-progress",
+        OperationProgress {
+            operation: operation.into(),
+            phase: phase.into(),
+            completed,
+            total,
+            unit: unit.into(),
+            cancellable: cancellable
+                || matches!(operation, "carregamento" | "exploração" | "análise"),
+        },
+    );
 }
 
 pub(crate) fn config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("LOGINSIGHT_DATA_DIR") {
+        return PathBuf::from(path);
+    }
     #[cfg(windows)]
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
     #[cfg(not(windows))]
@@ -89,9 +103,10 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(f)
+    let generation = operations::generation();
+    tauri::async_runtime::spawn_blocking(move || operations::run(generation, f))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
 }
 
 const CATALOG_VERSION: u32 = 3;
@@ -152,43 +167,6 @@ fn load_system_codes(path: &PathBuf) -> CodesConfig {
         .unwrap_or_default()
 }
 
-/// Materializa todos os eventos da fonte atual (para união com outra fonte).
-fn materialize_current(state: &AppState) -> Vec<Event> {
-    let source = state.source.read();
-    match &*source {
-        SourceData::Memory(evs) => evs.clone(),
-        SourceData::Indexed(idx) => analysis::materialize_indexed(
-            idx,
-            &[],
-            &CodesConfig::default(),
-            &CodesConfig::default(),
-            &[],
-            usize::MAX,
-        ),
-        SourceData::None => vec![],
-    }
-}
-
-fn store_events(state: &AppState, mut evs: Vec<Event>, source_desc: String) -> LoadSummary {
-    let codes = state.codes.read().clone();
-    let system = state.system_codes.read().clone();
-    let derived = state.derived.read();
-    for (i, ev) in evs.iter_mut().enumerate() {
-        ev.id = i;
-        ev.enrich(&codes, &system);
-        sources::apply_derived(ev, &derived);
-    }
-    let columns = all_columns(&evs);
-    let count = evs.len();
-    *state.source.write() = SourceData::Memory(evs);
-    *state.source_names.write() = vec![source_desc.clone()];
-    LoadSummary {
-        count,
-        columns,
-        source_desc,
-    }
-}
-
 #[tauri::command]
 async fn list_channels() -> Result<Vec<String>, String> {
     offload(sources::list_channels).await?
@@ -216,35 +194,84 @@ pub(crate) fn load_event_log_impl(
     app: Option<&AppHandle>,
 ) -> Result<LoadSummary, String> {
     let max_events = max_events.clamp(1, 100_000);
-    emit_progress(app, "carregamento", "Lendo Event Log", 0, max_events, "eventos", false);
-    let evs = sources::read_channel(channel, max_events)?;
-    emit_progress(app, "carregamento", "Enriquecendo eventos", evs.len(), max_events, "eventos", false);
-    let desc = format!("Event Log: {channel}");
-    let summary = if merge.unwrap_or(false) && !matches!(&*state.source.read(), SourceData::None) {
-        let mut all = materialize_current(state);
-        all.extend(evs);
-        let mut names = state.source_names.read().clone();
-        names.push(desc);
-        let desc = names.join(" + ");
-        *state.source_names.write() = names;
-        store_events_merged(state, all, desc)
-    } else {
-        store_events(state, evs, desc)
+    emit_progress(
+        app,
+        "carregamento",
+        "Lendo Event Log",
+        0,
+        max_events,
+        "eventos",
+        false,
+    );
+    let mut idx = workspace::index_channel(channel, max_events)?;
+    operations::check()?;
+    let mut source = state.source.write();
+    let mut names = vec![format!("Event Log: {channel}")];
+    if merge.unwrap_or(false) {
+        match std::mem::replace(&mut *source, SourceData::None) {
+            SourceData::Indexed(mut previous) => {
+                previous.append(idx);
+                idx = previous;
+            }
+            SourceData::Memory(events) => match workspace::index_events(&events) {
+                Ok(mut previous) => {
+                    previous.append(idx);
+                    idx = previous;
+                }
+                Err(error) => {
+                    *source = SourceData::Memory(events);
+                    return Err(error);
+                }
+            },
+            SourceData::None => {}
+        }
+        let mut previous = state.source_names.read().clone();
+        previous.append(&mut names);
+        names = previous;
+    }
+    let summary = LoadSummary {
+        count: idx.lines.len(),
+        columns: idx.columns.clone(),
+        source_desc: names.join(" + "),
     };
-    emit_progress(app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
+    crate::operations::commit();
+    *source = SourceData::Indexed(idx);
+    *state.source_names.write() = names;
+    emit_progress(
+        app,
+        "carregamento",
+        "Concluído",
+        summary.count,
+        summary.count,
+        "eventos",
+        false,
+    );
     Ok(summary)
 }
 
-/// igual a store_events, mas preserva a lista de fontes unidas (já atualizada pelo chamador)
-fn store_events_merged(state: &AppState, evs: Vec<Event>, source_desc: String) -> LoadSummary {
-    let names = state.source_names.read().clone();
-    let summary = store_events(state, evs, source_desc);
-    *state.source_names.write() = names;
-    summary
-}
-
 /// Indexa um arquivo aplicando formato customizado e config de data/hora salva.
-fn index_source_file(path: &str, format: &str, app: Option<&AppHandle>) -> Result<sources::FileIndex, String> {
+fn index_source_file(
+    path: &str,
+    format: &str,
+    app: Option<&AppHandle>,
+) -> Result<sources::FileIndex, String> {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    if extension == "evtx" {
+        return workspace::index_channel(path, usize::MAX);
+    }
+    let expanded = if extension == "gz" {
+        Some(workspace::expand_gzip(std::path::Path::new(path))?)
+    } else {
+        None
+    };
+    let index_path = expanded
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
     let custom = if let Some(name) = format.strip_prefix("custom:") {
         let f = custom_formats()
             .into_iter()
@@ -254,15 +281,29 @@ fn index_source_file(path: &str, format: &str, app: Option<&AppHandle>) -> Resul
     } else {
         None
     };
-    let saved_ts = load_ts_config(path)
-        .map(|c| c.compile())
-        .transpose()?;
+    let saved_ts = load_ts_config(path).map(|c| c.compile()).transpose()?;
     let file_label = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
-    let mut idx = sources::index_file(path, format, custom, saved_ts, Some(&|done, total| {
-        emit_progress(app, "carregamento", &format!("Indexando {file_label}"), done, total, "linhas", false);
-    }))?;
+    let mut idx = index_cache::open(
+        &index_path,
+        format,
+        custom,
+        saved_ts,
+        Some(&|done, total| {
+            emit_progress(
+                app,
+                "carregamento",
+                &format!("Indexando {file_label}"),
+                done,
+                total,
+                "linhas",
+                false,
+            );
+        }),
+    )?;
+    idx.parts[0].path = path.to_string();
+    idx.parts[0].file_name = file_label;
     if idx.ts_config.is_some() {
-        sources::retimestamp_index(&mut idx, None);
+        sources::retimestamp_index(&mut idx, None)?;
     }
     Ok(idx)
 }
@@ -288,36 +329,70 @@ pub(crate) fn load_file_impl(
     merge: Option<bool>,
     app: Option<&AppHandle>,
 ) -> Result<LoadSummary, String> {
-    emit_progress(app, "carregamento", "Preparando arquivo", 0, 0, "linhas", false);
+    emit_progress(
+        app,
+        "carregamento",
+        "Preparando arquivo",
+        0,
+        0,
+        "linhas",
+        false,
+    );
     let idx = index_source_file(path, format, app)?;
-    emit_progress(app, "carregamento", "Indexando linhas", idx.lines.len(), idx.lines.len(), "linhas", false);
-    if merge.unwrap_or(false) && !matches!(&*state.source.read(), SourceData::None) {
-        // união: materializa a fonte atual + o novo arquivo em uma única fonte em memória
-        let mut all = materialize_current(state);
-        all.extend(analysis::materialize_indexed(
-            &idx,
-            &[],
-            &CodesConfig::default(),
-            &CodesConfig::default(),
-            &[],
-            usize::MAX,
-        ));
-        let mut names = state.source_names.read().clone();
-        names.push(format!("Arquivo: {path}"));
-        let desc = names.join(" + ");
-        *state.source_names.write() = names;
-        let summary = store_events_merged(state, all, desc);
-        emit_progress(app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
-        return Ok(summary);
+    operations::check()?;
+    emit_progress(
+        app,
+        "carregamento",
+        "Indexando linhas",
+        idx.lines.len(),
+        idx.lines.len(),
+        "linhas",
+        false,
+    );
+    let mut source = state.source.write();
+    let mut idx = idx;
+    let mut names = vec![format!("Arquivo: {path}")];
+    if merge.unwrap_or(false) {
+        // Prepare the replacement before mutating the current source.
+        let old = std::mem::replace(&mut *source, SourceData::None);
+        match old {
+            SourceData::Indexed(mut previous) => {
+                previous.append(idx);
+                idx = previous;
+            }
+            SourceData::Memory(events) => match workspace::index_events(&events) {
+                Ok(mut previous) => {
+                    previous.append(idx);
+                    idx = previous;
+                }
+                Err(e) => {
+                    *source = SourceData::Memory(events);
+                    return Err(e);
+                }
+            },
+            SourceData::None => {}
+        }
+        let mut previous_names = state.source_names.read().clone();
+        previous_names.append(&mut names);
+        names = previous_names;
     }
     let summary = LoadSummary {
         count: idx.lines.len(),
         columns: idx.columns.clone(),
-        source_desc: format!("Arquivo: {path}"),
+        source_desc: names.join(" + "),
     };
-    *state.source.write() = SourceData::Indexed(idx);
-    *state.source_names.write() = vec![summary.source_desc.clone()];
-    emit_progress(app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
+    crate::operations::commit();
+    *source = SourceData::Indexed(idx);
+    *state.source_names.write() = names;
+    emit_progress(
+        app,
+        "carregamento",
+        "Concluído",
+        summary.count,
+        summary.count,
+        "eventos",
+        false,
+    );
     Ok(summary)
 }
 
@@ -345,35 +420,60 @@ pub(crate) fn load_files_impl(
     if paths.is_empty() {
         return Err("Nenhum arquivo selecionado.".into());
     }
-    let merge = merge.unwrap_or(false) && !matches!(&*state.source.read(), SourceData::None);
-    let mut all = if merge { materialize_current(state) } else { vec![] };
-    let mut names = if merge { state.source_names.read().clone() } else { vec![] };
+    let mut indices: Option<sources::FileIndex> = None;
+    let mut names = Vec::new();
     for path in paths {
-        emit_progress(app, "carregamento", "Preparando arquivo", 0, 0, "linhas", false);
+        operations::check()?;
         let idx = index_source_file(path, format, app)?;
-        emit_progress(
-            app,
-            "carregamento",
-            "Indexando linhas",
-            idx.lines.len(),
-            idx.lines.len(),
-            "linhas",
-            false,
-        );
-        all.extend(analysis::materialize_indexed(
-            &idx,
-            &[],
-            &CodesConfig::default(),
-            &CodesConfig::default(),
-            &[],
-            usize::MAX,
-        ));
+        if let Some(ref mut all) = indices {
+            all.append(idx);
+        } else {
+            indices = Some(idx);
+        }
         names.push(format!("Arquivo: {path}"));
     }
-    let desc = names.join(" + ");
+    operations::check()?;
+    let mut source = state.source.write();
+    let mut idx = indices.unwrap();
+    if merge.unwrap_or(false) {
+        match std::mem::replace(&mut *source, SourceData::None) {
+            SourceData::Indexed(mut previous) => {
+                previous.append(idx);
+                idx = previous;
+            }
+            SourceData::Memory(events) => match workspace::index_events(&events) {
+                Ok(mut previous) => {
+                    previous.append(idx);
+                    idx = previous;
+                }
+                Err(e) => {
+                    *source = SourceData::Memory(events);
+                    return Err(e);
+                }
+            },
+            SourceData::None => {}
+        }
+        let mut previous = state.source_names.read().clone();
+        previous.append(&mut names);
+        names = previous;
+    }
+    let summary = LoadSummary {
+        count: idx.lines.len(),
+        columns: idx.columns.clone(),
+        source_desc: names.join(" + "),
+    };
+    crate::operations::commit();
+    *source = SourceData::Indexed(idx);
     *state.source_names.write() = names;
-    let summary = store_events_merged(state, all, desc);
-    emit_progress(app, "carregamento", "Concluído", summary.count, summary.count, "eventos", false);
+    emit_progress(
+        app,
+        "carregamento",
+        "Pronto",
+        summary.count,
+        summary.count,
+        "eventos",
+        false,
+    );
     Ok(summary)
 }
 
@@ -415,7 +515,8 @@ pub(crate) fn set_ts_config_impl(
     config: Option<sources::TsConfig>,
     app: Option<&AppHandle>,
 ) -> Result<(), String> {
-    // persiste por caminho de arquivo
+    let compiled = config.as_ref().map(|c| c.compile()).transpose()?;
+    // Validate before touching the saved configuration.
     let mut map: std::collections::HashMap<String, sources::TsConfig> =
         std::fs::read_to_string(ts_configs_path())
             .ok()
@@ -430,17 +531,37 @@ pub(crate) fn set_ts_config_impl(
         }
     }
     let text = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
-    std::fs::write(ts_configs_path(), text).map_err(|e| e.to_string())?;
-
-    // aplica na fonte atual se for o mesmo arquivo
-    let compiled = config.as_ref().map(|c| c.compile()).transpose()?;
     match &mut *state.source.write() {
         SourceData::Indexed(idx) => {
-            if idx.path == path {
-                idx.ts_config = compiled;
-                sources::retimestamp_index(idx, Some(&|done, total| {
-                    emit_progress(app, "data/hora", "Recalculando timestamps", done, total, "linhas", false);
-                }));
+            if let Some(position) = idx.parts.iter().position(|p| p.path == path) {
+                let previous = std::mem::replace(&mut idx.parts[position].ts_config, compiled);
+                let timestamps: Vec<i64> = idx.lines.iter().map(|m| m.ts).collect();
+                if let Err(error) = sources::retimestamp_index(
+                    idx,
+                    Some(&|done, total| {
+                        emit_progress(
+                            app,
+                            "data/hora",
+                            "Recalculando timestamps",
+                            done,
+                            total,
+                            "linhas",
+                            false,
+                        );
+                    }),
+                ) {
+                    idx.parts[position].ts_config = previous;
+                    return Err(error);
+                }
+                if let Err(error) = std::fs::write(ts_configs_path(), &text) {
+                    idx.parts[position].ts_config = previous;
+                    for (line, ts) in idx.lines.iter_mut().zip(timestamps) {
+                        line.ts = ts;
+                    }
+                    idx.time_order.take();
+                    return Err(error.to_string());
+                }
+                return Ok(());
             }
         }
         // fontes unidas/em memória: aplica aos eventos cujo arquivo de origem é este
@@ -455,24 +576,42 @@ pub(crate) fn set_ts_config_impl(
                     }
                 }
                 if i % 4096 == 0 {
-                    emit_progress(app, "data/hora", "Recalculando timestamps", i, total, "eventos", false);
+                    emit_progress(
+                        app,
+                        "data/hora",
+                        "Recalculando timestamps",
+                        i,
+                        total,
+                        "eventos",
+                        false,
+                    );
                 }
             }
-            emit_progress(app, "data/hora", "Data/hora aplicada", total, total, "eventos", false);
+            emit_progress(
+                app,
+                "data/hora",
+                "Data/hora aplicada",
+                total,
+                total,
+                "eventos",
+                false,
+            );
         }
         SourceData::None => {}
     }
+    std::fs::write(ts_configs_path(), text).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 async fn test_ts_config(
     config: sources::TsConfig,
+    path: Option<String>,
     app: AppHandle,
 ) -> Result<Vec<(String, String)>, String> {
     offload(move || {
         let state = app.state::<AppState>();
-        test_ts_config_impl(state.inner(), config)
+        test_ts_config_impl(state.inner(), config, path.as_deref())
     })
     .await?
 }
@@ -480,10 +619,11 @@ async fn test_ts_config(
 pub(crate) fn test_ts_config_impl(
     state: &AppState,
     config: sources::TsConfig,
+    path: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
     let source = state.source.read();
     let cc = config.compile()?;
-    let joined_of = |ev: &Event, line: &str, idx: Option<&sources::FileIndex>| {
+    let joined_of = |ev: &Event, line: &str, idx: Option<&sources::FilePart>| {
         config
             .sources
             .iter()
@@ -502,16 +642,20 @@ pub(crate) fn test_ts_config_impl(
     let mut out = Vec::new();
     match &*source {
         SourceData::Indexed(idx) => {
-            for i in 0..idx.lines.len().min(5) {
+            for i in (0..idx.lines.len())
+                .filter(|&i| path.is_none_or(|path| idx.part_at(i).path == path))
+                .take(5)
+            {
+                let part = idx.part_at(i);
                 let mut ev = sources::parse_line(
                     sources::line_bytes(idx, i),
-                    &idx.format,
-                    idx.custom.as_ref(),
-                    &idx.header,
+                    &part.format,
+                    part.custom.as_ref(),
+                    &part.header,
                 );
                 let line = String::from_utf8_lossy(sources::line_bytes(idx, i)).into_owned();
-                sources::apply_ts_config(&mut ev, &cc, idx, &line);
-                let entrada = joined_of(&ev, &line, Some(idx));
+                let entrada = joined_of(&ev, &line, Some(part));
+                sources::apply_ts_config(&mut ev, &cc, part, &line);
                 let resultado = ev
                     .timestamp
                     .map(crate::model::ts_to_iso)
@@ -555,17 +699,23 @@ fn load_derived() -> Vec<sources::CompiledDerived> {
                 .rules
                 .iter()
                 .filter_map(|r| {
-                    regex::Regex::new(&r.pattern).ok().map(|re| sources::CompiledRule {
-                        re,
-                        template: r.template.clone(),
-                        filter: r.filter.clone(),
-                    })
+                    regex::Regex::new(&r.pattern)
+                        .ok()
+                        .map(|re| sources::CompiledRule {
+                            re,
+                            template: r.template.clone(),
+                            filter: r.filter.clone(),
+                        })
                 })
                 .collect();
             if rules.is_empty() {
                 None
             } else {
-                Some(sources::CompiledDerived { name: d.name, source: d.source, rules })
+                Some(sources::CompiledDerived {
+                    name: d.name,
+                    source: d.source,
+                    rules,
+                })
             }
         })
         .collect()
@@ -642,12 +792,11 @@ pub(crate) fn save_derived_field_impl(
                 .map_err(|e| format!("Regex inválida em regra ({}): {e}", r.pattern))
         })
         .collect::<Result<_, _>>()?;
-    let mut defs: Vec<sources::DerivedFieldCompat> = std::fs::read_to_string(derived_path())
+    let defs: Vec<sources::DerivedFieldCompat> = std::fs::read_to_string(derived_path())
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
-    let mut defs: Vec<sources::DerivedField> =
-        defs.into_iter().map(|d| d.normalize()).collect();
+    let mut defs: Vec<sources::DerivedField> = defs.into_iter().map(|d| d.normalize()).collect();
     defs.retain(|d| d.name != name);
     defs.push(sources::DerivedField {
         name: name.to_string(),
@@ -686,8 +835,7 @@ pub(crate) fn delete_derived_field_impl(state: &AppState, name: &str) -> Result<
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
-    let mut defs: Vec<sources::DerivedField> =
-        defs.into_iter().map(|d| d.normalize()).collect();
+    let mut defs: Vec<sources::DerivedField> = defs.into_iter().map(|d| d.normalize()).collect();
     defs.retain(|d| d.name != name);
     let text = serde_json::to_string_pretty(&defs).map_err(|e| e.to_string())?;
     std::fs::write(derived_path(), text).map_err(|e| e.to_string())?;
@@ -900,7 +1048,7 @@ pub(crate) fn source_summary_impl(state: &AppState) -> SourceSummary {
         SourceData::Indexed(idx) => (
             idx.lines.len(),
             idx.columns.clone(),
-            format!("Arquivo: {}", idx.path),
+            source_names.join(" + "),
         ),
     };
     SourceSummary {
@@ -920,9 +1068,17 @@ async fn query_events(
     limit: usize,
     app: AppHandle,
 ) -> Result<query::QueryResult, String> {
+    workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
-        query_events_impl(state.inner(), filters, &sort_column, &sort_dir, offset, limit)
+        query_events_impl(
+            state.inner(),
+            filters,
+            &sort_column,
+            &sort_dir,
+            offset,
+            limit,
+        )
     })
     .await
 }
@@ -945,7 +1101,15 @@ pub(crate) fn query_events_impl(
             query::query(events, &filters, sort_column, sort_dir, offset, limit)
         }
         SourceData::Indexed(idx) => query::query_indexed(
-            idx, &filters, sort_column, sort_dir, offset, limit, &codes, &system, &derived,
+            idx,
+            &filters,
+            sort_column,
+            sort_dir,
+            offset,
+            limit,
+            &codes,
+            &system,
+            &derived,
         ),
         SourceData::None => query::QueryResult {
             total: 0,
@@ -963,9 +1127,18 @@ async fn explore_snapshot(
     limit: usize,
     app: AppHandle,
 ) -> Result<query::ExplorerSnapshot, String> {
+    workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
-        explore_snapshot_impl(state.inner(), filters, &sort_column, &sort_dir, offset, limit, Some(&app))
+        explore_snapshot_impl(
+            state.inner(),
+            filters,
+            &sort_column,
+            &sort_dir,
+            offset,
+            limit,
+            Some(&app),
+        )
     })
     .await
 }
@@ -979,24 +1152,53 @@ pub(crate) fn explore_snapshot_impl(
     limit: usize,
     app: Option<&AppHandle>,
 ) -> query::ExplorerSnapshot {
-    emit_progress(app, "exploração", "Aplicando filtros", 0, 0, "eventos", false);
+    emit_progress(
+        app,
+        "exploração",
+        "Aplicando filtros",
+        0,
+        0,
+        "eventos",
+        false,
+    );
     let source = state.source.read();
     let codes = state.codes.read();
     let system = state.system_codes.read();
     let derived = state.derived.read();
     let limit = limit.clamp(1, 2_000);
     let snapshot = match &*source {
-        SourceData::Memory(events) => query::explore(
-            events, &filters, sort_column, sort_dir, offset, limit,
-        ),
+        SourceData::Memory(events) => {
+            query::explore(events, &filters, sort_column, sort_dir, offset, limit)
+        }
         SourceData::Indexed(idx) => query::explore_indexed(
-            idx, &filters, sort_column, sort_dir, offset, limit, &codes, &system, &derived,
+            idx,
+            &filters,
+            sort_column,
+            sort_dir,
+            offset,
+            limit,
+            &codes,
+            &system,
+            &derived,
         ),
         SourceData::None => query::ExplorerSnapshot {
-            query: query::QueryResult { total: 0, rows: vec![] },
-            stats: query::Stats { buckets: vec![], bucket_ms: 0, levels: vec![] },
-            sources: query::AggResult { columns: vec![], rows: vec![] },
-            codes: query::AggResult { columns: vec![], rows: vec![] },
+            query: query::QueryResult {
+                total: 0,
+                rows: vec![],
+            },
+            stats: query::Stats {
+                buckets: vec![],
+                bucket_ms: 0,
+                levels: vec![],
+            },
+            sources: query::AggResult {
+                columns: vec![],
+                rows: vec![],
+            },
+            codes: query::AggResult {
+                columns: vec![],
+                rows: vec![],
+            },
         },
     };
     emit_progress(
@@ -1019,6 +1221,7 @@ async fn aggregate_events(
     case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<query::AggResult, String> {
+    workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
         aggregate_events_impl(state.inner(), &group_column, aggs, filters, case_events)
@@ -1045,9 +1248,15 @@ pub(crate) fn aggregate_events_impl(
     let derived = state.derived.read();
     match &*source {
         SourceData::Memory(events) => query::aggregate(events, &filters, group_column, &aggs),
-        SourceData::Indexed(idx) => {
-            query::aggregate_indexed(idx, &filters, group_column, &aggs, &codes, &system, &derived)
-        }
+        SourceData::Indexed(idx) => query::aggregate_indexed(
+            idx,
+            &filters,
+            group_column,
+            &aggs,
+            &codes,
+            &system,
+            &derived,
+        ),
         SourceData::None => query::AggResult {
             columns: vec![],
             rows: vec![],
@@ -1065,21 +1274,34 @@ pub(crate) struct TrailResult {
 }
 
 /// Trilha temporal em torno de um evento: N antes, o evento, N depois.
-fn trail_from_events(events: &[Event], filters: &[query::Filter], center_id: usize, before: usize, after: usize) -> TrailResult {
+fn trail_from_events(
+    events: &[Event],
+    filters: &[query::Filter],
+    center_id: usize,
+    before: usize,
+    after: usize,
+) -> TrailResult {
     let idxs = query::filtered_indices(events, filters);
     let mut rows: Vec<(i64, usize)> = idxs
         .iter()
         .map(|&i| (events[i].timestamp.unwrap_or(i64::MIN), i))
         .collect();
     rows.sort();
-    let pos = rows
-        .iter()
-        .position(|&(_, i)| i == center_id)
-        .unwrap_or_else(|| rows.len().saturating_sub(1));
+    let pos = rows.iter().position(|&(_, i)| events[i].id == center_id);
+    let Some(pos) = pos else {
+        return TrailResult {
+            events: vec![],
+            before_available: 0,
+            after_available: 0,
+        };
+    };
     let start = pos.saturating_sub(before);
     let end = (pos + after + 1).min(rows.len());
     TrailResult {
-        events: rows[start..end].iter().map(|&(_, i)| events[i].clone()).collect(),
+        events: rows[start..end]
+            .iter()
+            .map(|&(_, i)| events[i].clone())
+            .collect(),
         before_available: start,
         after_available: rows.len() - end,
     }
@@ -1095,9 +1317,17 @@ async fn trail_events(
     case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<TrailResult, String> {
+    workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
-        trail_events_impl(state.inner(), center_id, before, after, filters, case_events)
+        trail_events_impl(
+            state.inner(),
+            center_id,
+            before,
+            after,
+            filters,
+            case_events,
+        )
     })
     .await
 }
@@ -1124,12 +1354,17 @@ pub(crate) fn trail_events_impl(
                 &state.system_codes.read(),
                 &state.derived.read(),
             );
-            let mut rows: Vec<(i64, usize)> = matched.into_iter().map(|i| (idx.lines[i].ts, i)).collect();
+            let mut rows: Vec<(i64, usize)> =
+                matched.into_iter().map(|i| (idx.lines[i].ts, i)).collect();
             rows.sort();
-            let pos = rows
-                .iter()
-                .position(|&(_, i)| i == center_id)
-                .unwrap_or_else(|| rows.len().saturating_sub(1));
+            let pos = rows.iter().position(|&(_, i)| i == center_id);
+            let Some(pos) = pos else {
+                return TrailResult {
+                    events: vec![],
+                    before_available: 0,
+                    after_available: 0,
+                };
+            };
             let start = pos.saturating_sub(before);
             let end = (pos + after + 1).min(rows.len());
             let codes = state.codes.read();
@@ -1144,7 +1379,11 @@ pub(crate) fn trail_events_impl(
                 after_available: rows.len() - end,
             }
         }
-        SourceData::None => TrailResult { events: vec![], before_available: 0, after_available: 0 },
+        SourceData::None => TrailResult {
+            events: vec![],
+            before_available: 0,
+            after_available: 0,
+        },
     }
 }
 
@@ -1155,6 +1394,7 @@ async fn count_filtered(
     case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<usize, String> {
+    workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
         count_filtered_impl(state.inner(), filters, case_events)
@@ -1192,6 +1432,7 @@ async fn tree_aggs(
     case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<Vec<(String, query::AggResult)>, String> {
+    workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
         tree_aggs_impl(state.inner(), columns, filters, case_events)
@@ -1225,6 +1466,7 @@ pub(crate) fn tree_aggs_impl(
 
 #[tauri::command]
 async fn stats_events(filters: Vec<query::Filter>, app: AppHandle) -> Result<query::Stats, String> {
+    workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
         stats_events_impl(state.inner(), filters)
@@ -1280,7 +1522,7 @@ pub(crate) fn event_detail_impl(state: &AppState, id: usize) -> Option<Event> {
 
 // ------------------------------------------------------------------ análise
 
-const ANALYSIS_CAP: usize = 50_000;
+const ANALYSIS_CAP: usize = 3_000; // Distributed sample used only by field profiling.
 
 fn work_events(
     state: &AppState,
@@ -1288,33 +1530,49 @@ fn work_events(
     case_events: Option<Vec<Event>>,
 ) -> Vec<Event> {
     if let Some(events) = case_events {
-        // eventos do Caso também respeitam os filtros ativos (realidade filtrada)
-        let indices = query::filtered_indices(&events, &filters);
-        return indices
-            .into_iter()
-            .take(ANALYSIS_CAP)
-            .map(|i| events[i].clone())
+        let matched = query::filtered_indices(&events, &filters);
+        return (0..matched.len().min(ANALYSIS_CAP))
+            .map(|s| events[matched[s * matched.len() / matched.len().min(ANALYSIS_CAP)]].clone())
             .collect();
     }
     let source = state.source.read();
+    let codes = state.codes.read();
+    let system = state.system_codes.read();
+    let derived = state.derived.read();
     match &*source {
-        SourceData::Memory(events) => analysis::materialize_memory(events, &filters),
-        SourceData::Indexed(idx) => analysis::materialize_indexed(
-            idx,
-            &filters,
-            &state.codes.read(),
-            &state.system_codes.read(),
-            &state.derived.read(),
-            ANALYSIS_CAP,
-        ),
+        SourceData::Indexed(idx) => {
+            let matched = query::indexed_matches(idx, &filters, &codes, &system, &derived);
+            (0..matched.len().min(ANALYSIS_CAP))
+                .map(|s| {
+                    sources::event_at(
+                        idx,
+                        matched[s * matched.len() / matched.len().min(ANALYSIS_CAP)],
+                        &codes,
+                        &system,
+                        &derived,
+                    )
+                })
+                .collect()
+        }
+        SourceData::Memory(events) => {
+            let matched = query::filtered_indices(events, &filters);
+            (0..matched.len().min(ANALYSIS_CAP))
+                .map(|s| {
+                    events[matched[s * matched.len() / matched.len().min(ANALYSIS_CAP)]].clone()
+                })
+                .collect()
+        }
         SourceData::None => vec![],
     }
 }
 
 fn work_columns(evs: &[Event]) -> Vec<String> {
-    let mut cols: Vec<String> = model::STANDARD_COLUMNS.iter().map(|s| s.to_string()).collect();
+    let mut cols: Vec<String> = model::STANDARD_COLUMNS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let mut extra = std::collections::HashSet::new();
-    for ev in evs.iter().take(500) {
+    for ev in evs {
         for k in ev.fields.keys() {
             extra.insert(k.clone());
         }
@@ -1331,6 +1589,7 @@ async fn profile_fields(
     case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<Vec<analysis::FieldProfile>, String> {
+    workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
         profile_fields_impl(state.inner(), filters, case_events)
@@ -1355,6 +1614,7 @@ async fn compute_series(
     spec: analysis::SeriesSpec,
     app: AppHandle,
 ) -> Result<analysis::SeriesResult, String> {
+    workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
         compute_series_impl(state.inner(), filters, case_events, spec)
@@ -1368,8 +1628,35 @@ pub(crate) fn compute_series_impl(
     case_events: Option<Vec<Event>>,
     spec: analysis::SeriesSpec,
 ) -> analysis::SeriesResult {
-    let evs = work_events(state, filters, case_events);
-    analysis::compute_series(&evs, &spec)
+    if let Some(events) = case_events {
+        let matched = query::filtered_indices(&events, &filters);
+        return analysis::compute_series_stream(
+            || matched.iter().map(|&i| events[i].clone()),
+            &spec,
+        );
+    }
+    let source = state.source.read();
+    let codes = state.codes.read();
+    let system = state.system_codes.read();
+    let derived = state.derived.read();
+    match &*source {
+        SourceData::Indexed(idx) => {
+            let matched = query::indexed_matches(idx, &filters, &codes, &system, &derived);
+            analysis::compute_series_stream(
+                || {
+                    matched
+                        .iter()
+                        .map(|&i| sources::event_at(idx, i, &codes, &system, &derived))
+                },
+                &spec,
+            )
+        }
+        SourceData::Memory(events) => {
+            let matched = query::filtered_indices(events, &filters);
+            analysis::compute_series_stream(|| matched.iter().map(|&i| events[i].clone()), &spec)
+        }
+        SourceData::None => analysis::compute_series(&[], &spec),
+    }
 }
 
 #[tauri::command]
@@ -1379,6 +1666,7 @@ async fn pivot(
     spec: analysis::PivotSpec,
     app: AppHandle,
 ) -> Result<analysis::PivotResult, String> {
+    workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
         pivot_impl(state.inner(), filters, case_events, spec)
@@ -1392,8 +1680,30 @@ pub(crate) fn pivot_impl(
     case_events: Option<Vec<Event>>,
     spec: analysis::PivotSpec,
 ) -> analysis::PivotResult {
-    let evs = work_events(state, filters, case_events);
-    analysis::pivot(&evs, &spec)
+    if let Some(events) = case_events {
+        let matched = query::filtered_indices(&events, &filters);
+        return analysis::pivot_stream(matched.iter().map(|&i| events[i].clone()), &spec);
+    }
+    let source = state.source.read();
+    let codes = state.codes.read();
+    let system = state.system_codes.read();
+    let derived = state.derived.read();
+    match &*source {
+        SourceData::Indexed(idx) => {
+            let matched = query::indexed_matches(idx, &filters, &codes, &system, &derived);
+            analysis::pivot_stream(
+                matched
+                    .iter()
+                    .map(|&i| sources::event_at(idx, i, &codes, &system, &derived)),
+                &spec,
+            )
+        }
+        SourceData::Memory(events) => {
+            let matched = query::filtered_indices(events, &filters);
+            analysis::pivot_stream(matched.iter().map(|&i| events[i].clone()), &spec)
+        }
+        SourceData::None => analysis::pivot(&[], &spec),
+    }
 }
 
 #[tauri::command]
@@ -1419,8 +1729,7 @@ async fn save_codes(text: String, app: AppHandle) -> Result<(), String> {
 }
 
 pub(crate) fn save_codes_impl(state: &AppState, text: &str) -> Result<(), String> {
-    let cfg: CodesConfig =
-        serde_json::from_str(text).map_err(|e| format!("JSON inválido: {e}"))?;
+    let cfg: CodesConfig = serde_json::from_str(text).map_err(|e| format!("JSON inválido: {e}"))?;
     std::fs::write(&state.codes_path, text).map_err(|e| format!("Falha ao gravar: {e}"))?;
     *state.codes.write() = cfg;
     // Re-enriquece eventos em memória (fontes indexadas enriquecem sob demanda).
@@ -1487,63 +1796,27 @@ pub(crate) fn system_codes_count_impl(state: &AppState) -> usize {
         .sum()
 }
 
-// Os casos de análise são JSON opaco gerenciado pelo frontend; o backend
-// apenas persiste em disco (sobrevive a reloads e fechamento do app).
-fn cases_path() -> PathBuf {
-    config_dir().join("cases.json")
-}
-
-fn cases_backup_path() -> PathBuf {
-    config_dir().join("cases.backup.json")
-}
-
-fn read_cases_file(path: &PathBuf) -> Option<serde_json::Value> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-}
-
 #[tauri::command]
-fn cases_load() -> serde_json::Value {
-    cases_load_impl()
+async fn cases_load() -> Result<serde_json::Value, String> {
+    offload(cases_load_impl).await?
 }
-
-pub(crate) fn cases_load_impl() -> serde_json::Value {
-    read_cases_file(&cases_path())
-        .or_else(|| read_cases_file(&cases_backup_path()))
-        .unwrap_or_else(|| serde_json::json!({ "active": null, "cases": [] }))
+pub(crate) fn cases_load_impl() -> Result<serde_json::Value, String> {
+    case_store::load()
 }
-
 #[tauri::command]
-fn cases_save(data: serde_json::Value, state: State<AppState>) -> Result<(), String> {
-    cases_save_impl(state.inner(), data)
+async fn cases_save(data: serde_json::Value, app: AppHandle) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cases_save_impl(app.state::<AppState>().inner(), data)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
-
-pub(crate) fn cases_save_impl(state: &AppState, data: serde_json::Value) -> Result<(), String> {
-    let _store_guard = state.case_store_lock.lock();
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-
-    let path = cases_path();
-    let backup = cases_backup_path();
-    let temp = dir.join("cases.pending.json");
-    let text = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
-
-    {
-        let mut file = std::fs::File::create(&temp).map_err(|e| e.to_string())?;
-        file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-    }
-
-    if read_cases_file(&path).is_some() {
-        std::fs::copy(&path, &backup).map_err(|e| e.to_string())?;
-    }
-
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-    }
-    std::fs::rename(&temp, &path).map_err(|e| e.to_string())
+pub(crate) fn cases_save_impl(
+    state: &AppState,
+    data: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let _guard = state.case_store_lock.lock();
+    case_store::save(data)
 }
 
 #[tauri::command]
@@ -1600,7 +1873,7 @@ pub fn run() {
     let codes = load_codes(&codes_path);
     let system_codes_path = config_dir().join("system_codes.json");
     let system_codes = load_system_codes(&system_codes_path);
-    let (mcp_enabled, mcp_port, mcp_config_path) = mcp::load_config();
+    let (mcp_enabled, mcp_port, mcp_config_path, mcp_token) = mcp::load_config();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1614,7 +1887,12 @@ pub fn run() {
             codes_path,
             system_codes_path,
         })
-        .manage(mcp::McpState::new(mcp_enabled, mcp_port, mcp_config_path))
+        .manage(mcp::McpState::new(
+            mcp_enabled,
+            mcp_port,
+            mcp_config_path,
+            mcp_token,
+        ))
         .setup(move |app| {
             // Primeira execução: extrai o catálogo do sistema em background
             // (leva ~20s e não pode bloquear a abertura da janela).
@@ -1642,6 +1920,17 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            mcp::mcp_configure,
+            workspace::dataset_overview,
+            workspace::import_investigation,
+            workspace::load_bundle,
+            workspace::compare_periods,
+            workspace::list_sources,
+            workspace::cancel_operation,
+            workspace::validate_filters,
+            workspace::export_events,
+            workspace::export_document,
+            workspace::expand_paths,
             list_channels,
             load_event_log,
             load_file,

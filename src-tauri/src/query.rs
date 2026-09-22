@@ -1,11 +1,11 @@
+use crate::model::CodesConfig;
 use crate::model::{label_class, Event, LineMeta, LV_OTHER};
 use crate::sources::{event_at, line_bytes, CompiledDerived, FileIndex};
-use crate::model::CodesConfig;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use rayon::prelude::*;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Filter {
@@ -17,13 +17,12 @@ pub struct Filter {
     pub value2: Option<String>,
 }
 
-/// Filtro com regex pré-compilada (op "regex"). Regex inválida cai para "contém".
+/// Filtro com regex pré-compilada; entradas inválidas são rejeitadas na fronteira.
 /// `needle_lower`, `num` e `num2` são pré-computados uma vez por consulta
 /// em vez de por evento/linha.
 pub struct PreparedFilter {
     pub f: Filter,
     regex: Option<regex::Regex>,
-    bregex: Option<regex::bytes::Regex>,
     needle_lower: String,
     num: Option<f64>,
     num2: Option<f64>,
@@ -36,7 +35,6 @@ pub fn prepare(filters: &[Filter]) -> Vec<PreparedFilter> {
             let is_re = f.op == "regex";
             PreparedFilter {
                 regex: is_re.then(|| regex::Regex::new(&f.value).ok()).flatten(),
-                bregex: is_re.then(|| regex::bytes::Regex::new(&f.value).ok()).flatten(),
                 needle_lower: f.value.to_lowercase(),
                 num: value_as_num(&f.column, &f.value),
                 num2: value_as_num(&f.column, f.value2.as_deref().unwrap_or("")),
@@ -97,10 +95,13 @@ fn value_as_num(column: &str, s: &str) -> Option<f64> {
     crate::analysis::parse_num_unit(s).map(|(n, _)| n)
 }
 
-fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
+pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
     let f = &pf.f;
     let col = f.column.as_str();
     let needle = pf.needle_lower.as_str();
+    if f.op == "pattern" {
+        return crate::insights::pattern_of(&ev.message) == f.value;
+    }
 
     if f.op == "regex" {
         let hay: Cow<'_, str> = if col == "_all" {
@@ -111,10 +112,18 @@ fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
         return match &pf.regex {
             Some(re) => re.is_match(&hay),
             // regex inválida → contém (case-insensitive ASCII, como ci_contains_bytes)
-            None => ci_contains_bytes(hay.as_bytes(), needle.as_bytes()),
+            None => false,
         };
     }
 
+    if col == "_all" {
+        let text = format!("{}\n{}", ev.message, ev.raw);
+        return match f.op.as_str() {
+            "contains" => ci_contains_bytes(text.as_bytes(), needle.as_bytes()),
+            "not_contains" => !ci_contains_bytes(text.as_bytes(), needle.as_bytes()),
+            _ => false,
+        };
+    }
     match f.op.as_str() {
         "contains" => ev
             .col_ref(col)
@@ -161,7 +170,7 @@ fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
             };
             a >= lo && a <= hi
         }
-        _ => true,
+        _ => false,
     }
 }
 
@@ -176,6 +185,7 @@ pub fn filtered_indices(events: &[Event], filters: &[Filter]) -> Vec<usize> {
     events
         .iter()
         .enumerate()
+        .take_while(|_| !crate::operations::cancelled())
         .filter(|(_, ev)| pfs.iter().all(|pf| matches(ev, pf)))
         .map(|(i, _)| i)
         .collect()
@@ -270,7 +280,13 @@ fn aggregate_from_memory_matches(
     let mut order = Vec::new();
     for &i in matched {
         let event = &events[i];
-        push_group(&mut groups, &mut order, event, event.col_str(group_column), specs);
+        push_group(
+            &mut groups,
+            &mut order,
+            event,
+            event.col_str(group_column),
+            specs,
+        );
     }
     build_agg_result(groups, order, group_column, specs)
 }
@@ -288,11 +304,20 @@ pub fn explore(
         let event = &events[i];
         (event.timestamp.unwrap_or(0), event.level.as_str())
     }));
-    let count = [AggSpec { func: "count".into(), column: "*".into(), alias: "n".into() }];
+    let count = [AggSpec {
+        func: "count".into(),
+        column: "*".into(),
+        alias: "n".into(),
+    }];
     let sources = aggregate_from_memory_matches(events, &matched, "source", &count);
     let codes = aggregate_from_memory_matches(events, &matched, "code", &count);
     let query = query_from_memory_matches(events, matched, sort_column, sort_dir, offset, limit);
-    ExplorerSnapshot { query, stats, sources, codes }
+    ExplorerSnapshot {
+        query,
+        stats,
+        sources,
+        codes,
+    }
 }
 
 // ==========================================================================
@@ -307,6 +332,11 @@ enum Tri {
 }
 
 fn ci_contains_bytes(hay: &[u8], needle_lower: &[u8]) -> bool {
+    if !hay.is_ascii() || !needle_lower.is_ascii() {
+        return String::from_utf8_lossy(hay)
+            .to_lowercase()
+            .contains(String::from_utf8_lossy(needle_lower).as_ref());
+    }
     let Some((&first, rest)) = needle_lower.split_first() else {
         return true;
     };
@@ -337,6 +367,9 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8]) -> Tri {
     let v = f.value.trim();
     // equivalente a v.to_lowercase() (trim e lowercase comutam para whitespace)
     let needle = pf.needle_lower.trim();
+    if matches!(f.column.as_str(), "message" | "_all") && memchr::memchr(b'\\', line).is_some() {
+        return Tri::NeedEvent;
+    }
     match f.column.as_str() {
         "timestamp" => match op {
             "gt" | "gte" | "lt" | "lte" | "between" => {
@@ -399,6 +432,9 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8]) -> Tri {
             _ => Tri::NeedEvent,
         },
         "code" => {
+            if meta.code_len == 0 {
+                return Tri::NeedEvent;
+            }
             let code = meta.code(line);
             match op {
                 "equals" | "not_equals" => {
@@ -454,29 +490,12 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8]) -> Tri {
                     Tri::NeedEvent // confirmar no evento parseado
                 }
             }
-            "regex" => match &pf.bregex {
-                Some(re) => {
-                    if re.is_match(line) {
-                        Tri::NeedEvent
-                    } else {
-                        Tri::Fail
-                    }
-                }
-                None => Tri::NeedEvent,
-            },
+            // Anchors refer to the parsed message, not the surrounding JSON.
+            "regex" => Tri::NeedEvent,
             _ => Tri::NeedEvent,
         },
         "_all" => match op {
-            "regex" => match &pf.bregex {
-                Some(re) => {
-                    if re.is_match(line) {
-                        Tri::Pass
-                    } else {
-                        Tri::Fail
-                    }
-                }
-                None => Tri::NeedEvent,
-            },
+            "regex" => Tri::NeedEvent,
             "contains" | "not_contains" => {
                 if v.is_empty() {
                     return Tri::NeedEvent;
@@ -505,6 +524,9 @@ pub fn indexed_matches(
     let pfs = prepare(filters);
     let mut matched = Vec::new();
     for (i, meta) in idx.lines.iter().enumerate() {
+        if i % 2048 == 0 && crate::operations::cancelled() {
+            break;
+        }
         let line = line_bytes(idx, i);
         let mut need = false;
         let mut ok = true;
@@ -544,48 +566,60 @@ pub fn query_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> QueryResult {
-    let mut matched = indexed_matches(idx, filters, codes, system, derived);
-    let desc = sort_dir == "desc";
-    match sort_column {
-        "" => {}
-        "timestamp" => matched.sort_by(|&a, &b| {
-            let ord = idx.lines[a].ts.cmp(&idx.lines[b].ts);
-            if desc { ord.reverse() } else { ord }
-        }),
-        "level" => matched.sort_by(|&a, &b| {
-            let ord = idx.lines[a].level.cmp(&idx.lines[b].level);
-            if desc { ord.reverse() } else { ord }
-        }),
-        "code" => matched.sort_by(|&a, &b| {
-            let ord = idx.lines[a]
-                .code(line_bytes(idx, a))
-                .cmp(idx.lines[b].code(line_bytes(idx, b)));
-            if desc { ord.reverse() } else { ord }
-        }),
-        col => {
-            // pré-computa a chave de ordenação materializando uma vez por linha
-            let keys: HashMap<usize, String> = matched
+    let matched = indexed_matches(idx, filters, codes, system, derived);
+    query_from_indexed_matches(
+        idx,
+        matched,
+        sort_column,
+        sort_dir,
+        offset,
+        limit,
+        codes,
+        system,
+        derived,
+    )
+}
+
+fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
+    if matched.len() > idx.lines.len() / 4 {
+        if matched.len() == idx.lines.len() {
+            *matched = idx.ordered().to_vec();
+        } else {
+            let mut selected = vec![false; idx.lines.len()];
+            for &i in matched.iter() {
+                selected[i] = true;
+            }
+            *matched = idx
+                .ordered()
                 .iter()
-                .map(|&i| (i, event_at(idx, i, codes, system, derived).col_str(col).unwrap_or_default()))
+                .copied()
+                .filter(|&i| selected[i])
                 .collect();
-            matched.sort_by(|a, b| {
-                let ord = keys[a].to_lowercase().cmp(&keys[b].to_lowercase());
-                if desc { ord.reverse() } else { ord }
-            });
         }
+        if desc {
+            matched.reverse();
+            let mut start = 0;
+            while start < matched.len() {
+                let mut end = start + 1;
+                while end < matched.len()
+                    && idx.lines[matched[end]].ts == idx.lines[matched[start]].ts
+                {
+                    end += 1;
+                }
+                matched[start..end].reverse();
+                start = end;
+            }
+        }
+    } else {
+        matched.sort_by(|&a, &b| {
+            let ord = idx.lines[a].ts.cmp(&idx.lines[b].ts);
+            if desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
     }
-    let total = matched.len();
-    let rows = matched
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|i| {
-            let mut e = event_at(idx, i, codes, system, derived);
-            e.raw = String::new();
-            e
-        })
-        .collect();
-    QueryResult { total, rows }
 }
 
 // ==========================================================================
@@ -594,7 +628,7 @@ pub fn query_indexed(
 
 enum Acc {
     Count(u64),
-    CountDistinct(HashSet<String>),
+    CountDistinct(crate::distinct::Counter),
     Sum(f64),
     Avg(f64, u64),
     Min(Option<f64>),
@@ -606,7 +640,7 @@ impl Acc {
     fn new(func: &str) -> Self {
         match func {
             "count" => Acc::Count(0),
-            "count_distinct" => Acc::CountDistinct(HashSet::new()),
+            "count_distinct" => Acc::CountDistinct(Default::default()),
             "sum" => Acc::Sum(0.0),
             "avg" => Acc::Avg(0.0, 0),
             "min" => Acc::Min(None),
@@ -620,9 +654,7 @@ impl Acc {
             Acc::Count(n) => *n += 1,
             Acc::CountDistinct(set) => {
                 if let Some(s) = ev.col_str(column) {
-                    if set.len() < 100_000 {
-                        set.insert(s);
-                    }
+                    set.insert(s);
                 }
             }
             Acc::Sum(n) => {
@@ -671,9 +703,7 @@ impl Acc {
                 }
             }
             Acc::Min(cur) | Acc::Max(cur) => match cur {
-                Some(v) if ev_col == "timestamp" => {
-                    Value::from(crate::model::ts_to_iso(*v as i64))
-                }
+                Some(v) if ev_col == "timestamp" => Value::from(crate::model::ts_to_iso(*v as i64)),
                 Some(v) => round2(*v).into(),
                 None => Value::Null,
             },
@@ -706,12 +736,20 @@ pub fn multi_count(
     columns
         .par_iter()
         .map(|col| {
-            let fs: Vec<Filter> = filters.iter().filter(|f| f.column != *col).cloned().collect();
+            let fs: Vec<Filter> = filters
+                .iter()
+                .filter(|f| f.column != *col)
+                .cloned()
+                .collect();
             let agg = aggregate(
                 events,
                 &fs,
                 col,
-                &[AggSpec { func: "count".into(), column: "*".into(), alias: "n".into() }],
+                &[AggSpec {
+                    func: "count".into(),
+                    column: "*".into(),
+                    alias: "n".into(),
+                }],
             );
             (col.clone(), agg)
         })
@@ -730,12 +768,20 @@ pub fn multi_count_indexed(
     columns
         .par_iter()
         .map(|col| {
-            let fs: Vec<Filter> = filters.iter().filter(|f| f.column != *col).cloned().collect();
+            let fs: Vec<Filter> = filters
+                .iter()
+                .filter(|f| f.column != *col)
+                .cloned()
+                .collect();
             let agg = aggregate_indexed(
                 idx,
                 &fs,
                 col,
-                &[AggSpec { func: "count".into(), column: "*".into(), alias: "n".into() }],
+                &[AggSpec {
+                    func: "count".into(),
+                    column: "*".into(),
+                    alias: "n".into(),
+                }],
                 codes,
                 system,
                 derived,
@@ -807,7 +853,11 @@ fn push_group(
     specs: &[AggSpec],
 ) {
     let key = key.unwrap_or_default();
-    let key = if key.is_empty() { "(vazio)".to_string() } else { key };
+    let key = if key.is_empty() {
+        "(vazio)".to_string()
+    } else {
+        key
+    };
     // Caminho quente é o grupo já existente: get_mut evita clonar a chave
     // a cada linha; só clona ao criar um grupo novo.
     if let Some(accs) = groups.get_mut(key.as_str()) {
@@ -826,7 +876,7 @@ fn push_group(
 
 /// Colunas disponíveis direto dos metadados (sem parse da linha).
 fn is_meta_column(col: &str) -> bool {
-    matches!(col, "*" | "timestamp" | "level" | "code")
+    matches!(col, "*" | "timestamp" | "level")
 }
 
 /// Evento parcial montado só com os campos dos metadados.
@@ -860,16 +910,27 @@ pub fn aggregate_indexed(
 
     // Caminho rápido: grupo e agregações só sobre colunas de metadados
     // (timestamp, level, code) — zero parse por linha.
-    let meta_only = is_meta_column(group_column)
-        && specs.iter().all(|s| is_meta_column(&s.column));
+    let meta_only = is_meta_column(group_column) && specs.iter().all(|s| is_meta_column(&s.column));
 
     for i in matched {
         if meta_only {
             let ev = meta_event(idx, i);
-            push_group(&mut groups, &mut order, &ev, ev.col_str(group_column), specs);
+            push_group(
+                &mut groups,
+                &mut order,
+                &ev,
+                ev.col_str(group_column),
+                specs,
+            );
         } else {
             let ev = event_at(idx, i, codes, system, derived);
-            push_group(&mut groups, &mut order, &ev, ev.col_str(group_column), specs);
+            push_group(
+                &mut groups,
+                &mut order,
+                &ev,
+                ev.col_str(group_column),
+                specs,
+            );
         }
     }
     build_agg_result(groups, order, group_column, specs)
@@ -893,28 +954,37 @@ fn query_from_indexed_matches(
     let desc = sort_dir == "desc";
     match sort_column {
         "" => {}
-        "timestamp" => matched.sort_by(|&a, &b| {
-            let ord = idx.lines[a].ts.cmp(&idx.lines[b].ts);
-            if desc { ord.reverse() } else { ord }
-        }),
+        "timestamp" => sort_time(idx, &mut matched, desc),
         "level" => matched.sort_by(|&a, &b| {
             let ord = idx.lines[a].level.cmp(&idx.lines[b].level);
-            if desc { ord.reverse() } else { ord }
-        }),
-        "code" => matched.sort_by(|&a, &b| {
-            let ord = idx.lines[a]
-                .code(line_bytes(idx, a))
-                .cmp(idx.lines[b].code(line_bytes(idx, b)));
-            if desc { ord.reverse() } else { ord }
+            if desc {
+                ord.reverse()
+            } else {
+                ord
+            }
         }),
         col => {
             let keys: HashMap<usize, String> = matched
                 .iter()
-                .map(|&i| (i, event_at(idx, i, codes, system, derived).col_str(col).unwrap_or_default()))
+                .map(|&i| {
+                    (
+                        i,
+                        event_at(idx, i, codes, system, derived)
+                            .col_str(col)
+                            .unwrap_or_default(),
+                    )
+                })
                 .collect();
             matched.sort_by(|a, b| {
-                let ord = keys[a].to_lowercase().cmp(&keys[b].to_lowercase());
-                if desc { ord.reverse() } else { ord }
+                let ord = match (keys[a].parse::<f64>(), keys[b].parse::<f64>()) {
+                    (Ok(a), Ok(b)) => a.total_cmp(&b),
+                    _ => keys[a].to_lowercase().cmp(&keys[b].to_lowercase()),
+                };
+                if desc {
+                    ord.reverse()
+                } else {
+                    ord
+                }
             });
         }
     }
@@ -943,15 +1013,27 @@ fn aggregate_from_indexed_matches(
 ) -> AggResult {
     let mut groups: HashMap<String, Vec<Acc>> = HashMap::new();
     let mut order = Vec::new();
-    let meta_only = is_meta_column(group_column)
-        && specs.iter().all(|spec| is_meta_column(&spec.column));
+    let meta_only =
+        is_meta_column(group_column) && specs.iter().all(|spec| is_meta_column(&spec.column));
     for &i in matched {
         if meta_only {
             let event = meta_event(idx, i);
-            push_group(&mut groups, &mut order, &event, event.col_str(group_column), specs);
+            push_group(
+                &mut groups,
+                &mut order,
+                &event,
+                event.col_str(group_column),
+                specs,
+            );
         } else {
             let event = event_at(idx, i, codes, system, derived);
-            push_group(&mut groups, &mut order, &event, event.col_str(group_column), specs);
+            push_group(
+                &mut groups,
+                &mut order,
+                &event,
+                event.col_str(group_column),
+                specs,
+            );
         }
     }
     build_agg_result(groups, order, group_column, specs)
@@ -970,13 +1052,37 @@ pub fn explore_indexed(
 ) -> ExplorerSnapshot {
     let matched = indexed_matches(idx, filters, codes, system, derived);
     let stats = stats_from(matched.iter().map(|&i| {
-        (idx.lines[i].ts, crate::model::class_label(idx.lines[i].level))
+        (
+            idx.lines[i].ts,
+            crate::model::class_label(idx.lines[i].level),
+        )
     }));
-    let count = [AggSpec { func: "count".into(), column: "*".into(), alias: "n".into() }];
-    let sources = aggregate_from_indexed_matches(idx, &matched, "source", &count, codes, system, derived);
-    let codes_agg = aggregate_from_indexed_matches(idx, &matched, "code", &count, codes, system, derived);
-    let query = query_from_indexed_matches(idx, matched, sort_column, sort_dir, offset, limit, codes, system, derived);
-    ExplorerSnapshot { query, stats, sources, codes: codes_agg }
+    let count = [AggSpec {
+        func: "count".into(),
+        column: "*".into(),
+        alias: "n".into(),
+    }];
+    let sources =
+        aggregate_from_indexed_matches(idx, &matched, "source", &count, codes, system, derived);
+    let codes_agg =
+        aggregate_from_indexed_matches(idx, &matched, "code", &count, codes, system, derived);
+    let query = query_from_indexed_matches(
+        idx,
+        matched,
+        sort_column,
+        sort_dir,
+        offset,
+        limit,
+        codes,
+        system,
+        derived,
+    );
+    ExplorerSnapshot {
+        query,
+        stats,
+        sources,
+        codes: codes_agg,
+    }
 }
 
 fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i64)>) -> Stats {
@@ -989,9 +1095,7 @@ fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i6
 
 const N_BUCKETS: usize = 60;
 
-fn stats_from<'a>(
-    iter: impl Iterator<Item = (i64, &'a str)>,
-) -> Stats {
+fn stats_from<'a>(iter: impl Iterator<Item = (i64, &'a str)>) -> Stats {
     // Chaveia por &str emprestada (zero alocação por linha); converte para
     // String apenas no Vec final.
     let mut levels: HashMap<&'a str, i64> = HashMap::new();
@@ -1024,8 +1128,10 @@ fn stats_from<'a>(
             .collect();
     }
 
-    let mut levels: Vec<(String, i64)> =
-        levels.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    let mut levels: Vec<(String, i64)> = levels
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
     levels.sort_by(|a, b| b.1.cmp(&a.1));
     build_stats(buckets, bucket_ms, levels)
 }
@@ -1048,6 +1154,9 @@ pub fn stats_indexed(
     let pfs = prepare(filters);
     let mut matched: Vec<(i64, Cow<'static, str>)> = Vec::new();
     for (i, meta) in idx.lines.iter().enumerate() {
+        if i % 2048 == 0 && crate::operations::cancelled() {
+            break;
+        }
         let line = line_bytes(idx, i);
         let mut need = false;
         let mut ok = true;
@@ -1071,7 +1180,10 @@ pub fn stats_indexed(
             }
         } else {
             // rótulo fixo da classe: sem String por linha
-            matched.push((meta.ts, Cow::Borrowed(crate::model::class_label(meta.level))));
+            matched.push((
+                meta.ts,
+                Cow::Borrowed(crate::model::class_label(meta.level)),
+            ));
         }
     }
     stats_from(matched.iter().map(|(t, l)| (*t, l.as_ref())))
