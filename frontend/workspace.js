@@ -11,7 +11,7 @@
     const signature = JSON.stringify(current);
     if (signature !== lastFilters) { history.push(previousSelection); if (history.length > 30) history.shift(); previousSelection = current; lastFilters = signature; cacheKey = ""; }
   }
-  const titles = { summary: "Resumo", timeline: "Timeline", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Fontes" };
+  const titles = { summary: "Resumo", timeline: "Atividade", "case-timeline": "Linha do tempo", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Fontes" };
   const fmtBytes = n => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${fmtNum(Math.ceil(n / 1000))} KB`;
   const pct = n => `${(n * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
   const localInput = t => { const d = new Date(t); return new Date(t - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
@@ -24,7 +24,7 @@
     page = next; document.body.dataset.page = next;
     document.querySelectorAll("[data-page]").forEach(b => { if (b.tagName === "BUTTON") { b.classList.toggle("selected", b.dataset.page === next); b.setAttribute("aria-current", b.dataset.page === next ? "page" : "false"); } });
     $("#ws-title").textContent = titles[next] || next;
-    $("#ws-reload").hidden = ["sources", "evidence"].includes(next) || !state.loaded;
+    $("#ws-reload").hidden = ["sources", "evidence", "case-timeline"].includes(next) || !state.loaded;
     $("#ws-clear-scope").hidden = !backendFilters().length || next === "evidence";
     updateCounts();
   }
@@ -35,6 +35,12 @@
   }
   async function showPage(next) {
     markPage(next); closeDrawer();
+    if (next === "case-timeline") {
+      home.hidden = true;
+      setAnalysisView("vtimeline");
+      switchView("caso");
+      return;
+    }
     if (next === "explore") {
       if (!state.loaded) { await showPage("summary"); return; }
       switchView("viz"); home.hidden = true; return;
@@ -76,7 +82,7 @@
         ${metric("Com horário", pct(dated / Math.max(1, data.total)), data.undated ? `${fmtNum(data.undated)} sem data` : "Todos os eventos datados")}
         </div>
         ${!data.complete ? note("Análise interrompida. Atualize para calcular o conjunto completo.") : ""}
-        <section class="ws-card"><div class="card-heading"><h2>Eventos no tempo</h2><button class="text-button" data-action="timeline">Abrir timeline <i class="fas fa-arrow-right"></i></button></div><div class="timeline-chart" id="ws-timeline"></div></section>
+        <section class="ws-card"><div class="card-heading"><h2>Eventos no tempo</h2><button class="text-button" data-action="timeline">Ver atividade <i class="fas fa-arrow-right"></i></button></div><div class="timeline-chart" id="ws-timeline"></div></section>
         <div class="overview-grid"><div>
         <section class="ws-card"><div class="card-heading"><h2>Ocorrências em destaque</h2><span>${data.findings.length ? data.findings.length + (data.findings.length === 1 ? " indicação" : " indicações") : ""}</span></div>
         ${data.findings.length ? data.findings.map((f, i) => `<article class="finding"><i class="finding-icon ${esc(f.kind)} fas ${f.kind === "spike" ? "fa-arrow-trend-up" : f.kind === "quality" ? "fa-clock" : f.kind === "gap" ? "fa-arrows-left-right" : "fa-layer-group"}"></i><div><h3>${esc(f.title)}</h3><p>${esc(f.detail)}</p><button class="text-button" data-action="finding" data-index="${i}">${f.kind === "quality" ? "Revisar data/hora" : "Investigar"}<i class="fas fa-arrow-right"></i></button></div><div class="finding-actions">${iconButton("save-finding", "fa-bookmark", "Salvar evidência", i)}</div></article>`).join("") : '<p class="quiet-empty">Nenhuma concentração de erros ou lacuna destacada neste recorte. Você pode explorar os padrões e comparar períodos.</p>'}</section>
@@ -196,7 +202,7 @@
     const c = activeCase(), items = c?.items || []; updateCounts();
     content.innerHTML = `<div class="source-controls"><button class="btn ghost" id="ws-evidence-export"><i class="fas fa-arrow-up-from-bracket"></i> Exportar evidências</button><button class="btn ghost" id="ws-evidence-advanced">Linha do tempo</button></div>${items.length ? items.map((it, i) => `<article class="ws-card evidence-card"><div class="evidence-top"><div><h2>${esc(it.label || "Evidência")}</h2><span class="subtle">${esc(fmtTs(it.createdAt))}${it.rows?.length ? ` · ${fmtNum(it.rows.length)} eventos preservados` : " · Recorte salvo"}</span></div>${iconButton("remove-evidence", "fa-trash-can", "Remover evidência", i)}</div><textarea class="evidence-note" data-note="${i}" aria-label="Anotação da evidência" placeholder="Anotação ou hipótese…">${esc(it.note || "")}</textarea><div class="evidence-actions">${it.rows?.length ? `<button class="btn ghost small" data-action="evidence-event" data-index="${i}">Ver evento</button>` : ""}<button class="btn ghost small" data-action="reopen-evidence" data-index="${i}">Reabrir recorte</button><span class="tag">${esc(it.relevance || "normal")}</span></div></article>`).join("") : '<section class="ws-card"><p class="quiet-empty">Salve eventos e ocorrências durante a análise. Eles ficam aqui, junto das suas anotações.</p></section>'}`;
     $("#ws-evidence-export").onclick = () => { openExport(); $("#ws-export-kind").value = "report"; };
-    $("#ws-evidence-advanced").onclick = () => { home.hidden = true; switchView("caso"); setAnalysisView("timeline"); };
+    $("#ws-evidence-advanced").onclick = () => showPage("case-timeline");
     if (removedEvidence?.caseId === c?.id) {
       const restore = el("button", "btn ghost", "Desfazer remoção");
       $("#ws-evidence-advanced").after(restore);
@@ -320,7 +326,7 @@
     onView(which) {
       if (which === "workspace") return;
       home.hidden = true;
-      markPage(which === "viz" || which === "trail" ? "explore" : which === "source" ? "sources" : "evidence");
+      markPage(which === "viz" || which === "trail" ? "explore" : which === "source" ? "sources" : which === "caso" && ["timeline", "vtimeline"].includes(state.analysisView) ? "case-timeline" : "evidence");
     },
     onRefresh() {
       rememberSelection();

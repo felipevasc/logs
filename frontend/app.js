@@ -1623,6 +1623,7 @@ function showCtxMenu(x, y, items) {
     if (it.sep) { m.appendChild(el("div", "ctx-sep")); continue; }
     const b = el("button", "ctx-item" + (it.danger ? " danger" : ""));
     b.innerHTML = `<i class="fas ${it.icon}"></i><span>${esc(it.label)}</span>`;
+    if (it.color) b.querySelector("i").style.color = it.color;
     b.onclick = () => { closeCtxMenu(); it.onClick(); };
     m.appendChild(b);
   }
@@ -3433,6 +3434,8 @@ function renderCaseData(box, c) {
 function renderAnalysis() {
   const box = $("#analysis-list");
   box.innerHTML = "";
+  box.classList.remove("case-timeline-host");
+  $("#view-analysis").classList.toggle("case-timeline-active", ["timeline", "vtimeline"].includes(state.analysisView));
   const c = activeCase();
   if (!c) {
     box.innerHTML = `<div class="analysis-empty">
@@ -3500,275 +3503,27 @@ function showBucketPop(x, y, evs) {
 }
 
 function renderTimeline(box, c) {
-  const pts = [];
-  c.items.forEach((item, ii) =>
-    item.rows.forEach((ev) => { if (ev.timestamp != null && rowPassesFilters(ev)) pts.push({ t: ev.timestamp, item: ii, ev }); })
-  );
-  const mans = c.manual || [];
-  let tmin = Infinity, tmax = -Infinity;
-  pts.forEach((p) => { tmin = Math.min(tmin, p.t); tmax = Math.max(tmax, p.t); });
-  mans.forEach((m) => { tmin = Math.min(tmin, m.start); tmax = Math.max(tmax, m.end || m.start); });
-  if (tmin === Infinity) {
-    box.innerHTML = `<div class="analysis-empty">
-      <i class="fas fa-timeline"></i>
-      Nada na timeline.<br>
-      <span class="small">Envie eventos ao caso ou crie um evento manual.</span>
-    </div>`;
-    return;
-  }
-  if (tmin === tmax) tmax = tmin + 60000;
-  const pad = (tmax - tmin) * 0.03;
-  tmin -= pad; tmax += pad;
-  const pct = (t) => ((t - tmin) / (tmax - tmin)) * 100;
-
-  const tl = el("div", "tl");
-  const axis = el("div", "tl-axis");
-  const N = 6;
-  const span = tmax - tmin;
-  for (let i = 0; i <= N; i++) {
-    const tick = el("span", "tl-tick", fmtTick(tmin + (span * i) / N, span));
-    tick.style.left = `${(i / N) * 100}%`;
-    axis.appendChild(tick);
-  }
-  tl.appendChild(axis);
-
-  const addGrid = (track) => {
-    for (let i = 1; i < N; i++) {
-      const g = el("div", "tl-gridline");
-      g.style.left = `${(i / N) * 100}%`;
-      track.appendChild(g);
-    }
-  };
-
-  c.items.forEach((item, ii) => {
-    const evs = pts.filter((p) => p.item === ii);
-    if (!evs.length) return;
-    const lane = el("div", "tl-lane");
-    const lab = el("div", "tl-label", item.label);
-    lab.title = item.label;
-    lab.style.borderLeftColor = itemColor(ii);
-    lane.appendChild(lab);
-    const track = el("div", "tl-track");
-    addGrid(track);
-
-    // Grupo nomeado: renderiza como barra de início→fim em vez de pontos.
-    if (item.named) {
-      const start = Math.min(...evs.map((p) => p.t));
-      const end = Math.max(...evs.map((p) => p.t));
-      const bar = el("div", "tl-bar");
-      bar.style.left = `${pct(start)}%`;
-      const w = Math.max(0.8, pct(end) - pct(start));
-      bar.style.width = `${w}%`;
-      bar.style.background = itemColor(ii);
-      bar.style.borderColor = itemColor(ii);
-      bar.style.color = "#fff";
-      if (w > 8) bar.textContent = `${item.label} (${evs.length})`;
-      bar.title = `${item.label}\n${fmtTs(start)} → ${fmtTs(end)}\n${evs.length} eventos`;
-      track.appendChild(bar);
-      lane.appendChild(track);
-      tl.appendChild(lane);
-      return;
-    }
-
-    const B = 90;
-    const buckets = new Map();
-    evs.forEach((p) => {
-      const b = Math.min(B - 1, Math.floor((pct(p.t) / 100) * B));
-      if (!buckets.has(b)) buckets.set(b, []);
-      buckets.get(b).push(p.ev);
-    });
-    for (const [b, evsInB] of buckets) {
-      const dot = el("button", "tl-dot");
-      dot.style.left = `${(b / B) * 100}%`;
-      dot.style.background = itemColor(ii);
-      dot.title = `${evsInB.length} evento(s)`;
-      if (evsInB.length > 1) {
-        dot.classList.add("multi");
-        dot.textContent = evsInB.length;
-      }
-      dot.onclick = (e) => {
-        if (evsInB.length === 1) showDetail(evsInB[0]);
-        else showBucketPop(e.clientX, e.clientY, evsInB);
-      };
-      track.appendChild(dot);
-    }
-    lane.appendChild(track);
-    tl.appendChild(lane);
-  });
-
-  mans.forEach((m) => {
-    const lane = el("div", "tl-lane");
-    const lab = el("div", "tl-label manual", m.name);
-    lab.title = m.description || m.name;
-    lab.style.borderLeftColor = "var(--lv-aviso)";
-    lane.appendChild(lab);
-    const track = el("div", "tl-track");
-    addGrid(track);
-    const bar = el("div", "tl-bar");
-    const barWidth = Math.max(0.6, pct(m.end || m.start) - pct(m.start));
-    bar.style.left = `${pct(m.start)}%`;
-    if (!m.end) bar.classList.add("point");
-    else {
-      bar.style.width = `${barWidth}%`;
-      if (barWidth > 7) bar.textContent = m.name;
-    }
-    bar.title = `${m.name}\n${fmtTs(m.start)} → ${m.end ? fmtTs(m.end) : ""}${m.description ? "\n" + m.description : ""}`;
-    bar.oncontextmenu = (e) => {
-      e.preventDefault();
-      showCtxMenu(e.clientX, e.clientY, [
-        {
-          icon: "fa-trash-can", label: "Remover evento manual", danger: true,
-          onClick: () => {
-            c.manual = c.manual.filter((x) => x.id !== m.id);
-            saveCases();
-            updateAnalysisBadge();
-            renderAnalysis();
-          },
-        },
-      ]);
-    };
-    track.appendChild(bar);
-    lane.appendChild(track);
-    tl.appendChild(lane);
-  });
-
-  box.appendChild(tl);
+  window.CaseTimeline.render(box, c, "horizontal", caseTimelineCallbacks);
 }
-
 // ------------------------------------------------------------------ timeline vertical
 function renderVTimeline(box, c) {
-  const raw = [];
-  c.items.forEach((item, ii) =>
-    item.rows.forEach((ev) => {
-      if (ev.timestamp != null && rowPassesFilters(ev)) raw.push({ t: ev.timestamp, type: "ev", item: ii, ev });
-    })
-  );
-  (c.manual || []).forEach((m) => raw.push({ t: m.start, type: "manual", m }));
-  if (!raw.length) {
-    box.innerHTML = `<div class="analysis-empty">
-      <i class="fas fa-timeline"></i>
-      Nada na timeline.<br>
-      <span class="small">Envie eventos ao caso ou crie um evento manual.</span>
-    </div>`;
-    return;
-  }
-  raw.sort((a, b) => a.t - b.t);
-
-  // agrupa sequências do mesmo tipo (mesmo item + nome/código), sem nada no meio:
-  // a sequência vira um único marco "N eventos" com barra de início→fim
-  const entries = [];
-  const evKey = (e) => `${e.item}|${e.ev.name || e.ev.code}`;
-  let i = 0;
-  while (i < raw.length) {
-    const e = raw[i];
-    if (e.type !== "ev") { entries.push(e); i++; continue; }
-    let j = i + 1;
-    while (j < raw.length && raw[j].type === "ev" && evKey(raw[j]) === evKey(e)) j++;
-    if (j - i >= 2) {
-      const evs = raw.slice(i, j).map((r) => r.ev);
-      entries.push({ t: e.t, t2: raw[j - 1].t, type: "group", item: e.item, evs, count: j - i });
-    } else entries.push(e);
-    i = j;
-  }
-
-  // Períodos: manuais com fim, grupos nomeados e sequências agrupadas.
-  // Cada período vira uma barra à direita da linha; sobrepostos ficam lado a lado (tracks).
-  const ranges = [];
-  (c.manual || []).forEach((m) => {
-    if (m.end && m.end > m.start) ranges.push({ start: m.start, end: m.end, color: "var(--lv-aviso)" });
-  });
-  c.items.forEach((item, ii) => {
-    if (!item.named) return;
-    const ts = item.rows.filter(rowPassesFilters).map((ev) => ev.timestamp).filter((t) => t != null);
-    if (!ts.length) return;
-    const start = Math.min(...ts), end = Math.max(...ts);
-    if (end > start) ranges.push({ start, end, color: itemColor(ii) });
-  });
-  for (const e of entries) {
-    if (e.type === "group" && e.t2 > e.t) ranges.push({ start: e.t, end: e.t2, color: itemColor(e.item) });
-  }
-  ranges.sort((a, b) => a.start - b.start);
-  const trackEnds = [];
-  for (const r of ranges) {
-    let t = trackEnds.findIndex((end) => end < r.start);
-    if (t === -1) { trackEnds.push(r.end); t = trackEnds.length - 1; }
-    else trackEnds[t] = r.end;
-    r.track = Math.min(t, 3);
-  }
-  const stripesAt = (t) => ranges.filter((r) => r.start <= t && t <= r.end);
-
-  const wrap = el("div", "vtl");
-  let lastDay = null;
-  for (const e of entries) {
-    const day = fmtDay(e.t);
-    if (day !== lastDay) {
-      lastDay = day;
-      wrap.appendChild(el("div", "vtl-day", day));
-    }
-    const row = el("div", "vtl-row");
-    row.appendChild(el("div", "vtl-time", fmtTime(e.t)));
-
-    const covering = e.type === "ev" ? stripesAt(e.t) : [];
-    const dot = el("div", "vtl-dot" + (e.type === "manual" ? " manual" : ""));
-    dot.style.background = e.type === "manual" ? "var(--lv-aviso)" : itemColor(e.item);
-
-    // barras de período passam à direita da linha principal
-    const zone = el("div", "vtl-tracks");
-    for (const r of stripesAt(e.t)) {
-      const s = el("div", "vtl-bar");
-      s.style.left = `${r.track * 9}px`;
-      s.style.background = r.color;
-      zone.appendChild(s);
-    }
-    if (covering.length) {
-      // evento dentro do período de uma barra: o ponto sai da linha e vai para a direita
-      dot.classList.add("in-zone");
-      dot.style.left = `${(Math.max(...covering.map((r) => r.track)) + 1) * 9}px`;
-      zone.appendChild(dot);
-    } else {
-      row.appendChild(dot);
-    }
-    if (zone.children.length) row.appendChild(zone);
-
-    const card = el("div", "vtl-card" + (e.type === "manual" ? " manual" : ""));
-    if (e.type === "group") {
-      const name = e.evs[0].name || `#${e.evs[0].code}` || "eventos";
-      card.appendChild(el("span", "vtl-src", `${c.items[e.item].label} · ${e.count} eventos seguidos`));
-      card.appendChild(el("span", "vtl-msg", name));
-      row.onclick = (evt) => showBucketPop(evt.clientX, evt.clientY, e.evs);
-    } else if (e.type === "ev") {
-      card.appendChild(el("span", "vtl-src", c.items[e.item].label));
-      card.appendChild(el("span", "vtl-msg", e.ev.message || e.ev.name || `#${e.ev.code}`));
-      row.onclick = () => showDetail(e.ev);
-    } else {
-      const m = e.m;
-      card.appendChild(el("span", "vtl-src", m.name));
-      const periodo = m.end
-        ? `De ${fmtTs(m.start)} até ${fmtTs(m.end)}`
-        : fmtTs(m.start);
-      card.appendChild(el("span", "vtl-msg", m.description ? `${periodo} — ${m.description}` : periodo));
-      card.oncontextmenu = (evt) => {
-        evt.preventDefault();
-        evt.stopPropagation();
-        showCtxMenu(evt.clientX, evt.clientY, [
-          {
-            icon: "fa-trash-can", label: "Remover evento manual", danger: true,
-            onClick: () => {
-              c.manual = c.manual.filter((x) => x.id !== m.id);
-              saveCases();
-              updateAnalysisBadge();
-              renderAnalysis();
-            },
-          },
-        ]);
-      };
-    }
-    row.appendChild(card);
-    wrap.appendChild(row);
-  }
-  box.appendChild(wrap);
+  window.CaseTimeline.render(box, c, "vertical", caseTimelineCallbacks);
 }
 
+const caseTimelineCallbacks = {
+  passes: rowPassesFilters,
+  detail: showDetail,
+  bucket: showBucketPop,
+  menu: showCtxMenu,
+  notify: message => toast(message, "info"),
+  save: () => { saveCases(); updateAnalysisBadge(); renderAnalysis(); },
+  createAt: timestamp => {
+    const date = new Date(timestamp);
+    $("#mf-start").value = new Date(timestamp - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    $("#manual-form").hidden = false;
+    $("#mf-name").focus();
+  },
+};
 function saveManualEvent() {
   const name = $("#mf-name").value.trim();
   const start = $("#mf-start").value;

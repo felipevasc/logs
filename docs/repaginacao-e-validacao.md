@@ -4,11 +4,12 @@ Implementação em 22/09/2026. A avaliação inicial permanece em `avaliacao-pro
 
 ## Experiência
 
-- Navegação principal: **Resumo, Explorar, Comparar, Evidências e Fontes**.
+- Navegação principal: **Resumo, Atividade, Linha do tempo, Explorar, Comparar, Evidências e Fontes**.
 - Interface em grafite e verde suave, tema claro, menos texto e prioridade para os dados. Revisão visual em 1440×960 e 1024×768.
 - Abrir arquivos, pastas e arquivos arrastados; adicionar fontes preservando o conjunto e reabrir conjuntos mistos.
 - Resumo com contagens completas, cobertura de horário, distribuição temporal, padrões de mensagem, concentração de erros, lacunas e percentis de latência.
 - Timeline em tela própria, com volume e gravidade por intervalo, escala no horário local, seleção por clique ou arraste, aproximação, retorno ao período anterior e abertura do recorte no explorador. A contagem é exata para o período visível e inclui avisos, erros e intervalos vazios. Eventos sem horário são identificados separadamente.
+- Linha do tempo do caso em modos vertical e horizontal: dia abreviado uma vez por seção, horário em cada ocorrência, marcas curtas junto ao eixo e agrupamento automático de eventos consecutivos semelhantes. É possível selecionar e agrupar ocorrências, mover nomes para o outro lado, editar título e cor, criar marcos e adicionar notas com ícone ou texto. As curvas das notas podem ter pontas opcionais, traço contínuo, tracejado ou pontilhado, e um ponto arrastável para ajustar o trajeto. As posições das notas e o ajuste das curvas são guardados separadamente para cada modo.
 - Clicar em um padrão, origem ou intervalo leva ao recorte correspondente. Os achados são indicações verificáveis, não diagnóstico automático de causa.
 - Comparação de dois períodos, contagens e participação relativa dos padrões. Períodos sobrepostos são rejeitados.
 - Exploração com busca de campos, favoritos, quebra de linhas, densidade, desfazer filtros e atalhos.
