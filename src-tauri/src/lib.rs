@@ -1922,6 +1922,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             mcp::mcp_configure,
             workspace::dataset_overview,
+            workspace::timeline_range,
             workspace::import_investigation,
             workspace::load_bundle,
             workspace::compare_periods,

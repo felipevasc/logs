@@ -200,6 +200,148 @@ pub async fn dataset_overview(
 ) -> Result<insights::Overview, String> {
     crate::offload(move || overview_impl(app.state::<AppState>().inner(), filters)).await?
 }
+
+#[derive(Serialize)]
+pub struct TimelineBucket {
+    timestamp: i64,
+    count: usize,
+    errors: usize,
+    warnings: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineRange {
+    start: i64,
+    end: i64,
+    bucket_ms: i64,
+    total: usize,
+    errors: usize,
+    warnings: usize,
+    buckets: Vec<TimelineBucket>,
+}
+
+pub fn timeline_range_impl(
+    state: &AppState,
+    filters: Vec<Filter>,
+    start: i64,
+    end: i64,
+    bucket_count: usize,
+) -> Result<TimelineRange, String> {
+    validate(&filters)?;
+    if start > end {
+        return Err("O início deve ser anterior ao fim.".into());
+    }
+    let mut scoped_filters = Vec::with_capacity(filters.len() + 1);
+    scoped_filters.push(Filter {
+        column: "timestamp".into(),
+        op: "between".into(),
+        value: start.to_string(),
+        value2: Some(end.to_string()),
+    });
+    scoped_filters.extend(filters);
+    let bucket_count = bucket_count.clamp(1, 240);
+    let span = end.saturating_sub(start).saturating_add(1);
+    let width = (span / bucket_count as i64)
+        .saturating_add(i64::from(span % bucket_count as i64 != 0))
+        .max(1);
+    let mut result = TimelineRange {
+        start,
+        end,
+        bucket_ms: width,
+        total: 0,
+        errors: 0,
+        warnings: 0,
+        buckets: (0..bucket_count)
+            .map(|i| TimelineBucket {
+                timestamp: start.saturating_add((i as i64).saturating_mul(width)),
+                count: 0,
+                errors: 0,
+                warnings: 0,
+            })
+            .collect(),
+    };
+    let mut add = |timestamp: i64, level: &str| {
+        if timestamp < start || timestamp > end {
+            return;
+        }
+        let index = ((timestamp - start) / width) as usize;
+        let bucket = &mut result.buckets[index.min(bucket_count - 1)];
+        bucket.count += 1;
+        result.total += 1;
+        if matches!(level, "Erro" | "Crítico") {
+            bucket.errors += 1;
+            result.errors += 1;
+        } else if level == "Aviso" {
+            bucket.warnings += 1;
+            result.warnings += 1;
+        }
+    };
+    let source = state.source.read();
+    match &*source {
+        SourceData::Indexed(idx) => {
+            if scoped_filters.len() == 1 {
+                // The normal timeline reads only the compact index metadata.
+                // It never allocates an ID for every matching log line.
+                for (id, meta) in idx.lines.iter().enumerate() {
+                    if id % 2048 == 0 {
+                        crate::operations::check()?;
+                    }
+                    if meta.ts != 0 {
+                        add(meta.ts, crate::model::class_label(meta.level));
+                    }
+                }
+            } else {
+                let codes = state.codes.read();
+                let system = state.system_codes.read();
+                let derived = state.derived.read();
+                let matched =
+                    query::indexed_matches(idx, &scoped_filters, &codes, &system, &derived);
+                crate::operations::check()?;
+                for id in matched {
+                    crate::operations::check()?;
+                    let meta = &idx.lines[id];
+                    if meta.ts != 0 {
+                        add(meta.ts, crate::model::class_label(meta.level));
+                    }
+                }
+            }
+        }
+        SourceData::Memory(events) => {
+            let matched = query::filtered_indices(events, &scoped_filters);
+            crate::operations::check()?;
+            for id in matched {
+                crate::operations::check()?;
+                let ev = &events[id];
+                if let Some(timestamp) = ev.timestamp {
+                    add(timestamp, &ev.level);
+                }
+            }
+        }
+        SourceData::None => {}
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn timeline_range(
+    filters: Vec<Filter>,
+    start: i64,
+    end: i64,
+    bucket_count: usize,
+    app: AppHandle,
+) -> Result<TimelineRange, String> {
+    crate::offload(move || {
+        timeline_range_impl(
+            app.state::<AppState>().inner(),
+            filters,
+            start,
+            end,
+            bucket_count,
+        )
+    })
+    .await?
+}
 #[tauri::command]
 pub async fn compare_periods(
     filters: Vec<Filter>,

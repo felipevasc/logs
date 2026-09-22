@@ -315,6 +315,58 @@ fn cancelled_work_never_starts_and_scope_is_reset() {
     assert!(!crate::operations::cancelled());
 }
 #[test]
+fn timeline_keeps_exact_counts_and_gaps_across_storage_modes() {
+    let start = 1_706_745_600_000i64;
+    let file = Fixture::new(&format!(
+        "{{\"timestamp\":{start},\"level\":\"error\",\"source\":\"api\",\"message\":\"failed\"}}\n{{\"timestamp\":{},\"level\":\"warn\",\"source\":\"api\",\"message\":\"slow\"}}\n{{\"timestamp\":{},\"level\":\"info\",\"source\":\"api\",\"message\":\"ok\"}}\n{{\"level\":\"error\",\"source\":\"api\",\"message\":\"undated\"}}\n",
+        start + 5_000,
+        start + 10_000,
+    ));
+    let index = file.index("jsonl");
+    let events = materialize(&index);
+    let make_state = |source| crate::AppState {
+        source: parking_lot::RwLock::new(source),
+        source_names: parking_lot::RwLock::new(vec![]),
+        codes: parking_lot::RwLock::new(CodesConfig::default()),
+        system_codes: parking_lot::RwLock::new(CodesConfig::default()),
+        derived: parking_lot::RwLock::new(vec![]),
+        case_store_lock: parking_lot::Mutex::new(()),
+        codes_path: PathBuf::new(),
+        system_codes_path: PathBuf::new(),
+    };
+    let memory = make_state(crate::SourceData::Memory(events));
+    let indexed = make_state(crate::SourceData::Indexed(index));
+    for state in [&memory, &indexed] {
+        let result =
+            workspace::timeline_range_impl(state, vec![], start, start + 10_000, 5).unwrap();
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["errors"], 1);
+        assert_eq!(json["warnings"], 1);
+        let buckets = json["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 5);
+        assert_eq!(
+            buckets
+                .iter()
+                .map(|b| b["count"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 0, 1, 0, 1]
+        );
+        assert_eq!(buckets[0]["errors"], 1);
+        assert_eq!(buckets[2]["warnings"], 1);
+        let filtered = workspace::timeline_range_impl(
+            state,
+            vec![filter("level", "equals", "Erro")],
+            start,
+            start + 10_000,
+            5,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(filtered).unwrap()["total"], 1);
+    }
+}
+
+#[test]
 fn cached_index_reopens_and_invalidates_when_source_changes() {
     let f = Fixture::new("{\"message\":\"first\"}\n");
     let a = crate::index_cache::open(f.0.to_str().unwrap(), "jsonl", None, None, None).unwrap();

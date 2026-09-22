@@ -11,7 +11,7 @@
     const signature = JSON.stringify(current);
     if (signature !== lastFilters) { history.push(previousSelection); if (history.length > 30) history.shift(); previousSelection = current; lastFilters = signature; cacheKey = ""; }
   }
-  const titles = { summary: "Resumo", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Fontes" };
+  const titles = { summary: "Resumo", timeline: "Timeline", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Fontes" };
   const fmtBytes = n => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${fmtNum(Math.ceil(n / 1000))} KB`;
   const pct = n => `${(n * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
   const localInput = t => { const d = new Date(t); return new Date(t - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
@@ -46,6 +46,7 @@
     if (next === "evidence") { renderEvidence(); return; }
     if (next === "sources") { await renderSources(); return; }
     if (next === "compare") { await renderCompare(); return; }
+    if (next === "timeline") { await timeline.load(); return; }
     await renderSummary();
   }
   async function getOverview(force = false) {
@@ -75,7 +76,7 @@
         ${metric("Com horário", pct(dated / Math.max(1, data.total)), data.undated ? `${fmtNum(data.undated)} sem data` : "Todos os eventos datados")}
         </div>
         ${!data.complete ? note("Análise interrompida. Atualize para calcular o conjunto completo.") : ""}
-        <section class="ws-card"><div class="card-heading"><h2>Eventos no tempo</h2><div class="chart-legend"><span><b class="dot"></b>Eventos</span><span><b class="dot error"></b>Erros</span></div></div><div class="timeline-chart" id="ws-timeline"></div></section>
+        <section class="ws-card"><div class="card-heading"><h2>Eventos no tempo</h2><button class="text-button" data-action="timeline">Abrir timeline <i class="fas fa-arrow-right"></i></button></div><div class="timeline-chart" id="ws-timeline"></div></section>
         <div class="overview-grid"><div>
         <section class="ws-card"><div class="card-heading"><h2>Ocorrências em destaque</h2><span>${data.findings.length ? data.findings.length + (data.findings.length === 1 ? " indicação" : " indicações") : ""}</span></div>
         ${data.findings.length ? data.findings.map((f, i) => `<article class="finding"><i class="finding-icon ${esc(f.kind)} fas ${f.kind === "spike" ? "fa-arrow-trend-up" : f.kind === "quality" ? "fa-clock" : f.kind === "gap" ? "fa-arrows-left-right" : "fa-layer-group"}"></i><div><h3>${esc(f.title)}</h3><p>${esc(f.detail)}</p><button class="text-button" data-action="finding" data-index="${i}">${f.kind === "quality" ? "Revisar data/hora" : "Investigar"}<i class="fas fa-arrow-right"></i></button></div><div class="finding-actions">${iconButton("save-finding", "fa-bookmark", "Salvar evidência", i)}</div></article>`).join("") : '<p class="quiet-empty">Nenhuma concentração de erros ou lacuna destacada neste recorte. Você pode explorar os padrões e comparar períodos.</p>'}</section>
@@ -103,6 +104,12 @@
   function applyRange(start, end) {
     applyFilters([...state.filters.filter(f => f.column !== "timestamp"), { column: "timestamp", op: "between", value: String(start), value2: String(end) }], true);
   }
+  const timeline = window.createTimelineView({
+    content, getOverview, sourceKey,
+    filters: () => backendFilters(),
+    isActive: () => page === "timeline",
+    applyRange,
+  });
   function undo() { const previous = history.pop(); if (!previous) return; Object.assign(state, previous); state.page = 0; previousSelection = structuredClone(previous); lastFilters = JSON.stringify(previous); $("#quick-search").value = state.quick; renderChips(); syncCurrentSavedFilter(); refresh(); }
   async function renderCompare() {
     const version = ++serial; loading();
@@ -238,7 +245,7 @@
     const source = e.target.closest("[data-source]"); if (source) { applyFilters([{ column: "source", op: "equals", value: source.dataset.source }]); return; }
     const b = e.target.closest("[data-action]"); if (!b) return;
     const i = +b.dataset.index, action = b.dataset.action;
-    if (["sources", "compare", "explore"].includes(action)) { await showPage(action); return; }
+    if (["sources", "compare", "explore", "timeline"].includes(action)) { await showPage(action); return; }
     if (action === "retry") { await showPage(page); return; }
     if (action === "errors") { applyFilters([{ column: "level", op: "regex", value: "^(Erro|Crítico)$" }]); return; }
     if (action === "pattern") { applyFilters([{ column: "message", op: "pattern", value: overview.patterns[i].pattern }]); return; }
@@ -260,7 +267,7 @@
   $("#ws-empty-open").onclick = () => openFiles(); $("#ws-folder").onclick = () => openFiles(true);
   $("#ws-windows").onclick = () => { home.hidden = true; switchView("source"); showSourceMode("load"); setSource("eventlog"); };
   $("#ws-preferences").onclick = () => openSettings();
-  $("#ws-reload").onclick = async () => { cacheKey = ""; await showPage(page); };
+  $("#ws-reload").onclick = async () => { cacheKey = ""; timeline.invalidate(); await showPage(page); };
   $("#ws-clear-scope").onclick = () => { state.filters = []; state.quick = ""; $("#quick-search").value = ""; state.page = 0; renderChips(); syncCurrentSavedFilter(); refresh().then(() => showPage(page)); };
   $("#ws-export").onclick = openExport; $("#ws-export-close").onclick = () => { $("#ws-export-modal").hidden = true; }; $("#ws-export-save").onclick = exportFile;
   $("#ws-export-modal").onclick = e => { if (e.target.id === "ws-export-modal") e.target.hidden = true; };

@@ -274,6 +274,20 @@
     export_events: ({filters}) => applyFilters(filters).length,
     export_document: () => null,
     dataset_overview: ({filters}) => overviewFor(applyFilters(filters)),
+    timeline_range: ({filters,start,end,bucketCount}) => {
+      if (start > end) throw new Error("O início deve ser anterior ao fim.");
+      const count=Math.max(1,Math.min(240,bucketCount||120));
+      const bucketMs=Math.max(1,Math.ceil((end-start+1)/count));
+      const buckets=Array.from({length:count},(_,i)=>({timestamp:start+i*bucketMs,count:0,errors:0,warnings:0}));
+      let total=0,errors=0,warnings=0;
+      for(const e of applyFilters(filters)){
+        if(e.timestamp==null||e.timestamp<start||e.timestamp>end)continue;
+        const bucket=buckets[Math.min(count-1,Math.floor((e.timestamp-start)/bucketMs))];
+        const error=["Erro","Crítico"].includes(e.level),warning=e.level==="Aviso";
+        bucket.count++;bucket.errors+=error;bucket.warnings+=warning;total++;errors+=error;warnings+=warning;
+      }
+      return {start,end,bucketMs,total,errors,warnings,buckets};
+    },
     list_sources: () => [{id:"mock-app",name:"application.jsonl",path:"C:\\mock\\mock.jsonl",format:"jsonl",bytes:2400000,count:events.length,undated:0,start:now-86400000,end:now,sampled:200,unparsed:0}],
     compare_periods: ({filters,before,after}) => {
       const rows=applyFilters(filters),a=rows.filter(e=>e.timestamp>=before.start&&e.timestamp<=before.end),b=rows.filter(e=>e.timestamp>=after.start&&e.timestamp<=after.end);

@@ -8,6 +8,7 @@ Implementação em 22/09/2026. A avaliação inicial permanece em `avaliacao-pro
 - Interface em grafite e verde suave, tema claro, menos texto e prioridade para os dados. Revisão visual em 1440×960 e 1024×768.
 - Abrir arquivos, pastas e arquivos arrastados; adicionar fontes preservando o conjunto e reabrir conjuntos mistos.
 - Resumo com contagens completas, cobertura de horário, distribuição temporal, padrões de mensagem, concentração de erros, lacunas e percentis de latência.
+- Timeline em tela própria, com volume e gravidade por intervalo, escala no horário local, seleção por clique ou arraste, aproximação, retorno ao período anterior e abertura do recorte no explorador. A contagem é exata para o período visível e inclui avisos, erros e intervalos vazios. Eventos sem horário são identificados separadamente.
 - Clicar em um padrão, origem ou intervalo leva ao recorte correspondente. Os achados são indicações verificáveis, não diagnóstico automático de causa.
 - Comparação de dois períodos, contagens e participação relativa dos padrões. Períodos sobrepostos são rejeitados.
 - Exploração com busca de campos, favoritos, quebra de linhas, densidade, desfazer filtros e atalhos.
@@ -89,6 +90,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --release benchmark_large_index 
 ## Registro visual
 
 ![Resumo nativo com dados sintéticos](imagens/visao-geral.png)
+
+![Timeline com dados sintéticos no preview](imagens/timeline.png)
 
 A última tentativa de reabrir o executável para repetir os testes nativos após os ajustes finais foi bloqueada pela revisão automática, com a mensagem genérica 'blocked by policy'. Os testes nativos descritos acima foram realizados antes desse bloqueio; a compilação final e as verificações de código continuaram disponíveis.
 
