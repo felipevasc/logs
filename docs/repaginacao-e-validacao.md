@@ -39,6 +39,19 @@ Implementação em 22/09/2026. A avaliação inicial permanece em `avaliacao-pro
 - MCP nativo: autenticação válida aceita; ausência de chave, chave inválida e Origin de navegador rejeitados.
 - Build Windows release realizado com `npm run build`: executável em `src-tauri/target/release/loginsight.exe` e instaladores NSIS (`.exe`) e MSI em `src-tauri/target/release/bundle/`.
 
+### Builds de distribuição — Windows e Linux
+
+A [execução 35727273500](https://github.com/felipevasc/logs/actions/runs/35727273500) compilou o commit `ca8258063ab39ee8be3f05389bb81c941d1c3f45` com Rust 1.98.1 e Node.js 22. Os dois jobs terminaram com sucesso.
+
+| Plataforma | Testes em release | Pacotes x64 |
+| --- | --- | --- |
+| Windows Server 2022 | 19 passaram, 0 falharam, 3 optativos ignorados | NSIS `.exe` e `.msi` |
+| Ubuntu 22.04 | 18 passaram, 0 falharam, 1 optativo ignorado | `.deb`, `.rpm` e `.AppImage` |
+
+Os arquivos foram baixados para `output/releases/0.1.0/`. Os SHA-256 dos dois arquivos ZIP foram comparados com os hashes publicados pelo GitHub; os ZIPs passaram pela verificação de integridade. Também foram conferidos os tipos dos cinco pacotes e os metadados do `.deb`. Os hashes individuais estão em `output/releases/0.1.0/SHA256SUMS.txt`.
+
+Os artefatos do GitHub ficam disponíveis por 30 dias. O workflow pode ser executado novamente pela aba Actions. Os instaladores não possuem assinatura de código. A validação do Linux abrange compilação, testes do backend e estrutura dos pacotes; a interface gráfica no Linux ainda não foi exercitada.
+
 ### Medição de arquivo grande
 
 Corpus sintético de **1.073.741.784 bytes**, **1.091.201 eventos JSONL**, mensagens repetidas e timestamps iguais. Execução release neste computador:
