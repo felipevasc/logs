@@ -614,14 +614,12 @@ html[data-theme="light"] .chip { color: var(--accent-strong); }
   max-width: 480px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   vertical-align: middle;
 }
-#events-table tbody tr { cursor: pointer; }
+#events-table tbody tr { cursor: pointer; user-select: none; }
 #events-table tbody tr:nth-child(even) { background: var(--row-alt); }
 #events-table tbody tr:hover { background: var(--accent-soft); }
-#events-table tbody tr.selected { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
-#events-table tbody tr.row-multi-selected { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
-#events-table tbody tr.selected.row-multi-selected { background: var(--accent-soft); box-shadow: inset 4px 0 0 var(--accent); }
-.th-select-all, .td-row-check { width: 38px; min-width: 38px; max-width: 38px; text-align: center; padding: 0 4px !important; }
-.th-select-all input[type="checkbox"], .td-row-check input[type="checkbox"] { cursor: pointer; margin: 0; vertical-align: middle; }
+#events-table tbody tr.selected { background: color-mix(in srgb, var(--accent) 18%, var(--bg-1)); box-shadow: inset 3px 0 0 var(--accent); }
+#events-table tbody tr.row-multi-selected { background: color-mix(in srgb, var(--accent) 24%, var(--bg-1)) !important; box-shadow: inset 4px 0 0 var(--accent); }
+#events-table tbody tr.selected.row-multi-selected { background: color-mix(in srgb, var(--accent) 30%, var(--bg-1)) !important; box-shadow: inset 5px 0 0 var(--accent); }
 
 .t-mono { font-family: var(--font-mono); font-size: 11.5px; }
 .t-ts { color: var(--text-1); font-variant-numeric: tabular-nums; }

@@ -3953,15 +3953,22 @@ function openSendToTrailModal(events) {
 function toggleRowSelect(ev, forceState = null) {
   state.selectedEventRows = state.selectedEventRows || new Map();
   const next = forceState !== null ? forceState : !state.selectedEventRows.has(ev.id);
-  if (next) state.selectedEventRows.set(ev.id, ev);
-  else state.selectedEventRows.delete(ev.id);
-  state.lastSelectedRowId = ev.id;
+  if (next) {
+    state.selectedEventRows.set(ev.id, ev);
+    state.lastSelectedRowId = ev.id;
+  } else {
+    state.selectedEventRows.delete(ev.id);
+  }
   updateRowSelectionStyles();
 }
 
-function selectRowRange(targetId) {
-  state.selectedEventRows = state.selectedEventRows || new Map();
-  const ids = state.rows.map(r => r.id);
+function selectRowRange(targetId, keepExisting = false) {
+  if (!keepExisting) {
+    state.selectedEventRows = new Map();
+  } else {
+    state.selectedEventRows = state.selectedEventRows || new Map();
+  }
+  const ids = (state.rows || []).map(r => r.id);
   const idxA = ids.indexOf(state.lastSelectedRowId);
   const idxB = ids.indexOf(targetId);
   if (idxA >= 0 && idxB >= 0) {
@@ -3970,8 +3977,12 @@ function selectRowRange(targetId) {
     for (let i = min; i <= max; i++) {
       state.selectedEventRows.set(state.rows[i].id, state.rows[i]);
     }
-    updateRowSelectionStyles();
+  } else {
+    const targetEv = state.rows?.find(r => r.id === targetId);
+    if (targetEv) state.selectedEventRows.set(targetEv.id, targetEv);
+    state.lastSelectedRowId = targetId;
   }
+  updateRowSelectionStyles();
 }
 
 function updateRowSelectionStyles() {
@@ -3981,13 +3992,7 @@ function updateRowSelectionStyles() {
     const id = Number(tr.dataset.eventId);
     const selected = state.selectedEventRows?.has(id);
     tr.classList.toggle("row-multi-selected", !!selected);
-    const chk = tr.querySelector(".row-select-check");
-    if (chk) chk.checked = !!selected;
   });
-  const checkAll = $("#events-table thead .select-all-check");
-  if (checkAll && state.rows?.length) {
-    checkAll.checked = state.rows.every(r => state.selectedEventRows?.has(r.id));
-  }
 }
 
 // envia a página visível ao Caso, sem duplicar o que já está lá
@@ -4025,25 +4030,12 @@ function buildEventRow(ev) {
       e.preventDefault();
       selectRowRange(ev.id);
     } else {
+      state.selectedEventRows = new Map([[ev.id, ev]]);
+      state.lastSelectedRowId = ev.id;
+      updateRowSelectionStyles();
       openDetail(ev.id);
     }
   };
-
-  const tdCheck = el("td", "td-row-check");
-  tdCheck.style.width = "38px";
-  tdCheck.style.textAlign = "center";
-  const rowCheck = el("input", "row-select-check");
-  rowCheck.type = "checkbox";
-  rowCheck.setAttribute("aria-label", `Selecionar evento ${ev.id}`);
-  rowCheck.checked = !!state.selectedEventRows?.has(ev.id);
-  rowCheck.onclick = (e) => { e.stopPropagation(); };
-  rowCheck.onchange = (e) => { e.stopPropagation(); toggleRowSelect(ev, rowCheck.checked); };
-  tdCheck.appendChild(rowCheck);
-  tdCheck.oncontextmenu = (e) => {
-    e.preventDefault();
-    showCtxMenu(e.clientX, e.clientY, eventCellMenu(ev, null, null));
-  };
-  row.appendChild(tdCheck);
 
   for (const col of state.visibleCols) {
     const td = el("td");
@@ -4074,6 +4066,11 @@ function buildEventRow(ev) {
     td.title = col === "level" ? ev.level : cellValue(ev, col);
     td.oncontextmenu = (e) => {
       e.preventDefault();
+      if (!state.selectedEventRows?.has(ev.id)) {
+        state.selectedEventRows = new Map([[ev.id, ev]]);
+        state.lastSelectedRowId = ev.id;
+        updateRowSelectionStyles();
+      }
       const value = col === "level" ? ev.level : cellValue(ev, col);
       showCtxMenu(e.clientX, e.clientY, eventCellMenu(ev, col, value));
     };
@@ -4093,9 +4090,6 @@ function renderTable(qr) {
   const table = $("#events-table");
   table.querySelector("colgroup")?.remove();
   const colgroup = document.createElement("colgroup");
-  const checkCol = document.createElement("col");
-  checkCol.style.width = "38px";
-  colgroup.appendChild(checkCol);
   for (const col of state.visibleCols) {
     const colEl = document.createElement("col");
     if (state.colWidths[col]) colEl.style.width = `${state.colWidths[col]}px`;
@@ -4104,26 +4098,6 @@ function renderTable(qr) {
   table.prepend(colgroup);
 
   const tr = el("tr");
-  const thCheck = el("th", "th-select-all");
-  thCheck.style.width = "38px";
-  thCheck.style.textAlign = "center";
-  const checkAll = el("input", "select-all-check");
-  checkAll.type = "checkbox";
-  checkAll.title = "Selecionar todos os eventos da página";
-  checkAll.setAttribute("aria-label", "Selecionar todos os eventos da página");
-  checkAll.checked = qr.rows.length > 0 && qr.rows.every(r => state.selectedEventRows?.has(r.id));
-  checkAll.onchange = (e) => {
-    e.stopPropagation();
-    state.selectedEventRows = state.selectedEventRows || new Map();
-    if (checkAll.checked) {
-      for (const ev of qr.rows) state.selectedEventRows.set(ev.id, ev);
-    } else {
-      for (const ev of qr.rows) state.selectedEventRows.delete(ev.id);
-    }
-    updateRowSelectionStyles();
-  };
-  thCheck.appendChild(checkAll);
-  tr.appendChild(thCheck);
   let lastColumnDropAt = 0;
   for (const col of state.visibleCols) {
     const th = el("th", "", colLabel(col));
@@ -5204,6 +5178,13 @@ function bindKeyboard() {
     } else if (!$("#drawer").hidden && !typing) {
       if (e.key === "ArrowLeft") detailStep(-1);
       else if (e.key === "ArrowRight") detailStep(1);
+    } else if ((e.ctrlKey || e.metaKey) && (e.key === "a" || e.key === "A") && !typing) {
+      if (state.rows?.length && !$("#view-explore")?.hidden) {
+        e.preventDefault();
+        state.selectedEventRows = new Map();
+        for (const ev of state.rows) state.selectedEventRows.set(ev.id, ev);
+        updateRowSelectionStyles();
+      }
     }
   });
   // fecha o menu de contexto ao clicar/usar botão direito fora dele
