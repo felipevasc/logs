@@ -20,10 +20,11 @@ window.createTimelineView = ({ content, getOverview, sourceKey, filters, isActiv
     : span < 45 * 24 * HOUR
       ? { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }
       : { day: "2-digit", month: "2-digit", year: "2-digit" }).format(new Date(time));
-  const fullTime = time => new Intl.DateTimeFormat("pt-BR", {
+  const fullTime = (time, precise = false) => new Intl.DateTimeFormat("pt-BR", {
     day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit",
+    ...(precise ? { fractionalSecondDigits: 3 } : {}),
   }).format(new Date(time));
-  const intervalLabel = (start, end) => `${fullTime(start)} — ${fullTime(end)}`;
+  const intervalLabel = (start, end) => `${fullTime(start, end - start < 1000)} — ${fullTime(end, end - start < 1000)}`;
   // Apply the fallback before subtracting: undefined - 1 is NaN, not nullish.
   const bucketEnd = (data, index) => Math.min(data.end, (data.buckets[index + 1]?.timestamp ?? data.end + 1) - 1);
   const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
@@ -39,7 +40,7 @@ window.createTimelineView = ({ content, getOverview, sourceKey, filters, isActiv
     if (scope() !== "case" || !onMode) return;
     const controls = document.createElement("div"); controls.className = "seg tl-mode-switch";
     controls.setAttribute("role", "group"); controls.setAttribute("aria-label", "Visualização da linha do tempo");
-    controls.innerHTML = '<button type="button" class="seg-btn active" aria-pressed="true"><i class="fas fa-chart-column" aria-hidden="true"></i> Volume</button><button type="button" class="seg-btn" data-timeline-mode="horizontal" aria-pressed="false"><i class="fas fa-arrows-left-right" aria-hidden="true"></i> Horizontal</button><button type="button" class="seg-btn" data-timeline-mode="vertical" aria-pressed="false"><i class="fas fa-arrows-up-down" aria-hidden="true"></i> Vertical</button>';
+    controls.innerHTML = '<button type="button" class="seg-btn active" aria-pressed="true"><i class="fas fa-chart-column" aria-hidden="true"></i> Volume</button><button type="button" class="seg-btn" data-timeline-mode="horizontal" aria-pressed="false"><i class="fas fa-arrows-left-right" aria-hidden="true"></i> Horizontal</button><button type="button" class="seg-btn" data-timeline-mode="vertical" aria-pressed="false"><i class="fas fa-arrows-up-down" aria-hidden="true"></i> Vertical</button><button type="button" class="seg-btn" data-timeline-mode="table" aria-pressed="false"><i class="fas fa-table-list" aria-hidden="true"></i> Tabela</button>';
     controls.querySelectorAll("[data-timeline-mode]").forEach(button => { button.onclick = () => onMode(button.dataset.timelineMode); });
     content.prepend(controls);
   }
@@ -152,7 +153,7 @@ window.createTimelineView = ({ content, getOverview, sourceKey, filters, isActiv
     const signal = (index, label, number, suffix, last = index) => `<button type="button" class="tl-signal" data-signal="${index}" data-signal-end="${last}"><span>${label}</span><strong>${number}</strong><small>${shortTime(data.buckets[index].timestamp, span)} · ${suffix}</small></button>`;
     content.innerHTML = `<div class="tl-summary"><div><span>Período visível</span><strong>${intervalLabel(data.start, data.end)}</strong></div><div class="tl-summary-numbers"><span><b>${fmtNum(data.total)}</b> eventos</span><span><b>${fmtNum(data.errors)}</b> erros</span><span><b>${fmtNum(data.warnings)}</b> avisos</span></div></div>
       <section class="ws-card tl-main"><div class="tl-main-head"><div class="tl-legend"><span><i class="tl-key total"></i> Demais eventos</span><span><i class="tl-key error"></i> Erros</span><span><i class="tl-key warning"></i> Avisos</span></div><div class="tl-controls"><button class="btn ghost small" data-tl="back" ${view.history.length ? "" : "disabled"}><i class="fas fa-arrow-left"></i> Voltar</button><button class="btn ghost small" data-tl="hour" ${span > HOUR ? "" : "disabled"}>1 h</button><button class="btn ghost small" data-tl="day" ${span > 24 * HOUR ? "" : "disabled"}>24 h</button><button class="btn ghost small" data-tl="all" ${data.start !== view.bounds.start || data.end !== view.bounds.end ? "" : "disabled"}>Tudo</button></div></div>
-      <div class="tl-chart-layout"><div class="tl-y-axis"><span>${fmtNum(max)}</span><span>${fmtNum(Math.round(max / 2))}</span><span>0</span></div><div class="tl-plot-column"><div class="tl-interactive" id="tl-interactive" tabindex="0" role="group" aria-label="Volume ao longo do tempo" aria-describedby="tl-instructions tl-selection-status"><svg viewBox="0 0 1000 260" preserveAspectRatio="none" role="img" aria-label="Volume de eventos, erros e avisos no período">${grid}${bars}</svg><div class="tl-selected-band" id="tl-selected-band" hidden></div><div class="tl-drag-band" id="tl-drag-band" hidden></div><div class="tl-hover" id="tl-hover" hidden></div></div><div class="tl-x-axis">${timeTicks}</div></div></div>
+      <div class="tl-chart-layout"><div class="tl-y-axis"><span>${fmtNum(max)}</span><span>${fmtNum(max / 2)}</span><span>0</span></div><div class="tl-plot-column"><div class="tl-interactive" id="tl-interactive" tabindex="0" role="group" aria-label="Volume ao longo do tempo" aria-describedby="tl-instructions tl-selection-status"><svg viewBox="0 0 1000 260" preserveAspectRatio="none" role="img" aria-label="Volume de eventos, erros e avisos no período">${grid}${bars}</svg><div class="tl-selected-band" id="tl-selected-band" hidden></div><div class="tl-drag-band" id="tl-drag-band" hidden></div><div class="tl-hover" id="tl-hover" hidden></div></div><div class="tl-x-axis">${timeTicks}</div></div></div>
       <div class="tl-chart-foot"><span id="tl-instructions">Clique ou arraste para selecionar · Setas para navegar · Shift + setas para ampliar</span><span>Horário local · intervalos de ${formatDuration(data.bucketMs)}</span></div><p id="tl-selection-status" class="tl-sr-only" aria-live="polite" aria-atomic="true"></p></section>
       <div class="tl-bottom"><section class="ws-card tl-selection" id="tl-selection"></section><section class="ws-card tl-signals"><div class="card-heading"><h2>Destaques do período</h2></div>${data.total ? signal(peak, "Maior volume", fmtNum(data.buckets[peak].count), "eventos") : ""}${data.errors ? signal(errorPeak, "Mais erros", fmtNum(data.buckets[errorPeak].errors), "erros") : ""}${gap ? signal(gap.first, "Maior pausa", formatDuration(bucketEnd(data, gap.last) - data.buckets[gap.first].timestamp + 1), "sem registros entre eventos", gap.last) : ""}${!data.total ? '<p class="quiet-empty">Não há eventos com horário neste período.</p>' : ""}</section></div>
       ${overview.undated ? `<p class="tl-undated">${fmtNum(overview.undated)} eventos sem horário não aparecem na timeline.</p>` : ""}`;
@@ -216,8 +217,8 @@ window.createTimelineView = ({ content, getOverview, sourceKey, filters, isActiv
       } else {
         const duration = button.dataset.tl === "hour" ? HOUR : 24 * HOUR;
         const center = view.selected ? (data.buckets[view.selected.first].timestamp + bucketEnd(data, view.selected.last)) / 2 : (data.start + data.end) / 2;
-        const from = clamp(Math.round(center - duration / 2), view.bounds.start, Math.max(view.bounds.start, view.bounds.end - duration));
-        await navigate(from, Math.min(view.bounds.end, from + duration), overview);
+        const from = clamp(Math.round(center - (duration - 1) / 2), view.bounds.start, Math.max(view.bounds.start, view.bounds.end - duration + 1));
+        await navigate(from, Math.min(view.bounds.end, from + duration - 1), overview);
       }
     });
     select(view.selected?.first ?? peak, view.selected?.last ?? peak);

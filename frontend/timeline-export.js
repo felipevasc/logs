@@ -38,6 +38,7 @@ window.TimelineExport = (() => {
     if (!board?.isConnected) throw new Error("A timeline mudou. Feche esta janela e abra a exportação novamente.");
     const width = Math.ceil(board.getBoundingClientRect().width);
     const height = Math.ceil(type === "activity" ? Math.max(board.scrollHeight, board.getBoundingClientRect().height) : board.offsetHeight);
+    if (!(width > 0 && height > 0)) throw new Error("A timeline mudou. Feche esta janela e abra a exportação novamente.");
     const matrix = type === "matrix";
     const labelWidth = matrix ? parseFloat(board.style.getPropertyValue("--ct-label-width")) || 220 : 0;
     return { board, width, height, matrix, labelWidth };
@@ -54,22 +55,42 @@ window.TimelineExport = (() => {
     const occupied = [...board.querySelectorAll(".ct-entry,.ct-note,.ct-axis-tick,.ct-day,.tl-summary,.tl-chart-layout,.tl-selection,.tl-signals,.tx-note-paragraph")].map(node => {
       const r = node.getBoundingClientRect(); return { top: r.top - rect.top - 4, bottom: r.bottom - rect.top + 4 };
     });
-    const preferred = matrix ? [...board.querySelectorAll(".ct-matrix-lane")].map(node => node.offsetTop + node.offsetHeight) : occupied.map(r => r.bottom + 4);
+    // Merge occupied spans once. A page boundary must not cut through any label;
+    // checking every label for every candidate made long timelines quadratic.
+    const spans = [];
+    for (const span of occupied.slice().sort((a, b) => a.top - b.top || a.bottom - b.bottom)) {
+      const last = spans.at(-1);
+      if (last && span.top < last.bottom) last.bottom = Math.max(last.bottom, span.bottom);
+      else spans.push({ ...span });
+    }
+    const candidates = (matrix ? [...board.querySelectorAll(".ct-matrix-lane")].map(node => node.offsetTop + node.offsetHeight) : occupied.map(r => r.bottom + 4)).sort((a, b) => a - b);
+    let spanIndex = 0;
+    const preferred = candidates.filter(value => {
+      while (spanIndex < spans.length && spans[spanIndex].bottom <= value) spanIndex++;
+      const span = spans[spanIndex]; return !span || value <= span.top;
+    });
+    const lastAt = target => {
+      let lo = 0, hi = preferred.length;
+      while (lo < hi) { const mid = (lo + hi) >>> 1; if (preferred[mid] <= target) lo = mid + 1; else hi = mid; }
+      return preferred[lo - 1];
+    };
     const rows = [];
     for (let y = matrix ? 48 : 0; y < height;) {
       const target = Math.min(height, y + rowHeight);
       let end = target;
       if (target < height) {
-        const candidates = preferred.filter(value => value > y + rowHeight * .4 && value <= target && !occupied.some(r => value > r.top && value < r.bottom));
-        if (candidates.length) end = Math.max(...candidates);
+        const candidate = lastAt(target);
+        if (candidate > y + rowHeight * .4) end = candidate;
       }
       rows.push({ y, height: end - y + (matrix ? 48 : 0) }); y = end;
+      if (rows.length > MAX_PAGES) break;
     }
     const tileWidth = Math.min(PDF_WIDTH, width), step = Math.max(1, tileWidth - labelWidth);
     const columns = matrix ? Math.max(1, Math.ceil((width - labelWidth) / step)) : Math.max(1, Math.ceil(width / tileWidth));
     const pages = [];
     for (let row = 0; row < rows.length; row++) for (let column = 0; column < columns; column++) {
       pages.push({ x: column * (matrix ? step : tileWidth), y: rows[row].y, width: tileWidth, height: rows[row].height, row: row + 1, column: column + 1, rows: rows.length, columns });
+      if (pages.length > MAX_PAGES) return pages;
     }
     return pages;
   }
@@ -118,14 +139,18 @@ window.TimelineExport = (() => {
   }
   async function render(spec, { signal, progress = () => {} } = {}) {
     abort(signal); const info = measure(spec), png = pngPlan(info), pages = spec.format === "pdf" ? planPages(info) : [{ x: 0, y: info.matrix ? 48 : 0, width: info.width, height: info.height }];
+    const firstChild = info.board.firstElementChild;
     if (spec.format === "png" && !png.allowed) throw new Error("A timeline é grande demais para uma única imagem sem perder legibilidade. Exporte em PDF, que divide o conteúdo em páginas.");
-    if (pages.length > MAX_PAGES) throw new Error(`Esta visão precisaria de ${pages.length} páginas. Reduza a escala horizontal ou refine o recorte e exporte novamente.`);
+    if (pages.length > MAX_PAGES) throw new Error(`Esta visão excede ${MAX_PAGES} páginas. Reduza a escala horizontal ou refine o recorte e exporte novamente.`);
     progress(0, pages.length, "Preparando fontes e desenho…");
     const fontEmbedCSS = await loadLibraries(); abort(signal); await document.fonts.ready; abort(signal);
+    const current = measure(spec);
+    if (current.board !== info.board || current.board.firstElementChild !== firstChild || current.width !== info.width || current.height !== info.height) throw new Error("A timeline mudou durante a preparação. Abra a exportação novamente.");
     const frozen = snapshot(info), stage = text("div", "tx-stage", ""); stage.setAttribute("aria-hidden", "true"); document.body.append(stage);
+    if (spec.theme === "light") stage.classList.add("ct-report-light");
     const tasks = pages.map(tile => ({ spec, info, frozen, tile }));
     let appendix = null;
-    if (frozen.notes.length) {
+    if (frozen.notes.length && spec.noteAppendix !== false) {
       appendix = text("section", "tx-note-appendix", ""); appendix.style.width = `${Math.min(info.width, PDF_WIDTH)}px`;
       frozen.notes.forEach((note, index) => appendix.append(text("p", "tx-note-paragraph", `${index + 1}. ${note}`)));
       if (spec.format === "pdf") {
@@ -186,7 +211,7 @@ window.TimelineExport = (() => {
     const status = overlay.querySelector("[data-tx-status]"), submit = overlay.querySelector("[data-tx-save]"), cancel = overlay.querySelector("[data-tx-cancel]"), meter = overlay.querySelector("progress");
     let controller = null, writing = false;
     const selectedFormat = () => overlay.querySelector("input:checked").value;
-    const update = () => { const format = selectedFormat(); status.classList.remove("error"); status.textContent = format === "png" ? png.allowed ? `${Math.round(png.width * png.ratio).toLocaleString("pt-BR")} × ${Math.round(png.height * png.ratio).toLocaleString("pt-BR")} pixels` : "Esta timeline é grande demais para uma única imagem. Escolha PDF para preservar a leitura." : `${pdfPages.toLocaleString("pt-BR")} ${pdfPages === 1 ? "página" : "páginas"} estimadas · conteúdo dividido sem reduzir tudo a uma miniatura.`; submit.disabled = format === "png" ? !png.allowed : pdfPages > MAX_PAGES; };
+    const update = () => { const format = selectedFormat(); status.classList.remove("error"); status.textContent = format === "png" ? png.allowed ? `${Math.round(png.width * png.ratio).toLocaleString("pt-BR")} × ${Math.round(png.height * png.ratio).toLocaleString("pt-BR")} pixels` : "Esta timeline é grande demais para uma única imagem. Escolha PDF para preservar a leitura." : pdfPages > MAX_PAGES ? `Mais de ${MAX_PAGES} páginas. Reduza a escala ou refine o recorte.` : `${pdfPages.toLocaleString("pt-BR")} ${pdfPages === 1 ? "página" : "páginas"} estimadas · conteúdo dividido sem reduzir tudo a uma miniatura.`; submit.disabled = format === "png" ? !png.allowed : pdfPages > MAX_PAGES; };
     const close = () => { if (writing) return; controller?.abort(); overlay.remove(); dialog = null; origin?.focus({ preventScroll: true }); };
     cancel.onclick = close; overlay.onclick = event => { if (event.target === overlay && !controller) close(); };
     overlay.onkeydown = event => {

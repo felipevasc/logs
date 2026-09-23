@@ -1,17 +1,25 @@
 /* Visual case chronology. Its edits belong to the case, never to the source logs. */
 window.CaseTimeline = (() => {
   const COLORS = ["#76c9b5", "#7daef2", "#d3a9fa", "#f4bb73", "#f08e91", "#a7b9cf"];
-  const selection = new Set();
+  const sharedSelection = new Set();
   let activeCaseId = null;
   let selectionAnchor = null;
   let resizeObserver = null;
   const scrollPositions = new Map();
+  const tableViews = new Map();
   document.addEventListener("workspace-context-change", () => {
     // The case board is retained while Análise is shown. Do not measure a hidden board.
     resizeObserver?.disconnect(); resizeObserver = null;
   });
   const safe = value => String(value ?? "").replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
   const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const preview = (value, limit = 600) => {
+    const text = String(value ?? "");
+    if (text.length <= limit) return text;
+    let prefix = text.slice(0, limit);
+    if (/[\uD800-\uDBFF]$/.test(prefix)) prefix = prefix.slice(0, -1);
+    return `${prefix}…`;
+  };
   const dateTimeFormat = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const timeFormat = new Intl.DateTimeFormat("pt-BR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const when = value => dateTimeFormat.format(new Date(value));
@@ -39,14 +47,16 @@ window.CaseTimeline = (() => {
     document.body.append(overlay); exit.focus();
   }
 
-  function collect(c, passes) {
+  function collect(c, passes = () => true, { signal } = {}) {
     const config = c.timeline ||= { groups: [], annotations: [], edits: {}, layout: {} };
     config.groups ||= []; config.annotations ||= []; config.edits ||= {}; config.layout ||= {};
-    const events = [];
+    const events = []; let undated = 0;
     (c.items || []).forEach((item, itemIndex) => {
       (item.rows || []).forEach((event, index) => {
-        if (!valid(event.timestamp) || !passes(event)) return;
-        const id = `e:${item.id}:${event.event_ref || event.id || index}`;
+        if (!(index % 256) && signal?.aborted) throw new DOMException("Operação cancelada", "AbortError");
+        if (!passes(event)) return;
+        if (!valid(event.timestamp)) { undated++; return; }
+        const id = `e:${item.id}:${event.event_ref || (event.id ?? index)}`;
         const edit = config.edits[id] || {};
         events.push({ id, itemId: item.id, type: "event", start: event.timestamp, end: event.timestamp,
           title: edit.title || event.name || event.message || event.code || "Evento",
@@ -70,10 +80,10 @@ window.CaseTimeline = (() => {
     const rest = events.filter(event => !consumed.has(event.id));
     for (let i = 0; i < rest.length;) {
       const first = rest[i];
-      const signature = `${first.itemId}|${first.rows[0].code || first.rows[0].name || first.title}`;
+      const signature = first.rows[0].code || first.rows[0].name || first.title;
       let j = i + 1;
       while (config.compact !== false && j < rest.length && j - i < 250 && rest[j].start - rest[j - 1].start <= 5 * 60_000 &&
-        `${rest[j].itemId}|${rest[j].rows[0].code || rest[j].rows[0].name || rest[j].title}` === signature) j++;
+        rest[j].itemId === first.itemId && (rest[j].rows[0].code || rest[j].rows[0].name || rest[j].title) === signature) j++;
       if (j - i >= 2) {
         const members = rest.slice(i, j);
         entries.push({ id: `a:${first.id}`, type: "auto", start: first.start, end: members.at(-1).end,
@@ -90,16 +100,124 @@ window.CaseTimeline = (() => {
         color: manual.color || COLORS[3], rows: [], manual });
     }
     entries.sort((a, b) => a.start - b.start || a.end - b.end);
-    return { config, entries };
+    return { config, entries, undated };
+  }
+
+  function noteMap(config, entries) {
+    const anchors = new Map(), notes = new Map();
+    for (const entry of entries) {
+      anchors.set(entry.id, entry.id);
+      for (const member of entry.members || [entry]) { anchors.set(member.id, entry.id); if (member.id.startsWith("e:")) anchors.set(`a:${member.id}`, entry.id); }
+    }
+    for (const group of config.groups) if (!anchors.has(group.id)) {
+      const member = group.ids?.find(id => anchors.has(id));
+      if (member) anchors.set(group.id, anchors.get(member));
+    }
+    for (const note of config.annotations) {
+      const id = anchors.get(note.anchor); if (!id) continue;
+      if (!notes.has(id)) notes.set(id, []); notes.get(id).push(note);
+    }
+    return notes;
+  }
+  const rowKind = type => ({ event: "Evento", auto: "Sequência", group: "Grupo", manual: "Marco" })[type] || "Evento";
+  function exportRow(entry, notes) {
+    return { id: entry.id, type: entry.type, start: entry.start, end: entry.end,
+      title: String(entry.title || ""), detail: String(entry.detail || ""), source: String(entry.source || ""), count: entry.rows.length,
+      itemIds: [...new Set((entry.members || [entry]).map(member => member.itemId).filter(id => id != null))],
+      manualId: entry.manual?.id ?? null,
+      notes: (notes.get(entry.id) || []).map(note => ({ id: note.id, anchor: note.anchor, text: String(note.text || ""), icon: note.icon || "", color: note.color || null })) };
+  }
+  function rows(c, passes = () => true, { limit = 10000, maxChars = 8000000, includeUndated = false, signal } = {}) {
+    if (signal?.aborted) throw new DOMException("Operação cancelada", "AbortError");
+    limit = clamp(Math.floor(Number(limit) || 10000), 1, 100000);
+    maxChars = clamp(Math.floor(Number(maxChars) || 8000000), 1, 16000000);
+    // Default normalization must not add properties to the original case during export.
+    const copy = { ...c, timeline: { ...c.timeline } }, collected = collect(copy, passes, { signal });
+    const total = collected.entries.length + (includeUndated ? collected.undated : 0);
+    if (total > limit) throw new Error(`A timeline tem ${total.toLocaleString("pt-BR")} linhas; o relatório permite até ${limit.toLocaleString("pt-BR")}. Refine o recorte antes de exportar.`);
+    if (includeUndated) for (const item of c.items || []) for (let index = 0; index < (item.rows || []).length; index++) {
+      if (!(index % 256) && signal?.aborted) throw new DOMException("Operação cancelada", "AbortError");
+      const event = item.rows[index]; if (valid(event.timestamp) || !passes(event)) continue;
+      const id = `e:${item.id}:${event.event_ref || (event.id ?? index)}`, edit = collected.config.edits[id] || {};
+      collected.entries.push({ id, itemId: item.id, type: "event", start: null, end: null,
+        title: edit.title || event.name || event.message || event.code || "Evento",
+        detail: event.message || event.description || "", source: item.label || item.name || "Item do caso", rows: [event] });
+    }
+    const notes = noteMap(collected.config, collected.entries), result = []; let chars = 0, eventCount = 0, end = null;
+    for (const entry of collected.entries) {
+      if (signal?.aborted) throw new DOMException("Operação cancelada", "AbortError");
+      const row = exportRow(entry, notes);
+      chars += row.title.length + row.detail.length + row.source.length + row.notes.reduce((sum, note) => sum + note.text.length, 0);
+      if (chars > maxChars) throw new Error("O texto completo da timeline ultrapassa o limite do relatório. Refine o recorte antes de exportar; nenhum texto foi omitido.");
+      result.push(row); eventCount += row.count; if (row.end != null) end = end == null ? row.end : Math.max(end, row.end);
+    }
+    return { start: result[0]?.start ?? null, end, eventCount, undated: collected.undated, complete: true, rows: result };
+  }
+  function renderTable(box, c, config, entries, callbacks) {
+    box.classList.add("case-timeline-host");
+    if (!tableViews.has(c.id)) { tableViews.set(c.id, { query: "", page: 0 }); if (tableViews.size > 24) tableViews.delete(tableViews.keys().next().value); }
+    const view = tableViews.get(c.id), notes = noteMap(config, entries), pageSize = 100;
+    box.innerHTML = `<section class="ct-table-shell"><div class="ct-table-tools"><label class="ct-table-search"><i class="fas fa-magnifying-glass" aria-hidden="true"></i><input type="search" aria-label="Buscar na tabela da timeline" placeholder="Buscar ocorrências ou notas" maxlength="200"></label><button type="button" class="btn ghost small" data-ct-report><i class="fas fa-file-pdf" aria-hidden="true"></i> Relatório PDF</button></div><div class="ct-table-scroll"><table class="ct-data-table"><caption class="sr-only">Timeline do caso em ordem cronológica</caption><thead><tr><th scope="col">Horário local</th><th scope="col">Ocorrência</th><th scope="col">Origem</th><th scope="col" class="ct-table-count">Registros</th><th scope="col">Notas</th></tr></thead><tbody></tbody></table></div><div class="ct-table-pager"><span role="status" aria-live="polite"></span><div><button type="button" class="btn ghost small" data-ct-page="previous" aria-label="Página anterior"><i class="fas fa-chevron-left" aria-hidden="true"></i></button><button type="button" class="btn ghost small" data-ct-page="next" aria-label="Próxima página"><i class="fas fa-chevron-right" aria-hidden="true"></i></button></div></div></section>`;
+    const body = box.querySelector("tbody"), search = box.querySelector("input"), status = box.querySelector('[role="status"]'), previous = box.querySelector('[data-ct-page="previous"]'), next = box.querySelector('[data-ct-page="next"]');
+    const report = box.querySelector("[data-ct-report]"); report.onclick = () => { if (window.CaseReport?.open) window.CaseReport.open(); else callbacks.notify?.("O relatório PDF ainda está sendo preparado. Tente novamente em instantes."); };
+    search.value = view.query;
+    let indices = entries.map((_, index) => index), generation = 0, debounce;
+    const preciseTime = time => { const date = new Date(time); return `${when(time)}.${String(date.getMilliseconds()).padStart(3, "0")}`; };
+    const disclosure = (summary, fill) => {
+      const details = document.createElement("details"), heading = document.createElement("summary"); heading.textContent = summary; details.append(heading);
+      details.addEventListener("toggle", () => { if (details.open && details.children.length === 1) fill(details); }); return details;
+    };
+    const paint = () => {
+      view.page = clamp(view.page, 0, Math.max(0, Math.ceil(indices.length / pageSize) - 1));
+      const from = view.page * pageSize, visible = indices.slice(from, from + pageSize); body.replaceChildren();
+      for (const index of visible) {
+        const entry = entries[index], rowNotes = notes.get(entry.id) || [], tr = document.createElement("tr"); tr.dataset.id = entry.id;
+        const time = document.createElement("td"); time.className = "ct-table-time";
+        const first = document.createElement("time"); first.dateTime = new Date(entry.start).toISOString(); first.textContent = preciseTime(entry.start); time.append(first);
+        if (entry.end !== entry.start) { const last = document.createElement("time"); last.dateTime = new Date(entry.end).toISOString(); last.textContent = `até ${preciseTime(entry.end)}`; time.append(last); }
+        const main = document.createElement("td"), open = document.createElement(entry.rows.length ? "button" : "strong"); open.className = "ct-table-title"; open.textContent = preview(entry.title, 180); open.title = preview(entry.title, 600);
+        if (entry.rows.length) { open.type = "button"; open.onclick = () => { if (entry.rows.length === 1) callbacks.detail(entry.rows[0]); else { const rect = open.getBoundingClientRect(); callbacks.bucket(rect.left, rect.bottom, entry.rows); } }; }
+        main.append(open); const kind = document.createElement("small"); kind.textContent = rowKind(entry.type); main.append(kind);
+        if (entry.detail || entry.title.length > 180) main.append(disclosure("Detalhes", node => { for (const text of [entry.title, entry.detail].filter((value, i, all) => value && all.indexOf(value) === i)) { const paragraph = document.createElement("p"); paragraph.textContent = text; node.append(paragraph); } }));
+        const source = document.createElement("td"); source.textContent = preview(entry.source, 120); source.title = preview(entry.source, 600);
+        const count = document.createElement("td"); count.className = "ct-table-count"; count.textContent = entry.rows.length ? entry.rows.length.toLocaleString("pt-BR") : "—";
+        const annotation = document.createElement("td"); annotation.className = "ct-table-notes";
+        if (rowNotes.length) annotation.append(disclosure(`${rowNotes.length} ${rowNotes.length === 1 ? "nota" : "notas"} · ${preview(rowNotes[0].text || "Ícone", 80)}`, node => {
+          for (const note of rowNotes) { const paragraph = document.createElement("p"), classes = window.NoteIconPicker?.classes(note.icon); if (classes) { const icon = document.createElement("i"); icon.className = classes; icon.setAttribute("aria-hidden", "true"); paragraph.append(icon); } paragraph.append(document.createTextNode(note.text || "Ícone")); node.append(paragraph); }
+        })); else annotation.textContent = "—";
+        tr.append(time, main, source, count, annotation); body.append(tr);
+      }
+      if (!visible.length) { const tr = document.createElement("tr"), td = document.createElement("td"); td.colSpan = 5; td.className = "ct-table-empty"; td.textContent = entries.length ? "Nenhuma ocorrência ou nota corresponde à busca." : "Nenhum evento com horário neste recorte do caso."; tr.append(td); body.append(tr); }
+      previous.disabled = view.page === 0; next.disabled = from + pageSize >= indices.length;
+      status.textContent = indices.length ? `${(from + 1).toLocaleString("pt-BR")}–${Math.min(from + pageSize, indices.length).toLocaleString("pt-BR")} de ${indices.length.toLocaleString("pt-BR")} ocorrências` : "0 ocorrências";
+    };
+    async function filter() {
+      const current = ++generation, query = view.query.trim().toLocaleLowerCase("pt-BR");
+      if (!query) { indices = entries.map((_, index) => index); paint(); return; }
+      status.textContent = "Buscando…"; const matching = [];
+      for (let index = 0; index < entries.length; index++) {
+        if (!(index % 1000)) { await new Promise(resolve => setTimeout(resolve, 0)); if (current !== generation || !body.isConnected) return; }
+        const entry = entries[index], texts = [entry.title, entry.detail, entry.source, ...(notes.get(entry.id) || []).map(note => note.text)];
+        if (texts.some(text => String(text || "").toLocaleLowerCase("pt-BR").includes(query))) matching.push(index);
+      }
+      if (current === generation) { indices = matching; paint(); }
+    }
+    search.oninput = () => { view.query = search.value; view.page = 0; generation++; clearTimeout(debounce); debounce = setTimeout(filter, 180); };
+    previous.onclick = () => { view.page--; paint(); box.querySelector(".ct-table-scroll").scrollTop = 0; };
+    next.onclick = () => { view.page++; paint(); box.querySelector(".ct-table-scroll").scrollTop = 0; };
+    if (view.query) filter(); else paint();
   }
 
   function render(box, c, mode, callbacks) {
-    resizeObserver?.disconnect();
-    resizeObserver = null;
-    if (activeCaseId !== c.id) { activeCaseId = c.id; selection.clear(); selectionAnchor = null; }
+    const isolated = !!callbacks.isolated, selection = isolated ? new Set() : sharedSelection;
+    if (!isolated) {
+      resizeObserver?.disconnect(); resizeObserver = null;
+      if (activeCaseId !== c.id) { activeCaseId = c.id; selection.clear(); selectionAnchor = null; }
+    }
     const previousScroll = box.scrollTop;
     const scrollKey = JSON.stringify([c.id, mode]);
-    const { config, entries } = collect(c, callbacks.passes);
+    const { config, entries } = callbacks.collected || collect(c, callbacks.passes);
+    if (mode === "table") { renderTable(box, c, config, entries, callbacks); return; }
     const presentIds = new Set(entries.map(entry => entry.id));
     for (const id of selection) if (!presentIds.has(id)) selection.delete(id);
     box.classList.add("case-timeline-host");
@@ -126,17 +244,22 @@ window.CaseTimeline = (() => {
     const horizontal = mode === "horizontal";
     const laneMap = new Map(), matrixLanes = [], entryLane = new Map();
     if (horizontal) entries.forEach((entry, index) => {
-      const key = entry.type === "manual" || entry.type === "group" ? entry.id : JSON.stringify([entry.source, entry.title]);
-      let lane = laneMap.get(key);
-      if (!lane) { lane = { index: matrixLanes.length, title: entry.title, source: entry.source, color: entry.color, entries: [], ids: new Set(), count: 0 }; laneMap.set(key, lane); matrixLanes.push(lane); }
+      const isolated = entry.type === "manual" || entry.type === "group";
+      let sourceLanes = laneMap.get(entry.source);
+      if (!sourceLanes && !isolated) { sourceLanes = new Map(); laneMap.set(entry.source, sourceLanes); }
+      let lane = isolated ? null : sourceLanes.get(entry.title);
+      if (!lane) { lane = { index: matrixLanes.length, title: entry.title, source: entry.source, color: entry.color, entries: [], ids: new Set(), count: 0, noteCount: 0 }; if (!isolated) sourceLanes.set(entry.title, lane); matrixLanes.push(lane); }
       lane.entries.push(index); lane.count += entry.rows.length; lane.ids.add(entry.id);
       for (const member of entry.members || []) lane.ids.add(member.id);
       entryLane.set(entry.id, lane);
     });
+    const noteLanes = new Map();
+    for (const lane of matrixLanes) for (const id of lane.ids) { noteLanes.set(id, lane); if (id.startsWith("e:")) noteLanes.set(`a:${id}`, lane); }
+    for (const group of config.groups) if (!noteLanes.has(group.id)) { const first = group.ids?.find(id => noteLanes.has(id)); if (first) noteLanes.set(group.id, noteLanes.get(first)); }
+    for (const note of config.annotations) { const lane = noteLanes.get(note.anchor); if (lane) lane.noteCount++; }
     let matrixHeight = 48;
     for (const lane of matrixLanes) {
-      const notes = config.annotations.filter(note => lane.ids.has(note.anchor) || note.anchor?.startsWith("a:e:") && lane.ids.has(note.anchor.slice(2)) || config.groups.find(group => group.id === note.anchor)?.ids?.some(id => lane.ids.has(id))).length;
-      lane.y = matrixHeight; lane.height = 44 + notes * 64; matrixHeight += lane.height;
+      lane.y = matrixHeight; lane.height = 44 + lane.noteCount * 64; matrixHeight += lane.height;
     }
     const labelWidth = horizontal ? clamp(Math.round((box.clientWidth || 980) * .22), 160, 240) : 0;
     const matrixZoom = [1, 2, 4, 8].includes(config.matrixZoom) ? config.matrixZoom : 1;
@@ -351,8 +474,8 @@ window.CaseTimeline = (() => {
       for (const lane of matrixLanes) {
         const row = document.createElement("div"); row.className = "ct-matrix-lane"; row.dataset.lane = String(lane.index); row.style.top = `${lane.y}px`; row.style.height = `${lane.height}px`;
         const label = document.createElement("button"); label.type = "button"; label.className = "ct-lane-label"; label.style.setProperty("--entry-color", lane.color);
-        label.innerHTML = `<span class="ct-lane-title">${safe(lane.title)}</span><span class="ct-lane-source">${safe(lane.source)}</span><span class="ct-lane-count">${lane.count ? lane.count.toLocaleString("pt-BR") : "◆"}</span>`;
-        label.title = `${lane.title}\n${lane.source} · ${lane.count} registros\nClique para selecionar a linha; botão direito para opções.`;
+        label.innerHTML = `<span class="ct-lane-title">${safe(preview(lane.title, 180))}</span><span class="ct-lane-source">${safe(preview(lane.source, 180))}</span><span class="ct-lane-count">${lane.count ? lane.count.toLocaleString("pt-BR") : "◆"}</span>`;
+        label.title = `${preview(lane.title)}\n${preview(lane.source, 180)} · ${lane.count} registros\nClique para selecionar a linha; botão direito para opções.`;
         label.onclick = event => { if (!event.ctrlKey && !event.metaKey) selection.clear(); lane.entries.forEach(index => selection.add(entries[index].id)); selectionAnchor = entries[lane.entries[0]].id; syncSelection(); };
         label.oncontextmenu = event => entryNodes.get(entries[lane.entries[0]].id)?.oncontextmenu(event);
         label.onkeydown = event => { if (event.key === "ContextMenu" || event.shiftKey && event.key === "F10") { event.preventDefault(); const rect = label.getBoundingClientRect(); label.oncontextmenu({ preventDefault() {}, clientX: rect.right, clientY: rect.bottom }); } else if (event.key === "ArrowRight") { event.preventDefault(); entryNodes.get(entries[lane.entries[0]].id)?.focus(); } };
@@ -372,8 +495,8 @@ window.CaseTimeline = (() => {
       node.setAttribute("aria-roledescription", "ocorrência");
       node.dataset.id = entry.id; node.style.setProperty("--entry-color", entry.color);
       node.dataset.side = side;
-      node.title = `${entry.title}\n${entry.source} · ${when(entry.start)}${entry.end > entry.start ? ` → ${when(entry.end)}` : ""}${entry.detail ? `\n${entry.detail}` : ""}`;
-      node.innerHTML = `<strong>${safe(entry.title)}</strong>${entry.rows.length > 1 ? `<span class="ct-entry-count" aria-label="${entry.rows.length} registros" title="${entry.type === "auto" ? "Repetições resumidas automaticamente" : "Registros agrupados no caso"}">${entry.rows.length.toLocaleString("pt-BR")}</span>` : ""}<button class="ct-open" type="button" tabindex="-1" title="Abrir detalhes" aria-label="Abrir detalhes de ${safe(entry.title)}"><i class="fas fa-arrow-up-right-from-square"></i></button>`;
+      node.title = `${preview(entry.title)}\n${preview(entry.source, 180)} · ${when(entry.start)}${entry.end > entry.start ? ` → ${when(entry.end)}` : ""}${entry.detail ? `\n${preview(entry.detail, 800)}` : ""}`;
+      node.innerHTML = `<strong>${safe(preview(entry.title, 180))}</strong>${entry.rows.length > 1 ? `<span class="ct-entry-count" aria-label="${entry.rows.length} registros" title="${entry.type === "auto" ? "Repetições resumidas automaticamente" : "Registros agrupados no caso"}">${entry.rows.length.toLocaleString("pt-BR")}</span>` : ""}<button class="ct-open" type="button" tabindex="-1" title="Abrir detalhes" aria-label="Abrir detalhes de ${safe(preview(entry.title, 180))}"><i class="fas fa-arrow-up-right-from-square"></i></button>`;
       node.style.setProperty("--entry-offset", `${offset}px`);
       node.style.setProperty("--range-gutter", `${gutter}px`);
       node.style.setProperty("--range-lane", `${lane * laneStep}px`);
@@ -453,7 +576,7 @@ window.CaseTimeline = (() => {
         for (const member of members) {
           const marker = document.createElement("span"); marker.className = "ct-matrix-dot"; marker.dataset.markerAnchor = member.id;
           marker.style.left = `${matrixPosition(member.start) - point.x + 2}px`;
-          marker.title = `${entry.title}\n${when(member.start)}${member.rows[0]?.message ? `\n${member.rows[0].message}` : ""}`;
+          marker.title = `${preview(entry.title)}\n${when(member.start)}${member.rows[0]?.message ? `\n${preview(member.rows[0].message, 800)}` : ""}`;
           marker.ondblclick = event => { event.stopPropagation(); if (member.rows.length === 1) callbacks.detail(member.rows[0]); else open(); };
           node.append(marker); markerNodes.set(member.id, marker); markerPoints.set(member.id, { x: matrixPosition(member.start), y: point.y });
           if (!markerNodes.has(entry.id)) { markerNodes.set(entry.id, marker); markerPoints.set(entry.id, { x: point.x, y: point.y }); }
@@ -519,7 +642,7 @@ window.CaseTimeline = (() => {
     const redrawLinks = () => {
       if (!board.isConnected) return;
       const svg = shell.querySelector(".ct-links"), controls = shell.querySelector(".ct-controls"), rect = board.getBoundingClientRect();
-      const focusedArrow = document.activeElement?.dataset.arrow;
+      const focusedArrow = isolated ? null : document.activeElement?.dataset.arrow;
       svg.setAttribute("viewBox", `0 0 ${rect.width} ${board.offsetHeight}`);
       controls.setAttribute("viewBox", `0 0 ${rect.width} ${board.offsetHeight}`);
       svg.replaceChildren(); controls.replaceChildren();
@@ -671,7 +794,7 @@ window.CaseTimeline = (() => {
     const noteNodes = new Map();
     const noteRows = new Map();
     const boardRect = board.getBoundingClientRect();
-    const occupiedNotes = [...entryNodes.values()].map(node => {
+    const occupiedNotes = (config.annotations.length ? [...entryNodes.values()] : []).map(node => {
       const rect = node.getBoundingClientRect();
       return { left: rect.left - boardRect.left, top: rect.top - boardRect.top, right: rect.right - boardRect.left, bottom: rect.bottom - boardRect.top };
     });
@@ -735,7 +858,7 @@ window.CaseTimeline = (() => {
       const bins = Array(100).fill(0);
       entries.forEach(entry => (entry.members || [entry]).forEach(member => bins[clamp(Math.floor(matrixPosition(member.start) / actualWidth * 100), 0, 99)]++));
       const max = Math.max(...bins);
-      track.innerHTML = bins.map(count => `<i style="height:${Math.max(2, Math.round(count / max * 22))}px"></i>`).join("");
+      track.innerHTML = bins.map(count => `<i style="height:${count ? Math.max(2, Math.round(count / max * 22)) : 0}px"></i>`).join("");
       const updateWindow = () => { windowMark.style.left = `${scroll.scrollLeft / scroll.scrollWidth * 100}%`; windowMark.style.width = `${scroll.clientWidth / scroll.scrollWidth * 100}%`; minimap.setAttribute("aria-valuenow", String(Math.round(scroll.scrollLeft / Math.max(1, scroll.scrollWidth - scroll.clientWidth) * 100))); };
       updateMinimap = updateWindow;
       scroll.onscroll = updateWindow;
@@ -751,17 +874,71 @@ window.CaseTimeline = (() => {
       requestAnimationFrame(updateWindow);
     }
     const viewport = shell.querySelector(".ct-scroll");
-    const position = scrollPositions.get(scrollKey);
+    const position = isolated ? null : scrollPositions.get(scrollKey);
     if (position) { viewport.scrollLeft = position.left; viewport.scrollTop = position.top; }
-    viewport.addEventListener("scroll", () => {
+    if (!isolated) viewport.addEventListener("scroll", () => {
       scrollPositions.set(scrollKey, { left: viewport.scrollLeft, top: viewport.scrollTop });
       if (scrollPositions.size > 24) scrollPositions.delete(scrollPositions.keys().next().value);
     });
-    const observer = new ResizeObserver(() => { if (!board.isConnected) { observer.disconnect(); return; } redrawLinks(); updateMinimap(); });
-    resizeObserver = observer;
-    observer.observe(board);
-    observer.observe(shell.querySelector(".ct-scroll"));
+    if (!isolated) {
+      const observer = new ResizeObserver(() => { if (!board.isConnected) { observer.disconnect(); return; } redrawLinks(); updateMinimap(); });
+      resizeObserver = observer; observer.observe(board); observer.observe(shell.querySelector(".ct-scroll"));
+    }
     box.scrollTop = previousScroll;
   }
-  return { render };
+  function overviewImage(host, entries, eventCount, undated) {
+    const start = entries[0].start, end = entries.reduce((max, entry) => Math.max(max, entry.end), start), span = Math.max(1, end - start), sources = new Map();
+    for (const entry of entries) for (const member of entry.members || [entry]) if (member.rows.length) sources.set(member.source, (sources.get(member.source) || 0) + member.rows.length);
+    const sorted = [...sources].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])), shown = sorted.slice(0, 15), names = new Map(shown.map(([name], index) => [name, index]));
+    if (sorted.length > shown.length) shown.push(["Outras origens", sorted.slice(15).reduce((sum, [, count]) => sum + count, 0)]);
+    const bins = shown.map(() => Array(80).fill(0));
+    for (const entry of entries) for (const member of entry.members || [entry]) if (member.rows.length) {
+      const index = names.has(member.source) ? names.get(member.source) : shown.length - 1;
+      bins[index][clamp(Math.floor((member.start - start) / span * 80), 0, 79)] += member.rows.length;
+    }
+    const width = host.clientWidth, label = 220, plotWidth = width - label - 25, rowHeight = 38, height = 58 + Math.max(1, shown.length) * rowHeight;
+    const summary = `Visão agregada de ${eventCount.toLocaleString("pt-BR")} registros em 80 intervalos${sorted.length > 15 ? "; as demais origens estão somadas em Outras origens" : ""}. Marcos, notas e ocorrências constam na tabela do relatório.${undated ? ` ${undated.toLocaleString("pt-BR")} registros sem horário não entram no eixo temporal.` : ""}`;
+    const section = document.createElement("section"); section.className = "ct-report-overview";
+    section.innerHTML = `<p>${safe(summary)}</p><svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Volume de registros por origem e intervalo"><text x="${label}" y="18" font-size="10" fill="#526575">${safe(shortWhen(start))}</text><text x="${width - 25}" y="18" text-anchor="end" font-size="10" fill="#526575">${safe(shortWhen(end))}</text>${shown.map(([name, count], row) => {
+      const y = 40 + row * rowHeight, max = Math.max(1, ...bins[row]);
+      return `<text x="8" y="${y + 8}" font-size="11" fill="#192b37">${safe(preview(name, 27))}</text><text x="${label - 14}" y="${y + 21}" text-anchor="end" font-size="9" fill="#526575">${count.toLocaleString("pt-BR")}</text><line x1="${label}" x2="${width - 25}" y1="${y + 23}" y2="${y + 23}" stroke="#dce3e9"/>${bins[row].map((count, bin) => count ? `<rect x="${label + bin / 80 * plotWidth}" y="${y + 23 - Math.max(2, count / max * 23)}" width="${Math.max(1, plotWidth / 80 - 2)}" height="${Math.max(2, count / max * 23)}" fill="#7850a5"/>` : "").join("")}`;
+    }).join("")}</svg>`;
+    host.append(section); return { source: section, summary };
+  }
+  async function image(c, { mode = "horizontal", passes = () => true, width = 1100, maxHeight = 900, forceOverview = false, signal } = {}) {
+    const check = () => { if (signal?.aborted) throw new DOMException("Operação cancelada", "AbortError"); };
+    check(); if (!window.TimelineExport) throw new Error("O exportador de timeline não está disponível.");
+    const copy = { ...c, timeline: structuredClone(c.timeline || {}) };
+    copy.timeline.matrixZoom = 1;
+    const collected = collect(copy, passes, { signal }), { entries, config, undated } = collected;
+    const eventCount = entries.reduce((count, entry) => count + entry.rows.length, 0);
+    if (!entries.length) return { blob: null, width: 0, height: 0, complete: true, overview: false, eventCount, undated, summary: "Nenhum evento com horário neste recorte do caso." };
+    const lanes = new Map(); let laneCount = 0;
+    for (const entry of entries) {
+      if (entry.type === "manual" || entry.type === "group") { laneCount++; continue; }
+      if (!lanes.has(entry.source)) lanes.set(entry.source, new Set());
+      const titles = lanes.get(entry.source); if (!titles.has(entry.title)) { titles.add(entry.title); laneCount++; }
+    }
+    const noteChars = config.annotations.reduce((sum, note) => sum + String(note.text || "").length, 0);
+    let overview = !!forceOverview || eventCount > 2000 || laneCount > 40 || config.annotations.length > 60 || noteChars > 20000 || mode === "vertical" && entries.length > 60;
+    const host = document.createElement("div"); host.className = "ct-report-capture ct-report-light"; host.inert = true; host.setAttribute("aria-hidden", "true");
+    host.style.width = `${clamp(Math.round(Number(width) || 1100), 800, 1400)}px`; document.body.append(host);
+    let source, type, summary;
+    const drawOverview = () => { host.replaceChildren(); const result = overviewImage(host, entries, eventCount, undated); source = result.source; type = "activity"; summary = result.summary; overview = true; };
+    try {
+      if (overview) drawOverview();
+      else {
+        render(host, copy, mode === "vertical" ? "vertical" : "horizontal", { isolated: true, collected, passes, detail() {}, bucket() {}, menu() {}, notify() {}, save() {} });
+        await new Promise(requestAnimationFrame); check();
+        source = host.querySelector(".ct-shell"); type = mode === "vertical" ? "vertical" : "matrix";
+        const measured = TimelineExport.measure({ source, type }), limits = TimelineExport.limits;
+        if (measured.height + 110 > Math.max(800, Number(maxHeight) || 900) || measured.width * (measured.height + 110) > limits.maxPixels || Math.max(measured.width, measured.height + 110) > limits.maxEdge) drawOverview();
+        else summary = `Timeline · ${eventCount.toLocaleString("pt-BR")} registros${undated ? ` · ${undated.toLocaleString("pt-BR")} sem horário fora do eixo temporal` : ""}. Notas completas na tabela.`;
+      }
+      check();
+      const rendered = await TimelineExport.render({ source, type, format: "png", theme: "light", noteAppendix: false, title: `${c.name || "Caso"} · Linha do tempo`, subtitle: summary }, { signal });
+      return { ...rendered, complete: !overview, overview, summary, eventCount, undated };
+    } finally { host.remove(); }
+  }
+  return { render, rows, image };
 })();

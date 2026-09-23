@@ -50,6 +50,253 @@ fn state_for(source: crate::SourceData) -> crate::AppState {
 }
 
 #[test]
+fn mixed_numeric_sort_is_transitive_and_matches_indexed_units() {
+    let values = ["11x", "10", "2", "1s", "900ms", "NaN", "-3", "z"];
+    let text = values
+        .iter()
+        .map(|value| serde_json::json!({"mixed":value}).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fixture = Fixture::new(&text);
+    let index = fixture.index("jsonl");
+    let codes = CodesConfig::default();
+    let events: Vec<_> = (0..index.lines.len())
+        .map(|i| sources::event_at(&index, i, &codes, &codes, &[]))
+        .collect();
+    for direction in ["asc", "desc"] {
+        let memory = query::query(&events, &[], "mixed", direction, 0, 100);
+        let indexed =
+            query::query_indexed(&index, &[], "mixed", direction, 0, 100, &codes, &codes, &[]);
+        let values = |rows: &[Event]| {
+            rows.iter()
+                .map(|e| e.col_str("mixed").unwrap())
+                .collect::<Vec<_>>()
+        };
+        let mut expected = vec!["-3", "2", "10", "900ms", "1s", "11x", "NaN", "z"];
+        if direction == "desc" {
+            expected.reverse();
+        }
+        assert_eq!(values(&memory.rows), expected);
+        assert_eq!(values(&indexed.rows), expected);
+    }
+    assert!(analysis::parse_num_unit(&format!("{}TB", "9".repeat(300))).is_none());
+    let mut invalid = Event::empty();
+    invalid.fields.insert("number".into(), "NaN".into());
+    assert!(invalid.col_num("number").is_none());
+}
+
+#[test]
+fn categories_keep_literal_empty_label_separate_from_missing() {
+    let mut events = Vec::new();
+    for value in [
+        None,
+        Some(""),
+        Some(" "),
+        Some("(vazio)"),
+        Some("API"),
+        Some("api"),
+        Some(" API "),
+    ] {
+        let mut event = Event::empty();
+        if let Some(value) = value {
+            event.fields.insert("category".into(), value.into());
+        }
+        events.push(event);
+    }
+    let specs = vec![query::AggSpec {
+        func: "count".into(),
+        column: "*".into(),
+        alias: "n".into(),
+    }];
+    let grouped = query::aggregate(&events, &[], "category", &specs);
+    assert_eq!(grouped.rows.len(), 5);
+    for (value, row) in grouped.group_values.iter().zip(&grouped.rows) {
+        let selected = query::filtered_indices(
+            &events,
+            &[filter(
+                "category",
+                if value.is_some() {
+                    "equals_exact"
+                } else {
+                    "empty"
+                },
+                value.as_deref().unwrap_or(""),
+            )],
+        );
+        assert_eq!(row["n"], serde_json::json!(selected.len()));
+    }
+    let series = serde_json::to_value(analysis::compute_series(
+        &events,
+        &serde_json::from_value(
+            serde_json::json!({"chart":"terms","metric":"count","field":"category","limit":10}),
+        )
+        .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(series["x_values"].as_array().unwrap().len(), 5);
+    assert!(series["x_values"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::Value::Null));
+    assert!(series["x_values"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("(vazio)")));
+}
+
+#[test]
+fn pivot_uses_exact_tuples_and_rejects_mixed_numeric_units() {
+    let mut events = Vec::new();
+    for (r1, r2, c1, c2, latency) in [
+        ("a\u{1f}b", "c", "x → y", "z", "1s"),
+        ("a", "b\u{1f}c", "x", "y → z", "10MB"),
+    ] {
+        let mut event = Event::empty();
+        event.timestamp = Some(100);
+        for (field, value) in [
+            ("r1", r1),
+            ("r2", r2),
+            ("c1", c1),
+            ("c2", c2),
+            ("latency", latency),
+        ] {
+            event.fields.insert(field.into(), value.into());
+        }
+        events.push(event);
+    }
+    let spec=serde_json::from_value(serde_json::json!({"rows":["r1","r2"],"cols":["c1","c2"],"values":[{"func":"count","column":"*","alias":"n"},{"func":"avg","column":"latency","alias":"avg"},{"func":"min","column":"timestamp","alias":"start"}]})).unwrap();
+    let result = serde_json::to_value(analysis::pivot(&events, &spec)).unwrap();
+    assert_eq!(result["row_values"].as_array().unwrap().len(), 4);
+    assert_eq!(result["col_values"].as_array().unwrap().len(), 2);
+    assert_ne!(result["col_values"][0], result["col_values"][1]);
+    assert_eq!(result["incompatible_units"], serde_json::json!([0, 1, 0]));
+    for total in result["totals"].as_array().unwrap() {
+        assert_eq!(total[0], 1);
+        assert!(total[1].is_null());
+        assert_eq!(total[2], 100.0);
+    }
+    let leaf_count = result["row_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.as_array().unwrap().len() == 2)
+        .map(|(i, _)| {
+            result["cells"][i]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|cell| cell[0].as_u64().unwrap_or(0))
+                .sum::<u64>()
+        })
+        .sum::<u64>();
+    assert_eq!(leaf_count, 2);
+}
+
+#[test]
+fn pivot_exactly_two_hundred_columns_does_not_drop_later_records() {
+    let mut events = Vec::new();
+    for i in 0..400 {
+        let mut event = Event::empty();
+        event
+            .fields
+            .insert("column".into(), format!("c{}", i % 200).into());
+        events.push(event);
+    }
+    let spec=serde_json::from_value(serde_json::json!({"rows":[],"cols":["column"],"values":[{"func":"count","column":"*","alias":"n"}]})).unwrap();
+    let result = serde_json::to_value(analysis::pivot(&events, &spec)).unwrap();
+    assert_eq!(result["complete"], true);
+    assert_eq!(result["processed_events"], 400);
+    assert!(result["totals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|total| total[0] == 2));
+}
+
+#[test]
+fn parallel_facets_inherit_cancellation_and_nested_operations_restore_token() {
+    let generation = crate::operations::generation();
+    let result = crate::operations::run(generation, || {
+        crate::operations::run(generation, || {}).unwrap();
+        assert_eq!(crate::operations::current_generation(), Some(generation));
+        crate::operations::cancel();
+        let events = vec![Event::empty(); 10];
+        let columns = vec!["level".to_string(); 8];
+        assert!(query::multi_count(&events, &[], &columns)
+            .iter()
+            .all(|(_, result)| result.rows.is_empty()));
+    });
+    assert!(result.is_err());
+    assert!(crate::operations::current_generation().is_none());
+}
+
+#[test]
+fn discovery_category_counts_round_trip_with_exact_filters() {
+    let mut events = Vec::new();
+    for value in ["API", "api", " API "] {
+        for _ in 0..30 {
+            let mut event = Event::empty();
+            event.fields.insert("component".into(), value.into());
+            events.push(event);
+        }
+    }
+    let state = state_for(crate::SourceData::Memory(events.clone()));
+    let result = serde_json::to_value(crate::discover_patterns_impl(&state, vec![], None)).unwrap();
+    let category = result["categories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|category| category["field"] == "component")
+        .unwrap();
+    assert_eq!(category["distinct"], 3);
+    let dominant = category["dominant"]["value"].as_str().unwrap();
+    assert_eq!(
+        query::filtered_indices(&events, &[filter("component", "equals_exact", dominant)]).len(),
+        category["dominant"]["count"].as_u64().unwrap() as usize
+    );
+}
+
+#[test]
+fn grouped_numeric_measures_do_not_compare_incompatible_units() {
+    let fixture=Fixture::new("{\"group\":\"first\",\"size\":\"1s\"}\n{\"group\":\"first\",\"size\":\"500ms\"}\n{\"group\":\"second\",\"size\":\"1MB\"}\n");
+    let index = fixture.index("jsonl");
+    let codes = CodesConfig::default();
+    let events: Vec<_> = (0..index.lines.len())
+        .map(|i| sources::event_at(&index, i, &codes, &codes, &[]))
+        .collect();
+    let specs = vec![
+        query::AggSpec {
+            func: "count".into(),
+            column: "*".into(),
+            alias: "n".into(),
+        },
+        query::AggSpec {
+            func: "avg".into(),
+            column: "size".into(),
+            alias: "mean".into(),
+        },
+    ];
+    let memory = query::aggregate(&events, &[], "group", &specs);
+    let indexed = query::aggregate_indexed(&index, &[], "group", &specs, &codes, &codes, &[]);
+    assert_eq!(memory.incompatible_units, vec![0, 1]);
+    assert_eq!(memory.value_units, vec!["", "duration"]);
+    assert!(memory.rows.iter().all(|row| row["mean"].is_null()));
+    assert_eq!(
+        serde_json::to_value(memory).unwrap(),
+        serde_json::to_value(indexed).unwrap()
+    );
+    let compatible = query::aggregate(
+        &events,
+        &[filter("group", "equals_exact", "first")],
+        "group",
+        &specs,
+    );
+    assert_eq!(compatible.incompatible_units, vec![0, 0]);
+    assert_eq!(compatible.rows[0]["mean"], 750.0);
+}
+
+#[test]
 fn case_scope_queries_overview_comparison_timeline_and_export_are_isolated() {
     let mut dataset = Event::empty();
     dataset.id = 9;

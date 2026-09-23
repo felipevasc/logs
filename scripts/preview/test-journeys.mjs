@@ -13,7 +13,7 @@ page.on("pageerror", error => errors.push(error.message));
 try {
   await page.goto(url);
   await page.waitForFunction(() => state.loaded && state.rows.length > 0 && window.Journeys && window.WorkspaceContext?.ready && !WorkspaceContext.changing && (window.__mockCommandCalls.load_file || window.__mockCommandCalls.load_files) && document.querySelector("#load-overlay").hidden);
-  await page.getByRole("button", { name: "Jornadas", exact: true }).click();
+  await page.getByRole("button", { name: "Possíveis trilhas", exact: true }).click();
   await page.waitForFunction(() => document.querySelectorAll(".journey-item").length === 30);
   assert.equal(await page.getByRole("combobox", { name: "Conjunto", exact: true }).count(), 0, "Jornadas uses the global context toggle");
   assert.equal(await page.getByRole("combobox", { name: "Ligar pelo campo" }).inputValue(), "correlation_id", "prefer useful repeated correlation over unique request IDs");
@@ -69,7 +69,7 @@ try {
   await page.waitForFunction(() => document.querySelector(".journey-item strong")?.textContent === "flow-long");
   assert.equal(await page.locator(".journey-item").count(), 50);
   results.caseIndex = await page.locator(".journey-status").innerText();
-  assert.match(results.caseIndex, /63 jornadas/);
+  assert.match(results.caseIndex, /63 possíveis trilhas/);
   await page.locator(".journey-list-panel").getByRole("button", { name: "Próxima", exact: true }).click();
   await page.waitForFunction(() => document.querySelectorAll(".journey-item").length === 13);
   await page.locator(".journey-list-panel").getByRole("button", { name: "Anterior", exact: true }).click();

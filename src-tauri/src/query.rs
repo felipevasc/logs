@@ -63,10 +63,14 @@ pub struct QueryResult {
     pub rows: Vec<Event>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct AggResult {
     pub columns: Vec<String>,
     pub rows: Vec<Map<String, Value>>,
+    /// Exact grouping values, parallel to rows; None is an empty/missing value.
+    pub group_values: Vec<Option<String>>,
+    pub incompatible_units: Vec<usize>,
+    pub value_units: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -224,6 +228,7 @@ pub fn sort_indices(events: &[Event], indices: &mut [usize], column: &str, desc:
     // linha; o comparador anterior realocava as strings a cada comparação.
     let mut keyed: Vec<((Option<f64>, String), usize)> = indices
         .iter()
+        .take_while(|_| !crate::operations::cancelled())
         .map(|&i| {
             let ev = &events[i];
             let num = ev.col_num(column);
@@ -231,11 +236,11 @@ pub fn sort_indices(events: &[Event], indices: &mut [usize], column: &str, desc:
             ((num, text), i)
         })
         .collect();
+    if keyed.len() != indices.len() {
+        return;
+    }
     keyed.sort_by(|((na, sa), _), ((nb, sb), _)| {
-        let ord = match (na, nb) {
-            (Some(x), Some(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-            _ => sa.cmp(sb),
-        };
+        let ord = compare_sort_keys(*na, sa, *nb, sb);
         if desc {
             ord.reverse()
         } else {
@@ -244,6 +249,17 @@ pub fn sort_indices(events: &[Event], indices: &mut [usize], column: &str, desc:
     });
     for (slot, (_, i)) in indices.iter_mut().zip(keyed) {
         *slot = i;
+    }
+}
+
+// A mixed numeric/text comparator must keep the two kinds in a fixed order.
+// Falling back to text only for mixed pairs creates cycles (2 < 10 < 11x < 2).
+fn compare_sort_keys(a: Option<f64>, sa: &str, b: Option<f64>, sb: &str) -> std::cmp::Ordering {
+    match (a.filter(|n| n.is_finite()), b.filter(|n| n.is_finite())) {
+        (Some(a), Some(b)) => a.total_cmp(&b).then_with(|| sa.cmp(sb)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => sa.cmp(sb),
     }
 }
 
@@ -304,9 +320,12 @@ fn aggregate_from_memory_matches(
     group_column: &str,
     specs: &[AggSpec],
 ) -> AggResult {
-    let mut groups: HashMap<String, Vec<Acc>> = HashMap::new();
+    let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order = Vec::new();
     for &i in matched {
+        if crate::operations::cancelled() {
+            break;
+        }
         let event = &events[i];
         push_group(
             &mut groups,
@@ -685,10 +704,10 @@ fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
 enum Acc {
     Count(u64),
     CountDistinct(crate::distinct::Counter),
-    Sum(f64),
-    Avg(f64, u64),
-    Min(Option<f64>),
-    Max(Option<f64>),
+    Sum(f64, [usize; 5]),
+    Avg(f64, u64, [usize; 5]),
+    Min(Option<f64>, [usize; 5]),
+    Max(Option<f64>, [usize; 5]),
     StrAgg(Vec<String>),
 }
 
@@ -697,15 +716,24 @@ impl Acc {
         match func {
             "count" => Acc::Count(0),
             "count_distinct" => Acc::CountDistinct(Default::default()),
-            "sum" => Acc::Sum(0.0),
-            "avg" => Acc::Avg(0.0, 0),
-            "min" => Acc::Min(None),
-            "max" => Acc::Max(None),
+            "sum" => Acc::Sum(0.0, [0; 5]),
+            "avg" => Acc::Avg(0.0, 0, [0; 5]),
+            "min" => Acc::Min(None, [0; 5]),
+            "max" => Acc::Max(None, [0; 5]),
             _ => Acc::StrAgg(Vec::new()),
         }
     }
 
     fn push(&mut self, ev: &Event, column: &str) {
+        let numeric = || {
+            if matches!(column, "timestamp" | "id") {
+                ev.col_num(column)
+                    .map(|value| (value, crate::analysis::UnitKind::Number))
+            } else {
+                ev.col_ref(column)
+                    .and_then(|value| crate::analysis::parse_num_unit(&value))
+            }
+        };
         match self {
             Acc::Count(n) => *n += 1,
             Acc::CountDistinct(set) => {
@@ -713,25 +741,29 @@ impl Acc {
                     set.insert(s);
                 }
             }
-            Acc::Sum(n) => {
-                if let Some(v) = ev.col_num(column) {
+            Acc::Sum(n, units) => {
+                if let Some((v, unit)) = numeric() {
                     *n += v;
+                    units[unit as usize] += 1;
                 }
             }
-            Acc::Avg(sum, n) => {
-                if let Some(v) = ev.col_num(column) {
+            Acc::Avg(sum, n, units) => {
+                if let Some((v, unit)) = numeric() {
                     *sum += v;
                     *n += 1;
+                    units[unit as usize] += 1;
                 }
             }
-            Acc::Min(cur) => {
-                if let Some(v) = ev.col_num(column) {
+            Acc::Min(cur, units) => {
+                if let Some((v, unit)) = numeric() {
                     *cur = Some(cur.map(|c: f64| c.min(v)).unwrap_or(v));
+                    units[unit as usize] += 1;
                 }
             }
-            Acc::Max(cur) => {
-                if let Some(v) = ev.col_num(column) {
+            Acc::Max(cur, units) => {
+                if let Some((v, unit)) = numeric() {
                     *cur = Some(cur.map(|c: f64| c.max(v)).unwrap_or(v));
+                    units[unit as usize] += 1;
                 }
             }
             Acc::StrAgg(items) => {
@@ -746,19 +778,29 @@ impl Acc {
         }
     }
 
+    fn units(&self) -> &[usize; 5] {
+        match self {
+            Acc::Sum(_, units)
+            | Acc::Avg(_, _, units)
+            | Acc::Min(_, units)
+            | Acc::Max(_, units) => units,
+            _ => &[0; 5],
+        }
+    }
+
     fn finish(&self, ev_col: &str) -> Value {
         match self {
             Acc::Count(n) => Value::from(*n),
             Acc::CountDistinct(set) => Value::from(set.len() as u64),
-            Acc::Sum(n) => round2(*n).into(),
-            Acc::Avg(sum, n) => {
+            Acc::Sum(n, _) => round2(*n).into(),
+            Acc::Avg(sum, n, _) => {
                 if *n == 0 {
                     Value::Null
                 } else {
                     round2(*sum / *n as f64).into()
                 }
             }
-            Acc::Min(cur) | Acc::Max(cur) => match cur {
+            Acc::Min(cur, _) | Acc::Max(cur, _) => match cur {
                 Some(v) if ev_col == "timestamp" => Value::from(crate::model::ts_to_iso(*v as i64)),
                 Some(v) => round2(*v).into(),
                 None => Value::Null,
@@ -789,6 +831,7 @@ pub fn multi_count(
     filters: &[Filter],
     columns: &[String],
 ) -> Vec<(String, AggResult)> {
+    let generation = crate::operations::current_generation();
     columns
         .par_iter()
         .map(|col| {
@@ -797,16 +840,22 @@ pub fn multi_count(
                 .filter(|f| f.column != *col)
                 .cloned()
                 .collect();
-            let agg = aggregate(
-                events,
-                &fs,
-                col,
-                &[AggSpec {
-                    func: "count".into(),
-                    column: "*".into(),
-                    alias: "n".into(),
-                }],
-            );
+            let run = || {
+                aggregate(
+                    events,
+                    &fs,
+                    col,
+                    &[AggSpec {
+                        func: "count".into(),
+                        column: "*".into(),
+                        alias: "n".into(),
+                    }],
+                )
+            };
+            let agg = match generation {
+                Some(g) => crate::operations::run(g, run).unwrap_or_default(),
+                None => run(),
+            };
             (col.clone(), agg)
         })
         .collect()
@@ -821,6 +870,7 @@ pub fn multi_count_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Vec<(String, AggResult)> {
+    let generation = crate::operations::current_generation();
     columns
         .par_iter()
         .map(|col| {
@@ -829,33 +879,45 @@ pub fn multi_count_indexed(
                 .filter(|f| f.column != *col)
                 .cloned()
                 .collect();
-            let agg = aggregate_indexed(
-                idx,
-                &fs,
-                col,
-                &[AggSpec {
-                    func: "count".into(),
-                    column: "*".into(),
-                    alias: "n".into(),
-                }],
-                codes,
-                system,
-                derived,
-            );
+            let run = || {
+                aggregate_indexed(
+                    idx,
+                    &fs,
+                    col,
+                    &[AggSpec {
+                        func: "count".into(),
+                        column: "*".into(),
+                        alias: "n".into(),
+                    }],
+                    codes,
+                    system,
+                    derived,
+                )
+            };
+            let agg = match generation {
+                Some(g) => crate::operations::run(g, run).unwrap_or_default(),
+                None => run(),
+            };
             (col.clone(), agg)
         })
         .collect()
 }
 
 fn build_agg_result(
-    groups: HashMap<String, Vec<Acc>>,
-    mut order: Vec<String>,
+    groups: HashMap<Option<String>, Vec<Acc>>,
+    mut order: Vec<Option<String>>,
     group_column: &str,
     specs: &[AggSpec],
 ) -> AggResult {
-    order.sort_by(|a, b| match (a.parse::<f64>(), b.parse::<f64>()) {
-        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-        _ => a.to_lowercase().cmp(&b.to_lowercase()),
+    order.sort_by(|a, b| {
+        let (sa, sb) = (a.as_deref().unwrap_or(""), b.as_deref().unwrap_or(""));
+        compare_sort_keys(
+            sa.parse().ok(),
+            &sa.to_lowercase(),
+            sb.parse().ok(),
+            &sb.to_lowercase(),
+        )
+        .then_with(|| a.cmp(b))
     });
 
     let alias = |s: &AggSpec| {
@@ -867,21 +929,57 @@ fn build_agg_result(
     };
     let mut columns = vec![group_column.to_string()];
     columns.extend(specs.iter().map(&alias));
+    let mut incompatible_units = vec![0; specs.len()];
+    let mut value_units = vec![String::new(); specs.len()];
+    for i in 0..specs.len() {
+        let mut counts = [0usize; 5];
+        for accs in groups.values() {
+            for (total, count) in counts.iter_mut().zip(accs[i].units()) {
+                *total += count;
+            }
+        }
+        if let Some((unit, count)) = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(unit, count)| (**count, std::cmp::Reverse(*unit)))
+            .filter(|(_, count)| **count > 0)
+        {
+            incompatible_units[i] = counts.iter().sum::<usize>() - count;
+            value_units[i] = ["number", "bytes", "bits", "duration", "number"][unit].into();
+        }
+    }
 
+    let group_values = order.clone();
     let rows = order
         .into_iter()
         .map(|key| {
             let accs = &groups[&key];
             let mut row = Map::new();
-            row.insert(group_column.to_string(), Value::from(key));
-            for (acc, spec) in accs.iter().zip(specs.iter()) {
-                row.insert(alias(spec), acc.finish(&spec.column));
+            row.insert(
+                group_column.to_string(),
+                Value::from(key.unwrap_or_else(|| "(vazio)".into())),
+            );
+            for (i, (acc, spec)) in accs.iter().zip(specs.iter()).enumerate() {
+                row.insert(
+                    alias(spec),
+                    if incompatible_units[i] > 0 {
+                        Value::Null
+                    } else {
+                        acc.finish(&spec.column)
+                    },
+                );
             }
             row
         })
         .collect();
 
-    AggResult { columns, rows }
+    AggResult {
+        columns,
+        rows,
+        group_values,
+        incompatible_units,
+        value_units,
+    }
 }
 
 pub fn aggregate(
@@ -891,10 +989,13 @@ pub fn aggregate(
     specs: &[AggSpec],
 ) -> AggResult {
     let idx = filtered_indices(events, filters);
-    let mut groups: HashMap<String, Vec<Acc>> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
+    let mut order: Vec<Option<String>> = Vec::new();
 
     for i in idx {
+        if crate::operations::cancelled() {
+            break;
+        }
         let ev = &events[i];
         push_group(&mut groups, &mut order, ev, ev.col_str(group_column), specs);
     }
@@ -902,21 +1003,16 @@ pub fn aggregate(
 }
 
 fn push_group(
-    groups: &mut HashMap<String, Vec<Acc>>,
-    order: &mut Vec<String>,
+    groups: &mut HashMap<Option<String>, Vec<Acc>>,
+    order: &mut Vec<Option<String>>,
     ev: &Event,
     key: Option<String>,
     specs: &[AggSpec],
 ) {
-    let key = key.unwrap_or_default();
-    let key = if key.is_empty() {
-        "(vazio)".to_string()
-    } else {
-        key
-    };
+    let key = key.filter(|value| !value.trim().is_empty());
     // Caminho quente é o grupo já existente: get_mut evita clonar a chave
     // a cada linha; só clona ao criar um grupo novo.
-    if let Some(accs) = groups.get_mut(key.as_str()) {
+    if let Some(accs) = groups.get_mut(&key) {
         for (acc, spec) in accs.iter_mut().zip(specs.iter()) {
             acc.push(ev, &spec.column);
         }
@@ -961,14 +1057,17 @@ pub fn aggregate_indexed(
     derived: &[CompiledDerived],
 ) -> AggResult {
     let matched = indexed_matches(idx, filters, codes, system, derived);
-    let mut groups: HashMap<String, Vec<Acc>> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
+    let mut order: Vec<Option<String>> = Vec::new();
 
     // Caminho rápido: grupo e agregações só sobre colunas de metadados
     // (timestamp, level, code) — zero parse por linha.
     let meta_only = is_meta_column(group_column) && specs.iter().all(|s| is_meta_column(&s.column));
 
     for i in matched {
+        if crate::operations::cancelled() {
+            break;
+        }
         if meta_only {
             let ev = meta_event(idx, i);
             push_group(
@@ -1020,22 +1119,28 @@ fn query_from_indexed_matches(
             }
         }),
         col => {
-            let keys: HashMap<usize, String> = matched
+            let keys: HashMap<usize, (Option<f64>, String)> = matched
                 .iter()
+                .take_while(|_| !crate::operations::cancelled())
                 .map(|&i| {
+                    let event = event_at(idx, i, codes, system, derived);
                     (
                         i,
-                        event_at(idx, i, codes, system, derived)
-                            .col_str(col)
-                            .unwrap_or_default(),
+                        (
+                            event.col_num(col),
+                            event.col_ref(col).unwrap_or_default().to_lowercase(),
+                        ),
                     )
                 })
                 .collect();
-            matched.sort_by(|a, b| {
-                let ord = match (keys[a].parse::<f64>(), keys[b].parse::<f64>()) {
-                    (Ok(a), Ok(b)) => a.total_cmp(&b),
-                    _ => keys[a].to_lowercase().cmp(&keys[b].to_lowercase()),
+            if keys.len() != matched.len() {
+                return QueryResult {
+                    total: 0,
+                    rows: vec![],
                 };
+            }
+            matched.sort_by(|a, b| {
+                let ord = compare_sort_keys(keys[a].0, &keys[a].1, keys[b].0, &keys[b].1);
                 if desc {
                     ord.reverse()
                 } else {
@@ -1067,11 +1172,14 @@ fn aggregate_from_indexed_matches(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> AggResult {
-    let mut groups: HashMap<String, Vec<Acc>> = HashMap::new();
+    let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order = Vec::new();
     let meta_only =
         is_meta_column(group_column) && specs.iter().all(|spec| is_meta_column(&spec.column));
     for &i in matched {
+        if crate::operations::cancelled() {
+            break;
+        }
         if meta_only {
             let event = meta_event(idx, i);
             push_group(

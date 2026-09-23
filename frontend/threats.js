@@ -7,11 +7,12 @@
   const emptyView=()=>({category:'',severity:'',kind:'',search:'',page:0});
   const view=emptyView(),views=new Map();
   let viewKey='';
-  const contextKey=scope=>scope==='case'?`case:${activeCase()?.id||''}`:'dataset';
+  const contextKey=scope=>JSON.stringify([scope,activeCase()?.id||'',scope==='dataset'?state.currentArtifact?.id||'':null]);
   function useContext(scope){
     const key=contextKey(scope);
     if(key===viewKey)return;
     if(viewKey)views.set(viewKey,{...view});
+    if(views.size>12)views.delete(views.keys().next().value);
     Object.assign(view,emptyView(),views.get(key)||{});viewKey=key;inspectorRequest++;
   }
   document.addEventListener('workspace-context-change',event=>useContext(event.detail.scope));
@@ -74,7 +75,7 @@
         const pages=Math.max(1,Math.ceil(data.total/50)),pager=el('div','threat-pager');
         const previous=button('Anterior',()=>{page--;load();}),next=button('Próxima',()=>{page++;load();});previous.disabled=page===0;next.disabled=page>=pages-1;
         pager.append(previous,el('span','',`${page+1} / ${pages}`),next);body.append(pager);
-      }catch(error){if(current()){body.innerHTML='';body.append(el('p','threat-error',String(error)),button('Tentar novamente',load));}}
+      }catch(error){if(current()&&request===version){body.innerHTML='';body.append(el('p','threat-error',String(error)),button('Tentar novamente',load));}}
     }
     await load();
   }

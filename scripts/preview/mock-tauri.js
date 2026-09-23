@@ -229,7 +229,7 @@
             const baseline_observed=all.get(observed)-window_observed,observed_share=window_observed/window_count,baseline_observed_share=baseline_observed/baseline_count,delta=observed_share-baseline_observed_share;
             const fresh=!group.context.length&&field==='message'&&baseline_observed===0&&observed_share>=.15;if(delta<.35&&!fresh)continue;
             const example=windowRows[bin].find(e=>value(e)===observed);
-            candidates.push({kind:group.context.length?'behavior_shift':fresh?'new_pattern':'distribution_shift',context:group.context,outcome_field:field,outcome_op:field==='message'?'pattern':'equals',expected,observed,baseline_count,baseline_expected,baseline_observed,window_count,window_expected:window.get(expected)||0,window_observed,expected_share,observed_share,baseline_observed_share,delta,start:min+bin*width,end:Math.min(max,min+(bin+1)*width-1),score:delta*Math.sqrt(window_observed)*(group.context.length?expected_share:1),event_id:example.id,event_ref:example.event_ref||`preview:${example.id}`});
+            candidates.push({kind:group.context.length?'behavior_shift':fresh?'new_pattern':'distribution_shift',context:group.context,outcome_field:field,outcome_op:field==='message'?'pattern':'equals_exact',expected,observed,baseline_count,baseline_expected,baseline_observed,window_count,window_expected:window.get(expected)||0,window_observed,expected_share,observed_share,baseline_observed_share,delta,start:min+bin*width,end:Math.min(max,min+(bin+1)*width-1),score:delta*Math.sqrt(window_observed)*(group.context.length?expected_share:1),event_id:example.id,event_ref:example.event_ref||`preview:${example.id}`});
           }
         });
       }
@@ -261,10 +261,7 @@
     };
   }
 
-  const aggRows = (rows, col) => ({
-    columns: [col, "n"],
-    rows: countBy(rows, col).map(([k, n]) => ({ [col]: k, n })),
-  });
+  const aggRows = (rows, col) => window.__mockAggregate(rows, col, [{ func: "count", column: "*", alias: "n" }]);
 
   const isIp = (s) => /^\d{1,3}(\.\d{1,3}){3}$/.test(s) || (/^[\da-f:]+$/i.test(s) && s.includes(":"));
   const isBool = (s) => ["true", "false", "0", "1", "sim", "não", "nao", "yes", "no"].includes(s.toLowerCase());
@@ -349,6 +346,10 @@
     expand_paths: ({paths}) => paths,
     export_events: ({filters,caseEvents}) => applyFilters(filters,poolOf(caseEvents)).length,
     export_document: () => null,
+    case_image_add: async args => (await import('/__mock-case-images__.js')).addImage(args),
+    case_image_read: async args => (await import('/__mock-case-images__.js')).readImage(args),
+    export_investigation: async args => (await import('/__mock-case-images__.js')).exportInvestigation(args),
+    import_investigation: async args => (await import('/__mock-case-images__.js')).importInvestigation(args),
     export_timeline: async ({format, filename, base64}) => {
       const state = window.__timelineExportMock ||= { files: [], cancel: false, download: true };
       if (state.cancel) { state.cancel = false; return { saved: false }; }
@@ -622,8 +623,9 @@
     compute_series: ({ filters, caseEvents, spec }) => {
       const rows = applyFilters(filters, poolOf(caseEvents));
       if (spec.chart === "terms") {
-        const counts = countBy(rows, spec.field).slice(0, spec.limit || 12);
-        return { kind: "terms", unit: null, x: counts.map(([k]) => k), series: [{ name: spec.field, points: counts.map(([, n]) => n) }] };
+        const grouped=window.__mockAggregate(rows,spec.field,[{func:'count',column:'*',alias:'n'}]);
+        const counts=grouped.rows.map((row,index)=>({label:row[spec.field],raw:grouped.group_values[index],count:row.n})).sort((a,b)=>b.count-a.count).slice(0,spec.limit||12);
+        return { kind: "terms", unit: null, x: counts.map(v=>v.label), x_values:counts.map(v=>v.raw), series: [{ name: spec.field, points: counts.map(v=>v.count) }] };
       }
       const tss = rows.map((e) => e.timestamp).filter((t) => t != null);
       if (!tss.length) return { kind: "time", unit: null, x: [], series: [] };

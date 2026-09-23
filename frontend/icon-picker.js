@@ -31,13 +31,19 @@ window.NoteIconPicker=(()=>{
     const pager=make('div','ct-icon-pager'),previous=make('button','btn ghost small','Anterior'),next=make('button','btn ghost small','Próxima'),status=make('span');
     previous.type=next.type='button';previous.setAttribute('aria-label','Página anterior de ícones');next.setAttribute('aria-label','Próxima página de ícones');status.setAttribute('role','status');status.setAttribute('aria-live','polite');
     pager.append(previous,status,next);host.append(grid,pager);
+    function selectedValue(){
+      const match=String(input.value).match(/fa-([a-z0-9-]+)$/),style=classes(input.value).startsWith('fab')?'brands':'solid';
+      const icon=icons.find(icon=>icon.style===style&&(icon.name===match?.[1]||icon.aliases.includes(match?.[1])));
+      return icon?valueOf(icon):input.value;
+    }
     function updateSelection(){
       selection.textContent='';
       const match=String(input.value).match(/fa-([a-z0-9-]+)$/),name=match?.[1],style=classes(input.value).startsWith('fab')?'brands':'solid';
       const icon=icons.find(icon=>icon.style===style&&(icon.name===name||icon.aliases.includes(name)));
       if(classes(input.value))selection.append(glyph(input.value));
       selection.append(make('span','',input.value?icon?.label||name||'Ícone salvo':'Sem ícone'));none.setAttribute('aria-pressed',String(!input.value));
-      for(const button of grid.querySelectorAll('button'))button.setAttribute('aria-pressed',String(button.dataset.value===input.value));
+      const selected=selectedValue();
+      for(const button of grid.querySelectorAll('button'))button.setAttribute('aria-pressed',String(button.dataset.value===selected));
     }
     function select(value){input.value=value;updateSelection();input.dispatchEvent(new Event('change',{bubbles:true}));}
     none.onclick=()=>select('');updateSelection();grid.textContent='Carregando ícones…';
@@ -47,9 +53,9 @@ window.NoteIconPicker=(()=>{
       const terms=normalize(search.value).trim().split(/\s+/).filter(Boolean);
       all=icons.filter(icon=>icon.style===collection.value&&(!category.value||icon.groups.includes(category.value))&&terms.every(term=>icon.hay.includes(term)));
       const pages=Math.max(1,Math.ceil(all.length/PAGE));page=Math.min(page,pages-1);grid.textContent='';
-      const slice=all.slice(page*PAGE,(page+1)*PAGE);active=Math.max(0,slice.findIndex(icon=>valueOf(icon)===input.value));
+      const selected=selectedValue(),slice=all.slice(page*PAGE,(page+1)*PAGE);active=Math.max(0,slice.findIndex(icon=>valueOf(icon)===selected));
       for(const [index,icon]of slice.entries()){
-        const value=valueOf(icon),button=make('button','ct-icon-choice');button.type='button';button.dataset.value=value;button.title=`${icon.label} · ${icon.en} (${icon.name})`;button.setAttribute('aria-label',`${icon.label} · ${icon.en}`);button.setAttribute('aria-pressed',String(value===input.value));button.tabIndex=index===active?0:-1;button.append(glyph(value));button.onclick=()=>{active=index;select(value);};button.onfocus=()=>{active=index;for(const other of grid.querySelectorAll('button'))other.tabIndex=other===button?0:-1;};grid.append(button);
+        const value=valueOf(icon),button=make('button','ct-icon-choice');button.type='button';button.dataset.value=value;button.title=`${icon.label} · ${icon.en} (${icon.name})`;button.setAttribute('aria-label',`${icon.label} · ${icon.en}`);button.setAttribute('aria-pressed',String(value===selected));button.tabIndex=index===active?0:-1;button.append(glyph(value));button.onclick=()=>{active=index;select(value);};button.onfocus=()=>{active=index;for(const other of grid.querySelectorAll('button'))other.tabIndex=other===button?0:-1;};grid.append(button);
       }
       if(!slice.length)grid.append(make('p','ct-icon-empty','Nenhum ícone. Tente outro nome ou categoria.'));
       previous.disabled=page===0;next.disabled=page===pages-1;status.textContent=`${all.length.toLocaleString('pt-BR')} ícones · ${page+1} / ${pages}`;grid.scrollTop=0;
@@ -75,7 +81,10 @@ window.NoteIconPicker=(()=>{
       collection.options[0].textContent=`Ícones (${icons.filter(icon=>icon.style==='solid').length.toLocaleString('pt-BR')})`;
       collection.options[1].textContent=`Marcas (${icons.filter(icon=>icon.style==='brands').length.toLocaleString('pt-BR')})`;
       for(const group of [...new Set(icons.filter(icon=>icon.style==='solid').flatMap(icon=>icon.groups))].sort((a,b)=>a.localeCompare(b,'pt-BR')))option(category,group,group);
-      category.disabled=collection.value==='brands';updateSelection();render();
+      category.disabled=collection.value==='brands';
+      // Open the saved glyph's page, including legacy aliases, without rewriting it.
+      if(!search.value&&!category.value){const index=icons.filter(icon=>icon.style===collection.value).findIndex(icon=>valueOf(icon)===selectedValue());if(index>=0)page=Math.floor(index/PAGE);}
+      updateSelection();render();
     }).catch(error=>{if(host.isConnected){grid.textContent=error.message;status.textContent='Seu ícone salvo foi preservado.';previous.disabled=next.disabled=true;}});
     return input;
   }

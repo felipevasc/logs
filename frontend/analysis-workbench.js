@@ -7,6 +7,7 @@
   const pivotView = { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "" };
   const pivotTask = { busy: false, queued: false };
   let groupTimer;
+  let groupKeys = new WeakMap();
   const number = value => typeof value === "number" ? fmtNum(value) : String(value ?? "—");
   const percent = value => `${(value * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
   const button = (label, action, className = "btn ghost small") => {
@@ -20,6 +21,9 @@
     target.append(details, button("Tentar novamente", retry));
   }
   const emptyFilter = (field, value, exclude = false) => ({ column: field, op: value === "(vazio)" ? (exclude ? "not_empty" : "empty") : (exclude ? "not_equals_exact" : "equals_exact"), value: value === "(vazio)" ? "" : String(value), value2: null });
+  const exactFilter = (field, value, exclude = false) => ({ column: field, op: value == null ? (exclude ? "not_empty" : "empty") : (exclude ? "not_equals_exact" : "equals_exact"), value: value == null ? "" : String(value), value2: null });
+  const displayGroup = value => value == null ? "(vazio)" : value === "(vazio)" ? '“(vazio)”' : String(value);
+  const groupValue = row => groupKeys.has(row) ? groupKeys.get(row) : row[groupView.field] === "(vazio)" ? null : row[groupView.field];
   const fieldNames = (scope = workspaceScope()) => [...new Set(scope === "case" ? [...state.columns, ...STANDARD, ...(scopeProfiles(scope) || []).map(p => p.name)] : state.columns)];
   const candidates = (scope = workspaceScope()) => {
     const columns = fieldNames(scope), profiles = scopeProfiles(scope) || [];
@@ -106,7 +110,7 @@
 
   runGroup = async function () {
     groupShell(); clearTimeout(groupTimer);
-    if (!scopeHasEvents(workspaceScope())) { $("#aw-group-summary").textContent = workspaceScope() === "case" ? "Adicione registros relevantes ao Caso para resumir." : "Abra um arquivo para resumir seus registros."; $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); return; }
+    if (!scopeHasEvents(workspaceScope())) { groupView.version++; groupView.result = null; $("#aw-group-summary").textContent = workspaceScope() === "case" ? "Adicione registros relevantes ao Caso para resumir." : "Abra um arquivo para resumir seus registros."; $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren(); return; }
     if (!state.columns.includes(state.groupCol)) state.groupCol = state.columns[0];
     if (!state.aggs.length) { state.aggs = [{ func: "count", column: "*", alias: "Registros" }]; renderAggs(); }
     if (!checkMeasures(state.aggs, state.groupCol)) return;
@@ -116,15 +120,18 @@
     const scope = workspaceScope(), source = scope === "case" ? caseSig() : state.currentArtifact?.id, filters = backendFilters(), signature = JSON.stringify([scope, filters]);
     const run = $("#btn-run-group"); run.disabled = true;
     $("#group-table").setAttribute("aria-busy", "true"); $("#aw-group-summary").textContent = "Calculando todos os registros do recorte…";
+    $("#group-table").inert = true;
     startOperation("group", "Calculando resumo", `Por ${colLabel(field)}`);
     try {
       const result = await api("aggregate_events", { ...analyticsRequest(scope), groupColumn: field, aggs, filters });
       if (version !== groupView.version || source !== (scope === "case" ? caseSig() : state.currentArtifact?.id) || signature !== JSON.stringify([workspaceScope(), backendFilters()])) return;
-      groupView.result = result; groupView.field = field; groupView.aggs = aggs; groupView.page = 0;
+      groupView.result = result; groupView.field = field; groupView.aggs = aggs;
+      groupKeys = new WeakMap(); if (result.group_values?.length === result.rows.length) result.rows.forEach((row, index) => groupKeys.set(row, result.group_values[index]));
       const order = $("#aw-group-order");
       order.options[0].text = aggs[0]?.func === "count" ? "Mais frequentes" : "Maior medida";
       order.options[1].text = aggs[0]?.func === "count" ? "Menos frequentes" : "Menor medida";
-      groupView.sort = order.value === "name" ? field : result.columns[1]; groupView.direction = order.value === "largest" ? -1 : 1;
+      if (!result.columns.includes(groupView.sort)) { groupView.sort = result.columns[1]; groupView.direction = -1; }
+      order.value = groupView.sort === field ? "name" : groupView.direction < 0 ? "largest" : "smallest";
       renderGroupShortcuts(); renderGroups(); finishOperation("Resumo atualizado", `${fmtNum(result.rows.length)} grupos`);
     } catch (error) {
       if (version !== groupView.version || source !== (scope === "case" ? caseSig() : state.currentArtifact?.id) || signature !== JSON.stringify([workspaceScope(), backendFilters()])) return;
@@ -133,12 +140,13 @@
       calculationError($("#aw-group-summary"), error, () => runGroup()); finishOperation("Falha ao resumir", String(error));
     } finally {
       groupView.busy = false; run.disabled = false; $("#group-table").setAttribute("aria-busy", "false");
+      $("#group-table").inert = false;
       if (groupView.queued) { groupView.queued = false; runGroup(); }
     }
   };
 
   function filterGroup(value, exclude = false) {
-    state.filters.push(emptyFilter(groupView.field, value, exclude)); state.page = 0; switchTab("table"); filtersChanged();
+    state.filters.push(exactFilter(groupView.field, value, exclude)); state.page = 0; switchTab("table"); filtersChanged();
   }
   function renderGroups() {
     const result = groupView.result; if (!result) return;
@@ -161,15 +169,15 @@
     if (countKey) hr.append(el("th", "aw-number", "% do recorte")); hr.append(el("th", "", "")); head.append(hr);
     const max = countKey ? result.rows.reduce((n, row) => Math.max(n, Number(row[countKey]) || 0), 1) : 1;
     for (const row of rows.slice(groupView.page * pageSize, (groupView.page + 1) * pageSize)) {
-      const tr = el("tr"); const value = row[field]; tr.title = "Abrir os registros deste grupo"; tr.onclick = () => filterGroup(value);
+      const tr = el("tr"); const value = groupValue(row); tr.title = "Abrir os registros deste grupo"; tr.onclick = () => filterGroup(value);
       tr.oncontextmenu = event => { event.preventDefault(); showCtxMenu(event.clientX, event.clientY, [
         { icon: "fa-filter", label: "Abrir registros do grupo", onClick: () => filterGroup(value) },
         { icon: "fa-filter-circle-xmark", label: "Excluir este grupo do recorte", onClick: () => filterGroup(value, true) },
-        { icon: "fa-briefcase", label: "Adicionar grupo ao caso…", onClick: () => openNamePop(tr, name => { const filter = emptyFilter(field, value); addGroupToAnalysis(field, filter.value, name, filter.op); }) },
+        { icon: "fa-briefcase", label: "Adicionar grupo ao caso…", onClick: () => openNamePop(tr, name => { const filter = exactFilter(field, value); addGroupToAnalysis(field, filter.value, name, filter.op); }) },
         { icon: "fa-circle-info", label: "Inspecionar campo", onClick: () => showFieldInspector(field) },
       ].filter(action => workspaceScope() !== "case" || action.icon !== "fa-briefcase")); };
       for (const [index, key] of result.columns.entries()) {
-        const td = el("td", index ? "aw-number" : "aw-group-key", number(row[key])); td.title = String(row[key] ?? "(vazio)");
+        const td = el("td", index ? "aw-number" : "aw-group-key", index ? number(row[key]) : displayGroup(value)); td.title = String(row[key] ?? "(vazio)");
         if (key === countKey) { td.classList.add("aw-bar-cell"); td.style.setProperty("--aw-bar", `${Math.max(0, Number(row[key]) / max * 100)}%`); }
         tr.append(td);
       }
@@ -178,6 +186,8 @@
     }
     if (!rows.length) { const tr = el("tr"), td = el("td", "aw-empty", groupView.search ? "Nenhum grupo corresponde à busca. Altere o termo acima." : "Nenhum registro neste recorte. Revise os filtros."); td.colSpan = result.columns.length + 2; tr.append(td); body.append(tr); }
     $("#aw-group-summary").textContent = `${fmtNum(result.rows.length)} grupos${countKey ? ` · ${fmtNum(total)} registros` : ""}${groupView.search ? ` · ${fmtNum(rows.length)} encontrados` : ""}`;
+    const incompatible = (result.incompatible_units || []).map((count, index) => count ? `${measureName(groupView.aggs[index])} (${fmtNum(count)} valores)` : null).filter(Boolean);
+    if (incompatible.length) $("#aw-group-summary").append(el("span", "aw-partial", ` · Unidades incompatíveis em ${incompatible.join(", ")}. Separe os registros por unidade para calcular essas medidas.`));
     const footer = $("#aw-group-pager"); footer.replaceChildren(el("span", "muted small", "Busca e ordenação usam todos os grupos calculados. Clique em um grupo para investigar."));
     const prev = button("←", () => { groupView.page--; renderGroups(); }); prev.disabled = !groupView.page; prev.setAttribute("aria-label", "Grupos anteriores");
     const next = button("→", () => { groupView.page++; renderGroups(); }); next.disabled = groupView.page >= pages - 1; next.setAttribute("aria-label", "Próximos grupos");
@@ -195,10 +205,10 @@
     const tools = el("div", "aw-result-tools aw-pivot-result-tools");
     const search = el("input", "aw-search"); search.type = "search"; search.placeholder = "Buscar nas linhas…"; search.setAttribute("aria-label", "Buscar linhas do cruzamento"); search.id = "aw-pivot-search";
     search.oninput = () => { pivotView.search = search.value; pivotView.page = 0; redrawPivot(); };
-    const heat = button("Mapa de calor", () => { pivotView.heat = !pivotView.heat; heat.setAttribute("aria-pressed", String(pivotView.heat)); redrawPivot(); }); heat.setAttribute("aria-pressed", "true");
-    const order = el("select"); order.setAttribute("aria-label", "Ordenação do cruzamento"); option(order, "tree", "Por grupos"); option(order, "desc", "Maior primeira medida"); option(order, "asc", "Menor primeira medida");
+    const heat = button("Mapa de calor", () => { pivotView.heat = !pivotView.heat; heat.setAttribute("aria-pressed", String(pivotView.heat)); redrawPivot(); }); heat.id = "aw-pivot-heat"; heat.setAttribute("aria-pressed", "true");
+    const order = el("select"); order.id = "aw-pivot-order"; order.setAttribute("aria-label", "Ordenação do cruzamento"); option(order, "tree", "Por grupos"); option(order, "desc", "Maior primeira medida"); option(order, "asc", "Menor primeira medida");
     order.onchange = () => { pivotView.sort = order.value; pivotView.page = 0; redrawPivot(); };
-    const fold = button("Recolher", () => { cubeState.collapsed = new Set((cubeState.result?.row_paths || []).filter(p => p.length === 1)); pivotView.page = 0; redrawPivot(); });
+    const fold = button("Recolher", () => { cubeState.collapsed = new Set((cubeState.result?.row_values || cubeState.result?.row_paths || []).filter(p => p.length === 1)); pivotView.page = 0; redrawPivot(); });
     const expand = button("Expandir", () => { cubeState.collapsed.clear(); redrawPivot(); });
     tools.append(search, order, heat, fold, expand); $("#cube-table-view").before(tools);
     const summary = el("div", "aw-pivot-summary"); summary.id = "aw-pivot-summary"; summary.setAttribute("aria-live", "polite"); tools.after(summary);
@@ -287,14 +297,14 @@
     }
   };
 
-  function pivotFilters(cube, path, columnKey = null) {
-    const filters = path.slice(0, cube.rows.length).map((value, index) => emptyFilter(cube.rows[index], value));
-    // Multi-column keys are display strings, not safely reversible tuples.
-    if (cube.cols.length === 1 && columnKey !== null) filters.push(emptyFilter(cube.cols[0], columnKey));
+  function pivotFilters(cube, path, columnKey = null, columnValues = null, exact = false) {
+    const filters = path.slice(0, cube.rows.length).map((value, index) => (exact ? exactFilter : emptyFilter)(cube.rows[index], value));
+    if (Array.isArray(columnValues)) columnValues.forEach((value, index) => { if (cube.cols[index]) filters.push(exactFilter(cube.cols[index], value)); });
+    else if (cube.cols.length === 1 && columnKey !== null) filters.push(emptyFilter(cube.cols[0], columnKey));
     return filters;
   }
-  function pivotMenu(event, cube, path, columnKey = null) {
-    event.preventDefault(); const scope = state.analyticsScope, filters = pivotFilters(cube, path, columnKey);
+  function pivotMenu(event, cube, path, columnKey = null, columnValues = null, exact = false) {
+    event.preventDefault(); const scope = state.analyticsScope, filters = pivotFilters(cube, path, columnKey, columnValues, exact);
     if (!filters.length) return;
     const apply = (open = false) => {
       for (const filter of filters) if (!state.filters.some(f => f.column === filter.column && f.op === filter.op && f.value === filter.value)) state.filters.push(filter);
@@ -302,7 +312,7 @@
       if (open) { switchView("viz"); switchTab("table"); }
       filtersChanged();
     };
-    const label = cube.cols.length > 1 ? "Filtrar esta linha" : "Filtrar esta combinação";
+    const label = cube.cols.length > 1 && !columnValues ? "Filtrar esta linha" : "Filtrar esta combinação";
     const actions = [{ icon: "fa-filter", label, onClick: () => apply() }];
     actions.push({ icon: "fa-table-list", label: "Abrir registros correspondentes", onClick: () => apply(true) });
     actions.push({ icon: "fa-circle-info", label: `Inspecionar ${colLabel(filters[filters.length - 1].column)}`, onClick: () => showFieldInspector(filters[filters.length - 1].column) });
@@ -311,9 +321,10 @@
   renderCubeTable = function (cube, result) {
     pivotShell();
     const key = `${state.analyticsScope}:${cube.id}:${cubeSchemaSignature(cube)}`;
-    if (pivotView.tableKey !== key) { pivotView.tableKey = key; pivotView.page = 0; pivotView.columnPage = 0; }
+    if (pivotView.tableKey !== key) { if (!pivotView.restoring) { pivotView.page = 0; pivotView.columnPage = 0; } pivotView.tableKey = key; } pivotView.restoring = false;
     const head = $("#cube-table thead"), body = $("#cube-table tbody"); head.replaceChildren(); body.replaceChildren();
-    const pathKey = path => JSON.stringify(path), paths = result.row_paths || [], depth = cube.rows.length;
+    const exact = Array.isArray(result.row_values) && result.row_values.length === result.row_paths?.length;
+    const pathKey = path => JSON.stringify(path), paths = exact ? result.row_values : result.row_paths || [], depth = cube.rows.length;
     const parents = new Set(paths.filter(path => path.length > 1).map(path => pathKey(path.slice(0, -1))));
     const collapsed = [...cubeState.collapsed];
     let rows = paths.map((path, ri) => ({ path, ri })).filter(({ path }) => {
@@ -321,7 +332,7 @@
       if (collapsed.some(prefix => prefix.length < path.length && prefix.every((v, i) => path[i] === v))) return false;
       return path.length === depth || !parents.has(pathKey(path)) || collapsed.some(prefix => pathKey(prefix) === pathKey(path));
     });
-    const query = pivotView.search.toLocaleLowerCase(); if (query) rows = rows.filter(row => row.path.some(value => String(value).toLocaleLowerCase().includes(query)));
+    const query = pivotView.search.toLocaleLowerCase(); if (query) rows = rows.filter(row => row.path.some(value => displayGroup(value).toLocaleLowerCase().includes(query)));
     if (pivotView.sort !== "tree") rows.sort((a, b) => ((Number(result.cells[a.ri]?.[0]?.[0]) || 0) - (Number(result.cells[b.ri]?.[0]?.[0]) || 0)) * (pivotView.sort === "desc" ? -1 : 1));
     const pageSize = 100, pages = Math.max(1, Math.ceil(rows.length / pageSize)), names = result.value_names?.length ? result.value_names : ["Registros"], columnKeys = result.col_keys?.length ? result.col_keys : ["(total)"];
     const columnSize = Math.max(1, Math.floor(24 / names.length)), columnPages = Math.max(1, Math.ceil(columnKeys.length / columnSize));
@@ -354,13 +365,13 @@
             if (saved) cubeState.collapsed.delete(saved); else cubeState.collapsed.add(prefix); renderCubeTable(cube, result);
           }, "cube-toggle"); toggle.title = isCollapsed ? "Expandir grupo" : "Recolher grupo"; toggle.setAttribute("aria-label", `${toggle.title}: ${value}`); toggle.setAttribute("aria-expanded", String(!isCollapsed)); td.append(toggle);
         }
-        td.append(document.createTextNode(value === undefined ? "Subtotal" : String(value))); td.title = value === undefined ? "Subtotal das dimensões anteriores" : String(value);
-        if (depth && value !== undefined) td.oncontextmenu = event => pivotMenu(event, cube, path.slice(0, di + 1)); tr.append(td);
+        td.append(document.createTextNode(value === undefined ? "Subtotal" : exact ? displayGroup(value) : String(value))); td.title = value === undefined ? "Subtotal das dimensões anteriores" : exact ? displayGroup(value) : String(value);
+        if (depth && value !== undefined) td.oncontextmenu = event => pivotMenu(event, cube, path.slice(0, di + 1), null, null, exact); tr.append(td);
       }
       columns.forEach(({ key, ci }, displayedColumn) => names.forEach((_, vi) => {
         const raw = result.cells[ri]?.[ci]?.[vi], td = el("td", "cube-value aw-number", number(raw));
         if (pivotView.heat && typeof raw === "number" && Number.isFinite(raw) && maxima[displayedColumn][vi] > 0) td.style.backgroundColor = `color-mix(in srgb, var(--accent) ${Math.round(Math.abs(raw) / maxima[displayedColumn][vi] * 24)}%, transparent)`;
-        td.title = "Botão direito: investigar os registros desta combinação"; td.oncontextmenu = event => pivotMenu(event, cube, depth ? path : [], cube.cols.length ? key : null); tr.append(td);
+        td.title = "Botão direito: investigar os registros desta combinação"; td.oncontextmenu = event => pivotMenu(event, cube, depth ? path : [], cube.cols.length ? key : null, result.col_values?.[ci], exact); tr.append(td);
       })); body.append(tr);
     }
     if (!rows.length) { const tr = el("tr"), td = el("td", "aw-empty", query ? "Nenhuma linha corresponde à busca." : "Nenhum registro neste recorte."); td.colSpan = dimensionCount + columns.length * names.length; tr.append(td); body.append(tr); }
@@ -368,6 +379,8 @@
     for (const { ci } of columns) for (let vi = 0; vi < names.length; vi++) total.append(el("td", "cube-value aw-number", number(result.totals?.[ci]?.[vi]))); body.append(total);
     const partial = result.complete === false;
     $("#aw-pivot-summary").textContent = `${fmtNum(rows.length)} linhas · ${fmtNum(columnKeys.length)} ${columnKeys.length === 1 ? "coluna" : "colunas"}${result.processed_events !== undefined ? ` · ${fmtNum(result.processed_events)} registros analisados` : ""}${partial ? " · Resultado parcial: reduza dimensões ou período." : result.truncated ? " · Exibição limitada pelo motor; totais consideram o recorte completo." : ""}`;
+    const incompatible = (result.incompatible_units || []).map((count, index) => count ? `${names[index]} (${fmtNum(count)} valores)` : null).filter(Boolean);
+    if (incompatible.length) $("#aw-pivot-summary").append(el("span", "aw-partial", ` · Unidades incompatíveis em ${incompatible.join(", ")}. Separe os registros por unidade para calcular essas medidas.`));
     if (partial) title.textContent = "Total analisado (parcial)";
     $("#aw-pivot-summary").classList.toggle("aw-partial", partial);
     const pager = $("#aw-pivot-pager"); pager.replaceChildren(el("span", "muted small", "Totais independem da busca e da página. Botão direito para investigar."));
@@ -387,7 +400,18 @@
   };
   window.WorkspaceAnalysis = {
     capture: () => ({ group: { search: groupView.search, sort: groupView.sort, direction: groupView.direction, page: groupView.page }, pivot: { ...pivotView } }),
-    restore: saved => { groupView.version++; clearTimeout(groupTimer); Object.assign(groupView, { result: null, field: null, search: "", sort: null, direction: -1, page: 0 }, saved?.group); Object.assign(pivotView, { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "" }, saved?.pivot); if ($("#aw-group-tools input")) $("#aw-group-tools input").value = groupView.search; }
+    restore: saved => {
+      groupView.version++; clearTimeout(groupTimer); Object.assign(groupView, { result: null, field: null, search: "", sort: null, direction: -1, page: 0 }, saved?.group);
+      Object.assign(pivotView, { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "" }, saved?.pivot, { restoring: true });
+      if ($("#aw-group-tools input")) $("#aw-group-tools input").value = groupView.search;
+      if ($("#aw-pivot-search")) $("#aw-pivot-search").value = pivotView.search;
+      if ($("#aw-pivot-order")) $("#aw-pivot-order").value = pivotView.sort;
+      $("#aw-pivot-heat")?.setAttribute("aria-pressed", String(pivotView.heat));
+      if ($("#aw-field-search")) $("#aw-field-search").value = "";
+      for (const selector of ["#group-table thead", "#group-table tbody", "#cube-table thead", "#cube-table tbody", "#aw-group-pager", "#aw-pivot-pager"]) $(selector)?.replaceChildren();
+      if ($("#aw-group-summary")) $("#aw-group-summary").textContent = "";
+      if ($("#aw-pivot-summary")) $("#aw-pivot-summary").textContent = "";
+    }
   };
   groupShell(); renderAggs(); pivotShell();
 })();

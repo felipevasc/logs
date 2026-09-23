@@ -1,4 +1,5 @@
 mod analysis;
+mod case_images;
 mod case_store;
 mod discovery;
 mod distinct;
@@ -1249,10 +1250,14 @@ pub(crate) fn explore_snapshot_impl(
             sources: query::AggResult {
                 columns: vec![],
                 rows: vec![],
+                group_values: vec![],
+                ..Default::default()
             },
             codes: query::AggResult {
                 columns: vec![],
                 rows: vec![],
+                group_values: vec![],
+                ..Default::default()
             },
         },
     };
@@ -1293,9 +1298,7 @@ pub(crate) fn aggregate_events_impl(
 ) -> query::AggResult {
     // eventos do Caso: aplica os filtros recebidos e agrega sobre o recorte
     if let Some(events) = case_events {
-        let indices = query::filtered_indices(&events, &filters);
-        let filtered: Vec<Event> = indices.into_iter().map(|i| events[i].clone()).collect();
-        return query::aggregate(&filtered, &[], group_column, &aggs);
+        return query::aggregate(&events, &filters, group_column, &aggs);
     }
     let source = state.source.read();
     let codes = state.codes.read();
@@ -1315,6 +1318,8 @@ pub(crate) fn aggregate_events_impl(
         SourceData::None => query::AggResult {
             columns: vec![],
             rows: vec![],
+            group_values: vec![],
+            ..Default::default()
         },
     }
 }
@@ -2047,6 +2052,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            case_images::case_image_add,
+            case_images::case_image_read,
+            case_images::export_investigation,
             remote::remote_list,
             remote::remote_save,
             remote::remote_delete,

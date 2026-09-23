@@ -807,39 +807,26 @@ pub async fn export_document(path: String, content: String) -> Result<(), String
     if content.len() > 64 * 1024 * 1024 {
         return Err("O relatório excede 64 MB.".into());
     }
-    crate::offload(move || std::fs::write(path, content).map_err(|e| e.to_string())).await?
+    crate::offload(move || {
+        let path = Path::new(&path);
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+        temp.write_all(content.as_bytes())
+            .and_then(|_| temp.as_file().sync_all())
+            .map_err(|e| e.to_string())?;
+        crate::operations::check()?;
+        temp.persist(path).map_err(|e| e.error.to_string())?;
+        crate::operations::commit();
+        Ok(())
+    })
+    .await?
 }
 #[tauri::command]
 pub async fn import_investigation(path: String) -> Result<serde_json::Value, String> {
-    crate::offload(move || {
-        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        if file.metadata().map_err(|e| e.to_string())?.len() > 64 * 1024 * 1024 {
-            return Err("O arquivo excede 64 MB.".into());
-        }
-        let data: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(file))
-            .map_err(|e| format!("Investigação inválida: {e}"))?;
-        if data
-            .get("schemaVersion")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1)
-            > 2
-        {
-            return Err("Esta investigação exige uma versão mais recente.".into());
-        }
-        let cases = data
-            .get("cases")
-            .and_then(|v| v.as_array())
-            .ok_or("Arquivo sem investigações.")?;
-        if cases.is_empty()
-            || cases
-                .iter()
-                .any(|c| !c.is_object() || !c.get("id").is_some_and(|v| v.is_string()))
-        {
-            return Err("Estrutura de investigação inválida.".into());
-        }
-        Ok(data)
-    })
-    .await?
+    crate::offload(move || crate::case_images::import_document(&path)).await?
 }
 
 #[tauri::command]

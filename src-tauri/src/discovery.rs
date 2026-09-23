@@ -172,7 +172,7 @@ fn near_duplicate_values(left: &[String], right: &[String]) -> bool {
             continue;
         }
         overlap += 1;
-        identical += usize::from(a.eq_ignore_ascii_case(b));
+        identical += usize::from(a == b);
     }
     overlap > 0 && (identical == overlap || (overlap >= 20 && identical * 100 >= overlap * 95))
 }
@@ -265,8 +265,8 @@ where
             .enumerate()
             .filter(|(_, v)| !v.trim().is_empty())
         {
-            // Same case semantics as an "equals" filter. Keep original label.
-            *counts.entry(val.to_ascii_lowercase()).or_default() += 1;
+            // Match the exact category selected by an equals_exact filter.
+            *counts.entry(val.clone()).or_default() += 1;
             if let Some((n, unit)) = parse_num_unit(val).filter(|(n, _)| n.is_finite()) {
                 numeric.push((i, n, unit));
                 units[unit as usize] += 1;
@@ -350,10 +350,7 @@ where
         if counts.len() < 2 || counts.len() > 64 || counts.len() * 2 > present {
             continue;
         }
-        let labels: HashMap<_, _> = vals
-            .iter()
-            .map(|v| (v.to_ascii_lowercase(), v.clone()))
-            .collect();
+        let labels: HashMap<_, _> = vals.iter().map(|v| (v.clone(), v.clone())).collect();
         let mut ranked: Vec<_> = counts.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let make = |(v, n): &(String, usize)| ValueCount {
@@ -402,9 +399,7 @@ where
                 if av.trim().is_empty() || bv.trim().is_empty() {
                     continue;
                 }
-                *pairs
-                    .entry((av.to_ascii_lowercase(), bv.to_ascii_lowercase()))
-                    .or_default() += 1;
+                *pairs.entry((av.clone(), bv.clone())).or_default() += 1;
             }
             // Suppress near-duplicate fields too: >=95% identical among at
             // least 20 co-present rows. A few missing/different values must not

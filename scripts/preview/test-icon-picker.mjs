@@ -13,11 +13,12 @@ assert.equal(catalog.icons.filter(icon=>icon.style==='solid').length,1422);asser
 assert(catalog.icons.every(icon=>css.includes(`.fa-${icon.name}`)),'All catalog icons exist in bundled CSS');
 const result={url,solid:1422,brands:572};
 try{
-  await page.goto(url);await page.waitForFunction(()=>state.loaded&&state.total===6000);
+  await page.goto(url);await page.waitForFunction(()=>state.loaded&&state.total===6000&&window.WorkspaceContext?.ready&&!WorkspaceContext.changing&&document.querySelector('#load-overlay').hidden);
   await page.evaluate(()=>{
     const c=activeCase();c.items=[{id:'note-icons',name:'Icon fixture',kind:'events',rows:[{id:0,event_ref:'icon:0',timestamp:Date.now(),source:'API',level:'Informação',name:'Início',message:'Evento de teste',fields:{}},{id:1,event_ref:'icon:1',timestamp:Date.now()+60000,source:'API',level:'Informação',name:'Fim',message:'Evento de teste',fields:{}}]}];
     c.timeline={groups:[],edits:{},layout:{},compact:false,annotations:[{id:'old-icon',anchor:'e:note-icons:icon:0',text:'Nota anterior',icon:'fa-comment'}]};caseEventsCache.sig=null;
   });
+  await page.evaluate(()=>WorkspaceContext.setScope('case',{page:'case-timeline',animate:false}));
   await page.getByRole('button',{name:'Linha do tempo',exact:true}).click();
   assert.equal(await page.locator('.ct-note .fa-comment').count(),1);
   await page.locator('.ct-note').dblclick();
@@ -94,6 +95,24 @@ try{
   await page.screenshot({path:resolve(output,'note-icons-1024.png')});
   await page.keyboard.press('Escape');assert.equal(await page.locator('.ct-editor-backdrop').isVisible(),false);
   assert.equal(await page.evaluate(()=>document.activeElement.dataset.ctAction),'note','Escape restores trigger focus');
+  for(const [saved,canonical]of [['fas fa-shield-alt','fa-shield-halved'],['fa-worm','fa-worm']]){
+    await page.evaluate(saved=>{activeCase().timeline.annotations[0].icon=saved;renderAnalysis();},saved);
+    await page.locator('.ct-note[data-note="old-icon"]').dblclick();
+    await page.locator(`.ct-icon-choice[data-value="${canonical}"]`).waitFor();
+    assert.equal(await page.locator(`.ct-icon-choice[data-value="${canonical}"]`).getAttribute('aria-pressed'),'true','The saved glyph is selected on reopening, including legacy aliases');
+    assert.equal(await page.locator('input[name="icon"]').inputValue(),saved);
+    await page.getByRole('button',{name:'Salvar',exact:true}).click();
+    assert.equal(await page.evaluate(()=>activeCase().timeline.annotations[0].icon),saved);
+  }
+  await page.locator('[data-ct-action="note"]').click();await page.waitForFunction(()=>document.querySelectorAll('.ct-icon-choice').length===96);
+  for(const width of [1024,1440])for(const theme of ['dark','light']){
+    await page.setViewportSize({width,height:900});await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme);
+    const editor=await page.locator('.ct-editor').boundingBox(),save=await page.getByRole('button',{name:'Salvar',exact:true}).boundingBox();
+    assert(editor.x>=0&&editor.x+editor.width<=width&&editor.y>=0&&editor.y+editor.height<=900);
+    assert(save.y+save.height<=editor.y+editor.height);
+    await checkGridGeometry();await page.screenshot({path:resolve(output,`note-icons-audit-${width}-${theme}.png`)});
+  }
+  await page.keyboard.press('Escape');
   assert.deepEqual(errors,[]);
   Object.assign(result,{legacyPreserved:true,keyboard:true,searchPtEn:true,boundedGrid:true,brandsPersisted:true,minimumViewport:true,pageErrors:errors});
   writeFileSync(resolve(output,'note-icons-validation.json'),JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));

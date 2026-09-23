@@ -16,6 +16,8 @@
   <link rel="stylesheet" href="remote-sources.css" />
   <link rel="stylesheet" href="journeys.css" />
   <link rel="stylesheet" href="workspace-context.css" />
+  <link rel="stylesheet" href="case-content.css" />
+  <link rel="stylesheet" href="case-trails.css" />
 </head>
 <body>
   <nav class="workspace-nav" aria-label="Navegação principal">
@@ -49,7 +51,7 @@
   <div id="ws-export-modal" class="modal-overlay" hidden>
     <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="ws-export-title">
       <div class="modal-head"><h3 id="ws-export-title">Exportar</h3><button class="icon-btn" id="ws-export-close" aria-label="Fechar"><i class="fas fa-xmark"></i></button></div>
-      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="report">Evidências · Markdown</option><option value="case">Investigação · JSON</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask" checked> Ocultar senhas e tokens reconhecidos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
+      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Itens do Caso · Markdown</option><option value="case">Investigação · JSON</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask" checked> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
     </div>
   </div>
   <div id="ws-drop" hidden><i class="fas fa-arrow-down-to-bracket"></i><strong>Solte os logs aqui</strong></div>
@@ -333,6 +335,7 @@
           <button class="seg-btn" data-view="items" type="button"><i class="fas fa-layer-group"></i> Itens</button>
           <button class="seg-btn" data-view="timeline" type="button"><i class="fas fa-arrows-left-right"></i> Horizontal</button>
           <button class="seg-btn" data-view="vtimeline" type="button"><i class="fas fa-arrows-up-down"></i> Vertical</button>
+          <button class="seg-btn" data-view="timeline-table" type="button"><i class="fas fa-table-list"></i> Tabela</button>
           <button class="seg-btn" id="case-timeline-volume" type="button"><i class="fas fa-chart-column"></i> Volume</button>
           <button class="seg-btn" data-view="data" type="button"><i class="fas fa-database"></i> Dados do Caso</button>
         </div>
@@ -985,12 +988,15 @@
   <script src="case-timeline.js"></script>
   <script src="app.js"></script>
   <script src="timeline.js"></script>
+  <script src="case-content.js"></script>
+  <script src="case-report.js"></script>
   <script src="workspace.js"></script>
   <script src="analysis-workbench.js"></script>
   <script src="discovery.js"></script>
   <script src="threats.js"></script>
   <script src="remote-sources.js"></script>
   <script src="journeys.js"></script>
+  <script src="case-trails.js"></script>
   <script src="workspace-context.js"></script>
 </body>
 </html>

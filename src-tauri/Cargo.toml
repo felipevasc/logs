@@ -1,6 +1,6 @@
 [package]
 name = "loginsight"
-version = "0.2.0"
+version = "0.3.0"
 description = "Visualizador e analisador de logs"
 edition = "2021"
 rust-version = "1.88"
@@ -27,7 +27,7 @@ rayon = "1"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 rmcp = { version = "3.1", features = ["transport-streamable-http-server"] }
 schemars = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -35,6 +35,7 @@ tokio = { version = "1", features = ["net", "rt", "sync"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
 base64 = "0.22.1"
 tempfile = "3.27"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

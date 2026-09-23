@@ -6,7 +6,8 @@ const browser=await chromium.launch({headless:true,...(!existsSync(chromium.exec
 const page=await browser.newPage({viewport:{width:1024,height:680}});page.setDefaultTimeout(15000);
 const errors=[];page.on('pageerror',error=>errors.push(error.message));
 try{
-  await page.goto(process.argv[2]||'http://127.0.0.1:4173');await page.waitForFunction(()=>state.loaded&&state.total===6000);
+  await page.goto(process.argv[2]||'http://127.0.0.1:4173');await page.waitForFunction(()=>state.loaded&&state.total===6000&&window.WorkspaceContext?.ready&&!WorkspaceContext.changing&&document.querySelector('#load-overlay').hidden);
+  await page.evaluate(()=>WorkspaceContext.setScope('case',{page:'case-timeline',animate:false}));
   await page.getByRole('button',{name:'Linha do tempo',exact:true}).click();
   await page.locator('[data-ct-action="note"]').click();
   await page.locator('.ct-icon-choice').first().waitFor();

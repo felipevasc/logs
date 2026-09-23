@@ -104,6 +104,7 @@
   async function openSnapshot(result) {
     setStatus("Preparando os registros para análise…");
     if(window.WorkspaceContext?.scope()==='case')await window.WorkspaceContext.setScope('dataset');
+    if(window.WorkspaceContext?.scope()==='case') { setStatus("Aguarde a operação atual e abra o arquivo importado na Análise.", "warning"); q("open-result").hidden = false; return false; }
     const loaded = await loadData({ kind: "file", path: result.path, paths: [result.path], format: "jsonl" });
     if (!loaded) {
       q("open-result").hidden = false; setStatus("O arquivo foi importado, mas não pôde ser aberto. Use Abrir arquivo importado para tentar novamente.", "error"); return false;
@@ -154,6 +155,7 @@
   }
   async function open() {
     if(window.WorkspaceContext?.scope()==='case')await window.WorkspaceContext.setScope('dataset');
+    if(window.WorkspaceContext?.scope()==='case')return;
     ui.returnFocus = document.activeElement; modal.hidden = false;
     q("name").focus();
     try { await refreshConnections(); }

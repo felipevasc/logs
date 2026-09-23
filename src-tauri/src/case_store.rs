@@ -81,6 +81,10 @@ pub fn save(data: Value) -> Result<Value, String> {
     save_at(&crate::config_dir(), data)
 }
 fn save_at(dir: &std::path::Path, data: Value) -> Result<Value, String> {
+    crate::case_images::references(&data)?;
+    if data.get("imageAssets").is_some() {
+        return Err("Importe as imagens antes de salvar a investigação; o Caso armazena somente referências.".into());
+    }
     let cases = data
         .get("cases")
         .and_then(Value::as_array)

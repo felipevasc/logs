@@ -2,7 +2,8 @@
 (() => {
   const raw = (row, field) => Object.hasOwn(row, field) ? row[field] : row.fields?.[field];
   const text = (row, field) => { const value = raw(row, field); return value === undefined || value === null ? null : typeof value === "object" ? JSON.stringify(value) : String(value); };
-  const groupValue = (row, field) => text(row, field) || "(vazio)";
+  const groupValue = (row, field) => { const value = text(row, field); return value?.trim() ? value : null; };
+  const label = value => value == null ? "(vazio)" : value;
   const numeric = value => {
     const match = String(value).trim().toLowerCase().match(/^(-?\d+(?:[.,]\d+)?(?:e[+-]?\d+)?)\s*(bytes?|b|kb|mb|gb|tb|bps|kbps|mbps|gbps|ms|s|min|h)?$/);
     if (!match) return NaN;
@@ -27,27 +28,27 @@
   window.__mockAggregate = (events, field, specs) => {
     const groups = new Map();
     for (const row of events) { const key = groupValue(row, field); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); }
-    return { columns: [field, ...specs.map(alias)], rows: [...groups].map(([key, rows]) => Object.fromEntries([[field, key], ...specs.map(spec => [alias(spec), measure(rows, spec)])])) };
+    return { columns: [field, ...specs.map(alias)], group_values: [...groups.keys()], rows: [...groups].map(([key, rows]) => Object.fromEntries([[field, label(key)], ...specs.map(spec => [alias(spec), measure(rows, spec)])])) };
   };
   window.__mockPivot = (events, spec) => {
     const rows = spec.rows || [], cols = spec.cols || [], values = spec.values || [];
     const columnKeys = [], paths = new Map(), cells = new Map(), totals = new Map();
     for (const row of events) {
-      const columnKey = cols.length ? cols.map(field => groupValue(row, field)).join(" → ") : "(total)";
+      const columnKey = JSON.stringify(cols.map(field => groupValue(row, field)));
       if (!totals.has(columnKey)) { columnKeys.push(columnKey); totals.set(columnKey, []); }
       totals.get(columnKey).push(row);
       const full = rows.map(field => groupValue(row, field));
-      const prefixes = rows.length ? rows.map((_, index) => full.slice(0, index + 1)) : [["(total)"]];
+      const prefixes = rows.length ? rows.map((_, index) => full.slice(0, index + 1)) : [[]];
       for (const prefix of prefixes) {
         const key = JSON.stringify(prefix); paths.set(key, prefix);
         if (!cells.has(key)) cells.set(key, new Map());
         const columns = cells.get(key); if (!columns.has(columnKey)) columns.set(columnKey, []); columns.get(columnKey).push(row);
       }
     }
-    const ordered = [...paths.values()].sort((a, b) => a.join("\u001f").toLowerCase().localeCompare(b.join("\u001f").toLowerCase()));
+    const ordered = [...paths.values()].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
     const visible = ordered.slice(0, spec.limit_rows || 2000);
     return {
-      value_names: values.map(alias), col_keys: columnKeys, row_paths: visible,
+      value_names: values.map(alias), col_keys: columnKeys.map(key => cols.length ? JSON.parse(key).map(label).join(" → ") : "(total)"), col_values: columnKeys.map(key => JSON.parse(key)), row_paths: visible.map(path => path.map(label)), row_values: visible,
       cells: visible.map(path => columnKeys.map(columnKey => {
         const group = cells.get(JSON.stringify(path))?.get(columnKey); return values.map(value => group ? measure(group, value, 50) : null);
       })),

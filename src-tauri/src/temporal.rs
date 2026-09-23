@@ -50,13 +50,7 @@ struct Context {
 }
 fn encode(field: String, values: impl Iterator<Item = String>, max: usize) -> Column {
     let raw: Vec<_> = values.collect();
-    let normalized = |v: &str| {
-        if field == "message" {
-            v.to_string()
-        } else {
-            v.to_ascii_lowercase()
-        }
-    };
+    let normalized = |v: &str| v.to_string();
     let mut frequencies = BTreeMap::<String, usize>::new();
     let mut displays = BTreeMap::new();
     for v in raw.iter().filter(|v| !v.trim().is_empty()) {
@@ -198,7 +192,7 @@ pub fn analyze(result: &mut Discovery, values: &[Vec<String>], records: &[Record
             .iter()
             .filter(|v| !v.is_empty() && v.trim() == v.as_str())
         {
-            *counts.entry(value.to_ascii_lowercase()).or_default() += 1;
+            *counts.entry(value.clone()).or_default() += 1;
         }
         if counts.len() < 2 || counts.len() > 12 || counts.values().sum::<usize>() < 40 {
             continue;
@@ -367,7 +361,7 @@ pub fn analyze(result: &mut Discovery, values: &[Vec<String>], records: &[Record
                         outcome_op: if outcome.field == "message" {
                             "pattern"
                         } else {
-                            "equals"
+                            "equals_exact"
                         }
                         .into(),
                         expected: outcome.labels[expected].clone(),

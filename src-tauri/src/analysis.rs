@@ -38,7 +38,7 @@ pub fn parse_num_unit(s: &str) -> Option<(f64, UnitKind)> {
     if !n.is_finite() {
         return None;
     }
-    Some(match unit_part {
+    let parsed = match unit_part {
         "" => (n, UnitKind::Number),
         "b" | "byte" | "bytes" => (n, UnitKind::Bytes),
         "kb" => (n * 1024.0, UnitKind::Bytes),
@@ -54,7 +54,8 @@ pub fn parse_num_unit(s: &str) -> Option<(f64, UnitKind)> {
         "min" => (n * 60_000.0, UnitKind::DurationMs),
         "h" => (n * 3_600_000.0, UnitKind::DurationMs),
         _ => return None,
-    })
+    };
+    parsed.0.is_finite().then_some(parsed)
 }
 
 fn split_num_unit(s: &str) -> (&str, &str) {
@@ -258,6 +259,8 @@ pub struct SeriesResult {
     interval_ms: i64,
     /// "time": epoch ms do bucket; "terms": rótulo
     x: Vec<Value>,
+    /// Exact category values for terms charts; None means missing/empty.
+    x_values: Vec<Option<String>>,
     series: Vec<SeriesData>,
     incompatible_units: usize,
 }
@@ -396,7 +399,7 @@ where
     F: Fn() -> I,
     I: Iterator<Item = Event>,
 {
-    let limit = spec.limit.unwrap_or(10);
+    let limit = spec.limit.unwrap_or(10).min(500);
     let field = spec.field.as_deref();
     if spec.chart == "terms" && spec.metric == "count" {
         let key = field.unwrap_or("level");
@@ -406,20 +409,23 @@ where
                 break;
             }
             counts.insert(
-                ev.col_str(key)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "(vazio)".into()),
+                serde_json::to_string(&ev.col_str(key).filter(|s| !s.trim().is_empty())).unwrap(),
             );
         }
-        let top = counts.top(limit);
+        let top: Vec<(Option<String>, usize)> = counts
+            .top(limit)
+            .into_iter()
+            .map(|(key, count)| (serde_json::from_str(&key).unwrap(), count))
+            .collect();
         return SeriesResult {
             kind: "terms".into(),
             unit: "number".into(),
             interval_ms: 0,
             x: top
                 .iter()
-                .map(|(value, _)| Value::from(value.clone()))
+                .map(|(value, _)| Value::from(value.clone().unwrap_or_else(|| "(vazio)".into())))
                 .collect(),
+            x_values: top.iter().map(|(value, _)| value.clone()).collect(),
             series: vec![SeriesData {
                 name: key.into(),
                 samples: top.iter().map(|(_, n)| *n).collect(),
@@ -478,15 +484,12 @@ where
         } else {
             field
         };
-        let mut accs: HashMap<String, MetricAcc> = HashMap::new();
+        let mut accs: HashMap<Option<String>, MetricAcc> = HashMap::new();
         for ev in events() {
             if crate::operations::cancelled() {
                 break;
             }
-            let key = ev
-                .col_str(&key_field)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "(vazio)".into());
+            let key = ev.col_str(&key_field).filter(|s| !s.trim().is_empty());
             incompatible_units += usize::from(
                 accs.entry(key)
                     .or_insert_with(|| MetricAcc::new(&spec.metric))
@@ -497,11 +500,11 @@ where
                     ),
             );
         }
-        let mut items: Vec<(String, f64, usize)> = accs
+        let mut items: Vec<(Option<String>, f64, usize)> = accs
             .iter()
             .map(|(k, a)| (k.clone(), a.value(), a.n as usize))
             .collect();
-        items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        items.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         items.truncate(limit);
         return SeriesResult {
             kind: "terms".into(),
@@ -509,8 +512,9 @@ where
             interval_ms: 0,
             x: items
                 .iter()
-                .map(|(k, _, _)| Value::from(k.clone()))
+                .map(|(k, _, _)| Value::from(k.clone().unwrap_or_else(|| "(vazio)".into())))
                 .collect(),
+            x_values: items.iter().map(|(key, _, _)| key.clone()).collect(),
             series: vec![SeriesData {
                 name: split_names[0].clone(),
                 samples: items.iter().map(|(_, _, n)| *n).collect(),
@@ -522,6 +526,7 @@ where
 
     // série temporal
     let bounds = events()
+        .take_while(|_| !crate::operations::cancelled())
         .filter_map(|ev| ev.timestamp)
         .fold(None, |acc: Option<(i64, i64)>, t| {
             Some(acc.map(|(a, b)| (a.min(t), b.max(t))).unwrap_or((t, t)))
@@ -532,6 +537,7 @@ where
             unit,
             interval_ms: 0,
             x: vec![],
+            x_values: vec![],
             series: vec![],
             incompatible_units: 0,
         };
@@ -602,6 +608,7 @@ where
         x: (0..n_buckets)
             .map(|b| Value::from(tmin.saturating_add((b as i64).saturating_mul(interval))))
             .collect(),
+        x_values: vec![],
         series: split_names
             .iter()
             .map(|name| SeriesData {
@@ -641,6 +648,10 @@ pub struct PivotResult {
     col_keys: Vec<String>,
     /// caminho de cada linha (nível = tamanho do caminho)
     row_paths: Vec<Vec<String>>,
+    row_values: Vec<Vec<Option<String>>>,
+    col_values: Vec<Vec<Option<String>>>,
+    incompatible_units: Vec<usize>,
+    value_units: Vec<String>,
     /// cells[i][j][v] = valor da linha i, coluna j, medida v
     cells: Vec<Vec<Vec<Value>>>,
     /// totais[i][v]
@@ -740,29 +751,31 @@ pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> Pi
         }
     }
 
+    type Path = Vec<Option<String>>;
+    let label = |value: &Option<String>| value.clone().unwrap_or_else(|| "(vazio)".into());
     let mut col_keys: Vec<String> = Vec::new();
-    let mut col_index: HashMap<String, usize> = HashMap::new();
-    // key: (path_string, col_idx) → acumuladores
-    let mut cells: HashMap<(String, usize), Vec<Acc>> = HashMap::new();
+    let mut col_values: Vec<Path> = Vec::new();
+    let mut col_index: HashMap<Path, usize> = HashMap::new();
+    // Typed tuples prevent separator text and missing labels from merging keys.
+    let mut cells: HashMap<(Path, usize), Vec<Acc>> = HashMap::new();
     let mut totals: HashMap<usize, Vec<Acc>> = HashMap::new();
-    let mut paths: Vec<Vec<String>> = Vec::new();
-    let mut path_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut paths: Vec<Path> = Vec::new();
+    let mut path_set: std::collections::HashSet<Path> = std::collections::HashSet::new();
     let n_vals = spec.values.len().max(1);
+    let mut value_units = vec![None; spec.values.len()];
+    let mut incompatible_units = vec![0usize; spec.values.len()];
 
-    let acc_cell =
-        |cells: &mut HashMap<(String, usize), Vec<Acc>>, path: String, col: usize, ev: &Event| {
-            let accs = cells
-                .entry((path, col))
-                .or_insert_with(|| spec.values.iter().map(|a| Acc::new(&a.func)).collect());
-            for (i, a) in spec.values.iter().enumerate() {
-                let num = ev
-                    .col_str(&a.column)
-                    .and_then(|s| parse_num_unit(&s).map(|(n, _)| n));
-                let s = ev.col_str(&a.column);
-                accs[i].push(num, s);
-            }
-            let _ = n_vals;
-        };
+    let acc_cell = |cells: &mut HashMap<(Path, usize), Vec<Acc>>,
+                    path: Path,
+                    col: usize,
+                    values: &[(Option<f64>, Option<String>)]| {
+        let accs = cells
+            .entry((path, col))
+            .or_insert_with(|| spec.values.iter().map(|a| Acc::new(&a.func)).collect());
+        for (acc, (num, text)) in accs.iter_mut().zip(values) {
+            acc.push(*num, text.clone());
+        }
+    };
 
     let mut budget_reached = false;
     let mut processed_events = 0;
@@ -770,93 +783,114 @@ pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> Pi
         if crate::operations::cancelled() {
             break;
         }
-        if cells.len() > 100_000 || col_keys.len() >= 200 {
+        if cells.len() > 100_000 / n_vals {
+            budget_reached = true;
+            break;
+        }
+        // chave de coluna
+        let col_key: Path = spec
+            .cols
+            .iter()
+            .map(|c| ev.col_str(c).filter(|v| !v.trim().is_empty()))
+            .collect();
+        if !col_index.contains_key(&col_key) && col_keys.len() >= 200 {
             budget_reached = true;
             break;
         }
         processed_events += 1;
-        // chave de coluna
-        let col_key = if spec.cols.is_empty() {
-            "(total)".to_string()
-        } else {
-            spec.cols
-                .iter()
-                .map(|c| {
-                    let v = ev.col_str(c).unwrap_or_default();
-                    if v.is_empty() {
-                        "(vazio)".into()
-                    } else {
-                        v
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" → ")
-        };
         let ci = *col_index.entry(col_key.clone()).or_insert_with(|| {
-            col_keys.push(col_key);
+            col_keys.push(if col_key.is_empty() {
+                "(total)".into()
+            } else {
+                col_key.iter().map(&label).collect::<Vec<_>>().join(" → ")
+            });
+            col_values.push(col_key);
             col_keys.len() - 1
         });
-
-        // caminhos (todos os prefixos para a árvore de drill)
-        let full: Vec<String> = spec
-            .rows
+        let values: Vec<_> = spec
+            .values
             .iter()
-            .map(|c| {
-                let v = ev.col_str(c).unwrap_or_default();
-                if v.is_empty() {
-                    "(vazio)".into()
+            .enumerate()
+            .map(|(i, a)| {
+                let text = ev.col_str(&a.column);
+                if matches!(a.func.as_str(), "sum" | "avg" | "min" | "max") {
+                    let parsed = if a.column == "timestamp" {
+                        ev.timestamp.map(|t| (t as f64, UnitKind::Number))
+                    } else {
+                        text.as_deref().and_then(parse_num_unit)
+                    };
+                    let num = parsed.and_then(|(num, unit)| {
+                        if !num.is_finite() {
+                            return None;
+                        }
+                        let expected = value_units[i].get_or_insert(unit);
+                        if *expected != unit {
+                            incompatible_units[i] += 1;
+                            None
+                        } else {
+                            Some(num)
+                        }
+                    });
+                    (num, None)
+                } else if a.func == "count" {
+                    (None, None)
                 } else {
-                    v
+                    (None, text)
                 }
             })
             .collect();
+
+        // caminhos (todos os prefixos para a árvore de drill)
+        let full: Path = spec
+            .rows
+            .iter()
+            .map(|c| ev.col_str(c).filter(|v| !v.trim().is_empty()))
+            .collect();
         if full.is_empty() {
-            acc_cell(&mut cells, "(total)".into(), ci, &ev);
+            acc_cell(&mut cells, vec![], ci, &values);
             if paths.is_empty() {
-                paths.push(vec!["(total)".into()]);
+                paths.push(vec![]);
             }
         }
         for depth in 1..=full.len() {
-            let path = full[..depth].join("\u{1f}");
+            let path = full[..depth].to_vec();
             if path_set.insert(path.clone()) {
                 paths.push(full[..depth].to_vec());
             }
-            acc_cell(&mut cells, path, ci, &ev);
+            acc_cell(&mut cells, path, ci, &values);
         }
         // totais por coluna
         let taccs = totals
             .entry(ci)
             .or_insert_with(|| spec.values.iter().map(|a| Acc::new(&a.func)).collect());
-        for (i, a) in spec.values.iter().enumerate() {
-            let num = ev
-                .col_str(&a.column)
-                .and_then(|s| parse_num_unit(&s).map(|(n, _)| n));
-            let s = ev.col_str(&a.column);
-            taccs[i].push(num, s);
+        for (acc, (num, text)) in taccs.iter_mut().zip(&values) {
+            acc.push(*num, text.clone());
         }
     }
 
     // ordena caminhos em ordem de árvore (prefixo antes de filho)
-    paths.sort_by(|a, b| {
-        let ja = a.join("\u{1f}").to_lowercase();
-        let jb = b.join("\u{1f}").to_lowercase();
-        ja.cmp(&jb)
-    });
-    let truncated = budget_reached || paths.len() > spec.limit_rows;
-    paths.truncate(spec.limit_rows);
+    paths.sort();
+    let output_rows = spec
+        .limit_rows
+        .min(2_000)
+        .min(100_000 / col_keys.len().max(1) / n_vals);
+    let truncated = budget_reached || paths.len() > output_rows;
+    paths.truncate(output_rows);
 
     let cells_out: Vec<Vec<Vec<Value>>> = paths
         .iter()
         .map(|p| {
-            let pkey = p.join("\u{1f}");
             (0..col_keys.len())
                 .map(|ci| {
                     spec.values
                         .iter()
                         .enumerate()
                         .map(|(vi, a)| {
+                            if incompatible_units[vi] > 0 {
+                                return Value::Null;
+                            }
                             cells
-                                .get(&(pkey.clone(), ci))
+                                .get(&(p.clone(), ci))
                                 .map(|accs| accs[vi].finish(&a.func))
                                 .unwrap_or(Value::Null)
                         })
@@ -871,6 +905,9 @@ pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> Pi
                 .iter()
                 .enumerate()
                 .map(|(vi, a)| {
+                    if incompatible_units[vi] > 0 {
+                        return Value::Null;
+                    }
                     totals
                         .get(&ci)
                         .map(|accs| accs[vi].finish(&a.func))
@@ -883,11 +920,27 @@ pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> Pi
     PivotResult {
         value_names,
         col_keys,
-        row_paths: paths,
+        row_paths: paths
+            .iter()
+            .map(|path| {
+                if path.is_empty() {
+                    vec!["(total)".into()]
+                } else {
+                    path.iter().map(&label).collect()
+                }
+            })
+            .collect(),
+        row_values: paths,
+        col_values,
+        incompatible_units,
+        value_units: value_units
+            .into_iter()
+            .map(|unit| unit.map(unit_name).unwrap_or_default())
+            .collect(),
         cells: cells_out,
         totals: totals_out,
         truncated,
-        complete: !budget_reached,
+        complete: !budget_reached && !crate::operations::cancelled(),
         processed_events,
     }
 }

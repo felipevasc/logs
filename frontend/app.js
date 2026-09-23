@@ -449,12 +449,12 @@ async function syncActiveCaseArtifacts() {
 }
 
 function updateContextBar() {
+  if (state.queryError) { $("#context-summary").textContent = "Consulta não concluída"; return; }
   // contexto de Caso: os números são sempre do conjunto do Caso, nunca do artefato
   if (state.activeContext !== "artifact" && activeCase()) {
-    const events = caseEvents();
+    const events = caseEvents(), summary = caseEventsCache.summary;
     const bits = [activeCase().name, `${fmtNum(events.length)} eventos no Caso`];
-    const tss = events.map((e) => e.timestamp).filter((t) => t != null);
-    if (tss.length) bits.push(`${fmtTs(Math.min(...tss))} — ${fmtTs(Math.max(...tss))}`);
+    if (summary.start != null) bits.push(`${fmtTs(summary.start)} — ${fmtTs(summary.end)}`);
     if (state.filters.length || state.quick.trim()) bits.push("recorte filtrado");
     if (state.stationAnalyticsId) {
       const station = caseStations().find((item) => item.id === state.stationAnalyticsId);
@@ -470,7 +470,7 @@ function updateContextBar() {
       : "Crie ou selecione um Caso para começar.";
     return;
   }
-  const bits = [fmtNum(state.total || artifact.count || 0) + " eventos"];
+  const bits = [fmtNum(state.total ?? artifact.count ?? 0) + " eventos"];
   if (state.dataPeriod?.min != null && state.dataPeriod?.max != null) {
     bits.push(`${fmtTs(state.dataPeriod.min)} — ${fmtTs(state.dataPeriod.max)}`);
   }
@@ -1060,25 +1060,27 @@ function treeNode({ id, icon, label, meta, kids, active }) {
 
 function facetValueItem(column, value, count, dotColor, mono) {
   const item = el("button", "facet-item");
-  if (hasFacetFilter(column, value)) item.classList.add("active");
+  const empty = value == null, label = empty ? "(vazio)" : value === "(vazio)" ? "“(vazio)”" : String(value);
+  const filter = (exclude = false) => ({ column, op: empty ? (exclude ? "not_empty" : "empty") : (exclude ? "not_equals_exact" : "equals_exact"), value: empty ? "" : String(value), value2: null });
+  if (state.filters.some(f => f.column === column && (empty ? f.op === "empty" : ["equals", "equals_exact"].includes(f.op) && f.value === String(value)))) item.classList.add("active");
   if (dotColor) {
     const d = el("span", "facet-dot");
     d.style.background = dotColor;
     item.appendChild(d);
   }
-  const v = el("span", "fv", value || "(vazio)");
+  const v = el("span", empty ? "fv muted" : "fv", label);
   if (mono) v.classList.add("t-code");
-  v.title = value;
+  v.title = label;
   item.append(v, el("span", "fc", fmtNum(count)));
   item.onclick = () => toggleFacet(column, value);
   item.oncontextmenu = (e) => {
     e.preventDefault();
     showCtxMenu(e.clientX, e.clientY, [
-      { icon: "fa-filter", label: `Filtrar: ${colLabel(column)} = ${trunc(value)}`, onClick: () => addFilter({ column, op: "equals", value, value2: null }) },
-      { icon: "fa-filter-circle-xmark", label: `Excluir: ${colLabel(column)} ≠ ${trunc(value)}`, onClick: () => addFilter({ column, op: "not_equals", value, value2: null }) },
+      { icon: "fa-filter", label: `Filtrar: ${colLabel(column)} = ${trunc(label)}`, onClick: () => addFilter(filter()) },
+      { icon: "fa-filter-circle-xmark", label: `Excluir: ${colLabel(column)} ≠ ${trunc(label)}`, onClick: () => addFilter(filter(true)) },
       { sep: true },
-      { icon: "fa-microscope", label: "Enviar ao caso", onClick: () => addGroupToAnalysis(column, value) },
-      ...(value ? [{
+      { icon: "fa-microscope", label: "Enviar ao caso", onClick: () => addGroupToAnalysis(column, empty ? "" : String(value), "", empty ? "empty" : "equals_exact") },
+      ...(!empty ? [{
         icon: "fa-microscope",
         label: `Enviar todos com ${colLabel(column)} preenchido ao caso`,
         onClick: () => addGroupToAnalysis(column, "", "", "not_empty"),
@@ -1349,9 +1351,10 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
   if (version !== treeAggVersion[scope] || workspaceScope() !== scope || context !== (scope === "case" ? caseSig() : `${state.currentArtifact?.id}:${state.currentArtifact?.loadedAt}`)) return;
   const map = {};
   for (const [col, agg] of res || []) {
-    map[col] = agg.rows.map((r) => {
+    map[col] = agg.rows.map((r, index) => {
       const key = Object.keys(r).find((k) => k !== "n");
-      return [String(r[key] ?? "(vazio)"), Number(r.n) || 0];
+      const raw = Array.isArray(agg.group_values) && agg.group_values.length === agg.rows.length ? agg.group_values[index] : (r[key] === "(vazio)" ? null : r[key]);
+      return [raw == null ? null : String(raw), Number(r.n) || 0];
     });
   }
   state.treeAgg[scope] = map;
@@ -1446,22 +1449,20 @@ function renderExploreTreeInto(box, scope) {
   const valueGroup = (column, fallbackItems, meta, emptyCount = 0) => {
     let entries = live[column];
     if (!entries) {
-      entries = (fallbackItems || []).map(([v, n]) => [String(v), n]);
-      if (emptyCount > 0) entries.push(["(vazio)", emptyCount]);
+      entries = (fallbackItems || []).map(([v, n]) => [v == null ? null : String(v), n]);
+      if (emptyCount > 0) entries.push([null, emptyCount]);
     }
     entries = entries.slice().sort((a, b) => b[1] - a[1]);
     // valores com filtro ativo permanecem mesmo se ausentes da agregação
     if (hasColFilter(column)) {
-      for (const f of state.filters.filter((f) => f.column === column && f.op === "equals"))
+      for (const f of state.filters.filter((f) => f.column === column && ["equals", "equals_exact"].includes(f.op)))
         if (!entries.some(([v]) => v === f.value)) entries.push([f.value, 0]);
       if (state.filters.some((f) => f.column === column && f.op === "empty")
-        && !entries.some(([v]) => v === "(vazio)")) entries.push(["(vazio)", 0]);
+        && !entries.some(([v]) => v == null)) entries.push([null, 0]);
     }
     if (entries.length < 2 && !hasColFilter(column)) return; // nada a escolher
     const kids = entries.slice(0, FACET_VALUE_LIMIT).map(([value, count]) =>
-      value === "(vazio)"
-        ? emptyValueItem(column, count)
-        : facetValueItem(column, value, count, column === "level" ? levelColor(value) : null, column === "code"));
+      facetValueItem(column, value, count, value != null && column === "level" ? levelColor(value) : null, column === "code"));
     box.appendChild(treeNode({
       id: `facet-${scope}-${column}`,
       icon: stdIcons[column] || FIELD_KIND_ICONS[byName[column]?.kind] || "fa-tag",
@@ -1505,11 +1506,12 @@ function hasFacetFilter(column, value) {
 }
 
 function toggleFacet(column, value) {
-  const i = state.filters.findIndex((f) => f.column === column && f.op === "equals" && f.value === value);
+  const empty = value == null;
+  const i = state.filters.findIndex((f) => f.column === column && (empty ? f.op === "empty" : ["equals", "equals_exact"].includes(f.op) && f.value === String(value)));
   if (i >= 0) { removeFilter(i); return; }
   // substitui a seleção anterior do mesmo campo — combinar valores zeraria o recorte
-  state.filters = state.filters.filter((f) => !(f.column === column && (f.op === "equals" || f.op === "empty")));
-  addFilter({ column, op: "equals", value, value2: null });
+  state.filters = state.filters.filter((f) => !(f.column === column && ["equals", "equals_exact", "empty"].includes(f.op)));
+  addFilter({ column, op: empty ? "empty" : "equals_exact", value: empty ? "" : String(value), value2: null });
 }
 
 // popover de novo filtro
@@ -1559,7 +1561,7 @@ function positionPop(pop, anchor) {
 }
 
 // ------------------------------------------------------------------ refresh
-async function refresh() {
+async function refresh({ analytics = true } = {}) {
   const scope = workspaceScope();
   if (scope === "dataset" && !state.loaded) return;
   const filters = backendFilters();
@@ -1582,20 +1584,29 @@ async function refresh() {
       limit: state.pageSize,
     });
     snapshot = cached ? { ...cached, query: result } : result;
+    if (version === state.refreshVersion && snapshot.query.total > 0 && state.page * state.pageSize >= snapshot.query.total) {
+      state.page = Math.floor((snapshot.query.total - 1) / state.pageSize);
+      snapshot = { ...snapshot, query: await api("query_events", { filters, ...(scope === "case" ? { caseEvents: caseEvents() } : {}), sortColumn: state.sortCol, sortDir: state.sortDir, offset: state.page * state.pageSize, limit: state.pageSize }) };
+    }
     if (version === state.refreshVersion) state.explorerCache = { key: cacheKey, snapshot };
   } catch (e) {
     loading.done();
     if (version === state.refreshVersion) {
-      // devolve os botões da paginação ao estado correto
-      const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
-      $("#pg-prev").disabled = state.page === 0;
-      $("#pg-next").disabled = state.page >= pages - 1;
+      state.queryError = String(e); state.rows = []; state.total = 0; state.dataPeriod = null; state.explorerCache = null;
+      renderTable({ rows: [], total: 0 });
+      $("#empty-state p").textContent = "Não foi possível consultar. Revise os filtros ou tente novamente.";
+      const retry = el("button", "btn ghost small", "Tentar novamente"); retry.dataset.retry = "true"; retry.onclick = () => refresh(); $("#empty-state").append(retry);
+      $("#pg-prev").disabled = true; $("#pg-next").disabled = true; $("#result-count").textContent = "Consulta não concluída";
+      if (chart) { chart.destroy(); chart = null; } $("#chart").replaceChildren();
+      updateContextBar();
       finishOperation("Falha ao atualizar", String(e));
     }
-    return;
+    return false;
   }
   if (version !== state.refreshVersion) { loading.done(); return; }
   const { query: qr, stats, sources: srcAgg, codes: codeAgg } = snapshot;
+  state.queryError = null;
+  if (!qr.total) state.page = 0;
   state.total = qr.total;
   state.rows = qr.rows;
   if (stats.buckets?.length) {
@@ -1619,12 +1630,13 @@ async function refresh() {
   refreshTreeAggs(scope);
   updateContextBar();
   // recalcula a aba analítica aberta para refletir o novo recorte
-  if (state.activeDatasetTab === "dashboard") renderDashboard(scope);
-  else if (state.activeDatasetTab === "cube") runCube();
-  else if (state.activeDatasetTab === "group") runGroup();
+  if (analytics && state.activeDatasetTab === "dashboard") renderDashboard(scope);
+  else if (analytics && state.activeDatasetTab === "cube") runCube();
+  else if (analytics && state.activeDatasetTab === "group") runGroup();
   loading.done();
   finishOperation("Pronto", `${fmtNum(qr.total)} eventos no recorte`);
   window.Workspace?.onRefresh();
+  return true;
 }
 
 function scheduleRefresh() {
@@ -2327,7 +2339,7 @@ async function renderTrail() {
     finishOperation("Falha ao analisar trilha", String(e));
     return;
   }
-  finishOperation("Trilha pronta", `${res.events.length} eventos na vizinhança`);
+  finishOperation("Possível trilha pronta", `${res.events.length} eventos na vizinhança`);
   list.innerHTML = "";
   // formato de timeline vertical: o evento analisado destacado no meio do fluxo
   const wrap = el("div", "vtl trail-vtl");
@@ -2764,7 +2776,7 @@ function normalizeCaseWorkspace(raw) {
   const base = defaultCaseWorkspace();
   const source = raw && typeof raw === "object" ? raw : {};
   const allowedViews = new Set(["caso", "estacoes", "case-dashboard", "case-cube", "trail"]);
-  const allowedAnalysisViews = new Set(["overview", "items", "timeline", "vtimeline", "data"]);
+  const allowedAnalysisViews = new Set(["overview", "items", "timeline", "vtimeline", "timeline-table", "data"]);
   return {
     ...base,
     ...source,
@@ -2784,7 +2796,7 @@ function syncAnalysisViewButtons() {
 }
 
 function setAnalysisView(view) {
-  if (!["overview", "items", "timeline", "vtimeline", "data"].includes(view)) return;
+  if (!["overview", "items", "timeline", "vtimeline", "timeline-table", "data"].includes(view)) return;
   state.analysisView = view;
   syncAnalysisViewButtons();
 }
@@ -2832,9 +2844,13 @@ function normalizeCaseStore(loaded) {
       rows: Array.isArray(item?.rows) ? item.rows : [],
       sourceFilters: Array.isArray(item?.sourceFilters) ? item.sourceFilters : [],
       tags: Array.isArray(item?.tags) ? item.tags : [],
-      note: item?.note || "",
+      note: typeof item?.note === "string" ? item.note : "",
+      summary: typeof item?.summary === "string" ? item.summary : "",
+      details: typeof item?.details === "string" ? item.details : (typeof item?.note === "string" ? item.note : ""),
+      attachments: window.CaseContent?.attachments(item) || [],
       relevance: item?.relevance || "normal",
     })) : [],
+    caseTrails: Array.isArray(raw.caseTrails) ? raw.caseTrails.filter(trail => trail && typeof trail.id === "string").map(trail => ({ ...trail, title: typeof trail.title === "string" ? trail.title : "Trilha", summary: typeof trail.summary === "string" ? trail.summary : "", details: typeof trail.details === "string" ? trail.details : "", itemIds: [...new Set(Array.isArray(trail.itemIds) ? trail.itemIds.filter(id => typeof id === "string") : [])], attachments: window.CaseContent?.attachments(trail) || [] })) : [],
     manual: Array.isArray(raw.manual) ? raw.manual.map((item) => ({ ...item, createdAt: item?.createdAt || raw.createdAt || Date.now() })) : [],
     stations: Array.isArray(raw.stations) ? raw.stations : [],
     artifacts: Array.isArray(raw.artifacts) ? raw.artifacts : [],
@@ -2860,6 +2876,7 @@ function newCase(name, { keepArtifact = false, contextSnapshot = null } = {}) {
     createdAt: Date.now(),
     items: [],
     manual: [],
+    caseTrails: [],
     stations: [],
     artifacts: context?.artifacts || [],
     activeArtifactId: context?.activeArtifactId || null,
@@ -2976,6 +2993,7 @@ async function deleteActiveCase() {
 let pendingCaseAdd = null;
 
 function openCaseAdd(request) {
+  if (workspaceScope() === "case") { toast("Esses registros já pertencem ao Caso.", "info"); return; }
   const c = ensureCase();
   const artifact = currentCaseArtifact();
   pendingCaseAdd = request;
@@ -2997,7 +3015,7 @@ function addEventToAnalysis(evId) {
   openCaseAdd({ kind: "event", evId });
 }
 
-function addGroupToAnalysis(column, value, name, op = "equals") {
+function addGroupToAnalysis(column, value, name, op = "equals_exact") {
   openCaseAdd({ kind: "group", column, value, name: name || "", op });
 }
 
@@ -3117,7 +3135,7 @@ function openCaseItemContext(item) {
   editingCaseItem = item;
   $("#case-item-relevance").value = item.relevance || "normal";
   $("#case-item-tags").value = (item.tags || []).join(", ");
-  $("#case-item-note").value = item.note || "";
+  $("#case-item-note").value = CaseContent.narrative(item).details;
   $("#case-item-modal").hidden = false;
 }
 
@@ -3125,7 +3143,8 @@ function saveCaseItemContext() {
   if (!editingCaseItem) return;
   editingCaseItem.relevance = $("#case-item-relevance").value;
   editingCaseItem.tags = $("#case-item-tags").value.split(",").map((tag) => tag.trim()).filter(Boolean);
-  editingCaseItem.note = $("#case-item-note").value.trim();
+  editingCaseItem.details = $("#case-item-note").value.trim();
+  editingCaseItem.note = editingCaseItem.details;
   saveCases();
   $("#case-item-modal").hidden = true;
   editingCaseItem = null;
@@ -3202,7 +3221,10 @@ function appendCaseItemMeta(host, c, item) {
 function appendCaseItemBody(card, c, item) {
   const body = el("div", "case-item-body");
   appendCaseItemMeta(body, c, item);
-  if (item.note) body.appendChild(el("p", "case-item-note", item.note));
+  const narrative = CaseContent.narrative(item);
+  if (narrative.summary) body.appendChild(el("p", "case-narrative-summary", narrative.summary));
+  if (narrative.details) body.appendChild(el("p", "case-item-details", narrative.details));
+  if (item.attachments?.length) { const images = el("div"); body.append(images); CaseContent.mountAttachments(images, item); }
 
   if (item.sourceFilters?.length) {
     const filters = document.createElement("details");
@@ -3297,7 +3319,8 @@ function renderCaseItems(box, c) {
       updateAnalysisBadge();
       renderAnalysis();
     };
-    actions.append(edit, del);
+    const explain = el("button", "icon-btn"); explain.innerHTML = '<i class="fas fa-pen-to-square"></i>'; explain.title = "Explicação e imagens"; explain.setAttribute("aria-label", explain.title); explain.onclick = () => CaseContent.editItem(item.id);
+    actions.append(explain, edit, del);
     header.appendChild(actions);
     card.appendChild(header);
     if (isOpen) appendCaseItemBody(card, c, item);
@@ -3465,7 +3488,7 @@ function renderAnalysis() {
   const box = $("#analysis-list");
   box.innerHTML = "";
   box.classList.remove("case-timeline-host");
-  $("#view-analysis").classList.toggle("case-timeline-active", ["timeline", "vtimeline"].includes(state.analysisView));
+  $("#view-analysis").classList.toggle("case-timeline-active", ["timeline", "vtimeline", "timeline-table"].includes(state.analysisView));
   const c = activeCase();
   if (!c) {
     box.innerHTML = `<div class="analysis-empty">
@@ -3481,6 +3504,7 @@ function renderAnalysis() {
   if (state.analysisView === "overview") return renderCaseOverview(box, c);
   if (state.analysisView === "timeline") return renderTimeline(box, c);
   if (state.analysisView === "vtimeline") return renderVTimeline(box, c);
+  if (state.analysisView === "timeline-table") return window.CaseTimeline.render(box, c, "table", caseTimelineCallbacks);
   if (state.analysisView === "data") return renderCaseData(box, c);
   renderCaseItems(box, c);
 }
@@ -3583,7 +3607,7 @@ function eventCellMenu(ev, col, value) {
   const hasVal = value !== undefined && value !== null && String(value).trim() !== "";
   const items = [
     { icon: "fa-eye", label: "Ver detalhes", onClick: () => openDetail(ev.id) },
-    { icon: "fa-route", label: "Analisar Trilha", onClick: () => openTrail(ev) },
+    { icon: "fa-route", label: "Investigar possível trilha", onClick: () => openTrail(ev) },
   ];
   if (hasVal) {
     items.push({ sep: true });
@@ -3646,10 +3670,10 @@ function sendVisibleToCase() {
   const existing = new Set();
   for (const item of c.items || []) {
     for (const r of item.rows || []) {
-      existing.add([r.id, r.timestamp, r.source, r.code, r.message].join("\u001f"));
+      existing.add(caseRecordKey(r, item.artifactId, item.origin));
     }
   }
-  const rows = state.rows.filter((ev) => !existing.has([ev.id, ev.timestamp, ev.source, ev.code, ev.message].join("\u001f")));
+  const rows = state.rows.filter((ev) => !existing.has(caseRecordKey(ev, state.currentArtifact?.id, state.currentOrigin)));
   if (!rows.length) { toast("Todos os eventos visíveis já estão no Caso.", "info"); return; }
   openCaseAdd({ kind: "visible", rows });
 }
@@ -3701,6 +3725,7 @@ function buildEventRow(ev) {
 }
 
 function renderTable(qr) {
+  $("#empty-state [data-retry]")?.remove();
   const thead = $("#events-table thead");
   const tbody = $("#events-table tbody");
   thead.innerHTML = "";
@@ -3770,7 +3795,7 @@ function renderTable(qr) {
     if (state.sortCol === col) {
       th.appendChild(el("span", "sort-arrow", state.sortDir === "asc" ? "▲" : "▼"));
     }
-    if (col === "timestamp") {
+    if (col === "timestamp" && workspaceScope() === "dataset") {
       const cfg = el("button", "icon-btn th-cfg");
       cfg.innerHTML = '<i class="fas fa-clock"></i>';
       cfg.title = "Configurar data/hora do artefato";
@@ -3811,7 +3836,7 @@ function renderTable(qr) {
 
   const empty = $("#empty-state");
   empty.hidden = qr.rows.length > 0;
-  empty.querySelector("p").textContent = state.loaded
+  empty.querySelector("p").textContent = state.loaded || workspaceScope() === "case"
     ? "Nenhum evento encontrado."
     : "Selecione uma fonte de dados.";
 
@@ -3856,7 +3881,7 @@ function renderChart(stats) {
       ],
       series: [
         {},
-        { stroke: isLight() ? "#14745c" : "#83e3c3", width: 1.5, fill: isLight() ? "rgba(20,116,92,0.12)" : "rgba(131,227,195,0.1)", points: { show: false } },
+        { stroke: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim(), width: 1.5, fill: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() + "1a", points: { show: false } },
       ],
       hooks: {
         setSelect: [
@@ -3941,6 +3966,9 @@ async function openDetail(id) {
 
 // abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
 function showDetailLoading() {
+  state.detailId = null; state.currentDetailEv = null; state.detailSourceSpec = null;
+  const actions = $("#drawer .detail-quick-actions"); if (actions) actions.hidden = true;
+  for (const id of ["dr-prev", "dr-next", "dr-copy"]) $("#" + id).hidden = true;
   $("#drawer-badges").innerHTML = "";
   const wait = el("div", "loading-inline drawer-loading");
   wait.innerHTML = '<i class="fas fa-circle-notch spin"></i> Carregando…';
@@ -3958,6 +3986,8 @@ function openContextInspector(title, subtitle, overview) {
   detailRequest++;
   state.detailId = null;
   state.currentDetailEv = null;
+  state.detailSourceSpec = null;
+  const actions = $("#drawer .detail-quick-actions"); if (actions) actions.hidden = true;
   $("#drawer-badges").innerHTML = "";
   $("#drawer-badges").append(el("span", "badge code", title));
   if (subtitle) $("#drawer-badges").append(el("span", "badge", subtitle));
@@ -4025,6 +4055,7 @@ function showDetail(ev, sourceSpec = null) {
   state.detailId = ev.id;
   state.currentDetailEv = ev;
   state.detailSourceSpec = sourceSpec;
+  const actions = $("#drawer .detail-quick-actions"); if (actions) actions.hidden = false;
   const follow = $("#ws-detail-follow"), context = $("#ws-detail-context");
   if (follow) follow.hidden = !["trace_id", "trace.id", "request_id", "requestId", "correlation_id", "session_id"].some(key => ev.fields?.[key]);
   if (context) context.hidden = ev.timestamp == null;
@@ -4045,14 +4076,14 @@ function showDetail(ev, sourceSpec = null) {
   if (ev.name) badges.appendChild(el("span", "badge code", ev.name));
 
   const rows = [];
-  const push = (k, v, mono) => rows.push({ k, v: v ?? "", mono });
-  push("Data/hora", fmtTsFull(ev.timestamp), true);
-  push("Fonte", ev.source);
-  push("Nível", ev.level);
-  push("Código", ev.code, true);
-  push("Nome", ev.name);
-  push("Descrição", ev.description);
-  push("Mensagem", ev.message, true);
+  const push = (k, v, mono, filterValue = v) => rows.push({ k, v: v ?? "", mono, filterValue });
+  push("timestamp", fmtTsFull(ev.timestamp), true, ev.timestamp);
+  push("source", ev.source);
+  push("level", ev.level);
+  push("code", ev.code, true);
+  push("name", ev.name);
+  push("description", ev.description);
+  push("message", ev.message, true);
   for (const [k, v] of Object.entries(ev.fields || {})) {
     push(k, typeof v === "object" ? JSON.stringify(v) : String(v), true);
   }
@@ -4063,15 +4094,15 @@ function showDetail(ev, sourceSpec = null) {
     row.appendChild(el("div", "kv-k", colLabel(r.k)));
     const v = el("div", `kv-v${r.mono ? " mono" : ""}`, String(r.v));
     row.appendChild(v);
-    const colKey = Object.keys(COL_LABELS).find((c) => COL_LABELS[c] === r.k) || r.k;
+    const colKey = r.k;
     row.dataset.col = colKey;
-    if (!["raw"].includes(colKey) && String(r.v).trim() !== "") {
+    if (!["raw"].includes(colKey) && r.filterValue != null && String(r.filterValue).trim() !== "") {
       const f = el("button", "kv-filter");
       f.innerHTML = '<i class="fas fa-filter"></i>';
       f.title = `Filtrar: ${colLabel(colKey)} = ${String(r.v).slice(0, 40)}`;
       f.onclick = (e) => {
         e.stopPropagation();
-        addFilter({ column: colKey, op: "equals", value: String(r.v), value2: null });
+        addFilter({ column: colKey, op: colKey === "timestamp" ? "between" : "equals_exact", value: String(r.filterValue), value2: colKey === "timestamp" ? String(r.filterValue) : null });
         toast("Filtro adicionado.", "ok");
       };
       row.appendChild(f);
@@ -4286,7 +4317,7 @@ function placeSourcePanel() {
   target.appendChild(panel);
 }
 
-function switchTab(which) {
+function switchTab(which, { deferAnalytics = false } = {}) {
   placeAnalytics("dataset");
   const scope = workspaceScope(); state.analyticsScope = scope;
   state.activeDatasetTab = which;
@@ -4299,9 +4330,9 @@ function switchTab(which) {
   $("#view-cube").hidden = which !== "cube";
   $("#view-dashboard").classList.toggle("in-workspace", which === "dashboard");
   $("#view-cube").classList.toggle("in-workspace", which === "cube");
-  if (which === "group") runGroup();
-  if (which === "dashboard") openDashboard(scope);
-  if (which === "cube") openCube(scope);
+  if (!deferAnalytics && which === "group") runGroup();
+  if (!deferAnalytics && which === "dashboard") openDashboard(scope);
+  if (!deferAnalytics && which === "cube") openCube(scope);
 }
 
 // troca entre as telas "Visualização", "Caso" e "Estações"
@@ -4314,9 +4345,9 @@ function showSourceMode(mode) {
   $("#btn-source-back").hidden = !has;
 }
 
-function switchView(which) {
+function switchView(which, { deferAnalytics = false } = {}) {
   if (window.WorkspaceContext && !window.WorkspaceContext.changing && ["caso", "case-dashboard", "case-cube", "estacoes"].includes(which) && workspaceScope() !== "case") {
-    return window.WorkspaceContext.setScope("case", { page: which === "caso" && ["timeline", "vtimeline"].includes(state.analysisView) ? "case-timeline" : which === "case-dashboard" || which === "case-cube" ? "explore" : "evidence", tab: which === "case-cube" ? "cube" : which === "case-dashboard" ? "dashboard" : undefined });
+    return window.WorkspaceContext.setScope("case", { page: which === "caso" && ["timeline", "vtimeline", "timeline-table"].includes(state.analysisView) ? "case-timeline" : which === "case-dashboard" || which === "case-cube" ? "explore" : "evidence", tab: which === "case-cube" ? "cube" : which === "case-dashboard" ? "dashboard" : undefined });
   }
   window.Workspace?.onView(which);
   if (which === "source") showSourceMode("list");
@@ -4345,7 +4376,7 @@ function switchView(which) {
   if (which === "estacoes") renderStations();
   if (which === "case-dashboard") openDashboard("case");
   if (which === "case-cube") openCube("case");
-  if (which === "viz") { switchTab(state.activeDatasetTab); requestAnimationFrame(() => { const box = $("#chart"); if (chart && box.clientWidth > 0) chart.setSize({ width: box.clientWidth - 4, height: 96 }); }); }
+  if (which === "viz") { switchTab(state.activeDatasetTab, { deferAnalytics }); requestAnimationFrame(() => { const box = $("#chart"); if (chart && box.clientWidth > 0) chart.setSize({ width: box.clientWidth - 4, height: 96 }); }); }
   updateContextBar();
 }
 
@@ -5208,14 +5239,21 @@ function fmtVal(v, unit) {
   return fmtNum(Math.round(v * 100) / 100);
 }
 
-// assinatura do conteúdo do Caso (invalida caches de eventos/perfis/árvore)
+// Track replacement/reordering of immutable evidence rows without hashing large log bodies.
+const caseObjectIds = new WeakMap();
+let caseObjectId = 0;
+function caseObjectKey(value) {
+  if (!value || typeof value !== "object") return 0;
+  if (!caseObjectIds.has(value)) caseObjectIds.set(value, ++caseObjectId);
+  return caseObjectIds.get(value);
+}
 function caseSig() {
   const c = activeCase();
   if (!c) return "none";
-  return `${c.id}:${(c.items || []).length}:${(c.items || []).reduce((a, it) => a + (it.rows?.length || 0), 0)}:${(c.manual || []).length}:${state.stationAnalyticsId || ""}`;
+  return JSON.stringify([c.id, caseObjectKey(c), state.stationAnalyticsId || "", (c.items || []).map(it => [it.id, caseObjectKey(it.rows), it.rows?.length || 0, it.stationId, it.artifactId, it.origin])]);
 }
 
-const caseEventsCache = { sig: null, events: [] };
+const caseEventsCache = { sig: null, events: [], summary: { start: null, end: null, columns: [] } };
 
 function caseEvents() {
   const sig = caseSig();
@@ -5223,7 +5261,17 @@ function caseEvents() {
   const events = caseEventsCompute();
   caseEventsCache.sig = sig;
   caseEventsCache.events = events;
+  let start = null, end = null; const columns = new Set(STANDARD);
+  for (const event of events) {
+    if (event.timestamp != null && Number.isFinite(event.timestamp)) { start = start == null ? event.timestamp : Math.min(start, event.timestamp); end = end == null ? event.timestamp : Math.max(end, event.timestamp); }
+    for (const column of Object.keys(event.fields || {})) columns.add(column);
+  }
+  caseEventsCache.summary = { start, end, columns: [...columns] };
   return events;
+}
+
+function caseRecordKey(row, artifactId, origin) {
+  return row.event_ref || JSON.stringify([row.fields?.caminho || artifactId || origin || "", row.id, row.timestamp, row.source, row.code, row.message]);
 }
 
 function caseEventsCompute() {
@@ -5233,7 +5281,7 @@ function caseEventsCompute() {
     if (state.stationAnalyticsId && item.stationId !== state.stationAnalyticsId) continue;
     for (const row of item.rows || []) {
       if (!Number.isInteger(row.id)) continue;
-      const key = row.event_ref || [row.fields?.caminho || item.artifactId || item.origin, row.id, row.timestamp, row.source, row.code, row.message].join("\u001f");
+      const key = caseRecordKey(row, item.artifactId, item.origin);
       if (seen.has(key)) continue;
       seen.add(key);
       events.push({
@@ -5428,37 +5476,33 @@ async function renderChartCard(body, spec, scope = state.analyticsScope) {
 function showChartValueActions(event, spec, value, scope) {
   if (!spec.field || spec.chart !== "terms") return;
   event.preventDefault();
-  const openInEvents = () => {
-    addFilter({ column: spec.field, op: "equals", value: String(value), value2: null });
-    switchView("viz");
-    switchTab("table");
-  };
-  const items = scope === "case"
-    ? [
-        { icon: "fa-briefcase", label: "Abrir itens relacionados do Caso", onClick: () => { setAnalysisView("items"); switchView("caso"); } },
-        { icon: "fa-circle-info", label: "Inspecionar campo", onClick: () => showFieldInspector(spec.field) },
-      ]
-    : [
-        { icon: "fa-filter", label: `Filtrar: ${colLabel(spec.field)} = ${trunc(value)}`, onClick: () => addFilter({ column: spec.field, op: "equals", value: String(value), value2: null }) },
-        { icon: "fa-table-list", label: "Abrir eventos correspondentes", onClick: openInEvents },
-        { icon: "fa-briefcase", label: "Adicionar grupo ao Caso", onClick: () => addGroupToAnalysis(spec.field, String(value)) },
-      ];
+  const filter = { column: spec.field, op: value == null ? "empty" : "equals_exact", value: value == null ? "" : String(value), value2: null };
+  const items = [
+    { icon: "fa-filter", label: `Filtrar: ${colLabel(spec.field)} = ${trunc(value ?? "(vazio)")}`, onClick: () => window.Discovery.applySelection([filter], scope) },
+    { icon: "fa-table-list", label: "Abrir eventos correspondentes", onClick: () => window.Discovery.applySelection([filter], scope, true) },
+    { icon: "fa-circle-info", label: "Inspecionar campo", onClick: () => showFieldInspector(spec.field) },
+  ];
+  if (scope === "dataset") items.push({ icon: "fa-briefcase", label: "Adicionar grupo ao Caso", onClick: () => addGroupToAnalysis(spec.field, filter.value, undefined, filter.op) });
   showCtxMenu(event.clientX, event.clientY, items);
 }
 
 function renderHBars(box, res, spec, scope) {
   const wrap = el("div", "hbar");
-  const max = Math.max(1e-9, ...res.series[0].points);
+  const min = Math.min(0, ...res.series[0].points), max = Math.max(0, ...res.series[0].points), span = Math.max(1e-9, max - min), zero = -min / span * 100;
   res.x.forEach((label, i) => {
     const v = res.series[0].points[i];
     const row = el("div", "hbar-row");
     row.title = spec.field ? "Clique com o botão direito para ações" : "";
-    row.oncontextmenu = (event) => showChartValueActions(event, spec, label, scope);
+    const value = res.x_values?.length === res.x.length ? res.x_values[i] : label === "(vazio)" ? null : label;
+    row.oncontextmenu = (event) => showChartValueActions(event, spec, value, scope);
     const lab = el("span", "hbar-label", String(label));
     lab.title = String(label);
     const track = el("div", "hbar-track");
     const fill = el("div", "hbar-fill");
-    fill.style.width = `${(v / max) * 100}%`;
+    track.style.position = "relative"; fill.style.position = "absolute";
+    fill.style.left = `${Math.min(zero, (v - min) / span * 100)}%`; fill.style.width = `${Math.abs(v) / span * 100}%`;
+    if (v < 0) fill.style.background = "var(--lv-erro)";
+    if (min < 0 && max > 0) { const axis = el("i"); axis.style.cssText = `position:absolute;left:${zero}%;height:100%;width:1px;background:var(--text-2)`; track.append(axis); }
     track.appendChild(fill);
     row.append(lab, track, el("span", "hbar-val", fmtVal(v, res.unit)));
     wrap.appendChild(row);
@@ -5467,6 +5511,7 @@ function renderHBars(box, res, spec, scope) {
 }
 
 function renderDonut(box, res, spec, scope) {
+  if (res.series[0].points.some(value => value < 0)) { renderHBars(box, res, spec, scope); box.append(el("p", "muted small", "Valores negativos são mostrados em barras.")); return; }
   const total = res.series[0].points.reduce((a, b) => a + b, 0) || 1;
   const R = 60, CX = 70, CY = 70;
   let angle = -Math.PI / 2;
@@ -5478,7 +5523,9 @@ function renderDonut(box, res, spec, scope) {
     const large = frac > 0.5 ? 1 : 0;
     const x1 = CX + R * Math.cos(angle), y1 = CY + R * Math.sin(angle);
     const x2 = CX + R * Math.cos(a2), y2 = CY + R * Math.sin(a2);
-    if (frac > 0.001) {
+    if (frac >= 1 - 1e-9) {
+      svgParts.push(`<circle cx="${CX}" cy="${CY}" r="${R}" fill="${CHART_COLORS[i % CHART_COLORS.length]}"/>`);
+    } else if (frac > 0.001) {
       svgParts.push(`<path d="M ${CX} ${CY} L ${x1.toFixed(1)} ${y1.toFixed(1)} A ${R} ${R} 0 ${large} 1 ${x2.toFixed(1)} ${y2.toFixed(1)} Z" fill="${CHART_COLORS[i % CHART_COLORS.length]}"/>`);
     }
     angle = a2;
@@ -5493,7 +5540,8 @@ function renderDonut(box, res, spec, scope) {
   res.x.slice(0, 8).forEach((label, i) => {
     const li = el("div", "li");
     li.title = spec.field ? "Clique com o botão direito para ações" : "";
-    li.oncontextmenu = (event) => showChartValueActions(event, spec, label, scope);
+    const value = res.x_values?.length === res.x.length ? res.x_values[i] : label === "(vazio)" ? null : label;
+    li.oncontextmenu = (event) => showChartValueActions(event, spec, value, scope);
     const sw = el("span", "sw");
     sw.style.background = CHART_COLORS[i % CHART_COLORS.length];
     li.append(sw, el("span", "", String(label)), el("span", "v", fmtVal(res.series[0].points[i], res.unit)));
@@ -5836,7 +5884,7 @@ function cubeFingerprint(value) {
 }
 
 function cubeDataSignature(result) {
-  return cubeFingerprint({ rows: result.row_paths, cols: result.col_keys, values: result.value_names, cells: result.cells, totals: result.totals });
+  return cubeFingerprint({ rows: result.row_values || result.row_paths, cols: result.col_values || result.col_keys, values: result.value_names, cells: result.cells, totals: result.totals, incompatible: result.incompatible_units, units: result.value_units });
 }
 
 function cloneCubeResult(result) {
@@ -6215,15 +6263,19 @@ function removeCubeTable(tableId) {
 
 function cubeChartPoints(chart) {
   const result = chart.snapshot;
+  if (result.incompatible_units?.[chart.measureIndex]) return [];
+  const table = cubeWorkspace().tables.find(item => item.id === chart.sourceTableId);
+  const fn = result.value_functions?.[chart.measureIndex] || (table && cubeSchemaSignature(table) === chart.sourceSchemaSignature ? table.values?.[chart.measureIndex]?.func : null);
+  if (chart.columnIndex === -1 && result.col_keys.length > 1 && !["count", "sum"].includes(fn)) return [];
   const dimensionCount = chart.sourceRows?.length || 0;
   const rows = dimensionCount
     ? result.row_paths.map((path, ri) => ({ path, ri })).filter((item) => item.path.length === dimensionCount)
     : [{ path: [], ri: result.row_paths.findIndex((path) => path.length === 0) }];
   const points = rows.map(({ path, ri }) => {
-    const value = chart.columnIndex === -1
-      ? result.cells[ri]?.reduce((sum, column) => sum + (Number(column?.[chart.measureIndex]) || 0), 0)
-      : Number(result.cells[ri]?.[chart.columnIndex]?.[chart.measureIndex]) || 0;
-    return { label: path.length ? path.join(" · ") : "Total", value };
+    const raw = chart.columnIndex === -1 ? result.cells[ri]?.map(column => column?.[chart.measureIndex]).filter(value => typeof value === "number" && Number.isFinite(value)) : [result.cells[ri]?.[chart.columnIndex]?.[chart.measureIndex]];
+    const value = raw?.length && raw.every(value => typeof value === "number" && Number.isFinite(value)) ? raw.reduce((sum, value) => sum + value, 0) : null;
+    const labels = result.row_values?.[ri]?.map(value => value == null ? "(vazio)" : value === "(vazio)" ? '“(vazio)”' : String(value)) || path;
+    return { label: labels.length ? labels.join(" · ") : "Total", value };
   });
   return points.filter((point) => Number.isFinite(point.value)).slice(0, 32);
 }
@@ -6260,11 +6312,12 @@ function renderCubeChart(chart, host = $("#cube-chart-view")) {
   const body = el("div", "cube-chart-body");
   const points = cubeChartPoints(chart);
   if (!points.length) {
-    body.appendChild(el("p", "muted", "A tabela não possui dados para este gráfico."));
-  } else if (chart.type === "donut") {
-    renderCubeDonut(body, points);
+    const incompatible = chart.snapshot.incompatible_units?.[chart.measureIndex];
+    body.appendChild(el("p", "muted", incompatible ? "Esta medida mistura unidades incompatíveis. Separe os registros por unidade e recalcule a tabela." : chart.columnIndex === -1 && chart.snapshot.col_keys.length > 1 ? "Esta medida não pode somar colunas. Edite o gráfico e escolha uma coluna para visualizar os valores corretos." : "A tabela não possui valores numéricos para este gráfico."));
   } else {
-    renderCubeBars(body, points);
+    const data = { kind: "terms", x: points.map(point => point.label), series: [{ points: points.map(point => point.value) }] };
+    if (chart.type === "donut") renderDonut(body, data, {}, state.analyticsScope); else renderHBars(body, data, {}, state.analyticsScope);
+    if (chart.snapshot.row_paths.filter(path => path.length === (chart.sourceRows?.length || 0)).length > points.length) body.append(el("p", "muted small", `Mostrando ${points.length} grupos com valores numéricos. O gráfico exibe até 32 grupos.`));
   }
   host.appendChild(body);
 }
@@ -6340,6 +6393,7 @@ function openCubeChartModal(chart = null, sourceResult = null) {
     sourceSchemaSignature: refreshing || !chart ? cubeSchemaSignature(table) : chart.sourceSchemaSignature,
     sourceDataSignature: refreshing || !chart ? cubeDataSignature(result) : chart.sourceDataSignature,
   };
+  cubeChartEditing.result.value_functions = result.value_functions || (refreshing || !chart || cubeSchemaSignature(table) === chart.sourceSchemaSignature ? table.values.map(value => value.func) : []);
   $("#cube-chart-modal-title").textContent = chart ? "Atualizar gráfico do Cubo" : "Novo gráfico do Cubo";
   $("#cube-chart-apply").textContent = chart ? "Atualizar gráfico" : "Criar gráfico";
   $("#cube-chart-name").value = chart?.name || `${table.name} · ${result.value_names?.[0] || "Eventos"}`;
@@ -6349,9 +6403,15 @@ function openCubeChartModal(chart = null, sourceResult = null) {
   measure.value = String(chart?.measureIndex ?? 0);
   const column = $("#cube-chart-column");
   column.innerHTML = "";
-  column.appendChild(el("option", "", "Todas as colunas")).value = "-1";
+  const allColumns = el("option", "", "Somar colunas"); allColumns.value = "-1"; column.append(allColumns);
   (result.col_keys || []).forEach((name, index) => column.appendChild(el("option", "", name === "(total)" ? "Total" : name)).value = String(index));
   column.value = String(chart?.columnIndex ?? -1);
+  const validColumn = () => {
+    const fn = cubeChartEditing.result.value_functions[Number(measure.value)];
+    allColumns.disabled = result.col_keys.length > 1 && !["count", "sum"].includes(fn);
+    if (allColumns.disabled && column.value === "-1") column.value = "0";
+  };
+  measure.onchange = validColumn; validColumn();
   setCubeChartType(chart?.type || "bar");
   $("#cube-chart-modal").hidden = false;
 }
@@ -6401,24 +6461,7 @@ async function refreshCubeChart(chart) {
 }
 
 function showCubeValueActions(event, field, value) {
-  event.preventDefault();
-  const openInEvents = () => {
-    addFilter({ column: field, op: "equals", value, value2: null });
-    switchView("viz");
-    switchTab("table");
-  };
-  const items = state.analyticsScope === "case"
-    ? [
-        { icon: "fa-briefcase", label: "Abrir itens relacionados do Caso", onClick: () => { setAnalysisView("items"); switchView("caso"); } },
-        { icon: "fa-circle-info", label: `Inspecionar ${colLabel(field)}`, onClick: () => showFieldInspector(field) },
-      ]
-    : [
-        { icon: "fa-filter", label: `Filtrar: ${colLabel(field)} = ${trunc(value)}`, onClick: () => { addFilter({ column: field, op: "equals", value, value2: null }); runCube(); } },
-        { icon: "fa-table-list", label: "Abrir eventos correspondentes", onClick: openInEvents },
-        { icon: "fa-briefcase", label: "Adicionar grupo ao Caso", onClick: () => addGroupToAnalysis(field, value) },
-        { icon: "fa-circle-info", label: "Inspecionar campo", onClick: () => showFieldInspector(field) },
-      ];
-  showCtxMenu(event.clientX, event.clientY, items);
+  showChartValueActions(event, { chart: "terms", field }, value, state.analyticsScope);
 }
 
 function legacyRenderCubeTable(cube, res) {

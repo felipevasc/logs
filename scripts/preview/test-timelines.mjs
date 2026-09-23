@@ -51,6 +51,8 @@ try {
     await window.volume.load();
   });
   assert.equal(await page.locator(".tl-bin").count(), 1, "out-of-range buckets are omitted");
+  assert.deepEqual(await page.locator(".tl-y-axis span").allTextContents(), ["1", "0,5", "0"], "half-height tick does not round to the maximum");
+  assert.match(await page.locator("#tl-selection-status").textContent(), /[.,]000/, "a subsecond selection exposes millisecond precision");
   await page.locator('[data-tl="explore"]').click();
   assert.deepEqual(await page.evaluate(() => window.applied), { from: 0, to: 0 });
 
@@ -98,6 +100,16 @@ try {
     fresh.restore(snapshot); await fresh.load();
   }, savedVolume);
   assert.equal(await page.locator(".tl-summary").innerText(), datasetZoom, "saved timeline configuration restores zoom without saved results");
+  await page.evaluate(async () => {
+    window.api = async (name, args) => { window.lastDurationRequest = args; return { start: args.start, end: args.end, bucketMs: args.end - args.start + 1, total: 1, errors: 0, warnings: 0, buckets: [{ timestamp: args.start, count: 1, errors: 0, warnings: 0 }] }; };
+    window.durationVolume = window.createTimelineView({ content: document.querySelector("#fixture"), getOverview: async () => ({ start: 0, end: 7 * 86400000 - 1, undated: 0 }), sourceKey: () => "duration", filters: () => [], isActive: () => true, applyRange() {} });
+    await window.durationVolume.load();
+  });
+  await page.locator('[data-tl="hour"]').click();
+  assert.equal(await page.evaluate(() => window.lastDurationRequest.end - window.lastDurationRequest.start + 1), 3600000);
+  await page.locator('[data-tl="all"]').click();
+  await page.locator('[data-tl="day"]').click();
+  assert.equal(await page.evaluate(() => window.lastDurationRequest.end - window.lastDurationRequest.start + 1), 86400000);
 
   await page.evaluate(() => {
     const start = Date.UTC(2026, 8, 22, 12, 34, 56, 789);

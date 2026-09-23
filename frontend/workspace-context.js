@@ -7,7 +7,7 @@ window.WorkspaceContext = (() => {
   const key = (value = scope) => `${activeCase()?.id || "none"}:${value}`;
   const copy = value => structuredClone(value);
   const stateKeys = ["filters", "quick", "visibleCols", "colWidths", "sortCol", "sortDir", "page", "pageSize", "groupCol", "aggs", "activeDatasetTab", "analysisView", "dashboardCompact", "favoriteFields"];
-  const runtimeKeys = ["loaded", "rows", "total", "columns", "dataPeriod", "facetData", "explorerCache"];
+  const runtimeKeys = ["loaded", "rows", "total", "columns", "dataPeriod", "facetData", "explorerCache", "queryError"];
   const scrollSelectors = ["#workspace-home", "#table-scroll", ".table-wrap", "#workspace-side", ".ct-scroll", ".journey-list", ".journey-records", "#view-dashboard", "#view-cube"];
   function defaults() {
     return { page: "summary", values: { filters: [], quick: "", visibleCols: ["timestamp", "level", "code", "name", "message"], colWidths: {}, sortCol: "timestamp", sortDir: "desc", page: 0, pageSize: 100, groupCol: "level", aggs: [{ func: "count", column: "*", alias: "Registros" }], activeDatasetTab: "table", analysisView: "vtimeline", dashboardCompact: false, favoriteFields: [] }, tree: [], density: "comfortable", wrap: "false", sideCollapsed: false, scroll: {}, discovery: { mode: "overview", showVolume: true } };
@@ -18,7 +18,7 @@ window.WorkspaceContext = (() => {
   const validFilters = value => Array.isArray(value) ? value.filter(item => item && typeof item.column === "string" && typeof item.op === "string").slice(0, 200).map(item => ({ ...item, ...(item.value != null ? { value: String(item.value) } : {}), ...(item.value2 != null ? { value2: String(item.value2) } : {}) })) : [];
   function sanitize(raw) {
     const base = defaults(), input = record(raw), values = record(input.values), snapshot = { ...base, ...input, values: { ...base.values, ...values }, scroll: {} };
-    snapshot.page = ["summary", "timeline", "case-timeline", "journeys", "explore", "compare", "evidence", "sources"].includes(input.page) ? input.page : "summary";
+    snapshot.page = ["summary", "timeline", "case-timeline", "case-trails", "journeys", "explore", "compare", "evidence", "sources"].includes(input.page) ? input.page : "summary";
     const v = snapshot.values;
     v.filters = validFilters(values.filters); v.quick = typeof values.quick === "string" ? values.quick : "";
     v.visibleCols = Array.isArray(values.visibleCols) ? strings(values.visibleCols) : base.values.visibleCols; v.favoriteFields = strings(values.favoriteFields);
@@ -26,7 +26,7 @@ window.WorkspaceContext = (() => {
     for (const name of ["sortCol", "groupCol"]) if (typeof v[name] !== "string") v[name] = base.values[name];
     v.sortDir = v.sortDir === "asc" ? "asc" : "desc"; v.page = integer(v.page, 0); v.pageSize = integer(v.pageSize, 100, 1, 2000);
     v.activeDatasetTab = ["table", "group", "dashboard", "cube"].includes(v.activeDatasetTab) ? v.activeDatasetTab : "table";
-    v.analysisView = ["overview", "items", "timeline", "vtimeline", "data"].includes(v.analysisView) ? v.analysisView : "vtimeline";
+    v.analysisView = ["overview", "items", "timeline", "vtimeline", "timeline-table", "data"].includes(v.analysisView) ? v.analysisView : "vtimeline";
     v.dashboardCompact = !!v.dashboardCompact;
     v.aggs = Array.isArray(v.aggs) ? v.aggs.filter(item => item && AGG_FUNCS.some(([func]) => func === item.func) && typeof item.column === "string").slice(0, 20).map(item => ({ func: item.func, column: item.column, alias: typeof item.alias === "string" ? item.alias : item.func })) : base.values.aggs;
     if (!v.aggs.length) v.aggs = base.values.aggs;
@@ -54,8 +54,8 @@ window.WorkspaceContext = (() => {
     state.quick = String(state.quick || "");
     Object.assign(state, runtime.get(key()) || {});
     if (scope === "case") {
-      const rows = caseEvents(), columns = new Set(STANDARD); for (const row of rows) for (const column of Object.keys(row.fields || {})) columns.add(column); state.loaded = rows.length > 0; state.columns = [...columns]; state.total = rows.length;
-      if (!runtime.has(key())) { state.rows = []; state.dataPeriod = null; state.facetData = null; state.explorerCache = null; }
+      const rows = caseEvents(); state.loaded = rows.length > 0; state.columns = [...caseEventsCache.summary.columns]; state.total = rows.length;
+      if (!runtime.has(key())) { state.rows = []; state.dataPeriod = null; state.facetData = null; state.explorerCache = null; state.queryError = null; }
     }
     state.visibleCols = state.visibleCols.filter(column => state.columns.includes(column)); if (!state.visibleCols.includes("timestamp")) state.visibleCols.unshift("timestamp");
     if (!state.columns.includes(state.groupCol)) state.groupCol = "level";
@@ -89,6 +89,7 @@ window.WorkspaceContext = (() => {
     if (!options.skipCapture) capture();
     const snapshot = stored(next), page = options.page || snapshot.page || "summary";
     detailRequest++; state.refreshVersion++; clearTimeout(debounceTimer); closeDrawer(); closeCtxMenu();
+    state.currentDetailEv = null; state.detailSourceSpec = null;
     document.querySelectorAll(".ctx-menu,.filter-pop").forEach(node => { node.hidden = true; });
     changing = true;
     let render = Promise.resolve();
@@ -98,7 +99,6 @@ window.WorkspaceContext = (() => {
       finishOperation(scope === "case" ? "Caso" : "Análise", scope === "case" ? `${fmtNum(caseEvents().length)} registros preservados no Caso` : `${fmtNum(state.total)} registros na Análise`);
       document.dispatchEvent(new CustomEvent("workspace-context-change", { detail: { scope, previousScope } }));
       render = Workspace.showPage(page === "sources" && scope === "case" ? "summary" : page).then(async () => {
-        if (request !== generation) return;
         if (request !== generation) return;
         for (const [selector, [left, top]] of Object.entries(snapshot.scroll || {})) { const node = document.querySelector(selector); if (node) { node.scrollLeft = left; node.scrollTop = top; } }
       });
@@ -175,7 +175,7 @@ window.WorkspaceContext = (() => {
     } finally { restoringCase = false; }
   }
   let membershipSignature = "", refs = new Set(), identities = new Set();
-  const identity = (event, artifact = state.currentArtifact?.id) => [event.fields?.caminho || artifact || "", event.id, event.timestamp, event.source, event.code, event.message].join("\u001f");
+  const identity = (event, artifact = state.currentArtifact?.id) => JSON.stringify([event.fields?.caminho || artifact || "", event.id, event.timestamp, event.source, event.code, event.message]);
   function indexMembership() {
     const signature = caseSig(); if (signature === membershipSignature) return;
     membershipSignature = signature; refs = new Set(); identities = new Set();

@@ -11,6 +11,9 @@ pub fn cancel() {
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::SeqCst)
 }
+pub fn current_generation() -> Option<u64> {
+    START.with(Cell::get)
+}
 pub fn cancelled() -> bool {
     START.with(|s| s.get().is_some_and(|g| g != generation()))
 }
@@ -26,14 +29,13 @@ pub fn commit() {
     START.with(|s| s.set(None));
 }
 pub fn run<T>(generation: u64, f: impl FnOnce() -> T) -> Result<T, String> {
-    struct Reset;
+    struct Reset(Option<u64>);
     impl Drop for Reset {
         fn drop(&mut self) {
-            START.with(|s| s.set(None));
+            START.with(|s| s.set(self.0));
         }
     }
-    START.with(|s| s.set(Some(generation)));
-    let _reset = Reset;
+    let _reset = Reset(START.with(|s| s.replace(Some(generation))));
     check()?;
     let result = f();
     check()?;

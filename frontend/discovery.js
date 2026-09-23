@@ -36,6 +36,7 @@
   }
   async function applySelection(filters, scope, openRecords = false) {
     if (window.WorkspaceContext && scope !== workspaceScope()) await window.WorkspaceContext.setScope(scope, { page: 'explore', tab: 'table' });
+    if (scope !== workspaceScope()) return;
     closeDrawer();
     for (const filter of filters) {
       if (!state.filters.some(f => f.column === filter.column && f.op === filter.op && f.value === filter.value && (f.value2 ?? null) === (filter.value2 ?? null))) state.filters.push({...filter, value2: filter.value2 ?? null});
@@ -45,8 +46,9 @@
     filtersChanged();
   }
   function valueFilter(field, value) {
-    return {column: field, op: value === '(vazio)' || value === '' ? 'empty' : 'equals_exact', value: value === '(vazio)' ? '' : String(value)};
+    return {column: field, op: value == null || value === '' ? 'empty' : 'equals_exact', value: value == null ? '' : String(value)};
   }
+  const rawCategory=(raw,label)=>raw !== undefined ? raw : label === '(vazio)' ? null : label;
   function button(label, onClick, className = 'btn ghost small') {
     const b = el('button', className, label); b.type = 'button'; b.onclick = onClick; return b;
   }
@@ -189,12 +191,13 @@
   function renderRanking(box, res, spec, scope) {
     const values = res.series[0]?.points || [], max = Math.max(1,...values);
     res.x.forEach((label,i) => {
-      const row = button('', ()=>applySelection([valueFilter(spec.field,label)],scope,true), 'discovery-rank');
+      const value=rawCategory(res.x_values?.[i],label);
+      const row = button('', ()=>applySelection([valueFilter(spec.field,value)],scope,true), 'discovery-rank');
       row.title = `${label}: ${fmtNum(values[i])} registros. Clique para filtrar.`;
       row.innerHTML = `<span class="discovery-rank-index">${i+1}</span><span class="discovery-rank-label">${esc(label || '(vazio)')}</span><span class="discovery-rank-track"><span style="width:${Math.max(0,100*values[i]/max)}%"></span></span><strong>${fmtNum(values[i])}</strong>`;
       row.oncontextmenu = e => {
         e.preventDefault();
-        const filter=valueFilter(spec.field,label);
+        const filter=valueFilter(spec.field,value);
         showCtxMenu(e.clientX,e.clientY,[
           {icon:'fa-filter',label:'Incluir este valor',onClick:()=>applySelection([filter],scope,true)},
           {icon:'fa-filter-circle-xmark',label:'Excluir este valor',onClick:()=>applySelection([{...filter,op:filter.op==='empty'?'not_empty':'not_equals_exact'}],scope,true)},
@@ -362,7 +365,7 @@
     const rare=data.categories.filter(c=>c.rare?.length).slice(0,4);
     for(const c of rare) {
       const body=card(grid,`${colLabel(c.field)} · pouco frequentes`,'Raridade no recorte analisado; não implica problema.');
-      for(const r of c.rare.slice(0,5)) body.append(button(`${r.value} · ${fmtNum(r.count)} (${percent(r.share)})`,()=>applySelection([{column:c.field,op:'equals',value:r.value}],scope,true),'discovery-rare'));
+      for(const r of c.rare.slice(0,5)) body.append(button(`${r.value} · ${fmtNum(r.count)} (${percent(r.share)})`,()=>applySelection([{column:c.field,op:'equals_exact',value:r.value}],scope,true),'discovery-rare'));
     }
     if(!data.outliers.length) { const body=card(grid,'Desvios numéricos','Estatística robusta, sem configuração');empty(body,'Nenhum desvio destacado nos campos numéricos compatíveis.'); }
   }
@@ -381,7 +384,7 @@
       contrast.innerHTML=`<div><span>Demais intervalos</span><i><b style="width:${Math.max(0,Math.min(100,s.baseline_observed_share*100))}%"></b></i><small>${fmtNum(s.baseline_observed)} / ${fmtNum(s.baseline_count)}</small></div><div><span>Neste intervalo</span><i><b style="width:${Math.max(0,Math.min(100,s.observed_share*100))}%"></b></i><small>${fmtNum(s.window_observed)} / ${fmtNum(s.window_count)}</small></div>`;body.append(contrast);
       body.append(el('p','behavior-expected',`Esperado: ${s.expected} · ${percent(s.expected_share)}`));
       addExplanation(body,`O resultado predominante fora desta janela era “${s.expected}”, neste mesmo contexto. ${data.limited?'Contagens da amostra; a investigação consulta todo o recorte.':'Contagens dos registros analisados.'}`);
-      const filters=s.context.map(c=>({column:c.field,op:'equals',value:c.value}));filters.push({column:'timestamp',op:'between',value:String(s.start),value2:String(s.end)});
+      const filters=s.context.map(c=>({column:c.field,op:'equals_exact',value:c.value}));filters.push({column:'timestamp',op:'between',value:String(s.start),value2:String(s.end)});
       const actions=el('div','discovery-actions');actions.append(button('Ver desvio',()=>applySelection([...filters,{column:s.outcome_field,op:s.outcome_op,value:s.observed}],scope,true),'btn primary small'),button('Ver contexto',()=>applySelection(filters,scope,true)));body.append(actions);
     }
   }
@@ -404,15 +407,15 @@
       try{
         const data=await cached('pivot',{...analyticsRequest(scope),spec:{rows:[rowField],cols:[colField],values:[{func:'count',column:'*',alias:'Registros'}],limit_rows:100}},key);
         if(!isCurrent()||token!==request||!body.isConnected)return;output.innerHTML='';
-        const groups=data.row_paths.map((path,i)=>({value:path[0],cells:data.cells[i].map(v=>Number(v[0])||0)})).filter(g=>g.value!==undefined).map(g=>({...g,total:g.cells.reduce((a,b)=>a+b,0)})).sort((a,b)=>b.total-a.total);
+        const groups=data.row_paths.map((path,i)=>({value:path[0],raw:rawCategory(data.row_values?.[i]?.[0],path[0]),cells:data.cells[i].map(v=>Number(v[0])||0)})).filter(g=>g.value!==undefined).map(g=>({...g,total:g.cells.reduce((a,b)=>a+b,0)})).sort((a,b)=>b.total-a.total);
         const columnTotals=data.col_keys.map((_,i)=>groups.reduce((sum,g)=>sum+g.cells[i],0));
-        const columns=data.col_keys.map((value,i)=>({value,i,count:columnTotals[i]})).sort((a,b)=>b.count-a.count).slice(0,6);
+        const columns=data.col_keys.map((value,i)=>({value,raw:rawCategory(data.col_values?.[i]?.[0],value),i,count:columnTotals[i]})).sort((a,b)=>b.count-a.count).slice(0,6);
         if(!groups.length){empty(output,'Sem combinações neste recorte.');return;}
         const legend=el('div','cross-legend');columns.forEach((c,i)=>{const item=el('span','',c.value);item.style.setProperty('--color',CHART_COLORS[i%CHART_COLORS.length]);legend.append(item);});output.append(legend);
         for(const g of groups.slice(0,8)){
           const row=el('div','cross-row');const name=el('span','cross-name',g.value);name.title=g.value;
           const bar=el('div','cross-bar');let shown=0;
-          columns.forEach((c,i)=>{const count=g.cells[c.i],share=count/Math.max(1,g.total);shown+=count;if(!count)return;const segment=button(share>=.11?percent(share):'',()=>applySelection([valueFilter(rowField,g.value),valueFilter(colField,c.value)],scope,true),'cross-segment');segment.style.width=`${share*100}%`;segment.style.background=CHART_COLORS[i%CHART_COLORS.length];segment.title=`${g.value} · ${c.value}: ${fmtNum(count)} registros (${percent(share)} deste grupo)`;segment.setAttribute('aria-label',segment.title);bar.append(segment);});
+          columns.forEach((c,i)=>{const count=g.cells[c.i],share=count/Math.max(1,g.total);shown+=count;if(!count)return;const segment=button(share>=.11?percent(share):'',()=>applySelection([valueFilter(rowField,g.raw),valueFilter(colField,c.raw)],scope,true),'cross-segment');segment.style.width=`${share*100}%`;segment.style.background=CHART_COLORS[i%CHART_COLORS.length];segment.title=`${g.value} · ${c.value}: ${fmtNum(count)} registros (${percent(share)} deste grupo)`;segment.setAttribute('aria-label',segment.title);bar.append(segment);});
           if(shown<g.total){const rest=el('span','cross-other');rest.style.width=`${100*(g.total-shown)/g.total}%`;rest.title=`Outros: ${fmtNum(g.total-shown)}`;bar.append(rest);}
           row.append(name,bar,el('strong','',fmtNum(g.total)));output.append(row);
         }
@@ -443,11 +446,11 @@
         const domain={column:'timestamp',op:'between',value:String(res.x[0]),value2:String(Number(res.x.at(-1))+(res.interval_ms||1)-1)};
         const baseline=await cached('pivot',{...analyticsRequest(scope),filters:[...backendFilters(),domain],spec:pivotSpec},key);if(!current())return;
         const windowData=await cached('pivot',{...analyticsRequest(scope),filters:[...backendFilters(),range],spec:pivotSpec},key);if(!current())return;result.innerHTML='';
-        const values=new Map(baseline.row_paths.map((p,i)=>[p[0],baseline.cells[i]?.[0]]));
-        const groups=windowData.row_paths.map((p,i)=>({value:p[0],count:Number(windowData.cells[i]?.[0]?.[0])||0,mean:windowData.cells[i]?.[0]?.[1],max:windowData.cells[i]?.[0]?.[2],baseline:values.get(p[0])?.[1]})).filter(g=>g.value!==undefined&&g.mean!=null).sort((a,b)=>(b.mean-(b.baseline??b.mean))-(a.mean-(a.baseline??a.mean))||b.max-a.max).slice(0,5);
+        const values=new Map(baseline.row_paths.map((p,i)=>[rawCategory(baseline.row_values?.[i]?.[0],p[0]),baseline.cells[i]?.[0]]));
+        const groups=windowData.row_paths.map((p,i)=>{const raw=rawCategory(windowData.row_values?.[i]?.[0],p[0]);return{value:p[0],raw,count:Number(windowData.cells[i]?.[0]?.[0])||0,mean:windowData.cells[i]?.[0]?.[1],max:windowData.cells[i]?.[0]?.[2],baseline:values.get(raw)?.[1]};}).filter(g=>g.value!==undefined&&g.mean!=null).sort((a,b)=>(b.mean-(b.baseline??b.mean))-(a.mean-(a.baseline??a.mean))||b.max-a.max).slice(0,5);
         if(!groups.length){empty(result,'Sem valores numéricos neste intervalo.');continue;}
         const table=el('table','peak-table');table.innerHTML='<thead><tr><th>Grupo</th><th>Média geral</th><th>Neste intervalo</th><th>Máximo</th></tr></thead>';const tbody=el('tbody');
-        for(const g of groups){const tr=el('tr'),name=el('td'),open=button(g.value,()=>applySelection([range,valueFilter(field.name,g.value)],scope,true),'text-button');name.append(open,el('small','',`${fmtNum(g.count)} registros`));tr.append(name);for(const n of [g.baseline,g.mean,g.max])tr.append(el('td','',n==null?'—':fmtVal(n,res.unit)));tbody.append(tr);}table.append(tbody);result.append(table);
+        for(const g of groups){const tr=el('tr'),name=el('td'),open=button(g.value,()=>applySelection([range,valueFilter(field.name,g.raw)],scope,true),'text-button');name.append(open,el('small','',`${fmtNum(g.count)} registros`));tr.append(name);for(const n of [g.baseline,g.mean,g.max])tr.append(el('td','',n==null?'—':fmtVal(n,res.unit)));tbody.append(tr);}table.append(tbody);result.append(table);
         if(baseline.complete===false||windowData.complete===false||baseline.truncated||windowData.truncated)result.append(el('p','discovery-explain','Comparação limitada pelo motor. Refine o campo ou o período.'));
       }catch(error){if(current()){result.innerHTML='';empty(result,String(error));}}
     }
@@ -456,7 +459,13 @@
   $('#btn-dash-refresh').onclick=()=>{ cache.clear(); profileKey=''; renderDashboard(state.analyticsScope); };
   const compactClick=$('#btn-dash-compact').onclick;
   $('#btn-dash-compact').onclick=e=>{ if(compactClick) compactClick(e); else {state.dashboardCompact=!state.dashboardCompact;renderDashboard();} };
-  window.Discovery = {applySelection, valueFilter, showExplanation, clearCache:()=>{revision++;cache.clear();}, capture:()=>({mode,showVolume}), restore:saved=>{generation++;fieldRequest++;mode=modes.some(item=>item[0]===saved?.mode)?saved.mode:'overview';showVolume=saved?.showVolume!==false;cache.clear();profileKey='';}};
+  window.Discovery = {applySelection, valueFilter, showExplanation, clearCache:()=>{revision++;cache.clear();}, capture:()=>({mode,showVolume,heat:{...heatChoice},cross:{...crossChoice}}), restore:saved=>{
+    generation++;fieldRequest++;mode=modes.some(item=>item[0]===saved?.mode)?saved.mode:'overview';showVolume=saved?.showVolume!==false;
+    const text=value=>typeof value==='string'?value:'';
+    Object.assign(crossChoice,{row:text(saved?.cross?.row),column:text(saved?.cross?.column)});
+    Object.assign(heatChoice,{row:text(saved?.heat?.row),color:saved?.heat?.color==null?null:text(saved.heat.color),border:saved?.heat?.border==null?null:text(saved.heat.border),bins:['12','24','48'].includes(saved?.heat?.bins)?saved.heat.bins:'auto'});
+    cache.clear();profileKey='';
+  }};
 
   async function fieldTop(column,scope=workspaceScope()) {
     const token=++fieldRequest,key=scopeKey(scope),body=el('div','field-profile');

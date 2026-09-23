@@ -27,6 +27,7 @@ impl Terms {
             }
             let db = rusqlite::Connection::open("")
                 .expect("Não foi possível criar arquivo temporário para o ranking");
+            db.progress_handler(10_000, Some(crate::operations::cancelled));
             db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; CREATE TABLE terms(v TEXT PRIMARY KEY,n INTEGER NOT NULL) WITHOUT ROWID; BEGIN").expect("Falha ao preparar ranking no disco");
             {
                 let mut insert = db
@@ -114,6 +115,7 @@ mod terms_tests {
 
 pub struct Counter {
     values: HashSet<String>,
+    bytes: usize,
     disk: Option<rusqlite::Connection>,
     count: usize,
 }
@@ -121,12 +123,14 @@ impl Default for Counter {
     fn default() -> Self {
         Self {
             values: HashSet::new(),
+            bytes: 0,
             disk: None,
             count: 0,
         }
     }
 }
 impl Counter {
+    const BYTES: usize = 2 * 1024 * 1024;
     pub fn insert(&mut self, value: String) {
         if let Some(db) = &self.disk {
             self.count += db
@@ -134,12 +138,17 @@ impl Counter {
                 .expect("Falha ao contar valores distintos no disco");
             return;
         }
+        if self.values.contains(&value) {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(value.len().saturating_add(64));
         self.values.insert(value);
         self.count = self.values.len();
-        if self.values.len() >= 25_000 {
+        if self.values.len() >= 25_000 || self.bytes >= Self::BYTES {
             let mut db = rusqlite::Connection::open("")
                 .expect("Não foi possível criar arquivo temporário para a contagem");
-            db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; CREATE TABLE vals(v TEXT PRIMARY KEY) WITHOUT ROWID;").expect("Falha ao preparar contagem");
+            db.progress_handler(10_000, Some(crate::operations::cancelled));
+            db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-512; PRAGMA temp_store=FILE; CREATE TABLE vals(v TEXT PRIMARY KEY) WITHOUT ROWID;").expect("Falha ao preparar contagem");
             {
                 let tx = db.transaction().expect("Falha na contagem");
                 {
@@ -155,9 +164,27 @@ impl Counter {
             db.execute_batch("BEGIN").expect("Falha na contagem");
             self.disk = Some(db);
             self.values.shrink_to_fit();
+            self.bytes = 0;
         }
     }
     pub fn len(&self) -> usize {
         self.count
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::Counter;
+
+    #[test]
+    fn distinct_spills_by_bytes_before_key_count() {
+        let mut counter = Counter::default();
+        let value = "日".repeat(Counter::BYTES / 3 + 1);
+        counter.insert(value.clone());
+        assert!(counter.disk.is_some());
+        assert!(counter.values.is_empty());
+        counter.insert(value);
+        counter.insert("another".into());
+        assert_eq!(counter.len(), 2);
     }
 }

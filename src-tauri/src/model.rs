@@ -119,6 +119,7 @@ impl Event {
                 s.parse::<f64>()
                     .ok()
                     .or_else(|| crate::analysis::parse_num_unit(s).map(|(n, _)| n))
+                    .filter(|n| n.is_finite())
             }),
         }
     }

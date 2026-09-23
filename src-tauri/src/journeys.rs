@@ -269,6 +269,7 @@ fn db() -> Result<Connection, String> {
     let db = Connection::open("").map_err(|e| {
         format!("Não foi possível abrir armazenamento temporário das jornadas: {e}")
     })?;
+    db.progress_handler(10_000, Some(operations::cancelled));
     db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; BEGIN;").map_err(|e| e.to_string())?;
     Ok(db)
 }
@@ -428,7 +429,7 @@ pub(crate) fn index_impl(
         Ok(JourneyIndex {
             total,
             groups,
-            complete: true,
+            complete: skipped_keys == 0,
             field: field.into(),
             missing_key,
             missing_time,

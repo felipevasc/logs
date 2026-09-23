@@ -59,7 +59,7 @@ window.Journeys = (() => {
   const duration = value => { if (value == null) return "Sem duração"; if (value < 1000) return `${value} ms`; if (value < 60000) return `${(value / 1000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} s`; if (value < 3600000) return `${(value / 60000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} min`; return `${(value / 3600000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} h`; };
   const fullTime = value => value == null ? "Sem horário" : new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "medium" }).format(value);
   const localInput = value => value == null ? "" : new Date(value - new Date(value).getTimezoneOffset() * 60000).toISOString().slice(0, 23);
-  function help(origin, message = "Registros são ligados pelo mesmo valor exato no campo escolhido. Letras maiúsculas e espaços são preservados; nomes de campos diferentes não são fundidos. IDs de trace, requisição, correlação ou sessão costumam ser as melhores chaves. Uma ligação não demonstra causa. Para usuário ou IP, escolha uma janela de tempo: são relações temporais, não sessões confirmadas.") { window.Discovery?.showExplanation("Como interpretar Jornadas", message, origin); }
+  function help(origin, message = "Registros são ligados pelo mesmo valor exato no campo escolhido. Letras maiúsculas e espaços são preservados; nomes de campos diferentes não são fundidos. IDs de trace, requisição, correlação ou sessão costumam ser as melhores chaves. Uma ligação não demonstra causa. Para usuário ou IP, escolha uma janela de tempo: são relações temporais, não sessões confirmadas. As Trilhas do Caso são sequências que você organiza a partir dos itens selecionados.") { window.Discovery?.showExplanation("Como interpretar possíveis trilhas", message, origin); }
   function pager(target, page, total, size, change) {
     const node = el("div", "journey-pager"), pages = Math.max(1, Math.ceil(total / size));
     const previous = button("Anterior", () => change(page - 1)), next = button("Próxima", () => change(page + 1)); previous.disabled = page === 0; next.disabled = page >= pages - 1;
@@ -91,9 +91,9 @@ window.Journeys = (() => {
     select("Ordenar", [["recent", "Mais recentes"], ["duration", "Maior duração"], ["count", "Mais registros"], ["errors", "Mais erros"]], view.sort, sort => { view.sort = sort; view.page = 0; loadIndex(); });
     const single = el("label", "journey-single"), checkbox = el("input"); checkbox.type = "checkbox"; checkbox.checked = view.singles; checkbox.onchange = () => { view.singles = checkbox.checked; view.page = 0; loadIndex(); }; single.append(checkbox, document.createTextNode("Incluir isolados")); tools.append(single);
     const jump = el("label", "journey-key-jump", "Abrir valor exato"), row = el("div"), input = el("input"); input.type = "search"; input.placeholder = "Cole um identificador…"; input.setAttribute("aria-label", "Identificador exato");
-    const go = button("Abrir", () => { if (input.value !== "") selectValue(input.value); }); row.append(input, go); jump.append(row); tools.append(jump); input.onkeydown = event => { if (event.key === "Enter") go.click(); };
-    const info = button("", () => help(info), "icon-btn"); info.innerHTML = '<i class="fas fa-circle-info"></i>'; info.title = "Como interpretar Jornadas"; info.setAttribute("aria-label", info.title);
-    const reload = button("", () => render(host.parentElement), "icon-btn"); reload.innerHTML = '<i class="fas fa-rotate"></i>'; reload.title = "Atualizar jornadas"; reload.setAttribute("aria-label", reload.title); tools.append(info, reload);
+    const go = button("Abrir", () => { if (view.field && input.value !== "") selectValue(input.value); }); go.disabled = !view.field; row.append(input, go); jump.append(row); tools.append(jump); input.onkeydown = event => { if (event.key === "Enter") go.click(); };
+    const info = button("", () => help(info), "icon-btn"); info.innerHTML = '<i class="fas fa-circle-info"></i>'; info.title = "Como interpretar possíveis trilhas"; info.setAttribute("aria-label", info.title);
+    const reload = button("", () => render(host.parentElement), "icon-btn"); reload.innerHTML = '<i class="fas fa-rotate"></i>'; reload.title = "Atualizar possíveis trilhas"; reload.setAttribute("aria-label", reload.title); tools.append(info, reload);
     return tools;
   }
   function draw() {
@@ -107,7 +107,7 @@ window.Journeys = (() => {
     }
     const statusNode = el("div", "journey-status"); statusNode.setAttribute("role", "status"); host.append(statusNode);
     const grid = el("div", "journey-grid"), list = el("section", "journey-list-panel"), detail = el("section", "journey-detail");
-    list.setAttribute("aria-label", "Jornadas encontradas"); detail.setAttribute("aria-label", "Registros da jornada");
+    list.setAttribute("aria-label", "Possíveis trilhas encontradas"); detail.setAttribute("aria-label", "Registros da possível trilha");
     detail.append(el("div", "journey-empty", "Escolha um identificador para acompanhar seus registros no tempo.")); grid.append(list, detail); host.append(grid);
   }
   async function loadIndex() {
@@ -122,7 +122,7 @@ window.Journeys = (() => {
       if (view.page > lastPage) { view.page = lastPage; view.listScroll = 0; return loadIndex(); }
       list.innerHTML = ""; const rows = el("div", "journey-list"); list.append(rows);
       const known = currentField(), coverage = known?.coverage == null ? "" : ` · ${(known.coverage * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% com a chave`;
-      status(`${view.scope === "case" ? "Caso atual" : "Logs abertos"}${backendFilters().length ? " · com filtros" : ""} · ${fmtNum(data.total)} ${heuristic() ? "valores no período" : "jornadas"}${heuristic() ? "" : coverage}${data.missing_key ? ` · ${fmtNum(data.missing_key)} sem chave` : ""}${data.skipped_keys ? ` · ${fmtNum(data.skipped_keys)} chaves muito longas omitidas` : ""}${data.complete === false ? " · resultado parcial" : ""}`, data.complete === false || data.skipped_keys > 0);
+      status(`${view.scope === "case" ? "Caso atual" : "Logs abertos"}${backendFilters().length ? " · com filtros" : ""} · ${fmtNum(data.total)} ${heuristic() ? "valores no período" : "possíveis trilhas"}${heuristic() ? "" : coverage}${data.missing_key ? ` · ${fmtNum(data.missing_key)} sem chave` : ""}${data.skipped_keys ? ` · ${fmtNum(data.skipped_keys)} chaves muito longas omitidas` : ""}${data.complete === false ? " · resultado parcial" : ""}`, data.complete === false || data.skipped_keys > 0);
       for (const group of data.groups || []) {
         const item = button("", () => selectValue(group.value, group), "journey-item"); item.dataset.journeyValue = group.value; item.setAttribute("aria-current", String(view.selected?.value === group.value)); item.title = group.value;
         item.append(el("strong", "", group.value)); const meta = el("div", "journey-item-meta");
@@ -150,13 +150,16 @@ window.Journeys = (() => {
     const copy = button("", () => navigator.clipboard.writeText(selected.value).then(() => toast("Identificador copiado.")).catch(() => toast("Não foi possível copiar.", "err")), "icon-btn"); copy.innerHTML = '<i class="fas fa-copy"></i>'; copy.title = "Copiar identificador"; copy.setAttribute("aria-label", copy.title); title.append(name, copy); head.append(title);
     const metadata = el("div", "journey-detail-meta", view.field); head.append(metadata);
     const actions = el("div", "journey-detail-actions");
-    const explore = button("Ver registros", () => { const filters = [{ column: view.field, op: "equals_exact", value: selected.value, value2: null }]; if (heuristic()) filters.push({ column: "timestamp", op: "between", value: String(view.from), value2: String(view.to) }); window.Discovery.applySelection(filters, view.scope, true); }); actions.append(explore); head.append(actions); detail.append(head);
+    const explore = button("Ver registros", () => { const filters = [{ column: view.field, op: "equals_exact", value: selected.value, value2: null }]; if (heuristic()) filters.push({ column: "timestamp", op: "between", value: String(view.from), value2: String(view.to) }); window.Discovery.applySelection(filters, view.scope, true); });
+    const preserve = button("Guardar em trilha", () => window.CaseTrails?.fromJourney({ scope: view.scope, field: view.field, value: selected.value, filters: backendFilters(), ...timeArgs() }), "btn primary small"); preserve.disabled = true;
+    actions.append(explore, preserve); head.append(actions); detail.append(head);
     const records = el("div", "journey-records"); detail.append(records);
     if (heuristic() && !hasWindow()) { records.append(el("div", "journey-empty", "Escolha um período para consultar relações por usuário ou IP.")); explore.disabled = true; return; }
     busy(records, "Lendo a sequência…");
     try {
       const data = await api("journey_events", { ...base(), ...timeArgs(), field: view.field, value: selected.value, offset: view.detailPage * 100, limit: 100 });
       if (!isActive(token) || version !== view.detailToken) return;
+      preserve.disabled = !data.total;
       const lastPage = Math.max(0, Math.ceil(data.total / 100) - 1);
       if (view.detailPage > lastPage) { view.detailPage = lastPage; view.detailScroll = 0; return loadDetail(); }
       records.innerHTML = ""; const group = selected.group;
@@ -211,11 +214,13 @@ window.Journeys = (() => {
       if (window.WorkspaceContext) await window.WorkspaceContext.setScope(nextScope);
       else state.analyticsScope = nextScope;
     }
+    if (nextScope !== globalScope()) return;
     syncContext();
     if (event) { view.seed = event; view.seedPending = true; view.selected = null; resetRange(); view.page = 0; view.field = ""; view.listScroll = view.detailScroll = 0; }
     await window.Workspace.showPage("journeys");
   }
-  const nav = button("", () => open()); nav.dataset.page = "journeys"; nav.innerHTML = '<i class="fas fa-route"></i>Jornadas'; document.querySelector('.nav-pages [data-page="case-timeline"]').after(nav);
+  const nav = button("", () => open(), ""); nav.dataset.page = "journeys"; nav.innerHTML = '<i class="fas fa-code-branch" aria-hidden="true"></i>Possíveis trilhas'; document.querySelector('.nav-pages [data-page="case-timeline"]').after(nav);
+  const updateNavigation = () => { nav.hidden = false; const authored = document.querySelector('.nav-pages [data-page="case-trails"]'); if (globalScope() === "case" && authored) authored.after(nav); else document.querySelector('.nav-pages [data-page="case-timeline"]').after(nav); }; document.addEventListener("workspace-context-change", updateNavigation); updateNavigation();
   const oldDetail = showDetail;
   showDetail = function(event, ...args) { drawerSource = { event, scope: globalScope() }; return oldDetail(event, ...args); };
   if (typeof caseTimelineCallbacks !== "undefined") caseTimelineCallbacks.detail = event => { showDetail(event); drawerSource = { event, scope: "case" }; };

@@ -11,10 +11,10 @@
     const signature = JSON.stringify(current);
     if (signature !== lastFilters) { history.push(previousSelection); if (history.length > 30) history.shift(); previousSelection = current; lastFilters = signature; cacheKey = ""; }
   }
-  const titles = { summary: "Resumo", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", journeys: "Jornadas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos" };
+  const titles = { summary: "Resumo", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos" };
   const fmtBytes = n => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${fmtNum(Math.ceil(n / 1000))} KB`;
   const pct = n => `${(n * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
-  const localInput = t => { const d = new Date(t); return new Date(t - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
+  const localInput = t => { const d = new Date(t); return new Date(t - d.getTimezoneOffset() * 60000).toISOString().slice(0, 23); };
   const sourceKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt, backendFilters(), state.derivedFields]);
   const note = text => `<div class="notice">${esc(text)}</div>`;
   const iconButton = (action, icon, title, index) => `<button class="icon-btn" data-action="${action}" data-index="${index}" title="${esc(title)}" aria-label="${esc(title)}"><i class="fas ${icon}"></i></button>`;
@@ -25,30 +25,34 @@
     const navPage = next === "timeline" ? "case-timeline" : next;
     document.querySelectorAll("[data-page]").forEach(b => { if (b.tagName === "BUTTON") { b.classList.toggle("selected", b.dataset.page === navPage); b.setAttribute("aria-current", b.dataset.page === navPage ? "page" : "false"); } });
     $("#ws-title").textContent = titles[next] || next;
-    $("#ws-reload").hidden = ["sources", "evidence", "case-timeline", "journeys"].includes(next) || !state.loaded;
+    $("#ws-reload").hidden = ["sources", "evidence", "case-timeline", "case-trails", "journeys"].includes(next) || !state.loaded;
     $("#ws-clear-scope").hidden = !backendFilters().length || next === "evidence";
     updateCounts();
   }
   function updateCounts() {
     $("#ws-evidence-count").textContent = activeCase()?.items?.length || "";
     $("#ws-source-count").textContent = sourceList.length || "";
-    $("#ws-subtitle").textContent = page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : state.loaded ? `${fmtNum(state.total)} eventos${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
+    $("#ws-subtitle").textContent = page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${fmtNum(state.total)} registros do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${fmtNum(state.total)} eventos${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
   }
   async function showPage(next) {
     if (next === "case-timeline" && workspaceScope() === "case" && activeCase()?.workspace?.timelineMode === "volume") next = "timeline";
     if (workspaceScope() === "case" && next === "sources") { await window.WorkspaceContext.setScope("dataset", { page: "sources" }); return; }
-    if (workspaceScope() === "dataset" && next === "evidence" && window.WorkspaceContext && !window.WorkspaceContext.changing) { await window.WorkspaceContext.setScope("case", { page: "evidence" }); return; }
+    if (workspaceScope() === "dataset" && ["evidence", "case-trails"].includes(next) && window.WorkspaceContext && !window.WorkspaceContext.changing) { await window.WorkspaceContext.setScope("case", { page: next }); return; }
     markPage(next); closeDrawer();
     if (next === "case-timeline" && workspaceScope() === "case") {
       home.hidden = true;
       const savedView = activeCase()?.workspace?.analysisView;
-      setAnalysisView([savedView, state.analysisView].find(view => ["timeline", "vtimeline"].includes(view)) || "vtimeline");
+      setAnalysisView([savedView, state.analysisView].find(view => ["timeline", "vtimeline", "timeline-table"].includes(view)) || "vtimeline");
       switchView("caso");
       return;
     }
     if (next === "explore") {
       if (workspaceScope() === "dataset" && !state.loaded) { await showPage("summary"); return; }
-      switchView("viz"); home.hidden = true; await refresh(); return;
+      const contextKey = sourceKey();
+      switchView("viz", { deferAnalytics: true }); home.hidden = true;
+      const refreshed = await refresh({ analytics: false });
+      if (refreshed && page === "explore" && contextKey === sourceKey()) switchTab(state.activeDatasetTab);
+      return;
     }
     switchView("workspace"); home.hidden = false;
     if (next === "journeys") { empty.hidden = true; content.hidden = false; await window.Journeys.render(content); return; }
@@ -56,6 +60,7 @@
     content.hidden = !empty.hidden;
     if (!empty.hidden) return;
     if (next === "evidence") { renderEvidence(); return; }
+    if (next === "case-trails") { window.CaseTrails.render(content, activeCase()); return; }
     if (next === "sources") { await renderSources(); return; }
     if (next === "compare") { await renderCompare(); return; }
     if (next === "timeline" || next === "case-timeline") { await timeline.load(); return; }
@@ -77,7 +82,8 @@
     const version = ++serial, contextKey = sourceKey(); loading();
     startOperation("summary", "Calculando resumo", "Você pode continuar explorando os eventos.");
     try {
-      const data = await getOverview(); if (version !== serial || page !== "summary") return;
+      const data = await getOverview(); if (version !== serial || contextKey !== sourceKey() || page !== "summary") return;
+      state.queryError = null; state.total = data.total; state.dataPeriod = data.start == null ? null : { min: data.start, max: data.end }; updateContextBar();
       if (state.activeOperation?.kind === "summary") finishOperation("Resumo atualizado", `${fmtNum(data.total)} eventos analisados`);
       updateCounts();
       const dated = data.total - data.undated;
@@ -111,7 +117,7 @@
   function applyFilters(filters, replace = false) {
     state.filters = replace ? filters : [...state.filters, ...filters]; state.page = 0; renderChips(); syncCurrentSavedFilter();
     rememberSelection();
-    showPage("explore"); refresh();
+    return showPage("explore");
   }
   function applyRange(start, end) {
     applyFilters([...state.filters.filter(f => f.column !== "timestamp"), { column: "timestamp", op: "between", value: String(start), value2: String(end) }], true);
@@ -122,26 +128,27 @@
     filters: () => backendFilters(),
     isActive: () => page === "timeline" || page === "case-timeline" && workspaceScope() === "dataset",
     applyRange,
-    onMode: mode => { setAnalysisView(mode === "horizontal" ? "timeline" : "vtimeline"); if (activeCase()) { activeCase().workspace.analysisView = state.analysisView; activeCase().workspace.timelineMode = mode; } showPage("case-timeline"); },
+    onMode: mode => { setAnalysisView(mode === "table" ? "timeline-table" : mode === "horizontal" ? "timeline" : "vtimeline"); if (activeCase()) { activeCase().workspace.analysisView = state.analysisView; activeCase().workspace.timelineMode = mode; } showPage("case-timeline"); },
   });
   function undo() { const previous = history.pop(); if (!previous) return; Object.assign(state, previous); state.page = 0; previousSelection = structuredClone(previous); lastFilters = JSON.stringify(previous); $("#quick-search").value = state.quick; renderChips(); syncCurrentSavedFilter(); refresh(); }
   async function renderCompare() {
     const version = ++serial, contextKey = sourceKey(); loading();
     try {
-      const data = await getOverview(); if (version !== serial || page !== "compare") return;
+      const data = await getOverview(); if (version !== serial || contextKey !== sourceKey() || page !== "compare") return;
       if (data.start == null || data.start === data.end) { content.innerHTML = '<div class="quiet-empty">Carregue eventos com horários distintos para comparar períodos.</div>'; return; }
-      const middle = Math.floor((data.start + data.end) / 2 / 60000) * 60000;
-      content.innerHTML = `<section class="ws-card"><form id="ws-compare-form" class="compare-form"><div class="compare-period"><label>Período de referência</label><div><input id="ws-before-start" aria-label="Início da referência" type="datetime-local" required value="${localInput(data.start)}"><input id="ws-before-end" aria-label="Fim da referência" type="datetime-local" required value="${localInput(middle - 60000)}"></div></div><div class="compare-period"><label>Período de análise</label><div><input id="ws-after-start" aria-label="Início da análise" type="datetime-local" required value="${localInput(middle)}"><input id="ws-after-end" aria-label="Fim da análise" type="datetime-local" required value="${localInput(data.end)}"></div></div><button class="btn primary" type="submit">Comparar</button></form></section><div id="ws-comparison"></div>`;
+      const middle = data.start + Math.floor((data.end - data.start) / 2) + 1;
+      content.innerHTML = `<section class="ws-card"><form id="ws-compare-form" class="compare-form"><div class="compare-period"><label>Período de referência</label><div><input id="ws-before-start" aria-label="Início da referência" type="datetime-local" required value="${localInput(data.start)}"><input id="ws-before-end" aria-label="Fim da referência" type="datetime-local" required value="${localInput(middle - 1)}"></div></div><div class="compare-period"><label>Período de análise</label><div><input id="ws-after-start" aria-label="Início da análise" type="datetime-local" required value="${localInput(middle)}"><input id="ws-after-end" aria-label="Fim da análise" type="datetime-local" required value="${localInput(data.end)}"></div></div><button class="btn primary" type="submit">Comparar</button></form></section><div id="ws-comparison"></div>`;
       $("#ws-compare-form").onsubmit = async e => { e.preventDefault(); await runComparison(); };
-      if (middle - 60000 >= data.start) await runComparison();
+      for (const input of content.querySelectorAll('input[type="datetime-local"]')) input.step = "0.001";
+      await runComparison();
     } catch (e) { if (version === serial && contextKey === sourceKey() && page === "compare") failed(e); }
   }
   let comparison = null, comparisonPeriods = null;
   async function runComparison() {
     const contextKey = sourceKey(), version = serial;
     const area = $("#ws-comparison"), button = $("#ws-compare-form button");
-    const before = { start: +new Date($("#ws-before-start").value), end: +new Date($("#ws-before-end").value) + 59999 };
-    const after = { start: +new Date($("#ws-after-start").value), end: +new Date($("#ws-after-end").value) + 59999 };
+    const before = { start: +new Date($("#ws-before-start").value), end: +new Date($("#ws-before-end").value) };
+    const after = { start: +new Date($("#ws-after-start").value), end: +new Date($("#ws-after-end").value) };
     if (![before.start, before.end, after.start, after.end].every(Number.isFinite) || before.start > before.end || after.start > after.end || (before.start <= after.end && after.start <= before.end)) { area.innerHTML = note("Escolha dois períodos válidos, sem sobreposição."); return; }
     button.disabled = true; area.innerHTML = '<div class="ws-loading"><i class="fas fa-circle-notch spin"></i>Comparando…</div>';
     try {
@@ -205,16 +212,27 @@
   async function saveEvent(ev) {
     if (!ev) return;
     if (workspaceScope() === "case") { toast("Este registro já pertence ao Caso.", "info"); return; }
-    const c = ensureCase(); const key = ev.event_ref || `${ev.fields?.caminho || state.currentArtifact?.id}:${ev.id}`;
-    if (c.items.some(it => it.rows?.some(r => (r.event_ref || `${r.fields?.caminho || it.artifactId}:${r.id}`) === key))) { toast("Este evento já está nas evidências.", "info"); return; }
+    const c = ensureCase(); const key = caseRecordKey(ev, state.currentArtifact?.id, state.currentOrigin);
+    if (c.items.some(it => it.rows?.some(r => caseRecordKey(r, it.artifactId, it.origin) === key))) { toast("Este evento já está nas evidências.", "info"); return; }
     c.items.push({ id: nid(), kind: "evento", label: ev.message.split("\n")[0].slice(0, 140), note: "", createdAt: Date.now(), rows: [structuredClone(ev)], sourceFilters: backendFilters(), sourceSpec: structuredClone(state.currentArtifact?.source), foundCount: 1, includedCount: 1, tags: [], relevance: "normal", origin: state.currentOrigin, artifactId: state.currentArtifact?.id, stationId: null });
     if (await saveCases()) { updateCounts(); window.WorkspaceContext?.refreshMembership(); toast("Evento salvo.", "ok"); }
   }
+  let evidencePage = 0, evidenceSearch = "", evidenceCaseId = null;
   function renderEvidence() {
     const c = activeCase(), items = c?.items || []; updateCounts();
-    content.innerHTML = `<div class="source-controls"><button class="btn ghost" id="ws-evidence-export"><i class="fas fa-arrow-up-from-bracket"></i> Exportar evidências</button><button class="btn ghost" id="ws-evidence-advanced">Linha do tempo</button></div>${items.length ? items.map((it, i) => `<article class="ws-card evidence-card"><div class="evidence-top"><div><h2>${esc(it.label || "Evidência")}</h2><span class="subtle">${esc(fmtTs(it.createdAt))}${it.rows?.length ? ` · ${fmtNum(it.rows.length)} eventos preservados` : " · Recorte salvo"}</span></div>${iconButton("remove-evidence", "fa-trash-can", "Remover evidência", i)}</div><textarea class="evidence-note" data-note="${i}" aria-label="Anotação da evidência" placeholder="Anotação ou hipótese…">${esc(it.note || "")}</textarea><div class="evidence-actions">${it.rows?.length ? `<button class="btn ghost small" data-action="evidence-event" data-index="${i}">Ver evento</button>` : ""}<button class="btn ghost small" data-action="reopen-evidence" data-index="${i}">Reabrir recorte</button><span class="tag">${esc(it.relevance || "normal")}</span></div></article>`).join("") : '<section class="ws-card"><p class="quiet-empty">Salve eventos e ocorrências durante a análise. Eles ficam aqui, junto das suas anotações.</p></section>'}`;
-    $("#ws-evidence-export").onclick = () => { openExport(); $("#ws-export-kind").value = "report"; };
+    if (evidenceCaseId !== c?.id) { evidenceCaseId = c?.id; evidencePage = 0; evidenceSearch = ""; }
+    const query = evidenceSearch.toLocaleLowerCase("pt-BR"), selected = items.map((item,index)=>({item,index})).filter(({item})=>!query||[item.label,...Object.values(CaseContent.narrative(item))].join(" ").toLocaleLowerCase("pt-BR").includes(query));
+    const pages = Math.max(1, Math.ceil(selected.length / 40)); evidencePage = Math.min(evidencePage, pages-1);
+    const visible = selected.slice(evidencePage*40,evidencePage*40+40);
+    content.innerHTML = `<div class="source-controls"><button class="btn primary" id="ws-evidence-pdf"><i class="fas fa-file-pdf"></i> Relatório PDF</button><button class="btn ghost" id="ws-evidence-trails"><i class="fas fa-route"></i> Trilhas</button><button class="btn ghost" id="ws-evidence-advanced">Linha do tempo</button><button class="btn ghost" id="ws-evidence-export" title="Exportar a investigação com seus textos e imagens"><i class="fas fa-arrow-up-from-bracket"></i> Exportar</button></div><div class="evidence-list-controls"><input id="ws-evidence-search" type="search" placeholder="Buscar nos itens…" aria-label="Buscar nos itens do Caso" value="${esc(evidenceSearch)}"><span class="muted small">${fmtNum(selected.length)} itens</span><div class="spacer"></div><button class="icon-btn" id="ws-evidence-prev" aria-label="Página anterior" ${evidencePage===0?'disabled':''}><i class="fas fa-chevron-left"></i></button><span class="muted small">${evidencePage+1} / ${pages}</span><button class="icon-btn" id="ws-evidence-next" aria-label="Próxima página" ${evidencePage+1===pages?'disabled':''}><i class="fas fa-chevron-right"></i></button></div>${visible.length ? visible.map(({item:it,index:i}) => { const narrative=CaseContent.narrative(it);return `<article class="ws-card evidence-card" data-item-index="${i}"><div class="evidence-top"><div><h2>${esc(it.label || "Item do Caso")}</h2><span class="subtle">${esc(fmtTs(it.createdAt))}${it.rows?.length ? ` · ${fmtNum(it.rows.length)} registros preservados` : " · Recorte salvo"}</span></div>${iconButton("remove-evidence", "fa-trash-can", "Remover item do Caso", i)}</div>${narrative.summary?`<p class="case-narrative-summary">${esc(narrative.summary)}</p>`:''}${narrative.details?`<details class="case-item-details"><summary>Detalhes</summary><p>${esc(narrative.details)}</p></details>`:''}<div data-item-images></div><div class="evidence-actions"><button class="btn ghost small" data-action="explain-evidence" data-index="${i}"><i class="fas fa-pen-to-square"></i> Explicação e imagens</button>${it.rows?.length ? `<button class="btn ghost small" data-action="evidence-event" data-index="${i}">${it.rows.length>1?'Primeiro registro':'Ver registro'}</button>` : ""}<button class="btn ghost small" data-action="reopen-evidence" data-index="${i}">Reabrir recorte</button>${it.relevance&&it.relevance!=='normal'?`<span class="tag">${esc(it.relevance)}</span>`:''}</div></article>`; }).join("") : '<section class="ws-card"><p class="quiet-empty">Nenhum item encontrado. Salve registros da Análise para reuni-los no Caso.</p></section>'}`;
+    $("#ws-evidence-pdf").onclick = () => CaseReport.open();
+    $("#ws-evidence-trails").onclick = () => showPage("case-trails");
+    $("#ws-evidence-export").onclick = () => { openExport(); $("#ws-export-kind").value = "case"; $("#ws-export-kind").dispatchEvent(new Event("change")); };
     $("#ws-evidence-advanced").onclick = () => showPage("case-timeline");
+    $("#ws-evidence-prev").onclick = () => { evidencePage--; renderEvidence(); };
+    $("#ws-evidence-next").onclick = () => { evidencePage++; renderEvidence(); };
+    $("#ws-evidence-search").oninput = event => { evidenceSearch=event.target.value;evidencePage=0;renderEvidence();const search=$("#ws-evidence-search");search.focus(); };
+    for(const card of content.querySelectorAll("[data-item-index]")){const item=items[+card.dataset.itemIndex];if(item.attachments?.length)CaseContent.mountAttachments(card.querySelector("[data-item-images]"),item);}
     if (removedEvidence?.caseId === c?.id) {
       const restore = el("button", "btn ghost", "Desfazer remoção");
       $("#ws-evidence-advanced").after(restore);
@@ -231,24 +249,23 @@
         if (await saveCases()) { renderCaseBar(); toast("Investigação importada. Selecione-a no menu de casos.", "ok"); }
       } catch (error) { toast(String(error), "err"); }
     };
-    content.querySelectorAll("[data-note]").forEach(t => t.onchange = () => { const it = activeCase()?.items[+t.dataset.note]; if (it) { it.note = t.value; saveCases(); } });
   }
   function report() {
     const c = activeCase();
-    return `# ${c?.name || "Investigação"}\n\n${(c?.items || []).map(it => `## ${it.label}\n\n${it.note || ""}\n\n${it.rows?.length || 0} eventos preservados.\n\n${(it.rows || []).map(e => `- ${fmtTsFull(e.timestamp)} · ${e.source} · ${e.message.replaceAll("\n", " ")}\n  Referência: ${e.event_ref || e.id}`).join("\n")}\n\nFiltros: ${JSON.stringify(it.sourceFilters || [])}`).join("\n\n")}`;
+    return `# ${c?.name || "Investigação"}\n\n${(c?.items || []).map(it => `## ${it.label}\n\n${Object.values(CaseContent.narrative(it)).filter(Boolean).join("\n\n")}\n\n${it.rows?.length || 0} eventos preservados.\n\n${(it.rows || []).map(e => `- ${fmtTsFull(e.timestamp)} · ${e.source} · ${e.message.replaceAll("\n", " ")}\n  Referência: ${e.event_ref || e.id}`).join("\n")}\n\nFiltros: ${JSON.stringify(it.sourceFilters || [])}`).join("\n\n")}`;
   }
-  function openExport() { $("#ws-export-modal").hidden = false; $("#ws-export-kind").focus(); $("#ws-export-scope").textContent = `${fmtNum(state.total)} eventos no recorte atual. A exportação de eventos inclui todos os resultados.`; }
+  function openExport() { $("#ws-export-modal").hidden = false; $("#ws-export-kind").focus(); $("#ws-export-kind").dispatchEvent(new Event("change")); $("#ws-export-scope").textContent = `${fmtNum(state.total)} eventos no recorte atual. A exportação de eventos inclui todos os resultados.`; }
   async function exportFile() {
     const kind = $("#ws-export-kind").value, mask = $("#ws-mask").checked;
+    if (kind === "case-pdf") { $("#ws-export-modal").hidden = true; window.CaseReport.open(); return; }
     const extension = kind === "report" ? "md" : kind === "case" ? "json" : kind;
     const path = await dialogApi.save({ defaultPath: `loginsight.${extension}`, filters: [{ name: extension.toUpperCase(), extensions: [extension] }] });
     if (!path) return; const button = $("#ws-export-save"), restore = btnBusy(button, "Exportando…");
     try {
       if (kind === "report" || kind === "case") {
         const data = kind === "report" ? report() : { schemaVersion: 2, active: activeCase()?.id, cases: activeCase() ? [activeCase()] : [] };
-        const sanitized = mask ? redactValue(data) : data;
-        const text = typeof sanitized === "string" ? sanitized : JSON.stringify(sanitized, null, 2);
-        await api("export_document", { path, content: text });
+        if (kind === "case") await api("export_investigation", { path, data, mask });
+        else await api("export_document", { path, content: mask ? redactValue(data) : data });
       } else { await api("export_events", { path, format: kind, ...analyticsRequest(workspaceScope()), mask }); }
       toast("Arquivo exportado.", "ok"); $("#ws-export-modal").hidden = true;
     } catch {} finally { restore(); }
@@ -260,7 +277,7 @@
     return value;
   }
   content.addEventListener("click", async e => {
-    const source = e.target.closest("[data-source]"); if (source) { applyFilters([{ column: "source", op: "equals", value: source.dataset.source }]); return; }
+    const source = e.target.closest("[data-source]"); if (source) { applyFilters([{ column: "source", op: "equals_exact", value: source.dataset.source }]); return; }
     const b = e.target.closest("[data-action]"); if (!b) return;
     const i = +b.dataset.index, action = b.dataset.action;
     if (["sources", "compare", "explore", "timeline"].includes(action)) { await showPage(action); return; }
@@ -273,6 +290,7 @@
     const item = activeCase()?.items?.[i]; if (!item) return;
     if (action === "remove-evidence") { removedEvidence = { item, caseId: activeCase().id, index: i }; activeCase().items.splice(i, 1); await saveCases(); renderEvidence(); }
     if (action === "evidence-event") { showDetail(item.rows[0], item.sourceSpec); }
+    if (action === "explain-evidence") { await CaseContent.editItem(item.id); }
     if (action === "reopen-evidence") {
       await window.WorkspaceContext?.setScope("dataset", { animate: false });
       if (item.sourceSpec && JSON.stringify(item.sourceSpec) !== JSON.stringify(state.currentArtifact?.source) && !await loadData(item.sourceSpec)) return;
@@ -290,6 +308,7 @@
   $("#ws-reload").onclick = async () => { cacheKey = ""; timeline.invalidate(); await showPage(page); };
   $("#ws-clear-scope").onclick = () => { state.filters = []; state.quick = ""; $("#quick-search").value = ""; state.page = 0; renderChips(); syncCurrentSavedFilter(); refresh().then(() => showPage(page)); };
   $("#ws-export").onclick = openExport; $("#ws-export-close").onclick = () => { $("#ws-export-modal").hidden = true; }; $("#ws-export-save").onclick = exportFile;
+  $("#ws-export-kind").onchange = () => { const wholeCase=["case", "case-pdf", "report"].includes($("#ws-export-kind").value);$("#ws-export-scope").textContent=wholeCase?`Caso completo · ${fmtNum(activeCase()?.items?.length||0)} itens. Imagens acompanham a investigação JSON e o relatório PDF.`:`${fmtNum(state.total)} registros no recorte atual.`;$("#ws-mask").closest("label").hidden=$("#ws-export-kind").value==="case-pdf"; };
   $("#ws-export-modal").onclick = e => { if (e.target.id === "ws-export-modal") e.target.hidden = true; };
   $("#btn-load").onclick = async () => { await loadData(); if (state.loaded) { await loaded(); await showPage("summary"); } };
   $("#btn-merge").onclick = async () => { await loadData(null, { merge: true }); if (state.loaded) { await loaded(); await showPage("summary"); } };
@@ -317,7 +336,7 @@
     const field = ["trace_id", "trace.id", "request_id", "requestId", "correlation_id", "session_id"].find(k => ev.fields?.[k]);
     if (!field) { toast("Nenhum identificador de requisição neste evento.", "info"); return; }
     if (!await restoreDetailSource()) return;
-    applyFilters([{ column: field, op: "equals", value: String(ev.fields[field]) }], true);
+    applyFilters([{ column: field, op: "equals_exact", value: String(ev.fields[field]) }], true);
   };
   document.addEventListener("keydown", e => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") { e.preventDefault(); openFiles(); }
@@ -337,6 +356,7 @@
   window.__TAURI__.event?.listen("tauri://drag-drop", ({ payload }) => { $("#ws-drop").hidden = true; if (payload?.paths?.length) openFiles(false, state.loaded, payload.paths); }).catch(() => {});
   window.Workspace = {
     loaded, showPage, saveEvent,
+    openItem: itemId => { const item=activeCase()?.items?.find(item=>item.id===itemId);if(item?.rows?.length)showDetail(item.rows[0],item.sourceSpec); },
     page: () => page,
     capture: () => ({ history: structuredClone(history), previousSelection: structuredClone(previousSelection), lastFilters, timeline: timeline.capture() }),
     restore: snapshot => { serial++; cacheKey = ""; overview = null; pendingOverview = null; history.splice(0, history.length, ...(snapshot?.history || [])); previousSelection = snapshot?.previousSelection || { filters: structuredClone(state.filters), quick: state.quick }; lastFilters = snapshot?.lastFilters || JSON.stringify(previousSelection); timeline.restore(snapshot?.timeline); },
@@ -344,7 +364,7 @@
     onView(which) {
       if (which === "workspace") return;
       home.hidden = true;
-      markPage(which === "viz" || which === "trail" ? "explore" : which === "source" ? "sources" : which === "caso" && ["timeline", "vtimeline"].includes(state.analysisView) ? "case-timeline" : "evidence");
+      markPage(which === "viz" || which === "trail" ? "explore" : which === "source" ? "sources" : which === "caso" && ["timeline", "vtimeline", "timeline-table"].includes(state.analysisView) ? "case-timeline" : "evidence");
     },
     onRefresh() {
       rememberSelection();
