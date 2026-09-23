@@ -118,7 +118,7 @@ window.CaseTimeline = (() => {
       <div class="ct-hint">Clique para selecionar · Shift + clique para agrupar · arraste uma barra para mudar o lado · botão direito para editar</div>
       ${horizontal ? '<div class="ct-minimap" title="Clique para navegar pela linha do tempo"><div class="ct-minimap-track"></div><div class="ct-minimap-window"></div></div>' : ""}
       <div class="ct-scroll"><div class="ct-board" style="${horizontal ? `width:${actualWidth}px;height:${height}px` : `height:${height}px`}">
-        <div class="ct-axis"></div><svg class="ct-links" aria-hidden="true"></svg><div class="ct-items"></div><div class="ct-notes"></div></div></div>
+        <div class="ct-axis"></div><svg class="ct-links" aria-hidden="true"></svg><div class="ct-items"></div><div class="ct-notes"></div><svg class="ct-controls" aria-label="Controles da curva"></svg></div></div>
       <div class="ct-editor-backdrop" hidden><form class="ct-editor"><div class="ct-editor-head"><strong></strong><button type="button" class="ct-close" aria-label="Fechar">×</button></div><div class="ct-editor-fields"></div><div class="ct-editor-actions"><button type="button" class="btn ghost small ct-cancel">Cancelar</button><button type="submit" class="btn primary small">Salvar</button></div></form></div></div>`;
     const shell = box.querySelector(".ct-shell"), board = shell.querySelector(".ct-board");
     const itemLayer = shell.querySelector(".ct-items"), noteLayer = shell.querySelector(".ct-notes");
@@ -150,7 +150,9 @@ window.CaseTimeline = (() => {
         fields.innerHTML = `<label>Nome<input name="name" maxlength="120" required value="${safe(entry?.title || "")}"></label><label>Início<input name="start" type="datetime-local" step="1" required value="${local(entry?.start || time || Date.now())}"></label><label>Fim <span>(opcional)</span><input name="end" type="datetime-local" step="1" value="${entry?.end > entry?.start ? local(entry.end) : ""}"></label><label>Descrição<textarea name="description" rows="3" maxlength="1200">${safe(entry?.detail || "")}</textarea></label>`;
       } else if (type === "annotation") {
         heading.textContent = entry ? "Editar nota" : "Nova nota";
-        fields.innerHTML = `<label>Texto <span>(opcional com ícone)</span><textarea name="text" rows="4" maxlength="1500">${safe(entry?.text || "")}</textarea></label><label>Ícone<select name="icon"><option value="" ${entry?.icon === "" ? "selected" : ""}>Sem ícone</option>${ICONS.map(icon => `<option value="${icon}" ${entry?.icon === icon || !entry && icon === ICONS[0] ? "selected" : ""}>${({"fa-comment":"Comentário","fa-triangle-exclamation":"Atenção","fa-shield-halved":"Proteção","fa-key":"Acesso","fa-link":"Relação","fa-circle-info":"Informação"})[icon]}</option>`).join("")}</select></label><label>Pontas<select name="arrow"><option value="forward" ${!entry || entry.arrow === "forward" ? "selected" : ""}>Para a nota</option><option value="back" ${entry?.arrow === "back" ? "selected" : ""}>Para o título</option><option value="both" ${entry?.arrow === "both" ? "selected" : ""}>Nas duas pontas</option><option value="none" ${entry?.arrow === "none" ? "selected" : ""}>Sem pontas</option></select></label><label>Traço<select name="lineStyle"><option value="solid" ${!entry || !entry.lineStyle || entry.lineStyle === "solid" ? "selected" : ""}>Contínuo</option><option value="dashed" ${entry?.lineStyle === "dashed" ? "selected" : ""}>Tracejado</option><option value="dotted" ${entry?.lineStyle === "dotted" ? "selected" : ""}>Pontilhado</option></select></label>`;
+        const modeKey = horizontal ? "horizontal" : "vertical";
+        const sideOptions = selected => [["auto", "Automático"], ["left", "Esquerda"], ["right", "Direita"], ["top", "Cima"], ["bottom", "Baixo"]].map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`).join("");
+        fields.innerHTML = `<label>Texto <span>(opcional com ícone)</span><textarea name="text" rows="4" maxlength="1500">${safe(entry?.text || "")}</textarea></label><label>Ícone<select name="icon"><option value="" ${entry?.icon === "" ? "selected" : ""}>Sem ícone</option>${ICONS.map(icon => `<option value="${icon}" ${entry?.icon === icon || !entry && icon === ICONS[0] ? "selected" : ""}>${({"fa-comment":"Comentário","fa-triangle-exclamation":"Atenção","fa-shield-halved":"Proteção","fa-key":"Acesso","fa-link":"Relação","fa-circle-info":"Informação"})[icon]}</option>`).join("")}</select></label><label>Pontas<select name="arrow"><option value="forward" ${!entry || entry.arrow === "forward" ? "selected" : ""}>Para a nota</option><option value="back" ${entry?.arrow === "back" ? "selected" : ""}>Para o título</option><option value="both" ${entry?.arrow === "both" ? "selected" : ""}>Nas duas pontas</option><option value="none" ${entry?.arrow === "none" ? "selected" : ""}>Sem pontas</option></select></label><label>Traço<select name="lineStyle"><option value="solid" ${!entry || !entry.lineStyle || entry.lineStyle === "solid" ? "selected" : ""}>Contínuo</option><option value="dashed" ${entry?.lineStyle === "dashed" ? "selected" : ""}>Tracejado</option><option value="dotted" ${entry?.lineStyle === "dotted" ? "selected" : ""}>Pontilhado</option></select></label><label>Saída do título<select name="startSide">${sideOptions(entry?.endpoints?.[modeKey]?.start || "auto")}</select></label><label>Chegada à nota<select name="endSide">${sideOptions(entry?.endpoints?.[modeKey]?.end || "auto")}</select></label>`;
       } else {
         heading.textContent = "Editar título";
         fields.innerHTML = `<label>Nome<input name="name" maxlength="120" required value="${safe(entry?.title || "")}"></label>`;
@@ -175,6 +177,7 @@ window.CaseTimeline = (() => {
           const selected = selectedEntries()[0] || entries[0];
           const annotation = entry || { id: uniqueId("n"), anchor: selected.members?.[0]?.id || selected.id };
           Object.assign(annotation, { text: String(values.get("text")).trim(), icon: String(values.get("icon")), arrow: String(values.get("arrow")), lineStyle: String(values.get("lineStyle")) });
+          (annotation.endpoints ||= {})[horizontal ? "horizontal" : "vertical"] = { start: String(values.get("startSide")), end: String(values.get("endSide")) };
           if (!entry) config.annotations.push(annotation);
         } else if (entry) {
           const name = String(values.get("name")).trim();
@@ -203,11 +206,24 @@ window.CaseTimeline = (() => {
       }
     };
 
+    const rangeLanes = new Map(), occupiedLanes = { left: [], right: [] };
+    entries.forEach((entry, index) => {
+      if (entry.end <= entry.start) return;
+      const side = config.layout[entry.id]?.side || (index % 2 ? "right" : "left");
+      const lanes = occupiedLanes[side];
+      let lane = lanes.findIndex(lastEnd => lastEnd < entry.start);
+      if (lane < 0) lane = lanes.length;
+      lanes[lane] = entry.end;
+      rangeLanes.set(entry.id, lane);
+    });
+    const laneStep = horizontal ? 8 : 9;
+    const rangeGutter = { left: Math.max(0, occupiedLanes.left.length - 1) * laneStep, right: Math.max(0, occupiedLanes.right.length - 1) * laneStep };
     const entryNodes = new Map();
     entries.forEach((entry, index) => {
       const point = points[index], saved = config.layout[entry.id] || {};
       const side = saved.side || (index % 2 ? "right" : "left");
       const offset = clamp(saved.offset || 0, 0, 100);
+      const lane = rangeLanes.get(entry.id) || 0, gutter = rangeGutter[side];
       const node = document.createElement("article");
       node.className = `ct-entry ${entry.type === "manual" ? "is-manual" : ""} ${entry.end > entry.start ? "has-range" : ""}`;
       node.dataset.id = entry.id; node.style.setProperty("--entry-color", entry.color);
@@ -215,7 +231,9 @@ window.CaseTimeline = (() => {
       node.title = `${entry.title}\n${entry.source} · ${when(entry.start)}${entry.end > entry.start ? ` → ${when(entry.end)}` : ""}${entry.detail ? `\n${entry.detail}` : ""}`;
       node.innerHTML = `<strong>${safe(entry.title)}</strong>${entry.rows.length > 1 ? `<span class="ct-entry-count">${entry.rows.length}</span>` : ""}<button class="ct-open" type="button" title="Abrir detalhes" aria-label="Abrir detalhes"><i class="fas fa-arrow-up-right-from-square"></i></button>`;
       node.style.setProperty("--entry-offset", `${offset}px`);
-      if (horizontal) { node.style.left = `${point.x}px`; node.style.top = `${side === "left" ? centerY - 48 - offset * .5 : centerY + 25 + offset * .5}px`; }
+      node.style.setProperty("--range-gutter", `${gutter}px`);
+      node.style.setProperty("--range-lane", `${lane * laneStep}px`);
+      if (horizontal) { node.style.left = `${point.x}px`; node.style.top = `${side === "left" ? centerY - 48 - offset * .5 - gutter : centerY + 25 + offset * .5 + gutter}px`; }
       else node.style.top = `${point.y - 11}px`;
       const open = () => { if (entry.type === "manual") openEditor("manual", entry); else if (entry.rows.length === 1) callbacks.detail(entry.rows[0]); else callbacks.bucket(node.getBoundingClientRect().left, node.getBoundingClientRect().bottom, entry.rows); };
       node.querySelector(".ct-open").onclick = event => { event.stopPropagation(); open(); };
@@ -244,7 +262,8 @@ window.CaseTimeline = (() => {
       node.onpointerup = event => { if (!drag) return; if (drag.moved) {
         const rect = board.getBoundingClientRect();
         const side = horizontal ? (node.offsetTop < centerY ? "left" : "right") : (node.offsetLeft + node.offsetWidth / 2 < rect.width / 2 ? "left" : "right");
-        const offset = horizontal ? clamp(Math.abs(node.offsetTop - centerY) - 25, 0, 100) : clamp(side === "left" ? rect.width / 2 - 30 - node.offsetLeft - node.offsetWidth : node.offsetLeft - rect.width / 2 - 30, 0, 100);
+        const sideGutter = rangeGutter[side];
+        const offset = horizontal ? clamp(Math.abs(node.offsetTop - centerY) - 25 - sideGutter, 0, 100) : clamp(side === "left" ? rect.width / 2 - 30 - sideGutter - node.offsetLeft - node.offsetWidth : node.offsetLeft - rect.width / 2 - 30 - sideGutter, 0, 100);
         config.layout[entry.id] = { side, offset }; callbacksSave();
         node.onclick = null;
       } else if (!horizontal) node.style.right = ""; drag = null; node.classList.remove("dragging"); };
@@ -265,17 +284,30 @@ window.CaseTimeline = (() => {
       }
       if (entry.end > entry.start) {
         const bar = document.createElement("div"); bar.className = "ct-range-bar"; bar.style.background = entry.color;
-        if (horizontal) { bar.style.left = `${point.x}px`; bar.style.width = `${Math.max(14, positionFor(entry.end) - point.x)}px`; bar.style.top = `${side === "left" ? centerY - 14 : centerY + 11}px`; }
-        else { bar.style.top = `${point.y}px`; bar.style.height = `${Math.max(14, positionFor(entry.end) - point.y)}px`; bar.style.left = `calc(50% ${side === "left" ? "-" : "+"} 10px)`; }
+        if (horizontal) { bar.style.left = `${point.x}px`; bar.style.width = `${Math.max(14, positionFor(entry.end) - point.x)}px`; bar.style.top = `${side === "left" ? centerY - 14 - lane * laneStep : centerY + 11 + lane * laneStep}px`; }
+        else { bar.style.top = `${point.y}px`; bar.style.height = `${Math.max(14, positionFor(entry.end) - point.y)}px`; bar.style.left = `calc(50% ${side === "left" ? "-" : "+"} ${side === "left" ? 17 + lane * laneStep : 14 + lane * laneStep}px)`; }
         itemLayer.appendChild(bar);
       }
     });
     const anchorIndex = annotation => entries.findIndex(entry => entry.id === annotation.anchor || entry.members?.some(member => member.id === annotation.anchor || `a:${member.id}` === annotation.anchor));
+    const pointOnSide = (r, side) => {
+      const middleX = r.left + r.width / 2, middleY = r.top + r.height / 2;
+      if (side === "left") return { x: r.left - 7, y: middleY };
+      if (side === "right") return { x: r.right + 7, y: middleY };
+      if (side === "top") return { x: middleX, y: r.top - 7 };
+      return { x: middleX, y: r.bottom + 7 };
+    };
+    const nearestSide = (r, x, y) => ["left", "right", "top", "bottom"].reduce((best, side) => {
+      const point = pointOnSide(r, side);
+      const distance = Math.hypot(x - point.x, y - point.y);
+      return distance < best.distance ? { side, distance } : best;
+    }, { side: "left", distance: Infinity }).side;
     let curveEditId = null, curveDrag = null;
     const redrawLinks = () => {
-      const svg = shell.querySelector(".ct-links"), rect = board.getBoundingClientRect();
+      const svg = shell.querySelector(".ct-links"), controls = shell.querySelector(".ct-controls"), rect = board.getBoundingClientRect();
       svg.setAttribute("viewBox", `0 0 ${rect.width} ${board.offsetHeight}`);
-      svg.replaceChildren();
+      controls.setAttribute("viewBox", `0 0 ${rect.width} ${board.offsetHeight}`);
+      svg.replaceChildren(); controls.replaceChildren();
       for (const annotation of config.annotations) {
         const anchor = anchorIndex(annotation);
         if (anchor < 0) continue;
@@ -287,7 +319,10 @@ window.CaseTimeline = (() => {
         const axisY = horizontal ? centerY : points[anchor].y;
         const noteX = nr.left - rect.left + nr.width / 2;
         const noteY = nr.top - rect.top + nr.height / 2;
-        const target = horizontal && noteY < axisY && label ? label : icon || label;
+        const modeKey = horizontal ? "horizontal" : "vertical";
+        const startSide = annotation.endpoints?.[modeKey]?.start || "auto";
+        const endSide = annotation.endpoints?.[modeKey]?.end || "auto";
+        const target = endSide === "top" && icon ? icon : endSide === "bottom" && label ? label : horizontal && noteY < axisY && label ? label : icon || label;
         const tr = target?.getBoundingClientRect() || nr;
         const noteSide = Math.sign(horizontal ? noteY - axisY : noteX - axisX) || 1;
         const title = entryNodes.get(entries[anchor].id)?.querySelector("strong");
@@ -296,7 +331,11 @@ window.CaseTimeline = (() => {
         const titleX = titleRect.left - rect.left + titleRect.width / 2;
         const titleY = titleRect.top - rect.top + titleRect.height / 2;
         let x1, y1, sourceAbove = false;
-        if (horizontal) {
+        if (startSide !== "auto") {
+          const point = pointOnSide(titleRect, startSide);
+          x1 = point.x - rect.left; y1 = point.y - rect.top;
+          sourceAbove = startSide === "top";
+        } else if (horizontal) {
           x1 = titleX;
           if (noteY < titleRect.top - rect.top - 8) { y1 = titleRect.top - rect.top - 7; sourceAbove = true; }
           else if (noteY > titleRect.bottom - rect.top + 8) y1 = titleRect.bottom - rect.top + 7;
@@ -313,8 +352,9 @@ window.CaseTimeline = (() => {
             y1 = (sourceAbove ? titleRect.top - 7 : titleRect.bottom + 7) - rect.top;
           }
         }
-        const x2 = horizontal ? tr.left - rect.left + tr.width / 2 : (noteSide > 0 ? tr.left : tr.right) - rect.left - noteSide * 7;
-        const y2 = horizontal ? (noteSide > 0 ? tr.top : tr.bottom) - rect.top - noteSide * 7 : tr.top - rect.top + tr.height / 2;
+        const endPoint = endSide === "auto" ? null : pointOnSide(tr, endSide);
+        const x2 = endPoint ? endPoint.x - rect.left : horizontal ? tr.left - rect.left + tr.width / 2 : (noteSide > 0 ? tr.left : tr.right) - rect.left - noteSide * 7;
+        const y2 = endPoint ? endPoint.y - rect.top : horizontal ? (noteSide > 0 ? tr.top : tr.bottom) - rect.top - noteSide * 7 : tr.top - rect.top + tr.height / 2;
         const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
         const dx = x2 - x1, dy = y2 - y1;
         let c1x, c1y, c2x, c2y;
@@ -355,13 +395,29 @@ window.CaseTimeline = (() => {
           handle.setAttribute("cx", defaultMidX + curve.dx); handle.setAttribute("cy", defaultMidY + curve.dy);
           handle.setAttribute("r", "7"); handle.setAttribute("fill", color);
           handle.setAttribute("title", "Arraste para ajustar a curva");
-          handle.onpointerdown = event => { event.preventDefault(); event.stopPropagation(); curveDrag = { annotation, midX: defaultMidX, midY: defaultMidY, pointerId: event.pointerId }; board.setPointerCapture(event.pointerId); };
-          svg.appendChild(handle);
+          handle.onpointerdown = event => { event.preventDefault(); event.stopPropagation(); curveDrag = { kind: "midpoint", annotation, midX: defaultMidX, midY: defaultMidY, pointerId: event.pointerId }; board.setPointerCapture(event.pointerId); };
+          controls.appendChild(handle);
+          for (const [endpoint, x, y, targetRect] of [["start", x1, y1, titleRect], ["end", x2, y2, tr]]) {
+            const grip = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            grip.setAttribute("class", "ct-endpoint-handle"); grip.setAttribute("data-endpoint", endpoint);
+            grip.setAttribute("cx", x); grip.setAttribute("cy", y); grip.setAttribute("r", "6");
+            grip.setAttribute("stroke", color);
+            grip.setAttribute("aria-label", endpoint === "start" ? "Mover saída do título" : "Mover chegada à nota");
+            grip.onpointerdown = event => { event.preventDefault(); event.stopPropagation(); curveDrag = { kind: "endpoint", annotation, endpoint, targetRect, pointerId: event.pointerId }; board.setPointerCapture(event.pointerId); };
+            controls.appendChild(grip);
+          }
         }
       }
     };
     board.onpointermove = event => {
       if (!curveDrag || event.pointerId !== curveDrag.pointerId) return;
+      if (curveDrag.kind === "endpoint") {
+        const modeKey = horizontal ? "horizontal" : "vertical";
+        const endpoints = (curveDrag.annotation.endpoints ||= {});
+        (endpoints[modeKey] ||= { start: "auto", end: "auto" })[curveDrag.endpoint] = nearestSide(curveDrag.targetRect, event.clientX, event.clientY);
+        redrawLinks();
+        return;
+      }
       const rect = board.getBoundingClientRect();
       (curveDrag.annotation.curve ||= {})[horizontal ? "horizontal" : "vertical"] = {
         dx: event.clientX - rect.left - curveDrag.midX,
