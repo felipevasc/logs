@@ -1,15 +1,22 @@
 {
   "name": "loginsight",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "prepare:frontend": "node scripts/prepare-frontend.mjs",
+    "preview": "node --watch scripts/preview/serve.mjs 4173",
+    "vendor:timeline": "node scripts/vendor-timeline-export.mjs",
+    "vendor:icons": "node scripts/vendor-note-icons.mjs",
     "dev": "npm run prepare:frontend && tauri dev",
     "build": "npm run prepare:frontend && tauri build",
     "icon": "tauri icon"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
+  },
+  "dependencies": {
+    "html-to-image": "1.11.13",
+    "jspdf": "4.2.1"
   }
 }

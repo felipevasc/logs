@@ -1,0 +1,61 @@
+.remote-overlay { z-index:190; padding:20px; }
+.remote-modal { width:min(980px, 100%); max-width:980px; max-height:calc(100vh - 40px); display:flex; flex-direction:column; overflow:hidden; }
+.remote-modal .modal-head { flex:0 0 auto; align-items:flex-start; padding:18px 20px; }
+.remote-modal .modal-head h3 { font-size:19px; margin:0 0 5px; }
+.remote-modal .modal-head p { font-size:12px; color:var(--text-1); margin:0; }
+.remote-body { display:grid; grid-template-columns:235px minmax(0, 1fr); min-height:0; overflow:hidden; }
+.remote-saved { padding:18px 12px; border-right:1px solid var(--border); overflow:auto; background:var(--bg-0); }
+.remote-list-head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:0 0 14px; }
+.remote-list-head strong { font-size:11px; color:var(--text-1); font-weight:500; }
+.remote-list-head button { margin-left:auto; }
+#rs-list { display:flex; flex-direction:column; gap:7px; }
+.remote-list-empty { font-size:12px; color:var(--text-1); line-height:1.7; padding:8px 4px; }
+.remote-connection { display:flex; flex-direction:column; align-items:flex-start; gap:5px; width:100%; border:1px solid var(--border); border-radius:8px; padding:11px; background:var(--bg-1); color:var(--text-0); cursor:pointer; text-align:left; }
+.remote-connection:hover,.remote-connection[aria-selected="true"] { border-color:var(--accent); background:var(--accent-soft); }
+.remote-connection-name { max-width:100%; overflow:hidden; text-overflow:ellipsis; font-size:12px; font-weight:600; }
+.remote-connection-kind { color:var(--accent); font-size:10px; }
+.remote-connection-detail { font-size:10px; line-height:1.5; color:var(--text-1); overflow-wrap:anywhere; }
+#rs-reload { margin:16px 0 0; font-size:11px; }
+.remote-form { margin:0; padding:18px 22px 14px; overflow:auto; min-width:0; }
+.remote-form fieldset { min-width:0; margin:0; padding:0; border:0; }
+.remote-form-heading { display:flex; align-items:baseline; gap:8px; margin-bottom:16px; }
+.remote-form-heading h4 { font-size:14px; margin:0; }
+#rs-saved-state { color:var(--text-2); font-size:10px; margin-left:auto; }
+.remote-grid { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:14px; }
+.remote-grid label { display:flex; flex-direction:column; gap:6px; font-size:12px; font-weight:500; min-width:0; }
+.remote-wide { grid-column:1/-1; }
+.remote-grid input,.remote-grid select,.remote-form textarea { width:100%; min-width:0; padding:8px 10px; border:1px solid var(--border-strong); border-radius:6px; background:var(--bg-0); color:var(--text-0); font:inherit; font-size:12px; }
+.remote-form textarea { margin-top:8px; resize:vertical; font-family:var(--font-mono); line-height:1.55; }
+.remote-form input:focus,.remote-form select:focus,.remote-form textarea:focus { outline:2px solid var(--accent); outline-offset:1px; }
+.remote-optional { color:var(--text-2); font-weight:400; font-size:10px; }
+.remote-help { color:var(--text-1); font-weight:400; font-size:11px; line-height:1.6; }
+.remote-help code { font-size:10px; }
+.remote-check { display:flex; gap:8px; align-items:center; font-size:12px; margin-top:16px; }
+.remote-check input { width:15px; height:15px; accent-color:var(--accent); }
+#rs-secret-note { margin:5px 0 14px 23px; }
+.remote-options { border-top:1px solid var(--border); padding:12px 0; }
+.remote-options summary { font-size:12px; cursor:pointer; font-weight:550; }
+.remote-options[open] summary { margin-bottom:14px; }
+.remote-options .remote-help { margin:10px 0 0; }
+.remote-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-top:8px; border-top:1px solid var(--border); padding-top:16px; }
+.remote-actions .btn { font-size:11px; padding:8px 10px; }
+#rs-delete { color:var(--lv-erro); padding-left:0; }
+.remote-status { display:flex; flex-wrap:wrap; align-items:center; gap:10px; min-height:44px; margin-top:14px; font-size:11px; line-height:1.6; color:var(--text-1); padding:10px 12px; border-radius:7px; background:var(--bg-2); }
+#rs-status-text { flex:1; min-width:180px; overflow-wrap:anywhere; }
+.remote-status[data-kind="error"] { color:var(--lv-erro); }
+.remote-status[data-kind="success"] { color:var(--accent); }
+.remote-status[data-kind="warning"] { color:var(--lv-aviso); }
+.remote-form[aria-busy="true"] fieldset { opacity:.72; }
+.remote-form [disabled],.remote-connection:disabled { cursor:default; }
+#ws-remote-empty { margin:4px 0 0; }
+@media(max-width:760px) {
+  .remote-overlay { padding:8px; }
+  .remote-modal { max-height:calc(100vh - 16px); }
+  .remote-body { grid-template-columns:1fr; overflow:auto; }
+  .remote-saved { border-right:0; border-bottom:1px solid var(--border); max-height:175px; overflow:auto; }
+  #rs-list { flex-direction:row; }
+  .remote-connection { min-width:190px; max-width:230px; }
+  .remote-form { padding:16px; overflow:visible; }
+  .remote-grid { gap:12px; }
+  .remote-actions .spacer { display:none; }
+}

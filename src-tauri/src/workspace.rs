@@ -135,6 +135,8 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
             "not_contains",
             "equals",
             "not_equals",
+            "equals_exact",
+            "not_equals_exact",
             "starts_with",
             "regex",
             "gt",
@@ -145,6 +147,7 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
             "empty",
             "not_empty",
             "pattern",
+            "threat_rule",
         ]
         .contains(&f.op.as_str())
         {
@@ -152,6 +155,12 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
         }
         if f.op == "regex" {
             regex::Regex::new(&f.value).map_err(|e| format!("Expressão inválida: {e}"))?;
+        }
+        if f.op == "threat_rule" {
+            if f.column != "_all" {
+                return Err("O filtro de ameaça deve usar a coluna _all.".into());
+            }
+            crate::threats::matcher(&f.value, None)?;
         }
         if ["gt", "gte", "lt", "lte", "between"].contains(&f.op.as_str()) {
             let parse = |v: &str| {
@@ -188,7 +197,25 @@ pub fn cancel_operation() {
 }
 
 pub fn overview_impl(state: &AppState, filters: Vec<Filter>) -> Result<insights::Overview, String> {
+    overview_scope_impl(state, filters, None)
+}
+pub fn overview_scope_impl(
+    state: &AppState,
+    filters: Vec<Filter>,
+    case_events: Option<&[Event]>,
+) -> Result<insights::Overview, String> {
     validate(&filters)?;
+    if let Some(events) = case_events {
+        let prepared = query::prepare(&filters);
+        let result = insights::overview(|| {
+            events
+                .iter()
+                .filter(|event| prepared.iter().all(|filter| query::matches(event, filter)))
+                .cloned()
+        });
+        crate::operations::check()?;
+        return Ok(result);
+    }
     Ok(with_selection(state, &filters, |selection| {
         insights::overview(|| selection.iter())
     }))
@@ -196,9 +223,17 @@ pub fn overview_impl(state: &AppState, filters: Vec<Filter>) -> Result<insights:
 #[tauri::command]
 pub async fn dataset_overview(
     filters: Vec<Filter>,
+    case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<insights::Overview, String> {
-    crate::offload(move || overview_impl(app.state::<AppState>().inner(), filters)).await?
+    crate::offload(move || {
+        overview_scope_impl(
+            app.state::<AppState>().inner(),
+            filters,
+            case_events.as_deref(),
+        )
+    })
+    .await?
 }
 
 #[derive(Serialize)]
@@ -228,6 +263,16 @@ pub fn timeline_range_impl(
     end: i64,
     bucket_count: usize,
 ) -> Result<TimelineRange, String> {
+    timeline_range_scope_impl(state, filters, start, end, bucket_count, None)
+}
+pub fn timeline_range_scope_impl(
+    state: &AppState,
+    filters: Vec<Filter>,
+    start: i64,
+    end: i64,
+    bucket_count: usize,
+    case_events: Option<&[Event]>,
+) -> Result<TimelineRange, String> {
     validate(&filters)?;
     if start > end {
         return Err("O início deve ser anterior ao fim.".into());
@@ -245,6 +290,9 @@ pub fn timeline_range_impl(
     let width = (span / bucket_count as i64)
         .saturating_add(i64::from(span % bucket_count as i64 != 0))
         .max(1);
+    // Rounding the bucket width up can otherwise create empty buckets beyond
+    // the requested end, especially when zoomed into a sub-second interval.
+    let bucket_count = (((span - 1) / width + 1) as usize).min(bucket_count);
     let mut result = TimelineRange {
         start,
         end,
@@ -265,7 +313,7 @@ pub fn timeline_range_impl(
         if timestamp < start || timestamp > end {
             return;
         }
-        let index = ((timestamp - start) / width) as usize;
+        let index = (timestamp.saturating_sub(start) / width) as usize;
         let bucket = &mut result.buckets[index.min(bucket_count - 1)];
         bucket.count += 1;
         result.total += 1;
@@ -277,6 +325,18 @@ pub fn timeline_range_impl(
             result.warnings += 1;
         }
     };
+    if let Some(events) = case_events {
+        let prepared = query::prepare(&scoped_filters);
+        for event in events {
+            crate::operations::check()?;
+            if prepared.iter().all(|filter| query::matches(event, filter)) {
+                if let Some(timestamp) = event.timestamp {
+                    add(timestamp, &event.level);
+                }
+            }
+        }
+        return Ok(result);
+    }
     let source = state.source.read();
     match &*source {
         SourceData::Indexed(idx) => {
@@ -329,15 +389,26 @@ pub async fn timeline_range(
     start: i64,
     end: i64,
     bucket_count: usize,
+    case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<TimelineRange, String> {
     crate::offload(move || {
-        timeline_range_impl(
+        if case_events.is_none() {
+            return timeline_range_impl(
+                app.state::<AppState>().inner(),
+                filters,
+                start,
+                end,
+                bucket_count,
+            );
+        }
+        timeline_range_scope_impl(
             app.state::<AppState>().inner(),
             filters,
             start,
             end,
             bucket_count,
+            case_events.as_deref(),
         )
     })
     .await?
@@ -347,10 +418,23 @@ pub async fn compare_periods(
     filters: Vec<Filter>,
     before: insights::Period,
     after: insights::Period,
+    case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<insights::Comparison, String> {
-    crate::offload(move || compare_impl(app.state::<AppState>().inner(), filters, before, after))
-        .await?
+    crate::offload(move || {
+        if case_events.is_none() {
+            compare_impl(app.state::<AppState>().inner(), filters, before, after)
+        } else {
+            compare_scope_impl(
+                app.state::<AppState>().inner(),
+                filters,
+                before,
+                after,
+                case_events.as_deref(),
+            )
+        }
+    })
+    .await?
 }
 pub fn compare_impl(
     state: &AppState,
@@ -358,12 +442,34 @@ pub fn compare_impl(
     before: insights::Period,
     after: insights::Period,
 ) -> Result<insights::Comparison, String> {
+    compare_scope_impl(state, filters, before, after, None)
+}
+pub fn compare_scope_impl(
+    state: &AppState,
+    filters: Vec<Filter>,
+    before: insights::Period,
+    after: insights::Period,
+    case_events: Option<&[Event]>,
+) -> Result<insights::Comparison, String> {
     validate(&filters)?;
     if before.start > before.end || after.start > after.end {
         return Err("Revise os intervalos de comparação.".into());
     }
     if before.start <= after.end && after.start <= before.end {
         return Err("Os períodos não podem se sobrepor.".into());
+    }
+    if let Some(events) = case_events {
+        let prepared = query::prepare(&filters);
+        let result = insights::compare(
+            events
+                .iter()
+                .filter(|event| prepared.iter().all(|filter| query::matches(event, filter)))
+                .cloned(),
+            &before,
+            &after,
+        );
+        crate::operations::check()?;
+        return Ok(result);
     }
     Ok(with_selection(state, &filters, |s| {
         insights::compare(s.iter(), &before, &after)
@@ -557,6 +663,7 @@ pub async fn export_events(
     format: String,
     filters: Vec<Filter>,
     mask: bool,
+    case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<usize, String> {
     crate::offload(move || {
@@ -577,48 +684,123 @@ pub async fn export_events(
                 return Err("Escolha outro arquivo para não substituir a fonte.".into());
             }
         }
-        let temp = requested.with_extension(format!("{}.exporting", uuid::Uuid::new_v4()));
-        let result = (|| {
-            let mut file = BufWriter::new(std::fs::File::create(&temp).map_err(|e| e.to_string())?);
-            let mut count = 0;
-            with_selection(state.inner(), &filters, |s| -> Result<(), String> {
-                let mut columns:Vec<String>=crate::model::STANDARD_COLUMNS.iter().map(|v|v.to_string()).collect();
-                columns.extend(["id","event_ref","parse_status","raw"].map(str::to_string));
-                if format=="csv" {
-                    let mut extra=std::collections::BTreeSet::new();
-                    for event in s.iter(){crate::operations::check()?;extra.extend(event.fields.keys().cloned());if extra.len()>10000{return Err("Há mais de 10.000 campos. Use JSONL para preservar todos os dados.".into());}}
-                    columns.extend(extra.into_iter().filter(|c|!crate::model::STANDARD_COLUMNS.contains(&c.as_str())&&! ["id","event_ref","parse_status","raw"].contains(&c.as_str())));
-                    writeln!(file,"{}",columns.iter().map(|v|csv(v)).collect::<Vec<_>>().join(",")).map_err(|e|e.to_string())?;
-                }
-                for ev in s.iter() {
-                    crate::operations::check()?;
-                    let mut value=serde_json::to_value(&ev).map_err(|e|e.to_string())?;
-                    if mask{redact_value(&mut value);}
-                    let text=if format=="csv" {
-                        columns.iter().map(|column|{
-                            let text=if column=="timestamp"{ev.timestamp.map(crate::model::ts_to_iso).unwrap_or_default()}else{
-                                value.get(column).or_else(||value.get("fields").and_then(|v|v.get(column))).filter(|v|!v.is_null()).map(|v|v.as_str().map(str::to_string).unwrap_or_else(||v.to_string())).unwrap_or_default()
-                            };csv(&text)
-                        }).collect::<Vec<_>>().join(",")
-                    }else{serde_json::to_string(&value).map_err(|e|e.to_string())?};
-                    writeln!(file, "{text}").map_err(|e| e.to_string())?;
-                    count += 1;
-                }
-                Ok(())
-            })?;
+        let parent = requested
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut pending = tempfile::Builder::new()
+            .prefix(".loginsight-export-")
+            .suffix(".part")
+            .tempfile_in(parent)
+            .map_err(|e| e.to_string())?;
+        {
+            let mut file = BufWriter::new(pending.as_file_mut());
+            let count = if let Some(events) = case_events.as_deref() {
+                let prepared = query::prepare(&filters);
+                write_events_export(&mut file, &format, mask, || {
+                    events
+                        .iter()
+                        .filter(|event| prepared.iter().all(|filter| query::matches(event, filter)))
+                        .cloned()
+                })
+            } else {
+                with_selection(state.inner(), &filters, |s| {
+                    write_events_export(&mut file, &format, mask, || s.iter())
+                })
+            }?;
             crate::operations::check()?;
             file.flush().map_err(|e| e.to_string())?;
+            file.get_ref().sync_all().map_err(|e| e.to_string())?;
             drop(file);
+            crate::operations::check()?;
+            // Same-directory atomic replacement works for existing destinations
+            // on Windows and Unix, after the save picker confirms overwriting.
+            pending
+                .persist(&requested)
+                .map_err(|e| e.error.to_string())?;
             crate::operations::commit();
-            std::fs::rename(&temp, &requested).map_err(|e| e.to_string())?;
             Ok(count)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temp);
         }
-        result
     })
     .await?
+}
+pub(crate) fn write_events_export<F, I>(
+    file: &mut impl Write,
+    format: &str,
+    mask: bool,
+    events: F,
+) -> Result<usize, String>
+where
+    F: Fn() -> I,
+    I: Iterator<Item = Event>,
+{
+    let mut columns: Vec<String> = crate::model::STANDARD_COLUMNS
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+    columns.extend(["id", "event_ref", "parse_status", "raw"].map(str::to_string));
+    if format == "csv" {
+        let mut extra = std::collections::BTreeSet::new();
+        for event in events() {
+            crate::operations::check()?;
+            for key in event.fields.keys() {
+                extra.insert(key.clone());
+                if extra.len() > 10000 {
+                    return Err(
+                        "Há mais de 10.000 campos. Use JSONL para preservar todos os dados.".into(),
+                    );
+                }
+            }
+        }
+        columns.extend(extra.into_iter().filter(|c| {
+            !crate::model::STANDARD_COLUMNS.contains(&c.as_str())
+                && !["id", "event_ref", "parse_status", "raw"].contains(&c.as_str())
+        }));
+        writeln!(
+            file,
+            "{}",
+            columns.iter().map(|v| csv(v)).collect::<Vec<_>>().join(",")
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let mut count = 0;
+    for ev in events() {
+        crate::operations::check()?;
+        let mut value = serde_json::to_value(&ev).map_err(|e| e.to_string())?;
+        if mask {
+            redact_value(&mut value);
+        }
+        let text = if format == "csv" {
+            columns
+                .iter()
+                .map(|column| {
+                    let text = if column == "timestamp" {
+                        ev.timestamp
+                            .map(crate::model::ts_to_iso)
+                            .unwrap_or_default()
+                    } else {
+                        value
+                            .get(column)
+                            .or_else(|| value.get("fields").and_then(|v| v.get(column)))
+                            .filter(|v| !v.is_null())
+                            .map(|v| {
+                                v.as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| v.to_string())
+                            })
+                            .unwrap_or_default()
+                    };
+                    csv(&text)
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            serde_json::to_string(&value).map_err(|e| e.to_string())?
+        };
+        writeln!(file, "{text}").map_err(|e| e.to_string())?;
+        count += 1;
+    }
+    Ok(count)
 }
 #[tauri::command]
 pub async fn export_document(path: String, content: String) -> Result<(), String> {

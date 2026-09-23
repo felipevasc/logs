@@ -10,7 +10,7 @@ const COL_LABELS = {
   _all: "Todo o evento",
   comentario: "Comentário",
   timestamp: "Data/hora",
-  source: "Fonte",
+  source: "Origem",
   level: "Nível",
   code: "Código",
   name: "Nome",
@@ -23,6 +23,8 @@ const OPS = [
   ["not_contains", "não contém"],
   ["equals", "igual a"],
   ["not_equals", "diferente de"],
+  ["equals_exact", "exatamente igual a"],
+  ["not_equals_exact", "diferente do valor exato"],
   ["starts_with", "começa com"],
   ["regex", "regex"],
   ["pattern", "padrão"],
@@ -36,6 +38,7 @@ const OPS = [
 ];
 const OP_SYMBOL = {
   contains: "~", not_contains: "!~", equals: "=", not_equals: "≠",
+  equals_exact: "=", not_equals_exact: "≠",
   starts_with: "^", regex: "/…/", gt: ">", gte: "≥", lt: "<", lte: "≤",
   between: "↔", empty: "vazio", not_empty: "preenchido",
 };
@@ -59,6 +62,7 @@ const LEVEL_COLOR = {
   "Rastreio": "var(--lv-rastreio)",
 };
 const levelColor = (lv) => LEVEL_COLOR[lv] || "var(--text-2)";
+const workspaceScope = () => window.WorkspaceContext?.scope() || "dataset";
 
 // ------------------------------------------------------------------ estado
 const state = {
@@ -301,6 +305,7 @@ const baseName = (p) => String(p || "").split(/[\\/]/).pop() || String(p || "");
 
 // persiste as colunas visíveis no registro do artefato (por Caso)
 function saveVisibleCols() {
+  if (workspaceScope() === "case") { saveCases(); return; }
   const artifact = currentCaseArtifact();
   if (!artifact) return;
   artifact.visibleCols = [...state.visibleCols];
@@ -743,6 +748,8 @@ function skeletonRows() {
 }
 
 async function loadData(requestedSource = null, options = {}) {
+  await window.WorkspaceContext?.waitForSource();
+  if (window.WorkspaceContext?.scope() === "case") await window.WorkspaceContext.setScope("dataset", { animate: false });
   const btn = $("#btn-load");
   btn.disabled = true;
   btn.innerHTML = '<i class="fas fa-circle-notch spin"></i> Carregando…';
@@ -993,7 +1000,7 @@ function filtersChanged() {
   syncCurrentSavedFilter();
   renderChips();
   renderExploreTree();
-  if (state.activeContext === "artifact") {
+  if (state.activeContext === "artifact" || !document.querySelector(".shell").hidden) {
     state.page = 0;
     refresh();
     return;
@@ -1004,6 +1011,7 @@ function filtersChanged() {
   if (!$("#view-analysis").hidden) renderAnalysis();
   if (!$("#view-dashboard").hidden) renderDashboard("case");
   else if (!$("#view-cube").hidden) runCube();
+  else window.Workspace?.onFiltersChanged?.();
 }
 
 // ------------------------------------------------------------------ árvore de exploração
@@ -1012,7 +1020,7 @@ const RANGE_KINDS = new Set(["number", "bytes", "bits", "duration", "percent"]);
 const FACET_VALUE_LIMIT = 8; // campos com até N valores distintos viram nó de valores
 
 function profileFor(column) {
-  return (state.datasetProfiles || []).find((p) => p.name === column) || null;
+  return (scopeProfiles(workspaceScope()) || []).find((p) => p.name === column) || null;
 }
 
 function fmtDurationMs(ms) {
@@ -1175,7 +1183,7 @@ function caseTreeProfiles() {
     api("profile_fields", { filters: [], caseEvents: caseEvents() }, { silent: true })
       .then((profiles) => { state.caseTreeProfiles[c.id] = { sig, profiles }; })
       .catch(() => { state.caseTreeProfiles[c.id] = { sig, profiles: [] }; })
-      .finally(() => { state.caseProfilesLoading = false; refreshTreeAggs("case"); });
+      .finally(() => { state.caseProfilesLoading = false; if (workspaceScope() === "case") refreshTreeAggs("case"); });
   }
   return null;
 }
@@ -1188,6 +1196,7 @@ async function loadDerivedFields() {
 
 function renderExploreTree() {
   document.querySelectorAll(".explore-tree-sync").forEach((box) => {
+    if (box.closest("[hidden]")) return;
     renderExploreTreeInto(box, box.dataset.treeScope || "dataset");
   });
 }
@@ -1207,6 +1216,16 @@ function jsValNum(col, s) {
   return jsParseNumUnit(t);
 }
 function jsMatchFilter(ev, f) {
+  if (f.op === "equals_exact" || f.op === "not_equals_exact") {
+    if (f.column === "_all") return false;
+    const standard = ["id", "source", "level", "code", "name", "description", "message", "raw"];
+    const present = f.column === "timestamp" ? ev.timestamp != null : standard.includes(f.column) || Object.hasOwn(ev.fields || {}, f.column);
+    const value = f.column === "timestamp" && present ? new Date(ev.timestamp).toISOString().replace(/\.000Z$/, "+00:00").replace(/Z$/, "+00:00")
+      : standard.includes(f.column) ? String(ev[f.column] ?? "")
+      : typeof ev.fields?.[f.column] === "string" ? ev.fields[f.column] : JSON.stringify(ev.fields?.[f.column]);
+    const equal = present && value === String(f.value ?? "");
+    return f.op === "equals_exact" ? equal : !equal;
+  }
   const hay = f.column === "_all" ? `${ev.message || ""}\n${ev.raw || ""}` : cellValue(ev, f.column);
   const low = hay.toLowerCase();
   const needle = String(f.value ?? "").toLowerCase();
@@ -1299,6 +1318,7 @@ const treeAggVersion = { dataset: 0, case: 0 };
 // contagens vivas da árvore em UMA chamada consolidada (backend agrega cada coluna
 // com os filtros das outras, em paralelo). Memoizada: mesma assinatura → sem recálculo.
 async function refreshTreeAggs(scope, { force = false } = {}) {
+  const context = scope === "case" ? caseSig() : `${state.currentArtifact?.id}:${state.currentArtifact?.loadedAt}`;
   if ((scope === "dataset" && !state.loaded) || (scope === "case" && !activeCase())) {
     state.treeAgg[scope] = null;
     state.treeAggSig[scope] = null;
@@ -1326,7 +1346,7 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
     }, { silent: true });
   } catch { spinDone(); return; }
   spinDone();
-  if (version !== treeAggVersion[scope]) return;
+  if (version !== treeAggVersion[scope] || workspaceScope() !== scope || context !== (scope === "case" ? caseSig() : `${state.currentArtifact?.id}:${state.currentArtifact?.loadedAt}`)) return;
   const map = {};
   for (const [col, agg] of res || []) {
     map[col] = agg.rows.map((r) => {
@@ -1373,6 +1393,7 @@ function renderExploreTreeInto(box, scope) {
     const kind = profile?.kind || (column === "timestamp" ? "time" : "text");
     const row = el("div", "field-row");
     row.dataset.field = `${column} ${colLabel(column)}`.toLocaleLowerCase();
+    row.dataset.column = column;
     if (hasColFilter(column)) row.classList.add("has-filter");
     const main = el("button", "field-item");
     main.innerHTML = `<i class="fas ${FIELD_KIND_ICONS[kind] || "fa-font"}"></i><span>${esc(colLabel(column))}</span><small>${profile?.cardinality ? fmtNum(profile.cardinality) : ""}</small>`;
@@ -1539,7 +1560,8 @@ function positionPop(pop, anchor) {
 
 // ------------------------------------------------------------------ refresh
 async function refresh() {
-  if (!state.loaded) return;
+  const scope = workspaceScope();
+  if (scope === "dataset" && !state.loaded) return;
   const filters = backendFilters();
   const version = ++state.refreshVersion;
   // evita cliques duplos na paginação enquanto a consulta está no ar
@@ -1549,10 +1571,11 @@ async function refresh() {
   startOperation("explore", "Atualizando exploração", "Lendo eventos e calculando recortes");
   let snapshot;
   try {
-    const cacheKey = JSON.stringify([filters, state.currentArtifact?.loadedAt]);
+    const cacheKey = JSON.stringify([scope, scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, filters]);
     const cached = state.explorerCache?.key === cacheKey ? state.explorerCache.snapshot : null;
     const result = await api(cached ? "query_events" : "explore_snapshot", {
       filters,
+      ...(scope === "case" ? { caseEvents: caseEvents() } : {}),
       sortColumn: state.sortCol,
       sortDir: state.sortDir,
       offset: state.page * state.pageSize,
@@ -1593,10 +1616,10 @@ async function refresh() {
       })
       .sort((a, b) => b[1] - a[1]);
   state.facetData = { levels: stats.levels, sources: toRows(srcAgg), codes: toRows(codeAgg) };
-  refreshTreeAggs("dataset");
+  refreshTreeAggs(scope);
   updateContextBar();
   // recalcula a aba analítica aberta para refletir o novo recorte
-  if (state.activeDatasetTab === "dashboard") renderDashboard("dataset");
+  if (state.activeDatasetTab === "dashboard") renderDashboard(scope);
   else if (state.activeDatasetTab === "cube") runCube();
   else if (state.activeDatasetTab === "group") runGroup();
   loading.done();
@@ -2346,6 +2369,7 @@ const CURRENT_FILTER_ID = "__current__";
 function savedFilters() {
   const c = activeCase();
   if (!c) return [];
+  if (workspaceScope() === "case") { c.workspace ||= defaultCaseWorkspace(); return c.workspace.savedFilters ||= []; }
   c.savedFilters = c.savedFilters || [];
   return c.savedFilters;
 }
@@ -2444,7 +2468,7 @@ function renderFilterTabs() {
         actions.push(
           { icon: "fa-arrows-rotate", label: "Atualizar com o recorte atual", onClick: () => { Object.assign(f, copyCurrentFilterState()); saveCases(); renderFilterTabs(); refreshFilterTabCounts(); } },
           { sep: true },
-          { icon: "fa-trash-can", label: "Excluir visualizacao", danger: true, onClick: () => { c.savedFilters = savedFilters().filter((x) => x.id !== f.id); saveCases(); renderFilterTabs(); } },
+          { icon: "fa-trash-can", label: "Excluir visualizacao", danger: true, onClick: () => { const index = saved.findIndex((x) => x.id === f.id); if (index >= 0) saved.splice(index, 1); saveCases(); renderFilterTabs(); } },
         );
       }
       showCtxMenu(e.clientX, e.clientY, actions);
@@ -2827,7 +2851,9 @@ function ensureCase() {
   if (!c) { newCase(undefined, { keepArtifact: true }); c = activeCase(); }
   return c;
 }
-function newCase(name, { keepArtifact = false } = {}) {
+function newCase(name, { keepArtifact = false, contextSnapshot = null } = {}) {
+  if (window.WorkspaceContext?.sourceBusy) { toast("Aguarde a atualização das fontes para criar um Caso.", "info"); return activeCase(); }
+  const context = contextSnapshot || window.WorkspaceContext?.beforeCaseCreation();
   const c = {
     id: "c" + Date.now().toString(36) + Math.floor(Math.random() * 1e4),
     name: name || `Caso ${state.cases.cases.length + 1}`,
@@ -2835,7 +2861,8 @@ function newCase(name, { keepArtifact = false } = {}) {
     items: [],
     manual: [],
     stations: [],
-    artifacts: [],
+    artifacts: context?.artifacts || [],
+    activeArtifactId: context?.activeArtifactId || null,
     savedFilters: [{ id: CURRENT_FILTER_ID, name: "Visualizacao atual", filters: [], quick: "" }],
     workspace: defaultCaseWorkspace(),
   };
@@ -2848,7 +2875,8 @@ function newCase(name, { keepArtifact = false } = {}) {
   renderCaseBar();
   updateAnalysisBadge();
   renderAnalysis();
-  if (!keepArtifact) void syncActiveCaseArtifacts();
+  if (context) void window.WorkspaceContext.afterCaseCreation(context);
+  else if (!keepArtifact) void syncActiveCaseArtifacts();
   return c;
 }
 function caseItems() {
@@ -2866,6 +2894,7 @@ function updateAnalysisBadge() {
     ? `${countLabel(n, "item", "itens")} · ${countLabel((c.manual || []).length, "marco manual", "marcos manuais")}`
     : "Sem caso ativo";
   renderStationShortcuts();
+  window.WorkspaceContext?.refreshMembership?.();
   updateContextBar();
 }
 
@@ -2924,6 +2953,7 @@ function commitCaseNameInput() {
 async function deleteActiveCase() {
   const c = activeCase();
   if (!c) return;
+  if (window.WorkspaceContext?.ready) { await window.WorkspaceContext.deleteCase(c); toast(`Caso "${c.name}" excluído.`, "ok"); return; }
   state.artifactSessions.delete(c.id);
   state.cases.cases = state.cases.cases.filter((x) => x.id !== c.id);
   state.cases.active = state.cases.cases[0]?.id || null;
@@ -3605,11 +3635,12 @@ function eventCellMenu(ev, col, value) {
     label: "Enviar todos visíveis ao caso",
     onClick: sendVisibleToCase,
   });
-  return items;
+  return workspaceScope() === "case" ? items.filter(item => !["fa-microscope", "fa-briefcase"].includes(item.icon)) : items;
 }
 
 // envia a página visível ao Caso, sem duplicar o que já está lá
 function sendVisibleToCase() {
+  if (workspaceScope() === "case") { toast("Esses registros já pertencem ao Caso.", "info"); return; }
   const c = ensureCase();
   if (!c) return;
   const existing = new Set();
@@ -3628,6 +3659,8 @@ function buildEventRow(ev) {
   const quick = state.quick.trim();
   const quickRe = quick ? new RegExp(`(${escRe(esc(quick))})`, "gi") : null;
   const row = el("tr");
+  row.dataset.eventId = ev.id;
+  if (workspaceScope() === "dataset" && window.WorkspaceContext?.isIncluded(ev)) { row.classList.add("event-in-case"); row.title = "Este registro já está no Caso"; }
   if (ev.id === state.detailId) row.classList.add("selected");
   row.onclick = () => openDetail(ev.id);
   for (const col of state.visibleCols) {
@@ -3799,18 +3832,6 @@ function renderChart(stats) {
   box.innerHTML = "";
   if (chart) { chart.destroy(); chart = null; }
 
-  const mini = $("#levels-mini");
-  mini.innerHTML = "";
-  for (const [level, count] of (stats.levels || []).slice(0, 6)) {
-    const b = el("button", "lv-mini");
-    const d = el("span", "facet-dot");
-    d.style.background = levelColor(level);
-    b.append(d, el("span", "", level), el("span", "fc", fmtNum(count)));
-    b.title = "Filtrar por este nível";
-    b.onclick = () => toggleFacet("level", level);
-    mini.appendChild(b);
-  }
-
   if (!stats.buckets || stats.buckets.length === 0) {
     const p = el("div", "hint-empty", "Sem dados temporais.");
     box.appendChild(p);
@@ -3830,7 +3851,7 @@ function renderChart(stats) {
       cursor: { drag: { x: true, y: false, setScale: false }, focus: { prox: 24 } },
       scales: { x: { time: true } },
       axes: [
-        { stroke: axisColor, grid: { show: false }, ticks: { show: false }, size: 20, font: "10px " + "sans-serif" },
+        { stroke: axisColor, grid: { show: false }, ticks: { show: false }, size: 20, font: "10px " + "sans-serif", values: (u, vals) => vals.map(v => new Date(v * 1000).toLocaleTimeString("pt-BR", {hour:"2-digit",minute:"2-digit"})) },
         { stroke: axisColor, grid: { stroke: gridColor }, ticks: { show: false }, size: 30 },
       ],
       series: [
@@ -3906,10 +3927,16 @@ function currentIndex() {
   return state.rows.findIndex((r) => r.id === state.detailId);
 }
 
+let detailRequest = 0;
 async function openDetail(id) {
+  const request = ++detailRequest;
   showDetailLoading();
-  const ev = await api("event_detail", { id });
-  if (ev) showDetail(ev);
+  try {
+    const ev = workspaceScope() === "case" ? caseEvents().find(event => event.id === id) : await api("event_detail", { id });
+    if (request === detailRequest && ev) showDetail(ev);
+  } catch (error) {
+    if (request === detailRequest) $("#pane-overview").textContent = `Não foi possível abrir o registro: ${String(error)}`;
+  }
 }
 
 // abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
@@ -3928,6 +3955,7 @@ function showDetailLoading() {
 }
 
 function openContextInspector(title, subtitle, overview) {
+  detailRequest++;
   state.detailId = null;
   state.currentDetailEv = null;
   $("#drawer-badges").innerHTML = "";
@@ -3993,6 +4021,7 @@ function showStationInspector(station) {
 }
 
 function showDetail(ev, sourceSpec = null) {
+  detailRequest++;
   state.detailId = ev.id;
   state.currentDetailEv = ev;
   state.detailSourceSpec = sourceSpec;
@@ -4080,6 +4109,7 @@ function detailStep(dir) {
 }
 
 function closeDrawer() {
+  detailRequest++;
   state.detailId = null;
   $("#drawer").hidden = true;
   $("#drawer-scrim").hidden = true;
@@ -4258,6 +4288,7 @@ function placeSourcePanel() {
 
 function switchTab(which) {
   placeAnalytics("dataset");
+  const scope = workspaceScope(); state.analyticsScope = scope;
   state.activeDatasetTab = which;
   for (const tab of ["table", "group", "dashboard", "cube"]) {
     $(`#tabbtn-${tab}`).classList.toggle("active", which === tab);
@@ -4269,8 +4300,8 @@ function switchTab(which) {
   $("#view-dashboard").classList.toggle("in-workspace", which === "dashboard");
   $("#view-cube").classList.toggle("in-workspace", which === "cube");
   if (which === "group") runGroup();
-  if (which === "dashboard") openDashboard("dataset");
-  if (which === "cube") openCube("dataset");
+  if (which === "dashboard") openDashboard(scope);
+  if (which === "cube") openCube(scope);
 }
 
 // troca entre as telas "Visualização", "Caso" e "Estações"
@@ -4284,9 +4315,12 @@ function showSourceMode(mode) {
 }
 
 function switchView(which) {
+  if (window.WorkspaceContext && !window.WorkspaceContext.changing && ["caso", "case-dashboard", "case-cube", "estacoes"].includes(which) && workspaceScope() !== "case") {
+    return window.WorkspaceContext.setScope("case", { page: which === "caso" && ["timeline", "vtimeline"].includes(state.analysisView) ? "case-timeline" : which === "case-dashboard" || which === "case-cube" ? "explore" : "evidence", tab: which === "case-cube" ? "cube" : which === "case-dashboard" ? "dashboard" : undefined });
+  }
   window.Workspace?.onView(which);
   if (which === "source") showSourceMode("list");
-  state.activeContext = which === "estacoes" ? "station"
+  state.activeContext = workspaceScope() === "case" ? "case" : which === "estacoes" ? "station"
     : ((which === "viz" || which === "source" || which === "trail" || which === "workspace") ? "artifact" : "case");
   if (["caso", "estacoes", "case-dashboard", "case-cube", "trail"].includes(which)) {
     saveCaseWorkspace(which);
@@ -4582,6 +4616,8 @@ async function renderMcpPane() {
 
 // ------------------------------------------------------------------ live-refresh via MCP
 async function handleMcpStateChanged(kind) {
+  window.Discovery?.clearCache();
+  caseEventsCache.sig = null;
   if (kind === "source") {
     await mcpRefreshSource();
     toast("Fonte de dados atualizada via MCP.", "info");
@@ -4617,7 +4653,8 @@ async function handleMcpStateChanged(kind) {
 }
 
 // a fonte de eventos mudou no backend (load/clear via MCP): refaz o pós-load lógico da UI
-async function mcpRefreshSource() {
+async function mcpRefreshSource(contextual = false) {
+  if (window.WorkspaceContext?.ready && !contextual) return window.WorkspaceContext.sourceChanged(() => mcpRefreshSource(true));
   // resume a fonte atual no backend; fallback: deriva as colunas dos perfis (vazio = fonte limpa)
   let columns = [];
   let count = null;
@@ -4697,6 +4734,7 @@ async function mcpReloadCases() {
   let loaded = null;
   try { loaded = await api("cases_load", {}, { silent: true }); } catch { return; }
   if (!loaded || !Array.isArray(loaded.cases)) return;
+  if (window.WorkspaceContext?.ready) { await window.WorkspaceContext.replaceCases(normalizeCaseStore(loaded)); return; }
   state.cases = normalizeCaseStore(loaded);
   // sessões de artefatos foram derivadas do estado anterior dos casos
   state.artifactSessions = new Map();
@@ -4897,6 +4935,7 @@ function bind() {
 
   // casos de análise
   $("#case-select").onchange = async () => {
+    if (window.WorkspaceContext) { await window.WorkspaceContext.changeCase($("#case-select").value || null); return; }
     state.cases.active = $("#case-select").value || null;
     saveCases();
     updateAnalysisBadge();
@@ -5118,7 +5157,7 @@ renderTable({ total: 0, rows: [] });
 renderChart({ buckets: [], levels: [] });
 setWorkbar("Nenhuma fonte carregada", "");
 switchView("source");
-(async () => {
+window.workspaceBootstrap = (async () => {
   try {
     const loaded = await api("cases_load", {}, { silent: true });
     if (loaded && Array.isArray(loaded.cases)) {
@@ -5129,10 +5168,10 @@ switchView("source");
   renderCaseBar();
   updateAnalysisBadge();
   if (activeCase()) {
-    restoreCaseWorkspace();
-    // restaura o artefato ativo da sessão (fechar e abrir volta ao mesmo ponto)
-    syncActiveCaseArtifacts();
-  }
+    setAnalysisView(activeCase().workspace?.analysisView || "vtimeline");
+    await syncActiveCaseArtifacts();
+    if (window.WorkspaceContext) await window.WorkspaceContext.initialize();
+  } else if (window.WorkspaceContext) await window.WorkspaceContext.initialize();
 })();
 
 
@@ -5365,6 +5404,7 @@ async function renderChartCard(body, spec, scope = state.analyticsScope) {
       interval_ms: spec.interval_ms, split: spec.split, limit: 12, unit: "auto",
     },
   });
+  if (!body.isConnected) return;
   body.innerHTML = "";
   if (!res.x.length || !res.series?.length) { body.innerHTML = '<span class="muted small">Sem dados.</span>'; return; }
   const type = dashboardType(spec);
@@ -5626,10 +5666,11 @@ function renderLineChart(box, res, id) {
       width: Math.max(280, box.clientWidth - 8),
       height: state.dashboardCompact ? 112 : 170,
       legend: { show: res.series.length > 1 },
-      cursor: { show: false },
+      cursor: { show: true, drag: { x: true, y: false, setScale: false } },
       scales: { x: { time: true } },
       axes: [
-        { stroke: axisColor, grid: { show: false }, ticks: { show: false }, size: 22 },
+        { stroke: axisColor, grid: { show: false }, ticks: { show: false }, size: 22,
+          values: (u, vals) => vals.map(v => new Date(v * 1000).toLocaleString("pt-BR", Number(res.x.at(-1)) - Number(res.x[0]) < 86400000 ? {hour:"2-digit",minute:"2-digit"} : {day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})) },
         {
           stroke: axisColor, grid: { stroke: isLight() ? "rgba(19,81,180,0.08)" : "rgba(255,255,255,0.06)" },
           ticks: { show: false }, size: 44,
@@ -5637,10 +5678,11 @@ function renderLineChart(box, res, id) {
         },
       ],
       series: [
-        {},
+        { label: "Horário", value: (u, v) => v == null ? "—" : fmtTs(v * 1000) },
         ...res.series.map((s, i) => ({
           label: s.name,
-          stroke: CHART_COLORS[i % CHART_COLORS.length],
+          stroke: LEVEL_COLOR[s.name] ? getComputedStyle(document.documentElement).getPropertyValue(LEVEL_COLOR[s.name].slice(4, -1)).trim() : CHART_COLORS[i % CHART_COLORS.length],
+          value: (u, v) => v == null ? "—" : fmtVal(v, res.unit),
           width: 1.6,
           fill: res.series.length === 1 ? "rgba(47,111,237,0.18)" : undefined,
           points: { show: false },
@@ -5742,7 +5784,8 @@ function normalizeCubeWorkspace(raw) {
     const table = newCubeTable(1, raw);
     return { tables: [table], charts: [], activeTableId: table.id, activeView: { type: "table", id: table.id } };
   }
-  raw.tables = raw.tables.filter((table) => table && typeof table === "object").map((table, index) => ({
+  // Keep table identity: pending calculations and chart editors hold this reference.
+  raw.tables = raw.tables.filter((table) => table && typeof table === "object").map((table, index) => Object.assign(table, {
     ...newCubeTable(index + 1, table), ...table,
     id: table.id || `cube-table-${nid()}`,
     name: table.name || `Tabela ${index + 1}`,
@@ -5819,6 +5862,11 @@ const FIELD_ICONS = {
 };
 
 async function openCube(scope = "dataset") {
+  const opening = Symbol("cube-opening");
+  cubeState.openingRequest = opening;
+  const contextKey = () => JSON.stringify([workspaceScope(), activeCase()?.id, scope === "case" ? caseSig() : [state.currentArtifact?.id, state.currentArtifact?.loadedAt]]);
+  const openedContext = contextKey();
+  const current = () => cubeState.openingRequest === opening && state.analyticsScope === scope && contextKey() === openedContext && !$("#view-cube").hidden;
   startOperation("cube", "Atualizando Cubo", "Preparando dimensões e medidas");
   if (state.analyticsScope !== scope) {
     cubeState.collapsed.clear();
@@ -5826,13 +5874,21 @@ async function openCube(scope = "dataset") {
   }
   state.analyticsScope = scope;
   if (!scopeProfiles(scope) && scopeHasEvents(scope)) {
-    try { setScopeProfiles(await api("profile_fields", analyticsRequest(scope)), scope); } catch { setScopeProfiles([], scope); }
+    try {
+      const profiles = await api("profile_fields", analyticsRequest(scope));
+      if (!current()) return;
+      setScopeProfiles(profiles, scope);
+    } catch {
+      if (!current()) return;
+      setScopeProfiles([], scope);
+    }
   }
+  if (!current()) return;
   renderCubeFields();
   renderCubeZones();
   renderCubeViews();
   await runCube();
-  finishOperation("Cubo pronto", "Recorte calculado no escopo atual.");
+  if (current()) finishOperation("Cubo pronto", "Recorte calculado no escopo atual.");
 }
 
 function renderCubeFields() {
@@ -6006,7 +6062,7 @@ async function runCube() {
     cubeState.result = null;
     cubeState.results.delete(resultKey);
     renderCubeViews();
-    return;
+    return { status: "empty" };
   }
   const loading = areaLoading(document.querySelector(".cube-output"), "Calculando Cubo…");
   try {
@@ -6015,7 +6071,7 @@ async function runCube() {
       ...analyticsRequest(scope),
       spec: { rows: cube.rows, cols: cube.cols, values: cube.values, limit_rows: 2000 },
     });
-    if (version !== cubeState.requestVersion || scope !== state.analyticsScope || cube.id !== activeCube(scope).id) return;
+    if (version !== cubeState.requestVersion || scope !== state.analyticsScope || cube.id !== activeCube(scope).id) return { status: "stale" };
     if (res.complete === false) toast(`Resultado parcial: ${fmtNum(res.processed_events)} eventos analisados. Reduza as dimensões ou o período.`, "info");
     cubeState.result = res;
     cubeState.results.set(resultKey, res);
@@ -6024,8 +6080,14 @@ async function runCube() {
     saveActiveCube(scope);
     renderCubeTable(cube, res);
     renderCubeViews();
+    finishOperation("Cruzamento atualizado");
+    return { status: "success" };
   } catch (error) {
+    if (version !== cubeState.requestVersion || scope !== state.analyticsScope || cube.id !== activeCube(scope).id) return { status: "stale" };
+    cubeState.result = null;
+    cubeState.results.delete(resultKey);
     finishOperation("Falha ao calcular Cubo", String(error));
+    return { status: "error", error: String(error) };
   } finally {
     loading.done();
   }

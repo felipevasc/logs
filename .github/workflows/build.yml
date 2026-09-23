@@ -2,6 +2,12 @@ name: Build Windows and Linux
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the version in package.json after both platforms pass
+        type: boolean
+        required: false
+        default: false
   push:
     branches: [main]
     paths-ignore:
@@ -41,7 +47,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential pkg-config curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
@@ -51,9 +57,13 @@ jobs:
         with:
           workspaces: src-tauri -> target
       - run: npm ci
+      - name: Verify version
+        run: node scripts/release/verify-version.mjs
+      - name: Verify release safeguards
+        run: node scripts/release/test-release.mjs
       - run: npm run prepare:frontend
       - name: Backend tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --lib
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --lib -- --test-threads=1
       - name: Build installers
         run: npm run build -- --ci --bundles ${{ matrix.bundles }} -- --locked
       - name: Upload installers
@@ -68,3 +78,30 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/rpm/*.rpm
+
+  release:
+    name: Publish Windows and Linux release
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_release && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: LogInsight-*
+          merge-multiple: true
+          path: release-downloads
+      - name: Verify version and installers
+        run: |
+          node scripts/release/verify-version.mjs
+          node scripts/release/prepare-assets.mjs release-downloads release-assets
+      - name: Publish complete release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/release/publish.mjs release-assets

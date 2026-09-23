@@ -35,6 +35,798 @@ fn filter(column: &str, op: &str, value: &str) -> Filter {
         value2: None,
     }
 }
+
+fn state_for(source: crate::SourceData) -> crate::AppState {
+    crate::AppState {
+        source: parking_lot::RwLock::new(source),
+        source_names: parking_lot::RwLock::new(vec![]),
+        codes: parking_lot::RwLock::new(CodesConfig::default()),
+        system_codes: parking_lot::RwLock::new(CodesConfig::default()),
+        derived: parking_lot::RwLock::new(vec![]),
+        case_store_lock: parking_lot::Mutex::new(()),
+        codes_path: PathBuf::new(),
+        system_codes_path: PathBuf::new(),
+    }
+}
+
+#[test]
+fn case_scope_queries_overview_comparison_timeline_and_export_are_isolated() {
+    let mut dataset = Event::empty();
+    dataset.id = 9;
+    dataset.timestamp = Some(50);
+    dataset.source = "Dataset".into();
+    dataset.message = "dataset only".into();
+    let state = state_for(crate::SourceData::Memory(vec![dataset]));
+    let mut case = Vec::new();
+    for (id, timestamp, level) in [
+        (31, Some(0), "Erro"),
+        (72, Some(100), "Aviso"),
+        (95, None, "Informação"),
+    ] {
+        let mut event = Event::empty();
+        event.id = id;
+        event.timestamp = timestamp;
+        event.source = "Caso".into();
+        event.level = level.into();
+        event.event_ref = format!("saved:{id}");
+        event.message = format!("saved event {id}");
+        event.raw = "preserved raw".into();
+        event
+            .fields
+            .insert("password".into(), "secret-example".into());
+        case.push(event);
+    }
+    let filters = vec![filter("source", "equals_exact", "Caso")];
+    let overview = workspace::overview_scope_impl(&state, filters.clone(), Some(&case)).unwrap();
+    assert_eq!(
+        (
+            overview.total,
+            overview.errors,
+            overview.warnings,
+            overview.undated
+        ),
+        (3, 1, 1, 1)
+    );
+    assert_eq!((overview.start, overview.end), (Some(0), Some(100)));
+    assert_eq!(
+        workspace::overview_scope_impl(&state, vec![], Some(&[]))
+            .unwrap()
+            .total,
+        0
+    );
+    assert_eq!(workspace::overview_impl(&state, vec![]).unwrap().total, 1);
+    let page =
+        crate::query_events_scope_impl(&state, filters.clone(), "id", "desc", 1, 1, Some(&case));
+    assert_eq!(page.total, 3);
+    assert_eq!(page.rows[0].id, 72);
+    assert_eq!(page.rows[0].event_ref, "saved:72");
+    assert!(
+        crate::query_events_scope_impl(&state, vec![], "id", "asc", 0, 100, Some(&[]))
+            .rows
+            .is_empty()
+    );
+    let explore = crate::explore_snapshot_scope_impl(
+        &state,
+        filters.clone(),
+        "id",
+        "asc",
+        0,
+        10,
+        None,
+        Some(&case),
+    );
+    assert_eq!(explore.query.total, 3);
+    assert_eq!(explore.query.rows[0].id, 31);
+    assert_eq!(
+        explore
+            .stats
+            .buckets
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<i64>(),
+        2
+    );
+    assert_eq!(explore.stats.buckets[0].0, 0);
+    assert!(explore
+        .stats
+        .buckets
+        .iter()
+        .all(|(timestamp, _)| *timestamp <= 100));
+    assert_eq!(
+        explore
+            .stats
+            .levels
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<i64>(),
+        3
+    );
+    let range = serde_json::to_value(
+        workspace::timeline_range_scope_impl(&state, filters.clone(), 0, 100, 240, Some(&case))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(range["total"], 2);
+    assert_eq!(range["errors"], 1);
+    assert_eq!(range["warnings"], 1);
+    assert!(range["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|bucket| bucket["timestamp"].as_i64().unwrap() <= 100));
+    let comparison = workspace::compare_scope_impl(
+        &state,
+        filters.clone(),
+        insights::Period { start: 0, end: 49 },
+        insights::Period {
+            start: 50,
+            end: 150,
+        },
+        Some(&case),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            comparison.before_total,
+            comparison.after_total,
+            comparison.before_errors
+        ),
+        (1, 1, 1)
+    );
+    let prepared = query::prepare(&filters);
+    let mut jsonl = Vec::new();
+    assert_eq!(
+        workspace::write_events_export(&mut jsonl, "jsonl", true, || case
+            .iter()
+            .filter(|event| prepared.iter().all(|filter| query::matches(event, filter)))
+            .cloned())
+        .unwrap(),
+        3
+    );
+    let exported: Vec<serde_json::Value> = std::str::from_utf8(&jsonl)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(exported[0]["event_ref"], "saved:31");
+    assert_eq!(exported[0]["raw"], "preserved raw");
+    assert_eq!(exported[0]["fields"]["password"], "[oculto]");
+    assert_eq!(case[0].fields["password"], "secret-example");
+    assert_eq!(
+        crate::query_events_impl(&state, vec![], "id", "asc", 0, 10).rows[0].source,
+        "Dataset"
+    );
+}
+
+#[test]
+fn json_arrays_preserve_nested_fields_strings_and_epoch_units() {
+    let file = Fixture::new("\u{feff}[\n {\"Timestamp\":\"1706745600000000\",\"service\":{\"name\":\"payments\"},\"log\":{\"level\":\"ERROR\"},\"http\":{\"response\":{\"status_code\":503}},\"message\":\"braces } ] and \\\"quotes\\\"\",\"tags\":[\"a\",\"b\"]},\n {\"timestamp\":1706745600000000000,\"message\":\"ok\"}\n]\n");
+    let index = file.index("auto");
+    assert_eq!(index.lines.len(), 2);
+    let events = materialize(&index);
+    assert_eq!(events[0].source, "payments");
+    assert_eq!(events[0].level, "Erro");
+    assert_eq!(events[0].timestamp, Some(1706745600000));
+    assert_eq!(events[1].timestamp, events[0].timestamp);
+    assert_eq!(events[0].fields["http.response.status_code"], 503);
+    assert_eq!(events[0].fields["service"], "payments");
+    assert_eq!(events[0].fields["tags"], serde_json::json!(["a", "b"]));
+    assert_eq!(events[0].message, "braces } ] and \"quotes\"");
+    assert!(events.iter().all(|e| e.parse_status == "parsed"));
+    assert!(index.columns.contains(&"http.response.status_code".into()));
+    assert_ne!(events[0].event_ref, events[1].event_ref);
+}
+
+#[test]
+fn json_array_rejects_incomplete_input_and_preserves_literal_dotted_fields() {
+    for text in [
+        "[{\"message\":\"ok\"}",
+        "[{\"message\":\"ok\"},]",
+        "[{\"message\":\"ok\"}] garbage",
+    ] {
+        let file = Fixture::new(text);
+        assert!(sources::index_file(file.0.to_str().unwrap(), "auto", None, None, None).is_err());
+    }
+    let ev = sources::parse_line(br#"{"service":{"name":"nested"},"service.name":"explicit","level":null,"severity":"WARN","message":"hello"}"#, "jsonl", None, &[]);
+    assert_eq!(ev.source, "explicit");
+    assert_eq!(ev.level, "Aviso");
+    assert_eq!(ev.fields["service.name"], "explicit");
+}
+
+#[test]
+fn discovery_respects_case_filters_and_matches_indexed_storage() {
+    let mut text = String::new();
+    for i in 0..100 {
+        let region = if i < 30 { "south" } else { "north" };
+        let status = if i < 25 { "failed" } else { "ok" };
+        text.push_str(&format!("{{\"source\":\"api\",\"region\":\"{region}\",\"status\":\"{status}\",\"latency\":\"{}ms\",\"message\":\"request {} finished\"}}\n", if i == 99 {900} else {10}, i));
+    }
+    let file = Fixture::new(&text);
+    let index = file.index("auto");
+    let events = materialize(&index);
+    let state = state_for(crate::SourceData::Indexed(index));
+    let indexed = crate::discover_patterns_impl(&state, vec![], None);
+    assert_eq!(indexed.total, 100);
+    assert_eq!(indexed.sample_count, 100);
+    assert!(!indexed.limited);
+    assert!(indexed.complete);
+    assert_eq!(indexed.templates[0].count, 100);
+    assert_eq!(indexed.outliers[0].outlier_count, 1);
+    assert_eq!(indexed.outliers[0].examples[0].event_id, 99);
+    assert_eq!(indexed.outliers[0].unit, "ms");
+    let association = indexed
+        .associations
+        .iter()
+        .find(|a| a.left.field == "status" && a.left.value == "failed")
+        .unwrap();
+    assert_eq!(association.right.value, "south");
+    assert!((association.confidence - 1.0).abs() < 1e-9);
+    assert!((association.lift - 100.0 / 30.0).abs() < 1e-9);
+    let memory = crate::discover_patterns_impl(
+        &state_for(crate::SourceData::Memory(events.clone())),
+        vec![],
+        None,
+    );
+    assert_eq!(
+        serde_json::to_value(indexed).unwrap(),
+        serde_json::to_value(memory).unwrap()
+    );
+    let case = crate::discover_patterns_impl(
+        &state,
+        vec![filter("region", "equals", "south")],
+        Some(events),
+    );
+    assert_eq!(case.total, 30);
+    assert_eq!(case.sample_count, 30);
+    assert!(case.outliers.is_empty());
+}
+
+#[test]
+fn discovery_sample_is_bounded_repeatable_and_reaches_file_tail() {
+    let mut first = crate::discovery::Sampler::new();
+    let mut second = crate::discovery::Sampler::new();
+    for i in 0..120_000 {
+        first.push(i);
+        second.push(i);
+    }
+    assert_eq!(first.ids, second.ids);
+    assert_eq!(first.ids.len(), 6000);
+    for tenth in 0..10 {
+        let count = first.ids.iter().filter(|&&i| i / 12_000 == tenth).count();
+        assert!(
+            (400..800).contains(&count),
+            "unrepresentative decile {tenth}: {count}"
+        );
+    }
+}
+
+#[test]
+fn discoveries_suppress_near_aliases_and_diversify_field_pairs() {
+    let events = (0..400)
+        .map(|i| {
+            let mut ev = Event::empty();
+            ev.code = format!("c{}", i % 8);
+            ev.fields.insert(
+                "status".into(),
+                if i == 0 {
+                    "different".into()
+                } else {
+                    ev.code.clone().into()
+                },
+            );
+            ev.fields
+                .insert("region".into(), format!("r{}", i % 4).into());
+            ev.fields
+                .insert("phase".into(), format!("p{}", i % 2).into());
+            ev
+        })
+        .collect();
+    let result =
+        crate::discover_patterns_impl(&state_for(crate::SourceData::Memory(events)), vec![], None);
+    assert!(!result.associations.is_empty());
+    let mut pairs = std::collections::BTreeMap::<_, usize>::new();
+    for association in result.associations {
+        let mut pair = [association.left.field, association.right.field];
+        pair.sort();
+        assert_ne!(pair, ["code", "status"]);
+        assert!(
+            !pair.iter().any(|field| field == "status"),
+            "Near-alias must not generate duplicate relations with other fields"
+        );
+        *pairs.entry(pair).or_default() += 1;
+    }
+    assert!(pairs.len() >= 3);
+    assert!(pairs.values().all(|count| *count <= 2));
+}
+
+#[test]
+fn time_series_ends_at_last_observed_bucket_without_false_zero() {
+    let mut events = vec![Event::empty(); 3];
+    for (event, timestamp) in events.iter_mut().zip([1000, 1999, 2000]) {
+        event.timestamp = Some(timestamp);
+    }
+    let spec = analysis::SeriesSpec {
+        chart: "time".into(),
+        metric: "count".into(),
+        field: None,
+        interval_ms: Some(1000),
+        split: None,
+        limit: None,
+        unit: None,
+    };
+    let result = serde_json::to_value(analysis::compute_series(&events, &spec)).unwrap();
+    assert_eq!(result["x"], serde_json::json!([1000, 2000]));
+    assert_eq!(result["series"][0]["points"], serde_json::json!([2.0, 1.0]));
+    let result = serde_json::to_value(analysis::compute_series(&events[..1], &spec)).unwrap();
+    assert_eq!(result["x"], serde_json::json!([1000]));
+    assert_eq!(result["series"][0]["points"], serde_json::json!([1.0]));
+}
+
+#[test]
+fn terms_count_is_exact_beyond_memory_budget_and_counts_missing_values() {
+    let spec = analysis::SeriesSpec {
+        chart: "terms".into(),
+        metric: "count".into(),
+        field: Some("message".into()),
+        interval_ms: None,
+        split: None,
+        limit: Some(3),
+        unit: Some("auto".into()),
+    };
+    let result = analysis::compute_series_stream(
+        || {
+            (0..30_006).map(|i| {
+                let mut ev = Event::empty();
+                ev.message = if i >= 30_004 {
+                    String::new()
+                } else if i >= 30_000 {
+                    "late winner".into()
+                } else {
+                    format!("event-{i:05}")
+                };
+                ev
+            })
+        },
+        &spec,
+    );
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(
+        result["x"],
+        serde_json::json!(["late winner", "(vazio)", "event-00000"])
+    );
+    assert_eq!(
+        result["series"][0]["points"],
+        serde_json::json!([4.0, 2.0, 1.0])
+    );
+    assert_eq!(result["unit"], "number");
+}
+
+fn contextual_fixture(incident: bool, timestamp: bool) -> Vec<Event> {
+    let mut events = Vec::new();
+    for bin in 0..12 {
+        for combination in 0..8 {
+            for repetition in 0..6 {
+                let mut ev = Event::empty();
+                ev.id = events.len();
+                ev.event_ref = format!("context-test:{}", ev.id);
+                ev.timestamp = timestamp.then_some(1_706_745_600_000 + bin * 1000 + repetition);
+                ev.code = if incident && bin == 5 && combination == 7 {
+                    "unexpected".into()
+                } else {
+                    format!("normal-{combination}")
+                };
+                ev.message = "request finished".into();
+                for (field, bit) in [("a", 0), ("b", 1), ("c", 2)] {
+                    ev.fields.insert(
+                        field.into(),
+                        format!("v{}", (combination >> bit) & 1).into(),
+                    );
+                }
+                ev.fields.insert("a_alias".into(), ev.fields["a"].clone());
+                ev.fields.insert("constant".into(), "same".into());
+                ev.fields
+                    .insert("trace_id".into(), format!("trace-{}", ev.id).into());
+                events.push(ev);
+            }
+        }
+    }
+    events
+}
+
+#[test]
+fn contextual_change_finds_three_field_incident_in_middle_of_period() {
+    let events = contextual_fixture(true, true);
+    let result =
+        crate::discover_patterns_impl(&state_for(crate::SourceData::Memory(events)), vec![], None);
+    let shift = result
+        .behavior_shifts
+        .iter()
+        .find(|s| s.observed == "unexpected")
+        .expect("three-field incident");
+    assert_eq!(shift.context.len(), 3);
+    assert_eq!(shift.expected, "normal-7");
+    assert_eq!(shift.outcome_op, "equals");
+    assert_eq!(shift.baseline_count, 66);
+    assert_eq!(shift.window_observed, 6);
+    assert_eq!(shift.expected_share, 1.0);
+    assert_eq!(shift.observed_share, 1.0);
+    assert_eq!(shift.baseline_observed_share, 0.0);
+    assert!(shift.start <= 1_706_745_605_000 && shift.end >= 1_706_745_605_005);
+    assert!(shift
+        .context
+        .iter()
+        .all(|item| ["a", "b", "c"].contains(&item.field.as_str())));
+    assert!(result.behavior_shifts.len() <= 8);
+    assert!(result.changes.is_empty());
+}
+
+#[test]
+fn stable_contexts_and_undated_data_do_not_flood_temporal_findings() {
+    for (incident, timestamp) in [(false, true), (true, false)] {
+        let result = crate::discover_patterns_impl(
+            &state_for(crate::SourceData::Memory(contextual_fixture(
+                incident, timestamp,
+            ))),
+            vec![],
+            None,
+        );
+        assert!(result.behavior_shifts.is_empty());
+        assert!(result.changes.is_empty());
+        if !timestamp {
+            assert_eq!(result.timed_sample_count, 0);
+            assert_eq!(result.time_bins, 0);
+        }
+    }
+}
+
+#[test]
+fn truncated_outcomes_do_not_invent_a_dominant_context_baseline() {
+    let mut events = Vec::new();
+    let mut add = |source: &str, code: String, bin: i64| {
+        let mut ev = Event::empty();
+        ev.id = events.len();
+        ev.event_ref = format!("truncated:{}", ev.id);
+        ev.source = source.into();
+        ev.code = code;
+        ev.timestamp = Some(1_706_745_600_000 + bin * 1000);
+        events.push(ev);
+    };
+    for value in 0..63 {
+        for i in 0..5 {
+            add("background", format!("frequent-{value}"), (value + i) % 12);
+        }
+    }
+    for i in 0..6 {
+        add("background", "incident".into(), i);
+    }
+    for i in 0..20 {
+        add("target", "expected".into(), i % 4);
+    }
+    for i in 0..27 {
+        add("target", format!("unique-{i}"), i % 4);
+    }
+    for _ in 0..3 {
+        add("target", "incident".into(), 5);
+    }
+    let result =
+        crate::discover_patterns_impl(&state_for(crate::SourceData::Memory(events)), vec![], None);
+    assert!(result.temporal_limited);
+    assert!(!result
+        .behavior_shifts
+        .iter()
+        .any(|s| s.observed == "incident" && s.context.iter().any(|item| item.value == "target")));
+}
+
+#[test]
+fn changes_expose_new_message_pattern_in_middle_window() {
+    let events = (0..120)
+        .map(|i| {
+            let mut ev = Event::empty();
+            ev.id = i;
+            ev.event_ref = format!("new-message:{i}");
+            ev.timestamp = Some(1_706_745_600_000 + (i / 10) as i64 * 1000 + (i % 10) as i64);
+            ev.message = if (50..60).contains(&i) {
+                "queue stalled"
+            } else {
+                "request completed"
+            }
+            .into();
+            ev
+        })
+        .collect();
+    let result =
+        crate::discover_patterns_impl(&state_for(crate::SourceData::Memory(events)), vec![], None);
+    let change = result
+        .changes
+        .iter()
+        .find(|s| s.observed == "queue stalled")
+        .unwrap();
+    assert_eq!(change.kind, "new_pattern");
+    assert_eq!(change.outcome_op, "pattern");
+    assert_eq!(change.baseline_observed, 0);
+    assert_eq!(change.window_observed, 10);
+    assert!(change.context.is_empty());
+}
+
+#[test]
+fn series_skips_incompatible_units_and_reports_their_count() {
+    let events = ["10ms", "20ms", "1GB"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let mut ev = Event::empty();
+            ev.timestamp = Some(1000 + i as i64);
+            ev.fields.insert("metric".into(), v.into());
+            ev
+        })
+        .collect::<Vec<_>>();
+    let spec = analysis::SeriesSpec {
+        chart: "time".into(),
+        metric: "avg".into(),
+        field: Some("metric".into()),
+        interval_ms: Some(1000),
+        split: None,
+        limit: None,
+        unit: Some("auto".into()),
+    };
+    let result = serde_json::to_value(analysis::compute_series(&events, &spec)).unwrap();
+    assert_eq!(result["unit"], "duration");
+    assert_eq!(result["incompatible_units"], 1);
+    assert_eq!(result["series"][0]["points"], serde_json::json!([15.0]));
+    assert_eq!(result["series"][0]["samples"], serde_json::json!([2]));
+}
+
+#[test]
+fn sparse_numeric_units_sample_values_instead_of_prefix_records() {
+    let mut events = (0..501)
+        .map(|i| {
+            let mut event = Event::empty();
+            event.timestamp = Some(1000 + i);
+            event
+        })
+        .collect::<Vec<_>>();
+    events[500].fields.insert("latency".into(), "5ms".into());
+    let mut spec = analysis::SeriesSpec {
+        chart: "time".into(),
+        metric: "avg".into(),
+        field: Some("latency".into()),
+        interval_ms: Some(1000),
+        split: None,
+        limit: None,
+        unit: Some("auto".into()),
+    };
+    let result = serde_json::to_value(analysis::compute_series(&events, &spec)).unwrap();
+    assert_eq!(result["unit"], "duration");
+    assert_eq!(result["incompatible_units"], 0);
+    assert_eq!(result["series"][0]["points"], serde_json::json!([5.0]));
+    assert_eq!(result["series"][0]["samples"], serde_json::json!([1]));
+    spec.metric = "count".into();
+    spec.field = None;
+    let count = serde_json::to_value(analysis::compute_series(&events, &spec)).unwrap();
+    assert_eq!(count["unit"], "number");
+    assert_eq!(count["series"][0]["points"], serde_json::json!([501.0]));
+
+    // Ties must resolve consistently between separately computed metrics.
+    events[499].fields.insert("latency".into(), "5".into());
+    spec.field = Some("latency".into());
+    for metric in ["min", "max", "avg", "sum"] {
+        spec.metric = metric.into();
+        let result = serde_json::to_value(analysis::compute_series(&events, &spec)).unwrap();
+        assert_eq!(result["unit"], "number");
+        assert_eq!(result["incompatible_units"], 1);
+    }
+}
+
+#[test]
+fn exact_value_filters_preserve_case_whitespace_and_empty_literals() {
+    let values = ["API", "api", " API ", "(vazio)", "", "ÁPI"];
+    let mut text = values
+        .iter()
+        .map(|value| serde_json::json!({"category":value,"message":value,"code":value}).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push_str("\n{\"message\":\"missing\"}\n");
+    // Same decoded string as row 0, through escaped JSON text.
+    text.push_str(
+        "{\"category\":\"\\u0041PI\",\"message\":\"\\u0041PI\",\"code\":\"\\u0041PI\"}\n",
+    );
+    let fixture = Fixture::new(&text);
+    let index = fixture.index("jsonl");
+    let events = materialize(&index);
+    let empty = CodesConfig::default();
+    for (value, expected) in [
+        ("API", vec![0, 7]),
+        ("api", vec![1]),
+        (" API ", vec![2]),
+        ("(vazio)", vec![3]),
+        ("", vec![4]),
+        ("ÁPI", vec![5]),
+        ("ápi", vec![]),
+    ] {
+        let exact = vec![filter("category", "equals_exact", value)];
+        assert!(workspace::validate(&exact).is_ok());
+        assert_eq!(
+            query::filtered_indices(&events, &exact),
+            expected,
+            "memory {value:?}"
+        );
+        assert_eq!(
+            query::indexed_matches(&index, &exact, &empty, &empty, &[]),
+            expected,
+            "index {value:?}"
+        );
+        let not_exact = vec![filter("category", "not_equals_exact", value)];
+        assert!(workspace::validate(&not_exact).is_ok());
+        let complement = (0..events.len())
+            .filter(|i| !expected.contains(i))
+            .collect::<Vec<_>>();
+        assert_eq!(query::filtered_indices(&events, &not_exact), complement);
+        assert_eq!(
+            query::indexed_matches(&index, &not_exact, &empty, &empty, &[]),
+            complement
+        );
+    }
+    for column in ["code", "message"] {
+        let exact = vec![filter(column, "equals_exact", "API")];
+        assert_eq!(query::filtered_indices(&events, &exact), vec![0, 7]);
+        assert_eq!(
+            query::indexed_matches(&index, &exact, &empty, &empty, &[]),
+            vec![0, 7]
+        );
+    }
+    // Existing manual equals keeps its prior case-insensitive/trimmed semantics.
+    let legacy = vec![filter("category", "equals", " API ")];
+    assert_eq!(query::filtered_indices(&events, &legacy), vec![0, 1, 7]);
+    assert_eq!(
+        query::indexed_matches(&index, &legacy, &empty, &empty, &[]),
+        vec![0, 1, 7]
+    );
+}
+
+#[test]
+fn numeric_series_samples_distinguish_gaps_from_real_zero() {
+    let events = [
+        (0, Some("-10ms")),
+        (2, Some("-5ms")),
+        (3, Some("0ms")),
+        (4, Some("invalid")),
+        (5, Some("1GB")),
+        (6, None),
+        (7, Some("4ms")),
+        (7, Some("6ms")),
+    ]
+    .into_iter()
+    .map(|(second, value)| {
+        let mut event = Event::empty();
+        event.timestamp = Some(1000 + second * 1000);
+        if let Some(value) = value {
+            event.fields.insert("metric".into(), value.into());
+        }
+        event
+    })
+    .collect::<Vec<_>>();
+    let mut spec = analysis::SeriesSpec {
+        chart: "time".into(),
+        metric: "max".into(),
+        field: Some("metric".into()),
+        interval_ms: Some(1000),
+        split: None,
+        limit: None,
+        unit: Some("duration".into()),
+    };
+    for metric in ["min", "max", "sum", "avg"] {
+        spec.metric = metric.into();
+        let result = serde_json::to_value(analysis::compute_series(&events, &spec)).unwrap();
+        assert_eq!(
+            result["series"][0]["samples"],
+            serde_json::json!([1, 0, 1, 1, 0, 0, 0, 2])
+        );
+        assert_eq!(result["series"][0]["points"][0], -10.0);
+        assert_eq!(result["series"][0]["points"][1], 0.0); // Empty, compatible legacy points.
+        assert_eq!(result["series"][0]["points"][3], 0.0); // A real observed zero.
+        assert_eq!(result["incompatible_units"], 1);
+    }
+    spec.metric = "count".into();
+    let count = serde_json::to_value(analysis::compute_series(&events, &spec)).unwrap();
+    assert_eq!(
+        count["series"][0]["samples"],
+        serde_json::json!([1, 0, 1, 1, 1, 1, 1, 2])
+    );
+    spec.metric = "distinct".into();
+    let distinct = serde_json::to_value(analysis::compute_series(&events, &spec)).unwrap();
+    assert_eq!(
+        distinct["series"][0]["samples"],
+        serde_json::json!([1, 0, 1, 1, 1, 1, 0, 2])
+    );
+
+    // Terms use the same validity count, including the optimized count path.
+    spec.chart = "terms".into();
+    spec.metric = "avg".into();
+    let terms = serde_json::to_value(analysis::compute_series(&events, &spec)).unwrap();
+    for (label, samples) in terms["x"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(terms["series"][0]["samples"].as_array().unwrap())
+    {
+        let missing = matches!(label.as_str().unwrap(), "invalid" | "1GB" | "(vazio)");
+        assert_eq!(samples.as_u64().unwrap(), u64::from(!missing));
+    }
+    spec.metric = "count".into();
+    let terms = serde_json::to_value(analysis::compute_series(&events, &spec)).unwrap();
+    assert_eq!(
+        terms["series"][0]["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .sum::<u64>(),
+        8
+    );
+}
+
+#[test]
+fn timeline_buckets_never_extend_past_requested_end() {
+    let state = state_for(crate::SourceData::None);
+    for (end, requested, expected) in [(100, 80, 51), (0, 100, 1), (2, 100, 3)] {
+        let result = workspace::timeline_range_impl(&state, vec![], 0, end, requested).unwrap();
+        let json = serde_json::to_value(result).unwrap();
+        let buckets = json["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), expected);
+        assert!(buckets
+            .iter()
+            .all(|b| b["timestamp"].as_i64().unwrap() <= end));
+    }
+}
+
+#[test]
+fn generic_text_with_non_ascii_prefix_never_panics() {
+    for message in [
+        "错误详情：服务器不可用",
+        "⚠ falha de conexão",
+        "日本語ログの行",
+        "2026-01-01 10:00:00 错误详情",
+    ] {
+        let ev = sources::parse_line(message.as_bytes(), "text", None, &[]);
+        assert_eq!(ev.message, message);
+    }
+}
+
+#[test]
+fn discovery_does_not_mix_incompatible_units_or_claim_independent_pairs() {
+    let mut events = Vec::new();
+    for i in 0..100 {
+        let mut ev = Event::empty();
+        ev.fields
+            .insert("region".into(), if i % 2 == 0 { "a" } else { "b" }.into());
+        ev.fields
+            .insert("kind".into(), if i % 4 < 2 { "x" } else { "y" }.into());
+        ev.fields.insert(
+            "metric".into(),
+            if i % 2 == 0 { "10ms" } else { "10GB" }.into(),
+        );
+        ev.fields.insert(
+            "mostly_duration".into(),
+            match i {
+                0 => "1GB",
+                1 => "900ms",
+                _ => "10ms",
+            }
+            .into(),
+        );
+        events.push(ev);
+    }
+    let state = state_for(crate::SourceData::Memory(events));
+    let result = crate::discover_patterns_impl(&state, vec![], None);
+    assert!(result.outliers.is_empty());
+    assert!(result
+        .associations
+        .iter()
+        .all(|a| a.left.field != "kind" && a.right.field != "kind"));
+    assert_eq!(analysis::parse_num_unit("1e3").unwrap().0, 1000.0);
+    assert!(analysis::parse_num_unit("NaN").is_none());
+    assert!(analysis::parse_num_unit("Infinity").is_none());
+}
 fn materialize(idx: &sources::FileIndex) -> Vec<Event> {
     let empty = CodesConfig::default();
     (0..idx.lines.len())
@@ -382,7 +1174,7 @@ fn cached_index_reopens_and_invalidates_when_source_changes() {
     assert_ne!(c.identity, id);
 }
 #[test]
-#[ignore = "Generates a 1 GiB workload; run explicitly in release mode."]
+#[ignore = "Generates a workload (BENCH_MB, default 1 GiB); run explicitly."]
 fn benchmark_large_index() {
     let mb = std::env::var("BENCH_MB")
         .ok()
@@ -390,16 +1182,37 @@ fn benchmark_large_index() {
         .unwrap_or(1024);
     let file = Fixture::new("");
     let mut writer = std::io::BufWriter::new(std::fs::File::create(&file.0).unwrap());
-    let line=format!("{{\"timestamp\":1706745600000,\"level\":\"info\",\"source\":\"worker\",\"message\":\"processed {}\"}}\n","x".repeat(900));
-    let count = mb * 1024 * 1024 / line.len();
-    for _ in 0..count {
-        writer.write_all(line.as_bytes()).unwrap();
+    let array = std::env::var("BENCH_FORMAT").as_deref() == Ok("array");
+    let variants: Vec<_> = (0..32).map(|i| format!(
+        "{{\"timestamp\":{},\"log\":{{\"level\":\"{}\"}},\"service\":{{\"name\":\"{}\"}},\"region\":\"{}\",\"duration_ms\":{},\"message\":\"processed job {} {}\"}}",
+        1706745600000i64+i*1000, if i<8 {"error"} else {"info"}, if i<10 {"api"} else {"worker"}, if i<12 {"south"} else {"north"}, if i==31 {900} else {20+i%5}, i, "x".repeat(900)
+    )).collect();
+    let average = variants.iter().map(|line| line.len() + 1).sum::<usize>() / variants.len();
+    let count = mb * 1024 * 1024 / average;
+    if array {
+        writer.write_all(b"[\n").unwrap();
+    }
+    for i in 0..count {
+        if array && i > 0 {
+            writer.write_all(b",\n").unwrap();
+        }
+        let unique = variants[i % variants.len()].replacen(
+            &format!("processed job {} ", i % variants.len()),
+            &format!("processed job {i} "),
+            1,
+        );
+        writer.write_all(unique.as_bytes()).unwrap();
+        if !array {
+            writer.write_all(b"\n").unwrap();
+        }
+    }
+    if array {
+        writer.write_all(b"\n]\n").unwrap();
     }
     writer.flush().unwrap();
     drop(writer);
     let start = std::time::Instant::now();
-    let idx =
-        crate::index_cache::open(file.0.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+    let idx = crate::index_cache::open(file.0.to_str().unwrap(), "auto", None, None, None).unwrap();
     let cold = start.elapsed().as_secs_f64();
     assert_eq!(idx.lines.len(), count);
     let empty = CodesConfig::default();
@@ -428,13 +1241,46 @@ fn benchmark_large_index() {
     });
     let overview_seconds = start.elapsed().as_secs_f64();
     assert_eq!(summary.total, count);
-    drop(idx);
+    let start = std::time::Instant::now();
+    let top10 = analysis::compute_series_stream(
+        || (0..idx.lines.len()).map(|i| sources::event_at(&idx, i, &empty, &empty, &[])),
+        &analysis::SeriesSpec {
+            chart: "terms".into(),
+            metric: "count".into(),
+            field: Some("message".into()),
+            interval_ms: None,
+            split: None,
+            limit: Some(10),
+            unit: None,
+        },
+    );
+    let top10_count_seconds = start.elapsed().as_secs_f64();
+    assert_eq!(
+        serde_json::to_value(top10).unwrap()["x"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    let state = state_for(crate::SourceData::Indexed(idx));
+    let start = std::time::Instant::now();
+    let discovery = crate::discover_patterns_impl(&state, vec![], None);
+    let discovery_seconds = start.elapsed().as_secs_f64();
+    assert_eq!(discovery.total, count);
+    assert_eq!(
+        discovery.sample_count,
+        count.min(crate::discovery::SAMPLE_CAP)
+    );
+    assert!(discovery.complete);
+    assert!(!discovery.outliers.is_empty());
+    assert!(!discovery.associations.is_empty());
+    drop(state);
     let start = std::time::Instant::now();
     let reopened =
-        crate::index_cache::open(file.0.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        crate::index_cache::open(file.0.to_str().unwrap(), "auto", None, None, None).unwrap();
     let warm = start.elapsed().as_secs_f64();
     assert_eq!(reopened.lines.len(), count);
-    let result = serde_json::json!({"bytes":count*line.len(),"events":count,"cold_index_seconds":cold,"warm_index_seconds":warm,"first_page_seconds":first_seconds,"next_page_seconds":page_seconds,"overview_seconds":overview_seconds});
+    let result = serde_json::json!({"format":if array {"json_array"} else {"jsonl"},"profile":if cfg!(debug_assertions) {"debug"} else {"release"},"bytes":std::fs::metadata(&file.0).unwrap().len(),"events":count,"cold_index_seconds":cold,"warm_index_seconds":warm,"first_page_seconds":first_seconds,"next_page_seconds":page_seconds,"overview_seconds":overview_seconds,"top10_unique_messages_seconds":top10_count_seconds,"discovery_seconds":discovery_seconds,"discovery_sample_count":discovery.sample_count,"discovery_associations":discovery.associations.len(),"discovery_outliers":discovery.outliers.len(),"discovery_behavior_shifts":discovery.behavior_shifts.len(),"discovery_changes":discovery.changes.len()});
     println!("BENCHMARK {result}");
     if let Ok(path) = std::env::var("BENCH_RESULT") {
         std::fs::write(path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();

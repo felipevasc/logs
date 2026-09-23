@@ -392,7 +392,7 @@ fn succeeded(result: &CallToolResult) -> bool {
 // ------------------------------------------------------------- parâmetros
 
 const FORMAT_IDS_DOC: &str = "Format id: auto, jsonl, syslog3164, syslog5424, apache, firewall, cef, leef, log4j, logfmt, csv, w3c, text, wildfly or custom:<name>. Use list_formats to see the available ids.";
-const FILTERS_DOC: &str = "Filters to apply (AND semantics). Each filter: {column, op, value, value2?}. Ops: contains, not_contains, equals, not_equals, starts_with, regex, gt, gte, lt, lte, between (uses value2 as upper bound), empty, not_empty. Special column \"_all\" matches the whole raw line. For the timestamp column, gt/gte/lt/lte/between accept epoch ms or ISO text.";
+const FILTERS_DOC: &str = "Filters to apply (AND semantics). Each filter: {column, op, value, value2?}. Ops: contains, not_contains, equals, not_equals, equals_exact, not_equals_exact, starts_with, regex, gt, gte, lt, lte, between (uses value2 as upper bound), empty, not_empty. Exact equality preserves case and whitespace. Special column \"_all\" matches the whole raw line. For the timestamp column, gt/gte/lt/lte/between accept epoch ms or ISO text.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoadFileParams {
@@ -1205,7 +1205,7 @@ impl ServerHandler for LogInsightMcp {
                  time context around a given event.\n\
                  \n\
                  FILTERS: tools accept a filters array of {column, op, value, value2?} with AND semantics. \
-                 Ops: contains, not_contains, equals, not_equals, starts_with, regex, gt, gte, lt, lte, \
+                 Ops: contains, not_contains, equals, not_equals, equals_exact, not_equals_exact, starts_with, regex, gt, gte, lt, lte, \
                  between (uses value2 as upper bound), empty, not_empty. The special column \"_all\" matches \
                  the whole raw line. For the timestamp column, gt/gte/lt/lte/between accept epoch \
                  milliseconds or ISO date-time text.\n\

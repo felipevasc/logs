@@ -19,6 +19,11 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     if s.len() < 8 {
         return None;
     }
+    if let Ok(number) = s.parse::<f64>() {
+        if let Some(ms) = epoch_to_ms(number) {
+            return Some(ms);
+        }
+    }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_millis());
     }
@@ -58,66 +63,137 @@ pub fn normalize_level(raw: &str) -> String {
 
 // ---------------------------------------------------------------- arquivos
 
-const TS_KEYS: &[&str] = &["timestamp", "time", "ts", "@timestamp", "date", "datetime"];
-const LEVEL_KEYS: &[&str] = &["level", "severity", "lvl", "log.level"];
+const TS_KEYS: &[&str] = &[
+    "timestamp",
+    "time",
+    "ts",
+    "@timestamp",
+    "date",
+    "datetime",
+    "timeStamp",
+    "event.created",
+];
+const LEVEL_KEYS: &[&str] = &[
+    "level",
+    "severity",
+    "lvl",
+    "log.level",
+    "severityText",
+    "severity_text",
+];
 const CODE_KEYS: &[&str] = &["code", "event_id", "eventid", "event.code", "id"];
-const SOURCE_KEYS: &[&str] = &["source", "provider", "logger", "service", "channel"];
+const SOURCE_KEYS: &[&str] = &[
+    "source",
+    "provider",
+    "logger",
+    "service",
+    "channel",
+    "service.name",
+    "host.name",
+    "resource.service.name",
+];
 const MSG_KEYS: &[&str] = &["message", "msg", "log", "body", "text"];
 
 fn take_key(map: &mut Map<String, Value>, keys: &[&str]) -> Option<Value> {
-    keys.iter().find_map(|k| map.remove(*k))
+    // An object/null in an alias must not hide a usable scalar alias.
+    let key = keys.iter().find_map(|key| {
+        map.iter()
+            .find(|(k, v)| {
+                k.eq_ignore_ascii_case(key)
+                    && (v.is_string() || v.is_number() || v.is_boolean())
+                    && v.as_str().is_none_or(|s| !s.trim().is_empty())
+            })
+            .map(|(k, _)| k.clone())
+    })?;
+    if key.contains('.') {
+        map.get(&key).cloned()
+    } else {
+        map.remove(&key)
+    }
+}
+
+fn epoch_to_ms(number: f64) -> Option<i64> {
+    if !number.is_finite() {
+        return None;
+    }
+    let magnitude = number.abs();
+    let millis = if magnitude >= 1e17 {
+        number / 1e6
+    } else if magnitude >= 1e14 {
+        number / 1e3
+    } else if magnitude >= 1e11 {
+        number
+    } else if magnitude >= 1e8 {
+        number * 1000.0
+    } else {
+        return None;
+    };
+    let ms = millis as i64;
+    chrono::DateTime::from_timestamp_millis(ms).map(|_| ms)
 }
 
 fn value_to_ms(v: &Value) -> Option<i64> {
     match v {
-        Value::Number(n) => {
-            let f = n.as_f64()?;
-            // heurística: >1e12 é ms, >1e9 é segundos
-            if f > 1e12 {
-                Some(f as i64)
-            } else if f > 1e9 {
-                Some((f * 1000.0) as i64)
-            } else {
-                None
-            }
-        }
+        Value::Number(n) => epoch_to_ms(n.as_f64()?),
         Value::String(s) => parse_timestamp(s),
         _ => None,
     }
 }
 
-fn event_from_json(mut map: Map<String, Value>, raw: &str) -> Event {
+fn flatten_json(
+    map: Map<String, Value>,
+    prefix: &str,
+    depth: usize,
+    flat: &mut Map<String, Value>,
+) {
+    // Explicit dotted keys win over the equivalent nested path.
+    let mut leaves = Vec::new();
+    for (key, value) in map {
+        let path = if prefix.is_empty() {
+            key
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            Value::Object(inner) if depth < 12 && !inner.is_empty() => {
+                flatten_json(inner, &path, depth + 1, flat)
+            }
+            value => leaves.push((path, value)),
+        }
+    }
+    for (path, value) in leaves {
+        flat.insert(path, value);
+    }
+}
+
+fn event_from_json(input: Map<String, Value>, raw: &str) -> Event {
     let mut ev = Event::empty();
     ev.raw = raw.to_string();
-
-    // ECS (Elastic Common Schema): campos aninhados conhecidos (pré-extraídos
-    // para não misturar borrows mutáveis/imutáveis do mapa)
-    let nested =
-        |obj: &str, key: &str| -> Option<Value> { map.get(obj).and_then(|o| o.get(key)).cloned() };
-    let ecs_ts = map.get("@timestamp").cloned();
-    let ecs_level = nested("log", "level");
-    let ecs_code = nested("event", "code");
-    let ecs_source = nested("host", "name").or_else(|| nested("service", "name"));
-
-    if let Some(v) = take_key(&mut map, TS_KEYS).or(ecs_ts) {
+    let mut map = Map::new();
+    flatten_json(input, "", 0, &mut map);
+    // Keep normalized aliases useful for filtering even when they also fill
+    // a standard column (for example service.name and log.level).
+    if let Some(v) = take_key(&mut map, TS_KEYS) {
         ev.timestamp = value_to_ms(&v);
     }
-    map.remove("@timestamp");
-    if let Some(v) = take_key(&mut map, LEVEL_KEYS).or(ecs_level) {
+    if let Some(v) = take_key(&mut map, LEVEL_KEYS) {
         ev.level = normalize_level(
             &v.as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| v.to_string()),
         );
     }
-    if let Some(v) = take_key(&mut map, CODE_KEYS).or(ecs_code) {
+    if let Some(v) = take_key(&mut map, CODE_KEYS) {
         ev.code = match &v {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
     }
-    if let Some(v) = take_key(&mut map, SOURCE_KEYS).or(ecs_source) {
-        ev.source = v.as_str().unwrap_or_default().to_string();
+    if let Some(v) = take_key(&mut map, SOURCE_KEYS) {
+        ev.source = v
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| v.to_string());
     }
     if let Some(v) = take_key(&mut map, MSG_KEYS) {
         ev.message = v
@@ -128,18 +204,7 @@ fn event_from_json(mut map: Map<String, Value>, raw: &str) -> Event {
     if ev.message.is_empty() {
         ev.message = raw.chars().take(500).collect();
     }
-    // Achata objetos de primeiro nível ("event": {"action": ...} → "event.action")
-    let mut flat = Map::new();
-    for (k, v) in map {
-        if let Value::Object(inner) = &v {
-            for (ik, iv) in inner {
-                flat.insert(format!("{k}.{ik}"), iv.clone());
-            }
-        } else {
-            flat.insert(k, v);
-        }
-    }
-    ev.fields = flat;
+    ev.fields = map;
     ev
 }
 
@@ -162,7 +227,11 @@ fn event_from_text(line: &str) -> Event {
     for kw in [
         "CRITICAL", "FATAL", "ERROR", "WARN", "INFO", "DEBUG", "TRACE",
     ] {
-        if trimmed.len() >= kw.len() && trimmed[..kw.len()].eq_ignore_ascii_case(kw) {
+        if trimmed
+            .as_bytes()
+            .get(..kw.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(kw.as_bytes()))
+        {
             ev.level = normalize_level(kw);
             break;
         }
@@ -390,6 +459,18 @@ fn parse_custom(line: &str, re: &regex::Regex) -> Option<Event> {
 
 /// Inferência automática do formato pela amostra inicial do arquivo.
 fn detect_format(bytes: &[u8]) -> &'static str {
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let trimmed = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map(|i| &bytes[i..])
+        .unwrap_or(bytes);
+    if trimmed.first() == Some(&b'[') {
+        let next = trimmed[1..].iter().find(|b| !b.is_ascii_whitespace());
+        if matches!(next, Some(b'{') | Some(b']')) {
+            return "jsonl";
+        }
+    }
     let mut n = 0usize;
     let (mut json, mut s3164, mut s5424, mut apache, mut fw, mut log4j, mut logfmt, mut wildfly) =
         (0, 0, 0, 0, 0, 0, 0, 0);
@@ -1448,6 +1529,7 @@ pub fn parse_line(
     custom: Option<&CustomParse>,
     header: &[String],
 ) -> Event {
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     let text = String::from_utf8_lossy(bytes);
     let mut ev = match format {
         "snapshot" => {
@@ -1620,6 +1702,103 @@ fn push_meta(
     lines.push(meta_for_line(line, offset, fmt, custom, header));
 }
 
+/// Index JSON array objects directly in the mapped file, including pretty JSON.
+/// Only positions and nesting are kept; the array is never deserialized as a Vec.
+fn index_json_array(
+    bytes: &[u8],
+    start: usize,
+    lines: &mut Vec<LineMeta>,
+    custom: Option<&CustomParse>,
+    header: &[String],
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<(), String> {
+    let mut stack = Vec::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut record_start = None;
+    let mut need_separator = false;
+    let mut after_comma = false;
+    for (i, &byte) in bytes.iter().enumerate().skip(start + 1) {
+        if i % 65_536 == 0 {
+            crate::operations::check()?;
+        }
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        if let Some(begin) = record_start {
+            match byte {
+                b'"' => quoted = true,
+                b'{' | b'[' => {
+                    if stack.len() >= 128 {
+                        return Err("JSON excede 128 níveis de aninhamento.".into());
+                    }
+                    stack.push(byte);
+                }
+                b'}' | b']' => {
+                    let opening = if byte == b'}' { b'{' } else { b'[' };
+                    if stack.pop() != Some(opening) {
+                        return Err(format!("Estrutura JSON inválida no byte {i}."));
+                    }
+                    if stack.is_empty() {
+                        if i - begin >= u32::MAX as usize {
+                            return Err("Um registro JSON excede 4 GB.".into());
+                        }
+                        lines.push(meta_for_line(
+                            &bytes[begin..=i],
+                            begin as u64,
+                            "jsonl",
+                            custom,
+                            header,
+                        ));
+                        record_start = None;
+                        need_separator = true;
+                        if lines.len().is_multiple_of(2048) {
+                            if let Some(cb) = progress {
+                                cb(i, bytes.len());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        match byte {
+            b']' if !after_comma => {
+                if bytes[i + 1..].iter().any(|b| !b.is_ascii_whitespace()) {
+                    return Err("Há conteúdo após o fim do array JSON.".into());
+                }
+                return Ok(());
+            }
+            b',' if need_separator => {
+                need_separator = false;
+                after_comma = true;
+            }
+            b'{' if !need_separator => {
+                record_start = Some(i);
+                stack.push(byte);
+                after_comma = false;
+            }
+            _ => {
+                return Err(format!(
+                    "Esperado um objeto ou separador no array JSON (byte {i})."
+                ))
+            }
+        }
+    }
+    Err("Array JSON incompleto: falta fechar um objeto ou o array.".into())
+}
+
 /// Indexa um arquivo inteiro em uma única passada, guardando apenas
 /// metadados compactos por linha (~32 bytes/linha).
 pub fn index_file(
@@ -1681,19 +1860,53 @@ pub fn index_file(
         "log4j" | "wildfly" => detect_entry_start(&mmap),
         _ => None,
     };
-    for (physical_line, nl) in memchr::memchr_iter(b'\n', &mmap).enumerate() {
-        if physical_line % 2048 == 0 {
-            crate::operations::check()?;
+    let content_start = if mmap.starts_with(&[0xef, 0xbb, 0xbf]) {
+        3
+    } else {
+        0
+    };
+    let array_start = (content_start..mmap.len())
+        .find(|&i| !mmap[i].is_ascii_whitespace())
+        .filter(|&i| fmt == "jsonl" && mmap[i] == b'[');
+    if let Some(start) = array_start {
+        index_json_array(&mmap, start, &mut lines, custom.as_ref(), &header, progress)?;
+    } else {
+        for (physical_line, nl) in memchr::memchr_iter(b'\n', &mmap).enumerate() {
+            if physical_line % 2048 == 0 {
+                crate::operations::check()?;
+            }
+            let raw = &mmap[offset..nl];
+            let line = if raw.last() == Some(&b'\r') {
+                &raw[..raw.len() - 1]
+            } else {
+                raw
+            };
+            if !line.is_empty() {
+                let skip = (fmt == "csv" && first_line) || (fmt == "w3c" && line[0] == b'#');
+                if !skip {
+                    push_meta(
+                        &mut lines,
+                        line,
+                        offset as u64,
+                        fmt,
+                        custom.as_ref(),
+                        &header,
+                        start_re.as_ref(),
+                    );
+                }
+            }
+            first_line = false;
+            offset = nl + 1;
+            if let Some(cb) = progress {
+                if lines.len() >= last_report + 2048 {
+                    last_report = lines.len();
+                    cb(lines.len(), total_lines);
+                }
+            }
         }
-        let raw = &mmap[offset..nl];
-        let line = if raw.last() == Some(&b'\r') {
-            &raw[..raw.len() - 1]
-        } else {
-            raw
-        };
-        if !line.is_empty() {
-            let skip = (fmt == "csv" && first_line) || (fmt == "w3c" && line[0] == b'#');
-            if !skip {
+        if offset < mmap.len() {
+            let line = &mmap[offset..];
+            if !line.is_empty() {
                 push_meta(
                     &mut lines,
                     line,
@@ -1704,28 +1917,6 @@ pub fn index_file(
                     start_re.as_ref(),
                 );
             }
-        }
-        first_line = false;
-        offset = nl + 1;
-        if let Some(cb) = progress {
-            if lines.len() >= last_report + 2048 {
-                last_report = lines.len();
-                cb(lines.len(), total_lines);
-            }
-        }
-    }
-    if offset < mmap.len() {
-        let line = &mmap[offset..];
-        if !line.is_empty() {
-            push_meta(
-                &mut lines,
-                line,
-                offset as u64,
-                fmt,
-                custom.as_ref(),
-                &header,
-                start_re.as_ref(),
-            );
         }
     }
 

@@ -29,9 +29,15 @@ pub fn parse_num_unit(s: &str) -> Option<(f64, UnitKind)> {
     if s.is_empty() {
         return None;
     }
+    if let Ok(n) = s.parse::<f64>() {
+        return n.is_finite().then_some((n, UnitKind::Number));
+    }
     let lower = s.to_lowercase();
     let (num_part, unit_part) = split_num_unit(&lower);
     let n: f64 = num_part.replace(',', ".").parse().ok()?;
+    if !n.is_finite() {
+        return None;
+    }
     Some(match unit_part {
         "" => (n, UnitKind::Number),
         "b" | "byte" | "bytes" => (n, UnitKind::Bytes),
@@ -253,12 +259,16 @@ pub struct SeriesResult {
     /// "time": epoch ms do bucket; "terms": rótulo
     x: Vec<Value>,
     series: Vec<SeriesData>,
+    incompatible_units: usize,
 }
 
 #[derive(Serialize)]
 pub struct SeriesData {
     name: String,
     points: Vec<f64>,
+    /// Values admitted to each accumulator; zero identifies an empty numeric bucket.
+    /// Count includes all records; distinct includes records with a nonempty value.
+    samples: Vec<usize>,
 }
 
 struct MetricAcc {
@@ -281,7 +291,12 @@ impl MetricAcc {
             distinct: Default::default(),
         }
     }
-    fn push(&mut self, ev: &Event, field: Option<&str>) {
+    fn push_checked(
+        &mut self,
+        ev: &Event,
+        field: Option<&str>,
+        expected: Option<UnitKind>,
+    ) -> bool {
         match self.metric.as_str() {
             "count" => self.n += 1,
             "distinct" => {
@@ -289,13 +304,21 @@ impl MetricAcc {
                     if let Some(v) = ev.col_str(f) {
                         if !v.is_empty() {
                             self.distinct.insert(v);
+                            self.n += 1;
                         }
                     }
                 }
             }
             _ => {
                 if let Some(f) = field {
-                    if let Some((n, _)) = ev.col_str(f).and_then(|s| parse_num_unit(&s)) {
+                    if let Some((n, unit)) = ev
+                        .col_str(f)
+                        .and_then(|s| parse_num_unit(&s))
+                        .filter(|(n, _)| n.is_finite())
+                    {
+                        if expected.is_some_and(|e| e != unit) {
+                            return true;
+                        }
                         self.sum += n;
                         self.n += 1;
                         self.min = Some(self.min.map(|m: f64| m.min(n)).unwrap_or(n));
@@ -304,6 +327,7 @@ impl MetricAcc {
                 }
             }
         }
+        false
     }
     fn value(&self) -> f64 {
         match self.metric.as_str() {
@@ -324,20 +348,30 @@ impl MetricAcc {
     }
 }
 
-fn dominant_unit(events: &[Event], field: &str, sample: usize) -> UnitKind {
-    let mut votes: HashMap<u8, usize> = HashMap::new();
-    for ev in events.iter().take(sample) {
-        if let Some((_, u)) = ev.col_str(field).and_then(|s| parse_num_unit(&s)) {
-            *votes.entry(u as u8).or_default() += 1;
+fn dominant_unit(events: impl Iterator<Item = Event>, field: &str, sample: usize) -> UnitKind {
+    let mut votes = [0usize; 5];
+    let mut valid = 0;
+    for ev in events {
+        if valid >= sample || crate::operations::cancelled() {
+            break;
+        }
+        if let Some((_, unit)) = ev
+            .col_str(field)
+            .and_then(|s| parse_num_unit(&s))
+            .filter(|(n, _)| n.is_finite())
+        {
+            votes[unit as usize] += 1;
+            valid += 1;
         }
     }
     votes
         .into_iter()
-        .max_by_key(|(_, c)| *c)
+        .enumerate()
+        .max_by_key(|(unit, count)| (*count, std::cmp::Reverse(*unit)))
         .map(|(u, _)| match u {
-            u if u == UnitKind::Bytes as u8 => UnitKind::Bytes,
-            u if u == UnitKind::Bits as u8 => UnitKind::Bits,
-            u if u == UnitKind::DurationMs as u8 => UnitKind::DurationMs,
+            u if u == UnitKind::Bytes as usize => UnitKind::Bytes,
+            u if u == UnitKind::Bits as usize => UnitKind::Bits,
+            u if u == UnitKind::DurationMs as usize => UnitKind::DurationMs,
             _ => UnitKind::Number,
         })
         .unwrap_or(UnitKind::Number)
@@ -364,33 +398,69 @@ where
 {
     let limit = spec.limit.unwrap_or(10);
     let field = spec.field.as_deref();
+    if spec.chart == "terms" && spec.metric == "count" {
+        let key = field.unwrap_or("level");
+        let mut counts = crate::distinct::Terms::default();
+        for ev in events() {
+            if crate::operations::cancelled() {
+                break;
+            }
+            counts.insert(
+                ev.col_str(key)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "(vazio)".into()),
+            );
+        }
+        let top = counts.top(limit);
+        return SeriesResult {
+            kind: "terms".into(),
+            unit: "number".into(),
+            interval_ms: 0,
+            x: top
+                .iter()
+                .map(|(value, _)| Value::from(value.clone()))
+                .collect(),
+            series: vec![SeriesData {
+                name: key.into(),
+                samples: top.iter().map(|(_, n)| *n).collect(),
+                points: top.into_iter().map(|(_, n)| n as f64).collect(),
+            }],
+            incompatible_units: 0,
+        };
+    }
     let unit = match (spec.unit.as_deref(), field) {
         (Some(u), _) if u != "auto" => u.to_string(),
         (Some(_), None) | (None, None) => "number".to_string(),
-        (_, Some(f)) => unit_name(dominant_unit(
-            &events().take(500).collect::<Vec<_>>(),
-            f,
-            500,
-        )),
+        (_, Some(f)) => unit_name(dominant_unit(events(), f, 500)),
     };
+    let expected_unit = if matches!(spec.metric.as_str(), "count" | "distinct") {
+        None
+    } else {
+        match unit.as_str() {
+            "number" => Some(UnitKind::Number),
+            "bytes" => Some(UnitKind::Bytes),
+            "bits" => Some(UnitKind::Bits),
+            "duration" => Some(UnitKind::DurationMs),
+            _ => None,
+        }
+    };
+    let mut incompatible_units = 0;
 
     // splits: top N valores do campo de split
     let splits: Vec<String> = match &spec.split {
         Some(col) => {
-            let mut counts: HashMap<String, i64> = HashMap::new();
+            let mut counts = crate::distinct::Terms::default();
             for ev in events() {
                 if crate::operations::cancelled() {
                     break;
                 }
                 if let Some(v) = ev.col_str(col) {
                     if !v.is_empty() {
-                        *counts.entry(v).or_default() += 1;
+                        counts.insert(v);
                     }
                 }
             }
-            let mut v: Vec<_> = counts.into_iter().collect();
-            v.sort_by(|a, b| b.1.cmp(&a.1));
-            v.into_iter().take(6).map(|(k, _)| k).collect()
+            counts.top(6).into_iter().map(|(k, _)| k).collect()
         }
         None => vec![],
     };
@@ -417,23 +487,36 @@ where
                 .col_str(&key_field)
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "(vazio)".into());
-            accs.entry(key)
-                .or_insert_with(|| MetricAcc::new(&spec.metric))
-                .push(&ev, metric_field.map(|_| field.unwrap_or(&key_field)));
+            incompatible_units += usize::from(
+                accs.entry(key)
+                    .or_insert_with(|| MetricAcc::new(&spec.metric))
+                    .push_checked(
+                        &ev,
+                        metric_field.map(|_| field.unwrap_or(&key_field)),
+                        expected_unit,
+                    ),
+            );
         }
-        let mut items: Vec<(String, f64)> =
-            accs.iter().map(|(k, a)| (k.clone(), a.value())).collect();
+        let mut items: Vec<(String, f64, usize)> = accs
+            .iter()
+            .map(|(k, a)| (k.clone(), a.value(), a.n as usize))
+            .collect();
         items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         items.truncate(limit);
         return SeriesResult {
             kind: "terms".into(),
             unit,
             interval_ms: 0,
-            x: items.iter().map(|(k, _)| Value::from(k.clone())).collect(),
+            x: items
+                .iter()
+                .map(|(k, _, _)| Value::from(k.clone()))
+                .collect(),
             series: vec![SeriesData {
                 name: split_names[0].clone(),
-                points: items.into_iter().map(|(_, v)| v).collect(),
+                samples: items.iter().map(|(_, _, n)| *n).collect(),
+                points: items.into_iter().map(|(_, v, _)| v).collect(),
             }],
+            incompatible_units,
         };
     }
 
@@ -450,11 +533,12 @@ where
             interval_ms: 0,
             x: vec![],
             series: vec![],
+            incompatible_units: 0,
         };
     }
     let (tmin, tmax) = bounds.unwrap();
     let interval = spec.interval_ms.filter(|n| *n > 0).unwrap_or_else(|| {
-        let span = (tmax - tmin).max(1);
+        let span = tmax.saturating_sub(tmin).max(1);
         // ~60 buckets; escolhe intervalo "redondo"
         let target = span / 60;
         for nice in [
@@ -479,7 +563,7 @@ where
         2_592_000_000
     });
     let interval = interval.max((tmax.saturating_sub(tmin) / 2000).max(1));
-    let n_buckets = ((tmax - tmin) / interval + 2) as usize;
+    let n_buckets = (tmax.saturating_sub(tmin) / interval + 1) as usize;
 
     let mut accs: Vec<HashMap<String, MetricAcc>> =
         (0..n_buckets).map(|_| HashMap::new()).collect();
@@ -488,7 +572,7 @@ where
             break;
         }
         let Some(t) = ev.timestamp else { continue };
-        let b = ((t - tmin) / interval) as usize;
+        let b = (t.saturating_sub(tmin) / interval) as usize;
         if b >= n_buckets {
             continue;
         }
@@ -503,10 +587,12 @@ where
             }
             None => split_names[0].clone(),
         };
-        accs[b]
-            .entry(name)
-            .or_insert_with(|| MetricAcc::new(&spec.metric))
-            .push(&ev, field);
+        incompatible_units += usize::from(
+            accs[b]
+                .entry(name)
+                .or_insert_with(|| MetricAcc::new(&spec.metric))
+                .push_checked(&ev, field, expected_unit),
+        );
     }
 
     SeriesResult {
@@ -514,18 +600,23 @@ where
         unit,
         interval_ms: interval,
         x: (0..n_buckets)
-            .map(|b| Value::from(tmin + b as i64 * interval))
+            .map(|b| Value::from(tmin.saturating_add((b as i64).saturating_mul(interval))))
             .collect(),
         series: split_names
             .iter()
             .map(|name| SeriesData {
                 name: name.clone(),
+                samples: accs
+                    .iter()
+                    .map(|m| m.get(name).map(|a| a.n as usize).unwrap_or(0))
+                    .collect(),
                 points: accs
                     .iter()
                     .map(|m| m.get(name).map(|a| a.value()).unwrap_or(0.0))
                     .collect(),
             })
             .collect(),
+        incompatible_units,
     }
 }
 

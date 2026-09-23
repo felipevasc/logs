@@ -1,0 +1,25 @@
+html[data-theme="dark"][data-workspace="dataset"] { --accent:#e8c769; --accent-strong:#f3da8e; --accent-soft:#e8c71314; --hover:#e8c76909; --case-accent:#bd93f9; }
+html[data-theme="light"][data-workspace="dataset"] { --accent:#846200; --accent-strong:#614a05; --accent-soft:#bd910d13; --hover:#bd910d09; --case-accent:#7650b4; }
+html[data-theme="dark"][data-workspace="case"] { --bg-0:#1d1a29; --bg-1:#242031; --bg-2:#2c263c; --bg-3:#3a314c; --border:#3b324b; --border-strong:#554363; --accent:#bd93f9; --accent-strong:#d4b7ff; --accent-soft:#bd93f91b; --hover:#bd93f909; --text-0:#f4effa; --text-1:#bfb3d0; --text-2:#a095b2; --case-accent:#bd93f9; --code-bg:#1b1725; }
+html[data-theme="light"][data-workspace="case"] { --bg-0:#f6f3fa; --bg-1:#fefcff; --bg-2:#f0e9f7; --bg-3:#e5dcef; --border:#e0d5ec; --border-strong:#b5a0ce; --accent:#7650b4; --accent-strong:#563087; --accent-soft:#7650b414; --hover:#7650b409; --text-0:#30233e; --text-1:#605171; --text-2:#756282; --case-accent:#7650b4; --code-bg:#ede7f4; }
+.context-toggle { display:flex; flex:none; gap:3px; background:var(--bg-1); border:1px solid var(--border-strong); border-radius:8px; padding:3px; }
+.context-toggle button { display:flex; align-items:center; gap:7px; padding:6px 11px; min-height:30px; border:0; border-radius:5px; color:var(--text-1); background:transparent; cursor:pointer; font-size:11px; white-space:nowrap; }
+.context-toggle button.selected { color:var(--accent); background:var(--accent-soft); font-weight:650; }
+.context-toggle button[data-workspace-scope="case"] { --accent:var(--case-accent); }
+.context-toggle button:not(.selected):hover { background:var(--hover); }
+#context-case-count { font-size:9px; font-variant-numeric:tabular-nums; }
+.topbar .context-summary { flex:1; }
+.event-in-case { box-shadow:inset 3px 0 var(--case-accent); background:color-mix(in srgb,var(--case-accent) 7%,transparent)!important; }
+.event-in-case td:first-child::before { content:"◆"; color:var(--case-accent); margin-right:7px; font-size:8px; vertical-align:middle; }
+.event-in-case-action { color:var(--case-accent)!important; border-color:var(--case-accent)!important; }
+#workspace-home,.shell,#view-analysis,#view-stations,#view-trail,#view-artifact-source { view-transition-name:workspace-canvas; }
+html[data-switch-direction="to-case"]::view-transition-old(workspace-canvas) { animation:context-analysis-out .25s ease both; }
+html[data-switch-direction="to-case"]::view-transition-new(workspace-canvas) { animation:context-case-in .25s ease both; }
+html[data-switch-direction="to-analysis"]::view-transition-old(workspace-canvas) { animation:context-case-out .25s ease both; }
+html[data-switch-direction="to-analysis"]::view-transition-new(workspace-canvas) { animation:context-analysis-in .25s ease both; }
+@keyframes context-case-in { from{transform:translateX(100%);opacity:.5} to{transform:translateX(0);opacity:1} }
+@keyframes context-case-out { from{transform:translateX(0);opacity:1} to{transform:translateX(100%);opacity:.5} }
+@keyframes context-analysis-in { from{transform:translateX(-10%);opacity:.5} to{transform:translateX(0);opacity:1} }
+@keyframes context-analysis-out { from{transform:translateX(0);opacity:1} to{transform:translateX(-10%);opacity:.5} }
+@media(prefers-reduced-motion:reduce) { ::view-transition-old(workspace-canvas),::view-transition-new(workspace-canvas) { animation:none!important; } }
+@media(max-width:1100px) { .topbar{padding-inline:15px;gap:10px}.context-toggle button{padding:6px 8px}.topbar-case .case-select{width:135px} }

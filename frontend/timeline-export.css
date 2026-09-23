@@ -1,0 +1,35 @@
+.tx-trigger { display: inline-flex; align-items: center; gap: 6px; }
+.tx-backdrop { position: fixed; inset: 0; z-index: 300; background: var(--scrim); display: grid; place-items: center; padding: 20px; }
+.tx-dialog { width: min(420px, 100%); background: var(--bg-1); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow); padding: 22px; color: var(--text-0); }
+.tx-dialog h2 { margin: 0 0 10px; font-size: 17px; }
+.tx-dialog p { font-size: 12px; color: var(--text-1); line-height: 1.6; margin: 8px 0; }
+.tx-formats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 18px 0 12px; }
+.tx-formats label { display: flex; align-items: center; gap: 9px; padding: 13px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.tx-formats label:has(input:checked) { background: var(--accent-soft); border-color: var(--accent); }
+.tx-formats strong { display: block; font-size: 12px; }
+.tx-formats small { display: block; font-size: 10px; color: var(--text-2); margin-top: 3px; }
+.tx-dialog progress { display: block; width: 100%; height: 6px; margin: 17px 0; accent-color: var(--accent); }
+.tx-dialog [data-tx-status] { min-height: 40px; }
+.tx-dialog [data-tx-status].error { color: var(--lv-erro); }
+.tx-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.tx-stage { position: fixed; left: -100000px; top: 0; pointer-events: none; z-index: -10; }
+.tx-sheet { position: relative; overflow: hidden; background: var(--bg-0); color: var(--text-0); font-family: var(--font-ui); padding: 0; }
+.tx-sheet-heading { height: 84px; padding: 17px 20px 12px; border-bottom: 1px solid var(--border); overflow: hidden; }
+.tx-sheet-heading strong { display: block; font-size: 16px; line-height: 1.5; }
+.tx-sheet-heading p { margin: 3px 0 0; color: var(--text-1); font-size: 10px; line-height: 1.5; white-space: pre-wrap; }
+.tx-sheet-viewport { position: relative; overflow: hidden; }
+.tx-sheet .ct-board { margin: 0 !important; max-width: none !important; min-width: 0 !important; }
+.tx-sheet .ct-controls, .tx-sheet .ct-open, .tx-sheet .ct-editor-backdrop,
+.tx-sheet .tl-controls, .tx-sheet #tl-instructions, .tx-sheet .tl-hover,
+.tx-sheet .tl-drag-band, .tx-sheet .tl-selection-actions, .tx-sheet .tx-trigger { display: none !important; }
+.tx-sheet .ct-matrix-ruler, .tx-sheet .ct-matrix-corner, .tx-sheet .ct-lane-label { position: absolute; }
+.tx-sheet .ct-matrix-corner, .tx-sheet .ct-lane-label { left: var(--tx-left, 0px); }
+.tx-sheet .ct-entry, .tx-sheet .ct-note, .tx-sheet .ct-lane-label { cursor: default; }
+.tx-sheet .ct-entry:focus-within, .tx-sheet .ct-note:focus-within { outline: none; }
+.tx-sheet .ct-links .is-highlighted { stroke-width: 1.5px; opacity: .85; }
+.tx-sheet .ct-note.is-arrow-target { border-color: transparent; }
+.tx-sheet-footer { height: 26px; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; color: var(--text-2); font: 9px var(--font-ui); border-top: 1px solid var(--border); }
+.tx-note-appendix { padding: 16px 20px; background: var(--bg-0); color: var(--text-0); }
+.tx-note-appendix h3 { font-size: 15px; margin: 0 0 12px; }
+.tx-note-paragraph { margin: 0 0 14px; font: 12px/1.6 var(--font-ui); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ct-hint .ct-info { min-height: 20px; height: 20px; width: 24px; padding: 0; margin: -4px 0; }

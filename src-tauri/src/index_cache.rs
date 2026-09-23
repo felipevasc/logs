@@ -57,7 +57,8 @@ pub fn open(
     }
     // Local timezone affects timestamps without a zone.
     hash.update(chrono::Local::now().offset().to_string());
-    let dir = crate::config_dir().join("indexes-v3");
+    // Parser semantics are part of the cache version (nested JSON/epoch/arrays).
+    let dir = crate::config_dir().join("indexes-v4");
     let cache = dir.join(format!("{:x}.idx", hash.finalize()));
     if let Some((header, lines)) = read(&cache, mmap.len()) {
         if let Some(cb) = progress {

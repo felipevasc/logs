@@ -8,6 +8,14 @@
   <link rel="stylesheet" href="vendor/uplot/uPlot.min.css" />
   <link rel="stylesheet" href="styles.css" />
   <link rel="stylesheet" href="workspace.css" />
+  <link rel="stylesheet" href="analysis-workbench.css" />
+  <link rel="stylesheet" href="timeline-refinements.css" />
+  <link rel="stylesheet" href="timeline-export.css" />
+  <link rel="stylesheet" href="discovery.css" />
+  <link rel="stylesheet" href="threats.css" />
+  <link rel="stylesheet" href="remote-sources.css" />
+  <link rel="stylesheet" href="journeys.css" />
+  <link rel="stylesheet" href="workspace-context.css" />
 </head>
 <body>
   <nav class="workspace-nav" aria-label="Navegação principal">
@@ -15,14 +23,13 @@
     <button class="nav-import" id="ws-open"><i class="fas fa-plus"></i> Abrir logs</button>
     <div class="nav-pages">
       <button data-page="summary" class="selected"><i class="fas fa-chart-simple"></i>Resumo</button>
-      <button data-page="timeline"><i class="fas fa-chart-column"></i>Atividade</button>
       <button data-page="case-timeline"><i class="fas fa-timeline"></i>Linha do tempo</button>
       <button data-page="explore"><i class="fas fa-magnifying-glass"></i>Explorar</button>
       <button data-page="compare"><i class="fas fa-code-compare"></i>Comparar</button>
       <button data-page="evidence"><i class="fas fa-bookmark"></i>Evidências<span id="ws-evidence-count"></span></button>
     </div>
     <div class="nav-bottom">
-      <button data-page="sources"><i class="fas fa-layer-group"></i>Fontes<span id="ws-source-count"></span></button>
+      <button data-page="sources" title="Arquivos e canais de logs"><i class="fas fa-folder-open"></i>Arquivos<span id="ws-source-count"></span></button>
       <button id="ws-export"><i class="fas fa-arrow-up-from-bracket"></i>Exportar</button>
       <button id="ws-preferences"><i class="fas fa-sliders"></i>Configurações</button>
     </div>
@@ -49,6 +56,7 @@
 
   <!-- ===================== CONTEXTO GLOBAL ===================== -->
   <header class="topbar">
+    <div id="context-toggle" class="context-toggle" role="group" aria-label="Área de trabalho"><button type="button" data-workspace-scope="dataset" aria-pressed="true"><i class="fas fa-magnifying-glass" aria-hidden="true"></i>Análise</button><button type="button" data-workspace-scope="case" aria-pressed="false"><i class="fas fa-briefcase" aria-hidden="true"></i>Caso<span id="context-case-count"></span></button></div>
     <div id="context-summary" class="context-summary">Carregue um artefato para começar.</div>
     <div class="topbar-right">
       <span id="activity-indicator" class="activity-indicator" hidden>
@@ -220,7 +228,6 @@
     <main class="content">
       <div class="hist-panel" hidden>
         <div id="chart" class="chart"></div>
-        <div id="levels-mini" class="levels-mini"></div>
       </div>
 
       <div class="viewbar">
@@ -326,6 +333,7 @@
           <button class="seg-btn" data-view="items" type="button"><i class="fas fa-layer-group"></i> Itens</button>
           <button class="seg-btn" data-view="timeline" type="button"><i class="fas fa-arrows-left-right"></i> Horizontal</button>
           <button class="seg-btn" data-view="vtimeline" type="button"><i class="fas fa-arrows-up-down"></i> Vertical</button>
+          <button class="seg-btn" id="case-timeline-volume" type="button"><i class="fas fa-chart-column"></i> Volume</button>
           <button class="seg-btn" data-view="data" type="button"><i class="fas fa-database"></i> Dados do Caso</button>
         </div>
         <span class="muted small case-toolbar-count" id="analysis-count"></span>
@@ -972,9 +980,17 @@
   <div id="toast-area"></div>
 
   <script src="vendor/uplot/uPlot.iife.min.js"></script>
+  <script src="timeline-export.js"></script>
+  <script src="icon-picker.js"></script>
   <script src="case-timeline.js"></script>
   <script src="app.js"></script>
   <script src="timeline.js"></script>
   <script src="workspace.js"></script>
+  <script src="analysis-workbench.js"></script>
+  <script src="discovery.js"></script>
+  <script src="threats.js"></script>
+  <script src="remote-sources.js"></script>
+  <script src="journeys.js"></script>
+  <script src="workspace-context.js"></script>
 </body>
 </html>

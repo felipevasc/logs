@@ -1,6 +1,6 @@
 [package]
 name = "loginsight"
-version = "0.1.0"
+version = "0.2.0"
 description = "Visualizador e analisador de logs"
 edition = "2021"
 rust-version = "1.88"
@@ -32,12 +32,16 @@ rmcp = { version = "3.1", features = ["transport-streamable-http-server"] }
 schemars = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["net", "rt", "sync"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
+base64 = "0.22.1"
+tempfile = "3.27"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_System_EventLog",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
 ] }
 
 [features]

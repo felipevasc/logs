@@ -1,15 +1,21 @@
 mod analysis;
 mod case_store;
+mod discovery;
 mod distinct;
+mod event_preview;
 mod index_cache;
 mod insights;
+mod journeys;
 mod mcp;
 mod model;
 mod operations;
 mod query;
 #[cfg(test)]
 mod regression_tests;
+mod remote;
 mod sources;
+mod threats;
+mod timeline_export;
 mod workspace;
 
 use model::{CodesConfig, Event, STANDARD_COLUMNS};
@@ -1066,21 +1072,45 @@ async fn query_events(
     sort_dir: String,
     offset: usize,
     limit: usize,
+    case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<query::QueryResult, String> {
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
-        query_events_impl(
+        query_events_scope_impl(
             state.inner(),
             filters,
             &sort_column,
             &sort_dir,
             offset,
             limit,
+            case_events.as_deref(),
         )
     })
     .await
+}
+
+pub(crate) fn query_events_scope_impl(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    sort_column: &str,
+    sort_dir: &str,
+    offset: usize,
+    limit: usize,
+    case_events: Option<&[Event]>,
+) -> query::QueryResult {
+    match case_events {
+        Some(events) => query::query(
+            events,
+            &filters,
+            sort_column,
+            sort_dir,
+            offset,
+            limit.clamp(1, 2_000),
+        ),
+        None => query_events_impl(state, filters, sort_column, sort_dir, offset, limit),
+    }
 }
 
 pub(crate) fn query_events_impl(
@@ -1125,12 +1155,13 @@ async fn explore_snapshot(
     sort_dir: String,
     offset: usize,
     limit: usize,
+    case_events: Option<Vec<Event>>,
     app: AppHandle,
 ) -> Result<query::ExplorerSnapshot, String> {
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
-        explore_snapshot_impl(
+        explore_snapshot_scope_impl(
             state.inner(),
             filters,
             &sort_column,
@@ -1138,9 +1169,33 @@ async fn explore_snapshot(
             offset,
             limit,
             Some(&app),
+            case_events.as_deref(),
         )
     })
     .await
+}
+
+pub(crate) fn explore_snapshot_scope_impl(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    sort_column: &str,
+    sort_dir: &str,
+    offset: usize,
+    limit: usize,
+    app: Option<&AppHandle>,
+    case_events: Option<&[Event]>,
+) -> query::ExplorerSnapshot {
+    match case_events {
+        Some(events) => query::explore(
+            events,
+            &filters,
+            sort_column,
+            sort_dir,
+            offset,
+            limit.clamp(1, 2_000),
+        ),
+        None => explore_snapshot_impl(state, filters, sort_column, sort_dir, offset, limit, app),
+    }
 }
 
 pub(crate) fn explore_snapshot_impl(
@@ -1465,9 +1520,16 @@ pub(crate) fn tree_aggs_impl(
 }
 
 #[tauri::command]
-async fn stats_events(filters: Vec<query::Filter>, app: AppHandle) -> Result<query::Stats, String> {
+async fn stats_events(
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
+    app: AppHandle,
+) -> Result<query::Stats, String> {
     workspace::validate(&filters)?;
     offload(move || {
+        if let Some(events) = case_events {
+            return query::stats(&events, &filters);
+        }
         let state = app.state::<AppState>();
         stats_events_impl(state.inner(), filters)
     })
@@ -1521,6 +1583,71 @@ pub(crate) fn event_detail_impl(state: &AppState, id: usize) -> Option<Event> {
 }
 
 // ------------------------------------------------------------------ análise
+
+#[tauri::command]
+async fn discover_patterns(
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
+    app: AppHandle,
+) -> Result<discovery::Discovery, String> {
+    workspace::validate(&filters)?;
+    offload(move || discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
+        .await
+}
+
+pub(crate) fn discover_patterns_impl(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
+) -> discovery::Discovery {
+    let memory = |events: &[Event]| {
+        let prepared = query::prepare(&filters);
+        let mut sample = discovery::Sampler::new();
+        let mut result = discovery::Discovery::default();
+        for (i, ev) in events.iter().enumerate() {
+            if operations::cancelled() {
+                break;
+            }
+            if prepared.iter().all(|pf| query::matches(ev, pf)) {
+                result.observe(ev.timestamp, insights::is_error(ev), ev.level == "Aviso");
+                sample.push(i);
+            }
+        }
+        sample.ids.sort_unstable();
+        discovery::analyze(result, || sample.ids.iter().map(|&i| events[i].clone()))
+    };
+    if let Some(events) = case_events {
+        return memory(&events);
+    }
+    let source = state.source.read();
+    match &*source {
+        SourceData::Memory(events) => memory(events),
+        SourceData::Indexed(idx) => {
+            let codes = state.codes.read();
+            let system = state.system_codes.read();
+            let derived = state.derived.read();
+            let mut sample = discovery::Sampler::new();
+            let mut result = discovery::Discovery::default();
+            query::visit_indexed_matches(idx, &filters, &codes, &system, &derived, |i| {
+                let meta = &idx.lines[i];
+                result.observe(
+                    (meta.ts != 0).then_some(meta.ts),
+                    matches!(meta.level, model::LV_ERR | model::LV_CRIT),
+                    meta.level == model::LV_WARN,
+                );
+                sample.push(i);
+            });
+            sample.ids.sort_unstable();
+            discovery::analyze(result, || {
+                sample
+                    .ids
+                    .iter()
+                    .map(|&i| sources::event_at(idx, i, &codes, &system, &derived))
+            })
+        }
+        SourceData::None => discovery::analyze(discovery::Discovery::default(), std::iter::empty),
+    }
+}
 
 const ANALYSIS_CAP: usize = 3_000; // Distributed sample used only by field profiling.
 
@@ -1920,6 +2047,19 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            remote::remote_list,
+            remote::remote_save,
+            remote::remote_delete,
+            remote::remote_test,
+            remote::remote_import,
+            timeline_export::export_timeline,
+            threats::threat_catalog,
+            threats::threat_catalog_update,
+            threats::threat_scan,
+            threats::threat_events,
+            journeys::journey_fields,
+            journeys::journey_index,
+            journeys::journey_events,
             mcp::mcp_configure,
             workspace::dataset_overview,
             workspace::timeline_range,
@@ -1964,6 +2104,7 @@ pub fn run() {
             save_derived_field,
             delete_derived_field,
             profile_fields,
+            discover_patterns,
             compute_series,
             pivot,
             mcp_status,

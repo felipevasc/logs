@@ -26,9 +26,17 @@ pub struct PreparedFilter {
     needle_lower: String,
     num: Option<f64>,
     num2: Option<f64>,
+    threat: Option<crate::threats::RuleMatcher>,
 }
 
 pub fn prepare(filters: &[Filter]) -> Vec<PreparedFilter> {
+    prepare_with_threat_catalog(filters, None)
+}
+
+pub(crate) fn prepare_with_threat_catalog(
+    filters: &[Filter],
+    catalog: Option<&std::sync::Arc<crate::threats::CompiledCatalog>>,
+) -> Vec<PreparedFilter> {
     filters
         .iter()
         .map(|f| {
@@ -39,6 +47,11 @@ pub fn prepare(filters: &[Filter]) -> Vec<PreparedFilter> {
                 num: value_as_num(&f.column, &f.value),
                 num2: value_as_num(&f.column, f.value2.as_deref().unwrap_or("")),
                 f: f.clone(),
+                threat: if f.op == "threat_rule" {
+                    crate::threats::matcher(&f.value, catalog.cloned()).ok()
+                } else {
+                    None
+                },
             }
         })
         .collect()
@@ -97,6 +110,13 @@ fn value_as_num(column: &str, s: &str) -> Option<f64> {
 
 pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
     let f = &pf.f;
+    if f.op == "threat_rule" {
+        return f.column == "_all"
+            && pf
+                .threat
+                .as_ref()
+                .is_some_and(|matcher| matcher.matches(ev));
+    }
     let col = f.column.as_str();
     let needle = pf.needle_lower.as_str();
     if f.op == "pattern" {
@@ -140,6 +160,14 @@ pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
         "not_equals" => ev
             .col_ref(col)
             .map(|s| !s.eq_ignore_ascii_case(f.value.trim()))
+            .unwrap_or(true),
+        "equals_exact" => ev
+            .col_ref(col)
+            .map(|s| s.as_ref() == f.value)
+            .unwrap_or(false),
+        "not_equals_exact" => ev
+            .col_ref(col)
+            .map(|s| s.as_ref() != f.value)
             .unwrap_or(true),
         "starts_with" => ev
             .col_ref(col)
@@ -302,7 +330,7 @@ pub fn explore(
     let matched = filtered_indices(events, filters);
     let stats = stats_from(matched.iter().map(|&i| {
         let event = &events[i];
-        (event.timestamp.unwrap_or(0), event.level.as_str())
+        (event.timestamp, event.level.as_str())
     }));
     let count = [AggSpec {
         func: "count".into(),
@@ -364,6 +392,11 @@ fn ci_contains_bytes(hay: &[u8], needle_lower: &[u8]) -> bool {
 fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8]) -> Tri {
     let f = &pf.f;
     let op = f.op.as_str();
+    // Exact selection uses decoded field values, including whitespace and case.
+    // Raw spans can contain JSON escapes or represent a normalized standard field.
+    if matches!(op, "equals_exact" | "not_equals_exact" | "threat_rule") {
+        return Tri::NeedEvent;
+    }
     let v = f.value.trim();
     // equivalente a v.to_lowercase() (trim e lowercase comutam para whitespace)
     let needle = pf.needle_lower.trim();
@@ -521,8 +554,32 @@ pub fn indexed_matches(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Vec<usize> {
-    let pfs = prepare(filters);
     let mut matched = Vec::new();
+    visit_indexed_matches(idx, filters, codes, system, derived, |i| matched.push(i));
+    matched
+}
+
+/// Visit matching positions without allocating a vector proportional to the file.
+pub fn visit_indexed_matches(
+    idx: &FileIndex,
+    filters: &[Filter],
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+    visit: impl FnMut(usize),
+) {
+    let pfs = prepare(filters);
+    visit_indexed_prepared(idx, &pfs, codes, system, derived, visit);
+}
+
+pub(crate) fn visit_indexed_prepared(
+    idx: &FileIndex,
+    pfs: &[PreparedFilter],
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+    mut visit: impl FnMut(usize),
+) {
     for (i, meta) in idx.lines.iter().enumerate() {
         if i % 2048 == 0 && crate::operations::cancelled() {
             break;
@@ -530,7 +587,7 @@ pub fn indexed_matches(
         let line = line_bytes(idx, i);
         let mut need = false;
         let mut ok = true;
-        for pf in &pfs {
+        for pf in pfs {
             match meta_check(pf, meta, line) {
                 Tri::Fail => {
                     ok = false;
@@ -546,13 +603,12 @@ pub fn indexed_matches(
         if need {
             let ev = event_at(idx, i, codes, system, derived);
             if pfs.iter().all(|pf| matches(&ev, pf)) {
-                matched.push(i);
+                visit(i);
             }
         } else {
-            matched.push(i);
+            visit(i);
         }
     }
-    matched
 }
 
 pub fn query_indexed(
@@ -1053,7 +1109,7 @@ pub fn explore_indexed(
     let matched = indexed_matches(idx, filters, codes, system, derived);
     let stats = stats_from(matched.iter().map(|&i| {
         (
-            idx.lines[i].ts,
+            (idx.lines[i].ts != 0).then_some(idx.lines[i].ts),
             crate::model::class_label(idx.lines[i].level),
         )
     }));
@@ -1095,7 +1151,7 @@ fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i6
 
 const N_BUCKETS: usize = 60;
 
-fn stats_from<'a>(iter: impl Iterator<Item = (i64, &'a str)>) -> Stats {
+fn stats_from<'a>(iter: impl Iterator<Item = (Option<i64>, &'a str)>) -> Stats {
     // Chaveia por &str emprestada (zero alocação por linha); converte para
     // String apenas no Vec final.
     let mut levels: HashMap<&'a str, i64> = HashMap::new();
@@ -1104,27 +1160,35 @@ fn stats_from<'a>(iter: impl Iterator<Item = (i64, &'a str)>) -> Stats {
     let mut items = Vec::new();
     for (ts, level) in iter {
         *levels.entry(level).or_default() += 1;
-        if ts != 0 {
+        if let Some(ts) = ts {
             min_ts = min_ts.min(ts);
             max_ts = max_ts.max(ts);
+            items.push(ts);
         }
-        items.push(ts);
     }
 
     let mut buckets = Vec::new();
     let mut bucket_ms = 0i64;
     if min_ts <= max_ts {
-        let span = (max_ts - min_ts).max(1);
-        bucket_ms = (span / N_BUCKETS as i64).max(1);
-        let mut counts = vec![0i64; N_BUCKETS + 1];
-        for t in items.into_iter().filter(|&t| t != 0) {
-            let b = ((t - min_ts) / bucket_ms) as usize;
-            counts[b.min(N_BUCKETS)] += 1;
+        let span = max_ts.saturating_sub(min_ts).saturating_add(1);
+        bucket_ms = (span / N_BUCKETS as i64)
+            .saturating_add(i64::from(span % N_BUCKETS as i64 != 0))
+            .max(1);
+        let count = (((span - 1) / bucket_ms + 1) as usize).min(N_BUCKETS);
+        let mut counts = vec![0i64; count];
+        for t in items {
+            let b = (t.saturating_sub(min_ts) / bucket_ms) as usize;
+            counts[b.min(count - 1)] += 1;
         }
         buckets = counts
             .into_iter()
             .enumerate()
-            .map(|(b, c)| (min_ts + b as i64 * bucket_ms, c))
+            .map(|(b, c)| {
+                (
+                    min_ts.saturating_add((b as i64).saturating_mul(bucket_ms)),
+                    c,
+                )
+            })
             .collect();
     }
 
@@ -1140,7 +1204,7 @@ pub fn stats(events: &[Event], filters: &[Filter]) -> Stats {
     let idx = filtered_indices(events, filters);
     stats_from(idx.into_iter().map(|i| {
         let ev = &events[i];
-        (ev.timestamp.unwrap_or(0), ev.level.as_str())
+        (ev.timestamp, ev.level.as_str())
     }))
 }
 
@@ -1152,7 +1216,7 @@ pub fn stats_indexed(
     derived: &[CompiledDerived],
 ) -> Stats {
     let pfs = prepare(filters);
-    let mut matched: Vec<(i64, Cow<'static, str>)> = Vec::new();
+    let mut matched: Vec<(Option<i64>, Cow<'static, str>)> = Vec::new();
     for (i, meta) in idx.lines.iter().enumerate() {
         if i % 2048 == 0 && crate::operations::cancelled() {
             break;
@@ -1176,12 +1240,12 @@ pub fn stats_indexed(
         if need {
             let ev = event_at(idx, i, codes, system, derived);
             if pfs.iter().all(|pf| matches(&ev, pf)) {
-                matched.push((ev.timestamp.unwrap_or(0), Cow::Owned(ev.level)));
+                matched.push((ev.timestamp, Cow::Owned(ev.level)));
             }
         } else {
             // rótulo fixo da classe: sem String por linha
             matched.push((
-                meta.ts,
+                (meta.ts != 0).then_some(meta.ts),
                 Cow::Borrowed(crate::model::class_label(meta.level)),
             ));
         }

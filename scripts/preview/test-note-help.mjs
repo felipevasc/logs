@@ -1,0 +1,37 @@
+import assert from 'node:assert/strict';
+import { chromium } from 'playwright';
+import { existsSync,mkdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+const browser=await chromium.launch({headless:true,...(!existsSync(chromium.executablePath())?{executablePath:'C:/Users/felip/AppData/Local/ms-playwright/chromium-1217/chrome-win64/chrome.exe'}:{})});
+const page=await browser.newPage({viewport:{width:1024,height:680}});page.setDefaultTimeout(15000);
+const errors=[];page.on('pageerror',error=>errors.push(error.message));
+try{
+  await page.goto(process.argv[2]||'http://127.0.0.1:4173');await page.waitForFunction(()=>state.loaded&&state.total===6000);
+  await page.getByRole('button',{name:'Linha do tempo',exact:true}).click();
+  await page.locator('[data-ct-action="note"]').click();
+  await page.locator('.ct-icon-choice').first().waitFor();
+  await page.locator('textarea[name="text"]').fill('Nota com ajuda');
+  assert.doesNotMatch(await page.locator('.ct-editor').innerText(),/Para mudar a seta/,'Explanation does not occupy editor');
+  const help=page.getByRole('button',{name:'Ajuda sobre notas e setas',exact:true});
+  await help.click();
+  await page.locator('#analysis-help').waitFor({state:'visible'});
+  assert.match(await page.locator('#analysis-help .modal-body').innerText(),/botão direito.*Enter/);
+  assert(await page.evaluate(()=>Number(getComputedStyle(document.querySelector('#analysis-help')).zIndex)>Number(getComputedStyle(document.querySelector('.ct-editor-backdrop')).zIndex)),'Help appears above note editor');
+  await page.keyboard.press('Tab');assert.equal(await page.locator('#analysis-help button').evaluate(node=>node===document.activeElement),true);
+  await page.keyboard.press('Escape');assert.equal(await page.locator('#analysis-help').isVisible(),false);
+  assert(await help.evaluate(node=>node===document.activeElement),'Closing explanation restores help trigger');
+  assert.equal(await page.locator('.ct-editor-backdrop').isVisible(),true);
+  assert.equal(await page.locator('textarea[name="text"]').inputValue(),'Nota com ajuda');
+  await page.evaluate(()=>{window.__originalNoteExplanation=Discovery.showExplanation;Discovery.showExplanation=null;});
+  await help.click();
+  const fallback=page.locator('[aria-labelledby="ct-note-help-title"]');await fallback.waitFor();
+  assert.match(await fallback.innerText(),/Para mudar a seta/);
+  await fallback.getByRole('button',{name:'Fechar explicação',exact:true}).click();
+  assert.equal(await fallback.count(),0);assert(await help.evaluate(node=>node===document.activeElement));
+  await page.evaluate(()=>Discovery.showExplanation=window.__originalNoteExplanation);
+  mkdirSync('output/playwright',{recursive:true});await page.screenshot({path:resolve('output/playwright/note-help-1024.png')});
+  await page.getByRole('button',{name:'Salvar',exact:true}).click();
+  await page.waitForFunction(()=>activeCase().timeline.annotations.some(note=>note.text==='Nota com ajuda'&&note.icon==='fa-comment'));
+  assert.equal(await page.locator('.ct-editor-backdrop').isVisible(),false);assert.deepEqual(errors,[]);
+  console.log('PASS: fixed hint removed; accessible modal help above note editor, keyboard/focus restoration, fallback modal and note save; no JS errors.');
+}finally{await browser.close();}
