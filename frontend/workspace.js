@@ -162,7 +162,7 @@
     loading("Lendo fontes…");
     try {
       const sources = await api("list_sources", {}, { silent: true }); if (page !== "sources" || version !== serial || contextKey !== sourceKey()) return; sourceList = sources; updateCounts();
-      content.innerHTML = `<div class="source-controls"><button id="ws-source-add" class="btn primary"><i class="fas fa-plus"></i> Adicionar arquivos</button><button id="ws-source-folder" class="btn ghost">Adicionar pasta</button><button id="ws-source-config" class="btn ghost">Formato e data/hora</button><div class="spacer"></div><button id="ws-source-apply" class="btn ghost" ${sourceList.length < 2 ? "disabled" : ""}>Explorar seleção</button></div><section class="ws-card"><table class="ws-table"><thead><tr><th></th><th>Arquivo</th><th>Formato</th><th class="num">Tamanho</th><th class="num">Eventos</th><th>Leitura</th></tr></thead><tbody>${sourceList.map((s, i) => `<tr><td><input class="source-check" aria-label="Selecionar ${esc(s.name)}" type="checkbox" data-source-index="${i}" checked></td><td><strong>${esc(s.name)}</strong><div class="pattern-meta" title="${esc(s.path)}">${s.start != null ? `${esc(fmtTs(s.start))} — ${esc(fmtTs(s.end))}` : "Sem horário reconhecido"}</div></td><td><span class="tag">${esc(s.format)}</span></td><td class="num">${s.bytes ? fmtBytes(s.bytes) : "—"}</td><td class="num">${fmtNum(s.count)}</td><td>${s.unparsed ? `<span class="tag">${s.unparsed}/${s.sampled} não interpretados na amostra</span>` : '<span class="tag good">Disponível</span>'}${s.undated ? `<div class="pattern-meta">${fmtNum(s.undated)} sem horário</div>` : ""}</td></tr>`).join("")}</tbody></table></section>`;
+      content.innerHTML = `<div class="source-controls"><button id="ws-source-add" class="btn primary"><i class="fas fa-plus"></i> Adicionar arquivos</button><button id="ws-source-folder" class="btn ghost">Adicionar pasta</button><button id="ws-source-config" class="btn ghost">Formato e data/hora</button><div class="spacer"></div><button id="ws-source-clear" class="btn ghost danger" title="Descarregar todas as fontes da análise"><i class="fas fa-trash"></i> Limpar análise</button><button id="ws-source-apply" class="btn ghost" ${sourceList.length < 2 ? "disabled" : ""}>Explorar seleção</button></div><section class="ws-card"><table class="ws-table"><thead><tr><th></th><th>Arquivo</th><th>Formato</th><th class="num">Tamanho</th><th class="num">Eventos</th><th>Leitura</th><th class="num">Ação</th></tr></thead><tbody>${sourceList.map((s, i) => `<tr><td><input class="source-check" aria-label="Selecionar ${esc(s.name)}" type="checkbox" data-source-index="${i}" checked></td><td><strong>${esc(s.name)}</strong><div class="pattern-meta" title="${esc(s.path)}">${s.start != null ? `${esc(fmtTs(s.start))} — ${esc(fmtTs(s.end))}` : "Sem horário reconhecido"}</div></td><td><span class="tag">${esc(s.format)}</span></td><td class="num">${s.bytes ? fmtBytes(s.bytes) : "—"}</td><td class="num">${fmtNum(s.count)}</td><td>${s.unparsed ? `<span class="tag">${s.unparsed}/${s.sampled} não interpretados na amostra</span>` : '<span class="tag good">Disponível</span>'}${s.undated ? `<div class="pattern-meta">${fmtNum(s.undated)} sem horário</div>` : ""}</td><td class="num"><button class="icon-btn danger source-remove-btn" title="Remover da análise" data-remove-index="${i}"><i class="fas fa-trash-can"></i></button></td></tr>`).join("")}</tbody></table></section>`;
       const reload = el("button", "btn ghost", "Recarregar fontes");
       $("#ws-source-config").after(reload);
       reload.onclick = async () => { if (state.currentArtifact?.source && await loadData(state.currentArtifact.source)) await showPage("sources"); };
@@ -171,6 +171,13 @@
         button.onclick = async () => { await loadTsConfig(sourceList[i].path); openTsModal(sourceList[i].path); };
         row.cells[1].append(button);
       });
+      content.querySelectorAll(".source-remove-btn").forEach(btn => {
+        btn.onclick = async () => { await removeSource(+btn.dataset.removeIndex); };
+      });
+      $("#ws-source-clear").onclick = async () => {
+        if (!confirm("Deseja realmente descarregar todas as fontes e limpar a análise atual?")) return;
+        await clearAnalysis();
+      };
       $("#ws-source-add").onclick = () => openFiles(false, true);
       $("#ws-source-folder").onclick = () => openFiles(true, true);
       $("#ws-source-config").onclick = () => { home.hidden = true; switchView("source"); showSourceMode("load"); };
@@ -182,8 +189,76 @@
       };
     } catch (e) { if (page === "sources" && version === serial && contextKey === sourceKey()) failed(e); }
   }
+  async function removeSource(index) {
+    const target = sourceList[index];
+    if (!target) return;
+    if (!confirm(`Remover "${target.name}" da análise?`)) return;
+    const currentSource = state.currentArtifact?.source;
+    if (!currentSource) return;
+
+    if (currentSource.kind === "bundle") {
+      const remainingMembers = [];
+      for (const m of currentSource.members) {
+        if (m.kind === "file") {
+          const allPaths = m.paths?.length ? m.paths : (m.path ? [m.path] : []);
+          const remainingPaths = allPaths.filter(p => p !== target.path && p !== target.name);
+          if (remainingPaths.length > 0) {
+            remainingMembers.push({ ...m, path: remainingPaths[0], paths: remainingPaths });
+          }
+        } else if (m.kind === "eventlog") {
+          if (m.channel !== target.name && m.channel !== target.path) {
+            remainingMembers.push(m);
+          }
+        }
+      }
+      if (remainingMembers.length === 0) {
+        await clearAnalysis();
+        return;
+      }
+      let newSource;
+      if (remainingMembers.length === 1 && remainingMembers[0].kind === "file" && (remainingMembers[0].paths?.length || 1) === 1) {
+        const single = remainingMembers[0];
+        newSource = { kind: "file", path: single.path, paths: [single.path], format: single.format || "auto" };
+      } else {
+        newSource = { kind: "bundle", members: remainingMembers, path: remainingMembers[0].path || remainingMembers[0].channel };
+      }
+      if (await loadData(newSource)) {
+        toast(`Fonte "${target.name}" removida da análise.`, "ok");
+        await showPage("sources");
+      }
+    } else if (currentSource.kind === "file") {
+      const allPaths = currentSource.paths?.length ? currentSource.paths : (currentSource.path ? [currentSource.path] : []);
+      const remainingPaths = allPaths.filter(p => p !== target.path && p !== target.name);
+      if (remainingPaths.length === 0) {
+        await clearAnalysis();
+        return;
+      }
+      const newSource = { kind: "file", path: remainingPaths[0], paths: remainingPaths, format: currentSource.format || "auto" };
+      if (await loadData(newSource)) {
+        toast(`Fonte "${target.name}" removida da análise.`, "ok");
+        await showPage("sources");
+      }
+    } else {
+      await clearAnalysis();
+    }
+  }
+  async function clearAnalysis() {
+    state.loaded = false;
+    state.currentArtifact = null;
+    state.columns = [];
+    state.visibleCols = [];
+    state.filters = [];
+    state.quick = "";
+    state.rows = [];
+    state.total = 0;
+    sourceList = [];
+    sessionStorage.removeItem("loginsight_current_artifact");
+    applySourceSpec({ kind: "file", path: "", paths: [], format: "auto" });
+    toast("Análise limpa.", "info");
+    await showPage("summary");
+  }
   function escapeRegex(text) { return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-  async function openFiles(folder = false, merge = false, dropped = null) {
+  async function openFiles(folder = false, merge = state.loaded, dropped = null) {
     if (importing) return; importing = true;
     try {
       let chosen = dropped || await dialogApi.open({ multiple: !folder, directory: folder });
@@ -232,7 +307,49 @@
     $("#ws-evidence-prev").onclick = () => { evidencePage--; renderEvidence(); };
     $("#ws-evidence-next").onclick = () => { evidencePage++; renderEvidence(); };
     $("#ws-evidence-search").oninput = event => { evidenceSearch=event.target.value;evidencePage=0;renderEvidence();const search=$("#ws-evidence-search");search.focus(); };
-    for(const card of content.querySelectorAll("[data-item-index]")){const item=items[+card.dataset.itemIndex];if(item.attachments?.length)CaseContent.mountAttachments(card.querySelector("[data-item-images]"),item);}
+    for(const card of content.querySelectorAll("[data-item-index]")){
+      const index = +card.dataset.itemIndex;
+      const item = items[index];
+      if(item?.attachments?.length)CaseContent.mountAttachments(card.querySelector("[data-item-images]"),item);
+      card.oncontextmenu = (e) => {
+        e.preventDefault();
+        showCtxMenu(e.clientX, e.clientY, [
+          {
+            icon: "fa-trash-can",
+            label: "Remover item do Caso",
+            danger: true,
+            onClick: async () => {
+              removedEvidence = { item, caseId: c.id, index };
+              c.items.splice(index, 1);
+              await saveCases();
+              renderEvidence();
+              toast("Item removido do Caso.", "ok");
+            }
+          },
+          { sep: true },
+          {
+            icon: "fa-pen-to-square",
+            label: "Explicação e imagens",
+            onClick: () => CaseContent.editItem(item.id)
+          },
+          ...(item.rows?.length ? [{
+            icon: "fa-eye",
+            label: item.rows.length > 1 ? "Primeiro registro" : "Ver registro",
+            onClick: () => showDetail(item.rows[0], item.sourceSpec)
+          }] : []),
+          {
+            icon: "fa-rotate-left",
+            label: "Reabrir recorte",
+            onClick: async () => {
+              await window.WorkspaceContext?.setScope("dataset", { animate: false });
+              if (item.sourceSpec && JSON.stringify(item.sourceSpec) !== JSON.stringify(state.currentArtifact?.source) && !await loadData(item.sourceSpec)) return;
+              if (!state.loaded) { toast("Abra a fonte original para reexecutar este recorte.", "info"); return; }
+              applyFilters(structuredClone(item.sourceFilters || []), true);
+            }
+          }
+        ]);
+      };
+    }
     if (removedEvidence?.caseId === c?.id) {
       const restore = el("button", "btn ghost", "Desfazer remoção");
       $("#ws-evidence-advanced").after(restore);

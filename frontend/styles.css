@@ -618,6 +618,10 @@ html[data-theme="light"] .chip { color: var(--accent-strong); }
 #events-table tbody tr:nth-child(even) { background: var(--row-alt); }
 #events-table tbody tr:hover { background: var(--accent-soft); }
 #events-table tbody tr.selected { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+#events-table tbody tr.row-multi-selected { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+#events-table tbody tr.selected.row-multi-selected { background: var(--accent-soft); box-shadow: inset 4px 0 0 var(--accent); }
+.th-select-all, .td-row-check { width: 38px; min-width: 38px; max-width: 38px; text-align: center; padding: 0 4px !important; }
+.th-select-all input[type="checkbox"], .td-row-check input[type="checkbox"] { cursor: pointer; margin: 0; vertical-align: middle; }
 
 .t-mono { font-family: var(--font-mono); font-size: 11.5px; }
 .t-ts { color: var(--text-1); font-variant-numeric: tabular-nums; }

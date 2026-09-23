@@ -36,6 +36,9 @@ fn default_time_field() -> String {
 fn default_limit() -> usize {
     100_000
 }
+fn default_kibana_version() -> String {
+    "auto".into()
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -54,6 +57,8 @@ pub struct RemoteConfig {
     pub max_records: usize,
     #[serde(default)]
     pub query: Option<Value>,
+    #[serde(default = "default_kibana_version")]
+    pub kibana_version: String,
 }
 
 #[derive(Serialize)]
@@ -168,6 +173,9 @@ fn validate(mut c: RemoteConfig) -> Result<RemoteConfig, String> {
         }
     } else {
         c.query = None;
+    }
+    if c.kibana_version.trim().is_empty() {
+        c.kibana_version = "auto".into();
     }
     Ok(c)
 }
@@ -415,7 +423,8 @@ impl RemoteClient {
             operations::check()?;
         }
         let mut url = Url::parse(&self.connection.url).map_err(|_| "Endereço inválido.")?;
-        let actual_method = if self.connection.kind == RemoteKind::Kibana {
+        let is_kibana = self.connection.kind == RemoteKind::Kibana;
+        let actual_method = if is_kibana {
             url.set_path(&format!(
                 "{}/api/console/proxy",
                 url.path().trim_end_matches('/')
@@ -439,14 +448,25 @@ impl RemoteClient {
         if cleanup {
             request = request.timeout(Duration::from_secs(5));
         }
-        if self.connection.kind == RemoteKind::Kibana {
-            request = request.header("kbn-xsrf", "loginsight");
+        if is_kibana {
+            request = request
+                .header("kbn-xsrf", "true")
+                .header("x-elastic-product-origin", "kibana");
+            if self.connection.kibana_version == "v9" || self.connection.kibana_version == "auto" {
+                request = request
+                    .header("elastic-api-version", "2023-10-31")
+                    .header("Accept", "application/vnd.elasticsearch+json; compatible-with=8, application/json");
+            }
         }
         if !self.connection.username.is_empty() {
             request = request.basic_auth(&self.connection.username, self.password.as_deref());
         }
         if let Some(body) = body {
             request = request.json(body);
+        } else if is_kibana {
+            request = request
+                .header("Content-Type", "application/json")
+                .body("{}");
         }
         let response = request.send().map_err(|e| {
             if e.is_timeout() {
@@ -1007,6 +1027,7 @@ mod tests {
             username: "user".into(),
             max_records: 100_000,
             query: None,
+            kibana_version: "auto".into(),
         }
     }
     fn client(url: &str) -> RemoteClient {
@@ -1124,7 +1145,11 @@ mod tests {
             url.query_pairs().find(|(k, _)| k == "path").unwrap().1,
             "logs-*/_pit?keep_alive=2m"
         );
-        assert_eq!(requests[0].headers.get("kbn-xsrf").unwrap(), "loginsight");
+        assert_eq!(requests[0].headers.get("kbn-xsrf").unwrap(), "true");
+        assert_eq!(
+            requests[0].headers.get("x-elastic-product-origin").unwrap(),
+            "kibana"
+        );
 
         let server = Server::new(vec![Reply {
             status: 302,

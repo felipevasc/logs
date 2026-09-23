@@ -309,7 +309,7 @@ where
     out
 }
 
-#[derive(Clone, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 pub struct Period {
     pub start: i64,
     pub end: i64,

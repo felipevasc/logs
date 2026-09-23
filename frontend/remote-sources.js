@@ -2,14 +2,14 @@
 (() => {
   "use strict";
   const ui = { connections: [], selected: null, persistentSecrets: false, busy: false, action: null, cancelled: false, listVersion: 0, lastImport: null, returnFocus: null };
-  const defaults = () => ({ name: "", kind: "elasticsearch", url: "", index: "logs-*", timeField: "@timestamp", username: "", maxRecords: 100000, query: null });
+  const defaults = () => ({ name: "", kind: "elasticsearch", kibanaVersion: "auto", url: "", index: "logs-*", timeField: "@timestamp", username: "", maxRecords: 100000, query: null });
   const modal = el("div", "modal-overlay remote-overlay"); modal.id = "remote-modal"; modal.hidden = true;
   modal.innerHTML = `<section class="modal remote-modal" role="dialog" aria-modal="true" aria-labelledby="rs-title">
     <header class="modal-head"><div><h3 id="rs-title">Conexões</h3><p>Consulte Elasticsearch ou Kibana e analise uma cópia local dos registros.</p></div><button class="icon-btn" type="button" id="rs-close" aria-label="Fechar conexões"><i class="fas fa-xmark"></i></button></header>
     <div class="remote-body"><aside class="remote-saved"><div class="remote-list-head"><strong>Salvas neste computador</strong><button class="btn ghost small" id="rs-new" type="button">+ Nova</button></div><div id="rs-list" role="listbox" aria-label="Conexões salvas"></div><button class="text-button" id="rs-reload" type="button">Atualizar lista</button></aside>
       <form id="rs-form" class="remote-form" novalidate><fieldset id="rs-fields"><div class="remote-form-heading"><h4 id="rs-form-title">Nova conexão</h4><span id="rs-saved-state"></span></div>
         <div class="remote-grid"><label class="remote-wide" for="rs-name">Nome<input id="rs-name" autocomplete="off" maxlength="120" placeholder="Ex.: Produção · API" required /></label>
-          <label for="rs-kind">Serviço<select id="rs-kind"><option value="elasticsearch">Elasticsearch</option><option value="kibana">Kibana</option></select></label><label for="rs-index">Índice ou padrão<input id="rs-index" autocomplete="off" placeholder="logs-*" required /></label>
+          <label for="rs-kind">Serviço<select id="rs-kind"><option value="elasticsearch">Elasticsearch</option><option value="kibana">Kibana</option></select></label><label for="rs-kibana-version" id="rs-kibana-version-wrap" hidden>Versão do Kibana<select id="rs-kibana-version"><option value="auto">Automático (Kibana 7, 8 ou 9+)</option><option value="v7_8">Kibana 7.x / 8.x</option><option value="v9">Kibana 9+ / Serverless</option></select></label><label for="rs-index">Índice ou padrão<input id="rs-index" autocomplete="off" placeholder="logs-*" required /></label>
           <label class="remote-wide" for="rs-url">URL base<input id="rs-url" type="url" autocomplete="off" placeholder="https://elastic.exemplo:9200" required /><span id="rs-url-hint" class="remote-help"></span></label>
           <label for="rs-username">Usuário <span class="remote-optional">opcional</span><input id="rs-username" autocomplete="off" spellcheck="false" /></label><label for="rs-password">Senha<input id="rs-password" type="password" autocomplete="new-password" placeholder="Senha de acesso" /><span id="rs-password-hint" class="remote-help"></span></label>
         </div>
@@ -34,6 +34,7 @@
   }
   function syncHints() {
     const kibana = q("kind").value === "kibana";
+    q("kibana-version-wrap").hidden = !kibana;
     q("url").placeholder = kibana ? "https://kibana.exemplo/s/meu-espaco" : "https://elastic.exemplo:9200";
     q("url-hint").textContent = kibana ? "Use a URL base, com /s/espaco se necessário. Requer permissão no Console do Kibana; login SSO do navegador não é reutilizado." : "Endereço da API Elasticsearch. Use usuário e senha nos campos próprios, se exigidos.";
     q("password").placeholder = credentialReusable() ? "Em branco mantém a senha existente" : "Senha de acesso";
@@ -56,6 +57,7 @@
     ui.selected = connection ? { ...connection } : null; ui.lastImport = null; q("open-result").hidden = true;
     const value = connection || defaults();
     for (const [input, field] of [["name", "name"], ["kind", "kind"], ["url", "url"], ["index", "index"], ["username", "username"], ["time-field", "timeField"], ["limit", "maxRecords"]]) q(input).value = value[field] ?? "";
+    q("kibana-version").value = value.kibanaVersion ?? "auto";
     q("query").value = value.query ? JSON.stringify(value.query, null, 2) : "";
     q("from").value = ""; q("to").value = ""; q("password").value = "";
     q("remember").checked = ui.persistentSecrets && !!connection?.passwordSaved;
@@ -77,6 +79,7 @@
     const connection = {
       ...(ui.selected?.id ? { id: ui.selected.id } : {}),
       name: q("name").value.trim(), kind: q("kind").value, url: q("url").value.trim(), index: q("index").value.trim(),
+      kibanaVersion: q("kind").value === "kibana" ? q("kibana-version").value : "auto",
       username: q("username").value.trim(), timeField: q("time-field").value.trim(), maxRecords: Number(q("limit").value), query: null,
     };
     if (!connection.name) { q("name").focus(); throw Error("Dê um nome à conexão."); }
@@ -105,7 +108,7 @@
     setStatus("Preparando os registros para análise…");
     if(window.WorkspaceContext?.scope()==='case')await window.WorkspaceContext.setScope('dataset');
     if(window.WorkspaceContext?.scope()==='case') { setStatus("Aguarde a operação atual e abra o arquivo importado na Análise.", "warning"); q("open-result").hidden = false; return false; }
-    const loaded = await loadData({ kind: "file", path: result.path, paths: [result.path], format: "jsonl" });
+    const loaded = await loadData({ kind: "file", path: result.path, paths: [result.path], format: "jsonl" }, { merge: state.loaded });
     if (!loaded) {
       q("open-result").hidden = false; setStatus("O arquivo foi importado, mas não pôde ser aberto. Use Abrir arquivo importado para tentar novamente.", "error"); return false;
     }
@@ -188,7 +191,10 @@
     setBusy("open"); let opened = false;
     try { opened = await openSnapshot(ui.lastImport); } finally { setBusy(); if (opened) close(); }
   };
-  for (const id of ["url", "username", "kind"]) q(id).addEventListener("input", syncHints);
+  for (const id of ["url", "username", "kind", "kibana-version"]) {
+    q(id).addEventListener("input", syncHints);
+    q(id).addEventListener("change", syncHints);
+  }
   q("fields").addEventListener("input", () => { q("saved-state").textContent = ui.selected ? "Alterações ainda não salvas" : "Ainda não salva"; });
   modal.addEventListener("click", event => { if (event.target === modal) close(); });
   document.addEventListener("keydown", event => { if (event.key === "Escape" && !modal.hidden) { event.preventDefault(); close(); } });

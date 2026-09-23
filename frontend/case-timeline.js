@@ -551,8 +551,24 @@ window.CaseTimeline = (() => {
           ...(entry.type === "manual" ? [] : [{ icon: "fa-pen", label: "Editar título", onClick: () => openEditor("title", entry) }]),
           { icon: "fa-palette", label: "Alterar cor", onClick: () => colorMenu(entry, event.clientX, event.clientY) },
           ...(!horizontal ? [{ icon: "fa-arrows-left-right", label: "Mover para o outro lado", onClick: () => { config.layout[entry.id] = { side: side === "left" ? "right" : "left", offset }; callbacksSave(); } }] : [])];
-        if (entry.type === "manual") menu.push({ icon: "fa-pen", label: "Editar marco", onClick: () => openEditor("manual", entry) },
-          { icon: "fa-trash-can", label: "Remover marco", danger: true, onClick: () => { c.manual = c.manual.filter(manual => manual.id !== entry.manual.id); callbacksSave(); } });
+        if (entry.type === "manual") {
+          menu.push({ icon: "fa-pen", label: "Editar marco", onClick: () => openEditor("manual", entry) },
+            { icon: "fa-trash-can", label: "Remover marco", danger: true, onClick: () => { c.manual = c.manual.filter(manual => manual.id !== entry.manual.id); callbacksSave(); } });
+        } else {
+          menu.push({
+            icon: "fa-trash-can",
+            label: "Remover do caso",
+            danger: true,
+            onClick: async () => {
+              const idsToRemove = new Set(entry.members ? entry.members.map(m => m.id) : [entry.id]);
+              c.items = (c.items || []).filter(it => !idsToRemove.has(it.id));
+              config.groups = (config.groups || []).filter(g => !idsToRemove.has(g.id));
+              config.annotations = (config.annotations || []).filter(a => !idsToRemove.has(a.anchor));
+              await callbacksSave();
+              toast("Item removido do Caso.", "ok");
+            }
+          });
+        }
         if (entry.type === "group") menu.push({ icon: "fa-layer-group", label: "Desagrupar", onClick: () => { config.annotations.filter(note => note.anchor === entry.id).forEach(note => note.anchor = entry.members[0].id); config.groups = config.groups.filter(group => group.id !== entry.id); callbacksSave(); } });
         if (!shell.querySelector(".ct-group-action").hidden) menu.push({ icon: "fa-layer-group", label: "Agrupar seleção", onClick: () => shell.querySelector('[data-ct-action="group"]').click() });
         callbacks.menu(event.clientX, event.clientY, menu);

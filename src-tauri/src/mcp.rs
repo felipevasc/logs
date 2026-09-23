@@ -283,6 +283,66 @@ pub fn tool_catalog() -> Vec<(&'static str, &'static str)> {
         ),
         ("cases_load", "Carrega os casos de análise persistidos"),
         ("cases_save", "Persiste os casos de análise (muta estado)"),
+        (
+            "discover_patterns",
+            "Descoberta local de padrões: templates, anomalias numéricas e desvios",
+        ),
+        (
+            "compare_periods",
+            "Compara dois recortes temporais (before/after) e mudanças de padrões",
+        ),
+        (
+            "timeline_range",
+            "Histograma, erros e limites temporais para a linha do tempo",
+        ),
+        (
+            "export_events",
+            "Exporta recorte filtrado para JSONL ou CSV com máscara opcional",
+        ),
+        (
+            "expand_paths",
+            "Expande pastas, curingas e arquivos compactados gzip",
+        ),
+        (
+            "threat_scan",
+            "Varre eventos contra o catálogo de 378 regras locais de ameaças",
+        ),
+        (
+            "threat_events",
+            "Lista eventos e evidências de ameaças com paginação",
+        ),
+        (
+            "threat_catalog",
+            "Catálogo de regras de ameaças, severidades e categorias",
+        ),
+        (
+            "threat_catalog_update",
+            "Recarrega catálogo de regras de ameaças do disco (muta estado)",
+        ),
+        (
+            "journey_fields",
+            "Campos sugeridos para rastrear jornadas entre origens",
+        ),
+        (
+            "journey_index",
+            "Indexa jornadas por identificador com duração e agregações",
+        ),
+        (
+            "journey_events",
+            "Eventos cronológicos de uma jornada específica",
+        ),
+        (
+            "remote_list",
+            "Lista conexões Elasticsearch e Kibana salvas",
+        ),
+        (
+            "remote_test",
+            "Testa acesso e autenticação em conexão Elasticsearch ou Kibana",
+        ),
+        (
+            "remote_import",
+            "Consulta e importa registros remotos para arquivo JSONL local",
+        ),
     ]
 }
 
@@ -334,16 +394,36 @@ pub async fn serve(app: AppHandle, port: u16) {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("");
                         let expected = format!("Bearer {}", state.token);
-                        let equal = authorization.len() == expected.len()
+                        let equal_header = authorization.len() == expected.len()
                             && authorization
                                 .bytes()
                                 .zip(expected.bytes())
                                 .fold(0u8, |a, (b, c)| a | (b ^ c))
                                 == 0;
+                        let token_param = request
+                            .uri()
+                            .query()
+                            .and_then(|q| {
+                                q.split('&').find_map(|pair| {
+                                    let mut parts = pair.splitn(2, '=');
+                                    if parts.next()? == "token" {
+                                        parts.next()
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .unwrap_or("");
+                        let equal_query = token_param.len() == state.token.len()
+                            && token_param
+                                .bytes()
+                                .zip(state.token.bytes())
+                                .fold(0u8, |a, (b, c)| a | (b ^ c))
+                                == 0;
                         let allowed = state.enabled.load(Ordering::Relaxed)
                             && allowed_host
                             && headers.get("origin").is_none()
-                            && equal;
+                            && (equal_header || equal_query);
                         if !allowed {
                             return axum::http::StatusCode::UNAUTHORIZED.into_response();
                         }
@@ -607,6 +687,224 @@ pub struct SaveCodesParams {
 pub struct CasesSaveParams {
     /// Cases document as managed by the app ({active, cases: [...]}); stored as opaque JSON.
     pub data: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DiscoverPatternsParams {
+    #[schemars(description = FILTERS_DOC)]
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ComparePeriodsParams {
+    #[schemars(description = FILTERS_DOC)]
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    /// Baseline period ({start: epoch_ms, end: epoch_ms}).
+    pub before: crate::insights::Period,
+    /// Comparison period ({start: epoch_ms, end: epoch_ms}).
+    pub after: crate::insights::Period,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TimelineRangeParams {
+    #[schemars(description = FILTERS_DOC)]
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    /// Start timestamp (epoch ms).
+    pub start: i64,
+    /// End timestamp (epoch ms).
+    pub end: i64,
+    /// Number of histogram buckets (default: 50).
+    #[serde(default = "default_bucket_count")]
+    pub bucket_count: usize,
+}
+
+fn default_bucket_count() -> usize {
+    50
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExportEventsParams {
+    /// Destination file path (.jsonl or .csv).
+    pub path: String,
+    /// Export format: "jsonl" or "csv".
+    pub format: String,
+    #[schemars(description = FILTERS_DOC)]
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    /// Whether to redact/mask sensitive data (credentials, emails, ips, etc.).
+    #[serde(default)]
+    pub mask: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExpandPathsParams {
+    /// File paths, directories or wildcards to expand.
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ThreatScanParams {
+    #[schemars(description = FILTERS_DOC)]
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ThreatEventsParams {
+    #[schemars(description = FILTERS_DOC)]
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    /// Rows to skip (pagination).
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Max rows to return (clamped to 1..=500).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JourneyFieldsParams {
+    #[schemars(description = FILTERS_DOC)]
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JourneyIndexParams {
+    /// Field to group journeys by (e.g. "trace_id", "request_id", "session_id", "ip", "user").
+    pub field: String,
+    #[schemars(description = FILTERS_DOC)]
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    /// Rows to skip (pagination).
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Max journey groups to return (clamped to 1..=200).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Sort order: "recent" (default), "longest", "shortest", "events", "errors".
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// Whether to include single-event groups.
+    #[serde(default)]
+    pub include_singles: Option<bool>,
+    /// Start timestamp (epoch ms) - required for user/ip fields.
+    pub from: Option<i64>,
+    /// End timestamp (epoch ms) - required for user/ip fields.
+    pub to: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JourneyEventsParams {
+    /// Field used for tracking (e.g. "trace_id", "ip", "user").
+    pub field: String,
+    /// Exact value of the journey identifier.
+    pub value: String,
+    #[schemars(description = FILTERS_DOC)]
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    /// Start timestamp (epoch ms) - required for user/ip fields.
+    pub from: Option<i64>,
+    /// End timestamp (epoch ms) - required for user/ip fields.
+    pub to: Option<i64>,
+    /// Events to skip (pagination).
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Max events to return (clamped to 1..=500).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemoteConnectionParams {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    /// Service kind: "elasticsearch" or "kibana".
+    pub kind: String,
+    /// Base URL (e.g. "https://elastic.example:9200").
+    pub url: String,
+    /// Index name or wildcard pattern (e.g. "logs-*").
+    pub index: String,
+    /// Timestamp field name (default "@timestamp").
+    #[serde(default = "default_remote_time_field")]
+    pub time_field: String,
+    /// Username for Basic auth.
+    #[serde(default)]
+    pub username: String,
+    /// Maximum records to fetch (clamped to 1..=5000000).
+    #[serde(default = "default_remote_max_records")]
+    pub max_records: usize,
+    /// Optional Query DSL JSON query.
+    pub query: Option<serde_json::Value>,
+    /// Kibana version compatibility: "auto", "v7_8", or "v9".
+    #[serde(default = "default_remote_kibana_version")]
+    pub kibana_version: String,
+}
+
+fn default_remote_time_field() -> String {
+    "@timestamp".to_string()
+}
+
+fn default_remote_max_records() -> usize {
+    100_000
+}
+
+fn default_remote_kibana_version() -> String {
+    "auto".to_string()
+}
+
+impl From<RemoteConnectionParams> for crate::remote::RemoteConfig {
+    fn from(p: RemoteConnectionParams) -> Self {
+        let kind = if p.kind.eq_ignore_ascii_case("kibana") {
+            crate::remote::RemoteKind::Kibana
+        } else {
+            crate::remote::RemoteKind::Elasticsearch
+        };
+        crate::remote::RemoteConfig {
+            id: p.id,
+            name: p.name,
+            kind,
+            url: p.url,
+            index: p.index,
+            time_field: if p.time_field.is_empty() {
+                "@timestamp".to_string()
+            } else {
+                p.time_field
+            },
+            username: p.username,
+            max_records: p.max_records.clamp(1, 5_000_000),
+            query: p.query,
+            kibana_version: if p.kibana_version.trim().is_empty() {
+                "auto".to_string()
+            } else {
+                p.kibana_version
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemoteTestParams {
+    /// Remote connection configuration.
+    pub connection: RemoteConnectionParams,
+    /// Password for Basic auth (optional).
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemoteImportParams {
+    /// Remote connection configuration.
+    pub connection: RemoteConnectionParams,
+    /// Password for Basic auth (optional).
+    pub password: Option<String>,
+    /// Start ISO datetime (e.g. "2026-09-01T00:00:00Z").
+    pub from: Option<String>,
+    /// End ISO datetime (e.g. "2026-09-23T23:59:59Z").
+    pub to: Option<String>,
 }
 
 // ------------------------------------------------------------------ servidor
@@ -1185,6 +1483,238 @@ impl LogInsightMcp {
         }
         Ok(result)
     }
+
+    // ------------------------------------------------------------ descobertas & padrões
+
+    #[tool(
+        description = "Deep local pattern discovery: reservoir sampling over the dataset (up to 6,000 events) detecting frequent message templates, numerical anomalies/outliers (IQR/MAD), conditional deviations in context fields, and temporal distribution changes.",
+        annotations(read_only_hint = true)
+    )]
+    async fn discover_patterns(
+        &self,
+        Parameters(p): Parameters<DiscoverPatternsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
+        self.run(move |state| crate::discover_patterns_impl(state, p.filters, None))
+            .await
+    }
+
+    #[tool(
+        description = "Compare two time periods (before vs after, each {start, end} in epoch ms) within the filtered slice: event counts, error rates, and delta in message patterns.",
+        annotations(read_only_hint = true)
+    )]
+    async fn compare_periods(
+        &self,
+        Parameters(p): Parameters<ComparePeriodsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
+        self.run_domain(move |state| {
+            crate::workspace::compare_impl(state, p.filters, p.before, p.after)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Compute time span bounds, bucket size, error/warn totals, and histogram buckets for the timeline over the filtered slice.",
+        annotations(read_only_hint = true)
+    )]
+    async fn timeline_range(
+        &self,
+        Parameters(p): Parameters<TimelineRangeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
+        self.run_domain(move |state| {
+            crate::workspace::timeline_range_impl(state, p.filters, p.start, p.end, p.bucket_count)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Export filtered events to a file on disk (format: 'jsonl' or 'csv') with optional sensitive data redaction/masking (mask=true).",
+        annotations(read_only_hint = false)
+    )]
+    async fn export_events(
+        &self,
+        Parameters(p): Parameters<ExportEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
+        let count = crate::workspace::export_events(
+            p.path,
+            p.format,
+            p.filters,
+            p.mask,
+            None,
+            self.app.clone(),
+        )
+        .await;
+        from_domain(count.map(|c| serde_json::json!({ "exported_events": c })))
+    }
+
+    #[tool(
+        description = "Expand paths, directories, wildcards and .gz archives into a list of matching file paths (useful before calling load_files).",
+        annotations(read_only_hint = true)
+    )]
+    async fn expand_paths(
+        &self,
+        Parameters(p): Parameters<ExpandPathsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        from_domain(crate::workspace::expand_paths(p.paths).await)
+    }
+
+    // ------------------------------------------------------------ ameaças
+
+    #[tool(
+        description = "Scan loaded events against the local catalog of 378 threat rules (cloud metadata, credential dumps, command execution, injections, etc.). Returns matched rules, severity breakdown, categories, and timeline.",
+        annotations(read_only_hint = true)
+    )]
+    async fn threat_scan(
+        &self,
+        Parameters(p): Parameters<ThreatScanParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
+        from_domain(crate::threats::threat_scan(p.filters, None, self.app.clone()).await)
+    }
+
+    #[tool(
+        description = "Query events matching threat rules with filters and pagination.",
+        annotations(read_only_hint = true)
+    )]
+    async fn threat_events(
+        &self,
+        Parameters(p): Parameters<ThreatEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
+        from_domain(
+            crate::threats::threat_events(p.filters, None, p.offset, p.limit, self.app.clone())
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Inspect the catalog of 378 local threat rules: rule definitions, categories, severities, enabled states, and reference links.",
+        annotations(read_only_hint = true)
+    )]
+    async fn threat_catalog(&self) -> Result<CallToolResult, McpError> {
+        from_domain(crate::threats::threat_catalog().await)
+    }
+
+    #[tool(
+        description = "Reload and update the local threat rules catalog from disk. MUTATES app state: emits 'mcp-state-changed' {kind: 'threats'}.",
+        annotations(read_only_hint = false, idempotent_hint = true)
+    )]
+    async fn threat_catalog_update(&self) -> Result<CallToolResult, McpError> {
+        let result = from_domain(crate::threats::threat_catalog_update().await)?;
+        if succeeded(&result) {
+            notify_state_changed(&self.app, "threats");
+        }
+        Ok(result)
+    }
+
+    // ------------------------------------------------------------ jornadas
+
+    #[tool(
+        description = "Discover candidate fields for tracking journeys across sources (e.g. trace_id, request_id, session_id, ip, user) with event coverage counts.",
+        annotations(read_only_hint = true)
+    )]
+    async fn journey_fields(
+        &self,
+        Parameters(p): Parameters<JourneyFieldsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
+        from_domain(crate::journeys::journey_fields(p.filters, None, self.app.clone()).await)
+    }
+
+    #[tool(
+        description = "Group and index events into journeys by a correlation identifier field (e.g. trace_id). Returns start, end, observed duration, error counts, warning counts, and sources involved.",
+        annotations(read_only_hint = true)
+    )]
+    async fn journey_index(
+        &self,
+        Parameters(p): Parameters<JourneyIndexParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
+        from_domain(
+            crate::journeys::journey_index(
+                p.filters,
+                None,
+                p.field,
+                p.offset,
+                p.limit,
+                p.sort,
+                p.include_singles,
+                p.from,
+                p.to,
+                self.app.clone(),
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Retrieve the chronological events of a specific journey identified by an exact field value.",
+        annotations(read_only_hint = true)
+    )]
+    async fn journey_events(
+        &self,
+        Parameters(p): Parameters<JourneyEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
+        from_domain(
+            crate::journeys::journey_events(
+                p.filters,
+                None,
+                p.field,
+                p.value,
+                p.from,
+                p.to,
+                p.offset,
+                p.limit,
+                self.app.clone(),
+            )
+            .await,
+        )
+    }
+
+    // ------------------------------------------------------------ conexões remotas
+
+    #[tool(
+        description = "List saved Elasticsearch and Kibana connections configured in the application.",
+        annotations(read_only_hint = true)
+    )]
+    async fn remote_list(&self) -> Result<CallToolResult, McpError> {
+        from_domain(crate::remote::remote_list().await)
+    }
+
+    #[tool(
+        description = "Test connectivity and credentials for an Elasticsearch or Kibana endpoint.",
+        annotations(read_only_hint = true)
+    )]
+    async fn remote_test(
+        &self,
+        Parameters(p): Parameters<RemoteTestParams>,
+    ) -> Result<CallToolResult, McpError> {
+        from_domain(crate::remote::remote_test(p.connection.into(), p.password).await)
+    }
+
+    #[tool(
+        description = "Query and import records from an Elasticsearch or Kibana endpoint into a local JSONL snapshot file on disk.",
+        annotations(read_only_hint = false)
+    )]
+    async fn remote_import(
+        &self,
+        Parameters(p): Parameters<RemoteImportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        from_domain(
+            crate::remote::remote_import(
+                p.connection.into(),
+                p.password,
+                p.from,
+                p.to,
+                self.app.clone(),
+            )
+            .await,
+        )
+    }
 }
 
 #[tool_handler]
@@ -1202,7 +1732,11 @@ impl ServerHandler for LogInsightMcp {
                  source; (3) source_summary to confirm what is loaded (count, columns); (4) query_events to \
                  browse rows and event_detail to see a full event including the raw line; (5) aggregate_events, \
                  compute_series, pivot, profile_fields and stats_events for analysis; (6) trail_events for the \
-                 time context around a given event.\n\
+                 time context around a given event; (7) discover_patterns for statistical patterns, templates and anomalies; \
+                 (8) threat_scan and threat_events to detect threats against 378 local security rules; \
+                 (9) journey_fields, journey_index and journey_events to trace transactions across sources; \
+                 (10) compare_periods to compare two time ranges; (11) export_events to export data with optional masking; \
+                 (12) remote_* for Elasticsearch/Kibana integration.\n\
                  \n\
                  FILTERS: tools accept a filters array of {column, op, value, value2?} with AND semantics. \
                  Ops: contains, not_contains, equals, not_equals, equals_exact, not_equals_exact, starts_with, regex, gt, gte, lt, lte, \
@@ -1220,10 +1754,91 @@ impl ServerHandler for LogInsightMcp {
                  column (or the stacktrace field) to search text that only appears inside a stacktrace.\n\
                  \n\
                  MUTATIONS: tools marked as mutating (load_*, clear_events, save_*, set_ts_config, \
-                 delete_derived_field, harvest_codes, cases_save) change the app state and live-refresh the \
+                 delete_derived_field, harvest_codes, cases_save, threat_catalog_update, export_events, remote_import) change the app state and live-refresh the \
                  user's UI via the 'mcp-state-changed' event. Always tell the user before changing the loaded \
                  data source or any saved configuration on their behalf."
                     .to_string(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_catalog_includes_all_new_tools() {
+        let catalog = tool_catalog();
+        let names: std::collections::HashSet<&str> = catalog.iter().map(|(n, _)| *n).collect();
+
+        // Verificar ferramentas pré-existentes
+        assert!(names.contains("load_file"));
+        assert!(names.contains("query_events"));
+        assert!(names.contains("aggregate_events"));
+
+        // Verificar ferramentas de Ameaças
+        assert!(names.contains("threat_scan"));
+        assert!(names.contains("threat_events"));
+        assert!(names.contains("threat_catalog"));
+        assert!(names.contains("threat_catalog_update"));
+
+        // Verificar ferramentas de Jornadas
+        assert!(names.contains("journey_fields"));
+        assert!(names.contains("journey_index"));
+        assert!(names.contains("journey_events"));
+
+        // Verificar ferramentas de Descoberta e Análise
+        assert!(names.contains("discover_patterns"));
+        assert!(names.contains("compare_periods"));
+        assert!(names.contains("timeline_range"));
+        assert!(names.contains("export_events"));
+        assert!(names.contains("expand_paths"));
+
+        // Verificar ferramentas de Conexões Remotas
+        assert!(names.contains("remote_list"));
+        assert!(names.contains("remote_test"));
+        assert!(names.contains("remote_import"));
+
+        assert_eq!(catalog.len(), 50);
+    }
+
+    #[test]
+    fn test_remote_connection_params_conversion() {
+        let params = RemoteConnectionParams {
+            id: "conn-1".to_string(),
+            name: "Elastic Prod".to_string(),
+            kind: "elasticsearch".to_string(),
+            url: "https://elastic.local:9200".to_string(),
+            index: "app-logs-*".to_string(),
+            time_field: "@timestamp".to_string(),
+            username: "elastic".to_string(),
+            max_records: 50_000,
+            query: Some(serde_json::json!({"match_all": {}})),
+            kibana_version: "auto".to_string(),
+        };
+        let config: crate::remote::RemoteConfig = params.into();
+        assert_eq!(config.id, "conn-1");
+        assert_eq!(config.name, "Elastic Prod");
+        assert_eq!(config.url, "https://elastic.local:9200");
+        assert_eq!(config.index, "app-logs-*");
+        assert_eq!(config.max_records, 50_000);
+        assert_eq!(config.kibana_version, "auto");
+
+        let kibana_params = RemoteConnectionParams {
+            id: "conn-2".to_string(),
+            name: "Kibana Prod".to_string(),
+            kind: "kibana".to_string(),
+            url: "https://kibana.local:5601".to_string(),
+            index: "logs-*".to_string(),
+            time_field: "".to_string(),
+            username: "".to_string(),
+            max_records: 0,
+            query: None,
+            kibana_version: "v9".to_string(),
+        };
+        let kibana_config: crate::remote::RemoteConfig = kibana_params.into();
+        assert_eq!(kibana_config.time_field, "@timestamp");
+        assert_eq!(kibana_config.max_records, 1);
+        assert_eq!(kibana_config.kibana_version, "v9");
     }
 }

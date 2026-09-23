@@ -779,8 +779,23 @@ async function loadData(requestedSource = null, options = {}) {
     const version = options.version ?? ++state.artifactSwitchVersion;
     let merge = !!options.merge;
     if (merge && state.currentArtifact?.source) {
-      const members = [state.currentArtifact.source, source].flatMap(s => s.kind === "bundle" ? s.members : [s]);
-      source = { kind: "bundle", members, path: members[0].path || members[0].channel };
+      const currentMembers = state.currentArtifact.source.kind === "bundle"
+        ? state.currentArtifact.source.members
+        : [state.currentArtifact.source];
+      const newMembers = source.kind === "bundle" ? source.members : [source];
+      const rawMembers = [...currentMembers, ...newMembers];
+      const uniqueMembers = [];
+      const seen = new Set();
+      for (const m of rawMembers) {
+        const key = m.kind === "eventlog"
+          ? `eventlog:${m.channel}`
+          : `file:${(m.paths?.length ? m.paths : [m.path]).map(p => String(p).toLowerCase()).sort().join(";")}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          uniqueMembers.push(m);
+        }
+      }
+      source = { kind: "bundle", members: uniqueMembers, path: uniqueMembers[0]?.path || uniqueMembers[0]?.channel || "" };
       merge = false;
     }
     applySourceSpec(source);
@@ -963,19 +978,83 @@ function chipLabel(f) {
   return `${col} ${sym} ${f.value}`;
 }
 
+function invertFilter(index) {
+  const f = state.filters[index];
+  if (!f) return;
+  const INVERT_OPS = {
+    contains: "not_contains",
+    not_contains: "contains",
+    equals: "not_equals",
+    not_equals: "equals",
+    equals_exact: "not_equals_exact",
+    not_equals_exact: "equals_exact",
+    gt: "lte",
+    lte: "gt",
+    gte: "lt",
+    lt: "gte",
+    empty: "not_empty",
+    not_empty: "empty",
+  };
+  if (INVERT_OPS[f.op]) {
+    f.op = INVERT_OPS[f.op];
+  } else if (f.op === "starts_with") {
+    f.op = "regex";
+    f.value = `^(?!${escRe(f.value)})`;
+  } else if (f.op === "regex") {
+    if (f.value.startsWith("^(?!") && f.value.endsWith(")")) {
+      f.value = f.value.slice(4, -1);
+    } else {
+      f.value = `^(?!.*(?:${f.value}))`;
+    }
+  } else if (f.op === "pattern") {
+    f.op = "not_contains";
+  } else {
+    toast(`Não é possível inverter o operador "${f.op}".`, "info");
+    return;
+  }
+  state.page = 0;
+  filtersChanged();
+  toast(`Filtro invertido: ${chipLabel(f)}`, "ok");
+}
+
 function renderChips() {
   const boxes = document.querySelectorAll(".chips-sync");
   boxes.forEach((box) => (box.innerHTML = ""));
   state.filters.forEach((f, i) => {
     boxes.forEach((box) => {
       const chip = el("span", "chip");
-      chip.title = chipLabel(f); // filtro completo no tooltip quando truncado
+      chip.title = `${chipLabel(f)} (Botão direito: inverter ou editar)`;
       chip.appendChild(el("span", "", chipLabel(f)));
       const x = el("button", "x");
       x.innerHTML = '<i class="fas fa-xmark"></i>';
       x.title = "Remover filtro";
-      x.onclick = () => removeFilter(i);
+      x.onclick = (e) => { e.stopPropagation(); removeFilter(i); };
       chip.appendChild(x);
+
+      chip.oncontextmenu = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showCtxMenu(e.clientX, e.clientY, [
+          {
+            icon: "fa-arrows-rotate",
+            label: "Inverter filtro",
+            onClick: () => invertFilter(i),
+          },
+          {
+            icon: "fa-pen-to-square",
+            label: "Editar filtro",
+            onClick: () => openFilterPop(chip, i),
+          },
+          { sep: true },
+          {
+            icon: "fa-trash-can",
+            label: "Remover filtro",
+            danger: true,
+            onClick: () => removeFilter(i),
+          },
+        ]);
+      };
+
       box.appendChild(chip);
     });
   });
@@ -1514,19 +1593,35 @@ function toggleFacet(column, value) {
   addFilter({ column, op: empty ? "empty" : "equals_exact", value: empty ? "" : String(value), value2: null });
 }
 
-// popover de novo filtro
-function openFilterPop(anchor = null) {
+let currentEditFilterIndex = null;
+
+// popover de novo filtro ou edição
+function openFilterPop(anchor = null, editIndex = null) {
+  currentEditFilterIndex = editIndex;
   const pop = $("#filter-pop");
   const colSel = $("#fp-col");
   const opSel = $("#fp-op");
+  const titleEl = pop.querySelector(".pop-title");
+  if (titleEl) titleEl.textContent = editIndex != null ? "Editar filtro" : "Novo filtro";
+
   colSel.innerHTML = "";
   colSel.appendChild(el("option", "", colLabel("_all"))).value = "_all";
   for (const c of state.columns) colSel.appendChild(el("option", "", colLabel(c))).value = c;
   opSel.innerHTML = "";
   for (const [v, l] of OPS) opSel.appendChild(el("option", "", l)).value = v;
-  $("#fp-val").value = "";
-  $("#fp-val2").value = "";
-  $("#fp-val2").hidden = true;
+
+  if (editIndex != null && state.filters[editIndex]) {
+    const f = state.filters[editIndex];
+    colSel.value = f.column;
+    opSel.value = f.op;
+    $("#fp-val").value = f.value ?? "";
+    $("#fp-val2").value = f.value2 ?? "";
+    $("#fp-val2").hidden = f.op !== "between";
+  } else {
+    $("#fp-val").value = "";
+    $("#fp-val2").value = "";
+    $("#fp-val2").hidden = true;
+  }
   opSel.onchange = () => { $("#fp-val2").hidden = opSel.value !== "between"; };
   pop.hidden = false;
   positionPop(pop, anchor || $("#btn-add-filter"));
@@ -1541,7 +1636,15 @@ function applyFilterPop() {
     toast("Informe um valor para o filtro.", "info");
     return;
   }
-  addFilter({ column, op, value, value2: value2 || null });
+  if (currentEditFilterIndex != null && state.filters[currentEditFilterIndex]) {
+    state.filters[currentEditFilterIndex] = { column, op, value, value2: value2 || null };
+    currentEditFilterIndex = null;
+    state.page = 0;
+    filtersChanged();
+    toast("Filtro atualizado.", "ok");
+  } else {
+    addFilter({ column, op, value, value2: value2 || null });
+  }
   $("#filter-pop").hidden = true;
 }
 
@@ -3659,7 +3762,232 @@ function eventCellMenu(ev, col, value) {
     label: "Enviar todos visíveis ao caso",
     onClick: sendVisibleToCase,
   });
-  return workspaceScope() === "case" ? items.filter(item => !["fa-microscope", "fa-briefcase"].includes(item.icon)) : items;
+  const selectedList = (state.selectedEventRows?.has(ev.id) && state.selectedEventRows.size > 1)
+    ? Array.from(state.selectedEventRows.values())
+    : [ev];
+
+  items.push({ sep: true });
+  items.push({
+    icon: "fa-route",
+    label: selectedList.length > 1
+      ? `Jogar ${selectedList.length} eventos para uma trilha...`
+      : "Jogar evento para uma trilha...",
+    onClick: () => openSendToTrailModal(selectedList),
+  });
+
+  if (workspaceScope() === "case") {
+    const caseItems = items.filter(item => !["fa-microscope", "fa-briefcase"].includes(item.icon));
+    caseItems.push({ sep: true });
+    caseItems.push({
+      icon: "fa-trash-can",
+      label: "Remover este registro do Caso",
+      danger: true,
+      onClick: () => removeEventFromCase(ev),
+    });
+    return caseItems;
+  }
+  return items;
+}
+
+async function removeEventFromCase(ev) {
+  const c = activeCase();
+  if (!c) return;
+  const key = caseRecordKey(ev, state.currentArtifact?.id, state.currentOrigin);
+  let removed = false;
+  for (let i = (c.items || []).length - 1; i >= 0; i--) {
+    const item = c.items[i];
+    if (item.rows && item.rows.length) {
+      const matchIdx = item.rows.findIndex(r => caseRecordKey(r, item.artifactId, item.origin) === key || r.id === ev.id);
+      if (matchIdx >= 0) {
+        if (item.rows.length === 1) {
+          c.items.splice(i, 1);
+        } else {
+          item.rows.splice(matchIdx, 1);
+          item.includedCount = item.rows.length;
+        }
+        removed = true;
+        break;
+      }
+    }
+  }
+  if (removed) {
+    await saveCases();
+    window.WorkspaceContext?.refreshMembership();
+    filtersChanged();
+    toast("Registro removido do Caso.", "ok");
+  } else {
+    toast("Registro não encontrado no Caso.", "info");
+  }
+}
+
+function openSendToTrailModal(events) {
+  if (!events || !events.length) return;
+  const c = ensureCase();
+  if (!c) return;
+  const existingTrails = Array.isArray(c.caseTrails) ? c.caseTrails : [];
+
+  let overlay = document.querySelector("#send-trail-modal");
+  if (overlay) overlay.remove();
+
+  overlay = el("div", "modal-overlay");
+  overlay.id = "send-trail-modal";
+  const modal = el("section", "modal");
+  modal.setAttribute("role", "dialog");
+  modal.setAttribute("aria-modal", "true");
+  modal.setAttribute("aria-label", "Jogar para trilha");
+
+  const head = el("header", "modal-head");
+  head.innerHTML = `<div><h3>Jogar para trilha</h3><p>${fmtNum(events.length)} evento(s) selecionado(s)</p></div><button class="icon-btn" type="button" id="stm-close" aria-label="Fechar"><i class="fas fa-xmark"></i></button>`;
+
+  const body = el("div", "modal-body");
+  const optionsWrap = el("div", "trail-pick-options");
+  optionsWrap.style.display = "flex";
+  optionsWrap.style.flexDirection = "column";
+  optionsWrap.style.gap = "12px";
+
+  let selectExistingHtml = "";
+  if (existingTrails.length > 0) {
+    selectExistingHtml = `
+      <label class="radio-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+        <input type="radio" name="stm-mode" value="existing" checked>
+        <strong>Trilha existente:</strong>
+      </label>
+      <select id="stm-existing-select" class="form-select" style="margin-left:24px;width:calc(100% - 24px);padding:6px 10px;border-radius:4px;border:1px solid var(--border);">
+        ${existingTrails.map(t => `<option value="${t.id}">${esc(t.title || "Trilha sem título")} (${fmtNum(t.itemIds?.length || 0)} itens)</option>`).join("")}
+      </select>
+    `;
+  }
+
+  const defaultTitle = events.length === 1
+    ? (events[0].message ? events[0].message.slice(0, 60) : `Evento ${events[0].id}`)
+    : `Trilha · ${events.length} eventos (${fmtTs(events[0].timestamp || Date.now())})`;
+
+  const newTrailHtml = `
+    <label class="radio-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:${existingTrails.length ? '8px' : '0'};">
+      <input type="radio" name="stm-mode" value="new" ${existingTrails.length === 0 ? "checked" : ""}>
+      <strong>Nova trilha:</strong>
+    </label>
+    <div style="margin-left:24px;width:calc(100% - 24px);">
+      <input type="text" id="stm-new-title" class="form-input" style="width:100%;padding:6px 10px;border-radius:4px;border:1px solid var(--border);" placeholder="Título da nova trilha" value="${esc(defaultTitle)}">
+    </div>
+  `;
+
+  optionsWrap.innerHTML = selectExistingHtml + newTrailHtml;
+  body.appendChild(optionsWrap);
+
+  const footer = el("div", "modal-actions");
+  footer.style.display = "flex";
+  footer.style.justifyContent = "flex-end";
+  footer.style.gap = "8px";
+  footer.style.marginTop = "16px";
+  footer.innerHTML = `
+    <button class="btn ghost small" id="stm-cancel" type="button">Cancelar</button>
+    <button class="btn primary small" id="stm-confirm" type="button"><i class="fas fa-check"></i> Confirmar</button>
+  `;
+
+  modal.append(head, body, footer);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  const close = () => { overlay.remove(); };
+  overlay.querySelector("#stm-close").onclick = close;
+  overlay.querySelector("#stm-cancel").onclick = close;
+  overlay.onclick = (e) => { if (e.target === overlay) close(); };
+
+  const confirmBtn = overlay.querySelector("#stm-confirm");
+  confirmBtn.onclick = async () => {
+    confirmBtn.disabled = true;
+    try {
+      const mode = overlay.querySelector('input[name="stm-mode"]:checked')?.value || "new";
+      const artifact = registerCurrentArtifact();
+      const groupItem = {
+        ...caseItemBase("grupo", artifact?.stationId || null, events.length, events.length),
+        label: events.length === 1 ? (events[0].message?.slice(0, 100) || "Evento") : `${events.length} eventos da exploração`,
+        rows: structuredClone(events),
+        sourceFilters: structuredClone(state.filters),
+        sourceSpec: structuredClone(state.currentArtifact?.source),
+        summary: `Eventos enviados da exploração (${events.length} registros)`,
+        details: "",
+        attachments: []
+      };
+      c.items = c.items || [];
+      c.items.push(groupItem);
+
+      let trailTitle = "";
+      if (mode === "existing") {
+        const selId = overlay.querySelector("#stm-existing-select")?.value;
+        const trail = c.caseTrails?.find(t => t.id === selId);
+        if (!trail) throw Error("Trilha não encontrada.");
+        trail.itemIds = trail.itemIds || [];
+        if (!trail.itemIds.includes(groupItem.id)) trail.itemIds.push(groupItem.id);
+        trail.updatedAt = Date.now();
+        trailTitle = trail.title || "Trilha";
+      } else {
+        const titleInput = overlay.querySelector("#stm-new-title")?.value?.trim() || defaultTitle;
+        const newTrail = {
+          id: `ct-${nid()}`,
+          title: titleInput,
+          summary: `Criada com ${events.length} evento(s) da exploração`,
+          details: "",
+          attachments: [],
+          itemIds: [groupItem.id],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+        c.caseTrails = c.caseTrails || [];
+        c.caseTrails.push(newTrail);
+        trailTitle = newTrail.title;
+      }
+
+      await saveCases();
+      updateAnalysisBadge();
+      close();
+      toast(`${fmtNum(events.length)} evento(s) adicionado(s) à trilha "${trailTitle}".`, "ok");
+    } catch (err) {
+      toast(String(err.message || err), "err");
+      confirmBtn.disabled = false;
+    }
+  };
+}
+
+function toggleRowSelect(ev, forceState = null) {
+  state.selectedEventRows = state.selectedEventRows || new Map();
+  const next = forceState !== null ? forceState : !state.selectedEventRows.has(ev.id);
+  if (next) state.selectedEventRows.set(ev.id, ev);
+  else state.selectedEventRows.delete(ev.id);
+  state.lastSelectedRowId = ev.id;
+  updateRowSelectionStyles();
+}
+
+function selectRowRange(targetId) {
+  state.selectedEventRows = state.selectedEventRows || new Map();
+  const ids = state.rows.map(r => r.id);
+  const idxA = ids.indexOf(state.lastSelectedRowId);
+  const idxB = ids.indexOf(targetId);
+  if (idxA >= 0 && idxB >= 0) {
+    const min = Math.min(idxA, idxB);
+    const max = Math.max(idxA, idxB);
+    for (let i = min; i <= max; i++) {
+      state.selectedEventRows.set(state.rows[i].id, state.rows[i]);
+    }
+    updateRowSelectionStyles();
+  }
+}
+
+function updateRowSelectionStyles() {
+  const tbody = $("#events-table tbody");
+  if (!tbody) return;
+  tbody.querySelectorAll("tr").forEach(tr => {
+    const id = Number(tr.dataset.eventId);
+    const selected = state.selectedEventRows?.has(id);
+    tr.classList.toggle("row-multi-selected", !!selected);
+    const chk = tr.querySelector(".row-select-check");
+    if (chk) chk.checked = !!selected;
+  });
+  const checkAll = $("#events-table thead .select-all-check");
+  if (checkAll && state.rows?.length) {
+    checkAll.checked = state.rows.every(r => state.selectedEventRows?.has(r.id));
+  }
 }
 
 // envia a página visível ao Caso, sem duplicar o que já está lá
@@ -3686,7 +4014,37 @@ function buildEventRow(ev) {
   row.dataset.eventId = ev.id;
   if (workspaceScope() === "dataset" && window.WorkspaceContext?.isIncluded(ev)) { row.classList.add("event-in-case"); row.title = "Este registro já está no Caso"; }
   if (ev.id === state.detailId) row.classList.add("selected");
-  row.onclick = () => openDetail(ev.id);
+  if (state.selectedEventRows?.has(ev.id)) row.classList.add("row-multi-selected");
+
+  row.onclick = (e) => {
+    if (e.target.closest("input, button, a")) return;
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      toggleRowSelect(ev);
+    } else if (e.shiftKey && state.lastSelectedRowId != null) {
+      e.preventDefault();
+      selectRowRange(ev.id);
+    } else {
+      openDetail(ev.id);
+    }
+  };
+
+  const tdCheck = el("td", "td-row-check");
+  tdCheck.style.width = "38px";
+  tdCheck.style.textAlign = "center";
+  const rowCheck = el("input", "row-select-check");
+  rowCheck.type = "checkbox";
+  rowCheck.setAttribute("aria-label", `Selecionar evento ${ev.id}`);
+  rowCheck.checked = !!state.selectedEventRows?.has(ev.id);
+  rowCheck.onclick = (e) => { e.stopPropagation(); };
+  rowCheck.onchange = (e) => { e.stopPropagation(); toggleRowSelect(ev, rowCheck.checked); };
+  tdCheck.appendChild(rowCheck);
+  tdCheck.oncontextmenu = (e) => {
+    e.preventDefault();
+    showCtxMenu(e.clientX, e.clientY, eventCellMenu(ev, null, null));
+  };
+  row.appendChild(tdCheck);
+
   for (const col of state.visibleCols) {
     const td = el("td");
     if (col === "level") {
@@ -3735,6 +4093,9 @@ function renderTable(qr) {
   const table = $("#events-table");
   table.querySelector("colgroup")?.remove();
   const colgroup = document.createElement("colgroup");
+  const checkCol = document.createElement("col");
+  checkCol.style.width = "38px";
+  colgroup.appendChild(checkCol);
   for (const col of state.visibleCols) {
     const colEl = document.createElement("col");
     if (state.colWidths[col]) colEl.style.width = `${state.colWidths[col]}px`;
@@ -3743,6 +4104,26 @@ function renderTable(qr) {
   table.prepend(colgroup);
 
   const tr = el("tr");
+  const thCheck = el("th", "th-select-all");
+  thCheck.style.width = "38px";
+  thCheck.style.textAlign = "center";
+  const checkAll = el("input", "select-all-check");
+  checkAll.type = "checkbox";
+  checkAll.title = "Selecionar todos os eventos da página";
+  checkAll.setAttribute("aria-label", "Selecionar todos os eventos da página");
+  checkAll.checked = qr.rows.length > 0 && qr.rows.every(r => state.selectedEventRows?.has(r.id));
+  checkAll.onchange = (e) => {
+    e.stopPropagation();
+    state.selectedEventRows = state.selectedEventRows || new Map();
+    if (checkAll.checked) {
+      for (const ev of qr.rows) state.selectedEventRows.set(ev.id, ev);
+    } else {
+      for (const ev of qr.rows) state.selectedEventRows.delete(ev.id);
+    }
+    updateRowSelectionStyles();
+  };
+  thCheck.appendChild(checkAll);
+  tr.appendChild(thCheck);
   let lastColumnDropAt = 0;
   for (const col of state.visibleCols) {
     const th = el("th", "", colLabel(col));
@@ -4479,21 +4860,25 @@ const MCP_MUTATING_TOOLS = new Set([
   "save_custom_format", "set_ts_config",
   "save_derived_field", "delete_derived_field",
   "save_codes", "harvest_codes", "cases_save",
+  "threat_catalog_update", "export_events", "remote_import",
 ]);
 const MCP_CATEGORY_ORDER = [
-  "Fontes", "Consulta", "Análise", "Formatos", "Data/Hora",
+  "Fontes", "Consulta", "Análise", "Ameaças", "Jornadas", "Conexões", "Formatos", "Data/Hora",
   "Campos derivados", "Códigos", "Casos", "Outros",
 ];
 
 function mcpToolCategory(name) {
-  if (/^(load_|clear_events|source_summary)/.test(name)) return "Fontes";
+  if (/^threat_/.test(name)) return "Ameaças";
+  if (/^journey_/.test(name)) return "Jornadas";
+  if (/^remote_/.test(name)) return "Conexões";
+  if (/^(load_|clear_events|source_summary|list_sources|expand_paths)/.test(name)) return "Fontes";
   if (/format/.test(name)) return "Formatos";
   if (/ts_config|timestamp/.test(name)) return "Data/Hora";
   if (/derived/.test(name)) return "Campos derivados";
   if (/code|harvest/.test(name)) return "Códigos";
   if (/^cases?_/.test(name)) return "Casos";
   if (/^(query|count|event_detail|stats|explore|trail|list_channels)/.test(name)) return "Consulta";
-  if (/^(aggregate|profile|compute|pivot|tree)/.test(name)) return "Análise";
+  if (/^(aggregate|profile|compute|pivot|tree|discover_patterns|compare_periods|timeline_range|dataset_overview|export_events)/.test(name)) return "Análise";
   return "Outros";
 }
 
@@ -4582,7 +4967,7 @@ async function renderMcpPane() {
   pane.appendChild(box);
 
   pane.appendChild(el("p", "muted small",
-    "MCP (Model Context Protocol) permite que assistentes de IA (VS Code/Copilot, opencode, Claude Code, Cursor) " +
+    "MCP (Model Context Protocol) permite que assistentes de IA (Google Antigravity, VS Code/Copilot, opencode, Claude Code, Cursor) " +
     "usem o LogInsight como ferramenta: eles enxergam e operam os mesmos dados que você vê na tela — " +
     "mudanças feitas pela IA aparecem aqui na hora."));
 
@@ -4593,6 +4978,15 @@ async function renderMcpPane() {
     const headers = { Authorization: `Bearer ${status.token || ""}` };
     const fldConfig = el("div", "fld");
     fldConfig.appendChild(el("label", "", "Como configurar"));
+    fldConfig.appendChild(mcpSnippet("Google Antigravity (~/.gemini/config/mcp_config.json)",
+      JSON.stringify({
+        mcpServers: {
+          loginsight: {
+            serverUrl: url,
+            headers,
+          },
+        },
+      }, null, 2)));
     fldConfig.appendChild(mcpSnippet("VS Code (mcp.json)",
       JSON.stringify({ servers: { loginsight: { type: "http", url, headers } } }, null, 2)));
     fldConfig.appendChild(mcpSnippet("opencode (opencode.json)",
@@ -4600,7 +4994,7 @@ async function renderMcpPane() {
     fldConfig.appendChild(mcpSnippet("Claude Code (terminal)",
       `claude mcp add --transport http loginsight ${url} --header "Authorization: Bearer ${status.token || ""}"`));
     fldConfig.appendChild(el("p", "muted small",
-      "Use a URL local e o cabeçalho Authorization no seu cliente. A chave permite consultar e alterar os dados abertos."));
+      "No Google Antigravity, configure em ~/.gemini/config/mcp_config.json (global) ou em .agents/mcp_config.json (workspace). Para os demais clientes, use a URL local e o cabeçalho Authorization."));
     const adv = el("div", "mcp-status");
     const advRow = el("div", "mcp-status-row");
     advRow.appendChild(el("span", "muted small", "Config avançada:"));
@@ -4657,6 +5051,10 @@ async function handleMcpStateChanged(kind) {
   if (kind === "cases") {
     await mcpReloadCases();
     toast("Casos atualizados via MCP.", "info");
+    return;
+  }
+  if (kind === "threats") {
+    toast("Catálogo de ameaças atualizado via MCP.", "info");
     return;
   }
   // codes / derived / ts_config / formats: recarrega painéis abertos e reconsulta a view
@@ -4825,7 +5223,7 @@ function bind() {
   $("#src-btn-eventlog").onclick = () => setSource("eventlog");
   $("#btn-browse").onclick = browseFile;
   $("#btn-refresh-channels").onclick = refreshChannels;
-  $("#btn-load").onclick = async () => { await loadData(); if (state.loaded) switchView("viz"); };
+  $("#btn-load").onclick = async () => { await loadData(null, { merge: state.loaded }); if (state.loaded) switchView("viz"); };
   $("#btn-merge").onclick = async () => { await loadData(null, { merge: true }); if (state.loaded) switchView("viz"); };
   $("#btn-clear").onclick = () => clearData({ removeCurrent: true });
   $("#btn-back-drive").onclick = () => switchView("source");
