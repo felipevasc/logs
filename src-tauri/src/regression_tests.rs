@@ -692,7 +692,7 @@ fn contextual_change_finds_three_field_incident_in_middle_of_period() {
         .expect("three-field incident");
     assert_eq!(shift.context.len(), 3);
     assert_eq!(shift.expected, "normal-7");
-    assert_eq!(shift.outcome_op, "equals");
+    assert_eq!(shift.outcome_op, "equals_exact");
     assert_eq!(shift.baseline_count, 66);
     assert_eq!(shift.window_observed, 6);
     assert_eq!(shift.expected_share, 1.0);
