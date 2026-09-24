@@ -1406,6 +1406,10 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
     renderExploreTree();
     return;
   }
+  if (!force && document.querySelector(".shell")?.classList.contains("side-collapsed")) {
+    state.treeAggSig[scope] = null;
+    return;
+  }
   const profiles = scope === "case" ? caseTreeProfilesPeek() : (state.datasetProfiles || []);
   const { categories, ranges } = treeGroupProfiles(profiles);
   const cols = ["level", "source", "code", ...categories.map((p) => p.name), ...ranges.map((p) => p.name)];
@@ -1468,17 +1472,20 @@ function renderExploreTreeInto(box, scope) {
   const live = state.treeAgg[scope] || {};
   const byName = Object.fromEntries((profiles || []).map((p) => [p.name, p]));
 
-  // nó raiz: todos os campos; clique inspeciona, funil abre o filtro avançado
+  // nó raiz: todos os campos organizados em árvore hierárquica por ponto (.)
   const favorites = state.favoriteFields || [];
-  const fieldKids = [...columns].sort((a,b) => Number(favorites.includes(b)) - Number(favorites.includes(a))).map((column) => {
+
+  const createFieldRow = (column, labelOverride = null, isParent = false, toggleBtn = null) => {
     const profile = byName[column];
     const kind = profile?.kind || (column === "timestamp" ? "time" : "text");
-    const row = el("div", "field-row");
+    const row = el("div", `field-row${isParent ? " is-parent" : ""}`);
     row.dataset.field = `${column} ${colLabel(column)}`.toLocaleLowerCase();
     row.dataset.column = column;
     if (hasColFilter(column)) row.classList.add("has-filter");
+    if (toggleBtn) row.appendChild(toggleBtn);
     const main = el("button", "field-item");
-    main.innerHTML = `<i class="fas ${FIELD_KIND_ICONS[kind] || "fa-font"}"></i><span>${esc(colLabel(column))}</span><small>${profile?.cardinality ? fmtNum(profile.cardinality) : ""}</small>`;
+    const displayLabel = labelOverride || colLabel(column);
+    main.innerHTML = `<i class="fas ${FIELD_KIND_ICONS[kind] || "fa-font"}"></i><span>${esc(displayLabel)}</span><small>${profile?.cardinality ? fmtNum(profile.cardinality) : ""}</small>`;
     main.title = `Inspecionar campo: ${colLabel(column)}${profile?.sampled_events ? ` · perfil de ${fmtNum(profile.sampled_events)} eventos amostrados` : ""}`;
     main.onclick = () => showFieldInspector(column);
     const adv = el("button", "icon-btn field-adv-btn");
@@ -1494,12 +1501,137 @@ function renderExploreTreeInto(box, scope) {
     favorite.innerHTML = `<i class="${favorites.includes(column) ? "fas" : "far"} fa-star"></i>`;
     favorite.setAttribute("aria-label", `${favorites.includes(column) ? "Desafixar" : "Fixar"} ${colLabel(column)}`);
     favorite.title = favorite.getAttribute("aria-label");
-    favorite.onclick = () => { state.favoriteFields = favorites.includes(column) ? favorites.filter(c => c !== column) : [...favorites, column]; localStorage.setItem("workspace.fields", JSON.stringify(state.favoriteFields)); renderExploreTree(); };
+    favorite.onclick = () => {
+      state.favoriteFields = favorites.includes(column) ? favorites.filter(c => c !== column) : [...favorites, column];
+      localStorage.setItem("workspace.fields", JSON.stringify(state.favoriteFields));
+      renderExploreTree();
+    };
     row.append(favorite);
     return row;
+  };
+
+  const buildTree = (cols) => {
+    const root = { name: "", fullPath: "", isField: false, children: new Map() };
+    for (const column of cols) {
+      const parts = column.split(".");
+      let cur = root;
+      let pathAcc = "";
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        pathAcc = pathAcc ? `${pathAcc}.${part}` : part;
+        if (!cur.children.has(part)) {
+          cur.children.set(part, {
+            name: part,
+            fullPath: pathAcc,
+            isField: false,
+            children: new Map(),
+          });
+        }
+        cur = cur.children.get(part);
+        if (i === parts.length - 1) cur.isField = true;
+      }
+    }
+    return root;
+  };
+
+  const countDescendants = (node) => {
+    let count = node.isField ? 1 : 0;
+    for (const child of node.children.values()) {
+      count += countDescendants(child);
+    }
+    return count;
+  };
+
+  const renderNode = (node, depth = 0) => {
+    if (node.children.size === 0) {
+      return createFieldRow(node.fullPath, depth > 0 ? node.name : null);
+    }
+
+    const container = el("div", "field-tree-node");
+    const treeId = `field-tree-${scope}-${node.fullPath}`;
+    container.dataset.treeId = treeId;
+    container.dataset.field = `${node.fullPath} ${node.name}`.toLocaleLowerCase();
+    if (state.treeCollapsed.has(treeId)) container.classList.add("collapsed");
+
+    const toggle = el("button", "field-toggle-btn");
+    toggle.innerHTML = '<i class="fas fa-angle-down"></i>';
+    toggle.setAttribute("aria-label", "Recolher / expandir subcampos");
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      if (state.treeCollapsed.delete(treeId)) container.classList.remove("collapsed");
+      else { state.treeCollapsed.add(treeId); container.classList.add("collapsed"); }
+    };
+
+    if (node.isField) {
+      container.appendChild(createFieldRow(node.fullPath, depth > 0 ? node.name : null, true, toggle));
+    } else {
+      const groupRow = el("div", "field-group-row");
+      groupRow.dataset.field = `${node.fullPath} ${node.name}`.toLocaleLowerCase();
+      const head = el("button", "field-group-head");
+      head.innerHTML = `<i class="fas fa-angle-down xnode-caret"></i><i class="fas fa-folder-tree xnode-icon"></i><span class="xnode-label">${esc(node.name)}</span><span class="xnode-meta">${countDescendants(node)}</span>`;
+      head.onclick = () => {
+        if (state.treeCollapsed.delete(treeId)) container.classList.remove("collapsed");
+        else { state.treeCollapsed.add(treeId); container.classList.add("collapsed"); }
+      };
+      groupRow.appendChild(head);
+      container.appendChild(groupRow);
+    }
+
+    const kids = el("div", "field-tree-kids");
+    const sortedChildren = [...node.children.values()].sort((a, b) => {
+      const aFav = a.isField && favorites.includes(a.fullPath);
+      const bFav = b.isField && favorites.includes(b.fullPath);
+      if (aFav !== bFav) return Number(bFav) - Number(aFav);
+      return a.name.localeCompare(b.name);
+    });
+    for (const child of sortedChildren) {
+      kids.appendChild(renderNode(child, depth + 1));
+    }
+    container.appendChild(kids);
+    return container;
+  };
+
+  const treeRoot = buildTree(columns);
+  const sortedRoots = [...treeRoot.children.values()].sort((a, b) => {
+    const aFav = a.isField && favorites.includes(a.fullPath);
+    const bFav = b.isField && favorites.includes(b.fullPath);
+    if (aFav !== bFav) return Number(bFav) - Number(aFav);
+    return a.name.localeCompare(b.name);
   });
-  const searchFields = el("input", "field-search"); searchFields.type = "search"; searchFields.placeholder = "Buscar campo…"; searchFields.setAttribute("aria-label", "Buscar campo");
-  searchFields.oninput = () => fieldKids.forEach(row => row.hidden = !row.dataset.field.includes(searchFields.value.toLocaleLowerCase()));
+  const fieldKids = sortedRoots.map((rootNode) => renderNode(rootNode, 0));
+
+  const searchFields = el("input", "field-search");
+  searchFields.type = "search";
+  searchFields.placeholder = "Buscar campo…";
+  searchFields.setAttribute("aria-label", "Buscar campo");
+
+  searchFields.oninput = () => {
+    const q = searchFields.value.trim().toLocaleLowerCase();
+    const updateVisibility = (domEl) => {
+      if (!q) {
+        domEl.hidden = false;
+        const treeId = domEl.dataset.treeId;
+        if (treeId) {
+          if (state.treeCollapsed.has(treeId)) domEl.classList.add("collapsed");
+          else domEl.classList.remove("collapsed");
+        }
+        for (const child of domEl.querySelectorAll(":scope > .field-tree-kids > .field-tree-node, :scope > .field-tree-kids > .field-row")) {
+          updateVisibility(child);
+        }
+        return true;
+      }
+      const selfMatch = (domEl.dataset.field || "").includes(q);
+      let childMatch = false;
+      for (const child of domEl.querySelectorAll(":scope > .field-tree-kids > .field-tree-node, :scope > .field-tree-kids > .field-row")) {
+        if (updateVisibility(child)) childMatch = true;
+      }
+      const visible = selfMatch || childMatch;
+      domEl.hidden = !visible;
+      if (childMatch) domEl.classList.remove("collapsed");
+      return visible;
+    };
+    fieldKids.forEach(r => updateVisibility(r));
+  };
   box.appendChild(treeNode({ id: `fields-${scope}`, icon: "fa-table-columns", label: "Campos", meta: String(columns.length), kids: [searchFields, ...fieldKids] }));
 
   // campos customizados (regex): gerenciáveis, com edição
@@ -4209,10 +4341,11 @@ function renderChart(stats) {
   const box = $("#chart");
   const panel = box.closest(".hist-panel");
   panel.hidden = !state.loaded;
-  box.innerHTML = "";
-  if (chart) { chart.destroy(); chart = null; }
+
 
   if (!stats.buckets || stats.buckets.length === 0) {
+    if (chart) { chart.destroy(); chart = null; }
+    box.innerHTML = "";
     const p = el("div", "hint-empty", "Sem dados temporais.");
     box.appendChild(p);
     return;
@@ -4222,6 +4355,14 @@ function renderChart(stats) {
   const ys = stats.buckets.map(([, c]) => c);
   const axisColor = isLight() ? "#5b6678" : "#6b7690";
   const gridColor = isLight() ? "rgba(19,81,180,0.08)" : "rgba(255,255,255,0.06)";
+
+  if (chart) {
+    chart.setData([xs, ys]);
+    const width = Math.max(280, box.clientWidth - 4);
+    if (Math.abs(chart.width - width) > 2) chart.setSize({ width, height: 96 });
+    return;
+  }
+  box.innerHTML = "";
 
   chart = new uPlot(
     {
@@ -4439,18 +4580,35 @@ function showDetail(ev, sourceSpec = null) {
   push("name", ev.name);
   push("description", ev.description);
   push("message", ev.message, true);
-  for (const [k, v] of Object.entries(ev.fields || {})) {
+  const fieldEntries = Object.entries(ev.fields || {}).sort(([a], [b]) => a.localeCompare(b));
+  for (const [k, v] of fieldEntries) {
     push(k, typeof v === "object" ? JSON.stringify(v) : String(v), true);
   }
 
+  const allFieldKeys = new Set(Object.keys(ev.fields || {}));
   const kv = el("div", "kv");
   for (const r of rows) {
     const row = el("div", "kv-row");
-    row.appendChild(el("div", "kv-k", colLabel(r.k)));
-    const v = el("div", `kv-v${r.mono ? " mono" : ""}`, String(r.v));
-    row.appendChild(v);
     const colKey = r.k;
     row.dataset.col = colKey;
+
+    const lastDot = colKey.lastIndexOf(".");
+    const parentKey = lastDot > 0 ? colKey.slice(0, lastDot) : null;
+    const isChild = parentKey && (allFieldKeys.has(parentKey) || rows.some(other => other.k === parentKey));
+
+    if (isChild) {
+      row.classList.add("kv-row-child");
+      const kDiv = el("div", "kv-k");
+      const lastSegment = colKey.slice(lastDot + 1);
+      kDiv.innerHTML = `<span class="kv-tree-guide">└─</span> <span class="kv-child-name">${esc(lastSegment)}</span>`;
+      kDiv.title = `${colLabel(colKey)} (filho de ${colLabel(parentKey)})`;
+      row.appendChild(kDiv);
+    } else {
+      row.appendChild(el("div", "kv-k", colLabel(colKey)));
+    }
+
+    const v = el("div", `kv-v${r.mono ? " mono" : ""}`, String(r.v));
+    row.appendChild(v);
     if (!["raw"].includes(colKey) && r.filterValue != null && String(r.filterValue).trim() !== "") {
       const f = el("button", "kv-filter");
       f.innerHTML = '<i class="fas fa-filter"></i>';
@@ -5289,7 +5447,10 @@ function bind() {
     switchView("caso");
   };
   $("#btn-right-stations").onclick = () => switchView("estacoes");
-  $("#btn-side-toggle").onclick = () => document.querySelector(".shell").classList.toggle("side-collapsed");
+  $("#btn-side-toggle").onclick = () => {
+    const collapsed = document.querySelector(".shell").classList.toggle("side-collapsed");
+    if (!collapsed) refreshTreeAggs(workspaceScope());
+  };
   $("#btn-clear-filters").onclick = () => {
     state.filters = [];
     state.quick = "";
@@ -6278,6 +6439,7 @@ function markCubeTableChanged() {
   const table = activeCube();
   table.lastSchemaSignature = null;
   table.lastDataSignature = null;
+  cubeState.lastComputedSignature = null;
   cubeState.results.delete(cubeResultKey(state.analyticsScope, table.id));
   saveActiveCube();
 }
@@ -6288,7 +6450,7 @@ const FIELD_ICONS = {
   bool: "fa-toggle-on", ip: "fa-network-wired", percent: "fa-percent", id: "fa-fingerprint",
 };
 
-async function openCube(scope = "dataset") {
+async function openCube(scope = "dataset", { force = false } = {}) {
   const opening = Symbol("cube-opening");
   cubeState.openingRequest = opening;
   const contextKey = () => JSON.stringify([workspaceScope(), activeCase()?.id, scope === "case" ? caseSig() : [state.currentArtifact?.id, state.currentArtifact?.loadedAt]]);
@@ -6298,6 +6460,7 @@ async function openCube(scope = "dataset") {
   if (state.analyticsScope !== scope) {
     cubeState.collapsed.clear();
     cubeState.result = null;
+    cubeState.lastComputedSignature = null;
   }
   state.analyticsScope = scope;
   if (!scopeProfiles(scope) && scopeHasEvents(scope)) {
@@ -6314,7 +6477,14 @@ async function openCube(scope = "dataset") {
   renderCubeFields();
   renderCubeZones();
   renderCubeViews();
-  await runCube();
+
+  const cube = activeCube(scope);
+  const currentSig = JSON.stringify([scope, cube.id, cubeSchemaSignature(cube), backendFilters(), scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, state.derivedFields]);
+  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody tr").length > 0) {
+    finishOperation("Cubo pronto", "Recorte exibido do cache.");
+    return;
+  }
+  await runCube({ force });
   if (current()) finishOperation("Cubo pronto", "Recorte calculado no escopo atual.");
 }
 
@@ -6477,16 +6647,24 @@ function renderCubeZones() {
   }
 }
 
-async function runCube() {
+async function runCube({ force = false } = {}) {
   const version = ++cubeState.requestVersion;
   const scope = state.analyticsScope;
   const cube = activeCube(scope);
   const resultKey = cubeResultKey(scope, cube.id);
+  const filters = backendFilters();
+  const currentSig = JSON.stringify([scope, cube.id, cubeSchemaSignature(cube), filters, scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, state.derivedFields]);
+
+  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody tr").length > 0) {
+    return { status: "cached" };
+  }
+
   const table = $("#cube-table");
   table.querySelector("thead").innerHTML = "";
   table.querySelector("tbody").innerHTML = "";
   if (!scopeHasEvents(scope)) {
     cubeState.result = null;
+    cubeState.lastComputedSignature = null;
     cubeState.results.delete(resultKey);
     renderCubeViews();
     return { status: "empty" };
@@ -6501,6 +6679,7 @@ async function runCube() {
     if (version !== cubeState.requestVersion || scope !== state.analyticsScope || cube.id !== activeCube(scope).id) return { status: "stale" };
     if (res.complete === false) toast(`Resultado parcial: ${fmtNum(res.processed_events)} eventos analisados. Reduza as dimensões ou o período.`, "info");
     cubeState.result = res;
+    cubeState.lastComputedSignature = currentSig;
     cubeState.results.set(resultKey, res);
     cube.lastSchemaSignature = cubeSchemaSignature(cube);
     cube.lastDataSignature = cubeDataSignature(res);
@@ -6512,6 +6691,7 @@ async function runCube() {
   } catch (error) {
     if (version !== cubeState.requestVersion || scope !== state.analyticsScope || cube.id !== activeCube(scope).id) return { status: "stale" };
     cubeState.result = null;
+    cubeState.lastComputedSignature = null;
     cubeState.results.delete(resultKey);
     finishOperation("Falha ao calcular Cubo", String(error));
     return { status: "error", error: String(error) };

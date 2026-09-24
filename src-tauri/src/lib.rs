@@ -1025,6 +1025,7 @@ fn clear_events(state: State<AppState>) {
 pub(crate) fn clear_events_impl(state: &AppState) {
     *state.source.write() = SourceData::None;
     state.source_names.write().clear();
+    query::clear_match_cache();
 }
 
 /// Resumo da fonte carregada no momento (para MCP/UI saberem o que há no app).

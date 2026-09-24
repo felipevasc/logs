@@ -2,14 +2,14 @@
 (() => {
   "use strict";
   const home = $("#workspace-home"), content = $("#ws-content"), empty = $("#ws-empty");
-  let page = "summary", overview = null, sourceList = [], serial = 0, cacheKey = "", pendingOverview = null;
+  let page = "summary", overview = null, sourceList = [], serial = 0, cacheKey = "", pendingOverview = null, lastExploredKey = "";
   const history = [];
   let lastFilters = "[]", importing = false, removedEvidence = null;
   let previousSelection = { filters: [], quick: "" };
   function rememberSelection() {
     const current = { filters: structuredClone(state.filters), quick: state.quick };
     const signature = JSON.stringify(current);
-    if (signature !== lastFilters) { history.push(previousSelection); if (history.length > 30) history.shift(); previousSelection = current; lastFilters = signature; cacheKey = ""; }
+    if (signature !== lastFilters) { history.push(previousSelection); if (history.length > 30) history.shift(); previousSelection = current; lastFilters = signature; cacheKey = ""; lastExploredKey = ""; }
   }
   const titles = { summary: "Resumo", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos" };
   const fmtBytes = n => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${fmtNum(Math.ceil(n / 1000))} KB`;
@@ -50,8 +50,15 @@
       if (workspaceScope() === "dataset" && !state.loaded) { await showPage("summary"); return; }
       const contextKey = sourceKey();
       switchView("viz", { deferAnalytics: true }); home.hidden = true;
+      if (lastExploredKey === contextKey && state.rows?.length > 0 && !state.queryError) {
+        switchTab(state.activeDatasetTab, { deferAnalytics: false });
+        return;
+      }
       const refreshed = await refresh({ analytics: false });
-      if (refreshed && page === "explore" && contextKey === sourceKey()) switchTab(state.activeDatasetTab);
+      if (refreshed && page === "explore" && contextKey === sourceKey()) {
+        lastExploredKey = contextKey;
+        switchTab(state.activeDatasetTab);
+      }
       return;
     }
     switchView("workspace"); home.hidden = false;
@@ -477,7 +484,7 @@
     page: () => page,
     capture: () => ({ history: structuredClone(history), previousSelection: structuredClone(previousSelection), lastFilters, timeline: timeline.capture() }),
     restore: snapshot => { serial++; cacheKey = ""; overview = null; pendingOverview = null; history.splice(0, history.length, ...(snapshot?.history || [])); previousSelection = snapshot?.previousSelection || { filters: structuredClone(state.filters), quick: state.quick }; lastFilters = snapshot?.lastFilters || JSON.stringify(previousSelection); timeline.restore(snapshot?.timeline); },
-    onFiltersChanged: () => { if (["summary", "timeline", "case-timeline", "compare", "journeys"].includes(page)) showPage(page); },
+    onFiltersChanged: () => { lastExploredKey = ""; if (["summary", "timeline", "case-timeline", "compare", "journeys"].includes(page)) showPage(page); },
     onView(which) {
       if (which === "workspace") return;
       home.hidden = true;
@@ -485,6 +492,7 @@
     },
     onRefresh() {
       rememberSelection();
+      lastExploredKey = sourceKey();
       updateCounts();
       if (page === "journeys") window.Journeys?.refresh();
     },

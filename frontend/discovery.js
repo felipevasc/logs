@@ -13,14 +13,14 @@
   ];
   const savedMode = localStorage.getItem('analysis.mode');
   let mode = modes.some(m => m[0] === savedMode) ? savedMode : 'overview';
-  let generation = 0, revision = 0, profileKey = '', fieldRequest = 0;
+  let generation = 0, revision = 0, profileKey = '', fieldRequest = 0, lastDashboardKey = '';
   const cache = new Map();
   const legacyRender = renderDashboard;
   const originalApi = api;
   api = async function(command, args, options) {
     const result = await originalApi(command, args, options);
     if (/^(load_file|load_files|load_event_log|clear_events|save_codes|save_derived_field|delete_derived_field|set_ts_config|harvest_codes|cases_load)$/.test(command)) {
-      revision++; cache.clear(); profileKey = '';
+      revision++; cache.clear(); profileKey = ''; lastDashboardKey = '';
     }
     return result;
   };
@@ -118,6 +118,18 @@
       if (!(dashboardCharts(scope) || []).length) empty(grid, 'Use + Gráfico para montar uma visualização. As sugestões automáticas continuam nos outros modos.');
       return;
     }
+    const activeDashboardKey = `${key}:${mode}:${state.dashboardCompact}`;
+    if (lastDashboardKey === activeDashboardKey && grid.children.length > 0 && !grid.querySelector('.discovery-loading')) {
+      for (const id of Object.keys(dashCharts)) {
+        const plot = dashCharts[id];
+        const box = plot?.root?.parentElement;
+        if (plot && box && box.clientWidth > 0) {
+          const width = Math.max(200, box.clientWidth - 8);
+          if (Math.abs(plot.width - width) > 1) plot.setSize({ width, height: state.dashboardCompact ? 112 : 170 });
+        }
+      }
+      return;
+    }
     clearCharts(); grid.innerHTML = '<div class="discovery-loading" role="status"><i class="fas fa-circle-notch spin"></i> Lendo o recorte…</div>';
     $('#dash-info').textContent = 'Análise do recorte atual';
     if (!scopeHasEvents(scope)) { grid.innerHTML = ''; empty(grid, 'Abra logs ou salve registros no caso para começar.'); return; }
@@ -125,6 +137,7 @@
     try {
       if(mode==='threats') {
         await window.Threats.render(grid,scope,{card,infoButton,isCurrent:current,load:()=>cached('threat_scan',analyticsRequest(scope),key)});
+        if (current()) lastDashboardKey = activeDashboardKey;
         return;
       }
       if (['patterns','behavior','changes'].includes(mode)) {
@@ -134,6 +147,7 @@
         $('#dash-info').textContent = `${fmtNum(data.sample_count)} analisados de ${fmtNum(data.total)} registros · ${data.limited ? 'amostra distribuída' : 'seleção completa'}${data.complete ? '' : ' · análise interrompida'}`;
         addExplanation(grid,`${data.limited ? 'Descobertas estimadas na amostra. Eventos raros podem não aparecer. ' : ''}${data.fields_limited ? `Perfil limitado a ${data.fields_considered.length} campos. ` : ''}${data.temporal_limited?'A análise temporal atingiu seu orçamento de campos ou contextos. ':''}Indicações para investigar; não comprovam falha nem causa. Os filtros consultam todos os registros do recorte.`);
         if (mode === 'patterns') renderPatterns(grid, data, scope); else renderBehavior(grid, data, scope, mode === 'changes');
+        if (current()) lastDashboardKey = activeDashboardKey;
         return;
       }
       let profiles = scopeProfiles(scope);
@@ -186,7 +200,8 @@
       }));
       if(crossBody && current()) await renderCrossFrequency(crossBody,profiles,scope,key,current);
       if(heatBody && current()) await renderContextHeatmap(heatBody,profiles,scope,key,current);
-    } catch (error) { if (current()) { grid.innerHTML=''; empty(grid, `Não foi possível analisar: ${String(error)}`); grid.append(button('Tentar novamente',()=>renderDashboard(scope))); } }
+      if (current()) lastDashboardKey = activeDashboardKey;
+    } catch (error) { lastDashboardKey = ''; if (current()) { grid.innerHTML=''; empty(grid, `Não foi possível analisar: ${String(error)}`); grid.append(button('Tentar novamente',()=>renderDashboard(scope))); } }
   };
   function renderRanking(box, res, spec, scope) {
     const values = res.series[0]?.points || [], max = Math.max(1,...values);

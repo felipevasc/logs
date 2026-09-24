@@ -30,7 +30,7 @@ window.CaseTimeline = (() => {
   const valid = value => Number.isFinite(value) && Math.abs(value) <= 8640000000000000;
   const uniqueId = prefix => `${prefix}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
   function noteHelp(origin) {
-    const title = 'Notas e setas', text = 'Para mudar a seta, use o botão direito sobre ela. Com teclado, selecione a seta e pressione Enter.';
+    const title = 'Notas e setas', text = 'Para ligar uma nota a vários itens ou a outra nota, use o botão direito sobre a nota ou sobre o item e escolha "Ligar a…". Para mudar ou remover uma seta, use o botão direito sobre ela. Com teclado, selecione a seta e pressione Enter.';
     if (window.Discovery?.showExplanation) {
       window.Discovery.showExplanation(title, text, origin);
       document.getElementById('analysis-help')?.classList.add('ct-note-help-overlay');
@@ -113,9 +113,33 @@ window.CaseTimeline = (() => {
       const member = group.ids?.find(id => anchors.has(id));
       if (member) anchors.set(group.id, anchors.get(member));
     }
+    const resolveEntryId = (targetId, visited = new Set()) => {
+      if (!targetId || visited.has(targetId)) return null;
+      visited.add(targetId);
+      if (anchors.has(targetId)) return anchors.get(targetId);
+      const parentNote = config.annotations.find(a => a.id === targetId);
+      if (parentNote) {
+        if (parentNote.anchor && anchors.has(parentNote.anchor)) return anchors.get(parentNote.anchor);
+        return resolveEntryId(parentNote.anchor, visited);
+      }
+      return null;
+    };
     for (const note of config.annotations) {
-      const id = anchors.get(note.anchor); if (!id) continue;
-      if (!notes.has(id)) notes.set(id, []); notes.get(id).push(note);
+      const targetIds = new Set();
+      if (!note.arrowHidden && note.anchor) {
+        const entryId = resolveEntryId(note.anchor);
+        if (entryId) targetIds.add(entryId);
+      }
+      for (const link of note.links || []) {
+        const entryId = resolveEntryId(link.targetId);
+        if (entryId) targetIds.add(entryId);
+      }
+      for (const entryId of targetIds) {
+        if (!notes.has(entryId)) notes.set(entryId, []);
+        if (!notes.get(entryId).some(n => n.id === note.id)) {
+          notes.get(entryId).push(note);
+        }
+      }
     }
     return notes;
   }
@@ -256,7 +280,15 @@ window.CaseTimeline = (() => {
     const noteLanes = new Map();
     for (const lane of matrixLanes) for (const id of lane.ids) { noteLanes.set(id, lane); if (id.startsWith("e:")) noteLanes.set(`a:${id}`, lane); }
     for (const group of config.groups) if (!noteLanes.has(group.id)) { const first = group.ids?.find(id => noteLanes.has(id)); if (first) noteLanes.set(group.id, noteLanes.get(first)); }
-    for (const note of config.annotations) { const lane = noteLanes.get(note.anchor); if (lane) lane.noteCount++; }
+    const resolveNoteLane = (targetId, visited = new Set()) => {
+      if (!targetId || visited.has(targetId)) return null;
+      visited.add(targetId);
+      if (noteLanes.has(targetId)) return noteLanes.get(targetId);
+      const parentNote = config.annotations.find(a => a.id === targetId);
+      if (parentNote) return resolveNoteLane(parentNote.anchor, visited);
+      return null;
+    };
+    for (const note of config.annotations) { const lane = noteLanes.get(note.anchor) || resolveNoteLane(note.anchor); if (lane) lane.noteCount++; }
     let matrixHeight = 48;
     for (const lane of matrixLanes) {
       lane.y = matrixHeight; lane.height = 44 + lane.noteCount * 64; matrixHeight += lane.height;
@@ -337,6 +369,7 @@ window.CaseTimeline = (() => {
     const selectedEntries = () => entries.filter(entry => selection.has(entry.id));
     const syncSelection = () => {
       shell.querySelectorAll(".ct-entry").forEach(node => { node.classList.toggle("selected", selection.has(node.dataset.id)); node.setAttribute("aria-label", `${selection.has(node.dataset.id) ? "Selecionado. " : ""}${node.title}`); });
+      shell.querySelectorAll(".ct-range-bar").forEach(bar => { bar.classList.toggle("is-selected", selection.has(bar.dataset.id)); });
       if (horizontal) shell.querySelectorAll(".ct-lane-label").forEach((label, index) => { const selected = matrixLanes[index].entries.every(i => selection.has(entries[i].id)); label.classList.toggle("is-selected", selected); label.setAttribute("aria-pressed", String(selected)); });
       const selected = selectedEntries();
       const canGroup = selected.flatMap(entry => entry.members || [entry]).filter(entry => entry.type === "event").length >= 2;
@@ -371,7 +404,11 @@ window.CaseTimeline = (() => {
         heading.textContent = "Editar seta";
         const modeKey = horizontal ? "matrix" : "vertical";
         const sideOptions = selected => [["auto", "Automático"], ["left", "Esquerda"], ["right", "Direita"], ["top", "Cima"], ["bottom", "Baixo"]].map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`).join("");
-        fields.innerHTML = `<label>Pontas<select name="arrow"><option value="forward" ${!entry.arrow || entry.arrow === "forward" ? "selected" : ""}>Para a nota</option><option value="back" ${entry.arrow === "back" ? "selected" : ""}>Para o título</option><option value="both" ${entry.arrow === "both" ? "selected" : ""}>Nas duas pontas</option><option value="none" ${entry.arrow === "none" ? "selected" : ""}>Sem pontas</option></select></label><label>Traço<select name="lineStyle"><option value="solid" ${!entry.lineStyle || entry.lineStyle === "solid" ? "selected" : ""}>Contínuo</option><option value="dashed" ${entry.lineStyle === "dashed" ? "selected" : ""}>Tracejado</option><option value="dotted" ${entry.lineStyle === "dotted" ? "selected" : ""}>Pontilhado</option></select></label><label>Saída do título<select name="startSide">${sideOptions(entry.endpoints?.[modeKey]?.start || "auto")}</select></label><label>Chegada à nota<select name="endSide">${sideOptions(entry.endpoints?.[modeKey]?.end || "auto")}</select></label>`;
+        const destLabel = entry.isNoteToNote ? "Para a nota de destino" : "Para a nota";
+        const srcLabel = entry.isNoteToNote ? "Para a nota de origem" : "Para o título";
+        const startSideLabel = entry.isNoteToNote ? "Saída da nota de origem" : "Saída do título";
+        const endSideLabel = entry.isNoteToNote ? "Chegada à nota de destino" : "Chegada à nota";
+        fields.innerHTML = `<label>Pontas<select name="arrow"><option value="forward" ${!entry.arrow || entry.arrow === "forward" ? "selected" : ""}>${destLabel}</option><option value="back" ${entry.arrow === "back" ? "selected" : ""}>${srcLabel}</option><option value="both" ${entry.arrow === "both" ? "selected" : ""}>Nas duas pontas</option><option value="none" ${entry.arrow === "none" ? "selected" : ""}>Sem pontas</option></select></label><label>Traço<select name="lineStyle"><option value="solid" ${!entry.lineStyle || entry.lineStyle === "solid" ? "selected" : ""}>Contínuo</option><option value="dashed" ${entry.lineStyle === "dashed" ? "selected" : ""}>Tracejado</option><option value="dotted" ${entry.lineStyle === "dotted" ? "selected" : ""}>Pontilhado</option></select></label><label>${startSideLabel}<select name="startSide">${sideOptions(entry.endpoints?.[modeKey]?.start || "auto")}</select></label><label>${endSideLabel}<select name="endSide">${sideOptions(entry.endpoints?.[modeKey]?.end || "auto")}</select></label>`;
       } else {
         heading.textContent = "Editar título";
         fields.innerHTML = `<label>Nome<input name="name" maxlength="120" required value="${safe(entry?.title || "")}"></label>`;
@@ -408,8 +445,18 @@ window.CaseTimeline = (() => {
           if (!entry) Object.assign(annotation, { arrow: "forward", lineStyle: "solid" });
           if (!entry) config.annotations.push(annotation);
         } else if (type === "arrow") {
-          entry.arrow = String(values.get("arrow")); entry.lineStyle = String(values.get("lineStyle"));
-          (entry.endpoints ||= {})[horizontal ? "matrix" : "vertical"] = { start: String(values.get("startSide")), end: String(values.get("endSide")) };
+          const arrowVal = String(values.get("arrow")), lineStyleVal = String(values.get("lineStyle"));
+          const endpointsVal = { start: String(values.get("startSide")), end: String(values.get("endSide")) };
+          const modeKey = horizontal ? "matrix" : "vertical";
+          const targetObj = entry.extra || (entry.annotation && entry.isPrimary ? entry.annotation : entry);
+          targetObj.arrow = arrowVal;
+          targetObj.lineStyle = lineStyleVal;
+          (targetObj.endpoints ||= {})[modeKey] = endpointsVal;
+          if (entry.annotation) {
+            entry.arrow = arrowVal;
+            entry.lineStyle = lineStyleVal;
+            entry.endpoints = targetObj.endpoints;
+          }
         } else if (entry) {
           const name = String(values.get("name")).trim();
           if (entry.type === "group") {
@@ -433,7 +480,10 @@ window.CaseTimeline = (() => {
         const original = group.ids || [];
         group.ids = original.filter(id => !idSet.has(id));
         if (group.ids.length >= 2) return true;
-        config.annotations.filter(note => note.anchor === group.id).forEach(note => note.anchor = original[0]);
+        config.annotations.forEach(note => {
+          if (note.anchor === group.id) note.anchor = original[0];
+          if (note.links) note.links.forEach(l => { if (l.targetId === group.id) l.targetId = original[0]; });
+        });
         return false;
       });
       config.groups.push({ id: uniqueId("g"), ids, name: members[0].title, color: members[0].color });
@@ -488,8 +538,11 @@ window.CaseTimeline = (() => {
       const side = saved.side || (index % 2 ? "right" : "left");
       const offset = clamp(saved.offset || 0, 0, 100);
       const lane = rangeLanes.get(entry.id) || 0, gutter = rangeGutter[side];
+      const isGrouped = entry.type === "group" || entry.type === "auto" || (entry.rows && entry.rows.length > 1);
+      const hasRange = entry.end > entry.start;
+      const isSingle = !isGrouped && !hasRange;
       const node = document.createElement("article");
-      node.className = `ct-entry ${entry.type === "manual" ? "is-manual" : ""} ${entry.type === "auto" ? "is-auto" : ""} ${entry.end > entry.start ? "has-range" : ""}`;
+      node.className = `ct-entry ${entry.type === "manual" ? "is-manual" : ""} ${entry.type === "group" ? "is-group" : ""} ${entry.type === "auto" ? "is-auto" : ""} ${hasRange ? "has-range" : ""} ${isGrouped ? "is-grouped" : ""} ${isSingle ? "is-single" : ""}`;
       node.tabIndex = index === 0 ? 0 : -1;
       node.setAttribute("role", "group");
       node.setAttribute("aria-roledescription", "ocorrência");
@@ -548,12 +601,56 @@ window.CaseTimeline = (() => {
         event.preventDefault(); selection.add(entry.id); syncSelection();
         const menu = [{ icon: "fa-eye", label: "Abrir detalhes", onClick: open },
           { icon: "fa-comment-dots", label: "Adicionar nota aqui", onClick: () => { selection.clear(); selection.add(entry.id); openEditor("annotation", null, null, event.target?.closest("[data-marker-anchor]")?.dataset.markerAnchor || null); } },
+          ...(config.annotations.length ? [{
+            icon: "fa-link",
+            label: "Ligar a uma nota existente…",
+            onClick: () => {
+              const noteAnchor = event.target?.closest("[data-marker-anchor]")?.dataset.markerAnchor || entry.id;
+              const noteOptions = config.annotations.map(n => {
+                const iconCls = window.NoteIconPicker.classes(n.icon) || "fa-comment";
+                const textPreview = n.text ? preview(n.text, 36) : "Nota sem texto";
+                return {
+                  icon: iconCls,
+                  label: textPreview,
+                  onClick: () => {
+                    connectNoteToTarget(n, noteAnchor);
+                    callbacksSave();
+                    redrawLinks();
+                    toast("Seta ligada à nota.", "ok");
+                  },
+                };
+              });
+              callbacks.menu(event.clientX, event.clientY, noteOptions);
+            },
+          }] : []),
           ...(entry.type === "manual" ? [] : [{ icon: "fa-pen", label: "Editar título", onClick: () => openEditor("title", entry) }]),
           { icon: "fa-palette", label: "Alterar cor", onClick: () => colorMenu(entry, event.clientX, event.clientY) },
           ...(!horizontal ? [{ icon: "fa-arrows-left-right", label: "Mover para o outro lado", onClick: () => { config.layout[entry.id] = { side: side === "left" ? "right" : "left", offset }; callbacksSave(); } }] : [])];
         if (entry.type === "manual") {
           menu.push({ icon: "fa-pen", label: "Editar marco", onClick: () => openEditor("manual", entry) },
-            { icon: "fa-trash-can", label: "Remover marco", danger: true, onClick: () => { c.manual = c.manual.filter(manual => manual.id !== entry.manual.id); callbacksSave(); } });
+            { icon: "fa-trash-can", label: "Remover marco", danger: true, onClick: () => {
+              const removedId = entry.manual.id;
+              c.manual = c.manual.filter(manual => manual.id !== removedId);
+              const idsToRemove = new Set([removedId, `m:${removedId}`, entry.id]);
+              config.annotations = (config.annotations || []).filter(a => {
+                if (a.links) a.links = a.links.filter(l => !idsToRemove.has(l.targetId));
+                if (idsToRemove.has(a.anchor)) {
+                  if (a.links && a.links.length > 0) {
+                    const next = a.links.shift();
+                    a.anchor = next.targetId;
+                    a.arrow = next.arrow;
+                    a.lineStyle = next.lineStyle;
+                    a.color = next.color;
+                    a.curve = next.curve;
+                    a.endpoints = next.endpoints;
+                    return true;
+                  }
+                  return false;
+                }
+                return true;
+              });
+              callbacksSave();
+            } });
         } else {
           menu.push({
             icon: "fa-trash-can",
@@ -563,13 +660,37 @@ window.CaseTimeline = (() => {
               const idsToRemove = new Set(entry.members ? entry.members.map(m => m.id) : [entry.id]);
               c.items = (c.items || []).filter(it => !idsToRemove.has(it.id));
               config.groups = (config.groups || []).filter(g => !idsToRemove.has(g.id));
-              config.annotations = (config.annotations || []).filter(a => !idsToRemove.has(a.anchor));
+              config.annotations = (config.annotations || []).filter(a => {
+                if (a.links) a.links = a.links.filter(l => !idsToRemove.has(l.targetId));
+                if (idsToRemove.has(a.anchor)) {
+                  if (a.links && a.links.length > 0) {
+                    const next = a.links.shift();
+                    a.anchor = next.targetId;
+                    a.arrow = next.arrow;
+                    a.lineStyle = next.lineStyle;
+                    a.color = next.color;
+                    a.curve = next.curve;
+                    a.endpoints = next.endpoints;
+                    return true;
+                  }
+                  return false;
+                }
+                return true;
+              });
               await callbacksSave();
               toast("Item removido do Caso.", "ok");
             }
           });
         }
-        if (entry.type === "group") menu.push({ icon: "fa-layer-group", label: "Desagrupar", onClick: () => { config.annotations.filter(note => note.anchor === entry.id).forEach(note => note.anchor = entry.members[0].id); config.groups = config.groups.filter(group => group.id !== entry.id); callbacksSave(); } });
+        if (entry.type === "group") menu.push({ icon: "fa-layer-group", label: "Desagrupar", onClick: () => {
+          const targetMemberId = entry.members[0].id;
+          config.annotations.forEach(note => {
+            if (note.anchor === entry.id) note.anchor = targetMemberId;
+            if (note.links) note.links.forEach(l => { if (l.targetId === entry.id) l.targetId = targetMemberId; });
+          });
+          config.groups = config.groups.filter(group => group.id !== entry.id);
+          callbacksSave();
+        } });
         if (!shell.querySelector(".ct-group-action").hidden) menu.push({ icon: "fa-layer-group", label: "Agrupar seleção", onClick: () => shell.querySelector('[data-ct-action="group"]').click() });
         callbacks.menu(event.clientX, event.clientY, menu);
       };
@@ -612,7 +733,7 @@ window.CaseTimeline = (() => {
         itemLayer.appendChild(day);
       }
       if (entry.end > entry.start && (!horizontal || entry.type === "manual")) {
-        const bar = document.createElement("div"); bar.className = "ct-range-bar"; bar.style.background = entry.color;
+        const bar = document.createElement("div"); bar.className = "ct-range-bar"; bar.dataset.id = entry.id; bar.style.background = entry.color;
         if (horizontal) { bar.style.left = `${point.x}px`; bar.style.width = `${Math.max(2, positionFor(entry.end) - point.x)}px`; bar.style.top = `${point.y - 3}px`; bar.title = `${entry.title} · ${when(entry.start)} → ${when(entry.end)}`; }
         else { bar.style.top = `${point.y}px`; bar.style.height = `${Math.max(14, positionFor(entry.end) - point.y)}px`; bar.style.left = `calc(50% ${side === "left" ? "-" : "+"} ${side === "left" ? 17 + lane * laneStep : 14 + lane * laneStep}px)`; }
         itemLayer.appendChild(bar);
@@ -625,8 +746,25 @@ window.CaseTimeline = (() => {
       const member = group.ids?.find(id => anchors.has(id));
       if (member) anchors.set(group.id, anchors.get(member));
     }
-    const anchorIndex = annotation => anchors.get(annotation.anchor) ?? -1;
-    const anchorPoint = annotation => horizontal ? markerPoints.get(annotation.anchor) || points[anchorIndex(annotation)] : points[anchorIndex(annotation)];
+    const resolveAnchorIndex = (annotation, visited = new Set()) => {
+      if (!annotation || visited.has(annotation.id)) return 0;
+      visited.add(annotation.id);
+      if (anchors.has(annotation.anchor)) return anchors.get(annotation.anchor);
+      const parentNote = config.annotations.find(a => a.id === annotation.anchor);
+      if (parentNote) return resolveAnchorIndex(parentNote, visited);
+      return 0;
+    };
+    const anchorIndex = annotation => resolveAnchorIndex(annotation);
+    const anchorPoint = target => {
+      const targetId = typeof target === "string" ? target : target?.anchor;
+      if (!targetId) return points[0] || { x: 0, y: 0 };
+      if (horizontal && markerPoints.has(targetId)) return markerPoints.get(targetId);
+      const idx = anchors.get(targetId);
+      if (idx != null && idx >= 0) return points[idx];
+      const parentNote = config.annotations.find(a => a.id === targetId);
+      if (parentNote) return anchorPoint(parentNote.anchor);
+      return points[0] || { x: 0, y: 0 };
+    };
     const pointOnSide = (r, side) => {
       const middleX = r.left + r.width / 2, middleY = r.top + r.height / 2;
       if (side === "left") return { x: r.left - 7, y: middleY };
@@ -639,22 +777,138 @@ window.CaseTimeline = (() => {
       const distance = Math.hypot(x - point.x, y - point.y);
       return distance < best.distance ? { side, distance } : best;
     }, { side: "left", distance: Infinity }).side;
+
+    const connectNoteToTarget = (note, targetId) => {
+      if (!note || !targetId || note.id === targetId) return;
+      if (note.arrowHidden) {
+        note.anchor = targetId;
+        note.arrowHidden = false;
+        note.arrow = "forward";
+        note.lineStyle ||= "solid";
+        return;
+      }
+      if (note.anchor === targetId) {
+        if (note.arrow === "none") note.arrow = "forward";
+        return;
+      }
+      note.links ||= [];
+      const existing = note.links.find(l => l.targetId === targetId);
+      if (existing) {
+        if (existing.arrow === "none") existing.arrow = "forward";
+        return;
+      }
+      note.links.push({
+        id: uniqueId("l"),
+        targetId,
+        arrow: "forward",
+        lineStyle: "solid",
+        color: note.color || "#d3a9fa",
+      });
+    };
+
+    const getTimelineLinks = () => {
+      const links = [];
+      for (const annotation of config.annotations) {
+        if (!annotation.arrowHidden && annotation.anchor) {
+          links.push({
+            id: annotation.id,
+            annotation,
+            isPrimary: true,
+            targetId: annotation.anchor,
+            isNoteToNote: config.annotations.some(n => n.id === annotation.anchor),
+            arrow: annotation.arrow || "forward",
+            lineStyle: annotation.lineStyle || "solid",
+            color: annotation.color || "#d3a9fa",
+            curve: annotation.curve,
+            endpoints: annotation.endpoints,
+          });
+        }
+        for (const extra of annotation.links || []) {
+          if (!extra.targetId) continue;
+          links.push({
+            id: extra.id,
+            annotation,
+            extra,
+            isPrimary: false,
+            targetId: extra.targetId,
+            isNoteToNote: config.annotations.some(n => n.id === extra.targetId),
+            arrow: extra.arrow || "forward",
+            lineStyle: extra.lineStyle || "solid",
+            color: extra.color || annotation.color || "#d3a9fa",
+            curve: extra.curve,
+            endpoints: extra.endpoints,
+          });
+        }
+      }
+      return links;
+    };
+
+    const removeTimelineLink = link => {
+      const ann = link.annotation;
+      if (!link.isPrimary) {
+        ann.links = (ann.links || []).filter(l => l.id !== link.id);
+      } else if (ann.links && ann.links.length > 0) {
+        const next = ann.links.shift();
+        ann.anchor = next.targetId;
+        ann.arrow = next.arrow;
+        ann.lineStyle = next.lineStyle;
+        ann.color = next.color;
+        ann.curve = next.curve;
+        ann.endpoints = next.endpoints;
+      } else {
+        ann.arrowHidden = true;
+      }
+      callbacksSave();
+      redrawLinks();
+    };
+
+    const deleteAnnotation = targetAnnotation => {
+      const targetId = targetAnnotation.id;
+      config.annotations = config.annotations.filter(item => item.id !== targetId);
+      for (const note of config.annotations) {
+        if (note.links) note.links = note.links.filter(l => l.targetId !== targetId);
+        if (note.anchor === targetId) {
+          if (note.links && note.links.length > 0) {
+            const next = note.links.shift();
+            note.anchor = next.targetId;
+            note.arrow = next.arrow;
+            note.lineStyle = next.lineStyle;
+            note.color = next.color;
+            note.curve = next.curve;
+            note.endpoints = next.endpoints;
+          } else {
+            note.anchor = entries[0]?.id || "";
+            note.arrowHidden = true;
+          }
+        }
+      }
+      callbacksSave();
+    };
+
     let curveEditId = null, curveDrag = null;
     const arrowTarget = id => [...shell.querySelectorAll(".ct-link-hit")].find(node => node.dataset.arrow === id);
-    const arrowMenu = (annotation, x, y) => {
+    const arrowMenu = (link, x, y) => {
       const mode = horizontal ? "matrix" : "vertical";
-      const saveArrow = change => () => { arrowTarget(annotation.id)?.focus({ preventScroll: true }); change(); callbacksSave(); };
-      const choices = (key, options) => callbacks.menu(x, y, options.map(([value, label]) => ({ icon: (annotation[key] || (key === "arrow" ? "forward" : "solid")) === value ? "fa-check" : "fa-minus", label, onClick: saveArrow(() => { annotation[key] = value; }) })));
+      const targetObj = link.extra || link.annotation;
+      const saveArrow = change => () => { arrowTarget(link.id)?.focus({ preventScroll: true }); change(); callbacksSave(); };
+      const choices = (key, options) => callbacks.menu(x, y, options.map(([value, label]) => ({
+        icon: (targetObj[key] || (key === "arrow" ? "forward" : "solid")) === value ? "fa-check" : "fa-minus",
+        label,
+        onClick: saveArrow(() => { targetObj[key] = value; if (link.isPrimary) link.annotation[key] = value; })
+      })));
       callbacks.menu(x, y, [
-        { icon: "fa-pen", label: "Editar seta…", onClick: () => openEditor("arrow", annotation) },
-        { icon: "fa-arrows-left-right", label: "Pontas da seta…", onClick: () => choices("arrow", [["forward", "Para a nota"], ["back", "Para o título"], ["both", "Nas duas pontas"], ["none", "Sem pontas"]]) },
+        { icon: "fa-pen", label: "Editar seta…", onClick: () => openEditor("arrow", link) },
+        { icon: "fa-arrows-left-right", label: "Pontas da seta…", onClick: () => choices("arrow", [["forward", link.isNoteToNote ? "Para a nota de destino" : "Para a nota"], ["back", link.isNoteToNote ? "Para a nota de origem" : "Para o título"], ["both", "Nas duas pontas"], ["none", "Sem pontas"]]) },
         { icon: "fa-grip-lines", label: "Tipo de traço…", onClick: () => choices("lineStyle", [["solid", "Contínuo"], ["dashed", "Tracejado"], ["dotted", "Pontilhado"]]) },
-        { icon: "fa-palette", label: "Cor…", onClick: () => callbacks.menu(x, y, COLORS.map((color, index) => ({ icon: "fa-circle", color, label: ["Verde", "Azul", "Lilás", "Âmbar", "Coral", "Cinza"][index], onClick: saveArrow(() => { annotation.color = color; }) }))) },
+        { icon: "fa-palette", label: "Cor…", onClick: () => callbacks.menu(x, y, COLORS.map((color, index) => ({ icon: "fa-circle", color, label: ["Verde", "Azul", "Lilás", "Âmbar", "Coral", "Cinza"][index], onClick: saveArrow(() => { targetObj.color = color; if (link.isPrimary) link.annotation.color = color; }) }))) },
         { sep: true },
-        { icon: "fa-bezier-curve", label: curveEditId === annotation.id ? "Concluir ajuste da curva" : "Ajustar curva", onClick: () => { curveEditId = curveEditId === annotation.id ? null : annotation.id; arrowTarget(annotation.id)?.focus({ preventScroll: true }); redrawLinks(); } },
-        ...(annotation.curve?.[mode] || annotation.endpoints?.[mode] ? [{ icon: "fa-rotate-left", label: "Restaurar forma automática", onClick: saveArrow(() => { if (annotation.curve) delete annotation.curve[mode]; if (annotation.endpoints) delete annotation.endpoints[mode]; }) }] : []),
+        { icon: "fa-bezier-curve", label: curveEditId === link.id ? "Concluir ajuste da curva" : "Ajustar curva", onClick: () => { curveEditId = curveEditId === link.id ? null : link.id; arrowTarget(link.id)?.focus({ preventScroll: true }); redrawLinks(); } },
+        ...(targetObj.curve?.[mode] || targetObj.endpoints?.[mode] ? [{ icon: "fa-rotate-left", label: "Restaurar forma automática", onClick: saveArrow(() => { if (targetObj.curve) delete targetObj.curve[mode]; if (targetObj.endpoints) delete targetObj.endpoints[mode]; if (link.isPrimary) { if (link.annotation.curve) delete link.annotation.curve[mode]; if (link.annotation.endpoints) delete link.annotation.endpoints[mode]; } }) }] : []),
+        { sep: true },
+        { icon: "fa-trash-can", label: "Remover esta seta", danger: true, onClick: () => removeTimelineLink(link) },
       ]);
     };
+
     const redrawLinks = () => {
       if (!board.isConnected) return;
       const svg = shell.querySelector(".ct-links"), controls = shell.querySelector(".ct-controls"), rect = board.getBoundingClientRect();
@@ -662,94 +916,148 @@ window.CaseTimeline = (() => {
       svg.setAttribute("viewBox", `0 0 ${rect.width} ${board.offsetHeight}`);
       controls.setAttribute("viewBox", `0 0 ${rect.width} ${board.offsetHeight}`);
       svg.replaceChildren(); controls.replaceChildren();
-      for (const annotation of config.annotations) {
-        const anchor = anchorIndex(annotation);
-        if (anchor < 0) continue;
-        const note = noteNodes.get(annotation.id);
+      for (const link of getTimelineLinks()) {
+        const note = noteNodes.get(link.annotation.id);
         if (!note) continue;
         const nr = note.getBoundingClientRect();
-        const icon = note.querySelector("i"), label = note.querySelector("span");
-        const origin = anchorPoint(annotation);
-        const axisX = horizontal ? origin.x : rect.width / 2;
-        const axisY = origin.y;
-        const noteX = nr.left - rect.left + nr.width / 2;
-        const noteY = nr.top - rect.top + nr.height / 2;
         const modeKey = horizontal ? "matrix" : "vertical";
-        const startSide = annotation.endpoints?.[modeKey]?.start || "auto";
-        const endSide = annotation.endpoints?.[modeKey]?.end || "auto";
-        const target = endSide === "top" && icon ? icon : endSide === "bottom" && label ? label : horizontal && noteY < axisY && label ? label : icon || label;
-        const tr = target?.getBoundingClientRect() || nr;
-        const noteSide = Math.sign(horizontal ? noteY - axisY : noteX - axisX) || 1;
-        const title = horizontal ? markerNodes.get(annotation.anchor) || markerNodes.get(entries[anchor].id) : entryNodes.get(entries[anchor].id)?.querySelector("strong");
-        if (!title) continue;
-        const titleRect = title.getBoundingClientRect();
-        const titleX = titleRect.left - rect.left + titleRect.width / 2;
-        const titleY = titleRect.top - rect.top + titleRect.height / 2;
-        let x1, y1, sourceAbove = false;
-        if (startSide !== "auto") {
-          const point = pointOnSide(titleRect, startSide);
-          x1 = point.x - rect.left; y1 = point.y - rect.top;
-          sourceAbove = startSide === "top";
-        } else if (horizontal) {
-          x1 = titleX;
-          if (noteY < titleRect.top - rect.top - 8) { y1 = titleRect.top - rect.top - 7; sourceAbove = true; }
-          else if (noteY > titleRect.bottom - rect.top + 8) y1 = titleRect.bottom - rect.top + 7;
-          else { x1 = (noteX > titleX ? titleRect.right + 7 : titleRect.left - 7) - rect.left; y1 = titleY; }
-        } else {
-          const titleDirection = titleX < axisX ? -1 : 1;
-          const outerEdge = titleDirection > 0 ? titleRect.right : titleRect.left;
-          const noteBeyondTitle = (noteX - (outerEdge - rect.left)) * titleDirection > 8;
-          if ((noteX - axisX) * titleDirection > 0 && noteBeyondTitle) {
-            x1 = outerEdge - rect.left + titleDirection * 7; y1 = titleY;
-          } else {
-            x1 = titleX;
-            sourceAbove = noteY < titleY - 18;
-            y1 = (sourceAbove ? titleRect.top - 7 : titleRect.bottom + 7) - rect.top;
+        const startSide = link.endpoints?.[modeKey]?.start || "auto";
+        const endSide = link.endpoints?.[modeKey]?.end || "auto";
+        let x1, y1, x2, y2, c1x, c1y, c2x, c2y, defaultMidX, defaultMidY;
+        let sourceRectForEndpoint, targetRectForEndpoint;
+
+        if (link.isNoteToNote) {
+          const targetNote = noteNodes.get(link.targetId);
+          if (!targetNote) continue;
+          const tr = targetNote.getBoundingClientRect();
+          const aCenter = { x: nr.left - rect.left + nr.width / 2, y: nr.top - rect.top + nr.height / 2 };
+          const bCenter = { x: tr.left - rect.left + tr.width / 2, y: tr.top - rect.top + tr.height / 2 };
+          let p1 = startSide !== "auto" ? pointOnSide(nr, startSide) : null;
+          let p2 = endSide !== "auto" ? pointOnSide(tr, endSide) : null;
+          const dxCenter = bCenter.x - aCenter.x, dyCenter = bCenter.y - aCenter.y;
+          if (!p1 || !p2) {
+            let autoStartSide, autoEndSide;
+            if (Math.abs(dxCenter) >= Math.abs(dyCenter)) {
+              if (dxCenter >= 0) { autoStartSide = "right"; autoEndSide = "left"; }
+              else { autoStartSide = "left"; autoEndSide = "right"; }
+            } else {
+              if (dyCenter >= 0) { autoStartSide = "bottom"; autoEndSide = "top"; }
+              else { autoStartSide = "top"; autoEndSide = "bottom"; }
+            }
+            p1 ||= pointOnSide(nr, autoStartSide);
+            p2 ||= pointOnSide(tr, autoEndSide);
           }
-        }
-        const endPoint = endSide === "auto" ? null : pointOnSide(tr, endSide);
-        const x2 = endPoint ? endPoint.x - rect.left : horizontal ? tr.left - rect.left + tr.width / 2 : (noteSide > 0 ? tr.left : tr.right) - rect.left - noteSide * 7;
-        const y2 = endPoint ? endPoint.y - rect.top : horizontal ? (noteSide > 0 ? tr.top : tr.bottom) - rect.top - noteSide * 7 : tr.top - rect.top + tr.height / 2;
-        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-        const dx = x2 - x1, dy = y2 - y1;
-        let c1x, c1y, c2x, c2y;
-        if (horizontal) {
-          const bow = clamp(Math.abs(dy) * .22, 32, 65) * (dx >= 0 ? 1 : -1);
-          c1x = x1 + bow; c1y = y1 + dy * .3;
-          c2x = x2 + bow; c2y = y2 - dy * .3;
+          x1 = p1.x - rect.left; y1 = p1.y - rect.top;
+          x2 = p2.x - rect.left; y2 = p2.y - rect.top;
+          const dx = x2 - x1, dy = y2 - y1;
+          if (Math.abs(dx) >= Math.abs(dy)) {
+            const bow = clamp(Math.abs(dy) * 0.22, 20, 50) * (dy >= 0 ? 1 : -1);
+            c1x = x1 + dx * 0.35; c1y = y1 + bow;
+            c2x = x2 - dx * 0.35; c2y = y2 - bow;
+          } else {
+            const bow = clamp(Math.abs(dx) * 0.22, 20, 50) * (dx >= 0 ? 1 : -1);
+            c1x = x1 + bow; c1y = y1 + dy * 0.35;
+            c2x = x2 - bow; c2y = y2 - dy * 0.35;
+          }
+          defaultMidX = (x1 + 3 * c1x + 3 * c2x + x2) / 8;
+          defaultMidY = (y1 + 3 * c1y + 3 * c2y + y2) / 8;
+          const curve = link.curve?.[modeKey] || { dx: 0, dy: 0 };
+          c1x += curve.dx * 4 / 3; c2x += curve.dx * 4 / 3;
+          c1y += curve.dy * 4 / 3; c2y += curve.dy * 4 / 3;
+          sourceRectForEndpoint = nr;
+          targetRectForEndpoint = tr;
         } else {
-          const bow = clamp(Math.abs(dx) * .12, 24, 42) * (sourceAbove ? -1 : 1);
-          c1x = x1 + dx * .3; c1y = y1 + bow;
-          c2x = x2 - dx * .3; c2y = y2 + bow;
+          const anchor = anchors.get(link.targetId) ?? -1;
+          if (anchor < 0) continue;
+          const icon = note.querySelector("i"), label = note.querySelector("span");
+          const origin = anchorPoint(link.targetId);
+          const axisX = horizontal ? origin.x : rect.width / 2;
+          const axisY = origin.y;
+          const noteX = nr.left - rect.left + nr.width / 2;
+          const noteY = nr.top - rect.top + nr.height / 2;
+          const target = endSide === "top" && icon ? icon : endSide === "bottom" && label ? label : horizontal && noteY < axisY && label ? label : icon || label;
+          const tr = target?.getBoundingClientRect() || nr;
+          const noteSide = Math.sign(horizontal ? noteY - axisY : noteX - axisX) || 1;
+          const title = horizontal ? markerNodes.get(link.targetId) || markerNodes.get(entries[anchor]?.id) : entryNodes.get(entries[anchor]?.id)?.querySelector("strong");
+          if (!title) continue;
+          const titleRect = title.getBoundingClientRect();
+          const titleX = titleRect.left - rect.left + titleRect.width / 2;
+          const titleY = titleRect.top - rect.top + titleRect.height / 2;
+          let sourceAbove = false;
+          if (startSide !== "auto") {
+            const point = pointOnSide(titleRect, startSide);
+            x1 = point.x - rect.left; y1 = point.y - rect.top;
+            sourceAbove = startSide === "top";
+          } else if (horizontal) {
+            x1 = titleX;
+            if (noteY < titleRect.top - rect.top - 8) { y1 = titleRect.top - rect.top - 7; sourceAbove = true; }
+            else if (noteY > titleRect.bottom - rect.top + 8) y1 = titleRect.bottom - rect.top + 7;
+            else { x1 = (noteX > titleX ? titleRect.right + 7 : titleRect.left - 7) - rect.left; y1 = titleY; }
+          } else {
+            const titleDirection = titleX < axisX ? -1 : 1;
+            const outerEdge = titleDirection > 0 ? titleRect.right : titleRect.left;
+            const noteBeyondTitle = (noteX - (outerEdge - rect.left)) * titleDirection > 8;
+            if ((noteX - axisX) * titleDirection > 0 && noteBeyondTitle) {
+              x1 = outerEdge - rect.left + titleDirection * 7; y1 = titleY;
+            } else {
+              x1 = titleX;
+              sourceAbove = noteY < titleY - 18;
+              y1 = (sourceAbove ? titleRect.top - 7 : titleRect.bottom + 7) - rect.top;
+            }
+          }
+          const endPoint = endSide === "auto" ? null : pointOnSide(tr, endSide);
+          x2 = endPoint ? endPoint.x - rect.left : horizontal ? tr.left - rect.left + tr.width / 2 : (noteSide > 0 ? tr.left : tr.right) - rect.left - noteSide * 7;
+          y2 = endPoint ? endPoint.y - rect.top : horizontal ? (noteSide > 0 ? tr.top : tr.bottom) - rect.top - noteSide * 7 : tr.top - rect.top + tr.height / 2;
+          const dx = x2 - x1, dy = y2 - y1;
+          if (horizontal) {
+            const bow = clamp(Math.abs(dy) * .22, 32, 65) * (dx >= 0 ? 1 : -1);
+            c1x = x1 + bow; c1y = y1 + dy * .3;
+            c2x = x2 + bow; c2y = y2 - dy * .3;
+          } else {
+            const bow = clamp(Math.abs(dx) * .12, 24, 42) * (sourceAbove ? -1 : 1);
+            c1x = x1 + dx * .3; c1y = y1 + bow;
+            c2x = x2 - dx * .3; c2y = y2 + bow;
+          }
+          defaultMidX = (x1 + 3 * c1x + 3 * c2x + x2) / 8;
+          defaultMidY = (y1 + 3 * c1y + 3 * c2y + y2) / 8;
+          const curve = link.curve?.[horizontal ? "matrix" : "vertical"] || { dx: 0, dy: 0 };
+          c1x += curve.dx * 4 / 3; c2x += curve.dx * 4 / 3;
+          c1y += curve.dy * 4 / 3; c2y += curve.dy * 4 / 3;
+          sourceRectForEndpoint = titleRect;
+          targetRectForEndpoint = tr;
         }
-        const defaultMidX = (x1 + 3 * c1x + 3 * c2x + x2) / 8;
-        const defaultMidY = (y1 + 3 * c1y + 3 * c2y + y2) / 8;
-        const curve = annotation.curve?.[horizontal ? "matrix" : "vertical"] || { dx: 0, dy: 0 };
-        c1x += curve.dx * 4 / 3; c2x += curve.dx * 4 / 3;
-        c1y += curve.dy * 4 / 3; c2y += curve.dy * 4 / 3;
+
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
         path.setAttribute("d", `M${x1},${y1} C${c1x},${c1y} ${c2x},${c2y} ${x2},${y2}`);
         path.setAttribute("stroke-linecap", "round");
-        if (annotation.lineStyle === "dashed") path.setAttribute("stroke-dasharray", "6 5");
-        if (annotation.lineStyle === "dotted") path.setAttribute("stroke-dasharray", "1 5");
-        const color = annotation.color || "#d3a9fa";
+        if (link.lineStyle === "dashed") path.setAttribute("stroke-dasharray", "6 5");
+        if (link.lineStyle === "dotted") path.setAttribute("stroke-dasharray", "1 5");
+        const color = link.color || "#d3a9fa";
         path.classList.add("ct-link-line");
         path.setAttribute("stroke", color); svg.appendChild(path);
-        // A generous transparent stroke makes thin connectors easy to target without visual clutter.
+
         const hit = document.createElementNS("http://www.w3.org/2000/svg", "path");
-        hit.classList.add("ct-link-hit"); hit.dataset.arrow = annotation.id;
+        hit.classList.add("ct-link-hit"); hit.dataset.arrow = link.id;
         hit.setAttribute("d", path.getAttribute("d")); hit.setAttribute("tabindex", "0"); hit.setAttribute("role", "button"); hit.setAttribute("aria-haspopup", "menu");
-        hit.setAttribute("aria-label", `Editar seta da nota: ${annotation.text || "Ícone"}`);
-        const hint = document.createElementNS("http://www.w3.org/2000/svg", "title"); hint.textContent = "Botão direito: editar seta · Enter: opções da seta"; hit.append(hint);
-        hit.oncontextmenu = event => { event.preventDefault(); event.stopPropagation(); hit.focus({ preventScroll: true }); arrowMenu(annotation, event.clientX, event.clientY); };
-        hit.ondblclick = event => { event.stopPropagation(); openEditor("arrow", annotation); };
+        hit.setAttribute("aria-label", `Editar seta da nota: ${link.annotation.text || "Ícone"}`);
+        const hint = document.createElementNS("http://www.w3.org/2000/svg", "title"); hint.textContent = "Botão direito: opções da seta · Enter: editar seta"; hit.append(hint);
+        hit.oncontextmenu = event => { event.preventDefault(); event.stopPropagation(); hit.focus({ preventScroll: true }); arrowMenu(link, event.clientX, event.clientY); };
+        hit.ondblclick = event => { event.stopPropagation(); openEditor("arrow", link); };
         hit.onkeydown = event => {
-          if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); openEditor("arrow", annotation); }
-          else if (event.key === "ContextMenu" || event.shiftKey && event.key === "F10") { event.preventDefault(); event.stopPropagation(); const bounds = hit.getBoundingClientRect(); arrowMenu(annotation, bounds.left + bounds.width / 2, bounds.top + bounds.height / 2); }
-          else if (event.key === "Escape" && curveEditId === annotation.id) { event.preventDefault(); curveEditId = null; redrawLinks(); }
+          if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); openEditor("arrow", link); }
+          else if (event.key === "ContextMenu" || event.shiftKey && event.key === "F10") { event.preventDefault(); event.stopPropagation(); const bounds = hit.getBoundingClientRect(); arrowMenu(link, bounds.left + bounds.width / 2, bounds.top + bounds.height / 2); }
+          else if (event.key === "Escape" && curveEditId === link.id) { event.preventDefault(); curveEditId = null; redrawLinks(); }
         };
-        const highlight = active => { path.classList.toggle("is-highlighted", active); note.classList.toggle("is-arrow-target", active); };
+        const highlight = active => {
+          path.classList.toggle("is-highlighted", active);
+          note.classList.toggle("is-arrow-target", active);
+          if (link.isNoteToNote) {
+            noteNodes.get(link.targetId)?.classList.toggle("is-arrow-target", active);
+          }
+        };
         hit.onpointerenter = () => highlight(true); hit.onpointerleave = () => highlight(document.activeElement === hit); hit.onfocus = () => highlight(true); hit.onblur = () => highlight(false);
         controls.append(hit);
+
         const addHead = (tipX, tipY, fromX, fromY) => {
           const length = Math.hypot(tipX - fromX, tipY - fromY) || 1;
           const ux = (tipX - fromX) / length, uy = (tipY - fromY) / length;
@@ -758,41 +1066,55 @@ window.CaseTimeline = (() => {
           head.setAttribute("points", `${tipX},${tipY} ${baseX - uy * 4.5},${baseY + ux * 4.5} ${baseX + uy * 4.5},${baseY - ux * 4.5}`);
           head.setAttribute("fill", color); svg.appendChild(head);
         };
-        const arrow = annotation.arrow || "forward";
+        const arrow = link.arrow || "forward";
         if (arrow === "back" || arrow === "both") addHead(x1, y1, c1x, c1y);
         if (arrow === "forward" || arrow === "both") addHead(x2, y2, c2x, c2y);
-        if (curveEditId === annotation.id) {
+
+        if (curveEditId === link.id) {
+          const curve = link.curve?.[modeKey] || { dx: 0, dy: 0 };
           const handle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
           handle.setAttribute("class", "ct-curve-handle");
           handle.setAttribute("cx", defaultMidX + curve.dx); handle.setAttribute("cy", defaultMidY + curve.dy);
           handle.setAttribute("r", "7"); handle.setAttribute("fill", color);
           handle.setAttribute("title", "Arraste para ajustar a curva");
-          handle.onpointerdown = event => { event.preventDefault(); event.stopPropagation(); curveDrag = { kind: "midpoint", annotation, previous: annotation.curve?.[modeKey] ? { ...annotation.curve[modeKey] } : null, midX: defaultMidX, midY: defaultMidY, pointerId: event.pointerId }; board.setPointerCapture(event.pointerId); };
+          handle.onpointerdown = event => {
+            event.preventDefault(); event.stopPropagation();
+            const targetObj = link.extra || link.annotation;
+            curveDrag = { kind: "midpoint", link, previous: targetObj.curve?.[modeKey] ? { ...targetObj.curve[modeKey] } : null, midX: defaultMidX, midY: defaultMidY, pointerId: event.pointerId };
+            board.setPointerCapture(event.pointerId);
+          };
           controls.appendChild(handle);
-          for (const [endpoint, x, y, targetRect] of [["start", x1, y1, titleRect], ["end", x2, y2, tr]]) {
+          for (const [endpoint, x, y, targetRect] of [["start", x1, y1, sourceRectForEndpoint], ["end", x2, y2, targetRectForEndpoint]]) {
             const grip = document.createElementNS("http://www.w3.org/2000/svg", "circle");
             grip.setAttribute("class", "ct-endpoint-handle"); grip.setAttribute("data-endpoint", endpoint);
             grip.setAttribute("cx", x); grip.setAttribute("cy", y); grip.setAttribute("r", "6");
             grip.setAttribute("stroke", color);
-            grip.setAttribute("aria-label", endpoint === "start" ? "Mover saída do título" : "Mover chegada à nota");
-            grip.onpointerdown = event => { event.preventDefault(); event.stopPropagation(); curveDrag = { kind: "endpoint", annotation, previous: annotation.endpoints?.[modeKey] ? { ...annotation.endpoints[modeKey] } : null, endpoint, targetRect, pointerId: event.pointerId }; board.setPointerCapture(event.pointerId); };
+            grip.setAttribute("aria-label", endpoint === "start" ? (link.isNoteToNote ? "Mover saída da nota de origem" : "Mover saída do título") : (link.isNoteToNote ? "Mover chegada à nota de destino" : "Mover chegada à nota"));
+            grip.onpointerdown = event => {
+              event.preventDefault(); event.stopPropagation();
+              const targetObj = link.extra || link.annotation;
+              curveDrag = { kind: "endpoint", link, previous: targetObj.endpoints?.[modeKey] ? { ...targetObj.endpoints[modeKey] } : null, endpoint, targetRect, pointerId: event.pointerId };
+              board.setPointerCapture(event.pointerId);
+            };
             controls.appendChild(grip);
           }
         }
       }
       if (focusedArrow) arrowTarget(focusedArrow)?.focus({ preventScroll: true });
     };
+
     board.onpointermove = event => {
       if (!curveDrag || event.pointerId !== curveDrag.pointerId) return;
+      const targetObj = curveDrag.link?.extra || curveDrag.link?.annotation || curveDrag.annotation;
       if (curveDrag.kind === "endpoint") {
         const modeKey = horizontal ? "matrix" : "vertical";
-        const endpoints = (curveDrag.annotation.endpoints ||= {});
+        const endpoints = (targetObj.endpoints ||= {});
         (endpoints[modeKey] ||= { start: "auto", end: "auto" })[curveDrag.endpoint] = nearestSide(curveDrag.targetRect, event.clientX, event.clientY);
         redrawLinks();
         return;
       }
       const rect = board.getBoundingClientRect();
-      (curveDrag.annotation.curve ||= {})[horizontal ? "matrix" : "vertical"] = {
+      (targetObj.curve ||= {})[horizontal ? "matrix" : "vertical"] = {
         dx: event.clientX - rect.left - curveDrag.midX,
         dy: event.clientY - rect.top - curveDrag.midY,
       };
@@ -801,12 +1123,14 @@ window.CaseTimeline = (() => {
     board.onpointerup = event => { if (!curveDrag || event.pointerId !== curveDrag.pointerId) return; curveDrag = null; callbacksSave(); };
     board.onpointercancel = () => {
       if (!curveDrag) return;
+      const targetObj = curveDrag.link?.extra || curveDrag.link?.annotation || curveDrag.annotation;
       const modeKey = horizontal ? "matrix" : "vertical", key = curveDrag.kind === "endpoint" ? "endpoints" : "curve";
-      if (curveDrag.previous) (curveDrag.annotation[key] ||= {})[modeKey] = curveDrag.previous;
-      else if (curveDrag.annotation[key]) delete curveDrag.annotation[key][modeKey];
+      if (curveDrag.previous) (targetObj[key] ||= {})[modeKey] = curveDrag.previous;
+      else if (targetObj[key]) delete targetObj[key][modeKey];
       if (board.hasPointerCapture(curveDrag.pointerId)) board.releasePointerCapture(curveDrag.pointerId);
       curveDrag = null; redrawLinks();
     };
+
     const noteNodes = new Map();
     const noteRows = new Map();
     const boardRect = board.getBoundingClientRect();
@@ -820,7 +1144,7 @@ window.CaseTimeline = (() => {
       const note = document.createElement("article"); note.className = "ct-note"; note.dataset.note = annotation.id;
       note.tabIndex = 0; note.setAttribute("role", "button"); note.setAttribute("aria-label", `Editar nota: ${annotation.text || "Ícone"}`);
       note.title = annotation.text || "Editar nota";
-      const origin = anchorPoint(annotation), lane = horizontal ? entryLane.get(entries[anchor].id) : null;
+      const origin = anchorPoint(annotation.anchor), lane = horizontal ? entryLane.get(entries[anchor]?.id) || matrixLanes[0] || { index: 0, y: centerY } : null;
       const noteRow = horizontal ? noteRows.get(lane.index) || 0 : 0;
       if (horizontal) noteRows.set(lane.index, noteRow + 1);
       const hasPlacement = horizontal ? !!annotation.matrix : !!annotation.vertical || annotation.x != null || annotation.y != null;
@@ -829,19 +1153,104 @@ window.CaseTimeline = (() => {
       note.style.left = horizontal ? `${origin.x + placement.x}px` : `calc(50% + ${placement.x}px)`;
       note.style.top = `${origin.y + placement.y}px`;
       note.style.setProperty("--note-color", annotation.color || "#d3a9fa");
-      const iconClasses=window.NoteIconPicker.classes(annotation.icon);
+      const iconClasses = window.NoteIconPicker.classes(annotation.icon);
       note.innerHTML = `${iconClasses ? `<i class="${iconClasses}" aria-hidden="true"></i>` : ""}${annotation.text ? `<span>${safe(annotation.text)}</span>` : ""}`;
       note.ondblclick = () => openEditor("annotation", annotation);
       note.onkeydown = event => {
         if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openEditor("annotation", annotation); }
         else if (event.key === "ContextMenu" || event.shiftKey && event.key === "F10") { event.preventDefault(); const rect = note.getBoundingClientRect(); note.oncontextmenu({ preventDefault() {}, clientX: rect.left, clientY: rect.bottom }); }
       };
-      note.oncontextmenu = event => { event.preventDefault(); callbacks.menu(event.clientX, event.clientY, [
-        { icon: "fa-pen", label: "Editar nota", onClick: () => openEditor("annotation", annotation) },
-        { icon: "fa-arrow-right-long", label: "Opções da seta…", onClick: () => arrowMenu(annotation, event.clientX, event.clientY) },
-        ...COLORS.map((color, index) => ({ icon: "fa-circle", color, label: ["Verde", "Azul", "Lilás", "Âmbar", "Coral", "Cinza"][index], onClick: () => { annotation.color = color; callbacksSave(); } })),
-        { icon: "fa-trash-can", label: "Remover nota", danger: true, onClick: () => { config.annotations = config.annotations.filter(item => item.id !== annotation.id); callbacksSave(); } },
-      ]); };
+      note.oncontextmenu = event => {
+        event.preventDefault();
+        const otherNotes = config.annotations.filter(n => n.id !== annotation.id);
+        const noteLinks = getTimelineLinks().filter(l => l.annotation.id === annotation.id);
+        callbacks.menu(event.clientX, event.clientY, [
+          { icon: "fa-pen", label: "Editar nota", onClick: () => openEditor("annotation", annotation) },
+          {
+            icon: "fa-link",
+            label: "Ligar a outro item da timeline…",
+            onClick: () => {
+              const entryOptions = entries.map(ent => ({
+                icon: ent.type === "manual" ? "fa-flag" : ent.type === "group" ? "fa-layer-group" : "fa-clock",
+                label: `${preview(ent.title, 40)} · ${when(ent.start)}`,
+                onClick: () => {
+                  connectNoteToTarget(annotation, ent.id);
+                  callbacksSave();
+                  redrawLinks();
+                  toast("Seta ligada ao item.", "ok");
+                },
+              }));
+              callbacks.menu(event.clientX, event.clientY, entryOptions);
+            },
+          },
+          ...(otherNotes.length ? [{
+            icon: "fa-arrow-progress",
+            label: "Ligar a outra nota…",
+            onClick: () => {
+              const noteOptions = otherNotes.map(n => {
+                const iconCls = window.NoteIconPicker.classes(n.icon) || "fa-comment";
+                const textPreview = n.text ? preview(n.text, 36) : "Nota sem texto";
+                return {
+                  icon: iconCls,
+                  label: textPreview,
+                  onClick: () => {
+                    connectNoteToTarget(annotation, n.id);
+                    callbacksSave();
+                    redrawLinks();
+                    toast("Seta ligada à nota.", "ok");
+                  },
+                };
+              });
+              callbacks.menu(event.clientX, event.clientY, noteOptions);
+            },
+          }] : []),
+          {
+            icon: "fa-plus",
+            label: "Criar nota ligada a esta…",
+            onClick: () => openEditor("annotation", null, null, annotation.id),
+          },
+          ...(noteLinks.length === 1 ? [{
+            icon: "fa-arrow-right-long",
+            label: "Opções da seta…",
+            onClick: () => arrowMenu(noteLinks[0], event.clientX, event.clientY),
+          }] : noteLinks.length > 1 ? [{
+            icon: "fa-arrow-right-long",
+            label: "Opções das setas…",
+            onClick: () => {
+              const linkOptions = noteLinks.map((l, idx) => {
+                let targetName = "";
+                if (l.isNoteToNote) {
+                  const targetNote = config.annotations.find(n => n.id === l.targetId);
+                  targetName = "Nota: " + (targetNote?.text ? preview(targetNote.text, 20) : "Ícone");
+                } else {
+                  const targetEntry = entries.find(e => e.id === l.targetId || (e.members && e.members.some(m => m.id === l.targetId)));
+                  targetName = targetEntry ? preview(targetEntry.title, 20) : "Item";
+                }
+                return {
+                  icon: "fa-arrow-right",
+                  label: `Seta ${idx + 1} (${targetName})`,
+                  onClick: () => arrowMenu(l, event.clientX, event.clientY),
+                };
+              });
+              callbacks.menu(event.clientX, event.clientY, linkOptions);
+            },
+          }] : []),
+          { sep: true },
+          ...COLORS.map((color, index) => ({
+            icon: "fa-circle",
+            color,
+            label: ["Verde", "Azul", "Lilás", "Âmbar", "Coral", "Cinza"][index],
+            onClick: () => { annotation.color = color; callbacksSave(); },
+          })),
+          { sep: true },
+          {
+            icon: "fa-trash-can",
+            label: "Remover nota",
+            danger: true,
+            onClick: () => deleteAnnotation(annotation),
+          },
+        ]);
+      };
       let drag = null;
       note.onpointerdown = event => { if (event.button !== 0) return; drag = { x: event.clientX, y: event.clientY, left: note.offsetLeft, top: note.offsetTop }; note.setPointerCapture(event.pointerId); };
       note.onpointermove = event => { if (!drag || !drag.moved && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 4) return; const left = drag.left + event.clientX - drag.x, top = drag.top + event.clientY - drag.y; note.style.left = `${clamp(left, minNoteX, board.clientWidth - note.offsetWidth - 8)}px`; note.style.top = `${clamp(top, horizontal ? 48 : 8, board.offsetHeight - note.offsetHeight - 8)}px`; drag.moved = true; redrawLinks(); };
@@ -852,10 +1261,10 @@ window.CaseTimeline = (() => {
       note.style.left = `${clamp((horizontal ? origin.x : board.clientWidth / 2) + placement.x, minNoteX, board.clientWidth - note.offsetWidth - 8)}px`;
       note.style.top = `${clamp(origin.y + placement.y, horizontal ? 48 : 8, board.offsetHeight - note.offsetHeight - 8)}px`;
       if (!hasPlacement) {
-        const anchorNode = entryNodes.get(entries[anchor].id), ar = anchorNode.getBoundingClientRect();
+        const anchorNode = entryNodes.get(entries[anchor]?.id), ar = anchorNode?.getBoundingClientRect();
         const width = note.offsetWidth, height = note.offsetHeight;
-        const x = horizontal ? origin.x + 18 : anchorNode.dataset.side === "left" ? ar.left - boardRect.left - width - 24 : ar.right - boardRect.left + 24;
-        const y = horizontal ? lane.y + 42 + noteRow * 64 : points[anchor].y - height / 2;
+        const x = horizontal ? origin.x + 18 : anchorNode?.dataset.side === "left" ? ar?.left - boardRect.left - width - 24 : (ar ? ar.right - boardRect.left + 24 : 80);
+        const y = horizontal ? lane.y + 42 + noteRow * 64 : (points[anchor]?.y ?? 0) - height / 2;
         const candidates = [[x, y], [x - width - 24, y], [x + width + 24, y], [x, y - height - 18], [x, y + height + 18]];
         for (const [cx, cy] of candidates) {
           const left = clamp(cx, minNoteX, board.clientWidth - width - 8), top = clamp(cy, horizontal ? 48 : 8, board.offsetHeight - height - 8);

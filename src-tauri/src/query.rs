@@ -4,8 +4,10 @@ use crate::sources::{event_at, line_bytes, CompiledDerived, FileIndex};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Filter {
@@ -213,6 +215,9 @@ pub fn matches_filter(ev: &Event, filter: &Filter) -> bool {
 }
 
 pub fn filtered_indices(events: &[Event], filters: &[Filter]) -> Vec<usize> {
+    if filters.is_empty() {
+        return (0..events.len()).collect();
+    }
     let pfs = prepare(filters);
     events
         .iter()
@@ -565,6 +570,39 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8]) -> Tri {
     }
 }
 
+struct MatchCacheEntry {
+    idx_id: usize,
+    idx_identity: String,
+    lines_count: usize,
+    filters_key: String,
+    derived_count: usize,
+    codes_count: usize,
+    matches: Arc<Vec<usize>>,
+}
+
+static MATCH_CACHE: Mutex<Vec<MatchCacheEntry>> = Mutex::new(Vec::new());
+
+fn filters_cache_key(filters: &[Filter]) -> String {
+    let mut s = String::new();
+    for f in filters {
+        s.push_str(&f.column);
+        s.push(':');
+        s.push_str(&f.op);
+        s.push('=');
+        s.push_str(&f.value);
+        if let Some(v2) = &f.value2 {
+            s.push(',');
+            s.push_str(v2);
+        }
+        s.push(';');
+    }
+    s
+}
+
+pub fn clear_match_cache() {
+    MATCH_CACHE.lock().clear();
+}
+
 /// Filtra as linhas do índice; materializa apenas quando necessário.
 pub fn indexed_matches(
     idx: &FileIndex,
@@ -573,8 +611,49 @@ pub fn indexed_matches(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Vec<usize> {
+    if filters.is_empty() {
+        return (0..idx.lines.len()).collect();
+    }
+    let idx_id = idx.lines.as_ptr() as usize;
+    let lines_count = idx.lines.len();
+    let idx_identity = idx.parts.first().map(|p| p.identity.as_str()).unwrap_or("");
+    let fkey = filters_cache_key(filters);
+    let derived_count = derived.len();
+    let codes_count = codes.sources.len() + system.sources.len();
+
+    {
+        let cache = MATCH_CACHE.lock();
+        if let Some(entry) = cache.iter().find(|e| {
+            e.idx_id == idx_id
+                && e.lines_count == lines_count
+                && e.derived_count == derived_count
+                && e.codes_count == codes_count
+                && e.idx_identity == idx_identity
+                && e.filters_key == fkey
+        }) {
+            return (*entry.matches).clone();
+        }
+    }
+
     let mut matched = Vec::new();
     visit_indexed_matches(idx, filters, codes, system, derived, |i| matched.push(i));
+
+    if !crate::operations::cancelled() {
+        let mut cache = MATCH_CACHE.lock();
+        if cache.len() >= 16 {
+            cache.remove(0);
+        }
+        cache.push(MatchCacheEntry {
+            idx_id,
+            idx_identity: idx_identity.to_string(),
+            lines_count,
+            filters_key: fkey,
+            derived_count,
+            codes_count,
+            matches: Arc::new(matched.clone()),
+        });
+    }
+
     matched
 }
 

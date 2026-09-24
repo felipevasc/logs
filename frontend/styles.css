@@ -737,6 +737,22 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1
 .kv-row:hover .kv-filter { opacity: 1; }
 .kv-filter:hover { color: var(--accent); background: var(--accent-soft); }
 
+.kv-row.kv-row-child {
+  position: relative;
+  background: color-mix(in srgb, var(--hover) 35%, transparent);
+}
+.kv-tree-guide {
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  margin-right: 4px;
+  user-select: none;
+}
+.kv-child-name {
+  color: var(--text-0);
+  font-weight: 600;
+}
+
 .code-pane {
   margin: 0; padding: 12px; border-radius: 8px;
   background: var(--code-bg); color: #e6e6e6;
@@ -1470,6 +1486,35 @@ body { overflow: hidden; }
   display: flex; flex-direction: column; gap: 1px;
 }
 .xnode.collapsed > .xnode-kids { display: none; }
+
+/* nós de campos na árvore hierárquica */
+.field-tree-node { display: flex; flex-direction: column; width: 100%; }
+.field-tree-node.collapsed > .field-tree-kids { display: none; }
+.field-tree-kids {
+  margin: 1px 0 4px 11px; padding-left: 8px; border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 1px;
+}
+.field-group-row {
+  display: flex; align-items: center; width: 100%; border-radius: 6px; position: relative;
+}
+.field-group-row:hover { background: var(--hover); }
+.field-group-head {
+  flex: 1; display: flex; align-items: center; gap: 6px; min-height: 28px; padding: 4px 6px;
+  border: 0; background: transparent; color: var(--text-0); font-family: var(--font-ui);
+  font-size: 12px; font-weight: 600; cursor: pointer; text-align: left;
+}
+.field-group-head .xnode-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.field-group-head .xnode-meta { margin-left: auto; padding-left: 6px; color: var(--text-2); font-size: 10px; }
+.field-row.is-parent {
+  display: flex; align-items: center; width: 100%; border-radius: 6px; position: relative;
+}
+.field-toggle-btn {
+  width: 20px; height: 28px; border: 0; background: transparent; color: var(--text-2);
+  cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 10px;
+  transition: transform 0.12s; flex-shrink: 0;
+}
+.field-tree-node.collapsed > .field-row .field-toggle-btn i { transform: rotate(-90deg); }
+.field-toggle-btn:hover { color: var(--text-0); }
 
 /* moldura global: há filtros ativos e a janela mostra só a realidade filtrada.
    Brilho suave estilo LED ao redor de todo o programa. */
@@ -2245,13 +2290,24 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 .ct-vertical .ct-entry[data-side="left"] { right: calc(50% + 30px + var(--range-gutter) + var(--entry-offset)); justify-content: flex-end; }
 .ct-vertical .ct-entry[data-side="right"] { left: calc(50% + 30px + var(--range-gutter) + var(--entry-offset)); }
 .ct-vertical .ct-entry::before { top: 50%; width: calc(19px + var(--range-gutter) + var(--entry-offset)); height: 1px; opacity: .52; }
-.ct-vertical .ct-entry::after { top: 1px; width: 3px; height: 20px; border-radius: 3px; opacity: .92; }
+/* Ponto representando o ocorrido para evento individual / único */
+.ct-vertical .ct-entry::after { top: calc(50% - 3.5px); width: 7px; height: 7px; border-radius: 50%; opacity: .95; box-shadow: 0 0 0 2px var(--bg-0); }
+.ct-vertical .ct-entry[data-side="left"]::before { left: 100%; }
+.ct-vertical .ct-entry[data-side="left"]::after { left: calc(100% + 19px + var(--range-gutter) + var(--entry-offset) - 3.5px); }
+.ct-vertical .ct-entry[data-side="right"]::before { right: 100%; }
+.ct-vertical .ct-entry[data-side="right"]::after { right: calc(100% + 19px + var(--range-gutter) + var(--entry-offset) - 3.5px); }
+.ct-vertical .ct-entry.is-single.is-manual::after { border-radius: 1.5px; transform: rotate(45deg); }
+.ct-vertical .ct-entry.is-single:hover::after, .ct-vertical .ct-entry.is-single:focus-within::after { opacity: 1; filter: brightness(1.2); }
+.ct-vertical .ct-entry.is-single.selected::after { opacity: 1; box-shadow: 0 0 0 2px var(--bg-0), 0 0 0 4px var(--accent); }
+/* Barra para eventos agrupados sem duração estendida */
+.ct-vertical .ct-entry.is-grouped:not(.has-range)::after { top: 1px; width: 3px; height: 20px; border-radius: 3px; opacity: .92; box-shadow: none; transform: none; }
+.ct-vertical .ct-entry.is-grouped:not(.has-range)[data-side="left"]::after { left: calc(100% + 19px + var(--range-gutter) + var(--entry-offset)); }
+.ct-vertical .ct-entry.is-grouped:not(.has-range)[data-side="right"]::after { right: calc(100% + 19px + var(--range-gutter) + var(--entry-offset)); }
+.ct-vertical .ct-entry.is-grouped:not(.has-range).selected::after { box-shadow: 0 0 0 2px var(--bg-0), 0 0 0 3px var(--accent); opacity: 1; }
+/* Itens com início e fim (has-range) usam .ct-range-bar */
 .ct-vertical .ct-entry.has-range::before { width: calc(13px + var(--range-gutter) + var(--entry-offset) - var(--range-lane)); }
 .ct-entry.has-range::after { display: none; }
-.ct-vertical .ct-entry[data-side="left"]::before { left: 100%; }
-.ct-vertical .ct-entry[data-side="left"]::after { left: calc(100% + 19px + var(--range-gutter) + var(--entry-offset)); }
-.ct-vertical .ct-entry[data-side="right"]::before { right: 100%; }
-.ct-vertical .ct-entry[data-side="right"]::after { right: calc(100% + 19px + var(--range-gutter) + var(--entry-offset)); }
+.ct-range-bar.is-selected { opacity: 1; filter: brightness(1.2); box-shadow: 0 0 0 2px var(--accent); }
 .ct-horizontal .ct-entry { width: 150px; max-width: none; transform: translateX(-50%); justify-content: center; }
 .ct-horizontal .ct-entry::before { left: 50%; width: 1px; height: calc(9px + var(--range-gutter) + var(--entry-offset) * .5); opacity: .52; }
 .ct-horizontal .ct-entry.has-range[data-side="left"]::before { height: calc(12px + var(--range-gutter) + var(--entry-offset) * .5 - var(--range-lane)); }

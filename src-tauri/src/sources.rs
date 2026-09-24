@@ -1498,7 +1498,130 @@ pub fn event_at(
     }
     normalize_fields(&mut ev);
     apply_derived(&mut ev, derived);
+    expand_query_param_fields(&mut ev);
     ev
+}
+
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
+}
+
+pub fn extract_query_params(field_name: &str, raw_val: &str) -> Option<Vec<(String, String)>> {
+    let s = raw_val.trim();
+    if s.len() < 3 || !s.contains('=') {
+        return None;
+    }
+
+    let qs = if let Some(pos) = s.find('?') {
+        let after = &s[pos + 1..];
+        after.split('#').next().unwrap_or(after)
+    } else {
+        let lower_field = field_name.to_ascii_lowercase();
+        let field_suggests_params = lower_field.contains("query")
+            || lower_field.contains("param")
+            || lower_field.contains("qs")
+            || lower_field.contains("search");
+        if !s.contains('&') && !field_suggests_params {
+            return None;
+        }
+        s
+    };
+
+    if qs.is_empty() || !qs.contains('=') {
+        return None;
+    }
+
+    let parts: Vec<&str> = qs.split('&').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let lower_field = field_name.to_ascii_lowercase();
+    if !s.contains('?') && !lower_field.contains("query") && !lower_field.contains("param") && parts.len() < 2 {
+        return None;
+    }
+
+    let mut pairs = Vec::new();
+    for part in parts {
+        let (raw_k, raw_v) = part.split_once('=')?;
+        let key = percent_decode(raw_k.trim());
+        let val = percent_decode(raw_v.trim());
+
+        if key.is_empty() || key.len() > 100 {
+            return None;
+        }
+        if key.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || c == '='
+                || c == '&'
+                || c == '<'
+                || c == '>'
+                || c == '"'
+                || c == '\''
+        }) {
+            return None;
+        }
+        pairs.push((key, val));
+    }
+
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs)
+    }
+}
+
+pub fn expand_query_param_fields(ev: &mut Event) {
+    let mut additions: Vec<(String, String)> = Vec::new();
+
+    for (k, v) in &ev.fields {
+        if k.matches('.').count() >= 8 {
+            continue;
+        }
+        if let serde_json::Value::String(s) = v {
+            if let Some(params) = extract_query_params(k, s) {
+                for (sub_k, sub_v) in params {
+                    additions.push((format!("{k}.{sub_k}"), sub_v));
+                }
+            }
+        }
+    }
+
+    for (sub_field, sub_val) in additions {
+        match ev.fields.get_mut(&sub_field) {
+            Some(serde_json::Value::String(existing)) => {
+                if !existing.is_empty() && !existing.split(", ").any(|part| part == sub_val) {
+                    existing.push_str(", ");
+                    existing.push_str(&sub_val);
+                }
+            }
+            Some(_) => {}
+            None => {
+                ev.fields.insert(sub_field, serde_json::Value::String(sub_val));
+            }
+        }
+    }
 }
 
 pub fn normalize_fields(ev: &mut Event) {
@@ -1521,6 +1644,7 @@ pub fn normalize_fields(ev: &mut Event) {
             }
         }
     }
+    expand_query_param_fields(ev);
 }
 
 pub fn parse_line(

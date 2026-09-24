@@ -1533,3 +1533,75 @@ fn benchmark_large_index() {
         std::fs::write(path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
     }
 }
+
+#[test]
+fn query_parameters_are_automatically_expanded_into_subfields() {
+    // 1. JSON com campo aninhado virando request.query_parameter
+    let raw = br#"{"request":{"query_parameter":"chave1=valor1&chave2=valor2"},"url":"/search?action=find&limit=10","msg":"User logged in & status=ok","plain":"key=val"}"#;
+    let ev = sources::parse_line(raw, "jsonl", None, &[]);
+
+    // Campo original preservado
+    assert_eq!(
+        ev.fields.get("request.query_parameter").unwrap(),
+        "chave1=valor1&chave2=valor2"
+    );
+    // Subcampos criados
+    assert_eq!(
+        ev.fields.get("request.query_parameter.chave1").unwrap(),
+        "valor1"
+    );
+    assert_eq!(
+        ev.fields.get("request.query_parameter.chave2").unwrap(),
+        "valor2"
+    );
+
+    // URL com '?' também gera subcampos sob url.*
+    assert_eq!(
+        ev.fields.get("url").unwrap(),
+        "/search?action=find&limit=10"
+    );
+    assert_eq!(ev.fields.get("url.action").unwrap(), "find");
+    assert_eq!(ev.fields.get("url.limit").unwrap(), "10");
+
+    // Campos normais de texto NÃO são falsamente expandidos
+    assert!(ev.fields.get("msg.status").is_none());
+    assert!(ev.fields.get("plain.key").is_none());
+
+    // 2. Percent-decoding e '+'
+    let raw_encoded = br#"{"query":"nome=Jo%C3%A3o&cidade=S%C3%A3o+Paulo"}"#;
+    let ev_encoded = sources::parse_line(raw_encoded, "jsonl", None, &[]);
+    assert_eq!(ev_encoded.fields.get("query.nome").unwrap(), "João");
+    assert_eq!(ev_encoded.fields.get("query.cidade").unwrap(), "São Paulo");
+}
+
+#[test]
+fn query_parameters_subfields_are_indexed_and_filterable() {
+    let mut text = String::new();
+    for i in 0..20 {
+        let chave1 = if i % 2 == 0 { "alpha" } else { "beta" };
+        let chave2 = format!("val_{i}");
+        text.push_str(&format!(
+            "{{\"source\":\"web\",\"request\":{{\"query_parameter\":\"chave1={chave1}&chave2={chave2}\"}},\"message\":\"req {i}\"}}\n"
+        ));
+    }
+    let file = Fixture::new(&text);
+    let index = file.index("auto");
+
+    // Descoberta de colunas inclui os subcampos
+    assert!(index.columns.contains(&"request.query_parameter".to_string()));
+    assert!(index.columns.contains(&"request.query_parameter.chave1".to_string()));
+    assert!(index.columns.contains(&"request.query_parameter.chave2".to_string()));
+
+    // Filtro pelo subcampo funciona perfeitamente
+    let filter = crate::query::Filter {
+        column: "request.query_parameter.chave1".into(),
+        op: "equals_exact".into(),
+        value: "alpha".into(),
+        value2: None,
+    };
+    let codes = crate::model::CodesConfig::default();
+    let derived = vec![];
+    let matched = crate::query::indexed_matches(&index, &[filter], &codes, &codes, &derived);
+    assert_eq!(matched.len(), 10);
+}
+
