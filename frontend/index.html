@@ -905,7 +905,10 @@
         </button>
       </div>
       <div class="settings-tabs" role="tablist" aria-label="Seções de configuração">
-        <button class="settings-tab active" data-settings-tab="mcp" type="button" role="tab">
+        <button class="settings-tab active" data-settings-tab="interface" type="button" role="tab">
+          <i class="fas fa-display"></i> Interface
+        </button>
+        <button class="settings-tab" data-settings-tab="mcp" type="button" role="tab">
           <i class="fas fa-plug"></i> MCP
         </button>
         <button class="settings-tab" data-settings-tab="detection" type="button" role="tab">
@@ -913,7 +916,8 @@
         </button>
       </div>
       <div class="modal-body">
-        <section id="settings-pane-mcp" class="settings-pane" role="tabpanel"></section>
+        <section id="settings-pane-interface" class="settings-pane" role="tabpanel"></section>
+        <section id="settings-pane-mcp" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-detection" class="settings-pane" role="tabpanel" hidden></section>
       </div>
     </div>
@@ -992,6 +996,7 @@
   <script src="icon-picker.js"></script>
   <script src="case-timeline.js"></script>
   <script src="app.js"></script>
+  <script src="ui-scale.js"></script>
   <script src="timeline.js"></script>
   <script src="case-content.js"></script>
   <script src="case-report.js"></script>

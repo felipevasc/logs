@@ -507,6 +507,8 @@
       source_desc: events.length ? loadedParts.join(" + ") : "",
       source_names: events.length ? [...loadedParts] : [],
     }),
+    // The preview cannot zoom the browser; screenshots emulate a scale with the viewport.
+    ui_zoom: () => false,
     mcp_status: () => ({
       enabled: mcpEnabled,
       running: mcpEnabled,

@@ -131,3 +131,9 @@
 .hash-copy{margin-right:12px}.case-hash{display:block;margin-top:3px}
 .hash-copy:hover,.case-hash:hover,.hash-copy:focus-visible,.case-hash:focus-visible{color:var(--text-0)}
 .source-actions{display:flex;gap:14px;align-items:center}
+
+/* Settings → Interface */
+.ui-pref{display:grid;gap:10px;padding:4px 0 18px}.ui-pref+.ui-pref{border-top:1px solid var(--border);padding-top:18px}
+.ui-pref-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px}.ui-pref-head span{color:var(--text-2);font-size:12px}
+.ui-pref .seg{display:inline-flex;flex-wrap:wrap;width:max-content;max-width:100%;margin:0}.ui-pref .seg-btn i{margin-right:6px;font-size:11px}
+.ui-pref p{margin:0;line-height:1.6}.ui-pref kbd{padding:1px 5px;border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;font:11px var(--font-mono)}

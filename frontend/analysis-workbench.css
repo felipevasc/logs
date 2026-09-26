@@ -27,7 +27,8 @@
 .aw-row-action .btn { color:var(--text-1); font-size:11px; }
 .aw-group tbody tr:hover .aw-row-action .btn { color:var(--accent); }
 .aw-empty { padding:32px 18px !important; color:var(--text-1); text-align:center !important; }
-#group-table { min-width:520px; }
+/* The summary uses the whole panel; the group label takes the spare width. */
+#group-table { min-width:max(520px, 100%); }
 .aw-group > .table-scroll { min-height:160px; flex:1; }
 .aw-pivot-presets { padding:10px 12px; border-bottom:1px solid var(--border); }
 .aw-pivot-presets #btn-cube-clear { margin-left:auto; }
