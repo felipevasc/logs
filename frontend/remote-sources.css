@@ -59,3 +59,9 @@
   .remote-grid { gap:12px; }
   .remote-actions .spacer { display:none; }
 }
+
+/* Docked in the Conexões page of the Estrutura area. */
+.remote-modal.docked { width:100%; max-width:none; max-height:none; box-shadow:none; border:1px solid var(--border); border-radius:var(--radius); background:var(--bg-1); }
+.remote-modal.docked .modal-head { padding:16px 20px; }
+.remote-modal.docked .modal-head h3, .remote-modal.docked #rs-close { display:none; }
+.remote-modal.docked .remote-body { overflow:visible; }

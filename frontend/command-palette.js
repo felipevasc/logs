@@ -12,7 +12,7 @@ window.CommandPalette = (() => {
   const click = selector => () => document.querySelector(selector)?.click();
 
   function build() {
-    const pages = [["summary", "Resumo", "fa-chart-simple"], ["case-timeline", "Linha do tempo", "fa-timeline"], ["explore", "Explorar", "fa-magnifying-glass"], ["compare", "Comparar períodos", "fa-code-compare"], ["evidence", "Evidências do Caso", "fa-bookmark"], ["case-trails", "Trilhas do Caso", "fa-route"], ["journeys", "Possíveis trilhas", "fa-code-branch"], ["sources", "Arquivos e fontes", "fa-folder-open"]];
+    const pages = [["summary", "Resumo", "fa-chart-simple"], ["case-timeline", "Linha do tempo", "fa-timeline"], ["explore", "Explorar", "fa-magnifying-glass"], ["compare", "Comparar períodos", "fa-code-compare"], ["evidence", "Evidências do Caso", "fa-bookmark"], ["case-trails", "Trilhas do Caso", "fa-route"], ["journeys", "Possíveis trilhas", "fa-code-branch"], ["sources", "Arquivos e fontes", "fa-folder-open"], ["connections", "Conexões", "fa-plug"], ["import", "Abrir logs", "fa-file-circle-plus"]];
     const list = [
       ...pages.map(([page, label, icon]) => ({ group: "Ir para", label, icon, run: go(page), keys: page })),
       { group: "Ações", label: "Abrir arquivos…", icon: "fa-file-circle-plus", run: click("#ws-open"), keys: "importar carregar logs" },

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="pt-BR" data-theme="dark">
+<html lang="pt-BR" data-theme="dark" data-zone="analysis">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -23,18 +23,20 @@
 <body>
   <nav class="workspace-nav" aria-label="Navegação principal">
     <a class="workspace-brand" href="#" aria-label="LogInsight — Resumo"><span class="brand-mark"><b></b><b></b><b></b></span>LogInsight</a>
-    <button class="nav-import" id="ws-open"><i class="fas fa-plus"></i> Abrir logs</button>
+    <button class="nav-import" id="ws-open" type="button" hidden><i class="fas fa-plus"></i> Abrir logs</button>
     <div class="nav-pages">
-      <button data-page="summary" class="selected"><i class="fas fa-chart-simple"></i>Resumo</button>
-      <button data-page="case-timeline"><i class="fas fa-timeline"></i>Linha do tempo</button>
-      <button data-page="explore"><i class="fas fa-magnifying-glass"></i>Explorar</button>
-      <button data-page="compare"><i class="fas fa-code-compare"></i>Comparar</button>
-      <button data-page="evidence"><i class="fas fa-bookmark"></i>Evidências<span id="ws-evidence-count"></span></button>
+      <button data-page="summary" data-zones="analysis case" class="selected"><i class="fas fa-chart-simple"></i>Resumo</button>
+      <button data-page="case-timeline" data-zones="analysis case"><i class="fas fa-timeline"></i>Linha do tempo</button>
+      <button data-page="explore" data-zones="analysis case"><i class="fas fa-magnifying-glass"></i>Explorar</button>
+      <button hidden data-page="evidence" data-zones="case"><i class="fas fa-bookmark"></i>Evidências<span id="ws-evidence-count"></span></button>
+      <button hidden data-page="sources" data-zones="structure" title="Arquivos e canais de logs"><i class="fas fa-folder-open"></i>Arquivos<span id="ws-source-count"></span></button>
+      <button hidden data-page="connections" data-zones="structure" title="Elasticsearch e Kibana"><i class="fas fa-plug"></i>Conexões</button>
+      <button hidden data-page="import" data-zones="structure"><i class="fas fa-file-circle-plus"></i>Abrir logs</button>
     </div>
-    <div class="nav-bottom">
-      <button data-page="sources" title="Arquivos e canais de logs"><i class="fas fa-folder-open"></i>Arquivos<span id="ws-source-count"></span></button>
-      <button id="ws-export"><i class="fas fa-arrow-up-from-bracket"></i>Exportar</button>
-      <button id="ws-preferences"><i class="fas fa-sliders"></i>Configurações</button>
+    <div class="zone-switch" role="group" aria-label="Área de trabalho">
+      <button type="button" data-zone="analysis" data-workspace-scope="dataset" aria-pressed="true"><i class="fas fa-magnifying-glass" aria-hidden="true"></i><span>Análise</span></button>
+      <button type="button" data-zone="case" data-workspace-scope="case" aria-pressed="false"><i class="fas fa-briefcase" aria-hidden="true"></i><span>Caso</span><small id="context-case-count"></small></button>
+      <button type="button" data-zone="structure" aria-pressed="false"><i class="fas fa-layer-group" aria-hidden="true"></i><span>Estrutura</span></button>
     </div>
   </nav>
   <main id="workspace-home" class="workspace-page">
@@ -59,7 +61,7 @@
 
   <!-- ===================== CONTEXTO GLOBAL ===================== -->
   <header class="topbar">
-    <div id="context-toggle" class="context-toggle" role="group" aria-label="Área de trabalho"><button type="button" data-workspace-scope="dataset" aria-pressed="true"><i class="fas fa-magnifying-glass" aria-hidden="true"></i>Análise</button><button type="button" data-workspace-scope="case" aria-pressed="false"><i class="fas fa-briefcase" aria-hidden="true"></i>Caso<span id="context-case-count"></span></button></div>
+    <div id="page-tabs" class="page-tabs" role="tablist" aria-label="Seções" hidden></div>
     <div id="context-summary" class="context-summary">Carregue um artefato para começar.</div>
     <div class="topbar-right">
       <span id="activity-indicator" class="activity-indicator" hidden>
@@ -73,7 +75,7 @@
         <button id="btn-new-case" class="icon-btn" type="button" title="Novo Caso"><i class="fas fa-plus"></i></button>
         <button id="btn-case-menu" class="icon-btn" type="button" title="Opções do Caso"><i class="fas fa-ellipsis"></i></button>
       </div>
-      <button id="btn-codes" class="icon-btn" type="button" title="Catálogo de códigos"><i class="fas fa-book"></i></button>
+      <button id="ws-export" class="icon-btn" type="button" title="Exportar" aria-label="Exportar"><i class="fas fa-arrow-up-from-bracket"></i></button>
       <button id="btn-settings" class="icon-btn" type="button" title="Configurações"><i class="fas fa-gear"></i></button>
       <button id="btn-theme" class="icon-btn" type="button" title="Alternar tema claro/escuro"><i class="fas fa-sun"></i></button>
     </div>
@@ -908,6 +910,9 @@
         <button class="settings-tab active" data-settings-tab="interface" type="button" role="tab">
           <i class="fas fa-display"></i> Interface
         </button>
+        <button class="settings-tab" data-settings-tab="codes" type="button" role="tab">
+          <i class="fas fa-book"></i> Códigos
+        </button>
         <button class="settings-tab" data-settings-tab="mcp" type="button" role="tab">
           <i class="fas fa-plug"></i> MCP
         </button>
@@ -917,6 +922,7 @@
       </div>
       <div class="modal-body">
         <section id="settings-pane-interface" class="settings-pane" role="tabpanel"></section>
+        <section id="settings-pane-codes" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-mcp" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-detection" class="settings-pane" role="tabpanel" hidden></section>
       </div>
@@ -996,6 +1002,7 @@
   <script src="icon-picker.js"></script>
   <script src="case-timeline.js"></script>
   <script src="app.js"></script>
+  <script src="tasks.js"></script>
   <script src="ui-scale.js"></script>
   <script src="timeline.js"></script>
   <script src="case-content.js"></script>

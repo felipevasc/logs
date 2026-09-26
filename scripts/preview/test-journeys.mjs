@@ -13,7 +13,9 @@ page.on("pageerror", error => errors.push(error.message));
 try {
   await page.goto(url);
   await page.waitForFunction(() => state.loaded && state.rows.length > 0 && window.Journeys && window.WorkspaceContext?.ready && !WorkspaceContext.changing && (window.__mockCommandCalls.load_file || window.__mockCommandCalls.load_files) && document.querySelector("#load-overlay").hidden);
-  await page.getByRole("button", { name: "Possíveis trilhas", exact: true }).click();
+  // Possíveis trilhas is a tab of the Linha do tempo menu.
+  await page.locator('.nav-pages [data-page="case-timeline"]').click();
+  await page.getByRole("tab", { name: "Possíveis trilhas", exact: true }).click();
   await page.waitForFunction(() => document.querySelectorAll(".journey-item").length === 30);
   assert.equal(await page.getByRole("combobox", { name: "Conjunto", exact: true }).count(), 0, "Jornadas uses the global context toggle");
   assert.equal(await page.getByRole("combobox", { name: "Ligar pelo campo" }).inputValue(), "correlation_id", "prefer useful repeated correlation over unique request IDs");

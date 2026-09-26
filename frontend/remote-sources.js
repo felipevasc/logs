@@ -20,7 +20,8 @@
       <div class="remote-status" id="rs-status" role="status" aria-live="polite"><span id="rs-status-text">Salvar a conexão guarda suas opções para a próxima consulta.</span><button class="btn ghost small" id="rs-open-result" type="button" hidden>Abrir arquivo importado</button><button class="btn ghost small" id="rs-cancel" type="button" hidden>Cancelar</button></div>
       </form></div></section>`;
   document.body.append(modal);
-  const q = id => modal.querySelector(`#rs-${id}`);
+  // The panel may be docked outside the overlay: look elements up by id.
+  const q = id => document.getElementById(`rs-${id}`);
   const setStatus = (text, kind = "neutral") => { q("status-text").textContent = text; q("status").dataset.kind = kind; };
   function setBusy(action = null) {
     ui.action = action; ui.busy = !!action; q("fields").disabled = ui.busy;
@@ -156,16 +157,20 @@
       if (closeOnSuccess) close();
     }
   }
-  async function open() {
-    if(window.WorkspaceContext?.scope()==='case')await window.WorkspaceContext.setScope('dataset');
-    if(window.WorkspaceContext?.scope()==='case')return;
-    ui.returnFocus = document.activeElement; modal.hidden = false;
-    q("name").focus();
+  // Conexões is a page of the Estrutura area; the panel is docked into it.
+  const panel = modal.querySelector(".remote-modal");
+  async function open() { await window.Workspace.showPage("connections"); }
+  async function mount(host) {
+    panel.classList.add("docked"); panel.removeAttribute("aria-modal"); host.append(panel);
     try { await refreshConnections(); }
     catch (error) { setStatus(`Não foi possível carregar as conexões. Use Atualizar lista para tentar novamente. ${String(error)}`, "error"); }
   }
+  function unmount() {
+    if (!panel.classList.contains("docked")) return;
+    q("password").value = ""; panel.classList.remove("docked"); panel.setAttribute("aria-modal", "true"); modal.append(panel);
+  }
   function close() {
-    if (ui.busy) return;
+    if (ui.busy || panel.classList.contains("docked")) return;
     q("password").value = ""; modal.hidden = true; ui.returnFocus?.focus?.();
   }
   q("form").onsubmit = event => event.preventDefault();
@@ -203,13 +208,7 @@
     const count = Number(payload.completed) || 0, total = Number(payload.total) || 0;
     setStatus(`${payload.phase || "Importando"}${count ? ` · ${fmtNum(count)}${total ? ` de ${fmtNum(total)}` : ""} registros` : ""}…`);
   }).catch(() => {});
-  const nav = el("button"); nav.id = "ws-remote"; nav.type = "button"; nav.innerHTML = '<i class="fas fa-plug"></i>Conexões'; nav.onclick = open;
-  $("#ws-export").before(nav);
   const empty = el("button", "text-button", "Elasticsearch / Kibana"); empty.id = "ws-remote-empty"; empty.type = "button"; empty.onclick = open; $("#ws-windows").after(empty);
-  const pageButton = el("button", "btn ghost small", "Conexões"); pageButton.id="ws-remote-page";pageButton.type = "button"; pageButton.onclick = open; $(".page-actions").prepend(pageButton);
-  const updatePageButton = () => { pageButton.hidden = document.body.dataset.page !== "sources"||window.WorkspaceContext?.scope()==='case'; };
-  document.addEventListener('workspace-context-change',updatePageButton);
-  new MutationObserver(updatePageButton).observe(document.body, { attributes: true, attributeFilter: ["data-page"] }); updatePageButton();
   selectConnection();
-  window.RemoteSources = { open };
+  window.RemoteSources = { open, mount, unmount };
 })();

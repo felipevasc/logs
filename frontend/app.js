@@ -5037,11 +5037,14 @@ function openRightInspector() {
 }
 
 // ------------------------------------------------------------------ códigos
-async function openCodes() {
+// The codes catalog is a section of Settings.
+function openCodes() { return openSettings("codes"); }
+async function renderCodesPane() {
+  const pane = $("#settings-pane-codes"), body = $("#codes-modal .modal-body");
+  if (body && body.parentElement !== pane) { body.classList.add("codes-pane"); pane.append(body); }
   $("#codes-editor").value = await api("get_codes");
   $("#codes-path").textContent = await api("get_codes_path");
   updateSysCount();
-  $("#codes-modal").hidden = false;
 }
 
 async function updateSysCount() {
@@ -5144,6 +5147,7 @@ async function openSettings(tab = "interface") {
   $("#settings-modal").hidden = false;
   switchSettingsTab(tab);
   if (tab === "interface") window.UiScale?.renderPane($("#settings-pane-interface"));
+  if (tab === "codes") await renderCodesPane();
   if (tab === "mcp") await renderMcpPane();
   if (tab === "detection") await window.Security?.renderRulesPane($("#settings-pane-detection"));
 }
@@ -5285,7 +5289,7 @@ async function handleMcpStateChanged(kind) {
   }
   // codes / derived / ts_config / formats: recarrega painéis abertos e reconsulta a view
   try {
-    if (kind === "codes" && !$("#codes-modal").hidden) {
+    if (kind === "codes" && !$("#settings-modal").hidden && !$("#settings-pane-codes").hidden) {
       $("#codes-editor").value = await api("get_codes", {}, { silent: true });
       updateSysCount();
     } else if (kind === "derived") {
@@ -5691,9 +5695,8 @@ function bind() {
     t.onclick = () => switchDetailTab(t.dataset.pane);
   });
 
-  $("#btn-codes").onclick = openCodes;
   $("#codes-close").onclick = () => { $("#codes-modal").hidden = true; };
-  $("#codes-cancel").onclick = () => { $("#codes-modal").hidden = true; };
+  $("#codes-cancel").onclick = () => { $("#settings-modal").hidden = true; };
   $("#codes-save").onclick = saveCodes;
   $("#btn-harvest").onclick = runHarvest;
 

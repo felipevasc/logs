@@ -210,7 +210,7 @@ window.CaseTrails = (() => {
       }, "btn primary"); footer.append(save); select.focus();
     } catch (error) { if (!closed) message.textContent = String(error.message || error); }
   }
-  const nav = button("", () => Workspace.showPage("case-trails"), ""); nav.dataset.page = "case-trails"; nav.innerHTML = '<i class="fas fa-route" aria-hidden="true"></i>Trilhas'; document.querySelector('.nav-pages [data-page="evidence"]').before(nav);
-  const updateNav = () => { nav.hidden = workspaceScope() !== "case"; }; document.addEventListener("workspace-context-change", () => { generation++; imageObserver?.disconnect(); updateNav(); document.querySelector(".case-trail-picker")?.remove(); }); updateNav();
+  // Trilhas is a section of the Linha do tempo menu in the Case (tabs in the top bar).
+  document.addEventListener("workspace-context-change", () => { generation++; imageObserver?.disconnect(); document.querySelector(".case-trail-picker")?.remove(); });
   return { render, fromJourney, refresh: () => { if (active()) render(host.parentElement, activeCase()); } };
 })();
