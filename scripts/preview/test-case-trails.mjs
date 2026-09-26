@@ -19,7 +19,7 @@ try{
     await WorkspaceContext.setScope("case",{page:"summary",animate:false});return data.split(",")[1];
   });
   async function showTrails(){await page.evaluate(async()=>{await Workspace.showPage("case-trails");if(!document.querySelector(".case-trails-workspace")){document.body.dataset.page="case-trails";document.querySelector("#ws-title").textContent="Trilhas";CaseTrails.render(document.querySelector("#ws-content"),activeCase());}});}
-  await showTrails();assert.equal(await page.locator('button[data-page="case-trails"]').isVisible(),true);
+  await showTrails();assert.equal(await page.locator('#page-tabs [data-subpage="case-trails"]').isVisible(),true);
   await page.getByRole("button",{name:"Nova trilha",exact:true}).click();await page.getByLabel("Título",{exact:true}).fill("Rascunho cancelado");await page.getByRole("button",{name:"Cancelar",exact:true}).click();assert.equal(await page.evaluate(()=>activeCase().caseTrails.length),0);
   await page.getByRole("button",{name:"Nova trilha",exact:true}).click();await page.getByLabel("Título",{exact:true}).fill("Acesso e movimentação");await page.getByLabel("Resumo",{exact:true}).fill("Sequência preservada para análise.");await page.getByLabel("Detalhes",{exact:true}).fill("Hipótese de teste; confirmar com os registros originais.");
   await page.locator('.case-content-dialog input[type="file"]').setInputFiles({name:"Contexto.png",mimeType:"image/png",buffer:Buffer.from(png,"base64")});await page.waitForFunction(()=>document.querySelectorAll('.case-content-dialog .case-image-card').length===1);

@@ -335,7 +335,7 @@
   const handlers = {
     mcp_configure: ({ enabled }) => { mcpEnabled = enabled; return handlers.mcp_status(); },
     validate_filters: ({filters}) => { for(const f of filters||[]) { if(f.op==="regex") new RegExp(f.value); if(f.op==="query") { const problem = window.QueryLang?.validate(f.value); if (problem) throw new Error(problem); } } return null; },
-    cancel_operation: () => { window.__mockRemoteCancel?.(); return null; },
+    cancel_operation: () => { window.__mockGeneration = (window.__mockGeneration || 0) + 1; window.__mockRemoteCancel?.(); return null; },
     remote_list: args => window.__mockRemote('remote_list',args),
     remote_save: args => window.__mockRemote('remote_save',args),
     remote_delete: args => window.__mockRemote('remote_delete',args),
@@ -815,6 +815,9 @@
           // latência artificial para visualizar os estados de carregamento
           if (["load_file", "load_files", "load_event_log"].includes(cmd)) await simulateLoad("mock.jsonl", 6300);
           if (["explore_snapshot", "aggregate_events", "profile_fields"].includes(cmd)) await delay(350);
+          // Tests can slow commands down (window.__mockLatency = { cmd: ms }); a cancel in between aborts them like the engine does.
+          const extra = window.__mockLatency?.[cmd];
+          if (extra) { const generation = window.__mockGeneration || 0; await delay(extra); if ((window.__mockGeneration || 0) !== generation) throw new Error("Operação cancelada."); }
           return h(args);
         } catch (e) {
           return Promise.reject(String(e));

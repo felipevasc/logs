@@ -9,6 +9,7 @@ Aplicacao desktop para investigar logs, feita com Tauri 2: o backend em Rust ind
 - Linguagem de busca com campos, comparações, redes CIDR, listas, regex e `AND`/`OR`/`NOT`, com validação e complemento enquanto digita; campos canônicos (`@user`, `@src_ip`, `@host`, `@action`…) que atravessam todas as fontes. [Busca, entidades e detecções](docs/busca-e-deteccoes.md).
 - Menu de entidades em usuários, IPs, hosts e processos, paleta de comandos (Ctrl+K) e detalhe do registro com ação normalizada, regras e conteúdo decodificado.
 - Tamanho da interface automático para janelas pequenas e telas com escala do sistema, ajustável em Configurações → Interface ou com Ctrl + / Ctrl − / Ctrl 0.
+- Três áreas no rodapé do menu, cada uma com sua cor: Análise (amarelo), Caso (roxo) e Estrutura (laranja: arquivos, conexões e abertura de logs). Menus e abas mostram quando estão carregando; o status lista o que está em andamento e permite cancelar cada item.
 - Indicadores, hipóteses e cadeia de custódia (SHA-256) no Caso, incluídos nos relatórios PDF e Markdown.
 - Enriquecimento de codigos com nome e descricao configuraveis.
 - Filtros por campos, busca textual, faixas numericas e arvore de facetas.

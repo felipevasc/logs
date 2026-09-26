@@ -48,7 +48,7 @@ try {
   results.search = `falhas de logon: ${failures}; sugestões: ${options.length}`;
 
   // Event detail: normalized action and entities.
-  await page.evaluate(() => { state.quick = "code:4625"; $("#quick-search").value = state.quick; state.page = 0; return Workspace.showPage("explore"); });
+  await page.evaluate(() => { state.quick = "code:4625"; $("#quick-search").value = state.quick; state.page = 0; Workspace.showPage("explore"); });
   await page.waitForFunction(() => state.rows.length && state.rows[0].code === "4625");
   await page.locator("#events-table tbody tr").first().click();
   await page.waitForSelector(".insight-block .insight-action");

@@ -18,7 +18,7 @@ window.WorkspaceContext = (() => {
   const validFilters = value => Array.isArray(value) ? value.filter(item => item && typeof item.column === "string" && typeof item.op === "string").slice(0, 200).map(item => ({ ...item, ...(item.value != null ? { value: String(item.value) } : {}), ...(item.value2 != null ? { value2: String(item.value2) } : {}) })) : [];
   function sanitize(raw) {
     const base = defaults(), input = record(raw), values = record(input.values), snapshot = { ...base, ...input, values: { ...base.values, ...values }, scroll: {} };
-    snapshot.page = ["summary", "timeline", "case-timeline", "case-trails", "journeys", "explore", "compare", "evidence", "sources"].includes(input.page) ? input.page : "summary";
+    snapshot.page = ["summary", "timeline", "case-timeline", "case-trails", "journeys", "explore", "compare", "evidence", "sources", "connections", "import"].includes(input.page) ? input.page : "summary";
     const v = snapshot.values;
     v.filters = validFilters(values.filters); v.quick = typeof values.quick === "string" ? values.quick : "";
     v.visibleCols = Array.isArray(values.visibleCols) ? strings(values.visibleCols) : base.values.visibleCols; v.favoriteFields = strings(values.favoriteFields);
@@ -74,11 +74,8 @@ window.WorkspaceContext = (() => {
   }
   function updateToggle() {
     document.documentElement.dataset.workspace = scope; document.body.dataset.workspace = scope;
-    for (const button of document.querySelectorAll("[data-workspace-scope]")) { const selected = button.dataset.workspaceScope === scope; button.setAttribute("aria-pressed", String(selected)); button.classList.toggle("selected", selected); }
-    $("#context-toggle").setAttribute("aria-label", `Área de trabalho: ${scope === "case" ? "Caso" : "Análise"}`);
     $("#context-case-count").textContent = String(caseEvents().length || "");
-    for (const node of document.querySelectorAll(".nav-import,.nav-bottom [data-page='sources'],#ws-remote,#ws-remote-page")) node.hidden = scope === "case";
-    $(".nav-pages [data-page='evidence']").hidden = scope !== "case";
+    window.Workspace?.syncZone?.();
   }
   async function setScope(next, options = {}) {
     if (!["dataset", "case"].includes(next)) return;
@@ -98,16 +95,20 @@ window.WorkspaceContext = (() => {
       scope = next; apply(snapshot); if (options.tab) state.activeDatasetTab = options.tab; updateToggle();
       finishOperation(scope === "case" ? "Caso" : "Análise", scope === "case" ? `${fmtNum(caseEvents().length)} registros preservados no Caso` : `${fmtNum(state.total)} registros na Análise`);
       document.dispatchEvent(new CustomEvent("workspace-context-change", { detail: { scope, previousScope } }));
-      render = Workspace.showPage(page === "sources" && scope === "case" ? "summary" : page).then(async () => {
+      render = Workspace.showPage(["sources", "connections", "import"].includes(page) && scope === "case" ? "summary" : page).then(async () => {
         if (request !== generation) return;
         for (const [selector, [left, top]] of Object.entries(snapshot.scroll || {})) { const node = document.querySelector(selector); if (node) { node.scrollLeft = left; node.scrollTop = top; } }
       });
     };
     const animate = options.animate !== false && !matchMedia("(prefers-reduced-motion: reduce)").matches;
-    document.documentElement.dataset.switchDirection = next === "case" ? "to-case" : "to-analysis";
+    // Zones are stacked in the menu: moving down the list slides the new area up from below.
+    const order = { analysis: 0, case: 1, structure: 2 }, from = document.documentElement.dataset.zone || "analysis";
+    const to = next === "case" ? "case" : ["sources", "connections", "import"].includes(page) ? "structure" : "analysis";
+    const down = order[to] >= order[from];
+    document.documentElement.dataset.switchDirection = down ? "down" : "up";
     try {
       if (animate && document.startViewTransition) { const transition = document.startViewTransition(update); await transition.updateCallbackDone; transition.finished.catch(() => {}); }
-      else { update(); if (animate) { const node = [...document.querySelectorAll("#workspace-home,.shell,#view-analysis")].find(node => !node.hidden); node?.animate([{ transform: `translateX(${next === "case" ? "100%" : "-12%"})`, opacity: .3 }, { transform: "translateX(0)", opacity: 1 }], { duration: 220, easing: "ease-out" }); } }
+      else { update(); if (animate) { const node = [...document.querySelectorAll("#workspace-home,.shell,#view-analysis")].find(node => !node.hidden); node?.animate([{ transform: `translateY(${down ? "32%" : "-32%"})`, opacity: .3 }, { transform: "translateY(0)", opacity: 1 }], { duration: 240, easing: "cubic-bezier(.2,.7,.2,1)" }); } }
       await render;
       if (request === generation && activeCase()) { activeCase().workspace.activeScope = scope; saveCases(); }
     } finally { if (request === generation) changing = false; }
@@ -188,7 +189,6 @@ window.WorkspaceContext = (() => {
   }
   const oldDetail = showDetail;
   showDetail = function(...args) { const result = oldDetail(...args); $("#ws-detail-save").hidden = scope === "case"; if (scope === "dataset") { const included = isIncluded(args[0]); $("#ws-detail-save").classList.toggle("event-in-case-action", included); $("#ws-detail-save").title = included ? "Este registro já está no Caso" : "Salvar no Caso"; } return result; };
-  for (const button of document.querySelectorAll("[data-workspace-scope]")) button.onclick = () => setScope(button.dataset.workspaceScope);
   const originalSave = saveCases;
   saveCases = function(...args) { if (initialized && !changing && !restoringCase) capture(); return originalSave(...args); };
   updateToggle();

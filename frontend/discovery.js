@@ -9,6 +9,7 @@
     ['behavior', 'fa-wand-magic-sparkles', 'Desvios', 'Combinações que passaram a se comportar de outra forma'],
     ['changes', 'fa-arrow-trend-up', 'Mudanças', 'Resultados que ganharam espaço em um intervalo'],
     ['threats', 'fa-shield-halved', 'Ameaças', 'Indícios locais por regras editáveis'],
+    ['compare', 'fa-code-compare', 'Comparar', 'Dois períodos lado a lado: o que ganhou ou perdeu espaço'],
     ['custom', 'fa-sliders', 'Meus gráficos', 'Monte e preserve suas próprias visualizações'],
   ];
   const savedMode = localStorage.getItem('analysis.mode');
@@ -90,7 +91,7 @@
     rail.innerHTML = '';
     for (const [id, icon, title] of modes) {
       const b = button('', () => { mode = id; localStorage.setItem('analysis.mode', id); renderDashboard(scope); }, 'discovery-mode');
-      b.innerHTML = `<i class="fas ${icon}" aria-hidden="true"></i><span>${title}</span>`;
+      b.innerHTML = `<i class="fas ${icon}" aria-hidden="true"></i><span>${title}</span>`; b.dataset.mode = id;
       b.title = title; b.setAttribute('aria-label', title); b.setAttribute('aria-pressed', String(mode === id)); rail.append(b);
     }
     const current = modes.find(m => m[0] === mode);
@@ -99,7 +100,7 @@
     $('#discovery-method').setAttribute('aria-label',`Como interpretar ${current[2]}`);
     panel.querySelector('.discovery-scope').textContent = `${scope === 'case' ? 'Registros salvos no caso' : 'Logs abertos'}${backendFilters().length ? ' · com filtros' : ' · sem filtros'}`;
     $('#btn-dash-add').hidden = mode !== 'custom';
-    $('#btn-dash-compact').hidden = ['patterns','behavior','changes','threats'].includes(mode);
+    $('#btn-dash-compact').hidden = ['patterns','behavior','changes','threats','compare'].includes(mode);
   }
   function usefulFields(profiles) {
     return profiles.filter(p => p.cardinality > 1 && !['timestamp','message','description','event_ref','id','raw'].includes(p.name) && p.kind !== 'time' && !/request.?id|trace.?id|correlation.?id/i.test(p.name))
@@ -135,6 +136,11 @@
     if (!scopeHasEvents(scope)) { grid.innerHTML = ''; empty(grid, 'Abra logs ou salve registros no caso para começar.'); return; }
     const current = () => version === generation && key === scopeKey(scope) && !$('#view-dashboard').hidden;
     try {
+      if (mode === 'compare') {
+        grid.innerHTML = ''; const host = el('div', 'discovery-compare'); grid.append(host);
+        await window.Workspace.renderCompare(host, current);
+        return;
+      }
       if(mode==='threats') {
         await window.Threats.render(grid,scope,{card,infoButton,isCurrent:current,load:()=>cached('threat_scan',analyticsRequest(scope),key)});
         if (current()) lastDashboardKey = activeDashboardKey;
@@ -474,7 +480,7 @@
   $('#btn-dash-refresh').onclick=()=>{ cache.clear(); profileKey=''; renderDashboard(state.analyticsScope); };
   const compactClick=$('#btn-dash-compact').onclick;
   $('#btn-dash-compact').onclick=e=>{ if(compactClick) compactClick(e); else {state.dashboardCompact=!state.dashboardCompact;renderDashboard();} };
-  window.Discovery = {applySelection, valueFilter, showExplanation, clearCache:()=>{revision++;cache.clear();}, capture:()=>({mode,showVolume,heat:{...heatChoice},cross:{...crossChoice}}), restore:saved=>{
+  window.Discovery = {applySelection, valueFilter, showExplanation, setMode:id=>{if(modes.some(m=>m[0]===id)){mode=id;localStorage.setItem('analysis.mode',id);}}, mode:()=>mode, modeLabel:()=>modes.find(m=>m[0]===mode)?.[2]||'', clearCache:()=>{revision++;cache.clear();}, capture:()=>({mode,showVolume,heat:{...heatChoice},cross:{...crossChoice}}), restore:saved=>{
     generation++;fieldRequest++;mode=modes.some(item=>item[0]===saved?.mode)?saved.mode:'overview';showVolume=saved?.showVolume!==false;
     const text=value=>typeof value==='string'?value:'';
     Object.assign(crossChoice,{row:text(saved?.cross?.row),column:text(saved?.cross?.column)});

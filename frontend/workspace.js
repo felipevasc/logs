@@ -11,7 +11,40 @@
     const signature = JSON.stringify(current);
     if (signature !== lastFilters) { history.push(previousSelection); if (history.length > 30) history.shift(); previousSelection = current; lastFilters = signature; cacheKey = ""; lastExploredKey = ""; }
   }
-  const titles = { summary: "Resumo", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos" };
+  const titles = { summary: "Resumo", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs" };
+  // Areas: Análise and Caso read the data; Estrutura holds what feeds it.
+  const STRUCTURE = new Set(["sources", "connections", "import"]);
+  const TIMELINE_GROUP = new Set(["timeline", "case-timeline", "case-trails", "journeys"]);
+  const ZONE_ORDER = { analysis: 0, case: 1, structure: 2 };
+  const lastZonePage = { analysis: "summary", case: "summary", structure: "sources" };
+  const lastGroupPage = { dataset: "case-timeline", case: "case-timeline" };
+  const zoneOf = (p = page) => STRUCTURE.has(p) ? "structure" : workspaceScope() === "case" ? "case" : "analysis";
+  function syncZone() {
+    const zone = zoneOf(), root = document.documentElement, previous = root.dataset.zone;
+    root.dataset.zone = zone; document.body.dataset.zone = zone;
+    document.querySelectorAll(".nav-pages [data-zones]").forEach(b => { b.hidden = !b.dataset.zones.split(" ").includes(zone); });
+    document.querySelectorAll(".zone-switch [data-zone]").forEach(b => { const on = b.dataset.zone === zone; b.classList.toggle("selected", on); b.setAttribute("aria-pressed", String(on)); });
+    // Moving between areas without changing the data slides the new area in, down or up the menu.
+    if (previous && previous !== zone && !window.WorkspaceContext?.changing && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      const down = ZONE_ORDER[zone] > ZONE_ORDER[previous];
+      requestAnimationFrame(() => [...document.querySelectorAll("#workspace-home,.shell,#view-analysis,#view-artifact-source")].find(n => !n.hidden)?.animate([{ transform: `translateY(${down ? "32%" : "-32%"})`, opacity: .3 }, { transform: "translateY(0)", opacity: 1 }], { duration: 260, easing: "cubic-bezier(.2,.7,.2,1)" }));
+    }
+  }
+  function renderPageTabs(next) {
+    const bar = $("#page-tabs");
+    if (!TIMELINE_GROUP.has(next)) { bar.hidden = true; bar.innerHTML = ""; return; }
+    const current = next === "timeline" ? "case-timeline" : next;
+    const tabs = [["case-timeline", "fa-timeline", "Linha do tempo"], ...(workspaceScope() === "case" ? [["case-trails", "fa-route", "Trilhas"]] : []), ["journeys", "fa-code-branch", "Possíveis trilhas"]];
+    bar.innerHTML = tabs.map(([id, icon, label]) => `<button type="button" role="tab" data-subpage="${id}" aria-selected="${id === current}" class="${id === current ? "selected" : ""}"><i class="fas ${icon}" aria-hidden="true"></i>${label}</button>`).join("");
+    bar.querySelectorAll("[data-subpage]").forEach(b => { b.onclick = () => showPage(b.dataset.subpage); });
+    bar.hidden = false;
+  }
+  async function goZone(zone) {
+    const target = lastZonePage[zone];
+    if (zone === "case") { if (workspaceScope() !== "case") await window.WorkspaceContext.setScope("case", { page: target }); else await showPage(target); return; }
+    if (workspaceScope() === "case") { await window.WorkspaceContext.setScope("dataset", { page: target }); return; }
+    await showPage(target);
+  }
   const fmtBytes = n => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${fmtNum(Math.ceil(n / 1000))} KB`;
   const pct = n => `${(n * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
   const localInput = t => { const d = new Date(t); return new Date(t - d.getTimezoneOffset() * 60000).toISOString().slice(0, 23); };
@@ -22,10 +55,13 @@
 
   function markPage(next) {
     page = next; document.body.dataset.page = next;
-    const navPage = next === "timeline" ? "case-timeline" : next;
+    const navPage = TIMELINE_GROUP.has(next) ? "case-timeline" : next;
+    if (TIMELINE_GROUP.has(next)) lastGroupPage[workspaceScope()] = next === "timeline" ? "case-timeline" : next;
+    lastZonePage[zoneOf(next)] = next;
+    syncZone(); renderPageTabs(next);
     document.querySelectorAll("[data-page]").forEach(b => { if (b.tagName === "BUTTON") { b.classList.toggle("selected", b.dataset.page === navPage); b.setAttribute("aria-current", b.dataset.page === navPage ? "page" : "false"); } });
     $("#ws-title").textContent = titles[next] || next;
-    $("#ws-reload").hidden = ["sources", "evidence", "case-timeline", "case-trails", "journeys"].includes(next) || !state.loaded;
+    $("#ws-reload").hidden = ["sources", "connections", "import", "evidence", "case-timeline", "case-trails", "journeys"].includes(next) || !state.loaded;
     $("#ws-clear-scope").hidden = !backendFilters().length || next === "evidence";
     updateCounts();
   }
@@ -35,8 +71,11 @@
     $("#ws-subtitle").textContent = page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${fmtNum(state.total)} registros do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${fmtNum(state.total)} eventos${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
   }
   async function showPage(next) {
+    window.RemoteSources?.unmount?.();
+    // Comparar lives in Explorar → Descobrir.
+    if (next === "compare") { window.Discovery?.setMode?.("compare"); state.activeDatasetTab = "dashboard"; next = "explore"; }
     if (next === "case-timeline" && workspaceScope() === "case" && activeCase()?.workspace?.timelineMode === "volume") next = "timeline";
-    if (workspaceScope() === "case" && next === "sources") { await window.WorkspaceContext.setScope("dataset", { page: "sources" }); return; }
+    if (workspaceScope() === "case" && STRUCTURE.has(next)) { await window.WorkspaceContext.setScope("dataset", { page: next }); return; }
     if (workspaceScope() === "dataset" && ["evidence", "case-trails"].includes(next) && window.WorkspaceContext && !window.WorkspaceContext.changing) { await window.WorkspaceContext.setScope("case", { page: next }); return; }
     markPage(next); closeDrawer();
     if (next === "case-timeline" && workspaceScope() === "case") {
@@ -62,6 +101,8 @@
       return;
     }
     switchView("workspace"); home.hidden = false;
+    if (next === "import") { empty.hidden = false; content.hidden = true; return; }
+    if (next === "connections") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; window.RemoteSources?.mount(content); return; }
     if (next === "journeys") { empty.hidden = true; content.hidden = false; await window.Journeys.render(content); return; }
     empty.hidden = workspaceScope() === "case" || state.loaded || next === "evidence" || (next === "sources" && sourceList.length > 0);
     content.hidden = !empty.hidden;
@@ -69,7 +110,6 @@
     if (next === "evidence") { renderEvidence(); return; }
     if (next === "case-trails") { window.CaseTrails.render(content, activeCase()); return; }
     if (next === "sources") { await renderSources(); return; }
-    if (next === "compare") { await renderCompare(); return; }
     if (next === "timeline" || next === "case-timeline") { await timeline.load(); return; }
     await renderSummary();
   }
@@ -154,21 +194,31 @@
     onMode: mode => { setAnalysisView(mode === "table" ? "timeline-table" : mode === "horizontal" ? "timeline" : "vtimeline"); if (activeCase()) { activeCase().workspace.analysisView = state.analysisView; activeCase().workspace.timelineMode = mode; } showPage("case-timeline"); },
   });
   function undo() { const previous = history.pop(); if (!previous) return; Object.assign(state, previous); state.page = 0; previousSelection = structuredClone(previous); lastFilters = JSON.stringify(previous); $("#quick-search").value = state.quick; renderChips(); syncCurrentSavedFilter(); refresh(); }
-  async function renderCompare() {
-    const version = ++serial, contextKey = sourceKey(); loading();
+  // Comparar is a mode of Explorar → Descobrir: it renders into the host it is given.
+  let compareHost = null, compareCurrent = () => false;
+  async function renderCompare(host, isCurrent) {
+    compareHost = host; compareCurrent = isCurrent;
+    const contextKey = sourceKey();
+    host.innerHTML = '<div class="ws-loading"><i class="fas fa-circle-notch spin"></i>Lendo o período…</div>';
     try {
-      const data = await getOverview(); if (version !== serial || contextKey !== sourceKey() || page !== "compare") return;
-      if (data.start == null || data.start === data.end) { content.innerHTML = '<div class="quiet-empty">Carregue eventos com horários distintos para comparar períodos.</div>'; return; }
+      const data = await getOverview(); if (!isCurrent() || contextKey !== sourceKey()) return;
+      if (data.start == null || data.start === data.end) { host.innerHTML = '<div class="quiet-empty">Carregue eventos com horários distintos para comparar períodos.</div>'; return; }
       const middle = data.start + Math.floor((data.end - data.start) / 2) + 1;
-      content.innerHTML = `<section class="ws-card"><form id="ws-compare-form" class="compare-form"><div class="compare-period"><label>Período de referência</label><div><input id="ws-before-start" aria-label="Início da referência" type="datetime-local" required value="${localInput(data.start)}"><input id="ws-before-end" aria-label="Fim da referência" type="datetime-local" required value="${localInput(middle - 1)}"></div></div><div class="compare-period"><label>Período de análise</label><div><input id="ws-after-start" aria-label="Início da análise" type="datetime-local" required value="${localInput(middle)}"><input id="ws-after-end" aria-label="Fim da análise" type="datetime-local" required value="${localInput(data.end)}"></div></div><button class="btn primary" type="submit">Comparar</button></form></section><div id="ws-comparison"></div>`;
+      host.innerHTML = `<section class="ws-card"><form id="ws-compare-form" class="compare-form"><div class="compare-period"><label>Período de referência</label><div><input id="ws-before-start" aria-label="Início da referência" type="datetime-local" required value="${localInput(data.start)}"><input id="ws-before-end" aria-label="Fim da referência" type="datetime-local" required value="${localInput(middle - 1)}"></div></div><div class="compare-period"><label>Período de análise</label><div><input id="ws-after-start" aria-label="Início da análise" type="datetime-local" required value="${localInput(middle)}"><input id="ws-after-end" aria-label="Fim da análise" type="datetime-local" required value="${localInput(data.end)}"></div></div><button class="btn primary" type="submit">Comparar</button></form></section><div id="ws-comparison"></div>`;
       $("#ws-compare-form").onsubmit = async e => { e.preventDefault(); await runComparison(); };
-      for (const input of content.querySelectorAll('input[type="datetime-local"]')) input.step = "0.001";
+      for (const input of host.querySelectorAll('input[type="datetime-local"]')) input.step = "0.001";
+      host.onclick = event => {
+        const b = event.target.closest('[data-action="change"]'); if (!b || !comparison) return;
+        const c = comparison.changes[+b.dataset.index], period = c.after ? comparisonPeriods.after : comparisonPeriods.before;
+        state.activeDatasetTab = "table";
+        applyFilters([...state.filters.filter(f => f.column !== "timestamp"), { column: "message", op: "pattern", value: c.pattern }, { column: "timestamp", op: "between", value: String(period.start), value2: String(period.end) }], true, "explore");
+      };
       await runComparison();
-    } catch (e) { if (version === serial && contextKey === sourceKey() && page === "compare") failed(e); }
+    } catch (e) { if (isCurrent() && contextKey === sourceKey()) host.innerHTML = note(String(e)); }
   }
   let comparison = null, comparisonPeriods = null;
   async function runComparison() {
-    const contextKey = sourceKey(), version = serial;
+    const contextKey = sourceKey();
     const area = $("#ws-comparison"), button = $("#ws-compare-form button");
     const before = { start: +new Date($("#ws-before-start").value), end: +new Date($("#ws-before-end").value) };
     const after = { start: +new Date($("#ws-after-start").value), end: +new Date($("#ws-after-end").value) };
@@ -176,9 +226,9 @@
     button.disabled = true; area.innerHTML = '<div class="ws-loading"><i class="fas fa-circle-notch spin"></i>Comparando…</div>';
     try {
       const res = await api("compare_periods", { ...analyticsRequest(workspaceScope()), filters: backendFilters().filter(f => f.column !== "timestamp"), before, after });
-      if (page !== "compare" || version !== serial || contextKey !== sourceKey()) return; comparison = res; comparisonPeriods = { before, after };
+      if (!compareCurrent() || contextKey !== sourceKey() || !area.isConnected) return; comparison = res; comparisonPeriods = { before, after };
       area.innerHTML = `<div class="metric-grid">${metric("Referência", fmtNum(res.before_total), "eventos")}${metric("Análise", fmtNum(res.after_total), "eventos")}${metric("Erros · referência", pct(res.before_errors / Math.max(1, res.before_total)), fmtNum(res.before_errors) + " erros", "error")}${metric("Erros · análise", pct(res.after_errors / Math.max(1, res.after_total)), fmtNum(res.after_errors) + " erros", "error")}</div>${res.limited ? note("Limite de padrões atingido. Refine os períodos para detalhar as diferenças.") : ""}${!res.before_total || !res.after_total ? note("Um dos períodos não contém eventos. Revise a cobertura antes de interpretar as diferenças.") : ""}<section class="ws-card"><div class="card-heading"><h2>O que mudou</h2><span>Participação no volume de cada período</span></div><table class="ws-table"><thead><tr><th>Padrão</th><th class="num">Referência</th><th class="num">Análise</th><th class="num">Diferença</th></tr></thead><tbody>${res.changes.map((c, i) => `<tr><td><button class="pattern-button" data-action="change" data-index="${i}">${esc(c.pattern)}</button>${!c.before && c.after ? '<div class="pattern-meta">Aparece somente no período de análise</div>' : ""}</td><td class="num">${fmtNum(c.before)}<div class="pattern-meta">${pct(c.before_rate)}</div></td><td class="num">${fmtNum(c.after)}<div class="pattern-meta">${pct(c.after_rate)}</div></td><td class="num ${c.delta > 0 ? "delta-plus" : "delta-minus"}">${c.delta > 0 ? "+" : ""}${(c.delta * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} pp</td></tr>`).join("")}</tbody></table></section>`;
-    } catch (e) { if (version === serial && contextKey === sourceKey() && area.isConnected) area.innerHTML = note(String(e)); } finally { button.disabled = false; }
+    } catch (e) { if (compareCurrent() && contextKey === sourceKey() && area.isConnected) area.innerHTML = note(String(e)); } finally { button.disabled = false; }
   }
   async function renderSources() {
     const version = ++serial, contextKey = sourceKey();
@@ -484,7 +534,9 @@
   $("#case-timeline-volume").onclick = () => { if (activeCase()) activeCase().workspace.timelineMode = "volume"; saveCases(); showPage("timeline"); };
   $("#ws-empty-open").onclick = () => openFiles(); $("#ws-folder").onclick = () => openFiles(true);
   $("#ws-windows").onclick = () => { home.hidden = true; switchView("source"); showSourceMode("load"); setSource("eventlog"); };
-  $("#ws-preferences").onclick = () => openSettings();
+  document.querySelectorAll(".zone-switch [data-zone]").forEach(b => { b.onclick = () => goZone(b.dataset.zone); });
+  // The Linha do tempo menu reopens the section last used in this area.
+  $('.nav-pages [data-page="case-timeline"]').onclick = () => showPage(lastGroupPage[workspaceScope()] || "case-timeline");
   $("#ws-reload").onclick = async () => { cacheKey = ""; timeline.invalidate(); window.Security?.invalidate(); await showPage(page); };
   $("#ws-clear-scope").onclick = () => { state.filters = []; state.quick = ""; $("#quick-search").value = ""; state.page = 0; renderChips(); syncCurrentSavedFilter(); refresh().then(() => showPage(page)); };
   $("#ws-export").onclick = openExport; $("#ws-export-close").onclick = () => { $("#ws-export-modal").hidden = true; }; $("#ws-export-save").onclick = exportFile;
@@ -492,7 +544,7 @@
   $("#ws-export-modal").onclick = e => { if (e.target.id === "ws-export-modal") e.target.hidden = true; };
   $("#btn-load").onclick = async () => { await loadData(); if (state.loaded) { await loaded(); await showPage("summary"); } };
   $("#btn-merge").onclick = async () => { await loadData(null, { merge: true }); if (state.loaded) { await loaded(); await showPage("summary"); } };
-  $("#workbar-cancel").onclick = async () => { await api("cancel_operation", {}, { silent: true }); state.refreshVersion++; serial++; finishOperation("Operação cancelada"); };
+  $("#workbar-cancel").onclick = async () => { window.Tasks?.cancelAll(); await api("cancel_operation", {}, { silent: true }); state.refreshVersion++; serial++; finishOperation("Operação cancelada"); };
   $("#tabbtn-group").innerHTML = '<i class="fas fa-layer-group"></i> Agrupar';
   $("#tabbtn-dashboard").innerHTML = '<i class="fas fa-chart-line"></i> Gráficos';
   $("#tabbtn-cube").innerHTML = '<i class="fas fa-table-cells"></i> Tabela dinâmica';
@@ -539,7 +591,7 @@
     timeline.restore({ range: { start: start - pad, end: end + pad }, history: [] });
   }
   window.Workspace = {
-    loaded, showPage, saveEvent, applyFilters, applyRange, contextAround, search, sourceKey, focusTimeline,
+    loaded, showPage, saveEvent, applyFilters, applyRange, contextAround, search, sourceKey, focusTimeline, syncZone, renderCompare,
     overview: () => getOverview(),
     openItem: itemId => { const item=activeCase()?.items?.find(item=>item.id===itemId);if(item?.rows?.length)showDetail(item.rows[0],item.sourceSpec); },
     page: () => page,

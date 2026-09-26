@@ -230,8 +230,7 @@ window.Journeys = (() => {
     view.from = from ?? period?.min ?? null; view.to = to ?? period?.max ?? null;
     await window.Workspace.showPage("journeys");
   }
-  const nav = button("", () => open(), ""); nav.dataset.page = "journeys"; nav.innerHTML = '<i class="fas fa-code-branch" aria-hidden="true"></i>Possíveis trilhas'; document.querySelector('.nav-pages [data-page="case-timeline"]').after(nav);
-  const updateNavigation = () => { nav.hidden = false; const authored = document.querySelector('.nav-pages [data-page="case-trails"]'); if (globalScope() === "case" && authored) authored.after(nav); else document.querySelector('.nav-pages [data-page="case-timeline"]').after(nav); }; document.addEventListener("workspace-context-change", updateNavigation); updateNavigation();
+  // Possíveis trilhas is a section of the Linha do tempo menu (tabs in the top bar).
   const oldDetail = showDetail;
   showDetail = function(event, ...args) { drawerSource = { event, scope: globalScope() }; return oldDetail(event, ...args); };
   if (typeof caseTimelineCallbacks !== "undefined") caseTimelineCallbacks.detail = event => { showDetail(event); drawerSource = { event, scope: "case" }; };
