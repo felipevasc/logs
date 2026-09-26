@@ -401,6 +401,22 @@
       "summary": "{@parent_process} iniciou {@process}"
     },
     {
+      "id": "exec.browser-child",
+      "name": "Navegador iniciou um interpretador",
+      "description": "Um navegador criou um shell ou interpretador de scripts, padrão de exploração por página maliciosa (drive-by).",
+      "severity": "high",
+      "attack": [
+        "T1203",
+        "T1059"
+      ],
+      "kind": "single",
+      "where": "@parent_process:/(^|[\\\\/])(iexplore|chrome|firefox|msedge|opera|brave|safari)(\\.exe)?$/ @process:/(^|[\\\\/])(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|bash|sh)(\\.exe)?$/",
+      "by": [
+        "@host"
+      ],
+      "summary": "{@parent_process} iniciou {@process} em {@host}"
+    },
+    {
       "id": "exec.lolbin",
       "name": "Binário do sistema usado para executar código",
       "description": "Uso de rundll32, regsvr32, mshta, certutil ou msbuild com padrões de execução remota ou decodificação.",
@@ -487,6 +503,21 @@
         "@user"
       ],
       "summary": "Replicação de diretório solicitada por {@user}"
+    },
+    {
+      "id": "cred.pth",
+      "name": "Possível pass-the-hash",
+      "description": "Logon do tipo 9 (NewCredentials) pelo processo seclogo, padrão de overpass-the-hash com Mimikatz. O uso legítimo de runas /netonly produz o mesmo evento; confirme o usuário e o processo.",
+      "severity": "high",
+      "attack": [
+        "T1550.002"
+      ],
+      "kind": "single",
+      "where": "@action:logon LogonType:9 LogonProcessName:seclogo",
+      "by": [
+        "@host"
+      ],
+      "summary": "Logon com credenciais alternativas de {@user} em {@host}"
     },
     {
       "id": "linux.sudo.sensitive",

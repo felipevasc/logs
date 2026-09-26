@@ -471,7 +471,7 @@ fn succeeded(result: &CallToolResult) -> bool {
 
 // ------------------------------------------------------------- parâmetros
 
-const FORMAT_IDS_DOC: &str = "Format id: auto, jsonl, syslog3164, syslog5424, apache, firewall, cef, leef, log4j, logfmt, csv, w3c, text, wildfly or custom:<name>. Use list_formats to see the available ids.";
+const FORMAT_IDS_DOC: &str = "Format id: auto, jsonl, syslog3164, syslog5424, apache, firewall, cef, leef, log4j, logfmt, csv, w3c, zeek, auditd, text, wildfly or custom:<name>. Use list_formats to see the available ids.";
 const FILTERS_DOC: &str = "Filters to apply (AND semantics). Each filter: {column, op, value, value2?}. Ops: contains, not_contains, equals, not_equals, equals_exact, not_equals_exact, starts_with, regex, gt, gte, lt, lte, between (uses value2 as upper bound), empty, not_empty. Exact equality preserves case and whitespace. Special column \"_all\" matches the whole raw line. For the timestamp column, gt/gte/lt/lte/between accept epoch ms or ISO text.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -479,7 +479,7 @@ pub struct LoadFileParams {
     /// Absolute path of the log file to load.
     pub path: String,
     #[schemars(
-        description = "Format id: auto, jsonl, syslog3164, syslog5424, apache, firewall, cef, leef, log4j, logfmt, csv, w3c, text, wildfly or custom:<name>. Use list_formats to see the available ids."
+        description = "Format id: auto, jsonl, syslog3164, syslog5424, apache, firewall, cef, leef, log4j, logfmt, csv, w3c, zeek, auditd, text, wildfly or custom:<name>. Use list_formats to see the available ids."
     )]
     pub format: String,
     /// If true, merge with the currently loaded source instead of replacing it.

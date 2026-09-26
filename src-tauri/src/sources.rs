@@ -92,7 +92,7 @@ const SOURCE_KEYS: &[&str] = &[
     "host.name",
     "resource.service.name",
 ];
-const MSG_KEYS: &[&str] = &["message", "msg", "log", "body", "text"];
+const MSG_KEYS: &[&str] = &["message", "msg", "log", "body", "text", "displayMessage"];
 
 fn take_key(map: &mut Map<String, Value>, keys: &[&str]) -> Option<Value> {
     // An object/null in an alias must not hide a usable scalar alias.
@@ -201,11 +201,139 @@ fn event_from_json(input: Map<String, Value>, raw: &str) -> Event {
             .map(|s| s.to_string())
             .unwrap_or_else(|| v.to_string());
     }
+    ev.fields = map;
+    describe_known_json(&mut ev);
     if ev.message.is_empty() {
         ev.message = raw.chars().take(500).collect();
     }
-    ev.fields = map;
     ev
+}
+
+fn field_text(ev: &Event, key: &str) -> Option<String> {
+    ev.fields.get(key).and_then(|v| match v {
+        Value::String(s) if !s.is_empty() && s != "-" => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    })
+}
+
+/// Readable message, code and level for well-known JSON families whose
+/// records carry no message: CloudTrail, Suricata EVE, Zeek, Okta, GCP and
+/// Kubernetes audit. Original fields are kept.
+fn describe_known_json(ev: &mut Event) {
+    let synthesized = ev.message.is_empty();
+    // AWS CloudTrail: eventID is a UUID; the operation is eventName.
+    if let (Some(source), Some(name)) = (field_text(ev, "eventSource"), field_text(ev, "eventName")) {
+        if !ev.code.is_empty() && !ev.fields.contains_key("eventID") {
+            ev.fields.insert("eventID".into(), Value::from(ev.code.clone()));
+        }
+        ev.code = name.clone();
+        if ev.source.is_empty() {
+            ev.source = source.trim_end_matches(".amazonaws.com").to_string();
+        }
+        let who = field_text(ev, "userIdentity.userName")
+            .or_else(|| field_text(ev, "userIdentity.arn"))
+            .or_else(|| field_text(ev, "userIdentity.type"))
+            .unwrap_or_default();
+        let from = field_text(ev, "sourceIPAddress").unwrap_or_default();
+        if let Some(error) = field_text(ev, "errorCode") {
+            ev.level = "Aviso".into();
+            if synthesized {
+                ev.message = format!("{name} negado ({error}) · {who} · {from}");
+            }
+        } else if synthesized {
+            ev.message = format!("{name} · {who} · {from}");
+        }
+        return;
+    }
+    // Suricata EVE
+    if let Some(kind) = field_text(ev, "event_type") {
+        if let Some(signature) = field_text(ev, "alert.signature") {
+            ev.message = signature;
+            if let Some(id) = field_text(ev, "alert.signature_id") {
+                ev.code = id;
+            }
+            ev.level = match field_text(ev, "alert.severity").as_deref() {
+                Some("1") => "Erro",
+                Some("2") => "Aviso",
+                _ => "Informação",
+            }
+            .into();
+        } else if synthesized {
+            let src = field_text(ev, "src_ip").unwrap_or_default();
+            let dst = field_text(ev, "dest_ip").unwrap_or_default();
+            let detail = field_text(ev, "dns.rrname")
+                .or_else(|| field_text(ev, "http.hostname").map(|h| format!("{h}{}", field_text(ev, "http.url").unwrap_or_default())))
+                .or_else(|| field_text(ev, "tls.sni"))
+                .unwrap_or_default();
+            ev.message = format!("{kind} {src} → {dst} {detail}").trim().to_string();
+        }
+        if ev.source.is_empty() {
+            ev.source = "suricata".into();
+        }
+        if ev.code.is_empty() {
+            ev.code = kind;
+        }
+        return;
+    }
+    // Zeek (JSON or TSV converted to JSON)
+    if let (Some(orig), Some(resp)) = (field_text(ev, "id.orig_h"), field_text(ev, "id.resp_h")) {
+        if synthesized {
+            let detail = field_text(ev, "query")
+                .or_else(|| field_text(ev, "host").map(|h| format!("{h}{}", field_text(ev, "uri").unwrap_or_default())))
+                .or_else(|| field_text(ev, "server_name"))
+                .or_else(|| field_text(ev, "service"))
+                .unwrap_or_default();
+            let port = field_text(ev, "id.resp_p").map(|p| format!(":{p}")).unwrap_or_default();
+            let proto = field_text(ev, "proto").unwrap_or_default();
+            ev.message = format!("{orig} → {resp}{port} {proto} {detail}").trim().to_string();
+        }
+        if ev.source.is_empty() {
+            ev.source = "zeek".into();
+        }
+        return;
+    }
+    // Okta System Log
+    if let Some(kind) = field_text(ev, "eventType") {
+        if ev.code.is_empty() || ev.fields.contains_key("uuid") {
+            ev.code = kind.clone();
+        }
+        if ev.source.is_empty() {
+            ev.source = "okta".into();
+        }
+        if field_text(ev, "outcome.result").is_some_and(|r| r.eq_ignore_ascii_case("FAILURE")) && ev.level == "Informação" {
+            ev.level = "Aviso".into();
+        }
+        return;
+    }
+    // Google Cloud audit logs
+    if let Some(method) = field_text(ev, "protoPayload.methodName") {
+        if ev.code.is_empty() {
+            ev.code = method.clone();
+        }
+        if synthesized {
+            let who = field_text(ev, "protoPayload.authenticationInfo.principalEmail").unwrap_or_default();
+            ev.message = format!("{method} · {who}");
+        }
+        return;
+    }
+    // Kubernetes audit
+    if let (Some(verb), Some(stage)) = (field_text(ev, "verb"), field_text(ev, "stage")) {
+        let _ = stage;
+        if synthesized {
+            let resource = field_text(ev, "objectRef.resource").unwrap_or_default();
+            let name = field_text(ev, "objectRef.name").map(|n| format!("/{n}")).unwrap_or_default();
+            let who = field_text(ev, "user.username").unwrap_or_default();
+            ev.message = format!("{verb} {resource}{name} · {who}");
+        }
+        if ev.code.is_empty() {
+            ev.code = verb;
+        }
+        if field_text(ev, "responseStatus.code").is_some_and(|c| c.starts_with('4') || c.starts_with('5')) {
+            ev.level = "Aviso".into();
+        }
+    }
 }
 
 fn event_from_text(line: &str) -> Event {
@@ -457,6 +585,221 @@ fn parse_custom(line: &str, re: &regex::Regex) -> Option<Event> {
     Some(ev)
 }
 
+/// Several objects on consecutive lines (JSONL) rather than one document.
+fn looks_like_jsonl(bytes: &[u8]) -> bool {
+    let Some(nl) = memchr::memchr(b'\n', bytes) else { return false };
+    bytes[nl + 1..]
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'{')
+        && serde_json::from_slice::<Value>(&bytes[..nl]).is_ok()
+}
+
+const ENVELOPE_KEYS: &[&str] = &[
+    "records", "value", "data", "events", "items", "logs", "entries", "results", "hits", "rows",
+    "messages", "alerts", "logevents", "findings", "activities", "signins", "detections", "auditlogs",
+];
+
+/// Offset of the records array inside a JSON document such as
+/// `{"Records":[...]}` (CloudTrail), `{"value":[...]}` (Azure, Graph) or
+/// `{"hits":{"hits":[...]}}` (Elasticsearch export).
+pub(crate) fn json_envelope_array(bytes: &[u8]) -> Option<usize> {
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace() && *b != 0xef && *b != 0xbb && *b != 0xbf)?;
+    if bytes[start] != b'{' {
+        return None;
+    }
+    envelope_in_object(bytes, start, 0)
+}
+
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn read_json_string(bytes: &[u8], i: usize) -> Option<(String, usize)> {
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => return Some((String::from_utf8_lossy(&bytes[i + 1..j]).into_owned(), j + 1)),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Skips one JSON value starting at `i`; returns the index after it.
+fn skip_json_value(bytes: &[u8], i: usize) -> Option<usize> {
+    let i = skip_ws(bytes, i);
+    match bytes.get(i)? {
+        b'"' => read_json_string(bytes, i).map(|(_, end)| end),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'"' => {
+                        j = read_json_string(bytes, j)?.1;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => {
+            let mut j = i;
+            while j < bytes.len() && !matches!(bytes[j], b',' | b'}' | b']') {
+                j += 1;
+            }
+            Some(j)
+        }
+    }
+}
+
+fn envelope_in_object(bytes: &[u8], open: usize, depth: usize) -> Option<usize> {
+    if depth > 2 {
+        return None;
+    }
+    let mut i = skip_ws(bytes, open + 1);
+    let limit = bytes.len().min(open + 64 * 1024 * 1024);
+    while i < limit {
+        if bytes[i] == b'}' {
+            return None;
+        }
+        let (key, after) = read_json_string(bytes, i)?;
+        i = skip_ws(bytes, after);
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_ws(bytes, i + 1);
+        let known = ENVELOPE_KEYS.contains(&key.to_ascii_lowercase().as_str());
+        match bytes.get(i)? {
+            b'[' if known => {
+                let first = skip_ws(bytes, i + 1);
+                if bytes.get(first) == Some(&b'{') {
+                    return Some(i);
+                }
+            }
+            b'{' if known => {
+                if let Some(found) = envelope_in_object(bytes, i, depth + 1) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+        i = skip_ws(bytes, skip_json_value(bytes, i)?);
+        if bytes.get(i) == Some(&b',') {
+            i = skip_ws(bytes, i + 1);
+        }
+    }
+    None
+}
+
+/// Zeek TSV: `#fields` header, `-` unset and `(empty)` values.
+fn parse_zeek(line: &str, header: &[String]) -> Option<Event> {
+    if header.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut map = Map::new();
+    for (key, value) in header.iter().zip(line.split('\t')) {
+        if value == "-" || value == "(empty)" || value.is_empty() {
+            continue;
+        }
+        let v = match value.parse::<f64>() {
+            Ok(n) if key == "ts" => serde_json::Number::from_f64(n).map(Value::Number).unwrap_or_else(|| Value::from(value)),
+            _ => Value::from(value),
+        };
+        map.insert(key.clone(), v);
+    }
+    let mut ev = event_from_json(map, line);
+    ev.raw = line.to_string();
+    Some(ev)
+}
+
+fn decode_hex_text(value: &str) -> Option<String> {
+    if value.len() < 4 || value.len() % 2 != 0 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..value.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&value[i..i + 2], 16).ok())
+        .map(|b| if b == 0 { b' ' } else { b })
+        .collect();
+    let text = String::from_utf8(bytes).ok()?;
+    text.chars().all(|c| !c.is_control()).then(|| text.trim().to_string())
+}
+
+/// Linux audit: `type=... msg=audit(epoch.ms:serial): key=value ... msg='k=v ...'`.
+fn parse_auditd(line: &str) -> Option<Event> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static KV: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let head = RE.get_or_init(|| regex::Regex::new(r"^(?:node=(\S+) )?type=(\S+) msg=audit\((\d+)(?:\.(\d+))?:(\d+)\):\s?(.*)$").unwrap());
+    let kv = KV.get_or_init(|| regex::Regex::new(r#"([A-Za-z0-9_\-]+)=("(?:[^"\\]|\\.)*"|'[^']*'|\S*)"#).unwrap());
+    let c = head.captures(line)?;
+    let mut ev = Event::empty();
+    ev.raw = line.to_string();
+    let seconds: i64 = c[3].parse().ok()?;
+    let millis: i64 = c.get(4).and_then(|m| m.as_str().get(..3)).and_then(|m| format!("{m:0<3}").parse().ok()).unwrap_or(0);
+    ev.timestamp = Some(seconds * 1000 + millis);
+    let kind = c[2].to_string();
+    ev.code = kind.clone();
+    ev.source = c.get(1).map(|m| m.as_str().to_string()).unwrap_or_else(|| "auditd".into());
+    ev.fields.insert("type".into(), Value::from(kind.clone()));
+    ev.fields.insert("audit_serial".into(), Value::from(c[5].to_string()));
+    let body = c[6].to_string();
+    let mut add = |text: &str, fields: &mut Map<String, Value>| {
+        for cap in kv.captures_iter(text) {
+            let key = cap[1].to_string();
+            let raw_value = &cap[2];
+            if key == "msg" && raw_value.starts_with('\'') {
+                continue;
+            }
+            let value = raw_value.trim_matches(['"', '\'']).to_string();
+            fields.entry(key).or_insert(Value::from(value));
+        }
+    };
+    add(&body, &mut ev.fields);
+    // USER_* records nest their details in msg='op=... acct=... res=...'.
+    if let Some(start) = body.find("msg='") {
+        if let Some(end) = body[start + 5..].find('\'') {
+            let inner = body[start + 5..start + 5 + end].to_string();
+            add(&inner, &mut ev.fields);
+            ev.message = format!("{kind} {inner}");
+        }
+    }
+    for key in ["proctitle", "cmd"] {
+        if let Some(decoded) = ev.fields.get(key).and_then(Value::as_str).and_then(decode_hex_text) {
+            ev.fields.insert("cmdline".into(), Value::from(decoded));
+        }
+    }
+    let failed = ev.fields.get("res").and_then(Value::as_str).is_some_and(|r| r.starts_with("fail"))
+        || ev.fields.get("success").and_then(Value::as_str) == Some("no");
+    ev.level = if failed { "Aviso" } else { "Informação" }.into();
+    if ev.message.is_empty() {
+        let what = ["cmdline", "exe", "comm", "name", "key"]
+            .iter()
+            .find_map(|k| ev.fields.get(*k).and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        ev.message = format!("{kind} {what}").trim().to_string();
+    }
+    Some(ev)
+}
+
 /// Inferência automática do formato pela amostra inicial do arquivo.
 fn detect_format(bytes: &[u8]) -> &'static str {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
@@ -469,6 +812,22 @@ fn detect_format(bytes: &[u8]) -> &'static str {
         let next = trimmed[1..].iter().find(|b| !b.is_ascii_whitespace());
         if matches!(next, Some(b'{') | Some(b']')) {
             return "jsonl";
+        }
+    }
+    if trimmed.first() == Some(&b'{') && !looks_like_jsonl(trimmed) && json_envelope_array(bytes).is_some() {
+        return "jsonl";
+    }
+    if trimmed.starts_with(b"#separator") || trimmed.starts_with(b"#fields\t") {
+        return "zeek";
+    }
+    {
+        let head: Vec<&[u8]> = trimmed.split(|&b| b == b'\n').take(20).filter(|l| !l.is_empty()).collect();
+        let audit = head
+            .iter()
+            .filter(|l| (l.starts_with(b"type=") || l.starts_with(b"node=")) && memchr::memmem::find(l, b"msg=audit(").is_some())
+            .count();
+        if !head.is_empty() && audit * 2 > head.len() {
+            return "auditd";
         }
     }
     let mut n = 0usize;
@@ -1680,6 +2039,8 @@ pub fn parse_line(
         "logfmt" => parse_logfmt(&text).unwrap_or_else(|| event_from_text(&text)),
         "csv" => parse_csv_line(&text, header).unwrap_or_else(|| event_from_text(&text)),
         "w3c" => parse_w3c(&text, header).unwrap_or_else(|| event_from_text(&text)),
+        "zeek" => parse_zeek(&text, header).unwrap_or_else(|| event_from_text(&text)),
+        "auditd" => parse_auditd(&text).unwrap_or_else(|| event_from_text(&text)),
         "custom" => match custom {
             Some(CustomParse::Regex(re)) => {
                 parse_custom(&text, re).unwrap_or_else(|| event_from_text(&text))
@@ -1835,6 +2196,7 @@ fn index_json_array(
     custom: Option<&CustomParse>,
     header: &[String],
     progress: Option<&dyn Fn(usize, usize)>,
+    envelope: bool,
 ) -> Result<(), String> {
     let mut stack = Vec::new();
     let mut quoted = false;
@@ -1899,7 +2261,8 @@ fn index_json_array(
         }
         match byte {
             b']' if !after_comma => {
-                if bytes[i + 1..].iter().any(|b| !b.is_ascii_whitespace()) {
+                // The rest of an envelope document follows the records array.
+                if !envelope && bytes[i + 1..].iter().any(|b| !b.is_ascii_whitespace()) {
                     return Err("Há conteúdo após o fim do array JSON.".into());
                 }
                 return Ok(());
@@ -1959,6 +2322,14 @@ pub fn index_file(
                 .map(|s| s.trim().to_string())
                 .collect();
         }
+    } else if fmt == "zeek" {
+        for line in mmap.split(|&b| b == b'\n').take(40) {
+            let l = String::from_utf8_lossy(line);
+            if let Some(rest) = l.trim_end().strip_prefix("#fields") {
+                header = rest.split('\t').filter(|f| !f.is_empty()).map(|f| f.to_string()).collect();
+                break;
+            }
+        }
     } else if fmt == "w3c" {
         for line in mmap.split(|&b| b == b'\n').take(20) {
             let l = String::from_utf8_lossy(line);
@@ -1989,11 +2360,16 @@ pub fn index_file(
     } else {
         0
     };
-    let array_start = (content_start..mmap.len())
-        .find(|&i| !mmap[i].is_ascii_whitespace())
-        .filter(|&i| fmt == "jsonl" && mmap[i] == b'[');
+    let first_byte = (content_start..mmap.len()).find(|&i| !mmap[i].is_ascii_whitespace());
+    let array_start = first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'[');
+    // A single document wrapping the records (CloudTrail, Azure, exports).
+    let envelope_start = first_byte
+        .filter(|&i| fmt == "jsonl" && mmap[i] == b'{' && !looks_like_jsonl(&mmap[i..]))
+        .and_then(|_| json_envelope_array(&mmap));
     if let Some(start) = array_start {
-        index_json_array(&mmap, start, &mut lines, custom.as_ref(), &header, progress)?;
+        index_json_array(&mmap, start, &mut lines, custom.as_ref(), &header, progress, false)?;
+    } else if let Some(start) = envelope_start {
+        index_json_array(&mmap, start, &mut lines, custom.as_ref(), &header, progress, true)?;
     } else {
         for (physical_line, nl) in memchr::memchr_iter(b'\n', &mmap).enumerate() {
             if physical_line % 2048 == 0 {
@@ -2006,7 +2382,7 @@ pub fn index_file(
                 raw
             };
             if !line.is_empty() {
-                let skip = (fmt == "csv" && first_line) || (fmt == "w3c" && line[0] == b'#');
+                let skip = (fmt == "csv" && first_line) || (matches!(fmt, "w3c" | "zeek") && line[0] == b'#');
                 if !skip {
                     push_meta(
                         &mut lines,
@@ -2151,15 +2527,18 @@ pub fn visit_channel(
         } else {
             EvtQueryChannelPath.0
         } | EvtQueryReverseDirection.0;
-        let query = Handle(
-            EvtQuery(None, PCWSTR(path.as_ptr()), PCWSTR::null(), flags).map_err(|e| {
-                if e.code().0 as u32 == 0x80070005 {
+        let query = match EvtQuery(None, PCWSTR(path.as_ptr()), PCWSTR::null(), flags) {
+            Ok(handle) => Handle(handle),
+            // Damaged or foreign exports are still readable by the portable parser.
+            Err(_) if file => return visit_evtx_file(channel, max_events, visit),
+            Err(e) => {
+                return Err(if e.code().0 as u32 == 0x80070005 {
                     "ELEVATION_REQUIRED".into()
                 } else {
                     e.message()
-                }
-            })?,
-        );
+                })
+            }
+        };
         let mut count = 0;
         let mut batch = [0isize; 64];
         while count < max_events {
@@ -2196,11 +2575,47 @@ pub fn visit_channel(
 }
 #[cfg(not(windows))]
 pub fn visit_channel(
-    _channel: &str,
-    _max_events: usize,
-    _visit: impl FnMut(Event) -> Result<(), String>,
+    channel: &str,
+    max_events: usize,
+    visit: impl FnMut(Event) -> Result<(), String>,
 ) -> Result<usize, String> {
-    Err("Leitura do Event Log só está disponível no Windows.".into())
+    if std::path::Path::new(channel).is_file() {
+        return visit_evtx_file(channel, max_events, visit);
+    }
+    Err("Canais do Event Log só podem ser lidos no Windows. Arquivos .evtx exportados funcionam em qualquer sistema.".into())
+}
+
+/// Exported .evtx files through a pure Rust parser (any operating system).
+/// Records that cannot be decoded are skipped and counted.
+pub fn visit_evtx_file(
+    path: &str,
+    max_events: usize,
+    mut visit: impl FnMut(Event) -> Result<(), String>,
+) -> Result<usize, String> {
+    let mut parser = evtx::EvtxParser::from_path(path).map_err(|e| format!("Não foi possível abrir o EVTX: {e}"))?;
+    let mut count = 0usize;
+    let mut skipped = 0usize;
+    for record in parser.records() {
+        crate::operations::check()?;
+        if count >= max_events {
+            break;
+        }
+        match record {
+            Ok(record) => match parse_event_xml(&record.data) {
+                Some(mut event) => {
+                    event.fields.insert("EventRecordID".into(), Value::from(record.event_record_id));
+                    visit(event)?;
+                    count += 1;
+                }
+                None => skipped += 1,
+            },
+            Err(_) => skipped += 1,
+        }
+    }
+    if count == 0 && skipped > 0 {
+        return Err(format!("Nenhum evento legível no EVTX ({skipped} registros com erro)."));
+    }
+    Ok(count)
 }
 
 #[cfg(windows)]
@@ -2229,7 +2644,6 @@ unsafe fn render_event_xml(h: windows::Win32::System::EventLog::EVT_HANDLE) -> O
     Some(String::from_utf16_lossy(&buf[..len]))
 }
 
-#[cfg(windows)]
 fn parse_event_xml(xml: &str) -> Option<Event> {
     let doc = roxmltree::Document::parse(xml).ok()?;
     let root = doc.root_element();

@@ -269,18 +269,26 @@ fn index_source_file(
     format: &str,
     app: Option<&AppHandle>,
 ) -> Result<sources::FileIndex, String> {
-    let extension = std::path::Path::new(path)
+    // Members of ZIP/TAR packages keep a stable virtual path (pacote.zip!/app.log).
+    let member = workspace::resolve_member(path)?;
+    let physical = member
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let extension = std::path::Path::new(&physical)
         .extension()
         .unwrap_or_default()
         .to_string_lossy()
         .to_lowercase();
     if extension == "evtx" {
-        return workspace::index_channel(path, usize::MAX);
+        let mut idx = workspace::index_channel(&physical, usize::MAX)?;
+        idx.parts[0].path = path.to_string();
+        return Ok(idx);
     }
     let expanded = if extension == "gz" {
-        Some(workspace::expand_gzip(std::path::Path::new(path))?)
+        Some(workspace::expand_gzip(std::path::Path::new(&physical))?)
     } else {
-        None
+        member.clone()
     };
     let index_path = expanded
         .as_ref()
@@ -960,7 +968,7 @@ fn list_formats() -> Vec<FormatInfo> {
 pub(crate) fn list_formats_impl() -> Vec<FormatInfo> {
     let mut v: Vec<FormatInfo> = [
         ("auto", "Automático (inferir)"),
-        ("jsonl", "JSON / Elastic (ECS)"),
+        ("jsonl", "JSON / JSONL (CloudTrail, Azure, Okta, Suricata, Elastic)"),
         ("syslog3164", "Syslog (RFC 3164)"),
         ("syslog5424", "Syslog (RFC 5424)"),
         ("apache", "Apache / Nginx (combined)"),
@@ -972,6 +980,8 @@ pub(crate) fn list_formats_impl() -> Vec<FormatInfo> {
         ("logfmt", "Logfmt (key=value)"),
         ("csv", "CSV (com cabeçalho)"),
         ("w3c", "IIS / W3C"),
+        ("zeek", "Zeek (TSV)"),
+        ("auditd", "Linux auditd"),
         ("text", "Texto puro"),
     ]
     .into_iter()
