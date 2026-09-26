@@ -377,6 +377,19 @@ window.CaseTimeline = (() => {
       shell.querySelector(".ct-group-action").textContent = `Agrupar ${selected.length} selecionados`;
       shell.querySelector(".ct-clear-action").hidden = !selected.length;
     };
+    // Pivots from a Case record to the same user, address, host or process anywhere.
+    const entityPivots = (entry, event) => {
+      const ev = entry.rows?.[0];
+      if (!ev || !window.EntityMenu || !window.QueryLang) return [];
+      const seen = new Set(), list = [];
+      for (const role of ["@user", "@src_ip", "@dst_ip", "@host", "@process"]) {
+        const value = window.QueryLang.fieldValue(ev, window.QueryLang.resolve(role));
+        if (!value || seen.has(value)) continue;
+        seen.add(value);
+        list.push({ icon: window.EntityMenu.icon(role), label: `${window.EntityMenu.label(role)}: ${trunc(value, 30)}`, onClick: () => window.EntityMenu.open(event.clientX, event.clientY, { column: role, value, first: entry.start, last: entry.end }) });
+      }
+      return list.length ? [{ icon: "fa-crosshairs", label: "Mesma entidade…", onClick: () => callbacks.menu(event.clientX, event.clientY, list) }] : [];
+    };
     const colorMenu = (entry, x, y) => callbacks.menu(x, y, COLORS.map((color, index) => ({
       icon: "fa-circle", label: ["Verde", "Azul", "Lilás", "Âmbar", "Coral", "Cinza"][index],
       onClick: () => {
@@ -600,6 +613,8 @@ window.CaseTimeline = (() => {
       node.oncontextmenu = event => {
         event.preventDefault(); selection.add(entry.id); syncSelection();
         const menu = [{ icon: "fa-eye", label: "Abrir detalhes", onClick: open },
+          ...(Number.isFinite(entry.start) && window.Workspace?.contextAround ? [{ icon: "fa-clock-rotate-left", label: "Contexto em todas as fontes (±5 min)", onClick: () => window.Workspace.contextAround(entry.start, Number.isFinite(entry.end) ? entry.end : entry.start) }] : []),
+          ...entityPivots(entry, event),
           { icon: "fa-comment-dots", label: "Adicionar nota aqui", onClick: () => { selection.clear(); selection.add(entry.id); openEditor("annotation", null, null, event.target?.closest("[data-marker-anchor]")?.dataset.markerAnchor || null); } },
           ...(config.annotations.length ? [{
             icon: "fa-link",

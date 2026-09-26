@@ -161,3 +161,22 @@ button.ct-table-title:hover { color: var(--accent); text-decoration: underline; 
 .ct-report-overview { background: #fff; color: #192b37; }
 .ct-report-overview>p { padding: 10px 16px; margin: 0; font-size: 11px; line-height: 1.6; color: #526575; }
 @media (max-width: 1050px) { .ct-data-table th:nth-child(1) { width: 151px; }.ct-data-table th:nth-child(4) { width: 62px; }.ct-data-table td,.ct-data-table th { padding: 8px; }.ct-table-time time { font-size: 9px; } }
+
+/* Optional lanes: one quiet strip per value, aligned with the bars above. */
+.tl-swim-button.active { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.tl-swims { position: relative; display: grid; gap: 7px; margin: 16px 0 0 47px; }
+.tl-swim-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; margin-bottom: 3px; }
+.tl-swim-label { min-width: 0; max-width: 70%; padding: 0; border: 0; background: none; color: var(--text-1); font-size: 11px; text-align: left; cursor: pointer; }
+.tl-swim-label span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-swim-label:hover:not(:disabled), .tl-swim-label:focus-visible { color: var(--text-0); text-decoration: underline; text-underline-offset: 3px; }
+.tl-swim-label:disabled { cursor: default; color: var(--text-2); }
+.tl-swim-head small { flex: none; color: var(--text-2); font: 10px var(--font-mono); font-variant-numeric: tabular-nums; }
+.tl-swim-head small b { color: var(--lv-erro); font-weight: 500; }
+.tl-swim-strip { display: block; width: 100%; height: 12px; border-radius: 3px; background: color-mix(in srgb, var(--border) 45%, transparent); cursor: pointer; }
+.tl-swim-strip rect { fill: var(--accent); }
+.tl-swim-strip rect.err { fill: var(--lv-erro); }
+.tl-swim-strip .tl-swim-sel { fill: color-mix(in srgb, var(--accent) 16%, transparent); opacity: 1; }
+.tl-swim.others .tl-swim-strip rect:not(.tl-swim-sel):not(.err) { fill: var(--text-2); }
+.tl-swim-note { margin: 0; color: var(--text-2); font-size: 10px; }
+.tl-swim-hover { position: absolute; z-index: 3; padding: 6px 9px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--bg-0); box-shadow: 0 10px 24px #0004; color: var(--text-0); font-size: 11px; white-space: nowrap; pointer-events: none; }
+@media (max-width: 700px) { .tl-swims { margin-left: 32px; } }
