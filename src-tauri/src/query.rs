@@ -29,6 +29,20 @@ pub struct PreparedFilter {
     num: Option<f64>,
     num2: Option<f64>,
     threat: Option<crate::threats::RuleMatcher>,
+    /// Compiled search expression (`op = "query"`).
+    expr: Option<crate::querylang::Expr>,
+    /// Lowercased values for `in` / `not_in`.
+    set: Option<std::collections::HashSet<String>>,
+    /// Networks for `cidr` / `not_cidr`.
+    nets: Vec<crate::querylang::IpNet>,
+}
+
+/// Values of an `in` filter: one per line (commas also separate).
+pub fn list_values(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(['\n', '\r', ','])
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
 pub fn prepare(filters: &[Filter]) -> Vec<PreparedFilter> {
@@ -43,17 +57,37 @@ pub(crate) fn prepare_with_threat_catalog(
         .iter()
         .map(|f| {
             let is_re = f.op == "regex";
+            let is_query = f.op == "query";
             PreparedFilter {
                 regex: is_re.then(|| regex::Regex::new(&f.value).ok()).flatten(),
-                needle_lower: f.value.to_lowercase(),
+                needle_lower: if is_query { String::new() } else { f.value.to_lowercase() },
                 num: value_as_num(&f.column, &f.value),
                 num2: value_as_num(&f.column, f.value2.as_deref().unwrap_or("")),
-                f: f.clone(),
                 threat: if f.op == "threat_rule" {
                     crate::threats::matcher(&f.value, catalog.cloned()).ok()
                 } else {
                     None
                 },
+                expr: is_query
+                    .then(|| {
+                        crate::querylang::compile_with(
+                            &f.value,
+                            &crate::querylang::Options { threats: catalog },
+                        )
+                        .ok()
+                    })
+                    .flatten(),
+                set: matches!(f.op.as_str(), "in" | "not_in")
+                    .then(|| list_values(&f.value).map(str::to_lowercase).collect()),
+                nets: if matches!(f.op.as_str(), "cidr" | "not_cidr") {
+                    list_values(&f.value)
+                        .flat_map(|v| v.split_whitespace())
+                        .filter_map(crate::querylang::IpNet::parse)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                f: f.clone(),
             }
         })
         .collect()
@@ -123,8 +157,25 @@ pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
                 .as_ref()
                 .is_some_and(|matcher| matcher.matches(ev));
     }
+    if f.op == "query" {
+        // An invalid expression was rejected by validation; never match silently.
+        return pf.expr.as_ref().is_some_and(|expr| expr.matches(ev));
+    }
     let col = f.column.as_str();
     let needle = pf.needle_lower.as_str();
+    if let Some(set) = &pf.set {
+        let hit = ev
+            .col_ref(col)
+            .is_some_and(|v| set.contains(&v.trim().to_lowercase()));
+        return (f.op == "in") == hit;
+    }
+    if matches!(f.op.as_str(), "cidr" | "not_cidr") {
+        let hit = ev
+            .col_ref(col)
+            .and_then(|v| crate::entities::parse_ip(&v))
+            .is_some_and(|ip| pf.nets.iter().any(|n| n.contains(ip)));
+        return (f.op == "cidr") == hit;
+    }
     if f.op == "pattern" {
         return crate::insights::pattern_of(&ev.message) == f.value;
     }
@@ -383,7 +434,7 @@ enum Tri {
     NeedEvent,
 }
 
-fn ci_contains_bytes(hay: &[u8], needle_lower: &[u8]) -> bool {
+pub(crate) fn ci_contains_bytes(hay: &[u8], needle_lower: &[u8]) -> bool {
     if !hay.is_ascii() || !needle_lower.is_ascii() {
         return String::from_utf8_lossy(hay)
             .to_lowercase()
@@ -413,9 +464,23 @@ fn ci_contains_bytes(hay: &[u8], needle_lower: &[u8]) -> bool {
     false
 }
 
-fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8]) -> Tri {
+fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8], enriched: bool) -> Tri {
     let f = &pf.f;
     let op = f.op.as_str();
+    if op == "query" {
+        let Some(expr) = &pf.expr else { return Tri::Fail };
+        // Catalog names/descriptions and derived fields are absent from the
+        // raw line; free text that may match them needs the parsed event.
+        if enriched {
+            return Tri::NeedEvent;
+        }
+        let escaped = memchr::memchr(b'\\', line).is_some();
+        return match expr.line_check(meta, line, escaped) {
+            Some(true) => Tri::Pass,
+            Some(false) => Tri::Fail,
+            None => Tri::NeedEvent,
+        };
+    }
     // Exact selection uses decoded field values, including whitespace and case.
     // Raw spans can contain JSON escapes or represent a normalized standard field.
     if matches!(op, "equals_exact" | "not_equals_exact" | "threat_rule") {
@@ -670,43 +735,123 @@ pub fn visit_indexed_matches(
     visit_indexed_prepared(idx, &pfs, codes, system, derived, visit);
 }
 
+/// Lines per parallel work unit. Batches keep memory bounded and results in order.
+const SCAN_CHUNK: usize = 8192;
+
+/// Scans the index in parallel chunks, calling `map` for each matching line
+/// (with the parsed event when one was needed) and `visit` in file order.
+pub(crate) fn scan_indexed<T: Send>(
+    idx: &FileIndex,
+    pfs: &[PreparedFilter],
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+    map: impl Fn(usize, &LineMeta, Option<Event>) -> T + Sync,
+    mut visit: impl FnMut(T),
+) {
+    let enriched: Vec<bool> = pfs
+        .iter()
+        .map(|pf| query_needs_enrichment(pf, codes, system, derived))
+        .collect();
+    let generation = crate::operations::current_generation();
+    let chunk = |from: usize, to: usize| -> Vec<T> {
+        let mut out = Vec::new();
+        for i in from..to {
+            if (i - from) % 2048 == 0 && crate::operations::cancelled_for(generation) {
+                break;
+            }
+            let meta = &idx.lines[i];
+            let line = line_bytes(idx, i);
+            let mut need = false;
+            let mut ok = true;
+            for (pf, enriched) in pfs.iter().zip(&enriched) {
+                match meta_check(pf, meta, line, *enriched) {
+                    Tri::Fail => {
+                        ok = false;
+                        break;
+                    }
+                    Tri::NeedEvent => need = true,
+                    Tri::Pass => {}
+                }
+            }
+            if !ok {
+                continue;
+            }
+            if need {
+                let ev = event_at(idx, i, codes, system, derived);
+                if pfs.iter().all(|pf| matches(&ev, pf)) {
+                    out.push(map(i, meta, Some(ev)));
+                }
+            } else {
+                out.push(map(i, meta, None));
+            }
+        }
+        out
+    };
+    let total = idx.lines.len();
+    if total <= SCAN_CHUNK * 2 || rayon::current_num_threads() <= 1 {
+        for item in chunk(0, total) {
+            visit(item);
+        }
+        return;
+    }
+    let batch = SCAN_CHUNK * rayon::current_num_threads() * 2;
+    let mut start = 0;
+    while start < total {
+        if crate::operations::cancelled() {
+            break;
+        }
+        let end = (start + batch).min(total);
+        let parts: Vec<Vec<T>> = (start..end)
+            .step_by(SCAN_CHUNK)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|from| chunk(from, (from + SCAN_CHUNK).min(end)))
+            .collect();
+        for part in parts {
+            for item in part {
+                visit(item);
+            }
+        }
+        start = end;
+    }
+}
+
 pub(crate) fn visit_indexed_prepared(
     idx: &FileIndex,
     pfs: &[PreparedFilter],
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-    mut visit: impl FnMut(usize),
+    visit: impl FnMut(usize),
 ) {
-    for (i, meta) in idx.lines.iter().enumerate() {
-        if i % 2048 == 0 && crate::operations::cancelled() {
-            break;
-        }
-        let line = line_bytes(idx, i);
-        let mut need = false;
-        let mut ok = true;
-        for pf in pfs {
-            match meta_check(pf, meta, line) {
-                Tri::Fail => {
-                    ok = false;
-                    break;
-                }
-                Tri::NeedEvent => need = true,
-                Tri::Pass => {}
-            }
-        }
-        if !ok {
-            continue;
-        }
-        if need {
-            let ev = event_at(idx, i, codes, system, derived);
-            if pfs.iter().all(|pf| matches(&ev, pf)) {
-                visit(i);
-            }
-        } else {
-            visit(i);
-        }
+    scan_indexed(idx, pfs, codes, system, derived, |i, _, _| i, visit);
+}
+
+/// Free text in a search expression may match code names/descriptions from
+/// the catalogs or derived fields, which are not part of the raw line.
+fn query_needs_enrichment(
+    pf: &PreparedFilter,
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> bool {
+    let Some(expr) = &pf.expr else { return false };
+    let mut needles = Vec::new();
+    expr.free_text_needles(&mut needles);
+    if needles.is_empty() {
+        return false;
     }
+    if !derived.is_empty() {
+        return true;
+    }
+    [codes, system].iter().any(|catalog| {
+        catalog.sources.values().flat_map(|m| m.values()).any(|info| {
+            let name = info.name.to_lowercase();
+            let description = info.description.to_lowercase();
+            needles.iter().any(|n| name.contains(n.as_str()) || description.contains(n.as_str()))
+        })
+    })
 }
 
 pub fn query_indexed(
@@ -1404,38 +1549,21 @@ pub fn stats_indexed(
 ) -> Stats {
     let pfs = prepare(filters);
     let mut matched: Vec<(Option<i64>, Cow<'static, str>)> = Vec::new();
-    for (i, meta) in idx.lines.iter().enumerate() {
-        if i % 2048 == 0 && crate::operations::cancelled() {
-            break;
-        }
-        let line = line_bytes(idx, i);
-        let mut need = false;
-        let mut ok = true;
-        for pf in &pfs {
-            match meta_check(pf, meta, line) {
-                Tri::Fail => {
-                    ok = false;
-                    break;
-                }
-                Tri::NeedEvent => need = true,
-                Tri::Pass => {}
-            }
-        }
-        if !ok {
-            continue;
-        }
-        if need {
-            let ev = event_at(idx, i, codes, system, derived);
-            if pfs.iter().all(|pf| matches(&ev, pf)) {
-                matched.push((ev.timestamp, Cow::Owned(ev.level)));
-            }
-        } else {
+    scan_indexed(
+        idx,
+        &pfs,
+        codes,
+        system,
+        derived,
+        |_, meta, ev| match ev {
+            Some(ev) => (ev.timestamp, Cow::Owned(ev.level)),
             // rótulo fixo da classe: sem String por linha
-            matched.push((
+            None => (
                 (meta.ts != 0).then_some(meta.ts),
                 Cow::Borrowed(crate::model::class_label(meta.level)),
-            ));
-        }
-    }
+            ),
+        },
+        |item| matched.push(item),
+    );
     stats_from(matched.iter().map(|(t, l)| (*t, l.as_ref())))
 }

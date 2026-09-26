@@ -80,6 +80,9 @@ impl Event {
             "description" => Some(self.description.clone()),
             "message" => Some(self.message.clone()),
             "raw" => Some(self.raw.clone()),
+            other if other.starts_with('@') && !self.fields.contains_key(other) => {
+                crate::entities::column_value(self, other).map(Cow::into_owned)
+            }
             other => self.fields.get(other).map(|v| match v {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -101,6 +104,9 @@ impl Event {
             "description" => Some(Cow::Borrowed(self.description.as_str())),
             "message" => Some(Cow::Borrowed(self.message.as_str())),
             "raw" => Some(Cow::Borrowed(self.raw.as_str())),
+            other if other.starts_with('@') && !self.fields.contains_key(other) => {
+                crate::entities::column_value(self, other)
+            }
             other => self.fields.get(other).map(|v| match v {
                 Value::String(s) => Cow::Borrowed(s.as_str()),
                 other => Cow::Owned(other.to_string()),

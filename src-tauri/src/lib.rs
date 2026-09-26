@@ -3,6 +3,7 @@ mod case_images;
 mod case_store;
 mod discovery;
 mod distinct;
+mod entities;
 mod event_preview;
 mod index_cache;
 mod insights;
@@ -11,6 +12,7 @@ mod mcp;
 mod model;
 mod operations;
 mod query;
+mod querylang;
 #[cfg(test)]
 mod regression_tests;
 mod remote;
@@ -2043,6 +2045,8 @@ pub fn run() {
                     }
                 });
             }
+            // Old parser caches and unused indexes do not accumulate on disk.
+            std::thread::spawn(index_cache::prune);
             // Servidor MCP embutido (loopback) para automação por agentes.
             if mcp_enabled {
                 let handle = app.handle().clone();

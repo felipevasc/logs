@@ -86,14 +86,58 @@ pub struct Selection<'a> {
     system: &'a CodesConfig,
     derived: &'a [CompiledDerived],
 }
+/// Materializes indexed events in parallel batches while yielding them in order.
+struct ParallelEvents<'a> {
+    idx: &'a sources::FileIndex,
+    ids: &'a [usize],
+    next: usize,
+    buffer: std::collections::VecDeque<Event>,
+    codes: &'a CodesConfig,
+    system: &'a CodesConfig,
+    derived: &'a [CompiledDerived],
+}
+impl Iterator for ParallelEvents<'_> {
+    type Item = Event;
+    fn next(&mut self) -> Option<Event> {
+        use rayon::prelude::*;
+        if self.buffer.is_empty() {
+            if self.next >= self.ids.len() || crate::operations::cancelled() {
+                return None;
+            }
+            let end = (self.next + 4096).min(self.ids.len());
+            let (idx, codes, system, derived) = (self.idx, self.codes, self.system, self.derived);
+            let batch: Vec<Event> = self.ids[self.next..end]
+                .par_iter()
+                .map(|&i| sources::event_at(idx, i, codes, system, derived))
+                .collect();
+            self.buffer.extend(batch);
+            self.next = end;
+        }
+        self.buffer.pop_front()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.ids.len() - self.next + self.buffer.len();
+        (0, Some(left))
+    }
+}
+
 impl Selection<'_> {
+    pub fn ids(&self) -> &[usize] {
+        &self.ids
+    }
     pub fn iter(&self) -> Box<dyn Iterator<Item = Event> + '_> {
         match self.source {
             SourceData::Indexed(idx) => Box::new(
-                self.ids
-                    .iter()
-                    .take_while(|_| !crate::operations::cancelled())
-                    .map(|&i| sources::event_at(idx, i, self.codes, self.system, self.derived)),
+                ParallelEvents {
+                    idx,
+                    ids: &self.ids,
+                    next: 0,
+                    buffer: std::collections::VecDeque::new(),
+                    codes: self.codes,
+                    system: self.system,
+                    derived: self.derived,
+                }
+                .take_while(|_| !crate::operations::cancelled()),
             ),
             SourceData::Memory(events) => Box::new(
                 self.ids
@@ -148,10 +192,32 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
             "not_empty",
             "pattern",
             "threat_rule",
+            "query",
+            "in",
+            "not_in",
+            "cidr",
+            "not_cidr",
         ]
         .contains(&f.op.as_str())
         {
             return Err(format!("Operador inválido: {}", f.op));
+        }
+        if f.op == "query" {
+            crate::querylang::compile(&f.value)?;
+        }
+        if matches!(f.op.as_str(), "in" | "not_in") && query::list_values(&f.value).next().is_none() {
+            return Err("Informe ao menos um valor da lista.".into());
+        }
+        if matches!(f.op.as_str(), "cidr" | "not_cidr") {
+            let mut any = false;
+            for value in query::list_values(&f.value).flat_map(|v| v.split_whitespace()) {
+                crate::querylang::IpNet::parse(value)
+                    .ok_or_else(|| format!("Rede inválida: {value}. Use o formato 10.0.0.0/8."))?;
+                any = true;
+            }
+            if !any {
+                return Err("Informe ao menos uma rede.".into());
+            }
         }
         if f.op == "regex" {
             regex::Regex::new(&f.value).map_err(|e| format!("Expressão inválida: {e}"))?;

@@ -17,6 +17,10 @@ pub fn current_generation() -> Option<u64> {
 pub fn cancelled() -> bool {
     START.with(|s| s.get().is_some_and(|g| g != generation()))
 }
+/// Cancellation seen from worker threads that do not own the operation.
+pub fn cancelled_for(generation: Option<u64>) -> bool {
+    generation.is_some_and(|g| g != self::generation())
+}
 pub fn check() -> Result<(), String> {
     if cancelled() {
         Err("Operação cancelada.".into())
