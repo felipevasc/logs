@@ -563,6 +563,9 @@
         { name: "remote_list", description: "Lista conexões Elasticsearch e Kibana salvas" },
         { name: "remote_test", description: "Testa acesso e autenticação em conexão Elasticsearch ou Kibana" },
         { name: "remote_import", description: "Consulta e importa registros remotos para arquivo JSONL local" },
+        { name: "triage", description: "Triagem de segurança: detecções, episódios, táticas ATT&CK e entidades de risco" },
+        { name: "event_insights", description: "Entidades, ação/resultado, conteúdo decodificado e regras de um evento" },
+        { name: "detection_rules", description: "Regras de detecção embutidas e Sigma importadas" },
       ],
     }),
     load_file: ({ merge } = {}) => {

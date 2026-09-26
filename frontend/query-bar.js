@@ -145,7 +145,13 @@ window.QueryBar = (() => {
     return true;
   }
   let suggestTimer = null;
-  input.addEventListener("input", () => { clearTimeout(suggestTimer); suggestTimer = setTimeout(suggest, 90); });
+  input.addEventListener("input", () => {
+    clearTimeout(suggestTimer);
+    // Suggestions for another token are stale as soon as the text changes.
+    const next = currentToken();
+    if (!next || !token || next.kind !== token.kind || next.start !== token.start) { items = []; draw(); }
+    suggestTimer = setTimeout(suggest, 90);
+  });
   input.addEventListener("keydown", event => {
     if (list.hidden) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
