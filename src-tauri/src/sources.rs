@@ -761,7 +761,7 @@ fn parse_auditd(line: &str) -> Option<Event> {
     ev.fields.insert("type".into(), Value::from(kind.clone()));
     ev.fields.insert("audit_serial".into(), Value::from(c[5].to_string()));
     let body = c[6].to_string();
-    let mut add = |text: &str, fields: &mut Map<String, Value>| {
+    let add = |text: &str, fields: &mut Map<String, Value>| {
         for cap in kv.captures_iter(text) {
             let key = cap[1].to_string();
             let raw_value = &cap[2];

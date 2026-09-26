@@ -74,7 +74,7 @@ pub(crate) fn prepare_with_threat_catalog(
                     .then(|| {
                         crate::querylang::compile_with(
                             &f.value,
-                            &crate::querylang::Options { threats: catalog },
+                            &crate::querylang::Options { threats: catalog, detections: true },
                         )
                         .ok()
                     })

@@ -122,9 +122,6 @@ impl Iterator for ParallelEvents<'_> {
 }
 
 impl Selection<'_> {
-    pub fn ids(&self) -> &[usize] {
-        &self.ids
-    }
     /// Folds every selected event in parallel chunks; `merge` combines partial results.
     pub fn par_fold<A: Send>(
         &self,

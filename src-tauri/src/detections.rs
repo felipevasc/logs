@@ -150,10 +150,10 @@ pub fn compile_rule(def: RuleDef, origin: &'static str, conds: Option<Vec<Expr>>
             }
             def.steps
                 .iter()
-                .map(|s| querylang::compile(&s.condition).map_err(|e| format!("{}: {e}", def.id)))
+                .map(|s| querylang::compile_rule(&s.condition).map_err(|e| format!("{}: {e}", def.id)))
                 .collect::<Result<_, _>>()?
         }
-        None => vec![querylang::compile(&def.condition).map_err(|e| format!("{}: {e}", def.id))?],
+        None => vec![querylang::compile_rule(&def.condition).map_err(|e| format!("{}: {e}", def.id))?],
     };
     let counts = if kind == "sequence" {
         def.steps.iter().map(|s| s.count.unwrap_or(1).max(1)).collect()
@@ -253,7 +253,6 @@ pub struct RuleSet {
     automaton: Option<AhoCorasick>,
     pub sigma_loaded: usize,
     pub sigma_errors: Vec<String>,
-    pub builtin: usize,
 }
 
 impl RuleSet {
@@ -296,7 +295,6 @@ pub fn ruleset() -> Result<Arc<RuleSet>, String> {
     let mut defs: Vec<RuleDef> = serde_json::from_str::<RuleFile>(BUILTIN)
         .map_err(|e| format!("Regras de detecção embutidas inválidas: {e}"))?
         .rules;
-    let builtin = defs.len();
     if let Ok(text) = std::fs::read_to_string(crate::config_dir().join("detection-rules.json")) {
         let local: RuleFile = serde_json::from_str(&text)
             .map_err(|e| format!("detection-rules.json local inválido: {e}"))?;
@@ -308,16 +306,16 @@ pub fn ruleset() -> Result<Arc<RuleSet>, String> {
         }
     }
     let (sigma, sigma_errors) = crate::sigma::load_dir(&sigma_dir());
-    let set = Arc::new(build(defs, sigma, sigma_errors, &disabled, builtin)?);
+    let set = Arc::new(build(defs, sigma, sigma_errors, &disabled)?);
     *RULESET.lock() = Some((key, set.clone()));
     Ok(set)
 }
 
-/// Built-in rules only (tests and first run without configuration).
+/// Built-in rules only.
+#[cfg(test)]
 pub fn builtin_ruleset() -> Result<RuleSet, String> {
     let defs = serde_json::from_str::<RuleFile>(BUILTIN).map_err(|e| e.to_string())?.rules;
-    let count = defs.len();
-    build(defs, Vec::new(), Vec::new(), &HashSet::new(), count)
+    build(defs, Vec::new(), Vec::new(), &HashSet::new())
 }
 
 fn build(
@@ -325,7 +323,6 @@ fn build(
     sigma: Vec<Compiled>,
     sigma_errors: Vec<String>,
     disabled: &HashSet<&str>,
-    builtin: usize,
 ) -> Result<RuleSet, String> {
     let mut rules = Vec::new();
     for def in defs {
@@ -369,7 +366,7 @@ fn build(
     } else {
         Some(AhoCorasick::new(&patterns).map_err(|e| format!("Pré-filtro de regras: {e}"))?)
     };
-    Ok(RuleSet { rules, automaton, sigma_loaded, sigma_errors, builtin })
+    Ok(RuleSet { rules, automaton, sigma_loaded, sigma_errors })
 }
 
 pub fn invalidate() {
@@ -962,10 +959,6 @@ fn format_period(ms: i64) -> String {
     }
 }
 
-fn quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 // ------------------------------------------------------------------ assembly
 
 struct Raw {
@@ -1419,9 +1412,19 @@ fn cluster(detections: &[Detection]) -> Vec<Episode> {
                 .unwrap_or("low")
                 .to_string();
             let score: f64 = members.iter().map(|&i| severity_weight(&detections[i].severity)).sum();
-            let mut tactics: Vec<String> = members.iter().flat_map(|&i| detections[i].tactics.clone()).collect();
-            tactics.sort_by_key(|t| attack::tactic_order(t));
-            tactics.dedup();
+            // Tactics in the order they were first observed (kill-chain order breaks ties).
+            let mut first_seen: Vec<(String, i64)> = Vec::new();
+            for &i in &members {
+                let at = detections[i].start.unwrap_or(i64::MAX);
+                for t in &detections[i].tactics {
+                    match first_seen.iter_mut().find(|(k, _)| k == t) {
+                        Some(entry) => entry.1 = entry.1.min(at),
+                        None => first_seen.push((t.clone(), at)),
+                    }
+                }
+            }
+            first_seen.sort_by_key(|(t, at)| (*at, attack::tactic_order(t)));
+            let tactics: Vec<String> = first_seen.into_iter().map(|(t, _)| t).collect();
             let mut entity_counts: Vec<(EntityRef, usize)> = Vec::new();
             for &i in &members {
                 for e in &detections[i].entities {
@@ -1453,16 +1456,11 @@ fn cluster(detections: &[Detection]) -> Vec<Episode> {
             } else {
                 lead.name.clone()
             };
-            let summary = if distinct_names.len() > 1 {
-                let shown: Vec<&str> = distinct_names.iter().take(3).copied().collect();
-                let more = distinct_names.len().saturating_sub(3);
-                if more > 0 {
-                    format!("{} e mais {more}", shown.join(" · "))
-                } else {
-                    shown.join(" · ")
-                }
-            } else {
-                lead.summary.clone()
+            let others: Vec<&str> = distinct_names.iter().copied().filter(|n| *n != lead.name).collect();
+            let summary = match others.len() {
+                0 => lead.summary.clone(),
+                1 => format!("{} · também {}", lead.summary, others[0]),
+                n => format!("{} · também {} e mais {}", lead.summary, others[0], n - 1),
             };
             let mut detections_in_time = members.clone();
             detections_in_time.sort_by_key(|&i| detections[i].start);
@@ -1608,6 +1606,3 @@ pub fn clear_cache() {
     TRIAGE_CACHE.lock().clear();
 }
 
-pub(crate) fn quote_value(value: &str) -> String {
-    quote(value)
-}

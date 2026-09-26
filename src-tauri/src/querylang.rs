@@ -50,6 +50,14 @@ impl std::fmt::Debug for Threat {
     }
 }
 
+/// `deteccao:<id>`: records a detection rule selects (any of its steps).
+pub struct Detection(std::sync::Arc<crate::detections::RuleSet>, usize);
+impl std::fmt::Debug for Detection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Detection")
+    }
+}
+
 #[derive(Debug)]
 enum Matcher {
     Contains(String),
@@ -64,6 +72,7 @@ enum Matcher {
     Set(HashSet<String>),
     Level(String),
     Threat(Threat),
+    Detection(Detection),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,10 +123,18 @@ pub fn is_plain(text: &str) -> bool {
 
 pub struct Options<'a> {
     pub threats: Option<&'a std::sync::Arc<crate::threats::CompiledCatalog>>,
+    /// Resolve `deteccao:<id>` against the active rule set. Off while the
+    /// rules themselves are compiled, so a rule can never reference a rule.
+    pub detections: bool,
 }
 
 pub fn compile(text: &str) -> Result<Expr, String> {
-    compile_with(text, &Options { threats: None })
+    compile_with(text, &Options { threats: None, detections: true })
+}
+
+/// Conditions inside detection and Sigma rules.
+pub fn compile_rule(text: &str) -> Result<Expr, String> {
+    compile_with(text, &Options { threats: None, detections: false })
 }
 
 pub fn compile_with(text: &str, options: &Options<'_>) -> Result<Expr, String> {
@@ -570,6 +587,18 @@ impl Parser<'_> {
             let matcher = crate::threats::matcher(value, self.options.threats.cloned())?;
             return Ok(Matcher::Threat(Threat(matcher)));
         }
+        if matches!(field.name.as_str(), "deteccao" | "detecção" | "detection") {
+            if !self.options.detections {
+                return Err("deteccao: não pode ser usado dentro de uma regra.".into());
+            }
+            let set = crate::detections::ruleset()?;
+            let index = set
+                .rules
+                .iter()
+                .position(|r| r.def.id == value)
+                .ok_or_else(|| format!("Regra de detecção não encontrada: {value}."))?;
+            return Ok(Matcher::Detection(Detection(set, index)));
+        }
         if !quoted {
             if value == "*" {
                 return Ok(Matcher::Exists);
@@ -873,11 +902,13 @@ impl Term {
                 Matcher::Wildcard(re) | Matcher::Regex(re) => any_value(ev, &|v| re.is_match(v)) || re.is_match(&ev.raw),
                 Matcher::Exact(value) => any_value(ev, &|v| v == value),
                 Matcher::Threat(threat) => threat.0.matches(ev),
+                Matcher::Detection(d) => d.0.rules[d.1].matches(ev),
                 _ => false,
             };
         }
         match &self.matcher {
             Matcher::Threat(threat) => threat.0.matches(ev),
+            Matcher::Detection(d) => d.0.rules[d.1].matches(ev),
             Matcher::Cmp(cmp, bound) => ctx.number(field).is_some_and(|n| match cmp {
                 Cmp::Gt => n > *bound,
                 Cmp::Gte => n >= *bound,
@@ -1101,6 +1132,18 @@ mod tests {
             e.fields = map;
         }
         e
+    }
+
+    #[test]
+    fn detection_terms_select_rule_records() {
+        let failure = ev("Failed password for root from 45.90.12.3 port 22 ssh2", json!({}));
+        let accepted = ev("Accepted password for root from 45.90.12.3 port 22 ssh2", json!({}));
+        let expr = compile("deteccao:\"auth.bruteforce.source\" AND @src_ip:\"45.90.12.3\"").unwrap();
+        assert!(expr.matches(&failure));
+        assert!(!expr.matches(&accepted));
+        assert!(compile("deteccao:regra.inexistente").is_err());
+        // Rules cannot reference rules.
+        assert!(compile_rule("deteccao:auth.bruteforce.source").is_err());
     }
 
     #[test]
