@@ -1605,3 +1605,202 @@ fn query_parameters_subfields_are_indexed_and_filterable() {
     assert_eq!(matched.len(), 10);
 }
 
+
+// ------------------------------------------------------------ triage scenarios
+
+fn triage_events(events: Vec<Event>, threats: bool) -> crate::detections::Triage {
+    let rules = crate::detections::builtin_ruleset().unwrap();
+    let catalog = crate::threats::builtin_catalog();
+    let settings = crate::detections::Settings { threats, ..Default::default() };
+    let inputs = crate::detections::Inputs {
+        rules: &rules,
+        catalog: threats.then_some(&*catalog),
+        settings: &settings,
+    };
+    let refs: Vec<&Event> = events.iter().collect();
+    crate::detections::run(&inputs, &crate::detections::Source::Events(refs)).unwrap()
+}
+
+fn win(id: usize, t: i64, provider: &str, code: &str, fields: serde_json::Value) -> Event {
+    let mut e = Event::empty();
+    e.id = id;
+    e.timestamp = Some(t);
+    e.source = provider.into();
+    e.code = code.into();
+    if let serde_json::Value::Object(map) = fields {
+        e.fields = map;
+    }
+    e.message = format!("{provider} {code}");
+    e.raw = e.message.clone();
+    e
+}
+
+fn rules_of(t: &crate::detections::Triage) -> Vec<String> {
+    let mut ids: Vec<String> = t.detections.iter().map(|d| d.rule.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[test]
+fn triage_ssh_bruteforce_success_is_one_episode_with_risky_source() {
+    let mut lines = Vec::new();
+    for i in 0..12 {
+        lines.push(format!("Jan 31 08:0{}:{:02} srv-app-01 sshd[2211]: Failed password for root from 45.90.12.3 port {} ssh2", i / 6, (i % 6) * 9, 50000 + i));
+    }
+    lines.push("Jan 31 08:03:10 srv-app-01 sshd[2211]: Accepted password for root from 45.90.12.3 port 51122 ssh2".into());
+    lines.push("Jan 31 08:05:00 srv-app-01 systemd[1]: Started Daily apt download activities.".into());
+    let fixture = Fixture::new(&lines.join("\n"));
+    let index = fixture.index("auto");
+    let state = state_for(crate::SourceData::Indexed(index));
+    let value = crate::triage::triage_impl(&state, vec![], None, true).unwrap();
+    let t: serde_json::Value = (*value).clone();
+    let rules: Vec<&str> = t["detections"].as_array().unwrap().iter().map(|d| d["rule"].as_str().unwrap()).collect();
+    assert!(rules.contains(&"auth.bruteforce.source"), "{rules:?}");
+    assert!(rules.contains(&"auth.bruteforce.success"), "{rules:?}");
+    assert!(rules.contains(&"auth.root.public"), "{rules:?}");
+    let episodes = t["episodes"].as_array().unwrap();
+    assert_eq!(episodes.len(), 1, "{episodes:?}");
+    assert_eq!(episodes[0]["severity"], "high");
+    let top = &t["entities"][0];
+    assert_eq!(top["value"], "45.90.12.3");
+    assert_eq!(top["scope"], "público");
+    assert!(top["failures"].as_u64().unwrap() >= 12);
+    // Evidence filters reproduce the supporting records.
+    let detection = t["detections"].as_array().unwrap().iter().find(|d| d["rule"] == "auth.bruteforce.source").unwrap();
+    let filters: Vec<Filter> = serde_json::from_value(detection["filters"].clone()).unwrap();
+    let count = crate::count_filtered_impl(&state, filters, None);
+    assert_eq!(count, 12);
+    assert!(detection["summary"].as_str().unwrap().contains("45.90.12.3"));
+    assert!(t["tactics"].as_array().unwrap().iter().any(|x| x["key"] == "credential-access" && x["count"].as_u64().unwrap() > 0));
+}
+
+#[test]
+fn triage_windows_spraying_webshell_encoded_powershell_and_log_clear() {
+    let base = 1_700_000_000_000i64;
+    let security = "Microsoft-Windows-Security-Auditing";
+    let sysmon = "Microsoft-Windows-Sysmon";
+    let mut events = Vec::new();
+    for i in 0..10 {
+        events.push(win(i, base + i as i64 * 20_000, security, "4625", serde_json::json!({"TargetUserName": format!("user{i}"), "IpAddress": "10.9.9.9", "LogonType": "3", "Computer": "DC01"})));
+    }
+    events.push(win(20, base + 600_000, sysmon, "1", serde_json::json!({"ParentImage": "C:\\Windows\\System32\\inetsrv\\w3wp.exe", "Image": "C:\\Windows\\System32\\cmd.exe", "CommandLine": "cmd.exe /c whoami", "Computer": "WEB01"})));
+    events.push(win(21, base + 610_000, sysmon, "1", serde_json::json!({"ParentImage": "C:\\Windows\\System32\\cmd.exe", "Image": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "CommandLine": "powershell.exe -nop -w hidden -enc SQBFAFgA", "Computer": "WEB01"})));
+    events.push(win(22, base + 900_000, security, "1102", serde_json::json!({"SubjectUserName": "admin", "Computer": "WEB01"})));
+    let t = triage_events(events, false);
+    let rules = rules_of(&t);
+    for expected in ["auth.spraying", "exec.webshell-child", "exec.encoded-powershell", "evasion.log-clear"] {
+        assert!(rules.contains(&expected.to_string()), "missing {expected}: {rules:?}");
+    }
+    let spray = t.detections.iter().find(|d| d.rule == "auth.spraying").unwrap();
+    assert_eq!(spray.distinct, 10);
+    assert!(spray.summary.contains("10.9.9.9") && spray.summary.contains("10"), "{}", spray.summary);
+    // WEB01 activity forms a multi-tactic episode.
+    let web = t.episodes.iter().find(|e| e.entities.iter().any(|x| x.value == "WEB01")).unwrap();
+    assert!(web.tactics.len() >= 3, "{:?}", web.tactics);
+    assert!(web.title.starts_with("Possível cadeia de ataque"), "{}", web.title);
+    assert!(t.entities.iter().any(|e| e.value == "WEB01" && e.score >= 70));
+}
+
+#[test]
+fn triage_web_scan_tool_success_port_scan_and_beacon() {
+    let mut lines = Vec::new();
+    for i in 0..45 {
+        lines.push(format!("203.0.113.50 - - [31/Jan/2024:08:{:02}:{:02} -0300] \"GET /admin{i}.php HTTP/1.1\" 404 12 \"-\" \"sqlmap/1.7\"", 1 + i / 30, (i * 2) % 60));
+    }
+    lines.push("203.0.113.50 - - [31/Jan/2024:08:04:00 -0300] \"GET /uploads/shell.php?cmd=id HTTP/1.1\" 200 88 \"-\" \"sqlmap/1.7\"".into());
+    lines.push("192.168.1.10 - - [31/Jan/2024:08:05:00 -0300] \"GET /api/users?id=1 UNION SELECT password FROM users HTTP/1.1\" 500 12 \"-\" \"Mozilla/5.0\"".into());
+    let web = Fixture::new(&lines.join("\n"));
+    let web_state = state_for(crate::SourceData::Indexed(web.index("auto")));
+    let t: serde_json::Value = (*crate::triage::triage_impl(&web_state, vec![], None, true).unwrap()).clone();
+    let rules: Vec<&str> = t["detections"].as_array().unwrap().iter().map(|d| d["rule"].as_str().unwrap()).collect();
+    for expected in ["web.scan", "tool.scanner", "web.success-after-scan"] {
+        assert!(rules.contains(&expected), "missing {expected}: {rules:?}");
+    }
+    let mut fw = Vec::new();
+    for port in 0..25 {
+        fw.push(format!("Jan 31 08:00:{:02} fw-01 kernel: [9.1] iptables DROP IN=eth0 OUT= SRC=198.51.100.7 DST=10.0.0.1 PROTO=TCP SPT=40000 DPT={} SYN", port, 1000 + port));
+    }
+    for n in 0..12 {
+        let t = 600 + n * 60 + (n % 2);
+        fw.push(format!("Jan 31 08:{:02}:{:02} fw-01 kernel: [9.2] iptables ACCEPT IN=eth0 OUT= SRC=10.0.0.23 DST=185.100.87.3 PROTO=TCP SPT=40001 DPT=443", t / 60, t % 60));
+    }
+    let firewall = Fixture::new(&fw.join("\n"));
+    let fw_state = state_for(crate::SourceData::Indexed(firewall.index("auto")));
+    let t: serde_json::Value = (*crate::triage::triage_impl(&fw_state, vec![], None, true).unwrap()).clone();
+    let detections = t["detections"].as_array().unwrap();
+    let rules: Vec<&str> = detections.iter().map(|d| d["rule"].as_str().unwrap()).collect();
+    assert!(rules.contains(&"net.portscan"), "{rules:?}");
+    let beacon = detections.iter().find(|d| d["rule"] == "net.beacon").expect("beacon");
+    assert!((59_000..=61_000).contains(&beacon["period_ms"].as_i64().unwrap()), "{}", beacon["period_ms"]);
+    assert!(beacon["summary"].as_str().unwrap().contains("1 min"), "{}", beacon["summary"]);
+}
+
+#[test]
+fn triage_threat_signals_rarity_and_suppression() {
+    let base = 1_700_000_000_000i64;
+    let mut events = Vec::new();
+    for i in 0..80 {
+        let process = if i == 40 { "C:\\Users\\Public\\x.exe" } else { ["C:\\Windows\\explorer.exe", "C:\\Windows\\System32\\svchost.exe", "C:\\Program Files\\App\\app.exe", "C:\\Windows\\System32\\cmd.exe", "C:\\Windows\\System32\\conhost.exe", "C:\\Windows\\System32\\taskhostw.exe"][i % 6] };
+        events.push(win(i, base + i as i64 * 1000, "Microsoft-Windows-Sysmon", "1", serde_json::json!({"Image": process, "Computer": "WS1"})));
+    }
+    let mut sqli = Event::empty();
+    sqli.id = 500;
+    sqli.timestamp = Some(base + 5000);
+    sqli.source = "203.0.113.9".into();
+    sqli.message = "GET /p?id=1' UNION SELECT username,password FROM users--".into();
+    sqli.raw = sqli.message.clone();
+    events.push(sqli);
+    let t = triage_events(events.clone(), true);
+    assert!(t.rare.iter().any(|r| r.value == "x.exe"), "{:?}", t.rare.iter().map(|r| &r.value).collect::<Vec<_>>());
+    let signal = t.detections.iter().find(|d| d.origin == "threats").expect("threat signal");
+    assert_eq!(signal.name, "Injeção SQL");
+    assert!(signal.entities.iter().any(|e| e.value == "203.0.113.9"));
+    assert!(signal.attack.iter().any(|a| a.id == "T1190"));
+    // Suppressing the signal for that address hides it and counts it.
+    let rules = crate::detections::builtin_ruleset().unwrap();
+    let catalog = crate::threats::builtin_catalog();
+    let settings = crate::detections::Settings {
+        suppress: vec![crate::detections::Suppression { rule: signal.rule.clone(), column: None, value: Some("203.0.113.9".into()), ..Default::default() }],
+        ..Default::default()
+    };
+    let inputs = crate::detections::Inputs { rules: &rules, catalog: Some(&catalog), settings: &settings };
+    let refs: Vec<&Event> = events.iter().collect();
+    let hidden = crate::detections::run(&inputs, &crate::detections::Source::Events(refs)).unwrap();
+    assert!(hidden.detections.iter().all(|d| d.origin != "threats"));
+    assert!(hidden.suppressed >= 1);
+}
+
+#[test]
+fn search_language_filters_indexed_and_memory_sources_alike() {
+    let text = [
+        r#"{"timestamp":"2024-01-31T08:00:00Z","level":"error","message":"login failed","user":"alice","src_ip":"10.1.2.3","status":401}"#,
+        r#"{"timestamp":"2024-01-31T08:00:01Z","level":"info","message":"login ok","user":"bob","src_ip":"8.8.8.8","status":200}"#,
+        r#"{"timestamp":"2024-01-31T08:00:02Z","level":"warn","message":"slow request","user":"carol","src_ip":"10.200.0.1","status":200}"#,
+    ]
+    .join("\n");
+    let fixture = Fixture::new(&text);
+    let index = fixture.index("jsonl");
+    let codes = CodesConfig::default();
+    let events: Vec<Event> = (0..index.lines.len()).map(|i| sources::event_at(&index, i, &codes, &codes, &[])).collect();
+    for (query, expected) in [
+        ("login", 2),
+        ("login failed", 1),
+        ("user:(alice OR carol)", 2),
+        ("ip:10.0.0.0/8", 2),
+        ("-level:erro status>=200", 2),
+        ("@src_scope:público", 1),
+        ("status:4* OR user:carol", 2),
+        ("NOT (user:alice OR user:bob)", 1),
+    ] {
+        let filters = vec![filter("_all", "query", query)];
+        assert_eq!(query::filtered_indices(&events, &filters).len(), expected, "memory {query}");
+        assert_eq!(query::indexed_matches(&index, &filters, &codes, &codes, &[]).len(), expected, "indexed {query}");
+    }
+    let list = vec![filter("user", "in", "alice\nBOB")];
+    assert_eq!(query::filtered_indices(&events, &list).len(), 2);
+    let nets = vec![filter("src_ip", "cidr", "10.0.0.0/8, 192.168.0.0/16")];
+    assert_eq!(query::indexed_matches(&index, &nets, &codes, &codes, &[]).len(), 2);
+    assert!(workspace::validate(&[filter("_all", "query", "user:(alice")]).is_err());
+    assert!(workspace::validate(&[filter("src_ip", "cidr", "10.0.0.0/99")]).is_err());
+}

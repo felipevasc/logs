@@ -35,6 +35,8 @@ pub struct PreparedFilter {
     set: Option<std::collections::HashSet<String>>,
     /// Networks for `cidr` / `not_cidr`.
     nets: Vec<crate::querylang::IpNet>,
+    /// Detection rule reproduced as evidence filter (`op = "detection"`).
+    detection: Option<(std::sync::Arc<crate::detections::RuleSet>, usize)>,
 }
 
 /// Values of an `in` filter: one per line (commas also separate).
@@ -87,6 +89,13 @@ pub(crate) fn prepare_with_threat_catalog(
                 } else {
                     Vec::new()
                 },
+                detection: (f.op == "detection")
+                    .then(|| {
+                        let set = crate::detections::ruleset().ok()?;
+                        let index = set.rules.iter().position(|r| r.def.id == f.value)?;
+                        Some((set, index))
+                    })
+                    .flatten(),
                 f: f.clone(),
             }
         })
@@ -160,6 +169,12 @@ pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
     if f.op == "query" {
         // An invalid expression was rejected by validation; never match silently.
         return pf.expr.as_ref().is_some_and(|expr| expr.matches(ev));
+    }
+    if f.op == "detection" {
+        return pf
+            .detection
+            .as_ref()
+            .is_some_and(|(set, index)| set.rules[*index].matches(ev));
     }
     let col = f.column.as_str();
     let needle = pf.needle_lower.as_str();

@@ -1074,6 +1074,42 @@ impl<'a> Extracted<'a> {
     }
 }
 
+/// Field-based values of every role in one pass (no message fallbacks, no
+/// derived roles). Addresses are normalized and Sysmon hashes unpacked.
+pub fn scan_fields(ev: &Event) -> [Option<Cow<'_, str>>; 19] {
+    let mut values: [Option<Cow<'_, str>>; 19] = Default::default();
+    let table = alias_table();
+    let mut priorities = [u8::MAX; 19];
+    let mut buffer = [0u8; 96];
+    for (key, value) in &ev.fields {
+        let Some(lower) = lookup_key(key, &mut buffer) else { continue };
+        let Some(&(role, priority)) = table.get(lower) else { continue };
+        let index = slot(role);
+        if priorities[index] <= priority {
+            continue;
+        }
+        if let Some(text) = scalar(value).filter(|t| usable(t)) {
+            priorities[index] = priority;
+            values[index] = Some(text);
+        }
+    }
+    for role in [Role::SrcIp, Role::DstIp] {
+        let index = slot(role);
+        if let Some(found) = values[index].take() {
+            values[index] = parse_ip(&found).map(|ip| Cow::Owned(ip.to_string()));
+        }
+    }
+    if let Some(hash) = values[slot(Role::Hash)].take() {
+        values[slot(Role::Hash)] = Some(normalize_hash(hash));
+    }
+    values
+}
+
+/// Value of a role that the fields do not carry (origin, syslog host, messages).
+pub fn fallback_value(ev: &Event, role: Role) -> Option<Cow<'_, str>> {
+    fallback(ev, role)
+}
+
 pub fn extract(ev: &Event) -> Extracted<'_> {
     let mut out = Extracted::default();
     let table = alias_table();

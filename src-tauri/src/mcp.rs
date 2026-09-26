@@ -1544,6 +1544,7 @@ impl LogInsightMcp {
             p.filters,
             p.mask,
             None,
+            None,
             self.app.clone(),
         )
         .await;
@@ -1572,7 +1573,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<ThreatScanParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        from_domain(crate::threats::threat_scan(p.filters, None, self.app.clone()).await)
+        from_domain(crate::threats::threat_scan(p.filters, None, None, self.app.clone()).await)
     }
 
     #[tool(
@@ -1585,7 +1586,7 @@ impl LogInsightMcp {
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
         from_domain(
-            crate::threats::threat_events(p.filters, None, p.offset, p.limit, self.app.clone())
+            crate::threats::threat_events(p.filters, None, None, p.offset, p.limit, self.app.clone())
                 .await,
         )
     }
@@ -1621,7 +1622,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<JourneyFieldsParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        from_domain(crate::journeys::journey_fields(p.filters, None, self.app.clone()).await)
+        from_domain(crate::journeys::journey_fields(p.filters, None, None, self.app.clone()).await)
     }
 
     #[tool(
@@ -1636,6 +1637,7 @@ impl LogInsightMcp {
         from_domain(
             crate::journeys::journey_index(
                 p.filters,
+                None,
                 None,
                 p.field,
                 p.offset,
@@ -1662,6 +1664,7 @@ impl LogInsightMcp {
         from_domain(
             crate::journeys::journey_events(
                 p.filters,
+                None,
                 None,
                 p.field,
                 p.value,

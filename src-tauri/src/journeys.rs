@@ -523,8 +523,10 @@ pub(crate) fn events_impl(
 pub async fn journey_fields(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<Vec<JourneyField>, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     crate::offload(move || {
         fields_impl(
             app.state::<AppState>().inner(),
@@ -538,6 +540,7 @@ pub async fn journey_fields(
 pub async fn journey_index(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     field: String,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -547,6 +550,7 @@ pub async fn journey_index(
     to: Option<i64>,
     app: tauri::AppHandle,
 ) -> Result<JourneyIndex, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     crate::offload(move || {
         let filters = window_filters(&field, filters, from, to)?;
         index_impl(
@@ -566,6 +570,7 @@ pub async fn journey_index(
 pub async fn journey_events(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     field: String,
     value: String,
     from: Option<i64>,
@@ -574,6 +579,7 @@ pub async fn journey_events(
     limit: Option<usize>,
     app: tauri::AppHandle,
 ) -> Result<JourneyEvents, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     crate::offload(move || {
         events_impl(
             app.state::<AppState>().inner(),

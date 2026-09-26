@@ -125,6 +125,48 @@ impl Selection<'_> {
     pub fn ids(&self) -> &[usize] {
         &self.ids
     }
+    /// Folds every selected event in parallel chunks; `merge` combines partial results.
+    pub fn par_fold<A: Send>(
+        &self,
+        init: impl Fn() -> A + Sync + Send,
+        step: impl Fn(&mut A, &Event) + Sync + Send,
+        merge: impl Fn(A, A) -> A + Sync + Send,
+    ) -> A {
+        use rayon::prelude::*;
+        let generation = crate::operations::current_generation();
+        self.ids
+            .par_chunks(2048)
+            .fold(&init, |mut acc, chunk| {
+                for &i in chunk {
+                    if crate::operations::cancelled_for(generation) {
+                        break;
+                    }
+                    match self.source {
+                        SourceData::Indexed(idx) => {
+                            let ev = sources::event_at(idx, i, self.codes, self.system, self.derived);
+                            step(&mut acc, &ev);
+                        }
+                        SourceData::Memory(events) => step(&mut acc, &events[i]),
+                        SourceData::None => {}
+                    }
+                }
+                acc
+            })
+            .reduce(&init, &merge)
+    }
+    /// One event by its id (positions for files, stored ids for memory sources).
+    pub fn event(&self, id: usize) -> Option<Event> {
+        match self.source {
+            SourceData::Indexed(idx) => (id < idx.lines.len())
+                .then(|| sources::event_at(idx, id, self.codes, self.system, self.derived)),
+            SourceData::Memory(events) => events
+                .get(id)
+                .filter(|e| e.id == id)
+                .or_else(|| events.iter().find(|e| e.id == id))
+                .cloned(),
+            SourceData::None => None,
+        }
+    }
     pub fn iter(&self) -> Box<dyn Iterator<Item = Event> + '_> {
         match self.source {
             SourceData::Indexed(idx) => Box::new(
@@ -197,6 +239,7 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
             "not_in",
             "cidr",
             "not_cidr",
+            "detection",
         ]
         .contains(&f.op.as_str())
         {
@@ -204,6 +247,9 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
         }
         if f.op == "query" {
             crate::querylang::compile(&f.value)?;
+        }
+        if f.op == "detection" && crate::detections::ruleset()?.find(&f.value).is_none() {
+            return Err(format!("Regra de detecção não encontrada: {}.", f.value));
         }
         if matches!(f.op.as_str(), "in" | "not_in") && query::list_values(&f.value).next().is_none() {
             return Err("Informe ao menos um valor da lista.".into());
@@ -290,8 +336,10 @@ pub fn overview_scope_impl(
 pub async fn dataset_overview(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<insights::Overview, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     crate::offload(move || {
         overview_scope_impl(
             app.state::<AppState>().inner(),
@@ -456,8 +504,10 @@ pub async fn timeline_range(
     end: i64,
     bucket_count: usize,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<TimelineRange, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     crate::offload(move || {
         if case_events.is_none() {
             return timeline_range_impl(
@@ -485,8 +535,10 @@ pub async fn compare_periods(
     before: insights::Period,
     after: insights::Period,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<insights::Comparison, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     crate::offload(move || {
         if case_events.is_none() {
             compare_impl(app.state::<AppState>().inner(), filters, before, after)
@@ -730,8 +782,10 @@ pub async fn export_events(
     filters: Vec<Filter>,
     mask: bool,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<usize, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     crate::offload(move || {
         validate(&filters)?;
         if !["csv", "jsonl"].contains(&format.as_str()) {
