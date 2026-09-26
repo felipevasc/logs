@@ -14,6 +14,7 @@ mod journeys;
 mod mcp;
 mod model;
 mod operations;
+mod pivots;
 mod query;
 mod querylang;
 #[cfg(test)]
@@ -2119,6 +2120,10 @@ pub fn run() {
             triage::sigma_import,
             triage::sigma_clear,
             case_cache::case_sync,
+            pivots::timeline_lanes,
+            pivots::entity_summary,
+            pivots::ioc_sightings,
+            pivots::source_hashes,
             workspace::timeline_range,
             workspace::import_investigation,
             workspace::load_bundle,
