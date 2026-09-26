@@ -1162,6 +1162,21 @@ pub fn extract(ev: &Event) -> Extracted<'_> {
     out
 }
 
+/// Adds the canonical values as `@role` fields for records shown to people,
+/// so tables, exports and saved evidence carry the same columns.
+pub fn annotate(ev: &mut Event) {
+    let found: Vec<(&'static str, String)> = {
+        let extracted = extract(ev);
+        ROLES
+            .iter()
+            .filter_map(|info| extracted.get(info.role).map(|v| (info.column, v.chars().take(4000).collect())))
+            .collect()
+    };
+    for (column, value) in found {
+        ev.fields.entry(column.to_string()).or_insert(Value::from(value));
+    }
+}
+
 /// Roles observed in a sample, for the column list. Attributes that every
 /// event would derive (scope, action) appear only when their source exists.
 pub fn observed_columns<'a>(events: impl Iterator<Item = &'a Event>) -> Vec<String> {

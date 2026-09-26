@@ -1385,7 +1385,11 @@ fn trail_from_events(
     TrailResult {
         events: rows[start..end]
             .iter()
-            .map(|&(_, i)| events[i].clone())
+            .map(|&(_, i)| {
+                let mut event = events[i].clone();
+                entities::annotate(&mut event);
+                event
+            })
             .collect(),
         before_available: start,
         after_available: rows.len() - end,
@@ -1460,7 +1464,11 @@ pub(crate) fn trail_events_impl(
             TrailResult {
                 events: rows[start..end]
                     .iter()
-                    .map(|&(_, i)| crate::sources::event_at(idx, i, &codes, &system, &derived))
+                    .map(|&(_, i)| {
+                        let mut event = crate::sources::event_at(idx, i, &codes, &system, &derived);
+                        entities::annotate(&mut event);
+                        event
+                    })
                     .collect(),
                 before_available: start,
                 after_available: rows.len() - end,
@@ -1600,6 +1608,12 @@ async fn event_detail(id: usize, app: AppHandle) -> Result<Option<Event>, String
 }
 
 pub(crate) fn event_detail_impl(state: &AppState, id: usize) -> Option<Event> {
+    let mut event = event_detail_raw(state, id)?;
+    entities::annotate(&mut event);
+    Some(event)
+}
+
+fn event_detail_raw(state: &AppState, id: usize) -> Option<Event> {
     let source = state.source.read();
     match &*source {
         SourceData::Memory(events) => events.get(id).cloned(),

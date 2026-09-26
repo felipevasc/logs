@@ -353,6 +353,7 @@ pub fn query(
         .take(limit)
         .map(|i| {
             let mut e = events[i].clone();
+            crate::entities::annotate(&mut e);
             e.raw = String::new();
             e
         })
@@ -378,6 +379,7 @@ fn query_from_memory_matches(
         .take(limit)
         .map(|i| {
             let mut event = events[i].clone();
+            crate::entities::annotate(&mut event);
             event.raw.clear();
             event
         })
@@ -1395,6 +1397,7 @@ fn query_from_indexed_matches(
         .take(limit)
         .map(|i| {
             let mut event = event_at(idx, i, codes, system, derived);
+            crate::entities::annotate(&mut event);
             event.raw.clear();
             event
         })
