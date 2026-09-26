@@ -83,8 +83,9 @@ window.Tasks = (() => {
   function render() {
     const list = groups();
     const marked = new Set(list.flatMap(g => g.marks.flatMap(selector => [...document.querySelectorAll(selector)])));
-    document.querySelectorAll("[data-loading]").forEach(node => { if (!marked.has(node)) node.removeAttribute("data-loading"); });
-    marked.forEach(node => node.setAttribute("data-loading", ""));
+    // A veil dims the item and two wave lines run across it; only marks set here are removed here.
+    document.querySelectorAll('[data-loading="task"]').forEach(node => { if (!marked.has(node)) { node.removeAttribute("data-loading"); node.querySelector(":scope > .li-waves")?.remove(); } });
+    marked.forEach(node => { node.setAttribute("data-loading", "task"); if (!node.querySelector(":scope > .li-waves")) node.append(waves()); });
     const bar = $("#workbar"), button = $("#workbar-tasks");
     bar.classList.toggle("has-tasks", list.length > 0);
     if (list.length) { button.querySelector("span").textContent = summary(list); button.title = "Ver e cancelar o que está carregando"; }
@@ -104,6 +105,7 @@ window.Tasks = (() => {
   }
   function cancelAll() { for (const t of [...tasks.values()]) { t.cancelled = true; t.reject(new Error("Operação cancelada.")); } tasks.clear(); inflight.clear(); selectiveUntil = 0; schedule(); }
 
+  function waves() { const node = document.createElement("span"); node.className = "li-waves"; node.setAttribute("aria-hidden", "true"); return node; }
   const elapsed = t => { const s = Math.round((performance.now() - t.started) / 1000); return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`; };
   let drawn = "";
   function drawDialog() {
@@ -112,7 +114,7 @@ window.Tasks = (() => {
     const shape = list.map(g => g.key + ":" + g.tasks.map(t => t.id).join(",")).join("|");
     if (shape === drawn && list.length) { for (const g of list) for (const t of g.tasks) { const cell = body.querySelector(`[data-elapsed="${t.id}"]`); if (cell) cell.textContent = elapsed(t); } return; }
     drawn = shape;
-    body.innerHTML = list.length ? list.map(g => `<div class="task-group"><div class="task-origin" data-loading>${esc(g.label)}</div>${g.tasks.map(t => `<div class="task-row"><span>${esc(WHAT[t.cmd] || t.cmd)}</span><small data-elapsed="${t.id}">${elapsed(t)}</small><button type="button" class="btn ghost small" data-cancel="${t.id}">Cancelar</button></div>`).join("")}</div>`).join("") : '<p class="quiet-empty">Nada carregando agora.</p>';
+    body.innerHTML = list.length ? list.map(g => `<div class="task-group"><div class="task-origin" data-loading>${esc(g.label)}<span class="li-waves" aria-hidden="true"></span></div>${g.tasks.map(t => `<div class="task-row"><span>${esc(WHAT[t.cmd] || t.cmd)}</span><small data-elapsed="${t.id}">${elapsed(t)}</small><button type="button" class="btn ghost small" data-cancel="${t.id}">Cancelar</button></div>`).join("")}</div>`).join("") : '<p class="quiet-empty">Nada carregando agora.</p>';
     body.querySelectorAll("[data-cancel]").forEach(b => { b.onclick = () => { const t = tasks.get(+b.dataset.cancel); if (t) cancel(t); }; });
     dialog.querySelector("[data-cancel-all]").hidden = !list.length;
   }
