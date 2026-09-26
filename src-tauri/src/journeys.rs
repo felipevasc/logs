@@ -17,6 +17,7 @@ const FIELD_CAP: usize = 128;
 const DISTINCT_CAP: usize = 512;
 const PROFILE_BYTES: usize = 8 * 1024 * 1024;
 const KEY_BYTES: usize = 4096;
+const CANONICAL: &[&str] = &["@user", "@src_ip", "@dst_ip", "@host"];
 
 #[derive(Serialize)]
 pub struct JourneyField {
@@ -290,6 +291,20 @@ pub(crate) fn fields_impl(
         let (mut total, mut bytes, mut limited) = (0, 0usize, false);
         view.scan(|_, event| {
             total += 1;
+            // Canonical entities link the same user, address or host across formats.
+            for column in CANONICAL {
+                let Some(value) = key(event, column) else { continue };
+                let acc = fields.entry((*column).to_string()).or_default();
+                acc.present += 1;
+                if !acc.values.contains(&value) {
+                    if acc.values.len() >= DISTINCT_CAP || value.len() > 256 || bytes.saturating_add(value.len() + 64) > PROFILE_BYTES {
+                        acc.limited = true;
+                    } else {
+                        bytes += value.len() + 64;
+                        acc.values.insert(value);
+                    }
+                }
+            }
             for (name, value) in &event.fields {
                 if valid_field(name).is_err() || !value.is_string() && !value.is_number() {
                     continue;
@@ -322,7 +337,9 @@ pub(crate) fn fields_impl(
             .map(|(field, acc)| {
                 let kind = kind(&field);
                 JourneyField {
-                    label: field.clone(),
+                    label: crate::entities::role_of_column(&field)
+                        .map(|r| format!("{} (todas as fontes)", crate::entities::info(r).label))
+                        .unwrap_or_else(|| field.clone()),
                     field,
                     kind: kind.into(),
                     suggested: matches!(kind, "trace" | "request" | "correlation" | "session"),

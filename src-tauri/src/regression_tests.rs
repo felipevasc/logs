@@ -1954,3 +1954,37 @@ fn evtx_samples_triage() {
         }
     }
 }
+
+#[test]
+fn lanes_entities_sightings_and_hashes() {
+    let text = [
+        r#"{"timestamp":"2024-01-31T08:00:00Z","level":"error","message":"login failed for alice","user":"alice","src_ip":"45.90.12.3"}"#,
+        r#"{"timestamp":"2024-01-31T08:00:30Z","level":"info","message":"login ok","user":"alice","src_ip":"10.0.0.2"}"#,
+        r#"{"timestamp":"2024-01-31T08:01:00Z","level":"info","message":"download evil.example.com","user":"bob","src_ip":"10.0.0.3"}"#,
+        r#"{"timestamp":"2024-01-31T08:02:00Z","level":"info","message":"idle"}"#,
+    ]
+    .join("\n");
+    let fixture = Fixture::new(&text);
+    let state = state_for(crate::SourceData::Indexed(fixture.index("jsonl")));
+    let start = crate::sources::parse_timestamp("2024-01-31T08:00:00Z").unwrap();
+    let lanes = crate::pivots::lanes_impl(&state, vec![], start, start + 179_999, 3, "@user".into(), 1, None).unwrap();
+    assert_eq!(lanes.lanes.len(), 1);
+    assert_eq!(lanes.lanes[0].value, "alice");
+    assert_eq!(lanes.lanes[0].counts, vec![2, 0, 0]);
+    assert_eq!(lanes.lanes[0].errors, 1);
+    assert_eq!(lanes.others.as_ref().unwrap().total, 1);
+    assert_eq!(lanes.missing, 1);
+    let groups = crate::pivots::entity_summary_impl(&state, vec![], 10, None).unwrap();
+    let users = groups.iter().find(|g| g.column == "@user").unwrap();
+    assert_eq!(users.values[0].value, "alice");
+    assert_eq!(users.values[0].count, 2);
+    let ips = groups.iter().find(|g| g.column == "@src_ip").unwrap();
+    assert!(ips.values.iter().any(|v| v.value == "45.90.12.3" && v.scope.as_deref() == Some("público")));
+    let seen = crate::pivots::sightings_impl(&state, vec!["EVIL.example.com".into(), "45.90.12.3".into(), "absent.io".into()], vec![]).unwrap();
+    let by = |v: &str| seen.iter().find(|s| s.value == v).unwrap().count;
+    assert_eq!((by("EVIL.example.com"), by("45.90.12.3"), by("absent.io")), (1, 1, 0));
+    let hashes = crate::pivots::hashes_impl(&state).unwrap();
+    use sha2::Digest;
+    assert_eq!(hashes[0].sha256, format!("{:x}", sha2::Sha256::digest(text.as_bytes())));
+    assert_eq!(hashes[0].origin, "original");
+}
