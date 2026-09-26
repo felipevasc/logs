@@ -88,6 +88,14 @@ window.CaseReport = (() => {
     if(overview.blob)await image(await toDataURL(overview.blob),overview.width,overview.height,overview.overview?overview.summary:'Visão temporal dos registros preservados no Caso.',125);
     else await paragraph('Os registros deste Caso não têm horário reconhecido. A tabela a seguir inclui as ocorrências sem data.',{size:10});
     if(timeline.undated)await paragraph(`${timeline.undated} registros sem horário estão identificados na tabela.`,{size:8,color:[112,117,129]});
+    const facts=window.CaseIntel?.synthesis(c,item=>byId.get(item.id)?.ref);
+    if(facts&&(facts.hypotheses.length||facts.techniques.length||facts.indicators.length||facts.custody.length)){
+      section='Síntese da investigação';progress('Incluindo hipóteses, indicadores e integridade…');await heading(section,{fresh:true});
+      if(facts.hypotheses.length){await heading('Hipóteses',{level:2});for(const h of facts.hypotheses)await paragraph(`${h.status.toUpperCase()} · ${h.text}${h.refs.length?`\nEvidências: ${h.refs.join(', ')}`:''}`,{size:9.5});y+=3;}
+      if(facts.techniques.length){await heading('Técnicas observadas (MITRE ATT&CK)',{level:2});for(const t of facts.techniques)await paragraph(`${t.id} ${t.name}${t.tactics.length?` · ${t.tactics.join(', ')}`:''}${t.refs.length?` · ${t.refs.join(', ')}`:''}`,{size:9,gap:2});y+=3;}
+      if(facts.indicators.length){await heading('Indicadores',{level:2});for(const i of facts.indicators)await paragraph(`${i.value} · ${i.kind} · ${i.status} · ${CaseIntel.sightingText(i.sightings)}${i.note?`\n${i.note}`:''}`,{size:9,gap:2});y+=3;}
+      if(facts.custody.length){await heading('Integridade das fontes (SHA-256)',{level:2});for(const a of facts.custody){await paragraph(a.label,{size:9,bold:true,gap:1});for(const f of a.files)await paragraph(`${f.name}${f.origin==='extraído'?' (extraído do pacote)':''} · ${fmtBytes(f.bytes)}\n${f.sha256}`,{size:8,color:[80,86,98],gap:2});await paragraph(`Calculado em ${stamp(a.at)}`,{size:7.5,color:[120,124,136]});}}
+    }
     section='Linha do tempo';await heading(section,{fresh:true});
     await paragraph(`${timeline.rows.length} ocorrências em ordem temporal. Referências I001, I002… identificam os itens detalhados nas próximas seções.`,{size:9,color:[104,110,124]});
     const columns=[LEFT,53,158,RIGHT], tableLine=4.2;

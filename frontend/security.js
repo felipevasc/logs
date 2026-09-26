@@ -78,11 +78,12 @@ window.Security = (() => {
     const rows = [];
     for (const id of ids) { try { const row = await api("event_detail", { id }, { silent: true }); if (row) rows.push(row); } catch { /* record no longer available */ } }
     const c = ensureCase();
+    queueCustody(registerCurrentArtifact(c));
     const start = Math.min(...detections.map(d => d.start ?? Infinity)), end = Math.max(...detections.map(d => d.end ?? -Infinity));
     const filters = detections.length === 1 ? detectionFilters(detections[0]) : [];
     c.items.push({
       id: "i" + Date.now().toString(36) + Math.floor(Math.random() * 1e4), kind: "grupo", label: title, note: summary, createdAt: Date.now(),
-      rows, sourceFilters: [...backendFilters().filter(f => f.column !== "timestamp" && !f._quick), ...filters], sourceSpec: structuredClone(state.currentArtifact?.source),
+      rows, sourceFilters: [...backendFilters().filter(f => f.column !== "timestamp"), ...filters], sourceSpec: structuredClone(state.currentArtifact?.source),
       foundCount: detections.reduce((n, d) => n + d.count, 0), includedCount: rows.length, tags: ["detecção"], relevance: detections.some(d => SEVERITY[d.severity]?.[1] >= 3) ? "importante" : "normal",
       origin: state.currentOrigin, artifactId: state.currentArtifact?.id, stationId: null,
       detection: { detections: detections.map(d => ({ rule: d.rule, name: d.name, severity: d.severity, attack: d.attack, tactics: d.tactics, summary: d.summary, start: d.start, end: d.end, count: d.count, entities: d.entities })), start: Number.isFinite(start) ? start : null, end: Number.isFinite(end) ? end : null },

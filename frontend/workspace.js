@@ -189,10 +189,35 @@
       const reload = el("button", "btn ghost", "Recarregar fontes");
       $("#ws-source-config").after(reload);
       reload.onclick = async () => { if (state.currentArtifact?.source && await loadData(state.currentArtifact.source)) await showPage("sources"); };
+      const short = hash => `${hash.slice(0, 12)}…${hash.slice(-8)}`;
+      const showHashes = list => content.querySelectorAll("tbody tr").forEach((row, i) => {
+        const path = sourceList[i].path, own = list.find(h => h.path === path);
+        const pack = path.includes("!/") ? list.find(h => h.path === path.split("!/")[0]) : null;
+        row.querySelector(".source-hash")?.remove();
+        if (!own) return;
+        const line = el("div", "pattern-meta source-hash");
+        const code = (hash, label) => { const b = el("button", "hash-copy", `${label} ${short(hash.sha256)}`); b.type = "button"; b.title = `${hash.name} · ${fmtBytes(hash.bytes)}\n${hash.sha256}\nClique para copiar`; b.onclick = () => navigator.clipboard?.writeText(hash.sha256).then(() => toast("SHA-256 copiado.", "ok")); return b; };
+        line.append(code(own, own.origin === "extraído" ? "SHA-256 (extraído)" : "SHA-256"));
+        if (pack) line.append(code(pack, "pacote"));
+        row.cells[1].append(line);
+      });
       content.querySelectorAll("tbody tr").forEach((row, i) => {
         const button = el("button", "text-button", "Data/hora");
         button.onclick = async () => { await loadTsConfig(sourceList[i].path); openTsModal(sourceList[i].path); };
-        row.cells[1].append(button);
+        const hash = el("button", "text-button", "SHA-256");
+        hash.title = "Calcular o SHA-256 dos arquivos para a cadeia de custódia";
+        hash.onclick = async () => {
+          const restore = btnBusy(hash, "Calculando…");
+          try {
+            const list = await api("source_hashes", {});
+            showHashes(list);
+            const c = activeCase(), artifact = c?.artifacts?.find(a => a.id === state.currentArtifact?.id);
+            if (artifact && recordCustody(artifact, list)) saveCases();
+          } catch {} finally { restore(); }
+        };
+        const actions = el("div", "source-actions");
+        actions.append(button, hash);
+        row.cells[1].append(actions);
       });
       content.querySelectorAll(".source-remove-btn").forEach(btn => {
         btn.onclick = async () => { await removeSource(+btn.dataset.removeIndex); };
@@ -304,6 +329,7 @@
     const row = finding.event_id != null ? await api("event_detail", { id: finding.event_id }) : null;
     const filters = [...backendFilters().filter(f => f.column !== "timestamp")];
     if (finding.start != null && finding.end != null) filters.push({ column: "timestamp", op: "between", value: String(finding.start), value2: String(finding.end) });
+    queueCustody(registerCurrentArtifact(c));
     c.items.push({ id: nid(), kind: "grupo", label: finding.title, note: finding.detail, createdAt: Date.now(), rows: row ? [row] : [], sourceFilters: filters, sourceSpec: structuredClone(state.currentArtifact?.source), foundCount: null, includedCount: row ? 1 : 0, tags: [], relevance: "normal", origin: state.currentOrigin, artifactId: state.currentArtifact?.id, stationId: null });
     if (await saveCases()) { updateCounts(); toast("Evidência salva.", "ok"); }
   }
@@ -312,6 +338,7 @@
     if (workspaceScope() === "case") { toast("Este registro já pertence ao Caso.", "info"); return; }
     const c = ensureCase(); const key = caseRecordKey(ev, state.currentArtifact?.id, state.currentOrigin);
     if (c.items.some(it => it.rows?.some(r => caseRecordKey(r, it.artifactId, it.origin) === key))) { toast("Este evento já está nas evidências.", "info"); return; }
+    queueCustody(registerCurrentArtifact(c));
     c.items.push({ id: nid(), kind: "evento", label: ev.message.split("\n")[0].slice(0, 140), note: "", createdAt: Date.now(), rows: [structuredClone(ev)], sourceFilters: backendFilters(), sourceSpec: structuredClone(state.currentArtifact?.source), foundCount: 1, includedCount: 1, tags: [], relevance: "normal", origin: state.currentOrigin, artifactId: state.currentArtifact?.id, stationId: null });
     if (await saveCases()) { updateCounts(); window.WorkspaceContext?.refreshMembership(); toast("Evento salvo.", "ok"); }
   }
@@ -392,9 +419,19 @@
       } catch (error) { toast(String(error), "err"); }
     };
   }
+  function synthesisMarkdown(c) {
+    const facts = window.CaseIntel?.synthesis(c);
+    if (!facts) return "";
+    const parts = [];
+    if (facts.hypotheses.length) parts.push(`## Hipóteses\n\n${facts.hypotheses.map(h => `- **${h.status}** · ${h.text}${h.refs.length ? ` (evidências: ${h.refs.join("; ")})` : ""}`).join("\n")}`);
+    if (facts.techniques.length) parts.push(`## Técnicas observadas (MITRE ATT&CK)\n\n${facts.techniques.map(t => `- ${t.id} ${t.name}${t.tactics.length ? ` · ${t.tactics.join(", ")}` : ""}`).join("\n")}`);
+    if (facts.indicators.length) parts.push(`## Indicadores\n\n| Valor | Tipo | Estado | Nas fontes |\n|---|---|---|---|\n${facts.indicators.map(i => `| \`${i.value.replace(/\|/g, "\\|")}\` | ${i.kind} | ${i.status} | ${window.CaseIntel.sightingText(i.sightings)} |`).join("\n")}`);
+    if (facts.custody.length) parts.push(`## Integridade das fontes (SHA-256)\n\n${facts.custody.map(a => a.files.map(f => `- ${a.label} · ${f.name}${f.origin === "extraído" ? " (extraído do pacote)" : ""} · ${fmtBytes(f.bytes)}\n  \`${f.sha256}\``).join("\n")).join("\n")}`);
+    return parts.length ? `${parts.join("\n\n")}\n\n` : "";
+  }
   function report() {
     const c = activeCase();
-    return `# ${c?.name || "Investigação"}\n\n${(c?.items || []).map(it => `## ${it.label}\n\n${Object.values(CaseContent.narrative(it)).filter(Boolean).join("\n\n")}\n\n${it.rows?.length || 0} eventos preservados.\n\n${(it.rows || []).map(e => `- ${fmtTsFull(e.timestamp)} · ${e.source} · ${e.message.replaceAll("\n", " ")}\n  Referência: ${e.event_ref || e.id}`).join("\n")}\n\nFiltros: ${JSON.stringify(it.sourceFilters || [])}`).join("\n\n")}`;
+    return `# ${c?.name || "Investigação"}\n\n${synthesisMarkdown(c)}${(c?.items || []).map(it => `## ${it.label}\n\n${Object.values(CaseContent.narrative(it)).filter(Boolean).join("\n\n")}\n\n${it.rows?.length || 0} eventos preservados.\n\n${(it.rows || []).map(e => `- ${fmtTsFull(e.timestamp)} · ${e.source} · ${e.message.replaceAll("\n", " ")}\n  Referência: ${e.event_ref || e.id}`).join("\n")}\n\nFiltros: ${JSON.stringify(it.sourceFilters || [])}`).join("\n\n")}`;
   }
   function openExport() { $("#ws-export-modal").hidden = false; $("#ws-export-kind").focus(); $("#ws-export-kind").dispatchEvent(new Event("change")); $("#ws-export-scope").textContent = `${fmtNum(state.total)} eventos no recorte atual. A exportação de eventos inclui todos os resultados.`; }
   async function exportFile() {

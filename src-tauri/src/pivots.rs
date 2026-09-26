@@ -468,21 +468,39 @@ pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
         SourceData::Indexed(idx) => idx.parts.iter().map(|p| (p.identity.clone(), p.path.clone(), p.file_name.clone())).collect(),
         _ => Vec::new(),
     };
+    // A package member is hashed as extracted, and the package itself as the
+    // user opened it. Live channels and other non-file sources have no hash.
+    let mut jobs: Vec<(String, String, String, std::path::PathBuf, &'static str)> = Vec::new();
+    for (id, path, name) in parts {
+        match workspace::resolve_member(&path)? {
+            Some(member) => {
+                let container = path.split("!/").next().unwrap_or(&path).to_string();
+                if !jobs.iter().any(|job| job.1 == container) {
+                    let file = std::path::Path::new(&container);
+                    let stamp = std::fs::metadata(file).ok().map(|m| (m.len(), m.modified().ok()));
+                    let label = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| container.clone());
+                    jobs.push((format!("package:{container}:{stamp:?}"), container.clone(), label, file.to_path_buf(), "original"));
+                }
+                jobs.push((id, path, name, member, "extraído"));
+            }
+            None if std::path::Path::new(&path).is_file() => {
+                let physical = std::path::PathBuf::from(&path);
+                jobs.push((id, path, name, physical, "original"));
+            }
+            None => {}
+        }
+    }
     use rayon::prelude::*;
     let generation = crate::operations::current_generation();
-    let results: Vec<Result<SourceHash, String>> = parts
+    let results: Vec<Result<SourceHash, String>> = jobs
         .into_par_iter()
-        .map(|(id, path, name)| {
+        .map(|(id, path, name, physical, origin)| {
             if let Some((_, hit)) = HASHES.lock().iter().find(|(k, _)| *k == id) {
                 return Ok(hit.clone());
             }
             if crate::operations::cancelled_for(generation) {
                 return Err("Operação cancelada.".into());
             }
-            let (physical, origin) = match workspace::resolve_member(&path)? {
-                Some(member) => (member, "extraído"),
-                None => (std::path::PathBuf::from(&path), "original"),
-            };
             let (sha256, bytes) = sha256_file(&physical)?;
             let hash = SourceHash { id: id.clone(), path, name, bytes, sha256, origin: origin.into() };
             let mut cache = HASHES.lock();

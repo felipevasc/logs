@@ -2845,6 +2845,27 @@ function caseArtifacts(c = activeCase()) {
   return c.artifacts;
 }
 
+// Chain of custody: files that contribute records to a Case are hashed once per load, in the background.
+const custodyPending = new Set();
+function hashFiles(list) {
+  return list.map(({ path, name, bytes, sha256, origin }) => ({ path, name, bytes, sha256, origin }));
+}
+function recordCustody(artifact, list, loadedAt = state.currentArtifact?.loadedAt) {
+  if (!artifact || !list?.length) return false;
+  artifact.hashes = { at: Date.now(), loadedAt, files: hashFiles(list) };
+  return true;
+}
+function queueCustody(artifact) {
+  const current = state.currentArtifact;
+  if (!artifact || !current || artifact.id !== current.id || !["file", "bundle"].includes(current.kind)) return;
+  if (artifact.hashes?.loadedAt === current.loadedAt || custodyPending.has(artifact.id)) return;
+  custodyPending.add(artifact.id);
+  api("source_hashes", {}, { silent: true })
+    .then(list => { if (state.currentArtifact?.loadedAt === current.loadedAt && recordCustody(artifact, list, current.loadedAt)) saveCases(); })
+    .catch(() => {})
+    .finally(() => custodyPending.delete(artifact.id));
+}
+
 function registerCurrentArtifact(c = activeCase()) {
   if (!c || !state.currentArtifact) return null;
   c.activeArtifactId = state.currentArtifact.id; // restaura o artefato aberto ao reabrir
@@ -3316,6 +3337,7 @@ function addGroupToAnalysis(column, value, name, op = "equals_exact") {
 
 function caseItemBase(kind, stationId, foundCount, includedCount) {
   const artifact = registerCurrentArtifact();
+  queueCustody(artifact);
   if (artifact) artifact.stationId = stationId || null;
   return {
     id: "i" + Date.now().toString(36) + Math.floor(Math.random() * 1e4),
@@ -3715,6 +3737,13 @@ function renderCaseData(box, c) {
     const station = (c.stations || []).find((item) => item.id === artifact.stationId);
     row.appendChild(el("span", "", `${artifact.kind === "eventlog" ? "Event Log" : "Arquivo"} · ${countLabel(artifact.count || 0, "evento")}${station ? ` · ${station.name}` : ""}`));
     if (artifact.path) row.appendChild(el("small", "", artifact.path));
+    for (const file of artifact.hashes?.files || []) {
+      const hash = el("button", "case-hash", `SHA-256 ${file.sha256.slice(0, 12)}…${file.sha256.slice(-8)}`);
+      hash.type = "button";
+      hash.title = `${file.name}${file.origin === "extraído" ? " (extraído do pacote)" : ""} · ${fmtBytes(file.bytes)}\n${file.sha256}\nCalculado em ${fmtTsFull(artifact.hashes.at)}\nClique para copiar`;
+      hash.onclick = () => navigator.clipboard?.writeText(file.sha256).then(() => toast("SHA-256 copiado.", "ok"));
+      row.appendChild(hash);
+    }
     artifacts.appendChild(row);
   }
   data.appendChild(artifacts);

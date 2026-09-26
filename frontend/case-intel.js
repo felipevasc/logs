@@ -166,5 +166,24 @@ window.CaseIntel = (() => {
     const list = c ? intel(c).hypotheses.filter(h => !h.items.includes(item.id)) : [];
     return list.slice(0, 6).map(h => ({ icon: "fa-lightbulb", label: `Vincular a: ${h.text.slice(0, 48)}`, onClick: () => { h.items.push(item.id); persist(c, "Evidência vinculada à hipótese."); } }));
   }
-  return { addIndicator, mount, menuItems, intel };
+  /** What the reports state about the investigation; `ref(item)` names an item. */
+  function synthesis(c, ref = item => item.label || "Item") {
+    const items = c?.items || [], byId = new Map(items.map(item => [item.id, item]));
+    const data = c?.intel || {};
+    const techniques = new Map();
+    for (const item of items) for (const d of item.detection?.detections || []) for (const a of d.attack || []) {
+      const t = techniques.get(a.id) || techniques.set(a.id, { id: a.id, name: a.name, tactics: a.tactics || [], refs: [] }).get(a.id);
+      const r = ref(item);
+      if (r && !t.refs.includes(r)) t.refs.push(r);
+    }
+    return {
+      hypotheses: (data.hypotheses || []).map(h => ({ status: h.status, text: h.text, refs: (h.items || []).map(id => byId.get(id)).filter(Boolean).map(ref) })),
+      techniques: [...techniques.values()].sort((a, b) => a.id.localeCompare(b.id)),
+      indicators: (data.indicators || []).map(i => ({ value: i.value, kind: i.kind, status: i.status, note: i.note || "", sightings: i.sightings || null })),
+      custody: (c?.artifacts || []).filter(a => a.hashes?.files?.length).map(a => ({ label: a.label || a.path || "Artefato", at: a.hashes.at, files: a.hashes.files })),
+    };
+  }
+  const sightingText = s => !s ? "não verificado" : s.count ? `${s.count} ocorrências nas fontes` : "sem ocorrências nas fontes verificadas";
+
+  return { addIndicator, mount, menuItems, intel, synthesis, sightingText };
 })();
