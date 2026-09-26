@@ -2047,6 +2047,7 @@ pub fn index_file(
     // Descoberta de colunas: amostra das primeiras 2.000 linhas.
     let mut columns: Vec<String> = STANDARD_COLUMNS.iter().map(|s| s.to_string()).collect();
     let mut extra = std::collections::HashSet::new();
+    let mut sampled = Vec::with_capacity(lines.len().min(4_000));
     for sample in 0..lines.len().min(4_000) {
         let i = sample * lines.len() / lines.len().min(4_000);
         let m = &lines[i];
@@ -2059,10 +2060,18 @@ pub fn index_file(
         for k in ev.fields.keys() {
             extra.insert(k.clone());
         }
+        sampled.push(ev);
     }
     let mut extra: Vec<String> = extra.into_iter().collect();
     extra.sort();
     columns.extend(extra);
+    // Canonical entities (@user, @src_ip…) observed in the sample.
+    for column in crate::entities::observed_columns(sampled.iter()) {
+        if !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+    drop(sampled);
 
     // campos de origem sempre disponíveis como colunas
     for extra_col in ["arquivo", "caminho"] {
