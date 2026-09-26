@@ -125,3 +125,9 @@
 .rule-row:hover{background:var(--hover)}.rule-row input{accent-color:var(--accent)}.rule-row small{font:10px var(--font-mono);color:var(--text-2)}
 .rules-suppress,.rules-errors{margin:4px 0 10px;font-size:12px;color:var(--text-1)}.rules-suppress summary,.rules-errors summary{cursor:pointer;padding:4px 0}
 .rules-suppressed{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-bottom:1px solid var(--border)}.rules-errors div{font:11px var(--font-mono);color:var(--text-2);padding:3px 0}
+
+/* Chain of custody: short hash, full value on hover, click to copy. */
+.hash-copy,.case-hash{padding:0;border:0;background:none;color:var(--text-2);font:10px var(--font-mono);font-variant-numeric:tabular-nums;text-align:left;cursor:copy}
+.hash-copy{margin-right:12px}.case-hash{display:block;margin-top:3px}
+.hash-copy:hover,.case-hash:hover,.hash-copy:focus-visible,.case-hash:focus-visible{color:var(--text-0)}
+.source-actions{display:flex;gap:14px;align-items:center}

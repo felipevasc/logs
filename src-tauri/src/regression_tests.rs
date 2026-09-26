@@ -1900,6 +1900,15 @@ fn zip_and_tar_members_become_sources() {
     assert_eq!(index.lines.len(), 2);
     assert_eq!(index.parts[0].path, members[0]);
     assert_eq!(index.parts[0].file_name, "app.log");
+    // Custody: the package as opened and the member as read.
+    let state = state_for(crate::SourceData::Indexed(index));
+    let hashes = crate::pivots::hashes_impl(&state).unwrap();
+    use sha2::Digest;
+    let package = hashes.iter().find(|h| h.origin == "original").unwrap();
+    assert_eq!(package.name, "pack.zip");
+    assert_eq!(package.sha256, format!("{:x}", sha2::Sha256::digest(std::fs::read(&zip_path).unwrap())));
+    let member = hashes.iter().find(|h| h.origin == "extraído").unwrap();
+    assert_eq!(member.sha256, format!("{:x}", sha2::Sha256::digest(b"2024-01-31 10:00:00 ERROR falha\n2024-01-31 10:00:01 INFO ok\n")));
 
     let tgz_path = dir.join("pack.tar.gz");
     {
