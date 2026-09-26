@@ -513,6 +513,22 @@ function activityHide() {
   setTimeout(() => { if (!activity.count) ind.hidden = true; }, 180);
 }
 
+// Case records travel once per version; commands then refer to them by key.
+const caseTransport = { keys: new WeakMap(), synced: new Set(), serial: 0 };
+async function caseArgs(args, resync = false) {
+  const events = args.caseEvents;
+  if (!Array.isArray(events)) return args;
+  let key = caseTransport.keys.get(events);
+  if (!key) { key = `case-${++caseTransport.serial}-${events.length}`; caseTransport.keys.set(events, key); }
+  if (resync || !caseTransport.synced.has(key)) {
+    await invoke("case_sync", { key, events });
+    caseTransport.synced.add(key);
+    if (caseTransport.synced.size > 3) caseTransport.synced.delete(caseTransport.synced.values().next().value);
+  }
+  const { caseEvents: _omit, ...rest } = args;
+  return { ...rest, caseKey: key };
+}
+
 async function api(cmd, args = {}, opts = {}) {
   const track = !opts.silent;
   if (track) {
@@ -522,7 +538,13 @@ async function api(cmd, args = {}, opts = {}) {
   try {
     if (args.filters?.length) await invoke("validate_filters", { filters: args.filters });
     if (/^(load_|clear_|set_|save_|delete_|harvest_)/.test(cmd)) state.explorerCache = null;
-    return await invoke(cmd, args);
+    try {
+      return await invoke(cmd, await caseArgs(args));
+    } catch (error) {
+      // The backend keeps a few versions; a missing one is sent again once.
+      if (String(error).includes("CASE_CACHE_MISS")) return await invoke(cmd, await caseArgs(args, true));
+      throw error;
+    }
   } catch (e) {
     if (!opts.silent) toast(String(e), "err");
     throw e;
