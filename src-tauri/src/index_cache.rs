@@ -14,8 +14,24 @@ pub fn prune() {
     for old in ["indexes", "indexes-v1", "indexes-v2", "indexes-v3", "indexes-v4"] {
         let _ = std::fs::remove_dir_all(base.join(old));
     }
-    let Ok(entries) = std::fs::read_dir(base.join(INDEX_DIR)) else { return };
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+    // Expanded packages and event-log snapshots are recreated on demand.
+    for folder in ["expanded", "snapshots"] {
+        let Ok(entries) = std::fs::read_dir(base.join(folder)) else { continue };
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .is_some_and(|t| t < cutoff);
+            let pending = entry.file_name().to_string_lossy().contains("pending");
+            if stale || pending {
+                let path = entry.path();
+                let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(base.join(INDEX_DIR)) else { return };
     for entry in entries.flatten() {
         let stale = entry
             .metadata()

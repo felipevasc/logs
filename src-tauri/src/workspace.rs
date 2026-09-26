@@ -980,14 +980,21 @@ pub async fn expand_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_lowercase();
-                if explicit
+                let text = path.to_string_lossy().into_owned();
+                if archive_kind(&text).is_some() {
+                    let members = archive_members(&path)?;
+                    if members.is_empty() && explicit {
+                        return Err(format!("Nenhum arquivo de log em {}.", path.display()));
+                    }
+                    files.extend(members);
+                } else if explicit
                     || [
-                        "log", "txt", "jsonl", "ndjson", "json", "csv", "tsv", "evtx", "gz",
+                        "log", "txt", "jsonl", "ndjson", "json", "csv", "tsv", "evtx", "gz", "audit",
                     ]
                     .contains(&ext.as_str())
                     || ext.parse::<u32>().is_ok()
                 {
-                    files.push(path.to_string_lossy().into_owned());
+                    files.push(text);
                 }
             }
         }
@@ -1000,6 +1007,181 @@ pub async fn expand_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
     })
     .await?
 }
+// ------------------------------------------------------------------ archives
+
+const ARCHIVE_SEPARATOR: &str = "!/";
+const ARCHIVE_MEMBERS: usize = 10_000;
+const ARCHIVE_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+pub fn archive_kind(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".zip") {
+        Some("zip")
+    } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        Some("tgz")
+    } else if lower.ends_with(".tar") {
+        Some("tar")
+    } else {
+        None
+    }
+}
+
+/// Member paths that look like logs (text, compressed logs, EVTX).
+fn loggable_member(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    if file.is_empty() || file.starts_with('.') || lower.contains("__macosx/") {
+        return false;
+    }
+    let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    ["log", "txt", "jsonl", "ndjson", "json", "csv", "tsv", "evtx", "gz", "out", "err", "audit"].contains(&ext)
+        || ext.is_empty()
+        || ext.parse::<u32>().is_ok()
+}
+
+/// Relative path without traversal, absolute roots or drive letters.
+fn safe_member_path(name: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for part in name.replace('\\', "/").split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return None,
+            p if p.contains(':') => return None,
+            p => out.push(p),
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+fn archive_dir(archive: &Path) -> Result<PathBuf, String> {
+    let file = std::fs::File::open(archive).map_err(|e| format!("Não foi possível abrir {}: {e}", archive.display()))?;
+    let mapped = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| e.to_string())?;
+    let id = crate::index_cache::identity(&archive.to_string_lossy(), &mapped);
+    Ok(crate::config_dir().join("expanded").join(format!("archive-{}", &id[..16])))
+}
+
+/// Extracts the loggable members once (atomically marked complete) and
+/// returns their relative names.
+fn extract_archive(archive: &Path) -> Result<(PathBuf, Vec<String>), String> {
+    let dir = archive_dir(archive)?;
+    let manifest = dir.join(".members");
+    if let Ok(text) = std::fs::read_to_string(&manifest) {
+        return Ok((dir, text.lines().map(str::to_string).collect()));
+    }
+    let staging = dir.with_extension(format!("pending-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+    let result = (|| -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        let mut total = 0u64;
+        let mut write_member = |name: &str, reader: &mut dyn Read, declared: u64| -> Result<(), String> {
+            crate::operations::check()?;
+            if !loggable_member(name) {
+                return Ok(());
+            }
+            let Some(relative) = safe_member_path(name) else { return Ok(()) };
+            if names.len() >= ARCHIVE_MEMBERS {
+                return Err("O pacote tem mais de 10.000 arquivos de log.".into());
+            }
+            let target = staging.join(&relative);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut out = BufWriter::new(std::fs::File::create(&target).map_err(|e| e.to_string())?);
+            let mut buf = [0u8; 65536];
+            let mut written = 0u64;
+            loop {
+                let n = reader.read(&mut buf).map_err(|e| format!("Falha ao extrair {name}: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                written += n as u64;
+                total += n as u64;
+                if total > ARCHIVE_TOTAL_BYTES || (declared > 0 && written > declared.saturating_mul(2) + 1024 * 1024) {
+                    return Err("O pacote excede o limite de extração (64 GB) ou declara tamanhos inconsistentes.".into());
+                }
+                out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                if written % (64 * 1024 * 1024) < 65536 {
+                    crate::operations::check()?;
+                }
+            }
+            out.flush().map_err(|e| e.to_string())?;
+            names.push(relative.to_string_lossy().replace('\\', "/"));
+            Ok(())
+        };
+        match archive_kind(&archive.to_string_lossy()) {
+            Some("zip") => {
+                let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+                let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| format!("ZIP inválido: {e}"))?;
+                for i in 0..zip.len() {
+                    let mut entry = zip.by_index(i).map_err(|e| format!("ZIP inválido: {e}"))?;
+                    if entry.is_dir() || entry.encrypted() {
+                        continue;
+                    }
+                    let name = entry.name().to_string();
+                    let size = entry.size();
+                    write_member(&name, &mut entry, size)?;
+                }
+            }
+            Some(kind) => {
+                let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+                let reader: Box<dyn Read> = if kind == "tgz" {
+                    Box::new(flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file)))
+                } else {
+                    Box::new(std::io::BufReader::new(file))
+                };
+                let mut tar = tar::Archive::new(reader);
+                for entry in tar.entries().map_err(|e| format!("TAR inválido: {e}"))? {
+                    let mut entry = entry.map_err(|e| format!("TAR inválido: {e}"))?;
+                    if !entry.header().entry_type().is_file() {
+                        continue;
+                    }
+                    let name = entry.path().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+                    let size = entry.header().size().unwrap_or(0);
+                    write_member(&name, &mut entry, size)?;
+                }
+            }
+            None => return Err("Formato de pacote não suportado.".into()),
+        }
+        Ok(names)
+    })();
+    match result {
+        Ok(names) => {
+            std::fs::write(staging.join(".members"), names.join("\n")).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::rename(&staging, &dir).map_err(|e| e.to_string())?;
+            Ok((dir, names))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
+}
+
+/// Virtual paths (`pacote.zip!/pasta/app.log`) for the members of an archive.
+pub fn archive_members(archive: &Path) -> Result<Vec<String>, String> {
+    let (_, names) = extract_archive(archive)?;
+    Ok(names
+        .into_iter()
+        .map(|name| format!("{}{ARCHIVE_SEPARATOR}{name}", archive.to_string_lossy()))
+        .collect())
+}
+
+/// Resolves a virtual member path to its extracted file.
+pub fn resolve_member(path: &str) -> Result<Option<PathBuf>, String> {
+    let Some((archive, member)) = path.split_once(ARCHIVE_SEPARATOR) else { return Ok(None) };
+    if archive_kind(archive).is_none() {
+        return Ok(None);
+    }
+    let relative = safe_member_path(member).ok_or("Caminho inválido dentro do pacote.")?;
+    let (dir, _) = extract_archive(Path::new(archive))?;
+    let target = dir.join(relative);
+    if !target.is_file() {
+        return Err(format!("{member} não foi encontrado em {archive}."));
+    }
+    Ok(Some(target))
+}
+
 pub fn expand_gzip(path: &Path) -> Result<PathBuf, String> {
     let dir = crate::config_dir().join("expanded");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

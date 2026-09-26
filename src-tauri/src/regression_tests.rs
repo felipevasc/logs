@@ -1804,3 +1804,153 @@ fn search_language_filters_indexed_and_memory_sources_alike() {
     assert!(workspace::validate(&[filter("_all", "query", "user:(alice")]).is_err());
     assert!(workspace::validate(&[filter("src_ip", "cidr", "10.0.0.0/99")]).is_err());
 }
+
+// ------------------------------------------------------------ ingestion
+
+fn events_of(index: &sources::FileIndex) -> Vec<Event> {
+    let codes = CodesConfig::default();
+    (0..index.lines.len()).map(|i| sources::event_at(index, i, &codes, &codes, &[])).collect()
+}
+
+#[test]
+fn json_envelopes_are_split_into_records() {
+    let cloudtrail = r#"{"Records":[{"eventVersion":"1.08","eventTime":"2024-01-31T10:00:00Z","eventSource":"signin.amazonaws.com","eventName":"ConsoleLogin","eventID":"a1b2","sourceIPAddress":"203.0.113.5","userIdentity":{"type":"Root","arn":"arn:aws:iam::1:root"},"responseElements":{"ConsoleLogin":"Success"},"additionalEventData":{"MFAUsed":"No"}},{"eventTime":"2024-01-31T10:05:00Z","eventSource":"iam.amazonaws.com","eventName":"CreateAccessKey","eventID":"c3d4","sourceIPAddress":"203.0.113.5","userIdentity":{"type":"IAMUser","userName":"ops"},"errorCode":"AccessDenied"}]}"#;
+    let fixture = Fixture::new(cloudtrail);
+    let index = fixture.index("auto");
+    assert_eq!(index.lines.len(), 2);
+    let events = events_of(&index);
+    assert_eq!(events[0].code, "ConsoleLogin");
+    assert_eq!(events[0].fields["eventID"], "a1b2");
+    assert!(events[0].message.contains("ConsoleLogin"));
+    assert_eq!(events[1].level, "Aviso");
+    assert_eq!(crate::entities::value(&events[0], crate::entities::Role::SrcIp).as_deref(), Some("203.0.113.5"));
+    let t = triage_events(events, false);
+    let rules = rules_of(&t);
+    assert!(rules.contains(&"cloud.root".to_string()) && rules.contains(&"cloud.console-no-mfa".to_string()), "{rules:?}");
+
+    let pretty = "{\n  \"meta\": {\"count\": 2},\n  \"value\": [\n    {\"time\": \"2024-01-31T10:00:00Z\", \"message\": \"a\"},\n    {\"time\": \"2024-01-31T10:00:01Z\", \"message\": \"b\"}\n  ],\n  \"next\": null\n}\n";
+    let fixture = Fixture::new(pretty);
+    let index = fixture.index("auto");
+    assert_eq!(events_of(&index).iter().map(|e| e.message.clone()).collect::<Vec<_>>(), ["a", "b"]);
+    let elastic = r#"{"took":3,"hits":{"total":{"value":1},"hits":[{"_source":{"@timestamp":"2024-01-31T10:00:00Z","message":"x"}}]}}"#;
+    let fixture = Fixture::new(elastic);
+    assert_eq!(fixture.index("auto").lines.len(), 1);
+    // JSONL with array fields stays line-oriented.
+    let jsonl = "{\"message\":\"a\",\"items\":[{\"x\":1}]}\n{\"message\":\"b\",\"items\":[]}\n";
+    let fixture = Fixture::new(jsonl);
+    assert_eq!(fixture.index("auto").lines.len(), 2);
+}
+
+#[test]
+fn zeek_auditd_and_suricata_are_readable() {
+    let zeek = "#separator \\x09\n#set_separator\t,\n#path\tconn\n#fields\tts\tuid\tid.orig_h\tid.orig_p\tid.resp_h\tid.resp_p\tproto\tservice\n#types\ttime\tstring\taddr\tport\taddr\tport\tenum\tstring\n1706695200.123456\tC1\t10.0.0.5\t51000\t93.184.216.34\t443\ttcp\tssl\n1706695201.5\tC2\t10.0.0.5\t51001\t8.8.8.8\t53\tudp\t-\n";
+    let fixture = Fixture::new(zeek);
+    let index = fixture.index("auto");
+    assert_eq!(index.format, "zeek");
+    let events = events_of(&index);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].timestamp, Some(1_706_695_200_123));
+    assert!(events[0].message.contains("10.0.0.5 → 93.184.216.34:443"), "{}", events[0].message);
+    assert!(!events[1].fields.contains_key("service"));
+    assert_eq!(crate::entities::value(&events[0], crate::entities::Role::DstIp).as_deref(), Some("93.184.216.34"));
+
+    let audit = "type=USER_AUTH msg=audit(1706695200.500:101): pid=1 uid=0 auid=4294967295 ses=4294967295 msg='op=PAM:authentication grantors=? acct=\"root\" exe=\"/usr/sbin/sshd\" hostname=45.90.12.3 addr=45.90.12.3 terminal=ssh res=failed'\ntype=EXECVE msg=audit(1706695201.000:102): argc=2 a0=\"cat\" a1=\"/etc/shadow\"\ntype=PROCTITLE msg=audit(1706695201.000:102): proctitle=636174002F6574632F736861646F77\n";
+    let fixture = Fixture::new(audit);
+    let index = fixture.index("auto");
+    assert_eq!(index.format, "auditd");
+    let events = events_of(&index);
+    assert_eq!(events[0].timestamp, Some(1_706_695_200_500));
+    assert_eq!(events[0].level, "Aviso");
+    assert_eq!(crate::entities::action_outcome(&events[0]), (Some("logon"), Some("failure")));
+    assert_eq!(crate::entities::value(&events[0], crate::entities::Role::User).as_deref(), Some("root"));
+    assert_eq!(crate::entities::value(&events[0], crate::entities::Role::SrcIp).as_deref(), Some("45.90.12.3"));
+    assert_eq!(events[2].fields["cmdline"], "cat /etc/shadow");
+    assert_eq!(events[1].fields["audit_serial"], events[2].fields["audit_serial"]);
+
+    let eve = r#"{"timestamp":"2024-01-31T10:00:00.000000+0000","event_type":"alert","src_ip":"45.90.12.3","dest_ip":"10.0.0.1","dest_port":22,"alert":{"signature":"ET SCAN SSH BruteForce","signature_id":2001219,"severity":2}}"#;
+    let fixture = Fixture::new(eve);
+    let events = events_of(&fixture.index("auto"));
+    assert_eq!(events[0].message, "ET SCAN SSH BruteForce");
+    assert_eq!(events[0].code, "2001219");
+    assert_eq!(events[0].level, "Aviso");
+    assert_eq!(crate::entities::action_outcome(&events[0]).0, Some("ids_alert"));
+}
+
+#[test]
+fn zip_and_tar_members_become_sources() {
+    let dir = std::env::temp_dir().join(format!("loginsight-archive-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let zip_path = dir.join("pack.zip");
+    {
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("logs/app.log", options).unwrap();
+        zip.write_all(b"2024-01-31 10:00:00 ERROR falha\n2024-01-31 10:00:01 INFO ok\n").unwrap();
+        zip.start_file("../evil.log", options).unwrap();
+        zip.write_all(b"x\n").unwrap();
+        zip.start_file("image.png", options).unwrap();
+        zip.write_all(b"\x89PNG").unwrap();
+        zip.finish().unwrap();
+    }
+    let members = workspace::archive_members(&zip_path).unwrap();
+    assert_eq!(members.len(), 1, "{members:?}");
+    assert!(members[0].ends_with("pack.zip!/logs/app.log"));
+    let index = crate::index_source_file(&members[0], "auto", None).unwrap();
+    assert_eq!(index.lines.len(), 2);
+    assert_eq!(index.parts[0].path, members[0]);
+    assert_eq!(index.parts[0].file_name, "app.log");
+
+    let tgz_path = dir.join("pack.tar.gz");
+    {
+        let file = std::fs::File::create(&tgz_path).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        let data = b"{\"message\":\"a\"}\n{\"message\":\"b\"}\n{\"message\":\"c\"}\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "srv/events.jsonl", &data[..]).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    let members = workspace::archive_members(&tgz_path).unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(crate::index_source_file(&members[0], "auto", None).unwrap().lines.len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Real EVTX samples (Windows event exports). Run with
+/// LOGINSIGHT_EVTX_SAMPLES=<dir> cargo test --lib evtx_samples -- --ignored --nocapture
+#[test]
+#[ignore]
+fn evtx_samples_triage() {
+    let dir = std::env::var("LOGINSIGHT_EVTX_SAMPLES").expect("LOGINSIGHT_EVTX_SAMPLES");
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "evtx") || std::fs::metadata(&path).unwrap().len() < 1000 {
+            continue;
+        }
+        let mut events = Vec::new();
+        let count = sources::visit_evtx_file(path.to_str().unwrap(), usize::MAX, |mut e| {
+            e.id = events.len();
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        assert!(count > 0);
+        if std::env::var("LOGINSIGHT_EVTX_DUMP").is_ok() {
+            for e in events.iter().take(8) {
+                println!("   {} {} {:?}", e.source, e.code, e.fields.iter().filter(|(k, _)| !["arquivo", "caminho"].contains(&k.as_str())).map(|(k, v)| format!("{k}={}", v.to_string().chars().take(80).collect::<String>())).collect::<Vec<_>>());
+            }
+        }
+        let t = triage_events(events, true);
+        println!("\n== {} ({} eventos)", path.file_name().unwrap().to_string_lossy(), count);
+        for d in &t.detections {
+            println!("  [{}] {} · {} · {}", d.severity, d.name, d.count, d.summary);
+        }
+        for e in &t.episodes {
+            println!("  episódio: {} ({}) {:?}", e.title, e.severity, e.tactics);
+        }
+    }
+}
