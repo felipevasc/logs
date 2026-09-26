@@ -71,7 +71,7 @@ try {
   await page.waitForFunction(() => { const labels = Tasks.groups().map(g => g.label).join("|"); return /Linha do tempo/.test(labels) && /Padrões/.test(labels); });
   const status = await page.locator("#workbar-tasks span").textContent();
   assert.match(status, /^Carregando /);
-  assert.equal(await page.locator('.nav-pages [data-page="case-timeline"]').getAttribute("data-loading"), "");
+  assert.equal(await page.locator('.nav-pages [data-page="case-timeline"] > .li-waves').count(), 1, "the loading menu item is veiled with waves");
   await page.click('.nav-pages [data-page="case-timeline"]');
   await page.waitForTimeout(300);
   assert.equal(await page.evaluate(() => window.__mockCommandCalls.timeline_range) - before, 0, "returning joins the same request");

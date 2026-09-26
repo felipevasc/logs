@@ -138,37 +138,27 @@
 .ui-pref .seg{display:inline-flex;flex-wrap:wrap;width:max-content;max-width:100%;margin:0}.ui-pref .seg-btn i{margin-right:6px;font-size:11px}
 .ui-pref p{margin:0;line-height:1.6}.ui-pref kbd{padding:1px 5px;border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;font:11px var(--font-mono)}
 
-/* Loading, where it happens: two hairlines glide past each other in opposite directions, rising and
-   falling like crossing waves, low on the menu item or tab that is working. */
+/* Loading, where it happens: a veil dims the menu item or tab, and two wave lines cross over its full
+   width in opposite directions, their amplitude pulsing like a voice or a heartbeat. */
 [data-loading] { position:relative; overflow:hidden; --wave:var(--zone, var(--accent)); }
-[data-loading]::after { content:""; position:absolute; inset:0; border-radius:inherit; pointer-events:none;
-  background:
-    linear-gradient(90deg, transparent, var(--wave) 50%, transparent) no-repeat,
-    linear-gradient(90deg, transparent, color-mix(in srgb, var(--wave) 55%, transparent) 50%, transparent) no-repeat,
-    linear-gradient(90deg, transparent, color-mix(in srgb, var(--wave) 22%, transparent) 50%, transparent) no-repeat,
-    linear-gradient(180deg, transparent 60%, color-mix(in srgb, var(--wave) 6%, transparent));
-  background-size:46% 1px, 46% 1px, 46% 3px, 100% 100%;
-  animation:li-waves 2.4s cubic-bezier(.45,0,.55,1) infinite; opacity:.9; }
-@keyframes li-waves {
-  0%   { background-position:-60% 94%, 160% 78%, -60% 95%, 0 0; }
-  25%  { background-position:-5% 80%, 105% 92%, -5% 81%, 0 0; }
-  50%  { background-position:50% 86%, 50% 86%, 50% 87%, 0 0; }
-  75%  { background-position:105% 92%, -5% 80%, 105% 93%, 0 0; }
-  100% { background-position:160% 78%, -60% 94%, 160% 79%, 0 0; } }
-@media(prefers-reduced-motion:reduce) { [data-loading]::after { animation:none; background-position:30% 82%, 70% 90%, 30% 83%, 0 0; opacity:.6; } }
+.li-waves { position:absolute; inset:0; z-index:2; border-radius:inherit; pointer-events:none; background:color-mix(in srgb, var(--bg-0) 60%, transparent); }
+.li-waves::before, .li-waves::after, .li-pulse::before, .li-pulse::after { content:""; position:absolute; inset:0; background:var(--wave, var(--accent));
+  -webkit-mask-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 24' preserveAspectRatio='none'><path d='M0 12 C20 -1 40 -1 60 12 S100 25 120 12' fill='none' stroke='black' stroke-width='1.1' stroke-linecap='round' vector-effect='non-scaling-stroke'/></svg>"); mask-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 24' preserveAspectRatio='none'><path d='M0 12 C20 -1 40 -1 60 12 S100 25 120 12' fill='none' stroke='black' stroke-width='1.1' stroke-linecap='round' vector-effect='non-scaling-stroke'/></svg>");
+  -webkit-mask-repeat:repeat-x; mask-repeat:repeat-x; -webkit-mask-position:0 50%; mask-position:0 50%; }
+.li-waves::before, .li-pulse::before { -webkit-mask-size:62% 40%; mask-size:62% 40%; opacity:.9; animation:li-flow-a 3s linear infinite, li-beat-a 1.9s ease-in-out infinite; }
+.li-waves::after, .li-pulse::after { -webkit-mask-size:84% 50%; mask-size:84% 50%; opacity:.45; animation:li-flow-b 3.8s linear infinite, li-beat-b 2.5s ease-in-out infinite; }
+@keyframes li-flow-a { from { -webkit-mask-position:0% 50%; mask-position:0% 50%; } to { -webkit-mask-position:163.158% 50%; mask-position:163.158% 50%; } }
+@keyframes li-flow-b { from { -webkit-mask-position:525% 50%; mask-position:525% 50%; } to { -webkit-mask-position:0% 50%; mask-position:0% 50%; } }
+@keyframes li-beat-a { 0%,100% { -webkit-mask-size:62% 16%; mask-size:62% 16%; } 18% { -webkit-mask-size:62% 62%; mask-size:62% 62%; } 34% { -webkit-mask-size:62% 26%; mask-size:62% 26%; } 52% { -webkit-mask-size:62% 48%; mask-size:62% 48%; } 72% { -webkit-mask-size:62% 20%; mask-size:62% 20%; } }
+@keyframes li-beat-b { 0%,100% { -webkit-mask-size:84% 50%; mask-size:84% 50%; } 30% { -webkit-mask-size:84% 18%; mask-size:84% 18%; } 55% { -webkit-mask-size:84% 60%; mask-size:84% 60%; } 80% { -webkit-mask-size:84% 30%; mask-size:84% 30%; } }
+@media(prefers-reduced-motion:reduce) { .li-waves::before, .li-waves::after, .li-pulse::before, .li-pulse::after { animation:none; } }
 /* Status bar: what is loading, in a line; click to see and cancel. */
 .workbar-tasks { display:none; align-items:center; gap:9px; min-width:0; padding:3px 8px 3px 4px; border:0; border-radius:5px; background:transparent; color:var(--text-1); font:inherit; cursor:pointer; }
 .workbar-tasks span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .workbar-tasks:hover { background:var(--hover); color:var(--text-0); }
 .workbar.has-tasks .workbar-tasks { display:inline-flex; }
 .workbar.has-tasks #workbar-label, .workbar.has-tasks #workbar-idle-icon, .workbar.has-tasks #workbar-spin { display:none!important; }
-.li-pulse { width:16px; height:10px; flex:none; --wave:var(--accent);
-  background:linear-gradient(90deg, transparent, var(--wave) 50%, transparent) no-repeat, linear-gradient(90deg, transparent, color-mix(in srgb, var(--wave) 55%, transparent) 50%, transparent) no-repeat, linear-gradient(90deg, transparent, color-mix(in srgb, var(--wave) 22%, transparent) 50%, transparent) no-repeat, none;
-  background-size:60% 1px, 60% 1px, 60% 3px, 0 0; animation:li-waves-icon 2.4s cubic-bezier(.45,0,.55,1) infinite; }
-@keyframes li-waves-icon {
-  0%   { background-position:-60% 85%, 160% 15%, -60% 90%, 0 0; }
-  50%  { background-position:50% 50%, 50% 50%, 50% 55%, 0 0; }
-  100% { background-position:160% 15%, -60% 85%, 160% 20%, 0 0; } }
+.li-pulse { position:relative; width:22px; height:12px; flex:none; --wave:var(--accent); }
 .tasks-modal { width:min(560px, 100%); }
 .tasks-list { display:grid; gap:12px; margin:12px 0 4px; max-height:52vh; overflow:auto; }
 .task-group { border:1px solid var(--border); border-radius:8px; overflow:hidden; }
