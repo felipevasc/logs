@@ -36,30 +36,28 @@ pub struct RoleInfo {
     pub role: Role,
     pub column: &'static str,
     pub label: &'static str,
-    /// Entities identify an actor or object; attributes describe the event.
-    pub entity: bool,
 }
 
 pub const ROLES: &[RoleInfo] = &[
-    RoleInfo { role: Role::User, column: "@user", label: "Usuário", entity: true },
-    RoleInfo { role: Role::SrcIp, column: "@src_ip", label: "IP de origem", entity: true },
-    RoleInfo { role: Role::DstIp, column: "@dst_ip", label: "IP de destino", entity: true },
-    RoleInfo { role: Role::Host, column: "@host", label: "Host", entity: true },
-    RoleInfo { role: Role::Process, column: "@process", label: "Processo", entity: true },
-    RoleInfo { role: Role::ParentProcess, column: "@parent_process", label: "Processo pai", entity: true },
-    RoleInfo { role: Role::CommandLine, column: "@cmdline", label: "Linha de comando", entity: false },
-    RoleInfo { role: Role::Url, column: "@url", label: "URL", entity: true },
-    RoleInfo { role: Role::Domain, column: "@domain", label: "Domínio", entity: true },
-    RoleInfo { role: Role::Hash, column: "@hash", label: "Hash", entity: true },
-    RoleInfo { role: Role::DstPort, column: "@dst_port", label: "Porta de destino", entity: false },
-    RoleInfo { role: Role::UserAgent, column: "@user_agent", label: "User agent", entity: false },
-    RoleInfo { role: Role::File, column: "@file", label: "Arquivo", entity: true },
-    RoleInfo { role: Role::Status, column: "@status", label: "Status", entity: false },
-    RoleInfo { role: Role::Action, column: "@action", label: "Ação", entity: false },
-    RoleInfo { role: Role::Outcome, column: "@outcome", label: "Resultado", entity: false },
-    RoleInfo { role: Role::SrcScope, column: "@src_scope", label: "Rede de origem", entity: false },
-    RoleInfo { role: Role::DstScope, column: "@dst_scope", label: "Rede de destino", entity: false },
-    RoleInfo { role: Role::Tool, column: "@tool", label: "Ferramenta", entity: false },
+    RoleInfo { role: Role::User, column: "@user", label: "Usuário" },
+    RoleInfo { role: Role::SrcIp, column: "@src_ip", label: "IP de origem" },
+    RoleInfo { role: Role::DstIp, column: "@dst_ip", label: "IP de destino" },
+    RoleInfo { role: Role::Host, column: "@host", label: "Host" },
+    RoleInfo { role: Role::Process, column: "@process", label: "Processo" },
+    RoleInfo { role: Role::ParentProcess, column: "@parent_process", label: "Processo pai" },
+    RoleInfo { role: Role::CommandLine, column: "@cmdline", label: "Linha de comando" },
+    RoleInfo { role: Role::Url, column: "@url", label: "URL" },
+    RoleInfo { role: Role::Domain, column: "@domain", label: "Domínio" },
+    RoleInfo { role: Role::Hash, column: "@hash", label: "Hash" },
+    RoleInfo { role: Role::DstPort, column: "@dst_port", label: "Porta de destino" },
+    RoleInfo { role: Role::UserAgent, column: "@user_agent", label: "User agent" },
+    RoleInfo { role: Role::File, column: "@file", label: "Arquivo" },
+    RoleInfo { role: Role::Status, column: "@status", label: "Status" },
+    RoleInfo { role: Role::Action, column: "@action", label: "Ação" },
+    RoleInfo { role: Role::Outcome, column: "@outcome", label: "Resultado" },
+    RoleInfo { role: Role::SrcScope, column: "@src_scope", label: "Rede de origem" },
+    RoleInfo { role: Role::DstScope, column: "@dst_scope", label: "Rede de destino" },
+    RoleInfo { role: Role::Tool, column: "@tool", label: "Ferramenta" },
 ];
 
 pub fn info(role: Role) -> &'static RoleInfo {
@@ -356,8 +354,6 @@ pub fn ip_scope(ip: IpAddr) -> &'static str {
 
 pub struct ToolMatch {
     pub name: &'static str,
-    /// "scanner" (reconnaissance through HTTP) or "offensive" (post-exploitation).
-    pub kind: &'static str,
 }
 
 const UA_TOOLS: &[(&str, &str)] = &[
@@ -429,7 +425,7 @@ pub fn tool_in_user_agent(ua: &str) -> Option<ToolMatch> {
     UA_TOOLS
         .iter()
         .find(|(needle, _)| lower.contains(needle))
-        .map(|(_, name)| ToolMatch { name, kind: "scanner" })
+        .map(|(_, name)| ToolMatch { name })
 }
 
 pub fn tool_in_process(text: &str) -> Option<ToolMatch> {
@@ -437,7 +433,7 @@ pub fn tool_in_process(text: &str) -> Option<ToolMatch> {
     PROCESS_TOOLS
         .iter()
         .find(|(needle, _)| lower.contains(needle))
-        .map(|(_, name)| ToolMatch { name, kind: "offensive" })
+        .map(|(_, name)| ToolMatch { name })
 }
 
 // ------------------------------------------------------------- messages

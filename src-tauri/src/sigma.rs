@@ -391,7 +391,7 @@ fn logsource_gate(logsource: Option<&Value>) -> Result<Option<Expr>, String> {
     };
     let mut parts = Vec::new();
     for query in [action, product_gate].into_iter().flatten() {
-        parts.push(querylang::compile(query)?);
+        parts.push(querylang::compile_rule(query)?);
     }
     Ok((!parts.is_empty()).then(|| querylang::and(parts)))
 }
