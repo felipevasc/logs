@@ -20,7 +20,7 @@
 .tx-sheet-viewport { position: relative; overflow: hidden; }
 .tx-sheet .ct-board { margin: 0 !important; max-width: none !important; min-width: 0 !important; }
 .tx-sheet .ct-controls, .tx-sheet .ct-open, .tx-sheet .ct-editor-backdrop,
-.tx-sheet .tl-controls, .tx-sheet #tl-instructions, .tx-sheet .tl-hover,
+.tx-sheet .tl-controls, .tx-sheet #tl-instructions, .tx-sheet .tl-hover, .tx-sheet .tl-swim-hover,
 .tx-sheet .tl-drag-band, .tx-sheet .tl-selection-actions, .tx-sheet .tx-trigger { display: none !important; }
 .tx-sheet .ct-matrix-ruler, .tx-sheet .ct-matrix-corner, .tx-sheet .ct-lane-label { position: absolute; }
 .tx-sheet .ct-matrix-corner, .tx-sheet .ct-lane-label { left: var(--tx-left, 0px); }

@@ -18,6 +18,7 @@
   <link rel="stylesheet" href="workspace-context.css" />
   <link rel="stylesheet" href="case-content.css" />
   <link rel="stylesheet" href="case-trails.css" />
+  <link rel="stylesheet" href="security.css" />
 </head>
 <body>
   <nav class="workspace-nav" aria-label="Navegação principal">
@@ -44,7 +45,7 @@
       <p>Arraste arquivos ou uma pasta para começar.</p>
       <div class="empty-actions"><button id="ws-empty-open" class="btn primary"><i class="fas fa-folder-open"></i> Escolher arquivos</button><button id="ws-folder" class="btn ghost">Abrir pasta</button></div>
       <button id="ws-windows" class="text-button">Windows Event Log <i class="fas fa-arrow-right"></i></button>
-      <span class="supported-formats">JSONL · Syslog · Java · CSV · IIS · CEF · GZ</span>
+      <span class="supported-formats">JSON · Syslog · EVTX · CloudTrail · Zeek · auditd · CSV · IIS · CEF · ZIP · GZ</span>
     </div>
     <div id="ws-content" hidden></div>
   </main>
@@ -907,9 +908,13 @@
         <button class="settings-tab active" data-settings-tab="mcp" type="button" role="tab">
           <i class="fas fa-plug"></i> MCP
         </button>
+        <button class="settings-tab" data-settings-tab="detection" type="button" role="tab">
+          <i class="fas fa-shield-halved"></i> Detecção
+        </button>
       </div>
       <div class="modal-body">
         <section id="settings-pane-mcp" class="settings-pane" role="tabpanel"></section>
+        <section id="settings-pane-detection" class="settings-pane" role="tabpanel" hidden></section>
       </div>
     </div>
   </div>
@@ -998,5 +1003,12 @@
   <script src="journeys.js"></script>
   <script src="case-trails.js"></script>
   <script src="workspace-context.js"></script>
+  <script src="query-lang.js"></script>
+  <script src="entity-menu.js"></script>
+  <script src="query-bar.js"></script>
+  <script src="security.js"></script>
+  <script src="event-insights.js"></script>
+  <script src="case-intel.js"></script>
+  <script src="command-palette.js"></script>
 </body>
 </html>

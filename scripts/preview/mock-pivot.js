@@ -1,6 +1,9 @@
 /* Preview-only implementations of the native aggregate and pivot contracts. */
 (() => {
-  const raw = (row, field) => Object.hasOwn(row, field) ? row[field] : row.fields?.[field];
+  const raw = (row, field) => {
+    if (field.startsWith("@") && !Object.hasOwn(row.fields || {}, field) && window.QueryLang) return window.QueryLang.fieldValue(row, window.QueryLang.resolve(field)) ?? null;
+    return Object.hasOwn(row, field) ? row[field] : row.fields?.[field];
+  };
   const text = (row, field) => { const value = raw(row, field); return value === undefined || value === null ? null : typeof value === "object" ? JSON.stringify(value) : String(value); };
   const groupValue = (row, field) => { const value = text(row, field); return value?.trim() ? value : null; };
   const label = value => value == null ? "(vazio)" : value;

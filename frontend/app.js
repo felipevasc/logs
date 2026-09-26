@@ -8,6 +8,25 @@ const dialogApi = window.__TAURI__.dialog;
 const STANDARD = ["timestamp", "source", "level", "code", "name", "description", "message"];
 const COL_LABELS = {
   _all: "Todo o evento",
+  "@user": "Usuário",
+  "@src_ip": "IP de origem",
+  "@dst_ip": "IP de destino",
+  "@host": "Host",
+  "@process": "Processo",
+  "@parent_process": "Processo pai",
+  "@cmdline": "Linha de comando",
+  "@url": "URL",
+  "@domain": "Domínio",
+  "@hash": "Hash",
+  "@dst_port": "Porta de destino",
+  "@user_agent": "User agent",
+  "@file": "Arquivo alvo",
+  "@status": "Status",
+  "@action": "Ação",
+  "@outcome": "Resultado",
+  "@src_scope": "Rede de origem",
+  "@dst_scope": "Rede de destino",
+  "@tool": "Ferramenta",
   comentario: "Comentário",
   timestamp: "Data/hora",
   source: "Origem",
@@ -35,12 +54,17 @@ const OPS = [
   ["between", "entre"],
   ["empty", "vazio"],
   ["not_empty", "não vazio"],
+  ["in", "está na lista"],
+  ["not_in", "fora da lista"],
+  ["cidr", "na rede (CIDR)"],
+  ["not_cidr", "fora da rede (CIDR)"],
 ];
 const OP_SYMBOL = {
   contains: "~", not_contains: "!~", equals: "=", not_equals: "≠",
   equals_exact: "=", not_equals_exact: "≠",
   starts_with: "^", regex: "/…/", gt: ">", gte: "≥", lt: "<", lte: "≤",
   between: "↔", empty: "vazio", not_empty: "preenchido",
+  in: "∈", not_in: "∉", cidr: "∈", not_cidr: "∉",
 };
 
 const AGG_FUNCS = [
@@ -961,7 +985,7 @@ async function clearData({ removeCurrent = false } = {}) {
 function allFilters() {
   const fs = [...state.filters];
   if (state.quick.trim()) {
-    fs.unshift({ column: "message", op: "contains", value: state.quick.trim(), value2: null, _quick: true });
+    fs.unshift({ column: "_all", op: "query", value: state.quick.trim(), value2: null, _quick: true });
   }
   return fs;
 }
@@ -990,8 +1014,16 @@ function fmtFilterSideValue(column, raw) {
 }
 
 function chipLabel(f) {
+  if (f.op === "query" && f.label) return f.label;
+  if (f.op === "query") return `Busca: ${f.value}`;
+  if (f.op === "detection") return `Detecção: ${window.Security?.ruleName(f.value) || f.value}`;
+  if (f.op === "threat_rule") return `Ameaça: ${f.value === "*" ? "qualquer regra" : f.value}`;
   const col = colLabel(f.column);
   const sym = OP_SYMBOL[f.op] || f.op;
+  if (["in", "not_in", "cidr", "not_cidr"].includes(f.op)) {
+    const values = window.QueryLang?.listValues(f.value) || [f.value];
+    return `${col} ${sym} ${values.length > 3 ? `${values.slice(0, 2).join(", ")} e mais ${values.length - 2}` : values.join(", ")}`;
+  }
   if (f.op === "empty" || f.op === "not_empty") return `${col} ${sym}`;
   if (f.op === "between") {
     return `${col}: ${fmtFilterSideValue(f.column, f.value)} → ${fmtFilterSideValue(f.column, f.value2)}`;
@@ -1016,6 +1048,10 @@ function invertFilter(index) {
     lt: "gte",
     empty: "not_empty",
     not_empty: "empty",
+    in: "not_in",
+    not_in: "in",
+    cidr: "not_cidr",
+    not_cidr: "cidr",
   };
   if (INVERT_OPS[f.op]) {
     f.op = INVERT_OPS[f.op];
@@ -1045,7 +1081,7 @@ function renderChips() {
   state.filters.forEach((f, i) => {
     boxes.forEach((box) => {
       const chip = el("span", "chip");
-      chip.title = `${chipLabel(f)} (Botão direito: inverter ou editar)`;
+      chip.title = `${f.op === "query" && f.label ? f.value : chipLabel(f)} (Botão direito: inverter ou editar)`;
       chip.appendChild(el("span", "", chipLabel(f)));
       const x = el("button", "x");
       x.innerHTML = '<i class="fas fa-xmark"></i>';
@@ -1319,6 +1355,8 @@ function jsValNum(col, s) {
   return jsParseNumUnit(t);
 }
 function jsMatchFilter(ev, f) {
+  const language = window.QueryLang?.matchFilter(ev, f);
+  if (language !== undefined) return language;
   if (f.op === "equals_exact" || f.op === "not_equals_exact") {
     if (f.column === "_all") return false;
     const standard = ["id", "source", "level", "code", "name", "description", "message", "raw"];
@@ -4168,7 +4206,7 @@ function sendVisibleToCase() {
 // ------------------------------------------------------------------ tabela
 function buildEventRow(ev) {
   const quick = state.quick.trim();
-  const quickRe = quick ? new RegExp(`(${escRe(esc(quick))})`, "gi") : null;
+  const quickRe = quick && (!window.QueryLang || window.QueryLang.isPlain(quick)) ? new RegExp(`(${escRe(esc(quick))})`, "gi") : null;
   const row = el("tr");
   row.dataset.eventId = ev.id;
   if (workspaceScope() === "dataset" && window.WorkspaceContext?.isIncluded(ev)) { row.classList.add("event-in-case"); row.title = "Este registro já está no Caso"; }
@@ -4212,7 +4250,9 @@ function buildEventRow(ev) {
       td.textContent = cellValue(ev, col);
     } else if (col === "message") {
       td.className = "t-msg";
+      const pivots = !quickRe && window.EntityMenu?.highlight(ev.message);
       if (quickRe) td.innerHTML = esc(ev.message).replace(quickRe, "<mark>$1</mark>");
+      else if (pivots) td.innerHTML = pivots;
       else td.textContent = ev.message;
     } else {
       td.textContent = cellValue(ev, col);
@@ -4654,6 +4694,7 @@ function showDetail(ev, sourceSpec = null) {
   $("#btn-right-inspect").classList.add("active");
   switchDetailTab("overview");
   updateDetailNav();
+  window.EventInsights?.render(ev, $("#pane-overview"));
 
   // marca a linha selecionada na tabela
   document.querySelectorAll("#events-table tbody tr").forEach((tr) => tr.classList.remove("selected"));
@@ -5074,6 +5115,7 @@ async function openSettings(tab = "mcp") {
   $("#settings-modal").hidden = false;
   switchSettingsTab(tab);
   if (tab === "mcp") await renderMcpPane();
+  if (tab === "detection") await window.Security?.renderRulesPane($("#settings-pane-detection"));
 }
 
 async function renderMcpPane() {
@@ -5411,6 +5453,10 @@ function bind() {
   $("#btn-source-back").onclick = () => showSourceMode("list");
 
   $("#quick-search").addEventListener("input", (e) => {
+    // An expression is applied only when complete; the last valid one stays active.
+    const problem = window.QueryLang?.validate(e.target.value) || null;
+    window.QueryBar?.status(problem);
+    if (problem || window.QueryBar?.typingField()) return;
     state.quick = e.target.value;
     scheduleRefresh();
   });
@@ -5720,7 +5766,7 @@ function bind() {
     if (e.target === $("#settings-modal")) $("#settings-modal").hidden = true;
   });
   document.querySelectorAll("#settings-modal .settings-tab").forEach((b) => {
-    b.onclick = () => switchSettingsTab(b.dataset.settingsTab);
+    b.onclick = () => openSettings(b.dataset.settingsTab);
   });
 
   $("#btn-theme").onclick = toggleTheme;

@@ -152,8 +152,8 @@ window.createTimelineView = ({ content, getOverview, sourceKey, filters, isActiv
     const errorPeak = data.buckets.reduce((best, bucket, index) => bucket.errors > data.buckets[best].errors ? index : best, 0);
     const signal = (index, label, number, suffix, last = index) => `<button type="button" class="tl-signal" data-signal="${index}" data-signal-end="${last}"><span>${label}</span><strong>${number}</strong><small>${shortTime(data.buckets[index].timestamp, span)} · ${suffix}</small></button>`;
     content.innerHTML = `<div class="tl-summary"><div><span>Período visível</span><strong>${intervalLabel(data.start, data.end)}</strong></div><div class="tl-summary-numbers"><span><b>${fmtNum(data.total)}</b> eventos</span><span><b>${fmtNum(data.errors)}</b> erros</span><span><b>${fmtNum(data.warnings)}</b> avisos</span></div></div>
-      <section class="ws-card tl-main"><div class="tl-main-head"><div class="tl-legend"><span><i class="tl-key total"></i> Demais eventos</span><span><i class="tl-key error"></i> Erros</span><span><i class="tl-key warning"></i> Avisos</span></div><div class="tl-controls"><button class="btn ghost small" data-tl="back" ${view.history.length ? "" : "disabled"}><i class="fas fa-arrow-left"></i> Voltar</button><button class="btn ghost small" data-tl="hour" ${span > HOUR ? "" : "disabled"}>1 h</button><button class="btn ghost small" data-tl="day" ${span > 24 * HOUR ? "" : "disabled"}>24 h</button><button class="btn ghost small" data-tl="all" ${data.start !== view.bounds.start || data.end !== view.bounds.end ? "" : "disabled"}>Tudo</button></div></div>
-      <div class="tl-chart-layout"><div class="tl-y-axis"><span>${fmtNum(max)}</span><span>${fmtNum(max / 2)}</span><span>0</span></div><div class="tl-plot-column"><div class="tl-interactive" id="tl-interactive" tabindex="0" role="group" aria-label="Volume ao longo do tempo" aria-describedby="tl-instructions tl-selection-status"><svg viewBox="0 0 1000 260" preserveAspectRatio="none" role="img" aria-label="Volume de eventos, erros e avisos no período">${grid}${bars}</svg><div class="tl-selected-band" id="tl-selected-band" hidden></div><div class="tl-drag-band" id="tl-drag-band" hidden></div><div class="tl-hover" id="tl-hover" hidden></div></div><div class="tl-x-axis">${timeTicks}</div></div></div>
+      <section class="ws-card tl-main"><div class="tl-main-head"><div class="tl-legend"><span><i class="tl-key total"></i> Demais eventos</span><span><i class="tl-key error"></i> Erros</span><span><i class="tl-key warning"></i> Avisos</span></div><div class="tl-controls"><button class="btn ghost small tl-swim-button" data-lanes aria-haspopup="menu" title="Separar a atividade por origem, usuário, IP…"><i class="fas fa-layer-group"></i> Separar</button><button class="btn ghost small" data-tl="back" ${view.history.length ? "" : "disabled"}><i class="fas fa-arrow-left"></i> Voltar</button><button class="btn ghost small" data-tl="hour" ${span > HOUR ? "" : "disabled"}>1 h</button><button class="btn ghost small" data-tl="day" ${span > 24 * HOUR ? "" : "disabled"}>24 h</button><button class="btn ghost small" data-tl="all" ${data.start !== view.bounds.start || data.end !== view.bounds.end ? "" : "disabled"}>Tudo</button></div></div>
+      <div class="tl-chart-layout"><div class="tl-y-axis"><span>${fmtNum(max)}</span><span>${fmtNum(max / 2)}</span><span>0</span></div><div class="tl-plot-column"><div class="tl-interactive" id="tl-interactive" tabindex="0" role="group" aria-label="Volume ao longo do tempo" aria-describedby="tl-instructions tl-selection-status"><svg viewBox="0 0 1000 260" preserveAspectRatio="none" role="img" aria-label="Volume de eventos, erros e avisos no período">${grid}${bars}</svg><div class="tl-selected-band" id="tl-selected-band" hidden></div><div class="tl-drag-band" id="tl-drag-band" hidden></div><div class="tl-hover" id="tl-hover" hidden></div></div><div class="tl-x-axis">${timeTicks}</div></div></div><div class="tl-swims" id="tl-swims" hidden></div>
       <div class="tl-chart-foot"><span id="tl-instructions">Clique ou arraste para selecionar · Setas para navegar · Shift + setas para ampliar</span><span>Horário local · intervalos de ${formatDuration(data.bucketMs)}</span></div><p id="tl-selection-status" class="tl-sr-only" aria-live="polite" aria-atomic="true"></p></section>
       <div class="tl-bottom"><section class="ws-card tl-selection" id="tl-selection"></section><section class="ws-card tl-signals"><div class="card-heading"><h2>Destaques do período</h2></div>${data.total ? signal(peak, "Maior volume", fmtNum(data.buckets[peak].count), "eventos") : ""}${data.errors ? signal(errorPeak, "Mais erros", fmtNum(data.buckets[errorPeak].errors), "erros") : ""}${gap ? signal(gap.first, "Maior pausa", formatDuration(bucketEnd(data, gap.last) - data.buckets[gap.first].timestamp + 1), "sem registros entre eventos", gap.last) : ""}${!data.total ? '<p class="quiet-empty">Não há eventos com horário neste período.</p>' : ""}</section></div>
       ${overview.undated ? `<p class="tl-undated">${fmtNum(overview.undated)} eventos sem horário não aparecem na timeline.</p>` : ""}`;
@@ -222,6 +222,19 @@ window.createTimelineView = ({ content, getOverview, sourceKey, filters, isActiv
       }
     });
     select(view.selected?.first ?? peak, view.selected?.last ?? peak);
+    // Detections become marks under the axis; a mark selects its interval.
+    window.Security?.markers(content.querySelector(".tl-plot-column"), data.start, data.end, (from, to) => {
+      const first = clamp(Math.floor((from - data.start) / data.bucketMs), 0, n - 1);
+      const last = clamp(Math.floor((to - data.start) / data.bucketMs), first, n - 1);
+      select(first, last);
+    }, content.querySelector(".tl-x-axis"));
+    content.querySelector("[data-lanes]").onclick = event => {
+      const r = event.currentTarget.getBoundingClientRect();
+      const current = view.lanes;
+      const options = laneOptions().map(([column, label]) => ({ icon: column === current ? "fa-check" : window.EntityMenu?.icon(column) || "fa-tag", label, onClick: () => { view.lanes = column; drawLanes(data, select); } }));
+      showCtxMenu(r.left, r.bottom + 4, current ? [{ icon: "fa-minus", label: "Não separar", onClick: () => { view.lanes = null; drawLanes(data, select); } }, { sep: true }, ...options] : options);
+    };
+    drawLanes(data, select);
 
     function select(first, last = first, anchor = first, cursor = last) {
       first = clamp(first, 0, n - 1);
@@ -238,11 +251,91 @@ window.createTimelineView = ({ content, getOverview, sourceKey, filters, isActiv
       band.hidden = false;
       band.style.left = `${first * 100 / n}%`;
       band.style.width = `${(last - first + 1) * 100 / n}%`;
+      markLanes(first, last, n);
       const target = content.querySelector("#tl-selection");
       target.innerHTML = `<div class="card-heading"><h2>Intervalo selecionado</h2><span>${intervalLabel(start, end)}</span></div><div class="tl-selection-stats"><div><strong>${fmtNum(count)}</strong><span>eventos</span></div><div><strong>${fmtNum(errors)}</strong><span>erros${count ? ` · ${pctLocal(errors, count)}` : ""}</span></div><div><strong>${fmtNum(warnings)}</strong><span>avisos</span></div></div><div class="tl-selection-actions"><button class="btn primary small" data-tl="explore" ${count ? "" : "disabled"}>Explorar eventos <i class="fas fa-arrow-right"></i></button><button class="btn ghost small" data-tl="zoom" ${end > start && end - start < data.end - data.start ? "" : "disabled"}>Aproximar período</button></div>`;
       target.querySelector('[data-tl="explore"]').onclick = () => applyRange(start, end);
       target.querySelector('[data-tl="zoom"]').onclick = () => navigate(start, end, overview);
     }
+  }
+
+  // ------------------------------------------------------------ lanes (optional, off by default)
+  const laneLabel = column => column === "source" ? "Origem" : column === "code" ? "Código" : window.EntityMenu?.label(column) || column;
+  function laneOptions() {
+    const coverage = (window.Security?.last()?.coverage || []).filter(c => c.count > 0).map(c => [c.column, c.label]);
+    const roles = coverage.length ? coverage : [["@user", "Usuário"], ["@src_ip", "IP de origem"], ["@host", "Host"]];
+    return [["source", "Origem"], ...roles, ["code", "Código"]];
+  }
+  function markLanes(first, last, n) {
+    const step = 1000 / n;
+    content.querySelectorAll(".tl-swim-sel").forEach(rect => { rect.setAttribute("x", first * step); rect.setAttribute("width", (last - first + 1) * step); });
+  }
+  async function drawLanes(data, select) {
+    const host = content.querySelector("#tl-swims"), button = content.querySelector("[data-lanes]");
+    if (!host || !button) return;
+    const column = view.lanes;
+    button.classList.toggle("active", !!column);
+    button.innerHTML = `<i class="fas fa-layer-group"></i> ${column ? esc(laneLabel(column)) : "Separar"}`;
+    if (!column) { host.hidden = true; host.innerHTML = ""; return; }
+    host.hidden = false;
+    const key = JSON.stringify([column, data.start, data.end, view.key]);
+    if (view.lanesResult?.key !== key) {
+      host.innerHTML = '<div class="tl-swim-note"><i class="fas fa-circle-notch spin"></i></div>';
+      try {
+        const selection = typeof analyticsRequest === "function" ? analyticsRequest(scope()) : { filters: filters() };
+        const lanes = await api("timeline_lanes", { ...selection, start: data.start, end: data.end, bucketCount: data.buckets.length, column, limit: 8 }, { silent: true });
+        if (view.result !== data || view.lanes !== column || !host.isConnected) return;
+        view.lanesResult = { key, lanes };
+      } catch (error) {
+        if (view.result === data && host.isConnected) host.innerHTML = `<p class="tl-swim-note">${esc(String(error))}</p>`;
+        return;
+      }
+    }
+    renderLanes(host, data, view.lanesResult.lanes, select);
+  }
+  function renderLanes(host, data, lanes, select) {
+    const n = data.buckets.length, step = 1000 / n, span = Math.max(1, data.end - data.start);
+    const rows = [...lanes.lanes, ...(lanes.others ? [{ ...lanes.others, others: true }] : [])];
+    const label = laneLabel(lanes.column);
+    if (!rows.length) { host.innerHTML = `<p class="tl-swim-note">Nenhum valor de ${esc(label)} neste período.</p>`; return; }
+    // Buckets use the chart's layout; a lane bucket maps onto the bar that covers its start.
+    const cells = rows.map(lane => {
+      const merged = new Map();
+      lane.counts.forEach((count, j) => {
+        if (!count) return;
+        const i = clamp(Math.floor((lanes.start + j * lanes.bucketMs - data.start) / data.bucketMs), 0, n - 1);
+        const cell = merged.get(i) || { count: 0, errors: 0 };
+        cell.count += count; cell.errors += lane.error_counts[j] || 0;
+        merged.set(i, cell);
+      });
+      return merged;
+    });
+    host.innerHTML = rows.map((lane, k) => {
+      const max = Math.max(1, ...[...cells[k].values()].map(c => c.count));
+      const rects = [...cells[k]].map(([i, c]) => `<rect x="${i * step + 0.6}" y="0" width="${Math.max(1, step - 1.2)}" height="12" class="${c.errors * 2 >= c.count ? "err" : ""}" style="opacity:${(0.2 + 0.8 * Math.sqrt(c.count / max)).toFixed(2)}"/>`).join("");
+      const name = lane.others ? `Outros valores` : lane.value;
+      return `<div class="tl-swim${lane.others ? " others" : ""}" data-lane="${k}"><div class="tl-swim-head"><button type="button" class="tl-swim-label" ${lane.others ? "disabled" : ""} title="${lane.others ? "" : "Ações para este valor"}"><span></span></button><small>${fmtNum(lane.total)}${lane.errors ? ` · <b>${fmtNum(lane.errors)} erros</b>` : ""}</small></div><svg class="tl-swim-strip" viewBox="0 0 1000 12" preserveAspectRatio="none" role="img" aria-label="${esc(name)}: ${fmtNum(lane.total)} eventos"><rect class="tl-swim-sel" y="0" height="12" x="0" width="0"/>${rects}</svg></div>`;
+    }).join("") + `${lanes.missing ? `<p class="tl-swim-note">${fmtNum(lanes.missing)} eventos sem ${esc(label.toLowerCase())}</p>` : ""}<div class="tl-swim-hover" hidden></div>`;
+    rows.forEach((lane, k) => { host.querySelector(`[data-lane="${k}"] .tl-swim-label span`).textContent = lane.others ? "Outros valores" : lane.value; });
+    const hover = host.querySelector(".tl-swim-hover");
+    const at = (event, strip) => clamp(Math.floor((event.clientX - strip.getBoundingClientRect().left) / strip.clientWidth * n), 0, n - 1);
+    const entity = (lane, i) => i == null ? { column: lanes.column, value: lane.value, first: data.start, last: data.end } : { column: lanes.column, value: lane.value, first: data.buckets[i].timestamp, last: bucketEnd(data, i) };
+    host.querySelectorAll(".tl-swim").forEach(row => {
+      const k = +row.dataset.lane, lane = rows[k], strip = row.querySelector(".tl-swim-strip");
+      const menu = (event, i) => { if (lane.others) return; event.preventDefault(); window.EntityMenu?.open(event.clientX, event.clientY, entity(lane, i)); };
+      row.querySelector(".tl-swim-label").onclick = event => { const r = event.currentTarget.getBoundingClientRect(); menu({ preventDefault() {}, clientX: r.left, clientY: r.bottom + 4 }); };
+      strip.onpointermove = event => {
+        const i = at(event, strip), cell = cells[k].get(i);
+        hover.textContent = `${lane.others ? "Outros valores" : lane.value} · ${shortTime(data.buckets[i].timestamp, span)} · ${fmtNum(cell?.count || 0)} eventos${cell?.errors ? ` · ${fmtNum(cell.errors)} erros` : ""}`;
+        hover.style.left = `${clamp((event.clientX - host.getBoundingClientRect().left) / host.clientWidth * 100, 6, 74)}%`;
+        hover.style.top = `${row.offsetTop - 26}px`;
+        hover.hidden = false;
+      };
+      strip.onpointerleave = () => { hover.hidden = true; };
+      strip.onclick = event => select(at(event, strip));
+      strip.oncontextmenu = event => menu(event, at(event, strip));
+    });
+    if (view.selected) markLanes(view.selected.first, view.selected.last, n);
   }
 
   function formatDuration(ms) {

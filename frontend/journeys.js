@@ -219,6 +219,17 @@ window.Journeys = (() => {
     if (event) { view.seed = event; view.seedPending = true; view.selected = null; resetRange(); view.page = 0; view.field = ""; view.listScroll = view.detailScroll = 0; }
     await window.Workspace.showPage("journeys");
   }
+  /** Follows one value (user, address, host) across sources, optionally around a time. */
+  async function openValue({ field, value, from = null, to = null, scope = null }) {
+    const nextScope = scope || globalScope();
+    if (nextScope !== globalScope() && window.WorkspaceContext) await window.WorkspaceContext.setScope(nextScope);
+    syncContext();
+    const period = state.dataPeriod;
+    view.seed = null; view.seedPending = false; view.page = 0; view.detailPage = 0; view.listScroll = view.detailScroll = 0;
+    view.field = field; view.selected = { value: String(value) };
+    view.from = from ?? period?.min ?? null; view.to = to ?? period?.max ?? null;
+    await window.Workspace.showPage("journeys");
+  }
   const nav = button("", () => open(), ""); nav.dataset.page = "journeys"; nav.innerHTML = '<i class="fas fa-code-branch" aria-hidden="true"></i>Possíveis trilhas'; document.querySelector('.nav-pages [data-page="case-timeline"]').after(nav);
   const updateNavigation = () => { nav.hidden = false; const authored = document.querySelector('.nav-pages [data-page="case-trails"]'); if (globalScope() === "case" && authored) authored.after(nav); else document.querySelector('.nav-pages [data-page="case-timeline"]').after(nav); }; document.addEventListener("workspace-context-change", updateNavigation); updateNavigation();
   const oldDetail = showDetail;
@@ -227,5 +238,5 @@ window.Journeys = (() => {
   const investigate = document.querySelector("#ws-detail-follow"); investigate.innerHTML = '<i class="fas fa-route"></i> Investigar daqui'; investigate.title = "Seguir identificadores deste registro entre as origens";
   investigate.onclick = () => { const event = state.currentDetailEv; if (event) open({ event, scope: drawerSource?.event === event ? drawerSource.scope : globalScope() }); };
   new MutationObserver(() => { investigate.hidden = !state.currentDetailEv || !!document.querySelector(".drawer-loading") || document.querySelector("#drawer").hidden; }).observe(document.querySelector("#drawer-badges"), { childList: true });
-  return { open, render, capture, restore, refresh: () => { if (host?.isConnected && document.body.dataset.page === "journeys") return render(host.parentElement); } };
+  return { open, openValue, render, capture, restore, refresh: () => { if (host?.isConnected && document.body.dataset.page === "journeys") return render(host.parentElement); } };
 })();
