@@ -8,6 +8,7 @@ Aplicacao desktop para investigar logs, feita com Tauri 2: o backend em Rust ind
 - Triagem de segurança no Resumo: episódios com táticas MITRE ATT&CK, 47 regras de correlação (força bruta, pulverização de senhas, persistência, limpeza de logs, PowerShell codificado, webshell, LSASS, Kerberoasting, DCSync, varreduras, beaconing, eventos de nuvem), entidades por risco, raridades e importação de regras Sigma.
 - Linguagem de busca com campos, comparações, redes CIDR, listas, regex e `AND`/`OR`/`NOT`, com validação e complemento enquanto digita; campos canônicos (`@user`, `@src_ip`, `@host`, `@action`…) que atravessam todas as fontes. [Busca, entidades e detecções](docs/busca-e-deteccoes.md).
 - Menu de entidades em usuários, IPs, hosts e processos, paleta de comandos (Ctrl+K) e detalhe do registro com ação normalizada, regras e conteúdo decodificado.
+- Tamanho da interface automático para janelas pequenas e telas com escala do sistema, ajustável em Configurações → Interface ou com Ctrl + / Ctrl − / Ctrl 0.
 - Indicadores, hipóteses e cadeia de custódia (SHA-256) no Caso, incluídos nos relatórios PDF e Markdown.
 - Enriquecimento de codigos com nome e descricao configuraveis.
 - Filtros por campos, busca textual, faixas numericas e arvore de facetas.
