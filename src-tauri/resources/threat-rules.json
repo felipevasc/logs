@@ -13,6 +13,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -26,6 +29,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -39,6 +45,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -52,6 +61,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -65,6 +77,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -78,6 +93,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -91,6 +109,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -104,6 +125,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -117,6 +141,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -130,6 +157,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -143,6 +173,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -156,6 +189,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/xss/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -169,6 +205,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -182,6 +221,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -195,6 +237,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -208,6 +253,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -221,6 +269,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -234,6 +285,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -247,6 +301,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -260,6 +317,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -273,6 +333,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -286,6 +349,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -299,6 +365,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -312,6 +381,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -325,6 +397,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -338,6 +413,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -351,6 +429,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -364,6 +445,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -377,6 +461,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -390,6 +477,9 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -403,6 +493,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Command_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -416,6 +510,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Command_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -429,6 +527,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Command_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -442,6 +544,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Command_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -455,6 +561,11 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Command_Injection"
+      ],
+      "attack": [
+        "T1105",
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -468,6 +579,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Command_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -481,6 +596,12 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Command_Injection"
+      ],
+      "attack": [
+        "T1140",
+        "T1027",
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -494,6 +615,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Command_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -507,6 +632,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Command_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -520,6 +649,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Command_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -533,6 +666,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal"
+      ],
+      "attack": [
+        "T1190",
+        "T1083"
       ]
     },
     {
@@ -546,6 +683,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal"
+      ],
+      "attack": [
+        "T1190",
+        "T1083"
       ]
     },
     {
@@ -559,6 +700,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal"
+      ],
+      "attack": [
+        "T1190",
+        "T1083"
       ]
     },
     {
@@ -572,6 +717,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal"
+      ],
+      "attack": [
+        "T1190",
+        "T1083"
       ]
     },
     {
@@ -585,6 +734,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal"
+      ],
+      "attack": [
+        "T1190",
+        "T1083"
       ]
     },
     {
@@ -598,6 +751,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal"
+      ],
+      "attack": [
+        "T1190",
+        "T1083"
       ]
     },
     {
@@ -611,6 +768,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal"
+      ],
+      "attack": [
+        "T1190",
+        "T1083"
       ]
     },
     {
@@ -624,6 +785,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal"
+      ],
+      "attack": [
+        "T1190",
+        "T1083"
       ]
     },
     {
@@ -637,6 +802,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal"
+      ],
+      "attack": [
+        "T1190",
+        "T1083"
       ]
     },
     {
@@ -650,6 +819,10 @@
       "enabled": true,
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal"
+      ],
+      "attack": [
+        "T1190",
+        "T1083"
       ]
     },
     {
@@ -664,6 +837,9 @@
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal",
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -678,6 +854,9 @@
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal",
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -692,6 +871,9 @@
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal",
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -706,6 +888,9 @@
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal",
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -720,6 +905,9 @@
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal",
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -734,6 +922,9 @@
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal",
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -748,6 +939,9 @@
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal",
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -762,6 +956,9 @@
       "references": [
         "https://community.owasp.org/attacks/Path_Traversal",
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -775,6 +972,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -788,6 +989,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -801,6 +1006,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -814,6 +1023,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -827,6 +1040,11 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -840,6 +1058,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -853,6 +1075,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -866,6 +1092,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -879,6 +1109,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -892,6 +1126,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -905,6 +1143,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -918,6 +1160,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1552.005"
       ]
     },
     {
@@ -931,6 +1177,9 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -944,6 +1193,9 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -957,6 +1209,9 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -970,6 +1225,9 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -983,6 +1241,9 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -996,6 +1257,9 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -1009,6 +1273,9 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -1022,6 +1289,10 @@
       "enabled": true,
       "references": [
         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Injection_Testing/18-Testing_for_Server-side_Template_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -1035,6 +1306,10 @@
       "enabled": true,
       "references": [
         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Injection_Testing/18-Testing_for_Server-side_Template_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -1048,6 +1323,10 @@
       "enabled": true,
       "references": [
         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Injection_Testing/18-Testing_for_Server-side_Template_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -1061,6 +1340,10 @@
       "enabled": true,
       "references": [
         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Injection_Testing/18-Testing_for_Server-side_Template_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -1074,6 +1357,10 @@
       "enabled": true,
       "references": [
         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Injection_Testing/18-Testing_for_Server-side_Template_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -1087,6 +1374,10 @@
       "enabled": true,
       "references": [
         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Injection_Testing/18-Testing_for_Server-side_Template_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -1100,6 +1391,10 @@
       "enabled": true,
       "references": [
         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Injection_Testing/18-Testing_for_Server-side_Template_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -1113,6 +1408,10 @@
       "enabled": true,
       "references": [
         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Injection_Testing/18-Testing_for_Server-side_Template_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -1126,6 +1425,10 @@
       "enabled": true,
       "references": [
         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Injection_Testing/18-Testing_for_Server-side_Template_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -1139,6 +1442,10 @@
       "enabled": true,
       "references": [
         "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Injection_Testing/18-Testing_for_Server-side_Template_Injection"
+      ],
+      "attack": [
+        "T1190",
+        "T1059"
       ]
     },
     {
@@ -1152,6 +1459,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1203"
       ]
     },
     {
@@ -1165,6 +1476,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1203"
       ]
     },
     {
@@ -1178,6 +1493,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1203"
       ]
     },
     {
@@ -1191,6 +1510,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1203"
       ]
     },
     {
@@ -1204,6 +1527,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1203"
       ]
     },
     {
@@ -1217,6 +1544,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1203"
       ]
     },
     {
@@ -1230,6 +1561,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1203"
       ]
     },
     {
@@ -1243,6 +1578,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1203"
       ]
     },
     {
@@ -1256,6 +1595,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1203"
       ]
     },
     {
@@ -1269,6 +1612,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1190",
+        "T1203"
       ]
     },
     {
@@ -1283,6 +1630,9 @@
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html",
         "https://attack.mitre.org/techniques/T1505/003/"
+      ],
+      "attack": [
+        "T1505.003"
       ]
     },
     {
@@ -1297,6 +1647,9 @@
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html",
         "https://attack.mitre.org/techniques/T1505/003/"
+      ],
+      "attack": [
+        "T1505.003"
       ]
     },
     {
@@ -1311,6 +1664,9 @@
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html",
         "https://attack.mitre.org/techniques/T1505/003/"
+      ],
+      "attack": [
+        "T1505.003"
       ]
     },
     {
@@ -1325,6 +1681,9 @@
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html",
         "https://attack.mitre.org/techniques/T1505/003/"
+      ],
+      "attack": [
+        "T1505.003"
       ]
     },
     {
@@ -1339,6 +1698,9 @@
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html",
         "https://attack.mitre.org/techniques/T1505/003/"
+      ],
+      "attack": [
+        "T1505.003"
       ]
     },
     {
@@ -1353,6 +1715,9 @@
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html",
         "https://attack.mitre.org/techniques/T1505/003/"
+      ],
+      "attack": [
+        "T1505.003"
       ]
     },
     {
@@ -1367,6 +1732,9 @@
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html",
         "https://attack.mitre.org/techniques/T1505/003/"
+      ],
+      "attack": [
+        "T1505.003"
       ]
     },
     {
@@ -1381,6 +1749,9 @@
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html",
         "https://attack.mitre.org/techniques/T1505/003/"
+      ],
+      "attack": [
+        "T1505.003"
       ]
     },
     {
@@ -1395,6 +1766,9 @@
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html",
         "https://attack.mitre.org/techniques/T1505/003/"
+      ],
+      "attack": [
+        "T1505.003"
       ]
     },
     {
@@ -1409,6 +1783,9 @@
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html",
         "https://attack.mitre.org/techniques/T1505/003/"
+      ],
+      "attack": [
+        "T1505.003"
       ]
     },
     {
@@ -1422,6 +1799,10 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1059/"
+      ],
+      "attack": [
+        "T1059",
+        "T1071"
       ]
     },
     {
@@ -1435,6 +1816,10 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1059/"
+      ],
+      "attack": [
+        "T1059",
+        "T1071"
       ]
     },
     {
@@ -1448,6 +1833,10 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1059/"
+      ],
+      "attack": [
+        "T1059",
+        "T1071"
       ]
     },
     {
@@ -1461,6 +1850,10 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1059/"
+      ],
+      "attack": [
+        "T1059",
+        "T1071"
       ]
     },
     {
@@ -1474,6 +1867,10 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1059/"
+      ],
+      "attack": [
+        "T1059",
+        "T1071"
       ]
     },
     {
@@ -1487,6 +1884,10 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1059/"
+      ],
+      "attack": [
+        "T1059",
+        "T1071"
       ]
     },
     {
@@ -1500,6 +1901,10 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1059/"
+      ],
+      "attack": [
+        "T1059",
+        "T1071"
       ]
     },
     {
@@ -1513,6 +1918,10 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1059/"
+      ],
+      "attack": [
+        "T1059",
+        "T1071"
       ]
     },
     {
@@ -1527,6 +1936,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1071/",
         "https://attack.mitre.org/techniques/T1090/"
+      ],
+      "attack": [
+        "T1071",
+        "T1572"
       ]
     },
     {
@@ -1541,6 +1954,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1071/",
         "https://attack.mitre.org/techniques/T1090/"
+      ],
+      "attack": [
+        "T1071",
+        "T1572"
       ]
     },
     {
@@ -1555,6 +1972,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1071/",
         "https://attack.mitre.org/techniques/T1090/"
+      ],
+      "attack": [
+        "T1071",
+        "T1572"
       ]
     },
     {
@@ -1569,6 +1990,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1071/",
         "https://attack.mitre.org/techniques/T1090/"
+      ],
+      "attack": [
+        "T1071",
+        "T1572"
       ]
     },
     {
@@ -1583,6 +2008,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1071/",
         "https://attack.mitre.org/techniques/T1090/"
+      ],
+      "attack": [
+        "T1071",
+        "T1572"
       ]
     },
     {
@@ -1597,6 +2026,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1071/",
         "https://attack.mitre.org/techniques/T1090/"
+      ],
+      "attack": [
+        "T1071",
+        "T1572"
       ]
     },
     {
@@ -1611,6 +2044,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1071/",
         "https://attack.mitre.org/techniques/T1090/"
+      ],
+      "attack": [
+        "T1071",
+        "T1572"
       ]
     },
     {
@@ -1625,6 +2062,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1071/",
         "https://attack.mitre.org/techniques/T1090/"
+      ],
+      "attack": [
+        "T1071",
+        "T1572"
       ]
     },
     {
@@ -1638,6 +2079,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1048/"
+      ],
+      "attack": [
+        "T1048"
       ]
     },
     {
@@ -1651,6 +2095,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1048/"
+      ],
+      "attack": [
+        "T1048"
       ]
     },
     {
@@ -1664,6 +2111,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1048/"
+      ],
+      "attack": [
+        "T1048"
       ]
     },
     {
@@ -1677,6 +2127,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1048/"
+      ],
+      "attack": [
+        "T1048"
       ]
     },
     {
@@ -1690,6 +2143,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1048/"
+      ],
+      "attack": [
+        "T1048"
       ]
     },
     {
@@ -1703,6 +2159,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1048/"
+      ],
+      "attack": [
+        "T1048"
       ]
     },
     {
@@ -1716,6 +2175,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1048/"
+      ],
+      "attack": [
+        "T1048"
       ]
     },
     {
@@ -1729,6 +2191,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1048/"
+      ],
+      "attack": [
+        "T1048"
       ]
     },
     {
@@ -1743,6 +2208,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1552/",
         "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "attack": [
+        "T1110",
+        "T1552"
       ]
     },
     {
@@ -1757,6 +2226,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1552/",
         "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "attack": [
+        "T1110",
+        "T1552"
       ]
     },
     {
@@ -1771,6 +2244,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1552/",
         "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "attack": [
+        "T1110",
+        "T1552"
       ]
     },
     {
@@ -1785,6 +2262,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1552/",
         "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "attack": [
+        "T1110",
+        "T1552"
       ]
     },
     {
@@ -1799,6 +2280,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1552/",
         "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "attack": [
+        "T1110",
+        "T1552"
       ]
     },
     {
@@ -1813,6 +2298,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1552/",
         "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "attack": [
+        "T1110",
+        "T1552"
       ]
     },
     {
@@ -1827,6 +2316,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1552/",
         "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "attack": [
+        "T1110",
+        "T1552"
       ]
     },
     {
@@ -1841,6 +2334,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1552/",
         "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "attack": [
+        "T1110",
+        "T1552"
       ]
     },
     {
@@ -1855,6 +2352,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1552/",
         "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "attack": [
+        "T1110",
+        "T1552"
       ]
     },
     {
@@ -1869,6 +2370,10 @@
       "references": [
         "https://attack.mitre.org/techniques/T1552/",
         "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "attack": [
+        "T1110",
+        "T1552"
       ]
     },
     {
@@ -1882,6 +2387,10 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -1895,6 +2404,10 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -1908,6 +2421,10 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -1921,6 +2438,10 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -1934,6 +2455,10 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -1947,6 +2472,10 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -1960,6 +2489,10 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -1973,6 +2506,10 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -1986,6 +2523,10 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -1999,6 +2540,10 @@
       "enabled": true,
       "references": [
         "https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/activity-log-schema"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2012,6 +2557,10 @@
       "enabled": true,
       "references": [
         "https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/activity-log-schema"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2025,6 +2574,10 @@
       "enabled": true,
       "references": [
         "https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/activity-log-schema"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2038,6 +2591,10 @@
       "enabled": true,
       "references": [
         "https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/activity-log-schema"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2051,6 +2608,10 @@
       "enabled": true,
       "references": [
         "https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/activity-log-schema"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2064,6 +2625,10 @@
       "enabled": true,
       "references": [
         "https://docs.cloud.google.com/logging/docs/audit"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2077,6 +2642,11 @@
       "enabled": true,
       "references": [
         "https://docs.cloud.google.com/logging/docs/audit"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2090,6 +2660,10 @@
       "enabled": true,
       "references": [
         "https://docs.cloud.google.com/logging/docs/audit"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2103,6 +2677,10 @@
       "enabled": true,
       "references": [
         "https://docs.cloud.google.com/logging/docs/audit"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2116,6 +2694,10 @@
       "enabled": true,
       "references": [
         "https://docs.cloud.google.com/logging/docs/audit"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2129,6 +2711,10 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-record-contents.html"
+      ],
+      "attack": [
+        "T1078.004",
+        "T1580"
       ]
     },
     {
@@ -2143,6 +2729,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2157,6 +2747,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2171,6 +2765,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2185,6 +2783,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2199,6 +2801,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2213,6 +2819,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2227,6 +2837,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2241,6 +2855,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2255,6 +2873,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2269,6 +2891,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2283,6 +2909,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2297,6 +2927,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2311,6 +2945,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2325,6 +2963,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/security/security-checklist/",
         "https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/"
+      ],
+      "attack": [
+        "T1609",
+        "T1611"
       ]
     },
     {
@@ -2338,6 +2980,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1496/"
+      ],
+      "attack": [
+        "T1496"
       ]
     },
     {
@@ -2351,6 +2996,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1496/"
+      ],
+      "attack": [
+        "T1496"
       ]
     },
     {
@@ -2364,6 +3012,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1496/"
+      ],
+      "attack": [
+        "T1496"
       ]
     },
     {
@@ -2377,6 +3028,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1496/"
+      ],
+      "attack": [
+        "T1496"
       ]
     },
     {
@@ -2390,6 +3044,9 @@
       "enabled": true,
       "references": [
         "https://attack.mitre.org/techniques/T1496/"
+      ],
+      "attack": [
+        "T1496"
       ]
     },
     {
@@ -2403,6 +3060,11 @@
       "description": "Reconhece powershell com comando codificado. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1140",
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2416,6 +3078,11 @@
       "description": "Reconhece download seguido de execução em powershell. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1105",
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2429,6 +3096,10 @@
       "description": "Reconhece resposta web enviada ao invoke-expression. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2442,6 +3113,11 @@
       "description": "Reconhece reflexão sobre estado interno amsi. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1562.001",
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2455,6 +3131,11 @@
       "description": "Reconhece referência a patch de amsiscanbuffer. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1562.001",
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2468,6 +3149,10 @@
       "description": "Reconhece assembly carregado a partir de base64. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2481,6 +3166,10 @@
       "description": "Reconhece função powershell de injeção em memória. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2494,6 +3183,10 @@
       "description": "Reconhece função powershell de extração de credenciais. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2507,6 +3200,10 @@
       "description": "Reconhece monitoramento do defender desativado. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2520,6 +3217,10 @@
       "description": "Reconhece exclusão de pasta adicionada ao defender. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2533,6 +3234,10 @@
       "description": "Reconhece política de scriptblocklogging alterada. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2546,6 +3251,10 @@
       "description": "Reconhece powershell com cliente tcp e stream. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2559,6 +3268,10 @@
       "description": "Reconhece powershell oculto e política bypass. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2572,6 +3285,10 @@
       "description": "Reconhece credenciais powershell exportadas. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2585,6 +3302,10 @@
       "description": "Reconhece securestring convertido em texto. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2598,6 +3319,11 @@
       "description": "Reconhece prompt de ferramenta de credenciais. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/001/"
+      ],
+      "attack": [
+        "T1003.001",
+        "T1059.001",
+        "T1027"
       ]
     },
     {
@@ -2611,6 +3337,10 @@
       "description": "Reconhece comando sekurlsa de credenciais. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003.001",
+        "T1003"
       ]
     },
     {
@@ -2624,6 +3354,10 @@
       "description": "Reconhece procdump direcionado a lsass. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003.001",
+        "T1003"
       ]
     },
     {
@@ -2637,6 +3371,10 @@
       "description": "Reconhece minidump via comsvcs e rundll32. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003.001",
+        "T1003"
       ]
     },
     {
@@ -2650,6 +3388,10 @@
       "description": "Reconhece arquivo de dump identificado como lsass. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003.001",
+        "T1003"
       ]
     },
     {
@@ -2663,6 +3405,9 @@
       "description": "Reconhece exportação do hive sam. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003"
       ]
     },
     {
@@ -2676,6 +3421,9 @@
       "description": "Reconhece exportação do hive security. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003"
       ]
     },
     {
@@ -2689,6 +3437,9 @@
       "description": "Reconhece armazenamento wdigest de senha habilitado. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003"
       ]
     },
     {
@@ -2702,6 +3453,9 @@
       "description": "Reconhece comando de extração de segredos lsa. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003"
       ]
     },
     {
@@ -2715,6 +3469,9 @@
       "description": "Reconhece referência a ferramenta de dump furtivo. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003"
       ]
     },
     {
@@ -2728,6 +3485,9 @@
       "description": "Reconhece pypykatz analisando memória. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003"
       ]
     },
     {
@@ -2741,6 +3501,9 @@
       "description": "Reconhece saída de hash ntlm de credencial. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003"
       ]
     },
     {
@@ -2754,6 +3517,9 @@
       "description": "Reconhece saída de credencial sekurlsa. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/001/"
+      ],
+      "attack": [
+        "T1003"
       ]
     },
     {
@@ -2767,6 +3533,11 @@
       "description": "Reconhece solicitação explícita de dcsync. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/006/"
+      ],
+      "attack": [
+        "T1003.006",
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2780,6 +3551,11 @@
       "description": "Reconhece guid de replicação de segredo no ad. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/006/"
+      ],
+      "attack": [
+        "T1003.006",
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2793,6 +3569,10 @@
       "description": "Reconhece criação ifm via ntdsutil. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/006/"
+      ],
+      "attack": [
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2806,6 +3586,10 @@
       "description": "Reconhece cópia do banco ntds. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/006/"
+      ],
+      "attack": [
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2819,6 +3603,11 @@
       "description": "Reconhece ferramenta solicitando kerberoast. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1558/"
+      ],
+      "attack": [
+        "T1558.003",
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2832,6 +3621,11 @@
       "description": "Reconhece ferramenta solicitando as-rep roast. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1558/"
+      ],
+      "attack": [
+        "T1558.004",
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2845,6 +3639,10 @@
       "description": "Reconhece comando de criação de ticket kerberos. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1558/"
+      ],
+      "attack": [
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2858,6 +3656,10 @@
       "description": "Reconhece ticket kerberos injetado por ferramenta. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/006/"
+      ],
+      "attack": [
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2871,6 +3673,10 @@
       "description": "Reconhece saída de material kerberos para quebra. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1558/"
+      ],
+      "attack": [
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2884,6 +3690,10 @@
       "description": "Reconhece coleta explícita para bloodhound. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/006/"
+      ],
+      "attack": [
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2897,6 +3707,10 @@
       "description": "Reconhece ferramenta enumerando configuração ad cs. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/006/"
+      ],
+      "attack": [
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2910,6 +3724,10 @@
       "description": "Reconhece consulta a machineaccountquota. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1003/006/"
+      ],
+      "attack": [
+        "T1558",
+        "T1087"
       ]
     },
     {
@@ -2923,6 +3741,11 @@
       "description": "Reconhece exclusão de cópias de sombra. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -2936,6 +3759,11 @@
       "description": "Reconhece exclusão de catálogo ou backups windows. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -2949,6 +3777,11 @@
       "description": "Reconhece recuperação de inicialização desabilitada. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -2962,6 +3795,11 @@
       "description": "Reconhece política de ignorar falhas de inicialização. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -2975,6 +3813,12 @@
       "description": "Reconhece limpeza de canal de eventos windows. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1070.001",
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -2988,6 +3832,12 @@
       "description": "Reconhece limpeza de eventos via powershell. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1070.001",
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -3001,6 +3851,11 @@
       "description": "Reconhece auditoria desabilitada por auditpol. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -3014,6 +3869,11 @@
       "description": "Reconhece serviço de event log interrompido. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -3027,6 +3887,12 @@
       "description": "Reconhece política disableantispyware habilitada. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1562.001",
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -3040,6 +3906,11 @@
       "description": "Reconhece perfis de firewall desativados. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -3053,6 +3924,12 @@
       "description": "Reconhece serviço de proteção interrompido. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1562.001",
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -3066,6 +3943,12 @@
       "description": "Reconhece mensagem de log de auditoria limpo. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1490/"
+      ],
+      "attack": [
+        "T1070.001",
+        "T1070",
+        "T1562",
+        "T1490"
       ]
     },
     {
@@ -3079,6 +3962,11 @@
       "description": "Reconhece gravação de chave run ou runonce. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3092,6 +3980,11 @@
       "description": "Reconhece alteração de inicialização winlogon. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3105,6 +3998,11 @@
       "description": "Reconhece debugger associado a image file execution options. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3118,6 +4016,11 @@
       "description": "Reconhece registro de appinit dlls. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3131,6 +4034,11 @@
       "description": "Reconhece tarefa agendada com script remoto. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3144,6 +4052,11 @@
       "description": "Reconhece tarefa agendada solicitando system. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3157,6 +4070,11 @@
       "description": "Reconhece serviço criado com binário em pasta temporária. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3170,6 +4088,11 @@
       "description": "Reconhece serviço criado apontando para interpretador. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3183,6 +4106,11 @@
       "description": "Reconhece consumidor wmi de comando ou script. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3196,6 +4124,11 @@
       "description": "Reconhece associação permanente de filtro wmi. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3209,6 +4142,11 @@
       "description": "Reconhece cópia de executável para pasta startup. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3222,6 +4160,11 @@
       "description": "Reconhece alteração da chave bootexecute. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1547/001/"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1053.005",
+        "T1547.001"
       ]
     },
     {
@@ -3235,6 +4178,11 @@
       "description": "Reconhece shell com redirecionamento para socket tcp. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3248,6 +4196,11 @@
       "description": "Reconhece netcat executando interpretador. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3261,6 +4214,11 @@
       "description": "Reconhece socat ligando socket a shell. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3274,6 +4232,11 @@
       "description": "Reconhece fifo usada em pipeline de shell. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3287,6 +4250,11 @@
       "description": "Reconhece download remoto enviado ao shell. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3300,6 +4268,12 @@
       "description": "Reconhece base64 decodificado e executado por shell. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1140",
+        "T1027",
+        "T1059.004",
+        "T1053.003"
       ]
     },
     {
@@ -3313,6 +4287,11 @@
       "description": "Reconhece escrita de biblioteca em ld.so.preload. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3326,6 +4305,11 @@
       "description": "Reconhece chave adicionada a authorized_keys. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3339,6 +4323,11 @@
       "description": "Reconhece cron com download remoto ou shell tcp. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3352,6 +4341,11 @@
       "description": "Reconhece bit setuid aplicado a shell. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3365,6 +4359,11 @@
       "description": "Reconhece histórico do shell apagado ou desabilitado. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3378,6 +4377,11 @@
       "description": "Reconhece formato de senha no arquivo shadow. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "attack": [
+        "T1059.004",
+        "T1053.003",
+        "T1098.004"
       ]
     },
     {
@@ -3391,6 +4395,10 @@
       "description": "Reconhece proxy tcp configurado pelo netsh. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1090/001/"
+      ],
+      "attack": [
+        "T1021",
+        "T1570"
       ]
     },
     {
@@ -3404,6 +4412,10 @@
       "description": "Reconhece encaminhamento remoto via ssh. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1090/001/"
+      ],
+      "attack": [
+        "T1021",
+        "T1570"
       ]
     },
     {
@@ -3417,6 +4429,10 @@
       "description": "Reconhece proxy socks dinâmico por ssh. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1090/001/"
+      ],
+      "attack": [
+        "T1021",
+        "T1570"
       ]
     },
     {
@@ -3430,6 +4446,10 @@
       "description": "Reconhece chisel em modo túnel. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1090/001/"
+      ],
+      "attack": [
+        "T1021",
+        "T1570"
       ]
     },
     {
@@ -3443,6 +4463,10 @@
       "description": "Reconhece ligolo com conexão de agente. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1090/001/"
+      ],
+      "attack": [
+        "T1021",
+        "T1570"
       ]
     },
     {
@@ -3456,6 +4480,10 @@
       "description": "Reconhece ferramenta impacket de execução remota. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1090/001/"
+      ],
+      "attack": [
+        "T1021",
+        "T1570"
       ]
     },
     {
@@ -3469,6 +4497,11 @@
       "description": "Reconhece winrm executando powershell remoto. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1090/001/"
+      ],
+      "attack": [
+        "T1021.006",
+        "T1021",
+        "T1570"
       ]
     },
     {
@@ -3482,6 +4515,10 @@
       "description": "Reconhece serviço remoto psexesvc observado. Confira processo, usuário, origem e autorização; administração legítima, testes e texto citado também podem corresponder.",
       "references": [
         "https://attack.mitre.org/techniques/T1090/001/"
+      ],
+      "attack": [
+        "T1021",
+        "T1570"
       ]
     },
     {
@@ -3496,6 +4533,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3510,6 +4550,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3523,6 +4566,9 @@
       "enabled": true,
       "references": [
         "https://git-scm.com/docs/git-config"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3537,6 +4583,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3551,6 +4600,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3565,6 +4617,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3578,6 +4633,9 @@
       "enabled": true,
       "references": [
         "https://docs.djangoproject.com/en/5.2/ref/settings/#debug"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3592,6 +4650,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3605,6 +4666,9 @@
       "enabled": true,
       "references": [
         "https://docs.spring.io/spring-boot/reference/actuator/endpoints.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3619,6 +4683,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3633,6 +4700,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3647,6 +4717,10 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/"
+      ],
+      "attack": [
+        "T1105",
+        "T1190"
       ]
     },
     {
@@ -3661,6 +4735,9 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552.001"
       ]
     },
     {
@@ -3675,6 +4752,9 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552.001"
       ]
     },
     {
@@ -3689,6 +4769,10 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1021.001",
+        "T1552.001"
       ]
     },
     {
@@ -3703,6 +4787,9 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552.001"
       ]
     },
     {
@@ -3717,6 +4804,9 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552.001"
       ]
     },
     {
@@ -3731,6 +4821,9 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552.001"
       ]
     },
     {
@@ -3745,6 +4838,9 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552.001"
       ]
     },
     {
@@ -3759,6 +4855,9 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552.001"
       ]
     },
     {
@@ -3773,6 +4872,9 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552.001"
       ]
     },
     {
@@ -3787,6 +4889,9 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552.001"
       ]
     },
     {
@@ -3801,6 +4906,9 @@
       "references": [
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552.001"
       ]
     },
     {
@@ -3815,6 +4923,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3829,6 +4940,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3843,6 +4957,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3857,6 +4974,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3871,6 +4991,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3885,6 +5008,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3899,6 +5025,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3913,6 +5042,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3927,6 +5059,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3941,6 +5076,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3955,6 +5093,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3969,6 +5110,9 @@
       "references": [
         "https://community.owasp.org/attacks/SQL_Injection",
         "https://www.postgresql.org/docs/current/errcodes-appendix.html"
+      ],
+      "attack": [
+        "T1190"
       ]
     },
     {
@@ -3984,6 +5128,9 @@
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html",
         "https://www.sqlite.org/cli.html"
+      ],
+      "attack": [
+        "T1005"
       ]
     },
     {
@@ -3999,6 +5146,9 @@
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html",
         "https://www.sqlite.org/cli.html"
+      ],
+      "attack": [
+        "T1005"
       ]
     },
     {
@@ -4014,6 +5164,9 @@
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html",
         "https://www.sqlite.org/cli.html"
+      ],
+      "attack": [
+        "T1005"
       ]
     },
     {
@@ -4029,6 +5182,9 @@
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html",
         "https://www.sqlite.org/cli.html"
+      ],
+      "attack": [
+        "T1005"
       ]
     },
     {
@@ -4044,6 +5200,9 @@
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html",
         "https://www.sqlite.org/cli.html"
+      ],
+      "attack": [
+        "T1005"
       ]
     },
     {
@@ -4059,6 +5218,9 @@
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html",
         "https://www.sqlite.org/cli.html"
+      ],
+      "attack": [
+        "T1005"
       ]
     },
     {
@@ -4074,6 +5236,9 @@
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html",
         "https://www.sqlite.org/cli.html"
+      ],
+      "attack": [
+        "T1005"
       ]
     },
     {
@@ -4089,6 +5254,9 @@
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html",
         "https://www.sqlite.org/cli.html"
+      ],
+      "attack": [
+        "T1005"
       ]
     },
     {
@@ -4104,6 +5272,9 @@
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html",
         "https://www.sqlite.org/cli.html"
+      ],
+      "attack": [
+        "T1005"
       ]
     },
     {
@@ -4119,6 +5290,9 @@
         "https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information/",
         "https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html",
         "https://www.sqlite.org/cli.html"
+      ],
+      "attack": [
+        "T1005"
       ]
     },
     {
@@ -4135,6 +5309,9 @@
         "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html",
         "https://docs.cloud.google.com/compute/docs/metadata/querying-metadata",
         "https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-use-vm-token"
+      ],
+      "attack": [
+        "T1552.005"
       ]
     },
     {
@@ -4151,6 +5328,9 @@
         "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html",
         "https://docs.cloud.google.com/compute/docs/metadata/querying-metadata",
         "https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-use-vm-token"
+      ],
+      "attack": [
+        "T1552.005"
       ]
     },
     {
@@ -4167,6 +5347,9 @@
         "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html",
         "https://docs.cloud.google.com/compute/docs/metadata/querying-metadata",
         "https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-use-vm-token"
+      ],
+      "attack": [
+        "T1552.005"
       ]
     },
     {
@@ -4183,6 +5366,9 @@
         "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html",
         "https://docs.cloud.google.com/compute/docs/metadata/querying-metadata",
         "https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-use-vm-token"
+      ],
+      "attack": [
+        "T1552.005"
       ]
     },
     {
@@ -4196,6 +5382,9 @@
       "enabled": true,
       "references": [
         "https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html"
+      ],
+      "attack": [
+        "T1552.005"
       ]
     },
     {
@@ -4212,6 +5401,9 @@
         "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html",
         "https://docs.cloud.google.com/compute/docs/metadata/querying-metadata",
         "https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-use-vm-token"
+      ],
+      "attack": [
+        "T1552.005"
       ]
     },
     {
@@ -4228,6 +5420,10 @@
         "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html",
         "https://docs.cloud.google.com/compute/docs/metadata/querying-metadata",
         "https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-use-vm-token"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1552.005"
       ]
     },
     {
@@ -4244,6 +5440,9 @@
         "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html",
         "https://docs.cloud.google.com/compute/docs/metadata/querying-metadata",
         "https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-use-vm-token"
+      ],
+      "attack": [
+        "T1552.005"
       ]
     },
     {
@@ -4260,6 +5459,9 @@
         "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html",
         "https://docs.cloud.google.com/compute/docs/metadata/querying-metadata",
         "https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-use-vm-token"
+      ],
+      "attack": [
+        "T1552.005"
       ]
     },
     {
@@ -4276,6 +5478,9 @@
         "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html",
         "https://docs.cloud.google.com/compute/docs/metadata/querying-metadata",
         "https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-use-vm-token"
+      ],
+      "attack": [
+        "T1552.005"
       ]
     },
     {
@@ -4289,6 +5494,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4302,6 +5511,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4315,6 +5528,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4329,6 +5546,10 @@
       "references": [
         "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4343,6 +5564,10 @@
       "references": [
         "https://docs.gitlab.com/user/profile/personal_access_tokens/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4357,6 +5582,10 @@
       "references": [
         "https://docs.slack.dev/authentication/tokens/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4371,6 +5600,10 @@
       "references": [
         "https://docs.npmjs.com/using-private-packages-in-a-ci-cd-workflow/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4384,6 +5617,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4398,6 +5635,10 @@
       "references": [
         "https://kubernetes.io/docs/concepts/configuration/organize-cluster-access-kubeconfig/",
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4411,6 +5652,10 @@
       "enabled": true,
       "references": [
         "https://learn.microsoft.com/en-us/azure/storage/common/storage-sas-overview"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4424,6 +5669,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4437,6 +5686,10 @@
       "enabled": true,
       "references": [
         "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ],
+      "attack": [
+        "T1552",
+        "T1528"
       ]
     },
     {
@@ -4451,6 +5704,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://docs.python.org/3/library/traceback.html"
+      ],
+      "attack": [
+        "T1203"
       ]
     },
     {
@@ -4465,6 +5721,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://docs.python.org/3/library/traceback.html"
+      ],
+      "attack": [
+        "T1203"
       ]
     },
     {
@@ -4479,6 +5738,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://docs.python.org/3/library/traceback.html"
+      ],
+      "attack": [
+        "T1203"
       ]
     },
     {
@@ -4493,6 +5755,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://docs.python.org/3/library/traceback.html"
+      ],
+      "attack": [
+        "T1203"
       ]
     },
     {
@@ -4507,6 +5772,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://docs.python.org/3/library/traceback.html"
+      ],
+      "attack": [
+        "T1203"
       ]
     },
     {
@@ -4521,6 +5789,9 @@
       "references": [
         "https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/05-Review_Web_Page_Content_for_Information_Leakage",
         "https://docs.python.org/3/library/traceback.html"
+      ],
+      "attack": [
+        "T1203"
       ]
     },
     {
@@ -4534,6 +5805,11 @@
       "description": "Reconhece conteúdo no formato de /etc/passwd. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man5/passwd.5.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4547,6 +5823,11 @@
       "description": "Reconhece conteúdo de grupos unix em linhas consecutivas. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man5/group.5.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4560,6 +5841,11 @@
       "description": "Reconhece hash de conta no formato de /etc/shadow. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4573,6 +5859,11 @@
       "description": "Reconhece saída de id com uid, gid e grupos. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://www.gnu.org/software/coreutils/manual/html_node/id-invocation.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4586,6 +5877,11 @@
       "description": "Reconhece saída de uname com kernel e arquitetura. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://attack.mitre.org/techniques/T1082/"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4599,6 +5895,11 @@
       "description": "Reconhece conteúdo de os-release. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://attack.mitre.org/techniques/T1082/"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4612,6 +5913,11 @@
       "description": "Reconhece conteúdo de /proc/cpuinfo. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man5/proc_cpuinfo.5.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4625,6 +5931,11 @@
       "description": "Reconhece conteúdo de status de processo em /proc. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man5/proc_pid_status.5.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4638,6 +5949,11 @@
       "description": "Reconhece tabela de processos no formato ps aux. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man1/ps.1.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4651,6 +5967,11 @@
       "description": "Reconhece tabela de processos no formato ps ef. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man1/ps.1.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4664,6 +5985,11 @@
       "description": "Reconhece listagem unix com permissões, dono e caminho. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://www.gnu.org/software/coreutils/manual/html_node/What-information-is-listed.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4677,6 +6003,11 @@
       "description": "Reconhece tabela de conexões no formato netstat. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man8/netstat.8.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4690,6 +6021,11 @@
       "description": "Reconhece tabela de sockets no formato ss. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man8/ss.8.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4703,6 +6039,11 @@
       "description": "Reconhece saída detalhada de ip address. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man8/ip-address.8.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4716,6 +6057,11 @@
       "description": "Reconhece tabela de rotas unix. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man8/route.8.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4729,6 +6075,11 @@
       "description": "Reconhece saída de montagens de dispositivos unix. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man8/mount.8.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4742,6 +6093,11 @@
       "description": "Reconhece saída de espaço em disco unix. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://www.gnu.org/software/coreutils/manual/html_node/df-invocation.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4755,6 +6111,11 @@
       "description": "Reconhece resposta de privilégios sudo do usuário. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://www.sudo.ws/docs/man/sudo.man/"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4768,6 +6129,11 @@
       "description": "Reconhece regra de privilégios no formato sudoers. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://www.sudo.ws/docs/man/sudoers.man/"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4781,6 +6147,11 @@
       "description": "Reconhece listagem de capabilities sensíveis em arquivo. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man7/capabilities.7.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4794,6 +6165,11 @@
       "description": "Reconhece mapa de memória de processo unix. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4807,6 +6183,11 @@
       "description": "Reconhece identidade windows acompanhada de sid. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/whoami"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4820,6 +6201,11 @@
       "description": "Reconhece privilégio windows sensível habilitado. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/whoami"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4833,6 +6219,11 @@
       "description": "Reconhece tabela de grupos windows com sid. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/whoami"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4846,6 +6237,11 @@
       "description": "Reconhece saída de systeminfo com sistema e versão. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/systeminfo"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4859,6 +6255,11 @@
       "description": "Reconhece saída localizada de informações do windows. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/systeminfo"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4872,6 +6273,11 @@
       "description": "Reconhece configuração ip com máscara de sub-rede. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/ipconfig"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4885,6 +6291,11 @@
       "description": "Reconhece listagem de diretório windows. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/dir"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4898,6 +6309,11 @@
       "description": "Reconhece tabela de processos windows. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/tasklist"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4911,6 +6327,12 @@
       "description": "Reconhece resposta detalhada de serviço windows. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/sc-query"
+      ],
+      "attack": [
+        "T1543.003",
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4924,6 +6346,11 @@
       "description": "Reconhece resposta de consulta ao registro do windows. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/reg-query"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4937,6 +6364,11 @@
       "description": "Reconhece tabela de sessões interativas windows. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/query-user"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4950,6 +6382,11 @@
       "description": "Reconhece resposta detalhada de conta windows. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/net-user"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4963,6 +6400,11 @@
       "description": "Reconhece resposta de membros de grupo windows. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/cc725622(v=ws.11)"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4976,6 +6418,11 @@
       "description": "Reconhece resposta de tickets kerberos em cache. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/klist"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -4989,6 +6436,11 @@
       "description": "Reconhece linhas no formato de hashes de contas windows. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/whoami"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -5002,6 +6454,11 @@
       "description": "Reconhece tabela de versão do powershell. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/powershell"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -5015,6 +6472,11 @@
       "description": "Reconhece tabela wmic de contas e sids. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/wmic"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -5028,6 +6490,11 @@
       "description": "Reconhece tabela wmic de software e versão. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/wmic"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -5041,6 +6508,11 @@
       "description": "Reconhece tabela de conexões windows com pid. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/netstat"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     },
     {
@@ -5054,6 +6526,11 @@
       "description": "Reconhece tabela de rotas no formato route print. Saída inesperada em logs de aplicação ou resposta HTTP pode indicar leitura de arquivo, execução ou exposição de informações. Inventário, diagnóstico autorizado e conteúdo citado também podem produzir esse formato; confira origem, campo, horário e registros próximos.",
       "references": [
         "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/route_ws2008"
+      ],
+      "attack": [
+        "T1082",
+        "T1033",
+        "T1087"
       ]
     }
   ]

@@ -31,6 +31,8 @@ struct Field {
     name: String,
     role: Option<Role>,
     text: bool,
+    /// Sigma field names: case-insensitive lookup before the role fallback.
+    ci: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,7 +187,7 @@ fn resolve_field(name: &str) -> Field {
         None
     };
     let text = TEXT_COLUMNS.contains(&column.as_str());
-    Field { name: column, role, text }
+    Field { name: column, role, text, ci: false }
 }
 
 fn is_field_char(c: char) -> bool {
@@ -393,8 +395,13 @@ impl Parser<'_> {
         let mut j = open + 1;
         while j < close {
             let c = self.chars[j];
-            if c == '\\' && self.chars.get(j + 1) == Some(&'/') {
-                pattern.push('/');
+            if c == '\\' && j + 1 < close {
+                // Escape pairs stay intact, except "\/" which only protects the delimiter.
+                let next = self.chars[j + 1];
+                if next != '/' {
+                    pattern.push('\\');
+                }
+                pattern.push(next);
                 j += 2;
                 continue;
             }
@@ -647,13 +654,13 @@ fn number_for(field: &str, value: &str) -> Option<f64> {
 
 const SKIP_IN_FREE_TEXT: &[&str] = &["arquivo", "caminho"];
 
-/// Roles whose canonical value is copied verbatim from the record.
-fn literal_role(role: Role) -> bool {
-    !matches!(role, Role::Action | Role::Outcome | Role::SrcScope | Role::DstScope | Role::Tool)
-}
-
 fn contains_ci(hay: &str, needle_lower: &str) -> bool {
     crate::query::ci_contains_bytes(hay.as_bytes(), needle_lower.as_bytes())
+}
+
+/// Roles whose canonical value is copied verbatim from the record.
+pub(crate) fn literal_role(role: Role) -> bool {
+    !matches!(role, Role::Action | Role::Outcome | Role::SrcScope | Role::DstScope | Role::Tool)
 }
 
 fn any_value(ev: &Event, test: &dyn Fn(&str) -> bool) -> bool {
@@ -674,31 +681,108 @@ fn any_value(ev: &Event, test: &dyn Fn(&str) -> bool) -> bool {
     })
 }
 
-fn field_value<'a>(ev: &'a Event, field: &Field) -> Option<Cow<'a, str>> {
-    ev.col_ref(&field.name)
-        .or_else(|| field.role.and_then(|role| entities::value(ev, role)))
+/// Per-event evaluation context: canonical roles are computed once and
+/// shared by every term and rule evaluated against the same event.
+pub struct Ctx<'a> {
+    pub ev: &'a Event,
+    fields: std::cell::OnceCell<[Option<Cow<'a, str>>; 19]>,
+    fallbacks: [std::cell::OnceCell<Option<Cow<'a, str>>>; 19],
+    action: std::cell::OnceCell<(Option<&'static str>, Option<&'static str>)>,
+    tool: std::cell::OnceCell<Option<&'static str>>,
 }
 
-fn field_number(ev: &Event, field: &Field) -> Option<f64> {
-    if field.name == "timestamp" {
-        return ev.timestamp.map(|t| t as f64);
+impl<'a> Ctx<'a> {
+    pub fn new(ev: &'a Event) -> Self {
+        Ctx {
+            ev,
+            fields: std::cell::OnceCell::new(),
+            fallbacks: Default::default(),
+            action: std::cell::OnceCell::new(),
+            tool: std::cell::OnceCell::new(),
+        }
     }
-    let text = field_value(ev, field)?;
-    let text = text.trim();
-    text.parse::<f64>()
-        .ok()
-        .or_else(|| crate::analysis::parse_num_unit(text).map(|(n, _)| n))
-        .filter(|n| n.is_finite())
+    pub fn role(&self, role: Role) -> Option<&str> {
+        match role {
+            Role::Action => return self.action_outcome().0,
+            Role::Outcome => return self.action_outcome().1,
+            Role::SrcScope => {
+                return self.role(Role::SrcIp).and_then(entities::parse_ip).map(entities::ip_scope)
+            }
+            Role::DstScope => {
+                return self.role(Role::DstIp).and_then(entities::parse_ip).map(entities::ip_scope)
+            }
+            Role::Tool => {
+                return *self.tool.get_or_init(|| {
+                    self.role(Role::UserAgent)
+                        .and_then(entities::tool_in_user_agent)
+                        .or_else(|| self.role(Role::Process).and_then(entities::tool_in_process))
+                        .or_else(|| self.role(Role::CommandLine).and_then(entities::tool_in_process))
+                        .map(|t| t.name)
+                })
+            }
+            _ => {}
+        }
+        let index = role as usize;
+        let fields = self.fields.get_or_init(|| entities::scan_fields(self.ev));
+        if let Some(found) = fields[index].as_deref() {
+            return Some(found);
+        }
+        self.fallbacks[index]
+            .get_or_init(|| entities::fallback_value(self.ev, role))
+            .as_deref()
+    }
+    fn action_outcome(&self) -> (Option<&'static str>, Option<&'static str>) {
+        *self.action.get_or_init(|| entities::action_outcome(self.ev))
+    }
+    /// Value of a column or role by name (grouping keys, placeholders).
+    pub fn get(&self, column: &FieldRef) -> Option<Cow<'a, str>> {
+        self.field(&column.0)
+    }
+    fn field(&self, field: &Field) -> Option<Cow<'a, str>> {
+        let name = field.name.as_str();
+        if let Some(role) = name.strip_prefix('@').and_then(|_| entities::role_of_column(name)) {
+            if !self.ev.fields.contains_key(name) {
+                return self.role(role).map(|v| Cow::Owned(v.to_string()));
+            }
+        }
+        if let Some(found) = self.ev.col_ref(name) {
+            return Some(found);
+        }
+        if field.ci {
+            if let Some((_, value)) = self.ev.fields.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                return Some(match value {
+                    Value::String(s) => Cow::Borrowed(s.as_str()),
+                    other => Cow::Owned(other.to_string()),
+                });
+            }
+        }
+        field.role.and_then(|role| self.role(role)).map(|v| Cow::Owned(v.to_string()))
+    }
+    fn number(&self, field: &Field) -> Option<f64> {
+        if field.name == "timestamp" {
+            return self.ev.timestamp.map(|t| t as f64);
+        }
+        let text = self.field(field)?;
+        let text = text.trim();
+        text.parse::<f64>()
+            .ok()
+            .or_else(|| crate::analysis::parse_num_unit(text).map(|(n, _)| n))
+            .filter(|n| n.is_finite())
+    }
 }
 
 impl Expr {
     pub fn matches(&self, ev: &Event) -> bool {
+        self.matches_ctx(&Ctx::new(ev))
+    }
+
+    pub fn matches_ctx(&self, ctx: &Ctx<'_>) -> bool {
         match self {
             Expr::All => true,
-            Expr::And(items) => items.iter().all(|e| e.matches(ev)),
-            Expr::Or(items) => items.iter().any(|e| e.matches(ev)),
-            Expr::Not(inner) => !inner.matches(ev),
-            Expr::Term(term) => term.matches(ev),
+            Expr::And(items) => items.iter().all(|e| e.matches_ctx(ctx)),
+            Expr::Or(items) => items.iter().any(|e| e.matches_ctx(ctx)),
+            Expr::Not(inner) => !inner.matches_ctx(ctx),
+            Expr::Term(term) => term.matches(ctx),
         }
     }
 
@@ -734,8 +818,7 @@ impl Expr {
         }
     }
 
-    /// Whether free-text terms could be satisfied by catalog enrichment that
-    /// is absent from the raw line (code names and descriptions).
+    /// Free-text needles, which could also match catalog enrichment.
     pub fn free_text_needles(&self, out: &mut Vec<String>) {
         match self {
             Expr::And(items) | Expr::Or(items) => items.iter().for_each(|e| e.free_text_needles(out)),
@@ -744,10 +827,39 @@ impl Expr {
             _ => {}
         }
     }
+
+    /// Lowercase literals of which at least one must occur in the event's
+    /// values for the expression to match; `None` when no such set exists.
+    pub fn required_literals(&self) -> Option<Vec<String>> {
+        match self {
+            Expr::All | Expr::Not(_) => None,
+            Expr::And(items) => items
+                .iter()
+                .filter_map(|e| e.required_literals())
+                .min_by_key(|set| (set.len(), usize::MAX - set.iter().map(|s| s.len()).min().unwrap_or(0))),
+            Expr::Or(items) => {
+                let mut all = Vec::new();
+                for item in items {
+                    all.extend(item.required_literals()?);
+                }
+                Some(all)
+            }
+            Expr::Term(term) => term.required_literals(),
+        }
+    }
+}
+
+fn longest_literal(pattern: &str) -> Option<String> {
+    pattern
+        .split(['*', '?'])
+        .max_by_key(|chunk| chunk.len())
+        .map(str::to_lowercase)
+        .filter(|chunk| chunk.chars().count() >= 3)
 }
 
 impl Term {
-    fn matches(&self, ev: &Event) -> bool {
+    fn matches(&self, ctx: &Ctx<'_>) -> bool {
+        let ev = ctx.ev;
         let Some(field) = &self.field else {
             return match &self.matcher {
                 Matcher::Contains(needle) => any_value(ev, &|v| contains_ci(v, needle)),
@@ -766,27 +878,65 @@ impl Term {
         }
         match &self.matcher {
             Matcher::Threat(threat) => threat.0.matches(ev),
-            Matcher::Cmp(cmp, bound) => field_number(ev, field).is_some_and(|n| match cmp {
+            Matcher::Cmp(cmp, bound) => ctx.number(field).is_some_and(|n| match cmp {
                 Cmp::Gt => n > *bound,
                 Cmp::Gte => n >= *bound,
                 Cmp::Lt => n < *bound,
                 Cmp::Lte => n <= *bound,
             }),
-            Matcher::Range(lo, hi) => field_number(ev, field).is_some_and(|n| n >= *lo && n <= *hi),
+            Matcher::Range(lo, hi) => ctx.number(field).is_some_and(|n| n >= *lo && n <= *hi),
             _ => {
-                let Some(value) = field_value(ev, field) else { return false };
+                let Some(value) = ctx.field(field) else { return false };
                 match &self.matcher {
                     Matcher::Contains(needle) => contains_ci(&value, needle),
-                    Matcher::Equals(needle) => value.trim().to_lowercase() == *needle,
+                    Matcher::Equals(needle) => {
+                        let v = value.trim();
+                        v.len() == needle.len() && v.eq_ignore_ascii_case(needle) || v.to_lowercase() == *needle
+                    }
                     Matcher::Exact(expected) => value.as_ref() == expected,
                     Matcher::Wildcard(re) | Matcher::Regex(re) => re.is_match(&value),
                     Matcher::Cidr(nets) => entities::parse_ip(&value).is_some_and(|ip| nets.iter().any(|n| n.contains(ip))),
                     Matcher::Exists => !value.trim().is_empty(),
-                    Matcher::Set(set) => set.contains(&value.trim().to_lowercase()),
+                    Matcher::Set(set) => {
+                        let v = value.trim();
+                        set.contains(v) || set.contains(&v.to_lowercase())
+                    }
                     Matcher::Level(label) => value.as_ref() == label,
                     _ => false,
                 }
             }
+        }
+    }
+
+    fn required_literals(&self) -> Option<Vec<String>> {
+        let literal = |field: &Option<Field>| match field {
+            None => true,
+            Some(f) if f.name == "_all" => true,
+            Some(f) => {
+                !matches!(f.name.as_str(), "level" | "timestamp" | "name" | "description" | "arquivo" | "caminho")
+                    && f.role.is_none_or(literal_role)
+                    && entities::role_of_column(&f.name).is_none_or(literal_role)
+            }
+        };
+        if !literal(&self.field) {
+            return None;
+        }
+        let usable = |v: &str| v.chars().count() >= 3 && !v.contains(':');
+        match &self.matcher {
+            Matcher::Contains(v) | Matcher::Equals(v) => usable(v).then(|| vec![v.to_lowercase()]),
+            Matcher::Exact(v) => usable(v).then(|| vec![v.to_lowercase()]),
+            Matcher::Set(values) => {
+                let list: Vec<String> = values.iter().map(|v| v.to_lowercase()).collect();
+                list.iter().all(|v| usable(v)).then_some(list)
+            }
+            Matcher::Wildcard(re) => {
+                // Recover the literal chunks from the anchored wildcard source.
+                let source = re.as_str().trim_start_matches("(?is)^").trim_start_matches("(?is)").trim_end_matches('$');
+                let plain: String = source.replace(".*", "*").replace('.', "?");
+                let unescaped = plain.replace('\\', "");
+                longest_literal(&unescaped).filter(|v| !v.contains(':')).map(|v| vec![v])
+            }
+            _ => None,
         }
     }
 
@@ -846,6 +996,98 @@ impl Term {
     }
 }
 
+/// Resolved column reference, reusable across events.
+pub struct FieldRef(Field);
+
+pub fn field_ref(name: &str) -> FieldRef {
+    FieldRef(resolve_field(name))
+}
+
+// ---------------------------------------------------------------- builders
+
+/// Condition built programmatically (Sigma conversion).
+pub enum Spec {
+    Contains(String),
+    StartsWith(String),
+    EndsWith(String),
+    Equals(String),
+    /// Sigma wildcard pattern: `*`, `?`, `\*` escapes.
+    Wildcard(String),
+    Regex(String),
+    Cidr(String),
+    Exists,
+    Gt(f64),
+    Gte(f64),
+    Lt(f64),
+    Lte(f64),
+}
+
+pub fn and(items: Vec<Expr>) -> Expr {
+    if items.len() == 1 { items.into_iter().next().unwrap() } else { Expr::And(items) }
+}
+pub fn or(items: Vec<Expr>) -> Expr {
+    if items.len() == 1 { items.into_iter().next().unwrap() } else { Expr::Or(items) }
+}
+pub fn not(item: Expr) -> Expr {
+    Expr::Not(Box::new(item))
+}
+
+fn sigma_wildcard(pattern: &str) -> Result<regex::Regex, String> {
+    let mut re = String::from("(?is)^");
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if matches!(chars.peek(), Some('*') | Some('?') | Some('\\')) => {
+                re.push_str(&regex::escape(&chars.next().unwrap().to_string()));
+            }
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            other => re.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    re.push('$');
+    regex::Regex::new(&re).map_err(|e| format!("Curinga inválido: {e}"))
+}
+
+/// Field term for converted rules; `field = None` searches every value.
+pub fn term(field: Option<&str>, role: Option<Role>, spec: Spec) -> Result<Expr, String> {
+    let field = field.map(|name| {
+        let mut resolved = resolve_field(name);
+        resolved.ci = true;
+        if role.is_some() {
+            resolved.role = role;
+        }
+        resolved
+    });
+    let matcher = match spec {
+        Spec::Contains(v) => Matcher::Contains(v.to_lowercase()),
+        Spec::Equals(v) => {
+            if v.contains(['*', '?']) {
+                Matcher::Wildcard(sigma_wildcard(&v)?)
+            } else {
+                Matcher::Equals(v.to_lowercase())
+            }
+        }
+        Spec::StartsWith(v) => Matcher::Wildcard(sigma_wildcard(&format!("{v}*"))?),
+        Spec::EndsWith(v) => Matcher::Wildcard(sigma_wildcard(&format!("*{v}"))?),
+        Spec::Wildcard(v) => Matcher::Wildcard(sigma_wildcard(&v)?),
+        Spec::Regex(v) => Matcher::Regex(
+            regex::RegexBuilder::new(&v)
+                .size_limit(1 << 22)
+                .build()
+                .map_err(|e| format!("Expressão regular inválida: {e}"))?,
+        ),
+        Spec::Cidr(v) => Matcher::Cidr(vec![IpNet::parse(&v).ok_or_else(|| format!("Rede inválida: {v}"))?]),
+        Spec::Exists => Matcher::Exists,
+        Spec::Gt(n) => Matcher::Cmp(Cmp::Gt, n),
+        Spec::Gte(n) => Matcher::Cmp(Cmp::Gte, n),
+        Spec::Lt(n) => Matcher::Cmp(Cmp::Lt, n),
+        Spec::Lte(n) => Matcher::Cmp(Cmp::Lte, n),
+    };
+    // Free-text contains without a field uses the same semantics as the search box.
+    Ok(Expr::Term(Term { field, matcher }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,6 +1133,11 @@ mod tests {
         assert!(compile("user:root @src_scope:público").unwrap().matches(&e));
         assert!(compile("(status:404 OR level:erro) -\"port 23\"").unwrap().matches(&e));
         assert!(compile("message:/fail\\w+ password/").unwrap().matches(&e));
+        let mut p = ev("x", json!({"Image": "C:\\Windows\\System32\\cmd.exe", "path": "/usr/bin/ssh"}));
+        p.source = "h".into();
+        assert!(compile(r"Image:/(^|[\\/])cmd\.exe$/").unwrap().matches(&p));
+        assert!(!compile(r"path:/(^|[\\/])sh$/").unwrap().matches(&p));
+        assert!(compile(r"path:/(^|[\\/])ssh$/").unwrap().matches(&p));
         assert!(compile("path=\"/api/pay\"").unwrap().matches(&e));
         assert!(!compile("path=\"/API/pay\"").unwrap().matches(&e));
         assert!(compile("path!=/x").unwrap().matches(&e));

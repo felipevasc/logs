@@ -39,6 +39,9 @@ pub struct Rule {
     pub enabled: bool,
     #[serde(default)]
     pub references: Vec<String>,
+    /// MITRE ATT&CK technique ids; older catalogs fall back to the bundled mapping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attack: Vec<String>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -197,6 +200,121 @@ fn load_path(path: &Path) -> Result<Arc<CompiledCatalog>, String> {
         result: result.clone(),
     });
     result
+}
+
+#[cfg(test)]
+pub(crate) fn builtin_catalog() -> Arc<CompiledCatalog> {
+    compile(BUILTIN.as_bytes()).expect("bundled catalog")
+}
+
+/// The active editable catalog (compiled once and cached by content hash).
+pub(crate) fn load_active() -> Result<Arc<CompiledCatalog>, String> {
+    load_path(&path())
+}
+
+fn bundled_attack() -> &'static std::collections::HashMap<String, Vec<String>> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<String, Vec<String>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        serde_json::from_str::<CatalogFile>(BUILTIN)
+            .map(|file| {
+                file.rules
+                    .into_iter()
+                    .filter(|r| !r.attack.is_empty())
+                    .map(|r| (r.id, r.attack))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// ATT&CK techniques of a rule: explicit, bundled by id or by category.
+pub(crate) fn attack_for(rule: &Rule) -> Vec<String> {
+    if !rule.attack.is_empty() {
+        return rule.attack.clone();
+    }
+    if let Some(found) = bundled_attack().get(&rule.id) {
+        return found.clone();
+    }
+    crate::attack::for_threat_category(&rule.category)
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+pub(crate) struct Hit {
+    pub rule: usize,
+    pub snippet: String,
+    pub normalized: bool,
+}
+
+impl CompiledCatalog {
+    pub(crate) fn rule(&self, index: usize) -> &Rule {
+        &self.file.rules[index]
+    }
+    pub(crate) fn rule_count(&self) -> usize {
+        self.file.rules.len()
+    }
+    pub(crate) fn has_enabled(&self) -> bool {
+        !self.enabled.is_empty()
+    }
+    /// Enabled rules matching an event. Records without encodings or escapes
+    /// are checked on their text directly; others use the normalized corpus.
+    pub(crate) fn event_hits(&self, event: &Event) -> Vec<usize> {
+        if self.enabled.is_empty() {
+            return Vec::new();
+        }
+        let plain = |t: &str| !t.contains(['%', '\\']);
+        if !event.raw.is_empty()
+            && event.raw.len() <= CORPUS_BYTES
+            && plain(&event.raw)
+            && plain(&event.message)
+            && plain(&event.description)
+        {
+            let mut text = String::with_capacity(event.raw.len() + event.message.len() + 2);
+            if !event.raw.contains(event.message.as_str()) {
+                text.push_str(&event.message);
+                text.push('\n');
+            }
+            if !event.description.is_empty() && event.description != event.message {
+                text.push_str(&event.description);
+                text.push('\n');
+            }
+            text.push_str(&event.raw);
+            return self
+                .set
+                .matches(text.as_bytes())
+                .iter()
+                .map(|i| self.enabled[i])
+                .collect();
+        }
+        let body = corpus(event);
+        self.set
+            .matches(body.text.as_bytes())
+            .iter()
+            .map(|i| self.enabled[i])
+            .collect()
+    }
+    /// Matches with the evidence excerpt, for the event detail.
+    pub(crate) fn explain(&self, event: &Event) -> Vec<Hit> {
+        let body = corpus(event);
+        self.set
+            .matches(body.text.as_bytes())
+            .iter()
+            .map(|i| self.enabled[i])
+            .take(20)
+            .map(|rule| {
+                let found = self.regexes[rule].find(body.text.as_bytes());
+                Hit {
+                    rule,
+                    snippet: found
+                        .map(|m| snippet(&body.text, m.start(), m.end()))
+                        .unwrap_or_default(),
+                    normalized: found.is_some_and(|m| m.end() > body.original_len),
+                }
+            })
+            .collect()
+    }
 }
 
 pub(crate) struct RuleMatcher {
@@ -911,8 +1029,10 @@ pub async fn threat_catalog_update() -> Result<CatalogUpdate, String> {
 pub async fn threat_scan(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<ScanResult, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     crate::offload(move || {
         let path = path();
         let catalog = load_path(&path)?;
@@ -941,10 +1061,12 @@ pub async fn threat_scan(
 pub async fn threat_events(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
     app: tauri::AppHandle,
 ) -> Result<EventResult, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     crate::offload(move || {
         events_impl(
             app.state::<AppState>().inner(),

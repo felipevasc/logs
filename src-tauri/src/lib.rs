@@ -1,6 +1,9 @@
 mod analysis;
+mod attack;
+mod case_cache;
 mod case_images;
 mod case_store;
+mod detections;
 mod discovery;
 mod distinct;
 mod entities;
@@ -16,9 +19,11 @@ mod querylang;
 #[cfg(test)]
 mod regression_tests;
 mod remote;
+mod sigma;
 mod sources;
 mod threats;
 mod timeline_export;
+mod triage;
 mod workspace;
 
 use model::{CodesConfig, Event, STANDARD_COLUMNS};
@@ -1077,8 +1082,10 @@ async fn query_events(
     offset: usize,
     limit: usize,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<query::QueryResult, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1160,8 +1167,10 @@ async fn explore_snapshot(
     offset: usize,
     limit: usize,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<query::ExplorerSnapshot, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1282,8 +1291,10 @@ async fn aggregate_events(
     aggs: Vec<query::AggSpec>,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<query::AggResult, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1378,8 +1389,10 @@ async fn trail_events(
     after: usize,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<TrailResult, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1455,8 +1468,10 @@ pub(crate) fn trail_events_impl(
 async fn count_filtered(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<usize, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1493,8 +1508,10 @@ async fn tree_aggs(
     columns: Vec<String>,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<Vec<(String, query::AggResult)>, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1531,8 +1548,10 @@ pub(crate) fn tree_aggs_impl(
 async fn stats_events(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<query::Stats, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         if let Some(events) = case_events {
@@ -1596,8 +1615,10 @@ pub(crate) fn event_detail_impl(state: &AppState, id: usize) -> Option<Event> {
 async fn discover_patterns(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<discovery::Discovery, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
         .await
@@ -1722,8 +1743,10 @@ fn work_columns(evs: &[Event]) -> Vec<String> {
 async fn profile_fields(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     app: AppHandle,
 ) -> Result<Vec<analysis::FieldProfile>, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1746,9 +1769,11 @@ pub(crate) fn profile_fields_impl(
 async fn compute_series(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     spec: analysis::SeriesSpec,
     app: AppHandle,
 ) -> Result<analysis::SeriesResult, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1798,9 +1823,11 @@ pub(crate) fn compute_series_impl(
 async fn pivot(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
     spec: analysis::PivotSpec,
     app: AppHandle,
 ) -> Result<analysis::PivotResult, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -2075,6 +2102,13 @@ pub fn run() {
             journeys::journey_events,
             mcp::mcp_configure,
             workspace::dataset_overview,
+            triage::triage,
+            triage::event_insights,
+            triage::detection_rules,
+            triage::detection_settings_save,
+            triage::sigma_import,
+            triage::sigma_clear,
+            case_cache::case_sync,
             workspace::timeline_range,
             workspace::import_investigation,
             workspace::load_bundle,

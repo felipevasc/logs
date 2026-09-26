@@ -1,0 +1,755 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "auth.bruteforce.source",
+      "name": "Força bruta de senha",
+      "description": "Muitas falhas de autenticação da mesma origem em pouco tempo. Pode ser um ataque, um script mal configurado ou uma senha expirada em uso automático.",
+      "severity": "medium",
+      "attack": [
+        "T1110.001"
+      ],
+      "kind": "threshold",
+      "where": "@action:logon @outcome:failure",
+      "by": [
+        "@src_ip"
+      ],
+      "window": "10m",
+      "count": 10,
+      "summary": "{count} falhas de autenticação de {@src_ip}"
+    },
+    {
+      "id": "auth.bruteforce.account",
+      "name": "Tentativas repetidas contra uma conta",
+      "description": "Muitas falhas de autenticação para a mesma conta. Confirme se a origem é conhecida e se a conta foi bloqueada ou acessada em seguida.",
+      "severity": "medium",
+      "attack": [
+        "T1110.001"
+      ],
+      "kind": "threshold",
+      "where": "@action:logon @outcome:failure",
+      "by": [
+        "@user"
+      ],
+      "window": "10m",
+      "count": 15,
+      "summary": "{count} falhas de autenticação para {@user}"
+    },
+    {
+      "id": "auth.spraying",
+      "name": "Pulverização de senhas",
+      "description": "A mesma origem falhou ao autenticar em várias contas diferentes, padrão típico de tentativa de senhas comuns em muitas contas.",
+      "severity": "high",
+      "attack": [
+        "T1110.003"
+      ],
+      "kind": "distinct",
+      "where": "@action:logon @outcome:failure",
+      "by": [
+        "@src_ip"
+      ],
+      "distinct": "@user",
+      "window": "30m",
+      "count": 8,
+      "summary": "{@src_ip} tentou {distinct} contas diferentes"
+    },
+    {
+      "id": "auth.bruteforce.success",
+      "name": "Acesso após força bruta",
+      "description": "Uma sequência de falhas de autenticação foi seguida por um acesso bem-sucedido da mesma origem. Verifique se a conta foi comprometida.",
+      "severity": "high",
+      "attack": [
+        "T1110",
+        "T1078"
+      ],
+      "kind": "sequence",
+      "by": [
+        "@src_ip"
+      ],
+      "window": "30m",
+      "steps": [
+        {
+          "where": "@action:logon @outcome:failure",
+          "count": 5
+        },
+        {
+          "where": "@action:logon @outcome:success"
+        }
+      ],
+      "summary": "Falhas seguidas de acesso bem-sucedido a partir de {@src_ip}"
+    },
+    {
+      "id": "auth.bruteforce.success.account",
+      "name": "Conta acessada após falhas repetidas",
+      "description": "Uma conta teve várias falhas de autenticação seguidas de acesso bem-sucedido.",
+      "severity": "high",
+      "attack": [
+        "T1110",
+        "T1078"
+      ],
+      "kind": "sequence",
+      "by": [
+        "@user"
+      ],
+      "window": "30m",
+      "steps": [
+        {
+          "where": "@action:logon @outcome:failure",
+          "count": 8
+        },
+        {
+          "where": "@action:logon @outcome:success"
+        }
+      ],
+      "summary": "{@user} foi acessada após falhas repetidas"
+    },
+    {
+      "id": "auth.lockout",
+      "name": "Conta bloqueada",
+      "description": "Uma conta foi bloqueada por excesso de tentativas.",
+      "severity": "medium",
+      "attack": [
+        "T1110"
+      ],
+      "kind": "single",
+      "where": "@action:account_lockout",
+      "by": [
+        "@user"
+      ],
+      "summary": "{@user} foi bloqueada"
+    },
+    {
+      "id": "auth.rdp.public",
+      "name": "Acesso RDP a partir da internet",
+      "description": "Sessão de área de trabalho remota iniciada a partir de um endereço público.",
+      "severity": "high",
+      "attack": [
+        "T1021.001",
+        "T1133"
+      ],
+      "kind": "single",
+      "where": "@action:logon @outcome:success LogonType:10 @src_scope:público",
+      "by": [
+        "@src_ip"
+      ],
+      "summary": "RDP de {@src_ip} para {@host}"
+    },
+    {
+      "id": "auth.root.public",
+      "name": "Login de administrador a partir da internet",
+      "description": "Conta root ou administradora autenticou com sucesso a partir de um endereço público.",
+      "severity": "high",
+      "attack": [
+        "T1078",
+        "T1133"
+      ],
+      "kind": "single",
+      "where": "@action:logon @outcome:success @src_scope:público @user:(root OR administrator OR administrador OR admin)",
+      "by": [
+        "@src_ip"
+      ],
+      "summary": "{@user} acessado a partir de {@src_ip}"
+    },
+    {
+      "id": "account.create",
+      "name": "Conta criada",
+      "description": "Uma nova conta foi criada. Contas criadas fora do processo normal são um meio comum de persistência.",
+      "severity": "medium",
+      "attack": [
+        "T1136"
+      ],
+      "kind": "single",
+      "where": "@action:account_create",
+      "by": [
+        "@host"
+      ],
+      "summary": "Conta criada em {@host}"
+    },
+    {
+      "id": "account.privileged-group",
+      "name": "Conta adicionada a grupo privilegiado",
+      "description": "Um membro foi adicionado a um grupo administrativo (Administrators, Domain Admins, sudo, wheel).",
+      "severity": "high",
+      "attack": [
+        "T1098"
+      ],
+      "kind": "single",
+      "where": "@action:group_member_add (*admin* OR *sudo* OR *wheel* OR *root* OR *administrador*)",
+      "by": [
+        "@host"
+      ],
+      "summary": "Membro adicionado a grupo privilegiado em {@host}"
+    },
+    {
+      "id": "persist.service",
+      "name": "Serviço instalado",
+      "description": "Um novo serviço foi instalado. Atacantes usam serviços para persistência e execução com privilégios.",
+      "severity": "medium",
+      "attack": [
+        "T1543.003"
+      ],
+      "kind": "single",
+      "where": "@action:service_install",
+      "by": [
+        "@host"
+      ],
+      "summary": "Serviço instalado em {@host}"
+    },
+    {
+      "id": "persist.service.suspicious",
+      "name": "Serviço com comando suspeito",
+      "description": "O serviço instalado executa um interpretador, um script ou um binário em pasta temporária ou de usuário.",
+      "severity": "high",
+      "attack": [
+        "T1543.003",
+        "T1569.002"
+      ],
+      "kind": "single",
+      "where": "@action:service_install (/(powershell|cmd(\\.exe)? \\/c|\\\\temp\\\\|\\\\appdata\\\\|\\\\users\\\\public\\\\|rundll32|mshta|\\.bat|\\.vbs|-enc)/)",
+      "by": [
+        "@host"
+      ],
+      "summary": "Serviço suspeito em {@host}"
+    },
+    {
+      "id": "persist.task",
+      "name": "Tarefa agendada criada",
+      "description": "Tarefa agendada criada. Confirme o autor e o comando executado.",
+      "severity": "medium",
+      "attack": [
+        "T1053.005"
+      ],
+      "kind": "single",
+      "where": "@action:task_create",
+      "by": [
+        "@host"
+      ],
+      "summary": "Tarefa agendada criada em {@host}"
+    },
+    {
+      "id": "persist.runkey",
+      "name": "Inicialização automática alterada",
+      "description": "Chave Run/RunOnce do registro alterada, meio comum de persistência no Windows.",
+      "severity": "medium",
+      "attack": [
+        "T1547.001"
+      ],
+      "kind": "single",
+      "where": "@action:registry_change /currentversion\\\\run/",
+      "by": [
+        "@host"
+      ],
+      "summary": "Chave de inicialização alterada em {@host}"
+    },
+    {
+      "id": "persist.cron.suspicious",
+      "name": "Tarefa agendada com comando suspeito",
+      "description": "Tarefa cron executa download, decodificação ou binário em pasta temporária.",
+      "severity": "high",
+      "attack": [
+        "T1053.003"
+      ],
+      "kind": "single",
+      "where": "@action:task_run @cmdline:/(curl|wget|base64|\\/tmp\\/|\\/dev\\/shm|\\bnc\\s|bash\\s+-c)/",
+      "by": [
+        "@host"
+      ],
+      "summary": "Cron suspeito em {@host}"
+    },
+    {
+      "id": "evasion.log-clear",
+      "name": "Registro de auditoria apagado ou desativado",
+      "description": "O log de auditoria foi apagado ou a trilha de auditoria foi desativada. É um passo frequente para esconder atividade.",
+      "severity": "high",
+      "attack": [
+        "T1070.001",
+        "T1562.008"
+      ],
+      "kind": "single",
+      "where": "@action:log_clear",
+      "by": [
+        "@host"
+      ],
+      "summary": "Registros apagados ou desativados"
+    },
+    {
+      "id": "evasion.audit-policy",
+      "name": "Política de auditoria alterada",
+      "description": "A política de auditoria foi modificada, o que pode reduzir o que é registrado.",
+      "severity": "medium",
+      "attack": [
+        "T1562.002"
+      ],
+      "kind": "single",
+      "where": "@action:audit_policy_change",
+      "by": [
+        "@host"
+      ],
+      "summary": "Auditoria alterada em {@host}"
+    },
+    {
+      "id": "evasion.defender",
+      "name": "Proteção antivírus desativada",
+      "description": "Proteção em tempo real desativada ou exclusões adicionadas ao Windows Defender.",
+      "severity": "high",
+      "attack": [
+        "T1562.001"
+      ],
+      "kind": "single",
+      "where": "@action:protection_disabled OR @cmdline:/set-mppreference.*(disable|exclusion)|add-mppreference.*exclusion/",
+      "by": [
+        "@host"
+      ],
+      "summary": "Proteção desativada em {@host}"
+    },
+    {
+      "id": "impact.recovery",
+      "name": "Cópias de recuperação removidas",
+      "description": "Comandos que apagam cópias de sombra, catálogos de backup ou desativam a recuperação — etapa típica de ransomware.",
+      "severity": "high",
+      "attack": [
+        "T1490"
+      ],
+      "kind": "single",
+      "where": "@cmdline:/(vssadmin.*delete.*shadows|wmic.*shadowcopy.*delete|bcdedit.*recoveryenabled.*no|wbadmin.*delete.*catalog|delete-backup)/",
+      "by": [
+        "@host"
+      ],
+      "summary": "Recuperação do sistema inibida em {@host}"
+    },
+    {
+      "id": "impact.mass-files",
+      "name": "Alteração massiva de arquivos",
+      "description": "Um processo criou ou removeu centenas de arquivos em um minuto, comportamento compatível com criptografia por ransomware ou destruição de dados.",
+      "severity": "high",
+      "attack": [
+        "T1486",
+        "T1485"
+      ],
+      "kind": "threshold",
+      "where": "@action:(file_create OR file_delete)",
+      "by": [
+        "@host",
+        "@process"
+      ],
+      "window": "1m",
+      "count": 500,
+      "summary": "{count} arquivos alterados por {@process}"
+    },
+    {
+      "id": "exec.encoded-powershell",
+      "name": "PowerShell codificado ou oculto",
+      "description": "PowerShell executado com comando codificado, janela oculta ou decodificação em memória.",
+      "severity": "high",
+      "attack": [
+        "T1059.001",
+        "T1027"
+      ],
+      "kind": "single",
+      "where": "(@process:/powershell|pwsh/ OR @cmdline:/powershell|pwsh/) @cmdline:/(\\s-e(nc(odedcommand)?)?\\s|frombase64string|-w(indowstyle)?\\s+hidden|-nop\\b.*-w)/",
+      "by": [
+        "@host"
+      ],
+      "summary": "PowerShell codificado em {@host}"
+    },
+    {
+      "id": "exec.download-cradle",
+      "name": "Download e execução por linha de comando",
+      "description": "Comando baixa conteúdo remoto com PowerShell, certutil, bitsadmin, curl ou wget, frequentemente para executar código.",
+      "severity": "high",
+      "attack": [
+        "T1105",
+        "T1059"
+      ],
+      "kind": "single",
+      "where": "@cmdline:/(downloadstring|downloadfile|invoke-webrequest|\\biwr\\s|certutil.*-urlcache|bitsadmin.*\\/transfer|start-bitstransfer|(curl|wget)\\s.*\\|\\s*(ba)?sh)/",
+      "by": [
+        "@host"
+      ],
+      "summary": "Download por linha de comando em {@host}"
+    },
+    {
+      "id": "exec.webshell-child",
+      "name": "Servidor web executou um shell",
+      "description": "Um processo de servidor web iniciou um interpretador de comandos. É um forte indício de web shell ou exploração.",
+      "severity": "high",
+      "attack": [
+        "T1505.003",
+        "T1190"
+      ],
+      "kind": "single",
+      "where": "@parent_process:/(^|[\\\\/])(w3wp|httpd|apache2?|nginx|php-cgi|php-fpm|tomcat\\d*|java|node)(\\.exe)?$/ @process:/(^|[\\\\/])(cmd|powershell|pwsh|bash|sh|dash|whoami|net1?|certutil|wscript|cscript|mshta|nc|ncat)(\\.exe)?$/",
+      "by": [
+        "@host"
+      ],
+      "summary": "{@parent_process} iniciou {@process}"
+    },
+    {
+      "id": "exec.office-child",
+      "name": "Documento do Office iniciou um interpretador",
+      "description": "Aplicativo do Office criou um processo de script ou shell, padrão comum de anexos maliciosos.",
+      "severity": "high",
+      "attack": [
+        "T1566",
+        "T1204"
+      ],
+      "kind": "single",
+      "where": "@parent_process:/(^|[\\\\/])(winword|excel|powerpnt|outlook|mspub)\\.exe$/ @process:/(^|[\\\\/])(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32)\\.exe$/",
+      "by": [
+        "@host"
+      ],
+      "summary": "{@parent_process} iniciou {@process}"
+    },
+    {
+      "id": "exec.lolbin",
+      "name": "Binário do sistema usado para executar código",
+      "description": "Uso de rundll32, regsvr32, mshta, certutil ou msbuild com padrões de execução remota ou decodificação.",
+      "severity": "medium",
+      "attack": [
+        "T1218",
+        "T1140"
+      ],
+      "kind": "single",
+      "where": "@cmdline:/(rundll32.*javascript:|regsvr32.*\\/i:https?:|mshta\\s+(https?:|vbscript:|javascript:)|certutil.*-decode|msbuild.*\\.(xml|csproj)\\b|installutil.*\\/u)/",
+      "by": [
+        "@host"
+      ],
+      "summary": "Binário do sistema abusado em {@host}"
+    },
+    {
+      "id": "exec.discovery-burst",
+      "name": "Rajada de comandos de reconhecimento",
+      "description": "Vários comandos de descoberta (whoami, net, ipconfig, systeminfo, nltest, id, uname) em poucos minutos na mesma máquina.",
+      "severity": "medium",
+      "attack": [
+        "T1033",
+        "T1087",
+        "T1082",
+        "T1016"
+      ],
+      "kind": "distinct",
+      "where": "@action:(process_start OR privilege_use) (@process:/(^|[\\\\/])(whoami|net1?|ipconfig|systeminfo|nltest|quser|tasklist|netstat|arp|hostname|id|uname|ifconfig|ip)(\\.exe)?$/ OR @cmdline:/\\b(whoami|net (user|group|localgroup|view)|ipconfig|systeminfo|nltest|quser|tasklist|netstat -an|arp -a|uname -a)\\b/)",
+      "by": [
+        "@host"
+      ],
+      "distinct": "@cmdline",
+      "window": "10m",
+      "count": 4,
+      "summary": "{distinct} comandos de reconhecimento em {@host}",
+      "distinct_fallback": [
+        "@process"
+      ]
+    },
+    {
+      "id": "cred.lsass",
+      "name": "Acesso à memória do LSASS",
+      "description": "Leitura da memória do LSASS ou ferramenta de despejo de credenciais.",
+      "severity": "high",
+      "attack": [
+        "T1003.001"
+      ],
+      "kind": "single",
+      "where": "(@action:process_access TargetImage:*lsass.exe) OR @cmdline:/(sekurlsa|lsadump|procdump.*lsass|comsvcs(\\.dll)?.*minidump|rundll32.*comsvcs)/",
+      "by": [
+        "@host"
+      ],
+      "summary": "Acesso ao LSASS em {@host}"
+    },
+    {
+      "id": "cred.kerberoast",
+      "name": "Possível Kerberoasting",
+      "description": "Muitos tickets de serviço Kerberos com criptografia RC4 pedidos pela mesma conta em pouco tempo.",
+      "severity": "medium",
+      "attack": [
+        "T1558.003"
+      ],
+      "kind": "distinct",
+      "where": "code:4769 TicketEncryptionType:0x17",
+      "by": [
+        "@user"
+      ],
+      "distinct": "ServiceName",
+      "window": "10m",
+      "count": 5,
+      "summary": "{@user} pediu {distinct} tickets RC4 de serviços diferentes"
+    },
+    {
+      "id": "cred.dcsync",
+      "name": "Possível DCSync",
+      "description": "Solicitação de replicação de diretório por uma conta, técnica usada para extrair hashes do domínio.",
+      "severity": "high",
+      "attack": [
+        "T1003.006"
+      ],
+      "kind": "single",
+      "where": "code:4662 (*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2* OR *1131f6ad-9c07-11d1-f79f-00c04fc2dcd2* OR *89e95b76-444d-4c62-991a-0facbeda640c*)",
+      "by": [
+        "@user"
+      ],
+      "summary": "Replicação de diretório solicitada por {@user}"
+    },
+    {
+      "id": "linux.sudo.sensitive",
+      "name": "Comando sensível com sudo",
+      "description": "Uso de sudo para ler arquivos de senha, alterar contas ou iniciar shells de rede.",
+      "severity": "medium",
+      "attack": [
+        "T1548.003"
+      ],
+      "kind": "single",
+      "where": "@action:privilege_use @cmdline:/(\\/etc\\/(shadow|sudoers|passwd)|\\bvisudo\\b|\\buseradd\\b|\\busermod\\b|\\bpasswd\\b|\\bnc(at)?\\s|bash\\s+-i|\\/bin\\/sh\\b|chmod\\s+[0-7]*[4-7][0-7]{3})/",
+      "by": [
+        "@host"
+      ],
+      "summary": "Comando sensível por {@user} em {@host}"
+    },
+    {
+      "id": "tool.scanner",
+      "name": "Ferramenta de varredura identificada",
+      "description": "Requisições com user agent de ferramentas de varredura ou exploração automatizada.",
+      "severity": "medium",
+      "attack": [
+        "T1595.002"
+      ],
+      "kind": "single",
+      "where": "@user_agent:* @tool:*",
+      "by": [
+        "@src_ip"
+      ],
+      "summary": "{@tool} a partir de {@src_ip}"
+    },
+    {
+      "id": "tool.offensive",
+      "name": "Ferramenta ofensiva executada",
+      "description": "Processo ou linha de comando com ferramenta de pós-exploração conhecida.",
+      "severity": "high",
+      "attack": [
+        "T1588.002"
+      ],
+      "kind": "single",
+      "where": "(@process:* OR @cmdline:*) @tool:* -@user_agent:*",
+      "by": [
+        "@host"
+      ],
+      "summary": "{@tool} em {@host}"
+    },
+    {
+      "id": "web.scan",
+      "name": "Varredura web",
+      "description": "Muitas requisições com erro para caminhos diferentes a partir da mesma origem.",
+      "severity": "medium",
+      "attack": [
+        "T1595.002"
+      ],
+      "kind": "distinct",
+      "where": "@action:http_request @outcome:failure",
+      "by": [
+        "@src_ip"
+      ],
+      "distinct": "@url",
+      "window": "5m",
+      "count": 40,
+      "summary": "{@src_ip} testou {distinct} caminhos com erro"
+    },
+    {
+      "id": "web.success-after-scan",
+      "name": "Acesso bem-sucedido após varredura",
+      "description": "A origem que gerou muitos erros passou a obter respostas de sucesso em scripts do servidor.",
+      "severity": "high",
+      "attack": [
+        "T1190"
+      ],
+      "kind": "sequence",
+      "by": [
+        "@src_ip"
+      ],
+      "window": "30m",
+      "steps": [
+        {
+          "where": "@action:http_request @outcome:failure",
+          "count": 30
+        },
+        {
+          "where": "@action:http_request @outcome:success @url:/\\.(php|jsp|jspx|asp|aspx|cgi)\\b|[?&](cmd|exec|command)=/"
+        }
+      ],
+      "summary": "{@src_ip} obteve sucesso após varredura"
+    },
+    {
+      "id": "net.portscan",
+      "name": "Varredura de portas",
+      "description": "A mesma origem tentou muitas portas diferentes em pouco tempo.",
+      "severity": "medium",
+      "attack": [
+        "T1046"
+      ],
+      "kind": "distinct",
+      "where": "@action:network_connection",
+      "by": [
+        "@src_ip"
+      ],
+      "distinct": "@dst_port",
+      "window": "2m",
+      "count": 20,
+      "summary": "{@src_ip} tentou {distinct} portas"
+    },
+    {
+      "id": "net.hostscan",
+      "name": "Varredura de hosts",
+      "description": "A mesma origem tentou conectar a muitos destinos diferentes em pouco tempo.",
+      "severity": "medium",
+      "attack": [
+        "T1046",
+        "T1018"
+      ],
+      "kind": "distinct",
+      "where": "@action:network_connection",
+      "by": [
+        "@src_ip"
+      ],
+      "distinct": "@dst_ip",
+      "window": "5m",
+      "count": 30,
+      "summary": "{@src_ip} tentou {distinct} destinos"
+    },
+    {
+      "id": "net.sensitive-port.public",
+      "name": "Serviço sensível acessado da internet",
+      "description": "Conexão aceita de endereço público para porta administrativa ou de banco de dados.",
+      "severity": "medium",
+      "attack": [
+        "T1133"
+      ],
+      "kind": "single",
+      "where": "@action:network_connection @outcome:success @src_scope:público @dst_port:(22 OR 23 OR 445 OR 3389 OR 5985 OR 5986 OR 1433 OR 3306 OR 5432 OR 6379 OR 9200 OR 27017)",
+      "by": [
+        "@src_ip"
+      ],
+      "summary": "{@src_ip} acessou a porta {@dst_port}"
+    },
+    {
+      "id": "net.beacon",
+      "name": "Comunicação periódica (beaconing)",
+      "description": "Conexões repetidas entre o mesmo par de endereços em intervalos muito regulares, padrão comum de implantes de comando e controle.",
+      "severity": "medium",
+      "attack": [
+        "T1071"
+      ],
+      "kind": "beacon",
+      "where": "@action:(network_connection OR dns_query OR http_request) @dst_ip:*",
+      "by": [
+        "@src_ip",
+        "@dst_ip"
+      ],
+      "count": 8,
+      "summary": "{@src_ip} → {@dst_ip} a cada {period}"
+    },
+    {
+      "id": "ids.alert",
+      "name": "Alerta de IDS",
+      "description": "O sensor de rede registrou um alerta. Confira a assinatura e a direção do tráfego.",
+      "severity": "medium",
+      "attack": [
+        "T1190"
+      ],
+      "kind": "single",
+      "where": "@action:ids_alert",
+      "by": [
+        "@src_ip"
+      ],
+      "summary": "Alertas do IDS para {@src_ip}"
+    },
+    {
+      "id": "av.detection",
+      "name": "Malware detectado",
+      "description": "O antivírus detectou ou bloqueou um arquivo malicioso.",
+      "severity": "high",
+      "attack": [
+        "T1204"
+      ],
+      "kind": "single",
+      "where": "@action:malware_detected",
+      "by": [
+        "@host"
+      ],
+      "summary": "Malware detectado em {@host}"
+    },
+    {
+      "id": "cloud.root",
+      "name": "Uso da conta raiz da nuvem",
+      "description": "A conta raiz (root) da AWS foi usada. O uso rotineiro dessa conta é desaconselhado.",
+      "severity": "high",
+      "attack": [
+        "T1078.004"
+      ],
+      "kind": "single",
+      "where": "userIdentity.type:Root",
+      "by": [
+        "@src_ip"
+      ],
+      "summary": "Conta raiz usada a partir de {@src_ip}"
+    },
+    {
+      "id": "cloud.console-no-mfa",
+      "name": "Login no console sem MFA",
+      "description": "Acesso ao console de nuvem sem segundo fator.",
+      "severity": "medium",
+      "attack": [
+        "T1078.004"
+      ],
+      "kind": "single",
+      "where": "eventName:ConsoleLogin @outcome:success additionalEventData.MFAUsed:No",
+      "by": [
+        "@user"
+      ],
+      "summary": "{@user} entrou no console sem MFA"
+    },
+    {
+      "id": "cloud.credential",
+      "name": "Credencial de nuvem criada",
+      "description": "Chave de acesso ou perfil de login criado. Atacantes criam credenciais para manter acesso.",
+      "severity": "medium",
+      "attack": [
+        "T1098.001"
+      ],
+      "kind": "single",
+      "where": "@action:credential_create",
+      "by": [
+        "@user"
+      ],
+      "summary": "Credencial criada por {@user}"
+    },
+    {
+      "id": "cloud.privilege",
+      "name": "Privilégio concedido na nuvem",
+      "description": "Política anexada ou usuário adicionado a grupo na nuvem.",
+      "severity": "medium",
+      "attack": [
+        "T1098"
+      ],
+      "kind": "single",
+      "where": "@action:privilege_grant",
+      "by": [
+        "@user"
+      ],
+      "summary": "Privilégio concedido por {@user}"
+    },
+    {
+      "id": "cloud.secret-burst",
+      "name": "Leitura massiva de segredos",
+      "description": "Muitos segredos ou parâmetros lidos pela mesma identidade em pouco tempo.",
+      "severity": "medium",
+      "attack": [
+        "T1552"
+      ],
+      "kind": "threshold",
+      "where": "@action:secret_access",
+      "by": [
+        "@user"
+      ],
+      "window": "10m",
+      "count": 20,
+      "summary": "{count} segredos lidos por {@user}"
+    }
+  ]
+}
