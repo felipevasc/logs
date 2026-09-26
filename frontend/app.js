@@ -5140,9 +5140,10 @@ function switchSettingsTab(tab) {
   });
 }
 
-async function openSettings(tab = "mcp") {
+async function openSettings(tab = "interface") {
   $("#settings-modal").hidden = false;
   switchSettingsTab(tab);
+  if (tab === "interface") window.UiScale?.renderPane($("#settings-pane-interface"));
   if (tab === "mcp") await renderMcpPane();
   if (tab === "detection") await window.Security?.renderRulesPane($("#settings-pane-detection"));
 }

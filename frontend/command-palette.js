@@ -22,6 +22,9 @@ window.CommandPalette = (() => {
       { group: "Ações", label: "Recalcular triagem", icon: "fa-rotate", run: () => { window.Security?.invalidate(); window.Workspace.showPage("summary"); }, keys: "atualizar deteccoes" },
       { group: "Ações", label: "Regras de detecção e Sigma", icon: "fa-shield-halved", run: () => openSettings("detection"), keys: "sigma importar ocultas configuracoes" },
       { group: "Ações", label: "Configurações e MCP", icon: "fa-sliders", run: () => openSettings("mcp"), keys: "preferencias agentes" },
+      { group: "Ações", label: "Tamanho da interface", icon: "fa-display", run: () => openSettings("interface"), keys: "zoom escala aparencia fonte menor maior" },
+      { group: "Ações", label: "Reduzir interface (Ctrl −)", icon: "fa-magnifying-glass-minus", run: () => window.UiScale?.step(-1), keys: "zoom diminuir menor" },
+      { group: "Ações", label: "Ampliar interface (Ctrl +)", icon: "fa-magnifying-glass-plus", run: () => window.UiScale?.step(1), keys: "zoom aumentar maior" },
       { group: "Ações", label: "Alternar tema claro/escuro", icon: "fa-circle-half-stroke", run: click("#btn-theme"), keys: "dark light" },
       ...(window.Security?.recipes() || []).map(r => ({ group: "Caçar", label: r.label, icon: r.icon, run: r.run, keys: r.query })),
     ];

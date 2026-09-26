@@ -2011,6 +2011,13 @@ fn get_codes_path(state: State<AppState>) -> String {
     state.codes_path.display().to_string()
 }
 
+/// Interface scale of the window (webview zoom, like the browser's zoom).
+/// Returns false where the platform cannot zoom, so the interface keeps 100%.
+#[tauri::command]
+fn ui_zoom(window: tauri::WebviewWindow, scale: f64) -> bool {
+    scale.is_finite() && window.set_zoom(scale.clamp(0.5, 2.0)).is_ok()
+}
+
 /// Status do servidor MCP embutido (para a tela de configurações).
 #[tauri::command]
 fn mcp_status(mcp: State<mcp::McpState>) -> mcp::McpStatus {
@@ -2109,6 +2116,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ui_zoom,
             case_images::case_image_add,
             case_images::case_image_read,
             case_images::export_investigation,
