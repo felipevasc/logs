@@ -371,6 +371,53 @@ pub async fn triage_episode(
     .await?
 }
 
+pub fn evidence_event_impl(
+    state: &AppState,
+    analysis_id: &str,
+    reference: &str,
+    id: usize,
+    case: Option<&[Event]>,
+) -> Result<Event, String> {
+    let full = stored_analysis(state, case, false)?;
+    if full.metadata["analysis_id"].as_str() != Some(analysis_id) {
+        return Err("O conjunto ou a análise mudou; recarregue Comprometimentos".into());
+    }
+    if !full.contains_member(reference, id)? {
+        return Err("O evento não pertence às evidências desta análise".into());
+    }
+    let event = match case {
+        Some(events) => events.iter().find(|e| e.id == id).cloned(),
+        None => crate::event_detail_raw(state, id),
+    }
+    .ok_or("Evento original indisponível")?;
+    if crate::security_normalize::event_ref(&event) != reference {
+        return Err("A identidade do evento mudou; recarregue a análise".into());
+    }
+    Ok(event)
+}
+
+#[tauri::command]
+pub async fn triage_evidence_event(
+    analysis_id: String,
+    event_ref: String,
+    event_id: usize,
+    case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
+    app: AppHandle,
+) -> Result<Event, String> {
+    crate::offload(move || {
+        let case = crate::case_cache::resolve(case_events, case_key)?;
+        evidence_event_impl(
+            app.state::<AppState>().inner(),
+            &analysis_id,
+            &event_ref,
+            event_id,
+            case.as_deref().map(|v| v.as_slice()),
+        )
+    })
+    .await?
+}
+
 #[derive(Serialize)]
 pub struct ThreatExplanation {
     pub id: String,

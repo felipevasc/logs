@@ -11,7 +11,7 @@
     const signature = JSON.stringify(current);
     if (signature !== lastFilters) { history.push(previousSelection); if (history.length > 30) history.shift(); previousSelection = current; lastFilters = signature; cacheKey = ""; lastExploredKey = ""; }
   }
-  const titles = { summary: "Resumo", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs" };
+  const titles = { summary: "Resumo", compromises: "Comprometimentos", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs" };
   // Areas: Análise and Caso read the data; Estrutura holds what feeds it.
   const STRUCTURE = new Set(["sources", "connections", "import"]);
   const TIMELINE_GROUP = new Set(["timeline", "case-timeline", "case-trails", "journeys"]);
@@ -62,13 +62,14 @@
     document.querySelectorAll("[data-page]").forEach(b => { if (b.tagName === "BUTTON") { b.classList.toggle("selected", b.dataset.page === navPage); b.setAttribute("aria-current", b.dataset.page === navPage ? "page" : "false"); } });
     $("#ws-title").textContent = titles[next] || next;
     $("#ws-reload").hidden = ["sources", "connections", "import", "evidence", "case-timeline", "case-trails", "journeys"].includes(next) || !state.loaded;
-    $("#ws-clear-scope").hidden = !backendFilters().length || next === "evidence";
+    $("#ws-clear-scope").hidden = !backendFilters().length || ["evidence", "compromises"].includes(next);
     updateCounts();
+    updateContextBar();
   }
   function updateCounts() {
     $("#ws-evidence-count").textContent = activeCase()?.items?.length || "";
     $("#ws-source-count").textContent = sourceList.length || "";
-    $("#ws-subtitle").textContent = page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${fmtNum(state.total)} registros do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${fmtNum(state.total)} eventos${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
+    $("#ws-subtitle").textContent = page === "compromises" ? `Todo o ${workspaceScope() === "case" ? "Caso ativo" : "conjunto carregado"} · independente dos filtros do Explorar` : page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${fmtNum(state.total)} registros do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${fmtNum(state.total)} eventos${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
   }
   async function showPage(next) {
     window.RemoteSources?.unmount?.();
@@ -107,6 +108,7 @@
     empty.hidden = workspaceScope() === "case" || state.loaded || next === "evidence" || (next === "sources" && sourceList.length > 0);
     content.hidden = !empty.hidden;
     if (!empty.hidden) return;
+    if (next === "compromises") { await window.Security.renderPage(content); return; }
     if (next === "evidence") { renderEvidence(); return; }
     if (next === "case-trails") { window.CaseTrails.render(content, activeCase()); return; }
     if (next === "sources") { await renderSources(); return; }
@@ -147,12 +149,11 @@
         <section class="ws-card"><div class="card-heading"><h2>Ocorrências em destaque</h2><span>${data.findings.length ? data.findings.length + (data.findings.length === 1 ? " indicação" : " indicações") : ""}</span></div>
         ${data.findings.length ? data.findings.map((f, i) => `<article class="finding"><i class="finding-icon ${esc(f.kind)} fas ${f.kind === "spike" ? "fa-arrow-trend-up" : f.kind === "quality" ? "fa-clock" : f.kind === "gap" ? "fa-arrows-left-right" : "fa-layer-group"}"></i><div><h3>${esc(f.title)}</h3><p>${esc(f.detail)}</p><button class="text-button" data-action="finding" data-index="${i}">${f.kind === "quality" ? "Revisar data/hora" : "Investigar"}<i class="fas fa-arrow-right"></i></button></div><div class="finding-actions">${iconButton("save-finding", "fa-bookmark", "Salvar evidência", i)}</div></article>`).join("") : '<p class="quiet-empty">Nenhuma concentração de erros ou lacuna destacada neste recorte. Você pode explorar os padrões e comparar períodos.</p>'}</section>
         <section class="ws-card"><div class="card-heading"><h2>Padrões de mensagem</h2><span>Mais frequentes</span></div>${data.patterns_limited ? note("O limite de 20.000 padrões foi atingido. Refine o período; padrões adicionais não aparecem nesta lista.") : ""}<table class="ws-table"><thead><tr><th>Mensagem</th><th class="num">Eventos</th></tr></thead><tbody>${data.patterns.slice(0, 14).map((p, i) => `<tr><td><button class="pattern-button" data-action="pattern" data-index="${i}">${esc(p.pattern || "Mensagem vazia")}</button><div class="pattern-meta">${esc(p.example.source || "Sem origem")}${p.errors ? ` · ${fmtNum(p.errors)} erros` : ""}</div></td><td class="num">${fmtNum(p.count)}<br><span class="count-bar" style="width:${90 * p.count / Math.max(1, data.patterns[0].count)}px"></span></td></tr>`).join("")}</tbody></table></section>
-        </div><div><section id="ws-entities" hidden></section><section class="ws-card"><div class="card-heading"><h2>Origens</h2><button class="text-button" data-action="sources">Ver fontes <i class="fas fa-arrow-right"></i></button></div>${data.sources.map(([source, count]) => `<button class="source-row source-filter" data-source="${esc(source)}"><i class="fas fa-server"></i><span class="source-name"><strong>${esc(source)}</strong><small>${pct(count / Math.max(1, data.total))} do recorte</small></span><span class="source-amount">${fmtNum(count)}</span></button>`).join("")}${data.sources_other ? `<div class="source-row"><span class="source-name">Outras origens</span><span>${fmtNum(data.sources_other)}</span></div>` : ""}</section><section id="ws-rare" hidden></section>
+        </div><div><section class="ws-card"><div class="card-heading"><h2>Origens</h2><button class="text-button" data-action="sources">Ver fontes <i class="fas fa-arrow-right"></i></button></div>${data.sources.map(([source, count]) => `<button class="source-row source-filter" data-source="${esc(source)}"><i class="fas fa-server"></i><span class="source-name"><strong>${esc(source)}</strong><small>${pct(count / Math.max(1, data.total))} do recorte</small></span><span class="source-amount">${fmtNum(count)}</span></button>`).join("")}${data.sources_other ? `<div class="source-row"><span class="source-name">Outras origens</span><span>${fmtNum(data.sources_other)}</span></div>` : ""}</section>
         ${data.latency ? `<section class="ws-card"><div class="card-heading"><h2>${esc(colLabel(data.latency.field))}</h2><span>${fmtNum(data.latency.count)} valores · ${esc(data.latency.unit || "unidade da fonte")}</span></div><div class="latency-values">${["p50", "p95", "p99"].map(k => `<div><span>${k.toUpperCase()}</span><strong>${fmtNum(Math.round(data.latency[k] * 100) / 100)}</strong></div>`).join("")}</div><p class="quiet-empty">${data.latency.sampled < data.latency.count ? `Percentis estimados em ${fmtNum(data.latency.sampled)} valores distribuídos.` : "Percentis de todos os valores disponíveis."}${data.latency.incompatible ? ` ${fmtNum(data.latency.incompatible)} valores com outra unidade foram excluídos.` : ""}</p></section>` : ""}
         <section class="ws-card"><div class="card-heading"><h2>Investigar</h2></div><div class="recipe-list"><button data-action="errors"><i class="fas fa-circle-exclamation"></i>Ver erros e falhas<i class="fas fa-arrow-right"></i></button><button data-action="compare"><i class="fas fa-code-compare"></i>Comparar períodos<i class="fas fa-arrow-right"></i></button><button data-action="explore"><i class="fas fa-list"></i>Explorar todos os eventos<i class="fas fa-arrow-right"></i></button><button data-action="hunt"><i class="fas fa-crosshairs"></i>Caçar ameaças<i class="fas fa-chevron-down"></i></button></div></section></div></div>`;
       drawTimeline(data);
-      window.Security?.fillSummary({ attention: $("#ws-attention"), entities: $("#ws-entities"), rare: $("#ws-rare") });
-      if (data.start != null && data.end > data.start) window.Security?.markers($("#ws-timeline"), data.start, data.end, (from, to) => applyRange(from, to), $("#ws-timeline .time-labels"));
+      window.Security?.fillSummary({ attention: $("#ws-attention") });
     } catch (e) { if (version === serial && contextKey === sourceKey() && page === "summary") { if (state.activeOperation?.kind === "summary") finishOperation("Resumo não concluído"); failed(e); } }
     finally { if (version === serial && contextKey === sourceKey() && state.activeOperation?.kind === "summary") finishOperation("Pronto"); }
   }

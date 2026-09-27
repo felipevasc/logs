@@ -32,8 +32,9 @@ impl Writer {
     pub fn new() -> Result<Self, String> {
         let db = Connection::open("").map_err(err)?;
         db.execute_batch("PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; PRAGMA mmap_size=0;
-            CREATE TABLE findings(n INTEGER PRIMARY KEY, id TEXT UNIQUE, root INTEGER, level INTEGER, impact INTEGER, start INTEGER, end INTEGER, namespace TEXT, payload TEXT);
+            CREATE TABLE findings(n INTEGER PRIMARY KEY, id TEXT UNIQUE, root INTEGER, level INTEGER, impact INTEGER, start INTEGER, end INTEGER, namespace TEXT, payload TEXT, pattern TEXT, display_root INTEGER, participants TEXT);
             CREATE INDEX finding_root ON findings(root,level);
+            CREATE INDEX finding_display ON findings(display_root,level);
             CREATE TABLE parents(n INTEGER PRIMARY KEY,p INTEGER,size INTEGER);
             CREATE TABLE members(n INTEGER,ref TEXT,event INTEGER,namespace TEXT, PRIMARY KEY(n,ref));
             CREATE INDEX member_ref ON members(namespace,ref); CREATE INDEX member_event ON members(event,n);
@@ -43,7 +44,9 @@ impl Writer {
             CREATE TABLE entities(n INTEGER,namespace TEXT,col TEXT,value TEXT,label TEXT,level INTEGER,PRIMARY KEY(n,namespace,col,value));
             CREATE INDEX entity_key ON entities(namespace,col,value,level);
             CREATE TABLE entity_stats(namespace TEXT,col TEXT,value TEXT,events INTEGER,failures INTEGER,PRIMARY KEY(namespace,col,value));
-            CREATE TABLE episodes(root INTEGER PRIMARY KEY,id TEXT,level INTEGER,impact INTEGER,start INTEGER,end INTEGER,count INTEGER,payload TEXT);
+            CREATE TABLE episodes(root INTEGER PRIMARY KEY,id TEXT,level INTEGER,impact INTEGER,start INTEGER,end INTEGER,count INTEGER,payload TEXT,pattern TEXT);
+            CREATE INDEX episode_pattern ON episodes(pattern,root);
+            CREATE TABLE cards(root INTEGER PRIMARY KEY,id TEXT,level INTEGER,impact INTEGER,start INTEGER,end INTEGER,count INTEGER,payload TEXT);
             BEGIN;").map_err(err)?;
         Ok(Self { db, next: 0 })
     }
@@ -75,7 +78,7 @@ impl Writer {
         self.next += 1;
         let inserted = execute(
             &self.db,
-            "INSERT OR IGNORE INTO findings VALUES(?1,?2,?1,?3,?4,?5,?6,?7,?8)",
+            "INSERT OR IGNORE INTO findings VALUES(?1,?2,?1,?3,?4,?5,?6,?7,?8,?9,?1,?10)",
             params![
                 n,
                 d.id,
@@ -84,7 +87,9 @@ impl Writer {
                 d.start,
                 d.end,
                 d.namespace,
-                serde_json::to_string(d).map_err(err)?
+                serde_json::to_string(d).map_err(err)?,
+                crate::security_grouping::pattern(d),
+                serde_json::to_string(&d.participants).map_err(err)?
             ],
         )
         .map_err(err)?;
@@ -175,7 +180,7 @@ impl Writer {
             let Some(n) = n else { break };
             previous = n;
             let (root, _) = self.root(n)?;
-            execute(&self.db, "UPDATE findings SET root=?1 WHERE n=?2", params![root, n]).map_err(err)?;
+            execute(&self.db, "UPDATE findings SET root=?1,display_root=?1 WHERE n=?2", params![root, n]).map_err(err)?;
         }
         let mut previous = -1;
         loop {
@@ -229,22 +234,106 @@ impl Writer {
             let tactics: Vec<String> =
                 statement.query_map([root], |r| r.get(0)).map_err(err)?.collect::<Result<_, _>>().map_err(err)?;
             let payload = json!({"id":id,"title":lead["name"],"summary":lead["summary"],"severity":lead["severity"],"score":level*20,"evidence_level":level,"start":start,"end":end,"detections":[],"event_refs":[],"record_count":records,"detection_count":count,"tactics":tactics,"entities":lead["entities"].as_array().map(|v|v.iter().take(6).cloned().collect::<Vec<_>>()).unwrap_or_default()});
+            let pattern = if records == 1 {
+                let mut stmt = self.db.prepare("SELECT pattern FROM findings WHERE root=?1 ORDER BY pattern").map_err(err)?;
+                let keys = stmt.query_map([root], |r| r.get::<_, Option<String>>(0)).map_err(err)?
+                    .collect::<Result<Vec<_>, _>>().map_err(err)?;
+                crate::security_grouping::episode_pattern(keys)
+            } else { None };
             execute(
                 &self.db,
-                "INSERT INTO episodes VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![root, id, level, impact, start, end, count, payload.to_string()],
+                "INSERT INTO episodes VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![root, id, level, impact, start, end, count, payload.to_string(), pattern],
             )
             .map_err(err)?;
         }
-        self.db.execute_batch("COMMIT; CREATE INDEX episode_order ON episodes(level DESC,impact DESC,id); CREATE TEMP TABLE selected(event INTEGER PRIMARY KEY);").map_err(err)?;
+        self.group_patterns()?;
+        self.add_participants()?;
+        self.db.execute_batch("COMMIT; CREATE INDEX card_order ON cards(level DESC,impact DESC,id); CREATE INDEX card_id ON cards(id); CREATE INDEX episode_id ON episodes(id); CREATE TEMP TABLE selected(event INTEGER PRIMARY KEY);").map_err(err)?;
         let mut metadata = serde_json::to_value(triage).map_err(err)?;
+        let mut all_levels = [0usize; 5];
+        let mut levels = self
+            .db
+            .prepare("SELECT level,count(*) FROM findings WHERE level>0 GROUP BY level")
+            .map_err(err)?;
+        for result in levels
+            .query_map([], |r| Ok((r.get::<_, usize>(0)?, r.get::<_, usize>(1)?)))
+            .map_err(err)?
+        {
+            let (level, count) = result.map_err(err)?;
+            all_levels[level - 1] = count;
+        }
+        drop(levels);
+        metadata["universe_counts_by_level"] = json!(all_levels);
         metadata["storage"] = json!({"kind":"sqlite","complete":true,"working_memory_budget_mib":256});
         metadata["memory"] = crate::security_budget::snapshot();
         Ok(Arc::new(Results { db: Mutex::new(self.db), metadata }))
     }
+
+    fn add_participants(&self) -> Result<(), String> {
+        let mut stmt=self.db.prepare("SELECT root,payload FROM cards ORDER BY root").map_err(err)?;
+        let mut cards=stmt.query([]).map_err(err)?;
+        while let Some(card)=cards.next().map_err(err)? {
+            crate::operations::check()?;
+            crate::security_budget::check()?;
+            let root:i64=card.get(0).map_err(err)?;
+            let payload:String=card.get(1).map_err(err)?;
+            let mut value:Value=serde_json::from_str(&payload).map_err(err)?;
+            let mut profile=crate::security_participants::Participants::default();
+            let mut members=self.db.prepare("SELECT participants FROM findings WHERE display_root=?1 ORDER BY id").map_err(err)?;
+            for p in members.query_map([root],|r|r.get::<_,String>(0)).map_err(err)? {
+                crate::operations::check()?;
+                crate::security_budget::check()?;
+                profile.merge(&serde_json::from_str(&p.map_err(err)?).map_err(err)?);
+            }
+            value["participants"]=serde_json::to_value(profile).map_err(err)?;
+            execute(&self.db,"UPDATE cards SET payload=?1 WHERE root=?2",params![value.to_string(),root]).map_err(err)?;
+        }
+        Ok(())
+    }
+    fn group_patterns(&self) -> Result<(), String> {
+        self.db.execute_batch("INSERT INTO cards SELECT root,id,level,impact,start,end,count,payload FROM episodes;").map_err(err)?;
+        // Work in SQLite before paging. Original episodes and findings remain intact.
+        let mut stmt = self.db.prepare("SELECT pattern,min(root),count(*),sum(count),min(start),max(end) FROM episodes WHERE pattern IS NOT NULL GROUP BY pattern HAVING count(*)>1 ORDER BY pattern").map_err(err)?;
+        let mut groups = stmt.query([]).map_err(err)?;
+        while let Some(group) = groups.next().map_err(err)? {
+            crate::operations::check()?;
+            crate::security_budget::check()?;
+            let key: String = group.get(0).map_err(err)?;
+            let root: i64 = group.get(1).map_err(err)?;
+            let occurrences: usize = group.get(2).map_err(err)?;
+            let count: usize = group.get(3).map_err(err)?;
+            let start: Option<i64> = group.get(4).map_err(err)?;
+            let end: Option<i64> = group.get(5).map_err(err)?;
+            let lead: String = row(&self.db, "SELECT payload FROM episodes WHERE pattern=?1 ORDER BY id LIMIT 1", [&key], |r| r.get(0)).map_err(err)?;
+            let mut payload: Value = serde_json::from_str(&lead).map_err(err)?;
+            payload["id"] = json!(key);
+            payload["start"] = json!(start);
+            payload["end"] = json!(end);
+            payload["record_count"] = json!(occurrences);
+            payload["detection_count"] = json!(count);
+            payload["grouping"] = json!({"kind":"pattern","occurrence_count":occurrences,"version":crate::security_grouping::VERSION});
+            execute(&self.db, "DELETE FROM cards WHERE root IN(SELECT root FROM episodes WHERE pattern=?1)", [&key]).map_err(err)?;
+            execute(&self.db, "INSERT INTO cards VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![root, key, payload["evidence_level"].as_i64(),
+                    row(&self.db, "SELECT impact FROM episodes WHERE root=?1", [root], |r| r.get::<_, i64>(0)).map_err(err)?,
+                    start, end, count, payload.to_string()]).map_err(err)?;
+            execute(&self.db, "UPDATE findings SET display_root=?1 WHERE root IN(SELECT root FROM episodes WHERE pattern=?2)", params![root, key]).map_err(err)?;
+        }
+        Ok(())
+    }
 }
 
 impl Results {
+    pub fn contains_member(&self, reference: &str, event: usize) -> Result<bool, String> {
+        row(
+            &self.db.lock(),
+            "SELECT EXISTS(SELECT 1 FROM members WHERE event=?1 AND ref=?2)",
+            params![event as i64, reference],
+            |r| r.get(0),
+        )
+        .map_err(err)
+    }
     /// Compact timeline over the complete result, independent of episode pages.
     pub fn timeline(
         &self,
@@ -311,15 +400,15 @@ impl Results {
         }
         let available: usize = counts.iter().sum();
         let visible: usize = counts[(minimum - 1) as usize..].iter().sum();
-        let eligible = format!("EXISTS(SELECT 1 FROM findings f WHERE f.root=e.root AND f.level>=?3 AND {condition})");
+        let eligible = format!("EXISTS(SELECT 1 FROM findings f WHERE f.display_root=e.root AND f.level>=?3 AND {condition})");
         let total: usize = row(
             &db,
-            &format!("SELECT count(*) FROM episodes e WHERE {eligible}"),
+            &format!("SELECT count(*) FROM cards e WHERE {eligible}"),
             params![filtered, tactic, minimum],
             |r| r.get(0),
         )
         .map_err(err)?;
-        let mut stmt=db.prepare(&format!("SELECT root,payload FROM episodes e WHERE {eligible} ORDER BY level DESC,impact DESC,id LIMIT ?4 OFFSET ?5")).map_err(err)?;
+        let mut stmt=db.prepare(&format!("SELECT root,payload FROM cards e WHERE {eligible} ORDER BY level DESC,impact DESC,id LIMIT ?4 OFFSET ?5")).map_err(err)?;
         let mut detections = Vec::new();
         let mut episodes = Vec::new();
         let mut bytes = 0usize;
@@ -335,17 +424,17 @@ impl Results {
                 break;
             }
             // Bound transport even for an episode containing millions of findings.
-            let mut members=db.prepare(&format!("SELECT f.payload, (f.level>=?3 AND {condition}) AS visible FROM findings f WHERE root=?4 ORDER BY visible DESC,level DESC,impact DESC,id LIMIT 100")).map_err(err)?;
+            let mut members=db.prepare(&format!("SELECT f.payload, (f.level>=?3 AND {condition}) AS visible, e.id FROM findings f JOIN episodes e ON e.root=f.root WHERE f.display_root=?4 ORDER BY visible DESC,f.level DESC,f.impact DESC,f.start,f.id LIMIT 100")).map_err(err)?;
             let mut indices = Vec::new();
             let mut refs = std::collections::BTreeSet::new();
             let mut member_bytes = 0usize;
             for row in members
                 .query_map(params![filtered, tactic, minimum, root], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+                    Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?, r.get::<_, String>(2)?))
                 })
                 .map_err(err)?
             {
-                let (payload, visible) = row.map_err(err)?;
+                let (payload, visible, source_episode) = row.map_err(err)?;
                 if member_bytes.saturating_add(payload.len()) > 8 * 1024 * 1024 && !indices.is_empty() {
                     break;
                 }
@@ -360,6 +449,7 @@ impl Results {
                 bytes += payload.len();
                 let mut d: Value = serde_json::from_str(&payload).map_err(err)?;
                 d["context_only"] = json!(!visible);
+                d["source_episode_id"] = json!(source_episode);
                 for r in d["event_refs"].as_array().into_iter().flatten() {
                     if let Some(r) = r.as_str() {
                         refs.insert(r.to_string());
@@ -450,20 +540,20 @@ impl Results {
             return Err("Limite de membros inválido".into());
         }
         let db = self.db.lock();
-        let (root, total): (i64, usize) =
-            row(&db, "SELECT root,count FROM episodes WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+        let (root, total, grouped): (i64, usize, bool) =
+            row(&db, "SELECT root,count,1 FROM cards WHERE id=?1 UNION ALL SELECT root,count,0 FROM episodes WHERE id=?1 LIMIT 1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .map_err(err)?;
         let mut stmt = db
-            .prepare("SELECT payload FROM findings WHERE root=?1 ORDER BY level DESC,impact DESC,id LIMIT ?2 OFFSET ?3")
+            .prepare(&format!("SELECT f.payload,e.id FROM findings f JOIN episodes e ON e.root=f.root WHERE f.{}=?1 ORDER BY f.level DESC,f.impact DESC,f.start,f.id LIMIT ?2 OFFSET ?3", if grouped { "display_root" } else { "root" }))
             .map_err(err)?;
         let mut members = Vec::new();
         let mut bytes = 0;
         for payload in
-            stmt.query_map(params![root, limit as i64, offset as i64], |r| r.get::<_, String>(0)).map_err(err)?
+            stmt.query_map(params![root, limit as i64, offset as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).map_err(err)?
         {
             crate::operations::check()?;
             crate::security_budget::check()?;
-            let payload = payload.map_err(err)?;
+            let (payload, source_episode) = payload.map_err(err)?;
             if bytes + payload.len() > 8 * 1024 * 1024 && !members.is_empty() {
                 break;
             }
@@ -471,7 +561,9 @@ impl Results {
                 return Err("Achado individual excede o limite de transporte".into());
             }
             bytes += payload.len();
-            members.push(serde_json::from_str::<Value>(&payload).map_err(err)?);
+            let mut d: Value = serde_json::from_str(&payload).map_err(err)?;
+            d["source_episode_id"] = json!(source_episode);
+            members.push(d);
         }
         Ok(
             json!({"analysis_id":self.metadata["analysis_id"],"episode_id":id,"total":total,"detections":members,"next_offset":if offset.saturating_add(members.len())<total {Some(offset+members.len())}else{None}}),

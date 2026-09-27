@@ -18,7 +18,7 @@ window.WorkspaceContext = (() => {
   const validFilters = value => Array.isArray(value) ? value.filter(item => item && typeof item.column === "string" && typeof item.op === "string").slice(0, 200).map(item => ({ ...item, ...(item.value != null ? { value: String(item.value) } : {}), ...(item.value2 != null ? { value2: String(item.value2) } : {}) })) : [];
   function sanitize(raw) {
     const base = defaults(), input = record(raw), values = record(input.values), snapshot = { ...base, ...input, values: { ...base.values, ...values }, scroll: {} };
-    snapshot.page = ["summary", "timeline", "case-timeline", "case-trails", "journeys", "explore", "compare", "evidence", "sources", "connections", "import"].includes(input.page) ? input.page : "summary";
+    snapshot.page = ["summary", "compromises", "timeline", "case-timeline", "case-trails", "journeys", "explore", "compare", "evidence", "sources", "connections", "import"].includes(input.page) ? input.page : "summary";
     const v = snapshot.values;
     v.filters = validFilters(values.filters); v.quick = typeof values.quick === "string" ? values.quick : "";
     v.visibleCols = Array.isArray(values.visibleCols) ? strings(values.visibleCols) : base.values.visibleCols; v.favoriteFields = strings(values.favoriteFields);

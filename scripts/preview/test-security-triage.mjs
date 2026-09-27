@@ -12,7 +12,7 @@ try {
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { animate: false }));
 
   // Summary: an episode opens exactly the records of its detections.
-  await page.evaluate(() => Workspace.showPage("summary"));
+  await page.evaluate(() => Workspace.showPage("compromises"));
   await page.waitForSelector(".evidence-control");
   assert.equal(await page.evaluate(() => Security.minimum()), 5);
   assert.equal(await page.locator(".sec-episode").count(), 0);
@@ -33,7 +33,8 @@ try {
   assert.equal(preserved.minimum,2);
   results.caseEvidence=preserved;
   await page.locator(".sec-episode").first().hover();
-  await page.locator(".sec-episode [data-act='records']").first().click();
+  await page.locator(".sec-episode").first().click({button:"right"});
+  await page.locator(".ctx-item", {hasText:"Filtrar eventos no Explorar"}).click();
   await page.waitForFunction(() => document.body.dataset.page === "explore" && state.filters.some(f => f.op === "in_exact") && state.rows.length > 0 && state.rows.every(r => r.code === "4625" || r.code === "4624"));
   const scoped = await page.evaluate(() => ({ chip: [...document.querySelectorAll(".chip")].map(c => c.textContent).join(" | "), total: state.total, codes: [...new Set(state.rows.map(r => r.code))] }));
   assert.match(scoped.chip, /event_ref|Episódio|Evidências/i);

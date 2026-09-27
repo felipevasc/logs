@@ -1,8 +1,8 @@
 //! Versioned evidence policy. Impact never determines confidence.
 use serde::{Deserialize, Serialize};
 
-pub const POLICY_VERSION: &str = "evidence-2";
-pub const NORMALIZATION_VERSION: &str = "normalization-2";
+pub const POLICY_VERSION: &str = "evidence-3";
+pub const NORMALIZATION_VERSION: &str = "normalization-4";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -85,9 +85,88 @@ pub struct Evidence {
     pub evidence_members: Vec<Member>,
     pub relationships: Vec<Relationship>,
     #[serde(default)]
+    pub excerpts: Vec<Excerpt>,
+    #[serde(default)]
     pub claim: String,
     #[serde(default)]
     pub validation: Option<Validation>,
+    #[serde(default)]
+    pub checks: Vec<Check>,
+}
+
+/// Evaluation facts, not generated explanations. Unknown is never a failed test.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Check {
+    pub status: String,
+    pub label: String,
+    pub expected: String,
+    pub observed: String,
+    pub event_refs: Vec<String>,
+    pub fields: Vec<String>,
+}
+
+/// Byte offsets refer to the named field after the declared transformation.
+/// Only positive matched predicates may produce an excerpt.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Excerpt {
+    pub event_ref: String,
+    pub field: String,
+    pub transformation: String,
+    pub start: usize,
+    pub end: usize,
+    pub before: String,
+    pub matched: String,
+    pub after: String,
+    pub prefix_omitted: bool,
+    pub suffix_omitted: bool,
+    pub match_truncated: bool,
+}
+impl Excerpt {
+    pub fn new(
+        reference: &str,
+        field: &str,
+        transformation: &str,
+        value: &str,
+        start: usize,
+        end: usize,
+    ) -> Option<Self> {
+        if start >= end
+            || end > value.len()
+            || !value.is_char_boundary(start)
+            || !value.is_char_boundary(end)
+        {
+            return None;
+        }
+        let a = value[..start]
+            .char_indices()
+            .rev()
+            .nth(80)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let b = value[end..]
+            .char_indices()
+            .nth(80)
+            .map(|(i, _)| end + i)
+            .unwrap_or(value.len());
+        let cut = value[start..end]
+            .char_indices()
+            .nth(400)
+            .map(|(i, _)| start + i)
+            .unwrap_or(end);
+        Some(Self {
+            event_ref: reference.into(),
+            field: field.into(),
+            transformation: transformation.into(),
+            start,
+            end,
+            before: value[a..start].into(),
+            matched: value[start..cut].into(),
+            after: value[end..b].into(),
+            prefix_omitted: a > 0,
+            suffix_omitted: b < value.len(),
+            match_truncated: cut < end,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -130,6 +209,9 @@ impl Evidence {
         self.evidence_level = self.evidence_level.min(maximum);
         if !self.missing_evidence.iter().any(|s| s == reason) {
             self.missing_evidence.push(reason.into());
+            self.checks.push(Check { status: "unknown".into(), label: reason.into(),
+                expected: format!("Contexto necessário para ultrapassar {}", label(maximum)),
+                observed: format!("Nível limitado a {}", label(maximum)), event_refs: vec![], fields: vec![] });
         }
         self.evaluation = "partial".into();
     }
@@ -137,11 +219,11 @@ impl Evidence {
 
 pub fn label(level: u8) -> &'static str {
     match level {
-        5 => "Evidência muito forte",
-        4 => "Suspeita forte",
-        3 => "Suspeita relevante",
-        2 => "Suspeita contextual",
-        1 => "Pista exploratória",
+        5 => "Quase confirmado",
+        4 => "Forte indício",
+        3 => "Indício",
+        2 => "Suspeita",
+        1 => "Inconclusivo",
         _ => "Nível não avaliado",
     }
 }

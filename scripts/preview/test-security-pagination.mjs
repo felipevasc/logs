@@ -8,7 +8,7 @@ try {
   await page.goto(process.argv[2]||'http://127.0.0.1:4173');
   await page.waitForFunction(()=>WorkspaceContext.ready&&state.loaded&&!state.loadOverlay);
   await page.evaluate(()=>WorkspaceContext.setScope('dataset',{animate:false}));
-  await page.evaluate(()=>Workspace.showPage('summary'));
+  await page.evaluate(()=>Workspace.showPage('compromises'));
   await page.waitForSelector('.evidence-control');
   await page.evaluate(()=>{
     const source=structuredClone(Security.cached()),original=api;

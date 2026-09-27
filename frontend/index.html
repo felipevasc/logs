@@ -26,6 +26,7 @@
     <button class="nav-import" id="ws-open" type="button" hidden><i class="fas fa-plus"></i> Abrir logs</button>
     <div class="nav-pages">
       <button data-page="summary" data-zones="analysis case" class="selected"><i class="fas fa-chart-simple"></i>Resumo</button>
+      <button data-page="compromises" data-zones="analysis case"><i class="fas fa-shield-halved"></i>Comprometimentos</button>
       <button data-page="case-timeline" data-zones="analysis case"><i class="fas fa-timeline"></i>Linha do tempo</button>
       <button data-page="explore" data-zones="analysis case"><i class="fas fa-magnifying-glass"></i>Explorar</button>
       <button hidden data-page="evidence" data-zones="case"><i class="fas fa-bookmark"></i>Evidências<span id="ws-evidence-count"></span></button>
@@ -1019,6 +1020,7 @@
   <script src="entity-menu.js"></script>
   <script src="query-bar.js"></script>
   <script src="evidence-ui.js"></script>
+<script src="participants-ui.js"></script>
 <script src="security.js"></script>
   <script src="event-insights.js"></script>
   <script src="case-intel.js"></script>

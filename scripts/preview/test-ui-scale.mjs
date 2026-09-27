@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 const url = process.argv[2] || "http://127.0.0.1:4173";
-const browser = await chromium.launch();
+const browser = await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL||"chrome"});
 const errors = [], results = {};
 try {
   // A 2000×1054 screen at 150% system scaling: the window is 1333×703 CSS pixels.

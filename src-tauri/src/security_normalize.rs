@@ -40,6 +40,8 @@ pub const MAPPABLE: &[&str] = &[
     "created_credential",
     "resource",
     "request_command",
+    "request_body",
+    "response_body",
     "url",
     "persistence_target",
     "application",
@@ -82,6 +84,10 @@ pub struct Normalized {
     pub limitations: Vec<String>,
     pub dedup_key: Option<String>,
     pub event_refs: Vec<String>,
+    #[serde(default)]
+    pub signals: Vec<crate::security_content::Signal>,
+    #[serde(default)]
+    pub content_clipped: bool,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TimeProvenance {
@@ -96,7 +102,7 @@ impl Normalized {
     pub fn get(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(|v| v.value.as_str())
     }
-    fn put(&mut self, key: &str, field: &str, value: String, method: &str) {
+    pub(crate) fn put(&mut self, key: &str, field: &str, value: String, method: &str) {
         if value.trim().is_empty() || value == "-" {
             return;
         }
@@ -262,6 +268,7 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
             "organization.id",
             "org_id",
             "userIdentity.accountId",
+            "cloud.account.id",
             "protoPayload.resourceName.project",
             "resource.labels.project_id",
             "cluster.uid",
@@ -326,6 +333,8 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
     n.alias(ev, "command", &["CommandLine", "process.command_line", "ScriptBlockText", "cmdline", "command_line"]);
     n.alias(ev, "file", &["TargetFilename", "file.path", "target_file", "download.path"]);
     n.alias(ev, "request_command", &["http.request.body.command", "http.request.body.cmd"]);
+    n.alias(ev, "request_body", &["http.request.body.content", "http.request.body", "request.body", "request_body"]);
+    n.alias(ev, "response_body", &["http.response.body.content", "http.response.body", "response.body", "response_body"]);
     n.alias(ev, "url", &["url.original", "url.full", "http.url", "download.url", "request_uri", "uri"]);
     if n.get("request_command").is_none() && n.product == "web" {
         if let Some(url) = n.get("url").map(str::to_string) {
@@ -542,6 +551,7 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
         n.limitations.push("Registro sem horário inequívoco; não participa de correlações temporais.".into());
     }
 
+    crate::security_content::infer_request(ev, &mut n);
     let host = n.get("host").unwrap_or("").to_string();
     // Local accounts are namespaced by host, never by their display name alone.
     if n.get("namespace").is_none()
@@ -674,6 +684,18 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
             }),
     };
     n.dedup_key = unique;
+    for role in ["request_body", "response_body"] {
+        if let Some(p) = n.values.get_mut(role) {
+            if p.value.len() > 65536 {
+                n.content_clipped = true;
+                let mut end = 65536;
+                while !p.value.is_char_boundary(end) {
+                    end -= 1;
+                }
+                p.value.truncate(end);
+            }
+        }
+    }
     let mut derived = ev.clone();
     derived.timestamp = n.time.epoch_ms;
     derived.event_ref = event_ref(ev);
@@ -714,6 +736,7 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
     {
         derived.fields.insert("_sec.literal_output".into(), Value::from("true"));
     }
+    crate::security_content::apply(ev, &mut derived, &mut n);
     (derived, n)
 }
 
@@ -835,7 +858,7 @@ fn mapped_time(value: &str, mapping: &SourceMapping) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
-fn literal_output(command: &str) -> bool {
+pub(crate) fn literal_output(command: &str) -> bool {
     static PRINT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let print=PRINT.get_or_init(||regex::Regex::new(r#"(?i)^\s*(?:(?:cmd(?:\.exe)?\s+/[ck]|(?:powershell|pwsh)(?:\.exe)?\s+-(?:command|c))\s+)?["']?(?:echo|printf|write-output|write-host)\b"#).unwrap());
     if !print.is_match(command) {

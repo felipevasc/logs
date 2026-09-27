@@ -19,9 +19,10 @@ use std::sync::Arc;
 const BUILTIN: &str = include_str!("../resources/detection-rules.json");
 const EXPANSION: &str = include_str!("../resources/detection-expansion.json");
 const ADVANCED: &str = include_str!("../resources/detection-advanced.json");
+const CONTENT: &str = include_str!("../resources/detection-content.json");
 fn builtin_defs() -> Result<Vec<RuleDef>, String> {
     let mut rules = Vec::new();
-    for text in [BUILTIN, EXPANSION, ADVANCED] {
+    for text in [BUILTIN, EXPANSION, ADVANCED, CONTENT] {
         rules.extend(serde_json::from_str::<RuleFile>(text).map_err(|e| e.to_string())?.rules);
     }
     Ok(rules)
@@ -631,6 +632,10 @@ pub struct EntityRef {
 
 #[derive(Clone, Serialize)]
 pub struct Detection {
+    pub participants: crate::security_participants::Participants,
+    /// Internal source boundary for presentation grouping; original evidence is unchanged.
+    #[serde(skip)]
+    pub pattern_source: Option<String>,
     pub id: String,
     pub rule: String,
     pub name: String,
@@ -659,6 +664,9 @@ pub struct Detection {
 
 #[derive(Serialize)]
 pub struct Episode {
+    pub participants: crate::security_participants::Participants,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grouping: Option<crate::security_grouping::Grouping>,
     pub id: String,
     pub title: String,
     pub summary: String,
@@ -946,6 +954,7 @@ impl Pass<'_> {
         acc.fingerprint.update(ev.event_ref.as_bytes());
         let ctx = Ctx::new(ev);
         acc.total += 1;
+        acc.clipped += usize::from(normalized.content_clipped);
         match ev.timestamp {
             Some(t) => {
                 acc.first = min_opt(acc.first, Some(t));
@@ -1108,8 +1117,9 @@ impl Pass<'_> {
             self.catalog.filter(|_| ev.fields.get("_sec.literal_output").and_then(|v| v.as_str()) != Some("true"))
         {
             let (found, clipped) = catalog.event_hits_checked(ev);
-            acc.clipped += usize::from(clipped);
+            acc.clipped += usize::from(clipped && !normalized.content_clipped);
             if !found.is_empty() {
+                let explained = found.iter().any(|&r| catalog.rule(r).id.starts_with("web.")).then(||catalog.explain(ev));
                 let key: Box<str> = [(Role::SrcIp, "@src_ip"), (Role::Host, "@host"), (Role::User, "@user")]
                     .iter()
                     .find_map(|(r, column)| ctx.role(*r).map(|v| serde_json::to_string(&[column, &v]).unwrap()))
@@ -1122,6 +1132,27 @@ impl Pass<'_> {
                     if !crate::threats::reviewed_indication(catalog.rule(rule)) {
                         continue;
                     }
+                    let id = catalog.rule(rule).id.as_str();
+                    if let Some(hit) = explained.as_ref().and_then(|v|v.iter().find(|h|h.rule==rule)) {
+                        let original = match hit.provenance.field.as_str() {
+                            "message"=>Some(ev.message.as_str()), "raw"=>Some(ev.raw.as_str()),
+                            field=>crate::security_normalize::field_value(ev,field).and_then(|v|v.as_str()),
+                        };
+                        if original.is_some_and(|v| crate::security_normalize::literal_output(v)
+                            || ["documentation:","example:","sample payload:","exemplo:","documentação:"].iter().any(|p|v.trim_start().to_lowercase().starts_with(p))) {continue;}
+                        let request = hit.provenance.direction == "request" || normalized.values.get("url").is_some_and(|p| p.field == hit.provenance.field && p.method.starts_with("URI extraída"));
+                        // A SQL query or a script returned by an application is not, by itself, an attack.
+                        if id.starts_with("web.") && hit.provenance.direction == "response" {continue;}
+                        if id.starts_with("web.sql.") && !request {continue;}
+                        if id == "web.xss.remote-script" && !request {continue;}
+                    }
+                    // A contextual finding supersedes the equivalent legacy textual signal.
+                    if normalized.signals.iter().any(|s| {
+                        (id.starts_with("web.xss.") && ["_sec.content.xss_request", "_sec.content.xss_payload"].contains(&s.key.as_str()))
+                        || (id.starts_with("web.sql.") && ["_sec.content.sqli_request", "_sec.content.sqli_payload"].contains(&s.key.as_str()))
+                        || (id.starts_with("net.reverse.") && s.key == "_sec.content.reverse_payload")
+                        || (id.starts_with("web.path.") && ["_sec.content.sensitive_request", "_sec.content.traversal_request"].contains(&s.key.as_str()))
+                    }) { continue; }
                     let category = self.threat_category[rule];
                     let extra: Box<str> = catalog.rule(rule).id.clone().into();
                     if !seen.insert((category, rule)) {
@@ -1844,21 +1875,6 @@ fn run_inner(
                 });
             }
         }
-        // Suppressions by rule and entity.
-        let hidden = settings.suppress.iter().any(|s| {
-            s.rule == rule_id
-                && s.expires.is_none_or(|t| t > chrono::Utc::now().timestamp_millis())
-                && s.scope.as_deref().is_none_or(|v| v == namespace)
-                && match (&s.column, &s.value) {
-                    (Some(column), Some(value)) => entity_refs.iter().any(|e| &e.column == column && &e.value == value),
-                    (None, Some(value)) => entity_refs.iter().any(|e| &e.value == value),
-                    _ => true,
-                }
-        });
-        if hidden {
-            suppressed += 1;
-            continue;
-        }
         // The primary tactic of each technique keeps episode chains honest
         // (Valid Accounts, for example, is listed under four tactics).
         let mut tactics: Vec<String> = attack_refs.iter().filter_map(|a| a.tactics.first().cloned()).collect();
@@ -1868,6 +1884,8 @@ fn run_inner(
         tactics.sort_by_key(|t| attack::tactic_order(t));
         tactics.dedup();
         let mut detection = Detection {
+            participants: Default::default(),
+            pattern_source: None,
             id: String::new(),
             rule: rule_id,
             name,
@@ -1897,7 +1915,7 @@ fn run_inner(
         detection.start = None;
         detection.end = None;
         let rule = inputs.rules.find(&detection.rule);
-        let policy = rule.map(|r| r.def.evidence.clone()).unwrap_or_else(|| crate::evidence::Policy {
+        let mut policy = rule.map(|r| r.def.evidence.clone()).unwrap_or_else(|| crate::evidence::Policy {
             maturity: "experimental".into(),
             level: 1,
             rationale: "Conteúdo original com estrutura suspeita; a correspondência não demonstra execução.".into(),
@@ -1905,6 +1923,17 @@ fn run_inner(
             benign: vec!["Teste autorizado, documentação ou conteúdo citado".into()],
             ..Default::default()
         });
+        if rule.is_none() && detection.signal_rules.iter().any(|id| id.starts_with("web.xss.") || id.starts_with("web.sql.") || id.starts_with("web.path.")) {
+            let request = first.as_ref().is_some_and(|e| {
+                let n=crate::security_normalize::normalize(e,&inputs.settings.mappings).1;
+                inputs.catalog.is_some_and(|catalog| catalog.explain(e).iter().any(|h| detection.signal_rules.contains(&catalog.rule(h.rule).id)
+                    && (h.provenance.direction=="request" || ["url","request_body","request_command"].iter().filter_map(|k|n.values.get(*k)).any(|p|p.field==h.provenance.field))))
+            });
+            policy.level = if request { 3 } else { 2 };
+            policy.claim = if request { "attempt" } else { "activity" }.into();
+            policy.version = "2".into();
+            policy.rationale = if request { "Estrutura específica de exploração presente em requisição HTTP; não comprova execução nem retorno sensível." } else { "Estrutura específica de payload presente no conteúdo registrado; direção e uso ainda não demonstrados." }.into();
+        }
         detection.evidence = crate::evidence::Evidence::from_policy(&policy);
         let mut outcomes = HashSet::new();
         let mut refs = Vec::new();
@@ -1914,6 +1943,7 @@ fn run_inner(
                 let reference = crate::security_normalize::event_ref(&event);
                 refs.push(reference.clone());
                 let (view, normalized) = crate::security_normalize::normalize(&event, &inputs.settings.mappings);
+                detection.participants.merge(&crate::security_participants::extract(&event, &normalized, &detection.rule, &detection.tactics));
                 detection.start = min_opt(detection.start, normalized.time.epoch_ms);
                 detection.end = max_opt(detection.end, normalized.time.epoch_ms);
                 if normalized.time.ambiguity.is_some()
@@ -1935,13 +1965,32 @@ fn run_inner(
                     }
                 }
                 outcomes.insert(normalized.get("outcome").unwrap_or("unknown").to_string());
+                if normalized.content_clipped && detection.rule.starts_with("content.") {
+                    detection.evidence.limit(3,"Inspeção parcial (64 KiB/campo; até 256 KiB e 128 segmentos na varredura genérica); contexto restante não avaliado");
+                }
                 if !normalized.conflicts.is_empty() {
                     detection.evidence.limit(2, "Campos de identidade ou resultado conflitantes");
                 }
-                if normalized.product == "generic" && normalized.get("action").is_none() {
+                if normalized.product == "generic" && normalized.get("action").is_none()
+                    && !(detection.rule.starts_with("content.") && (policy.claim == "attempt" || detection.rule.ends_with("_payload"))) {
                     detection.evidence.limit(2, "Sem ação observada em fonte reconhecida ou mapeada");
                 }
                 let step = rule.and_then(|r| r.conds.iter().position(|c| c.matches(&view))).unwrap_or(0);
+                if detection.evidence.excerpts.len() < 8 {
+                    if let Some(condition) = rule.and_then(|r| r.conds.get(step)) {
+                        detection
+                            .evidence
+                            .excerpts
+                            .extend(condition.evidence_excerpts(&view, &normalized, &reference));
+                    } else if let Some(catalog) = inputs.catalog {
+                        for hit in catalog.explain(&event) {
+                            if detection.signal_rules.contains(&catalog.rule(hit.rule).id) {
+                                detection.evidence.excerpts.extend(hit.excerpt);
+                            }
+                        }
+                    }
+                    detection.evidence.excerpts.truncate(8);
+                }
                 let condition = rule
                     .map(|r| {
                         if r.def.steps.is_empty() {
@@ -1959,12 +2008,36 @@ fn run_inner(
                 if !detection.evidence.conditions_satisfied.contains(&satisfied) {
                     detection.evidence.conditions_satisfied.push(satisfied);
                 }
+                let mut excerpts: Vec<_> = normalized.signals.iter().filter(|s| condition.contains(&s.key)).map(|s| &s.excerpt).collect();
+                if excerpts.is_empty() {excerpts.extend(detection.evidence.excerpts.iter().filter(|x|x.event_ref==reference));}
+                let fields: Vec<_> = excerpts.iter().map(|x|x.field.clone()).collect();
+                let observed = excerpts.iter().map(|x| format!("{}: {}", x.field, x.matched)).collect::<Vec<_>>().join(" · ");
+                if let Some(check) = detection.evidence.checks.iter_mut().find(|c| c.status == "passed" && c.expected == condition) {
+                    if check.event_refs.len() < 8 {check.event_refs.push(reference.clone());}
+                } else if detection.evidence.checks.len() < 32 {
+                    detection.evidence.checks.push(crate::evidence::Check {
+                        status: "passed".into(), label: format!("Condição observada · etapa {}", step+1), expected: condition,
+                        observed: if observed.is_empty() { "Seletor satisfeito no evento original".into() } else { observed.chars().take(1200).collect() },
+                        event_refs: vec![reference.clone()], fields,
+                    });
+                }
+                for field in &policy.required {
+                    let expected = format!("{field}: presente");
+                    if detection.evidence.checks.iter().any(|c| c.expected == expected) || detection.evidence.checks.len() >= 32 {continue;}
+                    let provenance = field.strip_prefix("_sec.").and_then(|f|normalized.values.get(f));
+                    let value = provenance.map(|p|p.value.clone()).or_else(||crate::security_normalize::field_text(&view,field)).unwrap_or_default();
+                    detection.evidence.checks.push(crate::evidence::Check {
+                        status: "passed".into(),label:"Campo obrigatório presente".into(),expected,
+                        observed:value.chars().take(400).collect(),event_refs:vec![reference.clone()],
+                        fields:vec![provenance.map(|p|p.field.clone()).unwrap_or_else(||field.clone())],
+                    });
+                }
                 detection.evidence.evidence_members.push(crate::evidence::Member {
                     event_ref: reference,
                     event_id: *id,
                     step,
                     fields: policy.required.clone(),
-                    provenance: normalized.values.clone(),
+                    provenance: normalized.values.iter().filter(|(key,_)| !matches!(key.as_str(), "request_body" | "response_body")).map(|(k,v)|(k.clone(),v.clone())).collect(),
                     time: normalized.time.clone(),
                 });
             }
@@ -1979,7 +2052,11 @@ fn run_inner(
                     refs.push(reference.clone());
                     if !detection.evidence.evidence_members.iter().any(|m| m.event_id == *member_id) {
                         let original = lookup(*member_id)
-                            .map(|e| crate::security_normalize::normalize(&e, &inputs.settings.mappings).1)
+                            .map(|e| {
+                                let n = crate::security_normalize::normalize(&e, &inputs.settings.mappings).1;
+                                detection.participants.merge(&crate::security_participants::extract(&e, &n, &detection.rule, &detection.tactics));
+                                n
+                            })
                             .unwrap_or_default();
                         detection.evidence.evidence_members.push(crate::evidence::Member {
                             event_ref: reference.clone(),
@@ -2029,6 +2106,19 @@ fn run_inner(
         } else {
             detection.evidence.outcome = "mixed".into();
         }
+        detection.evidence.checks.push(crate::evidence::Check {
+            status: if detection.evidence.outcome == "unknown" { "unknown" } else if matches!(detection.evidence.outcome.as_str(), "blocked"|"failure") { "failed" } else { "observed" }.into(),
+            label: "Resultado da operação".into(), expected: "Resultado registrado; sucesso HTTP não comprova exploração".into(),
+            observed: detection.evidence.outcome.clone(), event_refs: detection.evidence.event_refs.iter().take(8).cloned().collect(), fields: vec!["outcome".into()],
+        });
+        if let Some(rule) = rule {
+            for (label, expected, observed) in [
+                ("Agrupamento da regra", rule.def.by.join(", "), format!("{} eventos · {} valores distintos · janela {}", detection.count, detection.distinct, rule.def.window.as_deref().unwrap_or("evento individual"))),
+                ("Condição de exclusão", rule.def.unless.clone(), "Condição avaliada e não encontrada nos membros".into()),
+            ] {
+                if !expected.is_empty() { detection.evidence.checks.push(crate::evidence::Check { status:"passed".into(),label:label.into(),expected,observed,event_refs:vec![],fields:vec![] }); }
+            }
+        }
         if detection.evidence.outcome == "unknown"
             && matches!(policy.claim.as_str(), "execution" | "effect")
             && detection.evidence.evidence_level >= 4
@@ -2057,8 +2147,22 @@ fn run_inner(
                 detection.evidence.limit(2, "Corroboração requer fatos independentes");
             }
         }
+        // Apply exceptions after collecting the entities actually present in the evidence.
+        // Single-event content rules need not group by an IP to support an IP-scoped exception.
+        let hidden = settings.suppress.iter().any(|s| {
+            s.rule == detection.rule
+                && s.expires.is_none_or(|t| t > chrono::Utc::now().timestamp_millis())
+                && s.scope.as_deref().is_none_or(|v| v == detection.namespace)
+                && match (&s.column, &s.value) {
+                    (Some(column), Some(value)) => detection.entities.iter().any(|e| &e.column == column && &e.value == value),
+                    (None, Some(value)) => detection.entities.iter().any(|e| &e.value == value),
+                    _ => true,
+                }
+        });
+        if hidden { suppressed += 1; continue; }
         let template = rule.and_then(|r| r.def.summary.as_deref());
         detection.summary = render_summary(template, detection, first.as_ref());
+        detection.pattern_source = first.as_ref().map(crate::security_grouping::source);
         // Exact evidence selection, independent of mutable rule definitions and time filters.
         detection.filters = vec![crate::query::Filter {
             column: "event_ref".into(),
@@ -2085,6 +2189,8 @@ fn run_inner(
     let versions = serde_json::to_string(&(
         crate::evidence::POLICY_VERSION,
         crate::evidence::NORMALIZATION_VERSION,
+        crate::security_grouping::VERSION,
+        crate::security_participants::VERSION,
         crate::attack::VERSION,
         inputs.rules.rules.iter().map(|r| &r.def).collect::<Vec<_>>(),
         inputs.settings,
@@ -2374,6 +2480,8 @@ fn cluster(detections: &[Detection]) -> Vec<Episode> {
             let mut detections_in_time = members.clone();
             detections_in_time.sort_by_key(|&i| detections[i].start);
             Episode {
+                participants: members.iter().fold(crate::security_participants::Participants::default(), |mut p,&i| {p.merge(&detections[i].participants);p}),
+                grouping: None,
                 id: if evidence_level == 0 {
                     crate::evidence::stable_id("episode-unassessed", std::iter::once(&lead.id).chain(event_refs.iter()))
                 } else {
@@ -2393,6 +2501,7 @@ fn cluster(detections: &[Detection]) -> Vec<Episode> {
             }
         })
         .collect();
+    episodes = crate::security_grouping::group(episodes, detections);
     episodes.sort_by(|a, b| {
         b.evidence_level
             .cmp(&a.evidence_level)

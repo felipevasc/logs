@@ -22,7 +22,7 @@ try {
   assert.equal(redaction.original,"password=fixture-secret-value","masking must preserve original evidence");
   assert.equal(redaction.field,"[oculto]");
   await page.evaluate(()=>WorkspaceContext.setScope("dataset",{animate:false}));
-  await page.evaluate(()=>Workspace.showPage("summary"));
+  await page.evaluate(()=>Workspace.showPage("compromises"));
   await page.waitForSelector(".evidence-control");
   assert.equal(await page.evaluate(()=>Security.minimum()),5);
   assert.equal(await page.locator(".sec-episode").count(),0);
@@ -43,13 +43,14 @@ try {
     await page.locator(`.evidence-segments [data-evidence-min='${minimum}']`).click();
     assert.equal(await page.evaluate(()=>Security.minimum()),minimum);
     const levels=await page.locator(".sec-episode > .sec-main .evidence-badge").allTextContents();
-    assert.ok(levels.every(text=>Number(text.match(/E(\d)/)?.[1])>=minimum));
+    assert.equal(levels.length, Math.min(3,6-minimum));
+    assert.ok(levels.every(text=>["Inconclusivo","Suspeita","Indício","Forte indício","Quase confirmado"].slice(minimum-1).some(label=>text.includes(label))));
     assert.match(await page.locator(".evidence-control-heading").innerText(),new RegExp(`${6-minimum} indícios visíveis`));
     assert.equal(await page.evaluate(()=>window.__triageCalls),0,"rigidity must not request a new analysis");
     assert.equal(await page.evaluate(()=>JSON.stringify(Security.cached().detections.map(({id,evidence_level,event_refs,relationships})=>({id,evidence_level,event_refs,relationships}))) ),await page.evaluate(()=>window.__evidenceFixture));
   }
   await page.evaluate(()=>Workspace.showPage("explore"));
-  await page.evaluate(()=>Workspace.showPage("summary"));
+  await page.evaluate(()=>Workspace.showPage("compromises"));
   await page.waitForSelector(".evidence-control");
   assert.equal(await page.evaluate(()=>Security.minimum()),1,"navigation within a universe preserves selection");
   await page.locator(".evidence-counts [data-evidence-min='5']").click();
@@ -60,7 +61,7 @@ try {
   await page.screenshot({path:"output/playwright/evidence-levels-narrow.png",fullPage:false});
   assert.equal(await page.locator(".evidence-segments button").count(),5);
   const report=await page.evaluate(()=>EvidenceUI.report({detection:{...EvidenceUI.exportMetadata(Security.cached(),3,"dataset"),detections:Security.cached().detections,analyst_state:"unreviewed"}}));
-  for(const n of [1,2,3,4,5]) assert.ok(report.includes(`E${n} ·`));
+  for(const name of ["Inconclusivo","Suspeita","Indício","Forte indício","Quase confirmado"]) assert.ok(report.includes(name));
   await page.evaluate(async()=>{Security.setMinimum(1);await WorkspaceContext.setScope("case",{animate:false});});
   assert.equal(await page.evaluate(()=>Security.minimum()),5,"new universe resets rigidity");
   assert.deepEqual(errors,[]);

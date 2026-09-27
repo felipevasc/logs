@@ -473,6 +473,11 @@ async function syncActiveCaseArtifacts() {
 }
 
 function updateContextBar() {
+  if (document.body.dataset.page === 'compromises') {
+    const data=window.Security?.cached();
+    $('#context-summary').textContent=`${data ? fmtNum(data.total)+' registros · ' : ''}${workspaceScope()==='case'?'Caso ativo completo':'Conjunto carregado completo'} · filtros do Explorar não se aplicam`;
+    return;
+  }
   if (state.queryError) { $("#context-summary").textContent = "Consulta não concluída"; return; }
   // contexto de Caso: os números são sempre do conjunto do Caso, nunca do artefato
   if (state.activeContext !== "artifact" && activeCase()) {
@@ -5890,10 +5895,10 @@ function caseObjectKey(value) {
   if (!caseObjectIds.has(value)) caseObjectIds.set(value, ++caseObjectId);
   return caseObjectIds.get(value);
 }
-function caseSig() {
+function caseSig(allRecords = false) {
   const c = activeCase();
   if (!c) return "none";
-  return JSON.stringify([c.id, caseObjectKey(c), state.stationAnalyticsId || "", (c.items || []).map(it => [it.id, caseObjectKey(it.rows), it.rows?.length || 0, it.stationId, it.artifactId, it.origin])]);
+  return JSON.stringify([c.id, caseObjectKey(c), allRecords ? "" : state.stationAnalyticsId || "", (c.items || []).map(it => [it.id, caseObjectKey(it.rows), it.rows?.length || 0, it.stationId, it.artifactId, it.origin])]);
 }
 
 const caseEventsCache = { sig: null, events: [], summary: { start: null, end: null, columns: [] } };
@@ -5917,11 +5922,11 @@ function caseRecordKey(row, artifactId, origin) {
   return row.event_ref || JSON.stringify([row.fields?.caminho || artifactId || origin || "", row.id, row.timestamp, row.source, row.code, row.message]);
 }
 
-function caseEventsCompute() {
+function caseEventsCompute(allRecords = false) {
   const events = [];
   const seen = new Set();
   for (const item of activeCase()?.items || []) {
-    if (state.stationAnalyticsId && item.stationId !== state.stationAnalyticsId) continue;
+    if (!allRecords && state.stationAnalyticsId && item.stationId !== state.stationAnalyticsId) continue;
     for (const row of item.rows || []) {
       if (!Number.isInteger(row.id)) continue;
       const key = caseRecordKey(row, item.artifactId, item.origin);

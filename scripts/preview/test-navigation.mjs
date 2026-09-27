@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 const url = process.argv[2] || "http://127.0.0.1:4173";
-const browser = await chromium.launch();
+const browser = await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL||"chrome"});
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, reducedMotion: "reduce" });
 const errors = [], results = {};
 page.on("pageerror", error => errors.push(error.message));
@@ -22,8 +22,8 @@ try {
   const structure = { bg: await css("--bg-0"), accent: await css("--accent"), menu: await menu(), scope: await page.evaluate(() => WorkspaceContext.scope()) };
   assert.equal(caseArea.bg, analysis.bg); assert.equal(structure.bg, analysis.bg);
   assert.equal(new Set([analysis.accent, caseArea.accent, structure.accent]).size, 3, "yellow, purple and orange accents");
-  assert.deepEqual(analysis.menu, ["summary", "case-timeline", "explore"]);
-  assert.deepEqual(caseArea.menu, ["summary", "case-timeline", "explore", "evidence"]);
+  assert.deepEqual(analysis.menu, ["summary", "compromises", "case-timeline", "explore"]);
+  assert.deepEqual(caseArea.menu, ["summary", "compromises", "case-timeline", "explore", "evidence"]);
   assert.deepEqual(structure.menu, ["sources", "connections", "import"]);
   assert.equal(structure.scope, "dataset");
   results.areas = { analysis: analysis.accent, case: caseArea.accent, structure: structure.accent };
@@ -71,7 +71,10 @@ try {
   await page.waitForFunction(() => { const labels = Tasks.groups().map(g => g.label).join("|"); return /Linha do tempo/.test(labels) && /Padrões/.test(labels); });
   const status = await page.locator("#workbar-tasks span").textContent();
   assert.match(status, /^Carregando /);
-  assert.equal(await page.locator('.nav-pages [data-page="case-timeline"] > .li-waves').count(), 1, "the loading menu item is veiled with waves");
+  assert.equal(await page.locator('.nav-pages [data-page="case-timeline"] > .li-loader').count(), 1, "the loading menu item has a compact spinner");
+  assert.equal(await page.locator('.nav-pages [data-page="case-timeline"]').getAttribute('aria-busy'),'true');
+  assert.equal(await page.locator('.li-waves').count(),0);
+  await page.screenshot({path:'output/playwright/loading-orbit.png'});
   await page.click('.nav-pages [data-page="case-timeline"]');
   await page.waitForTimeout(300);
   assert.equal(await page.evaluate(() => window.__mockCommandCalls.timeline_range) - before, 0, "returning joins the same request");
@@ -82,6 +85,7 @@ try {
   await page.keyboard.press("Escape");
   await page.waitForFunction(() => !document.querySelector("#workbar").classList.contains("has-tasks"), null, { timeout: 15000 });
   assert.equal(await page.evaluate(() => !!document.querySelector(".tl-main svg")), true, "the timeline finishes after the other task is cancelled");
+  assert.equal(await page.locator('.nav-pages [data-page="case-timeline"]').getAttribute('aria-busy'),null);
   results.loading = status;
 
   assert.deepEqual(errors, []);

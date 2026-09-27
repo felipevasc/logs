@@ -712,7 +712,7 @@
       return { id: `d${n}-${d.rule}`, rule: d.rule, name: rule.name, description: rule.description, severity: rule.severity, origin: "builtin", kind: rule.kind, attack: rule.attack, tactics: rule.attack.map(a => a.tactics[0]),
         start: d.list[0].timestamp, end: d.list.at(-1).timestamp, count: d.list.length, entities: [{ column: "@src_ip", label: "IP de origem", value: d.ip }],
         summary: d.rule === "auth.bruteforce.source" ? `${d.list.length} falhas de autenticação de ${d.ip}` : `Falhas seguidas de acesso bem-sucedido a partir de ${d.ip}`,
-        evidence_level: d.rule === "auth.bruteforce.source" ? 1 : 2, evidence_reasons: ["Cenario sintetico de demonstracao"], missing_evidence: ["Uso abusivo posterior"], benign_alternatives: ["Senha expirada"], outcome: "mixed", event_refs: d.list.map(e => e.event_ref), policy_version: "evidence-1", rule_version: "2", normalization_version: "normalization-1", distinct: 0, period_ms: null, event_ids: d.ids, filters: [{ column: "_all", op: "detection", value: d.rule, value2: null }, { column: "@src_ip", op: "equals_exact", value: d.ip, value2: null }] };
+        evidence_members: d.list.map(e=>({event_ref:e.event_ref,event_id:e.id,step:0,fields:[]})), evidence_level: d.rule === "auth.bruteforce.source" ? 1 : 2, evidence_reasons: ["Cenario sintetico de demonstracao"], missing_evidence: ["Uso abusivo posterior"], benign_alternatives: ["Senha expirada"], outcome: "mixed", event_refs: d.list.map(e => e.event_ref), policy_version: "evidence-1", rule_version: "2", normalization_version: "normalization-1", distinct: 0, period_ms: null, event_ids: d.ids, filters: [{ column: "_all", op: "detection", value: d.rule, value2: null }, { column: "@src_ip", op: "equals_exact", value: d.ip, value2: null }] };
     }).filter(d => !detectionSettings.suppress.some(s => s.rule === d.rule && (!s.value || d.entities.some(e => e.value === s.value))));
     const suppressed = detections.length - shaped.length;
     const groups = new Map();
@@ -733,6 +733,7 @@
   Object.assign(handlers, {
     case_sync: ({ key, events }) => { caseStore.set(key, events); if (caseStore.size > 3) caseStore.delete(caseStore.keys().next().value); return null; },
     triage: ({ filters, caseEvents }) => mockTriage(poolOf(caseEvents)),
+    triage_evidence_event: ({eventId,eventRef,caseEvents}) => { const e=poolOf(caseEvents).find(e=>e.id===eventId && (e.event_ref || `preview:${e.id}`)===eventRef); if(!e)throw Error("Evento indisponível"); return structuredClone(e); },
     event_insights: ({ event }) => {
       const entities = [];
       if (event.fields?.usuario) entities.push({ role: "User", column: "@user", label: "Usuário", value: event.fields.usuario, scope: null });

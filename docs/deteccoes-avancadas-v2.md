@@ -1,5 +1,7 @@
 # Detecções avançadas — política e motor v2
 
+Atualização de interface e conteúdo: [Comprometimentos](comprometimentos.md). Os nomes exibidos agora são Quase confirmado, Forte indício, Indício, Suspeita e Inconclusivo; os números do contrato permanecem compatíveis. A normalização atual é `normalization-3`.
+
 ## Força da evidência e resultado
 
 E5 significa evidência extremamente forte da hipótese escrita na regra. Pode ser uma tentativa inequívoca: um payload completo de shell reverso registrado em um parâmetro de comando de uma requisição, mesmo que o WAF bloqueie a operação. O resultado continua **bloqueado**, e a hipótese continua **tentativa**, sem afirmar execução ou comprometimento.

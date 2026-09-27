@@ -12,14 +12,14 @@ window.CommandPalette = (() => {
   const click = selector => () => document.querySelector(selector)?.click();
 
   function build() {
-    const pages = [["summary", "Resumo", "fa-chart-simple"], ["case-timeline", "Linha do tempo", "fa-timeline"], ["explore", "Explorar", "fa-magnifying-glass"], ["compare", "Comparar períodos", "fa-code-compare"], ["evidence", "Evidências do Caso", "fa-bookmark"], ["case-trails", "Trilhas do Caso", "fa-route"], ["journeys", "Possíveis trilhas", "fa-code-branch"], ["sources", "Arquivos e fontes", "fa-folder-open"], ["connections", "Conexões", "fa-plug"], ["import", "Abrir logs", "fa-file-circle-plus"]];
+    const pages = [["summary", "Resumo", "fa-chart-simple"], ["compromises", "Comprometimentos", "fa-shield-halved"], ["case-timeline", "Linha do tempo", "fa-timeline"], ["explore", "Explorar", "fa-magnifying-glass"], ["compare", "Comparar períodos", "fa-code-compare"], ["evidence", "Evidências do Caso", "fa-bookmark"], ["case-trails", "Trilhas do Caso", "fa-route"], ["journeys", "Possíveis trilhas", "fa-code-branch"], ["sources", "Arquivos e fontes", "fa-folder-open"], ["connections", "Conexões", "fa-plug"], ["import", "Abrir logs", "fa-file-circle-plus"]];
     const list = [
       ...pages.map(([page, label, icon]) => ({ group: "Ir para", label, icon, run: go(page), keys: page })),
       { group: "Ações", label: "Abrir arquivos…", icon: "fa-file-circle-plus", run: click("#ws-open"), keys: "importar carregar logs" },
       { group: "Ações", label: "Exportar…", icon: "fa-arrow-up-from-bracket", run: click("#ws-export"), keys: "salvar csv jsonl pdf relatorio" },
       { group: "Ações", label: workspaceScope() === "case" ? "Mudar para Análise" : "Mudar para Caso", icon: "fa-right-left", run: () => window.WorkspaceContext?.setScope(workspaceScope() === "case" ? "dataset" : "case"), keys: "alternar contexto" },
       { group: "Ações", label: "Limpar filtros", icon: "fa-filter-circle-xmark", run: click("#ws-clear-scope"), keys: "remover filtros busca" },
-      { group: "Ações", label: "Recalcular triagem", icon: "fa-rotate", run: () => { window.Security?.invalidate(); window.Workspace.showPage("summary"); }, keys: "atualizar deteccoes" },
+      { group: "Ações", label: "Recalcular triagem", icon: "fa-rotate", run: () => { window.Security?.invalidate(); window.Workspace.showPage("compromises"); }, keys: "atualizar deteccoes" },
       { group: "Ações", label: "Regras de detecção e Sigma", icon: "fa-shield-halved", run: () => openSettings("detection"), keys: "sigma importar ocultas configuracoes" },
       { group: "Ações", label: "Configurações e MCP", icon: "fa-sliders", run: () => openSettings("mcp"), keys: "preferencias agentes" },
       { group: "Ações", label: "Tamanho da interface", icon: "fa-display", run: () => openSettings("interface"), keys: "zoom escala aparencia fonte menor maior" },

@@ -6,8 +6,13 @@ mod case_store;
 mod detections;
 mod evidence;
 mod security_normalize;
+mod security_content;
 mod security_store;
 mod security_results;
+mod security_grouping;
+mod security_participants;
+#[cfg(test)]
+mod security_participants_tests;
 mod security_budget;
 mod security_reconstruct;
 mod discovery;
@@ -2143,6 +2148,7 @@ pub fn run() {
             workspace::dataset_overview,
             triage::triage,
             triage::triage_episode,
+            triage::triage_evidence_event,
             triage::triage_timeline,
             triage::event_insights,
             triage::normalization_preview,

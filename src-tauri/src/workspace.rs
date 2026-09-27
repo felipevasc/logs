@@ -739,7 +739,13 @@ fn csv(value: &str) -> String {
 }
 pub fn redact(value: &str) -> String {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(||regex::Regex::new(r#"(?i)(password|passwd|token|secret|authorization|api[_-]?key)(["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:Bearer|Basic)\s+[^\s",;]+|[^\s",;]+)"#).unwrap()).replace_all(value,"$1$2\"[oculto]\"").into_owned()
+    static HASH: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static PEM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let value = HASH
+        .get_or_init(|| regex::Regex::new(r"\$(?:[156y]|2[aby])\$[./A-Za-z0-9$=,-]{20,}").unwrap())
+        .replace_all(value, "[hash protegido]");
+    let value=PEM.get_or_init(||regex::Regex::new(r"(?s)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?(?:-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|$)").unwrap()).replace_all(&value,"[chave privada oculta]");
+    RE.get_or_init(||regex::Regex::new(r#"(?i)(password|passwd|token|secret|AWS_SECRET_ACCESS_KEY|authorization|api[_-]?key)(["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:Bearer|Basic)\s+[^\s",;]+|[^\s",;]+)"#).unwrap()).replace_all(&value,"$1$2\"[oculto]\"").into_owned()
 }
 pub fn redact_value(value: &mut serde_json::Value) {
     match value {

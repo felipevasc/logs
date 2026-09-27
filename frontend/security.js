@@ -11,7 +11,7 @@ window.Security = (() => {
   let lastData = null;
   let minimumEvidence = 5, universe = "", summarySlots = null;
   const evidence = () => window.EvidenceUI;
-  const universeKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
+  const universeKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig(true) : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
   function syncUniverse() { const next = universeKey(); if (next !== universe) { universe = next; minimumEvidence = 5; } }
   function setMinimum(n) {
     if (!Number.isInteger(n) || n < 1 || n > 5) return;
@@ -32,7 +32,14 @@ window.Security = (() => {
   const visibleDetection = d => (d.evidence_level || 0) >= minimumEvidence && !d.context_only;
   const COLLAPSED = 3;
 
-  const key = () => JSON.stringify([workspaceScope(), window.Workspace?.sourceKey?.() || ""]);
+  const key = () => JSON.stringify([universeKey(), state.derivedFields]);
+  let fullCaseKey = "", fullCaseRows = [];
+  function fullRequest() {
+    if (workspaceScope() !== "case") return { filters: [] };
+    const sig = caseSig(true);
+    if (sig !== fullCaseKey) { fullCaseKey = sig; fullCaseRows = caseEventsCompute(true); }
+    return { filters: [], caseEvents: fullCaseRows };
+  }
   const two = n => String(n).padStart(2, "0");
   const shortTime = ms => { const d = new Date(ms); return `${two(d.getDate())}/${two(d.getMonth() + 1)} ${two(d.getHours())}:${two(d.getMinutes())}`; };
   const range = (a, b) => {
@@ -52,7 +59,7 @@ window.Security = (() => {
     const k = key();
     if (!force && results.has(k)) return results.get(k);
     if (!force && pending.has(k)) return pending.get(k);
-    const request = typeof analyticsRequest === "function" ? analyticsRequest(workspaceScope()) : { filters: backendFilters() };
+    const request = fullRequest();
     const promise = api("triage", { ...request, force, minimumEvidence: minimumEvidence, episodeLimit: 20 }, { silent: true }).then(data => {
       remember(data);
       if (k === key()) { results.set(k, data); lastData = data; if (results.size > 8) results.delete(results.keys().next().value); }
@@ -65,7 +72,7 @@ window.Security = (() => {
   let pageGeneration = 0;
   async function loadStoredPage(offset) {
     const generation=++pageGeneration, context=key(), level=minimumEvidence;
-    const request=analyticsRequest(workspaceScope());
+    const request=fullRequest();
     const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter},{silent:true});
     if(generation!==pageGeneration || context!==key() || level!==minimumEvidence)return;
     results.set(context,data);lastData=data;remember(data);
@@ -108,17 +115,25 @@ window.Security = (() => {
     if (start != null) window.Workspace.focusTimeline?.(start, end ?? start);
     window.Workspace.applyFilters(filters, true, "timeline");
   }
-  async function saveToCase(data, detections, title, summary) {
+  async function saveToCase(data, detections, title, summary, grouping) {
     if (workspaceScope() === "case") { toast("Estes registros já pertencem ao Caso.", "info"); return; }
     const contextBefore = universeKey();
     const ids = [...new Set(detections.flatMap(d => d.event_ids))];
+    const membersById=new Map();
+    for(const d of detections)for(const member of d.evidence_members || [])if(!membersById.has(member.event_id))membersById.set(member.event_id,member);
     const rows = [];
-    for (const id of ids) { try { const row = await api("event_detail", { id }, { silent: true }); if (row) rows.push(row); } catch (error) { toast("Nao foi possivel preservar todas as evidencias: " + String(error), "error"); return; } }
+    for (const id of ids) { try {
+      const member=membersById.get(id);
+      if(!member)throw Error('Referência original não preservada neste achado histórico');
+      const row = await api("triage_evidence_event", { analysisId:data.analysis_id,eventId:id,eventRef:member.event_ref }, { silent: true });
+      if (row) rows.push(row);
+    } catch (error) { toast("Nao foi possivel preservar todas as evidencias: " + String(error), "error"); return; } }
     if (universeKey() !== contextBefore) { toast("O conjunto mudou durante a coleta de evidencias.", "error"); return; }
     if (rows.length !== ids.length) { toast("Evidencias incompletas; achado nao salvo.", "error"); return; }
     const c = ensureCase();
     queueCustody(registerCurrentArtifact(c));
-    const start = Math.min(...detections.map(d => d.start ?? Infinity)), end = Math.max(...detections.map(d => d.end ?? -Infinity));
+    let start=Infinity,end=-Infinity;
+    for(const d of detections){start=Math.min(start,d.start??Infinity);end=Math.max(end,d.end??-Infinity);}
     const references = [...new Set(detections.flatMap(d => d.event_refs || []))];
     const filters = references.length ? [{ column: "event_ref", op: "in_exact", value: references.join("\n") }] : detections.flatMap(detectionFilters);
     c.items.push({
@@ -126,7 +141,7 @@ window.Security = (() => {
       rows, sourceFilters: filters, sourceSpec: structuredClone(state.currentArtifact?.source),
       foundCount: ids.length, includedCount: rows.length, tags: ["detecção"], relevance: detections.some(d => SEVERITY[d.severity]?.[1] >= 3) ? "importante" : "normal",
       origin: state.currentOrigin, artifactId: state.currentArtifact?.id, stationId: null,
-      detection: { ...evidence().exportMetadata(data, minimumEvidence, workspaceScope()), analyst_state: "unreviewed", detections: structuredClone(detections), start: Number.isFinite(start) ? start : null, end: Number.isFinite(end) ? end : null },
+      detection: { ...evidence().exportMetadata(data, minimumEvidence, workspaceScope()), analyst_state: "unreviewed", ...(grouping?{grouping:structuredClone(grouping)}:{}), detections: structuredClone(detections), start: Number.isFinite(start) ? start : null, end: Number.isFinite(end) ? end : null },
     });
     if (await saveCases()) { window.Workspace?.loaded && updateCountsSafe(); window.WorkspaceContext?.refreshMembership?.(); toast("Salvo no Caso com os registros de apoio.", "ok"); }
   }
@@ -153,6 +168,50 @@ window.Security = (() => {
   }
 
   // ---------------------------------------------------------------- attention
+  function openInlineEvents(node, detection, data) {
+    const host=node.querySelector('.sec-inline-events');
+    host.hidden=!host.hidden;
+    node.querySelector('[data-act="d-records"]').setAttribute('aria-expanded',String(!host.hidden));
+    if(host.hidden)return;
+    const article=node.closest('.sec-episode');
+    article.__previewDetection=detection;
+    article.querySelector('.sec-evidence-preview').innerHTML=preview(detection,article.dataset.patternGroup==='true',3);
+    if(host.childNodes.length)return;
+    host.innerHTML=`<h4>Eventos originais</h4><div class="sec-event-list"></div>`;
+    const members=[...new Map((detection.evidence_members || []).map(m=>[m.event_ref,m])).values()];
+    if(!members.length) {host.querySelector('.sec-event-list').textContent='Este achado histórico não preservou referências completas aos eventos.';return;}
+    const context=key(), request=fullRequest(), list=host.querySelector('.sec-event-list'); let offset=0;
+    const appendPage=()=>{
+      host.querySelector('[data-more-events]')?.remove();
+      for(const member of members.slice(offset,offset+20)) {
+        const details=el('details','sec-event');
+        details.innerHTML=`<summary>Evento ${esc(member.event_id)} <code>${esc(member.event_ref)}</code></summary><div class="sec-event-content"></div>`;
+        const body=details.querySelector('.sec-event-content');let loading=false,loaded=false;
+        details.addEventListener('toggle',async()=>{
+          if(!details.open || loading || loaded)return;
+          loading=true;body.textContent='Carregando evento original…';
+          try {
+            const event=await api('triage_evidence_event',{analysisId:data.analysis_id,eventRef:member.event_ref,eventId:member.event_id,...request},{silent:true});
+            if(!details.isConnected || context!==key())return;
+            if(!event)throw Error('Evento original indisponível');
+            const safe=evidence().redact(event);
+            const fields=Object.entries(safe.fields || {});
+            const meta=Object.entries(safe).filter(([k])=>!['fields','raw'].includes(k));
+            const rows=entries=>entries.map(([k,v])=>`<div class="sec-event-field"><dt>${esc(k)}</dt><dd><pre>${esc(typeof v==='string'?v:JSON.stringify(v,null,2))}</pre></dd></div>`).join('');
+            body.innerHTML=`<h5>Evento</h5><dl>${rows(meta)}</dl><h5>Campos (${fields.length})</h5><dl>${rows(fields)}</dl><details class="sec-raw"><summary>Conteúdo bruto original</summary><pre>${esc(safe.raw || '(não registrado)')}</pre></details>`;
+            loaded=true;
+          }catch(error){body.textContent=`Não foi possível abrir este evento: ${error}`;const retry=el('button','text-button','Tentar novamente');retry.onclick=()=>{details.open=false;requestAnimationFrame(()=>details.open=true);};body.append(retry);}
+          finally{loading=false;}
+        });
+        details.oncontextmenu=e=>{e.preventDefault();e.stopPropagation();showCtxMenu(e.clientX,e.clientY,[{icon:'fa-filter',label:'Filtrar este evento no Explorar',onClick:()=>showRecords([{column:'event_ref',op:'in_exact',value:member.event_ref}])}]);};
+        list.append(details);
+      }
+      offset+=20;
+      if(offset<members.length){const more=el('button','btn ghost',`Mais eventos (${members.length-offset} restantes)`);more.dataset.moreEvents='';more.onclick=appendPage;host.append(more);}
+    };
+    appendPage();
+  }
+
   function tacticsStrip(data) {
     const tactics = data.tactics.map(t => ({ ...t, count: t.counts_by_level ? t.counts_by_level.slice(minimumEvidence-1).reduce((a,b)=>a+b,0) : data.detections.filter(d => visibleDetection(d) && d.tactics.includes(t.key)).length }));
     const max = Math.max(1, ...tactics.map(t => t.count));
@@ -162,25 +221,36 @@ window.Security = (() => {
       return `<button type="button" class="sec-tactic l${level}${tacticFilter === t.key ? " on" : ""}" data-tactic="${esc(t.key)}" ${t.count ? "" : "disabled"} title="${esc(`${t.label}${t.count ? ` · ${t.count} ${t.count === 1 ? "detecção" : "detecções"}` : ""}${tips ? `\n${tips}` : ""}`)}" aria-label="${esc(t.label)}"></button>`;
     }).join("")}</div>`;
   }
+  function preview(detection, grouped, limit=1) {
+    return `${grouped ? `<small class="sec-preview-source">Trecho da ocorrência · Evento ${esc(detection.event_ids?.[0] ?? '—')} · ${esc(range(detection.start,detection.end))}</small>` : ''}${evidence().excerpts(detection,limit)}`;
+  }
   function episodeRow(data, episode, index) {
     const detections = episode.detections.map(i => data.detections[i]);
+    const lead=detections.slice().sort((a,b)=>b.evidence_level-a.evidence_level)[0] || {};
     const records = episode.record_count ?? episode.event_refs?.length ?? new Set(detections.flatMap(d => d.event_ids)).size;
     const chain = episode.tactics.map(t => tacticLabel(data, t)).join(" → ");
-    return `<article class="sec-episode sev-${esc(episode.severity)}" data-episode="${index}" tabindex="0" aria-expanded="false">
+    const grouped=episode.grouping?.kind==='pattern',occurrences=episode.grouping?.occurrence_count;
+    const content=`${evidence().badge(episode.evidence_level)}${icon("fa-circle-info", "Entender a classificação e ver verificações", "explain")}<small class="evidence-impact">Impacto potencial: ${esc(sevLabel(episode.severity))} · ${esc(evidence().claim(lead.claim))} · ${esc(evidence().outcome(lead.outcome))}</small><h3>${esc(episode.title)}</h3>${grouped ? `<button class="sec-pattern-count" data-act="expand" title="Mesmo padrão e contexto. A repetição não aumenta o nível nem demonstra vínculo entre os eventos."><i class="fas fa-layer-group" aria-hidden="true"></i>${fmtNum(occurrences)} ocorrências semelhantes <span>Ver ocorrências</span></button>` : ''}<div class="sec-evidence-preview">${preview(lead,grouped)}</div>
+      <div class="sec-meta"><time>${esc(range(episode.start, episode.end))}</time><span>${fmtNum(episode.detection_count ?? detections.length)} ${(episode.detection_count ?? detections.length) === 1 ? "detecção" : "detecções"} · ${fmtNum(records)} ${records === 1 ? "registro" : "registros"}</span>${chain ? `<span class="sec-chain">${esc(chain)}</span>` : ""}<span class="sec-entities"></span></div>`;
+    return `<article class="sec-episode sev-${esc(episode.severity)}" data-episode="${index}" data-pattern-group="${grouped}" tabindex="0" aria-expanded="false">
       <span class="sec-bar" title="Severidade ${esc(sevLabel(episode.severity))}"></span>
-      <div class="sec-main">${evidence().badge(episode.evidence_level)}<small class="evidence-impact">Impacto potencial: ${esc(sevLabel(episode.severity))}</small><h3>${esc(episode.title)}</h3><p>${esc(evidence().redact(episode.summary))}</p>
-        <div class="sec-meta"><time>${esc(range(episode.start, episode.end))}</time><span>${fmtNum(detections.length)} ${detections.length === 1 ? "detecção" : "detecções"} · ${fmtNum(records)} ${records === 1 ? "registro" : "registros"}</span>${chain ? `<span class="sec-chain">${esc(chain)}</span>` : ""}<span class="sec-entities"></span></div>
+      <div class="sec-main">${ParticipantsUI.cards(episode.participants,content)}
         <div class="sec-detections" hidden></div></div>
-      <div class="sec-actions">${icon("fa-list", "Ver registros", "records")}${icon("fa-timeline", "Ver na linha do tempo", "timeline")}${workspaceScope() === "dataset" ? icon("fa-bookmark", "Salvar no Caso", "save") : ""}</div></article>`;
+      <div class="sec-actions">${icon("fa-chevron-down", "Abrir indícios e eventos", "expand")}${workspaceScope() === "dataset" ? icon("fa-bookmark", "Salvar no Caso", "save") : ""}</div></article>`;
   }
   function detectionRows(data, episode) {
     return episode.detections.map(i => {
       const d = data.detections[i];
-      const attack = d.attack.map(a => `${a.id} ${a.name}`).join(" · ");
-      return `<div class="sec-detection sev-${esc(d.severity)}" data-detection="${i}" title="${esc(`${d.description}${attack ? `\n\nATT&CK: ${attack}` : ""}`)}">
-        <span class="sec-dot"></span><div>${evidence().badge(d.evidence_level)}${!visibleDetection(d) ? '<small>Contexto da correlacao</small>' : ""}<strong>${esc(d.name)}</strong><small>Impacto potencial: ${esc(sevLabel(d.severity))} · ${esc(evidence().outcome(d.outcome))}</small><small>${esc(evidence().redact(d.summary))}</small><details class="evidence-why"><summary>Motivos e evidencias</summary>${evidence().explanation(d)}<small>${fmtNum(d.event_refs?.length || d.count)} eventos originais · Regra ${esc(d.rule_version || "legada")} · ${esc(d.policy_version || "nao avaliada")}</small></details></div>
+      if(episode.grouping?.kind==='pattern') {
+        const severalRules=episode.detection_count>episode.grouping.occurrence_count;
+        return `<div class="sec-detection sec-occurrence sev-${esc(d.severity)}" data-detection="${i}">
+          <span class="sec-dot"></span><div><strong>Evento ${esc(d.event_ids?.[0] ?? '—')}</strong>${severalRules ? `<small>${evidence().badge(d.evidence_level)}${esc(d.name)}</small>` : ''}${!visibleDetection(d) ? '<small>Fora do recorte de exibição</small>' : ''}</div>
+          <time>${esc(range(d.start,d.end))}</time><span class="sec-row-actions">${icon("fa-circle-info", "Verificações desta ocorrência", "d-explain")}<button class="btn ghost" data-act="d-records" aria-expanded="false">Ver evento</button></span><div class="sec-inline-events" hidden></div></div>`;
+      }
+      return `<div class="sec-detection sev-${esc(d.severity)}" data-detection="${i}">
+        <span class="sec-dot"></span><div>${evidence().badge(d.evidence_level)}${icon("fa-circle-info", "Entender a classificação e ver verificações", "d-explain")}${!visibleDetection(d) ? '<small>Contexto da correlação</small>' : ""}<strong>${esc(d.name)}</strong><small>${esc(evidence().claim(d.claim))} · ${esc(evidence().outcome(d.outcome))}</small></div>
         <span class="sec-count">${fmtNum(d.count)}</span><time>${esc(range(d.start, d.end))}</time>
-        <span class="sec-row-actions">${icon("fa-list", "Ver registros", "d-records")}${icon("fa-eye-slash", "Ocultar esta detecção", "d-hide")}</span></div>`;
+        <span class="sec-row-actions"><button class="btn ghost" data-act="d-records" aria-expanded="false">Ver eventos</button>${icon("fa-eye-slash", "Ocultar esta detecção", "d-hide")}</span><div class="sec-inline-events" hidden></div></div>`;
     }).join("");
   }
   function drawAttention(slot, data) {
@@ -196,14 +266,15 @@ window.Security = (() => {
     if (!eligibleEpisodes.length) {
       slot.className = "sec-clear";
       const gaps = (data.rule_coverage || []).filter(r => ["partial", "missing_fields", "missing_coverage"].includes(r.status));
-      slot.innerHTML = `${controls}<div class="evidence-empty"><strong>Nenhum indício ${minimumEvidence === 5 ? "E5" : `E${minimumEvidence} a E5`} encontrado neste conjunto.</strong><p>${(data.counts_by_level || []).slice(0, minimumEvidence - 1).some(Boolean) ? "Existem indícios em outros níveis. Reduza a rigidez para investigar." : "A ausência de indícios não demonstra ausência de comprometimento."}</p><small>Cobertura: ${data.limited || gaps.length ? "parcial" : "conforme os campos disponíveis"}${gaps.length ? ` · ${gaps.length} regras com dados insuficientes` : ""}. ${esc((data.limitations || []).join(" · "))}</small></div><small>${esc(rulesText)} · ${fmtNum(data.total)} registros analisados no universo completo</small>`;
+      slot.innerHTML = `${controls}<div class="evidence-empty"><strong>Nenhum indício no nível ${evidence().label(minimumEvidence)}${minimumEvidence < 5 ? " ou acima" : ""} encontrado neste conjunto.</strong><p>${(data.counts_by_level || []).slice(0, minimumEvidence - 1).some(Boolean) ? "Existem indícios em outros níveis. Selecione um nível abaixo para investigar." : "A ausência de indícios não demonstra ausência de comprometimento."}</p><small>Cobertura: ${data.limited || gaps.length ? "parcial" : "conforme os campos disponíveis"}${gaps.length ? ` · ${gaps.length} regras com dados insuficientes` : ""}. ${esc((data.limitations || []).join(" · "))}</small></div><small>${esc(rulesText)} · ${fmtNum(data.total)} registros analisados no universo completo</small>`;
       bindRigidity();
+      if(tacticFilter){const clear=el('button','text-button',`Remover seleção de tática: ${tacticLabel(data,tacticFilter)}`);clear.onclick=()=>{tacticFilter=null;data.storage?.kind==='sqlite'?loadStoredPage(0).catch(e=>toast(String(e),'err')):drawAttention(slot,data);};slot.append(clear);}
       slot.hidden = false;
       slot.querySelector("[data-open-rules]")?.addEventListener("click", () => openSettings("detection"));
       return;
     }
     slot.className = "ws-card sec-attention";
-    slot.innerHTML = `${controls}<div class="card-heading"><h2>Indícios</h2>${tacticsStrip(data)}<span class="sec-heading-count">${stored ? `Episódios ${data.page.episode_offset+1}–${data.page.episode_offset+data.page.returned_episodes} de ${fmtNum(data.page.total_episodes)}` : `${fmtNum(eligibleEpisodes.length)} episódios visíveis · ${fmtNum(data.episodes.length)} disponíveis`}</span></div>
+    slot.innerHTML = `${controls}<div class="card-heading"><h2>Indícios de comprometimento</h2>${tacticsStrip(data)}<span class="sec-heading-count">${stored ? `Cartões ${data.page.episode_offset+1}–${data.page.episode_offset+data.page.returned_episodes} de ${fmtNum(data.page.total_episodes)}` : `${fmtNum(eligibleEpisodes.length)} cartões visíveis · ${fmtNum(data.episodes.length)} disponíveis`}</span></div>
       ${tacticFilter ? `<div class="sec-filtering">${esc(tacticLabel(data, tacticFilter))} <button type="button" class="text-button" data-clear-tactic>mostrar todos</button></div>` : ""}
       <div class="sec-episodes">${episodes.map(({ e, i }) => episodeRow(data, e, i)).join("")}</div>
       ${stored ? `<div class="sec-pagination"><button class="btn ghost" data-page-offset="${Math.max(0,data.page.episode_offset-data.page.episode_limit)}" ${data.page.episode_offset===0?"disabled":""}>Anterior</button><button class="btn ghost" data-page-offset="${data.page.next_offset??0}" ${data.page.next_offset==null?"disabled":""}>Próxima</button></div>` : ""}
@@ -226,24 +297,32 @@ window.Security = (() => {
     slot.querySelector("[data-more]")?.addEventListener("click", () => { shownEpisodes = slot.querySelector("[data-more]").dataset.more === "expand" ? shownEpisodes + 20 : COLLAPSED; drawAttention(slot, data); });
     const episodeOf = node => data.episodes[+node.closest("[data-episode]").dataset.episode];
     const loadMembers = async (article,offset) => {
-      const episode=episodeOf(article),page=await api("triage_episode",{analysisId:data.analysis_id,episodeId:episode.id,offset,limit:100},{silent:true});
-      article.__detailMembers=page.detections.map(d=>({...d,context_only:true}));
-      article.querySelector(".sec-detections").innerHTML=detectionRows({...data,detections:article.__detailMembers},{detections:page.detections.map((_,i)=>i)})+`<p class="small">Indícios ${offset+1}–${offset+page.detections.length} de ${page.total}</p>${offset>0?`<button class="btn ghost" data-members-offset="${Math.max(0,offset-100)}">Anteriores</button>`:""}${page.next_offset!=null?`<button class="btn ghost" data-members-offset="${page.next_offset}">Próximos indícios</button>`:""}`;
+      const episode=episodeOf(article),limit=episode.grouping?.kind==='pattern'?20:100;
+      const page=await api("triage_episode",{analysisId:data.analysis_id,episodeId:episode.id,offset,limit},{silent:true});
+      article.__detailMembers=page.detections.map(d=>({...d,context_only:(d.evidence_level||0)<minimumEvidence || !!(tacticFilter&&!d.tactics.includes(tacticFilter))}));
+      article.querySelector(".sec-detections").innerHTML=detectionRows({...data,detections:article.__detailMembers},{...episode,detections:page.detections.map((_,i)=>i)})+`<p class="small">Indícios ${offset+1}–${offset+page.detections.length} de ${page.total}</p>${offset>0?`<button class="btn ghost" data-members-offset="${Math.max(0,offset-limit)}">Anteriores</button>`:""}${page.next_offset!=null?`<button class="btn ghost" data-members-offset="${page.next_offset}">Próximos indícios</button>`:""}`;
     };
     const toggle = async article => {
       const list = article.querySelector(".sec-detections"), open = list.hidden;
       list.hidden = !open; article.setAttribute("aria-expanded", String(open));
+      article.querySelectorAll('[data-act="expand"]').forEach(b=>b.setAttribute('aria-expanded',String(open)));
+      const groupLabel=article.querySelector('.sec-pattern-count span');
+      if(groupLabel)groupLabel.textContent=open?'Ocultar ocorrências':'Ver ocorrências';
       if (open && !list.innerHTML) {
         const episode=episodeOf(article);
-        if(episode.members_complete===false){list.textContent="Carregando componentes da correlação…";try{await loadMembers(article,0);}catch(error){list.innerHTML="";toast(String(error),"err");}}
+        if(episode.members_complete===false || (episode.grouping?.kind==='pattern' && data.storage?.kind==='sqlite' && episode.detection_count>20)){list.textContent="Carregando ocorrências…";try{await loadMembers(article,0);}catch(error){list.innerHTML="";toast(String(error),"err");}}
         else list.innerHTML = detectionRows(data, episode);
       }
     };
     slot.querySelector(".sec-episodes")?.addEventListener("click", async event => {
       const article = event.target.closest("[data-episode]");
-      if (!article || event.target.closest(".entity-chip, .evidence-why")) return;
+      if (!article || event.target.closest(".entity-chip, .evidence-why, .sec-inline-events, .sec-excerpts") || window.getSelection()?.toString()) return;
       const action = event.target.closest("[data-act]")?.dataset.act;
       let episode = episodeOf(article);
+      if(action==='participants') {
+        ParticipantsUI.inspect(episode.participants,event.target.closest('[data-side]').dataset.side,{analysisId:data.analysis_id,request:fullRequest()});
+        return;
+      }
       const membersPage=event.target.closest("[data-members-offset]");
       if(membersPage){
         try {await loadMembers(article,+membersPage.dataset.membersOffset);}catch(error){toast(String(error),"err");}return;
@@ -254,19 +333,22 @@ window.Security = (() => {
         catch(error){toast(String(error),"err");return;}
       }
       const detection = event.target.closest("[data-detection]") && (article.__detailMembers || data.detections)[+event.target.closest("[data-detection]").dataset.detection];
-      if (action === "records") showRecords(episodeFilters(actionData, episode));
+      if (action === "explain") evidence().inspect(article.__previewDetection || episode.detections.map(i=>data.detections[i]).sort((a,b)=>b.evidence_level-a.evidence_level)[0]);
+      else if (action === "d-explain" && detection) evidence().inspect(detection);
+      else if (action === "records") showRecords(episodeFilters(actionData, episode));
       else if (action === "timeline") showTimeline(episodeFilters(actionData, episode), episode.start, episode.end);
-      else if (action === "save") await saveToCase(actionData, episode.detections.map(i => actionData.detections[i]), episode.title, episode.summary);
-      else if (action === "d-records" && detection) showRecords(detectionFilters(detection));
+      else if (action === "save") await saveToCase(actionData, episode.detections.map(i => actionData.detections[i]), episode.title, episode.summary, episode.grouping);
+      else if (action === "d-records" && detection) openInlineEvents(event.target.closest('[data-detection]'), detection, data);
       else if (action === "d-hide" && detection) await suppress(detection);
       else if (!detection) toggle(article);
-      else showRecords(detectionFilters(detection));
+      else openInlineEvents(event.target.closest('[data-detection]'), detection, data);
     });
     slot.querySelector(".sec-episodes")?.addEventListener("keydown", event => {
       const article = event.target.closest("[data-episode]");
       if (article && event.target === article && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); toggle(article); }
     });
     slot.querySelector(".sec-episodes")?.addEventListener("contextmenu", async event => {
+      if (event.target.closest('.sec-event')) return;
       const article = event.target.closest("[data-episode]");
       if (!article || event.target.closest(".entity-chip, .evidence-why")) return;
       event.preventDefault();
@@ -279,9 +361,9 @@ window.Security = (() => {
       }
       const target = detection ? { title: detection.name, summary: detection.summary, list: [detection], filters: detectionFilters(detection), start: detection.start, end: detection.end } : { title: episode.title, summary: episode.summary, list: episode.detections.map(i => actionData.detections[i]), filters: episodeFilters(actionData, episode), start: episode.start, end: episode.end };
       showCtxMenu(event.clientX, event.clientY, [
-        { icon: "fa-list", label: "Ver registros", onClick: () => showRecords(target.filters) },
+        { icon: "fa-filter", label: "Filtrar eventos no Explorar", onClick: () => showRecords(target.filters) },
         { icon: "fa-timeline", label: "Ver na linha do tempo", onClick: () => showTimeline(target.filters, target.start, target.end) },
-        ...(workspaceScope() === "dataset" ? [{ icon: "fa-bookmark", label: "Salvar no Caso", onClick: () => saveToCase(actionData, target.list, target.title, target.summary) }] : []),
+        ...(workspaceScope() === "dataset" ? [{ icon: "fa-bookmark", label: "Salvar no Caso", onClick: () => saveToCase(actionData, target.list, target.title, target.summary, detection?undefined:episode.grouping) }] : []),
         { icon: "fa-copy", label: "Copiar resumo", onClick: () => navigator.clipboard?.writeText(`${target.title}\n${target.summary}\n${range(target.start, target.end)}\n${target.list.map(d => `- ${d.name}: ${d.summary} (${d.count})`).join("\n")}`) },
         ...(detection ? [{ sep: true }, { icon: "fa-eye-slash", label: "Ocultar esta detecção", onClick: () => suppress(detection) }] : []),
       ]);
@@ -381,7 +463,7 @@ window.Security = (() => {
   }
 
   // ---------------------------------------------------------------- summary
-  async function fillSummary({ attention, entities, rare }) {
+  async function loadAttention({ attention, entities, rare }) {
     if (!attention) return;
     summarySlots = { attention, entities, rare };
     syncUniverse();
@@ -392,7 +474,9 @@ window.Security = (() => {
     try {
       const data = await get();
       if (!attention.isConnected || k !== key()) return;
+      updateContextBar();
       drawAttention(attention, data);
+      if(document.body.dataset.page==='compromises' && !state.activeOperation)finishOperation('Comprometimentos',`${fmtNum(data.total)} registros no conjunto completo`);
       if (entities) drawEntities(entities, data);
       if (rare) drawRare(rare, data);
     } catch (error) {
@@ -400,7 +484,31 @@ window.Security = (() => {
       attention.className = "sec-clear sec-failed";
       attention.innerHTML = `<i class="fas fa-triangle-exclamation" aria-hidden="true"></i><span>Triagem indisponível</span><small></small><button type="button" class="text-button">Tentar novamente</button>`;
       attention.querySelector("small").textContent = String(error).slice(0, 200);
-      attention.querySelector("button").onclick = () => { results.delete(k); fillSummary({ attention, entities, rare }); };
+      attention.querySelector("button").onclick = () => { results.delete(k); loadAttention({ attention, entities, rare }); };
+    }
+  }
+
+  async function renderPage(host) {
+    host.innerHTML = `<section class="sec-intro"><div><p>Abra um indício para percorrer as evidências até os eventos originais.<br>Use o botão direito para filtrar um evento no Explorar.</p></div><small>Força da evidência, impacto potencial e resultado são informações distintas. “Quase confirmado” também pode descrever uma tentativa muito específica, inclusive bloqueada.</small></section><div class="sec-page-results"></div>`;
+    await loadAttention({ attention: host.querySelector('.sec-page-results') });
+  }
+  async function fillSummary({ attention }) {
+    if (!attention) return;
+    attention.hidden = false; attention.className = 'ws-card sec-summary';
+    attention.textContent = 'Calculando indícios no conjunto completo…';
+    const context = key();
+    try {
+      const data = await get();
+      if (!attention.isConnected || context !== key()) return;
+      const counts = data.universe_counts_by_level || data.counts_by_level || [0,0,0,0,0], max = Math.max(1,...counts);
+      attention.innerHTML = `<div class="card-heading"><h2>Comprometimentos</h2><button class="text-button" data-open-compromises>Abrir análise <i class="fas fa-arrow-right"></i></button></div><p class="small muted">Indícios por força da evidência · ${fmtNum(data.total)} registros no conjunto completo · filtros do Explorar não se aplicam</p><div class="sec-count-chart" role="group" aria-label="Número de indícios por força da evidência">${[5,4,3,2,1].map(n=>`<button class="sec-chart-row evidence-e${n}" data-chart-level="${n}" aria-label="${evidence().label(n)}: ${counts[n-1]} indícios"><span>${evidence().label(n)}</span><span class="sec-chart-track"><span style="width:${100*counts[n-1]/max}%"></span></span><strong>${fmtNum(counts[n-1])}</strong></button>`).join('')}</div>`;
+      const open=async level=>{const hadTactic=!!tacticFilter;tacticFilter=null;if(hadTactic)results.delete(key());await Workspace.showPage('compromises');if(level)setMinimum(level);};
+      attention.querySelector('[data-open-compromises]').onclick=()=>open();
+      attention.querySelectorAll('[data-chart-level]').forEach(b=>b.onclick=()=>open(+b.dataset.chartLevel));
+    } catch(error) {
+      if(!attention.isConnected)return;
+      attention.textContent=`Não foi possível calcular os indícios: ${error}`;
+      const retry=el('button','text-button','Tentar novamente');retry.onclick=()=>fillSummary({attention});attention.append(retry);
     }
   }
 
@@ -423,7 +531,7 @@ window.Security = (() => {
       <input type="search" class="rules-search" placeholder="Filtrar regras…" aria-label="Filtrar regras">
       ${settings.suppress?.length ? `<details class="rules-suppress"><summary>${settings.suppress.length} ${settings.suppress.length === 1 ? "detecção oculta" : "detecções ocultas"}</summary>${settings.suppress.map((s, i) => `<div class="rules-suppressed"><span>${esc(names.get(s.rule) || s.rule)}${s.value ? ` · ${esc(s.value)}` : ""}</span><button type="button" class="text-button" data-unsuppress="${i}">Mostrar novamente</button></div>`).join("")}</details>` : ""}
       ${overview.sigma_errors.length ? `<details class="rules-errors"><summary>${overview.sigma_errors.length} regras Sigma não convertidas</summary>${overview.sigma_errors.slice(0, 50).map(e => `<div>${esc(e)}</div>`).join("")}</details>` : ""}
-      <div class="rules-list">${groups.map(([origin, label]) => { const list = overview.rules.filter(r => r.origin === origin); return list.length ? `<h4>${label} <span>${list.filter(r => r.enabled).length}/${list.length}</span></h4>${list.map(r => `<label class="rule-row" data-search="${esc(`${r.name} ${r.id} ${r.attack.map(a => a.id + " " + a.name).join(" ")}`.toLowerCase())}" title="${esc(r.description)}"><input type="checkbox" data-rule="${esc(r.id)}" ${r.enabled ? "checked" : ""} ${r.retired ? 'disabled title="Retirada da triagem: comportamento insuficiente isoladamente"' : ""}><span class="sec-dot sev-${esc(r.severity)}"></span><span class="rule-name">${esc(r.name)}</span><small>${r.evidence?.maturity === "unassessed" ? "Nível não avaliado" : `E${r.evidence_level ?? Math.min(r.evidence?.level || 0, 4)}`} · ${esc(r.evidence?.maturity || "legada")}</small><small>${esc(r.attack.map(a => a.id).join(" "))}</small></label>`).join("")}` : ""; }).join("")}</div>`;
+      <div class="rules-list">${groups.map(([origin, label]) => { const list = overview.rules.filter(r => r.origin === origin); return list.length ? `<h4>${label} <span>${list.filter(r => r.enabled).length}/${list.length}</span></h4>${list.map(r => `<label class="rule-row" data-search="${esc(`${r.name} ${r.id} ${r.attack.map(a => a.id + " " + a.name).join(" ")}`.toLowerCase())}" title="${esc(r.description)}"><input type="checkbox" data-rule="${esc(r.id)}" ${r.enabled ? "checked" : ""} ${r.retired ? 'disabled title="Retirada da triagem: comportamento insuficiente isoladamente"' : ""}><span class="sec-dot sev-${esc(r.severity)}"></span><span class="rule-name">${esc(r.name)}</span><small>${r.evidence?.maturity === "unassessed" ? "Nível não avaliado" : evidence().label(r.evidence_level ?? r.evidence?.level)} · ${esc(r.evidence?.maturity || "legada")}</small><small>${esc(r.attack.map(a => a.id).join(" "))}</small></label>`).join("")}` : ""; }).join("")}</div>`;
     const mappingsPane = el("details", "rules-mappings");
     mappingsPane.innerHTML = `<summary>Mapeamento de fontes e procedência</summary><p class="muted small">Cada fonte usa seu nome exato. Campos: timestamp, actor, target, namespace, host, service, action, outcome, request, session, connection, process, parent, file, command, credential, created_credential, resource, request_command, url, persistence_target, application, grant, token, repository, pipeline, run, revision, secret, certificate, certificate_issuer, certificate_subject, requester, beneficiary, delegator, resource_spn, destination, artifact, logon, remote_session, principal, source_address. Resultados: success, failure, blocked, unknown.</p><textarea class="source-mapping-editor" aria-label="Mapeamentos por fonte (JSON)"></textarea><button type="button" class="btn ghost small" data-preview-map>Prévia no evento aberto</button><button type="button" class="btn ghost small" data-save-map>Salvar mapeamentos</button><pre class="mapping-preview" aria-live="polite"></pre>`;
     pane.prepend(mappingsPane);
@@ -477,9 +585,9 @@ window.Security = (() => {
   function recipes() { return RECIPES.map(r => ({ ...r, run: () => window.Workspace.search(r.query) })); }
   function recipesMenu(x, y) { showCtxMenu(x, y, recipes().map(r => ({ icon: r.icon, label: r.label, onClick: r.run }))); }
 
-  function openEpisode(index) {
+  async function openEpisode(index) {
     const data = lastData, episode = data?.episodes?.[index];
-    if (episode) showRecords(episodeFilters(data, episode));
+    if (episode) { await Workspace.showPage('compromises'); document.querySelector(`[data-episode="${index}"] [data-act="expand"]`)?.click(); }
   }
-  return { setMinimum, minimum: () => { syncUniverse(); return minimumEvidence; }, get, cached, fillSummary, markers, renderRulesPane, recipes, recipesMenu, openEpisode, ruleName: id => names.get(id) || null, rules: async () => (await rules()).rules, invalidate: () => results.clear(), last: () => lastData };
+  return { setMinimum, minimum: () => { syncUniverse(); return minimumEvidence; }, get, cached, fillSummary, renderPage, markers, renderRulesPane, recipes, recipesMenu, openEpisode, ruleName: id => names.get(id) || null, rules: async () => (await rules()).rules, invalidate: () => results.clear(), last: () => lastData };
 })();

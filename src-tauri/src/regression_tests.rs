@@ -1789,8 +1789,9 @@ fn triage_threat_signals_rarity_and_suppression() {
     events.push(sqli);
     let t = triage_events(events.clone(), true);
     assert!(t.rare.iter().any(|r| r.value == "x.exe"), "{:?}", t.rare.iter().map(|r| &r.value).collect::<Vec<_>>());
-    let signal = t.detections.iter().find(|d| d.origin == "threats").expect("threat signal");
-    assert_eq!(signal.name, "Injeção SQL");
+    // The contextual request rule supersedes the legacy text-only SQL signal.
+    let signal = t.detections.iter().find(|d| d.rule == "content.sqli_request").expect("contextual SQL signal");
+    assert_eq!(signal.evidence.evidence_level, 3);
     assert!(signal.entities.iter().any(|e| e.value == "203.0.113.9"));
     assert!(signal.attack.iter().any(|a| a.id == "T1190"));
     // Suppressing the signal for that address hides it and counts it.
@@ -1803,7 +1804,7 @@ fn triage_threat_signals_rarity_and_suppression() {
     let inputs = crate::detections::Inputs { rules: &rules, catalog: Some(&catalog), settings: &settings };
     let refs: Vec<&Event> = events.iter().collect();
     let hidden = crate::detections::run(&inputs, &crate::detections::Source::Events(refs)).unwrap();
-    assert!(hidden.detections.iter().all(|d| d.origin != "threats"));
+    assert!(hidden.detections.iter().all(|d| d.rule != signal.rule));
     assert!(hidden.suppressed >= 1);
 }
 

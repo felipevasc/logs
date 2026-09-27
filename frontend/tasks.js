@@ -4,12 +4,12 @@ window.Tasks = (() => {
   "use strict";
   const base = api;
   // Commands that only read: identical requests in flight are shared and survive a selective cancel.
-  const READS = new Set(["threat_catalog", "threat_scan", "threat_events", "journey_fields", "journey_index", "journey_events", "dataset_overview", "triage", "event_insights", "detection_rules", "timeline_lanes", "entity_summary", "ioc_sightings", "source_hashes", "timeline_range", "compare_periods", "list_sources", "source_summary", "query_events", "explore_snapshot", "aggregate_events", "trail_events", "count_filtered", "tree_aggs", "stats_events", "event_detail", "profile_fields", "discover_patterns", "compute_series", "pivot", "list_channels", "list_formats", "list_derived_fields", "get_codes", "get_codes_path", "system_codes_count", "remote_list", "get_ts_config"]);
+  const READS = new Set(["threat_catalog", "threat_scan", "threat_events", "journey_fields", "journey_index", "journey_events", "dataset_overview", "triage", "triage_evidence_event", "event_insights", "detection_rules", "timeline_lanes", "entity_summary", "ioc_sightings", "source_hashes", "timeline_range", "compare_periods", "list_sources", "source_summary", "query_events", "explore_snapshot", "aggregate_events", "trail_events", "count_filtered", "tree_aggs", "stats_events", "event_detail", "profile_fields", "discover_patterns", "compute_series", "pivot", "list_channels", "list_formats", "list_derived_fields", "get_codes", "get_codes_path", "system_codes_count", "remote_list", "get_ts_config"]);
   // Bookkeeping calls never show as work.
   const QUIET = new Set(["validate_filters", "case_sync", "ui_zoom", "cancel_operation", "cases_save", "cases_load", "mcp_status", "get_codes_path", "system_codes_count", "list_formats"]);
-  const WHAT = { dataset_overview: "Visão geral", triage: "Triagem de segurança", timeline_range: "Volume no tempo", timeline_lanes: "Faixas", query_events: "Registros", explore_snapshot: "Registros e campos", tree_aggs: "Campos", aggregate_events: "Grupos", profile_fields: "Perfil dos campos", compute_series: "Gráficos", pivot: "Tabela dinâmica", discover_patterns: "Padrões", threat_scan: "Ameaças", threat_events: "Registros de ameaça", compare_periods: "Comparação de períodos", journey_index: "Possíveis trilhas", journey_events: "Registros da trilha", journey_fields: "Campos de ligação", entity_summary: "Entidades", ioc_sightings: "Indicadores nas fontes", source_hashes: "SHA-256 das fontes", stats_events: "Histograma", count_filtered: "Contagem", trail_events: "Vizinhança do registro", load_file: "Abrindo logs", load_files: "Abrindo logs", load_bundle: "Abrindo logs", load_event_log: "Lendo o Event Log", remote_import: "Importação remota", remote_test: "Teste de conexão", export_events: "Exportação", export_investigation: "Exportação", import_investigation: "Importação da investigação", harvest_codes: "Catálogo do sistema", sigma_import: "Importação Sigma", expand_paths: "Lendo pastas", event_detail: "Detalhe do registro", list_sources: "Fontes", event_insights: "Detalhe do registro" };
+  const WHAT = { dataset_overview: "Visão geral", triage: "Comprometimentos", triage_evidence_event: "Evento da evidência", timeline_range: "Volume no tempo", timeline_lanes: "Faixas", query_events: "Registros", explore_snapshot: "Registros e campos", tree_aggs: "Campos", aggregate_events: "Grupos", profile_fields: "Perfil dos campos", compute_series: "Gráficos", pivot: "Tabela dinâmica", discover_patterns: "Padrões", threat_scan: "Ameaças", threat_events: "Registros de ameaça", compare_periods: "Comparação de períodos", journey_index: "Possíveis trilhas", journey_events: "Registros da trilha", journey_fields: "Campos de ligação", entity_summary: "Entidades", ioc_sightings: "Indicadores nas fontes", source_hashes: "SHA-256 das fontes", stats_events: "Histograma", count_filtered: "Contagem", trail_events: "Vizinhança do registro", load_file: "Abrindo logs", load_files: "Abrindo logs", load_bundle: "Abrindo logs", load_event_log: "Lendo o Event Log", remote_import: "Importação remota", remote_test: "Teste de conexão", export_events: "Exportação", export_investigation: "Exportação", import_investigation: "Importação da investigação", harvest_codes: "Catálogo do sistema", sigma_import: "Importação Sigma", expand_paths: "Lendo pastas", event_detail: "Detalhe do registro", list_sources: "Fontes", event_insights: "Detalhe do registro" };
   const ZONES = { analysis: "Análise", case: "Caso", structure: "Estrutura" };
-  const PAGES = { summary: "Resumo", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas" };
+  const PAGES = { summary: "Resumo", compromises: "Comprometimentos", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas" };
   const TABS = { table: "Registros", group: "Resumir", dashboard: "Descobrir", cube: "Cruzar dados" };
   const VISIBLE_AFTER = 300;
   const tasks = new Map(), inflight = new Map(), ids = new WeakMap();
@@ -83,9 +83,9 @@ window.Tasks = (() => {
   function render() {
     const list = groups();
     const marked = new Set(list.flatMap(g => g.marks.flatMap(selector => [...document.querySelectorAll(selector)])));
-    // A veil dims the item and two wave lines run across it; only marks set here are removed here.
-    document.querySelectorAll('[data-loading="task"]').forEach(node => { if (!marked.has(node)) { node.removeAttribute("data-loading"); node.querySelector(":scope > .li-waves")?.remove(); } });
-    marked.forEach(node => { node.setAttribute("data-loading", "task"); if (!node.querySelector(":scope > .li-waves")) node.append(waves()); });
+    // One compact spinner per busy control; preserve any pre-existing busy state.
+    document.querySelectorAll('[data-loading="task"]').forEach(node => { if (!marked.has(node)) { node.removeAttribute("data-loading"); if(node.__taskBusyBefore == null)node.removeAttribute("aria-busy");else node.setAttribute("aria-busy",node.__taskBusyBefore); delete node.__taskBusyBefore; node.querySelector(":scope > .li-loader")?.remove(); } });
+    marked.forEach(node => { if(node.dataset.loading!=="task")node.__taskBusyBefore=node.getAttribute("aria-busy"); node.setAttribute("aria-busy","true"); node.setAttribute("data-loading", "task"); if (!node.querySelector(":scope > .li-loader")) node.append(loader()); });
     const bar = $("#workbar"), button = $("#workbar-tasks");
     bar.classList.toggle("has-tasks", list.length > 0);
     if (list.length) { button.querySelector("span").textContent = summary(list); button.title = "Ver e cancelar o que está carregando"; }
@@ -105,7 +105,7 @@ window.Tasks = (() => {
   }
   function cancelAll() { for (const t of [...tasks.values()]) { t.cancelled = true; t.reject(new Error("Operação cancelada.")); } tasks.clear(); inflight.clear(); selectiveUntil = 0; schedule(); }
 
-  function waves() { const node = document.createElement("span"); node.className = "li-waves"; node.setAttribute("aria-hidden", "true"); return node; }
+  function loader() { const node = document.createElement("span"); node.className = "li-loader"; node.setAttribute("aria-hidden", "true"); return node; }
   const elapsed = t => { const s = Math.round((performance.now() - t.started) / 1000); return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`; };
   let drawn = "";
   function drawDialog() {
@@ -114,7 +114,7 @@ window.Tasks = (() => {
     const shape = list.map(g => g.key + ":" + g.tasks.map(t => t.id).join(",")).join("|");
     if (shape === drawn && list.length) { for (const g of list) for (const t of g.tasks) { const cell = body.querySelector(`[data-elapsed="${t.id}"]`); if (cell) cell.textContent = elapsed(t); } return; }
     drawn = shape;
-    body.innerHTML = list.length ? list.map(g => `<div class="task-group"><div class="task-origin" data-loading>${esc(g.label)}<span class="li-waves" aria-hidden="true"></span></div>${g.tasks.map(t => `<div class="task-row"><span>${esc(WHAT[t.cmd] || t.cmd)}</span><small data-elapsed="${t.id}">${elapsed(t)}</small><button type="button" class="btn ghost small" data-cancel="${t.id}">Cancelar</button></div>`).join("")}</div>`).join("") : '<p class="quiet-empty">Nada carregando agora.</p>';
+    body.innerHTML = list.length ? list.map(g => `<div class="task-group"><div class="task-origin" data-loading>${esc(g.label)}<span class="li-loader" aria-hidden="true"></span></div>${g.tasks.map(t => `<div class="task-row"><span>${esc(WHAT[t.cmd] || t.cmd)}</span><small data-elapsed="${t.id}">${elapsed(t)}</small><button type="button" class="btn ghost small" data-cancel="${t.id}">Cancelar</button></div>`).join("")}</div>`).join("") : '<p class="quiet-empty">Nada carregando agora.</p>';
     body.querySelectorAll("[data-cancel]").forEach(b => { b.onclick = () => { const t = tasks.get(+b.dataset.cancel); if (t) cancel(t); }; });
     dialog.querySelector("[data-cancel-all]").hidden = !list.length;
   }

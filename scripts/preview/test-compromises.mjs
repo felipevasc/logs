@@ -1,0 +1,111 @@
+/* UI contract tests; native tests exercise actual classification and evidence identity. */
+import assert from 'node:assert/strict';
+import {mkdir} from 'node:fs/promises';
+import {chromium} from 'playwright';
+const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL||'chrome'});
+const page=await browser.newPage({viewport:{width:1440,height:1050},reducedMotion:'reduce'});
+const errors=[];page.on('pageerror',e=>errors.push(e.message));
+try {
+  await page.goto(process.argv[2]||'http://127.0.0.1:4173');
+  await page.waitForFunction(()=>WorkspaceContext.ready&&state.loaded&&!state.loadOverlay);
+  await page.evaluate(()=>WorkspaceContext.setScope('dataset',{animate:false}));
+  await page.evaluate(()=>Workspace.showPage('summary'));
+  await page.waitForSelector('.sec-count-chart');
+  assert.equal(await page.locator('.sec-chart-row').count(),5);
+  assert.equal(await page.locator('.evidence-control,.sec-episode,#ws-rare,#ws-entities').count(),0);
+  await page.evaluate(()=>{
+    const original=api,data=structuredClone(Security.cached()),event=structuredClone(state.rows[0]);
+    event.event_ref||=`preview:${event.id}`;
+    event.fields={...event.fields,'process.command_line':'cat /etc/shadow',nested:{child:'valor completo'},password:'fixture-secret',
+      'response.body':'root:$6$testsalt$'+'a'.repeat(86)+':20000:0:99999:7:::',
+      'untrusted':'<script>window.compromiseInjected=true</script>'};
+    event.raw=JSON.stringify(event.fields);
+    const excerpt={event_ref:event.event_ref,field:'process.command_line',transformation:'original',before:'antes ',matched:'cat /etc/shadow',after:' depois',prefix_omitted:true,suffix_omitted:true,start:6,end:21};
+    const finding={...data.detections[0],id:'content-fixture',name:'Tentativa com leitura de arquivo sensível',summary:'Requisição com comando de leitura sensível.',evidence_level:5,claim:'attempt',outcome:'blocked',event_ids:[event.id],event_refs:[event.event_ref],excerpts:[excerpt],evidence_members:[{event_id:event.id,event_ref:event.event_ref,step:0,fields:['process.command_line']}],context_only:false};
+    finding.checks=[{status:'passed',label:'Condição observada · etapa 1',expected:'_sec.content.read_request:true',observed:'process.command_line: cat /etc/shadow',event_refs:[event.event_ref],fields:['process.command_line']},{status:'failed',label:'Resultado da operação',expected:'Resultado registrado',observed:'blocked',event_refs:[event.event_ref],fields:['outcome']},{status:'unknown',label:'Execução não demonstrada',expected:'Telemetria do processo',observed:'Sem registro de execução',event_refs:[],fields:[]}];
+    data.detections=[finding];data.episodes=[{...data.episodes[0],title:finding.name,summary:finding.summary,evidence_level:5,detections:[0],event_refs:[event.event_ref]}];data.counts_by_level=[0,0,0,0,1];
+    window.__compromiseFixture={data,event};window.__compromiseCalls=[];
+    api=async function(command,args,...rest){
+      if(command==='triage'){__compromiseCalls.push({command,args});return workspaceScope()==='dataset'?structuredClone(data):original(command,args,...rest);}
+      if(command==='triage_evidence_event'){__compromiseCalls.push({command,args});if(args.eventRef!==event.event_ref||args.eventId!==event.id)throw Error('Wrong evidence');return structuredClone(event);}
+      return original(command,args,...rest);
+    };
+    state.filters=[{column:'code',op:'equals_exact',value:'NO_MATCH'}];state.quick='unrelated';state.total=0;Security.invalidate();
+  });
+  await page.locator('.nav-pages [data-page="compromises"]').click();
+  await page.waitForSelector('.sec-episode');
+  assert.equal(await page.evaluate(()=>Security.minimum()),5);
+  assert.match(await page.locator('#ws-subtitle').innerText(),/independente dos filtros/);
+  assert.deepEqual(await page.evaluate(()=>__compromiseCalls.find(c=>c.command==='triage').args.filters),[]);
+  assert.equal(await page.locator('.sec-episode > .sec-main .sec-excerpts mark').innerText(),'cat /etc/shadow');
+  await page.locator('.sec-episode [data-act="expand"]').click();
+  await page.locator('.sec-detection [data-act="d-records"]').click();
+  assert.equal(await page.locator('.sec-episode .sec-excerpts').count(),1,'one excerpt section, never repeated above original events');
+  assert.equal(await page.locator('.sec-episode .evidence-why,.sec-episode .evidence-explanation').count(),0,'explanations stay outside primary reading flow');
+  await page.locator('.sec-detection [data-act="d-explain"]').click();
+  await page.waitForSelector('dialog.evidence-inspector[open]');
+  assert.equal(await page.locator('.evidence-check').count(),3);
+  assert.match(await page.locator('.check-passed').innerText(),/cat \/etc\/shadow/);
+  assert.match(await page.locator('.check-failed').innerText(),/bloqueado/);
+  assert.match(await page.locator('.check-unknown').innerText(),/Não demonstrado/);
+  assert.equal(await page.locator('.evidence-secondary[open]').count(),0);
+  await mkdir('output/playwright',{recursive:true});
+  await page.screenshot({path:'output/playwright/compromises-checks.png'});
+  await page.evaluate(()=>document.documentElement.dataset.theme='light');
+  await page.screenshot({path:'output/playwright/compromises-checks-light.png'});
+  await page.setViewportSize({width:650,height:760});
+  const modalSize=await page.locator('.evidence-inspector').boundingBox();
+  assert.ok(modalSize.width<=618&&modalSize.height<=670);
+  await page.screenshot({path:'output/playwright/compromises-checks-narrow.png'});
+  await page.setViewportSize({width:1440,height:1050});
+  await page.evaluate(()=>document.documentElement.dataset.theme='dark');
+  await page.locator('.evidence-check details summary').first().click();
+  assert.match(await page.locator('.evidence-check details').first().innerText(),/_sec.content.read_request/);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('dialog.evidence-inspector').count(),0);
+  assert.equal(await page.locator('.sec-detection [data-act="d-explain"]').evaluate(n=>n===document.activeElement),true);
+  await page.locator('.sec-event>summary').click();
+  await page.waitForSelector('.sec-event-field');
+  assert.equal(await page.evaluate(()=>document.body.dataset.page),'compromises');
+  assert.match(await page.locator('.sec-event-content').innerText(),/valor completo/);
+  assert.match(await page.locator('.sec-event-content').innerText(),/cat \/etc\/shadow/);
+  assert.ok(!(await page.locator('.sec-event-content').innerText()).includes('fixture-secret'));
+  assert.ok(!(await page.locator('.sec-event-content').innerText()).includes('a'.repeat(86)));
+  assert.equal(await page.locator('.sec-event-content script').count(),0);
+  assert.equal(await page.evaluate(()=>!!window.compromiseInjected),false);
+  await page.locator('.sec-raw>summary').click();
+  assert.match(await page.locator('.sec-raw pre').innerText(),/process.command_line/);
+  await mkdir('output/playwright',{recursive:true});
+  await page.screenshot({path:'output/playwright/compromises-event.png',fullPage:false});
+  await page.evaluate(()=>{document.documentElement.dataset.theme='light';document.querySelector('#workspace-home').scrollTop=0;});
+  await page.screenshot({path:'output/playwright/compromises-light.png',fullPage:false});
+  await page.evaluate(()=>document.documentElement.dataset.theme='dark');
+  await page.screenshot({path:'output/playwright/compromises-dark.png',fullPage:false});
+  await page.locator('.sec-event>summary').click({button:'right'});
+  await page.locator('.ctx-item',{hasText:'Filtrar este evento no Explorar'}).click();
+  await page.waitForFunction(()=>document.body.dataset.page==='explore');
+  assert.deepEqual(await page.evaluate(()=>state.filters.map(({column,op,value})=>({column,op,value}))),await page.evaluate(()=>[{column:'event_ref',op:'in_exact',value:__compromiseFixture.event.event_ref}]));
+  const calls=await page.evaluate(()=>__compromiseCalls.filter(c=>c.command==='triage').length);
+  await page.locator('.nav-pages [data-page="compromises"]').click();
+  assert.equal(await page.evaluate(()=>__compromiseCalls.filter(c=>c.command==='triage').length),calls,'Explore filters must not invalidate full-universe cache');
+  await page.evaluate(()=>Workspace.showPage('summary'));
+  await page.waitForSelector('.sec-count-chart');
+  assert.equal(await page.locator('.sec-episode,.evidence-control').count(),0);
+  await page.screenshot({path:'output/playwright/compromises-summary.png',fullPage:false});
+  await page.locator('[data-chart-level="3"]').click();
+  await page.waitForFunction(()=>document.body.dataset.page==='compromises'&&Security.minimum()===3);
+  await page.setViewportSize({width:700,height:1000});
+  await page.screenshot({path:'output/playwright/compromises-narrow.png',fullPage:false});
+  assert.equal(await page.locator('.evidence-segments button').count(),5);
+  await page.evaluate(async()=>{
+    const c=activeCase(),row=__compromiseFixture.event;
+    c.items=[{id:'a',stationId:'a',rows:[{...row,event_ref:'case-a'}]},{id:'b',stationId:'b',rows:[{...row,id:row.id+1,event_ref:'case-b'}]}];
+    await WorkspaceContext.setScope('case',{animate:false});
+    state.stationAnalyticsId='a';state.filters=[{column:'code',op:'equals',value:'nothing'}];state.quick='nothing';Security.invalidate();await Workspace.showPage('compromises');
+  });
+  assert.equal(await page.evaluate(()=>Security.minimum()),5);
+  assert.deepEqual(await page.evaluate(()=>__compromiseCalls.filter(c=>c.command==='triage').at(-1).args.caseEvents.map(e=>e.event_ref)),['case-a','case-b']);
+  assert.deepEqual(await page.evaluate(()=>__compromiseCalls.filter(c=>c.command==='triage').at(-1).args.filters),[]);
+  assert.deepEqual(errors,[]);
+  console.log(JSON.stringify({summaryChartOnly:true,ignoresExploreFilters:true,fullCaseAcrossStations:true,inlineExactEvents:true,highlightedExcerpt:true,redaction:true,contextMenu:true,errors},null,2));
+}finally{await browser.close();}

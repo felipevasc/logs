@@ -226,6 +226,7 @@ pub(crate) struct Hit {
     pub snippet: String,
     pub normalized: bool,
     pub provenance: Segment,
+    pub excerpt: Option<crate::evidence::Excerpt>,
 }
 
 impl CompiledCatalog {
@@ -254,12 +255,29 @@ impl CompiledCatalog {
             .into_iter()
             .filter_map(|rule| {
                 let (start, end, normalized) = body.find(&self.regexes[rule])?;
-                let index = body.segments.iter().position(|&(a, b, _)| start >= a && end <= b)?;
+                let index = body
+                    .segments
+                    .iter()
+                    .position(|&(a, b, _)| start >= a && end <= b)?;
                 let (a, b, _) = body.segments[index];
                 let mut provenance = body.origins[index].clone();
                 provenance.start = start - a;
                 provenance.end = end - a;
-                Some(Hit { rule, snippet: snippet(&body.text[a..b], start - a, end - a), normalized, provenance })
+                let excerpt = crate::evidence::Excerpt::new(
+                    &crate::security_normalize::event_ref(event),
+                    &provenance.field,
+                    &provenance.transformation,
+                    &body.text[a..b],
+                    start - a,
+                    end - a,
+                );
+                Some(Hit {
+                    rule,
+                    snippet: snippet(&body.text[a..b], start - a, end - a),
+                    normalized,
+                    provenance,
+                    excerpt,
+                })
             })
             .collect()
     }

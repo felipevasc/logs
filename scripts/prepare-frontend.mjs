@@ -14,6 +14,10 @@ for (const item of ["index.html", "icon-picker.js", "case-timeline.js", "case-co
 }
 
 // A successful build must include every local script referenced by the entrypoint.
+for (const item of ["participants-ui.js", "assets"]) {
+  cpSync(resolve(source, item), resolve(output, item), { recursive: true });
+}
+
 for (const [, src] of readFileSync(resolve(output, "index.html"), "utf8").matchAll(/<script\b[^>]*\bsrc="([^"]+)"/g)) {
   const path = resolve(output, src.split(/[?#]/)[0]);
   if (!path.startsWith(output + sep) || !existsSync(path)) throw Error(`Missing or invalid bundled script: ${src}`);

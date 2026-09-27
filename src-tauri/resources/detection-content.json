@@ -1,0 +1,1060 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "content.sensitive_request",
+      "name": "Busca de arquivo sensível em requisição",
+      "description": "Caminho específico de credenciais, contas ou configuração em URI ou corpo de requisição; não demonstra leitura.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.sensitive_request:true",
+      "evidence": {
+        "level": 3,
+        "claim": "attempt",
+        "rationale": "Caminho específico de credenciais, contas ou configuração em URI ou corpo de requisição; não demonstra leitura.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.traversal_request",
+      "name": "Traversal ou inclusão de arquivo direcionada a conteúdo sensível",
+      "description": "Traversal, file:// ou php://filter junto a caminho sensível no mesmo campo da requisição, após decodificação limitada.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.traversal_request:true",
+      "evidence": {
+        "level": 3,
+        "claim": "attempt",
+        "rationale": "Traversal, file:// ou php://filter junto a caminho sensível no mesmo campo da requisição, após decodificação limitada.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.read_request",
+      "name": "Comando de leitura de arquivo sensível na requisição",
+      "description": "Sintaxe de comando de leitura com alvo sensível dentro de um campo de requisição; execução não observada.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.read_request:true",
+      "evidence": {
+        "level": 4,
+        "claim": "attempt",
+        "rationale": "Sintaxe de comando de leitura com alvo sensível dentro de um campo de requisição; execução não observada.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.sensitive_read",
+      "name": "Leitura de arquivo sensível registrada em comando",
+      "description": "Comando registrado lê arquivo de contas, credenciais ou ambiente. Pode ser administração legítima, especialmente /etc/passwd.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1005",
+        "T1552.001"
+      ],
+      "where": "_sec.action:process_start _sec.content.sensitive_read:true",
+      "evidence": {
+        "level": 1,
+        "claim": "activity",
+        "rationale": "Comando registrado lê arquivo de contas, credenciais ou ambiente. Pode ser administração legítima, especialmente /etc/passwd.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.web_process_read",
+      "name": "Processo web inicia leitura de arquivo sensível",
+      "description": "Evento de processo com comando de leitura sensível e pai web registrado; autorização e origem da requisição não demonstradas.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1005",
+        "T1552.001"
+      ],
+      "where": "_sec.content.web_process_read:true",
+      "evidence": {
+        "level": 3,
+        "claim": "activity",
+        "rationale": "Evento de processo com comando de leitura sensível e pai web registrado; autorização e origem da requisição não demonstradas.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.ambiguous_request",
+      "name": "Busca de configuração possivelmente exposta",
+      "description": "Requisição aponta a configuração de aplicação (.env, wp-config ou .git/config). Isoladamente pode ser uso da própria aplicação; não demonstra leitura.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.ambiguous_request:true",
+      "evidence": {
+        "level": 1,
+        "claim": "attempt",
+        "rationale": "Requisição aponta a configuração de aplicação (.env, wp-config ou .git/config). Isoladamente pode ser uso da própria aplicação; não demonstra leitura.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.backup_request",
+      "name": "Busca de dump ou configuração de banco",
+      "description": "Requisição procura nome específico de dump SQL ou configuração de banco; ausência de rota não demonstra exposição.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.backup_request:true",
+      "evidence": {
+        "level": 2,
+        "claim": "attempt",
+        "rationale": "Requisição procura nome específico de dump SQL ou configuração de banco; ausência de rota não demonstra exposição.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.path_traversal",
+      "name": "Tentativa de navegação fora do diretório publicado",
+      "description": "Dois ou mais segmentos ../ ou ..\\ na mesma requisição, inclusive codificação dupla. O efeito depende da validação do servidor.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.path_traversal:true NOT _sec.content.traversal_request:true",
+      "evidence": {
+        "level": 3,
+        "claim": "attempt",
+        "rationale": "Dois ou mais segmentos ../ ou ..\\ na mesma requisição, inclusive codificação dupla. O efeito depende da validação do servidor.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.xxe_request",
+      "name": "Tentativa de XXE direcionada a arquivo ou metadados sensíveis",
+      "description": "Declaração XML de entidade externa SYSTEM/PUBLIC aponta para credenciais locais ou serviço de metadados dentro de uma requisição. Não comprova expansão da entidade.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.xxe_request:true",
+      "evidence": {
+        "level": 4,
+        "claim": "attempt",
+        "rationale": "Declaração XML de entidade externa SYSTEM/PUBLIC aponta para credenciais locais ou serviço de metadados dentro de uma requisição. Não comprova expansão da entidade.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.xxe_payload",
+      "name": "Payload de XXE direcionado a arquivo ou metadados sensíveis",
+      "description": "Mensagem contém declaração XML de entidade externa com destino sensível. A direção e o processamento ainda não estão demonstrados.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.xxe_payload:true",
+      "evidence": {
+        "level": 3,
+        "claim": "activity",
+        "rationale": "Mensagem contém declaração XML de entidade externa com destino sensível. A direção e o processamento ainda não estão demonstrados.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.xxe_blocked",
+      "name": "Resolução de entidade XML sensível bloqueada",
+      "description": "Diagnóstico do parser registra tentativa de resolver entidade externa de arquivo sensível e recusa explícita. A tentativa é sustentada; a leitura foi bloqueada.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.xxe_blocked:true",
+      "evidence": {
+        "level": 4,
+        "claim": "attempt",
+        "rationale": "Diagnóstico do parser registra tentativa de resolver entidade externa de arquivo sensível e recusa explícita. A tentativa é sustentada; a leitura foi bloqueada.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.xss_request",
+      "name": "Payload de XSS em requisição",
+      "description": "Código de script, atributo de evento ou URI JavaScript com chamada executável em entrada HTTP; não demonstra execução no navegador.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.xss_request:true",
+      "evidence": {
+        "level": 3,
+        "claim": "attempt",
+        "rationale": "Código de script, atributo de evento ou URI JavaScript com chamada executável em entrada HTTP; não demonstra execução no navegador.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.sqli_request",
+      "name": "Payload de injeção SQL em requisição",
+      "description": "Sintaxe de UNION SELECT, tautologia com fechamento/comentário SQL ou injeção de atraso em entrada HTTP; erros e palavras SQL isoladas não satisfazem a regra.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.sqli_request:true",
+      "evidence": {
+        "level": 3,
+        "claim": "attempt",
+        "rationale": "Sintaxe de UNION SELECT, tautologia com fechamento/comentário SQL ou injeção de atraso em entrada HTTP; erros e palavras SQL isoladas não satisfazem a regra.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.xss_payload",
+      "name": "Sintaxe de payload XSS em campo sem direção conhecida",
+      "description": "Campo original contém sintaxe executável de XSS. Sem contexto de requisição, resposta ou navegador, descreve presença do payload e não sua utilização.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.xss_payload:true",
+      "evidence": {
+        "level": 2,
+        "claim": "activity",
+        "rationale": "Campo original contém sintaxe executável de XSS. Sem contexto de requisição, resposta ou navegador, descreve presença do payload e não sua utilização.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.sqli_payload",
+      "name": "Tautologia com quebra de contexto SQL em campo original",
+      "description": "Aspas, operador booleano, comparação verdadeira e comentário SQL no mesmo campo; uma consulta SQL comum ou um erro de banco não bastam.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.sqli_payload:true",
+      "evidence": {
+        "level": 2,
+        "claim": "activity",
+        "rationale": "Aspas, operador booleano, comparação verdadeira e comentário SQL no mesmo campo; uma consulta SQL comum ou um erro de banco não bastam.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.traversal_payload",
+      "name": "Traversal direcionado a arquivo sensível em campo original",
+      "description": "Vários segmentos de retorno de diretório conduzem a arquivo sensível no mesmo campo. A direção e o efeito ainda não são demonstrados.",
+      "kind": "single",
+      "severity": "medium",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.traversal_payload:true",
+      "evidence": {
+        "level": 3,
+        "claim": "activity",
+        "rationale": "Vários segmentos de retorno de diretório conduzem a arquivo sensível no mesmo campo. A direção e o efeito ainda não são demonstrados.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.reverse_payload",
+      "name": "Payload completo de shell reverso em campo original",
+      "description": "Sintaxe de shell com redirecionamento de entrada/saída e conexão de retorno, validada como comando e não como echo ou mera referência a /dev/tcp. Presença do payload não demonstra execução.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1059",
+        "T1071"
+      ],
+      "where": "_sec.content.reverse_payload:true",
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Sintaxe de shell com redirecionamento de entrada/saída e conexão de retorno, validada como comando e não como echo ou mera referência a /dev/tcp. Presença do payload não demonstra execução.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.sensitive_probe_set",
+      "name": "Busca combinada por diferentes famílias de arquivos sensíveis",
+      "description": "Ao menos três famílias distintas de arquivos sensíveis procuradas em dez minutos no mesmo escopo de fonte, host e serviço. Origens registradas são separadas; sem origem registrada não se atribui a sequência ao mesmo cliente.",
+      "kind": "distinct",
+      "severity": "medium",
+      "by": [
+        "_sec.content.probe_scope"
+      ],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.probe_family:*",
+      "evidence": {
+        "level": 3,
+        "claim": "attempt",
+        "rationale": "Ao menos três famílias distintas de arquivos sensíveis procuradas em dez minutos no mesmo escopo de fonte, host e serviço. Origens registradas são separadas; sem origem registrada não se atribui a sequência ao mesmo cliente.",
+        "required": [
+          "_sec.content.probe_scope",
+          "_sec.content.probe_family"
+        ],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada.",
+          "Identidade/autorização do cliente; o agrupamento descreve buscas contra o escopo, não uma identidade de atacante."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ],
+      "distinct": "_sec.content.probe_family",
+      "count": 3,
+      "window": "10m"
+    },
+    {
+      "id": "content.passwd_response",
+      "name": "Resposta contém contas Unix no formato passwd",
+      "description": "Estrutura de contas Unix no formato passwd registrada no corpo de resposta, sem bloqueio, conteúdo HTML ou reflexão direta do corpo enviado. A origem do conteúdo exige investigação.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.passwd_response:true",
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Estrutura de contas Unix no formato passwd registrada no corpo de resposta, sem bloqueio, conteúdo HTML ou reflexão direta do corpo enviado. A origem do conteúdo exige investigação.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.passwd_disclosure",
+      "name": "Busca de arquivo com retorno de contas Unix no formato passwd",
+      "description": "O mesmo evento registra requisição de arquivo sensível e corpo de resposta com estrutura correspondente de contas Unix no formato passwd. Sem bloqueio ou reflexão direta. Evidência muito específica de exposição, inclusive em teste autorizado.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.passwd_disclosure:true",
+      "evidence": {
+        "level": 5,
+        "claim": "activity",
+        "rationale": "O mesmo evento registra requisição de arquivo sensível e corpo de resposta com estrutura correspondente de contas Unix no formato passwd. Sem bloqueio ou reflexão direta. Evidência muito específica de exposição, inclusive em teste autorizado.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.passwd_linked_response",
+      "name": "Requisição ligada ao retorno de contas Unix no formato passwd",
+      "description": "Eventos distintos da mesma requisição, host, serviço e namespace registram a busca sensível e o retorno de contas Unix no formato passwd, em até cinco minutos. A relação exige identificador de requisição e horários suficientes.",
+      "kind": "sequence",
+      "severity": "high",
+      "by": [
+        "_sec.request",
+        "_sec.host"
+      ],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "evidence": {
+        "level": 5,
+        "claim": "activity",
+        "rationale": "Eventos distintos da mesma requisição, host, serviço e namespace registram a busca sensível e o retorno de contas Unix no formato passwd, em até cinco minutos. A relação exige identificador de requisição e horários suficientes.",
+        "required": [
+          "_sec.request",
+          "_sec.host"
+        ],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ],
+      "window": "5m",
+      "steps": [
+        {
+          "where": "_sec.content.passwd_request:true NOT _sec.outcome:(blocked OR failure)"
+        },
+        {
+          "where": "_sec.content.passwd_response:true"
+        }
+      ]
+    },
+    {
+      "id": "content.shadow_response",
+      "name": "Resposta contém hashes no formato shadow",
+      "description": "Estrutura de hashes no formato shadow registrada no corpo de resposta, sem bloqueio, conteúdo HTML ou reflexão direta do corpo enviado. A origem do conteúdo exige investigação.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.shadow_response:true",
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Estrutura de hashes no formato shadow registrada no corpo de resposta, sem bloqueio, conteúdo HTML ou reflexão direta do corpo enviado. A origem do conteúdo exige investigação.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.shadow_disclosure",
+      "name": "Busca de arquivo com retorno de hashes no formato shadow",
+      "description": "O mesmo evento registra requisição de arquivo sensível e corpo de resposta com estrutura correspondente de hashes no formato shadow. Sem bloqueio ou reflexão direta. Evidência muito específica de exposição, inclusive em teste autorizado.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.shadow_disclosure:true",
+      "evidence": {
+        "level": 5,
+        "claim": "activity",
+        "rationale": "O mesmo evento registra requisição de arquivo sensível e corpo de resposta com estrutura correspondente de hashes no formato shadow. Sem bloqueio ou reflexão direta. Evidência muito específica de exposição, inclusive em teste autorizado.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.shadow_linked_response",
+      "name": "Requisição ligada ao retorno de hashes no formato shadow",
+      "description": "Eventos distintos da mesma requisição, host, serviço e namespace registram a busca sensível e o retorno de hashes no formato shadow, em até cinco minutos. A relação exige identificador de requisição e horários suficientes.",
+      "kind": "sequence",
+      "severity": "high",
+      "by": [
+        "_sec.request",
+        "_sec.host"
+      ],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "evidence": {
+        "level": 5,
+        "claim": "activity",
+        "rationale": "Eventos distintos da mesma requisição, host, serviço e namespace registram a busca sensível e o retorno de hashes no formato shadow, em até cinco minutos. A relação exige identificador de requisição e horários suficientes.",
+        "required": [
+          "_sec.request",
+          "_sec.host"
+        ],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ],
+      "window": "5m",
+      "steps": [
+        {
+          "where": "_sec.content.shadow_request:true NOT _sec.outcome:(blocked OR failure)"
+        },
+        {
+          "where": "_sec.content.shadow_response:true"
+        }
+      ]
+    },
+    {
+      "id": "content.private_key_response",
+      "name": "Resposta contém bloco completo de chave privada",
+      "description": "Estrutura de bloco completo de chave privada registrada no corpo de resposta, sem bloqueio, conteúdo HTML ou reflexão direta do corpo enviado. A origem do conteúdo exige investigação.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.private_key_response:true",
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Estrutura de bloco completo de chave privada registrada no corpo de resposta, sem bloqueio, conteúdo HTML ou reflexão direta do corpo enviado. A origem do conteúdo exige investigação.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.private_key_disclosure",
+      "name": "Busca de arquivo com retorno de bloco completo de chave privada",
+      "description": "O mesmo evento registra requisição de arquivo sensível e corpo de resposta com estrutura correspondente de bloco completo de chave privada. Sem bloqueio ou reflexão direta. Evidência muito específica de exposição, inclusive em teste autorizado.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.private_key_disclosure:true",
+      "evidence": {
+        "level": 5,
+        "claim": "activity",
+        "rationale": "O mesmo evento registra requisição de arquivo sensível e corpo de resposta com estrutura correspondente de bloco completo de chave privada. Sem bloqueio ou reflexão direta. Evidência muito específica de exposição, inclusive em teste autorizado.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.private_key_linked_response",
+      "name": "Requisição ligada ao retorno de bloco completo de chave privada",
+      "description": "Eventos distintos da mesma requisição, host, serviço e namespace registram a busca sensível e o retorno de bloco completo de chave privada, em até cinco minutos. A relação exige identificador de requisição e horários suficientes.",
+      "kind": "sequence",
+      "severity": "high",
+      "by": [
+        "_sec.request",
+        "_sec.host"
+      ],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "evidence": {
+        "level": 5,
+        "claim": "activity",
+        "rationale": "Eventos distintos da mesma requisição, host, serviço e namespace registram a busca sensível e o retorno de bloco completo de chave privada, em até cinco minutos. A relação exige identificador de requisição e horários suficientes.",
+        "required": [
+          "_sec.request",
+          "_sec.host"
+        ],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ],
+      "window": "5m",
+      "steps": [
+        {
+          "where": "_sec.content.private_key_request:true NOT _sec.outcome:(blocked OR failure)"
+        },
+        {
+          "where": "_sec.content.private_key_response:true"
+        }
+      ]
+    },
+    {
+      "id": "content.secrets_response",
+      "name": "Resposta contém configuração com credenciais",
+      "description": "Estrutura de configuração com credenciais registrada no corpo de resposta, sem bloqueio, conteúdo HTML ou reflexão direta do corpo enviado. A origem do conteúdo exige investigação.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.secrets_response:true",
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Estrutura de configuração com credenciais registrada no corpo de resposta, sem bloqueio, conteúdo HTML ou reflexão direta do corpo enviado. A origem do conteúdo exige investigação.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.secrets_disclosure",
+      "name": "Busca de arquivo com retorno de configuração com credenciais",
+      "description": "O mesmo evento registra requisição de arquivo sensível e corpo de resposta com estrutura correspondente de configuração com credenciais. Sem bloqueio ou reflexão direta. Evidência muito específica de exposição, inclusive em teste autorizado.",
+      "kind": "single",
+      "severity": "high",
+      "by": [],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "where": "_sec.content.secrets_disclosure:true",
+      "evidence": {
+        "level": 5,
+        "claim": "activity",
+        "rationale": "O mesmo evento registra requisição de arquivo sensível e corpo de resposta com estrutura correspondente de configuração com credenciais. Sem bloqueio ou reflexão direta. Evidência muito específica de exposição, inclusive em teste autorizado.",
+        "required": [],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ]
+    },
+    {
+      "id": "content.secrets_linked_response",
+      "name": "Requisição ligada ao retorno de configuração com credenciais",
+      "description": "Eventos distintos da mesma requisição, host, serviço e namespace registram a busca sensível e o retorno de configuração com credenciais, em até cinco minutos. A relação exige identificador de requisição e horários suficientes.",
+      "kind": "sequence",
+      "severity": "high",
+      "by": [
+        "_sec.request",
+        "_sec.host"
+      ],
+      "attack": [
+        "T1190",
+        "T1005"
+      ],
+      "evidence": {
+        "level": 5,
+        "claim": "activity",
+        "rationale": "Eventos distintos da mesma requisição, host, serviço e namespace registram a busca sensível e o retorno de configuração com credenciais, em até cinco minutos. A relação exige identificador de requisição e horários suficientes.",
+        "required": [
+          "_sec.request",
+          "_sec.host"
+        ],
+        "maturity": "experimental",
+        "version": "2",
+        "missing": [
+          "Autorização da atividade e contexto do solicitante; o nível não confirma comprometimento.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Teste de segurança autorizado ou ambiente de laboratório com dados simulados."
+        ]
+      },
+      "references": [
+        "https://owasp.org/www-community/attacks/Path_Traversal",
+        "https://man7.org/linux/man-pages/man5/passwd.5.html",
+        "https://man7.org/linux/man-pages/man5/shadow.5.html"
+      ],
+      "window": "5m",
+      "steps": [
+        {
+          "where": "_sec.content.secrets_request:true NOT _sec.outcome:(blocked OR failure)"
+        },
+        {
+          "where": "_sec.content.secrets_response:true"
+        }
+      ]
+    }
+  ]
+}

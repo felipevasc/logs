@@ -812,6 +812,244 @@ impl<'a> Ctx<'a> {
 }
 
 impl Expr {
+    /// Explain only predicates that actually matched. NOT/absence and derived
+    /// identities have no textual match and never fabricate a highlighted span.
+    pub fn evidence_excerpts(
+        &self,
+        ev: &Event,
+        n: &crate::security_normalize::Normalized,
+        reference: &str,
+    ) -> Vec<crate::evidence::Excerpt> {
+        use crate::evidence::Excerpt;
+        let mut out = Vec::new();
+        match self {
+            Expr::And(items) | Expr::Or(items) => {
+                for item in items.iter().filter(|e| e.matches(ev)) {
+                    out.extend(item.evidence_excerpts(ev, n, reference));
+                    if out.len() >= 8 {
+                        break;
+                    }
+                }
+            }
+            Expr::Term(term) if term.matches(&Ctx::new(ev)) => {
+                if term.field.as_ref().is_none_or(|f| f.name == "_all") {
+                    fn visit(
+                        term: &Term,
+                        reference: &str,
+                        field: &str,
+                        value: &Value,
+                        out: &mut Vec<Excerpt>,
+                        depth: usize,
+                        nodes: &mut usize,
+                    ) {
+                        if depth > 12 || *nodes >= 1000 || out.len() >= 8 {
+                            return;
+                        }
+                        *nodes += 1;
+                        match value {
+                            Value::Object(map) => {
+                                for (k, v) in map {
+                                    if !k.starts_with("_sec.") {
+                                        visit(
+                                            term,
+                                            reference,
+                                            &format!("{field}.{k}"),
+                                            v,
+                                            out,
+                                            depth + 1,
+                                            nodes,
+                                        );
+                                    }
+                                }
+                            }
+                            Value::Array(values) => {
+                                for (i, v) in values.iter().enumerate() {
+                                    visit(
+                                        term,
+                                        reference,
+                                        &format!("{field}[{i}]"),
+                                        v,
+                                        out,
+                                        depth + 1,
+                                        nodes,
+                                    );
+                                }
+                            }
+                            _ => {
+                                let s = value
+                                    .as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| value.to_string());
+                                let span = match &term.matcher {
+                                    Matcher::Regex(re) | Matcher::Wildcard(re) => {
+                                        re.find(&s).map(|m| (m.start(), m.end()))
+                                    }
+                                    Matcher::Contains(needle) | Matcher::Equals(needle) => {
+                                        regex::Regex::new(&format!("(?i){}", regex::escape(needle)))
+                                            .ok()
+                                            .and_then(|re| {
+                                                re.find(&s).map(|m| (m.start(), m.end()))
+                                            })
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((a, b)) = span {
+                                    out.extend(Excerpt::new(
+                                        reference, field, "original", &s, a, b,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    let mut nodes = 0;
+                    for (field, value) in [
+                        ("message", &ev.message),
+                        ("raw", &ev.raw),
+                        ("source", &ev.source),
+                        ("code", &ev.code),
+                    ] {
+                        visit(
+                            term,
+                            reference,
+                            field,
+                            &Value::String(value.clone()),
+                            &mut out,
+                            0,
+                            &mut nodes,
+                        );
+                    }
+                    for (field, value) in &ev.fields {
+                        if !field.starts_with("_sec.") {
+                            visit(term, reference, field, value, &mut out, 0, &mut nodes);
+                        }
+                    }
+                    return out;
+                }
+                let Some(field) = term.field.as_ref() else {
+                    return out;
+                };
+                for signal in n.signals.iter().filter(|s| s.key == field.name) {
+                    out.push(signal.excerpt.clone());
+                }
+                if !out.is_empty() {
+                    return out;
+                }
+                let mut transform = "original".to_string();
+                let mut name = field.name.clone();
+                let value = if matches!(
+                    name.as_str(),
+                    "_sec.reverse_shell"
+                        | "_sec.suspicious_command"
+                        | "_sec.reverse_shell_request"
+                        | "_sec.suspicious_request"
+                        | "_sec.decoded_command"
+                ) {
+                    let role = if name.contains("request") {
+                        "request_command"
+                    } else {
+                        "command"
+                    };
+                    let Some(p) = n.values.get(role) else {
+                        return out;
+                    };
+                    let flag = name.clone();
+                    name = p.field.clone();
+                    if p.method.contains("decod") {
+                        transform = p.method.clone();
+                    }
+                    if role == "request_command" {
+                        let mut s = p.value.clone();
+                        for _ in 0..2 {
+                            s = crate::threats::percent_decode(&s);
+                        }
+                        if s != p.value {
+                            transform = "percent-decode (até 2 passagens)".into();
+                        }
+                        s
+                    } else if let Some(v) = ev
+                        .fields
+                        .get("_sec.decoded_command")
+                        .and_then(Value::as_str)
+                        .filter(|v| {
+                            flag == "_sec.decoded_command"
+                                || crate::security_normalize::suspicious_command(v)
+                        })
+                    {
+                        transform = "conteúdo decodificado do comando".into();
+                        v.into()
+                    } else {
+                        p.value.clone()
+                    }
+                } else if let Some(role) = name.strip_prefix("_sec.") {
+                    let Some(p) = n.values.get(role) else {
+                        return out;
+                    };
+                    // A synthesized identity is a relation, not a substring of an original field.
+                    if p.method == "derived" || p.field.contains('+') {
+                        return out;
+                    }
+                    name = p.field.clone();
+                    crate::security_normalize::field_text(ev, &name).unwrap_or_else(|| {
+                        transform = format!("normalização: {}", p.method);
+                        p.value.clone()
+                    })
+                } else {
+                    let Some(v) = Ctx::new(ev).field(field).map(|v| v.into_owned()) else {
+                        return out;
+                    };
+                    v
+                };
+                if name.starts_with('@') {
+                    if let Some(p) = n.values.values().find(|p| {
+                        p.value == value && !p.field.starts_with('@') && !p.field.contains('+')
+                    }) {
+                        name = p.field.clone();
+                    } else {
+                        transform = "valor de alias normalizado".into();
+                    }
+                }
+                let span = if field.name != name
+                    && matches!(
+                        field.name.as_str(),
+                        "_sec.reverse_shell"
+                            | "_sec.suspicious_command"
+                            | "_sec.reverse_shell_request"
+                            | "_sec.suspicious_request"
+                    ) {
+                    Some((0, value.len()))
+                } else {
+                    match &term.matcher {
+                        Matcher::Regex(re) | Matcher::Wildcard(re) => {
+                            re.find(&value).map(|m| (m.start(), m.end()))
+                        }
+                        Matcher::Contains(s) => {
+                            regex::Regex::new(&format!("(?i){}", regex::escape(s)))
+                                .ok()
+                                .and_then(|r| r.find(&value).map(|m| (m.start(), m.end())))
+                        }
+                        _ => Some((0, value.len())),
+                    }
+                };
+                if let Some((a, b)) = span {
+                    if let Some(excerpt) = Excerpt::new(reference, &name, &transform, &value, a, b)
+                    {
+                        out.push(excerpt);
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Prioritize payload/content over selectors such as action/category.
+        out.sort_by_key(|e| {
+            !(e.field.contains("command")
+                || e.field.contains("Command")
+                || e.field.contains("body")
+                || e.field.contains("url")
+                || e.field == "@cmdline")
+        });
+        out.truncate(8);
+        out
+    }
     /// An array member is an object, not an event. Names such as `Name` and
     /// `timestamp` must resolve inside that same object, never to event metadata.
     pub fn matches_object(&self, fields: &serde_json::Map<String, Value>) -> bool {
