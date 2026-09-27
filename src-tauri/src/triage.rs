@@ -33,24 +33,31 @@ fn case_key(events: &[Event]) -> String {
     format!("case:{}:{:x}", events.len(), hasher.finish())
 }
 
-pub fn triage_impl(
+pub fn stored_analysis(
     state: &AppState,
-    filters: Vec<Filter>,
     case_events: Option<&[Event]>,
     force: bool,
-) -> Result<Arc<serde_json::Value>, String> {
-    workspace::validate(&filters)?;
+) -> Result<Arc<crate::security_results::Results>, String> {
+    // One analysis worker: all rule stores share the application's analysis budget.
+    static ANALYSIS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _working = ANALYSIS.lock();
+    crate::operations::check()?;
     let rules = detections::ruleset()?;
     let settings = detections::load_settings();
-    let catalog = if settings.threats { crate::threats::load_active().ok() } else { None };
+    let catalog = if settings.threats { Some(crate::threats::load_active()?) } else { None };
+    let expired: Vec<_> = settings
+        .suppress
+        .iter()
+        .map(|s| s.expires.is_some_and(|t| t <= chrono::Utc::now().timestamp_millis()))
+        .collect();
     let key = format!(
-        "{}|{}|{:p}|{:p}|{}|{}",
+        "{}|{:p}|{:p}|{}|{}|{:?}",
         case_events.map(case_key).unwrap_or_else(|| source_key(state)),
-        serde_json::to_string(&filters).unwrap_or_default(),
         Arc::as_ptr(&rules),
         catalog.as_ref().map(Arc::as_ptr).unwrap_or(std::ptr::null()),
         serde_json::to_string(&settings).unwrap_or_default(),
         state.derived.read().len(),
+        expired,
     );
     if !force {
         if let Some(hit) = detections::cached(&key) {
@@ -59,24 +66,263 @@ pub fn triage_impl(
     }
     let inputs = detections::Inputs { rules: &rules, catalog: catalog.as_deref(), settings: &settings };
     let result = match case_events {
-        Some(events) => {
-            let prepared = query::prepare(&filters);
-            let selected: Vec<&Event> = events
-                .iter()
-                .filter(|e| prepared.iter().all(|f| query::matches(e, f)))
-                .collect();
-            detections::run(&inputs, &Source::Events(selected))?
-        }
-        None => workspace::with_selection(state, &filters, |selection| {
-            detections::run(&inputs, &Source::Selection(&selection))
+        Some(events) => detections::run_stored(&inputs, &Source::Events(events.iter().collect()))?,
+        None => workspace::with_selection(state, &[], |selection| {
+            detections::run_stored(&inputs, &Source::Selection(&selection))
         })?,
     };
     crate::operations::check()?;
-    let value = Arc::new(serde_json::to_value(result).map_err(|e| e.to_string())?);
-    if value.get("complete").and_then(|v| v.as_bool()).unwrap_or(false) {
-        detections::remember(key, value.clone());
+    if result.metadata.get("complete").and_then(|v| v.as_bool()).unwrap_or(false) {
+        detections::remember(key, result.clone());
     }
-    Ok(value)
+    Ok(result)
+}
+
+#[cfg(test)]
+pub fn analysis_impl(
+    state: &AppState,
+    case_events: Option<&[Event]>,
+    force: bool,
+) -> Result<Arc<serde_json::Value>, String> {
+    Ok(Arc::new(stored_analysis(state, case_events, force)?.page(1, 0, 500, None, None)?))
+}
+
+/// Filtering selects related findings after the full universe has been correlated.
+/// Context members keep their original level and cannot become independent high-level findings.
+pub fn triage_page(
+    state: &AppState,
+    filters: Vec<Filter>,
+    case: Option<&[Event]>,
+    force: bool,
+    minimum: u8,
+    offset: usize,
+    limit: usize,
+    tactic: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    if !(1..=5).contains(&minimum) {
+        return Err("minimum_evidence must be between 1 and 5".into());
+    }
+    workspace::validate(&filters)?;
+    let full = stored_analysis(state, case, force)?;
+    if filters.is_empty() {
+        return full.page(minimum, offset, limit, None, tactic);
+    }
+    match case {
+        Some(events) => {
+            let prepared = query::prepare(&filters);
+            let mut ids = events.iter().filter(|e| prepared.iter().all(|f| query::matches(e, f))).map(|e| e.id);
+            full.page(minimum, offset, limit, Some(&mut ids), tactic)
+        }
+        None => workspace::with_selection(state, &filters, |selection| {
+            let mut ids = selection.iter().map(|e| e.id);
+            full.page(minimum, offset, limit, Some(&mut ids), tactic)
+        }),
+    }
+}
+
+pub fn timeline_impl(
+    state: &AppState,
+    filters: Vec<Filter>,
+    case: Option<&[Event]>,
+    minimum: u8,
+    start: i64,
+    end: i64,
+) -> Result<serde_json::Value, String> {
+    workspace::validate(&filters)?;
+    let full = stored_analysis(state, case, false)?;
+    if filters.is_empty() {
+        return full.timeline(minimum, start, end, None);
+    }
+    match case {
+        Some(events) => {
+            let prepared = query::prepare(&filters);
+            let mut ids = events.iter().filter(|e| prepared.iter().all(|f| query::matches(e, f))).map(|e| e.id);
+            full.timeline(minimum, start, end, Some(&mut ids))
+        }
+        None => workspace::with_selection(state, &filters, |selection| {
+            let mut ids = selection.iter().map(|e| e.id);
+            full.timeline(minimum, start, end, Some(&mut ids))
+        }),
+    }
+}
+
+#[tauri::command]
+pub async fn triage_timeline(
+    filters: Vec<Filter>,
+    case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
+    minimum_evidence: Option<u8>,
+    start: i64,
+    end: i64,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    crate::offload(move || {
+        let case = crate::case_cache::resolve(case_events, case_key)?;
+        timeline_impl(
+            app.state::<AppState>().inner(),
+            filters,
+            case.as_deref().map(|v| v.as_slice()),
+            minimum_evidence.unwrap_or(5),
+            start,
+            end,
+        )
+    })
+    .await?
+}
+
+pub fn project(
+    full: &serde_json::Value,
+    minimum: u8,
+    related: Option<&std::collections::HashSet<usize>>,
+) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let mut result = full.clone();
+    let all = full["detections"].as_array().cloned().unwrap_or_default();
+    let related_indices: std::collections::HashSet<_> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| {
+            related.is_none_or(|ids| {
+                d["event_ids"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|id| ids.contains(&(id.as_u64().unwrap_or(u64::MAX) as usize))))
+            })
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let visible: std::collections::HashSet<_> = related_indices
+        .iter()
+        .copied()
+        .filter(|&i| all[i]["evidence_level"].as_u64().unwrap_or(0) >= minimum as u64)
+        .collect();
+    let counts: Vec<_> = (1..=5)
+        .map(|level| related_indices.iter().filter(|&&i| all[i]["evidence_level"].as_u64() == Some(level)).count())
+        .collect();
+    let episodes: Vec<_> = full["episodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["detections"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|i| visible.contains(&(i.as_u64().unwrap_or(u64::MAX) as usize))))
+        })
+        .cloned()
+        .collect();
+    let mut included = visible.clone();
+    for e in &episodes {
+        for i in e["detections"].as_array().into_iter().flatten() {
+            included.insert(i.as_u64().unwrap_or(u64::MAX) as usize);
+        }
+    }
+    let mut remap = std::collections::HashMap::new();
+    let mut rows = Vec::new();
+    for (i, d) in all.iter().enumerate() {
+        if included.contains(&i) {
+            remap.insert(i, rows.len());
+            let mut row = d.clone();
+            row["context_only"] = json!(!visible.contains(&i));
+            rows.push(row);
+        }
+    }
+    let episodes: Vec<_> = episodes
+        .into_iter()
+        .map(|mut e| {
+            e["detections"] = json!(e["detections"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|i| remap.get(&(i.as_u64()? as usize)))
+                .copied()
+                .collect::<Vec<_>>());
+            e
+        })
+        .collect();
+    result["detections"] = json!(rows);
+    result["episodes"] = json!(episodes);
+    result["counts_by_level"] = json!(counts);
+    result["minimum_evidence"] = json!(minimum);
+    result["available_detections"] = json!(related_indices.len());
+    result["visible_detections"] = json!(visible.len());
+    result["analysis_scope"] = json!("full_universe");
+    result["display_filtered"] = json!(related.is_some());
+    let entities = full["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["evidence_level"].as_u64().unwrap_or(0) >= minimum as u64
+                && visible.iter().any(|&i| {
+                    all[i]["namespace"] == e["namespace"]
+                        && all[i]["entities"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|x| x["column"] == e["column"] && x["value"] == e["value"])
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    result["entities"] = json!(entities);
+    if let Some(tactics) = result["tactics"].as_array_mut() {
+        for t in tactics {
+            let matches: Vec<_> = visible
+                .iter()
+                .map(|&i| &all[i])
+                .filter(|d| d["tactics"].as_array().is_some_and(|a| a.contains(&t["key"])))
+                .collect();
+            t["count"] = json!(matches.len());
+            let mut techniques = std::collections::BTreeMap::<String, Value>::new();
+            for d in matches {
+                for a in d["attack"].as_array().into_iter().flatten() {
+                    let id = a["id"].as_str().unwrap_or_default().to_string();
+                    let entry = techniques.entry(id.clone()).or_insert(json!({"id":id,"name":a["name"],"count":0}));
+                    entry["count"] = json!(entry["count"].as_u64().unwrap_or(0) + 1);
+                }
+            }
+            t["techniques"] = json!(techniques.into_values().collect::<Vec<_>>());
+        }
+    }
+    result
+}
+
+/// Paginate episodes after correlation and classification, keeping every context member.
+pub fn paginate(mut result: serde_json::Value, offset: usize, limit: usize) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    if !(1..=500).contains(&limit) {
+        return Err("episode_limit deve estar entre 1 e 500".into());
+    }
+    let all = result["detections"].as_array().cloned().unwrap_or_default();
+    let total = result["episodes"].as_array().map_or(0, Vec::len);
+    let mut episodes: Vec<_> =
+        result["episodes"].as_array().into_iter().flatten().skip(offset).take(limit).cloned().collect();
+    let included: std::collections::HashSet<_> = episodes
+        .iter()
+        .flat_map(|e| e["detections"].as_array().into_iter().flatten())
+        .filter_map(|i| i.as_u64().map(|i| i as usize))
+        .collect();
+    let mut remap = std::collections::HashMap::new();
+    let mut rows = Vec::new();
+    for (i, d) in all.into_iter().enumerate() {
+        if included.contains(&i) {
+            remap.insert(i, rows.len());
+            rows.push(d);
+        }
+    }
+    for e in &mut episodes {
+        e["detections"] = json!(e["detections"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| remap.get(&(i.as_u64()? as usize)))
+            .copied()
+            .collect::<Vec<_>>());
+    }
+    result["page"] = json!({"episode_offset":offset,"episode_limit":limit,"total_episodes":total,"returned_episodes":episodes.len(),"next_offset":if offset.saturating_add(limit)<total {Some(offset+limit)}else{None}});
+    result["returned_detections"] = json!(rows.iter().filter(|d| d["context_only"] != true).count());
+    result["episodes"] = json!(episodes);
+    result["detections"] = json!(rows);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -85,13 +331,42 @@ pub async fn triage(
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
     force: Option<bool>,
+    minimum_evidence: Option<u8>,
+    episode_offset: Option<usize>,
+    episode_limit: Option<usize>,
+    tactic: Option<String>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     crate::offload(move || {
         let state = app.state::<AppState>();
         let events = crate::case_cache::resolve(case_events, case_key)?;
-        triage_impl(state.inner(), filters, events.as_deref().map(|v| v.as_slice()), force.unwrap_or(false))
-            .map(|v| (*v).clone())
+        triage_page(
+            state.inner(),
+            filters,
+            events.as_deref().map(|v| v.as_slice()),
+            force.unwrap_or(false),
+            minimum_evidence.unwrap_or(5),
+            episode_offset.unwrap_or(0),
+            episode_limit.unwrap_or(20),
+            tactic.as_deref(),
+        )
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn triage_episode(
+    analysis_id: String,
+    episode_id: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    crate::offload(move || {
+        detections::cached_analysis(&analysis_id).ok_or("Análise expirada; recarregue a triagem")?.episode_members(
+            &episode_id,
+            offset.unwrap_or(0),
+            limit.unwrap_or(100),
+        )
     })
     .await?
 }
@@ -105,6 +380,7 @@ pub struct ThreatExplanation {
     pub kind: String,
     pub snippet: String,
     pub normalized: bool,
+    pub provenance: crate::threats::Segment,
     pub attack: Vec<crate::attack::AttackRef>,
 }
 
@@ -115,6 +391,8 @@ pub struct RuleMatch {
     pub severity: String,
     pub kind: String,
     pub attack: Vec<crate::attack::AttackRef>,
+    #[serde(flatten)]
+    pub evidence: crate::evidence::Evidence,
 }
 
 #[derive(Serialize)]
@@ -126,10 +404,16 @@ pub struct EventInsights {
     pub decoded: Vec<entities::Decoded>,
     pub threats: Vec<ThreatExplanation>,
     pub rules: Vec<RuleMatch>,
+    pub normalization: crate::security_normalize::Normalized,
+    pub related_findings: Vec<serde_json::Value>,
+    pub related_findings_total: usize,
 }
 
 pub fn insights_impl(event: &Event) -> Result<EventInsights, String> {
-    let (action, outcome) = entities::action_outcome(event);
+    let settings = detections::load_settings();
+    let (_, normalization) = crate::security_normalize::normalize(event, &settings.mappings);
+    let action = normalization.get("action");
+    let outcome = normalization.get("outcome");
     let mut threats = Vec::new();
     if detections::load_settings().threats {
         if let Ok(catalog) = crate::threats::load_active() {
@@ -143,25 +427,25 @@ pub fn insights_impl(event: &Event) -> Result<EventInsights, String> {
                     kind: rule.kind.clone(),
                     snippet: hit.snippet,
                     normalized: hit.normalized,
-                    attack: crate::threats::attack_for(rule)
-                        .iter()
-                        .map(|t| crate::attack::reference(t, &[]))
-                        .collect(),
+                    provenance: hit.provenance,
+                    attack: crate::threats::attack_for(rule).iter().map(|t| crate::attack::reference(t, &[])).collect(),
                 });
             }
         }
     }
-    let rules = detections::ruleset()?
-        .rules
-        .iter()
-        .filter(|r| r.def.kind == "single" && r.matches(event))
-        .take(20)
-        .map(|r| RuleMatch {
-            id: r.def.id.clone(),
-            name: r.def.name.clone(),
-            severity: r.def.severity.clone(),
-            kind: r.origin.to_string(),
-            attack: r.def.attack.iter().map(|t| crate::attack::reference(t, &r.def.tactics)).collect(),
+    let set = detections::ruleset()?;
+    let input = detections::Inputs { rules: &set, catalog: None, settings: &settings };
+    let assessed = detections::run(&input, &Source::Events(vec![event]))?;
+    let rules = assessed
+        .detections
+        .into_iter()
+        .map(|d| RuleMatch {
+            id: d.rule,
+            name: d.name,
+            severity: d.severity,
+            kind: d.origin,
+            attack: d.attack,
+            evidence: d.evidence,
         })
         .collect();
     Ok(EventInsights {
@@ -172,12 +456,44 @@ pub fn insights_impl(event: &Event) -> Result<EventInsights, String> {
         decoded: entities::decode_payloads(event),
         threats,
         rules,
+        normalization,
+        related_findings: Vec::new(),
+        related_findings_total: 0,
     })
 }
 
 #[tauri::command]
-pub async fn event_insights(event: Event) -> Result<EventInsights, String> {
-    crate::offload(move || insights_impl(&event)).await?
+pub async fn event_insights(
+    event: Event,
+    case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
+    app: AppHandle,
+) -> Result<EventInsights, String> {
+    crate::offload(move || {
+        let case = crate::case_cache::resolve(case_events, case_key)?;
+        insights_in_context(app.state::<AppState>().inner(), &event, case.as_deref().map(|v| v.as_slice()))
+    })
+    .await?
+}
+
+pub fn insights_in_context(state: &AppState, event: &Event, case: Option<&[Event]>) -> Result<EventInsights, String> {
+    let mut result = insights_impl(event)?;
+    let full = stored_analysis(state, case, false)?;
+    let reference = crate::security_normalize::event_ref(event);
+    (result.related_findings, result.related_findings_total) = full.related_page(&reference)?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn normalization_preview(
+    event: Event,
+    mappings: Vec<crate::security_normalize::SourceMapping>,
+) -> Result<serde_json::Value, String> {
+    crate::security_normalize::validate_mappings(&mappings)?;
+    let (_, normalized) = crate::security_normalize::normalize(&event, &mappings);
+    let mut value = serde_json::to_value(normalized).map_err(|e| e.to_string())?;
+    crate::workspace::redact_value(&mut value);
+    Ok(value)
 }
 
 #[derive(Serialize)]
@@ -189,7 +505,12 @@ pub struct RuleInfo {
     pub kind: String,
     pub origin: String,
     pub enabled: bool,
+    pub retired: bool,
+    pub evidence_level: u8,
+    pub evidence_label: String,
     pub attack: Vec<crate::attack::AttackRef>,
+    pub evidence: crate::evidence::Policy,
+    pub provenance: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -214,7 +535,12 @@ pub fn rules_impl() -> Result<RulesOverview, String> {
             kind: r.def.kind.clone(),
             origin: r.origin.to_string(),
             enabled: r.enabled,
+            retired: !r.def.enabled,
+            evidence_level: r.def.evidence.assessed_level(),
+            evidence_label: crate::evidence::label(r.def.evidence.assessed_level()).into(),
             attack: r.def.attack.iter().map(|t| crate::attack::reference(t, &r.def.tactics)).collect(),
+            evidence: r.def.evidence.clone(),
+            provenance: r.def.provenance.clone(),
         })
         .collect();
     rules.sort_by(|a, b| a.origin.cmp(&b.origin).then(a.name.cmp(&b.name)));
@@ -262,35 +588,62 @@ pub fn sigma_import_impl(paths: Vec<String>) -> Result<SigmaImport, String> {
             files.push(path);
         }
     }
-    let (mut imported, mut rules, mut failed) = (0, 0, Vec::new());
-    for file in files {
-        crate::operations::check()?;
-        let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let text = match std::fs::read_to_string(&file) {
-            Ok(t) => t,
-            Err(e) => {
-                failed.push(format!("{name}: {e}"));
-                continue;
-            }
-        };
-        match crate::sigma::convert_text(&text) {
-            Ok(found) => {
-                let mut destination = target.join(&name);
-                let mut n = 1;
-                while destination.exists() && std::fs::read_to_string(&destination).ok().as_deref() != Some(text.as_str()) {
-                    destination = target.join(format!("{}-{n}.yml", name.trim_end_matches(".yml").trim_end_matches(".yaml")));
-                    n += 1;
-                }
-                std::fs::write(&destination, &text).map_err(|e| e.to_string())?;
-                imported += 1;
-                rules += found.len();
-            }
-            Err(e) => failed.push(format!("{name}: {e}")),
+    let mut prepared = Vec::new();
+    let mut unique = std::collections::HashSet::new();
+    let mut texts = Vec::new();
+    for file in crate::sigma::rule_files(&target) {
+        let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
+        if unique.insert(text.clone()) {
+            texts.push(text);
         }
     }
+    let previous = crate::sigma::load_dir(&target).0.len();
+    for file in files {
+        crate::operations::check()?;
+        let name = file.file_name().ok_or("Arquivo sem nome")?.to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(&file).map_err(|e| format!("{name}: {e}"))?;
+        if unique.insert(text.clone()) {
+            texts.push(text.clone());
+            prepared.push((name, text));
+        }
+    }
+    if prepared.is_empty() {
+        return Ok(SigmaImport { imported: 0, rules: 0, failed: vec![] });
+    }
+    // Resolve dependencies across the entire batch before publishing any file.
+    let found = crate::sigma::convert_texts(texts.iter().map(String::as_str))?;
+    let mut published = Vec::new();
+    let publish = (|| -> Result<(), String> {
+        for (name, text) in &prepared {
+            crate::operations::check()?;
+            let mut destination = target.join(name);
+            let mut n = 1;
+            while destination.exists() {
+                destination =
+                    target.join(format!("{}-{n}.yml", name.trim_end_matches(".yml").trim_end_matches(".yaml")));
+                n += 1;
+            }
+            let pending = destination.with_extension("pending");
+            std::fs::write(&pending, text).map_err(|e| e.to_string())?;
+            if let Err(e) = std::fs::rename(&pending, &destination) {
+                let _ = std::fs::remove_file(&pending);
+                return Err(e.to_string());
+            }
+            published.push(destination);
+        }
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        for path in published {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    let imported = prepared.len();
+    let rules = found.len().saturating_sub(previous);
+    let failed = Vec::new();
     detections::invalidate();
     detections::clear_cache();
-    failed.truncate(200);
     Ok(SigmaImport { imported, rules, failed })
 }
 

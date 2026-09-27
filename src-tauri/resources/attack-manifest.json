@@ -1,0 +1,8 @@
+{
+  "version": "19.2",
+  "source": "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/enterprise-attack/enterprise-attack-19.2.json",
+  "source_sha256": "dc1639caa5501d720e280cf1cbd8fbe009884a0c9b3e6e9ed9d0c25166c3d8f4",
+  "bundle_sha256": "8b8b13516184b0ef999fd8d2b237c2ae344a06a7d2513e124ea64e70fd361eff",
+  "objects": 1033,
+  "scope": "Enterprise tactics, techniques and revocation relationships; STIX objects preserved verbatim."
+}

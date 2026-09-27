@@ -72,6 +72,7 @@ impl Event {
     pub fn col_str(&self, col: &str) -> Option<String> {
         match col {
             "id" => Some(self.id.to_string()),
+            "event_ref" => Some(crate::security_normalize::event_ref(self)),
             "timestamp" => self.timestamp.map(ts_to_iso),
             "source" => Some(self.source.clone()),
             "level" => Some(self.level.clone()),
@@ -96,6 +97,7 @@ impl Event {
     pub fn col_ref(&self, col: &str) -> Option<Cow<'_, str>> {
         match col {
             "id" => Some(Cow::Owned(self.id.to_string())),
+            "event_ref" => Some(Cow::Owned(crate::security_normalize::event_ref(self))),
             "timestamp" => self.timestamp.map(|t| Cow::Owned(ts_to_iso(t))),
             "source" => Some(Cow::Borrowed(self.source.as_str())),
             "level" => Some(Cow::Borrowed(self.level.as_str())),

@@ -22,6 +22,7 @@ window.CaseReport = (() => {
   function filename(c,date=new Date()) { const slug=String(c?.name||'caso').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,100)||'caso';return `relatorio-${slug}-${date.toISOString().slice(0,10)}.pdf`; }
   async function render(c,{signal,progress=()=>{}}={}) {
     if(!c)throw Error('Selecione um Caso.');check(signal);progress('Preparando a timeline…');
+    c = window.EvidenceUI ? EvidenceUI.redact(structuredClone(c)) : c;
     const fonts=await prepare();check(signal);
     const timeline=await CaseTimeline.rows(c,()=>true,{signal,limit:10000,maxChars:8000000,includeUndated:true});
     const items=c.items||[], trails=c.caseTrails||[], byId=new Map(items.map((item,i)=>[item.id,{item,ref:`I${String(i+1).padStart(3,'0')}`} ]));
@@ -123,6 +124,7 @@ window.CaseReport = (() => {
       ensure(28);pageMap.set(item.id,pdf.getNumberOfPages());await heading(`${ref} · ${item.label||'Item do Caso'}`,{level:2});
       const rows=item.rows||[], sources=[...new Set(rows.map(row=>row.source).filter(Boolean))];
       await paragraph(`${rows.length} registros preservados${sources.length?` · ${sources.slice(0,6).join(', ')}${sources.length>6?` e mais ${sources.length-6} origens`:''}`:''}`,{size:8,color:[108,114,127]});
+      if(item.detection)await paragraph(window.EvidenceUI?.report(item)||"",{size:8.5});
       const narrative=CaseContent.narrative(item);await paragraph(narrative.summary,{bold:true});await paragraph(narrative.details);await gallery(item);y+=4;
     }
     const associated=new Set();

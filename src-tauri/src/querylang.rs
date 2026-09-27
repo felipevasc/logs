@@ -714,6 +714,7 @@ fn any_value(ev: &Event, test: &dyn Fn(&str) -> bool) -> bool {
 /// shared by every term and rule evaluated against the same event.
 pub struct Ctx<'a> {
     pub ev: &'a Event,
+    object_only: bool,
     fields: std::cell::OnceCell<[Option<Cow<'a, str>>; 19]>,
     fallbacks: [std::cell::OnceCell<Option<Cow<'a, str>>>; 19],
     action: std::cell::OnceCell<(Option<&'static str>, Option<&'static str>)>,
@@ -724,6 +725,7 @@ impl<'a> Ctx<'a> {
     pub fn new(ev: &'a Event) -> Self {
         Ctx {
             ev,
+            object_only: false,
             fields: std::cell::OnceCell::new(),
             fallbacks: Default::default(),
             action: std::cell::OnceCell::new(),
@@ -769,6 +771,12 @@ impl<'a> Ctx<'a> {
     }
     fn field(&self, field: &Field) -> Option<Cow<'a, str>> {
         let name = field.name.as_str();
+        if self.object_only {
+            return crate::security_normalize::field_value(self.ev, name).map(|value| match value {
+                Value::String(s) => Cow::Borrowed(s.as_str()),
+                other => Cow::Owned(other.to_string()),
+            });
+        }
         if let Some(role) = name.strip_prefix('@').and_then(|_| entities::role_of_column(name)) {
             if !self.ev.fields.contains_key(name) {
                 return self.role(role).map(|v| Cow::Owned(v.to_string()));
@@ -776,6 +784,9 @@ impl<'a> Ctx<'a> {
         }
         if let Some(found) = self.ev.col_ref(name) {
             return Some(found);
+        }
+        if let Some(value) = crate::security_normalize::field_value(self.ev, name) {
+            return Some(match value { Value::String(s) => Cow::Borrowed(s), other => Cow::Owned(other.to_string()) });
         }
         if field.ci {
             if let Some((_, value)) = self.ev.fields.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
@@ -788,7 +799,7 @@ impl<'a> Ctx<'a> {
         field.role.and_then(|role| self.role(role)).map(|v| Cow::Owned(v.to_string()))
     }
     fn number(&self, field: &Field) -> Option<f64> {
-        if field.name == "timestamp" {
+        if field.name == "timestamp" && !self.object_only {
             return self.ev.timestamp.map(|t| t as f64);
         }
         let text = self.field(field)?;
@@ -801,6 +812,15 @@ impl<'a> Ctx<'a> {
 }
 
 impl Expr {
+    /// An array member is an object, not an event. Names such as `Name` and
+    /// `timestamp` must resolve inside that same object, never to event metadata.
+    pub fn matches_object(&self, fields: &serde_json::Map<String, Value>) -> bool {
+        let mut member = Event::empty();
+        member.fields = fields.clone();
+        let mut ctx = Ctx::new(&member);
+        ctx.object_only = true;
+        self.matches_ctx(&ctx)
+    }
     pub fn matches(&self, ev: &Event) -> bool {
         self.matches_ctx(&Ctx::new(ev))
     }

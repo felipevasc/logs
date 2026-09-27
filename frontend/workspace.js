@@ -411,6 +411,7 @@
     for(const card of content.querySelectorAll("[data-item-index]")){
       const index = +card.dataset.itemIndex;
       const item = items[index];
+      window.EvidenceUI?.mountCase(card, item);
       if(item?.attachments?.length)CaseContent.mountAttachments(card.querySelector("[data-item-images]"),item);
       card.oncontextmenu = (e) => {
         e.preventDefault();
@@ -481,7 +482,7 @@
   }
   function report() {
     const c = activeCase();
-    return `# ${c?.name || "Investigação"}\n\n${synthesisMarkdown(c)}${(c?.items || []).map(it => `## ${it.label}\n\n${Object.values(CaseContent.narrative(it)).filter(Boolean).join("\n\n")}\n\n${it.rows?.length || 0} eventos preservados.\n\n${(it.rows || []).map(e => `- ${fmtTsFull(e.timestamp)} · ${e.source} · ${e.message.replaceAll("\n", " ")}\n  Referência: ${e.event_ref || e.id}`).join("\n")}\n\nFiltros: ${JSON.stringify(it.sourceFilters || [])}`).join("\n\n")}`;
+    return `# ${c?.name || "Investigação"}\n\n${synthesisMarkdown(c)}${(c?.items || []).map(it => `## ${it.label}\n\n${Object.values(CaseContent.narrative(it)).filter(Boolean).join("\n\n")}\n\n${window.EvidenceUI?.redact(window.EvidenceUI.report(it)) || ""}\n\n${it.rows?.length || 0} eventos preservados.\n\n${(it.rows || []).map(e => `- ${fmtTsFull(e.timestamp)} · ${e.source} · ${e.message.replaceAll("\n", " ")}\n  Referência: ${e.event_ref || e.id}`).join("\n")}\n\nFiltros: ${JSON.stringify(it.sourceFilters || [])}`).join("\n\n")}`;
   }
   function openExport() { $("#ws-export-modal").hidden = false; $("#ws-export-kind").focus(); $("#ws-export-kind").dispatchEvent(new Event("change")); $("#ws-export-scope").textContent = `${fmtNum(state.total)} eventos no recorte atual. A exportação de eventos inclui todos os resultados.`; }
   async function exportFile() {

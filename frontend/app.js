@@ -4260,6 +4260,8 @@ function buildEventRow(ev) {
 
   for (const col of state.visibleCols) {
     const td = el("td");
+    const originalValue = col === "level" ? ev.level : cellValue(ev, col);
+    const displayValue = window.EvidenceUI?.redact({ [col]: originalValue })[col] ?? originalValue;
     if (col === "level") {
       const wrap = el("span", "lv-cell");
       const dot = el("span", "lv-dot");
@@ -4270,23 +4272,23 @@ function buildEventRow(ev) {
       td.appendChild(wrap);
     } else if (col === "timestamp") {
       td.className = "t-mono t-ts";
-      td.textContent = cellValue(ev, col);
+      td.textContent = displayValue;
     } else if (col === "code") {
       td.className = "t-code";
-      td.textContent = cellValue(ev, col);
+      td.textContent = displayValue;
     } else if (col === "name") {
       td.className = "t-name";
-      td.textContent = cellValue(ev, col);
+      td.textContent = displayValue;
     } else if (col === "message") {
       td.className = "t-msg";
-      const pivots = !quickRe && window.EntityMenu?.highlight(ev.message);
-      if (quickRe) td.innerHTML = esc(ev.message).replace(quickRe, "<mark>$1</mark>");
+      const pivots = !quickRe && window.EntityMenu?.highlight(displayValue);
+      if (quickRe) td.innerHTML = esc(displayValue).replace(quickRe, "<mark>$1</mark>");
       else if (pivots) td.innerHTML = pivots;
-      else td.textContent = ev.message;
+      else td.textContent = displayValue;
     } else {
-      td.textContent = cellValue(ev, col);
+      td.textContent = displayValue;
     }
-    td.title = col === "level" ? ev.level : cellValue(ev, col);
+    td.title = displayValue;
     td.oncontextmenu = (e) => {
       e.preventDefault();
       if (!state.selectedEventRows?.has(ev.id)) {
@@ -4663,7 +4665,7 @@ function showDetail(ev, sourceSpec = null) {
   if (ev.name) badges.appendChild(el("span", "badge code", ev.name));
 
   const rows = [];
-  const push = (k, v, mono, filterValue = v) => rows.push({ k, v: v ?? "", mono, filterValue });
+  const push = (k, v, mono, filterValue = v) => rows.push({ k, v: window.EvidenceUI ? EvidenceUI.redact({ [k]: v ?? "" })[k] : v ?? "", mono, filterValue });
   push("timestamp", fmtTsFull(ev.timestamp), true, ev.timestamp);
   push("source", ev.source);
   push("level", ev.level);
@@ -4715,8 +4717,8 @@ function showDetail(ev, sourceSpec = null) {
   }
   $("#pane-overview").innerHTML = "";
   $("#pane-overview").appendChild(kv);
-  $("#pane-json").innerHTML = highlightJson(ev);
-  $("#pane-raw").textContent = ev.raw || "(sem conteúdo bruto)";
+  $("#pane-json").innerHTML = highlightJson(window.EvidenceUI ? EvidenceUI.redact(ev) : ev);
+  $("#pane-raw").textContent = (window.EvidenceUI ? EvidenceUI.redact(ev.raw) : ev.raw) || "(sem conteúdo bruto)";
 
   $("#drawer").hidden = false;
   $("#drawer-scrim").hidden = false;

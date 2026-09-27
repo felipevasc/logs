@@ -79,8 +79,8 @@ pub(crate) fn prepare_with_threat_catalog(
                         .ok()
                     })
                     .flatten(),
-                set: matches!(f.op.as_str(), "in" | "not_in")
-                    .then(|| list_values(&f.value).map(str::to_lowercase).collect()),
+                set: if f.op == "in_exact" { Some(f.value.lines().filter(|v| !v.is_empty()).map(str::to_string).collect()) }
+                    else { matches!(f.op.as_str(), "in" | "not_in").then(|| list_values(&f.value).map(str::to_lowercase).collect()) },
                 nets: if matches!(f.op.as_str(), "cidr" | "not_cidr") {
                     list_values(&f.value)
                         .flat_map(|v| v.split_whitespace())
@@ -179,6 +179,7 @@ pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
     let col = f.column.as_str();
     let needle = pf.needle_lower.as_str();
     if let Some(set) = &pf.set {
+        if f.op == "in_exact" { return ev.col_ref(col).is_some_and(|v| set.contains(v.as_ref())); }
         let hit = ev
             .col_ref(col)
             .is_some_and(|v| set.contains(&v.trim().to_lowercase()));

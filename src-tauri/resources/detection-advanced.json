@@ -1,0 +1,502 @@
+{
+  "version": 3,
+  "rules": [
+    {
+      "id": "attempt.reverse-shell.request",
+      "name": "Payload completo de shell reverso em parâmetro de comando da requisição",
+      "description": "Payload completo de shell reverso em parâmetro de comando da requisição",
+      "severity": "high",
+      "attack": [
+        "T1190",
+        "T1059.004"
+      ],
+      "kind": "single",
+      "by": [],
+      "evidence": {
+        "level": 5,
+        "claim": "attempt",
+        "rationale": "Payload completo de shell reverso em parâmetro de comando da requisição: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1190/",
+        "https://attack.mitre.org/techniques/T1059/004/"
+      ],
+      "where": "_sec.action:http_request _sec.reverse_shell_request:true"
+    },
+    {
+      "id": "attempt.reverse-shell.process",
+      "name": "Comando completo de shell reverso registrado para execução",
+      "description": "Comando completo de shell reverso registrado para execução",
+      "severity": "high",
+      "attack": [
+        "T1059.004",
+        "T1071"
+      ],
+      "kind": "single",
+      "by": [],
+      "evidence": {
+        "level": 5,
+        "claim": "attempt",
+        "rationale": "Comando completo de shell reverso registrado para execução: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1059/004/",
+        "https://attack.mitre.org/techniques/T1071/"
+      ],
+      "where": "_sec.action:(process_start OR script_execution) _sec.reverse_shell:true"
+    },
+    {
+      "id": "chain.oauth.grant-mail",
+      "name": "Consentimento OAuth usado para encaminhar e ocultar mensagens",
+      "description": "Consentimento OAuth usado para encaminhar e ocultar mensagens",
+      "severity": "high",
+      "attack": [
+        "T1098.003",
+        "T1114.003"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.application",
+        "_sec.grant"
+      ],
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Consentimento OAuth usado para encaminhar e ocultar mensagens: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1098/003/",
+        "https://attack.mitre.org/techniques/T1114/003/"
+      ],
+      "window": "24h",
+      "steps": [
+        {
+          "where": "_sec.action:oauth_consent _sec.outcome:success oauth.scope:/(Mail.ReadWrite|Mail.ReadWrite.All|full_access_as_app)/"
+        },
+        {
+          "where": "_sec.action:mail_rule_create _sec.outcome:success mail.forward.external:true mail.rule.hide:true"
+        }
+      ]
+    },
+    {
+      "id": "chain.oauth.token-exfil",
+      "name": "Token OAuth usado para ler e transferir o mesmo objeto sensível",
+      "description": "Token OAuth usado para ler e transferir o mesmo objeto sensível",
+      "severity": "high",
+      "attack": [
+        "T1528",
+        "T1537"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.application",
+        "_sec.token",
+        "_sec.resource"
+      ],
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Token OAuth usado para ler e transferir o mesmo objeto sensível: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1528/",
+        "https://attack.mitre.org/techniques/T1537/"
+      ],
+      "window": "15m",
+      "steps": [
+        {
+          "where": "_sec.action:object_read _sec.outcome:success data.classification:sensitive"
+        },
+        {
+          "where": "_sec.action:object_transfer _sec.outcome:success network.direction:outbound destination.external:true"
+        }
+      ]
+    },
+    {
+      "id": "chain.cicd.secret-transfer",
+      "name": "Alteração de workflow usada em execução que lê e envia o mesmo segredo",
+      "description": "Alteração de workflow usada em execução que lê e envia o mesmo segredo",
+      "severity": "high",
+      "attack": [
+        "T1195.002",
+        "T1552.001",
+        "T1048"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.repository",
+        "_sec.revision",
+        "_sec.secret"
+      ],
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Alteração de workflow usada em execução que lê e envia o mesmo segredo: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1195/002/",
+        "https://attack.mitre.org/techniques/T1552/001/",
+        "https://attack.mitre.org/techniques/T1048/"
+      ],
+      "window": "15m",
+      "steps": [
+        {
+          "where": "_sec.action:workflow_change _sec.outcome:success workflow.diff:/secrets\\.[A-Z_]+/ workflow.diff:/(curl|wget|Invoke-WebRequest)/",
+          "by": [
+            "_sec.repository",
+            "_sec.revision",
+            "_sec.secret"
+          ]
+        },
+        {
+          "where": "_sec.action:secret_access _sec.outcome:success _sec.run:*"
+        },
+        {
+          "where": "_sec.action:secret_transfer _sec.outcome:success _sec.run:* destination.external:true network.direction:outbound"
+        }
+      ],
+      "bindings": [
+        {
+          "field": "_sec.run",
+          "steps": [
+            1,
+            2
+          ]
+        }
+      ]
+    },
+    {
+      "id": "chain.cicd.publish-token",
+      "name": "Token de publicação alterando proteção e publicando artefato divergente",
+      "description": "Token de publicação alterando proteção e publicando artefato divergente",
+      "severity": "high",
+      "attack": [
+        "T1552.001",
+        "T1195.002"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.repository",
+        "_sec.token"
+      ],
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Token de publicação alterando proteção e publicando artefato divergente: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1552/001/",
+        "https://attack.mitre.org/techniques/T1195/002/"
+      ],
+      "window": "15m",
+      "steps": [
+        {
+          "where": "_sec.action:repository_protection_disable _sec.outcome:success"
+        },
+        {
+          "where": "_sec.action:package_publish _sec.outcome:success artifact.attestation.mismatch:true"
+        }
+      ]
+    },
+    {
+      "id": "chain.ad.rbcd-use",
+      "name": "Delegação RBCD adicionada e utilizada pelo principal beneficiado",
+      "description": "Delegação RBCD adicionada e utilizada pelo principal beneficiado",
+      "severity": "high",
+      "attack": [
+        "T1098",
+        "T1550.003"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.beneficiary",
+        "_sec.resource_spn"
+      ],
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Delegação RBCD adicionada e utilizada pelo principal beneficiado: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1098/",
+        "https://attack.mitre.org/techniques/T1550/003/"
+      ],
+      "window": "24h",
+      "steps": [
+        {
+          "where": "_sec.action:directory_change _sec.outcome:success AttributeLDAPDisplayName:msDS-AllowedToActOnBehalfOfOtherIdentity delegation.operation:add",
+          "by": [
+            "_sec.beneficiary",
+            "_sec.resource_spn"
+          ]
+        },
+        {
+          "where": "_sec.action:service_ticket _sec.outcome:success kerberos.delegated:true",
+          "by": [
+            "_sec.delegator",
+            "_sec.resource_spn"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "chain.ad.certificate-auth",
+      "name": "Certificado com identidade divergente seguido de autenticação com o mesmo certificado",
+      "description": "Certificado com identidade divergente seguido de autenticação com o mesmo certificado",
+      "severity": "high",
+      "attack": [
+        "T1649",
+        "T1550"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.certificate"
+      ],
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Certificado com identidade divergente seguido de autenticação com o mesmo certificado: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1649/",
+        "https://attack.mitre.org/techniques/T1550/"
+      ],
+      "window": "24h",
+      "steps": [
+        {
+          "where": "_sec.action:certificate_issue _sec.outcome:success _sec.certificate_identity_mismatch:true"
+        },
+        {
+          "where": "_sec.action:auth_success _sec.outcome:success authentication.method:certificate"
+        }
+      ],
+      "unless": "certificate.enrollment_agent_authorized:true"
+    },
+    {
+      "id": "chain.ad.shadow-key-auth",
+      "name": "Chave de autenticação adicionada ao diretório e utilizada pelo mesmo alvo",
+      "description": "Chave de autenticação adicionada ao diretório e utilizada pelo mesmo alvo",
+      "severity": "high",
+      "attack": [
+        "T1098",
+        "T1550"
+      ],
+      "kind": "sequence",
+      "by": [
+        "key.id",
+        "target.id"
+      ],
+      "evidence": {
+        "level": 4,
+        "claim": "activity",
+        "rationale": "Chave de autenticação adicionada ao diretório e utilizada pelo mesmo alvo: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1098/",
+        "https://attack.mitre.org/techniques/T1550/"
+      ],
+      "window": "24h",
+      "steps": [
+        {
+          "where": "_sec.action:directory_change _sec.outcome:success AttributeLDAPDisplayName:msDS-KeyCredentialLink key.operation:add"
+        },
+        {
+          "where": "_sec.action:auth_success _sec.outcome:success authentication.method:keytrust"
+        }
+      ]
+    },
+    {
+      "id": "chain.lateral.windows",
+      "name": "Logon remoto, transferência e execução suspeita vinculados ao mesmo logon e artefato",
+      "description": "Logon remoto, transferência e execução suspeita vinculados ao mesmo logon e artefato",
+      "severity": "high",
+      "attack": [
+        "T1021.002",
+        "T1569.002"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.logon",
+        "_sec.principal"
+      ],
+      "evidence": {
+        "level": 5,
+        "claim": "execution",
+        "rationale": "Logon remoto, transferência e execução suspeita vinculados ao mesmo logon e artefato: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1021/002/",
+        "https://attack.mitre.org/techniques/T1569/002/"
+      ],
+      "window": "15m",
+      "steps": [
+        {
+          "where": "_sec.action:(auth_success OR logon) _sec.outcome:success LogonType:(3 OR 10) _sec.source_address:*",
+          "by": [
+            "_sec.logon",
+            "_sec.principal"
+          ]
+        },
+        {
+          "where": "_sec.action:file_create _sec.outcome:success share.name:/(ADMIN\\$|C\\$)/ _sec.artifact:*"
+        },
+        {
+          "where": "_sec.action:process_start _sec.outcome:success _sec.reverse_shell:true _sec.artifact:*"
+        }
+      ],
+      "bindings": [
+        {
+          "field": "_sec.artifact",
+          "steps": [
+            1,
+            2
+          ]
+        }
+      ]
+    },
+    {
+      "id": "chain.lateral.ssh",
+      "name": "Sessão SSH seguida de transferência e execução do artefato com comportamento de abuso",
+      "description": "Sessão SSH seguida de transferência e execução do artefato com comportamento de abuso",
+      "severity": "high",
+      "attack": [
+        "T1021.004",
+        "T1105"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.remote_session",
+        "_sec.principal"
+      ],
+      "evidence": {
+        "level": 5,
+        "claim": "execution",
+        "rationale": "Sessão SSH seguida de transferência e execução do artefato com comportamento de abuso: condições específicas e vínculos registrados nos eventos.",
+        "required": [],
+        "missing": [
+          "A autorização da atividade não é determinada pelo log."
+        ],
+        "benign": [
+          "Automação administrativa autorizada; conferir autorização e contexto."
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1021/004/",
+        "https://attack.mitre.org/techniques/T1105/"
+      ],
+      "window": "15m",
+      "steps": [
+        {
+          "where": "_sec.action:(auth_success OR logon) _sec.outcome:success service.name:sshd"
+        },
+        {
+          "where": "_sec.action:file_create _sec.outcome:success _sec.artifact:*"
+        },
+        {
+          "where": "_sec.action:process_start _sec.outcome:success _sec.reverse_shell:true _sec.artifact:*"
+        }
+      ],
+      "bindings": [
+        {
+          "field": "_sec.artifact",
+          "steps": [
+            1,
+            2
+          ]
+        }
+      ]
+    }
+  ]
+}

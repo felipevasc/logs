@@ -26,6 +26,26 @@ use crate::event_preview::preview;
 use crate::event_preview::PREVIEW_BYTES;
 const BUILTIN: &str = include_str!("../resources/threat-rules.json");
 
+/// Explicit review, independent of severity. Other patterns remain available
+/// for search and as correlation components; they do not become standalone suspicions.
+pub(crate) fn reviewed_indication(rule: &Rule) -> bool {
+    static IDS: std::sync::OnceLock<std::collections::HashMap<String, (String, String)>> = std::sync::OnceLock::new();
+    let reviewed = IDS.get_or_init(|| {
+        let value: serde_json::Value = serde_json::from_str(include_str!("../resources/threat-evidence-policy.json"))
+            .expect("bundled evidence policy");
+        let ids: HashSet<_> =
+            value["reviewed_ids"].as_array().expect("reviewed ids").iter().filter_map(|v| v.as_str()).collect();
+        let builtins: CatalogFile = serde_json::from_str(BUILTIN).expect("bundled catalog");
+        builtins
+            .rules
+            .into_iter()
+            .filter(|r| ids.contains(r.id.as_str()))
+            .map(|r| (r.id, (r.kind, r.pattern)))
+            .collect()
+    });
+    reviewed.get(&rule.id).is_some_and(|(kind, pattern)| kind == &rule.kind && pattern == &rule.pattern)
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
@@ -68,13 +88,8 @@ fn compile(bytes: &[u8]) -> Result<Arc<CompiledCatalog>, String> {
     if bytes.len() > CATALOG_BYTES {
         return Err("O catálogo excede 4 MiB.".into());
     }
-    let file: CatalogFile =
-        serde_json::from_slice(bytes).map_err(|e| format!("Catálogo JSON inválido: {e}"))?;
-    if file.version != 1
-        || file.name.trim().is_empty()
-        || file.name.len() > 160
-        || file.rules.len() > 1000
-    {
+    let file: CatalogFile = serde_json::from_slice(bytes).map_err(|e| format!("Catálogo JSON inválido: {e}"))?;
+    if file.version != 1 || file.name.trim().is_empty() || file.name.len() > 160 || file.rules.len() > 1000 {
         return Err("O catálogo requer version: 1, nome e no máximo 1.000 regras.".into());
     }
     let mut ids = HashSet::new();
@@ -84,10 +99,7 @@ fn compile(bytes: &[u8]) -> Result<Arc<CompiledCatalog>, String> {
         operations::check()?;
         if rule.id.is_empty()
             || rule.id.len() > 100
-            || !rule
-                .id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+            || !rule.id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
             || !ids.insert(rule.id.clone())
         {
             return Err(format!("ID de regra inválido ou duplicado: {}", rule.id));
@@ -103,14 +115,11 @@ fn compile(bytes: &[u8]) -> Result<Arc<CompiledCatalog>, String> {
             || !matches!(rule.kind.as_str(), "attempt" | "response" | "indicator")
             || rule.references.len() > 10
         {
-            return Err(format!(
-                "Metadados ou limites inválidos na regra {}.",
-                rule.id
-            ));
+            return Err(format!("Metadados ou limites inválidos na regra {}.", rule.id));
         }
         for reference in &rule.references {
-            let url = reqwest::Url::parse(reference)
-                .map_err(|_| format!("Referência inválida na regra {}.", rule.id))?;
+            let url =
+                reqwest::Url::parse(reference).map_err(|_| format!("Referência inválida na regra {}.", rule.id))?;
             if reference.len() > 2048
                 || !matches!(url.scheme(), "http" | "https")
                 || url.host_str().is_none()
@@ -129,10 +138,7 @@ fn compile(bytes: &[u8]) -> Result<Arc<CompiledCatalog>, String> {
             .build()
             .map_err(|e| format!("Regex inválida ou complexa na regra {}: {e}", rule.id))?;
         if regex.is_match(b"") {
-            return Err(format!(
-                "A regra {} também corresponde a texto vazio. Use um padrão específico.",
-                rule.id
-            ));
+            return Err(format!("A regra {} também corresponde a texto vazio. Use um padrão específico.", rule.id));
         }
         regexes.push(regex);
         if rule.enabled {
@@ -145,12 +151,7 @@ fn compile(bytes: &[u8]) -> Result<Arc<CompiledCatalog>, String> {
         .dfa_size_limit(16 * 1024 * 1024)
         .build()
         .map_err(|e| format!("O conjunto de regras excedeu o orçamento de compilação: {e}"))?;
-    Ok(Arc::new(CompiledCatalog {
-        file,
-        regexes,
-        set,
-        enabled,
-    }))
+    Ok(Arc::new(CompiledCatalog { file, regexes, set, enabled }))
 }
 
 fn path() -> PathBuf {
@@ -158,22 +159,17 @@ fn path() -> PathBuf {
 }
 fn load_path(path: &Path) -> Result<Arc<CompiledCatalog>, String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Não foi possível preparar o catálogo: {e}"))?;
+        fs::create_dir_all(parent).map_err(|e| format!("Não foi possível preparar o catálogo: {e}"))?;
     }
     if !path.exists() {
-        let mut file =
-            tempfile::NamedTempFile::new_in(path.parent().ok_or("Pasta do catálogo inválida.")?)
-                .map_err(|e| format!("Não foi possível preparar o catálogo: {e}"))?;
+        let mut file = tempfile::NamedTempFile::new_in(path.parent().ok_or("Pasta do catálogo inválida.")?)
+            .map_err(|e| format!("Não foi possível preparar o catálogo: {e}"))?;
         file.write_all(BUILTIN.as_bytes())
             .and_then(|_| file.as_file().sync_all())
             .map_err(|e| format!("Não foi possível criar o catálogo: {e}"))?;
         if let Err(error) = file.persist_noclobber(path) {
             if error.error.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(format!(
-                    "Não foi possível criar o catálogo: {}",
-                    error.error
-                ));
+                return Err(format!("Não foi possível criar o catálogo: {}", error.error));
             }
         }
     }
@@ -186,19 +182,12 @@ fn load_path(path: &Path) -> Result<Arc<CompiledCatalog>, String> {
     }
     let hash: [u8; 32] = Sha256::digest(&bytes).into();
     let mut cached = CACHE.lock();
-    if let Some(entry) = cached
-        .as_ref()
-        .filter(|entry| entry.path == path && entry.hash == hash)
-    {
+    if let Some(entry) = cached.as_ref().filter(|entry| entry.path == path && entry.hash == hash) {
         return entry.result.clone();
     }
     let result = compile(&bytes);
     operations::check()?;
-    *cached = Some(Cached {
-        path: path.to_owned(),
-        hash,
-        result: result.clone(),
-    });
+    *cached = Some(Cached { path: path.to_owned(), hash, result: result.clone() });
     result
 }
 
@@ -213,17 +202,10 @@ pub(crate) fn load_active() -> Result<Arc<CompiledCatalog>, String> {
 }
 
 fn bundled_attack() -> &'static std::collections::HashMap<String, Vec<String>> {
-    static MAP: std::sync::OnceLock<std::collections::HashMap<String, Vec<String>>> =
-        std::sync::OnceLock::new();
+    static MAP: std::sync::OnceLock<std::collections::HashMap<String, Vec<String>>> = std::sync::OnceLock::new();
     MAP.get_or_init(|| {
         serde_json::from_str::<CatalogFile>(BUILTIN)
-            .map(|file| {
-                file.rules
-                    .into_iter()
-                    .filter(|r| !r.attack.is_empty())
-                    .map(|r| (r.id, r.attack))
-                    .collect()
-            })
+            .map(|file| file.rules.into_iter().filter(|r| !r.attack.is_empty()).map(|r| (r.id, r.attack)).collect())
             .unwrap_or_default()
     })
 }
@@ -236,16 +218,14 @@ pub(crate) fn attack_for(rule: &Rule) -> Vec<String> {
     if let Some(found) = bundled_attack().get(&rule.id) {
         return found.clone();
     }
-    crate::attack::for_threat_category(&rule.category)
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    crate::attack::for_threat_category(&rule.category).iter().map(|s| s.to_string()).collect()
 }
 
 pub(crate) struct Hit {
     pub rule: usize,
     pub snippet: String,
     pub normalized: bool,
+    pub provenance: Segment,
 }
 
 impl CompiledCatalog {
@@ -261,57 +241,25 @@ impl CompiledCatalog {
     /// Enabled rules matching an event. Records without encodings or escapes
     /// are checked on their text directly; others use the normalized corpus.
     pub(crate) fn event_hits(&self, event: &Event) -> Vec<usize> {
-        if self.enabled.is_empty() {
-            return Vec::new();
-        }
-        let plain = |t: &str| !t.contains(['%', '\\']);
-        if !event.raw.is_empty()
-            && event.raw.len() <= CORPUS_BYTES
-            && plain(&event.raw)
-            && plain(&event.message)
-            && plain(&event.description)
-        {
-            let mut text = String::with_capacity(event.raw.len() + event.message.len() + 2);
-            if !event.raw.contains(event.message.as_str()) {
-                text.push_str(&event.message);
-                text.push('\n');
-            }
-            if !event.description.is_empty() && event.description != event.message {
-                text.push_str(&event.description);
-                text.push('\n');
-            }
-            text.push_str(&event.raw);
-            return self
-                .set
-                .matches(text.as_bytes())
-                .iter()
-                .map(|i| self.enabled[i])
-                .collect();
-        }
-        let body = corpus(event);
-        self.set
-            .matches(body.text.as_bytes())
-            .iter()
-            .map(|i| self.enabled[i])
-            .collect()
+        self.event_hits_checked(event).0
     }
-    /// Matches with the evidence excerpt, for the event detail.
+    pub(crate) fn event_hits_checked(&self, event: &Event) -> (Vec<usize>, bool) {
+        let body = corpus(event);
+        (body.hits(self), body.clipped)
+    }
+    /// Matches never cross field boundaries or a decoded/original boundary.
     pub(crate) fn explain(&self, event: &Event) -> Vec<Hit> {
         let body = corpus(event);
-        self.set
-            .matches(body.text.as_bytes())
-            .iter()
-            .map(|i| self.enabled[i])
-            .take(20)
-            .map(|rule| {
-                let found = self.regexes[rule].find(body.text.as_bytes());
-                Hit {
-                    rule,
-                    snippet: found
-                        .map(|m| snippet(&body.text, m.start(), m.end()))
-                        .unwrap_or_default(),
-                    normalized: found.is_some_and(|m| m.end() > body.original_len),
-                }
+        body.hits(self)
+            .into_iter()
+            .filter_map(|rule| {
+                let (start, end, normalized) = body.find(&self.regexes[rule])?;
+                let index = body.segments.iter().position(|&(a, b, _)| start >= a && end <= b)?;
+                let (a, b, _) = body.segments[index];
+                let mut provenance = body.origins[index].clone();
+                provenance.start = start - a;
+                provenance.end = end - a;
+                Some(Hit { rule, snippet: snippet(&body.text[a..b], start - a, end - a), normalized, provenance })
             })
             .collect()
     }
@@ -321,10 +269,7 @@ pub(crate) struct RuleMatcher {
     catalog: Arc<CompiledCatalog>,
     rule: Option<usize>,
 }
-pub(crate) fn matcher(
-    id: &str,
-    catalog: Option<Arc<CompiledCatalog>>,
-) -> Result<RuleMatcher, String> {
+pub(crate) fn matcher(id: &str, catalog: Option<Arc<CompiledCatalog>>) -> Result<RuleMatcher, String> {
     let catalog = catalog.map(Ok).unwrap_or_else(|| load_path(&path()))?;
     let rule = if id == "*" {
         None
@@ -334,13 +279,9 @@ pub(crate) fn matcher(
             .rules
             .iter()
             .position(|rule| rule.id == id)
-            .ok_or_else(|| {
-                format!("Regra de ameaça não encontrada: {id}. Atualize ou remova o filtro.")
-            })?;
+            .ok_or_else(|| format!("Regra de ameaça não encontrada: {id}. Atualize ou remova o filtro."))?;
         if !catalog.file.rules[i].enabled {
-            return Err(format!(
-                "A regra {id} está desativada. Ative-a ou remova o filtro."
-            ));
+            return Err(format!("A regra {id} está desativada. Ative-a ou remova o filtro."));
         }
         Some(i)
     };
@@ -352,8 +293,8 @@ impl RuleMatcher {
     }
     fn matches_corpus(&self, corpus: &Corpus) -> bool {
         self.rule
-            .map(|i| self.catalog.regexes[i].is_match(corpus.text.as_bytes()))
-            .unwrap_or_else(|| self.catalog.set.is_match(corpus.text.as_bytes()))
+            .map(|i| corpus.find(&self.catalog.regexes[i]).is_some())
+            .unwrap_or_else(|| !corpus.hits(&self.catalog).is_empty())
     }
 }
 
@@ -364,11 +305,39 @@ fn prefix(text: &str, max: usize) -> &str {
     }
     &text[..end]
 }
+#[derive(Clone, Default, Serialize)]
+pub struct Segment {
+    pub field: String,
+    pub direction: String,
+    pub transformation: String,
+    pub start: usize,
+    pub end: usize,
+}
 struct Corpus {
     text: String,
     original_len: usize,
+    segments: Vec<(usize, usize, bool)>,
+    origins: Vec<Segment>,
+    origin: Segment,
     clipped: bool,
 }
+impl Corpus {
+    fn hits(&self, catalog: &CompiledCatalog) -> Vec<usize> {
+        let mut hits = std::collections::BTreeSet::new();
+        for &(a, b, _) in &self.segments {
+            for i in catalog.set.matches(&self.text.as_bytes()[a..b]).iter() {
+                hits.insert(catalog.enabled[i]);
+            }
+        }
+        hits.into_iter().collect()
+    }
+    fn find(&self, regex: &regex::bytes::Regex) -> Option<(usize, usize, bool)> {
+        self.segments
+            .iter()
+            .find_map(|&(a, b, n)| regex.find(&self.text.as_bytes()[a..b]).map(|m| (a + m.start(), a + m.end(), n)))
+    }
+}
+
 fn append(corpus: &mut Corpus, text: &str) {
     if text.is_empty() {
         return;
@@ -383,9 +352,15 @@ fn append(corpus: &mut Corpus, text: &str) {
     }
     let part = prefix(text, CORPUS_BYTES.saturating_sub(corpus.text.len()));
     corpus.clipped |= part.len() < text.len();
+    let start = corpus.text.len();
     corpus.text.push_str(part);
+    corpus.segments.push((start, corpus.text.len(), false));
+    let mut origin = corpus.origin.clone();
+    origin.start = 0;
+    origin.end = part.len();
+    corpus.origins.push(origin);
 }
-fn percent_decode(text: &str) -> String {
+pub(crate) fn percent_decode(text: &str) -> String {
     let hex = |b: u8| match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
@@ -412,10 +387,7 @@ fn unicode_escapes(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut at = 0;
     while at < text.len() {
-        if text.as_bytes()[at] == b'\\'
-            && text.as_bytes().get(at + 1) == Some(&b'u')
-            && at + 6 <= text.len()
-        {
+        if text.as_bytes()[at] == b'\\' && text.as_bytes().get(at + 1) == Some(&b'u') && at + 6 <= text.len() {
             if let Some(hex) = text.get(at + 2..at + 6) {
                 if let Ok(code) = u32::from_str_radix(hex, 16) {
                     if let Some(ch) = char::from_u32(code) {
@@ -436,32 +408,55 @@ fn corpus(event: &Event) -> Corpus {
     let mut result = Corpus {
         text: String::new(),
         original_len: 0,
+        segments: Vec::new(),
+        origins: Vec::new(),
+        origin: Segment {
+            field: "message".into(),
+            direction: "unknown".into(),
+            transformation: "original".into(),
+            ..Default::default()
+        },
         clipped: false,
     };
-    append(&mut result, &event.message);
-    if event.description != event.message {
-        append(&mut result, &event.description);
+    if event.message != event.raw || serde_json::from_str::<serde_json::Value>(&event.message).is_err() {
+        append(&mut result, &event.message);
     }
-    if event.raw != event.message {
+    if event.raw != event.message && serde_json::from_str::<serde_json::Value>(&event.raw).is_err() {
+        result.origin.field = "raw".into();
         append(&mut result, &event.raw);
     }
     // Parsed strings preserve backslashes/quotes that JSON serialization would
-    // escape again. Include field names, but bound recursion and visited nodes.
-    fn visit_value(body: &mut Corpus, value: &serde_json::Value, depth: usize, nodes: &mut usize) {
+    // escape again. Field paths are provenance, never text used for detection.
+    fn visit_value(body: &mut Corpus, value: &serde_json::Value, path: &str, depth: usize, nodes: &mut usize) {
         if *nodes >= 1000 || depth > 12 || body.text.len() >= CORPUS_BYTES {
             body.clipped = true;
             return;
         }
         *nodes += 1;
+        body.origin = Segment {
+            field: path.into(),
+            direction: if path.contains("response") {
+                "response"
+            } else if path.contains("request") || path.starts_with("url.") {
+                "request"
+            } else if path.contains("command") || path == "CommandLine" || path == "ScriptBlockText" {
+                "command"
+            } else {
+                "unknown"
+            }
+            .into(),
+            transformation: "original".into(),
+            ..Default::default()
+        };
         match value {
             serde_json::Value::String(text) => append(body, text),
             serde_json::Value::Array(values) => {
-                for item in values {
+                for (i, item) in values.iter().enumerate() {
                     if *nodes >= 1000 || body.text.len() >= CORPUS_BYTES {
                         body.clipped = true;
                         break;
                     }
-                    visit_value(body, item, depth + 1, nodes);
+                    visit_value(body, item, &format!("{path}.{i}"), depth + 1, nodes);
                 }
             }
             serde_json::Value::Object(fields) => {
@@ -470,8 +465,10 @@ fn corpus(event: &Event) -> Corpus {
                         body.clipped = true;
                         break;
                     }
-                    append(body, key);
-                    visit_value(body, item, depth + 1, nodes);
+                    if key.starts_with("_sec.") || matches!(key.as_str(), "documentation" | "description") {
+                        continue;
+                    }
+                    visit_value(body, item, &format!("{path}.{key}"), depth + 1, nodes);
                 }
             }
             other => append(body, &other.to_string()),
@@ -483,25 +480,60 @@ fn corpus(event: &Event) -> Corpus {
             result.clipped = true;
             break;
         }
-        if item
-            .as_str()
-            .is_some_and(|s| s == event.message || s == event.raw || s == event.description)
-        {
+        if item.as_str().is_some_and(|s| s == event.message || s == event.raw || s == event.description) {
             continue;
         }
-        append(&mut result, key);
-        visit_value(&mut result, item, 0, &mut nodes);
+        if key.starts_with("_sec.") || matches!(key.as_str(), "documentation" | "description" | "arquivo" | "caminho") {
+            continue;
+        }
+        visit_value(&mut result, item, key, 0, &mut nodes);
     }
     result.original_len = result.text.len();
-    let original = result.text.clone();
-    let mut previous = original;
-    for _ in 0..2 {
-        let decoded = unicode_escapes(&percent_decode(&previous));
-        if decoded == previous {
-            break;
+    let originals: Vec<_> = result
+        .segments
+        .iter()
+        .zip(&result.origins)
+        .map(|(&(a, b, _), origin)| (result.text[a..b].to_string(), origin.clone()))
+        .collect();
+    for (original, origin) in originals {
+        let mut previous = original;
+        for depth in 0..2 {
+            let decoded = unicode_escapes(&percent_decode(&previous))
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&amp;", "&");
+            if decoded == previous {
+                break;
+            }
+            result.origin = origin.clone();
+            result.origin.transformation = format!("percent/unicode/html:{}", depth + 1);
+            let n = result.segments.len();
+            append(&mut result, &decoded);
+            if result.segments.len() > n {
+                result.segments.last_mut().unwrap().2 = true;
+            }
+            previous = decoded;
         }
-        append(&mut result, &decoded);
-        previous = decoded;
+    }
+    // Base64 is meaningful in a command, not in every token or unrelated field.
+    if let Some(command) = crate::entities::value(event, crate::entities::Role::CommandLine) {
+        let mut cmd = Event::empty();
+        cmd.fields.insert("CommandLine".into(), serde_json::Value::from(command.into_owned()));
+        for decoded in crate::entities::decode_payloads(&cmd) {
+            result.origin = Segment {
+                field: decoded.source.clone(),
+                direction: "command".into(),
+                transformation: decoded.kind.clone(),
+                ..Default::default()
+            };
+            let n = result.segments.len();
+            append(&mut result, &decoded.text);
+            if result.segments.len() > n {
+                result.segments.last_mut().unwrap().2 = true;
+            }
+        }
     }
     result
 }
@@ -519,12 +551,7 @@ pub struct CatalogInfo {
     error: Option<String>,
 }
 fn info_for(path: &Path, catalog: &CompiledCatalog, bundled: &CatalogFile) -> CatalogInfo {
-    let ids: HashSet<_> = catalog
-        .file
-        .rules
-        .iter()
-        .map(|rule| rule.id.as_str())
-        .collect();
+    let ids: HashSet<_> = catalog.file.rules.iter().map(|rule| rule.id.as_str()).collect();
     CatalogInfo {
         path: path.to_string_lossy().into_owned(),
         name: catalog.file.name.clone(),
@@ -539,22 +566,14 @@ fn info_for(path: &Path, catalog: &CompiledCatalog, bundled: &CatalogFile) -> Ca
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect(),
-        updates_available: bundled
-            .rules
-            .iter()
-            .filter(|rule| !ids.contains(rule.id.as_str()))
-            .count(),
+        updates_available: bundled.rules.iter().filter(|rule| !ids.contains(rule.id.as_str())).count(),
         error: None,
     }
 }
 fn catalog_info() -> CatalogInfo {
     let path = path();
     match load_path(&path) {
-        Ok(catalog) => info_for(
-            &path,
-            &catalog,
-            &serde_json::from_str(BUILTIN).expect("bundled catalog JSON"),
-        ),
+        Ok(catalog) => info_for(&path, &catalog, &serde_json::from_str(BUILTIN).expect("bundled catalog JSON")),
         Err(error) => CatalogInfo {
             path: path.to_string_lossy().into_owned(),
             name: "Catálogo de ameaças".into(),
@@ -588,27 +607,13 @@ fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, Str
     let _guard = UPDATE_LOCK.lock();
     let original = read_catalog_bytes(path)?;
     let existing = compile(&original)?;
-    let bundled: CatalogFile = serde_json::from_slice(bundled)
-        .map_err(|error| format!("Catálogo distribuído inválido: {error}"))?;
-    let ids: HashSet<_> = existing
-        .file
-        .rules
-        .iter()
-        .map(|rule| rule.id.as_str())
-        .collect();
-    let additions: Vec<_> = bundled
-        .rules
-        .iter()
-        .filter(|rule| !ids.contains(rule.id.as_str()))
-        .cloned()
-        .collect();
+    let bundled: CatalogFile =
+        serde_json::from_slice(bundled).map_err(|error| format!("Catálogo distribuído inválido: {error}"))?;
+    let ids: HashSet<_> = existing.file.rules.iter().map(|rule| rule.id.as_str()).collect();
+    let additions: Vec<_> = bundled.rules.iter().filter(|rule| !ids.contains(rule.id.as_str())).cloned().collect();
     let added = additions.len();
     if added == 0 {
-        return Ok(CatalogUpdate {
-            added,
-            backup_path: None,
-            catalog: info_for(path, &existing, &bundled),
-        });
+        return Ok(CatalogUpdate { added, backup_path: None, catalog: info_for(path, &existing, &bundled) });
     }
     let mut merged = existing.file.clone();
     merged.rules.extend(additions);
@@ -624,9 +629,7 @@ fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, Str
         .map_err(|error| format!("Não foi possível preparar a atualização: {error}"))?;
     operations::check()?;
     if read_catalog_bytes(path)? != original {
-        return Err(
-            "O catálogo mudou durante a atualização. Reabra Regras e tente novamente.".into(),
-        );
+        return Err("O catálogo mudou durante a atualização. Reabra Regras e tente novamente.".into());
     }
     let mut backup = tempfile::Builder::new()
         .prefix("threat-rules.backup-")
@@ -637,14 +640,10 @@ fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, Str
         .write_all(&original)
         .and_then(|_| backup.as_file().sync_all())
         .map_err(|error| format!("Não foi possível salvar backup: {error}"))?;
-    let (_, backup_path) = backup
-        .keep()
-        .map_err(|error| format!("Não foi possível preservar backup: {error}"))?;
+    let (_, backup_path) = backup.keep().map_err(|error| format!("Não foi possível preservar backup: {error}"))?;
     operations::check()?;
     if read_catalog_bytes(path)? != original {
-        return Err(
-            "O catálogo mudou durante a atualização; o arquivo atual foi preservado.".into(),
-        );
+        return Err("O catálogo mudou durante a atualização; o arquivo atual foi preservado.".into());
     }
     replacement.persist(path).map_err(|error| {
         format!(
@@ -654,11 +653,8 @@ fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, Str
         )
     })?;
     operations::commit();
-    *CACHE.lock() = Some(Cached {
-        path: path.to_owned(),
-        hash: Sha256::digest(&bytes).into(),
-        result: Ok(checked.clone()),
-    });
+    *CACHE.lock() =
+        Some(Cached { path: path.to_owned(), hash: Sha256::digest(&bytes).into(), result: Ok(checked.clone()) });
     Ok(CatalogUpdate {
         added,
         backup_path: Some(backup_path.to_string_lossy().into_owned()),
@@ -717,31 +713,20 @@ struct Timeline {
 }
 impl Timeline {
     fn new() -> Self {
-        Self {
-            width: 1000,
-            bins: BTreeMap::new(),
-        }
+        Self { width: 1000, bins: BTreeMap::new() }
     }
     fn push(&mut self, timestamp: i64) {
-        while self
-            .bins
-            .first_key_value()
-            .zip(self.bins.last_key_value())
-            .is_some_and(|((lo, _), (hi, _))| {
-                let bucket = timestamp.div_euclid(self.width);
-                hi.max(&bucket).saturating_sub(*lo.min(&bucket)) >= 120
-            })
-        {
+        while self.bins.first_key_value().zip(self.bins.last_key_value()).is_some_and(|((lo, _), (hi, _))| {
+            let bucket = timestamp.div_euclid(self.width);
+            hi.max(&bucket).saturating_sub(*lo.min(&bucket)) >= 120
+        }) {
             self.width = self.width.saturating_mul(2);
             let previous = std::mem::take(&mut self.bins);
             for (key, count) in previous {
                 *self.bins.entry(key.div_euclid(2)).or_default() += count;
             }
         }
-        *self
-            .bins
-            .entry(timestamp.div_euclid(self.width))
-            .or_default() += 1;
+        *self.bins.entry(timestamp.div_euclid(self.width)).or_default() += 1;
     }
     fn finish(&self) -> Vec<TimeCount> {
         match self.bins.first_key_value().zip(self.bins.last_key_value()) {
@@ -756,11 +741,7 @@ impl Timeline {
     }
 }
 fn validate_local(filters: &[Filter], catalog: &Arc<CompiledCatalog>) -> Result<(), String> {
-    let ordinary: Vec<_> = filters
-        .iter()
-        .filter(|f| f.op != "threat_rule")
-        .cloned()
-        .collect();
+    let ordinary: Vec<_> = filters.iter().filter(|f| f.op != "threat_rule").cloned().collect();
     crate::workspace::validate(&ordinary)?;
     for filter in filters.iter().filter(|f| f.op == "threat_rule") {
         if filter.column != "_all" {
@@ -774,11 +755,7 @@ fn split_filters(
     filters: &[Filter],
     catalog: &Arc<CompiledCatalog>,
 ) -> Result<(Vec<Filter>, Vec<RuleMatcher>), String> {
-    let ordinary = filters
-        .iter()
-        .filter(|f| f.op != "threat_rule")
-        .cloned()
-        .collect();
+    let ordinary = filters.iter().filter(|f| f.op != "threat_rule").cloned().collect();
     let predicates = filters
         .iter()
         .filter(|f| f.op == "threat_rule")
@@ -828,12 +805,7 @@ fn snippet(text: &str, start: usize, end: usize) -> String {
         from += 1;
     }
     let until = prefix(&text[from..], (end.saturating_sub(from) + 130).min(800)).len() + from;
-    format!(
-        "{}{}{}",
-        if from > 0 { "…" } else { "" },
-        &text[from..until],
-        if until < text.len() { "…" } else { "" }
-    )
+    format!("{}{}{}", if from > 0 { "…" } else { "" }, &text[from..until], if until < text.len() { "…" } else { "" })
 }
 fn scan_impl(
     state: &AppState,
@@ -860,10 +832,7 @@ fn scan_impl(
         }
         let body = corpus(event);
         clipped += usize::from(body.clipped);
-        if !predicates
-            .iter()
-            .all(|predicate| predicate.matches_corpus(&body))
-        {
+        if !predicates.iter().all(|predicate| predicate.matches_corpus(&body)) {
             return;
         }
         total += 1;
@@ -873,12 +842,7 @@ fn scan_impl(
         if catalog.enabled.is_empty() {
             return;
         }
-        let ids: Vec<_> = catalog
-            .set
-            .matches(body.text.as_bytes())
-            .iter()
-            .map(|i| catalog.enabled[i])
-            .collect();
+        let ids = body.hits(&catalog);
         if ids.is_empty() {
             return;
         }
@@ -893,13 +857,13 @@ fn scan_impl(
                 ends[i] = Some(ends[i].map_or(t, |v: i64| v.max(t)));
             }
             if examples[i].len() < 3 {
-                if let Some(found) = catalog.regexes[i].find(body.text.as_bytes()) {
+                if let Some((a, b, normalized)) = body.find(&catalog.regexes[i]) {
                     examples[i].push(Example {
                         event_id: event.id,
                         event_ref: prefix(&event.event_ref, 512).into(),
                         timestamp: event.timestamp,
-                        snippet: snippet(&body.text, found.start(), found.end()),
-                        normalized: found.end() > body.original_len,
+                        snippet: snippet(&body.text, a, b),
+                        normalized,
                     });
                 }
             }
@@ -941,18 +905,11 @@ fn scan_impl(
         clipped_records: clipped,
         enabled_rules: catalog.enabled.len(),
         catalog_path,
-        categories: categories
-            .into_iter()
-            .map(|(name, count)| Count { name, count })
-            .collect(),
+        categories: categories.into_iter().map(|(name, count)| Count { name, count }).collect(),
         rules,
         time: timeline.finish(),
         time_bucket_ms: timeline.width,
-        sources: sources
-            .top(10)
-            .into_iter()
-            .map(|(name, count)| Count { name, count })
-            .collect(),
+        sources: sources.top(10).into_iter().map(|(name, count)| Count { name, count }).collect(),
         undated_matches: undated,
         corpus_limit: CORPUS_BYTES,
         start,
@@ -977,32 +934,18 @@ fn events_impl(
     catalog: Arc<CompiledCatalog>,
 ) -> Result<EventResult, String> {
     if !filters.iter().any(|f| f.op == "threat_rule") {
-        filters.push(Filter {
-            column: "_all".into(),
-            op: "threat_rule".into(),
-            value: "*".into(),
-            value2: None,
-        });
+        filters.push(Filter { column: "_all".into(), op: "threat_rule".into(), value: "*".into(), value2: None });
     }
     validate_local(&filters, &catalog)?;
     let (ordinary, predicates) = split_filters(&filters, &catalog)?;
-    let mut result = EventResult {
-        total: 0,
-        rows: vec![],
-        complete: true,
-        clipped_records: 0,
-        rows_clipped: 0,
-    };
+    let mut result = EventResult { total: 0, rows: vec![], complete: true, clipped_records: 0, rows_clipped: 0 };
     visit(state, &ordinary, case.as_deref(), &catalog, |event| {
         if operations::cancelled() {
             return;
         }
         let body = corpus(event);
         result.clipped_records += usize::from(body.clipped);
-        if !predicates
-            .iter()
-            .all(|predicate| predicate.matches_corpus(&body))
-        {
+        if !predicates.iter().all(|predicate| predicate.matches_corpus(&body)) {
             return;
         }
         result.total += 1;
@@ -1043,15 +986,7 @@ pub async fn threat_scan(
             catalog,
             path.to_string_lossy().into_owned(),
             |count| {
-                crate::emit_progress(
-                    Some(&app),
-                    "ameaças",
-                    "Conferindo regras locais",
-                    count,
-                    0,
-                    "registros",
-                    true,
-                )
+                crate::emit_progress(Some(&app), "ameaças", "Conferindo regras locais", count, 0, "registros", true)
             },
         )
     })
@@ -1112,15 +1047,10 @@ mod tests {
         event
     }
     fn filter(id: &str) -> Filter {
-        Filter {
-            column: "_all".into(),
-            op: "threat_rule".into(),
-            value: id.into(),
-            value2: None,
-        }
+        Filter { column: "_all".into(), op: "threat_rule".into(), value: id.into(), value2: None }
     }
     #[test]
-    fn evidence_crossing_into_decoded_text_is_marked_normalized() {
+    fn evidence_cannot_cross_a_field_or_transformation_boundary() {
         let compiled = compile(&serde_json::to_vec(&serde_json::json!({
             "version":1,"name":"Boundary test","rules":[{
                 "id":"test.boundary","name":"Boundary","category":"Test","severity":"low",
@@ -1131,42 +1061,21 @@ mod tests {
         let body = corpus(&event);
         let found = compiled.regexes[0].find(body.text.as_bytes()).unwrap();
         assert!(found.start() < body.original_len && found.end() > body.original_len);
-        let result = scan_impl(
-            &state(SourceData::Memory(vec![event])),
-            vec![],
-            None,
-            compiled,
-            "test".into(),
-            |_| {},
-        )
-        .unwrap();
-        assert_eq!(result.matched, 1);
-        assert!(result.rules[0].examples[0].normalized);
+        let result =
+            scan_impl(&state(SourceData::Memory(vec![event])), vec![], None, compiled, "test".into(), |_| {}).unwrap();
+        assert_eq!(result.matched, 0);
+        assert!(result.rules.is_empty());
     }
     #[test]
     fn builtin_threat_catalog_compiles_and_invalid_rules_are_rejected() {
         let builtin = compile(BUILTIN.as_bytes()).unwrap();
         assert!(builtin.file.rules.len() >= 250);
-        assert_eq!(
-            builtin.enabled.len(),
-            builtin
-                .file
-                .rules
-                .iter()
-                .filter(|rule| rule.enabled)
-                .count()
-        );
+        assert_eq!(builtin.enabled.len(), builtin.file.rules.iter().filter(|rule| rule.enabled).count());
         let mut file: serde_json::Value = serde_json::from_str(BUILTIN).unwrap();
         file["rules"][0]["pattern"] = serde_json::json!("(?=not-supported)");
-        assert!(compile(&serde_json::to_vec(&file).unwrap())
-            .err()
-            .unwrap()
-            .contains("Regex inválida"));
+        assert!(compile(&serde_json::to_vec(&file).unwrap()).err().unwrap().contains("Regex inválida"));
         file["rules"][0]["pattern"] = serde_json::json!(".*");
-        assert!(compile(&serde_json::to_vec(&file).unwrap())
-            .err()
-            .unwrap()
-            .contains("texto vazio"));
+        assert!(compile(&serde_json::to_vec(&file).unwrap()).err().unwrap().contains("texto vazio"));
         assert!(matcher("test.disabled", Some(catalog())).is_err());
         assert!(matcher("not.found", Some(catalog())).is_err());
     }
@@ -1179,12 +1088,7 @@ mod tests {
             for sample in fixture[key].as_array().unwrap() {
                 let id = sample["id"].as_str().unwrap();
                 let text = sample["text"].as_str().unwrap();
-                assert!(
-                    matcher(id, Some(catalog.clone()))
-                        .unwrap()
-                        .matches(&event(0, text)),
-                    "{id}: {text}"
-                );
+                assert!(matcher(id, Some(catalog.clone())).unwrap().matches(&event(0, text)), "{id}: {text}");
             }
         }
         for text in fixture["benign"].as_array().unwrap() {
@@ -1205,20 +1109,11 @@ mod tests {
         let direct = event(1, "attack alpha attack alpha");
         let encoded = event(2, "attack%2520alpha");
         let mut fields = event(3, "");
-        fields.fields.insert(
-            "CommandLine".into(),
-            serde_json::json!(r"C:\Windows\System32\evil.exe"),
-        );
+        fields.fields.insert("CommandLine".into(), serde_json::json!(r"C:\Windows\System32\evil.exe"));
         for e in [&direct, &encoded, &fields] {
             assert!(matcher("*", Some(catalog.clone())).unwrap().matches(e));
         }
-        let events = vec![
-            direct,
-            encoded,
-            fields,
-            event(4, "disabled match"),
-            event(5, "ordinary successful request"),
-        ];
+        let events = vec![direct, encoded, fields, event(4, "disabled match"), event(5, "ordinary successful request")];
         let result = scan_impl(
             &state(SourceData::Memory(events.clone())),
             vec![],
@@ -1233,28 +1128,11 @@ mod tests {
         assert_eq!(result.occurrences, 3);
         assert!(result.complete);
         assert_eq!(result.categories[0].count, 3);
-        assert!(result
-            .rules
-            .iter()
-            .find(|r| r.rule.id == "test.alpha")
-            .unwrap()
-            .examples
-            .iter()
-            .any(|e| e.normalized));
+        assert!(result.rules.iter().find(|r| r.rule.id == "test.alpha").unwrap().examples.iter().any(|e| e.normalized));
         let pfs = query::prepare_with_threat_catalog(&[filter("test.alpha")], Some(&catalog));
-        assert_eq!(
-            events.iter().filter(|e| query::matches(e, &pfs[0])).count(),
-            2
-        );
-        let page = events_impl(
-            &state(SourceData::None),
-            vec![filter("test.alpha")],
-            Some(events),
-            1,
-            1,
-            catalog,
-        )
-        .unwrap();
+        assert_eq!(events.iter().filter(|e| query::matches(e, &pfs[0])).count(), 2);
+        let page =
+            events_impl(&state(SourceData::None), vec![filter("test.alpha")], Some(events), 1, 1, catalog).unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].id, 2);
@@ -1266,32 +1144,18 @@ mod tests {
             writeln!(file,"{}",serde_json::json!({"timestamp":1700000000000i64+i*1000,"source":if i%2==0{"API"}else{"api"},"message":if i>=10000{"attack alpha"}else{"ordinary"}})).unwrap();
         }
         file.flush().unwrap();
-        let index =
-            sources::index_file(file.path().to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let index = sources::index_file(file.path().to_str().unwrap(), "jsonl", None, None, None).unwrap();
         let codes = crate::model::CodesConfig::default();
-        let events: Vec<_> = (0..index.lines.len())
-            .map(|i| sources::event_at(&index, i, &codes, &codes, &[]))
-            .collect();
+        let events: Vec<_> =
+            (0..index.lines.len()).map(|i| sources::event_at(&index, i, &codes, &codes, &[])).collect();
         let indexed = state(SourceData::Indexed(index));
         let memory = state(SourceData::Memory(events.clone()));
         let catalog = catalog();
-        let filters = vec![Filter {
-            column: "source".into(),
-            op: "equals_exact".into(),
-            value: "API".into(),
-            value2: None,
-        }];
+        let filters =
+            vec![Filter { column: "source".into(), op: "equals_exact".into(), value: "API".into(), value2: None }];
         let scan = |state: &AppState, case| {
             serde_json::to_value(
-                scan_impl(
-                    state,
-                    filters.clone(),
-                    case,
-                    catalog.clone(),
-                    "fixture".into(),
-                    |_| {},
-                )
-                .unwrap(),
+                scan_impl(state, filters.clone(), case, catalog.clone(), "fixture".into(), |_| {}).unwrap(),
             )
             .unwrap()
         };
@@ -1300,10 +1164,7 @@ mod tests {
         assert_eq!(expected["matched"], 10);
         assert_eq!(expected["rules"][0]["count"], 10);
         assert_eq!(scan(&indexed, None), expected);
-        assert_eq!(
-            scan(&state(SourceData::None), Some(events.clone())),
-            expected
-        );
+        assert_eq!(scan(&state(SourceData::None), Some(events.clone())), expected);
         let pfs = query::prepare_with_threat_catalog(&[filter("test.alpha")], Some(&catalog));
         let mut matches = vec![];
         if let SourceData::Indexed(index) = &*indexed.source.read() {
@@ -1316,22 +1177,11 @@ mod tests {
         let mut clipped = event(1, &"界".repeat(CORPUS_BYTES));
         clipped.message.push_str("attack alpha");
         let mut preview = event(2, "attack alpha");
-        preview.fields.insert(
-            "padding".into(),
-            serde_json::json!("z".repeat(CORPUS_BYTES * 2)),
-        );
+        preview.fields.insert("padding".into(), serde_json::json!("z".repeat(CORPUS_BYTES * 2)));
         let events = vec![clipped, preview];
         let state = state(SourceData::Memory(events));
         let catalog = catalog();
-        let scan = scan_impl(
-            &state,
-            vec![],
-            None,
-            catalog.clone(),
-            "fixture".into(),
-            |_| {},
-        )
-        .unwrap();
+        let scan = scan_impl(&state, vec![], None, catalog.clone(), "fixture".into(), |_| {}).unwrap();
         assert_eq!(scan.matched, 1);
         assert_eq!(scan.clipped_records, 2);
         assert!(!scan.complete);
@@ -1347,20 +1197,13 @@ mod tests {
             timeline.push(t);
         }
         assert!(timeline.finish().len() <= 120);
-        assert_eq!(
-            timeline.finish().iter().map(|bin| bin.count).sum::<usize>(),
-            4
-        );
+        assert_eq!(timeline.finish().iter().map(|bin| bin.count).sum::<usize>(), 4);
     }
     #[test]
     fn threat_catalog_hash_reload_preserves_invalid_user_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("rules.json");
-        fs::write(
-            &path,
-            serde_json::json!({"version":1,"name":"One","rules":[]}).to_string(),
-        )
-        .unwrap();
+        fs::write(&path, serde_json::json!({"version":1,"name":"One","rules":[]}).to_string()).unwrap();
         let first = load_path(&path).unwrap();
         assert!(first.enabled.is_empty());
         fs::write(&path, BUILTIN).unwrap();
@@ -1414,18 +1257,9 @@ mod tests {
         event.message.clear();
         event.raw.clear();
         event.description.clear();
-        event.fields.insert(
-            "values".into(),
-            serde_json::json!((0..999).map(|_| 1).collect::<Vec<_>>()),
-        );
+        event.fields.insert("values".into(), serde_json::json!((0..999).map(|_| 1).collect::<Vec<_>>()));
         assert!(!corpus(&event).clipped);
-        event
-            .fields
-            .get_mut("values")
-            .unwrap()
-            .as_array_mut()
-            .unwrap()
-            .push(1.into());
+        event.fields.get_mut("values").unwrap().as_array_mut().unwrap().push(1.into());
         assert!(corpus(&event).clipped);
     }
 }

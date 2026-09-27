@@ -61,8 +61,9 @@ window.EntityMenu = (() => {
     const node = el("button", `entity-chip ${extra}`.trim());
     node.type = "button";
     node.innerHTML = `<i class="fas ${icon(column)}" aria-hidden="true"></i><span></span>`;
-    node.querySelector("span").textContent = entity.display || entity.value;
-    node.title = `${label(column)}: ${entity.value}${entity.scope ? ` · rede ${entity.scope}` : ""}\nClique para ações`;
+    const display = value => window.EvidenceUI?.redact({ [column]: value })[column] ?? value;
+    node.querySelector("span").textContent = display(entity.display || entity.value);
+    node.title = `${label(column)}: ${display(entity.value)}${entity.scope ? ` · rede ${entity.scope}` : ""}\nClique para ações`;
     const act = event => { event.preventDefault(); event.stopPropagation(); const r = node.getBoundingClientRect(); open(event.clientX || r.left, event.clientY || r.bottom, { ...entity, column }); };
     node.onclick = act; node.oncontextmenu = act;
     return node;

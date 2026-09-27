@@ -43,20 +43,15 @@ Os campos canônicos aparecem no detalhe do registro. Um clique (ou botão direi
 
 ## Triagem
 
-O card **Atenção** do Resumo roda as regras sobre o recorte atual (fontes e filtros) e mostra primeiro o que merece análise:
+O card **Indícios** calcula o conjunto carregado ou o Caso completo. Os filtros selecionam achados relacionados e preservam seus membros fora do recorte. **Rigidez da análise** começa em 5 (somente E5); reduzi-la revela E4, E3, E2 e E1 cumulativamente, sem nova varredura nem mudança de classificação.
 
-- **Episódios**: detecções que compartilham uma entidade ou registros, com até 1 h de intervalo, são reunidas em um episódio com a cadeia de táticas ATT&CK em ordem cronológica. Os três mais graves aparecem abertos; os demais ficam em **Mostrar mais**. Cada episódio abre exatamente os registros das suas detecções, pode ser levado à linha do tempo ou salvo no Caso com as técnicas ATT&CK.
-- **Entidades em destaque**: usuários, IPs e hosts ordenados por risco (gravidade e quantidade de detecções, falhas e alcance).
-- **Raridades**: valores pouco comuns de processos, user agents, ferramentas e destinos, para revisar o que destoa.
-- As detecções também aparecem como marcas discretas sob os gráficos do Resumo e da Linha do tempo; uma marca seleciona o intervalo correspondente.
+As evidências têm nível, hipótese (`claim`), impacto potencial, resultado, lacunas e versões separados. E5 pode representar tentativa extremamente sustentada, inclusive bloqueada; não afirma comprometimento consumado. Episódios compartilham fatos verificáveis; IP ou host em comum não bastam. Ver registros abre os membros exatos por `event_ref`, buscando todas as páginas necessárias. Exceções novas exigem motivo, escopo e validade.
 
-A triagem examina até 3 milhões de correspondências e apresenta até 500 detecções, cada uma com até 50 registros de amostra. O resultado fica em cache até o recorte ou as regras mudarem; **Recalcular triagem** na paleta de comandos (Ctrl+K) força uma nova leitura.
-
-Detecções indicam padrões que merecem verificação, não conclusões. Ocultar uma detecção (ícone de olho) registra uma supressão por regra e entidade; a lista pode ser revista em **Configurações → Detecção**.
+Veja [política completa, normalização, contratos, validação e limites](deteccao-evidencias.md).
 
 ## Regras de detecção
 
-As 47 regras distribuídas estão em [detection-rules.json](../src-tauri/resources/detection-rules.json). Para criar ou substituir regras, grave um arquivo `detection-rules.json` com o mesmo formato na pasta de configuração do aplicativo: uma regra com `id` existente substitui a distribuída; um `id` novo é acrescentado.
+As 87 definições distribuídas estão em [detection-rules.json](../src-tauri/resources/detection-rules.json), [detection-expansion.json](../src-tauri/resources/detection-expansion.json) e [detection-advanced.json](../src-tauri/resources/detection-advanced.json). As regras genéricas retiradas permanecem desativadas. Para criar ou substituir regras, grave um arquivo `detection-rules.json` com o mesmo formato na pasta de configuração do aplicativo: uma regra com `id` existente substitui a distribuída; um `id` novo é acrescentado.
 
 ```json
 {
@@ -70,8 +65,9 @@ As 47 regras distribuídas estão em [detection-rules.json](../src-tauri/resourc
       "attack": ["T1110.003"],
       "kind": "distinct",
       "where": "@action:logon @outcome:failure",
-      "by": ["@src_ip"],
-      "distinct": "@user",
+      "by": ["_sec.namespace", "_sec.host", "_sec.service", "@src_ip"],
+      "distinct": "_sec.identity",
+      "evidence": {"level": 2, "rationale": "Falhas dirigidas a identidades distintas no mesmo serviço e host", "maturity": "experimental", "required": ["_sec.namespace", "_sec.host", "_sec.service"]},
       "window": "30m",
       "count": 8,
       "summary": "{@src_ip} tentou {distinct} contas diferentes"
@@ -86,6 +82,7 @@ As 47 regras distribuídas estão em [detection-rules.json](../src-tauri/resourc
 | `threshold` | `count` registros de `where` com o mesmo `by` dentro de `window` |
 | `distinct` | `count` valores diferentes de `distinct` para o mesmo `by` dentro de `window` (`distinct_fallback` lista campos alternativos) |
 | `sequence` | os `steps` ocorrem em ordem para o mesmo `by` dentro de `window`; cada passo tem `where` e `count` opcional |
+| `temporal` | os seletores coexistem na janela, com fatos distintos e vínculos explícitos |
 | `beacon` | ao menos `count` conexões entre o mesmo `by` com intervalos regulares |
 
 - `where` usa a linguagem de busca; `window` aceita `ms`, `s`, `m`, `h` e `d` (`90s`, `10m`, `2h`).
@@ -117,4 +114,4 @@ São aceitos: seleções com listas e mapas, os modificadores `contains`, `start
 
 ## MCP
 
-O servidor MCP expõe 53 ferramentas. As novas são `triage` (detecções, episódios e entidades de risco do recorte), `event_insights` (ação normalizada, entidades, regras e conteúdo decodificado de um registro) e `detection_rules` (regras ativas, Sigma importado e erros de conversão).
+O servidor MCP inclui `triage` (análise do universo completo, filtros de apresentação, paginação e `minimum_evidence` padrão 5), `triage_episode` (todos os componentes do episódio por páginas), `triage_timeline` (contagens por nível e intervalo sobre o resultado completo), `event_insights` (ação normalizada, entidades, regras e conteúdo decodificado de um registro) e `detection_rules` (regras ativas, Sigma importado e erros de conversão).

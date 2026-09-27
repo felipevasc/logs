@@ -19,10 +19,7 @@ pub fn rule_files(dir: &Path) -> Vec<PathBuf> {
             let p = entry.path();
             if p.is_dir() {
                 pending.push(p);
-            } else if p
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml"))
-            {
+            } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml")) {
                 out.push(p);
             }
         }
@@ -35,41 +32,231 @@ pub fn rule_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 pub fn load_dir(dir: &Path) -> (Vec<Compiled>, Vec<String>) {
-    let mut rules = Vec::new();
+    let mut docs = Vec::new();
     let mut errors = Vec::new();
     for file in rule_files(dir) {
-        let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        match std::fs::read_to_string(&file) {
-            Ok(text) => match convert_text(&text) {
-                Ok(mut found) => rules.append(&mut found),
-                Err(e) => errors.push(format!("{name}: {e}")),
-            },
-            Err(e) => errors.push(format!("{name}: {e}")),
+        match std::fs::read_to_string(&file).map_err(|e| e.to_string()).and_then(|t| documents(&t)) {
+            Ok(mut values) => docs.append(&mut values),
+            Err(e) => errors.push(format!("{}: {e}", file.display())),
+        }
+    }
+    let mut rules = Vec::new();
+    for (i, doc) in docs.iter().enumerate() {
+        match resolve(i, &docs, &mut Vec::new()) {
+            Ok(rule) => rules.push(rule),
+            Err(e) => errors.push(format!("{}: {e}", doc["title"].as_str().unwrap_or("Sigma"))),
         }
     }
     (rules, errors)
 }
-
-/// Converts every rule document of a YAML file.
-pub fn convert_text(text: &str) -> Result<Vec<Compiled>, String> {
+fn documents(text: &str) -> Result<Vec<Value>, String> {
     if text.len() > 2 * 1024 * 1024 {
         return Err("arquivo maior que 2 MiB".into());
     }
     let mut out = Vec::new();
     for document in yaml_serde::Deserializer::from_str(text) {
-        let value: Value = serde::Deserialize::deserialize(document).map_err(|e| format!("YAML inválido: {e}"))?;
+        let value: Value = serde::Deserialize::deserialize(document).map_err(|e| format!("YAML: {e}"))?;
         if value.is_null() {
             continue;
         }
         if value.get("action").is_some() {
-            return Err("coleções de regras (action: global) não são suportadas".into());
+            return Err("action: global nao suportado".into());
         }
-        out.push(convert(&value)?);
-    }
-    if out.is_empty() {
-        return Err("nenhuma regra encontrada".into());
+        out.push(value);
     }
     Ok(out)
+}
+pub fn convert_text(text: &str) -> Result<Vec<Compiled>, String> {
+    convert_texts([text])
+}
+pub fn convert_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Result<Vec<Compiled>, String> {
+    let mut docs = Vec::new();
+    for text in texts {
+        docs.extend(documents(text)?);
+    }
+    if docs.is_empty() {
+        return Err("nenhuma regra encontrada".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    for doc in &docs {
+        if let Some(id) = doc["id"].as_str() {
+            if !ids.insert(id) {
+                return Err(format!("ID Sigma duplicado: {id}"));
+            }
+        }
+    }
+    (0..docs.len()).map(|i| resolve(i, &docs, &mut Vec::new())).collect()
+}
+fn resolve(index: usize, docs: &[Value], stack: &mut Vec<usize>) -> Result<Compiled, String> {
+    if stack.contains(&index) {
+        return Err("dependencia circular entre regras Sigma".into());
+    }
+    stack.push(index);
+    let doc = &docs[index];
+    let result = if doc.get("correlation").is_some() { correlation(doc, docs, stack) } else { convert(doc) };
+    stack.pop();
+    result
+}
+fn correlation(doc: &Value, docs: &[Value], stack: &mut Vec<usize>) -> Result<Compiled, String> {
+    let c = doc["correlation"].as_object().ok_or("correlation deve ser objeto")?;
+    for key in c.keys() {
+        if !["type", "rules", "group-by", "timespan", "condition", "aliases"].contains(&key.as_str()) {
+            return Err(format!("construcao de correlacao nao suportada: {key}"));
+        }
+    }
+    let kind = c.get("type").and_then(Value::as_str).ok_or("correlation.type ausente")?;
+    if !["event_count", "value_count", "temporal", "temporal_ordered", "value_sum", "value_avg"].contains(&kind) {
+        return Err(format!("tipo de correlacao nao suportado: {kind}"));
+    }
+    let refs = c.get("rules").and_then(Value::as_array).ok_or("correlation.rules ausente")?;
+    if refs.is_empty() || refs.len() > 16 {
+        return Err("correlacao precisa de 1 a 16 referencias".into());
+    }
+    let mut rules = Vec::new();
+    let mut names = Vec::new();
+    for reference in refs {
+        let name = reference.as_str().ok_or("referencia nao textual")?;
+        let candidates: Vec<_> = docs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d["id"].as_str() == Some(name) || d["name"].as_str() == Some(name))
+            .map(|(i, _)| i)
+            .collect();
+        if candidates.len() != 1 {
+            return Err(format!("referencia ausente ou ambigua: {name}"));
+        }
+        let rule = resolve(candidates[0], docs, stack)?;
+        if rule.def.kind != "single" {
+            return Err(format!("correlacao sobre agregado nao suportada: {name}"));
+        }
+        rules.push(rule);
+        names.push(name);
+    }
+    let group: Vec<String> = c
+        .get("group-by")
+        .and_then(Value::as_array)
+        .ok_or("group-by explicito obrigatorio")?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string).ok_or("group-by invalido".to_string()))
+        .collect::<Result<_, _>>()?;
+    let window = c.get("timespan").and_then(Value::as_str).ok_or("timespan obrigatorio")?.to_string();
+    if crate::detections::parse_duration(&window).is_none() {
+        return Err("timespan invalido".into());
+    }
+    let mapped = |field: &str, name: &str| -> Result<String, String> {
+        match c.get("aliases").and_then(|v| v.get(field)) {
+            Some(alias) => alias
+                .get(name)
+                .and_then(Value::as_str)
+                .map(|f| field_name(f).to_string())
+                .ok_or_else(|| format!("alias {field} sem mapeamento para {name}")),
+            None => Ok(field_name(field).into()),
+        }
+    };
+    let mut def = rules[0].def.clone();
+    def.id =
+        format!("sigma:{}", doc["id"].as_str().or(doc["name"].as_str()).ok_or("correlacao precisa de id ou name")?);
+    def.name = doc["title"].as_str().ok_or("title ausente")?.into();
+    def.description = doc["description"].as_str().unwrap_or("").into();
+    def.severity = severity(doc["level"].as_str());
+    def.evidence = policy(doc)?;
+    def.provenance = metadata(doc);
+    def.window = Some(window);
+    def.by = group.clone();
+    def.steps.clear();
+    def.distinct = None;
+    def.references = names.iter().map(|s| s.to_string()).collect();
+    let mut exprs = Vec::new();
+    if kind.starts_with("temporal") {
+        if refs.len() < 2 {
+            return Err("correlacao temporal requer duas regras".into());
+        }
+        if c.get("condition").is_some() {
+            return Err("condition temporal nao suportada; exige todas as etapas".into());
+        }
+        def.kind = if kind == "temporal_ordered" { "sequence" } else { "temporal" }.into();
+        for (rule, name) in rules.into_iter().zip(&names) {
+            def.steps.push(crate::detections::StepDef {
+                by: group.iter().map(|f| mapped(f, name)).collect::<Result<_, _>>()?,
+                ..Default::default()
+            });
+            exprs.push(rule.gated_condition()?);
+        }
+    } else if matches!(kind, "value_sum" | "value_avg") {
+        let condition = c.get("condition").and_then(Value::as_object).ok_or("condition ausente")?;
+        if condition.keys().any(|k| !["gte", "lte", "field"].contains(&k.as_str())) {
+            return Err("Agregação Sigma suporta gte/lte explícitos".into());
+        }
+        let field = condition.get("field").and_then(Value::as_str).ok_or("Agregação exige campo numérico")?;
+        let numeric = mapped(field, names[0])?;
+        def.by = group.iter().map(|f| mapped(f, names[0])).collect::<Result<_, _>>()?;
+        for name in &names[1..] {
+            if mapped(field, name)? != numeric
+                || group.iter().map(|f| mapped(f, name)).collect::<Result<Vec<_>, _>>()? != def.by
+            {
+                return Err("Aliases agregados incompatíveis".into());
+            }
+        }
+        def.kind = "aggregate".into();
+        def.count = Some(1);
+        def.aggregate = Some(crate::detections::AggregateDef {
+            field: numeric,
+            operation: if kind == "value_sum" { "sum" } else { "avg" }.into(),
+            gte: condition.get("gte").map(|v| v.as_f64().ok_or("gte deve ser numérico")).transpose()?,
+            lte: condition.get("lte").map(|v| v.as_f64().ok_or("lte deve ser numérico")).transpose()?,
+        });
+        exprs.push(querylang::or(rules.into_iter().map(|r| r.gated_condition()).collect::<Result<_, _>>()?));
+    } else {
+        let condition = c.get("condition").and_then(Value::as_object).ok_or("condition ausente")?;
+        if condition.keys().any(|k| !["gte", "gt", "field"].contains(&k.as_str()))
+            || condition.contains_key("gte") == condition.contains_key("gt")
+        {
+            return Err("somente uma condicao gte ou gt e suportada".into());
+        }
+        let count = condition.get("gte").or(condition.get("gt")).and_then(Value::as_u64).ok_or("contagem invalida")?;
+        def.count = Some(
+            usize::try_from(count)
+                .map_err(|_| "contagem excedida")?
+                .checked_add(usize::from(condition.contains_key("gt")))
+                .ok_or("contagem excedida")?,
+        );
+        def.by = group.iter().map(|f| mapped(f, names[0])).collect::<Result<_, _>>()?;
+        for name in &names[1..] {
+            if group.iter().map(|f| mapped(f, name)).collect::<Result<Vec<_>, _>>()? != def.by {
+                return Err("aliases diferentes entre regras de contagem nao suportados".into());
+            }
+        }
+        def.kind = if kind == "event_count" { "threshold" } else { "distinct" }.into();
+        if kind == "value_count" {
+            let field = condition.get("field").and_then(Value::as_str).ok_or("value_count requer field")?;
+            let mapped_field = mapped(field, names[0])?;
+            for name in &names[1..] {
+                if mapped(field, name)? != mapped_field {
+                    return Err("alias distinto incompatível".into());
+                }
+            }
+            def.distinct = Some(mapped_field);
+        }
+        exprs.push(querylang::or(rules.into_iter().map(|r| r.gated_condition()).collect::<Result<_, _>>()?));
+    }
+    compile_rule(def, "sigma", Some(exprs))
+}
+fn policy(doc: &Value) -> Result<crate::evidence::Policy, String> {
+    let mut policy = match doc.get("x-loginsight-evidence") {
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("politica de evidencia: {e}"))?,
+        None => crate::evidence::Policy { maturity: "unassessed".into(), ..Default::default() },
+    };
+    if let Some(fp) = doc["falsepositives"].as_array() {
+        policy.benign = fp.iter().filter_map(Value::as_str).map(str::to_string).collect();
+    }
+    if doc["x-loginsight-evidence"].get("version").is_none() {
+        policy.version = crate::evidence::stable_id("sigma", [doc.to_string()]);
+    }
+    policy.validate()?;
+    Ok(policy)
+}
+fn metadata(doc: &Value) -> Value {
+    serde_json::json!({"format":"sigma","id":doc["id"],"name":doc["name"],"status":doc["status"],"logsource":doc["logsource"],"aliases":doc["correlation"]["aliases"],"author":doc["author"],"date":doc["date"],"modified":doc["modified"],"references":doc["references"],"falsepositives":doc["falsepositives"]})
 }
 
 fn text(value: &Value) -> Option<String> {
@@ -126,8 +313,25 @@ fn windash(value: &str) -> Vec<String> {
 
 fn value_expr(field: Option<&str>, modifiers: &[String], value: &Value) -> Result<Expr, String> {
     let has = |m: &str| modifiers.iter().any(|x| x == m);
-    let unsupported = ["base64", "base64offset", "utf16le", "utf16be", "wide", "utf16", "expand", "fieldref"];
-    if let Some(m) = modifiers.iter().find(|m| unsupported.contains(&m.as_str())) {
+    let supported = [
+        "contains",
+        "startswith",
+        "endswith",
+        "all",
+        "re",
+        "cidr",
+        "exists",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "windash",
+        "cased",
+        "i",
+        "m",
+        "s",
+    ];
+    if let Some(m) = modifiers.iter().find(|m| !supported.contains(&m.as_str())) {
         return Err(format!("modificador não suportado: {m}"));
     }
     let role = field.and_then(sigma_role);
@@ -210,10 +414,7 @@ fn selection_map(map: &serde_json::Map<String, Value>) -> Result<Expr, String> {
         if values.is_empty() {
             return Err(format!("lista vazia em {key}"));
         }
-        let exprs = values
-            .into_iter()
-            .map(|v| value_expr(field, &modifiers, v))
-            .collect::<Result<Vec<_>, _>>()?;
+        let exprs = values.into_iter().map(|v| value_expr(field, &modifiers, v)).collect::<Result<Vec<_>, _>>()?;
         all.push(if modifiers.iter().any(|m| m == "all") { querylang::and(exprs) } else { querylang::or(exprs) });
     }
     if all.is_empty() {
@@ -288,10 +489,7 @@ impl Cond<'_> {
         }
         let re = pattern.replace('*', ".*");
         let re = regex::Regex::new(&format!("^{re}$")).ok();
-        self.selections
-            .iter()
-            .filter(|(name, _)| re.as_ref().is_some_and(|r| r.is_match(name)))
-            .collect()
+        self.selections.iter().filter(|(name, _)| re.as_ref().is_some_and(|r| r.is_match(name))).collect()
     }
     fn primary(&mut self) -> Result<Expr, String> {
         let token = self.next().ok_or("condição incompleta")?;
@@ -342,16 +540,12 @@ struct Aggregation {
 
 fn aggregation(text: &str) -> Result<Aggregation, String> {
     // count() by Field > 10   |   count(Target) by Source >= 5
-    let re = regex::Regex::new(r"(?i)^\s*count\(\s*([^)]*)\)\s*(?:by\s+([A-Za-z0-9_.\-]+))?\s*(>=|>|==|=)\s*(\d+)\s*$").unwrap();
+    let re = regex::Regex::new(r"(?i)^\s*count\(\s*([^)]*)\)\s*(?:by\s+([A-Za-z0-9_.\-]+))?\s*(>=|>|==|=)\s*(\d+)\s*$")
+        .unwrap();
     let caps = re.captures(text).ok_or_else(|| format!("agregação não suportada: {text}"))?;
     let distinct = caps.get(1).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
     let value: usize = caps[4].parse().map_err(|_| "limite inválido")?;
-    Ok(Aggregation {
-        distinct,
-        by: caps.get(2).map(|m| m.as_str().to_string()),
-        op: caps[3].to_string(),
-        value,
-    })
+    Ok(Aggregation { distinct, by: caps.get(2).map(|m| m.as_str().to_string()), op: caps[3].to_string(), value })
 }
 
 fn logsource_gate(logsource: Option<&Value>) -> Result<Option<Expr>, String> {
@@ -366,7 +560,9 @@ fn logsource_gate(logsource: Option<&Value>) -> Result<Option<Expr>, String> {
         Some("dns_query") | Some("dns") => Some("@action:dns_query"),
         Some("file_event") => Some("@action:file_create"),
         Some("file_delete") => Some("@action:file_delete"),
-        Some("registry_add") | Some("registry_set") | Some("registry_event") | Some("registry_delete") => Some("@action:registry_change"),
+        Some("registry_add") | Some("registry_set") | Some("registry_event") | Some("registry_delete") => {
+            Some("@action:registry_change")
+        }
         Some("image_load") => Some("@action:image_load"),
         Some("process_access") => Some("@action:process_access"),
         Some("create_remote_thread") => Some("@action:remote_thread"),
@@ -378,7 +574,9 @@ fn logsource_gate(logsource: Option<&Value>) -> Result<Option<Expr>, String> {
         (_, Some("security")) => Some("(source:*security* OR channel:security OR winlog.channel:security)"),
         (_, Some("sysmon")) => Some("(source:*sysmon* OR channel:*sysmon*)"),
         (_, Some("system")) => Some("(channel:system OR source:\"Service Control Manager\" OR source:*eventlog*)"),
-        (_, Some("powershell")) | (_, Some("powershell-classic")) => Some("(source:*powershell* OR channel:*powershell*)"),
+        (_, Some("powershell")) | (_, Some("powershell-classic")) => {
+            Some("(source:*powershell* OR channel:*powershell*)")
+        }
         (_, Some("auditd")) => Some("type:*"),
         (_, Some("sshd")) | (_, Some("auth")) => Some("(process:sshd OR process:sudo OR process:su OR @action:logon)"),
         (Some("aws"), _) => Some("eventSource:*"),
@@ -450,11 +648,9 @@ pub fn convert(doc: &Value) -> Result<Compiled, String> {
             }
         }
     }
-    let id = doc
-        .get("id")
-        .and_then(Value::as_str)
-        .map(|s| format!("sigma:{s}"))
-        .unwrap_or_else(|| format!("sigma:{}", title.to_lowercase().replace(|c: char| !c.is_ascii_alphanumeric(), "-")));
+    let id = doc.get("id").and_then(Value::as_str).map(|s| format!("sigma:{s}")).unwrap_or_else(|| {
+        format!("sigma:{}", title.to_lowercase().replace(|c: char| !c.is_ascii_alphanumeric(), "-"))
+    });
     let description = doc.get("description").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let falsepositives: Vec<String> = doc
         .get("falsepositives")
@@ -488,6 +684,21 @@ pub fn convert(doc: &Value) -> Result<Compiled, String> {
         summary: None,
         enabled: true,
         tactics,
+        evidence: policy(doc)?,
+        any: Vec::new(),
+        unless: String::new(),
+        provenance: metadata(doc),
+        ratio: None,
+        aggregate: None,
+        coverage: None,
+        bindings: Vec::new(),
+        references: doc["references"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
     };
     if let Some(agg) = agg {
         let by = agg.by.ok_or_else(|| format!("{}: agregação sem 'by' não é suportada", def.name))?;
@@ -545,11 +756,23 @@ detection:
         let rule = &rules[0];
         assert_eq!(rule.def.severity, "high");
         assert_eq!(rule.def.attack, vec!["T1033"]);
-        let hit = ev("Microsoft-Windows-Sysmon", "1", json!({"ParentImage": "C:\\inetpub\\w3wp.exe", "Image": "C:\\Windows\\System32\\whoami.exe", "CommandLine": "whoami /all", "User": "IIS APPPOOL\\site"}));
+        let hit = ev(
+            "Microsoft-Windows-Sysmon",
+            "1",
+            json!({"ParentImage": "C:\\inetpub\\w3wp.exe", "Image": "C:\\Windows\\System32\\whoami.exe", "CommandLine": "whoami /all", "User": "IIS APPPOOL\\site"}),
+        );
         assert!(rule.matches(&hit));
-        let filtered = ev("Microsoft-Windows-Sysmon", "1", json!({"ParentImage": "C:\\inetpub\\w3wp.exe", "Image": "C:\\Windows\\System32\\whoami.exe", "CommandLine": "whoami /all", "User": "NT AUTHORITY\\SYSTEM"}));
+        let filtered = ev(
+            "Microsoft-Windows-Sysmon",
+            "1",
+            json!({"ParentImage": "C:\\inetpub\\w3wp.exe", "Image": "C:\\Windows\\System32\\whoami.exe", "CommandLine": "whoami /all", "User": "NT AUTHORITY\\SYSTEM"}),
+        );
         assert!(!rule.matches(&filtered));
-        let other = ev("Microsoft-Windows-Sysmon", "3", json!({"ParentImage": "C:\\inetpub\\w3wp.exe", "Image": "C:\\Windows\\System32\\whoami.exe", "CommandLine": "whoami /all"}));
+        let other = ev(
+            "Microsoft-Windows-Sysmon",
+            "3",
+            json!({"ParentImage": "C:\\inetpub\\w3wp.exe", "Image": "C:\\Windows\\System32\\whoami.exe", "CommandLine": "whoami /all"}),
+        );
         assert!(!rule.matches(&other), "logsource gate requires a process creation");
     }
 
@@ -576,7 +799,8 @@ detection:
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].def.kind, "distinct");
         assert_eq!(rules[0].def.count, Some(6));
-        let failed = ev("Microsoft-Windows-Security-Auditing", "4625", json!({"TargetUserName": "a", "IpAddress": "1.2.3.4"}));
+        let failed =
+            ev("Microsoft-Windows-Security-Auditing", "4625", json!({"TargetUserName": "a", "IpAddress": "1.2.3.4"}));
         assert!(rules[0].matches(&failed));
         let mut linux = ev("srv", "", json!({"process": "sshd"}));
         linux.message = "Accepted password for root from 1.2.3.4 port 22".into();

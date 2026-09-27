@@ -5,7 +5,7 @@ Aplicacao desktop para investigar logs, feita com Tauri 2: o backend em Rust ind
 ## Recursos
 
 - Carregamento de arquivos de log (inclusive varios arquivos em conjunto), pacotes `.zip`/`.tar`/`.tgz`, arquivos `.evtx` em Windows e Linux e canais do Windows Event Log.
-- Triagem de segurança no Resumo: episódios com táticas MITRE ATT&CK, 47 regras de correlação (força bruta, pulverização de senhas, persistência, limpeza de logs, PowerShell codificado, webshell, LSASS, Kerberoasting, DCSync, varreduras, beaconing, eventos de nuvem), entidades por risco, raridades e importação de regras Sigma.
+- Triagem de segurança no Resumo: episódios com táticas MITRE ATT&CK, cinco níveis de evidência (E1–E5), rigidez máxima por padrão, correlações com vínculos explícitos, procedência, cobertura por regra e Sigma. O pacote contém 87 definições revisadas/experimentais, incluindo regras antigas retiradas por falta de contexto. E5 pode representar tentativa inequívoca bloqueada; resultados completos ficam em disco e são paginados. [Política, validação e limites](docs/deteccao-evidencias.md).
 - Linguagem de busca com campos, comparações, redes CIDR, listas, regex e `AND`/`OR`/`NOT`, com validação e complemento enquanto digita; campos canônicos (`@user`, `@src_ip`, `@host`, `@action`…) que atravessam todas as fontes. [Busca, entidades e detecções](docs/busca-e-deteccoes.md).
 - Menu de entidades em usuários, IPs, hosts e processos, paleta de comandos (Ctrl+K) e detalhe do registro com ação normalizada, regras e conteúdo decodificado.
 - Tamanho da interface automático para janelas pequenas e telas com escala do sistema, ajustável em Configurações → Interface ou com Ctrl + / Ctrl − / Ctrl 0.

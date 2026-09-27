@@ -16,7 +16,8 @@ pub const TACTICS: &[Tactic] = &[
     Tactic { id: "TA0002", key: "execution", label: "Execução" },
     Tactic { id: "TA0003", key: "persistence", label: "Persistência" },
     Tactic { id: "TA0004", key: "privilege-escalation", label: "Escalada de privilégio" },
-    Tactic { id: "TA0005", key: "defense-evasion", label: "Evasão de defesa" },
+    Tactic { id: "TA0005", key: "stealth", label: "Ocultação" },
+    Tactic { id: "TA0112", key: "defense-impairment", label: "Enfraquecimento de defesas" },
     Tactic { id: "TA0006", key: "credential-access", label: "Acesso a credenciais" },
     Tactic { id: "TA0007", key: "discovery", label: "Descoberta" },
     Tactic { id: "TA0008", key: "lateral-movement", label: "Movimento lateral" },
@@ -164,10 +165,40 @@ pub struct AttackRef {
     pub id: String,
     pub name: String,
     pub tactics: Vec<String>,
+    pub version: String,
+    pub original_id: Option<String>,
+}
+
+pub const VERSION: &str = "19.2";
+struct StixIndex { objects: std::collections::HashMap<String, serde_json::Value>, replacements: std::collections::HashMap<String,String> }
+fn stix() -> &'static StixIndex {
+    static INDEX: std::sync::OnceLock<StixIndex> = std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        let bundle: serde_json::Value = serde_json::from_str(include_str!("../resources/attack-enterprise-v19.2.json")).expect("versioned ATT&CK STIX bundle");
+        let mut objects = std::collections::HashMap::new();
+        let mut ids = std::collections::HashMap::new();
+        let all = bundle["objects"].as_array().expect("STIX objects");
+        for object in all {
+            if object["type"] != "attack-pattern" { continue; }
+            if let Some(id) = object["external_references"].as_array().into_iter().flatten().find(|r| r["source_name"] == "mitre-attack").and_then(|r| r["external_id"].as_str()) {
+                ids.insert(object["id"].as_str().unwrap_or_default().to_string(), id.to_string());
+                objects.insert(id.to_string(), object.clone());
+            }
+        }
+        let mut replacements = std::collections::HashMap::new();
+        for object in all {
+            if object["relationship_type"] == "revoked-by" {
+                if let (Some(a),Some(b)) = (object["source_ref"].as_str().and_then(|v| ids.get(v)),object["target_ref"].as_str().and_then(|v| ids.get(v))) { replacements.insert(a.clone(),b.clone()); }
+            }
+        }
+        StixIndex { objects, replacements }
+    })
 }
 
 pub fn tactic(key: &str) -> Option<&'static Tactic> {
     let key = key.trim().to_lowercase().replace(['_', ' '], "-");
+    // Legacy tags remain readable; technique-specific migration uses STIX below.
+    let key = if key == "defense-evasion" { "stealth".to_string() } else { key };
     TACTICS.iter().find(|t| t.key == key || t.id.eq_ignore_ascii_case(&key))
 }
 
@@ -186,8 +217,19 @@ pub fn technique(id: &str) -> Option<&'static Technique> {
 /// Reference for a technique id, keeping unknown ids visible.
 pub fn reference(id: &str, extra_tactics: &[String]) -> AttackRef {
     let upper = id.trim().to_uppercase();
+    let index = stix();
+    let mut current = upper.clone();
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(current.clone()) { if let Some(next) = index.replacements.get(&current) { current = next.clone(); } else { break; } }
+    if let Some(object) = index.objects.get(&current) {
+        let mut tactics: Vec<_> = object["kill_chain_phases"].as_array().into_iter().flatten().filter(|p| p["kill_chain_name"] == "mitre-attack").filter_map(|p| p["phase_name"].as_str().map(str::to_string)).collect();
+        tactics.sort_by_key(|t| tactic_order(t));
+        let name = TECHNIQUES.iter().find(|t| t.id == current).map(|t| t.name.to_string()).unwrap_or_else(|| object["name"].as_str().unwrap_or(&current).to_string());
+        return AttackRef { original_id: (current != upper).then_some(upper), id: current, name, tactics, version: VERSION.into() };
+    }
     match technique(&upper) {
         Some(found) => AttackRef {
+            version: VERSION.into(), original_id: None,
             id: upper.clone(),
             name: if found.id == upper {
                 found.name.to_string()
@@ -196,7 +238,7 @@ pub fn reference(id: &str, extra_tactics: &[String]) -> AttackRef {
             },
             tactics: found.tactics.iter().map(|t| t.to_string()).collect(),
         },
-        None => AttackRef { id: upper.clone(), name: upper, tactics: extra_tactics.to_vec() },
+        None => AttackRef { id: upper.clone(), name: upper, tactics: extra_tactics.to_vec(), version: VERSION.into(), original_id: None },
     }
 }
 

@@ -708,6 +708,7 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
     // ECS-shaped sources already carry both.
     let explicit_action = field_ci(ev, "event.action");
     let explicit_outcome = field_ci(ev, "event.outcome").and_then(|v| textual_outcome(&v));
+    if let Some(a) = explicit_action_static(explicit_action.as_deref()) { return (Some(a), explicit_outcome); }
     let hint = provider_hint(ev);
     let code = ev.code.trim();
 
@@ -786,7 +787,7 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
             return (Some("task_create"), Some("success"));
         }
         if hint.contains("windows defender") && ["1116", "1117", "1006", "1007"].contains(&code) {
-            return (Some("malware_detected"), Some("success"));
+            return (Some("malware_detected"), None);
         }
         if hint.contains("windows defender") && code == "5001" {
             return (Some("protection_disabled"), Some("success"));
@@ -794,12 +795,12 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
     }
 
     // Cloud audit logs.
-    if let Some(name) = field_ci(ev, "eventName") {
-        let error = field_ci(ev, "errorCode").is_some();
+    if let Some(name) = field_ci(ev, "eventName").filter(|_| field_ci(ev, "eventSource").is_some_and(|v| v.ends_with(".amazonaws.com"))) {
+        let error = field_ci(ev, "errorCode").is_some() || field_ci(ev, "responseElements.errorCode").is_some();
         let outcome = if name == "ConsoleLogin" {
             field_ci(ev, "responseElements.ConsoleLogin")
                 .and_then(|v| textual_outcome(&v))
-                .or(Some(if error { "failure" } else { "success" }))
+                .or(if error { Some("failure") } else { None })
         } else if error {
             Some("failure")
         } else {
@@ -814,11 +815,11 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
             "CreateAccessKey" | "CreateLoginProfileKey" | "UpdateLoginProfile" => {
                 Some("credential_create")
             }
-            "StopLogging" | "DeleteTrail" | "UpdateTrail" | "DeleteFlowLogs"
+            "StopLogging" | "DeleteTrail" | "DeleteFlowLogs"
             | "DeleteDetector" | "DisableSecurityHub" => Some("log_clear"),
             "AuthorizeSecurityGroupIngress" | "ModifyInstanceAttribute" => Some("network_change"),
             "GetSecretValue" | "GetParameter" | "GetParameters" => Some("secret_access"),
-            _ => None,
+            _ => Some("api_request"),
         };
         if action.is_some() {
             return (action, outcome);
@@ -848,6 +849,33 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
             let ok = result.trim() == "0";
             return (Some("logon"), Some(if ok { "success" } else { "failure" }));
         }
+    }
+
+    // Structured cloud/container outcomes. RequestReceived is not a completed operation.
+    if field_ci(ev, "auditID").is_some() {
+        let outcome = field_ci(ev, "responseStatus.code").filter(|_| field_ci(ev, "stage").as_deref() == Some("ResponseComplete")).and_then(|v| v.parse::<u16>().ok())
+            .map(|c| if c < 400 { "success" } else { "failure" });
+        let resource = field_ci(ev, "objectRef.resource").unwrap_or_default();
+        let verb = field_ci(ev, "verb").unwrap_or_default();
+        let sub = field_ci(ev, "objectRef.subresource").unwrap_or_default();
+        let action = match (resource.as_ref(), verb.as_ref(), sub.as_ref()) {
+            ("pods", "create", "exec") => "container_exec",
+            ("pods", "create", _) => "container_create",
+            ("secrets", "get" | "list", _) => "secret_access",
+            ("clusterrolebindings" | "rolebindings", "create" | "patch" | "update", _) => "privilege_grant",
+            (_, "delete" | "deletecollection", _) => "resource_delete",
+            _ => "api_request",
+        };
+        return (Some(action), outcome);
+    }
+    if let Some(method) = field_ci(ev, "protoPayload.methodName") {
+        let outcome = field_ci(ev, "protoPayload.status.code").and_then(|v| v.parse::<u16>().ok())
+            .map(|c| if c == 0 { "success" } else { "failure" });
+        let action = if method.contains("AccessSecretVersion") { "secret_access" }
+            else if method.contains("CreateServiceAccountKey") { "credential_create" }
+            else if method.contains("SetIamPolicy") { "privilege_grant" }
+            else if method.contains("DeleteSink") { "log_clear" } else { "api_request" };
+        return (Some(action), outcome);
     }
 
     // Linux authentication and administration.
@@ -898,35 +926,15 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
             _ => None,
         };
         if action.is_some() {
-            return (action, res.or(Some("success")));
+            return (action, res);
         }
     }
 
-    // Web requests: status decides the outcome; login endpoints are logons.
+    // HTTP status describes transport/application response, never authentication.
     if let Some(status) = value(ev, Role::Status) {
         if let Ok(number) = status.trim().parse::<u16>() {
-            if (100..600).contains(&number) {
-                let outcome = if number < 400 { "success" } else { "failure" };
-                let path = value(ev, Role::Url).map(|u| u.to_ascii_lowercase()).unwrap_or_default();
-                let method = ["method", "cs-method", "http.request.method", "request_method"]
-                    .iter()
-                    .find_map(|k| field_ci(ev, k))
-                    .map(|m| m.to_ascii_uppercase())
-                    .unwrap_or_default();
-                let login_path = ["login", "signin", "sign-in", "logon", "auth", "session", "token", "wp-login", "xmlrpc"]
-                    .iter()
-                    .any(|n| path.contains(n));
-                if login_path && method == "POST" {
-                    let outcome = if number == 401 || number == 403 || (number == 200 && path.contains("wp-login")) {
-                        "failure"
-                    } else if number < 400 {
-                        "success"
-                    } else {
-                        "failure"
-                    };
-                    return (Some("logon"), Some(outcome));
-                }
-                return (Some("http_request"), Some(outcome));
+            if (100..600).contains(&number) && has_http_shape(ev) {
+                return (Some("http_request"), Some(if number < 400 { "success" } else { "failure" }));
             }
         }
     }
@@ -950,7 +958,7 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
     if let Some(event_type) = field_ci(ev, "event_type") {
         // Suricata EVE
         if event_type == "alert" {
-            return (Some("ids_alert"), Some("success"));
+            return (Some("ids_alert"), None);
         }
         if event_type == "dns" {
             return (Some("dns_query"), Some("success"));
@@ -985,17 +993,73 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
 }
 
 fn explicit_action_static(value: Option<&str>) -> Option<&'static str> {
-    let v = value?.to_ascii_lowercase();
-    Some(match v.as_str() {
-        a if a.contains("logon") || a.contains("login") || a.contains("authentication") => "logon",
-        a if a.contains("logoff") || a.contains("logout") => "logoff",
-        a if a.contains("process") && (a.contains("start") || a.contains("creat")) => "process_start",
-        a if a.contains("dns") => "dns_query",
-        a if a.contains("connection") || a.contains("network") => "network_connection",
-        a if a.contains("file") && a.contains("creat") => "file_create",
-        a if a.contains("user") && a.contains("creat") => "account_create",
-        _ => return None,
-    })
+    match value?.to_ascii_lowercase().as_str() {
+        "oauth_consent" => Some("oauth_consent"),
+        "mail_rule_create" => Some("mail_rule_create"),
+        "object_read" => Some("object_read"),
+        "object_transfer" => Some("object_transfer"),
+        "workflow_change" => Some("workflow_change"),
+        "secret_transfer" => Some("secret_transfer"),
+        "repository_protection_disable" => Some("repository_protection_disable"),
+        "package_publish" => Some("package_publish"),
+        "service_ticket" => Some("service_ticket"),
+        "auth_success" => Some("auth_success"),
+        "logon" => Some("logon"),
+        "logoff" => Some("logoff"),
+        "process_start" => Some("process_start"),
+        "process_end" => Some("process_end"),
+        "dns_query" => Some("dns_query"),
+        "network_connection" => Some("network_connection"),
+        "file_create" => Some("file_create"),
+        "file_delete" => Some("file_delete"),
+        "file_modify" => Some("file_modify"),
+        "file_rename" => Some("file_rename"),
+        "account_create" => Some("account_create"),
+        "account_change" => Some("account_change"),
+        "account_lockout" => Some("account_lockout"),
+        "task_create" => Some("task_create"),
+        "task_update" => Some("task_update"),
+        "service_install" => Some("service_install"),
+        "registry_change" => Some("registry_change"),
+        "script_execution" => Some("script_execution"),
+        "process_access" => Some("process_access"),
+        "privilege_use" => Some("privilege_use"),
+        "privilege_grant" => Some("privilege_grant"),
+        "credential_create" => Some("credential_create"),
+        "mail_rule_change" => Some("mail_rule_change"),
+        "file_transfer" => Some("file_transfer"),
+        "secret_access" => Some("secret_access"),
+        "log_clear" => Some("log_clear"),
+        "audit_policy_change" => Some("audit_policy_change"),
+        "protection_disabled" => Some("protection_disabled"),
+        "http_request" => Some("http_request"),
+        "malware_detected" => Some("malware_detected"),
+        "ids_alert" => Some("ids_alert"),
+        "container_exec" => Some("container_exec"),
+        "container_create" => Some("container_create"),
+        "resource_delete" => Some("resource_delete"),
+        "api_request" => Some("api_request"),
+        "file_download" => Some("file_download"),
+        "file_upload" => Some("file_upload"),
+        "credential_use" => Some("credential_use"),
+        "data_export" => Some("data_export"),
+        "certificate_request" => Some("certificate_request"),
+        "certificate_issue" => Some("certificate_issue"),
+        "directory_change" => Some("directory_change"),
+        "module_load" => Some("module_load"),
+        "email_rule_create" => Some("email_rule_create"),
+        "pipeline_change" => Some("pipeline_change"),
+        "artifact_publish" => Some("artifact_publish"),
+        "privileged_logon" => Some("privileged_logon"),
+        "group_member_add" => Some("group_member_add"),
+        "logon_explicit" => Some("logon_explicit"),
+        "kerberos_service_ticket" => Some("kerberos_service_ticket"),
+        "share_access" => Some("share_access"),
+        "process_tampering" => Some("process_tampering"),
+        "login" | "authentication" | "logged-in" => Some("logon"),
+        "logout" => Some("logoff"),
+        _ => None,
+    }
 }
 
 pub fn action_label(action: &str) -> &'static str {
@@ -1384,13 +1448,13 @@ mod tests {
     }
 
     #[test]
-    fn web_requests_classify_logins_and_tools() {
+    fn web_requests_do_not_infer_authentication() {
         let mut ev = event(json!({"method": "POST", "path": "/api/login", "agent": "sqlmap/1.7"}));
         ev.source = "192.168.1.11".into();
         ev.code = "401".into();
         assert_eq!(value(&ev, Role::SrcIp).as_deref(), Some("192.168.1.11"));
         assert_eq!(value(&ev, Role::Status).as_deref(), Some("401"));
-        assert_eq!(action_outcome(&ev), (Some("logon"), Some("failure")));
+        assert_eq!(action_outcome(&ev), (Some("http_request"), Some("failure")));
         assert_eq!(value(&ev, Role::Tool).as_deref(), Some("sqlmap"));
         let extracted = extract(&ev);
         assert_eq!(extracted.get(Role::Tool), Some("sqlmap"));

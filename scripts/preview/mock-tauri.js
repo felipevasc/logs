@@ -123,6 +123,7 @@
   // ---------------------------------------------------------------- helpers
   const colStr = (ev, col) => {
     if (col.startsWith("@") && window.QueryLang) return window.QueryLang.fieldValue(ev, window.QueryLang.resolve(col)) ?? "";
+    if (col === "event_ref") return ev.event_ref || `preview:${ev.id}`;
     if (col === "id") return String(ev.id);
     if (col === "timestamp") return ev.timestamp == null ? "" : new Date(ev.timestamp).toISOString().replace(/\.000Z$/, "+00:00").replace(/Z$/, "+00:00");
     if (col in ev && typeof ev[col] === "string") return ev[col];
@@ -164,6 +165,7 @@
   function matchFilter(ev, f) {
     if (window.QueryLang && !window.QueryLang.detectionMatch) { window.QueryLang.detectionMatch = mockDetectionMatch; window.QueryLang.derive = mockDerive; }
     if (f.op === "detection") return mockDetectionMatch(ev, f.value);
+    if (f.op === "in_exact") return new Set(String(f.value || "").split("\n")).has(colStr(ev,f.column));
     const language = window.QueryLang?.matchFilter(ev, f);
     if (language !== undefined) return language;
     const hay = f.column === "_all" ? `${ev.message||''}\n${ev.raw||''}` : colStr(ev, f.column);
@@ -672,9 +674,9 @@
   const MOCK_RULES = [
     { id: "auth.bruteforce.source", name: "Força bruta de senha", severity: "medium", kind: "threshold", attack: [{ id: "T1110.001", name: "Adivinhação de senha", tactics: ["credential-access"] }], description: "Muitas falhas de autenticação da mesma origem." },
     { id: "auth.bruteforce.success", name: "Acesso após força bruta", severity: "high", kind: "sequence", attack: [{ id: "T1110", name: "Força bruta", tactics: ["credential-access"] }, { id: "T1078", name: "Contas válidas", tactics: ["initial-access", "persistence"] }], description: "Falhas seguidas de acesso bem-sucedido da mesma origem." },
-    { id: "evasion.log-clear", name: "Registro de auditoria apagado ou desativado", severity: "high", kind: "single", attack: [{ id: "T1070.001", name: "Limpeza de logs de eventos do Windows", tactics: ["defense-evasion"] }], description: "O log de auditoria foi apagado." },
+    { id: "evasion.log-clear", name: "Registro de auditoria apagado ou desativado", severity: "high", kind: "single", attack: [{ id: "T1070.001", name: "Limpeza de logs de eventos do Windows", tactics: ["stealth"] }], description: "O log de auditoria foi apagado." },
   ];
-  const TACTICS = [["TA0043","reconnaissance","Reconhecimento"],["TA0042","resource-development","Preparação"],["TA0001","initial-access","Acesso inicial"],["TA0002","execution","Execução"],["TA0003","persistence","Persistência"],["TA0004","privilege-escalation","Escalada de privilégio"],["TA0005","defense-evasion","Evasão de defesa"],["TA0006","credential-access","Acesso a credenciais"],["TA0007","discovery","Descoberta"],["TA0008","lateral-movement","Movimento lateral"],["TA0009","collection","Coleta"],["TA0011","command-and-control","Comando e controle"],["TA0010","exfiltration","Exfiltração"],["TA0040","impact","Impacto"]];
+  const TACTICS = [["TA0043","reconnaissance","Reconhecimento"],["TA0042","resource-development","Preparação"],["TA0001","initial-access","Acesso inicial"],["TA0002","execution","Execução"],["TA0003","persistence","Persistência"],["TA0004","privilege-escalation","Escalada de privilégio"],["TA0005","stealth","Ocultação"],["TA0112","defense-impairment","Enfraquecimento de defesas"],["TA0006","credential-access","Acesso a credenciais"],["TA0007","discovery","Descoberta"],["TA0008","lateral-movement","Movimento lateral"],["TA0009","collection","Coleta"],["TA0011","command-and-control","Comando e controle"],["TA0010","exfiltration","Exfiltração"],["TA0040","impact","Impacto"]];
   function mockDerive(ev, role) {
     const logon = ev.code === "4624" || ev.code === "4625";
     if (role === "@action") return logon ? "logon" : null;
@@ -689,6 +691,7 @@
   const ipOf = ev => ev.fields?.ip_cliente || "";
   const scopeOf = ip => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip) ? "privado" : "público";
   function mockTriage(rows) {
+    rows.forEach(e => e.event_ref ||= `preview:${e.id}`);
     const enabled = MOCK_RULES.filter(r => !detectionSettings.disabled.includes(r.id));
     const byIp = new Map();
     for (const e of rows) if (e.code === "4625" || e.code === "4624") { const ip = ipOf(e); if (!ip) continue; (byIp.get(ip) || byIp.set(ip, []).get(ip)).push(e); }
@@ -709,7 +712,7 @@
       return { id: `d${n}-${d.rule}`, rule: d.rule, name: rule.name, description: rule.description, severity: rule.severity, origin: "builtin", kind: rule.kind, attack: rule.attack, tactics: rule.attack.map(a => a.tactics[0]),
         start: d.list[0].timestamp, end: d.list.at(-1).timestamp, count: d.list.length, entities: [{ column: "@src_ip", label: "IP de origem", value: d.ip }],
         summary: d.rule === "auth.bruteforce.source" ? `${d.list.length} falhas de autenticação de ${d.ip}` : `Falhas seguidas de acesso bem-sucedido a partir de ${d.ip}`,
-        distinct: 0, period_ms: null, event_ids: d.ids.slice(0, 50), filters: [{ column: "_all", op: "detection", value: d.rule, value2: null }, { column: "@src_ip", op: "equals_exact", value: d.ip, value2: null }] };
+        evidence_level: d.rule === "auth.bruteforce.source" ? 1 : 2, evidence_reasons: ["Cenario sintetico de demonstracao"], missing_evidence: ["Uso abusivo posterior"], benign_alternatives: ["Senha expirada"], outcome: "mixed", event_refs: d.list.map(e => e.event_ref), policy_version: "evidence-1", rule_version: "2", normalization_version: "normalization-1", distinct: 0, period_ms: null, event_ids: d.ids, filters: [{ column: "_all", op: "detection", value: d.rule, value2: null }, { column: "@src_ip", op: "equals_exact", value: d.ip, value2: null }] };
     }).filter(d => !detectionSettings.suppress.some(s => s.rule === d.rule && (!s.value || d.entities.some(e => e.value === s.value))));
     const suppressed = detections.length - shaped.length;
     const groups = new Map();
@@ -718,18 +721,18 @@
     const episodes = [...groups.values()].map((idx, n) => {
       const list = idx.map(i => shaped[i]).sort((a, b) => rank[b.severity] - rank[a.severity]);
       const tactics = [...new Set(list.flatMap(d => d.tactics))].sort((a, b) => TACTICS.findIndex(t => t[1] === a) - TACTICS.findIndex(t => t[1] === b));
-      return { id: `e${n}`, title: list[0].name, summary: list.length > 1 ? `${list[0].summary} · também ${list[1].name}` : list[0].summary, severity: list[0].severity, score: list.length * 30, start: Math.min(...list.map(d => d.start)), end: Math.max(...list.map(d => d.end)), detections: idx, tactics, entities: list[0].entities };
+      return { id: `e${n}`, evidence_level: Math.max(...list.map(d => d.evidence_level)), event_refs: [...new Set(list.flatMap(d => d.event_refs))], title: list[0].name, summary: list.length > 1 ? `${list[0].summary} · também ${list[1].name}` : list[0].summary, severity: list[0].severity, score: list.length * 30, start: Math.min(...list.map(d => d.start)), end: Math.max(...list.map(d => d.end)), detections: idx, tactics, entities: list[0].entities };
     }).sort((a, b) => rank[b.severity] - rank[a.severity]);
-    const entities = [...groups.keys()].map(ip => { const evs = byIp.get(ip) || []; const failures = evs.filter(e => e.code === "4625").length; const n = shaped.filter(d => d.entities[0].value === ip).length; const score = Math.min(100, n * 35); return { column: "@src_ip", label: "IP de origem", value: ip, score, level: score >= 70 ? "alto" : score >= 40 ? "médio" : "baixo", detections: n, events: evs.length, failures, first: evs[0]?.timestamp ?? null, last: evs.at(-1)?.timestamp ?? null, scope: scopeOf(ip), tactics: [...new Set(shaped.filter(d => d.entities[0].value === ip).flatMap(d => d.tactics))] }; }).sort((a, b) => b.score - a.score);
+    const entities = [...groups.keys()].map(ip => { const evs = byIp.get(ip) || []; const failures = evs.filter(e => e.code === "4625").length; const n = shaped.filter(d => d.entities[0].value === ip).length; const score = Math.min(100, n * 35); return { column: "@src_ip", label: "IP de origem", value: ip, score, evidence_level: 2, level: score >= 70 ? "alto" : score >= 40 ? "médio" : "baixo", detections: n, events: evs.length, failures, first: evs[0]?.timestamp ?? null, last: evs.at(-1)?.timestamp ?? null, scope: scopeOf(ip), tactics: [...new Set(shaped.filter(d => d.entities[0].value === ip).flatMap(d => d.tactics))] }; }).sort((a, b) => b.score - a.score);
     const codes = countBy(rows, "code").filter(([v, n]) => v !== "(vazio)" && n <= 6);
     const rare = codes.slice(0, 8).map(([value, count]) => { const first = rows.filter(e => e.code === value).sort((a, b) => a.timestamp - b.timestamp)[0]; return { column: "code", label: "Código", value, count, first: first?.timestamp ?? null, event_id: first?.id ?? 0, role_events: rows.length, role_distinct: codes.length, filter: { column: "code", op: "equals", value, value2: null } }; });
     const tactics = TACTICS.map(([id, key, label]) => { const hits = shaped.filter(d => d.attack.some(a => a.tactics[0] === key)); const techniques = []; for (const d of hits) for (const a of d.attack) if (a.tactics[0] === key && !techniques.some(t => t.id === a.id)) techniques.push({ id: a.id, name: a.name, count: hits.filter(h => h.attack.some(x => x.id === a.id)).length }); return { id, key, label, count: hits.length, techniques }; });
     const times = rows.map(e => e.timestamp).filter(t => t != null);
-    return { total: rows.length, undated: rows.length - times.length, start: times.length ? Math.min(...times) : null, end: times.length ? Math.max(...times) : null, complete: true, limited: false, detections: shaped, episodes, entities, rare, tactics, coverage: [{ column: "@user", label: "Usuário", count: rows.filter(e => e.fields?.usuario).length }, { column: "@src_ip", label: "IP de origem", count: rows.filter(e => e.fields?.ip_cliente).length }], suppressed, rules: MOCK_RULES.length - detectionSettings.disabled.length, sigma_rules: 0, sigma_errors: [], threat_rules: detectionSettings.threats ? 378 : 0, elapsed_ms: 120 };
+    return { analysis_id: "preview-analysis", policy_version: "evidence-1", normalization_version: "normalization-1", attack_version: "19.2", counts_by_level: [1,2,3,4,5].map(n => shaped.filter(d => d.evidence_level === n).length), rule_coverage: [{ rule: "execution", status: "missing_fields", missing: ["process.entity_id"] }], limitations: ["Cenario sintetico de demonstracao"], total: rows.length, undated: rows.length - times.length, start: times.length ? Math.min(...times) : null, end: times.length ? Math.max(...times) : null, complete: true, limited: false, detections: shaped, episodes, entities, rare, tactics, coverage: [{ column: "@user", label: "Usuário", count: rows.filter(e => e.fields?.usuario).length }, { column: "@src_ip", label: "IP de origem", count: rows.filter(e => e.fields?.ip_cliente).length }], suppressed, rules: MOCK_RULES.length - detectionSettings.disabled.length, sigma_rules: 0, sigma_errors: [], threat_rules: detectionSettings.threats ? 378 : 0, elapsed_ms: 120 };
   }
   Object.assign(handlers, {
     case_sync: ({ key, events }) => { caseStore.set(key, events); if (caseStore.size > 3) caseStore.delete(caseStore.keys().next().value); return null; },
-    triage: ({ filters, caseEvents }) => mockTriage(applyFilters(filters, poolOf(caseEvents))),
+    triage: ({ filters, caseEvents }) => mockTriage(poolOf(caseEvents)),
     event_insights: ({ event }) => {
       const entities = [];
       if (event.fields?.usuario) entities.push({ role: "User", column: "@user", label: "Usuário", value: event.fields.usuario, scope: null });

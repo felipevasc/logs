@@ -13,6 +13,7 @@ window.CaseTimeline = (() => {
   });
   const safe = value => String(value ?? "").replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
   const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const display = value => window.EvidenceUI?.redact(value) ?? value;
   const preview = (value, limit = 600) => {
     const text = String(value ?? "");
     if (text.length <= limit) return text;
@@ -59,8 +60,8 @@ window.CaseTimeline = (() => {
         const id = `e:${item.id}:${event.event_ref || (event.id ?? index)}`;
         const edit = config.edits[id] || {};
         events.push({ id, itemId: item.id, type: "event", start: event.timestamp, end: event.timestamp,
-          title: edit.title || event.name || event.message || event.code || "Evento",
-          detail: event.message || event.description || "", source: item.label || item.name || "Item do caso",
+          title: display(edit.title || event.name || event.message || event.code || "Evento"),
+          detail: display([event.message || event.description || "", window.EvidenceUI?.eventContext(item, event)].filter(Boolean).join("\n")), source: display(item.label || item.name || "Item do caso"),
           color: edit.color || item.timelineColor || COLORS[itemIndex % COLORS.length], rows: [event] });
       });
     });
@@ -164,8 +165,8 @@ window.CaseTimeline = (() => {
       const event = item.rows[index]; if (valid(event.timestamp) || !passes(event)) continue;
       const id = `e:${item.id}:${event.event_ref || (event.id ?? index)}`, edit = collected.config.edits[id] || {};
       collected.entries.push({ id, itemId: item.id, type: "event", start: null, end: null,
-        title: edit.title || event.name || event.message || event.code || "Evento",
-        detail: event.message || event.description || "", source: item.label || item.name || "Item do caso", rows: [event] });
+        title: display(edit.title || event.name || event.message || event.code || "Evento"),
+        detail: display([event.message || event.description || "", window.EvidenceUI?.eventContext(item, event)].filter(Boolean).join("\n")), source: display(item.label || item.name || "Item do caso"), rows: [event] });
     }
     const notes = noteMap(collected.config, collected.entries), result = []; let chars = 0, eventCount = 0, end = null;
     for (const entry of collected.entries) {

@@ -4,6 +4,12 @@ mod case_cache;
 mod case_images;
 mod case_store;
 mod detections;
+mod evidence;
+mod security_normalize;
+mod security_store;
+mod security_results;
+mod security_budget;
+mod security_reconstruct;
 mod discovery;
 mod distinct;
 mod entities;
@@ -2136,7 +2142,10 @@ pub fn run() {
             mcp::mcp_configure,
             workspace::dataset_overview,
             triage::triage,
+            triage::triage_episode,
+            triage::triage_timeline,
             triage::event_insights,
+            triage::normalization_preview,
             triage::detection_rules,
             triage::detection_settings_save,
             triage::sigma_import,
@@ -2196,3 +2205,6 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("erro ao iniciar o LogInsight");
 }
+
+#[cfg(test)]
+mod security_tests;

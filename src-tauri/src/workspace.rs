@@ -233,6 +233,7 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
             "threat_rule",
             "query",
             "in",
+            "in_exact",
             "not_in",
             "cidr",
             "not_cidr",

@@ -7,6 +7,32 @@ use crate::{
 use std::{io::Write, path::PathBuf};
 
 struct Fixture(PathBuf);
+
+#[test]
+#[ignore = "Synthetic security scale benchmark; BENCH_EVENTS=100000,1000000,10000000"]
+fn benchmark_security_evidence() {
+    let counts=std::env::var("BENCH_EVENTS").unwrap_or_else(|_|"100000,1000000,10000000".into());
+    let rules=crate::detections::builtin_ruleset().unwrap();
+    let catalog=crate::threats::builtin_catalog();
+    let settings=crate::detections::Settings::default();
+    for count in counts.split(',').map(|n|n.parse::<usize>().unwrap()) {
+        let fixture=Fixture::new("");
+        let mut writer=std::io::BufWriter::new(std::fs::File::create(&fixture.0).unwrap());
+        for i in 0..count {
+            writeln!(writer,"{{\"timestamp\":{},\"event.category\":\"process\",\"event.action\":\"process_start\",\"event.outcome\":\"success\",\"host.name\":\"host-{}\",\"process.command_line\":\"{}\"}}",1_700_000_000_000i64+i as i64,i%100,if i+1==count {"sekurlsa::logonpasswords"}else{"worker --job completed"}).unwrap();
+        }
+        writer.flush().unwrap(); drop(writer);
+        let start=std::time::Instant::now(); let index=fixture.index("jsonl"); let indexing_ms=start.elapsed().as_millis();
+        let state=state_for(crate::SourceData::Indexed(index)); let start=std::time::Instant::now();
+        let result=workspace::with_selection(&state,&[],|selection|crate::detections::run_stored(&crate::detections::Inputs {rules:&rules,catalog:Some(&catalog),settings:&settings},&crate::detections::Source::Selection(&selection))).unwrap();
+        let analysis_ms=start.elapsed().as_millis(); assert_eq!(result.metadata["total"],count);
+        let mut tail=std::iter::once(count-1);let page=result.page(1,0,20,Some(&mut tail),None).unwrap();
+        assert!(page["detections"].as_array().unwrap().iter().any(|d|d["event_ids"].as_array().unwrap().contains(&serde_json::json!(count-1))));
+        assert_eq!(result.metadata["storage"]["complete"],true);let start=std::time::Instant::now();
+        for level in 1..=5 { result.page(level,0,20,None,None).unwrap(); }
+        println!("SECURITY_BENCH {}",serde_json::json!({"events":count,"indexing_ms":indexing_ms,"analysis_ms":analysis_ms,"five_projections_ms":start.elapsed().as_millis(),"detections":page["available_detections"],"limited":result.metadata["limited"],"memory":result.metadata["memory"],"storage":result.metadata["storage"],"synthetic":true,"policy":result.metadata["policy_version"]}));
+    }
+}
 impl Fixture {
     fn new(text: &str) -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -47,6 +73,20 @@ fn state_for(source: crate::SourceData) -> crate::AppState {
         codes_path: PathBuf::new(),
         system_codes_path: PathBuf::new(),
     }
+}
+
+#[test]
+fn security_memory_index_and_projection_have_identical_evidence() {
+    let lines=(0..5).map(|i|serde_json::json!({"timestamp":1700000000000i64+i*1000,"event.category":"process","event.action":"process_start","event.outcome":"success","host.name":"host","process.command_line":if i==4 {"sekurlsa::logonpasswords"}else{"worker --job completed"}}).to_string()).collect::<Vec<_>>().join("\n");
+    let fixture=Fixture::new(&lines);let idx=fixture.index("jsonl");let codes=CodesConfig::default();
+    let events:Vec<_>=(0..idx.lines.len()).map(|id|sources::event_at(&idx,id,&codes,&codes,&[])).collect();
+    let rules=crate::detections::builtin_ruleset().unwrap();let settings=crate::detections::Settings::default();let catalog=crate::threats::builtin_catalog();
+    let inputs=crate::detections::Inputs {rules:&rules,settings:&settings,catalog:Some(&catalog)};
+    let memory=crate::detections::run(&inputs,&crate::detections::Source::Events(events.iter().collect())).unwrap();
+    let state=state_for(crate::SourceData::Indexed(idx));
+    let indexed=workspace::with_selection(&state,&[],|selection|crate::detections::run(&inputs,&crate::detections::Source::Selection(&selection))).unwrap();
+    let mut a=serde_json::to_value(memory).unwrap();let mut b=serde_json::to_value(indexed).unwrap();a["elapsed_ms"]=0.into();b["elapsed_ms"]=0.into();assert_eq!(a,b);
+    for minimum in 1..=5 { assert_eq!(crate::triage::project(&a,minimum,None),crate::triage::project(&b,minimum,None)); }
 }
 
 #[test]
@@ -1653,17 +1693,16 @@ fn triage_ssh_bruteforce_success_is_one_episode_with_risky_source() {
     let fixture = Fixture::new(&lines.join("\n"));
     let index = fixture.index("auto");
     let state = state_for(crate::SourceData::Indexed(index));
-    let value = crate::triage::triage_impl(&state, vec![], None, true).unwrap();
+    let value = crate::triage::analysis_impl(&state, None, true).unwrap();
     let t: serde_json::Value = (*value).clone();
     let rules: Vec<&str> = t["detections"].as_array().unwrap().iter().map(|d| d["rule"].as_str().unwrap()).collect();
     assert!(rules.contains(&"auth.bruteforce.source"), "{rules:?}");
     assert!(rules.contains(&"auth.bruteforce.success"), "{rules:?}");
-    assert!(rules.contains(&"auth.root.public"), "{rules:?}");
+    assert!(!rules.contains(&"auth.root.public"), "public IP and admin name alone are not suspicious");
     let episodes = t["episodes"].as_array().unwrap();
     assert_eq!(episodes.len(), 1, "{episodes:?}");
     assert_eq!(episodes[0]["severity"], "high");
-    let top = &t["entities"][0];
-    assert_eq!(top["value"], "45.90.12.3");
+    let top = t["entities"].as_array().unwrap().iter().find(|e| e["column"] == "@src_ip" && e["value"] == "45.90.12.3").unwrap();
     assert_eq!(top["scope"], "público");
     assert!(top["failures"].as_u64().unwrap() >= 12);
     // Evidence filters reproduce the supporting records.
@@ -1689,17 +1728,16 @@ fn triage_windows_spraying_webshell_encoded_powershell_and_log_clear() {
     events.push(win(22, base + 900_000, security, "1102", serde_json::json!({"SubjectUserName": "admin", "Computer": "WEB01"})));
     let t = triage_events(events, false);
     let rules = rules_of(&t);
-    for expected in ["auth.spraying", "exec.webshell-child", "exec.encoded-powershell", "evasion.log-clear"] {
+    for expected in ["auth.spraying", "exec.webshell-child", "evasion.log-clear"] {
         assert!(rules.contains(&expected.to_string()), "missing {expected}: {rules:?}");
     }
     let spray = t.detections.iter().find(|d| d.rule == "auth.spraying").unwrap();
     assert_eq!(spray.distinct, 10);
     assert!(spray.summary.contains("10.9.9.9") && spray.summary.contains("10"), "{}", spray.summary);
-    // WEB01 activity forms a multi-tactic episode.
-    let web = t.episodes.iter().find(|e| e.entities.iter().any(|x| x.value == "WEB01")).unwrap();
-    assert!(web.tactics.len() >= 3, "{:?}", web.tactics);
-    assert!(web.title.starts_with("Possível cadeia de ataque"), "{}", web.title);
-    assert!(t.entities.iter().any(|e| e.value == "WEB01" && e.score >= 70));
+    assert!(!rules.contains(&"exec.encoded-powershell".to_string()), "encoding alone is not suspicious");
+    assert!(t.detections.iter().all(|d|d.evidence.evidence_level <= 2));
+    assert!(t.episodes.iter().all(|e|!e.title.starts_with("Possivel cadeia")), "host/time alone cannot join unrelated events");
+
 }
 
 #[test]
@@ -1712,10 +1750,10 @@ fn triage_web_scan_tool_success_port_scan_and_beacon() {
     lines.push("192.168.1.10 - - [31/Jan/2024:08:05:00 -0300] \"GET /api/users?id=1 UNION SELECT password FROM users HTTP/1.1\" 500 12 \"-\" \"Mozilla/5.0\"".into());
     let web = Fixture::new(&lines.join("\n"));
     let web_state = state_for(crate::SourceData::Indexed(web.index("auto")));
-    let t: serde_json::Value = (*crate::triage::triage_impl(&web_state, vec![], None, true).unwrap()).clone();
+    let t: serde_json::Value = (*crate::triage::analysis_impl(&web_state, None, true).unwrap()).clone();
     let rules: Vec<&str> = t["detections"].as_array().unwrap().iter().map(|d| d["rule"].as_str().unwrap()).collect();
-    for expected in ["web.scan", "tool.scanner", "web.success-after-scan"] {
-        assert!(rules.contains(&expected), "missing {expected}: {rules:?}");
+    for excluded in ["web.scan", "tool.scanner", "web.success-after-scan"] {
+        assert!(!rules.contains(&excluded), "HTTP status and a scanner user agent do not prove compromise");
     }
     let mut fw = Vec::new();
     for port in 0..25 {
@@ -1727,13 +1765,11 @@ fn triage_web_scan_tool_success_port_scan_and_beacon() {
     }
     let firewall = Fixture::new(&fw.join("\n"));
     let fw_state = state_for(crate::SourceData::Indexed(firewall.index("auto")));
-    let t: serde_json::Value = (*crate::triage::triage_impl(&fw_state, vec![], None, true).unwrap()).clone();
+    let t: serde_json::Value = (*crate::triage::analysis_impl(&fw_state, None, true).unwrap()).clone();
     let detections = t["detections"].as_array().unwrap();
     let rules: Vec<&str> = detections.iter().map(|d| d["rule"].as_str().unwrap()).collect();
     assert!(rules.contains(&"net.portscan"), "{rules:?}");
-    let beacon = detections.iter().find(|d| d["rule"] == "net.beacon").expect("beacon");
-    assert!((59_000..=61_000).contains(&beacon["period_ms"].as_i64().unwrap()), "{}", beacon["period_ms"]);
-    assert!(beacon["summary"].as_str().unwrap().contains("1 min"), "{}", beacon["summary"]);
+    assert!(!rules.contains(&"net.beacon"), "periodicity without an abuse characteristic is context only");
 }
 
 #[test]
@@ -1826,7 +1862,7 @@ fn json_envelopes_are_split_into_records() {
     assert_eq!(crate::entities::value(&events[0], crate::entities::Role::SrcIp).as_deref(), Some("203.0.113.5"));
     let t = triage_events(events, false);
     let rules = rules_of(&t);
-    assert!(rules.contains(&"cloud.root".to_string()) && rules.contains(&"cloud.console-no-mfa".to_string()), "{rules:?}");
+    assert!(rules.is_empty(), "root access and missing MFA alone are not compromise evidence: {rules:?}");
 
     let pretty = "{\n  \"meta\": {\"count\": 2},\n  \"value\": [\n    {\"time\": \"2024-01-31T10:00:00Z\", \"message\": \"a\"},\n    {\"time\": \"2024-01-31T10:00:01Z\", \"message\": \"b\"}\n  ],\n  \"next\": null\n}\n";
     let fixture = Fixture::new(pretty);

@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "rules": [
     {
       "id": "auth.bruteforce.source",
@@ -10,13 +10,37 @@
         "T1110.001"
       ],
       "kind": "threshold",
-      "where": "@action:logon @outcome:failure",
+      "where": "_sec.action:logon _sec.outcome:failure",
       "by": [
+        "_sec.identity",
+        "_sec.service",
+        "_sec.host",
         "@src_ip"
       ],
       "window": "10m",
       "count": 10,
-      "summary": "{count} falhas de autenticação de {@src_ip}"
+      "summary": "{count} falhas de autenticação de {@src_ip}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Muitas falhas de autenticação da mesma origem em pouco tempo. Pode ser um ataque, um script mal configurado ou uma senha expirada em uso automático.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.namespace",
+          "_sec.identity",
+          "_sec.service",
+          "_sec.host"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1110/001/"
+      ]
     },
     {
       "id": "auth.bruteforce.account",
@@ -27,13 +51,37 @@
         "T1110.001"
       ],
       "kind": "threshold",
-      "where": "@action:logon @outcome:failure",
+      "where": "_sec.action:logon _sec.outcome:failure",
       "by": [
-        "@user"
+        "_sec.identity",
+        "_sec.service",
+        "_sec.host",
+        "@src_ip"
       ],
       "window": "10m",
       "count": 15,
-      "summary": "{count} falhas de autenticação para {@user}"
+      "summary": "{count} falhas de autenticação para {@user}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Muitas falhas de autenticação para a mesma conta. Confirme se a origem é conhecida e se a conta foi bloqueada ou acessada em seguida.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.namespace",
+          "_sec.identity",
+          "_sec.service",
+          "_sec.host"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1110/001/"
+      ]
     },
     {
       "id": "auth.spraying",
@@ -44,14 +92,33 @@
         "T1110.003"
       ],
       "kind": "distinct",
-      "where": "@action:logon @outcome:failure",
+      "where": "_sec.action:logon _sec.outcome:failure",
       "by": [
+        "_sec.namespace",
+        "_sec.service",
+        "_sec.host",
         "@src_ip"
       ],
-      "distinct": "@user",
+      "distinct": "_sec.identity",
       "window": "30m",
       "count": 8,
-      "summary": "{@src_ip} tentou {distinct} contas diferentes"
+      "summary": "{@src_ip} tentou {distinct} contas diferentes",
+      "evidence": {
+        "level": 2,
+        "rationale": "A mesma origem falhou ao autenticar em várias contas diferentes, padrão típico de tentativa de senhas comuns em muitas contas.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1110/003/"
+      ]
     },
     {
       "id": "auth.bruteforce.success",
@@ -64,19 +131,43 @@
       ],
       "kind": "sequence",
       "by": [
+        "_sec.identity",
+        "_sec.service",
+        "_sec.host",
         "@src_ip"
       ],
       "window": "30m",
       "steps": [
         {
-          "where": "@action:logon @outcome:failure",
+          "where": "_sec.action:logon _sec.outcome:failure",
           "count": 5
         },
         {
-          "where": "@action:logon @outcome:success"
+          "where": "_sec.action:logon _sec.outcome:success"
         }
       ],
-      "summary": "Falhas seguidas de acesso bem-sucedido a partir de {@src_ip}"
+      "summary": "Falhas seguidas de acesso bem-sucedido a partir de {@src_ip}",
+      "evidence": {
+        "level": 2,
+        "rationale": "Uma sequência de falhas de autenticação foi seguida por um acesso bem-sucedido da mesma origem. Verifique se a conta foi comprometida.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.namespace",
+          "_sec.identity",
+          "_sec.service",
+          "_sec.host"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1110/"
+      ]
     },
     {
       "id": "auth.bruteforce.success.account",
@@ -89,19 +180,43 @@
       ],
       "kind": "sequence",
       "by": [
-        "@user"
+        "_sec.identity",
+        "_sec.service",
+        "_sec.host",
+        "@src_ip"
       ],
       "window": "30m",
       "steps": [
         {
-          "where": "@action:logon @outcome:failure",
+          "where": "_sec.action:logon _sec.outcome:failure",
           "count": 8
         },
         {
-          "where": "@action:logon @outcome:success"
+          "where": "_sec.action:logon _sec.outcome:success"
         }
       ],
-      "summary": "{@user} foi acessada após falhas repetidas"
+      "summary": "{@user} foi acessada após falhas repetidas",
+      "evidence": {
+        "level": 2,
+        "rationale": "Uma conta teve várias falhas de autenticação seguidas de acesso bem-sucedido.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.namespace",
+          "_sec.identity",
+          "_sec.service",
+          "_sec.host"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1110/"
+      ]
     },
     {
       "id": "auth.lockout",
@@ -112,11 +227,28 @@
         "T1110"
       ],
       "kind": "single",
-      "where": "@action:account_lockout",
+      "where": "_sec.action:account_lockout",
       "by": [
         "@user"
       ],
-      "summary": "{@user} foi bloqueada"
+      "summary": "{@user} foi bloqueada",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1110/"
+      ],
+      "enabled": false
     },
     {
       "id": "auth.rdp.public",
@@ -128,11 +260,28 @@
         "T1133"
       ],
       "kind": "single",
-      "where": "@action:logon @outcome:success LogonType:10 @src_scope:público",
+      "where": "_sec.action:logon _sec.outcome:success LogonType:10 @src_scope:público",
       "by": [
         "@src_ip"
       ],
-      "summary": "RDP de {@src_ip} para {@host}"
+      "summary": "RDP de {@src_ip} para {@host}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1021/001/"
+      ],
+      "enabled": false
     },
     {
       "id": "auth.root.public",
@@ -144,11 +293,28 @@
         "T1133"
       ],
       "kind": "single",
-      "where": "@action:logon @outcome:success @src_scope:público @user:(root OR administrator OR administrador OR admin)",
+      "where": "_sec.action:logon _sec.outcome:success @src_scope:público @user:(root OR administrator OR administrador OR admin)",
       "by": [
         "@src_ip"
       ],
-      "summary": "{@user} acessado a partir de {@src_ip}"
+      "summary": "{@user} acessado a partir de {@src_ip}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1078/"
+      ],
+      "enabled": false
     },
     {
       "id": "account.create",
@@ -159,11 +325,28 @@
         "T1136"
       ],
       "kind": "single",
-      "where": "@action:account_create",
+      "where": "_sec.action:account_create",
       "by": [
         "@host"
       ],
-      "summary": "Conta criada em {@host}"
+      "summary": "Conta criada em {@host}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1136/"
+      ],
+      "enabled": false
     },
     {
       "id": "account.privileged-group",
@@ -174,11 +357,28 @@
         "T1098"
       ],
       "kind": "single",
-      "where": "@action:group_member_add (*admin* OR *sudo* OR *wheel* OR *root* OR *administrador*)",
+      "where": "_sec.action:group_member_add (*admin* OR *sudo* OR *wheel* OR *root* OR *administrador*)",
       "by": [
         "@host"
       ],
-      "summary": "Membro adicionado a grupo privilegiado em {@host}"
+      "summary": "Membro adicionado a grupo privilegiado em {@host}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1098/"
+      ],
+      "enabled": false
     },
     {
       "id": "persist.service",
@@ -189,11 +389,28 @@
         "T1543.003"
       ],
       "kind": "single",
-      "where": "@action:service_install",
+      "where": "_sec.action:service_install",
       "by": [
         "@host"
       ],
-      "summary": "Serviço instalado em {@host}"
+      "summary": "Serviço instalado em {@host}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1543/003/"
+      ],
+      "enabled": false
     },
     {
       "id": "persist.service.suspicious",
@@ -205,11 +422,27 @@
         "T1569.002"
       ],
       "kind": "single",
-      "where": "@action:service_install (/(powershell|cmd(\\.exe)? \\/c|\\\\temp\\\\|\\\\appdata\\\\|\\\\users\\\\public\\\\|rundll32|mshta|\\.bat|\\.vbs|-enc)/)",
+      "where": "_sec.action:service_install ServiceFileName:/[\\\\/](temp|appdata|users[\\\\/]public)[\\\\/]/",
       "by": [
         "@host"
       ],
-      "summary": "Serviço suspeito em {@host}"
+      "summary": "Serviço suspeito em {@host}",
+      "evidence": {
+        "level": 1,
+        "rationale": "O serviço instalado executa um interpretador, um script ou um binário em pasta temporária ou de usuário.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1543/003/"
+      ]
     },
     {
       "id": "persist.task",
@@ -220,11 +453,28 @@
         "T1053.005"
       ],
       "kind": "single",
-      "where": "@action:task_create",
+      "where": "_sec.action:task_create",
       "by": [
         "@host"
       ],
-      "summary": "Tarefa agendada criada em {@host}"
+      "summary": "Tarefa agendada criada em {@host}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1053/005/"
+      ],
+      "enabled": false
     },
     {
       "id": "persist.runkey",
@@ -235,11 +485,27 @@
         "T1547.001"
       ],
       "kind": "single",
-      "where": "@action:registry_change /currentversion\\\\run/",
+      "where": "_sec.action:registry_change TargetObject:/currentversion\\\\run/ Details:/[\\\\/](temp|appdata|users[\\\\/]public)[\\\\/]/",
       "by": [
         "@host"
       ],
-      "summary": "Chave de inicialização alterada em {@host}"
+      "summary": "Chave de inicialização alterada em {@host}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Chave Run/RunOnce do registro alterada, meio comum de persistência no Windows.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1547/001/"
+      ]
     },
     {
       "id": "persist.cron.suspicious",
@@ -250,11 +516,27 @@
         "T1053.003"
       ],
       "kind": "single",
-      "where": "@action:task_run @cmdline:/(curl|wget|base64|\\/tmp\\/|\\/dev\\/shm|\\bnc\\s|bash\\s+-c)/",
+      "where": "_sec.action:task_run _sec.suspicious_command:true",
       "by": [
         "@host"
       ],
-      "summary": "Cron suspeito em {@host}"
+      "summary": "Cron suspeito em {@host}",
+      "evidence": {
+        "level": 2,
+        "rationale": "Tarefa cron executa download, decodificação ou binário em pasta temporária.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1053/003/"
+      ]
     },
     {
       "id": "evasion.log-clear",
@@ -266,11 +548,27 @@
         "T1562.008"
       ],
       "kind": "single",
-      "where": "@action:log_clear",
+      "where": "_sec.action:log_clear _sec.outcome:success",
       "by": [
         "@host"
       ],
-      "summary": "Registros apagados ou desativados"
+      "summary": "Registros apagados ou desativados",
+      "evidence": {
+        "level": 1,
+        "rationale": "O log de auditoria foi apagado ou a trilha de auditoria foi desativada. É um passo frequente para esconder atividade.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1070/001/"
+      ]
     },
     {
       "id": "evasion.audit-policy",
@@ -281,11 +579,28 @@
         "T1562.002"
       ],
       "kind": "single",
-      "where": "@action:audit_policy_change",
+      "where": "_sec.action:audit_policy_change",
       "by": [
         "@host"
       ],
-      "summary": "Auditoria alterada em {@host}"
+      "summary": "Auditoria alterada em {@host}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1562/002/"
+      ],
+      "enabled": false
     },
     {
       "id": "evasion.defender",
@@ -296,11 +611,27 @@
         "T1562.001"
       ],
       "kind": "single",
-      "where": "@action:protection_disabled OR @cmdline:/set-mppreference.*(disable|exclusion)|add-mppreference.*exclusion/",
+      "where": "_sec.action:process_start _sec.command:/set-mppreference.*disablerealtimemonitoring\\s+\\$true|add-mppreference.*exclusionpath\\s+[\\x22\\x27]?[c-z]:\\\\($|[\\x22\\x27])/",
       "by": [
         "@host"
       ],
-      "summary": "Proteção desativada em {@host}"
+      "summary": "Proteção desativada em {@host}",
+      "evidence": {
+        "level": 2,
+        "rationale": "Proteção em tempo real desativada ou exclusões adicionadas ao Windows Defender.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1562/001/"
+      ]
     },
     {
       "id": "impact.recovery",
@@ -313,9 +644,30 @@
       "kind": "single",
       "where": "@cmdline:/(vssadmin.*delete.*shadows|wmic.*shadowcopy.*delete|bcdedit.*recoveryenabled.*no|wbadmin.*delete.*catalog|delete-backup)/",
       "by": [
-        "@host"
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
       ],
-      "summary": "Recuperação do sistema inibida em {@host}"
+      "summary": "Recuperação do sistema inibida em {@host}",
+      "evidence": {
+        "level": 3,
+        "rationale": "Comandos que apagam cópias de sombra, catálogos de backup ou desativam a recuperação — etapa típica de ransomware.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.action",
+          "_sec.command"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1490/"
+      ]
     },
     {
       "id": "impact.mass-files",
@@ -327,14 +679,31 @@
         "T1485"
       ],
       "kind": "threshold",
-      "where": "@action:(file_create OR file_delete)",
+      "where": "_sec.action:(file_create OR file_delete)",
       "by": [
         "@host",
         "@process"
       ],
       "window": "1m",
       "count": 500,
-      "summary": "{count} arquivos alterados por {@process}"
+      "summary": "{count} arquivos alterados por {@process}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1486/"
+      ],
+      "enabled": false
     },
     {
       "id": "exec.encoded-powershell",
@@ -346,11 +715,32 @@
         "T1027"
       ],
       "kind": "single",
-      "where": "(@process:/powershell|pwsh/ OR @cmdline:/powershell|pwsh/) @cmdline:/(\\s-e(nc(odedcommand)?)?\\s|frombase64string|-w(indowstyle)?\\s+hidden|-nop\\b.*-w)/",
+      "where": "_sec.action:(process_start OR script_execution) _sec.decoded_command:* _sec.suspicious_command:true",
       "by": [
-        "@host"
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
       ],
-      "summary": "PowerShell codificado em {@host}"
+      "summary": "PowerShell codificado em {@host}",
+      "evidence": {
+        "level": 3,
+        "rationale": "PowerShell executado com comando codificado, janela oculta ou decodificação em memória.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.action",
+          "_sec.command"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1059/001/"
+      ]
     },
     {
       "id": "exec.download-cradle",
@@ -362,27 +752,69 @@
         "T1059"
       ],
       "kind": "single",
-      "where": "@cmdline:/(downloadstring|downloadfile|invoke-webrequest|\\biwr\\s|certutil.*-urlcache|bitsadmin.*\\/transfer|start-bitstransfer|(curl|wget)\\s.*\\|\\s*(ba)?sh)/",
+      "where": "_sec.action:(process_start OR script_execution) _sec.command:/(curl|wget)\\s.*\\|\\s*(ba)?sh|\\b(iex|invoke-expression)\\b.*downloadstring/",
       "by": [
-        "@host"
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
       ],
-      "summary": "Download por linha de comando em {@host}"
+      "summary": "Download por linha de comando em {@host}",
+      "evidence": {
+        "level": 3,
+        "rationale": "Comando baixa conteúdo remoto com PowerShell, certutil, bitsadmin, curl ou wget, frequentemente para executar código.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.action",
+          "_sec.command"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1105/"
+      ]
     },
     {
       "id": "exec.webshell-child",
       "name": "Servidor web executou um shell",
-      "description": "Um processo de servidor web iniciou um interpretador de comandos. É um forte indício de web shell ou exploração.",
+      "description": "Servidor web iniciou interpretador com comando registrado; investigar plugins e tarefas administrativas antes de atribuir abuso.",
       "severity": "high",
       "attack": [
         "T1505.003",
         "T1190"
       ],
       "kind": "single",
-      "where": "@parent_process:/(^|[\\\\/])(w3wp|httpd|apache2?|nginx|php-cgi|php-fpm|tomcat\\d*|java|node)(\\.exe)?$/ @process:/(^|[\\\\/])(cmd|powershell|pwsh|bash|sh|dash|whoami|net1?|certutil|wscript|cscript|mshta|nc|ncat)(\\.exe)?$/",
+      "where": "@parent_process:/(^|[\\\\/])(w3wp|httpd|apache2?|nginx|php-cgi|php-fpm|tomcat\\d*)(\\.exe)?$/ @process:/(^|[\\\\/])(cmd|powershell|pwsh|bash|sh|dash|whoami|net1?|certutil|wscript|cscript|mshta|nc|ncat)(\\.exe)?$/ _sec.action:process_start _sec.command:*",
       "by": [
-        "@host"
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
       ],
-      "summary": "{@parent_process} iniciou {@process}"
+      "summary": "{@parent_process} iniciou {@process}",
+      "evidence": {
+        "level": 2,
+        "rationale": "Servidor web iniciou interpretador com comando registrado; investigar plugins e tarefas administrativas antes de atribuir abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.action",
+          "_sec.command"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1505/003/"
+      ]
     },
     {
       "id": "exec.office-child",
@@ -396,9 +828,30 @@
       "kind": "single",
       "where": "@parent_process:/(^|[\\\\/])(winword|excel|powerpnt|outlook|mspub)\\.exe$/ @process:/(^|[\\\\/])(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32)\\.exe$/",
       "by": [
-        "@host"
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
       ],
-      "summary": "{@parent_process} iniciou {@process}"
+      "summary": "{@parent_process} iniciou {@process}",
+      "evidence": {
+        "level": 2,
+        "rationale": "Aplicativo do Office criou um processo de script ou shell, padrão comum de anexos maliciosos.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.action",
+          "_sec.command"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1566/"
+      ]
     },
     {
       "id": "exec.browser-child",
@@ -412,9 +865,30 @@
       "kind": "single",
       "where": "@parent_process:/(^|[\\\\/])(iexplore|chrome|firefox|msedge|opera|brave|safari)(\\.exe)?$/ @process:/(^|[\\\\/])(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|bash|sh)(\\.exe)?$/",
       "by": [
-        "@host"
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
       ],
-      "summary": "{@parent_process} iniciou {@process} em {@host}"
+      "summary": "{@parent_process} iniciou {@process} em {@host}",
+      "evidence": {
+        "level": 2,
+        "rationale": "Um navegador criou um shell ou interpretador de scripts, padrão de exploração por página maliciosa (drive-by).",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.action",
+          "_sec.command"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1203/"
+      ]
     },
     {
       "id": "exec.lolbin",
@@ -426,11 +900,32 @@
         "T1140"
       ],
       "kind": "single",
-      "where": "@cmdline:/(rundll32.*javascript:|regsvr32.*\\/i:https?:|mshta\\s+(https?:|vbscript:|javascript:)|certutil.*-decode|msbuild.*\\.(xml|csproj)\\b|installutil.*\\/u)/",
+      "where": "_sec.action:process_start _sec.command:/(rundll32.*javascript:|regsvr32.*\\/i:https?:|mshta\\s+(https?:|vbscript:|javascript:))/",
       "by": [
-        "@host"
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
       ],
-      "summary": "Binário do sistema abusado em {@host}"
+      "summary": "Binário do sistema abusado em {@host}",
+      "evidence": {
+        "level": 3,
+        "rationale": "Uso de rundll32, regsvr32, mshta, certutil ou msbuild com padrões de execução remota ou decodificação.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.action",
+          "_sec.command"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1218/"
+      ]
     },
     {
       "id": "exec.discovery-burst",
@@ -444,9 +939,9 @@
         "T1016"
       ],
       "kind": "distinct",
-      "where": "@action:(process_start OR privilege_use) (@process:/(^|[\\\\/])(whoami|net1?|ipconfig|systeminfo|nltest|quser|tasklist|netstat|arp|hostname|id|uname|ifconfig|ip)(\\.exe)?$/ OR @cmdline:/\\b(whoami|net (user|group|localgroup|view)|ipconfig|systeminfo|nltest|quser|tasklist|netstat -an|arp -a|uname -a)\\b/)",
+      "where": "_sec.action:(process_start OR privilege_use) (@process:/(^|[\\\\/])(whoami|net1?|ipconfig|systeminfo|nltest|quser|tasklist|netstat|arp|hostname|id|uname|ifconfig|ip)(\\.exe)?$/ OR @cmdline:/\\b(whoami|net (user|group|localgroup|view)|ipconfig|systeminfo|nltest|quser|tasklist|netstat -an|arp -a|uname -a)\\b/)",
       "by": [
-        "@host"
+        "_sec.parent"
       ],
       "distinct": "@cmdline",
       "window": "10m",
@@ -454,6 +949,24 @@
       "summary": "{distinct} comandos de reconhecimento em {@host}",
       "distinct_fallback": [
         "@process"
+      ],
+      "evidence": {
+        "level": 1,
+        "rationale": "Vários comandos de descoberta (whoami, net, ipconfig, systeminfo, nltest, id, uname) em poucos minutos na mesma máquina.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.parent"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1033/"
       ]
     },
     {
@@ -465,11 +978,32 @@
         "T1003.001"
       ],
       "kind": "single",
-      "where": "(@action:process_access TargetImage:*lsass.exe) OR @cmdline:/(sekurlsa|lsadump|procdump.*lsass|comsvcs(\\.dll)?.*minidump|rundll32.*comsvcs)/",
+      "where": "_sec.action:process_start _sec.command:/(sekurlsa::|lsadump::|procdump.*lsass|comsvcs(\\.dll)?.*minidump)/",
       "by": [
-        "@host"
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
       ],
-      "summary": "Acesso ao LSASS em {@host}"
+      "summary": "Acesso ao LSASS em {@host}",
+      "evidence": {
+        "level": 3,
+        "rationale": "Leitura da memória do LSASS ou ferramenta de despejo de credenciais.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.action",
+          "_sec.command"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1003/001/"
+      ]
     },
     {
       "id": "cred.kerberoast",
@@ -487,7 +1021,24 @@
       "distinct": "ServiceName",
       "window": "10m",
       "count": 5,
-      "summary": "{@user} pediu {distinct} tickets RC4 de serviços diferentes"
+      "summary": "{@user} pediu {distinct} tickets RC4 de serviços diferentes",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1558/003/"
+      ],
+      "enabled": false
     },
     {
       "id": "cred.dcsync",
@@ -502,7 +1053,24 @@
       "by": [
         "@user"
       ],
-      "summary": "Replicação de diretório solicitada por {@user}"
+      "summary": "Replicação de diretório solicitada por {@user}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1003/006/"
+      ],
+      "enabled": false
     },
     {
       "id": "cred.pth",
@@ -513,11 +1081,28 @@
         "T1550.002"
       ],
       "kind": "single",
-      "where": "@action:logon LogonType:9 LogonProcessName:seclogo",
+      "where": "_sec.action:logon LogonType:9 LogonProcessName:seclogo",
       "by": [
         "@host"
       ],
-      "summary": "Logon com credenciais alternativas de {@user} em {@host}"
+      "summary": "Logon com credenciais alternativas de {@user} em {@host}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1550/002/"
+      ],
+      "enabled": false
     },
     {
       "id": "linux.sudo.sensitive",
@@ -528,11 +1113,32 @@
         "T1548.003"
       ],
       "kind": "single",
-      "where": "@action:privilege_use @cmdline:/(\\/etc\\/(shadow|sudoers|passwd)|\\bvisudo\\b|\\buseradd\\b|\\busermod\\b|\\bpasswd\\b|\\bnc(at)?\\s|bash\\s+-i|\\/bin\\/sh\\b|chmod\\s+[0-7]*[4-7][0-7]{3})/",
+      "where": "_sec.action:privilege_use _sec.suspicious_command:true",
       "by": [
-        "@host"
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
       ],
-      "summary": "Comando sensível por {@user} em {@host}"
+      "summary": "Comando sensível por {@user} em {@host}",
+      "evidence": {
+        "level": 2,
+        "rationale": "Uso de sudo para ler arquivos de senha, alterar contas ou iniciar shells de rede.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [
+          "_sec.action",
+          "_sec.command"
+        ],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1548/003/"
+      ]
     },
     {
       "id": "tool.scanner",
@@ -547,7 +1153,24 @@
       "by": [
         "@src_ip"
       ],
-      "summary": "{@tool} a partir de {@src_ip}"
+      "summary": "{@tool} a partir de {@src_ip}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1595/002/"
+      ],
+      "enabled": false
     },
     {
       "id": "tool.offensive",
@@ -562,7 +1185,24 @@
       "by": [
         "@host"
       ],
-      "summary": "{@tool} em {@host}"
+      "summary": "{@tool} em {@host}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1588/002/"
+      ],
+      "enabled": false
     },
     {
       "id": "web.scan",
@@ -573,14 +1213,31 @@
         "T1595.002"
       ],
       "kind": "distinct",
-      "where": "@action:http_request @outcome:failure",
+      "where": "_sec.action:http_request _sec.outcome:failure @url:/\\.(env|git)|wp-admin|phpmyadmin|cgi-bin|actuator|etc\\/passwd/",
       "by": [
+        "_sec.host",
         "@src_ip"
       ],
       "distinct": "@url",
       "window": "5m",
       "count": 40,
-      "summary": "{@src_ip} testou {distinct} caminhos com erro"
+      "summary": "{@src_ip} testou {distinct} caminhos com erro",
+      "evidence": {
+        "level": 1,
+        "rationale": "Muitas requisições com erro para caminhos diferentes a partir da mesma origem.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1595/002/"
+      ]
     },
     {
       "id": "web.success-after-scan",
@@ -597,14 +1254,31 @@
       "window": "30m",
       "steps": [
         {
-          "where": "@action:http_request @outcome:failure",
+          "where": "_sec.action:http_request _sec.outcome:failure",
           "count": 30
         },
         {
-          "where": "@action:http_request @outcome:success @url:/\\.(php|jsp|jspx|asp|aspx|cgi)\\b|[?&](cmd|exec|command)=/"
+          "where": "_sec.action:http_request _sec.outcome:success @url:/\\.(php|jsp|jspx|asp|aspx|cgi)\\b|[?&](cmd|exec|command)=/"
         }
       ],
-      "summary": "{@src_ip} obteve sucesso após varredura"
+      "summary": "{@src_ip} obteve sucesso após varredura",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1190/"
+      ],
+      "enabled": false
     },
     {
       "id": "net.portscan",
@@ -615,14 +1289,32 @@
         "T1046"
       ],
       "kind": "distinct",
-      "where": "@action:network_connection",
+      "where": "_sec.action:network_connection",
       "by": [
-        "@src_ip"
+        "_sec.namespace",
+        "@src_ip",
+        "@dst_ip"
       ],
       "distinct": "@dst_port",
       "window": "2m",
       "count": 20,
-      "summary": "{@src_ip} tentou {distinct} portas"
+      "summary": "{@src_ip} tentou {distinct} portas",
+      "evidence": {
+        "level": 1,
+        "rationale": "A mesma origem tentou muitas portas diferentes em pouco tempo.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1046/"
+      ]
     },
     {
       "id": "net.hostscan",
@@ -634,14 +1326,31 @@
         "T1018"
       ],
       "kind": "distinct",
-      "where": "@action:network_connection",
+      "where": "_sec.action:network_connection",
       "by": [
         "@src_ip"
       ],
       "distinct": "@dst_ip",
       "window": "5m",
       "count": 30,
-      "summary": "{@src_ip} tentou {distinct} destinos"
+      "summary": "{@src_ip} tentou {distinct} destinos",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1046/"
+      ],
+      "enabled": false
     },
     {
       "id": "net.sensitive-port.public",
@@ -652,11 +1361,28 @@
         "T1133"
       ],
       "kind": "single",
-      "where": "@action:network_connection @outcome:success @src_scope:público @dst_port:(22 OR 23 OR 445 OR 3389 OR 5985 OR 5986 OR 1433 OR 3306 OR 5432 OR 6379 OR 9200 OR 27017)",
+      "where": "_sec.action:network_connection _sec.outcome:success @src_scope:público @dst_port:(22 OR 23 OR 445 OR 3389 OR 5985 OR 5986 OR 1433 OR 3306 OR 5432 OR 6379 OR 9200 OR 27017)",
       "by": [
         "@src_ip"
       ],
-      "summary": "{@src_ip} acessou a porta {@dst_port}"
+      "summary": "{@src_ip} acessou a porta {@dst_port}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1133/"
+      ],
+      "enabled": false
     },
     {
       "id": "net.beacon",
@@ -667,13 +1393,30 @@
         "T1071"
       ],
       "kind": "beacon",
-      "where": "@action:(network_connection OR dns_query OR http_request) @dst_ip:*",
+      "where": "_sec.action:network_connection _sec.command:* _sec.suspicious_command:true @dst_ip:*",
       "by": [
-        "@src_ip",
-        "@dst_ip"
+        "_sec.process",
+        "@dst_ip",
+        "@dst_port"
       ],
       "count": 8,
-      "summary": "{@src_ip} → {@dst_ip} a cada {period}"
+      "summary": "{@src_ip} → {@dst_ip} a cada {period}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Conexões repetidas entre o mesmo par de endereços em intervalos muito regulares, padrão comum de implantes de comando e controle.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1071/"
+      ]
     },
     {
       "id": "ids.alert",
@@ -684,11 +1427,28 @@
         "T1190"
       ],
       "kind": "single",
-      "where": "@action:ids_alert",
+      "where": "_sec.action:ids_alert",
       "by": [
         "@src_ip"
       ],
-      "summary": "Alertas do IDS para {@src_ip}"
+      "summary": "Alertas do IDS para {@src_ip}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1190/"
+      ],
+      "enabled": false
     },
     {
       "id": "av.detection",
@@ -699,11 +1459,27 @@
         "T1204"
       ],
       "kind": "single",
-      "where": "@action:malware_detected",
+      "where": "_sec.action:malware_detected",
       "by": [
         "@host"
       ],
-      "summary": "Malware detectado em {@host}"
+      "summary": "Malware detectado em {@host}",
+      "evidence": {
+        "level": 3,
+        "rationale": "O antivírus detectou ou bloqueou um arquivo malicioso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1204/"
+      ]
     },
     {
       "id": "cloud.root",
@@ -718,7 +1494,24 @@
       "by": [
         "@src_ip"
       ],
-      "summary": "Conta raiz usada a partir de {@src_ip}"
+      "summary": "Conta raiz usada a partir de {@src_ip}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1078/004/"
+      ],
+      "enabled": false
     },
     {
       "id": "cloud.console-no-mfa",
@@ -729,11 +1522,28 @@
         "T1078.004"
       ],
       "kind": "single",
-      "where": "eventName:ConsoleLogin @outcome:success additionalEventData.MFAUsed:No",
+      "where": "eventName:ConsoleLogin _sec.outcome:success additionalEventData.MFAUsed:No",
       "by": [
         "@user"
       ],
-      "summary": "{@user} entrou no console sem MFA"
+      "summary": "{@user} entrou no console sem MFA",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1078/004/"
+      ],
+      "enabled": false
     },
     {
       "id": "cloud.credential",
@@ -744,11 +1554,28 @@
         "T1098.001"
       ],
       "kind": "single",
-      "where": "@action:credential_create",
+      "where": "_sec.action:credential_create",
       "by": [
         "@user"
       ],
-      "summary": "Credencial criada por {@user}"
+      "summary": "Credencial criada por {@user}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1098/001/"
+      ],
+      "enabled": false
     },
     {
       "id": "cloud.privilege",
@@ -759,11 +1586,28 @@
         "T1098"
       ],
       "kind": "single",
-      "where": "@action:privilege_grant",
+      "where": "_sec.action:privilege_grant",
       "by": [
         "@user"
       ],
-      "summary": "Privilégio concedido por {@user}"
+      "summary": "Privilégio concedido por {@user}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1098/"
+      ],
+      "enabled": false
     },
     {
       "id": "cloud.secret-burst",
@@ -774,13 +1618,262 @@
         "T1552"
       ],
       "kind": "threshold",
-      "where": "@action:secret_access",
+      "where": "_sec.action:secret_access",
       "by": [
         "@user"
       ],
       "window": "10m",
       "count": 20,
-      "summary": "{count} segredos lidos por {@user}"
+      "summary": "{count} segredos lidos por {@user}",
+      "evidence": {
+        "level": 1,
+        "rationale": "Desativada na revisao: o padrao isolado nao demonstra uma caracteristica concreta de abuso.",
+        "missing": [
+          "Vinculo com atividade maliciosa e efeito observado."
+        ],
+        "benign": [
+          "Administracao, testes ou manutencao autorizados; conferir os eventos originais."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "2"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1552/"
+      ],
+      "enabled": false
+    },
+    {
+      "id": "chain.web.command",
+      "name": "Exploracao web vinculada a comando executado",
+      "description": "Comando suspeito recebido na requisicao e o mesmo comando executado, com ID de requisicao, host e servico coincidentes.",
+      "severity": "high",
+      "attack": [
+        "T1190",
+        "T1059"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.request",
+        "_sec.command_key"
+      ],
+      "window": "5m",
+      "steps": [
+        {
+          "where": "_sec.action:http_request _sec.reverse_shell_request:true -_sec.outcome:(blocked OR failure)"
+        },
+        {
+          "where": "_sec.action:process_start _sec.reverse_shell:true _sec.outcome:success"
+        }
+      ],
+      "summary": "Exploracao web vinculada a comando executado: {count} registros vinculados",
+      "evidence": {
+        "level": 5,
+        "rationale": "Comando suspeito recebido na requisicao e o mesmo comando executado, com ID de requisicao, host e servico coincidentes.",
+        "missing": [
+          "Criacao ou uso do payload e validacao externa do cenario."
+        ],
+        "benign": [
+          "Exercicio autorizado ou teste de seguranca documentado."
+        ],
+        "required": [],
+        "products": [],
+        "maturity": "experimental",
+        "version": "2",
+        "claim": "execution"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1190/",
+        "https://attack.mitre.org/techniques/T1059/"
+      ]
+    },
+    {
+      "id": "chain.download.execution",
+      "name": "Arquivo baixado e executado pela mesma arvore",
+      "description": "Artefato transferido e executado como filho do processo de transferencia; o comando de execucao possui comportamento de abuso especifico.",
+      "severity": "high",
+      "attack": [
+        "T1105",
+        "T1059"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.file_key",
+        "_sec.process"
+      ],
+      "window": "15m",
+      "steps": [
+        {
+          "where": "_sec.action:file_create _sec.outcome:success _sec.url:/^https?:/ _sec.file:/[\\\\/](tmp|temp|appdata|dev[\\\\/]shm)[\\\\/]/",
+          "by": [
+            "_sec.file_key",
+            "_sec.process"
+          ]
+        },
+        {
+          "where": "_sec.action:process_start _sec.outcome:success _sec.reverse_shell:true",
+          "by": [
+            "_sec.image_key",
+            "_sec.parent"
+          ]
+        }
+      ],
+      "summary": "Arquivo baixado e executado pela mesma arvore: {count} registros vinculados",
+      "evidence": {
+        "level": 5,
+        "rationale": "Artefato transferido e executado como filho do processo de transferencia; o comando de execucao possui comportamento de abuso especifico.",
+        "missing": [],
+        "benign": [
+          "Exercicio autorizado ou teste de seguranca documentado."
+        ],
+        "required": [],
+        "products": [],
+        "maturity": "experimental",
+        "version": "2",
+        "claim": "execution"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1105/",
+        "https://attack.mitre.org/techniques/T1059/"
+      ]
+    },
+    {
+      "id": "chain.cloud.credential",
+      "name": "Credencial criada, usada contra auditoria e segredos",
+      "description": "Identificador exato da credencial criada foi usado na mesma conta para enfraquecer controles e acessar segredos.",
+      "severity": "high",
+      "attack": [
+        "T1098.001",
+        "T1562.008",
+        "T1552"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.credential"
+      ],
+      "window": "24h",
+      "steps": [
+        {
+          "where": "eventName:CreateAccessKey _sec.outcome:success",
+          "by": [
+            "_sec.created_credential"
+          ]
+        },
+        {
+          "where": "eventName:(StopLogging OR DeleteTrail OR DeleteDetector) _sec.outcome:success"
+        },
+        {
+          "where": "eventName:(GetSecretValue OR GetParameter) _sec.outcome:success"
+        }
+      ],
+      "summary": "Credencial criada, usada contra auditoria e segredos: {count} registros vinculados",
+      "evidence": {
+        "level": 4,
+        "rationale": "Identificador exato da credencial criada foi usado na mesma conta para enfraquecer controles e acessar segredos.",
+        "missing": [],
+        "benign": [
+          "Exercicio autorizado ou teste de seguranca documentado."
+        ],
+        "required": [],
+        "products": [
+          "aws"
+        ],
+        "maturity": "experimental",
+        "version": "2",
+        "claim": "activity"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1098/001/",
+        "https://attack.mitre.org/techniques/T1562/008/",
+        "https://attack.mitre.org/techniques/T1552/"
+      ]
+    },
+    {
+      "id": "chain.persistence.payload",
+      "name": "Persistencia vinculada a payload executado",
+      "description": "Destino efetivamente configurado corresponde ao executavel que depois executou comando especifico de abuso; mesmo host e namespace.",
+      "severity": "high",
+      "attack": [
+        "T1543",
+        "T1059"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.persistence_key"
+      ],
+      "window": "24h",
+      "steps": [
+        {
+          "where": "_sec.action:(service_install OR task_create OR registry_change) _sec.outcome:success _sec.persistence_key:*"
+        },
+        {
+          "where": "_sec.action:process_start _sec.outcome:success _sec.reverse_shell:true",
+          "by": [
+            "_sec.image_key"
+          ]
+        }
+      ],
+      "summary": "Persistencia vinculada a payload executado: {count} registros vinculados",
+      "evidence": {
+        "level": 5,
+        "rationale": "Destino efetivamente configurado corresponde ao executavel que depois executou comando especifico de abuso; mesmo host e namespace.",
+        "missing": [],
+        "benign": [
+          "Exercicio autorizado ou teste de seguranca documentado."
+        ],
+        "required": [],
+        "products": [],
+        "maturity": "experimental",
+        "version": "2",
+        "claim": "execution"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1543/",
+        "https://attack.mitre.org/techniques/T1059/"
+      ]
+    },
+    {
+      "id": "chain.recovery.destruction",
+      "name": "Recuperacao enfraquecida e destruicao vinculada",
+      "description": "Processos da mesma instancia pai executaram inibicao de recuperacao e comando destrutivo especifico.",
+      "severity": "high",
+      "attack": [
+        "T1490",
+        "T1485"
+      ],
+      "kind": "sequence",
+      "by": [
+        "_sec.parent"
+      ],
+      "window": "15m",
+      "steps": [
+        {
+          "where": "_sec.action:process_start _sec.outcome:success _sec.command:/(vssadmin.*delete.*shadows|bcdedit.*recoveryenabled.*no|wbadmin.*delete.*catalog)/"
+        },
+        {
+          "where": "_sec.action:process_start _sec.outcome:success _sec.command:/(dd\\s+.*if=\\/dev\\/(zero|urandom).*of=\\/dev\\/(sd|nvme)|cipher\\s+\\/w:|format\\s+[a-z]:.*\\/q)/"
+        }
+      ],
+      "summary": "Recuperacao enfraquecida e destruicao vinculada: {count} registros vinculados",
+      "evidence": {
+        "level": 4,
+        "rationale": "Processos da mesma instancia pai executaram inibicao de recuperacao e comando destrutivo especifico.",
+        "missing": [
+          "O inicio dos comandos nao prova a conclusao da destruicao."
+        ],
+        "benign": [
+          "Exercicio autorizado ou teste de seguranca documentado."
+        ],
+        "required": [],
+        "products": [],
+        "maturity": "experimental",
+        "version": "2",
+        "claim": "execution"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1490/",
+        "https://attack.mitre.org/techniques/T1485/"
+      ]
     }
   ]
 }

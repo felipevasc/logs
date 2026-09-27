@@ -1,0 +1,871 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "id": "cred.registry-hives",
+      "name": "Exportação de hives de credenciais",
+      "description": "Comando exporta SAM ou SECURITY; não deduz extração pelo nome da ferramenta.",
+      "severity": "high",
+      "attack": [
+        "T1003.002",
+        "T1003.004"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/reg\\s+save\\s+hklm\\\\(sam|security)\\b/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 3,
+        "rationale": "Comando exporta SAM ou SECURITY; não deduz extração pelo nome da ferramenta.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1003/002/",
+        "https://attack.mitre.org/techniques/T1003/004/"
+      ]
+    },
+    {
+      "id": "cred.ntds-ifm",
+      "name": "Cópia da base de domínio por IFM",
+      "description": "Criação de cópia IFM de dados do domínio; manutenção autorizada é uma alternativa benigna.",
+      "severity": "medium",
+      "attack": [
+        "T1003.003"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/ntdsutil.*activate instance ntds.*ifm.*create/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Criação de cópia IFM de dados do domínio; manutenção autorizada é uma alternativa benigna.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1003/003/"
+      ]
+    },
+    {
+      "id": "cred.dcsync-command",
+      "name": "Comando explícito de replicação de credenciais",
+      "description": "Comando DCSync explicitamente registrado; Event ID, RC4 e nome da conta isolados não bastam.",
+      "severity": "high",
+      "attack": [
+        "T1003.006"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/lsadump::dcsync\\b/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 3,
+        "rationale": "Comando DCSync explicitamente registrado; Event ID, RC4 e nome da conta isolados não bastam.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1003/006/"
+      ]
+    },
+    {
+      "id": "cred.dpapi-command",
+      "name": "Extração explícita de material DPAPI",
+      "description": "Operação específica de extração de cofre, credenciais ou chaves DPAPI.",
+      "severity": "high",
+      "attack": [
+        "T1555",
+        "T1552.004"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/dpapi::(chrome|cred|vault|masterkey)\\b/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 3,
+        "rationale": "Operação específica de extração de cofre, credenciais ou chaves DPAPI.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1555/",
+        "https://attack.mitre.org/techniques/T1552/004/"
+      ]
+    },
+    {
+      "id": "ad.shadow-credential-command",
+      "name": "Alteração de shadow credentials por comando",
+      "description": "Comando de adição ou abuso de shadow credentials; efeito no diretório precisa de auditoria.",
+      "severity": "high",
+      "attack": [
+        "T1098"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/certipy\\b.*shadow\\s+(auto|add)\\b/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 3,
+        "rationale": "Comando de adição ou abuso de shadow credentials; efeito no diretório precisa de auditoria.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1098/"
+      ]
+    },
+    {
+      "id": "ad.certificate-impersonation",
+      "name": "Pedido de certificado para identidade privilegiada",
+      "description": "Solicitação para identidade privilegiada via ferramenta de auditoria; confirmar requerente, template, emissão e autenticação.",
+      "severity": "medium",
+      "attack": [
+        "T1649"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/certipy\\b.*\\breq\\b.*-upn\\s+(administrator|administrador|krbtgt)@/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Solicitação para identidade privilegiada via ferramenta de auditoria; confirmar requerente, template, emissão e autenticação.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1649/"
+      ]
+    },
+    {
+      "id": "linux.setuid-writable",
+      "name": "Bit SUID em executável temporário",
+      "description": "Pedido de SUID em local gravável; permissão efetiva e utilização ainda precisam ser comprovadas.",
+      "severity": "medium",
+      "attack": [
+        "T1548.001"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/chmod\\s+(u\\+s|[0-7]*[4-7][0-7]{3})\\s+\\/(tmp|dev\\/shm)\\//",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Pedido de SUID em local gravável; permissão efetiva e utilização ainda precisam ser comprovadas.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1548/001/"
+      ]
+    },
+    {
+      "id": "linux.sudoers-unrestricted",
+      "name": "Sudo sem senha e sem restrição",
+      "description": "Comando grava permissão irrestrita sem senha em sudoers.",
+      "severity": "medium",
+      "attack": [
+        "T1548.003"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/NOPASSWD:\\s*ALL.*(\\/etc\\/sudoers|\\/etc\\/sudoers.d\\/)/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Comando grava permissão irrestrita sem senha em sudoers.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1548/003/"
+      ]
+    },
+    {
+      "id": "linux.ssh-command-key",
+      "name": "Chave SSH com comando forçado de rede",
+      "description": "Chave autorizada associada a comando forçado de shell de rede.",
+      "severity": "high",
+      "attack": [
+        "T1098.004"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/command=.*(\\/dev\\/tcp\\/|\\bnc\\s+-e).*authorized_keys/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 3,
+        "rationale": "Chave autorizada associada a comando forçado de shell de rede.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1098/004/"
+      ]
+    },
+    {
+      "id": "persist.systemd-temp",
+      "name": "Serviço systemd executando de área temporária",
+      "description": "Configuração aponta para executável temporário; confirmar instalação e execução.",
+      "severity": "medium",
+      "attack": [
+        "T1543.002"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/ExecStart=\\/(tmp|dev\\/shm)\\/.*\\.service/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Configuração aponta para executável temporário; confirmar instalação e execução.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1543/002/"
+      ]
+    },
+    {
+      "id": "persist.macos-launch-temp",
+      "name": "LaunchAgent carregado de diretório temporário",
+      "description": "Pedido de inicialização a partir de plist temporário; investigar o conteúdo.",
+      "severity": "medium",
+      "attack": [
+        "T1543.001"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/launchctl\\s+(load|bootstrap)\\b.*(\\/tmp\\/|\\/private\\/tmp\\/).*\\.plist/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 1,
+        "rationale": "Pedido de inicialização a partir de plist temporário; investigar o conteúdo.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1543/001/"
+      ]
+    },
+    {
+      "id": "container.host-nsenter",
+      "name": "Acesso ao namespace do host a partir de container",
+      "description": "Entrada no namespace do PID 1 com contexto de container registrado.",
+      "severity": "high",
+      "attack": [
+        "T1611"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/nsenter\\s+.*(--target\\s+1|-t\\s+1).*--mount/ container.id:*",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 3,
+        "rationale": "Entrada no namespace do PID 1 com contexto de container registrado.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1611/"
+      ]
+    },
+    {
+      "id": "container.runtime-api",
+      "name": "Criação ou execução via socket do runtime",
+      "description": "Criação ou execução pelo socket privilegiado; confirmar direitos e efeito.",
+      "severity": "medium",
+      "attack": [
+        "T1611",
+        "T1609"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/curl\\b.*--unix-socket\\s+\\/var\\/run\\/docker.sock.*(containers\\/create|containers\\/.*\\/exec)/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Criação ou execução pelo socket privilegiado; confirmar direitos e efeito.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1611/",
+        "https://attack.mitre.org/techniques/T1609/"
+      ]
+    },
+    {
+      "id": "stealth.timestomp-reference",
+      "name": "Copiar timestamps para artefato temporário",
+      "description": "Cópia de horário de arquivo do sistema para artefato temporário; pode ocorrer em testes.",
+      "severity": "medium",
+      "attack": [
+        "T1070.006"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/touch\\s+-r\\s+\\/[^ ]+\\s+\\/(tmp|dev\\/shm)\\//",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 1,
+        "rationale": "Cópia de horário de arquivo do sistema para artefato temporário; pode ocorrer em testes.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1070/006/"
+      ]
+    },
+    {
+      "id": "defense.audit-disable",
+      "name": "Desativação explícita da auditoria Linux",
+      "description": "Pedido para desabilitar auditoria ou remover regras; confirmar resultado.",
+      "severity": "medium",
+      "attack": [
+        "T1562.012"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/auditctl\\s+-e\\s+0\\b|auditctl\\s+-D\\b/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Pedido para desabilitar auditoria ou remover regras; confirmar resultado.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1562/012/"
+      ]
+    },
+    {
+      "id": "defense.firewall-disable",
+      "name": "Desativação do firewall Windows",
+      "description": "Pedido de desativação de todos os perfis; uma consulta não corresponde.",
+      "severity": "medium",
+      "attack": [
+        "T1562.004"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/netsh\\s+advfirewall\\s+set\\s+allprofiles\\s+state\\s+off/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Pedido de desativação de todos os perfis; uma consulta não corresponde.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1562/004/"
+      ]
+    },
+    {
+      "id": "collect.domain-secrets",
+      "name": "Compactação de arquivos de credenciais",
+      "description": "Compactação inclui material específico de credenciais; volume sozinho é insuficiente.",
+      "severity": "medium",
+      "attack": [
+        "T1005",
+        "T1560.001"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/(tar|7z|zip)\\b.*(\\/etc\\/shadow|ntds\\.dit|\\\\sam\\.hive)/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Compactação inclui material específico de credenciais; volume sozinho é insuficiente.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1005/",
+        "https://attack.mitre.org/techniques/T1560/001/"
+      ]
+    },
+    {
+      "id": "c2.reverse-shell",
+      "name": "Shell redirecionado para rede",
+      "description": "Redirecionamento de shell para rede; conexão efetiva ainda não demonstrada.",
+      "severity": "high",
+      "attack": [
+        "T1059",
+        "T1071"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/(bash|sh)\\b.*(\\/dev\\/tcp\\/|\\/dev\\/udp\\/)|\\b(nc|ncat)\\b.*\\s-[ec]\\s+(cmd|\\/bin\\/(ba)?sh)/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 3,
+        "rationale": "Redirecionamento de shell para rede; conexão efetiva ainda não demonstrada.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1059/",
+        "https://attack.mitre.org/techniques/T1071/"
+      ]
+    },
+    {
+      "id": "c2.socat-exec",
+      "name": "Socket associado a interpretador por socat",
+      "description": "Canal de rede associado diretamente à execução de interpretador.",
+      "severity": "high",
+      "attack": [
+        "T1095"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/socat\\b.*(TCP|OPENSSL).*EXEC:.*(bash|sh|cmd)/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 3,
+        "rationale": "Canal de rede associado diretamente à execução de interpretador.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1095/"
+      ]
+    },
+    {
+      "id": "exfil.secret-webhook",
+      "name": "Envio de segredo para endpoint de coleta",
+      "description": "Comando envia variável de segredo para endpoint explícito de coleta; transferência precisa ser comprovada.",
+      "severity": "high",
+      "attack": [
+        "T1567"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/curl\\b.*(webhook\\.site|requestbin\\.).*(GITHUB_TOKEN|AWS_SECRET_ACCESS_KEY|CI_JOB_TOKEN)/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 3,
+        "rationale": "Comando envia variável de segredo para endpoint explícito de coleta; transferência precisa ser comprovada.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1567/"
+      ]
+    },
+    {
+      "id": "impact.block-device",
+      "name": "Sobrescrita de dispositivo de armazenamento",
+      "description": "Sobrescrita direcionada a dispositivo; criação de arquivo de teste não corresponde.",
+      "severity": "high",
+      "attack": [
+        "T1485"
+      ],
+      "kind": "single",
+      "where": "_sec.action:(process_start OR script_execution OR privilege_use) _sec.command:/dd\\s+.*if=\\/dev\\/(zero|urandom).*of=\\/dev\\/(sd[a-z]|nvme[0-9])/",
+      "by": [
+        "_sec.host",
+        "_sec.process",
+        "_sec.command"
+      ],
+      "evidence": {
+        "level": 3,
+        "rationale": "Sobrescrita direcionada a dispositivo; criação de arquivo de teste não corresponde.",
+        "missing": [
+          "Corroboração independente, efeito e autorização da atividade."
+        ],
+        "benign": [
+          "Teste de segurança, laboratório ou operação administrativa autorizada."
+        ],
+        "required": [
+          "_sec.command",
+          "_sec.action"
+        ],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1485/"
+      ]
+    },
+    {
+      "id": "k8s.privileged-host-root",
+      "name": "Pod privilegiado com montagem da raiz do host",
+      "description": "Pod criado ou alterado com privilégios e acesso à raiz do host. Configuração não comprova escape.",
+      "severity": "medium",
+      "attack": [
+        "T1611"
+      ],
+      "kind": "single",
+      "where": "_sec.product:kubernetes verb:(create OR patch OR update) _sec.outcome:success",
+      "by": [
+        "_sec.namespace",
+        "_sec.resource"
+      ],
+      "any": [
+        {
+          "field": "requestObject.spec.containers",
+          "where": "securityContext.privileged:true"
+        },
+        {
+          "field": "requestObject.spec.volumes",
+          "where": "hostPath.path=\"/\""
+        }
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Pod criado ou alterado com privilégios e acesso à raiz do host. Configuração não comprova escape.",
+        "missing": [
+          "Uso posterior relevante e corroboração independente."
+        ],
+        "benign": [
+          "Alteração administrativa autorizada ou publicação intencional."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1611/"
+      ]
+    },
+    {
+      "id": "cloud.s3-public-read",
+      "name": "Política S3 concede leitura pública",
+      "description": "O mesmo statement permite leitura pública de objetos; site estático é alternativa benigna.",
+      "severity": "medium",
+      "attack": [
+        "T1530"
+      ],
+      "kind": "single",
+      "where": "_sec.product:aws eventName:PutBucketPolicy _sec.outcome:success",
+      "by": [
+        "_sec.namespace",
+        "_sec.resource"
+      ],
+      "any": [
+        {
+          "field": "requestParameters.policy.Statement",
+          "where": "Effect=\"Allow\" Principal=\"*\" Action=\"s3:GetObject\" Resource:*"
+        }
+      ],
+      "evidence": {
+        "level": 1,
+        "rationale": "O mesmo statement permite leitura pública de objetos; site estático é alternativa benigna.",
+        "missing": [
+          "Uso posterior relevante e corroboração independente."
+        ],
+        "benign": [
+          "Alteração administrativa autorizada ou publicação intencional."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1530/"
+      ]
+    },
+    {
+      "id": "saas.mail-forward-hide",
+      "name": "Regra de e-mail encaminha e oculta mensagens",
+      "description": "Encaminhamento combinado com exclusão ou marcação como lida, mantendo Name/Value do mesmo objeto.",
+      "severity": "medium",
+      "attack": [
+        "T1114.003",
+        "T1564.008"
+      ],
+      "kind": "single",
+      "where": "Operation:(New-InboxRule OR Set-InboxRule) _sec.outcome:success",
+      "by": [
+        "_sec.namespace",
+        "_sec.resource"
+      ],
+      "any": [
+        {
+          "field": "Parameters",
+          "where": "Name:ForwardTo Value:/@/"
+        },
+        {
+          "field": "Parameters",
+          "where": "Name:(DeleteMessage OR MarkAsRead) Value=\"True\""
+        }
+      ],
+      "evidence": {
+        "level": 2,
+        "rationale": "Encaminhamento combinado com exclusão ou marcação como lida, mantendo Name/Value do mesmo objeto.",
+        "missing": [
+          "Uso posterior relevante e corroboração independente."
+        ],
+        "benign": [
+          "Alteração administrativa autorizada ou publicação intencional."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1114/003/",
+        "https://attack.mitre.org/techniques/T1564/008/"
+      ]
+    }
+  ]
+}

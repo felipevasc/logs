@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 const url = process.argv[2] || "http://127.0.0.1:4173";
-const browser = await chromium.launch();
+const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chrome" });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, reducedMotion: "reduce" });
 const errors = [], results = {};
 page.on("pageerror", error => errors.push(error.message));
@@ -13,14 +13,30 @@ try {
 
   // Summary: an episode opens exactly the records of its detections.
   await page.evaluate(() => Workspace.showPage("summary"));
+  await page.waitForSelector(".evidence-control");
+  assert.equal(await page.evaluate(() => Security.minimum()), 5);
+  assert.equal(await page.locator(".sec-episode").count(), 0);
+  await page.locator("[data-evidence-min='2']").click();
   await page.waitForSelector(".sec-episode");
   const episode = await page.evaluate(() => ({ title: document.querySelector(".sec-episode h3")?.textContent, markers: document.querySelectorAll(".sec-markers .sec-marker, .sec-markers button").length }));
   assert.ok(episode.title);
   await page.locator(".sec-episode").first().hover();
+  await page.locator(".sec-episode [data-act='save']").first().click();
+  await page.waitForFunction(() => activeCase().items.some(item => item.detection));
+  const preserved = await page.evaluate(() => {
+    const item=activeCase().items.find(item=>item.detection);
+    return {rows:item.rows.length,expected:new Set(item.detection.detections.flatMap(d=>d.event_ids)).size,filter:item.sourceFilters[0]?.op,minimum:item.detection.minimum_evidence};
+  });
+  assert.equal(preserved.rows,preserved.expected);
+  assert.ok(preserved.rows>40,"saving a correlation must preserve all members");
+  assert.equal(preserved.filter,"in_exact");
+  assert.equal(preserved.minimum,2);
+  results.caseEvidence=preserved;
+  await page.locator(".sec-episode").first().hover();
   await page.locator(".sec-episode [data-act='records']").first().click();
-  await page.waitForFunction(() => document.body.dataset.page === "explore" && state.filters.some(f => f.label) && state.rows.length > 0 && state.rows.every(r => r.code === "4625" || r.code === "4624"));
+  await page.waitForFunction(() => document.body.dataset.page === "explore" && state.filters.some(f => f.op === "in_exact") && state.rows.length > 0 && state.rows.every(r => r.code === "4625" || r.code === "4624"));
   const scoped = await page.evaluate(() => ({ chip: [...document.querySelectorAll(".chip")].map(c => c.textContent).join(" | "), total: state.total, codes: [...new Set(state.rows.map(r => r.code))] }));
-  assert.match(scoped.chip, /Episódio: /);
+  assert.match(scoped.chip, /event_ref|Episódio|Evidências/i);
   assert.ok(scoped.codes.every(code => code === "4625" || code === "4624"), JSON.stringify(scoped.codes));
   results.episodeRecords = `${scoped.total} registros do episódio “${episode.title}”`;
 

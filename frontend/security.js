@@ -7,8 +7,29 @@ window.Security = (() => {
   const pending = new Map();
   const names = new Map();
   let tacticFilter = null;
-  let showAll = false;
+  let shownEpisodes = 3;
   let lastData = null;
+  let minimumEvidence = 5, universe = "", summarySlots = null;
+  const evidence = () => window.EvidenceUI;
+  const universeKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
+  function syncUniverse() { const next = universeKey(); if (next !== universe) { universe = next; minimumEvidence = 5; } }
+  function setMinimum(n) {
+    if (!Number.isInteger(n) || n < 1 || n > 5) return;
+    syncUniverse(); minimumEvidence = n;
+    const data = cached();
+    if (data?.storage?.kind === "sqlite") {
+      loadStoredPage(0).catch(error => toast(String(error), "err"));
+      document.dispatchEvent(new CustomEvent("evidence-rigidity-change", { detail: { minimum: n } }));
+      return;
+    }
+    if (data && summarySlots?.attention?.isConnected) {
+      drawAttention(summarySlots.attention, data);
+      if (summarySlots.entities) drawEntities(summarySlots.entities, data);
+      if (summarySlots.rare) drawRare(summarySlots.rare, data);
+    }
+    document.dispatchEvent(new CustomEvent("evidence-rigidity-change", { detail: { minimum: n } }));
+  }
+  const visibleDetection = d => (d.evidence_level || 0) >= minimumEvidence && !d.context_only;
   const COLLAPSED = 3;
 
   const key = () => JSON.stringify([workspaceScope(), window.Workspace?.sourceKey?.() || ""]);
@@ -27,11 +48,12 @@ window.Security = (() => {
     for (const d of data?.detections || []) names.set(d.rule, d.name);
   }
   async function get({ force = false } = {}) {
+    syncUniverse();
     const k = key();
     if (!force && results.has(k)) return results.get(k);
     if (!force && pending.has(k)) return pending.get(k);
     const request = typeof analyticsRequest === "function" ? analyticsRequest(workspaceScope()) : { filters: backendFilters() };
-    const promise = api("triage", { ...request, force }, { silent: true }).then(data => {
+    const promise = api("triage", { ...request, force, minimumEvidence: minimumEvidence, episodeLimit: 20 }, { silent: true }).then(data => {
       remember(data);
       if (k === key()) { results.set(k, data); lastData = data; if (results.size > 8) results.delete(results.keys().next().value); }
       return data;
@@ -40,12 +62,29 @@ window.Security = (() => {
     return promise;
   }
   const cached = () => results.get(key()) || null;
-  document.addEventListener("workspace-context-change", () => { tacticFilter = null; showAll = false; });
+  let pageGeneration = 0;
+  async function loadStoredPage(offset) {
+    const generation=++pageGeneration, context=key(), level=minimumEvidence;
+    const request=analyticsRequest(workspaceScope());
+    const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter},{silent:true});
+    if(generation!==pageGeneration || context!==key() || level!==minimumEvidence)return;
+    results.set(context,data);lastData=data;remember(data);
+    if(summarySlots?.attention?.isConnected){drawAttention(summarySlots.attention,data);if(summarySlots.entities)drawEntities(summarySlots.entities,data);}
+  }
+  async function completeEpisode(data,episode) {
+    if(episode.members_complete!==false)return episode.detections.map(i=>data.detections[i]);
+    const detections=[];let offset=0;
+    do {const page=await api("triage_episode",{analysisId:data.analysis_id,episodeId:episode.id,offset,limit:100},{silent:true});
+      if(page.analysis_id!==data.analysis_id)throw new Error("A análise mudou durante a leitura das evidências");
+      detections.push(...page.detections);offset=page.next_offset;
+    } while(offset!=null);
+    return detections;
+  }
+  document.addEventListener("workspace-context-change", () => { tacticFilter = null; shownEpisodes = 3; minimumEvidence = 5; universe = universeKey(); });
 
   // ---------------------------------------------------------------- evidence
   function detectionFilters(d) {
-    const time = d.start != null ? [{ column: "timestamp", op: "between", value: String(d.start), value2: String(d.end ?? d.start) }] : [];
-    return [...d.filters, ...time];
+    return d.event_refs?.length ? [{ column: "event_ref", op: "in_exact", value: d.event_refs.join("\n") }] : [...d.filters];
   }
   const FIELD_NAME = /^@?[\p{L}\p{N}_.-]+$/u;
   const quoted = value => `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
@@ -60,33 +99,34 @@ window.Security = (() => {
     return parts.join(" AND ");
   }
   function episodeFilters(data, episode) {
-    const detections = episode.detections.map(i => data.detections[i]);
-    if (detections.length === 1) return detectionFilters(detections[0]);
-    const clauses = detections.map(detectionClause).filter(Boolean);
-    const time = episode.start != null ? [{ column: "timestamp", op: "between", value: String(episode.start), value2: String(episode.end ?? episode.start) }] : [];
-    return [...(clauses.length ? [{ column: "_all", op: "query", value: clauses.map(c => `(${c})`).join(" OR "), label: `Episódio: ${episode.title}` }] : []), ...time];
+    const refs = episode.event_refs || [...new Set(episode.detections.flatMap(i => data.detections[i].event_refs || []))];
+    return refs.length ? [{ column: "event_ref", op: "in_exact", value: refs.join("\n") }] : episode.detections.flatMap(i => detectionFilters(data.detections[i]));
   }
   const keepContext = () => state.filters.filter(f => f.column !== "timestamp");
-  function showRecords(filters) { window.Workspace.applyFilters([...keepContext(), ...filters], true); }
+  function showRecords(filters) { window.Workspace.applyFilters(filters, true); }
   function showTimeline(filters, start, end) {
     if (start != null) window.Workspace.focusTimeline?.(start, end ?? start);
-    window.Workspace.applyFilters([...keepContext(), ...filters.filter(f => f.column !== "timestamp")], true, "timeline");
+    window.Workspace.applyFilters(filters, true, "timeline");
   }
   async function saveToCase(data, detections, title, summary) {
     if (workspaceScope() === "case") { toast("Estes registros já pertencem ao Caso.", "info"); return; }
-    const ids = [...new Set(detections.flatMap(d => d.event_ids))].slice(0, 40);
+    const contextBefore = universeKey();
+    const ids = [...new Set(detections.flatMap(d => d.event_ids))];
     const rows = [];
-    for (const id of ids) { try { const row = await api("event_detail", { id }, { silent: true }); if (row) rows.push(row); } catch { /* record no longer available */ } }
+    for (const id of ids) { try { const row = await api("event_detail", { id }, { silent: true }); if (row) rows.push(row); } catch (error) { toast("Nao foi possivel preservar todas as evidencias: " + String(error), "error"); return; } }
+    if (universeKey() !== contextBefore) { toast("O conjunto mudou durante a coleta de evidencias.", "error"); return; }
+    if (rows.length !== ids.length) { toast("Evidencias incompletas; achado nao salvo.", "error"); return; }
     const c = ensureCase();
     queueCustody(registerCurrentArtifact(c));
     const start = Math.min(...detections.map(d => d.start ?? Infinity)), end = Math.max(...detections.map(d => d.end ?? -Infinity));
-    const filters = detections.length === 1 ? detectionFilters(detections[0]) : [];
+    const references = [...new Set(detections.flatMap(d => d.event_refs || []))];
+    const filters = references.length ? [{ column: "event_ref", op: "in_exact", value: references.join("\n") }] : detections.flatMap(detectionFilters);
     c.items.push({
       id: "i" + Date.now().toString(36) + Math.floor(Math.random() * 1e4), kind: "grupo", label: title, note: summary, createdAt: Date.now(),
-      rows, sourceFilters: [...backendFilters().filter(f => f.column !== "timestamp"), ...filters], sourceSpec: structuredClone(state.currentArtifact?.source),
-      foundCount: detections.reduce((n, d) => n + d.count, 0), includedCount: rows.length, tags: ["detecção"], relevance: detections.some(d => SEVERITY[d.severity]?.[1] >= 3) ? "importante" : "normal",
+      rows, sourceFilters: filters, sourceSpec: structuredClone(state.currentArtifact?.source),
+      foundCount: ids.length, includedCount: rows.length, tags: ["detecção"], relevance: detections.some(d => SEVERITY[d.severity]?.[1] >= 3) ? "importante" : "normal",
       origin: state.currentOrigin, artifactId: state.currentArtifact?.id, stationId: null,
-      detection: { detections: detections.map(d => ({ rule: d.rule, name: d.name, severity: d.severity, attack: d.attack, tactics: d.tactics, summary: d.summary, start: d.start, end: d.end, count: d.count, entities: d.entities })), start: Number.isFinite(start) ? start : null, end: Number.isFinite(end) ? end : null },
+      detection: { ...evidence().exportMetadata(data, minimumEvidence, workspaceScope()), analyst_state: "unreviewed", detections: structuredClone(detections), start: Number.isFinite(start) ? start : null, end: Number.isFinite(end) ? end : null },
     });
     if (await saveCases()) { window.Workspace?.loaded && updateCountsSafe(); window.WorkspaceContext?.refreshMembership?.(); toast("Salvo no Caso com os registros de apoio.", "ok"); }
   }
@@ -94,7 +134,18 @@ window.Security = (() => {
   async function suppress(detection) {
     const settings = (await rules()).settings;
     const entity = detection.entities[0];
-    settings.suppress = [...(settings.suppress || []), { rule: detection.rule, column: entity?.column || null, value: entity?.value || null, note: "", created: Date.now() }];
+    const exception = await new Promise(resolve => {
+      const dialog = document.createElement("dialog"); dialog.className = "evidence-exception";
+      dialog.innerHTML = `<form><h3>Exceção de detecção</h3><p></p><label>Justificativa<textarea required maxlength="1000" name="reason"></textarea></label><label>Validade<select name="days"><option value="1">1 dia</option><option value="7" selected>7 dias</option><option value="30">30 dias</option></select></label><div class="modal-actions"><button type="button" class="btn ghost" data-cancel>Cancelar</button><button class="btn primary" type="submit">Aplicar exceção</button></div></form>`;
+      dialog.querySelector("p").textContent = `${detection.name} · ${entity?.value || "todos os achados desta regra"} · escopo ${detection.namespace || "fonte sem namespace"}`;
+      const close = value => { dialog.close(); dialog.remove(); resolve(value); };
+      dialog.querySelector("[data-cancel]").onclick = () => close(null);
+      dialog.oncancel = event => { event.preventDefault(); close(null); };
+      dialog.querySelector("form").onsubmit = event => { event.preventDefault(); const form = new FormData(event.target), note = String(form.get("reason")).trim(); if (!note) return; close({ note, expires: Date.now() + Number(form.get("days")) * 86400000 }); };
+      document.body.append(dialog); dialog.showModal(); dialog.querySelector("textarea").focus();
+    });
+    if (!exception) return;
+    settings.suppress = [...(settings.suppress || []), { rule: detection.rule, column: entity?.column || null, value: entity?.value || null, scope: detection.namespace || "", created: Date.now(), ...exception }];
     await api("detection_settings_save", { settings });
     results.clear(); rulesCache = null;
     toast(entity ? `Ocultado para ${entity.value}.` : "Detecção ocultada.", "ok");
@@ -103,8 +154,9 @@ window.Security = (() => {
 
   // ---------------------------------------------------------------- attention
   function tacticsStrip(data) {
-    const max = Math.max(1, ...data.tactics.map(t => t.count));
-    return `<div class="sec-tactics" role="group" aria-label="Táticas MITRE ATT&CK">${data.tactics.map(t => {
+    const tactics = data.tactics.map(t => ({ ...t, count: t.counts_by_level ? t.counts_by_level.slice(minimumEvidence-1).reduce((a,b)=>a+b,0) : data.detections.filter(d => visibleDetection(d) && d.tactics.includes(t.key)).length }));
+    const max = Math.max(1, ...tactics.map(t => t.count));
+    return `<div class="sec-tactics" role="group" aria-label="Táticas MITRE ATT&CK">${tactics.map(t => {
       const level = t.count ? Math.ceil(4 * t.count / max) : 0;
       const tips = t.techniques.slice(0, 4).map(x => `${x.id} ${x.name}`).join("\n");
       return `<button type="button" class="sec-tactic l${level}${tacticFilter === t.key ? " on" : ""}" data-tactic="${esc(t.key)}" ${t.count ? "" : "disabled"} title="${esc(`${t.label}${t.count ? ` · ${t.count} ${t.count === 1 ? "detecção" : "detecções"}` : ""}${tips ? `\n${tips}` : ""}`)}" aria-label="${esc(t.label)}"></button>`;
@@ -112,11 +164,11 @@ window.Security = (() => {
   }
   function episodeRow(data, episode, index) {
     const detections = episode.detections.map(i => data.detections[i]);
-    const records = detections.reduce((n, d) => n + d.count, 0);
+    const records = episode.record_count ?? episode.event_refs?.length ?? new Set(detections.flatMap(d => d.event_ids)).size;
     const chain = episode.tactics.map(t => tacticLabel(data, t)).join(" → ");
     return `<article class="sec-episode sev-${esc(episode.severity)}" data-episode="${index}" tabindex="0" aria-expanded="false">
       <span class="sec-bar" title="Severidade ${esc(sevLabel(episode.severity))}"></span>
-      <div class="sec-main"><h3>${esc(episode.title)}</h3><p>${esc(episode.summary)}</p>
+      <div class="sec-main">${evidence().badge(episode.evidence_level)}<small class="evidence-impact">Impacto potencial: ${esc(sevLabel(episode.severity))}</small><h3>${esc(episode.title)}</h3><p>${esc(evidence().redact(episode.summary))}</p>
         <div class="sec-meta"><time>${esc(range(episode.start, episode.end))}</time><span>${fmtNum(detections.length)} ${detections.length === 1 ? "detecção" : "detecções"} · ${fmtNum(records)} ${records === 1 ? "registro" : "registros"}</span>${chain ? `<span class="sec-chain">${esc(chain)}</span>` : ""}<span class="sec-entities"></span></div>
         <div class="sec-detections" hidden></div></div>
       <div class="sec-actions">${icon("fa-list", "Ver registros", "records")}${icon("fa-timeline", "Ver na linha do tempo", "timeline")}${workspaceScope() === "dataset" ? icon("fa-bookmark", "Salvar no Caso", "save") : ""}</div></article>`;
@@ -126,28 +178,36 @@ window.Security = (() => {
       const d = data.detections[i];
       const attack = d.attack.map(a => `${a.id} ${a.name}`).join(" · ");
       return `<div class="sec-detection sev-${esc(d.severity)}" data-detection="${i}" title="${esc(`${d.description}${attack ? `\n\nATT&CK: ${attack}` : ""}`)}">
-        <span class="sec-dot"></span><div><strong>${esc(d.name)}</strong><small>${esc(d.summary)}</small></div>
+        <span class="sec-dot"></span><div>${evidence().badge(d.evidence_level)}${!visibleDetection(d) ? '<small>Contexto da correlacao</small>' : ""}<strong>${esc(d.name)}</strong><small>Impacto potencial: ${esc(sevLabel(d.severity))} · ${esc(evidence().outcome(d.outcome))}</small><small>${esc(evidence().redact(d.summary))}</small><details class="evidence-why"><summary>Motivos e evidencias</summary>${evidence().explanation(d)}<small>${fmtNum(d.event_refs?.length || d.count)} eventos originais · Regra ${esc(d.rule_version || "legada")} · ${esc(d.policy_version || "nao avaliada")}</small></details></div>
         <span class="sec-count">${fmtNum(d.count)}</span><time>${esc(range(d.start, d.end))}</time>
         <span class="sec-row-actions">${icon("fa-list", "Ver registros", "d-records")}${icon("fa-eye-slash", "Ocultar esta detecção", "d-hide")}</span></div>`;
     }).join("");
   }
   function drawAttention(slot, data) {
-    const matching = data.episodes.map((e, i) => ({ e, i })).filter(({ e }) => !tacticFilter || e.tactics.includes(tacticFilter));
-    const episodes = showAll || tacticFilter ? matching : matching.slice(0, COLLAPSED);
+    syncUniverse();
+    const eligibleEpisodes = data.episodes.filter(e => e.detections.some(i => visibleDetection(data.detections[i])));
+    const matching = data.episodes.map((e, i) => ({ e, i })).filter(({ e }) => eligibleEpisodes.includes(e) && (!tacticFilter || e.tactics.includes(tacticFilter)));
+    const controls = evidence().control(data, minimumEvidence);
+    const bindRigidity = () => slot.querySelectorAll("[data-evidence-min]").forEach(b => b.onclick = () => setMinimum(+b.dataset.evidenceMin));
+    const stored=data.storage?.kind==="sqlite";
+    const episodes = stored ? matching : matching.slice(0, shownEpisodes);
     const hidden = matching.length - episodes.length;
     const rulesText = `${fmtNum(data.rules)} regras${data.threat_rules ? ` · ${fmtNum(data.threat_rules)} sinais` : ""}${data.sigma_rules ? ` · ${fmtNum(data.sigma_rules)} Sigma` : ""}`;
-    if (!data.episodes.length) {
+    if (!eligibleEpisodes.length) {
       slot.className = "sec-clear";
-      slot.innerHTML = `<i class="fas fa-shield-halved" aria-hidden="true"></i><span>Nenhum padrão de ataque identificado</span><small>${esc(rulesText)} · ${fmtNum(data.total)} registros</small>${data.suppressed ? `<button type="button" class="text-button" data-open-rules>${fmtNum(data.suppressed)} ocultas</button>` : ""}`;
+      const gaps = (data.rule_coverage || []).filter(r => ["partial", "missing_fields", "missing_coverage"].includes(r.status));
+      slot.innerHTML = `${controls}<div class="evidence-empty"><strong>Nenhum indício ${minimumEvidence === 5 ? "E5" : `E${minimumEvidence} a E5`} encontrado neste conjunto.</strong><p>${(data.counts_by_level || []).slice(0, minimumEvidence - 1).some(Boolean) ? "Existem indícios em outros níveis. Reduza a rigidez para investigar." : "A ausência de indícios não demonstra ausência de comprometimento."}</p><small>Cobertura: ${data.limited || gaps.length ? "parcial" : "conforme os campos disponíveis"}${gaps.length ? ` · ${gaps.length} regras com dados insuficientes` : ""}. ${esc((data.limitations || []).join(" · "))}</small></div><small>${esc(rulesText)} · ${fmtNum(data.total)} registros analisados no universo completo</small>`;
+      bindRigidity();
       slot.hidden = false;
       slot.querySelector("[data-open-rules]")?.addEventListener("click", () => openSettings("detection"));
       return;
     }
     slot.className = "ws-card sec-attention";
-    slot.innerHTML = `<div class="card-heading"><h2>Atenção</h2>${tacticsStrip(data)}<span class="sec-heading-count">${fmtNum(data.episodes.length)} ${data.episodes.length === 1 ? "episódio" : "episódios"}</span></div>
+    slot.innerHTML = `${controls}<div class="card-heading"><h2>Indícios</h2>${tacticsStrip(data)}<span class="sec-heading-count">${stored ? `Episódios ${data.page.episode_offset+1}–${data.page.episode_offset+data.page.returned_episodes} de ${fmtNum(data.page.total_episodes)}` : `${fmtNum(eligibleEpisodes.length)} episódios visíveis · ${fmtNum(data.episodes.length)} disponíveis`}</span></div>
       ${tacticFilter ? `<div class="sec-filtering">${esc(tacticLabel(data, tacticFilter))} <button type="button" class="text-button" data-clear-tactic>mostrar todos</button></div>` : ""}
       <div class="sec-episodes">${episodes.map(({ e, i }) => episodeRow(data, e, i)).join("")}</div>
-      ${hidden > 0 ? `<button type="button" class="sec-more-episodes" data-more>Mostrar mais ${fmtNum(hidden)} ${hidden === 1 ? "episódio" : "episódios"}</button>` : showAll && matching.length > COLLAPSED ? '<button type="button" class="sec-more-episodes" data-more>Mostrar menos</button>' : ""}
+      ${stored ? `<div class="sec-pagination"><button class="btn ghost" data-page-offset="${Math.max(0,data.page.episode_offset-data.page.episode_limit)}" ${data.page.episode_offset===0?"disabled":""}>Anterior</button><button class="btn ghost" data-page-offset="${data.page.next_offset??0}" ${data.page.next_offset==null?"disabled":""}>Próxima</button></div>` : ""}
+      ${hidden > 0 ? `<button type="button" class="sec-more-episodes" data-more="expand">Mostrar mais ${fmtNum(Math.min(20, hidden))} ${hidden === 1 ? "episódio" : "episódios"}</button>` : shownEpisodes > COLLAPSED && matching.length > COLLAPSED ? '<button type="button" class="sec-more-episodes" data-more="collapse">Mostrar menos</button>' : ""}
       <div class="sec-foot"><span>${esc(rulesText)} · ${fmtNum(data.total)} registros${data.elapsed_ms ? ` em ${(data.elapsed_ms / 1000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} s` : ""}</span>${data.limited ? '<span class="sec-limited" title="Algum orçamento de memória foi atingido; refine o período para análise completa.">parcial</span>' : ""}${data.suppressed ? `<button type="button" class="text-button" data-open-rules>${fmtNum(data.suppressed)} ocultas</button>` : '<button type="button" class="text-button" data-open-rules>Regras</button>'}</div>`;
     slot.hidden = false;
     for (const article of slot.querySelectorAll("[data-episode]")) {
@@ -155,28 +215,48 @@ window.Security = (() => {
       const holder = article.querySelector(".sec-entities");
       for (const entity of episode.entities.slice(0, 3)) holder.append(window.EntityMenu.chip({ ...entity, first: episode.start, last: episode.end }, "small"));
     }
+    bindRigidity();
     bindAttention(slot, data);
   }
   function bindAttention(slot, data) {
-    slot.querySelectorAll("[data-tactic]").forEach(b => b.onclick = () => { tacticFilter = tacticFilter === b.dataset.tactic ? null : b.dataset.tactic; drawAttention(slot, data); });
-    slot.querySelector("[data-clear-tactic]")?.addEventListener("click", () => { tacticFilter = null; drawAttention(slot, data); });
+    slot.querySelectorAll("[data-page-offset]").forEach(b=>b.onclick=()=>loadStoredPage(+b.dataset.pageOffset).catch(e=>toast(String(e),"err")));
+    slot.querySelectorAll("[data-tactic]").forEach(b => b.onclick = () => { tacticFilter = tacticFilter === b.dataset.tactic ? null : b.dataset.tactic; if(data.storage?.kind==="sqlite")loadStoredPage(0).catch(e=>toast(String(e),"err"));else drawAttention(slot, data); });
+    slot.querySelector("[data-clear-tactic]")?.addEventListener("click", () => { tacticFilter = null; if(data.storage?.kind==="sqlite")loadStoredPage(0).catch(e=>toast(String(e),"err"));else drawAttention(slot, data); });
     slot.querySelectorAll("[data-open-rules]").forEach(b => b.onclick = () => openSettings("detection"));
-    slot.querySelector("[data-more]")?.addEventListener("click", () => { showAll = !showAll; drawAttention(slot, data); });
+    slot.querySelector("[data-more]")?.addEventListener("click", () => { shownEpisodes = slot.querySelector("[data-more]").dataset.more === "expand" ? shownEpisodes + 20 : COLLAPSED; drawAttention(slot, data); });
     const episodeOf = node => data.episodes[+node.closest("[data-episode]").dataset.episode];
-    const toggle = article => {
+    const loadMembers = async (article,offset) => {
+      const episode=episodeOf(article),page=await api("triage_episode",{analysisId:data.analysis_id,episodeId:episode.id,offset,limit:100},{silent:true});
+      article.__detailMembers=page.detections.map(d=>({...d,context_only:true}));
+      article.querySelector(".sec-detections").innerHTML=detectionRows({...data,detections:article.__detailMembers},{detections:page.detections.map((_,i)=>i)})+`<p class="small">Indícios ${offset+1}–${offset+page.detections.length} de ${page.total}</p>${offset>0?`<button class="btn ghost" data-members-offset="${Math.max(0,offset-100)}">Anteriores</button>`:""}${page.next_offset!=null?`<button class="btn ghost" data-members-offset="${page.next_offset}">Próximos indícios</button>`:""}`;
+    };
+    const toggle = async article => {
       const list = article.querySelector(".sec-detections"), open = list.hidden;
-      if (open && !list.innerHTML) list.innerHTML = detectionRows(data, episodeOf(article));
       list.hidden = !open; article.setAttribute("aria-expanded", String(open));
+      if (open && !list.innerHTML) {
+        const episode=episodeOf(article);
+        if(episode.members_complete===false){list.textContent="Carregando componentes da correlação…";try{await loadMembers(article,0);}catch(error){list.innerHTML="";toast(String(error),"err");}}
+        else list.innerHTML = detectionRows(data, episode);
+      }
     };
     slot.querySelector(".sec-episodes")?.addEventListener("click", async event => {
       const article = event.target.closest("[data-episode]");
-      if (!article || event.target.closest(".entity-chip")) return;
+      if (!article || event.target.closest(".entity-chip, .evidence-why")) return;
       const action = event.target.closest("[data-act]")?.dataset.act;
-      const episode = episodeOf(article);
-      const detection = event.target.closest("[data-detection]") && data.detections[+event.target.closest("[data-detection]").dataset.detection];
-      if (action === "records") showRecords(episodeFilters(data, episode));
-      else if (action === "timeline") showTimeline(episodeFilters(data, episode), episode.start, episode.end);
-      else if (action === "save") await saveToCase(data, episode.detections.map(i => data.detections[i]), episode.title, episode.summary);
+      let episode = episodeOf(article);
+      const membersPage=event.target.closest("[data-members-offset]");
+      if(membersPage){
+        try {await loadMembers(article,+membersPage.dataset.membersOffset);}catch(error){toast(String(error),"err");}return;
+      }
+      let actionData=data;
+      if(action && episode.members_complete===false && ["records","timeline","save"].includes(action)) {
+        try {const members=await completeEpisode(data,episode);actionData={...data,detections:members};episode={...episode,detections:members.map((_,i)=>i),event_refs:[...new Set(members.flatMap(d=>d.event_refs||[]))],members_complete:true};}
+        catch(error){toast(String(error),"err");return;}
+      }
+      const detection = event.target.closest("[data-detection]") && (article.__detailMembers || data.detections)[+event.target.closest("[data-detection]").dataset.detection];
+      if (action === "records") showRecords(episodeFilters(actionData, episode));
+      else if (action === "timeline") showTimeline(episodeFilters(actionData, episode), episode.start, episode.end);
+      else if (action === "save") await saveToCase(actionData, episode.detections.map(i => actionData.detections[i]), episode.title, episode.summary);
       else if (action === "d-records" && detection) showRecords(detectionFilters(detection));
       else if (action === "d-hide" && detection) await suppress(detection);
       else if (!detection) toggle(article);
@@ -186,18 +266,22 @@ window.Security = (() => {
       const article = event.target.closest("[data-episode]");
       if (article && event.target === article && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); toggle(article); }
     });
-    slot.querySelector(".sec-episodes")?.addEventListener("contextmenu", event => {
+    slot.querySelector(".sec-episodes")?.addEventListener("contextmenu", async event => {
       const article = event.target.closest("[data-episode]");
-      if (!article || event.target.closest(".entity-chip")) return;
+      if (!article || event.target.closest(".entity-chip, .evidence-why")) return;
       event.preventDefault();
-      const episode = episodeOf(article);
+      let episode = episodeOf(article), actionData=data;
       const detectionNode = event.target.closest("[data-detection]");
-      const detection = detectionNode && data.detections[+detectionNode.dataset.detection];
-      const target = detection ? { title: detection.name, summary: detection.summary, list: [detection], filters: detectionFilters(detection), start: detection.start, end: detection.end } : { title: episode.title, summary: episode.summary, list: episode.detections.map(i => data.detections[i]), filters: episodeFilters(data, episode), start: episode.start, end: episode.end };
+      const detection = detectionNode && (article.__detailMembers || data.detections)[+detectionNode.dataset.detection];
+      if(!detection && episode.members_complete===false){
+        try {const members=await completeEpisode(data,episode);actionData={...data,detections:members};episode={...episode,detections:members.map((_,i)=>i),event_refs:[...new Set(members.flatMap(d=>d.event_refs||[]))]};}
+        catch(error){toast(String(error),"err");return;}
+      }
+      const target = detection ? { title: detection.name, summary: detection.summary, list: [detection], filters: detectionFilters(detection), start: detection.start, end: detection.end } : { title: episode.title, summary: episode.summary, list: episode.detections.map(i => actionData.detections[i]), filters: episodeFilters(actionData, episode), start: episode.start, end: episode.end };
       showCtxMenu(event.clientX, event.clientY, [
         { icon: "fa-list", label: "Ver registros", onClick: () => showRecords(target.filters) },
         { icon: "fa-timeline", label: "Ver na linha do tempo", onClick: () => showTimeline(target.filters, target.start, target.end) },
-        ...(workspaceScope() === "dataset" ? [{ icon: "fa-bookmark", label: "Salvar no Caso", onClick: () => saveToCase(data, target.list, target.title, target.summary) }] : []),
+        ...(workspaceScope() === "dataset" ? [{ icon: "fa-bookmark", label: "Salvar no Caso", onClick: () => saveToCase(actionData, target.list, target.title, target.summary) }] : []),
         { icon: "fa-copy", label: "Copiar resumo", onClick: () => navigator.clipboard?.writeText(`${target.title}\n${target.summary}\n${range(target.start, target.end)}\n${target.list.map(d => `- ${d.name}: ${d.summary} (${d.count})`).join("\n")}`) },
         ...(detection ? [{ sep: true }, { icon: "fa-eye-slash", label: "Ocultar esta detecção", onClick: () => suppress(detection) }] : []),
       ]);
@@ -206,16 +290,17 @@ window.Security = (() => {
 
   // ---------------------------------------------------------------- entities and rarity
   function drawEntities(slot, data) {
+    data = { ...data, entities: data.entities.filter(e => (e.evidence_level || 0) >= minimumEvidence) };
     if (!data.entities.length) { slot.hidden = true; return; }
     slot.className = "ws-card sec-entities-card";
-    slot.innerHTML = `<div class="card-heading"><h2>Entidades em destaque</h2><span>por risco</span></div><div class="sec-entity-list"></div>`;
+    slot.innerHTML = `<div class="card-heading"><h2>Entidades em destaque</h2><span>por força da evidência</span></div><div class="sec-entity-list"></div>`;
     const list = slot.querySelector(".sec-entity-list");
     for (const e of data.entities.slice(0, 8)) {
       const row = el("button", `sec-entity risk-${e.level === "alto" ? "high" : e.level === "médio" ? "medium" : "low"}`);
       row.type = "button";
       row.innerHTML = `<i class="fas ${window.EntityMenu.icon(e.column)}" aria-hidden="true"></i><span class="sec-entity-name"><strong></strong><small></small></span><span class="sec-risk" aria-hidden="true"><b style="width:${Math.max(6, e.score)}%"></b></span><span class="sec-score">${e.score}</span>`;
       row.querySelector("strong").textContent = e.value;
-      row.querySelector("small").textContent = `${e.label}${e.scope && e.scope !== "privado" ? ` · ${e.scope}` : ""} · ${e.detections} ${e.detections === 1 ? "detecção" : "detecções"}`;
+      row.querySelector("small").textContent = `${evidence().label(e.evidence_level)} · ${e.namespace || e.scope || e.label} · ${e.detections} ${e.detections === 1 ? "detecção" : "detecções"}`;
       row.title = `${e.label}: ${e.value}\nRisco ${e.score}/100 (${e.level})\n${fmtNum(e.events)} registros${e.failures ? ` · ${fmtNum(e.failures)} falhas` : ""}${e.first != null ? `\n${range(e.first, e.last)}` : ""}${e.tactics.length ? `\n${e.tactics.map(t => tacticLabel(data, t)).join(" · ")}` : ""}`;
       const act = event => { event.preventDefault(); window.EntityMenu.open(event.clientX, event.clientY, e); };
       row.onclick = act; row.oncontextmenu = act;
@@ -224,10 +309,10 @@ window.Security = (() => {
     slot.hidden = false;
   }
   function drawRare(slot, data, expanded = false) {
-    if (!data.rare.length) { slot.hidden = true; return; }
+    if (minimumEvidence !== 1 || !data.rare.length) { slot.hidden = true; return; }
     const shown = expanded ? data.rare : data.rare.slice(0, 6);
     slot.className = "ws-card sec-rare-card";
-    slot.innerHTML = `<div class="card-heading"><h2>Raridades</h2><span title="Valores que quase nunca aparecem entre muitos registros do mesmo tipo">pouco comuns</span></div>${shown.map((r, i) => `<button type="button" class="sec-rare" data-rare="${i}" title="${esc(`${r.label}: ${r.value}\n${r.count} de ${fmtNum(r.role_events)} registros · ${fmtNum(r.role_distinct)} valores distintos${r.first != null ? `\nPrimeira vez: ${shortTime(r.first)}` : ""}`)}"><code></code><small>${esc(r.label)}</small><span>${fmtNum(r.count)}</span></button>`).join("")}${shown.length < data.rare.length ? `<button type="button" class="text-button sec-more">Mais ${data.rare.length - shown.length}</button>` : ""}`;
+    slot.innerHTML = `<div class="card-heading"><h2>Contexto estatístico</h2><span title="Valores que quase nunca aparecem entre muitos registros do mesmo tipo">raridade não é indício</span></div>${shown.map((r, i) => `<button type="button" class="sec-rare" data-rare="${i}" title="${esc(`${r.label}: ${r.value}\n${r.count} de ${fmtNum(r.role_events)} registros · ${fmtNum(r.role_distinct)} valores distintos${r.first != null ? `\nPrimeira vez: ${shortTime(r.first)}` : ""}`)}"><code></code><small>${esc(r.label)}</small><span>${fmtNum(r.count)}</span></button>`).join("")}${shown.length < data.rare.length ? `<button type="button" class="text-button sec-more">Mais ${data.rare.length - shown.length}</button>` : ""}`;
     slot.querySelectorAll("[data-rare]").forEach(b => {
       const r = data.rare[+b.dataset.rare];
       b.querySelector("code").textContent = r.value;
@@ -243,9 +328,30 @@ window.Security = (() => {
   function markers(host, start, end, onPick, before = null) {
     if (!host) return;
     host.querySelector(".sec-markers")?.remove();
-    const draw = data => {
-      if (!host.isConnected || !data?.detections?.length || !(end > start)) return;
-      const visible = data.detections.filter(d => d.start != null && d.end >= start && d.start <= end);
+    let revision=0;
+    const draw = async data => {
+      const mine=++revision,context=key(),level=minimumEvidence;
+      host.querySelectorAll(".sec-markers").forEach(n => n.remove());
+      if (!host.isConnected || !data || !(end > start)) return;
+      if(data.storage?.kind==="sqlite") {
+        try {
+          const timeline=await api("triage_timeline",{...analyticsRequest(workspaceScope()),minimumEvidence:level,start,end},{silent:true});
+          if(mine!==revision || context!==key() || level!==minimumEvidence || !host.isConnected)return;
+          if(!timeline.count)return;
+          const strip=el("div","sec-markers");strip.setAttribute("aria-label",`${fmtNum(timeline.count)} indícios no período — resultado completo`);
+          const groups=new Map();for(const bin of timeline.bins)(groups.get(bin.slot)||groups.set(bin.slot,[]).get(bin.slot)).push(bin);
+          for(const [slot,bins] of groups){
+            const strength=Math.max(...bins.map(b=>b.evidence_level)),from=Math.min(...bins.map(b=>b.start)),to=Math.max(...bins.map(b=>b.end));
+            const mark=el("button",`sec-marker evidence-marker-e${strength}`);mark.type="button";mark.style.left=`${slot/2}%`;
+            mark.title=bins.map(b=>`${evidence().label(b.evidence_level)}: ${fmtNum(b.count)} indícios`).join("\n");mark.setAttribute("aria-label",mark.title);
+            mark.onclick=()=>onPick(from,to,[]);mark.oncontextmenu=event=>{event.preventDefault();showCtxMenu(event.clientX,event.clientY,[{icon:"fa-timeline",label:"Selecionar intervalo dos indícios",onClick:()=>onPick(from,to,[])}]);};strip.append(mark);
+          }
+          if(before?.parentElement===host)host.insertBefore(strip,before);else host.append(strip);
+        }catch(error){if(mine===revision && host.isConnected){const failure=el("div","sec-markers","Não foi possível consultar os indícios do período");failure.title=String(error);host.append(failure);}}
+        return;
+      }
+      if(!data.detections?.length)return;
+      const visible = data.detections.filter(d => visibleDetection(d) && d.start != null && d.end >= start && d.start <= end);
       if (!visible.length) return;
       const strip = el("div", "sec-markers");
       strip.setAttribute("aria-label", "Detecções no período");
@@ -256,11 +362,11 @@ window.Security = (() => {
         (groups.get(slot) || groups.set(slot, []).get(slot)).push(d);
       }
       for (const [slot, list] of groups) {
-        list.sort((a, b) => (SEVERITY[b.severity]?.[1] || 0) - (SEVERITY[a.severity]?.[1] || 0));
-        const mark = el("button", `sec-marker sev-${list[0].severity}`);
+        list.sort((a, b) => b.evidence_level - a.evidence_level || (SEVERITY[b.severity]?.[1] || 0) - (SEVERITY[a.severity]?.[1] || 0));
+        const mark = el("button", `sec-marker evidence-marker-e${list[0].evidence_level}`);
         mark.type = "button";
         mark.style.left = `${slot / 2}%`;
-        mark.title = list.slice(0, 6).map(d => `${d.name} · ${d.summary}`).join("\n") + (list.length > 6 ? `\n+${list.length - 6}` : "");
+        mark.title = list.slice(0, 6).map(d => `${evidence().label(d.evidence_level)} · ${d.name} · ${d.summary}`).join("\n") + (list.length > 6 ? `\n+${list.length - 6}` : "");
         mark.setAttribute("aria-label", mark.title);
         mark.onclick = () => onPick(Math.min(...list.map(d => d.start)), Math.max(...list.map(d => d.end ?? d.start)), list);
         mark.oncontextmenu = event => { event.preventDefault(); showCtxMenu(event.clientX, event.clientY, list.slice(0, 8).map(d => ({ icon: "fa-list", label: `${d.name} (${fmtNum(d.count)})`, onClick: () => showRecords(detectionFilters(d)) }))); };
@@ -268,6 +374,8 @@ window.Security = (() => {
       }
       if (before && before.parentElement === host) host.insertBefore(strip, before); else host.append(strip);
     };
+    const refresh = () => { if (host.isConnected) draw(cached()); else document.removeEventListener("evidence-rigidity-change", refresh); };
+    document.addEventListener("evidence-rigidity-change", refresh);
     const now = cached();
     if (now) draw(now); else get().then(draw, () => {});
   }
@@ -275,6 +383,8 @@ window.Security = (() => {
   // ---------------------------------------------------------------- summary
   async function fillSummary({ attention, entities, rare }) {
     if (!attention) return;
+    summarySlots = { attention, entities, rare };
+    syncUniverse();
     attention.className = "sec-loading";
     attention.innerHTML = '<i class="fas fa-circle-notch spin" aria-hidden="true"></i><span>Procurando padrões de ataque…</span>';
     attention.hidden = false;
@@ -313,7 +423,24 @@ window.Security = (() => {
       <input type="search" class="rules-search" placeholder="Filtrar regras…" aria-label="Filtrar regras">
       ${settings.suppress?.length ? `<details class="rules-suppress"><summary>${settings.suppress.length} ${settings.suppress.length === 1 ? "detecção oculta" : "detecções ocultas"}</summary>${settings.suppress.map((s, i) => `<div class="rules-suppressed"><span>${esc(names.get(s.rule) || s.rule)}${s.value ? ` · ${esc(s.value)}` : ""}</span><button type="button" class="text-button" data-unsuppress="${i}">Mostrar novamente</button></div>`).join("")}</details>` : ""}
       ${overview.sigma_errors.length ? `<details class="rules-errors"><summary>${overview.sigma_errors.length} regras Sigma não convertidas</summary>${overview.sigma_errors.slice(0, 50).map(e => `<div>${esc(e)}</div>`).join("")}</details>` : ""}
-      <div class="rules-list">${groups.map(([origin, label]) => { const list = overview.rules.filter(r => r.origin === origin); return list.length ? `<h4>${label} <span>${list.filter(r => r.enabled).length}/${list.length}</span></h4>${list.map(r => `<label class="rule-row" data-search="${esc(`${r.name} ${r.id} ${r.attack.map(a => a.id + " " + a.name).join(" ")}`.toLowerCase())}" title="${esc(r.description)}"><input type="checkbox" data-rule="${esc(r.id)}" ${r.enabled ? "checked" : ""}><span class="sec-dot sev-${esc(r.severity)}"></span><span class="rule-name">${esc(r.name)}</span><small>${esc(r.attack.map(a => a.id).join(" "))}</small></label>`).join("")}` : ""; }).join("")}</div>`;
+      <div class="rules-list">${groups.map(([origin, label]) => { const list = overview.rules.filter(r => r.origin === origin); return list.length ? `<h4>${label} <span>${list.filter(r => r.enabled).length}/${list.length}</span></h4>${list.map(r => `<label class="rule-row" data-search="${esc(`${r.name} ${r.id} ${r.attack.map(a => a.id + " " + a.name).join(" ")}`.toLowerCase())}" title="${esc(r.description)}"><input type="checkbox" data-rule="${esc(r.id)}" ${r.enabled ? "checked" : ""} ${r.retired ? 'disabled title="Retirada da triagem: comportamento insuficiente isoladamente"' : ""}><span class="sec-dot sev-${esc(r.severity)}"></span><span class="rule-name">${esc(r.name)}</span><small>${r.evidence?.maturity === "unassessed" ? "Nível não avaliado" : `E${r.evidence_level ?? Math.min(r.evidence?.level || 0, 4)}`} · ${esc(r.evidence?.maturity || "legada")}</small><small>${esc(r.attack.map(a => a.id).join(" "))}</small></label>`).join("")}` : ""; }).join("")}</div>`;
+    const mappingsPane = el("details", "rules-mappings");
+    mappingsPane.innerHTML = `<summary>Mapeamento de fontes e procedência</summary><p class="muted small">Cada fonte usa seu nome exato. Campos: timestamp, actor, target, namespace, host, service, action, outcome, request, session, connection, process, parent, file, command, credential, created_credential, resource, request_command, url, persistence_target, application, grant, token, repository, pipeline, run, revision, secret, certificate, certificate_issuer, certificate_subject, requester, beneficiary, delegator, resource_spn, destination, artifact, logon, remote_session, principal, source_address. Resultados: success, failure, blocked, unknown.</p><textarea class="source-mapping-editor" aria-label="Mapeamentos por fonte (JSON)"></textarea><button type="button" class="btn ghost small" data-preview-map>Prévia no evento aberto</button><button type="button" class="btn ghost small" data-save-map>Salvar mapeamentos</button><pre class="mapping-preview" aria-live="polite"></pre>`;
+    pane.prepend(mappingsPane);
+    const editor = mappingsPane.querySelector("textarea"), preview = mappingsPane.querySelector("pre");
+    editor.value = JSON.stringify(settings.mappings || [], null, 2);
+    const coveragePane=el("details","rules-mappings");
+    coveragePane.innerHTML=`<summary>Cobertura explícita para regras por ausência</summary><p class="small muted">Declare somente intervalos completos comprovados. Cada declaração exige dataset_fingerprint, source, namespace, category, start/end em epoch ms, complete e justification. Uma declaração não vale para outro conjunto ou Caso.</p><code class="coverage-fingerprint"></code><textarea class="source-mapping-editor" aria-label="Cobertura por fonte (JSON)"></textarea><button type="button" class="btn ghost small" data-save-coverage>Salvar cobertura</button><pre aria-live="polite"></pre>`;
+    coveragePane.querySelector("code").textContent=`Conjunto atual: ${cached()?.dataset_fingerprint || "Execute a triagem para obter a identificação"}`;
+    coveragePane.querySelector("textarea").value=JSON.stringify(settings.coverage||[],null,2);
+    coveragePane.querySelector("button").onclick=async()=>{try{const coverage=JSON.parse(coveragePane.querySelector("textarea").value);if(!Array.isArray(coverage))throw Error("Informe uma lista de declarações");await api("detection_settings_save",{settings:{...settings,coverage}});settings.coverage=coverage;results.clear();rulesCache=null;coveragePane.querySelector("pre").textContent="Cobertura salva para o conjunto identificado.";}catch(e){coveragePane.querySelector("pre").textContent=String(e);}};
+    pane.prepend(coveragePane);
+    mappingsPane.querySelector("[data-preview-map]").onclick = async () => {
+      try { if (!state.currentDetailEv) throw Error("Abra um evento para conferir os campos reais da fonte."); const data = await api("normalization_preview", { event: state.currentDetailEv, mappings: JSON.parse(editor.value) }); preview.textContent = JSON.stringify(data, null, 2); } catch (e) { preview.textContent = String(e); }
+    };
+    mappingsPane.querySelector("[data-save-map]").onclick = async () => {
+      try { const next = JSON.parse(editor.value); if (!Array.isArray(next)) throw Error("Informe uma lista de mapeamentos."); await api("detection_settings_save", { settings: { ...settings, mappings: next } }); settings.mappings = next; results.clear(); rulesCache = null; preview.textContent = "Mapeamentos salvos. A proxima analise usara a nova versao."; } catch (e) { preview.textContent = String(e); }
+    };
     pane.querySelector("#rules-threats").onchange = async e => { settings.threats = e.target.checked; await save(); };
     pane.querySelectorAll("[data-rule]").forEach(box => box.onchange = async () => {
       const id = box.dataset.rule;
@@ -354,5 +481,5 @@ window.Security = (() => {
     const data = lastData, episode = data?.episodes?.[index];
     if (episode) showRecords(episodeFilters(data, episode));
   }
-  return { get, cached, fillSummary, markers, renderRulesPane, recipes, recipesMenu, openEpisode, ruleName: id => names.get(id) || null, rules: async () => (await rules()).rules, invalidate: () => results.clear(), last: () => lastData };
+  return { setMinimum, minimum: () => { syncUniverse(); return minimumEvidence; }, get, cached, fillSummary, markers, renderRulesPane, recipes, recipesMenu, openEpisode, ruleName: id => names.get(id) || null, rules: async () => (await rules()).rules, invalidate: () => results.clear(), last: () => lastData };
 })();
