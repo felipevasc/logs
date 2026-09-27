@@ -60,6 +60,8 @@ jobs:
         run: node scripts/release/verify-version.mjs
       - name: Verify release safeguards
         run: node scripts/release/test-release.mjs
+      - name: Test event detail tree and formatters
+        run: node --test scripts/preview/test-detail-fields.cjs
       - run: npm run prepare:frontend
       - name: Backend tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --lib -- --test-threads=1

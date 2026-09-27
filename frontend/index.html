@@ -834,6 +834,16 @@
     </div>
   </aside>
   <div id="drawer-scrim" class="drawer-scrim" hidden></div>
+  <div id="detail-value-modal" class="modal-overlay" hidden>
+    <div class="modal detail-value-modal" role="dialog" aria-modal="true" aria-labelledby="detail-value-title">
+      <div class="modal-head">
+        <div class="detail-value-heading"><span class="detail-eyebrow">Conteúdo do campo</span><h3 id="detail-value-title"></h3></div>
+        <button class="icon-btn" id="detail-value-close" type="button" aria-label="Fechar conteúdo"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div class="detail-value-toolbar"><span id="detail-value-type"></span><button class="btn ghost small" id="detail-value-copy" type="button"><i class="fas fa-copy"></i> Copiar valor</button></div>
+      <div class="modal-body"><pre id="detail-value-content" class="detail-value-content"></pre></div>
+    </div>
+  </div>
 
   <!-- ===================== POPOVER: NOVO FILTRO ===================== -->
   <div id="filter-pop" class="popover" hidden>
@@ -1002,6 +1012,8 @@
   <script src="timeline-export.js"></script>
   <script src="icon-picker.js"></script>
   <script src="case-timeline.js"></script>
+  <script src="vendor/js-yaml/js-yaml.min.js"></script>
+  <script src="detail-fields.js"></script>
   <script src="app.js"></script>
   <script src="tasks.js"></script>
   <script src="ui-scale.js"></script>

@@ -4560,6 +4560,7 @@ async function openDetail(id) {
 
 // abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
 function showDetailLoading() {
+  closeDetailValue();
   state.detailId = null; state.currentDetailEv = null; state.detailSourceSpec = null;
   const actions = $("#drawer .detail-quick-actions"); if (actions) actions.hidden = true;
   for (const id of ["dr-prev", "dr-next", "dr-copy"]) $("#" + id).hidden = true;
@@ -4577,6 +4578,7 @@ function showDetailLoading() {
 }
 
 function openContextInspector(title, subtitle, overview) {
+  closeDetailValue();
   detailRequest++;
   state.detailId = null;
   state.currentDetailEv = null;
@@ -4644,7 +4646,188 @@ function showStationInspector(station) {
   openContextInspector("Estação", station.name, overview);
 }
 
+let detailValueReturnFocus = null;
+let detailValueText = "";
+let detailValueNode = null;
+function closeDetailValue() {
+  const modal = $("#detail-value-modal");
+  if (modal.hidden) return;
+  modal.hidden = true;
+  detailValueReturnFocus?.focus?.();
+  detailValueReturnFocus = null;
+  detailValueNode = null;
+}
+
+function openDetailValue(node, trigger) {
+  detailValueReturnFocus = trigger;
+  detailValueNode = node;
+  const formatted = DetailFields.format(node.value, node.format);
+  detailValueText = typeof node.value === "object" ? JSON.stringify(node.value, null, 2) : String(node.value ?? "");
+  $("#detail-value-title").textContent = node.path;
+  $("#detail-value-type").textContent = formatted.type;
+  $("#detail-value-content").innerHTML = formatted.html;
+  $("#detail-value-modal").hidden = false;
+  $("#detail-value-close").focus();
+}
+
+function detailFieldColumn(node) {
+  let path = node.path;
+  while (path) {
+    if (state.columns.includes(path)) return path;
+    const dot = path.lastIndexOf(".");
+    path = dot > 0 ? path.slice(0, dot) : "";
+  }
+  return null;
+}
+
+function detailFieldFilterValue(node) {
+  return typeof node.filterValue === "object" ? JSON.stringify(node.filterValue) : String(node.filterValue ?? "");
+}
+
+function toggleDetailColumn(column) {
+  const visible = state.visibleCols.includes(column);
+  if (visible && column === "timestamp") return;
+  const next = new Set(state.visibleCols);
+  if (visible) next.delete(column);
+  else next.add(column);
+  state.visibleCols = state.columns.filter((item) => next.has(item));
+  saveVisibleCols();
+  renderTable({ total: state.total, rows: state.rows });
+  toast(visible ? "Coluna removida da tabela." : "Coluna adicionada à tabela.", "ok");
+}
+
+function showDetailNameMenu(event, node) {
+  event.preventDefault();
+  event.stopPropagation();
+  const column = state.columns.includes(node.path) ? node.path : null;
+  const items = [];
+  if (column) {
+    if (column !== "timestamp") items.push({
+      icon: state.visibleCols.includes(column) ? "fa-eye-slash" : "fa-table-columns",
+      label: state.visibleCols.includes(column) ? "Remover coluna da tabela" : "Adicionar coluna à tabela",
+      onClick: () => toggleDetailColumn(column),
+    });
+    items.push(
+      { icon: "fa-filter", label: "Filtrar preenchidos", onClick: () => addFilter({ column, op: "not_empty", value: "", value2: null }) },
+      { icon: "fa-filter-circle-xmark", label: "Filtrar vazios", onClick: () => addFilter({ column, op: "empty", value: "", value2: null }) },
+      { sep: true },
+    );
+  }
+  if (node.hasValue) items.push({ icon: "fa-expand", label: "Ver conteúdo completo", onClick: () => openDetailValue(node, event.target) });
+  items.push({ icon: "fa-copy", label: "Copiar caminho do campo", onClick: () => navigator.clipboard.writeText(node.path).then(() => toast("Nome copiado.", "ok")) });
+  showCtxMenu(event.clientX, event.clientY, items);
+}
+
+function showDetailValueMenu(event, node, selected = "", inModal = false) {
+  event.preventDefault();
+  event.stopPropagation();
+  const column = detailFieldColumn(node);
+  const actual = column === node.path;
+  const raw = actual ? detailFieldFilterValue(node) : String(node.value ?? "");
+  const text = selected || (typeof node.value === "object" ? JSON.stringify(node.value) : raw);
+  const sourceText = column && state.currentDetailEv ? String(cellValue(state.currentDetailEv, column) ?? "") : "";
+  const canContain = !!column && !!text.trim() && sourceText.includes(text);
+  const items = [];
+  if (column && text.trim()) {
+    if (actual && !selected) items.push(
+      { icon: "fa-filter", label: `Filtrar valor exato: ${trunc(text)}`, onClick: () => addFilter({ column, op: column === "timestamp" ? "between" : "equals_exact", value: raw, value2: column === "timestamp" ? raw : null }) },
+      { icon: "fa-filter-circle-xmark", label: `Excluir valor: ${trunc(text)}`, onClick: () => addFilter({ column, op: "not_equals_exact", value: raw, value2: null }) },
+    );
+    if (canContain) items.push(
+      { icon: "fa-magnifying-glass", label: `${actual ? "Filtrar" : `Filtrar em ${colLabel(column)}`} contendo: ${trunc(text)}`, onClick: () => addFilter({ column, op: "contains", value: text, value2: null }) },
+      { icon: "fa-filter-circle-xmark", label: `${actual ? "Excluir" : `Excluir em ${colLabel(column)}`} contendo: ${trunc(text)}`, onClick: () => addFilter({ column, op: "not_contains", value: text, value2: null }) },
+    );
+    items.push({ sep: true });
+  }
+  if (!inModal) items.push({ icon: "fa-expand", label: "Ver conteúdo completo", onClick: () => openDetailValue(node, event.target) });
+  items.push({ icon: "fa-copy", label: selected ? "Copiar seleção" : "Copiar valor", onClick: () => navigator.clipboard.writeText(selected || (typeof node.value === "object" ? JSON.stringify(node.value, null, 2) : String(node.value ?? ""))).then(() => toast("Valor copiado.", "ok")) });
+  if (column && selected && canContain && state.currentDetailEv) items.push(
+    { sep: true },
+    { icon: "fa-square-plus", label: "Criar campo a partir da seleção", onClick: () => openDeriveModal(selected, column, cellValue(state.currentDetailEv, column)) },
+  );
+  showCtxMenu(event.clientX, event.clientY, items);
+}
+
+function renderDetailTree(entries) {
+  const tree = el("div", "detail-tree");
+  tree.setAttribute("role", "tree");
+  tree.setAttribute("aria-label", "Campos do evento");
+  const nodes = DetailFields.buildTree(entries);
+  function renderNode(node, depth) {
+    const item = el("div", "detail-tree-item");
+    item.setAttribute("role", "treeitem");
+    item.setAttribute("aria-label", node.path);
+    const row = el("div", "detail-tree-row");
+    row.dataset.col = node.original ? node.path : "";
+    const head = el("div", "detail-tree-head");
+    const hasChildren = node.children.length > 0;
+    const expanded = depth < 2;
+    let children;
+    if (hasChildren) {
+      const toggle = el("button", "detail-tree-toggle");
+      toggle.type = "button";
+      toggle.setAttribute("aria-label", `${expanded ? "Recolher" : "Expandir"} ${node.path}`);
+      toggle.setAttribute("aria-expanded", String(expanded));
+      toggle.innerHTML = '<i class="fas fa-chevron-right" aria-hidden="true"></i>';
+      toggle.classList.toggle("expanded", expanded);
+      toggle.onclick = () => {
+        const open = toggle.getAttribute("aria-expanded") !== "true";
+        toggle.setAttribute("aria-expanded", String(open));
+        toggle.setAttribute("aria-label", `${open ? "Recolher" : "Expandir"} ${node.path}`);
+        toggle.classList.toggle("expanded", open);
+        children.hidden = !open;
+      };
+      head.appendChild(toggle);
+    } else head.appendChild(el("span", "detail-tree-spacer"));
+    const name = el("span", "detail-tree-name", depth ? node.name : colLabel(node.name));
+    name.title = node.path;
+    name.oncontextmenu = (event) => showDetailNameMenu(event, node);
+    head.appendChild(name);
+    row.appendChild(head);
+    if (node.hasValue) {
+      const valueLine = el("div", "detail-tree-value-line");
+      const value = el("button", `detail-tree-value${node.mono ? " mono" : ""}`);
+      value.type = "button";
+      const display = node.format?.type === "json" && typeof node.value === "object"
+        ? JSON.stringify(node.value) : String(node.value ?? "");
+      value.textContent = display || "(vazio)";
+      value.title = `Ver conteúdo completo de ${node.path}`;
+      value.setAttribute("aria-label", `Ver conteúdo completo de ${node.path}`);
+      value.onclick = () => openDetailValue(node, value);
+      value.oncontextmenu = (event) => showDetailValueMenu(event, node);
+      valueLine.appendChild(value);
+      if (node.original && state.columns.includes(node.path) && node.filterValue != null && String(node.filterValue).trim() !== "" && node.path !== "raw") {
+        const filter = el("button", "kv-filter");
+        filter.type = "button";
+        filter.innerHTML = '<i class="fas fa-filter" aria-hidden="true"></i>';
+        filter.title = `Filtrar: ${colLabel(node.path)} = ${display.slice(0, 40)}`;
+        filter.setAttribute("aria-label", `Filtrar por ${node.path}`);
+        filter.onclick = (event) => {
+          event.stopPropagation();
+          const filterValue = detailFieldFilterValue(node);
+          addFilter({ column: node.path, op: node.path === "timestamp" ? "between" : "equals_exact", value: filterValue, value2: node.path === "timestamp" ? filterValue : null });
+          toast("Filtro adicionado.", "ok");
+        };
+        valueLine.appendChild(filter);
+      }
+      row.appendChild(valueLine);
+    }
+    item.appendChild(row);
+    if (hasChildren) {
+      children = el("div", "detail-tree-children");
+      children.setAttribute("role", "group");
+      children.hidden = !expanded;
+      for (const child of node.children) children.appendChild(renderNode(child, depth + 1));
+      item.appendChild(children);
+    }
+    return item;
+  }
+  for (const node of nodes) tree.appendChild(renderNode(node, 0));
+  return tree;
+}
+
 function showDetail(ev, sourceSpec = null) {
+  closeDetailValue();
   detailRequest++;
   state.detailId = ev.id;
   state.currentDetailEv = ev;
@@ -4670,7 +4853,9 @@ function showDetail(ev, sourceSpec = null) {
   if (ev.name) badges.appendChild(el("span", "badge code", ev.name));
 
   const rows = [];
-  const push = (k, v, mono, filterValue = v) => rows.push({ k, v: window.EvidenceUI ? EvidenceUI.redact({ [k]: v ?? "" })[k] : v ?? "", mono, filterValue });
+  const push = (key, value, mono, filterValue = value) => rows.push({
+    key, value: window.EvidenceUI ? EvidenceUI.redact({ [key]: value ?? "" })[key] : value ?? "", mono, filterValue,
+  });
   push("timestamp", fmtTsFull(ev.timestamp), true, ev.timestamp);
   push("source", ev.source);
   push("level", ev.level);
@@ -4680,48 +4865,11 @@ function showDetail(ev, sourceSpec = null) {
   push("message", ev.message, true);
   const fieldEntries = Object.entries(ev.fields || {}).sort(([a], [b]) => a.localeCompare(b));
   for (const [k, v] of fieldEntries) {
-    push(k, typeof v === "object" ? JSON.stringify(v) : String(v), true);
+    push(k, v, true);
   }
 
-  const allFieldKeys = new Set(Object.keys(ev.fields || {}));
-  const kv = el("div", "kv");
-  for (const r of rows) {
-    const row = el("div", "kv-row");
-    const colKey = r.k;
-    row.dataset.col = colKey;
-
-    const lastDot = colKey.lastIndexOf(".");
-    const parentKey = lastDot > 0 ? colKey.slice(0, lastDot) : null;
-    const isChild = parentKey && (allFieldKeys.has(parentKey) || rows.some(other => other.k === parentKey));
-
-    if (isChild) {
-      row.classList.add("kv-row-child");
-      const kDiv = el("div", "kv-k");
-      const lastSegment = colKey.slice(lastDot + 1);
-      kDiv.innerHTML = `<span class="kv-tree-guide">└─</span> <span class="kv-child-name">${esc(lastSegment)}</span>`;
-      kDiv.title = `${colLabel(colKey)} (filho de ${colLabel(parentKey)})`;
-      row.appendChild(kDiv);
-    } else {
-      row.appendChild(el("div", "kv-k", colLabel(colKey)));
-    }
-
-    const v = el("div", `kv-v${r.mono ? " mono" : ""}`, String(r.v));
-    row.appendChild(v);
-    if (!["raw"].includes(colKey) && r.filterValue != null && String(r.filterValue).trim() !== "") {
-      const f = el("button", "kv-filter");
-      f.innerHTML = '<i class="fas fa-filter"></i>';
-      f.title = `Filtrar: ${colLabel(colKey)} = ${String(r.v).slice(0, 40)}`;
-      f.onclick = (e) => {
-        e.stopPropagation();
-        addFilter({ column: colKey, op: colKey === "timestamp" ? "between" : "equals_exact", value: String(r.filterValue), value2: colKey === "timestamp" ? String(r.filterValue) : null });
-        toast("Filtro adicionado.", "ok");
-      };
-      row.appendChild(f);
-    }
-    kv.appendChild(row);
-  }
   $("#pane-overview").innerHTML = "";
-  $("#pane-overview").appendChild(kv);
+  $("#pane-overview").appendChild(renderDetailTree(rows));
   $("#pane-json").innerHTML = highlightJson(window.EvidenceUI ? EvidenceUI.redact(ev) : ev);
   $("#pane-raw").textContent = (window.EvidenceUI ? EvidenceUI.redact(ev.raw) : ev.raw) || "(sem conteúdo bruto)";
 
@@ -4754,6 +4902,7 @@ function detailStep(dir) {
 function closeDrawer() {
   detailRequest++;
   state.detailId = null;
+  closeDetailValue();
   $("#drawer").hidden = true;
   $("#drawer-scrim").hidden = true;
   $("#btn-right-inspect").classList.remove("active");
@@ -5420,6 +5569,10 @@ function bindKeyboard() {
       e.preventDefault();
       $("#quick-search").focus();
     } else if (e.key === "Escape") {
+      if (!$("#detail-value-modal").hidden) {
+        closeDetailValue();
+        return;
+      }
       closeCtxMenu();
       closeTlPop();
       closeDrawer();
@@ -5438,7 +5591,7 @@ function bindKeyboard() {
       $("#case-item-modal").hidden = true;
       pendingCaseAdd = null;
       editingCaseItem = null;
-    } else if (!$("#drawer").hidden && !typing) {
+    } else if (!$("#drawer").hidden && $("#detail-value-modal").hidden && !typing) {
       if (e.key === "ArrowLeft") detailStep(-1);
       else if (e.key === "ArrowRight") detailStep(1);
     } else if ((e.ctrlKey || e.metaKey) && (e.key === "a" || e.key === "A") && !typing) {
@@ -5690,6 +5843,21 @@ function bind() {
 
   $("#dr-close").onclick = closeDrawer;
   $("#drawer-scrim").onclick = closeDrawer;
+  $("#detail-value-close").onclick = closeDetailValue;
+  $("#detail-value-modal").onclick = (event) => {
+    if (event.target === $("#detail-value-modal")) closeDetailValue();
+  };
+  $("#detail-value-copy").onclick = async () => {
+    await navigator.clipboard.writeText(detailValueText);
+    toast("Valor copiado.", "ok");
+  };
+  $("#detail-value-content").oncontextmenu = (event) => {
+    if (!detailValueNode) return;
+    const selection = window.getSelection();
+    const selected = selection && $("#detail-value-content").contains(selection.anchorNode)
+      && $("#detail-value-content").contains(selection.focusNode) ? selection.toString().trim() : "";
+    showDetailValueMenu(event, detailValueNode, selected, true);
+  };
   $("#dr-prev").onclick = () => detailStep(-1);
   $("#dr-next").onclick = () => detailStep(1);
   $("#dr-copy").onclick = async () => {
