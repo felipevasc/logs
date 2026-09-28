@@ -993,7 +993,8 @@ pub async fn expand_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
                     files.extend(members);
                 } else if explicit
                     || [
-                        "log", "txt", "jsonl", "ndjson", "json", "csv", "tsv", "evtx", "gz", "audit",
+                        "log", "txt", "jsonl", "ndjson", "json", "csv", "tsv", "evtx", "gz", "audit", "xlsx", "xlsm",
+                        "xlsb", "xls", "ods",
                     ]
                     .contains(&ext.as_str())
                     || ext.parse::<u32>().is_ok()
@@ -1030,7 +1031,7 @@ pub fn archive_kind(path: &str) -> Option<&'static str> {
     }
 }
 
-/// Member paths that look like logs (text, compressed logs, EVTX).
+/// Member paths that look like logs (text, compressed logs, EVTX, spreadsheets).
 fn loggable_member(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let file = lower.rsplit('/').next().unwrap_or(&lower);
@@ -1038,7 +1039,8 @@ fn loggable_member(name: &str) -> bool {
         return false;
     }
     let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    ["log", "txt", "jsonl", "ndjson", "json", "csv", "tsv", "evtx", "gz", "out", "err", "audit"].contains(&ext)
+    ["log", "txt", "jsonl", "ndjson", "json", "csv", "tsv", "evtx", "gz", "out", "err", "audit", "xlsx", "xlsm", "xlsb", "xls", "ods"]
+        .contains(&ext)
         || ext.is_empty()
         || ext.parse::<u32>().is_ok()
 }
@@ -1223,4 +1225,108 @@ pub fn expand_gzip(path: &Path) -> Result<PathBuf, String> {
         let _ = std::fs::remove_file(temp);
     }
     result
+}
+
+/// Text logs written by Windows tools in UTF-16 (PowerShell, Event Viewer
+/// exports) or in a legacy code page, recognized from a sample; UTF-8 and
+/// binary files are left as they are.
+pub fn sniff_encoding(sample: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    if sample.starts_with(&[0xFF, 0xFE]) {
+        return Some(encoding_rs::UTF_16LE);
+    }
+    if sample.starts_with(&[0xFE, 0xFF]) {
+        return Some(encoding_rs::UTF_16BE);
+    }
+    if sample.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return None;
+    }
+    // UTF-16 without a byte order mark: ASCII text has a zero in every other byte.
+    let pairs = sample.len() / 2;
+    if pairs >= 16 {
+        let (mut even, mut odd) = (0usize, 0usize);
+        for pair in sample.chunks_exact(2) {
+            even += usize::from(pair[0] == 0);
+            odd += usize::from(pair[1] == 0);
+        }
+        if odd * 10 >= pairs * 4 && even * 10 < pairs {
+            return Some(encoding_rs::UTF_16LE);
+        }
+        if even * 10 >= pairs * 4 && odd * 10 < pairs {
+            return Some(encoding_rs::UTF_16BE);
+        }
+    }
+    if sample.contains(&0) {
+        return None;
+    }
+    // A legacy code page shows invalid UTF-8 and no valid multi-byte character.
+    let mut rest = sample;
+    let mut invalid = false;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                if !text.is_ascii() {
+                    return None;
+                }
+                break;
+            }
+            Err(error) => {
+                let (valid, after) = rest.split_at(error.valid_up_to());
+                if !valid.is_ascii() {
+                    return None;
+                }
+                match error.error_len() {
+                    Some(length) => {
+                        invalid = true;
+                        rest = &after[length..];
+                    }
+                    // A character cut at the end of the sample.
+                    None => break,
+                }
+            }
+        }
+    }
+    invalid.then_some(encoding_rs::WINDOWS_1252)
+}
+
+/// Converts a UTF-16 or legacy code page text file to UTF-8 once; `None` when
+/// the file is read as it is.
+pub fn expand_encoding(path: &Path) -> Result<Option<PathBuf>, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+        return Ok(None);
+    }
+    let mapped = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| e.to_string())?;
+    let Some(encoding) = sniff_encoding(&mapped[..mapped.len().min(1 << 20)]) else { return Ok(None) };
+    let dir = crate::config_dir().join("expanded");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let id = crate::index_cache::identity(&path.to_string_lossy(), &mapped);
+    let target = dir.join(format!("{}-utf8-{}", &id[..16], path.file_name().unwrap_or_default().to_string_lossy()));
+    if target.exists() {
+        return Ok(Some(target));
+    }
+    let temp = target.with_extension("pending");
+    let result = (|| {
+        let mut decoder = encoding.new_decoder_with_bom_removal();
+        let mut out = BufWriter::new(std::fs::File::create(&temp).map_err(|e| e.to_string())?);
+        let mut input: &[u8] = &mapped;
+        let mut text = String::with_capacity(1 << 18);
+        loop {
+            crate::operations::check()?;
+            let (result, read, _) = decoder.decode_to_string(input, &mut text, true);
+            input = &input[read..];
+            out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            text.clear();
+            if result == encoding_rs::CoderResult::InputEmpty {
+                break;
+            }
+        }
+        out.flush().map_err(|e| e.to_string())?;
+        drop(out);
+        std::fs::rename(&temp, &target).map_err(|e| e.to_string())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(temp);
+        return Err(error);
+    }
+    Ok(Some(target))
 }

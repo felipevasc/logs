@@ -1029,7 +1029,7 @@ impl LogInsightMcp {
     // ------------------------------------------------------------ carregamento
 
     #[tool(
-        description = "Load a log file as the current source (replaces it unless merge=true). MUTATES app state: emits 'mcp-state-changed' {kind: 'source'}. Returns {count, columns, source_desc}. Java formats (log4j, wildfly) group multi-line stacktraces into a single event: the raw line holds the whole block and the event gains 'stacktrace' (array of 'at ...' frames) and 'exception' fields."
+        description = "Load a log file as the current source (replaces it unless merge=true). MUTATES app state: emits 'mcp-state-changed' {kind: 'source'}. Returns {count, columns, source_desc}. Java formats (log4j, wildfly) group multi-line stacktraces into a single event: the raw line holds the whole block and the event gains 'stacktrace' (array of 'at ...' frames) and 'exception' fields. Spreadsheets (.xlsx, .xlsm, .xlsb, .xls, .ods) become one event per row with 'planilha.aba' and 'planilha.linha'; CSV/TSV separators and UTF-16 or Windows-1252 text are detected."
     )]
     async fn load_file(
         &self,

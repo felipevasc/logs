@@ -6,12 +6,12 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 /// Parser semantics are part of the cache version; older directories are removed.
-pub const INDEX_DIR: &str = "indexes-v5";
+pub const INDEX_DIR: &str = "indexes-v6";
 
 /// Removes caches from previous parser versions and indexes unused for 30 days.
 pub fn prune() {
     let base = crate::config_dir();
-    for old in ["indexes", "indexes-v1", "indexes-v2", "indexes-v3", "indexes-v4"] {
+    for old in ["indexes", "indexes-v1", "indexes-v2", "indexes-v3", "indexes-v4", "indexes-v5"] {
         let _ = std::fs::remove_dir_all(base.join(old));
     }
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);

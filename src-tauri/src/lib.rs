@@ -33,6 +33,9 @@ mod regression_tests;
 mod remote;
 mod sigma;
 mod sources;
+mod spreadsheet;
+#[doc(hidden)]
+pub mod testkit;
 mod threats;
 mod timeline_export;
 mod triage;
@@ -298,10 +301,27 @@ fn index_source_file(
         idx.parts[0].path = path.to_string();
         return Ok(idx);
     }
-    let expanded = if extension == "gz" {
-        Some(workspace::expand_gzip(std::path::Path::new(&physical))?)
+    let file_label = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
+    // Workbooks become one event per row; exports named .xls that are text are read as text.
+    let sheet = if spreadsheet::is_spreadsheet(std::path::Path::new(&physical)) {
+        spreadsheet::expand(std::path::Path::new(&physical), &|rows| {
+            emit_progress(app, "carregamento", &format!("Lendo planilha {file_label}"), rows, 0, "linhas", false);
+        })?
     } else {
-        member.clone()
+        None
+    };
+    let (expanded, format) = match sheet {
+        Some(events) => (Some(events), "snapshot"),
+        None => {
+            let expanded = if extension == "gz" {
+                Some(workspace::expand_gzip(std::path::Path::new(&physical))?)
+            } else {
+                member.clone()
+            };
+            // UTF-16 and legacy code pages are converted to UTF-8 before indexing.
+            let text = expanded.clone().unwrap_or_else(|| std::path::PathBuf::from(&physical));
+            (workspace::expand_encoding(&text)?.or(expanded), format)
+        }
     };
     let index_path = expanded
         .as_ref()
@@ -317,7 +337,6 @@ fn index_source_file(
         None
     };
     let saved_ts = load_ts_config(path).map(|c| c.compile()).transpose()?;
-    let file_label = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
     let mut idx = index_cache::open(
         &index_path,
         format,
@@ -991,7 +1010,7 @@ pub(crate) fn list_formats_impl() -> Vec<FormatInfo> {
         ("log4j", "Log4j / Logback"),
         ("wildfly", "WildFly / JBoss"),
         ("logfmt", "Logfmt (key=value)"),
-        ("csv", "CSV (com cabeçalho)"),
+        ("csv", "CSV / TSV (cabeçalho; separador detectado)"),
         ("w3c", "IIS / W3C"),
         ("zeek", "Zeek (TSV)"),
         ("auditd", "Linux auditd"),

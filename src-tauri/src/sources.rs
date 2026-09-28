@@ -6,7 +6,7 @@ use chrono::Datelike;
 use serde_json::{Map, Value};
 
 /// Interpreta data/hora "naive" (sem fuso) como horário LOCAL da máquina.
-fn naive_to_ms(ndt: chrono::NaiveDateTime) -> i64 {
+pub(crate) fn naive_to_ms(ndt: chrono::NaiveDateTime) -> i64 {
     ndt.and_local_timezone(chrono::Local)
         .single()
         .map(|d| d.timestamp_millis())
@@ -27,14 +27,24 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_millis());
     }
+    // Spreadsheets and exports often drop the seconds or use slashes.
     const FORMATS: &[&str] = &[
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+        "%Y/%m/%d %H:%M:%S%.f",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
         "%d/%m/%Y %H:%M:%S%.f",
         "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d-%m-%Y %H:%M:%S",
         "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
     ];
     for fmt in FORMATS {
         if let Ok(n) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
@@ -801,7 +811,7 @@ fn parse_auditd(line: &str) -> Option<Event> {
 }
 
 /// Inferência automática do formato pela amostra inicial do arquivo.
-fn detect_format(bytes: &[u8]) -> &'static str {
+pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     let trimmed = bytes
         .iter()
@@ -836,10 +846,8 @@ fn detect_format(bytes: &[u8]) -> &'static str {
     // linhas de corpo de stacktrace Java contam como evidência de log4j/wildfly
     // (arquivos com muitos stacktraces teriam poucas linhas de cabeçalho)
     let mut stack = 0usize;
-    let mut csv_hint = false;
-    let mut csv_checked = false;
     let mut w3c_hint = false;
-    for (li, line_b) in bytes.split(|&b| b == b'\n').take(60).enumerate() {
+    for line_b in bytes.split(|&b| b == b'\n').take(60) {
         let line = std::str::from_utf8(line_b).unwrap_or("").trim();
         if line.is_empty() {
             continue;
@@ -859,20 +867,6 @@ fn detect_format(bytes: &[u8]) -> &'static str {
         }
         if line.starts_with("LEEF:") {
             return "leef";
-        }
-        if !csv_checked {
-            csv_checked = true;
-            if looks_like_csv_header(line) {
-                // próxima linha precisa ter o mesmo número de vírgulas
-                csv_hint = bytes
-                    .split(|&b| b == b'\n')
-                    .nth(li + 1)
-                    .map(|l2| {
-                        l2.iter().filter(|&&b| b == b',').count() == line.matches(',').count()
-                    })
-                    .unwrap_or(false);
-                continue;
-            }
         }
         n += 1;
         if line.starts_with('{') {
@@ -898,8 +892,8 @@ fn detect_format(bytes: &[u8]) -> &'static str {
     if w3c_hint {
         return "w3c";
     }
-    if csv_hint {
-        return "csv";
+    if let Some(format) = detect_delimited(bytes) {
+        return format;
     }
     if n == 0 {
         return "text";
@@ -1260,8 +1254,17 @@ fn parse_leef(line: &str) -> Option<Event> {
     Some(ev)
 }
 
-/// Divide linha CSV respeitando aspas duplas com escape "".
-fn split_csv(line: &str) -> Vec<String> {
+//// Formatos tabulares com cabeçalho e o separador de cada um: CSV com vírgula,
+/// CSV com ponto e vírgula (Excel em português e outros idiomas com vírgula
+/// decimal), TSV e barra vertical.
+const DELIMITED: [(&str, char); 4] = [("csv", ','), ("csv-semicolon", ';'), ("tsv", '\t'), ("csv-pipe", '|')];
+
+pub(crate) fn delimiter_of(format: &str) -> Option<char> {
+    DELIMITED.iter().find(|(id, _)| *id == format).map(|(_, delimiter)| *delimiter)
+}
+
+/// Divide uma linha pelo separador, respeitando aspas duplas com escape "".
+fn split_delimited(line: &str, delimiter: char) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_q = false;
@@ -1280,7 +1283,7 @@ fn split_csv(line: &str) -> Vec<String> {
             }
         } else if c == '"' {
             in_q = true;
-        } else if c == ',' {
+        } else if c == delimiter {
             out.push(std::mem::take(&mut cur));
         } else {
             cur.push(c);
@@ -1290,52 +1293,207 @@ fn split_csv(line: &str) -> Vec<String> {
     out
 }
 
-/// Mapeia colunas (de cabeçalho CSV ou #Fields do W3C) para o evento.
+#[cfg(test)]
+fn split_csv(line: &str) -> Vec<String> {
+    split_delimited(line, ',')
+}
+
+/// Nome de coluna plausível num cabeçalho: texto curto com letras, que não é
+/// data, JSON nem chave=valor.
+fn plausible_column_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name.chars().count() <= 64
+        && name.chars().any(char::is_alphabetic)
+        && !name.chars().any(|c| c.is_control() || matches!(c, '{' | '}' | '[' | ']' | '=' | '"'))
+        && name.split_whitespace().count() <= 6
+        && parse_timestamp(name).is_none()
+}
+
+/// Texto tabular com cabeçalho: o separador que divide a primeira linha em
+/// nomes de coluna plausíveis e a maioria das linhas seguintes no mesmo número
+/// de valores (ou um a mais, como a mensagem sem nome das exportações do
+/// Visualizador de Eventos do Windows).
+fn detect_delimited(bytes: &[u8]) -> Option<&'static str> {
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let lines: Vec<&str> = bytes
+        .split(|&b| b == b'\n')
+        .take(60)
+        .filter_map(|line| std::str::from_utf8(line.strip_suffix(b"\r").unwrap_or(line)).ok())
+        .filter(|line| !line.trim().is_empty())
+        .take(30)
+        .collect();
+    let (header, rows) = lines.split_first()?;
+    if rows.is_empty() || header.trim_start().starts_with(['{', '[', '#']) {
+        return None;
+    }
+    let mut best: Option<(&'static str, usize)> = None;
+    for (format, delimiter) in DELIMITED {
+        let names = split_delimited(header, delimiter);
+        let minimum = if matches!(delimiter, ',' | '|') { 3 } else { 2 };
+        if names.len() < minimum || !names.iter().all(|name| plausible_column_name(name)) {
+            continue;
+        }
+        let consistent = rows
+            .iter()
+            .filter(|row| {
+                let count = split_delimited(row, delimiter).len();
+                count == names.len() || count == names.len() + 1
+            })
+            .count();
+        if consistent * 10 >= rows.len() * 8 && best.is_none_or(|(_, columns)| names.len() > columns) {
+            best = Some((format, names.len()));
+        }
+    }
+    best.map(|(format, _)| format)
+}
+
+/// Significado de um nome de coluna em fontes tabulares (CSV, TSV, IIS e
+/// planilhas), em inglês ou português.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColumnRole {
+    Timestamp,
+    Date,
+    Time,
+    Level,
+    Code,
+    Source,
+    Message,
+    Other,
+}
+
+/// Minúsculas sem acentos e com separadores uniformes ("Data/Hora" → "data hora").
+fn column_key(name: &str) -> String {
+    let folded: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            '_' | '-' | '/' | '.' | ':' => ' ',
+            other => other,
+        })
+        .collect();
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub(crate) fn column_role(name: &str) -> ColumnRole {
+    let key = column_key(name);
+    let is = |names: &[&str]| names.contains(&key.as_str());
+    if is(&[
+        "timestamp", "@timestamp", "ts", "datetime", "date time", "time stamp", "event created", "event time",
+        "eventtime", "time generated", "timegenerated", "time created", "timecreated", "created", "created at",
+        "data hora", "data e hora", "datahora", "carimbo de data hora", "momento", "registrado em", "ocorrido em",
+    ]) {
+        ColumnRole::Timestamp
+    } else if is(&["date", "data", "dia", "day"]) {
+        ColumnRole::Date
+    } else if is(&["time", "hora", "horario", "hour"]) {
+        ColumnRole::Time
+    } else if is(&[
+        "level", "severity", "lvl", "log level", "loglevel", "severity text", "severitytext", "nivel", "severidade",
+        "criticidade", "gravidade",
+    ]) {
+        ColumnRole::Level
+    } else if is(&[
+        "code", "id", "event id", "eventid", "event code", "status", "sc status", "codigo", "codigo do evento",
+        "id do evento", "identificacao do evento",
+    ]) {
+        ColumnRole::Code
+    } else if is(&[
+        "source", "provider", "logger", "service", "channel", "service name", "host name", "s ip", "c ip", "origem",
+        "fonte", "servidor", "host", "hostname", "computador", "computer", "maquina", "sistema", "servico",
+        "aplicacao", "aplicativo", "equipamento", "dispositivo",
+    ]) {
+        ColumnRole::Source
+    } else if is(&[
+        "message", "msg", "log", "body", "text", "displaymessage", "description", "details", "detail", "mensagem",
+        "descricao", "detalhes", "detalhe", "evento", "ocorrencia", "historico", "observacao", "texto", "conteudo",
+        "resumo",
+    ]) {
+        ColumnRole::Message
+    } else {
+        ColumnRole::Other
+    }
+}
+
+/// Data e hora vindas de uma coluna só ou de uma coluna de data e outra de hora.
+pub(crate) fn date_time_ms(date: Option<&str>, time: Option<&str>) -> Option<i64> {
+    match (date, time) {
+        (Some(date), Some(time)) => parse_timestamp(&format!("{date} {time}"))
+            .or_else(|| parse_timestamp(date))
+            .or_else(|| parse_timestamp(time)),
+        (Some(value), None) | (None, Some(value)) => parse_timestamp(value),
+        (None, None) => None,
+    }
+}
+
+/// Mapeia colunas nomeadas (cabeçalho CSV/TSV ou #Fields do IIS) para o evento.
+/// Valores além do cabeçalho recebem o nome da posição ("coluna 6").
 fn event_from_columns(vals: Vec<String>, header: &[String], raw: &str) -> Event {
     let mut ev = Event::empty();
     ev.raw = raw.to_string();
-    for (i, h) in header.iter().enumerate() {
-        let v = vals.get(i).map(|s| s.trim()).unwrap_or("");
+    let mut level_set = false;
+    // Resolved after every column is seen: a timestamp column wins, a date and a time are combined.
+    let (mut stamp, mut date, mut time): (Option<(String, String)>, Option<(String, String)>, Option<(String, String)>) =
+        (None, None, None);
+    let mut unnamed: Option<(String, String)> = None;
+    for (i, value) in vals.iter().enumerate() {
+        let v = value.trim();
         if v.is_empty() || v == "-" {
             continue;
         }
-        let hl = h.to_lowercase();
-        if TS_KEYS.contains(&hl.as_str()) {
-            if ev.timestamp.is_none() {
-                ev.timestamp = parse_timestamp(v).or_else(|| {
-                    v.parse::<f64>().ok().map(|f| {
-                        if f > 1e12 {
-                            f as i64
-                        } else {
-                            (f * 1000.0) as i64
-                        }
-                    })
-                });
+        let Some(name) = header.get(i).map(|h| h.trim()).filter(|h| !h.is_empty()).map(str::to_string) else {
+            // Windows Event Viewer exports leave the message column unnamed.
+            let name = format!("coluna {}", i + 1);
+            match unnamed {
+                None => unnamed = Some((name, v.to_string())),
+                Some(_) => {
+                    ev.fields.insert(name, Value::from(v));
+                }
             }
-        } else if hl == "date" {
-            // W3C: combina date + time
-            let time = header
-                .iter()
-                .position(|x| x.eq_ignore_ascii_case("time"))
-                .and_then(|p| vals.get(p))
-                .map(|s| s.trim());
-            ev.timestamp = parse_timestamp(&format!("{} {}", v, time.unwrap_or("00:00:00")));
-        } else if hl == "time" {
-            // tratado junto com date
-        } else if LEVEL_KEYS.contains(&hl.as_str()) {
-            ev.level = normalize_level(v);
-        } else if CODE_KEYS.contains(&hl.as_str()) || hl == "status" || hl == "sc-status" {
-            ev.code = v.to_string();
-        } else if SOURCE_KEYS.contains(&hl.as_str()) || hl == "s-ip" || hl == "c-ip" {
-            if ev.source.is_empty() {
-                ev.source = v.to_string();
-            } else {
-                ev.fields.insert(h.clone(), Value::from(v));
+            continue;
+        };
+        match column_role(&name) {
+            ColumnRole::Timestamp if stamp.is_none() => stamp = Some((name, v.to_string())),
+            ColumnRole::Date if date.is_none() => date = Some((name, v.to_string())),
+            ColumnRole::Time if time.is_none() => time = Some((name, v.to_string())),
+            ColumnRole::Level if !level_set => {
+                ev.level = normalize_level(v);
+                level_set = true;
             }
-        } else if MSG_KEYS.contains(&hl.as_str()) {
-            ev.message = v.to_string();
+            ColumnRole::Code if ev.code.is_empty() => ev.code = v.to_string(),
+            ColumnRole::Source if ev.source.is_empty() => ev.source = v.to_string(),
+            ColumnRole::Message if ev.message.is_empty() => ev.message = v.to_string(),
+            _ => {
+                ev.fields.insert(name, Value::from(v));
+            }
+        }
+    }
+    let text = |pair: &Option<(String, String)>| pair.as_ref().map(|(_, v)| v.clone());
+    ev.timestamp = text(&stamp).and_then(|v| parse_timestamp(&v));
+    let stamp_used = ev.timestamp.is_some();
+    let parts_used = !stamp_used && {
+        ev.timestamp = date_time_ms(text(&date).as_deref(), text(&time).as_deref());
+        ev.timestamp.is_some()
+    };
+    // Columns that did not become the event time remain available as fields.
+    for (used, pair) in [(stamp_used, stamp), (parts_used, date), (parts_used, time)] {
+        if let (false, Some((name, value))) = (used, pair) {
+            ev.fields.insert(name, Value::from(value));
+        }
+    }
+    if let Some((name, value)) = unnamed {
+        if ev.message.is_empty() {
+            ev.message = value;
         } else {
-            ev.fields.insert(h.clone(), Value::from(v));
+            ev.fields.insert(name, Value::from(value));
         }
     }
     if ev.message.is_empty() {
@@ -1352,25 +1510,16 @@ fn parse_w3c(line: &str, header: &[String]) -> Option<Event> {
     Some(event_from_columns(vals, header, line))
 }
 
-fn parse_csv_line(line: &str, header: &[String]) -> Option<Event> {
+fn parse_delimited(line: &str, header: &[String], delimiter: char) -> Option<Event> {
     if header.is_empty() {
         return None;
     }
-    Some(event_from_columns(split_csv(line), header, line))
+    Some(event_from_columns(split_delimited(line, delimiter), header, line))
 }
 
-/// Parece um cabeçalho CSV? (≥3 colunas, tokens simples, sem espaços longos)
-fn looks_like_csv_header(line: &str) -> bool {
-    let cols: Vec<&str> = line.split(',').collect();
-    cols.len() >= 3
-        && cols.iter().all(|c| {
-            let c = c.trim();
-            !c.is_empty()
-                && c.len() <= 32
-                && c.chars()
-                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ' '))
-                && c.chars().filter(|ch| ch.is_whitespace()).count() <= 2
-        })
+#[cfg(test)]
+fn parse_csv_line(line: &str, header: &[String]) -> Option<Event> {
+    parse_delimited(line, header, ',')
 }
 
 // ==========================================================================
@@ -2037,7 +2186,10 @@ pub fn parse_line(
             .or_else(|| parse_wildfly(&text))
             .unwrap_or_else(|| event_from_text(&text)),
         "logfmt" => parse_logfmt(&text).unwrap_or_else(|| event_from_text(&text)),
-        "csv" => parse_csv_line(&text, header).unwrap_or_else(|| event_from_text(&text)),
+        tabular if delimiter_of(tabular).is_some() => {
+            parse_delimited(&text, header, delimiter_of(tabular).unwrap_or(','))
+                .unwrap_or_else(|| event_from_text(&text))
+        }
         "w3c" => parse_w3c(&text, header).unwrap_or_else(|| event_from_text(&text)),
         "zeek" => parse_zeek(&text, header).unwrap_or_else(|| event_from_text(&text)),
         "auditd" => parse_auditd(&text).unwrap_or_else(|| event_from_text(&text)),
@@ -2307,17 +2459,21 @@ pub fn index_file(
         detect_format(&mmap).to_string()
     } else if format == "custom" || format.starts_with("custom:") {
         "custom".to_string()
+    } else if format == "csv" {
+        // CSV chosen by hand still has its separator detected.
+        detect_delimited(&mmap).unwrap_or("csv").to_string()
     } else {
         format.to_string()
     };
     let fmt = fmt.as_str();
 
-    // Cabeçalho (csv: primeira linha; w3c: linha "#Fields:")
+    // Cabeçalho (tabulares: primeira linha não vazia; w3c: linha "#Fields:")
     let mut header: Vec<String> = Vec::new();
-    if fmt == "csv" {
-        if let Some(first) = mmap.split(|&b| b == b'\n').next() {
+    if let Some(delimiter) = delimiter_of(fmt) {
+        let body = mmap.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&mmap);
+        if let Some(first) = body.split(|&b| b == b'\n').find(|line| !line.trim_ascii().is_empty()) {
             let first = String::from_utf8_lossy(first).trim().to_string();
-            header = split_csv(&first)
+            header = split_delimited(&first, delimiter)
                 .iter()
                 .map(|s| s.trim().to_string())
                 .collect();
@@ -2347,7 +2503,8 @@ pub fn index_file(
         .unwrap_or(0);
     let mut lines: Vec<LineMeta> = Vec::with_capacity((mmap.len() / 160).min(1_000_000) + 16);
     let mut offset = 0usize;
-    let mut first_line = true;
+    // The header line of tabular formats is not an event.
+    let mut header_pending = delimiter_of(fmt).is_some();
     let mut last_report = 0usize;
     // Formatos multi-linha (stacktrace Java): linha que casa o padrão do
     // formato inicia um evento; as demais estendem o evento anterior.
@@ -2382,7 +2539,9 @@ pub fn index_file(
                 raw
             };
             if !line.is_empty() {
-                let skip = (fmt == "csv" && first_line) || (matches!(fmt, "w3c" | "zeek") && line[0] == b'#');
+                let header_line = header_pending && !line.trim_ascii().is_empty();
+                header_pending &= !header_line;
+                let skip = header_line || (matches!(fmt, "w3c" | "zeek") && line[0] == b'#');
                 if !skip {
                     push_meta(
                         &mut lines,
@@ -2395,7 +2554,6 @@ pub fn index_file(
                     );
                 }
             }
-            first_line = false;
             offset = nl + 1;
             if let Some(cb) = progress {
                 if lines.len() >= last_report + 2048 {

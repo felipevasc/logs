@@ -44,6 +44,14 @@ evtx = { version = "0.12.3", default-features = false, features = ["multithreadi
 yaml_serde = "0.10.7"
 aho-corasick = "1.1"
 semver = "1"
+# Excel (xlsx, xlsm, xlsb, xls) and OpenDocument (ods) spreadsheets as log sources.
+calamine = { version = "0.36", features = ["dates"] }
+# Text logs in UTF-16 or Windows-1252 are converted to UTF-8 before indexing.
+encoding_rs = "0.8"
+
+[dev-dependencies]
+# Workbooks for the spreadsheet tests.
+rust_xlsxwriter = "0.99"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
