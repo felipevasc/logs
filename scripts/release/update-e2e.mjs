@@ -4,7 +4,7 @@
 // Usage: node scripts/release/update-e2e.mjs   (after npm ci; runs two release builds)
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { chmodSync, copyFileSync, createReadStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, copyFileSync, createReadStream, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { buildManifest, updaterPubkey, verifyManifest } from './manifest.mjs';
@@ -15,7 +15,7 @@ const PRODUCT = 'LogInsightE2E', IDENTIFIER = 'com.loginsight.e2e', NEXT = '99.0
 const bundle = windows ? 'nsis' : 'appimage', key = windows ? 'windows-x86_64-nsis' : 'linux-x86_64-appimage', kind = windows ? 'Nsis' : 'Appimage';
 const version = JSON.parse(readFileSync('package.json', 'utf8')).version;
 const work = mkdtempSync(join(tmpdir(), 'loginsight-update-e2e-'));
-const served = join(work, 'serve'), data = join(work, 'data'), report = join(work, 'report.txt');
+const served = join(work, 'serve'), data = join(work, 'data'), report = join(work, 'report.txt'), appLog = join(work, 'app.log');
 const bundleDir = resolve(process.env.CARGO_TARGET_DIR || 'src-tauri/target', 'release', 'bundle', bundle);
 const baseUrl = `http://127.0.0.1:${PORT}/`;
 const sleep = ms => new Promise(done => setTimeout(done, ms));
@@ -29,8 +29,10 @@ function build(appVersion) {
     plugins: { updater: { endpoints: [`${baseUrl}latest.json`], dangerousInsecureTransportProtocol: true } },
   }));
   say(`building ${PRODUCT} ${appVersion}`);
-  const result = spawnSync(process.execPath, ['scripts/tauri-build.mjs', '--ci', '--bundles', bundle, '--features', 'update-e2e', '--config', config, '--', '--locked'], { stdio: 'inherit' });
-  if (result.status !== 0) throw Error(`The build of ${appVersion} failed.`);
+  const result = spawnSync(process.execPath, ['scripts/tauri-build.mjs', '--ci', '--bundles', bundle, '--features', 'update-e2e', '--config', config, '--', '--locked'], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+  process.stdout.write(result.stdout || '');
+  process.stderr.write(result.stderr || '');
+  if (result.status !== 0) throw Error(`The build of ${appVersion} failed:\n${`${result.stdout || ''}${result.stderr || ''}`.split(/\r?\n/).slice(-40).join('\n')}`);
   const name = readdirSync(bundleDir).find(file => file.startsWith(`${PRODUCT}_${appVersion}_`) && file.endsWith(windows ? '-setup.exe' : '.AppImage'));
   if (!name || !existsSync(join(bundleDir, `${name}.sig`))) throw Error(`No signed installer for ${appVersion} in ${bundleDir}.`);
   return { name, path: join(bundleDir, name) };
@@ -42,6 +44,9 @@ function registry(value) {
   } catch { return null; }
 }
 const reportLines = () => (existsSync(report) ? readFileSync(report, 'utf8').split(/\r?\n/).filter(Boolean) : []);
+const tail = path => (existsSync(path) ? readFileSync(path, 'utf8').split(/\r?\n/).slice(-80).join('\n') : '(none)');
+// Written to the run page, which is public; the step logs need admin rights.
+const summary = text => { if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${text}\n`); };
 
 const requests = [];
 let server = null, display = null, installDir = null;
@@ -79,16 +84,20 @@ try {
     mkdirSync(join(work, 'app'));
     copyFileSync(current.path, executable);
     chmodSync(executable, 0o755);
-    env.APPIMAGE_EXTRACT_AND_RUN = '1';
+    // No FUSE on CI runners; software rendering on the virtual display.
+    Object.assign(env, { APPIMAGE_EXTRACT_AND_RUN: '1', WEBKIT_DISABLE_DMABUF_RENDERER: '1', LIBGL_ALWAYS_SOFTWARE: '1' });
     // A display of our own: the restarted app must outlive the first process.
     if (!env.DISPLAY) {
       display = spawn('Xvfb', [':97', '-screen', '0', '1280x800x24'], { stdio: 'ignore' });
+      display.on('error', error => say(`Xvfb: ${error.message}`));
       env.DISPLAY = ':97';
       await sleep(2000);
     }
   }
   say(`starting ${executable}`);
-  spawn(executable, [], { env, detached: true, stdio: 'ignore' }).unref();
+  const output = openSync(appLog, 'a');
+  spawn(executable, [], { env, detached: true, stdio: ['ignore', output, output] }).unref();
+  closeSync(output);
 
   // The first build ends by installing; only a build without a newer version reports `current`.
   const finished = lines => lines.some(line => /^(error|unavailable)/.test(line)) || /^current/.test(lines.at(-1) ?? '');
@@ -105,8 +114,11 @@ try {
   expect(requests.includes('latest.json') && requests.includes(next.name), `Unexpected requests: ${requests.join(', ')}`);
   if (windows) expect(registry('DisplayVersion') === NEXT, `The installation reports version ${registry('DisplayVersion')}.`);
   say(`PASS: ${version} updated itself to ${NEXT} (${bundle}), reopened and reported the installation.`);
+  summary(`Update end to end (${bundle}): ${version} updated itself to ${NEXT} and reopened.`);
 } catch (error) {
-  say(`requests: ${requests.join(', ') || 'none'}`);
+  const details = `requests: ${requests.join(', ') || 'none'}\n\nreport:\n${tail(report)}\n\napp output:\n${tail(appLog)}`;
+  say(details);
+  summary(`### Update end to end failed (${bundle})\n\n${error.message}\n\n~~~\n${details}\n~~~`);
   throw error;
 } finally {
   server?.close();
