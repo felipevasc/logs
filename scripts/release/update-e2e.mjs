@@ -35,7 +35,11 @@ function build(appVersion) {
   if (result.status !== 0) throw Error(`The build of ${appVersion} failed:\n${`${result.stdout || ''}${result.stderr || ''}`.split(/\r?\n/).slice(-40).join('\n')}`);
   const name = readdirSync(bundleDir).find(file => file.startsWith(`${PRODUCT}_${appVersion}_`) && file.endsWith(windows ? '-setup.exe' : '.AppImage'));
   if (!name || !existsSync(join(bundleDir, `${name}.sig`))) throw Error(`No signed installer for ${appVersion} in ${bundleDir}.`);
-  return { name, path: join(bundleDir, name) };
+  // The AppImage bundler empties its folder on the next build.
+  const kept = join(work, 'builds');
+  mkdirSync(kept, { recursive: true });
+  for (const file of [name, `${name}.sig`]) copyFileSync(join(bundleDir, file), join(kept, file));
+  return { name, path: join(kept, name) };
 }
 function registry(value) {
   try {
