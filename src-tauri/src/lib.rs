@@ -2075,6 +2075,8 @@ fn relaunch_elevated() -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(feature = "update-e2e")]
+    updates::e2e_arguments();
     let context = tauri::generate_context!();
     // Before anything reads the data folder: a new version backs it up first.
     let updates = updates::prepare(&context.package_info().version);

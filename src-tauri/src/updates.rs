@@ -729,6 +729,20 @@ fn open_in_browser(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Test builds only: the Windows installer reopens the app through the desktop
+/// shell, which keeps the arguments but not the environment, so the test passes
+/// its report file and data folder as `--e2e-report=` and `--e2e-data=`.
+#[cfg(feature = "update-e2e")]
+pub fn e2e_arguments() {
+    for argument in std::env::args().skip(1) {
+        if let Some(path) = argument.strip_prefix("--e2e-report=") {
+            std::env::set_var("LOGINSIGHT_E2E_REPORT", path);
+        } else if let Some(path) = argument.strip_prefix("--e2e-data=") {
+            std::env::set_var("LOGINSIGHT_DATA_DIR", path);
+        }
+    }
+}
+
 /// Test builds only (`--features update-e2e`): runs the whole update flow without
 /// asking and appends each step to LOGINSIGHT_E2E_REPORT. Driven by
 /// scripts/release/update-e2e.mjs.

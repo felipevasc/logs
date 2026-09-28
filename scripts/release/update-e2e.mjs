@@ -93,7 +93,7 @@ try {
   await new Promise((done, fail) => server.once('error', fail).listen(PORT, '127.0.0.1', done));
   server.on('error', error => say(`server: ${error.message}`));
 
-  const env = { ...process.env, LOGINSIGHT_E2E_REPORT: report, LOGINSIGHT_DATA_DIR: data };
+  const env = { ...process.env };
   let executable;
   if (windows) {
     say(`installing ${current.name}`);
@@ -118,7 +118,8 @@ try {
   }
   progress(`starting ${executable}`);
   const output = openSync(appLog, 'a');
-  const app = spawn(executable, [], { env, detached: true, stdio: ['ignore', output, output] });
+  // Arguments survive the restart made by the installer; the environment may not.
+  const app = spawn(executable, [`--e2e-report=${report}`, `--e2e-data=${data}`], { env, detached: true, stdio: ['ignore', output, output] });
   app.on('error', error => say(`app: ${error.message}`));
   app.on('exit', (code, signal) => say(`first process exited: ${code ?? signal}`));
   app.unref();
