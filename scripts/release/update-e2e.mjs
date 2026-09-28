@@ -44,14 +44,31 @@ function registry(value) {
   } catch { return null; }
 }
 const reportLines = () => (existsSync(report) ? readFileSync(report, 'utf8').split(/\r?\n/).filter(Boolean) : []);
-const tail = path => (existsSync(path) ? readFileSync(path, 'utf8').split(/\r?\n/).slice(-80).join('\n') : '(none)');
-// Written to the run page, which is public; the step logs need admin rights.
-const summary = text => { if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${text}\n`); };
+const tail = (path, count = 60) => (existsSync(path) ? readFileSync(path, 'utf8').split(/\r?\n/).slice(-count).join('\n') : '(none)');
+// On GitHub, annotations are the part of a run that anyone can read (step logs need admin rights).
+const annotate = (level, message) => {
+  if (process.env.GITHUB_ACTIONS) console.log(`::${level} title=update-e2e (${bundle})::${message.slice(0, 12_000).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A')}`);
+};
+const progress = message => { say(message); annotate('notice', message); };
+let failed = false;
+function failure(error) {
+  if (failed) return;
+  failed = true;
+  const details = `${error?.stack || error}\n\nrequests: ${requests.join(', ') || 'none'}\n\nreport:\n${tail(report)}\n\napp output:\n${tail(appLog)}`;
+  say(details);
+  annotate('error', details);
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### Update end to end failed (${bundle})\n\n~~~\n${details}\n~~~\n`);
+}
+process.on('uncaughtException', error => { failure(error); process.exit(1); });
+process.on('unhandledRejection', error => { failure(error); process.exit(1); });
 
 const requests = [];
 let server = null, display = null, installDir = null;
 try {
-  const current = build(version), next = build(NEXT);
+  const current = build(version);
+  progress(`built ${current.name}`);
+  const next = build(NEXT);
+  progress(`built ${next.name}`);
   copyFileSync(next.path, join(served, next.name));
   const manifest = buildManifest({
     version: NEXT, notes: '# Teste\n\n- Atualização de teste.', pubDate: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
@@ -67,9 +84,10 @@ try {
     const path = join(served, name);
     if (!name || /[\\/]/.test(name) || !existsSync(path)) { response.writeHead(404).end(); return; }
     response.writeHead(200, { 'Content-Length': statSync(path).size, 'Content-Type': name.endsWith('.json') ? 'application/json' : 'application/octet-stream' });
-    createReadStream(path).pipe(response);
+    createReadStream(path).on('error', error => response.destroy(error)).pipe(response);
   });
   await new Promise((done, fail) => server.once('error', fail).listen(PORT, '127.0.0.1', done));
+  server.on('error', error => say(`server: ${error.message}`));
 
   const env = { ...process.env, LOGINSIGHT_E2E_REPORT: report, LOGINSIGHT_DATA_DIR: data };
   let executable;
@@ -94,9 +112,12 @@ try {
       await sleep(2000);
     }
   }
-  say(`starting ${executable}`);
+  progress(`starting ${executable}`);
   const output = openSync(appLog, 'a');
-  spawn(executable, [], { env, detached: true, stdio: ['ignore', output, output] }).unref();
+  const app = spawn(executable, [], { env, detached: true, stdio: ['ignore', output, output] });
+  app.on('error', error => say(`app: ${error.message}`));
+  app.on('exit', (code, signal) => say(`first process exited: ${code ?? signal}`));
+  app.unref();
   closeSync(output);
 
   // The first build ends by installing; only a build without a newer version reports `current`.
@@ -113,19 +134,19 @@ try {
   expect(/^current/.test(lines.at(-1)), 'The updated app still announced an update.');
   expect(requests.includes('latest.json') && requests.includes(next.name), `Unexpected requests: ${requests.join(', ')}`);
   if (windows) expect(registry('DisplayVersion') === NEXT, `The installation reports version ${registry('DisplayVersion')}.`);
-  say(`PASS: ${version} updated itself to ${NEXT} (${bundle}), reopened and reported the installation.`);
-  summary(`Update end to end (${bundle}): ${version} updated itself to ${NEXT} and reopened.`);
+  progress(`PASS: ${version} updated itself to ${NEXT} (${bundle}), reopened and reported the installation.`);
 } catch (error) {
-  const details = `requests: ${requests.join(', ') || 'none'}\n\nreport:\n${tail(report)}\n\napp output:\n${tail(appLog)}`;
-  say(details);
-  summary(`### Update end to end failed (${bundle})\n\n${error.message}\n\n~~~\n${details}\n~~~`);
-  throw error;
+  failure(error);
+  process.exitCode = 1;
 } finally {
   server?.close();
   display?.kill();
   if (windows && installDir && existsSync(join(installDir, 'uninstall.exe'))) spawnSync(join(installDir, 'uninstall.exe'), ['/S'], { stdio: 'ignore' });
   for (const file of existsSync(bundleDir) ? readdirSync(bundleDir) : []) if (file.startsWith(`${PRODUCT}_`)) rmSync(join(bundleDir, file), { force: true });
   const webviewData = windows ? [join(process.env.LOCALAPPDATA || '', IDENTIFIER)] : [join(homedir(), '.local', 'share', IDENTIFIER), join(homedir(), '.cache', IDENTIFIER)];
-  await sleep(1500);
-  for (const path of [...webviewData, work]) if (path.includes(IDENTIFIER) || path === work) rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+  await sleep(3000);
+  // WebView processes may still hold files for a moment; leftovers never fail the test.
+  for (const path of [...webviewData, work]) {
+    try { rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 1000 }); } catch (error) { say(`cleanup left ${path}: ${error.message}`); }
+  }
 }
