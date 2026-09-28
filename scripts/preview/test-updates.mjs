@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 const url = process.argv[2] || "http://127.0.0.1:4173";
 const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chrome" });
 const errors = [], results = {};
-const NOTES = "# LogInsight 0.6.0\n\n## Atualizações\n\n- Verifica versões **novas** ao abrir.\n- Instala com `um clique`.\n\n<img src=x onerror=alert(1)>";
+const NOTES = "# LogInsight 0.6.0\n\n## Atualizações\n\n- Verifica versões **novas** ao abrir.\n- Instala com `um clique`.\n\nDetalhes em [Atualizações](https://example.org/docs).\n\n<img src=x onerror=alert(1)>";
 async function open(update) {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   page.on("pageerror", error => errors.push(error.message));
@@ -22,6 +22,7 @@ try {
   assert.equal(await page.textContent(".update-notes strong"), "LogInsight 0.6.0");
   assert.equal(await page.locator(".update-notes .update-bullet").count(), 2);
   assert.equal(await page.locator(".update-notes img").count(), 0, "release notes are text, never markup");
+  assert.ok((await page.textContent(".update-notes")).includes("Detalhes em Atualizações."), "links show their text");
   assert.ok(await page.locator("#btn-settings.has-update").count(), "settings button marks the pending update");
   results.announce = "diálogo ao abrir, notas como texto, marca em Configurações";
 

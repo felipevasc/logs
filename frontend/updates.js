@@ -22,13 +22,14 @@ window.Updates = (() => {
   const warn = text => node("p", "update-warn", text);
 
   // Release notes are Markdown written in docs/releases; shown as plain text, headings and bullets only.
+  const plain = text => text.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/\*\*|`/g, "");
   function notes(text) {
     const box = node("div", "update-notes");
     for (const line of String(text).split(/\r?\n/)) {
       const heading = line.match(/^#{1,6}\s+(.*)/), bullet = line.match(/^\s*[-*]\s+(.*)/);
-      if (heading) box.append(node("strong", "", heading[1].replace(/\*\*/g, "")));
-      else if (bullet) box.append(node("div", "update-bullet", bullet[1].replace(/\*\*|`/g, "")));
-      else if (line.trim()) box.append(node("p", "", line.replace(/\*\*|`/g, "")));
+      if (heading) box.append(node("strong", "", plain(heading[1])));
+      else if (bullet) box.append(node("div", "update-bullet", plain(bullet[1])));
+      else if (line.trim()) box.append(node("p", "", plain(line)));
     }
     return box;
   }
