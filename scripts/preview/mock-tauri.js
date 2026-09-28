@@ -334,6 +334,24 @@
       findings:failure?[{kind:"pattern",title:"Falha recorrente",detail:`${failure.errors} ocorrências · ${failure.pattern}`,start:failure.first,end:failure.last,event_id:failure.example.id}]:[]};
   }
   let mcpEnabled = true;
+  const updateState = { phase: "idle", checkOnStart: true, skippedVersion: null, installOnClose: false, downloaded: 0, total: null, lastCheck: null };
+  const updateStatus = () => {
+    const next = window.__mockUpdate, announced = next && updateState.phase !== "idle";
+    return {
+      currentVersion: "0.5.1", installKind: "nsis", unavailable: null, blocker: null, needsAdmin: false,
+      checkOnStart: updateState.checkOnStart, skippedVersion: updateState.skippedVersion, lastCheck: updateState.lastCheck,
+      phase: updateState.phase, available: announced ? { version: next.version, notes: next.notes || null, date: "2026-09-28T12:00:00Z" } : null,
+      downloaded: updateState.downloaded, total: updateState.total, error: null, installOnClose: updateState.installOnClose,
+      notice: null, releasesUrl: "https://github.com/felipevasc/logs/releases",
+    };
+  };
+  const updatePublish = () => { const status = updateStatus(); emitMock("update-state", status); return status; };
+  const updateCheck = () => {
+    const next = window.__mockUpdate;
+    updateState.phase = next ? "available" : "idle";
+    updateState.lastCheck = { at: new Date().toISOString(), outcome: next ? "available" : "current", message: next ? `A versão ${next.version} está disponível.` : "Você está usando a versão mais recente." };
+    return updatePublish();
+  };
   const handlers = {
     mcp_configure: ({ enabled }) => { mcpEnabled = enabled; return handlers.mcp_status(); },
     validate_filters: ({filters}) => { for(const f of filters||[]) { if(f.op==="regex") new RegExp(f.value); if(f.op==="query") { const problem = window.QueryLang?.validate(f.value); if (problem) throw new Error(problem); } } return null; },
@@ -511,6 +529,27 @@
     }),
     // The preview cannot zoom the browser; screenshots emulate a scale with the viewport.
     ui_zoom: () => false,
+    // Updates (updates.js): nothing is announced unless a test sets window.__mockUpdate = { version, notes },
+    // so the dialog never covers other previews.
+    update_status: () => updateStatus(),
+    update_startup: () => (updateState.checkOnStart ? updateCheck() : updateStatus()),
+    update_check: () => updateCheck(),
+    update_download: () => {
+      Object.assign(updateState, { phase: "downloading", downloaded: 0, total: 42 * 1048576 });
+      const timer = setInterval(() => {
+        if (updateState.phase !== "downloading") return clearInterval(timer);
+        updateState.downloaded = Math.min(updateState.total, updateState.downloaded + 7 * 1048576);
+        if (updateState.downloaded >= updateState.total) { clearInterval(timer); updateState.phase = "ready"; }
+        updatePublish();
+      }, 150);
+      return updatePublish();
+    },
+    update_cancel: () => { if (updateState.phase === "downloading") Object.assign(updateState, { phase: "available", downloaded: 0 }); return updatePublish(); },
+    update_install: () => { updateState.phase = "installing"; updatePublish(); return null; },
+    update_install_on_close: ({ enabled }) => { updateState.installOnClose = enabled; return updatePublish(); },
+    update_set_check_on_start: ({ enabled }) => { updateState.checkOnStart = enabled; return updatePublish(); },
+    update_skip: ({ version }) => { updateState.skippedVersion = version || null; return updatePublish(); },
+    update_open_page: ({ version }) => { window.__mockOpenedRelease = version || "latest"; return null; },
     mcp_status: () => ({
       enabled: mcpEnabled,
       running: mcpEnabled,

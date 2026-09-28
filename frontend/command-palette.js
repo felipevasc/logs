@@ -22,6 +22,7 @@ window.CommandPalette = (() => {
       { group: "Ações", label: "Recalcular triagem", icon: "fa-rotate", run: () => { window.Security?.invalidate(); window.Workspace.showPage("compromises"); }, keys: "atualizar deteccoes" },
       { group: "Ações", label: "Regras de detecção e Sigma", icon: "fa-shield-halved", run: () => openSettings("detection"), keys: "sigma importar ocultas configuracoes" },
       { group: "Ações", label: "Configurações e MCP", icon: "fa-sliders", run: () => openSettings("mcp"), keys: "preferencias agentes" },
+      { group: "Ações", label: "Verificar atualizações", icon: "fa-rotate", run: () => window.Updates?.check(), keys: "versao nova atualizar instalar github" },
       { group: "Ações", label: "Tamanho da interface", icon: "fa-display", run: () => openSettings("interface"), keys: "zoom escala aparencia fonte menor maior" },
       { group: "Ações", label: "Reduzir interface (Ctrl −)", icon: "fa-magnifying-glass-minus", run: () => window.UiScale?.step(-1), keys: "zoom diminuir menor" },
       { group: "Ações", label: "Ampliar interface (Ctrl +)", icon: "fa-magnifying-glass-plus", run: () => window.UiScale?.step(1), keys: "zoom aumentar maior" },

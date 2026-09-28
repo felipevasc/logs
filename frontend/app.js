@@ -5306,6 +5306,7 @@ async function openSettings(tab = "interface") {
   if (tab === "codes") await renderCodesPane();
   if (tab === "mcp") await renderMcpPane();
   if (tab === "detection") await window.Security?.renderRulesPane($("#settings-pane-detection"));
+  if (tab === "updates") await window.Updates?.renderPane($("#settings-pane-updates"));
 }
 
 async function renderMcpPane() {

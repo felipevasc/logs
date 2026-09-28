@@ -26,6 +26,7 @@ Aplicacao desktop para investigar logs, feita com Tauri 2: o backend em Rust ind
 - Conexões Elasticsearch e Kibana Console com autenticação Basic, consulta por período/Query DSL e importação paginada para uma cópia local.
 - Catálogo editável com 378 sinais textuais de ameaças, incluindo tentativas, bloqueios, saídas de comandos e conteúdo exposto (arquivos de sistema, configurações, dumps e credenciais). [Cobertura, interpretação e falsos positivos](docs/regras-ameacas.md).
 - Jornadas por identificador exato entre fontes, com ordem temporal, duração observada e contagens; investigação por usuário/IP delimitada por período.
+- Atualização pelo GitHub: ao abrir, o aplicativo verifica se há versão nova e pergunta antes de baixar e instalar. [Como funciona e como publicar](docs/atualizacoes.md).
 
 ## Executar em desenvolvimento
 
@@ -48,17 +49,19 @@ Os exemplos menores em `exemplos/` podem ser usados para testar os parsers. O ar
 
 ## Downloads e builds de Windows e Linux
 
-A versão publicada, com os instaladores de **Windows e Linux**, fica em [GitHub Releases](https://github.com/felipevasc/logs/releases/latest). Cada Release inclui `.exe`, `.msi`, `.AppImage`, `.deb`, `.rpm` e `SHA256SUMS.txt` para conferir a integridade dos arquivos.
+A versão publicada, com os instaladores de **Windows e Linux**, fica em [GitHub Releases](https://github.com/felipevasc/logs/releases/latest). Cada Release inclui `.exe`, `.msi`, `.AppImage`, `.deb`, `.rpm`, as assinaturas do atualizador (`.sig`), o manifesto `latest.json` e `SHA256SUMS.txt` para conferir a integridade dos arquivos.
+
+A partir da 0.6.0 o LogInsight se atualiza: ao abrir, consulta a última Release e, se houver versão nova, pergunta antes de baixar e instalar. Prefira o `.exe` no Windows e o `.AppImage` no Linux, que atualizam sem senha de administrador; `.msi`, `.deb` e `.rpm` também atualizam, mas pedem a senha. Quem usa a 0.5.x instala a 0.6.0 manualmente uma vez. Detalhes em [Atualizações](docs/atualizacoes.md).
 
 O workflow [Build Windows and Linux](https://github.com/felipevasc/logs/actions/workflows/build.yml) executa os testes do backend e gera instaladores x64 a cada push de codigo para `main`. Tambem pode ser iniciado pela opcao **Run workflow** no GitHub Actions. Os downloads ficam nos artefatos da execucao por 30 dias:
 
 - **Windows:** instalador `.exe` (NSIS) e `.msi`.
 - **Linux:** `.deb`, `.rpm` e `.AppImage`, compilados no Ubuntu 22.04.
 
-Para publicar uma versão, alinhe a versão em `package.json`, nos lockfiles, em `Cargo.toml` e em `tauri.conf.json`, e registre as notas em `docs/releases/vX.Y.Z.md`. Inicie o workflow em `main` com **publish_release** habilitado. A publicação só acontece após os testes e builds das duas plataformas: o job confere versão, formato e integridade dos cinco pacotes, envia todos para uma Release em rascunho e só então a publica. Uma tag existente de outro commit ou uma versão já publicada interrompe a operação, sem sobrescrevê-la.
+Para publicar uma versão, qualquer pessoa com permissão de escrita no repositório executa `npm run release -- X.Y.Z` (alinha a versão nos cinco arquivos, usa as notas de `docs/releases/vX.Y.Z.md`, cria o commit e a tag) e envia com `git push --follow-tags origin HEAD:main`. A tag inicia o workflow: testes, instaladores das duas plataformas, teste de atualização ponta a ponta, assinatura e manifesto. O job de publicação confere versão, formato, assinatura e integridade dos pacotes, envia tudo para uma Release em rascunho e só então a publica; em seguida confere se o manifesto já é servido aos aplicativos instalados. Uma tag de commit fora da `main`, de outro commit ou de versão já publicada ou menor que a atual interrompe a operação, sem sobrescrever nada. O workflow também pode ser iniciado em `main` com **publish_release** habilitado.
 
 Para compilar localmente, instale as dependencias da plataforma, execute `npm ci` e `npm run build`. Os pacotes ficam em `src-tauri/target/release/bundle/`. O build Linux precisa de ambiente Linux; o de Windows precisa de Windows.
 
-Os pacotes ainda nao possuem assinatura de codigo. A leitura de canais ao vivo do Windows Event Log requer Windows; arquivos `.evtx` e os demais formatos podem ser analisados nas duas plataformas.
+Os instaladores ainda não têm assinatura de código do Windows (Authenticode); as atualizações são conferidas pela assinatura do atualizador. A leitura de canais ao vivo do Windows Event Log requer Windows; arquivos `.evtx` e os demais formatos podem ser analisados nas duas plataformas.
 
 As funcionalidades novas, seus limites, o contrato das conexões e os benchmarks medidos estão em [Evolução da análise genérica](docs/evolucao-analise-generica.md). O histórico anterior permanece em [Reformulacao e validacao](docs/repaginacao-e-validacao.md).

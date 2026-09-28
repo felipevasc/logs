@@ -25,9 +25,27 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/icon.ico",
       "icons/icon.png"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhCODYxRUVFN0I1Q0I4N0QKUldSOXVGeDc3aDZHaTBjcVJxK200K2lPaDBDVTNHM01mUHRUTXJpSklGa2QzczJ4c3c5emFPeXkK",
+      "endpoints": [
+        "https://github.com/felipevasc/logs/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

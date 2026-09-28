@@ -19,6 +19,7 @@
   <link rel="stylesheet" href="case-content.css" />
   <link rel="stylesheet" href="case-trails.css" />
   <link rel="stylesheet" href="security.css" />
+  <link rel="stylesheet" href="updates.css" />
 </head>
 <body>
   <nav class="workspace-nav" aria-label="Navegação principal">
@@ -930,12 +931,16 @@
         <button class="settings-tab" data-settings-tab="detection" type="button" role="tab">
           <i class="fas fa-shield-halved"></i> Detecção
         </button>
+        <button class="settings-tab" data-settings-tab="updates" type="button" role="tab">
+          <i class="fas fa-rotate"></i> Atualizações
+        </button>
       </div>
       <div class="modal-body">
         <section id="settings-pane-interface" class="settings-pane" role="tabpanel"></section>
         <section id="settings-pane-codes" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-mcp" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-detection" class="settings-pane" role="tabpanel" hidden></section>
+        <section id="settings-pane-updates" class="settings-pane" role="tabpanel" hidden></section>
       </div>
     </div>
   </div>
@@ -1037,5 +1042,6 @@
   <script src="event-insights.js"></script>
   <script src="case-intel.js"></script>
   <script src="command-palette.js"></script>
+  <script src="updates.js"></script>
 </body>
 </html>

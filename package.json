@@ -9,11 +9,12 @@
     "vendor:timeline": "node scripts/vendor-timeline-export.mjs",
     "vendor:icons": "node scripts/vendor-note-icons.mjs",
     "dev": "npm run prepare:frontend && tauri dev",
-    "build": "npm run prepare:frontend && tauri build",
+    "build": "npm run prepare:frontend && node scripts/tauri-build.mjs",
+    "release": "node scripts/release/release.mjs",
     "icon": "tauri icon"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "^2.12.0"
   },
   "dependencies": {
     "html-to-image": "1.11.13",

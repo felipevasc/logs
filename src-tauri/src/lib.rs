@@ -36,6 +36,7 @@ mod sources;
 mod threats;
 mod timeline_export;
 mod triage;
+mod updates;
 mod workspace;
 
 use model::{CodesConfig, Event, STANDARD_COLUMNS};
@@ -2074,6 +2075,9 @@ fn relaunch_elevated() -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    // Before anything reads the data folder: a new version backs it up first.
+    let updates = updates::prepare(&context.package_info().version);
     let codes_path = config_dir().join("codes.json");
     let codes = load_codes(&codes_path);
     let system_codes_path = config_dir().join("system_codes.json");
@@ -2082,6 +2086,9 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updates)
+        .on_window_event(updates::on_window_event)
         .manage(AppState {
             source: RwLock::new(SourceData::None),
             source_names: RwLock::new(vec![]),
@@ -2124,6 +2131,8 @@ pub fn run() {
                     mcp::serve(handle, mcp_port).await;
                 });
             }
+            #[cfg(feature = "update-e2e")]
+            updates::run_e2e(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2207,8 +2216,18 @@ pub fn run() {
             compute_series,
             pivot,
             mcp_status,
+            updates::update_status,
+            updates::update_startup,
+            updates::update_check,
+            updates::update_download,
+            updates::update_cancel,
+            updates::update_install,
+            updates::update_install_on_close,
+            updates::update_set_check_on_start,
+            updates::update_skip,
+            updates::update_open_page,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("erro ao iniciar o LogInsight");
 }
 

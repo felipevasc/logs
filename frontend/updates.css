@@ -1,0 +1,35 @@
+/* Update dialog and Settings → Atualizações (updates.js). */
+.update-overlay { z-index: 120; }
+.update-modal .modal-body { display: grid; gap: 10px; }
+.update-modal .modal-body > p { margin: 0; line-height: 1.55; }
+.update-lead { font-weight: 600; color: var(--text-0); }
+.update-notes {
+  display: grid; gap: 6px; max-height: 38vh; overflow: auto;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-2); font-size: 12.5px; line-height: 1.5; color: var(--text-1);
+}
+.update-notes strong { color: var(--text-0); margin-top: 4px; }
+.update-notes strong:first-child { margin-top: 0; }
+.update-notes p { margin: 0; }
+.update-bullet { padding-left: 14px; position: relative; }
+.update-bullet::before { content: "•"; position: absolute; left: 2px; color: var(--text-2); }
+.update-warn, .update-error { margin: 0; padding: 8px 10px; border-radius: var(--radius-sm); font-size: 12.5px; line-height: 1.5; }
+.update-warn { border-left: 3px solid var(--lv-aviso); background: color-mix(in srgb, var(--lv-aviso) 12%, transparent); color: var(--text-0); }
+.update-error { border-left: 3px solid var(--lv-erro); background: color-mix(in srgb, var(--lv-erro) 12%, transparent); color: var(--text-0); }
+.update-actions { flex-wrap: wrap; }
+.update-progress { position: relative; height: 8px; overflow: hidden; border-radius: 99px; background: var(--bg-3); }
+.update-progress span { position: absolute; inset: 0 auto 0 0; width: 0; border-radius: inherit; background: var(--accent); transition: width 0.2s ease; }
+.update-progress.indeterminate span { width: 35%; animation: update-slide 1.1s ease-in-out infinite; }
+@keyframes update-slide { from { left: -35%; } to { left: 100%; } }
+.update-pane-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.update-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.update-toggle input { accent-color: var(--accent); }
+#btn-settings { position: relative; }
+#btn-settings.has-update::after {
+  content: ""; position: absolute; top: 5px; right: 5px; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 2px var(--bg-1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .update-progress span { transition: none; }
+  .update-progress.indeterminate span { animation: none; width: 100%; opacity: 0.5; }
+}
