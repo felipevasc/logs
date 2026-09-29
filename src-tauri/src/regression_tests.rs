@@ -2034,3 +2034,35 @@ fn lanes_entities_sightings_and_hashes() {
     assert_eq!(hashes[0].sha256, format!("{:x}", sha2::Sha256::digest(text.as_bytes())));
     assert_eq!(hashes[0].origin, "original");
 }
+
+#[test]
+fn huge_groupings_return_the_largest_groups_and_the_omitted_totals() {
+    // 60 000 users seen once and three frequent ones.
+    let mut events = Vec::new();
+    for i in 0..60_000usize {
+        let mut ev = Event::empty();
+        ev.id = i;
+        ev.fields.insert("user".into(), serde_json::Value::from(format!("u{i:05}")));
+        events.push(ev);
+    }
+    for (name, times) in [("alice", 5), ("bob", 3), ("carol", 2)] {
+        for _ in 0..times {
+            let mut ev = Event::empty();
+            ev.id = events.len();
+            ev.fields.insert("user".into(), serde_json::Value::from(name));
+            events.push(ev);
+        }
+    }
+    let spec = [query::AggSpec { func: "count".into(), column: "*".into(), alias: "n".into() }];
+    let result = query::aggregate(&events, &[], "user", &spec);
+    assert_eq!(result.rows.len(), query::MAX_GROUPS);
+    assert_eq!(result.omitted_groups, 60_003 - query::MAX_GROUPS);
+    let kept: u64 = result.rows.iter().map(|r| r["n"].as_u64().unwrap()).sum();
+    assert_eq!(kept + result.omitted_records, events.len() as u64);
+    for name in ["alice", "bob", "carol"] {
+        assert!(result.group_values.contains(&Some(name.to_string())), "{name} is among the largest");
+    }
+    // Small groupings are complete and report nothing omitted.
+    let small = query::aggregate(&events[..10], &[], "user", &spec);
+    assert_eq!((small.rows.len(), small.omitted_groups, small.omitted_records), (10, 0, 0));
+}

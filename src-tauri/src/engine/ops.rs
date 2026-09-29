@@ -575,8 +575,9 @@ fn page_ids(scope: &Scope, sort_column: &str, sort_dir: &str, offset: usize, lim
     Ok((total, ids))
 }
 
+/// Rows of a page, read in parallel (pages of trails reach thousands).
 fn page_rows(src: &Source, ids: Vec<usize>) -> Vec<Event> {
-    ids.into_iter()
+    ids.into_par_iter()
         .map(|i| {
             let mut event = src.event(i);
             crate::entities::annotate(&mut event);

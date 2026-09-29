@@ -300,3 +300,59 @@ pub fn set_engine_dir(path: &str) {
 pub fn clear_caches() {
     query::clear_match_cache();
 }
+
+/// Time spent per step of reading `count` lines of a file (manual profiling).
+#[doc(hidden)]
+pub fn profile_reading(path: &str, count: usize) -> Vec<(&'static str, std::time::Duration)> {
+    use std::time::{Duration, Instant};
+    let idx = crate::index_source_file(path, "auto", None).expect("índice");
+    let empty = CodesConfig::default();
+    let n = count.min(idx.lines.len());
+    let part = &idx.parts[0];
+    let mut out: Vec<(&'static str, Duration)> = Vec::new();
+    let t = Instant::now();
+    for i in 0..n {
+        std::hint::black_box(crate::sources::parse_line(
+            crate::sources::line_bytes(&idx, i),
+            &part.format,
+            part.custom.as_ref(),
+            &part.header,
+        ));
+    }
+    out.push(("parse_line", t.elapsed()));
+    let t = Instant::now();
+    let events: Vec<Event> = (0..n).map(|i| event_at(&idx, i, &empty, &empty, &[])).collect();
+    out.push(("event_at", t.elapsed()));
+    let t = Instant::now();
+    for ev in &events {
+        std::hint::black_box(crate::entities::extract(ev).get(crate::entities::Role::User).map(str::len));
+    }
+    out.push(("entities::extract", t.elapsed()));
+    let t = Instant::now();
+    for ev in &events {
+        std::hint::black_box(crate::entities::tool(ev).map(|t| t.name));
+    }
+    out.push(("entities::tool", t.elapsed()));
+    let t = Instant::now();
+    for ev in &events {
+        std::hint::black_box(crate::insights::pattern_of(&ev.message));
+    }
+    out.push(("pattern_of", t.elapsed()));
+    let t = Instant::now();
+    for ev in &events {
+        let mut text = ev.message.to_lowercase();
+        for value in ev.fields.values() {
+            if let Value::String(s) = value {
+                text.push_str(&s.to_lowercase());
+            }
+        }
+        std::hint::black_box(text);
+    }
+    out.push(("valores em minúsculas", t.elapsed()));
+    let t = Instant::now();
+    for ev in &events {
+        std::hint::black_box(crate::entities::value(ev, crate::entities::Role::Tool));
+    }
+    out.push(("entities::value(Tool)", t.elapsed()));
+    out
+}

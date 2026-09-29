@@ -70,6 +70,7 @@ pub async fn load_bundle(
             source_desc: names.join(" + "),
         };
         let state = app.state::<AppState>();
+        crate::prepare_engine(state.inner(), &idx, Some(&app))?;
         let mut source = state.source.write();
         crate::operations::commit();
         *source = SourceData::Indexed(idx);

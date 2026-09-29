@@ -28,3 +28,12 @@ fn build_time_on_a_large_file() {
     eprintln!("motor: {:?}, {} MB", started.elapsed(), size / 1_000_000);
     let _ = std::fs::remove_dir_all(&engine);
 }
+
+#[test]
+#[ignore]
+fn reading_profile() {
+    let Ok(file) = std::env::var("LOGINSIGHT_BENCH_FILE") else { return };
+    for (step, time) in testkit::profile_reading(&file, 100_000) {
+        eprintln!("{step:<24} {:>8.1} µs/linha", time.as_secs_f64() * 1e6 / 100_000.0);
+    }
+}

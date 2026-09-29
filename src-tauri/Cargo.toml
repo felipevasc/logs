@@ -50,6 +50,8 @@ calamine = { version = "0.36", features = ["dates"] }
 encoding_rs = "0.8"
 # Columnar query engine (embedded, no server): filters and aggregations over large files.
 duckdb = { version = "1.10505", features = ["bundled", "appender-arrow", "vscalar"] }
+# Allocator that scales with many threads parsing events at once.
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 # Workbooks for the spreadsheet tests.
@@ -62,9 +64,15 @@ windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+# Background threads run with a lower scheduling priority.
+libc = "0.2"
 
 [features]
 default = ["custom-protocol"]

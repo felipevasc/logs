@@ -11,6 +11,12 @@ Arquivos grandes são consultados por um motor colunar embutido (DuckDB), sem se
 - Mudar a data/hora de uma fonte ou os campos derivados gera uma nova cópia em segundo plano; enquanto ela não fica pronta, o leitor linha a linha responde.
 - Qualquer falha do motor (disco cheio, arquivo removido, erro inesperado) faz a consulta ser respondida pelo leitor linha a linha, apenas mais devagar.
 
+## Máquinas modestas
+
+- A leitura inicial e a preparação usam todos os núcleos menos um, com prioridade abaixo do normal: a interface e os outros programas continuam respondendo.
+- O motor usa no máximo 40% da memória instalada e grava em disco resultados intermediários maiores. Com menos de 8 GB de RAM, a preparação usa lotes menores e um único gravador.
+- Resumos com mais de 50.000 grupos retornam os maiores e informam quantos ficaram de fora.
+
 ## Espaço em disco
 
 As cópias ficam em `%APPDATA%\LogInsight\engine-v1` (Windows) ou `~/LogInsight/engine-v1` e ocupam cerca de um terço do arquivo original (531 MB para um log JSON de 1,95 GB com 3 milhões de registros, preparado em menos de um minuto). O aplicativo:

@@ -160,7 +160,9 @@
   function renderGroups() {
     const result = groupView.result; if (!result) return;
     const field = groupView.field, countIndex = groupView.aggs.findIndex(a => a.func === "count" && a.column === "*"), countKey = countIndex >= 0 ? result.columns[countIndex + 1] : null;
-    const total = countKey ? result.rows.reduce((sum, row) => sum + (Number(row[countKey]) || 0), 0) : 0;
+    // Beyond 50 000 groups only the largest come back; their records still count in the total.
+    const omitted = Number(result.omitted_groups) || 0;
+    const total = countKey ? result.rows.reduce((sum, row) => sum + (Number(row[countKey]) || 0), 0) + (Number(result.omitted_records) || 0) : 0;
     let rows = result.rows.filter(row => String(row[field] ?? "").toLocaleLowerCase().includes(groupView.search.toLocaleLowerCase()));
     rows = rows.slice().sort((a, b) => {
       const aa = a[groupView.sort], bb = b[groupView.sort];
@@ -194,10 +196,11 @@
       const action = el("td", "aw-row-action"); const open = button("Ver registros →", event => { event.stopPropagation(); filterGroup(value); }); action.append(open); tr.append(action); body.append(tr);
     }
     if (!rows.length) { const tr = el("tr"), td = el("td", "aw-empty", groupView.search ? "Nenhum grupo corresponde à busca. Altere o termo acima." : "Nenhum registro neste recorte. Revise os filtros."); td.colSpan = result.columns.length + 2; tr.append(td); body.append(tr); }
-    $("#aw-group-summary").textContent = `${fmtNum(result.rows.length)} grupos${countKey ? ` · ${fmtNum(total)} registros` : ""}${groupView.search ? ` · ${fmtNum(rows.length)} encontrados` : ""}`;
+    const groupsText = omitted ? `${fmtNum(result.rows.length)} maiores de ${fmtNum(result.rows.length + omitted)} grupos` : `${fmtNum(result.rows.length)} grupos`;
+    $("#aw-group-summary").textContent = `${groupsText}${countKey ? ` · ${fmtNum(total)} registros` : ""}${groupView.search ? ` · ${fmtNum(rows.length)} encontrados` : ""}`;
     const incompatible = (result.incompatible_units || []).map((count, index) => count ? `${measureName(groupView.aggs[index])} (${fmtNum(count)} valores)` : null).filter(Boolean);
     if (incompatible.length) $("#aw-group-summary").append(el("span", "aw-partial", ` · Unidades incompatíveis em ${incompatible.join(", ")}. Separe os registros por unidade para calcular essas medidas.`));
-    const footer = $("#aw-group-pager"); footer.replaceChildren(el("span", "muted small", "Busca e ordenação usam todos os grupos calculados. Clique em um grupo para investigar."));
+    const footer = $("#aw-group-pager"); footer.replaceChildren(el("span", "muted small", omitted ? "Busca e ordenação usam os maiores grupos calculados; refine o recorte para ver os demais." : "Busca e ordenação usam todos os grupos calculados. Clique em um grupo para investigar."));
     const prev = button("←", () => { groupView.page--; renderGroups(); }); prev.disabled = !groupView.page; prev.setAttribute("aria-label", "Grupos anteriores");
     const next = button("→", () => { groupView.page++; renderGroups(); }); next.disabled = groupView.page >= pages - 1; next.setAttribute("aria-label", "Próximos grupos");
     footer.append(prev, el("span", "", `${groupView.page + 1} / ${pages}`), next);

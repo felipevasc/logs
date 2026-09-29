@@ -1,3 +1,8 @@
+// Parsing allocates many small values on every worker thread; the system
+// allocator serializes them, mimalloc does not.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod analysis;
 mod attack;
 mod case_cache;
@@ -32,6 +37,7 @@ mod querylang;
 #[cfg(test)]
 mod regression_tests;
 mod remote;
+mod resources;
 mod sigma;
 mod sources;
 mod spreadsheet;
@@ -236,6 +242,7 @@ pub(crate) fn load_event_log_impl(
     );
     let mut idx = workspace::index_channel(channel, max_events)?;
     operations::check()?;
+    prepare_engine(state, &idx, app)?;
     let mut source = state.source.write();
     let mut names = vec![format!("Event Log: {channel}")];
     if merge.unwrap_or(false) {
@@ -454,7 +461,7 @@ pub(crate) fn load_file_impl(
 
 /// Builds the query engine's stores for newly indexed files (cached per
 /// file), so the first queries are already fast. Opening takes longer once.
-fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Option<&AppHandle>) -> Result<(), String> {
+pub(crate) fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Option<&AppHandle>) -> Result<(), String> {
     let codes = state.codes.read().clone();
     let system = state.system_codes.read().clone();
     let derived = state.derived.read().clone();
@@ -2117,6 +2124,8 @@ fn relaunch_elevated() -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Parallel work leaves a core free and runs below normal priority.
+    resources::init();
     #[cfg(feature = "update-e2e")]
     updates::e2e_arguments();
     let context = tauri::generate_context!();

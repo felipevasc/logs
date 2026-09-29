@@ -3,6 +3,7 @@ use crate::model::{
     LV_TRACE, LV_WARN, STANDARD_COLUMNS,
 };
 use chrono::Datelike;
+use rayon::prelude::*;
 use serde_json::{Map, Value};
 
 /// Interpreta data/hora "naive" (sem fuso) como horário LOCAL da máquina.
@@ -1959,20 +1960,33 @@ pub fn retimestamp_index(
 ) -> Result<(), String> {
     let total = idx.lines.len();
     let mut timestamps = Vec::with_capacity(total);
-    for i in 0..total {
-        if i % 2048 == 0 {
-            crate::operations::check()?;
-            if let Some(cb) = progress {
-                cb(i, total);
-            }
+    let generation = crate::operations::current_generation();
+    let wave = crate::resources::workers() * 8192;
+    let index: &FileIndex = idx;
+    while timestamps.len() < total {
+        crate::operations::check()?;
+        if let Some(cb) = progress {
+            cb(timestamps.len(), total);
         }
-        let part = idx.part_at(i);
-        let bytes = line_bytes(idx, i);
-        let mut ev = parse_line(bytes, &part.format, part.custom.as_ref(), &part.header);
-        if let Some(cc) = &part.ts_config {
-            apply_ts_config(&mut ev, cc, part, &String::from_utf8_lossy(bytes));
-        }
-        timestamps.push(ev.timestamp.unwrap_or(0));
+        let start = timestamps.len();
+        let end = (start + wave).min(total);
+        let part: Vec<i64> = (start..end)
+            .into_par_iter()
+            .with_min_len(1024)
+            .map(|i| {
+                if crate::operations::cancelled_for(generation) {
+                    return 0;
+                }
+                let part = index.part_at(i);
+                let bytes = line_bytes(index, i);
+                let mut ev = parse_line(bytes, &part.format, part.custom.as_ref(), &part.header);
+                if let Some(cc) = &part.ts_config {
+                    apply_ts_config(&mut ev, cc, part, &String::from_utf8_lossy(bytes));
+                }
+                ev.timestamp.unwrap_or(0)
+            })
+            .collect();
+        timestamps.extend(part);
     }
     crate::operations::check()?;
     for (line, timestamp) in idx.lines.iter_mut().zip(timestamps) {
@@ -2354,6 +2368,41 @@ fn index_json_array(
     progress: Option<&dyn Fn(usize, usize)>,
     envelope: bool,
 ) -> Result<(), String> {
+    let records = json_array_records(bytes, start, progress, envelope)?;
+    // Positions come from one fast scan; the records are read in parallel.
+    let generation = crate::operations::current_generation();
+    let wave = crate::resources::workers() * 4 * 1024;
+    lines.reserve(records.len());
+    for group in records.chunks(wave) {
+        let metas: Vec<Vec<LineMeta>> = group
+            .par_chunks(1024)
+            .map(|chunk| {
+                if crate::operations::cancelled_for(generation) {
+                    return Vec::new();
+                }
+                chunk
+                    .iter()
+                    .map(|&(begin, end)| meta_for_line(&bytes[begin..=end], begin as u64, "jsonl", custom, header))
+                    .collect()
+            })
+            .collect();
+        crate::operations::check()?;
+        lines.extend(metas.into_iter().flatten());
+        if let Some(cb) = progress {
+            cb(lines.len(), records.len());
+        }
+    }
+    Ok(())
+}
+
+/// Byte ranges of the objects of a JSON array, found in one pass.
+fn json_array_records(
+    bytes: &[u8],
+    start: usize,
+    progress: Option<&dyn Fn(usize, usize)>,
+    envelope: bool,
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut records = Vec::new();
     let mut stack = Vec::new();
     let mut quoted = false;
     let mut escaped = false;
@@ -2392,16 +2441,10 @@ fn index_json_array(
                         if i - begin >= u32::MAX as usize {
                             return Err("Um registro JSON excede 4 GB.".into());
                         }
-                        lines.push(meta_for_line(
-                            &bytes[begin..=i],
-                            begin as u64,
-                            "jsonl",
-                            custom,
-                            header,
-                        ));
+                        records.push((begin, i));
                         record_start = None;
                         need_separator = true;
-                        if lines.len().is_multiple_of(2048) {
+                        if records.len().is_multiple_of(65_536) {
                             if let Some(cb) = progress {
                                 cb(i, bytes.len());
                             }
@@ -2421,7 +2464,7 @@ fn index_json_array(
                 if !envelope && bytes[i + 1..].iter().any(|b| !b.is_ascii_whitespace()) {
                     return Err("Há conteúdo após o fim do array JSON.".into());
                 }
-                return Ok(());
+                return Ok(records);
             }
             b',' if need_separator => {
                 need_separator = false;
@@ -2440,6 +2483,117 @@ fn index_json_array(
         }
     }
     Err("Array JSON incompleto: falta fechar um objeto ou o array.".into())
+}
+
+/// Bytes per parallel indexing task, cut at line ends.
+const INDEX_CHUNK: usize = 4 << 20;
+
+/// Entries of one chunk. In multi-line formats, continuation lines before
+/// the chunk's first entry belong to the previous chunk's last entry.
+struct ChunkLines {
+    lines: Vec<LineMeta>,
+    /// Start of the first and end of the last leading continuation line.
+    leading: Option<(usize, usize)>,
+}
+
+/// Indexes a line-oriented file in parallel chunks, with the same result as
+/// reading it line by line; waves keep memory bounded and report progress.
+#[allow(clippy::too_many_arguments)]
+fn index_lines(
+    bytes: &[u8],
+    fmt: &str,
+    custom: Option<&CustomParse>,
+    header: &[String],
+    header_at: Option<usize>,
+    start_re: Option<&regex::Regex>,
+    progress: Option<&dyn Fn(usize, usize)>,
+    total_lines: usize,
+) -> Result<Vec<LineMeta>, String> {
+    let mut bounds = vec![0usize];
+    let mut next = INDEX_CHUNK;
+    while next < bytes.len() {
+        match memchr::memchr(b'\n', &bytes[next..]) {
+            Some(nl) if next + nl + 1 < bytes.len() => {
+                bounds.push(next + nl + 1);
+                next += nl + 1 + INDEX_CHUNK;
+            }
+            _ => break,
+        }
+    }
+    bounds.push(bytes.len());
+    let comments = matches!(fmt, "w3c" | "zeek");
+    // A terminated line may be skipped (blank, header, comment); the final
+    // unterminated line is taken as it is, as the line-by-line reader did.
+    let keep = |line: &[u8], offset: usize, terminated: bool| {
+        !line.is_empty() && (!terminated || (Some(offset) != header_at && !(comments && line[0] == b'#')))
+    };
+    let generation = crate::operations::current_generation();
+    let chunk = |k: usize| -> ChunkLines {
+        let (from, to) = (bounds[k], bounds[k + 1]);
+        let mut out = ChunkLines { lines: Vec::new(), leading: None };
+        let visit = |line: &[u8], offset: usize, terminated: bool, out: &mut ChunkLines| {
+            if !keep(line, offset, terminated) {
+                return;
+            }
+            if let Some(re) = start_re {
+                if k > 0 && out.lines.is_empty() && !re.is_match(std::str::from_utf8(line).unwrap_or("")) {
+                    let end = offset + line.len();
+                    out.leading = Some((out.leading.map_or(offset, |(start, _)| start), end));
+                    return;
+                }
+            }
+            push_meta(&mut out.lines, line, offset as u64, fmt, custom, header, start_re);
+        };
+        let mut offset = from;
+        for (n, nl) in memchr::memchr_iter(b'\n', &bytes[from..to]).enumerate() {
+            if n % 4096 == 0 && crate::operations::cancelled_for(generation) {
+                break;
+            }
+            let end = from + nl;
+            let raw = &bytes[offset..end];
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            visit(line, offset, true, &mut out);
+            offset = end + 1;
+        }
+        if offset < to {
+            visit(&bytes[offset..to], offset, false, &mut out);
+        }
+        out
+    };
+    let mut merged: Vec<LineMeta> = Vec::with_capacity(total_lines.min(1 << 24));
+    let wave = crate::resources::workers() * 2;
+    let mut first = 0;
+    while first + 1 < bounds.len() {
+        crate::operations::check()?;
+        let last = (first + wave).min(bounds.len() - 1);
+        let parts: Vec<ChunkLines> = (first..last).into_par_iter().map(chunk).collect();
+        crate::operations::check()?;
+        for part in parts {
+            if let Some((start, stop)) = part.leading {
+                match merged.last_mut() {
+                    Some(entry) => entry.len = (stop - entry.offset as usize) as u32,
+                    // Nothing before them: the first line stands alone and the
+                    // next ones continue it, as when read in order.
+                    None => {
+                        let mut offset = start;
+                        for raw in bytes[start..stop].split(|&b| b == b'\n') {
+                            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+                            if keep(line, offset, true) {
+                                push_meta(&mut merged, line, offset as u64, fmt, custom, header, start_re);
+                            }
+                            offset += raw.len() + 1;
+                        }
+                    }
+                }
+            }
+            merged.extend(part.lines);
+        }
+        first = last;
+        if let Some(cb) = progress {
+            cb(merged.len(), total_lines);
+        }
+    }
+    Ok(merged)
 }
 
 /// Indexa um arquivo inteiro em uma única passada, guardando apenas
@@ -2505,11 +2659,22 @@ pub fn index_file(
     let total_lines = progress
         .map(|_| memchr::memchr_iter(b'\n', &mmap).count() + 1)
         .unwrap_or(0);
-    let mut lines: Vec<LineMeta> = Vec::with_capacity((mmap.len() / 160).min(1_000_000) + 16);
-    let mut offset = 0usize;
-    // The header line of tabular formats is not an event.
-    let mut header_pending = delimiter_of(fmt).is_some();
-    let mut last_report = 0usize;
+    let mut lines: Vec<LineMeta> = Vec::new();
+    // The header line of tabular formats (first line with content) is not an event.
+    let header_at = if delimiter_of(fmt).is_some() {
+        let mut offset = 0usize;
+        let mut found = None;
+        for line in mmap.split(|&b| b == b'\n') {
+            if !line.trim_ascii().is_empty() {
+                found = Some(offset);
+                break;
+            }
+            offset += line.len() + 1;
+        }
+        found
+    } else {
+        None
+    };
     // Formatos multi-linha (stacktrace Java): linha que casa o padrão do
     // formato inicia um evento; as demais estendem o evento anterior.
     let start_re: Option<regex::Regex> = match fmt {
@@ -2532,54 +2697,16 @@ pub fn index_file(
     } else if let Some(start) = envelope_start {
         index_json_array(&mmap, start, &mut lines, custom.as_ref(), &header, progress, true)?;
     } else {
-        for (physical_line, nl) in memchr::memchr_iter(b'\n', &mmap).enumerate() {
-            if physical_line % 2048 == 0 {
-                crate::operations::check()?;
-            }
-            let raw = &mmap[offset..nl];
-            let line = if raw.last() == Some(&b'\r') {
-                &raw[..raw.len() - 1]
-            } else {
-                raw
-            };
-            if !line.is_empty() {
-                let header_line = header_pending && !line.trim_ascii().is_empty();
-                header_pending &= !header_line;
-                let skip = header_line || (matches!(fmt, "w3c" | "zeek") && line[0] == b'#');
-                if !skip {
-                    push_meta(
-                        &mut lines,
-                        line,
-                        offset as u64,
-                        fmt,
-                        custom.as_ref(),
-                        &header,
-                        start_re.as_ref(),
-                    );
-                }
-            }
-            offset = nl + 1;
-            if let Some(cb) = progress {
-                if lines.len() >= last_report + 2048 {
-                    last_report = lines.len();
-                    cb(lines.len(), total_lines);
-                }
-            }
-        }
-        if offset < mmap.len() {
-            let line = &mmap[offset..];
-            if !line.is_empty() {
-                push_meta(
-                    &mut lines,
-                    line,
-                    offset as u64,
-                    fmt,
-                    custom.as_ref(),
-                    &header,
-                    start_re.as_ref(),
-                );
-            }
-        }
+        lines = index_lines(
+            &mmap,
+            fmt,
+            custom.as_ref(),
+            &header,
+            header_at,
+            start_re.as_ref(),
+            progress,
+            total_lines,
+        )?;
     }
 
     // Descoberta de colunas: amostra das primeiras 2.000 linhas.

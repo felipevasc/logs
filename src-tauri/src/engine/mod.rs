@@ -251,7 +251,7 @@ impl Session {
             sql::lit(&temp.to_string_lossy())
         ))
         .map_err(|e| e.to_string())?;
-        limit_memory(&conn);
+        limit_resources(&conn);
         udf::register(&conn).map_err(|e| e.to_string())?;
         let mut schema = sql::Schema::default();
         let mut columns: HashMap<String, String> = HashMap::new();
@@ -417,25 +417,15 @@ impl Session {
     }
 }
 
-/// DuckDB may use 80% of the memory by default; a desktop app shares it.
-/// Half of that default (40% of the memory) is left to the engine, which
-/// spills larger intermediate results to its temporary folder.
-pub(crate) fn limit_memory(conn: &Connection) {
-    let Ok(default) = conn.query_row("SELECT current_setting('memory_limit')", [], |r| r.get::<_, String>(0)) else {
-        return;
-    };
-    let mut parts = default.split_whitespace();
-    let (Some(number), Some(unit)) = (parts.next(), parts.next()) else { return };
-    let Ok(number) = number.parse::<f64>() else { return };
-    let scale = match unit {
-        "KiB" | "KB" => 1u64 << 10,
-        "MiB" | "MB" => 1 << 20,
-        "GiB" | "GB" => 1 << 30,
-        "TiB" | "TB" => 1 << 40,
-        _ => return,
-    };
-    let megabytes = ((number * scale as f64 / 2.0) as u64 >> 20).max(512);
-    let _ = conn.execute_batch(&format!("SET memory_limit = '{megabytes}MB'"));
+/// DuckDB would use every core and 80% of the memory; a desktop app shares
+/// the machine. The engine gets the shared worker budget and 40% of the
+/// installed memory, spilling larger intermediate results to disk.
+pub(crate) fn limit_resources(conn: &Connection) {
+    let megabytes = (crate::resources::total_memory() / 5 * 2 >> 20).max(512);
+    let _ = conn.execute_batch(&format!(
+        "SET threads = {}; SET memory_limit = '{megabytes}MB';",
+        crate::resources::workers()
+    ));
 }
 
 // ---------------------------------------------------------------- registry
@@ -445,6 +435,12 @@ struct Registry {
     session: Option<Arc<Session>>,
     building: HashSet<String>,
     failed: HashMap<String, String>,
+    /// Stores of the source in use; background builds of others stop.
+    wanted: HashSet<String>,
+}
+
+fn still_wanted(key: &str) -> bool {
+    with_registry(|reg| reg.wanted.contains(key))
 }
 
 static REGISTRY: Mutex<Option<Registry>> = parking_lot::const_mutex(None);
@@ -467,6 +463,7 @@ pub(crate) fn session(
     }
     let spec = spec(idx, codes, system, derived)?;
     let session = with_registry(|reg| -> Option<Arc<Session>> {
+        reg.wanted = spec.parts.iter().map(|p| p.key.clone()).collect();
         if let Some(current) = &reg.session {
             if current.key == spec.key {
                 return Some(Arc::clone(current));
@@ -531,9 +528,11 @@ fn schedule(idx: &FileIndex, part: &PartSpec, derived: &[CompiledDerived], catal
         std::thread::Builder::new()
             .name("loginsight-engine".into())
             .spawn(move || {
+                crate::resources::lower_priority();
                 for job in receiver {
                     let key = job.key.clone();
-                    let result = run_job(job, &|_, _| {}, &|| false);
+                    // A build for a source no longer open stops early.
+                    let result = run_job(job, &|_, _| {}, &|| !still_wanted(&key));
                     with_registry(|reg| {
                         reg.building.remove(&key);
                         if let Err(error) = result {
@@ -582,6 +581,7 @@ pub(crate) fn prepare(
         return Ok(());
     }
     let Some(spec) = spec(idx, codes, system, derived) else { return Ok(()) };
+    with_registry(|reg| reg.wanted.extend(spec.parts.iter().map(|p| p.key.clone())));
     let total: usize = spec.parts.iter().filter(|p| !p.path.exists()).map(|p| p.rows).sum();
     let mut done = 0;
     for part in &spec.parts {

@@ -115,7 +115,15 @@ pub struct AggResult {
     pub group_values: Vec<Option<String>>,
     pub incompatible_units: Vec<usize>,
     pub value_units: Vec<String>,
+    /// Groups left out beyond [`MAX_GROUPS`] (the smallest by the first measure).
+    pub omitted_groups: usize,
+    /// Records counted in the omitted groups, when a count is among the measures.
+    pub omitted_records: u64,
 }
+
+/// Groups returned at most. Values with millions of distinct groups (ids,
+/// messages) would otherwise produce payloads the interface cannot render.
+pub(crate) const MAX_GROUPS: usize = 50_000;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -750,11 +758,12 @@ fn cached_matches(
         matched
     });
 
-    if !crate::operations::cancelled() {
+    // Recent selections stay in memory within a budget: 16 lists and 1/16
+    // of the installed memory (at most 512 MB); huge lists are not kept.
+    let budget = (crate::resources::total_memory() / 16).min(512 << 20) as usize;
+    let size = |entry: &MatchCacheEntry| entry.matches.len() * std::mem::size_of::<usize>();
+    if !crate::operations::cancelled() && matched.len() * std::mem::size_of::<usize>() <= budget / 2 {
         let mut cache = MATCH_CACHE.lock();
-        if cache.len() >= 16 {
-            cache.remove(0);
-        }
         cache.push(MatchCacheEntry {
             idx_id,
             idx_identity: idx_identity.to_string(),
@@ -764,6 +773,11 @@ fn cached_matches(
             codes_count,
             matches: Arc::new(matched.clone()),
         });
+        let mut total: usize = cache.iter().map(size).sum();
+        while cache.len() > 16 || total > budget {
+            total -= size(&cache[0]);
+            cache.remove(0);
+        }
     }
 
     matched
@@ -1250,6 +1264,31 @@ pub(crate) fn build_agg_result(
         }
     }
 
+    // Only the largest groups by the first measure are returned.
+    let mut omitted_groups = 0;
+    let mut omitted_records = 0u64;
+    if order.len() > MAX_GROUPS && !specs.is_empty() {
+        let score = |key: &Option<String>| match groups[key][0].finish(&specs[0].column) {
+            Value::Number(n) => n.as_f64().unwrap_or(f64::NEG_INFINITY),
+            _ => f64::NEG_INFINITY,
+        };
+        let scores: Vec<f64> = order.iter().map(score).collect();
+        let mut ranked: Vec<usize> = (0..order.len()).collect();
+        ranked.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+        let mut kept = vec![false; order.len()];
+        for &i in &ranked[..MAX_GROUPS] {
+            kept[i] = true;
+        }
+        let counted = specs.iter().position(|s| s.func == "count");
+        omitted_groups = order.len() - MAX_GROUPS;
+        for (key, _) in order.iter().zip(&kept).filter(|(_, kept)| !**kept) {
+            if let Some(Acc::Count(n)) = counted.map(|c| &groups[key][c]) {
+                omitted_records += n;
+            }
+        }
+        order = order.into_iter().zip(kept).filter(|(_, kept)| *kept).map(|(key, _)| key).collect();
+    }
+
     let group_values = order.clone();
     let rows = order
         .into_iter()
@@ -1280,6 +1319,8 @@ pub(crate) fn build_agg_result(
         group_values,
         incompatible_units,
         value_units,
+        omitted_groups,
+        omitted_records,
     }
 }
 

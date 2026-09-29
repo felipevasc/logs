@@ -342,12 +342,17 @@ pub(crate) fn build(
     progress: &(dyn Fn(usize, usize) + Sync),
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Outcome, String> {
-    let pending = target.with_extension("pending");
+    // Each process writes its own file, so two open windows never collide.
+    let pending = target.with_extension(format!("{}.pending", std::process::id()));
     remove_database(&pending);
     let result = write(source, &pending, derived, catalogs, progress, cancelled);
     match result {
         Ok(outcome) => {
-            let _ = std::fs::remove_file(target);
+            // Another window may have finished the same store meanwhile.
+            if target.exists() {
+                remove_database(&pending);
+                return Ok(outcome);
+            }
             std::fs::rename(&pending, target).map_err(|e| {
                 remove_database(&pending);
                 format!("Não foi possível concluir o índice de consultas: {e}")
@@ -370,8 +375,6 @@ pub(crate) fn remove_database(path: &Path) {
 
 /// Lines parsed and converted per parallel task.
 const CHUNK: usize = 2_048;
-/// Lines handed to the thread pool at a time, for one writer.
-const STEP: usize = 16 * CHUNK;
 
 /// Field facts of one chunk that the store records for query translation.
 #[derive(Default)]
@@ -409,17 +412,21 @@ fn write(
         wide_fields.iter().enumerate().map(|(i, k)| (k.clone(), i)).collect();
     let schema = table_schema(wide_fields.len());
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    super::limit_resources(&conn);
     create_table(&conn, &wide_names).map_err(|e| e.to_string())?;
     // Each writer appends one contiguous share of the file inside its own
     // transaction: full row groups go straight to the file, compressed in
     // parallel, instead of a commit, log write and checkpoint per batch.
-    let writers = (rayon::current_num_threads() / 4).clamp(1, 4);
+    // Machines with little memory keep one writer and smaller batches.
+    let low_memory = crate::resources::low_memory();
+    let writers = if low_memory { 1 } else { (crate::resources::workers() / 4).clamp(1, 4) };
+    let step = CHUNK * if low_memory { 4 } else { 16 };
     let mut connections = Vec::with_capacity(writers);
     for _ in 1..writers {
         connections.push(conn.try_clone().map_err(|e| e.to_string())?);
     }
     connections.push(conn);
-    let share = total.div_ceil(writers).div_ceil(STEP) * STEP;
+    let share = total.div_ceil(writers).div_ceil(step) * step;
     let mut cursors: Vec<(usize, usize)> =
         (0..writers).map(|k| ((k * share).min(total), ((k + 1) * share).min(total))).collect();
 
@@ -429,9 +436,10 @@ fn write(
         let mut senders = Vec::with_capacity(writers);
         let mut handles = Vec::with_capacity(writers);
         for conn in connections {
-            let (sender, receiver) = std::sync::mpsc::sync_channel::<RecordBatch>(STEP / CHUNK);
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<RecordBatch>(step / CHUNK);
             senders.push(sender);
             handles.push(scope.spawn(move || -> Result<Connection, String> {
+                crate::resources::lower_priority();
                 let mut busy = std::time::Duration::ZERO;
                 conn.execute_batch("BEGIN TRANSACTION").map_err(|e| e.to_string())?;
                 {
@@ -465,7 +473,7 @@ fn write(
                 writer = (writer + 1) % writers;
             }
             let start = cursors[writer].0;
-            let end = (start + STEP).min(cursors[writer].1);
+            let end = (start + step).min(cursors[writer].1);
             let chunks: Vec<usize> = (start..end).step_by(CHUNK).collect();
             let parts: Vec<(RecordBatch, Facts)> = chunks
                 .into_par_iter()
