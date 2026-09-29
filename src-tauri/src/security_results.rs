@@ -325,6 +325,24 @@ impl Writer {
 }
 
 impl Results {
+    /// Copies the analysis to `path` with its metadata beside it, so a later
+    /// session opens it instead of correlating the whole source again.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        let tmp = path.with_extension("tmp");
+        let _ = std::fs::remove_file(&tmp);
+        self.db.lock().execute("VACUUM INTO ?1", [tmp.to_string_lossy()]).map_err(err)?;
+        std::fs::write(path.with_extension("json"), self.metadata.to_string()).map_err(err)?;
+        std::fs::rename(&tmp, path).map_err(err)
+    }
+
+    pub fn open(path: &std::path::Path) -> Result<Arc<Results>, String> {
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("json")).map_err(err)?).map_err(err)?;
+        let db = Connection::open(path).map_err(err)?;
+        db.execute_batch("PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; PRAGMA mmap_size=0;").map_err(err)?;
+        Ok(Arc::new(Results { db: Mutex::new(db), metadata }))
+    }
+
     pub fn contains_member(&self, reference: &str, event: usize) -> Result<bool, String> {
         row(
             &self.db.lock(),

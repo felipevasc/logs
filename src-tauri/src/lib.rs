@@ -1774,7 +1774,10 @@ fn work_events(
     match &*source {
         SourceData::Indexed(idx) => {
             let matched = query::indexed_matches(idx, &filters, &codes, &system, &derived);
+            // Scattered lines are read in parallel (slow disks read them one by one otherwise).
+            use rayon::prelude::*;
             (0..matched.len().min(ANALYSIS_CAP))
+                .into_par_iter()
                 .map(|s| {
                     sources::event_at(
                         idx,

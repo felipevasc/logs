@@ -796,6 +796,50 @@ pub fn visit_indexed_matches(
     visit_indexed_prepared(idx, &pfs, codes, system, derived, visit);
 }
 
+/// Visits matching events in file order; they are parsed in parallel batches.
+pub(crate) fn visit_indexed_events(
+    idx: &FileIndex,
+    pfs: &[PreparedFilter],
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+    mut visit: impl FnMut(usize, &Event),
+) {
+    visit_indexed_mapped(idx, pfs, codes, system, derived, |_| (), |i, event, ()| visit(i, event));
+}
+
+/// Like [`visit_indexed_events`], with `map` run in parallel on each event
+/// and its result handed to `visit` in file order.
+pub(crate) fn visit_indexed_mapped<T: Send>(
+    idx: &FileIndex,
+    pfs: &[PreparedFilter],
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+    map: impl Fn(&Event) -> T + Sync,
+    mut visit: impl FnMut(usize, &Event, T),
+) {
+    let mut ids = Vec::new();
+    visit_indexed_prepared(idx, pfs, codes, system, derived, |i| ids.push(i));
+    let generation = crate::operations::current_generation();
+    for chunk in ids.chunks(8192) {
+        if crate::operations::cancelled_for(generation) {
+            return;
+        }
+        let events: Vec<(Event, T)> = chunk
+            .par_iter()
+            .map(|&i| {
+                let event = crate::sources::event_at(idx, i, codes, system, derived);
+                let mapped = map(&event);
+                (event, mapped)
+            })
+            .collect();
+        for (&i, (event, mapped)) in chunk.iter().zip(events) {
+            visit(i, &event, mapped);
+        }
+    }
+}
+
 /// Lines per parallel work unit. Batches keep memory bounded and results in order.
 const SCAN_CHUNK: usize = 8192;
 

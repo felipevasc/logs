@@ -200,9 +200,14 @@ impl View<'_> {
             Records::Empty => unreachable!(),
         }
     }
-    fn scan(
+    fn scan(&self, mut visit: impl FnMut(usize, &Event) -> Result<(), String>) -> Result<(), String> {
+        self.scan_mapped(|_| (), |i, event, ()| visit(i, event))
+    }
+    /// Like `scan`, with `map` run in parallel on each indexed event.
+    fn scan_mapped<T: Send>(
         &self,
-        mut visit: impl FnMut(usize, &Event) -> Result<(), String>,
+        map: impl Fn(&Event) -> T + Sync,
+        mut visit: impl FnMut(usize, &Event, T) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut failure = None;
         match self.records {
@@ -212,19 +217,20 @@ impl View<'_> {
                         operations::check()?;
                     }
                     if self.prepared.iter().all(|f| query::matches(event, f)) {
-                        visit(i, event)?;
+                        visit(i, event, map(event))?;
                     }
                 }
             }
-            Records::Indexed(file) => query::visit_indexed_prepared(
+            Records::Indexed(file) => query::visit_indexed_mapped(
                 file,
                 &self.prepared,
                 self.codes,
                 self.system,
                 self.derived,
-                |i| {
+                map,
+                |i, event, mapped| {
                     if failure.is_none() {
-                        if let Err(error) = visit(i, &self.fetch(i)) {
+                        if let Err(error) = visit(i, event, mapped) {
                             failure = Some(error);
                         }
                     }
@@ -289,11 +295,22 @@ pub(crate) fn fields_impl(
     with_view(state, filters, case, |view| {
         let mut fields = BTreeMap::<String, FieldAcc>::new();
         let (mut total, mut bytes, mut limited) = (0, 0usize, false);
-        view.scan(|_, event| {
+        // Values are extracted in parallel; counting stays in file order.
+        let extract = |event: &Event| {
+            let canonical: Vec<(&str, String)> =
+                CANONICAL.iter().filter_map(|column| key(event, column).map(|value| (*column, value))).collect();
+            let own: Vec<(String, String)> = event
+                .fields
+                .iter()
+                .filter(|(name, value)| valid_field(name).is_ok() && (value.is_string() || value.is_number()))
+                .filter_map(|(name, _)| key(event, name).map(|value| (name.clone(), value)))
+                .collect();
+            (canonical, own)
+        };
+        view.scan_mapped(extract, |_, _, (canonical, own)| {
             total += 1;
             // Canonical entities link the same user, address or host across formats.
-            for column in CANONICAL {
-                let Some(value) = key(event, column) else { continue };
+            for (column, value) in canonical {
                 let acc = fields.entry((*column).to_string()).or_default();
                 acc.present += 1;
                 if !acc.values.contains(&value) {
@@ -305,18 +322,12 @@ pub(crate) fn fields_impl(
                     }
                 }
             }
-            for (name, value) in &event.fields {
-                if valid_field(name).is_err() || !value.is_string() && !value.is_number() {
-                    continue;
-                }
-                let Some(value) = key(event, name) else {
-                    continue;
-                };
-                if !fields.contains_key(name) && fields.len() >= FIELD_CAP {
+            for (name, value) in own {
+                if !fields.contains_key(&name) && fields.len() >= FIELD_CAP {
                     limited = true;
                     continue;
                 }
-                let acc = fields.entry(name.clone()).or_default();
+                let acc = fields.entry(name).or_default();
                 acc.present += 1;
                 if !acc.values.contains(&value) {
                     if acc.values.len() >= DISTINCT_CAP

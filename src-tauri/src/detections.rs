@@ -477,7 +477,7 @@ impl RuleSet {
     }
 }
 
-fn fingerprint() -> u64 {
+pub(crate) fn fingerprint() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let stamp = |path: &std::path::Path, h: &mut std::collections::hash_map::DefaultHasher| {

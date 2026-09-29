@@ -64,6 +64,19 @@ pub fn stored_analysis(
             return Ok(hit);
         }
     }
+    // Analyses of indexed files are kept on disk across sessions.
+    let saved = case_events
+        .is_none()
+        .then(|| saved_path(state, &settings, catalog.as_deref(), &expired))
+        .flatten();
+    if let (Some(path), false) = (&saved, force) {
+        if path.exists() {
+            if let Ok(hit) = crate::security_results::Results::open(path) {
+                detections::remember(key, hit.clone());
+                return Ok(hit);
+            }
+        }
+    }
     let inputs = detections::Inputs { rules: &rules, catalog: catalog.as_deref(), settings: &settings };
     let result = match case_events {
         Some(events) => detections::run_stored(&inputs, &Source::Events(events.iter().collect()))?,
@@ -74,8 +87,68 @@ pub fn stored_analysis(
     crate::operations::check()?;
     if result.metadata.get("complete").and_then(|v| v.as_bool()).unwrap_or(false) {
         detections::remember(key, result.clone());
+        if let Some(path) = saved {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+                prune_saved(dir);
+            }
+            if let Err(error) = result.save(&path) {
+                eprintln!("[triage] análise não salva: {error}");
+            }
+        }
     }
     Ok(result)
+}
+
+/// File of the saved analysis of the indexed source with the current rules,
+/// catalog, settings and derived fields; `None` for sources held in memory.
+fn saved_path(
+    state: &AppState,
+    settings: &Settings,
+    catalog: Option<&crate::threats::CompiledCatalog>,
+    expired: &[bool],
+) -> Option<std::path::PathBuf> {
+    use sha2::{Digest, Sha256};
+    let source = source_key(state);
+    if !source.starts_with("idx:") {
+        return None;
+    }
+    let derived: Vec<String> = state
+        .derived
+        .read()
+        .iter()
+        .map(|d| {
+            let rules: Vec<String> = d
+                .rules
+                .iter()
+                .map(|r| format!("{}|{:?}|{}", r.re.as_str(), r.template, serde_json::to_string(&r.filter).unwrap_or_default()))
+                .collect();
+            format!("{}|{}|{rules:?}", d.name, d.source)
+        })
+        .collect();
+    let mut hash = Sha256::new();
+    hash.update(env!("CARGO_PKG_VERSION"));
+    hash.update(source);
+    hash.update(detections::fingerprint().to_le_bytes());
+    hash.update(serde_json::to_string(settings).unwrap_or_default());
+    hash.update(catalog.map(|c| c.signature()).unwrap_or_default());
+    hash.update(format!("{derived:?}{expired:?}"));
+    Some(crate::config_dir().join("triage-v1").join(format!("{:x}.sqlite", hash.finalize())))
+}
+
+/// Keeps the 8 most recently saved analyses.
+fn prune_saved(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut saved: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "sqlite"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    saved.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in saved.into_iter().skip(7) {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json"));
+    }
 }
 
 #[cfg(test)]

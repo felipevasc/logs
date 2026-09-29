@@ -558,14 +558,24 @@ fn run_job(
     }
     let dir = job.target.parent().map(PathBuf::from).unwrap_or_else(engine_dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // Stores take about a third of the file; keep 1 GB free besides.
-    let needed = job.source.part.mmap.len() as u64 / 5 * 2 + (1 << 30);
+    // Size estimated from the stores built so far (text-heavy logs make
+    // stores as large as the file); 1 GB stays free besides.
+    let source_len = job.source.part.mmap.len() as u64;
+    let needed = source_len / 1000 * STORE_RATIO.load(Ordering::Relaxed) + (1 << 30);
+    prune(&job.target);
     if free_space(&dir).is_some_and(|free| free < needed) {
         return Err("Pouco espaço em disco para o índice de consultas rápidas.".into());
     }
-    prune(&job.target);
     let catalogs = job.catalogs.as_ref().map(|(c, s)| (c, s));
-    build::build(job.source, &job.target, &job.derived, catalogs, progress, cancelled).map(|_| ())
+    let target = job.target.clone();
+    build::build(job.source, &job.target, &job.derived, catalogs, progress, cancelled)?;
+    if let Ok(meta) = std::fs::metadata(&target) {
+        if source_len > 0 {
+            let ratio = (meta.len() * 1100 / source_len).clamp(100, 3000);
+            STORE_RATIO.fetch_max(ratio, Ordering::Relaxed);
+        }
+    }
+    Ok(())
 }
 
 /// Builds the missing stores now (file loads), reporting progress. Errors
@@ -628,6 +638,9 @@ pub(crate) fn prepare(
     Ok(())
 }
 
+/// Store size per 1000 bytes of source, highest seen (starts at 40%).
+static STORE_RATIO: AtomicU64 = AtomicU64::new(400);
+
 /// Keeps the store folder bounded: stale builds go first, then the least
 /// recently used stores beyond 30 days or the size budget.
 fn prune(keep: &std::path::Path) {
@@ -664,11 +677,16 @@ fn prune(keep: &std::path::Path) {
 }
 
 fn in_use_paths() -> HashSet<PathBuf> {
+    // The open session and every store of the source in use: pruning them
+    // would only make the app build them again, in a loop.
     with_registry(|reg| {
-        reg.session
+        let mut paths: HashSet<PathBuf> = reg
+            .session
             .as_ref()
             .map(|s| s.key.split(',').filter_map(|p| p.split('@').next()).map(|k| engine_dir().join(format!("{k}.duckdb"))).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        paths.extend(reg.wanted.iter().map(|k| engine_dir().join(format!("{k}.duckdb"))));
+        paths
     })
 }
 

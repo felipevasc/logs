@@ -4,7 +4,7 @@ use crate::{
     model::Event,
     operations,
     query::{self, Filter},
-    sources, AppState, SourceData,
+    AppState, SourceData,
 };
 use parking_lot::Mutex;
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
@@ -230,6 +230,11 @@ pub(crate) struct Hit {
 }
 
 impl CompiledCatalog {
+    /// Text identifying the catalog rules (saved analyses depend on it).
+    pub(crate) fn signature(&self) -> String {
+        serde_json::to_string(&self.file).unwrap_or_default()
+    }
+
     pub(crate) fn rule(&self, index: usize) -> &Rule {
         &self.file.rules[index]
     }
@@ -787,16 +792,24 @@ fn visit(
     filters: &[Filter],
     case: Option<&[Event]>,
     catalog: &Arc<CompiledCatalog>,
-    mut visitor: impl FnMut(&Event),
+    hits: bool,
+    mut visitor: impl FnMut(&Event, Corpus, Vec<usize>),
 ) {
     let prepared = query::prepare_with_threat_catalog(filters, Some(catalog));
+    // Text and rule hits are computed in parallel with the parsing.
+    let analyze = |event: &Event| {
+        let body = corpus(event);
+        let ids = if hits && !catalog.enabled.is_empty() { body.hits(catalog) } else { Vec::new() };
+        (body, ids)
+    };
     let mut memory = |events: &[Event]| {
         for event in events {
             if operations::cancelled() {
                 break;
             }
             if prepared.iter().all(|pf| query::matches(event, pf)) {
-                visitor(event);
+                let (body, ids) = analyze(event);
+                visitor(event, body, ids);
             }
         }
     };
@@ -811,8 +824,8 @@ fn visit(
             let codes = state.codes.read();
             let system = state.system_codes.read();
             let derived = state.derived.read();
-            query::visit_indexed_prepared(index, &prepared, &codes, &system, &derived, |i| {
-                visitor(&sources::event_at(index, i, &codes, &system, &derived))
+            query::visit_indexed_mapped(index, &prepared, &codes, &system, &derived, analyze, |_, event, (body, ids)| {
+                visitor(event, body, ids)
             });
         }
         SourceData::None => {}
@@ -845,11 +858,10 @@ fn scan_impl(
     let mut sources = crate::distinct::Terms::default();
     let mut timeline = Timeline::new();
     let (mut start, mut end) = (None, None);
-    visit(state, &ordinary, case.as_deref(), &catalog, |event| {
+    visit(state, &ordinary, case.as_deref(), &catalog, true, |event, body, ids| {
         if operations::cancelled() {
             return;
         }
-        let body = corpus(event);
         clipped += usize::from(body.clipped);
         if !predicates.iter().all(|predicate| predicate.matches_corpus(&body)) {
             return;
@@ -861,7 +873,6 @@ fn scan_impl(
         if catalog.enabled.is_empty() {
             return;
         }
-        let ids = body.hits(&catalog);
         if ids.is_empty() {
             return;
         }
@@ -958,11 +969,10 @@ fn events_impl(
     validate_local(&filters, &catalog)?;
     let (ordinary, predicates) = split_filters(&filters, &catalog)?;
     let mut result = EventResult { total: 0, rows: vec![], complete: true, clipped_records: 0, rows_clipped: 0 };
-    visit(state, &ordinary, case.as_deref(), &catalog, |event| {
+    visit(state, &ordinary, case.as_deref(), &catalog, false, |event, body, _| {
         if operations::cancelled() {
             return;
         }
-        let body = corpus(event);
         result.clipped_records += usize::from(body.clipped);
         if !predicates.iter().all(|predicate| predicate.matches_corpus(&body)) {
             return;
@@ -1163,10 +1173,10 @@ mod tests {
             writeln!(file,"{}",serde_json::json!({"timestamp":1700000000000i64+i*1000,"source":if i%2==0{"API"}else{"api"},"message":if i>=10000{"attack alpha"}else{"ordinary"}})).unwrap();
         }
         file.flush().unwrap();
-        let index = sources::index_file(file.path().to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let index = crate::sources::index_file(file.path().to_str().unwrap(), "jsonl", None, None, None).unwrap();
         let codes = crate::model::CodesConfig::default();
         let events: Vec<_> =
-            (0..index.lines.len()).map(|i| sources::event_at(&index, i, &codes, &codes, &[])).collect();
+            (0..index.lines.len()).map(|i| crate::sources::event_at(&index, i, &codes, &codes, &[])).collect();
         let indexed = state(SourceData::Indexed(index));
         let memory = state(SourceData::Memory(events.clone()));
         let catalog = catalog();
