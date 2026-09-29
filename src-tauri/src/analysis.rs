@@ -254,24 +254,24 @@ pub struct SeriesSpec {
 
 #[derive(Serialize)]
 pub struct SeriesResult {
-    kind: String,
-    unit: String, // number | bytes | bits | duration
-    interval_ms: i64,
+    pub(crate) kind: String,
+    pub(crate) unit: String, // number | bytes | bits | duration
+    pub(crate) interval_ms: i64,
     /// "time": epoch ms do bucket; "terms": rótulo
-    x: Vec<Value>,
+    pub(crate) x: Vec<Value>,
     /// Exact category values for terms charts; None means missing/empty.
-    x_values: Vec<Option<String>>,
-    series: Vec<SeriesData>,
-    incompatible_units: usize,
+    pub(crate) x_values: Vec<Option<String>>,
+    pub(crate) series: Vec<SeriesData>,
+    pub(crate) incompatible_units: usize,
 }
 
 #[derive(Serialize)]
 pub struct SeriesData {
-    name: String,
-    points: Vec<f64>,
+    pub(crate) name: String,
+    pub(crate) points: Vec<f64>,
     /// Values admitted to each accumulator; zero identifies an empty numeric bucket.
     /// Count includes all records; distinct includes records with a nonempty value.
-    samples: Vec<usize>,
+    pub(crate) samples: Vec<usize>,
 }
 
 struct MetricAcc {
@@ -367,6 +367,11 @@ fn dominant_unit(events: impl Iterator<Item = Event>, field: &str, sample: usize
             valid += 1;
         }
     }
+    dominant_of(votes)
+}
+
+/// Most frequent unit among sampled values (ties favor the lower kind).
+pub(crate) fn dominant_of(votes: [usize; 5]) -> UnitKind {
     votes
         .into_iter()
         .enumerate()
@@ -380,7 +385,7 @@ fn dominant_unit(events: impl Iterator<Item = Event>, field: &str, sample: usize
         .unwrap_or(UnitKind::Number)
 }
 
-fn unit_name(u: UnitKind) -> String {
+pub(crate) fn unit_name(u: UnitKind) -> String {
     match u {
         UnitKind::Bytes => "bytes",
         UnitKind::Bits => "bits",
@@ -434,22 +439,8 @@ where
             incompatible_units: 0,
         };
     }
-    let unit = match (spec.unit.as_deref(), field) {
-        (Some(u), _) if u != "auto" => u.to_string(),
-        (Some(_), None) | (None, None) => "number".to_string(),
-        (_, Some(f)) => unit_name(dominant_unit(events(), f, 500)),
-    };
-    let expected_unit = if matches!(spec.metric.as_str(), "count" | "distinct") {
-        None
-    } else {
-        match unit.as_str() {
-            "number" => Some(UnitKind::Number),
-            "bytes" => Some(UnitKind::Bytes),
-            "bits" => Some(UnitKind::Bits),
-            "duration" => Some(UnitKind::DurationMs),
-            _ => None,
-        }
-    };
+    let unit = series_unit(spec, |f| dominant_unit(events(), f, 500));
+    let expected_unit = expected_unit(spec, &unit);
     let mut incompatible_units = 0;
 
     // splits: top N valores do campo de split
@@ -543,33 +534,7 @@ where
         };
     }
     let (tmin, tmax) = bounds.unwrap();
-    let interval = spec.interval_ms.filter(|n| *n > 0).unwrap_or_else(|| {
-        let span = tmax.saturating_sub(tmin).max(1);
-        // ~60 buckets; escolhe intervalo "redondo"
-        let target = span / 60;
-        for nice in [
-            1_000i64,
-            5_000,
-            15_000,
-            60_000,
-            300_000,
-            900_000,
-            1_800_000,
-            3_600_000,
-            21_600_000,
-            43_200_000,
-            86_400_000,
-            604_800_000,
-            2_592_000_000,
-        ] {
-            if target <= nice {
-                return nice;
-            }
-        }
-        2_592_000_000
-    });
-    let interval = interval.max((tmax.saturating_sub(tmin) / 2000).max(1));
-    let n_buckets = (tmax.saturating_sub(tmin) / interval + 1) as usize;
+    let (interval, n_buckets) = series_interval(spec, tmin, tmax);
 
     let mut accs: Vec<HashMap<String, MetricAcc>> =
         (0..n_buckets).map(|_| HashMap::new()).collect();
@@ -625,6 +590,62 @@ where
             .collect(),
         incompatible_units,
     }
+}
+
+/// Unit of a series: explicit, or the dominant unit of the metric field.
+pub(crate) fn series_unit(spec: &SeriesSpec, dominant: impl FnOnce(&str) -> UnitKind) -> String {
+    match (spec.unit.as_deref(), spec.field.as_deref()) {
+        (Some(u), _) if u != "auto" => u.to_string(),
+        (Some(_), None) | (None, None) => "number".to_string(),
+        (_, Some(f)) => unit_name(dominant(f)),
+    }
+}
+
+/// Unit values must have to enter numeric metrics (none for counts).
+pub(crate) fn expected_unit(spec: &SeriesSpec, unit: &str) -> Option<UnitKind> {
+    if matches!(spec.metric.as_str(), "count" | "distinct") {
+        None
+    } else {
+        match unit {
+            "number" => Some(UnitKind::Number),
+            "bytes" => Some(UnitKind::Bytes),
+            "bits" => Some(UnitKind::Bits),
+            "duration" => Some(UnitKind::DurationMs),
+            _ => None,
+        }
+    }
+}
+
+/// Bucket width and count of a time series spanning `[tmin, tmax]`.
+pub(crate) fn series_interval(spec: &SeriesSpec, tmin: i64, tmax: i64) -> (i64, usize) {
+    let interval = spec.interval_ms.filter(|n| *n > 0).unwrap_or_else(|| {
+        let span = tmax.saturating_sub(tmin).max(1);
+        // ~60 buckets; escolhe intervalo "redondo"
+        let target = span / 60;
+        for nice in [
+            1_000i64,
+            5_000,
+            15_000,
+            60_000,
+            300_000,
+            900_000,
+            1_800_000,
+            3_600_000,
+            21_600_000,
+            43_200_000,
+            86_400_000,
+            604_800_000,
+            2_592_000_000,
+        ] {
+            if target <= nice {
+                return nice;
+            }
+        }
+        2_592_000_000
+    });
+    let interval = interval.max((tmax.saturating_sub(tmin) / 2000).max(1));
+    let n_buckets = (tmax.saturating_sub(tmin) / interval + 1) as usize;
+    (interval, n_buckets)
 }
 
 // ------------------------------------------------------------------ pivô OLAP

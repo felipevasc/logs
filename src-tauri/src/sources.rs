@@ -1565,6 +1565,7 @@ pub struct TsRule {
 }
 
 /// TsConfig com as regexes já compiladas.
+#[derive(Clone)]
 pub struct CompiledTsConfig {
     pub timezone_offset_minutes: Option<i32>,
     pub clock_adjustment_ms: i64,
@@ -1666,12 +1667,14 @@ impl DerivedFieldCompat {
     }
 }
 
+#[derive(Clone)]
 pub struct CompiledRule {
     pub re: regex::Regex,
     pub template: Option<String>,
     pub filter: Option<crate::query::Filter>,
 }
 
+#[derive(Clone)]
 pub struct CompiledDerived {
     pub name: String,
     pub source: String,
@@ -1727,7 +1730,8 @@ pub struct FilePart {
     pub custom: Option<CustomParse>,
     pub ts_config: Option<CompiledTsConfig>,
     pub header: Vec<String>,
-    pub mmap: memmap2::Mmap,
+    /// Shared so the query engine can read lines while it builds its store.
+    pub mmap: std::sync::Arc<memmap2::Mmap>,
     pub base: u64,
     pub identity: String,
 }
@@ -2623,7 +2627,7 @@ pub fn index_file(
             custom,
             ts_config: saved_ts,
             header,
-            mmap,
+            mmap: std::sync::Arc::new(mmap),
             base: 0,
             identity,
         }],

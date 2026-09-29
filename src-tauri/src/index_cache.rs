@@ -116,7 +116,7 @@ pub fn open(
                 custom,
                 ts_config: ts,
                 header: header.header,
-                mmap,
+                mmap: std::sync::Arc::new(mmap),
                 base: 0,
                 identity: id,
             }],

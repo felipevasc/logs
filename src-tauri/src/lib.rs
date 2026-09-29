@@ -17,6 +17,7 @@ mod security_budget;
 mod security_reconstruct;
 mod discovery;
 mod distinct;
+mod engine;
 mod entities;
 mod event_preview;
 mod index_cache;
@@ -403,6 +404,7 @@ pub(crate) fn load_file_impl(
         "linhas",
         false,
     );
+    prepare_engine(state, &idx, app)?;
     let mut source = state.source.write();
     let mut idx = idx;
     let mut names = vec![format!("Arquivo: {path}")];
@@ -450,6 +452,17 @@ pub(crate) fn load_file_impl(
     Ok(summary)
 }
 
+/// Builds the query engine's stores for newly indexed files (cached per
+/// file), so the first queries are already fast. Opening takes longer once.
+fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Option<&AppHandle>) -> Result<(), String> {
+    let codes = state.codes.read().clone();
+    let system = state.system_codes.read().clone();
+    let derived = state.derived.read().clone();
+    engine::prepare(idx, &codes, &system, &derived, &|done, total| {
+        emit_progress(app, "carregamento", "Preparando consultas rápidas", done, total, "linhas", false);
+    })
+}
+
 #[tauri::command]
 async fn load_files(
     paths: Vec<String>,
@@ -487,8 +500,10 @@ pub(crate) fn load_files_impl(
         names.push(format!("Arquivo: {path}"));
     }
     operations::check()?;
+    let idx = indices.unwrap();
+    prepare_engine(state, &idx, app)?;
     let mut source = state.source.write();
-    let mut idx = indices.unwrap();
+    let mut idx = idx;
     if merge.unwrap_or(false) {
         match std::mem::replace(&mut *source, SourceData::None) {
             SourceData::Indexed(mut previous) => {
@@ -1541,14 +1556,12 @@ pub(crate) fn count_filtered_impl(
     let source = state.source.read();
     match &*source {
         SourceData::Memory(events) => query::filtered_indices(events, &filters).len(),
-        SourceData::Indexed(idx) => query::indexed_matches(
-            idx,
-            &filters,
-            &state.codes.read(),
-            &state.system_codes.read(),
-            &state.derived.read(),
-        )
-        .len(),
+        SourceData::Indexed(idx) => {
+            let (codes, system, derived) = (state.codes.read(), state.system_codes.read(), state.derived.read());
+            let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
+            engine::count(&src, &filters)
+                .unwrap_or_else(|| query::indexed_matches(idx, &filters, &codes, &system, &derived).len())
+        }
         SourceData::None => 0,
     }
 }
@@ -1857,6 +1870,10 @@ pub(crate) fn compute_series_impl(
     let derived = state.derived.read();
     match &*source {
         SourceData::Indexed(idx) => {
+            let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
+            if let Some(result) = engine::series(&src, &query::prepare(&filters), &spec) {
+                return result;
+            }
             let matched = query::indexed_matches(idx, &filters, &codes, &system, &derived);
             analysis::compute_series_stream(
                 || {
@@ -1908,6 +1925,10 @@ pub(crate) fn pivot_impl(
     let derived = state.derived.read();
     match &*source {
         SourceData::Indexed(idx) => {
+            let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
+            if let Some(result) = engine::pivot(&src, &query::prepare(&filters), &spec) {
+                return result;
+            }
             let matched = query::indexed_matches(idx, &filters, &codes, &system, &derived);
             analysis::pivot_stream(
                 matched
@@ -1950,6 +1971,7 @@ pub(crate) fn save_codes_impl(state: &AppState, text: &str) -> Result<(), String
     let cfg: CodesConfig = serde_json::from_str(text).map_err(|e| format!("JSON inválido: {e}"))?;
     std::fs::write(&state.codes_path, text).map_err(|e| format!("Falha ao gravar: {e}"))?;
     *state.codes.write() = cfg;
+    engine::catalogs_changed();
     // Re-enriquece eventos em memória (fontes indexadas enriquecem sob demanda).
     let codes = state.codes.read().clone();
     let system = state.system_codes.read().clone();
@@ -1986,6 +2008,7 @@ pub(crate) fn harvest_codes_impl(state: &AppState) -> Result<HarvestSummary, Str
         let _ = std::fs::write(&state.system_codes_path, text);
     }
     *state.system_codes.write() = cfg;
+    engine::catalogs_changed();
     // Re-enriquece eventos em memória (fontes indexadas enriquecem sob demanda).
     let codes = state.codes.read().clone();
     let system = state.system_codes.read().clone();
@@ -2140,6 +2163,7 @@ pub fn run() {
                             let _ = std::fs::write(&state.system_codes_path, text);
                         }
                         *state.system_codes.write() = cfg;
+                        engine::catalogs_changed();
                     }
                 });
             }

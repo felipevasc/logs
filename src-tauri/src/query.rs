@@ -5,7 +5,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use parking_lot::Mutex;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,7 +29,7 @@ pub struct PreparedFilter {
     num2: Option<f64>,
     threat: Option<crate::threats::RuleMatcher>,
     /// Compiled search expression (`op = "query"`).
-    expr: Option<crate::querylang::Expr>,
+    pub(crate) expr: Option<crate::querylang::Expr>,
     /// Lowercased values for `in` / `not_in`.
     set: Option<std::collections::HashSet<String>>,
     /// Networks for `cidr` / `not_cidr`.
@@ -159,118 +158,107 @@ fn value_as_num(column: &str, s: &str) -> Option<f64> {
 
 pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
     let f = &pf.f;
-    if f.op == "threat_rule" {
-        return f.column == "_all"
-            && pf
-                .threat
-                .as_ref()
-                .is_some_and(|matcher| matcher.matches(ev));
-    }
-    if f.op == "query" {
+    let op = f.op.as_str();
+    match op {
+        "threat_rule" => {
+            return f.column == "_all"
+                && pf
+                    .threat
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.matches(ev))
+        }
         // An invalid expression was rejected by validation; never match silently.
-        return pf.expr.as_ref().is_some_and(|expr| expr.matches(ev));
+        "query" => return pf.expr.as_ref().is_some_and(|expr| expr.matches(ev)),
+        "detection" => {
+            return pf
+                .detection
+                .as_ref()
+                .is_some_and(|(set, index)| set.rules[*index].matches(ev))
+        }
+        "pattern" => return crate::insights::pattern_of(&ev.message) == f.value,
+        _ => {}
     }
-    if f.op == "detection" {
-        return pf
-            .detection
-            .as_ref()
-            .is_some_and(|(set, index)| set.rules[*index].matches(ev));
-    }
-    let col = f.column.as_str();
-    let needle = pf.needle_lower.as_str();
-    if let Some(set) = &pf.set {
-        if f.op == "in_exact" { return ev.col_ref(col).is_some_and(|v| set.contains(v.as_ref())); }
-        let hit = ev
-            .col_ref(col)
-            .is_some_and(|v| set.contains(&v.trim().to_lowercase()));
-        return (f.op == "in") == hit;
-    }
-    if matches!(f.op.as_str(), "cidr" | "not_cidr") {
-        let hit = ev
-            .col_ref(col)
-            .and_then(|v| crate::entities::parse_ip(&v))
-            .is_some_and(|ip| pf.nets.iter().any(|n| n.contains(ip)));
-        return (f.op == "cidr") == hit;
-    }
-    if f.op == "pattern" {
-        return crate::insights::pattern_of(&ev.message) == f.value;
-    }
-
-    if f.op == "regex" {
-        let hay: Cow<'_, str> = if col == "_all" {
-            Cow::Owned(format!("{}\n{}", ev.message, ev.raw))
-        } else {
-            ev.col_ref(col).unwrap_or(Cow::Borrowed(""))
-        };
-        return match &pf.regex {
-            Some(re) => re.is_match(&hay),
-            // regex inválida → contém (case-insensitive ASCII, como ci_contains_bytes)
-            None => false,
-        };
-    }
-
-    if col == "_all" {
+    if f.column == "_all" && !reads_all_as_column(op) {
         let text = format!("{}\n{}", ev.message, ev.raw);
-        return match f.op.as_str() {
-            "contains" => ci_contains_bytes(text.as_bytes(), needle.as_bytes()),
-            "not_contains" => !ci_contains_bytes(text.as_bytes(), needle.as_bytes()),
+        let needle = pf.needle_lower.as_bytes();
+        return match op {
+            "regex" => pf.regex.as_ref().is_some_and(|re| re.is_match(&text)),
+            "contains" => ci_contains_bytes(text.as_bytes(), needle),
+            "not_contains" => !ci_contains_bytes(text.as_bytes(), needle),
             _ => false,
         };
     }
-    match f.op.as_str() {
-        "contains" => ev
-            .col_ref(col)
-            .map(|s| ci_contains_bytes(s.as_bytes(), needle.as_bytes()))
-            .unwrap_or(false),
-        "not_contains" => ev
-            .col_ref(col)
-            .map(|s| !ci_contains_bytes(s.as_bytes(), needle.as_bytes()))
-            .unwrap_or(true),
-        "equals" => ev
-            .col_ref(col)
-            .map(|s| s.eq_ignore_ascii_case(f.value.trim()))
-            .unwrap_or(false),
-        "not_equals" => ev
-            .col_ref(col)
-            .map(|s| !s.eq_ignore_ascii_case(f.value.trim()))
-            .unwrap_or(true),
-        "equals_exact" => ev
-            .col_ref(col)
-            .map(|s| s.as_ref() == f.value)
-            .unwrap_or(false),
-        "not_equals_exact" => ev
-            .col_ref(col)
-            .map(|s| s.as_ref() != f.value)
-            .unwrap_or(true),
-        "starts_with" => ev
-            .col_ref(col)
-            .map(|s| {
-                let (hay, ndl) = (s.as_bytes(), needle.as_bytes());
-                hay.len() >= ndl.len() && hay[..ndl.len()].eq_ignore_ascii_case(ndl)
-            })
-            .unwrap_or(false),
-        "empty" => ev.col_ref(col).map(|s| s.trim().is_empty()).unwrap_or(true),
-        "not_empty" => ev
-            .col_ref(col)
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false),
-        "gt" | "gte" | "lt" | "lte" => {
-            let (Some(a), Some(b)) = (ev.col_num(col), pf.num) else {
-                return false;
-            };
-            match f.op.as_str() {
+    if is_numeric_op(op) {
+        return number_matches(pf, ev.col_num(&f.column));
+    }
+    value_matches(pf, ev.col_ref(&f.column).as_deref())
+}
+
+/// List and network operators read a column literally named `_all`.
+pub(crate) fn reads_all_as_column(op: &str) -> bool {
+    matches!(op, "in" | "not_in" | "in_exact" | "cidr" | "not_cidr")
+}
+
+pub(crate) fn is_numeric_op(op: &str) -> bool {
+    matches!(op, "gt" | "gte" | "lt" | "lte" | "between")
+}
+
+/// Numeric operators applied to the column's number (`None` when absent).
+pub(crate) fn number_matches(pf: &PreparedFilter, a: Option<f64>) -> bool {
+    let Some(a) = a else { return false };
+    match pf.f.op.as_str() {
+        "between" => match (pf.num, pf.num2) {
+            (Some(lo), Some(hi)) => a >= lo && a <= hi,
+            _ => false,
+        },
+        op => {
+            let Some(b) = pf.num else { return false };
+            match op {
                 "gt" => a > b,
                 "gte" => a >= b,
                 "lt" => a < b,
                 _ => a <= b,
             }
         }
-        "between" => {
-            let (Some(a), Some(lo), Some(hi)) = (ev.col_num(col), pf.num, pf.num2) else {
-                return false;
-            };
-            a >= lo && a <= hi
+    }
+}
+
+/// Text operators applied to the column's value (`None` when absent).
+pub(crate) fn value_matches(pf: &PreparedFilter, value: Option<&str>) -> bool {
+    let f = &pf.f;
+    let needle = pf.needle_lower.as_str();
+    if let Some(set) = &pf.set {
+        if f.op == "in_exact" {
+            return value.is_some_and(|v| set.contains(v));
         }
+        let hit = value.is_some_and(|v| set.contains(&v.trim().to_lowercase()));
+        return (f.op == "in") == hit;
+    }
+    match f.op.as_str() {
+        "cidr" | "not_cidr" => {
+            let hit = value
+                .and_then(crate::entities::parse_ip)
+                .is_some_and(|ip| pf.nets.iter().any(|n| n.contains(ip)));
+            (f.op == "cidr") == hit
+        }
+        // Regex inválida é rejeitada na validação; aqui nunca casa.
+        "regex" => pf
+            .regex
+            .as_ref()
+            .is_some_and(|re| re.is_match(value.unwrap_or(""))),
+        "contains" => value.is_some_and(|s| ci_contains_bytes(s.as_bytes(), needle.as_bytes())),
+        "not_contains" => value.is_none_or(|s| !ci_contains_bytes(s.as_bytes(), needle.as_bytes())),
+        "equals" => value.is_some_and(|s| s.eq_ignore_ascii_case(f.value.trim())),
+        "not_equals" => value.is_none_or(|s| !s.eq_ignore_ascii_case(f.value.trim())),
+        "equals_exact" => value.is_some_and(|s| s == f.value),
+        "not_equals_exact" => value.is_none_or(|s| s != f.value),
+        "starts_with" => value.is_some_and(|s| {
+            let (hay, ndl) = (s.as_bytes(), needle.as_bytes());
+            hay.len() >= ndl.len() && hay[..ndl.len()].eq_ignore_ascii_case(ndl)
+        }),
+        "empty" => value.is_none_or(|s| s.trim().is_empty()),
+        "not_empty" => value.is_some_and(|s| !s.trim().is_empty()),
+        op if is_numeric_op(op) => number_matches(pf, value.and_then(crate::model::text_number)),
         _ => false,
     }
 }
@@ -326,7 +314,7 @@ pub fn sort_indices(events: &[Event], indices: &mut [usize], column: &str, desc:
 
 // A mixed numeric/text comparator must keep the two kinds in a fixed order.
 // Falling back to text only for mixed pairs creates cycles (2 < 10 < 11x < 2).
-fn compare_sort_keys(a: Option<f64>, sa: &str, b: Option<f64>, sb: &str) -> std::cmp::Ordering {
+pub(crate) fn compare_sort_keys(a: Option<f64>, sa: &str, b: Option<f64>, sb: &str) -> std::cmp::Ordering {
     match (a.filter(|n| n.is_finite()), b.filter(|n| n.is_finite())) {
         (Some(a), Some(b)) => a.total_cmp(&b).then_with(|| sa.cmp(sb)),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -694,6 +682,38 @@ pub fn indexed_matches(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Vec<usize> {
+    cached_matches(idx, filters, codes, system, derived, true)
+}
+
+/// Same selection computed only by the line engine (raw-line searches that
+/// the query engine delegates).
+pub(crate) fn scan_matches(
+    idx: &FileIndex,
+    filters: &[Filter],
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> Vec<usize> {
+    cached_matches(idx, filters, codes, system, derived, false)
+}
+
+fn engine_source<'a>(
+    idx: &'a FileIndex,
+    codes: &'a CodesConfig,
+    system: &'a CodesConfig,
+    derived: &'a [CompiledDerived],
+) -> crate::engine::Source<'a> {
+    crate::engine::Source { idx, codes, system, derived }
+}
+
+fn cached_matches(
+    idx: &FileIndex,
+    filters: &[Filter],
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+    use_engine: bool,
+) -> Vec<usize> {
     if filters.is_empty() {
         return (0..idx.lines.len()).collect();
     }
@@ -718,8 +738,17 @@ pub fn indexed_matches(
         }
     }
 
-    let mut matched = Vec::new();
-    visit_indexed_matches(idx, filters, codes, system, derived, |i| matched.push(i));
+    let pfs = prepare(filters);
+    let engine = if use_engine {
+        crate::engine::matches(&engine_source(idx, codes, system, derived), &pfs)
+    } else {
+        None
+    };
+    let matched = engine.unwrap_or_else(|| {
+        let mut matched = Vec::new();
+        scan_indexed(idx, &pfs, codes, system, derived, |i, _, _| i, |i| matched.push(i));
+        matched
+    });
 
     if !crate::operations::cancelled() {
         let mut cache = MATCH_CACHE.lock();
@@ -841,8 +870,21 @@ pub(crate) fn visit_indexed_prepared(
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-    visit: impl FnMut(usize),
+    mut visit: impl FnMut(usize),
 ) {
+    if pfs.is_empty() {
+        for i in 0..idx.lines.len() {
+            if i % 8192 == 0 && crate::operations::cancelled() {
+                return;
+            }
+            visit(i);
+        }
+        return;
+    }
+    if let Some(ids) = crate::engine::matches(&engine_source(idx, codes, system, derived), pfs) {
+        ids.into_iter().for_each(visit);
+        return;
+    }
     scan_indexed(idx, pfs, codes, system, derived, |i, _, _| i, visit);
 }
 
@@ -883,6 +925,16 @@ pub fn query_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> QueryResult {
+    if let Some(result) = crate::engine::query(
+        &engine_source(idx, codes, system, derived),
+        &prepare(filters),
+        sort_column,
+        sort_dir,
+        offset,
+        limit,
+    ) {
+        return result;
+    }
     let matched = indexed_matches(idx, filters, codes, system, derived);
     query_from_indexed_matches(
         idx,
@@ -943,9 +995,11 @@ fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
 // Agregações
 // ==========================================================================
 
-enum Acc {
+pub(crate) enum Acc {
     Count(u64),
     CountDistinct(crate::distinct::Counter),
+    /// Distinct count computed elsewhere (query engine).
+    Distinct(u64),
     Sum(f64, [usize; 5]),
     Avg(f64, u64, [usize; 5]),
     Min(Option<f64>, [usize; 5]),
@@ -983,6 +1037,7 @@ impl Acc {
                     set.insert(s);
                 }
             }
+            Acc::Distinct(_) => {}
             Acc::Sum(n, units) => {
                 if let Some((v, unit)) = numeric() {
                     *n += v;
@@ -1034,6 +1089,7 @@ impl Acc {
         match self {
             Acc::Count(n) => Value::from(*n),
             Acc::CountDistinct(set) => Value::from(set.len() as u64),
+            Acc::Distinct(n) => Value::from(*n),
             Acc::Sum(n, _) => round2(*n).into(),
             Acc::Avg(sum, n, _) => {
                 if *n == 0 {
@@ -1112,6 +1168,9 @@ pub fn multi_count_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Vec<(String, AggResult)> {
+    if let Some(result) = crate::engine::multi_count(&engine_source(idx, codes, system, derived), filters, columns) {
+        return result;
+    }
     let generation = crate::operations::current_generation();
     columns
         .par_iter()
@@ -1145,7 +1204,7 @@ pub fn multi_count_indexed(
         .collect()
 }
 
-fn build_agg_result(
+pub(crate) fn build_agg_result(
     groups: HashMap<Option<String>, Vec<Acc>>,
     mut order: Vec<Option<String>>,
     group_column: &str,
@@ -1269,7 +1328,7 @@ fn push_group(
 }
 
 /// Colunas disponíveis direto dos metadados (sem parse da linha).
-fn is_meta_column(col: &str) -> bool {
+pub(crate) fn is_meta_column(col: &str) -> bool {
     matches!(col, "*" | "timestamp" | "level")
 }
 
@@ -1298,6 +1357,11 @@ pub fn aggregate_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> AggResult {
+    if let Some(result) =
+        crate::engine::aggregate(&engine_source(idx, codes, system, derived), &prepare(filters), group_column, specs)
+    {
+        return result;
+    }
     let matched = indexed_matches(idx, filters, codes, system, derived);
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order: Vec<Option<String>> = Vec::new();
@@ -1457,6 +1521,16 @@ pub fn explore_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> ExplorerSnapshot {
+    if let Some(snapshot) = crate::engine::explore(
+        &engine_source(idx, codes, system, derived),
+        &prepare(filters),
+        sort_column,
+        sort_dir,
+        offset,
+        limit,
+    ) {
+        return snapshot;
+    }
     let matched = indexed_matches(idx, filters, codes, system, derived);
     let stats = stats_from(matched.iter().map(|&i| {
         (
@@ -1492,7 +1566,7 @@ pub fn explore_indexed(
     }
 }
 
-fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i64)>) -> Stats {
+pub(crate) fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i64)>) -> Stats {
     Stats {
         buckets,
         bucket_ms,
@@ -1501,6 +1575,21 @@ fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i6
 }
 
 const N_BUCKETS: usize = 60;
+
+/// Width and number of histogram buckets covering `[min_ts, max_ts]`.
+pub(crate) fn stats_layout(min_ts: i64, max_ts: i64) -> (i64, usize) {
+    let span = max_ts.saturating_sub(min_ts).saturating_add(1);
+    let bucket_ms = (span / N_BUCKETS as i64)
+        .saturating_add(i64::from(span % N_BUCKETS as i64 != 0))
+        .max(1);
+    let count = (((span - 1) / bucket_ms + 1) as usize).min(N_BUCKETS);
+    (bucket_ms, count)
+}
+
+/// Level counts, most frequent first; ties by label keep the order stable.
+pub(crate) fn sort_levels(levels: &mut [(String, i64)]) {
+    levels.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
 
 fn stats_from<'a>(iter: impl Iterator<Item = (Option<i64>, &'a str)>) -> Stats {
     // Chaveia por &str emprestada (zero alocação por linha); converte para
@@ -1521,11 +1610,8 @@ fn stats_from<'a>(iter: impl Iterator<Item = (Option<i64>, &'a str)>) -> Stats {
     let mut buckets = Vec::new();
     let mut bucket_ms = 0i64;
     if min_ts <= max_ts {
-        let span = max_ts.saturating_sub(min_ts).saturating_add(1);
-        bucket_ms = (span / N_BUCKETS as i64)
-            .saturating_add(i64::from(span % N_BUCKETS as i64 != 0))
-            .max(1);
-        let count = (((span - 1) / bucket_ms + 1) as usize).min(N_BUCKETS);
+        let count;
+        (bucket_ms, count) = stats_layout(min_ts, max_ts);
         let mut counts = vec![0i64; count];
         for t in items {
             let b = (t.saturating_sub(min_ts) / bucket_ms) as usize;
@@ -1547,7 +1633,7 @@ fn stats_from<'a>(iter: impl Iterator<Item = (Option<i64>, &'a str)>) -> Stats {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-    levels.sort_by(|a, b| b.1.cmp(&a.1));
+    sort_levels(&mut levels);
     build_stats(buckets, bucket_ms, levels)
 }
 
@@ -1567,22 +1653,20 @@ pub fn stats_indexed(
     derived: &[CompiledDerived],
 ) -> Stats {
     let pfs = prepare(filters);
-    let mut matched: Vec<(Option<i64>, Cow<'static, str>)> = Vec::new();
+    if let Some(stats) = crate::engine::stats(&engine_source(idx, codes, system, derived), &pfs) {
+        return stats;
+    }
+    // Level classes and index time, as the Explorer shows them, whether or
+    // not a filter needed the parsed event.
+    let mut matched: Vec<(Option<i64>, &'static str)> = Vec::new();
     scan_indexed(
         idx,
         &pfs,
         codes,
         system,
         derived,
-        |_, meta, ev| match ev {
-            Some(ev) => (ev.timestamp, Cow::Owned(ev.level)),
-            // rótulo fixo da classe: sem String por linha
-            None => (
-                (meta.ts != 0).then_some(meta.ts),
-                Cow::Borrowed(crate::model::class_label(meta.level)),
-            ),
-        },
+        |_, meta, _| ((meta.ts != 0).then_some(meta.ts), crate::model::class_label(meta.level)),
         |item| matched.push(item),
     );
-    stats_from(matched.iter().map(|(t, l)| (*t, l.as_ref())))
+    stats_from(matched.into_iter())
 }

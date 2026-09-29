@@ -121,16 +121,18 @@ impl Event {
         match col {
             "id" => Some(self.id as f64),
             "timestamp" => self.timestamp.map(|t| t as f64),
-            _ => self.col_str(col).and_then(|s| {
-                let s = s.trim();
-                // aceita valores com unidade ("20 MB", "120 ms") além de números puros
-                s.parse::<f64>()
-                    .ok()
-                    .or_else(|| crate::analysis::parse_num_unit(s).map(|(n, _)| n))
-                    .filter(|n| n.is_finite())
-            }),
+            _ => self.col_str(col).and_then(|s| text_number(&s)),
         }
     }
+}
+
+/// Number written in a column value; accepts units ("20 MB", "120 ms").
+pub fn text_number(s: &str) -> Option<f64> {
+    let s = s.trim();
+    s.parse::<f64>()
+        .ok()
+        .or_else(|| crate::analysis::parse_num_unit(s).map(|(n, _)| n))
+        .filter(|n| n.is_finite())
 }
 
 pub fn ts_to_iso(ms: i64) -> String {

@@ -48,6 +48,8 @@ semver = "1"
 calamine = { version = "0.36", features = ["dates"] }
 # Text logs in UTF-16 or Windows-1252 are converted to UTF-8 before indexing.
 encoding_rs = "0.8"
+# Columnar query engine (embedded, no server): filters and aggregations over large files.
+duckdb = { version = "1.10505", features = ["bundled", "appender-arrow", "vscalar"] }
 
 [dev-dependencies]
 # Workbooks for the spreadsheet tests.
@@ -59,6 +61,7 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -68,3 +71,9 @@ default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 # Test builds only: accepts the announced update without asking (scripts/release/update-e2e.mjs).
 update-e2e = []
+
+# The bundled DuckDB is large C++: without optimizations it is slow and its
+# debug information alone takes gigabytes, so it is always built optimized.
+[profile.dev.package.libduckdb-sys]
+opt-level = 3
+debug = false

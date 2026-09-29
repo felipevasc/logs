@@ -20,7 +20,7 @@ pub enum Expr {
     Term(Term),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Term {
     field: Option<Field>,
     matcher: Matcher,
@@ -43,6 +43,7 @@ enum Cmp {
     Lte,
 }
 
+#[derive(Clone)]
 pub struct Threat(crate::threats::RuleMatcher);
 impl std::fmt::Debug for Threat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,6 +52,7 @@ impl std::fmt::Debug for Threat {
 }
 
 /// `deteccao:<id>`: records a detection rule selects (any of its steps).
+#[derive(Clone)]
 pub struct Detection(std::sync::Arc<crate::detections::RuleSet>, usize);
 impl std::fmt::Debug for Detection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -58,7 +60,7 @@ impl std::fmt::Debug for Detection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Matcher {
     Contains(String),
     Equals(String),
@@ -802,12 +804,7 @@ impl<'a> Ctx<'a> {
         if field.name == "timestamp" && !self.object_only {
             return self.ev.timestamp.map(|t| t as f64);
         }
-        let text = self.field(field)?;
-        let text = text.trim();
-        text.parse::<f64>()
-            .ok()
-            .or_else(|| crate::analysis::parse_num_unit(text).map(|(n, _)| n))
-            .filter(|n| n.is_finite())
+        crate::model::text_number(&self.field(field)?)
     }
 }
 
@@ -1105,6 +1102,16 @@ impl Expr {
         }
     }
 
+    /// Names of the fields the expression reads.
+    pub(crate) fn field_names(&self, out: &mut Vec<String>) {
+        match self {
+            Expr::And(items) | Expr::Or(items) => items.iter().for_each(|e| e.field_names(out)),
+            Expr::Not(inner) => inner.field_names(out),
+            Expr::Term(Term { field: Some(field), .. }) => out.push(field.name.clone()),
+            _ => {}
+        }
+    }
+
     /// Free-text needles, which could also match catalog enrichment.
     pub fn free_text_needles(&self, out: &mut Vec<String>) {
         match self {
@@ -1144,6 +1151,18 @@ fn longest_literal(pattern: &str) -> Option<String> {
         .filter(|chunk| chunk.chars().count() >= 3)
 }
 
+/// What a term tests, for the query engine's translation.
+pub(crate) enum TermKind<'a> {
+    /// Case-insensitive substring (lowercase needle).
+    Contains(&'a str),
+    /// Tested on the text value with [`Term::value_matches`].
+    Value,
+    /// Tested on a number with [`Term::number_matches`].
+    Number,
+    /// Needs the whole event (threat and detection rules).
+    Event,
+}
+
 impl Term {
     fn matches(&self, ctx: &Ctx<'_>) -> bool {
         let ev = ctx.ev;
@@ -1167,33 +1186,73 @@ impl Term {
         match &self.matcher {
             Matcher::Threat(threat) => threat.0.matches(ev),
             Matcher::Detection(d) => d.0.rules[d.1].matches(ev),
-            Matcher::Cmp(cmp, bound) => ctx.number(field).is_some_and(|n| match cmp {
+            Matcher::Cmp(..) | Matcher::Range(..) => ctx.number(field).is_some_and(|n| self.number_matches(n)),
+            _ => ctx.field(field).is_some_and(|value| self.value_matches(&value)),
+        }
+    }
+
+    /// Field name, role fallback and case-insensitive lookup of a field term.
+    pub(crate) fn field(&self) -> Option<(&str, Option<Role>, bool)> {
+        self.field.as_ref().map(|f| (f.name.as_str(), f.role, f.ci))
+    }
+
+    pub(crate) fn kind(&self) -> TermKind<'_> {
+        match &self.matcher {
+            Matcher::Contains(needle) => TermKind::Contains(needle),
+            Matcher::Cmp(..) | Matcher::Range(..) => TermKind::Number,
+            Matcher::Threat(_) | Matcher::Detection(_) => TermKind::Event,
+            _ => TermKind::Value,
+        }
+    }
+
+    /// Whether a free-text term is a wildcard or regular expression.
+    pub(crate) fn is_pattern(&self) -> bool {
+        matches!(self.matcher, Matcher::Wildcard(_) | Matcher::Regex(_))
+    }
+
+    /// Longest literal a wildcard term requires, when it has one.
+    pub(crate) fn wildcard_literal(&self) -> Option<String> {
+        match &self.matcher {
+            Matcher::Wildcard(_) => self.required_literals().and_then(|mut v| (v.len() == 1).then(|| v.remove(0))),
+            _ => None,
+        }
+    }
+
+    /// Comparison or range against a number.
+    pub(crate) fn number_matches(&self, n: f64) -> bool {
+        match &self.matcher {
+            Matcher::Cmp(cmp, bound) => match cmp {
                 Cmp::Gt => n > *bound,
                 Cmp::Gte => n >= *bound,
                 Cmp::Lt => n < *bound,
                 Cmp::Lte => n <= *bound,
-            }),
-            Matcher::Range(lo, hi) => ctx.number(field).is_some_and(|n| n >= *lo && n <= *hi),
-            _ => {
-                let Some(value) = ctx.field(field) else { return false };
-                match &self.matcher {
-                    Matcher::Contains(needle) => contains_ci(&value, needle),
-                    Matcher::Equals(needle) => {
-                        let v = value.trim();
-                        v.len() == needle.len() && v.eq_ignore_ascii_case(needle) || v.to_lowercase() == *needle
-                    }
-                    Matcher::Exact(expected) => value.as_ref() == expected,
-                    Matcher::Wildcard(re) | Matcher::Regex(re) => re.is_match(&value),
-                    Matcher::Cidr(nets) => entities::parse_ip(&value).is_some_and(|ip| nets.iter().any(|n| n.contains(ip))),
-                    Matcher::Exists => !value.trim().is_empty(),
-                    Matcher::Set(set) => {
-                        let v = value.trim();
-                        set.contains(v) || set.contains(&v.to_lowercase())
-                    }
-                    Matcher::Level(label) => value.as_ref() == label,
-                    _ => false,
-                }
+            },
+            Matcher::Range(lo, hi) => n >= *lo && n <= *hi,
+            _ => false,
+        }
+    }
+
+    /// Test of the resolved text value of the term's field.
+    pub(crate) fn value_matches(&self, value: &str) -> bool {
+        match &self.matcher {
+            Matcher::Contains(needle) => contains_ci(value, needle),
+            Matcher::Equals(needle) => {
+                let v = value.trim();
+                v.len() == needle.len() && v.eq_ignore_ascii_case(needle) || v.to_lowercase() == *needle
             }
+            Matcher::Exact(expected) => value == expected,
+            Matcher::Wildcard(re) | Matcher::Regex(re) => re.is_match(value),
+            Matcher::Cidr(nets) => entities::parse_ip(value).is_some_and(|ip| nets.iter().any(|n| n.contains(ip))),
+            Matcher::Exists => !value.trim().is_empty(),
+            Matcher::Set(set) => {
+                let v = value.trim();
+                set.contains(v) || set.contains(&v.to_lowercase())
+            }
+            Matcher::Level(label) => value == label,
+            Matcher::Cmp(..) | Matcher::Range(..) => {
+                crate::model::text_number(value).is_some_and(|n| self.number_matches(n))
+            }
+            Matcher::Threat(_) | Matcher::Detection(_) => false,
         }
     }
 

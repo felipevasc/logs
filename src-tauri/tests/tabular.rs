@@ -220,3 +220,204 @@ fn xls_exports_that_are_text_are_read_as_text() {
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].timestamp, Some(local(2026, 9, 28, 10, 0, 0)));
 }
+
+/// Cell of the minimal BIFF8 workbook below.
+enum XlsCell {
+    Text(&'static str),
+    /// Number and the index of its cell format (0 general, 1 date and time, 2 date).
+    Number(f64, u16),
+}
+
+fn biff_record(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
+    out.extend(kind.to_le_bytes());
+    out.extend((data.len() as u16).to_le_bytes());
+    out.extend(data);
+}
+
+fn utf16(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// Excel 97-2003 workbook (BIFF8 in an OLE compound file), as legacy
+/// systems still export: shared strings, numbers, date formats and a
+/// hidden sheet.
+fn biff8_workbook(sheets: &[(&str, bool, Vec<Vec<XlsCell>>)]) -> Vec<u8> {
+    let bof = |kind: u16| -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend(0x0600u16.to_le_bytes());
+        data.extend(kind.to_le_bytes());
+        data.extend(0x0DBBu16.to_le_bytes());
+        data.extend(0x07CCu16.to_le_bytes());
+        data.extend([0u8; 8]);
+        data
+    };
+    let mut strings: Vec<&str> = Vec::new();
+    for (_, _, rows) in sheets {
+        for cell in rows.iter().flatten() {
+            if let XlsCell::Text(text) = cell {
+                if !strings.contains(text) {
+                    strings.push(text);
+                }
+            }
+        }
+    }
+    let mut stream = Vec::new();
+    biff_record(&mut stream, 0x0809, &bof(0x0005));
+    biff_record(&mut stream, 0x0042, &1200u16.to_le_bytes());
+    // Cell formats: general, "m/d/yy h:mm" (22) and "m/d/yy" (14).
+    for format in [0u16, 22, 14] {
+        let mut xf = vec![0u8; 20];
+        xf[2..4].copy_from_slice(&format.to_le_bytes());
+        biff_record(&mut stream, 0x00E0, &xf);
+    }
+    let mut positions = Vec::new();
+    for (name, hidden, _) in sheets {
+        let mut data = vec![0u8; 4];
+        data.push(u8::from(*hidden));
+        data.push(0);
+        data.push(name.encode_utf16().count() as u8);
+        data.push(1);
+        data.extend(utf16(name));
+        positions.push(stream.len() + 4);
+        biff_record(&mut stream, 0x0085, &data);
+    }
+    let mut sst = Vec::new();
+    sst.extend((strings.len() as u32).to_le_bytes());
+    sst.extend((strings.len() as u32).to_le_bytes());
+    for text in &strings {
+        sst.extend((text.encode_utf16().count() as u16).to_le_bytes());
+        sst.push(1);
+        sst.extend(utf16(text));
+    }
+    biff_record(&mut stream, 0x00FC, &sst);
+    biff_record(&mut stream, 0x000A, &[]);
+    for ((_, _, rows), position) in sheets.iter().zip(positions) {
+        let start = stream.len() as u32;
+        stream[position..position + 4].copy_from_slice(&start.to_le_bytes());
+        biff_record(&mut stream, 0x0809, &bof(0x0010));
+        let columns = rows.iter().map(Vec::len).max().unwrap_or(0) as u16;
+        let mut dimensions = Vec::new();
+        dimensions.extend(0u32.to_le_bytes());
+        dimensions.extend((rows.len() as u32).to_le_bytes());
+        dimensions.extend(0u16.to_le_bytes());
+        dimensions.extend(columns.to_le_bytes());
+        dimensions.extend(0u16.to_le_bytes());
+        biff_record(&mut stream, 0x0200, &dimensions);
+        for (r, row) in rows.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                let mut data = Vec::new();
+                data.extend((r as u16).to_le_bytes());
+                data.extend((c as u16).to_le_bytes());
+                match cell {
+                    XlsCell::Text(text) => {
+                        data.extend(0u16.to_le_bytes());
+                        let index = strings.iter().position(|s| s == text).unwrap() as u32;
+                        data.extend(index.to_le_bytes());
+                        biff_record(&mut stream, 0x00FD, &data);
+                    }
+                    XlsCell::Number(value, format) => {
+                        data.extend(format.to_le_bytes());
+                        data.extend(value.to_le_bytes());
+                        biff_record(&mut stream, 0x0203, &data);
+                    }
+                }
+            }
+        }
+        biff_record(&mut stream, 0x000A, &[]);
+    }
+    // Streams under 4 KiB would live in the mini stream; pad to regular sectors.
+    stream.resize(stream.len().max(4096).div_ceil(512) * 512, 0);
+    let sectors = stream.len() / 512;
+    let directory = sectors + 1;
+    assert!(directory < 128, "one FAT sector");
+    let end = 0xFFFF_FFFEu32;
+    let mut out = Vec::new();
+    out.extend(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1");
+    out.extend([0u8; 16]);
+    for value in [0x003Eu16, 0x0003, 0xFFFE, 0x0009, 0x0006] {
+        out.extend(value.to_le_bytes());
+    }
+    out.extend([0u8; 6]);
+    for value in [0u32, 1, directory as u32, 0, 4096, end, 0, end, 0] {
+        out.extend(value.to_le_bytes());
+    }
+    out.extend(0u32.to_le_bytes());
+    for _ in 1..109 {
+        out.extend(0xFFFF_FFFFu32.to_le_bytes());
+    }
+    assert_eq!(out.len(), 512);
+    let mut fat = vec![0xFFFF_FFFFu32; 128];
+    fat[0] = 0xFFFF_FFFD;
+    for sector in 1..=sectors {
+        fat[sector] = if sector == sectors { end } else { sector as u32 + 1 };
+    }
+    fat[directory] = end;
+    out.extend(fat.iter().flat_map(|v| v.to_le_bytes()));
+    let stream_len = stream.len() as u32;
+    out.extend(stream);
+    let entry = |name: &str, kind: u8, child: u32, start: u32, size: u32| -> Vec<u8> {
+        let mut e = vec![0u8; 128];
+        let encoded = utf16(name);
+        e[..encoded.len()].copy_from_slice(&encoded);
+        let length = if name.is_empty() { 0 } else { encoded.len() as u16 + 2 };
+        e[64..66].copy_from_slice(&length.to_le_bytes());
+        e[66] = kind;
+        e[67] = 1;
+        e[68..72].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        e[72..76].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        e[76..80].copy_from_slice(&child.to_le_bytes());
+        e[116..120].copy_from_slice(&start.to_le_bytes());
+        e[120..124].copy_from_slice(&size.to_le_bytes());
+        e
+    };
+    out.extend(entry("Root Entry", 5, 1, end, 0));
+    out.extend(entry("Workbook", 2, 0xFFFF_FFFF, 1, stream_len));
+    out.extend(entry("", 0, 0xFFFF_FFFF, 0, 0));
+    out.extend(entry("", 0, 0xFFFF_FFFF, 0, 0));
+    out
+}
+
+#[test]
+fn binary_excel_97_workbook_rows_become_events() {
+    use XlsCell::{Number, Text};
+    // 2026-09-28 10:15:30 and 2026-09-29 in Excel serial days.
+    let first = 46293.0 + (10.0 * 3600.0 + 15.0 * 60.0 + 30.0) / 86400.0;
+    let workbook = biff8_workbook(&[
+        (
+            "Acessos",
+            false,
+            vec![
+                vec![Text("Relatório exportado do sistema legado")],
+                vec![Text("Data/Hora"), Text("Nível"), Text("Usuário"), Text("Descrição"), Text("Bytes")],
+                vec![Number(first, 1), Text("Erro"), Text("ana"), Text("Acesso ao painel administrativo negado"), Number(1532.0, 0)],
+                vec![Number(first + 1.0 / 24.0, 1), Text("Aviso"), Text("bruno"), Text("Senha próxima do vencimento"), Number(20480.5, 0)],
+            ],
+        ),
+        (
+            "Auditoria",
+            true,
+            vec![
+                vec![Text("Data"), Text("Mensagem")],
+                vec![Number(46294.0, 2), Text("Relatório fechado")],
+            ],
+        ),
+    ]);
+    let (format, events) = load(&file("legado.xls", &workbook));
+    assert_eq!(format, "snapshot");
+    assert_eq!(events.len(), 3, "{:#?}", events.iter().map(|e| &e.message).collect::<Vec<_>>());
+    let access = &events[0];
+    assert_eq!(access.timestamp, Some(local(2026, 9, 28, 10, 15, 30)));
+    assert_eq!(access.level, "Erro");
+    assert_eq!(access.message, "Acesso ao painel administrativo negado");
+    assert_eq!(field(access, "Usuário"), Some(&Value::from("ana")));
+    assert_eq!(field(access, "Bytes"), Some(&Value::from(1532)));
+    assert_eq!(field(access, "planilha.aba"), Some(&Value::from("Acessos")));
+    assert_eq!(field(access, "planilha.linha"), Some(&Value::from(3)));
+    assert_eq!(events[1].timestamp, Some(local(2026, 9, 28, 11, 15, 30)));
+    assert_eq!(events[1].level, "Aviso");
+    assert_eq!(field(&events[1], "Bytes"), Some(&Value::from(20480.5)));
+    let audit = &events[2];
+    assert_eq!(audit.timestamp, Some(local(2026, 9, 29, 0, 0, 0)));
+    assert_eq!(audit.message, "Relatório fechado");
+    assert_eq!(field(audit, "planilha.oculta"), Some(&Value::from(true)));
+}

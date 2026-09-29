@@ -380,9 +380,13 @@ pub async fn serve(app: AppHandle, port: u16) {
     eprintln!("[mcp] servidor ouvindo em http://127.0.0.1:{port}/mcp");
 
     let app_factory = app.clone();
+    // A session idle for rmcp's default five minutes is closed even while a
+    // tool runs; loading and preparing a large file can take longer.
+    let mut sessions = LocalSessionManager::default();
+    sessions.session_config.keep_alive = Some(std::time::Duration::from_secs(4 * 3600));
     let service = StreamableHttpService::new(
         move || Ok(LogInsightMcp::new(app_factory.clone())),
-        LocalSessionManager::default().into(),
+        sessions.into(),
         StreamableHttpServerConfig::default(),
     );
     let guard_app = app.clone();

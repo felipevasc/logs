@@ -188,6 +188,20 @@ impl Selection<'_> {
         }
     }
 }
+/// Runs a query-engine operation on an indexed source; `None` means the
+/// caller answers with the line engine.
+pub(crate) fn with_engine<T>(
+    state: &AppState,
+    f: impl FnOnce(&crate::engine::Source<'_>) -> Option<T>,
+) -> Option<T> {
+    let source = state.source.read();
+    let SourceData::Indexed(idx) = &*source else { return None };
+    let codes = state.codes.read();
+    let system = state.system_codes.read();
+    let derived = state.derived.read();
+    f(&crate::engine::Source { idx, codes: &codes, system: &system, derived: &derived })
+}
+
 pub fn with_selection<T>(
     state: &AppState,
     filters: &[Filter],
@@ -324,6 +338,9 @@ pub fn overview_scope_impl(
                 .cloned()
         });
         crate::operations::check()?;
+        return Ok(result);
+    }
+    if let Some(result) = with_engine(state, |src| crate::engine::overview(src, &query::prepare(&filters))) {
         return Ok(result);
     }
     Ok(with_selection(state, &filters, |selection| {
@@ -585,6 +602,11 @@ pub fn compare_scope_impl(
             &after,
         );
         crate::operations::check()?;
+        return Ok(result);
+    }
+    if let Some(result) =
+        with_engine(state, |src| crate::engine::compare(src, &query::prepare(&filters), &before, &after))
+    {
         return Ok(result);
     }
     Ok(with_selection(state, &filters, |s| {

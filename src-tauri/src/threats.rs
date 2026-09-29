@@ -283,6 +283,7 @@ impl CompiledCatalog {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RuleMatcher {
     catalog: Arc<CompiledCatalog>,
     rule: Option<usize>,

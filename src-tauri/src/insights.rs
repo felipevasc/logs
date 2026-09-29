@@ -66,12 +66,8 @@ pub fn is_error(ev: &Event) -> bool {
     matches!(ev.level.as_str(), "Erro" | "Crítico")
 }
 
-pub fn overview<F, I>(events: F) -> Overview
-where
-    F: Fn() -> I,
-    I: Iterator<Item = Event>,
-{
-    let mut out = Overview {
+pub(crate) fn empty_overview() -> Overview {
+    Overview {
         total: 0,
         errors: 0,
         warnings: 0,
@@ -87,16 +83,114 @@ where
         findings: vec![],
         complete: true,
         latency: None,
-    };
+    }
+}
+
+/// Latency percentiles over one numeric field, sampled in event order.
+pub(crate) struct LatencySample {
+    values: Vec<f64>,
+    count: usize,
+    field: String,
+    unit: String,
+    incompatible: usize,
+    random: u64,
+}
+
+impl Default for LatencySample {
+    fn default() -> Self {
+        LatencySample {
+            values: Vec::new(),
+            count: 0,
+            field: String::new(),
+            unit: String::new(),
+            incompatible: 0,
+            random: 0x9e3779b97f4a7c15,
+        }
+    }
+}
+
+/// Fields tried, in order, until one holds a number.
+pub(crate) const LATENCY_FIELDS: [&str; 5] = ["latency_ms", "duration_ms", "latencia", "latency", "duration"];
+
+impl LatencySample {
+    /// Observes one event; `text` returns a column's value as `col_str` does.
+    pub(crate) fn push(&mut self, text: impl Fn(&str) -> Option<String>) {
+        let number = |k: &str| text(k).and_then(|v| crate::model::text_number(&v));
+        // Field-specific units: only combine values from one selected latency field.
+        let candidate = if self.field.is_empty() {
+            LATENCY_FIELDS.into_iter().find(|k| number(k).is_some())
+        } else {
+            Some(self.field.as_str())
+        };
+        let Some(field) = candidate else { return };
+        let Some(n) = number(field).filter(|n| n.is_finite() && *n >= 0.0) else { return };
+        let parsed_unit = text(field)
+            .and_then(|v| crate::analysis::parse_num_unit(&v))
+            .map(|(_, unit)| unit);
+        let unit = if field.ends_with("_ms") || parsed_unit == Some(crate::analysis::UnitKind::DurationMs) {
+            "ms"
+        } else {
+            "unidade da fonte"
+        };
+        if self.field.is_empty() {
+            self.field = field.to_string();
+            self.unit = unit.into();
+        }
+        if unit != self.unit {
+            self.incompatible += 1;
+            return;
+        }
+        self.count += 1;
+        if self.values.len() < 10000 {
+            self.values.push(n);
+        } else {
+            self.random ^= self.random << 13;
+            self.random ^= self.random >> 7;
+            self.random ^= self.random << 17;
+            let j = (self.random % self.count as u64) as usize;
+            if j < self.values.len() {
+                self.values[j] = n;
+            }
+        }
+    }
+
+    fn summary(mut self) -> Option<Latency> {
+        if self.values.is_empty() {
+            return None;
+        }
+        self.values.sort_by(f64::total_cmp);
+        let pct = |p: f64| self.values[((self.values.len() - 1) as f64 * p).round() as usize];
+        Some(Latency {
+            field: self.field.clone(),
+            unit: self.unit.clone(),
+            incompatible: self.incompatible,
+            count: self.count,
+            sampled: self.values.len(),
+            p50: pct(0.5),
+            p95: pct(0.95),
+            p99: pct(0.99),
+        })
+    }
+}
+
+/// Example shown for a pattern: the event without raw text or fields.
+pub(crate) fn pattern_example(mut ev: Event) -> Event {
+    ev.raw.clear();
+    ev.fields.clear();
+    ev.message = ev.message.chars().take(500).collect();
+    ev
+}
+
+pub fn overview<F, I>(events: F) -> Overview
+where
+    F: Fn() -> I,
+    I: Iterator<Item = Event>,
+{
+    let mut out = empty_overview();
     let mut patterns: HashMap<String, Pattern> = HashMap::new();
     let mut sources: HashMap<String, usize> = HashMap::new();
-    let mut latency = Vec::<f64>::new();
-    let mut latency_count = 0;
-    let mut latency_field = String::new();
-    let mut latency_unit = String::new();
-    let mut incompatible = 0;
-    let mut random = 0x9e3779b97f4a7c15u64;
-    for mut ev in events() {
+    let mut latency = LatencySample::default();
+    for ev in events() {
         if crate::operations::cancelled() {
             out.complete = false;
             break;
@@ -129,10 +223,6 @@ where
                 p.last = Some(p.last.map(|v| v.max(t)).unwrap_or(t));
             }
         } else if patterns.len() < 20_000 {
-            ev.raw.clear();
-            let mut example = ev.clone();
-            example.fields.clear();
-            example.message = example.message.chars().take(500).collect();
             patterns.insert(
                 pattern.clone(),
                 Pattern {
@@ -141,62 +231,39 @@ where
                     errors: usize::from(error),
                     first: ev.timestamp,
                     last: ev.timestamp,
-                    example,
+                    example: pattern_example(ev.clone()),
                 },
             );
         } else {
             out.patterns_limited = true;
         }
-        // Field-specific units: only combine values from one selected latency field.
-        let candidate = if latency_field.is_empty() {
-            [
-                "latency_ms",
-                "duration_ms",
-                "latencia",
-                "latency",
-                "duration",
-            ]
-            .into_iter()
-            .find(|k| ev.col_num(k).is_some())
-        } else {
-            Some(latency_field.as_str())
-        };
-        if let Some(field) = candidate {
-            if let Some(n) = ev.col_num(field).filter(|n| n.is_finite() && *n >= 0.0) {
-                let parsed_unit = ev
-                    .col_str(field)
-                    .and_then(|v| crate::analysis::parse_num_unit(&v))
-                    .map(|(_, unit)| unit);
-                let unit = if field.ends_with("_ms")
-                    || parsed_unit == Some(crate::analysis::UnitKind::DurationMs)
-                {
-                    "ms"
-                } else {
-                    "unidade da fonte"
-                };
-                if latency_field.is_empty() {
-                    latency_field = field.to_string();
-                    latency_unit = unit.into();
-                }
-                if unit != latency_unit {
-                    incompatible += 1;
-                    continue;
-                }
-                latency_count += 1;
-                if latency.len() < 10000 {
-                    latency.push(n);
-                } else {
-                    random ^= random << 13;
-                    random ^= random >> 7;
-                    random ^= random << 17;
-                    let j = (random % latency_count as u64) as usize;
-                    if j < latency.len() {
-                        latency[j] = n;
-                    }
+        latency.push(|k| ev.col_str(k));
+    }
+    finish_overview(out, patterns.into_values().collect(), sources, latency, |buckets, complete, start, width| {
+        for ev in events() {
+            if crate::operations::cancelled() {
+                *complete = false;
+                break;
+            }
+            if let Some(t) = ev.timestamp {
+                if let Some(b) = buckets.get_mut(((t - start) / width) as usize) {
+                    b.count += 1;
+                    b.errors += usize::from(is_error(&ev));
                 }
             }
         }
-    }
+    })
+}
+
+/// Histogram, findings, rankings and latency of an accumulated overview.
+/// `fill` counts events and errors into buckets of `width` ms from `start`.
+pub(crate) fn finish_overview(
+    mut out: Overview,
+    patterns: Vec<Pattern>,
+    sources: HashMap<String, usize>,
+    latency: LatencySample,
+    fill: impl FnOnce(&mut Vec<Bucket>, &mut bool, i64, i64),
+) -> Overview {
     if let (Some(start), Some(end)) = (out.start, out.end) {
         let width = ((end.saturating_sub(start)) / 90 + 1).max(1000);
         out.buckets = (0..=((end - start) / width))
@@ -206,18 +273,7 @@ where
                 errors: 0,
             })
             .collect();
-        for ev in events() {
-            if crate::operations::cancelled() {
-                out.complete = false;
-                break;
-            }
-            if let Some(t) = ev.timestamp {
-                if let Some(b) = out.buckets.get_mut(((t - start) / width) as usize) {
-                    b.count += 1;
-                    b.errors += usize::from(is_error(&ev));
-                }
-            }
-        }
+        fill(&mut out.buckets, &mut out.complete, start, width);
         let baseline = out.errors as f64 / out.total.max(1) as f64;
         if let Some(b) = out
             .buckets
@@ -260,7 +316,7 @@ where
         .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     out.sources.truncate(20);
     out.sources_other = out.total - out.sources.iter().map(|(_, count)| count).sum::<usize>();
-    out.patterns = patterns.into_values().collect();
+    out.patterns = patterns;
     out.patterns
         .sort_by(|a, b| b.count.cmp(&a.count).then(a.pattern.cmp(&b.pattern)));
     if let Some(p) = out
@@ -292,20 +348,7 @@ where
             event_id: None,
         });
     }
-    if !latency.is_empty() {
-        latency.sort_by(f64::total_cmp);
-        let pct = |p: f64| latency[((latency.len() - 1) as f64 * p).round() as usize];
-        out.latency = Some(Latency {
-            field: latency_field,
-            unit: latency_unit,
-            incompatible,
-            count: latency_count,
-            sampled: latency.len(),
-            p50: pct(0.5),
-            p95: pct(0.95),
-            p99: pct(0.99),
-        });
-    }
+    out.latency = latency.summary();
     out
 }
 
@@ -343,7 +386,7 @@ pub fn compare(events: impl Iterator<Item = Event>, before: &Period, after: &Per
         limited: false,
     };
     let mut groups: HashMap<String, (usize, usize, Event)> = HashMap::new();
-    for mut ev in events {
+    for ev in events {
         if crate::operations::cancelled() {
             break;
         }
@@ -362,35 +405,54 @@ pub fn compare(events: impl Iterator<Item = Event>, before: &Period, after: &Per
             out.limited = true;
             continue;
         }
-        ev.raw.clear();
-        ev.fields.clear();
-        ev.message = ev.message.chars().take(500).collect();
-        let entry = groups.entry(key).or_insert((0, 0, ev));
+        let entry = groups.entry(key).or_insert_with(|| (0, 0, pattern_example(ev)));
         entry.0 += usize::from(a);
         entry.1 += usize::from(b);
     }
-    out.changes = groups
+    let groups = groups
         .into_iter()
-        .map(|(pattern, (before, after, example))| {
+        .map(|(pattern, (before, after, example))| (pattern, before, after, example))
+        .collect();
+    finish_compare(out, groups, |example| example)
+}
+
+/// Rates and ranking of pattern changes; only the 100 kept get an example.
+pub(crate) fn finish_compare<T>(
+    mut out: Comparison,
+    groups: Vec<(String, usize, usize, T)>,
+    example: impl Fn(T) -> Event,
+) -> Comparison {
+    let mut ranked: Vec<(Change, T)> = groups
+        .into_iter()
+        .map(|(pattern, before, after, source)| {
             let a = before as f64 / out.before_total.max(1) as f64;
             let b = after as f64 / out.after_total.max(1) as f64;
-            Change {
+            let change = Change {
                 pattern,
                 before,
                 after,
                 before_rate: a,
                 after_rate: b,
                 delta: b - a,
-                example,
-            }
+                example: Event::empty(),
+            };
+            (change, source)
         })
         .collect();
-    out.changes.sort_by(|a, b| {
+    ranked.sort_by(|(a, _), (b, _)| {
         b.delta
             .abs()
             .total_cmp(&a.delta.abs())
             .then(b.after.cmp(&a.after))
+            .then_with(|| a.pattern.cmp(&b.pattern))
     });
-    out.changes.truncate(100);
+    ranked.truncate(100);
+    out.changes = ranked
+        .into_iter()
+        .map(|(mut change, source)| {
+            change.example = example(source);
+            change
+        })
+        .collect();
     out
 }
