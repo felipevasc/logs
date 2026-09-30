@@ -11,7 +11,11 @@
     "dev": "npm run prepare:frontend && tauri dev",
     "build": "npm run prepare:frontend && node scripts/tauri-build.mjs",
     "release": "node scripts/release/release.mjs",
-    "icon": "tauri icon"
+    "icon": "tauri icon",
+    "check:js": "node scripts/check-js.mjs",
+    "test": "node --test scripts/preview/test-detail-fields.cjs",
+    "test:preview": "node scripts/preview/run-smoke.mjs",
+    "check": "npm run check:js && npm test && node scripts/release/verify-version.mjs && node scripts/release/test-release.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.0"

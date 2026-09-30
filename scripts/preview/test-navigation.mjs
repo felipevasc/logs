@@ -1,8 +1,8 @@
 /* Areas (Análise, Caso, Estrutura), grouped menus and per-tab loading with selective cancel. */
 import assert from "node:assert/strict";
-import { chromium } from "playwright";
+import { launchBrowser } from "./browser.mjs";
 const url = process.argv[2] || "http://127.0.0.1:4173";
-const browser = await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL||"chrome"});
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, reducedMotion: "reduce" });
 const errors = [], results = {};
 page.on("pageerror", error => errors.push(error.message));

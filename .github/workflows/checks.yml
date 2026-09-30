@@ -1,0 +1,74 @@
+name: Pull request checks
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend and interaction regressions
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            scripts/preview/package-lock.json
+      - run: npm ci
+      - run: npm ci --prefix scripts/preview
+      - run: npx --prefix scripts/preview playwright install --with-deps chromium
+      - run: npm run check
+      - run: npm run prepare:frontend
+      - run: npm run test:preview
+      - name: Preserve browser diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-diagnostics
+          path: output/playwright/
+          if-no-files-found: ignore
+
+  backend:
+    name: Backend tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    env:
+      CARGO_TERM_COLOR: always
+      # Avoid running several independent large fixture/index builds at once.
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential pkg-config libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci
+      - run: npm run prepare:frontend
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+
+# Intentionally no installers, updater runs, signing, repository writes or releases.

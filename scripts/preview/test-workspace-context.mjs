@@ -1,12 +1,11 @@
 /* Run: node scripts/preview/test-workspace-context.mjs http://127.0.0.1:4175 */
 import assert from "node:assert/strict";
-import { chromium } from "playwright";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { launchBrowser } from "./browser.mjs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 const url = process.argv[2] || "http://127.0.0.1:4175", output = resolve("output/playwright");
 mkdirSync(output, { recursive: true });
-const fallback = `${process.env.LOCALAPPDATA}/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-win64/chrome-headless-shell.exe`;
-const browser = await chromium.launch({ executablePath: existsSync(chromium.executablePath()) ? undefined : fallback });
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1024, height: 900 }, reducedMotion: "reduce" });
 const errors = [], results = {};
 page.on("pageerror", error => errors.push(error.message));
