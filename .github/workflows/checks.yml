@@ -8,15 +8,14 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: checks-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   frontend:
     name: Frontend and interaction regressions
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    concurrency:
+      group: checks-frontend-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -44,6 +43,11 @@ jobs:
     name: Backend tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    # Keep an expensive native build alive while newer UI-only fixes validate.
+    # GitHub retains only the latest pending run in this per-platform group.
+    concurrency:
+      group: checks-backend-${{ matrix.os }}-${{ github.ref }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:

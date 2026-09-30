@@ -1,6 +1,7 @@
 /* Run: node scripts/preview/test-workspace-context.mjs http://127.0.0.1:4175 */
 import assert from "node:assert/strict";
 import { launchBrowser } from "./browser.mjs";
+import { captureFailure } from "./diagnostics.mjs";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 const url = process.argv[2] || "http://127.0.0.1:4175", output = resolve("output/playwright");
@@ -117,4 +118,5 @@ try {
   assert.deepEqual(errors, []);
   writeFileSync(resolve(output, "workspace-context-results.json"), JSON.stringify(results, null, 2));
   console.log(JSON.stringify({ ...results, pageErrors: errors }, null, 2));
-} finally { await browser.close(); }
+} catch (error) { await captureFailure(page, 'workspace-context', error, { errors, results }); throw error; }
+finally { await browser.close(); }

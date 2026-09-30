@@ -1,6 +1,7 @@
 /* Interactive work must not wait for exact analytics or resend a huge case. */
 import assert from 'node:assert/strict';
 import { launchBrowser } from './browser.mjs';
+import { captureFailure } from './diagnostics.mjs';
 const browser=await launchBrowser();
 const page=await browser.newPage({viewport:{width:1440,height:900},reducedMotion:'reduce'});
 const errors=[];page.on('pageerror',error=>errors.push(error.message));
@@ -31,7 +32,8 @@ try {
     const row=document.querySelector('#events-table tbody tr'),cell=row.children[0],field=state.columns.find(c=>!state.visibleCols.includes(c));
     if(field) toggleDetailColumn(field);
     window.dispatchEvent(new Event('resize'));await new Promise(r=>setTimeout(r,600));
-    return {sameRow:row===document.querySelector('#events-table tbody tr'),sameCell:cell===row.children[0],sameQueries:before===JSON.stringify(queryCalls()),sameSaves:saves===(window.__mockCommandCalls.cases_save||0)};
+    const currentRow=document.querySelector('#events-table tbody tr');
+    return {sameRow:row===currentRow,sameCell:cell===currentRow.children[0],sameQueries:before===JSON.stringify(queryCalls()),sameSaves:saves===(window.__mockCommandCalls.cases_save||0)};
   });
   assert.deepEqual(local,{sameRow:true,sameCell:true,sameQueries:true,sameSaves:true});
   const cancel=await page.evaluate(async()=>{
@@ -44,4 +46,5 @@ try {
   assert.deepEqual(cancel,[true,true,true]);
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({first,local,cancel,errors},null,2));
-} finally {await browser.close();}
+} catch (error) { await captureFailure(page, 'responsiveness', error, { errors }); throw error; }
+finally {await browser.close();}

@@ -526,8 +526,8 @@
     });
   };
   const oldTable=renderTable;
-  renderTable=function(qr) {
-    oldTable(qr);
+  renderTable=function(qr, options) {
+    oldTable(qr, options);
     document.querySelectorAll('#events-table th').forEach((th,i)=>{
       const column=state.visibleCols[i];
       th.title='Clique para ordenar · arraste para mover · botão direito para analisar o campo';

@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 /* Interface scale (automatic, settings, shortcuts, persistence) and layouts that must fit small windows. */
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -91,7 +92,7 @@ try {
       };
     });
   } catch (captureError) { diagnostics.captureError = String(captureError); }
-  try { await page?.screenshot({ path: new URL("ui-scale-failure.png", directory).pathname, fullPage: true }); }
+  try { await page?.screenshot({ path: fileURLToPath(new URL("ui-scale-failure.png", directory)), fullPage: true }); }
   catch (captureError) { diagnostics.screenshotError = String(captureError); }
   await writeFile(new URL("ui-scale-failure.json", directory), JSON.stringify(diagnostics, null, 2));
   console.error(JSON.stringify(diagnostics, null, 2));
