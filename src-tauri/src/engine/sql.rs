@@ -353,18 +353,8 @@ impl Schema {
 }
 
 /// Some value (lowercase free-text column, name or description) contains `needle`.
-fn any_value(needle: &str, tests: &mut Tests, names: &mut bool) -> String {
-    *names = true;
-    let owned = needle.to_string();
-    let test: super::udf::TextTest = Arc::new(move |v| {
-        v.is_some_and(|v| crate::query::ci_contains_bytes(v.as_bytes(), owned.as_bytes()))
-    });
-    format!(
-        "(contains(vals, {}) OR {} OR {})",
-        lit(needle),
-        tests.text("name", test.clone()),
-        tests.text("description", test)
-    )
+fn any_value(needle: &str, tests: &mut Tests, _names: &mut bool) -> String {
+    tests.free_text(needle)
 }
 
 /// Column of a role as the search language resolves it (`Ctx::role`).

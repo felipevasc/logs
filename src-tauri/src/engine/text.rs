@@ -10,6 +10,7 @@
 //! marker that every search includes.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tantivy::collector::{Count, DocSetCollector};
 use tantivy::query::{BooleanQuery, Occur, Query, RegexQuery, TermQuery};
 use tantivy::schema::{
@@ -22,9 +23,9 @@ use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 const LONG: &str = "\u{1}";
 const MAX_WORD: usize = 64;
 /// Word standing for every hexadecimal word of [`HEX_WORD`] or more
-/// characters (ids, hashes): unique per record, they would fill the word list
-/// that each search scans. Only pieces made of hexadecimal digits can lie
-/// inside them, so only those searches include this word.
+/// characters (ids, hashes): the general substring dictionary keeps a marker
+/// so regex expansion does not walk every unique ID. A separate exact field
+/// handles full words when the recorded maximum length proves it sufficient.
 const HEX: &str = "\u{2}";
 const HEX_WORD: usize = 8;
 /// Shorter pieces narrow almost nothing, so neither they nor words this short
@@ -36,22 +37,24 @@ pub(crate) fn dir_of(store: &Path) -> PathBuf {
     store.with_extension("text")
 }
 
-fn schema() -> (Schema, Field, Field) {
+fn schema() -> (Schema, Field, Field, Field) {
     let mut builder = Schema::builder();
     let lid = builder.add_u64_field("lid", FAST);
     let indexing = TextFieldIndexing::default()
         .set_tokenizer("raw")
         .set_index_option(IndexRecordOption::Basic);
-    let text = builder.add_text_field("t", TextOptions::default().set_indexing_options(indexing));
-    (builder.build(), lid, text)
+    let text = builder.add_text_field("t", TextOptions::default().set_indexing_options(indexing.clone()));
+    let hex = builder.add_text_field("hex", TextOptions::default().set_indexing_options(indexing));
+    (builder.build(), lid, text, hex)
 }
 
-/// Distinct words of a lowercase text.
+/// Distinct words of a lowercase text. The writer separates hexadecimal words
+/// from the general substring dictionary.
 pub(crate) fn words(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.chars().nth(MIN_PIECE - 1).is_some())
-        .map(|w| if w.len() > MAX_WORD { LONG } else if is_hex_word(w) { HEX } else { w })
+        .map(|w| if w.len() > MAX_WORD { LONG } else { w })
         .filter(|w| seen.insert(*w))
         .map(str::to_string)
         .collect()
@@ -61,23 +64,36 @@ pub(crate) struct Writer {
     writer: IndexWriter,
     lid: Field,
     text: Field,
+    hex: Field,
+    max_hex_word: AtomicUsize,
+    dir: PathBuf,
 }
 
 impl Writer {
     pub(crate) fn create(dir: &Path, threads: usize, memory: usize) -> Result<Writer, String> {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        let (schema, lid, text) = schema();
+        let (schema, lid, text, hex) = schema();
         let index = Index::create_in_dir(dir, schema).map_err(|e| e.to_string())?;
         let writer = index
             .writer_with_num_threads(threads.max(1), memory.max(threads.max(1) * (16 << 20)))
             .map_err(|e| e.to_string())?;
-        Ok(Writer { writer, lid, text })
+        Ok(Writer { writer, lid, text, hex, max_hex_word: AtomicUsize::new(0), dir: dir.to_path_buf() })
     }
 
     pub(crate) fn add(&self, lid: u32, words: Vec<String>) -> Result<(), String> {
+        let mut doc = TantivyDocument::default();
+        let mut seen = HashSet::new();
         let tokens = words
             .into_iter()
+            .map(|word| {
+                if is_hex_word(&word) {
+                    self.max_hex_word.fetch_max(word.len(), Ordering::Relaxed);
+                    doc.add_text(self.hex, &word);
+                    HEX.to_string()
+                } else { word }
+            })
+            .filter(|word| seen.insert(word.clone()))
             .enumerate()
             .map(|(position, text)| Token {
                 offset_from: 0,
@@ -87,15 +103,18 @@ impl Writer {
                 position_length: 1,
             })
             .collect();
-        let mut doc = TantivyDocument::default();
         doc.add_u64(self.lid, u64::from(lid));
         doc.add_pre_tokenized_text(self.text, PreTokenizedString { text: String::new(), tokens });
         self.writer.add_document(doc).map(|_| ()).map_err(|e| e.to_string())
     }
 
     pub(crate) fn finish(mut self) -> Result<(), String> {
+        use std::io::Write;
         self.writer.commit().map_err(|e| e.to_string())?;
-        self.writer.wait_merging_threads().map_err(|e| e.to_string())
+        self.writer.wait_merging_threads().map_err(|e| e.to_string())?;
+        let mut metadata = std::fs::File::create(self.dir.join("hex-length")).map_err(|e| e.to_string())?;
+        write!(metadata, "{}", self.max_hex_word.load(Ordering::Relaxed)).map_err(|e| e.to_string())?;
+        metadata.sync_all().map_err(|e| e.to_string())
     }
 }
 
@@ -103,6 +122,8 @@ pub(crate) struct Text {
     reader: IndexReader,
     lid: Field,
     text: Field,
+    hex: Field,
+    max_hex_word: usize,
 }
 
 impl Text {
@@ -111,9 +132,10 @@ impl Text {
             return None;
         }
         let index = Index::open_in_dir(dir).ok()?;
-        let (_, lid, text) = schema();
+        let (_, lid, text, hex) = schema();
         let reader = index.reader().ok()?;
-        Some(Text { reader, lid, text })
+        let max_hex_word = std::fs::read_to_string(dir.join("hex-length")).ok()?.parse().ok()?;
+        Some(Text { reader, lid, text, hex, max_hex_word })
     }
 
     /// Rows (sorted) whose text may contain `needle`; `None` when the index
@@ -137,9 +159,15 @@ impl Text {
         for piece in pieces {
             let mut any: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Should, long.box_clone())];
             if piece.bytes().all(|b| b.is_ascii_hexdigit()) {
+                // A needle at least as long as every indexed hex word can
+                // only equal one. Shorter substrings retain the conservative
+                // HEX marker; LONG remains included for >64-byte words.
+                let (field, value) = if piece.len() >= self.max_hex_word {
+                    (self.hex, piece)
+                } else { (self.text, HEX) };
                 any.push((
                     Occur::Should,
-                    Box::new(TermQuery::new(Term::from_field_text(self.text, HEX), IndexRecordOption::Basic)),
+                    Box::new(TermQuery::new(Term::from_field_text(field, value), IndexRecordOption::Basic)),
                 ));
             }
             if piece.len() <= MAX_WORD {
@@ -190,6 +218,30 @@ fn regex_syntax_escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_hex_words_are_selective_but_substrings_and_long_words_stay_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Writer::create(dir.path(), 1, 32 << 20).unwrap();
+        let first = "0000000000000000000000006585cfa1";
+        let second = "000000000000000000000000e1677d9c";
+        writer.add(0, words(first)).unwrap();
+        writer.add(1, words(second)).unwrap();
+        writer.finish().unwrap();
+        let text = Text::open(dir.path()).unwrap();
+        assert_eq!(text.candidates(first, 1).unwrap(), vec![0]);
+        assert_eq!(text.candidates(second, 1).unwrap(), vec![1]);
+        assert_eq!(text.candidates("6585", 1), None, "partial hex keeps the broad safe marker");
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Writer::create(dir.path(), 1, 32 << 20).unwrap();
+        writer.add(0, words(&format!("aa{first}bb"))).unwrap();
+        writer.add(1, words(&format!("{}{first}", "f".repeat(80)))).unwrap();
+        writer.add(2, words(&format!("prefix{first}suffix"))).unwrap();
+        writer.finish().unwrap();
+        let text = Text::open(dir.path()).unwrap();
+        assert_eq!(text.candidates(first, 10).unwrap(), vec![0, 1, 2]);
+    }
 
     #[test]
     fn candidates_cover_every_row_containing_the_needle() {

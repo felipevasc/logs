@@ -694,7 +694,7 @@ pub(crate) fn literal_role(role: Role) -> bool {
     !matches!(role, Role::Action | Role::Outcome | Role::SrcScope | Role::DstScope | Role::Tool)
 }
 
-fn any_value(ev: &Event, test: &dyn Fn(&str) -> bool) -> bool {
+pub(crate) fn any_value(ev: &Event, test: &dyn Fn(&str) -> bool) -> bool {
     if test(&ev.message) || test(&ev.source) || test(&ev.code) || test(&ev.name) || test(&ev.description) {
         return true;
     }

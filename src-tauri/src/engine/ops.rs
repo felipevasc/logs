@@ -120,72 +120,101 @@ struct Scope<'s> {
 /// Rows checked at most per free-text needle found through the inverted index.
 const FREE_LIMIT: usize = 250_000;
 
-/// Replaces each `contains(vals, '…')` of a condition by the rows whose text
-/// contains the needle: candidates come from the inverted index and are
-/// confirmed with the same text the column holds. Needles the index cannot
-/// narrow keep the scan.
-fn resolve_free(session: &Session, src: &Source, sql: &str) -> Result<(String, Vec<Arc<Selection>>)> {
-    const OPEN: &str = "contains(vals, '";
+/// Replace a planner token only outside SQL string literals. A user-supplied
+/// field value may happen to contain the same text as an internal placeholder.
+fn replace_sql_marker(sql: &str, marker: &str, replacement: &str) -> Option<String> {
     let mut out = String::with_capacity(sql.len());
-    let mut held = Vec::new();
-    let mut rest = sql;
-    while let Some(at) = rest.find(OPEN) {
-        out.push_str(&rest[..at]);
-        let body = &rest[at + OPEN.len()..];
-        // SQL literal: '' is a quote inside it.
-        let mut needle = String::new();
-        let mut chars = body.char_indices().peekable();
-        let mut end = None;
-        while let Some((i, c)) = chars.next() {
-            if c == '\'' {
-                if chars.peek().map(|(_, n)| *n) == Some('\'') {
-                    chars.next();
-                    needle.push('\'');
-                } else {
-                    end = Some(i + 1);
-                    break;
-                }
-            } else {
-                needle.push(c);
+    let bytes = sql.as_bytes();
+    let (mut at, mut copied, mut changed) = (0, 0, false);
+    while at < bytes.len() {
+        if bytes[at] == b'\'' {
+            at += 1;
+            while at < bytes.len() {
+                if bytes[at] == b'\'' {
+                    at += 1;
+                    if at < bytes.len() && bytes[at] == b'\'' { at += 1; }
+                    else { break; }
+                } else { at += 1; }
             }
-        }
-        let Some(end) = end.filter(|&e| body[e..].starts_with(')')) else {
-            out.push_str(&rest[at..]);
-            return Ok((out, held));
-        };
-        let whole = &rest[at..at + OPEN.len() + end + 1];
-        match free_selection(session, src, &needle)? {
-            Some(selection) => {
-                out.push_str(&format!("id IN (SELECT id FROM {})", selection.name));
-                held.push(selection);
-            }
-            None => out.push_str(whole),
-        }
-        rest = &body[end + 1..];
+        } else if bytes[at..].starts_with(marker.as_bytes()) {
+            out.push_str(&sql[copied..at]);
+            out.push_str(replacement);
+            at += marker.len();
+            copied = at;
+            changed = true;
+        } else { at += 1; }
     }
-    out.push_str(rest);
-    Ok((out, held))
+    if !changed { return None; }
+    out.push_str(&sql[copied..]);
+    Some(out)
 }
 
-fn free_selection(session: &Session, src: &Source, needle: &str) -> Result<Option<Arc<Selection>>> {
-    let key = format!("free#{needle}");
+/// Resolve whole free-text terms, including effective names/descriptions.
+/// Narrow terms become one candidate membership predicate: this avoids the
+/// old million-row enrichment + MARK join even when only ten records match.
+fn resolve_free(session: &Session, src: &Source, sql: &str, tests: &Tests) -> Result<(String, Vec<Arc<Selection>>, bool)> {
+    let mut sql = sql.to_string();
+    let mut held = Vec::new();
+    let mut names = false;
+    for term in &tests.free {
+        if replace_sql_marker(&sql, &term.marker, "TRUE").is_none() { continue; }
+        let replacement = match free_selection(session, src, term)? {
+            Some(selection) => {
+                let predicate = format!("id IN (SELECT id FROM {})", selection.name);
+                held.push(selection);
+                predicate
+            }
+            None => {
+                names = true;
+                format!("(contains(vals, {}) OR {})", lit(&term.needle), term.names_sql)
+            }
+        };
+        sql = replace_sql_marker(&sql, &term.marker, &replacement).expect("planner marker found");
+    }
+    Ok((sql, held, names))
+}
+
+fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) -> Result<Option<Arc<Selection>>> {
+    let needle = &term.needle;
+    let key = format!("free-v2#{needle}");
     if let Some(found) = session.cached_selection(&key) {
         return Ok(Some(found));
     }
-    let Some(candidates) = session.free_candidates(needle, FREE_LIMIT) else { return Ok(None) };
-    // Confirmed on the stored text of the candidates only (the original file
-    // would be read line by line, slowly on a cold disk).
-    let _ = src;
-    let pending = selection(session, &candidates)?;
-    let found = selection_query(
-        session,
-        &format!(
-            "SELECT id FROM ev WHERE id IN (SELECT id FROM {}) AND contains(vals, {}) ORDER BY id",
-            pending.name,
-            lit(needle)
-        ),
-    )?;
-    drop(pending);
+    // The text index covers stored values AND intrinsic names/descriptions.
+    // Catalog overrides are a separate, small source/code relation.
+    let Some(mut candidates) = session.free_candidates(needle, FREE_LIMIT) else { return Ok(None) };
+    if !session.baked {
+        let catalog = read_ids(session, &format!(
+            "SELECT ev.id FROM ev INNER JOIN (SELECT source, code FROM enr WHERE {}) matched USING (source, code) LIMIT {}",
+            term.names_sql, FREE_LIMIT + 1
+        ))?;
+        if catalog.len() > FREE_LIMIT { return Ok(None); }
+        candidates.extend(catalog);
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.len() > FREE_LIMIT { return Ok(None); }
+    }
+    let found = if candidates.len() <= 4_096 {
+        // Random access through existing line offsets avoids scanning columnar
+        // row IDs/text to confirm a tiny candidate set. The canonical matcher
+        // also avoids allocating a second joined copy of a very wide record.
+        let mut confirmed = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            crate::operations::check()?;
+            let event = src.event(id);
+            if crate::querylang::any_value(&event, &|value| {
+                crate::query::ci_contains_bytes(value.as_bytes(), needle.as_bytes())
+            })
+            { confirmed.push(id); }
+        }
+        selection(session, &confirmed)?
+    } else {
+        let pending = selection(session, &candidates)?;
+        selection_query(session, &format!(
+            "SELECT id FROM evn WHERE id IN (SELECT id FROM {}) AND (contains(vals, {}) OR {}) ORDER BY id",
+            pending.name, lit(needle), term.names_sql
+        ))?
+    };
     session.cache_selection(key, Arc::clone(&found));
     Ok(Some(found))
 }
@@ -248,8 +277,8 @@ fn intersect(a: &[usize], b: &[usize]) -> Vec<usize> {
 /// Line numbers matching every filter, in file order.
 fn matching_ids(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Vec<usize>> {
     let plan = session.schema.plan(pfs);
-    let from = if plan.names { "evn" } else { "ev" };
-    let (sql, _free) = resolve_free(session, src, &plan.sql)?;
+    let (sql, _free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    let from = if plan.names || free_names { "evn" } else { "ev" };
     let mut ids = read_ids(session, &format!("SELECT id FROM {from} WHERE {sql} ORDER BY id"))?;
     drop(plan.tests);
     for &i in &plan.lines {
@@ -293,12 +322,12 @@ fn costly(sql: &str) -> bool {
 
 fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Scope<'s>> {
     let plan = session.schema.plan(pfs);
-    let (sql, free) = resolve_free(session, src, &plan.sql)?;
+    let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
     if plan.exact() && !costly(&sql) {
         return Ok(Scope {
             session,
             cond: sql,
-            names: plan.names,
+            names: plan.names || free_names,
             _tests: plan.tests,
             _selection: None,
             _free: free,
@@ -320,7 +349,7 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
         });
     }
     let selection = if plan.exact() {
-        let from = if plan.names { "evn" } else { "ev" };
+        let from = if plan.names || free_names { "evn" } else { "ev" };
         // Keep a potentially 50M-row selection inside DuckDB, whose buffer
         // manager can spill it, instead of a Rust Vec followed by another copy.
         selection_query(session, &format!("SELECT id FROM {from} WHERE {sql}"))?
@@ -346,8 +375,8 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
 fn page_scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<(Scope<'s>, bool)> {
     let plan = session.schema.plan(pfs);
     let exact = plan.exact();
-    let (sql, free) = resolve_free(session, src, &plan.sql)?;
-    Ok((Scope { session, cond: sql, names: plan.names, _tests: plan.tests, _selection: None, _free: free }, exact))
+    let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    Ok((Scope { session, cond: sql, names: plan.names || free_names, _tests: plan.tests, _selection: None, _free: free }, exact))
 }
 
 fn new_selection(session: &Session) -> Arc<Selection> {
@@ -804,6 +833,14 @@ fn after_cursor(sort: &[SortKey], keys: &[CursorKey]) -> Result<String> {
 mod interactive_contract_tests {
     use super::*;
 
+    #[test]
+    fn free_markers_are_not_replaced_inside_user_sql_literals() {
+        let sql = "__li_free_7() OR value = 'O''Reilly __li_free_7()'";
+        assert_eq!(replace_sql_marker(sql, "__li_free_7()", "id IN (SELECT id FROM chosen)").unwrap(),
+            "id IN (SELECT id FROM chosen) OR value = 'O''Reilly __li_free_7()'");
+        assert!(replace_sql_marker("'__li_free_7()'", "__li_free_7()", "FALSE").is_none());
+    }
+
     fn filters(column: &str, op: &str, value: &str) -> Vec<PreparedFilter> {
         crate::query::prepare(&[crate::query::Filter { column: column.into(), op: op.into(), value: value.into(), value2: None }])
     }
@@ -879,6 +916,38 @@ pub(crate) fn base_page_safe(pfs: &[PreparedFilter], sort: &str) -> bool {
     })
 }
 
+fn page_fingerprint(src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str, base_safe: bool) -> Result<String> {
+    let source_key = super::spec(src.idx, src.codes, src.system, if base_safe { &[] } else { src.derived })
+        .ok_or("Fonte indisponível para paginação.")?.key;
+    let filters: Vec<_> = pfs.iter().map(|pf| &pf.f).collect();
+    let mut hash = Sha256::new();
+    hash.update(source_key);
+    hash.update(super::catalogs_signature(src.codes, src.system));
+    hash.update(serde_json::to_vec(&(filters, sort_column, sort_dir)).map_err(err)?);
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn page_seek(cursor: Option<&str>, sort: &[SortKey], fingerprint: &str, rows: usize, offset: usize) -> Result<(String, usize)> {
+    let Some(value) = cursor else { return Ok(("TRUE".into(), offset)); };
+    if value.len() > 1_100_000 {
+        return Err("PAGINATION_RESET_REQUIRED: Cursor de paginação excede o limite.".into());
+    }
+    let cursor: PageCursor = serde_json::from_str(value).map_err(|_| "PAGINATION_RESET_REQUIRED: Cursor de paginação inválido.".to_string())?;
+    if cursor.version != 1 || cursor.fingerprint != fingerprint {
+        return Err("PAGINATION_RESET_REQUIRED: A consulta mudou. Recarregue a primeira página.".into());
+    }
+    if cursor.position > rows {
+        return Err("PAGINATION_RESET_REQUIRED: Posição de paginação inválida.".into());
+    }
+    Ok((after_cursor(sort, &cursor.keys)?, cursor.position))
+}
+
+fn page_statement(scope: &Scope, sort: &[SortKey], names: bool, seek: &str, batch: usize, offset: usize) -> String {
+    let order = sort.iter().map(|key| format!("{} {}", key.sql, if key.desc { "DESC" } else { "ASC" })).collect::<Vec<_>>().join(", ");
+    let projection = sort.iter().map(|key| key.sql.as_str()).collect::<Vec<_>>().join(", ");
+    format!("SELECT id, {projection} FROM {} WHERE ({}) AND {seek} ORDER BY {order} LIMIT {batch} OFFSET {offset}", scope.from(names), scope.cond)
+}
+
 /// Page-size work in Rust and no mandatory COUNT. Returns None only when no
 /// suitable store is ready; the caller can explicitly report the line fallback.
 pub(crate) fn query_page(
@@ -900,34 +969,10 @@ pub(crate) fn query_page(
     let _names = session.names_guard();
     Some((|| {
         crate::operations::check()?;
-        let source_key = super::spec(src.idx, src.codes, src.system, if base_safe { &[] } else { src.derived })
-            .ok_or("Fonte indisponível para paginação.")?.key;
-        let filters: Vec<_> = pfs.iter().map(|pf| &pf.f).collect();
-        let mut hash = Sha256::new();
-        hash.update(source_key);
-        hash.update(super::catalogs_signature(src.codes, src.system));
-        hash.update(serde_json::to_vec(&(filters, sort_column, sort_dir)).map_err(err)?);
-        let fingerprint = format!("{:x}", hash.finalize());
+        let fingerprint = page_fingerprint(src, pfs, sort_column, sort_dir, base_safe)?;
         let (scope, exact) = page_scope(&session, src, pfs)?;
         let (sort, names) = page_sort(&scope, sort_column, sort_dir)?;
-        let (after, position) = match cursor {
-            Some(value) => {
-                if value.len() > 1_100_000 {
-                    return Err("PAGINATION_RESET_REQUIRED: Cursor de paginação excede o limite.".into());
-                }
-                let cursor: PageCursor = serde_json::from_str(value).map_err(|_| "PAGINATION_RESET_REQUIRED: Cursor de paginação inválido.".to_string())?;
-                if cursor.version != 1 || cursor.fingerprint != fingerprint {
-                    return Err("PAGINATION_RESET_REQUIRED: A consulta mudou. Recarregue a primeira página.".into());
-                }
-                if cursor.position > src.idx.lines.len() {
-                    return Err("PAGINATION_RESET_REQUIRED: Posição de paginação inválida.".into());
-                }
-                (after_cursor(&sort, &cursor.keys)?, cursor.position)
-            }
-            None => ("TRUE".into(), offset),
-        };
-        let order = sort.iter().map(|key| format!("{} {}", key.sql, if key.desc { "DESC" } else { "ASC" })).collect::<Vec<_>>().join(", ");
-        let projection = sort.iter().map(|key| key.sql.as_str()).collect::<Vec<_>>().join(", ");
+        let (after, position) = page_seek(cursor, &sort, &fingerprint, src.idx.lines.len(), offset)?;
         let mut offset_sql = if cursor.is_some() || !exact { 0 } else { offset };
         let mut skip_matches = if cursor.is_none() && !exact { offset } else { 0 };
         let mut seek = after;
@@ -935,7 +980,7 @@ pub(crate) fn query_page(
         let batch_size = if exact { limit.saturating_add(1) } else { limit.saturating_add(1).max(1_024) };
         loop {
             crate::operations::check()?;
-            let sql = format!("SELECT id, {projection} FROM {} WHERE ({}) AND {seek} ORDER BY {order} LIMIT {batch_size} OFFSET {offset_sql}", scope.from(names), scope.cond);
+            let sql = page_statement(&scope, &sort, names, &seek, batch_size, offset_sql);
             let candidates = rows(&session, &sql, |row| {
                 let id = row.get::<_, i64>(0)? as usize;
                 let keys = sort.iter().enumerate().map(|(i, key)| {
@@ -985,15 +1030,31 @@ pub(crate) fn explain_page(
     src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str,
     limit: usize, analyze: bool,
 ) -> Option<Result<Value>> {
-    let session = ready_session(src, base_page_safe(pfs, sort_column))?;
+    explain_page_at(src, pfs, sort_column, sort_dir, 0, limit, None, analyze)
+}
+
+pub(crate) fn explain_page_at(
+    src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize, cursor: Option<&str>, analyze: bool,
+) -> Option<Result<Value>> {
+    let base_safe = base_page_safe(pfs, sort_column);
+    let session = ready_session(src, base_safe)?;
     let _names = session.names_guard();
     Some((|| {
+        let fingerprint = page_fingerprint(src, pfs, sort_column, sort_dir, base_safe)?;
         let (scope, exact) = page_scope(&session, src, pfs)?;
         let (sort, names) = page_sort(&scope, sort_column, sort_dir)?;
-        let order = sort.iter().map(|key| format!("{} {}", key.sql, if key.desc { "DESC" } else { "ASC" })).collect::<Vec<_>>().join(", ");
-        let sql = format!("SELECT id FROM {} WHERE {} ORDER BY {order} LIMIT {}", scope.from(names), scope.cond, limit.clamp(1, 2_000));
+        let (seek, _) = page_seek(cursor, &sort, &fingerprint, src.idx.lines.len(), offset)?;
+        let limit = limit.clamp(1, 2_000);
+        let batch = if exact { limit + 1 } else { (limit + 1).max(1_024) };
+        let sql = page_statement(&scope, &sort, names, &seek, batch, if cursor.is_some() || !exact { 0 } else { offset });
         let plan = rows(&session, &format!("EXPLAIN {}{sql}", if analyze { "ANALYZE " } else { "" }), |row| row.get::<_, String>(1))?.join("\n");
-        Ok(serde_json::json!({ "sql": sql, "plan": plan, "analyzed": analyze, "exactPredicate": exact }))
+        let profile = if analyze {
+            let value = rows(&session, &format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"), |row| row.get::<_, String>(1))?.join("\n");
+            Some(serde_json::from_str::<Value>(&value).map_err(err)?)
+        } else { None };
+        Ok(serde_json::json!({ "sql": sql, "plan": plan, "profile": profile, "analyzed": analyze, "exactPredicate": exact,
+            "candidateBatchSize": batch, "note": "Explains the actual first candidate batch; candidate discovery and event hydration are outside this SQL profile." }))
     })())
 }
 

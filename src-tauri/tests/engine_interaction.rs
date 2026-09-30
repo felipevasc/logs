@@ -61,6 +61,7 @@ fn interactive_workload() {
         ("rare_exact_id", json!([{"column":"trace_id","op":"equals_exact","value":point_id}]).to_string()),
         ("service_and_level", json!([{"column":"source","op":"equals_exact","value":"service-1"},{"column":"level","op":"equals_exact","value":"Erro"}]).to_string()),
         ("rare_substring", json!([{"column":"_all","op":"query","value":"rareneedle"}]).to_string()),
+        ("rare_hex_free", json!([{"column":"_all","op":"query","value":point_id}]).to_string()),
     ];
     for (name, filters) in workloads {
         let mut timings = Vec::with_capacity(repeats);

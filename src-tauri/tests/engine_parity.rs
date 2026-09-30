@@ -610,7 +610,7 @@ fn interactive_pages_seek_without_duplicates_and_keep_exact_api_semantics() {
     ).unwrap();
     let sql = diagnostic["sql"].as_str().unwrap();
     assert!(sql.contains("ts >= 1772359200000"));
-    assert!(sql.contains("LIMIT 7"));
+    assert!(sql.contains("LIMIT 8"));
     assert!(!sql.to_ascii_lowercase().contains("count("));
     assert!(!sql.contains("li_ntest"));
     assert!(diagnostic["plan"].as_str().is_some_and(|plan| !plan.is_empty()));
@@ -695,4 +695,62 @@ fn base_analytics_stay_indexed_while_derived_store_is_pending() {
     let derived_filter = filters_of(&[("record_number", "equals_exact", "12")]);
     assert_eq!(source.count(Engine::Columnar, &derived_filter), 1);
     same("derived field after preparation", source.page(&derived_filter, "timestamp", "asc", 0, 7, None)["rows"].clone(), source.query(Engine::Lines, &derived_filter, "timestamp", "asc", 0, 7)["rows"].clone());
+}
+
+#[test]
+fn selective_free_text_keeps_catalog_derived_and_hex_semantics() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOGINSIGHT_DATA_DIR", dir.path().join("dados"));
+    testkit::set_engine_dir(&dir.path().join("motor").to_string_lossy());
+    let file = write(dir.path(), "free.jsonl", &json_lines(81, 250));
+    let src = Source::open(&[&file], CODES, "[]").unwrap();
+    src.prepare().unwrap();
+    for expression in [
+        "timeout", "falha", "conta", "não encontrado", "Ação", "ſ", "3f2a1b4c", "444455556666",
+        "falha OR timeout", "NOT falha", "falha AND source:auth", "source:auth OR timeout", "time*",
+        "name:Falha AND falha", "description:Conta OR root",
+    ] {
+        let filters = filters_of(&[("_all", "query", expression)]);
+        assert_eq!(src.matches(Engine::Columnar, &filters), src.matches(Engine::Lines, &filters), "{expression}");
+        assert_eq!(src.count(Engine::Columnar, &filters), src.count(Engine::Lines, &filters), "count {expression}");
+        let page = src.page(&filters, "timestamp", "asc", 0, 100, None);
+        assert_eq!(page["rows"], src.query(Engine::Lines, &filters, "timestamp", "asc", 0, 100)["rows"], "page {expression}");
+    }
+    let filters = filters_of(&[("_all", "query", "timeout")]);
+    let plan = src.explain_page(&filters, "timestamp", "asc", 100, true).unwrap();
+    assert!(!plan["sql"].as_str().unwrap().contains("evn"));
+    assert!(!plan["plan"].as_str().unwrap().contains("Join Type: MARK"));
+    assert!(!plan["plan"].as_str().unwrap().contains("Join Type: LEFT"));
+    let replaced = Source::open(&[&file], r#"{"*":{"4625":{"name":"Replacement Catalog","description":"A different description"}}}"#, "[]").unwrap();
+    replaced.prepare().unwrap();
+    for expression in ["Replacement", "falha", "different"] {
+        let filters = filters_of(&[("_all", "query", expression)]);
+        assert_eq!(replaced.matches(Engine::Columnar, &filters), replaced.matches(Engine::Lines, &filters), "catalog edit {expression}");
+    }
+    let derived = Source::open(&[&file], CODES, r#"[{"name":"conta","source":"message","rules":[{"pattern":"for (\\w+) from","filter":{"column":"name","op":"contains","value":"logon"}}]}]"#).unwrap();
+    derived.prepare().unwrap();
+    for expression in ["falha", "root", "conta:root OR falha", "NOT timeout"] {
+        let filters = filters_of(&[("_all", "query", expression)]);
+        assert_eq!(derived.matches(Engine::Columnar, &filters), derived.matches(Engine::Lines, &filters), "derived {expression}");
+    }
+}
+
+#[test]
+fn free_text_large_candidate_sets_keep_catalog_confirmation_exact() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOGINSIGHT_DATA_DIR", dir.path().join("dados"));
+    testkit::set_engine_dir(&dir.path().join("motor").to_string_lossy());
+    let mut records = String::new();
+    for i in 0..4_200 {
+        writeln!(records, "{}", json!({"timestamp":1_772_359_200_000i64+i,"source":"auth","event_id":"4625","message":format!("plain record {i}")})).unwrap();
+    }
+    let file = write(dir.path(), "large-candidates.jsonl", &records);
+    let source = Source::open(&[&file], CODES, "[]").unwrap();
+    source.prepare().unwrap();
+    for expression in ["falha", "NOT falha", "falha AND plain", "conta OR absent"] {
+        let filters = filters_of(&[("_all", "query", expression)]);
+        assert_eq!(source.matches(Engine::Columnar, &filters), source.matches(Engine::Lines, &filters), "{expression}");
+    }
 }

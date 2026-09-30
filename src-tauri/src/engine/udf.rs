@@ -28,6 +28,13 @@ static NEXT: AtomicI32 = AtomicI32::new(1);
 #[derive(Default)]
 pub(crate) struct Tests {
     ids: Vec<i32>,
+    pub(crate) free: Vec<FreeText>,
+}
+
+pub(crate) struct FreeText {
+    pub(crate) marker: String,
+    pub(crate) needle: String,
+    pub(crate) names_sql: String,
 }
 
 impl Tests {
@@ -46,6 +53,23 @@ impl Tests {
     pub(crate) fn number(&mut self, value: &str, test: NumberTest) -> String {
         let id = self.add(Test::Number(test));
         format!("li_ntest(CAST({value} AS DOUBLE), {id})")
+    }
+    /// A structured planner placeholder, expanded before SQL reaches DuckDB.
+    /// Keeping the complete free-text term together lets candidate selection
+    /// avoid a full enrichment join without dropping name/description matches.
+    pub(crate) fn free_text(&mut self, needle: &str) -> String {
+        let owned = needle.to_string();
+        let test: TextTest = Arc::new(move |v| {
+            v.is_some_and(|v| crate::query::ci_contains_bytes(v.as_bytes(), owned.as_bytes()))
+        });
+        let id = self.add(Test::Text(test));
+        let marker = format!("__li_free_{id}()");
+        self.free.push(FreeText {
+            marker: marker.clone(),
+            needle: needle.into(),
+            names_sql: format!("(li_test(name, {id}) OR li_test(description, {id}))"),
+        });
+        marker
     }
 }
 

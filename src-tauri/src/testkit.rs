@@ -206,6 +206,11 @@ impl Source {
         Self::columnar("explain page", crate::engine::explain_page(&self.engine(), &query::prepare(&filters), sort, dir, limit, analyze))
     }
 
+    pub fn explain_page_at(&self, filters: &str, sort: &str, dir: &str, offset: usize, limit: usize, cursor: Option<&str>, analyze: bool) -> Result<Value, String> {
+        let filters: Vec<Filter> = parse(filters);
+        Self::columnar("explain page", crate::engine::explain_page_at(&self.engine(), &query::prepare(&filters), sort, dir, offset, limit, cursor, analyze))
+    }
+
     pub fn explore(&self, engine: Engine, filters: &str, sort: &str, dir: &str) -> Value {
         let filters: Vec<Filter> = parse(filters);
         match engine {

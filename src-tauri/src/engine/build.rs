@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Store layout version; part of every store key.
-pub(crate) const STORE_VERSION: u32 = 4;
+pub(crate) const STORE_VERSION: u32 = 5;
 /// Lines sampled to choose which fields become their own columns.
 const SAMPLE: usize = 20_000;
 /// Fields beyond this many live in the overflow lists (still exact, slower).
@@ -874,7 +874,10 @@ fn write(
                     }
                     // Each parsing task feeds the text index directly.
                     let indexed = rows.iter().enumerate().try_for_each(|(r, row)| {
-                        text.add((from + r) as u32, super::text::words(&row.vals))
+                        let mut words = super::text::words(&row.vals);
+                        words.extend(super::text::words(&row.pname.to_lowercase()));
+                        words.extend(super::text::words(&row.pdesc.to_lowercase()));
+                        text.add((from + r) as u32, words)
                     });
                     (
                         batch_of(&rows, from as u32, wide_fields.len(), &schema),
