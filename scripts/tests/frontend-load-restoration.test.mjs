@@ -47,7 +47,7 @@ function harness(store = { active: 'case', cases: [{ id: 'case', artifacts: [] }
     section('function storeCurrentArtifactInSession()', '\nfunction updateContextBar()'),
     section('function registerCurrentArtifact(', '\nfunction activeStation()'),
     section('let casesSaveQueue =', '\nfunction defaultCaseWorkspace()'),
-    section('async function loadData(', '\nasync function clearData('),
+    section('function clearSourceRecovery()', '\nasync function clearData('),
   ]) vm.runInContext(code, context);
   return {
     context, state, events, get persisted() { return persisted; }, get rowsPainted() { return rowsPainted; }, get completed() { return completed; },

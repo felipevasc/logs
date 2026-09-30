@@ -36,6 +36,8 @@ mod query;
 mod querylang;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod publication_tests;
 mod remote;
 mod resources;
 mod sigma;
@@ -149,6 +151,22 @@ where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
     let token = operations::token(operation_id)?;
     tauri::async_runtime::spawn_blocking(move || operations::run_with_token(token, f))
         .await.map_err(|e| e.to_string())?
+}
+
+/// Cancellation may arrive while existing readers hold the source. Recheck
+/// under the acquired write guard, before replacing or merging any state.
+pub(crate) fn source_write_checked(
+    state: &AppState,
+) -> Result<parking_lot::RwLockWriteGuard<'_, SourceData>, String> {
+    loop {
+        operations::check()?;
+        if let Some(source) = state.source.try_write_for(std::time::Duration::from_millis(50)) {
+            // Cancellation could arrive at the same instant the final reader
+            // released the lock. Check again before allowing any mutation.
+            operations::check()?;
+            return Ok(source);
+        }
+    }
 }
 
 /// Reject a changed/truncated mapped source before an infallible legacy reader
@@ -270,7 +288,8 @@ pub(crate) fn load_event_log_impl(
     let mut idx = workspace::index_channel(channel, max_events)?;
     operations::check()?;
     prepare_engine(state, &idx, app)?;
-    let mut source = state.source.write();
+    emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
+    let mut source = source_write_checked(state)?;
     let mut names = vec![format!("Event Log: {channel}")];
     if merge.unwrap_or(false) {
         match std::mem::replace(&mut *source, SourceData::None) {
@@ -444,7 +463,8 @@ pub(crate) fn load_file_impl(
         false,
     );
     prepare_engine(state, &idx, app)?;
-    let mut source = state.source.write();
+    emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
+    let mut source = source_write_checked(state)?;
     let mut idx = idx;
     let mut names = vec![format!("Arquivo: {path}")];
     if merge.unwrap_or(false) {
@@ -585,7 +605,8 @@ pub(crate) fn load_files_impl(
     operations::check()?;
     let idx = indices.unwrap();
     prepare_engine(state, &idx, app)?;
-    let mut source = state.source.write();
+    emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
+    let mut source = source_write_checked(state)?;
     let mut idx = idx;
     if merge.unwrap_or(false) {
         match std::mem::replace(&mut *source, SourceData::None) {
@@ -1174,17 +1195,24 @@ pub(crate) fn save_custom_format_impl(
 }
 
 #[tauri::command]
-async fn clear_events(app: AppHandle) -> Result<(), String> {
+async fn clear_events(app: AppHandle, operation_id: Option<String>) -> Result<(), String> {
     // Waiting for existing source readers and releasing native sessions can
     // take time; neither belongs on the WebView's synchronous IPC callback.
-    offload(move || {
+    offload_operation(operation_id, move || {
         let state = app.state::<AppState>();
         clear_events_impl(state.inner())
     }).await
 }
 
 pub(crate) fn clear_events_impl(state: &AppState) {
-    let mut source = state.source.write();
+    let Ok(mut source) = source_write_checked(state) else {
+        // Keep the token cancelled so the desktop/MCP operation wrapper
+        // reports cancellation; no source or engine state has changed.
+        return;
+    };
+    // Once clearing starts, report it as committed even if Cancel All arrives
+    // while native sessions and metadata are being released.
+    operations::commit();
     engine::source_published(None);
     *source = SourceData::None;
     state.source_names.write().clear();

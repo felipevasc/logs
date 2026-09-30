@@ -345,6 +345,7 @@
     }
   }
   async function clearAnalysis() {
+    if (!await clearData({ removeCurrent: true })) return;
     state.loaded = false;
     state.currentArtifact = null;
     state.columns = [];
@@ -548,8 +549,8 @@
   $("#ws-export").onclick = openExport; $("#ws-export-close").onclick = () => { $("#ws-export-modal").hidden = true; }; $("#ws-export-save").onclick = exportFile;
   $("#ws-export-kind").onchange = () => { const wholeCase=["case", "case-pdf", "report"].includes($("#ws-export-kind").value);$("#ws-export-scope").textContent=wholeCase?`Caso completo · ${fmtNum(activeCase()?.items?.length||0)} itens. Imagens acompanham a investigação JSON e o relatório PDF.`:`${currentCountLabel("registros")} no recorte atual.`;$("#ws-mask").closest("label").hidden=$("#ws-export-kind").value==="case-pdf"; };
   $("#ws-export-modal").onclick = e => { if (e.target.id === "ws-export-modal") e.target.hidden = true; };
-  $("#btn-load").onclick = async () => { await loadData(); if (state.loaded) { await loaded(); await showPage("summary"); } };
-  $("#btn-merge").onclick = async () => { await loadData(null, { merge: true }); if (state.loaded) { await loaded(); await showPage("summary"); } };
+  $("#btn-load").onclick = async () => { if (await loadData()) await showPage("summary"); };
+  $("#btn-merge").onclick = async () => { if (await loadData(null, { merge: true })) await showPage("summary"); };
   $("#workbar-cancel").onclick = cancelWorkbarTask;
   $("#tabbtn-group").innerHTML = '<i class="fas fa-layer-group"></i> Agrupar';
   $("#tabbtn-dashboard").innerHTML = '<i class="fas fa-chart-line"></i> Gráficos';

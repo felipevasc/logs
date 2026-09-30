@@ -72,7 +72,8 @@ pub async fn load_bundle(
         };
         let state = app.state::<AppState>();
         crate::prepare_engine(state.inner(), &idx, Some(&app))?;
-        let mut source = state.source.write();
+        crate::emit_progress(Some(&app), "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
+        let mut source = crate::source_write_checked(state.inner())?;
         crate::operations::commit();
         crate::engine::source_published(Some(&idx));
         *source = SourceData::Indexed(idx);

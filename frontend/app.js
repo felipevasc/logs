@@ -493,7 +493,7 @@ async function syncActiveCaseArtifacts() {
     await activateArtifact(session.activeId);
     return;
   }
-  if (state.currentArtifact || state.loaded) await clearData();
+  if (state.currentArtifact || state.loaded || window.Tasks?.pendingSources?.()) await clearData();
   else updateContextBar();
 }
 
@@ -593,11 +593,16 @@ async function api(cmd, args = {}, opts = {}) {
     if (args.filters?.length) await invoke("validate_filters", { filters: args.filters });
     if (opts.cancelled?.()) throw new Error("Operação cancelada.");
     if (/^(load_|clear_|set_|save_|delete_|harvest_)/.test(cmd)) { state.explorerCache = null; state.datasetRevision++; explorerAnalytics.clear(); }
+    const preparedArgs = async (retry = false) => {
+      const prepared = await caseArgs(args, retry);
+      if (opts.cancelled?.()) throw new Error("Operação cancelada.");
+      return prepared;
+    };
     try {
-      return await invoke(cmd, await caseArgs(args));
+      return await invoke(cmd, await preparedArgs());
     } catch (error) {
       // The backend keeps a few versions; a missing one is sent again once.
-      if (String(error).includes("CASE_CACHE_MISS")) return await invoke(cmd, await caseArgs(args, true));
+      if (String(error).includes("CASE_CACHE_MISS")) return await invoke(cmd, await preparedArgs(true));
       throw error;
     }
   } catch (e) {
@@ -826,9 +831,45 @@ function skeletonRows() {
   }
 }
 
+function clearSourceRecovery() {
+  state.sourceIdentityUnconfirmed = false;
+  const notice = $("#source-recovery"); if (notice) notice.hidden = true;
+}
+
+function sourceIdentityUnavailable(source) {
+  const message = "A troca de fonte não foi concluída e a fonte ativa não pôde ser confirmada. Reabra uma fonte para continuar a Análise.";
+  state.refreshVersion++; state.datasetRevision++; treeAggVersion.dataset++; cubeState.requestVersion++;
+  explorerAnalytics.clear(); window.Discovery?.clearCache(); window.Security?.invalidate();
+  Object.assign(state, { sourceIdentityUnconfirmed: true, loaded: false, currentArtifact: null, currentOrigin: "", rows: [], total: null, columns: [], pageResult: null, dataPeriod: null, facetData: null, explorerCache: null, queryError: message, datasetDashboard: null, datasetCube: null, datasetProfiles: null });
+  state.treeAgg.dataset = null; state.treeAggSig.dataset = null; state.treeAggError.dataset = message;
+  cubeState.result = null;
+  renderTable({ rows: [], total: 0 }); renderChart({ buckets: [], levels: [] }); renderExploreTree();
+  for (const selector of ["#group-table thead", "#group-table tbody", "#cube-table thead", "#cube-table tbody", "#dash-grid"]) $(selector)?.replaceChildren();
+  let notice = $("#source-recovery");
+  if (!notice) { notice = el("div", "notice"); notice.id = "source-recovery"; notice.setAttribute("role", "alert"); $("#workspace-home").before(notice); }
+  notice.hidden = false; notice.replaceChildren(document.createTextNode(message));
+  if (source?.kind) {
+    const retry = el("button", "btn primary small", "Reabrir fonte");
+    retry.onclick = async () => { retry.disabled = true; if (!await loadData(source)) retry.disabled = false; };
+    notice.append(retry);
+  }
+  if (workspaceScope() === "dataset") window.Workspace?.showPage("summary");
+  updateContextBar(); finishOperation("Fonte não confirmada", "Reabra uma fonte para continuar.");
+}
+
 async function loadData(requestedSource = null, options = {}) {
+  const version = options.version ?? ++state.artifactSwitchVersion;
+  let caseId = options.caseId ?? state.cases.active;
+  const current = () => version === state.artifactSwitchVersion && (!caseId || state.cases.active === caseId);
+  if (!current()) return false;
+  const sourceMayHaveChanged = window.Tasks?.pendingSources?.() || false;
+  let sourceAccepted = false, desiredSource = requestedSource || state.currentArtifact?.source;
+  window.Tasks?.cancelLatest("source-load");
+  state.refreshVersion++;
   await window.WorkspaceContext?.waitForSource();
+  if (!current()) return false;
   if (window.WorkspaceContext?.scope() === "case") await window.WorkspaceContext.setScope("dataset", { animate: false });
+  if (!current()) return false;
   const btn = $("#btn-load");
   btn.disabled = true;
   btn.innerHTML = '<i class="fas fa-circle-notch spin"></i> Carregando…';
@@ -839,23 +880,25 @@ async function loadData(requestedSource = null, options = {}) {
   skeletonRows();
   try {
     let source = requestedSource ? { ...requestedSource } : sourceSpecFromControls();
+    desiredSource = source;
     if (source.kind === "file") {
       source.paths = source.paths?.filter(Boolean)?.length
         ? source.paths
         : (source.path ? [source.path] : []);
       if (!source.paths.length) {
         await browseFile();
+        if (!current()) return false;
         source.paths = $("#file-path").value.split(";").map((s) => s.trim()).filter(Boolean);
         source.path = source.paths[0] || "";
         if (!source.paths.length) return;
       }
     }
     if (source.kind === "eventlog" && !source.channel) source.channel = "Application";
-    const c = options.caseId
-      ? state.cases.cases.find((item) => item.id === options.caseId)
+    const c = caseId
+      ? state.cases.cases.find((item) => item.id === caseId)
       : ensureCase();
-    if (!c || state.cases.active !== c.id) return;
-    const version = options.version ?? ++state.artifactSwitchVersion;
+    if (!c || !current() || state.cases.active !== c.id) return false;
+    caseId = c.id;
     let merge = !!options.merge;
     if (merge && state.currentArtifact?.source) {
       const currentMembers = state.currentArtifact.source.kind === "bundle"
@@ -877,22 +920,24 @@ async function loadData(requestedSource = null, options = {}) {
       source = { kind: "bundle", members: uniqueMembers, path: uniqueMembers[0]?.path || uniqueMembers[0]?.channel || "" };
       merge = false;
     }
+    desiredSource = source;
     applySourceSpec(source);
     let summary;
     if (source.kind === "bundle") {
-      summary = await api("load_bundle", { members: source.members.map(s => s.kind === "file" ? { ...s, paths: s.paths?.length ? s.paths : [s.path], format: s.format || "auto" } : { ...s, maxEvents: s.maxEvents || 5000 }) }, { silent: true });
+      summary = await api("load_bundle", { members: source.members.map(s => s.kind === "file" ? { ...s, paths: s.paths?.length ? s.paths : [s.path], format: s.format || "auto" } : { ...s, maxEvents: s.maxEvents || 5000 }) }, { silent: true, latest: "source-load" });
     } else if (source.kind === "file") {
       summary = source.paths.length > 1
-        ? await api("load_files", { paths: source.paths, format: source.format || "auto", merge }, { silent: true })
-        : await api("load_file", { path: source.path, format: source.format || "auto", merge }, { silent: true });
+        ? await api("load_files", { paths: source.paths, format: source.format || "auto", merge }, { silent: true, latest: "source-load" })
+        : await api("load_file", { path: source.path, format: source.format || "auto", merge }, { silent: true, latest: "source-load" });
     } else {
       summary = await api("load_event_log", {
         channel: source.channel,
         maxEvents: source.maxEvents || 5000,
         merge,
-      }, { silent: true });
+      }, { silent: true, latest: "source-load" });
     }
-    if (version !== state.artifactSwitchVersion || state.cases.active !== c.id) return;
+    if (!current()) return false;
+    sourceAccepted = true; clearSourceRecovery();
     updateOperation("Artefato carregado", `${fmtNum(summary.count)} eventos indexados`);
     state.columns = summary.columns;
     const savedArtifact = c.artifacts?.find((a) => a.id === artifactIdFromSource(source));
@@ -933,7 +978,8 @@ async function loadData(requestedSource = null, options = {}) {
       const linked = currentCaseArtifact();
       const st = linked ? caseStations().find((s) => s.id === linked.stationId) : null;
       if (st) state.currentOrigin = st.name;
-      await loadTsConfig(path);
+      await loadTsConfig(path, current);
+      if (!current()) return false;
     }
     state.datasetDashboard = null;
     state.datasetCube = null;
@@ -944,9 +990,10 @@ async function loadData(requestedSource = null, options = {}) {
     if (hasComments && !state.columns.includes("comentario")) state.columns.push("comentario");
     if (hasComments && !state.visibleCols.includes("comentario")) state.visibleCols.push("comentario");
     await refresh();
+    if (!current()) return false;
     // perfis dos campos alimentam os nós de valores/faixas da árvore de exploração
     api("profile_fields", { filters: [] }, { silent: true })
-      .then((profiles) => { state.datasetProfiles = profiles; renderExploreTree(); })
+      .then((profiles) => { if (current()) { state.datasetProfiles = profiles; renderExploreTree(); } })
       .catch(() => {});
     if (!savedArtifact?.visibleCols?.length && !restoredVisiblePreferences) autoVisibleCols();
     updateTsExample();
@@ -954,12 +1001,16 @@ async function loadData(requestedSource = null, options = {}) {
     // Rows are already visible, but a completed load must also survive an immediate restart.
     // The former snapshot query happened to outlast this debounced save; paging need not.
     const sessionSaved = await artifactSaved;
+    if (!current()) return false;
     finishOperation(sessionSaved === false ? "Registros disponíveis · sessão não salva" : "Artefato pronto", sessionSaved === false ? "Reabra a fonte manualmente se reiniciar o aplicativo." : state.total == null ? "Registros disponíveis · total em cálculo" : `${fmtNum(state.total)} eventos disponíveis`);
     hideLoadOverlay(sessionSaved !== false);
     await window.Workspace?.loaded();
+    if (!current()) return false;
     if (document.body.dataset.page === "summary") await window.Workspace?.showPage("summary");
-    return true;
+    return current();
   } catch (e) {
+    if (!current()) return false;
+    if (sourceMayHaveChanged && !sourceAccepted) { sourceIdentityUnavailable(desiredSource); toast(String(e), "err"); return false; }
     if (String(e).includes("ELEVATION_REQUIRED")) {
       status.textContent = "Este canal exige permissão de administrador.";
       status.classList.add("err");
@@ -980,15 +1031,28 @@ async function loadData(requestedSource = null, options = {}) {
     finishOperation("Falha ao carregar artefato", "Tente revisar a fonte ou o formato.");
     return false;
   } finally {
-    if (state.loadOverlay) hideLoadOverlay(false); // cobre cancelamento/erro
-    btn.disabled = false;
-    btn.innerHTML = '<i class="fas fa-play"></i> Carregar';
+    if (current()) {
+      if (sourceMayHaveChanged && !sourceAccepted && !state.sourceIdentityUnconfirmed) sourceIdentityUnavailable(desiredSource);
+      if (state.loadOverlay) hideLoadOverlay(false); // cobre cancelamento/erro
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-play"></i> Carregar';
+    }
   }
 }
 
 async function clearData({ removeCurrent = false } = {}) {
+  const version = ++state.artifactSwitchVersion;
+  const sourceMayHaveChanged = window.Tasks?.pendingSources?.() || false;
+  window.Tasks?.cancelLatest("source-load");
+  state.refreshVersion++;
   const artifact = state.currentArtifact;
-  await api("clear_events");
+  try { await api("clear_events", {}, { latest: "source-load" }); }
+  catch (error) { if (version !== state.artifactSwitchVersion) return false; if (sourceMayHaveChanged) sourceIdentityUnavailable(artifact?.source); throw error; }
+  if (version !== state.artifactSwitchVersion) return false;
+  clearSourceRecovery();
+  if (state.loadOverlay) hideLoadOverlay(false);
+  $("#btn-load").disabled = false;
+  $("#btn-load").innerHTML = '<i class="fas fa-play"></i> Carregar';
   if (removeCurrent && artifact) {
     const session = artifactSessionFor();
     if (session) {
@@ -1016,6 +1080,7 @@ async function clearData({ removeCurrent = false } = {}) {
   updateContextBar();
   if (state.activeDatasetTab === "cube" && state.analyticsScope === "dataset") runCube();
   finishOperation("Nenhuma fonte carregada");
+  return true;
 }
 
 // ------------------------------------------------------------------ filtros / chips
@@ -2330,13 +2395,14 @@ function buildTsConfig() {
   };
 }
 
-async function loadTsConfig(path) {
+async function loadTsConfig(path, current = () => true) {
   $("#ts-zone").value = ""; $("#ts-clock").value = "0";
   state.tsSources = [];
   $("#ts-regex").value = "";
   $("#ts-complement").value = "";
   try {
     const cfg = await api("get_ts_config", { path }, { silent: true });
+    if (!current()) return;
     if (cfg) {
       $("#ts-zone").value = cfg.timezone_offset_minutes == null ? "" : String(cfg.timezone_offset_minutes);
       $("#ts-clock").value = String((cfg.clock_adjustment_ms || 0) / 1000);
@@ -2354,7 +2420,7 @@ async function loadTsConfig(path) {
       }
     }
   } catch { /* sem config salva */ }
-  renderTsSources();
+  if (current()) renderTsSources();
 }
 
 async function testTsConfig() {
@@ -5724,8 +5790,8 @@ function bind() {
   $("#src-btn-eventlog").onclick = () => setSource("eventlog");
   $("#btn-browse").onclick = browseFile;
   $("#btn-refresh-channels").onclick = refreshChannels;
-  $("#btn-load").onclick = async () => { await loadData(null, { merge: state.loaded }); if (state.loaded) switchView("viz"); };
-  $("#btn-merge").onclick = async () => { await loadData(null, { merge: true }); if (state.loaded) switchView("viz"); };
+  $("#btn-load").onclick = async () => { if (await loadData(null, { merge: state.loaded })) switchView("viz"); };
+  $("#btn-merge").onclick = async () => { if (await loadData(null, { merge: true })) switchView("viz"); };
   $("#btn-clear").onclick = () => clearData({ removeCurrent: true });
   $("#btn-back-drive").onclick = () => switchView("source");
   $("#cm-close").onclick = () => { $("#comment-modal").hidden = true; };

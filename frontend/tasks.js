@@ -15,6 +15,8 @@ window.Tasks = (() => {
   const tasks = new Map(), inflight = new Map(), ids = new WeakMap();
   let serial = 0, arrays = 0, dialog = null, ticker = null;
   const named = new Set(["set_ts_config", "remote_import", "remote_test", "load_bundle", "journey_fields", "journey_index", "journey_events", "discover_patterns", "timeline_range", "query_page", "query_events", "explore_snapshot", "count_filtered", "stats_events", "tree_aggs", "aggregate_events", "compute_series", "pivot", "load_file", "load_files", "load_event_log", "engine_retry"]);
+  const sourceMutations = new Set(["load_file", "load_files", "load_bundle", "load_event_log", "clear_events"]);
+  named.add("clear_events");
   const latest = new Map();
   const background = window.PerformanceTools.queue(1);
 
@@ -53,7 +55,10 @@ window.Tasks = (() => {
     const entry = { id, cmd, args: operationId ? { ...args, operationId } : args, operationId, opts, read: READS.has(cmd), cancelled: false, owners: new Set(opts.latest ? [opts.latest] : []), keepAlive: !opts.latest, status: opts.background ? "queued" : "running", started: performance.now(), ...from };
     tasks.set(entry.id, entry);
     entry.promise = run(entry).then(result => {
-      if (entry.cancelled) throw new Error("Operação cancelada.");
+      // A successful source mutation already crossed the native commit boundary.
+      // Cancellation may have arrived too late; retain the committed result so the
+      // source intent guard can reconcile it instead of pretending it rolled back.
+      if (entry.cancelled && !sourceMutations.has(entry.cmd)) throw new Error("Operação cancelada.");
       return result;
     }, error => { if (!entry.cancelled && !opts.silent) toast(String(error), "err"); throw error; })
       .finally(() => { tasks.delete(entry.id); schedule(); if (inflight.get(entry.key2) === entry) inflight.delete(entry.key2); for (const [key, owner] of latest) if (owner === entry) latest.delete(key); });
@@ -116,7 +121,7 @@ window.Tasks = (() => {
     schedule();
   }
   function cancelLatest(key) { const entry = latest.get(key); latest.delete(key); if (!entry) return; entry.owners.delete(key); if (!entry.keepAlive && !entry.owners.size) cancel(entry); }
-  function cancelAll() { for (const task of tasks.values()) { task.cancelled = true; task.status = "cancelling"; } inflight.clear(); latest.clear(); schedule(); }
+  function cancelAll() { for (const task of tasks.values()) cancel(task); inflight.clear(); latest.clear(); schedule(); }
   function progress(payload) {
     if (!payload?.operationId) return null;
     const entry = [...tasks.values()].find(t => t.operationId === payload.operationId);
@@ -173,5 +178,5 @@ window.Tasks = (() => {
   button.innerHTML = '<i class="li-pulse" aria-hidden="true"></i><span></span>';
   button.onclick = openDialog;
   $("#workbar-label").before(button);
-  return { cancelAll, cancelLatest, cancelOperation: id => cancel([...tasks.values()].find(t => t.operationId === id)), progress, detail, operationFor: key => latest.get(key)?.operationId || null, pending: () => tasks.size, open: openDialog, running: () => visible().length, groups };
+  return { cancelAll, cancelLatest, cancelOperation: id => cancel([...tasks.values()].find(t => t.operationId === id)), progress, detail, operationFor: key => latest.get(key)?.operationId || null, pendingSources: () => [...tasks.values()].some(task => sourceMutations.has(task.cmd)), pending: () => tasks.size, open: openDialog, running: () => visible().length, groups };
 })();
