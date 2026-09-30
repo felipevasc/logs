@@ -265,6 +265,9 @@ pub(crate) struct Session {
     base: Mutex<Connection>,
     pool: Mutex<Vec<Connection>>,
     pub(crate) schema: sql::Schema,
+    /// Immutable-store proof, established once after every attached store is
+    /// validated. False also covers proof failure and keeps null-safe ordering.
+    pub(crate) timestamps_non_null: bool,
     baked: bool,
     /// Catalog fingerprint loaded into `enr`; readers hold it while querying names.
     names: RwLock<Option<(u64, usize, usize, usize, usize)>>,
@@ -302,6 +305,17 @@ impl Drop for Pooled<'_> {
             }
         }
     }
+}
+
+/// An existence probe can reject a nullable source as soon as one row matches;
+/// DuckDB can prove the null-free case from each segment's column statistics.
+/// This is an optional optimization: query/proof failures retain the old path.
+fn timestamp_non_null_proof(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT NOT EXISTS (SELECT 1 FROM ev WHERE ts IS NULL LIMIT 1)",
+        [],
+        |row| row.get::<_, bool>(0),
+    ).unwrap_or(false)
 }
 
 impl Session {
@@ -417,11 +431,16 @@ impl Session {
         };
         conn.execute_batch(&format!("CREATE VIEW ev AS {union}; {names_view}"))
             .map_err(|e| e.to_string())?;
+        // All parts have already passed store_ready/read_info and are held
+        // under shared publication leases. The attached tables are read-only,
+        // so this proof remains valid for the whole Session (including evn).
+        let timestamps_non_null = timestamp_non_null_proof(&conn);
         Ok(Session {
             key: spec.key.clone(),
             base: Mutex::new(conn),
             pool: Mutex::new(Vec::new()),
             schema,
+            timestamps_non_null,
             baked,
             names: RwLock::new(None),
             names_version: AtomicU64::new(0),
@@ -441,6 +460,16 @@ impl Session {
         let mut out = Vec::new();
         for (start, text) in &self.texts {
             let lids = text.candidates(needle, limit.checked_sub(out.len())?)?;
+            out.extend(lids.into_iter().map(|lid| start + lid as usize));
+        }
+        Some(out)
+    }
+
+    pub(crate) fn exact_hex_candidates(&self, value: &str, limit: usize) -> Option<Vec<usize>> {
+        if self.texts.is_empty() { return None; }
+        let mut out = Vec::new();
+        for (start, text) in &self.texts {
+            let lids = text.exact_hex_candidates(value, limit.checked_sub(out.len())?)?;
             out.extend(lids.into_iter().map(|lid| start + lid as usize));
         }
         Some(out)
@@ -1619,6 +1648,21 @@ fn free_space(dir: &std::path::Path) -> Option<u64> {
 #[cfg(test)]
 mod segment_tests {
     use super::*;
+
+    #[test]
+    fn timestamp_non_null_proof_checks_every_part_and_fails_closed() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(!timestamp_non_null_proof(&conn), "missing relation is not proof");
+        conn.execute_batch("CREATE TABLE a(ts BIGINT); CREATE TABLE b(ts BIGINT); CREATE VIEW ev AS SELECT ts FROM a UNION ALL SELECT ts FROM b").unwrap();
+        assert!(timestamp_non_null_proof(&conn), "empty ordering is safe");
+        conn.execute_batch("INSERT INTO a VALUES (-1), (0), (1); INSERT INTO b VALUES (-7), (0), (7)").unwrap();
+        assert!(timestamp_non_null_proof(&conn), "zero and negative values are non-null");
+        conn.execute_batch("INSERT INTO b VALUES (NULL)").unwrap();
+        assert!(!timestamp_non_null_proof(&conn), "a null in a later part must reject the proof");
+        conn.execute_batch("DELETE FROM a; DELETE FROM b; INSERT INTO a VALUES (NULL); INSERT INTO b VALUES (NULL)").unwrap();
+        assert!(!timestamp_non_null_proof(&conn), "all-null sources retain null-safe ordering");
+    }
+
     #[test]
     fn segment_bounds_cover_records_exactly_without_splitting_them() {
         let lines = vec![
@@ -1816,6 +1860,7 @@ mod lifecycle_tests {
             base: Mutex::new(Connection::open_in_memory().unwrap()),
             pool: Mutex::new(Vec::new()),
             schema: sql::Schema::default(),
+            timestamps_non_null: false,
             baked: false,
             names: RwLock::new(None),
             names_version: AtomicU64::new(0),

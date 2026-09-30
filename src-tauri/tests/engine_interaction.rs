@@ -21,6 +21,8 @@ fn interactive_workload() {
         .parse()
         .expect("integer repeats");
     assert!((1..=100).contains(&repeats), "repeats must be 1..100");
+    let sort_dir = std::env::var("LOGINSIGHT_BENCH_SORT_DIR").unwrap_or_else(|_| "asc".into());
+    assert!(matches!(sort_dir.as_str(), "asc" | "desc"), "sort direction must be asc or desc");
     std::env::set_var("LOGINSIGHT_DATA_DIR", format!("{dir}/data"));
     testkit::set_engine_dir(&format!("{dir}/engine"));
     std::env::set_var("LOGINSIGHT_ENGINE_TRACE", "1");
@@ -30,7 +32,7 @@ fn interactive_workload() {
     record(
         "metadata_open",
         start,
-        json!({"rows": source.len(), "sourceBytes": std::fs::metadata(&file).unwrap().len(), "cacheState": std::env::var("LOGINSIGHT_BENCH_CACHE_STATE").unwrap_or_else(|_| "unspecified".into())}),
+        json!({"rows": source.len(), "sourceBytes": std::fs::metadata(&file).unwrap().len(), "sortColumn":"timestamp", "sortDir":sort_dir, "cacheState": std::env::var("LOGINSIGHT_BENCH_CACHE_STATE").unwrap_or_else(|_| "unspecified".into())}),
     );
     if let Ok(expected) = std::env::var("LOGINSIGHT_BENCH_ROWS") {
         assert_eq!(
@@ -67,7 +69,7 @@ fn interactive_workload() {
         let mut timings = Vec::with_capacity(repeats);
         for iteration in 0..repeats {
             let start = Instant::now();
-            let result = source.page(&filters, "timestamp", "asc", 0, 100, None);
+            let result = source.page(&filters, "timestamp", &sort_dir, 0, 100, None);
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             timings.push(elapsed_ms);
             record(
@@ -77,7 +79,7 @@ fn interactive_workload() {
             );
             if let Some(cursor) = result["nextCursor"].as_str() {
                 let start = Instant::now();
-                let next = source.page(&filters, "timestamp", "asc", 100, 100, Some(cursor));
+                let next = source.page(&filters, "timestamp", &sort_dir, 100, 100, Some(cursor));
                 record(
                     "cursor_next_page",
                     start,
@@ -92,7 +94,7 @@ fn interactive_workload() {
         );
         if std::env::var_os("LOGINSIGHT_BENCH_EXPLAIN").is_some() {
             let plan = source
-                .explain_page(&filters, "timestamp", "asc", 100, true)
+                .explain_page(&filters, "timestamp", &sort_dir, 100, true)
                 .expect("explain interactive plan");
             println!(
                 "BENCH {}",

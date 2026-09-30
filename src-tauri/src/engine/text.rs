@@ -178,11 +178,24 @@ impl Text {
             must.push((Occur::Must, Box::new(BooleanQuery::new(any))));
         }
         let query = BooleanQuery::new(must);
+        self.collect_candidates(&query, limit)
+    }
+
+    /// Exact scalar equality has stronger semantics than free substring
+    /// search: longer hex words cannot satisfy it. No max-width restriction
+    /// or regex dictionary expansion is required for this candidate source.
+    pub(crate) fn exact_hex_candidates(&self, value: &str, limit: usize) -> Option<Vec<u32>> {
+        if !exact_hex_literal(value) { return None; }
+        let query = TermQuery::new(Term::from_field_text(self.hex, &value.to_ascii_lowercase()), IndexRecordOption::Basic);
+        self.collect_candidates(&query, limit)
+    }
+
+    fn collect_candidates(&self, query: &dyn Query, limit: usize) -> Option<Vec<u32>> {
         let searcher = self.reader.searcher();
-        if searcher.search(&query, &Count).ok()? > limit {
+        if searcher.search(query, &Count).ok()? > limit {
             return None;
         }
-        let docs = searcher.search(&query, &DocSetCollector).ok()?;
+        let docs = searcher.search(query, &DocSetCollector).ok()?;
         let mut lids = Vec::with_capacity(docs.len());
         let mut columns = std::collections::HashMap::new();
         for doc in docs {
@@ -197,6 +210,20 @@ impl Text {
         lids.sort_unstable();
         Some(lids)
     }
+}
+
+pub(crate) fn exact_hex_literal(value: &str) -> bool {
+    (HEX_WORD..=MAX_WORD).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// For exact field equality, a complete word of an ASCII literal must also be
+/// a complete word in the indexed value. Delimiters match `words` exactly;
+/// never extract a hex substring from a larger alphanumeric word.
+pub(crate) fn exact_field_hex_word(value: &str) -> Option<&str> {
+    if value.len() > 512 || !value.is_ascii() { return None; }
+    value.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| exact_hex_literal(word))
+        .max_by_key(|word| word.len())
 }
 
 fn is_hex_word(word: &str) -> bool {
@@ -220,6 +247,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_field_words_require_complete_ascii_tokens() {
+        let uuid = "3f2a1b4c-1111-2222-3333-444455556666";
+        assert_eq!(exact_field_hex_word(uuid), Some("444455556666"));
+        assert_eq!(exact_field_hex_word("request/DEADBEEF?x=1"), Some("DEADBEEF"));
+        assert_eq!(exact_field_hex_word("prefixdeadbeef"), None);
+        assert_eq!(exact_field_hex_word("deadbeefsuffix"), None);
+        assert_eq!(exact_field_hex_word("ação-deadbeef"), None);
+        assert_eq!(exact_field_hex_word(&format!("{}-deadbeef", "x".repeat(512))), None);
+    }
+
+    #[test]
     fn full_hex_words_are_selective_but_substrings_and_long_words_stay_safe() {
         let dir = tempfile::tempdir().unwrap();
         let writer = Writer::create(dir.path(), 1, 32 << 20).unwrap();
@@ -241,6 +279,24 @@ mod tests {
         writer.finish().unwrap();
         let text = Text::open(dir.path()).unwrap();
         assert_eq!(text.candidates(first, 10).unwrap(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn mixed_32_and_64_character_hex_values_keep_conservative_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Writer::create(dir.path(), 1, 32 << 20).unwrap();
+        let trace = "0000000000000000000000006585cfa1";
+        writer.add(0, words(trace)).unwrap();
+        writer.add(1, words(&"f".repeat(64))).unwrap();
+        writer.add(2, words(&format!("{}{}{}", "a".repeat(16), trace, "b".repeat(16)))).unwrap();
+        writer.finish().unwrap();
+        let text = Text::open(dir.path()).unwrap();
+        // An exact-token-only shortcut would miss the trace inside row 2.
+        // The broad candidate set also includes row 1 and exceeds this budget.
+        assert_eq!(text.candidates(trace, 1), None);
+        assert_eq!(text.candidates(trace, 10).unwrap(), vec![0, 1, 2]);
+        assert_eq!(text.exact_hex_candidates(trace, 1).unwrap(), vec![0]);
+        assert_eq!(text.exact_hex_candidates(&trace.to_ascii_uppercase(), 1).unwrap(), vec![0]);
     }
 
     #[test]

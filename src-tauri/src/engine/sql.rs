@@ -156,6 +156,20 @@ impl Schema {
         }
     }
 
+    /// Ordinary scalar fields are included verbatim in the indexed free-text
+    /// values. A complete hex word of an exact ASCII literal is therefore
+    /// guaranteed to contribute that token, including within a UUID.
+    /// Metadata, role aliases, skipped path fields and structured values do
+    /// not have that coverage proof and retain their existing SQL predicate.
+    fn exact_hex_field(&self, column: &str, value: &str) -> bool {
+        super::text::exact_field_hex_word(value).is_some()
+            && !column.starts_with(['@', '_'])
+            && !column.contains('.')
+            && !matches!(column, "id" | "event_ref" | "timestamp" | "source" | "level" | "code" | "name" | "description" | "message" | "raw" | "arquivo" | "caminho")
+            && self.fields.contains_key(column)
+            && !self.structured.contains(column)
+    }
+
     /// Value the search language reads for a field (`Ctx::field`).
     fn ctx_value(&self, name: &str, role: Option<Role>, names: &mut bool) -> Val {
         if name.starts_with('@') {
@@ -270,9 +284,15 @@ impl Schema {
             };
         }
         match self.value(&f.column, names) {
-            Val::Sql(value) => Decision::Sql(exact_text(&value, pf).unwrap_or_else(|| {
-                tests.text(&value, Arc::new(move |v| value_matches(&owned, v)))
-            })),
+            Val::Sql(value) => {
+                let native = exact_text(&value, pf);
+                if op == "equals_exact" && self.exact_hex_field(&f.column, &f.value) {
+                    let word = super::text::exact_field_hex_word(&f.value).expect("field coverage checked").to_ascii_lowercase();
+                    Decision::Sql(tests.hex_field(owned, native.expect("exact equality is native"), word))
+                } else {
+                    Decision::Sql(native.unwrap_or_else(|| tests.text(&value, Arc::new(move |v| value_matches(&owned, v)))))
+                }
+            }
             Val::Absent => Decision::Sql(literal(value_matches(&owned, None))),
             Val::Unsupported => Decision::Event,
         }
@@ -384,6 +404,30 @@ mod native_predicate_tests {
 
     fn filter(column: &str, op: &str, value: &str, value2: Option<&str>) -> PreparedFilter {
         crate::query::prepare(&[Filter { column: column.into(), op: op.into(), value: value.into(), value2: value2.map(str::to_string) }]).remove(0)
+    }
+
+    #[test]
+    fn exact_hex_candidates_require_stored_scalar_field_coverage() {
+        let mut schema = Schema::default();
+        let hex = "0000000000000000000000006585cfa1";
+        schema.fields.insert("trace_id".into(), "w0".into());
+        let plan = schema.plan(&[filter("trace_id", "equals_exact", hex, None)]);
+        assert!(plan.exact());
+        assert_eq!(plan.tests.hex_fields.len(), 1);
+        assert!(plan.tests.hex_fields[0].fallback_sql.contains("w0 ="));
+        for column in ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw", "arquivo", "caminho", "@user", "nested.id", "_meta"] {
+            schema.fields.insert(column.into(), "w1".into());
+            assert!(!schema.exact_hex_field(column, hex), "{column}");
+        }
+        assert!(!schema.exact_hex_field("missing", hex));
+        assert!(!schema.exact_hex_field("trace_id", "dead"));
+        assert!(!schema.exact_hex_field("trace_id", &"f".repeat(65)));
+        assert!(schema.exact_hex_field("trace_id", "deadbeef-12345678"));
+        assert!(!schema.exact_hex_field("trace_id", "prefixdeadbeef"));
+        assert!(schema.plan(&[filter("trace_id", "equals", hex, None)]).tests.hex_fields.is_empty());
+        assert!(schema.plan(&[filter("trace_id", "not_equals_exact", hex, None)]).tests.hex_fields.is_empty());
+        schema.structured.insert("trace_id".into());
+        assert!(!schema.exact_hex_field("trace_id", hex));
     }
 
     #[test]

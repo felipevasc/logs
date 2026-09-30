@@ -149,18 +149,31 @@ fn replace_sql_marker(sql: &str, marker: &str, replacement: &str) -> Option<Stri
     Some(out)
 }
 
-/// Resolve whole free-text terms, including effective names/descriptions.
+/// Resolve selective field equalities and complete free-text terms, including
+/// effective names/descriptions.
 /// Narrow terms become one candidate membership predicate: this avoids the
 /// old million-row enrichment + MARK join even when only ten records match.
 fn resolve_free(session: &Session, src: &Source, sql: &str, tests: &Tests) -> Result<(String, Vec<Arc<Selection>>, bool)> {
     let mut sql = sql.to_string();
     let mut held = Vec::new();
     let mut names = false;
+    for term in &tests.hex_fields {
+        if replace_sql_marker(&sql, &term.marker, "TRUE").is_none() { continue; }
+        let replacement = match exact_hex_selection(session, src, term)? {
+            Some(selection) => {
+                let predicate = selection.predicate();
+                held.push(selection);
+                predicate
+            }
+            None => term.fallback_sql.clone(),
+        };
+        sql = replace_sql_marker(&sql, &term.marker, &replacement).expect("planner marker found");
+    }
     for term in &tests.free {
         if replace_sql_marker(&sql, &term.marker, "TRUE").is_none() { continue; }
         let replacement = match free_selection(session, src, term)? {
             Some(selection) => {
-                let predicate = format!("id IN (SELECT id FROM {})", selection.name);
+                let predicate = selection.predicate();
                 held.push(selection);
                 predicate
             }
@@ -172,6 +185,24 @@ fn resolve_free(session: &Session, src: &Source, sql: &str, tests: &Tests) -> Re
         sql = replace_sql_marker(&sql, &term.marker, &replacement).expect("planner marker found");
     }
     Ok((sql, held, names))
+}
+
+fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexField) -> Result<Option<Arc<Selection>>> {
+    // A selective lookup must not replace cheap vectorized filtering with an
+    // unbounded amount of record hydration. Dense terms retain native SQL.
+    const LIMIT: usize = 4_096;
+    let filter = &term.filter;
+    let key = format!("exact-hex#{}", serde_json::to_string(&(&filter.f.column, &filter.f.value)).map_err(err)?);
+    if let Some(found) = session.cached_selection(&key) { return Ok(Some(found)); }
+    let Some(candidates) = session.exact_hex_candidates(&term.word, LIMIT) else { return Ok(None) };
+    let mut confirmed = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        crate::operations::check()?;
+        if crate::query::matches(&src.event(id), filter) { confirmed.push(id); }
+    }
+    let selected = selection(session, &confirmed)?;
+    session.cache_selection(key, Arc::clone(&selected));
+    Ok(Some(selected))
 }
 
 fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) -> Result<Option<Arc<Selection>>> {
@@ -222,7 +253,16 @@ fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) 
 /// Table holding the ids a filter list selects; dropped with its last user.
 pub(crate) struct Selection {
     name: String,
+    known_empty: bool,
+    single_id: Option<usize>,
     garbage: Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+impl Selection {
+    fn predicate(&self) -> String {
+        if self.known_empty { "FALSE".into() }
+        else { format!("id IN (SELECT id FROM {})", self.name) }
+    }
 }
 
 impl Drop for Selection {
@@ -341,7 +381,7 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
     if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
         return Ok(Scope {
             session,
-            cond: format!("id IN (SELECT id FROM {})", found.name),
+            cond: found.predicate(),
             names: false,
             _tests: Tests::default(),
             _selection: Some(found),
@@ -362,7 +402,7 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
     }
     Ok(Scope {
         session,
-        cond: format!("id IN (SELECT id FROM {})", selection.name),
+        cond: selection.predicate(),
         names: false,
         _tests: Tests::default(),
         _selection: Some(selection),
@@ -379,10 +419,12 @@ fn page_scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) ->
     Ok((Scope { session, cond: sql, names: plan.names || free_names, _tests: plan.tests, _selection: None, _free: free }, exact))
 }
 
-fn new_selection(session: &Session) -> Arc<Selection> {
+fn new_selection(session: &Session, known_empty: bool, single_id: Option<usize>) -> Arc<Selection> {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     Arc::new(Selection {
         name: format!("sel_{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+        known_empty,
+        single_id,
         garbage: session.garbage(),
     })
 }
@@ -393,7 +435,7 @@ fn selection_query(session: &Session, sql: &str) -> Result<Arc<Selection>> {
     for unused in session.take_garbage() {
         let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {unused}"));
     }
-    let selection = new_selection(session);
+    let selection = new_selection(session, false, None);
     conn.execute_batch(&format!("CREATE TABLE {} AS {sql}", selection.name)).map_err(err)?;
     Ok(selection)
 }
@@ -403,7 +445,7 @@ fn selection(session: &Session, ids: &[usize]) -> Result<Arc<Selection>> {
     for unused in session.take_garbage() {
         let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {unused}"));
     }
-    let selection = new_selection(session);
+    let selection = new_selection(session, ids.is_empty(), if ids.len() == 1 { Some(ids[0]) } else { None });
     let name = &selection.name;
     conn.execute_batch(&format!("CREATE TABLE {name} (id BIGINT)")).map_err(err)?;
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -781,27 +823,35 @@ struct PageCursor {
     keys: Vec<CursorKey>,
 }
 
+const TIMESTAMP_SORT_SQL: &str = "COALESCE(ts, 0)";
+
 struct SortKey {
     sql: String,
     desc: bool,
     text: bool,
+    /// Only native timestamp keys may carry the immutable Session proof.
+    timestamp_non_null: bool,
 }
 
 fn page_sort(scope: &Scope, column: &str, dir: &str) -> Result<(Vec<SortKey>, bool)> {
     let desc = dir == "desc";
-    let int = |sql: String, desc| SortKey { sql, desc, text: false };
+    let int = |sql: String, desc| SortKey { sql, desc, text: false, timestamp_non_null: false };
     let mut names = false;
     let mut keys = match column {
         "" => vec![int("id".into(), false)],
         "id" => vec![int("id".into(), desc)],
-        "timestamp" => vec![int("COALESCE(ts, 0)".into(), desc)],
+        "timestamp" => {
+            let mut key = int(TIMESTAMP_SORT_SQL.into(), desc);
+            key.timestamp_non_null = scope.session.timestamps_non_null;
+            vec![key]
+        },
         "level" => vec![int("CAST(lvl AS BIGINT)".into(), desc)],
         column => {
             let value = scope.session.schema.column(column, &mut names).ok_or("Ordenação pelo texto bruto.")?;
             vec![
                 int(format!("CAST(li_nkey({value}) IS NULL AS BIGINT)"), desc),
                 int(format!("COALESCE(li_nkey({value}), 0)"), desc),
-                SortKey { sql: format!("li_lower(COALESCE({value}, ''))"), desc, text: true },
+                SortKey { sql: format!("li_lower(COALESCE({value}, ''))"), desc, text: true, timestamp_non_null: false },
             ]
         }
     };
@@ -811,10 +861,16 @@ fn page_sort(scope: &Scope, column: &str, dir: &str) -> Result<(Vec<SortKey>, bo
     Ok((keys, names))
 }
 
+/// The complete seek predicate and an optional proof used only for ordering.
+struct PageSeek {
+    predicate: String,
+    timestamp_non_null: bool,
+}
+
 /// Lexicographic seek using non-null sort keys and the same final id tie-break
 /// as the exact page API. Sort directions can differ (descending time, id asc).
-fn after_cursor(sort: &[SortKey], keys: &[CursorKey]) -> Result<String> {
-    if keys.len() != sort.len() || keys.iter().zip(sort).any(|(key, sort)| matches!(key, CursorKey::Text(_)) != sort.text) {
+fn after_cursor(sort: &[SortKey], keys: &[CursorKey]) -> Result<PageSeek> {
+    if sort.is_empty() || keys.len() != sort.len() || keys.iter().zip(sort).any(|(key, sort)| matches!(key, CursorKey::Text(_)) != sort.text) {
         return Err("PAGINATION_RESET_REQUIRED: Cursor de paginação inválido. Recarregue os registros.".into());
     }
     let mut prefix = Vec::new();
@@ -826,7 +882,30 @@ fn after_cursor(sort: &[SortKey], keys: &[CursorKey]) -> Result<String> {
         alternatives.push(format!("({})", terms.join(" AND ")));
         prefix.push(format!("{} = {bound}", sort.sql));
     }
-    Ok(format!("({})", alternatives.join(" OR ")))
+    let exact = format!("({})", alternatives.join(" OR "));
+    // The OR-ed lexicographic expression must remain authoritative, including
+    // timestamp ties whose final id is always ascending. A redundant raw bound
+    // lets DuckDB push the leading timestamp range into each segment scan.
+    let bound = timestamp_cursor_bound(&sort[0], &keys[0]);
+    let timestamp_non_null = bound.is_some();
+    let predicate = match bound {
+        Some(bound) => format!("({bound} AND {exact})"),
+        None => exact,
+    };
+    Ok(PageSeek { predicate, timestamp_non_null })
+}
+
+fn timestamp_cursor_bound(sort: &SortKey, key: &CursorKey) -> Option<String> {
+    // Match only the native timestamp key, never a user-defined numeric/text
+    // expression. The id-only sort already has a directly pushable predicate.
+    if sort.sql != TIMESTAMP_SORT_SQL { return None; }
+    let CursorKey::Integer(value) = key else { return None; };
+    // A Session proof excludes nulls in every range. Otherwise missing
+    // timestamps sort as zero: optimize only when zero is strictly outside
+    // the remaining leading range. An OR-is-null bound is correct but
+    // does not improve the measured plan, so retain the original path there.
+    let excludes_null = sort.timestamp_non_null || if sort.desc { *value < 0 } else { *value > 0 };
+    excludes_null.then(|| format!("ts {} {value}", if sort.desc { "<=" } else { ">=" }))
 }
 
 #[cfg(test)]
@@ -860,12 +939,62 @@ mod interactive_contract_tests {
 
     #[test]
     fn cursor_keys_are_typed_and_sql_literals_are_escaped() {
-        let sort = vec![SortKey { sql: "value".into(), desc: true, text: true }, SortKey { sql: "id".into(), desc: false, text: false }];
-        let clause = after_cursor(&sort, &[CursorKey::Text("O'Reilly".into()), CursorKey::Integer(7)]).unwrap();
+        let sort = vec![SortKey { sql: "value".into(), desc: true, text: true, timestamp_non_null: false }, SortKey { sql: "id".into(), desc: false, text: false, timestamp_non_null: false }];
+        let clause = after_cursor(&sort, &[CursorKey::Text("O'Reilly".into()), CursorKey::Integer(7)]).unwrap().predicate;
         assert!(clause.contains("value < 'O''Reilly'"));
         assert!(clause.contains("value = 'O''Reilly' AND id > 7"));
         assert!(after_cursor(&sort, &[CursorKey::Integer(7), CursorKey::Integer(7)]).is_err());
         assert!(after_cursor(&sort, &[]).is_err());
+    }
+
+    #[test]
+    fn timestamp_cursor_bounds_keep_null_zero_negative_and_extreme_keys() {
+        let connection = duckdb::Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE ev(id BIGINT, ts BIGINT)").unwrap();
+        let timestamps = [Some(i64::MIN), Some(-7), Some(-1), None, Some(0),
+            Some(0), None, Some(1), Some(7), Some(i64::MAX)];
+        for (id, ts) in timestamps.iter().enumerate() {
+            connection.execute("INSERT INTO ev VALUES (?, ?)", duckdb::params![id as i64, ts]).unwrap();
+        }
+        for desc in [false, true] {
+            let sort = vec![
+                SortKey { sql: TIMESTAMP_SORT_SQL.into(), desc, text: false, timestamp_non_null: false },
+                SortKey { sql: "id".into(), desc: false, text: false, timestamp_non_null: false },
+            ];
+            for timestamp in [i64::MIN, -8, -7, -1, 0, 1, 7, 8, i64::MAX] {
+                for id in [-1, 3, 5, 10] {
+                    let keys = [CursorKey::Integer(timestamp), CursorKey::Integer(id)];
+                    let seek = after_cursor(&sort, &keys).unwrap();
+                    let excludes_null = if desc { timestamp < 0 } else { timestamp > 0 };
+                    assert_eq!(seek.timestamp_non_null, excludes_null);
+                    assert_eq!(timestamp_cursor_bound(&sort[0], &keys[0]).is_some(), excludes_null);
+                    let order = page_order(&sort, &seek);
+                    assert_eq!(order, format!("{} {}, id ASC", if excludes_null { "ts" } else { TIMESTAMP_SORT_SQL }, if desc { "DESC" } else { "ASC" }));
+                    let sql = format!("SELECT id FROM ev WHERE {} ORDER BY {order}", seek.predicate);
+                    let mut statement = connection.prepare(&sql).unwrap();
+                    let actual = statement.query_map([], |row| row.get::<_, i64>(0)).unwrap()
+                        .collect::<duckdb::Result<Vec<_>>>().unwrap();
+                    let mut expected = timestamps.iter().enumerate().map(|(id, ts)| (ts.unwrap_or(0), id as i64))
+                        .filter(|(ts, row)| (if desc { *ts < timestamp } else { *ts > timestamp }) || (*ts == timestamp && *row > id))
+                        .collect::<Vec<_>>();
+                    expected.sort_unstable_by(|a, b| {
+                        let time = a.0.cmp(&b.0);
+                        (if desc { time.reverse() } else { time }).then(a.1.cmp(&b.1))
+                    });
+                    assert_eq!(actual, expected.into_iter().map(|(_, id)| id).collect::<Vec<_>>(), "{sql}");
+                }
+            }
+        }
+        assert!(after_cursor(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn id_cursor_remains_a_direct_native_bound_in_both_directions() {
+        for desc in [false, true] {
+            let sort = [SortKey { sql: "id".into(), desc, text: false, timestamp_non_null: false }];
+            assert_eq!(after_cursor(&sort, &[CursorKey::Integer(42)]).unwrap().predicate,
+                format!("((id {} 42))", if desc { "<" } else { ">" }));
+        }
     }
 
     #[test]
@@ -927,8 +1056,8 @@ fn page_fingerprint(src: &Source, pfs: &[PreparedFilter], sort_column: &str, sor
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn page_seek(cursor: Option<&str>, sort: &[SortKey], fingerprint: &str, rows: usize, offset: usize) -> Result<(String, usize)> {
-    let Some(value) = cursor else { return Ok(("TRUE".into(), offset)); };
+fn page_seek(cursor: Option<&str>, sort: &[SortKey], fingerprint: &str, rows: usize, offset: usize) -> Result<(PageSeek, usize)> {
+    let Some(value) = cursor else { return Ok((PageSeek { predicate: "TRUE".into(), timestamp_non_null: false }, offset)); };
     if value.len() > 1_100_000 {
         return Err("PAGINATION_RESET_REQUIRED: Cursor de paginação excede o limite.".into());
     }
@@ -942,10 +1071,50 @@ fn page_seek(cursor: Option<&str>, sort: &[SortKey], fingerprint: &str, rows: us
     Ok((after_cursor(sort, &cursor.keys)?, cursor.position))
 }
 
-fn page_statement(scope: &Scope, sort: &[SortKey], names: bool, seek: &str, batch: usize, offset: usize) -> String {
-    let order = sort.iter().map(|key| format!("{} {}", key.sql, if key.desc { "DESC" } else { "ASC" })).collect::<Vec<_>>().join(", ");
+fn page_order(sort: &[SortKey], seek: &PageSeek) -> String {
+    sort.iter().enumerate().map(|(i, key)| {
+        // Once the Session or cursor proves timestamps are non-null, the raw
+        // column has exactly the same order as COALESCE. Keeping it visible to
+        // TOP_N enables DuckDB's dynamic range filter on each segment scan.
+        let sql = if i == 0 && (seek.timestamp_non_null || key.timestamp_non_null) && key.sql == TIMESTAMP_SORT_SQL { "ts" } else { &key.sql };
+        format!("{sql} {}", if key.desc { "DESC" } else { "ASC" })
+    }).collect::<Vec<_>>().join(", ")
+}
+
+fn page_statement(scope: &Scope, sort: &[SortKey], names: bool, seek: &PageSeek, batch: usize, offset: usize) -> String {
+    let order = page_order(sort, seek);
     let projection = sort.iter().map(|key| key.sql.as_str()).collect::<Vec<_>>().join(", ");
-    format!("SELECT id, {projection} FROM {} WHERE ({}) AND {seek} ORDER BY {order} LIMIT {batch} OFFSET {offset}", scope.from(names), scope.cond)
+    format!("SELECT id, {projection} FROM {} WHERE ({}) AND {} ORDER BY {order} LIMIT {batch} OFFSET {offset}", scope.from(names), scope.cond, seek.predicate)
+}
+
+/// A required top-level equality bounds the entire conjunction. Only a
+/// complete, canonically verified empty/singleton set may bypass page SQL;
+/// free-text OR/NOT terms never establish this proof.
+fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Option<crate::query::QueryPage>> {
+    if !pfs.iter().any(|pf| pf.f.op == "equals_exact" && super::text::exact_field_hex_word(&pf.f.value).is_some()) {
+        return Ok(None);
+    }
+    let plan = session.schema.plan(pfs);
+    for term in &plan.tests.hex_fields {
+        let Some(selected) = exact_hex_selection(session, src, term)? else { continue; };
+        if !selected.known_empty && selected.single_id.is_none() { continue; }
+        let mut rows = Vec::new();
+        if let Some(id) = selected.single_id {
+            crate::operations::check()?;
+            let mut event = src.event(id);
+            if pfs.iter().all(|pf| crate::query::matches(&event, pf)) {
+                crate::entities::annotate(&mut event);
+                event.raw.clear();
+                rows.push(event);
+            }
+        }
+        crate::operations::check()?;
+        return Ok(Some(crate::query::QueryPage {
+            total: Some(rows.len()), rows, has_more: false, next_cursor: None,
+            engine: "columnar".into(), warning: None,
+        }));
+    }
+    Ok(None)
 }
 
 /// Page-size work in Rust and no mandatory COUNT. Returns None only when no
@@ -969,6 +1138,9 @@ pub(crate) fn query_page(
     let _names = session.names_guard();
     Some((|| {
         crate::operations::check()?;
+        if cursor.is_none() && offset == 0 {
+            if let Some(page) = required_hex_page(&session, src, pfs)? { return Ok(page); }
+        }
         let fingerprint = page_fingerprint(src, pfs, sort_column, sort_dir, base_safe)?;
         let (scope, exact) = page_scope(&session, src, pfs)?;
         let (sort, names) = page_sort(&scope, sort_column, sort_dir)?;
@@ -1041,6 +1213,14 @@ pub(crate) fn explain_page_at(
     let session = ready_session(src, base_safe)?;
     let _names = session.names_guard();
     Some((|| {
+        if sort_column != "raw" && cursor.is_none() && offset == 0 {
+            if let Some(page) = required_hex_page(&session, src, pfs)? {
+                return Ok(serde_json::json!({ "mode": "verified_singleton", "sql": null,
+                    "plan": "Complete typed equality candidates verified directly; no page SQL statement executed.",
+                    "profile": null, "analyzed": false, "exactPredicate": true, "total": page.total,
+                    "note": "Index candidate discovery and canonical event verification are not DuckDB page scans." }));
+            }
+        }
         let fingerprint = page_fingerprint(src, pfs, sort_column, sort_dir, base_safe)?;
         let (scope, exact) = page_scope(&session, src, pfs)?;
         let (sort, names) = page_sort(&scope, sort_column, sort_dir)?;

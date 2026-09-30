@@ -754,3 +754,102 @@ fn free_text_large_candidate_sets_keep_catalog_confirmation_exact() {
         assert_eq!(source.matches(Engine::Columnar, &filters), source.matches(Engine::Lines, &filters), "{expression}");
     }
 }
+
+#[test]
+fn typed_hex_equality_uses_bounded_candidates_and_keeps_exact_field_semantics() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOGINSIGHT_DATA_DIR", dir.path().join("dados"));
+    testkit::set_engine_dir(&dir.path().join("motor").to_string_lossy());
+    let needle = "0000000000000000000000006585cfa1";
+    let upper = needle.to_ascii_uppercase();
+    let other = "000000000000000000000000e1677d9c";
+    let records = [
+        json!({"trace_id":needle,"hash":"f".repeat(64)}),
+        json!({"trace_id":upper,"hash":"f".repeat(64)}),
+        json!({"trace_id":other,"other":needle}),
+        json!({"trace_id":format!("aa{needle}bb")}),
+        json!({"other":needle}),
+        json!({"trace_id":null,"other":needle}),
+    ];
+    let mut data = String::new();
+    for row in records { writeln!(data, "{row}").unwrap(); }
+    let file = write(dir.path(), "typed-hex.jsonl", &data);
+    let source = Source::open(&[&file], "{}", "[]").unwrap();
+    source.prepare().unwrap();
+    for value in [needle, upper.as_str(), other, "ffffffffffffffffffffffffffffffff"] {
+        let filters = filters_of(&[("trace_id", "equals_exact", value)]);
+        assert_eq!(source.matches(Engine::Columnar, &filters), source.matches(Engine::Lines, &filters), "{value}");
+        assert_eq!(source.count(Engine::Columnar, &filters), source.count(Engine::Lines, &filters), "count {value}");
+        assert_eq!(source.page(&filters, "id", "asc", 0, 100, None)["rows"], source.query(Engine::Lines, &filters, "id", "asc", 0, 100)["rows"], "rows {value}");
+        let plan = source.explain_page(&filters, "id", "asc", 100, false).unwrap();
+        assert_eq!(plan["mode"], "verified_singleton");
+        assert!(plan["sql"].is_null(), "the direct lookup does not execute a page statement");
+    }
+    let filters = filters_of(&[("trace_id", "equals_exact", needle)]);
+    assert_eq!(source.matches(Engine::Columnar, &filters), vec![0]);
+    let filters = filters_of(&[("trace_id", "equals_exact", upper.as_str())]);
+    assert_eq!(source.matches(Engine::Columnar, &filters), vec![1]);
+
+    for extra in [
+        ("raw", "contains", needle),
+        ("other", "equals_exact", "absent"),
+        ("_all", "query", "absent OR other:missing"),
+    ] {
+        let filters = filters_of(&[("trace_id", "equals_exact", needle), extra]);
+        for (sort, direction) in [("timestamp", "asc"), ("timestamp", "desc"), ("hash", "desc")] {
+            let page = source.page(&filters, sort, direction, 0, 100, None);
+            let expected = source.query(Engine::Lines, &filters, sort, direction, 0, 100);
+            assert_eq!(page["rows"], expected["rows"]);
+            assert_eq!(page["total"], expected["total"]);
+            assert_eq!(page["hasMore"], false);
+            assert!(page["nextCursor"].is_null());
+        }
+    }
+    let duplicate = write(dir.path(), "two-matches.jsonl", &format!("{}\n{}\n", json!({"trace_id":needle,"message":"first"}), json!({"trace_id":needle,"message":"second"})));
+    let duplicate = Source::open(&[&duplicate], "{}", "[]").unwrap();
+    duplicate.prepare().unwrap();
+    let filters = filters_of(&[("trace_id", "equals_exact", needle)]);
+    let first = duplicate.page(&filters, "id", "asc", 0, 1, None);
+    assert_eq!(first["hasMore"], true);
+    let next = duplicate.page(&filters, "id", "asc", 1, 1, first["nextCursor"].as_str());
+    assert_eq!(first["rows"][0]["id"], 0);
+    assert_eq!(next["rows"][0]["id"], 1);
+    assert_eq!(next["hasMore"], false);
+    assert!(duplicate.explain_page(&filters, "id", "asc", 1, false).unwrap()["sql"].is_string());
+
+    let uuid = "3f2a1b4c-1111-2222-3333-444455556666";
+    let identifiers = [uuid.to_string(), uuid.to_ascii_uppercase(),
+        "cafebabe-1111-2222-3333-444455556666".into(),
+        format!("prefix{uuid}"), format!("request:{uuid}"), format!("prefix{needle}")];
+    let mut records = String::new();
+    for value in &identifiers {
+        writeln!(records, "{}", json!({"request_id":value,"other":"444455556666"})).unwrap();
+    }
+    let file = write(dir.path(), "uuid-fields.jsonl", &records);
+    let requests = Source::open(&[&file], "{}", "[]").unwrap();
+    requests.prepare().unwrap();
+    for (id, value) in identifiers.iter().enumerate() {
+        let filters = filters_of(&[("request_id", "equals_exact", value)]);
+        assert_eq!(requests.matches(Engine::Columnar, &filters), vec![id]);
+        assert_eq!(requests.matches(Engine::Columnar, &filters), requests.matches(Engine::Lines, &filters));
+        let plan = requests.explain_page(&filters, "id", "asc", 100, false).unwrap();
+        if id != 5 { assert_eq!(plan["mode"], "verified_singleton", "{value}"); }
+        else { assert!(plan["sql"].as_str().unwrap().contains("prefix")); }
+    }
+
+    // An equality term occurring in many records retains native SQL rather
+    // than hydrating an unbounded number of candidate events.
+    let mut dense = String::new();
+    for i in 0..4_100 {
+        writeln!(dense, "{}", json!({"trace_id":needle,"message":format!("record {i}")})).unwrap();
+    }
+    let file = write(dir.path(), "dense-hex.jsonl", &dense);
+    let dense = Source::open(&[&file], "{}", "[]").unwrap();
+    dense.prepare().unwrap();
+    let filters = filters_of(&[("trace_id", "equals_exact", needle)]);
+    assert_eq!(dense.count(Engine::Columnar, &filters), 4_100);
+    let plan = dense.explain_page(&filters, "id", "asc", 100, false).unwrap();
+    assert!(!plan["sql"].as_str().unwrap().contains("SELECT id FROM sel_"));
+    assert!(plan["sql"].as_str().unwrap().contains(needle));
+}

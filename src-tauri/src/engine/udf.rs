@@ -29,12 +29,20 @@ static NEXT: AtomicI32 = AtomicI32::new(1);
 pub(crate) struct Tests {
     ids: Vec<i32>,
     pub(crate) free: Vec<FreeText>,
+    pub(crate) hex_fields: Vec<HexField>,
 }
 
 pub(crate) struct FreeText {
     pub(crate) marker: String,
     pub(crate) needle: String,
     pub(crate) names_sql: String,
+}
+
+pub(crate) struct HexField {
+    pub(crate) marker: String,
+    pub(crate) filter: Arc<crate::query::PreparedFilter>,
+    pub(crate) fallback_sql: String,
+    pub(crate) word: String,
 }
 
 impl Tests {
@@ -69,6 +77,11 @@ impl Tests {
             needle: needle.into(),
             names_sql: format!("(li_test(name, {id}) OR li_test(description, {id}))"),
         });
+        marker
+    }
+    pub(crate) fn hex_field(&mut self, filter: Arc<crate::query::PreparedFilter>, fallback_sql: String, word: String) -> String {
+        let marker = format!("__li_hex_{}()", NEXT.fetch_add(1, Ordering::Relaxed));
+        self.hex_fields.push(HexField { marker: marker.clone(), filter, fallback_sql, word });
         marker
     }
 }
