@@ -16,6 +16,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --
 
 O preview usa dados e operações nativas simulados. Ele testa navegação, persistência, agendamento e renderização; os testes Rust exercitam os parsers, os índices reais e a paridade entre os motores. `PLAYWRIGHT_EXECUTABLE_PATH` ou `PLAYWRIGHT_CHANNEL` permitem escolher um navegador local explicitamente. Sem essas variáveis, o teste usa a versão do Chromium fixada pelo Playwright.
 
+`nginx_acceptance` cobre fixtures pequenas de acesso combinado, o mesmo arquivo em gzip e um mapeamento JSON explícito. Compara filtros e páginas com o motor de linhas e reabre cada fonte em outro processo, verificando que os artefatos persistidos não foram reescritos. Esses formatos representativos não substituem a validação do `log_format` real do usuário.
+
 O workflow `Pull request checks` roda nos PRs para `main`. Ele não publica instaladores, releases ou atualizações.
 
 ## Dados reproduzíveis, sem alocar o arquivo todo
@@ -84,6 +86,14 @@ Os pools do motor agora partem de um orçamento coordenado: por padrão, um ter�
 
 Checkpoints são segmentos completos do DuckDB e Tantivy, com manifesto publicado por último. A validação dos artefatos inclui integridade e quantidade de registros. A identidade estável da fonte usa caminho, tamanho, data de modificação e amostras de conteúdo; as chaves de cache e validação ativa acrescentam a identidade do arquivo subjacente (inode/dispositivo ou ID de arquivo no Windows), rejeitando substituição atômica mesmo com tamanho/data preservados. Não é um SHA-256 integral da fonte. Alteração da configuração de parser, timestamp ou campos derivados invalida a variante correspondente.
 
-A recuperação inicial cobre a preparação dos índices de consulta e texto **após** concluir o índice de metadados de linhas. Uma interrupção no primeiro levantamento de metadados ainda exige repetir essa etapa. Se o carregamento de um arquivo novo for cancelado antes de substituir a fonte ativa, reabra esse mesmo arquivo para aproveitar seus segmentos concluídos. “Tentar preparação novamente” atua na fonte que está carregada no momento.
+A fonte mapeada precisa permanecer estável enquanto estiver aberta. As verificações detectam mudanças observadas antes de ler ou publicar um checkpoint, mas não bloqueiam processos externos: uma gravação ou truncamento entre a verificação e o acesso ao `mmap` ainda pode produzir leitura inconsistente ou falha do processo. Trabalhe com uma cópia/snapshot estável de logs que continuam sendo gravados. Alterações no mesmo arquivo que preservem tamanho, data e as regiões amostradas também podem escapar à identidade parcial; não há garantia de detecção integral de corrupção da fonte.
+
+Limpar eventos ou concluir a troca de fonte libera as sessões antigas e descarta trabalho de preparação ainda pendente. Um segmento antigo em execução para no próximo ponto cooperativo; uma chamada nativa já iniciada pode precisar retornar primeiro. Consultas já em execução mantêm suas próprias referências até finalizar. Segmentos já publicados permanecem disponíveis para reutilização, e a ativação da mesma fonte preserva sessões e trabalho já preparados para ela.
+
+A leitura inicial agora mantém um journal de metadados com limites de registros concluídos e marcadores verificados. Uma interrupção permite reutilizar esses metadados e os segmentos completos de consulta/texto; a cauda ainda não confirmada é reinterpretada para preservar registros multilinha e limites JSON. Se o carregamento de um arquivo novo for cancelado antes de substituir a fonte ativa, reabra esse mesmo arquivo para aproveitar seus checkpoints. “Tentar preparação novamente” atua na fonte que está carregada no momento.
+
+A conversão de gzip, arquivos compactados, codificação e planilhas tem publicação própria verificada. Se for interrompida antes dessa publicação, essa conversão pode reiniciar; os checkpoints de leitura e consulta atuam sobre a fonte convertida disponível. EVTX/Event Log ainda podem produzir uma nova captura ao abrir. Não se promete retomada de toda chamada de conversão externa.
+
+Depois de uma atualização que invalide o formato de cache, pode haver uma reconstrução inicial. Nas próximas aberturas com fonte/configuração inalteradas, os índices retidos são reutilizados. A fase “Validando índices salvos” inclui leitura dos hashes e conferência dos bancos, portanto ainda pode demorar com muitos dados; ela não significa que os registros estão sendo indexados novamente. Partes ausentes, inválidas ou removidas pela política de cache precisam ser preparadas de novo.
 
 Timestamps configurados têm um overlay verificado próprio, incluindo configuração e caminho/nome exibidos. Reabrir a mesma fonte válida restaura esse overlay em lotes, sem reinterpretar todos os registros. A troca só vale para o novo índice ainda não publicado; cancelar não altera a fonte atualmente carregada.

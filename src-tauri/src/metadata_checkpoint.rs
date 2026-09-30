@@ -275,8 +275,13 @@ impl Journal {
             .write(true)
             .open(&path)
             .map_err(|e| OpenError::Unavailable(e.to_string()))?;
-        file.set_len(payload_bytes)
-            .map_err(|e| OpenError::Unavailable(e.to_string()))?;
+        // Only discard an uncommitted tail. Calling set_len with an unchanged
+        // length still updates mtime on some filesystems, making a clean warm
+        // reopen look like a rewritten checkpoint.
+        if file.metadata().map_err(|e| OpenError::Unavailable(e.to_string()))?.len() != payload_bytes {
+            file.set_len(payload_bytes)
+                .map_err(|e| OpenError::Unavailable(e.to_string()))?;
+        }
         file.seek(SeekFrom::Start(payload_bytes))
             .map_err(|e| OpenError::Unavailable(e.to_string()))?;
         let resumed_rows = resume.resumed_rows;

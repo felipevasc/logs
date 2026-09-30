@@ -218,10 +218,7 @@ fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) 
     // Catalog overrides are a separate, small source/code relation.
     let Some(mut candidates) = session.free_candidates(needle, FREE_LIMIT) else { return Ok(None) };
     if !session.baked {
-        let catalog = read_ids(session, &format!(
-            "SELECT ev.id FROM ev WHERE EXISTS (SELECT 1 FROM enr WHERE (enr.source=ev.source OR enr.source='*') AND enr.code=ev.code AND ({})) LIMIT {}",
-            term.names_sql, FREE_LIMIT + 1
-        ))?;
+        let catalog = read_ids(session, &catalog_candidates_sql(&term.names_sql))?;
         if catalog.len() > FREE_LIMIT { return Ok(None); }
         candidates.extend(catalog);
         candidates.sort_unstable();
@@ -251,6 +248,27 @@ fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) 
     };
     session.cache_selection(key, Arc::clone(&found));
     Ok(Some(found))
+}
+
+fn catalog_candidates_sql(names_sql: &str) -> String {
+    // A correlated EXISTS with the exact/wildcard OR makes DuckDB retain the
+    // entire event side in a delimiter join, even for an empty catalog. Two
+    // ordinary equality semi joins build from the small catalog instead.
+    // An event may occur in both branches; the caller deduplicates candidates
+    // and verifies the effective catalog precedence with the canonical matcher.
+    // Hitting the bound (including duplicates) conservatively uses the general
+    // query path, so LIMIT never publishes an incomplete candidate selection.
+    format!(
+        "SELECT id FROM (\
+         SELECT ev.id FROM ev SEMI JOIN \
+         (SELECT source, code FROM enr WHERE source <> '*' AND ({names_sql})) AS matched \
+         ON matched.source=ev.source AND matched.code=ev.code \
+         UNION ALL \
+         SELECT ev.id FROM ev SEMI JOIN \
+         (SELECT code FROM enr WHERE source='*' AND ({names_sql})) AS matched \
+         ON matched.code=ev.code) LIMIT {}",
+        FREE_LIMIT + 1
+    )
 }
 
 /// Table holding the ids a filter list selects; dropped with its last user.
@@ -603,6 +621,55 @@ mod bounded_analytics_tests {
             selection_builds: Mutex::new(std::collections::HashSet::new()), selection_changed: parking_lot::Condvar::new(),
             garbage: Arc::new(Mutex::new(Vec::new())), texts: Vec::new(), _leases: Vec::new(),
         }
+    }
+
+    #[test]
+    fn empty_catalog_candidates_do_not_materialize_the_event_side() {
+        let session = session();
+        let directory = tempfile::tempdir().unwrap();
+        let conn = session.conn().unwrap();
+        conn.execute_batch(&format!(
+            "SET threads=1; SET memory_limit='32MB'; SET max_temp_directory_size='1MB'; \
+             SET temp_directory={}; \
+             CREATE VIEW ev AS SELECT range::BIGINT AS id, \
+             (range % 31)::VARCHAR AS source, (range % 7)::VARCHAR AS code FROM range(2000000); \
+             CREATE TABLE enr(source VARCHAR, code VARCHAR, name VARCHAR, description VARCHAR, catalog INTEGER);",
+            lit(&directory.path().to_string_lossy())
+        )).unwrap();
+        super::super::udf::register(&conn).unwrap();
+        let mut tests = Tests::default();
+        tests.free_text("rareneedle");
+        let sql = catalog_candidates_sql(&tests.free[0].names_sql);
+        let plan: String = conn.query_row(&format!("EXPLAIN {sql}"), [], |r| r.get(1)).unwrap();
+        assert!(!plan.contains("DELIM"), "catalog candidates must not retain all events: {plan}");
+        drop(conn);
+        assert!(read_ids(&session, &sql).unwrap().is_empty());
+        session.conn().unwrap().execute_batch(
+            "INSERT INTO enr VALUES ('1','2','ordinary','ordinary',0),('*','3','ordinary','ordinary',1)"
+        ).unwrap();
+        assert!(read_ids(&session, &sql).unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_candidate_branches_preserve_exact_wildcard_and_duplicate_matches() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ev(id BIGINT, source VARCHAR, code VARCHAR); \
+             INSERT INTO ev VALUES (0,'api','42'),(1,'auth','42'),(2,'*','42'),(3,'api','43'),(4,'auth','43'); \
+             CREATE TABLE enr(source VARCHAR, code VARCHAR, name VARCHAR, description VARCHAR, catalog INTEGER); \
+             INSERT INTO enr VALUES ('api','42','Needle exact','',0),('*','42','','needle wildcard',1),\
+             ('api','42','needle duplicate','',1),('api','43','ordinary','',0),('auth','43','needle exact','',0);"
+        ).unwrap();
+        super::super::udf::register(&conn).unwrap();
+        let mut tests = Tests::default();
+        tests.free_text("needle");
+        drop(conn);
+        let mut ids = read_ids(&session, &catalog_candidates_sql(&tests.free[0].names_sql)).unwrap();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 0, 1, 2, 4]);
+        ids.dedup();
+        assert_eq!(ids, vec![0, 1, 2, 4]);
     }
 
     #[test]
