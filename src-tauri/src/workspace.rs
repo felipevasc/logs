@@ -74,6 +74,7 @@ pub async fn load_bundle(
         crate::prepare_engine(state.inner(), &idx, Some(&app))?;
         let mut source = state.source.write();
         crate::operations::commit();
+        crate::engine::source_published(Some(&idx));
         *source = SourceData::Indexed(idx);
         *state.source_names.write() = names;
         Ok(summary)

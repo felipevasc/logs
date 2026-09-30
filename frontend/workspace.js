@@ -90,6 +90,9 @@
       if (workspaceScope() === "dataset" && !state.loaded) { await showPage("summary"); return; }
       const contextKey = sourceKey();
       switchView("viz", { deferAnalytics: true }); home.hidden = true;
+      // Background load/profile updates skip hidden field trees. Populate the catalog
+      // when returning from Summary even when the current rows are already cached.
+      renderExploreTree();
       if (lastExploredKey === contextKey && state.rows?.length > 0 && !state.queryError) {
         switchTab(state.activeDatasetTab, { deferAnalytics: false });
         return;

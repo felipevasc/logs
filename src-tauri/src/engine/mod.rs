@@ -719,7 +719,80 @@ struct Registry {
     /// Stores of the source in use; background builds of others stop.
     wanted: HashSet<String>,
     source_identity: String,
+    /// Preparation can run before source publication, so readiness/error keys
+    /// need ownership independent of the currently opened session's identity.
+    source_keys: HashMap<String, HashSet<String>>,
     progress: HashMap<String, BuildProgress>,
+}
+
+impl Registry {
+    fn remember_spec(&mut self, idx: &FileIndex, spec: &SourceSpec) {
+        self.source_keys
+            .entry(source_identity(idx))
+            .or_default()
+            .insert(spec.key.clone());
+        // Segment keys survive append/merge: their ownership is the physical
+        // constituent source, independent of its global row offset.
+        for part in &spec.parts {
+            self.source_keys
+                .entry(part_source_identity(&idx.parts[part.part]))
+                .or_default()
+                .insert(part.key.clone());
+        }
+    }
+
+    fn source_published(&mut self, idx: Option<&FileIndex>, queue: Option<&BackgroundQueue>) {
+        let idx = idx.filter(|idx| !idx.lines.is_empty());
+        let identity = idx.map(source_identity);
+        let owners = idx
+            .map(|idx| {
+                idx.parts
+                    .iter()
+                    .map(part_source_identity)
+                    .chain(std::iter::once(source_identity(idx)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.retain_source(identity.as_deref(), &owners);
+        if let Some(queue) = queue {
+            // Same lock order as schedule: registry, then queue. The worker
+            // never holds the queue lock while acquiring the registry.
+            queue.retain_source(identity.as_deref());
+        }
+    }
+
+    fn retain_source(&mut self, identity: Option<&str>, owners: &HashSet<String>) {
+        if identity.is_none_or(|identity| self.source_identity != identity) {
+            self.session = None;
+            self.base_session = None;
+        }
+        // A failed incoming preparation still publishes a valid line source.
+        // Keep its degraded cause/progress and wanted keys even though no
+        // successful Session::open has set source_identity to it yet. Prune
+        // ownership even when a successful session already changed identity.
+        self.source_keys.retain(|owner, _| owners.contains(owner));
+        let keep: HashSet<&String> = self
+            .source_keys
+            .values()
+            .flat_map(|keys| keys.iter())
+            .collect();
+        self.wanted.retain(|key| keep.contains(key));
+        self.failed.retain(|key, _| keep.contains(key));
+        self.progress.retain(|key, _| keep.contains(key));
+        self.source_identity = identity.unwrap_or_default().to_string();
+        // Active builders keep their claims until they unwind. Dropping the
+        // claim here could let a foreground retry race the same segment.
+    }
+}
+
+/// Publish the UI source lifecycle while its write guard is held. Preparation
+/// may already have opened this source's sessions: keep those and its queued
+/// work, but release all state belonging to a cleared or replaced source.
+/// Existing query Arcs and an active native call live until they return.
+pub(crate) fn source_published(idx: Option<&FileIndex>) {
+    with_registry(|reg| {
+        reg.source_published(idx, BACKGROUND_QUEUE.get().map(Arc::as_ref));
+    });
 }
 
 fn still_wanted(key: &str) -> bool {
@@ -762,6 +835,10 @@ pub(crate) fn session(
     }
     let session = with_registry(|reg| -> Option<Arc<Session>> {
         let identity = source_identity(idx);
+        reg.remember_spec(idx, &spec);
+        if let Some(base) = &base {
+            reg.remember_spec(idx, base);
+        }
         if reg.source_identity != identity {
             reg.wanted.clear();
             reg.progress.clear();
@@ -857,6 +934,10 @@ pub(crate) fn request_rebuild(
     };
     let identity = source_identity(idx);
     with_registry(|reg| {
+        reg.remember_spec(idx, &desired);
+        if let Some(base) = &base {
+            reg.remember_spec(idx, base);
+        }
         if reg.source_identity != identity {
             reg.base_session = None;
             reg.session = None;
@@ -880,21 +961,23 @@ pub(crate) fn request_rebuild(
     });
 }
 
+fn part_source_identity(part: &crate::sources::FilePart) -> String {
+    format!(
+        "{}|{}|{:?}|{}",
+        part.identity,
+        part.format,
+        part.physical_file_id,
+        part.ts_config
+            .as_ref()
+            .map(|c| c.signature())
+            .unwrap_or_default()
+    )
+}
+
 fn source_identity(idx: &FileIndex) -> String {
     idx.parts
         .iter()
-        .map(|p| {
-            format!(
-                "{}|{}|{:?}|{}",
-                p.identity,
-                p.format,
-                p.physical_file_id,
-                p.ts_config
-                    .as_ref()
-                    .map(|c| c.signature())
-                    .unwrap_or_default()
-            )
-        })
+        .map(part_source_identity)
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -929,6 +1012,36 @@ struct BackgroundQueue {
     revision: AtomicU64,
 }
 
+static BACKGROUND_QUEUE: std::sync::OnceLock<Arc<BackgroundQueue>> = std::sync::OnceLock::new();
+
+impl BackgroundQueue {
+    fn retain_source(&self, source: Option<&str>) {
+        let mut state = self.state.lock();
+        let keep_pending = state
+            .pending
+            .as_ref()
+            .is_some_and(|request| source.is_some_and(|source| request.key.source == source));
+        let keep_active = state
+            .active
+            .as_ref()
+            .is_some_and(|request| source.is_some_and(|source| request.source == source));
+        let removed_pending = state.pending.is_some() && !keep_pending;
+        if !keep_pending {
+            // Drop shared metadata/mappings immediately for work not started.
+            state.pending = None;
+        }
+        if !keep_active || removed_pending {
+            // A pending request had already superseded the active revision;
+            // removing it cannot resurrect that active build. Let a future
+            // request for the same key enqueue instead of deduplicating it.
+            state.active = None;
+        }
+        if !keep_pending && (!keep_active || removed_pending) {
+            self.revision.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 fn supersedes(new: &RequestKey, current: &RequestKey) -> bool {
     new != current && !(new.source == current.source && !new.derived && current.derived)
 }
@@ -941,8 +1054,7 @@ fn schedule(
     codes: &CodesConfig,
     system: &CodesConfig,
 ) {
-    static QUEUE: std::sync::OnceLock<Arc<BackgroundQueue>> = std::sync::OnceLock::new();
-    let queue = QUEUE.get_or_init(|| {
+    let queue = BACKGROUND_QUEUE.get_or_init(|| {
         let queue = Arc::new(BackgroundQueue {
             state: Mutex::new(QueueState::default()),
             wake: parking_lot::Condvar::new(),
@@ -1027,7 +1139,11 @@ fn run_background(queue: &BackgroundQueue, request: &BackgroundRequest) {
                 continue;
             }
             let claimed = with_registry(|reg| {
-                if reg.failed.contains_key(&part.key) || reg.building.contains(&part.key) {
+                if superseded()
+                    || !reg.wanted.contains(&part.key)
+                    || reg.failed.contains_key(&part.key)
+                    || reg.building.contains(&part.key)
+                {
                     false
                 } else {
                     reg.building.insert(part.key.clone());
@@ -1051,6 +1167,9 @@ fn run_background(queue: &BackgroundQueue, request: &BackgroundRequest) {
             let phase = Mutex::new(String::from("Preparando checkpoint em segundo plano"));
             let publish = |label: &str, completed: usize| {
                 with_registry(|reg| {
+                    if superseded() || !reg.wanted.contains(&part.key) {
+                        return;
+                    }
                     reg.progress.insert(
                         part.key.clone(),
                         BuildProgress {
@@ -1084,7 +1203,7 @@ fn run_background(queue: &BackgroundQueue, request: &BackgroundRequest) {
                 reg.building.remove(&part.key);
                 reg.progress.remove(&part.key);
                 if let Err(error) = result {
-                    if !was_cancelled {
+                    if !was_cancelled && !superseded() && reg.wanted.contains(&part.key) {
                         reg.failed.insert(part.key.clone(), error.clone());
                         reg.failed.insert(spec.key.clone(), error.clone());
                         reg.failed.insert(request.spec.key.clone(), error);
@@ -1188,7 +1307,10 @@ fn prepare_variant(
     let Some(spec) = spec(idx, codes, system, derived) else {
         return Ok(());
     };
-    with_registry(|reg| reg.wanted.extend(spec.parts.iter().map(|p| p.key.clone())));
+    with_registry(|reg| {
+        reg.remember_spec(idx, &spec);
+        reg.wanted.extend(spec.parts.iter().map(|p| p.key.clone()));
+    });
     let total: usize = spec.parts.iter().map(|p| p.rows).sum();
     progress(BuildProgress {
         phase: "Verificando integridade dos checkpoints".into(),
@@ -1229,6 +1351,7 @@ fn prepare_variant(
             error,
         };
         with_registry(|reg| {
+            reg.remember_spec(idx, &spec);
             reg.progress.insert(spec.key.clone(), p.clone());
         });
         progress(p);
@@ -1643,5 +1766,331 @@ mod segment_tests {
             .unwrap();
         std::fs::rename(&replacement, &path).unwrap();
         assert!(crate::sources::validate_source(&idx.parts[0]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn queue() -> BackgroundQueue {
+        BackgroundQueue {
+            state: Mutex::new(QueueState::default()),
+            wake: parking_lot::Condvar::new(),
+            revision: AtomicU64::new(1),
+        }
+    }
+
+    fn request(dir: &std::path::Path, name: &str, revision: u64) -> BackgroundRequest {
+        let path = dir.join(format!("{name}.jsonl"));
+        std::fs::write(&path, b"{\"message\":\"alpha\"}\n").unwrap();
+        let idx =
+            crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let codes = CodesConfig::default();
+        let mut spec = spec(&idx, &codes, &codes, &[]).unwrap();
+        // Any accidental build remains isolated to the fixture, not user data.
+        for part in &mut spec.parts {
+            part.path = dir.join(format!("{}.duckdb", part.key));
+        }
+        BackgroundRequest {
+            key: RequestKey {
+                source: source_identity(&idx),
+                config: spec.key.clone(),
+                derived: false,
+            },
+            revision,
+            idx,
+            spec,
+            base: None,
+            derived: Vec::new(),
+            codes: CodesConfig::default(),
+            system: CodesConfig::default(),
+        }
+    }
+
+    fn leased_session(path: &std::path::Path) -> Arc<Session> {
+        let lease = std::fs::File::create(path).unwrap();
+        fs2::FileExt::try_lock_shared(&lease).unwrap();
+        Arc::new(Session {
+            key: path.to_string_lossy().into_owned(),
+            base: Mutex::new(Connection::open_in_memory().unwrap()),
+            pool: Mutex::new(Vec::new()),
+            schema: sql::Schema::default(),
+            baked: false,
+            names: RwLock::new(None),
+            names_version: AtomicU64::new(0),
+            selections: Mutex::new(Vec::new()),
+            garbage: Arc::new(Mutex::new(Vec::new())),
+            texts: Vec::new(),
+            _leases: vec![lease],
+        })
+    }
+
+    fn failed_preparation_survives_publication(previous_source: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let incoming = request(dir.path(), "incoming", 1);
+        let old = request(dir.path(), "previous", 1);
+        let error = "Pouco espaço em disco para o índice de consultas rápidas.";
+        let part_key = incoming.spec.parts[0].key.clone();
+        let mut reg = Registry::default();
+        if previous_source {
+            reg.source_identity = old.key.source.clone();
+            reg.remember_spec(&old.idx, &old.spec);
+            reg.wanted.insert(old.spec.parts[0].key.clone());
+            reg.failed
+                .insert(old.spec.key.clone(), "old failure".into());
+            reg.base_session = Some(leased_session(&dir.path().join("old.lock")));
+        }
+        let old_session = reg.base_session.as_ref().map(Arc::downgrade);
+        // This is the state recorded by prepare_variant's degraded return:
+        // a valid line index, failed segment and progress, but no new session.
+        reg.remember_spec(&incoming.idx, &incoming.spec);
+        reg.wanted.insert(part_key.clone());
+        reg.failed.insert(part_key.clone(), error.into());
+        reg.progress.insert(
+            incoming.spec.key.clone(),
+            BuildProgress {
+                phase: "Motor de linhas ativo; preparação pode ser retomada".into(),
+                completed: 0,
+                total: incoming.idx.lines.len(),
+                checkpoint_rows: 0,
+                completed_segments: 0,
+                total_segments: incoming.spec.parts.len(),
+                resumed_rows: 0,
+                state: "degraded".into(),
+                error: Some(error.into()),
+            },
+        );
+        reg.source_published(Some(&incoming.idx), None);
+        assert_eq!(reg.source_identity, incoming.key.source);
+        assert_eq!(reg.failed.get(&part_key).map(String::as_str), Some(error));
+        let progress = &reg.progress[&incoming.spec.key];
+        assert_eq!(progress.state, "degraded");
+        assert_eq!(progress.error.as_deref(), Some(error));
+        assert_eq!(reg.wanted, HashSet::from([part_key]));
+        assert!(!reg.failed.contains_key(&old.spec.key));
+        assert!(old_session.is_none_or(|weak| weak.upgrade().is_none()));
+        assert_eq!(reg.source_keys.len(), 1);
+        assert!(reg.source_keys.contains_key(&incoming.key.source));
+    }
+
+    #[test]
+    fn first_source_publication_preserves_its_failed_preparation_and_retry_cause() {
+        failed_preparation_survives_publication(false);
+    }
+
+    #[test]
+    fn replacement_publication_preserves_incoming_failure_and_releases_previous_source() {
+        failed_preparation_survives_publication(true);
+    }
+
+    #[test]
+    fn merged_source_publication_preserves_constituent_segment_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = request(dir.path(), "first", 1);
+        let second = request(dir.path(), "second", 1);
+        let failed_key = second.spec.parts[0].key.clone();
+        let mut reg = Registry {
+            source_identity: first.key.source.clone(),
+            ..Default::default()
+        };
+        reg.remember_spec(&first.idx, &first.spec);
+        reg.remember_spec(&second.idx, &second.spec);
+        reg.wanted
+            .extend([first.spec.parts[0].key.clone(), failed_key.clone()]);
+        reg.failed.insert(failed_key.clone(), "disk full".into());
+        first.idx.append(second.idx);
+        let codes = CodesConfig::default();
+        let merged = spec(&first.idx, &codes, &codes, &[]).unwrap();
+        assert_eq!(merged.parts[1].key, failed_key);
+        reg.source_published(Some(&first.idx), None);
+        assert_eq!(
+            reg.failed.get(&merged.parts[1].key).map(String::as_str),
+            Some("disk full")
+        );
+        assert!(reg.wanted.contains(&failed_key));
+        assert!(reg.wanted.contains(&merged.parts[0].key));
+        assert_eq!(reg.source_identity, source_identity(&first.idx));
+    }
+
+    #[test]
+    fn successful_session_adoption_does_not_leave_previous_source_ownership_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::default();
+        for n in 0..32 {
+            let current = request(dir.path(), &format!("source-{n}"), 1);
+            reg.remember_spec(&current.idx, &current.spec);
+            // Session::open succeeds before the application publishes it.
+            reg.source_identity = current.key.source.clone();
+            reg.source_published(Some(&current.idx), None);
+            assert_eq!(reg.source_keys.len(), 1);
+            assert!(reg.source_keys.contains_key(&current.key.source));
+        }
+    }
+
+    #[test]
+    fn clearing_or_replacing_source_releases_sessions_without_killing_active_readers() {
+        for next in [None, Some("replacement")] {
+            let dir = tempfile::tempdir().unwrap();
+            let base_path = dir.path().join("base.lock");
+            let derived_path = dir.path().join("derived.lock");
+            let base = leased_session(&base_path);
+            let derived = leased_session(&derived_path);
+            let base_weak = Arc::downgrade(&base);
+            let derived_weak = Arc::downgrade(&derived);
+            let active_reader = Arc::clone(&base);
+            let mut reg = Registry {
+                source_identity: "previous".into(),
+                base_session: Some(base),
+                session: Some(derived),
+                wanted: HashSet::from(["checkpoint".into()]),
+                building: HashSet::from(["checkpoint".into()]),
+                failed: HashMap::from([("old-error".into(), "error".into())]),
+                ..Default::default()
+            };
+            reg.retain_source(next, &HashSet::new());
+            assert!(reg.wanted.is_empty());
+            assert!(reg.failed.is_empty());
+            assert_eq!(reg.source_identity, next.unwrap_or_default());
+            assert!(
+                reg.building.contains("checkpoint"),
+                "builder owns claim until unwind"
+            );
+            assert!(derived_weak.upgrade().is_none());
+            assert!(
+                base_weak.upgrade().is_some(),
+                "in-flight query retains its lease"
+            );
+            let derived_lock = std::fs::File::open(&derived_path).unwrap();
+            fs2::FileExt::try_lock_exclusive(&derived_lock).unwrap();
+            let base_lock = std::fs::File::open(&base_path).unwrap();
+            assert!(fs2::FileExt::try_lock_exclusive(&base_lock).is_err());
+            drop(active_reader);
+            assert!(base_weak.upgrade().is_none());
+            fs2::FileExt::try_lock_exclusive(&base_lock).unwrap();
+        }
+    }
+
+    #[test]
+    fn clearing_source_cancels_active_request_and_releases_metadata_when_it_unwinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = request(dir.path(), "active", 1);
+        let lines = Arc::downgrade(&active.idx.lines);
+        let mapping = Arc::downgrade(&active.idx.parts[0].mmap);
+        let queue = queue();
+        queue.state.lock().active = Some(active.key.clone());
+        queue.retain_source(None);
+        assert_ne!(queue.revision.load(Ordering::SeqCst), active.revision);
+        assert!(queue.state.lock().active.is_none());
+        // A cancelled worker must return before touching stores or claiming
+        // more segments, even if an old wanted key remains somewhere else.
+        run_background(&queue, &active);
+        assert!(!active.spec.parts[0].path.exists());
+        assert!(lines.upgrade().is_some());
+        drop(active);
+        assert!(lines.upgrade().is_none());
+        assert!(mapping.upgrade().is_none());
+    }
+
+    #[test]
+    fn clearing_source_drops_pending_metadata_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = request(dir.path(), "pending", 1);
+        let lines = Arc::downgrade(&pending.idx.lines);
+        let mapping = Arc::downgrade(&pending.idx.parts[0].mmap);
+        let queue = queue();
+        queue.state.lock().pending = Some(pending);
+        queue.retain_source(None);
+        assert!(queue.state.lock().pending.is_none());
+        assert!(lines.upgrade().is_none());
+        assert!(mapping.upgrade().is_none());
+    }
+
+    #[test]
+    fn publishing_prepared_source_preserves_matching_sessions_and_active_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = request(dir.path(), "active", 1);
+        let session = leased_session(&dir.path().join("prepared.lock"));
+        let mut reg = Registry {
+            source_identity: active.key.source.clone(),
+            base_session: Some(Arc::clone(&session)),
+            wanted: HashSet::from([active.spec.parts[0].key.clone()]),
+            ..Default::default()
+        };
+        let queue = queue();
+        queue.state.lock().active = Some(active.key.clone());
+        reg.remember_spec(&active.idx, &active.spec);
+        reg.source_published(Some(&active.idx), Some(&queue));
+        assert!(Arc::ptr_eq(reg.base_session.as_ref().unwrap(), &session));
+        assert!(reg.wanted.contains(&active.spec.parts[0].key));
+        assert_eq!(queue.revision.load(Ordering::SeqCst), active.revision);
+        assert_eq!(queue.state.lock().active.as_ref(), Some(&active.key));
+    }
+
+    #[test]
+    fn publishing_new_source_keeps_its_pending_work_while_old_active_work_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = request(dir.path(), "old", 1);
+        let new = request(dir.path(), "new", 2);
+        let new_key = new.key.clone();
+        let queue = queue();
+        queue.revision.store(2, Ordering::SeqCst);
+        *queue.state.lock() = QueueState {
+            active: Some(old.key.clone()),
+            pending: Some(new),
+        };
+        queue.retain_source(Some(&new_key.source));
+        let state = queue.state.lock();
+        assert!(state.active.is_none());
+        assert_eq!(state.pending.as_ref().map(|r| &r.key), Some(&new_key));
+        assert_eq!(queue.revision.load(Ordering::SeqCst), 2);
+        assert_ne!(queue.revision.load(Ordering::SeqCst), old.revision);
+    }
+
+    #[test]
+    fn publishing_empty_index_releases_old_source_without_starting_a_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = request(dir.path(), "pending", 1);
+        let lines = Arc::downgrade(&pending.idx.lines);
+        let mut empty = request(dir.path(), "empty", 1).idx;
+        Arc::make_mut(&mut empty.lines).clear();
+        let session = leased_session(&dir.path().join("old.lock"));
+        let weak_session = Arc::downgrade(&session);
+        let mut reg = Registry {
+            source_identity: pending.key.source.clone(),
+            base_session: Some(session),
+            wanted: HashSet::from([pending.spec.parts[0].key.clone()]),
+            ..Default::default()
+        };
+        let queue = queue();
+        queue.state.lock().pending = Some(pending);
+        reg.source_published(Some(&empty), Some(&queue));
+        assert!(reg.source_identity.is_empty());
+        assert!(reg.wanted.is_empty());
+        assert!(weak_session.upgrade().is_none());
+        assert!(lines.upgrade().is_none());
+        assert!(queue.state.lock().pending.is_none());
+        assert_eq!(queue.revision.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn removing_a_superseding_request_does_not_resurrect_or_deduplicate_old_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = request(dir.path(), "old", 1);
+        let new = request(dir.path(), "new", 2);
+        let queue = queue();
+        queue.revision.store(2, Ordering::SeqCst);
+        *queue.state.lock() = QueueState {
+            active: Some(old.key.clone()),
+            pending: Some(new),
+        };
+        queue.retain_source(Some(&old.key.source));
+        let state = queue.state.lock();
+        assert!(state.pending.is_none());
+        assert!(
+            state.active.is_none(),
+            "a fresh request must not deduplicate cancelled work"
+        );
+        assert_ne!(queue.revision.load(Ordering::SeqCst), old.revision);
     }
 }

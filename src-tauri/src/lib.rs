@@ -300,6 +300,7 @@ pub(crate) fn load_event_log_impl(
         source_desc: names.join(" + "),
     };
     crate::operations::commit();
+    engine::source_published(Some(&idx));
     *source = SourceData::Indexed(idx);
     *state.source_names.write() = names;
     emit_progress(
@@ -476,6 +477,7 @@ pub(crate) fn load_file_impl(
         source_desc: names.join(" + "),
     };
     crate::operations::commit();
+    engine::source_published(Some(&idx));
     *source = SourceData::Indexed(idx);
     *state.source_names.write() = names;
     emit_progress(
@@ -613,6 +615,7 @@ pub(crate) fn load_files_impl(
         source_desc: names.join(" + "),
     };
     crate::operations::commit();
+    engine::source_published(Some(&idx));
     *source = SourceData::Indexed(idx);
     *state.source_names.write() = names;
     emit_progress(
@@ -1171,12 +1174,19 @@ pub(crate) fn save_custom_format_impl(
 }
 
 #[tauri::command]
-fn clear_events(state: State<AppState>) {
-    clear_events_impl(state.inner())
+async fn clear_events(app: AppHandle) -> Result<(), String> {
+    // Waiting for existing source readers and releasing native sessions can
+    // take time; neither belongs on the WebView's synchronous IPC callback.
+    offload(move || {
+        let state = app.state::<AppState>();
+        clear_events_impl(state.inner())
+    }).await
 }
 
 pub(crate) fn clear_events_impl(state: &AppState) {
-    *state.source.write() = SourceData::None;
+    let mut source = state.source.write();
+    engine::source_published(None);
+    *source = SourceData::None;
     state.source_names.write().clear();
     query::clear_match_cache();
 }

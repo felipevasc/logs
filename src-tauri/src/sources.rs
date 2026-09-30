@@ -1833,7 +1833,9 @@ pub(crate) fn file_identity(_file: &std::fs::File) -> Option<(u64, u64)> { None 
 pub(crate) fn validate_source(part: &FilePart) -> Result<(), String> {
     let file = std::fs::File::open(&part.physical_path).map_err(|e| format!("Fonte indisponível: {e}"))?;
     let metadata = file.metadata().map_err(|e| format!("Fonte indisponível: {e}"))?;
-    // Check length before touching a mapping that could have been truncated.
+    // Reject changes observed before touching the mapping. This is not an
+    // atomic snapshot: external writers must not modify/truncate the backing
+    // file during use, including between this guard and subsequent mmap reads.
     if metadata.len() != part.mmap.len() as u64
         || part.physical_file_id.is_some_and(|id| file_identity(&file) != Some(id))
         || crate::index_cache::identity(&part.physical_path, &part.mmap) != part.identity {
