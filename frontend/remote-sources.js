@@ -139,11 +139,11 @@
         await refreshConnections(); q("form-title").textContent = saved.name; q("saved-state").textContent = "Configuração salva"; q("delete").hidden = false;
         syncHints(); setStatus("Conexão salva. Suas opções estarão disponíveis na próxima consulta.", "success");
       } else if (action === "test") {
-        const result = await api("remote_test", { connection, ...passwordArgs() }, { silent: true });
+        const result = await api("remote_test", { connection, ...passwordArgs() }, { silent: true, latest: "remote-request" });
         setStatus(ui.cancelled ? "Teste cancelado. Sua configuração foi mantida." : result.message || "Acesso confirmado. A conexão está pronta para importar.", ui.cancelled ? "neutral" : "success");
       } else {
         startOperation("remote", "Importando registros", connection.name);
-        const result = await api("remote_import", { connection, ...passwordArgs(), ...range }, { silent: true });
+        const result = await api("remote_import", { connection, ...passwordArgs(), ...range }, { silent: true, latest: "remote-request" });
         if (ui.cancelled) { setStatus("Importação cancelada. Sua configuração foi mantida."); finishOperation("Importação cancelada"); return; }
         ui.lastImport = result;
         if (!result.count) { setStatus("Nenhum registro encontrado nesse recorte. Ajuste o período, o índice ou o filtro.", "neutral"); finishOperation("Consulta concluída", "Nenhum registro encontrado"); return; }
@@ -188,7 +188,7 @@
   q("cancel").onclick = async () => {
     if (!ui.busy || ui.cancelled) return;
     ui.cancelled = true; q("cancel").disabled = true; setStatus("Cancelando… Aguardando a consulta em andamento encerrar.");
-    try { await api("cancel_operation", {}, { silent: true }); }
+    try { window.Tasks?.cancelLatest("remote-request"); }
     catch { ui.cancelled = false; q("cancel").disabled = false; setStatus("Não foi possível solicitar o cancelamento. A consulta continua; você pode tentar novamente.", "error"); }
   };
   q("open-result").onclick = async () => {
@@ -205,6 +205,8 @@
   document.addEventListener("keydown", event => { if (event.key === "Escape" && !modal.hidden) { event.preventDefault(); close(); } });
   window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
     if (ui.action !== "import" || ui.cancelled || payload?.operation !== "remoto") return;
+    const operationId = window.Tasks?.operationFor("remote-request");
+    if (operationId && payload.operationId !== operationId) return;
     const count = Number(payload.completed) || 0, total = Number(payload.total) || 0;
     setStatus(`${payload.phase || "Importando"}${count ? ` · ${fmtNum(count)}${total ? ` de ${fmtNum(total)}` : ""} registros` : ""}…`);
   }).catch(() => {});

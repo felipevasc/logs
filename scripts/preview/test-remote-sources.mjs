@@ -1,14 +1,12 @@
 /* UI contract test against the preview fixture; never contacts Elasticsearch/Kibana. */
 import assert from "node:assert/strict";
-import { chromium } from "playwright";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { launchBrowser } from "./browser.mjs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const url = process.argv[2] || "http://127.0.0.1:4175";
 const output = resolve("output/playwright"); mkdirSync(output, { recursive: true });
-let executablePath = chromium.executablePath();
-if (!existsSync(executablePath)) executablePath = [`${process.env.LOCALAPPDATA}/ms-playwright/chromium-1217/chrome-win64/chrome.exe`, "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", "C:/Program Files/Google/Chrome/Application/chrome.exe"].find(existsSync);
-const browser = await chromium.launch(executablePath ? { executablePath } : {});
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1024, height: 768 } });
 const errors = [], result = {};
 page.on("pageerror", error => errors.push(error.message));

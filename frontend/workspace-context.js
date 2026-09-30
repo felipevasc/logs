@@ -65,7 +65,7 @@ window.WorkspaceContext = (() => {
     if (!state.columns.includes(state.groupCol)) state.groupCol = "level";
     state.stationAnalyticsId = null; state.activeContext = scope === "case" ? "case" : "artifact"; state.analyticsScope = scope;
     $("#explore-tree").dataset.treeScope = scope;
-    state.treeAgg[scope] = null; state.treeAggSig[scope] = null; treeAggVersion.dataset++; treeAggVersion.case++;
+    state.treeAgg[scope] = null; state.treeAggSig[scope] = null; state.treeAggError[scope] = null; treeAggVersion.dataset++; treeAggVersion.case++;
     state.treeCollapsed = new Set(snapshot.tree || []);
     cubeState.collapsed = new Set(snapshot.cubeCollapsed || []); cubeState.requestVersion++;
     document.body.dataset.density = snapshot.density || "comfortable"; document.body.dataset.wrap = snapshot.wrap || "false";
@@ -75,6 +75,7 @@ window.WorkspaceContext = (() => {
     window.Workspace?.restore(snapshot.workspace); window.Discovery?.restore(snapshot.discovery); window.WorkspaceAnalysis?.restore(snapshot.workbench);
     window.Journeys?.restore(snapshot.journeys);
     fillColumnControls(); renderChips(); renderExploreTree(); updateContextBar();
+    restoreVisiblePreferences();
   }
   function updateToggle() {
     document.documentElement.dataset.workspace = scope; document.body.dataset.workspace = scope;
@@ -97,7 +98,7 @@ window.WorkspaceContext = (() => {
     const update = () => {
       if (request !== generation) return;
       scope = next; apply(snapshot); if (options.tab) state.activeDatasetTab = options.tab; updateToggle();
-      finishOperation(scope === "case" ? "Caso" : "Análise", scope === "case" ? `${fmtNum(caseEvents().length)} registros preservados no Caso` : `${fmtNum(state.total)} registros na Análise`);
+      finishOperation(scope === "case" ? "Caso" : "Análise", scope === "case" ? `${fmtNum(caseEvents().length)} registros preservados no Caso` : `${currentCountLabel("registros")} na Análise`);
       document.dispatchEvent(new CustomEvent("workspace-context-change", { detail: { scope, previousScope } }));
       render = Workspace.showPage(["sources", "connections", "import"].includes(page) && scope === "case" ? "summary" : page).then(async () => {
         if (request !== generation) return;

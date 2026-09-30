@@ -510,13 +510,14 @@
       });
     },
     get_ts_config: () => null,
-    set_ts_config: async () => {
+    set_ts_config: async ({ operationId } = {}) => {
       for (let done = 0; done <= 6000; done += 1500) {
         emitMock("operation-progress", {
-          operation: "data/hora", phase: "Recalculando timestamps",
+          operationId, phaseId: "timestamp", operation: "data/hora", phase: "Recalculando timestamps",
           completed: done, total: 6000, unit: "linhas", cancellable: false,
         });
         await delay(300);
+        if (window.__mockCancelledIds?.has(operationId)) throw Error("Operação cancelada.");
       }
       return null;
     },
@@ -627,6 +628,14 @@
     load_event_log: () => handlers.load_file(),
     load_bundle: ({ members }) => handlers.load_files({ paths: members.flatMap(s => s.paths || [s.path || s.channel]), merge: false }),
     event_detail: ({ id }) => events.find((e) => e.id === id) || null,
+    query_page: ({ filters, offset=0, limit=100, cursor, sortColumn='', sortDir='', caseEvents }) => {
+      const rows = sortedRows(applyFilters(filters, poolOf(caseEvents)), sortColumn, sortDir);
+      const start = cursor ? Number(cursor) : offset, size = Math.max(1, Math.min(2000, limit));
+      return { rows: rows.slice(start, start + size), total: null, hasMore: start + size < rows.length, nextCursor: start + size < rows.length ? String(start + size) : null, engine: 'columnar', warning: null };
+    },
+    engine_status: () => window.__mockEngineStatus || { state: 'ready', baseReady: true, derivedReady: true, phase: 'Pronto', completedRows: poolOf().length, totalRows: poolOf().length, completedSegments: 1, totalSegments: 1, resumedRows: 0, canResume: false, error: null },
+    engine_retry: () => { window.__mockEngineStatus = null; return null; },
+    cancel_task: ({ operationId }) => { (window.__mockCancelledIds ||= new Set()).add(operationId); return true; },
     query_events: ({ filters, offset=0, limit=100, sortColumn='', sortDir='',caseEvents }) => {
       const rows = sortedRows(applyFilters(filters,poolOf(caseEvents)),sortColumn,sortDir);
       return { total: rows.length, rows: rows.slice(offset, offset + Math.max(1,Math.min(2000,limit))) };
@@ -825,22 +834,23 @@
     emitMock("mcp-state-changed", { kind });
   };
   // simula a indexação de um arquivo com progresso granular
-  async function simulateLoad(label, total) {
+  async function simulateLoad(label, total, operationId) {
     for (let done = 0; done < total; done += 900) {
       emitMock("operation-progress", {
-        operation: "carregamento", phase: `Indexando ${label}`,
+        operationId, phaseId: "parse", operation: "carregamento", phase: `Indexando ${label}`,
         completed: done, total, unit: "linhas", cancellable: false,
       });
       await delay(240);
     }
     emitMock("operation-progress", {
-      operation: "carregamento", phase: "Concluído",
+      operationId, phaseId: "ready", operation: "carregamento", phase: "Concluído",
       completed: total, total, unit: "linhas", cancellable: false,
     });
   }
   window.__TAURI__ = {
     core: {
       invoke: async (cmd, args = {}) => {
+        window.__mockRequests ||= []; window.__mockRequests.push({ cmd, cursor: args.cursor, offset: args.offset, operationId: args.operationId }); if (window.__mockRequests.length > 400) window.__mockRequests.shift();
         window.__mockCommandCalls ||= {};
         window.__mockCommandCalls[cmd] = (window.__mockCommandCalls[cmd] || 0) + 1;
         const h = handlers[cmd];
@@ -850,17 +860,17 @@
           args = { ...args, caseEvents: caseStore.get(args.caseKey) };
         }
         try {
-          const scopedCommands=['query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
+          const scopedCommands=['query_page','query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
           if(scopedCommands.includes(cmd)&&args.filters?.some(filter=>filter.op==='threat_rule')){
             const module=await import('/__mock-threats__.js');
             args={...args,caseEvents:await module.threatFilterRows(poolOf(args.caseEvents),args.filters.filter(filter=>filter.op==='threat_rule')),filters:args.filters.filter(filter=>filter.op!=='threat_rule')};
           }
           // latência artificial para visualizar os estados de carregamento
-          if (["load_file", "load_files", "load_event_log"].includes(cmd)) await simulateLoad("mock.jsonl", 6300);
+          if (["load_file", "load_files", "load_event_log"].includes(cmd)) await simulateLoad("mock.jsonl", 6300, args.operationId);
           if (["explore_snapshot", "aggregate_events", "profile_fields"].includes(cmd)) await delay(350);
           // Tests can slow commands down (window.__mockLatency = { cmd: ms }); a cancel in between aborts them like the engine does.
           const extra = window.__mockLatency?.[cmd];
-          if (extra) { const generation = window.__mockGeneration || 0; await delay(extra); if ((window.__mockGeneration || 0) !== generation) throw new Error("Operação cancelada."); }
+          if (extra) { const generation = window.__mockGeneration || 0; for (let elapsed = 0; elapsed < extra; elapsed += 25) { await delay(Math.min(25, extra - elapsed)); if ((window.__mockGeneration || 0) !== generation || window.__mockCancelledIds?.has(args.operationId)) throw new Error("Operação cancelada."); } }
           return h(args);
         } catch (e) {
           return Promise.reject(String(e));
