@@ -26,13 +26,21 @@ try {
     server.once("error", error => { clearTimeout(timeout); reject(error); });
     server.once("exit", code => { clearTimeout(timeout); reject(new Error(`Preview server exited (${code})`)); });
   });
+  const failures = [];
   for (const test of tests) {
     console.log(`\nPreview regression: ${test}`);
-    await new Promise((resolve, reject) => {
+    try { await new Promise((resolve, reject) => {
       active = spawn(process.execPath, [`scripts/preview/${test}`, url], { cwd: root, stdio: "inherit" });
       const timeout = setTimeout(() => { active.kill(); reject(new Error(`${test} timed out after 120s`)); }, 120_000);
       active.once("error", error => { clearTimeout(timeout); reject(error); });
       active.once("exit", code => { clearTimeout(timeout); code === 0 ? resolve() : reject(new Error(`${test} failed (${code})`)); });
-    });
+    }); } catch (error) {
+      failures.push({ test, message: String(error) });
+      console.error(`Preview regression failed: ${test}: ${error.message}`);
+    }
+  }
+  if (failures.length) {
+    console.error(`\n${failures.length}/${tests.length} preview regressions failed: ${failures.map(f => f.test).join(", ")}`);
+    process.exitCode = 1;
   }
 } finally { stop(); }

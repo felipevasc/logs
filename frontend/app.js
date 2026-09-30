@@ -467,8 +467,9 @@ function storeCurrentArtifactInSession() {
   });
   session.activeId = state.currentArtifact.id;
   registerCurrentArtifact(c);
-  saveCases();
+  const saved = saveCases();
   renderArtifactBar();
+  return saved;
 }
 
 async function activateArtifact(artifactId) {
@@ -926,7 +927,7 @@ async function loadData(requestedSource = null, options = {}) {
       source,
     };
     const restoredVisiblePreferences = restoreVisiblePreferences();
-    storeCurrentArtifactInSession();
+    const artifactSaved = storeCurrentArtifactInSession();
     if (source.kind === "file") {
       const path = source.path;
       const linked = currentCaseArtifact();
@@ -950,8 +951,11 @@ async function loadData(requestedSource = null, options = {}) {
     if (!savedArtifact?.visibleCols?.length && !restoredVisiblePreferences) autoVisibleCols();
     updateTsExample();
     updateContextBar();
-    finishOperation("Artefato pronto", state.total == null ? "Registros disponíveis · total em cálculo" : `${fmtNum(state.total)} eventos disponíveis`);
-    hideLoadOverlay(true);
+    // Rows are already visible, but a completed load must also survive an immediate restart.
+    // The former snapshot query happened to outlast this debounced save; paging need not.
+    const sessionSaved = await artifactSaved;
+    finishOperation(sessionSaved === false ? "Registros disponíveis · sessão não salva" : "Artefato pronto", sessionSaved === false ? "Reabra a fonte manualmente se reiniciar o aplicativo." : state.total == null ? "Registros disponíveis · total em cálculo" : `${fmtNum(state.total)} eventos disponíveis`);
+    hideLoadOverlay(sessionSaved !== false);
     await window.Workspace?.loaded();
     if (document.body.dataset.page === "summary") await window.Workspace?.showPage("summary");
     return true;
