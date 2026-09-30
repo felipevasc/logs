@@ -22,6 +22,9 @@ for (const payload of [
 assert.equal(estimate(null,{completed:50,total:0},0).percent,null);
 assert.equal(estimate(null,{completed:100,total:100,state:'indexing'},0).percent,null,'counters complete does not imply commit complete');
 assert.equal(estimate(null,{completed:100,total:100,state:'ready'},0).percent,100);
+assert.equal(context.window.PerformanceTools.phaseSeconds({phaseElapsedMs:2000},{updated:1000},1500),2.5);
+assert.equal(context.window.PerformanceTools.phaseSeconds({phaseElapsedMs:2000},{},1500),2);
+for (const phaseElapsedMs of [undefined, null, -1, Infinity, '2000']) assert.equal(context.window.PerformanceTools.phaseSeconds({phaseElapsedMs},{updated:1000},1500),null);
 let running = 0, maxRunning = 0, done = 0;
 const q = queue(1);
 await Promise.all(Array.from({length:5},()=>q.add(async()=>{maxRunning=Math.max(maxRunning,++running);await tick();running--;done++;})));
@@ -84,7 +87,8 @@ const taskContext=vm.createContext({window:{PerformanceTools:context.window.Perf
   setTimeout:(fn,delay)=>delay<100?setTimeout(fn,delay):0,clearInterval(){},setInterval(){},requestAnimationFrame(){},
   api:(cmd,args)=>{taskCalls.push({cmd,args});if(cmd==='cancel_task'){pendingTasks.get(args.operationId)?.reject(Error('Operação cancelada.'));return Promise.resolve(true);}return new Promise((resolve,reject)=>pendingTasks.set(args.operationId,{resolve,reject}));}
 });
-vm.runInContext(taskSource,taskContext);
+// Expose the real renderer only inside this VM fixture.
+vm.runInContext(taskSource.replace('return { cancelAll,','return { __render: render, cancelAll,'),taskContext);
 const first=taskContext.api('query_page',{limit:1},{latest:'records'}).catch(String);
 const unrelated=taskContext.api('query_page',{limit:2},{latest:'other'});
 const firstId=taskCalls[0].args.operationId;
@@ -115,11 +119,29 @@ for (const cmd of ['journey_fields','journey_index','journey_events','remote_tes
   taskContext.window.Tasks.cancelLatest(cmd);assert.match(await promise,/cancelada/);
 }
 console.log('Journey/remote/bundle named cancellation and explicit-only global cancel passed');
+taskContext.document.querySelectorAll=()=>[];
+const idleBars=[];taskContext.setWorkbar=(...args)=>idleBars.push(args);
+taskContext.state.progressOperationId='finished-native-task';taskContext.state.loadOverlay=true;
+taskContext.window.Tasks.__render();
+assert.equal(idleBars.length,0,'native settlement must not close frontend import finalization');
+taskContext.state.loadOverlay=false;taskContext.window.Tasks.__render();
+assert.equal(taskContext.state.progressOperationId,null,'settled progress no longer offers a stale Cancel target');
+assert.equal(idleBars.at(-1)[3],false,'the idle workbar is not left indefinitely cancellable');
+const unnamed=taskContext.api('profile_fields',{},{});
+taskNode.textContent='not selected';taskContext.window.Tasks.__render();
+assert.equal(taskNode.textContent,'not selected','null IDs never select an unrelated unnamed task');
+taskContext.state.loadOverlay=true;taskContext.window.Tasks.__render();
+assert.equal(taskNode.textContent,'not selected','task ticker does not overwrite an import awaiting dispatch or persistence');
+taskContext.state.loadOverlay=false;pendingTasks.get(undefined).resolve([]);await unnamed;
 
 const staleDetail=taskContext.window.Tasks.detail({progress:{phase:'Sincronizando checkpoint',completed:100,total:100,unit:'registros'},estimate:{updated:performance.now()-11000,eta:5,rate:20}});
 assert.match(staleDetail,/Aguardando atualização/);assert.doesNotMatch(staleDetail,/nesta etapa|registros\/s/,'stale rate and ETA disappear');
 const freshDetail=taskContext.window.Tasks.detail({progress:{phase:'Indexando',completed:50,total:100,unit:'registros'},estimate:{updated:performance.now(),eta:5,rate:20}});
 assert.match(freshDetail,/nesta etapa/);
+const verificationDetail=taskContext.window.Tasks.detail({progress:{phase:'Confirmando filtros',completed:500,total:0,unit:'candidatos',selected:3,phaseElapsedMs:2000},estimate:{updated:performance.now()-11000,eta:5,rate:20}});
+assert.match(verificationDetail,/13s nesta etapa/,'phase elapsed keeps ticking even without new work');
+assert.match(verificationDetail,/3 selecionados/,'selected rows stay distinct from candidates examined');
+assert.doesNotMatch(verificationDetail,/≈|candidatos\/s/,'stale throughput and ETA are still suppressed');
 assert.match(readFileSync(new URL('../../frontend/workspace.js',import.meta.url),'utf8'), /if \(kind === "case"\) \{ window\.WorkspaceContext\?\.capture\(\); syncVisiblePreferenceMetadata\(\); \}/);
 // Changed source can only be reopened; it must never offer resume against stale bytes.
 context.api=async()=>({state:'stale',baseReady:false,canResume:false,phase:'Fonte alterada; reabra o arquivo',completedRows:0,totalRows:50,error:'Fonte mudou'});

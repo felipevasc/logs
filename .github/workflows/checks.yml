@@ -74,5 +74,36 @@ jobs:
       - run: npm ci
       - run: npm run prepare:frontend
       - run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+      - name: Build Windows portable review executable
+        if: runner.os == 'Windows'
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --locked --bin loginsight
+      - name: Record portable executable identity
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          REVIEW_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $destination = 'output/windows-portable-review'
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          Copy-Item 'src-tauri/target/release/loginsight.exe' "$destination/LogInsight.exe"
+          $digest = (Get-FileHash "$destination/LogInsight.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          @{
+            kind = 'portable-review-build'
+            platform = 'windows-x64'
+            sourceCommit = $env:REVIEW_SOURCE_SHA
+            buildCommit = (git rev-parse HEAD)
+            executable = 'LogInsight.exe'
+            sha256 = $digest
+          } | ConvertTo-Json | Set-Content "$destination/build-identity.json" -Encoding utf8
+      - name: Upload Windows portable review build
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LogInsight-Windows-x64-review-${{ github.event.pull_request.head.sha || github.sha }}
+          path: output/windows-portable-review/
+          if-no-files-found: error
+          retention-days: 30
 
-# Intentionally no installers, updater runs, signing, repository writes or releases.
+# Portable review artifact only: no installers, updater runs, signing,
+# production configuration changes, repository writes or releases.

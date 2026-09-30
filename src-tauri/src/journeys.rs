@@ -235,7 +235,7 @@ impl View<'_> {
                         }
                     }
                 },
-            ),
+            )?,
             Records::Empty => {}
         }
         if let Some(error) = failure {

@@ -190,7 +190,7 @@ pub(crate) fn published_matches(
     let Ok(conn) = Connection::open(path) else {
         return false;
     };
-    super::limit_resources(&conn);
+    if super::limit_resources(&conn, true).is_err() { return false; }
     if !read_info(&conn, "main").is_ok_and(|info| info.rows == rows) {
         return false;
     }
@@ -266,6 +266,10 @@ pub(crate) fn copy_part(
             path: part.path.clone(),
             physical_path: part.physical_path.clone(),
             physical_file_id: part.physical_file_id,
+            calendar: part.calendar.clone(),
+            event_identity: part.event_identity.clone(),
+            metadata_identity: part.metadata_identity.clone(),
+            canonical_lease: part.canonical_lease.clone(),
             file_name: part.file_name.clone(),
             format: part.format.clone(),
             custom: part.custom.clone(),
@@ -757,7 +761,7 @@ fn write(
         .min(input_bytes.saturating_mul(2).saturating_add(32 << 20) as usize);
     let text = super::text::Writer::create(&super::text::dir_of(path), text_threads, text_memory)?;
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
-    super::limit_resources(&conn);
+    super::limit_resources(&conn, true)?;
     create_table(&conn, &wide_names).map_err(|e| e.to_string())?;
     // Each writer appends one contiguous share of the file inside its own
     // transaction: full row groups go straight to the file, compressed in

@@ -11,6 +11,59 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static START: Cell<Option<u64>> = const { Cell::new(None) };
     static LOCAL: RefCell<Option<Arc<Local>>> = const { RefCell::new(None) };
+    static REPORT_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+    static REPORTER: RefCell<Option<Reporter>> = const { RefCell::new(None) };
+    static REPORT_START: Cell<Option<Instant>> = const { Cell::new(None) };
+    static REPORT_PHASE: RefCell<Option<Arc<Mutex<PhaseClock>>>> = const { RefCell::new(None) };
+    static CHILD_STOPS: RefCell<Vec<Arc<AtomicBool>>> = const { RefCell::new(Vec::new()) };
+}
+type PhaseClock = Option<((&'static str, &'static str, &'static str), Instant)>;
+pub(crate) type Reporter = Arc<dyn Fn(Progress) + Send + Sync>;
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Progress {
+    pub operation_id: Option<String>,
+    pub operation: &'static str,
+    pub phase_id: &'static str,
+    pub phase: &'static str,
+    pub completed: usize,
+    pub total: usize,
+    pub unit: &'static str,
+    pub selected: usize,
+    pub elapsed_ms: u64,
+    pub phase_elapsed_ms: u64,
+    pub cancellable: bool,
+}
+pub(crate) fn progress(phase_id: &'static str, phase: &'static str, completed: usize, total: usize, selected: usize) {
+    report_progress("análise", phase_id, phase, completed, total, "candidatos", selected);
+}
+pub(crate) fn elapsed_ms() -> Option<u64> {
+    REPORT_START.with(|s| s.get().map(|at| at.elapsed().as_millis() as u64))
+}
+pub(crate) fn report_progress(operation: &'static str, phase_id: &'static str, phase: &'static str, completed: usize, total: usize, unit: &'static str, selected: usize) {
+    let reporter = REPORTER.with(|r| r.borrow().clone());
+    if let Some(reporter) = reporter {
+        let clock = REPORT_PHASE.with(|state| state.borrow_mut().get_or_insert_with(|| Arc::new(Mutex::new(None))).clone());
+        let phase_elapsed_ms = {
+            let mut state = clock.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (operation, phase_id, unit);
+            if state.as_ref().is_none_or(|(old, _)| *old != key) { *state = Some((key, Instant::now())); }
+            state.as_ref().unwrap().1.elapsed().as_millis() as u64
+        };
+        reporter(Progress {
+            operation_id: current_id(), operation, phase_id, phase,
+            completed, total, unit, selected,
+            elapsed_ms: elapsed_ms().unwrap_or(0),
+            phase_elapsed_ms,
+            cancellable: current_generation().is_some(),
+        });
+    }
+}
+pub(crate) fn with_reporter<T>(reporter: Reporter, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Reporter>);
+    impl Drop for Reset { fn drop(&mut self) { REPORTER.with(|r| *r.borrow_mut() = self.0.take()); } }
+    let _reset = Reset(REPORTER.with(|r| r.replace(Some(reporter))));
+    f()
 }
 struct Local {
     id: String,
@@ -63,15 +116,22 @@ static NAMED: LazyLock<Mutex<NamedRegistry>> =
 pub(crate) struct Cancellation {
     generation: Option<u64>,
     local: Option<Arc<Local>>,
+    report_id: Option<String>,
+    reporter: Option<Reporter>,
+    report_start: Option<Instant>,
+    report_phase: Option<Arc<Mutex<PhaseClock>>>,
+    child_stops: Vec<Arc<AtomicBool>>,
 }
 impl Cancellation {
     pub(crate) fn cancelled(&self) -> bool {
-        self.generation.is_some_and(|g| g != generation())
+        self.child_stops.iter().any(|stop| stop.load(Ordering::Relaxed))
+            || self.generation.is_some_and(|g| g != generation())
             || self
                 .local
                 .as_ref()
                 .is_some_and(|local| local.cancelled.load(Ordering::Relaxed))
     }
+    pub(crate) fn with_stop(mut self, stop: Arc<AtomicBool>) -> Self { self.child_stops.push(stop); self }
 }
 
 /// Register before queueing blocking work. Tauri can dispatch its async
@@ -102,16 +162,26 @@ pub(crate) fn token(id: Option<String>) -> Result<Cancellation, String> {
     Ok(Cancellation {
         generation: Some(generation()),
         local: Some(local),
+        report_id: None,
+        reporter: None,
+        report_start: None,
+        report_phase: None,
+        child_stops: Vec::new(),
     })
 }
 pub(crate) fn current_token() -> Cancellation {
     Cancellation {
         generation: current_generation(),
         local: LOCAL.with(|s| s.borrow().clone()),
+        report_id: current_id(),
+        reporter: REPORTER.with(|s| s.borrow().clone()),
+        report_start: REPORT_START.with(Cell::get),
+        report_phase: REPORT_PHASE.with(|s| s.borrow().clone()),
+        child_stops: CHILD_STOPS.with(|s| s.borrow().clone()),
     }
 }
 pub(crate) fn current_id() -> Option<String> {
-    LOCAL.with(|s| s.borrow().as_ref().map(|s| s.id.clone()))
+    REPORT_ID.with(|s| s.borrow().clone()).or_else(|| LOCAL.with(|s| s.borrow().as_ref().map(|s| s.id.clone())))
 }
 pub(crate) fn cancel_id(id: &str) -> bool {
     // Empty IDs are replaced by generated IDs at registration and cannot
@@ -156,18 +226,30 @@ pub fn check() -> Result<(), String> {
 pub fn commit() {
     START.with(|s| s.set(None));
     LOCAL.with(|s| *s.borrow_mut() = None);
+    CHILD_STOPS.with(|s| s.borrow_mut().clear());
 }
 pub(crate) fn run_with_token<T>(token: Cancellation, f: impl FnOnce() -> T) -> Result<T, String> {
-    struct Reset(Option<u64>, Option<Arc<Local>>);
+    struct Reset(Option<u64>, Option<Arc<Local>>, Option<String>, Option<Reporter>, Option<Instant>, Option<Arc<Mutex<PhaseClock>>>, Vec<Arc<AtomicBool>>);
     impl Drop for Reset {
         fn drop(&mut self) {
             START.with(|s| s.set(self.0));
             LOCAL.with(|s| *s.borrow_mut() = self.1.take());
+            REPORT_ID.with(|s| *s.borrow_mut() = self.2.take());
+            REPORTER.with(|s| *s.borrow_mut() = self.3.take());
+            REPORT_START.with(|s| s.set(self.4));
+            REPORT_PHASE.with(|s| *s.borrow_mut() = self.5.take());
+            CHILD_STOPS.with(|s| *s.borrow_mut() = std::mem::take(&mut self.6));
         }
     }
+    let report_id = token.report_id.or_else(|| token.local.as_ref().map(|local| local.id.clone()));
     let _reset = Reset(
         START.with(|s| s.replace(token.generation)),
         LOCAL.with(|s| s.replace(token.local)),
+        REPORT_ID.with(|s| s.replace(report_id)),
+        REPORTER.with(|s| s.replace(token.reporter)),
+        REPORT_START.with(|s| s.replace(Some(token.report_start.unwrap_or_else(Instant::now)))),
+        REPORT_PHASE.with(|s| s.replace(Some(token.report_phase.unwrap_or_else(|| Arc::new(Mutex::new(None)))))),
+        CHILD_STOPS.with(|s| s.replace(token.child_stops)),
     );
     check()?;
     let result = f();
@@ -179,6 +261,11 @@ pub fn run<T>(generation: u64, f: impl FnOnce() -> T) -> Result<T, String> {
         Cancellation {
             generation: Some(generation),
             local: LOCAL.with(|s| s.borrow().clone()),
+            report_id: current_id(),
+            reporter: REPORTER.with(|s| s.borrow().clone()),
+            report_start: REPORT_START.with(Cell::get),
+            report_phase: REPORT_PHASE.with(|s| s.borrow().clone()),
+            child_stops: CHILD_STOPS.with(|s| s.borrow().clone()),
         },
         f,
     )
@@ -244,5 +331,67 @@ mod tests {
     fn duplicate_live_ids_are_rejected() {
         let _a = token(Some("same-operation".into())).unwrap();
         assert!(token(Some("same-operation".into())).is_err());
+    }
+
+    #[test]
+    fn committed_progress_keeps_identity_without_reactivating_cancellation() {
+        let id = "progress-after-publication";
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&seen);
+        let result = run_with_token(token(Some(id.into())).unwrap(), || {
+            with_reporter(Arc::new(move |event| capture.lock().unwrap().push(event)), || {
+                progress("prepare", "Preparando", 1, 0, 0);
+                commit();
+                cancel_id(id);
+                progress("ready", "Pronto", 1, 1, 1);
+                42
+            })
+        });
+        assert_eq!(result.unwrap(), 42);
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].cancellable);
+        assert_eq!(events[1].operation_id.as_deref(), Some(id));
+        assert!(!events[1].cancellable);
+        assert!(current_id().is_none());
+    }
+    #[test]
+    fn progress_phase_clock_resets_without_resetting_operation_clock() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&seen);
+        run_with_token(token(Some("phase-clock-test".into())).unwrap(), || {
+            REPORT_START.with(|s| s.set(Some(Instant::now() - Duration::from_secs(10))));
+            REPORT_PHASE.with(|s| *s.borrow_mut() = Some(Arc::new(Mutex::new(Some((("análise", "verify", "candidatos"), Instant::now() - Duration::from_secs(2)))))));
+            with_reporter(Arc::new(move |event| capture.lock().unwrap().push(event)), || {
+                progress("verify", "Verificando", 10, 0, 5);
+                progress("sql", "Calculando", 0, 0, 5);
+            });
+        }).unwrap();
+        let events = seen.lock().unwrap();
+        assert!(events[0].elapsed_ms >= 10_000 && events[0].phase_elapsed_ms >= 2_000);
+        assert!(events[1].elapsed_ms >= 10_000 && events[1].phase_elapsed_ms < 1_000);
+    }
+    #[test]
+    fn producer_inherits_reporting_clocks_and_its_stop_does_not_cancel_parent() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&seen);
+        run_with_token(token(Some("stream-report-parent".into())).unwrap(), || {
+            REPORT_START.with(|s| s.set(Some(Instant::now() - Duration::from_secs(10))));
+            with_reporter(Arc::new(move |event| capture.lock().unwrap().push(event)), || {
+                progress("stream", "Lendo", 0, 0, 0);
+                let stop = Arc::new(AtomicBool::new(false));
+                let child = current_token().with_stop(Arc::clone(&stop));
+                assert!(std::thread::spawn(move || run_with_token(child, || {
+                    progress("stream", "Lendo", 1, 0, 1);
+                    stop.store(true, Ordering::Relaxed);
+                })).join().unwrap().is_err());
+                assert!(!cancelled());
+                progress("done", "Pronto", 1, 1, 1);
+            });
+        }).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|event| event.operation_id.as_deref() == Some("stream-report-parent") && event.elapsed_ms >= 10_000));
+        assert!(seen[1].phase_elapsed_ms >= seen[0].phase_elapsed_ms);
     }
 }

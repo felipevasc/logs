@@ -794,7 +794,7 @@ fn visit(
     catalog: &Arc<CompiledCatalog>,
     hits: bool,
     mut visitor: impl FnMut(&Event, Corpus, Vec<usize>),
-) {
+) -> Result<(), String> {
     let prepared = query::prepare_with_threat_catalog(filters, Some(catalog));
     // Text and rule hits are computed in parallel with the parsing.
     let analyze = |event: &Event| {
@@ -815,7 +815,7 @@ fn visit(
     };
     if let Some(events) = case {
         memory(events);
-        return;
+        return operations::check();
     }
     let source = state.source.read();
     match &*source {
@@ -826,10 +826,11 @@ fn visit(
             let derived = state.derived.read();
             query::visit_indexed_mapped(index, &prepared, &codes, &system, &derived, analyze, |_, event, (body, ids)| {
                 visitor(event, body, ids)
-            });
+            })?;
         }
         SourceData::None => {}
     }
+    operations::check()
 }
 fn snippet(text: &str, start: usize, end: usize) -> String {
     let mut from = start.saturating_sub(90);
@@ -909,7 +910,7 @@ fn scan_impl(
         } else {
             undated += 1;
         }
-    });
+    })?;
     operations::check()?;
     progress(total);
     let mut rules: Vec<_> = catalog
@@ -983,7 +984,7 @@ fn events_impl(
             result.rows_clipped += usize::from(clipped);
             result.rows.push(row);
         }
-    });
+    })?;
     operations::check()?;
     result.complete = result.clipped_records == 0;
     Ok(result)
@@ -1197,7 +1198,7 @@ mod tests {
         let pfs = query::prepare_with_threat_catalog(&[filter("test.alpha")], Some(&catalog));
         let mut matches = vec![];
         if let SourceData::Indexed(index) = &*indexed.source.read() {
-            query::visit_indexed_prepared(index, &pfs, &codes, &codes, &[], |i| matches.push(i));
+            query::visit_indexed_prepared(index, &pfs, &codes, &codes, &[], |i| matches.push(i)).unwrap();
         }
         assert_eq!(matches, (10000..10020).collect::<Vec<_>>());
     }

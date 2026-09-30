@@ -101,7 +101,14 @@ window.Tasks = (() => {
     const bar = $("#workbar"), button = $("#workbar-tasks");
     bar.classList.toggle("has-tasks", list.length > 0);
     if (list.length) { button.querySelector("span").textContent = summary(list); button.title = "Ver e cancelar o que está carregando"; }
-    const selected = [...tasks.values()].find(t => t.operationId === state.progressOperationId);
+    const selectedId = state.loadOverlay
+      ? latest.get(state.loadOverlayProgressKey || "source-load")?.operationId
+      : state.progressOperationId;
+    const selected = selectedId ? [...tasks.values()].find(t => t.operationId === selectedId) : null;
+    if (state.progressOperationId && !selected && !state.loadOverlay) {
+      state.progressOperationId = null;
+      setWorkbar(tasks.size ? "Tarefas em andamento" : "Nenhuma tarefa em andamento", "", null, false);
+    }
     if (selected) {
       const timing = `${detail(selected)} · ${elapsed(selected)} decorridos`;
       $("#workbar-detail").textContent = timing;
@@ -139,6 +146,9 @@ window.Tasks = (() => {
     const items = [p.phase || "Em execução"];
     if (p.total > 0) items.push(`${fmtNum(p.completed)} / ${fmtNum(p.total)} ${p.unit || "itens"}`);
     else if (p.completed > 0) items.push(`${fmtNum(p.completed)} ${p.unit || "itens"}`);
+    const phaseSeconds = window.PerformanceTools.phaseSeconds(p, estimate);
+    if (phaseSeconds != null) items.push(`${window.PerformanceTools.duration(phaseSeconds)} nesta etapa`);
+    if (p.unit === "candidatos" && Number.isFinite(p.selected)) items.push(`${fmtNum(p.selected)} selecionados`);
     const fresh = estimate && performance.now() - estimate.updated <= 10000;
     if (fresh && estimate.rate > 0) items.push(`${fmtNum(Math.round(estimate.rate))} ${p.unit || "itens"}/s`);
     if (fresh && estimate.eta != null) items.push(`≈ ${window.PerformanceTools.duration(estimate.eta)} nesta etapa`);

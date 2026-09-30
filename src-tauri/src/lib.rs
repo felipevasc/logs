@@ -26,6 +26,7 @@ mod engine;
 mod entities;
 mod event_preview;
 mod index_cache;
+mod metadata_checkpoint;
 mod insights;
 mod journeys;
 mod mcp;
@@ -120,8 +121,8 @@ fn emit_progress(
             completed,
             total,
             unit: unit.into(),
-            cancellable: cancellable
-                || matches!(operation, "carregamento" | "exploração" | "análise"),
+            cancellable: operations::current_generation().is_some()
+                && (cancellable || matches!(operation, "carregamento" | "exploração" | "análise")),
         },
     );
 }
@@ -183,7 +184,10 @@ async fn offload_source<T, F>(operation_id: Option<String>, app: AppHandle, data
 where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
     offload_operation(operation_id, move || {
         if dataset { validate_current_source(app.state::<AppState>().inner())?; }
-        Ok(f())
+        let progress_app = app.clone();
+        Ok(operations::with_reporter(std::sync::Arc::new(move |progress| {
+            let _ = progress_app.emit("operation-progress", progress);
+        }), f))
     }).await?
 }
 
@@ -340,6 +344,7 @@ fn index_source_file(
     format: &str,
     app: Option<&AppHandle>,
 ) -> Result<sources::FileIndex, String> {
+    emit_progress(app, "carregamento", "Preparando entrada para indexação", 0, 0, "", true);
     // Members of ZIP/TAR packages keep a stable virtual path (pacote.zip!/app.log).
     let member = workspace::resolve_member(path)?;
     let physical = member
@@ -392,21 +397,24 @@ fn index_source_file(
         None
     };
     let saved_ts = load_ts_config(path).map(|c| c.compile()).transpose()?;
-    let mut idx = index_cache::open(
+    let mut idx = index_cache::open_with_progress(
         &index_path,
         format,
         custom,
         saved_ts,
-        Some(&|done, total| {
-            emit_progress(
-                app,
-                "carregamento",
-                &format!("Indexando {file_label}"),
-                done,
-                total,
-                "bytes",
-                false,
-            );
+        Some(&|progress| {
+            if let Some(app) = app {
+                let _ = app.emit("operation-progress", serde_json::json!({
+                    "operationId": operations::current_id(),
+                    "operation": "carregamento", "phaseId": progress.phase_id,
+                    "phase": format!("{} · {}", progress.phase, file_label),
+                    "completed": progress.completed, "total": progress.total,
+                    "unit": progress.unit, "cancellable": true, "state": "indexing",
+                    "elapsedMs": operations::elapsed_ms(),
+                    "resumedRows": progress.resumed_rows,
+                    "checkpointRows": progress.checkpoint_rows,
+                }));
+            }
         }),
     )?;
     idx.parts[0].path = path.to_string();
@@ -418,6 +426,14 @@ fn index_source_file(
         }))?;
     }
     Ok(idx)
+}
+
+fn with_ingestion_progress<T>(app: Option<&AppHandle>, f: impl FnOnce() -> T) -> T {
+    if let Some(app) = app.cloned() {
+        operations::with_reporter(std::sync::Arc::new(move |progress: operations::Progress| {
+            let _ = app.emit("operation-progress", progress);
+        }), f)
+    } else { f() }
 }
 
 #[tauri::command]
@@ -442,6 +458,7 @@ pub(crate) fn load_file_impl(
     merge: Option<bool>,
     app: Option<&AppHandle>,
 ) -> Result<LoadSummary, String> {
+    with_ingestion_progress(app, || {
     emit_progress(
         app,
         "carregamento",
@@ -510,6 +527,7 @@ pub(crate) fn load_file_impl(
         false,
     );
     Ok(summary)
+    })
 }
 
 /// Builds the query engine's stores for newly indexed files (cached per
@@ -587,6 +605,7 @@ pub(crate) fn load_files_impl(
     merge: Option<bool>,
     app: Option<&AppHandle>,
 ) -> Result<LoadSummary, String> {
+    with_ingestion_progress(app, || {
     if paths.is_empty() {
         return Err("Nenhum arquivo selecionado.".into());
     }
@@ -649,6 +668,7 @@ pub(crate) fn load_files_impl(
         false,
     );
     Ok(summary)
+    })
 }
 
 // ------------------------------------------------------- data/hora (TsConfig)
@@ -823,12 +843,7 @@ pub(crate) fn test_ts_config_impl(
                 .take(5)
             {
                 let part = idx.part_at(i);
-                let mut ev = sources::parse_line(
-                    sources::line_bytes(idx, i),
-                    &part.format,
-                    part.custom.as_ref(),
-                    &part.header,
-                );
+                let mut ev = sources::parse_part_line(part, sources::line_bytes(idx, i));
                 let line = String::from_utf8_lossy(sources::line_bytes(idx, i)).into_owned();
                 let entrada = joined_of(&ev, &line, Some(part));
                 sources::apply_ts_config(&mut ev, &cc, part, &line);
@@ -1284,7 +1299,7 @@ async fn query_events(
             case_events.as_deref(),
         )
     })
-    .await
+    .await?
 }
 
 pub(crate) fn query_events_scope_impl(
@@ -1295,16 +1310,16 @@ pub(crate) fn query_events_scope_impl(
     offset: usize,
     limit: usize,
     case_events: Option<&[Event]>,
-) -> query::QueryResult {
+) -> Result<query::QueryResult, String> {
     match case_events {
-        Some(events) => query::query(
+        Some(events) => Ok(query::query(
             events,
             &filters,
             sort_column,
             sort_dir,
             offset,
             limit.clamp(1, 2_000),
-        ),
+        )),
         None => query_events_impl(state, filters, sort_column, sort_dir, offset, limit),
     }
 }
@@ -1316,7 +1331,7 @@ pub(crate) fn query_events_impl(
     sort_dir: &str,
     offset: usize,
     limit: usize,
-) -> query::QueryResult {
+) -> Result<query::QueryResult, String> {
     let source = state.source.read();
     let codes = state.codes.read();
     let system = state.system_codes.read();
@@ -1324,7 +1339,7 @@ pub(crate) fn query_events_impl(
     let limit = limit.clamp(1, 2_000);
     match &*source {
         SourceData::Memory(events) => {
-            query::query(events, &filters, sort_column, sort_dir, offset, limit)
+            Ok(query::query(events, &filters, sort_column, sort_dir, offset, limit))
         }
         SourceData::Indexed(idx) => query::query_indexed(
             idx,
@@ -1337,10 +1352,10 @@ pub(crate) fn query_events_impl(
             &system,
             &derived,
         ),
-        SourceData::None => query::QueryResult {
+        SourceData::None => Ok(query::QueryResult {
             total: 0,
             rows: vec![],
-        },
+        }),
     }
 }
 
@@ -1413,7 +1428,7 @@ async fn explore_snapshot(
             case_events.as_deref(),
         )
     })
-    .await
+    .await?
 }
 
 pub(crate) fn explore_snapshot_scope_impl(
@@ -1425,16 +1440,16 @@ pub(crate) fn explore_snapshot_scope_impl(
     limit: usize,
     app: Option<&AppHandle>,
     case_events: Option<&[Event]>,
-) -> query::ExplorerSnapshot {
+) -> Result<query::ExplorerSnapshot, String> {
     match case_events {
-        Some(events) => query::explore(
+        Some(events) => Ok(query::explore(
             events,
             &filters,
             sort_column,
             sort_dir,
             offset,
             limit.clamp(1, 2_000),
-        ),
+        )),
         None => explore_snapshot_impl(state, filters, sort_column, sort_dir, offset, limit, app),
     }
 }
@@ -1447,7 +1462,7 @@ pub(crate) fn explore_snapshot_impl(
     offset: usize,
     limit: usize,
     app: Option<&AppHandle>,
-) -> query::ExplorerSnapshot {
+) -> Result<query::ExplorerSnapshot, String> {
     emit_progress(
         app,
         "exploração",
@@ -1476,7 +1491,7 @@ pub(crate) fn explore_snapshot_impl(
             &codes,
             &system,
             &derived,
-        ),
+        )?,
         SourceData::None => query::ExplorerSnapshot {
             query: query::QueryResult {
                 total: 0,
@@ -1510,7 +1525,7 @@ pub(crate) fn explore_snapshot_impl(
         "eventos",
         false,
     );
-    snapshot
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -1638,7 +1653,7 @@ async fn trail_events(
             case_events,
         )
     })
-    .await
+    .await?
 }
 
 pub(crate) fn trail_events_impl(
@@ -1648,56 +1663,44 @@ pub(crate) fn trail_events_impl(
     after: usize,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
-) -> TrailResult {
+) -> Result<TrailResult, String> {
     if let Some(events) = case_events {
-        return trail_from_events(&events, &filters, center_id, before, after);
+        return Ok(trail_from_events(&events, &filters, center_id, before, after));
     }
+    query::check_collected_ids(before.saturating_add(after).saturating_add(1))?;
     let source = state.source.read();
-    match &*source {
+    Ok(match &*source {
         SourceData::Memory(events) => trail_from_events(events, &filters, center_id, before, after),
         SourceData::Indexed(idx) => {
-            let matched = query::indexed_matches(
-                idx,
-                &filters,
-                &state.codes.read(),
-                &state.system_codes.read(),
-                &state.derived.read(),
-            );
-            let mut rows: Vec<(i64, usize)> =
-                matched.into_iter().map(|i| (idx.lines[i].ts, i)).collect();
-            rows.sort();
-            let pos = rows.iter().position(|&(_, i)| i == center_id);
-            let Some(pos) = pos else {
-                return TrailResult {
-                    events: vec![],
-                    before_available: 0,
-                    after_available: 0,
-                };
-            };
-            let start = pos.saturating_sub(before);
-            let end = (pos + after + 1).min(rows.len());
-            let codes = state.codes.read();
-            let system = state.system_codes.read();
-            let derived = state.derived.read();
-            TrailResult {
-                events: rows[start..end]
-                    .iter()
-                    .map(|&(_, i)| {
-                        let mut event = crate::sources::event_at(idx, i, &codes, &system, &derived);
-                        entities::annotate(&mut event);
-                        event
-                    })
-                    .collect(),
-                before_available: start,
-                after_available: rows.len() - end,
+            let empty = || TrailResult { events: vec![], before_available: 0, after_available: 0 };
+            let Some(center_meta) = idx.lines.get(center_id) else { return Ok(empty()); };
+            let center = (center_meta.ts, center_id);
+            let (mut previous, mut following) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+            let (mut left, mut right, mut found) = (0usize, 0usize, false);
+            let codes = state.codes.read(); let system = state.system_codes.read(); let derived = state.derived.read();
+            query::visit_indexed_matches(idx, &filters, &codes, &system, &derived, |id| {
+                let key = (idx.lines[id].ts, id);
+                if key < center { left += 1; previous.insert(key); if previous.len() > before { previous.pop_first(); } }
+                else if key > center { right += 1; following.insert(key); if following.len() > after { following.pop_last(); } }
+                else { found = true; }
+            })?;
+            if !found { return Ok(empty()); }
+            let mut budget = query::AnalyticsBudget::new();
+            let mut events = Vec::new();
+            for (_, id) in previous.into_iter().chain(std::iter::once(center)).chain(following) {
+                let mut event = sources::event_at(idx, id, &codes, &system, &derived);
+                entities::annotate(&mut event);
+                budget.charge(query::event_payload_bytes(&event))?;
+                events.push(event);
             }
+            TrailResult { events, before_available: left.saturating_sub(before), after_available: right.saturating_sub(after) }
         }
         SourceData::None => TrailResult {
             events: vec![],
             before_available: 0,
             after_available: 0,
         },
-    }
+    })
 }
 
 /// Contagem simples de eventos que passam nos filtros (abas de filtros salvos).
@@ -1715,28 +1718,28 @@ async fn count_filtered(
         let state = app.state::<AppState>();
         count_filtered_impl(state.inner(), filters, case_events)
     })
-    .await
+    .await?
 }
 
 pub(crate) fn count_filtered_impl(
     state: &AppState,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
-) -> usize {
+) -> Result<usize, String> {
     if let Some(events) = case_events {
-        return query::count_memory(&events, &filters);
+        return Ok(query::count_memory(&events, &filters));
     }
     let source = state.source.read();
-    match &*source {
+    Ok(match &*source {
         SourceData::Memory(events) => query::count_memory(events, &filters),
         SourceData::Indexed(idx) => {
             let (codes, system, derived) = (state.codes.read(), state.system_codes.read(), state.derived.read());
             let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
-            engine::count(&src, &filters)
+            engine::count(&src, &filters)?
                 .unwrap_or_else(|| query::count_lines(idx, &filters, &codes, &system, &derived))
         }
         SourceData::None => 0,
-    }
+    })
 }
 
 #[tauri::command]
@@ -1793,27 +1796,27 @@ async fn stats_events(
     workspace::validate(&filters)?;
     offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         if let Some(events) = case_events {
-            return query::stats(&events, &filters);
+            return Ok(query::stats(&events, &filters));
         }
         let state = app.state::<AppState>();
         stats_events_impl(state.inner(), filters)
     })
-    .await
+    .await?
 }
 
-pub(crate) fn stats_events_impl(state: &AppState, filters: Vec<query::Filter>) -> query::Stats {
+pub(crate) fn stats_events_impl(state: &AppState, filters: Vec<query::Filter>) -> Result<query::Stats, String> {
     let source = state.source.read();
     let codes = state.codes.read();
     let system = state.system_codes.read();
     let derived = state.derived.read();
     match &*source {
-        SourceData::Memory(events) => query::stats(events, &filters),
+        SourceData::Memory(events) => Ok(query::stats(events, &filters)),
         SourceData::Indexed(idx) => query::stats_indexed(idx, &filters, &codes, &system, &derived),
-        SourceData::None => query::Stats {
+        SourceData::None => Ok(query::Stats {
             buckets: vec![],
             bucket_ms: 0,
             levels: vec![],
-        },
+        }),
     }
 }
 
@@ -1866,14 +1869,14 @@ async fn discover_patterns(
     let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload_source(operation_id, app.clone(), case_events.is_none(), move || discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
-        .await
+        .await?
 }
 
 pub(crate) fn discover_patterns_impl(
     state: &AppState,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
-) -> discovery::Discovery {
+) -> Result<discovery::Discovery, String> {
     let memory = |events: &[Event]| {
         let prepared = query::prepare(&filters);
         let mut sample = discovery::Sampler::new();
@@ -1891,10 +1894,10 @@ pub(crate) fn discover_patterns_impl(
         discovery::analyze(result, || sample.ids.iter().map(|&i| events[i].clone()))
     };
     if let Some(events) = case_events {
-        return memory(&events);
+        return Ok(memory(&events));
     }
     let source = state.source.read();
-    match &*source {
+    Ok(match &*source {
         SourceData::Memory(events) => memory(events),
         SourceData::Indexed(idx) => {
             let codes = state.codes.read();
@@ -1910,7 +1913,7 @@ pub(crate) fn discover_patterns_impl(
                     meta.level == model::LV_WARN,
                 );
                 sample.push(i);
-            });
+            })?;
             sample.ids.sort_unstable();
             discovery::analyze(result, || {
                 sample
@@ -1920,7 +1923,7 @@ pub(crate) fn discover_patterns_impl(
             })
         }
         SourceData::None => discovery::analyze(discovery::Discovery::default(), std::iter::empty),
-    }
+    })
 }
 
 const ANALYSIS_CAP: usize = 3_000; // Distributed sample used only by field profiling.
@@ -1929,34 +1932,29 @@ fn work_events(
     state: &AppState,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
-) -> Vec<Event> {
+) -> Result<Vec<Event>, String> {
     if let Some(events) = case_events {
         let matched = query::filtered_indices(&events, &filters);
-        return (0..matched.len().min(ANALYSIS_CAP))
+        return Ok((0..matched.len().min(ANALYSIS_CAP))
             .map(|s| events[matched[s * matched.len() / matched.len().min(ANALYSIS_CAP)]].clone())
-            .collect();
+            .collect());
     }
     let source = state.source.read();
     let codes = state.codes.read();
     let system = state.system_codes.read();
     let derived = state.derived.read();
-    match &*source {
+    Ok(match &*source {
         SourceData::Indexed(idx) => {
-            let matched = query::indexed_matches(idx, &filters, &codes, &system, &derived);
-            // Scattered lines are read in parallel (slow disks read them one by one otherwise).
-            use rayon::prelude::*;
-            (0..matched.len().min(ANALYSIS_CAP))
-                .into_par_iter()
-                .map(|s| {
-                    sources::event_at(
-                        idx,
-                        matched[s * matched.len() / matched.len().min(ANALYSIS_CAP)],
-                        &codes,
-                        &system,
-                        &derived,
-                    )
-                })
-                .collect()
+            let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
+            let total = engine::count(&src, &filters)?.unwrap_or_else(|| query::count_lines(idx, &filters, &codes, &system, &derived));
+            let limit = total.min(ANALYSIS_CAP);
+            let mut ids = Vec::with_capacity(limit);
+            let mut position = 0usize;
+            query::visit_indexed_matches(idx, &filters, &codes, &system, &derived, |id| {
+                if ids.len() < limit && position == ids.len() * total / limit { ids.push(id); }
+                position += 1;
+            })?;
+            ids.into_iter().map(|id| sources::event_at(idx, id, &codes, &system, &derived)).collect()
         }
         SourceData::Memory(events) => {
             let matched = query::filtered_indices(events, &filters);
@@ -1967,7 +1965,7 @@ fn work_events(
                 .collect()
         }
         SourceData::None => vec![],
-    }
+    })
 }
 
 fn work_columns(evs: &[Event]) -> Vec<String> {
@@ -2000,17 +1998,17 @@ async fn profile_fields(
         let state = app.state::<AppState>();
         profile_fields_impl(state.inner(), filters, case_events)
     })
-    .await
+    .await?
 }
 
 pub(crate) fn profile_fields_impl(
     state: &AppState,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
-) -> Vec<analysis::FieldProfile> {
-    let evs = work_events(state, filters, case_events);
+) -> Result<Vec<analysis::FieldProfile>, String> {
+    let evs = work_events(state, filters, case_events)?;
     let columns = work_columns(&evs);
-    analysis::profile_fields(&evs, &columns)
+    Ok(analysis::profile_fields(&evs, &columns))
 }
 
 #[tauri::command]
@@ -2028,7 +2026,7 @@ async fn compute_series(
         let state = app.state::<AppState>();
         compute_series_impl(state.inner(), filters, case_events, spec)
     })
-    .await
+    .await?
 }
 
 pub(crate) fn compute_series_impl(
@@ -2036,40 +2034,13 @@ pub(crate) fn compute_series_impl(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     spec: analysis::SeriesSpec,
-) -> analysis::SeriesResult {
+) -> Result<analysis::SeriesResult, String> {
     if let Some(events) = case_events {
-        let matched = query::filtered_indices(&events, &filters);
-        return analysis::compute_series_stream(
-            || matched.iter().map(|&i| events[i].clone()),
-            &spec,
-        );
+        let prepared = query::prepare(&filters);
+        return analysis::compute_series_stream(|| events.iter().filter(|event| prepared.iter().all(|pf| query::matches(event, pf))).cloned(), &spec);
     }
-    let source = state.source.read();
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
-    let derived = state.derived.read();
-    match &*source {
-        SourceData::Indexed(idx) => {
-            let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
-            if let Some(result) = engine::series(&src, &query::prepare(&filters), &spec) {
-                return result;
-            }
-            let matched = query::indexed_matches(idx, &filters, &codes, &system, &derived);
-            analysis::compute_series_stream(
-                || {
-                    matched
-                        .iter()
-                        .map(|&i| sources::event_at(idx, i, &codes, &system, &derived))
-                },
-                &spec,
-            )
-        }
-        SourceData::Memory(events) => {
-            let matched = query::filtered_indices(events, &filters);
-            analysis::compute_series_stream(|| matched.iter().map(|&i| events[i].clone()), &spec)
-        }
-        SourceData::None => analysis::compute_series(&[], &spec),
-    }
+    if let Some(result) = workspace::with_engine(state, |source| engine::series(source, &query::prepare(&filters), &spec))? { return Ok(result); }
+    workspace::with_selection(state, &filters, |selection| analysis::compute_series_stream(|| selection.iter(), &spec))?
 }
 
 #[tauri::command]
@@ -2087,7 +2058,7 @@ async fn pivot(
         let state = app.state::<AppState>();
         pivot_impl(state.inner(), filters, case_events, spec)
     })
-    .await
+    .await?
 }
 
 pub(crate) fn pivot_impl(
@@ -2095,35 +2066,13 @@ pub(crate) fn pivot_impl(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     spec: analysis::PivotSpec,
-) -> analysis::PivotResult {
+) -> Result<analysis::PivotResult, String> {
     if let Some(events) = case_events {
-        let matched = query::filtered_indices(&events, &filters);
-        return analysis::pivot_stream(matched.iter().map(|&i| events[i].clone()), &spec);
+        let prepared = query::prepare(&filters);
+        return analysis::pivot_stream(events.iter().filter(|event| prepared.iter().all(|pf| query::matches(event, pf))).cloned(), &spec);
     }
-    let source = state.source.read();
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
-    let derived = state.derived.read();
-    match &*source {
-        SourceData::Indexed(idx) => {
-            let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
-            if let Some(result) = engine::pivot(&src, &query::prepare(&filters), &spec) {
-                return result;
-            }
-            let matched = query::indexed_matches(idx, &filters, &codes, &system, &derived);
-            analysis::pivot_stream(
-                matched
-                    .iter()
-                    .map(|&i| sources::event_at(idx, i, &codes, &system, &derived)),
-                &spec,
-            )
-        }
-        SourceData::Memory(events) => {
-            let matched = query::filtered_indices(events, &filters);
-            analysis::pivot_stream(matched.iter().map(|&i| events[i].clone()), &spec)
-        }
-        SourceData::None => analysis::pivot(&[], &spec),
-    }
+    if let Some(result) = workspace::with_engine(state, |source| engine::pivot(source, &query::prepare(&filters), &spec))? { return Ok(result); }
+    workspace::with_selection(state, &filters, |selection| analysis::pivot_stream(selection.iter(), &spec))?
 }
 
 #[tauri::command]

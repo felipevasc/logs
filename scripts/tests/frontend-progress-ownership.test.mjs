@@ -23,12 +23,13 @@ const context = vm.createContext({
     },
     PerformanceTools: {
       estimate: (_old, payload) => ({ completed: payload.completed, total: payload.total, rate: null, eta: null, percent: null }),
+      phaseSeconds: payload => Number.isFinite(payload.phaseElapsedMs) ? payload.phaseElapsedMs / 1000 : null,
       duration: value => `${value}s`,
     },
   },
 });
 vm.runInContext(listener, context);
-const emit = (operationId, phase) => callback({ payload: { operationId, phase, phaseId: phase, completed: 10, total: 100, unit: 'registros', cancellable: true } });
+const emit = (operationId, phase, extra = {}) => callback({ payload: { operationId, phase, phaseId: phase, completed: 10, total: 100, unit: 'registros', cancellable: true, ...extra } });
 
 emit('load-new', 'Retomando metadados');
 assert.equal(bars.at(-1)[0], 'Retomando metadados');
@@ -47,9 +48,12 @@ emit('count-old', 'Contando outra consulta');
 assert.equal(bars.length, 1, 'no remaining source task does not grant another task ownership of the overlay');
 
 state.loadOverlay = false;
-emit('count-old', 'Contando outra consulta');
+emit('count-old', 'Contando outra consulta', { unit: 'candidatos', selected: 3, phaseElapsedMs: 2000, total: 0 });
 assert.equal(bars.length, 2, 'normal query progress reaches the workbar outside a source load');
 assert.equal(state.progressOperationId, 'count-old');
+assert.match(bars.at(-1)[1], /2s nesta etapa/);
+assert.match(bars.at(-1)[1], /3 selecionados/);
+assert.equal(bars.at(-1)[2], null, 'an unknown total has no invented percentage');
 emit('replaced', 'Resposta antiga');
 assert.equal(bars.length, 2, 'replaced tasks remain ignored');
 

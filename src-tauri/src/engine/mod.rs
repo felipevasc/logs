@@ -90,7 +90,7 @@ fn query_reads_id(text: &str) -> bool {
 
 fn catalogs_signature(codes: &CodesConfig, system: &CodesConfig) -> String {
     static CACHE: Mutex<Option<((u64, usize, usize, usize, usize), String)>> = Mutex::new(None);
-    let key = catalog_key(codes, system);
+    let key = catalog_pointer_key(codes, system);
     if let Some((cached, sig)) = &*CACHE.lock() {
         if *cached == key {
             return sig.clone();
@@ -117,7 +117,7 @@ fn catalogs_signature(codes: &CodesConfig, system: &CodesConfig) -> String {
     sig
 }
 
-fn catalog_key(codes: &CodesConfig, system: &CodesConfig) -> (u64, usize, usize, usize, usize) {
+fn catalog_pointer_key(codes: &CodesConfig, system: &CodesConfig) -> (u64, usize, usize, usize, usize) {
     (
         CATALOG_EPOCH.load(Ordering::SeqCst),
         codes as *const _ as usize,
@@ -125,6 +125,29 @@ fn catalog_key(codes: &CodesConfig, system: &CodesConfig) -> (u64, usize, usize,
         codes.sources.values().map(|m| m.len()).sum(),
         system.sources.values().map(|m| m.len()).sum(),
     )
+}
+
+type CatalogKey = (u64, String);
+fn catalog_key(codes: &CodesConfig, system: &CodesConfig) -> CatalogKey {
+    // Reader threads share source metadata but own catalog snapshots. Their
+    // address must not invalidate a completed selection on every iterator pass.
+    let mut hash = Sha256::new();
+    for catalog in [codes, system] {
+        let mut sources: Vec<_> = catalog.sources.iter().collect();
+        sources.sort_by(|a, b| a.0.cmp(b.0));
+        for (source, entries) in sources {
+            let mut entries: Vec<_> = entries.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (code, info) in entries {
+                for value in [source.as_str(), code.as_str(), info.name.as_str(), info.description.as_str()] {
+                    hash.update((value.len() as u64).to_le_bytes());
+                    hash.update(value.as_bytes());
+                }
+            }
+        }
+        hash.update([255]);
+    }
+    (CATALOG_EPOCH.load(Ordering::SeqCst), format!("{:x}", hash.finalize()))
 }
 
 #[derive(Clone)]
@@ -236,6 +259,17 @@ fn spec(
                 build::STORE_VERSION, crate::index_cache::INDEX_DIR, part.identity,
                 part.format, part.header, to - from, part.physical_file_id
             ));
+            // A current UTC offset alone cannot identify historical local-time
+            // rules. Old stores have no proof of this context and are rebuilt.
+            hash.update(b"|timezone-configuration:");
+            hash.update(part.calendar.timezone.as_bytes());
+            if matches!(part.format.as_str(), "syslog3164" | "firewall") {
+                hash.update(format!("|inferred-year:{}", part.calendar.year));
+            }
+            if let Some(identity) = &part.event_identity {
+                hash.update(b"|logical-event-identity:");
+                hash.update(serde_json::to_vec(identity).ok()?);
+            }
             let key = format!("{:x}", hash.finalize());
             parts.push(PartSpec {
                 path: dir.join(format!("{key}.duckdb")),
@@ -270,11 +304,13 @@ pub(crate) struct Session {
     pub(crate) timestamps_non_null: bool,
     baked: bool,
     /// Catalog fingerprint loaded into `enr`; readers hold it while querying names.
-    names: RwLock<Option<(u64, usize, usize, usize, usize)>>,
+    names: RwLock<Option<CatalogKey>>,
     /// Bumped whenever `enr` is reloaded (part of selection keys).
     names_version: AtomicU64,
     /// Recent selections of costly filters, most recent first.
     selections: Mutex<Vec<(String, Arc<ops::Selection>)>>,
+    selection_builds: Mutex<HashSet<String>>,
+    selection_changed: parking_lot::Condvar,
     /// Selection tables no longer referenced, dropped before new ones are made.
     garbage: Arc<Mutex<Vec<String>>>,
     /// Inverted text index of each part with its first line; empty when a
@@ -293,6 +329,19 @@ impl std::ops::Deref for Pooled<'_> {
     type Target = Connection;
     fn deref(&self) -> &Connection {
         self.conn.as_ref().expect("pooled connection")
+    }
+}
+
+impl Pooled<'_> {
+    /// Never recycle a connection whose transaction cleanup failed.
+    pub(crate) fn discard(&mut self) { self.conn.take(); }
+}
+
+pub(crate) struct SelectionBuild<'a> { session: &'a Session, key: String }
+impl Drop for SelectionBuild<'_> {
+    fn drop(&mut self) {
+        self.session.selection_builds.lock().remove(&self.key);
+        self.session.selection_changed.notify_all();
     }
 }
 
@@ -344,7 +393,7 @@ impl Session {
             sql::lit(&temp.to_string_lossy())
         ))
         .map_err(|e| e.to_string())?;
-        limit_resources(&conn);
+        limit_resources(&conn, false)?;
         udf::register(&conn).map_err(|e| e.to_string())?;
         let mut schema = sql::Schema::default();
         let mut columns: HashMap<String, String> = HashMap::new();
@@ -423,11 +472,14 @@ impl Session {
         let names_view = if baked {
             "CREATE VIEW evn AS SELECT *, pname AS name, pdesc AS description FROM ev;".to_string()
         } else {
-            "CREATE TABLE enr (source VARCHAR, code VARCHAR, name VARCHAR, description VARCHAR); \
-             CREATE VIEW evn AS SELECT ev.*, COALESCE(enr.name, ev.pname) AS name, \
-             COALESCE(enr.description, ev.pdesc) AS description FROM ev \
-             LEFT JOIN enr ON enr.source = ev.source AND enr.code = ev.code;"
-                .to_string()
+            "CREATE TABLE enr (source VARCHAR, code VARCHAR, name VARCHAR, description VARCHAR, catalog INTEGER); \
+             CREATE VIEW evn AS SELECT ev.*, \
+             COALESCE(ue.name, uw.name, se.name, sw.name, ev.pname) AS name, \
+             COALESCE(ue.description, uw.description, se.description, sw.description, ev.pdesc) AS description FROM ev \
+             LEFT JOIN enr ue ON ue.catalog=0 AND ue.source=ev.source AND ue.code=ev.code \
+             LEFT JOIN enr uw ON uw.catalog=0 AND uw.source='*' AND uw.code=ev.code \
+             LEFT JOIN enr se ON se.catalog=1 AND se.source=ev.source AND se.code=ev.code \
+             LEFT JOIN enr sw ON sw.catalog=1 AND sw.source='*' AND sw.code=ev.code;".to_string()
         };
         conn.execute_batch(&format!("CREATE VIEW ev AS {union}; {names_view}"))
             .map_err(|e| e.to_string())?;
@@ -445,6 +497,8 @@ impl Session {
             names: RwLock::new(None),
             names_version: AtomicU64::new(0),
             selections: Mutex::new(Vec::new()),
+            selection_builds: Mutex::new(HashSet::new()),
+            selection_changed: parking_lot::Condvar::new(),
             garbage: Arc::new(Mutex::new(Vec::new())),
             texts,
             _leases: leases,
@@ -488,11 +542,38 @@ impl Session {
         Some(found)
     }
 
+    pub(crate) fn selection_snapshot(&self) -> serde_json::Value {
+        let selections = self.selections.lock();
+        serde_json::json!({
+            "entries": selections.len(),
+            "accountedBytes": selections.iter().map(|(_, s)| s.accounted_bytes()).sum::<u64>(),
+            "tables": selections.iter().map(|(_, s)| s.name()).collect::<Vec<_>>(),
+        })
+    }
+
     pub(crate) fn cache_selection(&self, key: String, selection: Arc<ops::Selection>) {
         let mut selections = self.selections.lock();
         selections.retain(|(k, _)| *k != key);
+        let budget = crate::resources::selection_cache_bytes();
+        if selection.accounted_bytes() > budget { return; }
         selections.insert(0, (key, selection));
-        selections.truncate(8);
+        let mut bytes = 0u64;
+        let keep = selections.iter().take(8).take_while(|(_, selection)| {
+            bytes = bytes.saturating_add(selection.accounted_bytes());
+            bytes <= budget
+        }).count();
+        selections.truncate(keep);
+    }
+
+    pub(crate) fn begin_selection(&self, key: &str) -> Result<SelectionBuild<'_>, String> {
+        let mut building = self.selection_builds.lock();
+        while building.contains(key) {
+            crate::operations::check()?;
+            self.selection_changed.wait_for(&mut building, std::time::Duration::from_millis(25));
+        }
+        crate::operations::check()?;
+        building.insert(key.to_owned());
+        Ok(SelectionBuild { session: self, key: key.to_owned() })
     }
 
     pub(crate) fn garbage(&self) -> Arc<Mutex<Vec<String>>> {
@@ -501,6 +582,19 @@ impl Session {
 
     pub(crate) fn take_garbage(&self) -> Vec<String> {
         std::mem::take(&mut *self.garbage.lock())
+    }
+
+    pub(crate) fn collect_garbage(&self) -> Result<(), String> {
+        let unused = self.take_garbage();
+        if unused.is_empty() { return Ok(()); }
+        let conn = self.conn()?;
+        for (i, name) in unused.iter().enumerate() {
+            if let Err(error) = conn.execute_batch(&format!("DROP TABLE IF EXISTS {name}")) {
+                self.garbage.lock().extend_from_slice(&unused[i..]);
+                return Err(error.to_string());
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn conn(&self) -> Result<Pooled<'_>, String> {
@@ -520,39 +614,35 @@ impl Session {
             return Ok(());
         }
         let key = catalog_key(codes, system);
-        if *self.names.read() == Some(key) {
+        if self.names.read().as_ref() == Some(&key) {
             return Ok(());
         }
         let mut current = self.names.write();
-        if *current == Some(key) {
+        if current.as_ref() == Some(&key) {
             return Ok(());
         }
-        let conn = self.conn()?;
-        conn.execute_batch("DELETE FROM enr")
-            .map_err(|e| e.to_string())?;
-        let pairs: Vec<(String, String)> = {
-            let mut stmt = conn
-                .prepare("SELECT DISTINCT source, code FROM ev WHERE code <> ''")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
-        };
-        {
+        let mut conn = self.conn()?;
+        conn.execute_batch("BEGIN TRANSACTION").map_err(|e| e.to_string())?;
+        let result: Result<(), String> = (|| {
+            conn.execute_batch("DELETE FROM enr").map_err(|e| e.to_string())?;
             let mut appender = conn.appender("enr").map_err(|e| e.to_string())?;
-            for (source, code) in pairs {
-                if let Some(info) = codes
-                    .lookup(&source, &code)
-                    .or_else(|| system.lookup(&source, &code))
-                {
-                    appender
-                        .append_row(duckdb::params![source, code, info.name, info.description])
-                        .map_err(|e| e.to_string())?;
+            let mut budget = crate::query::AnalyticsBudget::new();
+            for (catalog, config) in [codes, system].iter().enumerate() {
+                for (source, entries) in &config.sources {
+                    for (code, info) in entries {
+                        if code.is_empty() { continue; }
+                        crate::operations::check()?;
+                        budget.charge(source.len().saturating_add(code.len()).saturating_add(info.name.len()).saturating_add(info.description.len()).saturating_add(64))?;
+                        appender.append_row(duckdb::params![source, code, info.name, info.description, catalog as i32]).map_err(|e| e.to_string())?;
+                    }
                 }
             }
             appender.flush().map_err(|e| e.to_string())?;
-        }
+            drop(appender);
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())
+        })();
+        if result.is_err() && conn.execute_batch("ROLLBACK").is_err() { conn.discard(); }
+        result?;
         *current = Some(key);
         self.names_version.fetch_add(1, Ordering::SeqCst);
         self.selections.lock().clear();
@@ -562,20 +652,22 @@ impl Session {
     /// Holds the names table steady while a statement reads it.
     pub(crate) fn names_guard(
         &self,
-    ) -> parking_lot::RwLockReadGuard<'_, Option<(u64, usize, usize, usize, usize)>> {
+    ) -> parking_lot::RwLockReadGuard<'_, Option<CatalogKey>> {
         self.names.read()
     }
 }
 
-/// DuckDB would use every core and 80% of the memory; a desktop app shares
-/// the machine. The engine gets the shared worker budget and 40% of the
-/// installed memory, spilling larger intermediate results to disk.
-pub(crate) fn limit_resources(conn: &Connection) {
+/// Apply coordinated worker/memory budgets and a separate spill ceiling.
+/// Source metadata, persistent stores and allocator overhead are additional.
+pub(crate) fn limit_resources(conn: &Connection, build: bool) -> Result<(), String> {
     let megabytes = crate::resources::duckdb_memory_mb();
-    let _ = conn.execute_batch(&format!(
-        "SET threads = {}; SET memory_limit = '{megabytes}MB';",
-        crate::resources::query_threads()
-    ));
+    let directory = engine_dir().join("tmp");
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let spill = crate::resources::spill_bytes(build, &directory)?;
+    conn.execute_batch(&format!(
+        "SET threads = {}; SET memory_limit = '{megabytes}MB'; SET max_temp_directory_size = '{spill}B';",
+        crate::resources::query_threads(),
+    )).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -837,32 +929,36 @@ fn with_registry<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
 
 /// Ready session for the source, or `None` while its stores are missing
 /// (they are then built in the background and the line engine answers).
-pub(crate) fn session(
+pub(crate) fn session(idx: &FileIndex, codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> Option<Arc<Session>> {
+    session_checked(idx, codes, system, derived).ok().flatten()
+}
+
+pub(crate) fn session_checked(
     idx: &FileIndex,
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-) -> Option<Arc<Session>> {
+) -> Result<Option<Arc<Session>>, String> {
     if !enabled() || idx.lines.is_empty() {
-        return None;
+        return Ok(None);
     }
     let base = if derived.is_empty() {
         None
     } else {
         spec(idx, codes, system, &[])
     };
-    let spec = spec(idx, codes, system, derived)?;
+    let Some(spec) = spec(idx, codes, system, derived) else { return Ok(None); };
     if let Some(error) = idx
         .parts
         .iter()
         .find_map(|part| crate::sources::validate_source(part).err())
     {
         with_registry(|reg| {
-            reg.failed.insert(spec.key.clone(), error);
+            reg.failed.insert(spec.key.clone(), error.clone());
         });
-        return None;
+        return Err(error);
     }
-    let session = with_registry(|reg| -> Option<Arc<Session>> {
+    let session = with_registry(|reg| -> Result<Option<Arc<Session>>, String> {
         let identity = source_identity(idx);
         reg.remember_spec(idx, &spec);
         if let Some(base) = &base {
@@ -890,11 +986,11 @@ pub(crate) fn session(
         };
         if let Some(current) = cached {
             if current.key == spec.key {
-                return Some(Arc::clone(current));
+                return Ok(Some(Arc::clone(current)));
             }
         }
-        if reg.failed.contains_key(&spec.key) {
-            return None;
+        if let Some(error) = reg.failed.get(&spec.key) {
+            return Err(error.clone());
         }
         let missing: Vec<&PartSpec> = spec.parts.iter().filter(|p| !store_ready(p)).collect();
         if !missing.is_empty() {
@@ -904,7 +1000,7 @@ pub(crate) fn session(
             {
                 schedule(idx, &spec, base.as_ref(), derived, codes, system);
             }
-            return None;
+            return Ok(None);
         }
         match Session::open(&spec) {
             Ok(session) => {
@@ -914,24 +1010,19 @@ pub(crate) fn session(
                 } else {
                     reg.session = Some(Arc::clone(&session));
                 }
-                Some(session)
+                Ok(Some(session))
             }
             Err(error) => {
                 eprintln!("[motor] sessão indisponível: {error}");
-                if !error.starts_with("Checkpoint ocupado") {
-                    reg.failed.insert(spec.key.clone(), error);
-                }
-                None
+                if error.starts_with("Checkpoint ocupado") { return Ok(None); }
+                reg.failed.insert(spec.key.clone(), error.clone());
+                Err(error)
             }
         }
     })?;
-    match session.refresh_names(codes, system) {
-        Ok(()) => Some(session),
-        Err(error) => {
-            eprintln!("[motor] nomes indisponíveis: {error}");
-            None
-        }
-    }
+    let Some(session) = session else { return Ok(None); };
+    session.refresh_names(codes, system)?;
+    Ok(Some(session))
 }
 
 struct Job {
@@ -1342,7 +1433,7 @@ fn prepare_variant(
     });
     let total: usize = spec.parts.iter().map(|p| p.rows).sum();
     progress(BuildProgress {
-        phase: "Verificando integridade dos checkpoints".into(),
+        phase: "Validando índices salvos".into(),
         completed: 0,
         total: 0,
         checkpoint_rows: 0,
@@ -1386,7 +1477,9 @@ fn prepare_variant(
         progress(p);
     };
     publish(
-        "Validando e reutilizando checkpoints",
+        if resumed == total { "Índices salvos validados" }
+        else if resumed > 0 { "Retomando índices; partes ausentes ou inválidas" }
+        else { "Preparando índices ausentes ou inválidos" },
         done,
         done,
         segments,
@@ -1502,7 +1595,7 @@ fn prepare_variant(
     }
     if spec.parts.iter().all(store_ready) {
         publish(
-            "Abrindo consultas preparadas",
+            if resumed == total { "Abrindo índices salvos" } else { "Abrindo índices preparados" },
             done,
             done,
             segments,
@@ -1865,6 +1958,8 @@ mod lifecycle_tests {
             names: RwLock::new(None),
             names_version: AtomicU64::new(0),
             selections: Mutex::new(Vec::new()),
+            selection_builds: Mutex::new(HashSet::new()),
+            selection_changed: parking_lot::Condvar::new(),
             garbage: Arc::new(Mutex::new(Vec::new())),
             texts: Vec::new(),
             _leases: vec![lease],
@@ -2137,5 +2232,60 @@ mod lifecycle_tests {
             "a fresh request must not deduplicate cancelled work"
         );
         assert_ne!(queue.revision.load(Ordering::SeqCst), old.revision);
+    }
+}
+
+#[cfg(test)]
+mod metadata_identity_tests {
+    use super::*;
+
+    #[test]
+    fn timezone_context_separates_new_engine_keys_from_unverifiable_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calendar.jsonl");
+        std::fs::write(&path, "{\"timestamp\":\"2026-09-30T00:00:00Z\",\"message\":\"alpha\"}\n").unwrap();
+        let mut idx = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let codes = CodesConfig::default();
+        let actual = spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key.clone();
+        let part = &idx.parts[0];
+        let first_offset = idx.lines[0].offset - part.base;
+        let last = idx.lines.last().unwrap();
+        let last_end = last.offset - part.base + u64::from(last.len);
+        let custom = ""; let ts = ""; let catalogs = "";
+        let tz = chrono::Local::now().offset().to_string();
+        let derived_sig = derived_signature(&[]).unwrap();
+        let mut hash = Sha256::new();
+        hash.update(format!(
+            "{}|{}|{}|{}|{:?}|{custom}|{ts}|{tz}|{}|{first_offset}|{last_end}|{derived_sig}|{catalogs}|{:?}",
+            build::STORE_VERSION, "indexes-v6", part.identity,
+            part.format, part.header, idx.lines.len(), part.physical_file_id
+        ));
+        assert_ne!(actual, format!("{:x}", hash.finalize()));
+        let original_zone = idx.parts[0].calendar.timezone.clone();
+        idx.parts[0].calendar.timezone = "different-historical-rules-with-the-same-current-offset".into();
+        assert_ne!(actual, spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key);
+        idx.parts[0].calendar.timezone = original_zone;
+        idx.parts[0].calendar.year += 1;
+        assert_eq!(actual, spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key);
+        idx.parts[0].event_identity = Some("stable-logical-source".into());
+        assert_ne!(actual, spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key);
+    }
+
+    #[test]
+    fn inferred_year_and_logical_identity_separate_engine_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("syslog.log");
+        std::fs::write(&path, "Sep 30 12:00:00 host app: alpha\n").unwrap();
+        let mut idx = crate::sources::index_file(path.to_str().unwrap(), "syslog3164", None, None, None).unwrap();
+        let codes = CodesConfig::default();
+        let first = spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key.clone();
+        idx.parts[0].calendar.year += 1;
+        let next = spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key.clone();
+        assert_ne!(first, next);
+        idx.parts[0].event_identity = Some("original:event".into());
+        let alias = spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key.clone();
+        assert_ne!(next, alias);
+        idx.parts[0].event_identity = Some("other:event".into());
+        assert_ne!(alias, spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key);
     }
 }

@@ -444,8 +444,7 @@ fn month_num(mon: &str) -> Option<u32> {
     })
 }
 
-fn syslog_ts(mon: &str, day: &str, h: &str, mi: &str, s: &str) -> Option<i64> {
-    let year = chrono::Utc::now().year();
+fn syslog_ts(mon: &str, day: &str, h: &str, mi: &str, s: &str, year: i32) -> Option<i64> {
     let (d, h, mi, s) = (
         day.parse().ok()?,
         h.parse().ok()?,
@@ -457,11 +456,11 @@ fn syslog_ts(mon: &str, day: &str, h: &str, mi: &str, s: &str) -> Option<i64> {
         .map(naive_to_ms)
 }
 
-fn parse_syslog3164(line: &str) -> Option<Event> {
+fn parse_syslog3164(line: &str, year: i32) -> Option<Event> {
     let c = re_syslog3164().captures(line)?;
     let mut ev = Event::empty();
     ev.raw = line.to_string();
-    ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6]);
+    ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6], year);
     ev.source = c[7].to_string();
     let proc = c[8].to_string();
     ev.fields
@@ -528,7 +527,7 @@ fn parse_apache(line: &str) -> Option<Event> {
     Some(ev)
 }
 
-fn parse_firewall(line: &str) -> Option<Event> {
+fn parse_firewall(line: &str, year: i32) -> Option<Event> {
     // iptables/netfilter: prefixo estilo syslog + pares CHAVE=VALOR
     let c = re_syslog3164().captures(line)?;
     let msg = c[10].to_string();
@@ -538,7 +537,7 @@ fn parse_firewall(line: &str) -> Option<Event> {
     };
     let mut ev = Event::empty();
     ev.raw = line.to_string();
-    ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6]);
+    ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6], year);
     ev.source = c[7].to_string();
     ev.fields
         .insert("process".into(), Value::from(c[8].to_string()));
@@ -1568,6 +1567,8 @@ pub struct TsRule {
 /// TsConfig com as regexes já compiladas.
 #[derive(Clone)]
 pub struct CompiledTsConfig {
+    /// Pin an omitted date once, rather than changing semantics across midnight.
+    pub reference_date: chrono::NaiveDate,
     pub timezone_offset_minutes: Option<i32>,
     pub clock_adjustment_ms: i64,
     pub sources: Vec<String>,
@@ -1582,8 +1583,19 @@ impl CompiledTsConfig {
     pub(crate) fn signature(&self) -> String {
         let rules: Vec<_> = self.rules.iter()
             .map(|(re, template)| (re.as_ref().map(|r| r.as_str()), template.as_ref())).collect();
-        format!("{:?}|{}|{:?}|{:?}|{}|{:?}", self.sources, self.format,
-            self.complement, self.timezone_offset_minutes, self.clock_adjustment_ms, rules)
+        let fallback_date = self.complement.as_deref()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
+            .is_none()
+            && !self.format.starts_with("epoch")
+            && chrono::format::StrftimeItems::new(&self.format).any(|item| {
+                use chrono::format::{Fixed, Item, Numeric};
+                matches!(item, Item::Numeric(Numeric::Hour | Numeric::Hour12 | Numeric::Minute | Numeric::Second | Numeric::Timestamp, _)
+                    | Item::Fixed(Fixed::RFC2822 | Fixed::RFC3339))
+            });
+        let mut signature = format!("{:?}|{}|{:?}|{:?}|{}|{:?}", self.sources, self.format,
+            self.complement, self.timezone_offset_minutes, self.clock_adjustment_ms, rules);
+        if fallback_date { signature.push_str(&format!("|reference-date:{}", self.reference_date)); }
+        signature
     }
 }
 
@@ -1614,6 +1626,7 @@ impl TsConfig {
             rules.push((re, r.template));
         }
         Ok(CompiledTsConfig {
+            reference_date: chrono::Utc::now().date_naive(),
             timezone_offset_minutes: self.timezone_offset_minutes,
             clock_adjustment_ms: self.clock_adjustment_ms,
             sources: self.sources.clone(),
@@ -1734,12 +1747,85 @@ pub enum CustomParse {
     Delimited { sep: char, fields: Vec<String> },
 }
 
+/// Calendar-sensitive parsers infer their year once per source load. Local
+/// timezone configuration remains part of the cache identity; the mapped
+/// source and system timezone must stay stable while a load is in progress.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct ParserCalendar {
+    pub year: i32,
+    pub timezone: String,
+}
+impl ParserCalendar {
+    pub(crate) fn current() -> Result<Self, String> {
+        Ok(Self { year: chrono::Utc::now().year(), timezone: Self::timezone_signature()? })
+    }
+    fn timezone_signature() -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"timezone-configuration-v1");
+        hash.update(chrono::Local::now().offset().to_string());
+        let tz = std::env::var_os("TZ").unwrap_or_default();
+        hash.update(tz.to_string_lossy().as_bytes());
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            let mut paths = vec![std::path::PathBuf::from("/etc/localtime")];
+            let name = tz.to_string_lossy();
+            let name = name.trim_start_matches(':');
+            let tzdir = std::env::var_os("TZDIR");
+            if let Some(dir) = &tzdir { hash.update(dir.to_string_lossy().as_bytes()); }
+            if !name.is_empty() {
+                if std::path::Path::new(name).is_absolute() { paths.push(name.into()); }
+                else {
+                    if let Some(dir) = tzdir { paths.push(std::path::PathBuf::from(dir).join(name)); }
+                    for dir in ["/usr/share/zoneinfo", "/share/zoneinfo", "/etc/zoneinfo"] { paths.push(std::path::Path::new(dir).join(name)); }
+                }
+            }
+            for path in paths {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    hash.update(path.to_string_lossy().as_bytes()); hash.update(bytes);
+                }
+            }
+            // The relevant TZif bytes are hashed above. Also include the tzdb
+            // version header when the distribution makes it available.
+            if let Ok(file) = std::fs::File::open("/usr/share/zoneinfo/tzdata.zi") {
+                let mut version = Vec::new(); file.take(1024).read_to_end(&mut version).map_err(|e| e.to_string())?;
+                hash.update(version.split(|&b| b == b'\n').next().unwrap_or_default());
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Time::{GetDynamicTimeZoneInformation, DYNAMIC_TIME_ZONE_INFORMATION, TIME_ZONE_ID_INVALID};
+            let mut zone = DYNAMIC_TIME_ZONE_INFORMATION::default();
+            if unsafe { GetDynamicTimeZoneInformation(&mut zone) } == TIME_ZONE_ID_INVALID {
+                return Err("Não foi possível identificar a configuração de fuso horário do Windows.".into());
+            }
+            // Includes dynamic zone key, enabled/disabled DST and current rules.
+            // This is not a hash of the entire historical Windows rule database.
+            hash.update(format!("{zone:?}"));
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    }
+    pub(crate) fn validate_timezone(&self) -> Result<(), String> {
+        if self.timezone != Self::timezone_signature()? {
+            return Err("O fuso horário mudou durante a indexação. Reabra a fonte para preservar horários consistentes.".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct FilePart {
     pub path: String,
     /// Actual immutable input backing the mapping (display paths may be virtual).
     pub physical_path: String,
     pub physical_file_id: Option<(u64, u64)>,
+    pub(crate) calendar: ParserCalendar,
+    pub(crate) event_identity: Option<String>,
+    /// Complete raw source/parser/calendar identity, fixed before publication.
+    pub(crate) metadata_identity: String,
+    /// Protects a canonical expanded file from another process's pruning.
+    pub(crate) canonical_lease: Option<std::sync::Arc<std::fs::File>>,
     pub file_name: String,
     pub format: String,
     pub custom: Option<CustomParse>,
@@ -1833,6 +1919,8 @@ pub(crate) fn file_identity(_file: &std::fs::File) -> Option<(u64, u64)> { None 
 pub(crate) fn validate_source(part: &FilePart) -> Result<(), String> {
     let file = std::fs::File::open(&part.physical_path).map_err(|e| format!("Fonte indisponível: {e}"))?;
     let metadata = file.metadata().map_err(|e| format!("Fonte indisponível: {e}"))?;
+    part.calendar.validate_timezone()?;
+    crate::workspace::validate_canonical_origin(std::path::Path::new(&part.physical_path))?;
     // Reject changes observed before touching the mapping. This is not an
     // atomic snapshot: external writers must not modify/truncate the backing
     // file during use, including between this guard and subsequent mmap reads.
@@ -1859,7 +1947,11 @@ fn file_name_of(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+#[cfg(test)]
 fn parse_with_format(s: &str, fmt: &str, complement: Option<&str>) -> Option<i64> {
+    parse_with_format_at(s, fmt, complement, chrono::Utc::now().date_naive())
+}
+fn parse_with_format_at(s: &str, fmt: &str, complement: Option<&str>, reference_date: chrono::NaiveDate) -> Option<i64> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -1890,7 +1982,7 @@ fn parse_with_format(s: &str, fmt: &str, complement: Option<&str>) -> Option<i64
         if let Ok(t) = chrono::NaiveTime::parse_from_str(cand, fmt) {
             let date = complement
                 .and_then(|c| chrono::NaiveDate::parse_from_str(c.trim(), "%Y-%m-%d").ok())
-                .unwrap_or_else(|| chrono::Utc::now().date_naive());
+                .unwrap_or(reference_date);
             return Some(naive_to_ms(date.and_time(t)));
         }
     }
@@ -1936,7 +2028,7 @@ fn ts_from_joined(joined: &str, cc: &CompiledTsConfig) -> Option<i64> {
             },
             None => joined.trim().to_string(),
         };
-        if let Some(mut ts) = parse_with_format(&candidate, &cc.format, cc.complement.as_deref()) {
+        if let Some(mut ts) = parse_with_format_at(&candidate, &cc.format, cc.complement.as_deref(), cc.reference_date) {
             if let Some(minutes) = cc.timezone_offset_minutes {
                 if !cc.format.contains("%z")
                     && !cc.format.contains("%:z")
@@ -2005,6 +2097,7 @@ pub fn retimestamp_index(
     idx: &mut FileIndex,
     progress: Option<&(dyn Fn(usize, usize) + Sync)>,
 ) -> Result<(), String> {
+    for part in &idx.parts { validate_source(part)?; }
     let total = idx.lines.len();
     let mut timestamps = Vec::with_capacity(total);
     let cancellation = crate::operations::current_token();
@@ -2026,7 +2119,7 @@ pub fn retimestamp_index(
                 }
                 let part = index.part_at(i);
                 let bytes = line_bytes(index, i);
-                let mut ev = parse_line(bytes, &part.format, part.custom.as_ref(), &part.header);
+                let mut ev = parse_part_line(part, bytes);
                 if let Some(cc) = &part.ts_config {
                     apply_ts_config(&mut ev, cc, part, &String::from_utf8_lossy(bytes));
                 }
@@ -2036,6 +2129,7 @@ pub fn retimestamp_index(
         timestamps.extend(part);
     }
     crate::operations::check()?;
+    for part in &idx.parts { validate_source(part)?; }
     for (line, timestamp) in std::sync::Arc::make_mut(&mut idx.lines).iter_mut().zip(timestamps) {
         line.ts = timestamp;
     }
@@ -2056,10 +2150,10 @@ pub fn event_at(
 ) -> Event {
     let part = idx.part_at(i);
     let bytes = line_bytes(idx, i);
-    let mut ev = parse_line(bytes, &part.format, part.custom.as_ref(), &part.header);
+    let mut ev = parse_part_line(part, bytes);
     ev.id = i;
     if ev.event_ref.is_empty() {
-        ev.event_ref = format!("{}:{}", part.identity, idx.lines[i].offset - part.base);
+        ev.event_ref = format!("{}:{}", part.event_identity.as_deref().unwrap_or(&part.identity), idx.lines[i].offset - part.base);
     }
     ev.enrich(codes, system);
     ev.fields
@@ -2226,6 +2320,14 @@ pub fn parse_line(
     custom: Option<&CustomParse>,
     header: &[String],
 ) -> Event {
+    parse_line_at(bytes, format, custom, header, chrono::Utc::now().year())
+}
+
+pub(crate) fn parse_part_line(part: &FilePart, bytes: &[u8]) -> Event {
+    parse_line_at(bytes, &part.format, part.custom.as_ref(), &part.header, part.calendar.year)
+}
+
+pub(crate) fn parse_line_at(bytes: &[u8], format: &str, custom: Option<&CustomParse>, header: &[String], year: i32) -> Event {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     let text = String::from_utf8_lossy(bytes);
     let mut ev = match format {
@@ -2236,10 +2338,10 @@ pub fn parse_line(
             Ok(Value::Object(map)) => event_from_json(map, &text),
             _ => event_from_text(&text),
         },
-        "syslog3164" => parse_syslog3164(&text).unwrap_or_else(|| event_from_text(&text)),
+        "syslog3164" => parse_syslog3164(&text, year).unwrap_or_else(|| event_from_text(&text)),
         "syslog5424" => parse_syslog5424(&text).unwrap_or_else(|| event_from_text(&text)),
         "apache" => parse_apache(&text).unwrap_or_else(|| event_from_text(&text)),
-        "firewall" => parse_firewall(&text).unwrap_or_else(|| event_from_text(&text)),
+        "firewall" => parse_firewall(&text, year).unwrap_or_else(|| event_from_text(&text)),
         "wildfly" => parse_wildfly(&text)
             .or_else(|| parse_jboss(&text))
             .or_else(|| parse_log4j(&text))
@@ -2349,467 +2451,448 @@ fn text_level_class(line: &[u8]) -> u8 {
     LV_INFO
 }
 
-fn meta_for_line(
-    line: &[u8],
-    offset: u64,
-    format: &str,
-    custom: Option<&CustomParse>,
-    header: &[String],
-) -> LineMeta {
-    let mut m = LineMeta {
-        offset,
-        len: line.len() as u32,
-        ..Default::default()
-    };
-    let ev = parse_line(line, format, custom, header);
+fn meta_for_line(line: &[u8], offset: u64, part: &FilePart) -> Result<LineMeta, String> {
+    let mut m = LineMeta { offset, len: u32::try_from(line.len()).map_err(|_| "Um registro excede 4 GB.")?, ..Default::default() };
+    let ev = parse_part_line(part, line);
     m.ts = ev.timestamp.unwrap_or(0);
     m.level = label_class(&ev.level).unwrap_or(LV_OTHER);
-    // Offset is an optimization only; non-JSON codes are resolved from the event.
-    if format == "jsonl" {
+    if part.format == "jsonl" {
         if let Some((a, b)) = find_json_value(line, CODE_KEYS) {
             if line.get(a..b) == Some(ev.code.as_bytes()) && b - a <= u16::MAX as usize {
-                m.code_off = a as u32;
+                m.code_off = u32::try_from(a).map_err(|_| "Posição de código excede 4 GB.")?;
                 m.code_len = (b - a) as u16;
             }
         }
     }
-    m
+    Ok(m)
 }
 
-/// Adiciona uma linha ao índice. Em formatos multi-linha (`start_re`), uma
-/// linha que NÃO casa o padrão de início é continuação (corpo de stacktrace):
-/// estende o `len` do evento anterior em vez de virar evento próprio.
-/// Continuações antes do primeiro evento viram linhas soltas (o comportamento
-/// normal de uma linha qualquer).
-#[allow(clippy::too_many_arguments)]
-fn push_meta(
-    lines: &mut Vec<LineMeta>,
-    line: &[u8],
-    offset: u64,
-    fmt: &str,
-    custom: Option<&CustomParse>,
-    header: &[String],
-    start_re: Option<&regex::Regex>,
-) {
+fn push_meta(lines: &mut Vec<LineMeta>, line: &[u8], offset: u64, part: &FilePart, start_re: Option<&regex::Regex>) -> Result<(), String> {
     if let Some(re) = start_re {
-        let text = std::str::from_utf8(line).unwrap_or("");
-        if !re.is_match(text) {
+        if !re.is_match(std::str::from_utf8(line).unwrap_or("")) {
             if let Some(last) = lines.last_mut() {
-                let end = offset as usize + line.len();
-                last.len = (end - last.offset as usize) as u32;
-                return;
+                let end = offset.checked_add(line.len() as u64).ok_or("Posição de registro inválida.")?;
+                last.len = u32::try_from(end - last.offset).map_err(|_| "Um registro multilinha excede 4 GB.")?;
+                return Ok(());
             }
         }
     }
-    lines.push(meta_for_line(line, offset, fmt, custom, header));
-}
-
-/// Index JSON array objects directly in the mapped file, including pretty JSON.
-/// Only positions and nesting are kept; the array is never deserialized as a Vec.
-fn index_json_array(
-    bytes: &[u8],
-    start: usize,
-    lines: &mut Vec<LineMeta>,
-    custom: Option<&CustomParse>,
-    header: &[String],
-    progress: Option<&dyn Fn(usize, usize)>,
-    envelope: bool,
-) -> Result<(), String> {
-    let records = json_array_records(bytes, start, progress, envelope)?;
-    // Positions come from one fast scan; the records are read in parallel.
-    let cancellation = crate::operations::current_token();
-    let wave = crate::resources::workers() * 4 * 1024;
-    lines.reserve(records.len());
-    for group in records.chunks(wave) {
-        let metas: Vec<Vec<LineMeta>> = group
-            .par_chunks(1024)
-            .map(|chunk| {
-                if cancellation.cancelled() {
-                    return Vec::new();
-                }
-                chunk
-                    .iter()
-                    .map(|&(begin, end)| meta_for_line(&bytes[begin..=end], begin as u64, "jsonl", custom, header))
-                    .collect()
-            })
-            .collect();
-        crate::operations::check()?;
-        lines.extend(metas.into_iter().flatten());
-        if let Some(cb) = progress {
-            cb(group.last().map(|(_, end)| end + 1).unwrap_or(0), bytes.len());
-        }
-    }
+    lines.push(meta_for_line(line, offset, part)?);
     Ok(())
 }
 
-/// Byte ranges of the objects of a JSON array, found in one pass.
-fn json_array_records(
-    bytes: &[u8],
-    start: usize,
-    progress: Option<&dyn Fn(usize, usize)>,
-    envelope: bool,
-) -> Result<Vec<(usize, usize)>, String> {
-    let mut records = Vec::new();
-    let mut stack = Vec::new();
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut record_start = None;
-    let mut need_separator = false;
-    let mut after_comma = false;
-    for (i, &byte) in bytes.iter().enumerate().skip(start + 1) {
-        if i % 65_536 == 0 {
-            crate::operations::check()?;
-        }
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                quoted = false;
-            }
-            continue;
-        }
-        if let Some(begin) = record_start {
-            match byte {
-                b'"' => quoted = true,
-                b'{' | b'[' => {
-                    if stack.len() >= 128 {
-                        return Err("JSON excede 128 níveis de aninhamento.".into());
-                    }
-                    stack.push(byte);
-                }
-                b'}' | b']' => {
-                    let opening = if byte == b'}' { b'{' } else { b'[' };
-                    if stack.pop() != Some(opening) {
-                        return Err(format!("Estrutura JSON inválida no byte {i}."));
-                    }
-                    if stack.is_empty() {
-                        if i - begin >= u32::MAX as usize {
-                            return Err("Um registro JSON excede 4 GB.".into());
-                        }
-                        records.push((begin, i));
-                        record_start = None;
-                        need_separator = true;
-                        if records.len().is_multiple_of(65_536) {
-                            if let Some(cb) = progress {
-                                cb(i, bytes.len());
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            continue;
-        }
-        if byte.is_ascii_whitespace() {
-            continue;
-        }
-        match byte {
-            b']' if !after_comma => {
-                // The rest of an envelope document follows the records array.
-                if !envelope && bytes[i + 1..].iter().any(|b| !b.is_ascii_whitespace()) {
-                    return Err("Há conteúdo após o fim do array JSON.".into());
-                }
-                return Ok(records);
-            }
-            b',' if need_separator => {
-                need_separator = false;
-                after_comma = true;
-            }
-            b'{' if !need_separator => {
-                record_start = Some(i);
-                stack.push(byte);
-                after_comma = false;
-            }
-            _ => {
-                return Err(format!(
-                    "Esperado um objeto ou separador no array JSON (byte {i})."
-                ))
-            }
-        }
-    }
-    Err("Array JSON incompleto: falta fechar um objeto ou o array.".into())
-}
+type CheckpointSink<'a> = dyn FnMut(&[LineMeta], usize, bool, Option<&[String]>) -> Result<(), String> + 'a;
 
-/// Bytes per parallel indexing task, cut at line ends.
+/// At most 4 MiB or 65,536 physical lines per worker, whichever comes first.
+/// This bounds temporary metadata even for very short records. A single long
+/// physical/logical record is still an indivisible parsing unit.
 const INDEX_CHUNK: usize = 4 << 20;
-
-/// Entries of one chunk. In multi-line formats, continuation lines before
-/// the chunk's first entry belong to the previous chunk's last entry.
+const INDEX_CHUNK_LINES: usize = 65_536;
 struct ChunkLines {
     lines: Vec<LineMeta>,
-    /// Start of the first and end of the last leading continuation line.
     leading: Option<(usize, usize)>,
 }
 
-/// Indexes a line-oriented file in parallel chunks, with the same result as
-/// reading it line by line; waves keep memory bounded and report progress.
-#[allow(clippy::too_many_arguments)]
-fn index_lines(
-    bytes: &[u8],
-    fmt: &str,
-    custom: Option<&CustomParse>,
-    header: &[String],
-    header_at: Option<usize>,
-    start_re: Option<&regex::Regex>,
-    progress: Option<&dyn Fn(usize, usize)>,
-    total_lines: usize,
-) -> Result<Vec<LineMeta>, String> {
-    let mut bounds = vec![0usize];
-    let mut next = INDEX_CHUNK;
-    while next < bytes.len() {
-        match memchr::memchr(b'\n', &bytes[next..]) {
-            Some(nl) if next + nl + 1 < bytes.len() => {
-                bounds.push(next + nl + 1);
-                next += nl + 1 + INDEX_CHUNK;
-            }
-            _ => break,
+fn next_line_bound(bytes: &[u8], from: usize, limits: &IndexLimits) -> Result<usize, String> {
+    let target = from.saturating_add(limits.chunk_bytes);
+    let mut line_count = 0usize;
+    for (block, bytes) in bytes[from..].chunks(65_536).enumerate() {
+        crate::operations::check()?;
+        let base = from + block * 65_536;
+        for nl in memchr::memchr_iter(b'\n', bytes) {
+            line_count += 1;
+            let end = base + nl + 1;
+            if end >= target || line_count >= limits.chunk_lines { return Ok(end); }
         }
     }
-    bounds.push(bytes.len());
-    let comments = matches!(fmt, "w3c" | "zeek");
-    // A terminated line may be skipped (blank, header, comment); the final
-    // unterminated line is taken as it is, as the line-by-line reader did.
+    Ok(bytes.len())
+}
+
+fn index_lines(prepared: &PreparedIndex, lines: &mut Vec<LineMeta>, mut cursor: usize, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
+    use crate::metadata_checkpoint::{report, Progress};
+    let part = &prepared.part;
+    let bytes: &[u8] = &part.mmap;
+    let start_re = prepared.descriptor.start_pattern.as_deref().map(regex::Regex::new).transpose().map_err(|e| e.to_string())?;
+    let comments = matches!(part.format.as_str(), "w3c" | "zeek");
     let keep = |line: &[u8], offset: usize, terminated: bool| {
-        !line.is_empty() && (!terminated || (Some(offset) != header_at && !(comments && line[0] == b'#')))
+        !line.is_empty() && (!terminated || (Some(offset) != prepared.descriptor.header_at && !(comments && line[0] == b'#')))
     };
     let cancellation = crate::operations::current_token();
-    let chunk = |k: usize| -> ChunkLines {
-        let (from, to) = (bounds[k], bounds[k + 1]);
-        let mut out = ChunkLines { lines: Vec::new(), leading: None };
-        let visit = |line: &[u8], offset: usize, terminated: bool, out: &mut ChunkLines| {
-            if !keep(line, offset, terminated) {
-                return;
-            }
-            if let Some(re) = start_re {
-                if k > 0 && out.lines.is_empty() && !re.is_match(std::str::from_utf8(line).unwrap_or("")) {
-                    let end = offset + line.len();
-                    out.leading = Some((out.leading.map_or(offset, |(start, _)| start), end));
-                    return;
+    while cursor < bytes.len() {
+        prepared.validate()?;
+        crate::operations::check()?;
+        let mut bounds = vec![cursor];
+        for _ in 0..prepared.limits.wave_chunks {
+            let from = *bounds.last().unwrap();
+            if from == bytes.len() { break; }
+            bounds.push(next_line_bound(bytes, from, &prepared.limits)?);
+        }
+        let chunk = |k: usize| -> Result<ChunkLines, String> {
+            let (from, to) = (bounds[k], bounds[k + 1]);
+            let mut out = ChunkLines { lines: Vec::new(), leading: None };
+            let visit = |line: &[u8], offset: usize, terminated: bool, out: &mut ChunkLines| -> Result<(), String> {
+                if !keep(line, offset, terminated) { return Ok(()); }
+                if let Some(re) = start_re.as_ref() {
+                    if from > 0 && out.lines.is_empty() && !re.is_match(std::str::from_utf8(line).unwrap_or("")) {
+                        let end = offset + line.len();
+                        out.leading = Some((out.leading.map_or(offset, |(start, _)| start), end));
+                        return Ok(());
+                    }
                 }
+                push_meta(&mut out.lines, line, offset as u64, part, start_re.as_ref())
+            };
+            let mut offset = from;
+            for (n, nl) in memchr::memchr_iter(b'\n', &bytes[from..to]).enumerate() {
+                if n % 4096 == 0 && cancellation.cancelled() { return Err("Operação cancelada.".into()); }
+                let end = from + nl;
+                let raw = &bytes[offset..end];
+                visit(raw.strip_suffix(b"\r").unwrap_or(raw), offset, true, &mut out)?;
+                offset = end + 1;
             }
-            push_meta(&mut out.lines, line, offset as u64, fmt, custom, header, start_re);
+            if offset < to { visit(&bytes[offset..to], offset, false, &mut out)?; }
+            Ok(out)
         };
-        let mut offset = from;
-        for (n, nl) in memchr::memchr_iter(b'\n', &bytes[from..to]).enumerate() {
-            if n % 4096 == 0 && cancellation.cancelled() {
-                break;
-            }
-            let end = from + nl;
-            let raw = &bytes[offset..end];
-            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
-            visit(line, offset, true, &mut out);
-            offset = end + 1;
-        }
-        if offset < to {
-            visit(&bytes[offset..to], offset, false, &mut out);
-        }
-        out
-    };
-    let mut merged: Vec<LineMeta> = Vec::with_capacity(total_lines.min(1 << 24));
-    let wave = crate::resources::workers() * 2;
-    let mut first = 0;
-    while first + 1 < bounds.len() {
+        report(reporter, Progress::new("metadata-scan", "Indexando metadados", cursor, bytes.len(), "bytes"));
+        let parts: Result<Vec<ChunkLines>, String> = (0..bounds.len() - 1).into_par_iter().map(chunk).collect();
         crate::operations::check()?;
-        let last = (first + wave).min(bounds.len() - 1);
-        let parts: Vec<ChunkLines> = (first..last).into_par_iter().map(chunk).collect();
-        crate::operations::check()?;
-        for part in parts {
-            if let Some((start, stop)) = part.leading {
-                match merged.last_mut() {
-                    Some(entry) => entry.len = (stop - entry.offset as usize) as u32,
-                    // Nothing before them: the first line stands alone and the
-                    // next ones continue it, as when read in order.
+        let previous_rows = lines.len();
+        for chunk in parts? {
+            if let Some((start, stop)) = chunk.leading {
+                match lines.last_mut() {
+                    Some(entry) => entry.len = u32::try_from(stop as u64 - entry.offset).map_err(|_| "Um registro multilinha excede 4 GB.")?,
                     None => {
                         let mut offset = start;
                         for raw in bytes[start..stop].split(|&b| b == b'\n') {
                             let line = raw.strip_suffix(b"\r").unwrap_or(raw);
-                            if keep(line, offset, true) {
-                                push_meta(&mut merged, line, offset as u64, fmt, custom, header, start_re);
-                            }
+                            if keep(line, offset, true) { push_meta(lines, line, offset as u64, part, start_re.as_ref())?; }
                             offset += raw.len() + 1;
                         }
                     }
                 }
             }
-            merged.extend(part.lines);
+            lines.extend(chunk.lines);
         }
-        first = last;
-        if let Some(cb) = progress {
-            cb(bounds[first], bytes.len());
-        }
+        cursor = *bounds.last().unwrap();
+        let parsed = prepared.parsed_rows.fetch_add(lines.len() - previous_rows, std::sync::atomic::Ordering::Relaxed) + lines.len() - previous_rows;
+        let mut progress = Progress::new("metadata-scan", "Indexando metadados", cursor, bytes.len(), "bytes");
+        progress.parsed_rows = parsed;
+        report(reporter, progress);
+        if cursor < bytes.len() { sink(lines, cursor, false, None)?; }
     }
-    Ok(merged)
+    Ok(())
 }
 
-/// Indexa um arquivo inteiro em uma única passada, guardando apenas
-/// metadados compactos por linha (~32 bytes/linha).
-pub fn index_file(
-    path: &str,
-    format: &str,
-    custom: Option<CustomParse>,
-    saved_ts: Option<CompiledTsConfig>,
-    progress: Option<&dyn Fn(usize, usize)>,
-) -> Result<FileIndex, String> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("Não foi possível abrir '{path}': {e}"))?;
-    if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-        return Err("Arquivo vazio.".into());
+/// Scanner checkpoints only between complete objects, never inside a string,
+/// escape, or nesting stack. The array itself is never collected in memory.
+struct JsonScanner<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+    need_separator: bool,
+    after_comma: bool,
+    envelope: bool,
+    done: bool,
+    stack: Vec<u8>,
+    last_report: std::time::Instant,
+}
+impl<'a> JsonScanner<'a> {
+    fn new(bytes: &'a [u8], start: usize, cursor: usize, envelope: bool) -> Self {
+        Self { bytes, cursor, need_separator: cursor != start + 1, after_comma: false, envelope, done: false, stack: Vec::with_capacity(32), last_report: std::time::Instant::now() }
     }
-    let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-        .map_err(|e| format!("Falha ao mapear '{path}': {e}"))?;
+    fn next(&mut self, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<Option<(usize, usize)>, String> {
+        use crate::metadata_checkpoint::{report, Progress};
+        if self.done { return Ok(None); }
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut record_start = None;
+        while self.cursor < self.bytes.len() {
+            let i = self.cursor;
+            let byte = self.bytes[i];
+            self.cursor += 1;
+            if i % 65_536 == 0 {
+                crate::operations::check()?;
+                if self.last_report.elapsed() >= std::time::Duration::from_millis(150) {
+                    report(reporter, Progress::new("metadata-json-boundaries", "Localizando registros JSON", i, self.bytes.len(), "bytes"));
+                    self.last_report = std::time::Instant::now();
+                }
+            }
+            if quoted {
+                if escaped { escaped = false; }
+                else if byte == b'\\' { escaped = true; }
+                else if byte == b'"' { quoted = false; }
+                continue;
+            }
+            if let Some(begin) = record_start {
+                match byte {
+                    b'"' => quoted = true,
+                    b'{' | b'[' => {
+                        if self.stack.len() >= 128 { return Err("JSON excede 128 níveis de aninhamento.".into()); }
+                        self.stack.push(byte);
+                    }
+                    b'}' | b']' => {
+                        let opening = if byte == b'}' { b'{' } else { b'[' };
+                        if self.stack.pop() != Some(opening) { return Err(format!("Estrutura JSON inválida no byte {i}.")); }
+                        if self.stack.is_empty() {
+                            if i - begin >= u32::MAX as usize { return Err("Um registro JSON excede 4 GB.".into()); }
+                            self.need_separator = true;
+                            return Ok(Some((begin, i + 1)));
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if byte.is_ascii_whitespace() { continue; }
+            match byte {
+                b']' if !self.after_comma => {
+                    if !self.envelope {
+                        for suffix in self.bytes[self.cursor..].chunks(65_536) {
+                            crate::operations::check()?;
+                            if suffix.iter().any(|b| !b.is_ascii_whitespace()) { return Err("Há conteúdo após o fim do array JSON.".into()); }
+                        }
+                    }
+                    self.done = true;
+                    return Ok(None);
+                }
+                b',' if self.need_separator => { self.need_separator = false; self.after_comma = true; }
+                b'{' if !self.need_separator => { record_start = Some(i); self.stack.push(byte); self.after_comma = false; }
+                _ => return Err(format!("Esperado um objeto ou separador no array JSON (byte {i}).")),
+            }
+        }
+        Err("Array JSON incompleto: falta fechar um objeto ou o array.".into())
+    }
+}
 
-    let fmt = if format == "auto" {
-        detect_format(&mmap).to_string()
-    } else if format == "custom" || format.starts_with("custom:") {
-        "custom".to_string()
-    } else if format == "csv" {
-        // CSV chosen by hand still has its separator detected.
-        detect_delimited(&mmap).unwrap_or("csv").to_string()
-    } else {
-        format.to_string()
-    };
-    let fmt = fmt.as_str();
+fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, cursor: usize, lines: &mut Vec<LineMeta>, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
+    use crate::metadata_checkpoint::{report, Progress};
+    let bytes: &[u8] = &prepared.part.mmap;
+    let mut scanner = JsonScanner::new(bytes, start, cursor, envelope);
+    let cancellation = crate::operations::current_token();
+    let max_records = prepared.limits.json_records;
+    while !scanner.done {
+        prepared.validate()?;
+        crate::operations::check()?;
+        let wave_start = scanner.cursor;
+        let mut records = Vec::with_capacity(max_records);
+        while records.len() < max_records {
+            let Some(record) = scanner.next(reporter)? else { break; };
+            records.push(record);
+            if scanner.cursor - wave_start >= prepared.limits.json_bytes { break; }
+        }
+        let metas: Result<Vec<LineMeta>, String> = records.par_iter().map(|&(begin, end)| {
+            if cancellation.cancelled() { return Err("Operação cancelada.".into()); }
+            meta_for_line(&bytes[begin..end], begin as u64, &prepared.part)
+        }).collect();
+        crate::operations::check()?;
+        lines.extend(metas?);
+        let parsed = prepared.parsed_rows.fetch_add(records.len(), std::sync::atomic::Ordering::Relaxed) + records.len();
+        let mut progress = Progress::new("metadata-scan", "Indexando metadados JSON", scanner.cursor, bytes.len(), "bytes");
+        progress.parsed_rows = parsed;
+        report(reporter, progress);
+        if !scanner.done { sink(lines, scanner.cursor, false, None)?; }
+    }
+    Ok(())
+}
 
-    // Cabeçalho (tabulares: primeira linha não vazia; w3c: linha "#Fields:")
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+struct SourceStamp {
+    canonical_path: String,
+    bytes: u64,
+    modified: Option<(u64, u32)>,
+    file_id: Option<(u64, u64)>,
+}
+impl SourceStamp {
+    fn read(file: &std::fs::File, path: &str) -> Result<Self, String> {
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        Ok(Self {
+            canonical_path: std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path)).to_string_lossy().into_owned(),
+            bytes: meta.len(),
+            modified: meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|t| (t.as_secs(), t.subsec_nanos())),
+            file_id: file_identity(file),
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+struct IndexDescriptor {
+    requested_format: String,
+    format: String,
+    custom: serde_json::Value,
+    header: Vec<String>,
+    header_at: Option<usize>,
+    start_pattern: Option<String>,
+    array: Option<(usize, bool)>,
+}
+
+/// Chunking affects work scheduling only, never the cache identity or parser
+/// semantics. Integration tests use tiny waves to exercise every boundary.
+pub(crate) struct IndexLimits {
+    pub chunk_bytes: usize,
+    pub chunk_lines: usize,
+    pub wave_chunks: usize,
+    pub json_records: usize,
+    pub json_bytes: usize,
+}
+impl Default for IndexLimits {
+    fn default() -> Self {
+        let workers = crate::resources::workers();
+        Self { chunk_bytes: INDEX_CHUNK, chunk_lines: INDEX_CHUNK_LINES, wave_chunks: workers * 2,
+            json_records: workers * 4 * 1024, json_bytes: INDEX_CHUNK * workers }
+    }
+}
+
+pub(crate) struct PreparedIndex {
+    pub(crate) limits: IndexLimits,
+    pub(crate) parsed_rows: std::sync::atomic::AtomicUsize,
+    pub part: FilePart,
+    descriptor: IndexDescriptor,
+    stamp: SourceStamp,
+}
+impl PreparedIndex {
+    pub(crate) fn key(&self) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(&(crate::index_cache::INDEX_DIR, crate::metadata_checkpoint::VERSION, &self.stamp, &self.part.identity, &self.descriptor, &self.part.calendar)).map_err(|e| e.to_string())?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+    pub(crate) fn initial_cursor(&self) -> usize { self.descriptor.array.map_or(0, |(start, _)| start + 1) }
+    pub(crate) fn multiline(&self) -> bool { self.descriptor.start_pattern.is_some() }
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        crate::operations::check()?;
+        let file = std::fs::File::open(&self.part.physical_path).map_err(|e| e.to_string())?;
+        if SourceStamp::read(&file, &self.part.physical_path)? != self.stamp {
+            return Err("A fonte foi alterada durante a indexação. Reabra o arquivo para usar uma versão consistente.".into());
+        }
+        validate_source(&self.part)
+    }
+}
+
+pub(crate) fn prepare_index(path: &str, format: &str, custom: Option<CustomParse>, saved_ts: Option<CompiledTsConfig>) -> Result<PreparedIndex, String> {
+    crate::operations::check()?;
+    let canonical_lease = crate::workspace::canonical_source_lease(std::path::Path::new(path))?;
+    let event_identity = crate::workspace::canonical_event_identity(std::path::Path::new(path))?;
+    let file = std::fs::File::open(path).map_err(|e| format!("Não foi possível abrir '{path}': {e}"))?;
+    let stamp = SourceStamp::read(&file, path)?;
+    if stamp.bytes == 0 { return Err("Arquivo vazio.".into()); }
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| format!("Falha ao mapear '{path}': {e}"))?;
+    let fmt = if format == "auto" { detect_format(&mmap).to_string() }
+        else if format == "custom" || format.starts_with("custom:") { "custom".to_string() }
+        else if format == "csv" { detect_delimited(&mmap).unwrap_or("csv").to_string() }
+        else { format.to_string() };
     let mut header: Vec<String> = Vec::new();
-    if let Some(delimiter) = delimiter_of(fmt) {
+    if let Some(delimiter) = delimiter_of(&fmt) {
         let body = mmap.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&mmap);
         if let Some(first) = body.split(|&b| b == b'\n').find(|line| !line.trim_ascii().is_empty()) {
             let first = String::from_utf8_lossy(first).trim().to_string();
-            header = split_delimited(&first, delimiter)
-                .iter()
-                .map(|s| s.trim().to_string())
-                .collect();
+            header = split_delimited(&first, delimiter).iter().map(|s| s.trim().to_string()).collect();
         }
     } else if fmt == "zeek" {
         for line in mmap.split(|&b| b == b'\n').take(40) {
             let l = String::from_utf8_lossy(line);
             if let Some(rest) = l.trim_end().strip_prefix("#fields") {
-                header = rest.split('\t').filter(|f| !f.is_empty()).map(|f| f.to_string()).collect();
-                break;
+                header = rest.split('\t').filter(|f| !f.is_empty()).map(|f| f.to_string()).collect(); break;
             }
         }
     } else if fmt == "w3c" {
         for line in mmap.split(|&b| b == b'\n').take(20) {
             let l = String::from_utf8_lossy(line);
-            let l = l.trim();
-            if let Some(rest) = l.to_lowercase().strip_prefix("#fields:") {
-                header = rest.split_whitespace().map(|s| s.to_string()).collect();
-                break;
+            if let Some(rest) = l.trim().to_lowercase().strip_prefix("#fields:") {
+                header = rest.split_whitespace().map(|s| s.to_string()).collect(); break;
             }
         }
     }
-
-    // Allocation hint only: byte progress avoids a complete pre-scan merely
-    // to count physical lines (which differ from logical multiline records).
-    let total_lines = (mmap.len() / 160).min(1 << 24);
-    let mut lines: Vec<LineMeta> = Vec::new();
-    // The header line of tabular formats (first line with content) is not an event.
-    let header_at = if delimiter_of(fmt).is_some() {
-        let mut offset = 0usize;
-        let mut found = None;
+    let header_at = if delimiter_of(&fmt).is_some() {
+        let mut offset = 0usize; let mut found = None;
         for line in mmap.split(|&b| b == b'\n') {
-            if !line.trim_ascii().is_empty() {
-                found = Some(offset);
-                break;
-            }
+            if !line.trim_ascii().is_empty() { found = Some(offset); break; }
             offset += line.len() + 1;
         }
         found
-    } else {
-        None
-    };
-    // Formatos multi-linha (stacktrace Java): linha que casa o padrão do
-    // formato inicia um evento; as demais estendem o evento anterior.
-    let start_re: Option<regex::Regex> = match fmt {
-        "log4j" | "wildfly" => detect_entry_start(&mmap),
-        _ => None,
-    };
-    let content_start = if mmap.starts_with(&[0xef, 0xbb, 0xbf]) {
-        3
-    } else {
-        0
-    };
+    } else { None };
+    let start_pattern = match fmt.as_str() { "log4j" | "wildfly" => detect_entry_start(&mmap).map(|re| re.as_str().to_string()), _ => None };
+    let content_start = if mmap.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
     let first_byte = (content_start..mmap.len()).find(|&i| !mmap[i].is_ascii_whitespace());
-    let array_start = first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'[');
-    // A single document wrapping the records (CloudTrail, Azure, exports).
-    let envelope_start = first_byte
-        .filter(|&i| fmt == "jsonl" && mmap[i] == b'{' && !looks_like_jsonl(&mmap[i..]))
-        .and_then(|_| json_envelope_array(&mmap));
-    if let Some(start) = array_start {
-        index_json_array(&mmap, start, &mut lines, custom.as_ref(), &header, progress, false)?;
-    } else if let Some(start) = envelope_start {
-        index_json_array(&mmap, start, &mut lines, custom.as_ref(), &header, progress, true)?;
-    } else {
-        lines = index_lines(
-            &mmap,
-            fmt,
-            custom.as_ref(),
-            &header,
-            header_at,
-            start_re.as_ref(),
-            progress,
-            total_lines,
-        )?;
-    }
-
-    // Descoberta de colunas: amostra das primeiras 2.000 linhas.
-    let mut columns: Vec<String> = STANDARD_COLUMNS.iter().map(|s| s.to_string()).collect();
-    let mut extra = std::collections::HashSet::new();
-    let mut sampled = Vec::with_capacity(lines.len().min(4_000));
-    for sample in 0..lines.len().min(4_000) {
-        let i = sample * lines.len() / lines.len().min(4_000);
-        let m = &lines[i];
-        let ev = parse_line(
-            &mmap[m.offset as usize..(m.offset as usize + m.len as usize)],
-            fmt,
-            custom.as_ref(),
-            &header,
-        );
-        for k in ev.fields.keys() {
-            extra.insert(k.clone());
-        }
-        sampled.push(ev);
-    }
-    let mut extra: Vec<String> = extra.into_iter().collect();
-    extra.sort();
-    columns.extend(extra);
-    // Canonical entities (@user, @src_ip…) observed in the sample.
-    for column in crate::entities::observed_columns(sampled.iter()) {
-        if !columns.contains(&column) {
-            columns.push(column);
-        }
-    }
-    drop(sampled);
-
-    // campos de origem sempre disponíveis como colunas
-    for extra_col in ["arquivo", "caminho"] {
-        if !columns.iter().any(|c| c == extra_col) {
-            columns.push(extra_col.to_string());
-        }
-    }
-
+    let array = first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'[').map(|start| (start, false))
+        .or_else(|| first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'{' && !looks_like_jsonl(&mmap[i..]))
+            .and_then(|_| json_envelope_array(&mmap)).map(|start| (start, true)));
+    let custom_descriptor = match &custom {
+        Some(CustomParse::Regex(re)) => serde_json::json!(["regex", re.as_str()]),
+        Some(CustomParse::Delimited { sep, fields }) => serde_json::json!(["delimited", sep, fields]),
+        None => serde_json::Value::Null,
+    };
     let identity = crate::index_cache::identity(path, &mmap);
-    Ok(FileIndex {
-        parts: vec![FilePart {
-            path: path.into(),
-            physical_path: path.into(),
-            physical_file_id: file_identity(&file),
-            file_name: file_name_of(path),
-            format: fmt.into(),
-            custom,
-            ts_config: saved_ts,
-            header,
-            mmap: std::sync::Arc::new(mmap),
-            base: 0,
-            identity,
-        }],
-        lines: std::sync::Arc::new(lines),
-        columns,
-        time_order: std::sync::OnceLock::new(),
-    })
+    let prepared = PreparedIndex {
+        limits: IndexLimits::default(), parsed_rows: std::sync::atomic::AtomicUsize::new(0),
+        descriptor: IndexDescriptor { requested_format: format.into(), format: fmt.clone(), custom: custom_descriptor, header: header.clone(), header_at, start_pattern, array },
+        stamp,
+        part: FilePart { path: path.into(), physical_path: path.into(), physical_file_id: file_identity(&file), calendar: ParserCalendar::current()?, canonical_lease, event_identity, metadata_identity: String::new(),
+            file_name: file_name_of(path), format: fmt, custom, ts_config: saved_ts, header, mmap: std::sync::Arc::new(mmap), base: 0, identity },
+    };
+    prepared.validate()?;
+    Ok(prepared)
+}
+
+pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metadata_checkpoint::Resume, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<FileIndex, String> {
+    use crate::metadata_checkpoint::{report, Progress};
+    prepared.validate()?;
+    let bytes: &[u8] = &prepared.part.mmap;
+    let safe_cursor = resume.cursor == bytes.len() || match prepared.descriptor.array {
+        Some((start, _)) => resume.cursor == start + 1 || resume.cursor > start + 1 && bytes.get(resume.cursor - 1) == Some(&b'}'),
+        None => resume.cursor == 0 || bytes.get(resume.cursor - 1) == Some(&b'\n'),
+    };
+    if !safe_cursor { return Err("Limite de retomada dos metadados inválido.".into()); }
+    if !resume.scan_complete {
+        if resume.lines.is_empty() { resume.lines.reserve((bytes.len() / 160).min(1 << 24)); }
+        match prepared.descriptor.array {
+            Some((start, envelope)) => index_json_array(&prepared, start, envelope, resume.cursor, &mut resume.lines, sink, reporter)?,
+            None => index_lines(&prepared, &mut resume.lines, resume.cursor, sink, reporter)?,
+        }
+        prepared.validate()?;
+        sink(&resume.lines, bytes.len(), true, None)?;
+    }
+    let columns = match resume.columns {
+        Some(columns) => columns,
+        None => {
+            let mut columns: Vec<String> = STANDARD_COLUMNS.iter().map(|s| s.to_string()).collect();
+            let mut extra = std::collections::HashSet::new();
+            let count = resume.lines.len().min(4_000);
+            let mut sampled = Vec::with_capacity(count);
+            for sample in 0..count {
+                if sample % 32 == 0 {
+                    crate::operations::check()?;
+                    report(reporter, Progress::new("metadata-columns", "Descobrindo colunas", sample, count, "amostras"));
+                }
+                let i = sample * resume.lines.len() / count;
+                let m = &resume.lines[i];
+                let ev = parse_part_line(&prepared.part, &bytes[m.offset as usize..m.offset as usize + m.len as usize]);
+                extra.extend(ev.fields.keys().cloned()); sampled.push(ev);
+            }
+            let mut extra: Vec<String> = extra.into_iter().collect(); extra.sort(); columns.extend(extra);
+            for column in crate::entities::observed_columns(sampled.iter()) {
+                if !columns.contains(&column) { columns.push(column); }
+            }
+            for extra in ["arquivo", "caminho"] {
+                if !columns.iter().any(|c| c == extra) { columns.push(extra.into()); }
+            }
+            prepared.validate()?;
+            sink(&resume.lines, bytes.len(), true, Some(&columns))?;
+            report(reporter, Progress::new("metadata-columns", "Colunas identificadas", count, count, "amostras"));
+            columns
+        }
+    };
+    prepared.validate()?;
+    crate::operations::check()?;
+    let mut part = prepared.part.clone();
+    part.metadata_identity = prepared.key()?;
+    Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(resume.lines), columns, time_order: std::sync::OnceLock::new() })
+}
+
+/// Uncached entry point, also used as the semantic oracle in recovery tests.
+pub fn index_file(path: &str, format: &str, custom: Option<CustomParse>, saved_ts: Option<CompiledTsConfig>, progress: Option<&dyn Fn(usize, usize)>) -> Result<FileIndex, String> {
+    let prepared = prepare_index(path, format, custom, saved_ts)?;
+    let resume = crate::metadata_checkpoint::Resume { cursor: prepared.initial_cursor(), ..Default::default() };
+    let report = |p: &crate::metadata_checkpoint::Progress| {
+        if p.phase_id == "metadata-scan" { if let Some(cb) = progress { cb(p.completed, p.total); } }
+    };
+    index_prepared(&prepared, resume, &mut |_, _, _, _| Ok(()), Some(&report))
 }
 
 // ------------------------------------------------------- Windows Event Log
@@ -3271,7 +3354,7 @@ mod tests {
             &codes,
             &codes,
             &[],
-        );
+        ).unwrap();
         eprintln!(
             "QUERY contains(message=timeout): {} resultados em {:?}",
             r.total,
@@ -3288,7 +3371,7 @@ mod tests {
             &codes,
             &codes,
             &[],
-        );
+        ).unwrap();
         eprintln!(
             "QUERY regex(_all): {} resultados em {:?}",
             r2.total,
@@ -3380,5 +3463,60 @@ mod ts_tests {
         let r = super::parse_with_format("2026-06-24 00:00:00,001", "%Y-%m-%d %H:%M:%S%.f", None);
         eprintln!("resultado: {:?}", r);
         assert!(r.is_some(), "falhou ao parsear com vírgula");
+    }
+}
+
+#[cfg(test)]
+mod metadata_calendar_tests {
+    use super::*;
+
+    fn configured(format: &str, complement: Option<&str>) -> CompiledTsConfig {
+        TsConfig { sources: vec!["linha".into()], format: format.into(), complement: complement.map(str::to_string), ..Default::default() }.compile().unwrap()
+    }
+    fn old_signature(cc: &CompiledTsConfig) -> String {
+        let rules: Vec<_> = cc.rules.iter().map(|(re, template)| (re.as_ref().map(|re| re.as_str()), template.as_ref())).collect();
+        format!("{:?}|{}|{:?}|{:?}|{}|{:?}", cc.sources, cc.format, cc.complement, cc.timezone_offset_minutes, cc.clock_adjustment_ms, rules)
+    }
+
+    #[test]
+    fn fallback_date_is_pinned_and_part_of_only_semantically_relevant_signatures() {
+        let day = chrono::NaiveDate::from_ymd_opt(2030, 1, 2).unwrap();
+        let next = day.succ_opt().unwrap();
+        for format in ["%H:%M:%S", "%H:%M:%S %%Y", "%Y-%m-%d %H:%M:%S"] {
+            let mut cc = configured(format, None); cc.reference_date = day;
+            let first = cc.signature(); cc.reference_date = next;
+            assert_ne!(first, cc.signature(), "{format} can use an omitted/invalid date");
+        }
+        let mut cc = configured("%H:%M:%S", None); cc.reference_date = day;
+        assert_eq!(ts_from_joined("12:30:00", &cc), Some(naive_to_ms(day.and_hms_opt(12, 30, 0).unwrap())));
+        cc.reference_date = next;
+        assert_eq!(ts_from_joined("12:30:00", &cc), Some(naive_to_ms(next.and_hms_opt(12, 30, 0).unwrap())));
+        for (format, complement) in [("epoch_ms", None), ("epoch_s", None), ("%Y-%m-%d", None), ("%H:%M:%S", Some("2020-02-03"))] {
+            let mut cc = configured(format, complement); cc.reference_date = day;
+            let first = cc.signature(); assert_eq!(first, old_signature(&cc));
+            cc.reference_date = next; assert_eq!(first, cc.signature());
+        }
+    }
+
+    #[test]
+    fn explicit_year_parser_covers_syslog_and_firewall_without_clock_reads() {
+        for (format, line) in [
+            ("syslog3164", "Sep 30 12:30:00 host app: hello"),
+            ("firewall", "Sep 30 12:30:00 host kernel: SRC=10.0.0.1 DST=10.0.0.2"),
+        ] {
+            let event = parse_line_at(line.as_bytes(), format, None, &[], 2032);
+            let expected = chrono::NaiveDate::from_ymd_opt(2032, 9, 30).unwrap().and_hms_opt(12, 30, 0).unwrap();
+            assert_eq!(event.timestamp, Some(naive_to_ms(expected)), "{format}");
+        }
+    }
+
+    #[test]
+    fn overflowing_multiline_length_is_rejected_instead_of_wrapped() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("source.log");
+        std::fs::write(&path, "first\n").unwrap();
+        let prepared = prepare_index(path.to_str().unwrap(), "text", None, None).unwrap();
+        let mut lines = vec![LineMeta { offset: 0, len: 1, ..Default::default() }];
+        let re = regex::Regex::new("^START").unwrap();
+        assert!(push_meta(&mut lines, b"continuation", u64::from(u32::MAX), &prepared.part, Some(&re)).is_err());
     }
 }

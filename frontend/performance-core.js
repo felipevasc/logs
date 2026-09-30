@@ -27,6 +27,13 @@ window.PerformanceTools = (() => {
     const eta = total > completed && rate > 0 && samples.length >= 3 && seconds >= 2 ? (total - completed) / rate : null;
     return { phase, completed, total, samples, rate, eta, percent: payload.state === "ready" ? 100 : total > completed ? completed / total * 100 : null, updated: now };
   }
+  function phaseSeconds(payload, estimate, now = performance.now()) {
+    const elapsed = payload.phaseElapsedMs;
+    if (!Number.isFinite(elapsed) || elapsed < 0) return null;
+    // Extend the backend's measured phase duration by time since receipt,
+    // without comparing clocks from different processes or inventing work.
+    return (elapsed + (Number.isFinite(estimate?.updated) ? Math.max(0, now - estimate.updated) : 0)) / 1000;
+  }
   const duration = seconds => { const s = Math.max(0, Math.round(seconds)); return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}min ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor(s / 60) % 60}min`; };
-  return { queue, estimate, duration };
+  return { queue, estimate, phaseSeconds, duration };
 })();

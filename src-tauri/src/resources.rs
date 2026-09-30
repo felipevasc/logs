@@ -7,6 +7,7 @@ const MIB: u64 = 1 << 20;
 
 #[derive(Clone, Copy, Debug)]
 struct Budget {
+    effective_bytes: u64,
     parser_threads: usize,
     query_threads: usize,
     text_threads: usize,
@@ -38,6 +39,7 @@ impl Budget {
         // Byte-aware batches and shallow queues avoid a row-count-only budget.
         let batch_bytes = (bytes / 128).clamp(256 << 10, 4 * MIB) as usize;
         Self {
+            effective_bytes: bytes,
             parser_threads,
             query_threads,
             text_threads,
@@ -82,6 +84,75 @@ pub(crate) fn batch_bytes() -> usize {
 }
 pub(crate) fn queue_batches() -> usize {
     budget().queue_batches
+}
+
+/// These are accounted payload limits, not claims about total allocator usage.
+/// A normal 50M-row BIGINT selection (400 MB) remains admissible, but is too
+/// large to retain in the interactive cache on typical desktop budgets.
+pub(crate) fn selection_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(limit) = TEST_SELECTION_LIMIT.with(std::cell::Cell::get) { return limit; }
+    configured_bytes("LOGINSIGHT_SELECTION_LIMIT_MB", (total_memory() / 2).clamp(1 << 30, 8 << 30))
+}
+#[cfg(test)]
+thread_local! { static TEST_SELECTION_LIMIT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn with_selection_limit<T>(limit: u64, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset { fn drop(&mut self) { TEST_SELECTION_LIMIT.with(|c| c.set(self.0)); } }
+    let _reset = Reset(TEST_SELECTION_LIMIT.with(|c| c.replace(Some(limit))));
+    f()
+}
+pub(crate) fn selection_cache_bytes() -> u64 {
+    // One 50M-ID hot selection fits on the measured 10 GiB configuration.
+    // The weighted LRU evicts older broad filters instead of retaining eight.
+    configured_bytes("LOGINSIGHT_SELECTION_CACHE_MB", (budget().duckdb_bytes / 2).min(512 * MIB))
+}
+pub(crate) fn collected_ids_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = TEST_COLLECTED_LIMIT.with(std::cell::Cell::get) { return limit; }
+    configured_bytes("LOGINSIGHT_COLLECTED_IDS_MB", (budget().effective_bytes / 32).min(128 * MIB)) as usize
+}
+#[cfg(test)]
+thread_local! { static TEST_COLLECTED_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn with_collected_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<usize>);
+    impl Drop for Reset { fn drop(&mut self) { TEST_COLLECTED_LIMIT.with(|c| c.set(self.0)); } }
+    let _reset = Reset(TEST_COLLECTED_LIMIT.with(|c| c.replace(Some(limit))));
+    f()
+}
+pub(crate) fn analytics_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = TEST_ANALYTICS_LIMIT.with(std::cell::Cell::get) { return limit; }
+    configured_bytes("LOGINSIGHT_ANALYTICS_LIMIT_MB", (budget().effective_bytes / 32).min(128 * MIB)) as usize
+}
+#[cfg(test)]
+thread_local! { static TEST_ANALYTICS_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn with_analytics_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<usize>);
+    impl Drop for Reset { fn drop(&mut self) { TEST_ANALYTICS_LIMIT.with(|c| c.set(self.0)); } }
+    let _reset = Reset(TEST_ANALYTICS_LIMIT.with(|c| c.replace(Some(limit))));
+    f()
+}
+fn configured_bytes(name: &str, fallback: u64) -> u64 {
+    std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok())
+        .and_then(|n| n.checked_mul(MIB)).filter(|&n| n > 0).unwrap_or(fallback)
+}
+
+/// A limit on DuckDB spill, separate from source/checkpoint files and memory.
+/// Two foreground sessions and one builder may coexist. This is a ceiling,
+/// not a disk reservation; another process can still exhaust available space.
+pub(crate) fn spill_bytes(build: bool, directory: &std::path::Path) -> Result<u64, String> {
+    let available = fs2::available_space(directory).map_err(|e| e.to_string())?;
+    let total = configured_bytes("LOGINSIGHT_TEMP_LIMIT_MB", (available / 2).min(8 << 30)).max(MIB);
+    let query = configured_bytes("LOGINSIGHT_QUERY_SPILL_MB", total / 3);
+    let builder = configured_bytes("LOGINSIGHT_BUILD_SPILL_MB", total / 3);
+    if query.saturating_mul(2).saturating_add(builder) > total {
+        return Err("Orçamento temporário inválido: duas sessões de consulta e a preparação excedem LOGINSIGHT_TEMP_LIMIT_MB.".into());
+    }
+    Ok(if build { builder } else { query })
 }
 
 /// Effective memory in bytes, respecting a Linux container memory ceiling.
@@ -218,6 +289,17 @@ mod tests {
         let many_cores = Budget::for_machine(64 << 30, 64, Some(128));
         assert!(many_cores.text_bytes >= many_cores.text_threads as u64 * 15 * MIB);
         assert!(Budget::for_machine(4 << 30, 64, Some(u64::MAX)).duckdb_bytes <= 2 << 30);
+    }
+    #[test]
+    fn explicit_low_profile_reserves_transient_analytics_and_id_buffers() {
+        let b = Budget::for_machine(10 << 30, 9, Some(128));
+        let transient = b.effective_bytes / 32;
+        assert_eq!(transient, 4 * MIB);
+        // Three SQL instances, text writer, analytical values, collected IDs,
+        // retained line IDs, and two queued batches with parser copies.
+        assert!(b.duckdb_bytes * 3 + b.text_bytes + transient * 3 + b.batch_bytes as u64 * 4 <= b.effective_bytes);
+        let measured = Budget::for_machine(10 << 30, 9, None);
+        assert!((measured.duckdb_bytes / 2).min(512 * MIB) >= 50_000_000 * 8);
     }
     #[test]
     fn container_limits_reject_unlimited_and_invalid_values() {

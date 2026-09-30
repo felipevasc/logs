@@ -1,12 +1,14 @@
 //! Versioned on-disk line indexes. Raw files are never copied into the cache.
 use crate::model::LineMeta;
-use crate::sources::{self, CompiledTsConfig, CustomParse, FileIndex, FilePart};
+use crate::sources::{self, CompiledTsConfig, CustomParse, FileIndex};
 use sha2::{Digest, Sha256};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 /// Parser semantics are part of the cache version; older directories are removed.
 pub const INDEX_DIR: &str = "indexes-v6";
+/// Storage layout only; changing it must not invalidate identical engine stores.
+pub(crate) const METADATA_DIR: &str = "metadata-v1";
 
 /// Removes caches from previous parser versions and indexes unused for 30 days.
 pub fn prune() {
@@ -33,8 +35,7 @@ pub fn prune() {
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .is_some_and(|t| t < cutoff);
-            let pending = entry.file_name().to_string_lossy().contains("pending");
-            if stale || pending {
+            if stale {
                 let path = entry.path();
                 let _ = if path.is_dir() {
                     std::fs::remove_dir_all(&path)
@@ -44,18 +45,14 @@ pub fn prune() {
             }
         }
     }
-    let Ok(entries) = std::fs::read_dir(base.join(INDEX_DIR)) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let stale = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.accessed().or_else(|_| m.modified()).ok())
-            .is_some_and(|t| t < cutoff);
-        let pending = entry.file_name().to_string_lossy().contains(".pending");
-        if stale || pending {
-            let _ = std::fs::remove_file(entry.path());
+    crate::metadata_checkpoint::prune(&base.join(INDEX_DIR).join(METADATA_DIR), cutoff);
+    crate::workspace::prune_canonical_sources();
+    // Timestamp overlays are immutable; only aged temporaries are orphaned.
+    if let Ok(entries) = std::fs::read_dir(base.join(INDEX_DIR)) {
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("timestamps-") { continue; }
+            let stale = entry.metadata().ok().and_then(|m| m.accessed().or_else(|_| m.modified()).ok()).is_some_and(|t| t < cutoff);
+            if stale { let _ = std::fs::remove_file(entry.path()); }
         }
     }
 }
@@ -80,153 +77,67 @@ pub fn identity(path: &str, bytes: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Header {
-    format: String,
-    columns: Vec<String>,
-    header: Vec<String>,
-    count: usize,
+/// Compatibility adapter for callers that only need scanning byte progress.
+pub fn open(path: &str, format: &str, custom: Option<CustomParse>, ts: Option<CompiledTsConfig>, progress: Option<&dyn Fn(usize, usize)>) -> Result<FileIndex, String> {
+    open_with_progress(path, format, custom, ts, Some(&|p| {
+        if p.phase_id == "metadata-scan" { if let Some(cb) = progress { cb(p.completed, p.total); } }
+    }))
 }
 
-pub fn open(
-    path: &str,
-    format: &str,
-    custom: Option<CustomParse>,
-    ts: Option<CompiledTsConfig>,
-    progress: Option<&dyn Fn(usize, usize)>,
-) -> Result<FileIndex, String> {
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
-        return Err("Arquivo vazio.".into());
-    }
-    let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| e.to_string())?;
-    let id = identity(path, &mmap);
-    let mut hash = Sha256::new();
-    hash.update(id.as_bytes());
-    hash.update(format!("{:?}", sources::file_identity(&file)));
-    hash.update(format.as_bytes());
-    if let Some(c) = &custom {
-        match c {
-            CustomParse::Regex(r) => hash.update(r.as_str()),
-            CustomParse::Delimited { sep, fields } => hash.update(format!("{sep}{fields:?}")),
+pub(crate) fn open_with_progress(path: &str, format: &str, custom: Option<CustomParse>, ts: Option<CompiledTsConfig>, progress: crate::metadata_checkpoint::Reporter<'_>) -> Result<FileIndex, String> {
+    let prepared = sources::prepare_index(path, format, custom, ts)?;
+    open_prepared_at(&prepared, &crate::config_dir().join(INDEX_DIR).join(METADATA_DIR), progress)
+}
+
+pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::path::Path, progress: crate::metadata_checkpoint::Reporter<'_>) -> Result<FileIndex, String> {
+    use crate::metadata_checkpoint::{report, Journal, OpenError, Progress, Resume};
+    let key = prepared.key()?;
+    let resumed = std::cell::Cell::new(0usize);
+    let committed = std::cell::Cell::new(0usize);
+    let parsed = std::cell::Cell::new(0usize);
+    let forward = |p: &Progress| {
+        resumed.set(resumed.get().max(p.resumed_rows));
+        committed.set(committed.get().max(p.checkpoint_rows));
+        parsed.set(parsed.get().max(p.parsed_rows));
+        let mut p = p.clone(); p.resumed_rows = resumed.get(); p.checkpoint_rows = committed.get(); p.parsed_rows = parsed.get();
+        report(progress, p);
+    };
+    let mut warning = None;
+    let (mut journal, resume) = match Journal::open(dir, &key, prepared.part.mmap.len(), prepared.initial_cursor(), prepared.multiline(), Some(&forward)) {
+        Ok((journal, resume)) => (Some(journal), resume),
+        Err(error @ (OpenError::Cancelled(_) | OpenError::Busy)) => return Err(error.to_string()),
+        Err(OpenError::Unavailable(error)) => {
+            warning = Some(error);
+            (None, Resume { cursor: prepared.initial_cursor(), ..Resume::default() })
         }
-    }
-    // Local timezone affects timestamps without a zone.
-    hash.update(chrono::Local::now().offset().to_string());
-    // Parser semantics are part of the cache version (nested JSON/epoch/arrays).
-    let dir = crate::config_dir().join(INDEX_DIR);
-    let cache = dir.join(format!("{:x}.idx", hash.finalize()));
-    if let Some((header, lines)) = read(&cache, mmap.len()) {
-        if let Some(cb) = progress {
-            cb(mmap.len(), mmap.len());
+    };
+    let mut sink = |lines: &[LineMeta], cursor, scan_complete, columns: Option<&[String]>| -> Result<(), String> {
+        prepared.validate()?;
+        if let Some(active) = journal.as_mut() {
+            if let Err(error) = active.checkpoint(lines, cursor, scan_complete, columns, Some(&forward), &|| prepared.validate()) {
+                crate::operations::check()?;
+                // A changed source is fatal even if the persistence operation
+                // failed at the same time. Never continue a mixed generation.
+                prepared.validate()?;
+                warning = Some(error.clone());
+                journal = None;
+                let mut p = Progress::new("metadata-unavailable", "Metadados sem checkpoint persistente", 0, 0, "");
+                p.phase = format!("Metadados sem checkpoint persistente: {error}");
+                forward(&p);
+            }
         }
-        return Ok(FileIndex {
-            parts: vec![FilePart {
-                path: path.into(),
-                physical_path: path.into(),
-                physical_file_id: sources::file_identity(&file),
-                file_name: PathBuf::from(path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                format: header.format,
-                custom,
-                ts_config: ts,
-                header: header.header,
-                mmap: std::sync::Arc::new(mmap),
-                base: 0,
-                identity: id,
-            }],
-            lines: std::sync::Arc::new(lines),
-            columns: header.columns,
-            time_order: std::sync::OnceLock::new(),
-        });
-    }
-    drop(mmap);
-    let idx = sources::index_file(path, format, custom, ts, progress)?;
+        Ok(())
+    };
+    let idx = sources::index_prepared(prepared, resume, &mut sink, Some(&forward))?;
+    drop(sink);
     crate::operations::check()?;
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let _ = write(&cache, &idx);
+    if let Some(error) = warning {
+        eprintln!("[índice] checkpoint de metadados indisponível: {error}");
+        let mut p = Progress::new("metadata-unavailable", "Metadados concluídos sem checkpoint persistente", 0, 0, "");
+        p.phase = format!("Metadados concluídos sem checkpoint persistente: {error}");
+        forward(&p);
     }
     Ok(idx)
-}
-
-fn read(path: &PathBuf, bytes: usize) -> Option<(Header, Vec<LineMeta>)> {
-    let mut file = BufReader::new(std::fs::File::open(path).ok()?);
-    let mut prefix = [0u8; 12];
-    file.read_exact(&mut prefix).ok()?;
-    if &prefix[..8] != b"LIDX0003" {
-        return None;
-    }
-    let len = u32::from_le_bytes(prefix[8..12].try_into().ok()?) as usize;
-    if len > 4_000_000 {
-        return None;
-    }
-    let mut data = vec![0; len];
-    file.read_exact(&mut data).ok()?;
-    let head: Header = serde_json::from_slice(&data).ok()?;
-    if head.count > bytes || head.count > 500_000_000 {
-        return None;
-    }
-    let expected = 12u64 + len as u64 + head.count as u64 * 27;
-    if file.get_ref().metadata().ok()?.len() != expected {
-        return None;
-    }
-    let mut lines = Vec::with_capacity(head.count.min(1_000_000));
-    for i in 0..head.count {
-        if i % 4096 == 0 && crate::operations::cancelled() {
-            return None;
-        }
-        let mut b = [0u8; 27];
-        file.read_exact(&mut b).ok()?;
-        let m = LineMeta {
-            offset: u64::from_le_bytes(b[0..8].try_into().ok()?),
-            len: u32::from_le_bytes(b[8..12].try_into().ok()?),
-            ts: i64::from_le_bytes(b[12..20].try_into().ok()?),
-            level: b[20],
-            code_off: u32::from_le_bytes(b[21..25].try_into().ok()?),
-            code_len: u16::from_le_bytes(b[25..27].try_into().ok()?),
-        };
-        if m.offset.checked_add(m.len as u64)? > bytes as u64 {
-            return None;
-        }
-        lines.push(m);
-    }
-    Some((head, lines))
-}
-
-fn write(path: &PathBuf, idx: &FileIndex) -> std::io::Result<()> {
-    let temp = path.with_extension(format!("{}.pending", uuid::Uuid::new_v4()));
-    let mut out = BufWriter::new(std::fs::File::create(&temp)?);
-    let data = serde_json::to_vec(&Header {
-        format: idx.format.clone(),
-        columns: idx.columns.clone(),
-        header: idx.header.clone(),
-        count: idx.lines.len(),
-    })?;
-    out.write_all(b"LIDX0003")?;
-    out.write_all(&(data.len() as u32).to_le_bytes())?;
-    out.write_all(&data)?;
-    for (i, m) in idx.lines.iter().enumerate() {
-        if i % 4096 == 0 && crate::operations::cancelled() {
-            drop(out);
-            let _ = std::fs::remove_file(&temp);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "Cancelado",
-            ));
-        }
-        out.write_all(&m.offset.to_le_bytes())?;
-        out.write_all(&m.len.to_le_bytes())?;
-        out.write_all(&m.ts.to_le_bytes())?;
-        out.write_all(&[m.level])?;
-        out.write_all(&m.code_off.to_le_bytes())?;
-        out.write_all(&m.code_len.to_le_bytes())?;
-    }
-    out.flush()?;
-    drop(out);
-    std::fs::rename(temp, path)
 }
 
 /// Corrected timestamps are cached only after the display path/file name have
@@ -245,6 +156,13 @@ fn timestamp_key(idx: &FileIndex) -> Option<String> {
         idx.lines.len(),
         part.physical_file_id
     ));
+    hash.update(b"|raw-metadata-identity:");
+    hash.update(part.metadata_identity.as_bytes());
+    hash.update(b"|timezone-configuration:");
+    hash.update(part.calendar.timezone.as_bytes());
+    if matches!(part.format.as_str(), "syslog3164" | "firewall") {
+        hash.update(format!("|inferred-year:{}", part.calendar.year));
+    }
     Some(format!("{:x}", hash.finalize()))
 }
 
@@ -525,4 +443,69 @@ mod timestamp_overlay_tests {
         assert_eq!(published[0].ts, 0);
         assert_eq!(published[1].ts, 0);
     }
+}
+
+#[cfg(test)]
+mod metadata_timezone_tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_overlay_key_includes_timezone_rules_not_only_current_offset() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("clock.log");
+        std::fs::write(&path, "12:30:00\n").unwrap();
+        let config = sources::TsConfig { sources: vec!["linha".into()], format: "%H:%M:%S".into(), ..Default::default() }.compile().unwrap();
+        let mut idx = sources::index_file(path.to_str().unwrap(), "text", None, Some(config), None).unwrap();
+        let first = timestamp_key(&idx).unwrap();
+        idx.parts[0].calendar.timezone = "different-rule-set-at-the-same-current-offset".into();
+        assert_ne!(first, timestamp_key(&idx).unwrap());
+        assert!(sources::validate_source(&idx.parts[0]).is_err());
+        let original = idx.lines[0].ts;
+        assert!(sources::retimestamp_index(&mut idx, None).is_err());
+        assert_eq!(idx.lines[0].ts, original, "invalid context must not publish timestamps");
+    }
+
+    #[test]
+    fn nonmatching_timestamp_rule_cannot_restore_the_previous_inferred_year() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("syslog.log");
+        std::fs::write(&path, "Sep 30 12:30:00 host app: message\n").unwrap();
+        let config = sources::TsConfig { sources: vec!["missing".into()], format: "epoch_ms".into(), regex: Some("never-matches".into()), ..Default::default() }.compile().unwrap();
+        let make = |year| {
+            let mut prepared = sources::prepare_index(path.to_str().unwrap(), "syslog3164", None, Some(config.clone())).unwrap();
+            prepared.part.calendar.year = year;
+            let seed = crate::metadata_checkpoint::Resume { cursor: prepared.initial_cursor(), ..Default::default() };
+            sources::index_prepared(&prepared, seed, &mut |_, _, _, _| Ok(()), None).unwrap()
+        };
+        let mut first = make(2031); let cache = dir.path().join("timestamps.bin");
+        assert!(!timestamps_at(&mut first, &cache, None).unwrap());
+        let mut next = make(2032); assert_ne!(timestamp_key(&first), timestamp_key(&next));
+        assert!(!timestamps_at(&mut next, &cache, None).unwrap());
+        assert_ne!(first.lines[0].ts, next.lines[0].ts);
+        let codes = crate::model::CodesConfig::default();
+        assert_eq!(Some(next.lines[0].ts), sources::event_at(&next, 0, &codes, &codes, &[]).timestamp);
+        let mut warm = make(2032); assert!(timestamps_at(&mut warm, &cache, None).unwrap());
+        assert_eq!(next.lines[0].ts, warm.lines[0].ts);
+    }
+
+
+    #[test]
+    fn overlay_rejects_a_different_base_parser_with_the_same_row_count() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("parser.log");
+        // Logfmt requires at least three key=value pairs; a two-pair fixture falls back to text.
+        std::fs::write(&path, "ts=2026-09-30T12:00:00Z level=info msg=hello\n").unwrap();
+        let config = sources::TsConfig { sources: vec!["missing".into()], format: "epoch_ms".into(), regex: Some("never-matches".into()), ..Default::default() }.compile().unwrap();
+        let mut logfmt = sources::index_file(path.to_str().unwrap(), "logfmt", None, Some(config.clone()), None).unwrap();
+        let cache = dir.path().join("timestamps.bin"); assert!(!timestamps_at(&mut logfmt, &cache, None).unwrap());
+        let mut text = sources::index_file(path.to_str().unwrap(), "text", None, Some(config.clone()), None).unwrap();
+        assert_eq!(text.lines.len(), logfmt.lines.len()); assert_ne!(timestamp_key(&logfmt), timestamp_key(&text));
+        assert!(!timestamps_at(&mut text, &cache, None).unwrap()); assert_eq!(text.lines[0].ts, 0); assert_ne!(logfmt.lines[0].ts, 0);
+        let with_time = sources::CustomParse::Regex(regex::Regex::new(r"ts=(?P<timestamp>\S+) level=\S+ msg=(?P<message>.*)").unwrap());
+        let without_time = sources::CustomParse::Regex(regex::Regex::new(r"(?P<message>.*)").unwrap());
+        let mut first = sources::index_file(path.to_str().unwrap(), "custom", Some(with_time), Some(config.clone()), None).unwrap();
+        assert!(!timestamps_at(&mut first, &cache, None).unwrap());
+        assert_ne!(first.lines[0].ts, 0, "the timestamp-bearing custom parser must exercise overlay fallback");
+        let mut second = sources::index_file(path.to_str().unwrap(), "custom", Some(without_time), Some(config), None).unwrap();
+        assert_ne!(timestamp_key(&first), timestamp_key(&second));
+        assert!(!timestamps_at(&mut second, &cache, None).unwrap()); assert_eq!(second.lines[0].ts, 0);
+    }
+
 }

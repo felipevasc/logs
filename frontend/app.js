@@ -266,6 +266,9 @@ window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
   const elapsed = payload.elapsedMs != null ? payload.elapsedMs / 1000 : task ? (performance.now() - task.started) / 1000 : null;
   const timing = [];
   if (elapsed != null) timing.push(`${window.PerformanceTools.duration(elapsed)} decorridos`);
+  const phaseSeconds = window.PerformanceTools.phaseSeconds(payload, estimate);
+  if (phaseSeconds != null) timing.push(`${window.PerformanceTools.duration(phaseSeconds)} nesta etapa`);
+  if (payload.unit === "candidatos" && Number.isFinite(payload.selected)) timing.push(`${fmtNum(payload.selected)} selecionados`);
   if (estimate.rate > 0) timing.push(`${fmtNum(Math.round(estimate.rate))} ${payload.unit || "itens"}/s`);
   if (estimate.eta != null) timing.push(`≈ ${window.PerformanceTools.duration(estimate.eta)} nesta etapa`);
   if (payload.resumedRows > 0) timing.push(`${fmtNum(payload.resumedRows)} registros retomados`);

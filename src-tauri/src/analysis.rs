@@ -1,6 +1,6 @@
 //! Motor analítico: perfil de campos, séries para gráficos e pivô OLAP.
 use crate::model::Event;
-use crate::query::AggSpec;
+use crate::query::{AggSpec, AnalyticsBudget};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -299,14 +299,15 @@ impl MetricAcc {
         ev: &Event,
         field: Option<&str>,
         expected: Option<UnitKind>,
-    ) -> bool {
+        budget: &mut AnalyticsBudget,
+    ) -> Result<bool, String> {
         match self.metric.as_str() {
             "count" => self.n += 1,
             "distinct" => {
                 if let Some(f) = field {
                     if let Some(v) = ev.col_str(f) {
                         if !v.is_empty() {
-                            self.distinct.insert(v);
+                            budget.charge(self.distinct.try_insert(v)?)?;
                             self.n += 1;
                         }
                     }
@@ -320,7 +321,7 @@ impl MetricAcc {
                         .filter(|(n, _)| n.is_finite())
                     {
                         if expected.is_some_and(|e| e != unit) {
-                            return true;
+                            return Ok(true);
                         }
                         self.sum += n;
                         self.n += 1;
@@ -330,7 +331,7 @@ impl MetricAcc {
                 }
             }
         }
-        false
+        Ok(false)
     }
     fn value(&self) -> f64 {
         match self.metric.as_str() {
@@ -351,11 +352,16 @@ impl MetricAcc {
     }
 }
 
-fn dominant_unit(events: impl Iterator<Item = Event>, field: &str, sample: usize) -> UnitKind {
+fn dominant_unit(
+    events: impl Iterator<Item = Event>,
+    field: &str,
+    sample: usize,
+) -> Result<UnitKind, String> {
     let mut votes = [0usize; 5];
     let mut valid = 0;
     for ev in events {
-        if valid >= sample || crate::operations::cancelled() {
+        crate::operations::check()?;
+        if valid >= sample {
             break;
         }
         if let Some((_, unit)) = ev
@@ -367,7 +373,8 @@ fn dominant_unit(events: impl Iterator<Item = Event>, field: &str, sample: usize
             valid += 1;
         }
     }
-    dominant_of(votes)
+    crate::operations::check()?;
+    Ok(dominant_of(votes))
 }
 
 /// Most frequent unit among sampled values (ties favor the lower kind).
@@ -395,34 +402,56 @@ pub(crate) fn unit_name(u: UnitKind) -> String {
     .to_string()
 }
 
-pub fn compute_series(events: &[Event], spec: &SeriesSpec) -> SeriesResult {
+pub fn compute_series(events: &[Event], spec: &SeriesSpec) -> Result<SeriesResult, String> {
     compute_series_stream(|| events.iter().cloned(), spec)
 }
 
-pub fn compute_series_stream<F, I>(events: F, spec: &SeriesSpec) -> SeriesResult
+pub fn compute_series_stream<F, I>(events: F, spec: &SeriesSpec) -> Result<SeriesResult, String>
 where
     F: Fn() -> I,
     I: Iterator<Item = Event>,
 {
+    let result = compute_series_budgeted(events, spec, &mut AnalyticsBudget::new())?;
+    crate::operations::check()?;
+    Ok(result)
+}
+
+/// One budget covers every pass and all accumulators, including disk-backed
+/// keys and the final response. Spilling does not reset the payload allowance.
+fn compute_series_budgeted<F, I>(
+    events: F,
+    spec: &SeriesSpec,
+    budget: &mut AnalyticsBudget,
+) -> Result<SeriesResult, String>
+where
+    F: Fn() -> I,
+    I: Iterator<Item = Event>,
+{
+    crate::operations::check()?;
     let limit = spec.limit.unwrap_or(10).min(500);
     let field = spec.field.as_deref();
     if spec.chart == "terms" && spec.metric == "count" {
         let key = field.unwrap_or("level");
         let mut counts = crate::distinct::Terms::default();
         for ev in events() {
-            if crate::operations::cancelled() {
-                break;
-            }
-            counts.insert(
-                serde_json::to_string(&ev.col_str(key).filter(|s| !s.trim().is_empty())).unwrap(),
-            );
+            crate::operations::check()?;
+            let value = serde_json::to_string(&ev.col_str(key).filter(|s| !s.trim().is_empty()))
+                .map_err(|e| e.to_string())?;
+            budget.charge(counts.try_insert(value)?)?;
         }
+        crate::operations::check()?;
         let top: Vec<(Option<String>, usize)> = counts
-            .top(limit)
+            .try_top(limit)?
             .into_iter()
-            .map(|(key, count)| (serde_json::from_str(&key).unwrap(), count))
-            .collect();
-        return SeriesResult {
+            .map(|(key, count)| {
+                serde_json::from_str(&key)
+                    .map(|key| (key, count))
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        charge_terms_output(budget, top.iter().map(|(key, _)| key), key)?;
+        crate::operations::check()?;
+        return Ok(SeriesResult {
             kind: "terms".into(),
             unit: "number".into(),
             interval_ms: 0,
@@ -437,67 +466,78 @@ where
                 points: top.into_iter().map(|(_, n)| n as f64).collect(),
             }],
             incompatible_units: 0,
-        };
+        });
     }
-    let unit = series_unit(spec, |f| dominant_unit(events(), f, 500));
+    let dominant = match (spec.unit.as_deref(), field) {
+        (Some(u), _) if u != "auto" => UnitKind::Number,
+        (_, Some(f)) => dominant_unit(events(), f, 500)?,
+        _ => UnitKind::Number,
+    };
+    let unit = series_unit(spec, |_| dominant);
+    budget.charge(unit.len())?;
     let expected_unit = expected_unit(spec, &unit);
     let mut incompatible_units = 0;
 
-    // splits: top N valores do campo de split
+    // Splits preserve the legacy exact top six and its deterministic ordering.
     let splits: Vec<String> = match &spec.split {
         Some(col) => {
             let mut counts = crate::distinct::Terms::default();
             for ev in events() {
-                if crate::operations::cancelled() {
-                    break;
-                }
+                crate::operations::check()?;
                 if let Some(v) = ev.col_str(col) {
                     if !v.is_empty() {
-                        counts.insert(v);
+                        budget.charge(counts.try_insert(v)?)?;
                     }
                 }
             }
-            counts.top(6).into_iter().map(|(k, _)| k).collect()
+            crate::operations::check()?;
+            counts.try_top(6)?.into_iter().map(|(k, _)| k).collect()
         }
         None => vec![],
     };
     let split_names: Vec<String> = if splits.is_empty() {
-        vec![spec.field.clone().unwrap_or_else(|| "eventos".into())]
+        let name = spec.field.as_deref().unwrap_or("eventos");
+        budget.charge(name.len().saturating_add(std::mem::size_of::<String>()))?;
+        vec![name.into()]
     } else {
+        for name in &splits {
+            budget.charge(name.len().saturating_add(std::mem::size_of::<String>()))?;
+        }
         splits.clone()
     };
 
     if spec.chart == "terms" {
-        // ranking de valores de `field_key` (ou da métrica se count)
-        let key_field = spec.field.clone().unwrap_or_else(|| "level".into());
-        let metric_field = if spec.metric == "count" || spec.metric == "distinct" {
-            spec.field.as_deref()
-        } else {
-            field
-        };
+        let key_field = field.unwrap_or("level");
         let mut accs: HashMap<Option<String>, MetricAcc> = HashMap::new();
         for ev in events() {
-            if crate::operations::cancelled() {
-                break;
-            }
-            let key = ev.col_str(&key_field).filter(|s| !s.trim().is_empty());
-            incompatible_units += usize::from(
-                accs.entry(key)
-                    .or_insert_with(|| MetricAcc::new(&spec.metric))
-                    .push_checked(
-                        &ev,
-                        metric_field.map(|_| field.unwrap_or(&key_field)),
-                        expected_unit,
-                    ),
-            );
+            crate::operations::check()?;
+            let key = ev.col_str(key_field).filter(|s| !s.trim().is_empty());
+            let acc = match accs.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    charge_metric_group(budget, entry.key(), &spec.metric)?;
+                    entry.insert(MetricAcc::new(&spec.metric))
+                }
+            };
+            incompatible_units +=
+                usize::from(acc.push_checked(&ev, field, expected_unit, budget)?);
         }
+        crate::operations::check()?;
+        // Move the keys instead of duplicating every group before selecting top N.
+        budget.charge(accs.len().saturating_mul(std::mem::size_of::<(
+            Option<String>,
+            f64,
+            usize,
+        )>()))?;
         let mut items: Vec<(Option<String>, f64, usize)> = accs
-            .iter()
-            .map(|(k, a)| (k.clone(), a.value(), a.n as usize))
+            .into_iter()
+            .map(|(key, acc)| (key, acc.value(), acc.n as usize))
             .collect();
         items.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         items.truncate(limit);
-        return SeriesResult {
+        charge_terms_output(budget, items.iter().map(|(key, _, _)| key), &split_names[0])?;
+        crate::operations::check()?;
+        return Ok(SeriesResult {
             kind: "terms".into(),
             unit,
             interval_ms: 0,
@@ -512,18 +552,19 @@ where
                 points: items.into_iter().map(|(_, v, _)| v).collect(),
             }],
             incompatible_units,
-        };
+        });
     }
 
-    // série temporal
-    let bounds = events()
-        .take_while(|_| !crate::operations::cancelled())
-        .filter_map(|ev| ev.timestamp)
-        .fold(None, |acc: Option<(i64, i64)>, t| {
-            Some(acc.map(|(a, b)| (a.min(t), b.max(t))).unwrap_or((t, t)))
-        });
-    if bounds.is_none() {
-        return SeriesResult {
+    let mut bounds: Option<(i64, i64)> = None;
+    for ev in events() {
+        crate::operations::check()?;
+        if let Some(t) = ev.timestamp {
+            bounds = Some(bounds.map(|(a, b)| (a.min(t), b.max(t))).unwrap_or((t, t)));
+        }
+    }
+    crate::operations::check()?;
+    let Some((tmin, tmax)) = bounds else {
+        return Ok(SeriesResult {
             kind: "time".into(),
             unit,
             interval_ms: 0,
@@ -531,17 +572,14 @@ where
             x_values: vec![],
             series: vec![],
             incompatible_units: 0,
-        };
-    }
-    let (tmin, tmax) = bounds.unwrap();
+        });
+    };
     let (interval, n_buckets) = series_interval(spec, tmin, tmax);
-
+    budget.charge(n_buckets.saturating_mul(std::mem::size_of::<HashMap<String, MetricAcc>>()))?;
     let mut accs: Vec<HashMap<String, MetricAcc>> =
         (0..n_buckets).map(|_| HashMap::new()).collect();
     for ev in events() {
-        if crate::operations::cancelled() {
-            break;
-        }
+        crate::operations::check()?;
         let Some(t) = ev.timestamp else { continue };
         let b = (t.saturating_sub(tmin) / interval) as usize;
         if b >= n_buckets {
@@ -558,15 +596,36 @@ where
             }
             None => split_names[0].clone(),
         };
-        incompatible_units += usize::from(
-            accs[b]
-                .entry(name)
-                .or_insert_with(|| MetricAcc::new(&spec.metric))
-                .push_checked(&ev, field, expected_unit),
-        );
+        let acc = match accs[b].entry(name) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                // Reserve the label before moving it into the bucket.
+                budget.charge(
+                    entry
+                        .key()
+                        .len()
+                        .saturating_add(128)
+                        .saturating_add(std::mem::size_of::<MetricAcc>())
+                        .saturating_add(spec.metric.len()),
+                )?;
+                entry.insert(MetricAcc::new(&spec.metric))
+            }
+        };
+        incompatible_units += usize::from(acc.push_checked(&ev, field, expected_unit, budget)?);
     }
-
-    SeriesResult {
+    budget.charge(n_buckets.saturating_mul(std::mem::size_of::<Value>()))?;
+    for name in &split_names {
+        budget.charge(
+            name.len()
+                .saturating_add(std::mem::size_of::<SeriesData>())
+                .saturating_add(
+                    n_buckets
+                        .saturating_mul(std::mem::size_of::<f64>() + std::mem::size_of::<usize>()),
+                ),
+        )?;
+    }
+    crate::operations::check()?;
+    let result = SeriesResult {
         kind: "time".into(),
         unit,
         interval_ms: interval,
@@ -589,7 +648,40 @@ where
             })
             .collect(),
         incompatible_units,
+    };
+    crate::operations::check()?;
+    Ok(result)
+}
+
+fn charge_metric_group(
+    budget: &mut AnalyticsBudget,
+    key: &Option<String>,
+    metric: &str,
+) -> Result<(), String> {
+    budget.group(key, 0)?;
+    budget.charge(std::mem::size_of::<MetricAcc>().saturating_add(metric.len()))
+}
+
+fn charge_terms_output<'a>(
+    budget: &mut AnalyticsBudget,
+    keys: impl Iterator<Item = &'a Option<String>>,
+    name: &str,
+) -> Result<(), String> {
+    budget.charge(name.len().saturating_add(std::mem::size_of::<SeriesData>()))?;
+    for key in keys {
+        crate::operations::check()?;
+        budget.charge(
+            key.as_ref()
+                .map_or("(vazio)".len(), |s| s.len().saturating_mul(2))
+                .saturating_add(
+                    std::mem::size_of::<Value>()
+                        + std::mem::size_of::<Option<String>>()
+                        + std::mem::size_of::<f64>()
+                        + std::mem::size_of::<usize>(),
+                ),
+        )?;
     }
+    Ok(())
 }
 
 /// Unit of a series: explicit, or the dominant unit of the metric field.
@@ -682,21 +774,44 @@ pub struct PivotResult {
     processed_events: usize,
 }
 
-pub fn pivot(events: &[Event], spec: &PivotSpec) -> PivotResult {
+pub fn pivot(events: &[Event], spec: &PivotSpec) -> Result<PivotResult, String> {
     pivot_stream(events.iter().cloned(), spec)
 }
-pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> PivotResult {
-    let value_names: Vec<String> = spec
-        .values
-        .iter()
-        .map(|a| {
-            if a.alias.is_empty() {
-                format!("{}({})", a.func, a.column)
-            } else {
-                a.alias.clone()
-            }
-        })
-        .collect();
+
+pub fn pivot_stream(
+    events: impl Iterator<Item = Event>,
+    spec: &PivotSpec,
+) -> Result<PivotResult, String> {
+    let result = pivot_budgeted(events, spec, &mut AnalyticsBudget::new())?;
+    crate::operations::check()?;
+    Ok(result)
+}
+
+fn pivot_budgeted(
+    events: impl Iterator<Item = Event>,
+    spec: &PivotSpec,
+    budget: &mut AnalyticsBudget,
+) -> Result<PivotResult, String> {
+    crate::operations::check()?;
+    let mut value_names = Vec::new();
+    for a in &spec.values {
+        crate::operations::check()?;
+        let bytes = if a.alias.is_empty() {
+            a.func
+                .len()
+                .saturating_add(a.column.len())
+                .saturating_add(2)
+        } else {
+            a.alias.len()
+        };
+        // Names, unit metadata, and the transient per-event values vector.
+        budget.charge(bytes.saturating_add(128))?;
+        value_names.push(if a.alias.is_empty() {
+            format!("{}({})", a.func, a.column)
+        } else {
+            a.alias.clone()
+        });
+    }
 
     enum Acc {
         Count(u64),
@@ -713,12 +828,17 @@ pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> Pi
                 _ => Acc::Num(0.0, 0, f64::MAX, f64::MIN),
             }
         }
-        fn push(&mut self, v: Option<f64>, s: Option<String>) {
+        fn push(
+            &mut self,
+            v: Option<f64>,
+            s: Option<&str>,
+            budget: &mut AnalyticsBudget,
+        ) -> Result<(), String> {
             match self {
                 Acc::Count(n) => *n += 1,
                 Acc::CountDistinct(set) => {
                     if let Some(s) = s {
-                        set.insert(s);
+                        budget.charge(set.try_insert(s.to_string())?)?;
                     }
                 }
                 Acc::Num(sum, n, min, max) => {
@@ -731,17 +851,18 @@ pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> Pi
                 }
                 Acc::Str(items) => {
                     if items.len() < 50 {
-                        if let Some(s) = s {
-                            if !s.is_empty() {
-                                items.push(s);
-                            }
+                        if let Some(s) = s.filter(|s| !s.is_empty()) {
+                            budget.charge(s.len().saturating_add(std::mem::size_of::<String>()))?;
+                            items.push(s.to_string());
                         }
                     }
                 }
             }
+            Ok(())
         }
-        fn finish(&self, func: &str) -> Value {
-            match (self, func) {
+        fn finish(&self, func: &str, budget: &mut AnalyticsBudget) -> Result<Value, String> {
+            crate::operations::check()?;
+            Ok(match (self, func) {
                 (Acc::Count(n), _) => Value::from(*n),
                 (Acc::CountDistinct(s), _) => Value::from(s.len() as u64),
                 (Acc::Num(sum, _, _, _), "sum") => Value::from((sum * 100.0).round() / 100.0),
@@ -766,68 +887,88 @@ pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> Pi
                         Value::from(*max)
                     }
                 }
-                (Acc::Str(items), _) => Value::from(items.join(", ")),
+                (Acc::Str(items), _) => {
+                    let bytes = items
+                        .iter()
+                        .fold(0usize, |n, s| n.saturating_add(s.len()))
+                        .saturating_add(items.len().saturating_sub(1).saturating_mul(2));
+                    budget.charge(bytes)?;
+                    Value::from(items.join(", "))
+                }
                 _ => Value::Null,
-            }
+            })
         }
     }
 
     type Path = Vec<Option<String>>;
-    let label = |value: &Option<String>| value.clone().unwrap_or_else(|| "(vazio)".into());
+    fn path_bytes(path: &Path) -> usize {
+        path.iter().fold(std::mem::size_of::<Path>(), |n, value| {
+            n.saturating_add(std::mem::size_of::<Option<String>>())
+                .saturating_add(value.as_ref().map_or(0, String::len))
+        })
+    }
+    fn path_label(path: &Path, budget: &mut AnalyticsBudget) -> Result<String, String> {
+        let bytes = if path.is_empty() {
+            "(total)".len()
+        } else {
+            path.iter()
+                .fold(0usize, |n, value| {
+                    n.saturating_add(value.as_deref().unwrap_or("(vazio)").len())
+                })
+                .saturating_add(path.len().saturating_sub(1).saturating_mul(" → ".len()))
+        };
+        budget.charge(bytes.saturating_add(std::mem::size_of::<String>()))?;
+        let mut label = String::with_capacity(bytes);
+        if path.is_empty() {
+            label.push_str("(total)");
+        }
+        for (i, value) in path.iter().enumerate() {
+            if i > 0 {
+                label.push_str(" → ");
+            }
+            label.push_str(value.as_deref().unwrap_or("(vazio)"));
+        }
+        Ok(label)
+    }
     let mut col_keys: Vec<String> = Vec::new();
     let mut col_values: Vec<Path> = Vec::new();
     let mut col_index: HashMap<Path, usize> = HashMap::new();
-    // Typed tuples prevent separator text and missing labels from merging keys.
-    let mut cells: HashMap<(Path, usize), Vec<Acc>> = HashMap::new();
-    let mut totals: HashMap<usize, Vec<Acc>> = HashMap::new();
+    // Intern typed paths once; cells retain numeric IDs, not a copy of every
+    // potentially wide row label for every column and aggregation.
     let mut paths: Vec<Path> = Vec::new();
-    let mut path_set: std::collections::HashSet<Path> = std::collections::HashSet::new();
+    let mut path_index: HashMap<Path, usize> = HashMap::new();
+    let mut cells: HashMap<(usize, usize), Vec<Acc>> = HashMap::new();
+    let mut totals: HashMap<usize, Vec<Acc>> = HashMap::new();
     let n_vals = spec.values.len().max(1);
     let mut value_units = vec![None; spec.values.len()];
     let mut incompatible_units = vec![0usize; spec.values.len()];
-
-    let acc_cell = |cells: &mut HashMap<(Path, usize), Vec<Acc>>,
-                    path: Path,
-                    col: usize,
-                    values: &[(Option<f64>, Option<String>)]| {
-        let accs = cells
-            .entry((path, col))
-            .or_insert_with(|| spec.values.iter().map(|a| Acc::new(&a.func)).collect());
-        for (acc, (num, text)) in accs.iter_mut().zip(values) {
-            acc.push(*num, text.clone());
-        }
-    };
-
-    let mut budget_reached = false;
+    let acc_bytes = spec
+        .values
+        .len()
+        .saturating_mul(std::mem::size_of::<Acc>())
+        .saturating_add(128);
     let mut processed_events = 0;
     for ev in events {
-        if crate::operations::cancelled() {
-            break;
-        }
-        if cells.len() > 100_000 / n_vals {
-            budget_reached = true;
-            break;
-        }
-        // chave de coluna
+        crate::operations::check()?;
         let col_key: Path = spec
             .cols
             .iter()
             .map(|c| ev.col_str(c).filter(|v| !v.trim().is_empty()))
             .collect();
-        if !col_index.contains_key(&col_key) && col_keys.len() >= 200 {
-            budget_reached = true;
-            break;
-        }
-        processed_events += 1;
-        let ci = *col_index.entry(col_key.clone()).or_insert_with(|| {
-            col_keys.push(if col_key.is_empty() {
-                "(total)".into()
-            } else {
-                col_key.iter().map(&label).collect::<Vec<_>>().join(" → ")
-            });
+        let ci = if let Some(&ci) = col_index.get(&col_key) {
+            ci
+        } else {
+            if col_keys.len() >= 200 {
+                return Err("O pivô excedeu o limite de 200 colunas. Restrinja os filtros ou reduza os agrupamentos.".into());
+            }
+            budget.charge(path_bytes(&col_key).saturating_mul(2).saturating_add(64))?;
+            let label = path_label(&col_key, budget)?;
+            let ci = col_keys.len();
+            col_index.insert(col_key.clone(), ci);
             col_values.push(col_key);
-            col_keys.len() - 1
-        });
+            col_keys.push(label);
+            ci
+        };
         let values: Vec<_> = spec
             .values
             .iter()
@@ -860,98 +1001,151 @@ pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> Pi
                 }
             })
             .collect();
-
-        // caminhos (todos os prefixos para a árvore de drill)
         let full: Path = spec
             .rows
             .iter()
             .map(|c| ev.col_str(c).filter(|v| !v.trim().is_empty()))
             .collect();
-        if full.is_empty() {
-            acc_cell(&mut cells, vec![], ci, &values);
-            if paths.is_empty() {
-                paths.push(vec![]);
+        // Empty row dimensions still have one total row, as before.
+        for depth in usize::from(!full.is_empty())..=full.len() {
+            crate::operations::check()?;
+            let prefix = &full[..depth];
+            let pi = if let Some(&pi) = path_index.get(prefix) {
+                pi
+            } else {
+                let bytes = prefix.iter().fold(std::mem::size_of::<Path>(), |n, value| {
+                    n.saturating_add(std::mem::size_of::<Option<String>>())
+                        .saturating_add(value.as_ref().map_or(0, String::len))
+                });
+                budget.charge(bytes.saturating_mul(2).saturating_add(64))?;
+                let pi = paths.len();
+                let path = prefix.to_vec();
+                path_index.insert(path.clone(), pi);
+                paths.push(path);
+                pi
+            };
+            let cell_count = cells.len();
+            let accs = match cells.entry((pi, ci)) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    if cell_count >= 100_000 / n_vals {
+                        return Err("O pivô excedeu o orçamento de células. Restrinja os filtros ou reduza os agrupamentos.".into());
+                    }
+                    budget.charge(acc_bytes)?;
+                    entry.insert(spec.values.iter().map(|a| Acc::new(&a.func)).collect())
+                }
+            };
+            for (acc, (num, text)) in accs.iter_mut().zip(&values) {
+                crate::operations::check()?;
+                acc.push(*num, text.as_deref(), budget)?;
             }
         }
-        for depth in 1..=full.len() {
-            let path = full[..depth].to_vec();
-            if path_set.insert(path.clone()) {
-                paths.push(full[..depth].to_vec());
+        let taccs = match totals.entry(ci) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                budget.charge(acc_bytes)?;
+                entry.insert(spec.values.iter().map(|a| Acc::new(&a.func)).collect())
             }
-            acc_cell(&mut cells, path, ci, &values);
-        }
-        // totais por coluna
-        let taccs = totals
-            .entry(ci)
-            .or_insert_with(|| spec.values.iter().map(|a| Acc::new(&a.func)).collect());
+        };
         for (acc, (num, text)) in taccs.iter_mut().zip(&values) {
-            acc.push(*num, text.clone());
+            crate::operations::check()?;
+            acc.push(*num, text.as_deref(), budget)?;
         }
+        processed_events += 1;
     }
+    crate::operations::check()?;
 
-    // ordena caminhos em ordem de árvore (prefixo antes de filho)
-    paths.sort();
+    // Sort IDs by the same typed tree ordering (prefix before child).
+    budget.charge(paths.len().saturating_mul(std::mem::size_of::<usize>()))?;
+    let mut ordered_paths: Vec<usize> = (0..paths.len()).collect();
+    ordered_paths.sort_by(|&a, &b| paths[a].cmp(&paths[b]));
     let output_rows = spec
         .limit_rows
         .min(2_000)
         .min(100_000 / col_keys.len().max(1) / n_vals);
-    let truncated = budget_reached || paths.len() > output_rows;
-    paths.truncate(output_rows);
+    let truncated = paths.len() > output_rows;
+    ordered_paths.truncate(output_rows);
 
-    let cells_out: Vec<Vec<Vec<Value>>> = paths
-        .iter()
-        .map(|p| {
-            (0..col_keys.len())
-                .map(|ci| {
-                    spec.values
-                        .iter()
-                        .enumerate()
-                        .map(|(vi, a)| {
-                            if incompatible_units[vi] > 0 {
-                                return Value::Null;
-                            }
-                            cells
-                                .get(&(p.clone(), ci))
-                                .map(|accs| accs[vi].finish(&a.func))
-                                .unwrap_or(Value::Null)
-                        })
-                        .collect()
-                })
-                .collect()
-        })
-        .collect();
-    let totals_out: Vec<Vec<Value>> = (0..col_keys.len())
-        .map(|ci| {
-            spec.values
-                .iter()
-                .enumerate()
-                .map(|(vi, a)| {
-                    if incompatible_units[vi] > 0 {
-                        return Value::Null;
-                    }
-                    totals
-                        .get(&ci)
-                        .map(|accs| accs[vi].finish(&a.func))
-                        .unwrap_or(Value::Null)
-                })
-                .collect()
-        })
-        .collect();
-
-    PivotResult {
+    let output_cell_bytes = spec
+        .values
+        .len()
+        .saturating_mul(std::mem::size_of::<Value>())
+        .saturating_add(std::mem::size_of::<Vec<Value>>());
+    budget.charge(
+        ordered_paths
+            .len()
+            .saturating_mul(
+                col_keys
+                    .len()
+                    .saturating_mul(output_cell_bytes)
+                    .saturating_add(std::mem::size_of::<Vec<Vec<Value>>>()),
+            )
+            .saturating_add(col_keys.len().saturating_mul(output_cell_bytes)),
+    )?;
+    let mut cells_out = Vec::new();
+    let mut row_paths = Vec::new();
+    let mut row_values = Vec::new();
+    for pi in ordered_paths {
+        crate::operations::check()?;
+        let path = &paths[pi];
+        budget.charge(path_bytes(path).saturating_add(std::mem::size_of::<Vec<String>>()))?;
+        let labels = if path.is_empty() {
+            budget.charge(
+                "(total)"
+                    .len()
+                    .saturating_add(std::mem::size_of::<String>()),
+            )?;
+            vec!["(total)".into()]
+        } else {
+            let mut labels = Vec::new();
+            for value in path {
+                let value = value.as_deref().unwrap_or("(vazio)");
+                budget.charge(value.len().saturating_add(std::mem::size_of::<String>()))?;
+                labels.push(value.to_string());
+            }
+            labels
+        };
+        row_paths.push(labels);
+        row_values.push(path.clone());
+        let mut row = Vec::new();
+        for ci in 0..col_keys.len() {
+            let mut cell = Vec::new();
+            for (vi, a) in spec.values.iter().enumerate() {
+                crate::operations::check()?;
+                let value = if incompatible_units[vi] > 0 {
+                    Value::Null
+                } else if let Some(accs) = cells.get(&(pi, ci)) {
+                    accs[vi].finish(&a.func, budget)?
+                } else {
+                    Value::Null
+                };
+                cell.push(value);
+            }
+            row.push(cell);
+        }
+        cells_out.push(row);
+    }
+    let mut totals_out = Vec::new();
+    for ci in 0..col_keys.len() {
+        let mut total = Vec::new();
+        for (vi, a) in spec.values.iter().enumerate() {
+            crate::operations::check()?;
+            total.push(if incompatible_units[vi] > 0 {
+                Value::Null
+            } else if let Some(accs) = totals.get(&ci) {
+                accs[vi].finish(&a.func, budget)?
+            } else {
+                Value::Null
+            });
+        }
+        totals_out.push(total);
+    }
+    crate::operations::check()?;
+    Ok(PivotResult {
         value_names,
         col_keys,
-        row_paths: paths
-            .iter()
-            .map(|path| {
-                if path.is_empty() {
-                    vec!["(total)".into()]
-                } else {
-                    path.iter().map(&label).collect()
-                }
-            })
-            .collect(),
-        row_values: paths,
+        row_paths,
+        row_values,
         col_values,
         incompatible_units,
         value_units: value_units
@@ -961,7 +1155,408 @@ pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> Pi
         cells: cells_out,
         totals: totals_out,
         truncated,
-        complete: !budget_reached && !crate::operations::cancelled(),
+        complete: true,
         processed_events,
+    })
+}
+
+#[cfg(test)]
+mod recovery_budget_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn event(source: &str, message: &str, timestamp: i64) -> Event {
+        let mut event = Event::empty();
+        event.source = source.into();
+        event.message = message.into();
+        event.timestamp = Some(timestamp);
+        event
+    }
+
+    fn series_spec(chart: &str, metric: &str) -> SeriesSpec {
+        SeriesSpec {
+            chart: chart.into(),
+            metric: metric.into(),
+            field: Some("message".into()),
+            interval_ms: Some(1000),
+            split: None,
+            limit: Some(10),
+            unit: Some("auto".into()),
+        }
+    }
+
+    fn pivot_spec(func: &str) -> PivotSpec {
+        PivotSpec {
+            rows: vec!["source".into()],
+            cols: vec![],
+            values: vec![AggSpec {
+                func: func.into(),
+                column: "message".into(),
+                alias: String::new(),
+            }],
+            limit_rows: 2000,
+        }
+    }
+
+    #[test]
+    fn series_preserves_exact_ranking_empty_keys_units_and_samples() {
+        let events = vec![
+            event("a", "b", 0),
+            event("a", "a", 0),
+            event("a", "b", 0),
+            event("a", "", 0),
+            event("a", "(vazio)", 0),
+        ];
+        let terms = compute_series(&events, &series_spec("terms", "count")).unwrap();
+        assert_eq!(
+            terms.x,
+            vec![json!("b"), json!("(vazio)"), json!("a"), json!("(vazio)")]
+        );
+        assert_eq!(
+            terms.x_values,
+            vec![
+                Some("b".into()),
+                Some("(vazio)".into()),
+                Some("a".into()),
+                None
+            ]
+        );
+        assert_eq!(terms.series[0].points, vec![2.0, 1.0, 1.0, 1.0]);
+        assert_eq!(terms.series[0].samples, vec![2, 1, 1, 1]);
+
+        let events = vec![
+            event("a", "1KB", 0),
+            event("a", "3KB", 0),
+            event("a", "5ms", 1000),
+        ];
+        let spec = series_spec("time", "avg");
+        let result = compute_series(&events, &spec).unwrap();
+        assert_eq!(result.unit, "bytes");
+        assert_eq!(result.x, vec![json!(0), json!(1000)]);
+        assert_eq!(result.series[0].points, vec![2048.0, 0.0]);
+        assert_eq!(result.series[0].samples, vec![2, 0]);
+        assert_eq!(result.incompatible_units, 1);
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::to_value(compute_series_stream(|| events.iter().cloned(), &spec).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn series_splits_keep_exact_top_six_and_distinct_bucket_counts() {
+        let mut events: Vec<_> = (0..7)
+            .map(|i| event(&format!("group-{i}"), "same", 0))
+            .collect();
+        events.push(event("group-6", "same", 0));
+        events.push(event("group-6", "another", 0));
+        events.push(event("group-6", "same", 1000));
+        let mut spec = series_spec("time", "distinct");
+        spec.split = Some("source".into());
+        let result = compute_series(&events, &spec).unwrap();
+        assert_eq!(
+            result
+                .series
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["group-6", "group-0", "group-1", "group-2", "group-3", "group-4"]
+        );
+        assert_eq!(result.series[0].points, vec![2.0, 1.0]);
+        assert_eq!(result.series[0].samples, vec![3, 1]);
+        assert_eq!(result.series[1].points, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn distinct_accumulators_share_budget_without_charging_duplicates() {
+        crate::resources::with_analytics_limit(140, || {
+            let mut budget = AnalyticsBudget::new();
+            let mut first = MetricAcc::new("distinct");
+            let mut second = MetricAcc::new("distinct");
+            let same = event("a", "same", 0);
+            first
+                .push_checked(&same, Some("message"), None, &mut budget)
+                .unwrap();
+            first
+                .push_checked(&same, Some("message"), None, &mut budget)
+                .unwrap();
+            second
+                .push_checked(&same, Some("message"), None, &mut budget)
+                .unwrap();
+            assert_eq!(first.value(), 1.0);
+            assert_eq!(first.n, 2);
+            assert_eq!(second.value(), 1.0);
+            assert!(second
+                .push_checked(&event("a", "new", 0), Some("message"), None, &mut budget)
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn recovery_series_limits_labels_buckets_and_distinct_payload_together() {
+        let spec = series_spec("terms", "count");
+        crate::resources::with_analytics_limit(4096, || {
+            let repeats = vec![event("a", "same", 0); 100];
+            assert_eq!(
+                compute_series(&repeats, &spec).unwrap().series[0].points,
+                vec![100.0]
+            );
+            let wide = vec![event("a", &"日".repeat(1500), 0)];
+            assert!(compute_series(&wide, &spec)
+                .err()
+                .unwrap()
+                .contains("orçamento"));
+            assert!(compute_series(&wide, &series_spec("terms", "distinct")).is_err());
+            let buckets: Vec<_> = (0..20)
+                .map(|i| event("a", &"x".repeat(256), i * 1000))
+                .collect();
+            assert!(compute_series(&buckets, &series_spec("time", "distinct")).is_err());
+        });
+    }
+
+    #[test]
+    fn recovery_pivot_preserves_typed_tree_order_and_full_totals() {
+        let mut events = vec![
+            event("B", "2KB", 0),
+            event("A", "4KB", 0),
+            event("A", "6KB", 0),
+        ];
+        events[0].level = "leaf".into();
+        events[1].level = "leaf".into();
+        events[2].level.clear();
+        events[0].code = "x".into();
+        events[1].code = "x".into();
+        events[2].code = "y".into();
+        let mut spec = pivot_spec("sum");
+        spec.rows.push("level".into());
+        spec.cols.push("code".into());
+        let result = pivot(&events, &spec).unwrap();
+        assert_eq!(
+            result.row_values,
+            vec![
+                vec![Some("A".into())],
+                vec![Some("A".into()), None],
+                vec![Some("A".into()), Some("leaf".into())],
+                vec![Some("B".into())],
+                vec![Some("B".into()), Some("leaf".into())],
+            ]
+        );
+        assert_eq!(result.col_keys, vec!["x", "y"]);
+        assert_eq!(
+            result.cells[0],
+            vec![vec![json!(4096.0)], vec![json!(6144.0)]]
+        );
+        assert_eq!(
+            result.totals,
+            vec![vec![json!(6144.0)], vec![json!(6144.0)]]
+        );
+        assert_eq!(result.value_units, vec!["bytes"]);
+        assert!(result.complete);
+        assert!(!result.truncated);
+        assert_eq!(result.processed_events, 3);
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::to_value(pivot_stream(events.iter().cloned(), &spec).unwrap()).unwrap()
+        );
+        spec.limit_rows = 1;
+        let limited = pivot(&events, &spec).unwrap();
+        assert_eq!(limited.row_values, vec![vec![Some("A".into())]]);
+        assert_eq!(
+            limited.totals,
+            vec![vec![json!(6144.0)], vec![json!(6144.0)]]
+        );
+        assert!(limited.complete && limited.truncated);
+        assert_eq!(limited.processed_events, 3);
+    }
+
+    #[test]
+    fn pivot_interning_keeps_separator_and_missing_labels_distinct() {
+        let mut events = vec![event("", "left → right", 0), event("(vazio)", "left", 0)];
+        events[0].code = "tail".into();
+        events[1].code = "right → tail".into();
+        let mut spec = pivot_spec("count");
+        spec.cols = vec!["message".into(), "code".into()];
+        let result = pivot(&events, &spec).unwrap();
+        assert_eq!(result.row_paths, vec![vec!["(vazio)"], vec!["(vazio)"]]);
+        assert_eq!(
+            result.row_values,
+            vec![vec![None], vec![Some("(vazio)".into())]]
+        );
+        assert_eq!(
+            result.col_keys,
+            vec!["left → right → tail", "left → right → tail"]
+        );
+        assert_ne!(result.col_values[0], result.col_values[1]);
+        assert_eq!(
+            result.cells,
+            vec![
+                vec![vec![json!(1)], vec![Value::Null]],
+                vec![vec![Value::Null], vec![json!(1)]],
+            ]
+        );
+        assert_eq!(result.totals, vec![vec![json!(1)], vec![json!(1)]]);
+    }
+
+    #[test]
+    fn pivot_retains_first_fifty_strings_and_exact_distinct_counts() {
+        let mut events: Vec<_> = (0..60)
+            .map(|i| event("group", &format!("v{i:02}"), 0))
+            .collect();
+        events.insert(0, event("group", "", 0));
+        events.push(events[1].clone());
+        let expected = (0..50)
+            .map(|i| format!("v{i:02}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let strings = pivot(&events, &pivot_spec("string_agg")).unwrap();
+        assert_eq!(strings.cells[0][0][0], json!(expected));
+        assert_eq!(strings.totals[0][0], json!(expected));
+        let distinct = pivot(&events, &pivot_spec("count_distinct")).unwrap();
+        assert_eq!(distinct.cells[0][0][0], json!(61));
+        assert_eq!(distinct.totals[0][0], json!(61));
+    }
+
+    #[test]
+    fn pivot_rejects_shared_label_string_and_final_output_budget_exhaustion() {
+        let wide_label = vec![event(&"日".repeat(500), "x", 0)];
+        crate::resources::with_analytics_limit(1024, || {
+            assert!(pivot(&wide_label, &pivot_spec("count")).is_err());
+        });
+        let grouped: Vec<_> = (0..8)
+            .map(|i| event(&format!("group-{i}"), &"x".repeat(512), 0))
+            .collect();
+        crate::resources::with_analytics_limit(4096, || {
+            assert!(pivot(&grouped, &pivot_spec("string_agg")).is_err());
+            assert!(pivot(&grouped, &pivot_spec("count_distinct")).is_err());
+        });
+        let mut spec = pivot_spec("string_agg");
+        spec.rows.clear();
+        let event = vec![event("a", &"x".repeat(512), 0)];
+        // Both the cell and total retain their own first-N strings and final joins.
+        crate::resources::with_analytics_limit(2500, || {
+            assert!(pivot(&event, &spec).is_err());
+        });
+        crate::resources::with_analytics_limit(4096, || {
+            assert_eq!(
+                pivot(&event, &spec).unwrap().cells[0][0][0],
+                json!("x".repeat(512))
+            );
+        });
+    }
+
+    #[test]
+    fn pivot_unit_conflicts_and_column_caps_never_claim_partial_success() {
+        let mixed = vec![event("a", "1KB", 0), event("a", "2ms", 0)];
+        let result = pivot(&mixed, &pivot_spec("sum")).unwrap();
+        assert_eq!(result.incompatible_units, vec![1]);
+        assert_eq!(result.cells[0][0][0], Value::Null);
+        assert_eq!(result.totals[0][0], Value::Null);
+        assert!(result.complete);
+        let columns: Vec<_> = (0..201)
+            .map(|i| event(&format!("column-{i}"), "x", 0))
+            .collect();
+        let mut spec = pivot_spec("count");
+        spec.cols = vec!["source".into()];
+        spec.rows.clear();
+        assert!(pivot(&columns, &spec)
+            .err()
+            .unwrap()
+            .contains("200 colunas"));
+    }
+
+    #[test]
+    fn recovery_rankings_and_distinct_aggregates_propagate_spill_errors() {
+        let events = vec![event("a", "1", 0)];
+        crate::distinct::with_spill_failure(|| {
+            assert!(compute_series(&events, &series_spec("terms", "count")).is_err());
+            assert!(compute_series(&events, &series_spec("terms", "distinct")).is_err());
+            assert!(compute_series(&events, &series_spec("time", "distinct")).is_err());
+            let mut spec = series_spec("time", "count");
+            spec.split = Some("source".into());
+            assert!(compute_series(&events, &spec).is_err());
+            assert!(pivot(&events, &pivot_spec("count_distinct")).is_err());
+        });
+    }
+
+    #[test]
+    fn every_series_pass_and_pivot_propagate_cancellation() {
+        let events = vec![event("a", "1KB", 0), event("a", "2KB", 1000)];
+        let mut spec = series_spec("time", "distinct");
+        spec.split = Some("source".into());
+        // Unit discovery, split ranking, bounds, and final bucket accumulation.
+        for cancelled_pass in 0..4 {
+            let id = format!("recovery-series-{}", uuid::Uuid::new_v4());
+            let token = crate::operations::token(Some(id.clone())).unwrap();
+            let pass = std::cell::Cell::new(0);
+            let outer = crate::operations::run_with_token(token, || {
+                let result = compute_series_stream(
+                    || {
+                        let current = pass.get();
+                        pass.set(current + 1);
+                        let id = &id;
+                        events.iter().cloned().enumerate().map(move |(i, event)| {
+                            if current == cancelled_pass && i == 1 {
+                                assert!(crate::operations::cancel_id(id));
+                            }
+                            event
+                        })
+                    },
+                    &spec,
+                );
+                assert_eq!(result.err().as_deref(), Some("Operação cancelada."));
+            });
+            assert!(outer.is_err());
+        }
+        let id = format!("recovery-pivot-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let outer = crate::operations::run_with_token(token, || {
+            let result = pivot_stream(
+                events.iter().cloned().enumerate().map(|(i, event)| {
+                    if i == 1 {
+                        assert!(crate::operations::cancel_id(&id));
+                    }
+                    event
+                }),
+                &pivot_spec("count"),
+            );
+            assert_eq!(result.err().as_deref(), Some("Operação cancelada."));
+        });
+        assert!(outer.is_err());
+    }
+
+    #[test]
+    fn cancelled_empty_streams_do_not_return_successful_empty_results() {
+        for chart in ["terms", "time"] {
+            let id = format!("recovery-empty-{}", uuid::Uuid::new_v4());
+            let token = crate::operations::token(Some(id.clone())).unwrap();
+            let outer = crate::operations::run_with_token(token, || {
+                let mut spec = series_spec(chart, "count");
+                spec.unit = Some("number".into());
+                let result = compute_series_stream(
+                    || {
+                        std::iter::from_fn(|| {
+                            assert!(crate::operations::cancel_id(&id));
+                            None
+                        })
+                    },
+                    &spec,
+                );
+                assert_eq!(result.err().as_deref(), Some("Operação cancelada."));
+            });
+            assert!(outer.is_err());
+        }
+        let id = format!("recovery-empty-pivot-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let outer = crate::operations::run_with_token(token, || {
+            let result = pivot_stream(
+                std::iter::from_fn(|| {
+                    assert!(crate::operations::cancel_id(&id));
+                    None
+                }),
+                &pivot_spec("count"),
+            );
+            assert_eq!(result.err().as_deref(), Some("Operação cancelada."));
+        });
+        assert!(outer.is_err());
     }
 }
