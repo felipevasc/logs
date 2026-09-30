@@ -170,8 +170,10 @@ function setWorkbar(label, detail = "", progress = null, cancellable = false) {
 // ------------------------------------------------------------------ overlay de carga
 let loadStepCount = 0;
 
-function showLoadOverlay(firstStep = "Validando a fonte") {
+function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-load") {
   state.loadOverlay = true;
+  state.loadOverlayProgressKey = progressKey;
+  state.loadOverlayVersion = (state.loadOverlayVersion || 0) + 1;
   loadStepCount = 0;
   $("#load-steps").innerHTML = "";
   $("#load-bar-fill").style.width = "0%"; $("#load-bar-fill").parentElement.hidden = true;
@@ -193,7 +195,8 @@ function hideLoadOverlay(ok = true) {
     });
     $("#load-bar-fill").parentElement.hidden = false; $("#load-bar-fill").style.width = "100%";
     $("#load-phase").textContent = "Pronto!";
-    setTimeout(() => { $("#load-overlay").hidden = true; }, 450);
+    const version = state.loadOverlayVersion;
+    setTimeout(() => { if (version === state.loadOverlayVersion) $("#load-overlay").hidden = true; }, 450);
   } else {
     $("#load-overlay").hidden = true;
   }
@@ -228,9 +231,9 @@ function startOperation(kind, label, detail = "") {
   setWorkbar(label, detail, null, false);
 }
 
-function updateOperation(label, detail = "", progress = null) {
+function updateOperation(label, detail = "", progress = null, cancellable = true) {
   if (!state.activeOperation) return;
-  setWorkbar(label, detail, progress, true);
+  setWorkbar(label, detail, progress, cancellable);
 }
 
 function cancelWorkbarTask() {
@@ -252,6 +255,10 @@ window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
   // Late messages from cancelled/replaced work must never overwrite the active UI.
   if (payload.operationId && !task) return;
   if (!payload.operationId && !state.loadOverlay) return;
+  // Each task keeps its own progress above. The foreground import overlay
+  // belongs only to its named foreground operation, including while session-save
+  // acknowledgement is pending after that native task has already settled.
+  if (state.loadOverlay && (!payload.operationId || payload.operationId !== window.Tasks?.operationFor(state.loadOverlayProgressKey || "source-load"))) return;
   const id = payload.operationId || payload.operation || "legacy-load";
   const estimate = task?.estimate || window.PerformanceTools.estimate(operationEstimates.get(id), payload);
   operationEstimates.set(id, estimate);
@@ -938,7 +945,7 @@ async function loadData(requestedSource = null, options = {}) {
     }
     if (!current()) return false;
     sourceAccepted = true; clearSourceRecovery();
-    updateOperation("Artefato carregado", `${fmtNum(summary.count)} eventos indexados`);
+    updateOperation("Artefato carregado", `${fmtNum(summary.count)} eventos indexados`, null, false);
     state.columns = summary.columns;
     const savedArtifact = c.artifacts?.find((a) => a.id === artifactIdFromSource(source));
     state.visibleCols = savedArtifact?.visibleCols?.filter((col) => summary.columns.includes(col));
@@ -2459,11 +2466,11 @@ async function applyTsConfig() {
   const empty = cfg.sources.length === 0 || !cfg.format;
   const done = btnBusy($("#ts-apply"), "Aplicando…");
   // status detalhado: passos + progresso por linha + resultado
-  showLoadOverlay("Aplicando configuração de data/hora");
+  showLoadOverlay("Aplicando configuração de data/hora", "timestamp-config");
   try {
     // cada arquivo do conjunto guarda a config pela própria chave (caminho)
     for (const path of paths) {
-      await api("set_ts_config", { path, config: empty ? null : cfg });
+      await api("set_ts_config", { path, config: empty ? null : cfg }, { latest: "timestamp-config" });
     }
     hideLoadOverlay(true);
     toast(empty ? "Configuração de data/hora removida." : "Data/hora aplicada aos eventos.", "ok");
