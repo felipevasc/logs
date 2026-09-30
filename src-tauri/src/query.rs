@@ -4,9 +4,7 @@ use crate::sources::{event_at, line_bytes, CompiledDerived, FileIndex};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Filter {
@@ -36,6 +34,14 @@ pub struct PreparedFilter {
     nets: Vec<crate::querylang::IpNet>,
     /// Detection rule reproduced as evidence filter (`op = "detection"`).
     detection: Option<(std::sync::Arc<crate::detections::RuleSet>, usize)>,
+}
+
+impl PreparedFilter {
+    /// Parsed numeric bounds, shared with the SQL compiler so native range
+    /// predicates use exactly the same timestamp/unit parsing as the reader.
+    pub(crate) fn numeric_bounds(&self) -> (Option<f64>, Option<f64>) {
+        (self.num, self.num2)
+    }
 }
 
 /// Values of an `in` filter: one per line (commas also separate).
@@ -107,6 +113,33 @@ pub struct QueryResult {
     pub rows: Vec<Event>,
 }
 
+/// Interactive pages do not wait for an exact global count. The exact APIs
+/// remain available to analytics, exports and MCP callers.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryPage {
+    pub rows: Vec<Event>,
+    pub total: Option<usize>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub engine: String,
+    pub warning: Option<String>,
+}
+
+impl QueryPage {
+    pub(crate) fn from_exact(result: QueryResult, offset: usize, engine: &str, warning: Option<String>) -> Self {
+        let has_more = offset.saturating_add(result.rows.len()) < result.total;
+        Self {
+            rows: result.rows,
+            total: Some(result.total),
+            has_more,
+            next_cursor: None,
+            engine: engine.into(),
+            warning,
+        }
+    }
+}
+
 #[derive(Serialize, Default)]
 pub struct AggResult {
     pub columns: Vec<String>,
@@ -119,6 +152,20 @@ pub struct AggResult {
     pub omitted_groups: usize,
     /// Records counted in the omitted groups, when a count is among the measures.
     pub omitted_records: u64,
+    /// Explicit bounded-work failure. Never publish a partial aggregate as exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl AggResult {
+    pub(crate) fn failure(error: String) -> Self { Self { error: Some(error), ..Self::default() } }
+    pub(crate) fn budget_error() -> Self {
+        Self { error: Some("Agrupamento excede o orçamento de grupos. Reduza o período/filtros, escolha um campo menos distinto ou use uma contagem simples.".into()), ..Self::default() }
+    }
+}
+
+fn group_budget(specs: &[AggSpec]) -> usize {
+    if !specs.is_empty() && specs.iter().all(|spec| spec.func == "count") { MAX_GROUPS * 2 } else { MAX_GROUPS }
 }
 
 /// Groups returned at most. Values with millions of distinct groups (ids,
@@ -291,6 +338,17 @@ pub fn filtered_indices(events: &[Event], filters: &[Filter]) -> Vec<usize> {
         .collect()
 }
 
+pub(crate) fn count_memory(events: &[Event], filters: &[Filter]) -> usize {
+    let pfs = prepare(filters);
+    events.iter().take_while(|_| !crate::operations::cancelled()).filter(|event| pfs.iter().all(|pf| matches(event, pf))).count()
+}
+
+pub(crate) fn count_lines(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> usize {
+    let mut count = 0usize;
+    scan_indexed(idx, &prepare(filters), codes, system, derived, |_, _, _| (), |()| count += 1);
+    count
+}
+
 pub fn sort_indices(events: &[Event], indices: &mut [usize], column: &str, desc: bool) {
     // Pré-computa a chave (número opcional + texto em minúsculas) uma vez por
     // linha; o comparador anterior realocava as strings a cada comparação.
@@ -390,20 +448,21 @@ fn aggregate_from_memory_matches(
     group_column: &str,
     specs: &[AggSpec],
 ) -> AggResult {
+    let mut budget = AnalyticsBudget::new();
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order = Vec::new();
     for &i in matched {
+        if groups.len() > group_budget(specs) { return AggResult::budget_error(); }
         if crate::operations::cancelled() {
             break;
         }
         let event = &events[i];
-        push_group(
+        if let Err(error) = push_group(
             &mut groups,
             &mut order,
             event,
             event.col_str(group_column),
-            specs,
-        );
+            specs, &mut budget) { return AggResult::failure(error); }
     }
     build_agg_result(groups, order, group_column, specs)
 }
@@ -649,60 +708,55 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8], enriched: bool)
     }
 }
 
-struct MatchCacheEntry {
-    idx_id: usize,
-    idx_identity: String,
-    lines_count: usize,
-    filters_key: String,
-    derived_count: usize,
-    codes_count: usize,
-    matches: Arc<Vec<usize>>,
+/// Complete-ID collection is a compatibility API with an explicit result
+/// budget. The database selection cache owns shared work; no second Rust copy
+/// is retained under the old pointer/count-based line-cache identity.
+pub fn clear_match_cache() {}
+
+pub(crate) fn check_collected_ids(rows: usize) -> Result<(), String> {
+    if rows.saturating_mul(std::mem::size_of::<usize>()) > crate::resources::collected_ids_bytes() {
+        Err("A lista completa de IDs excedeu LOGINSIGHT_COLLECTED_IDS_MB. Use paginação ou uma operação de leitura em fluxo.".into())
+    } else { Ok(()) }
 }
-
-static MATCH_CACHE: Mutex<Vec<MatchCacheEntry>> = Mutex::new(Vec::new());
-
-fn filters_cache_key(filters: &[Filter]) -> String {
-    let mut s = String::new();
-    for f in filters {
-        s.push_str(&f.column);
-        s.push(':');
-        s.push_str(&f.op);
-        s.push('=');
-        s.push_str(&f.value);
-        if let Some(v2) = &f.value2 {
-            s.push(',');
-            s.push_str(v2);
-        }
-        s.push(';');
+pub(crate) fn push_collected_id(ids: &mut Vec<usize>, id: usize) -> Result<(), String> {
+    check_collected_ids(ids.len().saturating_add(1))?;
+    if ids.len() == ids.capacity() {
+        let left = crate::resources::collected_ids_bytes() / std::mem::size_of::<usize>() - ids.len();
+        ids.try_reserve_exact(left.min(8192)).map_err(|e| e.to_string())?;
     }
-    s
+    ids.push(id);
+    Ok(())
 }
-
-pub fn clear_match_cache() {
-    MATCH_CACHE.lock().clear();
+/// Account owned event strings/containers without serializing a second copy.
+pub(crate) fn event_payload_bytes(event: &Event) -> usize {
+    fn value_bytes(value: &Value) -> usize {
+        match value {
+            Value::String(value) => value.len().saturating_add(32),
+            Value::Array(values) => values.iter().fold(32usize, |n, v| n.saturating_add(value_bytes(v))),
+            Value::Object(values) => values.iter().fold(32usize, |n, (k, v)| n.saturating_add(k.len()).saturating_add(64).saturating_add(value_bytes(v))),
+            _ => 32,
+        }
+    }
+    [&event.event_ref, &event.parse_status, &event.source, &event.level, &event.code, &event.name, &event.description, &event.message, &event.raw]
+        .iter().fold(std::mem::size_of::<Event>(), |n, v| n.saturating_add(v.len()))
+        .saturating_add(event.fields.iter().fold(0usize, |n, (k, v)| n.saturating_add(k.len()).saturating_add(64).saturating_add(value_bytes(v))))
 }
-
-/// Filtra as linhas do índice; materializa apenas quando necessário.
-pub fn indexed_matches(
-    idx: &FileIndex,
-    filters: &[Filter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-) -> Vec<usize> {
-    cached_matches(idx, filters, codes, system, derived, true)
-}
-
-/// Same selection computed only by the line engine (raw-line searches that
-/// the query engine delegates).
-pub(crate) fn scan_matches(
-    idx: &FileIndex,
-    filters: &[Filter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-) -> Vec<usize> {
-    cached_matches(idx, filters, codes, system, derived, false)
+pub fn indexed_matches(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> Result<Vec<usize>, String> {
+    if filters.is_empty() {
+        check_collected_ids(idx.lines.len())?;
+        return Ok((0..idx.lines.len()).collect());
+    }
+    let pfs = prepare(filters);
+    if let Some(ids) = crate::engine::matches(&engine_source(idx, codes, system, derived), &pfs)? { return Ok(ids); }
+    let mut ids = Vec::new();
+    let mut error = None;
+    scan_indexed_control(idx, &pfs, codes, system, derived, |i, _, _| i, |i| {
+        if let Err(e) = push_collected_id(&mut ids, i) { error = Some(e); return false; }
+        true
+    });
+    if let Some(error) = error { return Err(error); }
+    crate::operations::check()?;
+    Ok(ids)
 }
 
 fn engine_source<'a>(
@@ -714,130 +768,43 @@ fn engine_source<'a>(
     crate::engine::Source { idx, codes, system, derived }
 }
 
-fn cached_matches(
-    idx: &FileIndex,
-    filters: &[Filter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-    use_engine: bool,
-) -> Vec<usize> {
-    if filters.is_empty() {
-        return (0..idx.lines.len()).collect();
-    }
-    let idx_id = idx.lines.as_ptr() as usize;
-    let lines_count = idx.lines.len();
-    let idx_identity = idx.parts.first().map(|p| p.identity.as_str()).unwrap_or("");
-    let fkey = filters_cache_key(filters);
-    let derived_count = derived.len();
-    let codes_count = codes.sources.len() + system.sources.len();
-
-    {
-        let cache = MATCH_CACHE.lock();
-        if let Some(entry) = cache.iter().find(|e| {
-            e.idx_id == idx_id
-                && e.lines_count == lines_count
-                && e.derived_count == derived_count
-                && e.codes_count == codes_count
-                && e.idx_identity == idx_identity
-                && e.filters_key == fkey
-        }) {
-            return (*entry.matches).clone();
-        }
-    }
-
-    let pfs = prepare(filters);
-    let engine = if use_engine {
-        crate::engine::matches(&engine_source(idx, codes, system, derived), &pfs)
-    } else {
-        None
-    };
-    let matched = engine.unwrap_or_else(|| {
-        let mut matched = Vec::new();
-        scan_indexed(idx, &pfs, codes, system, derived, |i, _, _| i, |i| matched.push(i));
-        matched
-    });
-
-    // Recent selections stay in memory within a budget: 16 lists and 1/16
-    // of the installed memory (at most 512 MB); huge lists are not kept.
-    let budget = (crate::resources::total_memory() / 16).min(512 << 20) as usize;
-    let size = |entry: &MatchCacheEntry| entry.matches.len() * std::mem::size_of::<usize>();
-    if !crate::operations::cancelled() && matched.len() * std::mem::size_of::<usize>() <= budget / 2 {
-        let mut cache = MATCH_CACHE.lock();
-        cache.push(MatchCacheEntry {
-            idx_id,
-            idx_identity: idx_identity.to_string(),
-            lines_count,
-            filters_key: fkey,
-            derived_count,
-            codes_count,
-            matches: Arc::new(matched.clone()),
-        });
-        let mut total: usize = cache.iter().map(size).sum();
-        while cache.len() > 16 || total > budget {
-            total -= size(&cache[0]);
-            cache.remove(0);
-        }
-    }
-
-    matched
-}
-
 /// Visit matching positions without allocating a vector proportional to the file.
-pub fn visit_indexed_matches(
-    idx: &FileIndex,
-    filters: &[Filter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-    visit: impl FnMut(usize),
-) {
-    let pfs = prepare(filters);
-    visit_indexed_prepared(idx, &pfs, codes, system, derived, visit);
+pub fn visit_indexed_matches(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], visit: impl FnMut(usize)) -> Result<(), String> {
+    visit_indexed_prepared(idx, &prepare(filters), codes, system, derived, visit)
 }
 
-/// Visits matching events in file order; they are parsed in parallel batches.
-pub(crate) fn visit_indexed_events(
-    idx: &FileIndex,
-    pfs: &[PreparedFilter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-    mut visit: impl FnMut(usize, &Event),
-) {
-    visit_indexed_mapped(idx, pfs, codes, system, derived, |_| (), |i, event, ()| visit(i, event));
+pub(crate) fn visit_indexed_events(idx: &FileIndex, pfs: &[PreparedFilter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], mut visit: impl FnMut(usize, &Event)) -> Result<(), String> {
+    visit_indexed_mapped(idx, pfs, codes, system, derived, |_| (), |i, event, ()| visit(i, event))
 }
 
-/// Like [`visit_indexed_events`], with `map` run in parallel on each event
-/// and its result handed to `visit` in file order.
-pub(crate) fn visit_indexed_mapped<T: Send>(
-    idx: &FileIndex,
-    pfs: &[PreparedFilter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-    map: impl Fn(&Event) -> T + Sync,
-    mut visit: impl FnMut(usize, &Event, T),
-) {
+/// Preserves file order while hydrating only a byte-bounded wave of IDs.
+/// There is no preliminary vector proportional to the complete match set.
+pub(crate) fn visit_indexed_mapped<T: Send>(idx: &FileIndex, pfs: &[PreparedFilter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], map: impl Fn(&Event) -> T + Sync, mut visit: impl FnMut(usize, &Event, T)) -> Result<(), String> {
     let mut ids = Vec::new();
-    visit_indexed_prepared(idx, pfs, codes, system, derived, |i| ids.push(i));
-    let generation = crate::operations::current_generation();
-    for chunk in ids.chunks(8192) {
-        if crate::operations::cancelled_for(generation) {
-            return;
+    let mut bytes = 0usize;
+    let flush = |ids: &mut Vec<usize>, visit: &mut dyn FnMut(usize, &Event, T)| {
+        let events: Vec<_> = ids.par_iter().map(|&id| {
+            let event = event_at(idx, id, codes, system, derived);
+            let mapped = map(&event);
+            (id, event, mapped)
+        }).collect();
+        for (id, event, mapped) in events { visit(id, &event, mapped); }
+        ids.clear();
+    };
+    visit_indexed_prepared_control(idx, pfs, codes, system, derived, |id| {
+        let size = idx.lines[id].len as usize;
+        if !ids.is_empty() && (ids.len() >= 8192 || bytes.saturating_add(size) > crate::resources::batch_bytes()) {
+            flush(&mut ids, &mut visit);
+            bytes = 0;
+            crate::operations::check()?;
         }
-        let events: Vec<(Event, T)> = chunk
-            .par_iter()
-            .map(|&i| {
-                let event = crate::sources::event_at(idx, i, codes, system, derived);
-                let mapped = map(&event);
-                (event, mapped)
-            })
-            .collect();
-        for (&i, (event, mapped)) in chunk.iter().zip(events) {
-            visit(i, &event, mapped);
-        }
-    }
+        ids.push(id);
+        bytes = bytes.saturating_add(size);
+        Ok(true)
+    })?;
+    crate::operations::check()?;
+    flush(&mut ids, &mut visit);
+    crate::operations::check()
 }
 
 /// Lines per parallel work unit. Batches keep memory bounded and results in order.
@@ -854,15 +821,27 @@ pub(crate) fn scan_indexed<T: Send>(
     map: impl Fn(usize, &LineMeta, Option<Event>) -> T + Sync,
     mut visit: impl FnMut(T),
 ) {
+    scan_indexed_control(idx, pfs, codes, system, derived, map, |item| { visit(item); true });
+}
+
+fn scan_indexed_control<T: Send>(
+    idx: &FileIndex,
+    pfs: &[PreparedFilter],
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+    map: impl Fn(usize, &LineMeta, Option<Event>) -> T + Sync,
+    mut visit: impl FnMut(T) -> bool,
+) {
     let enriched: Vec<bool> = pfs
         .iter()
         .map(|pf| query_needs_enrichment(pf, codes, system, derived))
         .collect();
-    let generation = crate::operations::current_generation();
+    let cancellation = crate::operations::current_token();
     let chunk = |from: usize, to: usize| -> Vec<T> {
         let mut out = Vec::new();
         for i in from..to {
-            if (i - from) % 2048 == 0 && crate::operations::cancelled_for(generation) {
+            if (i - from) % 2048 == 0 && cancellation.cancelled() {
                 break;
             }
             let meta = &idx.lines[i];
@@ -894,19 +873,20 @@ pub(crate) fn scan_indexed<T: Send>(
         out
     };
     let total = idx.lines.len();
-    if total <= SCAN_CHUNK * 2 || rayon::current_num_threads() <= 1 {
-        for item in chunk(0, total) {
-            visit(item);
-        }
-        return;
-    }
     let batch = SCAN_CHUNK * rayon::current_num_threads() * 2;
     let mut start = 0;
     while start < total {
         if crate::operations::cancelled() {
             break;
         }
-        let end = (start + batch).min(total);
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < total && end - start < batch {
+            let next = idx.lines[end].len as usize;
+            if end > start && bytes.saturating_add(next) > crate::resources::batch_bytes() { break; }
+            bytes = bytes.saturating_add(next);
+            end += 1;
+        }
         let parts: Vec<Vec<T>> = (start..end)
             .step_by(SCAN_CHUNK)
             .collect::<Vec<_>>()
@@ -915,38 +895,36 @@ pub(crate) fn scan_indexed<T: Send>(
             .collect();
         for part in parts {
             for item in part {
-                visit(item);
+                if !visit(item) { return; }
             }
         }
         start = end;
     }
 }
 
-pub(crate) fn visit_indexed_prepared(
-    idx: &FileIndex,
-    pfs: &[PreparedFilter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-    mut visit: impl FnMut(usize),
-) {
-    if pfs.is_empty() {
-        for i in 0..idx.lines.len() {
-            if i % 8192 == 0 && crate::operations::cancelled() {
-                return;
-            }
-            visit(i);
-        }
-        return;
-    }
-    if let Some(ids) = crate::engine::matches(&engine_source(idx, codes, system, derived), pfs) {
-        ids.into_iter().for_each(visit);
-        return;
-    }
-    scan_indexed(idx, pfs, codes, system, derived, |i, _, _| i, visit);
+pub(crate) fn visit_indexed_prepared(idx: &FileIndex, pfs: &[PreparedFilter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], mut visit: impl FnMut(usize)) -> Result<(), String> {
+    visit_indexed_prepared_control(idx, pfs, codes, system, derived, |id| { visit(id); Ok(true) })
 }
 
-/// Free text in a search expression may match code names/descriptions from
+pub(crate) fn visit_indexed_prepared_control(idx: &FileIndex, pfs: &[PreparedFilter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], mut visit: impl FnMut(usize) -> Result<bool, String>) -> Result<(), String> {
+    if pfs.is_empty() {
+        for id in 0..idx.lines.len() {
+            if id % 2048 == 0 { crate::operations::check()?; }
+            if !visit(id)? { break; }
+        }
+        return crate::operations::check();
+    }
+    if crate::engine::visit_matches(&engine_source(idx, codes, system, derived), pfs, &mut visit)?.is_some() { return Ok(()); }
+    let mut failure = None;
+    scan_indexed_control(idx, pfs, codes, system, derived, |i, _, _| i, |id| match visit(id) {
+        Ok(keep) => keep,
+        Err(error) => { failure = Some(error); false }
+    });
+    if let Some(error) = failure { return Err(error); }
+    crate::operations::check()
+}
+
+
 /// the catalogs or derived fields, which are not part of the raw line.
 fn query_needs_enrichment(
     pf: &PreparedFilter,
@@ -972,6 +950,44 @@ fn query_needs_enrichment(
     })
 }
 
+/// Reuses the line engine's per-filter raw/meta decision without scanning
+/// unrelated rows. SQL already checked exact predicates; only residual tests
+/// belong here. A candidate is hydrated at most once, even with several tests.
+pub(crate) struct CandidateVerifier<'a> {
+    idx: &'a FileIndex,
+    pfs: &'a [PreparedFilter],
+    lines: Vec<(usize, bool)>,
+    verify: &'a [usize],
+    codes: &'a CodesConfig,
+    system: &'a CodesConfig,
+    derived: &'a [CompiledDerived],
+}
+impl<'a> CandidateVerifier<'a> {
+    pub(crate) fn new(idx: &'a FileIndex, pfs: &'a [PreparedFilter], lines: &[usize], verify: &'a [usize], codes: &'a CodesConfig, system: &'a CodesConfig, derived: &'a [CompiledDerived]) -> Self {
+        Self { idx, pfs, lines: lines.iter().map(|&i| (i, query_needs_enrichment(&pfs[i], codes, system, derived))).collect(), verify, codes, system, derived }
+    }
+    pub(crate) fn matches(&self, id: usize) -> bool {
+        let meta = &self.idx.lines[id];
+        let raw = line_bytes(self.idx, id);
+        let mut event = None;
+        for &(i, enriched) in &self.lines {
+            match meta_check(&self.pfs[i], meta, raw, enriched) {
+                Tri::Fail => return false,
+                Tri::Pass => (),
+                Tri::NeedEvent => {
+                    let ev = event.get_or_insert_with(|| event_at(self.idx, id, self.codes, self.system, self.derived));
+                    if !matches(ev, &self.pfs[i]) { return false; }
+                }
+            }
+        }
+        if !self.verify.is_empty() {
+            let ev = event.get_or_insert_with(|| event_at(self.idx, id, self.codes, self.system, self.derived));
+            if !self.verify.iter().all(|&i| matches(ev, &self.pfs[i])) { return false; }
+        }
+        true
+    }
+}
+
 pub fn query_indexed(
     idx: &FileIndex,
     filters: &[Filter],
@@ -982,7 +998,7 @@ pub fn query_indexed(
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-) -> QueryResult {
+) -> Result<QueryResult, String> {
     if let Some(result) = crate::engine::query(
         &engine_source(idx, codes, system, derived),
         &prepare(filters),
@@ -990,21 +1006,137 @@ pub fn query_indexed(
         sort_dir,
         offset,
         limit,
+    )? {
+        return Ok(result);
+    }
+    let page = query_page_lines(idx, filters, sort_column, sort_dir, offset, limit, codes, system, derived)?;
+    let total = count_lines(idx, filters, codes, system, derived);
+    crate::operations::check()?;
+    Ok(QueryResult { total, rows: page.rows })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn query_page_indexed(
+    idx: &FileIndex,
+    filters: &[Filter],
+    sort_column: &str,
+    sort_dir: &str,
+    offset: usize,
+    limit: usize,
+    cursor: Option<&str>,
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> Result<QueryPage, String> {
+    if let Some(result) = crate::engine::query_page(
+        &engine_source(idx, codes, system, derived), &prepare(filters),
+        sort_column, sort_dir, offset, limit, cursor,
     ) {
         return result;
     }
-    let matched = indexed_matches(idx, filters, codes, system, derived);
-    query_from_indexed_matches(
-        idx,
-        matched,
-        sort_column,
-        sort_dir,
-        offset,
-        limit,
-        codes,
-        system,
-        derived,
-    )
+    if cursor.is_some() {
+        return Err("PAGINATION_RESET_REQUIRED: O índice desta paginação não está disponível. Recarregue a primeira página para usar a recuperação.".into());
+    }
+    // Fallback remains explicit in the response; consumers can distinguish a
+    // ready indexed page from slower recovery while stores are being prepared.
+    query_page_lines(idx, filters, sort_column, sort_dir, offset, limit, codes, system, derived)
+}
+
+#[derive(Debug)]
+enum RecoveryKey {
+    Integer(i64),
+    Text(Option<f64>, String),
+}
+
+#[derive(Debug)]
+struct RecoveryRow { id: usize, key: RecoveryKey, desc: bool }
+
+impl RecoveryRow {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + match &self.key { RecoveryKey::Text(_, text) => text.len(), _ => 0 }
+    }
+}
+
+impl PartialEq for RecoveryRow { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
+impl Eq for RecoveryRow {}
+impl PartialOrd for RecoveryRow { fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) } }
+impl Ord for RecoveryRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let order = match (&self.key, &other.key) {
+            (RecoveryKey::Integer(a), RecoveryKey::Integer(b)) => a.cmp(b),
+            (RecoveryKey::Text(a, at), RecoveryKey::Text(b, bt)) => compare_sort_keys(*a, at, *b, bt),
+            _ => self.id.cmp(&other.id),
+        };
+        (if self.desc { order.reverse() } else { order }).then(self.id.cmp(&other.id))
+    }
+}
+
+/// Recovery is slower, but never allocates one id or sort key per matching
+/// event. Deep random access waits for the persistent index instead of risking
+/// a desktop OOM. Ordinary forward indexed navigation uses cursors above.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn query_page_lines(
+    idx: &FileIndex, filters: &[Filter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize, codes: &CodesConfig, system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> Result<QueryPage, String> {
+    for part in &idx.parts { crate::sources::validate_source(part)?; }
+    const WINDOW: usize = 10_000;
+    const KEY_BUDGET: usize = 32 << 20;
+    let keep = offset.saturating_add(limit).saturating_add(1);
+    if keep > WINDOW {
+        return Err("Navegação profunda aguarda o índice de consultas. Reduza o recorte ou conclua/repare a preparação.".into());
+    }
+    let pfs = prepare(filters);
+    let enriched: Vec<_> = pfs.iter().map(|pf| query_needs_enrichment(pf, codes, system, derived)).collect();
+    let mut selected: std::collections::BinaryHeap<RecoveryRow> = std::collections::BinaryHeap::new();
+    let (mut total, mut bytes) = (0usize, 0usize);
+    for i in 0..idx.lines.len() {
+        if i % 2048 == 0 { crate::operations::check()?; }
+        let meta = &idx.lines[i];
+        let line = line_bytes(idx, i);
+        let mut needs_event = false;
+        let mut eligible = true;
+        for (pf, enriched) in pfs.iter().zip(&enriched) {
+            match meta_check(pf, meta, line, *enriched) {
+                Tri::Fail => { eligible = false; break; }
+                Tri::NeedEvent => needs_event = true,
+                Tri::Pass => {}
+            }
+        }
+        if !eligible { continue; }
+        let mut event = needs_event.then(|| event_at(idx, i, codes, system, derived));
+        if event.as_ref().is_some_and(|event| !pfs.iter().all(|pf| matches(event, pf))) { continue; }
+        total += 1;
+        let key = match sort_column {
+            "" | "id" => RecoveryKey::Integer(i as i64),
+            "timestamp" => RecoveryKey::Integer(meta.ts),
+            "level" => RecoveryKey::Integer(meta.level as i64),
+            column => {
+                let event = event.get_or_insert_with(|| event_at(idx, i, codes, system, derived));
+                let text = event.col_ref(column).unwrap_or_default().to_lowercase();
+                if text.len() > KEY_BUDGET { return Err("Campo de ordenação excede o orçamento de recuperação. Escolha outra coluna ou conclua a preparação.".into()); }
+                RecoveryKey::Text(event.col_num(column), text)
+            }
+        };
+        let item = RecoveryRow { id: i, key, desc: !sort_column.is_empty() && sort_dir == "desc" };
+        if selected.len() < keep || selected.peek().is_some_and(|worst| item < *worst) {
+            if selected.len() == keep { bytes = bytes.saturating_sub(selected.pop().unwrap().bytes()); }
+            bytes = bytes.saturating_add(item.bytes());
+            if bytes > KEY_BUDGET { return Err("Ordenação excede o orçamento de recuperação. Reduza o recorte ou conclua a preparação.".into()); }
+            selected.push(item);
+        }
+    }
+    crate::operations::check()?;
+    let rows = selected.into_sorted_vec().into_iter().skip(offset).take(limit).map(|row| {
+        let mut event = event_at(idx, row.id, codes, system, derived);
+        crate::entities::annotate(&mut event);
+        event.raw.clear();
+        event
+    }).collect();
+    Ok(QueryPage::from_exact(QueryResult { total, rows }, offset, "lines", Some(
+        "Modo de recuperação: índice indisponível, leitura mais lenta e navegação limitada a 10 mil registros.".into(),
+    )))
 }
 
 fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
@@ -1053,6 +1185,50 @@ fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
 // Agregações
 // ==========================================================================
 
+pub(crate) struct AnalyticsBudget { used: usize, limit: usize }
+impl AnalyticsBudget {
+    pub(crate) fn new() -> Self { Self { used: 0, limit: crate::resources::analytics_bytes() } }
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        self.used = self.used.saturating_add(bytes);
+        if self.used > self.limit { Err("O resultado analítico excedeu o orçamento de valores (LOGINSIGHT_ANALYTICS_LIMIT_MB). Restrinja os filtros ou reduza os agrupamentos.".into()) } else { Ok(()) }
+    }
+    pub(crate) fn group(&mut self, key: &Option<String>, specs: usize) -> Result<(), String> {
+        self.charge(key.as_ref().map_or(0, |v| v.len()).saturating_mul(3).saturating_add(128).saturating_add(specs.saturating_mul(std::mem::size_of::<Acc>())))
+    }
+}
+
+#[cfg(test)]
+mod analytics_budget_tests {
+    use super::*;
+    #[test]
+    fn group_labels_and_text_values_share_one_byte_budget() {
+        let mut budget = AnalyticsBudget { used: 0, limit: 1024 };
+        budget.group(&Some("日".repeat(40)), 1).unwrap();
+        assert!(budget.group(&Some("x".repeat(400)), 1).is_err());
+        let mut budget = AnalyticsBudget { used: 0, limit: 64 };
+        let mut acc = Acc::StrAgg(Vec::new());
+        let mut event = Event::empty();
+        event.message = "日".repeat(30);
+        assert!(acc.push(&event, "message", &mut budget).is_err());
+        assert!(matches!(acc, Acc::StrAgg(ref values) if values.is_empty()));
+    }
+    #[test]
+    fn distinct_groups_charge_only_new_values_to_the_shared_budget() {
+        let mut budget = AnalyticsBudget { used: 0, limit: 200 };
+        let mut a = Acc::CountDistinct(Default::default());
+        let mut b = Acc::CountDistinct(Default::default());
+        let mut event = Event::empty();
+        event.message = "same".into();
+        a.push(&event, "message", &mut budget).unwrap();
+        let used = budget.used;
+        a.push(&event, "message", &mut budget).unwrap();
+        assert_eq!(used, budget.used);
+        b.push(&event, "message", &mut budget).unwrap();
+        event.message = "another".into();
+        assert!(b.push(&event, "message", &mut budget).is_err());
+    }
+}
+
 pub(crate) enum Acc {
     Count(u64),
     CountDistinct(crate::distinct::Counter),
@@ -1078,7 +1254,7 @@ impl Acc {
         }
     }
 
-    fn push(&mut self, ev: &Event, column: &str) {
+    fn push(&mut self, ev: &Event, column: &str, budget: &mut AnalyticsBudget) -> Result<(), String> {
         let numeric = || {
             if matches!(column, "timestamp" | "id") {
                 ev.col_num(column)
@@ -1092,7 +1268,7 @@ impl Acc {
             Acc::Count(n) => *n += 1,
             Acc::CountDistinct(set) => {
                 if let Some(s) = ev.col_str(column) {
-                    set.insert(s);
+                    budget.charge(set.try_insert(s)?)?;
                 }
             }
             Acc::Distinct(_) => {}
@@ -1125,12 +1301,14 @@ impl Acc {
                 if items.len() < 100 {
                     if let Some(s) = ev.col_str(column) {
                         if !s.is_empty() {
+                            budget.charge(s.len().saturating_mul(2).saturating_add(32))?;
                             items.push(s);
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn units(&self) -> &[usize; 5] {
@@ -1187,7 +1365,7 @@ pub fn multi_count(
     filters: &[Filter],
     columns: &[String],
 ) -> Vec<(String, AggResult)> {
-    let generation = crate::operations::current_generation();
+    let cancellation = crate::operations::current_token();
     columns
         .par_iter()
         .map(|col| {
@@ -1208,10 +1386,7 @@ pub fn multi_count(
                     }],
                 )
             };
-            let agg = match generation {
-                Some(g) => crate::operations::run(g, run).unwrap_or_default(),
-                None => run(),
-            };
+            let agg = crate::operations::run_with_token(cancellation.clone(), run).unwrap_or_default();
             (col.clone(), agg)
         })
         .collect()
@@ -1226,10 +1401,12 @@ pub fn multi_count_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Vec<(String, AggResult)> {
-    if let Some(result) = crate::engine::multi_count(&engine_source(idx, codes, system, derived), filters, columns) {
-        return result;
+    match crate::engine::multi_count(&engine_source(idx, codes, system, derived), filters, columns) {
+        Ok(Some(result)) => return result,
+        Err(error) => return columns.iter().map(|column| (column.clone(), AggResult::failure(error.clone()))).collect(),
+        Ok(None) => (),
     }
-    let generation = crate::operations::current_generation();
+    let cancellation = crate::operations::current_token();
     columns
         .par_iter()
         .map(|col| {
@@ -1253,10 +1430,7 @@ pub fn multi_count_indexed(
                     derived,
                 )
             };
-            let agg = match generation {
-                Some(g) => crate::operations::run(g, run).unwrap_or_default(),
-                None => run(),
-            };
+            let agg = crate::operations::run_with_token(cancellation.clone(), run).unwrap_or_default();
             (col.clone(), agg)
         })
         .collect()
@@ -1268,6 +1442,7 @@ pub(crate) fn build_agg_result(
     group_column: &str,
     specs: &[AggSpec],
 ) -> AggResult {
+    if groups.len() > group_budget(specs) { return AggResult::budget_error(); }
     order.sort_by(|a, b| {
         let (sa, sb) = (a.as_deref().unwrap_or(""), b.as_deref().unwrap_or(""));
         compare_sort_keys(
@@ -1365,6 +1540,7 @@ pub(crate) fn build_agg_result(
         value_units,
         omitted_groups,
         omitted_records,
+        error: None,
     }
 }
 
@@ -1375,15 +1551,17 @@ pub fn aggregate(
     specs: &[AggSpec],
 ) -> AggResult {
     let idx = filtered_indices(events, filters);
+    let mut budget = AnalyticsBudget::new();
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order: Vec<Option<String>> = Vec::new();
 
     for i in idx {
+        if groups.len() > group_budget(specs) { return AggResult::budget_error(); }
         if crate::operations::cancelled() {
             break;
         }
         let ev = &events[i];
-        push_group(&mut groups, &mut order, ev, ev.col_str(group_column), specs);
+        if let Err(error) = push_group(&mut groups, &mut order, ev, ev.col_str(group_column), specs, &mut budget) { return AggResult::failure(error); }
     }
     build_agg_result(groups, order, group_column, specs)
 }
@@ -1394,22 +1572,25 @@ fn push_group(
     ev: &Event,
     key: Option<String>,
     specs: &[AggSpec],
-) {
+    budget: &mut AnalyticsBudget,
+) -> Result<(), String> {
     let key = key.filter(|value| !value.trim().is_empty());
     // Caminho quente é o grupo já existente: get_mut evita clonar a chave
     // a cada linha; só clona ao criar um grupo novo.
     if let Some(accs) = groups.get_mut(&key) {
         for (acc, spec) in accs.iter_mut().zip(specs.iter()) {
-            acc.push(ev, &spec.column);
+            acc.push(ev, &spec.column, budget)?;
         }
-        return;
+        return Ok(());
     }
+    budget.group(&key, specs.len())?;
     order.push(key.clone());
     let mut accs: Vec<Acc> = specs.iter().map(|s| Acc::new(&s.func)).collect();
     for (acc, spec) in accs.iter_mut().zip(specs.iter()) {
-        acc.push(ev, &spec.column);
+        acc.push(ev, &spec.column, budget)?;
     }
     groups.insert(key, accs);
+    Ok(())
 }
 
 /// Colunas disponíveis direto dos metadados (sem parse da linha).
@@ -1442,158 +1623,35 @@ pub fn aggregate_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> AggResult {
-    if let Some(result) =
-        crate::engine::aggregate(&engine_source(idx, codes, system, derived), &prepare(filters), group_column, specs)
-    {
-        return result;
+    match crate::engine::aggregate(&engine_source(idx, codes, system, derived), &prepare(filters), group_column, specs) {
+        Ok(Some(result)) => return result,
+        Err(error) => return AggResult::failure(error),
+        Ok(None) => (),
     }
-    let matched = indexed_matches(idx, filters, codes, system, derived);
+    let mut budget = AnalyticsBudget::new();
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order: Vec<Option<String>> = Vec::new();
-
-    // Caminho rápido: grupo e agregações só sobre colunas de metadados
-    // (timestamp, level, code) — zero parse por linha.
     let meta_only = is_meta_column(group_column) && specs.iter().all(|s| is_meta_column(&s.column));
-
-    for i in matched {
-        if crate::operations::cancelled() {
-            break;
+    let mut failure = None;
+    let exceeded = std::sync::atomic::AtomicBool::new(false);
+    scan_indexed(idx, &prepare(filters), codes, system, derived, |i, _, event| {
+        if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+        Some(if meta_only { meta_event(idx, i) } else { event.unwrap_or_else(|| event_at(idx, i, codes, system, derived)) })
+    }, |event| {
+        if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return; }
+        if let Some(event) = event {
+            if let Err(error) = push_group(&mut groups, &mut order, &event, event.col_str(group_column), specs, &mut budget) { failure = Some(error); exceeded.store(true, std::sync::atomic::Ordering::Relaxed); }
+            if groups.len() > group_budget(specs) { exceeded.store(true, std::sync::atomic::Ordering::Relaxed); }
         }
-        if meta_only {
-            let ev = meta_event(idx, i);
-            push_group(
-                &mut groups,
-                &mut order,
-                &ev,
-                ev.col_str(group_column),
-                specs,
-            );
-        } else {
-            let ev = event_at(idx, i, codes, system, derived);
-            push_group(
-                &mut groups,
-                &mut order,
-                &ev,
-                ev.col_str(group_column),
-                specs,
-            );
-        }
-    }
+    });
+    if let Some(error) = failure { return AggResult::failure(error); }
+    if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return AggResult::budget_error(); }
     build_agg_result(groups, order, group_column, specs)
 }
 
 // ==========================================================================
 // Estatísticas (histograma + níveis)
 // ==========================================================================
-
-fn query_from_indexed_matches(
-    idx: &FileIndex,
-    mut matched: Vec<usize>,
-    sort_column: &str,
-    sort_dir: &str,
-    offset: usize,
-    limit: usize,
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-) -> QueryResult {
-    let desc = sort_dir == "desc";
-    match sort_column {
-        "" => {}
-        "timestamp" => sort_time(idx, &mut matched, desc),
-        "level" => matched.sort_by(|&a, &b| {
-            let ord = idx.lines[a].level.cmp(&idx.lines[b].level);
-            if desc {
-                ord.reverse()
-            } else {
-                ord
-            }
-        }),
-        col => {
-            let keys: HashMap<usize, (Option<f64>, String)> = matched
-                .iter()
-                .take_while(|_| !crate::operations::cancelled())
-                .map(|&i| {
-                    let event = event_at(idx, i, codes, system, derived);
-                    (
-                        i,
-                        (
-                            event.col_num(col),
-                            event.col_ref(col).unwrap_or_default().to_lowercase(),
-                        ),
-                    )
-                })
-                .collect();
-            if keys.len() != matched.len() {
-                return QueryResult {
-                    total: 0,
-                    rows: vec![],
-                };
-            }
-            matched.sort_by(|a, b| {
-                let ord = compare_sort_keys(keys[a].0, &keys[a].1, keys[b].0, &keys[b].1);
-                if desc {
-                    ord.reverse()
-                } else {
-                    ord
-                }
-            });
-        }
-    }
-    let total = matched.len();
-    let rows = matched
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|i| {
-            let mut event = event_at(idx, i, codes, system, derived);
-            crate::entities::annotate(&mut event);
-            event.raw.clear();
-            event
-        })
-        .collect();
-    QueryResult { total, rows }
-}
-
-fn aggregate_from_indexed_matches(
-    idx: &FileIndex,
-    matched: &[usize],
-    group_column: &str,
-    specs: &[AggSpec],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-) -> AggResult {
-    let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
-    let mut order = Vec::new();
-    let meta_only =
-        is_meta_column(group_column) && specs.iter().all(|spec| is_meta_column(&spec.column));
-    for &i in matched {
-        if crate::operations::cancelled() {
-            break;
-        }
-        if meta_only {
-            let event = meta_event(idx, i);
-            push_group(
-                &mut groups,
-                &mut order,
-                &event,
-                event.col_str(group_column),
-                specs,
-            );
-        } else {
-            let event = event_at(idx, i, codes, system, derived);
-            push_group(
-                &mut groups,
-                &mut order,
-                &event,
-                event.col_str(group_column),
-                specs,
-            );
-        }
-    }
-    build_agg_result(groups, order, group_column, specs)
-}
 
 pub fn explore_indexed(
     idx: &FileIndex,
@@ -1605,7 +1663,7 @@ pub fn explore_indexed(
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-) -> ExplorerSnapshot {
+) -> Result<ExplorerSnapshot, String> {
     if let Some(snapshot) = crate::engine::explore(
         &engine_source(idx, codes, system, derived),
         &prepare(filters),
@@ -1613,42 +1671,16 @@ pub fn explore_indexed(
         sort_dir,
         offset,
         limit,
-    ) {
-        return snapshot;
+    )? {
+        return Ok(snapshot);
     }
-    let matched = indexed_matches(idx, filters, codes, system, derived);
-    let stats = stats_from(matched.iter().map(|&i| {
-        (
-            (idx.lines[i].ts != 0).then_some(idx.lines[i].ts),
-            crate::model::class_label(idx.lines[i].level),
-        )
-    }));
-    let count = [AggSpec {
-        func: "count".into(),
-        column: "*".into(),
-        alias: "n".into(),
-    }];
-    let sources =
-        aggregate_from_indexed_matches(idx, &matched, "source", &count, codes, system, derived);
-    let codes_agg =
-        aggregate_from_indexed_matches(idx, &matched, "code", &count, codes, system, derived);
-    let query = query_from_indexed_matches(
-        idx,
-        matched,
-        sort_column,
-        sort_dir,
-        offset,
-        limit,
-        codes,
-        system,
-        derived,
-    );
-    ExplorerSnapshot {
-        query,
-        stats,
-        sources,
-        codes: codes_agg,
-    }
+    let query = query_indexed(idx, filters, sort_column, sort_dir, offset, limit, codes, system, derived)?;
+    let stats = stats_indexed(idx, filters, codes, system, derived)?;
+    let count = [AggSpec { func: "count".into(), column: "*".into(), alias: "n".into() }];
+    let sources = aggregate_indexed(idx, filters, "source", &count, codes, system, derived);
+    let codes_agg = aggregate_indexed(idx, filters, "code", &count, codes, system, derived);
+    crate::operations::check()?;
+    Ok(ExplorerSnapshot { query, stats, sources, codes: codes_agg })
 }
 
 pub(crate) fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i64)>) -> Stats {
@@ -1736,22 +1768,38 @@ pub fn stats_indexed(
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-) -> Stats {
+) -> Result<Stats, String> {
     let pfs = prepare(filters);
-    if let Some(stats) = crate::engine::stats(&engine_source(idx, codes, system, derived), &pfs) {
-        return stats;
+    if let Some(stats) = crate::engine::stats(&engine_source(idx, codes, system, derived), &pfs)? {
+        return Ok(stats);
     }
-    // Level classes and index time, as the Explorer shows them, whether or
-    // not a filter needed the parsed event.
-    let mut matched: Vec<(Option<i64>, &'static str)> = Vec::new();
+    // Two bounded passes trade recovery CPU for predictable memory. No vector
+    // of timestamps/matches proportional to a 50M-row source is retained.
+    let (mut min_ts, mut max_ts) = (i64::MAX, i64::MIN);
+    let mut levels: HashMap<&'static str, i64> = HashMap::new();
     scan_indexed(
-        idx,
-        &pfs,
-        codes,
-        system,
-        derived,
-        |_, meta, _| ((meta.ts != 0).then_some(meta.ts), crate::model::class_label(meta.level)),
-        |item| matched.push(item),
+        idx, &pfs, codes, system, derived,
+        |_, meta, _| (meta.ts, crate::model::class_label(meta.level)),
+        |(ts, level)| {
+            *levels.entry(level).or_default() += 1;
+            if ts != 0 { min_ts = min_ts.min(ts); max_ts = max_ts.max(ts); }
+        },
     );
-    stats_from(matched.into_iter())
+    let (mut buckets, mut bucket_ms) = (Vec::new(), 0);
+    if min_ts <= max_ts && !crate::operations::cancelled() {
+        let count;
+        (bucket_ms, count) = stats_layout(min_ts, max_ts);
+        let mut counts = vec![0i64; count];
+        scan_indexed(idx, &pfs, codes, system, derived, |_, meta, _| meta.ts, |ts| {
+            if ts != 0 {
+                let bucket = (ts.saturating_sub(min_ts) / bucket_ms) as usize;
+                counts[bucket.min(count - 1)] += 1;
+            }
+        });
+        buckets = counts.into_iter().enumerate().map(|(i, n)| (min_ts.saturating_add((i as i64).saturating_mul(bucket_ms)), n)).collect();
+    }
+    let mut levels: Vec<_> = levels.into_iter().map(|(key, n)| (key.to_string(), n)).collect();
+    sort_levels(&mut levels);
+    crate::operations::check()?;
+    Ok(build_stats(buckets, bucket_ms, levels))
 }

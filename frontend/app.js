@@ -115,6 +115,7 @@ const state = {
   stationAnalyticsId: null,
   dataPeriod: null,
   refreshVersion: 0,
+  datasetRevision: 0,
   activeOperation: null,
   tsSources: [], // fontes de data/hora selecionadas (ordem)
   currentDetailEv: null, // evento aberto no drawer
@@ -126,7 +127,8 @@ const state = {
   caseProfilesLoading: false,
   treeAgg: { dataset: null, case: null }, // contagens vivas por coluna da árvore (recorte atual)
   derivedFields: [], // campos customizados (regex) definidos pelo usuário
-  treeAggSig: { dataset: null, case: null }, // assinatura do último cálculo da árvore
+  treeAggSig: { dataset: null, case: null },
+  treeAggError: { dataset: null, case: null }, // assinatura do último cálculo da árvore
   colWidths: {}, // larguras das colunas da tabela, por coluna (px)
   loadOverlay: false,
   driveCollapsed: new Set(), // pastas de artefatos recolhidas na lista de arquivos
@@ -153,7 +155,7 @@ function setWorkbar(label, detail = "", progress = null, cancellable = false) {
   const bar = $("#workbar");
   const progressEl = $("#workbar-progress");
   const fill = $("#workbar-progress-fill");
-  const active = progress !== null;
+  const active = progress !== null || cancellable || !!state.activeOperation;
   bar.classList.toggle("active", active);
   $("#workbar-idle-icon").hidden = active;
   $("#workbar-spin").hidden = !active;
@@ -161,18 +163,21 @@ function setWorkbar(label, detail = "", progress = null, cancellable = false) {
   $("#workbar-detail").textContent = detail;
   progressEl.hidden = progress === null;
   if (progress !== null) fill.style.width = `${Math.max(0, Math.min(100, progress))}%`;
-  $("#workbar-cancel").hidden = !cancellable;
+  $("#workbar-cancel").hidden = !cancellable; $("#workbar-cancel").disabled = false;
   if (state.loadOverlay) mirrorLoadOverlay(label, detail, progress);
 }
 
 // ------------------------------------------------------------------ overlay de carga
 let loadStepCount = 0;
 
-function showLoadOverlay(firstStep = "Validando a fonte") {
+function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-load") {
   state.loadOverlay = true;
+  state.loadOverlayProgressKey = progressKey;
+  state.loadOverlayVersion = (state.loadOverlayVersion || 0) + 1;
   loadStepCount = 0;
   $("#load-steps").innerHTML = "";
-  $("#load-bar-fill").style.width = "4%";
+  $("#load-bar-fill").style.width = "0%"; $("#load-bar-fill").parentElement.hidden = true;
+  state.operationTiming = "";
   $("#load-phase").textContent = "Preparando…";
   $("#load-volume").textContent = "";
   $("#load-eta").textContent = "";
@@ -188,9 +193,10 @@ function hideLoadOverlay(ok = true) {
       li.classList.add("done");
       li.querySelector(".load-step-ico").innerHTML = '<i class="fas fa-check"></i>';
     });
-    $("#load-bar-fill").style.width = "100%";
+    $("#load-bar-fill").parentElement.hidden = false; $("#load-bar-fill").style.width = "100%";
     $("#load-phase").textContent = "Pronto!";
-    setTimeout(() => { $("#load-overlay").hidden = true; }, 450);
+    const version = state.loadOverlayVersion;
+    setTimeout(() => { if (version === state.loadOverlayVersion) $("#load-overlay").hidden = true; }, 450);
   } else {
     $("#load-overlay").hidden = true;
   }
@@ -215,57 +221,67 @@ function mirrorLoadOverlay(label, detail, progress) {
   if (label && label !== $("#load-phase").textContent) pushLoadStep(label);
   $("#load-phase").textContent = label;
   $("#load-volume").textContent = detail || "";
-  if (progress != null) $("#load-bar-fill").style.width = `${Math.max(4, Math.min(100, progress))}%`;
-  // taxa e tempo estimado a partir das últimas amostras de progresso
-  const etaEl = $("#load-eta");
-  const s = progressSamples;
-  if (s.length >= 2) {
-    const a = s[0], b = s[s.length - 1];
-    const dt = (b.at - a.at) / 1000;
-    const rate = dt > 0.05 ? (b.completed - a.completed) / dt : 0;
-    const remaining = b.total > 0 ? Math.max(0, b.total - b.completed) : 0;
-    if (rate > 0 && remaining > 0) {
-      const secs = Math.ceil(remaining / rate);
-      etaEl.textContent = `${fmtNum(Math.round(rate))}/s · faltam ${fmtNum(remaining)} · ≈ ${secs}s`;
-    } else if (b.total > 0 && remaining === 0) {
-      etaEl.textContent = "concluindo…";
-    }
-  }
+  $("#load-bar-fill").parentElement.hidden = progress == null;
+  if (progress != null) $("#load-bar-fill").style.width = `${Math.max(0, Math.min(100, progress))}%`;
+  $("#load-eta").textContent = state.operationTiming || "";
 }
 
 function startOperation(kind, label, detail = "") {
   state.activeOperation = { kind, cancelled: false };
-  setWorkbar(label, detail, 8, true);
-}
-
-function updateOperation(label, detail = "", progress = 52) {
-  if (!state.activeOperation) return;
-  setWorkbar(label, detail, progress, true);
-}
-
-function finishOperation(label, detail = "") {
-  state.activeOperation = null;
   setWorkbar(label, detail, null, false);
 }
 
-const progressSamples = []; // últimas amostras p/ taxa e ETA
+function updateOperation(label, detail = "", progress = null, cancellable = true) {
+  if (!state.activeOperation) return;
+  setWorkbar(label, detail, progress, cancellable);
+}
 
+function cancelWorkbarTask() {
+  if (!state.progressOperationId) { window.Tasks?.open(); return; }
+  window.Tasks?.cancelOperation(state.progressOperationId);
+  $("#workbar-detail").textContent = "Cancelando · aguardando confirmação";
+  $("#workbar-cancel").disabled = true;
+}
+function finishOperation(label, detail = "") {
+  state.activeOperation = null; state.progressOperationId = null;
+  setWorkbar(label, detail, null, false);
+}
+
+const progressSamples = []; // Retained only for load-overlay reset compatibility.
+const operationEstimates = new Map();
 window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
   if (!payload) return;
-  const total = Number(payload.total || 0);
-  const completed = Number(payload.completed || 0);
-  progressSamples.push({ completed, total, at: Date.now() });
-  if (progressSamples.length > 6) progressSamples.shift();
-  const progress = total > 0 ? (completed / total) * 100 : 12;
-  const volume = total > 0
-    ? `${fmtNum(completed)} de ${fmtNum(total)} ${payload.unit || "itens"}`
-    : (payload.unit || "");
-  setWorkbar(payload.phase || "Processando", volume, progress, !!payload.cancellable);
+  const task = window.Tasks?.progress(payload);
+  // Late messages from cancelled/replaced work must never overwrite the active UI.
+  if (payload.operationId && !task) return;
+  if (!payload.operationId && !state.loadOverlay) return;
+  // Each task keeps its own progress above. The foreground import overlay
+  // belongs only to its named foreground operation, including while session-save
+  // acknowledgement is pending after that native task has already settled.
+  if (state.loadOverlay && (!payload.operationId || payload.operationId !== window.Tasks?.operationFor(state.loadOverlayProgressKey || "source-load"))) return;
+  const id = payload.operationId || payload.operation || "legacy-load";
+  const estimate = task?.estimate || window.PerformanceTools.estimate(operationEstimates.get(id), payload);
+  operationEstimates.set(id, estimate);
+  if (operationEstimates.size > 32) operationEstimates.delete(operationEstimates.keys().next().value);
+  const elapsed = payload.elapsedMs != null ? payload.elapsedMs / 1000 : task ? (performance.now() - task.started) / 1000 : null;
+  const timing = [];
+  if (elapsed != null) timing.push(`${window.PerformanceTools.duration(elapsed)} decorridos`);
+  const phaseSeconds = window.PerformanceTools.phaseSeconds(payload, estimate);
+  if (phaseSeconds != null) timing.push(`${window.PerformanceTools.duration(phaseSeconds)} nesta etapa`);
+  if (payload.unit === "candidatos" && Number.isFinite(payload.selected)) timing.push(`${fmtNum(payload.selected)} selecionados`);
+  if (estimate.rate > 0) timing.push(`${fmtNum(Math.round(estimate.rate))} ${payload.unit || "itens"}/s`);
+  if (estimate.eta != null) timing.push(`≈ ${window.PerformanceTools.duration(estimate.eta)} nesta etapa`);
+  if (payload.resumedRows > 0) timing.push(`${fmtNum(payload.resumedRows)} registros retomados`);
+  if (payload.checkpointRows > 0) timing.push(`${fmtNum(payload.checkpointRows)} salvos para retomada`);
+  state.operationTiming = timing.join(" · ");
+  state.progressOperationId = task?.operationId || null;
+  const volume = estimate.total > 0 ? `${fmtNum(estimate.completed)} / ${fmtNum(estimate.total)} ${payload.unit || "itens"}` : estimate.completed ? `${fmtNum(estimate.completed)} ${payload.unit || "itens"}` : "Total ainda desconhecido";
+  setWorkbar(payload.phase || "Processando", [volume, state.operationTiming, payload.error].filter(Boolean).join(" · "), estimate.percent, !!task && !!payload.cancellable);
 }).catch(() => {});
 
 // live-refresh quando uma tool MCP muta o estado do backend
 window.__TAURI__.event?.listen("mcp-state-changed", ({ payload }) => {
-  state.explorerCache = null;
+  state.explorerCache = null; state.datasetRevision++; explorerAnalytics.clear();
   if (!payload?.kind) return;
   handleMcpStateChanged(payload.kind).catch(() => {});
 }).catch(() => {});
@@ -328,13 +344,31 @@ function artifactSessionFor(caseId = state.cases.active) {
 const baseName = (p) => String(p || "").split(/[\\/]/).pop() || String(p || "");
 
 // persiste as colunas visíveis no registro do artefato (por Caso)
-function saveVisibleCols() {
-  if (workspaceScope() === "case") { saveCases(); return; }
+function visiblePreferenceKey() { return `loginsight.columns.v1:${state.cases.active || "default"}:${workspaceScope()}:${workspaceScope() === "case" ? "case" : state.currentArtifact?.id || "dataset"}`; }
+function syncVisiblePreferenceMetadata() {
   const artifact = currentCaseArtifact();
-  if (!artifact) return;
-  artifact.visibleCols = [...state.visibleCols];
-  artifact.colWidths = { ...state.colWidths };
-  saveCases();
+  if (artifact && workspaceScope() !== "case") { artifact.visibleCols = [...state.visibleCols]; artifact.colWidths = { ...state.colWidths }; }
+}
+function saveVisibleCols() {
+  syncVisiblePreferenceMetadata();
+  // Small UI preferences are durable independently of potentially huge saved evidence.
+  try { localStorage.setItem(visiblePreferenceKey(), JSON.stringify({ columns: state.visibleCols, widths: state.colWidths })); }
+  catch { toast("Não foi possível salvar as preferências de colunas.", "err"); }
+}
+function clearVisiblePreferences(caseIds) {
+  try { for (const key of Object.keys(localStorage)) if (caseIds.some(id => key.startsWith(`loginsight.columns.v1:${id}:`))) localStorage.removeItem(key); } catch { /* Preferences are optional. */ }
+}
+function restoreVisiblePreferences() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(visiblePreferenceKey()) || "null");
+    if (!saved || !Array.isArray(saved.columns)) return;
+    const columns = [...new Set(saved.columns.filter(c => typeof c === "string" && state.columns.includes(c)))];
+    if (columns.length && state.columns.includes("timestamp") && !columns.includes("timestamp")) columns.unshift("timestamp");
+    if (columns.length) state.visibleCols = columns;
+    if (saved.widths && typeof saved.widths === "object") state.colWidths = Object.fromEntries(Object.entries(saved.widths).filter(([key, width]) => state.columns.includes(key) && Number.isFinite(width) && width >= 48 && width <= 4000));
+    if (columns.length) syncVisiblePreferenceMetadata();
+    return columns.length > 0;
+  } catch { /* An invalid preference never prevents opening data. */ }
 }
 
 async function removeArtifact(artifactId) {
@@ -443,8 +477,9 @@ function storeCurrentArtifactInSession() {
   });
   session.activeId = state.currentArtifact.id;
   registerCurrentArtifact(c);
-  saveCases();
+  const saved = saveCases();
   renderArtifactBar();
+  return saved;
 }
 
 async function activateArtifact(artifactId) {
@@ -468,7 +503,7 @@ async function syncActiveCaseArtifacts() {
     await activateArtifact(session.activeId);
     return;
   }
-  if (state.currentArtifact || state.loaded) await clearData();
+  if (state.currentArtifact || state.loaded || window.Tasks?.pendingSources?.()) await clearData();
   else updateContextBar();
 }
 
@@ -499,7 +534,7 @@ function updateContextBar() {
       : "Crie ou selecione um Caso para começar.";
     return;
   }
-  const bits = [fmtNum(state.total ?? artifact.count ?? 0) + " eventos"];
+  const bits = [state.total == null ? "Total do recorte em cálculo" : fmtNum(state.total) + " eventos"];
   if (state.dataPeriod?.min != null && state.dataPeriod?.max != null) {
     bits.push(`${fmtTs(state.dataPeriod.min)} — ${fmtTs(state.dataPeriod.max)}`);
   }
@@ -566,12 +601,18 @@ async function api(cmd, args = {}, opts = {}) {
   }
   try {
     if (args.filters?.length) await invoke("validate_filters", { filters: args.filters });
-    if (/^(load_|clear_|set_|save_|delete_|harvest_)/.test(cmd)) state.explorerCache = null;
+    if (opts.cancelled?.()) throw new Error("Operação cancelada.");
+    if (/^(load_|clear_|set_|save_|delete_|harvest_)/.test(cmd)) { state.explorerCache = null; state.datasetRevision++; explorerAnalytics.clear(); }
+    const preparedArgs = async (retry = false) => {
+      const prepared = await caseArgs(args, retry);
+      if (opts.cancelled?.()) throw new Error("Operação cancelada.");
+      return prepared;
+    };
     try {
-      return await invoke(cmd, await caseArgs(args));
+      return await invoke(cmd, await preparedArgs());
     } catch (error) {
       // The backend keeps a few versions; a missing one is sent again once.
-      if (String(error).includes("CASE_CACHE_MISS")) return await invoke(cmd, await caseArgs(args, true));
+      if (String(error).includes("CASE_CACHE_MISS")) return await invoke(cmd, await preparedArgs(true));
       throw error;
     }
   } catch (e) {
@@ -649,6 +690,8 @@ function fmtTsFull(ms) {
 function fmtNum(n) {
   return Number(n).toLocaleString("pt-BR");
 }
+
+function currentCountLabel(noun = "registros") { return state.total == null ? `Total de ${noun} em cálculo` : `${fmtNum(state.total)} ${noun}`; }
 
 function countLabel(value, singular, plural = `${singular}s`) {
   return `${fmtNum(value)} ${Number(value) === 1 ? singular : plural}`;
@@ -730,7 +773,7 @@ function autoVisibleCols() {
   if (!state.visibleCols.length && state.columns.includes("message")) state.visibleCols = ["message"];
   if (!state.visibleCols.length) state.visibleCols = state.columns.slice(0, 1);
   fillColumnControls();
-  renderTable({ total: state.total, rows: state.rows });
+  renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
 }
 
 // ------------------------------------------------------------------ tema
@@ -798,9 +841,45 @@ function skeletonRows() {
   }
 }
 
+function clearSourceRecovery() {
+  state.sourceIdentityUnconfirmed = false;
+  const notice = $("#source-recovery"); if (notice) notice.hidden = true;
+}
+
+function sourceIdentityUnavailable(source) {
+  const message = "A troca de fonte não foi concluída e a fonte ativa não pôde ser confirmada. Reabra uma fonte para continuar a Análise.";
+  state.refreshVersion++; state.datasetRevision++; treeAggVersion.dataset++; cubeState.requestVersion++;
+  explorerAnalytics.clear(); window.Discovery?.clearCache(); window.Security?.invalidate();
+  Object.assign(state, { sourceIdentityUnconfirmed: true, loaded: false, currentArtifact: null, currentOrigin: "", rows: [], total: null, columns: [], pageResult: null, dataPeriod: null, facetData: null, explorerCache: null, queryError: message, datasetDashboard: null, datasetCube: null, datasetProfiles: null });
+  state.treeAgg.dataset = null; state.treeAggSig.dataset = null; state.treeAggError.dataset = message;
+  cubeState.result = null;
+  renderTable({ rows: [], total: 0 }); renderChart({ buckets: [], levels: [] }); renderExploreTree();
+  for (const selector of ["#group-table thead", "#group-table tbody", "#cube-table thead", "#cube-table tbody", "#dash-grid"]) $(selector)?.replaceChildren();
+  let notice = $("#source-recovery");
+  if (!notice) { notice = el("div", "notice"); notice.id = "source-recovery"; notice.setAttribute("role", "alert"); $("#workspace-home").before(notice); }
+  notice.hidden = false; notice.replaceChildren(document.createTextNode(message));
+  if (source?.kind) {
+    const retry = el("button", "btn primary small", "Reabrir fonte");
+    retry.onclick = async () => { retry.disabled = true; if (!await loadData(source)) retry.disabled = false; };
+    notice.append(retry);
+  }
+  if (workspaceScope() === "dataset") window.Workspace?.showPage("summary");
+  updateContextBar(); finishOperation("Fonte não confirmada", "Reabra uma fonte para continuar.");
+}
+
 async function loadData(requestedSource = null, options = {}) {
+  const version = options.version ?? ++state.artifactSwitchVersion;
+  let caseId = options.caseId ?? state.cases.active;
+  const current = () => version === state.artifactSwitchVersion && (!caseId || state.cases.active === caseId);
+  if (!current()) return false;
+  const sourceMayHaveChanged = window.Tasks?.pendingSources?.() || false;
+  let sourceAccepted = false, desiredSource = requestedSource || state.currentArtifact?.source;
+  window.Tasks?.cancelLatest("source-load");
+  state.refreshVersion++;
   await window.WorkspaceContext?.waitForSource();
+  if (!current()) return false;
   if (window.WorkspaceContext?.scope() === "case") await window.WorkspaceContext.setScope("dataset", { animate: false });
+  if (!current()) return false;
   const btn = $("#btn-load");
   btn.disabled = true;
   btn.innerHTML = '<i class="fas fa-circle-notch spin"></i> Carregando…';
@@ -811,23 +890,25 @@ async function loadData(requestedSource = null, options = {}) {
   skeletonRows();
   try {
     let source = requestedSource ? { ...requestedSource } : sourceSpecFromControls();
+    desiredSource = source;
     if (source.kind === "file") {
       source.paths = source.paths?.filter(Boolean)?.length
         ? source.paths
         : (source.path ? [source.path] : []);
       if (!source.paths.length) {
         await browseFile();
+        if (!current()) return false;
         source.paths = $("#file-path").value.split(";").map((s) => s.trim()).filter(Boolean);
         source.path = source.paths[0] || "";
         if (!source.paths.length) return;
       }
     }
     if (source.kind === "eventlog" && !source.channel) source.channel = "Application";
-    const c = options.caseId
-      ? state.cases.cases.find((item) => item.id === options.caseId)
+    const c = caseId
+      ? state.cases.cases.find((item) => item.id === caseId)
       : ensureCase();
-    if (!c || state.cases.active !== c.id) return;
-    const version = options.version ?? ++state.artifactSwitchVersion;
+    if (!c || !current() || state.cases.active !== c.id) return false;
+    caseId = c.id;
     let merge = !!options.merge;
     if (merge && state.currentArtifact?.source) {
       const currentMembers = state.currentArtifact.source.kind === "bundle"
@@ -849,23 +930,25 @@ async function loadData(requestedSource = null, options = {}) {
       source = { kind: "bundle", members: uniqueMembers, path: uniqueMembers[0]?.path || uniqueMembers[0]?.channel || "" };
       merge = false;
     }
+    desiredSource = source;
     applySourceSpec(source);
     let summary;
     if (source.kind === "bundle") {
-      summary = await api("load_bundle", { members: source.members.map(s => s.kind === "file" ? { ...s, paths: s.paths?.length ? s.paths : [s.path], format: s.format || "auto" } : { ...s, maxEvents: s.maxEvents || 5000 }) }, { silent: true });
+      summary = await api("load_bundle", { members: source.members.map(s => s.kind === "file" ? { ...s, paths: s.paths?.length ? s.paths : [s.path], format: s.format || "auto" } : { ...s, maxEvents: s.maxEvents || 5000 }) }, { silent: true, latest: "source-load" });
     } else if (source.kind === "file") {
       summary = source.paths.length > 1
-        ? await api("load_files", { paths: source.paths, format: source.format || "auto", merge }, { silent: true })
-        : await api("load_file", { path: source.path, format: source.format || "auto", merge }, { silent: true });
+        ? await api("load_files", { paths: source.paths, format: source.format || "auto", merge }, { silent: true, latest: "source-load" })
+        : await api("load_file", { path: source.path, format: source.format || "auto", merge }, { silent: true, latest: "source-load" });
     } else {
       summary = await api("load_event_log", {
         channel: source.channel,
         maxEvents: source.maxEvents || 5000,
         merge,
-      }, { silent: true });
+      }, { silent: true, latest: "source-load" });
     }
-    if (version !== state.artifactSwitchVersion || state.cases.active !== c.id) return;
-    updateOperation("Artefato carregado", `${fmtNum(summary.count)} eventos indexados`, 82);
+    if (!current()) return false;
+    sourceAccepted = true; clearSourceRecovery();
+    updateOperation("Artefato carregado", `${fmtNum(summary.count)} eventos indexados`, null, false);
     state.columns = summary.columns;
     const savedArtifact = c.artifacts?.find((a) => a.id === artifactIdFromSource(source));
     state.visibleCols = savedArtifact?.visibleCols?.filter((col) => summary.columns.includes(col));
@@ -898,13 +981,15 @@ async function loadData(requestedSource = null, options = {}) {
       loadedAt: Date.now(),
       source,
     };
-    storeCurrentArtifactInSession();
+    const restoredVisiblePreferences = restoreVisiblePreferences();
+    const artifactSaved = storeCurrentArtifactInSession();
     if (source.kind === "file") {
       const path = source.path;
       const linked = currentCaseArtifact();
       const st = linked ? caseStations().find((s) => s.id === linked.stationId) : null;
       if (st) state.currentOrigin = st.name;
-      await loadTsConfig(path);
+      await loadTsConfig(path, current);
+      if (!current()) return false;
     }
     state.datasetDashboard = null;
     state.datasetCube = null;
@@ -915,19 +1000,27 @@ async function loadData(requestedSource = null, options = {}) {
     if (hasComments && !state.columns.includes("comentario")) state.columns.push("comentario");
     if (hasComments && !state.visibleCols.includes("comentario")) state.visibleCols.push("comentario");
     await refresh();
+    if (!current()) return false;
     // perfis dos campos alimentam os nós de valores/faixas da árvore de exploração
     api("profile_fields", { filters: [] }, { silent: true })
-      .then((profiles) => { state.datasetProfiles = profiles; renderExploreTree(); })
+      .then((profiles) => { if (current()) { state.datasetProfiles = profiles; renderExploreTree(); } })
       .catch(() => {});
-    if (!savedArtifact?.visibleCols?.length) autoVisibleCols();
+    if (!savedArtifact?.visibleCols?.length && !restoredVisiblePreferences) autoVisibleCols();
     updateTsExample();
     updateContextBar();
-    finishOperation("Artefato pronto", `${fmtNum(state.total)} eventos disponíveis`);
-    hideLoadOverlay(true);
+    // Rows are already visible, but a completed load must also survive an immediate restart.
+    // The former snapshot query happened to outlast this debounced save; paging need not.
+    const sessionSaved = await artifactSaved;
+    if (!current()) return false;
+    finishOperation(sessionSaved === false ? "Registros disponíveis · sessão não salva" : "Artefato pronto", sessionSaved === false ? "Reabra a fonte manualmente se reiniciar o aplicativo." : state.total == null ? "Registros disponíveis · total em cálculo" : `${fmtNum(state.total)} eventos disponíveis`);
+    hideLoadOverlay(sessionSaved !== false);
     await window.Workspace?.loaded();
+    if (!current()) return false;
     if (document.body.dataset.page === "summary") await window.Workspace?.showPage("summary");
-    return true;
+    return current();
   } catch (e) {
+    if (!current()) return false;
+    if (sourceMayHaveChanged && !sourceAccepted) { sourceIdentityUnavailable(desiredSource); toast(String(e), "err"); return false; }
     if (String(e).includes("ELEVATION_REQUIRED")) {
       status.textContent = "Este canal exige permissão de administrador.";
       status.classList.add("err");
@@ -948,15 +1041,28 @@ async function loadData(requestedSource = null, options = {}) {
     finishOperation("Falha ao carregar artefato", "Tente revisar a fonte ou o formato.");
     return false;
   } finally {
-    if (state.loadOverlay) hideLoadOverlay(false); // cobre cancelamento/erro
-    btn.disabled = false;
-    btn.innerHTML = '<i class="fas fa-play"></i> Carregar';
+    if (current()) {
+      if (sourceMayHaveChanged && !sourceAccepted && !state.sourceIdentityUnconfirmed) sourceIdentityUnavailable(desiredSource);
+      if (state.loadOverlay) hideLoadOverlay(false); // cobre cancelamento/erro
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-play"></i> Carregar';
+    }
   }
 }
 
 async function clearData({ removeCurrent = false } = {}) {
+  const version = ++state.artifactSwitchVersion;
+  const sourceMayHaveChanged = window.Tasks?.pendingSources?.() || false;
+  window.Tasks?.cancelLatest("source-load");
+  state.refreshVersion++;
   const artifact = state.currentArtifact;
-  await api("clear_events");
+  try { await api("clear_events", {}, { latest: "source-load" }); }
+  catch (error) { if (version !== state.artifactSwitchVersion) return false; if (sourceMayHaveChanged) sourceIdentityUnavailable(artifact?.source); throw error; }
+  if (version !== state.artifactSwitchVersion) return false;
+  clearSourceRecovery();
+  if (state.loadOverlay) hideLoadOverlay(false);
+  $("#btn-load").disabled = false;
+  $("#btn-load").innerHTML = '<i class="fas fa-play"></i> Carregar';
   if (removeCurrent && artifact) {
     const session = artifactSessionFor();
     if (session) {
@@ -984,6 +1090,7 @@ async function clearData({ removeCurrent = false } = {}) {
   updateContextBar();
   if (state.activeDatasetTab === "cube" && state.analyticsScope === "dataset") runCube();
   finishOperation("Nenhuma fonte carregada");
+  return true;
 }
 
 // ------------------------------------------------------------------ filtros / chips
@@ -1467,7 +1574,7 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
   const context = scope === "case" ? caseSig() : `${state.currentArtifact?.id}:${state.currentArtifact?.loadedAt}`;
   if ((scope === "dataset" && !state.loaded) || (scope === "case" && !activeCase())) {
     state.treeAgg[scope] = null;
-    state.treeAggSig[scope] = null;
+    state.treeAggSig[scope] = null; state.treeAggError[scope] = null;
     renderExploreTree();
     return;
   }
@@ -1479,7 +1586,7 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
   const { categories, ranges } = treeGroupProfiles(profiles);
   const cols = ["level", "source", "code", ...categories.map((p) => p.name), ...ranges.map((p) => p.name)];
   const filters = backendFilters();
-  const sig = [scope, JSON.stringify(filters), cols.join(" "), scope === "case" ? caseSig() : (state.currentArtifact?.id || "")].join("|");
+  const sig = [scope, state.datasetRevision, JSON.stringify(state.derivedFields), JSON.stringify(filters), cols.join(" "), scope === "case" ? caseSig() : (state.currentArtifact?.id || "")].join("|");
   if (!force && state.treeAggSig[scope] === sig && state.treeAgg[scope]) {
     renderExploreTree();
     return;
@@ -1493,10 +1600,21 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
       columns: cols,
       filters,
       ...(scope === "case" ? { caseEvents: caseEvents() } : {}),
-    }, { silent: true });
-  } catch { spinDone(); return; }
+    }, { silent: true, latest: "explore-tree" });
+  } catch (error) {
+    spinDone();
+    if (version === treeAggVersion[scope] && workspaceScope() === scope && !/cancelad|substituíd/i.test(String(error))) {
+      state.treeAggSig[scope] = null; state.treeAggError[scope] = String(error); renderExploreTree();
+    }
+    return;
+  }
   spinDone();
   if (version !== treeAggVersion[scope] || workspaceScope() !== scope || context !== (scope === "case" ? caseSig() : `${state.currentArtifact?.id}:${state.currentArtifact?.loadedAt}`)) return;
+  const errors = (res || []).filter(([, agg]) => agg.error).map(([col, agg]) => `${colLabel(col)}: ${agg.error}`);
+  if (errors.length) {
+    state.treeAggSig[scope] = null; state.treeAggError[scope] = errors.join(" · "); renderExploreTree(); return;
+  }
+  state.treeAggError[scope] = null;
   const map = {};
   for (const [col, agg] of res || []) {
     map[col] = agg.rows.map((r, index) => {
@@ -1512,6 +1630,10 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
 
 function renderExploreTreeInto(box, scope) {
   box.innerHTML = "";
+  if (state.treeAggError?.[scope]) {
+    const error = el("p", "muted small", `Contagens não atualizadas; valores anteriores podem estar fora do recorte. ${state.treeAggError[scope]}`);
+    error.setAttribute("role", "status"); box.append(error);
+  }
   if (scope === "dataset" && !state.loaded) {
     box.innerHTML = '<p class="muted small">Carregue uma fonte para explorar.</p>';
     return;
@@ -1861,82 +1983,126 @@ function positionPop(pop, anchor) {
 }
 
 // ------------------------------------------------------------------ refresh
-async function refresh({ analytics = true } = {}) {
+const explorerAnalytics = new Map();
+const explorerBackground = window.PerformanceTools.queue(1);
+let explorerIntent = "", explorerCursorKey = "", explorerCursors = [null];
+function explorerKey() {
+  const scope = workspaceScope();
+  return JSON.stringify([scope, state.datasetRevision, activeCase()?.id, scope === "case" ? caseSig() : [state.currentArtifact?.id, state.currentArtifact?.loadedAt], backendFilters(), state.derivedFields]);
+}
+function showQueryEngine(page) {
+  let note = $("#query-engine-status");
+  if (!note) { note = el("div", "muted small"); note.id = "query-engine-status"; note.setAttribute("role", "status"); $("#events-table").before(note); }
+  note.textContent = page.warning || ""; note.hidden = !page.warning;
+}
+let engineStatusTimer = null, engineStatusRequest = 0;
+async function refreshEngineStatus() {
+  clearTimeout(engineStatusTimer);
+  const request = ++engineStatusRequest, source = state.currentArtifact?.loadedAt;
+  if (!state.loaded || workspaceScope() !== "dataset") return;
+  try {
+    const status = await api("engine_status", {}, { silent: true });
+    if (request !== engineStatusRequest || source !== state.currentArtifact?.loadedAt || workspaceScope() !== "dataset") return;
+    let box = $("#engine-readiness");
+    if (!box) { box = el("div", "muted small"); box.id = "engine-readiness"; box.setAttribute("role", "status"); $("#events-table").before(box); }
+    if (!status || status.state === "ready") { box.hidden = true; return; }
+    box.hidden = false;
+    const detail = [status.baseReady ? "Consultas dos campos básicos disponíveis" : "Consultas podem usar leitura dos arquivos", status.phase,
+      status.totalRows ? `${fmtNum(status.completedRows)} / ${fmtNum(status.totalRows)} registros preparados` : null,
+      status.resumedRows ? `${fmtNum(status.resumedRows)} retomados` : null, status.error].filter(Boolean).join(" · ");
+    box.replaceChildren(document.createTextNode(detail));
+    if (["degraded", "cancelled", "failed"].includes(status.state) && status.canResume) {
+      const retry = el("button", "btn ghost small", "Retomar preparação");
+      retry.onclick = async () => { retry.disabled = true; try { await api("engine_retry"); await refreshEngineStatus(); } catch { retry.disabled = false; } };
+      box.append(retry);
+    }
+    if (status.state === "indexing") engineStatusTimer = setTimeout(refreshEngineStatus, 2000);
+  } catch { /* Older/in-memory sources may have no engine status. The page remains usable. */ }
+}
+function updatePager(qr = state.pageResult || { rows: state.rows, total: state.total, hasMore: false }) {
+  if ($("#events-table").getAttribute("aria-busy") === "true" || state.queryError) {
+    $("#pg-prev").disabled = true; $("#pg-next").disabled = true; return;
+  }
+  const page = Number.isInteger(qr.pageIndex) ? qr.pageIndex : state.page;
+  const known = Number.isFinite(qr.total), pages = known ? Math.max(1, Math.ceil(qr.total / state.pageSize)) : null;
+  $("#pg-label").textContent = pages === null ? `Página ${page + 1}` : `${page + 1} / ${pages}`;
+  $("#pg-prev").disabled = page === 0;
+  $("#pg-next").disabled = known ? page >= pages - 1 : !qr.hasMore;
+  const from = qr.rows.length ? page * state.pageSize + 1 : 0, to = page * state.pageSize + qr.rows.length;
+  $("#result-count").textContent = state.loaded ? `${fmtNum(from)}–${fmtNum(to)}${known ? ` de ${fmtNum(qr.total)}` : " · total em cálculo"}` : "";
+}
+function loadExplorerAnalytics(key, scope, filters) {
+  if (explorerAnalytics.has(key)) return explorerAnalytics.get(key);
+  const args = { filters, ...(scope === "case" ? { caseEvents: caseEvents() } : {}) };
+  const current = () => key === explorerKey();
+  const entry = { total: null, stats: null };
+  explorerAnalytics.set(key, entry);
+  if (explorerAnalytics.size > 8) explorerAnalytics.delete(explorerAnalytics.keys().next().value);
+  // Each result updates independently. No analytical work gates the first page.
+  entry.promise = explorerBackground.add(async () => {
+    try {
+      entry.total = await api("count_filtered", args, { silent: true, latest: "explore-count" });
+      if (!current()) { explorerAnalytics.delete(key); return; }
+      state.total = entry.total; if (state.pageResult) state.pageResult.total = entry.total;
+      updatePager(); updateContextBar(); window.Workspace?.onCountChanged?.();
+      entry.stats = await api("stats_events", args, { silent: true, latest: "explore-stats" });
+      if (!current()) { explorerAnalytics.delete(key); return; }
+      renderChart(entry.stats);
+      state.facetData = { ...(state.facetData || {}), levels: entry.stats.levels };
+      if (entry.stats.buckets?.length) state.dataPeriod = { min: entry.stats.buckets[0][0], max: entry.stats.buckets.at(-1)[0] + (entry.stats.bucketMs ?? entry.stats.bucket_ms ?? 0) };
+      await refreshTreeAggs(scope);
+    } catch (error) {
+      explorerAnalytics.delete(key);
+      if (current() && !/cancelad|substituíd/i.test(String(error))) { const n = $("#query-engine-status"); if (n) { n.hidden = false; n.textContent = `Registros disponíveis; resumo não concluído: ${String(error)}`; } }
+    }
+  }, current).catch(() => { explorerAnalytics.delete(key); });
+  return entry;
+}
+async function refresh({ analytics = true, resetAttempt = false } = {}) {
   const scope = workspaceScope();
   if (scope === "dataset" && !state.loaded) return;
-  const filters = backendFilters();
-  const version = ++state.refreshVersion;
-  // evita cliques duplos na paginação enquanto a consulta está no ar
-  $("#pg-prev").disabled = true;
-  $("#pg-next").disabled = true;
-  const loading = areaLoading($("#tab-table"), "Consultando…");
-  startOperation("explore", "Atualizando exploração", "Lendo eventos e calculando recortes");
-  let snapshot;
-  try {
-    const cacheKey = JSON.stringify([scope, scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, filters]);
-    const cached = state.explorerCache?.key === cacheKey ? state.explorerCache.snapshot : null;
-    const result = await api(cached ? "query_events" : "explore_snapshot", {
-      filters,
-      ...(scope === "case" ? { caseEvents: caseEvents() } : {}),
-      sortColumn: state.sortCol,
-      sortDir: state.sortDir,
-      offset: state.page * state.pageSize,
-      limit: state.pageSize,
-    });
-    snapshot = cached ? { ...cached, query: result } : result;
-    if (version === state.refreshVersion && snapshot.query.total > 0 && state.page * state.pageSize >= snapshot.query.total) {
-      state.page = Math.floor((snapshot.query.total - 1) / state.pageSize);
-      snapshot = { ...snapshot, query: await api("query_events", { filters, ...(scope === "case" ? { caseEvents: caseEvents() } : {}), sortColumn: state.sortCol, sortDir: state.sortDir, offset: state.page * state.pageSize, limit: state.pageSize }) };
-    }
-    if (version === state.refreshVersion) state.explorerCache = { key: cacheKey, snapshot };
-  } catch (e) {
-    loading.done();
-    if (version === state.refreshVersion) {
-      state.queryError = String(e); state.rows = []; state.total = 0; state.dataPeriod = null; state.explorerCache = null;
-      renderTable({ rows: [], total: 0 });
-      $("#empty-state p").textContent = "Não foi possível consultar. Revise os filtros ou tente novamente.";
-      const retry = el("button", "btn ghost small", "Tentar novamente"); retry.dataset.retry = "true"; retry.onclick = () => refresh(); $("#empty-state").append(retry);
-      $("#pg-prev").disabled = true; $("#pg-next").disabled = true; $("#result-count").textContent = "Consulta não concluída";
-      if (chart) { chart.destroy(); chart = null; } $("#chart").replaceChildren();
-      updateContextBar();
-      finishOperation("Falha ao atualizar", String(e));
-    }
-    return false;
+  const filters = backendFilters(), key = explorerKey();
+  const cursorKey = JSON.stringify([key, state.sortCol, state.sortDir, state.pageSize]);
+  if (cursorKey !== explorerCursorKey) { explorerCursorKey = cursorKey; explorerCursors = [null]; state.page = 0; }
+  if (explorerIntent !== key) {
+    explorerIntent = key; state.dataPeriod = null; state.facetData = null;
+    window.Tasks?.cancelLatest("explore-count"); window.Tasks?.cancelLatest("explore-stats"); window.Tasks?.cancelLatest("explore-tree");
+    if (chart) { chart.destroy(); chart = null; } $("#chart").replaceChildren();
   }
-  if (version !== state.refreshVersion) { loading.done(); return; }
-  const { query: qr, stats, sources: srcAgg, codes: codeAgg } = snapshot;
-  state.queryError = null;
-  if (!qr.total) state.page = 0;
-  state.total = qr.total;
-  state.rows = qr.rows;
-  if (stats.buckets?.length) {
-    state.dataPeriod = {
-      min: stats.buckets[0][0],
-      max: stats.buckets[stats.buckets.length - 1][0] + (stats.bucketMs ?? stats.bucket_ms ?? 0),
-    };
-  } else state.dataPeriod = null;
-  renderTable(qr);
-  renderChart(stats);
-  renderChips();
-
-  const toRows = (agg) =>
-    agg.rows
-      .map((r) => {
-        const key = Object.keys(r).find((k) => k !== "n");
-        return [r[key], r.n];
-      })
-      .sort((a, b) => b[1] - a[1]);
-  state.facetData = { levels: stats.levels, sources: toRows(srcAgg), codes: toRows(codeAgg) };
-  refreshTreeAggs(scope);
-  updateContextBar();
-  // recalcula a aba analítica aberta para refletir o novo recorte
-  if (analytics && state.activeDatasetTab === "dashboard") renderDashboard(scope);
-  else if (analytics && state.activeDatasetTab === "cube") runCube();
-  else if (analytics && state.activeDatasetTab === "group") runGroup();
-  loading.done();
-  finishOperation("Pronto", `${fmtNum(qr.total)} eventos no recorte`);
-  window.Workspace?.onRefresh();
-  return true;
+  const version = ++state.refreshVersion;
+  $("#pg-prev").disabled = true; $("#pg-next").disabled = true;
+  $("#events-table").setAttribute("aria-busy", "true");
+  $("#result-count").textContent = state.rows.length ? "Atualizando · registros anteriores" : "Consultando…";
+  try {
+    const qr = await api("query_page", { filters, ...(scope === "case" ? { caseEvents: caseEvents() } : {}), sortColumn: state.sortCol, sortDir: state.sortDir, offset: state.page * state.pageSize, limit: state.pageSize, cursor: explorerCursors[state.page] || null }, { latest: "explore-page" });
+    if (version !== state.refreshVersion || key !== explorerKey()) return false;
+    const cached = explorerAnalytics.get(key);
+    if (Number.isFinite(cached?.total)) qr.total = cached.total;
+    state.queryError = null; qr.pageIndex = state.page; state.rows = qr.rows; state.total = qr.total; state.pageResult = qr;
+    $("#events-table").setAttribute("aria-busy", "false");
+    explorerCursors[state.page + 1] = qr.nextCursor || null;
+    renderTable(qr); showQueryEngine(qr); renderChips(); updateContextBar();
+    if (scope === "dataset") refreshEngineStatus();
+    if (cached?.stats) {
+      renderChart(cached.stats);
+      explorerBackground.add(() => refreshTreeAggs(scope), () => key === explorerKey()).catch(() => {});
+    }
+    loadExplorerAnalytics(key, scope, filters);
+    if (analytics && state.activeDatasetTab === "dashboard") renderDashboard(scope);
+    else if (analytics && state.activeDatasetTab === "cube") runCube();
+    else if (analytics && state.activeDatasetTab === "group") runGroup();
+    window.Workspace?.onRefresh();
+    return true;
+  } catch (error) {
+    if (version !== state.refreshVersion || key !== explorerKey()) return false;
+    if (!resetAttempt && String(error).includes("PAGINATION_RESET_REQUIRED:")) { explorerCursors = [null]; state.page = 0; return refresh({ analytics, resetAttempt: true }); }
+    state.queryError = String(error);
+    $("#result-count").textContent = /cancelad|substituíd/i.test(String(error)) ? "Consulta cancelada · registros anteriores" : "Consulta não concluída · registros anteriores";
+    $("#pg-prev").disabled = true; $("#pg-next").disabled = true;
+    showQueryEngine({ warning: String(error) });
+    const retry = el("button", "btn ghost small", "Tentar novamente"); retry.onclick = () => refresh(); $("#query-engine-status").append(retry);
+    return false;
+  } finally { if (version === state.refreshVersion) $("#events-table").setAttribute("aria-busy", "false"); }
 }
 
 function scheduleRefresh() {
@@ -2239,13 +2405,14 @@ function buildTsConfig() {
   };
 }
 
-async function loadTsConfig(path) {
+async function loadTsConfig(path, current = () => true) {
   $("#ts-zone").value = ""; $("#ts-clock").value = "0";
   state.tsSources = [];
   $("#ts-regex").value = "";
   $("#ts-complement").value = "";
   try {
     const cfg = await api("get_ts_config", { path }, { silent: true });
+    if (!current()) return;
     if (cfg) {
       $("#ts-zone").value = cfg.timezone_offset_minutes == null ? "" : String(cfg.timezone_offset_minutes);
       $("#ts-clock").value = String((cfg.clock_adjustment_ms || 0) / 1000);
@@ -2263,7 +2430,7 @@ async function loadTsConfig(path) {
       }
     }
   } catch { /* sem config salva */ }
-  renderTsSources();
+  if (current()) renderTsSources();
 }
 
 async function testTsConfig() {
@@ -2302,11 +2469,11 @@ async function applyTsConfig() {
   const empty = cfg.sources.length === 0 || !cfg.format;
   const done = btnBusy($("#ts-apply"), "Aplicando…");
   // status detalhado: passos + progresso por linha + resultado
-  showLoadOverlay("Aplicando configuração de data/hora");
+  showLoadOverlay("Aplicando configuração de data/hora", "timestamp-config");
   try {
     // cada arquivo do conjunto guarda a config pela própria chave (caminho)
     for (const path of paths) {
-      await api("set_ts_config", { path, config: empty ? null : cfg });
+      await api("set_ts_config", { path, config: empty ? null : cfg }, { latest: "timestamp-config" });
     }
     hideLoadOverlay(true);
     toast(empty ? "Configuração de data/hora removida." : "Data/hora aplicada aos eventos.", "ok");
@@ -2580,7 +2747,8 @@ async function saveDerivedField() {
   try {
     await api("save_derived_field", { name, source: dvCtx.sourceCol, rules });
     $("#derive-modal").hidden = true;
-    loadDerivedFields();
+    await loadDerivedFields();
+    refreshEngineStatus();
     toast(`Campo "${name}" salvo.`, "ok");
     // disponibiliza a coluna imediatamente (árvore, seletor de colunas, agrupamentos)
     if (!state.columns.includes(name)) {
@@ -2815,25 +2983,32 @@ function updateFilterTabsLayout() {
 }
 
 let filterCountsTimer = null;
+const filterCountsCache = new Map();
 function refreshFilterTabCounts() {
   clearTimeout(filterCountsTimer);
-  filterCountsTimer = setTimeout(async () => {
-    const saved = savedFilters();
-    if (!saved.length) return;
+  filterCountsTimer = setTimeout(() => {
+    const context = JSON.stringify([state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields, activeCase()?.id, caseSig()]);
     const caseEvs = caseEvents();
-    await Promise.all(saved.map(async (f) => {
+    for (const f of savedFilters()) {
       const tab = document.querySelector(`.filter-tab[data-fid="${f.id}"] .filter-tab-counts`);
-      if (!tab) return;
-      try {
-        const [artifact, caso] = await Promise.all([
-          api("count_filtered", { filters: savedBackendFilters(f) }, { silent: true }),
-          caseEvs.length ? api("count_filtered", { filters: savedBackendFilters(f), caseEvents: caseEvs }, { silent: true }) : Promise.resolve(0),
+      if (!tab) continue;
+      const filters = savedBackendFilters(f), key = context + JSON.stringify(filters);
+      let result = filterCountsCache.get(key);
+      if (!result) {
+        result = Promise.all([
+          api("count_filtered", { filters }, { silent: true, background: true }),
+          caseEvs.length ? api("count_filtered", { filters, caseEvents: caseEvs }, { silent: true, background: true }) : Promise.resolve(0),
         ]);
+        filterCountsCache.set(key, result);
+        if (filterCountsCache.size > 64) filterCountsCache.delete(filterCountsCache.keys().next().value);
+      }
+      result.then(([artifact, caso]) => {
+        if (!tab.isConnected || context !== JSON.stringify([state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields, activeCase()?.id, caseSig()])) return;
         tab.textContent = `${fmtNum(caso)} · ${fmtNum(artifact)}`;
         tab.title = `${fmtNum(caso)} no Caso · ${fmtNum(artifact)} no Artefato`;
-      } catch { tab.textContent = "—"; }
-    }));
-  }, 250);
+      }).catch(() => { filterCountsCache.delete(key); if (tab.isConnected) tab.textContent = "—"; });
+    }
+  }, 300);
 }
 
 // ------------------------------------------------------------------ estações
@@ -4238,7 +4413,7 @@ function sendVisibleToCase() {
 }
 
 // ------------------------------------------------------------------ tabela
-function buildEventRow(ev) {
+function buildEventRow(ev, columns = state.visibleCols) {
   const quick = state.quick.trim();
   const quickRe = quick && (!window.QueryLang || window.QueryLang.isPlain(quick)) ? new RegExp(`(${escRe(esc(quick))})`, "gi") : null;
   const row = el("tr");
@@ -4263,8 +4438,8 @@ function buildEventRow(ev) {
     }
   };
 
-  for (const col of state.visibleCols) {
-    const td = el("td");
+  for (const col of columns) {
+    const td = el("td"); td.dataset.column = col;
     const originalValue = col === "level" ? ev.level : cellValue(ev, col);
     const displayValue = window.EvidenceUI?.redact({ [col]: originalValue })[col] ?? originalValue;
     if (col === "level") {
@@ -4309,12 +4484,13 @@ function buildEventRow(ev) {
   return row;
 }
 
-function renderTable(qr) {
+function renderTable(qr, { reuseRows = false } = {}) {
   $("#empty-state [data-retry]")?.remove();
   const thead = $("#events-table thead");
   const tbody = $("#events-table tbody");
+  const existingRows = reuseRows ? new Map([...tbody.children].map(row => [Number(row.dataset.eventId), row])) : new Map();
   thead.innerHTML = "";
-  tbody.innerHTML = "";
+  tbody.replaceChildren();
 
   // colgroup com as larguras salvas (redimensionamento manual)
   const table = $("#events-table");
@@ -4347,7 +4523,7 @@ function renderTable(qr) {
       state.visibleCols = cols;
       lastColumnDropAt = Date.now(); // impede o clique residual de reordenar a tabela
       saveVisibleCols();
-      renderTable({ total: state.total, rows: state.rows });
+      renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
     };
     th.title = "Clique para ordenar. Arraste para reordenar. Botão direito: adicionar ao Cubo.";
     th.onclick = () => {
@@ -4415,9 +4591,17 @@ function renderTable(qr) {
   }
   thead.appendChild(tr);
 
+  const fragment = document.createDocumentFragment();
   for (const ev of qr.rows) {
-    tbody.appendChild(buildEventRow(ev));
+    const previous = existingRows.get(ev.id);
+    if (!previous) { fragment.append(buildEventRow(ev)); continue; }
+    const cells = new Map([...previous.children].map(cell => [cell.dataset.column, cell]));
+    const missing = state.visibleCols.filter(col => !cells.has(col));
+    if (missing.length) for (const cell of [...buildEventRow(ev, missing).children]) cells.set(cell.dataset.column, cell);
+    previous.replaceChildren(...state.visibleCols.map(col => cells.get(col)));
+    fragment.append(previous);
   }
+  tbody.append(fragment);
 
   const empty = $("#empty-state");
   empty.hidden = qr.rows.length > 0;
@@ -4425,13 +4609,7 @@ function renderTable(qr) {
     ? "Nenhum evento encontrado."
     : "Selecione uma fonte de dados.";
 
-  const pages = Math.max(1, Math.ceil(qr.total / state.pageSize));
-  $("#pg-label").textContent = `${state.page + 1} / ${pages}`;
-  $("#pg-prev").disabled = state.page === 0;
-  $("#pg-next").disabled = state.page >= pages - 1;
-  const from = qr.rows.length ? state.page * state.pageSize + 1 : 0;
-  const to = state.page * state.pageSize + qr.rows.length;
-  $("#result-count").textContent = state.loaded ? `${fmtNum(from)}–${fmtNum(to)} de ${fmtNum(qr.total)}` : "";
+  updatePager({ ...state.pageResult, ...qr });
 }
 
 // ------------------------------------------------------------------ histograma
@@ -4532,7 +4710,7 @@ function openColPop() {
       state.visibleCols = state.columns.filter((c) => set.has(c));
       saveVisibleCols();
       // as linhas da página já estão no cliente: re-render local basta
-      renderTable({ total: state.total, rows: state.rows });
+      renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
     };
     item.append(cb, el("span", "", colLabel(col)));
     list.appendChild(item);
@@ -4692,7 +4870,7 @@ function toggleDetailColumn(column) {
   else next.add(column);
   state.visibleCols = state.columns.filter((item) => next.has(item));
   saveVisibleCols();
-  renderTable({ total: state.total, rows: state.rows });
+  renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
   toast(visible ? "Coluna removida da tabela." : "Coluna adicionada à tabela.", "ok");
 }
 
@@ -4975,6 +5153,7 @@ async function runGroup() {
       aggs: state.aggs,
       filters: backendFilters(),
     });
+    if (res.error) throw new Error(res.error);
   } catch (error) {
     loading.done();
     finishOperation("Falha ao agrupar", String(error));
@@ -5621,8 +5800,8 @@ function bind() {
   $("#src-btn-eventlog").onclick = () => setSource("eventlog");
   $("#btn-browse").onclick = browseFile;
   $("#btn-refresh-channels").onclick = refreshChannels;
-  $("#btn-load").onclick = async () => { await loadData(null, { merge: state.loaded }); if (state.loaded) switchView("viz"); };
-  $("#btn-merge").onclick = async () => { await loadData(null, { merge: true }); if (state.loaded) switchView("viz"); };
+  $("#btn-load").onclick = async () => { if (await loadData(null, { merge: state.loaded })) switchView("viz"); };
+  $("#btn-merge").onclick = async () => { if (await loadData(null, { merge: true })) switchView("viz"); };
   $("#btn-clear").onclick = () => clearData({ removeCurrent: true });
   $("#btn-back-drive").onclick = () => switchView("source");
   $("#cm-close").onclick = () => { $("#comment-modal").hidden = true; };
@@ -5830,11 +6009,7 @@ function bind() {
   $("#case-item-modal").addEventListener("click", (e) => {
     if (e.target === $("#case-item-modal")) { $("#case-item-modal").hidden = true; editingCaseItem = null; }
   });
-  $("#workbar-cancel").onclick = () => {
-    state.refreshVersion++;
-    if (state.activeOperation) state.activeOperation.cancelled = true;
-    finishOperation("Operação interrompida", "Resultados anteriores foram descartados.");
-  };
+  $("#workbar-cancel").onclick = cancelWorkbarTask;
   $("#group-col").onchange = () => { state.groupCol = $("#group-col").value; };
   $("#btn-add-agg").onclick = () => {
     state.aggs.push({ func: "count", column: "*", alias: "" });
@@ -5985,7 +6160,8 @@ function bind() {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       updateFilterTabsLayout();
-      if (state.loaded) refresh();
+      if (chart && $("#chart").clientWidth > 0) chart.setSize({ width: Math.max(280, $("#chart").clientWidth - 4), height: 96 });
+      for (const plot of Object.values(dashCharts)) { const box = plot?.root?.parentElement; if (box?.clientWidth) plot.setSize({ width: Math.max(200, box.clientWidth - 8), height: plot.height }); }
     }, 250);
   });
 
@@ -6268,7 +6444,7 @@ async function renderChartCard(body, spec, scope = state.analyticsScope) {
       chart: spec.chart, metric: spec.metric, field: spec.field,
       interval_ms: spec.interval_ms, split: spec.split, limit: 12, unit: "auto",
     },
-  });
+  }, { background: true, latest: `custom-chart:${scope}:${spec.id}` });
   if (!body.isConnected) return;
   body.innerHTML = "";
   if (!res.x.length || !res.series?.length) { body.innerHTML = '<span class="muted small">Sem dados.</span>'; return; }
@@ -6948,11 +7124,11 @@ async function runCube({ force = false } = {}) {
   }
   const loading = areaLoading(document.querySelector(".cube-output"), "Calculando Cubo…");
   try {
-    updateOperation("Calculando Cubo", "Agregando dimensões e valores", 58);
+    updateOperation("Calculando Cubo", "Agregando dimensões e valores");
     const res = await api("pivot", {
       ...analyticsRequest(scope),
       spec: { rows: cube.rows, cols: cube.cols, values: cube.values, limit_rows: 2000 },
-    });
+    }, { latest: "pivot" });
     if (version !== cubeState.requestVersion || scope !== state.analyticsScope || cube.id !== activeCube(scope).id) return { status: "stale" };
     if (res.complete === false) toast(`Resultado parcial: ${fmtNum(res.processed_events)} eventos analisados. Reduza as dimensões ou o período.`, "info");
     cubeState.result = res;

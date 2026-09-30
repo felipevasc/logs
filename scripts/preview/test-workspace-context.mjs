@@ -1,14 +1,18 @@
 /* Run: node scripts/preview/test-workspace-context.mjs http://127.0.0.1:4175 */
 import assert from "node:assert/strict";
-import { chromium } from "playwright";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { launchBrowser } from "./browser.mjs";
+import { captureFailure } from "./diagnostics.mjs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 const url = process.argv[2] || "http://127.0.0.1:4175", output = resolve("output/playwright");
 mkdirSync(output, { recursive: true });
-const fallback = `${process.env.LOCALAPPDATA}/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-win64/chrome-headless-shell.exe`;
-const browser = await chromium.launch({ executablePath: existsSync(chromium.executablePath()) ? undefined : fallback });
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1024, height: 900 }, reducedMotion: "reduce" });
 const errors = [], results = {};
+const exactTotal = () => page.evaluate(async () => {
+  if (!Number.isFinite(state.total)) await loadExplorerAnalytics(explorerKey(), workspaceScope(), backendFilters()).promise;
+  return state.total;
+});
 page.on("pageerror", error => errors.push(error.message));
 try {
   await page.goto(url);
@@ -16,6 +20,7 @@ try {
   const initial = await page.evaluate(async () => {
     await WorkspaceContext.setScope("dataset", { page: "explore", animate: false });
     state.filters = []; state.quick = ""; await refresh();
+    await loadExplorerAnalytics(explorerKey(), workspaceScope(), backendFilters()).promise;
     return { total: state.total, caseId: activeCase().id, artifactId: state.currentArtifact.id, rows: state.rows.slice(0, 3) };
   });
   assert.equal(initial.total, 6000);
@@ -28,20 +33,20 @@ try {
     window.oldCaseFilter = structuredClone(state.filters);
     window.createdId = newCase("Caso vazio sem perder fontes").id;
   });
-  assert.equal(await page.locator("#explore-tree").getAttribute("data-tree-scope"), "case");
   for (const total of Object.values(await page.evaluate(() => window.contextFacetTotals))) assert.ok(total <= 3, "case facets contain only saved records");
   await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "case" && state.total === 0);
+  assert.equal(await page.locator("#explore-tree").getAttribute("data-tree-scope"), "case");
   assert.equal(await page.evaluate(() => caseEvents().length), 0);
   assert.equal(await page.locator("#ws-empty").isVisible(), false);
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
-  assert.equal(await page.evaluate(() => state.total), 6000, "new case retains the open native dataset");
+  assert.equal(await exactTotal(), 6000, "new case retains the open native dataset");
   assert.equal(await page.evaluate(() => state.currentArtifact.id), initial.artifactId);
   await page.evaluate(async original => { await WorkspaceContext.setScope("case", { animate: false }); await WorkspaceContext.changeCase(original); }, initial.caseId);
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "case");
   assert.equal(await page.evaluate(() => caseEvents().length), 3);
   assert.deepEqual(await page.evaluate(() => state.filters), await page.evaluate(() => window.oldCaseFilter));
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
-  assert.equal(await page.evaluate(() => state.total), 6000);
+  assert.equal(await exactTotal(), 6000);
   await page.evaluate(async () => {
     await WorkspaceContext.setScope("case", { page: "explore", animate: false });
     await mcpRefreshSource();
@@ -49,7 +54,7 @@ try {
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "case", "MCP source refresh preserves active workspace");
   assert.deepEqual(await page.evaluate(() => state.filters), await page.evaluate(() => window.oldCaseFilter));
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
-  assert.equal(await page.evaluate(() => state.total), 6000);
+  assert.equal(await exactTotal(), 6000);
   results.lifecycle = "new case empty; original case filters restored; native dataset6000 intact; MCP refresh scoped";
   // A rejected old summary must not paint over the new workspace.
   await page.evaluate(async () => {
@@ -63,13 +68,15 @@ try {
   assert.doesNotMatch(await page.locator("#ws-content").innerText(), /Stale dataset response/);
   // Persist the active case workspace, then verify a cold start after native source load.
   await page.evaluate(async () => { await Workspace.showPage("explore"); await refresh(); await saveCases(); });
+  await exactTotal();
   const before = await page.evaluate(() => ({ caseId: activeCase().id, filters: state.filters, total: state.total }));
   await page.reload();
   await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && document.querySelector("#load-overlay").hidden);
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "case");
+  await exactTotal();
   assert.deepEqual(await page.evaluate(() => ({ caseId: activeCase().id, filters: state.filters, total: state.total })), before);
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
-  assert.equal(await page.evaluate(() => state.total), 6000);
+  assert.equal(await exactTotal(), 6000);
   results.reload = "active workspace + filters restored after source rehydration";
   // Corrupt imported UI preferences must safely normalize without touching events.
   await page.evaluate(async () => {
@@ -82,7 +89,7 @@ try {
   assert.equal(await page.evaluate(() => caseEvents().length), 3);
   assert.deepEqual(await page.evaluate(() => state.filters), []);
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
-  assert.equal(await page.evaluate(() => state.total), 6000);
+  assert.equal(await exactTotal(), 6000);
   results.invalidImportedPreferences = "normalized; case3/dataset6000 retained";
   // Background MCP events are serialized. A context request cannot split their update.
   await page.evaluate(async () => {
@@ -100,10 +107,10 @@ try {
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "dataset", "MCP update holds its source context until reconciled");
   await page.evaluate(async () => { window.releaseContextSource(); await Promise.all([window.firstSourceUpdate, window.secondSourceUpdate]); window.restoreContextApi(); });
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "case");
-  assert.equal(await page.evaluate(() => state.total), 3);
+  assert.equal(await exactTotal(), 3);
   await page.evaluate(async () => { await api("clear_events"); await mcpRefreshSource(); });
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "case");
-  assert.equal(await page.evaluate(() => state.total), 3, "native clear retains saved case records");
+  assert.equal(await exactTotal(), 3, "native clear retains saved case records");
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "summary", animate: false }));
   assert.deepEqual(await page.evaluate(() => ({ loaded: state.loaded, total: state.total, rows: state.rows.length })), { loaded: false, total: 0, rows: 0 });
   assert.equal(await page.locator("#ws-empty").isVisible(), true);
@@ -111,4 +118,5 @@ try {
   assert.deepEqual(errors, []);
   writeFileSync(resolve(output, "workspace-context-results.json"), JSON.stringify(results, null, 2));
   console.log(JSON.stringify({ ...results, pageErrors: errors }, null, 2));
-} finally { await browser.close(); }
+} catch (error) { await captureFailure(page, 'workspace-context', error, { errors, results }); throw error; }
+finally { await browser.close(); }

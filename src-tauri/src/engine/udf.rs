@@ -28,6 +28,21 @@ static NEXT: AtomicI32 = AtomicI32::new(1);
 #[derive(Default)]
 pub(crate) struct Tests {
     ids: Vec<i32>,
+    pub(crate) free: Vec<FreeText>,
+    pub(crate) hex_fields: Vec<HexField>,
+}
+
+pub(crate) struct FreeText {
+    pub(crate) marker: String,
+    pub(crate) needle: String,
+    pub(crate) names_sql: String,
+}
+
+pub(crate) struct HexField {
+    pub(crate) marker: String,
+    pub(crate) filter: Arc<crate::query::PreparedFilter>,
+    pub(crate) fallback_sql: String,
+    pub(crate) word: String,
 }
 
 impl Tests {
@@ -46,6 +61,28 @@ impl Tests {
     pub(crate) fn number(&mut self, value: &str, test: NumberTest) -> String {
         let id = self.add(Test::Number(test));
         format!("li_ntest(CAST({value} AS DOUBLE), {id})")
+    }
+    /// A structured planner placeholder, expanded before SQL reaches DuckDB.
+    /// Keeping the complete free-text term together lets candidate selection
+    /// avoid a full enrichment join without dropping name/description matches.
+    pub(crate) fn free_text(&mut self, needle: &str) -> String {
+        let owned = needle.to_string();
+        let test: TextTest = Arc::new(move |v| {
+            v.is_some_and(|v| crate::query::ci_contains_bytes(v.as_bytes(), owned.as_bytes()))
+        });
+        let id = self.add(Test::Text(test));
+        let marker = format!("__li_free_{id}()");
+        self.free.push(FreeText {
+            marker: marker.clone(),
+            needle: needle.into(),
+            names_sql: format!("(li_test(name, {id}) OR li_test(description, {id}))"),
+        });
+        marker
+    }
+    pub(crate) fn hex_field(&mut self, filter: Arc<crate::query::PreparedFilter>, fallback_sql: String, word: String) -> String {
+        let marker = format!("__li_hex_{}()", NEXT.fetch_add(1, Ordering::Relaxed));
+        self.hex_fields.push(HexField { marker: marker.clone(), filter, fallback_sql, word });
+        marker
     }
 }
 
@@ -252,6 +289,25 @@ impl VScalar for NumberKeyFn {
     }
 }
 
+/// Group labels use strict f64 parsing (without trimming or unit conversion),
+/// unlike event-column sorting. Keep the cap's tie-break identical to Rust.
+struct GroupNumberKeyFn;
+impl VScalar for GroupNumberKeyFn {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, output: &mut dyn WritableVector) -> Result<(), Box<dyn Error>> {
+        map_number::<i64>(input, output, |text| {
+            text.parse::<f64>().ok().filter(|n| n.is_finite()).map(|n| {
+                let bits = n.to_bits() as i64;
+                bits ^ (((bits >> 63) as u64) >> 1) as i64
+            })
+        });
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(vec![varchar()], LogicalTypeId::Bigint.into())]
+    }
+}
+
 /// Value of `parse_num_unit` (sums and averages).
 struct NumFn;
 impl VScalar for NumFn {
@@ -304,6 +360,7 @@ pub(crate) fn register(conn: &Connection) -> duckdb::Result<()> {
     conn.register_scalar_function::<LowerFn>("li_lower")?;
     conn.register_scalar_function::<IsoFn>("li_iso")?;
     conn.register_scalar_function::<NumberKeyFn>("li_nkey")?;
+    conn.register_scalar_function::<GroupNumberKeyFn>("li_gkey")?;
     conn.register_scalar_function::<NumFn>("li_num")?;
     conn.register_scalar_function::<UnitFn>("li_unit")?;
     conn.register_scalar_function::<BlankFn>("li_blank")?;

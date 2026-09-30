@@ -124,7 +124,7 @@
       return;
     }
 
-    if (groupView.busy) { groupView.version++; groupView.queued = true; return; }
+    if (groupView.busy) { groupView.version++; groupView.queued = true; window.Tasks?.cancelLatest("group"); return; }
     groupView.busy = true;
     const version = ++groupView.version;
     const run = $("#btn-run-group"); run.disabled = true;
@@ -132,7 +132,8 @@
     $("#group-table").inert = true;
     startOperation("group", "Calculando resumo", `Por ${colLabel(field)}`);
     try {
-      const result = await api("aggregate_events", { ...analyticsRequest(scope), groupColumn: field, aggs, filters });
+      const result = await api("aggregate_events", { ...analyticsRequest(scope), groupColumn: field, aggs, filters }, { latest: "group" });
+      if (result.error) throw new Error(result.error);
       if (version !== groupView.version || source !== (scope === "case" ? caseSig() : state.currentArtifact?.id) || signature !== JSON.stringify([workspaceScope(), scope === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt, backendFilters(), field, aggs, state.derivedFields])) return;
       groupView.result = result; groupView.field = field; groupView.aggs = aggs; groupView.computedKey = signature;
       groupKeys = new WeakMap(); if (result.group_values?.length === result.rows.length) result.rows.forEach((row, index) => groupKeys.set(row, result.group_values[index]));
@@ -292,7 +293,7 @@
     pivotShell(); const cube = activeCube();
     if (!cube.values.length) { cube.values = [{ func: "count", column: "*", alias: "Registros" }]; renderCubeZones(); }
     if (!checkMeasures(cube.values)) return;
-    if (pivotTask.busy) { pivotTask.queued = true; cubeState.requestVersion++; return; }
+    if (pivotTask.busy) { pivotTask.queued = true; cubeState.requestVersion++; window.Tasks?.cancelLatest("pivot"); return; }
     pivotTask.busy = true;
     $("#aw-pivot-summary").textContent = "Calculando o recorte…";
     try {

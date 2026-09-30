@@ -47,8 +47,8 @@ window.WorkspaceContext = (() => {
     return snapshot;
   }
   // Loaded source shared by every Case; its filtered rows belong to one Case only.
-  function sourceRuntime() {
-    return { loaded: state.loaded, columns: state.columns, dataPeriod: state.dataPeriod, rows: [], total: 0, facetData: null, explorerCache: null, queryError: null };
+  function sourceRuntime(source = state) {
+    return { loaded: source.loaded, columns: source.columns, dataPeriod: source.dataPeriod, rows: [], total: 0, facetData: null, explorerCache: null, queryError: null };
   }
   function stored(value) { return sanitize(states.get(key(value)) || activeCase()?.workspace?.contextStates?.[value]); }
   function apply(snapshot) {
@@ -65,7 +65,7 @@ window.WorkspaceContext = (() => {
     if (!state.columns.includes(state.groupCol)) state.groupCol = "level";
     state.stationAnalyticsId = null; state.activeContext = scope === "case" ? "case" : "artifact"; state.analyticsScope = scope;
     $("#explore-tree").dataset.treeScope = scope;
-    state.treeAgg[scope] = null; state.treeAggSig[scope] = null; treeAggVersion.dataset++; treeAggVersion.case++;
+    state.treeAgg[scope] = null; state.treeAggSig[scope] = null; state.treeAggError[scope] = null; treeAggVersion.dataset++; treeAggVersion.case++;
     state.treeCollapsed = new Set(snapshot.tree || []);
     cubeState.collapsed = new Set(snapshot.cubeCollapsed || []); cubeState.requestVersion++;
     document.body.dataset.density = snapshot.density || "comfortable"; document.body.dataset.wrap = snapshot.wrap || "false";
@@ -75,6 +75,7 @@ window.WorkspaceContext = (() => {
     window.Workspace?.restore(snapshot.workspace); window.Discovery?.restore(snapshot.discovery); window.WorkspaceAnalysis?.restore(snapshot.workbench);
     window.Journeys?.restore(snapshot.journeys);
     fillColumnControls(); renderChips(); renderExploreTree(); updateContextBar();
+    restoreVisiblePreferences();
   }
   function updateToggle() {
     document.documentElement.dataset.workspace = scope; document.body.dataset.workspace = scope;
@@ -97,7 +98,7 @@ window.WorkspaceContext = (() => {
     const update = () => {
       if (request !== generation) return;
       scope = next; apply(snapshot); if (options.tab) state.activeDatasetTab = options.tab; updateToggle();
-      finishOperation(scope === "case" ? "Caso" : "Análise", scope === "case" ? `${fmtNum(caseEvents().length)} registros preservados no Caso` : `${fmtNum(state.total)} registros na Análise`);
+      finishOperation(scope === "case" ? "Caso" : "Análise", scope === "case" ? `${fmtNum(caseEvents().length)} registros preservados no Caso` : `${currentCountLabel("registros")} na Análise`);
       document.dispatchEvent(new CustomEvent("workspace-context-change", { detail: { scope, previousScope } }));
       render = Workspace.showPage(["sources", "connections", "import"].includes(page) && scope === "case" ? "summary" : page).then(async () => {
         if (request !== generation) return;
@@ -137,17 +138,22 @@ window.WorkspaceContext = (() => {
   function beforeCaseCreation() {
     if (!initialized) return null;
     capture(); restoringCase = true; caseGeneration++; generation++; state.refreshVersion++; detailRequest++;
-    return { scope, snapshot: stored("dataset"), runtime: runtime.get(key("dataset")), artifacts: copy(activeCase()?.artifacts || []), activeArtifactId: activeCase()?.activeArtifactId || null };
+    return { scope, snapshot: stored("dataset"), activeSnapshot: stored(scope), runtime: runtime.get(key("dataset")), artifacts: copy(activeCase()?.artifacts || []), activeArtifactId: activeCase()?.activeArtifactId || null };
   }
   async function afterCaseCreation(previous) {
     if (!previous) return;
     const c = activeCase();
-    // A new Case starts a clean analysis over the same loaded source.
+    // Keep the user's area; a new Case has no evidence but shares the loaded source.
+    // When creating from Case, state describes saved evidence, not that source.
     const fresh = { ...defaults(), page: previous.snapshot?.page || "summary" };
-    runtime.set(key("dataset"), sourceRuntime());
-    states.set(key("dataset"), fresh); c.workspace.contextStates = { dataset: fresh }; c.workspace.activeScope = "dataset";
+    const target = previous.scope === "case" ? "case" : "dataset";
+    const freshCase = { ...defaults(), page: target === "case" ? previous.activeSnapshot?.page || "summary" : "summary" };
+    const source = previous.runtime || (previous.scope === "dataset" ? state : { loaded: false, columns: [], dataPeriod: null });
+    runtime.set(key("dataset"), sourceRuntime(source));
+    states.set(key("dataset"), fresh); states.set(key("case"), freshCase);
+    c.workspace.contextStates = { dataset: fresh, case: freshCase }; c.workspace.activeScope = target;
     try {
-      await setScope("dataset", { force: true, animate: false, skipCapture: true });
+      await setScope(target, { force: true, animate: false, skipCapture: true });
       if (state.loaded) await refresh();
     } finally { restoringCase = false; }
   }

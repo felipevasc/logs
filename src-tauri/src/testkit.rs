@@ -7,6 +7,13 @@ use crate::query::{self, AggSpec, Filter};
 use crate::sources::{event_at, CompiledDerived, FileIndex};
 use serde_json::Value;
 
+/// Initialize the same coordinated parser pool as the desktop before any
+/// benchmark/fixture work can initialize Rayon's unrestricted default pool.
+pub fn init_resources() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(crate::resources::init);
+}
+
 /// Loads a file as the app does (packages, spreadsheets, encodings, detected
 /// format) and returns the detected format and every event.
 pub fn load(path: &str) -> Result<(String, Vec<Event>), String> {
@@ -53,6 +60,7 @@ impl Source {
     /// `codes` is a catalog in the app's JSON format; `derived` a list of
     /// derived fields as saved by the app.
     pub fn open(paths: &[&str], codes: &str, derived: &str) -> Result<Source, String> {
+        init_resources();
         let mut idx: Option<FileIndex> = None;
         for path in paths {
             let part = crate::index_source_file(path, "auto", None)?;
@@ -94,11 +102,21 @@ impl Source {
     pub fn is_empty(&self) -> bool {
         self.idx.lines.is_empty()
     }
+    pub fn set_system_catalog(&mut self, catalog: &str) {
+        self.system = parse(catalog);
+        crate::engine::catalogs_changed();
+    }
 
     /// Builds the columnar stores now (as a file load does).
     pub fn prepare(&self) -> Result<(), String> {
         crate::engine::set_enabled(true);
         crate::engine::prepare(&self.idx, &self.codes, &self.system, &self.derived, &|_, _| {})
+    }
+
+    /// Deterministic pending-derived fixture: only immutable base stores exist.
+    pub fn prepare_base(&self) -> Result<(), String> {
+        crate::engine::set_enabled(true);
+        crate::engine::prepare(&self.idx, &self.codes, &self.system, &[], &|_, _| {})
     }
 
     fn engine(&self) -> crate::engine::Source<'_> {
@@ -132,10 +150,10 @@ impl Source {
         match engine {
             Engine::Columnar => Self::columnar(
                 "matches",
-                crate::engine::matches(&self.engine(), &query::prepare(&filters)),
+                crate::engine::matches(&self.engine(), &query::prepare(&filters)).expect("matching query failed"),
             ),
             Engine::Lines => self.lines(|| {
-                query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived)
+                query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived).unwrap()
             }),
         }
     }
@@ -143,11 +161,21 @@ impl Source {
     pub fn count(&self, engine: Engine, filters: &str) -> usize {
         let filters: Vec<Filter> = parse(filters);
         match engine {
-            Engine::Columnar => Self::columnar("count", crate::engine::count(&self.engine(), &filters)),
+            Engine::Columnar => Self::columnar("count", crate::engine::count(&self.engine(), &filters).expect("analytics query failed")),
             Engine::Lines => self.lines(|| {
-                query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived).len()
+                query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived).unwrap().len()
             }),
         }
+    }
+
+    pub fn try_count(&self, filters: &str) -> Result<usize, String> {
+        let filters: Vec<Filter> = parse(filters);
+        crate::engine::count(&self.engine(), &filters)?.ok_or("Motor indisponível.".into())
+    }
+
+    pub fn selection_cache(&self) -> Value {
+        crate::engine::session(&self.idx, &self.codes, &self.system, &self.derived)
+            .map_or(Value::Null, |session| session.selection_snapshot())
     }
 
     pub fn query(&self, engine: Engine, filters: &str, sort: &str, dir: &str, offset: usize, limit: usize) -> Value {
@@ -155,14 +183,46 @@ impl Source {
         match engine {
             Engine::Columnar => json(Self::columnar(
                 "query",
-                crate::engine::query(&self.engine(), &query::prepare(&filters), sort, dir, offset, limit),
+                crate::engine::query(&self.engine(), &query::prepare(&filters), sort, dir, offset, limit).unwrap(),
             )),
             Engine::Lines => self.lines(|| {
                 json(query::query_indexed(
                     &self.idx, &filters, sort, dir, offset, limit, &self.codes, &self.system, &self.derived,
-                ))
+                ).unwrap())
             }),
         }
+    }
+
+    /// Interactive page benchmark/parity entry point. Requires an indexed
+    /// answer, so benchmark runs never silently measure a line fallback.
+    pub fn page(&self, filters: &str, sort: &str, dir: &str, offset: usize, limit: usize, cursor: Option<&str>) -> Value {
+        self.try_page(filters, sort, dir, offset, limit, cursor).expect("interactive page")
+    }
+
+    pub fn try_page(&self, filters: &str, sort: &str, dir: &str, offset: usize, limit: usize, cursor: Option<&str>) -> Result<Value, String> {
+        let filters: Vec<Filter> = parse(filters);
+        Self::columnar("page", crate::engine::query_page(
+            &self.engine(), &query::prepare(&filters), sort, dir, offset, limit, cursor,
+        )).map(json)
+    }
+
+    pub fn recovery_page(&self, filters: &str, sort: &str, dir: &str, offset: usize, limit: usize) -> Result<Value, String> {
+        let filters: Vec<Filter> = parse(filters);
+        query::query_page_lines(&self.idx, &filters, sort, dir, offset, limit, &self.codes, &self.system, &self.derived).map(json)
+    }
+
+    pub fn engine_status(&self) -> Value {
+        json(crate::engine::status(&self.idx, &self.codes, &self.system, &self.derived))
+    }
+
+    pub fn explain_page(&self, filters: &str, sort: &str, dir: &str, limit: usize, analyze: bool) -> Result<Value, String> {
+        let filters: Vec<Filter> = parse(filters);
+        Self::columnar("explain page", crate::engine::explain_page(&self.engine(), &query::prepare(&filters), sort, dir, limit, analyze))
+    }
+
+    pub fn explain_page_at(&self, filters: &str, sort: &str, dir: &str, offset: usize, limit: usize, cursor: Option<&str>, analyze: bool) -> Result<Value, String> {
+        let filters: Vec<Filter> = parse(filters);
+        Self::columnar("explain page", crate::engine::explain_page_at(&self.engine(), &query::prepare(&filters), sort, dir, offset, limit, cursor, analyze))
     }
 
     pub fn explore(&self, engine: Engine, filters: &str, sort: &str, dir: &str) -> Value {
@@ -170,12 +230,12 @@ impl Source {
         match engine {
             Engine::Columnar => json(Self::columnar(
                 "explore",
-                crate::engine::explore(&self.engine(), &query::prepare(&filters), sort, dir, 0, 25),
+                crate::engine::explore(&self.engine(), &query::prepare(&filters), sort, dir, 0, 25).unwrap(),
             )),
             Engine::Lines => self.lines(|| {
                 json(query::explore_indexed(
                     &self.idx, &filters, sort, dir, 0, 25, &self.codes, &self.system, &self.derived,
-                ))
+                ).unwrap())
             }),
         }
     }
@@ -185,10 +245,10 @@ impl Source {
         match engine {
             Engine::Columnar => json(Self::columnar(
                 "stats",
-                crate::engine::stats(&self.engine(), &query::prepare(&filters)),
+                crate::engine::stats(&self.engine(), &query::prepare(&filters)).expect("analytics query failed"),
             )),
             Engine::Lines => self.lines(|| {
-                json(query::stats_indexed(&self.idx, &filters, &self.codes, &self.system, &self.derived))
+                json(query::stats_indexed(&self.idx, &filters, &self.codes, &self.system, &self.derived).unwrap())
             }),
         }
     }
@@ -199,7 +259,7 @@ impl Source {
         match engine {
             Engine::Columnar => json(Self::columnar(
                 "aggregate",
-                crate::engine::aggregate(&self.engine(), &query::prepare(&filters), group, &specs),
+                crate::engine::aggregate(&self.engine(), &query::prepare(&filters), group, &specs).unwrap_or_else(|error| Some(query::AggResult::failure(error))),
             )),
             Engine::Lines => self.lines(|| {
                 json(query::aggregate_indexed(
@@ -215,7 +275,7 @@ impl Source {
         match engine {
             Engine::Columnar => json(Self::columnar(
                 "multi_count",
-                crate::engine::multi_count(&self.engine(), &filters, &columns),
+                crate::engine::multi_count(&self.engine(), &filters, &columns).expect("analytics query failed"),
             )),
             Engine::Lines => self.lines(|| {
                 json(query::multi_count_indexed(
@@ -231,11 +291,11 @@ impl Source {
         match engine {
             Engine::Columnar => json(Self::columnar(
                 "series",
-                crate::engine::series(&self.engine(), &query::prepare(&filters), &spec),
+                crate::engine::series(&self.engine(), &query::prepare(&filters), &spec).expect("analytics query failed"),
             )),
             Engine::Lines => self.lines(|| {
-                let ids = query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived);
-                json(crate::analysis::compute_series_stream(|| self.events(&ids), &spec))
+                let ids = query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived).unwrap();
+                json(crate::analysis::compute_series_stream(|| self.events(&ids), &spec).unwrap())
             }),
         }
     }
@@ -245,10 +305,10 @@ impl Source {
         match engine {
             Engine::Columnar => json(Self::columnar(
                 "overview",
-                crate::engine::overview(&self.engine(), &query::prepare(&filters)),
+                crate::engine::overview(&self.engine(), &query::prepare(&filters)).expect("analytics query failed"),
             )),
             Engine::Lines => self.lines(|| {
-                let ids = query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived);
+                let ids = query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived).unwrap();
                 json(crate::insights::overview(|| self.events(&ids)))
             }),
         }
@@ -261,10 +321,10 @@ impl Source {
         match engine {
             Engine::Columnar => json(Self::columnar(
                 "compare",
-                crate::engine::compare(&self.engine(), &query::prepare(&filters), &before, &after),
+                crate::engine::compare(&self.engine(), &query::prepare(&filters), &before, &after).expect("analytics query failed"),
             )),
             Engine::Lines => self.lines(|| {
-                let ids = query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived);
+                let ids = query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived).unwrap();
                 json(crate::insights::compare(self.events(&ids), &before, &after))
             }),
         }
@@ -276,11 +336,11 @@ impl Source {
         match engine {
             Engine::Columnar => json(Self::columnar(
                 "pivot",
-                crate::engine::pivot(&self.engine(), &query::prepare(&filters), &spec),
+                crate::engine::pivot(&self.engine(), &query::prepare(&filters), &spec).expect("analytics query failed"),
             )),
             Engine::Lines => self.lines(|| {
-                let ids = query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived);
-                json(crate::analysis::pivot_stream(self.events(&ids), &spec))
+                let ids = query::indexed_matches(&self.idx, &filters, &self.codes, &self.system, &self.derived).unwrap();
+                json(crate::analysis::pivot_stream(self.events(&ids), &spec).unwrap())
             }),
         }
     }
@@ -299,6 +359,12 @@ pub fn set_engine_dir(path: &str) {
 /// Drops cached line-engine selections so each engine computes its own.
 pub fn clear_caches() {
     query::clear_match_cache();
+}
+
+pub fn cancel_named(id: &str) { crate::operations::cancel_id(id); }
+pub fn with_operation<T>(id: &str, progress: impl Fn(Value) + Send + Sync + 'static, work: impl FnOnce() -> T) -> Result<T, String> {
+    let token = crate::operations::token(Some(id.into()))?;
+    crate::operations::run_with_token(token, || crate::operations::with_reporter(std::sync::Arc::new(move |event| progress(json(event))), work))
 }
 
 /// Time spent per step of reading `count` lines of a file (manual profiling).
@@ -355,4 +421,78 @@ pub fn profile_reading(path: &str, count: usize) -> Vec<(&'static str, std::time
     }
     out.push(("entities::value(Tool)", t.elapsed()));
     out
+}
+
+/// Exercises the real metadata cache/parser with deliberately tiny waves. The
+/// options and callback are test harness controls, never production env flags.
+pub fn metadata_probe(
+    path: &str,
+    format: &str,
+    cache_dir: &str,
+    options: &str,
+    progress: &dyn Fn(Value),
+) -> Result<Value, String> {
+    use crate::metadata_checkpoint::{Progress, Resume};
+    use std::cell::Cell;
+    init_resources();
+    let options: Value = serde_json::from_str(options).map_err(|e| e.to_string())?;
+    let custom = if let Some(pattern) = options["regex"].as_str() {
+        Some(crate::sources::CustomParse::Regex(regex::Regex::new(pattern).map_err(|e| e.to_string())?))
+    } else if let Some(delimiter) = options["delimiter"].as_str() {
+        Some(crate::sources::CustomParse::Delimited {
+            sep: delimiter.chars().next().ok_or("empty delimiter")?,
+            fields: options["fields"].as_array().ok_or("missing fields")?.iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect(),
+        })
+    } else { None };
+    let ts = if options["timestamp"].is_object() {
+        Some(serde_json::from_value::<crate::sources::TsConfig>(options["timestamp"].clone()).map_err(|e| e.to_string())?.compile()?)
+    } else { None };
+    let mut prepared = crate::sources::prepare_index(path, format, custom, ts)?;
+    if options["smallWaves"].as_bool().unwrap_or(true) {
+        prepared.limits = crate::sources::IndexLimits { chunk_bytes: 512, chunk_lines: 7, wave_chunks: 2, json_records: 7, json_bytes: 512 };
+    }
+    if let Some(year) = options["year"].as_i64() { prepared.part.calendar.year = i32::try_from(year).map_err(|e| e.to_string())?; }
+    let key = prepared.key()?;
+    let restored_rows = Cell::new(0usize);
+    let committed_rows = Cell::new(0usize);
+    let on_progress = |p: &Progress| {
+        restored_rows.set(restored_rows.get().max(p.resumed_rows));
+        committed_rows.set(committed_rows.get().max(p.checkpoint_rows));
+        progress(serde_json::json!({
+            "phaseId": p.phase_id, "phase": p.phase,
+            "completed": p.completed, "total": p.total, "unit": p.unit,
+            "resumedRows": p.resumed_rows, "checkpointRows": p.checkpoint_rows,
+            "parsedRows": p.parsed_rows,
+        }));
+    };
+    let run = || -> Result<Value, String> {
+        let idx = if options["uncached"].as_bool().unwrap_or(false) {
+            let seed = Resume { cursor: prepared.initial_cursor(), ..Default::default() };
+            crate::sources::index_prepared(&prepared, seed, &mut |_, _, _, _| Ok(()), Some(&on_progress))?
+        } else {
+            crate::index_cache::open_prepared_at(&prepared, std::path::Path::new(cache_dir), Some(&on_progress))?
+        };
+        let rows: Vec<Value> = idx.lines.iter().map(|m| serde_json::json!([m.offset, m.len, m.ts, m.level, m.code_off, m.code_len])).collect();
+        let empty = crate::model::CodesConfig::default();
+        let events: Vec<Event> = (0..idx.lines.len()).map(|i| crate::sources::event_at(&idx, i, &empty, &empty, &[])).collect();
+        Ok(serde_json::json!({
+            "key": key, "format": idx.format, "header": idx.header, "columns": idx.columns,
+            "timezone": idx.parts[0].calendar.timezone, "currentOffset": chrono::Local::now().offset().to_string(),
+            "metadata": rows, "events": events, "rows": idx.lines.len(),
+            "resumedRows": restored_rows.get(), "checkpointRows": committed_rows.get(),
+            "parsedRows": prepared.parsed_rows.load(std::sync::atomic::Ordering::Relaxed),
+        }))
+    };
+    if let Some(operation_id) = options["operationId"].as_str() {
+        let token = crate::operations::token(Some(operation_id.into()))?;
+        crate::operations::run_with_token(token, run)?
+    } else { run() }
+}
+
+pub fn cancel_metadata_probe(operation_id: &str) -> bool {
+    crate::operations::cancel_id(operation_id)
+}
+
+pub fn prune_metadata_probe(cache_dir: &str, age_seconds: u64) {
+    crate::metadata_checkpoint::prune(std::path::Path::new(cache_dir), std::time::SystemTime::now() - std::time::Duration::from_secs(age_seconds));
 }

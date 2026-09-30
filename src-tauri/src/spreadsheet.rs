@@ -8,7 +8,7 @@ use crate::sources::{column_role, date_time_ms, naive_to_ms, normalize_level, pa
 use calamine::{open_workbook_auto, Data, DataRef, ExcelDateTime, Reader, SheetType, SheetVisible, Sheets};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use std::io::{BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const EXTENSIONS: [&str; 5] = ["xlsx", "xlsm", "xlsb", "xls", "ods"];
@@ -373,11 +373,11 @@ impl Plan {
         });
     }
 
-    fn event(&mut self, cells: &[(u32, Cell)]) -> Event {
+    fn event(&mut self, cells: &[(u32, Cell)], year: i32) -> Event {
         let cell = |column: Option<u32>| column.and_then(|c| cells.iter().find(|(k, _)| *k == c).map(|(_, v)| v));
         if let Some((column, format)) = self.lines {
             let text = cell(Some(column)).map(Cell::text).unwrap_or_default();
-            let mut ev = crate::sources::parse_line(text.as_bytes(), format, None, &[]);
+            let mut ev = crate::sources::parse_line_at(text.as_bytes(), format, None, &[], year);
             for (c, value) in cells.iter().filter(|(c, _)| *c != column) {
                 let name = self.name(*c, None);
                 ev.fields.insert(name, value.value());
@@ -495,7 +495,7 @@ fn describe(error: &str) -> String {
 }
 
 /// Writes one event per row of every worksheet; returns how many were written.
-fn convert(path: &Path, workbook_id: &str, out: &mut dyn Write, progress: &dyn Fn(usize)) -> Result<usize, String> {
+fn convert(path: &Path, workbook_id: &str, year: i32, out: &mut dyn Write, progress: &dyn Fn(usize)) -> Result<usize, String> {
     let mut book = open_workbook_auto(path).map_err(|e| describe(&e.to_string()))?;
     let sheets: Vec<_> = book.sheets_metadata().to_vec();
     let mut written = 0usize;
@@ -511,7 +511,7 @@ fn convert(path: &Path, workbook_id: &str, out: &mut dyn Write, progress: &dyn F
             if plan.header.is_some_and(|header| row <= header) {
                 return Ok(());
             }
-            let mut ev = plan.event(cells);
+            let mut ev = plan.event(cells, year);
             ev.event_ref = format!("planilha:{}:{sheet_index}:{}", &workbook_id[..16], row + 1);
             ev.fields.insert("planilha.aba".into(), Value::from(sheet.name.as_str()));
             ev.fields.insert("planilha.linha".into(), Value::from(row + 1));
@@ -570,38 +570,40 @@ fn convert(path: &Path, workbook_id: &str, out: &mut dyn Write, progress: &dyn F
 /// Converts the workbook once and returns the event snapshots to index, or
 /// `None` when the file is not a workbook and must be read as text.
 pub fn expand(path: &Path, progress: &dyn Fn(usize)) -> Result<Option<PathBuf>, String> {
-    if !is_workbook(path) {
-        return Ok(None);
+    if !is_workbook(path) { return Ok(None); }
+    let input = crate::workspace::CanonicalInput::open(path)?;
+    let legacy = input.legacy_source().map(|(path, id)| {
+        let stem: String = path.file_stem().unwrap_or_default().to_string_lossy().chars()
+            .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' }).take(60).collect();
+        crate::config_dir().join("expanded").join(format!("{}-planilha-v{VERSION}-{stem}.jsonl", &id[..16]))
+    });
+    // Explicit planilha event references retain the original/validated member
+    // identity; the physical generation only selects the disposable cache.
+    let calendar = crate::sources::ParserCalendar::current()?;
+    let converter = format!("workbook-v{VERSION}-{}-{}", calendar.year, calendar.timezone);
+    calendar.validate_timezone()?;
+    let output = crate::workspace::canonical_file(input, &converter, legacy, |input, out| {
+        calendar.validate_timezone()?;
+        convert(&input.path, &input.logical_identity, calendar.year, out, progress)?;
+        calendar.validate_timezone()
+    })?;
+    calendar.validate_timezone()?;
+    Ok(Some(output))
+}
+
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+
+    #[test]
+    fn single_column_logs_use_the_workbooks_pinned_parser_year() {
+        let rows = vec![(0, vec![(0, Cell::Text("Jan 31 08:03:10 srv sshd[22]: Accepted password for root from 192.0.2.1 port 22 ssh2".into()))])];
+        let mut plan = Plan::new(&rows);
+        assert!(plan.lines.is_some());
+        let event = plan.event(&rows[0].1, 2021);
+        let timestamp = event.timestamp.expect("syslog timestamp");
+        use chrono::TimeZone;
+        assert_eq!(chrono::Datelike::year(&chrono::Local.timestamp_millis_opt(timestamp).single().unwrap()), 2021);
     }
-    let dir = crate::config_dir().join("expanded");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mapped = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| e.to_string())?;
-    let id = crate::index_cache::identity(&path.to_string_lossy(), &mapped);
-    drop(mapped);
-    let stem: String = path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' })
-        .take(60)
-        .collect();
-    let target = dir.join(format!("{}-planilha-v{VERSION}-{stem}.jsonl", &id[..16]));
-    if target.exists() {
-        return Ok(Some(target));
-    }
-    let temp = target.with_extension("pending");
-    let result = (|| {
-        let mut out = BufWriter::new(std::fs::File::create(&temp).map_err(|e| e.to_string())?);
-        convert(path, &id, &mut out, progress)?;
-        out.flush().map_err(|e| e.to_string())?;
-        drop(out);
-        std::fs::rename(&temp, &target).map_err(|e| e.to_string())
-    })();
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error);
-    }
-    Ok(Some(target))
 }

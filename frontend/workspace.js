@@ -69,7 +69,7 @@
   function updateCounts() {
     $("#ws-evidence-count").textContent = activeCase()?.items?.length || "";
     $("#ws-source-count").textContent = sourceList.length || "";
-    $("#ws-subtitle").textContent = page === "compromises" ? `Todo o ${workspaceScope() === "case" ? "Caso ativo" : "conjunto carregado"} · independente dos filtros do Explorar` : page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${fmtNum(state.total)} registros do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${fmtNum(state.total)} eventos${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
+    $("#ws-subtitle").textContent = page === "compromises" ? `Todo o ${workspaceScope() === "case" ? "Caso ativo" : "conjunto carregado"} · independente dos filtros do Explorar` : page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${currentCountLabel("registros")} do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${currentCountLabel("eventos")}${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
   }
   async function showPage(next) {
     window.RemoteSources?.unmount?.();
@@ -90,6 +90,9 @@
       if (workspaceScope() === "dataset" && !state.loaded) { await showPage("summary"); return; }
       const contextKey = sourceKey();
       switchView("viz", { deferAnalytics: true }); home.hidden = true;
+      // Background load/profile updates skip hidden field trees. Populate the catalog
+      // when returning from Summary even when the current rows are already cached.
+      renderExploreTree();
       if (lastExploredKey === contextKey && state.rows?.length > 0 && !state.queryError) {
         switchTab(state.activeDatasetTab, { deferAnalytics: false });
         return;
@@ -342,6 +345,7 @@
     }
   }
   async function clearAnalysis() {
+    if (!await clearData({ removeCurrent: true })) return;
     state.loaded = false;
     state.currentArtifact = null;
     state.columns = [];
@@ -466,7 +470,7 @@
         const path = await dialogApi.open({ multiple: false, filters: [{ name: "Investigação", extensions: ["json"] }] });
         if (!path) return;
         const data = normalizeCaseStore(await api("import_investigation", { path }));
-        for (const c of data.cases) { if (state.cases.cases.some(saved => saved.id === c.id)) c.id = nid(); state.cases.cases.push(c); }
+        for (const c of data.cases) { if (state.cases.cases.some(saved => saved.id === c.id)) c.id = nid(); clearVisiblePreferences([c.id]); state.cases.cases.push(c); }
         if (await saveCases()) { renderCaseBar(); toast("Investigação importada. Selecione-a no menu de casos.", "ok"); }
       } catch (error) { toast(String(error), "err"); }
     };
@@ -485,7 +489,7 @@
     const c = activeCase();
     return `# ${c?.name || "Investigação"}\n\n${synthesisMarkdown(c)}${(c?.items || []).map(it => `## ${it.label}\n\n${Object.values(CaseContent.narrative(it)).filter(Boolean).join("\n\n")}\n\n${window.EvidenceUI?.redact(window.EvidenceUI.report(it)) || ""}\n\n${it.rows?.length || 0} eventos preservados.\n\n${(it.rows || []).map(e => `- ${fmtTsFull(e.timestamp)} · ${e.source} · ${e.message.replaceAll("\n", " ")}\n  Referência: ${e.event_ref || e.id}`).join("\n")}\n\nFiltros: ${JSON.stringify(it.sourceFilters || [])}`).join("\n\n")}`;
   }
-  function openExport() { $("#ws-export-modal").hidden = false; $("#ws-export-kind").focus(); $("#ws-export-kind").dispatchEvent(new Event("change")); $("#ws-export-scope").textContent = `${fmtNum(state.total)} eventos no recorte atual. A exportação de eventos inclui todos os resultados.`; }
+  function openExport() { $("#ws-export-modal").hidden = false; $("#ws-export-kind").focus(); $("#ws-export-kind").dispatchEvent(new Event("change")); $("#ws-export-scope").textContent = `${currentCountLabel("eventos")} no recorte atual. A exportação de eventos inclui todos os resultados.`; }
   async function exportFile() {
     const kind = $("#ws-export-kind").value, mask = $("#ws-mask").checked;
     if (kind === "case-pdf") { $("#ws-export-modal").hidden = true; window.CaseReport.open(); return; }
@@ -494,6 +498,7 @@
     if (!path) return; const button = $("#ws-export-save"), restore = btnBusy(button, "Exportando…");
     try {
       if (kind === "report" || kind === "case") {
+        if (kind === "case") { window.WorkspaceContext?.capture(); syncVisiblePreferenceMetadata(); }
         const data = kind === "report" ? report() : { schemaVersion: 2, active: activeCase()?.id, cases: activeCase() ? [activeCase()] : [] };
         if (kind === "case") await api("export_investigation", { path, data, mask });
         else await api("export_document", { path, content: mask ? redactValue(data) : data });
@@ -542,11 +547,11 @@
   $("#ws-reload").onclick = async () => { cacheKey = ""; timeline.invalidate(); window.Security?.invalidate(); await showPage(page); };
   $("#ws-clear-scope").onclick = () => { state.filters = []; state.quick = ""; $("#quick-search").value = ""; state.page = 0; renderChips(); syncCurrentSavedFilter(); refresh().then(() => showPage(page)); };
   $("#ws-export").onclick = openExport; $("#ws-export-close").onclick = () => { $("#ws-export-modal").hidden = true; }; $("#ws-export-save").onclick = exportFile;
-  $("#ws-export-kind").onchange = () => { const wholeCase=["case", "case-pdf", "report"].includes($("#ws-export-kind").value);$("#ws-export-scope").textContent=wholeCase?`Caso completo · ${fmtNum(activeCase()?.items?.length||0)} itens. Imagens acompanham a investigação JSON e o relatório PDF.`:`${fmtNum(state.total)} registros no recorte atual.`;$("#ws-mask").closest("label").hidden=$("#ws-export-kind").value==="case-pdf"; };
+  $("#ws-export-kind").onchange = () => { const wholeCase=["case", "case-pdf", "report"].includes($("#ws-export-kind").value);$("#ws-export-scope").textContent=wholeCase?`Caso completo · ${fmtNum(activeCase()?.items?.length||0)} itens. Imagens acompanham a investigação JSON e o relatório PDF.`:`${currentCountLabel("registros")} no recorte atual.`;$("#ws-mask").closest("label").hidden=$("#ws-export-kind").value==="case-pdf"; };
   $("#ws-export-modal").onclick = e => { if (e.target.id === "ws-export-modal") e.target.hidden = true; };
-  $("#btn-load").onclick = async () => { await loadData(); if (state.loaded) { await loaded(); await showPage("summary"); } };
-  $("#btn-merge").onclick = async () => { await loadData(null, { merge: true }); if (state.loaded) { await loaded(); await showPage("summary"); } };
-  $("#workbar-cancel").onclick = async () => { window.Tasks?.cancelAll(); await api("cancel_operation", {}, { silent: true }); state.refreshVersion++; serial++; finishOperation("Operação cancelada"); };
+  $("#btn-load").onclick = async () => { if (await loadData()) await showPage("summary"); };
+  $("#btn-merge").onclick = async () => { if (await loadData(null, { merge: true })) await showPage("summary"); };
+  $("#workbar-cancel").onclick = cancelWorkbarTask;
   $("#tabbtn-group").innerHTML = '<i class="fas fa-layer-group"></i> Agrupar';
   $("#tabbtn-dashboard").innerHTML = '<i class="fas fa-chart-line"></i> Gráficos';
   $("#tabbtn-cube").innerHTML = '<i class="fas fa-table-cells"></i> Tabela dinâmica';
@@ -605,6 +610,7 @@
       home.hidden = true;
       markPage(which === "viz" || which === "trail" ? "explore" : which === "source" ? "sources" : which === "caso" && ["timeline", "vtimeline", "timeline-table"].includes(state.analysisView) ? "case-timeline" : "evidence");
     },
+    onCountChanged: updateCounts,
     onRefresh() {
       rememberSelection();
       lastExploredKey = sourceKey();

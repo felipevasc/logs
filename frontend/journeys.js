@@ -53,7 +53,7 @@ window.Journeys = (() => {
   }
   function preferred(fields) {
     const count = view.scope === "case" ? caseEvents().filter(rowPassesFilters).length : state.total;
-    const repeated = field => field.distinct != null && field.distinct < Math.round(field.coverage * count);
+    const repeated = field => Number.isFinite(count) && field.distinct != null && field.distinct < Math.round(field.coverage * count);
     return fields.find(field => field.suggested && repeated(field)) || fields.find(field => field.suggested) || fields.find(field => ["user", "ip"].includes(field.kind)) || fields.find(repeated) || fields[0];
   }
   const duration = value => { if (value == null) return "Sem duração"; if (value < 1000) return `${value} ms`; if (value < 60000) return `${(value / 1000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} s`; if (value < 3600000) return `${(value / 60000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} min`; return `${(value / 3600000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} h`; };
@@ -66,9 +66,9 @@ window.Journeys = (() => {
     node.append(previous, el("span", "", `${page + 1} / ${pages}`), next); target.append(node);
   }
   function status(message, warning = false) { const node = host?.querySelector(".journey-status"); if (node) { node.textContent = message; node.classList.toggle("journey-warning", warning); } }
-  function busy(target, message) {
+  function busy(target, message, taskKey) {
     target.innerHTML = ""; const block = el("div", "journey-empty", message);
-    const cancel = button("Cancelar", async () => { cancel.disabled = true; try { await api("cancel_operation"); } catch {} }); block.append(document.createElement("br"), cancel); target.append(block);
+    const cancel = button("Cancelar", () => { cancel.disabled = true; cancel.textContent = "Cancelando…"; window.Tasks?.cancelLatest(taskKey); }); block.append(document.createElement("br"), cancel); target.append(block);
   }
   function failure(target, error, retry) { target.innerHTML = ""; const node = el("div", "journey-empty", String(error)); node.append(document.createElement("br"), button("Tentar novamente", retry)); target.append(node); }
   function controls() {
@@ -114,9 +114,9 @@ window.Journeys = (() => {
     const token = view.token, version = ++view.indexToken, list = host.querySelector(".journey-list-panel");
     if (!view.field) { list.innerHTML = '<p class="journey-empty">Escolha um campo para ligar os registros.</p>'; return; }
     if (heuristic() && !hasWindow()) { list.innerHTML = '<p class="journey-empty">Escolha início e fim para investigar este usuário ou IP no tempo.</p>'; status("Informe um período para evitar ligar registros sem relação."); return; }
-    busy(list, "Relacionando registros…");
+    busy(list, "Relacionando registros…", "journey-index");
     try {
-      const data = await api("journey_index", { ...base(), ...timeArgs(), field: view.field, offset: view.page * 50, limit: 50, sort: view.sort, includeSingles: view.singles });
+      const data = await api("journey_index", { ...base(), ...timeArgs(), field: view.field, offset: view.page * 50, limit: 50, sort: view.sort, includeSingles: view.singles }, { latest: "journey-index" });
       if (!isActive(token) || version !== view.indexToken) return;
       const lastPage = Math.max(0, Math.ceil(data.total / 50) - 1);
       if (view.page > lastPage) { view.page = lastPage; view.listScroll = 0; return loadIndex(); }
@@ -155,9 +155,9 @@ window.Journeys = (() => {
     actions.append(explore, preserve); head.append(actions); detail.append(head);
     const records = el("div", "journey-records"); detail.append(records);
     if (heuristic() && !hasWindow()) { records.append(el("div", "journey-empty", "Escolha um período para consultar relações por usuário ou IP.")); explore.disabled = true; return; }
-    busy(records, "Lendo a sequência…");
+    busy(records, "Lendo a sequência…", "journey-detail");
     try {
-      const data = await api("journey_events", { ...base(), ...timeArgs(), field: view.field, value: selected.value, offset: view.detailPage * 100, limit: 100 });
+      const data = await api("journey_events", { ...base(), ...timeArgs(), field: view.field, value: selected.value, offset: view.detailPage * 100, limit: 100 }, { latest: "journey-detail" });
       if (!isActive(token) || version !== view.detailToken) return;
       preserve.disabled = !data.total;
       const lastPage = Math.max(0, Math.ceil(data.total / 100) - 1);
@@ -193,9 +193,9 @@ window.Journeys = (() => {
     if (signature !== view.signature && !view.restorePending) { view.page = 0; view.selected = null; view.listScroll = view.detailScroll = 0; }
     view.signature = signature; view.restorePending = false;
     container.innerHTML = ""; host = el("div", "journey-workspace"); container.append(host);
-    busy(host, "Identificando chaves de correlação…");
+    busy(host, "Identificando chaves de correlação…", "journey-fields");
     try {
-      const fields = await api("journey_fields", base());
+      const fields = await api("journey_fields", base(), { latest: "journey-fields" });
       if (!isActive(token)) return;
       view.fields = [...fields, ...view.customFields.filter(custom => !fields.some(field => field.field === custom.field))];
       const seedFields = view.seedPending && view.seed ? view.fields.filter(field => valueOf(view.seed, field.field) != null) : [];

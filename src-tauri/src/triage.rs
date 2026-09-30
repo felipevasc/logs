@@ -82,7 +82,7 @@ pub fn stored_analysis(
         Some(events) => detections::run_stored(&inputs, &Source::Events(events.iter().collect()))?,
         None => workspace::with_selection(state, &[], |selection| {
             detections::run_stored(&inputs, &Source::Selection(&selection))
-        })?,
+        })??,
     };
     crate::operations::check()?;
     if result.metadata.get("complete").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -189,7 +189,7 @@ pub fn triage_page(
         None => workspace::with_selection(state, &filters, |selection| {
             let mut ids = selection.iter().map(|e| e.id);
             full.page(minimum, offset, limit, Some(&mut ids), tactic)
-        }),
+        })?,
     }
 }
 
@@ -215,7 +215,7 @@ pub fn timeline_impl(
         None => workspace::with_selection(state, &filters, |selection| {
             let mut ids = selection.iter().map(|e| e.id);
             full.timeline(minimum, start, end, Some(&mut ids))
-        }),
+        })?,
     }
 }
 

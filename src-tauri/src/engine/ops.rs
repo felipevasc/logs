@@ -1,8 +1,8 @@
-//! Operations answered by the engine. Each returns `None` when the engine is
-//! not ready or fails, and the caller then runs the line engine.
+//! Operations answered by the engine. Unavailable/unsupported capabilities
+//! permit explicit recovery; execution and resource failures are propagated.
 use super::sql::lit;
 use super::udf::Tests;
-use super::{session, Session};
+use super::Session;
 use crate::analysis::{SeriesData, SeriesResult, SeriesSpec, UnitKind};
 use crate::insights::{Comparison, Overview, Pattern, Period};
 use crate::model::{class_label, ts_to_iso, CodesConfig, Event};
@@ -11,11 +11,13 @@ use crate::query::{
     ExplorerSnapshot, PreparedFilter, QueryResult, Stats,
 };
 use crate::sources::{event_at, CompiledDerived, FileIndex};
-use duckdb::arrow::array::{Array, Int64Array};
+use duckdb::arrow::array::{Array, Int64Array, Int32Array, Float64Array, StringArray, LargeStringArray, StringViewArray, StructArray};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use duckdb::arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -40,19 +42,69 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// Runs `f` on the source's session; errors fall back to the line engine.
-fn with<T>(src: &Source, f: impl FnOnce(&Session) -> Result<T>) -> Option<T> {
-    let session = session(src.idx, src.codes, src.system, src.derived)?;
-    let _names = session.names_guard();
-    match f(&session) {
-        Ok(value) if !crate::operations::cancelled() => Some(value),
-        Ok(_) => None,
-        Err(error) => {
-            if !crate::operations::cancelled() {
-                eprintln!("[motor] consulta respondida pelo motor de linhas: {error}");
+/// The handle belongs to this checked-out connection only. Joining the watcher
+/// before returning it to the pool prevents a late cancellation from interrupting
+/// a different operation that reuses the connection.
+struct InterruptWatch {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for InterruptWatch {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+    }
+}
+
+fn interruptible(conn: &duckdb::Connection) -> Result<Option<InterruptWatch>> {
+    crate::operations::check()?;
+    if crate::operations::current_generation().is_none() && crate::operations::current_id().is_none() {
+        return Ok(None);
+    }
+    let token = crate::operations::current_token();
+    let interrupt = conn.interrupt_handle();
+    let (stop, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::Builder::new().name("loginsight-query-cancel".into()).spawn(move || {
+        loop {
+            match finished.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if token.cancelled() { interrupt.interrupt(); break; }
+                }
             }
-            None
         }
+    }).map_err(err)?;
+    Ok(Some(InterruptWatch { stop, worker: Some(worker) }))
+}
+
+fn ready_session(src: &Source, base_allowed: bool) -> Result<Option<Arc<Session>>> {
+    if base_allowed && !src.derived.is_empty() {
+        if let Some(base) = super::session_checked(src.idx, src.codes, src.system, &[])? { return Ok(Some(base)); }
+    }
+    super::session_checked(src.idx, src.codes, src.system, src.derived)
+}
+
+/// Unavailable/unsupported permits explicit recovery. A failed SQL operation
+/// (including cancellation, spill or selection limits) must never trigger a
+/// second unbounded line scan or publish an empty success response.
+fn analytics_with<T>(src: &Source, base_allowed: bool, f: impl FnOnce(&Session) -> Result<T>) -> Result<Option<T>> {
+    crate::operations::check()?;
+    let Some(session) = ready_session(src, base_allowed)? else {
+        crate::operations::progress("analytics-recovery", "Índice indisponível; verificando arquivo", 0, 0, 0);
+        return Ok(None);
+    };
+    session.collect_garbage()?;
+    let _names = session.names_guard();
+    let result = f(&session);
+    crate::operations::check()?;
+    match result {
+        Ok(value) => { session.collect_garbage()?; Ok(Some(value)) },
+        Err(error) if matches!(error.as_str(), "Coluna disponível apenas no texto bruto." | "Colunas canônicas exigem o evento completo." | "Ordenação pelo texto bruto.") => {
+            crate::operations::progress("analytics-recovery", "Campo bruto; verificando arquivo", 0, 0, 0);
+            Ok(None)
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -71,81 +123,170 @@ struct Scope<'s> {
 /// Rows checked at most per free-text needle found through the inverted index.
 const FREE_LIMIT: usize = 250_000;
 
-/// Replaces each `contains(vals, '…')` of a condition by the rows whose text
-/// contains the needle: candidates come from the inverted index and are
-/// confirmed with the same text the column holds. Needles the index cannot
-/// narrow keep the scan.
-fn resolve_free(session: &Session, src: &Source, sql: &str) -> Result<(String, Vec<Arc<Selection>>)> {
-    const OPEN: &str = "contains(vals, '";
+/// Replace a planner token only outside SQL string literals. A user-supplied
+/// field value may happen to contain the same text as an internal placeholder.
+fn replace_sql_marker(sql: &str, marker: &str, replacement: &str) -> Option<String> {
     let mut out = String::with_capacity(sql.len());
-    let mut held = Vec::new();
-    let mut rest = sql;
-    while let Some(at) = rest.find(OPEN) {
-        out.push_str(&rest[..at]);
-        let body = &rest[at + OPEN.len()..];
-        // SQL literal: '' is a quote inside it.
-        let mut needle = String::new();
-        let mut chars = body.char_indices().peekable();
-        let mut end = None;
-        while let Some((i, c)) = chars.next() {
-            if c == '\'' {
-                if chars.peek().map(|(_, n)| *n) == Some('\'') {
-                    chars.next();
-                    needle.push('\'');
-                } else {
-                    end = Some(i + 1);
-                    break;
-                }
-            } else {
-                needle.push(c);
+    let bytes = sql.as_bytes();
+    let (mut at, mut copied, mut changed) = (0, 0, false);
+    while at < bytes.len() {
+        if bytes[at] == b'\'' {
+            at += 1;
+            while at < bytes.len() {
+                if bytes[at] == b'\'' {
+                    at += 1;
+                    if at < bytes.len() && bytes[at] == b'\'' { at += 1; }
+                    else { break; }
+                } else { at += 1; }
             }
-        }
-        let Some(end) = end.filter(|&e| body[e..].starts_with(')')) else {
-            out.push_str(&rest[at..]);
-            return Ok((out, held));
-        };
-        let whole = &rest[at..at + OPEN.len() + end + 1];
-        match free_selection(session, src, &needle)? {
-            Some(selection) => {
-                out.push_str(&format!("id IN (SELECT id FROM {})", selection.name));
-                held.push(selection);
-            }
-            None => out.push_str(whole),
-        }
-        rest = &body[end + 1..];
+        } else if bytes[at..].starts_with(marker.as_bytes()) {
+            out.push_str(&sql[copied..at]);
+            out.push_str(replacement);
+            at += marker.len();
+            copied = at;
+            changed = true;
+        } else { at += 1; }
     }
-    out.push_str(rest);
-    Ok((out, held))
+    if !changed { return None; }
+    out.push_str(&sql[copied..]);
+    Some(out)
 }
 
-fn free_selection(session: &Session, src: &Source, needle: &str) -> Result<Option<Arc<Selection>>> {
-    let key = format!("free#{needle}");
+/// Resolve selective field equalities and complete free-text terms, including
+/// effective names/descriptions.
+/// Narrow terms become one candidate membership predicate: this avoids the
+/// old million-row enrichment + MARK join even when only ten records match.
+fn resolve_free(session: &Session, src: &Source, sql: &str, tests: &Tests) -> Result<(String, Vec<Arc<Selection>>, bool)> {
+    let mut sql = sql.to_string();
+    let mut held = Vec::new();
+    let mut names = false;
+    for term in &tests.hex_fields {
+        if replace_sql_marker(&sql, &term.marker, "TRUE").is_none() { continue; }
+        let replacement = match exact_hex_selection(session, src, term)? {
+            Some(selection) => {
+                let predicate = selection.predicate();
+                held.push(selection);
+                predicate
+            }
+            None => term.fallback_sql.clone(),
+        };
+        sql = replace_sql_marker(&sql, &term.marker, &replacement).expect("planner marker found");
+    }
+    for term in &tests.free {
+        if replace_sql_marker(&sql, &term.marker, "TRUE").is_none() { continue; }
+        let replacement = match free_selection(session, src, term)? {
+            Some(selection) => {
+                let predicate = selection.predicate();
+                held.push(selection);
+                predicate
+            }
+            None => {
+                names = true;
+                format!("(contains(vals, {}) OR {})", lit(&term.needle), term.names_sql)
+            }
+        };
+        sql = replace_sql_marker(&sql, &term.marker, &replacement).expect("planner marker found");
+    }
+    Ok((sql, held, names))
+}
+
+fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexField) -> Result<Option<Arc<Selection>>> {
+    // A selective lookup must not replace cheap vectorized filtering with an
+    // unbounded amount of record hydration. Dense terms retain native SQL.
+    const LIMIT: usize = 4_096;
+    let filter = &term.filter;
+    let key = format!("exact-hex#{}", serde_json::to_string(&(&filter.f.column, &filter.f.value)).map_err(err)?);
+    if let Some(found) = session.cached_selection(&key) { return Ok(Some(found)); }
+    let Some(candidates) = session.exact_hex_candidates(&term.word, LIMIT) else { return Ok(None) };
+    let mut confirmed = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        crate::operations::check()?;
+        if crate::query::matches(&src.event(id), filter) { confirmed.push(id); }
+    }
+    let selected = selection(session, &confirmed)?;
+    session.cache_selection(key, Arc::clone(&selected));
+    Ok(Some(selected))
+}
+
+fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) -> Result<Option<Arc<Selection>>> {
+    let needle = &term.needle;
+    let key = format!("free-v2#{needle}");
     if let Some(found) = session.cached_selection(&key) {
         return Ok(Some(found));
     }
-    let Some(candidates) = session.free_candidates(needle, FREE_LIMIT) else { return Ok(None) };
-    // Confirmed on the stored text of the candidates only (the original file
-    // would be read line by line, slowly on a cold disk).
-    let _ = src;
-    let pending = selection(session, &candidates)?;
-    let ids = read_ids(
-        session,
-        &format!(
-            "SELECT id FROM ev WHERE id IN (SELECT id FROM {}) AND contains(vals, {}) ORDER BY id",
-            pending.name,
-            lit(needle)
-        ),
-    )?;
-    drop(pending);
-    let found = selection(session, &ids)?;
+    // The text index covers stored values AND intrinsic names/descriptions.
+    // Catalog overrides are a separate, small source/code relation.
+    let Some(mut candidates) = session.free_candidates(needle, FREE_LIMIT) else { return Ok(None) };
+    if !session.baked {
+        let catalog = read_ids(session, &catalog_candidates_sql(&term.names_sql))?;
+        if catalog.len() > FREE_LIMIT { return Ok(None); }
+        candidates.extend(catalog);
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.len() > FREE_LIMIT { return Ok(None); }
+    }
+    let found = if candidates.len() <= 4_096 {
+        // Random access through existing line offsets avoids scanning columnar
+        // row IDs/text to confirm a tiny candidate set. The canonical matcher
+        // also avoids allocating a second joined copy of a very wide record.
+        let mut confirmed = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            crate::operations::check()?;
+            let event = src.event(id);
+            if crate::querylang::any_value(&event, &|value| {
+                crate::query::ci_contains_bytes(value.as_bytes(), needle.as_bytes())
+            })
+            { confirmed.push(id); }
+        }
+        selection(session, &confirmed)?
+    } else {
+        let pending = selection(session, &candidates)?;
+        selection_query(session, &format!(
+            "SELECT id FROM evn WHERE id IN (SELECT id FROM {}) AND (contains(vals, {}) OR {}) ORDER BY id",
+            pending.name, lit(needle), term.names_sql
+        ))?
+    };
     session.cache_selection(key, Arc::clone(&found));
     Ok(Some(found))
+}
+
+fn catalog_candidates_sql(names_sql: &str) -> String {
+    // A correlated EXISTS with the exact/wildcard OR makes DuckDB retain the
+    // entire event side in a delimiter join, even for an empty catalog. Two
+    // ordinary equality semi joins build from the small catalog instead.
+    // An event may occur in both branches; the caller deduplicates candidates
+    // and verifies the effective catalog precedence with the canonical matcher.
+    // Hitting the bound (including duplicates) conservatively uses the general
+    // query path, so LIMIT never publishes an incomplete candidate selection.
+    format!(
+        "SELECT id FROM (\
+         SELECT ev.id FROM ev SEMI JOIN \
+         (SELECT source, code FROM enr WHERE source <> '*' AND ({names_sql})) AS matched \
+         ON matched.source=ev.source AND matched.code=ev.code \
+         UNION ALL \
+         SELECT ev.id FROM ev SEMI JOIN \
+         (SELECT code FROM enr WHERE source='*' AND ({names_sql})) AS matched \
+         ON matched.code=ev.code) LIMIT {}",
+        FREE_LIMIT + 1
+    )
 }
 
 /// Table holding the ids a filter list selects; dropped with its last user.
 pub(crate) struct Selection {
     name: String,
+    known_empty: bool,
+    single_id: Option<usize>,
+    rows: AtomicU64,
     garbage: Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+impl Selection {
+    pub(crate) fn name(&self) -> &str { &self.name }
+    pub(crate) fn accounted_bytes(&self) -> u64 { self.rows.load(Ordering::Relaxed).saturating_mul(8) }
+    fn predicate(&self) -> String {
+        if self.known_empty { "FALSE".into() }
+        else { format!("id IN (SELECT id FROM {})", self.name) }
+    }
 }
 
 impl Drop for Selection {
@@ -164,72 +305,36 @@ impl Scope<'_> {
     }
 }
 
-fn read_ids(session: &Session, sql: &str) -> Result<Vec<usize>> {
+fn visit_ids(session: &Session, sql: &str, mut visit: impl FnMut(usize) -> Result<bool>) -> Result<()> {
     let conn = session.conn()?;
+    let _cancel = interruptible(&conn)?;
     let mut stmt = conn.prepare(sql).map_err(err)?;
-    let mut ids = Vec::new();
-    for batch in stmt.query_arrow([]).map_err(err)? {
-        let column = batch.column(0);
-        let values = column
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or("Identificadores em formato inesperado.")?;
-        ids.extend(values.values().iter().map(|&v| v as usize));
-    }
-    Ok(ids)
-}
-
-fn intersect(a: &[usize], b: &[usize]) -> Vec<usize> {
-    let (mut i, mut j, mut out) = (0, 0, Vec::with_capacity(a.len().min(b.len())));
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                out.push(a[i]);
-                i += 1;
-                j += 1;
-            }
+    drop(stmt.stream_arrow([]).map_err(err)?);
+    while let Some(batch) = stmt.step().map_err(err)? {
+        crate::operations::check()?;
+        let values = batch.column(0).as_any().downcast_ref::<Int64Array>().ok_or("Identificadores em formato inesperado.")?;
+        for &value in values.values().iter() {
+            let id = usize::try_from(value).map_err(err)?;
+            if !visit(id)? { return Ok(()); }
         }
     }
-    out
+    crate::operations::check()
+}
+fn read_ids(session: &Session, sql: &str) -> Result<Vec<usize>> {
+    let mut ids = Vec::new();
+    visit_ids(session, sql, |id| {
+        crate::query::push_collected_id(&mut ids, id)?;
+        Ok(true)
+    })?;
+    Ok(ids)
 }
 
-/// Line numbers matching every filter, in file order.
+/// The all-ID API is explicitly bounded; analytics and callbacks use the
+/// database selection/stream instead of collecting this result.
 fn matching_ids(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Vec<usize>> {
-    let plan = session.schema.plan(pfs);
-    let from = if plan.names { "evn" } else { "ev" };
-    let (sql, _free) = resolve_free(session, src, &plan.sql)?;
-    let mut ids = read_ids(session, &format!("SELECT id FROM {from} WHERE {sql} ORDER BY id"))?;
-    drop(plan.tests);
-    for &i in &plan.lines {
-        let other = crate::query::scan_matches(src.idx, std::slice::from_ref(&pfs[i].f), src.codes, src.system, src.derived);
-        crate::operations::check()?;
-        ids = intersect(&ids, &other);
-    }
-    if !plan.verify.is_empty() {
-        let checks: Vec<&PreparedFilter> = plan.verify.iter().map(|&i| &pfs[i]).collect();
-        let generation = crate::operations::current_generation();
-        let kept: Vec<Vec<usize>> = ids
-            .par_chunks(4096)
-            .map(|chunk| {
-                let mut out = Vec::new();
-                for &id in chunk {
-                    if crate::operations::cancelled_for(generation) {
-                        break;
-                    }
-                    let ev = src.event(id);
-                    if checks.iter().all(|pf| crate::query::matches(&ev, pf)) {
-                        out.push(id);
-                    }
-                }
-                out
-            })
-            .collect();
-        crate::operations::check()?;
-        ids = kept.concat();
-    }
-    Ok(ids)
+    if pfs.is_empty() { crate::query::check_collected_ids(src.idx.lines.len())?; }
+    let scope = scope(session, src, pfs)?;
+    read_ids(session, &format!("SELECT id FROM {} WHERE {} ORDER BY id", scope.from(false), scope.cond))
 }
 
 /// Conditions that read long texts on every row (free text, messages,
@@ -241,48 +346,66 @@ fn costly(sql: &str) -> bool {
         .any(|part| sql.contains(part))
 }
 
+fn cacheable_filters(pfs: &[PreparedFilter]) -> bool {
+    fn stable(expr: &crate::querylang::Expr) -> bool {
+        use crate::querylang::{Expr, TermKind};
+        match expr {
+            Expr::All => true,
+            Expr::And(items) | Expr::Or(items) => items.iter().all(stable),
+            Expr::Not(inner) => stable(inner),
+            Expr::Term(term) => !matches!(term.kind(), TermKind::Event),
+        }
+    }
+    pfs.iter().all(|pf| !matches!(pf.f.op.as_str(), "detection" | "threat_rule") && pf.expr.as_ref().is_none_or(stable))
+}
+
 fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Scope<'s>> {
     let plan = session.schema.plan(pfs);
-    let (sql, free) = resolve_free(session, src, &plan.sql)?;
+    let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
     if plan.exact() && !costly(&sql) {
         return Ok(Scope {
             session,
             cond: sql,
-            names: plan.names,
+            names: plan.names || free_names,
             _tests: plan.tests,
             _selection: None,
             _free: free,
         });
     }
-    // Exact selections depend only on the filters (and loaded names).
-    let key = plan.exact().then(|| {
+    // Detection/threat registries are mutable independently of the source;
+    // do not reuse those until their revisions become part of this key.
+    let key = cacheable_filters(pfs).then(|| {
         let filters: Vec<&crate::query::Filter> = pfs.iter().map(|pf| &pf.f).collect();
         format!("{}#{}", serde_json::to_string(&filters).unwrap_or_default(), session.names_version())
     });
     if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
         return Ok(Scope {
             session,
-            cond: format!("id IN (SELECT id FROM {})", found.name),
+            cond: found.predicate(),
             names: false,
             _tests: Tests::default(),
             _selection: Some(found),
             _free: Vec::new(),
         });
     }
-    let ids = if plan.exact() {
-        let from = if plan.names { "evn" } else { "ev" };
-        read_ids(session, &format!("SELECT id FROM {from} WHERE {sql}"))?
+    let _build = key.as_deref().map(|key| session.begin_selection(key)).transpose()?;
+    if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
+        return Ok(Scope { session, cond: found.predicate(), names: false, _tests: Tests::default(), _selection: Some(found), _free: Vec::new() });
+    }
+    let selection = if plan.exact() {
+        let from = if plan.names || free_names { "evn" } else { "ev" };
+        // Keep a potentially 50M-row selection inside DuckDB, whose buffer
+        // manager can spill it, instead of a Rust Vec followed by another copy.
+        selection_query(session, &format!("SELECT id FROM {from} WHERE {sql}"))?
     } else {
-        drop(plan);
-        matching_ids(session, src, pfs)?
+        verified_selection(session, src, pfs, &plan, &sql, free_names)?
     };
-    let selection = selection(session, &ids)?;
     if let Some(key) = key {
         session.cache_selection(key, Arc::clone(&selection));
     }
     Ok(Scope {
         session,
-        cond: format!("id IN (SELECT id FROM {})", selection.name),
+        cond: selection.predicate(),
         names: false,
         _tests: Tests::default(),
         _selection: Some(selection),
@@ -290,26 +413,145 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
     })
 }
 
-fn selection(session: &Session, ids: &[usize]) -> Result<Arc<Selection>> {
+/// A page must not first materialize every match to populate an analytics
+/// cache. Non-exact predicates are verified in bounded sorted batches below.
+fn page_scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<(Scope<'s>, bool)> {
+    let plan = session.schema.plan(pfs);
+    let exact = plan.exact();
+    let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    Ok((Scope { session, cond: sql, names: plan.names || free_names, _tests: plan.tests, _selection: None, _free: free }, exact))
+}
+
+fn new_selection(session: &Session, known_empty: bool, single_id: Option<usize>) -> Arc<Selection> {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    let conn = session.conn()?;
-    for unused in session.take_garbage() {
-        let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {unused}"));
-    }
-    let name = format!("sel_{}", NEXT.fetch_add(1, Ordering::Relaxed));
-    conn.execute_batch(&format!("CREATE TABLE {name} (id BIGINT)")).map_err(err)?;
-    let selection = Arc::new(Selection {
-        name: name.clone(),
+    Arc::new(Selection {
+        name: format!("sel_{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+        known_empty,
+        single_id,
+        rows: AtomicU64::new(u64::MAX),
         garbage: session.garbage(),
-    });
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-    let mut appender = conn.appender(&name).map_err(err)?;
-    for chunk in ids.chunks(1 << 16) {
-        let array = Int64Array::from_iter_values(chunk.iter().map(|&i| i as i64));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)]).map_err(err)?;
-        appender.append_record_batch(batch).map_err(err)?;
+    })
+}
+
+fn selection_query(session: &Session, sql: &str) -> Result<Arc<Selection>> {
+    let selection = new_selection(session, false, None);
+    selection_write(session, &selection, |conn| {
+        crate::operations::progress("analytics-select", "Selecionando candidatos", 0, 0, 0);
+        let max = crate::resources::selection_bytes() / 8;
+        let rows = conn.execute(&format!("INSERT INTO {} SELECT id FROM ({sql}) LIMIT {}", selection.name, max.saturating_add(1)), []).map_err(err)?;
+        check_selection_size(rows as u64)?;
+        Ok(rows as u64)
+    })?;
+    Ok(selection)
+}
+
+fn selection(session: &Session, ids: &[usize]) -> Result<Arc<Selection>> {
+    check_selection_size(ids.len() as u64)?;
+    let selection = new_selection(session, ids.is_empty(), if ids.len() == 1 { Some(ids[0]) } else { None });
+    selection_write(session, &selection, |conn| {
+        let mut appender = conn.appender(&selection.name).map_err(err)?;
+        for chunk in ids.chunks((crate::resources::batch_bytes() / 8).clamp(1, 65536)) {
+            crate::operations::check()?;
+            append_ids(&mut appender, chunk)?;
+        }
+        appender.flush().map_err(err)?;
+        Ok(ids.len() as u64)
+    })?;
+    Ok(selection)
+}
+
+fn check_selection_size(rows: u64) -> Result<()> {
+    if rows.saturating_mul(8) > crate::resources::selection_bytes() {
+        Err("A seleção excedeu o orçamento de IDs (LOGINSIGHT_SELECTION_LIMIT_MB). Restrinja os filtros ou aumente o limite.".into())
+    } else { Ok(()) }
+}
+
+/// The table becomes visible only after complete verification and commit.
+/// Both a failed COMMIT and a failed cleanup discard this pooled connection.
+fn selection_write(session: &Session, selection: &Selection, fill: impl FnOnce(&duckdb::Connection) -> Result<u64>) -> Result<()> {
+    let mut conn = session.conn()?;
+    for unused in session.take_garbage() {
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS {unused}")).map_err(err)?;
     }
-    appender.flush().map_err(err)?;
+    let cancel = interruptible(&conn)?;
+    conn.execute_batch("BEGIN TRANSACTION").map_err(err)?;
+    let result: Result<()> = (|| {
+        conn.execute_batch(&format!("CREATE TABLE {} (id BIGINT)", selection.name)).map_err(err)?;
+        let rows = fill(&conn)?;
+        crate::operations::check()?;
+        conn.execute_batch("COMMIT").map_err(err)?;
+        selection.rows.store(rows, Ordering::Relaxed);
+        Ok(())
+    })();
+    drop(cancel);
+    if result.is_err() && conn.execute_batch("ROLLBACK").is_err() { conn.discard(); }
+    result?;
+    crate::operations::check()
+}
+
+fn append_ids(appender: &mut duckdb::Appender<'_>, ids: &[usize]) -> Result<()> {
+    if ids.is_empty() { return Ok(()); }
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let array = Int64Array::from_iter_values(ids.iter().map(|&i| i as i64));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).map_err(err)?;
+    appender.append_record_batch(batch).map_err(err)
+}
+
+fn verified_selection(session: &Session, src: &Source, pfs: &[PreparedFilter], plan: &super::sql::Plan, sql: &str, free_names: bool) -> Result<Arc<Selection>> {
+    let selection = new_selection(session, false, None);
+    selection_write(session, &selection, |writer| {
+        // A second connection is required: appending on the streaming reader
+        // would invalidate its active result. Both share this immutable source.
+        let reader = session.conn()?;
+        let _cancel = interruptible(&reader)?;
+        let from = if plan.names || free_names { "evn" } else { "ev" };
+        let mut stmt = reader.prepare(&format!("SELECT id FROM {from} WHERE {sql}")).map_err(err)?;
+        crate::operations::progress("analytics-select", "Selecionando candidatos", 0, 0, 0);
+        // Arrow's Iterator::next panics on a late fetch error. Start streaming,
+        // then use the public fallible step API so no partial result is cached.
+        drop(stmt.stream_arrow([]).map_err(err)?);
+        let verifier = crate::query::CandidateVerifier::new(src.idx, pfs, &plan.lines, &plan.verify, src.codes, src.system, src.derived);
+        let cancellation = crate::operations::current_token();
+        let mut appender = writer.appender(&selection.name).map_err(err)?;
+        let mut examined = 0usize;
+        let mut selected = 0u64;
+        let mut last_report = std::time::Instant::now();
+        while let Some(batch) = stmt.step().map_err(err)? {
+            crate::operations::check()?;
+            let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().ok_or("Identificadores em formato inesperado.")?;
+            let mut from = 0;
+            while from < ids.len() {
+                let mut to = from;
+                let mut bytes = 0usize;
+                while to < ids.len() {
+                    let id = usize::try_from(ids.value(to)).map_err(err)?;
+                    let meta = src.idx.lines.get(id).ok_or("Identificador de candidato fora da fonte.")?;
+                    let next = meta.len as usize;
+                    if to > from && bytes.saturating_add(next) > crate::resources::batch_bytes() { break; }
+                    bytes = bytes.saturating_add(next);
+                    to += 1;
+                }
+                let kept: Vec<usize> = (from..to).into_par_iter().filter_map(|at| {
+                    if cancellation.cancelled() { return None; }
+                    let id = ids.value(at) as usize;
+                    verifier.matches(id).then_some(id)
+                }).collect();
+                crate::operations::check()?;
+                selected = selected.saturating_add(kept.len() as u64);
+                check_selection_size(selected)?;
+                append_ids(&mut appender, &kept)?;
+                examined += to - from;
+                if last_report.elapsed() >= std::time::Duration::from_millis(200) {
+                    crate::operations::progress("analytics-verify", "Verificando candidatos", examined, 0, selected as usize);
+                    last_report = std::time::Instant::now();
+                }
+                from = to;
+            }
+        }
+        appender.flush().map_err(err)?;
+        crate::operations::progress("analytics-verify", "Verificação concluída; publicando seleção", examined, 0, selected as usize);
+        Ok(selected)
+    })?;
     Ok(selection)
 }
 
@@ -319,21 +561,230 @@ fn prepared(filters: &[crate::query::Filter]) -> Vec<PreparedFilter> {
 
 fn rows<T>(session: &Session, sql: &str, map: impl FnMut(&duckdb::Row<'_>) -> duckdb::Result<T>) -> Result<Vec<T>> {
     let conn = session.conn()?;
+    let _cancel = interruptible(&conn)?;
     let mut stmt = conn.prepare(sql).map_err(err)?;
     let mapped = stmt.query_map([], map).map_err(err)?;
     mapped.collect::<duckdb::Result<Vec<T>>>().map_err(err)
 }
 
+struct StreamRow<'a> { batch: &'a StructArray, at: usize }
+impl StreamRow<'_> {
+    fn get<T: duckdb::types::FromSql>(&self, index: usize) -> Result<T> {
+        use duckdb::types::ValueRef;
+        let column = self.batch.column(index);
+        let value = if column.is_null(self.at) { ValueRef::Null }
+        else if let Some(a) = column.as_any().downcast_ref::<Int64Array>() { ValueRef::BigInt(a.value(self.at)) }
+        else if let Some(a) = column.as_any().downcast_ref::<Int32Array>() { ValueRef::Int(a.value(self.at)) }
+        else if let Some(a) = column.as_any().downcast_ref::<Float64Array>() { ValueRef::Double(a.value(self.at)) }
+        else if let Some(a) = column.as_any().downcast_ref::<StringArray>() { ValueRef::Text(a.value(self.at).as_bytes()) }
+        else if let Some(a) = column.as_any().downcast_ref::<LargeStringArray>() { ValueRef::Text(a.value(self.at).as_bytes()) }
+        else if let Some(a) = column.as_any().downcast_ref::<StringViewArray>() { ValueRef::Text(a.value(self.at).as_bytes()) }
+        else { return Err(format!("Tipo de resultado analítico não suportado: {:?}", column.data_type())); };
+        T::column_result(value).map_err(err)
+    }
+}
+fn stream_rows(session: &Session, sql: &str, mut visit: impl FnMut(StreamRow<'_>) -> Result<()>) -> Result<()> {
+    let conn = session.conn()?;
+    let _cancel = interruptible(&conn)?;
+    let mut stmt = conn.prepare(sql).map_err(err)?;
+    crate::operations::progress("analytics-sql", "Calculando estatísticas", 0, 0, 0);
+    drop(stmt.stream_arrow([]).map_err(err)?);
+    while let Some(batch) = stmt.step().map_err(err)? {
+        crate::operations::check()?;
+        for at in 0..batch.len() { visit(StreamRow { batch: &batch, at })?; }
+    }
+    crate::operations::check()
+}
+fn stream_key(row: &StreamRow<'_>, index: usize, time: bool) -> Result<Option<String>> {
+    if !time { return row.get(index); }
+    match row.get::<Option<i64>>(index)? {
+        None => Ok(None),
+        Some(ts) => {
+            let text = ts_to_iso(ts);
+            if text.trim().is_empty() { Err("Data fora do intervalo representável.".into()) }
+            else { Ok(Some(text)) }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_analytics_tests {
+    use super::*;
+    use parking_lot::{Mutex, RwLock};
+
+    fn session() -> Session {
+        Session {
+            key: "bounded-test".into(), base: Mutex::new(duckdb::Connection::open_in_memory().unwrap()),
+            pool: Mutex::new(Vec::new()), schema: super::super::sql::Schema::default(),
+            timestamps_non_null: false, baked: false, names: RwLock::new(None),
+            names_version: AtomicU64::new(0), selections: Mutex::new(Vec::new()),
+            selection_builds: Mutex::new(std::collections::HashSet::new()), selection_changed: parking_lot::Condvar::new(),
+            garbage: Arc::new(Mutex::new(Vec::new())), texts: Vec::new(), _leases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_catalog_candidates_do_not_materialize_the_event_side() {
+        let session = session();
+        let directory = tempfile::tempdir().unwrap();
+        let conn = session.conn().unwrap();
+        conn.execute_batch(&format!(
+            "SET threads=1; SET memory_limit='32MB'; SET max_temp_directory_size='1MB'; \
+             SET temp_directory={}; \
+             CREATE VIEW ev AS SELECT range::BIGINT AS id, \
+             (range % 31)::VARCHAR AS source, (range % 7)::VARCHAR AS code FROM range(2000000); \
+             CREATE TABLE enr(source VARCHAR, code VARCHAR, name VARCHAR, description VARCHAR, catalog INTEGER);",
+            lit(&directory.path().to_string_lossy())
+        )).unwrap();
+        super::super::udf::register(&conn).unwrap();
+        let mut tests = Tests::default();
+        tests.free_text("rareneedle");
+        let sql = catalog_candidates_sql(&tests.free[0].names_sql);
+        let plan: String = conn.query_row(&format!("EXPLAIN {sql}"), [], |r| r.get(1)).unwrap();
+        assert!(!plan.contains("DELIM"), "catalog candidates must not retain all events: {plan}");
+        drop(conn);
+        assert!(read_ids(&session, &sql).unwrap().is_empty());
+        session.conn().unwrap().execute_batch(
+            "INSERT INTO enr VALUES ('1','2','ordinary','ordinary',0),('*','3','ordinary','ordinary',1)"
+        ).unwrap();
+        assert!(read_ids(&session, &sql).unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_candidate_branches_preserve_exact_wildcard_and_duplicate_matches() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ev(id BIGINT, source VARCHAR, code VARCHAR); \
+             INSERT INTO ev VALUES (0,'api','42'),(1,'auth','42'),(2,'*','42'),(3,'api','43'),(4,'auth','43'); \
+             CREATE TABLE enr(source VARCHAR, code VARCHAR, name VARCHAR, description VARCHAR, catalog INTEGER); \
+             INSERT INTO enr VALUES ('api','42','Needle exact','',0),('*','42','','needle wildcard',1),\
+             ('api','42','needle duplicate','',1),('api','43','ordinary','',0),('auth','43','needle exact','',0);"
+        ).unwrap();
+        super::super::udf::register(&conn).unwrap();
+        let mut tests = Tests::default();
+        tests.free_text("needle");
+        drop(conn);
+        let mut ids = read_ids(&session, &catalog_candidates_sql(&tests.free[0].names_sql)).unwrap();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 0, 1, 2, 4]);
+        ids.dedup();
+        assert_eq!(ids, vec![0, 1, 2, 4]);
+    }
+
+    #[test]
+    fn selection_limit_rolls_back_and_reuses_a_clean_connection() {
+        let session = session();
+        let result = crate::resources::with_selection_limit(16, || selection_query(&session, "SELECT range::BIGINT AS id FROM range(100)"));
+        assert!(result.err().unwrap().contains("LOGINSIGHT_SELECTION_LIMIT_MB"));
+        let count: i64 = session.conn().unwrap().query_row("SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'sel_%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let valid = selection_query(&session, "SELECT range::BIGINT AS id FROM range(3)").unwrap();
+        assert_eq!(valid.accounted_bytes(), 24);
+    }
+
+    #[test]
+    fn cancelled_selection_is_not_published_and_retry_succeeds() {
+        let session = session();
+        let chosen = new_selection(&session, false, None);
+        let token = crate::operations::token(Some("cancel-selection-write".into())).unwrap();
+        let result = crate::operations::run_with_token(token, || selection_write(&session, &chosen, |conn| {
+            conn.execute(&format!("INSERT INTO {} VALUES(42)", chosen.name), []).map_err(err)?;
+            crate::operations::cancel_id("cancel-selection-write");
+            Ok(1)
+        }));
+        assert!(result.is_err());
+        assert_eq!(chosen.rows.load(Ordering::Relaxed), u64::MAX);
+        let valid = selection(&session, &[7, 8]).unwrap();
+        assert_eq!(valid.accounted_bytes(), 16);
+    }
+
+    #[test]
+    fn cache_charges_payload_and_never_retains_oversized_selection() {
+        let session = session();
+        let small = selection(&session, &[1, 2]).unwrap();
+        session.cache_selection("small".into(), Arc::clone(&small));
+        assert!(Arc::ptr_eq(&session.cached_selection("small").unwrap(), &small));
+        let large = new_selection(&session, false, None);
+        large.rows.store(crate::resources::selection_cache_bytes() / 8 + 1, Ordering::Relaxed);
+        session.cache_selection("large".into(), large);
+        assert!(session.cached_selection("large").is_none());
+        assert_eq!(session.selection_snapshot()["accountedBytes"], 16);
+    }
+
+    #[test]
+    fn waiting_for_same_selection_is_cancellable_without_poisoning_builder() {
+        let session = Arc::new(session());
+        let held = session.begin_selection("filter").unwrap();
+        let token = crate::operations::token(Some("selection-waiter".into())).unwrap();
+        let other = Arc::clone(&session);
+        let (send, receive) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || crate::operations::run_with_token(token, || {
+            send.send(()).unwrap();
+            other.begin_selection("filter").map(|_| ())
+        }));
+        receive.recv().unwrap();
+        crate::operations::cancel_id("selection-waiter");
+        assert!(waiter.join().unwrap().is_err());
+        drop(held);
+        assert!(session.begin_selection("filter").is_ok());
+    }
+
+    #[test]
+    fn streaming_fetch_propagates_late_sql_failure() {
+        let session = session();
+        let mut seen = 0;
+        let error = stream_rows(&session, "SELECT CASE WHEN range >= 4096 THEN error('late fetch') ELSE range END::BIGINT FROM range(10000)", |row| {
+            let _: i64 = row.get(0)?; seen += 1; Ok(())
+        }).unwrap_err();
+        assert!(error.contains("late fetch"));
+        // Execution can fail before the first chunk on some DuckDB versions;
+        // neither timing is permitted to turn a partial stream into success.
+        assert!(seen < 10000);
+        assert_eq!(session.conn().unwrap().query_row("SELECT 42", [], |r| r.get::<_, i64>(0)).unwrap(), 42);
+    }
+
+    #[test]
+    fn sql_spill_budget_failure_is_returned_and_connection_remains_usable() {
+        let session = session();
+        let temp = tempfile::tempdir().unwrap();
+        session.conn().unwrap().execute_batch(&format!(
+            "SET temp_directory={}; SET memory_limit='4MB'; SET max_temp_directory_size='1B'; SET threads=1;",
+            lit(&temp.path().to_string_lossy()),
+        )).unwrap();
+        let error = stream_rows(&session, "SELECT repeat('x', 1024) || range::VARCHAR AS v FROM range(30000) ORDER BY v DESC", |_| Ok(())).unwrap_err();
+        assert!(error.contains("Memory") || error.contains("memory") || error.contains("temporary"), "{error}");
+        assert_eq!(session.conn().unwrap().query_row("SELECT 42", [], |r| r.get::<_, i64>(0)).unwrap(), 42);
+    }
+
+    #[test]
+    fn plain_required_filters_are_cacheable_but_mutable_rules_are_not() {
+        let filters = |op: &str, value: &str| prepared(&[crate::query::Filter { column: "_all".into(), op: op.into(), value: value.into(), value2: None }]);
+        assert!(cacheable_filters(&filters("query", "timeout OR user:root")));
+        assert!(!cacheable_filters(&filters("threat_rule", "whatever")));
+        assert!(!cacheable_filters(&filters("detection", "whatever")));
+    }
+}
+
 // ---------------------------------------------------------------- matches
 
 /// `query::indexed_matches` for prepared filters.
-pub(crate) fn matches(src: &Source, pfs: &[PreparedFilter]) -> Option<Vec<usize>> {
-    with(src, |session| matching_ids(session, src, pfs))
+pub(crate) fn matches(src: &Source, pfs: &[PreparedFilter]) -> Result<Option<Vec<usize>>> {
+    analytics_with(src, false, |session| matching_ids(session, src, pfs))
 }
 
-pub(crate) fn count(src: &Source, filters: &[crate::query::Filter]) -> Option<usize> {
+pub(crate) fn visit_matches(src: &Source, pfs: &[PreparedFilter], visit: impl FnMut(usize) -> Result<bool>) -> Result<Option<()>> {
+    analytics_with(src, false, |session| {
+        let scope = scope(session, src, pfs)?;
+        // Ordered callbacks preserve first-N/export/text accumulation semantics;
+        // DuckDB's buffer/spill budgets cover any required sort.
+        visit_ids(session, &format!("SELECT id FROM {} WHERE {} ORDER BY id", scope.from(false), scope.cond), visit)
+    })
+}
+
+pub(crate) fn count(src: &Source, filters: &[crate::query::Filter]) -> Result<Option<usize>> {
     let pfs = prepared(filters);
-    with(src, |session| {
+    analytics_with(src, base_page_safe(&pfs, ""), |session| {
         let scope = scope(session, src, &pfs)?;
         let counted = rows(
             session,
@@ -392,8 +843,8 @@ fn stats_of(scope: &Scope) -> Result<Stats> {
     Ok(build_stats(buckets, bucket_ms, levels))
 }
 
-pub(crate) fn stats(src: &Source, pfs: &[PreparedFilter]) -> Option<Stats> {
-    with(src, |session| stats_of(&scope(session, src, pfs)?))
+pub(crate) fn stats(src: &Source, pfs: &[PreparedFilter]) -> Result<Option<Stats>> {
+    analytics_with(src, base_page_safe(pfs, ""), |session| stats_of(&scope(session, src, pfs)?))
 }
 
 // ---------------------------------------------------------------- groups
@@ -451,6 +902,9 @@ fn aggregate_of(scope: &Scope, group: &str, specs: &[AggSpec]) -> Result<AggResu
     let meta = is_meta_column(group) && specs.iter().all(|s| is_meta_column(&s.column));
     let mut names = false;
     let (key, time) = key_of(scope, group, meta, &mut names)?;
+    if !time && !specs.is_empty() && specs.iter().all(|spec| spec.func == "count") {
+        return count_groups(scope, group, specs, &key, names);
+    }
     let mut inner = vec!["id".to_string(), format!("{key} AS k")];
     let mut outer = vec!["k".to_string(), "count(*)".to_string()];
     let mut kinds = Vec::with_capacity(specs.len());
@@ -507,15 +961,20 @@ fn aggregate_of(scope: &Scope, group: &str, specs: &[AggSpec]) -> Result<AggResu
     }
     let from = scope.from(names);
     let sql = format!(
-        "SELECT {} FROM (SELECT {} FROM {from} WHERE {}) GROUP BY k",
+        "SELECT {} FROM (SELECT {} FROM {from} WHERE {}) GROUP BY k LIMIT {}",
         outer.join(", "),
         inner.join(", "),
-        scope.cond
+        scope.cond,
+        crate::query::MAX_GROUPS + 1,
     );
-    let mut failure = None;
-    let grouped = rows(scope.session, &sql, |r| {
-        let key = key_text(r, 0, time)?;
-        let n = r.get::<_, i64>(1)? as u64;
+    let mut budget = crate::query::AnalyticsBudget::new();
+    let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
+    let mut order = Vec::new();
+    stream_rows(scope.session, &sql, |r| {
+        if groups.len() >= crate::query::MAX_GROUPS { return Err(AggResult::budget_error().error.unwrap()); }
+        let key = stream_key(&r, 0, time)?;
+        budget.group(&key, specs.len())?;
+        let n = r.get::< i64>(1)? as u64;
         let mut column = 2;
         let mut accs = Vec::with_capacity(kinds.len());
         for (kind, spec) in kinds.iter().zip(specs) {
@@ -523,16 +982,16 @@ fn aggregate_of(scope: &Scope, group: &str, specs: &[AggSpec]) -> Result<AggResu
                 SpecSql::Count => Acc::Count(n),
                 SpecSql::Distinct => {
                     column += 1;
-                    Acc::Distinct(r.get::<_, i64>(column - 1)? as u64)
+                    Acc::Distinct(r.get::< i64>(column - 1)? as u64)
                 }
                 SpecSql::Numeric => {
                     let sum: Option<f64> = r.get(column)?;
-                    let valid = r.get::<_, i64>(column + 1)? as u64;
+                    let valid = r.get::< i64>(column + 1)? as u64;
                     let min: Option<f64> = r.get(column + 2)?;
                     let max: Option<f64> = r.get(column + 3)?;
                     let mut units = [0usize; 5];
                     for (u, slot) in units.iter_mut().enumerate() {
-                        *slot = r.get::<_, i64>(column + 4 + u)? as usize;
+                        *slot = r.get::< i64>(column + 4 + u)? as usize;
                     }
                     column += 9;
                     match spec.func.as_str() {
@@ -545,22 +1004,10 @@ fn aggregate_of(scope: &Scope, group: &str, specs: &[AggSpec]) -> Result<AggResu
                 SpecSql::Text => Acc::StrAgg(Vec::new()),
             });
         }
-        Ok((key, accs))
+        order.push(key.clone());
+        groups.insert(key, accs);
+        Ok(())
     })?;
-    let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::with_capacity(grouped.len());
-    let mut order = Vec::with_capacity(grouped.len());
-    for (key, accs) in grouped {
-        match key {
-            Ok(key) => {
-                order.push(key.clone());
-                groups.insert(key, accs);
-            }
-            Err(e) => failure = Some(e),
-        }
-    }
-    if let Some(e) = failure {
-        return Err(e);
-    }
     for (i, text) in texts {
         let sql = format!(
             "SELECT k, v FROM (SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY id) AS rn \
@@ -568,19 +1015,56 @@ fn aggregate_of(scope: &Scope, group: &str, specs: &[AggSpec]) -> Result<AggResu
              WHERE rn <= 100 ORDER BY k, rn",
             scope.cond
         );
-        let items = rows(scope.session, &sql, |r| Ok((key_text(r, 0, time)?, r.get::<_, String>(1)?)))?;
-        for (key, value) in items {
-            let key = key?;
+        stream_rows(scope.session, &sql, |r| {
+            let key = stream_key(&r, 0, time)?;
+            let value: String = r.get(1)?;
             if let Some(Acc::StrAgg(list)) = groups.get_mut(&key).map(|accs| &mut accs[i]) {
+                // Charge both retained strings and eventual joined output.
+                budget.charge(value.len().saturating_mul(2).saturating_add(32))?;
                 list.push(value);
             }
-        }
+            Ok(())
+        })?;
     }
     Ok(build_agg_result(groups, order, group, specs))
 }
 
-pub(crate) fn aggregate(src: &Source, pfs: &[PreparedFilter], group: &str, specs: &[AggSpec]) -> Option<AggResult> {
-    with(src, |session| aggregate_of(&scope(session, src, pfs)?, group, specs))
+/// Facets are count-only. Rank/cap their groups before crossing the database
+/// boundary; the exact omitted group/record counts stay available to the UI.
+fn count_groups(scope: &Scope, group: &str, specs: &[AggSpec], key: &str, names: bool) -> Result<AggResult> {
+    let from = scope.from(names);
+    let limit = crate::query::MAX_GROUPS;
+    let sql = format!(
+        "WITH grouped AS (SELECT {key} AS k, count(*)::BIGINT AS n FROM {from} WHERE {} GROUP BY k) \
+         SELECT k, n, count(*) OVER (), CAST(sum(n) OVER () AS BIGINT) FROM grouped \
+         ORDER BY n DESC, (li_gkey(COALESCE(k, '')) IS NULL), li_gkey(COALESCE(k, '')), \
+         li_lower(COALESCE(k, '')), k NULLS FIRST LIMIT {limit}",
+        scope.cond,
+    );
+    let mut budget = crate::query::AnalyticsBudget::new();
+    let (mut all_groups, mut all_records, mut retained) = (0, 0u64, 0u64);
+    let mut groups = HashMap::new();
+    let mut order = Vec::new();
+    stream_rows(scope.session, &sql, |row| {
+        let key = row.get::<Option<String>>(0)?;
+        let count = row.get::<i64>(1)? as u64;
+        all_groups = row.get::<i64>(2)? as usize;
+        all_records = row.get::<i64>(3)? as u64;
+        budget.group(&key, specs.len())?;
+        retained += count;
+        order.push(key.clone());
+        groups.insert(key, specs.iter().map(|_| Acc::Count(count)).collect());
+        Ok(())
+    })?;
+    let mut result = build_agg_result(groups, order, group, specs);
+    result.omitted_groups = all_groups.saturating_sub(result.rows.len());
+    result.omitted_records = all_records.saturating_sub(retained);
+    Ok(result)
+}
+
+pub(crate) fn aggregate(src: &Source, pfs: &[PreparedFilter], group: &str, specs: &[AggSpec]) -> Result<Option<AggResult>> {
+    let base_allowed = base_page_safe(pfs, group) && specs.iter().all(|spec| spec.func == "count" || base_field(&spec.column));
+    analytics_with(src, base_allowed, |session| aggregate_of(&scope(session, src, pfs)?, group, specs))
 }
 
 fn count_spec() -> [AggSpec; 1] {
@@ -596,8 +1080,9 @@ pub(crate) fn multi_count(
     src: &Source,
     filters: &[crate::query::Filter],
     columns: &[String],
-) -> Option<Vec<(String, AggResult)>> {
-    with(src, |session| {
+) -> Result<Option<Vec<(String, AggResult)>>> {
+    let base_allowed = base_page_safe(&prepared(filters), "") && columns.iter().all(|column| base_field(column));
+    analytics_with(src, base_allowed, |session| {
         let mut out = Vec::with_capacity(columns.len());
         for column in columns {
             crate::operations::check()?;
@@ -611,6 +1096,446 @@ pub(crate) fn multi_count(
 }
 
 // ---------------------------------------------------------------- pages
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum CursorKey {
+    Integer(i64),
+    Text(String),
+}
+
+impl CursorKey {
+    fn sql(&self) -> String {
+        match self {
+            Self::Integer(value) => value.to_string(),
+            Self::Text(value) => lit(value),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct PageCursor {
+    version: u8,
+    fingerprint: String,
+    position: usize,
+    keys: Vec<CursorKey>,
+}
+
+const TIMESTAMP_SORT_SQL: &str = "COALESCE(ts, 0)";
+
+struct SortKey {
+    sql: String,
+    desc: bool,
+    text: bool,
+    /// Only native timestamp keys may carry the immutable Session proof.
+    timestamp_non_null: bool,
+}
+
+fn page_sort(scope: &Scope, column: &str, dir: &str) -> Result<(Vec<SortKey>, bool)> {
+    let desc = dir == "desc";
+    let int = |sql: String, desc| SortKey { sql, desc, text: false, timestamp_non_null: false };
+    let mut names = false;
+    let mut keys = match column {
+        "" => vec![int("id".into(), false)],
+        "id" => vec![int("id".into(), desc)],
+        "timestamp" => {
+            let mut key = int(TIMESTAMP_SORT_SQL.into(), desc);
+            key.timestamp_non_null = scope.session.timestamps_non_null;
+            vec![key]
+        },
+        "level" => vec![int("CAST(lvl AS BIGINT)".into(), desc)],
+        column => {
+            let value = scope.session.schema.column(column, &mut names).ok_or("Ordenação pelo texto bruto.")?;
+            vec![
+                int(format!("CAST(li_nkey({value}) IS NULL AS BIGINT)"), desc),
+                int(format!("COALESCE(li_nkey({value}), 0)"), desc),
+                SortKey { sql: format!("li_lower(COALESCE({value}, ''))"), desc, text: true, timestamp_non_null: false },
+            ]
+        }
+    };
+    if !matches!(column, "" | "id") {
+        keys.push(int("id".into(), false));
+    }
+    Ok((keys, names))
+}
+
+/// The complete seek predicate and an optional proof used only for ordering.
+struct PageSeek {
+    predicate: String,
+    timestamp_non_null: bool,
+}
+
+/// Lexicographic seek using non-null sort keys and the same final id tie-break
+/// as the exact page API. Sort directions can differ (descending time, id asc).
+fn after_cursor(sort: &[SortKey], keys: &[CursorKey]) -> Result<PageSeek> {
+    if sort.is_empty() || keys.len() != sort.len() || keys.iter().zip(sort).any(|(key, sort)| matches!(key, CursorKey::Text(_)) != sort.text) {
+        return Err("PAGINATION_RESET_REQUIRED: Cursor de paginação inválido. Recarregue os registros.".into());
+    }
+    let mut prefix = Vec::new();
+    let mut alternatives = Vec::new();
+    for (sort, key) in sort.iter().zip(keys) {
+        let bound = key.sql();
+        let mut terms = prefix.clone();
+        terms.push(format!("{} {} {bound}", sort.sql, if sort.desc { "<" } else { ">" }));
+        alternatives.push(format!("({})", terms.join(" AND ")));
+        prefix.push(format!("{} = {bound}", sort.sql));
+    }
+    let exact = format!("({})", alternatives.join(" OR "));
+    // The OR-ed lexicographic expression must remain authoritative, including
+    // timestamp ties whose final id is always ascending. A redundant raw bound
+    // lets DuckDB push the leading timestamp range into each segment scan.
+    let bound = timestamp_cursor_bound(&sort[0], &keys[0]);
+    let timestamp_non_null = bound.is_some();
+    let predicate = match bound {
+        Some(bound) => format!("({bound} AND {exact})"),
+        None => exact,
+    };
+    Ok(PageSeek { predicate, timestamp_non_null })
+}
+
+fn timestamp_cursor_bound(sort: &SortKey, key: &CursorKey) -> Option<String> {
+    // Match only the native timestamp key, never a user-defined numeric/text
+    // expression. The id-only sort already has a directly pushable predicate.
+    if sort.sql != TIMESTAMP_SORT_SQL { return None; }
+    let CursorKey::Integer(value) = key else { return None; };
+    // A Session proof excludes nulls in every range. Otherwise missing
+    // timestamps sort as zero: optimize only when zero is strictly outside
+    // the remaining leading range. An OR-is-null bound is correct but
+    // does not improve the measured plan, so retain the original path there.
+    let excludes_null = sort.timestamp_non_null || if sort.desc { *value < 0 } else { *value > 0 };
+    excludes_null.then(|| format!("ts {} {value}", if sort.desc { "<=" } else { ">=" }))
+}
+
+#[cfg(test)]
+mod interactive_contract_tests {
+    use super::*;
+
+    #[test]
+    fn free_markers_are_not_replaced_inside_user_sql_literals() {
+        let sql = "__li_free_7() OR value = 'O''Reilly __li_free_7()'";
+        assert_eq!(replace_sql_marker(sql, "__li_free_7()", "id IN (SELECT id FROM chosen)").unwrap(),
+            "id IN (SELECT id FROM chosen) OR value = 'O''Reilly __li_free_7()'");
+        assert!(replace_sql_marker("'__li_free_7()'", "__li_free_7()", "FALSE").is_none());
+    }
+
+    fn filters(column: &str, op: &str, value: &str) -> Vec<PreparedFilter> {
+        crate::query::prepare(&[crate::query::Filter { column: column.into(), op: op.into(), value: value.into(), value2: None }])
+    }
+
+    #[test]
+    fn base_capability_proof_excludes_derived_and_unscoped_semantics() {
+        assert!(base_page_safe(&filters("timestamp", "gte", "1000"), "timestamp"));
+        assert!(base_page_safe(&filters("_all", "query", "source:api AND code:404"), "timestamp"));
+        for (column, op, value) in [
+            ("_all", "query", "timeout"), ("_all", "query", "source:api OR custom:x"),
+            ("custom", "equals_exact", "x"), ("@user", "equals", "root"),
+            ("name", "contains", "logon"), ("_all", "contains", "error"),
+            ("source", "detection", "anything"),
+        ] { assert!(!base_page_safe(&filters(column, op, value), "timestamp"), "{column} {op} {value}"); }
+        assert!(!base_page_safe(&[], "custom"));
+    }
+
+    #[test]
+    fn cursor_keys_are_typed_and_sql_literals_are_escaped() {
+        let sort = vec![SortKey { sql: "value".into(), desc: true, text: true, timestamp_non_null: false }, SortKey { sql: "id".into(), desc: false, text: false, timestamp_non_null: false }];
+        let clause = after_cursor(&sort, &[CursorKey::Text("O'Reilly".into()), CursorKey::Integer(7)]).unwrap().predicate;
+        assert!(clause.contains("value < 'O''Reilly'"));
+        assert!(clause.contains("value = 'O''Reilly' AND id > 7"));
+        assert!(after_cursor(&sort, &[CursorKey::Integer(7), CursorKey::Integer(7)]).is_err());
+        assert!(after_cursor(&sort, &[]).is_err());
+    }
+
+    #[test]
+    fn timestamp_cursor_bounds_keep_null_zero_negative_and_extreme_keys() {
+        let connection = duckdb::Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE ev(id BIGINT, ts BIGINT)").unwrap();
+        let timestamps = [Some(i64::MIN), Some(-7), Some(-1), None, Some(0),
+            Some(0), None, Some(1), Some(7), Some(i64::MAX)];
+        for (id, ts) in timestamps.iter().enumerate() {
+            connection.execute("INSERT INTO ev VALUES (?, ?)", duckdb::params![id as i64, ts]).unwrap();
+        }
+        for desc in [false, true] {
+            let sort = vec![
+                SortKey { sql: TIMESTAMP_SORT_SQL.into(), desc, text: false, timestamp_non_null: false },
+                SortKey { sql: "id".into(), desc: false, text: false, timestamp_non_null: false },
+            ];
+            for timestamp in [i64::MIN, -8, -7, -1, 0, 1, 7, 8, i64::MAX] {
+                for id in [-1, 3, 5, 10] {
+                    let keys = [CursorKey::Integer(timestamp), CursorKey::Integer(id)];
+                    let seek = after_cursor(&sort, &keys).unwrap();
+                    let excludes_null = if desc { timestamp < 0 } else { timestamp > 0 };
+                    assert_eq!(seek.timestamp_non_null, excludes_null);
+                    assert_eq!(timestamp_cursor_bound(&sort[0], &keys[0]).is_some(), excludes_null);
+                    let order = page_order(&sort, &seek);
+                    assert_eq!(order, format!("{} {}, id ASC", if excludes_null { "ts" } else { TIMESTAMP_SORT_SQL }, if desc { "DESC" } else { "ASC" }));
+                    let sql = format!("SELECT id FROM ev WHERE {} ORDER BY {order}", seek.predicate);
+                    let mut statement = connection.prepare(&sql).unwrap();
+                    let actual = statement.query_map([], |row| row.get::<_, i64>(0)).unwrap()
+                        .collect::<duckdb::Result<Vec<_>>>().unwrap();
+                    let mut expected = timestamps.iter().enumerate().map(|(id, ts)| (ts.unwrap_or(0), id as i64))
+                        .filter(|(ts, row)| (if desc { *ts < timestamp } else { *ts > timestamp }) || (*ts == timestamp && *row > id))
+                        .collect::<Vec<_>>();
+                    expected.sort_unstable_by(|a, b| {
+                        let time = a.0.cmp(&b.0);
+                        (if desc { time.reverse() } else { time }).then(a.1.cmp(&b.1))
+                    });
+                    assert_eq!(actual, expected.into_iter().map(|(_, id)| id).collect::<Vec<_>>(), "{sql}");
+                }
+            }
+        }
+        assert!(after_cursor(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn id_cursor_remains_a_direct_native_bound_in_both_directions() {
+        for desc in [false, true] {
+            let sort = [SortKey { sql: "id".into(), desc, text: false, timestamp_non_null: false }];
+            assert_eq!(after_cursor(&sort, &[CursorKey::Integer(42)]).unwrap().predicate,
+                format!("((id {} 42))", if desc { "<" } else { ">" }));
+        }
+    }
+
+    #[test]
+    fn named_cancel_interrupts_sql_and_cannot_poison_reused_connection() {
+        let connection = duckdb::Connection::open_in_memory().unwrap();
+        let token = crate::operations::token(Some("duckdb-cancel-query-test".into())).unwrap();
+        let (ready, started) = std::sync::mpsc::channel();
+        let cancel = std::thread::spawn(move || {
+            started.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(crate::operations::cancel_id("duckdb-cancel-query-test"));
+        });
+        let result = crate::operations::run_with_token(token, || {
+            let _watch = interruptible(&connection).unwrap();
+            ready.send(()).unwrap();
+            connection.query_row("SELECT sum(sqrt(i::DOUBLE)) FROM range(1000000000000) t(i)", [], |row| row.get::<_, f64>(0))
+        });
+        cancel.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(connection.query_row("SELECT 7", [], |row| row.get::<_, i64>(0)).unwrap(), 7);
+    }
+}
+
+fn base_field(name: &str) -> bool {
+    matches!(name, "id" | "event_ref" | "timestamp" | "level" | "source" | "code" | "message")
+}
+
+fn base_expression(expr: &crate::querylang::Expr) -> bool {
+    use crate::querylang::{Expr, TermKind};
+    match expr {
+        Expr::All => true,
+        Expr::And(items) | Expr::Or(items) => items.iter().all(base_expression),
+        Expr::Not(inner) => base_expression(inner),
+        Expr::Term(term) => !matches!(term.kind(), TermKind::Event)
+            && term.field().is_some_and(|(name, role, _)| role.is_none() && base_field(name)),
+    }
+}
+
+/// Derived fields are hydrated from the current definitions after selection.
+/// Only predicates/sorts proven independent of them may use the base store.
+pub(crate) fn base_page_safe(pfs: &[PreparedFilter], sort: &str) -> bool {
+    (sort.is_empty() || base_field(sort)) && pfs.iter().all(|pf| {
+        match pf.f.op.as_str() {
+            "query" => pf.expr.as_ref().is_some_and(base_expression),
+            "threat_rule" | "detection" => false,
+            _ => base_field(&pf.f.column),
+        }
+    })
+}
+
+fn page_fingerprint(src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str, base_safe: bool) -> Result<String> {
+    let source_key = super::spec(src.idx, src.codes, src.system, if base_safe { &[] } else { src.derived })
+        .ok_or("Fonte indisponível para paginação.")?.key;
+    let filters: Vec<_> = pfs.iter().map(|pf| &pf.f).collect();
+    let mut hash = Sha256::new();
+    hash.update(source_key);
+    hash.update(super::catalogs_signature(src.codes, src.system));
+    hash.update(serde_json::to_vec(&(filters, sort_column, sort_dir)).map_err(err)?);
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn page_seek(cursor: Option<&str>, sort: &[SortKey], fingerprint: &str, rows: usize, offset: usize) -> Result<(PageSeek, usize)> {
+    let Some(value) = cursor else { return Ok((PageSeek { predicate: "TRUE".into(), timestamp_non_null: false }, offset)); };
+    if value.len() > 1_100_000 {
+        return Err("PAGINATION_RESET_REQUIRED: Cursor de paginação excede o limite.".into());
+    }
+    let cursor: PageCursor = serde_json::from_str(value).map_err(|_| "PAGINATION_RESET_REQUIRED: Cursor de paginação inválido.".to_string())?;
+    if cursor.version != 1 || cursor.fingerprint != fingerprint {
+        return Err("PAGINATION_RESET_REQUIRED: A consulta mudou. Recarregue a primeira página.".into());
+    }
+    if cursor.position > rows {
+        return Err("PAGINATION_RESET_REQUIRED: Posição de paginação inválida.".into());
+    }
+    Ok((after_cursor(sort, &cursor.keys)?, cursor.position))
+}
+
+fn page_order(sort: &[SortKey], seek: &PageSeek) -> String {
+    sort.iter().enumerate().map(|(i, key)| {
+        // Once the Session or cursor proves timestamps are non-null, the raw
+        // column has exactly the same order as COALESCE. Keeping it visible to
+        // TOP_N enables DuckDB's dynamic range filter on each segment scan.
+        let sql = if i == 0 && (seek.timestamp_non_null || key.timestamp_non_null) && key.sql == TIMESTAMP_SORT_SQL { "ts" } else { &key.sql };
+        format!("{sql} {}", if key.desc { "DESC" } else { "ASC" })
+    }).collect::<Vec<_>>().join(", ")
+}
+
+fn page_statement(scope: &Scope, sort: &[SortKey], names: bool, seek: &PageSeek, batch: usize, offset: usize) -> String {
+    let order = page_order(sort, seek);
+    let projection = sort.iter().map(|key| key.sql.as_str()).collect::<Vec<_>>().join(", ");
+    format!("SELECT id, {projection} FROM {} WHERE ({}) AND {} ORDER BY {order} LIMIT {batch} OFFSET {offset}", scope.from(names), scope.cond, seek.predicate)
+}
+
+/// A required top-level equality bounds the entire conjunction. Only a
+/// complete, canonically verified empty/singleton set may bypass page SQL;
+/// free-text OR/NOT terms never establish this proof.
+fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Option<crate::query::QueryPage>> {
+    // Planner invariant: hex_fields contains required top-level equals_exact
+    // clauses only. OR/NOT query-expression terms must never enter this list.
+    if !pfs.iter().any(|pf| pf.f.op == "equals_exact" && super::text::exact_field_hex_word(&pf.f.value).is_some()) {
+        return Ok(None);
+    }
+    let plan = session.schema.plan(pfs);
+    for term in &plan.tests.hex_fields {
+        let Some(selected) = exact_hex_selection(session, src, term)? else { continue; };
+        if !selected.known_empty && selected.single_id.is_none() { continue; }
+        let mut rows = Vec::new();
+        if let Some(id) = selected.single_id {
+            crate::operations::check()?;
+            let mut event = src.event(id);
+            if pfs.iter().all(|pf| crate::query::matches(&event, pf)) {
+                crate::entities::annotate(&mut event);
+                event.raw.clear();
+                rows.push(event);
+            }
+        }
+        crate::operations::check()?;
+        return Ok(Some(crate::query::QueryPage {
+            total: Some(rows.len()), rows, has_more: false, next_cursor: None,
+            engine: "columnar".into(), warning: None,
+        }));
+    }
+    Ok(None)
+}
+
+/// Page-size work in Rust and no mandatory COUNT. Returns None only when no
+/// suitable store is ready; the caller can explicitly report the line fallback.
+pub(crate) fn query_page(
+    src: &Source,
+    pfs: &[PreparedFilter],
+    sort_column: &str,
+    sort_dir: &str,
+    offset: usize,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Option<Result<crate::query::QueryPage>> {
+    for part in &src.idx.parts {
+        if let Err(error) = crate::sources::validate_source(part) { return Some(Err(error)); }
+    }
+    if sort_column == "raw" { return None; }
+    let limit = limit.clamp(1, 2_000);
+    let base_safe = base_page_safe(pfs, sort_column);
+    let session = match ready_session(src, base_safe) { Ok(Some(session)) => session, Ok(None) => return None, Err(error) => return Some(Err(error)) };
+    let _names = session.names_guard();
+    Some((|| {
+        crate::operations::check()?;
+        if cursor.is_none() && offset == 0 {
+            if let Some(page) = required_hex_page(&session, src, pfs)? { return Ok(page); }
+        }
+        let fingerprint = page_fingerprint(src, pfs, sort_column, sort_dir, base_safe)?;
+        let (scope, exact) = page_scope(&session, src, pfs)?;
+        let (sort, names) = page_sort(&scope, sort_column, sort_dir)?;
+        let (after, position) = page_seek(cursor, &sort, &fingerprint, src.idx.lines.len(), offset)?;
+        let mut offset_sql = if cursor.is_some() || !exact { 0 } else { offset };
+        let mut skip_matches = if cursor.is_none() && !exact { offset } else { 0 };
+        let mut seek = after;
+        let mut found = Vec::new();
+        let batch_size = if exact { limit.saturating_add(1) } else { limit.saturating_add(1).max(1_024) };
+        loop {
+            crate::operations::check()?;
+            let sql = page_statement(&scope, &sort, names, &seek, batch_size, offset_sql);
+            let candidates = rows(&session, &sql, |row| {
+                let id = row.get::<_, i64>(0)? as usize;
+                let keys = sort.iter().enumerate().map(|(i, key)| {
+                    if key.text { row.get::<_, String>(i + 1).map(CursorKey::Text) }
+                    else { row.get::<_, i64>(i + 1).map(CursorKey::Integer) }
+                }).collect::<duckdb::Result<Vec<_>>>()?;
+                Ok((id, keys))
+            })?;
+            let exhausted = candidates.len() < batch_size;
+            let last_keys = candidates.last().map(|(_, keys)| keys.clone());
+            for candidate in candidates {
+                crate::operations::check()?;
+                if !exact {
+                    let event = src.event(candidate.0);
+                    if !pfs.iter().all(|pf| crate::query::matches(&event, pf)) { continue; }
+                }
+                if skip_matches > 0 { skip_matches -= 1; continue; }
+                found.push(candidate);
+                if found.len() > limit { break; }
+            }
+            if found.len() > limit || exhausted { break; }
+            let Some(keys) = last_keys else { break };
+            seek = after_cursor(&sort, &keys)?;
+            offset_sql = 0;
+        }
+        crate::operations::check()?;
+        let has_more = found.len() > limit;
+        found.truncate(limit);
+        let next_cursor = if has_more {
+            found.last().map(|(_, keys)| serde_json::to_string(&PageCursor { version: 1, fingerprint, position: position.saturating_add(found.len()), keys: keys.clone() }).map_err(err)).transpose()?
+        } else { None };
+        let total = if pfs.is_empty() { Some(src.idx.lines.len()) }
+            else if !has_more && (position == 0 || !found.is_empty()) { Some(position.saturating_add(found.len())) }
+            else { None };
+        let rows = page_rows(src, found.into_iter().map(|(id, _)| id).collect());
+        crate::operations::check()?;
+        Ok(crate::query::QueryPage {
+            rows, total, has_more, next_cursor, engine: "columnar".into(),
+            warning: (!exact).then(|| "Este filtro exige confirmação nos registros; consultas amplas podem demorar mais.".into()),
+        })
+    })())
+}
+
+/// Reproducible test/benchmark diagnostics of the actual interactive SQL path.
+/// This is intentionally not a desktop command or an automatic full-data probe.
+pub(crate) fn explain_page(
+    src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str,
+    limit: usize, analyze: bool,
+) -> Option<Result<Value>> {
+    explain_page_at(src, pfs, sort_column, sort_dir, 0, limit, None, analyze)
+}
+
+pub(crate) fn explain_page_at(
+    src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize, cursor: Option<&str>, analyze: bool,
+) -> Option<Result<Value>> {
+    let base_safe = base_page_safe(pfs, sort_column);
+    let session = match ready_session(src, base_safe) { Ok(Some(session)) => session, Ok(None) => return None, Err(error) => return Some(Err(error)) };
+    let _names = session.names_guard();
+    Some((|| {
+        if sort_column != "raw" && cursor.is_none() && offset == 0 {
+            if let Some(page) = required_hex_page(&session, src, pfs)? {
+                return Ok(serde_json::json!({ "mode": "verified_singleton", "sql": null,
+                    "plan": "Complete typed equality candidates verified directly; no page SQL statement executed.",
+                    "profile": null, "analyzed": false, "exactPredicate": true, "total": page.total,
+                    "note": "Index candidate discovery and canonical event verification are not DuckDB page scans." }));
+            }
+        }
+        let fingerprint = page_fingerprint(src, pfs, sort_column, sort_dir, base_safe)?;
+        let (scope, exact) = page_scope(&session, src, pfs)?;
+        let (sort, names) = page_sort(&scope, sort_column, sort_dir)?;
+        let (seek, _) = page_seek(cursor, &sort, &fingerprint, src.idx.lines.len(), offset)?;
+        let limit = limit.clamp(1, 2_000);
+        let batch = if exact { limit + 1 } else { (limit + 1).max(1_024) };
+        let sql = page_statement(&scope, &sort, names, &seek, batch, if cursor.is_some() || !exact { 0 } else { offset });
+        let plan = rows(&session, &format!("EXPLAIN {}{sql}", if analyze { "ANALYZE " } else { "" }), |row| row.get::<_, String>(1))?.join("\n");
+        let profile = if analyze {
+            let value = rows(&session, &format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"), |row| row.get::<_, String>(1))?.join("\n");
+            Some(serde_json::from_str::<Value>(&value).map_err(err)?)
+        } else { None };
+        Ok(serde_json::json!({ "sql": sql, "plan": plan, "profile": profile, "analyzed": analyze, "exactPredicate": exact,
+            "candidateBatchSize": batch, "note": "Explains the actual first candidate batch; candidate discovery and event hydration are outside this SQL profile." }))
+    })())
+}
 
 fn page_ids(scope: &Scope, sort_column: &str, sort_dir: &str, offset: usize, limit: usize) -> Result<(usize, Vec<usize>)> {
     let dir = if sort_dir == "desc" { "DESC" } else { "ASC" };
@@ -674,8 +1599,8 @@ pub(crate) fn query(
     sort_dir: &str,
     offset: usize,
     limit: usize,
-) -> Option<QueryResult> {
-    with(src, |session| {
+) -> Result<Option<QueryResult>> {
+    analytics_with(src, false, |session| {
         let scope = scope(session, src, pfs)?;
         let (total, ids) = page_ids(&scope, sort_column, sort_dir, offset, limit)?;
         Ok(QueryResult {
@@ -693,8 +1618,8 @@ pub(crate) fn explore(
     sort_dir: &str,
     offset: usize,
     limit: usize,
-) -> Option<ExplorerSnapshot> {
-    with(src, |session| {
+) -> Result<Option<ExplorerSnapshot>> {
+    analytics_with(src, false, |session| {
         let scope = scope(session, src, pfs)?;
         let stats = stats_of(&scope)?;
         let count = count_spec();
@@ -716,8 +1641,8 @@ pub(crate) fn explore(
 // ---------------------------------------------------------------- charts
 
 /// `analysis::compute_series_stream` over the engine's columns.
-pub(crate) fn series(src: &Source, pfs: &[PreparedFilter], spec: &SeriesSpec) -> Option<SeriesResult> {
-    with(src, |session| series_of(&scope(session, src, pfs)?, spec))
+pub(crate) fn series(src: &Source, pfs: &[PreparedFilter], spec: &SeriesSpec) -> Result<Option<SeriesResult>> {
+    analytics_with(src, false, |session| series_of(&scope(session, src, pfs)?, spec))
 }
 
 /// Metric columns shared by terms and time charts: count, distinct values,
@@ -989,8 +1914,8 @@ fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
 // ---------------------------------------------------------------- overview
 
 /// `insights::overview` over the engine's columns.
-pub(crate) fn overview(src: &Source, pfs: &[PreparedFilter]) -> Option<Overview> {
-    with(src, |session| overview_of(&scope(session, src, pfs)?, src))
+pub(crate) fn overview(src: &Source, pfs: &[PreparedFilter]) -> Result<Option<Overview>> {
+    analytics_with(src, false, |session| overview_of(&scope(session, src, pfs)?, src))
 }
 
 const ERROR_LEVEL: &str = "level IN ('Erro', 'Crítico')";
@@ -1134,8 +2059,8 @@ fn latency_of(scope: &Scope, from: &str) -> Result<crate::insights::LatencySampl
 // ---------------------------------------------------------------- comparison
 
 /// `insights::compare` over the engine's columns.
-pub(crate) fn compare(src: &Source, pfs: &[PreparedFilter], before: &Period, after: &Period) -> Option<Comparison> {
-    with(src, |session| {
+pub(crate) fn compare(src: &Source, pfs: &[PreparedFilter], before: &Period, after: &Period) -> Result<Option<Comparison>> {
+    analytics_with(src, false, |session| {
         let scope = scope(session, src, pfs)?;
         let from = scope.from(false);
         let a = format!("(ts BETWEEN {} AND {})", before.start, before.end);
@@ -1200,8 +2125,8 @@ pub(crate) fn pivot(
     src: &Source,
     pfs: &[PreparedFilter],
     spec: &crate::analysis::PivotSpec,
-) -> Option<crate::analysis::PivotResult> {
-    with(src, |session| {
+) -> Result<Option<crate::analysis::PivotResult>> {
+    analytics_with(src, false, |session| {
         let scope = scope(session, src, pfs)?;
         let mut columns: Vec<String> = spec
             .rows
@@ -1212,7 +2137,7 @@ pub(crate) fn pivot(
             .collect();
         columns.sort();
         columns.dedup();
-        light_events(&scope, &columns, |events| crate::analysis::pivot_stream(events, spec))
+        light_events(&scope, &columns, |events| crate::analysis::pivot_stream(events, spec))?
     })
 }
 

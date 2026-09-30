@@ -1,25 +1,22 @@
 /* Run against the preview server: node scripts/preview/test-analysis-workbench.mjs http://127.0.0.1:4174 */
 import assert from "node:assert/strict";
-import { chromium } from "playwright";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { launchBrowser } from "./browser.mjs";
+import { captureFailure } from "./diagnostics.mjs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const url = process.argv[2] || "http://127.0.0.1:4174";
 const output = resolve("output/playwright");
 mkdirSync(output, { recursive: true });
-let executablePath = chromium.executablePath();
-if (!existsSync(executablePath)) executablePath = [
-  `${process.env.LOCALAPPDATA}/ms-playwright/chromium-1217/chrome-win64/chrome.exe`,
-  "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-  "C:/Program Files/Google/Chrome/Application/chrome.exe",
-].find(existsSync);
-const browser = await chromium.launch(executablePath ? { executablePath } : {});
-const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+const browser = await launchBrowser();
+const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, reducedMotion: "reduce" });
 const errors = [], results = {};
+let phase = "startup";
 page.on("pageerror", error => errors.push(error.message));
 try {
   await page.goto(url);
-  await page.waitForFunction(() => state.loaded && state.rows.length > 0, { timeout: 30000 });
+  await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && state.loaded && state.rows.length > 0 && !state.loadOverlay && document.querySelector("#load-overlay").hidden);
+  phase = "grouping and bounded rendering";
   await page.getByRole("button", { name: "Explorar", exact: true }).click();
   await page.getByRole("button", { name: "Resumir", exact: true }).click();
   await page.waitForFunction(() => document.querySelector("#aw-group-summary").textContent.includes("6.000 registros"));
@@ -29,19 +26,19 @@ try {
   results.groupBounded = await page.evaluate(async () => {
     const originalApi = api, oldField = state.groupCol, oldAggs = state.aggs;
     let calls = 0;
-    api = async (name, args) => name === "aggregate_events" ? (calls++, {
+    api = async (name, args, opts) => name === "aggregate_events" ? (calls++, {
       columns: ["level", "Registros"], rows: Array.from({ length: 250 }, (_, index) => ({ level: `Grupo ${index}`, Registros: index + 1 })),
-    }) : originalApi(name, args);
+    }) : originalApi(name, args, opts);
     state.groupCol = "level"; state.aggs = [{ func: "count", column: "*", alias: "Registros" }];
     try {
-      await runGroup();
+      await runGroup({ force: true });
       const rowsPerPage = document.querySelector("#group-table tbody").rows.length;
       const first = document.querySelector("#group-table tbody tr").cells[0].textContent;
       const input = document.querySelector("#aw-group-tools input"); input.value = "Grupo 249"; input.dispatchEvent(new Event("input"));
       return { rowsPerPage, first, found: document.querySelector("#group-table tbody").rows.length, backendCalls: calls, summary: document.querySelector("#aw-group-summary").textContent };
     } finally {
       api = originalApi; state.groupCol = oldField; state.aggs = oldAggs;
-      const input = document.querySelector("#aw-group-tools input"); input.value = ""; input.dispatchEvent(new Event("input")); await runGroup();
+      const input = document.querySelector("#aw-group-tools input"); input.value = ""; input.dispatchEvent(new Event("input")); await runGroup({ force: true });
     }
   });
   assert.equal(results.groupBounded.rowsPerPage, 100);
@@ -51,6 +48,7 @@ try {
   assert.match(results.groupBounded.summary, /31\.375 registros/);
 
   // Reproduce the user's two measures through their real controls.
+  phase = "multiple measures";
   await page.getByRole("combobox", { name: "Cálculo da medida 1", exact: true }).selectOption("sum");
   await page.getByRole("combobox", { name: "Campo da medida 1", exact: true }).selectOption("code");
   await page.getByRole("button", { name: "+ Medida", exact: true }).click();
@@ -75,14 +73,14 @@ try {
   await page.evaluate(async () => {
     const original = api;
     api = async (name, args, opts) => { if (name === "aggregate_events") throw new Error("Falha de conexão de teste"); return original(name, args, opts); };
-    try { await runGroup(); } finally { api = original; }
+    try { await runGroup({ force: true }); } finally { api = original; }
   });
   assert.equal(await page.locator("#group-table tbody tr").count(), 0, "failed recalculation must not present stale totals");
   await page.locator("#aw-group-summary").getByRole("button", { name: "Detalhes", exact: true }).click();
   assert.match(await page.locator("#analysis-help .modal-body").textContent(), /Falha de conexão de teste/);
   await page.getByRole("button", { name: "Fechar explicação", exact: true }).click();
   await page.locator("#aw-group-summary").getByRole("button", { name: "Tentar novamente", exact: true }).click();
-  await page.waitForFunction(() => document.querySelectorAll("#group-table tbody tr").length === 5);
+  await page.waitForFunction(() => document.querySelectorAll("#group-table tbody tr").length === 5 && document.querySelector("#group-table").getAttribute("aria-busy") === "false");
   await page.evaluate(async () => { state.aggs = [{ func: "count", column: "*", alias: "Registros" }]; renderAggs(); await runGroup(); });
 
   await page.locator("#group-table tbody tr").first().getByRole("button", { name: "Ver registros →" }).click();
@@ -92,6 +90,7 @@ try {
   await page.evaluate(() => { state.filters = []; filtersChanged(); });
   await page.waitForFunction(() => state.total === 6000);
 
+  phase = "pivot calculations and recovery";
   await page.getByRole("button", { name: "Cruzar dados", exact: true }).click();
   await page.waitForFunction(() => document.querySelector("#cube-table tbody").rows.length > 1);
   assert.equal(await page.evaluate(() => activeCube() === activeCube()), true, "normalization must preserve table references");
@@ -99,7 +98,7 @@ try {
   await page.evaluate(async () => {
     const original = api;
     api = async (name, args, opts) => { if (name === "pivot") throw new Error("Falha do cruzamento de teste"); return original(name, args, opts); };
-    try { await runCube(); } finally { api = original; }
+    try { await runCube({ force: true }); } finally { api = original; }
   });
   assert.equal(await page.locator("#cube-table tbody tr").count(), 0);
   assert.equal(await page.evaluate(() => cubeResultForTable(activeCube())), null);
@@ -137,6 +136,7 @@ try {
   });
   assert.deepEqual(results.pivotFilters.map(filter => filter.column), ["level", "code", "source"]);
 
+  phase = "bounded pivot rendering";
   results.pivotBounded = await page.evaluate(() => {
     const cube = activeCube(), actual = cubeState.result, fixture = structuredClone(actual);
     fixture.row_paths = Array.from({ length: 250 }, (_, index) => [`Grupo ${index}`, `Valor ${index}`]);
@@ -151,6 +151,7 @@ try {
   assert.equal(results.pivotBounded.columns, 26);
   assert.match(results.pivotBounded.partial, /parcial/);
 
+  phase = "pivot search and compact layout";
   await page.getByRole("searchbox", { name: "Buscar linhas do cruzamento" }).fill("IMPOSSIBLE-NONEXISTENT");
   await page.waitForFunction(() => document.querySelector("#cube-table tbody").textContent.includes("Nenhuma linha"));
   assert.match(await page.locator("#cube-table .total").textContent(), /Total do recorte/);
@@ -169,6 +170,9 @@ try {
   results.pageErrors = errors;
   writeFileSync(resolve(output, "workbench-validation.json"), JSON.stringify(results, null, 2));
   console.log(JSON.stringify(results, null, 2));
+} catch (error) {
+  await captureFailure(page, "analysis-workbench", error, { phase, errors, results });
+  throw error;
 } finally {
   await browser.close();
 }

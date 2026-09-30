@@ -1,8 +1,8 @@
 //! Translation of the app's filters into SQL over the engine's columns.
 //!
-//! Every value test runs the app's own Rust comparison (registered through
-//! [`Tests`]) on a column holding the very value `Event::col_ref` or the
-//! search language would read. Conditions that the columns cannot decide
+//! Exact text equality and safe integer ranges use native SQL predicates so
+//! DuckDB can prune row groups. Other tests run the app's Rust comparisons
+//! (registered through [`Tests`]). Conditions that the columns cannot decide
 //! exactly become supersets whose candidates are confirmed on the parsed
 //! events, so results never depend on the translation being complete.
 use super::build::{role_column, QUERY_TOOL, SEP};
@@ -62,6 +62,67 @@ fn literal(value: bool) -> String {
     if value { "TRUE" } else { "FALSE" }.into()
 }
 
+/// Comparing an integer through f64 is exact around these bounds. Convert
+/// fractional bounds to integer boundaries without casting the stored column:
+/// casting it would hide its zonemaps from the optimizer. Exotic/non-finite
+/// bounds keep the established Rust comparison path.
+fn integer_range(column: &str, pf: &PreparedFilter) -> Option<String> {
+    const EXACT: f64 = 9_007_199_254_740_991.0;
+    let (first, second) = pf.numeric_bounds();
+    let first = match first {
+        Some(n) if n.is_finite() && n.abs() <= EXACT => n,
+        None => return Some("FALSE".into()),
+        _ => return None,
+    };
+    let comparison = match pf.f.op.as_str() {
+        "gt" => format!("{column} > {}", first.floor() as i64),
+        "gte" => format!("{column} >= {}", first.ceil() as i64),
+        "lt" => format!("{column} < {}", first.ceil() as i64),
+        "lte" => format!("{column} <= {}", first.floor() as i64),
+        "between" => {
+            let second = match second {
+                Some(n) if n.is_finite() && n.abs() <= EXACT => n,
+                None => return Some("FALSE".into()),
+                _ => return None,
+            };
+            format!("{column} >= {} AND {column} <= {}", first.ceil() as i64, second.floor() as i64)
+        }
+        _ => return None,
+    };
+    Some(format!("({comparison})"))
+}
+
+/// These predicates occur as conjuncts in a filter list, where SQL NULL and
+/// false both reject a row. Negative equality must explicitly retain NULLs.
+fn exact_text(value: &str, pf: &PreparedFilter) -> Option<String> {
+    let f = &pf.f;
+    let (needle, negative) = match f.op.as_str() {
+        "equals_exact" => (f.value.as_str(), false),
+        "not_equals_exact" => (f.value.as_str(), true),
+        // ASCII-insensitive equality is literal equality for needles without
+        // ASCII letters (common event codes, ports, and numeric identifiers).
+        "equals" | "not_equals" if !f.value.trim().bytes().any(|c| c.is_ascii_alphabetic()) => {
+            (f.value.trim(), f.op == "not_equals")
+        }
+        "in_exact" => {
+            let mut items: Vec<&str> = f.value.lines().filter(|v| !v.is_empty()).collect();
+            items.sort_unstable();
+            items.dedup();
+            return Some(if items.is_empty() {
+                "FALSE".into()
+            } else {
+                format!("({value} IN ({}))", items.into_iter().map(lit).collect::<Vec<_>>().join(", "))
+            });
+        }
+        _ => return None,
+    };
+    Some(if negative {
+        format!("({value} IS NULL OR {value} <> {})", lit(needle))
+    } else {
+        format!("({value} = {})", lit(needle))
+    })
+}
+
 impl Schema {
     /// Text of a field (exact key), or NULL.
     pub(crate) fn field(&self, name: &str) -> String {
@@ -93,6 +154,20 @@ impl Schema {
             Some(sql) if sql == NULL_TEXT => Val::Absent,
             Some(sql) => Val::Sql(sql),
         }
+    }
+
+    /// Ordinary scalar fields are included verbatim in the indexed free-text
+    /// values. A complete hex word of an exact ASCII literal is therefore
+    /// guaranteed to contribute that token, including within a UUID.
+    /// Metadata, role aliases, skipped path fields and structured values do
+    /// not have that coverage proof and retain their existing SQL predicate.
+    fn exact_hex_field(&self, column: &str, value: &str) -> bool {
+        super::text::exact_field_hex_word(value).is_some()
+            && !column.starts_with(['@', '_'])
+            && !column.contains('.')
+            && !matches!(column, "id" | "event_ref" | "timestamp" | "source" | "level" | "code" | "name" | "description" | "message" | "raw" | "arquivo" | "caminho")
+            && self.fields.contains_key(column)
+            && !self.structured.contains(column)
     }
 
     /// Value the search language reads for a field (`Ctx::field`).
@@ -194,6 +269,9 @@ impl Schema {
                 _ => None,
             };
             if let Some(column) = direct {
+                if let Some(sql) = integer_range(column, pf) {
+                    return Decision::Sql(sql);
+                }
                 return Decision::Sql(tests.number(column, Arc::new(move |n| number_matches(&owned, n))));
             }
             return match self.value(&f.column, names) {
@@ -206,7 +284,15 @@ impl Schema {
             };
         }
         match self.value(&f.column, names) {
-            Val::Sql(value) => Decision::Sql(tests.text(&value, Arc::new(move |v| value_matches(&owned, v)))),
+            Val::Sql(value) => {
+                let native = exact_text(&value, pf);
+                if op == "equals_exact" && self.exact_hex_field(&f.column, &f.value) {
+                    let word = super::text::exact_field_hex_word(&f.value).expect("field coverage checked").to_ascii_lowercase();
+                    Decision::Sql(tests.hex_field(owned, native.expect("exact equality is native"), word))
+                } else {
+                    Decision::Sql(native.unwrap_or_else(|| tests.text(&value, Arc::new(move |v| value_matches(&owned, v)))))
+                }
+            }
             Val::Absent => Decision::Sql(literal(value_matches(&owned, None))),
             Val::Unsupported => Decision::Event,
         }
@@ -287,18 +373,8 @@ impl Schema {
 }
 
 /// Some value (lowercase free-text column, name or description) contains `needle`.
-fn any_value(needle: &str, tests: &mut Tests, names: &mut bool) -> String {
-    *names = true;
-    let owned = needle.to_string();
-    let test: super::udf::TextTest = Arc::new(move |v| {
-        v.is_some_and(|v| crate::query::ci_contains_bytes(v.as_bytes(), owned.as_bytes()))
-    });
-    format!(
-        "(contains(vals, {}) OR {} OR {})",
-        lit(needle),
-        tests.text("name", test.clone()),
-        tests.text("description", test)
-    )
+fn any_value(needle: &str, tests: &mut Tests, _names: &mut bool) -> String {
+    tests.free_text(needle)
 }
 
 /// Column of a role as the search language resolves it (`Ctx::role`).
@@ -319,4 +395,69 @@ enum Decision {
     Event,
     /// Decided by the line engine.
     Lines,
+}
+
+#[cfg(test)]
+mod native_predicate_tests {
+    use super::*;
+    use crate::query::Filter;
+
+    fn filter(column: &str, op: &str, value: &str, value2: Option<&str>) -> PreparedFilter {
+        crate::query::prepare(&[Filter { column: column.into(), op: op.into(), value: value.into(), value2: value2.map(str::to_string) }]).remove(0)
+    }
+
+    #[test]
+    fn exact_hex_candidates_require_stored_scalar_field_coverage() {
+        let mut schema = Schema::default();
+        let hex = "0000000000000000000000006585cfa1";
+        schema.fields.insert("trace_id".into(), "w0".into());
+        let plan = schema.plan(&[filter("trace_id", "equals_exact", hex, None)]);
+        assert!(plan.exact());
+        assert_eq!(plan.tests.hex_fields.len(), 1);
+        assert!(plan.tests.hex_fields[0].fallback_sql.contains("w0 ="));
+        for column in ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw", "arquivo", "caminho", "@user", "nested.id", "_meta"] {
+            schema.fields.insert(column.into(), "w1".into());
+            assert!(!schema.exact_hex_field(column, hex), "{column}");
+        }
+        assert!(!schema.exact_hex_field("missing", hex));
+        assert!(!schema.exact_hex_field("trace_id", "dead"));
+        assert!(!schema.exact_hex_field("trace_id", &"f".repeat(65)));
+        assert!(schema.exact_hex_field("trace_id", "deadbeef-12345678"));
+        assert!(!schema.exact_hex_field("trace_id", "prefixdeadbeef"));
+        assert!(schema.plan(&[filter("trace_id", "equals", hex, None)]).tests.hex_fields.is_empty());
+        assert!(schema.plan(&[filter("trace_id", "not_equals_exact", hex, None)]).tests.hex_fields.is_empty());
+        schema.structured.insert("trace_id".into());
+        assert!(!schema.exact_hex_field("trace_id", hex));
+    }
+
+    #[test]
+    fn integer_bounds_keep_columns_uncast_and_preserve_fractional_edges() {
+        for (op, expected) in [("gt", "(ts > 10)"), ("gte", "(ts >= 11)"), ("lt", "(ts < 11)"), ("lte", "(ts <= 10)")] {
+            assert_eq!(integer_range("ts", &filter("timestamp", op, "10.5", None)).as_deref(), Some(expected));
+        }
+        assert_eq!(integer_range("id", &filter("id", "between", "-1.5", Some("2.5"))).as_deref(), Some("(id >= -1 AND id <= 2)"));
+        assert_eq!(integer_range("ts", &filter("timestamp", "gt", "invalid", None)).as_deref(), Some("FALSE"));
+        assert!(integer_range("ts", &filter("timestamp", "gt", "NaN", None)).is_none());
+        assert!(integer_range("ts", &filter("timestamp", "gte", "9007199254740992", None)).is_none());
+    }
+
+    #[test]
+    fn exact_lists_and_null_negative_semantics_are_preserved() {
+        assert_eq!(exact_text("code", &filter("code", "equals", " 404 ", None)).as_deref(), Some("(code = '404')"));
+        assert_eq!(exact_text("x", &filter("x", "not_equals_exact", "O'Reilly", None)).as_deref(), Some("(x IS NULL OR x <> 'O''Reilly')"));
+        assert_eq!(exact_text("x", &filter("x", "in_exact", " a \nb,c\n a \n", None)).as_deref(), Some("(x IN (' a ', 'b,c'))"));
+        assert!(exact_text("x", &filter("x", "equals", "Admin", None)).is_none());
+        assert!(exact_text("x", &filter("x", "in", "Admin", None)).is_none());
+    }
+
+    #[test]
+    fn plans_expose_safe_ranges_and_equality_to_duckdb() {
+        let schema = Schema::default();
+        let plan = schema.plan(&[filter("timestamp", "gte", "1000.5", None), filter("code", "equals_exact", "4625", None)]);
+        assert!(plan.exact());
+        assert!(plan.sql.contains("ts >= 1001"));
+        assert!(plan.sql.contains("code = '4625'"));
+        assert!(!plan.sql.contains("li_test"));
+        assert!(!plan.sql.contains("li_ntest"));
+    }
 }

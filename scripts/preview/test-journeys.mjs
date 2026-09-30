@@ -1,12 +1,11 @@
 /* Run: node scripts/preview/test-journeys.mjs http://127.0.0.1:4175 */
 import assert from "node:assert/strict";
-import { chromium } from "playwright";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { launchBrowser } from "./browser.mjs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 const url = process.argv[2] || "http://127.0.0.1:4175", output = resolve("output/playwright");
 mkdirSync(output, { recursive: true });
-const fallback = `${process.env.LOCALAPPDATA}/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-win64/chrome-headless-shell.exe`;
-const browser = await chromium.launch({ executablePath: existsSync(chromium.executablePath()) ? undefined : fallback });
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1200, height: 900 }, timezoneId: "America/Sao_Paulo" });
 const errors = [], results = {};
 page.on("pageerror", error => errors.push(error.message));
@@ -152,18 +151,11 @@ try {
   await page.locator(".journey-list-panel").getByRole("button", { name: "Tentar novamente" }).click();
   await page.waitForFunction(() => document.querySelectorAll(".journey-item").length === 50);
   await page.evaluate(() => window.journeyRestoreFailure());
-  await page.evaluate(() => {
-    const original = api; window.journeyRestoreCancel = () => { api = original; };
-    api = async (name, args, opts) => {
-      if (name === "journey_index") return new Promise((_, reject) => { window.journeyReject = () => reject(Error("Operação cancelada")); });
-      if (name === "cancel_operation") { window.journeyReject(); return null; }
-      return original(name, args, opts);
-    };
-  });
+  await page.evaluate(() => { window.__mockLatency = { journey_index: 1000 }; });
   await page.getByRole("combobox", { name: "Ordenar" }).selectOption("duration");
   await page.locator(".journey-list-panel").getByRole("button", { name: "Cancelar" }).click();
   await page.waitForFunction(() => document.querySelector(".journey-list-panel").textContent.includes("Operação cancelada"));
-  await page.evaluate(() => window.journeyRestoreCancel());
+  await page.evaluate(() => { window.__mockLatency = {}; });
   await page.locator(".journey-list-panel").getByRole("button", { name: "Tentar novamente" }).click();
   await page.waitForFunction(() => document.querySelectorAll(".journey-item").length === 50);
   results.cancelAndRetry = true;
