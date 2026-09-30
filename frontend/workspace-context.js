@@ -46,6 +46,10 @@ window.WorkspaceContext = (() => {
     const c = activeCase(); if (c) { c.workspace ||= defaultCaseWorkspace(); c.workspace.contextStates = record(c.workspace.contextStates); c.workspace.contextStates[scope] = snapshot; c.workspace.activeScope = scope; }
     return snapshot;
   }
+  // Loaded source shared by every Case; its filtered rows belong to one Case only.
+  function sourceRuntime() {
+    return { loaded: state.loaded, columns: state.columns, dataPeriod: state.dataPeriod, rows: [], total: 0, facetData: null, explorerCache: null, queryError: null };
+  }
   function stored(value) { return sanitize(states.get(key(value)) || activeCase()?.workspace?.contextStates?.[value]); }
   function apply(snapshot) {
     const base = defaults();
@@ -123,8 +127,11 @@ window.WorkspaceContext = (() => {
       state.cases.active = id; state.activeStationId = null; state.stationAnalyticsId = null;
       renderCaseBar(); updateAnalysisBadge(); await syncActiveCaseArtifacts();
       if (request !== caseGeneration) return;
-      runtime.set(key("dataset"), Object.fromEntries(runtimeKeys.map(name => [name, state[name]])));
+      // Each Case keeps its own analysis: its filters and views come back and
+      // its records are queried again, never carried over from the previous Case.
+      runtime.set(key("dataset"), sourceRuntime());
       await setScope(previousScope, { force: true, animate: false, skipCapture: true });
+      if (request === caseGeneration && state.loaded) await refresh();
     } finally { if (request === caseGeneration) restoringCase = false; }
   }
   function beforeCaseCreation() {
@@ -135,10 +142,14 @@ window.WorkspaceContext = (() => {
   async function afterCaseCreation(previous) {
     if (!previous) return;
     const c = activeCase();
-    if (previous.runtime) runtime.set(key("dataset"), previous.runtime);
-    states.set(key("dataset"), previous.snapshot); c.workspace.contextStates = { dataset: previous.snapshot }; c.workspace.activeScope = previous.scope;
-    try { await setScope(previous.scope, { force: true, animate: false, skipCapture: true }); }
-    finally { restoringCase = false; }
+    // A new Case starts a clean analysis over the same loaded source.
+    const fresh = { ...defaults(), page: previous.snapshot?.page || "summary" };
+    runtime.set(key("dataset"), sourceRuntime());
+    states.set(key("dataset"), fresh); c.workspace.contextStates = { dataset: fresh }; c.workspace.activeScope = "dataset";
+    try {
+      await setScope("dataset", { force: true, animate: false, skipCapture: true });
+      if (state.loaded) await refresh();
+    } finally { restoringCase = false; }
   }
   async function deleteCase(c) {
     if (sourceBusy) { toast("Aguarde a atualização das fontes para excluir o Caso.", "info"); return; }

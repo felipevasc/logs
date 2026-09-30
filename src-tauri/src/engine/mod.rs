@@ -9,6 +9,7 @@
 mod build;
 mod ops;
 mod sql;
+mod text;
 mod udf;
 
 pub(crate) use ops::*;
@@ -216,6 +217,9 @@ pub(crate) struct Session {
     selections: Mutex<Vec<(String, Arc<ops::Selection>)>>,
     /// Selection tables no longer referenced, dropped before new ones are made.
     garbage: Arc<Mutex<Vec<String>>>,
+    /// Inverted text index of each part with its first line; empty when a
+    /// part has none (free text is then scanned).
+    texts: Vec<(usize, text::Text)>,
 }
 
 pub(crate) struct Pooled<'a> {
@@ -258,6 +262,14 @@ impl Session {
         let mut overflow: HashSet<String> = HashSet::new();
         let mut selects = Vec::new();
         let mut baked = spec.baked;
+        let mut texts: Vec<(usize, text::Text)> = spec
+            .parts
+            .iter()
+            .filter_map(|part| text::Text::open(&text::dir_of(&part.path)).map(|t| (part.start, t)))
+            .collect();
+        if texts.len() != spec.parts.len() {
+            texts.clear();
+        }
         for (k, part) in spec.parts.iter().enumerate() {
             // Touch the store (before it is opened) so the cache keeps recently used ones.
             let _ = std::fs::File::options()
@@ -331,7 +343,22 @@ impl Session {
             names_version: AtomicU64::new(0),
             selections: Mutex::new(Vec::new()),
             garbage: Arc::new(Mutex::new(Vec::new())),
+            texts,
         })
+    }
+
+    /// Lines (sorted) whose free text may contain `needle`, through the
+    /// inverted indexes; `None` when they cannot narrow the search.
+    pub(crate) fn free_candidates(&self, needle: &str, limit: usize) -> Option<Vec<usize>> {
+        if self.texts.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (start, text) in &self.texts {
+            let lids = text.candidates(needle, limit.checked_sub(out.len())?)?;
+            out.extend(lids.into_iter().map(|lid| start + lid as usize));
+        }
+        Some(out)
     }
 
     pub(crate) fn names_version(&self) -> u64 {

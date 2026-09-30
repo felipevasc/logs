@@ -65,6 +65,81 @@ struct Scope<'s> {
     names: bool,
     _tests: Tests,
     _selection: Option<Arc<Selection>>,
+    _free: Vec<Arc<Selection>>,
+}
+
+/// Rows checked at most per free-text needle found through the inverted index.
+const FREE_LIMIT: usize = 250_000;
+
+/// Replaces each `contains(vals, '…')` of a condition by the rows whose text
+/// contains the needle: candidates come from the inverted index and are
+/// confirmed with the same text the column holds. Needles the index cannot
+/// narrow keep the scan.
+fn resolve_free(session: &Session, src: &Source, sql: &str) -> Result<(String, Vec<Arc<Selection>>)> {
+    const OPEN: &str = "contains(vals, '";
+    let mut out = String::with_capacity(sql.len());
+    let mut held = Vec::new();
+    let mut rest = sql;
+    while let Some(at) = rest.find(OPEN) {
+        out.push_str(&rest[..at]);
+        let body = &rest[at + OPEN.len()..];
+        // SQL literal: '' is a quote inside it.
+        let mut needle = String::new();
+        let mut chars = body.char_indices().peekable();
+        let mut end = None;
+        while let Some((i, c)) = chars.next() {
+            if c == '\'' {
+                if chars.peek().map(|(_, n)| *n) == Some('\'') {
+                    chars.next();
+                    needle.push('\'');
+                } else {
+                    end = Some(i + 1);
+                    break;
+                }
+            } else {
+                needle.push(c);
+            }
+        }
+        let Some(end) = end.filter(|&e| body[e..].starts_with(')')) else {
+            out.push_str(&rest[at..]);
+            return Ok((out, held));
+        };
+        let whole = &rest[at..at + OPEN.len() + end + 1];
+        match free_selection(session, src, &needle)? {
+            Some(selection) => {
+                out.push_str(&format!("id IN (SELECT id FROM {})", selection.name));
+                held.push(selection);
+            }
+            None => out.push_str(whole),
+        }
+        rest = &body[end + 1..];
+    }
+    out.push_str(rest);
+    Ok((out, held))
+}
+
+fn free_selection(session: &Session, src: &Source, needle: &str) -> Result<Option<Arc<Selection>>> {
+    let key = format!("free#{needle}");
+    if let Some(found) = session.cached_selection(&key) {
+        return Ok(Some(found));
+    }
+    let Some(candidates) = session.free_candidates(needle, FREE_LIMIT) else { return Ok(None) };
+    // Confirmed on the stored text of the candidates only (the original file
+    // would be read line by line, slowly on a cold disk).
+    let _ = src;
+    let pending = selection(session, &candidates)?;
+    let ids = read_ids(
+        session,
+        &format!(
+            "SELECT id FROM ev WHERE id IN (SELECT id FROM {}) AND contains(vals, {}) ORDER BY id",
+            pending.name,
+            lit(needle)
+        ),
+    )?;
+    drop(pending);
+    let found = selection(session, &ids)?;
+    session.cache_selection(key, Arc::clone(&found));
+    Ok(Some(found))
 }
 
 /// Table holding the ids a filter list selects; dropped with its last user.
@@ -124,7 +199,8 @@ fn intersect(a: &[usize], b: &[usize]) -> Vec<usize> {
 fn matching_ids(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Vec<usize>> {
     let plan = session.schema.plan(pfs);
     let from = if plan.names { "evn" } else { "ev" };
-    let mut ids = read_ids(session, &format!("SELECT id FROM {from} WHERE {} ORDER BY id", plan.sql))?;
+    let (sql, _free) = resolve_free(session, src, &plan.sql)?;
+    let mut ids = read_ids(session, &format!("SELECT id FROM {from} WHERE {sql} ORDER BY id"))?;
     drop(plan.tests);
     for &i in &plan.lines {
         let other = crate::query::scan_matches(src.idx, std::slice::from_ref(&pfs[i].f), src.codes, src.system, src.derived);
@@ -167,13 +243,15 @@ fn costly(sql: &str) -> bool {
 
 fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Scope<'s>> {
     let plan = session.schema.plan(pfs);
-    if plan.exact() && !costly(&plan.sql) {
+    let (sql, free) = resolve_free(session, src, &plan.sql)?;
+    if plan.exact() && !costly(&sql) {
         return Ok(Scope {
             session,
-            cond: plan.sql,
+            cond: sql,
             names: plan.names,
             _tests: plan.tests,
             _selection: None,
+            _free: free,
         });
     }
     // Exact selections depend only on the filters (and loaded names).
@@ -188,11 +266,12 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
             names: false,
             _tests: Tests::default(),
             _selection: Some(found),
+            _free: Vec::new(),
         });
     }
     let ids = if plan.exact() {
         let from = if plan.names { "evn" } else { "ev" };
-        read_ids(session, &format!("SELECT id FROM {from} WHERE {}", plan.sql))?
+        read_ids(session, &format!("SELECT id FROM {from} WHERE {sql}"))?
     } else {
         drop(plan);
         matching_ids(session, src, pfs)?
@@ -207,6 +286,7 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
         names: false,
         _tests: Tests::default(),
         _selection: Some(selection),
+        _free: Vec::new(),
     })
 }
 

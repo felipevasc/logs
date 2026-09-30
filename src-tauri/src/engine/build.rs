@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Store layout version; part of every store key.
-pub(crate) const STORE_VERSION: u32 = 1;
+pub(crate) const STORE_VERSION: u32 = 3;
 /// Lines sampled to choose which fields become their own columns.
 const SAMPLE: usize = 20_000;
 /// Fields beyond this many live in the overflow lists (still exact, slower).
@@ -103,7 +103,7 @@ fn field_text(value: &Value) -> String {
 
 /// Free-text values as `querylang::any_value` visits them, lowercased; names
 /// and descriptions come from the catalogs at query time.
-fn free_text(ev: &Event) -> String {
+pub(crate) fn free_text(ev: &Event) -> String {
     let mut out = String::with_capacity(ev.message.len() + ev.source.len() + 64);
     let mut push = |text: &str| {
         if !out.is_empty() {
@@ -353,6 +353,13 @@ pub(crate) fn build(
                 remove_database(&pending);
                 return Ok(outcome);
             }
+            // The text index goes first: a store is used once its file exists.
+            let text = super::text::dir_of(target);
+            let _ = std::fs::remove_dir_all(&text);
+            std::fs::rename(super::text::dir_of(&pending), &text).map_err(|e| {
+                remove_database(&pending);
+                format!("Não foi possível concluir o índice de texto: {e}")
+            })?;
             std::fs::rename(&pending, target).map_err(|e| {
                 remove_database(&pending);
                 format!("Não foi possível concluir o índice de consultas: {e}")
@@ -368,6 +375,7 @@ pub(crate) fn build(
 
 pub(crate) fn remove_database(path: &Path) {
     let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(super::text::dir_of(path));
     let mut wal = path.as_os_str().to_owned();
     wal.push(".wal");
     let _ = std::fs::remove_file(PathBuf::from(wal));
@@ -411,6 +419,11 @@ fn write(
     let wide_index: HashMap<String, usize> =
         wide_fields.iter().enumerate().map(|(i, k)| (k.clone(), i)).collect();
     let schema = table_schema(wide_fields.len());
+    // Inverted index of the free text, built alongside (see `text`).
+    let text_threads = if crate::resources::low_memory() { 1 } else { (crate::resources::workers() / 3).clamp(2, 6) };
+    // Larger buffers mean fewer segments to merge; bounded by the installed memory.
+    let text_memory = (crate::resources::total_memory() / 16).clamp(128 << 20, 2 << 30) as usize;
+    let text = super::text::Writer::create(&super::text::dir_of(path), text_threads, text_memory)?;
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     super::limit_resources(&conn);
     create_table(&conn, &wide_names).map_err(|e| e.to_string())?;
@@ -475,7 +488,8 @@ fn write(
             let start = cursors[writer].0;
             let end = (start + step).min(cursors[writer].1);
             let chunks: Vec<usize> = (start..end).step_by(CHUNK).collect();
-            let parts: Vec<(RecordBatch, Facts)> = chunks
+            let text = &text;
+            let parts: Vec<(RecordBatch, Facts, Result<(), String>)> = chunks
                 .into_par_iter()
                 .map(|from| {
                     let to = (from + CHUNK).min(end);
@@ -491,10 +505,19 @@ fn write(
                         found.ci_multi.extend(row.ci_multi.iter().cloned());
                         found.overflow.extend(row.over.iter().map(|(key, _)| key.clone()));
                     }
-                    (batch_of(&rows, from as u32, wide_fields.len(), &schema), found)
+                    // Each parsing task feeds the text index directly.
+                    let indexed = rows
+                        .iter()
+                        .enumerate()
+                        .try_for_each(|(r, row)| text.add((from + r) as u32, super::text::words(&row.vals)));
+                    (batch_of(&rows, from as u32, wide_fields.len(), &schema), found, indexed)
                 })
                 .collect();
-            for (batch, found) in parts {
+            for (batch, found, indexed) in parts {
+                if let Err(error) = indexed {
+                    produced = Err(error);
+                    break 'batches;
+                }
                 facts.structured.extend(found.structured);
                 facts.ci_multi.extend(found.ci_multi);
                 facts.overflow.extend(found.overflow);
@@ -529,6 +552,7 @@ fn write(
         }
         kept.ok_or_else(|| "Falha ao gravar o índice de consultas.".to_string())
     })?;
+    text.finish()?;
     let mut overflow: Vec<String> = facts.overflow.into_iter().collect();
     overflow.sort();
     let mut structured: Vec<String> = facts.structured.into_iter().collect();
