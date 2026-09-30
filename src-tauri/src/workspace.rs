@@ -1534,15 +1534,18 @@ mod canonical {
             let encoded = checked_bytes(manifest)?;
             if encoded.len() as u64 > MAX_MARKER { return Err("Manifesto da conversão excedeu o limite.".into()); }
             let mut file = OpenOptions::new().write(true).create_new(true).open(staging.path().join(MARKER)).map_err(|e| e.to_string())?;
-            file.write_all(&encoded).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
+            file.write_all(&encoded).and_then(|_| file.sync_all()).map_err(|e| format!("Falha ao gravar o manifesto da conversão: {e}"))?;
+            // Windows cannot rename a directory while a child file is open.
+            // The marker is durable; close its handle before publication.
+            drop(file);
             sync_dir(staging.path())?;
             self.input.validate()?;
             crate::operations::check()?;
             // Caller owns the exclusive lease, so no mapped reader or other
             // process can observe an invalid generation being replaced.
-            if self.dir.exists() { std::fs::remove_dir_all(&self.dir).map_err(|e| e.to_string())?; }
+            if self.dir.exists() { std::fs::remove_dir_all(&self.dir).map_err(|e| format!("Falha ao remover a conversão inválida: {e}"))?; }
             MEMO.lock().retain(|entry| entry.path != self.dir);
-            std::fs::rename(staging.path(), &self.dir).map_err(|e| e.to_string())?;
+            std::fs::rename(staging.path(), &self.dir).map_err(|e| format!("Falha ao publicar a conversão validada: {e}"))?;
             sync_dir(&self.root)?;
             touch(&self.dir);
             Ok(())
