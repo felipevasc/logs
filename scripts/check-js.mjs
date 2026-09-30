@@ -2,6 +2,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const root = new URL("../", import.meta.url);
 let checked = 0;
@@ -23,6 +24,6 @@ async function check(directory) {
     checked++;
   }
 }
-await check(new URL("frontend", root).pathname);
-await check(new URL("scripts", root).pathname);
+await check(fileURLToPath(new URL("frontend", root)));
+await check(fileURLToPath(new URL("scripts", root)));
 console.log(`Parsed ${checked} JavaScript files`);
