@@ -86,6 +86,8 @@ pub(crate) struct LoadSummary {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OperationProgress {
+    operation_id: Option<String>,
+    phase_id: String,
     operation: String,
     phase: String,
     completed: usize,
@@ -109,6 +111,8 @@ fn emit_progress(
     let _ = app.emit(
         "operation-progress",
         OperationProgress {
+            operation_id: operations::current_id(),
+            phase_id: phase.into(),
             operation: operation.into(),
             phase: phase.into(),
             completed,
@@ -136,15 +140,37 @@ pub(crate) fn config_dir() -> PathBuf {
 /// captura o AppHandle e resolve `app.state::<AppState>()` lá dentro, pois
 /// `State<'_, T>` não pode ser movido para um closure 'static.
 async fn offload<T, F>(f: F) -> Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let generation = operations::generation();
-    tauri::async_runtime::spawn_blocking(move || operations::run(generation, f))
-        .await
-        .map_err(|e| e.to_string())?
+where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
+    offload_operation(None, f).await
 }
+
+async fn offload_operation<T, F>(operation_id: Option<String>, f: F) -> Result<T, String>
+where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
+    let token = operations::token(operation_id)?;
+    tauri::async_runtime::spawn_blocking(move || operations::run_with_token(token, f))
+        .await.map_err(|e| e.to_string())?
+}
+
+/// Reject a changed/truncated mapped source before an infallible legacy reader
+/// can mistake a refused engine session for permission to scan stale offsets.
+pub(crate) fn validate_current_source(state: &AppState) -> Result<(), String> {
+    let source = state.source.read();
+    if let SourceData::Indexed(idx) = &*source {
+        for part in &idx.parts { sources::validate_source(part)?; }
+    }
+    Ok(())
+}
+
+async fn offload_source<T, F>(operation_id: Option<String>, app: AppHandle, dataset: bool, f: F) -> Result<T, String>
+where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
+    offload_operation(operation_id, move || {
+        if dataset { validate_current_source(app.state::<AppState>().inner())?; }
+        Ok(f())
+    }).await?
+}
+
+#[tauri::command]
+fn cancel_task(operation_id: String) -> bool { operations::cancel_id(&operation_id) }
 
 const CATALOG_VERSION: u32 = 3;
 
@@ -215,8 +241,9 @@ async fn load_event_log(
     max_events: usize,
     merge: Option<bool>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<LoadSummary, String> {
-    offload(move || {
+    offload_operation(operation_id, move || {
         let state = app.state::<AppState>();
         load_event_log_impl(state.inner(), &channel, max_events, merge, Some(&app))
     })
@@ -357,7 +384,7 @@ fn index_source_file(
                 &format!("Indexando {file_label}"),
                 done,
                 total,
-                "linhas",
+                "bytes",
                 false,
             );
         }),
@@ -365,7 +392,10 @@ fn index_source_file(
     idx.parts[0].path = path.to_string();
     idx.parts[0].file_name = file_label;
     if idx.ts_config.is_some() {
-        sources::retimestamp_index(&mut idx, None)?;
+        emit_progress(app, "carregamento", "Aplicando configuração de data/hora", 0, idx.lines.len(), "registros", true);
+        idx = index_cache::timestamps_on_load(idx, Some(&|phase, done, total| {
+            emit_progress(app, "carregamento", phase, done, total, "registros", true);
+        }))?;
     }
     Ok(idx)
 }
@@ -376,8 +406,9 @@ async fn load_file(
     format: String,
     merge: Option<bool>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<LoadSummary, String> {
-    offload(move || {
+    offload_operation(operation_id, move || {
         let state = app.state::<AppState>();
         load_file_impl(state.inner(), &path, &format, merge, Some(&app))
     })
@@ -465,9 +496,51 @@ pub(crate) fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Op
     let codes = state.codes.read().clone();
     let system = state.system_codes.read().clone();
     let derived = state.derived.read().clone();
-    engine::prepare(idx, &codes, &system, &derived, &|done, total| {
-        emit_progress(app, "carregamento", "Preparando consultas rápidas", done, total, "linhas", false);
+    let operation_id = operations::current_id();
+    let started = std::time::Instant::now();
+    let phase_clock = Mutex::new((String::new(), std::time::Instant::now()));
+    engine::prepare_detailed(idx, &codes, &system, &derived, &|p| {
+        let Some(app) = app else { return };
+        let phase_elapsed = {
+            let mut phase = phase_clock.lock();
+            if phase.0 != p.phase { *phase = (p.phase.clone(), std::time::Instant::now()); }
+            phase.1.elapsed().as_millis() as u64
+        };
+        let _ = app.emit("operation-progress", serde_json::json!({
+            "operationId": operation_id, "operation": "carregamento", "phaseId": p.phase,
+            "phase": p.phase, "completed": p.completed, "total": p.total, "unit": "registros",
+            "cancellable": p.state == "indexing", "state": p.state,
+            "checkpointRows": p.checkpoint_rows, "completedSegments": p.completed_segments,
+            "totalSegments": p.total_segments, "resumedRows": p.resumed_rows,
+            "elapsedMs": started.elapsed().as_millis() as u64, "phaseElapsedMs": phase_elapsed,
+            "error": p.error
+        }));
     })
+}
+
+#[tauri::command]
+async fn engine_status(app: AppHandle) -> Result<Option<engine::EngineStatus>, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        let source = state.source.read();
+        match &*source {
+            SourceData::Indexed(idx) => Some(engine::status(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read())),
+            _ => None,
+        }
+    }).await
+}
+
+#[tauri::command]
+async fn engine_retry(app: AppHandle, operation_id: Option<String>) -> Result<Option<engine::EngineStatus>, String> {
+    offload_operation(operation_id, move || {
+        let state = app.state::<AppState>();
+        let source = state.source.read();
+        let SourceData::Indexed(idx) = &*source else { return Ok(None) };
+        engine::retry(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read());
+        prepare_engine(state.inner(), idx, Some(&app))?;
+        let status = engine::status(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read());
+        Ok(Some(status))
+    }).await?
 }
 
 #[tauri::command]
@@ -476,8 +549,9 @@ async fn load_files(
     format: String,
     merge: Option<bool>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<LoadSummary, String> {
-    offload(move || {
+    offload_operation(operation_id, move || {
         let state = app.state::<AppState>();
         load_files_impl(state.inner(), &paths, &format, merge, Some(&app))
     })
@@ -577,8 +651,9 @@ async fn set_ts_config(
     path: String,
     config: Option<sources::TsConfig>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<(), String> {
-    offload(move || {
+    offload_operation(operation_id, move || {
         let state = app.state::<AppState>();
         set_ts_config_impl(state.inner(), &path, config, Some(&app))
     })
@@ -631,12 +706,13 @@ pub(crate) fn set_ts_config_impl(
                 }
                 if let Err(error) = std::fs::write(ts_configs_path(), &text) {
                     idx.parts[position].ts_config = previous;
-                    for (line, ts) in idx.lines.iter_mut().zip(timestamps) {
+                    for (line, ts) in std::sync::Arc::make_mut(&mut idx.lines).iter_mut().zip(timestamps) {
                         line.ts = ts;
                     }
                     idx.time_order.take();
                     return Err(error.to_string());
                 }
+                engine::request_rebuild(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read());
                 return Ok(());
             }
         }
@@ -894,6 +970,9 @@ pub(crate) fn save_derived_field_impl(
             sources::apply_derived(ev, &derived);
         }
     }
+    if let SourceData::Indexed(idx) = &*state.source.read() {
+        engine::request_rebuild(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read());
+    }
     Ok(())
 }
 
@@ -921,6 +1000,9 @@ pub(crate) fn delete_derived_field_impl(state: &AppState, name: &str) -> Result<
         for ev in evs.iter_mut() {
             ev.fields.remove(name);
         }
+    }
+    if let SourceData::Indexed(idx) = &*state.source.read() {
+        engine::request_rebuild(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read());
     }
     Ok(())
 }
@@ -1148,10 +1230,11 @@ async fn query_events(
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<query::QueryResult, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || {
+    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         let state = app.state::<AppState>();
         query_events_scope_impl(
             state.inner(),
@@ -1223,6 +1306,48 @@ pub(crate) fn query_events_impl(
     }
 }
 
+/// Interactive rows are independent of histogram/facet work and exact totals.
+#[tauri::command]
+async fn query_page(
+    filters: Vec<query::Filter>,
+    sort_column: String,
+    sort_dir: String,
+    offset: usize,
+    limit: usize,
+    cursor: Option<String>,
+    operation_id: Option<String>,
+    case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
+    app: AppHandle,
+) -> Result<query::QueryPage, String> {
+    let case_events = crate::case_cache::take(case_events, case_key)?;
+    workspace::validate(&filters)?;
+    offload_operation(operation_id, move || {
+        let limit = limit.clamp(1, 2_000);
+        if let Some(events) = case_events.as_deref() {
+            return Ok(query::QueryPage::from_exact(
+                query::query(events, &filters, &sort_column, &sort_dir, offset, limit), offset, "memory", None,
+            ));
+        }
+        let state = app.state::<AppState>();
+        let source = state.source.read();
+        let codes = state.codes.read();
+        let system = state.system_codes.read();
+        let derived = state.derived.read();
+        match &*source {
+            SourceData::Indexed(idx) => query::query_page_indexed(
+                idx, &filters, &sort_column, &sort_dir, offset, limit, cursor.as_deref(), &codes, &system, &derived,
+            ),
+            SourceData::Memory(events) => Ok(query::QueryPage::from_exact(
+                query::query(events, &filters, &sort_column, &sort_dir, offset, limit), offset, "memory", None,
+            )),
+            SourceData::None => Ok(query::QueryPage::from_exact(
+                query::QueryResult { total: 0, rows: Vec::new() }, offset, "memory", None,
+            )),
+        }
+    }).await?
+}
+
 #[tauri::command]
 async fn explore_snapshot(
     filters: Vec<query::Filter>,
@@ -1233,10 +1358,11 @@ async fn explore_snapshot(
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<query::ExplorerSnapshot, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || {
+    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         let state = app.state::<AppState>();
         explore_snapshot_scope_impl(
             state.inner(),
@@ -1357,10 +1483,11 @@ async fn aggregate_events(
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<query::AggResult, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || {
+    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         let state = app.state::<AppState>();
         aggregate_events_impl(state.inner(), &group_column, aggs, filters, case_events)
     })
@@ -1542,10 +1669,11 @@ async fn count_filtered(
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<usize, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || {
+    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         let state = app.state::<AppState>();
         count_filtered_impl(state.inner(), filters, case_events)
     })
@@ -1558,16 +1686,16 @@ pub(crate) fn count_filtered_impl(
     case_events: Option<Vec<Event>>,
 ) -> usize {
     if let Some(events) = case_events {
-        return query::filtered_indices(&events, &filters).len();
+        return query::count_memory(&events, &filters);
     }
     let source = state.source.read();
     match &*source {
-        SourceData::Memory(events) => query::filtered_indices(events, &filters).len(),
+        SourceData::Memory(events) => query::count_memory(events, &filters),
         SourceData::Indexed(idx) => {
             let (codes, system, derived) = (state.codes.read(), state.system_codes.read(), state.derived.read());
             let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
             engine::count(&src, &filters)
-                .unwrap_or_else(|| query::indexed_matches(idx, &filters, &codes, &system, &derived).len())
+                .unwrap_or_else(|| query::count_lines(idx, &filters, &codes, &system, &derived))
         }
         SourceData::None => 0,
     }
@@ -1580,10 +1708,11 @@ async fn tree_aggs(
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<Vec<(String, query::AggResult)>, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || {
+    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         let state = app.state::<AppState>();
         tree_aggs_impl(state.inner(), columns, filters, case_events)
     })
@@ -1620,10 +1749,11 @@ async fn stats_events(
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<query::Stats, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || {
+    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         if let Some(events) = case_events {
             return query::stats(&events, &filters);
         }
@@ -1651,7 +1781,7 @@ pub(crate) fn stats_events_impl(state: &AppState, filters: Vec<query::Filter>) -
 
 #[tauri::command]
 async fn event_detail(id: usize, app: AppHandle) -> Result<Option<Event>, String> {
-    offload(move || {
+    offload_source(None, app.clone(), true, move || {
         let state = app.state::<AppState>();
         event_detail_impl(state.inner(), id)
     })
@@ -1693,10 +1823,11 @@ async fn discover_patterns(
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<discovery::Discovery, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
+    offload_source(operation_id, app.clone(), case_events.is_none(), move || discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
         .await
 }
 
@@ -1851,10 +1982,11 @@ async fn compute_series(
     case_key: Option<String>,
     spec: analysis::SeriesSpec,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<analysis::SeriesResult, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || {
+    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         let state = app.state::<AppState>();
         compute_series_impl(state.inner(), filters, case_events, spec)
     })
@@ -1909,10 +2041,11 @@ async fn pivot(
     case_key: Option<String>,
     spec: analysis::PivotSpec,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<analysis::PivotResult, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || {
+    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         let state = app.state::<AppState>();
         pivot_impl(state.inner(), filters, case_events, spec)
     })
@@ -2233,6 +2366,9 @@ pub fn run() {
             workspace::compare_periods,
             workspace::list_sources,
             workspace::cancel_operation,
+            cancel_task,
+            engine_status,
+            engine_retry,
             workspace::validate_filters,
             workspace::export_events,
             workspace::export_document,
@@ -2244,6 +2380,7 @@ pub fn run() {
             clear_events,
             source_summary,
             query_events,
+            query_page,
             explore_snapshot,
             aggregate_events,
             trail_events,

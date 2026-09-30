@@ -1577,6 +1577,16 @@ pub struct CompiledTsConfig {
     pub rules: Vec<(Option<regex::Regex>, Option<String>)>,
 }
 
+impl CompiledTsConfig {
+    /// Stable cache fingerprint shared by metadata and columnar stores.
+    pub(crate) fn signature(&self) -> String {
+        let rules: Vec<_> = self.rules.iter()
+            .map(|(re, template)| (re.as_ref().map(|r| r.as_str()), template.as_ref())).collect();
+        format!("{:?}|{}|{:?}|{:?}|{}|{:?}", self.sources, self.format,
+            self.complement, self.timezone_offset_minutes, self.clock_adjustment_ms, rules)
+    }
+}
+
 impl TsConfig {
     pub fn compile(&self) -> Result<CompiledTsConfig, String> {
         if self
@@ -1724,8 +1734,12 @@ pub enum CustomParse {
     Delimited { sep: char, fields: Vec<String> },
 }
 
+#[derive(Clone)]
 pub struct FilePart {
     pub path: String,
+    /// Actual immutable input backing the mapping (display paths may be virtual).
+    pub physical_path: String,
+    pub physical_file_id: Option<(u64, u64)>,
     pub file_name: String,
     pub format: String,
     pub custom: Option<CustomParse>,
@@ -1739,7 +1753,7 @@ pub struct FilePart {
 
 pub struct FileIndex {
     pub parts: Vec<FilePart>,
-    pub lines: Vec<LineMeta>,
+    pub lines: std::sync::Arc<Vec<LineMeta>>,
     pub columns: Vec<String>,
     pub time_order: std::sync::OnceLock<Vec<usize>>,
 }
@@ -1773,11 +1787,11 @@ impl FileIndex {
         for p in &mut other.parts {
             p.base += base;
         }
-        for m in &mut other.lines {
+        for m in std::sync::Arc::make_mut(&mut other.lines).iter_mut() {
             m.offset += base;
         }
         self.parts.append(&mut other.parts);
-        self.lines.append(&mut other.lines);
+        std::sync::Arc::make_mut(&mut self.lines).append(std::sync::Arc::make_mut(&mut other.lines));
         for c in other.columns {
             if !self.columns.contains(&c) {
                 self.columns.push(c);
@@ -1795,6 +1809,37 @@ impl FileIndex {
             order
         })
     }
+}
+
+/// Identity of the opened file object, distinct from a reusable path. This
+/// catches atomic replacement even if byte length and modification time match.
+#[cfg(unix)]
+pub(crate) fn file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata().ok()?; Some((m.dev(), m.ino()))
+}
+#[cfg(windows)]
+pub(crate) fn file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }.ok()?;
+    Some((u64::from(info.dwVolumeSerialNumber), (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)))
+}
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn file_identity(_file: &std::fs::File) -> Option<(u64, u64)> { None }
+
+pub(crate) fn validate_source(part: &FilePart) -> Result<(), String> {
+    let file = std::fs::File::open(&part.physical_path).map_err(|e| format!("Fonte indisponível: {e}"))?;
+    let metadata = file.metadata().map_err(|e| format!("Fonte indisponível: {e}"))?;
+    // Check length before touching a mapping that could have been truncated.
+    if metadata.len() != part.mmap.len() as u64
+        || part.physical_file_id.is_some_and(|id| file_identity(&file) != Some(id))
+        || crate::index_cache::identity(&part.physical_path, &part.mmap) != part.identity {
+        return Err("A fonte foi alterada durante a preparação. Reabra o arquivo para indexar uma versão consistente; checkpoints anteriores permanecem separados.".into());
+    }
+    Ok(())
 }
 
 pub fn line_bytes(idx: &FileIndex, i: usize) -> &[u8] {
@@ -1960,7 +2005,7 @@ pub fn retimestamp_index(
 ) -> Result<(), String> {
     let total = idx.lines.len();
     let mut timestamps = Vec::with_capacity(total);
-    let generation = crate::operations::current_generation();
+    let cancellation = crate::operations::current_token();
     let wave = crate::resources::workers() * 8192;
     let index: &FileIndex = idx;
     while timestamps.len() < total {
@@ -1974,7 +2019,7 @@ pub fn retimestamp_index(
             .into_par_iter()
             .with_min_len(1024)
             .map(|i| {
-                if crate::operations::cancelled_for(generation) {
+                if cancellation.cancelled() {
                     return 0;
                 }
                 let part = index.part_at(i);
@@ -1989,7 +2034,7 @@ pub fn retimestamp_index(
         timestamps.extend(part);
     }
     crate::operations::check()?;
-    for (line, timestamp) in idx.lines.iter_mut().zip(timestamps) {
+    for (line, timestamp) in std::sync::Arc::make_mut(&mut idx.lines).iter_mut().zip(timestamps) {
         line.ts = timestamp;
     }
     idx.time_order.take();
@@ -2370,14 +2415,14 @@ fn index_json_array(
 ) -> Result<(), String> {
     let records = json_array_records(bytes, start, progress, envelope)?;
     // Positions come from one fast scan; the records are read in parallel.
-    let generation = crate::operations::current_generation();
+    let cancellation = crate::operations::current_token();
     let wave = crate::resources::workers() * 4 * 1024;
     lines.reserve(records.len());
     for group in records.chunks(wave) {
         let metas: Vec<Vec<LineMeta>> = group
             .par_chunks(1024)
             .map(|chunk| {
-                if crate::operations::cancelled_for(generation) {
+                if cancellation.cancelled() {
                     return Vec::new();
                 }
                 chunk
@@ -2389,7 +2434,7 @@ fn index_json_array(
         crate::operations::check()?;
         lines.extend(metas.into_iter().flatten());
         if let Some(cb) = progress {
-            cb(lines.len(), records.len());
+            cb(group.last().map(|(_, end)| end + 1).unwrap_or(0), bytes.len());
         }
     }
     Ok(())
@@ -2527,7 +2572,7 @@ fn index_lines(
     let keep = |line: &[u8], offset: usize, terminated: bool| {
         !line.is_empty() && (!terminated || (Some(offset) != header_at && !(comments && line[0] == b'#')))
     };
-    let generation = crate::operations::current_generation();
+    let cancellation = crate::operations::current_token();
     let chunk = |k: usize| -> ChunkLines {
         let (from, to) = (bounds[k], bounds[k + 1]);
         let mut out = ChunkLines { lines: Vec::new(), leading: None };
@@ -2546,7 +2591,7 @@ fn index_lines(
         };
         let mut offset = from;
         for (n, nl) in memchr::memchr_iter(b'\n', &bytes[from..to]).enumerate() {
-            if n % 4096 == 0 && crate::operations::cancelled_for(generation) {
+            if n % 4096 == 0 && cancellation.cancelled() {
                 break;
             }
             let end = from + nl;
@@ -2590,7 +2635,7 @@ fn index_lines(
         }
         first = last;
         if let Some(cb) = progress {
-            cb(merged.len(), total_lines);
+            cb(bounds[first], bytes.len());
         }
     }
     Ok(merged)
@@ -2655,10 +2700,9 @@ pub fn index_file(
         }
     }
 
-    // total de linhas por contagem rápida (memchr é SIMD, custo desprezível)
-    let total_lines = progress
-        .map(|_| memchr::memchr_iter(b'\n', &mmap).count() + 1)
-        .unwrap_or(0);
+    // Allocation hint only: byte progress avoids a complete pre-scan merely
+    // to count physical lines (which differ from logical multiline records).
+    let total_lines = (mmap.len() / 160).min(1 << 24);
     let mut lines: Vec<LineMeta> = Vec::new();
     // The header line of tabular formats (first line with content) is not an event.
     let header_at = if delimiter_of(fmt).is_some() {
@@ -2749,6 +2793,8 @@ pub fn index_file(
     Ok(FileIndex {
         parts: vec![FilePart {
             path: path.into(),
+            physical_path: path.into(),
+            physical_file_id: file_identity(&file),
             file_name: file_name_of(path),
             format: fmt.into(),
             custom,
@@ -2758,7 +2804,7 @@ pub fn index_file(
             base: 0,
             identity,
         }],
-        lines,
+        lines: std::sync::Arc::new(lines),
         columns,
         time_order: std::sync::OnceLock::new(),
     })

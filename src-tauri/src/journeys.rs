@@ -553,9 +553,10 @@ pub async fn journey_fields(
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
     app: tauri::AppHandle,
+    operation_id: Option<String>,
 ) -> Result<Vec<JourneyField>, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    crate::offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         fields_impl(
             app.state::<AppState>().inner(),
             &filters,
@@ -577,9 +578,10 @@ pub async fn journey_index(
     from: Option<i64>,
     to: Option<i64>,
     app: tauri::AppHandle,
+    operation_id: Option<String>,
 ) -> Result<JourneyIndex, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    crate::offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         let filters = window_filters(&field, filters, from, to)?;
         index_impl(
             app.state::<AppState>().inner(),
@@ -606,9 +608,10 @@ pub async fn journey_events(
     offset: Option<usize>,
     limit: Option<usize>,
     app: tauri::AppHandle,
+    operation_id: Option<String>,
 ) -> Result<JourneyEvents, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    crate::offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         events_impl(
             app.state::<AppState>().inner(),
             &filters,

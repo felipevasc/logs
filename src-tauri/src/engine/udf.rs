@@ -252,6 +252,25 @@ impl VScalar for NumberKeyFn {
     }
 }
 
+/// Group labels use strict f64 parsing (without trimming or unit conversion),
+/// unlike event-column sorting. Keep the cap's tie-break identical to Rust.
+struct GroupNumberKeyFn;
+impl VScalar for GroupNumberKeyFn {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, output: &mut dyn WritableVector) -> Result<(), Box<dyn Error>> {
+        map_number::<i64>(input, output, |text| {
+            text.parse::<f64>().ok().filter(|n| n.is_finite()).map(|n| {
+                let bits = n.to_bits() as i64;
+                bits ^ (((bits >> 63) as u64) >> 1) as i64
+            })
+        });
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(vec![varchar()], LogicalTypeId::Bigint.into())]
+    }
+}
+
 /// Value of `parse_num_unit` (sums and averages).
 struct NumFn;
 impl VScalar for NumFn {
@@ -304,6 +323,7 @@ pub(crate) fn register(conn: &Connection) -> duckdb::Result<()> {
     conn.register_scalar_function::<LowerFn>("li_lower")?;
     conn.register_scalar_function::<IsoFn>("li_iso")?;
     conn.register_scalar_function::<NumberKeyFn>("li_nkey")?;
+    conn.register_scalar_function::<GroupNumberKeyFn>("li_gkey")?;
     conn.register_scalar_function::<NumFn>("li_num")?;
     conn.register_scalar_function::<UnitFn>("li_unit")?;
     conn.register_scalar_function::<BlankFn>("li_blank")?;

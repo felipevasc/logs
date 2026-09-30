@@ -15,7 +15,9 @@ use duckdb::arrow::array::{Array, Int64Array};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use duckdb::arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -40,9 +42,56 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+/// The handle belongs to this checked-out connection only. Joining the watcher
+/// before returning it to the pool prevents a late cancellation from interrupting
+/// a different operation that reuses the connection.
+struct InterruptWatch {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for InterruptWatch {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+    }
+}
+
+fn interruptible(conn: &duckdb::Connection) -> Result<Option<InterruptWatch>> {
+    crate::operations::check()?;
+    if crate::operations::current_generation().is_none() && crate::operations::current_id().is_none() {
+        return Ok(None);
+    }
+    let token = crate::operations::current_token();
+    let interrupt = conn.interrupt_handle();
+    let (stop, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::Builder::new().name("loginsight-query-cancel".into()).spawn(move || {
+        loop {
+            match finished.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if token.cancelled() { interrupt.interrupt(); break; }
+                }
+            }
+        }
+    }).map_err(err)?;
+    Ok(Some(InterruptWatch { stop, worker: Some(worker) }))
+}
+
 /// Runs `f` on the source's session; errors fall back to the line engine.
 fn with<T>(src: &Source, f: impl FnOnce(&Session) -> Result<T>) -> Option<T> {
-    let session = session(src.idx, src.codes, src.system, src.derived)?;
+    with_ready(src, false, f)
+}
+
+fn ready_session(src: &Source, base_allowed: bool) -> Option<Arc<Session>> {
+    if base_allowed && !src.derived.is_empty() {
+        if let Some(base) = super::base_session(src.idx, src.codes, src.system) { return Some(base); }
+    }
+    session(src.idx, src.codes, src.system, src.derived)
+}
+
+fn with_ready<T>(src: &Source, base_allowed: bool, f: impl FnOnce(&Session) -> Result<T>) -> Option<T> {
+    let session = ready_session(src, base_allowed)?;
     let _names = session.names_guard();
     match f(&session) {
         Ok(value) if !crate::operations::cancelled() => Some(value),
@@ -128,7 +177,7 @@ fn free_selection(session: &Session, src: &Source, needle: &str) -> Result<Optio
     // would be read line by line, slowly on a cold disk).
     let _ = src;
     let pending = selection(session, &candidates)?;
-    let ids = read_ids(
+    let found = selection_query(
         session,
         &format!(
             "SELECT id FROM ev WHERE id IN (SELECT id FROM {}) AND contains(vals, {}) ORDER BY id",
@@ -137,7 +186,6 @@ fn free_selection(session: &Session, src: &Source, needle: &str) -> Result<Optio
         ),
     )?;
     drop(pending);
-    let found = selection(session, &ids)?;
     session.cache_selection(key, Arc::clone(&found));
     Ok(Some(found))
 }
@@ -166,9 +214,11 @@ impl Scope<'_> {
 
 fn read_ids(session: &Session, sql: &str) -> Result<Vec<usize>> {
     let conn = session.conn()?;
+    let _cancel = interruptible(&conn)?;
     let mut stmt = conn.prepare(sql).map_err(err)?;
     let mut ids = Vec::new();
     for batch in stmt.query_arrow([]).map_err(err)? {
+        crate::operations::check()?;
         let column = batch.column(0);
         let values = column
             .as_any()
@@ -209,13 +259,13 @@ fn matching_ids(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
     }
     if !plan.verify.is_empty() {
         let checks: Vec<&PreparedFilter> = plan.verify.iter().map(|&i| &pfs[i]).collect();
-        let generation = crate::operations::current_generation();
+        let cancellation = crate::operations::current_token();
         let kept: Vec<Vec<usize>> = ids
             .par_chunks(4096)
             .map(|chunk| {
                 let mut out = Vec::new();
                 for &id in chunk {
-                    if crate::operations::cancelled_for(generation) {
+                    if cancellation.cancelled() {
                         break;
                     }
                     let ev = src.event(id);
@@ -269,14 +319,15 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
             _free: Vec::new(),
         });
     }
-    let ids = if plan.exact() {
+    let selection = if plan.exact() {
         let from = if plan.names { "evn" } else { "ev" };
-        read_ids(session, &format!("SELECT id FROM {from} WHERE {sql}"))?
+        // Keep a potentially 50M-row selection inside DuckDB, whose buffer
+        // manager can spill it, instead of a Rust Vec followed by another copy.
+        selection_query(session, &format!("SELECT id FROM {from} WHERE {sql}"))?
     } else {
         drop(plan);
-        matching_ids(session, src, pfs)?
+        selection(session, &matching_ids(session, src, pfs)?)?
     };
-    let selection = selection(session, &ids)?;
     if let Some(key) = key {
         session.cache_selection(key, Arc::clone(&selection));
     }
@@ -290,18 +341,42 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
     })
 }
 
-fn selection(session: &Session, ids: &[usize]) -> Result<Arc<Selection>> {
+/// A page must not first materialize every match to populate an analytics
+/// cache. Non-exact predicates are verified in bounded sorted batches below.
+fn page_scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<(Scope<'s>, bool)> {
+    let plan = session.schema.plan(pfs);
+    let exact = plan.exact();
+    let (sql, free) = resolve_free(session, src, &plan.sql)?;
+    Ok((Scope { session, cond: sql, names: plan.names, _tests: plan.tests, _selection: None, _free: free }, exact))
+}
+
+fn new_selection(session: &Session) -> Arc<Selection> {
     static NEXT: AtomicU64 = AtomicU64::new(1);
+    Arc::new(Selection {
+        name: format!("sel_{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+        garbage: session.garbage(),
+    })
+}
+
+fn selection_query(session: &Session, sql: &str) -> Result<Arc<Selection>> {
+    let conn = session.conn()?;
+    let _cancel = interruptible(&conn)?;
+    for unused in session.take_garbage() {
+        let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {unused}"));
+    }
+    let selection = new_selection(session);
+    conn.execute_batch(&format!("CREATE TABLE {} AS {sql}", selection.name)).map_err(err)?;
+    Ok(selection)
+}
+
+fn selection(session: &Session, ids: &[usize]) -> Result<Arc<Selection>> {
     let conn = session.conn()?;
     for unused in session.take_garbage() {
         let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {unused}"));
     }
-    let name = format!("sel_{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let selection = new_selection(session);
+    let name = &selection.name;
     conn.execute_batch(&format!("CREATE TABLE {name} (id BIGINT)")).map_err(err)?;
-    let selection = Arc::new(Selection {
-        name: name.clone(),
-        garbage: session.garbage(),
-    });
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let mut appender = conn.appender(&name).map_err(err)?;
     for chunk in ids.chunks(1 << 16) {
@@ -319,6 +394,7 @@ fn prepared(filters: &[crate::query::Filter]) -> Vec<PreparedFilter> {
 
 fn rows<T>(session: &Session, sql: &str, map: impl FnMut(&duckdb::Row<'_>) -> duckdb::Result<T>) -> Result<Vec<T>> {
     let conn = session.conn()?;
+    let _cancel = interruptible(&conn)?;
     let mut stmt = conn.prepare(sql).map_err(err)?;
     let mapped = stmt.query_map([], map).map_err(err)?;
     mapped.collect::<duckdb::Result<Vec<T>>>().map_err(err)
@@ -333,7 +409,7 @@ pub(crate) fn matches(src: &Source, pfs: &[PreparedFilter]) -> Option<Vec<usize>
 
 pub(crate) fn count(src: &Source, filters: &[crate::query::Filter]) -> Option<usize> {
     let pfs = prepared(filters);
-    with(src, |session| {
+    with_ready(src, base_page_safe(&pfs, ""), |session| {
         let scope = scope(session, src, &pfs)?;
         let counted = rows(
             session,
@@ -393,7 +469,7 @@ fn stats_of(scope: &Scope) -> Result<Stats> {
 }
 
 pub(crate) fn stats(src: &Source, pfs: &[PreparedFilter]) -> Option<Stats> {
-    with(src, |session| stats_of(&scope(session, src, pfs)?))
+    with_ready(src, base_page_safe(pfs, ""), |session| stats_of(&scope(session, src, pfs)?))
 }
 
 // ---------------------------------------------------------------- groups
@@ -451,6 +527,9 @@ fn aggregate_of(scope: &Scope, group: &str, specs: &[AggSpec]) -> Result<AggResu
     let meta = is_meta_column(group) && specs.iter().all(|s| is_meta_column(&s.column));
     let mut names = false;
     let (key, time) = key_of(scope, group, meta, &mut names)?;
+    if !time && !specs.is_empty() && specs.iter().all(|spec| spec.func == "count") {
+        return count_groups(scope, group, specs, &key, names);
+    }
     let mut inner = vec!["id".to_string(), format!("{key} AS k")];
     let mut outer = vec!["k".to_string(), "count(*)".to_string()];
     let mut kinds = Vec::with_capacity(specs.len());
@@ -507,10 +586,11 @@ fn aggregate_of(scope: &Scope, group: &str, specs: &[AggSpec]) -> Result<AggResu
     }
     let from = scope.from(names);
     let sql = format!(
-        "SELECT {} FROM (SELECT {} FROM {from} WHERE {}) GROUP BY k",
+        "SELECT {} FROM (SELECT {} FROM {from} WHERE {}) GROUP BY k LIMIT {}",
         outer.join(", "),
         inner.join(", "),
-        scope.cond
+        scope.cond,
+        crate::query::MAX_GROUPS + 1,
     );
     let mut failure = None;
     let grouped = rows(scope.session, &sql, |r| {
@@ -547,6 +627,9 @@ fn aggregate_of(scope: &Scope, group: &str, specs: &[AggSpec]) -> Result<AggResu
         }
         Ok((key, accs))
     })?;
+    if grouped.len() > crate::query::MAX_GROUPS {
+        return Ok(AggResult::budget_error());
+    }
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::with_capacity(grouped.len());
     let mut order = Vec::with_capacity(grouped.len());
     for (key, accs) in grouped {
@@ -579,8 +662,41 @@ fn aggregate_of(scope: &Scope, group: &str, specs: &[AggSpec]) -> Result<AggResu
     Ok(build_agg_result(groups, order, group, specs))
 }
 
+/// Facets are count-only. Rank/cap their groups before crossing the database
+/// boundary; the exact omitted group/record counts stay available to the UI.
+fn count_groups(scope: &Scope, group: &str, specs: &[AggSpec], key: &str, names: bool) -> Result<AggResult> {
+    let from = scope.from(names);
+    let limit = crate::query::MAX_GROUPS;
+    let sql = format!(
+        "WITH grouped AS (SELECT {key} AS k, count(*)::BIGINT AS n FROM {from} WHERE {} GROUP BY k) \
+         SELECT k, n, count(*) OVER (), CAST(sum(n) OVER () AS BIGINT) FROM grouped \
+         ORDER BY n DESC, (li_gkey(COALESCE(k, '')) IS NULL), li_gkey(COALESCE(k, '')), \
+         li_lower(COALESCE(k, '')), k NULLS FIRST LIMIT {limit}",
+        scope.cond,
+    );
+    let grouped = rows(scope.session, &sql, |row| Ok((
+        row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)? as u64,
+        row.get::<_, i64>(2)? as usize, row.get::<_, i64>(3)? as u64,
+    )))?;
+    let (mut all_groups, mut all_records, mut retained) = (0, 0u64, 0u64);
+    let mut groups = HashMap::with_capacity(grouped.len());
+    let mut order = Vec::with_capacity(grouped.len());
+    for (key, count, total_groups, total_records) in grouped {
+        all_groups = total_groups;
+        all_records = total_records;
+        retained += count;
+        order.push(key.clone());
+        groups.insert(key, specs.iter().map(|_| Acc::Count(count)).collect());
+    }
+    let mut result = build_agg_result(groups, order, group, specs);
+    result.omitted_groups = all_groups.saturating_sub(result.rows.len());
+    result.omitted_records = all_records.saturating_sub(retained);
+    Ok(result)
+}
+
 pub(crate) fn aggregate(src: &Source, pfs: &[PreparedFilter], group: &str, specs: &[AggSpec]) -> Option<AggResult> {
-    with(src, |session| aggregate_of(&scope(session, src, pfs)?, group, specs))
+    let base_allowed = base_page_safe(pfs, group) && specs.iter().all(|spec| spec.func == "count" || base_field(&spec.column));
+    with_ready(src, base_allowed, |session| aggregate_of(&scope(session, src, pfs)?, group, specs))
 }
 
 fn count_spec() -> [AggSpec; 1] {
@@ -597,7 +713,8 @@ pub(crate) fn multi_count(
     filters: &[crate::query::Filter],
     columns: &[String],
 ) -> Option<Vec<(String, AggResult)>> {
-    with(src, |session| {
+    let base_allowed = base_page_safe(&prepared(filters), "") && columns.iter().all(|column| base_field(column));
+    with_ready(src, base_allowed, |session| {
         let mut out = Vec::with_capacity(columns.len());
         for column in columns {
             crate::operations::check()?;
@@ -611,6 +728,274 @@ pub(crate) fn multi_count(
 }
 
 // ---------------------------------------------------------------- pages
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum CursorKey {
+    Integer(i64),
+    Text(String),
+}
+
+impl CursorKey {
+    fn sql(&self) -> String {
+        match self {
+            Self::Integer(value) => value.to_string(),
+            Self::Text(value) => lit(value),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct PageCursor {
+    version: u8,
+    fingerprint: String,
+    position: usize,
+    keys: Vec<CursorKey>,
+}
+
+struct SortKey {
+    sql: String,
+    desc: bool,
+    text: bool,
+}
+
+fn page_sort(scope: &Scope, column: &str, dir: &str) -> Result<(Vec<SortKey>, bool)> {
+    let desc = dir == "desc";
+    let int = |sql: String, desc| SortKey { sql, desc, text: false };
+    let mut names = false;
+    let mut keys = match column {
+        "" => vec![int("id".into(), false)],
+        "id" => vec![int("id".into(), desc)],
+        "timestamp" => vec![int("COALESCE(ts, 0)".into(), desc)],
+        "level" => vec![int("CAST(lvl AS BIGINT)".into(), desc)],
+        column => {
+            let value = scope.session.schema.column(column, &mut names).ok_or("Ordenação pelo texto bruto.")?;
+            vec![
+                int(format!("CAST(li_nkey({value}) IS NULL AS BIGINT)"), desc),
+                int(format!("COALESCE(li_nkey({value}), 0)"), desc),
+                SortKey { sql: format!("li_lower(COALESCE({value}, ''))"), desc, text: true },
+            ]
+        }
+    };
+    if !matches!(column, "" | "id") {
+        keys.push(int("id".into(), false));
+    }
+    Ok((keys, names))
+}
+
+/// Lexicographic seek using non-null sort keys and the same final id tie-break
+/// as the exact page API. Sort directions can differ (descending time, id asc).
+fn after_cursor(sort: &[SortKey], keys: &[CursorKey]) -> Result<String> {
+    if keys.len() != sort.len() || keys.iter().zip(sort).any(|(key, sort)| matches!(key, CursorKey::Text(_)) != sort.text) {
+        return Err("PAGINATION_RESET_REQUIRED: Cursor de paginação inválido. Recarregue os registros.".into());
+    }
+    let mut prefix = Vec::new();
+    let mut alternatives = Vec::new();
+    for (sort, key) in sort.iter().zip(keys) {
+        let bound = key.sql();
+        let mut terms = prefix.clone();
+        terms.push(format!("{} {} {bound}", sort.sql, if sort.desc { "<" } else { ">" }));
+        alternatives.push(format!("({})", terms.join(" AND ")));
+        prefix.push(format!("{} = {bound}", sort.sql));
+    }
+    Ok(format!("({})", alternatives.join(" OR ")))
+}
+
+#[cfg(test)]
+mod interactive_contract_tests {
+    use super::*;
+
+    fn filters(column: &str, op: &str, value: &str) -> Vec<PreparedFilter> {
+        crate::query::prepare(&[crate::query::Filter { column: column.into(), op: op.into(), value: value.into(), value2: None }])
+    }
+
+    #[test]
+    fn base_capability_proof_excludes_derived_and_unscoped_semantics() {
+        assert!(base_page_safe(&filters("timestamp", "gte", "1000"), "timestamp"));
+        assert!(base_page_safe(&filters("_all", "query", "source:api AND code:404"), "timestamp"));
+        for (column, op, value) in [
+            ("_all", "query", "timeout"), ("_all", "query", "source:api OR custom:x"),
+            ("custom", "equals_exact", "x"), ("@user", "equals", "root"),
+            ("name", "contains", "logon"), ("_all", "contains", "error"),
+            ("source", "detection", "anything"),
+        ] { assert!(!base_page_safe(&filters(column, op, value), "timestamp"), "{column} {op} {value}"); }
+        assert!(!base_page_safe(&[], "custom"));
+    }
+
+    #[test]
+    fn cursor_keys_are_typed_and_sql_literals_are_escaped() {
+        let sort = vec![SortKey { sql: "value".into(), desc: true, text: true }, SortKey { sql: "id".into(), desc: false, text: false }];
+        let clause = after_cursor(&sort, &[CursorKey::Text("O'Reilly".into()), CursorKey::Integer(7)]).unwrap();
+        assert!(clause.contains("value < 'O''Reilly'"));
+        assert!(clause.contains("value = 'O''Reilly' AND id > 7"));
+        assert!(after_cursor(&sort, &[CursorKey::Integer(7), CursorKey::Integer(7)]).is_err());
+        assert!(after_cursor(&sort, &[]).is_err());
+    }
+
+    #[test]
+    fn named_cancel_interrupts_sql_and_cannot_poison_reused_connection() {
+        let connection = duckdb::Connection::open_in_memory().unwrap();
+        let token = crate::operations::token(Some("duckdb-cancel-query-test".into())).unwrap();
+        let (ready, started) = std::sync::mpsc::channel();
+        let cancel = std::thread::spawn(move || {
+            started.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(crate::operations::cancel_id("duckdb-cancel-query-test"));
+        });
+        let result = crate::operations::run_with_token(token, || {
+            let _watch = interruptible(&connection).unwrap();
+            ready.send(()).unwrap();
+            connection.query_row("SELECT sum(sqrt(i::DOUBLE)) FROM range(1000000000000) t(i)", [], |row| row.get::<_, f64>(0))
+        });
+        cancel.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(connection.query_row("SELECT 7", [], |row| row.get::<_, i64>(0)).unwrap(), 7);
+    }
+}
+
+fn base_field(name: &str) -> bool {
+    matches!(name, "id" | "event_ref" | "timestamp" | "level" | "source" | "code" | "message")
+}
+
+fn base_expression(expr: &crate::querylang::Expr) -> bool {
+    use crate::querylang::{Expr, TermKind};
+    match expr {
+        Expr::All => true,
+        Expr::And(items) | Expr::Or(items) => items.iter().all(base_expression),
+        Expr::Not(inner) => base_expression(inner),
+        Expr::Term(term) => !matches!(term.kind(), TermKind::Event)
+            && term.field().is_some_and(|(name, role, _)| role.is_none() && base_field(name)),
+    }
+}
+
+/// Derived fields are hydrated from the current definitions after selection.
+/// Only predicates/sorts proven independent of them may use the base store.
+pub(crate) fn base_page_safe(pfs: &[PreparedFilter], sort: &str) -> bool {
+    (sort.is_empty() || base_field(sort)) && pfs.iter().all(|pf| {
+        match pf.f.op.as_str() {
+            "query" => pf.expr.as_ref().is_some_and(base_expression),
+            "threat_rule" | "detection" => false,
+            _ => base_field(&pf.f.column),
+        }
+    })
+}
+
+/// Page-size work in Rust and no mandatory COUNT. Returns None only when no
+/// suitable store is ready; the caller can explicitly report the line fallback.
+pub(crate) fn query_page(
+    src: &Source,
+    pfs: &[PreparedFilter],
+    sort_column: &str,
+    sort_dir: &str,
+    offset: usize,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Option<Result<crate::query::QueryPage>> {
+    for part in &src.idx.parts {
+        if let Err(error) = crate::sources::validate_source(part) { return Some(Err(error)); }
+    }
+    if sort_column == "raw" { return None; }
+    let limit = limit.clamp(1, 2_000);
+    let base_safe = base_page_safe(pfs, sort_column);
+    let session = ready_session(src, base_safe)?;
+    let _names = session.names_guard();
+    Some((|| {
+        crate::operations::check()?;
+        let source_key = super::spec(src.idx, src.codes, src.system, if base_safe { &[] } else { src.derived })
+            .ok_or("Fonte indisponível para paginação.")?.key;
+        let filters: Vec<_> = pfs.iter().map(|pf| &pf.f).collect();
+        let mut hash = Sha256::new();
+        hash.update(source_key);
+        hash.update(super::catalogs_signature(src.codes, src.system));
+        hash.update(serde_json::to_vec(&(filters, sort_column, sort_dir)).map_err(err)?);
+        let fingerprint = format!("{:x}", hash.finalize());
+        let (scope, exact) = page_scope(&session, src, pfs)?;
+        let (sort, names) = page_sort(&scope, sort_column, sort_dir)?;
+        let (after, position) = match cursor {
+            Some(value) => {
+                if value.len() > 1_100_000 {
+                    return Err("PAGINATION_RESET_REQUIRED: Cursor de paginação excede o limite.".into());
+                }
+                let cursor: PageCursor = serde_json::from_str(value).map_err(|_| "PAGINATION_RESET_REQUIRED: Cursor de paginação inválido.".to_string())?;
+                if cursor.version != 1 || cursor.fingerprint != fingerprint {
+                    return Err("PAGINATION_RESET_REQUIRED: A consulta mudou. Recarregue a primeira página.".into());
+                }
+                if cursor.position > src.idx.lines.len() {
+                    return Err("PAGINATION_RESET_REQUIRED: Posição de paginação inválida.".into());
+                }
+                (after_cursor(&sort, &cursor.keys)?, cursor.position)
+            }
+            None => ("TRUE".into(), offset),
+        };
+        let order = sort.iter().map(|key| format!("{} {}", key.sql, if key.desc { "DESC" } else { "ASC" })).collect::<Vec<_>>().join(", ");
+        let projection = sort.iter().map(|key| key.sql.as_str()).collect::<Vec<_>>().join(", ");
+        let mut offset_sql = if cursor.is_some() || !exact { 0 } else { offset };
+        let mut skip_matches = if cursor.is_none() && !exact { offset } else { 0 };
+        let mut seek = after;
+        let mut found = Vec::new();
+        let batch_size = if exact { limit.saturating_add(1) } else { limit.saturating_add(1).max(1_024) };
+        loop {
+            crate::operations::check()?;
+            let sql = format!("SELECT id, {projection} FROM {} WHERE ({}) AND {seek} ORDER BY {order} LIMIT {batch_size} OFFSET {offset_sql}", scope.from(names), scope.cond);
+            let candidates = rows(&session, &sql, |row| {
+                let id = row.get::<_, i64>(0)? as usize;
+                let keys = sort.iter().enumerate().map(|(i, key)| {
+                    if key.text { row.get::<_, String>(i + 1).map(CursorKey::Text) }
+                    else { row.get::<_, i64>(i + 1).map(CursorKey::Integer) }
+                }).collect::<duckdb::Result<Vec<_>>>()?;
+                Ok((id, keys))
+            })?;
+            let exhausted = candidates.len() < batch_size;
+            let last_keys = candidates.last().map(|(_, keys)| keys.clone());
+            for candidate in candidates {
+                crate::operations::check()?;
+                if !exact {
+                    let event = src.event(candidate.0);
+                    if !pfs.iter().all(|pf| crate::query::matches(&event, pf)) { continue; }
+                }
+                if skip_matches > 0 { skip_matches -= 1; continue; }
+                found.push(candidate);
+                if found.len() > limit { break; }
+            }
+            if found.len() > limit || exhausted { break; }
+            let Some(keys) = last_keys else { break };
+            seek = after_cursor(&sort, &keys)?;
+            offset_sql = 0;
+        }
+        crate::operations::check()?;
+        let has_more = found.len() > limit;
+        found.truncate(limit);
+        let next_cursor = if has_more {
+            found.last().map(|(_, keys)| serde_json::to_string(&PageCursor { version: 1, fingerprint, position: position.saturating_add(found.len()), keys: keys.clone() }).map_err(err)).transpose()?
+        } else { None };
+        let total = if pfs.is_empty() { Some(src.idx.lines.len()) }
+            else if !has_more && (position == 0 || !found.is_empty()) { Some(position.saturating_add(found.len())) }
+            else { None };
+        let rows = page_rows(src, found.into_iter().map(|(id, _)| id).collect());
+        crate::operations::check()?;
+        Ok(crate::query::QueryPage {
+            rows, total, has_more, next_cursor, engine: "columnar".into(),
+            warning: (!exact).then(|| "Este filtro exige confirmação nos registros; consultas amplas podem demorar mais.".into()),
+        })
+    })())
+}
+
+/// Reproducible test/benchmark diagnostics of the actual interactive SQL path.
+/// This is intentionally not a desktop command or an automatic full-data probe.
+pub(crate) fn explain_page(
+    src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str,
+    limit: usize, analyze: bool,
+) -> Option<Result<Value>> {
+    let session = ready_session(src, base_page_safe(pfs, sort_column))?;
+    let _names = session.names_guard();
+    Some((|| {
+        let (scope, exact) = page_scope(&session, src, pfs)?;
+        let (sort, names) = page_sort(&scope, sort_column, sort_dir)?;
+        let order = sort.iter().map(|key| format!("{} {}", key.sql, if key.desc { "DESC" } else { "ASC" })).collect::<Vec<_>>().join(", ");
+        let sql = format!("SELECT id FROM {} WHERE {} ORDER BY {order} LIMIT {}", scope.from(names), scope.cond, limit.clamp(1, 2_000));
+        let plan = rows(&session, &format!("EXPLAIN {}{sql}", if analyze { "ANALYZE " } else { "" }), |row| row.get::<_, String>(1))?.join("\n");
+        Ok(serde_json::json!({ "sql": sql, "plan": plan, "analyzed": analyze, "exactPredicate": exact }))
+    })())
+}
 
 fn page_ids(scope: &Scope, sort_column: &str, sort_dir: &str, offset: usize, limit: usize) -> Result<(usize, Vec<usize>)> {
     let dir = if sort_dir == "desc" { "DESC" } else { "ASC" };

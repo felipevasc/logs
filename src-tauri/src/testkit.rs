@@ -7,6 +7,13 @@ use crate::query::{self, AggSpec, Filter};
 use crate::sources::{event_at, CompiledDerived, FileIndex};
 use serde_json::Value;
 
+/// Initialize the same coordinated parser pool as the desktop before any
+/// benchmark/fixture work can initialize Rayon's unrestricted default pool.
+pub fn init_resources() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(crate::resources::init);
+}
+
 /// Loads a file as the app does (packages, spreadsheets, encodings, detected
 /// format) and returns the detected format and every event.
 pub fn load(path: &str) -> Result<(String, Vec<Event>), String> {
@@ -53,6 +60,7 @@ impl Source {
     /// `codes` is a catalog in the app's JSON format; `derived` a list of
     /// derived fields as saved by the app.
     pub fn open(paths: &[&str], codes: &str, derived: &str) -> Result<Source, String> {
+        init_resources();
         let mut idx: Option<FileIndex> = None;
         for path in paths {
             let part = crate::index_source_file(path, "auto", None)?;
@@ -99,6 +107,12 @@ impl Source {
     pub fn prepare(&self) -> Result<(), String> {
         crate::engine::set_enabled(true);
         crate::engine::prepare(&self.idx, &self.codes, &self.system, &self.derived, &|_, _| {})
+    }
+
+    /// Deterministic pending-derived fixture: only immutable base stores exist.
+    pub fn prepare_base(&self) -> Result<(), String> {
+        crate::engine::set_enabled(true);
+        crate::engine::prepare(&self.idx, &self.codes, &self.system, &[], &|_, _| {})
     }
 
     fn engine(&self) -> crate::engine::Source<'_> {
@@ -163,6 +177,33 @@ impl Source {
                 ))
             }),
         }
+    }
+
+    /// Interactive page benchmark/parity entry point. Requires an indexed
+    /// answer, so benchmark runs never silently measure a line fallback.
+    pub fn page(&self, filters: &str, sort: &str, dir: &str, offset: usize, limit: usize, cursor: Option<&str>) -> Value {
+        self.try_page(filters, sort, dir, offset, limit, cursor).expect("interactive page")
+    }
+
+    pub fn try_page(&self, filters: &str, sort: &str, dir: &str, offset: usize, limit: usize, cursor: Option<&str>) -> Result<Value, String> {
+        let filters: Vec<Filter> = parse(filters);
+        Self::columnar("page", crate::engine::query_page(
+            &self.engine(), &query::prepare(&filters), sort, dir, offset, limit, cursor,
+        )).map(json)
+    }
+
+    pub fn recovery_page(&self, filters: &str, sort: &str, dir: &str, offset: usize, limit: usize) -> Result<Value, String> {
+        let filters: Vec<Filter> = parse(filters);
+        query::query_page_lines(&self.idx, &filters, sort, dir, offset, limit, &self.codes, &self.system, &self.derived).map(json)
+    }
+
+    pub fn engine_status(&self) -> Value {
+        json(crate::engine::status(&self.idx, &self.codes, &self.system, &self.derived))
+    }
+
+    pub fn explain_page(&self, filters: &str, sort: &str, dir: &str, limit: usize, analyze: bool) -> Result<Value, String> {
+        let filters: Vec<Filter> = parse(filters);
+        Self::columnar("explain page", crate::engine::explain_page(&self.engine(), &query::prepare(&filters), sort, dir, limit, analyze))
     }
 
     pub fn explore(&self, engine: Engine, filters: &str, sort: &str, dir: &str) -> Value {

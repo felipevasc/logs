@@ -76,6 +76,24 @@ fn state_for(source: crate::SourceData) -> crate::AppState {
 }
 
 #[test]
+#[cfg(unix)]
+fn checked_dataset_boundary_rejects_truncation_before_legacy_fallback() {
+    let fixture = Fixture::new("{\"timestamp\":1700000000000,\"message\":\"original log record\"}\n");
+    let state = state_for(crate::SourceData::Indexed(fixture.index("jsonl")));
+    crate::validate_current_source(&state).unwrap();
+    std::fs::OpenOptions::new().write(true).open(&fixture.0).unwrap().set_len(0).unwrap();
+    // Equivalent to the offload_source/run_source boundary used by count,
+    // histogram and aggregation commands: no stale mmap recovery may start.
+    let mut entered = false;
+    let result = crate::validate_current_source(&state).map(|()| {
+        entered = true;
+        crate::count_filtered_impl(&state, vec![], None)
+    });
+    assert!(result.is_err());
+    assert!(!entered);
+}
+
+#[test]
 fn security_memory_index_and_projection_have_identical_evidence() {
     let lines=(0..5).map(|i|serde_json::json!({"timestamp":1700000000000i64+i*1000,"event.category":"process","event.action":"process_start","event.outcome":"success","host.name":"host","process.command_line":if i==4 {"sekurlsa::logonpasswords"}else{"worker --job completed"}}).to_string()).collect::<Vec<_>>().join("\n");
     let fixture=Fixture::new(&lines);let idx=fixture.index("jsonl");let codes=CodesConfig::default();

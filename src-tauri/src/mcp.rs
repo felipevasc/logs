@@ -1011,6 +1011,18 @@ impl LogInsightMcp {
         from_domain(result.and_then(|v| v))
     }
 
+    /// Current-source readers cannot recover by touching a stale/truncated mmap.
+    async fn run_source<T, F>(&self, f: F) -> Result<CallToolResult, McpError>
+    where
+        T: Serialize + Send + 'static,
+        F: FnOnce(&AppState) -> T + Send + 'static,
+    {
+        self.run_domain(move |state| {
+            crate::validate_current_source(state)?;
+            Ok(f(state))
+        }).await
+    }
+
     /// Igual a `run_domain`, mas passa também o AppHandle (progresso para a UI).
     async fn run_domain_app<T, F>(&self, f: F) -> Result<CallToolResult, McpError>
     where
@@ -1142,7 +1154,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run(move |state| {
+        self.run_source(move |state| {
             crate::query_events_impl(
                 state,
                 p.filters,
@@ -1163,7 +1175,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<EventDetailParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |state| crate::event_detail_impl(state, p.id))
+        self.run_source(move |state| crate::event_detail_impl(state, p.id))
             .await
     }
 
@@ -1176,22 +1188,18 @@ impl LogInsightMcp {
         Parameters(p): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        let app = self.app.clone();
-        let snapshot = tokio::task::spawn_blocking(move || {
-            let state = app.state::<AppState>();
-            crate::explore_snapshot_impl(
-                state.inner(),
+        self.run_domain_app(move |state, app| {
+            crate::validate_current_source(state)?;
+            Ok(crate::explore_snapshot_impl(
+                state,
                 p.filters,
                 &p.sort_column,
                 &p.sort_dir,
                 p.offset,
                 p.limit,
-                Some(&app),
-            )
-        })
-        .await
-        .map_err(join_err)?;
-        ok_json(&snapshot)
+                Some(app),
+            ))
+        }).await
     }
 
     #[tool(
@@ -1203,7 +1211,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<AggregateParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run(move |state| {
+        self.run_source(move |state| {
             crate::aggregate_events_impl(state, &p.group_column, p.aggs, p.filters, None)
         })
         .await
@@ -1218,7 +1226,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<TrailParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run(move |state| {
+        self.run_source(move |state| {
             crate::trail_events_impl(state, p.center_id, p.before, p.after, p.filters, None)
         })
         .await
@@ -1233,7 +1241,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<FiltersParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run(move |state| crate::count_filtered_impl(state, p.filters, None))
+        self.run_source(move |state| crate::count_filtered_impl(state, p.filters, None))
             .await
     }
 
@@ -1246,7 +1254,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<TreeAggsParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run(move |state| crate::tree_aggs_impl(state, p.columns, p.filters, None))
+        self.run_source(move |state| crate::tree_aggs_impl(state, p.columns, p.filters, None))
             .await
     }
 
@@ -1259,7 +1267,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<FiltersParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run(move |state| crate::stats_events_impl(state, p.filters))
+        self.run_source(move |state| crate::stats_events_impl(state, p.filters))
             .await
     }
 
@@ -1274,7 +1282,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<FiltersParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run(move |state| crate::profile_fields_impl(state, p.filters, None))
+        self.run_source(move |state| crate::profile_fields_impl(state, p.filters, None))
             .await
     }
 
@@ -1287,7 +1295,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<ComputeSeriesParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run(move |state| crate::compute_series_impl(state, p.filters, None, p.spec))
+        self.run_source(move |state| crate::compute_series_impl(state, p.filters, None, p.spec))
             .await
     }
 
@@ -1300,7 +1308,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<PivotParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run(move |state| crate::pivot_impl(state, p.filters, None, p.spec))
+        self.run_source(move |state| crate::pivot_impl(state, p.filters, None, p.spec))
             .await
     }
 
@@ -1542,7 +1550,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<DiscoverPatternsParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run(move |state| crate::discover_patterns_impl(state, p.filters, None))
+        self.run_source(move |state| crate::discover_patterns_impl(state, p.filters, None))
             .await
     }
 
@@ -1713,7 +1721,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<JourneyFieldsParams>,
     ) -> Result<CallToolResult, McpError> {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        from_domain(crate::journeys::journey_fields(p.filters, None, None, self.app.clone()).await)
+        from_domain(crate::journeys::journey_fields(p.filters, None, None, self.app.clone(), None).await)
     }
 
     #[tool(
@@ -1738,6 +1746,7 @@ impl LogInsightMcp {
                 p.from,
                 p.to,
                 self.app.clone(),
+                None,
             )
             .await,
         )
@@ -1764,6 +1773,7 @@ impl LogInsightMcp {
                 p.offset,
                 p.limit,
                 self.app.clone(),
+                None,
             )
             .await,
         )
@@ -1787,7 +1797,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<RemoteTestParams>,
     ) -> Result<CallToolResult, McpError> {
-        from_domain(crate::remote::remote_test(p.connection.into(), p.password).await)
+        from_domain(crate::remote::remote_test(p.connection.into(), p.password, None).await)
     }
 
     #[tool(
@@ -1805,6 +1815,7 @@ impl LogInsightMcp {
                 p.from,
                 p.to,
                 self.app.clone(),
+                None,
             )
             .await,
         )

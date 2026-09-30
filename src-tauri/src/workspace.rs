@@ -27,8 +27,9 @@ pub enum ImportSource {
 pub async fn load_bundle(
     members: Vec<ImportSource>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<crate::LoadSummary, String> {
-    crate::offload(move || {
+    crate::offload_operation(operation_id, move || {
         let mut combined: Option<sources::FileIndex> = None;
         let mut names = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -522,9 +523,10 @@ pub async fn timeline_range(
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
     app: AppHandle,
+    operation_id: Option<String>,
 ) -> Result<TimelineRange, String> {
     let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    crate::offload_source(operation_id, app.clone(), case_events.is_none(), move || {
         if case_events.is_none() {
             return timeline_range_impl(
                 app.state::<AppState>().inner(),

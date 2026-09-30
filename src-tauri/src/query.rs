@@ -38,6 +38,14 @@ pub struct PreparedFilter {
     detection: Option<(std::sync::Arc<crate::detections::RuleSet>, usize)>,
 }
 
+impl PreparedFilter {
+    /// Parsed numeric bounds, shared with the SQL compiler so native range
+    /// predicates use exactly the same timestamp/unit parsing as the reader.
+    pub(crate) fn numeric_bounds(&self) -> (Option<f64>, Option<f64>) {
+        (self.num, self.num2)
+    }
+}
+
 /// Values of an `in` filter: one per line (commas also separate).
 pub fn list_values(value: &str) -> impl Iterator<Item = &str> {
     value
@@ -107,6 +115,33 @@ pub struct QueryResult {
     pub rows: Vec<Event>,
 }
 
+/// Interactive pages do not wait for an exact global count. The exact APIs
+/// remain available to analytics, exports and MCP callers.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryPage {
+    pub rows: Vec<Event>,
+    pub total: Option<usize>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub engine: String,
+    pub warning: Option<String>,
+}
+
+impl QueryPage {
+    pub(crate) fn from_exact(result: QueryResult, offset: usize, engine: &str, warning: Option<String>) -> Self {
+        let has_more = offset.saturating_add(result.rows.len()) < result.total;
+        Self {
+            rows: result.rows,
+            total: Some(result.total),
+            has_more,
+            next_cursor: None,
+            engine: engine.into(),
+            warning,
+        }
+    }
+}
+
 #[derive(Serialize, Default)]
 pub struct AggResult {
     pub columns: Vec<String>,
@@ -119,6 +154,19 @@ pub struct AggResult {
     pub omitted_groups: usize,
     /// Records counted in the omitted groups, when a count is among the measures.
     pub omitted_records: u64,
+    /// Explicit bounded-work failure. Never publish a partial aggregate as exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl AggResult {
+    pub(crate) fn budget_error() -> Self {
+        Self { error: Some("Agrupamento excede o orçamento de grupos. Reduza o período/filtros, escolha um campo menos distinto ou use uma contagem simples.".into()), ..Self::default() }
+    }
+}
+
+fn group_budget(specs: &[AggSpec]) -> usize {
+    if !specs.is_empty() && specs.iter().all(|spec| spec.func == "count") { MAX_GROUPS * 2 } else { MAX_GROUPS }
 }
 
 /// Groups returned at most. Values with millions of distinct groups (ids,
@@ -291,6 +339,17 @@ pub fn filtered_indices(events: &[Event], filters: &[Filter]) -> Vec<usize> {
         .collect()
 }
 
+pub(crate) fn count_memory(events: &[Event], filters: &[Filter]) -> usize {
+    let pfs = prepare(filters);
+    events.iter().take_while(|_| !crate::operations::cancelled()).filter(|event| pfs.iter().all(|pf| matches(event, pf))).count()
+}
+
+pub(crate) fn count_lines(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> usize {
+    let mut count = 0usize;
+    scan_indexed(idx, &prepare(filters), codes, system, derived, |_, _, _| (), |()| count += 1);
+    count
+}
+
 pub fn sort_indices(events: &[Event], indices: &mut [usize], column: &str, desc: bool) {
     // Pré-computa a chave (número opcional + texto em minúsculas) uma vez por
     // linha; o comparador anterior realocava as strings a cada comparação.
@@ -393,6 +452,7 @@ fn aggregate_from_memory_matches(
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order = Vec::new();
     for &i in matched {
+        if groups.len() > group_budget(specs) { return AggResult::budget_error(); }
         if crate::operations::cancelled() {
             break;
         }
@@ -821,9 +881,9 @@ pub(crate) fn visit_indexed_mapped<T: Send>(
 ) {
     let mut ids = Vec::new();
     visit_indexed_prepared(idx, pfs, codes, system, derived, |i| ids.push(i));
-    let generation = crate::operations::current_generation();
+    let cancellation = crate::operations::current_token();
     for chunk in ids.chunks(8192) {
-        if crate::operations::cancelled_for(generation) {
+        if cancellation.cancelled() {
             return;
         }
         let events: Vec<(Event, T)> = chunk
@@ -858,11 +918,11 @@ pub(crate) fn scan_indexed<T: Send>(
         .iter()
         .map(|pf| query_needs_enrichment(pf, codes, system, derived))
         .collect();
-    let generation = crate::operations::current_generation();
+    let cancellation = crate::operations::current_token();
     let chunk = |from: usize, to: usize| -> Vec<T> {
         let mut out = Vec::new();
         for i in from..to {
-            if (i - from) % 2048 == 0 && crate::operations::cancelled_for(generation) {
+            if (i - from) % 2048 == 0 && cancellation.cancelled() {
                 break;
             }
             let meta = &idx.lines[i];
@@ -1005,6 +1065,130 @@ pub fn query_indexed(
         system,
         derived,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn query_page_indexed(
+    idx: &FileIndex,
+    filters: &[Filter],
+    sort_column: &str,
+    sort_dir: &str,
+    offset: usize,
+    limit: usize,
+    cursor: Option<&str>,
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> Result<QueryPage, String> {
+    if let Some(result) = crate::engine::query_page(
+        &engine_source(idx, codes, system, derived), &prepare(filters),
+        sort_column, sort_dir, offset, limit, cursor,
+    ) {
+        return result;
+    }
+    if cursor.is_some() {
+        return Err("PAGINATION_RESET_REQUIRED: O índice desta paginação não está disponível. Recarregue a primeira página para usar a recuperação.".into());
+    }
+    // Fallback remains explicit in the response; consumers can distinguish a
+    // ready indexed page from slower recovery while stores are being prepared.
+    query_page_lines(idx, filters, sort_column, sort_dir, offset, limit, codes, system, derived)
+}
+
+#[derive(Debug)]
+enum RecoveryKey {
+    Integer(i64),
+    Text(Option<f64>, String),
+}
+
+#[derive(Debug)]
+struct RecoveryRow { id: usize, key: RecoveryKey, desc: bool }
+
+impl RecoveryRow {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + match &self.key { RecoveryKey::Text(_, text) => text.len(), _ => 0 }
+    }
+}
+
+impl PartialEq for RecoveryRow { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
+impl Eq for RecoveryRow {}
+impl PartialOrd for RecoveryRow { fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) } }
+impl Ord for RecoveryRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let order = match (&self.key, &other.key) {
+            (RecoveryKey::Integer(a), RecoveryKey::Integer(b)) => a.cmp(b),
+            (RecoveryKey::Text(a, at), RecoveryKey::Text(b, bt)) => compare_sort_keys(*a, at, *b, bt),
+            _ => self.id.cmp(&other.id),
+        };
+        (if self.desc { order.reverse() } else { order }).then(self.id.cmp(&other.id))
+    }
+}
+
+/// Recovery is slower, but never allocates one id or sort key per matching
+/// event. Deep random access waits for the persistent index instead of risking
+/// a desktop OOM. Ordinary forward indexed navigation uses cursors above.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn query_page_lines(
+    idx: &FileIndex, filters: &[Filter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize, codes: &CodesConfig, system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> Result<QueryPage, String> {
+    for part in &idx.parts { crate::sources::validate_source(part)?; }
+    const WINDOW: usize = 10_000;
+    const KEY_BUDGET: usize = 32 << 20;
+    let keep = offset.saturating_add(limit).saturating_add(1);
+    if keep > WINDOW {
+        return Err("Navegação profunda aguarda o índice de consultas. Reduza o recorte ou conclua/repare a preparação.".into());
+    }
+    let pfs = prepare(filters);
+    let enriched: Vec<_> = pfs.iter().map(|pf| query_needs_enrichment(pf, codes, system, derived)).collect();
+    let mut selected: std::collections::BinaryHeap<RecoveryRow> = std::collections::BinaryHeap::new();
+    let (mut total, mut bytes) = (0usize, 0usize);
+    for i in 0..idx.lines.len() {
+        if i % 2048 == 0 { crate::operations::check()?; }
+        let meta = &idx.lines[i];
+        let line = line_bytes(idx, i);
+        let mut needs_event = false;
+        let mut eligible = true;
+        for (pf, enriched) in pfs.iter().zip(&enriched) {
+            match meta_check(pf, meta, line, *enriched) {
+                Tri::Fail => { eligible = false; break; }
+                Tri::NeedEvent => needs_event = true,
+                Tri::Pass => {}
+            }
+        }
+        if !eligible { continue; }
+        let mut event = needs_event.then(|| event_at(idx, i, codes, system, derived));
+        if event.as_ref().is_some_and(|event| !pfs.iter().all(|pf| matches(event, pf))) { continue; }
+        total += 1;
+        let key = match sort_column {
+            "" | "id" => RecoveryKey::Integer(i as i64),
+            "timestamp" => RecoveryKey::Integer(meta.ts),
+            "level" => RecoveryKey::Integer(meta.level as i64),
+            column => {
+                let event = event.get_or_insert_with(|| event_at(idx, i, codes, system, derived));
+                let text = event.col_ref(column).unwrap_or_default().to_lowercase();
+                if text.len() > KEY_BUDGET { return Err("Campo de ordenação excede o orçamento de recuperação. Escolha outra coluna ou conclua a preparação.".into()); }
+                RecoveryKey::Text(event.col_num(column), text)
+            }
+        };
+        let item = RecoveryRow { id: i, key, desc: !sort_column.is_empty() && sort_dir == "desc" };
+        if selected.len() < keep || selected.peek().is_some_and(|worst| item < *worst) {
+            if selected.len() == keep { bytes = bytes.saturating_sub(selected.pop().unwrap().bytes()); }
+            bytes = bytes.saturating_add(item.bytes());
+            if bytes > KEY_BUDGET { return Err("Ordenação excede o orçamento de recuperação. Reduza o recorte ou conclua a preparação.".into()); }
+            selected.push(item);
+        }
+    }
+    crate::operations::check()?;
+    let rows = selected.into_sorted_vec().into_iter().skip(offset).take(limit).map(|row| {
+        let mut event = event_at(idx, row.id, codes, system, derived);
+        crate::entities::annotate(&mut event);
+        event.raw.clear();
+        event
+    }).collect();
+    Ok(QueryPage::from_exact(QueryResult { total, rows }, offset, "lines", Some(
+        "Modo de recuperação: índice indisponível, leitura mais lenta e navegação limitada a 10 mil registros.".into(),
+    )))
 }
 
 fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
@@ -1187,7 +1371,7 @@ pub fn multi_count(
     filters: &[Filter],
     columns: &[String],
 ) -> Vec<(String, AggResult)> {
-    let generation = crate::operations::current_generation();
+    let cancellation = crate::operations::current_token();
     columns
         .par_iter()
         .map(|col| {
@@ -1208,10 +1392,7 @@ pub fn multi_count(
                     }],
                 )
             };
-            let agg = match generation {
-                Some(g) => crate::operations::run(g, run).unwrap_or_default(),
-                None => run(),
-            };
+            let agg = crate::operations::run_with_token(cancellation.clone(), run).unwrap_or_default();
             (col.clone(), agg)
         })
         .collect()
@@ -1229,7 +1410,7 @@ pub fn multi_count_indexed(
     if let Some(result) = crate::engine::multi_count(&engine_source(idx, codes, system, derived), filters, columns) {
         return result;
     }
-    let generation = crate::operations::current_generation();
+    let cancellation = crate::operations::current_token();
     columns
         .par_iter()
         .map(|col| {
@@ -1253,10 +1434,7 @@ pub fn multi_count_indexed(
                     derived,
                 )
             };
-            let agg = match generation {
-                Some(g) => crate::operations::run(g, run).unwrap_or_default(),
-                None => run(),
-            };
+            let agg = crate::operations::run_with_token(cancellation.clone(), run).unwrap_or_default();
             (col.clone(), agg)
         })
         .collect()
@@ -1268,6 +1446,7 @@ pub(crate) fn build_agg_result(
     group_column: &str,
     specs: &[AggSpec],
 ) -> AggResult {
+    if groups.len() > group_budget(specs) { return AggResult::budget_error(); }
     order.sort_by(|a, b| {
         let (sa, sb) = (a.as_deref().unwrap_or(""), b.as_deref().unwrap_or(""));
         compare_sort_keys(
@@ -1365,6 +1544,7 @@ pub(crate) fn build_agg_result(
         value_units,
         omitted_groups,
         omitted_records,
+        error: None,
     }
 }
 
@@ -1379,6 +1559,7 @@ pub fn aggregate(
     let mut order: Vec<Option<String>> = Vec::new();
 
     for i in idx {
+        if groups.len() > group_budget(specs) { return AggResult::budget_error(); }
         if crate::operations::cancelled() {
             break;
         }
@@ -1447,38 +1628,21 @@ pub fn aggregate_indexed(
     {
         return result;
     }
-    let matched = indexed_matches(idx, filters, codes, system, derived);
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order: Vec<Option<String>> = Vec::new();
-
-    // Caminho rápido: grupo e agregações só sobre colunas de metadados
-    // (timestamp, level, code) — zero parse por linha.
     let meta_only = is_meta_column(group_column) && specs.iter().all(|s| is_meta_column(&s.column));
-
-    for i in matched {
-        if crate::operations::cancelled() {
-            break;
+    let exceeded = std::sync::atomic::AtomicBool::new(false);
+    scan_indexed(idx, &prepare(filters), codes, system, derived, |i, _, event| {
+        if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+        Some(if meta_only { meta_event(idx, i) } else { event.unwrap_or_else(|| event_at(idx, i, codes, system, derived)) })
+    }, |event| {
+        if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return; }
+        if let Some(event) = event {
+            push_group(&mut groups, &mut order, &event, event.col_str(group_column), specs);
+            if groups.len() > group_budget(specs) { exceeded.store(true, std::sync::atomic::Ordering::Relaxed); }
         }
-        if meta_only {
-            let ev = meta_event(idx, i);
-            push_group(
-                &mut groups,
-                &mut order,
-                &ev,
-                ev.col_str(group_column),
-                specs,
-            );
-        } else {
-            let ev = event_at(idx, i, codes, system, derived);
-            push_group(
-                &mut groups,
-                &mut order,
-                &ev,
-                ev.col_str(group_column),
-                specs,
-            );
-        }
-    }
+    });
+    if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return AggResult::budget_error(); }
     build_agg_result(groups, order, group_column, specs)
 }
 
@@ -1569,6 +1733,7 @@ fn aggregate_from_indexed_matches(
     let meta_only =
         is_meta_column(group_column) && specs.iter().all(|spec| is_meta_column(&spec.column));
     for &i in matched {
+        if groups.len() > group_budget(specs) { return AggResult::budget_error(); }
         if crate::operations::cancelled() {
             break;
         }
@@ -1741,17 +1906,32 @@ pub fn stats_indexed(
     if let Some(stats) = crate::engine::stats(&engine_source(idx, codes, system, derived), &pfs) {
         return stats;
     }
-    // Level classes and index time, as the Explorer shows them, whether or
-    // not a filter needed the parsed event.
-    let mut matched: Vec<(Option<i64>, &'static str)> = Vec::new();
+    // Two bounded passes trade recovery CPU for predictable memory. No vector
+    // of timestamps/matches proportional to a 50M-row source is retained.
+    let (mut min_ts, mut max_ts) = (i64::MAX, i64::MIN);
+    let mut levels: HashMap<&'static str, i64> = HashMap::new();
     scan_indexed(
-        idx,
-        &pfs,
-        codes,
-        system,
-        derived,
-        |_, meta, _| ((meta.ts != 0).then_some(meta.ts), crate::model::class_label(meta.level)),
-        |item| matched.push(item),
+        idx, &pfs, codes, system, derived,
+        |_, meta, _| (meta.ts, crate::model::class_label(meta.level)),
+        |(ts, level)| {
+            *levels.entry(level).or_default() += 1;
+            if ts != 0 { min_ts = min_ts.min(ts); max_ts = max_ts.max(ts); }
+        },
     );
-    stats_from(matched.into_iter())
+    let (mut buckets, mut bucket_ms) = (Vec::new(), 0);
+    if min_ts <= max_ts && !crate::operations::cancelled() {
+        let count;
+        (bucket_ms, count) = stats_layout(min_ts, max_ts);
+        let mut counts = vec![0i64; count];
+        scan_indexed(idx, &pfs, codes, system, derived, |_, meta, _| meta.ts, |ts| {
+            if ts != 0 {
+                let bucket = (ts.saturating_sub(min_ts) / bucket_ms) as usize;
+                counts[bucket.min(count - 1)] += 1;
+            }
+        });
+        buckets = counts.into_iter().enumerate().map(|(i, n)| (min_ts.saturating_add((i as i64).saturating_mul(bucket_ms)), n)).collect();
+    }
+    let mut levels: Vec<_> = levels.into_iter().map(|(key, n)| (key.to_string(), n)).collect();
+    sort_levels(&mut levels);
+    build_stats(buckets, bucket_ms, levels)
 }

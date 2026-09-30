@@ -852,8 +852,9 @@ pub async fn remote_delete(id: String) -> Result<(), String> {
 pub async fn remote_test(
     connection: RemoteConfig,
     password: Option<String>,
+    operation_id: Option<String>,
 ) -> Result<TestResult, String> {
-    crate::offload(move || test_impl(&client_for(&crate::config_dir(), connection, password)?))
+    crate::offload_operation(operation_id, move || test_impl(&client_for(&crate::config_dir(), connection, password)?))
         .await?
 }
 #[tauri::command]
@@ -863,8 +864,9 @@ pub async fn remote_import(
     from: Option<String>,
     to: Option<String>,
     app: tauri::AppHandle,
+    operation_id: Option<String>,
 ) -> Result<ImportResult, String> {
-    crate::offload(move || {
+    crate::offload_operation(operation_id, move || {
         let root = crate::config_dir();
         import_impl(
             &client_for(&root, connection, password)?,

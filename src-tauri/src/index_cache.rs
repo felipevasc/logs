@@ -11,13 +11,22 @@ pub const INDEX_DIR: &str = "indexes-v6";
 /// Removes caches from previous parser versions and indexes unused for 30 days.
 pub fn prune() {
     let base = crate::config_dir();
-    for old in ["indexes", "indexes-v1", "indexes-v2", "indexes-v3", "indexes-v4", "indexes-v5"] {
+    for old in [
+        "indexes",
+        "indexes-v1",
+        "indexes-v2",
+        "indexes-v3",
+        "indexes-v4",
+        "indexes-v5",
+    ] {
         let _ = std::fs::remove_dir_all(base.join(old));
     }
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
     // Expanded packages and event-log snapshots are recreated on demand.
     for folder in ["expanded", "snapshots"] {
-        let Ok(entries) = std::fs::read_dir(base.join(folder)) else { continue };
+        let Ok(entries) = std::fs::read_dir(base.join(folder)) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let stale = entry
                 .metadata()
@@ -27,11 +36,17 @@ pub fn prune() {
             let pending = entry.file_name().to_string_lossy().contains("pending");
             if stale || pending {
                 let path = entry.path();
-                let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+                let _ = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
             }
         }
     }
-    let Ok(entries) = std::fs::read_dir(base.join(INDEX_DIR)) else { return };
+    let Ok(entries) = std::fs::read_dir(base.join(INDEX_DIR)) else {
+        return;
+    };
     for entry in entries.flatten() {
         let stale = entry
             .metadata()
@@ -88,6 +103,7 @@ pub fn open(
     let id = identity(path, &mmap);
     let mut hash = Sha256::new();
     hash.update(id.as_bytes());
+    hash.update(format!("{:?}", sources::file_identity(&file)));
     hash.update(format.as_bytes());
     if let Some(c) = &custom {
         match c {
@@ -102,11 +118,13 @@ pub fn open(
     let cache = dir.join(format!("{:x}.idx", hash.finalize()));
     if let Some((header, lines)) = read(&cache, mmap.len()) {
         if let Some(cb) = progress {
-            cb(lines.len(), lines.len());
+            cb(mmap.len(), mmap.len());
         }
         return Ok(FileIndex {
             parts: vec![FilePart {
                 path: path.into(),
+                physical_path: path.into(),
+                physical_file_id: sources::file_identity(&file),
                 file_name: PathBuf::from(path)
                     .file_name()
                     .unwrap_or_default()
@@ -120,7 +138,7 @@ pub fn open(
                 base: 0,
                 identity: id,
             }],
-            lines,
+            lines: std::sync::Arc::new(lines),
             columns: header.columns,
             time_order: std::sync::OnceLock::new(),
         });
@@ -209,4 +227,302 @@ fn write(path: &PathBuf, idx: &FileIndex) -> std::io::Result<()> {
     out.flush()?;
     drop(out);
     std::fs::rename(temp, path)
+}
+
+/// Corrected timestamps are cached only after the display path/file name have
+/// been restored: timestamp rules may explicitly read `arquivo` or `caminho`.
+fn timestamp_key(idx: &FileIndex) -> Option<String> {
+    let part = idx.parts.first()?;
+    let config = part.ts_config.as_ref()?;
+    let mut hash = Sha256::new();
+    hash.update(format!(
+        "timestamps-v1|{INDEX_DIR}|{}|{}|{}|{}|{}|{}|{:?}",
+        part.identity,
+        part.path,
+        part.file_name,
+        config.signature(),
+        chrono::Local::now().offset(),
+        idx.lines.len(),
+        part.physical_file_id
+    ));
+    Some(format!("{:x}", hash.finalize()))
+}
+
+/// Only for a newly constructed, unpublished index. A cancelled streaming
+/// restore drops this index; the currently loaded AppState is never mutated.
+/// The interactive retimestamp_index path keeps its existing atomic semantics.
+pub(crate) fn timestamps_on_load(
+    mut idx: FileIndex,
+    progress: Option<&(dyn Fn(&str, usize, usize) + Sync)>,
+) -> Result<FileIndex, String> {
+    let Some(key) = timestamp_key(&idx) else {
+        return Ok(idx);
+    };
+    if idx.parts.len() != 1 {
+        sources::retimestamp_index(
+            &mut idx,
+            Some(&|done, total| {
+                if let Some(report) = progress {
+                    report("Recalculando data/hora", done, total);
+                }
+            }),
+        )?;
+        return Ok(idx);
+    }
+    let path = crate::config_dir()
+        .join(INDEX_DIR)
+        .join(format!("timestamps-{key}.bin"));
+    timestamps_at(&mut idx, &path, progress)?;
+    Ok(idx)
+}
+
+fn timestamps_at(
+    idx: &mut FileIndex,
+    path: &std::path::Path,
+    progress: Option<&(dyn Fn(&str, usize, usize) + Sync)>,
+) -> Result<bool, String> {
+    sources::validate_source(&idx.parts[0])?;
+    if let Some(report) = progress {
+        report("Verificando cache de data/hora", 0, 0);
+    }
+    if restore_timestamps(idx, path, progress)? {
+        return Ok(true);
+    }
+    sources::retimestamp_index(
+        idx,
+        Some(&|done, total| {
+            if let Some(report) = progress {
+                report("Recalculando data/hora", done, total);
+            }
+        }),
+    )?;
+    sources::validate_source(&idx.parts[0])?;
+    crate::operations::check()?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // A cache write failure does not invalidate correctly computed timestamps.
+    // Cancellation still aborts the load rather than publishing partial work.
+    if let Err(error) = write_timestamps(idx, path, progress) {
+        eprintln!("[índice] cache de horários não gravado: {error}");
+    }
+    crate::operations::check()?;
+    sources::validate_source(&idx.parts[0])?;
+    Ok(false)
+}
+
+fn restore_timestamps(
+    idx: &mut FileIndex,
+    path: &std::path::Path,
+    progress: Option<&(dyn Fn(&str, usize, usize) + Sync)>,
+) -> Result<bool, String> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Ok(false);
+    };
+    let count = idx.lines.len();
+    let Some(payload_len) = count.checked_mul(8).and_then(|n| n.checked_add(80)) else {
+        return Ok(false);
+    };
+    let Some(expected) = payload_len.checked_add(32) else {
+        return Ok(false);
+    };
+    if !file.metadata().is_ok_and(|m| m.len() == expected as u64) {
+        return Ok(false);
+    }
+    let Ok(mapped) = (unsafe { memmap2::MmapOptions::new().map(&file) }) else {
+        return Ok(false);
+    };
+    if &mapped[..8] != b"LTSO0001"
+        || u64::from_le_bytes(mapped[8..16].try_into().unwrap()) != count as u64
+    {
+        return Ok(false);
+    }
+    let Some(key) = timestamp_key(idx) else {
+        return Ok(false);
+    };
+    if &mapped[16..80] != key.as_bytes() {
+        return Ok(false);
+    }
+    let mut hash = Sha256::new();
+    for bytes in mapped[..payload_len].chunks(1 << 20) {
+        crate::operations::check()?;
+        hash.update(bytes);
+    }
+    if hash.finalize().as_slice() != &mapped[payload_len..] {
+        return Ok(false);
+    }
+    let mut last_report = std::time::Instant::now();
+    // No additional full-length timestamp vector on a warm open. The mutable
+    // index belongs exclusively to this still-unpublished load transaction.
+    for (chunk_index, chunk) in std::sync::Arc::make_mut(&mut idx.lines)
+        .chunks_mut(8192)
+        .enumerate()
+    {
+        crate::operations::check()?;
+        let first = chunk_index * 8192;
+        for (i, line) in chunk.iter_mut().enumerate() {
+            let offset = 80 + (first + i) * 8;
+            line.ts = i64::from_le_bytes(mapped[offset..offset + 8].try_into().unwrap());
+        }
+        if last_report.elapsed() >= std::time::Duration::from_millis(150) {
+            if let Some(report) = progress {
+                report(
+                    "Reutilizando cache de data/hora",
+                    first + chunk.len(),
+                    count,
+                );
+            }
+            last_report = std::time::Instant::now();
+        }
+    }
+    sources::validate_source(&idx.parts[0])?;
+    crate::operations::check()?;
+    idx.time_order.take();
+    if let Some(report) = progress {
+        report("Reutilizando cache de data/hora", count, count);
+    }
+    Ok(true)
+}
+
+fn write_timestamps(
+    idx: &FileIndex,
+    path: &std::path::Path,
+    progress: Option<&(dyn Fn(&str, usize, usize) + Sync)>,
+) -> Result<(), String> {
+    if let Some(report) = progress {
+        report("Gravando cache de data/hora", 0, idx.lines.len());
+    }
+    let temporary = path.with_extension(format!("{}.pending", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut out = BufWriter::with_capacity(
+            1 << 20,
+            std::fs::File::create(&temporary).map_err(|e| e.to_string())?,
+        );
+        let mut hash = Sha256::new();
+        let mut header = Vec::from(&b"LTSO0001"[..]);
+        header.extend_from_slice(&(idx.lines.len() as u64).to_le_bytes());
+        header.extend_from_slice(
+            timestamp_key(idx)
+                .ok_or("Configuração de data/hora ausente.")?
+                .as_bytes(),
+        );
+        out.write_all(&header).map_err(|e| e.to_string())?;
+        hash.update(&header);
+        let mut bytes = Vec::with_capacity(8192 * 8);
+        let mut last_report = std::time::Instant::now();
+        for (index, chunk) in idx.lines.chunks(8192).enumerate() {
+            crate::operations::check()?;
+            bytes.clear();
+            for line in chunk {
+                bytes.extend_from_slice(&line.ts.to_le_bytes());
+            }
+            out.write_all(&bytes).map_err(|e| e.to_string())?;
+            hash.update(&bytes);
+            if last_report.elapsed() >= std::time::Duration::from_millis(150) {
+                if let Some(report) = progress {
+                    report(
+                        "Gravando cache de data/hora",
+                        index * 8192 + chunk.len(),
+                        idx.lines.len(),
+                    );
+                }
+                last_report = std::time::Instant::now();
+            }
+        }
+        out.write_all(&hash.finalize()).map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
+        out.get_ref().sync_all().map_err(|e| e.to_string())?;
+        sources::validate_source(&idx.parts[0])?;
+        crate::operations::check()?;
+        drop(out);
+        std::fs::rename(&temporary, path).map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+#[cfg(test)]
+mod timestamp_overlay_tests {
+    use super::*;
+    fn fixture() -> (tempfile::TempDir, FileIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            "{\"message\":\"1700000001234\"}\n{\"message\":\"1700000005678\"}\n",
+        )
+        .unwrap();
+        // Use the production compiler: even a rule-free user definition gets
+        // the implicit (None, None) extraction rule.
+        let config = sources::TsConfig {
+            timezone_offset_minutes: Some(0),
+            sources: vec!["message".into()],
+            format: "epoch_ms".into(),
+            ..Default::default()
+        }
+        .compile()
+        .unwrap();
+        let idx =
+            sources::index_file(path.to_str().unwrap(), "jsonl", None, Some(config), None).unwrap();
+        (dir, idx)
+    }
+    #[test]
+    fn warm_overlay_reuses_corrected_timestamps_and_rejects_corruption() {
+        let (dir, mut idx) = fixture();
+        let cache = dir.path().join("timestamps.bin");
+        assert!(!timestamps_at(&mut idx, &cache, None).unwrap());
+        let expected: Vec<_> = idx.lines.iter().map(|m| m.ts).collect();
+        assert_eq!(expected, vec![1700000001234, 1700000005678]);
+        for line in std::sync::Arc::make_mut(&mut idx.lines) {
+            line.ts = 0;
+        }
+        assert!(timestamps_at(&mut idx, &cache, None).unwrap());
+        assert_eq!(idx.lines.iter().map(|m| m.ts).collect::<Vec<_>>(), expected);
+        let mut bytes = std::fs::read(&cache).unwrap();
+        bytes[80] ^= 1;
+        std::fs::write(&cache, bytes).unwrap();
+        assert!(!timestamps_at(&mut idx, &cache, None).unwrap());
+        assert_eq!(idx.lines.iter().map(|m| m.ts).collect::<Vec<_>>(), expected);
+    }
+    #[test]
+    fn overlay_key_includes_display_path_name_and_configuration() {
+        let (_dir, mut idx) = fixture();
+        let original = timestamp_key(&idx).unwrap();
+        idx.parts[0].path = "virtual.zip!/other.log".into();
+        assert_ne!(timestamp_key(&idx).unwrap(), original);
+        let path_key = timestamp_key(&idx).unwrap();
+        idx.parts[0].file_name = "other-name".into();
+        assert_ne!(timestamp_key(&idx).unwrap(), path_key);
+        let name_key = timestamp_key(&idx).unwrap();
+        idx.parts[0].ts_config.as_mut().unwrap().clock_adjustment_ms = 1000;
+        assert_ne!(timestamp_key(&idx).unwrap(), name_key);
+    }
+    #[test]
+    fn cancelled_restore_does_not_modify_published_metadata() {
+        let (dir, mut idx) = fixture();
+        let cache = dir.path().join("timestamps.bin");
+        timestamps_at(&mut idx, &cache, None).unwrap();
+        for line in std::sync::Arc::make_mut(&mut idx.lines) {
+            line.ts = 0;
+        }
+        let published = std::sync::Arc::clone(&idx.lines);
+        let token = crate::operations::token(Some("timestamp-restore-cancel".into())).unwrap();
+        let result = crate::operations::run_with_token(token, || {
+            restore_timestamps(
+                &mut idx,
+                &cache,
+                Some(&|_, _, _| {
+                    crate::operations::cancel_id("timestamp-restore-cancel");
+                }),
+            )
+        });
+        assert!(
+            result.is_err(),
+            "cancellation prevents publishing the new load"
+        );
+        assert_eq!(published[0].ts, 0);
+        assert_eq!(published[1].ts, 0);
+    }
 }

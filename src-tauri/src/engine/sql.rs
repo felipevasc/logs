@@ -1,8 +1,8 @@
 //! Translation of the app's filters into SQL over the engine's columns.
 //!
-//! Every value test runs the app's own Rust comparison (registered through
-//! [`Tests`]) on a column holding the very value `Event::col_ref` or the
-//! search language would read. Conditions that the columns cannot decide
+//! Exact text equality and safe integer ranges use native SQL predicates so
+//! DuckDB can prune row groups. Other tests run the app's Rust comparisons
+//! (registered through [`Tests`]). Conditions that the columns cannot decide
 //! exactly become supersets whose candidates are confirmed on the parsed
 //! events, so results never depend on the translation being complete.
 use super::build::{role_column, QUERY_TOOL, SEP};
@@ -60,6 +60,67 @@ enum Val {
 
 fn literal(value: bool) -> String {
     if value { "TRUE" } else { "FALSE" }.into()
+}
+
+/// Comparing an integer through f64 is exact around these bounds. Convert
+/// fractional bounds to integer boundaries without casting the stored column:
+/// casting it would hide its zonemaps from the optimizer. Exotic/non-finite
+/// bounds keep the established Rust comparison path.
+fn integer_range(column: &str, pf: &PreparedFilter) -> Option<String> {
+    const EXACT: f64 = 9_007_199_254_740_991.0;
+    let (first, second) = pf.numeric_bounds();
+    let first = match first {
+        Some(n) if n.is_finite() && n.abs() <= EXACT => n,
+        None => return Some("FALSE".into()),
+        _ => return None,
+    };
+    let comparison = match pf.f.op.as_str() {
+        "gt" => format!("{column} > {}", first.floor() as i64),
+        "gte" => format!("{column} >= {}", first.ceil() as i64),
+        "lt" => format!("{column} < {}", first.ceil() as i64),
+        "lte" => format!("{column} <= {}", first.floor() as i64),
+        "between" => {
+            let second = match second {
+                Some(n) if n.is_finite() && n.abs() <= EXACT => n,
+                None => return Some("FALSE".into()),
+                _ => return None,
+            };
+            format!("{column} >= {} AND {column} <= {}", first.ceil() as i64, second.floor() as i64)
+        }
+        _ => return None,
+    };
+    Some(format!("({comparison})"))
+}
+
+/// These predicates occur as conjuncts in a filter list, where SQL NULL and
+/// false both reject a row. Negative equality must explicitly retain NULLs.
+fn exact_text(value: &str, pf: &PreparedFilter) -> Option<String> {
+    let f = &pf.f;
+    let (needle, negative) = match f.op.as_str() {
+        "equals_exact" => (f.value.as_str(), false),
+        "not_equals_exact" => (f.value.as_str(), true),
+        // ASCII-insensitive equality is literal equality for needles without
+        // ASCII letters (common event codes, ports, and numeric identifiers).
+        "equals" | "not_equals" if !f.value.trim().bytes().any(|c| c.is_ascii_alphabetic()) => {
+            (f.value.trim(), f.op == "not_equals")
+        }
+        "in_exact" => {
+            let mut items: Vec<&str> = f.value.lines().filter(|v| !v.is_empty()).collect();
+            items.sort_unstable();
+            items.dedup();
+            return Some(if items.is_empty() {
+                "FALSE".into()
+            } else {
+                format!("({value} IN ({}))", items.into_iter().map(lit).collect::<Vec<_>>().join(", "))
+            });
+        }
+        _ => return None,
+    };
+    Some(if negative {
+        format!("({value} IS NULL OR {value} <> {})", lit(needle))
+    } else {
+        format!("({value} = {})", lit(needle))
+    })
 }
 
 impl Schema {
@@ -194,6 +255,9 @@ impl Schema {
                 _ => None,
             };
             if let Some(column) = direct {
+                if let Some(sql) = integer_range(column, pf) {
+                    return Decision::Sql(sql);
+                }
                 return Decision::Sql(tests.number(column, Arc::new(move |n| number_matches(&owned, n))));
             }
             return match self.value(&f.column, names) {
@@ -206,7 +270,9 @@ impl Schema {
             };
         }
         match self.value(&f.column, names) {
-            Val::Sql(value) => Decision::Sql(tests.text(&value, Arc::new(move |v| value_matches(&owned, v)))),
+            Val::Sql(value) => Decision::Sql(exact_text(&value, pf).unwrap_or_else(|| {
+                tests.text(&value, Arc::new(move |v| value_matches(&owned, v)))
+            })),
             Val::Absent => Decision::Sql(literal(value_matches(&owned, None))),
             Val::Unsupported => Decision::Event,
         }
@@ -319,4 +385,45 @@ enum Decision {
     Event,
     /// Decided by the line engine.
     Lines,
+}
+
+#[cfg(test)]
+mod native_predicate_tests {
+    use super::*;
+    use crate::query::Filter;
+
+    fn filter(column: &str, op: &str, value: &str, value2: Option<&str>) -> PreparedFilter {
+        crate::query::prepare(&[Filter { column: column.into(), op: op.into(), value: value.into(), value2: value2.map(str::to_string) }]).remove(0)
+    }
+
+    #[test]
+    fn integer_bounds_keep_columns_uncast_and_preserve_fractional_edges() {
+        for (op, expected) in [("gt", "(ts > 10)"), ("gte", "(ts >= 11)"), ("lt", "(ts < 11)"), ("lte", "(ts <= 10)")] {
+            assert_eq!(integer_range("ts", &filter("timestamp", op, "10.5", None)).as_deref(), Some(expected));
+        }
+        assert_eq!(integer_range("id", &filter("id", "between", "-1.5", Some("2.5"))).as_deref(), Some("(id >= -1 AND id <= 2)"));
+        assert_eq!(integer_range("ts", &filter("timestamp", "gt", "invalid", None)).as_deref(), Some("FALSE"));
+        assert!(integer_range("ts", &filter("timestamp", "gt", "NaN", None)).is_none());
+        assert!(integer_range("ts", &filter("timestamp", "gte", "9007199254740992", None)).is_none());
+    }
+
+    #[test]
+    fn exact_lists_and_null_negative_semantics_are_preserved() {
+        assert_eq!(exact_text("code", &filter("code", "equals", " 404 ", None)).as_deref(), Some("(code = '404')"));
+        assert_eq!(exact_text("x", &filter("x", "not_equals_exact", "O'Reilly", None)).as_deref(), Some("(x IS NULL OR x <> 'O''Reilly')"));
+        assert_eq!(exact_text("x", &filter("x", "in_exact", " a \nb,c\n a \n", None)).as_deref(), Some("(x IN (' a ', 'b,c'))"));
+        assert!(exact_text("x", &filter("x", "equals", "Admin", None)).is_none());
+        assert!(exact_text("x", &filter("x", "in", "Admin", None)).is_none());
+    }
+
+    #[test]
+    fn plans_expose_safe_ranges_and_equality_to_duckdb() {
+        let schema = Schema::default();
+        let plan = schema.plan(&[filter("timestamp", "gte", "1000.5", None), filter("code", "equals_exact", "4625", None)]);
+        assert!(plan.exact());
+        assert!(plan.sql.contains("ts >= 1001"));
+        assert!(plan.sql.contains("code = '4625'"));
+        assert!(!plan.sql.contains("li_test"));
+        assert!(!plan.sql.contains("li_ntest"));
+    }
 }

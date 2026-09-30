@@ -549,3 +549,150 @@ fn derived_fields_and_catalog_names_stay_consistent() {
         check_filters(&src, &case, true);
     }
 }
+
+#[test]
+fn interactive_pages_seek_without_duplicates_and_keep_exact_api_semantics() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOGINSIGHT_DATA_DIR", dir.path().join("dados"));
+    testkit::set_engine_dir(&dir.path().join("motor").to_string_lossy());
+    let mut records = String::new();
+    for i in 0..103 {
+        let value = ["2", "10", "-0", "0", "120 ms", "Ação", "Admin", "", " a ", "b,c", "O'Reilly"][i % 11];
+        let mut record = json!({"timestamp": 1_772_359_200_000i64 + (i / 3) as i64, "source":"api", "level":if i % 3 == 0 {"error"} else {"info"}, "message":format!("record {i}"), "custom":value});
+        if i % 13 == 0 { record.as_object_mut().unwrap().remove("custom"); }
+        if i % 17 == 0 { record.as_object_mut().unwrap().remove("timestamp"); }
+        writeln!(records, "{record}").unwrap();
+    }
+    let file = write(dir.path(), "pages.jsonl", &records);
+    let src = Source::open(&[&file], "{}", "[]").unwrap();
+    src.prepare().unwrap();
+    let filters = filters_of(&[("source", "equals_exact", "api")]);
+    for sort in ["", "id", "timestamp", "level", "custom", "message"] {
+        for direction in ["asc", "desc"] {
+            let expected = src.query(Engine::Columnar, &filters, sort, direction, 0, 1000);
+            let mut combined = Vec::new();
+            let mut cursor: Option<String> = None;
+            let mut offset = 0;
+            loop {
+                let result = src.page(&filters, sort, direction, offset, 7, cursor.as_deref());
+                assert_eq!(result["engine"], "columnar");
+                let rows = result["rows"].as_array().unwrap();
+                assert!(rows.len() <= 7);
+                combined.extend(rows.iter().cloned());
+                offset += rows.len();
+                if result["hasMore"] == false {
+                    assert_eq!(result["total"], json!(103));
+                    assert!(result["nextCursor"].is_null());
+                    break;
+                }
+                assert!(result["total"].is_null());
+                cursor = Some(result["nextCursor"].as_str().unwrap().to_string());
+                assert!(offset < 200, "cursor must advance");
+            }
+            same(&format!("cursor order {sort} {direction}"), Value::Array(combined), expected["rows"].clone());
+            let recovery = src.recovery_page(&filters, sort, direction, 13, 7).unwrap();
+            same(&format!("bounded recovery {sort} {direction}"), recovery["rows"].clone(), Value::Array(expected["rows"].as_array().unwrap()[13..20].to_vec()));
+            assert_eq!(recovery["total"], 103);
+            assert_eq!(recovery["engine"], "lines");
+        }
+    }
+    let first = src.page(&filters, "timestamp", "desc", 0, 7, None);
+    let cursor = first["nextCursor"].as_str().unwrap();
+    assert!(src.try_page("[]", "timestamp", "desc", 7, 7, Some(cursor)).is_err());
+    assert!(src.try_page(&filters, "timestamp", "asc", 7, 7, Some(cursor)).is_err());
+    assert!(src.try_page(&filters, "timestamp", "desc", 7, 7, Some("{}" )).is_err());
+    let all = src.page("[]", "timestamp", "asc", 0, 7, None);
+    assert_eq!(all["total"], 103);
+    let diagnostic = src.explain_page(
+        &json!([{"column":"timestamp","op":"gte","value":"1772359200000"}]).to_string(),
+        "timestamp", "asc", 7, false,
+    ).unwrap();
+    let sql = diagnostic["sql"].as_str().unwrap();
+    assert!(sql.contains("ts >= 1772359200000"));
+    assert!(sql.contains("LIMIT 7"));
+    assert!(!sql.to_ascii_lowercase().contains("count("));
+    assert!(!sql.contains("li_ntest"));
+    assert!(diagnostic["plan"].as_str().is_some_and(|plan| !plan.is_empty()));
+    assert!(src.recovery_page("[]", "timestamp", "asc", 10_000, 7).is_err());
+    // Raw-only filters take the bounded verification route, preserving page
+    // order and exact matching without a full result-id vector.
+    for condition in [query("bruto:record"), query("bruto:record AND NOT bruto:99")] {
+        let result = src.page(&condition, "timestamp", "desc", 0, 7, None);
+        let expected = src.query(Engine::Lines, &condition, "timestamp", "desc", 0, 7);
+        same("verified interactive page", result["rows"].clone(), expected["rows"].clone());
+        assert!(result["warning"].is_string());
+    }
+    for condition in [
+        filters_of(&[("custom", "equals_exact", "O'Reilly")]),
+        filters_of(&[("custom", "not_equals_exact", "Admin")]),
+        filters_of(&[("custom", "in_exact", " a \nb,c\nO'Reilly")]),
+        filters_of(&[("id", "gt", "2.5")]),
+        filters_of(&[("id", "lte", "10.5")]),
+        json!([{"column":"id","op":"between","value":"2.5","value2":"10.5"}]).to_string(),
+    ] {
+        testkit::clear_caches();
+        assert_eq!(src.matches(Engine::Columnar, &condition), src.matches(Engine::Lines, &condition), "{condition}");
+    }
+}
+
+#[test]
+fn count_facets_cap_in_database_and_preserve_omitted_totals() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOGINSIGHT_DATA_DIR", dir.path().join("dados"));
+    testkit::set_engine_dir(&dir.path().join("motor").to_string_lossy());
+    let mut records = String::new();
+    for i in 0..50_017 {
+        writeln!(records, "{}", json!({"source":"api","message":"row","key":i.to_string()})).unwrap();
+    }
+    for value in ["", " ", " 1", "-0", "0", "1.0", "2 ms", "A", "a", "Á", "á", "NaN"] {
+        writeln!(records, "{}", json!({"source":"api","message":"row","key":value})).unwrap();
+    }
+    let file = write(dir.path(), "groups.jsonl", &records);
+    let src = Source::open(&[&file], "{}", "[]").unwrap();
+    src.prepare().unwrap();
+    let specs = r#"[{"func":"count","column":"*","alias":"n"}]"#;
+    let columnar = src.aggregate(Engine::Columnar, "[]", "key", specs);
+    let lines = src.aggregate(Engine::Lines, "[]", "key", specs);
+    assert_eq!(columnar["rows"].as_array().unwrap().len(), 50_000);
+    assert!(columnar["omitted_groups"].as_u64().unwrap() > 0);
+    same("bounded count facets", columnar, lines);
+    let mixed = r#"[{"func":"count","column":"*","alias":"n"},{"func":"sum","column":"id","alias":"total"}]"#;
+    let result = src.aggregate(Engine::Columnar, "[]", "key", mixed);
+    assert!(result["error"].is_string());
+    assert!(result["rows"].as_array().unwrap().is_empty(), "a partial aggregate must not be presented as exact");
+}
+
+#[test]
+fn base_analytics_stay_indexed_while_derived_store_is_pending() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOGINSIGHT_DATA_DIR", dir.path().join("dados"));
+    testkit::set_engine_dir(&dir.path().join("motor").to_string_lossy());
+    let mut records = String::new();
+    for i in 0..64 {
+        writeln!(records, "{}", json!({"timestamp":1_772_359_200_000i64+i,"source":"api","code":"404","level":"error","message":format!("record {i}")})).unwrap();
+    }
+    let file = write(dir.path(), "pending-derived.jsonl", &records);
+    let derived = r#"[{"name":"record_number","source":"message","rules":[{"pattern":"record (\\d+)"}]}]"#;
+    let source = Source::open(&[&file], "{}", derived).unwrap();
+    source.prepare_base().unwrap();
+    let status = source.engine_status();
+    assert_eq!(status["baseReady"], true);
+    assert_eq!(status["derivedReady"], false);
+    let filters = filters_of(&[("code", "equals_exact", "404")]);
+    assert_eq!(source.count(Engine::Columnar, &filters), source.count(Engine::Lines, &filters));
+    same("pending-derived stats", sorted_levels(source.stats(Engine::Columnar, &filters)), sorted_levels(source.stats(Engine::Lines, &filters)));
+    let columns = ["source", "code", "level"];
+    same("pending-derived count facets", source.multi_count(Engine::Columnar, &filters, &columns), source.multi_count(Engine::Lines, &filters, &columns));
+    let page = source.page(&filters, "timestamp", "asc", 0, 7, None);
+    let lines = source.query(Engine::Lines, &filters, "timestamp", "asc", 0, 7);
+    same("pending-derived page hydration", page["rows"].clone(), lines["rows"].clone());
+    assert!(page["rows"][0]["fields"]["record_number"].is_string());
+    assert_eq!(source.engine_status()["derivedReady"], false, "base operations must not require a complete derived store");
+    source.prepare().unwrap();
+    let derived_filter = filters_of(&[("record_number", "equals_exact", "12")]);
+    assert_eq!(source.count(Engine::Columnar, &derived_filter), 1);
+    same("derived field after preparation", source.page(&derived_filter, "timestamp", "asc", 0, 7, None)["rows"].clone(), source.query(Engine::Lines, &derived_filter, "timestamp", "asc", 0, 7)["rows"].clone());
+}
