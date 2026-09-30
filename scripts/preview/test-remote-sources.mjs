@@ -82,10 +82,28 @@ try {
   await page.evaluate(() => { window.__remoteMock.delay = 100; });
   await page.screenshot({ path: resolve(output, "remote-connection-1024.png") });
   phase = "import snapshot";
+  const originalPaths = await page.evaluate(() => {
+    const files = source => source?.kind === "bundle" ? source.members.flatMap(files) : [source?.path].filter(Boolean);
+    return files(state.currentArtifact?.source);
+  });
+  assert.ok(originalPaths.length > 0, "Import fixture starts with an existing source");
   await page.locator("#rs-import").click();
-  await page.waitForFunction(() => !state.loadOverlay && document.body.dataset.page === "summary" && state.currentArtifact?.path.includes("remote-"), null, { timeout: 30000 });
-  result.snapshot = await page.evaluate(() => ({ kind: state.currentArtifact.source.kind, format: state.currentArtifact.source.format, page: document.body.dataset.page, hasRemotePasswordInCase: JSON.stringify(state.cases).includes("fixture-secret-only") }));
-  assert.equal(result.snapshot.kind, "file"); assert.equal(result.snapshot.format, "jsonl"); assert.equal(result.snapshot.page, "summary"); assert.equal(result.snapshot.hasRemotePasswordInCase, false);
+  // Import adds a local snapshot to the open dataset; the bundle path belongs to its first member.
+  await page.waitForFunction(() => {
+    const files = source => source?.kind === "bundle" ? source.members.flatMap(files) : [source].filter(Boolean);
+    return !state.loadOverlay && document.body.dataset.page === "summary" && files(state.currentArtifact?.source).some(source => source.path?.includes("remote-"));
+  }, null, { timeout: 30000 });
+  result.snapshot = await page.evaluate(() => {
+    const files = source => source?.kind === "bundle" ? source.members.flatMap(files) : [source].filter(Boolean);
+    const members = files(state.currentArtifact?.source), remote = members.find(source => source.path?.includes("remote-"));
+    return { kind: remote?.kind, format: remote?.format, bundleKind: state.currentArtifact.source.kind,
+      paths: members.map(source => source.path), page: document.body.dataset.page,
+      hasRemotePasswordInCase: JSON.stringify(state.cases).includes("fixture-secret-only") };
+  });
+  assert.equal(result.snapshot.kind, "file"); assert.equal(result.snapshot.format, "jsonl");
+  assert.equal(result.snapshot.bundleKind, "bundle");
+  for (const path of originalPaths) assert.ok(result.snapshot.paths.includes(path), "Import preserves each previously open source");
+  assert.equal(result.snapshot.page, "summary"); assert.equal(result.snapshot.hasRemotePasswordInCase, false);
   result.importRequest = await page.evaluate(() => {
     const request = window.__remoteMock.requests.filter(item => item.command === "remote_import").at(-1);
     return { from: request.from, to: request.to, maxRecords: request.connection.maxRecords, query: request.connection.query, passwordProvided: request.passwordProvided };
@@ -95,7 +113,11 @@ try {
   await openConnections();
   await page.locator("#rs-delete").click(); await idle();
   assert.equal(await page.locator("#rs-list .remote-connection").count(), 0);
-  result.deleteKeepsSnapshot = await page.evaluate(() => state.currentArtifact?.path.includes("remote-")); assert.equal(result.deleteKeepsSnapshot, true);
+  result.deleteKeepsSnapshot = await page.evaluate(paths => {
+    const files = source => source?.kind === "bundle" ? source.members.flatMap(files) : [source?.path].filter(Boolean);
+    const actual = files(state.currentArtifact?.source);
+    return paths.every(path => actual.includes(path));
+  }, result.snapshot.paths); assert.equal(result.deleteKeepsSnapshot, true);
   await page.locator("#rs-kind").selectOption("kibana");
   assert.match(await page.locator("#rs-url-hint").textContent(), /Console/); assert.match(await page.locator("#rs-url-hint").textContent(), /SSO/);
   await page.evaluate(() => { window.__remoteMock.persistentSecrets = false; });
