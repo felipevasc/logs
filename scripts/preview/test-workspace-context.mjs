@@ -94,9 +94,12 @@ try {
   // Background MCP events are serialized. A context request cannot split their update.
   await page.evaluate(async () => {
     await WorkspaceContext.setScope("case", { page: "explore", animate: false });
-    const original = api; let summaries = 0;
+    const original = api; window.contextSourceSnapshots = [];
     api = async (command, args, options) => {
-      if (command === "source_summary" && ++summaries === 1) await new Promise(resolve => { window.releaseContextSource = resolve; });
+      if (command === "source_snapshot") {
+        window.contextSourceSnapshots.push(WorkspaceContext.scope());
+        if (window.contextSourceSnapshots.length === 1) await new Promise(resolve => { window.releaseContextSource = resolve; });
+      }
       return original(command, args, options);
     };
     window.restoreContextApi = () => { api = original; };
@@ -107,6 +110,7 @@ try {
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "dataset", "MCP update holds its source context until reconciled");
   await page.evaluate(async () => { window.releaseContextSource(); await Promise.all([window.firstSourceUpdate, window.secondSourceUpdate]); window.restoreContextApi(); });
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "case");
+  assert.deepEqual(await page.evaluate(() => window.contextSourceSnapshots), ["dataset", "dataset"], "both source publication reconciliations run serially inside their Dataset scope");
   assert.equal(await exactTotal(), 3);
   await page.evaluate(async () => { await api("clear_events"); await mcpRefreshSource(); });
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "case");
