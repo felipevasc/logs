@@ -217,11 +217,13 @@ pub(crate) fn published_matches(
 }
 
 pub(crate) fn stored_bytes(path: &Path) -> u64 {
-    std::fs::read(manifest_path(path))
+    let auxiliary = std::fs::metadata(super::time_index::path(path)).map(|m|m.len()).unwrap_or(0);
+    let primary: u64 = std::fs::read(manifest_path(path))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).ok())
         .map(|m| m.artifacts.iter().map(|a| a.bytes).sum())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    primary.saturating_add(auxiliary)
 }
 
 fn publish_manifest(path: &Path, manifest: &Manifest) -> Result<(), String> {
@@ -692,7 +694,13 @@ pub(crate) fn build(
     }
 }
 
-pub(crate) fn remove_database(path: &Path) {
+pub(crate) fn remove_database(path: &Path) -> bool {
+    // Published targets are removed under their exclusive build.lock; pending
+    // artifacts stay under their parent's writer lease. Keep the complete
+    // publication intact if its auxiliary lease cannot close.
+    if let Err(error) = super::time_index::remove_under_build_lock(path) {
+        eprintln!("[motor] limpeza adiada: {error}"); return false;
+    }
     VERIFIED.lock().remove(path);
     let _ = std::fs::remove_file(path.with_extension("used"));
     let _ = std::fs::remove_file(manifest_path(path));
@@ -701,6 +709,7 @@ pub(crate) fn remove_database(path: &Path) {
     let mut wal = path.as_os_str().to_owned();
     wal.push(".wal");
     let _ = std::fs::remove_file(PathBuf::from(wal));
+    !path.exists() && !super::text::dir_of(path).exists() && !manifest_path(path).exists()
 }
 
 /// Lines parsed and converted per parallel task.

@@ -721,6 +721,7 @@ function setEventComment(ev, text) {
   const trimmed = String(text || "").trim();
   if (trimmed) c.comments[artifactId][ev.id] = trimmed;
   else delete c.comments[artifactId][ev.id];
+  window.QueryBar?.clearCache?.();
   saveCases();
   // coluna disponível e visível assim que existe o primeiro comentário
   if (trimmed && !state.columns.includes("comentario")) {
@@ -790,7 +791,13 @@ function toggleTheme() {
   document.documentElement.dataset.theme = cur;
   localStorage.setItem("li-theme", cur);
   updateThemeIcon();
-  if (state.loaded) refresh(); // redesenha o gráfico com as cores do tema
+  repaintChartTheme();
+}
+function repaintChartTheme() {
+  // uPlot supports dynamic color callbacks and a local repaint. Keep plot
+  // instances, data, cursor/selection handlers and scales; never query again.
+  chart?.redraw(false, true);
+  for (const plot of Object.values(dashCharts)) plot?.redraw(false, true);
 }
 function updateThemeIcon() {
   const light = document.documentElement.dataset.theme === "light";
@@ -885,7 +892,7 @@ async function reconcilePublishedSource(current = () => true) {
     page: 0, pageResult: null, queryError: null, dataPeriod: null, facetData: null,
     datasetDashboard: null, datasetCube: null, datasetProfiles: null,
   });
-  if (!same) { state.filters = []; state.quick = ""; $("#quick-search").value = ""; }
+  if (!same) { state.filters = []; state.quick = ""; setQuickSearchDraft(); }
   state.visibleCols = (saved?.visibleCols || state.visibleCols || ["timestamp", "level", "source", "message"]).filter(column => snapshot.columns.includes(column));
   if (!state.visibleCols.length) state.visibleCols = snapshot.columns.slice(0, 4);
   clearSourceRecovery(); applySourceSpec(source); restoreVisiblePreferences();
@@ -1018,7 +1025,7 @@ async function loadData(requestedSource = null, options = {}) {
     else {
       state.filters = [];
       state.quick = "";
-      $("#quick-search").value = "";
+      setQuickSearchDraft();
     }
     // Neste ponto o estado ja representa o recorte certo: um novo artefato
     // parte limpo; uma reabertura recupera o ultimo recorte persistido.
@@ -1149,7 +1156,7 @@ async function clearData({ removeCurrent = false } = {}) {
     datasetDashboard: null, datasetCube: null, datasetProfiles: null, caseProfiles: {},
     currentArtifact: null, dataPeriod: null,
   });
-  $("#quick-search").value = "";
+  setQuickSearchDraft();
   $("#load-status").textContent = "";
   $("#btn-merge").disabled = true;
   renderChips();
@@ -2054,16 +2061,31 @@ function openValueFilter(column, value, anchor = null, op = null) {
 
 // All value menus open the same editable composer; opening never applies a filter.
 function valueFilterMenuItem(column, value, anchor = null, { scope = workspaceScope(), op = null } = {}) {
+  const owner = () => JSON.stringify([activeCase()?.id, scope === "case" ? caseSig(true) : null, state.datasetRevision,
+    state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.sourceIdentityUnconfirmed, state.derivedFields]);
+  const expected = owner();
+  const stillCurrent = () => {
+    if (owner() === expected) return true;
+    toast("A fonte ou o Caso mudou. Abra o menu novamente no contexto atual para criar o filtro.", "info");
+    return false;
+  };
   return {
     icon: "fa-filter", label: `Criar filtro: ${colLabel(column)}`,
     onClick: async () => {
       try {
+        if (!stillCurrent()) return;
         if (scope !== workspaceScope()) await window.WorkspaceContext?.setScope(scope, { page: "explore", tab: "table" });
-        if (scope !== workspaceScope()) return;
+        if (!stillCurrent() || scope !== workspaceScope()) return;
         openValueFilter(column, value, anchor?.isConnected ? anchor : null, op);
       } catch (error) { toast(`Não foi possível abrir o filtro: ${error}`, "err"); }
     },
   };
+}
+
+function setQuickSearchDraft(value = "") {
+  const text = String(value ?? "");
+  if (window.QueryBar?.restoreDraft) window.QueryBar.restoreDraft({ value: text });
+  else { $("#quick-search").value = text; $("#btn-add-search").disabled = !text.trim(); }
 }
 
 function commitQuickSearch() {
@@ -3118,7 +3140,7 @@ function restoreCurrentSavedFilter() {
   const current = savedFilters().find((filter) => filter.id === CURRENT_FILTER_ID);
   state.filters = (current?.filters || []).map((filter) => ({ ...filter }));
   state.quick = current?.quick || "";
-  $("#quick-search").value = state.quick;
+  setQuickSearchDraft(state.quick);
 }
 
 function syncCurrentSavedFilter() {
@@ -3152,7 +3174,7 @@ function syncCurrentSavedFilter() {
 function applySavedFilter(saved) {
   state.filters = (saved.filters || []).map((f) => ({ ...f }));
   state.quick = saved.quick || "";
-  $("#quick-search").value = state.quick;
+  setQuickSearchDraft(state.quick);
   state.page = 0;
   filtersChanged();
 }
@@ -4889,8 +4911,8 @@ function renderChart(stats) {
 
   const xs = stats.buckets.map(([t]) => t / 1000);
   const ys = stats.buckets.map(([, c]) => c);
-  const axisColor = isLight() ? "#5b6678" : "#6b7690";
-  const gridColor = isLight() ? "rgba(19,81,180,0.08)" : "rgba(255,255,255,0.06)";
+  const axisColor = () => isLight() ? "#5b6678" : "#6b7690";
+  const gridColor = () => isLight() ? "rgba(19,81,180,0.08)" : "rgba(255,255,255,0.06)";
 
   if (chart) {
     chart.setData([xs, ys]);
@@ -4913,7 +4935,7 @@ function renderChart(stats) {
       ],
       series: [
         {},
-        { stroke: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim(), width: 1.5, fill: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() + "1a", points: { show: false } },
+        { stroke: () => getComputedStyle(document.documentElement).getPropertyValue("--accent").trim(), width: 1.5, fill: () => getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() + "1a", points: { show: false } },
       ],
       hooks: {
         setSelect: [
@@ -5943,7 +5965,7 @@ async function mcpRefreshSource(contextual = false) {
   // mesmo recorte limpo de um load manual: filtros e paginação recomeçam
   state.filters = [];
   state.quick = "";
-  $("#quick-search").value = "";
+  setQuickSearchDraft();
   state.page = 0;
   state.loaded = true;
   state.datasetDashboard = null;
@@ -6168,7 +6190,7 @@ function bind() {
   $("#btn-clear-filters").onclick = () => {
     state.filters = [];
     state.quick = "";
-    $("#quick-search").value = "";
+    setQuickSearchDraft();
     state.page = 0;
     filtersChanged();
   };
@@ -6974,7 +6996,7 @@ function renderLineChart(box, res, id) {
   const data = [xs, ...res.series.map((s) => s.points)];
   const holder = el("div");
   box.appendChild(holder);
-  const axisColor = isLight() ? "#5b6678" : "#6b7690";
+  const axisColor = () => isLight() ? "#5b6678" : "#6b7690";
   dashCharts[id] = new uPlot(
     {
       width: Math.max(280, box.clientWidth - 8),
@@ -6986,7 +7008,7 @@ function renderLineChart(box, res, id) {
         { stroke: axisColor, grid: { show: false }, ticks: { show: false }, size: 22,
           values: (u, vals) => vals.map(v => new Date(v * 1000).toLocaleString("pt-BR", Number(res.x.at(-1)) - Number(res.x[0]) < 86400000 ? {hour:"2-digit",minute:"2-digit"} : {day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})) },
         {
-          stroke: axisColor, grid: { stroke: isLight() ? "rgba(19,81,180,0.08)" : "rgba(255,255,255,0.06)" },
+          stroke: axisColor, grid: { stroke: () => isLight() ? "rgba(19,81,180,0.08)" : "rgba(255,255,255,0.06)" },
           ticks: { show: false }, size: 44,
           values: (u, vals) => vals.map((v) => fmtVal(v, res.unit)),
         },
@@ -6995,7 +7017,7 @@ function renderLineChart(box, res, id) {
         { label: "Horário", value: (u, v) => v == null ? "—" : fmtTs(v * 1000) },
         ...res.series.map((s, i) => ({
           label: s.name,
-          stroke: LEVEL_COLOR[s.name] ? getComputedStyle(document.documentElement).getPropertyValue(LEVEL_COLOR[s.name].slice(4, -1)).trim() : CHART_COLORS[i % CHART_COLORS.length],
+          stroke: () => LEVEL_COLOR[s.name] ? getComputedStyle(document.documentElement).getPropertyValue(LEVEL_COLOR[s.name].slice(4, -1)).trim() : CHART_COLORS[i % CHART_COLORS.length],
           value: (u, v) => v == null ? "—" : fmtVal(v, res.unit),
           width: 1.6,
           fill: res.series.length === 1 ? "rgba(47,111,237,0.18)" : undefined,

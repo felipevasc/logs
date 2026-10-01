@@ -145,7 +145,7 @@
       renderGroupShortcuts(); renderGroups(); finishOperation("Resumo atualizado", `${fmtNum(result.rows.length)} grupos`);
     } catch (error) {
       if (version !== groupView.version || source !== (scope === "case" ? caseSig() : state.currentArtifact?.id) || signature !== JSON.stringify([workspaceScope(), scope === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt, backendFilters(), field, aggs, state.derivedFields])) return;
-      groupView.result = null; groupView.computedKey = "";
+      groupView.result = null; groupView.computedKey = ""; groupPresentationCache = null;
       $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren();
       calculationError($("#aw-group-summary"), error, () => runGroup({ force: true })); finishOperation("Falha ao resumir", String(error));
     } finally {
@@ -158,18 +158,41 @@
   function filterGroup(value, exclude = false) {
     state.filters.push(exactFilter(groupView.field, value, exclude)); state.page = 0; switchTab("table"); filtersChanged();
   }
+  let groupPresentationCache = null;
+  function groupPresentation(result, view, countKey) {
+    const field = view.field, sort = view.sort, direction = view.direction, query = view.search.toLocaleLowerCase();
+    const omittedRecords = Number(result.omitted_records) || 0, cached = groupPresentationCache;
+    // Reuse sorting/filtering, but do not assume IPC results remain immutable.
+    // This linear identity/value check also catches edits to rows in place.
+    if (cached && cached.result === result && cached.sourceRows === result.rows && cached.revision === view.computedKey
+      && cached.field === field && cached.sort === sort && cached.direction === direction && cached.query === query
+      && cached.countKey === countKey && cached.omittedRecords === omittedRecords && cached.inputs.length === result.rows.length
+      && result.rows.every((row, i) => {
+        const prior = cached.inputs[i];
+        return prior[0] === row && Object.is(prior[1], row[field]) && Object.is(prior[2], row[sort]) && Object.is(prior[3], countKey ? row[countKey] : null);
+      })) return cached.presentation;
+    const rows = result.rows.filter(row => String(row[field] ?? "").toLocaleLowerCase().includes(query));
+    rows.sort((a, b) => {
+      const aa = a[sort], bb = b[sort];
+      const comparison = typeof aa === "number" && typeof bb === "number" ? aa - bb : String(aa ?? "").localeCompare(String(bb ?? ""), "pt-BR", { numeric: true });
+      return direction * comparison;
+    });
+    const total = countKey ? result.rows.reduce((sum, row) => sum + (Number(row[countKey]) || 0), 0) + omittedRecords : 0;
+    const max = countKey ? result.rows.reduce((n, row) => Math.max(n, Number(row[countKey]) || 0), 1) : 1;
+    const presentation = { rows, total, max };
+    // One result only; snapshots retain scalar references, never clone log text.
+    const scalar = value => value == null || ["string", "number", "boolean", "undefined"].includes(typeof value);
+    const cacheable = result.rows.length <= 50000 && result.rows.every(row => scalar(row[field]) && scalar(row[sort]) && (!countKey || scalar(row[countKey])));
+    groupPresentationCache = cacheable ? { result, sourceRows: result.rows, revision: view.computedKey, field, sort, direction, query, countKey, omittedRecords, presentation,
+      inputs: result.rows.map(row => [row, row[field], row[sort], countKey ? row[countKey] : null]) } : null;
+    return presentation;
+  }
   function renderGroups() {
     const result = groupView.result; if (!result) return;
     const field = groupView.field, countIndex = groupView.aggs.findIndex(a => a.func === "count" && a.column === "*"), countKey = countIndex >= 0 ? result.columns[countIndex + 1] : null;
     // Beyond 50 000 groups only the largest come back; their records still count in the total.
     const omitted = Number(result.omitted_groups) || 0;
-    const total = countKey ? result.rows.reduce((sum, row) => sum + (Number(row[countKey]) || 0), 0) + (Number(result.omitted_records) || 0) : 0;
-    let rows = result.rows.filter(row => String(row[field] ?? "").toLocaleLowerCase().includes(groupView.search.toLocaleLowerCase()));
-    rows = rows.slice().sort((a, b) => {
-      const aa = a[groupView.sort], bb = b[groupView.sort];
-      const comparison = typeof aa === "number" && typeof bb === "number" ? aa - bb : String(aa ?? "").localeCompare(String(bb ?? ""), "pt-BR", { numeric: true });
-      return groupView.direction * comparison;
-    });
+    const { rows, total, max } = groupPresentation(result, groupView, countKey);
     const pageSize = 100, pages = Math.max(1, Math.ceil(rows.length / pageSize)); groupView.page = Math.min(groupView.page, pages - 1);
     const head = $("#group-table thead"), body = $("#group-table tbody"); head.replaceChildren(); body.replaceChildren();
     const hr = el("tr");
@@ -179,7 +202,6 @@
       th.append(button(`${label}${groupView.sort === key ? (groupView.direction < 0 ? " ↓" : " ↑") : ""}`, () => { groupView.direction = groupView.sort === key ? -groupView.direction : index ? -1 : 1; groupView.sort = key; groupView.page = 0; renderGroups(); }, "aw-sort")); hr.append(th);
     });
     if (countKey) hr.append(el("th", "aw-number", "% do recorte")); hr.append(el("th", "", "")); head.append(hr);
-    const max = countKey ? result.rows.reduce((n, row) => Math.max(n, Number(row[countKey]) || 0), 1) : 1;
     for (const row of rows.slice(groupView.page * pageSize, (groupView.page + 1) * pageSize)) {
       const tr = el("tr"); const value = groupValue(row); tr.title = "Abrir os registros deste grupo"; tr.onclick = () => filterGroup(value);
       tr.oncontextmenu = event => { event.preventDefault(); showCtxMenu(event.clientX, event.clientY, [
@@ -333,6 +355,34 @@
     actions.push({ icon: "fa-circle-info", label: `Inspecionar ${colLabel(filters[filters.length - 1].column)}`, onClick: () => showFieldInspector(filters[filters.length - 1].column) });
     showCtxMenu(event.clientX, event.clientY, actions);
   }
+  let pivotPresentationCache = null;
+  function pivotPresentation(result, paths, depth, view, collapsed, revision) {
+    const query = view.search.toLocaleLowerCase(), sort = view.sort, collapsedKey = JSON.stringify(collapsed), cached = pivotPresentationCache;
+    const measure = ri => sort === "tree" ? null : result.cells[ri]?.[0]?.[0];
+    if (cached && cached.result === result && cached.paths === paths && cached.depth === depth && cached.revision === revision
+      && cached.query === query && cached.sort === sort && cached.collapsedKey === collapsedKey && cached.inputs.length === paths.length
+      && paths.every((path, i) => {
+        const prior = cached.inputs[i];
+        return prior[0] === path && prior[1].length === path.length && path.every((value, j) => Object.is(value, prior[1][j])) && Object.is(prior[2], measure(i));
+      })) return cached.presentation;
+    const pathKey = path => JSON.stringify(path);
+    const parents = new Set(paths.filter(path => path.length > 1).map(path => pathKey(path.slice(0, -1))));
+    let rows = paths.map((path, ri) => ({ path, ri })).filter(({ path }) => {
+      if (!depth) return true;
+      if (collapsed.some(prefix => prefix.length < path.length && prefix.every((value, i) => path[i] === value))) return false;
+      return path.length === depth || !parents.has(pathKey(path)) || collapsed.some(prefix => pathKey(prefix) === pathKey(path));
+    });
+    if (query) rows = rows.filter(row => row.path.some(value => displayGroup(value).toLocaleLowerCase().includes(query)));
+    if (sort !== "tree") rows.sort((a, b) => ((Number(result.cells[a.ri]?.[0]?.[0]) || 0) - (Number(result.cells[b.ri]?.[0]?.[0]) || 0)) * (sort === "desc" ? -1 : 1));
+    const presentation = { rows, parents };
+    const scalar = value => value == null || ["string", "number", "boolean", "undefined"].includes(typeof value);
+    const cacheable = paths.length <= 50000 && paths.reduce((n, path) => n + path.length, 0) <= 250000
+      && paths.every((path, i) => path.every(scalar) && scalar(measure(i)));
+    // Keep one current view. Validation copies array structure, not field text.
+    pivotPresentationCache = cacheable ? { result, paths, depth, revision, query, sort, collapsedKey, presentation,
+      inputs: paths.map((path, i) => [path, path.slice(), measure(i)]) } : null;
+    return presentation;
+  }
   renderCubeTable = function (cube, result) {
     pivotShell();
     const key = `${state.analyticsScope}:${cube.id}:${cubeSchemaSignature(cube)}`;
@@ -340,15 +390,9 @@
     const head = $("#cube-table thead"), body = $("#cube-table tbody"); head.replaceChildren(); body.replaceChildren();
     const exact = Array.isArray(result.row_values) && result.row_values.length === result.row_paths?.length;
     const pathKey = path => JSON.stringify(path), paths = exact ? result.row_values : result.row_paths || [], depth = cube.rows.length;
-    const parents = new Set(paths.filter(path => path.length > 1).map(path => pathKey(path.slice(0, -1))));
     const collapsed = [...cubeState.collapsed];
-    let rows = paths.map((path, ri) => ({ path, ri })).filter(({ path }) => {
-      if (!depth) return true;
-      if (collapsed.some(prefix => prefix.length < path.length && prefix.every((v, i) => path[i] === v))) return false;
-      return path.length === depth || !parents.has(pathKey(path)) || collapsed.some(prefix => pathKey(prefix) === pathKey(path));
-    });
-    const query = pivotView.search.toLocaleLowerCase(); if (query) rows = rows.filter(row => row.path.some(value => displayGroup(value).toLocaleLowerCase().includes(query)));
-    if (pivotView.sort !== "tree") rows.sort((a, b) => ((Number(result.cells[a.ri]?.[0]?.[0]) || 0) - (Number(result.cells[b.ri]?.[0]?.[0]) || 0)) * (pivotView.sort === "desc" ? -1 : 1));
+    const { rows, parents } = pivotPresentation(result, paths, depth, pivotView, collapsed, `${key}:${exact}`);
+    const query = pivotView.search.toLocaleLowerCase();
     const pageSize = 100, pages = Math.max(1, Math.ceil(rows.length / pageSize)), names = result.value_names?.length ? result.value_names : ["Registros"], columnKeys = result.col_keys?.length ? result.col_keys : ["(total)"];
     const columnSize = Math.max(1, Math.floor(24 / names.length)), columnPages = Math.max(1, Math.ceil(columnKeys.length / columnSize));
     pivotView.page = Math.min(pivotView.page, pages - 1); pivotView.columnPage = Math.min(pivotView.columnPage, columnPages - 1);
@@ -416,6 +460,7 @@
   window.WorkspaceAnalysis = {
     capture: () => ({ group: { search: groupView.search, sort: groupView.sort, direction: groupView.direction, page: groupView.page }, pivot: { ...pivotView } }),
     restore: saved => {
+      groupPresentationCache = null; pivotPresentationCache = null;
       groupView.version++; clearTimeout(groupTimer); Object.assign(groupView, { result: null, field: null, search: "", sort: null, direction: -1, page: 0 }, saved?.group);
       Object.assign(pivotView, { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "" }, saved?.pivot, { restoring: true });
       if ($("#aw-group-tools input")) $("#aw-group-tools input").value = groupView.search;

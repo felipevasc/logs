@@ -7,7 +7,10 @@ window.QueryBar = (() => {
   box.classList.add("query-box");
   input.placeholder = "Digite e pressione Enter…";
   input.setAttribute("autocomplete", "off");
+  input.setAttribute("role", "combobox");
   input.setAttribute("aria-autocomplete", "list");
+  input.setAttribute("aria-expanded", "false");
+  input.setAttribute("aria-controls", "quick-search-suggestions");
 
   const help = el("button", "query-help");
   help.type = "button";
@@ -18,6 +21,7 @@ window.QueryBar = (() => {
   error.hidden = true;
   box.after(error);
   const list = el("div", "query-suggest");
+  list.id = "quick-search-suggestions";
   list.setAttribute("role", "listbox");
   list.hidden = true;
   document.body.append(list);
@@ -25,7 +29,7 @@ window.QueryBar = (() => {
   const EXAMPLES = [
     ["falha login", "texto em qualquer campo"],
     ["user:admin", "valor de um campo"],
-    ["status>=500", "comparação numérica"],
+    ["code>=500", "comparação numérica"],
     ["ip:10.0.0.0/8", "rede"],
     ["host:web*", "curinga"],
     ["user:(ana OR bruno)", "lista de valores"],
@@ -57,12 +61,12 @@ window.QueryBar = (() => {
     error.hidden = !problem || document.activeElement !== input;
   }
   input.addEventListener("focus", () => { error.hidden = !box.classList.contains("invalid"); suggest(); });
-  input.addEventListener("blur", () => { setTimeout(() => { if (document.activeElement !== input) { list.hidden = true; error.hidden = true; } }, 150); });
+  input.addEventListener("blur", () => { setTimeout(() => { if (document.activeElement !== input) { dismissSuggestions(); error.hidden = true; } }, 150); });
 
   // ---------------------------------------------------------------- completion
   const ROLES = ["@user", "@src_ip", "@dst_ip", "@host", "@process", "@parent_process", "@cmdline", "@url", "@domain", "@hash", "@dst_port", "@user_agent", "@file", "@status", "@action", "@outcome", "@src_scope", "@dst_scope", "@tool"];
   const ACTIONS = ["logon", "logoff", "process_start", "network_connection", "dns_query", "http_request", "service_install", "task_create", "account_create", "group_member_add", "password_change", "log_clear", "privilege_use", "script_execution", "file_create", "registry_change", "ids_alert", "malware_detected"];
-  let items = [], active = -1, token = null, valueCache = new Map(), serial = 0;
+  let items = [], active = -1, token = null, valueCache = new Map(), serial = 0, suggestionNotice = "";
   const fold = text => text.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
 
   function currentToken() {
@@ -105,6 +109,7 @@ window.QueryBar = (() => {
     let values = prior?.facets === cached && prior?.rows === rows ? prior.values : null;
     const sampled = !Array.isArray(cached);
     if (!values) {
+      let oversized = false;
       // Completion is local while the search is a draft. Reuse already
       // displayed facets/rows instead of launching a full aggregation per token.
       if (Array.isArray(cached)) values = cached.slice(0, 200).map(([value, count]) => ({ value, count }));
@@ -112,24 +117,46 @@ window.QueryBar = (() => {
         const seen = new Map();
         for (const event of state.rows || []) {
           const value = resolved.startsWith("@") ? window.QueryLang.fieldValue(event, window.QueryLang.resolve(resolved)) : cellValue(event, resolved);
-          if (value != null && String(value) !== "") seen.set(String(value), (seen.get(String(value)) || 0) + 1);
+          const text = value == null ? "" : String(value);
+          if (text.length > 4096) { oversized = true; continue; }
+          if (text !== "") seen.set(text, (seen.get(text) || 0) + 1);
           if (seen.size >= 200) break;
         }
         values = [...seen].map(([value, count]) => ({ value, count }));
       }
-      valueCache.set(key, { values, facets: cached, rows });
+      // Completion is optional. Do not normalize/render or insert megabyte
+      // values into the search box; the full-value composer remains available.
+      oversized ||= values.some(item => String(item.value ?? "").length > 4096);
+      values = values.filter(item => item.value != null && String(item.value).length <= 4096);
+      valueCache.set(key, { values, facets: cached, rows, oversized });
       if (valueCache.size > 40) valueCache.delete(valueCache.keys().next().value);
     }
     const query = fold(prefix);
-    return values.filter(v => fold(String(v.value)).includes(query)).slice(0, 8).map(v => {
+    const found = values.filter(v => fold(String(v.value)).includes(query)).slice(0, 8).map(v => {
       const text = String(v.value);
-      return { text: /[\s():"]/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text, label: text, detail: `${fmtNum(v.count)} ${sampled ? "nesta página" : "no painel de campos"}` };
+      return { text: /[\s():"]/.test(text) ? `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : text, label: text, detail: `${fmtNum(v.count)} ${sampled ? "nesta página" : "no painel de campos"}` };
     });
+    found.notice = valueCache.get(key)?.oversized ? "Valores longos foram omitidos das sugestões. Abra o evento e use Criar filtro para o valor completo." : "";
+    return found;
+  }
+  function suggestionLabel(value) {
+    const text = String(value ?? "");
+    if (text.length <= 200) return text;
+    let end = 199;
+    if (/[\uD800-\uDBFF]/.test(text[end - 1]) && /[\uDC00-\uDFFF]/.test(text[end])) end--;
+    return text.slice(0, end) + "…";
+  }
+  function dismissSuggestions() {
+    clearTimeout(suggestTimer); serial++; items = []; suggestionNotice = ""; active = -1; draw();
   }
   function draw() {
-    list.hidden = !items.length;
-    if (!items.length) return;
-    list.innerHTML = items.map((item, i) => `<div class="query-option${i === active ? " active" : ""}" role="option" data-index="${i}"><span>${esc(item.label)}</span><small>${esc(item.detail || "")}</small></div>`).join("");
+    list.hidden = !items.length && !suggestionNotice;
+    input.setAttribute("aria-expanded", String(!list.hidden));
+    if (!list.hidden && active >= 0 && items[active]) input.setAttribute("aria-activedescendant", `${list.id}-${active}`);
+    else input.removeAttribute("aria-activedescendant");
+    if (list.hidden) return;
+    list.innerHTML = items.map((item, i) => `<div id="${list.id}-${i}" class="query-option${i === active ? " active" : ""}" role="option" aria-selected="${i === active}" data-index="${i}"><span>${esc(suggestionLabel(item.label))}</span><small>${esc(suggestionLabel(item.detail || ""))}</small></div>`).join("")
+      + (suggestionNotice ? `<div class="query-option muted small" role="note">${esc(suggestionNotice)}</div>` : "");
     const r = box.getBoundingClientRect();
     list.style.left = `${r.left}px`; list.style.top = `${r.bottom + 4}px`; list.style.minWidth = `${Math.max(r.width, 260)}px`;
   }
@@ -137,10 +164,11 @@ window.QueryBar = (() => {
     const mine = ++serial;
     const requestToken = currentToken();
     token = requestToken;
-    if (!token || composing || document.activeElement !== input) { items = []; draw(); return; }
+    if (!token || composing || document.activeElement !== input) { items = []; suggestionNotice = ""; draw(); return; }
     const found = token.kind === "field" ? fieldOptions(token.prefix) : await valueOptions(token.field, token.prefix);
     if (mine !== serial || document.activeElement !== input) return;
     // A complete field name needs no suggestion of itself.
+    suggestionNotice = found.notice || "";
     items = found.filter(item => item.text !== (token.kind === "field" ? `${token.prefix}:` : token.prefix));
     active = items.length ? 0 : -1;
     draw();
@@ -153,7 +181,7 @@ window.QueryBar = (() => {
     input.value = value.slice(0, token.start) + insert + value.slice(token.end);
     const caret = token.start + insert.length;
     input.setSelectionRange(caret, caret);
-    items = []; draw();
+    items = []; suggestionNotice = ""; draw();
     input.dispatchEvent(new Event("input", { bubbles: true }));
     if (token.kind === "field") suggest();
     return true;
@@ -163,13 +191,14 @@ window.QueryBar = (() => {
     clearTimeout(suggestTimer);
     // Invalidate before the debounce, including async suggestions for the
     // same field/prefix. Typing never starts a native data query or a save.
-    serial++; items = []; draw();
+    serial++; items = []; suggestionNotice = ""; draw();
     if (!composing) suggestTimer = setTimeout(suggest, 90);
   });
   let composing = false;
-  input.addEventListener("compositionstart", () => { composing = true; clearTimeout(suggestTimer); serial++; items = []; draw(); });
+  input.addEventListener("compositionstart", () => { composing = true; clearTimeout(suggestTimer); serial++; items = []; suggestionNotice = ""; draw(); });
   input.addEventListener("compositionend", () => { composing = false; clearTimeout(suggestTimer); suggestTimer = setTimeout(suggest, 90); });
-  function clearDraft() { clearTimeout(suggestTimer); serial++; items = []; draw(); status(null); }
+  function clearDraft() { clearTimeout(suggestTimer); serial++; items = []; suggestionNotice = ""; draw(); status(null); }
+  function clearCache() { valueCache.clear(); clearTimeout(suggestTimer); serial++; items = []; suggestionNotice = ""; draw(); }
   function captureDraft() {
     return { value: input.value, start: input.selectionStart, end: input.selectionEnd, direction: input.selectionDirection };
   }
@@ -186,7 +215,11 @@ window.QueryBar = (() => {
   input.addEventListener("keydown", event => {
     if (event.isComposing || composing || event.keyCode === 229) return;
     if (event.key === "Enter") { event.preventDefault(); if (!event.repeat) submit(); return; }
-    if (list.hidden) return;
+    if (event.key === "Escape") {
+      if (!list.hidden) { event.preventDefault(); event.stopPropagation(); }
+      dismissSuggestions(); return;
+    }
+    if (list.hidden || !items.length) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       active = (active + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
@@ -194,8 +227,6 @@ window.QueryBar = (() => {
     } else if (event.key === "Tab" && active >= 0) {
       event.preventDefault();
       accept();
-    } else if (event.key === "Escape") {
-      items = []; draw();
     }
   });
   list.addEventListener("mousedown", event => {
@@ -204,11 +235,11 @@ window.QueryBar = (() => {
     event.preventDefault();
     accept(+option.dataset.index);
   });
-  document.addEventListener("workspace-context-change", () => { valueCache.clear(); clearTimeout(suggestTimer); serial++; items = []; draw(); });
+  document.addEventListener("workspace-context-change", clearCache);
   // A canonical field name still being typed ("@us") is not a text search yet.
   function typingField() {
     const t = currentToken();
     return !!t && t.kind === "field" && t.prefix.startsWith("@") && ROLES.some(r => r !== t.prefix && r.startsWith(t.prefix));
   }
-  return { status, typingField, submit, clearDraft, captureDraft, restoreDraft, clearCache: () => valueCache.clear() };
+  return { status, typingField, submit, clearDraft, captureDraft, restoreDraft, clearCache };
 })();

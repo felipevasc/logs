@@ -4,11 +4,11 @@ import { readFileSync } from 'node:fs';
 const read = file => readFileSync(new URL(`../../frontend/${file}`, import.meta.url), 'utf8');
 const app = read('app.js'), analysis = read('analysis-workbench.js'), discovery = read('discovery.js');
 const part = (source, start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
-let scope = 'dataset', shown = [], drafts = [], applies = 0, scopeChanges = 0;
+let scope = 'dataset', shown = [], drafts = [], applies = 0, scopeChanges = 0, caseId = 'case-a', evidenceRevision = 1; const notices=[];
 const anchor = { isConnected: true }, event = { preventDefault() {}, stopPropagation() {}, target: anchor, currentTarget: anchor, clientX: 12, clientY: 34 };
 const context = vm.createContext({
   state: { columns: ['timestamp', 'request_path'], visibleCols: [], filters: [], analyticsScope: 'dataset', page: 0 }, window: {},
-  colLabel: String, trunc: String, workspaceScope: () => scope, toast() {},
+  colLabel: String, trunc: String, workspaceScope: () => scope, activeCase: () => ({id:caseId}), caseSig: () => `${caseId}:${evidenceRevision}`, toast: text => notices.push(text),
   showCtxMenu: (x,y,items) => { shown = items; }, openValueFilter: (...args) => drafts.push(args),
   addFilter: () => { applies++; }, filtersChanged: () => { applies++; },
   toggleDetailColumn() {}, detailFieldFilterValue: node => String(node.filterValue ?? ''), openDetailValue() {},
@@ -71,3 +71,20 @@ context.renderRanking(box, { x:['display label'], x_values:['raw value'], series
 rows[0].oncontextmenu(event); assert.equal((await open('request_path'))[1], 'raw value');
 assert.equal(applies, 0, 'opening any composer never applies a filter or runs data work');
 console.log('Chart, cube, grouped, detail-name and Discovery menus preserve editable raw filter values');
+
+// A delayed workspace transition must not reopen an old value over a new Case/source.
+context.state.currentArtifact={id:'source-a',loadedAt:1};context.state.datasetRevision=1;context.state.derivedFields=[];
+for(const mutate of [()=>caseId='case-b',()=>context.state.datasetRevision++,()=>context.state.currentArtifact.id='source-b',()=>context.state.currentArtifact.loadedAt++,()=>context.state.sourceIdentityUnconfirmed=true,()=>context.state.derivedFields.push({name:'changed'}),()=>evidenceRevision++]) {
+  scope='dataset';caseId='case-a';context.state.sourceIdentityUnconfirmed=false;let release;
+  context.window.WorkspaceContext.setScope=async next=>{await new Promise(resolve=>release=resolve);scope=next;};
+  const action=context.valueFilterMenuItem('source','value-from-old-context',null,{scope:'case'});
+  const before=drafts.length,pending=action.onClick();mutate();release();await pending;
+  assert.equal(drafts.length,before,'old menu must not populate an editor after an awaited context replacement');
+  assert.match(notices.at(-1),/Abra o menu novamente/);
+}
+let switches=0;scope='dataset';context.window.WorkspaceContext.setScope=async next=>{switches++;scope=next;};
+const stale=context.valueFilterMenuItem('source','old',null,{scope:'case'});caseId='case-c';await stale.onClick();
+assert.equal(switches,0,'a menu invalidated before click does not even switch areas');
+const current=context.valueFilterMenuItem('source','current',null,{scope:'case'});const count=drafts.length;await current.onClick();
+assert.equal(drafts.length,count+1);assert.equal(drafts.at(-1)[1],'current','unchanged cross-scope opening remains supported');
+console.log('Deferred menu-to-composer transitions reject replaced Case/source/config identities');

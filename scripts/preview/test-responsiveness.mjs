@@ -14,9 +14,11 @@ try {
     window.__mockLatency={count_filtered:1500,stats_events:1500};
     state.filters=[{column:'message',op:'not_contains',value:'__responsiveness_unique_missing__'}];state.page=0;
     const began=performance.now();await refresh();
-    return {elapsed:performance.now()-began,rows:state.rows.length,total:state.total,next:document.querySelector('#pg-next').disabled,label:document.querySelector('#result-count').textContent};
+    return {elapsed:performance.now()-began,rows:state.rows.length,total:state.total,next:document.querySelector('#pg-next').disabled,label:document.querySelector('#result-count').textContent,summaryStatus:explorerAnalytics.get(explorerKey())?.status};
   });
-  assert.ok(first.rows>0);assert.equal(first.total,null);assert.equal(first.next,false);assert.match(first.label,/em cálculo/);
+  assert.ok(first.rows>0);assert.equal(first.total,null);assert.equal(first.next,false);
+  assert.ok(['queued','count'].includes(first.summaryStatus),'unknown total is either queued or actively counting');
+  assert.match(first.label,first.summaryStatus==='queued'?/total aguardando cálculo$/:/total em cálculo$/,'visible total label matches its actual summary phase');
   assert.ok(first.elapsed<1300,'first page arrives before delayed exact count');
   await page.click('#pg-next');
   await page.waitForFunction(()=>state.page===1&&document.querySelector('#events-table').getAttribute('aria-busy')==='false');
@@ -31,7 +33,9 @@ try {
     const before=JSON.stringify(queryCalls()),saves=window.__mockCommandCalls.cases_save||0;
     const row=document.querySelector('#events-table tbody tr'),cell=row.children[0],field=state.columns.find(c=>!state.visibleCols.includes(c));
     if(field) toggleDetailColumn(field);
-    window.dispatchEvent(new Event('resize'));await new Promise(r=>setTimeout(r,600));
+    const currentChart=chart;
+    window.dispatchEvent(new Event('resize'));toggleTheme();toggleTheme();await new Promise(r=>setTimeout(r,600));
+    if(currentChart&&chart!==currentChart)throw Error('Theme repaint replaced the histogram');
     const currentRow=document.querySelector('#events-table tbody tr');
     return {sameRow:row===currentRow,sameCell:cell===currentRow.children[0],sameQueries:before===JSON.stringify(queryCalls()),sameSaves:saves===(window.__mockCommandCalls.cases_save||0)};
   });

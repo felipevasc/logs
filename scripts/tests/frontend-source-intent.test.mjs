@@ -68,6 +68,7 @@ function fixture() {
     },
   });
   vm.runInContext(core, context);
+  vm.runInContext(section('function setQuickSearchDraft(', 'function commitQuickSearch('), context);
   vm.runInContext(section('async function api(', '// ------------------------------------------------------------------ helpers de espera'), context);
   vm.runInContext(taskSource, context);
   vm.runInContext(section('function clearSourceRecovery()', '// ------------------------------------------------------------------ filtros / chips'), context);

@@ -42,6 +42,7 @@ function harness(store = { active: 'case', cases: [{ id: 'case', artifacts: [] }
     },
   });
   for (const code of [
+    section('function setQuickSearchDraft(', 'function commitQuickSearch('),
     section('function sourceSpecFromArtifact(', '\nfunction applySourceSpec('),
     section('function artifactSessionFor(', '\nconst baseName'),
     section('function storeCurrentArtifactInSession()', '\nfunction updateContextBar()'),

@@ -10,6 +10,7 @@ mod build;
 mod ops;
 mod sql;
 mod text;
+mod time_index;
 mod udf;
 
 pub(crate) use ops::*;
@@ -316,6 +317,8 @@ pub(crate) struct Session {
     /// Inverted text index of each part with its first line; empty when a
     /// part has none (free text is then scanned).
     texts: Vec<(usize, text::Text)>,
+    /// Complete verified capabilities only; acquiring them never reads files.
+    time_indexes: RwLock<Option<time_index::ReadSet>>,
     /// Shared OS leases outlive database connections and mapped text readers.
     _leases: Vec<std::fs::File>,
 }
@@ -368,7 +371,7 @@ fn timestamp_non_null_proof(conn: &Connection) -> bool {
 }
 
 impl Session {
-    fn open(spec: &SourceSpec) -> Result<Session, String> {
+    fn open(spec: &SourceSpec, time_indexes: Option<time_index::ReadSet>) -> Result<Session, String> {
         let mut leases = Vec::with_capacity(spec.parts.len());
         for part in &spec.parts {
             let file = std::fs::OpenOptions::new()
@@ -501,8 +504,13 @@ impl Session {
             selection_changed: parking_lot::Condvar::new(),
             garbage: Arc::new(Mutex::new(Vec::new())),
             texts,
+            time_indexes: RwLock::new(time_indexes),
             _leases: leases,
         })
+    }
+
+    pub(crate) fn exact_time_indexes(&self) -> Option<time_index::ReadSet> {
+        self.time_indexes.read().clone()
     }
 
     /// Lines (sorted) whose free text may contain `needle`, through the
@@ -845,9 +853,17 @@ struct Registry {
     /// need ownership independent of the currently opened session's identity.
     source_keys: HashMap<String, HashSet<String>>,
     progress: HashMap<String, BuildProgress>,
+    time_cache: time_index::VerifiedCache,
+    time_attempts: HashMap<String, std::time::Instant>,
 }
 
 impl Registry {
+    fn install_times(&mut self, spec: &SourceSpec) {
+        let Some(readers) = self.time_cache.complete(spec.parts.iter().map(|part|part.key.as_str())) else { return; };
+        for session in self.base_session.iter().chain(self.session.iter()) {
+            if session.key == spec.key { *session.time_indexes.write() = Some(Arc::clone(&readers)); }
+        }
+    }
     fn remember_spec(&mut self, idx: &FileIndex, spec: &SourceSpec) {
         self.source_keys
             .entry(source_identity(idx))
@@ -901,6 +917,8 @@ impl Registry {
         self.wanted.retain(|key| keep.contains(key));
         self.failed.retain(|key, _| keep.contains(key));
         self.progress.retain(|key, _| keep.contains(key));
+        self.time_cache.retain(|key| keep.contains(key));
+        self.time_attempts.retain(|key,_| keep.contains(key));
         self.source_identity = identity.unwrap_or_default().to_string();
         // Active builders keep their claims until they unwind. Dropping the
         // claim here could let a foreground retry race the same segment.
@@ -987,7 +1005,9 @@ pub(crate) fn session_checked(
         };
         if let Some(current) = cached {
             if current.key == spec.key {
-                return Ok(Some(Arc::clone(current)));
+                let current = Arc::clone(current);
+                maybe_schedule_time(reg, idx, &spec, base.as_ref(), derived, codes, system);
+                return Ok(Some(current));
             }
         }
         if let Some(error) = reg.failed.get(&spec.key) {
@@ -999,11 +1019,12 @@ pub(crate) fn session_checked(
                 .iter()
                 .any(|part| !reg.failed.contains_key(&part.key))
             {
-                schedule(idx, &spec, base.as_ref(), derived, codes, system);
+                schedule(reg, idx, &spec, base.as_ref(), derived, codes, system);
             }
             return Ok(None);
         }
-        match Session::open(&spec) {
+        let time_indexes = reg.time_cache.complete(spec.parts.iter().map(|part|part.key.as_str()));
+        match Session::open(&spec, time_indexes) {
             Ok(session) => {
                 let session = Arc::new(session);
                 if derived.is_empty() {
@@ -1011,6 +1032,7 @@ pub(crate) fn session_checked(
                 } else {
                     reg.session = Some(Arc::clone(&session));
                 }
+                maybe_schedule_time(reg, idx, &spec, base.as_ref(), derived, codes, system);
                 Ok(Some(session))
             }
             Err(error) => {
@@ -1078,7 +1100,7 @@ pub(crate) fn request_rebuild(
         if reg.session.as_ref().is_some_and(|s| s.key != desired.key) {
             reg.session = None;
         }
-        schedule(idx, &desired, base.as_ref(), derived, codes, system);
+        schedule(reg, idx, &desired, base.as_ref(), derived, codes, system);
     });
 }
 
@@ -1191,6 +1213,7 @@ fn supersedes(new: &RequestKey, current: &RequestKey) -> bool {
 }
 
 fn schedule(
+    reg: &mut Registry,
     idx: &FileIndex,
     spec: &SourceSpec,
     base: Option<&SourceSpec>,
@@ -1199,7 +1222,9 @@ fn schedule(
     system: &CodesConfig,
 ) {
     if crate::operations::update_paused() { return; }
-    let queue = BACKGROUND_QUEUE.get_or_init(|| {
+    // All callers hold Registry's mutex, so initialization is serialized.
+    // A missing optional-worker resource must not panic an otherwise ready query.
+    let queue = if let Some(queue) = BACKGROUND_QUEUE.get() { queue } else {
         let queue = Arc::new(BackgroundQueue {
             state: Mutex::new(QueueState::default()),
             wake: parking_lot::Condvar::new(),
@@ -1207,7 +1232,7 @@ fn schedule(
             running: AtomicBool::new(false),
         });
         let worker = Arc::clone(&queue);
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("loginsight-engine".into())
             .spawn(move || {
                 crate::resources::lower_priority();
@@ -1233,10 +1258,12 @@ fn schedule(
                     let _running = Running(&worker);
                     run_background(&worker, &request);
                 }
-            })
-            .expect("engine worker thread");
-        queue
-    });
+            });
+        if let Err(error) = spawned { eprintln!("[motor] preparação em segundo plano adiada: {error}"); return; }
+        let inserted = BACKGROUND_QUEUE.set(queue);
+        debug_assert!(inserted.is_ok(), "Registry serializes background queue initialization");
+        BACKGROUND_QUEUE.get().expect("background queue registered")
+    };
     let key = RequestKey {
         source: source_identity(idx),
         config: spec.key.clone(),
@@ -1252,6 +1279,12 @@ fn schedule(
     if current.is_some_and(|current| !supersedes(&key, current)) {
         return;
     }
+    // Bound strong cache ownership to this accepted base/desired request,
+    // rather than retaining every historical derived variant of one source.
+    let keys: HashSet<String> = base.iter().flat_map(|s|&s.parts).chain(&spec.parts).map(|p|p.key.clone()).collect();
+    reg.time_cache.retain(|key|keys.contains(key));
+    reg.time_attempts.retain(|key,_|key==&spec.key || base.is_some_and(|base|key==&base.key));
+    reg.time_attempts.insert(spec.key.clone(),std::time::Instant::now());
     let revision = queue.revision.fetch_add(1, Ordering::SeqCst) + 1;
     state.pending = Some(BackgroundRequest {
         key,
@@ -1367,6 +1400,109 @@ fn run_background(queue: &BackgroundQueue, request: &BackgroundRequest) {
             });
             if was_cancelled || failed {
                 return;
+            }
+        }
+    }
+    prepare_optional_times(queue, request);
+}
+
+/// Optional work stays on the mandatory builder's single queue. A foreground
+/// interaction pauses it; background status polling is deliberately not a gate.
+fn optional_time_enabled() -> bool {
+    std::env::var("LOGINSIGHT_TIME_PRECOMPUTE").as_deref() != Ok("0")
+}
+fn maybe_schedule_time(
+    reg: &mut Registry, idx: &FileIndex, spec: &SourceSpec, base: Option<&SourceSpec>,
+    derived: &[CompiledDerived], codes: &CodesConfig, system: &CodesConfig,
+) {
+    if !optional_time_enabled() || crate::operations::update_paused() { return; }
+    reg.install_times(spec);
+    if spec.parts.iter().all(|part| reg.time_cache.contains(&part.key)) { return; }
+    let now = std::time::Instant::now();
+    if reg.time_attempts.get(&spec.key).is_some_and(|last| now.duration_since(*last) < std::time::Duration::from_secs(30)) { return; }
+    // Retry optional I/O failures at most once per 30 seconds on actual demand.
+    reg.time_attempts.insert(spec.key.clone(), now);
+    schedule(reg, idx, spec, base, derived, codes, system);
+}
+fn optional_quiet(cancelled: &dyn Fn() -> bool, quiet: std::time::Duration) -> bool {
+    let mut idle = std::time::Instant::now();
+    loop {
+        if cancelled() { return false; }
+        if crate::operations::interactive_active() { idle = std::time::Instant::now(); }
+        else if idle.elapsed() >= quiet { return true; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+fn load_optional_time(part: &PartSpec, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<Option<Arc<time_index::TimeIndex>>, String> {
+    if cancelled() { return Err("Preparação temporal pausada.".into()); }
+    // The immutable base is pinned before validation and before acquiring the
+    // sidecar lease; the returned handle retains its own base/sidecar leases.
+    let base = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(part.path.with_extension("build.lock")).map_err(|e| e.to_string())?;
+    if fs2::FileExt::try_lock_shared(&base).is_err() { return Ok(None); }
+    if !store_ready(part) { return Err("Checkpoint principal indisponível para resumo opcional.".into()); }
+    let identity = time_index::identity(&part.path, part.rows)?;
+    match time_index::open_cancellable(&part.path, &identity, cancelled) {
+        Ok(Some(index)) => return Ok(Some(index)),
+        Ok(None) | Err(_) => { if cancelled() { return Err("Preparação temporal pausada.".into()); } }
+    }
+    let parent = part.path.parent().ok_or("Checkpoint sem diretório.")?;
+    let needed = (part.rows as u64).checked_mul(8).and_then(|n| n.checked_add(1 << 30)).ok_or("Resumo temporal grande demais.")?;
+    if free_space(parent).is_some_and(|bytes| bytes < needed) { return Err("Resumo temporal adiado por espaço em disco.".into()); }
+    let scratch = tempfile::Builder::new().prefix(&format!("{}.time-spill.", part.key)).suffix(".pending")
+        .tempdir_in(parent).map_err(|e| e.to_string())?;
+    let config = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly).map_err(|e| e.to_string())?;
+    let conn = Connection::open_with_flags(&part.path, config).map_err(|e| e.to_string())?;
+    conn.execute_batch(&format!("SET temp_directory={}; SET preserve_insertion_order=false;", sql::lit(&scratch.path().to_string_lossy()))).map_err(|e| e.to_string())?;
+    limit_resources(&conn, true)?;
+    time_index::ensure(&conn, &part.path, &identity, cancelled)?;
+    drop(conn);
+    if cancelled() { return Err("Preparação temporal pausada.".into()); }
+    time_index::open_cancellable(&part.path, &identity, cancelled)
+}
+fn prepare_optional_times(queue: &BackgroundQueue, request: &BackgroundRequest) {
+    if !optional_time_enabled() { return; }
+    let obsolete = || queue.revision.load(Ordering::SeqCst) != request.revision || crate::operations::update_paused();
+    for spec in request.base.iter().chain(std::iter::once(&request.spec)) {
+        for part in &spec.parts {
+            if obsolete() || !still_wanted(&part.key) { return; }
+            if with_registry(|reg| reg.time_cache.contains(&part.key)) { continue; }
+            let mut quiet_ms = 250;
+            loop {
+                let stopped = || obsolete() || !still_wanted(&part.key);
+                if !optional_quiet(&stopped, std::time::Duration::from_millis(quiet_ms)) { return; }
+                let preempted = AtomicBool::new(false);
+                // Do not acquire Registry while validating/sorting: a foreground
+                // Session open may hold it. Revision/UpdatePause are atomic;
+                // ownership is checked at each part boundary and publication.
+                let cancelled = || {
+                    let interactive = crate::operations::interactive_active();
+                    if interactive { preempted.store(true, Ordering::Relaxed); }
+                    obsolete() || interactive
+                };
+                if let Err(error) = crate::sources::validate_source(&request.idx.parts[part.part]) {
+                    eprintln!("[motor] resumo temporal adiado: {error}"); return;
+                }
+                let result = load_optional_time(part, &cancelled);
+                if stopped() { return; }
+                if preempted.load(Ordering::Relaxed) || crate::operations::interactive_active() {
+                    // A preempted optional sort is not a failed source. Wait
+                    // for a quiet period, with bounded backoff, then retry it.
+                    quiet_ms = (quiet_ms * 2).min(2_000); continue;
+                }
+                match result {
+                    Ok(Some(index)) => {
+                        if crate::sources::validate_source(&request.idx.parts[part.part]).is_err() { return; }
+                        with_registry(|reg| {
+                            if obsolete() || !reg.wanted.contains(&part.key) { return; }
+                            reg.time_cache.insert(part.key.clone(), index);
+                            reg.install_times(spec);
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("[motor] resumo temporal opcional adiado: {error}"),
+                }
+                break;
             }
         }
     }
@@ -1686,7 +1822,7 @@ fn prune(keep: &std::path::Path) {
                         .open(lock_path)
                     {
                         if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
-                            let _ = std::fs::remove_file(&path);
+                            let _ = if meta.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
                         }
                     }
                 }
@@ -1722,8 +1858,7 @@ fn prune(keep: &std::path::Path) {
             if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
                 continue;
             }
-            build::remove_database(&path);
-            total = total.saturating_sub(size);
+            if build::remove_database(&path) { total = total.saturating_sub(size); }
         }
     }
 }
@@ -2001,6 +2136,7 @@ mod lifecycle_tests {
             selection_changed: parking_lot::Condvar::new(),
             garbage: Arc::new(Mutex::new(Vec::new())),
             texts: Vec::new(),
+            time_indexes: RwLock::new(None),
             _leases: vec![lease],
         })
     }
@@ -2327,4 +2463,21 @@ mod metadata_identity_tests {
         idx.parts[0].event_identity = Some("other:event".into());
         assert_ne!(alias, spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key);
     }
+    #[test]
+    fn optional_worker_yields_to_interaction_and_quiesce_cancellation() {
+        let interacting = crate::operations::interactive();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancelled);
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done.send(optional_quiet(&|| stop.load(Ordering::Acquire), std::time::Duration::from_millis(1))).unwrap();
+        });
+        assert!(result.recv_timeout(std::time::Duration::from_millis(60)).is_err(), "optional work must not start during an interaction");
+        cancelled.store(true, Ordering::Release);
+        assert!(!result.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+        drop(interacting);
+        assert!(optional_quiet(&|| false, std::time::Duration::from_millis(1)), "idle retry is allowed without a new scheduler");
+    }
+
 }

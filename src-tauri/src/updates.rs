@@ -162,6 +162,9 @@ struct Inner {
 
 pub struct UpdateState {
     inner: Mutex<Inner>,
+    // A successful installer handoff must keep new work paused until exit,
+    // including when its awaiting IPC future is dropped before restart.
+    shutdown_pause: Mutex<Option<crate::operations::UpdatePause>>,
 }
 
 /// Runs before anything reads the data folder: on the first start of a version
@@ -181,6 +184,7 @@ pub fn prepare(current: &Version) -> UpdateState {
     prefs.last_run_version = Some(version);
     let _ = save_prefs(&dir, &prefs);
     UpdateState {
+        shutdown_pause: Mutex::new(None),
         inner: Mutex::new(Inner {
             prefs,
             phase: Phase::Idle,
@@ -617,6 +621,18 @@ fn install_failed(app: &AppHandle, reason: &str) -> String {
     message
 }
 
+fn install_and_retain_pause(
+    pause: crate::operations::UpdatePause,
+    held: &Mutex<Option<crate::operations::UpdatePause>>,
+    install: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    // Errors and unwinding release the reversible guard. Success transfers it
+    // before the blocking task completes, leaving no admission gap at await.
+    install()?;
+    *held.lock() = Some(pause);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn update_install(app: AppHandle, restart: Option<bool>) -> Result<(), String> {
     let restart = restart.unwrap_or(true);
@@ -629,11 +645,15 @@ pub async fn update_install(app: AppHandle, restart: Option<bool>) -> Result<(),
         begin_install(&app, &mut inner)?
     };
     // On Windows the plugin starts the installer and ends this process; the installer reopens the app.
+    let handoff_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         // The guard pauses admission, cancels and joins app-owned work. On a
         // failed launch its Drop makes the still-open source usable again.
-        let _pause = crate::engine::prepare_for_update()?;
-        update.restart_after_install(restart).install(package.as_slice()).map_err(|error| describe(&error))
+        let pause = crate::engine::prepare_for_update()?;
+        let state = handoff_app.state::<UpdateState>();
+        install_and_retain_pause(pause, &state.shutdown_pause, || {
+            update.restart_after_install(restart).install(package.as_slice()).map_err(|error| describe(&error))
+        })
     }).await;
     match result {
         Ok(Ok(())) if restart => app.restart(),
@@ -850,6 +870,28 @@ pub fn run_e2e(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_install_retains_pause_but_failure_and_unwind_release_it() {
+        let held = Mutex::new(None);
+        let pause = crate::operations::pause_for_update().unwrap();
+        assert!(install_and_retain_pause(pause, &held, || Err("installer unavailable".into())).is_err());
+        assert!(held.lock().is_none());
+        assert!(!crate::operations::update_paused());
+        let pause = crate::operations::pause_for_update().unwrap();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = install_and_retain_pause(pause, &held, || panic!("controlled installer unwind"));
+        }));
+        assert!(unwind.is_err());
+        assert!(!crate::operations::update_paused());
+        let pause = crate::operations::pause_for_update().unwrap();
+        install_and_retain_pause(pause, &held, || Ok(())).unwrap();
+        assert!(held.lock().is_some());
+        assert!(crate::operations::update_paused());
+        assert!(crate::operations::token(None).is_err());
+        drop(held);
+        assert!(!crate::operations::update_paused());
+    }
 
     fn version(text: &str) -> Version {
         Version::parse(text).unwrap()

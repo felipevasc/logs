@@ -30,7 +30,7 @@ Coleta textual isolada sobre os mesmos 52 índices existentes, nove amostras ap�
 | Palavra inexistente | 629,6 ms | 408,5 ms |
 | Palavra ampla, orçamento excedido | 9,0 ms | 9,9 ms |
 
-Esta segunda medição cobre candidatos, não SQL, IPC, interface ou busca completa. Os pares preservaram contagem, decisão de seletividade e digest dos IDs ordenados. A coleta elimina a segunda travessia e o conjunto hash; a construção de um scorer regex ainda pode expandir o dicionário antes do primeiro candidato. Não é um limite rígido de toda a consulta textual.
+Esta segunda medição cobre candidatos, não SQL, IPC, interface ou busca completa. Os pares preservaram contagem, decisão de seletividade e digest dos IDs ordenados. A coleta elimina a segunda travessia e o conjunto hash; essa primeira mudança ainda deixava a construção de um scorer regex expandir o dicionário antes do primeiro candidato. A etapa seguinte abaixo trata esse custo; as medições de 50M não devem ser atribuídas a ela.
 
 ## Metadados e disco
 
@@ -59,3 +59,14 @@ Próxima etapa arquitetural: um sidecar opcional com timestamps ordenados por cl
 ## Cadência de desenvolvimento
 
 Pesquisa, implementação estrutural e experiência de uso avançam continuamente em mudanças pequenas. Cada mudança recebe verificações focadas e rápidas; os cenários de integridade de dados/atualização continuam obrigatórios quando afetados. No PR em rascunho, o CI executa os testes rápidos e os fluxos de interação alterados. A suíte completa nativa/navegador roda ao marcar para revisão ou disparar a validação completa explicitamente. Benchmarks grandes e atualização instalada assinada ficam para a etapa final solicitada; publicar uma alteração em desenvolvimento não significa que esses gates já passaram. O workflow de release mantém suas verificações completas.
+
+## Segunda rodada focada
+
+- O probe textual agora percorre termos/postings diretamente com tetos explícitos de termos, postings e bitmap. Esgotar um teto retorna ao caminho exato, nunca uma lista parcial. O limite padrão de 262.144 termos foi confrontado com os cerca de 99.906 termos por segmento do corpus retido
+- Microteste sintético de 10 mil linhas, 20 pares alternados após aquecimento: termo comum 3,27→0,0081 ms; hexadecimal completo em busca livre 6,03→0,81 ms; palavra rara 2,09→1,27 ms; combinação comum/rara 4,53→2,02 ms. São tempos isolados do probe, não da aplicação ou de 50M; caudas de latência variaram. O caso amplo interrompeu após 33 postings para limite de 32 candidatos
+- Os 21 testes focados de texto/cancelamento passaram após integração. Dois microbenchmarks ficaram ignorados por padrão. Os testes nativos de estatísticas e três matrizes de timestamp também passaram, incluindo a inconsistência anterior do timestamp zero
+- A publicação opcional de resumos temporais está ligada à fila única, com preempção por interação, leases e disponibilidade completa por sessão. O harness pequeno de produção/leases passou; o roteamento de consultas e a compilação integrada dessa etapa ainda estão pendentes. Detalhes em [resumos temporais](benchmarks/v010-time-precompute.md)
+- Troca de tema reaproveita os gráficos; páginas de agrupamento/pivot reaproveitam a ordenação local com invalidação por conteúdo. Células e sugestões limitam apenas sua representação visual, preservando valores integrais para filtros, cópia e evidências
+- Após instalação bem-sucedida, a pausa de trabalho fica retida até a saída do processo. Falha e unwind liberam a pausa. O teste focado usa o helper real e o módulo real de operações; instalação Windows continua sendo um gate final
+
+O Chromium de CI já confirmou recuperação de salvamento/instalação. A validação de responsividade continua sendo iterada: o primeiro resultado expôs o fechamento imediato do composer pelo clique propagado, corrigido; o segundo expôs uma expectativa antiga que confundia resumo enfileirado com resumo em execução. Nenhum desses resultados representa aprovação completa do navegador.

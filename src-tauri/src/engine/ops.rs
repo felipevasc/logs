@@ -619,7 +619,8 @@ mod bounded_analytics_tests {
             timestamps_non_null: false, baked: false, names: RwLock::new(None),
             names_version: AtomicU64::new(0), selections: Mutex::new(Vec::new()),
             selection_builds: Mutex::new(std::collections::HashSet::new()), selection_changed: parking_lot::Condvar::new(),
-            garbage: Arc::new(Mutex::new(Vec::new())), texts: Vec::new(), _leases: Vec::new(),
+            garbage: Arc::new(Mutex::new(Vec::new())), texts: Vec::new(),
+            time_indexes: RwLock::new(None), _leases: Vec::new(),
         }
     }
 

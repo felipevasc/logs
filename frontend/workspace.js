@@ -175,7 +175,7 @@
     return showPage(target);
   }
   function search(text) {
-    state.quick = text; $("#quick-search").value = text; state.page = 0; renderChips(); syncCurrentSavedFilter();
+    state.quick = text; setQuickSearchDraft(text); state.page = 0; renderChips(); syncCurrentSavedFilter();
     rememberSelection();
     return showPage("explore");
   }
@@ -186,7 +186,7 @@
   async function contextAround(start, end = start, margin = 5 * 60000) {
     if (workspaceScope() === "case") await window.WorkspaceContext?.setScope("dataset", { animate: false });
     if (!state.loaded) { toast("Abra os registros de origem para ver o contexto.", "info"); return; }
-    state.quick = ""; $("#quick-search").value = ""; window.QueryBar?.status(null);
+    state.quick = ""; setQuickSearchDraft();
     return applyFilters([{ column: "timestamp", op: "between", value: String(start - margin), value2: String(end + margin) }], true);
   }
   const timeline = window.createTimelineView({
@@ -197,7 +197,7 @@
     applyRange,
     onMode: mode => { setAnalysisView(mode === "table" ? "timeline-table" : mode === "horizontal" ? "timeline" : "vtimeline"); if (activeCase()) { activeCase().workspace.analysisView = state.analysisView; activeCase().workspace.timelineMode = mode; } showPage("case-timeline"); },
   });
-  function undo() { const previous = history.pop(); if (!previous) return; Object.assign(state, previous); state.page = 0; previousSelection = structuredClone(previous); lastFilters = JSON.stringify(previous); $("#quick-search").value = state.quick; renderChips(); syncCurrentSavedFilter(); refresh(); }
+  function undo() { const previous = history.pop(); if (!previous) return; Object.assign(state, previous); state.page = 0; previousSelection = structuredClone(previous); lastFilters = JSON.stringify(previous); setQuickSearchDraft(state.quick); renderChips(); syncCurrentSavedFilter(); refresh(); }
   // Comparar is a mode of Explorar → Descobrir: it renders into the host it is given.
   let compareHost = null, compareCurrent = () => false;
   async function renderCompare(host, isCurrent) {
@@ -553,7 +553,7 @@
   // The Linha do tempo menu reopens the section last used in this area.
   $('.nav-pages [data-page="case-timeline"]').onclick = () => showPage(lastGroupPage[workspaceScope()] || "case-timeline");
   $("#ws-reload").onclick = async () => { cacheKey = ""; timeline.invalidate(); window.Security?.invalidate(); await showPage(page); };
-  $("#ws-clear-scope").onclick = () => { state.filters = []; state.quick = ""; $("#quick-search").value = ""; state.page = 0; renderChips(); syncCurrentSavedFilter(); refresh().then(() => showPage(page)); };
+  $("#ws-clear-scope").onclick = () => { state.filters = []; state.quick = ""; setQuickSearchDraft(); state.page = 0; renderChips(); syncCurrentSavedFilter(); refresh().then(() => showPage(page)); };
   $("#ws-export").onclick = openExport; $("#ws-export-close").onclick = () => { $("#ws-export-modal").hidden = true; }; $("#ws-export-save").onclick = exportFile;
   $("#ws-export-kind").onchange = () => { const wholeCase=["case", "case-pdf", "report"].includes($("#ws-export-kind").value);$("#ws-export-scope").textContent=wholeCase?`Caso completo · ${fmtNum(activeCase()?.items?.length||0)} itens. Imagens acompanham a investigação JSON e o relatório PDF.`:`${currentCountLabel("registros")} no recorte atual.`;$("#ws-mask").closest("label").hidden=$("#ws-export-kind").value==="case-pdf"; };
   $("#ws-export-modal").onclick = e => { if (e.target.id === "ws-export-modal") e.target.hidden = true; };

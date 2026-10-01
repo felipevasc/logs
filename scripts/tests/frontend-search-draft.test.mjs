@@ -11,8 +11,8 @@ const document = { body: { dataset: {}, append() {} }, activeElement: null, list
 function element(tag = 'div', className = '') {
   const classes = new Set(className.split(' '));
   return { tag, className, value: '', hidden: false, innerHTML: '', textContent: '', style: {}, dataset: {}, listeners: {}, selectionStart: 0, selectionEnd: 0, selectionDirection: 'none',
-    classList: { add: c => classes.add(c), contains: c => classes.has(c), toggle(c, on) { if (on ?? !classes.has(c)) classes.add(c); else classes.delete(c); } },
-    setAttribute() {}, append() {}, after() {}, closest() { return node('.search-box'); }, getBoundingClientRect() { return { left: 5, bottom: 15, width: 300 }; },
+    attributes: {}, classList: { add: c => classes.add(c), contains: c => classes.has(c), toggle(c, on) { if (on ?? !classes.has(c)) classes.add(c); else classes.delete(c); } },
+    setAttribute(key,value) { this.attributes[key]=String(value); }, removeAttribute(key) { delete this.attributes[key]; }, append() {}, after() {}, closest() { return node('.search-box'); }, getBoundingClientRect() { return { left: 5, bottom: 15, width: 300 }; },
     addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); },
     dispatchEvent(event) { for (const fn of this.listeners[event.type] || []) fn(event); },
     setSelectionRange(start, end, direction = 'none') { Object.assign(this, { selectionStart: start, selectionEnd: end, selectionDirection: direction }); },
@@ -73,6 +73,28 @@ await type('request_'); assert.equal(list.hidden, false);
 input.dispatchEvent({ type: 'compositionstart' }); assert.equal(list.hidden, true);
 input.dispatchEvent({ type: 'input' }); await flush(); assert.equal(list.hidden, true);
 input.dispatchEvent({ type: 'compositionend' }); await flush(); assert.equal(list.hidden, false);
+
+// Accessible active options and bounded labels; oversized values are never silently shortened into filters.
+state.filters=[];state.treeAggSig={};state.rows=[{request_path:'visible '+ '😀'.repeat(300)},{request_path:'x'.repeat(1000000)}];
+await type('request_path:');assert.equal(input.attributes['aria-expanded'],'true');
+assert.equal(input.attributes['aria-controls'],'quick-search-suggestions');assert.match(input.attributes['aria-activedescendant'],/^quick-search-suggestions-0$/);
+assert.match(list.innerHTML,/Valores longos foram omitidos/);assert.ok(list.innerHTML.length<2000,'the popup never renders the full value');
+const beforeApply=input.value;input.listeners.keydown[0]({key:'Tab',preventDefault(){}});assert.notEqual(input.value,beforeApply);assert.ok(input.value.includes('😀'.repeat(300)),'a bounded label still accepts the full eligible value');
+input.value='request_path:';input.setSelectionRange(13,13);input.dispatchEvent({type:'input'});
+input.listeners.keydown[0]({key:'Escape',preventDefault(){},stopPropagation(){}});await flush();assert.equal(list.hidden,true,'Escape cancels a pending debounce too');
+assert.equal(input.attributes['aria-expanded'],'false');assert.equal(input.attributes['aria-activedescendant'],undefined);
+
+// Comment edits mutate local values without replacing the page; invalidate suggestions.
+const appSource = readFileSync(new URL('../../frontend/app.js', import.meta.url), 'utf8');
+const commentCase = {comments:{source:{1:'old comment'}}};
+state.currentArtifact={id:'source'};state.visibleCols=['comentario'];state.columns.push('comentario');state.rows=[{id:1}];
+Object.assign(context,{ensureCase:()=>commentCase,fillColumnControls(){},saveVisibleCols(){},renderTable(){},renderExploreTree(){},
+  cellValue:(event,field)=>field==='comentario'?commentCase.comments.source[event.id]:event[field]});
+vm.runInContext(appSource.slice(appSource.indexOf('function setEventComment('),appSource.indexOf('let commentEv =')),context);
+await type('comentario:');assert.match(list.innerHTML,/old comment/);
+context.setEventComment(state.rows[0],'new comment');assert.equal(list.hidden,true);assert.equal(saves,1,'the explicit comment edit still persists');
+await type('comentario:');assert.match(list.innerHTML,/new comment/);assert.doesNotMatch(list.innerHTML,/old comment/);
+assert.equal(saves,1,'suggesting the updated comment does not autosave');saves=0;
 
 // Use real workspace capture/sanitize/apply, preserving draft separately from applied quick.
 const c = { id: caseId, workspace: {} };
