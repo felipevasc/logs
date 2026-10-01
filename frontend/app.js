@@ -582,22 +582,29 @@ function activityHide() {
 }
 
 // Case records travel once per version; commands then refer to them by key.
-const caseTransport = { keys: new WeakMap(), synced: new Map(), pending: new Map(), serial: 0, publication: 0 };
+const caseTransport = { keys: new WeakMap(), synced: new Map(), tokens: new Map(), pending: new Map(), serial: 0, publication: 0,
+  windowKey: window.crypto?.randomUUID?.() || Math.random().toString(36).slice(2) };
 const caseSyncKey = (key, args) => JSON.stringify([key, args.analysisContext?.caseId ?? null, args.analysisContext?.analysisId ?? null]);
-async function caseArgs(args, resync = false, previousPublication = null) {
+const validCaseContentToken = value => typeof value === "string" && value.length > 0 && value.length <= 128 && new TextEncoder().encode(value).length <= 128;
+async function caseArgs(args, resync = false, previousPublication = null, { canonical = false } = {}) {
   const events = args.caseEvents;
-  if (!Array.isArray(events)) return args;
+  if (!Array.isArray(events)) {
+    if (canonical && args.caseKey && !validCaseContentToken(args.caseContentToken)) throw Error("Não foi possível confirmar a versão exata das evidências do Caso. Atualize a análise.");
+    return args;
+  }
   let key = caseTransport.keys.get(events);
-  if (!key) { key = `case-${++caseTransport.serial}-${events.length}`; caseTransport.keys.set(events, key); }
+  if (!key) { key = `case-${caseTransport.windowKey}-${++caseTransport.serial}-${events.length}`; caseTransport.keys.set(events, key); }
   const syncKey = caseSyncKey(key, args);
   const force = resync && (previousPublication === null || caseTransport.synced.get(syncKey) === previousPublication);
-  if (force || !caseTransport.synced.has(syncKey)) {
+  if (force || !caseTransport.synced.has(syncKey) || canonical && !validCaseContentToken(caseTransport.tokens.get(syncKey))) {
     let pending = caseTransport.pending.get(syncKey);
     if (!pending) {
       pending = Promise.resolve().then(async () => {
-        await invoke("case_sync", { key, events, analysisContext: args.analysisContext ?? null, sourceGeneration: args.sourceGeneration ?? null });
+        const receipt = await invoke("case_sync", { key, events, analysisContext: args.analysisContext ?? null, sourceGeneration: args.sourceGeneration ?? null });
+        if (validCaseContentToken(receipt?.caseContentToken)) caseTransport.tokens.set(syncKey, receipt.caseContentToken);
+        else caseTransport.tokens.delete(syncKey);
         caseTransport.synced.set(syncKey, ++caseTransport.publication);
-        if (caseTransport.synced.size > 3) caseTransport.synced.delete(caseTransport.synced.keys().next().value);
+        if (caseTransport.synced.size > 3) { const evicted = caseTransport.synced.keys().next().value; caseTransport.synced.delete(evicted); caseTransport.tokens.delete(evicted); }
       }).finally(() => {
         if (caseTransport.pending.get(syncKey) === pending) caseTransport.pending.delete(syncKey);
       });
@@ -605,8 +612,10 @@ async function caseArgs(args, resync = false, previousPublication = null) {
     }
     await pending;
   }
-  const { caseEvents: _omit, ...rest } = args;
-  return { ...rest, caseKey: key };
+  const token = caseTransport.tokens.get(syncKey);
+  if (canonical && !validCaseContentToken(token)) throw Error("Não foi possível confirmar a versão exata das evidências do Caso. Atualize a análise.");
+  const { caseEvents: _omit, caseContentToken: _oldToken, ...rest } = args;
+  return { ...rest, caseKey: key, ...(canonical ? { caseContentToken: token } : {}) };
 }
 
 async function api(cmd, args = {}, opts = {}) {
@@ -622,9 +631,10 @@ async function api(cmd, args = {}, opts = {}) {
     let casePublication = null;
     const preparedArgs = async (retry = false) => {
       const capturedArgs = retry && !Array.isArray(args.caseEvents) && Array.isArray(opts.caseEvents) ? { ...args, caseEvents: opts.caseEvents } : args;
-      const prepared = await caseArgs(capturedArgs, retry, casePublication);
+      const prepared = await caseArgs(capturedArgs, retry, casePublication, { canonical: cmd === "analysis_field_text" });
       if (prepared.caseKey) casePublication = caseTransport.synced.get(caseSyncKey(prepared.caseKey, prepared)) ?? null;
       if (opts.cancelled?.()) throw new Error("Operação cancelada.");
+      if (cmd === "analysis_field_text" && prepared.caseKey) opts.onCasePrepared?.({ caseKey: prepared.caseKey, caseContentToken: prepared.caseContentToken });
       return prepared;
     };
     try {
@@ -2071,6 +2081,33 @@ function toggleFacet(column, value) {
 
 let currentEditFilterIndex = null;
 let currentEditFilter = null, currentEditFilterValue = null, currentFilterContext = null, filterReturnFocus = null, filterComposing = false;
+const filterValueFormats = new Map();
+function setFilterInputValue(selector, value) {
+  const input = $(selector), text = String(value ?? ""), escaped = text.includes("\r");
+  filterValueFormats.set(selector, escaped ? "json" : "text");
+  input.value = escaped ? JSON.stringify(text) : text;
+  input.rows = escaped ? 2 : Math.min(4, text.split("\n", 4).length);
+  input.setAttribute("data-value-format", escaped ? "json-string" : "text");
+  input.setAttribute("aria-describedby", "fp-text-hint");
+}
+function readFilterInputValue(selector) {
+  const value = $(selector).value;
+  if (filterValueFormats.get(selector) !== "json") return value;
+  try { const decoded = JSON.parse(value); if (typeof decoded === "string") return decoded; } catch { /* Keep malformed edits visible. */ }
+  throw Error("O valor com escapes deve ser um texto JSON entre aspas. Use \\r e \\n para preservar as quebras de linha.");
+}
+function refreshFilterInputHint() {
+  const escaped = filterValueFormats.get("#fp-val") === "json" || !$("#fp-val2").hidden && filterValueFormats.get("#fp-val2") === "json";
+  $("#fp-text-hint").textContent = escaped
+    ? "Retornos CR são exibidos como texto JSON entre aspas; \\r e \\n preservam cada quebra. Enter aplica; Shift+Enter insere \\n."
+    : "Enter aplica · Shift+Enter insere uma nova linha.";
+}
+function insertFilterLineBreak(input) {
+  const start = Math.max(1, Math.min(input.value.length - 1, input.selectionStart ?? input.value.length - 1));
+  const end = Math.max(start, Math.min(input.value.length - 1, input.selectionEnd ?? start));
+  input.value = input.value.slice(0, start) + "\\n" + input.value.slice(end);
+  input.setSelectionRange?.(start + 2, start + 2);
+}
 function filterContextKey() {
   return JSON.stringify([workspaceScope(), activeCase()?.id, window.AnalysisContexts?.capture().instance, window.AnalysisContexts?.identity(), state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields]);
 }
@@ -2088,6 +2125,7 @@ function closeFilterPop(restoreFocus = true) {
 
 // popover de novo filtro ou edição
 function openFilterPop(anchor = null, editIndex = null, preset = null) {
+  window.CanonicalFields?.cancel();
   currentEditFilterIndex = editIndex; filterComposing = false;
   currentEditFilter = editIndex == null ? null : state.filters[editIndex];
   currentEditFilterValue = currentEditFilter ? JSON.stringify(currentEditFilter) : null;
@@ -2116,15 +2154,16 @@ function openFilterPop(anchor = null, editIndex = null, preset = null) {
     if (![...colSel.options].some(option => option.value === f.column)) colSel.appendChild(el("option", "", colLabel(f.column))).value = f.column;
     colSel.value = f.column;
     opSel.value = f.op;
-    $("#fp-val").value = f.value ?? "";
-    $("#fp-val2").value = f.value2 ?? "";
+    setFilterInputValue("#fp-val", f.value);
+    setFilterInputValue("#fp-val2", f.value2);
     $("#fp-val2").hidden = f.op !== "between";
   } else {
-    $("#fp-val").value = "";
-    $("#fp-val2").value = "";
+    setFilterInputValue("#fp-val", "");
+    setFilterInputValue("#fp-val2", "");
     $("#fp-val2").hidden = true;
   }
-  opSel.onchange = () => { $("#fp-val2").hidden = opSel.value !== "between"; };
+  opSel.onchange = () => { $("#fp-val2").hidden = opSel.value !== "between"; refreshFilterInputHint(); };
+  refreshFilterInputHint();
   pop.hidden = false;
   positionPop(pop, anchor || $("#btn-add-filter"));
   $("#fp-val").focus();
@@ -2193,9 +2232,11 @@ function applyFilterPop() {
   }
   const column = $("#fp-col").value;
   const op = $("#fp-op").value;
-  const value = $("#fp-val").value;
-  const value2 = $("#fp-val2").value;
-  if (!["empty", "not_empty"].includes(op) && !value.trim()) {
+  let value, value2;
+  try { value = ["empty", "not_empty"].includes(op) ? "" : readFilterInputValue("#fp-val"); value2 = op === "between" ? readFilterInputValue("#fp-val2") : ""; }
+  catch (error) { toast(error.message, "info"); return false; }
+  const literalWhitespace = ["contains", "not_contains", "starts_with", "ends_with", "regex"].includes(op) && value.length > 0;
+  if (!["empty", "not_empty", "equals_exact", "not_equals_exact"].includes(op) && !literalWhitespace && !value.trim()) {
     toast("Informe um valor para o filtro.", "info");
     return;
   }
@@ -2479,6 +2520,7 @@ function closeCtxMenu() {
 }
 
 function showCtxMenu(x, y, items) {
+  window.CanonicalFields?.cancel();
   closeCtxMenu();
   const owner = window.AnalysisContexts?.capture();
   const m = el("div", "ctx-menu");
@@ -4539,6 +4581,7 @@ function saveManualEvent() {
 // menu de contexto de uma célula de evento
 function eventCellMenu(ev, col, value, anchor = null) {
   ensureSelectionOwner();
+  const exact = window.CanonicalFields.capture(ev, col, { anchor, ...(col === "comentario" ? { historical: true, literal: eventComment(ev) } : {}) });
   const hasVal = value !== undefined && value !== null && String(value).trim() !== "";
   const items = [
     { icon: "fa-eye", label: "Ver detalhes", onClick: () => openDetail(ev.id) },
@@ -4549,18 +4592,18 @@ function eventCellMenu(ev, col, value, anchor = null) {
   items.push({
     icon: "fa-filter",
     label: `Criar filtro: ${colLabel(col)}`,
-    onClick: () => openValueFilter(col, col === "timestamp" ? ev.timestamp : value, anchor),
+    onClick: () => window.CanonicalFields.filter(exact),
   });
   if (hasVal) {
     items.push({
       icon: "fa-filter",
       label: `Filtrar igual: ${colLabel(col)} = ${trunc(value)}`,
-      onClick: () => addFilter({ column: col, op: "equals", value: String(value), value2: null }),
+      onClick: () => window.CanonicalFields.filter(exact, { op: "equals", apply: true }),
     });
     items.push({
       icon: "fa-filter-circle-xmark",
       label: `Excluir: ${colLabel(col)} ≠ ${trunc(value)}`,
-      onClick: () => addFilter({ column: col, op: "not_equals", value: String(value), value2: null }),
+      onClick: () => window.CanonicalFields.filter(exact, { op: "not_equals", apply: true }),
     });
   }
   items.push({ sep: true });
@@ -4586,7 +4629,7 @@ function eventCellMenu(ev, col, value, anchor = null) {
     items.push({
       icon: "fa-copy",
       label: "Copiar valor",
-      onClick: () => { navigator.clipboard.writeText(String(value)); toast("Copiado.", "ok"); },
+      onClick: () => window.CanonicalFields.copy(exact),
     });
   }
   items.push({ sep: true });
@@ -5397,6 +5440,14 @@ function detailFieldFilterValue(node) {
   return typeof node.filterValue === "object" ? JSON.stringify(node.filterValue) : String(node.filterValue ?? "");
 }
 
+function detailCanonicalAction(column, node, anchor) {
+  const event = state.currentDetailEv, request = detailRequest, admission = state.detailAdmission;
+  return window.CanonicalFields.capture(event, column, { anchor,
+    historical: !admission || !state.columns.includes(node.path),
+    literal: Object.hasOwn(node, "filterValue") ? node.filterValue : node.value,
+    guard: () => request === detailRequest && event === state.currentDetailEv && !$("#drawer").hidden && (!admission || detailAdmissionCurrent(admission)) });
+}
+
 function toggleDetailColumn(column) {
   const visible = state.visibleCols.includes(column);
   if (visible && column === "timestamp") return;
@@ -5418,7 +5469,8 @@ function showDetailNameMenu(event, node) {
     if (window.ExplorerTimeline) items.push(window.ExplorerTimeline.menuItem(column));
     if (window.FieldTransforms) items.push(window.FieldTransforms.menuItem(column, { event: state.currentDetailEv, anchor: event.target }));
     if (window.CaseReferences) items.push(window.CaseReferences.lookupMenuItem(column, event.target));
-    items.push(valueFilterMenuItem(column, node.hasValue ? detailFieldFilterValue(node) : "", event.target, { op: node.hasValue ? null : "contains" }));
+    const exact = detailCanonicalAction(column, node, event.target);
+    items.push({ icon: "fa-filter", label: `Criar filtro: ${colLabel(column)}`, onClick: () => window.CanonicalFields.filter(exact) });
     if (column !== "timestamp") items.push({
       icon: state.visibleCols.includes(column) ? "fa-eye-slash" : "fa-table-columns",
       label: state.visibleCols.includes(column) ? "Remover coluna da tabela" : "Adicionar coluna à tabela",
@@ -5444,22 +5496,24 @@ function showDetailValueMenu(event, node, selected = "", inModal = false) {
   const text = selected || (typeof node.value === "object" ? JSON.stringify(node.value) : raw);
   const sourceText = column && state.currentDetailEv ? String(cellValue(state.currentDetailEv, column) ?? "") : "";
   const canContain = !!column && !!text.trim() && sourceText.includes(text);
+  const exact = detailCanonicalAction(column || node.path, node, event.target);
+  const action = selected ? window.CanonicalFields.selection(exact, selected) : exact;
   const items = [];
   if (actual && window.FieldTransforms) items.push(window.FieldTransforms.menuItem(column, { event: state.currentDetailEv, anchor: event.target }));
-  if (column) items.push({ icon: "fa-filter", label: `Criar filtro: ${colLabel(column)}`, onClick: () => openValueFilter(column, text, event.target, selected ? "contains" : null) });
+  if (column) items.push({ icon: "fa-filter", label: `Criar filtro: ${colLabel(column)}`, onClick: () => window.CanonicalFields.filter(action, { op: selected ? "contains" : null }) });
   if (column && text.trim()) {
     if (actual && !selected) items.push(
-      { icon: "fa-filter", label: `Filtrar valor exato: ${trunc(text)}`, onClick: () => addFilter({ column, op: column === "timestamp" ? "between" : "equals_exact", value: raw, value2: column === "timestamp" ? raw : null }) },
-      { icon: "fa-filter-circle-xmark", label: `Excluir valor: ${trunc(text)}`, onClick: () => addFilter({ column, op: "not_equals_exact", value: raw, value2: null }) },
+      { icon: "fa-filter", label: `Filtrar valor exato: ${trunc(text)}`, onClick: () => window.CanonicalFields.filter(exact, { apply: true }) },
+      { icon: "fa-filter-circle-xmark", label: `Excluir valor: ${trunc(text)}`, onClick: () => window.CanonicalFields.filter(exact, { op: "not_equals_exact", apply: true }) },
     );
     if (canContain) items.push(
-      { icon: "fa-magnifying-glass", label: `${actual ? "Filtrar" : `Filtrar em ${colLabel(column)}`} contendo: ${trunc(text)}`, onClick: () => addFilter({ column, op: "contains", value: text, value2: null }) },
-      { icon: "fa-filter-circle-xmark", label: `${actual ? "Excluir" : `Excluir em ${colLabel(column)}`} contendo: ${trunc(text)}`, onClick: () => addFilter({ column, op: "not_contains", value: text, value2: null }) },
+      { icon: "fa-magnifying-glass", label: `${actual ? "Filtrar" : `Filtrar em ${colLabel(column)}`} contendo: ${trunc(text)}`, onClick: () => window.CanonicalFields.filter(action, { op: "contains", apply: true }) },
+      { icon: "fa-filter-circle-xmark", label: `${actual ? "Excluir" : `Excluir em ${colLabel(column)}`} contendo: ${trunc(text)}`, onClick: () => window.CanonicalFields.filter(action, { op: "not_contains", apply: true }) },
     );
     items.push({ sep: true });
   }
   if (!inModal) items.push({ icon: "fa-expand", label: "Ver conteúdo completo", onClick: () => openDetailValue(node, event.target) });
-  items.push({ icon: "fa-copy", label: selected ? "Copiar seleção" : "Copiar valor", onClick: () => navigator.clipboard.writeText(selected || (typeof node.value === "object" ? JSON.stringify(node.value, null, 2) : String(node.value ?? ""))).then(() => toast("Valor copiado.", "ok")) });
+  items.push({ icon: "fa-copy", label: selected ? "Copiar seleção" : "Copiar valor", onClick: () => window.CanonicalFields.copy(action) });
   if (column && selected && canContain && state.currentDetailEv) items.push(
     { sep: true },
     { icon: "fa-square-plus", label: "Criar campo a partir da seleção", onClick: () => openDeriveModal(selected, column, cellValue(state.currentDetailEv, column)) },
@@ -6340,6 +6394,11 @@ function bind() {
     if (e.isComposing || filterComposing || e.keyCode === 229) return;
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeFilterPop(); return; }
     if (e.key === "Enter" && [$("#fp-val"), $("#fp-val2")].includes(e.target)) {
+      if (e.shiftKey) {
+        const selector = e.target === $("#fp-val") ? "#fp-val" : "#fp-val2";
+        if (filterValueFormats.get(selector) === "json") { e.preventDefault(); e.stopPropagation(); if (!e.repeat) insertFilterLineBreak(e.target); }
+        return;
+      }
       e.preventDefault(); e.stopPropagation(); if (!e.repeat) applyFilterPop();
     }
   });
@@ -6526,8 +6585,7 @@ function bind() {
     if (event.target === $("#detail-value-modal")) closeDetailValue();
   };
   $("#detail-value-copy").onclick = async () => {
-    await navigator.clipboard.writeText(detailValueText);
-    toast("Valor copiado.", "ok");
+    if (detailValueNode) await window.CanonicalFields.copy(detailCanonicalAction(detailFieldColumn(detailValueNode) || detailValueNode.path, detailValueNode, $("#detail-value-copy")));
   };
   $("#detail-value-content").oncontextmenu = (event) => {
     if (!detailValueNode) return;

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
+import {installCanonicalFields} from './helpers/canonical-fields-fixture.mjs';
 import { readFileSync } from 'node:fs';
 const app = readFileSync(new URL('../../frontend/app.js', import.meta.url), 'utf8');
 const bar = readFileSync(new URL('../../frontend/query-bar.js', import.meta.url), 'utf8');
@@ -48,8 +49,9 @@ let preset;
 Object.assign(context,{eventComment:()=>'',workspaceScope:()=> 'dataset',trunc:String,sendVisibleToCase(){},openValueFilter:(...args)=>{preset=args;}});
 vm.runInContext(app.slice(app.indexOf('function ensureSelectionOwner('), app.indexOf('function toggleRowSelect(')), context);
 vm.runInContext(app.slice(app.indexOf('function eventCellMenu('),app.indexOf('\nasync function removeEventFromCase(')),context);
-const menu=context.eventCellMenu({id:7,timestamp:123},'timestamp','formatted date',{});
-menu.find(item=>item.label?.startsWith('Criar filtro:')).onClick();assert.equal(preset[0],'timestamp');assert.equal(preset[1],123,'composer uses actual numeric timestamp');
+installCanonicalFields(context);state.rows=[{id:7,event_ref:'fixture:7',timestamp:123}];
+const menu=context.eventCellMenu(state.rows[0],'timestamp','formatted date',{});
+await menu.find(item=>item.label?.startsWith('Criar filtro:')).onClick();assert.equal(preset[0],'timestamp');assert.equal(Date.parse(preset[1]),123,'composer uses the exact native ISO timestamp for its numeric range');
 assert.equal(applied.length,3,'opening a composer does not immediately execute a filter');
 assert.ok(!bar.slice(bar.indexOf('async function valueOptions('),bar.indexOf('  function draw()')).includes('api("tree_aggs"'),'draft value completion never launches full aggregations');
 console.log('Explicit search, chips, draft validation, IME, and prefilled full filter composer passed');

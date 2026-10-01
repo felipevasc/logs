@@ -87,6 +87,31 @@
     "usuario", "ip_cliente", "status", "tamanho", "latencia", "ativo", "ambiente", "anotacao", "request_id", "correlation_id", "operacao", "regiao", "canal"];
   COLUMNS.push("mock_payload_b64");
   for (const [index, event] of events.slice(0, 8).entries()) event.fields.mock_payload_b64 = btoa(JSON.stringify({ user: "preview-user", attempt: index, allowed: index % 2 === 0 }));
+  // Opt-in transport fixture only: JSON numbers and integer-like object keys
+  // deliberately lose their native spelling/order when decoded by JavaScript.
+  // Keep the authoritative strings separately, just as the native command does.
+  const canonicalFixture = new Map();
+  if (window.__mockCanonicalFieldsEnabled) {
+    const event = events[0];
+    event.event_ref ||= `preview:${event.id}`;
+    const values = {
+      native_float: "1.0",
+      native_object: '{"10":"ten","2":"two"}',
+      native_u64: "18446744073709551615",
+      native_null: "null",
+    };
+    for (const [column, text] of Object.entries(values)) {
+      event.fields[column] = JSON.parse(text);
+      canonicalFixture.set(`${event.event_ref}\n${column}`, text);
+    }
+    // A native string keeps all line endings. Textarea display normalization
+    // must not silently replace its CRLF and lone CR while editing a filter.
+    values.native_multiline = "alpha\r\nbravo\ncharlie\rdelta";
+    event.fields.native_multiline = values.native_multiline;
+    canonicalFixture.set(`${event.event_ref}\nnative_multiline`, values.native_multiline);
+    COLUMNS.push(...Object.keys(values), "native_missing");
+    window.__mockCanonicalFixture = { id: event.id, eventRef: event.event_ref, values };
+  }
   const loadedParts = ["mock.jsonl (preview)"];
   const derivedFields = [];
   const mockCalls = {};
@@ -728,7 +753,7 @@
   };
 
   // ---------------------------------------------------------------- security (preview)
-  const caseStore = new Map();
+  const caseStore = new Map(); let casePublication = 0;
   const detectionSettings = { disabled: [], suppress: [], threats: true };
   const MOCK_RULES = [
     { id: "auth.bruteforce.source", name: "Força bruta de senha", severity: "medium", kind: "threshold", attack: [{ id: "T1110.001", name: "Adivinhação de senha", tactics: ["credential-access"] }], description: "Muitas falhas de autenticação da mesma origem." },
@@ -790,7 +815,12 @@
     return { analysis_id: "preview-analysis", policy_version: "evidence-1", normalization_version: "normalization-1", attack_version: "19.2", counts_by_level: [1,2,3,4,5].map(n => shaped.filter(d => d.evidence_level === n).length), rule_coverage: [{ rule: "execution", status: "missing_fields", missing: ["process.entity_id"] }], limitations: ["Cenario sintetico de demonstracao"], total: rows.length, undated: rows.length - times.length, start: times.length ? Math.min(...times) : null, end: times.length ? Math.max(...times) : null, complete: true, limited: false, detections: shaped, episodes, entities, rare, tactics, coverage: [{ column: "@user", label: "Usuário", count: rows.filter(e => e.fields?.usuario).length }, { column: "@src_ip", label: "IP de origem", count: rows.filter(e => e.fields?.ip_cliente).length }], suppressed, rules: MOCK_RULES.length - detectionSettings.disabled.length, sigma_rules: 0, sigma_errors: [], threat_rules: detectionSettings.threats ? 378 : 0, elapsed_ms: 120 };
   }
   Object.assign(handlers, {
-    case_sync: ({ key, events }) => { caseStore.set(key, events); if (caseStore.size > 3) caseStore.delete(caseStore.keys().next().value); return null; },
+    case_sync: ({ key, events }) => {
+      const caseContentToken = `preview-case-publication:${++casePublication}`;
+      caseStore.set(key, { rows: events, contentToken: caseContentToken });
+      if (caseStore.size > 3) caseStore.delete(caseStore.keys().next().value);
+      return { caseContentToken };
+    },
     triage: ({ filters, caseEvents }) => mockTriage(poolOf(caseEvents)),
     triage_evidence_event: ({eventId,eventRef,caseEvents}) => { const e=poolOf(caseEvents).find(e=>e.id===eventId && (e.event_ref || `preview:${e.id}`)===eventRef); if(!e)throw Error("Evento indisponível"); return structuredClone(e); },
     event_insights: ({ event }) => {
@@ -986,6 +1016,52 @@
     });
   }
 
+  function validateFieldContentToken(args) {
+    const token = args.caseContentToken;
+    if (!args.caseKey) {
+      if (token != null) throw Error("ANALYSIS_FIELD_ADMISSION: A origem não aceita um token de evidências do Caso.");
+      return;
+    }
+    if (typeof token !== "string" || !token || new TextEncoder().encode(token).length > 128)
+      throw Error("ANALYSIS_FIELD_ADMISSION: Informe um token válido das evidências sincronizadas do Caso.");
+    const admitted = caseStore.get(args.caseKey);
+    if (!admitted) throw Error("CASE_CACHE_MISS");
+    if (token !== admitted.contentToken) throw Error("CASE_CACHE_CHANGED: As evidências do Caso mudaram; recarregue a consulta.");
+  }
+  handlers.analysis_field_text = args => {
+    // Recheck after artificial latency as well as before row admission.
+    validateFieldContentToken(args);
+    const context = analysisFor(args);
+    if (!context) throw Error("ANALYSIS_CONTEXT_CHANGED: Contexto de análise obrigatório.");
+    if (!args.caseKey && args.sourceGeneration !== sourceGeneration) throw Error("SOURCE_GENERATION_CHANGED: Atualize a origem.");
+    const event = poolOf(args.caseEvents).find(row => row.id === args.id && (row.event_ref || `preview:${row.id}`) === args.eventRef);
+    if (!event) throw Error("Evento indisponível para este contexto de análise.");
+    const fixed = ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw"].includes(args.column);
+    let present = fixed || Object.hasOwn(event.fields || {}, args.column), value;
+    if (args.column === "event_ref") value = event.event_ref || `preview:${event.id}`;
+    else if (args.column === "timestamp") value = event.timestamp == null ? null : colStr(event, "timestamp");
+    else if (fixed) value = event[args.column];
+    else if (args.column.startsWith("@") && window.QueryLang) {
+      value = window.QueryLang.fieldValue(event, window.QueryLang.resolve(args.column));
+      present = value != null;
+    } else value = event.fields?.[args.column];
+    const presence = !present ? "missing" : value == null ? "null" : "present";
+    const valueType = !present ? null : value == null ? "null" : Array.isArray(value) ? "array" : typeof value;
+    let canonicalText = !present || (args.column === "timestamp" && value == null) ? null
+      : typeof value === "string" ? value : JSON.stringify(value ?? null);
+    // Only original fixture fields have authoritative overrides. A derived
+    // field with the same name must use the current analysis overlay instead.
+    const fixtureKey = `${args.eventRef}\n${args.column}`;
+    if (!args.caseKey && present && canonicalFixture.has(fixtureKey) && !Object.hasOwn(event.derived_originals || {}, args.column)) canonicalText = canonicalFixture.get(fixtureKey);
+    return {
+      kind: "exact_field", version: 1,
+      receipt: { analysisContext: analysisIdentity(context), sourceGeneration: args.caseKey ? null : sourceGeneration,
+        caseKey: args.caseKey || null, caseContentToken: args.caseKey ? args.caseContentToken : null,
+        catalogSignature: "ca".repeat(32), catalogEpoch: 0 },
+      row: { id: event.id, eventRef: args.eventRef }, column: args.column, presence, valueType, canonicalText,
+    };
+  };
+
   const delay = (ms) => new Promise((r) => setTimeout(r, ms));
   const listeners = {};
   const emitMock = (name, payload) => (listeners[name] || []).forEach((cb) => cb({ payload }));
@@ -1013,17 +1089,22 @@
     core: {
       invoke: async (cmd, args = {}) => {
         if (window.__mockExclusionsEnabled) for (const event of events) event.event_ref ||= `preview:${event.id}`;
-        window.__mockRequests ||= []; window.__mockRequests.push({ cmd, cursor: args.cursor, offset: args.offset, operationId: args.operationId, field: args.field, grid: args.grid, caseKey: args.caseKey, analysisContext: args.analysisContext, sourceGeneration: args.sourceGeneration }); if (window.__mockRequests.length > 400) window.__mockRequests.shift();
+        window.__mockRequests ||= []; window.__mockRequests.push({ cmd, cursor: args.cursor, offset: args.offset, operationId: args.operationId, field: args.field, grid: args.grid, caseKey: args.caseKey, analysisContext: args.analysisContext, sourceGeneration: args.sourceGeneration,
+          ...(cmd === "analysis_field_text" ? { id: args.id, eventRef: args.eventRef, column: args.column, caseContentToken: args.caseContentToken, hasCaseEvents: Object.hasOwn(args, "caseEvents") } : {}) }); if (window.__mockRequests.length > 400) window.__mockRequests.shift();
         window.__mockCommandCalls ||= {};
         window.__mockCommandCalls[cmd] = (window.__mockCommandCalls[cmd] || 0) + 1;
         const h = handlers[cmd];
         if (!h) return Promise.reject(`mock: comando não implementado: ${cmd}`);
+        if (cmd === "analysis_field_text") {
+          try { validateFieldContentToken(args); } catch (error) { return Promise.reject(String(error)); }
+        }
         if (args.caseKey && !args.caseEvents) {
           if (!caseStore.has(args.caseKey)) return Promise.reject("CASE_CACHE_MISS");
-          args = { ...args, caseEvents: caseStore.get(args.caseKey) };
+          const admitted = caseStore.get(args.caseKey);
+          args = { ...args, caseEvents: admitted.rows };
         }
         try {
-          const scopedCommands=['list_sources','source_summary','event_detail','triage','triage_evidence_event','grouped_timeline','query_page','query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
+          const scopedCommands=['list_sources','source_summary','event_detail','analysis_field_text','triage','triage_evidence_event','grouped_timeline','query_page','query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
           if (scopedCommands.includes(cmd) && args.analysisContext) args = { ...args, caseEvents: analysisRows(exclusions?.visible(args.analysisContext, poolOf(args.caseEvents)) || poolOf(args.caseEvents), analysisFor(args)) };
           if(scopedCommands.includes(cmd)&&args.filters?.some(filter=>filter.op==='threat_rule')){
             const module=await import('/__mock-threats__.js');

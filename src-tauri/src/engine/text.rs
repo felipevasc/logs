@@ -280,6 +280,10 @@ impl Text {
                 // A shorter second piece can be rare even when the longest
                 // is common. Both individually broad => exact SQL fallback.
                 Err(ProbeStop::Candidates) => {}
+                // Refinement is optional after a complete bounded superset.
+                // Never expose the incomplete `next` set: the caller still
+                // confirms the entire needle against the previous result.
+                Err(ProbeStop::Work) => return if keep_going() { found } else { None },
                 Err(_) => return None,
             }
         }
@@ -529,6 +533,104 @@ mod tests {
         assert_eq!(work.peak_bitmap_bytes, 0);
         assert_eq!(text.candidates("absent", 0), Some(Vec::new()));
         assert_eq!(text.candidates("common", 0), None);
+    }
+
+    #[test]
+    fn direct_probe_retains_only_a_complete_superset_when_refinement_exhausts_work() {
+        let rows: Vec<String> = (0..4_504).map(|id| match id {
+            0..3_000 => "longcommonword short",
+            3_000..4_500 => "longcommonword ordinary",
+            _ => "short",
+        }.into()).collect();
+        let (_directory, text) = fixture(&rows);
+        let limits = ProbeLimits::for_candidates(5_000);
+        let mut first = ProbeWork::default();
+        let complete = text.probe_while("longcommonword", 5_000, limits, &mut first, || true).unwrap();
+        assert_eq!(complete, (0..4_500).collect::<Vec<u32>>());
+        let exact: Vec<_> = rows.iter().enumerate().filter_map(|(id, row)|
+            row.contains("longcommonword short").then_some(id as u32)).collect();
+        assert_eq!(exact.len(), 3_000);
+        for budget in [
+            ProbeLimits { terms: first.terms + 1, ..limits },
+            ProbeLimits { postings: first.postings + 7, ..limits },
+        ] {
+            let mut work = ProbeWork::default();
+            let found = text.probe_while("longcommonword short", 5_000, budget, &mut work, || true).unwrap();
+            assert_eq!(work.attempts, 2);
+            assert_eq!(found, complete, "only the earlier complete set may be returned");
+            let confirmed: Vec<_> = found.iter().copied().filter(|&id|
+                rows[id as usize].contains("longcommonword short")).collect();
+            assert_eq!(confirmed, exact);
+            assert!(work.terms <= budget.terms && work.postings <= budget.postings);
+            if budget.postings < limits.postings {
+                assert_eq!(work.postings, first.postings + 7, "partial second-piece IDs existed");
+            }
+            eprintln!("TEXT_REFINEMENT {}", serde_json::json!({"rows":rows.len(),
+                "candidates":found.len(),"exactMatches":confirmed.len(),"attempts":work.attempts,
+                "terms":work.terms,"postings":work.postings,"peakBitmapBytes":work.peak_bitmap_bytes}));
+        }
+        let mut work = ProbeWork::default();
+        let incomplete = ProbeLimits { postings: first.postings - 1, ..limits };
+        assert_eq!(text.probe_while("longcommonword short", 5_000, incomplete, &mut work, || true), None,
+            "an incomplete first piece never establishes a reusable superset");
+        assert_eq!(work.attempts, 1);
+        assert_eq!(text.candidates("longcommonword short", 1_000), None,
+            "two individually over-cap pieces still require exact fallback");
+    }
+
+    #[test]
+    fn direct_probe_never_reuses_a_superset_after_refinement_cancellation() {
+        let rows = vec!["longcommonword short".to_string(); 4_500];
+        let (_directory, text) = fixture(&rows);
+        let limits = ProbeLimits::for_candidates(5_000);
+        let mut first_polls = 0;
+        let mut first = ProbeWork::default();
+        assert_eq!(text.probe_while("longcommonword", 5_000, limits, &mut first, || {
+            first_polls += 1; true
+        }).unwrap().len(), 4_500);
+        for (extra_polls, budget) in [
+            (2, limits),
+            // The second dictionary exhausts its allowance before visiting
+            // any postings. Cancellation arrives at the reuse boundary.
+            (4, ProbeLimits { terms: first.terms, ..limits }),
+        ] {
+            let id = format!("text-refinement-{}", uuid::Uuid::new_v4());
+            let token = crate::operations::token(Some(id.clone())).unwrap();
+            let mut polls = 0;
+            let mut work = ProbeWork::default();
+            let result = crate::operations::run_with_token(token, || {
+                let token = crate::operations::current_token();
+                assert_eq!(text.probe_while("longcommonword short", 5_000, budget, &mut work, || {
+                    polls += 1;
+                    if polls == first_polls + extra_polls { assert!(crate::operations::cancel_id(&id)); }
+                    !token.cancelled()
+                }), None);
+                assert!(token.cancelled());
+            });
+            assert!(result.is_err());
+            assert_eq!(work.attempts, 2);
+            assert_eq!(polls, first_polls + extra_polls);
+        }
+    }
+
+    #[test]
+    fn direct_probe_never_reuses_a_superset_after_invalid_refinement_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = Writer::create(directory.path(), 1, 32 << 20).unwrap();
+        for id in 0..4_500 { writer.add(id, words("longcommonword short")).unwrap(); }
+        // Only the second piece reaches this malformed document. Its missing
+        // source-row locator must not be ignored because the first set worked.
+        let mut invalid = TantivyDocument::default();
+        invalid.add_text(writer.text, "short");
+        writer.writer.add_document(invalid).unwrap();
+        writer.finish().unwrap();
+        let text = Text::open(directory.path()).unwrap();
+        let limits = ProbeLimits::for_candidates(5_000);
+        assert_eq!(text.probe_while("longcommonword", 5_000, limits, &mut ProbeWork::default(), || true).unwrap().len(), 4_500);
+        let mut work = ProbeWork::default();
+        assert_eq!(text.probe_while("longcommonword short", 5_000, limits, &mut work, || true), None);
+        assert_eq!(work.attempts, 2);
+        assert!(work.postings > 4_500);
     }
 
     #[test]

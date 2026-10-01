@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
+import {installCanonicalFields} from './helpers/canonical-fields-fixture.mjs';
 import { readFileSync } from 'node:fs';
 const read = file => readFileSync(new URL(`../../frontend/${file}`, import.meta.url), 'utf8');
 const app = read('app.js'), analysis = read('analysis-workbench.js'), discovery = read('discovery.js');
@@ -15,6 +16,9 @@ const context = vm.createContext({
   showFieldInspector() {}, cubeAdd() {}, addGroupToAnalysis() {}, switchView() {}, switchTab() {},
   navigator: { clipboard: { writeText: async () => {} } },
 });
+installCanonicalFields(context);context.$=()=>({hidden:false});context.detailRequest=0;context.detailAdmissionCurrent=()=>true;
+context.state.detailAdmission={scope:'dataset'};context.state.currentDetailEv={id:1,event_ref:'fixture:1',timestamp:1700000000123,fields:{}};
+vm.runInContext(part(app,'function detailCanonicalAction(', '\nfunction toggleDetailColumn('),context);
 context.window.WorkspaceContext = { setScope: async next => { scopeChanges++; scope = next; } };
 context.window.Discovery = { applySelection: () => { applies++; } };
 vm.runInContext(part(app, 'function valueFilterMenuItem(', '\nfunction commitQuickSearch('), context);
@@ -34,8 +38,8 @@ for (const value of [null, '', 0, false, '(vazio)', '/api?a=1&b=2', '  literal  
 context.showCubeValueActions(event, 'request_path', '/cube'); assert.equal((await open('request_path'))[1], '/cube');
 context.showCubeFieldActions(event, 'request_path'); assert.equal((await open('request_path'))[3], 'contains');
 context.showDetailNameMenu(event, { path: 'timestamp', hasValue: true, filterValue: 1700000000123 });
-assert.equal((await open('timestamp'))[1], '1700000000123');
-context.showDetailNameMenu(event, { path: 'request_path', hasValue: false }); assert.equal((await open('request_path'))[3], 'contains');
+assert.equal(Date.parse((await open('timestamp'))[1]), 1700000000123);
+context.showDetailNameMenu(event, { path: 'request_path', hasValue: false }); assert.equal((await open('request_path'))[3], 'empty');
 context.showDetailNameMenu(event, { path: 'unknown.child', hasValue: true, filterValue: 'x' });
 assert.ok(!shown.some(item => item.label?.startsWith('Criar filtro:')), 'a display-only child is not invented as a queryable column');
 context.showChartValueActions(event, { field: 'request_path', chart: 'terms' }, '/case', 'case');

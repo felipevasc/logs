@@ -15,8 +15,10 @@ window.Tasks = (() => {
   SCOPED.add("exclusion_visibility"); READS.add("exclusion_visibility"); METADATA.add("exclusion_visibility"); QUIET.add("exclusion_visibility");
   for (const command of ["reference_inspect", "reference_list", "reference_import", "reference_remove", "reference_save_lookup"]) { SCOPED.add(command); METADATA.add(command); }
   READS.add("reference_inspect"); READS.add("reference_list");
+  READS.add("analysis_field_text"); SCOPED.add("analysis_field_text");
   const WHAT = { exclusion_preview: "Prévia da exclusão", exclusion_commit: "Arquivando registros", exclusion_list: "Lotes excluídos", exclusion_archive_page: "Registros arquivados", exclusion_restore_batch: "Restaurando lote", exclusion_restore_selected: "Restaurando seleção", dataset_overview: "Visão geral", triage: "Comprometimentos", triage_evidence_event: "Evento da evidência", timeline_range: "Volume no tempo", timeline_lanes: "Faixas", query_page: "Registros", engine_retry: "Preparando índices", query_events: "Registros", explore_snapshot: "Registros e campos", tree_aggs: "Campos", aggregate_events: "Grupos", profile_fields: "Perfil dos campos", compute_series: "Gráficos", pivot: "Tabela dinâmica", discover_patterns: "Padrões", threat_scan: "Ameaças", threat_events: "Registros de ameaça", compare_periods: "Comparação de períodos", journey_index: "Possíveis trilhas", journey_events: "Registros da trilha", journey_fields: "Campos de ligação", entity_summary: "Entidades", ioc_sightings: "Indicadores nas fontes", source_hashes: "SHA-256 das fontes", stats_events: "Timeline", grouped_timeline: "Timeline por campo", preview_field_transform: "Prévia da transformação", count_filtered: "Contagem", trail_events: "Vizinhança do registro", load_file: "Abrindo logs", load_files: "Abrindo logs", load_bundle: "Abrindo logs", load_event_log: "Lendo o Event Log", remote_import: "Importação remota", remote_test: "Teste de conexão", export_events: "Exportação", export_investigation: "Exportação", import_investigation: "Importação da investigação", harvest_codes: "Catálogo do sistema", sigma_import: "Importação Sigma", expand_paths: "Lendo pastas", event_detail: "Detalhe do registro", list_sources: "Fontes", event_insights: "Detalhe do registro" };
   Object.assign(WHAT, { reference_inspect: "Inspecionando referência", reference_list: "Referências do Caso", reference_import: "Importando referência", reference_remove: "Removendo referência", reference_save_lookup: "Salvando campo por referência" });
+  WHAT.analysis_field_text = "Valor exato do campo";
   const ZONES = { analysis: "Análise", case: "Caso", structure: "Estrutura" };
   const PAGES = { summary: "Resumo", compromises: "Comprometimentos", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas" };
   const TABS = { table: "Registros", group: "Resumir", dashboard: "Descobrir", cube: "Cruzar dados" };
@@ -27,6 +29,7 @@ window.Tasks = (() => {
   const sourceMutations = new Set(["set_ts_config", "load_file", "load_files", "load_bundle", "load_event_log", "clear_events"]);
   named.add("clear_events"); named.add("grouped_timeline"); named.add("preview_field_transform"); for (const command of ["exclusion_visibility", "exclusion_preview", "exclusion_list", "exclusion_archive_page"]) named.add(command);
   const latest = new Map();
+  named.add("analysis_field_text");
   for (const command of ["reference_inspect", "reference_list", "reference_import", "reference_remove", "reference_save_lookup"]) named.add(command);
   const background = window.PerformanceTools.queue(1);
 

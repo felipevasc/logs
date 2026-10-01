@@ -2317,6 +2317,7 @@ pub fn run() {
             reference_commands::reference_list,
             reference_commands::reference_remove,
             reference_commands::reference_save_lookup,
+            projection_commands::analysis_field_text,
             projection_commands::query_projected_page,
             projection_commands::hydrate_projected_rows,
             projection_commands::hydrate_projected_field,

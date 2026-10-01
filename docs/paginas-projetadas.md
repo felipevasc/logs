@@ -1,6 +1,6 @@
 # Páginas projetadas: contrato experimental
 
-Esta interface nativa é uma etapa de desenvolvimento da versão 0.10. A tabela da aplicação continua usando `query_page` e registros completos. Os novos comandos ainda não são usados pela interface, pelo MCP nem pelo arquivo de exclusões.
+Esta interface nativa é uma etapa de desenvolvimento da versão 0.10. A tabela da aplicação continua usando `query_page` e registros completos; os comandos de páginas/linhas projetadas ainda não alimentam essa tabela, o MCP ou o arquivo de exclusões. A interface usa uma ação separada, `analysis_field_text`, para recuperar texto canônico de valores completos antes de copiar ou preencher filtros.
 
 ## Problema observado
 
@@ -39,8 +39,12 @@ O transporte JSON comum perde precisão em inteiros maiores que o intervalo segu
 
 `hydrate_projected_field` oferece uma ação separada para cópia/filtro: retorna presença, tipo e texto canônico produzido pelo mesmo resolvedor de campos da consulta. O texto preserva números, ordenação de chaves estruturadas, timestamps e aliases de entidades sem depender da reserialização de um objeto JavaScript. O envelope `exact_field` também é recusado em slots de evidência.
 
+Para registros completos já exibidos, `analysis_field_text` cria esse recibo no backend a partir de ID, referência do evento e contexto capturado. Leituras do Caso exigem o `caseContentToken` retornado pela sincronização exata das evidências. Troca do mesmo cache antes, durante ou depois da resolução invalida a ação. Sincronizações concorrentes compartilham uma promessa; uma recuperação já concluída não é repetida por um erro atrasado.
+
+Valores completos de células e detalhes da análise usam essa leitura; substrings selecionadas e chaves canônicas de agregações preservam seu literal intencional. Evidências históricas explícitas não são substituídas por dados da análise atual: ações numéricas/estruturadas que exigem texto histórico indisponível são recusadas com diagnóstico. O editor preserva LF diretamente e usa uma forma JSON-string explicitamente identificada quando há CR; uma edição inválida permanece como rascunho. Isso não resolve o armazenamento/exportação de números já normalizados em um Event legado.
+
 Ativar páginas projetadas na interface exige adaptar seleção, detalhes, cópia, filtros, trilhas, amostras de transformação e envio ao Caso para essas ações. Registros numéricos que exigem preservação sem perdas precisam de um caminho nativo de transferência de evidência antes dessa ativação. A API atual de registros completos não foi substituída.
 
 ## Validação
 
-Os testes focados cobrem identidade/cursor/ordem, recuperação pelo motor de linhas, campos largos ocultos, Unicode e escaping, tipos nulo/ausente/vazio, limites reais de serialização, roles antes da abreviação visual e precisão numérica. Os resultados de harnesses isolados não substituem a compilação e os testes de admissão integrados. Suíte completa, medição de RSS e comparação de escala continuam sendo gates da validação final.
+Os testes focados integrados cobrem identidade/cursor/ordem, recuperação pelo motor de linhas, campos largos ocultos, Unicode e escaping, tipos nulo/ausente/vazio, limites reais de serialização, roles antes da abreviação visual e precisão numérica. A rodada de campo/texto passou em 39 testes (dois microbenchmarks ignorados), seguida por 36 testes focados de tokens, cache e admissão; são lotes sobrepostos, não uma contagem da suíte completa. Suíte completa, medição de RSS e comparação de escala continuam sendo gates da validação final.

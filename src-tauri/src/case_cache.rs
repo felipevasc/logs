@@ -21,6 +21,14 @@ struct Entry {
 }
 static CACHE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 
+/// Publication captured by a successful synchronization. Exact field actions
+/// bind this token so a reused client key cannot silently select new evidence.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncReceipt {
+    pub case_content_token: String,
+}
+
 pub fn store(key: String, events: Vec<Event>) {
     store_for(key, events, None);
 }
@@ -29,14 +37,16 @@ fn store_for(
     key: String,
     events: Vec<Event>,
     identity: Option<&crate::analysis_context::Identity>,
-) {
+) -> String {
     let owner = owner(identity);
     let mut cache = CACHE.lock();
     cache.retain(|entry| entry.owner != owner || entry.key != key);
     if cache.len() >= 3 {
         cache.remove(0);
     }
-    cache.push(Entry { owner, key, publication: uuid::Uuid::new_v4().to_string(), events: Arc::new(events) });
+    let publication = uuid::Uuid::new_v4().to_string();
+    cache.push(Entry { owner, key, publication: publication.clone(), events: Arc::new(events) });
+    publication
 }
 
 /// Explicit records win; a key must have been synchronized before.
@@ -119,15 +129,15 @@ pub async fn case_sync(
     key: String,
     events: Vec<Event>,
     analysis_context: Option<crate::analysis_context::Identity>,
-) -> Result<(), String> {
+) -> Result<SyncReceipt, String> {
     if key.is_empty() || key.len() > 512 {
         return Err("Chave de caso inválida.".into());
     }
     if let Some(identity) = &analysis_context {
         crate::analysis_runtime::validate_identity(identity)?;
     }
-    store_for(key, events, analysis_context.as_ref());
-    Ok(())
+    let case_content_token = store_for(key, events, analysis_context.as_ref());
+    Ok(SyncReceipt { case_content_token })
 }
 
 #[cfg(test)]

@@ -78,11 +78,14 @@ try {
   await page.waitForFunction(n=>state.filters.length===n+1&&document.querySelector('#events-table').getAttribute('aria-busy')==='false',beforeFilters);
   assert.equal(await page.locator('#quick-search').inputValue(),'');
   assert.equal(await page.evaluate(()=>state.filters.at(-1).op),'query');
+  const filterTimestamp=await page.evaluate(()=>state.rows[0].timestamp);
   await page.locator('#events-table tbody tr td[data-column="timestamp"]').first().click({button:'right'});
   await page.getByText('Criar filtro: Data/hora',{exact:true}).click();
+  await page.locator('#filter-pop').waitFor({state:'visible'});
   assert.equal(await page.locator('#fp-col').inputValue(),'timestamp');
   assert.equal(await page.locator('#fp-op').inputValue(),'between');
-  assert.ok(Number.isFinite(Number(await page.locator('#fp-val').inputValue())));
+  assert.equal(Date.parse(await page.locator('#fp-val').inputValue()),filterTimestamp,'native canonical ISO text represents the exact selected timestamp');
+  assert.equal(await page.locator('#fp-val2').inputValue(),await page.locator('#fp-val').inputValue());
   for(const operator of ['contains','equals','gt','gte','lt','lte','between','regex','cidr']) assert.ok(await page.locator(`#fp-op option[value="${operator}"]`).count(),operator);
   await page.locator('#fp-val2').press('Escape');
   assert.equal(await page.locator('#filter-pop').isVisible(),false);

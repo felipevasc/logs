@@ -856,8 +856,9 @@
     <div class="pop-title">Novo filtro</div>
     <select id="fp-col"></select>
     <select id="fp-op"></select>
-    <input id="fp-val" type="text" placeholder="valor" spellcheck="false" />
-    <input id="fp-val2" type="text" placeholder="até" spellcheck="false" hidden />
+    <textarea id="fp-val" rows="1" placeholder="valor" spellcheck="false"></textarea>
+    <textarea id="fp-val2" rows="1" placeholder="até" spellcheck="false" hidden></textarea>
+    <small id="fp-text-hint" class="muted small"></small>
     <div class="pop-actions">
       <button class="btn ghost small" id="fp-cancel" type="button">Cancelar</button>
       <button class="btn primary small" id="fp-apply" type="button">Aplicar</button>
@@ -1028,6 +1029,7 @@
   <script src="app.js"></script>
   <script src="analysis-context.js"></script>
   <script src="tasks.js"></script>
+  <script src="canonical-fields.js"></script>
   <script src="explorer-timeline.js"></script>
   <script src="field-transform.js"></script>
   <script src="exclusion-archive.js"></script>

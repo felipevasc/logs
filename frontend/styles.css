@@ -423,6 +423,7 @@ input:focus, select:focus, textarea:focus {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 select { appearance: auto; cursor: pointer; }
+#filter-pop textarea { resize: vertical; max-height: 160px; }
 
 .muted { color: var(--text-1); }
 .small { font-size: 12px; }

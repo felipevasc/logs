@@ -65,3 +65,30 @@ context.openFilterPop();context.closeFilterPop();assert.equal(document.activeEle
 origin.hidden=false;drawerClose.hidden=true;const transient=node('#temporary-trigger');transient.hidden=false;
 context.openFilterPop(transient);transient.isConnected=false;context.closeFilterPop();assert.equal(document.activeElement,origin);
 console.log('Composer accessible names and visible/focusable return targets passed');
+
+// Textareas preserve LF; CR-containing values use a visible JSON-string view
+// so the browser cannot normalize a native CR/CRLF preset before applying it.
+for(const value of ['alpha\nbravo','alpha\r\nbravo','alpha\rbravo','alpha\r\nbravo\ncharlie\rdelta','',' \r\n ']){
+  context.openValueFilter('message',value,origin,'equals_exact');
+  assert.equal(first.value,value.includes('\r')?JSON.stringify(value):value);
+  assert.equal(first.attributes['data-value-format'],value.includes('\r')?'json-string':'text');
+  assert.equal(context.applyFilterPop(),true);
+  assert.equal(applied.at(-1).value,value,'exact empty, whitespace and mixed line-ending literals survive the real composer');
+}
+const raw='alpha\r\nbravo\ncharlie\rdelta';
+context.openValueFilter('message',raw,origin,'equals_exact');
+const before=applied.length;first.value='"broken';assert.equal(context.applyFilterPop(),false);
+assert.equal(applied.length,before);assert.equal(pop.hidden,false);assert.equal(first.value,'"broken');assert.match(messages.at(-1),/texto JSON entre aspas/);
+first.value=JSON.stringify(raw);first.selectionStart=first.selectionEnd=first.value.length-1;
+key(first,{shiftKey:true});assert.equal(JSON.parse(first.value),raw+'\n');assert.equal(applied.length,before);
+const edited=first.value;key(first,{shiftKey:true,repeat:true});key(first,{shiftKey:true,isComposing:true});assert.equal(first.value,edited);
+node('#fp-cancel').onclick();assert.equal(applied.length,before);assert.equal(document.activeElement,origin);
+context.openValueFilter('message','one\ntwo',origin,'equals_exact');
+let prevented=0;key(first,{shiftKey:true,preventDefault(){prevented++;}});assert.equal(prevented,0,'plain Shift+Enter retains the textarea newline action');assert.equal(applied.length,before);
+node('#fp-cancel').onclick();
+const saved={column:'message',op:'equals_exact',value:raw,value2:null};state.filters=[saved];
+context.openFilterPop(origin,0);assert.equal(first.value,JSON.stringify(raw));assert.equal(context.applyFilterPop(),true);assert.equal(state.filters[0].value,raw);
+context.openValueFilter('code',' ',origin,'gte');const numericBefore=applied.length;assert.equal(context.applyFilterPop(),undefined);assert.equal(applied.length,numericBefore,'numeric operators retain their blank-value guard');
+context.openValueFilter('message',raw,origin,'between');first.value='"broken';second.value='"also broken';node('#fp-op').value='empty';node('#fp-op').onchange();
+assert.equal(context.applyFilterPop(),true);assert.equal(applied.at(-1).op,'empty');assert.equal(applied.at(-1).value,'');assert.equal(applied.at(-1).value2,null,'irrelevant hidden draft values do not block a valueless operator');
+console.log('Literal multiline composer preserves CR/LF, saved filters, edits, cancellation, IME and range/numeric behavior');
