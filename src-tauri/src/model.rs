@@ -36,6 +36,9 @@ pub struct Event {
     /// Stable source/version/record identity; independent of result ordering.
     #[serde(default)]
     pub event_ref: String,
+    /// Verified original-record provenance for saved evidence; never a data column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_provenance: Option<crate::analysis_visibility::EvidenceProvenance>,
     #[serde(default)]
     pub parse_status: String,
     /// Epoch em milissegundos (UTC). `None` quando a linha não tem data reconhecível.
@@ -61,6 +64,7 @@ impl Event {
         Event {
             id: 0,
             event_ref: String::new(),
+            evidence_provenance: None,
             parse_status: "parsed".into(),
             timestamp: None,
             source: String::new(),

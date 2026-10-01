@@ -61,7 +61,10 @@ window.WorkspaceContext = (() => {
     state.quick = String(state.quick || "");
     Object.assign(state, runtime.get(key()) || {});
     if (scope === "case") {
-      const rows = caseEvents(); state.loaded = rows.length > 0; state.columns = [...caseEventsCache.summary.columns]; state.total = rows.length;
+      const rows = caseEvents(); state.loaded = rows.length > 0; state.columns = [...caseEventsCache.summary.columns];
+      // Saved evidence stays intact when records are excluded. Only an exact
+      // count for this analysis, evidence signature and filter is a visible total.
+      state.total = explorerAnalytics.get(explorerKey())?.total ?? null;
       if (!runtime.has(key())) { state.rows = []; state.dataPeriod = null; state.facetData = null; state.explorerCache = null; state.queryError = null; }
     }
     state.visibleCols = state.visibleCols.filter(column => state.columns.includes(column)); if (!state.visibleCols.includes("timestamp")) state.visibleCols.unshift("timestamp");

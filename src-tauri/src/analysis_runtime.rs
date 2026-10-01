@@ -6,7 +6,11 @@ use crate::{
     sources, AppState, SourceData,
 };
 use parking_lot::RwLockReadGuard;
-use std::{cell::RefCell, ops::Deref, sync::Arc};
+use std::{
+    cell::RefCell,
+    ops::Deref,
+    sync::{Arc, OnceLock},
+};
 
 /// Common desktop/MCP wire context. The schema mirror avoids coupling the
 /// durable storage model to a particular protocol's schema implementation.
@@ -47,6 +51,62 @@ pub(crate) struct Admitted {
     names: Vec<String>,
     derived: Arc<Vec<sources::CompiledDerived>>,
     pub diagnostics: Arc<Vec<analysis_context::Diagnostic>>,
+    pub references: Arc<Vec<analysis_context::ReferenceDescriptor>>,
+    visibility: OnceLock<PreparedVisibility>,
+    failure: parking_lot::Mutex<Option<String>>,
+    source_set: OnceLock<Result<Arc<crate::analysis_visibility::SourceSet>, String>>,
+}
+
+/// A fixed admitted row domain. Query workers share this object; checks never
+/// enter SQLite and retain the underlying immutable source/payload leases.
+pub(crate) struct RowGate {
+    rows: usize,
+    visible: usize,
+    unavailable_members: Option<u64>,
+    keep: Arc<dyn Fn(usize) -> bool + Send + Sync>,
+    verify: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+}
+impl RowGate {
+    fn new(
+        rows: usize,
+        visible: usize,
+        unavailable_members: Option<u64>,
+        keep: impl Fn(usize) -> bool + Send + Sync + 'static,
+        verify: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        if visible > rows {
+            return Err("Contagem de visibilidade incompatível com a fonte.".into());
+        }
+        Ok(Self {
+            rows,
+            visible,
+            unavailable_members,
+            keep: Arc::new(keep),
+            verify: Arc::new(verify),
+        })
+    }
+    pub(crate) fn allows(&self, row: usize) -> Result<bool, String> {
+        if row >= self.rows {
+            return Err("Registro fora da geração de visibilidade admitida.".into());
+        }
+        Ok((self.keep)(row))
+    }
+    pub(crate) fn allows_known_row(&self, row: usize) -> bool {
+        row < self.rows && (self.keep)(row)
+    }
+    pub(crate) fn visible_count(&self) -> usize {
+        self.visible
+    }
+    pub(crate) fn is_unrestricted(&self) -> bool {
+        self.visible == self.rows
+    }
+    fn validate(&self) -> Result<(), String> {
+        (self.verify)()
+    }
+}
+struct PreparedVisibility {
+    gate: Option<Arc<RowGate>>,
+    source: Option<Arc<SourceData>>,
 }
 
 thread_local! { static CURRENT: RefCell<Option<Arc<Admitted>>> = const { RefCell::new(None) }; }
@@ -73,9 +133,8 @@ pub(crate) fn validate_identity(identity: &Identity) -> Result<Snapshot, String>
     Ok(snapshot)
 }
 
-const REGEX_BYTES: usize = 16 << 20;
-const DFA_BYTES: usize = 4 << 20;
-const MAX_RULES: usize = 1024;
+const REGEX_BYTES: usize = analysis_context::REGEX_SET_BYTES;
+const DFA_BYTES: usize = analysis_context::DFA_SET_BYTES;
 const COMPILED_CACHE_BYTES: usize = 64 << 20;
 struct CompiledEntry {
     identity: Identity,
@@ -266,13 +325,9 @@ fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>
                 })
         })
         .sum::<usize>();
-    if rule_count > MAX_RULES {
-        return Err(format!(
-            "A configuração excede o limite de {MAX_RULES} regras derivadas por Caso."
-        ));
-    }
-    let regex_limit = (REGEX_BYTES / rule_count.max(1)).min(2 << 20);
-    let dfa_limit = (DFA_BYTES / rule_count.max(1)).min(512 << 10);
+    let limits = analysis_context::regex_limits(rule_count)?;
+    let regex_limit = limits.size_limit;
+    let dfa_limit = limits.dfa_size_limit;
     analysis_context::definition_order(&safe)?.into_iter().map(|index| {
         let definition: sources::DerivedFieldCompat = serde_json::from_value(safe[index].clone())
             .map_err(|_| "Campo derivado inválido no Caso.".to_string())?;
@@ -300,18 +355,11 @@ pub(crate) fn capture(
     expected_generation: Option<u64>,
     mode: Mode,
 ) -> Result<Arc<Admitted>, String> {
-    let (derived, diagnostics) = match &identity {
+    let (derived, diagnostics, references) = match &identity {
         Some(identity) => {
             let snapshot = validate_identity(identity)?;
-            // Membership is not inferred from a revision. Until a visibility
-            // payload is installed by the visibility consumer, revisions that
-            // might contain exclusions are refused, including restored batches.
-            if snapshot.visibility_revision != 0 {
-                return Err(
-                    "A visibilidade deste Caso precisa ser validada antes da consulta.".into(),
-                );
-            }
-            compile(&snapshot)?
+            let (derived, diagnostics) = compile(&snapshot)?;
+            (derived, diagnostics, Arc::new(snapshot.config.references))
         }
         None => {
             if analysis_context::active_snapshot()?.is_some() {
@@ -319,7 +367,11 @@ pub(crate) fn capture(
                     "Informe a identidade do Caso ativo para executar esta operação.".into(),
                 );
             }
-            (Arc::new(state.derived.read().clone()), Arc::new(Vec::new()))
+            (
+                Arc::new(state.derived.read().clone()),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+            )
         }
     };
     let mut names = Vec::new();
@@ -358,14 +410,7 @@ pub(crate) fn capture(
         };
         (Some(receipt.generation), captured)
     };
-    let source = captured.map(|mut source| {
-        if let SourceData::Memory(events) = Arc::get_mut(&mut source).expect("new snapshot") {
-            for event in events {
-                sources::apply_derived(event, &derived);
-            }
-        }
-        source
-    });
+    let source = captured;
     Ok(Arc::new(Admitted {
         identity,
         source_generation: generation,
@@ -375,6 +420,10 @@ pub(crate) fn capture(
         names,
         derived,
         diagnostics,
+        references,
+        visibility: OnceLock::new(),
+        failure: parking_lot::Mutex::new(None),
+        source_set: OnceLock::new(),
     }))
 }
 
@@ -386,6 +435,9 @@ pub(crate) fn capture_case(
     key: Option<String>,
 ) -> Result<(Arc<Admitted>, Option<Vec<Event>>), String> {
     let case = events.is_some() || key.is_some();
+    if case && identity.is_none() {
+        return Err("Informe a identidade do Caso antes de consultar suas evidências.".into());
+    }
     let mut admitted = capture(
         state,
         identity,
@@ -393,17 +445,268 @@ pub(crate) fn capture_case(
         if case { Mode::Case } else { Mode::Dataset },
     )?;
     Arc::get_mut(&mut admitted).expect("new admission").case_key = key.clone();
-    let events =
-        crate::case_cache::take_for(events, key, admitted.identity.as_ref())?.map(|mut events| {
-            for event in &mut events {
-                sources::apply_derived(event, &admitted.derived);
-            }
-            events
-        });
+    let events = crate::case_cache::take_for(events, key, admitted.identity.as_ref())?;
     Ok((admitted, events))
 }
 
+static MASKS: std::sync::LazyLock<crate::analysis_visibility::Cache> =
+    std::sync::LazyLock::new(crate::analysis_visibility::Cache::new);
+static EVIDENCE_MASKS: std::sync::LazyLock<crate::analysis_visibility::EvidenceCache> =
+    std::sync::LazyLock::new(crate::analysis_visibility::EvidenceCache::new);
+
+fn indexed_row_gate(mask: Arc<crate::analysis_visibility::Mask>) -> Result<Arc<RowGate>, String> {
+    let rows = mask.rows();
+    let visible = rows
+        .checked_sub(mask.cardinality())
+        .ok_or("Máscara excede a fonte admitida.")?;
+    let lease = Arc::clone(&mask);
+    Ok(Arc::new(RowGate::new(
+        rows,
+        visible,
+        Some(mask.ignored_members()),
+        move |row| !mask.contains_row(row),
+        move || lease.validate(),
+    )?))
+}
+fn evidence_row_gate(
+    mask: Arc<crate::analysis_visibility::EvidenceMask>,
+) -> Result<Arc<RowGate>, String> {
+    let rows = mask.rows();
+    let visible = rows
+        .checked_sub(mask.cardinality())
+        .ok_or("Máscara excede as evidências admitidas.")?;
+    let lease = Arc::clone(&mask);
+    Ok(Arc::new(RowGate::new(
+        rows,
+        visible,
+        None,
+        move |row| !mask.contains_row(row),
+        move || lease.validate(),
+    )?))
+}
+
 impl Admitted {
+    /// Called only inside a registered blocking operation. The lazy caches
+    /// serialize preparation, while hits validate retained immutable leases.
+    pub(crate) fn prepare_visibility(
+        &self,
+        case_events: Option<Vec<Event>>,
+    ) -> Result<Option<Vec<Event>>, String> {
+        if self.visibility.get().is_some() {
+            return Err("Esta captura de consulta já foi executada.".into());
+        }
+        crate::operations::check()?;
+        let token = crate::operations::current_token();
+        let cancelled = || token.cancelled();
+        let progress = |phase: &str, completed: u64, total: Option<u64>| {
+            crate::operations::report_progress(
+                "análise",
+                "visibility",
+                "Preparando visibilidade da análise",
+                completed.min(usize::MAX as u64) as usize,
+                total.unwrap_or(0).min(usize::MAX as u64) as usize,
+                "registros",
+                0,
+            );
+            let _ = phase;
+        };
+        let work = crate::exclusion_store::Work {
+            cancelled: &cancelled,
+            progress: &progress,
+        };
+        let budget = crate::analysis_visibility::MaskBudget::default();
+        let scope = crate::exclusion_store::Scope::ActiveUnion;
+        let load = || {
+            crate::exclusion_store::visibility(
+                &crate::config_dir(),
+                self.identity
+                    .as_ref()
+                    .ok_or("Caso ausente na visibilidade.")?,
+                &crate::exclusion_store::Budget::default(),
+                &work,
+            )
+        };
+        let mut gate = None;
+        let mut visible_source = self.source.clone();
+        let mut evidence = case_events;
+        if self.mode != Mode::Publish {
+            match (&self.mode, self.source.as_deref()) {
+                (Mode::Case, _) => {
+                    let events = evidence
+                        .as_mut()
+                        .ok_or("Evidências do Caso ausentes na captura.")?;
+                    if let Some(identity) = &self.identity {
+                        gate = Some(evidence_row_gate(
+                            EVIDENCE_MASKS
+                                .get_or_prepare(events, identity, &scope, &budget, &work, load)?,
+                        )?);
+                    }
+                    let mut row = 0;
+                    let mut stopped = false;
+                    events.retain_mut(|event| {
+                        if row % 256 == 0 && cancelled() {
+                            stopped = true;
+                        }
+                        let keep =
+                            !stopped && gate.as_ref().is_none_or(|gate| gate.allows_known_row(row));
+                        row += 1;
+                        if keep {
+                            sources::apply_derived(event, &self.derived);
+                        }
+                        keep
+                    });
+                }
+                (_, Some(SourceData::Indexed(index))) => {
+                    if let Some(identity) = &self.identity {
+                        gate = Some(indexed_row_gate(MASKS.get_or_prepare(
+                            index,
+                            self.source_generation.ok_or("Geração de fonte ausente.")?,
+                            identity,
+                            &scope,
+                            &budget,
+                            &work,
+                            load,
+                        )?)?);
+                    }
+                }
+                (_, Some(SourceData::Memory(events))) => {
+                    let mut events = events.clone();
+                    if let Some(identity) = &self.identity {
+                        gate = Some(evidence_row_gate(
+                            EVIDENCE_MASKS
+                                .get_or_prepare(&events, identity, &scope, &budget, &work, load)?,
+                        )?);
+                    }
+                    let mut row = 0;
+                    let mut stopped = false;
+                    events.retain_mut(|event| {
+                        if row % 256 == 0 && cancelled() {
+                            stopped = true;
+                        }
+                        let keep =
+                            !stopped && gate.as_ref().is_none_or(|gate| gate.allows_known_row(row));
+                        row += 1;
+                        if keep {
+                            sources::apply_derived(event, &self.derived);
+                        }
+                        keep
+                    });
+                    visible_source = Some(Arc::new(SourceData::Memory(events)));
+                }
+                _ => {
+                    if let Some(identity) = &self.identity {
+                        gate = Some(evidence_row_gate(EVIDENCE_MASKS.get_or_prepare(
+                            &[],
+                            identity,
+                            &scope,
+                            &budget,
+                            &work,
+                            load,
+                        )?)?);
+                    }
+                }
+            }
+        }
+        crate::operations::check()?;
+        if let Some(gate) = &gate {
+            gate.validate()?;
+        }
+        self.visibility
+            .set(PreparedVisibility {
+                gate,
+                source: visible_source,
+            })
+            .map_err(|_| "Captura de visibilidade já publicada.")?;
+        Ok(evidence)
+    }
+    /// Only optional scheduling consults publication again, after page work.
+    /// The query itself continues to use its immutable admitted snapshot.
+    pub(crate) fn schedule_derived_variant(&self, state: &AppState) {
+        if self.mode != Mode::Dataset || self.derived.is_empty() {
+            return;
+        }
+        let Some(SourceData::Indexed(index)) = self.source.as_deref() else {
+            return;
+        };
+        let _source = state.source.read();
+        if self.validate_publication(state, false).is_err() {
+            return;
+        }
+        if self
+            .identity
+            .as_ref()
+            .is_some_and(|identity| validate_identity(identity).is_err())
+        {
+            return;
+        }
+        crate::engine::ensure_admitted_variant(
+            index,
+            &state.codes.read(),
+            &state.system_codes.read(),
+            &self.derived,
+        );
+    }
+
+    pub(crate) fn validate_visibility(&self) -> Result<(), String> {
+        if let Some(error) = self.failure.lock().clone() {
+            return Err(error);
+        }
+        let prepared = self
+            .visibility
+            .get()
+            .ok_or("Visibilidade não preparada para esta consulta.")?;
+        if let Some(gate) = &prepared.gate {
+            gate.validate()?;
+        }
+        crate::operations::check()
+    }
+
+    /// Counts belong to this exact admitted scope, before user filters. Only
+    /// indexed Dataset masks can classify unmatched archived source members;
+    /// absence from a Case evidence subset says nothing about source availability.
+    pub(crate) fn visibility_summary(&self) -> Result<VisibilitySummary, String> {
+        self.validate_visibility()?;
+        let analysis = self
+            .identity
+            .clone()
+            .ok_or("Caso ausente na visibilidade.")?;
+        let prepared = self.visibility.get().ok_or("Visibilidade não preparada.")?;
+        let scope = match self.mode {
+            Mode::Dataset => VisibilityScope::Dataset,
+            Mode::Case => VisibilityScope::Case,
+            Mode::Publish => {
+                return Err("Publicação de fonte não é uma consulta de visibilidade.".into())
+            }
+        };
+        let source_available = self.mode == Mode::Case
+            || matches!(
+                self.source.as_deref(),
+                Some(SourceData::Indexed(_) | SourceData::Memory(_))
+            );
+        let (total_rows, excluded_rows, unavailable_members) = if source_available {
+            let gate = prepared
+                .gate
+                .as_ref()
+                .ok_or("Máscara da análise ausente.")?;
+            (
+                Some(gate.rows),
+                Some(gate.rows - gate.visible),
+                gate.unavailable_members,
+            )
+        } else {
+            (None, None, None)
+        };
+        Ok(VisibilitySummary {
+            analysis,
+            source_generation: self.source_generation,
+            scope,
+            source_available,
+            total_rows,
+            excluded_rows,
+            unavailable_members,
+        })
+    }
+
     /// Validate once before execution. The immutable snapshot remains valid if
     /// another request publishes a source/config while this query is running.
     pub(crate) fn validate(&self, state: &AppState) -> Result<(), String> {
@@ -443,6 +746,353 @@ impl Admitted {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum VisibilityScope {
+    Dataset,
+    Case,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VisibilitySummary {
+    pub analysis: Identity,
+    pub source_generation: Option<u64>,
+    pub scope: VisibilityScope,
+    pub source_available: bool,
+    pub total_rows: Option<usize>,
+    pub excluded_rows: Option<usize>,
+    pub unavailable_members: Option<u64>,
+}
+
+#[tauri::command]
+pub(crate) async fn exclusion_visibility(
+    app: tauri::AppHandle,
+    analysis_context: Identity,
+    source_generation: Option<u64>,
+    case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
+    operation_id: Option<String>,
+) -> Result<VisibilitySummary, String> {
+    use tauri::Manager;
+    let (admitted, events) = capture_case(
+        app.state::<AppState>().inner(),
+        Some(analysis_context),
+        source_generation,
+        case_events,
+        case_key,
+    )?;
+    let captured = Arc::clone(&admitted);
+    crate::offload_case(operation_id, app, admitted, events, move |_| {
+        captured.visibility_summary()
+    })
+    .await?
+}
+
+pub(crate) fn clone_index(index: &sources::FileIndex) -> sources::FileIndex {
+    sources::FileIndex {
+        parts: index.parts.clone(),
+        lines: Arc::clone(&index.lines),
+        columns: index.columns.clone(),
+        time_order: Arc::clone(&index.time_order),
+    }
+}
+
+/// Build source descriptors once for a returned page/detail, never for every
+/// scanned row. SourceSet verifies framing and exact original event references.
+pub(crate) fn source_set(
+    index: &sources::FileIndex,
+) -> Result<Arc<crate::analysis_visibility::SourceSet>, String> {
+    if let Some(admitted) = current() {
+        if let Some(SourceData::Indexed(original)) = admitted.source.as_deref() {
+            if !Arc::ptr_eq(&index.lines, &original.lines) {
+                return Err(STALE.into());
+            }
+            return admitted
+                .source_set
+                .get_or_init(|| crate::analysis_visibility::SourceSet::new(index).map(Arc::new))
+                .clone();
+        }
+    }
+    crate::analysis_visibility::SourceSet::new(index).map(Arc::new)
+}
+pub(crate) fn attach_provenance_with(
+    index: &sources::FileIndex,
+    binding: &crate::analysis_visibility::SourceSet,
+    event: &mut Event,
+) -> Result<(), String> {
+    event.evidence_provenance = binding.provenance(
+        index,
+        event.id,
+        &event.event_ref,
+        &crate::analysis_visibility::MaskBudget::default(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn attach_provenance(
+    index: &sources::FileIndex,
+    event: &mut Event,
+) -> Result<(), String> {
+    let binding = source_set(index)?;
+    attach_provenance_with(index, &binding, event)
+}
+
+pub(crate) fn indexed_gate(index: &sources::FileIndex) -> Result<Option<Arc<RowGate>>, String> {
+    let result = indexed_gate_inner(index);
+    if let Err(error) = &result {
+        record_failure(error.clone());
+    }
+    result
+}
+fn indexed_gate_inner(index: &sources::FileIndex) -> Result<Option<Arc<RowGate>>, String> {
+    let Some(admitted) = current() else {
+        return Ok(None);
+    };
+    if admitted.mode == Mode::Publish || admitted.identity.is_none() {
+        return Ok(None);
+    }
+    let prepared = admitted
+        .visibility
+        .get()
+        .ok_or("A visibilidade ainda não foi admitida para esta consulta.")?;
+    let Some(SourceData::Indexed(original)) = admitted.source.as_deref() else {
+        return Err("Esta consulta não pertence à fonte indexada admitida.".into());
+    };
+    if !Arc::ptr_eq(&index.lines, &original.lines)
+        || index.parts.len() != original.parts.len()
+        || index.parts.iter().zip(&original.parts).any(|(a, b)| {
+            a.base != b.base || !Arc::ptr_eq(&a.mmap, &b.mmap) || a.identity != b.identity
+        })
+    {
+        return Err("A visibilidade pertence a outra geração da fonte.".into());
+    }
+    if let Some(gate) = &prepared.gate {
+        gate.validate()?;
+    }
+    Ok(prepared.gate.clone())
+}
+pub(crate) fn visibility_restricted() -> bool {
+    current()
+        .and_then(|admitted| {
+            admitted.visibility.get().map(|prepared| {
+                prepared
+                    .gate
+                    .as_ref()
+                    .is_some_and(|gate| !gate.is_unrestricted())
+            })
+        })
+        .unwrap_or(false)
+}
+pub(crate) fn visibility_unrestricted(index: &sources::FileIndex) -> Result<bool, String> {
+    Ok(indexed_gate(index)?.is_none_or(|gate| gate.is_unrestricted()))
+}
+pub(crate) fn visible_total(index: &sources::FileIndex) -> Result<usize, String> {
+    Ok(indexed_gate(index)?.map_or(index.lines.len(), |gate| gate.visible_count()))
+}
+pub(crate) fn row_visible(index: &sources::FileIndex, row: usize) -> Result<bool, String> {
+    match indexed_gate(index)? {
+        Some(gate) => gate.allows(row),
+        None => Ok(row < index.lines.len()),
+    }
+}
+pub(crate) fn record_failure(error: String) {
+    if let Some(admitted) = current() {
+        *admitted.failure.lock() = Some(error);
+    }
+}
+
+/// A capability for hydrating a bounded, already-verified archive page. It is
+/// deliberately a different type from query admission and has no query bypass.
+pub(crate) struct ArchiveSource {
+    admitted: Arc<Admitted>,
+    evidence: Option<Vec<Event>>,
+    unavailable: Option<String>,
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArchiveRecord {
+    pub member: crate::exclusion_store::Member,
+    pub event: Option<Event>,
+    pub unavailable_reason: Option<String>,
+    pub active_in_batch: bool,
+}
+pub(crate) fn capture_archive_case(
+    state: &AppState,
+    identity: Identity,
+    generation: Option<u64>,
+    events: Option<Vec<Event>>,
+    key: Option<String>,
+) -> Result<ArchiveSource, String> {
+    if events.is_some() || key.is_some() {
+        let (admitted, evidence) = capture_case(state, Some(identity), generation, events, key)?;
+        return Ok(ArchiveSource {
+            admitted,
+            evidence,
+            unavailable: None,
+        });
+    }
+    match capture(state, Some(identity.clone()), generation, Mode::Dataset) {
+        Ok(admitted) => Ok(ArchiveSource {
+            admitted,
+            evidence: None,
+            unavailable: None,
+        }),
+        Err(error) => {
+            // A valid ledger history remains accessible after closing a source.
+            // Revalidating the explicit identity still rejects stale/other Cases.
+            let admitted = capture(state, Some(identity), None, Mode::Case)?;
+            Ok(ArchiveSource {
+                admitted,
+                evidence: None,
+                unavailable: Some(error),
+            })
+        }
+    }
+}
+
+impl ArchiveSource {
+    pub(crate) fn resolve(
+        &self,
+        state: &AppState,
+        page: &crate::exclusion_store::ArchivePage,
+    ) -> Result<Vec<ArchiveRecord>, String> {
+        if page.rows.len() > 500 || self.admitted.identity.as_ref() != Some(&page.analysis) {
+            return Err("A página do arquivo não pertence à captura de análise.".into());
+        }
+        validate_identity(&page.analysis)?;
+        let unavailable = |reason: String| {
+            page.rows
+                .iter()
+                .map(|row| ArchiveRecord {
+                    member: crate::exclusion_store::Member {
+                        key: row.key.clone(),
+                        event_ref: row.event_ref.clone(),
+                    },
+                    event: None,
+                    unavailable_reason: Some(reason.clone()),
+                    active_in_batch: !row.restored_from_batch,
+                })
+                .collect()
+        };
+        if let Some(reason) = &self.unavailable {
+            return Ok(unavailable(reason.clone()));
+        }
+        if let Err(error) = self.admitted.validate(state) {
+            return Ok(unavailable(error));
+        }
+        let codes = state.codes.read();
+        let system = state.system_codes.read();
+        let index = match self.admitted.source.as_deref() {
+            Some(SourceData::Indexed(index)) => Some(index),
+            _ => None,
+        };
+        let token = crate::operations::current_token();
+        let cancelled = || token.cancelled();
+        let progress = |_: &str, completed: u64, total: Option<u64>| {
+            crate::operations::report_progress(
+                "análise",
+                "archive",
+                "Localizando registros do arquivo",
+                completed as usize,
+                total.unwrap_or(0) as usize,
+                "registros",
+                0,
+            )
+        };
+        let work = crate::exclusion_store::Work {
+            cancelled: &cancelled,
+            progress: &progress,
+        };
+        let binding = match index
+            .map(|index| {
+                crate::analysis_visibility::SourceSet::prepare(
+                    index,
+                    &crate::analysis_visibility::MaskBudget::default(),
+                    &work,
+                )
+            })
+            .transpose()
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                crate::operations::check()?;
+                return Ok(unavailable(error));
+            }
+        };
+        let memory = self
+            .evidence
+            .as_deref()
+            .or_else(|| match self.admitted.source.as_deref() {
+                Some(SourceData::Memory(events)) => Some(events.as_slice()),
+                _ => None,
+            });
+        let mut budget = crate::query::AnalyticsBudget::new();
+        let mut result = Vec::with_capacity(page.rows.len());
+        for row in &page.rows {
+            crate::operations::check()?;
+            let member = crate::exclusion_store::Member {
+                key: row.key.clone(),
+                event_ref: row.event_ref.clone(),
+            };
+            let source = page
+                .sources
+                .get(&member.key.source_key)
+                .ok_or("Proveniência ausente na página do arquivo.")?;
+            let mut event = if let (Some(index), Some(binding)) = (index, binding.as_ref()) {
+                match binding.resolve_member(
+                    index,
+                    &member,
+                    &crate::analysis_visibility::MaskBudget::default(),
+                )? {
+                    Some(id) => {
+                        let mut event =
+                            sources::event_at(index, id, &codes, &system, &self.admitted.derived);
+                        attach_provenance_with(index, binding, &mut event)?;
+                        Some(event)
+                    }
+                    None => None,
+                }
+            } else if let Some(events) = memory {
+                let mut matching = events
+                    .iter()
+                    .take_while(|_| !crate::operations::cancelled())
+                    .filter(|event| event.event_ref == member.event_ref)
+                    .filter(|event| {
+                        if let Some(proof) = &event.evidence_provenance {
+                            proof.source.key().ok().as_deref()
+                                == Some(member.key.source_key.as_str())
+                                && proof.locator == member.key.locator
+                        } else if let (
+                            Some(prefix),
+                            crate::exclusion_store::Locator::ByteOffset(offset),
+                        ) = (&source.event_ref_prefix, &member.key.locator)
+                        {
+                            event.event_ref == format!("{prefix}:{offset}")
+                        } else {
+                            false
+                        }
+                    });
+                let event = matching.next().cloned();
+                if matching.next().is_some() {
+                    return Err("Referência ambígua nas evidências do Caso.".into());
+                }
+                event
+            } else {
+                None
+            };
+            if let Some(event) = &mut event {
+                sources::apply_derived(event, &self.admitted.derived);
+                crate::entities::annotate(event);
+                budget.charge(crate::query::event_payload_bytes(event))?;
+            }
+            result.push(ArchiveRecord { member, unavailable_reason: event.is_none().then(|| "O registro original com esta proveniência não está disponível na captura atual.".into()), event, active_in_batch: !row.restored_from_batch });
+        }
+        crate::operations::check()?;
+        Ok(result)
+    }
+}
+
 pub(crate) enum SourceView<'a> {
     Captured(Arc<SourceData>),
     Legacy(RwLockReadGuard<'a, SourceData>),
@@ -457,7 +1107,13 @@ impl Deref for SourceView<'_> {
     }
 }
 pub(crate) fn source(state: &AppState) -> SourceView<'_> {
-    match current().and_then(|admitted| admitted.source.clone()) {
+    match current().and_then(|admitted| {
+        admitted
+            .visibility
+            .get()
+            .and_then(|prepared| prepared.source.clone())
+            .or_else(|| admitted.source.clone())
+    }) {
         Some(source) => SourceView::Captured(source),
         None if current().is_some_and(|admitted| admitted.mode == Mode::Case) => {
             SourceView::Captured(Arc::new(SourceData::None))
@@ -470,6 +1126,14 @@ pub(crate) fn derived(state: &AppState) -> Arc<Vec<sources::CompiledDerived>> {
         .map(|admitted| admitted.derived.clone())
         .unwrap_or_else(|| Arc::new(state.derived.read().clone()))
 }
+/// Immutable descriptor metadata only; readers and lookup materialization stay
+/// local to worker preparation and must bind content/schema version hashes.
+pub(crate) fn reference_descriptors() -> Arc<Vec<analysis_context::ReferenceDescriptor>> {
+    current()
+        .map(|admitted| Arc::clone(&admitted.references))
+        .unwrap_or_else(|| Arc::new(Vec::new()))
+}
+
 pub(crate) fn source_names(state: &AppState) -> Vec<String> {
     current()
         .filter(|admitted| admitted.mode == Mode::Dataset)
@@ -563,12 +1227,16 @@ mod tests {
         )
         .unwrap();
         assert!(Arc::ptr_eq(&first.derived, &again.derived));
+        let a_events = first.prepare_visibility(a_events).unwrap();
         assert_eq!(a_events.as_ref().unwrap()[0].fields["tag"], "A");
-        let (_, b_events) = capture_case(&state, Some(b.identity()), None, a_events, None).unwrap();
+        let (b_admitted, b_events) =
+            capture_case(&state, Some(b.identity()), None, a_events, None).unwrap();
+        let b_events = b_admitted.prepare_visibility(b_events).unwrap();
         assert_eq!(b_events.as_ref().unwrap()[0].fields["tag"], "B");
         let empty = analysis_context::update(&b.identity(), Default::default()).unwrap();
-        let (_, empty_events) =
+        let (empty_admitted, empty_events) =
             capture_case(&state, Some(empty.identity()), None, b_events, None).unwrap();
+        let empty_events = empty_admitted.prepare_visibility(empty_events).unwrap();
         assert!(empty_events.unwrap()[0].fields.get("tag").is_none());
         assert!(evidence[0].fields.is_empty());
         assert!(first.validate(&state).is_ok());
@@ -717,6 +1385,7 @@ mod tests {
         )
         .unwrap();
         assert!(evidence.unwrap()[0].fields.is_empty());
+        assert!(capture_case(&state, None, None, Some(vec![original()]), None).is_err());
     }
 
     #[test]
@@ -781,9 +1450,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(queued.validate(&state).unwrap_err(), STALE);
+        let (restored, events) =
+            capture_case(&state, Some(changed.identity()), None, Some(vec![]), None).unwrap();
         assert!(
-            capture_case(&state, Some(changed.identity()), None, Some(vec![]), None).is_err(),
-            "unknown visibility must never silently fall back to all records"
+            restored
+                .prepare_visibility(events)
+                .unwrap()
+                .unwrap()
+                .is_empty(),
+            "actual empty membership is valid after any revision"
         );
         let mut cases = crate::case_store::load().unwrap();
         cases["cases"] = json!([]);
@@ -814,6 +1489,7 @@ mod tests {
         *state.derived.write() = compile_uncached(&a).unwrap();
         let captured = capture(&state, None, Some(0), Mode::Dataset).unwrap();
         state.derived.write().clear();
+        captured.prepare_visibility(None).unwrap();
         with(Some(captured), || {
             let view = source(&state);
             let SourceData::Memory(events) = &*view else {
@@ -850,6 +1526,7 @@ mod tests {
             context.clone(),
         )
         .unwrap();
+        let events = admitted.prepare_visibility(events).unwrap();
         let result = with(Some(admitted), || {
             crate::workspace::grouped_timeline_impl(&state, &[], events.as_deref(), &spec)
         })
@@ -857,5 +1534,659 @@ mod tests {
         assert_eq!(result.context, context);
         assert_eq!(result.series[0].key, "A");
         assert_eq!(result.total.count, 1);
+    }
+    fn visibility_fixture(directory: &Directory) -> (AppState, Vec<Event>) {
+        let path = directory.path.path().join("visible.jsonl");
+        let text = (0..12).map(|n| json!({"timestamp":1700000000000i64+n*1000,"source":"fixture","level":if n%2==0 {"ERROR"} else {"INFO"},"message":format!("event {n}"),"group":if n<6 {"A"} else {"B"},"value":n,"trace_id":if n==0 {"0123456789abcdef0123456789abcdef"} else {"ordinary"}}).to_string()+"\n").collect::<String>();
+        std::fs::write(&path, text).unwrap();
+        let index = sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let codes = crate::model::CodesConfig::default();
+        let binding = crate::analysis_visibility::SourceSet::new(&index).unwrap();
+        let events = (0..12)
+            .map(|id| {
+                let mut event = sources::event_at(&index, id, &codes, &codes, &[]);
+                attach_provenance_with(&index, &binding, &mut event).unwrap();
+                event
+            })
+            .collect();
+        let state = state(SourceData::None);
+        let owner = capture(
+            &state,
+            Some(directory.snapshot("a").identity()),
+            Some(0),
+            Mode::Publish,
+        )
+        .unwrap();
+        with(Some(owner), || {
+            crate::source_publication::publish(&state, index, vec!["fixture".into()], vec![], false)
+        })
+        .unwrap();
+        (state, events)
+    }
+    fn exclude(
+        directory: &Directory,
+        state: &AppState,
+        rows: &[usize],
+    ) -> crate::exclusion_store::Receipt {
+        let work = crate::exclusion_store::Work {
+            cancelled: &|| false,
+            progress: &|_, _, _| {},
+        };
+        let source = state.source.read();
+        let SourceData::Indexed(index) = &*source else {
+            panic!()
+        };
+        let binding =
+            crate::analysis_visibility::SourceSet::prepare(index, &Default::default(), &work)
+                .unwrap();
+        let admission = crate::exclusion_store::Admission {
+            analysis: directory.snapshot("a").identity(),
+            source_receipt: serde_json::to_value(crate::source_publication::receipt_locked(state))
+                .unwrap(),
+        };
+        let members = rows
+            .iter()
+            .map(|&row| binding.member_row(index, row, &Default::default()));
+        let staged = crate::exclusion_store::stage(
+            directory.path.path(),
+            admission,
+            crate::exclusion_store::Purpose::Exclude,
+            binding.descriptors(),
+            members,
+            &Default::default(),
+            &work,
+        )
+        .unwrap();
+        crate::exclusion_store::publish(
+            directory.path.path(),
+            staged,
+            "fixture batch",
+            "test",
+            json!({}),
+            &Default::default(),
+            &work,
+        )
+        .unwrap()
+    }
+    fn restore(
+        directory: &Directory,
+        state: &AppState,
+        batch: &str,
+    ) -> crate::exclusion_store::Receipt {
+        crate::exclusion_store::restore_batch(
+            directory.path.path(),
+            &crate::exclusion_store::Admission {
+                analysis: directory.snapshot("a").identity(),
+                source_receipt: serde_json::to_value(crate::source_publication::receipt_locked(
+                    state,
+                ))
+                .unwrap(),
+            },
+            batch,
+            &crate::exclusion_store::Work {
+                cancelled: &|| false,
+                progress: &|_, _, _| {},
+            },
+        )
+        .unwrap()
+    }
+    fn admitted_dataset(directory: &Directory, state: &AppState) -> Arc<Admitted> {
+        let admitted = capture(
+            state,
+            Some(directory.snapshot("a").identity()),
+            Some(crate::source_publication::receipt_locked(state).generation),
+            Mode::Dataset,
+        )
+        .unwrap();
+        admitted.validate(state).unwrap();
+        admitted.prepare_visibility(None).unwrap();
+        admitted
+    }
+    #[test]
+    fn visible_sql_fallback_case_memory_counts_pages_and_analytics_agree() {
+        let directory = Directory::new();
+        let (state, originals) = visibility_fixture(&directory);
+        exclude(&directory, &state, &[0, 5]);
+        exclude(&directory, &state, &[5, 11]);
+        let expected: Vec<_> = originals
+            .iter()
+            .filter(|event| ![0, 5, 11].contains(&event.id))
+            .cloned()
+            .collect();
+        let admitted = admitted_dataset(&directory, &state);
+        struct ResetEngine;
+        impl Drop for ResetEngine {
+            fn drop(&mut self) {
+                crate::engine::set_enabled(false);
+            }
+        }
+        let _reset = ResetEngine;
+        for sql in [false, true] {
+            crate::engine::set_enabled(sql);
+            if sql {
+                let source = state.source.read();
+                let SourceData::Indexed(index) = &*source else {
+                    panic!()
+                };
+                crate::engine::prepare(
+                    index,
+                    &Default::default(),
+                    &Default::default(),
+                    &[],
+                    &|_, _| {},
+                )
+                .unwrap();
+            }
+            with(Some(admitted.clone()), || {
+                assert_eq!(crate::count_filtered_impl(&state, vec![], None).unwrap(), 9);
+                let union = crate::query::Filter {
+                    column: "_all".into(),
+                    op: "query".into(),
+                    value: "group:A OR group:B".into(),
+                    value2: None,
+                };
+                assert_eq!(
+                    crate::count_filtered_impl(&state, vec![union], None).unwrap(),
+                    9
+                );
+                let page = crate::query_events_impl(&state, vec![], "id", "asc", 0, 100).unwrap();
+                assert_eq!(page.total, 9);
+                assert_eq!(
+                    page.rows.iter().map(|event| event.id).collect::<Vec<_>>(),
+                    vec![1, 2, 3, 4, 6, 7, 8, 9, 10]
+                );
+                assert!(page
+                    .rows
+                    .iter()
+                    .all(|event| event.evidence_provenance.is_some()));
+                assert!(crate::event_detail_raw(&state, 0).is_none());
+                assert_eq!(crate::event_detail_raw(&state, 1).unwrap().id, 1);
+                assert_eq!(crate::source_summary_impl(&state).unwrap().count, 9);
+                assert_eq!(
+                    serde_json::to_value(crate::workspace::sources_impl(&state).unwrap()).unwrap()
+                        [0]["count"],
+                    9
+                );
+                let actual = crate::stats_events_impl(&state, vec![]).unwrap();
+                let expected_stats = crate::query::stats(&expected, &[]);
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(expected_stats).unwrap()
+                );
+                assert_eq!(
+                    crate::workspace::overview_impl(&state, vec![])
+                        .unwrap()
+                        .total,
+                    9
+                );
+                let spec = crate::grouped_timeline::Spec::new(
+                    "group".into(),
+                    crate::grouped_timeline::Grid {
+                        start: 1700000000000,
+                        bucket_ms: 1000,
+                        bucket_count: 12,
+                    },
+                    Some(1),
+                    crate::grouped_timeline::Context::default(),
+                )
+                .unwrap();
+                let grouped =
+                    crate::workspace::grouped_timeline_impl(&state, &[], None, &spec).unwrap();
+                assert_eq!(grouped.total.count, 9);
+                assert_eq!(grouped.series[0].key, "B");
+                assert_eq!(grouped.series[0].count, 5);
+                assert_eq!(grouped.other.count, 4);
+                let pivot:crate::analysis::PivotSpec=serde_json::from_value(json!({"rows":["group"],"cols":[],"values":[{"func":"count","column":"*","alias":"n"}]})).unwrap();
+                assert_eq!(
+                    serde_json::to_value(
+                        crate::pivot_impl(&state, vec![], None, pivot.clone()).unwrap()
+                    )
+                    .unwrap(),
+                    serde_json::to_value(crate::analysis::pivot(&expected, &pivot).unwrap())
+                        .unwrap()
+                );
+                let journey =
+                    crate::journeys::index_impl(&state, &[], None, "group", 0, 100, "recent", true)
+                        .unwrap();
+                let expected_journey = crate::journeys::index_impl(
+                    &state,
+                    &[],
+                    Some(&expected),
+                    "group",
+                    0,
+                    100,
+                    "recent",
+                    true,
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(journey).unwrap(),
+                    serde_json::to_value(expected_journey).unwrap()
+                );
+                let mut exported = Vec::new();
+                let total = crate::workspace::with_selection(&state, &[], |selection| {
+                    crate::workspace::write_events_export(&mut exported, "jsonl", false, || {
+                        selection.iter()
+                    })
+                })
+                .unwrap()
+                .unwrap();
+                assert_eq!(total, 9);
+                assert_eq!(String::from_utf8(exported).unwrap().lines().count(), 9);
+                let singleton = crate::query::Filter {
+                    column: "trace_id".into(),
+                    op: "equals_exact".into(),
+                    value: "0123456789abcdef0123456789abcdef".into(),
+                    value2: None,
+                };
+                let source = source(&state);
+                let SourceData::Indexed(index) = &*source else {
+                    panic!()
+                };
+                let page = crate::query::query_page_indexed(
+                    index,
+                    &[singleton],
+                    "id",
+                    "asc",
+                    0,
+                    5,
+                    None,
+                    &Default::default(),
+                    &Default::default(),
+                    &[],
+                )
+                .unwrap();
+                assert!(page.rows.is_empty());
+                assert_eq!(page.total, Some(0));
+                if sql {
+                    let mut ids = Vec::new();
+                    let visited = crate::workspace::with_selection(&state, &[], |selection| {
+                        selection.visit_exact_ids(|id| {
+                            ids.push(id);
+                            Ok(true)
+                        })
+                    })
+                    .unwrap()
+                    .unwrap();
+                    assert!(visited.is_some());
+                    assert_eq!(ids.len(), 9);
+                }
+            });
+        }
+        let (case_admitted, case_events) = capture_case(
+            &state,
+            Some(directory.snapshot("a").identity()),
+            None,
+            Some(originals.clone()),
+            Some("evidence".into()),
+        )
+        .unwrap();
+        let filtered = case_admitted
+            .prepare_visibility(case_events)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            filtered.iter().map(|event| event.id).collect::<Vec<_>>(),
+            expected.iter().map(|event| event.id).collect::<Vec<_>>()
+        );
+        assert_eq!(originals.len(), 12);
+        let memory = self::state(SourceData::Memory(originals));
+        let owner = capture(
+            &memory,
+            Some(directory.snapshot("a").identity()),
+            Some(0),
+            Mode::Publish,
+        )
+        .unwrap();
+        with(Some(owner), || {
+            let _source = crate::source_write_checked(&memory).unwrap();
+            let receipt = crate::source_publication::prepare_touch_locked(&memory).unwrap();
+            crate::source_publication::commit_touch_locked(&memory, receipt);
+        });
+        let admitted = admitted_dataset(&directory, &memory);
+        with(Some(admitted), || {
+            assert_eq!(
+                crate::count_filtered_impl(&memory, vec![], None).unwrap(),
+                9
+            );
+            assert!(crate::event_detail_raw(&memory, 0).is_none());
+            assert_eq!(crate::event_detail_raw(&memory, 6).unwrap().id, 6);
+        });
+    }
+    #[test]
+    fn restores_invalidate_cursors_and_real_empty_membership_reopens_fast_paths() {
+        let directory = Directory::new();
+        let (state, _) = visibility_fixture(&directory);
+        let first = exclude(&directory, &state, &[0, 5]);
+        let second = exclude(&directory, &state, &[5, 11]);
+        crate::engine::set_enabled(true);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::engine::set_enabled(false);
+            }
+        }
+        let _reset = Reset;
+        {
+            let source = state.source.read();
+            let SourceData::Indexed(index) = &*source else {
+                panic!()
+            };
+            crate::engine::prepare(
+                index,
+                &Default::default(),
+                &Default::default(),
+                &[],
+                &|_, _| {},
+            )
+            .unwrap();
+        }
+        let before = admitted_dataset(&directory, &state);
+        let cursor = with(Some(before), || {
+            let view = source(&state);
+            let SourceData::Indexed(index) = &*view else {
+                panic!()
+            };
+            crate::query::query_page_indexed(
+                index,
+                &[],
+                "id",
+                "asc",
+                0,
+                3,
+                None,
+                &Default::default(),
+                &Default::default(),
+                &[],
+            )
+            .unwrap()
+            .next_cursor
+            .unwrap()
+        });
+        // Registry tokens are statement-local. A fresh admission of the same
+        // immutable identity must continue an earlier cursor and reuse results.
+        let unchanged = admitted_dataset(&directory, &state);
+        with(Some(unchanged), || {
+            let view = source(&state);
+            let SourceData::Indexed(index) = &*view else {
+                panic!()
+            };
+            let next = crate::query::query_page_indexed(
+                index,
+                &[],
+                "id",
+                "asc",
+                3,
+                3,
+                Some(&cursor),
+                &Default::default(),
+                &Default::default(),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                next.rows.iter().map(|event| event.id).collect::<Vec<_>>(),
+                vec![4, 6, 7]
+            );
+            assert_eq!(crate::count_filtered_impl(&state, vec![], None).unwrap(), 9);
+            assert_eq!(crate::count_filtered_impl(&state, vec![], None).unwrap(), 9);
+        });
+        restore(&directory, &state, &first.batch_id);
+        let restored = admitted_dataset(&directory, &state);
+        with(Some(restored), || {
+            assert_eq!(
+                crate::count_filtered_impl(&state, vec![], None).unwrap(),
+                10
+            );
+            let view = source(&state);
+            let SourceData::Indexed(index) = &*view else {
+                panic!()
+            };
+            assert!(crate::query::query_page_indexed(
+                index,
+                &[],
+                "id",
+                "asc",
+                3,
+                3,
+                Some(&cursor),
+                &Default::default(),
+                &Default::default(),
+                &[]
+            )
+            .err()
+            .expect("a cursor from the old visibility must be rejected")
+            .contains("PAGINATION_RESET_REQUIRED"));
+            assert!(!visibility_unrestricted(index).unwrap());
+        });
+        restore(&directory, &state, &second.batch_id);
+        let empty = admitted_dataset(&directory, &state);
+        assert!(empty.identity.as_ref().unwrap().visibility_revision > 0);
+        with(Some(empty), || {
+            let view = source(&state);
+            let SourceData::Indexed(index) = &*view else {
+                panic!()
+            };
+            assert!(visibility_unrestricted(index).unwrap());
+            assert_eq!(visible_total(index).unwrap(), 12);
+            assert_eq!(
+                crate::count_filtered_impl(&state, vec![], None).unwrap(),
+                12
+            );
+        });
+    }
+    #[test]
+    fn corrupt_membership_and_unknown_evidence_fail_without_mutating_originals() {
+        let directory = Directory::new();
+        let (state, originals) = visibility_fixture(&directory);
+        let receipt = exclude(&directory, &state, &[0]);
+        let good = admitted_dataset(&directory, &state);
+        good.validate_visibility().unwrap();
+        let mut unsupported = original();
+        unsupported.event_ref.clear();
+        let (mut capture, events) = capture_case(
+            &state,
+            Some(directory.snapshot("a").identity()),
+            None,
+            Some(vec![unsupported]),
+            None,
+        )
+        .unwrap();
+        assert!(capture.prepare_visibility(events).is_err());
+        let payload = directory
+            .path
+            .path()
+            .join("exclusions-v1")
+            .join(format!("{}.sqlite3", receipt.batch_id));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(payload)
+            .unwrap();
+        file.set_len(10).unwrap();
+        assert!(good.validate_visibility().is_err());
+        capture = capture_case(
+            &state,
+            Some(directory.snapshot("a").identity()),
+            None,
+            Some(originals.clone()),
+            None,
+        )
+        .unwrap()
+        .0;
+        assert!(capture.prepare_visibility(Some(originals.clone())).is_err());
+        assert_eq!(originals.len(), 12);
+        let view = state.source.read();
+        let SourceData::Indexed(index) = &*view else {
+            panic!()
+        };
+        assert_eq!(index.lines.len(), 12);
+    }
+    #[test]
+    fn bounded_archive_resolves_original_members_after_restore_and_source_close() {
+        let directory = Directory::new();
+        let (state, _) = visibility_fixture(&directory);
+        let batch = exclude(&directory, &state, &[0, 5]);
+        restore(&directory, &state, &batch.batch_id);
+        let identity = directory.snapshot("a").identity();
+        let work = crate::exclusion_store::Work {
+            cancelled: &|| false,
+            progress: &|_, _, _| {},
+        };
+        let page = crate::exclusion_store::archive_page(
+            directory.path.path(),
+            &identity,
+            &batch.batch_id,
+            None,
+            10,
+            &work,
+        )
+        .unwrap();
+        assert_eq!(page.rows.len(), 2);
+        assert!(page.rows.iter().all(|row| row.restored_from_batch));
+        let archive = capture_archive_case(&state, identity.clone(), None, None, None).unwrap();
+        let records = archive.resolve(&state, &page).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|row| row.event.as_ref().unwrap().id)
+                .collect::<Vec<_>>(),
+            vec![0, 5]
+        );
+        assert!(records
+            .iter()
+            .all(|row| !row.active_in_batch && row.unavailable_reason.is_none()));
+        let mut wrong = page.clone();
+        wrong.analysis = directory.snapshot("b").identity();
+        assert!(archive.resolve(&state, &wrong).is_err());
+        let mut too_large = page.clone();
+        too_large.rows = vec![page.rows[0].clone(); 501];
+        assert!(archive.resolve(&state, &too_large).is_err());
+        *state.source.write() = SourceData::None;
+        let archive = capture_archive_case(&state, identity, None, None, None).unwrap();
+        let unavailable = archive.resolve(&state, &page).unwrap();
+        assert_eq!(unavailable.len(), 2);
+        assert!(unavailable.iter().all(|row| row.event.is_none()
+            && row.unavailable_reason.is_some()
+            && !row.active_in_batch));
+    }
+    #[test]
+    fn visibility_summary_reports_changed_versions_and_missing_source_without_remapping() {
+        use std::io::Write;
+        let directory = Directory::new();
+        let (state, _) = visibility_fixture(&directory);
+        exclude(&directory, &state, &[0, 5]);
+        exclude(&directory, &state, &[5, 11]);
+        let before = admitted_dataset(&directory, &state);
+        let summary = before.visibility_summary().unwrap();
+        assert_eq!(summary.scope, VisibilityScope::Dataset);
+        assert_eq!(
+            (
+                summary.total_rows,
+                summary.excluded_rows,
+                summary.unavailable_members
+            ),
+            (Some(12), Some(3), Some(0))
+        );
+        let path = directory.path.path().join("visible.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"message":"appended record", "group":"C"})
+        )
+        .unwrap();
+        drop(file);
+        let index = sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let publication = capture(
+            &state,
+            Some(directory.snapshot("a").identity()),
+            Some(crate::source_publication::receipt_locked(&state).generation),
+            Mode::Publish,
+        )
+        .unwrap();
+        with(Some(publication), || {
+            crate::source_publication::publish(&state, index, vec!["fixture".into()], vec![], false)
+        })
+        .unwrap();
+        assert!(before.validate(&state).is_err());
+        let admitted = admitted_dataset(&directory, &state);
+        let summary = admitted.visibility_summary().unwrap();
+        assert_eq!(summary.analysis, directory.snapshot("a").identity());
+        assert_eq!(
+            summary.source_generation,
+            Some(crate::source_publication::receipt_locked(&state).generation)
+        );
+        assert!(summary.source_available);
+        assert_eq!(
+            (
+                summary.total_rows,
+                summary.excluded_rows,
+                summary.unavailable_members
+            ),
+            (Some(13), Some(0), Some(3))
+        );
+        let owner = capture(
+            &state,
+            Some(summary.analysis),
+            summary.source_generation,
+            Mode::Publish,
+        )
+        .unwrap();
+        with(Some(owner), || crate::source_publication::clear(&state)).unwrap();
+        let summary = admitted_dataset(&directory, &state)
+            .visibility_summary()
+            .unwrap();
+        assert!(!summary.source_available);
+        assert_eq!(
+            (
+                summary.total_rows,
+                summary.excluded_rows,
+                summary.unavailable_members
+            ),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn visibility_summary_keeps_case_subset_and_unavailable_members_distinct() {
+        let directory = Directory::new();
+        let (state, originals) = visibility_fixture(&directory);
+        exclude(&directory, &state, &[0, 5, 11]);
+        let identity = directory.snapshot("a").identity();
+        let subset = vec![originals[0].clone(), originals[1].clone()];
+        let (admitted, events) =
+            capture_case(&state, Some(identity.clone()), None, Some(subset), None).unwrap();
+        assert!(admitted.visibility_summary().is_err());
+        let filtered = admitted.prepare_visibility(events).unwrap().unwrap();
+        assert_eq!(filtered.len(), 1);
+        let value = serde_json::to_value(admitted.visibility_summary().unwrap()).unwrap();
+        assert_eq!(
+            value,
+            json!({"analysis":identity, "sourceGeneration":null, "scope":"case",
+            "sourceAvailable":true, "totalRows":2, "excludedRows":1, "unavailableMembers":null})
+        );
+        let (empty, events) = capture_case(
+            &state,
+            Some(directory.snapshot("a").identity()),
+            None,
+            Some(vec![]),
+            None,
+        )
+        .unwrap();
+        empty.prepare_visibility(events).unwrap();
+        let summary = empty.visibility_summary().unwrap();
+        assert!(summary.source_available);
+        assert_eq!(
+            (
+                summary.total_rows,
+                summary.excluded_rows,
+                summary.unavailable_members
+            ),
+            (Some(0), Some(0), None)
+        );
+        assert_eq!(originals.len(), 12);
     }
 }

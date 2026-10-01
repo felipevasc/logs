@@ -46,6 +46,7 @@ context.openValueFilter('timestamp',123456789);assert.equal(node('#fp-op').value
 context.openValueFilter('message','');assert.equal(node('#fp-op').value,'empty');
 let preset;
 Object.assign(context,{eventComment:()=>'',workspaceScope:()=> 'dataset',trunc:String,sendVisibleToCase(){},openValueFilter:(...args)=>{preset=args;}});
+vm.runInContext(app.slice(app.indexOf('function ensureSelectionOwner('), app.indexOf('function toggleRowSelect(')), context);
 vm.runInContext(app.slice(app.indexOf('function eventCellMenu('),app.indexOf('\nasync function removeEventFromCase(')),context);
 const menu=context.eventCellMenu({id:7,timestamp:123},'timestamp','formatted date',{});
 menu.find(item=>item.label?.startsWith('Criar filtro:')).onClick();assert.equal(preset[0],'timestamp');assert.equal(preset[1],123,'composer uses actual numeric timestamp');

@@ -55,7 +55,9 @@ impl serde::Serialize for CaseBody<'_> {
             .as_object()
             .expect("case validated before serialization")
         {
-            if key != "analysisContext" || self.preserve_context {
+            if key != crate::case_archive::TOKEN_FIELD
+                && (key != "analysisContext" || self.preserve_context)
+            {
                 map.serialize_entry(key, value)?;
             }
         }
@@ -210,7 +212,11 @@ fn save_initial_at(dir: &std::path::Path, data: Value, legacy: bool) -> Result<V
         .map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO cases(id,body,position) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET body=excluded.body,position=excluded.position WHERE cases.body<>excluded.body OR cases.position<>excluded.position",params![id,body,position as i64]).map_err(|e|e.to_string())?;
         if !legacy {
-            if let Some(snapshot) = crate::analysis_context::ensure_case(&tx, case)? {
+            let imported = crate::case_archive::consume_prepared(dir, &tx, case)?;
+            if let Some(snapshot) = match imported {
+                Some(snapshot) => Some(snapshot),
+                None => crate::analysis_context::ensure_case(&tx, case)?,
+            } {
                 analysis_contexts.push(snapshot);
             }
         }
@@ -243,6 +249,7 @@ fn save_initial_at(dir: &std::path::Path, data: Value, legacy: bool) -> Result<V
     tx.execute("INSERT INTO metadata(key,value) VALUES('revision',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[revision.to_string()]).map_err(|e|e.to_string())?;
     tx.execute("INSERT INTO metadata(key,value) VALUES('active',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[data.get("active").unwrap_or(&Value::Null).to_string()]).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
+    crate::case_archive::retire_committed(dir, &data);
     Ok(json!({"revision":revision,"schemaVersion":2,"analysisContexts":analysis_contexts}))
 }
 

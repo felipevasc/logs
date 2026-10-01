@@ -40,9 +40,9 @@ const empty=nullable.find(option=>option.label==='');assert.ok(empty);
 assert.equal(context.window.QueryLang.matches({fields:{path:''}},`path:${empty.text}`),true);
 assert.equal(context.window.QueryLang.matches({fields:{}},`path:${empty.text}`),false,'empty value remains distinct from a missing field');
 assert.equal(context.window.QueryLang.matches({fields:{path:null}},`path:${empty.text}`),false);
-// Preserve existing null/role fallback boundaries while matching ordinary empty strings.
+// Ordinary JSON null follows col_ref text; role fallback retains its own boundary.
 assert.equal(context.window.QueryLang.fieldValue({fields:{path:''}},context.window.QueryLang.resolve('path')),'');
-assert.equal(context.window.QueryLang.fieldValue({fields:{path:null}},context.window.QueryLang.resolve('path')),null);
+assert.equal(context.window.QueryLang.fieldValue({fields:{path:null}},context.window.QueryLang.resolve('path')),'null');
 assert.equal(context.window.QueryLang.fieldValue({fields:{}},context.window.QueryLang.resolve('path')),null);
 assert.equal(context.window.QueryLang.fieldValue({fields:{'@src_ip':''},source:'10.2.3.4'},context.window.QueryLang.resolve('@src_ip')),'10.2.3.4','explicit role fallback behavior remains unchanged in this narrow parity fix');
 assert.equal(context.window.QueryLang.fieldValue({fields:{path:0}},context.window.QueryLang.resolve('path')),'0');

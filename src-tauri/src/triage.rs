@@ -232,7 +232,7 @@ pub async fn triage_timeline(
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || {
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let case = case_events;
         timeline_impl(
             app.state::<AppState>().inner(),
@@ -416,7 +416,7 @@ pub async fn triage(
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || {
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         let events = case_events;
         triage_page(
@@ -445,8 +445,8 @@ pub async fn triage_episode(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    let (admitted, _) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |_case_events| {
         detections::cached_analysis(&analysis_id).ok_or("Análise expirada; recarregue a triagem")?.episode_members(
             &episode_id,
             offset.unwrap_or(0),
@@ -493,7 +493,7 @@ pub async fn triage_evidence_event(
     app: AppHandle,
 ) -> Result<Event, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || {
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let case = case_events;
         evidence_event_impl(
             app.state::<AppState>().inner(),
@@ -607,8 +607,15 @@ pub async fn event_insights(
     app: AppHandle,
 ) -> Result<EventInsights, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || {
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let case = case_events;
+        if crate::analysis_runtime::visibility_restricted() {
+            let visible = match case.as_deref() {
+                Some(events) => events.iter().any(|candidate| candidate.event_ref == event.event_ref && candidate.id == event.id),
+                None => crate::event_detail_raw(app.state::<AppState>().inner(), event.id).is_some_and(|candidate| candidate.event_ref == event.event_ref),
+            };
+            if !visible { return Err("O evento não pertence à análise visível atual.".into()); }
+        }
         insights_in_context(app.state::<AppState>().inner(), &event, case.as_deref())
     })
     .await?

@@ -117,13 +117,14 @@ assert.equal(saves,1,'suggesting the updated comment does not autosave');saves=0
 // Use real workspace capture/sanitize/apply, preserving draft separately from applied quick.
 const c = { id: caseId, workspace: {} };
 Object.assign(context, { activeCase: () => c, AGG_FUNCS: [['count', 'Count']], defaultCaseWorkspace: () => ({}), cubeState: { collapsed: new Set(), requestVersion: 0 }, treeAggVersion: { dataset: 0, case: 0 },
-  caseEvents: () => [], caseEventsCache: { summary: { columns: [] } }, fillColumnControls() {}, renderChips() {}, renderExploreTree() {}, updateContextBar() {}, restoreVisiblePreferences() {},
+  caseEvents: () => Array(5).fill({}), caseEventsCache: { summary: { columns: [] } }, explorerAnalytics: new Map(), explorerKey: () => 'case-scope', fillColumnControls() {}, renderChips() {}, renderExploreTree() {}, updateContextBar() {}, restoreVisiblePreferences() {},
 });
 vm.runInContext(workspaceSource.slice(workspaceSource.indexOf('  let scope ='), workspaceSource.indexOf('  function updateToggle()')), context);
 Object.assign(state, vm.runInContext('defaults().values', context), { columns: ['timestamp', 'request_path'], treeCollapsed: new Set(), treeAgg: {}, treeAggSig: {}, treeAggError: {}, quick: 'legacy applied' });
 bar.restoreDraft({ value: 'request_path:"unfinished', start: 7, end: 10 });
 const dataset = context.capture(); assert.equal(dataset.values.quick, 'legacy applied'); assert.equal(dataset.queryDraft.value, 'request_path:"unfinished');
 vm.runInContext('scope = "case";', context); activeScope = 'case'; context.apply(context.sanitize(null));
+assert.equal(state.total, null, 'saved evidence size does not imply a visible total before the exclusion-aware count');
 assert.equal(input.value, '', 'new case workspace starts with its own draft');
 bar.restoreDraft({ value: 'case draft', start: 2, end: 2 }); const evidence = context.capture();
 vm.runInContext('scope = "dataset";', context); activeScope = 'dataset'; context.apply(context.sanitize(JSON.parse(JSON.stringify(dataset))));
@@ -131,6 +132,8 @@ assert.equal(input.value, 'request_path:"unfinished'); assert.equal(input.select
 assert.equal(state.quick, 'legacy applied', 'draft restoration never changes applied saved search');
 assert.equal(node('.query-error').textContent, ''); // Test validator only treats a trailing colon as incomplete.
 vm.runInContext('scope = "case";', context); activeScope = 'case'; context.apply(context.sanitize(evidence)); assert.equal(input.value, 'case draft');
+context.explorerAnalytics.set('case-scope', { total: 0 }); context.apply(context.sanitize(evidence));
+assert.equal(state.total, 0, 'an exact zero visible count is preserved even with five saved records');
 context.apply(context.sanitize({ values: { quick: 'old saved search' } })); assert.equal(input.value, 'old saved search', 'old snapshots retain their applied quick-search display');
 c.id = 'new-case'; context.apply(context.sanitize(null)); assert.equal(input.value, '', 'another case cannot inherit a draft');
 assert.equal(nativeCalls, 0); assert.equal(saves, 0, 'typing/capture helpers never initiate a whole-case save');

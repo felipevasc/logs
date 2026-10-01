@@ -105,7 +105,7 @@ fn all_id_collection_has_a_separate_limit_but_count_and_visitors_do_not() {
         assert!(query::indexed_matches(&index, &[], &empty, &empty, &[]).unwrap_err().contains("LOGINSIGHT_COLLECTED_IDS_MB"));
         let filters = [filter("_all", "contains", "needle")];
         assert!(query::indexed_matches(&index, &filters, &empty, &empty, &[]).unwrap_err().contains("LOGINSIGHT_COLLECTED_IDS_MB"));
-        assert_eq!(query::count_lines(&index, &filters, &empty, &empty, &[]), 100);
+        assert_eq!(query::count_lines(&index, &filters, &empty, &empty, &[]).unwrap(), 100);
         let mut seen = 0;
         query::visit_indexed_matches(&index, &filters, &empty, &empty, &[], |_| seen += 1).unwrap();
         assert_eq!(seen, 100);

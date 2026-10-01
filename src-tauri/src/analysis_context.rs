@@ -540,6 +540,9 @@ fn imported(case_id: &str, embedded: Option<&Value>) -> Result<Snapshot, String>
         if foreign.schema_version != VERSION {
             return Err("Configuração importada exige uma versão mais recente.".into());
         }
+        if foreign.visibility_revision != 0 {
+            return Err("Este JSON não preserva os lotes de exclusão/restauração do Caso. O original foi preservado; use o arquivo portátil da investigação quando disponível.".into());
+        }
         validate(&foreign.config)?;
         // New local identity: foreign revisions and source visibility membership
         // cannot be applied to a different analysis without an explicit import.
@@ -556,6 +559,58 @@ fn imported(case_id: &str, embedded: Option<&Value>) -> Result<Snapshot, String>
         }
     }
     Ok(local)
+}
+/// Only the portable ledger importer may preserve a nonzero visibility baseline.
+/// Its payloads are rebuilt/verified before this new identity can be published.
+pub(crate) fn prepare_portable_snapshot(
+    case_id: &str,
+    foreign: &Snapshot,
+) -> Result<Snapshot, String> {
+    bounded(foreign)?;
+    if case_id.is_empty()
+        || case_id.len() > 4096
+        || foreign.schema_version != VERSION
+        || uuid::Uuid::parse_str(&foreign.analysis_id).is_err()
+    {
+        return Err("Identidade de Caso portátil inválida.".into());
+    }
+    validate(&foreign.config)?;
+    let mut local = foreign.clone();
+    local.case_id = case_id.into();
+    local.analysis_id = uuid::Uuid::new_v4().to_string();
+    Ok(local)
+}
+pub(crate) fn insert_portable_snapshot(
+    tx: &Transaction<'_>,
+    snapshot: &Snapshot,
+) -> Result<Snapshot, String> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM cases WHERE id=?1)",
+            [&snapshot.case_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Err("Caso inexistente durante a publicação portátil.".into());
+    }
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT body FROM case_analysis WHERE case_id=?1",
+            [&snapshot.case_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(body) = current {
+        let current: Snapshot = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        if current.case_id != snapshot.case_id || current.analysis_id != snapshot.analysis_id {
+            return Err("O Caso já possui outra configuração; importação recusada.".into());
+        }
+        return Ok(current);
+    }
+    write(tx, snapshot)?;
+    Ok(snapshot.clone())
 }
 pub(crate) fn ensure_case(tx: &Transaction<'_>, case: &Value) -> Result<Option<Snapshot>, String> {
     let id = case["id"].as_str().ok_or("Caso sem identificador.")?;
@@ -1162,5 +1217,21 @@ mod tests {
             .migration_diagnostics
             .iter()
             .any(|d| d.code == "legacy_regex_budget"));
+    }
+    #[test]
+    fn direct_json_import_cannot_silently_reset_exclusion_visibility() {
+        let dir = Directory::new();
+        dir.save(json!({"cases":[{"id":"existing"}]}));
+        let before = dir.load();
+        let mut foreign = Snapshot::empty("foreign");
+        foreign.visibility_revision = 7;
+        let mut incoming = before.clone();
+        incoming["cases"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"imported","analysisContext":foreign}));
+        let error = crate::case_store::save_at(&dir.0, incoming).unwrap_err();
+        assert!(error.contains("JSON") && error.contains("portátil"));
+        assert_eq!(dir.load(), before);
     }
 }

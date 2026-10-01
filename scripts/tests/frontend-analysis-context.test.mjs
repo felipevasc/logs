@@ -283,6 +283,20 @@ test('Tasks forwards captured identity and generation, overriding stale supplied
   assert.equal(f.calls[0].opts.cancelled(), false);
 });
 
+test('visible source metadata uses captured ownership and rejects replies after visibility changes', async () => {
+  for (const command of ['list_sources', 'source_summary', 'exclusion_visibility']) {
+    const response = deferred(), f = fixture({ tasks: true, native: () => response.promise });
+    const owner = f.contexts.capture();
+    const read = f.context.api(command, {}, { analysisOwner: owner }).then(value => ({ value }), error => ({ error }));
+    await settle();
+    assert.equal(f.calls.length, 1, 'metadata admission does not trigger derived-field discovery');
+    assert.deepEqual(plain(f.calls[0].args.analysisContext), plain(owner.identity));
+    assert.equal(f.calls[0].args.sourceGeneration, 10);
+    await f.contexts.adopt(snapshot('a', 1, 2)); response.resolve({ count: 99 });
+    assert.match(String((await read).error), /ANALYSIS_CONTEXT_CHANGED/);
+  }
+});
+
 test('Tasks rejects late read results when the Case, revisions, source, or Case instance changes', async () => {
   for (const change of ['active-case', 'config', 'visibility', 'source', 'recreated-case', 'analysis-id']) {
     const response = deferred();
@@ -341,4 +355,26 @@ test('committed source receipts remain available after a late cancellation', asy
   assert.equal(result.publication.generation, 11);
   assert.equal(result.count, 3);
   assert.equal(f.contexts.identity().configRevision, 1, 'an identity-only source receipt is not mistaken for a full Snapshot');
+});
+
+
+test('legacy null context never borrows another Case or global definition list', async () => {
+  const f=fixture({cases:[caseWith('legacy',null)],tasks:true,native:async cmd=>cmd==='analysis_context_snapshot'?null:cmd==='list_derived_fields'?[{name:'foreign-global-field'}]:{ok:true}});
+  f.state.derivedFields=[{name:'previous-case-field'}];
+  await f.context.api('query_page',{});
+  assert.deepEqual(plain(f.state.derivedFields),[]);
+  assert.equal(f.calls.filter(call=>call.cmd==='list_derived_fields').length,0,'null context cannot prove ownership of a global metadata response');
+  assert.equal(f.calls.find(call=>call.cmd==='query_page').args.analysisContext,null,'legacy source reads remain compatible');
+  f.contexts.definitionsLoaded(f.contexts.capture(),[{name:'foreign'}]);
+  assert.deepEqual(plain(f.state.derivedFields),[]);
+});
+
+test('late timestamp cancellation preserves the authoritative source publication receipt', async () => {
+  const result=deferred();
+  const f=fixture({tasks:true,native:async cmd=>cmd==='set_ts_config'?result.promise:true});
+  const applying=f.context.api('set_ts_config',{path:'source.jsonl',config:{sources:['message'],format:'unix'}},{latest:'timestamp-config',silent:true});
+  await settle();f.context.window.Tasks.cancelLatest('timestamp-config');
+  const publication={generation:11,operationId:'published-timestamps',analysisContext:identity(snapshot('a'))};
+  result.resolve({publication});
+  assert.deepEqual(plain((await applying).publication),publication,'a completed native retimestamp cannot be represented as a rollback');
 });

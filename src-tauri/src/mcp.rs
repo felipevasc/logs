@@ -1252,7 +1252,7 @@ impl LogInsightMcp {
         annotations(read_only_hint = true)
     )]
     async fn source_summary(&self, Parameters(p): Parameters<crate::analysis_runtime::Params>) -> Result<CallToolResult, McpError> {
-        self.run_source(p, |state| crate::source_summary_impl(state)).await
+        self.run_source_result(p, |state| crate::source_summary_impl(state)).await
     }
 
     #[tool(
@@ -1271,7 +1271,7 @@ impl LogInsightMcp {
         annotations(read_only_hint = true)
     )]
     async fn list_sources(&self, Parameters(p): Parameters<crate::analysis_runtime::Params>) -> Result<CallToolResult, McpError> {
-        self.run_source(p, crate::workspace::sources_impl).await
+        self.run_source_result(p, crate::workspace::sources_impl).await
     }
 
     // ------------------------------------------------------------ consulta

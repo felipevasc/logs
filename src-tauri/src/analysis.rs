@@ -274,26 +274,42 @@ pub struct SeriesData {
     pub(crate) samples: Vec<usize>,
 }
 
-struct MetricAcc {
-    metric: String,
-    sum: f64,
-    n: u64,
-    min: Option<f64>,
-    max: Option<f64>,
-    distinct: crate::distinct::Counter,
+#[derive(Clone, Copy)]
+enum NumericMetric { Sum, Avg, Min, Max, Unknown }
+
+/// Keep the exact distinct counter out of every count/numeric hash-map slot.
+/// Its boxed state is allocated and charged only for distinct metrics.
+enum MetricAcc {
+    Count(u64),
+    Distinct { values: Box<crate::distinct::Counter>, n: u64 },
+    Numeric { kind: NumericMetric, value: f64, n: u64 },
 }
 
 impl MetricAcc {
     fn new(metric: &str) -> Self {
-        MetricAcc {
-            metric: metric.to_string(),
-            sum: 0.0,
-            n: 0,
-            min: None,
-            max: None,
-            distinct: Default::default(),
+        match metric {
+            "count" => Self::Count(0),
+            "distinct" => Self::Distinct { values: Box::default(), n: 0 },
+            metric => Self::Numeric {
+                kind: match metric {
+                    "sum" => NumericMetric::Sum,
+                    "avg" => NumericMetric::Avg,
+                    "min" => NumericMetric::Min,
+                    "max" => NumericMetric::Max,
+                    _ => NumericMetric::Unknown,
+                },
+                value: 0.0,
+                n: 0,
+            },
         }
     }
+
+    fn allocation_bytes(metric: &str) -> usize {
+        std::mem::size_of::<Self>().saturating_add(
+            if metric == "distinct" { std::mem::size_of::<crate::distinct::Counter>() } else { 0 }
+        )
+    }
+
     fn push_checked(
         &mut self,
         ev: &Event,
@@ -301,53 +317,54 @@ impl MetricAcc {
         expected: Option<UnitKind>,
         budget: &mut AnalyticsBudget,
     ) -> Result<bool, String> {
-        match self.metric.as_str() {
-            "count" => self.n += 1,
-            "distinct" => {
+        match self {
+            Self::Count(n) => *n += 1,
+            Self::Distinct { values, n } => {
                 if let Some(f) = field {
                     if let Some(v) = ev.col_str(f) {
                         if !v.is_empty() {
-                            budget.charge(self.distinct.try_insert(v)?)?;
-                            self.n += 1;
+                            budget.charge(values.try_insert(v)?)?;
+                            *n += 1;
                         }
                     }
                 }
             }
-            _ => {
+            Self::Numeric { kind, value, n } => {
                 if let Some(f) = field {
-                    if let Some((n, unit)) = ev
-                        .col_str(f)
+                    if let Some((number, unit)) = ev
+                        .col_ref(f)
                         .and_then(|s| parse_num_unit(&s))
-                        .filter(|(n, _)| n.is_finite())
+                        .filter(|(number, _)| number.is_finite())
                     {
-                        if expected.is_some_and(|e| e != unit) {
-                            return Ok(true);
+                        if expected.is_some_and(|e| e != unit) { return Ok(true); }
+                        match kind {
+                            NumericMetric::Sum | NumericMetric::Avg => *value += number,
+                            NumericMetric::Min => *value = if *n == 0 { number } else { value.min(number) },
+                            NumericMetric::Max => *value = if *n == 0 { number } else { value.max(number) },
+                            NumericMetric::Unknown => {}
                         }
-                        self.sum += n;
-                        self.n += 1;
-                        self.min = Some(self.min.map(|m: f64| m.min(n)).unwrap_or(n));
-                        self.max = Some(self.max.map(|m: f64| m.max(n)).unwrap_or(n));
+                        *n += 1;
                     }
                 }
             }
         }
         Ok(false)
     }
+
+    fn samples(&self) -> u64 {
+        match self {
+            Self::Count(n) | Self::Distinct { n, .. } | Self::Numeric { n, .. } => *n,
+        }
+    }
+
     fn value(&self) -> f64 {
-        match self.metric.as_str() {
-            "count" => self.n as f64,
-            "distinct" => self.distinct.len() as f64,
-            "sum" => self.sum,
-            "avg" => {
-                if self.n == 0 {
-                    0.0
-                } else {
-                    self.sum / self.n as f64
-                }
+        match self {
+            Self::Count(n) => *n as f64,
+            Self::Distinct { values, .. } => values.len() as f64,
+            Self::Numeric { kind: NumericMetric::Avg, value, n } => {
+                if *n == 0 { 0.0 } else { value / *n as f64 }
             }
-            "min" => self.min.unwrap_or(0.0),
-            "max" => self.max.unwrap_or(0.0),
-            _ => 0.0,
+            Self::Numeric { value, .. } => *value,
         }
     }
 }
@@ -365,7 +382,7 @@ fn dominant_unit(
             break;
         }
         if let Some((_, unit)) = ev
-            .col_str(field)
+            .col_ref(field)
             .and_then(|s| parse_num_unit(&s))
             .filter(|(n, _)| n.is_finite())
         {
@@ -532,7 +549,7 @@ where
         )>()))?;
         let mut items: Vec<(Option<String>, f64, usize)> = accs
             .into_iter()
-            .map(|(key, acc)| (key, acc.value(), acc.n as usize))
+            .map(|(key, acc)| (key, acc.value(), acc.samples() as usize))
             .collect();
         items.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         items.truncate(limit);
@@ -601,8 +618,7 @@ where
                 // Sparse cells keep their existing metric/distinct budgets,
                 // but reference one selected label by index instead of owning it.
                 budget.charge(
-                    128usize.saturating_add(std::mem::size_of::<MetricAcc>())
-                        .saturating_add(spec.metric.len()),
+                    128usize.saturating_add(MetricAcc::allocation_bytes(&spec.metric)),
                 )?;
                 entry.insert(MetricAcc::new(&spec.metric))
             }
@@ -633,7 +649,7 @@ where
                 name,
                 samples: accs
                     .iter()
-                    .map(|m| m.get(&index).map(|a| a.n as usize).unwrap_or(0))
+                    .map(|m| m.get(&index).map(|a| a.samples() as usize).unwrap_or(0))
                     .collect(),
                 points: accs
                     .iter()
@@ -653,7 +669,7 @@ fn charge_metric_group(
     metric: &str,
 ) -> Result<(), String> {
     budget.group(key, 0)?;
-    budget.charge(std::mem::size_of::<MetricAcc>().saturating_add(metric.len()))
+    budget.charge(MetricAcc::allocation_bytes(metric))
 }
 
 fn charge_terms_output<'a>(
@@ -1193,6 +1209,76 @@ mod recovery_budget_tests {
     }
 
     #[test]
+    fn borrowed_numeric_reads_preserve_canonical_and_typed_fields() {
+        let mut row = event("a", "2KB", 0);
+        row.fields.insert("message".into(), json!("9ms"));
+        row.fields.insert("number".into(), json!(7));
+        row.fields.insert("text".into(), json!("3KB"));
+        row.fields.insert("boolean".into(), json!(false));
+        row.fields.insert("object".into(), json!({"n": 5}));
+        row.fields.insert("null".into(), Value::Null);
+        for (field, unit, value, samples) in [
+            ("message", UnitKind::Bytes, 2048.0, 1),
+            ("number", UnitKind::Number, 7.0, 1),
+            ("text", UnitKind::Bytes, 3072.0, 1),
+            ("boolean", UnitKind::Number, 0.0, 0),
+            ("object", UnitKind::Number, 0.0, 0),
+            ("null", UnitKind::Number, 0.0, 0),
+            ("missing", UnitKind::Number, 0.0, 0),
+        ] {
+            assert_eq!(dominant_unit(std::iter::once(row.clone()), field, 500).unwrap(), unit, "{field}");
+            let mut acc = MetricAcc::new("sum");
+            assert!(!acc.push_checked(&row, Some(field), Some(unit), &mut AnalyticsBudget::new()).unwrap());
+            assert_eq!(acc.value(), value, "{field}");
+            assert_eq!(acc.samples(), samples, "{field}");
+        }
+        assert!(matches!(row.col_ref("message"), Some(std::borrow::Cow::Borrowed("2KB"))));
+        assert!(matches!(row.col_ref("text"), Some(std::borrow::Cow::Borrowed("3KB"))));
+    }
+
+    #[test]
+    fn metric_accumulator_layout_charges_distinct_state_outside_the_slot() {
+        let inline = std::mem::size_of::<MetricAcc>();
+        let counter = std::mem::size_of::<crate::distinct::Counter>();
+        assert!(inline < counter, "count/numeric slots must not embed the counter");
+        assert_eq!(MetricAcc::allocation_bytes("distinct"), inline + counter);
+        crate::resources::with_analytics_limit(128 + inline, || {
+            for metric in ["count", "sum", "avg", "min", "max", "unknown"] {
+                charge_metric_group(&mut AnalyticsBudget::new(), &None, metric).unwrap();
+            }
+            assert!(charge_metric_group(&mut AnalyticsBudget::new(), &None, "distinct").is_err(),
+                "admission must charge the box as well as the enum slot");
+        });
+    }
+
+    #[test]
+    fn metric_specific_state_preserves_order_warnings_and_signed_zero() {
+        let rows: Vec<_> = ["10000000000000000", "1", "-10000000000000000", "3", "2KB", ""]
+            .into_iter().map(|value| event("a", value, 0)).collect();
+        for (metric, expected, samples, warnings) in [
+            ("count", 6.0, 6, 0), ("distinct", 5.0, 5, 0), ("sum", 3.0, 4, 1),
+            ("avg", 0.75, 4, 1), ("min", -1e16, 4, 1), ("max", 1e16, 4, 1), ("unknown", 0.0, 4, 1),
+        ] {
+            let mut acc = MetricAcc::new(metric);
+            let mut budget = AnalyticsBudget::new();
+            let mut incompatible = 0;
+            for row in &rows { incompatible += usize::from(acc.push_checked(row, Some("message"), Some(UnitKind::Number), &mut budget).unwrap()); }
+            assert_eq!(acc.value(), expected, "{metric}");
+            assert_eq!(acc.samples(), samples, "{metric}");
+            assert_eq!(incompatible, warnings, "{metric}");
+        }
+        for metric in ["min", "max"] {
+            let mut acc = MetricAcc::new(metric);
+            let mut budget = AnalyticsBudget::new();
+            assert_eq!(acc.value().to_bits(), 0.0f64.to_bits());
+            assert!(acc.push_checked(&event("a", "4KB", 0), Some("message"), Some(UnitKind::Number), &mut budget).unwrap());
+            acc.push_checked(&event("a", "-0", 0), Some("message"), Some(UnitKind::Number), &mut budget).unwrap();
+            assert_eq!(acc.value().to_bits(), (-0.0f64).to_bits(), "first admitted value for {metric}");
+            assert_eq!(acc.samples(), 1);
+        }
+    }
+
+    #[test]
     fn time_split_labels_do_not_repeat_in_the_shared_bucket_budget() {
         let labels: Vec<_> = (0..6).map(|i| format!("{i}{}", "x".repeat(8 << 10))).collect();
         let events: Vec<_> = (0..41).flat_map(|bucket| labels.iter().flat_map(move |label| {
@@ -1318,7 +1404,7 @@ mod recovery_budget_tests {
                 .push_checked(&same, Some("message"), None, &mut budget)
                 .unwrap();
             assert_eq!(first.value(), 1.0);
-            assert_eq!(first.n, 2);
+            assert_eq!(first.samples(), 2);
             assert_eq!(second.value(), 1.0);
             assert!(second
                 .push_checked(&event("a", "new", 0), Some("message"), None, &mut budget)

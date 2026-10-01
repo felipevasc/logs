@@ -7,13 +7,17 @@ mod analysis;
 mod analysis_context;
 mod analysis_runtime;
 mod analysis_commands;
+mod analysis_visibility;
 mod attack;
 mod case_cache;
+mod case_archive_format;
+mod case_archive;
 mod case_images;
 mod case_store;
 mod detections;
 mod evidence;
 mod exclusion_store;
+mod exclusion_commands;
 mod security_normalize;
 mod security_content;
 mod security_store;
@@ -46,6 +50,7 @@ mod querylang;
 mod regression_tests;
 #[cfg(test)]
 mod publication_tests;
+mod reference_store;
 mod remote;
 mod resources;
 mod sigma;
@@ -197,12 +202,27 @@ pub(crate) fn validate_current_source(state: &AppState) -> Result<(), String> {
 /// Execute a snapshot admitted before enqueueing the blocking request.
 async fn offload_admitted<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, f: F) -> Result<T, String>
 where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
+    offload_case(operation_id, app, admitted, None, move |_| f()).await
+}
+
+/// Expensive ledger verification/mask compilation runs only after cancellation
+/// registration. Evidence and memory sources are filtered once in this worker.
+async fn offload_case<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, case_events: Option<Vec<Event>>, f: F) -> Result<T, String>
+where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
     offload_operation(operation_id, move || {
         admitted.validate(app.state::<AppState>().inner())?;
         let progress_app = app.clone();
-        Ok(analysis_runtime::with(Some(admitted), || operations::with_reporter(std::sync::Arc::new(move |progress| {
+        analysis_runtime::with(Some(admitted.clone()), || operations::with_reporter(std::sync::Arc::new(move |progress| {
             let _ = progress_app.emit("operation-progress", progress);
-        }), f)))
+        }), || {
+            let case_events = admitted.prepare_visibility(case_events)?;
+            admitted.validate(app.state::<AppState>().inner())?;
+            operations::check()?;
+            let result = f(case_events);
+            admitted.validate_visibility()?;
+            admitted.schedule_derived_variant(app.state::<AppState>().inner());
+            Ok(result)
+        }))
     }).await?
 }
 
@@ -786,7 +806,9 @@ pub(crate) fn test_ts_config_impl(
     let mut out = Vec::new();
     match &*source {
         SourceData::Indexed(idx) => {
+            let visibility = analysis_runtime::indexed_gate(idx)?;
             for i in (0..idx.lines.len())
+                .filter(|&i| visibility.as_ref().is_none_or(|gate| gate.allows_known_row(i)))
                 .filter(|&i| path.is_none_or(|path| idx.part_at(i).path == path))
                 .take(5)
             {
@@ -1101,28 +1123,28 @@ async fn source_summary(app: AppHandle, analysis_context: Option<analysis_contex
         let state = app.state::<AppState>();
         source_summary_impl(state.inner())
     })
-    .await
+    .await?
 }
 
-pub(crate) fn source_summary_impl(state: &AppState) -> SourceSummary {
+pub(crate) fn source_summary_impl(state: &AppState) -> Result<SourceSummary, String> {
     let source = crate::analysis_runtime::source(&state);
     let source_names = crate::analysis_runtime::source_names(&state);
     let (count, columns, source_desc) = match &*source {
         SourceData::None => (0, vec![], String::new()),
         SourceData::Memory(evs) => (evs.len(), all_columns(evs), source_names.join(" + ")),
         SourceData::Indexed(idx) => (
-            idx.lines.len(),
+            analysis_runtime::visible_total(idx)?,
             idx.columns.clone(),
             source_names.join(" + "),
         ),
     };
-    SourceSummary {
+    Ok(SourceSummary {
         analysis_diagnostics: analysis_runtime::current().map(|admitted| (*admitted.diagnostics).clone()).unwrap_or_default(),
         count,
         columns,
         source_desc,
         source_names,
-    }
+    })
 }
 
 #[tauri::command]
@@ -1141,7 +1163,7 @@ async fn query_events(
 ) -> Result<query::QueryResult, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         query_events_scope_impl(
             state.inner(),
@@ -1232,7 +1254,7 @@ async fn query_page(
 ) -> Result<query::QueryPage, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let limit = limit.clamp(1, 2_000);
         if let Some(events) = case_events.as_deref() {
             return Ok(query::QueryPage::from_exact(
@@ -1274,7 +1296,7 @@ async fn explore_snapshot(
 ) -> Result<query::ExplorerSnapshot, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         explore_snapshot_scope_impl(
             state.inner(),
@@ -1401,7 +1423,7 @@ async fn aggregate_events(
 ) -> Result<query::AggResult, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         aggregate_events_impl(state.inner(), &group_column, aggs, filters, case_events)
     })
@@ -1505,7 +1527,7 @@ async fn trail_events(
 ) -> Result<TrailResult, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(None, app.clone(), admitted, move || {
+    offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         trail_events_impl(
             state.inner(),
@@ -1552,6 +1574,7 @@ pub(crate) fn trail_events_impl(
             let mut events = Vec::new();
             for (_, id) in previous.into_iter().chain(std::iter::once(center)).chain(following) {
                 let mut event = sources::event_at(idx, id, &codes, &system, &derived);
+                analysis_runtime::attach_provenance(idx, &mut event)?;
                 entities::annotate(&mut event);
                 budget.charge(query::event_payload_bytes(&event))?;
                 events.push(event);
@@ -1579,7 +1602,7 @@ async fn count_filtered(
 ) -> Result<usize, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         count_filtered_impl(state.inner(), filters, case_events)
     })
@@ -1600,8 +1623,7 @@ pub(crate) fn count_filtered_impl(
         SourceData::Indexed(idx) => {
             let (codes, system, derived) = (state.codes.read(), state.system_codes.read(), crate::analysis_runtime::derived(&state));
             let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
-            engine::count(&src, &filters)?
-                .unwrap_or_else(|| query::count_lines(idx, &filters, &codes, &system, &derived))
+            match engine::count(&src, &filters)? { Some(count) => count, None => query::count_lines(idx, &filters, &codes, &system, &derived)? }
         }
         SourceData::None => 0,
     })
@@ -1620,7 +1642,7 @@ async fn tree_aggs(
 ) -> Result<Vec<(String, query::AggResult)>, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         tree_aggs_impl(state.inner(), columns, filters, case_events)
     })
@@ -1663,7 +1685,7 @@ async fn stats_events(
 ) -> Result<query::Stats, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         if let Some(events) = case_events {
             return Ok(query::stats(&events, &filters));
         }
@@ -1709,19 +1731,16 @@ pub(crate) fn event_detail_impl(state: &AppState, id: usize) -> Option<Event> {
 fn event_detail_raw(state: &AppState, id: usize) -> Option<Event> {
     let source = crate::analysis_runtime::source(&state);
     match &*source {
-        SourceData::Memory(events) => events.get(id).cloned(),
+        SourceData::Memory(events) => events.get(id).filter(|event| event.id == id).or_else(|| events.iter().find(|event| event.id == id)).cloned(),
         SourceData::Indexed(idx) => {
-            if id < idx.lines.len() {
-                Some(sources::event_at(
-                    idx,
-                    id,
-                    &state.codes.read(),
-                    &state.system_codes.read(),
-                    &crate::analysis_runtime::derived(&state),
-                ))
-            } else {
-                None
+            if id >= idx.lines.len() { return None; }
+            match analysis_runtime::row_visible(idx, id) {
+                Ok(true) => (), Ok(false) => return None,
+                Err(error) => { analysis_runtime::record_failure(error); return None; }
             }
+            let mut event = sources::event_at(idx, id, &state.codes.read(), &state.system_codes.read(), &analysis_runtime::derived(state));
+            if let Err(error) = analysis_runtime::attach_provenance(idx, &mut event) { analysis_runtime::record_failure(error); return None; }
+            Some(event)
         }
         SourceData::None => None,
     }
@@ -1741,7 +1760,7 @@ async fn discover_patterns(
 ) -> Result<discovery::Discovery, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
         .await?
 }
 
@@ -1819,7 +1838,7 @@ fn work_events(
     Ok(match &*source {
         SourceData::Indexed(idx) => {
             let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
-            let total = engine::count(&src, &filters)?.unwrap_or_else(|| query::count_lines(idx, &filters, &codes, &system, &derived));
+            let total = match engine::count(&src, &filters)? { Some(count) => count, None => query::count_lines(idx, &filters, &codes, &system, &derived)? };
             let limit = total.min(ANALYSIS_CAP);
             let mut ids = Vec::with_capacity(limit);
             let mut position = 0usize;
@@ -1869,7 +1888,7 @@ async fn profile_fields(
 ) -> Result<Vec<analysis::FieldProfile>, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(None, app.clone(), admitted, move || {
+    offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         profile_fields_impl(state.inner(), filters, case_events)
     })
@@ -1899,7 +1918,7 @@ async fn compute_series(
 ) -> Result<analysis::SeriesResult, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         compute_series_impl(state.inner(), filters, case_events, spec)
     })
@@ -1933,7 +1952,7 @@ async fn pivot(
 ) -> Result<analysis::PivotResult, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         pivot_impl(state.inner(), filters, case_events, spec)
     })
@@ -2274,6 +2293,16 @@ pub fn run() {
             analysis_commands::analysis_context_snapshot,
             analysis_commands::analysis_context_update,
             analysis_commands::preview_field_transform,
+            analysis_runtime::exclusion_visibility,
+            exclusion_commands::exclusion_capabilities,
+            exclusion_commands::exclusion_preview,
+            exclusion_commands::exclusion_commit,
+            exclusion_commands::exclusion_discard,
+            exclusion_commands::exclusion_list,
+            exclusion_commands::exclusion_archive_page,
+            exclusion_commands::exclusion_restore_batch,
+            exclusion_commands::exclusion_restore_selected,
+
             list_derived_fields,
             save_derived_field,
             delete_derived_field,

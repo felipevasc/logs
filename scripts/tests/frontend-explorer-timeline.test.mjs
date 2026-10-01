@@ -164,9 +164,12 @@ test('full group keys, the empty value, missing field and Other remain distinct 
   const labels = f.plot.options.series.slice(1).map(item => item.label);
   assert.deepEqual(plain(labels), ['Total no período', keyA, keyB, '(valor vazio)', 'Outros valores', 'Campo ausente']);
   const legend = f.find('explorer-timeline-legend');
-  assert.match(legend.children[1].title, new RegExp(`${keyA} · 2`));
-  assert.match(legend.children[2].title, new RegExp(`${keyB} · 2`));
-  assert.notEqual(legend.children[1].children[0].attrs['aria-label'], legend.children[2].children[0].attrs['aria-label']);
+  assert.deepEqual(legend.children.slice(0,3).map(item => item.children[0].attrs['aria-label']), ['Mostrar Total no período', 'Mostrar Outros valores', 'Mostrar Campo ausente']);
+  assert.match(legend.children[3].title, new RegExp(`${keyA} · 2`));
+  assert.match(legend.children[4].title, new RegExp(`${keyB} · 2`));
+  assert.notEqual(legend.children[3].children[0].attrs['aria-label'], legend.children[4].children[0].attrs['aria-label']);
+  const other = legend.children[1].children[0]; other.checked = false; other.onchange();
+  assert.deepEqual(plain(f.plot.visibility.at(-1)), { index: 5, show: false }, 'the early Other legend still toggles its original plot series');
   assert.match(f.find('explorer-timeline-note').textContent, /2 sem horário/);
   assert.match(f.find('explorer-timeline-note').textContent, /1 fora da grade/);
 });
@@ -220,7 +223,7 @@ test('response field, grid, limit, selection and exact context must match the re
 test('legend visibility and clearing grouping reuse loaded data without making queries or changing filters', async () => {
   const f = await groupedFixture();
   const before = f.requests.length, filters = f.state.filters, plot = f.plot;
-  const checkbox = f.find('explorer-timeline-legend').children[1].children[0];
+  const checkbox = f.find('explorer-timeline-legend').children.find(item => item.children[0].attrs['aria-label'] === 'Mostrar host-one').children[0];
   checkbox.checked = false; checkbox.onchange();
   assert.deepEqual(plot.visibility, [{ index: 2, show: false }]);
   assert.deepEqual(plain(f.timeline.capture().hidden), [JSON.stringify(['value', 'source', 'host-one'])]);
@@ -336,7 +339,7 @@ test('manual pause, latest field changes and repeated renders cannot revive canc
 
 test('capture and restore preserve grouping preferences, sanitize input and never carry computed results', async () => {
   const f = await groupedFixture();
-  const checkbox = f.find('explorer-timeline-legend').children[1].children[0];
+  const checkbox = f.find('explorer-timeline-legend').children.find(item => item.children[0].attrs['aria-label'] === 'Mostrar host-one').children[0];
   checkbox.checked = false; checkbox.onchange();
   const saved = f.timeline.capture();
   saved.hidden.push('not-live');

@@ -16,6 +16,7 @@ vm.runInContext(evidence.slice(evidence.indexOf('  function redact('),evidence.i
 context.window.EvidenceUI={redact:context.redact};
 context.window.EntityMenu={highlight:text=>{highlighted.push(text);return null;}};
 vm.runInContext(app.slice(app.indexOf('function cellValue('),app.indexOf('\nfunction autoVisibleCols(')),context);
+vm.runInContext(app.slice(app.indexOf('function ensureSelectionOwner('), app.indexOf('function toggleRowSelect(')), context);
 vm.runInContext(app.slice(app.indexOf('function eventCellMenu('),app.indexOf('\nasync function removeEventFromCase(')),context);
 vm.runInContext(app.slice(app.indexOf('function tableValuePreview('),app.indexOf('\nfunction renderTable(')),context);
 for(const value of ['',0,false,'plain','😀'.repeat(3000),'x'.repeat(4085)+'😀'+'x'.repeat(100),'<script>unsafe</script>'.repeat(1000)]){

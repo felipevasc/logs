@@ -132,6 +132,13 @@ impl Iterator for OrderedEvents {
 }
 
 impl Selection<'_> {
+    /// A staging/preview consumer can stream exact row IDs from its admitted
+    /// indexed scope, retaining the caller's existing source/visibility guards.
+    pub(crate) fn visit_exact_ids(&self, visit: impl FnMut(usize) -> Result<bool, String>) -> Result<Option<()>, String> {
+        let SourceData::Indexed(index) = self.source else { return Ok(None); };
+        crate::engine::visit_exact_matches(&crate::engine::Source { idx: index, codes: self.codes, system: self.system, derived: self.derived }, &self.prepared, visit)
+    }
+
     fn batches(&self, idx: &sources::FileIndex) -> EventBatches {
         use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
         // The 50M line metadata and mmaps are shared; do not copy time_order.
@@ -198,7 +205,11 @@ impl Selection<'_> {
     }
     pub fn event(&self, id: usize) -> Option<Event> {
         match self.source {
-            SourceData::Indexed(idx) => (id < idx.lines.len()).then(|| sources::event_at(idx, id, self.codes, self.system, self.derived)),
+            SourceData::Indexed(idx) => match crate::analysis_runtime::row_visible(idx, id) {
+                Ok(true) => Some(sources::event_at(idx, id, self.codes, self.system, self.derived)),
+                Ok(false) => None,
+                Err(error) => { crate::analysis_runtime::record_failure(error); None }
+            },
             SourceData::Memory(events) => events.get(id).filter(|event| event.id == id).or_else(|| events.iter().find(|event| event.id == id)).cloned(),
             SourceData::None => None,
         }
@@ -378,7 +389,7 @@ pub async fn dataset_overview(
     app: AppHandle,
 ) -> Result<insights::Overview, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || {
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         overview_scope_impl(
             app.state::<AppState>().inner(),
             filters,
@@ -492,6 +503,7 @@ pub fn timeline_range_scope_impl(
     let source = crate::analysis_runtime::source(&state);
     match &*source {
         SourceData::Indexed(idx) => {
+            let gate = crate::analysis_runtime::indexed_gate(idx)?;
             if scoped_filters.len() == 1 {
                 let codes = state.codes.read();
                 let system = state.system_codes.read();
@@ -512,6 +524,7 @@ pub fn timeline_range_scope_impl(
                     if id % 2048 == 0 {
                         crate::operations::check()?;
                     }
+                    if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
                     if meta.ts != 0 {
                         add(meta.ts, crate::model::class_label(meta.level));
                     }
@@ -556,7 +569,7 @@ pub async fn timeline_range(
     operation_id: Option<String>,
 ) -> Result<TimelineRange, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(operation_id, app.clone(), admitted, move || {
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         if case_events.is_none() {
             return timeline_range_impl(
                 app.state::<AppState>().inner(),
@@ -589,7 +602,7 @@ pub async fn compare_periods(
     app: AppHandle,
 ) -> Result<insights::Comparison, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || {
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         if case_events.is_none() {
             compare_impl(app.state::<AppState>().inner(), filters, before, after)
         } else {
@@ -663,10 +676,12 @@ pub struct SourceInfo {
     pub sampled: usize,
     pub unparsed: usize,
 }
-pub fn sources_impl(state: &AppState) -> Vec<SourceInfo> {
+pub fn sources_impl(state: &AppState) -> Result<Vec<SourceInfo>, String> {
     let source = crate::analysis_runtime::source(&state);
-    match &*source {
-        SourceData::Indexed(idx) => idx
+    Ok(match &*source {
+        SourceData::Indexed(idx) => {
+            let gate = crate::analysis_runtime::indexed_gate(idx)?;
+            idx
             .parts
             .iter()
             .map(|p| {
@@ -674,41 +689,44 @@ pub fn sources_impl(state: &AppState) -> Vec<SourceInfo> {
                 let end = idx
                     .lines
                     .partition_point(|m| m.offset < p.base + p.mmap.len() as u64);
-                let lines = &idx.lines.range(start..end);
-                let min = lines
-                    .iter()
-                    .filter_map(|m| (m.ts != 0).then_some(m.ts))
-                    .min();
-                let max = lines
-                    .iter()
-                    .filter_map(|m| (m.ts != 0).then_some(m.ts))
-                    .max();
-                let sample = lines.len().min(200);
-                let mut unparsed = 0;
-                for n in 0..sample {
-                    let ev = sources::parse_part_line(
-                        p,
-                        sources::line_bytes(idx, start + n * lines.len() / sample),
-                    );
-                    if ev.parse_status == "unparsed" {
-                        unparsed += 1;
+                let mut count = 0usize;
+                let mut undated = 0usize;
+                let (mut min, mut max) = (None, None);
+                let mut sample = Vec::new();
+                for id in start..end {
+                    if id % 2048 == 0 { crate::operations::check()?; }
+                    if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
+                    let meta = idx.lines.at(id);
+                    count += 1;
+                    if meta.ts == 0 { undated += 1; } else {
+                        min = Some(min.map_or(meta.ts, |value: i64| value.min(meta.ts)));
+                        max = Some(max.map_or(meta.ts, |value: i64| value.max(meta.ts)));
+                    }
+                    // A fixed deterministic reservoir remains bounded even if
+                    // the visible source spans tens of millions of records.
+                    if sample.len() < 200 { sample.push(id); }
+                    else {
+                        let position = (id as u64).wrapping_mul(0x9e3779b97f4a7c15).rotate_left(17) % count as u64;
+                        if position < 200 { sample[position as usize] = id; }
                     }
                 }
-                SourceInfo {
+                let unparsed = sample.iter().filter(|&&id| sources::parse_part_line(p, sources::line_bytes(idx, id)).parse_status == "unparsed").count();
+                Ok(SourceInfo {
                     id: p.identity.clone(),
                     path: p.path.clone(),
                     name: p.file_name.clone(),
                     format: p.format.clone(),
                     bytes: p.mmap.len() as u64,
-                    count: lines.len(),
-                    undated: lines.iter().filter(|m| m.ts == 0).count(),
+                    count,
+                    undated,
                     start: min,
                     end: max,
-                    sampled: sample,
+                    sampled: sample.len(),
                     unparsed,
-                }
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, String>>()?
+        },
         SourceData::Memory(events) => vec![SourceInfo {
             id: "eventlog".into(),
             path: String::new(),
@@ -723,12 +741,12 @@ pub fn sources_impl(state: &AppState) -> Vec<SourceInfo> {
             unparsed: 0,
         }],
         SourceData::None => vec![],
-    }
+    })
 }
 #[tauri::command]
 pub async fn list_sources(app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<SourceInfo>, String> {
     let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || sources_impl(app.state::<AppState>().inner())).await
+    crate::offload_admitted(None, app.clone(), admitted, move || sources_impl(app.state::<AppState>().inner())).await?
 }
 
 pub fn index_events(events: &[Event]) -> Result<sources::FileIndex, String> {
@@ -848,7 +866,7 @@ pub async fn export_events(
     app: AppHandle,
 ) -> Result<usize, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || {
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         validate(&filters)?;
         if !["csv", "jsonl"].contains(&format.as_str()) {
             return Err("Formato de exportação inválido.".into());
@@ -895,6 +913,7 @@ pub async fn export_events(
             file.get_ref().sync_all().map_err(|e| e.to_string())?;
             drop(file);
             crate::operations::check()?;
+            if let Some(admitted) = crate::analysis_runtime::current() { admitted.validate_visibility()?; }
             // Same-directory atomic replacement works for existing destinations
             // on Windows and Unix, after the save picker confirms overwriting.
             pending
@@ -2487,7 +2506,7 @@ pub(crate) async fn grouped_timeline(
         analysis: admitted.identity.clone(), source_generation: admitted.source_generation, case_key: admitted.case_key.clone(),
     };
     let spec = crate::grouped_timeline::Spec::new(field, grid, limit, context)?;
-    crate::offload_admitted(operation_id, app.clone(), admitted, move || grouped_timeline_impl(app.state::<AppState>().inner(), &filters, case_events.as_deref(), &spec)).await?
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| grouped_timeline_impl(app.state::<AppState>().inner(), &filters, case_events.as_deref(), &spec)).await?
 }
 
 pub(crate) fn grouped_timeline_impl(

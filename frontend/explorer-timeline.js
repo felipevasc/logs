@@ -107,7 +107,11 @@ window.ExplorerTimeline = (() => {
       plotted = plotKey;
     }
     legend.replaceChildren();
-    for (const [index, item] of series.entries()) {
+    // Aggregate coverage stays visible before a long, scrollable list of keys.
+    // Retain each plot index so rearranging the legend cannot toggle another line.
+    const legendPriority = item => item.id === "total" ? 0 : item.id === "other" ? 1 : item.id === "missing" ? 2 : 3;
+    const legendSeries = [...series.entries()].sort(([, a], [, b]) => legendPriority(a) - legendPriority(b));
+    for (const [index, item] of legendSeries) {
       const label = el("label", "explorer-timeline-series"), checkbox = el("input"), swatch = el("span", "explorer-timeline-swatch");
       checkbox.type = "checkbox"; checkbox.checked = !preferences.hidden.includes(item.id);
       checkbox.setAttribute("aria-label", `Mostrar ${item.label}`); swatch.style.background = typeof item.color === "function" ? item.color() : item.color;
@@ -143,14 +147,14 @@ window.ExplorerTimeline = (() => {
     if (grouped?.base === base && grouped.result.field === field && grouped.result.limit === limit) { status = "done"; paint(); return; }
     const signature = JSON.stringify([base, field, limit]);
     if (pending?.signature === signature) return pending.promise;
-    cancel(); const version = serial, owner = window.AnalysisContexts?.capture(), scope = workspaceScope();
+    cancel(); const version = serial, owner = window.AnalysisContexts?.capture(), scope = workspaceScope(), capturedEvents = scope === "case" ? caseEvents() : null;
     const current = () => version === serial && base === expectedBase && contextKey(grid) === expectedBase && preferences.field === field && preferences.limit === limit;
     status = "loading"; error = null; paint();
     const promise = (async () => {
       try {
-        const args = await caseArgs({ field, grid, filters: copy(backendFilters()), limit, analysisContext: owner?.identity ?? null, sourceGeneration: owner?.sourceGeneration ?? null, ...(scope === "case" ? { caseEvents: caseEvents() } : {}) });
+        const args = await caseArgs({ field, grid, filters: copy(backendFilters()), limit, analysisContext: owner?.identity ?? null, sourceGeneration: owner?.sourceGeneration ?? null, ...(scope === "case" ? { caseEvents: capturedEvents } : {}) });
         if (!current()) return;
-        const result = await api("grouped_timeline", args, { silent: true, latest: "explore-timeline", analysisOwner: owner });
+        const result = await api("grouped_timeline", args, { silent: true, latest: "explore-timeline", analysisOwner: owner, caseEvents: capturedEvents });
         if (!current()) return;
         validate(result, { field, grid, owner, scope, limit, caseKey: args.caseKey ?? null });
         grouped = { base, result }; status = "done";

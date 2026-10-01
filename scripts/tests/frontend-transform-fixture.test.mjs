@@ -42,3 +42,20 @@ const other=another.analysisContexts.find(value=>value.caseId==='separate');
 const clean=await invoke('query_events',{filters:[],limit:1,sortColumn:'timestamp',sortDir:'desc',analysisContext:identity(other)});
 assert.equal(clean.rows[0].fields.decoded,undefined,'another Case reads only the raw source');assert.equal(clean.rows[0].fields.mock_payload_b64,raw);
 console.log('Preview native transport preserves scoped pipelines, typed descendants and original source values');
+
+
+// Fixed Event metadata wins over a shadowing custom field. Custom values retain
+// their original JSON type, including an explicitly present null.
+initial.rows[0].fields.level='shadowed level';
+initial.rows[0].fields.custom_null=null;
+initial.rows[0].fields.custom_object={enabled:false,attempt:0};
+let latest=regex.analysisContext;
+for(const [name,source,steps] of [['canonical_level','level',['text_to_hex']],['typed_null','custom_null',['parse_json']],['typed_object','custom_object',['parse_json']]]) {
+  latest=(await invoke('save_derived_field',{name,source,rules:[],steps,analysisContext:identity(latest)})).analysisContext;
+}
+const parity=await invoke('query_events',{filters:[],limit:1,sortColumn:'timestamp',sortDir:'desc',analysisContext:identity(latest)});
+assert.equal(parity.rows[0].fields.canonical_level,transform(initial.rows[0].level,['text_to_hex']).value);
+assert.equal(parity.rows[0].fields.level,'shadowed level','the original custom shadow remains untouched');
+assert.equal(parity.rows[0].fields.typed_null,null);
+assert.deepEqual(plain(parity.rows[0].fields.typed_object),{enabled:false,attempt:0});
+console.log('Canonical Event sources take precedence while typed custom fields and null survive');

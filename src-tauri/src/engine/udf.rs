@@ -13,12 +13,14 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, LazyLock};
 
 pub(crate) type TextTest = Arc<dyn Fn(Option<&str>) -> bool + Send + Sync>;
+pub(crate) type RowTest = Arc<dyn Fn(i64) -> Result<bool, String> + Send + Sync>;
 pub(crate) type NumberTest = Arc<dyn Fn(Option<f64>) -> bool + Send + Sync>;
 
 #[derive(Clone)]
 enum Test {
     Text(TextTest),
     Number(NumberTest),
+    Row(RowTest),
 }
 
 static TESTS: LazyLock<RwLock<HashMap<i32, Test>>> = LazyLock::new(Default::default);
@@ -61,6 +63,11 @@ impl Tests {
     pub(crate) fn number(&mut self, value: &str, test: NumberTest) -> String {
         let id = self.add(Test::Number(test));
         format!("li_ntest(CAST({value} AS DOUBLE), {id})")
+    }
+    /// Exact signed row identity; never round-trip IDs through DOUBLE.
+    pub(crate) fn row(&mut self, value: &str, test: RowTest) -> String {
+        let id = self.add(Test::Row(test));
+        format!("li_visible(CAST({value} AS BIGINT), {id})")
     }
     /// A structured planner placeholder, expanded before SQL reaches DuckDB.
     /// Keeping the complete free-text term together lets candidate selection
@@ -187,6 +194,38 @@ impl VScalar for NumberTestFn {
             vec![LogicalTypeId::Double.into(), LogicalTypeId::Integer.into()],
             LogicalTypeId::Boolean.into(),
         )]
+    }
+}
+
+/// DuckDB invokes this per vector. The registry is resolved once for each
+/// constant token in a chunk; the per-row operation is one bitmap lookup.
+struct RowTestFn;
+impl VScalar for RowTestFn {
+    type State = ();
+    fn volatile() -> bool { true }
+    fn invoke(_: &(), input: &mut DataChunkHandle, output: &mut dyn WritableVector) -> Result<(), Box<dyn Error>> {
+        let rows = input.len();
+        let values = input.flat_vector(0);
+        let tokens = input.flat_vector(1);
+        let ids = unsafe { tokens.as_slice_with_len::<i32>(rows) };
+        let positions = unsafe { values.as_slice_with_len::<i64>(rows) };
+        let mut out = output.flat_vector();
+        let out = unsafe { out.as_mut_slice_with_len::<bool>(rows) };
+        let mut current: Option<(i32, RowTest)> = None;
+        for row in 0..rows {
+            if tokens.row_is_null(row as u64) { return Err("Token de visibilidade ausente.".into()); }
+            if values.row_is_null(row as u64) { return Err("Identidade de linha ausente na visibilidade.".into()); }
+            let id = ids[row];
+            if current.as_ref().is_none_or(|(old, _)| *old != id) {
+                let Test::Row(test) = lookup(id)? else { return Err("Predicado de visibilidade inválido.".into()); };
+                current = Some((id, test));
+            }
+            out[row] = (current.as_ref().expect("visibility loaded").1)(positions[row]).map_err(|error| -> Box<dyn Error> { error.into() })?;
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(vec![LogicalTypeId::Bigint.into(), LogicalTypeId::Integer.into()], LogicalTypeId::Boolean.into())]
     }
 }
 
@@ -355,6 +394,7 @@ impl VScalar for BlankFn {
 }
 
 pub(crate) fn register(conn: &Connection) -> duckdb::Result<()> {
+    conn.register_scalar_function::<RowTestFn>("li_visible")?;
     conn.register_scalar_function::<TextTestFn>("li_test")?;
     conn.register_scalar_function::<NumberTestFn>("li_ntest")?;
     conn.register_scalar_function::<LowerFn>("li_lower")?;
@@ -365,4 +405,36 @@ pub(crate) fn register(conn: &Connection) -> duckdb::Result<()> {
     conn.register_scalar_function::<UnitFn>("li_unit")?;
     conn.register_scalar_function::<BlankFn>("li_blank")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+    fn connection() -> Connection { let conn = Connection::open_in_memory().unwrap(); register(&conn).unwrap(); conn }
+    #[test]
+    fn visibility_vectors_constants_and_mixed_tokens_remain_isolated() {
+        let conn = connection(); let mut tests = Tests::default();
+        let a = tests.add(Test::Row(Arc::new(|id| Ok(id % 4 == 0))));
+        let b = tests.add(Test::Row(Arc::new(|id| Ok(id % 3 == 0))));
+        let count: i64 = conn.query_row(&format!("SELECT count(*) FROM range(4097) t(id) WHERE li_visible(id, CASE WHEN id%2=0 THEN {a} ELSE {b} END)"), [], |row| row.get(0)).unwrap();
+        assert_eq!(count, (0..4097).filter(|id| if id%2 == 0 { id%4 == 0 } else { id%3 == 0 }).count() as i64);
+        let constants: i64 = conn.query_row(&format!("SELECT count(*) FROM range(5000) WHERE li_visible(12::BIGINT,{a})"), [], |row| row.get(0)).unwrap();
+        assert_eq!(constants, 5000);
+        let union: i64 = conn.query_row(&format!("SELECT count(*) FROM (SELECT id FROM range(100) t(id) WHERE li_visible(id,{a}) UNION ALL SELECT id FROM range(100) t(id) WHERE li_visible(id,{b}))"), [], |row| row.get(0)).unwrap();
+        assert_eq!(union, 25+34);
+    }
+    #[test]
+    fn expired_missing_and_invalid_row_visibility_fails_closed() {
+        let conn = connection(); let mut tests = Tests::default();
+        let id = tests.add(Test::Row(Arc::new(|row| if (0..5).contains(&row) { Ok(true) } else { Err("row outside admitted source".into()) })));
+        for row in [-1i64,5,i64::MAX] {
+            assert!(conn.query_row(&format!("SELECT li_visible({row}::BIGINT,{id})"), [], |row| row.get::<_,bool>(0)).is_err());
+        }
+        for sql in [format!("SELECT count(*) FROM range(1) WHERE li_visible(NULL::BIGINT,{id})"),"SELECT count(*) FROM range(1) WHERE li_visible(1::BIGINT,NULL::INTEGER)".into()] {
+            assert!(!matches!(conn.query_row(&sql, [], |row| row.get::<_,i64>(0)), Ok(count) if count != 0));
+        }
+        drop(tests);
+        assert!(conn.query_row(&format!("SELECT li_visible(1::BIGINT,{id})"), [], |row| row.get::<_,bool>(0)).is_err());
+        assert_eq!(conn.query_row("SELECT 7", [], |row| row.get::<_,i64>(0)).unwrap(),7);
+    }
 }

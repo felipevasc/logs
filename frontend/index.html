@@ -17,6 +17,7 @@
   <link rel="stylesheet" href="journeys.css" />
   <link rel="stylesheet" href="explorer-timeline.css">
   <link rel="stylesheet" href="field-transform.css">
+  <link rel="stylesheet" href="exclusion-archive.css">
   <link rel="stylesheet" href="workspace-context.css" />
   <link rel="stylesheet" href="case-content.css" />
   <link rel="stylesheet" href="case-trails.css" />
@@ -58,7 +59,7 @@
   <div id="ws-export-modal" class="modal-overlay" hidden>
     <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="ws-export-title">
       <div class="modal-head"><h3 id="ws-export-title">Exportar</h3><button class="icon-btn" id="ws-export-close" aria-label="Fechar"><i class="fas fa-xmark"></i></button></div>
-      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Itens do Caso · Markdown</option><option value="case">Investigação · JSON</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask" checked> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
+      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Itens do Caso · Markdown</option><option value="case">Investigação portátil · LICASE</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask" checked> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
     </div>
   </div>
   <div id="ws-drop" hidden><i class="fas fa-arrow-down-to-bracket"></i><strong>Solte os logs aqui</strong></div>
@@ -109,7 +110,7 @@
       <div class="drive-table-wrap">
         <table id="drive-table">
           <thead>
-            <tr><th></th><th>Nome</th><th>Tipo</th><th>Arquivos</th><th>Eventos</th><th>Carregado</th><th></th>
+            <tr><th></th><th>Nome</th><th>Tipo</th><th>Arquivos</th><th>Importados</th><th>Carregado</th><th></th>
           </thead>
           <tbody></tbody>
         </table>
@@ -1028,6 +1029,8 @@
   <script src="tasks.js"></script>
   <script src="explorer-timeline.js"></script>
   <script src="field-transform.js"></script>
+  <script src="exclusion-archive.js"></script>
+  <script src="exclusion-visibility.js"></script>
   <script src="ui-scale.js"></script>
   <script src="timeline.js"></script>
   <script src="case-content.js"></script>

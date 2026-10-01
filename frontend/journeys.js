@@ -52,7 +52,9 @@ window.Journeys = (() => {
     return "custom";
   }
   function preferred(fields) {
-    const count = view.scope === "case" ? caseEvents().filter(rowPassesFilters).length : state.total;
+    // A preserved evidence size cannot be used as the visible denominator.
+    // Without a matching admitted total, keep the backend's suggested order.
+    const count = explorerAnalytics.get(explorerKey())?.total;
     const repeated = field => Number.isFinite(count) && field.distinct != null && field.distinct < Math.round(field.coverage * count);
     return fields.find(field => field.suggested && repeated(field)) || fields.find(field => field.suggested) || fields.find(field => ["user", "ip"].includes(field.kind)) || fields.find(repeated) || fields[0];
   }

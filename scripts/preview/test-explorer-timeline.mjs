@@ -52,6 +52,10 @@ try{
   await page.waitForFunction(()=>document.querySelector('.explorer-timeline-note').textContent.includes('grupos de maior volume'));
   await page.locator('#btn-theme').click();
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Timeline fits the minimum viewport');
+  assert.ok(await page.getByRole('checkbox',{name:'Mostrar Outros valores',exact:true}).evaluate(node=>{
+    const item=node.getBoundingClientRect(),legend=node.closest('.explorer-timeline-legend').getBoundingClientRect();
+    return item.top>=legend.top&&item.bottom<=legend.bottom;
+  }),'Other remains visible before scrolling through high-cardinality groups');
   await page.screenshot({path:resolve(output,'explorer-timeline-message-light-1024.png')});
   phase='persistence';await page.evaluate(()=>saveCases());await page.reload();
   await page.waitForFunction(()=>window.WorkspaceContext?.ready&&!WorkspaceContext.changing&&state.loaded&&!state.loadOverlay);

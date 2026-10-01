@@ -558,8 +558,9 @@ impl Session {
     }
 
     pub(crate) fn cached_selection(&self, key: &str) -> Option<Arc<ops::Selection>> {
+        let key = format!("{}|{key}", crate::analysis_runtime::cache_namespace());
         let mut selections = self.selections.lock();
-        let at = selections.iter().position(|(k, _)| k == key)?;
+        let at = selections.iter().position(|(k, _)| k == &key)?;
         let entry = selections.remove(at);
         let found = Arc::clone(&entry.1);
         selections.insert(0, entry);
@@ -576,6 +577,7 @@ impl Session {
     }
 
     pub(crate) fn cache_selection(&self, key: String, selection: Arc<ops::Selection>) {
+        let key = format!("{}|{key}", crate::analysis_runtime::cache_namespace());
         let mut selections = self.selections.lock();
         selections.retain(|(k, _)| *k != key);
         let budget = crate::resources::selection_cache_bytes();
@@ -590,8 +592,9 @@ impl Session {
     }
 
     pub(crate) fn begin_selection(&self, key: &str) -> Result<SelectionBuild<'_>, String> {
+        let key = format!("{}|{key}", crate::analysis_runtime::cache_namespace());
         let mut building = self.selection_builds.lock();
-        while building.contains(key) {
+        while building.contains(&key) {
             crate::operations::check()?;
             self.selection_changed.wait_for(&mut building, std::time::Duration::from_millis(25));
         }
@@ -1069,6 +1072,25 @@ struct Job {
     source: build::PartSource,
     derived: Vec<CompiledDerived>,
     catalogs: Option<(CodesConfig, CodesConfig)>,
+}
+
+/// A base-safe first page can finish without opening a derived Session. Queue
+/// its captured desired variant afterward, without clearing failures or changing
+/// the registry owner. Source publication remains the ownership authority.
+pub(crate) fn ensure_admitted_variant(idx: &FileIndex, codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) {
+    if !enabled() || idx.lines.is_empty() || derived.is_empty() { return; }
+    let Some(desired) = spec(idx, codes, system, derived) else { return; };
+    let base = spec(idx, codes, system, &[]);
+    let identity = source_identity(idx);
+    with_registry(|reg| {
+        if reg.source_identity != identity || reg.failed.contains_key(&desired.key)
+            || desired.parts.iter().any(|part| reg.failed.contains_key(&part.key))
+            || desired.parts.iter().all(store_ready) { return; }
+        reg.remember_spec(idx, &desired);
+        if let Some(base) = &base { reg.remember_spec(idx, base); }
+        reg.wanted = base.iter().flat_map(|spec| &spec.parts).chain(&desired.parts).map(|part| part.key.clone()).collect();
+        schedule(reg, idx, &desired, base.as_ref(), derived, codes, system);
+    });
 }
 
 /// Called when definitions change, independent of which UI query runs next.

@@ -520,7 +520,7 @@ function updateContextBar() {
   // contexto de Caso: os números são sempre do conjunto do Caso, nunca do artefato
   if (state.activeContext !== "artifact" && activeCase()) {
     const events = caseEvents(), summary = caseEventsCache.summary;
-    const bits = [activeCase().name, `${fmtNum(events.length)} eventos no Caso`];
+    const bits = [activeCase().name, `${fmtNum(events.length)} registros preservados no Caso`];
     if (summary.start != null) bits.push(`${fmtTs(summary.start)} — ${fmtTs(summary.end)}`);
     if (state.filters.length || state.quick.trim()) bits.push("recorte filtrado");
     if (state.stationAnalyticsId) {
@@ -608,7 +608,8 @@ async function api(cmd, args = {}, opts = {}) {
     if (opts.cancelled?.()) throw new Error("Operação cancelada.");
     if (/^(load_|clear_|set_|save_|delete_|harvest_)/.test(cmd)) { state.explorerCache = null; state.datasetRevision++; explorerAnalytics.clear(); }
     const preparedArgs = async (retry = false) => {
-      const prepared = await caseArgs(args, retry);
+      const capturedArgs = retry && !Array.isArray(args.caseEvents) && Array.isArray(opts.caseEvents) ? { ...args, caseEvents: opts.caseEvents } : args;
+      const prepared = await caseArgs(capturedArgs, retry);
       if (opts.cancelled?.()) throw new Error("Operação cancelada.");
       return prepared;
     };
@@ -887,7 +888,7 @@ async function reconcilePublishedSource(current = () => true) {
   const id = artifactIdFromSource(source), same = state.currentArtifact?.id === id;
   const saved = activeCase()?.artifacts?.find(artifact => artifact.id === id);
   Object.assign(state, {
-    loaded: true, columns: snapshot.columns, total: snapshot.count,
+    loaded: true, columns: snapshot.columns, total: null,
     currentOrigin: snapshot.sourceDesc,
     currentArtifact: { id, label: snapshot.sourceDesc, kind: source.kind, path: source.path || source.channel, count: snapshot.count, loadedAt: Date.now(), source },
     page: 0, pageResult: null, queryError: null, dataPeriod: null, facetData: null,
@@ -1017,6 +1018,8 @@ async function loadData(requestedSource = null, options = {}) {
     }
     if (!current()) return false;
     sourceAccepted = true; state.sourcePublication = summary.publication || null; clearSourceRecovery();
+    // Publication counts describe ingestion, not records visible in this Case.
+    state.total = null; state.pageResult = null;
     updateOperation("Artefato carregado", `${fmtNum(summary.count)} eventos indexados`, null, false);
     state.columns = summary.columns;
     const savedArtifact = c.artifacts?.find((a) => a.id === artifactIdFromSource(source));
@@ -1036,7 +1039,7 @@ async function loadData(requestedSource = null, options = {}) {
     state.loaded = true;
     fillColumnControls();
     renderChips();
-    status.textContent = merge ? `${fmtNum(summary.count)} eventos (fontes unidas)` : `${fmtNum(summary.count)} eventos`;
+    status.textContent = `${fmtNum(summary.count)} registros importados${merge ? " (fontes unidas)" : ""}`;
     status.classList.add("ok");
     $("#btn-merge").disabled = false;
     // origem: estação associada ao arquivo (se houver) ou a própria fonte
@@ -1181,6 +1184,7 @@ async function clearData({ removeCurrent = false } = {}) {
   updateContextBar();
   if (state.activeDatasetTab === "cube" && state.analyticsScope === "dataset") runCube();
   finishOperation("Nenhuma fonte carregada");
+  void window.ExclusionVisibility?.refresh();
   return true;
 }
 
@@ -1543,7 +1547,7 @@ async function loadDerivedFields(capturedOwner = window.AnalysisContexts?.captur
   let owner = capturedOwner;
   try {
     owner = window.AnalysisContexts ? await window.AnalysisContexts.prepare(capturedOwner, { metadata: true }) : null;
-    const fields = (await api("list_derived_fields", { analysisContext: owner?.identity ?? null, sourceGeneration: owner?.sourceGeneration ?? null }, { silent: true, analysisOwner: owner })) || [];
+    const fields = owner && !owner.identity ? [] : (await api("list_derived_fields", { analysisContext: owner?.identity ?? null, sourceGeneration: owner?.sourceGeneration ?? null }, { silent: true, analysisOwner: owner })) || [];
     if (owner) window.AnalysisContexts.definitionsLoaded(owner, fields);
     else if (!window.AnalysisContexts?.identity()) state.derivedFields = fields;
     renderExploreTree(); return true;
@@ -2466,7 +2470,9 @@ function showCtxMenu(x, y, items) {
     const b = el("button", "ctx-item" + (it.danger ? " danger" : ""));
     b.innerHTML = `<i class="fas ${it.icon}"></i><span>${esc(it.label)}</span>`;
     if (it.color) b.querySelector("i").style.color = it.color;
+    b.disabled = !!it.disabled; if (it.title) b.title = it.title;
     b.onclick = () => {
+      if (b.disabled) return;
       closeCtxMenu();
       if (owner && !window.AnalysisContexts.isCurrent(owner)) { toast("O contexto mudou. Abra o menu novamente no Caso e na fonte atuais.", "info"); return; }
       it.onClick();
@@ -3550,7 +3556,7 @@ function renderStations() {
       const row = el("div", "analysis-item-head");
       row.appendChild(el("span", "label", artifact.label || artifact.path || "Artefato"));
       row.appendChild(el("span", "spacer"));
-      row.appendChild(el("span", "count", `${fmtNum(artifact.count || 0)} eventos`));
+      row.appendChild(el("span", "count", `${fmtNum(artifact.count || 0)} registros importados`));
       box.appendChild(row);
     }
     const itemTitle = el("div", "side-title", "Itens relacionados no Caso");
@@ -4320,7 +4326,7 @@ function renderCaseData(box, c) {
     const row = el("div", "case-data-record");
     row.append(el("strong", "", artifact.label || artifact.path || "Artefato"));
     const station = (c.stations || []).find((item) => item.id === artifact.stationId);
-    row.appendChild(el("span", "", `${artifact.kind === "eventlog" ? "Event Log" : "Arquivo"} · ${countLabel(artifact.count || 0, "evento")}${station ? ` · ${station.name}` : ""}`));
+    row.appendChild(el("span", "", `${artifact.kind === "eventlog" ? "Event Log" : "Arquivo"} · ${fmtNum(artifact.count || 0)} registros importados${station ? ` · ${station.name}` : ""}`));
     if (artifact.path) row.appendChild(el("small", "", artifact.path));
     for (const file of artifact.hashes?.files || []) {
       const hash = el("button", "case-hash", `SHA-256 ${file.sha256.slice(0, 12)}…${file.sha256.slice(-8)}`);
@@ -4513,6 +4519,7 @@ function saveManualEvent() {
 
 // menu de contexto de uma célula de evento
 function eventCellMenu(ev, col, value, anchor = null) {
+  ensureSelectionOwner();
   const hasVal = value !== undefined && value !== null && String(value).trim() !== "";
   const items = [
     { icon: "fa-eye", label: "Ver detalhes", onClick: () => openDetail(ev.id) },
@@ -4579,6 +4586,7 @@ function eventCellMenu(ev, col, value, anchor = null) {
     : [ev];
 
   items.push({ sep: true });
+  if (window.ExclusionArchive) items.push(window.ExclusionArchive.selectedMenuItem(ev, anchor));
   items.push({
     icon: "fa-route",
     label: selectedList.length > 1
@@ -4762,7 +4770,14 @@ function openSendToTrailModal(events) {
   };
 }
 
+function ensureSelectionOwner() {
+  const key = JSON.stringify([workspaceScope(), state.cases?.active, window.AnalysisContexts?.capture() || [state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt], workspaceScope() === "case" ? caseSig() : null]);
+  if (state.selectionOwner !== key) { state.selectedEventRows = new Map(); state.lastSelectedRowId = null; state.selectionOwner = key; }
+  return key;
+}
+
 function toggleRowSelect(ev, forceState = null) {
+  ensureSelectionOwner();
   state.selectedEventRows = state.selectedEventRows || new Map();
   const next = forceState !== null ? forceState : !state.selectedEventRows.has(ev.id);
   if (next) {
@@ -4775,6 +4790,7 @@ function toggleRowSelect(ev, forceState = null) {
 }
 
 function selectRowRange(targetId, keepExisting = false) {
+  ensureSelectionOwner();
   if (!keepExisting) {
     state.selectedEventRows = new Map();
   } else {
@@ -4798,6 +4814,7 @@ function selectRowRange(targetId, keepExisting = false) {
 }
 
 function updateRowSelectionStyles() {
+  ensureSelectionOwner();
   const tbody = $("#events-table tbody");
   if (!tbody) return;
   tbody.querySelectorAll("tr").forEach(tr => {
@@ -4845,6 +4862,7 @@ function buildEventRow(ev, columns = state.visibleCols) {
   if (state.selectedEventRows?.has(ev.id)) row.classList.add("row-multi-selected");
 
   row.onclick = (e) => {
+    ensureSelectionOwner();
     if (e.target.closest("input, button, a")) return;
     if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
@@ -4899,7 +4917,7 @@ function buildEventRow(ev, columns = state.visibleCols) {
       td.title = `${hint.text}${hint.marker}\nPrévia de texto limitada. Clique para ver os detalhes; use o botão direito para copiar ou filtrar o valor completo.`;
     } else td.title = displayText;
     td.oncontextmenu = (e) => {
-      e.preventDefault();
+      e.preventDefault(); ensureSelectionOwner();
       if (!state.selectedEventRows?.has(ev.id)) {
         state.selectedEventRows = new Map([[ev.id, ev]]);
         state.lastSelectedRowId = ev.id;
@@ -4914,6 +4932,7 @@ function buildEventRow(ev, columns = state.visibleCols) {
 }
 
 function renderTable(qr, { reuseRows = false } = {}) {
+  ensureSelectionOwner(); window.ExclusionArchive?.updateButtons();
   $("#empty-state [data-retry]")?.remove();
   const thead = $("#events-table thead");
   const tbody = $("#events-table tbody");
@@ -5214,28 +5233,62 @@ function openContextInspector(title, subtitle, overview) {
   $("#btn-right-inspect").classList.add("active");
 }
 
-function showFieldInspector(column) {
+async function showFieldInspector(column) {
   const overview = el("div", "kv");
-  const inCase = state.activeContext !== "artifact";
-  const pool = inCase ? caseEvents() : state.rows;
-  const values = pool.map((event) => cellValue(event, column)).filter(Boolean);
-  const counts = new Map();
-  for (const value of values) counts.set(value, (counts.get(value) || 0) + 1);
-  const rows = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12);
-  const description = el("p", "muted small", inCase
-    ? `${fmtNum(values.length)} valores observados no conjunto do Caso.`
-    : `${fmtNum(values.length)} valores observados na página atual.`);
-  overview.appendChild(description);
-  const include = el("button", "btn ghost small", "Filtrar valores deste campo");
-  include.onclick = () => { openFilterPop(); $("#fp-col").value = column; };
-  overview.appendChild(include);
-  for (const [value, count] of rows) {
-    const row = el("button", "kv-row");
-    row.append(el("span", "kv-v mono", value), el("span", "fc", fmtNum(count)));
-    row.onclick = () => { addFilter({ column, op: "equals", value, value2: null }); closeDrawer(); };
-    overview.appendChild(row);
-  }
+  const scope = workspaceScope(), owner = window.AnalysisContexts?.capture(), filters = structuredClone(backendFilters());
+  const evidence = scope === "case" ? caseEvents() : null, evidenceSignature = scope === "case" ? caseSig() : null;
+  window.Tasks?.cancelLatest("field-inspector");
+  overview.appendChild(el("p", "muted small", "Calculando valores visíveis…"));
   openContextInspector("Campo", colLabel(column), overview);
+  const request = detailRequest;
+  const current = () => request === detailRequest && !$("#drawer").hidden && scope === workspaceScope()
+    && (!owner || window.AnalysisContexts.isCurrent(owner)) && JSON.stringify(filters) === JSON.stringify(backendFilters())
+    && (evidenceSignature === null || evidenceSignature === caseSig());
+  const check = () => {
+    if (current()) return true;
+    if (request === detailRequest) overview.replaceChildren(el("p", "muted small", "O contexto mudou. Abra o campo novamente."));
+    return false;
+  };
+  try {
+    let rows, total, omittedGroups = 0, omittedRecords = 0;
+    if (scope === "case") {
+      const alias = column === "__field_inspector_count" ? "__field_inspector_count_2" : "__field_inspector_count";
+      const args = await caseArgs({ groupColumn: column, aggs: [{ func: "count", column: "*", alias }],
+        filters: [...filters, { column, op: "not_empty", value: "", value2: null }], caseEvents: evidence,
+        analysisContext: owner?.identity ?? null, sourceGeneration: owner?.sourceGeneration ?? null });
+      if (!check()) return;
+      const result = await api("aggregate_events", args, { silent: true, latest: "field-inspector", analysisOwner: owner, caseEvents: evidence });
+      if (!check()) return;
+      if (result.error) throw Error(result.error);
+      if (!Array.isArray(result.rows) || !Array.isArray(result.group_values) || result.group_values.length !== result.rows.length) throw Error("Contagens de campo incompletas.");
+      rows = result.rows.map((row, index) => [result.group_values[index], row[alias]]);
+      omittedGroups = result.omitted_groups ?? 0; omittedRecords = result.omitted_records ?? 0;
+      if (rows.some(([value, count]) => typeof value !== "string" || !Number.isSafeInteger(count) || count < 0)
+        || ![omittedGroups, omittedRecords].every(value => Number.isSafeInteger(value) && value >= 0)) throw Error("Contagens de campo inválidas.");
+      total = rows.reduce((sum, [, count]) => sum + count, omittedRecords);
+      if (!Number.isSafeInteger(total)) throw Error("Contagem de campo fora do limite.");
+    } else {
+      // The Dataset inspector remains a sample of the already admitted page.
+      const values = state.rows.map(event => cellValue(event, column)).filter(Boolean), counts = new Map();
+      for (const value of values) counts.set(value, (counts.get(value) || 0) + 1);
+      rows = [...counts]; total = values.length;
+    }
+    if (!check()) return;
+    overview.replaceChildren(el("p", "muted small", scope === "case"
+      ? `${fmtNum(total)} valores preenchidos no recorte visível do Caso · até 12 valores mais frequentes.`
+      : `${fmtNum(total)} valores observados na página atual.`));
+    if (omittedGroups) overview.appendChild(el("p", "muted small", `A agregação atingiu o limite de grupos. O total inclui ${fmtNum(omittedRecords)} registros de ${fmtNum(omittedGroups)} grupos adicionais.`));
+    const include = el("button", "btn ghost small", "Filtrar valores deste campo");
+    include.onclick = () => { if (check()) { openFilterPop(); $("#fp-col").value = column; } }; overview.appendChild(include);
+    for (const [value, count] of rows.sort((a, b) => b[1] - a[1]).slice(0, 12)) {
+      const row = el("button", "kv-row"); row.title = trunc(value, 512);
+      row.append(el("span", "kv-v mono", trunc(value, 160)), el("span", "fc", fmtNum(count)));
+      row.onclick = () => { if (check()) { addFilter({ column, op: "equals_exact", value, value2: null }); closeDrawer(); } };
+      overview.appendChild(row);
+    }
+  } catch (error) {
+    if (check()) overview.replaceChildren(el("p", "muted small", `Não foi possível inspecionar o campo: ${String(error)}`));
+  }
 }
 
 function showStationInspector(station) {
@@ -5519,6 +5572,7 @@ function detailStep(dir) {
 
 function closeDrawer() {
   detailRequest++;
+  window.Tasks?.cancelLatest("field-inspector");
   state.detailId = null;
   closeDetailValue();
   $("#drawer").hidden = true;
@@ -6154,7 +6208,7 @@ function bindKeyboard() {
     } else if ((e.ctrlKey || e.metaKey) && (e.key === "a" || e.key === "A") && !typing) {
       if (state.rows?.length && !$("#view-explore")?.hidden) {
         e.preventDefault();
-        state.selectedEventRows = new Map();
+        ensureSelectionOwner(); state.selectedEventRows = new Map();
         for (const ev of state.rows) state.selectedEventRows.set(ev.id, ev);
         updateRowSelectionStyles();
       }
@@ -6769,12 +6823,11 @@ async function renderDashboard(scope = state.analyticsScope) {
   $("#btn-dash-compact").setAttribute("aria-pressed", String(state.dashboardCompact));
   for (const id of Object.keys(dashCharts)) { dashCharts[id].destroy(); delete dashCharts[id]; }
   grid.innerHTML = "";
-  const selected = caseEvents().length;
   const station = state.stationAnalyticsId
     ? caseStations().find((item) => item.id === state.stationAnalyticsId)
     : null;
   $("#dash-info").textContent = scope === "case"
-    ? `${charts.length} ${charts.length === 1 ? "gráfico" : "gráficos"} · ${selected} eventos${station ? ` da estação ${station.name}` : " selecionados no Caso"}${state.filters.length ? " (filtros aplicados)" : ""}`
+    ? `${charts.length} ${charts.length === 1 ? "gráfico" : "gráficos"} · registros visíveis${station ? ` da estação ${station.name}` : " do Caso"}${state.filters.length ? " (filtros aplicados)" : ""}`
     : `${charts.length} ${charts.length === 1 ? "gráfico" : "gráficos"} · dados carregados${state.filters.length ? " (filtros aplicados)" : ""}`;
   if (!scopeHasEvents(scope)) {
     grid.innerHTML = scope === "case"

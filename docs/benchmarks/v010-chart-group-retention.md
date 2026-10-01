@@ -128,3 +128,62 @@ units, absent metric fields, string/dynamic/id/timestamp splits, negative/zero/
 missing timestamps, and long labels. Existing injected spill failure and
 cancellation tests remain green. Source parsing and diff checks pass; these are
 focused checks, with canonical native and scale evaluation still deferred.
+
+## Metric-specific fallback accumulator checkpoint
+
+The former `MetricAcc` stored a metric String, sum/min/max/count state and an
+inline exact distinct Counter for every metric. It now stores a small tagged
+count or numeric state; only distinct cells allocate a boxed Counter. Both term
+and time-bucket admission explicitly charge the box as well as the inline slot,
+and distinct key/duplicate/spill accounting remains unchanged. Numeric metrics
+update only their requested state, preserving input order, valid samples,
+incompatible units, empty results and signed zero.
+
+On the current x86_64 Rust 1.98.1 dependency build, standalone `size_of` checks give:
+
+| State | Before | After |
+| --- | ---: | ---: |
+| Inline accumulator | 296 bytes | 24 bytes |
+| Count/numeric retained state | 296 bytes + metric-name allocation | 24 bytes |
+| Distinct retained state before values | 296 bytes + metric-name allocation | 24-byte slot + 224-byte box |
+
+These are type/state allocation measurements, excluding allocator bookkeeping,
+map capacity, values, SQLite buffers and other process memory. Rust documents
+[`size_of` as the inline type stride, including padding](https://doc.rust-lang.org/std/mem/fn.size_of.html),
+and a sized `Box<T>` is pointer-sized while its value resides on the heap. Rust
+also cautions that [type layout can change between compilations](https://doc.rust-lang.org/reference/type-layout.html).
+The budgets use compiled sizes rather than these recorded constants. The extra
+indirection for distinct cells has not been latency-benchmarked.
+
+All 16 focused recovery tests pass, including explicit rejection when a distinct
+box cannot fit a budget that admits numeric state. The complete response matrix
+passes 300 old/new pairs, extending prior cases with signed zero and accumulated
+non-finite values. Numeric cancellation (sum=3, avg=0.75), samples, unit warnings,
+spill failures, duplicate charging and cancellation tests are green. Canonical
+native, large-scale RSS and latency validation remain deferred.
+
+## Borrowed numeric-read checkpoint
+
+Only numeric accumulation and dominant-unit discovery changed from `col_str` to
+`col_ref`. Ordinary canonical/String fields are now borrowed for the same
+`parse_num_unit` call; typed values still use the existing textual conversion.
+Distinct counters continue to own and charge their values. The getter preserves
+canonical-column precedence. This uses the immutable borrowed-data behavior
+specified by [Rust's Cow documentation](https://doc.rust-lang.org/std/borrow/enum.Cow.html).
+
+All 17 focused recovery tests and 300 complete old/new response pairs pass. New
+coverage includes a raw `message` alias conflicting with the canonical message,
+typed numeric/String/boolean/object/null values, and missing fields. A temporary
+thread-local allocator probe on the same plain numeric string `123` measured:
+
+| Isolated work | Allocation calls before | After | Requested bytes before → after |
+| --- | ---: | ---: | ---: |
+| 1,000 numeric pushes on one Event | 1,000 | 0 | 3,000 → 0 |
+| Unit discovery over 1,000 cloned Events | 5,000 | 4,000 | 25,000 → 22,000 |
+
+The second row includes unchanged input Event cloning. Unit-string normalization
+and typed-value serialization can still allocate; these measurements isolate
+removal of the extra getter copy. They are neither process RSS nor application
+latency measurements. No allocator instrumentation was added to production.
+This allocation lane is frozen for integrated compatibility review; complete
+native and scale gates remain coordinated separately.

@@ -263,7 +263,7 @@
   const originalFields = renderCubeFields;
   renderCubeFields = function () {
     pivotShell(); originalFields();
-    $("#cube-info").textContent = state.analyticsScope === "case" ? `${fmtNum(caseEvents().length)} registros do caso · filtros ativos aplicados` : `${backendFilters().length ? "Recorte filtrado" : "Todos os registros"} do arquivo aberto`;
+    $("#cube-info").textContent = state.analyticsScope === "case" ? "Registros visíveis do Caso · filtros ativos aplicados" : `${backendFilters().length ? "Recorte filtrado" : "Todos os registros"} do arquivo aberto`;
     const available = new Set(fieldNames(state.analyticsScope));
     for (const row of [...$("#cube-field-list").children]) if (!available.has(row.dataset.field)) row.remove();
     const existing = new Set([...$("#cube-field-list").children].map(e => e.dataset.field));

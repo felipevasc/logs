@@ -39,9 +39,10 @@ window.FieldTransforms = (() => {
   }
   function rawValue(event, field) {
     if (!event) return null;
-    if (Object.hasOwn(event.fields || {}, field)) return clone(event.fields[field]);
     if (field === "timestamp") return event.timestamp == null ? null : new Date(event.timestamp).toISOString().replace(/\.000Z$/, "+00:00").replace(/Z$/, "+00:00");
     if (field === "id") return String(event.id);
+    const canonical = ["event_ref", "source", "level", "code", "name", "description", "message", "raw"].includes(field);
+    if (!canonical && Object.hasOwn(event.fields || {}, field)) return clone(event.fields[field]);
     if (Object.hasOwn(event, field)) return clone(event[field]);
     return null;
   }

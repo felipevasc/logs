@@ -28,6 +28,10 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     if (await handlePreviewDownload(req, res, url)) return;
     let path = decodeURIComponent(url.pathname);
+    if (path === "/__mock-exclusions__.js") {
+      res.writeHead(200, { "content-type": MIME[".js"], "cache-control": "no-store" });
+      res.end(await readFile(new URL("./mock-exclusions.js", import.meta.url))); return;
+    }
     if (path === "/__mock-field-transforms__.js") {
       res.writeHead(200, { "content-type": MIME[".js"], "cache-control": "no-store" });
       res.end(await readFile(new URL("./mock-field-transforms.js", import.meta.url))); return;
@@ -72,7 +76,7 @@ const server = createServer(async (req, res) => {
       body = Buffer.from(
         body.toString("utf8").replace(
           '<script src="app.js"></script>',
-          '<script src="/__mock-field-transforms__.js"></script>\n  <script src="/__mock-pivot__.js"></script>\n  <script src="/__mock-remote__.js"></script>\n  <script src="/__mock-journeys__.js"></script>\n  <script src="/__mock__.js"></script>\n  <script src="app.js"></script>',
+          '<script src="/__mock-field-transforms__.js"></script>\n  <script src="/__mock-exclusions__.js"></script>\n  <script src="/__mock-pivot__.js"></script>\n  <script src="/__mock-remote__.js"></script>\n  <script src="/__mock-journeys__.js"></script>\n  <script src="/__mock__.js"></script>\n  <script src="app.js"></script>',
         ),
       );
     }

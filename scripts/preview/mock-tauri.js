@@ -132,7 +132,7 @@
     if (col === "timestamp") return ev.timestamp == null ? "" : new Date(ev.timestamp).toISOString().replace(/\.000Z$/, "+00:00").replace(/Z$/, "+00:00");
     if (col in ev && typeof ev[col] === "string") return ev[col];
     const v = ev.fields?.[col];
-    return v === undefined || v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+    return v === undefined ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
   };
   const parseNumUnit = (s) => {
     const m = String(s).trim().toLowerCase().match(/^(-?[\d.,]+)\s*(tb|gb|mb|kb|b|gbps|mbps|kbps|bps|ms|s|min|h|%)?$/);
@@ -410,7 +410,7 @@
       }
       return {start,end,bucketMs,total,errors,warnings,buckets};
     },
-    list_sources: () => [{id:"mock-app",name:"application.jsonl",path:"C:\\mock\\mock.jsonl",format:"jsonl",bytes:2400000,count:events.length,undated:0,start:now-86400000,end:now,sampled:200,unparsed:0}],
+    list_sources: ({caseEvents} = {}) => [{id:"mock-app",name:"application.jsonl",path:"C:\\mock\\mock.jsonl",format:"jsonl",bytes:2400000,count:poolOf(caseEvents).length,undated:0,start:now-86400000,end:now,sampled:200,unparsed:0}],
     compare_periods: ({filters,before,after,caseEvents}) => {
       if(before.start>before.end||after.start>after.end)throw new Error('Revise os intervalos de comparação.');
       if(before.start<=after.end&&after.start<=before.end)throw new Error('Os períodos não podem se sobrepor.');
@@ -533,8 +533,8 @@
       sourceDesc: events.length ? loadedParts.join(" + ") : "",
       sourceNames: events.length ? [...loadedParts] : [], sources: events.length ? structuredClone(sourceInputs) : [],
     }),
-    source_summary: () => ({
-      count: events.length,
+    source_summary: ({caseEvents} = {}) => ({
+      count: poolOf(caseEvents).length,
       columns: events.length ? [...COLUMNS] : [],
       source_desc: events.length ? loadedParts.join(" + ") : "",
       source_names: events.length ? [...loadedParts] : [],
@@ -638,7 +638,7 @@
     },
     load_event_log: () => handlers.load_file(),
     load_bundle: ({ members }) => handlers.load_files({ paths: members.flatMap(s => s.paths || [s.path || s.channel]), merge: false }),
-    event_detail: ({ id }) => events.find((e) => e.id === id) || null,
+    event_detail: ({ id, caseEvents }) => poolOf(caseEvents).find((e) => e.id === id) || null,
     query_page: ({ filters, offset=0, limit=100, cursor, sortColumn='', sortDir='', caseEvents }) => {
       const rows = sortedRows(applyFilters(filters, poolOf(caseEvents)), sortColumn, sortDir);
       const start = cursor ? Number(cursor) : offset, size = Math.max(1, Math.min(2000, limit));
@@ -894,6 +894,15 @@
     data.revision = ++storeRevision; localStorage.setItem("__mockStore", JSON.stringify(data));
     return { revision: storeRevision, analysisContexts: receipts };
   };
+  handlers.exclusion_capabilities = () => ({ available: false, reason: "O arquivo de exclusões ainda não está disponível nesta versão." });
+  const exclusions = window.createMockExclusions?.({ contextFor: analysisFor, identity: analysisIdentity, generation: () => sourceGeneration,
+    sourceAvailable: () => sourceInputs.length > 0,
+    rows: () => events, filter: applyFilters, persist: context => {
+      const stored = localStorage.getItem("__mockStore"); if (!stored) return;
+      const data = JSON.parse(stored), item = data.cases?.find(item => item.id === context.caseId);
+      if (item) { item.analysisContext = structuredClone(context); localStorage.setItem("__mockStore", JSON.stringify(data)); }
+    } });
+  if (exclusions) { Object.assign(handlers, exclusions.handlers); window.__mockExclusions = exclusions; }
   handlers.preview_field_transform = ({ value, steps }) => window.__mockFieldTransforms.transform(value, steps);
   handlers.analysis_context_snapshot = ({ caseId }) => {
     const value = analysisContexts.get(caseId); if (!value) throw Error("Caso não encontrado."); return structuredClone(value);
@@ -924,7 +933,7 @@
           const hasField = Object.hasOwn(event.fields || {}, field.source);
           const canonical = ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw"].includes(field.source);
           if (!hasField && !canonical && !field.source.startsWith("@")) continue;
-          let value = hasField ? event.fields[field.source] : colStr(event, field.source);
+          let value = !canonical && hasField ? event.fields[field.source] : colStr(event, field.source);
           if (field.rules?.length) {
             let matched = false;
             for (const rule of field.rules) {
@@ -971,6 +980,7 @@
   window.__TAURI__ = {
     core: {
       invoke: async (cmd, args = {}) => {
+        if (window.__mockExclusionsEnabled) for (const event of events) event.event_ref ||= `preview:${event.id}`;
         window.__mockRequests ||= []; window.__mockRequests.push({ cmd, cursor: args.cursor, offset: args.offset, operationId: args.operationId, field: args.field, grid: args.grid, caseKey: args.caseKey, analysisContext: args.analysisContext, sourceGeneration: args.sourceGeneration }); if (window.__mockRequests.length > 400) window.__mockRequests.shift();
         window.__mockCommandCalls ||= {};
         window.__mockCommandCalls[cmd] = (window.__mockCommandCalls[cmd] || 0) + 1;
@@ -981,8 +991,8 @@
           args = { ...args, caseEvents: caseStore.get(args.caseKey) };
         }
         try {
-          const scopedCommands=['grouped_timeline','query_page','query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
-          if (scopedCommands.includes(cmd) && args.analysisContext) args = { ...args, caseEvents: analysisRows(poolOf(args.caseEvents), analysisFor(args)) };
+          const scopedCommands=['list_sources','source_summary','event_detail','triage','triage_evidence_event','grouped_timeline','query_page','query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
+          if (scopedCommands.includes(cmd) && args.analysisContext) args = { ...args, caseEvents: analysisRows(exclusions?.visible(args.analysisContext, poolOf(args.caseEvents)) || poolOf(args.caseEvents), analysisFor(args)) };
           if(scopedCommands.includes(cmd)&&args.filters?.some(filter=>filter.op==='threat_rule')){
             const module=await import('/__mock-threats__.js');
             args={...args,caseEvents:await module.threatFilterRows(poolOf(args.caseEvents),args.filters.filter(filter=>filter.op==='threat_rule')),filters:args.filters.filter(filter=>filter.op!=='threat_rule')};
@@ -995,6 +1005,7 @@
           if (extra) { const generation = window.__mockGeneration || 0; for (let elapsed = 0; elapsed < extra; elapsed += 25) { await delay(Math.min(25, extra - elapsed)); if ((window.__mockGeneration || 0) !== generation || window.__mockCancelledIds?.has(args.operationId)) throw new Error("Operação cancelada."); } }
           if (window.__mockFailures?.[cmd]) throw new Error(window.__mockFailures[cmd]);
           let result = await h(args);
+          if (window.__mockExclusionsEnabled && cmd === "cases_load") for (const item of result.cases || []) for (const group of item.items || []) for (const event of group.rows || []) event.event_ref = `preview:${event.id}`;
           if (["load_file", "load_files", "load_bundle", "load_event_log", "clear_events"].includes(cmd)) {
             sourceGeneration++; sourceOperationId = args.operationId || null;
             const inputs = cmd === "clear_events" ? [] : cmd === "load_bundle" ? args.members
@@ -1002,6 +1013,7 @@
               : [{ kind: "file", paths: args.paths || [args.path], format: args.format || "auto" }];
             sourceInputs = args.merge ? [...sourceInputs, ...inputs] : inputs;
             result ||= {}; result.publication = { generation: sourceGeneration, operationId: sourceOperationId, analysisContext: args.analysisContext || null };
+            if (window.__mockExclusionsEnabled) for (const event of events) event.event_ref ||= `preview:${event.id}`;
           }
           return result;
         } catch (e) {

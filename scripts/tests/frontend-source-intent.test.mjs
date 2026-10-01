@@ -12,7 +12,8 @@ const file = path => ({ kind: 'file', path });
 
 function fixture() {
   const state = { cases: { active: 'case', cases: [{ id: 'case', artifacts: [] }] }, artifactSwitchVersion: 0, refreshVersion: 0, datasetRevision: 0, loaded: false, columns: [], visibleCols: [], rows: [], filters: [], quick: '', total: null, treeAgg: {}, treeAggSig: {}, treeAggError: {}, activeDatasetTab: 'table' };
-  const pending = [], calls = [], messages = [], refreshReads = [], nodes = new Map(), cancelled = new Set();
+  const pending = [], calls = [], messages = [], refreshReads = [], refreshTotals = [], nodes = new Map(), cancelled = new Set();
+  let physicalCount = 1, visibleCount = null;
   let createdNodes = 0;
   let native = null, generation = 0, nativeInputs = [], publicationId = null, snapshotFailure = false, prepare = async args => args, sourceWait = async () => {};
   const node = key => {
@@ -32,13 +33,13 @@ function fixture() {
     restoreVisiblePreferences: () => false, storeCurrentArtifactInSession: () => Promise.resolve(true), currentCaseArtifact: () => null,
     loadTsConfig: async () => {}, caseStations: () => [], autoVisibleCols() {}, updateTsExample() {}, updateContextBar() {}, renderExploreTree() {},
     renderTable() {}, renderChart() {}, updateAnalysisBadge() {}, closeDrawer() {}, renderArtifactBar() {},
-    refresh: async () => { refreshReads.push(native); state.rows = [{ source: native }]; },
+    refresh: async () => { refreshReads.push(native); refreshTotals.push(state.total); state.rows = [{ source: native }]; state.total = visibleCount; },
     invoke: async (cmd, args) => {
       calls.push({ cmd, args });
       if (cmd === 'profile_fields') return [];
       if (cmd === 'source_snapshot') {
         if (snapshotFailure) throw Error('Receipt temporarily unavailable');
-        return { generation, operationId:publicationId, count:native?1:0, columns:native?['timestamp','message']:[], sourceDesc:native||'', sourceNames:native?[native]:[], sources:nativeInputs };
+        return { generation, operationId:publicationId, count:native?physicalCount:0, columns:native?['timestamp','message']:[], sourceDesc:native||'', sourceNames:native?[native]:[], sources:nativeInputs };
       }
       if (cmd === 'cancel_task') {
         const target = pending.find(item => item.args.operationId === args.operationId);
@@ -59,7 +60,7 @@ function fixture() {
           },
           respond() {
             if (!record.committed && cancelled.has(args.operationId)) { reject(Error('Operação cancelada.')); return; }
-            resolve({ count: 1, columns: ['timestamp', 'message'], source_desc: native, publication:{generation,operationId:publicationId} });
+            resolve({ count: physicalCount, columns: ['timestamp', 'message'], source_desc: native, publication:{generation,operationId:publicationId} });
           },
           complete() { record.publish(); record.respond(); }, reject,
         };
@@ -72,8 +73,21 @@ function fixture() {
   vm.runInContext(section('async function api(', '// ------------------------------------------------------------------ helpers de espera'), context);
   vm.runInContext(taskSource, context);
   vm.runInContext(section('function clearSourceRecovery()', '// ------------------------------------------------------------------ filtros / chips'), context);
-  return { context, state, pending, calls, messages, refreshReads, node, get native() { return native; }, prepare: fn => { prepare = fn; }, sourceWait: fn => { sourceWait = fn; }, snapshotFailure: value => { snapshotFailure = value; } };
+  return { context, state, pending, calls, messages, refreshReads, refreshTotals, node, get native() { return native; }, counts: (physical, visible) => { physicalCount = physical; visibleCount = visible; }, prepare: fn => { prepare = fn; }, sourceWait: fn => { sourceWait = fn; }, snapshotFailure: value => { snapshotFailure = value; } };
 }
+
+// Import/publication counts describe physical records; exclusions change visible totals.
+const visibility = fixture(); visibility.counts(50, 7);
+visibility.state.total = 999; visibility.state.pageResult = { total: 999 };
+const visibleLoad = visibility.context.loadData(file('masked-source')); await settle();
+visibility.pending[0].complete(); await visibleLoad;
+assert.deepEqual(visibility.refreshTotals, [null], 'a committed load clears the previous visible total before querying');
+assert.equal(visibility.state.total, 7); assert.equal(visibility.state.currentArtifact.count, 50);
+assert.match(visibility.node('#load-status').textContent, /50 registros importados/);
+visibility.state.total = 999; visibility.state.pageResult = { total: 999 };
+await visibility.context.reconcilePublishedSource();
+assert.deepEqual(visibility.refreshTotals, [null, null], 'source reconciliation never seeds visible totals with physical counts');
+assert.equal(visibility.state.total, 7); assert.equal(visibility.state.currentArtifact.count, 50);
 
 // Slow A may complete after B; native cancellation prevents its late publication.
 const reverse = fixture();
@@ -239,10 +253,12 @@ assert.equal(ordinary.state.currentArtifact.path, 'C'); assert.equal(ordinary.na
 console.log('Latest source intents, clear ordering, deferred preparation, stale finalizers and committed cancellation passed');
 
 // Source-list discovery errors and late answers never erase newer known files.
-const listContext = vm.createContext({ state:{filters:[],quick:''}, structuredClone, history:[], sourceList:[{path:'C'}], cacheKey:'', overview:null, previousSelection:null, lastFilters:'', key:'C', sourceKey:()=>listContext.key, updateCounts(){}, api:async()=>{throw Error('temporary list failure');} });
+let visibilityRefreshes = 0;
+const listContext = vm.createContext({ window:{ExclusionVisibility:{refresh(){visibilityRefreshes++;}}}, state:{filters:[],quick:''}, structuredClone, history:[], sourceList:[{path:'C'}], cacheKey:'', overview:null, previousSelection:null, lastFilters:'', key:'C', sourceKey:()=>listContext.key, updateCounts(){}, api:async()=>{throw Error('temporary list failure');} });
 vm.runInContext(workspace.slice(workspace.indexOf('  async function loaded()'),workspace.indexOf('  async function saveFinding(')),listContext);
 await listContext.loaded();assert.equal(listContext.sourceList[0].path,'C');
 let releaseList;listContext.api=()=>new Promise(resolve=>{releaseList=resolve;});
 const slowList=listContext.loaded();listContext.key='D';listContext.sourceList=[{path:'D'}];releaseList([{path:'C'}]);await slowList;
 assert.equal(listContext.sourceList[0].path,'D');
+assert.equal(visibilityRefreshes,2,'source metadata refresh requests a new admitted exclusion status');
 console.log('Receipt reconciliation, failed imports, and retained source-list generations passed');

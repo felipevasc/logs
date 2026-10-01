@@ -119,6 +119,8 @@ window.AnalysisContexts = (() => {
   }
   async function ensureDefinitions(owner) {
     const key = definitionOwnerKey(owner);
+    // Legacy null admission has no proved Case configuration. Never borrow a global list.
+    if (!owner.identity) { definitionsLoaded(owner, []); return; }
     if (definitionKey === key && !state.analysisDefinitionsPending) return;
     const requestKey = JSON.stringify([key, owner.identity, owner.sourceKey]);
     let request = definitions.get(requestKey);
@@ -137,7 +139,7 @@ window.AnalysisContexts = (() => {
   function definitionsLoaded(owner, fields) {
     assertOwner(owner);
     if (!Array.isArray(fields)) throw new Error("Lista de campos do Caso inválida.");
-    state.derivedFields = fields; state.analysisDefinitionsPending = false;
+    state.derivedFields = owner.identity ? fields : []; state.analysisDefinitionsPending = false;
     definitionKey = definitionOwnerKey(owner); activeDefinitionOwner = definitionKey;
   }
   async function receipt(result, owner) {

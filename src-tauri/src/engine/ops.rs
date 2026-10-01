@@ -192,6 +192,7 @@ fn resolve_free(session: &Session, src: &Source, sql: &str, tests: &Tests) -> Re
 }
 
 fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexField) -> Result<Option<Arc<Selection>>> {
+    let gate = crate::analysis_runtime::indexed_gate(src.idx)?;
     // A selective lookup must not replace cheap vectorized filtering with an
     // unbounded amount of record hydration. Dense terms retain native SQL.
     const LIMIT: usize = 4_096;
@@ -202,6 +203,7 @@ fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexFi
     let mut confirmed = Vec::with_capacity(candidates.len());
     for id in candidates {
         crate::operations::check()?;
+        if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
         if crate::query::matches(&src.event(id), filter) { confirmed.push(id); }
     }
     let selected = selection(session, &confirmed)?;
@@ -210,6 +212,7 @@ fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexFi
 }
 
 fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) -> Result<Option<Arc<Selection>>> {
+    let gate = crate::analysis_runtime::indexed_gate(src.idx)?;
     let needle = &term.needle;
     let key = format!("free-v2#{needle}");
     if let Some(found) = session.cached_selection(&key) {
@@ -233,6 +236,7 @@ fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) 
         let mut confirmed = Vec::with_capacity(candidates.len());
         for id in candidates {
             crate::operations::check()?;
+            if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
             let event = src.event(id);
             if crate::querylang::any_value(&event, &|value| {
                 crate::query::ci_contains_bytes(value.as_bytes(), needle.as_bytes())
@@ -333,7 +337,7 @@ fn read_ids(session: &Session, sql: &str) -> Result<Vec<usize>> {
 /// The all-ID API is explicitly bounded; analytics and callbacks use the
 /// database selection/stream instead of collecting this result.
 fn matching_ids(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Vec<usize>> {
-    if pfs.is_empty() { crate::query::check_collected_ids(src.idx.lines.len())?; }
+    if pfs.is_empty() { crate::query::check_collected_ids(crate::analysis_runtime::visible_total(src.idx)?)?; }
     let scope = scope(session, src, pfs)?;
     read_ids(session, &format!("SELECT id FROM {} WHERE {} ORDER BY id", scope.from(false), scope.cond))
 }
@@ -360,9 +364,22 @@ fn cacheable_filters(pfs: &[PreparedFilter]) -> bool {
     pfs.iter().all(|pf| !matches!(pf.f.op.as_str(), "detection" | "threat_rule") && pf.expr.as_ref().is_none_or(stable))
 }
 
+/// Mandatory visibility is independent of the user predicate and of whether
+/// that predicate was compiled exactly or recovered through a selection table.
+fn visible_sql(src: &Source, sql: String, tests: &mut Tests) -> Result<String> {
+    let Some(gate) = crate::analysis_runtime::indexed_gate(src.idx)? else { return Ok(sql); };
+    if gate.is_unrestricted() { return Ok(sql); }
+    let predicate = tests.row("id", Arc::new(move |id| {
+        let id = usize::try_from(id).map_err(|_| "Identidade de linha negativa na visibilidade.".to_string())?;
+        gate.allows(id)
+    }));
+    Ok(format!("({sql}) AND ({predicate})"))
+}
+
 fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Scope<'s>> {
-    let plan = session.schema.plan(pfs);
+    let mut plan = session.schema.plan(pfs);
     let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    let sql = visible_sql(src, sql, &mut plan.tests)?;
     if plan.exact() && !costly(&sql) {
         return Ok(Scope {
             session,
@@ -382,16 +399,16 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
     if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
         return Ok(Scope {
             session,
-            cond: found.predicate(),
+            cond: visible_sql(src, found.predicate(), &mut plan.tests)?,
             names: false,
-            _tests: Tests::default(),
+            _tests: plan.tests,
             _selection: Some(found),
             _free: Vec::new(),
         });
     }
     let _build = key.as_deref().map(|key| session.begin_selection(key)).transpose()?;
     if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
-        return Ok(Scope { session, cond: found.predicate(), names: false, _tests: Tests::default(), _selection: Some(found), _free: Vec::new() });
+        return Ok(Scope { session, cond: visible_sql(src, found.predicate(), &mut plan.tests)?, names: false, _tests: plan.tests, _selection: Some(found), _free: Vec::new() });
     }
     let selection = if plan.exact() {
         let from = if plan.names || free_names { "evn" } else { "ev" };
@@ -417,9 +434,10 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
 /// A page must not first materialize every match to populate an analytics
 /// cache. Non-exact predicates are verified in bounded sorted batches below.
 fn page_scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<(Scope<'s>, bool)> {
-    let plan = session.schema.plan(pfs);
+    let mut plan = session.schema.plan(pfs);
     let exact = plan.exact();
     let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    let sql = visible_sql(src, sql, &mut plan.tests)?;
     Ok((Scope { session, cond: sql, names: plan.names || free_names, _tests: plan.tests, _selection: None, _free: free }, exact))
 }
 
@@ -511,7 +529,7 @@ fn verified_selection(session: &Session, src: &Source, pfs: &[PreparedFilter], p
         // Arrow's Iterator::next panics on a late fetch error. Start streaming,
         // then use the public fallible step API so no partial result is cached.
         drop(stmt.stream_arrow([]).map_err(err)?);
-        let verifier = crate::query::CandidateVerifier::new(src.idx, pfs, &plan.lines, &plan.verify, src.codes, src.system, src.derived);
+        let verifier = crate::query::CandidateVerifier::new(src.idx, pfs, &plan.lines, &plan.verify, src.codes, src.system, src.derived)?;
         let cancellation = crate::operations::current_token();
         let mut appender = writer.appender(&selection.name).map_err(err)?;
         let mut examined = 0usize;
@@ -1055,11 +1073,34 @@ pub(crate) fn visit_matches(src: &Source, pfs: &[PreparedFilter], visit: impl Fn
     })
 }
 
+/// Stream exactly matching global row IDs without materializing a selection
+/// table or formatting Events. None means unavailable/residual capability, never
+/// an execution/cancellation/visibility failure.
+pub(crate) fn visit_exact_matches(src: &Source, pfs: &[PreparedFilter], visit: impl FnMut(usize) -> Result<bool>) -> Result<Option<()>> {
+    Ok(analytics_with(src, base_page_safe(pfs, ""), |session| {
+        if !session.schema.plan(pfs).exact() { return Ok(None); }
+        let (scope, exact) = page_scope(session, src, pfs)?;
+        if !exact { return Ok(None); }
+        visit_ids(session, &format!("SELECT id FROM {} WHERE {} ORDER BY id", scope.from(false), scope.cond), visit)?;
+        Ok(Some(()))
+    })?.flatten())
+}
+
 fn count_session(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<usize> {
+    if pfs.is_empty() {
+        crate::operations::check()?;
+        // The admitted gate already counts exact visible positional rows. Its
+        // accessor validates source/payload leases before this scan-free return.
+        if let Some(gate) = crate::analysis_runtime::indexed_gate(src.idx)? {
+            return Ok(gate.visible_count());
+        }
+    }
+    if crate::analysis_runtime::visibility_unrestricted(src.idx)? {
     if let (Some(predicate), Some(readers)) = (super::time_index::predicate(pfs), session.exact_time_indexes()) {
         crate::operations::progress("analytics-time-index", "Lendo resumo temporal verificado", 0, 0, 0);
         if let Some(total) = super::time_index::count(&readers, &predicate)? { return Ok(total); }
         session.invalidate_exact_times(&readers)?;
+    }
     }
     let scope = scope(session, src, pfs)?;
     let counted = rows(
@@ -1127,10 +1168,12 @@ fn stats_of(scope: &Scope) -> Result<Stats> {
 }
 
 fn stats_session(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Stats> {
+    if crate::analysis_runtime::visibility_unrestricted(src.idx)? {
     if let (Some(predicate), Some(readers)) = (super::time_index::predicate(pfs), session.exact_time_indexes()) {
         crate::operations::progress("analytics-time-index", "Lendo resumo temporal verificado", 0, 0, 0);
         if let Some(stats) = super::time_index::stats(&readers, &predicate)? { return Ok(stats); }
         session.invalidate_exact_times(&readers)?;
+    }
     }
     stats_of(&scope(session, src, pfs)?)
 }
@@ -1150,6 +1193,7 @@ fn timeline_session(session: &Session, start: i64, end: i64, width: i64, buckets
 /// Optional exact acceleration for the unfiltered indexed timeline. Callers
 /// retain their existing source scan when no complete verified capability exists.
 pub(crate) fn timeline_histogram(src: &Source, start: i64, end: i64, width: i64, buckets: usize) -> Result<Option<super::time_index::Histogram>> {
+    if !crate::analysis_runtime::visibility_unrestricted(src.idx)? { return Ok(None); }
     Ok(analytics_with(src, true, |session| timeline_session(session, start, end, width, buckets))?.flatten())
 }
 
@@ -1201,6 +1245,144 @@ mod exact_time_routing_tests {
     }
     fn filters(value: Value) -> Vec<PreparedFilter> {
         prepared(&serde_json::from_value::<Vec<crate::query::Filter>>(value).unwrap())
+    }
+
+    #[test]
+    fn admitted_mask_answers_empty_count_without_sql_but_rejects_corrupted_membership() {
+        use crate::{
+            analysis_context::Snapshot,
+            analysis_runtime::{self, Mode},
+            exclusion_store::{self, Admission, Purpose, Work},
+            source_publication, AppState, SourceData,
+        };
+        struct Environment(Option<std::ffi::OsString>);
+        impl Drop for Environment {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("LOGINSIGHT_DATA_DIR", value),
+                    None => std::env::remove_var("LOGINSIGHT_DATA_DIR"),
+                }
+            }
+        }
+        let (directory, session, _, _) = fixture();
+        let _environment = Environment(std::env::var_os("LOGINSIGHT_DATA_DIR"));
+        std::env::set_var("LOGINSIGHT_DATA_DIR", directory.path());
+        crate::case_store::save_at(directory.path(), json!({"cases":[{"id":"a"}]})).unwrap();
+        let initial: Snapshot = serde_json::from_value(
+            crate::case_store::load_at(directory.path()).unwrap()["cases"][0]["analysisContext"]
+                .clone(),
+        )
+        .unwrap();
+        let raw = directory.path().join("source.jsonl");
+        std::fs::write(
+            &raw,
+            "{\"message\":\"one\"}\n{\"message\":\"two\"}\n{\"message\":\"three\"}\n",
+        )
+        .unwrap();
+        let index =
+            crate::sources::index_file(raw.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let state = AppState {
+            source: RwLock::new(SourceData::None),
+            source_publication: RwLock::new(Default::default()),
+            source_names: RwLock::new(Vec::new()),
+            codes: RwLock::new(Default::default()),
+            system_codes: RwLock::new(Default::default()),
+            derived: RwLock::new(Vec::new()),
+            case_store_lock: Mutex::new(()),
+            codes_path: Default::default(),
+            system_codes_path: Default::default(),
+        };
+        let owner = analysis_runtime::capture(&state, Some(initial.identity()), Some(0), Mode::Publish)
+            .unwrap();
+        analysis_runtime::with(Some(owner), || {
+            source_publication::publish(&state, index, vec!["fixture".into()], vec![], false)
+        })
+        .unwrap();
+        let work = Work {
+            cancelled: &|| false,
+            progress: &|_, _, _| {},
+        };
+        let staged = {
+            let source = state.source.read();
+            let SourceData::Indexed(index) = &*source else {
+                panic!()
+            };
+            let binding = crate::analysis_visibility::SourceSet::new(index).unwrap();
+            exclusion_store::stage(
+                directory.path(),
+                Admission {
+                    analysis: initial.identity(),
+                    source_receipt: json!({}),
+                },
+                Purpose::Exclude,
+                binding.descriptors(),
+                [binding.member_row(index, 1, &Default::default())],
+                &Default::default(),
+                &work,
+            )
+            .unwrap()
+        };
+        let receipt = exclusion_store::publish(
+            directory.path(),
+            staged,
+            "fixture",
+            "",
+            json!({}),
+            &Default::default(),
+            &work,
+        )
+        .unwrap();
+        let admitted = analysis_runtime::capture(
+            &state,
+            Some(receipt.analysis_context.identity()),
+            Some(source_publication::receipt_locked(&state).generation),
+            Mode::Dataset,
+        )
+        .unwrap();
+        admitted.validate(&state).unwrap();
+        admitted.prepare_visibility(None).unwrap();
+        session
+            .conn()
+            .unwrap()
+            .execute_batch("DROP TABLE ev")
+            .unwrap();
+        analysis_runtime::with(Some(admitted), || {
+            let captured = analysis_runtime::source(&state);
+            let SourceData::Indexed(index) = &*captured else {
+                panic!()
+            };
+            let codes = CodesConfig::default();
+            let source = Source {
+                idx: index,
+                codes: &codes,
+                system: &codes,
+                derived: &[],
+            };
+            assert_eq!(count_session(&session, &source, &[]).unwrap(), 2);
+            assert!(count_session(
+                &session,
+                &source,
+                &filters(json!([{"column":"source","op":"equals_exact","value":"other"}]))
+            )
+            .is_err());
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(
+                    directory
+                        .path()
+                        .join("exclusions-v1")
+                        .join(format!("{}.sqlite3", receipt.batch_id)),
+                )
+                .unwrap();
+            file.write_all(b"changed").unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            assert!(
+                count_session(&session, &source, &[]).is_err(),
+                "a cached count must not bypass membership integrity"
+            );
+        });
     }
 
     #[test]
@@ -1924,6 +2106,7 @@ fn page_fingerprint(src: &Source, pfs: &[PreparedFilter], sort_column: &str, sor
     let filters: Vec<_> = pfs.iter().map(|pf| &pf.f).collect();
     let mut hash = Sha256::new();
     hash.update(source_key);
+    hash.update(crate::analysis_runtime::cache_namespace());
     hash.update(super::catalogs_signature(src.codes, src.system));
     hash.update(serde_json::to_vec(&(filters, sort_column, sort_dir)).map_err(err)?);
     Ok(format!("{:x}", hash.finalize()))
@@ -1969,15 +2152,17 @@ fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) ->
     if !pfs.iter().any(|pf| pf.f.op == "equals_exact" && super::text::exact_field_hex_word(&pf.f.value).is_some()) {
         return Ok(None);
     }
+    let gate = crate::analysis_runtime::indexed_gate(src.idx)?;
     let plan = session.schema.plan(pfs);
     for term in &plan.tests.hex_fields {
         let Some(selected) = exact_hex_selection(session, src, term)? else { continue; };
         if !selected.known_empty && selected.single_id.is_none() { continue; }
         let mut rows = Vec::new();
-        if let Some(id) = selected.single_id {
+        if let Some(id) = selected.single_id.filter(|&id| gate.as_ref().is_none_or(|gate| gate.allows_known_row(id))) {
             crate::operations::check()?;
             let mut event = src.event(id);
             if pfs.iter().all(|pf| crate::query::matches(&event, pf)) {
+                crate::analysis_runtime::attach_provenance(src.idx, &mut event)?;
                 crate::entities::annotate(&mut event);
                 event.raw.clear();
                 rows.push(event);
@@ -2059,10 +2244,10 @@ pub(crate) fn query_page(
         let next_cursor = if has_more {
             found.last().map(|(_, keys)| serde_json::to_string(&PageCursor { version: 1, fingerprint, position: position.saturating_add(found.len()), keys: keys.clone() }).map_err(err)).transpose()?
         } else { None };
-        let total = if pfs.is_empty() { Some(src.idx.lines.len()) }
+        let total = if pfs.is_empty() { Some(crate::analysis_runtime::visible_total(src.idx)?) }
             else if !has_more && (position == 0 || !found.is_empty()) { Some(position.saturating_add(found.len())) }
             else { None };
-        let rows = page_rows(src, found.into_iter().map(|(id, _)| id).collect());
+        let rows = page_rows(src, found.into_iter().map(|(id, _)| id).collect())?;
         crate::operations::check()?;
         Ok(crate::query::QueryPage {
             rows, total, has_more, next_cursor, engine: "columnar".into(),
@@ -2157,13 +2342,15 @@ fn page_ids(scope: &Scope, sort_column: &str, sort_dir: &str, offset: usize, lim
 }
 
 /// Rows of a page, read in parallel (pages of trails reach thousands).
-fn page_rows(src: &Source, ids: Vec<usize>) -> Vec<Event> {
+fn page_rows(src: &Source, ids: Vec<usize>) -> Result<Vec<Event>> {
+    let binding = crate::analysis_runtime::source_set(src.idx)?;
     ids.into_par_iter()
         .map(|i| {
             let mut event = src.event(i);
+            crate::analysis_runtime::attach_provenance_with(src.idx, &binding, &mut event)?;
             crate::entities::annotate(&mut event);
             event.raw.clear();
-            event
+            Ok(event)
         })
         .collect()
 }
@@ -2181,7 +2368,7 @@ pub(crate) fn query(
         let (total, ids) = page_ids(&scope, sort_column, sort_dir, offset, limit)?;
         Ok(QueryResult {
             total,
-            rows: page_rows(src, ids),
+            rows: page_rows(src, ids)?,
         })
     })
 }
@@ -2205,7 +2392,7 @@ pub(crate) fn explore(
         Ok(ExplorerSnapshot {
             query: QueryResult {
                 total,
-                rows: page_rows(src, ids),
+                rows: page_rows(src, ids)?,
             },
             stats,
             sources,

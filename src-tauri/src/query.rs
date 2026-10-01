@@ -346,10 +346,11 @@ pub(crate) fn count_memory(events: &[Event], filters: &[Filter]) -> usize {
     events.iter().take_while(|_| !crate::operations::cancelled()).filter(|event| pfs.iter().all(|pf| matches(event, pf))).count()
 }
 
-pub(crate) fn count_lines(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> usize {
+pub(crate) fn count_lines(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> Result<usize, String> {
+    if filters.is_empty() { return crate::analysis_runtime::visible_total(idx); }
     let mut count = 0usize;
-    scan_indexed(idx, &prepare(filters), codes, system, derived, |_, _, _| (), |()| count += 1);
-    count
+    scan_indexed(idx, &prepare(filters), codes, system, derived, |_, _, _| (), |()| count += 1)?;
+    Ok(count)
 }
 
 pub fn sort_indices(events: &[Event], indices: &mut [usize], column: &str, desc: bool) {
@@ -743,11 +744,17 @@ pub(crate) fn event_payload_bytes(event: &Event) -> usize {
     [&event.event_ref, &event.parse_status, &event.source, &event.level, &event.code, &event.name, &event.description, &event.message, &event.raw]
         .iter().fold(std::mem::size_of::<Event>(), |n, v| n.saturating_add(v.len()))
         .saturating_add(event.fields.iter().fold(0usize, |n, (k, v)| n.saturating_add(k.len()).saturating_add(64).saturating_add(value_bytes(v))))
+        .saturating_add(event.evidence_provenance.as_ref().map_or(0, |proof| {
+            proof.source.version.len().saturating_add(proof.source.record_space.len()).saturating_add(proof.source.label.len())
+                .saturating_add(proof.source.event_ref_prefix.as_ref().map_or(0, String::len))
+                .saturating_add(match &proof.locator { crate::exclusion_store::Locator::StableRecord(key) => key.len(), _ => 0 }).saturating_add(128)
+        }))
 }
 pub fn indexed_matches(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> Result<Vec<usize>, String> {
     if filters.is_empty() {
-        check_collected_ids(idx.lines.len())?;
-        return Ok((0..idx.lines.len()).collect());
+        let gate = crate::analysis_runtime::indexed_gate(idx)?;
+        check_collected_ids(gate.as_ref().map_or(idx.lines.len(), |gate| gate.visible_count()))?;
+        return Ok((0..idx.lines.len()).filter(|&id| gate.as_ref().is_none_or(|gate| gate.allows_known_row(id))).collect());
     }
     let pfs = prepare(filters);
     if let Some(ids) = crate::engine::matches(&engine_source(idx, codes, system, derived), &pfs)? { return Ok(ids); }
@@ -756,7 +763,7 @@ pub fn indexed_matches(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig,
     scan_indexed_control(idx, &pfs, codes, system, derived, |i, _, _| i, |i| {
         if let Err(e) = push_collected_id(&mut ids, i) { error = Some(e); return false; }
         true
-    });
+    })?;
     if let Some(error) = error { return Err(error); }
     crate::operations::check()?;
     Ok(ids)
@@ -823,8 +830,8 @@ pub(crate) fn scan_indexed<T: Send>(
     derived: &[CompiledDerived],
     map: impl Fn(usize, &LineMeta, Option<Event>) -> T + Sync,
     mut visit: impl FnMut(T),
-) {
-    scan_indexed_control(idx, pfs, codes, system, derived, map, |item| { visit(item); true });
+) -> Result<(), String> {
+    scan_indexed_control(idx, pfs, codes, system, derived, map, |item| { visit(item); true })
 }
 
 fn scan_indexed_control<T: Send>(
@@ -835,7 +842,8 @@ fn scan_indexed_control<T: Send>(
     derived: &[CompiledDerived],
     map: impl Fn(usize, &LineMeta, Option<Event>) -> T + Sync,
     mut visit: impl FnMut(T) -> bool,
-) {
+) -> Result<(), String> {
+    let gate = crate::analysis_runtime::indexed_gate(idx)?;
     let enriched: Vec<bool> = pfs
         .iter()
         .map(|pf| query_needs_enrichment(pf, codes, system, derived))
@@ -847,6 +855,7 @@ fn scan_indexed_control<T: Send>(
             if (i - from) % 2048 == 0 && cancellation.cancelled() {
                 break;
             }
+            if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(i)) { continue; }
             let meta = &idx.lines.at(i);
             let line = line_bytes(idx, i);
             let mut need = false;
@@ -898,11 +907,12 @@ fn scan_indexed_control<T: Send>(
             .collect();
         for part in parts {
             for item in part {
-                if !visit(item) { return; }
+                if !visit(item) { return crate::operations::check(); }
             }
         }
         start = end;
     }
+    crate::operations::check()
 }
 
 pub(crate) fn visit_indexed_prepared(idx: &FileIndex, pfs: &[PreparedFilter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], mut visit: impl FnMut(usize)) -> Result<(), String> {
@@ -910,9 +920,11 @@ pub(crate) fn visit_indexed_prepared(idx: &FileIndex, pfs: &[PreparedFilter], co
 }
 
 pub(crate) fn visit_indexed_prepared_control(idx: &FileIndex, pfs: &[PreparedFilter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], mut visit: impl FnMut(usize) -> Result<bool, String>) -> Result<(), String> {
+    let gate = crate::analysis_runtime::indexed_gate(idx)?;
     if pfs.is_empty() {
         for id in 0..idx.lines.len() {
             if id % 2048 == 0 { crate::operations::check()?; }
+            if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
             if !visit(id)? { break; }
         }
         return crate::operations::check();
@@ -922,7 +934,7 @@ pub(crate) fn visit_indexed_prepared_control(idx: &FileIndex, pfs: &[PreparedFil
     scan_indexed_control(idx, pfs, codes, system, derived, |i, _, _| i, |id| match visit(id) {
         Ok(keep) => keep,
         Err(error) => { failure = Some(error); false }
-    });
+    })?;
     if let Some(error) = failure { return Err(error); }
     crate::operations::check()
 }
@@ -957,6 +969,7 @@ fn query_needs_enrichment(
 /// unrelated rows. SQL already checked exact predicates; only residual tests
 /// belong here. A candidate is hydrated at most once, even with several tests.
 pub(crate) struct CandidateVerifier<'a> {
+    visibility: Option<std::sync::Arc<crate::analysis_runtime::RowGate>>,
     idx: &'a FileIndex,
     pfs: &'a [PreparedFilter],
     lines: Vec<(usize, bool)>,
@@ -966,10 +979,11 @@ pub(crate) struct CandidateVerifier<'a> {
     derived: &'a [CompiledDerived],
 }
 impl<'a> CandidateVerifier<'a> {
-    pub(crate) fn new(idx: &'a FileIndex, pfs: &'a [PreparedFilter], lines: &[usize], verify: &'a [usize], codes: &'a CodesConfig, system: &'a CodesConfig, derived: &'a [CompiledDerived]) -> Self {
-        Self { idx, pfs, lines: lines.iter().map(|&i| (i, query_needs_enrichment(&pfs[i], codes, system, derived))).collect(), verify, codes, system, derived }
+    pub(crate) fn new(idx: &'a FileIndex, pfs: &'a [PreparedFilter], lines: &[usize], verify: &'a [usize], codes: &'a CodesConfig, system: &'a CodesConfig, derived: &'a [CompiledDerived]) -> Result<Self, String> {
+        Ok(Self { visibility: crate::analysis_runtime::indexed_gate(idx)?, idx, pfs, lines: lines.iter().map(|&i| (i, query_needs_enrichment(&pfs[i], codes, system, derived))).collect(), verify, codes, system, derived })
     }
     pub(crate) fn matches(&self, id: usize) -> bool {
+        if self.visibility.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { return false; }
         let meta = &self.idx.lines.at(id);
         let raw = line_bytes(self.idx, id);
         let mut event = None;
@@ -1013,7 +1027,7 @@ pub fn query_indexed(
         return Ok(result);
     }
     let page = query_page_lines(idx, filters, sort_column, sort_dir, offset, limit, codes, system, derived)?;
-    let total = count_lines(idx, filters, codes, system, derived);
+    let total = count_lines(idx, filters, codes, system, derived)?;
     crate::operations::check()?;
     Ok(QueryResult { total, rows: page.rows })
 }
@@ -1091,12 +1105,14 @@ pub(crate) fn query_page_lines(
     if keep > WINDOW {
         return Err("Navegação profunda aguarda o índice de consultas. Reduza o recorte ou conclua/repare a preparação.".into());
     }
+    let gate = crate::analysis_runtime::indexed_gate(idx)?;
     let pfs = prepare(filters);
     let enriched: Vec<_> = pfs.iter().map(|pf| query_needs_enrichment(pf, codes, system, derived)).collect();
     let mut selected: std::collections::BinaryHeap<RecoveryRow> = std::collections::BinaryHeap::new();
     let (mut total, mut bytes) = (0usize, 0usize);
     for i in 0..idx.lines.len() {
         if i % 2048 == 0 { crate::operations::check()?; }
+        if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(i)) { continue; }
         let meta = &idx.lines.at(i);
         let line = line_bytes(idx, i);
         let mut needs_event = false;
@@ -1132,12 +1148,14 @@ pub(crate) fn query_page_lines(
         }
     }
     crate::operations::check()?;
+    let binding = crate::analysis_runtime::source_set(idx)?;
     let rows = selected.into_sorted_vec().into_iter().skip(offset).take(limit).map(|row| {
         let mut event = event_at(idx, row.id, codes, system, derived);
+        crate::analysis_runtime::attach_provenance_with(idx, &binding, &mut event)?;
         crate::entities::annotate(&mut event);
         event.raw.clear();
-        event
-    }).collect();
+        Ok(event)
+    }).collect::<Result<Vec<_>, String>>()?;
     Ok(QueryPage::from_exact(QueryResult { total, rows }, offset, "lines", Some(
         "Modo de recuperação: índice indisponível, leitura mais lenta e navegação limitada a 10 mil registros.".into(),
     )))
@@ -1638,7 +1656,7 @@ pub fn aggregate_indexed(
     let meta_only = is_meta_column(group_column) && specs.iter().all(|s| is_meta_column(&s.column));
     let mut failure = None;
     let exceeded = std::sync::atomic::AtomicBool::new(false);
-    scan_indexed(idx, &prepare(filters), codes, system, derived, |i, _, event| {
+    let scan = scan_indexed(idx, &prepare(filters), codes, system, derived, |i, _, event| {
         if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return None; }
         Some(if meta_only { meta_event(idx, i) } else { event.unwrap_or_else(|| event_at(idx, i, codes, system, derived)) })
     }, |event| {
@@ -1648,6 +1666,7 @@ pub fn aggregate_indexed(
             if groups.len() > group_budget(specs) { exceeded.store(true, std::sync::atomic::Ordering::Relaxed); }
         }
     });
+    if let Err(error) = scan { return AggResult::failure(error); }
     if let Some(error) = failure { return AggResult::failure(error); }
     if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return AggResult::budget_error(); }
     build_agg_result(groups, order, group_column, specs)
@@ -1788,7 +1807,7 @@ pub fn stats_indexed(
             *levels.entry(level).or_default() += 1;
             if ts != 0 { min_ts = min_ts.min(ts); max_ts = max_ts.max(ts); }
         },
-    );
+    )?;
     let (mut buckets, mut bucket_ms) = (Vec::new(), 0);
     if min_ts <= max_ts && !crate::operations::cancelled() {
         let count;
@@ -1799,7 +1818,7 @@ pub fn stats_indexed(
                 let bucket = (ts.saturating_sub(min_ts) / bucket_ms) as usize;
                 counts[bucket.min(count - 1)] += 1;
             }
-        });
+        })?;
         buckets = counts.into_iter().enumerate().map(|(i, n)| (min_ts.saturating_add((i as i64).saturating_mul(bucket_ms)), n)).collect();
     }
     let mut levels: Vec<_> = levels.into_iter().map(|(key, n)| (key.to_string(), n)).collect();

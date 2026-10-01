@@ -196,7 +196,7 @@ pub async fn timeline_lanes(
     app: AppHandle,
 ) -> Result<Lanes, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || {
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         lanes_impl(
             app.state::<AppState>().inner(),
             filters,
@@ -341,7 +341,7 @@ pub async fn entity_summary(
     app: AppHandle,
 ) -> Result<Vec<EntityGroup>, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(None, app.clone(), admitted, move || {
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         entity_summary_impl(app.state::<AppState>().inner(), filters, limit.unwrap_or(50), case_events.as_deref())
     })
     .await?

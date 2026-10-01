@@ -411,3 +411,14 @@ test('event diagnostics show bounded errors and the mandatory JWT warning withou
   assert.equal(f.calls.length, 0, 'opening diagnostics adds no backend work');
   assert.equal(event.derived_diagnostics[0].message.length, 1008, 'original diagnostic stays intact');
 });
+
+
+test('preview samples honor canonical Event columns ahead of custom shadows', async () => {
+  const event={id:7,timestamp:1000,message:'canonical message',level:'Informação',fields:{message:'shadow message',level:'shadow level',timestamp:'shadow timestamp',custom:null}};
+  const f=fixture({event});f.editor.open('message');await f.editor.preview();
+  assert.equal(f.calls.at(-1).args.value,'canonical message');
+  assert.equal(f.editor.rawValue(event,'level'),'Informação');
+  assert.equal(f.editor.rawValue(event,'timestamp'),'1970-01-01T00:00:01+00:00');
+  assert.equal(f.editor.rawValue(event,'custom'),null);
+  assert.equal(event.fields.message,'shadow message','custom source values remain untouched');
+});

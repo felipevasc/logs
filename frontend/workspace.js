@@ -380,6 +380,7 @@
   }
   async function loaded() {
     cacheKey = ""; overview = null;
+    void window.ExclusionVisibility?.refresh();
     history.length = 0; previousSelection = { filters: structuredClone(state.filters), quick: state.quick }; lastFilters = JSON.stringify(previousSelection);
     const contextKey = sourceKey();
     try {
@@ -481,7 +482,7 @@
     $("#ws-evidence-advanced").after(importButton);
     importButton.onclick = async () => {
       try {
-        const path = await dialogApi.open({ multiple: false, filters: [{ name: "Investigação", extensions: ["json"] }] });
+        const path = await dialogApi.open({ multiple: false, filters: [{ name: "Investigação", extensions: ["licase", "json"] }] });
         if (!path) return;
         const data = normalizeCaseStore(await api("import_investigation", { path }));
         for (const c of data.cases) { if (state.cases.cases.some(saved => saved.id === c.id)) c.id = nid(); clearVisiblePreferences([c.id]); state.cases.cases.push(c); }
@@ -507,8 +508,9 @@
   async function exportFile() {
     const kind = $("#ws-export-kind").value, mask = $("#ws-mask").checked;
     if (kind === "case-pdf") { $("#ws-export-modal").hidden = true; window.CaseReport.open(); return; }
-    const extension = kind === "report" ? "md" : kind === "case" ? "json" : kind;
-    const path = await dialogApi.save({ defaultPath: `loginsight.${extension}`, filters: [{ name: extension.toUpperCase(), extensions: [extension] }] });
+    const extension = kind === "report" ? "md" : kind === "case" ? "licase" : kind;
+    const filters = kind === "case" ? [{ name: "Investigação portátil", extensions: ["licase"] }, { name: "JSON legado · sem exclusões", extensions: ["json"] }] : [{ name: extension.toUpperCase(), extensions: [extension] }];
+    const path = await dialogApi.save({ defaultPath: `loginsight.${extension}`, filters });
     if (!path) return; const button = $("#ws-export-save"), restore = btnBusy(button, "Exportando…");
     try {
       if (kind === "report" || kind === "case") {

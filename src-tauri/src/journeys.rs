@@ -191,11 +191,13 @@ struct View<'a> {
     derived: &'a [CompiledDerived],
 }
 impl View<'_> {
-    fn fetch(&self, index: usize) -> Event {
+    fn fetch(&self, index: usize) -> Result<Event, String> {
         match self.records {
-            Records::Memory(events) => events[index].clone(),
+            Records::Memory(events) => Ok(events[index].clone()),
             Records::Indexed(file) => {
-                sources::event_at(file, index, self.codes, self.system, self.derived)
+                let mut event = sources::event_at(file, index, self.codes, self.system, self.derived);
+                crate::analysis_runtime::attach_provenance(file, &mut event)?;
+                Ok(event)
             }
             Records::Empty => unreachable!(),
         }
@@ -529,11 +531,11 @@ pub(crate) fn events_impl(
         let rows = ids
             .into_iter()
             .map(|i| {
-                let (row, clipped) = crate::event_preview::preview(&view.fetch(i as usize));
+                let (row, clipped) = crate::event_preview::preview(&view.fetch(i as usize)?);
                 rows_clipped += usize::from(clipped);
-                row
+                Ok(row)
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         operations::check()?;
         Ok(JourneyEvents {
             total,
@@ -558,7 +560,7 @@ pub async fn journey_fields(
     operation_id: Option<String>,
 ) -> Result<Vec<JourneyField>, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(operation_id, app.clone(), admitted, move || {
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         fields_impl(
             app.state::<AppState>().inner(),
             &filters,
@@ -585,7 +587,7 @@ pub async fn journey_index(
     operation_id: Option<String>,
 ) -> Result<JourneyIndex, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(operation_id, app.clone(), admitted, move || {
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let filters = window_filters(&field, filters, from, to)?;
         index_impl(
             app.state::<AppState>().inner(),
@@ -617,7 +619,7 @@ pub async fn journey_events(
     operation_id: Option<String>,
 ) -> Result<JourneyEvents, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    crate::offload_admitted(operation_id, app.clone(), admitted, move || {
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         events_impl(
             app.state::<AppState>().inner(),
             &filters,
