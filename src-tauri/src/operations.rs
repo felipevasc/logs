@@ -3,11 +3,13 @@
 //! operations add isolated tokens so cancelling one query never restarts others.
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+static UPDATE_PAUSED: AtomicBool = AtomicBool::new(false);
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static START: Cell<Option<u64>> = const { Cell::new(None) };
     static LOCAL: RefCell<Option<Arc<Local>>> = const { RefCell::new(None) };
@@ -134,6 +136,38 @@ impl Cancellation {
     pub(crate) fn with_stop(mut self, stop: Arc<AtomicBool>) -> Self { self.child_stops.push(stop); self }
 }
 
+/// The updater owns this reversible admission barrier until the installer
+/// takes over. Failure/timeout drops it and leaves the source usable.
+pub(crate) struct UpdatePause;
+impl Drop for UpdatePause {
+    fn drop(&mut self) {
+        let _registry = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+        UPDATE_PAUSED.store(false, Ordering::SeqCst);
+    }
+}
+pub(crate) fn update_paused() -> bool { UPDATE_PAUSED.load(Ordering::Acquire) }
+pub(crate) fn pause_for_update() -> Result<UpdatePause, String> {
+    let _registry = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+    if UPDATE_PAUSED.swap(true, Ordering::SeqCst) { return Err("Uma atualização já está preparando o encerramento.".into()); }
+    cancel();
+    Ok(UpdatePause)
+}
+pub(crate) fn update_work_active() -> bool {
+    let mut registry = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+    registry.live.retain(|_, token| token.strong_count() > 0);
+    !registry.live.is_empty() || RUNNING.load(Ordering::Acquire) != 0
+}
+struct RunningOperation;
+impl Drop for RunningOperation {
+    fn drop(&mut self) { RUNNING.fetch_sub(1, Ordering::Release); }
+}
+fn admit_running() -> Result<RunningOperation, String> {
+    let _registry = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+    if update_paused() { return Err("Atualização em preparação; aguarde ou tente novamente após o aviso.".into()); }
+    RUNNING.fetch_add(1, Ordering::AcqRel);
+    Ok(RunningOperation)
+}
+
 /// Register before queueing blocking work. Tauri can dispatch its async
 /// command future after a synchronous cancel_task request, so consume an
 /// early cancellation before allowing that future to queue work. The bounded
@@ -147,6 +181,7 @@ pub(crate) fn token(id: Option<String>) -> Result<Cancellation, String> {
         return Err("Identificador de operação inválido.".into());
     }
     let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+    if update_paused() { return Err("Atualização em preparação; aguarde ou tente novamente após o aviso.".into()); }
     named.live.retain(|_, token| token.strong_count() > 0);
     if named.live.get(&id).and_then(Weak::upgrade).is_some() {
         return Err("Identificador de operação já está em uso.".into());
@@ -229,6 +264,7 @@ pub fn commit() {
     CHILD_STOPS.with(|s| s.borrow_mut().clear());
 }
 pub(crate) fn run_with_token<T>(token: Cancellation, f: impl FnOnce() -> T) -> Result<T, String> {
+    let _running = admit_running()?;
     struct Reset(Option<u64>, Option<Arc<Local>>, Option<String>, Option<Reporter>, Option<Instant>, Option<Arc<Mutex<PhaseClock>>>, Vec<Arc<AtomicBool>>);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -274,6 +310,32 @@ pub fn run<T>(generation: u64, f: impl FnOnce() -> T) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn update_pause_cancels_queued_work_blocks_new_admission_and_recovers() {
+        let queued = token(Some(format!("update-queued-{}", uuid::Uuid::new_v4()))).unwrap();
+        let pause = pause_for_update().unwrap();
+        assert!(queued.cancelled());
+        assert!(update_work_active(), "queued work is still owned until it settles");
+        assert!(token(None).is_err());
+        assert!(pause_for_update().is_err());
+        assert!(run_with_token(queued, || panic!("paused work must not start")).is_err());
+        assert!(!update_work_active());
+        drop(pause);
+        assert!(!update_paused());
+        assert_eq!(run_with_token(token(None).unwrap(), || 9).unwrap(), 9);
+    }
+
+    #[test]
+    fn update_wait_tracks_committed_finalization_and_panic_unwind() {
+        let result = std::panic::catch_unwind(|| run_with_token(token(None).unwrap(), || {
+            commit();
+            assert!(update_work_active(), "commit releases cancellation, not the running-work lease");
+            panic!("controlled operation panic");
+        }));
+        assert!(result.is_err());
+        assert!(!update_work_active(), "unwinding releases the running-work lease");
+    }
+
     #[test]
     fn named_cancellation_isolated_and_visible_to_workers() {
         let a = token(Some("isolated-a".into())).unwrap();

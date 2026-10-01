@@ -191,7 +191,7 @@ const SEGMENT_ROWS: usize = 1_000_000;
 const SEGMENT_BYTES: u64 = 256 << 20;
 
 fn segment_ranges(
-    lines: &[crate::model::LineMeta],
+    lines: &crate::metadata_store::LineStore,
     start: usize,
     end: usize,
 ) -> Vec<(usize, usize)> {
@@ -199,8 +199,8 @@ fn segment_ranges(
     let mut from = start;
     while from < end {
         let limit = (from + SEGMENT_ROWS).min(end);
-        let byte_end = lines[from].offset.saturating_add(SEGMENT_BYTES);
-        let count = lines[from..limit].partition_point(|line| line.offset < byte_end);
+        let byte_end = lines.at(from).offset.saturating_add(SEGMENT_BYTES);
+        let count = lines.range(from..limit).partition_point(|line| line.offset < byte_end);
         let to = (from + count.max(1)).min(limit);
         out.push((from, to));
         from = to;
@@ -250,8 +250,8 @@ fn spec(
         // Immutable record-aligned segments are independent recovery checkpoints.
         // Keep both row count and input bytes bounded, including very wide logs.
         for (from, to) in segment_ranges(&idx.lines, start, end) {
-            let first_offset = idx.lines[from].offset - part.base;
-            let last = &idx.lines[to - 1];
+            let first_offset = idx.lines.at(from).offset - part.base;
+            let last = &idx.lines.at(to - 1);
             let last_end = last.offset - part.base + u64::from(last.len);
             let mut hash = Sha256::new();
             hash.update(format!(
@@ -507,26 +507,27 @@ impl Session {
 
     /// Lines (sorted) whose free text may contain `needle`, through the
     /// inverted indexes; `None` when they cannot narrow the search.
-    pub(crate) fn free_candidates(&self, needle: &str, limit: usize) -> Option<Vec<usize>> {
-        if self.texts.is_empty() {
-            return None;
-        }
-        let mut out = Vec::new();
-        for (start, text) in &self.texts {
-            let lids = text.candidates(needle, limit.checked_sub(out.len())?)?;
-            out.extend(lids.into_iter().map(|lid| start + lid as usize));
-        }
-        Some(out)
+    pub(crate) fn free_candidates(&self, needle: &str, limit: usize) -> Result<Option<Vec<usize>>, String> {
+        self.text_candidates(limit, |text, remaining| text.candidates(needle, remaining))
     }
 
-    pub(crate) fn exact_hex_candidates(&self, value: &str, limit: usize) -> Option<Vec<usize>> {
-        if self.texts.is_empty() { return None; }
+    pub(crate) fn exact_hex_candidates(&self, value: &str, limit: usize) -> Result<Option<Vec<usize>>, String> {
+        self.text_candidates(limit, |text, remaining| text.exact_hex_candidates(value, remaining))
+    }
+
+    fn text_candidates(&self, limit: usize, mut probe: impl FnMut(&text::Text, usize) -> Option<Vec<u32>>) -> Result<Option<Vec<usize>>, String> {
+        crate::operations::check()?;
+        if self.texts.is_empty() { return Ok(None); }
         let mut out = Vec::new();
         for (start, text) in &self.texts {
-            let lids = text.exact_hex_candidates(value, limit.checked_sub(out.len())?)?;
+            crate::operations::check()?;
+            let candidates = probe(text, limit - out.len());
+            // A cancelled probe must not fall through to a full SQL scan.
+            crate::operations::check()?;
+            let Some(lids) = candidates else { return Ok(None) };
             out.extend(lids.into_iter().map(|lid| start + lid as usize));
         }
-        Some(out)
+        Ok(Some(out))
     }
 
     pub(crate) fn names_version(&self) -> u64 {
@@ -1130,6 +1131,7 @@ struct BackgroundQueue {
     state: Mutex<QueueState>,
     wake: parking_lot::Condvar,
     revision: AtomicU64,
+    running: AtomicBool,
 }
 
 static BACKGROUND_QUEUE: std::sync::OnceLock<Arc<BackgroundQueue>> = std::sync::OnceLock::new();
@@ -1162,6 +1164,28 @@ impl BackgroundQueue {
     }
 }
 
+/// Stop only this app's cooperative work. Never clear the loaded source,
+/// delete checkpoints, or terminate another process to install an update.
+pub(crate) fn prepare_for_update() -> Result<crate::operations::UpdatePause, String> {
+    let pause = crate::operations::pause_for_update()?;
+    if let Some(queue) = BACKGROUND_QUEUE.get() {
+        let mut state = queue.state.lock();
+        state.pending = None;
+        queue.revision.fetch_add(1, Ordering::SeqCst);
+        queue.wake.notify_all();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let building = with_registry(|reg| !reg.building.is_empty());
+        let background = BACKGROUND_QUEUE.get().is_some_and(|queue| queue.running.load(Ordering::Acquire));
+        if !building && !background && !crate::operations::update_work_active() { return Ok(pause); }
+        if std::time::Instant::now() >= deadline {
+            return Err("O trabalho em andamento ainda não confirmou o encerramento. A aplicação continua aberta; aguarde a tarefa terminar e tente instalar novamente.".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 fn supersedes(new: &RequestKey, current: &RequestKey) -> bool {
     new != current && !(new.source == current.source && !new.derived && current.derived)
 }
@@ -1174,11 +1198,13 @@ fn schedule(
     codes: &CodesConfig,
     system: &CodesConfig,
 ) {
+    if crate::operations::update_paused() { return; }
     let queue = BACKGROUND_QUEUE.get_or_init(|| {
         let queue = Arc::new(BackgroundQueue {
             state: Mutex::new(QueueState::default()),
             wake: parking_lot::Condvar::new(),
             revision: AtomicU64::new(0),
+            running: AtomicBool::new(false),
         });
         let worker = Arc::clone(&queue);
         std::thread::Builder::new()
@@ -1193,11 +1219,19 @@ fn schedule(
                         }
                         let request = state.pending.take().expect("pending request");
                         state.active = Some(request.key.clone());
+                        worker.running.store(true, Ordering::Release);
                         request
                     };
+                    struct Running<'a>(&'a BackgroundQueue);
+                    impl Drop for Running<'_> {
+                        fn drop(&mut self) {
+                            self.0.state.lock().active = None;
+                            self.0.running.store(false, Ordering::Release);
+                            self.0.wake.notify_all();
+                        }
+                    }
+                    let _running = Running(&worker);
                     run_background(&worker, &request);
-                    // Never hold the queue mutex while acquiring the registry.
-                    worker.state.lock().active = None;
                 }
             })
             .expect("engine worker thread");
@@ -1209,6 +1243,7 @@ fn schedule(
         derived: !derived.is_empty(),
     };
     let mut state = queue.state.lock();
+    if crate::operations::update_paused() { return; }
     let current = state
         .pending
         .as_ref()
@@ -1354,9 +1389,9 @@ fn run_job(
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // Size estimated from the stores built so far (text-heavy logs make
     // stores as large as the file); 1 GB stays free besides.
-    let source_len = job.source.lines[job.source.range.clone()]
+    let source_len = job.source.lines.range(job.source.range.clone())
         .last()
-        .zip(job.source.lines[job.source.range.clone()].first())
+        .zip(job.source.lines.range(job.source.range.clone()).first())
         .map(|(last, first)| last.offset + u64::from(last.len) - first.offset)
         .unwrap_or(0);
     let needed = source_len / 1000 * STORE_RATIO.load(Ordering::Relaxed) + (1 << 30);
@@ -1403,6 +1438,7 @@ pub(crate) fn prepare_detailed(
     derived: &[CompiledDerived],
     progress: &(dyn Fn(BuildProgress) + Sync),
 ) -> Result<(), String> {
+    if crate::operations::update_paused() { return Err("Preparação suspensa para instalar a atualização.".into()); }
     if !enabled() || idx.lines.is_empty() {
         return Ok(());
     }
@@ -1452,7 +1488,7 @@ fn prepare_variant(
     let mut done = resumed;
     let mut segments = spec.parts.iter().filter(|p| store_ready(p)).count();
     let cancellation = crate::operations::current_token();
-    let cancelled = || cancellation.cancelled();
+    let cancelled = || cancellation.cancelled() || crate::operations::update_paused();
     let publish = |phase: &str,
                    completed: usize,
                    checkpoint_rows: usize,
@@ -1775,6 +1811,7 @@ mod segment_tests {
                 ..Default::default()
             },
         ];
+        let lines = crate::metadata_store::LineStore::from(lines);
         assert_eq!(segment_ranges(&lines, 0, 3), vec![(0, 2), (2, 3)]);
         assert_eq!(segment_ranges(&lines, 1, 3), vec![(1, 3)]);
         assert!(segment_ranges(&lines, 0, 0).is_empty());
@@ -1793,6 +1830,7 @@ mod segment_tests {
                 ..Default::default()
             },
         ];
+        let lines = crate::metadata_store::LineStore::from(lines);
         assert_eq!(segment_ranges(&lines, 0, 2), vec![(0, 1), (1, 2)]);
     }
     #[test]
@@ -1915,6 +1953,7 @@ mod lifecycle_tests {
             state: Mutex::new(QueueState::default()),
             wake: parking_lot::Condvar::new(),
             revision: AtomicU64::new(1),
+            running: AtomicBool::new(false),
         }
     }
 
@@ -2039,7 +2078,7 @@ mod lifecycle_tests {
         reg.wanted
             .extend([first.spec.parts[0].key.clone(), failed_key.clone()]);
         reg.failed.insert(failed_key.clone(), "disk full".into());
-        first.idx.append(second.idx);
+        first.idx.append(second.idx).unwrap();
         let codes = CodesConfig::default();
         let merged = spec(&first.idx, &codes, &codes, &[]).unwrap();
         assert_eq!(merged.parts[1].key, failed_key);
@@ -2248,7 +2287,7 @@ mod metadata_identity_tests {
         let codes = CodesConfig::default();
         let actual = spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key.clone();
         let part = &idx.parts[0];
-        let first_offset = idx.lines[0].offset - part.base;
+        let first_offset = idx.lines.at(0).offset - part.base;
         let last = idx.lines.last().unwrap();
         let last_end = last.offset - part.base + u64::from(last.len);
         let custom = ""; let ts = ""; let catalogs = "";

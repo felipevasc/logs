@@ -375,7 +375,15 @@
   async function loaded() {
     cacheKey = ""; overview = null;
     history.length = 0; previousSelection = { filters: structuredClone(state.filters), quick: state.quick }; lastFilters = JSON.stringify(previousSelection);
-    try { sourceList = await api("list_sources", {}, { silent: true }); } catch { sourceList = []; }
+    const contextKey = sourceKey();
+    try {
+      const confirmed = await api("list_sources", {}, { silent: true });
+      if (contextKey !== sourceKey()) return;
+      sourceList = confirmed;
+    } catch {
+      // A transient listing error cannot mean that every imported file vanished.
+      // The Sources page retries the authoritative list before offering actions.
+    }
     updateCounts();
   }
   async function saveFinding(finding) {

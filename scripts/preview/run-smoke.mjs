@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const selected = process.argv.slice(2);
-const tests = selected.length ? selected : ["test-navigation.mjs", "test-ui-scale.mjs", "test-workspace-context.mjs", "test-responsiveness.mjs", "test-journeys.mjs", "test-remote-sources.mjs", "test-analysis-workbench.mjs", "test-discovery.mjs"];
+const tests = selected.length ? selected : ["test-navigation.mjs", "test-ui-scale.mjs", "test-workspace-context.mjs", "test-responsiveness.mjs", "test-journeys.mjs", "test-remote-sources.mjs", "test-analysis-workbench.mjs", "test-discovery.mjs", "test-updates.mjs"];
 for (const name of tests) {
   if (!/^test-[a-z0-9-]+\.mjs$/.test(name)) throw new Error(`Invalid preview test name: ${name}`);
 }

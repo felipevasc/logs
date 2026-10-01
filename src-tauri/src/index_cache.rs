@@ -1,5 +1,4 @@
 //! Versioned on-disk line indexes. Raw files are never copied into the cache.
-use crate::model::LineMeta;
 use crate::sources::{self, CompiledTsConfig, CustomParse, FileIndex};
 use sha2::{Digest, Sha256};
 use std::io::{BufWriter, Write};
@@ -50,9 +49,16 @@ pub fn prune() {
     // Timestamp overlays are immutable; only aged temporaries are orphaned.
     if let Ok(entries) = std::fs::read_dir(base.join(INDEX_DIR)) {
         for entry in entries.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with("timestamps-") { continue; }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("timestamps-") || name.ends_with(".lock") { continue; }
             let stale = entry.metadata().ok().and_then(|m| m.accessed().or_else(|_| m.modified()).ok()).is_some_and(|t| t < cutoff);
-            if stale { let _ = std::fs::remove_file(entry.path()); }
+            if stale {
+                // Stable lock files are never removed. Active mapped readers
+                // keep this generation alive on every supported platform.
+                if let Ok(_lease) = crate::metadata_store::overlay_lease(&entry.path(), true) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
         }
     }
 }
@@ -92,6 +98,12 @@ pub(crate) fn open_with_progress(path: &str, format: &str, custom: Option<Custom
 pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::path::Path, progress: crate::metadata_checkpoint::Reporter<'_>) -> Result<FileIndex, String> {
     use crate::metadata_checkpoint::{report, Journal, OpenError, Progress, Resume};
     let key = prepared.key()?;
+    prepared.validate()?;
+    if let Some((lines, columns)) = crate::metadata_checkpoint::open_complete(dir, &key, prepared.part.mmap.len(), prepared.initial_cursor(), prepared.multiline(), progress)? {
+        prepared.validate()?;
+        let mut part = prepared.part.clone(); part.metadata_identity = key;
+        return Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(lines), columns, time_order: std::sync::OnceLock::new() });
+    }
     let resumed = std::cell::Cell::new(0usize);
     let committed = std::cell::Cell::new(0usize);
     let parsed = std::cell::Cell::new(0usize);
@@ -111,10 +123,10 @@ pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::pat
             (None, Resume { cursor: prepared.initial_cursor(), ..Resume::default() })
         }
     };
-    let mut sink = |lines: &[LineMeta], cursor, scan_complete, columns: Option<&[String]>| -> Result<(), String> {
+    let mut sink = |lines: &mut crate::metadata_store::LineBuilder, cursor, scan_complete, columns: Option<&[String]>| -> Result<(), String> {
         prepared.validate()?;
         if let Some(active) = journal.as_mut() {
-            if let Err(error) = active.checkpoint(lines, cursor, scan_complete, columns, Some(&forward), &|| prepared.validate()) {
+            if let Err(error) = active.checkpoint_rows(lines, cursor, scan_complete, columns, Some(&forward), &|| prepared.validate()) {
                 crate::operations::check()?;
                 // A changed source is fatal even if the persistence operation
                 // failed at the same time. Never continue a mixed generation.
@@ -128,8 +140,21 @@ pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::pat
         }
         Ok(())
     };
-    let idx = sources::index_prepared(prepared, resume, &mut sink, Some(&forward))?;
+    let mut idx = sources::index_prepared(prepared, resume, &mut sink, Some(&forward))?;
     drop(sink);
+    let persisted = journal.is_some();
+    drop(journal);
+    if persisted {
+        // The post-write verification is visible, but these newly written rows
+        // are not falsely reported as resumed from a prior load.
+        let handoff = |p: &Progress| {
+            let mut p = p.clone(); p.resumed_rows = resumed.get(); forward(&p);
+        };
+        if let Some((lines, _)) = crate::metadata_checkpoint::open_complete(dir, &key, prepared.part.mmap.len(), prepared.initial_cursor(), prepared.multiline(), Some(&handoff))? {
+            prepared.validate()?;
+            idx.lines = std::sync::Arc::new(lines);
+        }
+    }
     crate::operations::check()?;
     if let Some(error) = warning {
         eprintln!("[índice] checkpoint de metadados indisponível: {error}");
@@ -234,6 +259,7 @@ fn restore_timestamps(
     path: &std::path::Path,
     progress: Option<&(dyn Fn(&str, usize, usize) + Sync)>,
 ) -> Result<bool, String> {
+    let Ok(lease) = crate::metadata_store::overlay_lease(path, false) else { return Ok(false); };
     let Ok(file) = std::fs::File::open(path) else {
         return Ok(false);
     };
@@ -269,32 +295,11 @@ fn restore_timestamps(
     if hash.finalize().as_slice() != &mapped[payload_len..] {
         return Ok(false);
     }
-    let mut last_report = std::time::Instant::now();
-    // No additional full-length timestamp vector on a warm open. The mutable
-    // index belongs exclusively to this still-unpublished load transaction.
-    for (chunk_index, chunk) in std::sync::Arc::make_mut(&mut idx.lines)
-        .chunks_mut(8192)
-        .enumerate()
-    {
-        crate::operations::check()?;
-        let first = chunk_index * 8192;
-        for (i, line) in chunk.iter_mut().enumerate() {
-            let offset = 80 + (first + i) * 8;
-            line.ts = i64::from_le_bytes(mapped[offset..offset + 8].try_into().unwrap());
-        }
-        if last_report.elapsed() >= std::time::Duration::from_millis(150) {
-            if let Some(report) = progress {
-                report(
-                    "Reutilizando cache de data/hora",
-                    first + chunk.len(),
-                    count,
-                );
-            }
-            last_report = std::time::Instant::now();
-        }
-    }
     sources::validate_source(&idx.parts[0])?;
+    if let Some(report) = progress { report("Reutilizando cache de data/hora", count, count); }
     crate::operations::check()?;
+    let timestamps = crate::metadata_store::Timestamps::from_validated_map(mapped, 80, count, Some(lease))?;
+    idx.lines = std::sync::Arc::new(idx.lines.with_timestamps(timestamps)?);
     idx.time_order.take();
     if let Some(report) = progress {
         report("Reutilizando cache de data/hora", count, count);
@@ -310,6 +315,7 @@ fn write_timestamps(
     if let Some(report) = progress {
         report("Gravando cache de data/hora", 0, idx.lines.len());
     }
+    let _lease = crate::metadata_store::overlay_lease(path, true)?;
     let temporary = path.with_extension(format!("{}.pending", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut out = BufWriter::with_capacity(
@@ -393,14 +399,16 @@ mod timestamp_overlay_tests {
         assert!(!timestamps_at(&mut idx, &cache, None).unwrap());
         let expected: Vec<_> = idx.lines.iter().map(|m| m.ts).collect();
         assert_eq!(expected, vec![1700000001234, 1700000005678]);
-        for line in std::sync::Arc::make_mut(&mut idx.lines) {
-            line.ts = 0;
-        }
+        idx.lines = std::sync::Arc::new(idx.lines.iter().map(|mut line| { line.ts = 0; line }).collect::<Vec<_>>().into());
         assert!(timestamps_at(&mut idx, &cache, None).unwrap());
         assert_eq!(idx.lines.iter().map(|m| m.ts).collect::<Vec<_>>(), expected);
         let mut bytes = std::fs::read(&cache).unwrap();
         bytes[80] ^= 1;
-        std::fs::write(&cache, bytes).unwrap();
+        let corrupt = dir.path().join("corrupt.bin");
+        std::fs::write(&corrupt, bytes).unwrap();
+        // Release this test reader before replacing its cache generation.
+        idx.lines = std::sync::Arc::new(idx.lines.iter().collect::<Vec<_>>().into());
+        std::fs::rename(corrupt, &cache).unwrap();
         assert!(!timestamps_at(&mut idx, &cache, None).unwrap());
         assert_eq!(idx.lines.iter().map(|m| m.ts).collect::<Vec<_>>(), expected);
     }
@@ -422,9 +430,7 @@ mod timestamp_overlay_tests {
         let (dir, mut idx) = fixture();
         let cache = dir.path().join("timestamps.bin");
         timestamps_at(&mut idx, &cache, None).unwrap();
-        for line in std::sync::Arc::make_mut(&mut idx.lines) {
-            line.ts = 0;
-        }
+        idx.lines = std::sync::Arc::new(idx.lines.iter().map(|mut line| { line.ts = 0; line }).collect::<Vec<_>>().into());
         let published = std::sync::Arc::clone(&idx.lines);
         let token = crate::operations::token(Some("timestamp-restore-cancel".into())).unwrap();
         let result = crate::operations::run_with_token(token, || {
@@ -440,8 +446,8 @@ mod timestamp_overlay_tests {
             result.is_err(),
             "cancellation prevents publishing the new load"
         );
-        assert_eq!(published[0].ts, 0);
-        assert_eq!(published[1].ts, 0);
+        assert_eq!(published.at(0).ts, 0);
+        assert_eq!(published.at(1).ts, 0);
     }
 }
 
@@ -459,9 +465,9 @@ mod metadata_timezone_tests {
         idx.parts[0].calendar.timezone = "different-rule-set-at-the-same-current-offset".into();
         assert_ne!(first, timestamp_key(&idx).unwrap());
         assert!(sources::validate_source(&idx.parts[0]).is_err());
-        let original = idx.lines[0].ts;
+        let original = idx.lines.at(0).ts;
         assert!(sources::retimestamp_index(&mut idx, None).is_err());
-        assert_eq!(idx.lines[0].ts, original, "invalid context must not publish timestamps");
+        assert_eq!(idx.lines.at(0).ts, original, "invalid context must not publish timestamps");
     }
 
     #[test]
@@ -479,11 +485,11 @@ mod metadata_timezone_tests {
         assert!(!timestamps_at(&mut first, &cache, None).unwrap());
         let mut next = make(2032); assert_ne!(timestamp_key(&first), timestamp_key(&next));
         assert!(!timestamps_at(&mut next, &cache, None).unwrap());
-        assert_ne!(first.lines[0].ts, next.lines[0].ts);
+        assert_ne!(first.lines.at(0).ts, next.lines.at(0).ts);
         let codes = crate::model::CodesConfig::default();
-        assert_eq!(Some(next.lines[0].ts), sources::event_at(&next, 0, &codes, &codes, &[]).timestamp);
+        assert_eq!(Some(next.lines.at(0).ts), sources::event_at(&next, 0, &codes, &codes, &[]).timestamp);
         let mut warm = make(2032); assert!(timestamps_at(&mut warm, &cache, None).unwrap());
-        assert_eq!(next.lines[0].ts, warm.lines[0].ts);
+        assert_eq!(next.lines.at(0).ts, warm.lines.at(0).ts);
     }
 
 
@@ -497,15 +503,15 @@ mod metadata_timezone_tests {
         let cache = dir.path().join("timestamps.bin"); assert!(!timestamps_at(&mut logfmt, &cache, None).unwrap());
         let mut text = sources::index_file(path.to_str().unwrap(), "text", None, Some(config.clone()), None).unwrap();
         assert_eq!(text.lines.len(), logfmt.lines.len()); assert_ne!(timestamp_key(&logfmt), timestamp_key(&text));
-        assert!(!timestamps_at(&mut text, &cache, None).unwrap()); assert_eq!(text.lines[0].ts, 0); assert_ne!(logfmt.lines[0].ts, 0);
+        assert!(!timestamps_at(&mut text, &cache, None).unwrap()); assert_eq!(text.lines.at(0).ts, 0); assert_ne!(logfmt.lines.at(0).ts, 0);
         let with_time = sources::CustomParse::Regex(regex::Regex::new(r"ts=(?P<timestamp>\S+) level=\S+ msg=(?P<message>.*)").unwrap());
         let without_time = sources::CustomParse::Regex(regex::Regex::new(r"(?P<message>.*)").unwrap());
         let mut first = sources::index_file(path.to_str().unwrap(), "custom", Some(with_time), Some(config.clone()), None).unwrap();
         assert!(!timestamps_at(&mut first, &cache, None).unwrap());
-        assert_ne!(first.lines[0].ts, 0, "the timestamp-bearing custom parser must exercise overlay fallback");
+        assert_ne!(first.lines.at(0).ts, 0, "the timestamp-bearing custom parser must exercise overlay fallback");
         let mut second = sources::index_file(path.to_str().unwrap(), "custom", Some(without_time), Some(config), None).unwrap();
         assert_ne!(timestamp_key(&first), timestamp_key(&second));
-        assert!(!timestamps_at(&mut second, &cache, None).unwrap()); assert_eq!(second.lines[0].ts, 0);
+        assert!(!timestamps_at(&mut second, &cache, None).unwrap()); assert_eq!(second.lines.at(0).ts, 0);
     }
 
 }

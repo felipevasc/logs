@@ -65,7 +65,7 @@ impl Source {
         for path in paths {
             let part = crate::index_source_file(path, "auto", None)?;
             match &mut idx {
-                Some(all) => all.append(part),
+                Some(all) => all.append(part)?,
                 None => idx = Some(part),
             }
         }
@@ -479,6 +479,7 @@ pub fn metadata_probe(
             "key": key, "format": idx.format, "header": idx.header, "columns": idx.columns,
             "timezone": idx.parts[0].calendar.timezone, "currentOffset": chrono::Local::now().offset().to_string(),
             "metadata": rows, "events": events, "rows": idx.lines.len(),
+            "metadataResidentRows": idx.lines.resident_rows(),
             "resumedRows": restored_rows.get(), "checkpointRows": committed_rows.get(),
             "parsedRows": prepared.parsed_rows.load(std::sync::atomic::Ordering::Relaxed),
         }))

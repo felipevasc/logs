@@ -13,7 +13,8 @@ const file = path => ({ kind: 'file', path });
 function fixture() {
   const state = { cases: { active: 'case', cases: [{ id: 'case', artifacts: [] }] }, artifactSwitchVersion: 0, refreshVersion: 0, datasetRevision: 0, loaded: false, columns: [], visibleCols: [], rows: [], filters: [], quick: '', total: null, treeAgg: {}, treeAggSig: {}, treeAggError: {}, activeDatasetTab: 'table' };
   const pending = [], calls = [], messages = [], refreshReads = [], nodes = new Map(), cancelled = new Set();
-  let native = null, prepare = async args => args, sourceWait = async () => {};
+  let createdNodes = 0;
+  let native = null, generation = 0, nativeInputs = [], publicationId = null, snapshotFailure = false, prepare = async args => args, sourceWait = async () => {};
   const node = key => {
     if (!nodes.has(key)) nodes.set(key, { value: '', hidden: false, children: [], classList: { add() {}, toggle() {} }, appendChild() {}, before() {}, append(...children) { this.children.push(...children); }, replaceChildren(...children) { this.children = children; }, setAttribute() {}, querySelector() { return this; } });
     return nodes.get(key);
@@ -21,10 +22,10 @@ function fixture() {
   const context = vm.createContext({
     state, window: { WorkspaceContext: { waitForSource: () => sourceWait(), scope: () => 'dataset' } },
     document: { body: { dataset: { page: 'explore' } }, documentElement: { dataset: { zone: 'analysis' } }, createTextNode: String }, performance,
-    $: node, el: () => node('new'), fmtNum: String, esc: String, toast: message => messages.push(String(message)),
+    $: node, el: () => node(`new-${++createdNodes}`), fmtNum: String, esc: String, toast: message => messages.push(String(message)),
     setTimeout() {}, clearTimeout() {}, setInterval() {}, clearInterval() {}, requestAnimationFrame() {},
     explorerAnalytics: new Map(), treeAggVersion: { dataset: 0 }, cubeState: { requestVersion: 0 }, workspaceScope: () => 'dataset', caseArgs: (...args) => prepare(...args),
-    ensureCase: () => state.cases.cases[0], artifactIdFromSource: value => value.path || value.channel,
+    activeCase: () => state.cases.cases.find(c => c.id === state.cases.active), ensureCase: () => state.cases.cases[0], artifactIdFromSource: value => value.path || value.channel,
     applySourceSpec() {}, startOperation() {}, updateOperation() {}, skeletonRows() {},
     showLoadOverlay: () => { state.loadOverlay = true; }, hideLoadOverlay: () => { state.loadOverlay = false; },
     finishOperation: label => messages.push(label), fillColumnControls() {}, renderChips() {}, syncCurrentSavedFilter() {}, restoreCurrentSavedFilter() {},
@@ -35,6 +36,10 @@ function fixture() {
     invoke: async (cmd, args) => {
       calls.push({ cmd, args });
       if (cmd === 'profile_fields') return [];
+      if (cmd === 'source_snapshot') {
+        if (snapshotFailure) throw Error('Receipt temporarily unavailable');
+        return { generation, operationId:publicationId, count:native?1:0, columns:native?['timestamp','message']:[], sourceDesc:native||'', sourceNames:native?[native]:[], sources:nativeInputs };
+      }
       if (cmd === 'cancel_task') {
         const target = pending.find(item => item.args.operationId === args.operationId);
         if (!target || target.committed) return false;
@@ -47,12 +52,14 @@ function fixture() {
             if (cancelled.has(args.operationId)) return false;
             if (['load_file', 'load_files', 'load_bundle', 'load_event_log', 'clear_events'].includes(cmd)) {
               native = cmd === 'clear_events' ? null : args.path || args.paths?.join(';') || args.members?.map(item => item.path).join(';') || args.channel;
+              generation++; publicationId=args.operationId;
+              nativeInputs = cmd === 'clear_events' ? [] : cmd === 'load_bundle' ? args.members : cmd === 'load_event_log' ? [{kind:'eventlog',channel:args.channel,maxEvents:args.maxEvents}] : [{kind:'file',paths:args.paths||[args.path],format:args.format||'auto'}];
             }
             record.committed = true; return true;
           },
           respond() {
             if (!record.committed && cancelled.has(args.operationId)) { reject(Error('Operação cancelada.')); return; }
-            resolve({ count: 1, columns: ['timestamp', 'message'], source_desc: native });
+            resolve({ count: 1, columns: ['timestamp', 'message'], source_desc: native, publication:{generation,operationId:publicationId} });
           },
           complete() { record.publish(); record.respond(); }, reject,
         };
@@ -64,7 +71,7 @@ function fixture() {
   vm.runInContext(section('async function api(', '// ------------------------------------------------------------------ helpers de espera'), context);
   vm.runInContext(taskSource, context);
   vm.runInContext(section('function clearSourceRecovery()', '// ------------------------------------------------------------------ filtros / chips'), context);
-  return { context, state, pending, calls, messages, refreshReads, node, get native() { return native; }, prepare: fn => { prepare = fn; }, sourceWait: fn => { sourceWait = fn; } };
+  return { context, state, pending, calls, messages, refreshReads, node, get native() { return native; }, prepare: fn => { prepare = fn; }, sourceWait: fn => { sourceWait = fn; }, snapshotFailure: value => { snapshotFailure = value; } };
 }
 
 // Slow A may complete after B; native cancellation prevents its late publication.
@@ -184,8 +191,7 @@ for (const superseded of [false, true]) {
 
 assert.ok(!reverse.calls.some(call => call.cmd === 'cancel_operation'), 'latest source replacement never cancels unrelated queries');
 
-// C is shown, A commits with its response delayed, and newer B fails. Without a
-// native publication identity, fail closed instead of labeling A's rows as C.
+// A committed receipt recovers the actual active source without reimporting.
 const uncertain = fixture();
 uncertain.state.cases.cases[0].items = [{ id: 'evidence', rows: [{ id: 7 }] }];
 uncertain.state.cases.cases[0].workspace = { preference: 'preserve' };
@@ -194,18 +200,27 @@ const c = uncertain.context.loadData(file('C')); await settle(); uncertain.pendi
 const committedA = uncertain.context.loadData(file('A')); await settle(); uncertain.pending[1].publish();
 const failedB = uncertain.context.loadData(file('B')); await settle(); uncertain.pending[2].reject(Error('B unreadable')); assert.equal(await failedB, false);
 uncertain.pending[1].respond(); assert.equal(await committedA, false);
-assert.equal(uncertain.native, 'A', 'a committed source is not silently rolled back');
-assert.equal(uncertain.state.sourceIdentityUnconfirmed, true);
-assert.equal(uncertain.state.loaded, false); assert.equal(uncertain.state.currentArtifact, null);
-assert.equal(uncertain.state.rows.length, 0); assert.equal(uncertain.state.total, null);
-assert.deepEqual(uncertain.refreshReads, ['C'], 'never query A under the old C identity');
+assert.equal(uncertain.native, 'A');
+assert.equal(uncertain.state.sourceIdentityUnconfirmed, false);
+assert.equal(uncertain.state.loaded, true); assert.equal(uncertain.state.currentArtifact.path, 'A');
+assert.deepEqual(uncertain.refreshReads, ['C','A'], 'receipt identifies A before any query is made');
 assert.equal(JSON.stringify(uncertain.state.cases), evidenceBefore, 'Case evidence and preferences are preserved');
-assert.equal(uncertain.node('#source-recovery').hidden, false);
-const reopening = uncertain.node('#source-recovery').children.at(-1).onclick(); await settle();
-assert.equal(uncertain.pending.at(-1).args.path, 'B', 'reopen targets the known desired source');
-uncertain.pending.at(-1).complete(); await reopening;
-assert.equal(uncertain.state.sourceIdentityUnconfirmed, false); assert.equal(uncertain.node('#source-recovery').hidden, true);
-assert.equal(uncertain.native, 'B'); assert.equal(uncertain.state.currentArtifact.path, 'B'); assert.equal(uncertain.state.loaded, true);
+assert.equal(uncertain.pending.filter(p => p.cmd === 'load_file').length, 3, 'reconciliation does not reingest valid sources');
+
+// Even a failed receipt read keeps the old file descriptors and visible rows.
+const disconnected = fixture();
+const previousKnown = disconnected.context.loadData(file('C')); await settle(); disconnected.pending[0].complete(); await previousKnown;
+const rowsBefore = disconnected.state.rows, artifactBefore = disconnected.state.currentArtifact;
+disconnected.snapshotFailure(true);
+const missing = disconnected.context.loadData(file('B')); await settle(); disconnected.pending[1].reject(Error('IPC response lost')); await missing;
+assert.equal(disconnected.state.sourceIdentityUnconfirmed, true);
+assert.equal(disconnected.state.currentArtifact, artifactBefore); assert.equal(disconnected.state.rows, rowsBefore);
+assert.equal(disconnected.state.loaded, false, 'unconfirmed old view cannot issue new queries');
+assert.equal(disconnected.node('#source-recovery').hidden, false);
+disconnected.snapshotFailure(false);
+await disconnected.node('#source-recovery').children[1].onclick();
+assert.equal(disconnected.state.loaded, true); assert.equal(disconnected.state.currentArtifact.path, 'C');
+assert.equal(disconnected.state.sourceIdentityUnconfirmed, false);
 
 const ordinary = fixture();
 const previous = ordinary.context.loadData(file('C')); await settle(); ordinary.pending[0].complete(); await previous;
@@ -213,3 +228,12 @@ const failure = ordinary.context.loadData(file('B')); await settle(); ordinary.p
 assert.equal(ordinary.state.sourceIdentityUnconfirmed, false, 'ordinary failures retain a confirmed prior source');
 assert.equal(ordinary.state.currentArtifact.path, 'C'); assert.equal(ordinary.native, 'C');
 console.log('Latest source intents, clear ordering, deferred preparation, stale finalizers and committed cancellation passed');
+
+// Source-list discovery errors and late answers never erase newer known files.
+const listContext = vm.createContext({ state:{filters:[],quick:''}, structuredClone, history:[], sourceList:[{path:'C'}], cacheKey:'', overview:null, previousSelection:null, lastFilters:'', key:'C', sourceKey:()=>listContext.key, updateCounts(){}, api:async()=>{throw Error('temporary list failure');} });
+vm.runInContext(workspace.slice(workspace.indexOf('  async function loaded()'),workspace.indexOf('  async function saveFinding(')),listContext);
+await listContext.loaded();assert.equal(listContext.sourceList[0].path,'C');
+let releaseList;listContext.api=()=>new Promise(resolve=>{releaseList=resolve;});
+const slowList=listContext.loaded();listContext.key='D';listContext.sourceList=[{path:'D'}];releaseList([{path:'C'}]);await slowList;
+assert.equal(listContext.sourceList[0].path,'D');
+console.log('Receipt reconciliation, failed imports, and retained source-list generations passed');

@@ -197,7 +197,7 @@ fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexFi
     let filter = &term.filter;
     let key = format!("exact-hex#{}", serde_json::to_string(&(&filter.f.column, &filter.f.value)).map_err(err)?);
     if let Some(found) = session.cached_selection(&key) { return Ok(Some(found)); }
-    let Some(candidates) = session.exact_hex_candidates(&term.word, LIMIT) else { return Ok(None) };
+    let Some(candidates) = session.exact_hex_candidates(&term.word, LIMIT)? else { return Ok(None) };
     let mut confirmed = Vec::with_capacity(candidates.len());
     for id in candidates {
         crate::operations::check()?;
@@ -216,7 +216,7 @@ fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) 
     }
     // The text index covers stored values AND intrinsic names/descriptions.
     // Catalog overrides are a separate, small source/code relation.
-    let Some(mut candidates) = session.free_candidates(needle, FREE_LIMIT) else { return Ok(None) };
+    let Some(mut candidates) = session.free_candidates(needle, FREE_LIMIT)? else { return Ok(None) };
     if !session.baked {
         let catalog = read_ids(session, &catalog_candidates_sql(&term.names_sql))?;
         if catalog.len() > FREE_LIMIT { return Ok(None); }
@@ -803,14 +803,25 @@ const LEVEL_LABEL: &str = "CASE lvl WHEN 1 THEN 'Crítico' WHEN 2 THEN 'Erro' WH
 fn stats_of(scope: &Scope) -> Result<Stats> {
     let from = scope.from(false);
     let cond = &scope.cond;
-    let bounds = rows(
+    // Histogram boundaries depend on the selected timestamp range. Obtain
+    // that range and the level counts together, so the exact histogram needs
+    // only one further pass instead of scanning for levels separately.
+    // lvl is a stored UTINYINT; this aggregation has at most 256 groups.
+    let summaries = rows(
         scope.session,
-        &format!("SELECT min(NULLIF(ts, 0)), max(NULLIF(ts, 0)) FROM {from} WHERE {cond}"),
-        |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        &format!("SELECT lvl, count(*), min(NULLIF(ts, 0)), max(NULLIF(ts, 0)) FROM {from} WHERE {cond} GROUP BY lvl"),
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<i64>>(3)?)),
     )?;
+    let mut merged: HashMap<&'static str, i64> = HashMap::new();
+    let (mut min_ts, mut max_ts): (Option<i64>, Option<i64>) = (None, None);
+    for (lvl, count, lower, upper) in summaries {
+        *merged.entry(class_label(lvl as u8)).or_default() += count;
+        if let Some(lower) = lower { min_ts = Some(min_ts.map_or(lower, |min| min.min(lower))); }
+        if let Some(upper) = upper { max_ts = Some(max_ts.map_or(upper, |max| max.max(upper))); }
+    }
     let mut buckets = Vec::new();
     let mut bucket_ms = 0;
-    if let Some((Some(min_ts), Some(max_ts))) = bounds.first().copied() {
+    if let (Some(min_ts), Some(max_ts)) = (min_ts, max_ts) {
         let count;
         (bucket_ms, count) = stats_layout(min_ts, max_ts);
         let mut counts = vec![0i64; count];
@@ -829,14 +840,6 @@ fn stats_of(scope: &Scope) -> Result<Stats> {
             .enumerate()
             .map(|(b, c)| (min_ts.saturating_add((b as i64).saturating_mul(bucket_ms)), c))
             .collect();
-    }
-    let mut merged: HashMap<&'static str, i64> = HashMap::new();
-    for (lvl, c) in rows(
-        scope.session,
-        &format!("SELECT lvl, count(*) FROM {from} WHERE {cond} GROUP BY lvl"),
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-    )? {
-        *merged.entry(class_label(lvl as u8)).or_default() += c;
     }
     let mut levels: Vec<(String, i64)> = merged.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     sort_levels(&mut levels);

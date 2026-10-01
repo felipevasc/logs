@@ -194,6 +194,7 @@ fn every_canonical_parser_resumes_with_exact_offsets_ids_headers_and_columns() {
         assert!(result.is_err(), "{name} must not publish a partial index");
         let resumed = probe(&path, format, &cache, &options, &|_| {}).unwrap();
         equivalent(&resumed, &expected);
+        assert_eq!(resumed["metadataResidentRows"], 0, "{name} resumed metadata must be file-backed");
         assert!(
             resumed["parsedRows"].as_u64().unwrap() < resumed["rows"].as_u64().unwrap(),
             "{name} reparsed a prefix"
@@ -201,6 +202,7 @@ fn every_canonical_parser_resumes_with_exact_offsets_ids_headers_and_columns() {
         let warm = probe(&path, format, &cache, &options, &|_| {}).unwrap();
         equivalent(&warm, &expected);
         assert_eq!(warm["parsedRows"], 0, "{name} warm metadata parse");
+        assert_eq!(warm["metadataResidentRows"], 0, "{name} warm metadata must be file-backed");
         assert_eq!(warm["resumedRows"], warm["rows"]);
     }
 }
@@ -258,7 +260,7 @@ fn raw_eof_checkpoint_survives_cancelled_column_discovery_and_restore() {
     let id = format!("restore-{}", uuid::Uuid::new_v4());
     assert!(
         probe(&path, "jsonl", &cache, &json!({"operationId":id}), &|p| {
-            if p["phaseId"] == "metadata-restore" {
+            if p["phaseId"] == "metadata-restore" || p["phaseId"] == "metadata-map-validate" {
                 testkit::cancel_metadata_probe(&id);
             }
         })

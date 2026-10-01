@@ -2,7 +2,9 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 const url = process.argv[2] || "http://127.0.0.1:4173";
-const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chrome" });
+const browser = await chromium.launch(process.env.PLAYWRIGHT_EXECUTABLE_PATH
+  ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH }
+  : { channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" });
 const errors = [], results = {};
 const NOTES = "# LogInsight 0.6.0\n\n## Atualizações\n\n- Verifica versões **novas** ao abrir.\n- Instala com `um clique`.\n\nDetalhes em [Atualizações](https://example.org/docs).\n\n<img src=x onerror=alert(1)>";
 async function open(update) {
@@ -39,6 +41,40 @@ try {
   assert.equal(await page.locator(".update-overlay [data-close]").isHidden(), true, "the dialog stays open while installing");
   results.install = "download com progresso, instalar ao fechar, reiniciar e instalar";
   await page.close();
+
+  const retry = await open({ version: "0.6.0", notes: NOTES });
+  await retry.waitForSelector(dialog, { timeout: 8000 });
+  await retry.getByRole("button", { name: "Atualizar agora" }).click();
+  await retry.getByRole("button", { name: "Reiniciar e instalar" }).waitFor({ timeout: 8000 });
+  await retry.evaluate(() => {
+    window.__saveBeforeUpdate = saveCases;
+    saveCases = async () => false;
+    const invoke = window.__TAURI__.core.invoke;
+    window.__updateInstallCalls = 0;
+    window.__TAURI__.core.invoke = (name, args) => {
+      if (name === "update_install") {
+        window.__updateInstallCalls++;
+        if (window.__updateLaunchFailure) return Promise.reject("O instalador não iniciou.");
+      }
+      return invoke(name, args);
+    };
+  });
+  await retry.getByRole("button", { name: "Reiniciar e instalar" }).click();
+  await retry.getByRole("button", { name: "Tentar novamente" }).waitFor();
+  assert.match(await retry.textContent(".update-error"), /salvar os casos/);
+  assert.equal(await retry.evaluate(() => window.__updateInstallCalls), 0);
+  await retry.getByRole("button", { name: "Baixar manualmente" }).click();
+  assert.equal(await retry.evaluate(() => window.__mockOpenedRelease), "0.6.0");
+  await retry.evaluate(() => { saveCases = window.__saveBeforeUpdate; window.__updateLaunchFailure = true; });
+  await retry.getByRole("button", { name: "Tentar novamente" }).click();
+  await retry.waitForFunction(() => document.querySelector(".update-error")?.textContent.includes("instalador não iniciou"));
+  assert.equal(await retry.locator(".update-overlay [data-close]").isVisible(), true);
+  await retry.evaluate(() => { window.__updateLaunchFailure = false; });
+  await retry.getByRole("button", { name: "Tentar novamente" }).click();
+  await retry.waitForFunction(() => document.querySelector(".update-lead")?.textContent.startsWith("Instalando"));
+  assert.equal(await retry.evaluate(() => window.__updateInstallCalls), 2);
+  results.recovery = "salvamento rejeitado impede instalação; falha de lançamento mantém janela e oferece download manual e nova tentativa";
+  await retry.close();
 
   const skip = await open({ version: "0.6.0", notes: NOTES });
   await skip.waitForSelector(dialog, { timeout: 8000 });

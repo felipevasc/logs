@@ -5,7 +5,7 @@ window.QueryBar = (() => {
   if (!input) return { status() {} };
   const box = input.closest(".search-box");
   box.classList.add("query-box");
-  input.placeholder = "Buscar ou filtrar…";
+  input.placeholder = "Digite e pressione Enter…";
   input.setAttribute("autocomplete", "off");
   input.setAttribute("aria-autocomplete", "list");
 
@@ -98,12 +98,19 @@ window.QueryBar = (() => {
     const key = JSON.stringify([workspaceScope(), window.Workspace?.sourceKey?.(), resolved]);
     let values = valueCache.get(key);
     if (!values) {
-      try {
-        const request = typeof analyticsRequest === "function" ? analyticsRequest(workspaceScope()) : { filters: [] };
-        const result = await api("tree_aggs", { ...request, filters: (request.filters || []).filter(f => !f._quick && f.op !== "query"), columns: [resolved] }, { silent: true });
-        const agg = result?.[0]?.[1];
-        values = (agg?.rows || []).map((row, i) => ({ value: agg.group_values ? agg.group_values[i] : row[agg.columns[0]], count: row[agg.columns[1]] ?? 0 })).filter(v => v.value != null && v.value !== "").slice(0, 200);
-      } catch { values = []; }
+      // Completion is local while the search is a draft. Reuse already
+      // displayed facets/rows instead of launching a full aggregation per token.
+      const cached = state.treeAgg?.[workspaceScope()]?.[resolved];
+      if (Array.isArray(cached)) values = cached.slice(0, 200).map(([value, count]) => ({ value, count }));
+      else {
+        const seen = new Map();
+        for (const event of state.rows || []) {
+          const value = resolved.startsWith("@") ? window.QueryLang.fieldValue(event, window.QueryLang.resolve(resolved)) : cellValue(event, resolved);
+          if (value != null && String(value) !== "") seen.set(String(value), (seen.get(String(value)) || 0) + 1);
+          if (seen.size >= 200) break;
+        }
+        values = [...seen].map(([value, count]) => ({ value, count }));
+      }
       valueCache.set(key, values);
       if (valueCache.size > 40) valueCache.delete(valueCache.keys().next().value);
     }
@@ -152,13 +159,20 @@ window.QueryBar = (() => {
     if (!next || !token || next.kind !== token.kind || next.start !== token.start) { items = []; draw(); }
     suggestTimer = setTimeout(suggest, 90);
   });
+  let composing = false;
+  input.addEventListener("compositionstart", () => { composing = true; });
+  input.addEventListener("compositionend", () => { composing = false; });
+  function clearDraft() { clearTimeout(suggestTimer); serial++; items = []; draw(); status(null); }
+  function submit() { if (composing) return false; const applied = commitQuickSearch(); if (applied) clearDraft(); return applied; }
   input.addEventListener("keydown", event => {
+    if (event.isComposing || composing || event.keyCode === 229) return;
+    if (event.key === "Enter") { event.preventDefault(); if (!event.repeat) submit(); return; }
     if (list.hidden) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       active = (active + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
       draw();
-    } else if ((event.key === "Tab" || event.key === "Enter") && active >= 0) {
+    } else if (event.key === "Tab" && active >= 0) {
       event.preventDefault();
       accept();
     } else if (event.key === "Escape") {
@@ -177,5 +191,5 @@ window.QueryBar = (() => {
     const t = currentToken();
     return !!t && t.kind === "field" && t.prefix.startsWith("@") && ROLES.some(r => r !== t.prefix && r.startsWith(t.prefix));
   }
-  return { status, typingField, clearCache: () => valueCache.clear() };
+  return { status, typingField, submit, clearDraft, clearCache: () => valueCache.clear() };
 })();

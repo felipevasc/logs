@@ -45,7 +45,7 @@ try {
   await page.evaluate(() => { state.filters = []; renderChips(); });
   const search = page.locator("#quick-search");
   await search.fill("@action:logon @outcome:failure");
-  await search.dispatchEvent("input");
+  await search.press("Enter");
   await page.waitForFunction(() => state.rows.length > 0 && state.rows.every(r => r.code === "4625"));
   const failures = await page.evaluate(() => state.total);
   await search.fill("@user:(ana");

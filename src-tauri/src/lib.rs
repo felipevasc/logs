@@ -27,6 +27,7 @@ mod entities;
 mod event_preview;
 mod index_cache;
 mod metadata_checkpoint;
+mod metadata_store;
 mod insights;
 mod journeys;
 mod mcp;
@@ -43,6 +44,7 @@ mod remote;
 mod resources;
 mod sigma;
 mod sources;
+mod source_publication;
 mod spreadsheet;
 #[doc(hidden)]
 pub mod testkit;
@@ -68,6 +70,7 @@ pub enum SourceData {
 }
 
 pub struct AppState {
+    pub(crate) source_publication: RwLock<source_publication::Publication>,
     pub source: RwLock<SourceData>,
     /// nomes das fontes carregadas (mais de uma quando arquivos são unidos)
     pub source_names: RwLock<Vec<String>>,
@@ -81,6 +84,7 @@ pub struct AppState {
 
 #[derive(Serialize)]
 pub(crate) struct LoadSummary {
+    publication: source_publication::Receipt,
     count: usize,
     columns: Vec<String>,
     source_desc: String,
@@ -289,43 +293,15 @@ pub(crate) fn load_event_log_impl(
         "eventos",
         false,
     );
-    let mut idx = workspace::index_channel(channel, max_events)?;
+    let idx = workspace::index_channel(channel, max_events)?;
     operations::check()?;
     prepare_engine(state, &idx, app)?;
     emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
-    let mut source = source_write_checked(state)?;
-    let mut names = vec![format!("Event Log: {channel}")];
-    if merge.unwrap_or(false) {
-        match std::mem::replace(&mut *source, SourceData::None) {
-            SourceData::Indexed(mut previous) => {
-                previous.append(idx);
-                idx = previous;
-            }
-            SourceData::Memory(events) => match workspace::index_events(&events) {
-                Ok(mut previous) => {
-                    previous.append(idx);
-                    idx = previous;
-                }
-                Err(error) => {
-                    *source = SourceData::Memory(events);
-                    return Err(error);
-                }
-            },
-            SourceData::None => {}
-        }
-        let mut previous = state.source_names.read().clone();
-        previous.append(&mut names);
-        names = previous;
-    }
-    let summary = LoadSummary {
-        count: idx.lines.len(),
-        columns: idx.columns.clone(),
-        source_desc: names.join(" + "),
-    };
-    crate::operations::commit();
-    engine::source_published(Some(&idx));
-    *source = SourceData::Indexed(idx);
-    *state.source_names.write() = names;
+    let summary = source_publication::publish(
+        state, idx, vec![format!("Event Log: {channel}")],
+        vec![source_publication::Input::Eventlog { channel: channel.into(), max_events }],
+        merge.unwrap_or(false),
+    )?;
     emit_progress(
         app,
         "carregamento",
@@ -481,42 +457,11 @@ pub(crate) fn load_file_impl(
     );
     prepare_engine(state, &idx, app)?;
     emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
-    let mut source = source_write_checked(state)?;
-    let mut idx = idx;
-    let mut names = vec![format!("Arquivo: {path}")];
-    if merge.unwrap_or(false) {
-        // Prepare the replacement before mutating the current source.
-        let old = std::mem::replace(&mut *source, SourceData::None);
-        match old {
-            SourceData::Indexed(mut previous) => {
-                previous.append(idx);
-                idx = previous;
-            }
-            SourceData::Memory(events) => match workspace::index_events(&events) {
-                Ok(mut previous) => {
-                    previous.append(idx);
-                    idx = previous;
-                }
-                Err(e) => {
-                    *source = SourceData::Memory(events);
-                    return Err(e);
-                }
-            },
-            SourceData::None => {}
-        }
-        let mut previous_names = state.source_names.read().clone();
-        previous_names.append(&mut names);
-        names = previous_names;
-    }
-    let summary = LoadSummary {
-        count: idx.lines.len(),
-        columns: idx.columns.clone(),
-        source_desc: names.join(" + "),
-    };
-    crate::operations::commit();
-    engine::source_published(Some(&idx));
-    *source = SourceData::Indexed(idx);
-    *state.source_names.write() = names;
+    let summary = source_publication::publish(
+        state, idx, vec![format!("Arquivo: {path}")],
+        vec![source_publication::Input::File { paths: vec![path.into()], format: format.into() }],
+        merge.unwrap_or(false),
+    )?;
     emit_progress(
         app,
         "carregamento",
@@ -615,7 +560,7 @@ pub(crate) fn load_files_impl(
         operations::check()?;
         let idx = index_source_file(path, format, app)?;
         if let Some(ref mut all) = indices {
-            all.append(idx);
+            all.append(idx)?;
         } else {
             indices = Some(idx);
         }
@@ -625,39 +570,11 @@ pub(crate) fn load_files_impl(
     let idx = indices.unwrap();
     prepare_engine(state, &idx, app)?;
     emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
-    let mut source = source_write_checked(state)?;
-    let mut idx = idx;
-    if merge.unwrap_or(false) {
-        match std::mem::replace(&mut *source, SourceData::None) {
-            SourceData::Indexed(mut previous) => {
-                previous.append(idx);
-                idx = previous;
-            }
-            SourceData::Memory(events) => match workspace::index_events(&events) {
-                Ok(mut previous) => {
-                    previous.append(idx);
-                    idx = previous;
-                }
-                Err(e) => {
-                    *source = SourceData::Memory(events);
-                    return Err(e);
-                }
-            },
-            SourceData::None => {}
-        }
-        let mut previous = state.source_names.read().clone();
-        previous.append(&mut names);
-        names = previous;
-    }
-    let summary = LoadSummary {
-        count: idx.lines.len(),
-        columns: idx.columns.clone(),
-        source_desc: names.join(" + "),
-    };
-    crate::operations::commit();
-    engine::source_published(Some(&idx));
-    *source = SourceData::Indexed(idx);
-    *state.source_names.write() = names;
+    let summary = source_publication::publish(
+        state, idx, names,
+        vec![source_publication::Input::File { paths: paths.to_vec(), format: format.into() }],
+        merge.unwrap_or(false),
+    )?;
     emit_progress(
         app,
         "carregamento",
@@ -730,7 +647,7 @@ pub(crate) fn set_ts_config_impl(
         SourceData::Indexed(idx) => {
             if let Some(position) = idx.parts.iter().position(|p| p.path == path) {
                 let previous = std::mem::replace(&mut idx.parts[position].ts_config, compiled);
-                let timestamps: Vec<i64> = idx.lines.iter().map(|m| m.ts).collect();
+                let previous_lines = std::sync::Arc::clone(&idx.lines);
                 if let Err(error) = sources::retimestamp_index(
                     idx,
                     Some(&|done, total| {
@@ -750,9 +667,7 @@ pub(crate) fn set_ts_config_impl(
                 }
                 if let Err(error) = std::fs::write(ts_configs_path(), &text) {
                     idx.parts[position].ts_config = previous;
-                    for (line, ts) in std::sync::Arc::make_mut(&mut idx.lines).iter_mut().zip(timestamps) {
-                        line.ts = ts;
-                    }
+                    idx.lines = previous_lines;
                     idx.time_order.take();
                     return Err(error.to_string());
                 }
@@ -1216,22 +1131,19 @@ async fn clear_events(app: AppHandle, operation_id: Option<String>) -> Result<()
     offload_operation(operation_id, move || {
         let state = app.state::<AppState>();
         clear_events_impl(state.inner())
-    }).await
+    }).await?
 }
 
-pub(crate) fn clear_events_impl(state: &AppState) {
-    let Ok(mut source) = source_write_checked(state) else {
-        // Keep the token cancelled so the desktop/MCP operation wrapper
-        // reports cancellation; no source or engine state has changed.
-        return;
-    };
-    // Once clearing starts, report it as committed even if Cancel All arrives
-    // while native sessions and metadata are being released.
-    operations::commit();
-    engine::source_published(None);
-    *source = SourceData::None;
-    state.source_names.write().clear();
-    query::clear_match_cache();
+pub(crate) fn clear_events_impl(state: &AppState) -> Result<(), String> {
+    source_publication::clear(state)
+}
+
+#[tauri::command]
+async fn source_snapshot(app: AppHandle) -> Result<source_publication::Snapshot, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        source_publication::snapshot(state.inner())
+    }).await
 }
 
 /// Resumo da fonte carregada no momento (para MCP/UI saberem o que há no app).
@@ -1254,8 +1166,8 @@ async fn source_summary(app: AppHandle) -> Result<SourceSummary, String> {
 }
 
 pub(crate) fn source_summary_impl(state: &AppState) -> SourceSummary {
-    let source_names = state.source_names.read().clone();
     let source = state.source.read();
+    let source_names = state.source_names.read().clone();
     let (count, columns, source_desc) = match &*source {
         SourceData::None => (0, vec![], String::new()),
         SourceData::Memory(evs) => (evs.len(), all_columns(evs), source_names.join(" + ")),
@@ -1679,7 +1591,7 @@ pub(crate) fn trail_events_impl(
             let (mut left, mut right, mut found) = (0usize, 0usize, false);
             let codes = state.codes.read(); let system = state.system_codes.read(); let derived = state.derived.read();
             query::visit_indexed_matches(idx, &filters, &codes, &system, &derived, |id| {
-                let key = (idx.lines[id].ts, id);
+                let key = (idx.lines.at(id).ts, id);
                 if key < center { left += 1; previous.insert(key); if previous.len() > before { previous.pop_first(); } }
                 else if key > center { right += 1; following.insert(key); if following.len() > after { following.pop_last(); } }
                 else { found = true; }
@@ -1906,7 +1818,7 @@ pub(crate) fn discover_patterns_impl(
             let mut sample = discovery::Sampler::new();
             let mut result = discovery::Discovery::default();
             query::visit_indexed_matches(idx, &filters, &codes, &system, &derived, |i| {
-                let meta = &idx.lines[i];
+                let meta = &idx.lines.at(i);
                 result.observe(
                     (meta.ts != 0).then_some(meta.ts),
                     matches!(meta.level, model::LV_ERR | model::LV_CRIT),
@@ -2267,6 +2179,7 @@ pub fn run() {
         .on_window_event(updates::on_window_event)
         .manage(AppState {
             source: RwLock::new(SourceData::None),
+            source_publication: RwLock::new(Default::default()),
             source_names: RwLock::new(vec![]),
             derived: RwLock::new(load_derived()),
             codes: RwLock::new(codes),
@@ -2366,6 +2279,7 @@ pub fn run() {
             load_files,
             clear_events,
             source_summary,
+            source_snapshot,
             query_events,
             query_page,
             explore_snapshot,

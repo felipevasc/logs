@@ -7,7 +7,7 @@ window.WorkspaceContext = (() => {
   const key = (value = scope) => `${activeCase()?.id || "none"}:${value}`;
   const copy = value => structuredClone(value);
   const stateKeys = ["filters", "quick", "visibleCols", "colWidths", "sortCol", "sortDir", "page", "pageSize", "groupCol", "aggs", "activeDatasetTab", "analysisView", "dashboardCompact", "favoriteFields"];
-  const runtimeKeys = ["loaded", "rows", "total", "columns", "dataPeriod", "facetData", "explorerCache", "queryError"];
+  const runtimeKeys = ["loaded", "rows", "total", "columns", "dataPeriod", "facetData", "explorerCache", "queryError", "sourceIdentityUnconfirmed"];
   const scrollSelectors = ["#workspace-home", "#table-scroll", ".table-wrap", "#workspace-side", ".ct-scroll", ".journey-list", ".journey-records", "#view-dashboard", "#view-cube"];
   function defaults() {
     return { page: "summary", values: { filters: [], quick: "", visibleCols: ["timestamp", "level", "code", "name", "message"], colWidths: {}, sortCol: "timestamp", sortDir: "desc", page: 0, pageSize: 100, groupCol: "level", aggs: [{ func: "count", column: "*", alias: "Registros" }], activeDatasetTab: "table", analysisView: "vtimeline", dashboardCompact: false, favoriteFields: [] }, tree: [], density: "comfortable", wrap: "false", sideCollapsed: false, scroll: {}, discovery: { mode: "overview", showVolume: true } };

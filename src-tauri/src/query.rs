@@ -792,7 +792,7 @@ pub(crate) fn visit_indexed_mapped<T: Send>(idx: &FileIndex, pfs: &[PreparedFilt
         ids.clear();
     };
     visit_indexed_prepared_control(idx, pfs, codes, system, derived, |id| {
-        let size = idx.lines[id].len as usize;
+        let size = idx.lines.at(id).len as usize;
         if !ids.is_empty() && (ids.len() >= 8192 || bytes.saturating_add(size) > crate::resources::batch_bytes()) {
             flush(&mut ids, &mut visit);
             bytes = 0;
@@ -844,7 +844,7 @@ fn scan_indexed_control<T: Send>(
             if (i - from) % 2048 == 0 && cancellation.cancelled() {
                 break;
             }
-            let meta = &idx.lines[i];
+            let meta = &idx.lines.at(i);
             let line = line_bytes(idx, i);
             let mut need = false;
             let mut ok = true;
@@ -882,7 +882,7 @@ fn scan_indexed_control<T: Send>(
         let mut end = start;
         let mut bytes = 0usize;
         while end < total && end - start < batch {
-            let next = idx.lines[end].len as usize;
+            let next = idx.lines.at(end).len as usize;
             if end > start && bytes.saturating_add(next) > crate::resources::batch_bytes() { break; }
             bytes = bytes.saturating_add(next);
             end += 1;
@@ -967,7 +967,7 @@ impl<'a> CandidateVerifier<'a> {
         Self { idx, pfs, lines: lines.iter().map(|&i| (i, query_needs_enrichment(&pfs[i], codes, system, derived))).collect(), verify, codes, system, derived }
     }
     pub(crate) fn matches(&self, id: usize) -> bool {
-        let meta = &self.idx.lines[id];
+        let meta = &self.idx.lines.at(id);
         let raw = line_bytes(self.idx, id);
         let mut event = None;
         for &(i, enriched) in &self.lines {
@@ -1093,7 +1093,7 @@ pub(crate) fn query_page_lines(
     let (mut total, mut bytes) = (0usize, 0usize);
     for i in 0..idx.lines.len() {
         if i % 2048 == 0 { crate::operations::check()?; }
-        let meta = &idx.lines[i];
+        let meta = &idx.lines.at(i);
         let line = line_bytes(idx, i);
         let mut needs_event = false;
         let mut eligible = true;
@@ -1161,7 +1161,7 @@ fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
             while start < matched.len() {
                 let mut end = start + 1;
                 while end < matched.len()
-                    && idx.lines[matched[end]].ts == idx.lines[matched[start]].ts
+                    && idx.lines.at(matched[end]).ts == idx.lines.at(matched[start]).ts
                 {
                     end += 1;
                 }
@@ -1171,7 +1171,7 @@ fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
         }
     } else {
         matched.sort_by(|&a, &b| {
-            let ord = idx.lines[a].ts.cmp(&idx.lines[b].ts);
+            let ord = idx.lines.at(a).ts.cmp(&idx.lines.at(b).ts);
             if desc {
                 ord.reverse()
             } else {
@@ -1600,7 +1600,7 @@ pub(crate) fn is_meta_column(col: &str) -> bool {
 
 /// Evento parcial montado só com os campos dos metadados.
 fn meta_event(idx: &FileIndex, i: usize) -> Event {
-    let m = &idx.lines[i];
+    let m = &idx.lines.at(i);
     let mut ev = Event::empty();
     ev.id = i;
     if m.ts != 0 {

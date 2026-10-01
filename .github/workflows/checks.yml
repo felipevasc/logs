@@ -3,6 +3,7 @@ name: Pull request checks
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -30,16 +31,24 @@ jobs:
       - run: npx --prefix scripts/preview playwright install --with-deps chromium
       - run: npm run check
       - run: npm run prepare:frontend
-      - run: npm run test:preview
+      - name: Focused draft interaction checks
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft
+        run: npm run test:preview -- test-responsiveness.mjs test-updates.mjs
+      - name: Full browser regression suite
+        if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+        run: npm run test:preview
       - name: Preserve browser diagnostics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: preview-diagnostics
           path: output/playwright/
           if-no-files-found: ignore
 
+  # Draft development keeps fast checks active; ready-for-review/manual checks
+  # retain the complete native gate. Release/build signing gates are unchanged.
   backend:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Backend tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90

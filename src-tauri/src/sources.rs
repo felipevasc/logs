@@ -1839,7 +1839,7 @@ pub struct FilePart {
 
 pub struct FileIndex {
     pub parts: Vec<FilePart>,
-    pub lines: std::sync::Arc<Vec<LineMeta>>,
+    pub lines: std::sync::Arc<crate::metadata_store::LineStore>,
     pub columns: Vec<String>,
     pub time_order: std::sync::OnceLock<Vec<usize>>,
 }
@@ -1858,32 +1858,32 @@ impl std::ops::DerefMut for FileIndex {
 }
 impl FileIndex {
     pub fn part_at(&self, i: usize) -> &FilePart {
-        let offset = self.lines[i].offset;
+        let offset = self.lines.at(i).offset;
         &self.parts[self
             .parts
             .partition_point(|p| p.base <= offset)
             .saturating_sub(1)]
     }
-    pub fn append(&mut self, mut other: FileIndex) {
-        let base = self
-            .parts
-            .last()
-            .map(|p| p.base + p.mmap.len() as u64 + 1)
-            .unwrap_or(0);
-        for p in &mut other.parts {
-            p.base += base;
-        }
-        for m in std::sync::Arc::make_mut(&mut other.lines).iter_mut() {
-            m.offset += base;
-        }
+    pub fn append(&mut self, mut other: FileIndex) -> Result<(), String> {
+        let base = self.parts.last().map(|p| p.base.checked_add(p.mmap.len() as u64).and_then(|n| n.checked_add(1)).ok_or("Posição de fonte excedida."))
+            .transpose()?.unwrap_or(0);
+        let bases = other.parts.iter().map(|p| {
+            let relocated = p.base.checked_add(base).ok_or("Posição de fonte excedida.")?;
+            relocated.checked_add(p.mmap.len() as u64).ok_or("Tamanho de fonte excedido.")?;
+            Ok(relocated)
+        }).collect::<Result<Vec<_>, &str>>()?;
+        // Build cheap immutable views before changing either source. This also
+        // checks all row/offset arithmetic before a staged import can publish.
+        let mut lines = (*self.lines).clone();
+        lines.append_relocated(&other.lines, base)?;
+        for (part, relocated) in other.parts.iter_mut().zip(bases) { part.base = relocated; }
         self.parts.append(&mut other.parts);
-        std::sync::Arc::make_mut(&mut self.lines).append(std::sync::Arc::make_mut(&mut other.lines));
+        self.lines = std::sync::Arc::new(lines);
         for c in other.columns {
-            if !self.columns.contains(&c) {
-                self.columns.push(c);
-            }
+            if !self.columns.contains(&c) { self.columns.push(c); }
         }
         self.time_order.take();
+        Ok(())
     }
     pub fn bytes_len(&self) -> u64 {
         self.parts.iter().map(|p| p.mmap.len() as u64).sum()
@@ -1891,7 +1891,7 @@ impl FileIndex {
     pub fn ordered(&self) -> &[usize] {
         self.time_order.get_or_init(|| {
             let mut order: Vec<usize> = (0..self.lines.len()).collect();
-            order.sort_unstable_by_key(|&i| (self.lines[i].ts, i));
+            order.sort_unstable_by_key(|&i| (self.lines.at(i).ts, i));
             order
         })
     }
@@ -1933,7 +1933,7 @@ pub(crate) fn validate_source(part: &FilePart) -> Result<(), String> {
 }
 
 pub fn line_bytes(idx: &FileIndex, i: usize) -> &[u8] {
-    let m = &idx.lines[i];
+    let m = &idx.lines.at(i);
     let part = idx.part_at(i);
     let start = (m.offset - part.base) as usize;
     let end = (start + m.len as usize).min(part.mmap.len());
@@ -2099,16 +2099,17 @@ pub fn retimestamp_index(
 ) -> Result<(), String> {
     for part in &idx.parts { validate_source(part)?; }
     let total = idx.lines.len();
-    let mut timestamps = Vec::with_capacity(total);
+    let mut timestamps = crate::metadata_store::TimestampWriter::new()?;
+    let mut completed = 0;
     let cancellation = crate::operations::current_token();
     let wave = crate::resources::workers() * 8192;
     let index: &FileIndex = idx;
-    while timestamps.len() < total {
+    while completed < total {
         crate::operations::check()?;
         if let Some(cb) = progress {
-            cb(timestamps.len(), total);
+            cb(completed, total);
         }
-        let start = timestamps.len();
+        let start = completed;
         let end = (start + wave).min(total);
         let part: Vec<i64> = (start..end)
             .into_par_iter()
@@ -2126,13 +2127,15 @@ pub fn retimestamp_index(
                 ev.timestamp.unwrap_or(0)
             })
             .collect();
-        timestamps.extend(part);
+        for timestamp in part { timestamps.push(timestamp)?; }
+        completed = end;
     }
     crate::operations::check()?;
     for part in &idx.parts { validate_source(part)?; }
-    for (line, timestamp) in std::sync::Arc::make_mut(&mut idx.lines).iter_mut().zip(timestamps) {
-        line.ts = timestamp;
-    }
+    let timestamps = timestamps.finish()?;
+    crate::operations::check()?;
+    for part in &idx.parts { validate_source(part)?; }
+    idx.lines = std::sync::Arc::new(idx.lines.with_timestamps(timestamps)?);
     idx.time_order.take();
     if let Some(cb) = progress {
         cb(total, total);
@@ -2153,7 +2156,7 @@ pub fn event_at(
     let mut ev = parse_part_line(part, bytes);
     ev.id = i;
     if ev.event_ref.is_empty() {
-        ev.event_ref = format!("{}:{}", part.event_identity.as_deref().unwrap_or(&part.identity), idx.lines[i].offset - part.base);
+        ev.event_ref = format!("{}:{}", part.event_identity.as_deref().unwrap_or(&part.identity), idx.lines.at(i).offset - part.base);
     }
     ev.enrich(codes, system);
     ev.fields
@@ -2481,7 +2484,7 @@ fn push_meta(lines: &mut Vec<LineMeta>, line: &[u8], offset: u64, part: &FilePar
     Ok(())
 }
 
-type CheckpointSink<'a> = dyn FnMut(&[LineMeta], usize, bool, Option<&[String]>) -> Result<(), String> + 'a;
+type CheckpointSink<'a> = dyn FnMut(&mut crate::metadata_store::LineBuilder, usize, bool, Option<&[String]>) -> Result<(), String> + 'a;
 
 /// At most 4 MiB or 65,536 physical lines per worker, whichever comes first.
 /// This bounds temporary metadata even for very short records. A single long
@@ -2508,7 +2511,7 @@ fn next_line_bound(bytes: &[u8], from: usize, limits: &IndexLimits) -> Result<us
     Ok(bytes.len())
 }
 
-fn index_lines(prepared: &PreparedIndex, lines: &mut Vec<LineMeta>, mut cursor: usize, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
+fn index_lines(prepared: &PreparedIndex, lines: &mut crate::metadata_store::LineBuilder, mut cursor: usize, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
     use crate::metadata_checkpoint::{report, Progress};
     let part = &prepared.part;
     let bytes: &[u8] = &part.mmap;
@@ -2561,16 +2564,18 @@ fn index_lines(prepared: &PreparedIndex, lines: &mut Vec<LineMeta>, mut cursor: 
                 match lines.last_mut() {
                     Some(entry) => entry.len = u32::try_from(stop as u64 - entry.offset).map_err(|_| "Um registro multilinha excede 4 GB.")?,
                     None => {
+                        let mut initial = Vec::new();
                         let mut offset = start;
                         for raw in bytes[start..stop].split(|&b| b == b'\n') {
                             let line = raw.strip_suffix(b"\r").unwrap_or(raw);
-                            if keep(line, offset, true) { push_meta(lines, line, offset as u64, part, start_re.as_ref())?; }
+                            if keep(line, offset, true) { push_meta(&mut initial, line, offset as u64, part, start_re.as_ref())?; }
                             offset += raw.len() + 1;
                         }
+                        lines.extend(initial)?;
                     }
                 }
             }
-            lines.extend(chunk.lines);
+            lines.extend(chunk.lines)?;
         }
         cursor = *bounds.last().unwrap();
         let parsed = prepared.parsed_rows.fetch_add(lines.len() - previous_rows, std::sync::atomic::Ordering::Relaxed) + lines.len() - previous_rows;
@@ -2662,7 +2667,7 @@ impl<'a> JsonScanner<'a> {
     }
 }
 
-fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, cursor: usize, lines: &mut Vec<LineMeta>, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
+fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, cursor: usize, lines: &mut crate::metadata_store::LineBuilder, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
     use crate::metadata_checkpoint::{report, Progress};
     let bytes: &[u8] = &prepared.part.mmap;
     let mut scanner = JsonScanner::new(bytes, start, cursor, envelope);
@@ -2683,7 +2688,7 @@ fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, curs
             meta_for_line(&bytes[begin..end], begin as u64, &prepared.part)
         }).collect();
         crate::operations::check()?;
-        lines.extend(metas?);
+        lines.extend(metas?)?;
         let parsed = prepared.parsed_rows.fetch_add(records.len(), std::sync::atomic::Ordering::Relaxed) + records.len();
         let mut progress = Progress::new("metadata-scan", "Indexando metadados JSON", scanner.cursor, bytes.len(), "bytes");
         progress.parsed_rows = parsed;
@@ -2840,13 +2845,13 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
     };
     if !safe_cursor { return Err("Limite de retomada dos metadados inválido.".into()); }
     if !resume.scan_complete {
-        if resume.lines.is_empty() { resume.lines.reserve((bytes.len() / 160).min(1 << 24)); }
         match prepared.descriptor.array {
             Some((start, envelope)) => index_json_array(&prepared, start, envelope, resume.cursor, &mut resume.lines, sink, reporter)?,
             None => index_lines(&prepared, &mut resume.lines, resume.cursor, sink, reporter)?,
         }
         prepared.validate()?;
-        sink(&resume.lines, bytes.len(), true, None)?;
+        resume.lines.flush()?;
+        sink(&mut resume.lines, bytes.len(), true, None)?;
     }
     let columns = match resume.columns {
         Some(columns) => columns,
@@ -2861,7 +2866,7 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
                     report(reporter, Progress::new("metadata-columns", "Descobrindo colunas", sample, count, "amostras"));
                 }
                 let i = sample * resume.lines.len() / count;
-                let m = &resume.lines[i];
+                let m = resume.lines.at(i)?;
                 let ev = parse_part_line(&prepared.part, &bytes[m.offset as usize..m.offset as usize + m.len as usize]);
                 extra.extend(ev.fields.keys().cloned()); sampled.push(ev);
             }
@@ -2873,7 +2878,7 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
                 if !columns.iter().any(|c| c == extra) { columns.push(extra.into()); }
             }
             prepared.validate()?;
-            sink(&resume.lines, bytes.len(), true, Some(&columns))?;
+            sink(&mut resume.lines, bytes.len(), true, Some(&columns))?;
             report(reporter, Progress::new("metadata-columns", "Colunas identificadas", count, count, "amostras"));
             columns
         }
@@ -2882,7 +2887,7 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
     crate::operations::check()?;
     let mut part = prepared.part.clone();
     part.metadata_identity = prepared.key()?;
-    Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(resume.lines), columns, time_order: std::sync::OnceLock::new() })
+    Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(resume.lines.finish()?), columns, time_order: std::sync::OnceLock::new() })
 }
 
 /// Uncached entry point, also used as the semantic oracle in recovery tests.

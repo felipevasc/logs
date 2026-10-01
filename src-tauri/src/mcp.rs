@@ -1125,9 +1125,9 @@ impl LogInsightMcp {
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn clear_events(&self) -> Result<CallToolResult, McpError> {
-        self.run(|state| crate::clear_events_impl(state)).await?;
-        notify_state_changed(&self.app, "source");
-        ok_json(&"source cleared")
+        let result = self.run_domain(|state| crate::clear_events_impl(state).map(|()| "source cleared")).await?;
+        if !result.is_error.unwrap_or(false) { notify_state_changed(&self.app, "source"); }
+        Ok(result)
     }
 
     #[tool(

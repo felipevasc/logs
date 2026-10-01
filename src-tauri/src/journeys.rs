@@ -633,6 +633,7 @@ mod tests {
     fn state() -> AppState {
         AppState {
             source: parking_lot::RwLock::new(SourceData::None),
+            source_publication: parking_lot::RwLock::new(Default::default()),
             source_names: parking_lot::RwLock::new(vec![]),
             derived: parking_lot::RwLock::new(vec![]),
             codes: parking_lot::RwLock::new(Default::default()),

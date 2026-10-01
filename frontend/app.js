@@ -58,6 +58,7 @@ const OPS = [
   ["not_in", "fora da lista"],
   ["cidr", "na rede (CIDR)"],
   ["not_cidr", "fora da rede (CIDR)"],
+  ["query", "expressão de busca"],
 ];
 const OP_SYMBOL = {
   contains: "~", not_contains: "!~", equals: "=", not_equals: "≠",
@@ -846,25 +847,82 @@ function clearSourceRecovery() {
   const notice = $("#source-recovery"); if (notice) notice.hidden = true;
 }
 
+function sourceSpecFromSnapshot(snapshot) {
+  if (!Number.isSafeInteger(snapshot?.generation) || snapshot.generation < 0 || !Number.isSafeInteger(snapshot.count) || snapshot.count < 0 || !Array.isArray(snapshot.columns) || !snapshot.columns.every(column => typeof column === "string") || !Array.isArray(snapshot.sources) || !snapshot.sources.length && snapshot.count !== 0) throw Error("Confirmação de fonte inválida.");
+  const members = snapshot.sources.map(input => {
+    if (input.kind === "file" && Array.isArray(input.paths) && input.paths.length && input.paths.every(path => typeof path === "string" && path)) return { kind: "file", paths: [...input.paths], path: input.paths[0], format: input.format || "auto" };
+    if (input.kind === "eventlog" && typeof input.channel === "string" && input.channel) return { kind: "eventlog", channel: input.channel, maxEvents: input.maxEvents || 5000 };
+    throw Error("A confirmação da fonte não contém um caminho reabrível.");
+  });
+  if (!members.length) return null;
+  return members.length === 1 ? members[0] : { kind: "bundle", members, path: members[0].path || members[0].channel };
+}
+
+async function reconcilePublishedSource(current = () => true) {
+  const snapshot = await api("source_snapshot", {}, { silent: true });
+  if (!current()) return false;
+  const source = sourceSpecFromSnapshot(snapshot);
+  // An atomic native receipt, rather than arrival order, identifies the source.
+  // Reconcile metadata only: valid indexes and raw logs are not reopened.
+  state.sourcePublication = { generation: snapshot.generation, operationId: snapshot.operationId };
+  state.datasetRevision++; state.refreshVersion++;
+  explorerAnalytics.clear(); window.Discovery?.clearCache(); window.Security?.invalidate();
+  if (!source) {
+    clearSourceRecovery();
+    Object.assign(state, { loaded: false, currentArtifact: null, currentOrigin: "", rows: [], total: 0, columns: [], pageResult: null });
+    renderTable({ rows: [], total: 0 }); updateContextBar();
+    await window.Workspace?.loaded();
+    return current();
+  }
+  const id = artifactIdFromSource(source), same = state.currentArtifact?.id === id;
+  const saved = activeCase()?.artifacts?.find(artifact => artifact.id === id);
+  Object.assign(state, {
+    loaded: true, columns: snapshot.columns, total: snapshot.count,
+    currentOrigin: snapshot.sourceDesc,
+    currentArtifact: { id, label: snapshot.sourceDesc, kind: source.kind, path: source.path || source.channel, count: snapshot.count, loadedAt: Date.now(), source },
+    page: 0, pageResult: null, queryError: null, dataPeriod: null, facetData: null,
+    datasetDashboard: null, datasetCube: null, datasetProfiles: null,
+  });
+  if (!same) { state.filters = []; state.quick = ""; $("#quick-search").value = ""; }
+  state.visibleCols = (saved?.visibleCols || state.visibleCols || ["timestamp", "level", "source", "message"]).filter(column => snapshot.columns.includes(column));
+  if (!state.visibleCols.length) state.visibleCols = snapshot.columns.slice(0, 4);
+  clearSourceRecovery(); applySourceSpec(source); restoreVisiblePreferences();
+  fillColumnControls(); renderChips(); updateContextBar();
+  const persisted = storeCurrentArtifactInSession();
+  await refresh();
+  if (!current()) return false;
+  await persisted;
+  if (!current()) return false;
+  await window.Workspace?.loaded();
+  return current();
+}
+
 function sourceIdentityUnavailable(source) {
-  const message = "A troca de fonte não foi concluída e a fonte ativa não pôde ser confirmada. Reabra uma fonte para continuar a Análise.";
+  const message = "Não foi possível confirmar a fonte ativa. A lista e a última visualização foram preservadas; confirme as fontes antes de continuar a análise.";
   state.refreshVersion++; state.datasetRevision++; treeAggVersion.dataset++; cubeState.requestVersion++;
   explorerAnalytics.clear(); window.Discovery?.clearCache(); window.Security?.invalidate();
-  Object.assign(state, { sourceIdentityUnconfirmed: true, loaded: false, currentArtifact: null, currentOrigin: "", rows: [], total: null, columns: [], pageResult: null, dataPeriod: null, facetData: null, explorerCache: null, queryError: message, datasetDashboard: null, datasetCube: null, datasetProfiles: null });
-  state.treeAgg.dataset = null; state.treeAggSig.dataset = null; state.treeAggError.dataset = message;
-  cubeState.result = null;
-  renderTable({ rows: [], total: 0 }); renderChart({ buckets: [], levels: [] }); renderExploreTree();
-  for (const selector of ["#group-table thead", "#group-table tbody", "#cube-table thead", "#cube-table tbody", "#dash-grid"]) $(selector)?.replaceChildren();
+  // Retain the last known file descriptors, rows and Case state. They are
+  // explicitly stale and cannot be queried under an unconfirmed native source.
+  Object.assign(state, { sourceIdentityUnconfirmed: true, loaded: false, queryError: message });
+  $("#pg-prev").disabled = true; $("#pg-next").disabled = true;
+  $("#result-count").textContent = "Última visualização · fonte aguardando confirmação";
   let notice = $("#source-recovery");
   if (!notice) { notice = el("div", "notice"); notice.id = "source-recovery"; notice.setAttribute("role", "alert"); $("#workspace-home").before(notice); }
   notice.hidden = false; notice.replaceChildren(document.createTextNode(message));
+  const verify = el("button", "btn primary small", "Confirmar fontes carregadas");
+  verify.onclick = async () => {
+    const version = state.artifactSwitchVersion; verify.disabled = true;
+    try { await reconcilePublishedSource(() => version === state.artifactSwitchVersion); }
+    catch (error) { toast(String(error), "err"); }
+    finally { verify.disabled = false; }
+  };
+  notice.append(verify);
   if (source?.kind) {
-    const retry = el("button", "btn primary small", "Reabrir fonte");
+    const retry = el("button", "btn ghost small", "Reabrir fonte");
     retry.onclick = async () => { retry.disabled = true; if (!await loadData(source)) retry.disabled = false; };
     notice.append(retry);
   }
-  if (workspaceScope() === "dataset") window.Workspace?.showPage("summary");
-  updateContextBar(); finishOperation("Fonte não confirmada", "Reabra uma fonte para continuar.");
+  updateContextBar(); finishOperation("Fonte aguardando confirmação", "A lista anterior foi preservada.");
 }
 
 async function loadData(requestedSource = null, options = {}) {
@@ -947,7 +1005,7 @@ async function loadData(requestedSource = null, options = {}) {
       }, { silent: true, latest: "source-load" });
     }
     if (!current()) return false;
-    sourceAccepted = true; clearSourceRecovery();
+    sourceAccepted = true; state.sourcePublication = summary.publication || null; clearSourceRecovery();
     updateOperation("Artefato carregado", `${fmtNum(summary.count)} eventos indexados`, null, false);
     state.columns = summary.columns;
     const savedArtifact = c.artifacts?.find((a) => a.id === artifactIdFromSource(source));
@@ -1020,7 +1078,13 @@ async function loadData(requestedSource = null, options = {}) {
     return current();
   } catch (e) {
     if (!current()) return false;
-    if (sourceMayHaveChanged && !sourceAccepted) { sourceIdentityUnavailable(desiredSource); toast(String(e), "err"); return false; }
+    if (!sourceAccepted) {
+      try {
+        sourceAccepted = await reconcilePublishedSource(current);
+        if (!current()) return false;
+      } catch { /* Preserve the last known display if even the receipt is unavailable. */ }
+      if (!sourceAccepted) { sourceIdentityUnavailable(desiredSource); toast(String(e), "err"); return false; }
+    }
     if (String(e).includes("ELEVATION_REQUIRED")) {
       status.textContent = "Este canal exige permissão de administrador.";
       status.classList.add("err");
@@ -1036,13 +1100,17 @@ async function loadData(requestedSource = null, options = {}) {
       status.classList.add("err");
       toast(String(e), "err");
     }
-    if (state.loaded) await refresh();
-    else renderTable({ total: 0, rows: [] });
+    if (state.loaded && !sourceAccepted) await refresh();
+    else if (!state.loaded) renderTable({ total: 0, rows: [] });
     finishOperation("Falha ao carregar artefato", "Tente revisar a fonte ou o formato.");
     return false;
   } finally {
     if (current()) {
-      if (sourceMayHaveChanged && !sourceAccepted && !state.sourceIdentityUnconfirmed) sourceIdentityUnavailable(desiredSource);
+      if (sourceMayHaveChanged && !sourceAccepted && !state.sourceIdentityUnconfirmed) {
+        try { sourceAccepted = await reconcilePublishedSource(current); } catch { if (current()) sourceIdentityUnavailable(desiredSource); }
+      }
+      if (!current()) return false;
+      if (!sourceAccepted && state.loaded) renderTable(state.pageResult || { total: state.total, rows: state.rows });
       if (state.loadOverlay) hideLoadOverlay(false); // cobre cancelamento/erro
       btn.disabled = false;
       btn.innerHTML = '<i class="fas fa-play"></i> Carregar';
@@ -1057,7 +1125,12 @@ async function clearData({ removeCurrent = false } = {}) {
   state.refreshVersion++;
   const artifact = state.currentArtifact;
   try { await api("clear_events", {}, { latest: "source-load" }); }
-  catch (error) { if (version !== state.artifactSwitchVersion) return false; if (sourceMayHaveChanged) sourceIdentityUnavailable(artifact?.source); throw error; }
+  catch (error) {
+    if (version !== state.artifactSwitchVersion) return false;
+    try { await reconcilePublishedSource(() => version === state.artifactSwitchVersion); }
+    catch { if (version === state.artifactSwitchVersion) sourceIdentityUnavailable(artifact?.source); }
+    throw error;
+  }
   if (version !== state.artifactSwitchVersion) return false;
   clearSourceRecovery();
   if (state.loadOverlay) hideLoadOverlay(false);
@@ -1227,6 +1300,13 @@ function renderChips() {
 
       box.appendChild(chip);
     });
+  });
+  if (state.quick.trim()) boxes.forEach(box => {
+    const chip = el("span", "chip");
+    chip.appendChild(el("span", "", `Busca: ${state.quick.trim()}`));
+    const remove = el("button", "x", "×"); remove.title = "Remover busca anterior";
+    remove.onclick = () => { state.quick = ""; filtersChanged(); };
+    chip.appendChild(remove); box.appendChild(chip);
   });
   if (state.filters.length > 1) {
     boxes.forEach((box) => {
@@ -1915,7 +1995,7 @@ function toggleFacet(column, value) {
 let currentEditFilterIndex = null;
 
 // popover de novo filtro ou edição
-function openFilterPop(anchor = null, editIndex = null) {
+function openFilterPop(anchor = null, editIndex = null, preset = null) {
   currentEditFilterIndex = editIndex;
   const pop = $("#filter-pop");
   const colSel = $("#fp-col");
@@ -1929,8 +2009,10 @@ function openFilterPop(anchor = null, editIndex = null) {
   opSel.innerHTML = "";
   for (const [v, l] of OPS) opSel.appendChild(el("option", "", l)).value = v;
 
-  if (editIndex != null && state.filters[editIndex]) {
-    const f = state.filters[editIndex];
+  const selected = editIndex != null ? state.filters[editIndex] : preset;
+  if (selected) {
+    const f = selected;
+    if (![...colSel.options].some(option => option.value === f.column)) colSel.appendChild(el("option", "", colLabel(f.column))).value = f.column;
     colSel.value = f.column;
     opSel.value = f.op;
     $("#fp-val").value = f.value ?? "";
@@ -1946,6 +2028,29 @@ function openFilterPop(anchor = null, editIndex = null) {
   positionPop(pop, anchor || $("#btn-add-filter"));
   $("#fp-val").focus();
 }
+function openValueFilter(column, value, anchor = null, op = null) {
+  const empty = value == null || String(value) === "";
+  const selectedOp = op || (empty ? "empty" : column === "timestamp" ? "between" : "equals_exact");
+  openFilterPop(anchor, null, { column, op: selectedOp, value: empty ? "" : String(value), value2: selectedOp === "between" ? String(value) : null });
+}
+
+function commitQuickSearch() {
+  const input = $("#quick-search"), value = input.value.trim();
+  if (!value) return false;
+  const problem = window.QueryLang?.validate(value) || null;
+  window.QueryBar?.status(problem);
+  if (problem) { input.focus(); return false; }
+  // Existing saved quick searches remain effective. Pressing Add on that
+  // same legacy expression converts it into an editable chip without doubling it.
+  if (state.quick.trim() === value) state.quick = "";
+  const duplicate = state.filters.some(filter => filter.column === "_all" && filter.op === "query" && filter.value.trim() === value);
+  input.value = ""; $("#btn-add-search").disabled = true;
+  window.QueryBar?.clearDraft?.();
+  if (!duplicate) addFilter({ column: "_all", op: "query", value, value2: null });
+  else renderChips();
+  return true;
+}
+
 function applyFilterPop() {
   const column = $("#fp-col").value;
   const op = $("#fp-op").value;
@@ -1954,6 +2059,10 @@ function applyFilterPop() {
   if (!["empty", "not_empty"].includes(op) && !value.trim()) {
     toast("Informe um valor para o filtro.", "info");
     return;
+  }
+  if (op === "query") {
+    const problem = window.QueryLang?.validate(value);
+    if (problem) { toast(problem, "info"); return; }
   }
   if (currentEditFilterIndex != null && state.filters[currentEditFilterIndex]) {
     state.filters[currentEditFilterIndex] = { column, op, value, value2: value2 || null };
@@ -2029,45 +2138,106 @@ function updatePager(qr = state.pageResult || { rows: state.rows, total: state.t
   $("#pg-prev").disabled = page === 0;
   $("#pg-next").disabled = known ? page >= pages - 1 : !qr.hasMore;
   const from = qr.rows.length ? page * state.pageSize + 1 : 0, to = page * state.pageSize + qr.rows.length;
-  $("#result-count").textContent = state.loaded ? `${fmtNum(from)}–${fmtNum(to)}${known ? ` de ${fmtNum(qr.total)}` : " · total em cálculo"}` : "";
+  const summary = explorerAnalytics.get(explorerKey());
+  const pendingTotal = summary?.status === "paused" ? " · total pausado" : summary?.status === "failed" ? " · total não concluído" : " · total em cálculo";
+  $("#result-count").textContent = state.loaded ? `${fmtNum(from)}–${fmtNum(to)}${known ? ` de ${fmtNum(qr.total)}` : pendingTotal}` : "";
 }
-function loadExplorerAnalytics(key, scope, filters) {
-  if (explorerAnalytics.has(key)) return explorerAnalytics.get(key);
+function showExplorerAnalytics(entry) {
+  let note = $("#query-analytics-status");
+  if (!note) { note = el("div", "query-analytics-status muted small"); note.id = "query-analytics-status"; note.setAttribute("role", "status"); $("#events-table").before(note); }
+  note.hidden = !entry || entry.status === "done";
+  if (note.hidden) return;
+  const labels = { queued: "Resumo na fila", count: "Calculando total exato", stats: "Calculando histograma", facets: "Atualizando campos", paused: "Resumo pausado", failed: "Resumo não concluído" };
+  note.replaceChildren(document.createTextNode(`${labels[entry.status] || "Preparando resumo"}${entry.error ? `: ${entry.error}` : ""} · os registros continuam disponíveis`));
+  const paused = entry.status === "paused" || entry.status === "failed";
+  const button = el("button", "btn ghost small", paused ? "Retomar resumo" : "Pausar resumo");
+  button.type = "button";
+  button.onclick = () => paused ? entry.resume() : entry.pause();
+  note.append(button);
+}
+function loadExplorerAnalytics(key, scope, filters, knownTotal = null) {
+  if (explorerAnalytics.has(key)) {
+    const cached = explorerAnalytics.get(key);
+    if (cached.status === "stale") cached.resume();
+    return cached;
+  }
   const args = { filters, ...(scope === "case" ? { caseEvents: caseEvents() } : {}) };
-  const current = () => key === explorerKey();
-  const entry = { total: null, stats: null };
+  const entry = { total: Number.isFinite(knownTotal) ? knownTotal : null, stats: null, status: "queued", error: null, generation: 0 };
+  const ownsEntry = () => explorerAnalytics.get(key) === entry;
+  const current = () => ownsEntry() && key === explorerKey();
   explorerAnalytics.set(key, entry);
   if (explorerAnalytics.size > 8) explorerAnalytics.delete(explorerAnalytics.keys().next().value);
-  // Each result updates independently. No analytical work gates the first page.
-  entry.promise = explorerBackground.add(async () => {
-    try {
-      entry.total = await api("count_filtered", args, { silent: true, latest: "explore-count" });
-      if (!current()) { explorerAnalytics.delete(key); return; }
-      state.total = entry.total; if (state.pageResult) state.pageResult.total = entry.total;
-      updatePager(); updateContextBar(); window.Workspace?.onCountChanged?.();
-      entry.stats = await api("stats_events", args, { silent: true, latest: "explore-stats" });
-      if (!current()) { explorerAnalytics.delete(key); return; }
-      renderChart(entry.stats);
-      state.facetData = { ...(state.facetData || {}), levels: entry.stats.levels };
-      if (entry.stats.buckets?.length) state.dataPeriod = { min: entry.stats.buckets[0][0], max: entry.stats.buckets.at(-1)[0] + (entry.stats.bucketMs ?? entry.stats.bucket_ms ?? 0) };
-      await refreshTreeAggs(scope);
-    } catch (error) {
-      explorerAnalytics.delete(key);
-      if (current() && !/cancelad|substituíd/i.test(String(error))) { const n = $("#query-engine-status"); if (n) { n.hidden = false; n.textContent = `Registros disponíveis; resumo não concluído: ${String(error)}`; } }
-    }
-  }, current).catch(() => { explorerAnalytics.delete(key); });
+  const render = () => { if (current()) { showExplorerAnalytics(entry); updatePager(); } };
+  entry.supersede = () => {
+    if (["queued", "count", "stats", "facets"].includes(entry.status)) { entry.generation++; entry.status = "stale"; }
+  };
+  entry.pause = () => {
+    if (!current() || ["paused", "failed", "done"].includes(entry.status)) return;
+    entry.generation++; entry.status = "paused"; entry.error = null;
+    for (const task of ["explore-count", "explore-stats", "explore-tree"]) window.Tasks?.cancelLatest(task);
+    render();
+  };
+  // Resume retains completed totals/histograms. The generation guard prevents
+  // an older cancelled run, including A→B→A, from deleting or overwriting it.
+  entry.resume = () => {
+    if (!current()) return;
+    const generation = ++entry.generation;
+    const active = () => current() && generation === entry.generation;
+    entry.status = "queued"; entry.error = null; render();
+    entry.promise = explorerBackground.add(async () => {
+      try {
+        if (!Number.isFinite(entry.total)) {
+          entry.status = "count"; render();
+          const total = await api("count_filtered", args, { silent: true, latest: "explore-count" });
+          if (!active()) return;
+          entry.total = total;
+        }
+        if (!active()) return;
+        state.total = entry.total; if (state.pageResult) state.pageResult.total = entry.total;
+        updatePager(); updateContextBar(); window.Workspace?.onCountChanged?.();
+        if (!entry.stats) {
+          entry.status = "stats"; render();
+          const stats = await api("stats_events", args, { silent: true, latest: "explore-stats" });
+          if (!active()) return;
+          entry.stats = stats;
+        }
+        if (!active()) return;
+        renderChart(entry.stats);
+        state.facetData = { ...(state.facetData || {}), levels: entry.stats.levels };
+        if (entry.stats.buckets?.length) state.dataPeriod = { min: entry.stats.buckets[0][0], max: entry.stats.buckets.at(-1)[0] + (entry.stats.bucketMs ?? entry.stats.bucket_ms ?? 0) };
+        entry.status = "facets"; render();
+        await refreshTreeAggs(scope);
+        if (active()) { entry.status = "done"; render(); }
+      } catch (error) {
+        if (!active()) return;
+        entry.status = /cancelad|substituíd/i.test(String(error)) ? "paused" : "failed";
+        entry.error = entry.status === "failed" ? String(error) : null;
+        render();
+      }
+    }, active).catch(error => {
+      if (!active()) return;
+      entry.status = /cancelad|substituíd/i.test(String(error)) ? "paused" : "failed";
+      entry.error = entry.status === "failed" ? String(error) : null;
+      render();
+    });
+    return entry.promise;
+  };
+  entry.resume();
   return entry;
 }
+
 async function refresh({ analytics = true, resetAttempt = false } = {}) {
   const scope = workspaceScope();
-  if (scope === "dataset" && !state.loaded) return;
+  if (scope === "dataset" && (!state.loaded || state.sourceIdentityUnconfirmed)) return;
   const filters = backendFilters(), key = explorerKey();
   const cursorKey = JSON.stringify([key, state.sortCol, state.sortDir, state.pageSize]);
   if (cursorKey !== explorerCursorKey) { explorerCursorKey = cursorKey; explorerCursors = [null]; state.page = 0; }
   if (explorerIntent !== key) {
+    explorerAnalytics.get(explorerIntent)?.supersede();
     explorerIntent = key; state.dataPeriod = null; state.facetData = null;
     window.Tasks?.cancelLatest("explore-count"); window.Tasks?.cancelLatest("explore-stats"); window.Tasks?.cancelLatest("explore-tree");
     if (chart) { chart.destroy(); chart = null; } $("#chart").replaceChildren();
+    showExplorerAnalytics(null);
   }
   const version = ++state.refreshVersion;
   $("#pg-prev").disabled = true; $("#pg-next").disabled = true;
@@ -2087,7 +2257,8 @@ async function refresh({ analytics = true, resetAttempt = false } = {}) {
       renderChart(cached.stats);
       explorerBackground.add(() => refreshTreeAggs(scope), () => key === explorerKey()).catch(() => {});
     }
-    loadExplorerAnalytics(key, scope, filters);
+    const summary = loadExplorerAnalytics(key, scope, filters, qr.total);
+    showExplorerAnalytics(summary);
     if (analytics && state.activeDatasetTab === "dashboard") renderDashboard(scope);
     else if (analytics && state.activeDatasetTab === "cube") runCube();
     else if (analytics && state.activeDatasetTab === "group") runGroup();
@@ -4107,17 +4278,22 @@ function saveManualEvent() {
 }
 
 // menu de contexto de uma célula de evento
-function eventCellMenu(ev, col, value) {
+function eventCellMenu(ev, col, value, anchor = null) {
   const hasVal = value !== undefined && value !== null && String(value).trim() !== "";
   const items = [
     { icon: "fa-eye", label: "Ver detalhes", onClick: () => openDetail(ev.id) },
     { icon: "fa-route", label: "Investigar possível trilha", onClick: () => openTrail(ev) },
   ];
+  items.push({ sep: true });
+  items.push({
+    icon: "fa-filter",
+    label: `Criar filtro: ${colLabel(col)}`,
+    onClick: () => openValueFilter(col, col === "timestamp" ? ev.timestamp : value, anchor),
+  });
   if (hasVal) {
-    items.push({ sep: true });
     items.push({
       icon: "fa-filter",
-      label: `Filtrar: ${colLabel(col)} = ${trunc(value)}`,
+      label: `Filtrar igual: ${colLabel(col)} = ${trunc(value)}`,
       onClick: () => addFilter({ column: col, op: "equals", value: String(value), value2: null }),
     });
     items.push({
@@ -4477,7 +4653,7 @@ function buildEventRow(ev, columns = state.visibleCols) {
         updateRowSelectionStyles();
       }
       const value = col === "level" ? ev.level : cellValue(ev, col);
-      showCtxMenu(e.clientX, e.clientY, eventCellMenu(ev, col, value));
+      showCtxMenu(e.clientX, e.clientY, eventCellMenu(ev, col, value, td));
     };
     row.appendChild(td);
   }
@@ -4906,6 +5082,7 @@ function showDetailValueMenu(event, node, selected = "", inModal = false) {
   const sourceText = column && state.currentDetailEv ? String(cellValue(state.currentDetailEv, column) ?? "") : "";
   const canContain = !!column && !!text.trim() && sourceText.includes(text);
   const items = [];
+  if (column) items.push({ icon: "fa-filter", label: `Criar filtro: ${colLabel(column)}`, onClick: () => openValueFilter(column, text, event.target, selected ? "contains" : null) });
   if (column && text.trim()) {
     if (actual && !selected) items.push(
       { icon: "fa-filter", label: `Filtrar valor exato: ${trunc(text)}`, onClick: () => addFilter({ column, op: column === "timestamp" ? "between" : "equals_exact", value: raw, value2: column === "timestamp" ? raw : null }) },
@@ -5827,13 +6004,12 @@ function bind() {
   $("#btn-source-back").onclick = () => showSourceMode("list");
 
   $("#quick-search").addEventListener("input", (e) => {
-    // An expression is applied only when complete; the last valid one stays active.
+    // Draft-only validation. No queries, counts or saved-filter changes while typing.
     const problem = window.QueryLang?.validate(e.target.value) || null;
     window.QueryBar?.status(problem);
-    if (problem || window.QueryBar?.typingField()) return;
-    state.quick = e.target.value;
-    scheduleRefresh();
+    $("#btn-add-search").disabled = !e.target.value.trim();
   });
+  $("#btn-add-search").onclick = () => window.QueryBar?.submit ? window.QueryBar.submit() : commitQuickSearch();
 
   $("#btn-add-filter").onclick = (e) => {
     e.stopPropagation();

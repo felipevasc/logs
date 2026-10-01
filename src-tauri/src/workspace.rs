@@ -30,57 +30,59 @@ pub async fn load_bundle(
     operation_id: Option<String>,
 ) -> Result<crate::LoadSummary, String> {
     crate::offload_operation(operation_id, move || {
-        let mut combined: Option<sources::FileIndex> = None;
-        let mut names = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for member in members {
-            let inputs = match member {
-                ImportSource::File { paths, format } => paths
-                    .into_iter()
-                    .map(|path| (path, format.clone(), None))
-                    .collect::<Vec<_>>(),
-                ImportSource::Eventlog {
-                    channel,
-                    max_events,
-                } => vec![(channel, String::new(), Some(max_events.clamp(1, 100_000)))],
-            };
-            for (path, format, max_events) in inputs {
-                crate::operations::check()?;
-                let key = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
-                if !seen.insert(key) {
-                    continue;
-                }
-                let idx = if let Some(max) = max_events {
-                    index_channel(&path, max)?
-                } else {
-                    crate::index_source_file(&path, &format, Some(&app))?
-                };
-                if let Some(all) = &mut combined {
-                    all.append(idx);
-                } else {
-                    combined = Some(idx);
-                }
-                names.push(path);
-            }
-        }
-        let idx = combined.ok_or("Selecione ao menos uma fonte.")?;
-        crate::operations::check()?;
-        let summary = crate::LoadSummary {
-            count: idx.lines.len(),
-            columns: idx.columns.clone(),
-            source_desc: names.join(" + "),
-        };
         let state = app.state::<AppState>();
-        crate::prepare_engine(state.inner(), &idx, Some(&app))?;
-        crate::emit_progress(Some(&app), "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
-        let mut source = crate::source_write_checked(state.inner())?;
-        crate::operations::commit();
-        crate::engine::source_published(Some(&idx));
-        *source = SourceData::Indexed(idx);
-        *state.source_names.write() = names;
-        Ok(summary)
-    })
-    .await?
+        load_bundle_impl(state.inner(), members, Some(&app))
+    }).await?
+}
+
+pub(crate) fn load_bundle_impl(
+    state: &AppState,
+    members: Vec<ImportSource>,
+    app: Option<&AppHandle>,
+) -> Result<crate::LoadSummary, String> {
+    let mut combined: Option<sources::FileIndex> = None;
+    let mut names = Vec::new();
+    let mut published_inputs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for member in members {
+        let inputs = match member {
+            ImportSource::File { paths, format } => paths
+                .into_iter()
+                .map(|path| (path, format.clone(), None))
+                .collect::<Vec<_>>(),
+            ImportSource::Eventlog {
+                channel,
+                max_events,
+            } => vec![(channel, String::new(), Some(max_events.clamp(1, 100_000)))],
+        };
+        for (path, format, max_events) in inputs {
+            crate::operations::check()?;
+            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
+            if !seen.insert(key) {
+                continue;
+            }
+            let idx = if let Some(max) = max_events {
+                index_channel(&path, max)?
+            } else {
+                crate::index_source_file(&path, &format, app)?
+            };
+            if let Some(all) = &mut combined {
+                all.append(idx)?;
+            } else {
+                combined = Some(idx);
+            }
+            published_inputs.push(match max_events {
+                Some(max_events) => crate::source_publication::Input::Eventlog { channel: path.clone(), max_events },
+                None => crate::source_publication::Input::File { paths: vec![path.clone()], format },
+            });
+            names.push(path);
+        }
+    }
+    let idx = combined.ok_or("Selecione ao menos uma fonte.")?;
+    crate::operations::check()?;
+    crate::prepare_engine(state, &idx, app)?;
+    crate::emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
+    crate::source_publication::publish(state, idx, names, published_inputs, false)
 }
 
 pub struct Selection<'a> {
@@ -501,7 +503,7 @@ pub fn timeline_range_scope_impl(
                 let system = state.system_codes.read();
                 let derived = state.derived.read();
                 query::visit_indexed_matches(idx, &scoped_filters, &codes, &system, &derived, |id| {
-                    let meta = &idx.lines[id];
+                    let meta = &idx.lines.at(id);
                     if meta.ts != 0 { add(meta.ts, crate::model::class_label(meta.level)); }
                 })?;
             }
@@ -650,7 +652,7 @@ pub fn sources_impl(state: &AppState) -> Vec<SourceInfo> {
                 let end = idx
                     .lines
                     .partition_point(|m| m.offset < p.base + p.mmap.len() as u64);
-                let lines = &idx.lines[start..end];
+                let lines = &idx.lines.range(start..end);
                 let min = lines
                     .iter()
                     .filter_map(|m| (m.ts != 0).then_some(m.ts))
@@ -1985,6 +1987,7 @@ mod canonical {
         fn indexed_state(index: sources::FileIndex) -> AppState {
             AppState {
                 source: parking_lot::RwLock::new(SourceData::Indexed(index)),
+                source_publication: parking_lot::RwLock::new(Default::default()),
                 source_names: parking_lot::RwLock::new(Vec::new()),
                 codes: parking_lot::RwLock::new(Default::default()),
                 system_codes: parking_lot::RwLock::new(Default::default()),

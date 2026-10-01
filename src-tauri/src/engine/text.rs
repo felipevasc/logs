@@ -11,13 +11,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tantivy::collector::{Count, DocSetCollector};
-use tantivy::query::{BooleanQuery, Occur, Query, RegexQuery, TermQuery};
+use tantivy::query::{BooleanQuery, EnableScoring, Occur, Query, RegexQuery, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST,
 };
 use tantivy::tokenizer::{PreTokenizedString, Token};
-use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
+use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term, TERMINATED};
 
 /// Word standing for every word longer than [`MAX_WORD`] bytes.
 const LONG: &str = "\u{1}";
@@ -141,6 +140,10 @@ impl Text {
     /// Rows (sorted) whose text may contain `needle`; `None` when the index
     /// cannot narrow the search or more than `limit` rows qualify.
     pub(crate) fn candidates(&self, needle: &str, limit: usize) -> Option<Vec<u32>> {
+        self.collect_candidates(&self.candidate_query(needle)?, limit)
+    }
+
+    fn candidate_query(&self, needle: &str) -> Option<BooleanQuery> {
         // The longest pieces narrow the most; one or two are enough.
         let mut pieces: Vec<&str> = needle
             .split(|c: char| !c.is_alphanumeric())
@@ -177,8 +180,7 @@ impl Text {
             }
             must.push((Occur::Must, Box::new(BooleanQuery::new(any))));
         }
-        let query = BooleanQuery::new(must);
-        self.collect_candidates(&query, limit)
+        Some(BooleanQuery::new(must))
     }
 
     /// Exact scalar equality has stronger semantics than free substring
@@ -191,25 +193,49 @@ impl Text {
     }
 
     fn collect_candidates(&self, query: &dyn Query, limit: usize) -> Option<Vec<u32>> {
+        let token = crate::operations::current_token();
+        self.collect_candidates_while(query, limit, || !token.cancelled())
+    }
+
+    /// One pass, with no hash set or preliminary full count. Stop as soon as
+    /// one live match proves the candidate budget insufficient. A missing lid
+    /// or cancellation rejects the entire probe, never a partial result.
+    ///
+    /// Creating a regex scorer can still expand its dictionary/postings before
+    /// yielding its first document. The bound is on candidate collection, not
+    /// on all work performed internally by a Tantivy scorer.
+    fn collect_candidates_while(
+        &self,
+        query: &dyn Query,
+        limit: usize,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Option<Vec<u32>> {
+        if !keep_going() { return None; }
         let searcher = self.reader.searcher();
-        if searcher.search(query, &Count).ok()? > limit {
-            return None;
+        let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher)).ok()?;
+        let mut lids = Vec::new();
+        for reader in searcher.segment_readers() {
+            if !keep_going() { return None; }
+            let mut scorer = weight.scorer(reader, 1.0).ok()?;
+            let column = reader.fast_fields().u64("lid").ok()?;
+            let alive = reader.alive_bitset();
+            let mut doc = scorer.doc();
+            let mut examined = 0usize;
+            while doc != TERMINATED {
+                if examined % 256 == 0 && !keep_going() { return None; }
+                examined += 1;
+                if alive.is_none_or(|bits| bits.is_alive(doc)) {
+                    if lids.len() == limit { return None; }
+                    lids.push(u32::try_from(column.first(doc)?).ok()?);
+                }
+                doc = scorer.advance();
+            }
         }
-        let docs = searcher.search(query, &DocSetCollector).ok()?;
-        let mut lids = Vec::with_capacity(docs.len());
-        let mut columns = std::collections::HashMap::new();
-        for doc in docs {
-            let column = match columns.entry(doc.segment_ord) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => e.insert(
-                    searcher.segment_reader(doc.segment_ord).fast_fields().u64("lid").ok()?,
-                ),
-            };
-            lids.push(column.first(doc.doc_id)? as u32);
-        }
+        if !keep_going() { return None; }
         lids.sort_unstable();
         Some(lids)
     }
+
 }
 
 pub(crate) fn exact_hex_literal(value: &str) -> bool {
@@ -245,6 +271,111 @@ fn regex_syntax_escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compare collectors against already-prepared immutable text stores. No
+    /// ingestion, source hashing or cache deletion belongs in this microbench.
+    #[test]
+    #[ignore = "requires explicit LOGINSIGHT_TEXT_BENCH_DIR; read-only existing indexes"]
+    fn benchmark_bounded_candidate_collection() {
+        use std::time::Instant;
+        use tantivy::collector::{Count, DocSetCollector};
+        let dir = std::env::var("LOGINSIGHT_TEXT_BENCH_DIR").expect("set text-store parent directory");
+        let repeats: usize = std::env::var("LOGINSIGHT_TEXT_BENCH_REPEATS").unwrap_or_else(|_| "10".into()).parse().unwrap();
+        assert!((1..=100).contains(&repeats));
+        let mut dirs: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "text")).collect();
+        dirs.sort();
+        assert!(!dirs.is_empty());
+        let texts: Vec<_> = dirs.iter().map(|p| Text::open(p).expect("valid text store")).collect();
+        for needle in ["request", "rareneedle", "0000000000000000000000000a1aa3c1", "absentwordneverpresent"] {
+            for iteration in 0..repeats {
+                let mut answers = Vec::new();
+                // Alternate order to avoid systematically favoring the second
+                // probe's page-cache state. These are warm-index measurements.
+                for legacy in if iteration % 2 == 0 { [true, false] } else { [false, true] } {
+                    let started = Instant::now();
+                    let mut count = 0usize;
+                    let mut signature = 0u64;
+                    let mut too_broad = false;
+                    for text in &texts {
+                        let query = text.candidate_query(needle).unwrap();
+                        let limit = 250_000 - count;
+                        let found = if legacy {
+                            let searcher = text.reader.searcher();
+                            if searcher.search(&query, &Count).unwrap() > limit { None } else {
+                                let docs = searcher.search(&query, &DocSetCollector).unwrap();
+                                let mut lids = Vec::with_capacity(docs.len());
+                                let mut columns = std::collections::HashMap::new();
+                                for doc in docs {
+                                    let column = columns.entry(doc.segment_ord).or_insert_with(||
+                                        searcher.segment_reader(doc.segment_ord).fast_fields().u64("lid").unwrap());
+                                    lids.push(column.first(doc.doc_id).unwrap() as u32);
+                                }
+                                lids.sort_unstable(); Some(lids)
+                            }
+                        } else { text.collect_candidates(&query, limit) };
+                        match found {
+                            Some(lids) => { count += lids.len(); for lid in lids { signature = signature.wrapping_mul(1_099_511_628_211).wrapping_add(u64::from(lid) + 1); } }
+                            None => { too_broad = true; break; }
+                        }
+                        signature = signature.wrapping_mul(1_099_511_628_211);
+                    }
+                    answers.push((count, too_broad, signature));
+                    println!("TEXT_BENCH {}", serde_json::json!({"needle":needle,"iteration":iteration,
+                        "collector":if legacy { "v0.9-count-then-docset" } else { "v0.10-bounded-one-pass" },
+                        "elapsedMs":started.elapsed().as_secs_f64()*1000.0,"count":count,"tooBroad":too_broad,"signature":signature,"stores":texts.len()}));
+                }
+                assert_eq!(answers[0], answers[1], "candidate result parity");
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_collection_matches_legacy_with_live_docs_and_segment_local_lids() {
+        use tantivy::collector::{Count, DocSetCollector};
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, lid, text_field, _) = schema();
+        let index = Index::create_in_dir(dir.path(), schema).unwrap();
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 32 << 20).unwrap();
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+        for group in 0..3u32 {
+            for row in 0..300u32 {
+                let mut doc = TantivyDocument::default();
+                doc.add_u64(lid, u64::from(group * 300 + row));
+                doc.add_text(text_field, "common");
+                if row == 0 { doc.add_text(text_field, "deleted"); }
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        writer.delete_term(Term::from_field_text(text_field, "deleted"));
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        std::fs::write(dir.path().join("hex-length"), "0").unwrap();
+        let text = Text::open(dir.path()).unwrap();
+        let query = TermQuery::new(Term::from_field_text(text_field, "common"), IndexRecordOption::Basic);
+        let searcher = text.reader.searcher();
+        assert_eq!(searcher.search(&query, &Count).unwrap(), 897);
+        let mut expected: Vec<u32> = searcher.search(&query, &DocSetCollector).unwrap().into_iter()
+            .map(|doc| searcher.segment_reader(doc.segment_ord).fast_fields().u64("lid").unwrap().first(doc.doc_id).unwrap() as u32)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(text.collect_candidates(&query, expected.len()).unwrap(), expected);
+        assert_eq!(text.collect_candidates(&query, expected.len() - 1), None);
+        assert_eq!(text.collect_candidates(&query, 0), None);
+        let absent = TermQuery::new(Term::from_field_text(text_field, "absent"), IndexRecordOption::Basic);
+        assert_eq!(text.collect_candidates(&absent, 0), Some(Vec::new()));
+
+        // The collection visits at most the first budget+1 live matches. This
+        // callback is also the cooperative-cancellation boundary used in production.
+        let mut polls = 0;
+        assert_eq!(text.collect_candidates_while(&query, 1, || { polls += 1; true }), None);
+        assert_eq!(polls, 3, "no second segment or full preliminary count");
+        let mut polls = 0;
+        assert_eq!(text.collect_candidates_while(&query, 900, || { polls += 1; polls < 4 }), None,
+            "cancellation never returns partially collected candidates");
+        assert_eq!(polls, 4);
+    }
 
     #[test]
     fn exact_field_words_require_complete_ascii_tokens() {

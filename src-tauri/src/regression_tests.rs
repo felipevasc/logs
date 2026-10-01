@@ -65,6 +65,7 @@ fn filter(column: &str, op: &str, value: &str) -> Filter {
 fn state_for(source: crate::SourceData) -> crate::AppState {
     crate::AppState {
         source: parking_lot::RwLock::new(source),
+        source_publication: parking_lot::RwLock::new(Default::default()),
         source_names: parking_lot::RwLock::new(vec![]),
         codes: parking_lot::RwLock::new(CodesConfig::default()),
         system_codes: parking_lot::RwLock::new(CodesConfig::default()),
@@ -1219,7 +1220,7 @@ fn composite_index_preserves_origins_and_local_offsets() {
     let b = Fixture::new(text);
     let mut idx = a.index("jsonl");
     let first_ref = materialize(&idx)[0].event_ref.clone();
-    idx.append(b.index("jsonl"));
+    idx.append(b.index("jsonl")).unwrap();
     assert_eq!(idx.parts.len(), 2);
     assert_eq!(idx.lines.len(), 2);
     let events = materialize(&idx);
@@ -1476,6 +1477,7 @@ fn timeline_keeps_exact_counts_and_gaps_across_storage_modes() {
     let events = materialize(&index);
     let make_state = |source| crate::AppState {
         source: parking_lot::RwLock::new(source),
+        source_publication: parking_lot::RwLock::new(Default::default()),
         source_names: parking_lot::RwLock::new(vec![]),
         codes: parking_lot::RwLock::new(CodesConfig::default()),
         system_codes: parking_lot::RwLock::new(CodesConfig::default()),

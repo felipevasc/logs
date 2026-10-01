@@ -2,7 +2,7 @@
 //! materializes (`event_at`), so every column holds the value the line
 //! engine would compute.
 use crate::entities::{self, ROLES};
-use crate::model::{label_class, CodesConfig, Event, LineMeta, LV_OTHER};
+use crate::model::{label_class, CodesConfig, Event, LV_OTHER};
 use crate::sources::{event_at, CompiledDerived, FileIndex, FilePart};
 use duckdb::arrow::array::{
     new_null_array, ArrayRef, Int64Array, ListBuilder, StringArray, StringBuilder, UInt32Array,
@@ -252,13 +252,13 @@ fn publish_manifest(path: &Path, manifest: &Manifest) -> Result<(), String> {
 /// Copy of a part that stays valid after the app's locks are released.
 pub(crate) struct PartSource {
     pub part: FilePart,
-    pub lines: Arc<Vec<LineMeta>>,
+    pub lines: Arc<crate::metadata_store::LineStore>,
     pub range: std::ops::Range<usize>,
 }
 
 pub(crate) fn copy_part(
     part: &FilePart,
-    lines: Arc<Vec<LineMeta>>,
+    lines: Arc<crate::metadata_store::LineStore>,
     range: std::ops::Range<usize>,
 ) -> PartSource {
     PartSource {
@@ -532,7 +532,7 @@ fn choose_wide(
     positions.extend((0..spread).map(|k| head + k * (n - head) / spread.max(1)));
     let mut sampled_bytes = 0usize;
     positions.retain(|&i| {
-        sampled_bytes = sampled_bytes.saturating_add(idx.lines[i].len as usize);
+        sampled_bytes = sampled_bytes.saturating_add(idx.lines.at(i).len as usize);
         sampled_bytes <= crate::resources::batch_bytes().max(1 << 20)
     });
     let seen: Vec<Vec<String>> = positions
@@ -605,7 +605,7 @@ pub(crate) fn build(
             Err(error) => return Err(format!("Não foi possível bloquear o checkpoint: {error}")),
         }
     }
-    let segment = &source.lines[source.range.clone()];
+    let segment = &source.lines.range(source.range.clone());
     let first_offset = segment
         .first()
         .map(|m| m.offset - source.part.base)
@@ -729,7 +729,7 @@ fn write(
     let base = source.part.base;
     let idx = FileIndex {
         parts: vec![source.part],
-        lines: Arc::new(source.lines[source.range].to_vec()),
+        lines: Arc::new(source.lines.slice(source.range)),
         columns: Vec::new(),
         time_order: std::sync::OnceLock::new(),
     };
@@ -847,8 +847,8 @@ fn write(
             // Rayon tasks. Queues stay shallow; this is not a hard RSS limit
             // because normalization and a single oversized record can expand.
             let raw_budget = crate::resources::batch_bytes().max(64 << 10);
-            let byte_end = idx.lines[start].offset.saturating_add(raw_budget as u64);
-            let count = idx.lines[start..row_end].partition_point(|m| m.offset < byte_end);
+            let byte_end = idx.lines.at(start).offset.saturating_add(raw_budget as u64);
+            let count = idx.lines.range(start..row_end).partition_point(|m| m.offset < byte_end);
             let end = (start + count.max(1)).min(row_end);
             let chunks: Vec<usize> = (start..end).step_by(CHUNK).collect();
             let text = &text;
@@ -859,7 +859,7 @@ fn write(
                     let rows: Vec<Row> = (from..to)
                         .take_while(|_| !cancelled())
                         .map(|i| {
-                            let off = idx.lines[i].offset - base;
+                            let off = idx.lines.at(i).offset - base;
                             row_of(
                                 event_at(&idx, i, codes, system, derived),
                                 off,
@@ -1029,8 +1029,8 @@ mod checkpoint_tests {
             target,
             &idx.parts[0].identity,
             range.len(),
-            idx.lines[range.start].offset,
-            idx.lines[range.end - 1].offset + u64::from(idx.lines[range.end - 1].len),
+            idx.lines.at(range.start).offset,
+            idx.lines.at(range.end - 1).offset + u64::from(idx.lines.at(range.end - 1).len),
         )
     }
     #[test]

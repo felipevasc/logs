@@ -2420,3 +2420,10 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
   #detail-value-modal { padding: 9px; }
   .detail-value-modal { max-height: 96vh; }
 }
+
+/* Exact summaries can pause without blocking the visible event page. */
+.query-analytics-status { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; padding: .4rem .6rem; }
+.query-analytics-status[hidden] { display: none; }
+.query-analytics-status .btn { margin-left: auto; flex-shrink: 0; }
+
+.filter-actions { flex-wrap: wrap; }

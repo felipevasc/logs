@@ -8,6 +8,7 @@ import { appendFileSync, chmodSync, closeSync, copyFileSync, createReadStream, e
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { buildManifest, updaterPubkey, verifyManifest } from './manifest.mjs';
+import { checkLockedInstaller, checkInstallerDialog, holdInstalledExecutable } from './windows-installer-handoff.mjs';
 
 const windows = process.platform === 'win32';
 if (!windows && process.platform !== 'linux') throw Error('The update test runs on Windows and Linux.');
@@ -67,7 +68,7 @@ process.on('uncaughtException', error => { failure(error); process.exit(1); });
 process.on('unhandledRejection', error => { failure(error); process.exit(1); });
 
 const requests = [];
-let server = null, display = null, installDir = null;
+let server = null, display = null, installDir = null, handoffLock = null, preservation = null;
 try {
   const current = build(version);
   progress(`built ${current.name}`);
@@ -101,6 +102,14 @@ try {
     installDir = registry('InstallLocation');
     executable = installDir && join(installDir, registry('MainBinaryName') || 'loginsight.exe');
     if (!executable || !existsSync(executable)) throw Error('The installed executable was not found.');
+    preservation = await checkLockedInstaller({ installer: next.path, executable, work, data, version, readVersion: () => registry('DisplayVersion'), report: progress });
+    await checkInstallerDialog({ installer: next.path, executable, work, version, readVersion: () => registry('DisplayVersion'), action: 'cancel', report: progress });
+    // Retry reinstalls the current test version, leaving the real version
+    // change below to the application's verified updater flow.
+    await checkInstallerDialog({ installer: current.path, executable, work, version, readVersion: () => registry('DisplayVersion'), action: 'retry', report: progress });
+    // Start the real old app while an unrelated reader temporarily denies
+    // writes. The updater must exit; the new installer must wait, not kill it.
+    handoffLock = await holdInstalledExecutable(executable, work, 'delayed-handoff');
   } else {
     executable = join(work, 'app', `${PRODUCT}.AppImage`);
     mkdirSync(join(work, 'app'));
@@ -128,7 +137,19 @@ try {
   // The first build ends by installing; only a build without a newer version reports `current`.
   const finished = lines => lines.some(line => /^(error|unavailable)/.test(line)) || /^current/.test(lines.at(-1) ?? '');
   const deadline = Date.now() + 8 * 60_000;
-  while (!finished(reportLines()) && Date.now() < deadline) await sleep(1000);
+  let firstExitSeen = null;
+  while (!finished(reportLines()) && Date.now() < deadline) {
+    if (handoffLock && app.exitCode !== null) {
+      firstExitSeen ??= Date.now();
+      handoffLock.assertAlive();
+      if (Date.now() - firstExitSeen >= 5000) {
+        if (registry('DisplayVersion') !== version) throw Error('The installer modified the installation while its executable was still locked.');
+        await handoffLock.release(); handoffLock = null;
+        progress('Released the owned delayed-shutdown lock after the old app exited; waiting for installer retry and restart.');
+      }
+    }
+    await sleep(1000);
+  }
   const lines = reportLines();
   say(`report:\n  ${lines.join('\n  ')}`);
   const expect = (condition, message) => { if (!condition) throw Error(message); };
@@ -139,11 +160,13 @@ try {
   expect(/^current/.test(lines.at(-1)), 'The updated app still announced an update.');
   expect(requests.includes('latest.json') && requests.includes(next.name), `Unexpected requests: ${requests.join(', ')}`);
   if (windows) expect(registry('DisplayVersion') === NEXT, `The installation reports version ${registry('DisplayVersion')}.`);
+  if (preservation) expect(readFileSync(preservation.sentinel, 'utf8') === 'case-data-must-survive-failed-install', 'Retry changed the preserved case-data fixture.');
   progress(`PASS: ${version} updated itself to ${NEXT} (${bundle}), reopened and reported the installation.`);
 } catch (error) {
   failure(error);
   process.exitCode = 1;
 } finally {
+  if (handoffLock) { try { await handoffLock.release(); } catch (error) { say(`lock fixture cleanup: ${error.message}`); } }
   server?.close();
   display?.kill();
   if (windows && installDir && existsSync(join(installDir, 'uninstall.exe'))) spawnSync(join(installDir, 'uninstall.exe'), ['/S'], { stdio: 'ignore' });

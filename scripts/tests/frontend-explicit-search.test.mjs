@@ -1,0 +1,52 @@
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import { readFileSync } from 'node:fs';
+const app = readFileSync(new URL('../../frontend/app.js', import.meta.url), 'utf8');
+const bar = readFileSync(new URL('../../frontend/query-bar.js', import.meta.url), 'utf8');
+const nodes = new Map();
+const node = key => {
+  if (!nodes.has(key)) nodes.set(key, {value:'',hidden:false,options:[],listeners:{},innerHTML:'',focus(){},setAttribute(){},querySelector(){return {textContent:''};},appendChild(option){this.options.push(option);return option;},addEventListener(kind,fn){(this.listeners[kind] ||= []).push(fn);}});
+  return nodes.get(key);
+};
+const input=node('#quick-search');
+const applied=[],problems=[];
+const state={filters:[],quick:'',columns:['timestamp','message','status'],page:0};
+const context=vm.createContext({state,$:node,el:(tag,cls,text)=>({tag,textContent:text}),colLabel:String,positionPop(){},toast(){},renderChips(){},filtersChanged(){},window:{QueryLang:{validate:value=>value.endsWith(':')?'Incomplete expression':null},QueryBar:{status:problem=>problems.push(problem)}},addFilter:filter=>{state.filters.push(filter);applied.push(filter);}});
+vm.runInContext(app.slice(app.indexOf('const OPS ='),app.indexOf('const OP_SYMBOL =')),context);
+vm.runInContext(app.slice(app.indexOf('let currentEditFilterIndex ='),app.indexOf('\nfunction positionPop(')),context);
+vm.runInContext(app.slice(app.indexOf('  $("#quick-search").addEventListener("input"'),app.indexOf('  $("#btn-add-filter").onclick',app.indexOf('  $("#quick-search").addEventListener("input"'))),context);
+input.value='falha login'; input.listeners.input[0]({target:input});
+assert.equal(applied.length,0,'typing never applies a query');assert.equal(state.quick,'');
+assert.equal(node('#btn-add-search').disabled,false);
+assert.equal(context.commitQuickSearch(),true);assert.equal(applied.length,1);
+assert.equal(applied[0].column,'_all');assert.equal(applied[0].op,'query');assert.equal(applied[0].value,'falha login');assert.equal(input.value,'');
+input.value='falha login';context.commitQuickSearch();assert.equal(applied.length,1,'same expression cannot be double-applied');
+input.value='status:';assert.equal(context.commitQuickSearch(),false);assert.equal(input.value,'status:');assert.equal(applied.length,1);
+input.value='status>=500';node('#btn-add-search').onclick();assert.equal(applied.length,2,'button applies a second chip');
+state.quick='legacy saved search';input.value=state.quick;context.commitQuickSearch();assert.equal(state.quick,'');assert.equal(applied.at(-1).value,'legacy saved search');
+
+// Enter commits once, Tab completes, composition/repeat cannot accidentally submit.
+let submits=0,accepts=0;
+Object.assign(context,{input,list:{hidden:true},items:[],active:-1,draw(){},accept(){accepts++;},clearTimeout(){},suggestTimer:null,serial:0,status(){},commitQuickSearch:()=>{submits++;return true;}});
+vm.runInContext(bar.slice(bar.indexOf('  let composing = false;'),bar.indexOf('  list.addEventListener("mousedown"')),context);
+const enter=input.listeners.keydown[0],preventDefault=()=>{};
+enter({key:'Enter',preventDefault});assert.equal(submits,1);
+enter({key:'Enter',repeat:true,preventDefault});enter({key:'Enter',isComposing:true,preventDefault});enter({key:'Enter',keyCode:229,preventDefault});assert.equal(submits,1);
+input.listeners.compositionstart[0]();enter({key:'Enter',preventDefault});assert.equal(submits,1);
+input.listeners.compositionend[0]();enter({key:'Enter',preventDefault});assert.equal(submits,2);
+context.list.hidden=false;context.active=0;context.items=[{}];enter({key:'Tab',preventDefault});assert.equal(accepts,1);assert.equal(submits,2);
+enter({key:'Enter',preventDefault});assert.equal(submits,3,'Enter submits draft even when completion is visible');
+
+context.openValueFilter('status',0);assert.equal(node('#fp-col').value,'status');assert.equal(node('#fp-val').value,'0');assert.equal(node('#fp-op').value,'equals_exact');
+for(const op of ['contains','equals','gt','gte','lt','lte','between','regex','cidr','query']) assert.ok(node('#fp-op').options.some(option=>option.value===op),op);
+context.openValueFilter('request.unseen',false);assert.equal(node('#fp-col').value,'request.unseen');assert.equal(node('#fp-val').value,'false');
+context.openValueFilter('timestamp',123456789);assert.equal(node('#fp-op').value,'between');assert.equal(node('#fp-val').value,'123456789');assert.equal(node('#fp-val2').value,'123456789');
+context.openValueFilter('message','');assert.equal(node('#fp-op').value,'empty');
+let preset;
+Object.assign(context,{eventComment:()=>'',workspaceScope:()=> 'dataset',trunc:String,sendVisibleToCase(){},openValueFilter:(...args)=>{preset=args;}});
+vm.runInContext(app.slice(app.indexOf('function eventCellMenu('),app.indexOf('\nasync function removeEventFromCase(')),context);
+const menu=context.eventCellMenu({id:7,timestamp:123},'timestamp','formatted date',{});
+menu.find(item=>item.label?.startsWith('Criar filtro:')).onClick();assert.equal(preset[0],'timestamp');assert.equal(preset[1],123,'composer uses actual numeric timestamp');
+assert.equal(applied.length,3,'opening a composer does not immediately execute a filter');
+assert.ok(!bar.slice(bar.indexOf('async function valueOptions('),bar.indexOf('  function draw()')).includes('api("tree_aggs"'),'draft value completion never launches full aggregations');
+console.log('Explicit search, chips, draft validation, IME, and prefilled full filter composer passed');

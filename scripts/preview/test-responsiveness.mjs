@@ -44,6 +44,48 @@ try {
     return Promise.all([old,other,newest]);
   });
   assert.deepEqual(cancel,[true,true,true]);
+  await page.evaluate(async()=>{
+    window.__mockLatency={count_filtered:1200,stats_events:1200};
+    state.filters=[{column:'message',op:'not_contains',value:'__pause_resume_summary_unique__'}];state.page=0;
+    await refresh();
+  });
+  await page.locator('#query-analytics-status button').filter({hasText:'Pausar resumo'}).click();
+  await page.waitForFunction(()=>document.querySelector('#result-count').textContent.includes('total pausado'));
+  assert.ok(await page.locator('#events-table tbody tr').count()>0,'paused summary keeps visible rows');
+  assert.equal(await page.locator('#pg-next').isDisabled(),false,'paused summary keeps paging available');
+  await page.screenshot({path:'output/playwright/summary-paused.png',fullPage:true});
+  await page.evaluate(()=>{window.__mockLatency={count_filtered:50,stats_events:50};});
+  await page.locator('#query-analytics-status button').filter({hasText:'Retomar resumo'}).click();
+  await page.waitForFunction(()=>Number.isFinite(state.total)&&document.querySelector('#query-analytics-status').hidden);
+  await page.waitForFunction(()=>Tasks.pending()===0,null,{timeout:30000});
+  const beforeDraft=await page.evaluate(()=>JSON.stringify(Object.entries(window.__mockCommandCalls).filter(([key])=>['query_page','count_filtered','stats_events','tree_aggs'].includes(key))));
+  const beforeFilters=await page.evaluate(()=>state.filters.length);
+  await page.locator('#quick-search').fill('status>=500');
+  await page.waitForTimeout(500);
+  assert.equal(await page.evaluate(()=>JSON.stringify(Object.entries(window.__mockCommandCalls).filter(([key])=>['query_page','count_filtered','stats_events','tree_aggs'].includes(key)))),beforeDraft,'typing a search draft starts no native data work');
+  await page.locator('#quick-search').press('Enter');
+  await page.waitForFunction(n=>state.filters.length===n+1&&document.querySelector('#events-table').getAttribute('aria-busy')==='false',beforeFilters);
+  assert.equal(await page.locator('#quick-search').inputValue(),'');
+  assert.equal(await page.evaluate(()=>state.filters.at(-1).op),'query');
+  await page.locator('#events-table tbody tr td[data-column="timestamp"]').first().click({button:'right'});
+  await page.getByText('Criar filtro: Data/hora',{exact:true}).click();
+  assert.equal(await page.locator('#fp-col').inputValue(),'timestamp');
+  assert.equal(await page.locator('#fp-op').inputValue(),'between');
+  assert.ok(Number.isFinite(Number(await page.locator('#fp-val').inputValue())));
+  for(const operator of ['contains','equals','gt','gte','lt','lte','between','regex','cidr']) assert.ok(await page.locator(`#fp-op option[value="${operator}"]`).count(),operator);
+  await page.locator('#fp-op').selectOption('gte');
+  await page.locator('#fp-cancel').click();
+  assert.equal(await page.evaluate(()=>state.filters.length),beforeFilters+1,'cancelled composer never applies its draft');
+  const failedImport=await page.evaluate(async()=>{
+    window.__mockLatency={};
+    const before={id:state.currentArtifact.id,source:JSON.stringify(state.currentArtifact.source),rows:state.rows.length};
+    window.__mockFailures={load_file:'Simulated unreadable new source'};
+    const result=await loadData({kind:'file',path:'C:\\mock\\missing.log',paths:['C:\\mock\\missing.log'],format:'auto'});
+    window.__mockFailures={};
+    return {result,before,after:{id:state.currentArtifact.id,source:JSON.stringify(state.currentArtifact.source),rows:state.rows.length},loaded:state.loaded,unconfirmed:state.sourceIdentityUnconfirmed};
+  });
+  assert.equal(failedImport.result,false);assert.equal(failedImport.loaded,true);assert.equal(failedImport.unconfirmed,false);
+  assert.equal(failedImport.before.id,failedImport.after.id);assert.ok(failedImport.after.rows>0,'failed import preserves queryable old source');
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({first,local,cancel,errors},null,2));
 } catch (error) { await captureFailure(page, 'responsiveness', error, { errors }); throw error; }

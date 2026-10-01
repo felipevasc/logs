@@ -9,6 +9,7 @@ fn state() -> AppState {
     event.message = "original source".into();
     AppState {
         source: RwLock::new(SourceData::Memory(vec![event])),
+        source_publication: RwLock::new(Default::default()),
         source_names: RwLock::new(vec!["original source".into()]),
         codes: RwLock::new(Default::default()),
         system_codes: RwLock::new(Default::default()),
@@ -128,7 +129,7 @@ fn completed_clear_is_not_reported_cancelled_after_its_commit_boundary() {
     let state = state();
     let token = operations::token(None).unwrap();
     let result = operations::run_with_token(token, || {
-        crate::clear_events_impl(&state);
+        crate::clear_events_impl(&state).unwrap();
         // A late Cancel All must not change the already-completed outcome.
         operations::cancel();
     });

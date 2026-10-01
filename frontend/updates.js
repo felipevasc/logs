@@ -6,6 +6,7 @@ window.Updates = (() => {
   const KINDS = { nsis: "instalador do Windows (.exe)", msi: "pacote MSI do Windows", appimage: "AppImage", deb: "pacote .deb", rpm: "pacote .rpm", other: "cópia sem instalador" };
   const STARTUP_DELAY = 2500;
   let status = null, notice = null, overlay = null;
+  let preparingInstall = false;
 
   const node = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
   const megabytes = bytes => `${(bytes / 1048576).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} MB`;
@@ -66,7 +67,7 @@ window.Updates = (() => {
     document.body.append(overlay);
     return overlay;
   }
-  function hide() { if (overlay && status?.phase !== "installing") overlay.hidden = true; }
+  function hide() { if (overlay && !preparingInstall && status?.phase !== "installing") overlay.hidden = true; }
   function open() { dialog().hidden = false; render(); }
 
   async function download() { set(await call("update_download")); }
@@ -76,13 +77,29 @@ window.Updates = (() => {
     hide();
     toast(`A versão ${version} não será mais oferecida ao abrir. Ela continua disponível em Configurações → Atualizações.`, "info");
   }
-  async function install() {
-    // Pending case edits are written before the app closes.
+  async function install(restart = true) {
+    if (preparingInstall || status?.phase === "installing") return;
+    preparingInstall = true;
+    open();
     try {
-      if (typeof caseSaveTimer !== "undefined" && caseSaveTimer && typeof saveCases === "function") await saveCases();
-      else if (typeof casesSaveQueue !== "undefined") await casesSaveQueue.catch(() => {});
-    } catch { /* the save error was already shown */ }
-    await call("update_install");
+      // Keep a native CloseRequested guarded while an immediate install is
+      // waiting for its save acknowledgement, too.
+      if (restart) await call("update_install_on_close", { enabled: true });
+      // Always wait for a fresh save: saveCases resolves false on failure and
+      // its queue deliberately catches errors for normal autosave recovery.
+      if (typeof saveCases !== "function" || await saveCases() !== true) {
+        throw Error("Não foi possível salvar os casos. A atualização foi interrompida; tente salvar novamente antes de instalar.");
+      }
+      await call("update_install", { restart });
+    } catch (error) {
+      try {
+        await call("update_install_on_close", { enabled: false });
+        set(await call("update_status"));
+      } catch { /* retain the last usable status if IPC itself failed */ }
+      if (status) set({ ...status, error: String(error) });
+      open();
+      throw error;
+    } finally { preparingInstall = false; render(); }
   }
   async function installOnClose() {
     set(await call("update_install_on_close", { enabled: !status.installOnClose }));
@@ -93,8 +110,12 @@ window.Updates = (() => {
   function render() {
     if (!overlay || overlay.hidden || !status) return;
     const s = status, next = s.available, body = overlay.querySelector(".modal-body");
-    overlay.querySelector("[data-close]").hidden = s.phase === "installing";
+    overlay.querySelector("[data-close]").hidden = preparingInstall || s.phase === "installing";
     body.replaceChildren();
+    if (preparingInstall && s.phase !== "installing") {
+      body.append(node("p", "update-lead", "Salvando os casos antes de instalar…"));
+      return;
+    }
     if (s.phase === "checking") { body.append(node("p", "muted", "Verificando se há uma versão nova…")); return; }
     if (!next || s.phase === "idle") {
       body.append(node("p", "", s.unavailable || s.lastCheck?.message || "Você está usando a versão mais recente."));
@@ -126,9 +147,9 @@ window.Updates = (() => {
       if (s.blocker) body.append(warn(s.blocker));
       if (s.error) body.append(node("p", "update-error", s.error));
       body.append(row(
-        s.blocker ? button("Baixar manualmente", "btn ghost", openPage, "fa-arrow-up-right-from-square") : null,
+        s.blocker || s.error ? button("Baixar manualmente", "btn ghost", openPage, "fa-arrow-up-right-from-square") : null,
         button(s.installOnClose ? "Não instalar ao fechar" : "Instalar ao fechar", "btn ghost", installOnClose),
-        button("Reiniciar e instalar", "btn primary", install, "fa-rotate"),
+        button(s.error ? "Tentar novamente" : "Reiniciar e instalar", "btn primary", () => install(true), "fa-rotate"),
       ));
       if (s.blocker) body.querySelector(".update-actions .btn.primary").disabled = true;
       return;
@@ -196,6 +217,9 @@ window.Updates = (() => {
   }
 
   window.__TAURI__?.event?.listen("update-state", ({ payload }) => set(payload)).catch(() => {});
+  window.__TAURI__?.event?.listen("update-close-requested", () => {
+    install(false).catch(error => toast(String(error), "err"));
+  }).catch(() => {});
   if (window.__TAURI__?.core) setTimeout(startup, STARTUP_DELAY);
   return {
     open: async () => { if (!status) set(await call("update_status")); open(); },

@@ -25,6 +25,8 @@ Cada instalação recebe o pacote do seu próprio formato; o executável registr
 | `npm run dev` ou executável fora de um instalador | Desativado; atualizar baixando a nova versão | — |
 
 - Se o aplicativo foi aberto como administrador com outra conta no Windows, ele pede para ser reaberto normalmente, pois o instalador por usuário atualizaria o perfil errado.
+- Se o salvamento dos casos ou o encerramento do trabalho em andamento falhar, a instalação não começa: a janela permanece aberta e oferece **Tentar novamente** e **Baixar manualmente**. Isso também vale para **Instalar ao fechar**.
+- O instalador `.exe` aguarda até 30 segundos para o executável desta instalação ser liberado. Se outra janela ou processo ainda o mantiver ocupado, oferece **Repetir** ou **Cancelar**. Feche essa janela normalmente e repita; não é necessário encerrar processos de outros aplicativos. Uma execução silenciosa retorna código 2 nesse caso.
 - Se o AppImage estiver numa pasta sem permissão de escrita, o aviso sugere movê-lo para uma pasta do usuário ou baixar manualmente.
 - `dpkg -i` e `rpm -U` não instalam dependências novas. Se uma versão mudar as dependências do Linux, as notas da versão devem pedir a atualização manual desses pacotes.
 
@@ -90,3 +92,7 @@ node scripts/release/update-e2e.mjs
 ```
 
 Compila o código atual e uma versão `99.0.0` com outro nome de produto (`LogInsightE2E`), outro identificador e outra pasta de dados, instala a primeira (NSIS no Windows, AppImage no Linux), serve a segunda em `http://127.0.0.1:47831` e confere que o aplicativo instalado encontra a atualização, baixa, confere a assinatura, instala, reabre na nova versão e avisa que foi atualizado. Ao final desinstala a versão de teste. A instalação real do LogInsight não é afetada. O fluxo automático sem confirmação existe apenas nesses builds de teste (`--features update-e2e`).
+
+No Windows, o roteiro também mantém o executável instalado aberto para leitura em um processo auxiliar de teste: verifica o timeout silencioso, os botões **Cancelar** e **Repetir**, a preservação da versão/arquivo/dados após a falha e a atualização após a liberação do arquivo. O processo que mantém a leitura deve sobreviver. Esses cenários precisam rodar no Windows; os testes de interface no navegador e os testes Rust isolados não substituem essa execução.
+
+O handoff acompanha a [ordem de instalação do plugin Tauri](https://github.com/tauri-apps/plugins-workspace/blob/updater-v2.13.0/plugins/updater/src/updater.rs) e substitui a chamada imediata a [Restart Manager do NSIS Tauri 2.12](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.0/crates/tauri-bundler/src/bundle/windows/nsis/utils.nsh) por uma espera limitada usando [CreateFileW com OPEN_EXISTING](https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-createfilew). A sondagem usa o caminho completo do executável instalado, sem escrever/truncar o arquivo e sem encerrar processos pelo nome.

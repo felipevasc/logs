@@ -90,6 +90,8 @@
   const mockCalls = {};
   window.__mockCalls = mockCalls;
   let merged = false;
+  let sourceGeneration = 0, sourceOperationId = null;
+  let sourceInputs = [{ kind: "file", paths: ["C:\\mock\\mock.jsonl"], format: "auto" }];
 
   // lote de uma segunda fonte para a opção "Unir"
   function appendFirewallBatch() {
@@ -522,6 +524,12 @@
       return null;
     },
     clear_events: () => { events.length = 0; COLUMNS = []; return null; },
+    source_snapshot: () => ({
+      generation: sourceGeneration, operationId: sourceOperationId,
+      count: events.length, columns: events.length ? [...COLUMNS] : [],
+      sourceDesc: events.length ? loadedParts.join(" + ") : "",
+      sourceNames: events.length ? [...loadedParts] : [], sources: events.length ? structuredClone(sourceInputs) : [],
+    }),
     source_summary: () => ({
       count: events.length,
       columns: events.length ? [...COLUMNS] : [],
@@ -871,7 +879,17 @@
           // Tests can slow commands down (window.__mockLatency = { cmd: ms }); a cancel in between aborts them like the engine does.
           const extra = window.__mockLatency?.[cmd];
           if (extra) { const generation = window.__mockGeneration || 0; for (let elapsed = 0; elapsed < extra; elapsed += 25) { await delay(Math.min(25, extra - elapsed)); if ((window.__mockGeneration || 0) !== generation || window.__mockCancelledIds?.has(args.operationId)) throw new Error("Operação cancelada."); } }
-          return h(args);
+          if (window.__mockFailures?.[cmd]) throw new Error(window.__mockFailures[cmd]);
+          const result = await h(args);
+          if (["load_file", "load_files", "load_bundle", "load_event_log", "clear_events"].includes(cmd)) {
+            sourceGeneration++; sourceOperationId = args.operationId || null;
+            const inputs = cmd === "clear_events" ? [] : cmd === "load_bundle" ? args.members
+              : cmd === "load_event_log" ? [{ kind: "eventlog", channel: args.channel, maxEvents: args.maxEvents }]
+              : [{ kind: "file", paths: args.paths || [args.path], format: args.format || "auto" }];
+            sourceInputs = args.merge ? [...sourceInputs, ...inputs] : inputs;
+            if (result) result.publication = { generation: sourceGeneration, operationId: sourceOperationId };
+          }
+          return result;
         } catch (e) {
           return Promise.reject(String(e));
         }
