@@ -46,6 +46,7 @@
     const msg = pick(MESSAGES);
     events.push({
       id: i,
+      event_ref: `preview:${i}`,
       timestamp: ts,
       source,
       level: pick(LEVELS),
@@ -128,6 +129,7 @@
       const ts = now - Math.floor(rnd() * 24 * 3600 * 1000);
       events.push({
         id: base + i,
+        event_ref: `preview:${base + i}`,
         timestamp: ts,
         source: "Firewall",
         level: allow ? "Informação" : "Erro",
@@ -491,6 +493,7 @@
                 auth.push({
                   ...auth[0],
                   id: 90000 + k,
+                  event_ref: `preview:${90000 + k}`,
                   timestamp: t0 + k * 60e3,
                   code: "4625", name: "Falha de logon",
                   message: "Tentativa de acesso negada (rajada)",

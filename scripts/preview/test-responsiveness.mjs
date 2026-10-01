@@ -79,6 +79,7 @@ try {
   assert.equal(await page.locator('#quick-search').inputValue(),'');
   assert.equal(await page.evaluate(()=>state.filters.at(-1).op),'query');
   const filterTimestamp=await page.evaluate(()=>state.rows[0].timestamp);
+  assert.match(await page.evaluate(()=>state.rows[0].event_ref),/^preview:\d+$/,'ordinary fixture rows carry the stable native handle required by exact field actions');
   await page.locator('#events-table tbody tr td[data-column="timestamp"]').first().click({button:'right'});
   await page.getByText('Criar filtro: Data/hora',{exact:true}).click();
   await page.locator('#filter-pop').waitFor({state:'visible'});
