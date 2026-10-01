@@ -1688,7 +1688,7 @@ mod exact_time_routing_tests {
                 for grid in [Grid{start:-100,bucket_ms:51,bucket_count:4},Grid{start:0,bucket_ms:1,bucket_count:6},Grid{start:0,bucket_ms:0,bucket_count:0}] {
                     let spec=Spec::new(field.into(),grid,Some(2),Context::default()).unwrap();
                     let mut expected=Accumulator::new(&spec).unwrap();
-                    for event in &events { if pfs.iter().all(|filter|crate::query::matches(event,filter)) { expected.add_event(event).unwrap(); } }
+                    for event in &events { if pfs.iter().all(|filter|crate::query::matches_indexed(event,filter)) { expected.add_indexed_event(event).unwrap(); } }
                     assert_eq!(grouped_timeline_session(&session,&source,&pfs,&spec).unwrap().unwrap(),expected.finish().unwrap(),"{field} {grid:?}");
                 }
             }

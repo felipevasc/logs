@@ -272,6 +272,96 @@ fn pending_directory_id(path: &Path) -> Option<(u64, u64)> {
 fn pending_directory_id(_path: &Path) -> Option<(u64, u64)> {
     None
 }
+// Keep application ownership locks off SQLite files. On Windows fs2 locks the
+// entire byte range, including SQLite's exclusive PENDING_BYTE read handshake.
+// These stable siblings are never unlinked while a published payload exists.
+fn payload_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+fn open_lease_file(path: &Path, create: bool) -> Result<File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(create)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Inspect a reparse point itself instead of following it.
+        options.custom_flags(0x00200000);
+    }
+    let file = options.open(path).map_err(|e| e.to_string())?;
+    if !file
+        .metadata()
+        .map_err(|e| e.to_string())?
+        .file_type()
+        .is_file()
+        || !std::fs::symlink_metadata(path)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_file()
+    {
+        return Err("Arquivo de lease de exclusão não é regular.".into());
+    }
+    Ok(file)
+}
+#[cfg(unix)]
+fn lease_identity(file: &File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata().ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+#[cfg(windows)]
+fn lease_identity(file: &File) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }.ok()?;
+    Some((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+#[cfg(not(any(unix, windows)))]
+fn lease_identity(_file: &File) -> Option<(u64, u64)> {
+    None
+}
+fn same_lease_path(path: &Path, file: &File) -> Result<bool, String> {
+    let current = open_lease_file(path, false)?;
+    let identity = lease_identity(file);
+    Ok(identity.is_some() && identity == lease_identity(&current))
+}
+struct PayloadLock {
+    file: File,
+    path: PathBuf,
+}
+impl PayloadLock {
+    fn shared(payload: &Path) -> Result<std::sync::Arc<Self>, String> {
+        let path = payload_lock_path(payload);
+        let file = open_lease_file(&path, true)?;
+        FileExt::try_lock_shared(&file).map_err(|e| format!("Payload de exclusão ocupado: {e}"))?;
+        let lease = Self { file, path };
+        lease.validate()?;
+        Ok(std::sync::Arc::new(lease))
+    }
+    fn validate(&self) -> Result<(), String> {
+        if !same_lease_path(&self.path, &self.file)? {
+            return Err("Lease de exclusão alterado; recarregue a análise.".into());
+        }
+        Ok(())
+    }
+}
 struct PendingDirectory {
     directory: Option<tempfile::TempDir>,
     // Outside the removable directory: the owner lock stays held during its
@@ -514,7 +604,7 @@ impl PendingSweep {
                     .read_to_end(&mut locked)
                     .map_err(|e| e.to_string())?;
                 if locked != bytes
-                    || small_regular(&owner_path)? != bytes
+                    || !same_lease_path(&owner_path, &owner)?
                     || small_regular(&target.join(PENDING_MARKER))? != bytes
                 {
                     return Ok(false);
@@ -542,10 +632,13 @@ impl PendingSweep {
                     let Some(name) = name.to_str() else {
                         return Ok(false);
                     };
-                    if files.len() >= 3
+                    if files.len() >= 4
                         || !matches!(
                             name,
-                            PENDING_MARKER | "payload.sqlite3" | "payload.sqlite3-journal"
+                            PENDING_MARKER
+                                | "payload.sqlite3"
+                                | "payload.sqlite3-journal"
+                                | "payload.sqlite3.lock"
                         )
                         || !child.file_type().map_err(|e| e.to_string())?.is_file()
                     {
@@ -612,6 +705,13 @@ fn stamp(file: &File) -> Result<(u64, Option<SystemTime>), String> {
     let m = file.metadata().map_err(|e| e.to_string())?;
     Ok((m.len(), m.modified().ok()))
 }
+fn path_stamp(path: &Path) -> Result<(u64, Option<SystemTime>), String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.file_type().is_file() {
+        return Err("Payload de exclusão ausente ou não regular.".into());
+    }
+    Ok((metadata.len(), metadata.modified().ok()))
+}
 fn hash_file(path: &Path, work: &Work<'_>) -> Result<(u64, String), String> {
     if !std::fs::symlink_metadata(path)
         .map_err(|e| e.to_string())?
@@ -640,7 +740,7 @@ fn hash_file(path: &Path, work: &Work<'_>) -> Result<(u64, String), String> {
             reported = Instant::now();
         }
     }
-    if stamp(&file)? != before || stamp(&File::open(path).map_err(|e| e.to_string())?)? != before {
+    if stamp(&file)? != before || path_stamp(path)? != before {
         return Err("Payload de exclusão mudou durante a validação.".into());
     }
     (work.progress)("verifying", completed, Some(before.0));
@@ -978,6 +1078,7 @@ fn validate_payload_schema(conn: &Connection) -> Result<(), String> {
 
 struct Payload {
     conn: Connection,
+    lease: std::sync::Arc<PayloadLock>,
     path: PathBuf,
     file: std::sync::Arc<File>,
     stamp: (u64, Option<SystemTime>),
@@ -992,12 +1093,12 @@ impl Payload {
         if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() != meta.bytes {
             return Err("Tamanho do payload de exclusão não confere.".into());
         }
+        let lease = PayloadLock::shared(&path)?;
         let (bytes, digest) = hash_file(&path, work)?;
         if bytes != meta.bytes || digest != meta.sha256 {
             return Err("Exclusões corrompidas: a integridade do payload não confere. A análise permanece bloqueada até recuperar ou restaurar o lote.".into());
         }
         let file = File::open(&path).map_err(|e| e.to_string())?;
-        FileExt::lock_shared(&file).map_err(|e| e.to_string())?;
         let stamp = stamp(&file)?;
         let conn = Connection::open_with_flags(
             &path,
@@ -1056,8 +1157,10 @@ impl Payload {
             }
             sources
         };
+        lease.validate()?;
         Ok(Self {
             conn,
+            lease,
             path,
             file: std::sync::Arc::new(file),
             stamp,
@@ -1066,9 +1169,8 @@ impl Payload {
         })
     }
     fn unchanged(&self) -> Result<(), String> {
-        if stamp(&self.file)? != self.stamp
-            || stamp(&File::open(&self.path).map_err(|e| e.to_string())?)? != self.stamp
-        {
+        self.lease.validate()?;
+        if stamp(&self.file)? != self.stamp || path_stamp(&self.path)? != self.stamp {
             return Err(
                 "Payload de exclusão alterado; recarregue e verifique a integridade.".into(),
             );
@@ -1473,15 +1575,15 @@ pub fn list(
 /// connections into parallel query execution.
 #[derive(Clone)]
 pub(crate) struct MembershipLease {
+    lease: std::sync::Arc<PayloadLock>,
     file: std::sync::Arc<File>,
     path: PathBuf,
     stamp: (u64, Option<SystemTime>),
 }
 impl MembershipLease {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if stamp(&self.file)? != self.stamp
-            || stamp(&File::open(&self.path).map_err(|e| e.to_string())?)? != self.stamp
-        {
+        self.lease.validate()?;
+        if stamp(&self.file)? != self.stamp || path_stamp(&self.path)? != self.stamp {
             return Err(
                 "Payload de exclusão alterado; verifique a integridade antes de consultar.".into(),
             );
@@ -1514,6 +1616,7 @@ impl VerifiedView {
             .iter()
             .flat_map(|batch| std::iter::once(&batch.original).chain(batch.masks.iter()))
             .map(|payload| MembershipLease {
+                lease: std::sync::Arc::clone(&payload.lease),
                 file: std::sync::Arc::clone(&payload.file),
                 path: payload.path.clone(),
                 stamp: payload.stamp,
@@ -1928,8 +2031,8 @@ fn portable_file(dir: &Path, meta: &PayloadMeta, budget: &Budget) -> Result<Port
     {
         return Err("Payload portátil não é um arquivo regular.".into());
     }
+    let lease = PayloadLock::shared(&path)?;
     let file = File::open(&path).map_err(|e| e.to_string())?;
-    FileExt::lock_shared(&file).map_err(|e| e.to_string())?;
     let stamp = stamp(&file)?;
     if stamp.0 != meta.bytes {
         return Err("Tamanho do payload portátil não confere.".into());
@@ -1937,6 +2040,7 @@ fn portable_file(dir: &Path, meta: &PayloadMeta, budget: &Budget) -> Result<Port
     Ok(PortableFile {
         meta: meta.clone(),
         lease: MembershipLease {
+            lease,
             file: std::sync::Arc::new(file),
             path,
             stamp,
@@ -2506,6 +2610,107 @@ mod tests {
             analysis: snapshot.identity(),
             source_receipt: json!({"generation":7,"sources":["version-one"]}),
         }
+    }
+    #[test]
+    fn payload_lease_allows_sqlite_reads_and_survives_compiled_view() {
+        let f = Fixture::new();
+        let receipt = f.exclude(&[1, 3]);
+        let path = db_path(f.path(), &receipt.batch_id).unwrap();
+        let view = visibility(
+            f.path(),
+            &f.admission().analysis,
+            &Budget::default(),
+            &work(),
+        )
+        .unwrap();
+        // A real SQLite schema/row read while the application lease is retained.
+        // Windows used to fail this before returning from Payload::open.
+        assert_eq!(
+            view.batches[0]
+                .original
+                .conn
+                .query_row::<u64, _, _>("SELECT count(*) FROM members", [], |row| row.get(0))
+                .unwrap(),
+            2
+        );
+        let detached = view.leases();
+        let owner = open_lease_file(&payload_lock_path(&path), false).unwrap();
+        assert!(owner.try_lock_exclusive().is_err());
+        let payload_file = File::open(&path).unwrap();
+        payload_file
+            .try_lock_exclusive()
+            .expect("application lease must not cover SQLite lock bytes");
+        FileExt::unlock(&payload_file).unwrap();
+        drop(payload_file);
+        drop(view);
+        assert!(
+            owner.try_lock_exclusive().is_err(),
+            "compiled visibility retains the lease"
+        );
+        detached[0].validate().unwrap();
+        let portable = portable_file(
+            f.path(),
+            &info(
+                &crate::case_store::context_connection(f.path()).unwrap(),
+                &f.admission().analysis.analysis_id,
+                &receipt.batch_id,
+            )
+            .unwrap()
+            .payload,
+            &Budget::default(),
+        )
+        .unwrap();
+        drop(detached);
+        assert!(
+            owner.try_lock_exclusive().is_err(),
+            "portable capture retains the same lease"
+        );
+        drop(portable);
+        owner.try_lock_exclusive().unwrap();
+    }
+    #[test]
+    fn contended_payload_lease_fails_before_verification_without_waiting() {
+        let f = Fixture::new();
+        let staged = f.stage(Purpose::Exclude, &[1]);
+        let path = staged.directory.path().join("payload.sqlite3");
+        let owner = open_lease_file(&payload_lock_path(&path), true).unwrap();
+        owner.try_lock_exclusive().unwrap();
+        let verified = Cell::new(false);
+        let work = Work {
+            cancelled: &|| false,
+            progress: &|phase, _, _| {
+                if phase == "verifying" {
+                    verified.set(true);
+                }
+            },
+        };
+        let error = Payload::open(path, &staged.payload, &work).err().unwrap();
+        assert!(error.contains("ocupado"), "{error}");
+        assert!(!verified.get());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_whole_file_lease_overlaps_sqlite_pending_byte() {
+        let f = Fixture::new();
+        let staged = f.stage(Purpose::Exclude, &[1]);
+        let path = staged.directory.path().join("payload.sqlite3");
+        let file = File::open(&path).unwrap();
+        FileExt::lock_shared(&file).unwrap();
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        conn.busy_timeout(Duration::ZERO).unwrap();
+        let error = conn
+            .query_row::<u64, _, _>("SELECT count(*) FROM members", [], |row| row.get(0))
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        FileExt::unlock(&file).unwrap();
+        assert_eq!(
+            conn.query_row::<u64, _, _>("SELECT count(*) FROM members", [], |row| row.get(0))
+                .unwrap(),
+            1
+        );
     }
     #[test]
     fn staged_payload_is_not_visible_until_atomic_publication() {
@@ -3477,6 +3682,8 @@ mod tests {
             b"unfinished payload",
         )
         .unwrap();
+        // Completed or partially restored stages can have a sibling lease.
+        std::fs::write(pending.path().join("payload.sqlite3.lock"), b"").unwrap();
         std::fs::write(
             path.join("child-pending-path"),
             pending.path().to_str().unwrap(),

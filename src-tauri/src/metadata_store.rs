@@ -475,6 +475,8 @@ pub(crate) struct LineBuilder {
     file: Option<BufWriter<File>>,
     sealed: usize,
     tail: Option<LineMeta>,
+    #[cfg(windows)]
+    read_cursor: parking_lot::Mutex<()>,
 }
 impl LineBuilder {
     pub(crate) fn len(&self) -> usize {
@@ -545,7 +547,7 @@ impl LineBuilder {
             return Err("Metadados temporários não foram sincronizados para leitura.".into());
         }
         let mut bytes = [0; RECORD_BYTES];
-        read_at(file.get_ref(), &mut bytes, row as u64 * RECORD_BYTES as u64)?;
+        self.read_spool(file.get_ref(), &mut bytes, row as u64 * RECORD_BYTES as u64)?;
         Ok(decode_record(&bytes))
     }
     /// Checkpoint transfer stays bounded to 8192 rows regardless of source size.
@@ -564,7 +566,7 @@ impl LineBuilder {
             if !file.buffer().is_empty() {
                 return Err("Metadados temporários não foram sincronizados para leitura.".into());
             }
-            read_at(
+            self.read_spool(
                 file.get_ref(),
                 &mut bytes,
                 range.start as u64 * RECORD_BYTES as u64,
@@ -579,6 +581,16 @@ impl LineBuilder {
         }
         Ok(rows)
     }
+    fn read_spool(&self, file: &File, bytes: &mut [u8], offset: u64) -> Result<(), String> {
+        #[cfg(windows)] {
+            // seek_read moves the shared Windows file cursor. Keep checkpoint
+            // readers serialized and restore the append position before any
+            // later buffered write (including the final mutable tail).
+            let _guard = self.read_cursor.lock();
+            return preserve_cursor(file, || read_at(file, bytes, offset));
+        }
+        #[cfg(not(windows))] { read_at(file, bytes, offset) }
+    }
     pub(crate) fn finish(mut self) -> Result<LineStore, String> {
         if let Some(tail) = self.tail.take() {
             self.write_row(tail)?;
@@ -588,6 +600,10 @@ impl LineBuilder {
             return Ok(LineStore::default());
         };
         let file = file.into_inner().map_err(|e| e.to_string())?;
+        let expected = self.sealed.checked_mul(RECORD_BYTES).ok_or("Metadados excedem o limite de bytes.")?;
+        if file.metadata().map_err(|e|e.to_string())?.len() != expected as u64 {
+            return Err("Metadados temporários truncados ou com tamanho inconsistente.".into());
+        }
         // SAFETY: consumed private spool, no other write handle escapes. Its
         // only owner moves into Mapping, whose bytes are always read-only.
         let bytes = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| e.to_string())?;
@@ -611,6 +627,16 @@ impl LineBuilder {
             len: self.sealed,
         })
     }
+}
+
+#[cfg(any(windows, test))]
+fn preserve_cursor(file: &File, read: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom};
+    let mut handle = file;
+    let original = handle.stream_position().map_err(|e|e.to_string())?;
+    let result = read();
+    let restored = handle.seek(SeekFrom::Start(original)).map_err(|e|e.to_string());
+    result.and(restored.map(|_| ()))
 }
 
 fn read_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> Result<(), String> {
@@ -828,6 +854,31 @@ mod tests {
         assert_eq!(published.last().unwrap().len, 333);
     }
     #[test]
+    fn checkpoint_sample_before_end_does_not_overwrite_final_tail() {
+        let mut rows = LineBuilder::default();
+        rows.extend((0..60_010).map(row)).unwrap(); rows.flush().unwrap();
+        assert_eq!(fields(rows.read_chunk(1..2).unwrap()[0]), fields(row(1)));
+        assert_eq!(fields(rows.at(7).unwrap()), fields(row(7)));
+        rows.last_mut().unwrap().len = 777;
+        let mapped = rows.finish().unwrap();
+        assert_eq!(mapped.len(), 60_010);
+        for i in [0,1,7,8,8192,60_008] { assert_eq!(fields(mapped.at(i)),fields(row(i as u64))); }
+        assert_eq!(mapped.last().unwrap().len,777);
+    }
+    #[test]
+    fn cursor_guard_restores_offset_on_success_and_io_failure() {
+        use std::io::{Seek, SeekFrom, Read};
+        let mut file = tempfile::tempfile().unwrap(); file.write_all(b"abcdef").unwrap();
+        for fail in [false,true] {
+            let result = preserve_cursor(&file, || {
+                let mut handle = &file; handle.seek(SeekFrom::Start(1)).unwrap();
+                let mut bytes=[0;2]; handle.read_exact(&mut bytes).unwrap(); assert_eq!(&bytes,b"bc");
+                if fail { Err("owned failure".into()) } else { Ok(()) }
+            });
+            assert_eq!(result.is_err(),fail); assert_eq!(file.stream_position().unwrap(),6);
+        }
+    }
+    #[test]
     fn overflowing_append_leaves_existing_views_unchanged() {
         let mut destination = LineStore::from(vec![row(1)]);
         let invalid = LineStore::from(vec![
@@ -851,6 +902,8 @@ mod tests {
             file: Some(BufWriter::new(file)),
             sealed: 0,
             tail: None,
+            #[cfg(windows)]
+            read_cursor: Default::default(),
         };
         rows.push(row(0)).unwrap();
         assert!(rows.finish().is_err());

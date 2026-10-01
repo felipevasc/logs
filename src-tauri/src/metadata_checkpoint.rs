@@ -788,6 +788,27 @@ mod tests {
         assert!(open_complete(dir.path(), &key, 300, 0, false, None).unwrap().is_none(), "full payload checksum must reject changed timestamps");
     }
     #[test]
+    fn shared_complete_read_retains_tail_and_exclusive_resume_truncates_it() {
+        let dir = tempfile::tempdir().unwrap(); let key = "e".repeat(64);
+        let (mut journal, _) = Journal::open(dir.path(), &key, 300, 0, false, None).unwrap_or_else(|e| panic!("{e}"));
+        journal.checkpoint(&[LineMeta { offset: 0, len: 11, ts: 123, ..Default::default() }, LineMeta { offset: 12, len: 10, ts: -7, ..Default::default() }], 300, true, Some(&["field".into()]), None, &|| Ok(())).unwrap();
+        drop(journal);
+        let path = dir.path().join(format!("{key}.lines"));
+        let committed = std::fs::read(&path).unwrap();
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(b"unfinished").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (mapped, _) = open_complete(dir.path(), &key, 300, 0, false, None).unwrap().unwrap();
+        assert_eq!(mapped.len(), 2); assert_eq!(mapped.at(1).ts, -7);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), committed.len() as u64 + 10);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        let writer = OpenOptions::new().read(true).write(true).open(dir.path().join(format!("{key}.lock"))).unwrap();
+        assert!(FileExt::try_lock_exclusive(&writer).is_err());
+        drop(mapped); drop(writer);
+        let (_writer, resumed) = Journal::open(dir.path(), &key, 300, 0, false, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(resumed.resumed_rows, 2);
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+    }
+    #[test]
     fn incomplete_journal_never_publishes_a_mapped_index() {
         let dir = tempfile::tempdir().unwrap(); let key = "d".repeat(64);
         let (mut journal, _) = Journal::open(dir.path(), &key, 300, 0, false, None).unwrap_or_else(|e| panic!("{e}"));

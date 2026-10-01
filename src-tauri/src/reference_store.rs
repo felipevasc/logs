@@ -467,7 +467,9 @@ pub(crate) fn prepare_jsonl(
     connection
         .close()
         .map_err(|(_, error)| Error::Database(error))?;
-    File::open(&database_path)?.sync_all()?;
+    // Windows FlushFileBuffers requires write access. SQLite is closed above;
+    // no ordinary handle may be closed while its connection still owns locks.
+    OpenOptions::new().read(true).write(true).open(&database_path)?.sync_all()?;
     let database_bytes = fs::metadata(&database_path)?.len();
     if database_bytes > limits.database_bytes {
         return Err(Error::Limit("disco do índice"));

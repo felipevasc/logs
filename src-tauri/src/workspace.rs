@@ -2640,9 +2640,40 @@ pub(crate) fn grouped_timeline_impl(
     } else {
         if let Some(result) = with_engine(state, |source| crate::engine::grouped_timeline(source, &prepared, spec))? { return Ok(result); }
         with_selection(state, filters, |selection| {
-            for event in selection.iter() { accumulator.add_event(&event)?; }
+            let indexed = matches!(selection.source, SourceData::Indexed(_));
+            for event in selection.iter() {
+                if indexed { accumulator.add_indexed_event(&event)?; }
+                else { accumulator.add_event(&event)?; }
+            }
             Ok::<(), String>(())
         })??;
     }
     accumulator.finish()
+}
+
+#[cfg(test)]
+mod grouped_epoch_domain_tests {
+    use super::*;
+    #[test]
+    fn grouped_case_and_memory_keep_epoch_distinct_from_absent_time() {
+        let state = AppState {
+            source_publication: Default::default(), source: parking_lot::RwLock::new(SourceData::None),
+            source_names: Default::default(), codes: Default::default(), system_codes: Default::default(),
+            derived: Default::default(), case_store_lock: Default::default(),
+            codes_path: Default::default(), system_codes_path: Default::default(),
+        };
+        let mut epoch = Event::empty(); epoch.timestamp = Some(0); epoch.source = "epoch".into();
+        let mut absent = Event::empty(); absent.id = 1; absent.source = "absent".into();
+        let events = vec![epoch, absent];
+        let spec = crate::grouped_timeline::Spec::new("source".into(),
+            crate::grouped_timeline::Grid { start: 0, bucket_ms: 1, bucket_count: 1 },
+            None, Default::default()).unwrap();
+        let case = grouped_timeline_impl(&state, &[], Some(&events), &spec).unwrap();
+        *state.source.write() = SourceData::Memory(events);
+        let memory = grouped_timeline_impl(&state, &[], None, &spec).unwrap();
+        assert_eq!(case, memory);
+        assert_eq!((case.total.count, case.untimed), (1, 1));
+        assert_eq!(case.total.buckets, [1]);
+        assert_eq!(case.series[0].key, "epoch");
+    }
 }

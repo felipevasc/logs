@@ -205,15 +205,27 @@ impl Accumulator {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
-        let result = self.add_event_inner(event);
+        let result = self.add_event_inner(event, false);
         if let Err(error) = &result {
             self.failure = Some(error.clone());
         }
         result
     }
-    fn add_event_inner(&mut self, event: &Event) -> Result<()> {
+    /// Compact indexed metadata reserves zero for missing time. Case/memory
+    /// Events instead retain the full Option<i64> domain, including the epoch.
+    pub(crate) fn add_indexed_event(&mut self, event: &Event) -> Result<()> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        let result = self.add_event_inner(event, true);
+        if let Err(error) = &result {
+            self.failure = Some(error.clone());
+        }
+        result
+    }
+    fn add_event_inner(&mut self, event: &Event, indexed: bool) -> Result<()> {
         crate::operations::check()?;
-        let Some(timestamp) = event.timestamp.filter(|&t| t != 0) else {
+        let Some(timestamp) = event.timestamp.filter(|&t| !indexed || t != 0) else {
             self.result.untimed = self
                 .result
                 .untimed
@@ -298,7 +310,7 @@ mod tests {
     fn collect(spec: &Spec, events: &[Event]) -> Response {
         let mut accumulator = Accumulator::new(spec).unwrap();
         for event in events {
-            accumulator.add_event(event).unwrap();
+            accumulator.add_indexed_event(event).unwrap();
         }
         accumulator.finish().unwrap()
     }
@@ -326,6 +338,22 @@ mod tests {
                     + response.series.iter().map(|s| s.buckets[i]).sum::<usize>()
             );
         }
+    }
+    #[test]
+    fn epoch_is_present_for_events_and_missing_only_for_compact_indexes() {
+        let spec = spec("group", None);
+        let events = [event(Some(0), Some(json!("epoch"))), event(None, None)];
+        let mut generic = Accumulator::new(&spec).unwrap();
+        for event in &events {
+            generic.add_event(event).unwrap();
+        }
+        let generic = generic.finish().unwrap();
+        assert_eq!((generic.total.count, generic.untimed), (1, 1));
+        assert_eq!(generic.total.buckets, vec![0, 1, 0]);
+        let indexed = collect(&spec, &events);
+        assert_eq!((indexed.total.count, indexed.untimed), (0, 2));
+        reconciles(&generic);
+        reconciles(&indexed);
     }
     #[test]
     fn exact_top_groups_keep_blank_keys_missing_and_outside_counts_separate() {
