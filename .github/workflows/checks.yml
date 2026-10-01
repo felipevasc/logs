@@ -82,7 +82,22 @@ jobs:
           workspaces: src-tauri -> target
       - run: npm ci
       - run: npm run prepare:frontend
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+      - name: Backend tests
+        if: runner.os != 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+      - name: Windows backend tests with loader diagnostics
+        if: runner.os == 'Windows'
+        id: backend_windows
+        shell: pwsh
+        run: ./scripts/ci/windows-native-tests.ps1
+      - name: Preserve Windows native failure evidence
+        if: failure() && runner.os == 'Windows' && steps.backend_windows.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/windows-native-diagnostics/
+          if-no-files-found: warn
+          retention-days: 30
       - name: Build Windows portable review executable
         if: runner.os == 'Windows'
         run: cargo build --manifest-path src-tauri/Cargo.toml --release --locked --bin loginsight
