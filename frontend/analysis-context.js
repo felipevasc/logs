@@ -131,6 +131,7 @@ window.AnalysisContexts = (() => {
         assertOwner(owner);
         if (!Array.isArray(fields)) throw new Error("Lista de campos do Caso inválida.");
         state.derivedFields = fields; state.analysisDefinitionsPending = false; definitionKey = key;
+        window.AnalysisFields?.refresh();
       })();
       definitions.set(requestKey, request);
     }
@@ -141,6 +142,7 @@ window.AnalysisContexts = (() => {
     if (!Array.isArray(fields)) throw new Error("Lista de campos do Caso inválida.");
     state.derivedFields = owner.identity ? fields : []; state.analysisDefinitionsPending = false;
     definitionKey = definitionOwnerKey(owner); activeDefinitionOwner = definitionKey;
+    window.AnalysisFields?.refresh();
   }
   async function receipt(result, owner) {
     if (result?.analysisContext) return adopt(result.analysisContext, { owner });

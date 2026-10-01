@@ -33,7 +33,7 @@ jobs:
       - run: npm run prepare:frontend
       - name: Focused draft interaction checks
         if: github.event_name == 'pull_request' && github.event.pull_request.draft
-        run: npm run test:preview -- test-responsiveness.mjs test-updates.mjs test-explorer-timeline.mjs test-field-transform.mjs test-exclusion-archive.mjs test-case-references.mjs test-canonical-field-actions.mjs
+        run: npm run test:preview -- test-responsiveness.mjs test-updates.mjs test-explorer-timeline.mjs test-field-transform.mjs test-exclusion-archive.mjs test-case-references.mjs test-canonical-field-actions.mjs test-journeys.mjs
       - name: Full browser regression suite
         if: github.event_name != 'pull_request' || !github.event.pull_request.draft
         run: npm run test:preview

@@ -586,3 +586,103 @@ test('clipboard failure remains a failure, and an old clipboard completion canno
   assert.equal(h.calls.notices.length, 0, 'completion in a replaced context is quiet');
   assert.equal(h.calls.focus.length, 0);
 });
+
+function openNewContextMenu(h) {
+  h.context.el = () => ({ style: {}, remove() {}, getBoundingClientRect: () => ({ width: 120, height: 80 }) });
+  h.context.document.body = { appendChild() {} };
+  h.context.innerWidth = 800; h.context.innerHeight = 600;
+  vm.runInContext(app.slice(app.indexOf('let ctxEl = null;'), app.indexOf('\nconst trunc =')), h.context, { filename: 'app.js:showCtxMenu' });
+  h.context.showCtxMenu(10, 10, []);
+}
+
+test('cancel, a new context menu and Escape invalidate pending clipboard feedback', async () => {
+  for (const interruption of ['cancel', 'new menu', 'Escape']) for (const failure of [false, true]) {
+    const h = harness(), gate = deferred(); h.hooks.clipboard = () => gate.promise;
+    const copy = h.fields.copy(h.capture());
+    await reached(() => h.calls.copies.length === 1, 'clipboard write has already been issued');
+    if (interruption === 'cancel') h.fields.cancel();
+    if (interruption === 'new menu') openNewContextMenu(h);
+    if (interruption === 'Escape') assert.deepEqual(h.escape(), { prevented: true, stopped: true });
+    const focusAtInterruption = h.calls.focus.length;
+    assert.equal(focusAtInterruption, interruption === 'Escape' ? 1 : 0);
+    assert.deepEqual(h.calls.cancels, ['canonical-field-action']);
+    if (failure) gate.reject(Error('superseded clipboard permission failure')); else gate.resolve();
+    await copy;
+    assert.deepEqual(h.calls.copies, ['native value'], 'an issued clipboard write cannot be rolled back');
+    assert.equal(h.calls.notices.length, 0, `${interruption}: old success or failure stays quiet`);
+    assert.equal(h.calls.focus.length, focusAtInterruption, `${interruption}: completion cannot restore focus again`);
+    assert.deepEqual(h.escape(), { prevented: false, stopped: false }, 'settled copy no longer consumes Escape');
+  }
+});
+
+test('an old clipboard completion cannot interrupt a newer open filter composer', async () => {
+  for (const failure of [false, true]) {
+    const h = harness(), gate = deferred(); h.hooks.clipboard = () => gate.promise;
+    const old = h.fields.copy(h.capture()); await reached(() => h.calls.copies.length === 1, 'old clipboard write started');
+    assert.equal(await h.fields.filter(h.capture('float')), true);
+    assert.equal(h.calls.drafts.length, 1); assert.equal(h.calls.drafts[0][0], 'float');
+    if (failure) gate.reject(Error('old clipboard failed')); else gate.resolve();
+    await old;
+    assert.equal(h.calls.drafts.length, 1); assert.equal(h.calls.notices.length, 0); assert.equal(h.calls.focus.length, 0);
+    assert.deepEqual(h.escape(), { prevented: false, stopped: false }, 'finished filter leaves Escape to its composer');
+  }
+});
+
+test('an old clipboard completion cannot clear a newer native request that is still pending', async () => {
+  for (const failure of [false, true]) {
+    const h = harness(), clipboard = deferred(), native = deferred(); h.hooks.clipboard = () => clipboard.promise;
+    const old = h.fields.copy(h.capture()); await reached(() => h.calls.copies.length === 1, 'old clipboard write started');
+    h.hooks.exact = () => native.promise;
+    const latest = h.fields.filter(h.capture('float')); await reached(() => h.calls.exact.length === 2, 'new native request started');
+    if (failure) clipboard.reject(Error('old clipboard failed')); else clipboard.resolve();
+    await old;
+    assert.equal(h.calls.notices.length, 0); assert.equal(h.calls.focus.length, 0); assert.equal(h.calls.drafts.length, 0);
+    assert.deepEqual(h.escape(), { prevented: true, stopped: true }, 'old completion must leave the newest request cancellable');
+    native.resolve(h.exactResult(h.calls.exact[1]));
+    assert.equal(await latest, false); assert.equal(h.calls.drafts.length, 0); assert.equal(h.calls.notices.length, 0);
+    assert.equal(h.calls.focus.length, 1, 'only explicit cancellation restores focus');
+  }
+});
+
+test('a newer clipboard completion owns feedback even when an older copy finishes later', async () => {
+  for (const failure of [false, true]) {
+    const h = harness(), first = deferred(), second = deferred();
+    h.hooks.exact = call => h.exactResult(call, { canonicalText: call.args.column });
+    h.hooks.clipboard = () => h.calls.copies.length === 1 ? first.promise : second.promise;
+    const old = h.fields.copy(h.capture('value')); await reached(() => h.calls.copies.length === 1, 'old clipboard write started');
+    const latest = h.fields.copy(h.capture('float')); await reached(() => h.calls.copies.length === 2, 'new clipboard write started');
+    second.resolve(); assert.equal(await latest, true);
+    assert.equal(h.calls.notices.length, 1); assert.equal(h.calls.notices[0].message, 'Valor copiado.'); assert.equal(h.calls.focus.length, 1);
+    if (failure) first.reject(Error('old clipboard failed')); else first.resolve();
+    await old;
+    assert.deepEqual(h.calls.copies, ['value', 'float']); assert.equal(h.calls.notices.length, 1); assert.equal(h.calls.focus.length, 1);
+    assert.deepEqual(h.escape(), { prevented: false, stopped: false });
+  }
+});
+
+test('an old clipboard completion leaves a newer pending clipboard action cancellable', async () => {
+  for (const failure of [false, true]) {
+    const h = harness(), first = deferred(), second = deferred();
+    h.hooks.clipboard = () => h.calls.copies.length === 1 ? first.promise : second.promise;
+    const old = h.fields.copy(h.capture()); await reached(() => h.calls.copies.length === 1, 'old clipboard write started');
+    const latest = h.fields.copy(h.capture('float')); await reached(() => h.calls.copies.length === 2, 'new clipboard write started');
+    if (failure) first.reject(Error('old clipboard failed')); else first.resolve();
+    await old;
+    assert.equal(h.calls.notices.length, 0); assert.equal(h.calls.focus.length, 0);
+    assert.deepEqual(h.escape(), { prevented: true, stopped: true }, 'new clipboard request retains pending ownership');
+    second.resolve(); await latest;
+    assert.equal(h.calls.copies.length, 2, 'both clipboard writes were already issued');
+    assert.equal(h.calls.notices.length, 0); assert.equal(h.calls.focus.length, 1, 'completion adds no focus change after Escape');
+  }
+});
+
+test('clipboard completion does not move focus after the user focuses another control', async () => {
+  const h = harness(), gate = deferred(); h.hooks.clipboard = () => gate.promise;
+  h.context.document.activeElement = { id: 'initial-focus' };
+  const copy = h.fields.copy(h.capture());
+  await reached(() => h.calls.copies.length === 1, 'clipboard write started');
+  const search = { id: 'quick-search' }; h.context.document.activeElement = search;
+  gate.resolve(); assert.equal(await copy, true);
+  assert.equal(h.context.document.activeElement, search); assert.equal(h.calls.focus.length, 0);
+  assert.equal(h.calls.notices.at(-1).message, 'Valor copiado.');
+});

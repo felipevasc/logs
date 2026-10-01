@@ -68,7 +68,7 @@ window.WorkspaceContext = (() => {
       if (!runtime.has(key())) { state.rows = []; state.dataPeriod = null; state.facetData = null; state.explorerCache = null; state.queryError = null; }
     }
     state.visibleCols = state.visibleCols.filter(column => state.columns.includes(column)); if (!state.visibleCols.includes("timestamp")) state.visibleCols.unshift("timestamp");
-    if (!state.columns.includes(state.groupCol)) state.groupCol = "level";
+    if (!state.groupCol) state.groupCol = "level";
     state.stationAnalyticsId = null; state.activeContext = scope === "case" ? "case" : "artifact"; state.analyticsScope = scope;
     $("#explore-tree").dataset.treeScope = scope;
     state.treeAgg[scope] = null; state.treeAggSig[scope] = null; state.treeAggError[scope] = null; treeAggVersion.dataset++; treeAggVersion.case++;

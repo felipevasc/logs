@@ -24,6 +24,12 @@ window.ExplorerTimeline = (() => {
   const safeCount = value => Number.isSafeInteger(value) && value >= 0;
   const color = index => index < COLORS.length ? COLORS[index] : `hsl(${(index * 137.5) % 360} 68% 60%)`;
   function syncFieldControl() {
+    if (window.AnalysisFields) {
+      window.AnalysisFields.control(fieldControl, { value: preferences.field || "", fixed: [["", "Sem agrupamento"]],
+        choose: field => { if ((field || null) !== preferences.field) select(field || null); } });
+      fieldControl.disabled = !state.loaded || !!state.analysisDefinitionsPending || !!state.loadOverlay;
+      return;
+    }
     const fields = [...new Set((state.columns || []).filter(field => typeof field === "string" && field))];
     const missing = preferences.field && !fields.includes(preferences.field) ? preferences.field : null;
     const key = JSON.stringify([fields, missing]);
@@ -172,6 +178,9 @@ window.ExplorerTimeline = (() => {
   async function requestGrouped() {
     if (!preferences.field || !stats) return;
     if (isPaused()) { status = "paused"; paint(); return; }
+    if (window.AnalysisFields && !window.AnalysisFields.available(preferences.field)) {
+      cancel(); grouped = null; status = "failed"; error = "Campo salvo indisponível neste contexto. Escolha outro campo."; paint(); return;
+    }
     const grid = gridFor(stats), expectedBase = contextKey(grid), field = preferences.field, limit = preferences.limit;
     if (expectedBase !== base) { invalidate(); return; }
     if (grouped?.base === base && grouped.result.field === field && grouped.result.limit === limit) { status = "done"; paint(); return; }
@@ -241,5 +250,6 @@ window.ExplorerTimeline = (() => {
       select(field); panel.scrollIntoView?.({ block: "nearest" });
     } };
   }
+  document.addEventListener?.("analysis-fields-change", () => syncFieldControl());
   return { render, summary, select, pause, resume, invalidate, restore, menuItem, capture: () => copy(preferences), gridFor, validate };
 })();

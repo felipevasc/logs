@@ -140,6 +140,7 @@ pub fn compile_rule(text: &str) -> Result<Expr, String> {
 }
 
 pub fn compile_with(text: &str, options: &Options<'_>) -> Result<Expr, String> {
+    crate::operations::check()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(Expr::All);
@@ -148,9 +149,11 @@ pub fn compile_with(text: &str, options: &Options<'_>) -> Result<Expr, String> {
         return Err("A consulta excede 1 MB.".into());
     }
     if is_plain(trimmed) {
-        return Ok(Expr::Term(Term { field: None, matcher: Matcher::Contains(trimmed.to_lowercase()) }));
+        let expr = Expr::Term(Term { field: None, matcher: Matcher::Contains(trimmed.to_lowercase()) });
+        crate::operations::check()?;
+        return Ok(expr);
     }
-    let mut parser = Parser { chars: trimmed.chars().collect(), pos: 0, options, depth: 0 };
+    let mut parser = Parser { chars: trimmed.chars().collect(), pos: 0, options, depth: 0, nodes: 0 };
     let expr = parser.parse_or()?;
     parser.skip_ws();
     if parser.pos < parser.chars.len() {
@@ -160,6 +163,7 @@ pub fn compile_with(text: &str, options: &Options<'_>) -> Result<Expr, String> {
             "Trecho inesperado"
         }));
     }
+    crate::operations::check()?;
     Ok(simplify(expr))
 }
 
@@ -179,7 +183,14 @@ struct Parser<'a> {
     pos: usize,
     options: &'a Options<'a>,
     depth: usize,
+    nodes: usize,
 }
+
+// Bound both recursive consumers (simplify/evaluation/drop) and broad query
+// structures. List entries consume the same work budget even when later folded
+// into a compact set or CIDR matcher. Regex program budgets are separate.
+const MAX_QUERY_DEPTH: usize = 64;
+const MAX_QUERY_NODES: usize = 16_384;
 
 const TEXT_COLUMNS: &[&str] = &["message", "_all", "raw", "description", "name", "@cmdline", "@url", "@user_agent", "@file"];
 
@@ -222,6 +233,14 @@ const AND_WORDS: &[&str] = &["AND", "E", "&&"];
 const NOT_WORDS: &[&str] = &["NOT", "NÃO", "NAO"];
 
 impl Parser<'_> {
+    fn node(&mut self) -> Result<(), String> {
+        crate::operations::check()?;
+        if self.nodes >= MAX_QUERY_NODES {
+            return Err(self.error("Consulta com estrutura excessiva"));
+        }
+        self.nodes += 1;
+        Ok(())
+    }
     fn error(&self, message: &str) -> String {
         let column = self.pos + 1;
         format!("{message} (posição {column}).")
@@ -255,13 +274,14 @@ impl Parser<'_> {
     }
     fn parse_or(&mut self) -> Result<Expr, String> {
         self.depth += 1;
-        if self.depth > 64 {
+        if self.depth > MAX_QUERY_DEPTH {
             return Err(self.error("Consulta com aninhamento excessivo"));
         }
         let mut items = vec![self.parse_and()?];
         loop {
             self.skip_ws();
             if self.take_keyword(OR_WORDS) {
+                if items.len() == 1 { self.node()?; }
                 self.skip_ws();
                 items.push(self.parse_and()?);
             } else {
@@ -284,24 +304,39 @@ impl Parser<'_> {
             }
             self.take_keyword(AND_WORDS);
             self.skip_ws();
+            if items.len() == 1 { self.node()?; }
             items.push(self.parse_unary()?);
         }
         Ok(if items.len() == 1 { items.remove(0) } else { Expr::And(items) })
     }
     fn parse_unary(&mut self) -> Result<Expr, String> {
-        self.skip_ws();
-        if self.take_keyword(NOT_WORDS) {
+        // Unary chains must share the parentheses budget. Previously each NOT
+        // recursively called this function without touching `depth`, so a short
+        // query could overflow parsing, simplify, evaluation or recursive Drop.
+        let mut negations = 0;
+        loop {
             self.skip_ws();
-            return Ok(Expr::Not(Box::new(self.parse_unary()?)));
-        }
-        if let Some(c) = self.peek() {
-            let next = self.chars.get(self.pos + 1).copied();
-            if (c == '-' || c == '!') && next.is_some_and(|n| !n.is_whitespace() && n != '=') {
+            let prefix = self.peek().is_some_and(|c| {
+                let next = self.chars.get(self.pos + 1).copied();
+                (c == '-' || c == '!') && next.is_some_and(|n| !n.is_whitespace() && n != '=')
+            });
+            if prefix {
                 self.pos += 1;
-                return Ok(Expr::Not(Box::new(self.parse_unary()?)));
+            } else if !self.take_keyword(NOT_WORDS) {
+                break;
             }
+            negations += 1;
+            if self.depth + negations > MAX_QUERY_DEPTH {
+                return Err(self.error("Consulta com aninhamento excessivo"));
+            }
+            self.node()?;
         }
-        self.parse_primary()
+        self.depth += negations;
+        let result = self.parse_primary();
+        self.depth -= negations;
+        let mut expr = result?;
+        for _ in 0..negations { expr = Expr::Not(Box::new(expr)); }
+        Ok(expr)
     }
     fn parse_primary(&mut self) -> Result<Expr, String> {
         self.skip_ws();
@@ -445,6 +480,7 @@ impl Parser<'_> {
         self.chars[start..self.pos].iter().collect()
     }
     fn parse_term(&mut self) -> Result<Expr, String> {
+        self.node()?;
         if let Some((name, end)) = self.field_ahead() {
             self.pos = end;
             let op = self.read_op();
@@ -515,6 +551,7 @@ impl Parser<'_> {
                     }
                     continue;
                 }
+                self.node()?;
                 let (value, quoted) = self.read_value_token()?;
                 items.push((value, quoted));
             }
@@ -531,6 +568,7 @@ impl Parser<'_> {
         let matcher = match op {
             "=" => Matcher::Exact(value),
             "!=" => {
+                self.node()?;
                 let inner = self.smart(&field, &value, true)?;
                 return Ok(Expr::Not(Box::new(Expr::Term(Term { field: Some(field), matcher: inner }))));
             }
@@ -1559,5 +1597,77 @@ mod tests {
         assert!(!expr.matches(&ev("x", json!({"src_ip": "11.0.0.1"}))));
         let v6 = IpNet::parse("2001:db8::/32").unwrap();
         assert!(v6.contains("2001:db8::5".parse().unwrap()));
+    }
+
+    #[test]
+    fn unary_prefixes_share_the_parentheses_depth_budget() {
+        let event = ev("match", json!({}));
+        // This bounded 128-prefix fixture was accepted by the old parser: the
+        // recursive unary branch never incremented its depth guard.
+        for prefix in ["NOT ", "!", "-", "NÃO ", "NAO "] {
+            let near = format!("{}message:match", prefix.repeat(MAX_QUERY_DEPTH - 1));
+            assert!(!compile(&near).unwrap().matches(&event));
+            let over = format!("{}message:match", prefix.repeat(MAX_QUERY_DEPTH));
+            assert!(compile(&over).unwrap_err().contains("aninhamento"));
+            let long = format!("{}message:match", prefix.repeat(128));
+            assert!(compile(&long).unwrap_err().contains("aninhamento"));
+        }
+        let grouped = |parentheses: usize, negations: usize| format!(
+            "{}{}message:match{}", "(".repeat(parentheses), "NOT ".repeat(negations), ")".repeat(parentheses),
+        );
+        assert!(!compile(&grouped(32, 31)).unwrap().matches(&event));
+        assert!(compile(&grouped(32, 32)).unwrap_err().contains("aninhamento"));
+        let alternate = format!("{}message:match{}", "NOT (".repeat(32), ")".repeat(32));
+        assert!(compile(&alternate).unwrap_err().contains("aninhamento"));
+        assert!(compile(&format!("{}message:match{}", "(".repeat(63), ")".repeat(63))).is_ok());
+    }
+
+    #[test]
+    fn iterative_unary_parsing_preserves_boolean_and_missing_field_semantics() {
+        let event = ev("match", json!({"value":null,"empty":"","number":1}));
+        for text in ["message:match", "missing:*", "value:null", "empty:\"\"", "number!=2", "(message:match OR missing:*)"] {
+            let original = compile(text).unwrap().matches(&event);
+            for count in 0..12 {
+                let tokens: String = (0..count).map(|n| match n % 3 { 0 => "NOT ", 1 => "!", _ => "-" }).collect();
+                let found = compile(&format!("{tokens}{text}")).unwrap().matches(&event);
+                assert_eq!(found, if count % 2 == 0 { original } else { !original }, "{count}: {text}");
+            }
+        }
+        // Prefix-looking text protected by a quoted value remains literal.
+        assert!(compile("message:\"!!match\"").unwrap().matches(&ev("!!match", json!({}))));
+        assert!(compile("message:\"NOT match\"").unwrap().matches(&ev("NOT match", json!({}))));
+    }
+
+    #[test]
+    fn flat_terms_and_value_lists_are_bounded_before_growth() {
+        let near = std::iter::repeat_n("value:x", MAX_QUERY_NODES - 1).collect::<Vec<_>>().join(" OR ");
+        let over = format!("{near} OR value:x");
+        assert!(near.len() < 1_000_000);
+        assert!(compile(&near).is_ok());
+        assert!(compile(&over).unwrap_err().contains("estrutura"));
+        let values = std::iter::repeat_n("x", MAX_QUERY_NODES - 1).collect::<Vec<_>>().join(" OR ");
+        assert!(compile(&format!("value:({values})")).is_ok());
+        assert!(compile(&format!("value:({values} OR x)")).unwrap_err().contains("estrutura"));
+        // Existing large, useful set queries fit; the work cap is not a
+        // 64-item restriction disguised as a recursion-depth check.
+        let values = (0..5000).map(|i| format!("value{i}")).collect::<Vec<_>>().join(" OR ");
+        assert!(compile(&format!("field:({values})")).unwrap().matches(&ev("", json!({"field":"value4999"}))));
+    }
+
+    #[test]
+    fn parser_resource_checks_observe_named_cancellation() {
+        let id = format!("parser-bounds-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let unrelated = crate::operations::token(None).unwrap();
+        assert!(crate::operations::run_with_token(token, || {
+            let options = Options { threats: None, detections: true };
+            let mut parser = Parser { chars: vec![], pos: 0, options: &options, depth: 0, nodes: 0 };
+            parser.node().unwrap();
+            assert!(crate::operations::cancel_id(&id));
+            assert!(parser.node().is_err(), "check between parser nodes");
+            assert!(compile("message:match").is_err(), "check before parsing");
+        }).is_err());
+        assert!(!unrelated.cancelled());
+        assert!(compile("message:match").is_ok(), "cancelled context was restored");
     }
 }

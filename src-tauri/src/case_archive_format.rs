@@ -244,10 +244,26 @@ pub(crate) fn write<T: Serialize>(
 }
 
 pub(crate) fn is_archive(path: &Path) -> Result<bool, String> {
-    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut file = open_regular(path)?;
     let mut magic = [0u8; MAGIC.len()];
     // Recognize the family even when a newer version must be rejected by read.
     Ok(file.read_exact(&mut magic).is_ok() && magic[..12] == MAGIC[..12])
+}
+
+/// Validate the opened handle, not a pathname checked before opening. Unix
+/// nonblocking open avoids waiting for a FIFO writer before its type is known.
+pub(crate) fn open_regular(path: &Path) -> Result<File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Selecione um arquivo regular para importar o Caso ou a imagem.".into());
+    }
+    Ok(file)
 }
 
 /// Every body is verified before returning. Temporary files are automatically
@@ -257,7 +273,8 @@ pub(crate) fn read<T: DeserializeOwned>(
     staging_parent: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<StagedArchive<T>, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
+    if cancelled() { return Err("Operação cancelada.".into()); }
+    let file = open_regular(path)?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     if size > MAX_ARCHIVE_BYTES {
         return Err("O arquivo portátil excede 32 GiB.".into());
@@ -323,6 +340,51 @@ pub(crate) fn read<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn cancelled_archive_read_stops_before_opening_the_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("does-not-exist.licase");
+        assert!(read::<Value>(&missing, directory.path(), &|| true).unwrap_err().contains("cancelada"));
+        assert!(open_regular(directory.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_inputs_do_not_block_archive_or_json_import() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        const INPUT: &str = "LOGINSIGHT_TEST_NONREGULAR_INPUT";
+        if let Some(path) = std::env::var_os(INPUT) {
+            let path = PathBuf::from(path);
+            let root = tempfile::tempdir().unwrap();
+            assert!(is_archive(&path).unwrap_err().contains("regular"));
+            assert!(read::<Value>(&path, root.path(), &|| false).unwrap_err().contains("regular"));
+            assert!(crate::case_images::import_at(root.path(), &path).unwrap_err().contains("regular"));
+            assert!(!root.path().join("investigations.sqlite3").exists());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("input.licase");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "case_archive_format::tests::non_regular_inputs_do_not_block_archive_or_json_import", "--test-threads=1"])
+            .env(INPUT, &fifo).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); break; }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill(); let _ = child.wait();
+                panic!("non-regular input blocked before cancellation/type validation");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ordinary = directory.path().join("ordinary.json");
+        std::fs::write(&ordinary, b"{}").unwrap();
+        let link = directory.path().join("regular-link.json");
+        symlink(&ordinary, &link).unwrap();
+        assert!(!is_archive(&link).unwrap(), "regular symlink targets retain their existing input policy");
+    }
 
     fn entry(kind: EntryKind, bytes: &[u8]) -> Entry {
         Entry {

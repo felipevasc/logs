@@ -74,9 +74,9 @@ fn contained_file(directory: &Path, id: &str, thumbnail: bool) -> Result<PathBuf
     Ok(path)
 }
 fn read_bytes(path: &Path, max: usize) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(path).map_err(|_| {
-        "Imagem do Caso não encontrada. Importe a investigação com os anexos originais.".to_string()
-    })?;
+    let file = crate::case_archive_format::open_regular(path).map_err(|error| format!(
+        "Imagem do Caso não encontrada. Importe a investigação com os anexos originais. ({error})"
+    ))?;
     if file.metadata().map_err(|e| e.to_string())?.len() > max as u64 {
         return Err("Imagem excede o limite permitido.".into());
     }

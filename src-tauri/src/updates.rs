@@ -158,6 +158,14 @@ struct Inner {
     close_requested: Option<Instant>,
     notice: Option<Notice>,
     download: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// Abort schedules cancellation; ownership also guards synchronous work
+    /// already running between await points. Arc identity cannot wrap/reuse
+    /// while an older callback still retains its ticket.
+    download_owner: Option<Arc<()>>,
+}
+
+fn owns_download(inner: &Inner, ticket: &Arc<()>) -> bool {
+    inner.download_owner.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, ticket))
 }
 
 pub struct UpdateState {
@@ -197,6 +205,7 @@ pub fn prepare(current: &Version) -> UpdateState {
             close_requested: None,
             notice,
             download: None,
+            download_owner: None,
         }),
     }
 }
@@ -513,15 +522,19 @@ pub fn update_download(app: AppHandle) -> Result<Status, String> {
     inner.downloaded = 0;
     inner.total = None;
     inner.error = None;
+    let ticket = Arc::new(());
+    inner.download_owner = Some(Arc::clone(&ticket));
     let handle = app.clone();
     inner.download = Some(tauri::async_runtime::spawn(async move {
         let progress = handle.clone();
+        let progress_ticket = Arc::clone(&ticket);
         let mut shown = Instant::now();
         let result = update
             .download(
                 move |chunk, total| {
                     let state = progress.state::<UpdateState>();
                     let mut inner = state.inner.lock();
+                    if !owns_download(&inner, &progress_ticket) { return; }
                     inner.downloaded += chunk as u64;
                     inner.total = total;
                     if shown.elapsed() >= Duration::from_millis(200) {
@@ -534,7 +547,9 @@ pub fn update_download(app: AppHandle) -> Result<Status, String> {
             .await;
         let state = handle.state::<UpdateState>();
         let mut inner = state.inner.lock();
+        if !owns_download(&inner, &ticket) { return; }
         inner.download = None;
+        inner.download_owner = None;
         match result {
             Ok(package) => {
                 inner.package = Some(Arc::new(package));
@@ -554,6 +569,7 @@ pub fn update_download(app: AppHandle) -> Result<Status, String> {
 pub fn update_cancel(app: AppHandle, state: State<'_, UpdateState>) -> Status {
     let mut inner = state.inner.lock();
     if inner.phase == Phase::Downloading {
+        inner.download_owner = None;
         if let Some(task) = inner.download.take() {
             task.abort();
         }
@@ -927,6 +943,7 @@ mod tests {
             phase: Phase::Installing, update: None, package: Some(package.clone()),
             downloaded: 3, total: Some(3), error: None, install_on_close: true,
             close_requested: Some(Instant::now()), notice: None, download: None,
+            download_owner: None,
         };
         let message = restore_failed_install(&mut inner, "o instalador não iniciou");
         assert_eq!(inner.phase, Phase::Ready);
@@ -936,6 +953,26 @@ mod tests {
         assert!(inner.close_requested.is_none());
         assert!(message.contains("Tente novamente"));
         assert!(message.contains("continua aberto"));
+    }
+
+    #[test]
+    fn download_tickets_do_not_rebind_cancelled_callbacks_to_new_requests() {
+        let first = Arc::new(());
+        let mut inner = Inner {
+            prefs: Prefs::default(), phase: Phase::Downloading, update: None, package: None,
+            downloaded: 0, total: None, error: None, install_on_close: false,
+            close_requested: None, notice: None, download: None,
+            download_owner: Some(Arc::clone(&first)),
+        };
+        assert!(owns_download(&inner, &first));
+        inner.download_owner = None; inner.phase = Phase::Available;
+        assert!(!owns_download(&inner, &first));
+        let second = Arc::new(());
+        inner.download_owner = Some(Arc::clone(&second)); inner.phase = Phase::Downloading;
+        assert!(!owns_download(&inner, &first), "same phase never grants an old callback ownership");
+        assert!(owns_download(&inner, &second));
+        inner.download_owner = None; inner.phase = Phase::Ready;
+        assert!(!owns_download(&inner, &second));
     }
 
     #[test]

@@ -211,6 +211,9 @@ fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexFi
     Ok(Some(selected))
 }
 
+#[cfg(test)]
+thread_local! { static FREE_CANDIDATE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) -> Result<Option<Arc<Selection>>> {
     let gate = crate::analysis_runtime::indexed_gate(src.idx)?;
     let needle = &term.needle;
@@ -220,6 +223,8 @@ fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) 
     }
     // The text index covers stored values AND intrinsic names/descriptions.
     // Catalog overrides are a separate, small source/code relation.
+    #[cfg(test)]
+    FREE_CANDIDATE_PROBES.with(|probes| probes.set(probes.get() + 1));
     let Some(mut candidates) = session.free_candidates(needle, FREE_LIMIT)? else { return Ok(None) };
     if !session.baked {
         let catalog = read_ids(session, &catalog_candidates_sql(&term.names_sql))?;
@@ -376,8 +381,37 @@ fn visible_sql(src: &Source, sql: String, tests: &mut Tests) -> Result<String> {
     Ok(format!("({sql}) AND ({predicate})"))
 }
 
+fn complete_selection_key(session: &Session, pfs: &[PreparedFilter]) -> Option<String> {
+    // Detection/threat registries are mutable independently of the source;
+    // do not reuse those until their revisions become part of this key.
+    cacheable_filters(pfs).then(|| {
+        let filters: Vec<&crate::query::Filter> = pfs.iter().map(|pf| &pf.f).collect();
+        format!("{}#{}", serde_json::to_string(&filters).unwrap_or_default(), session.names_version())
+    })
+}
+
 fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Scope<'s>> {
+    crate::operations::check()?;
     let mut plan = session.schema.plan(pfs);
+    // Cheap exact plans without markers never materialize a whole selection;
+    // preserve their allocation-free key path.
+    let may_materialize = !plan.exact() || costly(&plan.sql)
+        || !plan.tests.free.is_empty() || !plan.tests.hex_fields.is_empty();
+    let key = if may_materialize { complete_selection_key(session, pfs) } else { None };
+    // A complete retained result already includes every required text term.
+    // Re-probing those terms first can churn the shared LRU and evict this
+    // result before it is used. The Session still binds the key to the full
+    // admitted namespace, and visible_sql revalidates mandatory visibility.
+    if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
+        return Ok(Scope {
+            session,
+            cond: visible_sql(src, found.predicate(), &mut plan.tests)?,
+            names: false,
+            _tests: plan.tests,
+            _selection: Some(found),
+            _free: Vec::new(),
+        });
+    }
     let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
     let sql = visible_sql(src, sql, &mut plan.tests)?;
     if plan.exact() && !costly(&sql) {
@@ -388,22 +422,6 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
             _tests: plan.tests,
             _selection: None,
             _free: free,
-        });
-    }
-    // Detection/threat registries are mutable independently of the source;
-    // do not reuse those until their revisions become part of this key.
-    let key = cacheable_filters(pfs).then(|| {
-        let filters: Vec<&crate::query::Filter> = pfs.iter().map(|pf| &pf.f).collect();
-        format!("{}#{}", serde_json::to_string(&filters).unwrap_or_default(), session.names_version())
-    });
-    if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
-        return Ok(Scope {
-            session,
-            cond: visible_sql(src, found.predicate(), &mut plan.tests)?,
-            names: false,
-            _tests: plan.tests,
-            _selection: Some(found),
-            _free: Vec::new(),
         });
     }
     let _build = key.as_deref().map(|key| session.begin_selection(key)).transpose()?;
@@ -486,12 +504,11 @@ fn check_selection_size(rows: u64) -> Result<()> {
 }
 
 /// The table becomes visible only after complete verification and commit.
-/// Both a failed COMMIT and a failed cleanup discard this pooled connection.
+/// Cleanup failures retain their pending tables; failed transaction rollback
+/// discards the pooled connection instead of reusing an unknown state.
 fn selection_write(session: &Session, selection: &Selection, fill: impl FnOnce(&duckdb::Connection) -> Result<u64>) -> Result<()> {
     let mut conn = session.conn()?;
-    for unused in session.take_garbage() {
-        conn.execute_batch(&format!("DROP TABLE IF EXISTS {unused}")).map_err(err)?;
-    }
+    session.collect_garbage_on(&conn)?;
     let cancel = interruptible(&conn)?;
     conn.execute_batch("BEGIN TRANSACTION").map_err(err)?;
     let result: Result<()> = (|| {
@@ -918,6 +935,30 @@ mod bounded_analytics_tests {
     }
 
     #[test]
+    fn failed_or_cancelled_selection_cleanup_retains_every_pending_table_for_retry() {
+        let session = session();
+        session.conn().unwrap().execute_batch("CREATE VIEW retired_wrong_type AS SELECT 1; CREATE TABLE retired_later(id BIGINT)").unwrap();
+        session.garbage().lock().extend(["retired_wrong_type".to_string(), "retired_later".to_string()]);
+        let next = new_selection(&session, false, None);
+        let mut filled = false;
+        assert!(selection_write(&session, &next, |_| { filled = true; Ok(0) }).is_err());
+        assert!(!filled, "failed cleanup cannot begin publishing another selection");
+        assert_eq!(*session.garbage().lock(), vec!["retired_wrong_type", "retired_later"]);
+        session.conn().unwrap().execute_batch("DROP VIEW retired_wrong_type").unwrap();
+        let token = crate::operations::token(Some("selection-cleanup-cancel".into())).unwrap();
+        assert!(crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("selection-cleanup-cancel");
+            session.collect_garbage()
+        }).is_err());
+        assert_eq!(*session.garbage().lock(), vec!["retired_wrong_type", "retired_later"]);
+        session.collect_garbage().unwrap();
+        assert!(session.garbage().lock().is_empty());
+        assert_eq!(session.conn().unwrap().query_row("SELECT count(*) FROM information_schema.tables WHERE table_name='retired_later'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        selection_write(&session, &next, |conn| { conn.execute(&format!("INSERT INTO {} VALUES(7)", next.name), []).map_err(err)?; Ok(1) }).unwrap();
+        assert_eq!(next.accounted_bytes(), 8);
+    }
+
+    #[test]
     fn waiting_for_same_selection_is_cancellable_without_poisoning_builder() {
         let session = Arc::new(session());
         let held = session.begin_selection("filter").unwrap();
@@ -968,6 +1009,61 @@ mod bounded_analytics_tests {
         assert!(cacheable_filters(&filters("query", "timeout OR user:root")));
         assert!(!cacheable_filters(&filters("threat_rule", "whatever")));
         assert!(!cacheable_filters(&filters("detection", "whatever")));
+    }
+
+    #[test]
+    fn complete_filter_cache_precedes_eight_term_lru_churn_and_cancel_checks() {
+        struct Restore(Option<std::ffi::OsString>, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 { Some(value) => std::env::set_var("LOGINSIGHT_ENGINE_DIR", value), None => std::env::remove_var("LOGINSIGHT_ENGINE_DIR") }
+                crate::engine::set_enabled(self.1);
+            }
+        }
+        let _restore = Restore(std::env::var_os("LOGINSIGHT_ENGINE_DIR"), super::super::enabled());
+        let directory = tempfile::tempdir().unwrap();
+        std::env::set_var("LOGINSIGHT_ENGINE_DIR", directory.path().join("engine"));
+        crate::engine::set_enabled(true);
+        let words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"];
+        let path = directory.path().join("cache-order.jsonl");
+        let records: Vec<_> = (0..80).map(|id| serde_json::json!({
+            "timestamp":"2026-01-01T00:00:00Z", "message":words.join(" "), "keep":id % 2 == 0,
+        }).to_string()).collect();
+        std::fs::write(&path, records.join("\n")).unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let config = CodesConfig::default();
+        crate::engine::prepare(&index, &config, &config, &[], &|_, _| {}).unwrap();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let session = super::super::session_checked(&index, &config, &config, &[]).unwrap().unwrap();
+        let mut filters: Vec<_> = words.iter().map(|word| crate::query::Filter {
+            column:"_all".into(), op:"query".into(), value:(*word).into(), value2:None,
+        }).collect();
+        filters.push(crate::query::Filter { column:"raw".into(), op:"contains".into(), value:"\"keep\":true".into(), value2:None });
+        let pfs = prepared(&filters);
+        assert_eq!(session.schema.plan(&pfs).tests.free.len(), 8, "all eight required words have real text probes");
+        assert!(!session.schema.plan(&pfs).exact(), "the complete result must include canonical residual verification");
+        FREE_CANDIDATE_PROBES.with(|probes| probes.set(0));
+        assert_eq!(count_session(&session, &source, &pfs).unwrap(), 40);
+        assert_eq!(FREE_CANDIDATE_PROBES.with(std::cell::Cell::get), 8);
+        let before = session.selection_snapshot();
+        assert_eq!(before["entries"], 8, "whole-filter and term selections share the bounded LRU");
+        FREE_CANDIDATE_PROBES.with(|probes| probes.set(0));
+        assert_eq!(count_session(&session, &source, &pfs).unwrap(), 40);
+        assert_eq!(FREE_CANDIDATE_PROBES.with(std::cell::Cell::get), 0, "a completed filter must skip all repeated term probes");
+        assert_eq!(session.selection_snapshot(), before, "the retained selection must not be evicted by term churn");
+        let token = crate::operations::token(Some("complete-filter-hit-cancel".into())).unwrap();
+        let cancelled = crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("complete-filter-hit-cancel");
+            count_session(&session, &source, &pfs)
+        });
+        assert!(cancelled.is_err());
+        assert_eq!(FREE_CANDIDATE_PROBES.with(std::cell::Cell::get), 0);
+        assert_eq!(session.selection_snapshot(), before);
+        let key = complete_selection_key(&session, &pfs).unwrap();
+        session.names_version.fetch_add(1, Ordering::SeqCst);
+        assert_ne!(complete_selection_key(&session, &pfs).unwrap(), key, "catalog versions cannot reuse an earlier complete result");
+        filters[0].value = "changed".into();
+        assert_ne!(complete_selection_key(&session, &prepared(&filters)).unwrap(), complete_selection_key(&session, &pfs).unwrap());
     }
 
     fn bare_scope(session: &Session) -> Scope<'_> {

@@ -24,7 +24,7 @@
   const exactFilter = (field, value, exclude = false) => ({ column: field, op: value == null ? (exclude ? "not_empty" : "empty") : (exclude ? "not_equals_exact" : "equals_exact"), value: value == null ? "" : String(value), value2: null });
   const displayGroup = value => value == null ? "(vazio)" : value === "(vazio)" ? '“(vazio)”' : String(value);
   const groupValue = row => groupKeys.has(row) ? groupKeys.get(row) : row[groupView.field] === "(vazio)" ? null : row[groupView.field];
-  const fieldNames = (scope = workspaceScope()) => [...new Set(scope === "case" ? [...state.columns, ...STANDARD, ...(scopeProfiles(scope) || []).map(p => p.name)] : state.columns)];
+  const fieldNames = (scope = workspaceScope()) => [...new Set([...(window.AnalysisFields?.names(scope) || state.columns), ...(scope === "case" ? [...STANDARD, ...(scopeProfiles(scope) || []).map(p => p.name)] : [])])];
   const candidates = (scope = workspaceScope()) => {
     const columns = fieldNames(scope), profiles = scopeProfiles(scope) || [];
     const best = profiles.filter(p => p.cardinality > 1 && p.cardinality <= 80 && !["time", "text", "id"].includes(p.kind))
@@ -40,6 +40,7 @@
   function checkMeasures(measures, dimension) {
     const names = new Set(dimension ? [dimension] : []);
     for (const item of measures) {
+      if (item.column !== "*" && window.AnalysisFields && !window.AnalysisFields.available(item.column)) { toast("Uma medida usa um campo indisponível neste contexto. Escolha outro campo.", "info"); return false; }
       if (item.column === "*" && item.func !== "count") { toast("Escolha um campo para calcular essa medida.", "info"); return false; }
       const key = item.alias || `${item.func}(${item.column})`;
       if (names.has(key)) { toast("Cada medida precisa de um nome diferente dos demais campos.", "info"); return false; }
@@ -82,6 +83,8 @@
 
   renderAggs = function () {
     groupShell(); renderGroupShortcuts();
+    window.AnalysisFields?.control($("#group-col"), { value: state.groupCol,
+      choose: field => { state.groupCol = field; groupView.page = 0; renderAggs(); scheduleGroup(); } });
     const box = $("#agg-list"); box.replaceChildren();
     if (!state.aggs.length) state.aggs.push({ func: "count", column: "*", alias: "Registros" });
     for (const [index, agg] of state.aggs.entries()) {
@@ -90,9 +93,11 @@
       for (const [value, label] of Object.entries(measureLabels)) option(fn, value, label);
       fn.value = agg.func;
       const field = el("select"); field.setAttribute("aria-label", `Campo da medida ${index + 1}`);
-      if (agg.func === "count") option(field, "*", "Todos os registros");
-      for (const name of state.columns) option(field, name, colLabel(name));
-      field.value = agg.column;
+      if (!window.AnalysisFields) {
+        if (agg.func === "count") option(field, "*", "Todos os registros");
+        for (const name of fieldNames()) option(field, name, colLabel(name));
+        field.value = agg.column;
+      }
       fn.onchange = () => {
         if (agg.func === "count" && agg.column === "*" && ["qtd", "Registros"].includes(agg.alias)) agg.alias = "";
         agg.func = fn.value;
@@ -100,6 +105,8 @@
         renderAggs(); scheduleGroup();
       };
       field.onchange = () => { agg.column = field.value; scheduleGroup(); };
+      window.AnalysisFields?.control(field, { value: agg.column, fixed: agg.func === "count" ? [["*", "Todos os registros"]] : [],
+        choose: value => { agg.column = value; scheduleGroup(); } });
       const alias = el("input"); alias.type = "text"; alias.placeholder = "Nome opcional"; alias.value = agg.alias || ""; alias.setAttribute("aria-label", `Nome da medida ${index + 1}`);
       alias.onchange = () => { agg.alias = alias.value.trim(); scheduleGroup(); };
       const remove = button("×", () => { state.aggs.splice(index, 1); renderAggs(); scheduleGroup(); }, "icon-btn");
@@ -111,7 +118,12 @@
   runGroup = async function ({ force = false } = {}) {
     groupShell(); clearTimeout(groupTimer);
     if (!scopeHasEvents(workspaceScope())) { groupView.version++; groupView.result = null; groupView.computedKey = ""; $("#aw-group-summary").textContent = workspaceScope() === "case" ? "Adicione registros relevantes ao Caso para resumir." : "Abra um arquivo para resumir seus registros."; $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren(); return; }
-    if (!state.columns.includes(state.groupCol)) state.groupCol = state.columns[0];
+    if (!state.groupCol) state.groupCol = state.columns[0];
+    if (window.AnalysisFields && !window.AnalysisFields.available(state.groupCol)) {
+      groupView.result = null; groupView.computedKey = "";
+      $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren();
+      $("#aw-group-summary").textContent = "O campo salvo está indisponível neste contexto. Escolha um campo para resumir."; return;
+    }
     if (!state.aggs.length) { state.aggs = [{ func: "count", column: "*", alias: "Registros" }]; renderAggs(); }
     if (!checkMeasures(state.aggs, state.groupCol)) return;
 
@@ -279,6 +291,8 @@
       const box = $(`#cz-${zone}`); const items = cube[zone];
       [...box.querySelectorAll(".cube-chip")].forEach((chip, index) => {
         const item = items[index]; chip.querySelector("span").textContent = zone === "values" ? measureName(item) : colLabel(item);
+        const field = zone === "values" ? item.column : item;
+        if (field !== "*" && window.AnalysisFields && !window.AnalysisFields.available(field, state.analyticsScope)) chip.querySelector("span").textContent += " (indisponível)";
         chip.querySelector(".x")?.setAttribute("aria-label", `Remover ${zone === "values" ? measureName(item) : colLabel(item)}`);
         if (zone === "values") {
           const remove = chip.querySelector(".x");
@@ -292,14 +306,22 @@
         if (index > 0) { const move = button("←", event => { event.stopPropagation(); [items[index - 1], items[index]] = [items[index], items[index - 1]]; cubeState.collapsed.clear(); markCubeTableChanged(); renderCubeZones(); runCube(); }, "aw-chip-move"); move.title = "Mover antes"; move.setAttribute("aria-label", "Mover campo antes"); chip.prepend(move); }
       });
       const empty = box.querySelector(".cube-zone-empty"); if (empty) empty.textContent = zone === "rows" ? "Um grupo por linha" : zone === "cols" ? "Opcional: comparar lado a lado" : "Escolha uma medida";
-      const select = el("select", "aw-zone-add"); select.setAttribute("aria-label", `Adicionar campo em ${zone === "rows" ? "linhas" : zone === "cols" ? "colunas" : "valores"}`); option(select, "", "+ Campo");
-      if (zone === "values" && !items.some(v => v.func === "count" && v.column === "*")) option(select, "*", "Contar registros");
-      for (const name of fieldNames(state.analyticsScope)) if (zone === "values" || !items.includes(name)) option(select, name, colLabel(name));
+      const select = el("select", "aw-zone-add"); select.setAttribute("aria-label", `Adicionar campo em ${zone === "rows" ? "linhas" : zone === "cols" ? "colunas" : "valores"}`);
+      if (!window.AnalysisFields) {
+        option(select, "", "+ Campo");
+        if (zone === "values" && !items.some(v => v.func === "count" && v.column === "*")) option(select, "*", "Contar registros");
+        for (const name of fieldNames(state.analyticsScope)) if (zone === "values" || !items.includes(name)) option(select, name, colLabel(name));
+      }
       select.onchange = () => { if (select.value) cubeAdd(zone, select.value); }; box.append(select);
+      window.AnalysisFields?.control(select, { value: "", scope: state.analyticsScope,
+        exclude: zone === "values" ? [] : items,
+        fixed: [["", "+ Campo"], ...(zone === "values" && !items.some(v => v.func === "count" && v.column === "*") ? [["*", "Contar registros"]] : [])],
+        choose: field => { if (field) cubeAdd(zone, field); } });
     }
   };
   cubeAdd = function (zone, field) {
     if (!["rows", "cols", "values"].includes(zone) || !field) return;
+    if (field !== "*" && window.AnalysisFields && !window.AnalysisFields.available(field, state.analyticsScope)) { toast("Este campo não está disponível no contexto atual.", "info"); return; }
     const cube = activeCube();
     if (zone === "values") {
       const kind = (scopeProfiles() || []).find(p => p.name === field)?.kind;
@@ -314,6 +336,11 @@
   const originalRunCube = runCube;
   runCube = async function ({ force = false } = {}) {
     pivotShell(); const cube = activeCube();
+    if (window.AnalysisFields && [...cube.rows, ...cube.cols].some(field => !window.AnalysisFields.available(field, state.analyticsScope))) {
+      cubeState.requestVersion++; window.Tasks?.cancelLatest("pivot"); cubeState.result = null;
+      for (const selector of ["#cube-table thead", "#cube-table tbody", "#aw-pivot-pager"]) $(selector)?.replaceChildren();
+      $("#aw-pivot-summary").textContent = "O cruzamento salvo usa um campo indisponível neste contexto. Escolha outro campo."; return;
+    }
     if (!cube.values.length) { cube.values = [{ func: "count", column: "*", alias: "Registros" }]; renderCubeZones(); }
     if (!checkMeasures(cube.values)) return;
     if (pivotTask.busy) { pivotTask.queued = true; cubeState.requestVersion++; window.Tasks?.cancelLatest("pivot"); return; }
@@ -478,5 +505,9 @@
       if ($("#aw-pivot-summary")) $("#aw-pivot-summary").textContent = "";
     }
   };
+  document.addEventListener?.("analysis-fields-change", () => {
+    renderAggs();
+    if (!$("#view-cube")?.hidden) { renderCubeFields(); renderCubeZones(); }
+  });
   groupShell(); renderAggs(); pivotShell();
 })();

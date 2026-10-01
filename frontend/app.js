@@ -631,10 +631,11 @@ async function api(cmd, args = {}, opts = {}) {
     let casePublication = null;
     const preparedArgs = async (retry = false) => {
       const capturedArgs = retry && !Array.isArray(args.caseEvents) && Array.isArray(opts.caseEvents) ? { ...args, caseEvents: opts.caseEvents } : args;
-      const prepared = await caseArgs(capturedArgs, retry, casePublication, { canonical: cmd === "analysis_field_text" });
+      const requiresCaseToken = cmd === "analysis_field_text" || cmd === "event_detail";
+      const prepared = await caseArgs(capturedArgs, retry, casePublication, { canonical: requiresCaseToken });
       if (prepared.caseKey) casePublication = caseTransport.synced.get(caseSyncKey(prepared.caseKey, prepared)) ?? null;
       if (opts.cancelled?.()) throw new Error("Operação cancelada.");
-      if (cmd === "analysis_field_text" && prepared.caseKey) opts.onCasePrepared?.({ caseKey: prepared.caseKey, caseContentToken: prepared.caseContentToken });
+      if (requiresCaseToken && prepared.caseKey) opts.onCasePrepared?.({ caseKey: prepared.caseKey, caseContentToken: prepared.caseContentToken });
       return prepared;
     };
     try {
@@ -2144,7 +2145,7 @@ function openFilterPop(anchor = null, editIndex = null, preset = null) {
 
   colSel.innerHTML = "";
   colSel.appendChild(el("option", "", colLabel("_all"))).value = "_all";
-  for (const c of state.columns) colSel.appendChild(el("option", "", colLabel(c))).value = c;
+  for (const c of window.AnalysisFields?.names(workspaceScope(), [preset?.column, currentEditFilter?.column]) || state.columns) colSel.appendChild(el("option", "", colLabel(c))).value = c;
   opSel.innerHTML = "";
   for (const [v, l] of OPS) opSel.appendChild(el("option", "", l)).value = v;
 
@@ -4079,23 +4080,32 @@ async function confirmCaseAdd() {
 }
 
 // popover genérico para nomear um grupo antes de enviar à análise
-let namePopCb = null;
-function openNamePop(anchor, cb, { title = "Nome do agrupamento", placeholder = "ex.: Janela de falhas do gateway", initialValue = "" } = {}) {
-  namePopCb = cb;
+let namePopCb = null, namePopExact = false, namePopFocus = null;
+function openNamePop(anchor, cb, { title = "Nome do agrupamento", placeholder = "ex.: Janela de falhas do gateway", initialValue = "", exact = false, confirmLabel = "Enviar" } = {}) {
+  namePopCb = cb; namePopExact = exact; namePopFocus = exact ? anchor : null;
   $("#name-pop .pop-title").textContent = title;
   $("#np-val").placeholder = placeholder;
   $("#np-val").value = initialValue;
+  if (exact) $("#np-val").maxLength = 4096; else $("#np-val").removeAttribute?.("maxlength");
+  $("#np-val").setAttribute("aria-label", title);
+  $("#np-ok").textContent = confirmLabel;
   const pop = $("#name-pop");
+  pop.classList.toggle("field-path-pop", exact);
   pop.hidden = false;
   positionPop(pop, anchor);
   $("#np-val").focus();
 }
+function closeNamePop(restoreFocus = true) {
+  $("#name-pop").hidden = true; namePopCb = null;
+  if (restoreFocus && namePopFocus) filterFocusTarget(namePopFocus)?.focus?.({ preventScroll: true });
+  namePopFocus = null; namePopExact = false;
+}
 function commitNamePop() {
-  const v = $("#np-val").value.trim();
-  $("#name-pop").hidden = true;
+  const raw = $("#np-val").value, v = namePopExact ? raw : raw.trim();
+  if (!v.trim() && namePopExact) return;
   const cb = namePopCb;
-  namePopCb = null;
-  if (v && cb) cb(v);
+  if (v && cb && cb(v) === false) return;
+  if (namePopCb === cb) closeNamePop();
 }
 
 let editingCaseItem = null;
@@ -5191,9 +5201,12 @@ function renderChart(stats) {
 // ------------------------------------------------------------------ colunas
 function fillColumnControls() {
   const g = $("#group-col");
-  g.innerHTML = "";
-  for (const c of state.columns) g.appendChild(el("option", "", colLabel(c))).value = c;
-  g.value = state.columns.includes(state.groupCol) ? state.groupCol : state.columns[0];
+  if (window.AnalysisFields) window.AnalysisFields.control(g, { value: state.groupCol, choose: field => { state.groupCol = field; runGroup(); } });
+  else {
+    g.innerHTML = "";
+    for (const c of state.columns) g.appendChild(el("option", "", colLabel(c))).value = c;
+    g.value = state.groupCol || state.columns[0];
+  }
   renderAggs();
 }
 
@@ -5244,14 +5257,15 @@ function detailAdmissionCurrent(admission) {
   return !!admission && admission.scope === workspaceScope() && (!admission.owner || window.AnalysisContexts.isCurrent(admission.owner))
     && (admission.signature === null || admission.signature === caseSig());
 }
-async function openDetail(id) {
+async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
+  if (!guard()) { toast("O contexto mudou. Abra o registro novamente.", "info"); return false; }
   const request = ++detailRequest;
   const scope = workspaceScope(), owner = window.AnalysisContexts?.capture();
   const evidence = scope === "case" ? caseEvents() : null, signature = scope === "case" ? caseSig() : null;
   const admission = { scope, owner, signature };
   window.Tasks?.cancelLatest("event-detail");
   showDetailLoading();
-  const current = () => request === detailRequest && !$("#drawer").hidden && detailAdmissionCurrent(admission);
+  const current = () => request === detailRequest && !$("#drawer").hidden && detailAdmissionCurrent(admission) && guard();
   const check = () => {
     if (current()) return true;
     if (request === detailRequest && !$("#drawer").hidden) $("#pane-overview").textContent = "O contexto mudou. Abra o registro novamente.";
@@ -5259,24 +5273,23 @@ async function openDetail(id) {
   };
   try {
     let ev;
-    const captured = { analysisContext: owner?.identity ?? null, sourceGeneration: owner?.sourceGeneration ?? null };
-    const options = { silent: true, latest: "event-detail", analysisOwner: owner, caseEvents: evidence };
+    const captured = { id, ...(eventRef !== null ? { eventRef } : {}), analysisContext: owner?.identity ?? null, sourceGeneration: owner?.sourceGeneration ?? null };
+    const options = { silent: true, latest: "event-detail", analysisOwner: owner, caseEvents: evidence,
+      onCasePrepared: () => { if (!current()) throw Error("O contexto mudou. Abra o registro novamente."); } };
     if (scope === "case") {
-      const args = await caseArgs({ ...captured, caseEvents: evidence,
-        filters: [{ column: "id", op: "equals_exact", value: String(id), value2: null }],
-        sortColumn: "id", sortDir: "asc", offset: 0, limit: 1, cursor: null });
-      if (!check()) return;
-      const result = await api("query_page", args, options);
-      if (!check()) return;
-      if (!Array.isArray(result?.rows) || result.rows.length > 1 || result.rows[0] && result.rows[0].id !== id) throw Error("Resposta de detalhe inválida.");
-      ev = result.rows[0];
-    } else ev = await api("event_detail", { id, ...captured }, options);
-    if (!check()) return;
-    if (ev) showDetail(ev, null, admission);
+      const args = await caseArgs({ ...captured, caseEvents: evidence }, false, null, { canonical: true });
+      if (!check()) return false;
+      ev = await api("event_detail", args, options);
+    } else ev = await api("event_detail", captured, options);
+    if (!check()) return false;
+    if (ev != null && (typeof ev !== "object" || Array.isArray(ev) || ev.id !== id)) throw Error("Resposta de detalhe inválida.");
+    if (ev && eventRef !== null && (ev.id !== id || ev.event_ref !== eventRef)) throw Error("O registro retornado não corresponde à referência solicitada.");
+    if (ev) { showDetail(ev, null, admission); return true; }
     else $("#pane-overview").textContent = "Este registro não está disponível no recorte visível atual.";
   } catch (error) {
     if (check()) $("#pane-overview").textContent = `Não foi possível abrir o registro: ${String(error)}`;
   }
+  return false;
 }
 
 // abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
@@ -5427,6 +5440,7 @@ function openDetailValue(node, trigger) {
 }
 
 function detailFieldColumn(node) {
+  if (window.AnalysisFields?.admitted(node)) return node.path;
   let path = node.path;
   while (path) {
     if (state.columns.includes(path)) return path;
@@ -5443,7 +5457,7 @@ function detailFieldFilterValue(node) {
 function detailCanonicalAction(column, node, anchor) {
   const event = state.currentDetailEv, request = detailRequest, admission = state.detailAdmission;
   return window.CanonicalFields.capture(event, column, { anchor,
-    historical: !admission || !state.columns.includes(node.path),
+    historical: !admission || !state.columns.includes(node.path) && !window.AnalysisFields?.admitted(node, admission, event),
     literal: Object.hasOwn(node, "filterValue") ? node.filterValue : node.value,
     guard: () => request === detailRequest && event === state.currentDetailEv && !$("#drawer").hidden && (!admission || detailAdmissionCurrent(admission)) });
 }
@@ -5463,7 +5477,8 @@ function toggleDetailColumn(column) {
 function showDetailNameMenu(event, node) {
   event.preventDefault();
   event.stopPropagation();
-  const column = state.columns.includes(node.path) ? node.path : null;
+  window.AnalysisFields?.observe(node);
+  const column = state.columns.includes(node.path) || window.AnalysisFields?.admitted(node) ? node.path : null;
   const items = [];
   if (column) {
     if (window.ExplorerTimeline) items.push(window.ExplorerTimeline.menuItem(column));
@@ -5490,6 +5505,7 @@ function showDetailNameMenu(event, node) {
 function showDetailValueMenu(event, node, selected = "", inModal = false) {
   event.preventDefault();
   event.stopPropagation();
+  window.AnalysisFields?.observe(node);
   const column = detailFieldColumn(node);
   const actual = column === node.path;
   const raw = actual ? detailFieldFilterValue(node) : String(node.value ?? "");
@@ -5569,17 +5585,16 @@ function renderDetailTree(entries) {
       value.onclick = () => openDetailValue(node, value);
       value.oncontextmenu = (event) => showDetailValueMenu(event, node);
       valueLine.appendChild(value);
-      if (node.original && state.columns.includes(node.path) && node.filterValue != null && String(node.filterValue).trim() !== "" && node.path !== "raw") {
+      if (node.original && (state.columns.includes(node.path) || window.AnalysisFields?.admitted(node)) && node.filterValue != null && String(node.filterValue).trim() !== "" && node.path !== "raw") {
         const filter = el("button", "kv-filter");
         filter.type = "button";
         filter.innerHTML = '<i class="fas fa-filter" aria-hidden="true"></i>';
         filter.title = `Filtrar: ${colLabel(node.path)} = ${display.slice(0, 40)}`;
         filter.setAttribute("aria-label", `Filtrar por ${node.path}`);
-        filter.onclick = (event) => {
+        const action = detailCanonicalAction(node.path, node, filter);
+        filter.onclick = async (event) => {
           event.stopPropagation();
-          const filterValue = detailFieldFilterValue(node);
-          addFilter({ column: node.path, op: node.path === "timestamp" ? "between" : "equals_exact", value: filterValue, value2: node.path === "timestamp" ? filterValue : null });
-          toast("Filtro adicionado.", "ok");
+          if (await window.CanonicalFields.filter(action, { apply: true })) toast("Filtro adicionado.", "ok");
         };
         valueLine.appendChild(filter);
       }
@@ -6296,6 +6311,7 @@ function bindKeyboard() {
       $("#quick-search").focus();
     } else if (e.key === "Escape") {
       if (e.isComposing || e.keyCode === 229) return;
+      if (!$("#name-pop").hidden && namePopExact) { e.preventDefault(); closeNamePop(); return; }
       if (!$("#filter-pop").hidden) { e.preventDefault(); closeFilterPop(); return; }
       if (!$("#detail-value-modal").hidden) {
         closeDetailValue();
@@ -6403,8 +6419,8 @@ function bind() {
     }
   });
   $("#np-ok").onclick = commitNamePop;
-  $("#np-cancel").onclick = () => { $("#name-pop").hidden = true; namePopCb = null; };
-  $("#np-val").addEventListener("keydown", (e) => { if (e.key === "Enter") commitNamePop(); });
+  $("#np-cancel").onclick = () => closeNamePop();
+  $("#np-val").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); if (!e.repeat) commitNamePop(); } });
 
   $("#btn-colpicker").onclick = (e) => {
     e.stopPropagation();
@@ -6416,8 +6432,8 @@ function bind() {
     if (!$("#col-pop").hidden && !e.target.closest("#col-pop") && !e.target.closest("#btn-colpicker"))
       $("#col-pop").hidden = true;
     // .ctx-menu isento: o item que abriu o popover não pode fechá-lo no mesmo clique
-    if (!$("#name-pop").hidden && !e.target.closest("#name-pop") && !e.target.closest(".ctx-menu"))
-      $("#name-pop").hidden = true;
+    if (!$("#name-pop").hidden && !e.target.closest("#name-pop") && !e.target.closest(".ctx-menu") && !e.target.closest("[data-exact-field-picker]"))
+      closeNamePop(false);
   });
 
   $("#page-size").onchange = () => {
@@ -6591,7 +6607,7 @@ function bind() {
     if (!detailValueNode) return;
     const selection = window.getSelection();
     const selected = selection && $("#detail-value-content").contains(selection.anchorNode)
-      && $("#detail-value-content").contains(selection.focusNode) ? selection.toString().trim() : "";
+      && $("#detail-value-content").contains(selection.focusNode) ? selection.toString() : "";
     showDetailValueMenu(event, detailValueNode, selected, true);
   };
   $("#dr-prev").onclick = () => detailStep(-1);
@@ -6988,6 +7004,9 @@ async function renderDashboard(scope = state.analyticsScope) {
 }
 
 async function renderChartCard(body, spec, scope = state.analyticsScope) {
+  if (window.AnalysisFields && [spec.field, spec.split].some(field => field && !window.AnalysisFields.available(field, scope))) {
+    body.textContent = "Campo salvo indisponível neste contexto. Edite o gráfico para escolher outro campo."; return;
+  }
   const res = await api("compute_series", {
     ...analyticsRequest(scope),
     spec: {
@@ -7289,22 +7308,34 @@ function renderLineChart(box, res, id) {
 // ---------- editor de gráfico ----------
 let chartEditing = null;
 let chartEditingScope = "dataset";
+let chartEditingOwner = null;
+function refreshChartFieldChoices() {
+  if (!chartEditing || !window.AnalysisFields || chartEditingOwner && !window.AnalysisFields.isCurrent(chartEditingOwner)) return;
+  const field = $("#cp-field"), split = $("#cp-split");
+  window.AnalysisFields.control(field, { value: field.value, fixed: [["", "(contagem de eventos)"]], scope: chartEditingScope });
+  window.AnalysisFields.control(split, { value: split.value, fixed: [["", "(nenhum)"]], scope: chartEditingScope });
+}
+document.addEventListener("analysis-fields-change", () => { if (!$("#chart-modal").hidden) refreshChartFieldChoices(); });
 
 function openChartEditor(spec, anchor, scope = state.analyticsScope) {
   chartEditing = spec;
   chartEditingScope = scope;
+  chartEditingOwner = window.AnalysisFields?.capture(scope);
   $("#cp-title").value = spec.title;
   $("#cp-chart").value = spec.chart;
   $("#cp-metric").value = spec.metric;
   const field = $("#cp-field"), split = $("#cp-split");
-  field.innerHTML = "";
-  field.appendChild(el("option", "", "(contagem de eventos)")).value = "";
-  for (const c of state.columns) field.appendChild(el("option", "", colLabel(c))).value = c;
-  field.value = spec.field || "";
-  split.innerHTML = "";
-  split.appendChild(el("option", "", "(nenhum)")).value = "";
-  for (const c of state.columns) split.appendChild(el("option", "", colLabel(c))).value = c;
-  split.value = spec.split || "";
+  if (window.AnalysisFields) {
+    window.AnalysisFields.control(field, { value: spec.field || "", fixed: [["", "(contagem de eventos)"]], scope });
+    window.AnalysisFields.control(split, { value: spec.split || "", fixed: [["", "(nenhum)"]], scope });
+  } else {
+    field.innerHTML = ""; field.appendChild(el("option", "", "(contagem de eventos)")).value = "";
+    for (const c of state.columns) field.appendChild(el("option", "", colLabel(c))).value = c;
+    field.value = spec.field || "";
+    split.innerHTML = ""; split.appendChild(el("option", "", "(nenhum)")).value = "";
+    for (const c of state.columns) split.appendChild(el("option", "", colLabel(c))).value = c;
+    split.value = spec.split || "";
+  }
   $("#cp-interval").value = spec.interval_ms ? String(spec.interval_ms) : "";
   $("#cp-type").value = dashboardType(spec);
   syncDashboardChartEditor(false);
@@ -7332,6 +7363,7 @@ function syncDashboardChartEditor(preferCompatibleBase) {
 
 function applyChartEditor() {
   if (!chartEditing) return;
+  if (chartEditingOwner && !window.AnalysisFields.isCurrent(chartEditingOwner)) { toast("O contexto mudou. Abra o gráfico novamente no Caso atual.", "info"); return; }
   const charts = dashboardCharts(chartEditingScope) || [];
   const isNew = !charts.some((x) => x.id === chartEditing.id);
   Object.assign(chartEditing, {

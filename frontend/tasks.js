@@ -29,7 +29,7 @@ window.Tasks = (() => {
   const sourceMutations = new Set(["set_ts_config", "load_file", "load_files", "load_bundle", "load_event_log", "clear_events"]);
   named.add("clear_events"); named.add("grouped_timeline"); named.add("preview_field_transform"); for (const command of ["exclusion_visibility", "exclusion_preview", "exclusion_list", "exclusion_archive_page"]) named.add(command);
   const latest = new Map();
-  named.add("analysis_field_text");
+  named.add("analysis_field_text"); named.add("event_detail");
   for (const command of ["reference_inspect", "reference_list", "reference_import", "reference_remove", "reference_save_lookup"]) named.add(command);
   const background = window.PerformanceTools.queue(1);
 

@@ -557,6 +557,19 @@ pub(crate) fn capture_case(
     events: Option<Vec<Event>>,
     key: Option<String>,
 ) -> Result<(Arc<Admitted>, Option<Vec<Event>>), String> {
+    let (admitted, events) = capture_case_shared(state, identity, generation, events, key)?;
+    Ok((admitted, events.map(|events| Arc::try_unwrap(events).unwrap_or_else(|events| (*events).clone()))))
+}
+
+/// Read-only actions retain the synchronized publication without cloning every
+/// evidence payload on the command-admission thread.
+pub(crate) fn capture_case_shared(
+    state: &AppState,
+    identity: Option<Identity>,
+    generation: Option<u64>,
+    events: Option<Vec<Event>>,
+    key: Option<String>,
+) -> Result<(Arc<Admitted>, Option<Arc<Vec<Event>>>), String> {
     let case = events.is_some() || key.is_some();
     let cache_bound = events.is_none() && key.is_some();
     if case && identity.is_none() {
@@ -569,7 +582,7 @@ pub(crate) fn capture_case(
         if case { Mode::Case } else { Mode::Dataset },
     )?;
     Arc::get_mut(&mut admitted).expect("new admission").case_key = key.clone();
-    let (events, content_token) = crate::case_cache::take_for_with_token(events, key, admitted.identity.as_ref())?;
+    let (events, content_token) = crate::case_cache::resolve_for_with_token(events, key, admitted.identity.as_ref())?;
     let captured = Arc::get_mut(&mut admitted).expect("new admission");
     captured.case_content_token = content_token;
     captured.case_cache_bound = cache_bound;
@@ -763,6 +776,25 @@ impl Admitted {
         &self,
         case_events: Option<Vec<Event>>,
     ) -> Result<Option<Vec<Event>>, String> {
+        self.prepare_visibility_inner(case_events, None)
+    }
+
+    /// A single-record action reuses the full publication's visibility mask,
+    /// but clones and transforms only its requested record. Mask positions are
+    /// original vector positions, never the selected record's numeric ID.
+    pub(crate) fn prepare_visibility_record(
+        &self, case_events: Option<&[Event]>, id: usize, event_ref: Option<&str>,
+    ) -> Result<Option<Vec<Event>>, String> {
+        let Some(events) = case_events else { return self.prepare_visibility(None); };
+        if self.mode != Mode::Case { return Err("Registro de evidência fora de uma captura de Caso.".into()); }
+        let position = crate::case_cache::record_position(events, id, event_ref)?;
+        let selected = position.map(|position| events[position].clone()).into_iter().collect();
+        self.prepare_visibility_inner(Some(selected), Some((events, position)))
+    }
+
+    fn prepare_visibility_inner(
+        &self, case_events: Option<Vec<Event>>, full_case: Option<(&[Event], Option<usize>)>,
+    ) -> Result<Option<Vec<Event>>, String> {
         if self.visibility.get().is_some() {
             return Err("Esta captura de consulta já foi executada.".into());
         }
@@ -809,8 +841,10 @@ impl Admitted {
                         .ok_or("Evidências do Caso ausentes na captura.")?;
                     if let Some(identity) = &self.identity {
                         gate = Some(evidence_row_gate(
-                            EVIDENCE_MASKS
-                                .get_or_prepare(events, identity, &scope, &budget, &work, load)?,
+                            EVIDENCE_MASKS.get_or_prepare(
+                                full_case.map_or(events.as_slice(), |(events, _)| events),
+                                identity, &scope, &budget, &work, load,
+                            )?,
                         )?);
                     }
                     let mut row = 0;
@@ -819,8 +853,8 @@ impl Admitted {
                         if row % 256 == 0 && cancelled() {
                             stopped = true;
                         }
-                        let keep =
-                            !stopped && gate.as_ref().is_none_or(|gate| gate.allows_known_row(row));
+                        let mask_row = full_case.map_or(row, |(_, position)| position.unwrap_or(usize::MAX));
+                        let keep = !stopped && gate.as_ref().is_none_or(|gate| gate.allows_known_row(mask_row));
                         row += 1;
                         if keep {
                             sources::apply_derived(event, &derived);
@@ -2133,6 +2167,33 @@ mod tests {
             expected.iter().map(|event| event.id).collect::<Vec<_>>()
         );
         assert_eq!(originals.len(), 12);
+        // Full Case details consume only the already admitted visible overlay,
+        // never a raw saved-evidence fallback when a member has been excluded.
+        with(Some(case_admitted), || {
+            assert!(crate::detail_commands::detail_in_scope(
+                &state, 0, Some(&originals[0].event_ref), Some(filtered.clone()),
+            ).unwrap().is_none());
+            let detail = crate::detail_commands::detail_in_scope(
+                &state, 6, Some(&originals[6].event_ref), Some(filtered.clone()),
+            ).unwrap().unwrap();
+            assert_eq!(detail.raw, originals[6].raw);
+            assert_eq!(detail.event_ref, originals[6].event_ref);
+        });
+        let mut reordered = originals.clone();
+        reordered.rotate_left(2);
+        reordered.iter_mut().find(|event| event.id == 6).unwrap().id = 500;
+        for (id, original_position) in [(0, 0), (500, 6)] {
+            let (single, shared) = capture_case_shared(&state, Some(directory.snapshot("a").identity()), None,
+                Some(reordered.clone()), Some("single-record-mask".into())).unwrap();
+            with(Some(single.clone()), || {
+                let selected = single.prepare_visibility_record(shared.as_deref().map(Vec::as_slice), id, Some(&originals[original_position].event_ref)).unwrap().unwrap();
+                assert_eq!(selected.len(), usize::from(id == 500), "visibility uses vector positions even when IDs are sparse/reordered");
+                let summary = single.visibility_summary().unwrap();
+                assert_eq!(summary.total_rows, Some(12), "record actions reuse the complete Case mask domain");
+                assert_eq!(summary.excluded_rows, Some(3));
+                if id == 500 { assert_eq!(selected[0].raw, originals[6].raw); }
+            });
+        }
         let memory = self::state(SourceData::Memory(originals));
         let owner = capture(
             &memory,

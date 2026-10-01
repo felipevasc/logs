@@ -13,7 +13,7 @@ use tauri::{AppHandle, Manager};
 
 struct FieldTextAdmission {
     admitted: std::sync::Arc<analysis_runtime::Admitted>,
-    events: Option<Vec<Event>>,
+    events: Option<std::sync::Arc<Vec<Event>>>,
     receipt: Receipt,
 }
 
@@ -44,7 +44,7 @@ fn capture_field_text(
     // No client-supplied Event/value is accepted. Case content and its token
     // are captured together from case_sync, including same-key replacement.
     let (admitted, events) =
-        analysis_runtime::capture_case(state, analysis_context, source_generation, None, case_key)?;
+        analysis_runtime::capture_case_shared(state, analysis_context, source_generation, None, case_key)?;
     // The caller's sync token predates command admission. Comparing only a
     // freshly constructed receipt would miss same-key replacement before it.
     if admitted.case_content_token.as_deref() != case_content_token.as_deref() {
@@ -89,7 +89,7 @@ pub(crate) async fn analysis_field_text(
     )?;
     let captured = admitted.clone();
     let row = RowHandle { id, event_ref };
-    crate::offload_case(operation_id, app.clone(), admitted, events, move |events| {
+    crate::offload_case_record(operation_id, app.clone(), admitted, events, id, Some(row.event_ref.clone()), move |events| {
         let _interactive = crate::operations::interactive();
         let _publication = crate::catalog_read_guard()?;
         // Keep the exact helper's all-or-error record/output bounds and its
@@ -357,7 +357,7 @@ mod tests {
         } = captured;
         analysis_runtime::with(Some(admitted.clone()), || {
             admitted.validate(state)?;
-            let events = admitted.prepare_visibility(events)?;
+            let events = admitted.prepare_visibility_record(events.as_deref().map(Vec::as_slice), 0, Some("memory:0"))?;
             let _publication = crate::catalog_read_guard()?;
             crate::page_projection::hydrate_projected_field(
                 state,

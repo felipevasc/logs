@@ -88,6 +88,11 @@
     "usuario", "ip_cliente", "status", "tamanho", "latencia", "ativo", "ambiente", "anotacao", "request_id", "correlation_id", "operacao", "regiao", "canal"];
   COLUMNS.push("mock_payload_b64");
   for (const [index, event] of events.slice(0, 8).entries()) event.fields.mock_payload_b64 = btoa(JSON.stringify({ user: "preview-user", attempt: index, allowed: index % 2 === 0 }));
+  if (window.__mockRareDerivedFieldsEnabled) {
+    const event = events.at(-1);
+    event.fields.mock_payload_b64 = btoa(JSON.stringify({ rare: { flag: true, latency: 42 } }));
+    window.__mockRareDerivedFixture = { id: event.id, eventRef: event.event_ref };
+  }
   // Opt-in transport fixture only: JSON numbers and integer-like object keys
   // deliberately lose their native spelling/order when decoded by JavaScript.
   // Keep the authoritative strings separately, just as the native command does.
@@ -305,6 +310,7 @@
   const isBool = (s) => ["true", "false", "0", "1", "sim", "não", "nao", "yes", "no"].includes(s.toLowerCase());
 
   function profileFields(rows) {
+    if (window.__mockRareDerivedFieldsEnabled) rows = rows.slice(0, 3000);
     const profiles = [];
     const columns = new Set(COLUMNS); for (const row of rows) for (const key of Object.keys(row.fields || {})) columns.add(key);
     for (const col of columns) {
@@ -666,11 +672,16 @@
     },
     load_event_log: () => handlers.load_file(),
     load_bundle: ({ members }) => handlers.load_files({ paths: members.flatMap(s => s.paths || [s.path || s.channel]), merge: false }),
-    event_detail: ({ id, caseEvents }) => poolOf(caseEvents).find((e) => e.id === id) || null,
+    event_detail: args => {
+      validateFieldContentToken(args);
+      const event = poolOf(args.caseEvents).find(row => row.id === args.id) || null;
+      if (event && args.eventRef != null && event.event_ref !== args.eventRef) throw Error("O registro retornado não corresponde à referência solicitada.");
+      return event;
+    },
     query_page: ({ filters, offset=0, limit=100, cursor, sortColumn='', sortDir='', caseEvents }) => {
       const rows = sortedRows(applyFilters(filters, poolOf(caseEvents)), sortColumn, sortDir);
       const start = cursor ? Number(cursor) : offset, size = Math.max(1, Math.min(2000, limit));
-      return { rows: rows.slice(start, start + size), total: null, hasMore: start + size < rows.length, nextCursor: start + size < rows.length ? String(start + size) : null, engine: 'columnar', warning: null };
+      return { rows: rows.slice(start, start + size).map(row => ({ ...row, raw: "" })), total: null, hasMore: start + size < rows.length, nextCursor: start + size < rows.length ? String(start + size) : null, engine: 'columnar', warning: null };
     },
     engine_status: () => window.__mockEngineStatus || { state: 'ready', baseReady: true, derivedReady: true, phase: 'Pronto', completedRows: poolOf().length, totalRows: poolOf().length, completedSegments: 1, totalSegments: 1, resumedRows: 0, canResume: false, error: null },
     engine_retry: () => { window.__mockEngineStatus = null; return null; },
@@ -1093,12 +1104,13 @@
       invoke: async (cmd, args = {}) => {
         if (window.__mockExclusionsEnabled) for (const event of events) event.event_ref ||= `preview:${event.id}`;
         window.__mockRequests ||= []; window.__mockRequests.push({ cmd, cursor: args.cursor, offset: args.offset, operationId: args.operationId, field: args.field, grid: args.grid, caseKey: args.caseKey, analysisContext: args.analysisContext, sourceGeneration: args.sourceGeneration,
-          ...(cmd === "analysis_field_text" ? { id: args.id, eventRef: args.eventRef, column: args.column, caseContentToken: args.caseContentToken, hasCaseEvents: Object.hasOwn(args, "caseEvents") } : {}) }); if (window.__mockRequests.length > 400) window.__mockRequests.shift();
+          ...(["analysis_field_text", "event_detail"].includes(cmd) ? { id: args.id, eventRef: args.eventRef, column: args.column, caseContentToken: args.caseContentToken, hasCaseEvents: Object.hasOwn(args, "caseEvents") } : {}) }); if (window.__mockRequests.length > 400) window.__mockRequests.shift();
         window.__mockCommandCalls ||= {};
         window.__mockCommandCalls[cmd] = (window.__mockCommandCalls[cmd] || 0) + 1;
         const h = handlers[cmd];
         if (!h) return Promise.reject(`mock: comando não implementado: ${cmd}`);
-        if (cmd === "analysis_field_text") {
+        if (cmd === "analysis_field_text" || cmd === "event_detail") {
+          if (cmd === "event_detail" && args.caseEvents != null) return Promise.reject("ANALYSIS_DETAIL_ADMISSION: Sincronize as evidências do Caso antes de abrir o detalhe.");
           try { validateFieldContentToken(args); } catch (error) { return Promise.reject(String(error)); }
         }
         if (args.caseKey && !args.caseEvents) {

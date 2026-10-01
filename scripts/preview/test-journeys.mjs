@@ -61,9 +61,14 @@ try {
     window.journeyFixtureStart = start;
     const row = (id, value, timestamp) => ({ id, event_ref: `journey-test:${id}`, timestamp, source: id % 2 ? "Auth" : "API", level: id % 7 ? "Informação" : "Erro", code: "TEST", name: "Fluxo de teste", description: "", message: `Registro ${id} da jornada`, raw: "original:" + "x".repeat(id === 100 ? 70000 : 100), fields: { "trace.id": value, ip_cliente: "10.0.0.1", usuario: "ana", custom_key: value } });
     const rows = Array.from({ length: 150 }, (_, index) => row(index, "flow-long", index < 145 ? start + index * 1000 : null));
+    rows[100].fields.journey_overlay = "historical-A";
+    rows[100].derived_originals = { journey_overlay: { state: "present", value: "original-A" } };
     for (let index = 0; index < 60; index++) rows.push(row(rows.length, `short-${index}`, start + index * 2000), row(rows.length + 1, `short-${index}`, start + index * 2000 + 500));
     rows.push(row(270, "API", start), row(271, "API", start + 1), row(272, "api", start), row(273, "api", start + 1));
     const current = ensureCase(); current.items = [{ id: "journey-fixture", kind: "grupo", label: "Fixture Jornadas", rows, origin: "teste", artifactId: "test-artifact" }]; caseEventsCache.sig = null;
+    const owner = AnalysisContexts.capture();
+    await api("save_derived_field", { name: "journey_overlay", source: "source", rules: [{ pattern: "^(.*)$", template: "current-$1" }], steps: [], analysisContext: owner.identity }, { analysisOwner: owner });
+    await loadDerivedFields();
     await Journeys.open({ scope: "case" });
   });
   await page.getByRole("combobox", { name: "Ordenar" }).selectOption("count");
@@ -82,9 +87,37 @@ try {
   await page.locator(".journey-detail").getByRole("button", { name: "Próxima", exact: true }).click();
   await page.waitForFunction(() => document.querySelectorAll(".journey-record").length === 50);
   assert.match(await page.locator(".journey-record").last().innerText(), /Sem horário/);
+  const beforeCaseDetail = await page.evaluate(() => ({ detail: window.__mockCommandCalls.event_detail || 0, page: window.__mockCommandCalls.query_page || 0 }));
   await page.locator(".journey-record").first().click();
   await page.waitForFunction(() => state.currentDetailEv?.raw?.length > 70000);
+  results.caseFullDetail = await page.evaluate(() => {
+    const event = state.currentDetailEv, saved = caseEvents().find(row => row.event_ref === event.event_ref);
+    return { id: event.id, eventRef: event.event_ref, scope: state.detailAdmission?.scope,
+      request: window.__mockRequests.filter(request => request.cmd === "event_detail").at(-1),
+      detailCalls: window.__mockCommandCalls.event_detail, pageCalls: window.__mockCommandCalls.query_page,
+      rawLength: event.raw.length, rawMatchesSaved: event.raw === saved?.raw,
+      overlay: event.fields.journey_overlay, original: event.derived_originals?.journey_overlay,
+      savedOverlay: saved?.fields.journey_overlay, savedOriginal: saved?.derived_originals?.journey_overlay };
+  });
+  const fullDetail = results.caseFullDetail;
+  assert.equal(fullDetail.detailCalls, beforeCaseDetail.detail + 1, "Case journey opens one admitted full-detail request");
+  assert.equal(fullDetail.pageCalls, beforeCaseDetail.page, "a paginated query cannot hydrate Case detail");
+  assert.equal(fullDetail.eventRef, "journey-test:100"); assert.equal(fullDetail.scope, "case");
+  assert.equal(fullDetail.request.id, fullDetail.id); assert.equal(fullDetail.request.eventRef, fullDetail.eventRef);
+  assert.ok(fullDetail.request.caseKey); assert.ok(fullDetail.request.caseContentToken); assert.ok(fullDetail.request.operationId);
+  assert.equal(fullDetail.request.hasCaseEvents, false, "full-detail reads send the synchronized Case identity, not inline Events");
+  assert.equal(fullDetail.rawMatchesSaved, true); assert.equal(fullDetail.overlay, "current-API");
+  assert.deepEqual(fullDetail.original, { state: "present", value: "original-A" });
+  assert.equal(fullDetail.savedOverlay, "historical-A"); assert.deepEqual(fullDetail.savedOriginal, fullDetail.original);
   assert.equal(await page.locator("#dr-prev").isVisible(), false);
+  results.savedTrailDetail = await page.evaluate(() => {
+    const saved = caseEvents().find(row => row.event_ref === "journey-test:100"), before = window.__mockCommandCalls.event_detail;
+    caseTimelineCallbacks.detail(saved);
+    return { sameEvent: state.currentDetailEv === saved, admission: state.detailAdmission,
+      overlay: state.currentDetailEv.fields.journey_overlay, rawMatches: state.currentDetailEv.raw === saved.raw,
+      extraNativeReads: window.__mockCommandCalls.event_detail - before };
+  });
+  assert.deepEqual(results.savedTrailDetail, { sameEvent: true, admission: null, overlay: "historical-A", rawMatches: true, extraNativeReads: 0 }, "explicit saved-trail inspection retains its preserved historical value");
   await page.evaluate(() => closeDrawer());
   await page.getByRole("searchbox", { name: "Identificador exato" }).fill("API");
   await page.getByRole("button", { name: "Abrir", exact: true }).click();

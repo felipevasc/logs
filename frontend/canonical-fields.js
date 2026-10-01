@@ -65,13 +65,15 @@ window.CanonicalFields = (() => {
     assertCurrent(action); if (pending !== request) throw Error("Operação cancelada.");
     return validate(result, action, admission.caseKey, admission.caseContentToken);
   }
-  async function run(action, perform) {
+  async function run(action, perform, { retainPending = false } = {}) {
     cancel(); const request = { id: ++serial, action }; pending = request;
     try {
       const result = await resolve(action, request);
       if (pending !== request || request.id !== serial) return false;
-      assertCurrent(action); pending = null;
-      await perform(result); return true;
+      assertCurrent(action); if (!retainPending) pending = null;
+      await perform(result, () => pending === request && request.id === serial && current(action));
+      if (pending === request) pending = null;
+      return true;
     } catch (error) {
       if (request.id !== serial || pending && pending !== request) return false;
       pending = null; toast(String(error?.message || error), /contexto mudou|cancelad/i.test(String(error)) ? "info" : "err"); focusBack(action); return false;
@@ -85,11 +87,15 @@ window.CanonicalFields = (() => {
     });
   }
   function copy(action) {
-    return run(action, async result => {
+    return run(action, async (result, ownsCompletion) => {
       if (result.canonicalText === null) throw Error("O campo não tem um valor para copiar neste registro.");
+      const focusAtWrite = document.activeElement;
       await navigator.clipboard.writeText(result.canonicalText);
-      if (current(action)) { toast("Valor copiado.", "ok"); focusBack(action); }
-    });
+      if (ownsCompletion()) {
+        toast("Valor copiado.", "ok");
+        if (document.activeElement === focusAtWrite) focusBack(action);
+      }
+    }, { retainPending: true });
   }
   document.addEventListener("keydown", event => {
     if (event.key === "Escape" && pending) { cancel({ focus: true }); event.preventDefault(); event.stopPropagation(); }

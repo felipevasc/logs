@@ -691,13 +691,21 @@ impl Session {
     }
 
     pub(crate) fn collect_garbage(&self) -> Result<(), String> {
-        let unused = self.take_garbage();
-        if unused.is_empty() { return Ok(()); }
+        if self.garbage.lock().is_empty() { return Ok(()); }
+        // A failed connection acquisition must leave the cleanup queue intact.
         let conn = self.conn()?;
+        self.collect_garbage_on(&conn)
+    }
+
+    pub(crate) fn collect_garbage_on(&self, conn: &Connection) -> Result<(), String> {
+        let unused = self.take_garbage();
         for (i, name) in unused.iter().enumerate() {
-            if let Err(error) = conn.execute_batch(&format!("DROP TABLE IF EXISTS {name}")) {
+            let dropped = crate::operations::check().and_then(|_| {
+                conn.execute_batch(&format!("DROP TABLE IF EXISTS {name}")).map_err(|error| error.to_string())
+            });
+            if let Err(error) = dropped {
                 self.garbage.lock().extend_from_slice(&unused[i..]);
-                return Err(error.to_string());
+                return Err(error);
             }
         }
         Ok(())

@@ -69,6 +69,9 @@ mod timeline_export;
 mod triage;
 mod updates;
 mod workspace;
+mod detail_commands;
+#[cfg(test)]
+mod derived_surface_tests;
 
 use model::{CodesConfig, Event, STANDARD_COLUMNS};
 use parking_lot::{Mutex, RwLock};
@@ -214,13 +217,25 @@ where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
 /// registration. Evidence and memory sources are filtered once in this worker.
 async fn offload_case<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, case_events: Option<Vec<Event>>, f: F) -> Result<T, String>
 where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
+    offload_case_input(operation_id, app, admitted, move |admitted| admitted.prepare_visibility(case_events), f).await
+}
+
+/// A detail/field action prepares only its selected record. Admission still
+/// binds the complete synchronized publication and validates its token at exit.
+async fn offload_case_record<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, case_events: Option<std::sync::Arc<Vec<Event>>>, id: usize, event_ref: Option<String>, f: F) -> Result<T, String>
+where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
+    offload_case_input(operation_id, app, admitted, move |admitted| admitted.prepare_visibility_record(case_events.as_deref().map(Vec::as_slice), id, event_ref.as_deref()), f).await
+}
+
+async fn offload_case_input<T, P, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, input: P, f: F) -> Result<T, String>
+where T: Send + 'static, P: FnOnce(&analysis_runtime::Admitted) -> Result<Option<Vec<Event>>, String> + Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
     offload_operation(operation_id, move || {
         admitted.validate(app.state::<AppState>().inner())?;
         let progress_app = app.clone();
         analysis_runtime::with(Some(admitted.clone()), || operations::with_reporter(std::sync::Arc::new(move |progress| {
             let _ = progress_app.emit("operation-progress", progress);
         }), || {
-            let case_events = admitted.prepare_visibility(case_events)?;
+            let case_events = input(&admitted)?;
             admitted.validate(app.state::<AppState>().inner())?;
             operations::check()?;
             let result = f(case_events);
@@ -1717,16 +1732,6 @@ pub(crate) fn stats_events_impl(state: &AppState, filters: Vec<query::Filter>) -
     }
 }
 
-#[tauri::command]
-async fn event_detail(id: usize, app: AppHandle, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<Option<Event>, String> {
-    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
-    offload_admitted(None, app.clone(), admitted, move || {
-        let state = app.state::<AppState>();
-        event_detail_impl(state.inner(), id)
-    })
-    .await
-}
-
 pub(crate) fn event_detail_impl(state: &AppState, id: usize) -> Option<Event> {
     let _interactive = operations::interactive();
     let mut event = event_detail_raw(state, id)?;
@@ -2294,7 +2299,7 @@ pub fn run() {
             count_filtered,
             tree_aggs,
             stats_events,
-            event_detail,
+            detail_commands::event_detail,
             get_codes,
             save_codes,
             get_codes_path,

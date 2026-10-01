@@ -39,13 +39,23 @@ fn store_for(
     identity: Option<&crate::analysis_context::Identity>,
 ) -> String {
     let owner = owner(identity);
-    let mut cache = CACHE.lock();
-    cache.retain(|entry| entry.owner != owner || entry.key != key);
-    if cache.len() >= 3 {
-        cache.remove(0);
-    }
     let publication = uuid::Uuid::new_v4().to_string();
-    cache.push(Entry { owner, key, publication: publication.clone(), events: Arc::new(events) });
+    let shared = Arc::new(events);
+    let mut retired = Vec::with_capacity(3);
+    let mut cache = CACHE.lock();
+    for position in (0..cache.len()).rev() {
+        if cache[position].owner == owner && cache[position].key == key {
+            retired.push(cache.remove(position));
+        }
+    }
+    if cache.len() >= 3 {
+        retired.push(cache.remove(0));
+    }
+    cache.push(Entry { owner, key, publication: publication.clone(), events: shared });
+    drop(cache);
+    // The last Arc can own a large nested Event graph. Destruction must not
+    // serialize other Cases' captures/token checks behind the global mutex.
+    drop(retired);
     publication
 }
 
@@ -73,7 +83,7 @@ fn resolve_for(
 
 /// Capture the payload and publication token under one cache read. A reused
 /// client key never identifies replacement content as the same publication.
-fn resolve_for_with_token(
+pub(crate) fn resolve_for_with_token(
     events: Option<Vec<Event>>, key: Option<String>, identity: Option<&crate::analysis_context::Identity>,
 ) -> Result<(Option<Arc<Vec<Event>>>, Option<String>), String> {
     if let Some(events) = events {
@@ -86,6 +96,36 @@ fn resolve_for_with_token(
     CACHE.lock().iter().find(|entry| entry.owner == owner && entry.key == key)
         .map(|entry| (Some(Arc::clone(&entry.events)), Some(entry.publication.clone())))
         .ok_or_else(|| MISS.to_string())
+}
+
+/// Find the original vector position without cloning any event payload. Legacy
+/// ID-only detail preserves its first match; exact refs reject duplicates.
+pub(crate) fn record_position(events: &[Event], id: usize, event_ref: Option<&str>) -> Result<Option<usize>, String> {
+    crate::operations::check()?;
+    let mut first_id = None;
+    let mut found = None;
+    for (position, event) in events.iter().enumerate() {
+        if position % 256 == 0 { crate::operations::check()?; }
+        if event.id != id { continue; }
+        first_id.get_or_insert(position);
+        if event_ref.is_none_or(|expected| event.event_ref == expected) {
+            if found.is_some() { return Err("A referência exata do registro é ambígua neste Caso.".into()); }
+            found = Some(position);
+            if event_ref.is_none() { break; }
+        }
+    }
+    crate::operations::check()?;
+    // Retain an ID-only mismatch for the exact consumer's identity error.
+    Ok(found.or(first_id))
+}
+
+#[cfg(test)]
+fn select_record(events: Option<&[Event]>, id: usize, event_ref: Option<&str>) -> Result<Option<Vec<Event>>, String> {
+    let Some(events) = events else { crate::operations::check()?; return Ok(None); };
+    let position = record_position(events, id, event_ref)?;
+    let selected = position.map(|position| events[position].clone()).into_iter().collect();
+    crate::operations::check()?;
+    Ok(Some(selected))
 }
 
 /// A synchronized capture linearizes at this short final publication check.
@@ -143,6 +183,45 @@ pub async fn case_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_single_record_capture_retains_one_copy_and_distinguishes_absent_case_from_dataset() {
+        let key = format!("single-record-{}", uuid::Uuid::new_v4());
+        let events: Vec<_> = (0..32).map(|id| {
+            let mut event = Event::empty(); event.id = id; event.event_ref = format!("single:{id}");
+            event.raw = "x".repeat(16_384); event
+        }).collect();
+        store_for(key.clone(), events, None);
+        let (first, first_token) = resolve_for_with_token(None, Some(key.clone()), None).unwrap();
+        let (second, second_token) = resolve_for_with_token(None, Some(key), None).unwrap();
+        let first = first.unwrap(); let second = second.unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "admission shares the immutable payload");
+        assert_eq!(first_token, second_token);
+        let mut chosen = select_record(Some(first.as_slice()), 17, Some("single:17")).unwrap().unwrap();
+        assert_eq!(chosen.len(), 1); assert_eq!(chosen[0].id, 17);
+        assert_eq!(chosen.iter().map(|event| event.raw.len()).sum::<usize>(), 16_384);
+        assert_eq!(first.iter().map(|event| event.raw.len()).sum::<usize>(), 32 * 16_384);
+        chosen[0].raw.push_str("changed copy");
+        assert_eq!(first[17].raw.len(), 16_384, "transforming the selected copy cannot mutate evidence");
+        assert!(select_record(Some(first.as_slice()), 100, None).unwrap().unwrap().is_empty());
+        assert!(select_record(None, 100, None).unwrap().is_none());
+        let mut sparse = Event::empty(); sparse.id = 500;
+        assert_eq!(select_record(Some(&[sparse]), 500, None).unwrap().unwrap()[0].id, 500);
+        let token = crate::operations::token(Some("single-record-cancel".into())).unwrap();
+        assert!(crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("single-record-cancel");
+            select_record(Some(first.as_slice()), 17, Some("single:17"))
+        }).is_err());
+    }
+    #[test]
+    fn single_record_selection_preserves_legacy_order_and_rejects_duplicate_exact_handles() {
+        let mut first = Event::empty(); first.id = 1; first.event_ref = "A".into(); first.raw = "first".into();
+        let mut second = first.clone(); second.event_ref = "B".into(); second.raw = "second".into();
+        let records = vec![first.clone(), second];
+        assert_eq!(select_record(Some(&records), 1, None).unwrap().unwrap()[0].raw, "first");
+        assert_eq!(select_record(Some(&records), 1, Some("B")).unwrap().unwrap()[0].raw, "second");
+        let mut duplicate = first.clone(); duplicate.raw = "different body".into();
+        assert!(select_record(Some(&[first, duplicate]), 1, Some("A")).unwrap_err().contains("ambígua"));
+    }
     #[test]
     fn identical_keys_never_cross_case_or_recreated_analysis_owners() {
         let identity = |case_id: &str, analysis_id: &str| crate::analysis_context::Identity {
