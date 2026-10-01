@@ -983,6 +983,12 @@ fn update_at_inner(dir: &Path, expected: &Identity, config: Config, legacy_brows
         .ok_or("Revisão do Caso excedeu o limite.")?;
     current.config = config;
     current.migration_diagnostics.clear();
+    if native_context_owner(&tx, &expected.case_id)?.is_some() {
+        current.migration_diagnostics = reference_interpretation_diagnostics(
+            current.config.references.iter().map(|reference| reference.interpretation_version),
+            true,
+        );
+    }
     // Preserve malformed legacy material for recovery even after a repaired edit.
     write(&tx, &current)?;
     tx.commit().map_err(|e| e.to_string())?;
@@ -1128,6 +1134,46 @@ mod tests {
         assert_eq!(edited.config, config("(legacy)"));
         assert!(update_legacy_browser_at(&dir.0, &before.identity(), Config::default()).is_err());
         assert_eq!(dir.snapshot("a"), edited);
+    }
+    #[test]
+    fn native_typed_updates_refresh_interpretation_notices_and_drop_obsolete_errors() {
+        for native in [false, true] {
+            let dir = Directory::new();
+            dir.save(json!({"cases":[{"id":"a"}]}));
+            let mut initial = dir.snapshot("a");
+            initial.config.references.push(ReferenceDescriptor {
+                schema_version: 1, interpretation_version: 1, id: "r".into(), name: "Reference".into(),
+                content_sha256: "a".repeat(64), format: "jsonl".into(), columns: vec!["key".into()],
+                key_columns: vec!["key".into()], duplicate_policy: "reject".into(),
+            });
+            initial.migration_diagnostics.push(Diagnostic {
+                definition_index: None, code: "obsolete_migration_error".into(), message: "old error".into(),
+            });
+            initial.migration_diagnostics.extend(reference_interpretation_diagnostics([1], true));
+            let conn = crate::case_store::context_connection(&dir.0).unwrap();
+            conn.execute("UPDATE case_analysis SET body=?1 WHERE case_id='a'", [serde_json::to_string(&initial).unwrap()]).unwrap();
+            if native {
+                conn.execute_batch("CREATE TABLE native_evidence_cases(case_id TEXT PRIMARY KEY,analysis_id TEXT);").unwrap();
+                conn.execute("INSERT INTO native_evidence_cases VALUES('a',?1)", [&initial.analysis_id]).unwrap();
+            }
+            let unchanged = update_at(&dir.0, &initial.identity(), initial.config.clone()).unwrap();
+            assert_eq!(unchanged.config, initial.config);
+            assert_eq!(dir.snapshot("a"), unchanged);
+            let codes: Vec<_> = unchanged.migration_diagnostics.iter().map(|d| d.code.as_str()).collect();
+            assert_eq!(codes, if native { vec!["reference_interpretation_legacy"] } else { vec![] });
+            let mut exact_config = unchanged.config.clone();
+            exact_config.references[0].interpretation_version = 2;
+            let exact = update_at(&dir.0, &unchanged.identity(), exact_config.clone()).unwrap();
+            assert_eq!(exact.config, exact_config);
+            assert_eq!(dir.snapshot("a"), exact);
+            let codes: Vec<_> = exact.migration_diagnostics.iter().map(|d| d.code.as_str()).collect();
+            assert_eq!(codes, if native { vec!["reference_interpretation_exact"] } else { vec![] });
+            let mut empty_config = exact.config.clone();
+            empty_config.references.clear();
+            let empty = update_at(&dir.0, &exact.identity(), empty_config).unwrap();
+            assert!(empty.migration_diagnostics.is_empty());
+            assert_eq!(dir.snapshot("a"), empty);
+        }
     }
     #[test]
     fn queued_body_save_cannot_overwrite_new_config_and_stale_config_cas_fails() {
