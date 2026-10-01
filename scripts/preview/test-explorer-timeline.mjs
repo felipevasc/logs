@@ -24,12 +24,13 @@ try{
   results.sourceLegend=await page.locator('.explorer-timeline-legend').innerText();
   assert.match(results.sourceLegend,/Total no período/);assert.match(results.sourceLegend,/Auth/);
   assert.equal(await page.evaluate(()=>JSON.stringify(backendFilters())),initialFilters,'grouping leaves value filters unchanged');
+  assert.equal(await page.getByRole('combobox',{name:'Agrupar Timeline por campo',exact:true}).inputValue(),'source');
   await settled();const requests=await page.evaluate(()=>window.__mockCommandCalls.grouped_timeline);
   phase='local legend';await page.locator('.explorer-timeline-series input').nth(1).uncheck();await settled();
   assert.equal(await page.evaluate(()=>window.__mockCommandCalls.grouped_timeline),requests,'legend is entirely local');
   await page.screenshot({path:resolve(output,'explorer-timeline-source-1440.png')});
   phase='previous field and pause';await page.evaluate(()=>{window.__mockLatency={grouped_timeline:700};});
-  await chooseHeader('Mensagem');await page.getByRole('button',{name:'Pausar',exact:true}).click();
+  await page.getByRole('combobox',{name:'Agrupar Timeline por campo',exact:true}).selectOption('message');await page.getByRole('button',{name:'Pausar',exact:true}).click();
   assert.match(await page.locator('.explorer-timeline-note').textContent(),/Séries anteriores: Origem/);
   assert.match(await page.locator('.explorer-timeline-note').textContent(),/pausado/);
   await page.getByRole('button',{name:'Retomar',exact:true}).click();
@@ -40,15 +41,17 @@ try{
   phase='scope preferences';await page.evaluate(async()=>{await WorkspaceContext.setScope('case',{page:'explore',animate:false});});
   await page.waitForFunction(()=>explorerAnalytics.get(explorerKey())?.status==='done');
   assert.equal(await page.evaluate(()=>ExplorerTimeline.capture().field),null,'Case starts with its own Timeline preferences');
+  assert.equal(await page.getByRole('combobox',{name:'Agrupar Timeline por campo',exact:true}).inputValue(),'');
   await chooseHeader('Mensagem');await page.waitForFunction(()=>document.querySelector('.explorer-timeline-note').textContent.includes('grupos de maior volume'));
   await page.evaluate(async()=>{ExplorerTimeline.select('source');await WorkspaceContext.setScope('dataset',{page:'explore',animate:false});});
   assert.equal(await page.evaluate(()=>ExplorerTimeline.capture().field),'message');
+  assert.equal(await page.getByRole('combobox',{name:'Agrupar Timeline por campo',exact:true}).inputValue(),'message');
   await page.waitForFunction(()=>document.querySelector('.explorer-timeline-note').textContent.includes('grupos de maior volume'));await settled();
   phase='local clearing';const beforeClear=await page.evaluate(()=>window.__mockCommandCalls.grouped_timeline);
   await page.getByRole('button',{name:'Limpar agrupamento',exact:true}).click();await settled();
   assert.equal(await page.evaluate(()=>window.__mockCommandCalls.grouped_timeline),beforeClear);
   assert.equal(await page.locator('.explorer-timeline-series').count(),1);
-  phase='compact layout';await page.setViewportSize({width:1024,height:768});await chooseHeader('Mensagem');
+  phase='compact selector layout';await page.setViewportSize({width:1024,height:768});await page.getByRole('combobox',{name:'Agrupar Timeline por campo',exact:true}).selectOption('message');
   await page.waitForFunction(()=>document.querySelector('.explorer-timeline-note').textContent.includes('grupos de maior volume'));
   await page.locator('#btn-theme').click();
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Timeline fits the minimum viewport');
@@ -62,6 +65,7 @@ try{
   await page.getByRole('button',{name:'Explorar',exact:true}).click();
   await page.waitForFunction(()=>document.querySelector('.explorer-timeline-note').textContent.includes('grupos de maior volume'));
   assert.equal(await page.evaluate(()=>ExplorerTimeline.capture().field),'message');
+  assert.equal(await page.getByRole('combobox',{name:'Agrupar Timeline por campo',exact:true}).inputValue(),'message');
   assert.deepEqual(errors,[]);results.errors=errors;results.ok=true;
   writeFileSync(resolve(output,'explorer-timeline.json'),JSON.stringify(results,null,2));console.log(JSON.stringify(results,null,2));
 }catch(error){await captureFailure(page,'explorer-timeline',error,{phase,errors,results});throw error;}

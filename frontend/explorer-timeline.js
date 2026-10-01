@@ -5,20 +5,49 @@ window.ExplorerTimeline = (() => {
   const panel = $(".hist-panel"), box = $("#chart");
   const heading = el("div", "explorer-timeline-heading"), title = el("strong", "", "Timeline");
   const fieldLabel = el("span", "explorer-timeline-field"), clear = el("button", "btn ghost small", "Limpar agrupamento");
+  const fieldControl = el("select", "explorer-timeline-field-select");
+  fieldControl.setAttribute("aria-label", "Agrupar Timeline por campo");
+  fieldControl.disabled = true;
   const control = el("button", "btn ghost small");
   const legend = el("div", "explorer-timeline-legend"), note = el("div", "explorer-timeline-note muted small");
   const countControl = el("select", "explorer-timeline-limit");
   countControl.setAttribute("aria-label", "Máximo de grupos na Timeline");
   for (const count of [6, 12, 24]) { const option = el("option", "", `${count} grupos`); option.value = String(count); countControl.append(option); }
   clear.type = control.type = "button"; note.setAttribute("role", "status");
-  heading.append(title, fieldLabel, countControl, clear, control); panel.prepend(heading); panel.append(legend, note);
+  heading.append(title, fieldLabel, fieldControl, countControl, clear, control); panel.prepend(heading); panel.append(legend, note);
   panel.classList.add("explorer-timeline");
   let preferences = { field: null, limit: 12, hidden: [] };
   let stats = null, base = "", grouped = null, pending = null, serial = 0, status = "idle", error = null, manualPause = false, plotted = "";
+  let fieldOptionsKey = "";
   const copy = value => structuredClone(value);
   const sum = values => values.reduce((total, value) => total + value, 0);
   const safeCount = value => Number.isSafeInteger(value) && value >= 0;
   const color = index => index < COLORS.length ? COLORS[index] : `hsl(${(index * 137.5) % 360} 68% 60%)`;
+  function syncFieldControl() {
+    const fields = [...new Set((state.columns || []).filter(field => typeof field === "string" && field))];
+    const missing = preferences.field && !fields.includes(preferences.field) ? preferences.field : null;
+    const key = JSON.stringify([fields, missing]);
+    if (key !== fieldOptionsKey) {
+      fieldOptionsKey = key; fieldControl.replaceChildren();
+      const none = el("option", "", "Sem agrupamento"); none.value = ""; fieldControl.append(none);
+      for (const field of fields) {
+        const option = el("option", "", trunc(colLabel(field), 80)); option.value = field; option.title = field; fieldControl.append(option);
+      }
+      if (missing) { const option = el("option", "", `${trunc(colLabel(missing), 64)} (campo indisponível)`); option.value = missing; option.disabled = true; fieldControl.append(option); }
+    }
+    fieldControl.value = preferences.field || "";
+    fieldControl.disabled = !state.loaded || !!state.analysisDefinitionsPending || !!state.loadOverlay;
+    const owner = window.AnalysisContexts?.capture(), scope = workspaceScope(), signature = scope === "case" ? caseSig() : null;
+    fieldControl.onchange = () => {
+      if (fieldControl.disabled) return;
+      if (owner && !window.AnalysisContexts.isCurrent(owner) || scope !== workspaceScope() || signature !== null && signature !== caseSig()) {
+        toast("O contexto mudou. Atualize a Timeline antes de escolher um campo.", "info"); return;
+      }
+      const field = fieldControl.value || null;
+      if (field && !fields.includes(field) || field === preferences.field) return;
+      select(field);
+    };
+  }
   function gridFor(value) {
     const buckets = value?.buckets || [];
     if (!buckets.length) return { start: 0, bucketMs: 0, bucketCount: 0 };
@@ -72,6 +101,7 @@ window.ExplorerTimeline = (() => {
   function paint() {
     if (stats && contextKey(gridFor(stats)) !== base) invalidate();
     panel.hidden = !state.loaded;
+    syncFieldControl();
     clear.hidden = countControl.hidden = !preferences.field; countControl.value = String(preferences.limit);
     fieldLabel.textContent = preferences.field ? `por ${colLabel(preferences.field)}` : "Volume de eventos";
     fieldLabel.title = preferences.field || "";
@@ -178,6 +208,7 @@ window.ExplorerTimeline = (() => {
     cancel(); stats = null; grouped = null; base = ""; plotted = "";
     if (chart) { chart.destroy(); chart = null; }
     panel.hidden = !state.loaded; panel.classList.add("analytics-placeholder"); legend.replaceChildren();
+    syncFieldControl();
     fieldLabel.textContent = preferences.field ? `por ${colLabel(preferences.field)}` : "Volume de eventos";
     clear.hidden = countControl.hidden = !preferences.field; control.hidden = true; note.textContent = "";
     const label = entry?.status === "paused" ? "Timeline pausada. Os registros continuam disponíveis."
@@ -196,11 +227,12 @@ window.ExplorerTimeline = (() => {
   }
   clear.onclick = () => select(null);
   countControl.onchange = () => { preferences.limit = Number(countControl.value); cancel(); grouped = null; persist(); paint(); void requestGrouped(); };
-  function invalidate() { cancel(); stats = null; grouped = null; base = ""; plotted = ""; error = null; status = "idle"; if (chart) { chart.destroy(); chart = null; } box.replaceChildren(); legend.replaceChildren(); fieldLabel.textContent = ""; note.textContent = ""; control.hidden = true; }
+  function invalidate() { cancel(); stats = null; grouped = null; base = ""; plotted = ""; error = null; status = "idle"; fieldControl.disabled = true; if (chart) { chart.destroy(); chart = null; } box.replaceChildren(); legend.replaceChildren(); fieldLabel.textContent = ""; note.textContent = ""; control.hidden = true; }
   function restore(value) {
     invalidate(); manualPause = false;
     preferences = { field: typeof value?.field === "string" && value.field ? value.field : null, limit: [6, 12, 24].includes(value?.limit) ? value.limit : 12,
       hidden: Array.isArray(value?.hidden) ? value.hidden.filter(item => typeof item === "string").slice(0, 27) : [] };
+    syncFieldControl();
   }
   function menuItem(field) {
     const owner = window.AnalysisContexts?.capture(), scope = workspaceScope();

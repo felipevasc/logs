@@ -17,6 +17,7 @@ function deferred() {
 function fixture({ scope = 'dataset', filters = [] } = {}) {
   const requests = [], cancelled = [], plots = [], messages = [], captured = [], callsToSave = [], nodes = new Map();
   const state = { loaded: true, datasetRevision: 1, filters, sourcePublication: { generation: 7 },
+    columns: ['timestamp', 'source', 'message', 'host.name'],
     currentArtifact: { id: 'source-one', loadedAt: 10 }, rows: [{ id: 'keep-this-row' }],
     analysis: { caseId: 'case-a', analysisId: 'analysis-a', configRevision: 2, visibilityRevision: 3 } };
   let caseVersion = 'evidence-1', casePreparation = null, resumeCount = 0;
@@ -106,6 +107,40 @@ test('sparse statistics preserve the exact temporal grid with explicit zero buck
   assert.equal(f.requests.length, 0, 'plain total reuses the existing histogram data');
   assert.equal(f.plot.options.series[1].label, 'Total no período');
   assert.deepEqual(plain(f.timeline.gridFor({ buckets: [[1000, 5]], bucket_ms: 500 })), { start: 1000, bucketMs: 500, bucketCount: 1 });
+});
+
+test('field selector uses exact discovered IDs, shares menu state and clears grouping locally', async () => {
+  const f = fixture(), field = 'decoded.parent.child.with.dots'; f.state.columns.push(field);
+  f.timeline.render(sparseStats()); const control = f.find('explorer-timeline-field-select');
+  assert.equal(control.attrs['aria-label'], 'Agrupar Timeline por campo'); assert.equal(control.disabled, false);
+  assert.deepEqual(control.children.map(option => option.value), ['', ...f.state.columns]); assert.equal(f.requests.length, 0);
+  control.value = field; control.onchange(); await settle();
+  assert.equal(f.requests[0].args.field, field); assert.equal(f.timeline.capture().field, field); assert.deepEqual(f.state.filters, []);
+  f.requests[0].resolve(f.response()); await settle();
+  const before = f.requests.length; control.onchange(); await settle(); assert.equal(f.requests.length, before, 'unchanged field does not query again');
+  control.value = ''; control.onchange(); await settle(); assert.equal(f.timeline.capture().field, null); assert.equal(f.requests.length, before);
+  f.timeline.menuItem('source').onClick(); await settle(); assert.equal(control.value, 'source', 'the right-click route synchronizes the selector');
+  f.requests.at(-1).resolve(f.response()); await settle();
+  f.timeline.restore({ field, limit: 12, hidden: [] }); assert.equal(control.value, field); assert.equal(f.requests.length, before + 1, 'restore never queries');
+});
+
+test('field selector guards owner, source, Case evidence and paused summary boundaries', async () => {
+  for (const change of ['owner', 'source', 'scope', 'evidence']) {
+    const f = fixture({ scope: 'case' }); f.timeline.render(sparseStats());
+    const control = f.find('explorer-timeline-field-select'); control.value = 'message';
+    if (change === 'owner') f.state.analysis.visibilityRevision++;
+    if (change === 'source') f.state.sourcePublication.generation++;
+    if (change === 'scope') f.setScope('dataset');
+    if (change === 'evidence') f.setCaseVersion('replaced-evidence');
+    control.onchange(); await settle(); assert.equal(f.requests.length, 0, change); assert.equal(f.timeline.capture().field, null); assert.match(f.messages.at(-1), /contexto mudou/);
+  }
+  const f = fixture(); f.timeline.render(sparseStats()); f.summary('paused');
+  const control = f.find('explorer-timeline-field-select'); control.value = 'message'; control.onchange(); await settle();
+  assert.equal(f.timeline.capture().field, 'message'); assert.equal(f.requests.length, 0, 'choosing a field respects a paused summary');
+  f.state.analysisDefinitionsPending = true; f.timeline.summary(null); assert.equal(control.disabled, true);
+  f.state.analysisDefinitionsPending = false; f.state.columns = ['timestamp']; f.timeline.summary(null);
+  assert.equal(control.value, 'message'); assert.equal(control.children.find(option => option.value === 'message').disabled, true, 'a removed field stays explicit until the user clears or replaces it');
+  control.value = ''; control.onchange(); await settle(); assert.equal(f.timeline.capture().field, null);
 });
 
 test('empty statistics display an empty timeline, and invalid temporal grids are rejected', () => {

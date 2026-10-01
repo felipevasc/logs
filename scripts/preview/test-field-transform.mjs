@@ -40,6 +40,50 @@ try{
   results.typed=await page.evaluate(()=>{const row=state.rows.find(row=>row.fields?.decoded_payload);return{source:row.fields.mock_payload_b64,parent:row.fields.decoded_payload,child:row.fields['decoded_payload.allowed']};});
   assert.equal(results.typed.source,results.original);assert.equal(typeof results.typed.parent.allowed,'boolean');assert.equal(typeof results.typed.child,'boolean');
   await page.locator('#btn-colpicker').click();assert.equal(await page.locator('#col-list').getByText('decoded_payload.allowed',{exact:true}).count(),1);await page.locator('#btn-colpicker').click();
+  // Real UI wiring against the preview transport; native transform semantics have separate tests.
+  phase='derived child filter and chart';
+  const analysisBefore=await page.evaluate(()=>({owner:AnalysisContexts.capture(),filters:structuredClone(state.filters),quick:state.quick,tab:state.activeDatasetTab,mode:Discovery.mode(),total:state.total,
+    sourceRows:state.rows.filter(row=>row.fields?.mock_payload_b64).map(row=>({id:row.id,payload:row.fields.mock_payload_b64}))}));
+  assert.deepEqual(analysisBefore.filters,[]);assert.equal(analysisBefore.quick,'');assert.equal(analysisBefore.sourceRows.length,8,'all eight encoded fixture rows must be visible before filtering');
+  const expectedIds=analysisBefore.sourceRows.filter(row=>JSON.parse(Buffer.from(row.payload,'base64').toString()).allowed===true).map(row=>row.id).sort((a,b)=>a-b);
+  assert.equal(expectedIds.length,4);
+  await page.evaluate(()=>{
+    window.__fieldAnalysisCalls=[];window.__fieldAnalysisApi=api;
+    api=async(command,args,options)=>{
+      const observed=['query_page','compute_series'].includes(command)&&args.filters?.some(filter=>filter.column==='decoded_payload.allowed');
+      const request=observed?{command,args:structuredClone(args),owner:AnalysisContexts.capture()}:null;
+      const response=await window.__fieldAnalysisApi(command,args,options);
+      if(request)window.__fieldAnalysisCalls.push({...request,response:structuredClone(response),transportOwner:structuredClone(window.__mockRequests.findLast(call=>call.cmd===command)?.analysisContext)});
+      return response;
+    };
+  });
+  await page.locator('#btn-add-filter').click();await page.getByRole('combobox',{name:'Campo do filtro',exact:true}).selectOption('decoded_payload.allowed');
+  await page.getByRole('combobox',{name:'Operador do filtro',exact:true}).selectOption('equals_exact');await page.locator('#fp-val').fill('true');await page.locator('#fp-apply').click();
+  await page.waitForFunction(()=>state.total===4&&document.querySelector('#events-table').getAttribute('aria-busy')==='false'&&explorerAnalytics.get(explorerKey())?.status==='done');
+  const childFilter={column:'decoded_payload.allowed',op:'equals_exact',value:'true',value2:null};
+  const filteredChild=await page.evaluate(()=>({filters:state.filters,rows:state.rows.map(row=>({id:row.id,value:row.fields['decoded_payload.allowed']})),request:window.__fieldAnalysisCalls.findLast(call=>call.command==='query_page')}));
+  assert.deepEqual(filteredChild.filters,[childFilter]);assert.deepEqual(filteredChild.rows.map(row=>row.id).sort((a,b)=>a-b),expectedIds);
+  assert.ok(filteredChild.rows.every(row=>row.value===true));assert.deepEqual(filteredChild.request.args.filters,[childFilter]);
+  assert.deepEqual(filteredChild.request.response.rows.map(row=>row.id).sort((a,b)=>a-b),expectedIds);assert.equal(filteredChild.request.response.hasMore,false);
+  assert.deepEqual(filteredChild.request.owner,analysisBefore.owner);assert.deepEqual(filteredChild.request.transportOwner,analysisBefore.owner.identity);
+  await page.getByRole('button',{name:'Descobrir',exact:true}).click();await page.getByRole('button',{name:'Meus gráficos',exact:true}).click();
+  await page.locator('#btn-dash-add').click();await page.locator('#cp-title').fill('Permissões derivadas');await page.locator('#cp-type').selectOption('bar');
+  await page.locator('#cp-chart').selectOption('terms');await page.locator('#cp-metric').selectOption('count');await page.locator('#cp-field').selectOption('decoded_payload.allowed');await page.locator('#cp-apply').click();
+  const derivedChart=page.locator('#dash-grid .dash-card').filter({has:page.locator('.dash-card-title').filter({hasText:'Permissões derivadas'})});
+  await derivedChart.locator('.hbar-row').waitFor();
+  const chartRequest=await page.evaluate(()=>window.__fieldAnalysisCalls.findLast(call=>call.command==='compute_series'&&call.args.spec.field==='decoded_payload.allowed'));
+  assert.deepEqual(chartRequest.args.filters,[childFilter]);assert.equal(chartRequest.args.spec.chart,'terms');assert.equal(chartRequest.args.spec.metric,'count');
+  assert.deepEqual(chartRequest.owner,analysisBefore.owner);assert.deepEqual(chartRequest.transportOwner,analysisBefore.owner.identity);
+  assert.deepEqual(chartRequest.response,{kind:'terms',unit:null,x:['true'],x_values:['true'],series:[{name:'decoded_payload.allowed',points:[4]}]});
+  assert.deepEqual(await derivedChart.locator('.hbar-row').evaluateAll(rows=>rows.map(row=>({label:row.querySelector('.hbar-label').textContent,value:row.querySelector('.hbar-val').textContent}))),[{label:'true',value:'4'}]);
+  results.derivedAnalysis={evidence:'Real browser controls with preview transport; not native-engine verification',owner:analysisBefore.owner.identity,filter:childFilter,eventIds:expectedIds,chart:chartRequest.response};
+  await page.screenshot({path:resolve(output,'field-transform-derived-chart-1440.png')});
+  await derivedChart.getByTitle('Remover gráfico',{exact:true}).click();await page.locator(`.discovery-mode[data-mode="${analysisBefore.mode}"]`).click();
+  await page.locator(`#tabbtn-${analysisBefore.tab}`).click();await page.locator('#btn-clear-filters').click();
+  await page.waitForFunction(total=>state.total===total&&document.querySelector('#events-table').getAttribute('aria-busy')==='false'&&explorerAnalytics.get(explorerKey())?.status==='done',analysisBefore.total);
+  assert.deepEqual(await page.evaluate(()=>({filters:state.filters,quick:state.quick,tab:state.activeDatasetTab,mode:Discovery.mode(),owner:AnalysisContexts.capture()})),
+    {filters:analysisBefore.filters,quick:analysisBefore.quick,tab:analysisBefore.tab,mode:analysisBefore.mode,owner:analysisBefore.owner});
+  await page.evaluate(()=>{api=window.__fieldAnalysisApi;delete window.__fieldAnalysisApi;delete window.__fieldAnalysisCalls;});
   phase='JWT warning and retry';await openHeader();await page.locator('#ft-sample').fill('eyJhbGciOiJub25lIn0.eyJzdWIiOiJsb2NhbCJ9.');await addStep('jwt_payload');
   assert.ok(await page.locator('#ft-jwt-warning').isVisible());await page.locator('#ft-preview').click();
   await page.waitForFunction(()=>document.querySelector('#ft-result-type').textContent==='Objeto');assert.match(await page.locator('#ft-jwt-warning').textContent(),/assinatura não foi verificada/);
