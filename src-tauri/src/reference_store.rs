@@ -255,7 +255,7 @@ fn bounded_json<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<Vec<u8
     serde_json::to_writer(&mut writer, value).map_err(|_| Error::Limit("bytes do valor"))?;
     Ok(writer.bytes)
 }
-fn key(values: &[&Value], expected: usize) -> Result<Vec<u8>, Error> {
+pub(crate) fn encode_key(values: &[&Value], expected: usize) -> Result<Vec<u8>, Error> {
     if values.len() != expected
         || values
             .iter()
@@ -294,6 +294,21 @@ impl<'de> Deserialize<'de> for Record {
         }
         deserializer.deserialize_map(Visitor)
     }
+}
+
+/// Shared inspection/import parser: one bounded object with unique literal
+/// column names. BTreeMap order is deterministic even when serde_json's
+/// preserve_order feature is enabled by another application dependency.
+pub(crate) fn parse_record(
+    bytes: &[u8],
+    row_number: u64,
+) -> Result<BTreeMap<String, Value>, Error> {
+    if bytes.len() > Limits::default().record_bytes {
+        return Err(Error::Limit("bytes por registro"));
+    }
+    let Record(row) =
+        serde_json::from_slice::<Record>(bytes).map_err(|_| Error::InvalidRecord(row_number))?;
+    Ok(row)
 }
 
 fn hash_file(
@@ -408,8 +423,7 @@ pub(crate) fn prepare_jsonl(
             if row_count > limits.rows {
                 return Err(Error::Limit("registros"));
             }
-            let Record(row) = serde_json::from_slice::<Record>(&line)
-                .map_err(|_| Error::InvalidRecord(row_count))?;
+            let row = parse_record(&line, row_count)?;
             if row.len() != descriptor.columns.len()
                 || descriptor
                     .columns
@@ -423,7 +437,7 @@ pub(crate) fn prepare_jsonl(
                 .iter()
                 .map(|name| &row[name])
                 .collect();
-            let key = key(&keys, descriptor.key_columns.len())?;
+            let key = encode_key(&keys, descriptor.key_columns.len())?;
             let body = bounded_json(&row, limits.record_bytes)?;
             if let Err(error) = insert.execute(params![key, body]) {
                 if matches!(&error, rusqlite::Error::SqliteFailure(code, _) if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY)
@@ -507,7 +521,77 @@ pub(crate) struct ReferenceReader {
     connection: Connection,
     prepared: PreparedReference,
     descriptor: ReferenceDescriptor,
+    directory: PathBuf,
     _lease: File,
+}
+
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    bytes: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+fn stamp(path: &Path) -> Result<FileStamp, Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::Corrupt);
+    }
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Ok(FileStamp {
+        bytes: metadata.len(),
+        modified: metadata.modified()?,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
+/// A file-only lease for portable transport. Full hashing happens at admission;
+/// cheap validation inside a Case transaction never enters SQLite or rereads
+/// source bytes. The archive transport must still verify its streamed SHA.
+pub(crate) struct PortableSource {
+    prepared: PreparedReference,
+    directory: PathBuf,
+    stamps: [FileStamp; 3],
+    _lease: File,
+}
+pub(crate) fn portable_source(
+    root: &Path,
+    owner: &Owner,
+    descriptor: &ReferenceDescriptor,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<PortableSource, Error> {
+    let reader = open(root, owner, descriptor, cancelled)?;
+    check(cancelled)?;
+    reader.into_portable()
+}
+impl PortableSource {
+    pub(crate) fn prepared(&self) -> &PreparedReference {
+        &self.prepared
+    }
+    pub(crate) fn validate_unchanged(&self) -> Result<(), Error> {
+        if !fs::symlink_metadata(&self.directory)?.file_type().is_dir() {
+            return Err(Error::Corrupt);
+        }
+        for (name, expected) in ["source.jsonl", "rows.sqlite", "ready.json"]
+            .iter()
+            .zip(&self.stamps)
+        {
+            if &stamp(&self.directory.join(name))? != expected {
+                return Err(Error::Corrupt);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn source_reader(&self) -> Result<File, Error> {
+        self.validate_unchanged()?;
+        Ok(File::open(self.directory.join("source.jsonl"))?)
+    }
 }
 pub(crate) fn open(
     root: &Path,
@@ -605,12 +689,70 @@ pub(crate) fn open(
         connection,
         prepared,
         descriptor: descriptor.clone(),
+        directory,
         _lease: lease,
     })
 }
 impl ReferenceReader {
     pub(crate) fn prepared(&self) -> &PreparedReference {
         &self.prepared
+    }
+
+    /// Preserve this verified snapshot's file lease after copying a bounded
+    /// runtime projection, without another full hash or a shared Connection.
+    pub(crate) fn into_portable(self) -> Result<PortableSource, Error> {
+        let stamps = [
+            stamp(&self.directory.join("source.jsonl"))?,
+            stamp(&self.directory.join("rows.sqlite"))?,
+            stamp(&self.directory.join("ready.json"))?,
+        ];
+        let Self {
+            connection,
+            prepared,
+            directory,
+            _lease,
+            ..
+        } = self;
+        connection
+            .close()
+            .map_err(|(_, error)| Error::Database(error))?;
+        Ok(PortableSource {
+            prepared,
+            directory,
+            stamps,
+            _lease,
+        })
+    }
+
+    /// Stream one projection in canonical BLOB-key order. The caller controls
+    /// its aggregate retained budget; this reader only holds one bounded row.
+    pub(crate) fn visit_selected(
+        &self,
+        column: &str,
+        cancelled: &dyn Fn() -> bool,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if !self.descriptor.columns.iter().any(|name| name == column) {
+            return Err(Error::InvalidDescriptor);
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT key,body FROM rows ORDER BY key")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            check(cancelled)?;
+            let key = row.get_ref(0)?.as_blob().map_err(|_| Error::Corrupt)?;
+            let body = row.get_ref(1)?.as_blob().map_err(|_| Error::Corrupt)?;
+            if key.len() > KEY_BYTES || body.len() > self.prepared.max_record_bytes {
+                return Err(Error::Corrupt);
+            }
+            let Record(mut body) =
+                serde_json::from_slice::<Record>(body).map_err(|_| Error::Corrupt)?;
+            let value = body.remove(column).ok_or(Error::Corrupt)?;
+            let encoded = bounded_json(&value, self.prepared.max_record_bytes)?;
+            visit(key, &encoded)?;
+        }
+        check(cancelled)
     }
 
     pub(crate) fn lookup(&self, keys: &[Value], column: &str) -> Result<Option<Value>, Error> {
@@ -644,7 +786,7 @@ impl ReferenceReader {
             if values.len() != self.descriptor.key_columns.len() {
                 return Err(Error::InvalidKey);
             }
-            let encoded = key(
+            let encoded = encode_key(
                 &values.iter().collect::<Vec<_>>(),
                 self.descriptor.key_columns.len(),
             )?;
@@ -1088,5 +1230,58 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn portable_source_is_file_only_send_sync_and_detects_changes() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PortableSource>();
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"{\"key\":1,\"value\":\"one\"}\n";
+        let prepared = build(dir.path(), data).unwrap();
+        let portable =
+            portable_source(dir.path(), &owner("case-a"), &descriptor(data), &|| false).unwrap();
+        assert_eq!(portable.prepared(), &prepared);
+        let mut bytes = Vec::new();
+        portable
+            .source_reader()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, data);
+        portable.validate_unchanged().unwrap();
+        let path = directory(dir.path(), &prepared.version).unwrap();
+        let lease = File::open(path.join("lease")).unwrap();
+        assert!(FileExt::try_lock_exclusive(&lease).is_err());
+        fs::write(path.join("source.jsonl"), b"changed").unwrap();
+        assert!(portable.validate_unchanged().is_err());
+        assert!(portable.source_reader().is_err());
+    }
+
+    #[test]
+    fn strict_parser_is_order_independent_and_rejects_duplicate_columns() {
+        let first = parse_record(b"{\"key\":1,\"value\":null}", 1).unwrap();
+        let reordered = parse_record(b"{\"value\":null,\"key\":1}", 2).unwrap();
+        assert_eq!(first, reordered);
+        assert_eq!(
+            first.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["key", "value"]
+        );
+        assert!(matches!(
+            parse_record(b"{\"key\":1,\"key\":2,\"value\":null}", 7),
+            Err(Error::InvalidRecord(7))
+        ));
+        assert!(matches!(
+            parse_record(&vec![b'x'; Limits::default().record_bytes + 1], 9),
+            Err(Error::Limit(_))
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"{\"key\":1,\"value\":\"one\"}\n{\"value\":\"two\",\"key\":2}\n";
+        assert_eq!(build(dir.path(), data).unwrap().row_count, 2);
+        let reader = open(dir.path(), &owner("case-a"), &descriptor(data), &|| false).unwrap();
+        assert_eq!(
+            reader.lookup(&[serde_json::json!(2)], "value").unwrap(),
+            Some(serde_json::json!("two"))
+        );
     }
 }

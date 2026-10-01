@@ -284,7 +284,7 @@ test('Tasks forwards captured identity and generation, overriding stale supplied
 });
 
 test('visible source metadata uses captured ownership and rejects replies after visibility changes', async () => {
-  for (const command of ['list_sources', 'source_summary', 'exclusion_visibility']) {
+  for (const command of ['list_sources', 'source_summary', 'exclusion_visibility', 'reference_list', 'reference_inspect']) {
     const response = deferred(), f = fixture({ tasks: true, native: () => response.promise });
     const owner = f.contexts.capture();
     const read = f.context.api(command, {}, { analysisOwner: owner }).then(value => ({ value }), error => ({ error }));

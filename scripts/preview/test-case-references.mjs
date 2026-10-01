@@ -1,0 +1,63 @@
+/* Case-owned JSONL import and exact lookup fields, using the preview transport. */
+import assert from 'node:assert/strict';
+import {launchBrowser} from './browser.mjs';
+import {captureFailure} from './diagnostics.mjs';
+import {mkdirSync,writeFileSync} from 'node:fs';
+import {resolve} from 'node:path';
+const output=resolve('output/playwright');mkdirSync(output,{recursive:true});
+const browser=await launchBrowser(),page=await browser.newPage({viewport:{width:1440,height:960},reducedMotion:'reduce'});
+page.setDefaultTimeout(20000);let phase='startup';const errors=[],results={};page.on('pageerror',error=>errors.push(error.message));
+const settled=async()=>{await page.waitForFunction(()=>explorerAnalytics.get(explorerKey())?.status==='done');await page.evaluate(()=>settleFilterTabCounts());await page.waitForFunction(()=>Tasks.pending()===0);};
+const manager=async()=>{await page.locator('#btn-case-menu').click();await page.getByRole('button',{name:'Referências deste Caso',exact:true}).click();await page.waitForFunction(()=>!document.querySelector('#rf-reload').disabled&&document.querySelector('#rf-status').textContent==='');};
+try{
+  await page.goto(process.argv[2]||'http://127.0.0.1:4174');
+  await page.waitForFunction(()=>window.WorkspaceContext?.ready&&!WorkspaceContext.changing&&state.loaded&&!state.loadOverlay&&document.querySelector('#load-overlay').hidden);
+  await page.getByRole('button',{name:'Explorar',exact:true}).click();await settled();
+  const caseId=await page.evaluate(()=>activeCase().id),baseline=await page.evaluate(()=>state.total);assert.equal(baseline,6000);
+  phase='inspect and ordered import';await manager();assert.match(await page.locator('#rf-list').textContent(),/Nenhuma referência/);
+  await page.locator('#rf-choose').click();await page.waitForFunction(()=>!document.querySelector('#rf-import-pane').hidden&&!document.querySelector('#rf-key-choice').disabled);
+  assert.match(await page.locator('#rf-inspection').textContent(),/5 registros/);
+  await page.locator('#rf-import-name').fill('Equipes por serviço');
+  for(const key of ['service','environment']){await page.locator('#rf-key-choice').selectOption(key);await page.locator('#rf-add-key').click();}
+  assert.equal(await page.evaluate(()=>window.__mockCommandCalls.reference_inspect),1);
+  assert.equal(await page.evaluate(()=>window.__mockCommandCalls.reference_import||0),0,'form edits never import automatically');
+  await page.locator('#rf-import').click();await page.waitForFunction(()=>document.querySelector('#rf-status').textContent.includes('Referência importada')&&!document.querySelector('#rf-reload').disabled);
+  results.reference=await page.evaluate(()=>structuredClone(AnalysisContexts.context().config.references[0]));
+  assert.deepEqual(results.reference.keyColumns,['service','environment']);assert.match(results.reference.contentSha256,/^[a-f0-9]{64}$/);
+  phase='explicit lookup mapping';await page.getByRole('button',{name:'Criar campo por referência',exact:true}).click();
+  await page.waitForFunction(()=>!document.querySelector('#rf-field-name').disabled&&document.querySelectorAll('#rf-mappings select').length===2);
+  await page.locator('#rf-field-name').fill('reference_team');
+  await page.getByLabel('Campo do log para service',{exact:true}).selectOption('source');
+  await page.getByLabel('Campo do log para environment',{exact:true}).selectOption('ambiente');
+  await page.locator('#rf-value-column').selectOption('team');
+  assert.equal(await page.evaluate(()=>window.__mockCommandCalls.reference_save_lookup||0),0,'mapping edits never run or save a lookup');
+  await page.screenshot({path:resolve(output,'case-reference-lookup-dark-1440.png')});
+  await page.locator('#rf-save-lookup').click();await page.waitForFunction(()=>document.querySelector('#case-references-modal').hidden);await settled();
+  assert.equal(await page.evaluate(()=>state.total),baseline,'lookup does not multiply rows');
+  results.lookup=await page.evaluate(()=>{const row=state.rows.find(row=>Object.hasOwn(row.fields||{},'reference_team'));return{source:row?.source,value:row?.fields.reference_team,definition:state.derivedFields.find(field=>field.name==='reference_team')};});
+  assert.equal(results.lookup.value,`Equipe ${results.lookup.source}`);assert.equal(results.lookup.definition.lookup.referenceId,results.reference.id);
+  await page.locator('#btn-colpicker').click();assert.equal(await page.locator('#col-list').getByText('reference_team',{exact:true}).count(),1);await page.locator('#btn-colpicker').click();
+  phase='Case isolation';await page.evaluate(()=>newCase('Caso sem referências',{keepArtifact:true}));
+  await page.waitForFunction(id=>activeCase()?.id!==id&&!WorkspaceContext.changing&&!state.analysisDefinitionsPending,caseId);await settled();
+  assert.equal(await page.evaluate(()=>state.derivedFields.some(field=>field.name==='reference_team')),false);
+  await manager();assert.match(await page.locator('#rf-list').textContent(),/Nenhuma referência/);await page.locator('#rf-close').click();
+  await page.evaluate(id=>WorkspaceContext.changeCase(id),caseId);await settled();assert.ok(await page.evaluate(()=>state.derivedFields.some(field=>field.name==='reference_team')));
+  phase='dependency and unavailable content';await manager();
+  assert.equal(await page.getByRole('button',{name:'Remover referência do Caso',exact:true}).isDisabled(),true);assert.match(await page.locator('#rf-list').textContent(),/Campos dependentes: reference_team/);
+  await page.evaluate(id=>window.__mockReferences.setAvailable(AnalysisContexts.identity(),id,false),results.reference.id);await page.locator('#rf-reload').click();
+  await page.waitForFunction(()=>document.querySelector('#rf-list').textContent.includes('Indisponível')&&!document.querySelector('#rf-reload').disabled);
+  await page.setViewportSize({width:1024,height:768});await page.locator('#btn-theme').evaluate(button=>button.click());await page.getByText('Detalhes da referência',{exact:true}).click();
+  const readable=await page.locator('.rf-details').evaluate(node=>{const s=getComputedStyle(node),lum=c=>{const v=c.match(/[\d.]+/g).slice(0,3).map(Number).map(n=>{n/=255;return n<=.04045?n/12.92:((n+.055)/1.055)**2.4;});return .2126*v[0]+.7152*v[1]+.0722*v[2];},a=lum(s.color),b=lum(s.backgroundColor);return{contrast:(Math.max(a,b)+.05)/(Math.min(a,b)+.05),selection:s.userSelect,overflow:s.overflowY};});
+  assert.ok(readable.contrast>=4.5);assert.equal(readable.selection,'text');assert.equal(readable.overflow,'auto');results.readability=readable;
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.screenshot({path:resolve(output,'case-reference-unavailable-light-1024.png')});
+  await page.locator('#rf-close').click();await page.locator('#explore-tree').getByTitle('Editar campo reference_team',{exact:true}).click();
+  await page.waitForFunction(()=>document.querySelector('#rf-availability').textContent.includes('indisponível')&&!document.querySelector('#rf-delete-lookup').disabled);
+  assert.equal(await page.locator('#rf-field-name').inputValue(),'reference_team');assert.equal(await page.locator('#rf-save-lookup').isDisabled(),true);
+  phase='remove dependent field then descriptor';await page.locator('#rf-delete-lookup').click();await page.waitForFunction(()=>document.querySelector('#case-references-modal').hidden);await settled();
+  assert.equal(await page.evaluate(()=>state.derivedFields.some(field=>field.name==='reference_team')),false);assert.equal(await page.evaluate(()=>AnalysisContexts.context().config.references.length),1);
+  await manager();assert.equal(await page.getByRole('button',{name:'Remover referência do Caso',exact:true}).isDisabled(),false);
+  await page.getByRole('button',{name:'Remover referência do Caso',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#rf-status').textContent.includes('Referência removida')&&!document.querySelector('#rf-reload').disabled);
+  assert.equal(await page.evaluate(()=>AnalysisContexts.context().config.references.length),0);await page.locator('#rf-close').click();await settled();assert.equal(await page.evaluate(()=>state.total),baseline);
+  assert.deepEqual(errors,[]);results.errors=errors;results.ok=true;writeFileSync(resolve(output,'case-references.json'),JSON.stringify(results,null,2));console.log(JSON.stringify(results,null,2));
+}catch(error){await captureFailure(page,'case-references',error,{phase,errors,results});throw error;}
+finally{await browser.close();}

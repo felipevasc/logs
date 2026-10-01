@@ -3,6 +3,7 @@
 use crate::{
     analysis_context::Snapshot,
     case_archive_format::{self as format, Entry, EntryKind, Source},
+    case_archive_references::{self as references, ReferenceSet},
     exclusion_store::{self as ledger, Budget, PortableLedger, PreparedPortable, Work},
 };
 use parking_lot::Mutex;
@@ -22,16 +23,20 @@ pub(crate) const TOKEN_FIELD: &str = "portableImportToken";
 const MAX_CASES: usize = 1024;
 const MAX_PENDING_BYTES: usize = 128 << 20;
 const MASKED_HISTORY: &str = "O arquivo portátil completo inclui a proveniência original das exclusões, que não pode ser mascarada nesta versão. Para transferi-lo, desmarque ‘Ocultar senhas e tokens nos textos’. Para compartilhar textos ocultando esses dados, exporte um relatório. O destino foi preservado.";
+const MASKED_REFERENCES: &str = "O arquivo portátil inclui referências com seus bytes e esquema originais, que não podem ser mascarados sem alterar os resultados das consultas. Para transferi-lo, desmarque ‘Ocultar senhas e tokens nos textos’. Para compartilhar textos ocultando esses dados, exporte um relatório. O destino foi preservado.";
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Metadata {
     schema_version: u32,
     ledgers: Vec<PortableLedger>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reference_sets: Vec<ReferenceSet>,
 }
 struct Pending {
     root: PathBuf,
     prepared: PreparedPortable,
+    reference_sources: Vec<crate::reference_store::PortableSource>,
     metadata_bytes: usize,
 }
 static PENDING: LazyLock<Mutex<HashMap<String, Arc<Pending>>>> =
@@ -197,6 +202,7 @@ pub(crate) fn export_at(
     conn.execute_batch("BEGIN DEFERRED")
         .map_err(|e| e.to_string())?;
     let mut captured = Vec::new();
+    let mut snapshots = Vec::new();
     let mut metadata_budget = ByteCounter {
         bytes: 0,
         limit: format::MAX_MANIFEST_BYTES as usize,
@@ -210,6 +216,9 @@ pub(crate) fn export_at(
         if mask && snapshot.visibility_revision != 0 {
             return Err(MASKED_HISTORY.into());
         }
+        if mask && !snapshot.config.references.is_empty() {
+            return Err(MASKED_REFERENCES.into());
+        }
         let captured_case = ledger::capture_portable(&conn, root, &snapshot, &Budget::default())?;
         serde_json::to_writer(&mut metadata_budget, &captured_case.manifest)
             .map_err(|e| e.to_string())?;
@@ -220,9 +229,31 @@ pub(crate) fn export_at(
             return Err("O arquivo portátil excede 4.096 payloads.".into());
         }
         captured.push(captured_case);
+        snapshots.push(snapshot);
     }
     conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-    drop(conn); // File leases remain; a large export never retains a WAL read lock.
+    // File leases remain; large exports never retain a WAL read lock. Reference
+    // hashing uses immutable versions bound to the captured config and owner.
+    drop(conn);
+    let mut captured_references = Vec::new();
+    if snapshots
+        .iter()
+        .any(|context| !context.config.references.is_empty())
+    {
+        let mut count = 0usize;
+        for context in &snapshots {
+            count = count
+                .checked_add(context.config.references.len())
+                .ok_or("Quantidade de referências excessiva.")?;
+            if count > format::MAX_REFERENCES {
+                return Err("O arquivo portátil excede 4.096 referências.".into());
+            }
+            let captured = references::capture(root, context)?;
+            serde_json::to_writer(&mut metadata_budget, &captured.manifest)
+                .map_err(|e| e.to_string())?;
+            captured_references.push(captured);
+        }
+    }
     if mask
         && captured
             .iter()
@@ -255,9 +286,25 @@ pub(crate) fn export_at(
             });
         }
     }
+    for captured in &captured_references {
+        for (id, reference) in &captured.files {
+            sources.push(Source {
+                entry: Entry {
+                    kind: EntryKind::Reference(id.clone()),
+                    bytes: reference.prepared().source_bytes,
+                    sha256: reference.prepared().version.content_sha256.clone(),
+                },
+                file: reference.source_reader().map_err(|e| e.to_string())?,
+            });
+        }
+    }
     let metadata = Metadata {
-        schema_version: 1,
+        schema_version: if captured_references.is_empty() { 1 } else { 2 },
         ledgers: captured.iter().map(|c| c.manifest.clone()).collect(),
+        reference_sets: captured_references
+            .iter()
+            .map(|c| c.manifest.clone())
+            .collect(),
     };
     format::write(path, &metadata, &mut sources, &crate::operations::cancelled)?;
     crate::operations::commit();
@@ -275,7 +322,7 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let archive = format::read::<Metadata>(path, &root, &crate::operations::cancelled)?;
-    if archive.metadata.schema_version != 1 {
+    if ![1, 2].contains(&archive.metadata.schema_version) {
         return Err("O manifesto do Caso exige uma versão mais recente.".into());
     }
     let mut data: Value = serde_json::from_reader(std::io::BufReader::new(
@@ -309,6 +356,7 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
     }
     let mut images = BTreeMap::new();
     let mut payloads = BTreeMap::new();
+    let mut reference_paths = BTreeMap::new();
     for (index, entry) in archive.entries.iter().enumerate().skip(1) {
         match &entry.kind {
             EntryKind::Image(id) => {
@@ -322,6 +370,9 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
                     return Err("Metadados do payload portátil não conferem.".into());
                 }
                 payloads.insert(id.clone(), archive.path(index)?);
+            }
+            EntryKind::Reference(id) => {
+                reference_paths.insert(id.clone(), archive.path(index)?);
             }
             EntryKind::Document => return Err("Documento portátil duplicado.".into()),
         }
@@ -340,6 +391,12 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
         }
         foreign.push(context);
     }
+    let foreign_references = references::validate(
+        archive.metadata.schema_version,
+        &archive.metadata.reference_sets,
+        &mut foreign,
+        &archive.entries,
+    )?;
     crate::case_images::validate_portable_images(&mut data, &images)?;
     {
         let pending = PENDING.lock();
@@ -371,10 +428,10 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
             bytes: 0,
             limit: MAX_PENDING_BYTES,
         };
-        serde_json::to_writer(&mut metadata_budget, &(&context, ledger))
+        let reference_set = &foreign_references[&context.case_id];
+        serde_json::to_writer(&mut metadata_budget, &(&context, ledger, reference_set))
             .map_err(|e| e.to_string())?;
-        let metadata_bytes = metadata_budget.bytes;
-        let staged = ledger::prepare_portable(
+        let mut staged = ledger::prepare_portable(
             &root,
             &context,
             ledger,
@@ -383,6 +440,16 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
             &Budget::default(),
             &work(),
         )?;
+        let reference_sources =
+            references::prepare(&root, staged.snapshot(), reference_set, &reference_paths)?;
+        references::preflight(&root, &mut staged)?;
+        // Include readiness diagnostics added by preflight in the pending cap.
+        serde_json::to_writer(
+            &mut metadata_budget,
+            &staged.snapshot().migration_diagnostics,
+        )
+        .map_err(|e| e.to_string())?;
+        let metadata_bytes = metadata_budget.bytes;
         mapping.insert(
             context.case_id,
             (local_id, staged.snapshot().analysis_id.clone()),
@@ -390,6 +457,7 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
         prepared.push(Arc::new(Pending {
             root: root.clone(),
             prepared: staged,
+            reference_sources,
             metadata_bytes,
         }));
     }
@@ -478,6 +546,9 @@ pub(crate) fn consume_prepared(
         || pending.prepared.snapshot().case_id != case_id
     {
         return Err("O token de importação pertence a outro Caso ou armazenamento.".into());
+    }
+    for reference in &pending.reference_sources {
+        reference.validate_unchanged().map_err(|e| e.to_string())?;
     }
     ledger::insert_prepared(tx, &pending.prepared).map(Some)
 }
@@ -886,5 +957,492 @@ mod tests {
         )
         .unwrap();
         assert!(offsets(target.path(), id).is_empty());
+    }
+
+    fn add_reference(root: &Path, id: &str, content: &[u8], available: bool) {
+        let mut context = current(root, id);
+        let descriptor = crate::analysis_context::ReferenceDescriptor {
+            schema_version: 1,
+            id: "table".into(),
+            name: "Portable table".into(),
+            content_sha256: format!("{:x}", Sha256::digest(content)),
+            format: "jsonl".into(),
+            columns: vec!["code".into(), "label".into()],
+            key_columns: vec!["code".into()],
+            duplicate_policy: "reject".into(),
+        };
+        context.config.references = vec![descriptor.clone()];
+        crate::analysis_context::validate(&context.config).unwrap();
+        crate::case_store::connect(root)
+            .unwrap()
+            .execute(
+                "UPDATE case_analysis SET body=?1 WHERE case_id=?2",
+                rusqlite::params![serde_json::to_string(&context).unwrap(), id],
+            )
+            .unwrap();
+        if available {
+            crate::reference_store::prepare_jsonl(
+                root,
+                &crate::reference_store::Owner {
+                    case_id: id.into(),
+                    analysis_id: context.analysis_id,
+                },
+                &descriptor,
+                content,
+                crate::reference_store::Limits::default(),
+                &|| false,
+            )
+            .unwrap();
+        }
+    }
+    fn reference_reader(
+        root: &Path,
+        id: &str,
+    ) -> Result<crate::reference_store::ReferenceReader, crate::reference_store::Error> {
+        let context = current(root, id);
+        crate::reference_store::open(
+            root,
+            &crate::reference_store::Owner {
+                case_id: id.into(),
+                analysis_id: context.analysis_id,
+            },
+            &context.config.references[0],
+            &|| false,
+        )
+    }
+    fn rewrite_archive(
+        path: &Path,
+        output: &Path,
+        mutate: impl FnOnce(&mut Metadata, &mut Vec<Source>),
+    ) {
+        let mut staged: format::StagedArchive<Metadata> =
+            format::read(path, output.parent().unwrap(), &|| false).unwrap();
+        let mut sources = staged
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| Source {
+                entry: entry.clone(),
+                file: File::open(staged.path(index).unwrap()).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        mutate(&mut staged.metadata, &mut sources);
+        format::write(output, &staged.metadata, &mut sources, &|| false).unwrap();
+    }
+
+    #[test]
+    fn portable_reference_bytes_and_exclusions_roundtrip_under_new_owner() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        create(source.path(), "same-case");
+        create(target.path(), "same-case");
+        add_reference(
+            source.path(),
+            "same-case",
+            b"{\"code\":1,\"label\":\"foreign\"}\n",
+            true,
+        );
+        add_reference(
+            target.path(),
+            "same-case",
+            b"{\"code\":1,\"label\":\"local\"}\n",
+            true,
+        );
+        let batch = exclude(
+            source.path(),
+            "same-case",
+            ledger::Purpose::Exclude,
+            &[1, 2],
+        );
+        exclude(
+            source.path(),
+            "same-case",
+            ledger::Purpose::RestoreSelection {
+                batch_id: batch.batch_id,
+            },
+            &[2],
+        );
+        let path = exports.path().join("references.licase");
+        exported(source.path(), &path);
+        let imported = import_at(target.path(), &path).unwrap();
+        let id = imported["cases"][0]["id"].as_str().unwrap();
+        assert!(imported["cases"][0].get("analysisContext").is_none());
+        assert_eq!(
+            crate::case_store::load_at(target.path()).unwrap()["cases"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let before = crate::case_store::load_at(target.path()).unwrap();
+        let conn = crate::case_store::connect(target.path()).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_reference BEFORE INSERT ON case_analysis BEGIN SELECT RAISE(ABORT,'fixture rollback'); END;").unwrap();
+        let mut merged = merge(target.path(), &imported);
+        assert!(crate::case_store::save_at(target.path(), merged.clone()).is_err());
+        assert_eq!(crate::case_store::load_at(target.path()).unwrap(), before);
+        conn.execute_batch("DROP TRIGGER reject_reference").unwrap();
+        let receipt = crate::case_store::save_at(target.path(), merged.clone()).unwrap();
+        let local = current(target.path(), id);
+        assert_ne!(
+            local.analysis_id,
+            current(source.path(), "same-case").analysis_id
+        );
+        assert_eq!(local.config, current(source.path(), "same-case").config);
+        assert_eq!(
+            reference_reader(target.path(), id)
+                .unwrap()
+                .lookup(&[json!(1)], "label")
+                .unwrap(),
+            Some(json!("foreign"))
+        );
+        assert_eq!(
+            reference_reader(target.path(), "same-case")
+                .unwrap()
+                .lookup(&[json!(1)], "label")
+                .unwrap(),
+            Some(json!("local"))
+        );
+        assert_eq!(offsets(target.path(), id), vec![1]);
+        let changed = exclude(target.path(), id, ledger::Purpose::Exclude, &[3]);
+        merged["revision"] = receipt["revision"].clone();
+        crate::case_store::save_at(target.path(), merged).unwrap();
+        assert_eq!(current(target.path(), id), changed.analysis_context);
+        assert_eq!(
+            reference_reader(target.path(), id)
+                .unwrap()
+                .lookup(&[json!(1)], "label")
+                .unwrap(),
+            Some(json!("foreign"))
+        );
+    }
+
+    #[test]
+    fn portable_unavailable_and_legacy_references_remain_explicit() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        create(source.path(), "source");
+        add_reference(source.path(), "source", b"", false);
+        let path = exports.path().join("missing.licase");
+        exported(source.path(), &path);
+        let legacy = exports.path().join("legacy.licase");
+        rewrite_archive(&path, &legacy, |metadata, _| {
+            metadata.schema_version = 1;
+            metadata.reference_sets.clear();
+        });
+        for archive in [path, legacy] {
+            let imported = import_at(target.path(), &archive).unwrap();
+            let id = imported["cases"][0]["id"].as_str().unwrap();
+            crate::case_store::save_at(target.path(), merge(target.path(), &imported)).unwrap();
+            let context = current(target.path(), id);
+            assert_eq!(context.config.references.len(), 1);
+            assert!(context
+                .migration_diagnostics
+                .iter()
+                .any(|d| d.code == "portable_references_unavailable"));
+            assert!(matches!(
+                reference_reader(target.path(), id),
+                Err(crate::reference_store::Error::Unavailable)
+            ));
+        }
+    }
+
+    #[test]
+    fn portable_empty_reference_is_available_after_verified_preparation() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        create(source.path(), "source");
+        add_reference(source.path(), "source", b"", true);
+        let path = exports.path().join("empty.licase");
+        exported(source.path(), &path);
+        let imported = import_at(target.path(), &path).unwrap();
+        let id = imported["cases"][0]["id"].as_str().unwrap();
+        crate::case_store::save_at(target.path(), merge(target.path(), &imported)).unwrap();
+        assert_eq!(
+            reference_reader(target.path(), id)
+                .unwrap()
+                .prepared()
+                .row_count,
+            0
+        );
+        assert!(!current(target.path(), id)
+            .migration_diagnostics
+            .iter()
+            .any(|d| d.code == "portable_references_unavailable"));
+    }
+
+    #[test]
+    fn portable_reference_masking_preserves_destination() {
+        let source = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        create(source.path(), "source");
+        add_reference(
+            source.path(),
+            "source",
+            b"{\"code\":1,\"label\":\"password=private\"}\n",
+            true,
+        );
+        let path = exports.path().join("masked.licase");
+        std::fs::write(&path, b"previous").unwrap();
+        let error = export_at(
+            source.path(),
+            &path,
+            crate::case_store::load_at(source.path()).unwrap(),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("desmarque"));
+        assert_eq!(std::fs::read(path).unwrap(), b"previous");
+    }
+
+    #[test]
+    fn portable_reference_ownership_schema_and_completeness_are_checked() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        create(source.path(), "source");
+        add_reference(
+            source.path(),
+            "source",
+            b"{\"code\":1,\"label\":\"value\"}\n",
+            true,
+        );
+        let path = exports.path().join("valid.licase");
+        exported(source.path(), &path);
+        for attack in 0..5 {
+            let bad = exports.path().join(format!("bad-{attack}.licase"));
+            rewrite_archive(&path, &bad, |metadata, sources| match attack {
+                0 => {
+                    metadata.reference_sets[0].owner.analysis_id = uuid::Uuid::new_v4().to_string()
+                }
+                1 => {
+                    metadata.reference_sets[0].references[0]
+                        .descriptor
+                        .key_columns = vec!["label".into()]
+                }
+                2 => {
+                    if let references::ReferenceState::Available { schema_sha256, .. } =
+                        &mut metadata.reference_sets[0].references[0].state
+                    {
+                        *schema_sha256 = "0".repeat(64)
+                    }
+                }
+                3 => sources.retain(|source| !matches!(source.entry.kind, EntryKind::Reference(_))),
+                _ => {
+                    metadata.reference_sets[0].references[0].state =
+                        references::ReferenceState::Unavailable
+                }
+            });
+            assert!(import_at(target.path(), &bad).is_err(), "attack {attack}");
+            assert!(crate::case_store::load_at(target.path()).unwrap()["cases"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn portable_prepared_reference_changes_roll_back_case_publication() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        create(source.path(), "source");
+        add_reference(
+            source.path(),
+            "source",
+            b"{\"code\":1,\"label\":\"value\"}\n",
+            true,
+        );
+        let path = exports.path().join("valid.licase");
+        exported(source.path(), &path);
+        let imported = import_at(target.path(), &path).unwrap();
+        let owner = std::fs::read_dir(target.path().join("references-v1"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let version = std::fs::read_dir(owner)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(version.join("source.jsonl"))
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert!(
+            crate::case_store::save_at(target.path(), merge(target.path(), &imported)).is_err()
+        );
+        assert!(crate::case_store::load_at(target.path()).unwrap()["cases"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(PENDING
+            .lock()
+            .contains_key(imported["cases"][0][TOKEN_FIELD].as_str().unwrap()));
+    }
+
+    fn lookup_definition(name: &str, reference: &str) -> Value {
+        json!({"name":name,"lookup":{"schemaVersion":1,"referenceId":reference,"keys":[{"referenceColumn":"code","sourceField":"raw_key"}],"valueColumn":"label"}})
+    }
+    fn set_context(root: &Path, context: &Snapshot) {
+        crate::analysis_context::validate(&context.config).unwrap();
+        crate::case_store::connect(root)
+            .unwrap()
+            .execute(
+                "UPDATE case_analysis SET body=?1 WHERE case_id=?2",
+                rusqlite::params![serde_json::to_string(context).unwrap(), context.case_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn portable_missing_lookup_exposes_reason_while_healthy_and_raw_fields_work() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        create(source.path(), "source");
+        add_reference(
+            source.path(),
+            "source",
+            b"{\"code\":1,\"label\":\"ready\"}\n",
+            true,
+        );
+        let mut context = current(source.path(), "source");
+        let mut missing = context.config.references[0].clone();
+        missing.id = "missing-table".into();
+        context.config.references.push(missing);
+        context.config.derived_fields.extend([
+            lookup_definition("healthy_lookup", "table"),
+            lookup_definition("missing_lookup", "missing-table"),
+            json!({"name":"dependent","source":"missing_lookup","pattern":"(.*)"}),
+        ]);
+        set_context(source.path(), &context);
+        let path = exports.path().join("mixed.licase");
+        exported(source.path(), &path);
+        let imported = import_at(target.path(), &path).unwrap();
+        let id = imported["cases"][0]["id"].as_str().unwrap();
+        let receipt =
+            crate::case_store::save_at(target.path(), merge(target.path(), &imported)).unwrap();
+        let local = current(target.path(), id);
+        assert_eq!(local.config, context.config);
+        assert!(receipt["analysisContexts"][0]["migrationDiagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |diagnostic| diagnostic["code"] == "portable_reference_unavailable"
+                    && diagnostic["definitionIndex"] == 2
+            ));
+        let fields =
+            crate::analysis_runtime::prepare_portable_snapshot(target.path(), &local, &|| false)
+                .unwrap();
+        assert!(fields.iter().any(|field| field.name == "healthy_lookup"));
+        assert!(fields
+            .iter()
+            .all(|field| !["missing_lookup", "dependent"].contains(&field.name.as_str())));
+        let mut event = crate::model::Event::empty();
+        event.message = "portable".into();
+        event.fields.insert("raw_key".into(), json!(1));
+        crate::sources::apply_derived(&mut event, &fields);
+        assert_eq!(event.message, "portable");
+        assert_eq!(event.fields["raw_key"], json!(1));
+        assert_eq!(event.fields["healthy_lookup"], json!("ready"));
+        assert_eq!(event.fields["portable"], json!("portable"));
+    }
+
+    #[test]
+    fn portable_oversized_projection_retains_bytes_with_indexed_runtime_reason() {
+        use std::io::{Read, Seek, SeekFrom};
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        create(source.path(), "source");
+        // Eighteen rows cross the real projection budget; no large log fixture
+        // or whole-reference heap buffer is needed.
+        let mut input = tempfile::NamedTempFile::new_in(exports.path()).unwrap();
+        let value = "x".repeat(500_000);
+        for index in 0..18 {
+            writeln!(input, "{{\"code\":{index},\"label\":\"{value}\"}}").unwrap();
+        }
+        input.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 64 << 10];
+        loop {
+            let count = input.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        input.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        let mut context = current(source.path(), "source");
+        let descriptor = crate::analysis_context::ReferenceDescriptor {
+            schema_version: 1,
+            id: "table".into(),
+            name: "Large values".into(),
+            content_sha256: format!("{:x}", digest.finalize()),
+            format: "jsonl".into(),
+            columns: vec!["code".into(), "label".into()],
+            key_columns: vec!["code".into()],
+            duplicate_policy: "reject".into(),
+        };
+        context.config.references.push(descriptor.clone());
+        context.config.derived_fields.extend([
+            lookup_definition("large_lookup", "table"),
+            json!({"name":"dependent","source":"large_lookup","pattern":"(.*)"}),
+        ]);
+        set_context(source.path(), &context);
+        crate::reference_store::prepare_jsonl(
+            source.path(),
+            &crate::reference_store::Owner {
+                case_id: context.case_id.clone(),
+                analysis_id: context.analysis_id.clone(),
+            },
+            &descriptor,
+            input.as_file_mut(),
+            Default::default(),
+            &|| false,
+        )
+        .unwrap();
+        let path = exports.path().join("over-budget.licase");
+        exported(source.path(), &path);
+        let imported = import_at(target.path(), &path).unwrap();
+        let id = imported["cases"][0]["id"].as_str().unwrap();
+        let receipt =
+            crate::case_store::save_at(target.path(), merge(target.path(), &imported)).unwrap();
+        let local = current(target.path(), id);
+        assert_eq!(local.config, context.config);
+        let diagnostic = receipt["analysisContexts"][0]["migrationDiagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == "portable_reference_runtime_budget")
+            .unwrap();
+        assert_eq!(diagnostic["definitionIndex"], 1);
+        assert!(diagnostic["message"].as_str().unwrap().contains("8 MiB"));
+        let reader = reference_reader(target.path(), id).unwrap();
+        assert_eq!(reader.prepared().row_count, 18);
+        assert_eq!(
+            reader.prepared().version.content_sha256,
+            descriptor.content_sha256
+        );
+        let fields =
+            crate::analysis_runtime::prepare_portable_snapshot(target.path(), &local, &|| false)
+                .unwrap();
+        assert!(fields
+            .iter()
+            .all(|field| !["large_lookup", "dependent"].contains(&field.name.as_str())));
+        let mut event = crate::model::Event::empty();
+        event.message = "portable".into();
+        crate::sources::apply_derived(&mut event, &fields);
+        assert_eq!(event.message, "portable");
+        assert_eq!(event.fields["portable"], json!("portable"));
     }
 }

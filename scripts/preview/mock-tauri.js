@@ -903,6 +903,9 @@
       if (item) { item.analysisContext = structuredClone(context); localStorage.setItem("__mockStore", JSON.stringify(data)); }
     } });
   if (exclusions) { Object.assign(handlers, exclusions.handlers); window.__mockExclusions = exclusions; }
+  const references = window.createMockReferences?.({ contextFor: analysisFor, identity: analysisIdentity, columnText: colStr,
+    persist: context => { const saved = localStorage.getItem("__mockStore"); if (!saved) return; const data = JSON.parse(saved), item = data.cases?.find(item => item.id === context.caseId); if (item) { item.analysisContext = structuredClone(context); localStorage.setItem("__mockStore", JSON.stringify(data)); } } });
+  if (references) { Object.assign(handlers, references.handlers); window.__mockReferences = references; }
   handlers.preview_field_transform = ({ value, steps }) => window.__mockFieldTransforms.transform(value, steps);
   handlers.analysis_context_snapshot = ({ caseId }) => {
     const value = analysisContexts.get(caseId); if (!value) throw Error("Caso não encontrado."); return structuredClone(value);
@@ -925,11 +928,17 @@
   }
   function analysisRows(rows, context) {
     if (!context?.config.derivedFields.length) return rows;
+    const lookups = references?.prepare(context);
     return rows.map(row => {
-      const event = { ...row, fields: { ...row.fields } };
+      const event = { ...row, fields: Object.assign(Object.create(null), row.fields) };
       for (const field of context.config.derivedFields) {
         if (field.steps?.length && Object.hasOwn(row.fields || {}, field.name)) continue;
         try {
+          if (field.lookup) {
+            const lookup = lookups?.get(field.name); if (!lookup) throw Error("Referência indisponível para esta consulta.");
+            const result = lookup(event); if (result.matched) Object.assign(event.fields, window.__mockFieldTransforms?.expand(field.name, result.value) || { [field.name]: result.value });
+            continue;
+          }
           const hasField = Object.hasOwn(event.fields || {}, field.source);
           const canonical = ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw"].includes(field.source);
           if (!hasField && !canonical && !field.source.startsWith("@")) continue;
@@ -948,7 +957,7 @@
             Object.assign(event.fields, window.__mockFieldTransforms.expand(field.name, transformed.value));
             if (transformed.notices.length) event.derived_diagnostics = [...event.derived_diagnostics || [], ...transformed.notices.map(code => ({ field: field.name, code, warning: true }))];
           } else event.fields[field.name] = value;
-        } catch (error) { event.derived_diagnostics = [...event.derived_diagnostics || [], { field: field.name, code: "transform_error", message: String(error), warning: false }]; }
+        } catch (error) { event.derived_diagnostics = [...event.derived_diagnostics || [], { field: field.name, code: field.lookup ? "reference_lookup_error" : "transform_error", message: String(error), warning: false }]; }
       }
       return event;
     });
@@ -1029,9 +1038,9 @@
     },
     dialog: {
       save: () => Promise.resolve("C:\\mock\\export.jsonl"),
-      open: (opts = {}) => Promise.resolve(opts.multiple
-        ? ["C:\\mock\\mock.jsonl", "C:\\mock\\firewall.log"]
-        : "C:\\mock\\mock.jsonl"),
+      open: (opts = {}) => Promise.resolve(opts.filters?.some(filter => filter.name === "Referência JSONL")
+        ? window.__mockReferencePath || references?.defaultPath || null
+        : opts.multiple ? ["C:\\mock\\mock.jsonl", "C:\\mock\\firewall.log"] : "C:\\mock\\mock.jsonl"),
     },
   };
 

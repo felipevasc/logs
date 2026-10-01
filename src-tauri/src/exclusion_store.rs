@@ -1901,6 +1901,22 @@ impl PreparedPortable {
     pub(crate) fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
+    /// Preparation-time availability diagnostics may follow reference staging.
+    /// Ownership and revision fields remain fixed before the save token exists.
+    pub(crate) fn add_import_diagnostic(
+        &mut self,
+        diagnostic: crate::analysis_context::Diagnostic,
+    ) -> Result<(), String> {
+        if self.snapshot.migration_diagnostics.contains(&diagnostic) {
+            return Ok(());
+        }
+        self.snapshot.migration_diagnostics.push(diagnostic);
+        if let Err(error) = crate::analysis_context::validate_snapshot_size(&self.snapshot) {
+            self.snapshot.migration_diagnostics.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 fn portable_file(dir: &Path, meta: &PayloadMeta, budget: &Budget) -> Result<PortableFile, String> {
     validate_portable_meta(meta, budget)?;
@@ -3687,5 +3703,41 @@ mod tests {
         );
         assert!(!new.exists());
         assert!(saved.join(old_name).join("payload.sqlite3").exists());
+    }
+    #[test]
+    fn portable_import_diagnostics_are_bounded_atomic_and_do_not_change_ownership() {
+        let f = Fixture::new();
+        let (foreign, capture, paths) = captured(&f);
+        let target = tempfile::tempdir().unwrap();
+        let mut prepared = prepare_portable(
+            target.path(),
+            &foreign,
+            &capture.manifest,
+            "new",
+            &paths,
+            &Budget::default(),
+            &work(),
+        )
+        .unwrap();
+        let original = prepared.snapshot().clone();
+        let diagnostic = crate::analysis_context::Diagnostic {
+            definition_index: None,
+            code: "reference_runtime_budget".into(),
+            message: "Arquivo preservado; consulta excede o orçamento disponível.".into(),
+        };
+        prepared.add_import_diagnostic(diagnostic.clone()).unwrap();
+        prepared.add_import_diagnostic(diagnostic.clone()).unwrap();
+        assert_eq!(prepared.snapshot().identity(), original.identity());
+        assert_eq!(prepared.snapshot().config, original.config);
+        assert_eq!(prepared.snapshot().migration_diagnostics, vec![diagnostic]);
+        let accepted = prepared.snapshot().clone();
+        assert!(prepared
+            .add_import_diagnostic(crate::analysis_context::Diagnostic {
+                definition_index: None,
+                code: "oversized".into(),
+                message: "x".repeat(4 << 20)
+            })
+            .is_err());
+        assert_eq!(prepared.snapshot(), &accepted);
     }
 }

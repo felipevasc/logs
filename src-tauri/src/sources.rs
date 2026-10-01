@@ -1658,12 +1658,15 @@ pub struct DerivedField {
     pub rules: Vec<DerivedRule>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<crate::field_transform::Step>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup: Option<crate::reference_lookup::Definition>,
 }
 
 /// Formato de leitura tolerante ao legado (regra única na raiz do objeto).
 #[derive(serde::Deserialize)]
 pub struct DerivedFieldCompat {
     pub name: String,
+    #[serde(default)]
     pub source: String,
     #[serde(default)]
     pub pattern: String,
@@ -1675,6 +1678,8 @@ pub struct DerivedFieldCompat {
     pub rules: Vec<DerivedRule>,
     #[serde(default)]
     pub steps: Vec<crate::field_transform::Step>,
+    #[serde(default)]
+    pub lookup: Option<crate::reference_lookup::Definition>,
 }
 
 impl DerivedFieldCompat {
@@ -1692,6 +1697,7 @@ impl DerivedFieldCompat {
             source: self.source,
             rules,
             steps: self.steps,
+            lookup: self.lookup,
         }
     }
 }
@@ -1709,6 +1715,7 @@ pub struct CompiledDerived {
     pub source: String,
     pub rules: Vec<CompiledRule>,
     pub steps: Vec<crate::field_transform::Step>,
+    pub lookup: Option<crate::reference_lookup::Compiled>,
 }
 
 /// Aplica os campos derivados a um evento. As regras de cada campo são
@@ -1735,9 +1742,40 @@ pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
         }
     }
     for d in derived {
+        if let Some(lookup) = &d.lookup {
+            if !crate::field_transform::valid_typed_target(&d.name) {
+                diagnostic(ev, &d.name, "reserved_target", crate::field_transform::TARGET_NAME_ERROR.into(), false);
+                continue;
+            }
+            let value = match lookup.evaluate(ev) {
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
+                Err(error) => { diagnostic(ev, &d.name, "lookup_error", error, false); continue; }
+            };
+            let limits = crate::field_transform::Limits { output_bytes: (1 << 20).min(remaining), ..Default::default() };
+            let fields = match crate::field_transform::expanded_fields(&d.name, &value, limits, 512) {
+                Ok(fields) => fields,
+                Err(error) => { diagnostic(ev, &d.name, "lookup_error", error.to_string(), false); continue; }
+            };
+            if fields.keys().any(|name| ev.fields.contains_key(name)) {
+                diagnostic(ev, &d.name, "target_conflict", "O nome do campo consultado ou de um subcampo já existe no registro original.".into(), false);
+                continue;
+            }
+            let bytes = fields.iter().try_fold(0usize, |size, (key, value)| {
+                Ok::<_, crate::field_transform::Error>(size.saturating_add(key.len().saturating_mul(2)).saturating_add(crate::field_transform::payload_bytes(value, remaining)?).saturating_add(32))
+            });
+            let bytes = match bytes {
+                Ok(bytes) if bytes <= remaining => bytes,
+                _ => { diagnostic(ev, &d.name, "lookup_error", crate::field_transform::Error::OutputLimit.to_string(), false); continue; }
+            };
+            remaining -= bytes;
+            for name in fields.keys() { ev.derived_originals.insert(name.clone(), crate::model::DerivedOriginal::Missing); }
+            ev.fields.extend(fields);
+            continue;
+        }
         if !d.steps.is_empty() {
-            if d.name.starts_with('@') || ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw", "arquivo", "caminho"].iter().any(|name| d.name.eq_ignore_ascii_case(name)) {
-                diagnostic(ev, &d.name, "reserved_target", "Escolha outro nome; este campo é reservado para metadados do evento.".into(), false);
+            if !crate::field_transform::valid_typed_target(&d.name) {
+                diagnostic(ev, &d.name, "reserved_target", crate::field_transform::TARGET_NAME_ERROR.into(), false);
                 continue;
             }
             let limits = crate::field_transform::Limits { output_bytes: (512 << 10).min(remaining), ..Default::default() };
@@ -1864,7 +1902,7 @@ mod derived_transform_tests {
     use crate::field_transform::Step;
     use serde_json::json;
     fn definition(name: &str, source: &str, steps: Vec<Step>) -> CompiledDerived {
-        CompiledDerived { name: name.into(), source: source.into(), rules: Vec::new(), steps }
+        CompiledDerived { name: name.into(), source: source.into(), rules: Vec::new(), steps, lookup: None }
     }
     #[test]
     fn transformed_parent_and_children_keep_types_and_query_visibility() {

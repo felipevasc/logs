@@ -50,6 +50,9 @@ pub(crate) struct Admitted {
     source: Option<Arc<SourceData>>,
     names: Vec<String>,
     derived: Arc<Vec<sources::CompiledDerived>>,
+    prepared_fields: OnceLock<Arc<Vec<sources::CompiledDerived>>>,
+    data_root: std::path::PathBuf,
+    definition_bytes: usize,
     pub diagnostics: Arc<Vec<analysis_context::Diagnostic>>,
     pub references: Arc<Vec<analysis_context::ReferenceDescriptor>>,
     visibility: OnceLock<PreparedVisibility>,
@@ -226,13 +229,97 @@ pub(crate) fn validate_compilation(config: &analysis_context::Config) -> Result<
     compile_uncached(&snapshot).map(|_| ())
 }
 
-fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>, String> {
+/// Explicit save preflight, called in the command's cancellable worker before
+/// configuration CAS. Holding the returned fields pins verified projection bytes
+/// and their file-only leases through publication, without changing any config.
+pub(crate) fn prepare_candidate_config(
+    root: &std::path::Path,
+    owner: &crate::reference_store::Owner,
+    config: &analysis_context::Config,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Arc<Vec<sources::CompiledDerived>>, String> {
+    prepare_candidate_config_detailed(root, owner, config, cancelled)
+        .map_err(|error| error.to_string())
+}
+
+/// Portable-import callers can preserve unavailable/over-budget definitions
+/// with explicit diagnostics, without interpreting localized error messages.
+pub(crate) fn prepare_candidate_config_detailed(
+    root: &std::path::Path,
+    owner: &crate::reference_store::Owner,
+    config: &analysis_context::Config,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Arc<Vec<sources::CompiledDerived>>, crate::reference_lookup::PreparationError> {
+    let snapshot = Snapshot {
+        schema_version: 1,
+        case_id: owner.case_id.clone(),
+        analysis_id: owner.analysis_id.clone(),
+        config_revision: 0,
+        visibility_revision: 0,
+        config: config.clone(),
+        migration_diagnostics: Vec::new(),
+        legacy_raw: None,
+    };
+    prepare_portable_snapshot(root, &snapshot, cancelled)
+}
+
+/// Import preflight preserves explicitly disabled original definitions while
+/// strictly validating and preparing every remaining active dependency.
+pub(crate) fn prepare_portable_snapshot(
+    root: &std::path::Path,
+    snapshot: &Snapshot,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Arc<Vec<sources::CompiledDerived>>, crate::reference_lookup::PreparationError> {
+    use crate::reference_lookup::PreparationError;
+    let check = || {
+        if cancelled() {
+            Err(PreparationError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    let bytes = serde_json::to_vec(&snapshot.config)
+        .map_err(|error| PreparationError::Invalid(error.to_string()))?;
+    if snapshot.schema_version != 1
+        || bytes.len() > 4 << 20
+        || snapshot.config.derived_fields.len() > 256
+        || snapshot.config.references.len() > 128
+    {
+        return Err(PreparationError::Invalid(
+            "A configuração importada excede os limites do Caso ou usa uma versão incompatível."
+                .into(),
+        ));
+    }
+    let active = analysis_context::Config {
+        derived_fields: enabled_definitions(snapshot),
+        references: snapshot.config.references.clone(),
+    };
+    analysis_context::validate(&active).map_err(PreparationError::Invalid)?;
+    let fields = compile_uncached(snapshot).map_err(PreparationError::Invalid)?;
+    check()?;
+    let owner = crate::reference_store::Owner {
+        case_id: snapshot.case_id.clone(),
+        analysis_id: snapshot.analysis_id.clone(),
+    };
+    let prepared = crate::reference_lookup::prepare_fields_detailed(
+        root,
+        &owner,
+        &snapshot.config.references,
+        &fields,
+        cancelled,
+    )?;
+    check()?;
+    Ok(Arc::new(prepared))
+}
+
+fn enabled_definitions(snapshot: &Snapshot) -> Vec<serde_json::Value> {
     // A malformed legacy definition is disabled, while original logs remain
     // queryable. A diagnosed global dependency error makes no ordering safe.
     if snapshot.migration_diagnostics.iter().any(|issue| {
         issue.definition_index.is_none() && issue.code == "invalid_legacy_dependencies"
     }) {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let definitions = &snapshot.config.derived_fields;
     let mut disabled: std::collections::HashSet<usize> = snapshot
@@ -284,6 +371,15 @@ fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>
                                     .and_then(|filter| filter.get("column"))
                                     .and_then(serde_json::Value::as_str)
                             }),
+                    )
+                    .chain(
+                        definition
+                            .get("lookup")
+                            .and_then(|lookup| lookup.get("keys"))
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .map(|key| key.get("sourceField").and_then(serde_json::Value::as_str)),
                     );
             if references.flatten().any(|field| {
                 names.iter().any(|name| {
@@ -301,12 +397,16 @@ fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>
         }
         disabled.extend(more);
     }
-    let safe: Vec<_> = definitions
+    definitions
         .iter()
         .enumerate()
         .filter(|(index, _)| !disabled.contains(index))
         .map(|(_, value)| value.clone())
-        .collect();
+        .collect()
+}
+
+fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>, String> {
+    let safe = enabled_definitions(snapshot);
     let rule_count = safe
         .iter()
         .map(|value| {
@@ -337,7 +437,8 @@ fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>
                 .map(|re| sources::CompiledRule { re, template: rule.template, filter: rule.filter })
                 .map_err(|_| "Expressão regular inválida ou excede o orçamento total de compilação do Caso.".to_string())
         }).collect::<Result<Vec<_>, _>>()?;
-        Ok(sources::CompiledDerived { name: definition.name, source: definition.source, rules, steps: definition.steps })
+        Ok(sources::CompiledDerived { name: definition.name, source: definition.source, rules, steps: definition.steps,
+            lookup: definition.lookup.map(crate::reference_lookup::Compiled::new) })
     }).collect()
 }
 
@@ -355,11 +456,19 @@ pub(crate) fn capture(
     expected_generation: Option<u64>,
     mode: Mode,
 ) -> Result<Arc<Admitted>, String> {
-    let (derived, diagnostics, references) = match &identity {
+    let (derived, diagnostics, references, definition_bytes) = match &identity {
         Some(identity) => {
             let snapshot = validate_identity(identity)?;
             let (derived, diagnostics) = compile(&snapshot)?;
-            (derived, diagnostics, Arc::new(snapshot.config.references))
+            let definition_bytes = serde_json::to_vec(&snapshot.config)
+                .map_err(|e| e.to_string())?
+                .len();
+            (
+                derived,
+                diagnostics,
+                Arc::new(snapshot.config.references),
+                definition_bytes,
+            )
         }
         None => {
             if analysis_context::active_snapshot()?.is_some() {
@@ -371,6 +480,7 @@ pub(crate) fn capture(
                 Arc::new(state.derived.read().clone()),
                 Arc::new(Vec::new()),
                 Arc::new(Vec::new()),
+                0,
             )
         }
     };
@@ -419,6 +529,9 @@ pub(crate) fn capture(
         source,
         names,
         derived,
+        prepared_fields: OnceLock::new(),
+        data_root: crate::config_dir(),
+        definition_bytes,
         diagnostics,
         references,
         visibility: OnceLock::new(),
@@ -447,6 +560,147 @@ pub(crate) fn capture_case(
     Arc::get_mut(&mut admitted).expect("new admission").case_key = key.clone();
     let events = crate::case_cache::take_for(events, key, admitted.identity.as_ref())?;
     Ok((admitted, events))
+}
+
+// Cached projections contain copied, verified bytes and file-only leases. No
+// SQLite reader crosses threads. Cache hits preserve the exact snapshot
+// even if its immutable disk artifact later becomes unavailable; a changed
+// descriptor/config/owner cannot reuse it, and a miss verifies storage again.
+const PREPARED_CACHE_BYTES: usize = 64 << 20;
+const PREPARED_CACHE_ENTRIES: usize = 2;
+struct PreparedFieldsEntry {
+    root: std::path::PathBuf,
+    identity: Identity,
+    references: Arc<Vec<analysis_context::ReferenceDescriptor>>,
+    fields: Arc<Vec<sources::CompiledDerived>>,
+    budget: usize,
+}
+static PREPARED_FIELDS: parking_lot::Mutex<Vec<PreparedFieldsEntry>> =
+    parking_lot::Mutex::new(Vec::new());
+static PREPARING_FIELDS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+impl Admitted {
+    fn cached_prepared_fields(
+        &self,
+        identity: &Identity,
+    ) -> Option<Arc<Vec<sources::CompiledDerived>>> {
+        let mut cache = PREPARED_FIELDS.lock();
+        let index = cache.iter().position(|entry| {
+            entry.root == self.data_root
+                && &entry.identity == identity
+                && entry.references == self.references
+        })?;
+        let entry = cache.remove(index);
+        let fields = Arc::clone(&entry.fields);
+        cache.push(entry);
+        Some(fields)
+    }
+
+    /// File verification and projection loading run only inside the admitted
+    /// worker, before overlays or a derived engine variant can consume fields.
+    pub(crate) fn prepare_references(&self) -> Result<Arc<Vec<sources::CompiledDerived>>, String> {
+        crate::operations::check()?;
+        if let Some(fields) = self.prepared_fields.get() {
+            return Ok(Arc::clone(fields));
+        }
+        let fields = if !self.derived.iter().any(|field| field.lookup.is_some()) {
+            Arc::clone(&self.derived)
+        } else {
+            let identity = self
+                .identity
+                .as_ref()
+                .ok_or("Consultas à referência exigem um Caso admitido.")?;
+            if let Some(fields) = self.cached_prepared_fields(identity) {
+                fields
+            } else {
+                let token = crate::operations::current_token();
+                let cancelled = || token.cancelled();
+                let _preparing = loop {
+                    if cancelled() {
+                        return Err("Preparação das referências cancelada.".into());
+                    }
+                    if let Some(guard) =
+                        PREPARING_FIELDS.try_lock_for(std::time::Duration::from_millis(25))
+                    {
+                        break guard;
+                    }
+                };
+                if let Some(fields) = self.cached_prepared_fields(identity) {
+                    fields
+                } else {
+                    crate::operations::progress(
+                        "reference-runtime",
+                        "Preparando referências verificadas do Caso",
+                        0,
+                        0,
+                        0,
+                    );
+                    let owner = crate::reference_store::Owner {
+                        case_id: identity.case_id.clone(),
+                        analysis_id: identity.analysis_id.clone(),
+                    };
+                    let fields = Arc::new(crate::reference_lookup::prepare_fields(
+                        &self.data_root,
+                        &owner,
+                        &self.references,
+                        &self.derived,
+                        &cancelled,
+                    )?);
+                    if cancelled() {
+                        return Err("Preparação das referências cancelada.".into());
+                    }
+                    for lookup in fields.iter().filter_map(|field| field.lookup.as_ref()) {
+                        if lookup
+                            .version()
+                            .is_none_or(|version| version.owner != owner)
+                        {
+                            return Err(
+                                "A referência preparada não pertence à captura do Caso.".into()
+                            );
+                        }
+                    }
+                    let projection_bytes = crate::reference_lookup::retained_bytes(&fields);
+                    if projection_bytes > crate::reference_lookup::MAX_RETAINED_BYTES {
+                        return Err("As referências preparadas excedem o orçamento do Caso.".into());
+                    }
+                    // Conservatively account for retained regex automata and
+                    // serialized metadata as well as the exact projection bytes.
+                    let budget = (REGEX_BYTES + DFA_BYTES)
+                        .saturating_add(self.definition_bytes)
+                        .saturating_add(projection_bytes);
+                    if budget <= PREPARED_CACHE_BYTES {
+                        let mut cache = PREPARED_FIELDS.lock();
+                        while !cache.is_empty()
+                            && (cache.len() >= PREPARED_CACHE_ENTRIES
+                                || cache
+                                    .iter()
+                                    .map(|entry| entry.budget)
+                                    .sum::<usize>()
+                                    .saturating_add(budget)
+                                    > PREPARED_CACHE_BYTES)
+                        {
+                            cache.remove(0);
+                        }
+                        cache.push(PreparedFieldsEntry {
+                            root: self.data_root.clone(),
+                            identity: identity.clone(),
+                            references: Arc::clone(&self.references),
+                            fields: Arc::clone(&fields),
+                            budget,
+                        });
+                    }
+                    fields
+                }
+            }
+        };
+        crate::operations::check()?;
+        let _ = self.prepared_fields.set(Arc::clone(&fields));
+        Ok(Arc::clone(
+            self.prepared_fields
+                .get()
+                .expect("prepared fields installed"),
+        ))
+    }
 }
 
 static MASKS: std::sync::LazyLock<crate::analysis_visibility::Cache> =
@@ -496,6 +750,7 @@ impl Admitted {
             return Err("Esta captura de consulta já foi executada.".into());
         }
         crate::operations::check()?;
+        let derived = self.prepare_references()?;
         let token = crate::operations::current_token();
         let cancelled = || token.cancelled();
         let progress = |phase: &str, completed: u64, total: Option<u64>| {
@@ -551,7 +806,7 @@ impl Admitted {
                             !stopped && gate.as_ref().is_none_or(|gate| gate.allows_known_row(row));
                         row += 1;
                         if keep {
-                            sources::apply_derived(event, &self.derived);
+                            sources::apply_derived(event, &derived);
                         }
                         keep
                     });
@@ -587,7 +842,7 @@ impl Admitted {
                             !stopped && gate.as_ref().is_none_or(|gate| gate.allows_known_row(row));
                         row += 1;
                         if keep {
-                            sources::apply_derived(event, &self.derived);
+                            sources::apply_derived(event, &derived);
                         }
                         keep
                     });
@@ -639,11 +894,14 @@ impl Admitted {
         {
             return;
         }
+        let Some(derived) = self.prepared_fields.get() else {
+            return;
+        };
         crate::engine::ensure_admitted_variant(
             index,
             &state.codes.read(),
             &state.system_codes.read(),
-            &self.derived,
+            derived,
         );
     }
 
@@ -1027,6 +1285,11 @@ impl ArchiveSource {
                 Some(SourceData::Memory(events)) => Some(events.as_slice()),
                 _ => None,
             });
+        let derived = if !page.rows.is_empty() && (index.is_some() || memory.is_some()) {
+            self.admitted.prepare_references()?
+        } else {
+            Arc::new(Vec::new())
+        };
         let mut budget = crate::query::AnalyticsBudget::new();
         let mut result = Vec::with_capacity(page.rows.len());
         for row in &page.rows {
@@ -1046,8 +1309,7 @@ impl ArchiveSource {
                     &crate::analysis_visibility::MaskBudget::default(),
                 )? {
                     Some(id) => {
-                        let mut event =
-                            sources::event_at(index, id, &codes, &system, &self.admitted.derived);
+                        let mut event = sources::event_at(index, id, &codes, &system, &derived);
                         attach_provenance_with(index, binding, &mut event)?;
                         Some(event)
                     }
@@ -1082,7 +1344,7 @@ impl ArchiveSource {
                 None
             };
             if let Some(event) = &mut event {
-                sources::apply_derived(event, &self.admitted.derived);
+                sources::apply_derived(event, &derived);
                 crate::entities::annotate(event);
                 budget.charge(crate::query::event_payload_bytes(event))?;
             }
@@ -1123,7 +1385,18 @@ pub(crate) fn source(state: &AppState) -> SourceView<'_> {
 }
 pub(crate) fn derived(state: &AppState) -> Arc<Vec<sources::CompiledDerived>> {
     current()
-        .map(|admitted| admitted.derived.clone())
+        .map(|admitted| {
+            if let Some(prepared) = admitted.prepared_fields.get() {
+                return Arc::clone(prepared);
+            }
+            if admitted.derived.iter().any(|field| field.lookup.is_some()) {
+                record_failure(
+                    "As referências ainda não foram preparadas para esta consulta.".into(),
+                );
+                return Arc::new(Vec::new());
+            }
+            Arc::clone(&admitted.derived)
+        })
         .unwrap_or_else(|| Arc::new(state.derived.read().clone()))
 }
 /// Immutable descriptor metadata only; readers and lookup materialization stay
@@ -2188,5 +2461,368 @@ mod tests {
             (Some(0), Some(0), None)
         );
         assert_eq!(originals.len(), 12);
+    }
+    fn lookup_snapshot(directory: &Directory, case: &str, value: &str, install: bool) -> Snapshot {
+        use sha2::Digest;
+        let bytes = (json!({"key":1,"value":value}).to_string() + "\n").into_bytes();
+        let descriptor = analysis_context::ReferenceDescriptor {
+            schema_version: 1,
+            id: "shared-reference-id".into(),
+            name: "Fixture reference".into(),
+            content_sha256: format!("{:x}", sha2::Sha256::digest(&bytes)),
+            format: "jsonl".into(),
+            columns: vec!["key".into(), "value".into()],
+            key_columns: vec!["key".into()],
+            duplicate_policy: "reject".into(),
+        };
+        let config = analysis_context::Config {
+            derived_fields: vec![json!({"name":"lookup_tag","lookup":{"schemaVersion":1,
+                "referenceId":"shared-reference-id","keys":[{"referenceColumn":"key","sourceField":"lookup_key"}],"valueColumn":"value"}})],
+            references: vec![descriptor.clone()],
+        };
+        let snapshot =
+            analysis_context::update(&directory.snapshot(case).identity(), config).unwrap();
+        if install {
+            let owner = crate::reference_store::Owner {
+                case_id: case.into(),
+                analysis_id: snapshot.analysis_id.clone(),
+            };
+            crate::reference_store::prepare_jsonl(
+                directory.path.path(),
+                &owner,
+                &descriptor,
+                &bytes[..],
+                Default::default(),
+                &|| false,
+            )
+            .unwrap();
+        }
+        snapshot
+    }
+    fn lookup_event() -> Event {
+        let mut event = original();
+        event.fields.insert("lookup_key".into(), json!(1));
+        event
+    }
+    fn prepare_lookup_case(
+        state: &AppState,
+        identity: Identity,
+        event: Event,
+    ) -> (Arc<Admitted>, Vec<Event>) {
+        let (admitted, events) =
+            capture_case(state, Some(identity), None, Some(vec![event]), None).unwrap();
+        let token = crate::operations::token(None).unwrap();
+        let filtered =
+            crate::operations::run_with_token(token, || admitted.prepare_visibility(events))
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        (admitted, filtered)
+    }
+
+    #[test]
+    fn references_are_prepared_in_workers_and_pinned_to_case_and_config() {
+        let directory = Directory::new();
+        let a = lookup_snapshot(&directory, "a", "owner-a", true);
+        let b = lookup_snapshot(&directory, "b", "owner-b", true);
+        let state = state(SourceData::None);
+        let original = lookup_event();
+        let (first, events) = prepare_lookup_case(&state, a.identity(), original.clone());
+        assert_eq!(events[0].fields.get("lookup_tag"), Some(&json!("owner-a")));
+        assert!(original.fields.get("lookup_tag").is_none());
+        assert!(first.derived[0]
+            .lookup
+            .as_ref()
+            .unwrap()
+            .version()
+            .is_none());
+        let prepared = first.prepared_fields.get().unwrap();
+        assert_eq!(
+            prepared[0]
+                .lookup
+                .as_ref()
+                .unwrap()
+                .version()
+                .unwrap()
+                .owner
+                .case_id,
+            "a"
+        );
+        let (other, events) = prepare_lookup_case(&state, b.identity(), original.clone());
+        assert_eq!(events[0].fields.get("lookup_tag"), Some(&json!("owner-b")));
+        assert!(!Arc::ptr_eq(prepared, other.prepared_fields.get().unwrap()));
+        let (again, _) = prepare_lookup_case(&state, a.identity(), original.clone());
+        assert!(Arc::ptr_eq(prepared, again.prepared_fields.get().unwrap()));
+        let fields = Arc::clone(prepared);
+        let threaded = std::thread::spawn(move || {
+            let mut event = lookup_event();
+            sources::apply_derived(&mut event, &fields);
+            event.fields.get("lookup_tag").cloned()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(threaded, Some(json!("owner-a")));
+        let changed = lookup_snapshot(&directory, "a", "owner-a-new", true);
+        let (latest, events) = prepare_lookup_case(&state, changed.identity(), original);
+        assert_eq!(
+            events[0].fields.get("lookup_tag"),
+            Some(&json!("owner-a-new"))
+        );
+        assert!(!Arc::ptr_eq(
+            prepared,
+            latest.prepared_fields.get().unwrap()
+        ));
+        assert!(first.validate(&state).is_err());
+        assert_eq!(
+            prepared[0]
+                .lookup
+                .as_ref()
+                .unwrap()
+                .evaluate(&lookup_event())
+                .unwrap(),
+            Some(json!("owner-a"))
+        );
+        let cache = PREPARED_FIELDS.lock();
+        assert!(cache.len() <= PREPARED_CACHE_ENTRIES);
+        assert!(cache.iter().map(|entry| entry.budget).sum::<usize>() <= PREPARED_CACHE_BYTES);
+    }
+
+    #[test]
+    fn reference_capture_has_no_io_and_missing_foreign_or_cancelled_preparation_fails() {
+        let directory = Directory::new();
+        let missing = lookup_snapshot(&directory, "a", "not-installed", false);
+        let state = state(SourceData::None);
+        let original = lookup_event();
+        let (admitted, events) = capture_case(
+            &state,
+            Some(missing.identity()),
+            None,
+            Some(vec![original.clone()]),
+            None,
+        )
+        .unwrap();
+        assert!(admitted.prepared_fields.get().is_none());
+        assert!(admitted.derived[0]
+            .lookup
+            .as_ref()
+            .unwrap()
+            .version()
+            .is_none());
+        assert!(admitted.prepare_visibility(events).is_err());
+        assert!(admitted.prepared_fields.get().is_none());
+        assert!(admitted.visibility.get().is_none());
+        assert!(original.fields.get("lookup_tag").is_none());
+        let installed = lookup_snapshot(&directory, "a", "installed", true);
+        let foreign = analysis_context::update(
+            &directory.snapshot("b").identity(),
+            installed.config.clone(),
+        )
+        .unwrap();
+        let (foreign, events) = capture_case(
+            &state,
+            Some(foreign.identity()),
+            None,
+            Some(vec![original.clone()]),
+            None,
+        )
+        .unwrap();
+        assert!(foreign.prepare_visibility(events).is_err());
+        let (cancelled, events) = capture_case(
+            &state,
+            Some(installed.identity()),
+            None,
+            Some(vec![original]),
+            None,
+        )
+        .unwrap();
+        let id = format!("reference-cancel-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let result = crate::operations::run_with_token(token, || {
+            assert!(crate::operations::cancel_id(&id));
+            cancelled.prepare_visibility(events)
+        });
+        assert!(result.is_err());
+        assert!(cancelled.prepared_fields.get().is_none());
+        assert!(cancelled.visibility.get().is_none());
+    }
+
+    #[test]
+    fn verified_reference_cache_survives_backing_loss_but_new_descriptors_do_not_reuse_it() {
+        let directory = Directory::new();
+        let initial = lookup_snapshot(&directory, "a", "pinned", true);
+        let state = state(SourceData::None);
+        let (first, _) = prepare_lookup_case(&state, initial.identity(), lookup_event());
+        std::fs::remove_dir_all(directory.path.path().join("references-v1")).unwrap();
+        let (again, events) = prepare_lookup_case(&state, initial.identity(), lookup_event());
+        assert_eq!(events[0].fields.get("lookup_tag"), Some(&json!("pinned")));
+        assert!(Arc::ptr_eq(
+            first.prepared_fields.get().unwrap(),
+            again.prepared_fields.get().unwrap()
+        ));
+        let changed = lookup_snapshot(&directory, "a", "missing-new-version", false);
+        let (admitted, events) = capture_case(
+            &state,
+            Some(changed.identity()),
+            None,
+            Some(vec![lookup_event()]),
+            None,
+        )
+        .unwrap();
+        assert!(admitted.prepare_visibility(events).is_err());
+        assert!(admitted.prepared_fields.get().is_none());
+        assert_eq!(
+            first.prepared_fields.get().unwrap()[0]
+                .lookup
+                .as_ref()
+                .unwrap()
+                .evaluate(&lookup_event())
+                .unwrap(),
+            Some(json!("pinned"))
+        );
+    }
+    #[test]
+    fn candidate_reference_preflight_pins_projection_without_publishing_config() {
+        let directory = Directory::new();
+        let saved = lookup_snapshot(&directory, "a", "ready", true);
+        let owner = crate::reference_store::Owner {
+            case_id: saved.case_id.clone(),
+            analysis_id: saved.analysis_id.clone(),
+        };
+        let mut candidate = saved.config.clone();
+        candidate.derived_fields[0]["name"] = json!("new_lookup_tag");
+        let prepared =
+            prepare_candidate_config(directory.path.path(), &owner, &candidate, &|| false).unwrap();
+        assert_eq!(prepared[0].name, "new_lookup_tag");
+        assert_eq!(
+            prepared[0]
+                .lookup
+                .as_ref()
+                .unwrap()
+                .version()
+                .unwrap()
+                .owner,
+            owner
+        );
+        assert_eq!(directory.snapshot("a"), saved);
+        let mut missing = candidate.clone();
+        missing.references[0].content_sha256 = "f".repeat(64);
+        assert!(
+            matches!(prepare_candidate_config_detailed(directory.path.path(), &owner, &missing, &|| false),
+            Err(crate::reference_lookup::PreparationError::Unavailable { reference_id }) if reference_id == "shared-reference-id")
+        );
+        assert!(
+            prepare_candidate_config(directory.path.path(), &owner, &candidate, &|| true).is_err()
+        );
+        assert_eq!(directory.snapshot("a"), saved);
+        let published = analysis_context::update(&saved.identity(), candidate).unwrap();
+        assert_eq!(published.config_revision, saved.config_revision + 1);
+        assert_eq!(
+            prepared[0]
+                .lookup
+                .as_ref()
+                .unwrap()
+                .evaluate(&lookup_event())
+                .unwrap(),
+            Some(json!("ready"))
+        );
+    }
+    #[test]
+    fn portable_reference_preflight_disables_diagnosed_dependencies_and_preserves_healthy_fields() {
+        let directory = Directory::new();
+        let mut snapshot = lookup_snapshot(&directory, "a", "healthy", true);
+        let healthy = snapshot.config.derived_fields[0].clone();
+        let mut missing = snapshot.config.references[0].clone();
+        missing.id = "unavailable-reference".into();
+        missing.content_sha256 = "e".repeat(64);
+        snapshot.config.references.push(missing);
+        let lookup = |name: &str, reference: &str, source: &str| {
+            json!({"name":name,"lookup":{"schemaVersion":1,
+            "referenceId":reference,"keys":[{"referenceColumn":"key","sourceField":source}],"valueColumn":"value"}})
+        };
+        snapshot.config.derived_fields = vec![
+            lookup("disabled_lookup", "unavailable-reference", "lookup_key"),
+            lookup("dependent_lookup", "shared-reference-id", "disabled_lookup"),
+            json!({"name":"dependent_extract","source":"dependent_lookup","pattern":"(.*)"}),
+            healthy,
+            json!({"name":"raw_copy","source":"message","pattern":"(.*)"}),
+        ];
+        assert!(
+            matches!(prepare_portable_snapshot(directory.path.path(),&snapshot,&||false),
+            Err(crate::reference_lookup::PreparationError::Unavailable { reference_id }) if reference_id == "unavailable-reference")
+        );
+        snapshot
+            .migration_diagnostics
+            .push(analysis_context::Diagnostic {
+                definition_index: Some(0),
+                code: "unavailable_reference".into(),
+                message: "Reference bytes absent in imported evidence.".into(),
+            });
+        let original = snapshot.clone();
+        let fields =
+            prepare_portable_snapshot(directory.path.path(), &snapshot, &|| false).unwrap();
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lookup_tag", "raw_copy"]
+        );
+        let mut event = lookup_event();
+        event.fields.insert("disabled_lookup".into(), json!(1));
+        sources::apply_derived(&mut event, &fields);
+        assert_eq!(event.fields.get("lookup_tag"), Some(&json!("healthy")));
+        assert_eq!(event.fields.get("raw_copy"), Some(&json!("raw message")));
+        assert_eq!(event.fields.get("disabled_lookup"), Some(&json!(1)));
+        assert!(!event.fields.contains_key("dependent_lookup"));
+        assert!(!event.fields.contains_key("dependent_extract"));
+        assert_eq!(snapshot, original);
+    }
+
+    #[test]
+    fn portable_reference_preflight_preserves_typed_projection_budget_failure() {
+        use sha2::Digest;
+        let directory = Directory::new();
+        let mut snapshot = directory.snapshot("a");
+        let value = "x".repeat(500 << 10);
+        let data = (0..17)
+            .map(|key| json!({"key":key,"value":value}).to_string() + "\n")
+            .collect::<String>()
+            .into_bytes();
+        let descriptor = analysis_context::ReferenceDescriptor {
+            schema_version: 1,
+            id: "large".into(),
+            name: "Large fixture".into(),
+            content_sha256: format!("{:x}", sha2::Sha256::digest(&data)),
+            format: "jsonl".into(),
+            columns: vec!["key".into(), "value".into()],
+            key_columns: vec!["key".into()],
+            duplicate_policy: "reject".into(),
+        };
+        let owner = crate::reference_store::Owner {
+            case_id: snapshot.case_id.clone(),
+            analysis_id: snapshot.analysis_id.clone(),
+        };
+        crate::reference_store::prepare_jsonl(
+            directory.path.path(),
+            &owner,
+            &descriptor,
+            &data[..],
+            Default::default(),
+            &|| false,
+        )
+        .unwrap();
+        snapshot.config.references = vec![descriptor];
+        snapshot.config.derived_fields = vec![
+            json!({"name":"large_lookup","lookup":{"schemaVersion":1,"referenceId":"large",
+            "keys":[{"referenceColumn":"key","sourceField":"lookup_key"}],"valueColumn":"value"}}),
+        ];
+        assert!(matches!(
+            prepare_portable_snapshot(directory.path.path(), &snapshot, &|| false),
+            Err(crate::reference_lookup::PreparationError::RetainedBytes)
+        ));
+        assert_eq!(
+            directory.snapshot("a").config,
+            analysis_context::Config::default()
+        );
     }
 }

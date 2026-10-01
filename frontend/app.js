@@ -1806,6 +1806,7 @@ function renderExploreTreeInto(box, scope) {
       showCtxMenu(event.clientX, event.clientY, [
         ...(window.ExplorerTimeline ? [window.ExplorerTimeline.menuItem(column)] : []),
         ...(window.FieldTransforms ? [window.FieldTransforms.menuItem(column, { anchor: main })] : []),
+        ...(window.CaseReferences ? [window.CaseReferences.lookupMenuItem(column, main)] : []),
         valueFilterMenuItem(column, "", main, { op: "contains" }),
         { icon: "fa-circle-info", label: "Inspecionar campo", onClick: () => showFieldInspector(column) },
       ]);
@@ -1962,13 +1963,14 @@ function renderExploreTreeInto(box, scope) {
     const derivedKids = state.derivedFields.map((def) => {
       const row = el("div", "field-row");
       const main = el("button", "field-item");
-      main.innerHTML = `<i class="fas fa-wand-magic-sparkles"></i><span>${esc(def.name)}</span><small>${esc(colLabel(def.source))}</small>`;
-      main.title = `${def.name} ← ${colLabel(def.source)} · /${def.pattern}/`;
-      main.onclick = () => def.steps?.length && !def.rules?.length && window.FieldTransforms ? window.FieldTransforms.open(def.name, { anchor: main, owner: analysisOwner }) : openDeriveEdit(def, { analysisOwner });
+      const sourceLabel = def.lookup ? window.CaseReferences?.describe(def) || "Referência do Caso" : colLabel(def.source);
+      main.innerHTML = `<i class="fas ${def.lookup ? "fa-table-list" : "fa-wand-magic-sparkles"}"></i><span>${esc(def.name)}</span><small>${esc(sourceLabel)}</small>`;
+      main.title = `${def.name} ← ${sourceLabel}${def.lookup ? "" : ` · /${def.pattern}/`}`;
+      main.onclick = () => def.steps?.length && !def.rules?.length && window.FieldTransforms ? window.FieldTransforms.open(def.name, { anchor: main, owner: analysisOwner }) : openDeriveEdit(def, { analysisOwner, anchor: main });
       const edit = el("button", "icon-btn field-adv-btn");
       edit.innerHTML = '<i class="fas fa-pen"></i>';
       edit.title = `Editar campo ${def.name}`;
-      edit.onclick = (e) => { e.stopPropagation(); openDeriveEdit(def, { analysisOwner }); };
+      edit.onclick = (e) => { e.stopPropagation(); openDeriveEdit(def, { analysisOwner, anchor: edit }); };
       row.append(main, edit);
       if (window.FieldTransforms) {
         const transform = el("button", "icon-btn field-adv-btn"); transform.innerHTML = '<i class="fas fa-wand-magic-sparkles"></i>';
@@ -3086,8 +3088,9 @@ function openDeriveModal(selected, sourceCol, sourceValue) {
   $("#dv-name").focus();
 }
 
-function openDeriveEdit(def, { appendRule = false, analysisOwner = window.AnalysisContexts?.capture() } = {}) {
+function openDeriveEdit(def, { appendRule = false, analysisOwner = window.AnalysisContexts?.capture(), anchor } = {}) {
   if (analysisOwner && !window.AnalysisContexts.isCurrent(analysisOwner)) { toast("A configuração mudou. Abra o campo novamente.", "info"); return; }
+  if (def.lookup) { if (window.CaseReferences) void window.CaseReferences.openLookup(def, { owner: analysisOwner, anchor }); else toast("O editor de referência ainda não está disponível.", "info"); return; }
   const ev = state.rows.find((r) => String(cellValue(r, def.source) || "").trim()) || state.rows[0] || null;
   state.currentDetailEv = ev;
   openDeriveModal("", def.source, ev ? cellValue(ev, def.source) : "");
@@ -4986,6 +4989,7 @@ function renderTable(qr, { reuseRows = false } = {}) {
       showCtxMenu(event.clientX, event.clientY, [
         ...(window.ExplorerTimeline ? [window.ExplorerTimeline.menuItem(col)] : []),
         ...(window.FieldTransforms ? [window.FieldTransforms.menuItem(col, { anchor: th })] : []),
+        ...(window.CaseReferences ? [window.CaseReferences.lookupMenuItem(col, th)] : []),
         {
           icon: "fa-arrow-down",
           label: "Adicionar ao Cubo em Linhas",
@@ -5368,6 +5372,7 @@ function showDetailNameMenu(event, node) {
   if (column) {
     if (window.ExplorerTimeline) items.push(window.ExplorerTimeline.menuItem(column));
     if (window.FieldTransforms) items.push(window.FieldTransforms.menuItem(column, { event: state.currentDetailEv, anchor: event.target }));
+    if (window.CaseReferences) items.push(window.CaseReferences.lookupMenuItem(column, event.target));
     items.push(valueFilterMenuItem(column, node.hasValue ? detailFieldFilterValue(node) : "", event.target, { op: node.hasValue ? null : "contains" }));
     if (column !== "timestamp") items.push({
       icon: state.visibleCols.includes(column) ? "fa-eye-slash" : "fa-table-columns",
@@ -6399,6 +6404,7 @@ function bind() {
     e.stopPropagation();
     showCtxMenu(e.clientX, e.clientY, [
       { icon: "fa-pen", label: "Renomear caso", onClick: () => showCaseNameInput("rename") },
+      ...(window.CaseReferences ? [{ icon: "fa-table-list", label: "Referências deste Caso", onClick: () => window.CaseReferences.openManager() }] : []),
       { icon: "fa-trash-can", label: "Excluir caso", danger: true, onClick: deleteActiveCase },
     ]);
   };
@@ -6546,7 +6552,7 @@ function bind() {
         onClick: () => openDeriveModal(sel, sourceCol, cellValue(state.currentDetailEv, sourceCol)),
       },
     ];
-    const derived = (state.derivedFields || []).slice(0, 6);
+    const derived = (state.derivedFields || []).filter(def => !def.lookup).slice(0, 6);
     if (derived.length) {
       items.push({ sep: true });
       for (const def of derived) {

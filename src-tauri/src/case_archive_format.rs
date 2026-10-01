@@ -18,6 +18,8 @@ const MAX_PAYLOAD_BYTES: u64 = 4 << 30;
 pub(crate) const MAX_ARCHIVE_BYTES: u64 = 32 << 30;
 const MAX_IMAGES: usize = 1000;
 pub(crate) const MAX_PAYLOADS: usize = 4096;
+pub(crate) const MAX_REFERENCE_BYTES: u64 = 256 << 20;
+pub(crate) const MAX_REFERENCES: usize = 4096;
 const COPY_BUFFER_BYTES: usize = 64 << 10;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -31,6 +33,7 @@ pub(crate) enum EntryKind {
     Document,
     Image(String),
     Exclusion(String),
+    Reference(String),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -75,11 +78,11 @@ fn digest_valid(value: &str) -> bool {
 }
 fn validate_entries(entries: &[Entry]) -> Result<u64, String> {
     if entries.first().map(|e| &e.kind) != Some(&EntryKind::Document)
-        || entries.len() > 1 + MAX_IMAGES + MAX_PAYLOADS
+        || entries.len() > 1 + MAX_IMAGES + MAX_PAYLOADS + MAX_REFERENCES
     {
         return Err("Estrutura do arquivo portátil inválida ou excessiva.".into());
     }
-    let (mut images, mut payloads, mut bytes) = (0, 0, 0u64);
+    let (mut images, mut payloads, mut references, mut bytes) = (0, 0, 0, 0u64);
     let mut seen = HashSet::new();
     for entry in entries {
         if !seen.insert(&entry.kind) || !digest_valid(&entry.sha256) {
@@ -94,25 +97,39 @@ fn validate_entries(entries: &[Entry]) -> Result<u64, String> {
                 }
                 MAX_IMAGE_BYTES
             }
-            EntryKind::Exclusion(id) => {
-                payloads += 1;
+            EntryKind::Exclusion(id) | EntryKind::Reference(id) => {
                 let parsed = uuid::Uuid::parse_str(id)
-                    .map_err(|_| "Identificador de exclusão portátil inválido.")?;
+                    .map_err(|_| "Identificador de conteúdo portátil inválido.")?;
                 if parsed.is_nil() || parsed.to_string() != *id {
-                    return Err("Identificador de exclusão portátil inválido.".into());
+                    return Err("Identificador de conteúdo portátil inválido.".into());
                 }
-                MAX_PAYLOAD_BYTES
+                if matches!(entry.kind, EntryKind::Reference(_)) {
+                    references += 1;
+                    MAX_REFERENCE_BYTES
+                } else {
+                    payloads += 1;
+                    MAX_PAYLOAD_BYTES
+                }
             }
         };
-        if entry.bytes == 0 || entry.bytes > limit {
+        if (entry.bytes == 0 && !matches!(entry.kind, EntryKind::Reference(_)))
+            || entry.bytes > limit
+        {
             return Err("Uma entrada excede o limite do arquivo portátil.".into());
         }
         bytes = bytes
             .checked_add(entry.bytes)
             .ok_or("Arquivo portátil excessivo.")?;
     }
-    if images > MAX_IMAGES || payloads > MAX_PAYLOADS || bytes > MAX_ARCHIVE_BYTES {
-        return Err("O arquivo portátil excede 32 GiB, 1.000 imagens ou 4.096 payloads.".into());
+    if images > MAX_IMAGES
+        || payloads > MAX_PAYLOADS
+        || references > MAX_REFERENCES
+        || bytes > MAX_ARCHIVE_BYTES
+    {
+        return Err(
+            "O arquivo portátil excede 32 GiB, 1.000 imagens, 4.096 payloads ou 4.096 referências."
+                .into(),
+        );
     }
     Ok(bytes)
 }
@@ -501,5 +518,37 @@ mod tests {
         copy_checked(&mut source, &mut std::io::sink(), &entry, &|| false).unwrap();
         assert_eq!(source.remaining, 0);
         assert_eq!(source.largest_read, COPY_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn portable_reference_empty_bytes_are_valid_but_paths_and_sizes_are_bounded() {
+        let document = entry(EntryKind::Document, b"{}");
+        let reference = entry(EntryKind::Reference(uuid::Uuid::new_v4().to_string()), b"");
+        assert!(validate_entries(&[document.clone(), reference.clone()]).is_ok());
+        assert!(validate_entries(&[
+            document.clone(),
+            Entry {
+                bytes: MAX_REFERENCE_BYTES + 1,
+                ..reference.clone()
+            }
+        ])
+        .is_err());
+        assert!(validate_entries(&[
+            document.clone(),
+            Entry {
+                kind: EntryKind::Reference("../../foreign.jsonl".into()),
+                ..reference.clone()
+            }
+        ])
+        .is_err());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("empty.licase");
+        let mut sources = [
+            source(root.path(), "doc", EntryKind::Document, b"{}"),
+            source(root.path(), "ref", reference.kind, b""),
+        ];
+        write(&path, &json!({}), &mut sources, &|| false).unwrap();
+        let staged = read::<Value>(&path, root.path(), &|| false).unwrap();
+        assert_eq!(std::fs::metadata(staged.path(1).unwrap()).unwrap().len(), 0);
     }
 }

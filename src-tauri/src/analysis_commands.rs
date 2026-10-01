@@ -27,6 +27,23 @@ pub(crate) fn validate_config(config: &Config) -> Result<(), String> {
     crate::analysis_runtime::validate_compilation(config)
 }
 
+/// Keep verified reference projections and their leases alive through CAS.
+/// This runs only in an explicit mutation worker, never during request capture.
+pub(crate) fn prepare_config(
+    expected: &Identity,
+    config: &Config,
+) -> Result<std::sync::Arc<Vec<sources::CompiledDerived>>, String> {
+    crate::analysis_runtime::prepare_candidate_config(
+        &crate::config_dir(),
+        &crate::reference_store::Owner {
+            case_id: expected.case_id.clone(),
+            analysis_id: expected.analysis_id.clone(),
+        },
+        config,
+        &|| crate::operations::check().is_err(),
+    )
+}
+
 pub(crate) fn expected_identity(explicit: Option<Identity>) -> Result<Identity, String> {
     if let Some(identity) = explicit {
         return Ok(identity);
@@ -106,6 +123,7 @@ pub(crate) fn save_definition(
             analysis_context: current,
         });
     }
+    let _prepared = prepare_config(expected, &config)?;
     crate::operations::check()?;
     let snapshot = analysis_context::update(expected, config)?;
     crate::operations::commit();
@@ -130,6 +148,7 @@ pub(crate) fn delete_definition(
         });
     }
     validate_config(&config)?;
+    let _prepared = prepare_config(expected, &config)?;
     crate::operations::check()?;
     let snapshot = analysis_context::update(expected, config)?;
     crate::operations::commit();
@@ -164,10 +183,12 @@ pub(crate) async fn analysis_context_snapshot(case_id: String) -> Result<Snapsho
 pub(crate) async fn analysis_context_update(
     analysis_context: Identity,
     config: Config,
+    operation_id: Option<String>,
 ) -> Result<MutationReceipt, String> {
-    crate::offload(move || {
+    crate::offload_operation(operation_id, move || {
         current_for_edit(&analysis_context)?;
         validate_config(&config)?;
+        let _prepared = prepare_config(&analysis_context, &config)?;
         crate::operations::check()?;
         let snapshot = analysis_context::update(&analysis_context, config)?;
         crate::operations::commit();

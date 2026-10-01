@@ -57,12 +57,68 @@ pub(crate) fn identity(store: &Path, expected_rows: usize) -> Result<Identity> {
     })
 }
 
+/// Optional reader metadata, never a new persistent format. Immutable stores
+/// normally hold <=1M rows, so the default stride retains about16 KiB per store.
+/// The hard per-reader ceiling includes vector/level metadata, not allocator RSS.
+const RANK_FENCE_BYTES: usize = 64 << 10;
+const RANK_FENCE_STRIDE: usize = 512;
+struct RankFences {
+    stride: usize,
+    levels: [usize; LEVELS + 1],
+    maxima: Vec<i64>,
+}
+impl RankFences {
+    fn prepare(lengths: [usize; LEVELS], budget: usize) -> Option<Self> {
+        let available = budget.checked_sub(std::mem::size_of::<Self>())? / 8;
+        if available == 0 || lengths.iter().all(|&n| n == 0) {
+            return None;
+        }
+        let mut stride = RANK_FENCE_STRIDE;
+        loop {
+            let mut levels = [0usize; LEVELS + 1];
+            for (level, &length) in lengths.iter().enumerate() {
+                levels[level + 1] = levels[level].checked_add(length.div_ceil(stride))?;
+            }
+            let count = levels[LEVELS];
+            if count <= available {
+                let mut maxima = Vec::new();
+                maxima.try_reserve_exact(count).ok()?;
+                if maxima
+                    .capacity()
+                    .checked_mul(8)?
+                    .checked_add(std::mem::size_of::<Self>())?
+                    > budget
+                {
+                    return None;
+                }
+                return Some(Self {
+                    stride,
+                    levels,
+                    maxima,
+                });
+            }
+            stride = stride.checked_mul(2)?;
+        }
+    }
+    fn record(&mut self, row: usize, length: usize, value: i64) {
+        // prepare always chooses a power-of-two stride; avoid division in the
+        // existing per-value verification loop.
+        if (row + 1) & (self.stride - 1) == 0 || row + 1 == length {
+            self.maxima.push(value);
+        }
+    }
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.maxima.capacity() * 8
+    }
+}
+
 struct Data {
     file: File,
     mmap: Mmap,
     modified: Option<std::time::SystemTime>,
     totals: [u64; LEVELS],
     offsets: [usize; LEVELS + 1],
+    fences: Option<RankFences>,
 }
 
 pub(crate) struct TimeIndex {
@@ -192,6 +248,13 @@ fn load(
         if offsets[level + 1] > end {
             return Err("Partição temporal incompleta.".into());
         }
+    }
+    if total != identity.rows || offsets[LEVELS] != end {
+        return Err("Contagem temporal não corresponde ao checkpoint.".into());
+    }
+    let lengths = std::array::from_fn(|level| (offsets[level + 1] - offsets[level]) / 8);
+    let mut fences = RankFences::prepare(lengths, RANK_FENCE_BYTES);
+    for level in 0..LEVELS {
         let mut previous = None;
         for (row, bytes) in mmap[offsets[level]..offsets[level + 1]]
             .chunks_exact(8)
@@ -205,10 +268,14 @@ fn load(
                 return Err("Partição temporal fora de ordem.".into());
             }
             previous = Some(value);
+            if let Some(fences) = fences.as_mut() {
+                fences.record(row, lengths[level], value);
+            }
         }
     }
-    if total != identity.rows || offsets[LEVELS] != end {
-        return Err("Contagem temporal não corresponde ao checkpoint.".into());
+    if let Some(fences) = &fences {
+        debug_assert_eq!(fences.maxima.len(), fences.levels[LEVELS]);
+        debug_assert!(fences.bytes() <= RANK_FENCE_BYTES);
     }
     check(cancelled)?;
     // Verification visits every byte once. Remap afterwards so retaining many
@@ -227,6 +294,7 @@ fn load(
         modified: metadata.modified().ok(),
         totals,
         offsets,
+        fences,
     }))
 }
 
@@ -541,7 +609,25 @@ impl Data {
         )
     }
     fn partition(&self, level: usize, mut matches: impl FnMut(i64) -> bool) -> usize {
-        let (mut low, mut high) = (0, self.len(level));
+        let Some(fences) = &self.fences else {
+            return self.partition_raw(level, matches);
+        };
+        let maxima = &fences.maxima[fences.levels[level]..fences.levels[level + 1]];
+        let block = maxima.partition_point(|&value| matches(value));
+        let low = block.saturating_mul(fences.stride).min(self.len(level));
+        let high = low.saturating_add(fences.stride).min(self.len(level));
+        self.partition_between(level, low, high, matches)
+    }
+    fn partition_raw(&self, level: usize, matches: impl FnMut(i64) -> bool) -> usize {
+        self.partition_between(level, 0, self.len(level), matches)
+    }
+    fn partition_between(
+        &self,
+        level: usize,
+        mut low: usize,
+        mut high: usize,
+        mut matches: impl FnMut(i64) -> bool,
+    ) -> usize {
         while low < high {
             let middle = low + (high - low) / 2;
             if matches(self.value(level, middle)) {
@@ -1129,4 +1215,71 @@ mod tests {
         assert!(histogram(&readers, 0, 5, 1, 241).is_err());
     }
 
+    #[test]
+    fn rank_fence_budget_adapts_stride_and_can_decline_without_allocating() {
+        assert!(RankFences::prepare([0; LEVELS], RANK_FENCE_BYTES).is_none());
+        assert!(RankFences::prepare([1; LEVELS], 0).is_none());
+        assert!(RankFences::prepare([1; LEVELS], std::mem::size_of::<RankFences>() + 8).is_none());
+        let normal = RankFences::prepare([140_000; LEVELS], RANK_FENCE_BYTES).unwrap();
+        assert_eq!(normal.stride, 512);
+        assert!(normal.bytes() <= RANK_FENCE_BYTES);
+        let large = RankFences::prepare([1_000_000; LEVELS], RANK_FENCE_BYTES).unwrap();
+        assert!(large.stride > normal.stride && large.stride.is_power_of_two());
+        assert!(large.bytes() <= RANK_FENCE_BYTES);
+    }
+    #[test]
+    fn rank_fences_preserve_v1_boundaries_ties_and_raw_fallback() {
+        let (directory, connection, store, _) = fixture(&[]);
+        connection.execute_batch("INSERT INTO ev SELECT (i%7)::UTINYINT,NULLIF((i/35)::BIGINT-100,0) FROM range(8192) t(i); INSERT INTO ev VALUES (0,-9223372036854775808),(6,9223372036854775807),(3,0),(2,NULL)").unwrap();
+        std::fs::write(
+            store.with_extension("complete.json"),
+            json!({"key":"fixture","rows":8196,"version":5}).to_string(),
+        )
+        .unwrap();
+        let identity = identity(&store, 8196).unwrap();
+        ensure(&connection, &store, &identity, &|| false).unwrap();
+        let bytes = std::fs::read(path(&store)).unwrap();
+        let modified = std::fs::metadata(path(&store)).unwrap().modified().unwrap();
+        let index = open(&store, &identity).unwrap().unwrap();
+        assert!(index.data.fences.as_ref().unwrap().bytes() <= RANK_FENCE_BYTES);
+        for level in 0..LEVELS {
+            let values: Vec<_> = (0..index.data.len(level))
+                .map(|row| index.data.value(level, row))
+                .collect();
+            for bound in [i64::MIN, i64::MAX].into_iter().chain(-105..140) {
+                for inclusive in [false, true] {
+                    let predicate = |t: i64| if inclusive { t <= bound } else { t < bound };
+                    let expected = values.partition_point(|&value| predicate(value));
+                    assert_eq!(index.data.partition(level, predicate), expected);
+                    assert_eq!(index.data.partition_raw(level, predicate), expected);
+                }
+            }
+            for start in [i64::MIN, -101, -1, 0, 1, 130] {
+                for width in [1, 7, i64::MAX] {
+                    for bucket in [0, 1, 17, 239] {
+                        let predicate = |t: i64| t.saturating_sub(start) / width <= bucket;
+                        assert_eq!(
+                            index.data.partition(level, predicate),
+                            values.partition_point(|&value| predicate(value))
+                        );
+                    }
+                }
+            }
+        }
+        let p = predicate(&[]).unwrap();
+        let expected =
+            serde_json::to_value(stats(&[Arc::clone(&index)], &p).unwrap().unwrap()).unwrap();
+        let mut raw = Arc::try_unwrap(index).ok().unwrap();
+        raw.data.fences = None;
+        assert_eq!(
+            serde_json::to_value(stats(&[Arc::new(raw)], &p).unwrap().unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(std::fs::read(path(&store)).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(path(&store)).unwrap().modified().unwrap(),
+            modified
+        );
+        drop(directory);
+    }
 }

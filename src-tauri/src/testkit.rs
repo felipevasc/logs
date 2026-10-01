@@ -77,6 +77,7 @@ impl Source {
                 name: d.name,
                 source: d.source,
                 steps: d.steps,
+                lookup: d.lookup.map(crate::reference_lookup::Compiled::new),
                 rules: d
                     .rules
                     .iter()

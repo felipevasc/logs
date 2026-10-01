@@ -508,6 +508,7 @@
     const items=[
       ...(window.ExplorerTimeline ? [window.ExplorerTimeline.menuItem(column)] : []),
       ...(window.FieldTransforms ? [window.FieldTransforms.menuItem(column,{anchor})] : []),
+      ...(window.CaseReferences ? [window.CaseReferences.lookupMenuItem(column,anchor)] : []),
       {icon:'fa-ranking-star',label:`Top 10 de ${colLabel(column)}`,onClick:()=>fieldTop(column,scope)},
       {icon:'fa-filter',label:'Filtro avançado',onClick:()=>{openFilterPop(anchor);const select=$('#fp-col');if(![...select.options].some(o=>o.value===column)){const option=el('option','',colLabel(column));option.value=column;select.append(option);}select.value=column;}},
       {icon:'fa-filter-circle-xmark',label:'Somente vazios',onClick:()=>applySelection([{column,op:'empty',value:''}],scope)},
@@ -537,6 +538,7 @@
       th.oncontextmenu=e=>{e.preventDefault();showCtxMenu(e.clientX,e.clientY,[
         ...(window.ExplorerTimeline ? [window.ExplorerTimeline.menuItem(column)] : []),
         ...(window.FieldTransforms ? [window.FieldTransforms.menuItem(column,{anchor:th})] : []),
+        ...(window.CaseReferences ? [window.CaseReferences.lookupMenuItem(column,th)] : []),
         {icon:'fa-ranking-star',label:`Top 10 de ${colLabel(column)}`,onClick:()=>fieldTop(column)},
         {icon:'fa-layer-group',label:'Resumir valores',onClick:()=>{state.groupCol=column;$('#group-col').value=column;switchTab('group');}},
         {icon:'fa-filter',label:'Somente preenchidos',onClick:()=>addFilter({column,op:'not_empty',value:''})},

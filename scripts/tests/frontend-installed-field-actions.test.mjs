@@ -11,7 +11,8 @@ const context=vm.createContext({
   workspaceScope:()=> 'dataset',colLabel:field=>field==='source'?'Origem':field,
   renderTable:(...args)=>renders.push(args),renderExploreTreeInto(){},showCtxMenu:(x,y,items)=>shown.push({x,y,items}),
   window:{ExplorerTimeline:{menuItem:field=>({label:`Representar ${field==='source'?'Origem':field} na Timeline`,onClick:()=>opened.push({kind:'timeline',field})})},
-    FieldTransforms:{menuItem:(field,{anchor})=>({label:'Transformar campo',onClick:()=>opened.push({kind:'transform',field,anchor})})}},
+    FieldTransforms:{menuItem:(field,{anchor})=>({label:'Transformar campo',onClick:()=>opened.push({kind:'transform',field,anchor})})},
+    CaseReferences:{lookupMenuItem:(field,anchor)=>({label:'Criar campo por referência',onClick:()=>opened.push({kind:'reference',field,anchor})})}},
   addFilter:filter=>filters.push(filter),fieldTop(){},applySelection(){},openFilterPop(){},$:()=>({value:'',options:[]}),el:makeNode,cubeAdd(){},switchTab(){},
 });
 vm.runInContext(source.slice(source.indexOf('  function fieldMenu('),source.indexOf('  const oldDetail=showDetail;')),context);
@@ -23,6 +24,7 @@ for(const [index,field] of ['source','mock_payload_b64'].entries()){
   const timeline=menu.find(item=>item.label===`Representar ${field==='source'?'Origem':field} na Timeline`);
   const transform=menu.find(item=>item.label==='Transformar campo');assert.ok(timeline);assert.ok(transform);
   timeline.onClick();transform.onClick();assert.equal(opened.at(-1).field,field);assert.equal(opened.at(-1).anchor,headers[index]);
+  const reference=menu.find(item=>item.label==='Criar campo por referência');assert.ok(reference);reference.onClick();assert.equal(opened.at(-1).field,field);assert.equal(opened.at(-1).anchor,headers[index]);
   for(const label of ['Resumir valores','Somente preenchidos','Somente vazios','Cruzar nas linhas','Cruzar nas colunas'])assert.ok(menu.some(item=>item.label===label),label);
 }
 context.renderExploreTreeInto(box,'dataset');
@@ -30,9 +32,10 @@ for(const invoke of [()=>row.oncontextmenu(event),()=>more.onclick(event)]){
   invoke();const menu=shown.at(-1).items;
   assert.ok(menu.some(item=>item.label==='Representar Origem na Timeline'));
   const transform=menu.find(item=>item.label==='Transformar campo');assert.ok(transform);transform.onClick();assert.equal(opened.at(-1).field,'source');
+  const reference=menu.find(item=>item.label==='Criar campo por referência');assert.ok(reference);reference.onClick();assert.equal(opened.at(-1).field,'source');
   assert.ok(menu.some(item=>item.label==='Filtro avançado'),'field menus keep their existing filtering actions');
 }
 assert.equal(filters.length,0,'showing menus and selecting Timeline/Transform actions never applies a value filter');
-context.window.ExplorerTimeline=null;context.window.FieldTransforms=null;headers[0].oncontextmenu(event);
+context.window.ExplorerTimeline=null;context.window.FieldTransforms=null;context.window.CaseReferences=null;headers[0].oncontextmenu(event);
 assert.ok(shown.at(-1).items.some(item=>item.label==='Resumir valores'),'optional controllers do not break legacy menu actions');
 console.log('Installed Discovery decorators expose Timeline and Transform actions on headers and field menus');

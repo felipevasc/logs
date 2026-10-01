@@ -52,8 +52,13 @@ pub(crate) fn engine_dir() -> PathBuf {
 fn derived_signature(derived: &[CompiledDerived]) -> Option<String> {
     if derived.is_empty() { return Some(String::new()); }
     let mut definitions = Vec::with_capacity(derived.len());
+    let mut lookups = Vec::new();
     for field in derived {
         if field.source == "id" { return None; }
+        if let Some(lookup) = &field.lookup {
+            if lookup.definition.keys.iter().any(|key| key.source_field == "id") { return None; }
+            lookups.push((&field.name, &lookup.definition, lookup.version()?));
+        }
         let mut rules = Vec::with_capacity(field.rules.len());
         for rule in &field.rules {
             if let Some(filter) = &rule.filter {
@@ -65,7 +70,10 @@ fn derived_signature(derived: &[CompiledDerived]) -> Option<String> {
     }
     // Version all derived overlays (including legacy regex) because bounded
     // extraction/provenance semantics changed. Base immutable stores stay valid.
-    Some(format!("derived-overlay-v2:{}:{}", crate::field_transform::VERSION, serde_json::to_string(&definitions).ok()?))
+    if lookups.is_empty() {
+        return Some(format!("derived-overlay-v2:{}:{}", crate::field_transform::VERSION, serde_json::to_string(&definitions).ok()?));
+    }
+    Some(format!("derived-overlay-v3:{}:{}:{}", crate::field_transform::VERSION, crate::reference_lookup::VERSION, serde_json::to_string(&(definitions, lookups)).ok()?))
 }
 
 fn query_reads_id(text: &str) -> bool {
@@ -2018,6 +2026,7 @@ mod segment_tests {
         let derived = vec![CompiledDerived {
             name: "extracted".into(),
             source: "message".into(),
+            lookup: None,
             steps: Vec::new(),
             rules: vec![crate::sources::CompiledRule {
                 re: regex::Regex::new("(alpha)").unwrap(),

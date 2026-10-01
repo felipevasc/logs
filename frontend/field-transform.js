@@ -97,7 +97,7 @@ window.FieldTransforms = (() => {
   }
   function open(field, { event = null, anchor = null, owner = window.AnalysisContexts?.capture() } = {}) {
     if (owner) { try { window.AnalysisContexts.assertOwner(owner); } catch { toast("O contexto mudou. Abra o campo novamente.", "info"); return false; } }
-    const definition = state.derivedFields?.find(item => item.name === field), source = definition?.source || field;
+    const definition = state.derivedFields?.find(item => item.name === field && !item.lookup), source = definition?.source || field;
     const sampleEvent = event || state.rows.find(row => rawValue(row, source) != null) || state.currentDetailEv;
     const original = rawValue(sampleEvent, source), originalText = text(original), rules = clone(definition?.rules || []);
     serial++; window.Tasks?.cancelLatest("field-transform-preview");
@@ -206,9 +206,10 @@ window.FieldTransforms = (() => {
         ? "Conteúdo JWT decodificado. A assinatura e as declarações não foram verificadas."
         : diagnostic.message || (diagnostic.warning ? "Transformação com aviso." : "A transformação não foi aplicada a este registro.");
       row.append(el("span", "", bounded(message, 512)));
-      if (state.derivedFields?.some(field => field.name === diagnostic.field)) {
-        const edit = el("button", "btn ghost small", "Revisar transformação"); edit.type = "button";
-        edit.onclick = () => open(diagnostic.field, { event, anchor: edit, owner }); row.append(edit);
+      const definition = state.derivedFields?.find(field => field.name === diagnostic.field);
+      if (definition) {
+        const edit = el("button", "btn ghost small", definition.lookup ? "Revisar referência" : "Revisar transformação"); edit.type = "button";
+        edit.onclick = () => definition.lookup ? window.CaseReferences?.openLookup(definition, { anchor: edit, owner }) : open(diagnostic.field, { event, anchor: edit, owner }); row.append(edit);
       }
       block.append(row);
     }

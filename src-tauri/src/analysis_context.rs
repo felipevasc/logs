@@ -20,6 +20,56 @@ pub(crate) struct RegexLimits {
     pub size_limit: usize,
     pub dfa_size_limit: usize,
 }
+
+#[cfg(test)]
+mod lookup_validation_tests {
+    use super::*;
+    use serde_json::json;
+    fn reference() -> ReferenceDescriptor {
+        ReferenceDescriptor {schema_version:1,id:"ref".into(),name:"Ref".into(),content_sha256:"a".repeat(64),format:"jsonl".into(),columns:vec!["key".into(),"value".into()],key_columns:vec!["key".into()],duplicate_policy:"reject".into()}
+    }
+    fn lookup(source: &str) -> Value {
+        json!({"name":"asset","lookup":{"schemaVersion":1,"referenceId":"ref","keys":[{"referenceColumn":"key","sourceField":source}],"valueColumn":"value"}})
+    }
+    #[test]
+    fn lookup_inputs_participate_in_order_cycles_and_reference_validation() {
+        let config = Config {derived_fields:vec![lookup("decoded.key"),json!({"name":"decoded","source":"message","steps":["parse_json"]})],references:vec![reference()]};
+        validate(&config).unwrap();assert_eq!(definition_order(&config.derived_fields).unwrap(),vec![1,0]);
+        let mut cycle = config.clone();cycle.derived_fields[1]["source"] = json!("asset");assert!(validate(&cycle).is_err());
+        let mut missing = config.clone();missing.references.clear();assert!(validate(&missing).is_err());
+        let mut mixed = config;mixed.derived_fields[0]["rules"] = json!([{"pattern":".*"}]);assert!(validate(&mixed).is_err());
+    }
+
+    #[test]
+    fn typed_target_validation_matches_evaluation_and_preserves_legacy_regex() {
+        for name in ["LEVEL".to_string(),"Event_Ref".to_string(),"x".repeat(513),"ç".repeat(257)] {
+            let mut raw = lookup("message");raw["name"] = json!(name);
+            assert!(validate(&Config {derived_fields:vec![raw.clone()],references:vec![reference()]}).is_err());
+            let steps = vec![crate::field_transform::Step::UrlDecode];
+            let transform = json!({"name":name,"source":"message","steps":steps});
+            assert!(validate(&Config {derived_fields:vec![transform],references:vec![]}).is_err());
+            let definition = crate::reference_lookup::parse_definition(&raw).unwrap().unwrap();
+            for field in [
+                crate::sources::CompiledDerived {name:name.clone(),source:"message".into(),rules:vec![],steps:steps.clone(),lookup:None},
+                crate::sources::CompiledDerived {name:name.clone(),source:"message".into(),rules:vec![],steps:vec![],lookup:Some(crate::reference_lookup::Compiled::new(definition))},
+            ] {
+                let mut event = crate::model::Event::empty();event.message = "original".into();
+                crate::sources::apply_derived(&mut event,&[field]);
+                assert!(event.fields.is_empty());assert_eq!(event.message,"original");
+                assert_eq!(event.derived_diagnostics[0].code,"reserved_target");
+            }
+            let legacy = json!({"name":name,"source":"message","pattern":"(.*)"});
+            validate(&Config {derived_fields:vec![legacy],references:vec![]}).unwrap();
+        }
+        let name = "ç".repeat(256); // Exactly 512 UTF-8 bytes.
+        let raw = json!({"name":name,"source":"message","steps":["url_decode"]});
+        validate(&Config {derived_fields:vec![raw],references:vec![]}).unwrap();
+        let mut event = crate::model::Event::empty();event.message = "%2Fok".into();
+        let field = crate::sources::CompiledDerived {name:name.clone(),source:"message".into(),rules:vec![],steps:vec![crate::field_transform::Step::UrlDecode],lookup:None};
+        crate::sources::apply_derived(&mut event,&[field]);
+        assert_eq!(event.fields[&name],json!("/ok"));assert!(event.derived_diagnostics.is_empty());
+    }
+}
 pub(crate) fn regex_limits(total_rules: usize) -> Result<RegexLimits, String> {
     if total_rules > MAX_DERIVED_RULES {
         return Err("O Caso excede 1.024 regras de campos derivados.".into());
@@ -142,6 +192,10 @@ pub(crate) fn schema(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+pub(crate) fn validate_snapshot_size(snapshot: &Snapshot) -> Result<(), String> {
+    bounded(snapshot).map(|_| ())
+}
+
 fn bounded(value: &impl Serialize) -> Result<String, String> {
     let body = serde_json::to_string(value).map_err(|e| e.to_string())?;
     if body.len() > MAX_BYTES {
@@ -177,6 +231,12 @@ fn validate_definition(value: &Value, limits: Option<RegexLimits>) -> Result<(),
     {
         return Err("O nome do campo derivado é reservado para metadados do evento.".into());
     }
+    if crate::reference_lookup::parse_definition(value)?.is_some() {
+        if !crate::field_transform::valid_typed_target(name) {
+            return Err(crate::field_transform::TARGET_NAME_ERROR.into());
+        }
+        return Ok(());
+    }
     required_text(value, "source")?;
     let steps = value
         .get("steps")
@@ -186,6 +246,9 @@ fn validate_definition(value: &Value, limits: Option<RegexLimits>) -> Result<(),
         .unwrap_or_default();
     if steps.len() > 8 {
         return Err("O campo derivado excede oito transformações.".into());
+    }
+    if !steps.is_empty() && !crate::field_transform::valid_typed_target(name) {
+        return Err(crate::field_transform::TARGET_NAME_ERROR.into());
     }
     let rules = match value.get("rules") {
         Some(Value::Array(rules)) if rules.len() <= 256 => rules.clone(),
@@ -269,6 +332,11 @@ pub(crate) fn definition_order(definitions: &[Value]) -> Result<Vec<usize>, Stri
         {
             edges[index].push(found);
         }
+        for key in definition.get("lookup").and_then(|lookup| lookup.get("keys")).and_then(Value::as_array).into_iter().flatten() {
+            if let Some(found) = key.get("sourceField").and_then(Value::as_str).and_then(dependency) {
+                if !edges[index].contains(&found) { edges[index].push(found); }
+            }
+        }
         let rules = definition.get("rules").and_then(Value::as_array);
         for rule in rules
             .into_iter()
@@ -327,7 +395,13 @@ fn diagnostics(config: &Config) -> Vec<Diagnostic> {
         .iter()
         .enumerate()
         .filter_map(|(index, definition)| {
-            let error = validate_definition(definition, limits).err().or_else(|| {
+            let error = validate_definition(definition, limits)
+                .and_then(|_| {
+                    if let Some(lookup) = crate::reference_lookup::parse_definition(definition)? {
+                        crate::reference_lookup::validate_reference(&lookup, &config.references)?;
+                    }
+                    Ok(())
+                }).err().or_else(|| {
                 let name = definition.get("name").and_then(Value::as_str)?;
                 (!names.insert(name)).then(|| "Nome de campo derivado duplicado no Caso.".into())
             });

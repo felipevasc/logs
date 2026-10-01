@@ -12,6 +12,7 @@ mod attack;
 mod case_cache;
 mod case_archive_format;
 mod case_archive;
+mod case_archive_references;
 mod case_images;
 mod case_store;
 mod detections;
@@ -50,7 +51,9 @@ mod querylang;
 mod regression_tests;
 #[cfg(test)]
 mod publication_tests;
+mod reference_commands;
 mod reference_store;
+mod reference_lookup;
 mod remote;
 mod resources;
 mod sigma;
@@ -874,7 +877,7 @@ fn load_derived() -> Vec<sources::CompiledDerived> {
                 // of the entire source when legacy parsing skips that rule.
                 return None;
             }
-            if rules.is_empty() && d.steps.is_empty() {
+            if rules.is_empty() && d.steps.is_empty() && d.lookup.is_none() {
                 None
             } else {
                 Some(sources::CompiledDerived {
@@ -882,6 +885,7 @@ fn load_derived() -> Vec<sources::CompiledDerived> {
                     source: d.source,
                     rules,
                     steps: d.steps,
+                    lookup: d.lookup.map(crate::reference_lookup::Compiled::new),
                 })
             }
         })
@@ -2293,6 +2297,11 @@ pub fn run() {
             analysis_commands::analysis_context_snapshot,
             analysis_commands::analysis_context_update,
             analysis_commands::preview_field_transform,
+            reference_commands::reference_inspect,
+            reference_commands::reference_import,
+            reference_commands::reference_list,
+            reference_commands::reference_remove,
+            reference_commands::reference_save_lookup,
             analysis_runtime::exclusion_visibility,
             exclusion_commands::exclusion_capabilities,
             exclusion_commands::exclusion_preview,

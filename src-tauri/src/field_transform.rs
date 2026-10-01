@@ -9,6 +9,34 @@ use std::io::Write;
 /// Include this in baked-store identity; bump when transform/limit semantics change.
 pub const VERSION: &str = "field-transform-1";
 
+pub(crate) const TARGET_NAME_BYTES: usize = 512;
+pub(crate) const TARGET_NAME_ERROR: &str =
+    "Use um nome com até 512 bytes e diferente dos metadados reservados do evento.";
+
+/// Shared by typed-definition admission and evaluation. Legacy regex-only
+/// target naming retains its existing compatibility rules.
+pub(crate) fn valid_typed_target(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.len() <= TARGET_NAME_BYTES
+        && !name.starts_with('@')
+        && ![
+            "id",
+            "event_ref",
+            "timestamp",
+            "source",
+            "level",
+            "code",
+            "name",
+            "description",
+            "message",
+            "raw",
+            "arquivo",
+            "caminho",
+        ]
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
 /// Regex replacement syntax, with a byte limit checked before each append.
 /// Capture references match regex::Captures::expand ($1, $name, ${name}, $$).
 pub fn expand_capture(
@@ -551,7 +579,7 @@ pub fn expanded_fields(
     limits: Limits,
     field_limit: usize,
 ) -> Result<Map<String, Value>, Error> {
-    if target.is_empty() || target.len() > 512 {
+    if target.is_empty() || target.len() > TARGET_NAME_BYTES {
         return Err(Error::StructureLimit);
     }
     check_structure(value, limits)?;

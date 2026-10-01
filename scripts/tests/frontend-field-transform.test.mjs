@@ -122,6 +122,15 @@ test('opening, typing and step editing never invoke a preview automatically', as
   assert.equal(f.calls[0].opts.latest, 'field-transform-preview');
 });
 
+test('transforming a lookup result creates a separate field and preserves its lookup definition', async () => {
+  const lookup={id:'owned-lookup',name:'enriched',lookup:{schemaVersion:1,referenceId:'ref-one',keys:[{referenceColumn:'id',sourceField:'source.id'}],valueColumn:'payload'}};
+  const f=fixture({definitions:[lookup],event:{id:7,fields:{enriched:'{"ok":true}'}}});
+  f.editor.open('enriched');assert.equal(f.field('name').disabled,false);assert.equal(f.field('name').value,'enriched_transformado');
+  f.add('parse_json');await f.editor.save();
+  const saved=f.calls.find(call=>call.cmd==='save_derived_field');assert.equal(saved.args.source,'enriched');assert.equal(saved.args.name,'enriched_transformado');
+  assert.deepEqual(plain(f.nativeDefinitions.get('enriched')),lookup);
+});
+
 test('at most eight string steps can be added, reordered and removed without invoking native work', async () => {
   const f = fixture(); f.editor.open('payload');
   for (const step of supportedSteps.slice(0, 9)) f.add(step);
