@@ -65,13 +65,16 @@ static PAYLOAD_READERS: LazyLock<
 > = LazyLock::new(|| parking_lot::Mutex::new(VecDeque::new()));
 /// Restore calls this under root quiescence. In-flight readers remain charged
 /// and independently held; no lock is released by cache eviction alone.
-pub(crate) fn clear_cached_readers(root: &Path) {
+pub(crate) fn clear_cached_readers(root: &Path) -> Result<(), String> {
+    // Container opens store canonical profile paths (verbatim on Windows).
+    // Resolve before locking, and keep sibling/nested profile caches separate.
+    let directory = root.canonicalize().map_err(|e| e.to_string())?.join("evidence-v1");
     let retired = {
         let mut readers = PAYLOAD_READERS.lock();
         let mut retired = Vec::new();
         let mut keep = VecDeque::new();
         while let Some(entry) = readers.pop_front() {
-            if entry.0.starts_with(root) {
+            if entry.0.parent() == Some(directory.as_path()) {
                 retired.push(entry);
             } else {
                 keep.push_back(entry);
@@ -81,6 +84,7 @@ pub(crate) fn clear_cached_readers(root: &Path) {
         retired
     };
     drop(retired);
+    Ok(())
 }
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1070,7 +1074,28 @@ mod tests {
             1,
             "one shared payload reader across containers"
         );
-        clear_cached_readers(root.path());
+        let in_flight = containers[0].batch(&staged.batch.batch_id).unwrap();
+        let other_root = root.path().join("another-profile");
+        fs::create_dir(&other_root).unwrap();
+        let other = stage_records(&other_root, &owner_value(), &Value::Null, |sink| {
+            sink.push_envelope("{\"id\":1}")
+        }).unwrap();
+        other.publish_files(&other_root).unwrap();
+        let other_container = VerifiedContainer::open(&other_root, &other.reference, [other.batch.clone()]).unwrap();
+        other_container.visit_envelopes(0..1, |_, _| Ok(Visit::Continue)).unwrap();
+        assert_eq!(LIVE_READERS.load(Ordering::Acquire), 2);
+        assert!(clear_cached_readers(&root.path().join("missing")).is_err());
+        assert_eq!(LIVE_READERS.load(Ordering::Acquire), 2);
+        let lexical = root.path().join("path-component");
+        fs::create_dir(&lexical).unwrap();
+        // A real lexical alias reproduces the mismatch on every platform.
+        clear_cached_readers(&lexical.join("..")).unwrap();
+        assert_eq!(LIVE_READERS.load(Ordering::Acquire), 2, "in-flight and other-profile readers survive");
+        drop(in_flight);
+        assert_eq!(LIVE_READERS.load(Ordering::Acquire), 1);
+        clear_cached_readers(&root.path().canonicalize().unwrap()).unwrap();
+        assert_eq!(LIVE_READERS.load(Ordering::Acquire), 1, "nested profile is independent");
+        clear_cached_readers(&other_root).unwrap();
         assert_eq!(LIVE_READERS.load(Ordering::Acquire), 0);
     }
     #[test]
