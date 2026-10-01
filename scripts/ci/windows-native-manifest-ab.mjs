@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+export const confirmsAbsentManifest = text => /specified resource type cannot be found|specified image file did not contain a resource section/i.test(text);
 export function inspectPe(bytes) {
   const need = (offset, size) => { if (!Number.isSafeInteger(offset) || offset < 0 || offset + size > bytes.length) throw Error('Invalid PE range'); };
   const u16 = offset => { need(offset, 2); return bytes.readUInt16LE(offset); };
@@ -93,7 +94,7 @@ function diagnose(destination) {
     const name = basename(original);
     const mtStatus = JSON.parse(readFileSync(join(destination, `${name}.manifest-status.json`), 'utf8').replace(/^\uFEFF/, ''));
     const mtLog = readFileSync(join(destination, `${name}.manifest-extraction.txt`), 'utf8');
-    if (mtStatus.extracted || mtStatus.exitCode === 0 || !/specified resource type cannot be found/i.test(mtLog)) return stop('mt did not explicitly confirm an absent manifest resource type');
+    if (mtStatus.extracted || mtStatus.exitCode === 0 || !confirmsAbsentManifest(mtLog)) return stop('mt did not explicitly confirm an absent manifest resource type');
     const imports = importEvidence(readFileSync(join(destination, `${name}.imports.txt`), 'utf8'));
     const librariesRaw = JSON.parse(readFileSync(join(destination, 'common-controls-libraries.json'), 'utf8').replace(/^\uFEFF/, ''));
     const libraries = Array.isArray(librariesRaw) ? librariesRaw : [librariesRaw];

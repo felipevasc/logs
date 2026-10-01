@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { inspectPe, importEvidence } from '../ci/windows-native-manifest-ab.mjs';
+import { inspectPe, importEvidence, confirmsAbsentManifest } from '../ci/windows-native-manifest-ab.mjs';
 
 function image(manifest = false) {
   const b = Buffer.alloc(0x800), pe = 0x80, optional = pe + 24, table = optional + 0xf0;
@@ -27,6 +27,13 @@ test('manifest-only change preserves exact .text, while code edits and invalid r
   const changed = image(); changed[0x400] ^= 1;
   assert.notEqual(inspectPe(changed).text.sha256, before.text.sha256);
   assert.throws(() => inspectPe(image().subarray(0, 0x500)), /range/);
+});
+
+test('mt absence evidence accepts the observed resource-section error but not generic failures', () => {
+  assert.equal(confirmsAbsentManifest('The specified resource type cannot be found in the image file.'), true);
+  assert.equal(confirmsAbsentManifest('The specified image file did not contain a resource section.'), true);
+  assert.equal(confirmsAbsentManifest('Failed to read the manifest: access denied.'), false);
+  assert.equal(confirmsAbsentManifest('The system cannot find the file specified.'), false);
 });
 
 test('TaskDialog evidence stays within comctl32 and filename/resource summary changes do not alter imports', () => {
