@@ -56,8 +56,8 @@ window.QueryBar = (() => {
     error.textContent = problem || "";
     error.hidden = !problem || document.activeElement !== input;
   }
-  input.addEventListener("focus", () => { error.hidden = !box.classList.contains("invalid"); });
-  input.addEventListener("blur", () => { setTimeout(() => { list.hidden = true; error.hidden = true; }, 150); });
+  input.addEventListener("focus", () => { error.hidden = !box.classList.contains("invalid"); suggest(); });
+  input.addEventListener("blur", () => { setTimeout(() => { if (document.activeElement !== input) { list.hidden = true; error.hidden = true; } }, 150); });
 
   // ---------------------------------------------------------------- completion
   const ROLES = ["@user", "@src_ip", "@dst_ip", "@host", "@process", "@parent_process", "@cmdline", "@url", "@domain", "@hash", "@dst_port", "@user_agent", "@file", "@status", "@action", "@outcome", "@src_scope", "@dst_scope", "@tool"];
@@ -95,12 +95,18 @@ window.QueryBar = (() => {
       return rules.filter(r => r.enabled && (fold(r.id).includes(q) || fold(r.name).includes(q))).slice(0, 8).map(r => ({ text: r.id, label: r.name, detail: r.id }));
     }
     if (resolved === "level") return ["erro", "aviso", "informação", "crítico", "depuração"].filter(a => fold(a).startsWith(fold(prefix))).map(a => ({ text: a, label: a, detail: "" }));
-    const key = JSON.stringify([workspaceScope(), window.Workspace?.sourceKey?.(), resolved]);
-    let values = valueCache.get(key);
+    const scope = workspaceScope(), sourceKey = window.Workspace?.sourceKey?.();
+    const key = JSON.stringify([scope, sourceKey, state.datasetRevision, resolved]);
+    // The tree retains useful previous results while refreshing. Only take
+    // counts whose selection/revision prefix still matches the current source.
+    const facetPrefix = [scope, state.datasetRevision, JSON.stringify(state.derivedFields), JSON.stringify(backendFilters())].join("|") + "|";
+    const cached = state.treeAggSig?.[scope]?.startsWith(facetPrefix) ? state.treeAgg?.[scope]?.[resolved] : null;
+    const prior = valueCache.get(key), rows = state.rows;
+    let values = prior?.facets === cached && prior?.rows === rows ? prior.values : null;
+    const sampled = !Array.isArray(cached);
     if (!values) {
       // Completion is local while the search is a draft. Reuse already
       // displayed facets/rows instead of launching a full aggregation per token.
-      const cached = state.treeAgg?.[workspaceScope()]?.[resolved];
       if (Array.isArray(cached)) values = cached.slice(0, 200).map(([value, count]) => ({ value, count }));
       else {
         const seen = new Map();
@@ -111,13 +117,13 @@ window.QueryBar = (() => {
         }
         values = [...seen].map(([value, count]) => ({ value, count }));
       }
-      valueCache.set(key, values);
+      valueCache.set(key, { values, facets: cached, rows });
       if (valueCache.size > 40) valueCache.delete(valueCache.keys().next().value);
     }
     const query = fold(prefix);
     return values.filter(v => fold(String(v.value)).includes(query)).slice(0, 8).map(v => {
       const text = String(v.value);
-      return { text: /[\s():"]/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text, label: text, detail: fmtNum(v.count) };
+      return { text: /[\s():"]/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text, label: text, detail: `${fmtNum(v.count)} ${sampled ? "nesta página" : "no painel de campos"}` };
     });
   }
   function draw() {
@@ -129,10 +135,11 @@ window.QueryBar = (() => {
   }
   async function suggest() {
     const mine = ++serial;
-    token = currentToken();
-    if (!token || document.activeElement !== input) { items = []; draw(); return; }
+    const requestToken = currentToken();
+    token = requestToken;
+    if (!token || composing || document.activeElement !== input) { items = []; draw(); return; }
     const found = token.kind === "field" ? fieldOptions(token.prefix) : await valueOptions(token.field, token.prefix);
-    if (mine !== serial) return;
+    if (mine !== serial || document.activeElement !== input) return;
     // A complete field name needs no suggestion of itself.
     items = found.filter(item => item.text !== (token.kind === "field" ? `${token.prefix}:` : token.prefix));
     active = items.length ? 0 : -1;
@@ -154,15 +161,27 @@ window.QueryBar = (() => {
   let suggestTimer = null;
   input.addEventListener("input", () => {
     clearTimeout(suggestTimer);
-    // Suggestions for another token are stale as soon as the text changes.
-    const next = currentToken();
-    if (!next || !token || next.kind !== token.kind || next.start !== token.start) { items = []; draw(); }
-    suggestTimer = setTimeout(suggest, 90);
+    // Invalidate before the debounce, including async suggestions for the
+    // same field/prefix. Typing never starts a native data query or a save.
+    serial++; items = []; draw();
+    if (!composing) suggestTimer = setTimeout(suggest, 90);
   });
   let composing = false;
-  input.addEventListener("compositionstart", () => { composing = true; });
-  input.addEventListener("compositionend", () => { composing = false; });
+  input.addEventListener("compositionstart", () => { composing = true; clearTimeout(suggestTimer); serial++; items = []; draw(); });
+  input.addEventListener("compositionend", () => { composing = false; clearTimeout(suggestTimer); suggestTimer = setTimeout(suggest, 90); });
   function clearDraft() { clearTimeout(suggestTimer); serial++; items = []; draw(); status(null); }
+  function captureDraft() {
+    return { value: input.value, start: input.selectionStart, end: input.selectionEnd, direction: input.selectionDirection };
+  }
+  function restoreDraft(draft) {
+    clearDraft(); composing = false;
+    input.value = typeof draft?.value === "string" ? draft.value : "";
+    const bounded = n => Number.isInteger(n) ? Math.max(0, Math.min(input.value.length, n)) : input.value.length;
+    const start = bounded(draft?.start), end = Math.max(start, bounded(draft?.end));
+    input.setSelectionRange(start, end, ["forward", "backward"].includes(draft?.direction) ? draft.direction : "none");
+    $("#btn-add-search").disabled = !input.value.trim();
+    status(window.QueryLang?.validate(input.value) || null);
+  }
   function submit() { if (composing) return false; const applied = commitQuickSearch(); if (applied) clearDraft(); return applied; }
   input.addEventListener("keydown", event => {
     if (event.isComposing || composing || event.keyCode === 229) return;
@@ -185,11 +204,11 @@ window.QueryBar = (() => {
     event.preventDefault();
     accept(+option.dataset.index);
   });
-  document.addEventListener("workspace-context-change", () => valueCache.clear());
+  document.addEventListener("workspace-context-change", () => { valueCache.clear(); clearTimeout(suggestTimer); serial++; items = []; draw(); });
   // A canonical field name still being typed ("@us") is not a text search yet.
   function typingField() {
     const t = currentToken();
     return !!t && t.kind === "field" && t.prefix.startsWith("@") && ROLES.some(r => r !== t.prefix && r.startsWith(t.prefix));
   }
-  return { status, typingField, submit, clearDraft, clearCache: () => valueCache.clear() };
+  return { status, typingField, submit, clearDraft, captureDraft, restoreDraft, clearCache: () => valueCache.clear() };
 })();

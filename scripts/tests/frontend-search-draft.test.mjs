@@ -1,0 +1,97 @@
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import { readFileSync } from 'node:fs';
+const barSource = readFileSync(new URL('../../frontend/query-bar.js', import.meta.url), 'utf8');
+const workspaceSource = readFileSync(new URL('../../frontend/workspace-context.js', import.meta.url), 'utf8');
+const timers = new Map(), nodes = new Map(); let timerId = 0, nativeCalls = 0, saves = 0;
+const document = { body: { dataset: {}, append() {} }, activeElement: null, listeners: {},
+  addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); },
+  querySelector(selector) { return node(selector); },
+};
+function element(tag = 'div', className = '') {
+  const classes = new Set(className.split(' '));
+  return { tag, className, value: '', hidden: false, innerHTML: '', textContent: '', style: {}, dataset: {}, listeners: {}, selectionStart: 0, selectionEnd: 0, selectionDirection: 'none',
+    classList: { add: c => classes.add(c), contains: c => classes.has(c), toggle(c, on) { if (on ?? !classes.has(c)) classes.add(c); else classes.delete(c); } },
+    setAttribute() {}, append() {}, after() {}, closest() { return node('.search-box'); }, getBoundingClientRect() { return { left: 5, bottom: 15, width: 300 }; },
+    addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); },
+    dispatchEvent(event) { for (const fn of this.listeners[event.type] || []) fn(event); },
+    setSelectionRange(start, end, direction = 'none') { Object.assign(this, { selectionStart: start, selectionEnd: end, selectionDirection: direction }); },
+    focus() { document.activeElement = this; this.dispatchEvent({ type: 'focus' }); },
+  };
+}
+function node(selector) { if (!nodes.has(selector)) nodes.set(selector, element()); return nodes.get(selector); }
+const state = { filters: [], quick: 'legacy applied', rows: [], columns: ['request_path'], derivedFields: [], datasetRevision: 1, treeAgg: {}, treeAggSig: {} };
+let activeScope = 'dataset', source = 'source-a', caseId = 'a', ruleRequest = null;
+const context = vm.createContext({ console, window: {}, document, state, structuredClone, Map, Set, Promise, innerWidth: 1000,
+  $: node, el: (tag, cls = '') => { const result = element(tag, cls); if (cls) nodes.set(`.${cls}`, result); return result; },
+  esc: text => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;'), colLabel: String, fmtNum: String,
+  workspaceScope: () => activeScope, backendFilters: () => state.filters, cellValue: (event, field) => event[field],
+  setTimeout: fn => { timers.set(++timerId, fn); return timerId; }, clearTimeout: id => timers.delete(id),
+  Event: class { constructor(type) { this.type = type; } }, api: () => { nativeCalls++; throw Error('A draft must not query'); },
+  commitQuickSearch: () => true, saveCases: () => { saves++; },
+});
+context.window.Workspace = { sourceKey: () => source, capture: () => ({}), restore() {} };
+context.window.QueryLang = { resolve: field => ({ name: field }), fieldValue: (event, field) => event[field.name], validate: value => value.endsWith(':') ? 'Incomplete expression' : null };
+context.window.Security = { rules: () => ruleRequest };
+vm.runInContext(barSource, context);
+const bar = context.window.QueryBar, input = node('#quick-search'), list = node('.query-suggest');
+const tick = async () => { await Promise.resolve(); await Promise.resolve(); };
+const flush = async () => { const pending = [...timers.values()]; timers.clear(); for (const fn of pending) fn(); await tick(); };
+const type = async text => { input.value = text; input.setSelectionRange(text.length, text.length); document.activeElement = input; input.dispatchEvent({ type: 'input' }); await flush(); };
+
+// An early empty result is invalidated by new page rows and then completed facets.
+await type('request_path:'); assert.equal(list.hidden, true);
+state.rows = [{ request_path: '/one' }, { request_path: '/one' }];
+await type('request_path:'); assert.match(list.innerHTML, /\/one/); assert.match(list.innerHTML, /2 nesta página/);
+state.rows = [{ request_path: '/two' }];
+await type('request_path:'); assert.match(list.innerHTML, /\/two/); assert.doesNotMatch(list.innerHTML, /\/one/);
+state.treeAgg.dataset = { request_path: [['/all', 400]] };
+state.treeAggSig.dataset = `dataset|1|[]|[]|request_path|source-a`;
+await type('request_path:'); assert.match(list.innerHTML, /\/all/); assert.match(list.innerHTML, /400 no painel de campos/);
+state.filters = [{ column: 'source', op: 'equals_exact', value: 'nginx' }]; source = 'source-a-filtered';
+await type('request_path:'); assert.match(list.innerHTML, /\/two/); assert.doesNotMatch(list.innerHTML, /\/all/, 'old facet counts cannot masquerade as current selection counts');
+state.datasetRevision++;
+state.rows = [{ request_path: '/three' }];
+await type('request_path:'); assert.match(list.innerHTML, /\/three/);
+
+// Slow suggestions are invalid from the first subsequent keystroke or context switch.
+let resolveRules; ruleRequest = new Promise(resolve => { resolveRules = resolve; });
+await type('detection:a');
+input.value = 'detection:b'; input.setSelectionRange(11, 11); input.dispatchEvent({ type: 'input' });
+resolveRules([{ enabled: true, id: 'alpha', name: 'Alpha' }]); await tick();
+assert.equal(list.hidden, true, 'obsolete asynchronous suggestion cannot repaint during the debounce');
+bar.restoreDraft({ value: 'request_path:/restored', start: 3, end: 8, direction: 'backward' });
+await flush(); assert.equal(list.hidden, true); assert.equal(input.value, 'request_path:/restored');
+assert.equal(input.selectionStart, 3); assert.equal(input.selectionEnd, 8); assert.equal(input.selectionDirection, 'backward');
+assert.equal(node('#btn-add-search').disabled, false);
+const focusBefore = document.activeElement = node('#case-select');
+bar.restoreDraft({ value: '', start: -8, end: 900 });
+assert.equal(document.activeElement, focusBefore, 'restoring a draft does not steal keyboard focus'); assert.equal(node('#btn-add-search').disabled, true);
+
+// Composition must not submit or show a half-written completion.
+await type('request_'); assert.equal(list.hidden, false);
+input.dispatchEvent({ type: 'compositionstart' }); assert.equal(list.hidden, true);
+input.dispatchEvent({ type: 'input' }); await flush(); assert.equal(list.hidden, true);
+input.dispatchEvent({ type: 'compositionend' }); await flush(); assert.equal(list.hidden, false);
+
+// Use real workspace capture/sanitize/apply, preserving draft separately from applied quick.
+const c = { id: caseId, workspace: {} };
+Object.assign(context, { activeCase: () => c, AGG_FUNCS: [['count', 'Count']], defaultCaseWorkspace: () => ({}), cubeState: { collapsed: new Set(), requestVersion: 0 }, treeAggVersion: { dataset: 0, case: 0 },
+  caseEvents: () => [], caseEventsCache: { summary: { columns: [] } }, fillColumnControls() {}, renderChips() {}, renderExploreTree() {}, updateContextBar() {}, restoreVisiblePreferences() {},
+});
+vm.runInContext(workspaceSource.slice(workspaceSource.indexOf('  let scope ='), workspaceSource.indexOf('  function updateToggle()')), context);
+Object.assign(state, vm.runInContext('defaults().values', context), { columns: ['timestamp', 'request_path'], treeCollapsed: new Set(), treeAgg: {}, treeAggSig: {}, treeAggError: {}, quick: 'legacy applied' });
+bar.restoreDraft({ value: 'request_path:"unfinished', start: 7, end: 10 });
+const dataset = context.capture(); assert.equal(dataset.values.quick, 'legacy applied'); assert.equal(dataset.queryDraft.value, 'request_path:"unfinished');
+vm.runInContext('scope = "case";', context); activeScope = 'case'; context.apply(context.sanitize(null));
+assert.equal(input.value, '', 'new case workspace starts with its own draft');
+bar.restoreDraft({ value: 'case draft', start: 2, end: 2 }); const evidence = context.capture();
+vm.runInContext('scope = "dataset";', context); activeScope = 'dataset'; context.apply(context.sanitize(JSON.parse(JSON.stringify(dataset))));
+assert.equal(input.value, 'request_path:"unfinished'); assert.equal(input.selectionStart, 7); assert.equal(input.selectionEnd, 10);
+assert.equal(state.quick, 'legacy applied', 'draft restoration never changes applied saved search');
+assert.equal(node('.query-error').textContent, ''); // Test validator only treats a trailing colon as incomplete.
+vm.runInContext('scope = "case";', context); activeScope = 'case'; context.apply(context.sanitize(evidence)); assert.equal(input.value, 'case draft');
+context.apply(context.sanitize({ values: { quick: 'old saved search' } })); assert.equal(input.value, 'old saved search', 'old snapshots retain their applied quick-search display');
+c.id = 'new-case'; context.apply(context.sanitize(null)); assert.equal(input.value, '', 'another case cannot inherit a draft');
+assert.equal(nativeCalls, 0); assert.equal(saves, 0, 'typing/capture helpers never initiate a whole-case save');
+console.log('Draft/context isolation, caret restoration, local suggestion freshness, sample labels and IME passed');

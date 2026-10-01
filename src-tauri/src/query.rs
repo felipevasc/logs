@@ -261,6 +261,9 @@ pub(crate) fn is_numeric_op(op: &str) -> bool {
 /// Numeric operators applied to the column's number (`None` when absent).
 pub(crate) fn number_matches(pf: &PreparedFilter, a: Option<f64>) -> bool {
     let Some(a) = a else { return false };
+    // Zero is the line index's absent-time sentinel. Full-event verification
+    // must not reintroduce it into a numeric timestamp selection.
+    if pf.f.column == "timestamp" && a == 0.0 { return false; }
     match pf.f.op.as_str() {
         "between" => match (pf.num, pf.num2) {
             (Some(lo), Some(hi)) => a >= lo && a <= hi,

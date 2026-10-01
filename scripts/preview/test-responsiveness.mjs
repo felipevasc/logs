@@ -86,6 +86,36 @@ try {
   });
   assert.equal(failedImport.result,false);assert.equal(failedImport.loaded,true);assert.equal(failedImport.unconfirmed,false);
   assert.equal(failedImport.before.id,failedImport.after.id);assert.ok(failedImport.after.rows>0,'failed import preserves queryable old source');
+  // A draft belongs to its workspace and must never become an applied filter.
+  await page.evaluate(async () => { await Workspace.showPage('explore'); await loadExplorerAnalytics(explorerKey(), workspaceScope(), backendFilters()).promise; });
+  await page.waitForFunction(() => Tasks.pending() === 0);
+  const before = await page.evaluate(() => ({ calls: structuredClone(window.__mockCommandCalls), quick: state.quick, filters: JSON.stringify(state.filters), caseId: activeCase().id }));
+  const draft = 'message:"pending nginx';
+  await page.locator('#quick-search').fill(draft);
+  await page.locator('#quick-search').evaluate(input => input.setSelectionRange(3, 8, 'backward'));
+  await page.waitForTimeout(250);
+  const typed = await page.evaluate(() => ({ calls: window.__mockCommandCalls, quick: state.quick, filters: JSON.stringify(state.filters) }));
+  assert.deepEqual(typed.calls, before.calls, 'typing creates no queries or saves');
+  assert.equal(typed.quick, before.quick); assert.equal(typed.filters, before.filters);
+  await page.evaluate(() => WorkspaceContext.setScope('case', { page: 'explore', animate: false }));
+  assert.equal(await page.locator('#quick-search').inputValue(), '');
+  await page.locator('#quick-search').fill('case-only draft');
+  await page.evaluate(() => WorkspaceContext.setScope('dataset', { page: 'explore', animate: false }));
+  assert.equal(await page.locator('#quick-search').inputValue(), draft);
+  assert.deepEqual(await page.locator('#quick-search').evaluate(input => [input.selectionStart, input.selectionEnd, input.selectionDirection]), [3, 8, 'backward']);
+  assert.equal(await page.locator('#btn-add-search').isDisabled(), false);
+  await page.evaluate(() => newCase('Draft isolation fixture'));
+  await page.waitForFunction(() => !WorkspaceContext.changing);
+  assert.equal(await page.locator('#quick-search').inputValue(), '');
+  await page.locator('#quick-search').fill('other case draft');
+  await page.evaluate(id => WorkspaceContext.changeCase(id), before.caseId);
+  assert.equal(await page.locator('#quick-search').inputValue(), draft);
+  await page.evaluate(() => WorkspaceContext.setScope('case', { page: 'explore', animate: false }));
+  assert.equal(await page.locator('#quick-search').inputValue(), 'case-only draft');
+  await page.evaluate(() => saveCases());
+  await page.reload();
+  await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && !state.loadOverlay);
+  assert.equal(await page.locator('#quick-search').inputValue(), 'case-only draft');
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({first,local,cancel,errors},null,2));
 } catch (error) { await captureFailure(page, 'responsiveness', error, { errors }); throw error; }

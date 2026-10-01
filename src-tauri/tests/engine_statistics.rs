@@ -43,6 +43,13 @@ fn fused_statistics_preserve_time_sentinels_level_counts_and_filtered_selections
         json!([{"column":"source","op":"equals_exact","value":"timed"}]),
         json!([{"column":"id","op":"equals_exact","value":"0"}]),
         json!([{"column":"timestamp","op":"between","value":"-1000","value2":"1000"}]),
+        json!([{"column":"timestamp","op":"gte","value":"0"}]),
+        json!([{"column":"timestamp","op":"lte","value":"0"}]),
+        json!([{"column":"timestamp","op":"lt","value":"9007199254740992"}]),
+        json!([{"column":"_all","op":"query","value":"timestamp:-1000..1000"}]),
+        json!([{"column":"_all","op":"query","value":"NOT timestamp:-1000..1000"}]),
+        json!([{"column":"_all","op":"query","value":"NOT (timestamp>=0 OR NOT timestamp<1001)"}]),
+        json!([{"column":"_all","op":"query","value":"NOT timestamp<9007199254740992"}]),
         json!([{"column":"_all","op":"contains","value":"raw_marker"}]),
     ];
     for filters in filters {
@@ -50,6 +57,9 @@ fn fused_statistics_preserve_time_sentinels_level_counts_and_filtered_selections
         let expected = source.stats(Engine::Lines, &filters);
         let actual = source.stats(Engine::Columnar, &filters);
         assert_eq!(actual, expected, "statistics for {filters}");
+        assert_eq!(source.count(Engine::Columnar, &filters), source.count(Engine::Lines, &filters), "count for {filters}");
+        assert_eq!(source.query(Engine::Columnar, &filters, "id", "asc", 0, 20),
+            source.query(Engine::Lines, &filters, "id", "asc", 0, 20), "rows for {filters}");
         let level_total: u64 = actual["levels"]
             .as_array()
             .unwrap()

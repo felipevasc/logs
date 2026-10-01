@@ -27,7 +27,7 @@ state.quick='legacy saved search';input.value=state.quick;context.commitQuickSea
 
 // Enter commits once, Tab completes, composition/repeat cannot accidentally submit.
 let submits=0,accepts=0;
-Object.assign(context,{input,list:{hidden:true},items:[],active:-1,draw(){},accept(){accepts++;},clearTimeout(){},suggestTimer:null,serial:0,status(){},commitQuickSearch:()=>{submits++;return true;}});
+Object.assign(context,{input,list:{hidden:true},items:[],active:-1,draw(){},suggest(){},accept(){accepts++;},clearTimeout(){},setTimeout(){return 0;},suggestTimer:null,serial:0,status(){},commitQuickSearch:()=>{submits++;return true;}});
 vm.runInContext(bar.slice(bar.indexOf('  let composing = false;'),bar.indexOf('  list.addEventListener("mousedown"')),context);
 const enter=input.listeners.keydown[0],preventDefault=()=>{};
 enter({key:'Enter',preventDefault});assert.equal(submits,1);

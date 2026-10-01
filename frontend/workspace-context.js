@@ -18,6 +18,7 @@ window.WorkspaceContext = (() => {
   const validFilters = value => Array.isArray(value) ? value.filter(item => item && typeof item.column === "string" && typeof item.op === "string").slice(0, 200).map(item => ({ ...item, ...(item.value != null ? { value: String(item.value) } : {}), ...(item.value2 != null ? { value2: String(item.value2) } : {}) })) : [];
   function sanitize(raw) {
     const base = defaults(), input = record(raw), values = record(input.values), snapshot = { ...base, ...input, values: { ...base.values, ...values }, scroll: {} };
+    snapshot.queryDraft = typeof input.queryDraft?.value === "string" ? { value: input.queryDraft.value, start: input.queryDraft.start, end: input.queryDraft.end, direction: input.queryDraft.direction } : null;
     snapshot.page = ["summary", "compromises", "timeline", "case-timeline", "case-trails", "journeys", "explore", "compare", "evidence", "sources", "connections", "import"].includes(input.page) ? input.page : "summary";
     const v = snapshot.values;
     v.filters = validFilters(values.filters); v.quick = typeof values.quick === "string" ? values.quick : "";
@@ -40,7 +41,7 @@ window.WorkspaceContext = (() => {
     return snapshot;
   }
   function capture() {
-    const snapshot = { page: document.body.dataset.page || "summary", values: Object.fromEntries(stateKeys.map(name => [name, copy(state[name])])), tree: [...state.treeCollapsed], cubeCollapsed: [...cubeState.collapsed], density: document.body.dataset.density, wrap: document.body.dataset.wrap, sideCollapsed: document.querySelector(".shell").classList.contains("side-collapsed"), scroll: {}, discovery: window.Discovery?.capture(), workbench: window.WorkspaceAnalysis?.capture(), workspace: window.Workspace?.capture(), journeys: window.Journeys?.capture() };
+    const snapshot = { page: document.body.dataset.page || "summary", queryDraft: window.QueryBar?.captureDraft?.() || { value: $("#quick-search").value }, values: Object.fromEntries(stateKeys.map(name => [name, copy(state[name])])), tree: [...state.treeCollapsed], cubeCollapsed: [...cubeState.collapsed], density: document.body.dataset.density, wrap: document.body.dataset.wrap, sideCollapsed: document.querySelector(".shell").classList.contains("side-collapsed"), scroll: {}, discovery: window.Discovery?.capture(), workbench: window.WorkspaceAnalysis?.capture(), workspace: window.Workspace?.capture(), journeys: window.Journeys?.capture() };
     for (const selector of scrollSelectors) { const node = document.querySelector(selector); if (node) snapshot.scroll[selector] = [node.scrollLeft, node.scrollTop]; }
     states.set(key(), snapshot); runtime.set(key(), Object.fromEntries(runtimeKeys.map(name => [name, state[name]])));
     const c = activeCase(); if (c) { c.workspace ||= defaultCaseWorkspace(); c.workspace.contextStates = record(c.workspace.contextStates); c.workspace.contextStates[scope] = snapshot; c.workspace.activeScope = scope; }
@@ -71,7 +72,8 @@ window.WorkspaceContext = (() => {
     document.body.dataset.density = snapshot.density || "comfortable"; document.body.dataset.wrap = snapshot.wrap || "false";
     document.querySelector(".shell").classList.toggle("side-collapsed", !!snapshot.sideCollapsed);
     const sideToggle = $("#btn-side-toggle"); sideToggle.innerHTML = `<i class="fas fa-chevron-${snapshot.sideCollapsed ? "left" : "right"}"></i>`; sideToggle.title = snapshot.sideCollapsed ? "Mostrar campos" : "Recolher campos"; sideToggle.setAttribute("aria-label", sideToggle.title); sideToggle.setAttribute("aria-expanded", String(!snapshot.sideCollapsed));
-    $("#quick-search").value = state.quick;
+    if (window.QueryBar?.restoreDraft) window.QueryBar.restoreDraft(snapshot.queryDraft || { value: state.quick });
+    else $("#quick-search").value = snapshot.queryDraft?.value ?? state.quick;
     window.Workspace?.restore(snapshot.workspace); window.Discovery?.restore(snapshot.discovery); window.WorkspaceAnalysis?.restore(snapshot.workbench);
     window.Journeys?.restore(snapshot.journeys);
     fillColumnControls(); renderChips(); renderExploreTree(); updateContextBar();

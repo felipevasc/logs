@@ -802,7 +802,9 @@ impl<'a> Ctx<'a> {
     }
     fn number(&self, field: &Field) -> Option<f64> {
         if field.name == "timestamp" && !self.object_only {
-            return self.ev.timestamp.map(|t| t as f64);
+            // Line metadata reserves zero for an absent timestamp. Event
+            // verification must use the same numeric predicate semantics.
+            return self.ev.timestamp.filter(|t| *t != 0).map(|t| t as f64);
         }
         crate::model::text_number(&self.field(field)?)
     }
@@ -1214,6 +1216,22 @@ impl Term {
     pub(crate) fn wildcard_literal(&self) -> Option<String> {
         match &self.matcher {
             Matcher::Wildcard(_) => self.required_literals().and_then(|mut v| (v.len() == 1).then(|| v.remove(0))),
+            _ => None,
+        }
+    }
+
+    /// Comparison or range against a number.
+    /// Exposes the parsed bounds without reparsing the user's text. Consumers
+    /// must preserve `number_matches`' f64 and absent-value semantics.
+    pub(crate) fn numeric_bounds(&self) -> Option<(&'static str, f64, Option<f64>)> {
+        match self.matcher {
+            Matcher::Cmp(cmp, bound) => Some((match cmp {
+                Cmp::Gt => "gt",
+                Cmp::Gte => "gte",
+                Cmp::Lt => "lt",
+                Cmp::Lte => "lte",
+            }, bound, None)),
+            Matcher::Range(lo, hi) => Some(("between", lo, Some(hi))),
             _ => None,
         }
     }
