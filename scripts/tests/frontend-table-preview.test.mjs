@@ -12,7 +12,7 @@ const context=vm.createContext({window:{},state,el:node,esc:escape,escRe:text=>S
   showCtxMenu:(x,y,items)=>menus.push(items),openDetail:id=>details.push(id),updateRowSelectionStyles(){},sendVisibleToCase(){},toast(){},
   navigator:{clipboard:{writeText:text=>{copied.push(text);return Promise.resolve();}}},
 });
-vm.runInContext(evidence.slice(evidence.indexOf('  function redact('),evidence.indexOf('  const eventContext =')),context);
+vm.runInContext(evidence.slice(evidence.indexOf('  const isSensitiveKey ='),evidence.indexOf('  const eventContext =')),context);
 context.window.EvidenceUI={redact:context.redact};
 context.window.EntityMenu={highlight:text=>{highlighted.push(text);return null;}};
 vm.runInContext(app.slice(app.indexOf('function cellValue('),app.indexOf('\nfunction autoVisibleCols(')),context);

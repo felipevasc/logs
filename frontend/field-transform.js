@@ -31,19 +31,101 @@ window.FieldTransforms = (() => {
   const node = id => overlay.querySelector(`#ft-${id}`), clone = value => structuredClone(value);
   for (const [value, label] of STEPS) { const option = el("option", "", label); option.value = value; node("step-choice").append(option); }
   let session = null, serial = 0;
-  const text = value => typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2);
-  function bounded(value, limit = PREVIEW_LIMIT) {
-    const full = text(value), cut = full.length > limit;
-    let end = limit; if (cut && /[\uD800-\uDBFF]/.test(full[end - 1])) end--;
-    return cut ? `${full.slice(0, end)}\n… [prévia de ${fmtNum(full.length)} caracteres]` : full;
+  const prefix = (input, count) => {
+    let end = Math.min(input.length, Math.max(0, count));
+    if (end < input.length && end && /[\uD800-\uDBFF]/.test(input[end - 1])) end--;
+    return input.slice(0, end);
+  };
+  const utf8Size = (value, ceiling = INPUT_LIMIT) => {
+    let bytes = 0;
+    for (const char of value) {
+      const point = char.codePointAt(0);
+      bytes += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+      if (bytes > ceiling) break;
+    }
+    return bytes;
+  };
+  // Visit a bounded prefix for display or editable sample preparation.
+  // These limits bound visited values/output, not the received Event or JS heap.
+  // JS may enumerate every object key before the first loop iteration; strict
+  // wide-object work limits also require bounded native property projection.
+  function serializePrefix(value, { limit, byteLimit = Infinity, maxDepth = 16, maxNodes = 512, redact = false }) {
+    const ancestors = new WeakSet();
+    let output = "", reason = "", nodes = 0, bytes = 0;
+    const append = input => {
+      if (reason) return;
+      const remaining = limit - output.length;
+      const selected = prefix(input, remaining), size = Number.isFinite(byteLimit) ? utf8Size(selected, byteLimit - bytes) : 0;
+      if (bytes + size > byteLimit) { reason = "tamanho"; return; }
+      output += selected; bytes += size;
+      if (input.length > remaining) reason = "caracteres";
+    };
+    function string(input, quoted, mask = false) {
+      // Redaction also sees only this display prefix; original values stay intact.
+      const selected = prefix(input, limit - output.length);
+      // A clipped token/PEM may not match the full redactor. Omit that scalar
+      // rather than reveal a partial secret that its complete value would mask.
+      const clipped = selected.length < input.length;
+      const safe = mask && clipped ? "[texto extenso omitido]" : mask && window.EvidenceUI ? window.EvidenceUI.redact(selected) : selected;
+      if (quoted) append('"');
+      for (const char of safe) {
+        if (reason) break;
+        append(quoted ? JSON.stringify(char).slice(1, -1) : char);
+      }
+      if (!reason && selected.length < input.length) reason = "caracteres";
+      if (quoted) append('"');
+    }
+    function visit(input, depth, root = false) {
+      if (reason) return;
+      if (++nodes > maxNodes) { reason = "itens"; return; }
+      if (typeof input === "string") { string(input, !root, redact); return; }
+      if (input == null) { append("null"); return; }
+      if (typeof input === "number" || typeof input === "boolean") { append(JSON.stringify(input)); return; }
+      if (typeof input !== "object") { reason = "valor não JSON"; return; }
+      if (depth >= maxDepth) { reason = "profundidade"; return; }
+      if (ancestors.has(input)) { reason = "referência circular"; return; }
+      ancestors.add(input);
+      const array = Array.isArray(input), indent = "  ".repeat(depth + 1);
+      append(array ? "[" : "{"); let first = true;
+      const member = (key, descriptor) => {
+        if (!first) append(","); append(`\n${indent}`); first = false;
+        if (!array) { string(key, true); append(": "); }
+        if (reason) return;
+        if (descriptor && !Object.hasOwn(descriptor, "value")) { reason = "propriedade calculada"; return; }
+        const hidden = redact && !array && window.EvidenceUI?.isSensitiveKey?.(key);
+        visit(hidden ? "[oculto]" : descriptor?.value ?? null, depth + 1);
+      };
+      if (array) {
+        for (let index = 0; index < input.length && !reason; index++) member(String(index), Object.getOwnPropertyDescriptor(input, index));
+      } else {
+        // Avoid an explicit full key/value copy. The engine's key enumeration
+        // can still scale with the input object's width before this loop stops.
+        for (const key in input) {
+          if (reason) break;
+          const descriptor = Object.getOwnPropertyDescriptor(input, key);
+          if (descriptor?.enumerable) member(key, descriptor);
+        }
+      }
+      if (!first) append(`\n${"  ".repeat(depth)}`);
+      append(array ? "]" : "}"); ancestors.delete(input);
+    }
+    visit(value, 0, true);
+    return { output, reason };
   }
-  function rawValue(event, field) {
+  function bounded(value, limit = PREVIEW_LIMIT, { redact = false } = {}) {
+    limit = Number.isFinite(limit) ? Math.max(64, Math.min(PREVIEW_LIMIT, Math.floor(limit))) : PREVIEW_LIMIT;
+    const { output, reason } = serializePrefix(value, { limit, redact });
+    if (!reason) return output;
+    const marker = `\n… [prévia truncada: ${reason}]`;
+    return prefix(output, limit - marker.length) + marker;
+  }
+  function rawValue(event, field, copy = true) {
     if (!event) return null;
     if (field === "timestamp") return event.timestamp == null ? null : new Date(event.timestamp).toISOString().replace(/\.000Z$/, "+00:00").replace(/Z$/, "+00:00");
     if (field === "id") return String(event.id);
     const canonical = ["event_ref", "source", "level", "code", "name", "description", "message", "raw"].includes(field);
-    if (!canonical && Object.hasOwn(event.fields || {}, field)) return clone(event.fields[field]);
-    if (Object.hasOwn(event, field)) return clone(event[field]);
+    if (!canonical && Object.hasOwn(event.fields || {}, field)) return copy ? clone(event.fields[field]) : event.fields[field];
+    if (Object.hasOwn(event, field)) return copy ? clone(event[field]) : event[field];
     return null;
   }
   const current = draft => session === draft && !overlay.hidden;
@@ -98,17 +180,21 @@ window.FieldTransforms = (() => {
   function open(field, { event = null, anchor = null, owner = window.AnalysisContexts?.capture() } = {}) {
     if (owner) { try { window.AnalysisContexts.assertOwner(owner); } catch { toast("O contexto mudou. Abra o campo novamente.", "info"); return false; } }
     const definition = state.derivedFields?.find(item => item.name === field && !item.lookup), source = definition?.source || field;
-    const sampleEvent = event || state.rows.find(row => rawValue(row, source) != null) || state.currentDetailEv;
-    const original = rawValue(sampleEvent, source), originalText = text(original), rules = clone(definition?.rules || []);
+    const sampleEvent = event || state.rows.find(row => rawValue(row, source, false) != null) || state.currentDetailEv;
+    const originalValue = rawValue(sampleEvent, source, false), rules = clone(definition?.rules || []);
+    const input = rules.length ? null : serializePrefix(originalValue, { limit: INPUT_LIMIT, byteLimit: INPUT_LIMIT, maxDepth: 64, maxNodes: 65536 });
+    const originalText = input && !input.reason ? input.output : null;
+    // Only a complete, bounded sample needs an immutable copy for native preview.
+    const original = originalText == null ? originalValue : clone(originalValue);
     serial++; window.Tasks?.cancelLatest("field-transform-preview");
     session = { owner, source, original, originalText, rules, editName: definition?.name || null, steps: [...(definition?.steps || [])], anchor, version: 0, busy: false, saved: false };
     node("source").textContent = `Origem: ${colLabel(source)} · Caso: ${activeCase()?.name || "atual"}`;
     node("name").value = definition?.name || `${field.replace(/^@/, "")}_transformado`;
     node("original").textContent = bounded(original, 4096);
-    const oversized = new TextEncoder().encode(originalText).length > INPUT_LIMIT;
-    node("sample").value = rules.length || oversized ? "" : originalText;
+    const oversized = originalText == null;
+    node("sample").value = oversized ? "" : originalText;
     node("sample-hint").textContent = rules.length ? "Informe um exemplo já extraído pelas regras existentes. A prévia avalia somente as transformações."
-      : oversized ? "A origem excede 256 KiB. Use um exemplo menor para a prévia." : "Edite o exemplo se necessário. Isso não altera o registro de origem.";
+      : oversized ? "A origem excede 256 KiB ou o limite de estrutura do exemplo. Use um exemplo menor para a prévia." : "Edite o exemplo se necessário. Isso não altera o registro de origem.";
     node("rules-note").hidden = !rules.length;
     node("rules-note").textContent = `${rules.length} regra(s) de extração preservada(s). Elas são executadas antes das transformações.`;
     node("output").textContent = "Clique em Prévia para avaliar estas etapas."; node("result-type").textContent = ""; node("notices").textContent = "";
@@ -130,7 +216,7 @@ window.FieldTransforms = (() => {
       assertOwner(draft);
       const sample = node("sample").value;
       if (draft.rules.length && !sample) throw Error("Informe um exemplo já extraído pelas regras existentes.");
-      if (new TextEncoder().encode(sample).length > INPUT_LIMIT) throw Error("O exemplo excede 256 KiB. Use um valor menor.");
+      if (utf8Size(sample) > INPUT_LIMIT) throw Error("O exemplo excede 256 KiB. Use um valor menor.");
       const value = !draft.rules.length && sample === draft.originalText ? clone(draft.original) : sample;
       const steps = [...draft.steps]; node("preview").disabled = true; status("Calculando prévia local…");
       const result = await api("preview_field_transform", { value, steps }, { silent: true, latest: "field-transform-preview" });

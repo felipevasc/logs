@@ -6,5 +6,6 @@
 .ex-batch:hover,.ex-batch:focus-visible{background:var(--hover)}.ex-batch strong{font-size:12px}.ex-records{display:flex;flex-direction:column;gap:7px}.ex-record{display:flex;align-items:flex-start;gap:8px;border-top:1px solid var(--border);padding:8px 0}
 .ex-record>input{margin-top:4px;accent-color:var(--accent)}.ex-record-body{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1;font-size:11px;overflow-wrap:anywhere}
 .ex-record-body strong{font-size:12px}.ex-provenance,.ex-event-preview{font-size:10px;color:var(--text-2)}.ex-provenance pre,.ex-event-preview pre{color:var(--text-0);background:var(--code-bg);white-space:pre-wrap;overflow-wrap:anywhere;max-height:150px;overflow:auto;font-size:10px;user-select:text}
+.ex-record-meta{color:var(--text-1);font-variant-numeric:tabular-nums}.ex-record-summary{color:var(--text-0);margin:2px 0 4px;white-space:pre-wrap;user-select:text;line-height:1.45}
 .ex-unavailable{color:var(--text-2)}.ex-error{color:var(--danger,#e55e68)}#ex-preview-count{font-size:16px;font-weight:600}#ex-members h4{margin:3px 0 6px}#ex-reason{width:100%;resize:vertical}
 @media(max-width:700px){.ex-archive-layout{grid-template-columns:1fr}.ex-batches{max-height:150px;overflow:auto}.exclusion-modal .modal-body{padding:12px}}

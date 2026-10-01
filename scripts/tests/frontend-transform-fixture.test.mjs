@@ -53,7 +53,7 @@ let latest=regex.analysisContext;
 for(const [name,source,steps] of [['canonical_level','level',['text_to_hex']],['typed_null','custom_null',['parse_json']],['typed_object','custom_object',['parse_json']]]) {
   latest=(await invoke('save_derived_field',{name,source,rules:[],steps,analysisContext:identity(latest)})).analysisContext;
 }
-const parity=await invoke('query_events',{filters:[],limit:1,sortColumn:'timestamp',sortDir:'desc',analysisContext:identity(latest)});
+const parity=await invoke('query_events',{filters:[],limit:1,sortColumn:'timestamp',sortDir:'desc',caseEvents:initial.rows,analysisContext:identity(latest)});
 assert.equal(parity.rows[0].fields.canonical_level,transform(initial.rows[0].level,['text_to_hex']).value);
 assert.equal(parity.rows[0].fields.level,'shadowed level','the original custom shadow remains untouched');
 assert.equal(parity.rows[0].fields.typed_null,null);

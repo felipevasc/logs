@@ -247,12 +247,20 @@ window.ExclusionArchive = (() => {
         select.onchange = () => { if (!current(draft) || draft.busy) return; if (select.checked) draft.selected.set(memberKey, clone(row.member)); else draft.selected.delete(memberKey); updateArchiveControls(draft); };
         const title = source?.label || "Origem registrada";
         body.append(el("strong", "", trunc(title, 100)), el("span", "muted small", result.batch.active && row.activeInBatch ? "Excluído por este lote" : "Restaurado neste lote"));
+        if (row.event) {
+          const event = row.event, when = typeof event.timestamp === "number" ? new Date(event.timestamp) : null;
+          const time = when && Number.isFinite(when.getTime()) ? when.toLocaleString("pt-BR") : "Horário não informado";
+          const level = typeof event.level === "string" && event.level ? window.FieldTransforms.bounded(event.level, 128, { redact: true }) : "Nível não informado";
+          const message = [event.message, event.name, event.description].find(value => typeof value === "string" && value.length);
+          body.append(el("span", "ex-record-meta", `${time} · ${level}`),
+            el("p", "ex-record-summary", message ? window.FieldTransforms.bounded(message, 320, { redact: true }) : "Mensagem não informada"));
+        }
         const provenance = el("details", "ex-provenance"), summary = el("summary", "", "Procedência do registro");
         const location = row.member.key.locator.byte_offset != null ? `Posição: ${row.member.key.locator.byte_offset}` : `Registro: ${row.member.key.locator.stable_record}`;
         provenance.append(summary, el("pre", "", [source?.label, source?.version && `Versão: ${source.version}`, source?.recordSpace && `Espaço de registros: ${source.recordSpace}`, location, row.member.eventRef].filter(Boolean).join("\n"))); body.append(provenance);
         if (row.event) {
-          const content = el("details", "ex-event-preview"), event = window.EvidenceUI?.redact(row.event) || row.event;
-          content.append(el("summary", "", "Conteúdo disponível"), el("pre", "code-pane", window.FieldTransforms ? window.FieldTransforms.bounded(event, 4096) : trunc(JSON.stringify(event, null, 2), 4096))); body.append(content);
+          const content = el("details", "ex-event-preview");
+          content.append(el("summary", "", "Conteúdo disponível"), el("pre", "code-pane", window.FieldTransforms.bounded(row.event, 4096, { redact: true }))); body.append(content);
         } else body.append(el("span", "ex-unavailable small", trunc(row.unavailableReason || "Conteúdo indisponível: a origem não está aberta ou sua versão mudou.", 512)));
         item.append(select, body); node("records").append(item);
       }

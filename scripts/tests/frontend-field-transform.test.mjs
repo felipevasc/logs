@@ -169,12 +169,81 @@ test('bounded previews retain Unicode characters and leave the full native resul
   f.setNative(async () => ({ value: fullValue, notices: ['value_is_example'] }));
   f.editor.open('payload'); f.add('base64_decode'); await f.editor.preview();
   const shown = f.field('output').textContent;
-  assert.ok(shown.length < 8300);
-  assert.equal(shown.slice(0, 8191), 'x'.repeat(8191));
-  assert.equal(shown.charCodeAt(8191), 10, 'truncation never leaves a lone high surrogate');
-  assert.match(shown, /prévia de/);
+  assert.ok(shown.length <= 8192);
+  assert.match(shown, /^x+\n… \[prévia truncada: caracteres\]$/);
+  assert.doesNotMatch(shown, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u, 'truncation never leaves a lone high surrogate');
   assert.equal(fullValue.length, 8191 + 2 + 16000);
   assert.equal(f.field('notices').textContent, 'value_is_example');
+});
+
+test('display traversal stops at character, node and depth ceilings without serializing full objects', () => {
+  const f = fixture(), serialized = [];
+  f.context.JSON = { stringify(value) {
+    assert.notEqual(typeof value, 'object', 'display serialization never delegates a whole object');
+    if (typeof value === 'string') assert.ok(value.length <= 2, 'string escaping handles one code point at a time');
+    serialized.push(value); return JSON.stringify(value);
+  } };
+  const exact = { empty: '', nil: null, zero: 0, no: false, nested: ['line\nquote"', '🚀', '\ud800'] };
+  assert.equal(f.editor.bounded(exact), JSON.stringify(exact, null, 2));
+  let touched = false;
+  const large = { first: 'x'.repeat(1000000), get later() { touched = true; return 'never'; } };
+  const clipped = f.editor.bounded(large, 4096);
+  assert.ok(clipped.length <= 4096); assert.match(clipped, /truncada: caracteres/); assert.equal(touched, false);
+  assert.equal(large.first.length, 1000000); assert.ok(serialized.length < 5000);
+  let deep = {};
+  for (let i = 0; i < 10000; i++) deep = { nested: deep };
+  assert.match(f.editor.bounded(deep), /truncada: profundidade/);
+  assert.match(f.editor.bounded(Array(10000).fill(0)), /truncada: itens/);
+  const cycle = {}; cycle.self = cycle;
+  assert.match(f.editor.bounded(cycle), /truncada: referência circular/);
+  assert.match(f.editor.bounded({ get calculated() { throw Error('must not execute'); } }), /propriedade calculada/);
+  const toJSON = { value: 1, toJSON() { throw Error('must not execute'); } };
+  assert.match(f.editor.bounded(toJSON), /valor não JSON/);
+});
+
+test('bounded archive redaction classifies full keys and never reveals clipped secret scalars', () => {
+  const f = fixture();
+  vm.runInContext(readFileSync(new URL('../../frontend/evidence-ui.js', import.meta.url), 'utf8'), f.context);
+  const value = { timestamp: 0, fields: { 'nested.client_secret': 'secret-value', harmless: 'visible', token: { huge: 's'.repeat(1000000) } },
+    message: 'Cookie: abcdefg; Authorization: Bearer abcdefg' };
+  const safe = f.editor.bounded(value, 4096, { redact: true });
+  assert.match(safe, /visible/); assert.match(safe, /\[oculto\]/); assert.doesNotMatch(safe, /secret-value|abcdefg|huge/);
+  assert.equal(value.fields['nested.client_secret'], 'secret-value'); assert.equal(value.fields.token.huge.length, 1000000);
+  for (const secret of [
+    '-----BEGIN PRIVATE KEY-----\n' + 'secret'.repeat(1000) + '\n-----END PRIVATE KEY-----',
+    'Cookie: ' + 'secret'.repeat(1000), 'Authorization: Bearer ' + 'secret'.repeat(1000), '$2b$' + 'secret'.repeat(1000),
+  ]) {
+    const shown = f.editor.bounded(secret, 128, { redact: true });
+    assert.doesNotMatch(shown, /secret|BEGIN|Bearer|Cookie|\$2b/); assert.match(shown, /texto extenso omitido/);
+    assert.ok(shown.length <= 128);
+  }
+  const key = 'custom.'.repeat(1000) + 'token';
+  assert.doesNotMatch(f.editor.bounded({ [key]: 'hidden secret' }, 128, { redact: true }), /hidden secret/);
+});
+
+test('editable transform samples are exact under the UTF-8 ceiling and stop before oversized serialization', async () => {
+  const exact = { message: 'ação 🚀', value: null, list: [false, 0, ''] };
+  const f = fixture({ event: { id: 7, fields: { payload: exact } } });
+  f.context.TextEncoder = class { constructor() { throw Error('must not allocate encoded full input'); } };
+  f.context.JSON = { stringify(value) { assert.notEqual(typeof value, 'object'); if (typeof value === 'string') assert.ok(value.length <= 2); return JSON.stringify(value); } };
+  f.editor.open('payload'); f.add('parse_json');
+  assert.equal(f.field('sample').value, JSON.stringify(exact, null, 2));
+  await f.editor.preview(); assert.deepEqual(plain(f.calls[0].args.value), exact, 'unchanged sample forwards the full typed original');
+  const large = { first: '🚀'.repeat(100000), after: 'preserved' }, g = fixture({ event: { id: 8, fields: { payload: large } } });
+  let encoded = 0;
+  g.context.JSON = { stringify(value) { assert.notEqual(typeof value, 'object'); if (typeof value === 'string') { assert.ok(value.length <= 2); encoded += value.length; } return JSON.stringify(value); } };
+  g.context.TextEncoder = f.context.TextEncoder;
+  g.editor.open('payload'); g.add('parse_json');
+  assert.equal(g.field('sample').value, ''); assert.match(g.field('sample-hint').textContent, /256 KiB/);
+  assert.ok(encoded < 150000, 'preparation stops at the byte ceiling before visiting the whole source');
+  g.field('sample').value = 'manual sample'; g.field('sample').oninput(); await g.editor.preview();
+  assert.equal(g.calls[0].args.value, 'manual sample'); assert.equal(large.first.length, 200000); assert.equal(large.after, 'preserved');
+  let deep = {};
+  for (let i = 0; i < 10000; i++) deep = { nested: deep };
+  const h = fixture({ event: { id: 9, fields: { payload: deep } } });
+  assert.equal(h.editor.open('payload'), true, 'opening a deeply nested value does not clone the full source first');
+  assert.equal(h.field('sample').value, ''); assert.match(h.field('sample-hint').textContent, /limite de estrutura/);
+  assert.match(h.field('original').textContent, /truncada: profundidade/);
 });
 
 test('an explicitly edited empty sample remains a string even when the original value is null', async () => {

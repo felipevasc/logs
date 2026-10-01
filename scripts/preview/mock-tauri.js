@@ -927,16 +927,37 @@
     };
   }
   function analysisRows(rows, context) {
-    if (!context?.config.derivedFields.length) return rows;
+    if (!context) return rows;
     const lookups = references?.prepare(context);
     return rows.map(row => {
-      const event = { ...row, fields: Object.assign(Object.create(null), row.fields) };
+      const event = structuredClone(row);
+      event.fields = Object.assign(Object.create(null), event.fields);
+      // Captured rows may already contain an overlay from another configuration.
+      // Restore its exact originals before applying this request's definitions.
+      for (const [name, original] of Object.entries(event.derived_originals || {})) {
+        if (original.state === "present") event.fields[name] = original.value;
+        else if (original.state === "missing") delete event.fields[name];
+      }
+      delete event.derived_originals;
+      delete event.derived_diagnostics;
+      const writeFields = (fields, typed) => {
+        if (typed && Object.keys(fields).some(name => Object.hasOwn(event.fields, name))) {
+          event.derived_diagnostics = [...event.derived_diagnostics || [], { field: typed, code: "target_conflict", message: "O nome do campo ou de um subcampo já existe no registro original.", warning: false }];
+          return false;
+        }
+        event.derived_originals ||= Object.create(null);
+        for (const name of Object.keys(fields)) {
+          if (!Object.hasOwn(event.derived_originals, name)) event.derived_originals[name] = Object.hasOwn(event.fields, name)
+            ? { state: "present", value: event.fields[name] } : { state: "missing" };
+        }
+        Object.assign(event.fields, fields);
+        return true;
+      };
       for (const field of context.config.derivedFields) {
-        if (field.steps?.length && Object.hasOwn(row.fields || {}, field.name)) continue;
         try {
           if (field.lookup) {
             const lookup = lookups?.get(field.name); if (!lookup) throw Error("Referência indisponível para esta consulta.");
-            const result = lookup(event); if (result.matched) Object.assign(event.fields, window.__mockFieldTransforms?.expand(field.name, result.value) || { [field.name]: result.value });
+            const result = lookup(event); if (result.matched) writeFields(window.__mockFieldTransforms?.expand(field.name, result.value) || { [field.name]: result.value }, field.name);
             continue;
           }
           const hasField = Object.hasOwn(event.fields || {}, field.source);
@@ -948,15 +969,17 @@
             for (const rule of field.rules) {
               if (rule.filter && !matchFilter(event, rule.filter)) continue;
               const match = new RegExp(rule.pattern).exec(typeof value === "string" ? value : JSON.stringify(value)); if (!match) continue;
-              value = rule.template ? rule.template.replace(/\$(\d+)/g, (_, i) => match[Number(i)] ?? "") : match[1] ?? match[0]; matched = true; break;
+              const extracted = rule.template ? rule.template.replace(/\$(\d+)/g, (_, i) => match[Number(i)] ?? "") : match[1] ?? match[0];
+              if (!extracted) continue;
+              value = extracted; matched = true; break;
             }
             if (!matched) continue;
           }
           if (field.steps?.length) {
             const transformed = window.__mockFieldTransforms.transform(value, field.steps);
-            Object.assign(event.fields, window.__mockFieldTransforms.expand(field.name, transformed.value));
+            if (!writeFields(window.__mockFieldTransforms.expand(field.name, transformed.value), field.name)) continue;
             if (transformed.notices.length) event.derived_diagnostics = [...event.derived_diagnostics || [], ...transformed.notices.map(code => ({ field: field.name, code, warning: true }))];
-          } else event.fields[field.name] = value;
+          } else writeFields({ [field.name]: value });
         } catch (error) { event.derived_diagnostics = [...event.derived_diagnostics || [], { field: field.name, code: field.lookup ? "reference_lookup_error" : "transform_error", message: String(error), warning: false }]; }
       }
       return event;

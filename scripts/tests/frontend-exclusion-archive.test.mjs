@@ -5,6 +5,8 @@ import vm from 'node:vm';
 
 const source = readFileSync(new URL('../../frontend/exclusion-archive.js', import.meta.url), 'utf8');
 const tasksSource = readFileSync(new URL('../../frontend/tasks.js', import.meta.url), 'utf8');
+const transformSource = readFileSync(new URL('../../frontend/field-transform.js', import.meta.url), 'utf8');
+const evidenceSource = readFileSync(new URL('../../frontend/evidence-ui.js', import.meta.url), 'utf8');
 const plain = value => JSON.parse(JSON.stringify(value));
 const settle = async () => { for (let i = 0; i < 80; i++) await Promise.resolve(); };
 function deferred() {
@@ -85,7 +87,7 @@ function fixture({ available = true, scope = 'dataset', activeMembers = null, ta
     if (cmd === 'exclusion_archive_page') return { analysis: structuredClone(state.analysis), batch: structuredClone(batches.find(value => value.id === args.batchId) || batch(args.batchId)),
       sources: { 'source-key': { version: 'version-sha256', recordSpace: 'file-byte-offsets-v1', label: '/saved/source.log' } },
       rows: [{ member: member(100), activeInBatch: true, unavailableReason: 'The original source version is unavailable' },
-        { member: member(200), activeInBatch: true, event: { id: 2, message: 'available archived content' } },
+        { member: member(200), activeInBatch: true, event: { id: 2, timestamp: 1700000000000, level: 'Alerta', message: 'available archived content' } },
         { member: member(300), activeInBatch: false, unavailableReason: 'Source not open' }], nextCursor: null, activeMembers };
     if (cmd === 'exclusion_restore_batch' || cmd === 'exclusion_restore_selected') {
       if (cmd === 'exclusion_restore_batch') batches = batches.map(value => value.id === args.batchId ? { ...value, active: false, restoredAtMs: 1700000001000 } : value);
@@ -115,6 +117,8 @@ function fixture({ available = true, scope = 'dataset', activeMembers = null, ta
     loadDerivedFields: async owner => { assertOwner(owner); order.push('loadDerivedFields'); return true; },
     refresh: async () => { order.push('refresh'); return true; },
   });
+  vm.runInContext(evidenceSource, context, { filename: 'evidence-ui.js' });
+  vm.runInContext(transformSource, context, { filename: 'field-transform.js' });
   vm.runInContext(source, context, { filename: 'exclusion-archive.js' });
   if (tasks) vm.runInContext(tasksSource, context, { filename: 'tasks.js' });
   const archive = context.window.ExclusionArchive, field = name => nodes.get(`#ex-${name}`), overlay = nodes.get('#exclusion-modal');
@@ -301,6 +305,26 @@ test('archive retains unavailable source provenance and labels unknown remaining
   assert.match(textIn(f.records()[1]), /available archived content/);
   assert.equal(f.records()[0].children[0].disabled, false, 'unavailable content still permits metadata-only restoration');
   assert.equal(f.records()[2].children[0].disabled, true, 'already-restored membership cannot be selected');
+});
+
+test('available archive rows expose bounded safe summaries while collapsed and retain original values', async () => {
+  const f = fixture(); await settle();
+  const event = { id: 2, timestamp: 0, level: 'Alerta', message: 'Sign-in completed: token=private-token',
+    fields: { normal: 'original', client_secret: 'private-secret', body: 'x'.repeat(1000000) } };
+  f.on('exclusion_archive_page', args => {
+    const reply = f.defaultResponse('exclusion_archive_page', args); reply.rows[1].event = event; return reply;
+  });
+  await f.archive.openArchive();
+  const body = f.records()[1].children[1], summary = body.children.find(item => item.className === 'ex-record-summary');
+  const meta = body.children.find(item => item.className === 'ex-record-meta');
+  assert.match(summary.textContent, /Sign-in completed/); assert.match(summary.textContent, /\[oculto\]/);
+  assert.equal(meta.textContent, `${new Date(0).toLocaleString('pt-BR')} · Alerta`); assert.ok(summary.textContent.length <= 320);
+  assert.equal(f.records()[0].children[1].children.some(item => item.className === 'ex-record-summary'), false, 'missing content retains provenance without an invented message');
+  const details = body.children.find(item => item.className === 'ex-event-preview'), preview = details.children.find(item => item.tag === 'pre');
+  assert.ok(preview.textContent.length <= 4096); assert.match(preview.textContent, /prévia truncada/);
+  assert.doesNotMatch(textIn(body), /private-token|private-secret/);
+  assert.equal(event.message, 'Sign-in completed: token=private-token'); assert.equal(event.fields.client_secret, 'private-secret');
+  assert.equal(event.fields.body.length, 1000000);
 });
 
 test('full-batch restore sends metadata only and does not claim original batch size became newly visible', async () => {

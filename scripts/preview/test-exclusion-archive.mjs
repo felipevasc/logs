@@ -14,11 +14,12 @@ const countIs=async total=>{await page.waitForFunction(value=>state.total===valu
 const openArchive=async()=>{await page.locator('#btn-exclusion-archive').click();await page.waitForFunction(()=>!document.querySelector('#ex-members').hidden&&!document.querySelector('#ex-reload').disabled);};
 const clearFilters=async()=>{await page.evaluate(async()=>{state.filters=[];state.quick='';renderChips();await refresh();});await summary();};
 const readableArchive=async()=>{
-  const contrast=await page.locator('.ex-provenance[open] pre,.ex-event-preview[open] pre').evaluateAll(nodes=>{
+  const contrast=await page.locator('.ex-provenance[open] pre,.ex-event-preview[open] pre,.ex-record-summary,.ex-record-meta').evaluateAll(nodes=>{
     const luminance=color=>{const [r,g,b]=color.match(/[\d.]+/g).slice(0,3).map(Number).map(n=>{n/=255;return n<=.04045?n/12.92:((n+.055)/1.055)**2.4;});return .2126*r+.7152*g+.0722*b;};
-    return nodes.map(node=>{const style=getComputedStyle(node),a=luminance(style.color),b=luminance(style.backgroundColor);return{ratio:(Math.max(a,b)+.05)/(Math.min(a,b)+.05),select:style.userSelect,overflow:style.overflowY};});
+    const background=node=>{for(let current=node;current;current=current.parentElement){const color=getComputedStyle(current).backgroundColor;if(color!=='transparent'&&color!=='rgba(0, 0, 0, 0)')return color;}throw Error('Archive background missing');};
+    return nodes.map(node=>{const style=getComputedStyle(node),a=luminance(style.color),b=luminance(background(node));return{ratio:(Math.max(a,b)+.05)/(Math.min(a,b)+.05),select:style.userSelect,overflow:style.overflowY,pre:node.tagName==='PRE'};});
   });
-  assert.ok(contrast.length>0);for(const item of contrast){assert.ok(item.ratio>=4.5);assert.equal(item.select,'text');assert.equal(item.overflow,'auto');}return contrast;
+  assert.ok(contrast.length>0);for(const item of contrast){assert.ok(item.ratio>=4.5);if(item.pre){assert.equal(item.select,'text');assert.equal(item.overflow,'auto');}}return contrast;
 };
 try{
   await page.goto(process.argv[2]||'http://127.0.0.1:4174');
@@ -40,7 +41,15 @@ try{
   assert.equal(await page.evaluate(()=>JSON.stringify(backendFilters())),filters,'archive never installs a removable value filter');
   assert.equal(await page.evaluate(()=>caseEvents().length),preserved,'saved evidence remains intact');
   assert.equal(await page.evaluate(refs=>state.rows.some(row=>refs.includes(row.event_ref)),selected.map(row=>row.ref)),false);
-  phase='admitted Case field inspection';await page.evaluate(()=>WorkspaceContext.setScope('case',{page:'explore',animate:false}));await countIs(preserved-3);
+  phase='admitted Case detail and field inspection';await page.evaluate(()=>WorkspaceContext.setScope('case',{page:'explore',animate:false}));await countIs(preserved-3);
+  const hiddenId=await page.evaluate(ref=>caseEvents().find(row=>row.event_ref===ref)?.id,selected[0].ref);assert.equal(typeof hiddenId,'number');
+  await page.evaluate(id=>openDetail(id),hiddenId);
+  assert.match(await page.locator('#pane-overview').textContent(),/não está disponível no recorte visível/);
+  assert.equal(await page.evaluate(()=>state.currentDetailEv),null,'Case analysis detail cannot reopen an excluded preserved row');
+  await page.evaluate(()=>openDetail(state.rows[0].id));
+  assert.equal(await page.evaluate(()=>state.currentDetailEv?.id),await page.evaluate(()=>state.rows[0].id));
+  assert.equal(await page.evaluate(refs=>refs.includes(state.currentDetailEv?.event_ref),selected.map(row=>row.ref)),false);
+  await page.locator('#dr-close').click();
   await page.evaluate(()=>showFieldInspector('message'));
   await page.waitForFunction(value=>document.querySelector('#pane-overview').textContent.includes(`${fmtNum(value)} valores preenchidos no recorte visível do Caso`),preserved-3);
   assert.equal(await page.evaluate(()=>caseEvents().length),preserved,'field inspection preserves archived evidence');
@@ -49,6 +58,10 @@ try{
   assert.match(await page.locator('#ex-batch-meta').textContent(),/\d{2}\/\d{2}\/\d{4}/);
   assert.match(await page.locator('#ex-batch-meta').textContent(),/3 registro\(s\) no lote original/);
   assert.equal(await page.locator('.ex-record').count(),3);
+  assert.equal(await page.locator('.ex-record-summary').count(),3);
+  for(const meta of await page.locator('.ex-record-meta').allTextContents())assert.match(meta,/\d{2}\/\d{2}\/\d{4}.* · .+/);
+  for(const text of await page.locator('.ex-record-summary').allTextContents()){assert.ok(text.length>0&&text.length<=320);assert.doesNotMatch(text,/Mensagem não informada/);}
+  assert.equal(await page.locator('.ex-event-preview[open]').count(),0,'record summaries are visible before opening details');
   await page.locator('.ex-provenance summary').first().click();await page.locator('.ex-event-preview summary').first().click();
   results.darkContrast=await readableArchive();await page.screenshot({path:resolve(output,'exclusion-archive-dark-1440.png')});
   await page.locator('.ex-record input').first().check();await page.locator('#ex-restore-selected').click();
@@ -79,6 +92,7 @@ try{
   phase='source-unavailable provenance';await page.evaluate(()=>clearData());
   await page.waitForFunction(()=>!state.loaded&&!state.loadOverlay);await openArchive();
   assert.ok(await page.locator('.ex-unavailable').count()>0);assert.equal(await page.locator('.ex-event-preview').count(),0);
+  assert.equal(await page.locator('.ex-record-summary').count(),0,'unavailable records keep provenance without synthetic messages');
   await page.setViewportSize({width:1024,height:768});await page.locator('#btn-theme').evaluate(button=>button.click());
   await page.locator('.ex-provenance summary').first().click();results.lightContrast=await readableArchive();
   assert.match(await page.locator('.ex-provenance pre').first().textContent(),/synthetic-v1/);
@@ -86,6 +100,8 @@ try{
   await page.screenshot({path:resolve(output,'exclusion-archive-unavailable-light-1024.png')});await page.locator('#ex-close').click();
   phase='saved evidence archive hydration';await page.evaluate(()=>WorkspaceContext.setScope('case',{page:'explore',animate:false}));await summary();
   await openArchive();await page.waitForFunction(()=>document.querySelector('.ex-event-preview'));
+  await page.locator('.ex-event-preview summary').first().click();results.lightEvidenceContrast=await readableArchive();
+  await page.screenshot({path:resolve(output,'exclusion-archive-evidence-light-1024.png')});
   assert.equal(await page.evaluate(()=>caseEvents().length),preserved);
   await page.locator('#ex-restore-batch').click();await page.waitForFunction(()=>document.querySelector('#ex-batch-meta').textContent.includes('0 exclusão')&&!document.querySelector('#ex-reload').disabled);
   await countIs(preserved);assert.doesNotMatch(await page.locator('#ex-status').textContent(),/2[.\s]?000.*visíveis/);

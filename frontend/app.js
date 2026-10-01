@@ -120,6 +120,7 @@ const state = {
   activeOperation: null,
   tsSources: [], // fontes de data/hora selecionadas (ordem)
   currentDetailEv: null, // evento aberto no drawer
+  detailAdmission: null, // contexto da consulta; null para evidência preservada explícita
   datasetDashboard: null,
   datasetCube: null,
   datasetProfiles: null,
@@ -2228,6 +2229,7 @@ function explorerKey() {
 // Invalidate derived data only. Saved evidence, filters, drafts and layouts stay owned by the Case.
 function invalidateAnalysisComputedData(snapshot) {
   state.datasetRevision++; state.refreshVersion++; detailRequest++;
+  if (state.detailAdmission) { closeDrawer(); state.currentDetailEv = null; state.detailSourceSpec = null; state.detailAdmission = null; }
   clearTimeout(debounceTimer); clearTimeout(filterCountsTimer); filterCountsTimer = null;
   explorerAnalytics.clear(); filterCountsCache.clear();
   explorerIntent = ""; explorerCursorKey = ""; explorerCursors = [null];
@@ -4457,13 +4459,14 @@ function closeTlPop() {
 }
 function showBucketPop(x, y, evs) {
   closeTlPop();
+  const scope = workspaceScope(), admission = { scope, owner: window.AnalysisContexts?.capture(), signature: scope === "case" ? caseSig() : null };
   const pop = el("div", "tl-pop");
   for (const ev of evs.slice(0, 30)) {
     const b = el("button", "tl-pop-item");
     const ts = el("span", "ts", fmtTs(ev.timestamp));
     b.appendChild(ts);
     b.appendChild(document.createTextNode(trunc(ev.message || ev.name || `#${ev.code}`, 60)));
-    b.onclick = () => { closeTlPop(); showDetail(ev); };
+    b.onclick = () => { closeTlPop(); if (detailAdmissionCurrent(admission)) void openDetail(ev.id); else toast("O contexto mudou. Abra a Timeline novamente.", "info"); };
     pop.appendChild(b);
   }
   if (evs.length > 30) pop.appendChild(el("div", "muted small", `… e mais ${evs.length - 30}`));
@@ -5181,21 +5184,49 @@ function currentIndex() {
 }
 
 let detailRequest = 0;
+function detailAdmissionCurrent(admission) {
+  return !!admission && admission.scope === workspaceScope() && (!admission.owner || window.AnalysisContexts.isCurrent(admission.owner))
+    && (admission.signature === null || admission.signature === caseSig());
+}
 async function openDetail(id) {
   const request = ++detailRequest;
+  const scope = workspaceScope(), owner = window.AnalysisContexts?.capture();
+  const evidence = scope === "case" ? caseEvents() : null, signature = scope === "case" ? caseSig() : null;
+  const admission = { scope, owner, signature };
+  window.Tasks?.cancelLatest("event-detail");
   showDetailLoading();
+  const current = () => request === detailRequest && !$("#drawer").hidden && detailAdmissionCurrent(admission);
+  const check = () => {
+    if (current()) return true;
+    if (request === detailRequest && !$("#drawer").hidden) $("#pane-overview").textContent = "O contexto mudou. Abra o registro novamente.";
+    return false;
+  };
   try {
-    const ev = workspaceScope() === "case" ? caseEvents().find(event => event.id === id) : await api("event_detail", { id });
-    if (request === detailRequest && ev) showDetail(ev);
+    let ev;
+    const captured = { analysisContext: owner?.identity ?? null, sourceGeneration: owner?.sourceGeneration ?? null };
+    const options = { silent: true, latest: "event-detail", analysisOwner: owner, caseEvents: evidence };
+    if (scope === "case") {
+      const args = await caseArgs({ ...captured, caseEvents: evidence,
+        filters: [{ column: "id", op: "equals_exact", value: String(id), value2: null }],
+        sortColumn: "id", sortDir: "asc", offset: 0, limit: 1, cursor: null });
+      if (!check()) return;
+      const result = await api("query_page", args, options);
+      if (!check()) return;
+      if (!Array.isArray(result?.rows) || result.rows.length > 1 || result.rows[0] && result.rows[0].id !== id) throw Error("Resposta de detalhe inválida.");
+      ev = result.rows[0];
+    } else ev = await api("event_detail", { id, ...captured }, options);
+    if (!check()) return;
+    if (ev) showDetail(ev, null, admission);
+    else $("#pane-overview").textContent = "Este registro não está disponível no recorte visível atual.";
   } catch (error) {
-    if (request === detailRequest) $("#pane-overview").textContent = `Não foi possível abrir o registro: ${String(error)}`;
+    if (check()) $("#pane-overview").textContent = `Não foi possível abrir o registro: ${String(error)}`;
   }
 }
 
 // abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
 function showDetailLoading() {
   closeDetailValue();
-  state.detailId = null; state.currentDetailEv = null; state.detailSourceSpec = null;
+  state.detailId = null; state.currentDetailEv = null; state.detailSourceSpec = null; state.detailAdmission = null;
   const actions = $("#drawer .detail-quick-actions"); if (actions) actions.hidden = true;
   for (const id of ["dr-prev", "dr-next", "dr-copy"]) $("#" + id).hidden = true;
   $("#drawer-badges").innerHTML = "";
@@ -5217,6 +5248,7 @@ function openContextInspector(title, subtitle, overview) {
   state.detailId = null;
   state.currentDetailEv = null;
   state.detailSourceSpec = null;
+  state.detailAdmission = null;
   const actions = $("#drawer .detail-quick-actions"); if (actions) actions.hidden = true;
   $("#drawer-badges").innerHTML = "";
   $("#drawer-badges").append(el("span", "badge code", title));
@@ -5500,12 +5532,13 @@ function renderDetailTree(entries) {
   return tree;
 }
 
-function showDetail(ev, sourceSpec = null) {
+function showDetail(ev, sourceSpec = null, admission = null) {
   closeDetailValue();
   detailRequest++;
   state.detailId = ev.id;
   state.currentDetailEv = ev;
   state.detailSourceSpec = sourceSpec;
+  state.detailAdmission = admission;
   const actions = $("#drawer .detail-quick-actions"); if (actions) actions.hidden = false;
   const follow = $("#ws-detail-follow"), context = $("#ws-detail-context");
   if (follow) follow.hidden = !["trace_id", "trace.id", "request_id", "requestId", "correlation_id", "session_id"].some(key => ev.fields?.[key]);
@@ -5578,12 +5611,23 @@ function detailStep(dir) {
 function closeDrawer() {
   detailRequest++;
   window.Tasks?.cancelLatest("field-inspector");
+  window.Tasks?.cancelLatest("event-detail");
   state.detailId = null;
   closeDetailValue();
   $("#drawer").hidden = true;
   $("#drawer-scrim").hidden = true;
   $("#btn-right-inspect").classList.remove("active");
   document.querySelectorAll("#events-table tbody tr").forEach((tr) => tr.classList.remove("selected"));
+}
+
+async function copyDetail() {
+  const event = state.currentDetailEv;
+  if (state.detailId == null || !event) return;
+  if (state.detailAdmission && !detailAdmissionCurrent(state.detailAdmission)) {
+    toast("O contexto mudou. Abra o registro novamente antes de copiar.", "info"); return;
+  }
+  await navigator.clipboard.writeText(JSON.stringify(event, null, 2));
+  toast("JSON copiado.", "ok");
 }
 
 function switchDetailTab(which) {
@@ -5847,8 +5891,9 @@ function openRightInspector() {
     return;
   }
   if (state.currentDetailEv) {
-    showDetail(state.currentDetailEv);
-    return;
+    if (!state.detailAdmission) { showDetail(state.currentDetailEv, state.detailSourceSpec); return; }
+    if (detailAdmissionCurrent(state.detailAdmission)) { void openDetail(state.currentDetailEv.id); return; }
+    state.currentDetailEv = null; state.detailSourceSpec = null; state.detailAdmission = null;
   }
   if (activeStation()) {
     showStationInspector(activeStation());
@@ -6480,12 +6525,7 @@ function bind() {
   };
   $("#dr-prev").onclick = () => detailStep(-1);
   $("#dr-next").onclick = () => detailStep(1);
-  $("#dr-copy").onclick = async () => {
-    if (state.detailId == null) return;
-    const ev = await api("event_detail", { id: state.detailId });
-    await navigator.clipboard.writeText(JSON.stringify(ev, null, 2));
-    toast("JSON copiado.", "ok");
-  };
+  $("#dr-copy").onclick = copyDetail;
   document.querySelectorAll("#drawer .dtab").forEach((t) => {
     t.onclick = () => switchDetailTab(t.dataset.pane);
   });
@@ -6727,6 +6767,9 @@ function caseEventsCompute(allRecords = false) {
         message: row.message || "",
         raw: row.raw || "",
         fields: row.fields || {},
+        derived_originals: row.derived_originals || {},
+        derived_diagnostics: row.derived_diagnostics || [],
+        evidence_provenance: row.evidence_provenance ?? null,
       });
     }
   }
