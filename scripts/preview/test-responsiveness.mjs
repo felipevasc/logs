@@ -59,7 +59,7 @@ try {
   assert.equal(await page.locator('#pg-next').isDisabled(),false,'paused summary keeps paging available');
   assert.match(await page.locator('#context-summary').innerText(),/pausado/);
   assert.doesNotMatch(await page.locator('#workbar-label').innerText(),/atualizado/i);
-  assert.match(await page.locator('#chart').innerText(),/Histograma pausado/);
+  assert.match(await page.locator('#chart').innerText(),/Timeline pausada/);
   assert.ok((await page.locator('.hist-panel').boundingBox()).height<80,'paused empty histogram uses a compact honest placeholder');
   await page.screenshot({path:'output/playwright/summary-paused.png',fullPage:true});
   await page.evaluate(()=>{window.__mockLatency={count_filtered:50,stats_events:50};});
