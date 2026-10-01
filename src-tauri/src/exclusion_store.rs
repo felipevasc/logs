@@ -3708,7 +3708,9 @@ mod tests {
             String::from_utf8_lossy(&status.stderr)
         );
         let path = PathBuf::from(std::fs::read_to_string(dir.join("child-pending-path")).unwrap());
-        assert!(path.starts_with(root(dir)));
+        // PendingDirectory stores the canonical root. Windows may add the
+        // verbatim path prefix, so compare in that same namespace.
+        assert!(path.starts_with(root(dir).canonicalize().unwrap()));
         path
     }
     #[test]
