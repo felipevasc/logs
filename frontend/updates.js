@@ -7,6 +7,7 @@ window.Updates = (() => {
   const STARTUP_DELAY = 2500;
   let status = null, notice = null, overlay = null;
   let preparingInstall = false;
+  let snapshotRevision = null, downloadRequests = 0;
 
   const node = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
   const megabytes = bytes => `${(bytes / 1048576).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} MB`;
@@ -35,14 +36,28 @@ window.Updates = (() => {
     return box;
   }
 
-  function set(next) {
+  function set(next, { local = false } = {}) {
+    if (!next || typeof next !== "object") return false;
+    if (!local) {
+      const revision = next.snapshotRevision;
+      // Native captures share one monotonic counter across event and invoke
+      // delivery. Decimal comparison keeps counters beyond Number's precision.
+      if (typeof revision !== "string" || !/^(0|[1-9]\d{0,38})$/.test(revision)) return false;
+      if (snapshotRevision !== null) {
+        const order = revision.length - snapshotRevision.length || (revision === snapshotRevision ? 0 : revision > snapshotRevision ? 1 : -1);
+        if (order < 0) return false;
+        if (!order) return true;
+      }
+      snapshotRevision = revision;
+    }
     const previous = status?.phase;
     status = next;
     document.querySelector("#btn-settings")?.classList.toggle("has-update", ["available", "downloading", "ready"].includes(next.phase) && next.available?.version !== next.skippedVersion);
-    if (previous === "downloading" && next.phase === "ready") open();
+    if (next.phase === "ready" && (previous === "downloading" || downloadRequests > 0 && previous !== "ready")) open();
     render();
     const pane = document.querySelector("#settings-pane-updates");
     if (pane && !pane.hidden) renderPane(pane);
+    return true;
   }
 
   function dialog() {
@@ -70,12 +85,17 @@ window.Updates = (() => {
   function hide() { if (overlay && !preparingInstall && status?.phase !== "installing") overlay.hidden = true; }
   function open() { dialog().hidden = false; render(); }
 
-  async function download() { set(await call("update_download")); }
+  async function download() {
+    downloadRequests++;
+    try { set(await call("update_download")); }
+    finally { downloadRequests--; }
+  }
   async function skip() {
     const version = status.available.version;
-    set(await call("update_skip", { version }));
-    hide();
-    toast(`A versão ${version} não será mais oferecida ao abrir. Ela continua disponível em Configurações → Atualizações.`, "info");
+    if (set(await call("update_skip", { version }))) {
+      hide();
+      toast(`A versão ${version} não será mais oferecida ao abrir. Ela continua disponível em Configurações → Atualizações.`, "info");
+    }
   }
   async function install(restart = true) {
     if (preparingInstall || status?.phase === "installing") return;
@@ -96,14 +116,14 @@ window.Updates = (() => {
         await call("update_install_on_close", { enabled: false });
         set(await call("update_status"));
       } catch { /* retain the last usable status if IPC itself failed */ }
-      if (status) set({ ...status, error: String(error) });
+      if (status) set({ ...status, error: String(error) }, { local: true });
       open();
       throw error;
     } finally { preparingInstall = false; render(); }
   }
   async function installOnClose() {
-    set(await call("update_install_on_close", { enabled: !status.installOnClose }));
-    if (status.installOnClose) { hide(); toast("A atualização será instalada quando você fechar o LogInsight.", "ok"); }
+    const current = set(await call("update_install_on_close", { enabled: !status.installOnClose }));
+    if (current && status.installOnClose) { hide(); toast("A atualização será instalada quando você fechar o LogInsight.", "ok"); }
   }
   const openPage = () => call("update_open_page", { version: status?.available?.version || null });
 
@@ -209,11 +229,19 @@ window.Updates = (() => {
   }
 
   async function startup() {
-    try { set(await call("update_startup")); } catch { return; }
-    notice = status.notice;
-    if (notice?.kind === "updated") toast(`LogInsight atualizado para a versão ${notice.to}.`, "ok");
-    if (notice?.kind === "failed") toast(`A atualização para ${notice.to} não foi concluída. Veja Configurações → Atualizações.`, "err");
-    if (status.phase === "available" && status.available && status.available.version !== status.skippedVersion) open();
+    let response;
+    try { response = await call("update_startup"); set(response); } catch { return; }
+    // The one-shot startup notice belongs to this response even if a newer
+    // event already made its phase snapshot obsolete. Ordinary snapshots must
+    // neither lose that notice nor announce it again.
+    if (!notice && ["updated", "failed"].includes(response?.notice?.kind)) {
+      notice = response.notice;
+      if (notice.kind === "updated") toast(`LogInsight atualizado para a versão ${notice.to}.`, "ok");
+      else toast(`A atualização para ${notice.to} não foi concluída. Veja Configurações → Atualizações.`, "err");
+      const pane = document.querySelector("#settings-pane-updates");
+      if (pane && !pane.hidden) renderPane(pane);
+    }
+    if (status?.phase === "available" && status.available && status.available.version !== status.skippedVersion) open();
   }
 
   window.__TAURI__?.event?.listen("update-state", ({ payload }) => set(payload)).catch(() => {});

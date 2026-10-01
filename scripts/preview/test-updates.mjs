@@ -28,9 +28,35 @@ try {
   assert.ok(await page.locator("#btn-settings.has-update").count(), "settings button marks the pending update");
   results.announce = "diálogo ao abrir, notas como texto, marca em Configurações";
 
+  // Events and invoke replies use separate native transports. Hold the actual
+  // Downloading reply until the mock has emitted Ready, then let the production
+  // click handler process that older snapshot before asserting the final UI.
+  await page.evaluate(() => {
+    const invoke = window.__TAURI__.core.invoke;
+    const released = new Promise(resolve => { window.__releaseUpdateDownloadReply = resolve; });
+    window.__TAURI__.core.invoke = async (name, args) => {
+      const reply = await invoke(name, args);
+      if (name === "update_download") { window.__delayedUpdateSnapshot = reply; await released; }
+      return reply;
+    };
+    const button = [...document.querySelectorAll(".update-overlay button")].find(node => node.textContent.trim() === "Atualizar agora");
+    const click = button.onclick;
+    button.onclick = event => { window.__updateDownloadAction = click.call(button, event); return window.__updateDownloadAction; };
+  });
   await page.getByRole("button", { name: "Atualizar agora" }).click();
   await page.waitForSelector(".update-progress span");
   await page.getByRole("button", { name: "Reiniciar e instalar" }).waitFor({ timeout: 8000 });
+  const delayedSnapshot = await page.evaluate(async () => {
+    const reply = window.__delayedUpdateSnapshot;
+    window.__releaseUpdateDownloadReply();
+    await window.__updateDownloadAction;
+    return { phase: reply.phase, revision: reply.snapshotRevision };
+  });
+  assert.equal(delayedSnapshot.phase, "downloading");
+  assert.match(delayedSnapshot.revision, /^\d+$/);
+  assert.equal(await page.locator(".update-progress").count(), 0, "a delayed Downloading reply cannot regress Ready");
+  assert.equal(await page.getByRole("button", { name: "Reiniciar e instalar" }).isVisible(), true);
+  results.snapshotOrder = "Ready permanece após a resposta anterior de download chegar pelo outro transporte";
   await page.getByRole("button", { name: "Instalar ao fechar" }).click();
   await page.waitForSelector(".update-overlay[hidden]", { state: "attached" });
   assert.equal(await page.evaluate(() => window.__TAURI__.core.invoke("update_status").then(s => s.installOnClose)), true);

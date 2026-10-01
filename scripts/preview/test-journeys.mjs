@@ -220,6 +220,25 @@ try {
   await page.waitForFunction(() => document.querySelectorAll(".journey-record").length === 1);
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "case", "Investigar daqui retains case scope");
   results.isolatedContexts = caseConfig;
+  // The exact API selection is a singleton under source=Auth. The repeated-key
+  // list intentionally omits it while retaining the independently opened
+  // detail; flow-long must not be marked selected merely because it is first.
+  results.exactSingletonOutsideIndex = await page.evaluate(() => ({
+    field: document.querySelector('.journey-key').value,
+    includeSingles: document.querySelector('.journey-single input').checked,
+    filters: state.filters,
+    list: [...document.querySelectorAll('.journey-item')].map(item => ({ value: item.dataset.journeyValue,
+      selected: item.getAttribute('aria-current'), count: item.querySelector('.journey-item-meta span').textContent })),
+    selected: document.querySelector('.journey-detail-title strong').textContent,
+    detail: document.querySelector('.journey-detail-meta').textContent,
+    records: [...document.querySelectorAll('.journey-record-body p')].map(item => item.textContent),
+  }));
+  assert.deepEqual(results.exactSingletonOutsideIndex, {
+    field: 'trace.id', includeSingles: false,
+    filters: [{ column: 'source', op: 'equals_exact', value: 'Auth', value2: null }],
+    list: [{ value: 'flow-long', selected: 'false', count: '75 registros' }],
+    selected: 'API', detail: 'trace.id · 1 registros', records: ['Registro 271 da jornada'],
+  }, 'exact singleton detail remains coherent outside the repeated-key list after context restoration');
   await page.screenshot({ path: resolve(output, "journeys-context-case-light.png") });
 
   // A pending case query cannot repaint the source after a context change.

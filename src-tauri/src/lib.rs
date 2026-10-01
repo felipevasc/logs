@@ -48,6 +48,7 @@ mod page_projection;
 mod projection_commands;
 mod pivots;
 mod query;
+mod query_regex;
 mod querylang;
 #[cfg(test)]
 mod regression_tests;

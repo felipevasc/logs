@@ -310,7 +310,9 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
             }
         }
         if f.op == "regex" {
-            regex::Regex::new(&f.value).map_err(|e| format!("Expressão inválida: {e}"))?;
+            crate::operations::check()?;
+            crate::query_regex::compile(&f.value, crate::query_regex::ORDINARY).map_err(|e| format!("Expressão inválida: {e}"))?;
+            crate::operations::check()?;
         }
         if f.op == "threat_rule" {
             if f.column != "_all" {

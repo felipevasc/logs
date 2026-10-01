@@ -66,7 +66,7 @@ pub(crate) fn prepare_with_threat_catalog(
             let is_re = f.op == "regex";
             let is_query = f.op == "query";
             PreparedFilter {
-                regex: is_re.then(|| regex::Regex::new(&f.value).ok()).flatten(),
+                regex: is_re.then(|| crate::query_regex::compile(&f.value, crate::query_regex::ORDINARY).ok()).flatten(),
                 needle_lower: if is_query { String::new() } else { f.value.to_lowercase() },
                 num: value_as_num(&f.column, &f.value),
                 num2: value_as_num(&f.column, f.value2.as_deref().unwrap_or("")),
@@ -2035,5 +2035,51 @@ mod projected_page_parity_tests {
         let projected = crate::page_projection::project_indexed_row(&wide, 0, &config, &config, &[], &plan).unwrap();
         assert_eq!(projected.row.event_ref, event_at(&wide, 0, &config, &config, &[]).event_ref);
         assert!(matches!(projected.cells[0], crate::page_projection::Cell::Unavailable { reason: "record_too_wide" }));
+    }
+}
+
+#[cfg(test)]
+mod regex_program_reuse_tests {
+    use super::*;
+    use crate::query_regex::testing;
+
+    fn filter(op: &str, value: &str) -> Filter {
+        Filter { column: "message".into(), op: op.into(), value: value.into(), value2: None }
+    }
+
+    #[test]
+    fn invalid_regex_errors_and_infallible_prepare_fallback_remain_unchanged() {
+        let (_, builds) = testing::run(96 << 20, || {
+            let filters = [filter("regex", "[")];
+            let error = regex::Regex::new("[").unwrap_err();
+            for _ in 0..2 {
+                assert_eq!(crate::workspace::validate(&filters).unwrap_err(), format!("Expressão inválida: {error}"));
+                let pfs = prepare(&filters);
+                assert!(pfs[0].regex.is_none());
+                assert!(!value_matches(&pfs[0], Some("anything")));
+            }
+        });
+        assert_eq!(builds, 4, "invalid programs are not cached");
+    }
+
+    #[test]
+    fn cancellation_between_regex_and_list_compilations_is_explicit() {
+        for text in ["message:/first/ AND message:/second/", "path:(first* OR second* OR third*)"] {
+            let (_, builds) = testing::run(96 << 20, || {
+                let id = format!("regex-cancel-{}", uuid::Uuid::new_v4());
+                let token = crate::operations::token(Some(id.clone())).unwrap();
+                let result = testing::with_after_build(move || { crate::operations::cancel_id(&id); }, || {
+                    crate::operations::run_with_token(token, || {
+                        assert_eq!(crate::querylang::compile(text).unwrap_err(), "Operação cancelada.");
+                    })
+                });
+                assert_eq!(result.unwrap_err(), "Operação cancelada.");
+                // The cancelled first program was never published. A retry must
+                // compile all programs, including the first, then can reuse them.
+                crate::querylang::compile(text).unwrap();
+                crate::querylang::compile(text).unwrap();
+            });
+            assert_eq!(builds, if text.starts_with("path:") { 4 } else { 3 });
+        }
     }
 }

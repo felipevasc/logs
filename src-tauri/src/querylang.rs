@@ -463,11 +463,11 @@ impl Parser<'_> {
             j += 1;
         }
         self.pos = close + 1;
-        regex::RegexBuilder::new(&pattern)
-            .case_insensitive(true)
-            .size_limit(1 << 22)
-            .build()
-            .map_err(|e| format!("Expressão regular inválida: {e}"))
+        crate::operations::check()?;
+        let re = crate::query_regex::compile(&pattern, crate::query_regex::QUERY_LITERAL)
+            .map_err(|e| format!("Expressão regular inválida: {e}"))?;
+        crate::operations::check()?;
+        Ok(re)
     }
     fn read_bare(&mut self) -> String {
         let start = self.pos;
@@ -681,6 +681,7 @@ impl Parser<'_> {
         let mut nets = Vec::new();
         let mut rest = Vec::new();
         for (value, quoted) in items {
+            crate::operations::check()?;
             match self.smart(&field, &value, quoted)? {
                 Matcher::Cidr(mut found) => nets.append(&mut found),
                 other => rest.push(Expr::Term(Term { field: Some(field.clone()), matcher: other })),
@@ -694,6 +695,7 @@ impl Parser<'_> {
 }
 
 fn wildcard(pattern: &str, anchored: bool) -> Result<regex::Regex, String> {
+    crate::operations::check()?;
     let mut re = String::from(if anchored { "(?is)^" } else { "(?is)" });
     for c in pattern.chars() {
         match c {
@@ -705,7 +707,10 @@ fn wildcard(pattern: &str, anchored: bool) -> Result<regex::Regex, String> {
     if anchored {
         re.push('$');
     }
-    regex::Regex::new(&re).map_err(|e| format!("Curinga inválido: {e}"))
+    crate::operations::check()?;
+    let program = crate::query_regex::compile(&re, crate::query_regex::ORDINARY).map_err(|e| format!("Curinga inválido: {e}"))?;
+    crate::operations::check()?;
+    Ok(program)
 }
 
 fn number_for(field: &str, value: &str) -> Option<f64> {

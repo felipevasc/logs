@@ -7,6 +7,7 @@ use crate::config_dir;
 use parking_lot::Mutex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -125,6 +126,8 @@ pub struct Available {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
+    /// Decimal text keeps ordering exact across JavaScript's number boundary.
+    snapshot_revision: String,
     current_version: String,
     install_kind: Kind,
     /// Why this copy cannot update itself; updates are then manual.
@@ -146,6 +149,9 @@ pub struct Status {
 }
 
 struct Inner {
+    /// Accessed only while `UpdateState::inner` is locked. Events and invoke
+    /// responses may arrive out of order, so phase names are not an ordering.
+    snapshot_revision: Cell<u128>,
     prefs: Prefs,
     phase: Phase,
     update: Option<Update>,
@@ -194,6 +200,7 @@ pub fn prepare(current: &Version) -> UpdateState {
     UpdateState {
         shutdown_pause: Mutex::new(None),
         inner: Mutex::new(Inner {
+            snapshot_revision: Cell::new(0),
             prefs,
             phase: Phase::Idle,
             update: None,
@@ -397,6 +404,14 @@ fn describe(error: &UpdaterError) -> String {
     }
 }
 
+fn next_snapshot_revision(sequence: &Cell<u128>) -> String {
+    // Never wrap into an older snapshot. Even one snapshot per nanosecond
+    // cannot exhaust u128 during a process lifetime.
+    let next = sequence.get().saturating_add(1);
+    sequence.set(next);
+    next.to_string()
+}
+
 fn status(app: &AppHandle, inner: &Inner) -> Status {
     let kind = Kind::current();
     let available = inner.update.as_ref().map(|update| Available {
@@ -405,6 +420,7 @@ fn status(app: &AppHandle, inner: &Inner) -> Status {
         date: update.raw_json.get("pub_date").and_then(|value| value.as_str()).map(str::to_owned),
     });
     Status {
+        snapshot_revision: next_snapshot_revision(&inner.snapshot_revision),
         current_version: app.package_info().version.to_string(),
         install_kind: kind,
         unavailable: unavailable(kind),
@@ -939,6 +955,7 @@ mod tests {
     fn failed_install_retains_verified_bytes_and_allows_retry() {
         let package = Arc::new(vec![1, 2, 3]);
         let mut inner = Inner {
+            snapshot_revision: Cell::new(0),
             prefs: Prefs { pending: Some(Pending { from: "0.9.0".into(), to: "0.10.0".into() }), ..Prefs::default() },
             phase: Phase::Installing, update: None, package: Some(package.clone()),
             downloaded: 3, total: Some(3), error: None, install_on_close: true,
@@ -959,6 +976,7 @@ mod tests {
     fn download_tickets_do_not_rebind_cancelled_callbacks_to_new_requests() {
         let first = Arc::new(());
         let mut inner = Inner {
+            snapshot_revision: Cell::new(0),
             prefs: Prefs::default(), phase: Phase::Downloading, update: None, package: None,
             downloaded: 0, total: None, error: None, install_on_close: false,
             close_requested: None, notice: None, download: None,
@@ -973,6 +991,22 @@ mod tests {
         assert!(owns_download(&inner, &second));
         inner.download_owner = None; inner.phase = Phase::Ready;
         assert!(!owns_download(&inner, &second));
+    }
+
+    #[test]
+    fn snapshot_revisions_remain_exact_across_reads_and_javascript_integer_boundary() {
+        let sequence = Cell::new(9_007_199_254_740_990);
+        let event = next_snapshot_revision(&sequence);
+        // A later status read must supersede the event even if its phase did
+        // not change; an invoke's delayed response retains the captured text.
+        let read = next_snapshot_revision(&sequence);
+        let completion = next_snapshot_revision(&sequence);
+        assert_eq!(event, "9007199254740991");
+        assert_eq!(read, "9007199254740992");
+        assert_eq!(completion, "9007199254740993");
+        assert_eq!(serde_json::to_string(&completion).unwrap(), "\"9007199254740993\"");
+        sequence.set(u128::MAX);
+        assert_eq!(next_snapshot_revision(&sequence), u128::MAX.to_string(), "never wrap to an older revision");
     }
 
     #[test]

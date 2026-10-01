@@ -633,3 +633,50 @@ mod native_predicate_tests {
             &serde_json::json!({"timestamp":0}).as_object().unwrap().clone()));
     }
 }
+
+#[cfg(test)]
+mod regex_program_reuse_tests {
+    use super::Schema;
+    use crate::query::{prepare, value_matches, Filter};
+    use crate::query_regex::testing;
+
+    fn filter(op: &str, value: &str) -> Filter {
+        Filter { column: "message".into(), op: op.into(), value: value.into(), value2: None }
+    }
+
+    #[test]
+    fn validation_execution_and_sql_planning_share_the_same_ordinary_program() {
+        for (credits, expected) in [(96 << 20, 1), (16 << 20, 8)] {
+            let (_, builds) = testing::run(credits, || {
+                let filters = [filter("regex", r"(?i)failed\s+login")];
+                // The UI and native command each validate before execution.
+                crate::workspace::validate(&filters).unwrap();
+                crate::workspace::validate(&filters).unwrap();
+                for _ in 0..3 {
+                    let pfs = prepare(&filters);
+                    assert!(value_matches(&pfs[0], Some("FAILED login")));
+                    assert!(!value_matches(&pfs[0], Some("successful login")));
+                    // SQL owns another PreparedFilter for its UDF.
+                    let plan = Schema::default().plan(&pfs);
+                    assert!(plan.exact());
+                }
+            });
+            assert_eq!(builds, expected);
+        }
+    }
+
+    #[test]
+    fn expression_literals_and_wildcard_lists_reuse_only_their_programs() {
+        let (_, builds) = testing::run(96 << 20, || {
+            let filters = [filter("query", "message:/alpha/ AND path:adm* AND field:(one* OR two*)")];
+            for _ in 0..3 {
+                crate::workspace::validate(&filters).unwrap();
+                let pfs = prepare(&filters);
+                assert!(pfs[0].expr.is_some());
+                let _plan = Schema::default().plan(&pfs);
+            }
+        });
+        assert_eq!(builds, 4, "the expression is rebuilt; its four immutable programs are reused");
+    }
+
+}

@@ -373,9 +373,11 @@
   }
   let mcpEnabled = true;
   const updateState = { phase: "idle", checkOnStart: true, skippedVersion: null, installOnClose: false, downloaded: 0, total: null, lastCheck: null };
+  let updateSnapshotRevision = 0n;
   const updateStatus = () => {
     const next = window.__mockUpdate, announced = next && updateState.phase !== "idle";
     return {
+      snapshotRevision: String(++updateSnapshotRevision),
       currentVersion: "0.5.1", installKind: "nsis", unavailable: null, blocker: null, needsAdmin: false,
       checkOnStart: updateState.checkOnStart, skippedVersion: updateState.skippedVersion, lastCheck: updateState.lastCheck,
       phase: updateState.phase, available: announced ? { version: next.version, notes: next.notes || null, date: "2026-09-28T12:00:00Z" } : null,
@@ -578,7 +580,10 @@
     // Updates (updates.js): nothing is announced unless a test sets window.__mockUpdate = { version, notes },
     // so the dialog never covers other previews.
     update_status: () => updateStatus(),
-    update_startup: () => (updateState.checkOnStart ? updateCheck() : updateStatus()),
+    update_startup: () => {
+      const notice = window.__mockUpdateNotice || null; window.__mockUpdateNotice = null;
+      return { ...(updateState.checkOnStart ? updateCheck() : updateStatus()), notice };
+    },
     update_check: () => updateCheck(),
     update_download: () => {
       Object.assign(updateState, { phase: "downloading", downloaded: 0, total: 42 * 1048576 });
