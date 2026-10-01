@@ -8,6 +8,7 @@
 //! engine, which also remains the fallback for any engine error.
 mod build;
 mod ops;
+mod sparse_timeline;
 mod sql;
 mod text;
 mod time_index;
@@ -95,23 +96,9 @@ fn catalogs_signature(codes: &CodesConfig, system: &CodesConfig) -> String {
             return sig.clone();
         }
     }
-    let mut hash = Sha256::new();
-    for catalog in [codes, system] {
-        let mut sources: Vec<_> = catalog.sources.iter().collect();
-        sources.sort_by(|a, b| a.0.cmp(b.0));
-        for (source, entries) in sources {
-            let mut entries: Vec<_> = entries.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            for (code, info) in entries {
-                hash.update(format!(
-                    "{source}\u{1}{code}\u{1}{}\u{1}{}\u{2}",
-                    info.name, info.description
-                ));
-            }
-        }
-        hash.update([3u8]);
-    }
-    let sig = format!("{:x}", hash.finalize());
+    // This version intentionally retires catalog-sensitive derived variants
+    // and old page cursors once; immutable base stores do not use this key.
+    let sig = format!("catalog-v2:{}", catalog_content_signature(codes, system));
     *CACHE.lock() = Some((key, sig.clone()));
     sig
 }
@@ -131,7 +118,9 @@ fn catalog_key(codes: &CodesConfig, system: &CodesConfig) -> CatalogKey {
     // Reader threads share source metadata but own catalog snapshots. Their
     // address must not invalidate a completed selection on every iterator pass.
     let mut hash = Sha256::new();
+    hash.update(b"loginsight-catalog-content-v2\0");
     for catalog in [codes, system] {
+        hash.update((catalog.sources.values().map(|entries| entries.len()).sum::<usize>() as u64).to_le_bytes());
         let mut sources: Vec<_> = catalog.sources.iter().collect();
         sources.sort_by(|a, b| a.0.cmp(b.0));
         for (source, entries) in sources {
@@ -147,6 +136,88 @@ fn catalog_key(codes: &CodesConfig, system: &CodesConfig) -> CatalogKey {
         hash.update([255]);
     }
     (CATALOG_EPOCH.load(Ordering::SeqCst), format!("{:x}", hash.finalize()))
+}
+
+/// Content identity for projected-row admission. Length-prefixed values and
+/// explicit catalog boundaries make control characters unambiguous. Compute
+/// under the catalogs' read guards; unlike planner pointer caches this proves
+/// the actual content even before a mutation increments CATALOG_EPOCH.
+pub(crate) fn catalog_content_signature(codes: &CodesConfig, system: &CodesConfig) -> String {
+    catalog_key(codes, system).1
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogToken {
+    pub signature: String,
+    pub epoch: u64,
+}
+
+/// Capture under both catalog read guards. Comparing before/after admission
+/// detects intervening edits even if the catalog content returns to its start.
+pub(crate) fn catalog_token(codes: &CodesConfig, system: &CodesConfig) -> CatalogToken {
+    let (epoch, signature) = catalog_key(codes, system);
+    CatalogToken { signature, epoch }
+}
+
+#[cfg(test)]
+mod catalog_identity_tests {
+    use super::*;
+    use crate::model::CodeInfo;
+
+    fn catalog(name: &str, description: &str) -> CodesConfig {
+        let mut config = CodesConfig::default();
+        config.sources.entry("source".into()).or_default().insert("1".into(), CodeInfo { name: name.into(), description: description.into() });
+        config
+    }
+
+    #[test]
+    fn persisted_catalog_signature_is_unambiguous_and_epoch_aware() {
+        let mut first = catalog("name\u{1}part", "description");
+        let second = catalog("name", "part\u{1}description");
+        let empty = CodesConfig::default();
+        let first_sig = catalogs_signature(&first, &empty);
+        let second_sig = catalogs_signature(&second, &empty);
+        assert!(first_sig.starts_with("catalog-v2:"));
+        assert_ne!(first_sig, second_sig, "separator data must not alias different enrichment");
+        assert_eq!(first_sig, format!("catalog-v2:{}", catalog_content_signature(&first, &empty)));
+        let _ = catalogs_signature(&first, &empty); // seed this pointer/count entry
+        first.sources.get_mut("source").unwrap().get_mut("1").unwrap().description = "changed".into();
+        catalogs_changed();
+        assert_ne!(first_sig, catalogs_signature(&first, &empty));
+        assert_ne!(catalogs_signature(&first, &empty), catalogs_signature(&empty, &first));
+    }
+
+    #[test]
+    fn catalog_token_detects_content_aba_during_admission() {
+        let first = catalog("A", "original");
+        let second = catalog("B", "changed");
+        let empty = CodesConfig::default();
+        let before = catalog_token(&first, &empty);
+        catalogs_changed();
+        let middle = catalog_token(&second, &empty);
+        catalogs_changed();
+        let after = catalog_token(&first, &empty);
+        assert_ne!(before.signature, middle.signature);
+        assert_eq!(before.signature, after.signature);
+        assert_ne!(before.epoch, after.epoch);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn persisted_catalog_signature_is_stable_across_insertion_order() {
+        let mut forward = CodesConfig::default();
+        let mut reverse = CodesConfig::default();
+        for (target, order) in [(&mut forward, ["a", "b"]), (&mut reverse, ["b", "a"])] {
+            for source in order {
+                for code in order {
+                    target.sources.entry(source.into()).or_default().insert(code.into(), CodeInfo { name: code.into(), description: source.into() });
+                }
+            }
+        }
+        let empty = CodesConfig::default();
+        assert_eq!(catalogs_signature(&forward, &empty), catalogs_signature(&reverse, &empty));
+        assert_eq!(catalog_content_signature(&forward, &empty), catalog_content_signature(&reverse, &empty));
+    }
 }
 
 #[derive(Clone)]

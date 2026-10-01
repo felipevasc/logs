@@ -1190,10 +1190,46 @@ fn timeline_session(session: &Session, start: i64, end: i64, width: i64, buckets
     Ok(result)
 }
 
+fn sparse_timeline_session(
+    session: &Session, src: &Source, mask: &crate::analysis_visibility::Mask,
+    plan: super::sparse_timeline::Plan, start: i64, end: i64, width: i64, buckets: usize,
+) -> Result<Option<super::time_index::Histogram>> {
+    let readers = session.exact_time_indexes();
+    let result = super::sparse_timeline::histogram(plan, &src.idx.lines, mask, readers.as_ref(), start, end, width, buckets)?;
+    if result.is_none() {
+        if let Some(readers) = &readers { session.invalidate_exact_times(readers)?; }
+    }
+    Ok(result.map(|(histogram, _work)| histogram))
+}
+
+/// The caller has already bound this mask to the admitted indexed source.
+/// A visible remainder needs only those retained metadata/source/payload leases;
+/// waiting for a Session here would otherwise trigger an unnecessary full scan.
+fn sparse_timeline_query(
+    src: &Source, mask: &crate::analysis_visibility::Mask,
+    plan: super::sparse_timeline::Plan, start: i64, end: i64, width: i64, buckets: usize,
+) -> Result<Option<super::time_index::Histogram>> {
+    if !plan.requires_base() {
+        return Ok(super::sparse_timeline::histogram(
+            plan, &src.idx.lines, mask, None, start, end, width, buckets,
+        )?.map(|(histogram, _work)| histogram));
+    }
+    Ok(analytics_with(src, true, |session|
+        sparse_timeline_session(session, src, mask, plan, start, end, width, buckets)
+    )?.flatten())
+}
+
 /// Optional exact acceleration for the unfiltered indexed timeline. Callers
 /// retain their existing source scan when no complete verified capability exists.
 pub(crate) fn timeline_histogram(src: &Source, start: i64, end: i64, width: i64, buckets: usize) -> Result<Option<super::time_index::Histogram>> {
-    if !crate::analysis_runtime::visibility_unrestricted(src.idx)? { return Ok(None); }
+    if let Some(gate) = crate::analysis_runtime::indexed_gate(src.idx)? {
+        if !gate.is_unrestricted() {
+            if src.idx.lines.len() < super::sparse_timeline::MIN_SOURCE_ROWS { return Ok(None); }
+            let Some(mask) = gate.indexed_mask() else { return Ok(None); };
+            let Some(plan) = super::sparse_timeline::Plan::new(src.idx, mask)? else { return Ok(None); };
+            return sparse_timeline_query(src, mask, plan, start, end, width, buckets);
+        }
+    }
     Ok(analytics_with(src, true, |session| timeline_session(session, start, end, width, buckets))?.flatten())
 }
 
@@ -1276,11 +1312,13 @@ mod exact_time_routing_tests {
         let raw = directory.path().join("source.jsonl");
         std::fs::write(
             &raw,
-            "{\"message\":\"one\"}\n{\"message\":\"two\"}\n{\"message\":\"three\"}\n",
+            "{\"message\":\"one\",\"timestamp\":\"1970-01-01T00:00:10Z\",\"level\":\"ERROR\"}\n{\"message\":\"two\",\"timestamp\":\"1970-01-01T00:00:20Z\",\"level\":\"WARN\"}\n{\"message\":\"three\",\"timestamp\":\"1970-01-01T00:00:30Z\"}\n",
         )
         .unwrap();
         let index =
             crate::sources::index_file(raw.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        assert_eq!(index.lines.iter().map(|row| (row.ts, row.level)).collect::<Vec<_>>(),
+            vec![(10_000, crate::model::LV_ERR), (20_000, crate::model::LV_WARN), (30_000, crate::model::LV_INFO)]);
         let state = AppState {
             source: RwLock::new(SourceData::None),
             source_publication: RwLock::new(Default::default()),
@@ -1359,6 +1397,26 @@ mod exact_time_routing_tests {
                 derived: &[],
             };
             assert_eq!(count_session(&session, &source, &[]).unwrap(), 2);
+            let gate = analysis_runtime::indexed_gate(index).unwrap().unwrap();
+            let mask = gate.indexed_mask().expect("Dataset mask retains its exact positional capability");
+            let plan = super::super::sparse_timeline::Plan::new(index, mask).unwrap().unwrap();
+            assert!(sparse_timeline_session(&session, &source, mask, plan, 1, 40_000, 20_000, 2).unwrap().is_none());
+            let store = directory.path().join("admitted-timeline.duckdb");
+            let producer = duckdb::Connection::open_in_memory().unwrap();
+            producer.execute_batch("SET threads=1; CREATE TABLE ev(lvl UTINYINT, ts BIGINT)").unwrap();
+            for row in index.lines.iter() {
+                producer.execute("INSERT INTO ev VALUES (?, ?)", duckdb::params![row.level, row.ts]).unwrap();
+            }
+            std::fs::write(store.with_extension("complete.json"), json!({"key":"admitted-timeline","rows":3,"version":5}).to_string()).unwrap();
+            let identity = time_index::identity(&store, 3).unwrap();
+            time_index::ensure(&producer, &store, &identity, &|| false).unwrap();
+            *session.time_indexes.write() = Some(vec![time_index::open(&store, &identity).unwrap().unwrap()].into());
+            let visible = sparse_timeline_session(&session, &source, mask, plan, 1, 40_000, 20_000, 2).unwrap().unwrap();
+            assert_eq!((visible.total, visible.errors, visible.warnings), (2, 1, 0));
+            std::fs::OpenOptions::new().write(true).open(time_index::path(&store)).unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3)).unwrap();
+            assert!(sparse_timeline_session(&session, &source, mask, plan, 1, 40_000, 20_000, 2).unwrap().is_none());
+            assert!(session.exact_time_indexes().is_none());
             assert!(count_session(
                 &session,
                 &source,
@@ -1382,7 +1440,53 @@ mod exact_time_routing_tests {
                 count_session(&session, &source, &[]).is_err(),
                 "a cached count must not bypass membership integrity"
             );
+            assert!(sparse_timeline_session(&session, &source, mask, plan, 1, 40_000, 20_000, 2).is_err(),
+                "optional temporal fallback must not bypass changed membership");
         });
+    }
+
+    #[test]
+    fn sparse_visible_timeline_requires_no_session_but_keeps_source_and_cancellation_guards() {
+        use crate::{analysis_context::Snapshot, analysis_visibility::{Cache, SourceSet}, exclusion_store::{self, Admission, Purpose, Work}};
+        let directory = tempfile::tempdir().unwrap();
+        crate::case_store::save_at(directory.path(), json!({"cases":[{"id":"sparse"}]})).unwrap();
+        let initial: Snapshot = serde_json::from_value(
+            crate::case_store::load_at(directory.path()).unwrap()["cases"][0]["analysisContext"].clone(),
+        ).unwrap();
+        let raw = directory.path().join("visible.jsonl");
+        std::fs::write(&raw, "{\"timestamp\":\"1970-01-01T00:00:01Z\"}\n{\"timestamp\":\"1970-01-01T00:00:02Z\"}\n{\"timestamp\":\"1970-01-01T00:00:03Z\",\"level\":\"WARN\"}\n").unwrap();
+        let index = crate::sources::index_file(raw.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        assert_eq!(index.lines.iter().map(|row| row.ts).collect::<Vec<_>>(), vec![1_000, 2_000, 3_000]);
+        let work = Work { cancelled: &|| false, progress: &|_, _, _| {} };
+        let binding = SourceSet::new(&index).unwrap();
+        let staged = exclusion_store::stage(directory.path(), Admission {
+            analysis: initial.identity(), source_receipt: json!({}),
+        }, Purpose::Exclude, binding.descriptors(), [0, 1].map(|row|
+            binding.member_row(&index, row, &Default::default())
+        ), &Default::default(), &work).unwrap();
+        let receipt = exclusion_store::publish(directory.path(), staged, "fixture", "", json!({}), &Default::default(), &work).unwrap();
+        let identity = receipt.analysis_context.identity();
+        let view = exclusion_store::visibility(directory.path(), &identity, &Default::default(), &work).unwrap();
+        let mask = Cache::new().get_or_compile(&index, 1, &identity, &view, &Default::default(), &work).unwrap();
+        let plan = super::super::sparse_timeline::Plan::new(&index, &mask).unwrap().unwrap();
+        assert!(!plan.requires_base());
+        let codes = CodesConfig::default();
+        let source = Source { idx: &index, codes: &codes, system: &codes, derived: &[] };
+        struct EngineRestore(bool);
+        impl Drop for EngineRestore { fn drop(&mut self) { super::super::set_enabled(self.0); } }
+        let _engine = EngineRestore(super::super::ENABLED.load(Ordering::SeqCst));
+        super::super::set_enabled(false);
+        assert!(ready_session(&source, true).unwrap().is_none());
+        let result = sparse_timeline_query(&source, &mask, plan, 1, 4_000, 1_000, 4).unwrap().unwrap();
+        assert_eq!((result.total, result.errors, result.warnings), (1, 0, 1));
+        let token = crate::operations::token(Some("sparse-visible-no-session".into())).unwrap();
+        crate::operations::cancel_id("sparse-visible-no-session");
+        assert!(crate::operations::run_with_token(token, ||
+            sparse_timeline_query(&source, &mask, plan, 1, 4_000, 1_000, 4)
+        ).unwrap_err().contains("cancelad"));
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&raw).unwrap().write_all(b"changed").unwrap();
+        assert!(sparse_timeline_query(&source, &mask, plan, 1, 4_000, 1_000, 4).is_err());
     }
 
     #[test]
@@ -2146,7 +2250,7 @@ fn page_statement(scope: &Scope, sort: &[SortKey], names: bool, seek: &PageSeek,
 /// A required top-level equality bounds the entire conjunction. Only a
 /// complete, canonically verified empty/singleton set may bypass page SQL;
 /// free-text OR/NOT terms never establish this proof.
-fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Option<crate::query::QueryPage>> {
+fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Option<crate::query::SelectedPage>> {
     // Planner invariant: hex_fields contains required top-level equals_exact
     // clauses only. OR/NOT query-expression terms must never enter this list.
     if !pfs.iter().any(|pf| pf.f.op == "equals_exact" && super::text::exact_field_hex_word(&pf.f.value).is_some()) {
@@ -2157,20 +2261,17 @@ fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) ->
     for term in &plan.tests.hex_fields {
         let Some(selected) = exact_hex_selection(session, src, term)? else { continue; };
         if !selected.known_empty && selected.single_id.is_none() { continue; }
-        let mut rows = Vec::new();
+        let mut ids = Vec::new();
         if let Some(id) = selected.single_id.filter(|&id| gate.as_ref().is_none_or(|gate| gate.allows_known_row(id))) {
             crate::operations::check()?;
-            let mut event = src.event(id);
+            let event = src.event(id);
             if pfs.iter().all(|pf| crate::query::matches(&event, pf)) {
-                crate::analysis_runtime::attach_provenance(src.idx, &mut event)?;
-                crate::entities::annotate(&mut event);
-                event.raw.clear();
-                rows.push(event);
+                ids.push(id);
             }
         }
         crate::operations::check()?;
-        return Ok(Some(crate::query::QueryPage {
-            total: Some(rows.len()), rows, has_more: false, next_cursor: None,
+        return Ok(Some(crate::query::SelectedPage {
+            total: Some(ids.len()), ids, has_more: false, next_cursor: None,
             engine: "columnar".into(), warning: None,
         }));
     }
@@ -2188,6 +2289,32 @@ pub(crate) fn query_page(
     limit: usize,
     cursor: Option<&str>,
 ) -> Option<Result<crate::query::QueryPage>> {
+    select_page(src, pfs, sort_column, sort_dir, offset, limit, cursor).map(|result| {
+        let selected = result?;
+        let rows = page_rows(src, selected.ids.clone())?;
+        crate::operations::check()?;
+        Ok(selected.into_full(rows))
+    })
+}
+
+pub(crate) fn query_projected_page(
+    src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str,
+    offset: usize, cursor: Option<&str>, plan: &crate::page_projection::ProjectionPlan,
+) -> Option<Result<crate::page_projection::ProjectedPage>> {
+    select_page(src, pfs, sort_column, sort_dir, offset, plan.limit, cursor).map(|result| {
+        let selected = result?;
+        let items = selected.ids.iter().map(|&id| crate::page_projection::project_indexed_row(
+            src.idx, id, src.codes, src.system, src.derived, plan,
+        )).collect::<Result<Vec<_>>>()?;
+        crate::operations::check()?;
+        plan.finish(selected, items)
+    })
+}
+
+fn select_page(
+    src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize, cursor: Option<&str>,
+) -> Option<Result<crate::query::SelectedPage>> {
     for part in &src.idx.parts {
         if let Err(error) = crate::sources::validate_source(part) { return Some(Err(error)); }
     }
@@ -2247,10 +2374,10 @@ pub(crate) fn query_page(
         let total = if pfs.is_empty() { Some(crate::analysis_runtime::visible_total(src.idx)?) }
             else if !has_more && (position == 0 || !found.is_empty()) { Some(position.saturating_add(found.len())) }
             else { None };
-        let rows = page_rows(src, found.into_iter().map(|(id, _)| id).collect())?;
+        let ids = found.into_iter().map(|(id, _)| id).collect();
         crate::operations::check()?;
-        Ok(crate::query::QueryPage {
-            rows, total, has_more, next_cursor, engine: "columnar".into(),
+        Ok(crate::query::SelectedPage {
+            ids, total, has_more, next_cursor, engine: "columnar".into(),
             warning: (!exact).then(|| "Este filtro exige confirmação nos registros; consultas amplas podem demorar mais.".into()),
         })
     })())
@@ -2349,10 +2476,113 @@ fn page_rows(src: &Source, ids: Vec<usize>) -> Result<Vec<Event>> {
             let mut event = src.event(i);
             crate::analysis_runtime::attach_provenance_with(src.idx, &binding, &mut event)?;
             crate::entities::annotate(&mut event);
-            event.raw.clear();
+            // A page excludes raw text. Clearing it would keep the entire input
+            // allocation alive alongside fields until response serialization.
+            event.raw = String::new();
             Ok(event)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod page_payload_tests {
+    use super::*;
+
+    #[test]
+    fn projected_columnar_pages_share_exact_cursor_and_singleton_selection() {
+        struct Restore(Option<std::ffi::OsString>, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 { Some(value) => std::env::set_var("LOGINSIGHT_ENGINE_DIR", value), None => std::env::remove_var("LOGINSIGHT_ENGINE_DIR") }
+                crate::engine::set_enabled(self.1);
+            }
+        }
+        let _restore = Restore(std::env::var_os("LOGINSIGHT_ENGINE_DIR"), super::super::enabled());
+        let directory = tempfile::tempdir().unwrap();
+        std::env::set_var("LOGINSIGHT_ENGINE_DIR", directory.path().join("engine"));
+        crate::engine::set_enabled(true);
+        let path = directory.path().join("projected-pages.jsonl");
+        let records: Vec<_> = (0..6).map(|i| serde_json::json!({
+            "message": format!("record {i}"), "timestamp": ([Some("1969-12-31T23:59:59.999Z"), None, Some("1970-01-01T00:00:00Z")][i % 3]),
+            "request_id": format!("{i:032x}"), "body": "日".repeat(24_000),
+        }).to_string()).collect();
+        std::fs::write(&path, records.join("\n")).unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let config = CodesConfig::default();
+        crate::engine::prepare(&index, &config, &config, &[], &|_, _| {}).unwrap();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let plan = crate::page_projection::ProjectionPlan::new(crate::page_projection::ProjectionRequest {
+            projection_version: 1, columns: vec!["timestamp".into(), "body".into()], cell_bytes: None, response_bytes: None,
+        }, 2, crate::page_projection::Receipt {
+            analysis_context: crate::analysis_context::Identity { case_id: "test".into(), analysis_id: "analysis".into(), config_revision: 1, visibility_revision: 0 },
+            source_generation: Some(1), case_key: None,
+            case_content_token: None,
+            catalog_signature: crate::engine::catalog_content_signature(&CodesConfig::default(), &CodesConfig::default()),
+            catalog_epoch: crate::engine::catalog_token(&CodesConfig::default(), &CodesConfig::default()).epoch,
+        }).unwrap();
+        for pfs in [Vec::new(), crate::query::prepare(&[crate::query::Filter { column: "request_id".into(), op: "equals_exact".into(), value: format!("{:032x}", 3), value2: None }])] {
+            for direction in ["asc", "desc"] {
+                let mut cursor: Option<String> = None;
+                let mut offset = 0;
+                loop {
+                    let full = query_page(&source, &pfs, "timestamp", direction, offset, 2, cursor.as_deref()).unwrap().unwrap();
+                    let projected = query_projected_page(&source, &pfs, "timestamp", direction, offset, cursor.as_deref(), &plan).unwrap().unwrap();
+                    assert_eq!(projected.items.iter().map(|r| r.row.id).collect::<Vec<_>>(), full.rows.iter().map(|e| e.id).collect::<Vec<_>>());
+                    assert_eq!(projected.total, full.total);
+                    assert_eq!(projected.has_more, full.has_more);
+                    assert_eq!(projected.next_cursor, full.next_cursor);
+                    assert_eq!(projected.warning, full.warning);
+                    if !full.has_more { break; }
+                    offset += full.rows.len();
+                    cursor = full.next_cursor;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hydrated_page_releases_raw_capacity_and_preserves_full_evidence_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wide-page.jsonl");
+        let body = "日".repeat(24_000);
+        let raw = serde_json::to_string(&serde_json::json!({
+            "message":"request", "payload":body, "encoded":"日", "code":200
+        })).unwrap();
+        std::fs::write(&path, format!("{raw}\n")).unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let config = CodesConfig::default();
+        // Legacy regex overlays may replace a field while retaining its exact
+        // original. Typed transform pipelines deliberately reject that collision.
+        let derived = vec![CompiledDerived {
+            name:"payload".into(), source:"encoded".into(),
+            rules:vec![crate::sources::CompiledRule {
+                re:regex::Regex::new("^(.*)$").unwrap(), template:None, filter:None,
+            }], steps:Vec::new(), lookup:None,
+        }];
+        let source = Source { idx:&index, codes:&config, system:&config, derived:&derived };
+        let original = source.event(0);
+        assert!(original.raw.capacity() >= body.len());
+        let rows = page_rows(&source, vec![0]).unwrap();
+        assert_eq!(rows.len(), 1);
+        let event = &rows[0];
+        assert!(event.raw.is_empty());
+        assert_eq!(event.raw.capacity(), 0, "raw must not retain the source record buffer");
+        assert_eq!(event.fields["payload"], Value::from("日"));
+        assert!(matches!(event.derived_originals.get("payload"), Some(crate::model::DerivedOriginal::Present(Value::String(value))) if value == &body));
+        assert_eq!(serde_json::to_value(&event.derived_originals).unwrap(), serde_json::to_value(&original.derived_originals).unwrap());
+        assert_eq!(event.event_ref, original.event_ref);
+        assert!(event.evidence_provenance.is_some());
+        let mut expected = original;
+        crate::analysis_runtime::attach_provenance(&index, &mut expected).unwrap();
+        crate::entities::annotate(&mut expected);
+        expected.raw.clear();
+        assert_eq!(serde_json::to_value(event).unwrap(), serde_json::to_value(expected).unwrap());
+        let recovery = crate::query::query_page_lines(&index, &[], "id", "asc", 0, 1, &config, &config, &derived).unwrap();
+        assert_eq!(recovery.rows.len(), 1);
+        assert_eq!(recovery.rows[0].raw.capacity(), 0);
+        assert_eq!(serde_json::to_value(&recovery.rows[0]).unwrap(), serde_json::to_value(event).unwrap());
+        assert_eq!(source.event(0).raw, raw, "page hydration must not mutate original detail/evidence data");
+    }
 }
 
 pub(crate) fn query(

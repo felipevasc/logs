@@ -140,6 +140,27 @@ impl QueryPage {
     }
 }
 
+/// Exact page membership, shared by full Event and opt-in projected responses.
+/// IDs are memory positions on the memory route and indexed IDs otherwise.
+pub(crate) struct SelectedPage {
+    pub ids: Vec<usize>,
+    pub total: Option<usize>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub engine: String,
+    pub warning: Option<String>,
+}
+impl SelectedPage {
+    pub(crate) fn into_full(self, rows: Vec<Event>) -> QueryPage {
+        QueryPage { rows, total: self.total, has_more: self.has_more,
+            next_cursor: self.next_cursor, engine: self.engine, warning: self.warning }
+    }
+    fn exact(ids: Vec<usize>, total: usize, offset: usize, engine: &str, warning: Option<String>) -> Self {
+        Self { has_more: offset.saturating_add(ids.len()) < total, ids,
+            total: Some(total), next_cursor: None, engine: engine.into(), warning }
+    }
+}
+
 #[derive(Serialize, Default)]
 pub struct AggResult {
     pub columns: Vec<String>,
@@ -401,23 +422,33 @@ pub fn query(
     offset: usize,
     limit: usize,
 ) -> QueryResult {
-    let mut idx = filtered_indices(events, filters);
-    if !sort_column.is_empty() {
-        sort_indices(events, &mut idx, sort_column, sort_dir == "desc");
-    }
-    let total = idx.len();
-    let rows = idx
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|i| {
-            let mut e = events[i].clone();
-            crate::entities::annotate(&mut e);
-            e.raw = String::new();
-            e
-        })
-        .collect();
-    QueryResult { total, rows }
+    let selected = select_memory_page(events, filters, sort_column, sort_dir, offset, limit);
+    let rows = selected.ids.into_iter().map(|i| {
+        let mut event = events[i].clone();
+        crate::entities::annotate(&mut event);
+        event.raw = String::new();
+        event
+    }).collect();
+    QueryResult { total: selected.total.unwrap_or(0), rows }
+}
+
+fn select_memory_page(events: &[Event], filters: &[Filter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize) -> SelectedPage {
+    let mut ids = filtered_indices(events, filters);
+    if !sort_column.is_empty() { sort_indices(events, &mut ids, sort_column, sort_dir == "desc"); }
+    let total = ids.len();
+    SelectedPage::exact(ids.into_iter().skip(offset).take(limit).collect(), total, offset, "memory", None)
+}
+
+pub(crate) fn query_projected_memory(events: &[Event], filters: &[Filter], sort_column: &str,
+    sort_dir: &str, offset: usize, plan: &crate::page_projection::ProjectionPlan,
+) -> Result<crate::page_projection::ProjectedPage, String> {
+    let selected = select_memory_page(events, filters, sort_column, sort_dir, offset, plan.limit);
+    let items = selected.ids.iter().map(|&i| {
+        crate::operations::check()?;
+        plan.project_memory(&events[i])
+    }).collect::<Result<Vec<_>, String>>()?;
+    plan.finish(selected, items)
 }
 
 fn query_from_memory_matches(
@@ -439,7 +470,7 @@ fn query_from_memory_matches(
         .map(|i| {
             let mut event = events[i].clone();
             crate::entities::annotate(&mut event);
-            event.raw.clear();
+            event.raw = String::new();
             event
         })
         .collect();
@@ -731,24 +762,90 @@ pub(crate) fn push_collected_id(ids: &mut Vec<usize>, id: usize) -> Result<(), S
     ids.push(id);
     Ok(())
 }
-/// Account owned event strings/containers without serializing a second copy.
+/// Estimate owned event payload without serializing a second copy. This includes
+/// retained string capacity and overlay provenance, not all allocator/RSS costs.
 pub(crate) fn event_payload_bytes(event: &Event) -> usize {
     fn value_bytes(value: &Value) -> usize {
         match value {
-            Value::String(value) => value.len().saturating_add(32),
+            Value::String(value) => value.capacity().saturating_add(32),
             Value::Array(values) => values.iter().fold(32usize, |n, v| n.saturating_add(value_bytes(v))),
-            Value::Object(values) => values.iter().fold(32usize, |n, (k, v)| n.saturating_add(k.len()).saturating_add(64).saturating_add(value_bytes(v))),
+            Value::Object(values) => values.iter().fold(32usize, |n, (k, v)| n.saturating_add(k.capacity()).saturating_add(64).saturating_add(value_bytes(v))),
             _ => 32,
         }
     }
     [&event.event_ref, &event.parse_status, &event.source, &event.level, &event.code, &event.name, &event.description, &event.message, &event.raw]
-        .iter().fold(std::mem::size_of::<Event>(), |n, v| n.saturating_add(v.len()))
-        .saturating_add(event.fields.iter().fold(0usize, |n, (k, v)| n.saturating_add(k.len()).saturating_add(64).saturating_add(value_bytes(v))))
-        .saturating_add(event.evidence_provenance.as_ref().map_or(0, |proof| {
-            proof.source.version.len().saturating_add(proof.source.record_space.len()).saturating_add(proof.source.label.len())
-                .saturating_add(proof.source.event_ref_prefix.as_ref().map_or(0, String::len))
-                .saturating_add(match &proof.locator { crate::exclusion_store::Locator::StableRecord(key) => key.len(), _ => 0 }).saturating_add(128)
+        .iter().fold(std::mem::size_of::<Event>(), |n, v| n.saturating_add(v.capacity()))
+        .saturating_add(event.fields.iter().fold(0usize, |n, (k, v)| n.saturating_add(k.capacity()).saturating_add(64).saturating_add(value_bytes(v))))
+        .saturating_add(event.derived_originals.iter().fold(0usize, |n, (key, original)| {
+            n.saturating_add(key.capacity()).saturating_add(64).saturating_add(match original {
+                crate::model::DerivedOriginal::Missing => 32,
+                crate::model::DerivedOriginal::Present(value) => value_bytes(value),
+            })
         }))
+        .saturating_add(event.derived_diagnostics.capacity().saturating_mul(std::mem::size_of::<crate::model::DerivedDiagnostic>()))
+        .saturating_add(event.derived_diagnostics.iter().fold(0usize, |n, diagnostic| {
+            n.saturating_add(diagnostic.field.capacity()).saturating_add(diagnostic.code.capacity()).saturating_add(diagnostic.message.capacity())
+        }))
+        .saturating_add(event.evidence_provenance.as_ref().map_or(0, |proof| {
+            proof.source.version.capacity().saturating_add(proof.source.record_space.capacity()).saturating_add(proof.source.label.capacity())
+                .saturating_add(proof.source.event_ref_prefix.as_ref().map_or(0, String::capacity))
+                .saturating_add(match &proof.locator { crate::exclusion_store::Locator::StableRecord(key) => key.capacity(), _ => 0 }).saturating_add(128)
+        }))
+}
+
+#[cfg(test)]
+mod event_payload_budget_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_derived_originals_and_diagnostics_share_the_event_budget() {
+        let mut event = Event::empty();
+        event.fields.insert("payload".into(), Value::from("small replacement"));
+        let baseline = event_payload_bytes(&event);
+        event.derived_originals.insert("payload".into(), crate::model::DerivedOriginal::Present(
+            serde_json::json!({"nested":["日".repeat(24_000), {"original":"x".repeat(4_096)}]})
+        ));
+        event.derived_originals.insert("new_child".into(), crate::model::DerivedOriginal::Missing);
+        event.derived_diagnostics.push(crate::model::DerivedDiagnostic {
+            field:"payload".into(), code:"transform_input_limit".into(), message:"d".repeat(8_192), warning:false,
+        });
+        let before = serde_json::to_value(&event).unwrap();
+        let measured = event_payload_bytes(&event);
+        assert!(measured >= baseline + 72_000 + 4_096 + 8_192);
+        let mut budget = AnalyticsBudget { used:0, limit:32 << 10 };
+        assert!(budget.charge(measured).is_err());
+        assert_eq!(serde_json::to_value(&event).unwrap(), before, "accounting cannot strip evidence or diagnostics");
+    }
+
+    #[test]
+    fn retained_empty_string_capacity_remains_accounted_until_released() {
+        let mut event = Event::empty();
+        let baseline = event_payload_bytes(&event);
+        event.raw = "x".repeat(64 << 10);
+        event.raw.clear();
+        assert!(event_payload_bytes(&event) >= baseline + (64 << 10));
+        event.raw = String::new();
+        assert_eq!(event_payload_bytes(&event), baseline);
+    }
+
+    #[test]
+    fn memory_page_routes_release_raw_without_mutating_saved_evidence() {
+        let mut original = Event::empty();
+        original.raw = "x".repeat(64 << 10);
+        original.fields.insert("body".into(), Value::from("日".repeat(1_024)));
+        original.event_ref = "saved:1".into();
+        let events = vec![original];
+        let before = serde_json::to_value(&events).unwrap();
+        for page in [query(&events, &[], "id", "asc", 0, 1), query_from_memory_matches(&events, vec![0], "id", "asc", 0, 1)] {
+            assert_eq!(page.rows.len(), 1);
+            assert!(page.rows[0].raw.is_empty());
+            assert_eq!(page.rows[0].raw.capacity(), 0);
+            assert_eq!(page.rows[0].fields["body"], events[0].fields["body"]);
+            assert_eq!(page.rows[0].event_ref, events[0].event_ref);
+        }
+        assert_eq!(serde_json::to_value(&events).unwrap(), before);
+        assert_eq!(events[0].raw.len(), 64 << 10);
+    }
 }
 pub fn indexed_matches(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> Result<Vec<usize>, String> {
     if filters.is_empty() {
@@ -1098,6 +1195,24 @@ pub(crate) fn query_page_lines(
     offset: usize, limit: usize, codes: &CodesConfig, system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Result<QueryPage, String> {
+    let selected = select_page_lines(idx, filters, sort_column, sort_dir, offset, limit, codes, system, derived)?;
+    let binding = crate::analysis_runtime::source_set(idx)?;
+    let rows = selected.ids.iter().map(|&id| {
+        let mut event = event_at(idx, id, codes, system, derived);
+        crate::analysis_runtime::attach_provenance_with(idx, &binding, &mut event)?;
+        crate::entities::annotate(&mut event);
+        event.raw = String::new();
+        Ok(event)
+    }).collect::<Result<Vec<_>, String>>()?;
+    Ok(selected.into_full(rows))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_page_lines(
+    idx: &FileIndex, filters: &[Filter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize, codes: &CodesConfig, system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> Result<SelectedPage, String> {
     for part in &idx.parts { crate::sources::validate_source(part)?; }
     const WINDOW: usize = 10_000;
     const KEY_BUDGET: usize = 32 << 20;
@@ -1148,17 +1263,30 @@ pub(crate) fn query_page_lines(
         }
     }
     crate::operations::check()?;
-    let binding = crate::analysis_runtime::source_set(idx)?;
-    let rows = selected.into_sorted_vec().into_iter().skip(offset).take(limit).map(|row| {
-        let mut event = event_at(idx, row.id, codes, system, derived);
-        crate::analysis_runtime::attach_provenance_with(idx, &binding, &mut event)?;
-        crate::entities::annotate(&mut event);
-        event.raw.clear();
-        Ok(event)
-    }).collect::<Result<Vec<_>, String>>()?;
-    Ok(QueryPage::from_exact(QueryResult { total, rows }, offset, "lines", Some(
+    let ids = selected.into_sorted_vec().into_iter().skip(offset).take(limit).map(|row| row.id).collect();
+    Ok(SelectedPage::exact(ids, total, offset, "lines", Some(
         "Modo de recuperação: índice indisponível, leitura mais lenta e navegação limitada a 10 mil registros.".into(),
     )))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn query_projected_indexed(
+    idx: &FileIndex, filters: &[Filter], sort_column: &str, sort_dir: &str,
+    offset: usize, cursor: Option<&str>, codes: &CodesConfig, system: &CodesConfig,
+    derived: &[CompiledDerived], plan: &crate::page_projection::ProjectionPlan,
+) -> Result<crate::page_projection::ProjectedPage, String> {
+    let _interactive = crate::operations::interactive();
+    if let Some(result) = crate::engine::query_projected_page(
+        &engine_source(idx, codes, system, derived), &prepare(filters),
+        sort_column, sort_dir, offset, cursor, plan,
+    ) { return result; }
+    if cursor.is_some() {
+        return Err("PAGINATION_RESET_REQUIRED: O índice desta paginação não está disponível. Recarregue a primeira página para usar a recuperação.".into());
+    }
+    let selected = select_page_lines(idx, filters, sort_column, sort_dir, offset, plan.limit, codes, system, derived)?;
+    let items = selected.ids.iter().map(|&id| crate::page_projection::project_indexed_row(idx, id, codes, system, derived, plan))
+        .collect::<Result<Vec<_>, String>>()?;
+    plan.finish(selected, items)
 }
 
 fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
@@ -1825,4 +1953,87 @@ pub fn stats_indexed(
     sort_levels(&mut levels);
     crate::operations::check()?;
     Ok(build_stats(buckets, bucket_ms, levels))
+}
+
+#[cfg(test)]
+mod projected_page_parity_tests {
+    use super::*;
+    use crate::page_projection::{ProjectionPlan, ProjectionRequest, Receipt};
+
+    fn plan(columns: &[&str], limit: usize) -> ProjectionPlan {
+        ProjectionPlan::new(ProjectionRequest {
+            projection_version: 1, columns: columns.iter().map(|s| s.to_string()).collect(),
+            cell_bytes: None, response_bytes: None,
+        }, limit, Receipt {
+            analysis_context: crate::analysis_context::Identity { case_id: "test".into(), analysis_id: "test-analysis".into(), config_revision: 1, visibility_revision: 0 },
+            source_generation: Some(1), case_key: None,
+            case_content_token: None,
+            catalog_signature: crate::engine::catalog_content_signature(&CodesConfig::default(), &CodesConfig::default()),
+            catalog_epoch: crate::engine::catalog_token(&CodesConfig::default(), &CodesConfig::default()).epoch,
+        }).unwrap()
+    }
+
+    #[test]
+    fn projected_memory_uses_full_page_filter_order_and_count() {
+        let events: Vec<_> = [Some(-1), None, Some(0), Some(1)].into_iter().enumerate().map(|(i, timestamp)| {
+            let mut event = Event::empty();
+            event.id = 10 + i;
+            event.event_ref = format!("memory:{i}");
+            event.timestamp = timestamp;
+            event.fields.insert("value".into(), serde_json::json!((["10", "2", "11x", "1"][i])));
+            event.fields.insert("structured".into(), serde_json::json!({"n": i, "null": null}));
+            event
+        }).collect();
+        let filters = [Filter { column: "id".into(), op: "gte".into(), value: "11".into(), value2: None }];
+        for column in ["id", "timestamp", "value"] {
+            for direction in ["asc", "desc"] {
+                for offset in [0, 1, 4] {
+                    let full = query(&events, &filters, column, direction, offset, 2);
+                    let projected = query_projected_memory(&events, &filters, column, direction, offset, &plan(&["timestamp", "structured"], 2)).unwrap();
+                    assert_eq!(projected.items.iter().map(|r| r.row.id).collect::<Vec<_>>(), full.rows.iter().map(|e| e.id).collect::<Vec<_>>());
+                    assert_eq!(projected.total, Some(full.total));
+                    assert_eq!(projected.has_more, offset + full.rows.len() < full.total);
+                    assert!(projected.next_cursor.is_none());
+                    for (item, event) in projected.items.iter().zip(&full.rows) {
+                        assert_eq!(item.row.event_ref, event.event_ref);
+                        assert_eq!(serde_json::to_value(&item.cells[1]).unwrap()["value"], event.fields["structured"]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn projected_line_selection_preserves_order_and_wide_row_membership() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("projected-lines.jsonl");
+        let raw = [serde_json::json!({"message":"first", "timestamp":"1969-12-31T23:59:59.999Z", "body":"x".repeat(64 << 10)}),
+            serde_json::json!({"message":"second", "timestamp": null, "body": {"nested": true}}),
+            serde_json::json!({"message":"third", "timestamp":"1970-01-01T00:00:00Z", "body": ""})];
+        std::fs::write(&path, raw.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let config = CodesConfig::default();
+        for direction in ["asc", "desc"] {
+            let full = query_page_lines(&index, &[], "timestamp", direction, 0, 2, &config, &config, &[]).unwrap();
+            let selected = select_page_lines(&index, &[], "timestamp", direction, 0, 2, &config, &config, &[]).unwrap();
+            let plan = plan(&["message", "body"], 2);
+            let items = selected.ids.iter().map(|&id| crate::page_projection::project_indexed_row(&index, id, &config, &config, &[], &plan).unwrap()).collect();
+            let projected = plan.finish(selected, items).unwrap();
+            assert_eq!(projected.items.iter().map(|r| r.row.id).collect::<Vec<_>>(), full.rows.iter().map(|e| e.id).collect::<Vec<_>>());
+            assert_eq!(projected.total, full.total);
+            assert_eq!(projected.has_more, full.has_more);
+            assert_eq!(projected.next_cursor, full.next_cursor);
+            assert_eq!(projected.engine, full.engine);
+            assert_eq!(projected.warning, full.warning);
+        }
+        // Membership is known from metadata, so an over-wide original can
+        // retain its exact ordinary source handle without source hydration.
+        let wide_path = directory.path().join("too-wide.jsonl");
+        std::fs::write(&wide_path, serde_json::json!({"message":"wide", "body":"x".repeat((2 << 20) + 1)}).to_string()).unwrap();
+        let wide = crate::sources::index_file(wide_path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let plan = plan(&["message"], 1);
+        let projected = crate::page_projection::project_indexed_row(&wide, 0, &config, &config, &[], &plan).unwrap();
+        assert_eq!(projected.row.event_ref, event_at(&wide, 0, &config, &config, &[]).event_ref);
+        assert!(matches!(projected.cells[0], crate::page_projection::Cell::Unavailable { reason: "record_too_wide" }));
+    }
 }

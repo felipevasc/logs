@@ -165,10 +165,11 @@ impl Schema {
     /// guaranteed to contribute that token, including within a UUID.
     /// Metadata, role aliases, skipped path fields and structured values do
     /// not have that coverage proof and retain their existing SQL predicate.
+    /// A dot in an exact stored key is literal here (`Event::col_ref`), not
+    /// query-language nested traversal; the full key must exist in `fields`.
     fn exact_hex_field(&self, column: &str, value: &str) -> bool {
         super::text::exact_field_hex_word(value).is_some()
             && !column.starts_with(['@', '_'])
-            && !column.contains('.')
             && !matches!(column, "id" | "event_ref" | "timestamp" | "source" | "level" | "code" | "name" | "description" | "message" | "raw" | "arquivo" | "caminho")
             && self.fields.contains_key(column)
             && !self.structured.contains(column)
@@ -441,7 +442,7 @@ mod native_predicate_tests {
         assert!(plan.exact());
         assert_eq!(plan.tests.hex_fields.len(), 1);
         assert!(plan.tests.hex_fields[0].fallback_sql.contains("w0 ="));
-        for column in ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw", "arquivo", "caminho", "@user", "nested.id", "_meta"] {
+        for column in ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw", "arquivo", "caminho", "@user", "_meta"] {
             schema.fields.insert(column.into(), "w1".into());
             assert!(!schema.exact_hex_field(column, hex), "{column}");
         }
@@ -454,6 +455,55 @@ mod native_predicate_tests {
         assert!(schema.plan(&[filter("trace_id", "not_equals_exact", hex, None)]).tests.hex_fields.is_empty());
         schema.structured.insert("trace_id".into());
         assert!(!schema.exact_hex_field("trace_id", hex));
+    }
+
+    #[test]
+    fn dotted_hex_equality_requires_the_exact_stored_scalar_key() {
+        let mut schema = Schema::default();
+        let hex = "0123456789abcdef0123456789abcdef";
+        schema.fields.insert("trace.id".into(), "w0".into());
+        schema.fields.insert("Trace.ID".into(), "w1".into());
+        schema.fields.insert("trace".into(), "w2".into());
+        // A structured parent cannot manufacture a literal child column. It
+        // also cannot hide a separately stored exact child key.
+        schema.structured.insert("trace".into());
+        for (column, sql_column) in [("trace.id", "w0"), ("Trace.ID", "w1")] {
+            let plan = schema.plan(&[filter(column, "equals_exact", hex, None)]);
+            assert!(plan.exact());
+            assert_eq!(plan.tests.hex_fields.len(), 1);
+            let candidate = &plan.tests.hex_fields[0];
+            assert_eq!(candidate.filter.f.column, column);
+            assert_eq!(candidate.fallback_sql, format!("({sql_column} = '{hex}')"));
+        }
+        for column in ["trace.ID", "trace.nested.id", "missing.child", "@trace.id", "_trace.id"] {
+            assert!(!schema.exact_hex_field(column, hex), "{column}");
+        }
+        schema.structured.insert("trace.id".into());
+        assert!(schema.plan(&[filter("trace.id", "equals_exact", hex, None)]).tests.hex_fields.is_empty());
+        assert!(schema.exact_hex_field("Trace.ID", hex));
+    }
+
+    #[test]
+    fn dotted_query_expression_terms_never_establish_required_hex_equality() {
+        let mut schema = Schema::default();
+        let hex = "0123456789abcdef0123456789abcdef";
+        schema.fields.insert("trace.id".into(), "w0".into());
+        for op in ["equals", "not_equals_exact", "contains", "in_exact"] {
+            assert!(schema.plan(&[filter("trace.id", op, hex, None)]).tests.hex_fields.is_empty(), "{op}");
+        }
+        for expression in [
+            format!("trace.id:\"{hex}\""),
+            format!("NOT trace.id:\"{hex}\""),
+            format!("trace.id:\"{hex}\" OR source:other"),
+            format!("NOT (trace.id:\"{hex}\" OR NOT source:other)"),
+            format!("trace.id:\"{hex}\" AND source:other"),
+        ] {
+            let query = filter("_all", "query", &expression, None);
+            assert!(query.expr.is_some(), "fixture must compile: {expression}");
+            assert!(schema.plan(std::slice::from_ref(&query)).tests.hex_fields.is_empty(), "{expression}");
+            let plan = schema.plan(&[filter("trace.id", "equals_exact", hex, None), query]);
+            assert_eq!(plan.tests.hex_fields.len(), 1, "only the required top-level equality: {expression}");
+        }
     }
 
     #[test]

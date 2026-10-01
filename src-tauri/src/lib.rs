@@ -44,6 +44,8 @@ mod journeys;
 mod mcp;
 mod model;
 mod operations;
+mod page_projection;
+mod projection_commands;
 mod pivots;
 mod query;
 mod querylang;
@@ -1990,6 +1992,13 @@ pub(crate) fn get_codes_impl(state: &AppState) -> String {
     serde_json::to_string_pretty(&*state.codes.read()).unwrap_or_default()
 }
 
+// Catalog publication includes Memory enrichment. Projection readers must not
+// bind a receipt between the catalog swap and that associated publication.
+static CATALOG_PUBLICATION: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+pub(crate) fn catalog_read_guard() -> Result<parking_lot::RwLockReadGuard<'static, ()>, String> {
+    CATALOG_PUBLICATION.try_read().ok_or_else(|| "CATALOG_UPDATE_PENDING: O catálogo está sendo atualizado. Aguarde e recarregue a consulta.".into())
+}
+
 #[tauri::command]
 async fn save_codes(text: String, app: AppHandle) -> Result<(), String> {
     offload(move || {
@@ -2001,6 +2010,7 @@ async fn save_codes(text: String, app: AppHandle) -> Result<(), String> {
 
 pub(crate) fn save_codes_impl(state: &AppState, text: &str) -> Result<(), String> {
     let cfg: CodesConfig = serde_json::from_str(text).map_err(|e| format!("JSON inválido: {e}"))?;
+    let _publication = CATALOG_PUBLICATION.write();
     std::fs::write(&state.codes_path, text).map_err(|e| format!("Falha ao gravar: {e}"))?;
     *state.codes.write() = cfg;
     engine::catalogs_changed();
@@ -2014,6 +2024,7 @@ pub(crate) fn save_codes_impl(state: &AppState, text: &str) -> Result<(), String
             ev.enrich(&codes, &system);
         }
     }
+    engine::catalogs_changed();
     Ok(())
 }
 
@@ -2036,9 +2047,14 @@ async fn harvest_codes(app: AppHandle) -> Result<HarvestSummary, String> {
 pub(crate) fn harvest_codes_impl(state: &AppState) -> Result<HarvestSummary, String> {
     let (cfg, count) = sources::harvest_system_codes()?;
     let sources = cfg.sources.len();
-    if let Ok(text) = serde_json::to_string(&cfg) {
-        let _ = std::fs::write(&state.system_codes_path, text);
-    }
+    publish_system_catalog(state, cfg)?;
+    Ok(HarvestSummary { count, sources })
+}
+
+fn publish_system_catalog(state: &AppState, cfg: CodesConfig) -> Result<(), String> {
+    let _publication = CATALOG_PUBLICATION.write();
+    let text = serde_json::to_string(&cfg).map_err(|e| e.to_string())?;
+    std::fs::write(&state.system_codes_path, text).map_err(|e| format!("Falha ao gravar catálogo: {e}"))?;
     *state.system_codes.write() = cfg;
     engine::catalogs_changed();
     // Re-enriquece eventos em memória (fontes indexadas enriquecem sob demanda).
@@ -2051,7 +2067,8 @@ pub(crate) fn harvest_codes_impl(state: &AppState) -> Result<HarvestSummary, Str
             ev.enrich(&codes, &system);
         }
     }
-    Ok(HarvestSummary { count, sources })
+    engine::catalogs_changed();
+    Ok(())
 }
 
 #[tauri::command]
@@ -2194,11 +2211,9 @@ pub fn run() {
                 std::thread::spawn(move || {
                     if let Ok((cfg, _)) = sources::harvest_system_codes() {
                         let state = handle.state::<AppState>();
-                        if let Ok(text) = serde_json::to_string(&cfg) {
-                            let _ = std::fs::write(&state.system_codes_path, text);
+                        if let Err(error) = publish_system_catalog(state.inner(), cfg) {
+                            eprintln!("[catálogo] {error}");
                         }
-                        *state.system_codes.write() = cfg;
-                        engine::catalogs_changed();
                     }
                 });
             }
@@ -2302,6 +2317,9 @@ pub fn run() {
             reference_commands::reference_list,
             reference_commands::reference_remove,
             reference_commands::reference_save_lookup,
+            projection_commands::query_projected_page,
+            projection_commands::hydrate_projected_rows,
+            projection_commands::hydrate_projected_field,
             analysis_runtime::exclusion_visibility,
             exclusion_commands::exclusion_capabilities,
             exclusion_commands::exclusion_preview,

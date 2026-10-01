@@ -46,6 +46,8 @@ pub(crate) struct Admitted {
     pub identity: Option<Identity>,
     pub source_generation: Option<u64>,
     pub case_key: Option<String>,
+    pub case_content_token: Option<String>,
+    case_cache_bound: bool,
     mode: Mode,
     source: Option<Arc<SourceData>>,
     names: Vec<String>,
@@ -68,6 +70,8 @@ pub(crate) struct RowGate {
     unavailable_members: Option<u64>,
     keep: Arc<dyn Fn(usize) -> bool + Send + Sync>,
     verify: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    /// Only Dataset admission exposes an exact positional active-union mask.
+    indexed_mask: Option<Arc<crate::analysis_visibility::Mask>>,
 }
 impl RowGate {
     fn new(
@@ -86,6 +90,7 @@ impl RowGate {
             unavailable_members,
             keep: Arc::new(keep),
             verify: Arc::new(verify),
+            indexed_mask: None,
         })
     }
     pub(crate) fn allows(&self, row: usize) -> Result<bool, String> {
@@ -102,6 +107,9 @@ impl RowGate {
     }
     pub(crate) fn is_unrestricted(&self) -> bool {
         self.visible == self.rows
+    }
+    pub(crate) fn indexed_mask(&self) -> Option<&crate::analysis_visibility::Mask> {
+        self.indexed_mask.as_deref()
     }
     fn validate(&self) -> Result<(), String> {
         (self.verify)()
@@ -525,6 +533,8 @@ pub(crate) fn capture(
         identity,
         source_generation: generation,
         case_key: None,
+        case_content_token: None,
+        case_cache_bound: false,
         mode,
         source,
         names,
@@ -548,6 +558,7 @@ pub(crate) fn capture_case(
     key: Option<String>,
 ) -> Result<(Arc<Admitted>, Option<Vec<Event>>), String> {
     let case = events.is_some() || key.is_some();
+    let cache_bound = events.is_none() && key.is_some();
     if case && identity.is_none() {
         return Err("Informe a identidade do Caso antes de consultar suas evidências.".into());
     }
@@ -558,7 +569,10 @@ pub(crate) fn capture_case(
         if case { Mode::Case } else { Mode::Dataset },
     )?;
     Arc::get_mut(&mut admitted).expect("new admission").case_key = key.clone();
-    let events = crate::case_cache::take_for(events, key, admitted.identity.as_ref())?;
+    let (events, content_token) = crate::case_cache::take_for_with_token(events, key, admitted.identity.as_ref())?;
+    let captured = Arc::get_mut(&mut admitted).expect("new admission");
+    captured.case_content_token = content_token;
+    captured.case_cache_bound = cache_bound;
     Ok((admitted, events))
 }
 
@@ -714,13 +728,16 @@ fn indexed_row_gate(mask: Arc<crate::analysis_visibility::Mask>) -> Result<Arc<R
         .checked_sub(mask.cardinality())
         .ok_or("Máscara excede a fonte admitida.")?;
     let lease = Arc::clone(&mask);
-    Ok(Arc::new(RowGate::new(
+    let indexed_mask = Arc::clone(&mask);
+    let mut gate = RowGate::new(
         rows,
         visible,
         Some(mask.ignored_members()),
         move |row| !mask.contains_row(row),
         move || lease.validate(),
-    )?))
+    )?;
+    gate.indexed_mask = Some(indexed_mask);
+    Ok(Arc::new(gate))
 }
 fn evidence_row_gate(
     mask: Arc<crate::analysis_visibility::EvidenceMask>,
@@ -905,7 +922,19 @@ impl Admitted {
         );
     }
 
+    fn validate_case_publication(&self) -> Result<(), String> {
+        if self.case_cache_bound {
+            crate::case_cache::validate_token(
+                self.case_key.as_deref().ok_or(STALE)?,
+                self.case_content_token.as_deref().ok_or(STALE)?,
+                self.identity.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_visibility(&self) -> Result<(), String> {
+        self.validate_case_publication()?;
         if let Some(error) = self.failure.lock().clone() {
             return Err(error);
         }
@@ -968,6 +997,7 @@ impl Admitted {
     /// Validate once before execution. The immutable snapshot remains valid if
     /// another request publishes a source/config while this query is running.
     pub(crate) fn validate(&self, state: &AppState) -> Result<(), String> {
+        self.validate_case_publication()?;
         if let Some(identity) = &self.identity {
             validate_identity(identity)?;
         } else if analysis_context::active_snapshot()?.is_some() {
@@ -1417,8 +1447,8 @@ pub(crate) fn cache_namespace() -> String {
     current()
         .map(|admitted| {
             format!(
-                "{:?}|{:?}|{:?}",
-                admitted.identity, admitted.source_generation, admitted.case_key
+                "{:?}|{:?}|{:?}|{:?}",
+                admitted.identity, admitted.source_generation, admitted.case_key, admitted.case_content_token
             )
         })
         .unwrap_or_default()

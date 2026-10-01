@@ -636,6 +636,66 @@ fn reference(
     ))
 }
 
+/// Work performed by a positional mask visit; no row IDs are retained.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RowVisit {
+    pub bitmap_words: usize,
+    pub rows: usize,
+}
+
+/// Iterate one side of a verified dense mask without inspecting source metadata.
+/// Keep the domain/cardinality checks here so optional consumers cannot silently
+/// accept a truncated mask, trailing bits, or a mismatched stored cardinality.
+fn visit_mask_rows(
+    bits: &[u64],
+    rows: usize,
+    cardinality: usize,
+    excluded: bool,
+    limit: usize,
+    cancelled: &dyn Fn() -> bool,
+    mut visit: impl FnMut(usize) -> Result<(), String>,
+) -> Result<Option<RowVisit>, String> {
+    let check = || {
+        if cancelled() { Err("Operação cancelada.".to_string()) } else { Ok(()) }
+    };
+    check()?;
+    let visible = rows.checked_sub(cardinality).ok_or("Máscara excede a fonte admitida.")?;
+    let expected = if excluded { cardinality } else { visible };
+    // Decide density before touching bitmap words or invoking the metadata reader.
+    if expected > limit { return Ok(None); }
+    let words = rows.div_ceil(64);
+    if !(bits.len() == words || bits.is_empty() && cardinality == 0) {
+        return Err("Tamanho da máscara diverge da fonte admitida.".into());
+    }
+    let mut work = RowVisit::default();
+    for word_index in 0..words {
+        if word_index % 256 == 0 { check()?; }
+        let remaining = rows - word_index * 64;
+        let valid = if remaining >= 64 { u64::MAX } else { (1u64 << remaining) - 1 };
+        let original = bits.get(word_index).copied().unwrap_or(0);
+        work.bitmap_words += usize::from(!bits.is_empty());
+        if original & !valid != 0 {
+            return Err("Máscara contém registros fora da fonte admitida.".into());
+        }
+        let mut selected = if excluded { original } else { !original & valid };
+        while selected != 0 {
+            if work.rows % 256 == 0 { check()?; }
+            if work.rows >= expected {
+                return Err("Contagem da máscara diverge da fonte admitida.".into());
+            }
+            let bit = selected.trailing_zeros() as usize;
+            selected &= selected - 1;
+            visit(word_index * 64 + bit)?;
+            work.rows += 1;
+        }
+    }
+    check()?;
+    if work.rows != expected {
+        return Err("Contagem da máscara diverge da fonte admitida.".into());
+    }
+    Ok(Some(work))
+}
+
 pub struct Mask {
     identity: Identity,
     source_generation: u64,
@@ -687,6 +747,17 @@ impl Mask {
         } else {
             Ok(self.contains_row(row))
         }
+    }
+    /// Visit at most `limit` selected positional rows, reading only mask words
+    /// to locate them. The caller retains this mask and validates its leases.
+    pub(crate) fn visit_rows(
+        &self,
+        excluded: bool,
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+        visit: impl FnMut(usize) -> Result<(), String>,
+    ) -> Result<Option<RowVisit>, String> {
+        visit_mask_rows(&self.bits, self.rows, self.cardinality, excluded, limit, cancelled, visit)
     }
     /// Validate once at query admission/cache reuse, never inside the row UDF.
     pub fn validate(&self) -> Result<(), String> {
@@ -1415,6 +1486,61 @@ mod tests {
     fn event(reference: &str) -> crate::model::Event {
         serde_json::from_value(json!({"id":99,"event_ref":reference,"timestamp":null,"source":"s","level":"Informação","code":"200","name":"","description":"","message":"record","raw":"","fields":{}})).unwrap()
     }
+    #[test]
+    fn sparse_mask_visits_complements_tail_bits_and_stored_cardinality() {
+        for rows in [0usize, 1, 63, 64, 65, 131] {
+            let mut bits = vec![0u64; rows.div_ceil(64)];
+            let hidden: Vec<_> = (0..rows).filter(|row| row % 3 == 0).collect();
+            for &row in &hidden { bits[row / 64] |= 1 << (row % 64); }
+            for excluded in [false, true] {
+                let expected: Vec<_> = (0..rows).filter(|row| hidden.contains(row) == excluded).collect();
+                let mut actual = Vec::new();
+                let work = visit_mask_rows(&bits, rows, hidden.len(), excluded, 256, &|| false, |row| {
+                    actual.push(row); Ok(())
+                }).unwrap().unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(work.rows, expected.len());
+                assert_eq!(work.bitmap_words, bits.len());
+            }
+        }
+        let never = |_| -> Result<(), String> { panic!("dense decline read metadata") };
+        assert!(visit_mask_rows(&[u64::MAX], 10_000, 5_000, true, 4_096, &|| false, never).unwrap().is_none());
+        for (bits, rows, cardinality) in [(vec![1], 65, 1), (vec![1 << 63], 1, 1), (vec![1], 64, 2), (vec![3], 64, 1)] {
+            assert!(visit_mask_rows(&bits, rows, cardinality, true, 256, &|| false, |_| Ok(())).is_err());
+        }
+        let mut visible = Vec::new();
+        assert_eq!(visit_mask_rows(&[], 3, 0, false, 3, &|| false, |row| {
+            visible.push(row); Ok(())
+        }).unwrap().unwrap(), RowVisit { bitmap_words: 0, rows: 3 });
+        assert_eq!(visible, [0, 1, 2]);
+        assert!(visit_mask_rows(&[1], 64, 1, true, 1, &|| true, |_| Ok(())).unwrap_err().contains("cancelad"));
+        let stopped = std::cell::Cell::new(false);
+        assert!(visit_mask_rows(&[u64::MAX; 8], 512, 512, true, 512, &|| stopped.get(), |_| {
+            stopped.set(true); Ok(())
+        }).unwrap_err().contains("cancelad"));
+    }
+
+    #[test]
+    fn sparse_mask_visits_active_union_once_per_mapped_appearance() {
+        let f = Fixture::new();
+        let mut index = f.index("repeated.jsonl", "jsonl", &lines(5));
+        let duplicate = crate::sources::index_file(
+            f.dir.path().join("repeated.jsonl").to_str().unwrap(), "jsonl", None, None, None,
+        ).unwrap();
+        index.append(duplicate).unwrap();
+        f.exclude(&index, &[1, 3]);
+        f.exclude(&index, &[3, 4]);
+        let mask = f.mask(&index);
+        mask.validate().unwrap();
+        for (excluded, expected) in [(true, vec![1, 3, 4, 6, 8, 9]), (false, vec![0, 2, 5, 7])] {
+            let mut actual = Vec::new();
+            let work = mask.visit_rows(excluded, 10, &|| false, |row| { actual.push(row); Ok(()) }).unwrap().unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(work.rows, expected.len());
+            assert_eq!(work.bitmap_words, 1);
+        }
+    }
+
     #[test]
     fn indexed_mask_counts_duplicates_and_uses_positional_rows_not_numeric_identity() {
         let f = Fixture::new();

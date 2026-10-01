@@ -168,6 +168,7 @@ fn save_initial_at(dir: &std::path::Path, data: Value, legacy: bool) -> Result<V
     }
     let mut ids = std::collections::HashSet::new();
     for case in cases {
+        reject_projected_evidence(case)?;
         let id = case
             .get("id")
             .and_then(Value::as_str)
@@ -253,6 +254,47 @@ fn save_initial_at(dir: &std::path::Path, data: Value, legacy: bool) -> Result<V
     Ok(json!({"revision":revision,"schemaVersion":2,"analysisContexts":analysis_contexts}))
 }
 
+/// A preview is never an evidence record. Inspect only actual Event containers,
+/// so an original log's nested fields may use these words without false rejection.
+fn reject_projected_evidence(case: &Value) -> Result<(), String> {
+    let reject = |value: &Value| -> Result<(), String> {
+        if crate::page_projection::is_projected_row(value)
+            || matches!(
+                value.get("kind").and_then(Value::as_str),
+                Some("projected_page" | "exact_field")
+            )
+        {
+            Err("Uma prévia de tabela não pode ser salva como evidência. Carregue o registro completo antes de salvar.".into())
+        } else {
+            Ok(())
+        }
+    };
+    let rows = |value: &Value| -> Result<(), String> {
+        reject(value)?;
+        if let Some(values) = value.as_array() {
+            for value in values {
+                reject(value)?;
+            }
+        }
+        Ok(())
+    };
+    for key in ["rows", "events"] {
+        if let Some(value) = case.get(key) {
+            rows(value)?;
+        }
+    }
+    if let Some(items) = case.get("items").and_then(Value::as_array) {
+        for item in items {
+            for key in ["rows", "events"] {
+                if let Some(value) = item.get(key) {
+                    rows(value)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +344,32 @@ mod tests {
         )
         .unwrap();
         assert!(load_at(&dir.0).is_ok());
+    }
+    #[test]
+    fn projected_rows_cannot_replace_evidence_but_nested_log_fields_remain_valid() {
+        let dir = Directory::new();
+        let original = json!({"active":"case","cases":[{"id":"case","items":[{"rows":[{
+            "id":1,"event_ref":"source:1","fields":{"kind":"projected_row","version":1,"cells":["original data"]}
+        }]}]}]});
+        save_at(&dir.0, original.clone()).unwrap();
+        let before = load_at(&dir.0).unwrap();
+        let preview = json!({"kind":"projected_row","version":1,"row":{"id":1,"eventRef":"source:1"},"cells":[{"state":"preview","text":"partial"}]});
+        for kind in ["projected_row", "projected_page", "exact_field"] {
+            let mut preview = preview.clone();
+            preview["kind"] = json!(kind);
+            for container in ["items", "rows", "events"] {
+                let mut candidate = before.clone();
+                if container == "items" {
+                    candidate["cases"][0]["items"][0]["rows"][0] = preview.clone();
+                } else {
+                    candidate["cases"][0][container] = json!([preview.clone()]);
+                }
+                assert!(save_at(&dir.0, candidate)
+                    .unwrap_err()
+                    .contains("registro completo"));
+                assert_eq!(load_at(&dir.0).unwrap(), before);
+            }
+        }
+        assert_eq!(before["cases"][0]["items"], original["cases"][0]["items"]);
     }
 }
