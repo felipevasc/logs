@@ -22,6 +22,7 @@ pub(crate) enum Input {
 pub(crate) struct Receipt {
     pub generation: u64,
     pub operation_id: Option<String>,
+    pub analysis_context: Option<crate::analysis_context::Identity>,
 }
 
 #[derive(Default)]
@@ -40,6 +41,11 @@ pub(crate) struct Snapshot {
     pub source_desc: String,
     pub source_names: Vec<String>,
     pub sources: Vec<Input>,
+}
+
+/// The caller must already hold the source consistency guard.
+pub(crate) fn receipt_locked(state: &AppState) -> Receipt {
+    state.source_publication.read().receipt.clone()
 }
 
 pub(crate) fn snapshot(state: &AppState) -> Snapshot {
@@ -71,7 +77,33 @@ fn next(publication: &Publication) -> Result<Receipt, String> {
             .checked_add(1)
             .ok_or("Limite de revisões da fonte atingido; reinicie o aplicativo.")?,
         operation_id: operations::current_id(),
+        analysis_context: crate::analysis_runtime::current()
+            .and_then(|admitted| admitted.identity.clone()),
     })
+}
+
+#[derive(Serialize)]
+pub(crate) struct Mutation {
+    pub publication: Receipt,
+}
+
+/// Interpretation-only changes publish a new receipt under the existing source
+/// write guard, while retaining the same reopen inputs and Case owner.
+pub(crate) fn prepare_touch_locked(state: &AppState) -> Result<Receipt, String> {
+    let publication = state.source_publication.read();
+    let mut receipt = next(&publication)?;
+    if crate::analysis_runtime::current().is_none() {
+        receipt.analysis_context = publication.receipt.analysis_context.clone();
+    }
+    Ok(receipt)
+}
+pub(crate) fn commit_touch_locked(state: &AppState, receipt: Receipt) -> Mutation {
+    operations::commit();
+    state.source_publication.write().receipt = receipt.clone();
+    crate::query::clear_match_cache();
+    Mutation {
+        publication: receipt,
+    }
 }
 
 /// Sharing immutable source metadata is cheap. The merge operates exclusively
@@ -87,7 +119,7 @@ fn prepare_merge(
             parts: index.parts.clone(),
             lines: index.lines.clone(),
             columns: index.columns.clone(),
-            time_order: std::sync::OnceLock::new(),
+            time_order: std::sync::Arc::new(std::sync::OnceLock::new()),
         },
         SourceData::Memory(events) => crate::workspace::index_events(events)?,
         SourceData::None => return Ok(incoming),
@@ -103,7 +135,17 @@ pub(crate) fn publish(
     mut inputs: Vec<Input>,
     merge: bool,
 ) -> Result<LoadSummary, String> {
+    let admitted = crate::analysis_runtime::current();
+    if let Some(identity) = admitted
+        .as_ref()
+        .and_then(|admitted| admitted.identity.as_ref())
+    {
+        crate::analysis_runtime::validate_identity(identity)?;
+    }
     let mut source = crate::source_write_checked(state)?;
+    if let Some(admitted) = &admitted {
+        admitted.validate_publication(state, merge)?;
+    }
     let index = if merge {
         prepare_merge(&source, incoming, |previous, incoming| {
             previous.append(incoming)?;
@@ -143,7 +185,17 @@ pub(crate) fn publish(
 }
 
 pub(crate) fn clear(state: &AppState) -> Result<(), String> {
+    let admitted = crate::analysis_runtime::current();
+    if let Some(identity) = admitted
+        .as_ref()
+        .and_then(|admitted| admitted.identity.as_ref())
+    {
+        crate::analysis_runtime::validate_identity(identity)?;
+    }
     let mut source = crate::source_write_checked(state)?;
+    if let Some(admitted) = &admitted {
+        admitted.validate_publication(state, false)?;
+    }
     let mut publication = state.source_publication.write();
     let receipt = next(&publication)?;
     operations::commit();

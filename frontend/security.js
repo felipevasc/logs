@@ -3,7 +3,7 @@ window.Security = (() => {
   "use strict";
   const SEVERITY = { critical: ["Crítica", 4], high: ["Alta", 3], medium: ["Média", 2], low: ["Baixa", 1], info: ["Informativa", 0] };
   const sevLabel = s => SEVERITY[s]?.[0] || s;
-  const results = new Map();
+  const results = new Map(), analysisRequests = new WeakMap();
   const pending = new Map();
   const names = new Map();
   let tacticFilter = null;
@@ -11,7 +11,7 @@ window.Security = (() => {
   let lastData = null;
   let minimumEvidence = 5, universe = "", summarySlots = null;
   const evidence = () => window.EvidenceUI;
-  const universeKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig(true) : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
+  const universeKey = () => JSON.stringify([window.AnalysisContexts?.capture(), workspaceScope(), workspaceScope() === "case" ? caseSig(true) : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
   function syncUniverse() { const next = universeKey(); if (next !== universe) { universe = next; minimumEvidence = 5; } }
   function setMinimum(n) {
     if (!Number.isInteger(n) || n < 1 || n > 5) return;
@@ -59,9 +59,9 @@ window.Security = (() => {
     const k = key();
     if (!force && results.has(k)) return results.get(k);
     if (!force && pending.has(k)) return pending.get(k);
-    const request = fullRequest();
-    const promise = api("triage", { ...request, force, minimumEvidence: minimumEvidence, episodeLimit: 20 }, { silent: true }).then(data => {
-      remember(data);
+    const request = fullRequest(), owner = window.AnalysisContexts?.capture();
+    const promise = api("triage", { ...request, force, minimumEvidence: minimumEvidence, episodeLimit: 20 }, { silent: true, analysisOwner: owner }).then(data => {
+      analysisRequests.set(data, { request, owner }); remember(data);
       if (k === key()) { results.set(k, data); lastData = data; if (results.size > 8) results.delete(results.keys().next().value); }
       return data;
     }).finally(() => pending.delete(k));
@@ -72,16 +72,23 @@ window.Security = (() => {
   let pageGeneration = 0;
   async function loadStoredPage(offset) {
     const generation=++pageGeneration, context=key(), level=minimumEvidence;
-    const request=fullRequest();
-    const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter},{silent:true});
+    const request=fullRequest(),owner=window.AnalysisContexts?.capture();
+    const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter},{silent:true,analysisOwner:owner});
+    analysisRequests.set(data,{request,owner});
     if(generation!==pageGeneration || context!==key() || level!==minimumEvidence)return;
     results.set(context,data);lastData=data;remember(data);
     if(summarySlots?.attention?.isConnected){drawAttention(summarySlots.attention,data);if(summarySlots.entities)drawEntities(summarySlots.entities,data);}
   }
+  function episodeRequest(data) {
+    const captured = analysisRequests.get(data);
+    if (!captured && window.AnalysisContexts) throw new Error("Reabra a análise antes de consultar suas evidências.");
+    if (captured?.owner) window.AnalysisContexts.assertOwner(captured.owner);
+    return captured || { request: fullRequest(), owner: null };
+  }
   async function completeEpisode(data,episode) {
     if(episode.members_complete!==false)return episode.detections.map(i=>data.detections[i]);
-    const detections=[];let offset=0;
-    do {const page=await api("triage_episode",{analysisId:data.analysis_id,episodeId:episode.id,offset,limit:100},{silent:true});
+    const captured=episodeRequest(data),detections=[];let offset=0;
+    do {const page=await api("triage_episode",{...captured.request,analysisId:data.analysis_id,episodeId:episode.id,offset,limit:100},{silent:true,analysisOwner:captured.owner});
       if(page.analysis_id!==data.analysis_id)throw new Error("A análise mudou durante a leitura das evidências");
       detections.push(...page.detections);offset=page.next_offset;
     } while(offset!=null);
@@ -298,7 +305,9 @@ window.Security = (() => {
     const episodeOf = node => data.episodes[+node.closest("[data-episode]").dataset.episode];
     const loadMembers = async (article,offset) => {
       const episode=episodeOf(article),limit=episode.grouping?.kind==='pattern'?20:100;
-      const page=await api("triage_episode",{analysisId:data.analysis_id,episodeId:episode.id,offset,limit},{silent:true});
+      const captured=episodeRequest(data);
+      const page=await api("triage_episode",{...captured.request,analysisId:data.analysis_id,episodeId:episode.id,offset,limit},{silent:true,analysisOwner:captured.owner});
+      if (!article.isConnected) return;
       article.__detailMembers=page.detections.map(d=>({...d,context_only:(d.evidence_level||0)<minimumEvidence || !!(tacticFilter&&!d.tactics.includes(tacticFilter))}));
       article.querySelector(".sec-detections").innerHTML=detectionRows({...data,detections:article.__detailMembers},{...episode,detections:page.detections.map((_,i)=>i)})+`<p class="small">Indícios ${offset+1}–${offset+page.detections.length} de ${page.total}</p>${offset>0?`<button class="btn ghost" data-members-offset="${Math.max(0,offset-limit)}">Anteriores</button>`:""}${page.next_offset!=null?`<button class="btn ghost" data-members-offset="${page.next_offset}">Próximos indícios</button>`:""}`;
     };

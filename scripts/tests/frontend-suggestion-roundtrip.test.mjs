@@ -4,7 +4,8 @@ import {readFileSync} from 'node:fs';
 const bar=readFileSync(new URL('../../frontend/query-bar.js',import.meta.url),'utf8');
 const language=readFileSync(new URL('../../frontend/query-lang.js',import.meta.url),'utf8');
 const state={rows:[],treeAggSig:{},datasetRevision:1,derivedFields:[]};
-const context=vm.createContext({window:{Workspace:{sourceKey:()=> 'fixture'}},state,workspaceScope:()=> 'dataset',backendFilters:()=>[],valueCache:new Map(),fold:text=>text.toLowerCase(),cellValue:(event,column)=>event.fields[column],fmtNum:String});
+const identities=new WeakMap();let identity=0;const sourceIdentity=value=>{if(value==null||typeof value!=='object')return null;if(!identities.has(value))identities.set(value,++identity);return identities.get(value);};
+const context=vm.createContext({window:{Workspace:{sourceKey:()=> 'fixture'}},state,workspaceScope:()=> 'dataset',backendFilters:()=>[],valueCache:new Map(),sourceIdentity,fold:text=>text.toLowerCase(),cellValue:(event,column)=>event.fields[column],fmtNum:String});
 vm.runInContext(language,context);
 vm.runInContext(bar.slice(bar.indexOf('  async function valueOptions('),bar.indexOf('  function suggestionLabel(')),context);
 for(const literal of [String.raw`C:\logs\nginx access.log`,String.raw`C:\nginx\access.log`,String.raw`\\server\nginx logs`,String.raw`a"b\c`,String.raw`a\"b(c):`,"quoted trailing\\",'prévia 😀 "literal"']){

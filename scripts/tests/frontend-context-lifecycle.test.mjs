@@ -8,7 +8,7 @@ for (const scope of ['case', 'dataset']) for (const hasSource of [true, false]) 
   const c = { id: 'new', workspace: {} }, runtime = new Map(), states = new Map(), switches = [];
   const native = { loaded: true, columns: ['timestamp', 'native_only'], rows: [{ id: 100 }], total: 50_000_000, dataPeriod: { min: 1, max: 2 } };
   const context = vm.createContext({
-    state: { loaded: true, columns: scope === 'case' ? ['timestamp', 'saved_only'] : native.columns, total: 3, dataPeriod: null }, runtime, states,
+    window: {}, state: { loaded: true, columns: scope === 'case' ? ['timestamp', 'saved_only'] : native.columns, total: 3, dataPeriod: null }, runtime, states,
     activeCase: () => c, key: target => `new:${target}`, restoringCase: true,
     setScope: async (target, options) => { switches.push({ target, options }); }, refresh: async () => {},
   });

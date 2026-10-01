@@ -15,6 +15,8 @@
   <link rel="stylesheet" href="threats.css" />
   <link rel="stylesheet" href="remote-sources.css" />
   <link rel="stylesheet" href="journeys.css" />
+  <link rel="stylesheet" href="explorer-timeline.css">
+  <link rel="stylesheet" href="field-transform.css">
   <link rel="stylesheet" href="workspace-context.css" />
   <link rel="stylesheet" href="case-content.css" />
   <link rel="stylesheet" href="case-trails.css" />
@@ -765,7 +767,7 @@
           </button>
         </div>
         <div class="fld">
-          <label>Resultado no valor atual</label>
+          <label id="dv-preview-label">Resultado no valor atual</label>
           <pre id="dv-preview" class="code-pane dv-preview">—</pre>
         </div>
         <div class="modal-actions">
@@ -1022,7 +1024,10 @@
   <script src="detail-fields.js"></script>
   <script src="performance-core.js"></script>
   <script src="app.js"></script>
+  <script src="analysis-context.js"></script>
   <script src="tasks.js"></script>
+  <script src="explorer-timeline.js"></script>
+  <script src="field-transform.js"></script>
   <script src="ui-scale.js"></script>
   <script src="timeline.js"></script>
   <script src="case-content.js"></script>

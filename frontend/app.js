@@ -587,9 +587,10 @@ async function caseArgs(args, resync = false) {
   if (!Array.isArray(events)) return args;
   let key = caseTransport.keys.get(events);
   if (!key) { key = `case-${++caseTransport.serial}-${events.length}`; caseTransport.keys.set(events, key); }
-  if (resync || !caseTransport.synced.has(key)) {
-    await invoke("case_sync", { key, events });
-    caseTransport.synced.add(key);
+  const syncKey = JSON.stringify([key, args.analysisContext?.caseId ?? null, args.analysisContext?.analysisId ?? null]);
+  if (resync || !caseTransport.synced.has(syncKey)) {
+    await invoke("case_sync", { key, events, analysisContext: args.analysisContext ?? null, sourceGeneration: args.sourceGeneration ?? null });
+    caseTransport.synced.add(syncKey);
     if (caseTransport.synced.size > 3) caseTransport.synced.delete(caseTransport.synced.values().next().value);
   }
   const { caseEvents: _omit, ...rest } = args;
@@ -873,7 +874,7 @@ async function reconcilePublishedSource(current = () => true) {
   const source = sourceSpecFromSnapshot(snapshot);
   // An atomic native receipt, rather than arrival order, identifies the source.
   // Reconcile metadata only: valid indexes and raw logs are not reopened.
-  state.sourcePublication = { generation: snapshot.generation, operationId: snapshot.operationId };
+  state.sourcePublication = { generation: snapshot.generation, operationId: snapshot.operationId, analysisContext: snapshot.analysisContext };
   state.datasetRevision++; state.refreshVersion++;
   explorerAnalytics.clear(); window.Discovery?.clearCache(); window.Security?.invalidate();
   if (!source) {
@@ -937,7 +938,8 @@ function sourceIdentityUnavailable(source) {
 async function loadData(requestedSource = null, options = {}) {
   const version = options.version ?? ++state.artifactSwitchVersion;
   let caseId = options.caseId ?? state.cases.active;
-  const current = () => version === state.artifactSwitchVersion && (!caseId || state.cases.active === caseId);
+  let caseInstance = state.cases.cases.find(item => item.id === caseId) || null;
+  const current = () => version === state.artifactSwitchVersion && (!caseId || state.cases.active === caseId && state.cases.cases.find(item => item.id === caseId) === caseInstance);
   if (!current()) return false;
   const sourceMayHaveChanged = window.Tasks?.pendingSources?.() || false;
   let sourceAccepted = false, desiredSource = requestedSource || state.currentArtifact?.source;
@@ -975,7 +977,7 @@ async function loadData(requestedSource = null, options = {}) {
       ? state.cases.cases.find((item) => item.id === caseId)
       : ensureCase();
     if (!c || !current() || state.cases.active !== c.id) return false;
-    caseId = c.id;
+    caseId = c.id; caseInstance = c;
     let merge = !!options.merge;
     if (merge && state.currentArtifact?.source) {
       const currentMembers = state.currentArtifact.source.kind === "bundle"
@@ -1133,7 +1135,14 @@ async function clearData({ removeCurrent = false } = {}) {
   window.Tasks?.cancelLatest("source-load");
   state.refreshVersion++;
   const artifact = state.currentArtifact;
-  try { await api("clear_events", {}, { latest: "source-load" }); }
+  try {
+    const result = await api("clear_events", {}, { latest: "source-load" });
+    if (version !== state.artifactSwitchVersion) return false;
+    const publication = result?.publication || await api("source_snapshot", {}, { silent: true });
+    if (version !== state.artifactSwitchVersion) return false;
+    state.sourcePublication = publication && Number.isSafeInteger(publication.generation)
+      ? { generation: publication.generation, operationId: publication.operationId, analysisContext: publication.analysisContext } : null;
+  }
   catch (error) {
     if (version !== state.artifactSwitchVersion) return false;
     try { await reconcilePublishedSource(() => version === state.artifactSwitchVersion); }
@@ -1515,23 +1524,33 @@ function rangeItem(column, opt, count = null) {
 function caseTreeProfiles() {
   const c = activeCase();
   if (!c) return null;
-  const sig = caseSig();
+  const owner = window.AnalysisContexts?.capture();
+  const sig = JSON.stringify([caseSig(), owner?.instance, owner?.identity]);
+  const current = () => !owner || window.AnalysisContexts.isCurrent(owner);
   const cached = state.caseTreeProfiles[c.id];
   if (cached && cached.sig === sig) return cached.profiles;
   if (!state.caseProfilesLoading) {
     state.caseProfilesLoading = true;
     api("profile_fields", { filters: [], caseEvents: caseEvents() }, { silent: true })
-      .then((profiles) => { state.caseTreeProfiles[c.id] = { sig, profiles }; })
-      .catch(() => { state.caseTreeProfiles[c.id] = { sig, profiles: [] }; })
-      .finally(() => { state.caseProfilesLoading = false; if (workspaceScope() === "case") refreshTreeAggs("case"); });
+      .then((profiles) => { if (current()) state.caseTreeProfiles[c.id] = { sig, profiles }; })
+      .catch(() => {})
+      .finally(() => { if (!current()) return; state.caseProfilesLoading = false; if (workspaceScope() === "case") refreshTreeAggs("case"); });
   }
   return null;
 }
 
-async function loadDerivedFields() {
-  try { state.derivedFields = (await api("list_derived_fields", {}, { silent: true })) || []; }
-  catch { state.derivedFields = []; }
-  renderExploreTree();
+async function loadDerivedFields(capturedOwner = window.AnalysisContexts?.capture()) {
+  let owner = capturedOwner;
+  try {
+    owner = window.AnalysisContexts ? await window.AnalysisContexts.prepare(capturedOwner, { metadata: true }) : null;
+    const fields = (await api("list_derived_fields", { analysisContext: owner?.identity ?? null, sourceGeneration: owner?.sourceGeneration ?? null }, { silent: true, analysisOwner: owner })) || [];
+    if (owner) window.AnalysisContexts.definitionsLoaded(owner, fields);
+    else if (!window.AnalysisContexts?.identity()) state.derivedFields = fields;
+    renderExploreTree(); return true;
+  } catch (error) {
+    if (!owner || window.AnalysisContexts?.isCurrent(owner)) state.analysisDefinitionsPending = true;
+    return false;
+  }
 }
 
 function renderExploreTree() {
@@ -1614,7 +1633,8 @@ function treeGroupProfiles(profiles) {
 function caseTreeProfilesPeek() {
   const c = activeCase();
   const cached = c && state.caseTreeProfiles[c.id];
-  return cached ? cached.profiles : null;
+  const owner = window.AnalysisContexts?.capture();
+  return cached?.sig === JSON.stringify([caseSig(), owner?.instance, owner?.identity]) ? cached.profiles : null;
 }
 
 // interpreta "20 MB", "120 ms", "5.2" como número (espelha parse_num_unit do Rust)
@@ -1717,6 +1737,17 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
   renderExploreTree();
 }
 
+function includeDiscoveredFields(profiles, scope) {
+  if (scope !== workspaceScope() || state.analysisDefinitionsPending || !Array.isArray(profiles)) return;
+  const names = profiles.map(profile => profile.name).filter(name => typeof name === "string");
+  const added = names.filter(name => !state.columns.includes(name));
+  if (!added.length) return;
+  const visible = JSON.stringify(state.visibleCols);
+  state.columns = [...new Set([...state.columns, ...added])];
+  fillColumnControls(); restoreVisiblePreferences();
+  if (visible !== JSON.stringify(state.visibleCols)) renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
+}
+
 function renderExploreTreeInto(box, scope) {
   box.innerHTML = "";
   if (state.treeAggError?.[scope]) {
@@ -1745,6 +1776,8 @@ function renderExploreTreeInto(box, scope) {
     profiles = state.datasetProfiles || [];
     columns = state.columns;
   }
+  includeDiscoveredFields(profiles, scope);
+  if (scope === "dataset") columns = state.columns;
   const live = state.treeAgg[scope] || {};
   const byName = Object.fromEntries((profiles || []).map((p) => [p.name, p]));
 
@@ -1764,6 +1797,15 @@ function renderExploreTreeInto(box, scope) {
     main.innerHTML = `<i class="fas ${FIELD_KIND_ICONS[kind] || "fa-font"}"></i><span>${esc(displayLabel)}</span><small>${profile?.cardinality ? fmtNum(profile.cardinality) : ""}</small>`;
     main.title = `Inspecionar campo: ${colLabel(column)}${profile?.sampled_events ? ` · perfil de ${fmtNum(profile.sampled_events)} eventos amostrados` : ""}`;
     main.onclick = () => showFieldInspector(column);
+    row.oncontextmenu = event => {
+      event.preventDefault(); event.stopPropagation();
+      showCtxMenu(event.clientX, event.clientY, [
+        ...(window.ExplorerTimeline ? [window.ExplorerTimeline.menuItem(column)] : []),
+        ...(window.FieldTransforms ? [window.FieldTransforms.menuItem(column, { anchor: main })] : []),
+        valueFilterMenuItem(column, "", main, { op: "contains" }),
+        { icon: "fa-circle-info", label: "Inspecionar campo", onClick: () => showFieldInspector(column) },
+      ]);
+    };
     const adv = el("button", "icon-btn field-adv-btn");
     adv.innerHTML = '<i class="fas fa-filter"></i>';
     adv.title = `Filtro avançado: ${colLabel(column)}`;
@@ -1912,17 +1954,23 @@ function renderExploreTreeInto(box, scope) {
 
   // campos customizados (regex): gerenciáveis, com edição
   if (state.derivedFields?.length) {
+    const analysisOwner = window.AnalysisContexts?.capture();
     const derivedKids = state.derivedFields.map((def) => {
       const row = el("div", "field-row");
       const main = el("button", "field-item");
       main.innerHTML = `<i class="fas fa-wand-magic-sparkles"></i><span>${esc(def.name)}</span><small>${esc(colLabel(def.source))}</small>`;
       main.title = `${def.name} ← ${colLabel(def.source)} · /${def.pattern}/`;
-      main.onclick = () => openDeriveEdit(def);
+      main.onclick = () => def.steps?.length && !def.rules?.length && window.FieldTransforms ? window.FieldTransforms.open(def.name, { anchor: main, owner: analysisOwner }) : openDeriveEdit(def, { analysisOwner });
       const edit = el("button", "icon-btn field-adv-btn");
       edit.innerHTML = '<i class="fas fa-pen"></i>';
       edit.title = `Editar campo ${def.name}`;
-      edit.onclick = (e) => { e.stopPropagation(); openDeriveEdit(def); };
+      edit.onclick = (e) => { e.stopPropagation(); openDeriveEdit(def, { analysisOwner }); };
       row.append(main, edit);
+      if (window.FieldTransforms) {
+        const transform = el("button", "icon-btn field-adv-btn"); transform.innerHTML = '<i class="fas fa-wand-magic-sparkles"></i>';
+        transform.title = `Transformar campo ${def.name}`; transform.setAttribute("aria-label", transform.title);
+        transform.onclick = () => window.FieldTransforms.open(def.name, { anchor: transform, owner: analysisOwner }); row.append(transform);
+      }
       return row;
     });
     box.appendChild(treeNode({
@@ -2004,7 +2052,7 @@ function toggleFacet(column, value) {
 let currentEditFilterIndex = null;
 let currentEditFilter = null, currentEditFilterValue = null, currentFilterContext = null, filterReturnFocus = null, filterComposing = false;
 function filterContextKey() {
-  return JSON.stringify([workspaceScope(), activeCase()?.id, state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields]);
+  return JSON.stringify([workspaceScope(), activeCase()?.id, window.AnalysisContexts?.capture().instance, window.AnalysisContexts?.identity(), state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields]);
 }
 function filterFocusTarget(origin) {
   return [origin, $("#btn-add-filter"), $("#dr-close"), $("#quick-search")].find(node => node?.isConnected && !node.hidden && !node.disabled
@@ -2070,11 +2118,11 @@ function openValueFilter(column, value, anchor = null, op = null) {
 
 // All value menus open the same editable composer; opening never applies a filter.
 function valueFilterMenuItem(column, value, anchor = null, { scope = workspaceScope(), op = null } = {}) {
-  const owner = () => JSON.stringify([activeCase()?.id, scope === "case" ? caseSig(true) : null, state.datasetRevision,
+  const owner = () => JSON.stringify([activeCase()?.id, window.AnalysisContexts?.identity(), scope === "case" ? caseSig(true) : null, state.datasetRevision,
     state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.sourceIdentityUnconfirmed, state.derivedFields]);
-  const expected = owner();
+  const captured = window.AnalysisContexts?.capture(), expected = owner();
   const stillCurrent = () => {
-    if (owner() === expected) return true;
+    if ((!captured || window.AnalysisContexts.isCurrent(captured)) && owner() === expected) return true;
     toast("A fonte ou o Caso mudou. Abra o menu novamente no contexto atual para criar o filtro.", "info");
     return false;
   };
@@ -2169,7 +2217,28 @@ const explorerBackground = window.PerformanceTools.queue(1);
 let explorerIntent = "", explorerCursorKey = "", explorerCursors = [null];
 function explorerKey() {
   const scope = workspaceScope();
-  return JSON.stringify([scope, state.datasetRevision, activeCase()?.id, scope === "case" ? caseSig() : [state.currentArtifact?.id, state.currentArtifact?.loadedAt], backendFilters(), state.derivedFields]);
+  return JSON.stringify([scope, state.datasetRevision, activeCase()?.id, window.AnalysisContexts?.identity(), scope === "case" ? caseSig() : [state.currentArtifact?.id, state.currentArtifact?.loadedAt], backendFilters(), state.derivedFields]);
+}
+// Invalidate derived data only. Saved evidence, filters, drafts and layouts stay owned by the Case.
+function invalidateAnalysisComputedData(snapshot) {
+  state.datasetRevision++; state.refreshVersion++; detailRequest++;
+  clearTimeout(debounceTimer); clearTimeout(filterCountsTimer); filterCountsTimer = null;
+  explorerAnalytics.clear(); filterCountsCache.clear();
+  explorerIntent = ""; explorerCursorKey = ""; explorerCursors = [null];
+  treeAggVersion.dataset++; treeAggVersion.case++; cubeState.requestVersion++;
+  state.explorerCache = null; state.dataPeriod = null; state.facetData = null;
+  state.datasetProfiles = null; state.caseProfilesLoading = false; delete state.caseProfiles[snapshot.caseId]; delete state.caseTreeProfiles[snapshot.caseId];
+  state.treeAgg = { dataset: null, case: null }; state.treeAggSig = { dataset: null, case: null }; state.treeAggError = { dataset: null, case: null };
+  state.selectedEventRows = new Map(); state.lastSelectedRowId = null;
+  state.rows = []; state.total = null; state.page = 0; state.pageResult = null;
+  state.queryError = "A configuração da análise mudou. Atualize a visualização para consultar os dados atuais.";
+  cubeState.result = null; cubeState.results.clear(); cubeState.lastComputedSignature = null;
+  window.Tasks?.cancelStaleAnalysis?.(); window.Discovery?.clearCache(); window.Security?.invalidate(); window.QueryBar?.clearCache();
+  window.Workspace?.invalidateAnalysis?.(); window.WorkspaceAnalysis?.invalidateAnalysis?.(); window.ExplorerTimeline?.invalidate();
+  if (chart) { chart.destroy(); chart = null; } $("#chart")?.replaceChildren();
+  $("#events-table tbody")?.replaceChildren();
+  if ($("#result-count")) $("#result-count").textContent = "Análise atualizada · visualização aguardando recálculo";
+  if ($("#pg-prev")) $("#pg-prev").disabled = true; if ($("#pg-next")) $("#pg-next").disabled = true;
 }
 function showQueryEngine(page) {
   let note = $("#query-engine-status");
@@ -2221,14 +2290,15 @@ function pendingCountStatus(entry = explorerAnalytics.get(explorerKey())) {
   return "aguardando cálculo";
 }
 function showAnalyticsHistogram(entry) {
+  if (window.ExplorerTimeline) return window.ExplorerTimeline.summary(entry);
   const box = $("#chart"), panel = box.closest?.(".hist-panel");
   if (!panel || entry?.stats) return; // Keep a valid histogram if only facets are paused.
   if (chart) { chart.destroy(); chart = null; }
   panel.hidden = !state.loaded;
   panel.classList.add("analytics-placeholder");
-  const label = entry?.status === "paused" ? "Histograma pausado. Os registros continuam disponíveis."
-    : entry?.status === "failed" ? "Histograma não concluído. Retome o resumo para tentar novamente."
-    : entry?.status === "stats" ? "Calculando histograma…" : "Histograma aguardando o resumo.";
+  const label = entry?.status === "paused" ? "Timeline pausada. Os registros continuam disponíveis."
+    : entry?.status === "failed" ? "Timeline não concluída. Retome o resumo para tentar novamente."
+    : entry?.status === "stats" ? "Calculando Timeline…" : "Timeline aguardando o resumo.";
   const hint = el("p", "analytics-placeholder-text", label);
   hint.setAttribute?.("role", "status"); box.replaceChildren(hint);
 }
@@ -2236,7 +2306,7 @@ function showExplorerAnalytics(entry) {
   let note = $("#query-analytics-status");
   if (!note) { note = el("div", "query-analytics-status muted small"); note.id = "query-analytics-status"; note.setAttribute("role", "status"); $("#events-table").before(note); }
   note.hidden = !entry || entry.status === "done";
-  const labels = { queued: "Resumo na fila", count: "Calculando total exato", stats: "Calculando histograma", facets: "Atualizando campos", paused: "Resumo pausado", failed: "Resumo não concluído", done: "Resumo do recorte atualizado" };
+  const labels = { queued: "Resumo na fila", count: "Calculando total exato", stats: "Calculando Timeline", facets: "Atualizando campos", paused: "Resumo pausado", failed: "Resumo não concluído", done: "Resumo do recorte atualizado" };
   showAnalyticsHistogram(entry);
   updateContextBar(); window.Workspace?.onAnalyticsStateChanged?.();
   // Never replace another operation's progress or the source-save overlay.
@@ -2326,6 +2396,8 @@ function loadExplorerAnalytics(key, scope, filters, knownTotal = null) {
 async function refresh({ analytics = true, resetAttempt = false } = {}) {
   const scope = workspaceScope();
   if (scope === "dataset" && (!state.loaded || state.sourceIdentityUnconfirmed)) return;
+  if (window.AnalysisContexts && state.analysisDefinitionsPending && !await loadDerivedFields()) return false;
+  if (scope !== workspaceScope()) return false;
   const filters = backendFilters(), key = explorerKey();
   const cursorKey = JSON.stringify([key, state.sortCol, state.sortDir, state.pageSize]);
   if (cursorKey !== explorerCursorKey) { explorerCursorKey = cursorKey; explorerCursors = [null]; state.page = 0; }
@@ -2387,13 +2459,18 @@ function closeCtxMenu() {
 
 function showCtxMenu(x, y, items) {
   closeCtxMenu();
+  const owner = window.AnalysisContexts?.capture();
   const m = el("div", "ctx-menu");
   for (const it of items) {
     if (it.sep) { m.appendChild(el("div", "ctx-sep")); continue; }
     const b = el("button", "ctx-item" + (it.danger ? " danger" : ""));
     b.innerHTML = `<i class="fas ${it.icon}"></i><span>${esc(it.label)}</span>`;
     if (it.color) b.querySelector("i").style.color = it.color;
-    b.onclick = () => { closeCtxMenu(); it.onClick(); };
+    b.onclick = () => {
+      closeCtxMenu();
+      if (owner && !window.AnalysisContexts.isCurrent(owner)) { toast("O contexto mudou. Abra o menu novamente no Caso e na fonte atuais.", "info"); return; }
+      it.onClick();
+    };
     m.appendChild(b);
   }
   document.body.appendChild(m);
@@ -2639,6 +2716,20 @@ function renderTsExample() {
   box.innerHTML = html;
 }
 
+async function commitTsConfig(paths, config) {
+  let owner = state.tsAnalysisOwner || window.AnalysisContexts?.capture();
+  for (const path of paths) {
+    const result = await api("set_ts_config", { path, config }, { latest: "timestamp-config", analysisOwner: owner });
+    if (owner) window.AnalysisContexts.assertOwner(owner, { revisions: false });
+    if (result?.publication) {
+      state.sourcePublication = result.publication;
+      invalidateAnalysisComputedData({ caseId: owner?.caseId || state.cases.active });
+      owner = window.AnalysisContexts?.capture(owner?.caseId);
+      state.tsAnalysisOwner = owner;
+    }
+  }
+}
+
 async function resetTsConfig() {
   const paths = tsConfigPaths();
   state.tsSources = [];
@@ -2648,9 +2739,7 @@ async function resetTsConfig() {
   fillTsFormats();
   $("#ts-format-custom").hidden = true;
   renderTsSources();
-  for (const path of paths) {
-    await api("set_ts_config", { path, config: null });
-  }
+  await commitTsConfig(paths, null);
   if (paths.length) {
     toast("Configuração removida — voltou à inferência automática.", "ok");
     refresh();
@@ -2705,7 +2794,7 @@ async function testTsConfig() {
   const box = $("#ts-test-result");
   box.innerHTML = "";
   try {
-    const rows = await api("test_ts_config", { config: buildTsConfig(), path: tsConfigPath() }, { silent: true });
+    const rows = await api("test_ts_config", { config: buildTsConfig(), path: tsConfigPath() }, { silent: true, analysisOwner: state.tsAnalysisOwner });
     for (const [entrada, resultado] of rows) {
       const row = el("div", "tr-row");
       const ok = !resultado.includes("não reconhecido");
@@ -2740,9 +2829,7 @@ async function applyTsConfig() {
   showLoadOverlay("Aplicando configuração de data/hora", "timestamp-config");
   try {
     // cada arquivo do conjunto guarda a config pela própria chave (caminho)
-    for (const path of paths) {
-      await api("set_ts_config", { path, config: empty ? null : cfg }, { latest: "timestamp-config" });
-    }
+    await commitTsConfig(paths, empty ? null : cfg);
     hideLoadOverlay(true);
     toast(empty ? "Configuração de data/hora removida." : "Data/hora aplicada aos eventos.", "ok");
     refresh();
@@ -2966,7 +3053,8 @@ function updateDvPreview() {
 }
 
 function openDeriveModal(selected, sourceCol, sourceValue) {
-  dvCtx = { selected, sourceCol, sourceValue, editName: null };
+  if ($("#dv-preview-label")) $("#dv-preview-label").textContent = "Resultado no valor atual";
+  dvCtx = { selected, sourceCol, sourceValue, editName: null, analysisOwner: window.AnalysisContexts?.capture() };
   $("#derive-delete").hidden = true;
   $("#dv-name").disabled = false;
   $("#dv-selected").textContent = selected;
@@ -2992,11 +3080,13 @@ function openDeriveModal(selected, sourceCol, sourceValue) {
   $("#dv-name").focus();
 }
 
-function openDeriveEdit(def, { appendRule = false } = {}) {
+function openDeriveEdit(def, { appendRule = false, analysisOwner = window.AnalysisContexts?.capture() } = {}) {
+  if (analysisOwner && !window.AnalysisContexts.isCurrent(analysisOwner)) { toast("A configuração mudou. Abra o campo novamente.", "info"); return; }
   const ev = state.rows.find((r) => String(cellValue(r, def.source) || "").trim()) || state.rows[0] || null;
   state.currentDetailEv = ev;
   openDeriveModal("", def.source, ev ? cellValue(ev, def.source) : "");
-  dvCtx.editName = def.name;
+  dvCtx.editName = def.name; dvCtx.steps = [...(def.steps || [])];
+  if (dvCtx.steps.length && $("#dv-preview-label")) $("#dv-preview-label").textContent = `Resultado da extração · antes de ${dvCtx.steps.length} transformação(ões), que serão preservadas`;
   dvCtx.ev = ev;
   $("#dv-name").value = def.name;
   $("#dv-name").disabled = true; // renomear criaria outro campo; nome é a chave
@@ -3009,25 +3099,39 @@ function openDeriveEdit(def, { appendRule = false } = {}) {
 }
 
 async function saveDerivedField() {
-  const name = $("#dv-name").value.trim();
-  const rules = collectDvRules();
-  if (!rules.length) { toast("Informe ao menos uma regra (regex).", "info"); return; }
+  const editor = dvCtx, owner = editor?.analysisOwner;
+  const name = $("#dv-name").value.trim(), rules = collectDvRules();
+  if (!rules.length && !editor?.steps?.length) { toast("Informe ao menos uma regra (regex).", "info"); return; }
   try {
-    await api("save_derived_field", { name, source: dvCtx.sourceCol, rules });
+    await api("save_derived_field", { name, source: editor.sourceCol, rules }, { analysisOwner: owner });
+    // Native receipts update their Case even after navigation; UI effects stay with this editor.
+    if (owner) window.AnalysisContexts.assertOwner(owner, { revisions: false });
+    if (dvCtx !== editor) return;
     $("#derive-modal").hidden = true;
-    await loadDerivedFields();
+    if (!await loadDerivedFields(window.AnalysisContexts?.capture(owner?.caseId))) return;
     refreshEngineStatus();
     toast(`Campo "${name}" salvo.`, "ok");
-    // disponibiliza a coluna imediatamente (árvore, seletor de colunas, agrupamentos)
-    if (!state.columns.includes(name)) {
-      state.columns.push(name);
-      fillColumnControls();
-    }
+    if (!state.columns.includes(name)) { state.columns.push(name); fillColumnControls(); }
     state.datasetProfiles = null;
     api("profile_fields", { filters: [] }, { silent: true })
       .then((profiles) => { state.datasetProfiles = profiles; refreshTreeAggs(state.activeContext === "artifact" ? "dataset" : "case"); })
       .catch(() => {});
     refresh();
+  } catch { /* toast já exibido */ }
+}
+
+async function deleteDerivedField() {
+  const editor = dvCtx, owner = editor?.analysisOwner, name = editor?.editName;
+  if (!name) return;
+  try {
+    await api("delete_derived_field", { name }, { analysisOwner: owner });
+    if (owner) window.AnalysisContexts.assertOwner(owner, { revisions: false });
+    if (dvCtx !== editor) return;
+    $("#derive-modal").hidden = true;
+    if (!await loadDerivedFields(window.AnalysisContexts?.capture(owner?.caseId))) return;
+    toast(`Campo "${name}" removido.`, "ok");
+    state.columns = state.columns.filter((column) => column !== name);
+    fillColumnControls(); refresh();
   } catch { /* toast já exibido */ }
 }
 
@@ -3252,31 +3356,50 @@ function updateFilterTabsLayout() {
 
 let filterCountsTimer = null;
 const filterCountsCache = new Map();
+const filterCountsPending = new Set();
+function runFilterTabCounts() {
+  filterCountsTimer = null;
+  const context = JSON.stringify([state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields, activeCase()?.id, window.AnalysisContexts?.identity(), caseSig()]);
+  const caseEvs = caseEvents();
+  const updates = [];
+  for (const f of savedFilters()) {
+    const tab = document.querySelector(`.filter-tab[data-fid="${f.id}"] .filter-tab-counts`);
+    if (!tab) continue;
+    const filters = savedBackendFilters(f), key = context + JSON.stringify(filters);
+    let result = filterCountsCache.get(key);
+    if (!result) {
+      result = Promise.all([
+        api("count_filtered", { filters }, { silent: true, background: true }),
+        caseEvs.length ? api("count_filtered", { filters, caseEvents: caseEvs }, { silent: true, background: true }) : Promise.resolve(0),
+      ]);
+      filterCountsCache.set(key, result);
+      if (filterCountsCache.size > 64) filterCountsCache.delete(filterCountsCache.keys().next().value);
+    }
+    updates.push(result.then(([artifact, caso]) => {
+      if (!tab.isConnected || context !== JSON.stringify([state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields, activeCase()?.id, window.AnalysisContexts?.identity(), caseSig()])) return;
+      tab.textContent = `${fmtNum(caso)} · ${fmtNum(artifact)}`;
+      tab.title = `${fmtNum(caso)} no Caso · ${fmtNum(artifact)} no Artefato`;
+    }).catch(() => { filterCountsCache.delete(key); if (tab.isConnected) tab.textContent = "—"; }));
+  }
+  const pending = Promise.all(updates);
+  filterCountsPending.add(pending);
+  pending.finally(() => filterCountsPending.delete(pending));
+  return pending;
+}
 function refreshFilterTabCounts() {
   clearTimeout(filterCountsTimer);
-  filterCountsTimer = setTimeout(() => {
-    const context = JSON.stringify([state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields, activeCase()?.id, caseSig()]);
-    const caseEvs = caseEvents();
-    for (const f of savedFilters()) {
-      const tab = document.querySelector(`.filter-tab[data-fid="${f.id}"] .filter-tab-counts`);
-      if (!tab) continue;
-      const filters = savedBackendFilters(f), key = context + JSON.stringify(filters);
-      let result = filterCountsCache.get(key);
-      if (!result) {
-        result = Promise.all([
-          api("count_filtered", { filters }, { silent: true, background: true }),
-          caseEvs.length ? api("count_filtered", { filters, caseEvents: caseEvs }, { silent: true, background: true }) : Promise.resolve(0),
-        ]);
-        filterCountsCache.set(key, result);
-        if (filterCountsCache.size > 64) filterCountsCache.delete(filterCountsCache.keys().next().value);
-      }
-      result.then(([artifact, caso]) => {
-        if (!tab.isConnected || context !== JSON.stringify([state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields, activeCase()?.id, caseSig()])) return;
-        tab.textContent = `${fmtNum(caso)} · ${fmtNum(artifact)}`;
-        tab.title = `${fmtNum(caso)} no Caso · ${fmtNum(artifact)} no Artefato`;
-      }).catch(() => { filterCountsCache.delete(key); if (tab.isConnected) tab.textContent = "—"; });
+  filterCountsTimer = setTimeout(runFilterTabCounts, 300);
+}
+// A deterministic barrier includes the lazy timer, not just already-admitted Tasks.
+// Normal UI updates remain debounced; callers use this only when they need settlement.
+async function settleFilterTabCounts() {
+  do {
+    if (filterCountsTimer !== null) {
+      clearTimeout(filterCountsTimer);
+      runFilterTabCounts();
     }
-  }, 300);
+    await Promise.all([...filterCountsPending]);
+  } while (filterCountsTimer !== null || filterCountsPending.size);
 }
 
 // ------------------------------------------------------------------ estações
@@ -3509,14 +3632,27 @@ let caseSaveErrorShown = false;
 let caseSaveTimer = null;
 let caseSaveWaiters = [];
 function saveCases() {
+  const store = state.cases;
   clearTimeout(caseSaveTimer);
-  const result = new Promise((resolve, reject) => caseSaveWaiters.push({ resolve, reject }));
+  const result = new Promise((resolve, reject) => caseSaveWaiters.push({ resolve, reject, store }));
   // Autosave is coalesced, while callers can still await durable persistence.
   caseSaveTimer = setTimeout(() => {
-    const waiters = caseSaveWaiters.splice(0);
-    const snapshot = JSON.parse(JSON.stringify({ ...state.cases, schemaVersion: 2 }));
-    casesSaveQueue = casesSaveQueue.catch(() => {}).then(() => api("cases_save", { data: { ...snapshot, revision: state.cases.revision } }, { silent: true }))
-      .then(result => { if (result?.revision != null) state.cases.revision = result.revision; caseSaveErrorShown = false; waiters.forEach(w => w.resolve(true)); })
+    const pending = caseSaveWaiters.splice(0);
+    const waiters = pending.filter(waiter => waiter.store === store);
+    pending.filter(waiter => waiter.store !== store).forEach(waiter => waiter.resolve(false));
+    if (store !== state.cases) { waiters.forEach(waiter => waiter.resolve(false)); return; }
+    const snapshot = JSON.parse(JSON.stringify({ ...store, schemaVersion: 2 }));
+    const owners = new Map(snapshot.cases.map(item => [item.id, window.AnalysisContexts?.capture(item.id)]));
+    casesSaveQueue = casesSaveQueue.catch(() => {}).then(() => store === state.cases ? api("cases_save", { data: { ...snapshot, revision: store.revision } }, { silent: true }) : null)
+      .then(async result => {
+        if (store !== state.cases) { waiters.forEach(w => w.resolve(false)); return; }
+        if (result?.revision != null) store.revision = result.revision;
+        for (const context of result?.analysisContexts || []) {
+          const owner = owners.get(context.caseId);
+          if (owner) await window.AnalysisContexts.adopt(context, { owner });
+        }
+        caseSaveErrorShown = false; waiters.forEach(w => w.resolve(true));
+      })
       .catch(error => {
         if (!caseSaveErrorShown) { caseSaveErrorShown = true; toast(`Não foi possível salvar: ${error}`, "err"); }
         waiters.forEach(w => w.resolve(false));
@@ -3649,6 +3785,7 @@ function newCase(name, { keepArtifact = false, contextSnapshot = null } = {}) {
   };
   state.cases.cases.push(c);
   state.cases.active = c.id;
+  window.AnalysisContexts?.activate();
   state.activeStationId = null;
   state.stationAnalyticsId = null;
   setAnalysisView("overview");
@@ -4382,6 +4519,7 @@ function eventCellMenu(ev, col, value, anchor = null) {
     { icon: "fa-route", label: "Investigar possível trilha", onClick: () => openTrail(ev) },
   ];
   items.push({ sep: true });
+  if (window.FieldTransforms) items.push(window.FieldTransforms.menuItem(col, { event: ev, anchor }));
   items.push({
     icon: "fa-filter",
     label: `Criar filtro: ${colLabel(col)}`,
@@ -4816,7 +4954,7 @@ function renderTable(qr, { reuseRows = false } = {}) {
       saveVisibleCols();
       renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
     };
-    th.title = "Clique para ordenar. Arraste para reordenar. Botão direito: adicionar ao Cubo.";
+    th.title = "Clique para ordenar. Arraste para reordenar. Botão direito: Timeline, filtros e Cubo.";
     th.onclick = () => {
       if (Date.now() - lastColumnDropAt < 400) return;
       if (state.sortCol === col) state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
@@ -4827,6 +4965,8 @@ function renderTable(qr, { reuseRows = false } = {}) {
     th.oncontextmenu = (event) => {
       event.preventDefault();
       showCtxMenu(event.clientX, event.clientY, [
+        ...(window.ExplorerTimeline ? [window.ExplorerTimeline.menuItem(col)] : []),
+        ...(window.FieldTransforms ? [window.FieldTransforms.menuItem(col, { anchor: th })] : []),
         {
           icon: "fa-arrow-down",
           label: "Adicionar ao Cubo em Linhas",
@@ -4905,6 +5045,7 @@ function renderTable(qr, { reuseRows = false } = {}) {
 
 // ------------------------------------------------------------------ histograma
 function renderChart(stats) {
+  if (window.ExplorerTimeline) return window.ExplorerTimeline.render(stats);
   const box = $("#chart");
   const panel = box.closest(".hist-panel");
   panel.hidden = !state.loaded;
@@ -4975,6 +5116,7 @@ function fillColumnControls() {
 }
 
 function openTsModal(path = null) {
+  state.tsAnalysisOwner = window.AnalysisContexts?.capture();
   state.tsEditingPath = typeof path === "string" ? path : null;
   if (!document.querySelector("#ts-rules .dv-rule")) tsAddRule();
   updateTsExample();
@@ -5171,6 +5313,8 @@ function showDetailNameMenu(event, node) {
   const column = state.columns.includes(node.path) ? node.path : null;
   const items = [];
   if (column) {
+    if (window.ExplorerTimeline) items.push(window.ExplorerTimeline.menuItem(column));
+    if (window.FieldTransforms) items.push(window.FieldTransforms.menuItem(column, { event: state.currentDetailEv, anchor: event.target }));
     items.push(valueFilterMenuItem(column, node.hasValue ? detailFieldFilterValue(node) : "", event.target, { op: node.hasValue ? null : "contains" }));
     if (column !== "timestamp") items.push({
       icon: state.visibleCols.includes(column) ? "fa-eye-slash" : "fa-table-columns",
@@ -5198,6 +5342,7 @@ function showDetailValueMenu(event, node, selected = "", inModal = false) {
   const sourceText = column && state.currentDetailEv ? String(cellValue(state.currentDetailEv, column) ?? "") : "";
   const canContain = !!column && !!text.trim() && sourceText.includes(text);
   const items = [];
+  if (actual && window.FieldTransforms) items.push(window.FieldTransforms.menuItem(column, { event: state.currentDetailEv, anchor: event.target }));
   if (column) items.push({ icon: "fa-filter", label: `Criar filtro: ${colLabel(column)}`, onClick: () => openValueFilter(column, text, event.target, selected ? "contains" : null) });
   if (column && text.trim()) {
     if (actual && !selected) items.push(
@@ -5340,6 +5485,8 @@ function showDetail(ev, sourceSpec = null) {
   }
 
   $("#pane-overview").innerHTML = "";
+  const diagnostics = window.FieldTransforms?.renderDiagnostics(ev);
+  if (diagnostics) $("#pane-overview").appendChild(diagnostics);
   $("#pane-overview").appendChild(renderDetailTree(rows));
   $("#pane-json").innerHTML = highlightJson(window.EvidenceUI ? EvidenceUI.redact(ev) : ev);
   $("#pane-raw").textContent = (window.EvidenceUI ? EvidenceUI.redact(ev.raw) : ev.raw) || "(sem conteúdo bruto)";
@@ -5923,7 +6070,9 @@ async function handleMcpStateChanged(kind) {
       $("#codes-editor").value = await api("get_codes", {}, { silent: true });
       updateSysCount();
     } else if (kind === "derived") {
-      await loadDerivedFields();
+      const owner = window.AnalysisContexts?.capture();
+      if (owner?.caseId) await window.AnalysisContexts.refresh(owner.caseId, { owner });
+      if (!await loadDerivedFields()) return;
     } else if (kind === "ts_config") {
       if (state.currentArtifact?.kind === "file") await loadTsConfig(state.currentArtifact.path);
       updateTsExample();
@@ -5944,78 +6093,10 @@ async function handleMcpStateChanged(kind) {
 // a fonte de eventos mudou no backend (load/clear via MCP): refaz o pós-load lógico da UI
 async function mcpRefreshSource(contextual = false) {
   if (window.WorkspaceContext?.ready && !contextual) return window.WorkspaceContext.sourceChanged(() => mcpRefreshSource(true));
-  // resume a fonte atual no backend; fallback: deriva as colunas dos perfis (vazio = fonte limpa)
-  let columns = [];
-  let count = null;
-  let sourceDesc = "";
-  let profiles = null;
-  let summary = null;
-  try { summary = await api("source_summary", {}, { silent: true }); } catch { summary = null; }
-  if (summary && typeof summary.count === "number") {
-    columns = summary.columns || [];
-    count = summary.count;
-    sourceDesc = summary.source_desc || "";
-  } else {
-    try { profiles = (await api("profile_fields", { filters: [] }, { silent: true })) || []; }
-    catch { profiles = []; }
-    columns = profiles.map((p) => p.name);
-    if (!columns.length) count = 0;
-  }
-  if (count === 0) {
-    await clearData();
-    switchView("source");
-    return;
-  }
-  state.columns = columns;
-  state.visibleCols = (state.visibleCols || []).filter((col) => state.columns.includes(col));
-  if (!state.visibleCols.length) {
-    state.visibleCols = ["timestamp", "level", "code", "name", "message"].filter((col) => state.columns.includes(col));
-  }
-  // mesmo recorte limpo de um load manual: filtros e paginação recomeçam
-  state.filters = [];
-  state.quick = "";
-  setQuickSearchDraft();
-  state.page = 0;
-  state.loaded = true;
-  state.datasetDashboard = null;
-  state.datasetCube = null;
-  state.caseProfiles = {};
-  fillColumnControls();
-  renderChips();
-  $("#btn-merge").disabled = false;
-  // rótulo da fonte carregada pelo MCP (sem registrar no drive do Caso: a spec de origem é externa)
-  if (sourceDesc) {
-    if (state.currentArtifact) {
-      state.currentArtifact.label = sourceDesc;
-      if (count != null) state.currentArtifact.count = count;
-    } else {
-      state.currentArtifact = {
-        id: "mcp:externo",
-        label: sourceDesc,
-        kind: "file",
-        path: "",
-        count: count || 0,
-        loadedAt: Date.now(),
-        source: null,
-      };
-    }
-    state.currentOrigin = sourceDesc;
-  }
-  await refresh();
-  $("#load-status").textContent = `${fmtNum(count ?? state.total)} eventos`;
-  $("#load-status").className = "load-status ok";
-  // perfis dos campos alimentam a árvore de exploração
-  if (profiles) {
-    state.datasetProfiles = profiles;
-    renderExploreTree();
-  } else {
-    api("profile_fields", { filters: [] }, { silent: true })
-      .then((p) => { state.datasetProfiles = p; renderExploreTree(); })
-      .catch(() => {});
-  }
-  updateContextBar();
-  // se a UI estava fora da exploração do artefato, leva o usuário aos dados
-  if (state.activeContext === "artifact" && document.querySelector(".shell").hidden) switchView("viz");
+  const version = ++state.artifactSwitchVersion, item = activeCase();
+  const current = () => version === state.artifactSwitchVersion && activeCase() === item;
+  try { return await reconcilePublishedSource(current); }
+  catch (error) { if (current()) sourceIdentityUnavailable(state.currentArtifact?.source); throw error; }
 }
 
 // cases.json mudou fora do app: relê e substitui o estado em memória (sem regravar)
@@ -6428,17 +6509,7 @@ function bind() {
   $("#derive-cancel").onclick = () => { $("#derive-modal").hidden = true; };
   $("#derive-save").onclick = saveDerivedField;
   $("#dv-add-rule").onclick = () => { dvAddRule(); updateDvPreview(); };
-  $("#derive-delete").onclick = async () => {
-    if (!dvCtx?.editName) return;
-    try {
-      await api("delete_derived_field", { name: dvCtx.editName });
-      $("#derive-modal").hidden = true;
-      toast(`Campo "${dvCtx.editName}" removido.`, "ok");
-      state.columns = state.columns.filter((c) => c !== dvCtx.editName);
-      loadDerivedFields();
-      refresh();
-    } catch { /* toast já exibido */ }
-  };
+  $("#derive-delete").onclick = deleteDerivedField;
   $("#derive-modal").addEventListener("click", (e) => {
     if (e.target === $("#derive-modal")) $("#derive-modal").hidden = true;
   });
@@ -6478,23 +6549,26 @@ loadFormatOptions();
 fillColumnControls();
 renderChips();
 renderExploreTree();
-loadDerivedFields();
 renderStationShortcuts();
 renderTable({ total: 0, rows: [] });
 renderChart({ buckets: [], levels: [] });
 setWorkbar("Nenhuma fonte carregada", "");
 switchView("source");
 window.workspaceBootstrap = (async () => {
+  // Install context/task decorators before any Case-scoped bootstrap request.
+  if (document.readyState === "loading") await new Promise(resolve => document.addEventListener("DOMContentLoaded", resolve, { once: true }));
   try {
     const loaded = await api("cases_load", {}, { silent: true });
     if (loaded && Array.isArray(loaded.cases)) {
       state.cases = normalizeCaseStore(loaded);
+      window.AnalysisContexts?.activate();
       saveCases();
     }
   } catch (error) { toast(`Não foi possível abrir as investigações: ${error}`, "err"); }
   renderCaseBar();
   updateAnalysisBadge();
   if (activeCase()) {
+    await loadDerivedFields();
     setAnalysisView(activeCase().workspace?.analysisView || "vtimeline");
     await syncActiveCaseArtifacts();
     if (window.WorkspaceContext) await window.WorkspaceContext.initialize();

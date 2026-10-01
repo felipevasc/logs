@@ -50,32 +50,22 @@ pub(crate) fn engine_dir() -> PathBuf {
 /// Derived fields: when present, names and descriptions are resolved while
 /// building (rules may test them), so the catalogs join the store key.
 fn derived_signature(derived: &[CompiledDerived]) -> Option<String> {
-    let mut text = String::new();
-    for d in derived {
-        text.push_str(&format!("{}\u{1}{}\u{1}", d.name, d.source));
-        for rule in &d.rules {
-            // A rule reading the line position would depend on file order.
+    if derived.is_empty() { return Some(String::new()); }
+    let mut definitions = Vec::with_capacity(derived.len());
+    for field in derived {
+        if field.source == "id" { return None; }
+        let mut rules = Vec::with_capacity(field.rules.len());
+        for rule in &field.rules {
             if let Some(filter) = &rule.filter {
-                if filter.column == "id" || (filter.op == "query" && query_reads_id(&filter.value))
-                {
-                    return None;
-                }
+                if filter.column == "id" || (filter.op == "query" && query_reads_id(&filter.value)) { return None; }
             }
-            text.push_str(&format!(
-                "{}\u{2}{:?}\u{2}{}\u{3}",
-                rule.re.as_str(),
-                rule.template,
-                rule.filter
-                    .as_ref()
-                    .map(|f| serde_json::to_string(f).unwrap_or_default())
-                    .unwrap_or_default()
-            ));
+            rules.push((rule.re.as_str(), &rule.template, &rule.filter));
         }
-        if d.source == "id" {
-            return None;
-        }
+        definitions.push((&field.name, &field.source, &field.steps, rules));
     }
-    Some(text)
+    // Version all derived overlays (including legacy regex) because bounded
+    // extraction/provenance semantics changed. Base immutable stores stay valid.
+    Some(format!("derived-overlay-v2:{}:{}", crate::field_transform::VERSION, serde_json::to_string(&definitions).ok()?))
 }
 
 fn query_reads_id(text: &str) -> bool {
@@ -1318,7 +1308,7 @@ fn schedule(
             parts: idx.parts.clone(),
             lines: Arc::clone(&idx.lines),
             columns: Vec::new(),
-            time_order: std::sync::OnceLock::new(),
+            time_order: Arc::clone(&idx.time_order),
         },
         spec: spec.clone(),
         base: base.cloned(),
@@ -2006,6 +1996,7 @@ mod segment_tests {
         let derived = vec![CompiledDerived {
             name: "extracted".into(),
             source: "message".into(),
+            steps: Vec::new(),
             rules: vec![crate::sources::CompiledRule {
                 re: regex::Regex::new("(alpha)").unwrap(),
                 template: None,

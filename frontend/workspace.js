@@ -2,7 +2,7 @@
 (() => {
   "use strict";
   const home = $("#workspace-home"), content = $("#ws-content"), empty = $("#ws-empty");
-  let page = "summary", overview = null, sourceList = [], serial = 0, cacheKey = "", pendingOverview = null, lastExploredKey = "";
+  let page = "summary", overview = null, sourceList = [], serial = 0, cacheKey = "", pendingOverview = null, lastExploredKey = "", navigation = 0;
   const history = [];
   let lastFilters = "[]", importing = false, removedEvidence = null;
   let previousSelection = { filters: [], quick: "" };
@@ -72,12 +72,15 @@
     $("#ws-subtitle").textContent = page === "compromises" ? `Todo o ${workspaceScope() === "case" ? "Caso ativo" : "conjunto carregado"} · independente dos filtros do Explorar` : page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${currentCountLabel("registros")} do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${currentCountLabel("eventos")}${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
   }
   async function showPage(next) {
+    const request = ++navigation;
     window.RemoteSources?.unmount?.();
     // Comparar lives in Explorar → Descobrir.
     if (next === "compare") { window.Discovery?.setMode?.("compare"); state.activeDatasetTab = "dashboard"; next = "explore"; }
     if (next === "case-timeline" && workspaceScope() === "case" && activeCase()?.workspace?.timelineMode === "volume") next = "timeline";
     if (workspaceScope() === "case" && STRUCTURE.has(next)) { await window.WorkspaceContext.setScope("dataset", { page: next }); return; }
     if (workspaceScope() === "dataset" && ["evidence", "case-trails"].includes(next) && window.WorkspaceContext && !window.WorkspaceContext.changing) { await window.WorkspaceContext.setScope("case", { page: next }); return; }
+    if (window.AnalysisContexts && activeCase() && state.analysisDefinitionsPending && !await loadDerivedFields()) return;
+    if (request !== navigation) return;
     markPage(next); closeDrawer();
     if (next === "case-timeline" && workspaceScope() === "case") {
       home.hidden = true;
@@ -612,6 +615,7 @@
     page: () => page,
     capture: () => ({ history: structuredClone(history), previousSelection: structuredClone(previousSelection), lastFilters, timeline: timeline.capture() }),
     restore: snapshot => { serial++; cacheKey = ""; overview = null; pendingOverview = null; history.splice(0, history.length, ...(snapshot?.history || [])); previousSelection = snapshot?.previousSelection || { filters: structuredClone(state.filters), quick: state.quick }; lastFilters = snapshot?.lastFilters || JSON.stringify(previousSelection); timeline.restore(snapshot?.timeline); },
+    invalidateAnalysis: () => { serial++; cacheKey = ""; overview = null; pendingOverview = null; lastExploredKey = ""; timeline.invalidate(); },
     onFiltersChanged: () => { lastExploredKey = ""; if (["summary", "timeline", "case-timeline", "compare", "journeys"].includes(page)) showPage(page); },
     onView(which) {
       if (which === "workspace") return;

@@ -458,6 +458,11 @@
     for (const element of document.querySelectorAll(".aw-pivot-result-tools, #aw-pivot-summary, #aw-pivot-pager")) element.hidden = chart;
   };
   window.WorkspaceAnalysis = {
+    invalidateAnalysis: () => {
+      groupPresentationCache = null; pivotPresentationCache = null; groupView.version++; clearTimeout(groupTimer);
+      groupView.result = null; groupView.page = 0; pivotView.page = 0;
+      for (const selector of ["#group-table thead", "#group-table tbody", "#cube-table thead", "#cube-table tbody", "#aw-group-pager", "#aw-pivot-pager"]) $(selector)?.replaceChildren();
+    },
     capture: () => ({ group: { search: groupView.search, sort: groupView.sort, direction: groupView.direction, page: groupView.page }, pivot: { ...pivotView } }),
     restore: saved => {
       groupPresentationCache = null; pivotPresentationCache = null;

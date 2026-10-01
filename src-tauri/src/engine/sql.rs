@@ -174,6 +174,18 @@ impl Schema {
             && !self.structured.contains(column)
     }
 
+    /// Exact grouping text as Ctx::get(field_ref(...)) sees it. Unsupported
+    /// nested/ambiguous fields keep the bounded event path; NULL stays absent,
+    /// while empty and whitespace-only strings remain real keys.
+    pub(crate) fn grouped_field(&self, field: &crate::querylang::FieldRef, names: &mut bool) -> Option<String> {
+        let (name, role) = field.parts();
+        match self.ctx_value(name, role, names) {
+            Val::Sql(value) => Some(value),
+            Val::Absent => Some(NULL_TEXT.into()),
+            Val::Unsupported => None,
+        }
+    }
+
     /// Value the search language reads for a field (`Ctx::field`).
     fn ctx_value(&self, name: &str, role: Option<Role>, names: &mut bool) -> Val {
         if name.starts_with('@') {

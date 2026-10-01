@@ -74,6 +74,12 @@ window.QueryBar = (() => {
   const ACTIONS = ["logon", "logoff", "process_start", "network_connection", "dns_query", "http_request", "service_install", "task_create", "account_create", "group_member_add", "password_change", "log_clear", "privilege_use", "script_execution", "file_create", "registry_change", "ids_alert", "malware_detected"];
   let items = [], active = -1, token = null, valueCache = new Map(), serial = 0, suggestionNotice = "";
   const fold = text => text.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+  const sourceIdentities = new WeakMap(); let nextSourceIdentity = 0;
+  function sourceIdentity(value) {
+    if (value == null || typeof value !== "object") return null;
+    if (!sourceIdentities.has(value)) sourceIdentities.set(value, ++nextSourceIdentity);
+    return sourceIdentities.get(value);
+  }
 
   function currentToken() {
     const caret = input.selectionStart ?? input.value.length;
@@ -111,8 +117,8 @@ window.QueryBar = (() => {
     // counts whose selection/revision prefix still matches the current source.
     const facetPrefix = [scope, state.datasetRevision, JSON.stringify(state.derivedFields), JSON.stringify(backendFilters())].join("|") + "|";
     const cached = state.treeAggSig?.[scope]?.startsWith(facetPrefix) ? state.treeAgg?.[scope]?.[resolved] : null;
-    const prior = valueCache.get(key), rows = state.rows;
-    let values = prior?.facets === cached && prior?.rows === rows ? prior.values : null;
+    const prior = valueCache.get(key), rowToken = sourceIdentity(state.rows), facetToken = sourceIdentity(cached);
+    let values = prior?.facetToken === facetToken && prior?.rowToken === rowToken ? prior.values : null;
     const sampled = !Array.isArray(cached);
     if (!values) {
       let oversized = false;
@@ -134,7 +140,8 @@ window.QueryBar = (() => {
       // values into the search box; the full-value composer remains available.
       oversized ||= values.some(item => String(item.value ?? "").length > 4096);
       values = values.filter(item => item.value != null && String(item.value).length <= 4096);
-      valueCache.set(key, { values, facets: cached, rows, oversized });
+      // Tokens invalidate by identity without retaining whole old pages/facet arrays.
+      valueCache.set(key, { values, facetToken, rowToken, oversized });
       if (valueCache.size > 40) valueCache.delete(valueCache.keys().next().value);
     }
     const query = fold(prefix);

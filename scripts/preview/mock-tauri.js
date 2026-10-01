@@ -85,6 +85,8 @@
 
   let COLUMNS = ["timestamp", "source", "level", "code", "name", "description", "message",
     "usuario", "ip_cliente", "status", "tamanho", "latencia", "ativo", "ambiente", "anotacao", "request_id", "correlation_id", "operacao", "regiao", "canal"];
+  COLUMNS.push("mock_payload_b64");
+  for (const [index, event] of events.slice(0, 8).entries()) event.fields.mock_payload_b64 = btoa(JSON.stringify({ user: "preview-user", attempt: index, allowed: index % 2 === 0 }));
   const loadedParts = ["mock.jsonl (preview)"];
   const derivedFields = [];
   const mockCalls = {};
@@ -130,7 +132,7 @@
     if (col === "timestamp") return ev.timestamp == null ? "" : new Date(ev.timestamp).toISOString().replace(/\.000Z$/, "+00:00").replace(/Z$/, "+00:00");
     if (col in ev && typeof ev[col] === "string") return ev[col];
     const v = ev.fields?.[col];
-    return v === undefined || v === null ? "" : String(v);
+    return v === undefined || v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
   };
   const parseNumUnit = (s) => {
     const m = String(s).trim().toLowerCase().match(/^(-?[\d.,]+)\s*(tb|gb|mb|kb|b|gbps|mbps|kbps|bps|ms|s|min|h|%)?$/);
@@ -277,7 +279,8 @@
 
   function profileFields(rows) {
     const profiles = [];
-    for (const col of COLUMNS) {
+    const columns = new Set(COLUMNS); for (const row of rows) for (const key of Object.keys(row.fields || {})) columns.add(key);
+    for (const col of columns) {
       const counts = new Map();
       let total = 0, numeric = 0, bools = 0, ips = 0, min = null, max = null, empty = 0;
       for (const ev of rows) {
@@ -832,6 +835,116 @@
     source_hashes: () => [{ id: "mock-app", path: "C:\\mock\\mock.jsonl", name: "application.jsonl", bytes: 2400000, sha256: "9f2b5c1e7d3a4b6c8e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7", origin: "original" }],
   });
 
+  handlers.grouped_timeline = ({ field, grid, filters, caseEvents, caseKey, analysisContext, sourceGeneration: generation, limit = 12 }) => {
+    limit = Math.max(1, Math.min(24, limit));
+    const counts = () => ({ count: 0, buckets: Array(grid.bucketCount).fill(0) });
+    const total = counts(), missing = counts(), other = counts(), groups = new Map();
+    let untimed = 0, outsideGrid = 0;
+    const add = (group, bucket) => { group.count++; group.buckets[bucket]++; };
+    for (const event of applyFilters(filters, poolOf(caseEvents))) {
+      const time = event.timestamp;
+      if (time == null || time === 0) { untimed++; continue; }
+      const bucket = grid.bucketMs ? Math.floor((time - grid.start) / grid.bucketMs) : -1;
+      if (bucket < 0 || bucket >= grid.bucketCount) { outsideGrid++; continue; }
+      add(total, bucket);
+      const raw = field.startsWith("@") && window.QueryLang ? window.QueryLang.fieldValue(event, window.QueryLang.resolve(field))
+        : field === "timestamp" || field === "event_ref" ? colStr(event, field) : Object.hasOwn(event, field) ? event[field] : event.fields?.[field];
+      if (raw == null) { add(missing, bucket); continue; }
+      const key = typeof raw === "string" ? raw : typeof raw === "object" ? JSON.stringify(raw) : String(raw);
+      if (!groups.has(key)) groups.set(key, { key, ...counts() });
+      add(groups.get(key), bucket);
+    }
+    const compareKey = (a, b) => {
+      const left = [...a], right = [...b];
+      for (let i = 0; i < Math.min(left.length, right.length); i++) { const order = left[i].codePointAt(0) - right[i].codePointAt(0); if (order) return order; }
+      return left.length - right.length;
+    };
+    const ranked = [...groups.values()].sort((a, b) => b.count - a.count || compareKey(a.key, b.key));
+    for (const group of ranked.slice(limit)) { other.count += group.count; group.buckets.forEach((count, i) => { other.buckets[i] += count; }); }
+    return { field, grid, total, series: ranked.slice(0, limit), other, missing, untimed, outsideGrid, limit, selection: "top",
+      context: { analysis: analysisContext || null, sourceGeneration: caseKey ? null : generation ?? null, caseKey: caseKey || null } };
+  };
+
+  // Case-scoped configuration mirrors native receipts; source events remain immutable.
+  const analysisContexts = new Map(); let analysisSerial = 0, storeRevision = 0;
+  const analysisIdentity = value => value ? Object.fromEntries(["caseId", "analysisId", "configRevision", "visibilityRevision"].map(key => [key, value[key]])) : null;
+  const newAnalysis = caseId => ({ schemaVersion: 1, caseId, analysisId: `preview-analysis-${++analysisSerial}-${Date.now()}`, configRevision: 0, visibilityRevision: 0, config: { derivedFields: [], references: [] }, migrationDiagnostics: [], legacyRaw: null });
+  const analysisFor = args => {
+    if (!args.analysisContext) return null;
+    const value = analysisContexts.get(args.analysisContext.caseId);
+    if (!value || JSON.stringify(analysisIdentity(value)) !== JSON.stringify(analysisIdentity(args.analysisContext))) throw Error("ANALYSIS_CONTEXT_CHANGED: Atualize a configuração do Caso.");
+    return value;
+  };
+  const initialCasesLoad = handlers.cases_load;
+  handlers.cases_load = () => {
+    const store = initialCasesLoad(); storeRevision = store.revision || 0;
+    for (const item of store.cases || []) {
+      if (!analysisContexts.has(item.id)) analysisContexts.set(item.id, item.analysisContext?.schemaVersion === 1 ? structuredClone(item.analysisContext) : newAnalysis(item.id));
+      item.analysisContext = structuredClone(analysisContexts.get(item.id));
+    }
+    return store;
+  };
+  handlers.cases_save = ({ data }) => {
+    const receipts = [];
+    for (const item of data.cases || []) {
+      if (!analysisContexts.has(item.id)) { const value = newAnalysis(item.id); analysisContexts.set(item.id, value); receipts.push(structuredClone(value)); }
+      item.analysisContext = structuredClone(analysisContexts.get(item.id));
+    }
+    for (const id of analysisContexts.keys()) if (!data.cases.some(item => item.id === id)) analysisContexts.delete(id);
+    data.revision = ++storeRevision; localStorage.setItem("__mockStore", JSON.stringify(data));
+    return { revision: storeRevision, analysisContexts: receipts };
+  };
+  handlers.preview_field_transform = ({ value, steps }) => window.__mockFieldTransforms.transform(value, steps);
+  handlers.analysis_context_snapshot = ({ caseId }) => {
+    const value = analysisContexts.get(caseId); if (!value) throw Error("Caso não encontrado."); return structuredClone(value);
+  };
+  for (const command of ["list_derived_fields", "save_derived_field", "delete_derived_field"]) {
+    const legacy = handlers[command];
+    handlers[command] = args => {
+      const context = analysisFor(args); if (!context) return legacy(args);
+      if (command === "list_derived_fields") return structuredClone(context.config.derivedFields);
+      const list = context.config.derivedFields, index = list.findIndex(field => field.name === args.name);
+      const previous = list[index], steps = args.steps === undefined ? previous?.steps || [] : args.steps;
+      if (command === "save_derived_field" && !args.rules?.length && !steps.length) throw Error("O campo derivado precisa de regras ou transformações.");
+      if (index >= 0) list.splice(index, 1);
+      if (command === "save_derived_field") list.push({ ...previous, name: args.name, source: args.source, rules: structuredClone(args.rules || []), steps: structuredClone(steps) });
+      context.configRevision++;
+      const stored = localStorage.getItem("__mockStore");
+      if (stored) { const data = JSON.parse(stored), item = data.cases?.find(item => item.id === context.caseId); if (item) { item.analysisContext = context; localStorage.setItem("__mockStore", JSON.stringify(data)); } }
+      return { analysisContext: structuredClone(context) };
+    };
+  }
+  function analysisRows(rows, context) {
+    if (!context?.config.derivedFields.length) return rows;
+    return rows.map(row => {
+      const event = { ...row, fields: { ...row.fields } };
+      for (const field of context.config.derivedFields) {
+        if (field.steps?.length && Object.hasOwn(row.fields || {}, field.name)) continue;
+        try {
+          const hasField = Object.hasOwn(event.fields || {}, field.source);
+          const canonical = ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw"].includes(field.source);
+          if (!hasField && !canonical && !field.source.startsWith("@")) continue;
+          let value = hasField ? event.fields[field.source] : colStr(event, field.source);
+          if (field.rules?.length) {
+            let matched = false;
+            for (const rule of field.rules) {
+              if (rule.filter && !matchFilter(event, rule.filter)) continue;
+              const match = new RegExp(rule.pattern).exec(typeof value === "string" ? value : JSON.stringify(value)); if (!match) continue;
+              value = rule.template ? rule.template.replace(/\$(\d+)/g, (_, i) => match[Number(i)] ?? "") : match[1] ?? match[0]; matched = true; break;
+            }
+            if (!matched) continue;
+          }
+          if (field.steps?.length) {
+            const transformed = window.__mockFieldTransforms.transform(value, field.steps);
+            Object.assign(event.fields, window.__mockFieldTransforms.expand(field.name, transformed.value));
+            if (transformed.notices.length) event.derived_diagnostics = [...event.derived_diagnostics || [], ...transformed.notices.map(code => ({ field: field.name, code, warning: true }))];
+          } else event.fields[field.name] = value;
+        } catch (error) { event.derived_diagnostics = [...event.derived_diagnostics || [], { field: field.name, code: "transform_error", message: String(error), warning: false }]; }
+      }
+      return event;
+    });
+  }
+
   const delay = (ms) => new Promise((r) => setTimeout(r, ms));
   const listeners = {};
   const emitMock = (name, payload) => (listeners[name] || []).forEach((cb) => cb({ payload }));
@@ -858,7 +971,7 @@
   window.__TAURI__ = {
     core: {
       invoke: async (cmd, args = {}) => {
-        window.__mockRequests ||= []; window.__mockRequests.push({ cmd, cursor: args.cursor, offset: args.offset, operationId: args.operationId }); if (window.__mockRequests.length > 400) window.__mockRequests.shift();
+        window.__mockRequests ||= []; window.__mockRequests.push({ cmd, cursor: args.cursor, offset: args.offset, operationId: args.operationId, field: args.field, grid: args.grid, caseKey: args.caseKey, analysisContext: args.analysisContext, sourceGeneration: args.sourceGeneration }); if (window.__mockRequests.length > 400) window.__mockRequests.shift();
         window.__mockCommandCalls ||= {};
         window.__mockCommandCalls[cmd] = (window.__mockCommandCalls[cmd] || 0) + 1;
         const h = handlers[cmd];
@@ -868,7 +981,8 @@
           args = { ...args, caseEvents: caseStore.get(args.caseKey) };
         }
         try {
-          const scopedCommands=['query_page','query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
+          const scopedCommands=['grouped_timeline','query_page','query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
+          if (scopedCommands.includes(cmd) && args.analysisContext) args = { ...args, caseEvents: analysisRows(poolOf(args.caseEvents), analysisFor(args)) };
           if(scopedCommands.includes(cmd)&&args.filters?.some(filter=>filter.op==='threat_rule')){
             const module=await import('/__mock-threats__.js');
             args={...args,caseEvents:await module.threatFilterRows(poolOf(args.caseEvents),args.filters.filter(filter=>filter.op==='threat_rule')),filters:args.filters.filter(filter=>filter.op!=='threat_rule')};
@@ -880,14 +994,14 @@
           const extra = window.__mockLatency?.[cmd];
           if (extra) { const generation = window.__mockGeneration || 0; for (let elapsed = 0; elapsed < extra; elapsed += 25) { await delay(Math.min(25, extra - elapsed)); if ((window.__mockGeneration || 0) !== generation || window.__mockCancelledIds?.has(args.operationId)) throw new Error("Operação cancelada."); } }
           if (window.__mockFailures?.[cmd]) throw new Error(window.__mockFailures[cmd]);
-          const result = await h(args);
+          let result = await h(args);
           if (["load_file", "load_files", "load_bundle", "load_event_log", "clear_events"].includes(cmd)) {
             sourceGeneration++; sourceOperationId = args.operationId || null;
             const inputs = cmd === "clear_events" ? [] : cmd === "load_bundle" ? args.members
               : cmd === "load_event_log" ? [{ kind: "eventlog", channel: args.channel, maxEvents: args.maxEvents }]
               : [{ kind: "file", paths: args.paths || [args.path], format: args.format || "auto" }];
             sourceInputs = args.merge ? [...sourceInputs, ...inputs] : inputs;
-            if (result) result.publication = { generation: sourceGeneration, operationId: sourceOperationId };
+            result ||= {}; result.publication = { generation: sourceGeneration, operationId: sourceOperationId, analysisContext: args.analysisContext || null };
           }
           return result;
         } catch (e) {

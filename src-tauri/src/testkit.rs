@@ -76,6 +76,7 @@ impl Source {
             .map(|d| CompiledDerived {
                 name: d.name,
                 source: d.source,
+                steps: d.steps,
                 rules: d
                     .rules
                     .iter()

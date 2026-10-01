@@ -28,8 +28,11 @@ pub async fn load_bundle(
     members: Vec<ImportSource>,
     app: AppHandle,
     operation_id: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
 ) -> Result<crate::LoadSummary, String> {
-    crate::offload_operation(operation_id, move || {
+    let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Publish)?;
+    crate::offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         load_bundle_impl(state.inner(), members, Some(&app))
     }).await?
@@ -132,7 +135,7 @@ impl Selection<'_> {
     fn batches(&self, idx: &sources::FileIndex) -> EventBatches {
         use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
         // The 50M line metadata and mmaps are shared; do not copy time_order.
-        let idx = sources::FileIndex { parts: idx.parts.clone(), lines: Arc::clone(&idx.lines), columns: idx.columns.clone(), time_order: std::sync::OnceLock::new() };
+        let idx = sources::FileIndex { parts: idx.parts.clone(), lines: Arc::clone(&idx.lines), columns: idx.columns.clone(), time_order: Arc::clone(&idx.time_order) };
         let (codes, system, derived) = ((*self.codes).clone(), (*self.system).clone(), self.derived.to_vec());
         let prepared = Arc::clone(&self.prepared);
         let failure = Arc::clone(&self.failure);
@@ -216,19 +219,19 @@ pub(crate) fn with_engine<T>(
     state: &AppState,
     f: impl FnOnce(&crate::engine::Source<'_>) -> Result<Option<T>, String>,
 ) -> Result<Option<T>, String> {
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let SourceData::Indexed(idx) = &*source else { return Ok(None) };
     let codes = state.codes.read();
     let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let derived = crate::analysis_runtime::derived(&state);
     f(&crate::engine::Source { idx, codes: &codes, system: &system, derived: &derived })
 }
 
 pub fn with_selection<T>(state: &AppState, filters: &[Filter], f: impl FnOnce(Selection<'_>) -> T) -> Result<T, String> {
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let codes = state.codes.read();
     let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let derived = crate::analysis_runtime::derived(&state);
     if let SourceData::Indexed(idx) = &*source {
         for part in &idx.parts { sources::validate_source(part)?; }
     }
@@ -370,10 +373,12 @@ pub async fn dataset_overview(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<insights::Overview, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || {
         overview_scope_impl(
             app.state::<AppState>().inner(),
             filters,
@@ -484,10 +489,23 @@ pub fn timeline_range_scope_impl(
         }
         return Ok(result);
     }
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     match &*source {
         SourceData::Indexed(idx) => {
             if scoped_filters.len() == 1 {
+                let codes = state.codes.read();
+                let system = state.system_codes.read();
+                let derived = crate::analysis_runtime::derived(&state);
+                let input = crate::engine::Source { idx, codes: &codes, system: &system, derived: &derived };
+                if let Some(histogram) = crate::engine::timeline_histogram(&input, start, end, width, bucket_count)? {
+                    return Ok(TimelineRange {
+                        start, end, bucket_ms: width, total: histogram.total, errors: histogram.errors, warnings: histogram.warnings,
+                        buckets: histogram.buckets.into_iter().enumerate().map(|(i, b)| TimelineBucket {
+                            timestamp: start.saturating_add((i as i64).saturating_mul(width)),
+                            count: b.count, errors: b.errors, warnings: b.warnings,
+                        }).collect(),
+                    });
+                }
                 // The normal timeline reads only the compact index metadata.
                 // It never allocates an ID for every matching log line.
                 for (id, meta) in idx.lines.iter().enumerate() {
@@ -501,7 +519,7 @@ pub fn timeline_range_scope_impl(
             } else {
                 let codes = state.codes.read();
                 let system = state.system_codes.read();
-                let derived = state.derived.read();
+                let derived = crate::analysis_runtime::derived(&state);
                 query::visit_indexed_matches(idx, &scoped_filters, &codes, &system, &derived, |id| {
                     let meta = &idx.lines.at(id);
                     if meta.ts != 0 { add(meta.ts, crate::model::class_label(meta.level)); }
@@ -532,11 +550,13 @@ pub async fn timeline_range(
     bucket_count: usize,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<TimelineRange, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_admitted(operation_id, app.clone(), admitted, move || {
         if case_events.is_none() {
             return timeline_range_impl(
                 app.state::<AppState>().inner(),
@@ -564,10 +584,12 @@ pub async fn compare_periods(
     after: insights::Period,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<insights::Comparison, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || {
         if case_events.is_none() {
             compare_impl(app.state::<AppState>().inner(), filters, before, after)
         } else {
@@ -642,7 +664,7 @@ pub struct SourceInfo {
     pub unparsed: usize,
 }
 pub fn sources_impl(state: &AppState) -> Vec<SourceInfo> {
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     match &*source {
         SourceData::Indexed(idx) => idx
             .parts
@@ -690,7 +712,7 @@ pub fn sources_impl(state: &AppState) -> Vec<SourceInfo> {
         SourceData::Memory(events) => vec![SourceInfo {
             id: "eventlog".into(),
             path: String::new(),
-            name: state.source_names.read().join(" + "),
+            name: crate::analysis_runtime::source_names(state).join(" + "),
             format: "Event Log".into(),
             bytes: 0,
             count: events.len(),
@@ -704,8 +726,9 @@ pub fn sources_impl(state: &AppState) -> Vec<SourceInfo> {
     }
 }
 #[tauri::command]
-pub async fn list_sources(app: AppHandle) -> Result<Vec<SourceInfo>, String> {
-    crate::offload(move || sources_impl(app.state::<AppState>().inner())).await
+pub async fn list_sources(app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<SourceInfo>, String> {
+    let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || sources_impl(app.state::<AppState>().inner())).await
 }
 
 pub fn index_events(events: &[Event]) -> Result<sources::FileIndex, String> {
@@ -820,10 +843,12 @@ pub async fn export_events(
     mask: bool,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<usize, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || {
         validate(&filters)?;
         if !["csv", "jsonl"].contains(&format.as_str()) {
             return Err("Formato de exportação inválido.".into());
@@ -831,7 +856,7 @@ pub async fn export_events(
         let state = app.state::<AppState>();
         let requested = PathBuf::from(&path);
         let canonical = requested.canonicalize().unwrap_or(requested.clone());
-        if let SourceData::Indexed(idx) = &*state.source.read() {
+        if let SourceData::Indexed(idx) = &*crate::analysis_runtime::source(&state) {
             if idx.parts.iter().any(|p| {
                 PathBuf::from(&p.path)
                     .canonicalize()
@@ -2441,4 +2466,48 @@ pub fn expand_encoding(path: &Path) -> Result<Option<PathBuf>, String> {
         }
         Ok(())
     }).map(Some)
+}
+
+/// Exact grouped timeline over the same admitted scope as rows/count/facets.
+#[tauri::command]
+pub(crate) async fn grouped_timeline(
+    filters: Vec<Filter>,
+    field: String,
+    grid: crate::grouped_timeline::Grid,
+    limit: Option<usize>,
+    case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
+    operation_id: Option<String>,
+    app: AppHandle,
+) -> Result<crate::grouped_timeline::Response, String> {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let context = crate::grouped_timeline::Context {
+        analysis: admitted.identity.clone(), source_generation: admitted.source_generation, case_key: admitted.case_key.clone(),
+    };
+    let spec = crate::grouped_timeline::Spec::new(field, grid, limit, context)?;
+    crate::offload_admitted(operation_id, app.clone(), admitted, move || grouped_timeline_impl(app.state::<AppState>().inner(), &filters, case_events.as_deref(), &spec)).await?
+}
+
+pub(crate) fn grouped_timeline_impl(
+    state: &AppState, filters: &[Filter], case_events: Option<&[Event]>, spec: &crate::grouped_timeline::Spec,
+) -> Result<crate::grouped_timeline::Response, String> {
+    validate(filters)?;
+    spec.validate()?;
+    let prepared = query::prepare(filters);
+    let mut accumulator = crate::grouped_timeline::Accumulator::new(spec)?;
+    if let Some(events) = case_events {
+        for event in events {
+            crate::operations::check()?;
+            if prepared.iter().all(|filter| query::matches(event, filter)) { accumulator.add_event(event)?; }
+        }
+    } else {
+        if let Some(result) = with_engine(state, |source| crate::engine::grouped_timeline(source, &prepared, spec))? { return Ok(result); }
+        with_selection(state, filters, |selection| {
+            for event in selection.iter() { accumulator.add_event(&event)?; }
+            Ok::<(), String>(())
+        })??;
+    }
+    accumulator.finish()
 }

@@ -18,7 +18,8 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -624,6 +625,191 @@ mod bounded_analytics_tests {
         }
     }
 
+    fn chart(session: &Session, spec: serde_json::Value) -> Result<SeriesResult> {
+        let spec: SeriesSpec = serde_json::from_value(spec).unwrap();
+        let scope = Scope { session, cond: "TRUE".into(), names: false, _tests: Tests::default(), _selection: None, _free: Vec::new() };
+        series_of(&scope, &spec)
+    }
+
+    #[test]
+    fn series_count_stream_retains_only_top_keys_under_small_value_budget() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("SET threads=1; SET memory_limit='32MB'; \
+            CREATE VIEW ev AS SELECT range::BIGINT AS id, repeat('x',64) || lpad(range::VARCHAR,4,'0') AS level FROM range(4096)").unwrap();
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        let result = crate::resources::with_analytics_limit(8192, || chart(&session, serde_json::json!({"chart":"terms","metric":"count","limit":10}))).unwrap();
+        assert_eq!(result.x_values, (0..10).map(|i| Some(format!("{}{i:04}", "x".repeat(64)))).collect::<Vec<_>>());
+        assert_eq!(result.series[0].samples, vec![1;10]);
+        assert!(chart(&session, serde_json::json!({"chart":"terms","metric":"count","limit":0})).unwrap().x.is_empty());
+        assert_eq!(chart(&session, serde_json::json!({"chart":"terms","metric":"count","limit":900})).unwrap().x.len(), 500);
+    }
+
+    #[test]
+    fn series_numeric_terms_count_incompatible_units_below_top_n() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE TABLE ev(id BIGINT, source VARCHAR); \
+            INSERT INTO ev VALUES (0,'1KB'),(1,'2KB'),(2,'3s'),(3,'3s'),(4,'4s')").unwrap();
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        for metric in ["sum", "avg", "min", "max"] {
+            for limit in [0, 1, 3] {
+                let result = chart(&session, serde_json::json!({"chart":"terms","metric":metric,"field":"source","unit":"bytes","limit":limit})).unwrap();
+                assert_eq!(result.incompatible_units, 3);
+                if limit > 0 {
+                    assert_eq!(result.x_values[0], Some("2KB".into()));
+                    assert_eq!(result.series[0].points[0], 2048.0);
+                    assert_eq!(result.series[0].samples[0], 1);
+                }
+                assert_eq!(result.x.len(), limit);
+            }
+        }
+        let distinct = chart(&session, serde_json::json!({"chart":"terms","metric":"distinct","field":"source","unit":"bytes","limit":1})).unwrap();
+        assert_eq!(distinct.x_values, vec![Some("1KB".into())]);
+        assert_eq!(distinct.incompatible_units, 0);
+    }
+
+    #[test]
+    fn series_split_stream_keeps_six_raw_key_ties_without_other() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE TABLE ev(id BIGINT, ts BIGINT, level VARCHAR)").unwrap();
+        for (id, key) in ["\n", "\"", "\\", "a", "b", "c", "d", "é"].into_iter().enumerate() {
+            conn.execute("INSERT INTO ev VALUES (?,1,?)", duckdb::params![id as i64,key]).unwrap();
+        }
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        let result = chart(&session, serde_json::json!({"chart":"time","metric":"count","split":"level"})).unwrap();
+        assert_eq!(result.series.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["\n", "\"", "\\", "a", "b", "c"]);
+        assert!(result.series.iter().all(|s| s.samples == [1] && s.points == [1.0]));
+    }
+
+    #[test]
+    fn series_budget_and_sql_errors_do_not_publish_partial_charts() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE VIEW ev AS SELECT range::BIGINT AS id, repeat('x',4096) AS level FROM range(2)").unwrap();
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        let error = crate::resources::with_analytics_limit(1024, || chart(&session, serde_json::json!({"chart":"terms","metric":"count","limit":1}))).err().unwrap();
+        assert!(error.contains("LOGINSIGHT_ANALYTICS_LIMIT_MB"));
+        session.conn().unwrap().execute_batch("DROP VIEW ev; CREATE VIEW ev AS SELECT range::BIGINT AS id, \
+            CASE WHEN range>=4096 THEN error('chart fetch failure') ELSE range::VARCHAR END AS level FROM range(5000)").unwrap();
+        let error = chart(&session, serde_json::json!({"chart":"terms","metric":"count","limit":1})).err().unwrap();
+        assert!(error.contains("chart fetch failure"));
+        assert_eq!(session.conn().unwrap().query_row("SELECT 42", [], |r| r.get::<_,i64>(0)).unwrap(), 42);
+    }
+
+    #[test]
+    fn series_cancelled_stream_is_an_error_and_can_retry() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE TABLE ev(level VARCHAR); INSERT INTO ev VALUES ('a')").unwrap();
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        let token = crate::operations::token(Some("series-top-cancel".into())).unwrap();
+        let cancelled = crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("series-top-cancel");
+            let error = chart(&session, serde_json::json!({"chart":"terms","metric":"count"})).err().unwrap();
+            assert!(error.contains("cancelad"));
+        });
+        assert!(cancelled.is_err());
+        assert_eq!(chart(&session, serde_json::json!({"chart":"terms","metric":"count"})).unwrap().series[0].samples, vec![1]);
+    }
+
+    #[test]
+    fn series_metric_projection_plans_omit_unrequested_aggregates() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE TABLE ev(id BIGINT, source VARCHAR, level VARCHAR)").unwrap();
+        // Count/distinct must bind and execute without the numeric UDFs.
+        for metric in ["count", "distinct"] {
+            let (inner, outer) = metric_columns(Some("source"), None, metric);
+            let mut statement = conn.prepare(&format!("SELECT k,{outer} FROM (SELECT id,level AS k,{inner} FROM ev) GROUP BY k")).unwrap();
+            assert!(statement.query([]).unwrap().next().unwrap().is_none());
+        }
+        super::super::udf::register(&conn).unwrap();
+        for metric in ["count", "distinct", "sum", "avg", "min", "max"] {
+            let (inner, outer) = metric_columns(Some("source"), Some(UnitKind::Bytes), metric);
+            let plan: String = conn.query_row(&format!("EXPLAIN SELECT k,{outer} FROM (SELECT id,level AS k,{inner} FROM ev) GROUP BY k"), [], |r| r.get(1)).unwrap();
+            assert_eq!(plan.contains("count(DISTINCT"), metric == "distinct", "{metric}: {plan}");
+            assert_eq!(plan.contains("sum("), matches!(metric, "sum" | "avg"), "{metric}: {plan}");
+            assert_eq!(plan.contains("min("), metric == "min", "{metric}: {plan}");
+            assert_eq!(plan.contains("max("), metric == "max", "{metric}: {plan}");
+            assert_eq!(outer.contains("ORDER BY id"), matches!(metric, "sum" | "avg"));
+        }
+    }
+
+    #[test]
+    fn series_metric_projection_keeps_file_order_samples_and_warning_counts() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE TABLE ev(id BIGINT, ts BIGINT, source VARCHAR); INSERT INTO ev VALUES \
+            (3,1,'3'),(2,1,'-10000000000000000'),(1,1,'1'),(0,1,'10000000000000000'), \
+            (4,1,'2KB'),(5,1,''),(6,1,NULL)").unwrap();
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        for (metric, point, samples, warnings) in [
+            ("count", 7.0, 7, 0), ("distinct", 5.0, 5, 0), ("sum", 3.0, 4, 1),
+            ("avg", 0.75, 4, 1), ("min", -1e16, 4, 1), ("max", 1e16, 4, 1), ("unknown", 0.0, 4, 1),
+        ] {
+            let result = chart(&session, serde_json::json!({"chart":"time","metric":metric,"field":"source","unit":"number"})).unwrap();
+            assert_eq!(result.series[0].points, vec![point], "{metric}");
+            assert_eq!(result.series[0].samples, vec![samples], "{metric}");
+            assert_eq!(result.incompatible_units, warnings, "{metric}");
+            if metric != "count" {
+                let absent = chart(&session, serde_json::json!({"chart":"time","metric":metric,"unit":"number"})).unwrap();
+                assert_eq!(absent.series[0].points, vec![0.0]);
+                assert_eq!(absent.series[0].samples, vec![0]);
+                assert_eq!(absent.incompatible_units, 0);
+            }
+        }
+        let unrestricted = chart(&session, serde_json::json!({"chart":"time","metric":"sum","field":"source","unit":"unspecified"})).unwrap();
+        assert_eq!(unrestricted.series[0].points, vec![2051.0]);
+        assert_eq!(unrestricted.series[0].samples, vec![5]);
+        assert_eq!(unrestricted.incompatible_units, 0);
+        session.conn().unwrap().execute_batch("DELETE FROM ev WHERE id<4").unwrap();
+        for metric in ["sum", "avg", "min", "max"] {
+            let empty = chart(&session, serde_json::json!({"chart":"time","metric":metric,"field":"source","unit":"number"})).unwrap();
+            assert_eq!(empty.series[0].points, vec![0.0]);
+            assert_eq!(empty.series[0].samples, vec![0]);
+            assert_eq!(empty.incompatible_units, 1);
+        }
+    }
+
+    #[test]
+    fn series_indexed_buckets_keep_long_split_labels_and_sparse_values() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("SET threads=1; SET memory_limit='32MB'; CREATE TABLE ev(id BIGINT, ts BIGINT, level VARCHAR, source VARCHAR)").unwrap();
+        let names: Vec<_> = ["a'", "b\\", "c\n", "dé", "e日", "f", "z"].into_iter().map(|prefix| format!("{prefix}{}", "x".repeat(1024))).collect();
+        for (index, name) in names.iter().enumerate() {
+            conn.execute("INSERT INTO ev VALUES (?,1,?,'1KB'),(?,101,?,'3s')", duckdb::params![index as i64*2,name,index as i64*2+1,name]).unwrap();
+        }
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        for metric in ["sum", "avg", "min", "max"] {
+            let result = chart(&session, serde_json::json!({"chart":"time","metric":metric,"field":"source","split":"level","interval_ms":10,"unit":"bytes"})).unwrap();
+            assert_eq!(result.series.iter().map(|s| &s.name).collect::<Vec<_>>(), names.iter().take(6).collect::<Vec<_>>());
+            assert_eq!(result.incompatible_units, 6, "only selected split groups contribute legacy time warnings");
+            for series in result.series {
+                let mut points = vec![0.0; 11]; points[0] = 1024.0;
+                let mut samples = vec![0; 11]; samples[0] = 1;
+                assert_eq!(series.points, points);
+                assert_eq!(series.samples, samples);
+            }
+        }
+        session.conn().unwrap().execute_batch("UPDATE ev SET level=NULL").unwrap();
+        let empty = chart(&session, serde_json::json!({"chart":"time","metric":"count","split":"level","interval_ms":10})).unwrap();
+        assert_eq!(empty.series.len(), 1);
+        assert_eq!(empty.series[0].name, "eventos");
+        assert_eq!(empty.series[0].points, vec![0.0; 11]);
+        assert_eq!(empty.series[0].samples, vec![0; 11]);
+        assert_eq!(empty.incompatible_units, 0);
+    }
+
     #[test]
     fn empty_catalog_candidates_do_not_materialize_the_event_side() {
         let session = session();
@@ -953,6 +1139,20 @@ pub(crate) fn stats(src: &Source, pfs: &[PreparedFilter]) -> Result<Option<Stats
     analytics_with(src, base_page_safe(pfs, ""), |session| stats_session(session, src, pfs))
 }
 
+fn timeline_session(session: &Session, start: i64, end: i64, width: i64, buckets: usize) -> Result<Option<super::time_index::Histogram>> {
+    let Some(readers) = session.exact_time_indexes() else { return Ok(None); };
+    crate::operations::progress("analytics-time-index", "Lendo resumo temporal verificado", 0, 0, 0);
+    let result = super::time_index::histogram(&readers, start, end, width, buckets)?;
+    if result.is_none() { session.invalidate_exact_times(&readers)?; }
+    Ok(result)
+}
+
+/// Optional exact acceleration for the unfiltered indexed timeline. Callers
+/// retain their existing source scan when no complete verified capability exists.
+pub(crate) fn timeline_histogram(src: &Source, start: i64, end: i64, width: i64, buckets: usize) -> Result<Option<super::time_index::Histogram>> {
+    Ok(analytics_with(src, true, |session| timeline_session(session, start, end, width, buckets))?.flatten())
+}
+
 #[cfg(test)]
 mod exact_time_routing_tests {
     use super::*;
@@ -997,7 +1197,7 @@ mod exact_time_routing_tests {
         (dir, session, paths, handles.into())
     }
     fn index() -> FileIndex {
-        FileIndex { parts: Vec::new(), lines: Arc::new(crate::metadata_store::LineStore::default()), columns: Vec::new(), time_order: std::sync::OnceLock::new() }
+        FileIndex { parts: Vec::new(), lines: Arc::new(crate::metadata_store::LineStore::default()), columns: Vec::new(), time_order: std::sync::Arc::new(std::sync::OnceLock::new()) }
     }
     fn filters(value: Value) -> Vec<PreparedFilter> {
         prepared(&serde_json::from_value::<Vec<crate::query::Filter>>(value).unwrap())
@@ -1068,19 +1268,159 @@ mod exact_time_routing_tests {
     }
 
     #[test]
+    fn requested_timeline_uses_complete_capability_and_declines_stale_sets() {
+        let (_dir, session, paths, readers) = fixture();
+        assert!(timeline_session(&session, -100, 101, 51, 4).unwrap().is_none());
+        *session.time_indexes.write() = Some(readers);
+        session.conn().unwrap().execute_batch("DROP TABLE ev").unwrap();
+        let result = timeline_session(&session, -100, 101, 51, 4).unwrap().unwrap();
+        assert_eq!((result.total, result.errors, result.warnings), (6, 2, 0));
+        assert_eq!(result.buckets.iter().map(|b| b.count).collect::<Vec<_>>(), vec![1, 1, 2, 2]);
+        std::fs::OpenOptions::new().write(true).open(time_index::path(&paths[0])).unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3)).unwrap();
+        assert!(timeline_session(&session, -100, 101, 51, 4).unwrap().is_none());
+        assert!(session.exact_time_indexes().is_none());
+    }
+
+    #[test]
+    fn grouped_timeline_sql_matches_bounded_canonical_fallback() {
+        use crate::grouped_timeline::{Accumulator, Context, Grid, Spec};
+        let (_dir, mut session, _paths, _readers) = fixture();
+        let index = index(); let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        session.schema.fields.insert("group".into(), "grouping".into());
+        session.schema.lower.insert("group".into(), vec!["group".into()]);
+        session.conn().unwrap().execute_batch("ALTER TABLE ev ADD COLUMN grouping VARCHAR").unwrap();
+        let times = [Some(5),Some(-100),None,Some(0),Some(5),Some(101),Some(-1),Some(101),None];
+        let keys = [Some("".to_string()),Some(" ".to_string()),None,Some("ignored".into()),Some("a".into()),Some("a".into()),Some("null".into()),Some("x".repeat(400)),Some("untimed".into())];
+        let mut events = Vec::new();
+        for (id, (timestamp, key)) in times.into_iter().zip(keys).enumerate() {
+            session.conn().unwrap().execute("UPDATE ev SET grouping=? WHERE id=?", duckdb::params![key.as_deref(),id as i64]).unwrap();
+            let mut event = Event::empty(); event.id=id;event.timestamp=timestamp;event.source=if id<4{"api"}else{"auth"}.into();
+            if let Some(key)=key { event.fields.insert("group".into(),Value::String(key)); }
+            events.push(event);
+        }
+        for field in ["group","GROUP","origem","absent"] {
+            for filters in [vec![],vec![crate::query::Filter{column:"source".into(),op:"equals_exact".into(),value:"auth".into(),value2:None}]] {
+                let pfs=prepared(&filters);
+                for grid in [Grid{start:-100,bucket_ms:51,bucket_count:4},Grid{start:0,bucket_ms:1,bucket_count:6},Grid{start:0,bucket_ms:0,bucket_count:0}] {
+                    let spec=Spec::new(field.into(),grid,Some(2),Context::default()).unwrap();
+                    let mut expected=Accumulator::new(&spec).unwrap();
+                    for event in &events { if pfs.iter().all(|filter|crate::query::matches(event,filter)) { expected.add_event(event).unwrap(); } }
+                    assert_eq!(grouped_timeline_session(&session,&source,&pfs,&spec).unwrap().unwrap(),expected.finish().unwrap(),"{field} {grid:?}");
+                }
+            }
+        }
+        session.schema.structured.insert("nested".into());
+        let spec=Spec::new("nested.name".into(),Grid{start:0,bucket_ms:10,bucket_count:1},None,Context::default()).unwrap();
+        assert!(grouped_timeline_session(&session,&source,&[],&spec).unwrap().is_none());
+    }
+
+    #[test]
+    fn grouped_timeline_limits_and_cancellation_are_errors_not_fallback() {
+        use crate::grouped_timeline::{Context, Grid, Spec};
+        let (_dir, session, _paths, _readers) = fixture();
+        let index = index(); let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let spec=Spec::new("source".into(),Grid{start:-100,bucket_ms:51,bucket_count:4},None,Context::default()).unwrap();
+        let limited=crate::resources::with_analytics_limit(128,||grouped_timeline_session(&session,&source,&[],&spec));
+        assert!(limited.unwrap_err().contains("LOGINSIGHT_ANALYTICS_LIMIT_MB"));
+        let token=crate::operations::token(Some("grouped-timeline-cancel".into())).unwrap();
+        let result=crate::operations::run_with_token(token,||{
+            crate::operations::cancel_id("grouped-timeline-cancel");
+            assert!(grouped_timeline_session(&session,&source,&[],&spec).unwrap_err().contains("cancelad"));
+        });
+        assert!(result.unwrap_err().contains("cancelad"));
+    }
+
+    #[test]
     fn time_capability_cancellation_propagates_without_sql_fallback() {
         let (_dir, session, _paths, readers) = fixture();
         let index = index(); let config = CodesConfig::default();
         let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
         *session.time_indexes.write() = Some(readers);
         let token = crate::operations::token(Some("time-routing-cancel".into())).unwrap();
-        crate::operations::run_with_token(token, || {
+        let result = crate::operations::run_with_token(token, || {
             crate::operations::cancel_id("time-routing-cancel");
             assert!(count_session(&session, &source, &[]).unwrap_err().contains("cancelad"));
             assert!(stats_session(&session, &source, &[]).err().unwrap().contains("cancelad"));
+            assert!(timeline_session(&session, -100, 100, 20, 11).unwrap_err().contains("cancelad"));
         });
+        assert!(result.unwrap_err().contains("cancelad"));
         assert!(session.exact_time_indexes().is_some());
     }
+}
+
+// ------------------------------------------------------- grouped timeline
+
+fn grouped_timeline_session(session: &Session, src: &Source, pfs: &[PreparedFilter], spec: &crate::grouped_timeline::Spec) -> Result<Option<crate::grouped_timeline::Response>> {
+    use crate::grouped_timeline::{Response, Series};
+    spec.validate()?;
+    let mut budget = crate::query::AnalyticsBudget::new();
+    budget.charge(spec.base_bytes())?;
+    let mut names = false;
+    let Some(key) = session.schema.grouped_field(&crate::querylang::field_ref(&spec.field), &mut names) else { return Ok(None); };
+    let scope = scope(session, src, pfs)?;
+    let projection = format!("SELECT {key} AS k, NULLIF(ts, 0) AS t FROM {} WHERE {}", scope.from(names), scope.cond);
+    let start = spec.grid.start;
+    let end = spec.grid.end();
+    let inside = format!("t IS NOT NULL AND t::HUGEINT >= ({start})::HUGEINT AND t::HUGEINT < ({end})::HUGEINT");
+    let mut result = Response::empty(spec)?;
+    let mut expected = Vec::new();
+    if spec.grid.bucket_count > 0 {
+        stream_rows(session, &format!("SELECT k, count(*)::BIGINT AS n FROM ({projection}) WHERE ({inside}) AND k IS NOT NULL GROUP BY k ORDER BY n DESC, k ASC LIMIT {}", spec.limit), |row| {
+            let key: String = row.get(0)?;
+            budget.charge(spec.key_bytes(&key))?;
+            expected.push(usize::try_from(row.get::<i64>(1)?).map_err(err)?);
+            result.series.push(Series { key, count: 0, buckets: vec![0; spec.grid.bucket_count] });
+            Ok(())
+        })?;
+    }
+    let mut group = String::from("CASE WHEN t IS NULL THEN -3 WHEN NOT (");
+    group.push_str(&inside); group.push_str(") THEN -4 WHEN k IS NULL THEN -1");
+    for (index, series) in result.series.iter().enumerate() {
+        group.push_str(&format!(" WHEN k = {} THEN {index}", lit(&series.key)));
+    }
+    group.push_str(" ELSE -2 END");
+    // BIGINT subtraction can overflow before division. HUGEINT matches the
+    // exact i128 half-open grid, including a final edge beyond i64::MAX.
+    let bucket = if spec.grid.bucket_count == 0 { "0::BIGINT".into() } else {
+        format!("CASE WHEN ({inside}) THEN ((t::HUGEINT - ({start})::HUGEINT) // {})::BIGINT ELSE 0::BIGINT END", spec.grid.bucket_ms)
+    };
+    let histogram = format!("SELECT g::BIGINT, b::BIGINT, count(*)::BIGINT FROM (SELECT {group} AS g, {bucket} AS b FROM ({projection})) GROUP BY g,b");
+    stream_rows(session, &histogram, |row| {
+        let group: i64 = row.get(0)?;
+        let count = usize::try_from(row.get::<i64>(2)?).map_err(err)?;
+        match group {
+            -3 => result.untimed = result.untimed.checked_add(count).ok_or("Contagem temporal excedeu o limite.")?,
+            -4 => result.outside_grid = result.outside_grid.checked_add(count).ok_or("Contagem temporal excedeu o limite.")?,
+            group => {
+                let bucket = usize::try_from(row.get::<i64>(1)?).map_err(err)?;
+                match group {
+                    -1 => result.missing.add(bucket, count)?,
+                    -2 => result.other.add(bucket, count)?,
+                    index => {
+                        let series = usize::try_from(index).ok().and_then(|i|result.series.get_mut(i)).ok_or("Série temporal fora da seleção.")?;
+                        let value = series.buckets.get_mut(bucket).ok_or("Faixa temporal fora da grade.")?;
+                        *value = value.checked_add(count).ok_or("Contagem temporal excedeu o limite.")?;
+                        series.count = series.count.checked_add(count).ok_or("Contagem temporal excedeu o limite.")?;
+                    }
+                }
+                result.total.add(bucket, count)?;
+            }
+        }
+        Ok(())
+    })?;
+    if result.series.iter().zip(expected).any(|(series,count)|series.count!=count) {
+        return Err("A seleção temporal mudou durante o agrupamento.".into());
+    }
+    Ok(Some(result))
+}
+
+/// Fast path only when the engine proves the same canonical grouping key.
+/// Unsupported fields fall back; budget, spill and cancellation failures do not.
+pub(crate) fn grouped_timeline(src: &Source, pfs: &[PreparedFilter], spec: &crate::grouped_timeline::Spec) -> Result<Option<crate::grouped_timeline::Response>> {
+    Ok(analytics_with(src, base_page_safe(pfs, &spec.field), |session| grouped_timeline_session(session, src, pfs, spec))?.flatten())
 }
 
 // ---------------------------------------------------------------- groups
@@ -1881,31 +2221,38 @@ pub(crate) fn series(src: &Source, pfs: &[PreparedFilter], spec: &SeriesSpec) ->
     analytics_with(src, false, |session| series_of(&scope(session, src, pfs)?, spec))
 }
 
-/// Metric columns shared by terms and time charts: count, distinct values,
-/// numeric sum (file order), valid count, min, max and incompatible units.
-fn metric_columns(value: Option<&str>, expected: Option<UnitKind>) -> (String, String) {
+/// Only the requested metric, its admitted sample count and unit warnings cross
+/// the engine boundary. Avoid DISTINCT state and ordered sums for other metrics.
+/// The first numeric column is a sum for avg; division stays in Rust to preserve
+/// the existing arithmetic and the file-order sum used by the line engine.
+fn metric_columns(value: Option<&str>, expected: Option<UnitKind>, metric: &str) -> (String, String) {
+    if metric == "count" {
+        return ("NULL::DOUBLE AS num".into(), "count(*), count(*), 0::BIGINT".into());
+    }
     let Some(value) = value else {
+        return ("NULL::DOUBLE AS num".into(), "NULL::DOUBLE, 0::BIGINT, 0::BIGINT".into());
+    };
+    if metric == "distinct" {
         return (
-            "NULL AS v, NULL::DOUBLE AS num, NULL::INTEGER AS u".into(),
-            "count(*), 0, 0, NULL::DOUBLE, 0, NULL::DOUBLE, NULL::DOUBLE, 0".into(),
+            format!("{value} AS v"),
+            "count(DISTINCT CASE WHEN v <> '' THEN v END), count(*) FILTER (WHERE v <> ''), 0::BIGINT".into(),
         );
-    };
-    let ok = match expected {
-        Some(unit) => format!("num IS NOT NULL AND u = {}", unit as i32),
-        None => "num IS NOT NULL".into(),
-    };
-    let bad = match expected {
-        Some(unit) => format!("num IS NOT NULL AND u <> {}", unit as i32),
-        None => "FALSE".into(),
-    };
-    (
-        format!("{value} AS v, li_num({value}) AS num, li_unit({value}) AS u"),
-        format!(
-            "count(*), count(DISTINCT CASE WHEN v <> '' THEN v END), count(*) FILTER (WHERE v <> ''), \
-             sum(CASE WHEN {ok} THEN num END ORDER BY id), count(*) FILTER (WHERE {ok}), \
-             min(CASE WHEN {ok} THEN num END), max(CASE WHEN {ok} THEN num END), count(*) FILTER (WHERE {bad})"
+    }
+    let (inner, ok, incompatible) = match expected {
+        Some(unit) => (
+            format!("li_num({value}) AS num, li_unit({value}) AS u"),
+            format!("num IS NOT NULL AND u = {}", unit as i32),
+            format!("count(*) FILTER (WHERE num IS NOT NULL AND u <> {})", unit as i32),
         ),
-    )
+        None => (format!("li_num({value}) AS num"), "num IS NOT NULL".into(), "0::BIGINT".into()),
+    };
+    let numeric = match metric {
+        "sum" | "avg" => format!("sum(CASE WHEN {ok} THEN num END ORDER BY id)"),
+        "min" => format!("min(CASE WHEN {ok} THEN num END)"),
+        "max" => format!("max(CASE WHEN {ok} THEN num END)"),
+        _ => "NULL::DOUBLE".into(),
+    };
+    (inner, format!("{numeric}, count(*) FILTER (WHERE {ok}), {incompatible}"))
 }
 
 struct Metric {
@@ -1914,38 +2261,198 @@ struct Metric {
     incompatible: usize,
 }
 
-/// Reads the eight metric columns starting at `at` (see [`metric_columns`]).
-fn metric_at(row: &duckdb::Row<'_>, at: usize, metric: &str, field: bool) -> duckdb::Result<Metric> {
-    let count = row.get::<_, i64>(at)? as usize;
-    let distinct = row.get::<_, i64>(at + 1)? as usize;
-    let nonempty = row.get::<_, i64>(at + 2)? as usize;
-    let sum = row.get::<_, Option<f64>>(at + 3)?.unwrap_or(0.0);
-    let valid = row.get::<_, i64>(at + 4)? as usize;
-    let min = row.get::<_, Option<f64>>(at + 5)?;
-    let max = row.get::<_, Option<f64>>(at + 6)?;
-    let incompatible = row.get::<_, i64>(at + 7)? as usize;
-    Ok(match (metric, field) {
-        ("count", _) => Metric { value: count as f64, n: count, incompatible: 0 },
-        (_, false) => Metric { value: 0.0, n: 0, incompatible: 0 },
-        ("distinct", true) => Metric { value: distinct as f64, n: nonempty, incompatible: 0 },
-        (metric, true) => Metric {
-            value: match metric {
-                "sum" => sum,
-                "avg" => {
-                    if valid == 0 {
-                        0.0
-                    } else {
-                        sum / valid as f64
-                    }
+/// Reads value (or avg's ordered sum), admitted samples and incompatible units.
+fn metric_at(row: &StreamRow<'_>, at: usize, metric: &str) -> Result<Metric> {
+    let n = row.get::<i64>(at + 1)? as usize;
+    let incompatible = row.get::<i64>(at + 2)? as usize;
+    let value = match metric {
+        "count" | "distinct" => row.get::<Option<i64>>(at)?.unwrap_or(0) as usize as f64,
+        _ => row.get::<Option<f64>>(at)?.unwrap_or(0.0),
+    };
+    let value = if metric == "avg" {
+        if n == 0 { 0.0 } else { value / n as f64 }
+    } else { value };
+    Ok(Metric { value, n, incompatible })
+}
+
+/// The heap root is the worst retained group. Rank tuples use the existing
+/// Rust ordering, which SQL collation/NULL/float ordering cannot substitute.
+/// Account live keys plus one candidate, releasing evicted keys immediately;
+/// DuckDB's grouping state and Arrow fetch chunks are outside this retention budget.
+struct SeriesTopK<T: Ord> {
+    heap: BinaryHeap<(T, usize)>,
+    limit: usize,
+    key_bytes: usize,
+    base_bytes: usize,
+    byte_limit: usize,
+}
+
+impl<T: Ord> SeriesTopK<T> {
+    fn new(limit: usize) -> Result<Self> {
+        let base_bytes = limit.saturating_add(1).saturating_mul(std::mem::size_of::<(T, usize)>());
+        let byte_limit = crate::resources::analytics_bytes();
+        Self::check_bytes(base_bytes, byte_limit)?;
+        Ok(Self { heap: BinaryHeap::with_capacity(limit), limit, key_bytes: 0, base_bytes, byte_limit })
+    }
+
+    fn push(&mut self, rank: T, bytes: usize) -> Result<()> {
+        Self::check_bytes(self.base_bytes.saturating_add(self.key_bytes).saturating_add(bytes), self.byte_limit)?;
+        if self.limit == 0 { return Ok(()); }
+        if self.heap.len() == self.limit {
+            if rank >= self.heap.peek().expect("nonempty top groups").0 { return Ok(()); }
+            let (_, removed) = self.heap.pop().expect("nonempty top groups");
+            self.key_bytes -= removed;
+        }
+        self.key_bytes += bytes;
+        self.heap.push((rank, bytes));
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<T> {
+        self.heap.into_sorted_vec().into_iter().map(|(rank, _)| rank).collect()
+    }
+
+    fn check_bytes(bytes: usize, limit: usize) -> Result<()> {
+        if bytes > limit {
+            Err("O resultado analítico excedeu o orçamento de valores (LOGINSIGHT_ANALYTICS_LIMIT_MB). Restrinja os filtros ou reduza os agrupamentos.".into())
+        } else { Ok(()) }
+    }
+}
+
+/// Descending total float order, including NaN payloads and signed zero.
+#[derive(Clone, Copy, Debug)]
+struct SeriesMetricRank(f64);
+impl PartialEq for SeriesMetricRank {
+    fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() }
+}
+impl Eq for SeriesMetricRank {}
+impl PartialOrd for SeriesMetricRank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for SeriesMetricRank {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { other.0.total_cmp(&self.0) }
+}
+
+/// Own each label once and fill the final numeric buffers by stable series ID.
+/// Label storage is independent of bucket count; empty buckets start at zero.
+fn time_series_buffers(names: Vec<String>, buckets: usize) -> Vec<SeriesData> {
+    names.into_iter().map(|name| SeriesData {
+        name,
+        samples: vec![0; buckets],
+        points: vec![0.0; buckets],
+    }).collect()
+}
+
+#[cfg(test)]
+mod series_retention_tests {
+    use super::*;
+
+    #[test]
+    fn time_bucket_label_storage_is_independent_of_bucket_count() {
+        let buckets = 2001;
+        let names: Vec<_> = (0..6).map(|i| format!("{i}{}", "x".repeat((64 << 10) - 1))).collect();
+        let pointers: Vec<_> = names.iter().map(|s| s.as_ptr()).collect();
+        let label_bytes = names.iter().map(String::capacity).sum::<usize>();
+        let series = time_series_buffers(names, buckets);
+        assert_eq!(series.iter().map(|s| s.name.as_ptr()).collect::<Vec<_>>(), pointers,
+            "transfer the selected strings without cloning their allocation");
+        assert_eq!(series.iter().map(|s| s.name.capacity()).sum::<usize>(), label_bytes);
+        assert!(series.iter().all(|s| s.points.len() == buckets && s.samples.len() == buckets));
+        let numeric_bytes = series.iter().map(|s| s.points.capacity() * std::mem::size_of::<f64>()
+            + s.samples.capacity() * std::mem::size_of::<usize>()).sum::<usize>();
+        let old_repeated_key_bytes = label_bytes * buckets;
+        assert!(old_repeated_key_bytes > (label_bytes + numeric_bytes) * 1000,
+            "structural allocation comparison only, not a measured RSS claim");
+    }
+
+    #[test]
+    fn count_terms_keep_json_key_ties_in_every_input_order() {
+        let keys = [None, Some(""), Some("\n"), Some("\""), Some("\\"), Some("a"), Some("é"), Some("日"), Some("null")];
+        let original: Vec<_> = keys.into_iter().enumerate().map(|(i, key)| {
+            let key = key.map(str::to_string);
+            (serde_json::to_string(&key).unwrap(), key, i % 3)
+        }).collect();
+        for limit in [0, 1, 3, 10, 500] {
+            let mut expected = original.clone();
+            expected.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            expected.truncate(limit);
+            for offset in 0..original.len() {
+                let mut selected = SeriesTopK::new(limit).unwrap();
+                for (serialized, key, n) in original.iter().cycle().skip(offset).take(original.len()) {
+                    let bytes = serialized.capacity() + key.as_ref().map_or(0, String::capacity);
+                    selected.push((Reverse(*n), serialized.clone(), key.clone()), bytes).unwrap();
                 }
-                "min" => min.unwrap_or(0.0),
-                "max" => max.unwrap_or(0.0),
-                _ => 0.0,
-            },
-            n: valid,
-            incompatible,
-        },
-    })
+                let found: Vec<_> = selected.finish().into_iter().map(|(Reverse(n), serialized, key)| (serialized, key, n)).collect();
+                assert_eq!(found, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn metric_terms_keep_total_float_and_optional_key_ties() {
+        let values = [f64::NEG_INFINITY, -1.0, -0.0, 0.0, 1.0, f64::INFINITY,
+            f64::from_bits(0x7ff8000000000000), f64::from_bits(0x7ff8000000000001), f64::from_bits(0xfff8000000000000)];
+        let original: Vec<_> = values.into_iter().flat_map(|value| [None, Some("".into()), Some("a".into()), Some("日".into())]
+            .into_iter().map(move |key| (key, value, 3usize))).collect();
+        for limit in [0, 1, 7, 500] {
+            let mut expected = original.clone();
+            expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            expected.truncate(limit);
+            for backwards in [false, true] {
+                let mut input = original.clone();
+                if backwards { input.reverse(); }
+                let mut selected = SeriesTopK::new(limit).unwrap();
+                for (key, value, n) in input {
+                    let bytes = key.as_ref().map_or(0, String::capacity);
+                    selected.push((SeriesMetricRank(value), key, n), bytes).unwrap();
+                }
+                let found: Vec<_> = selected.finish().into_iter().map(|(SeriesMetricRank(value), key, n)| (key, value.to_bits(), n)).collect();
+                let expected: Vec<_> = expected.iter().map(|(key, value, n)| (key.clone(), value.to_bits(), *n)).collect();
+                assert_eq!(found, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn split_names_keep_raw_string_ties() {
+        let mut original: Vec<_> = ["\n", "\"", "\\", "a", "b", "c", "d", "é", "日"]
+            .into_iter().map(|key| (key.to_string(), 1i64)).collect();
+        original.push(("popular".into(), 5));
+        let mut selected = SeriesTopK::new(6).unwrap();
+        for (key, n) in original.iter().rev() {
+            selected.push((Reverse(*n), key.clone()), key.capacity()).unwrap();
+        }
+        original.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        original.truncate(6);
+        assert_eq!(selected.finish().into_iter().map(|(Reverse(n), key)| (key, n)).collect::<Vec<_>>(), original);
+    }
+
+    #[test]
+    fn retained_bytes_are_released_on_eviction_and_discard() {
+        crate::resources::with_analytics_limit(4096, || {
+            let mut selected = SeriesTopK::new(6).unwrap();
+            for i in 0..10_000usize {
+                let key = format!("{i:05}{}", "x".repeat(200));
+                let bytes = key.capacity();
+                selected.push((Reverse(i), key), bytes).unwrap();
+                assert!(selected.heap.len() <= 6);
+                assert_eq!(selected.key_bytes, selected.heap.iter().map(|(_, bytes)| bytes).sum::<usize>());
+                assert!(selected.base_bytes + selected.key_bytes <= 4096);
+            }
+            assert_eq!(selected.finish().iter().map(|(Reverse(n), _)| *n).collect::<Vec<_>>(), (9994..10_000).rev().collect::<Vec<_>>());
+        });
+    }
+
+    #[test]
+    fn candidate_bytes_are_checked_even_when_it_would_be_discarded() {
+        crate::resources::with_analytics_limit(1024, || {
+            let mut selected = SeriesTopK::new(1).unwrap();
+            selected.push((Reverse(2), "best".to_string()), 4).unwrap();
+            let key = "x".repeat(1024);
+            assert!(selected.push((Reverse(1), key), 1024).unwrap_err().contains("LOGINSIGHT_ANALYTICS_LIMIT_MB"));
+            assert_eq!(selected.finish(), vec![(Reverse(2), "best".to_string())]);
+        });
+    }
 }
 
 fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
@@ -1956,30 +2463,32 @@ fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
         let key_column = field.unwrap_or("level");
         let (key, time) = key_of(scope, key_column, false, &mut names)?;
         let from = scope.from(names);
-        let mut counted = Vec::new();
-        for (key, n) in rows(
+        let mut counted = SeriesTopK::new(limit)?;
+        stream_rows(
             scope.session,
             &format!("SELECT k, count(*) FROM (SELECT {key} AS k FROM {from} WHERE {}) GROUP BY k", scope.cond),
-            |r| Ok((key_text(r, 0, time)?, r.get::<_, i64>(1)? as usize)),
-        )? {
-            let key = key?;
-            counted.push((serde_json::to_string(&key).map_err(err)?, key, n));
-        }
-        counted.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-        counted.truncate(limit);
+            |r| {
+                let key = stream_key(&r, 0, time)?;
+                let n = r.get::<i64>(1)? as usize;
+                let serialized = serde_json::to_string(&key).map_err(err)?;
+                let bytes = serialized.capacity().saturating_add(key.as_ref().map_or(0, String::capacity));
+                counted.push((Reverse(n), serialized, key), bytes)
+            },
+        )?;
+        let counted = counted.finish();
         return Ok(SeriesResult {
             kind: "terms".into(),
             unit: "number".into(),
             interval_ms: 0,
             x: counted
                 .iter()
-                .map(|(_, value, _)| Value::from(value.clone().unwrap_or_else(|| "(vazio)".into())))
+                .map(|(_, _, value)| Value::from(value.clone().unwrap_or_else(|| "(vazio)".into())))
                 .collect(),
-            x_values: counted.iter().map(|(_, value, _)| value.clone()).collect(),
+            x_values: counted.iter().map(|(_, _, value)| value.clone()).collect(),
             series: vec![SeriesData {
                 name: key_column.into(),
-                samples: counted.iter().map(|(_, _, n)| *n).collect(),
-                points: counted.iter().map(|(_, _, n)| *n as f64).collect(),
+                samples: counted.iter().map(|(Reverse(n), _, _)| *n).collect(),
+                points: counted.iter().map(|(Reverse(n), _, _)| *n as f64).collect(),
             }],
             incompatible_units: 0,
         });
@@ -2016,58 +2525,66 @@ fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
         Some(column) => {
             let split = text_of(scope, column, false, &mut names)?;
             let from = scope.from(names);
-            let mut counted = rows(
+            let mut counted = SeriesTopK::new(6)?;
+            stream_rows(
                 scope.session,
                 &format!(
                     "SELECT s, count(*) FROM (SELECT {split} AS s FROM {from} WHERE {}) WHERE s <> '' GROUP BY s",
                     scope.cond
                 ),
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                |r| {
+                    let key = r.get::<String>(0)?;
+                    let bytes = key.capacity();
+                    counted.push((Reverse(r.get::<i64>(1)?), key), bytes)
+                },
             )?;
-            counted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            counted.into_iter().take(6).map(|(s, _)| s).collect()
+            counted.finish().into_iter().map(|(_, key)| key).collect()
         }
         None => Vec::new(),
     };
-    let split_names: Vec<String> = if splits.is_empty() {
+    let has_splits = !splits.is_empty();
+    let split_names: Vec<String> = if !has_splits {
         vec![spec.field.clone().unwrap_or_else(|| "eventos".into())]
     } else {
-        splits.clone()
+        splits
     };
-    let (metric_inner, metric_outer) = metric_columns(value.as_deref(), expected);
+    let (metric_inner, metric_outer) = metric_columns(value.as_deref(), expected, &spec.metric);
 
     if spec.chart == "terms" {
         let key_column = spec.field.clone().unwrap_or_else(|| "level".into());
         let (key, time) = key_of(scope, &key_column, false, &mut names)?;
         let from = scope.from(names);
-        let mut items = Vec::new();
+        let mut items = SeriesTopK::new(limit)?;
         let mut incompatible = 0;
-        for (key, metric) in rows(
+        stream_rows(
             scope.session,
             &format!(
                 "SELECT k, {metric_outer} FROM (SELECT id, {key} AS k, {metric_inner} FROM {from} WHERE {}) GROUP BY k",
                 scope.cond
             ),
-            |r| Ok((key_text(r, 0, time)?, metric_at(r, 1, &spec.metric, field.is_some())?)),
-        )? {
-            incompatible += metric.incompatible;
-            items.push((key?, metric.value, metric.n));
-        }
-        items.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        items.truncate(limit);
+            |r| {
+                let key = stream_key(&r, 0, time)?;
+                let metric = metric_at(&r, 1, &spec.metric)?;
+                // Unit warnings cover all groups, including those below Top N.
+                incompatible += metric.incompatible;
+                let bytes = key.as_ref().map_or(0, String::capacity);
+                items.push((SeriesMetricRank(metric.value), key, metric.n), bytes)
+            },
+        )?;
+        let items = items.finish();
         return Ok(SeriesResult {
             kind: "terms".into(),
             unit,
             interval_ms: 0,
             x: items
                 .iter()
-                .map(|(k, _, _)| Value::from(k.clone().unwrap_or_else(|| "(vazio)".into())))
+                .map(|(_, k, _)| Value::from(k.clone().unwrap_or_else(|| "(vazio)".into())))
                 .collect(),
-            x_values: items.iter().map(|(key, _, _)| key.clone()).collect(),
+            x_values: items.iter().map(|(_, key, _)| key.clone()).collect(),
             series: vec![SeriesData {
                 name: split_names[0].clone(),
                 samples: items.iter().map(|(_, _, n)| *n).collect(),
-                points: items.into_iter().map(|(_, v, _)| v).collect(),
+                points: items.into_iter().map(|(SeriesMetricRank(value), _, _)| value).collect(),
             }],
             incompatible_units: incompatible,
         });
@@ -2090,43 +2607,44 @@ fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
         });
     };
     let (interval, n_buckets) = crate::analysis::series_interval(spec, tmin, tmax);
-    let (name_sql, keep) = match &spec.split {
-        Some(column) => {
+    let series_sql = match &spec.split {
+        Some(column) if has_splits => {
             let split = text_of(scope, column, false, &mut names)?;
-            let list = splits.iter().map(|s| lit(s)).collect::<Vec<_>>().join(", ");
-            let keep = if splits.is_empty() {
-                "FALSE".to_string()
-            } else {
-                format!("COALESCE({split}, '') IN ({list})")
-            };
-            (format!("COALESCE({split}, '')"), keep)
+            let mut cases = format!("CASE COALESCE({split}, '')");
+            for (index, name) in split_names.iter().enumerate() {
+                cases.push_str(&format!(" WHEN {} THEN {index}", lit(name)));
+            }
+            cases.push_str(" ELSE -1 END");
+            cases
         }
-        None => (lit(&split_names[0]), "TRUE".to_string()),
+        Some(_) => "-1".into(),
+        None => "0".into(),
     };
     let from = scope.from(names);
-    let mut accs: Vec<HashMap<String, Metric>> = (0..n_buckets).map(|_| HashMap::new()).collect();
+    let mut series = time_series_buffers(split_names, n_buckets);
     let mut incompatible = 0;
-    for (b, name, metric) in rows(
+    stream_rows(
         scope.session,
         &format!(
-            "SELECT b, name, {metric_outer} FROM (SELECT id, (ts - ({tmin})) // {interval} AS b, {name_sql} AS name, \
-             {metric_inner} FROM {from} WHERE ({}) AND ts IS NOT NULL AND {keep}) GROUP BY b, name",
+            "SELECT b, series_id, {metric_outer} FROM (SELECT id, (ts - ({tmin})) // {interval} AS b, {series_sql} AS series_id, \
+             {metric_inner} FROM {from} WHERE ({}) AND ts IS NOT NULL) WHERE series_id >= 0 GROUP BY b, series_id",
             scope.cond
         ),
         |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                metric_at(r, 2, &spec.metric, field.is_some())?,
-            ))
+            let b = r.get::<i64>(0)?;
+            let series_id = r.get::<i64>(1)?;
+            let metric = metric_at(&r, 2, &spec.metric)?;
+            if b < 0 || b as usize >= n_buckets { return Ok(()); }
+            incompatible += metric.incompatible;
+            if let Ok(index) = usize::try_from(series_id) {
+                if let Some(series) = series.get_mut(index) {
+                    series.samples[b as usize] = metric.n;
+                    series.points[b as usize] = metric.value;
+                }
+            }
+            Ok(())
         },
-    )? {
-        if b < 0 || b as usize >= n_buckets {
-            continue;
-        }
-        incompatible += metric.incompatible;
-        accs[b as usize].insert(name, metric);
-    }
+    )?;
     Ok(SeriesResult {
         kind: "time".into(),
         unit,
@@ -2135,14 +2653,7 @@ fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
             .map(|b| Value::from(tmin.saturating_add((b as i64).saturating_mul(interval))))
             .collect(),
         x_values: vec![],
-        series: split_names
-            .iter()
-            .map(|name| SeriesData {
-                name: name.clone(),
-                samples: accs.iter().map(|m| m.get(name).map(|a| a.n).unwrap_or(0)).collect(),
-                points: accs.iter().map(|m| m.get(name).map(|a| a.value).unwrap_or(0.0)).collect(),
-            })
-            .collect(),
+        series,
         incompatible_units: incompatible,
     })
 }

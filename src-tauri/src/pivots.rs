@@ -191,10 +191,12 @@ pub async fn timeline_lanes(
     limit: Option<usize>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Lanes, String> {
-    let case_events = crate::case_cache::resolve(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || {
         lanes_impl(
             app.state::<AppState>().inner(),
             filters,
@@ -203,7 +205,7 @@ pub async fn timeline_lanes(
             bucket_count,
             column,
             limit.unwrap_or(8),
-            case_events.as_deref().map(|v| v.as_slice()),
+            case_events.as_deref(),
         )
     })
     .await?
@@ -334,11 +336,13 @@ pub async fn entity_summary(
     limit: Option<usize>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Vec<EntityGroup>, String> {
-    let case_events = crate::case_cache::resolve(case_events, case_key)?;
-    crate::offload(move || {
-        entity_summary_impl(app.state::<AppState>().inner(), filters, limit.unwrap_or(50), case_events.as_deref().map(|v| v.as_slice()))
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || {
+        entity_summary_impl(app.state::<AppState>().inner(), filters, limit.unwrap_or(50), case_events.as_deref())
     })
     .await?
 }
@@ -422,8 +426,9 @@ pub fn sightings_impl(state: &AppState, values: Vec<String>, filters: Vec<Filter
 }
 
 #[tauri::command]
-pub async fn ioc_sightings(values: Vec<String>, filters: Vec<Filter>, app: AppHandle) -> Result<Vec<Sighting>, String> {
-    crate::offload(move || sightings_impl(app.state::<AppState>().inner(), values, filters)).await?
+pub async fn ioc_sightings(values: Vec<String>, filters: Vec<Filter>, app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<Sighting>, String> {
+    let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || sightings_impl(app.state::<AppState>().inner(), values, filters)).await?
 }
 
 // ------------------------------------------------------------------ custody
@@ -466,7 +471,7 @@ fn sha256_file(path: &std::path::Path) -> Result<(String, u64), String> {
 pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
     // Keep the mapped-source leases alive for the entire request. Display
     // paths alone cannot identify which canonical generation was loaded.
-    let parts = match &*state.source.read() {
+    let parts = match &*crate::analysis_runtime::source(&state) {
         SourceData::Indexed(idx) => idx.parts.clone(),
         _ => Vec::new(),
     };
@@ -543,8 +548,9 @@ pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
 }
 
 #[tauri::command]
-pub async fn source_hashes(app: AppHandle) -> Result<Vec<SourceHash>, String> {
-    crate::offload(move || hashes_impl(app.state::<AppState>().inner())).await?
+pub async fn source_hashes(app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<SourceHash>, String> {
+    let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || hashes_impl(app.state::<AppState>().inner())).await?
 }
 
 #[cfg(test)]

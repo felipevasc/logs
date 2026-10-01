@@ -1,19 +1,72 @@
 //! Transactional, versioned case store. Only modified cases are rewritten.
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-fn connect(dir: &std::path::Path) -> Result<Connection, String> {
+pub(crate) fn connect(dir: &std::path::Path) -> Result<Connection, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let conn = Connection::open(dir.join("investigations.sqlite3")).map_err(|e| e.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS cases(id TEXT PRIMARY KEY, body TEXT NOT NULL, position INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);").map_err(|e|e.to_string())?;
+    crate::analysis_context::schema(&conn)?;
     Ok(conn)
+}
+/// Initializes only schema/migration metadata for context admission. Already
+/// migrated requests never deserialize the (potentially large) case evidence.
+pub(crate) fn context_connection(dir: &std::path::Path) -> Result<Connection, String> {
+    let mut conn = connect(dir)?;
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='revision')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        drop(conn);
+        load_at(dir)?;
+        return connect(dir);
+    }
+    let initialized: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='case-analysis-v1')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !initialized {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        crate::analysis_context::initialize(&tx, dir)?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    Ok(conn)
+}
+struct CaseBody<'a> {
+    value: &'a Value,
+    preserve_context: bool,
+}
+impl serde::Serialize for CaseBody<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        for (key, value) in self
+            .value
+            .as_object()
+            .expect("case validated before serialization")
+        {
+            if key != "analysisContext" || self.preserve_context {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
 }
 pub fn load() -> Result<Value, String> {
     load_at(&crate::config_dir())
 }
-fn load_at(dir: &std::path::Path) -> Result<Value, String> {
-    let conn = connect(dir)?;
+pub(crate) fn load_at(dir: &std::path::Path) -> Result<Value, String> {
+    let mut conn = connect(dir)?;
     let version: i64 = conn
         .query_row(
             "SELECT count(*) FROM metadata WHERE key='revision'",
@@ -38,14 +91,22 @@ fn load_at(dir: &std::path::Path) -> Result<Value, String> {
         if legacy.is_none() && paths.iter().any(|p| p.exists()) {
             return Err("Não foi possível recuperar os casos salvos. Os arquivos originais foram preservados.".into());
         }
+        let is_legacy = legacy.is_some();
         let mut legacy = legacy.unwrap_or(json!({"active":null,"cases":[]}));
         if let Some(object) = legacy.as_object_mut() {
             object.remove("revision");
         }
-        save_at(dir, legacy)?;
+        save_initial_at(dir, legacy, is_legacy)?;
         return load_at(dir);
     }
-    // A read transaction keeps cases and revision from the same snapshot.
+    {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        crate::analysis_context::initialize(&tx, dir)?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    // A read transaction keeps case bodies, configurations and revision together.
     conn.execute_batch("BEGIN DEFERRED")
         .map_err(|e| e.to_string())?;
     let revision: u64 = conn
@@ -63,7 +124,7 @@ fn load_at(dir: &std::path::Path) -> Result<Value, String> {
     let mut stmt = conn
         .prepare("SELECT body FROM cases ORDER BY position")
         .map_err(|e| e.to_string())?;
-    let cases = stmt
+    let mut cases = stmt
         .query_map([], |r| r.get::<_, String>(0))
         .map_err(|e| e.to_string())?
         .map(|r| {
@@ -72,6 +133,9 @@ fn load_at(dir: &std::path::Path) -> Result<Value, String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
+    for case in &mut cases {
+        crate::analysis_context::attach(&conn, case)?;
+    }
     conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
     Ok(
         json!({"schemaVersion":2,"revision":revision,"active":serde_json::from_str::<Value>(&active).unwrap_or(Value::Null),"cases":cases}),
@@ -80,7 +144,10 @@ fn load_at(dir: &std::path::Path) -> Result<Value, String> {
 pub fn save(data: Value) -> Result<Value, String> {
     save_at(&crate::config_dir(), data)
 }
-fn save_at(dir: &std::path::Path, data: Value) -> Result<Value, String> {
+pub(crate) fn save_at(dir: &std::path::Path, data: Value) -> Result<Value, String> {
+    save_initial_at(dir, data, false)
+}
+fn save_initial_at(dir: &std::path::Path, data: Value, legacy: bool) -> Result<Value, String> {
     crate::case_images::references(&data)?;
     if data.get("imageAssets").is_some() {
         return Err("Importe as imagens antes de salvar a investigação; o Caso armazena somente referências.".into());
@@ -129,10 +196,27 @@ fn save_at(dir: &std::path::Path, data: Value) -> Result<Value, String> {
             );
         }
     }
+    if !legacy {
+        crate::analysis_context::initialize(&tx, dir)?;
+    }
+    let mut analysis_contexts = Vec::new();
     for (position, case) in cases.iter().enumerate() {
         let id = case["id"].as_str().unwrap();
-        let body = serde_json::to_string(case).map_err(|e| e.to_string())?;
+        // Borrow large evidence arrays; stripping metadata must not clone them.
+        let body = serde_json::to_string(&CaseBody {
+            value: case,
+            preserve_context: legacy,
+        })
+        .map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO cases(id,body,position) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET body=excluded.body,position=excluded.position WHERE cases.body<>excluded.body OR cases.position<>excluded.position",params![id,body,position as i64]).map_err(|e|e.to_string())?;
+        if !legacy {
+            if let Some(snapshot) = crate::analysis_context::ensure_case(&tx, case)? {
+                analysis_contexts.push(snapshot);
+            }
+        }
+    }
+    if legacy {
+        crate::analysis_context::initialize(&tx, dir)?;
     }
     let stored: Vec<String> = {
         let mut stmt = tx
@@ -147,15 +231,19 @@ fn save_at(dir: &std::path::Path, data: Value) -> Result<Value, String> {
     };
     for id in stored {
         if !ids.contains(id.as_str()) {
+            tx.execute("DELETE FROM case_analysis WHERE case_id=?1", [&id])
+                .map_err(|e| e.to_string())?;
             tx.execute("DELETE FROM cases WHERE id=?1", [id])
                 .map_err(|e| e.to_string())?;
         }
     }
-    let revision = current + 1;
+    let revision = current
+        .checked_add(1)
+        .ok_or("Revisão da investigação excedeu o limite.")?;
     tx.execute("INSERT INTO metadata(key,value) VALUES('revision',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[revision.to_string()]).map_err(|e|e.to_string())?;
     tx.execute("INSERT INTO metadata(key,value) VALUES('active',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[data.get("active").unwrap_or(&Value::Null).to_string()]).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(json!({"revision":revision,"schemaVersion":2}))
+    Ok(json!({"revision":revision,"schemaVersion":2,"analysisContexts":analysis_contexts}))
 }
 
 #[cfg(test)]
@@ -181,7 +269,13 @@ mod tests {
         let original = json!({"active":"c1","cases":[{"id":"c1","name":"Investigação","items":[{"note":"evidência"}]}]});
         std::fs::write(dir.0.join("cases.json"), original.to_string()).unwrap();
         let mut loaded = load_at(&dir.0).unwrap();
-        assert_eq!(loaded["cases"], original["cases"]);
+        let mut unchanged = loaded["cases"].clone();
+        unchanged[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("analysisContext");
+        assert_eq!(unchanged, original["cases"]);
+        assert_eq!(loaded["cases"][0]["analysisContext"]["caseId"], "c1");
         assert_eq!(loaded["schemaVersion"], 2);
         let stale = loaded.clone();
         loaded["cases"][0]["name"] = json!("Atualizada");

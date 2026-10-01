@@ -585,6 +585,60 @@ pub(crate) fn count(indexes: &[Arc<TimeIndex>], predicate: &Predicate) -> Result
     usize::try_from(total).map(Some).map_err(|e| e.to_string())
 }
 
+/// Exact requested-range totals. The caller owns the existing layout policy;
+/// ranks use the same saturating subtraction and final-bucket clamp as a scan.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HistogramBucket {
+    pub count: usize,
+    pub errors: usize,
+    pub warnings: usize,
+}
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Histogram {
+    pub total: usize,
+    pub errors: usize,
+    pub warnings: usize,
+    pub buckets: Vec<HistogramBucket>,
+}
+pub(crate) fn histogram(
+    indexes: &[Arc<TimeIndex>], start: i64, end: i64, width: i64, buckets: usize,
+) -> Result<Option<Histogram>> {
+    if start > end || width < 1 || !(1..=240).contains(&buckets) {
+        return Err("Intervalo ou tamanho de faixa temporal inválido.".into());
+    }
+    if indexes.is_empty() { return Ok(None); }
+    let predicate = Predicate { levels: (1 << LEVELS) - 1, lower: start, upper: end, timed_only: true };
+    let mut out = Histogram { buckets: vec![HistogramBucket::default(); buckets], ..Histogram::default() };
+    for index in indexes {
+        crate::operations::check()?;
+        if !index.data.unchanged() { return Ok(None); }
+        for level in 0..LEVELS {
+            let range = index.data.range(level, &predicate);
+            let mut at = range.start;
+            for (bucket, counts) in out.buckets.iter_mut().enumerate() {
+                if bucket % 64 == 0 { crate::operations::check()?; }
+                let until = if bucket + 1 == buckets { range.end } else {
+                    index.data.partition(level, |t| t.saturating_sub(start) / width <= bucket as i64).clamp(at, range.end)
+                };
+                let n = until - at;
+                counts.count = counts.count.checked_add(n).ok_or("Contagem temporal excedeu o limite.")?;
+                if matches!(level as u8, crate::model::LV_ERR | crate::model::LV_CRIT) {
+                    counts.errors = counts.errors.checked_add(n).ok_or("Contagem temporal excedeu o limite.")?;
+                } else if level as u8 == crate::model::LV_WARN {
+                    counts.warnings = counts.warnings.checked_add(n).ok_or("Contagem temporal excedeu o limite.")?;
+                }
+                at = until;
+            }
+        }
+    }
+    for counts in &out.buckets {
+        out.total = out.total.checked_add(counts.count).ok_or("Contagem temporal excedeu o limite.")?;
+        out.errors = out.errors.checked_add(counts.errors).ok_or("Contagem temporal excedeu o limite.")?;
+        out.warnings = out.warnings.checked_add(counts.warnings).ok_or("Contagem temporal excedeu o limite.")?;
+    }
+    Ok(Some(out))
+}
+
 pub(crate) fn stats(indexes: &[Arc<TimeIndex>], predicate: &Predicate) -> Result<Option<Stats>> {
     if indexes.is_empty() {
         return Ok(None);
@@ -1045,4 +1099,34 @@ mod tests {
         assert!(cache.remove_matching(&stale));
         assert!(cache.complete(["part"]).is_none());
     }
+    #[test]
+    fn requested_histogram_matches_scan_at_ties_extreme_endpoints_and_short_ranges() {
+        let first = [(0, Some(-101)), (1, Some(-100)), (2, Some(-1)), (3, Some(0)), (3, Some(1)), (4, None), (6, Some(i64::MIN))];
+        let second = [(2, Some(1)), (3, Some(5)), (0, Some(5)), (1, Some(100)), (2, Some(101)), (6, Some(i64::MAX))];
+        let (_a, conn_a, store_a, id_a) = fixture(&first);
+        let (_b, conn_b, store_b, id_b) = fixture(&second);
+        ensure(&conn_a, &store_a, &id_a, &|| false).unwrap();
+        ensure(&conn_b, &store_b, &id_b, &|| false).unwrap();
+        let readers = [open(&store_a, &id_a).unwrap().unwrap(), open(&store_b, &id_b).unwrap().unwrap()];
+        for (start, end, requested) in [(-100, 100, 1), (-100, 101, 7), (1, 5, 240), (5, 5, 120), (0, 0, 10), (10, 20, 3), (i64::MIN, i64::MAX, 240), (i64::MAX - 1, i64::MAX, 240)] {
+            let (width, buckets) = crate::pivots::layout(start, end, requested);
+            let mut expected = Histogram { buckets: vec![HistogramBucket::default(); buckets], ..Histogram::default() };
+            for &(level, timestamp) in first.iter().chain(second.iter()) {
+                let Some(t) = timestamp.filter(|&t| t != 0 && t >= start && t <= end) else { continue; };
+                let slot = ((t.saturating_sub(start) / width) as usize).min(buckets - 1);
+                expected.total += 1; expected.buckets[slot].count += 1;
+                if matches!(level, crate::model::LV_ERR | crate::model::LV_CRIT) {
+                    expected.errors += 1; expected.buckets[slot].errors += 1;
+                } else if level == crate::model::LV_WARN {
+                    expected.warnings += 1; expected.buckets[slot].warnings += 1;
+                }
+            }
+            assert_eq!(histogram(&readers, start, end, width, buckets).unwrap().unwrap(), expected, "{start}..{end}/{requested}");
+        }
+        assert!(histogram(&[], 0, 5, 1, 6).unwrap().is_none());
+        assert!(histogram(&readers, 5, 0, 1, 1).is_err());
+        assert!(histogram(&readers, 0, 5, 0, 1).is_err());
+        assert!(histogram(&readers, 0, 5, 1, 241).is_err());
+    }
+
 }

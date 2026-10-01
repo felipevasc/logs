@@ -35,7 +35,7 @@ context.window.QueryLang = { resolve: field => ({ name: field }), fieldValue: (e
 context.window.Security = { rules: () => ruleRequest };
 node('#quick-search').value='request_path:';node('#quick-search').setSelectionRange(3,8,'backward');
 node('#btn-add-search').disabled=true;
-vm.runInContext(barSource, context);
+vm.runInContext(barSource.replace("return { status, typingField,", "return { __suggestionCache: valueCache, __sourceIdentities: sourceIdentities, status, typingField,"), context);
 assert.equal(node('#quick-search').value,'request_path:');assert.equal(node('#btn-add-search').disabled,false,'prefilled startup draft enables Add without an input event');
 assert.equal(node('#quick-search').attributes['aria-invalid'],'true','prefilled startup draft is validated');
 assert.equal(node('#quick-search').selectionStart,3);assert.equal(node('#quick-search').selectionEnd,8);
@@ -63,6 +63,14 @@ await type('request_path:'); assert.match(list.innerHTML, /\/two/); assert.doesN
 state.datasetRevision++;
 state.rows = [{ request_path: '/three' }];
 await type('request_path:'); assert.match(list.innerHTML, /\/three/);
+
+// The bounded value cache must not keep entire old Event pages/facet arrays alive.
+assert.equal(Object.prototype.toString.call(bar.__sourceIdentities),'[object WeakMap]');
+for(const entry of bar.__suggestionCache.values()) {
+  assert.equal(Object.hasOwn(entry,'rows'),false);assert.equal(Object.hasOwn(entry,'facets'),false);
+  assert.ok(entry.rowToken===null||typeof entry.rowToken==='number');assert.ok(entry.facetToken===null||typeof entry.facetToken==='number');
+  assert.ok(entry.values.length<=200);
+}
 
 // Slow suggestions are invalid from the first subsequent keystroke or context switch.
 let resolveRules; ruleRequest = new Promise(resolve => { resolveRules = resolve; });

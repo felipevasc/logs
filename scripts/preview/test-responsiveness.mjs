@@ -115,7 +115,7 @@ try {
   await page.locator('#fp-cancel').click();
   assert.equal(await page.evaluate(() => JSON.stringify(state.filters)), chartDraft.filters, 'chart composer cancellation preserves active filters');
   // A draft belongs to its workspace and must never become an applied filter.
-  await page.evaluate(async () => { await Workspace.showPage('explore'); await loadExplorerAnalytics(explorerKey(), workspaceScope(), backendFilters()).promise; });
+  await page.evaluate(async () => { await Workspace.showPage('explore'); await loadExplorerAnalytics(explorerKey(), workspaceScope(), backendFilters()).promise; await settleFilterTabCounts(); });
   await page.waitForFunction(() => Tasks.pending() === 0);
   const before = await page.evaluate(() => ({ calls: structuredClone(window.__mockCommandCalls), quick: state.quick, filters: JSON.stringify(state.filters), caseId: activeCase().id }));
   const draft = 'message:"pending nginx';

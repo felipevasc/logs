@@ -6,6 +6,66 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::io::Write;
 
+/// Include this in baked-store identity; bump when transform/limit semantics change.
+pub const VERSION: &str = "field-transform-1";
+
+/// Regex replacement syntax, with a byte limit checked before each append.
+/// Capture references match regex::Captures::expand ($1, $name, ${name}, $$).
+pub fn expand_capture(
+    captures: &regex::Captures<'_>,
+    template: &str,
+    limit: usize,
+) -> Result<String, Error> {
+    fn append(output: &mut String, value: &str, limit: usize) -> Result<(), Error> {
+        if value.len() > limit.saturating_sub(output.len()) {
+            return Err(Error::OutputLimit);
+        }
+        output.push_str(value);
+        Ok(())
+    }
+    let mut output = String::new();
+    let mut rest = template;
+    while let Some(dollar) = rest.find('$') {
+        append(&mut output, &rest[..dollar], limit)?;
+        rest = &rest[dollar + 1..];
+        if let Some(next) = rest.strip_prefix('$') {
+            append(&mut output, "$", limit)?;
+            rest = next;
+            continue;
+        }
+        let reference = if let Some(braced) = rest.strip_prefix('{') {
+            braced.find('}').map(|end| (&braced[..end], end + 2))
+        } else {
+            let end = rest
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                .count();
+            (end > 0).then(|| (&rest[..end], end))
+        };
+        if let Some((name, consumed)) = reference {
+            let value = name
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| captures.get(index))
+                .or_else(|| {
+                    if name.parse::<usize>().is_err() {
+                        captures.name(name)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(value) = value {
+                append(&mut output, value.as_str(), limit)?;
+            }
+            rest = &rest[consumed..];
+        } else {
+            append(&mut output, "$", limit)?;
+        }
+    }
+    append(&mut output, rest, limit)?;
+    Ok(output)
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Step {
@@ -147,6 +207,10 @@ fn text(value: &Value, max: usize, limits: Limits) -> Result<std::borrow::Cow<'_
     Ok(std::borrow::Cow::Owned(
         String::from_utf8(writer.bytes).map_err(|_| Error::InvalidUtf8)?,
     ))
+}
+
+pub fn payload_bytes(value: &Value, limit: usize) -> Result<usize, Error> {
+    Ok(text(value, limit, Limits::default())?.len())
 }
 
 fn checked_text(bytes: Vec<u8>, max: usize) -> Result<Value, Error> {
@@ -582,6 +646,54 @@ mod tests {
     use serde_json::json;
     fn run(value: Value, steps: &[Step]) -> Result<Output, Error> {
         transform(&value, steps, Limits::default())
+    }
+    #[test]
+    fn bounded_capture_expansion_matches_regex_syntax_without_pessimistic_rejection() {
+        let regex = regex::Regex::new(r"(?P<word>foo)(/é)?").unwrap();
+        for input in ["foo/é", "foo"] {
+            let captures = regex.captures(input).unwrap();
+            for template in [
+                "literal",
+                "$0",
+                "$1-$2",
+                "$word",
+                "${word}",
+                "$$",
+                "$$1",
+                "$$$1",
+                "$42a",
+                "${1}a",
+                "$missing",
+                "${}",
+                "${word",
+                "$é",
+                "${not a name}",
+                "$99999999999999999999999999999",
+                "a$!b",
+            ] {
+                let mut expected = String::new();
+                captures.expand(template, &mut expected);
+                assert_eq!(
+                    expand_capture(&captures, template, 1024).unwrap(),
+                    expected,
+                    "{template}"
+                );
+                if !expected.is_empty() {
+                    assert_eq!(
+                        expand_capture(&captures, template, expected.len() - 1),
+                        Err(Error::OutputLimit)
+                    );
+                }
+            }
+        }
+        let large = "x".repeat(256 << 10);
+        let captures = regex::Regex::new("(.*)").unwrap();
+        let captures = captures.captures(&large).unwrap();
+        assert_eq!(expand_capture(&captures, "ok", 2).unwrap(), "ok");
+        assert_eq!(
+            expand_capture(&captures, "$1$1", 300 << 10),
+            Err(Error::OutputLimit)
+        );
     }
     #[test]
     fn encodings_round_trip_unicode_without_touching_original() {

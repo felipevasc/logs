@@ -4,7 +4,8 @@ This stage publishes and verifies optional per-segment timestamp summaries in th
 existing background queue. Count and statistics use complete verified reader sets
 for supported level equality and timestamp bounds. Missing or corrupt summaries
 continue to use the existing SQL route, and optional work never changes the main
-checkpoint's readiness or key. Timeline routing is a separate next consumer.
+checkpoint's readiness or key. Unfiltered indexed timeline zooms also use requested-range ranks; filtered, case
+and memory timeline paths retain their existing semantics.
 
 ## Scheduling and ownership
 
@@ -51,10 +52,9 @@ from engine memory budgets and does not impose a process RSS limit.
 
 The producer/lease driver has exercised real DuckDB sorting, exact total count,
 dual-lease lifetime, cancellation, corruption rejection/repair, unchanged reuse,
-cleanup and temporary-file removal on a tiny fixture. Reference stats/query tests,
-new all-or-none cache ownership tests and queue preemption tests are included in
-source for the next coordinated focused native run. No 50M or cold-scale run is
-part of this structural checkpoint.
+cleanup and temporary-file removal on a tiny fixture. The coordinated native run
+passed the 13 time-index module tests, four count/statistics routing tests and the
+optional-worker yield test. No 50M or cold-scale run is part of these checkpoints.
 
 The count/statistics slice checks the optional capability before constructing a
 SQL Scope. Unsupported predicates and absent/changed sets use exact SQL; real
@@ -62,13 +62,16 @@ cancellation and execution failures remain errors. A metadata mismatch evicts on
 the matching stale Arc generations from the cache and sessions, preserving newer
 verified replacements, then permits a current-source demand to queue repair.
 
-The standalone driver also passed matching-generation eviction and replacement
-preservation. Four added in-module routing tests cover two-part SQL parity (then
-drop the SQL table to prove the fast path), unsupported/incomplete fallback, stale
-reader release and cancellation. These tests await the coordinated native run;
-the standalone driver does not validate app routing or statistics.
+The unfiltered timeline consumer uses the caller's existing requested start/end,
+ceil width and bucket count directly, without converting those bounds to f64.
+Per-level ranks produce count/error/warning buckets, with the same saturating
+arithmetic and final-bucket clamp as the metadata scan. Zero/missing timestamps
+remain excluded. Missing/stale capability retains that exact scan. Arbitrary-field
+grouping is a separate following stage.
 
-The next consumer is fixed-range timeline histograms. It should rank requested bucket boundaries in the sorted
-arrays instead of scanning every LineStore row on each zoom. Parity must preserve
-requested bounds, ceil bucket widths, final-bucket inclusion, ties, zero/missing
-and negative timestamps, error/warning classes, and all-part fallback.
+Tiny standalone rank-vs-scan checks passed for ties, negative and zero timestamps,
+short and single-value ranges, and full i64 endpoints. New two-part unit/routing
+tests await the next coordinated focused native run; source parsing and diff
+checks have passed. Large-scale performance remains unmeasured. Final evaluation
+must record file-backed versus private memory, minor/major faults, and cold/warm
+random-page pressure: demand-paged mappings do not establish a hard RSS bound.

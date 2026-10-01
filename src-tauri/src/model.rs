@@ -15,6 +15,22 @@ pub const STANDARD_COLUMNS: &[&str] = &[
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DerivedDiagnostic {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub warning: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum DerivedOriginal {
+    Missing,
+    Present(Value),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub id: usize,
     /// Stable source/version/record identity; independent of result ordering.
@@ -33,6 +49,11 @@ pub struct Event {
     pub raw: String,
     #[serde(default)]
     pub fields: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_diagnostics: Vec<DerivedDiagnostic>,
+    /// Provenance for recomputing an overlay on a request-local copy.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub derived_originals: std::collections::BTreeMap<String, DerivedOriginal>,
 }
 
 impl Event {
@@ -50,6 +71,8 @@ impl Event {
             message: String::new(),
             raw: String::new(),
             fields: Map::new(),
+            derived_diagnostics: Vec::new(),
+            derived_originals: std::collections::BTreeMap::new(),
         }
     }
 

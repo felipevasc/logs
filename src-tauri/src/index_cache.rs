@@ -102,7 +102,7 @@ pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::pat
     if let Some((lines, columns)) = crate::metadata_checkpoint::open_complete(dir, &key, prepared.part.mmap.len(), prepared.initial_cursor(), prepared.multiline(), progress)? {
         prepared.validate()?;
         let mut part = prepared.part.clone(); part.metadata_identity = key;
-        return Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(lines), columns, time_order: std::sync::OnceLock::new() });
+        return Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(lines), columns, time_order: std::sync::Arc::new(std::sync::OnceLock::new()) });
     }
     let resumed = std::cell::Cell::new(0usize);
     let committed = std::cell::Cell::new(0usize);
@@ -300,7 +300,7 @@ fn restore_timestamps(
     crate::operations::check()?;
     let timestamps = crate::metadata_store::Timestamps::from_validated_map(mapped, 80, count, Some(lease))?;
     idx.lines = std::sync::Arc::new(idx.lines.with_timestamps(timestamps)?);
-    idx.time_order.take();
+    idx.time_order = std::sync::Arc::new(std::sync::OnceLock::new());
     if let Some(report) = progress {
         report("Reutilizando cache de data/hora", count, count);
     }

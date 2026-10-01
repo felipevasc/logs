@@ -740,7 +740,7 @@ fn write(
         parts: vec![source.part],
         lines: Arc::new(source.lines.slice(source.range)),
         columns: Vec::new(),
-        time_order: std::sync::OnceLock::new(),
+        time_order: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let total = idx.lines.len();
     if total > u32::MAX as usize {

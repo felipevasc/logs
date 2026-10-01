@@ -1656,6 +1656,8 @@ pub struct DerivedField {
     pub name: String,
     pub source: String,
     pub rules: Vec<DerivedRule>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<crate::field_transform::Step>,
 }
 
 /// Formato de leitura tolerante ao legado (regra única na raiz do objeto).
@@ -1671,6 +1673,8 @@ pub struct DerivedFieldCompat {
     pub filter: Option<crate::query::Filter>,
     #[serde(default)]
     pub rules: Vec<DerivedRule>,
+    #[serde(default)]
+    pub steps: Vec<crate::field_transform::Step>,
 }
 
 impl DerivedFieldCompat {
@@ -1687,6 +1691,7 @@ impl DerivedFieldCompat {
             name: self.name,
             source: self.source,
             rules,
+            steps: self.steps,
         }
     }
 }
@@ -1703,13 +1708,112 @@ pub struct CompiledDerived {
     pub name: String,
     pub source: String,
     pub rules: Vec<CompiledRule>,
+    pub steps: Vec<crate::field_transform::Step>,
 }
 
 /// Aplica os campos derivados a um evento. As regras de cada campo são
 /// tentadas em ordem (OU): a primeira que extrai valor não vazio vence.
 pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
+    const BUDGET: usize = 2 << 20;
+    for (name, original) in std::mem::take(&mut ev.derived_originals) {
+        match original {
+            crate::model::DerivedOriginal::Missing => { ev.fields.remove(&name); }
+            crate::model::DerivedOriginal::Present(value) => { ev.fields.insert(name, value); }
+        }
+    }
+    ev.derived_diagnostics.clear();
+    let mut remaining = BUDGET;
+    fn diagnostic(ev: &mut Event, field: &str, code: &str, message: String, warning: bool) {
+        if ev.derived_diagnostics.len() < 31 {
+            ev.derived_diagnostics.push(crate::model::DerivedDiagnostic {
+                field: field.chars().take(128).collect(), code: code.into(), message, warning,
+            });
+        } else if ev.derived_diagnostics.len() == 31 {
+            ev.derived_diagnostics.push(crate::model::DerivedDiagnostic {
+                field: String::new(), code: "diagnostic_limit".into(), message: "Outros diagnósticos de campos foram omitidos neste registro.".into(), warning: true,
+            });
+        }
+    }
     for d in derived {
-        let Some(val) = ev.col_str(&d.source) else {
+        if !d.steps.is_empty() {
+            if d.name.starts_with('@') || ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw", "arquivo", "caminho"].iter().any(|name| d.name.eq_ignore_ascii_case(name)) {
+                diagnostic(ev, &d.name, "reserved_target", "Escolha outro nome; este campo é reservado para metadados do evento.".into(), false);
+                continue;
+            }
+            let limits = crate::field_transform::Limits { output_bytes: (512 << 10).min(remaining), ..Default::default() };
+            let canonical = matches!(d.source.as_str(), "id" | "event_ref" | "timestamp" | "source" | "level" | "code" | "name" | "description" | "message" | "raw");
+            let source = match (!canonical).then(|| ev.fields.get(&d.source)).flatten() {
+                Some(value) => std::borrow::Cow::Borrowed(value),
+                None => match ev.col_ref(&d.source) {
+                    Some(value) => {
+                        if value.len() > limits.input_bytes {
+                            diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::InputLimit.to_string(), false);
+                            continue;
+                        }
+                        std::borrow::Cow::Owned(Value::String(value.into_owned()))
+                    }
+                    None => continue,
+                },
+            };
+            // Validate before regex stringification or capture expansion. A
+            // structured source can otherwise allocate before pipeline limits.
+            let source = match crate::field_transform::transform(source.as_ref(), &[], limits) {
+                Ok(output) => output.value,
+                Err(error) => { diagnostic(ev, &d.name, "transform_error", error.to_string(), false); continue; }
+            };
+            let extracted;
+            let input = if d.rules.is_empty() { &source } else {
+                let value = source.as_str().map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|| std::borrow::Cow::Owned(source.to_string()));
+                let found = d.rules.iter().filter(|r| r.filter.as_ref().is_none_or(|f| crate::query::matches_filter(ev, f))).find_map(|r| {
+                    let captures = r.re.captures(&value)?;
+                    let output = match &r.template {
+                        Some(template) if !template.is_empty() => {
+                            match crate::field_transform::expand_capture(&captures, template, limits.output_bytes) {
+                                Ok(value) => value,
+                                Err(error) => return Some(Err(error)),
+                            }
+                        }
+                        _ => captures.get(1).or_else(|| captures.get(0)).map(|m| m.as_str().to_owned()).unwrap_or_default(),
+                    };
+                    (!output.is_empty()).then_some(Ok(Value::String(output)))
+                });
+                let Some(value) = found else { continue };
+                extracted = match value {
+                    Ok(value) => value,
+                    Err(error) => { diagnostic(ev, &d.name, "transform_error", error.to_string(), false); continue; }
+                }; &extracted
+            };
+            let result = crate::field_transform::transform(input, &d.steps, limits).and_then(|output| {
+                let expanded = crate::field_transform::expanded_fields(&d.name, &output.value,
+                    crate::field_transform::Limits { output_bytes: (1 << 20).min(remaining), ..limits }, 512)?;
+                Ok((expanded, output.notices))
+            });
+            match result {
+                Ok((fields, notices)) => {
+                    // A new transform creates another field; a raw same-named
+                    // field or child must never be silently overwritten.
+                    if fields.keys().any(|name| ev.fields.contains_key(name)) {
+                        diagnostic(ev, &d.name, "target_conflict", "O nome do campo transformado ou de um subcampo já existe no registro original.".into(), false);
+                        continue;
+                    }
+                    let bytes = fields.iter().try_fold(0usize, |size, (key, value)| {
+                        Ok::<_, crate::field_transform::Error>(size.saturating_add(key.len().saturating_mul(2)).saturating_add(crate::field_transform::payload_bytes(value, remaining)?).saturating_add(32))
+                    });
+                    let bytes = match bytes {
+                        Ok(bytes) if bytes <= remaining => bytes,
+                        _ => { diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::OutputLimit.to_string(), false); continue; }
+                    };
+                    remaining -= bytes;
+                    for name in fields.keys() { ev.derived_originals.insert(name.clone(), crate::model::DerivedOriginal::Missing); }
+                    ev.fields.extend(fields);
+                    for notice in notices { diagnostic(ev, &d.name, notice, "Payload JWT decodificado. A assinatura e as declarações não foram verificadas.".into(), true); }
+                }
+                Err(error) => diagnostic(ev, &d.name, "transform_error", error.to_string(), false),
+            }
+            continue;
+        }
+        let Some(val) = ev.col_ref(&d.source) else {
             continue;
         }; // owned: liberado para inserir o campo
         for r in &d.rules {
@@ -1721,22 +1825,148 @@ pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
             if let Some(cap) = r.re.captures(&val) {
                 let extracted = match &r.template {
                     Some(t) if !t.is_empty() => {
-                        let mut out = String::new();
-                        cap.expand(t, &mut out);
-                        out
+                        match crate::field_transform::expand_capture(&cap, t, remaining) {
+                            Ok(value) => value,
+                            Err(error) => { diagnostic(ev, &d.name, "transform_error", error.to_string(), false); break; }
+                        }
                     }
-                    _ => cap
-                        .get(1)
-                        .or_else(|| cap.get(0))
-                        .map(|m| m.as_str().to_string())
-                        .unwrap_or_default(),
+                    _ => {
+                        let value = cap.get(1).or_else(|| cap.get(0));
+                        if value.is_some_and(|m| m.len() > remaining) {
+                            diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::OutputLimit.to_string(), false);
+                            break;
+                        }
+                        value.map(|m| m.as_str().to_owned()).unwrap_or_default()
+                    },
                 };
                 if !extracted.is_empty() {
+                    let previous = if ev.derived_originals.contains_key(&d.name) { None } else { ev.fields.get(&d.name) };
+                    let bytes = previous.map(|value| crate::field_transform::payload_bytes(value, remaining)).transpose()
+                        .map(|n| n.unwrap_or(0).saturating_add(extracted.len()).saturating_add(d.name.len().saturating_mul(2)).saturating_add(32));
+                    let bytes = match bytes {
+                        Ok(bytes) if bytes <= remaining => bytes,
+                        _ => { diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::OutputLimit.to_string(), false); break; }
+                    };
+                    let original = previous.cloned().map(crate::model::DerivedOriginal::Present).unwrap_or(crate::model::DerivedOriginal::Missing);
+                    ev.derived_originals.entry(d.name.clone()).or_insert(original);
+                    remaining -= bytes;
                     ev.fields.insert(d.name.clone(), Value::from(extracted));
                     break;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod derived_transform_tests {
+    use super::*;
+    use crate::field_transform::Step;
+    use serde_json::json;
+    fn definition(name: &str, source: &str, steps: Vec<Step>) -> CompiledDerived {
+        CompiledDerived { name: name.into(), source: source.into(), rules: Vec::new(), steps }
+    }
+    #[test]
+    fn transformed_parent_and_children_keep_types_and_query_visibility() {
+        let mut event = Event::empty();
+        event.fields.insert("encoded".into(), json!("eyJjb2RlIjo1MDMsIm9rIjpmYWxzZSwiZW1wdHkiOiIifQ=="));
+        let original = event.fields.clone();
+        apply_derived(&mut event, &[definition("decoded", "encoded", vec![Step::Base64Decode, Step::ParseJson])]);
+        assert_eq!(event.fields["encoded"], original["encoded"]);
+        assert_eq!(event.fields["decoded.code"], 503);
+        assert_eq!(event.fields["decoded.ok"], false);
+        assert_eq!(event.fields["decoded.empty"], "");
+        assert!(event.fields["decoded"].is_object());
+        let filter: crate::query::Filter = serde_json::from_value(json!({"column":"decoded.code","op":"gte","value":"500"})).unwrap();
+        assert!(crate::query::matches_filter(&event, &filter));
+        assert!(event.derived_diagnostics.is_empty());
+    }
+    #[test]
+    fn transform_failure_keeps_original_and_other_fields_queryable() {
+        let mut event = Event::empty();
+        event.message = "visible original".into();
+        event.fields.insert("token".into(), json!("invalid-secret"));
+        event.fields.insert("path".into(), json!("%2Fapi"));
+        apply_derived(&mut event, &[
+            definition("decoded", "token", vec![Step::Base64Decode]),
+            definition("url", "path", vec![Step::UrlDecode]),
+        ]);
+        assert_eq!(event.message, "visible original");
+        assert_eq!(event.fields["token"], "invalid-secret");
+        assert!(!event.fields.contains_key("decoded"));
+        assert_eq!(event.fields["url"], "/api");
+        assert_eq!(event.derived_diagnostics.len(), 1);
+        assert!(!event.derived_diagnostics[0].message.contains("secret"));
+    }
+    #[test]
+    fn transform_children_never_overwrite_an_original_field() {
+        let mut event = Event::empty();
+        event.fields.insert("json".into(), json!("{\"code\":503}"));
+        event.fields.insert("decoded.code".into(), json!(200));
+        apply_derived(&mut event, &[definition("decoded", "json", vec![Step::ParseJson])]);
+        assert_eq!(event.fields["decoded.code"], 200);
+        assert!(!event.fields.contains_key("decoded"), "collision rejects the entire field, not just one child");
+        assert_eq!(event.derived_diagnostics[0].code, "target_conflict");
+    }
+    #[test]
+    fn regex_then_transform_preserves_existing_extraction_order() {
+        let mut event = Event::empty(); event.message = "value=%2Fapi".into();
+        let mut field = definition("decoded", "message", vec![Step::UrlDecode]);
+        field.rules.push(CompiledRule { re: regex::Regex::new("value=(.*)").unwrap(), template: None, filter: None });
+        apply_derived(&mut event, &[field]);
+        assert_eq!(event.fields["decoded"], "/api");
+    }
+    #[test]
+    fn transform_limits_and_diagnostics_are_bounded_per_record() {
+        let mut event = Event::empty(); event.message = "x".repeat((256 << 10) + 1);
+        let fields = (0..64).map(|n| definition(&format!("decoded{n}"), "message", vec![Step::Base64Decode])).collect::<Vec<_>>();
+        apply_derived(&mut event, &fields);
+        assert!(event.fields.is_empty());
+        assert_eq!(event.derived_diagnostics.len(), 32);
+        assert_eq!(event.derived_diagnostics.last().unwrap().code, "diagnostic_limit");
+        assert_eq!(event.message.len(), (256 << 10) + 1);
+    }
+    #[test]
+    fn transform_source_uses_canonical_columns_before_raw_aliases() {
+        let mut event = Event::empty(); event.level = "Erro".into(); event.id = 42;
+        event.fields.insert("level".into(), json!("ERROR"));
+        event.fields.insert("id".into(), json!("raw-id"));
+        event.fields.insert("timestamp".into(), json!("raw-time"));
+        apply_derived(&mut event, &[
+            definition("level_copy", "level", vec![Step::Base64Encode, Step::Base64Decode]),
+            definition("id_copy", "id", vec![Step::Base64Encode, Step::Base64Decode]),
+            definition("time_copy", "timestamp", vec![Step::Base64Encode, Step::Base64Decode]),
+        ]);
+        assert_eq!(event.fields["level_copy"], "Erro");
+        assert_eq!(event.fields["id_copy"], "42");
+        assert!(!event.fields.contains_key("time_copy"));
+        apply_derived(&mut event, &[definition("LEVEL", "id", vec![Step::Base64Encode])]);
+        assert!(!event.fields.contains_key("LEVEL"));
+        assert_eq!(event.derived_diagnostics[0].code, "reserved_target");
+    }
+    #[test]
+    fn case_overlay_recomputes_from_provenance_and_empty_config_restores_original() {
+        let mut original = Event::empty(); original.fields.insert("input".into(), json!("%2Fapi"));
+        original.fields.insert("native_null".into(), Value::Null);
+        let first = definition("decoded", "input", vec![Step::UrlDecode]);
+        let mut captured = original.clone(); apply_derived(&mut captured, &[first.clone()]);
+        let serialized = serde_json::to_string(&captured).unwrap();
+        let evidence: Event = serde_json::from_str(&serialized).unwrap();
+        let mut overlay = evidence.clone(); apply_derived(&mut overlay, &[first]);
+        assert_eq!(overlay.fields["decoded"], "/api"); assert!(overlay.derived_diagnostics.is_empty());
+        let mut second = definition("native_null", "input", Vec::new());
+        second.rules.push(CompiledRule { re: regex::Regex::new("(.*)").unwrap(), template: Some("replacement".into()), filter: None });
+        apply_derived(&mut overlay, &[second]);
+        assert!(!overlay.fields.contains_key("decoded"));
+        assert_eq!(overlay.fields["native_null"], "replacement");
+        let mut restored: Event = serde_json::from_str(&serde_json::to_string(&overlay).unwrap()).unwrap();
+        apply_derived(&mut restored, &[]);
+        assert_eq!(restored.fields, original.fields);
+        assert!(restored.derived_originals.is_empty());
+        assert_eq!(serde_json::to_string(&evidence).unwrap(), serialized, "saved evidence was never changed");
+        let mut legacy = original.clone(); legacy.fields.insert("historical_unmarked".into(), json!("keep"));
+        apply_derived(&mut legacy, &[]);
+        assert_eq!(legacy.fields["historical_unmarked"], "keep", "never guess that an unmarked captured field was generated");
     }
 }
 
@@ -1841,7 +2071,7 @@ pub struct FileIndex {
     pub parts: Vec<FilePart>,
     pub lines: std::sync::Arc<crate::metadata_store::LineStore>,
     pub columns: Vec<String>,
-    pub time_order: std::sync::OnceLock<Vec<usize>>,
+    pub time_order: std::sync::Arc<std::sync::OnceLock<Vec<usize>>>,
 }
 
 // Single-source configuration remains available to the existing format editor.
@@ -1882,7 +2112,7 @@ impl FileIndex {
         for c in other.columns {
             if !self.columns.contains(&c) { self.columns.push(c); }
         }
-        self.time_order.take();
+        self.time_order = std::sync::Arc::new(std::sync::OnceLock::new());
         Ok(())
     }
     pub fn bytes_len(&self) -> u64 {
@@ -2136,7 +2366,7 @@ pub fn retimestamp_index(
     crate::operations::check()?;
     for part in &idx.parts { validate_source(part)?; }
     idx.lines = std::sync::Arc::new(idx.lines.with_timestamps(timestamps)?);
-    idx.time_order.take();
+    idx.time_order = std::sync::Arc::new(std::sync::OnceLock::new());
     if let Some(cb) = progress {
         cb(total, total);
     }
@@ -2887,7 +3117,7 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
     crate::operations::check()?;
     let mut part = prepared.part.clone();
     part.metadata_identity = prepared.key()?;
-    Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(resume.lines.finish()?), columns, time_order: std::sync::OnceLock::new() })
+    Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(resume.lines.finish()?), columns, time_order: std::sync::Arc::new(std::sync::OnceLock::new()) })
 }
 
 /// Uncached entry point, also used as the semantic oracle in recovery tests.

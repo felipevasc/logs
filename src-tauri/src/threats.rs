@@ -817,13 +817,13 @@ fn visit(
         memory(events);
         return operations::check();
     }
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     match &*source {
         SourceData::Memory(events) => memory(events),
         SourceData::Indexed(index) => {
             let codes = state.codes.read();
             let system = state.system_codes.read();
-            let derived = state.derived.read();
+            let derived = crate::analysis_runtime::derived(&state);
             query::visit_indexed_mapped(index, &prepared, &codes, &system, &derived, analyze, |_, event, (body, ids)| {
                 visitor(event, body, ids)
             })?;
@@ -1003,10 +1003,12 @@ pub async fn threat_scan(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: tauri::AppHandle,
 ) -> Result<ScanResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || {
         let path = path();
         let catalog = load_path(&path)?;
         scan_impl(
@@ -1027,12 +1029,14 @@ pub async fn threat_events(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     offset: Option<usize>,
     limit: Option<usize>,
     app: tauri::AppHandle,
 ) -> Result<EventResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || {
         events_impl(
             app.state::<AppState>().inner(),
             filters,

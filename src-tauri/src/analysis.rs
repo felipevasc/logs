@@ -495,15 +495,16 @@ where
         }
         None => vec![],
     };
-    let split_names: Vec<String> = if splits.is_empty() {
+    let has_splits = !splits.is_empty();
+    let split_names: Vec<String> = if !has_splits {
         let name = spec.field.as_deref().unwrap_or("eventos");
         budget.charge(name.len().saturating_add(std::mem::size_of::<String>()))?;
         vec![name.into()]
     } else {
-        for name in &splits {
-            budget.charge(name.len().saturating_add(std::mem::size_of::<String>()))?;
-        }
-        splits.clone()
+        // The ranking already charged each key. Move selected names instead
+        // of retaining another copy for lookup and another for the response.
+        budget.charge(splits.len().saturating_mul(std::mem::size_of::<String>()))?;
+        splits
     };
 
     if spec.chart == "terms" {
@@ -575,8 +576,8 @@ where
         });
     };
     let (interval, n_buckets) = series_interval(spec, tmin, tmax);
-    budget.charge(n_buckets.saturating_mul(std::mem::size_of::<HashMap<String, MetricAcc>>()))?;
-    let mut accs: Vec<HashMap<String, MetricAcc>> =
+    budget.charge(n_buckets.saturating_mul(std::mem::size_of::<HashMap<usize, MetricAcc>>()))?;
+    let mut accs: Vec<HashMap<usize, MetricAcc>> =
         (0..n_buckets).map(|_| HashMap::new()).collect();
     for ev in events() {
         crate::operations::check()?;
@@ -585,27 +586,22 @@ where
         if b >= n_buckets {
             continue;
         }
-        let name = match &spec.split {
+        let series_index = match &spec.split {
             Some(col) => {
-                let v = ev.col_str(col).unwrap_or_default();
-                if splits.contains(&v) {
-                    v
-                } else {
-                    continue;
-                }
+                if !has_splits { continue; }
+                let Some(value) = ev.col_ref(col) else { continue; };
+                let Some(index) = split_names.iter().position(|name| name == value.as_ref()) else { continue; };
+                index
             }
-            None => split_names[0].clone(),
+            None => 0,
         };
-        let acc = match accs[b].entry(name) {
+        let acc = match accs[b].entry(series_index) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                // Reserve the label before moving it into the bucket.
+                // Sparse cells keep their existing metric/distinct budgets,
+                // but reference one selected label by index instead of owning it.
                 budget.charge(
-                    entry
-                        .key()
-                        .len()
-                        .saturating_add(128)
-                        .saturating_add(std::mem::size_of::<MetricAcc>())
+                    128usize.saturating_add(std::mem::size_of::<MetricAcc>())
                         .saturating_add(spec.metric.len()),
                 )?;
                 entry.insert(MetricAcc::new(&spec.metric))
@@ -614,14 +610,11 @@ where
         incompatible_units += usize::from(acc.push_checked(&ev, field, expected_unit, budget)?);
     }
     budget.charge(n_buckets.saturating_mul(std::mem::size_of::<Value>()))?;
-    for name in &split_names {
+    for _ in &split_names {
         budget.charge(
-            name.len()
-                .saturating_add(std::mem::size_of::<SeriesData>())
-                .saturating_add(
-                    n_buckets
-                        .saturating_mul(std::mem::size_of::<f64>() + std::mem::size_of::<usize>()),
-                ),
+            std::mem::size_of::<SeriesData>().saturating_add(
+                n_buckets.saturating_mul(std::mem::size_of::<f64>() + std::mem::size_of::<usize>()),
+            ),
         )?;
     }
     crate::operations::check()?;
@@ -634,16 +627,17 @@ where
             .collect(),
         x_values: vec![],
         series: split_names
-            .iter()
-            .map(|name| SeriesData {
-                name: name.clone(),
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| SeriesData {
+                name,
                 samples: accs
                     .iter()
-                    .map(|m| m.get(name).map(|a| a.n as usize).unwrap_or(0))
+                    .map(|m| m.get(&index).map(|a| a.n as usize).unwrap_or(0))
                     .collect(),
                 points: accs
                     .iter()
-                    .map(|m| m.get(name).map(|a| a.value()).unwrap_or(0.0))
+                    .map(|m| m.get(&index).map(|a| a.value()).unwrap_or(0.0))
                     .collect(),
             })
             .collect(),
@@ -1196,6 +1190,46 @@ mod recovery_budget_tests {
             }],
             limit_rows: 2000,
         }
+    }
+
+    #[test]
+    fn time_split_labels_do_not_repeat_in_the_shared_bucket_budget() {
+        let labels: Vec<_> = (0..6).map(|i| format!("{i}{}", "x".repeat(8 << 10))).collect();
+        let events: Vec<_> = (0..41).flat_map(|bucket| labels.iter().flat_map(move |label| {
+            [event(label, "1KB", bucket * 1000), event(label, "1KB", bucket * 1000)]
+        })).collect();
+        for (metric, point) in [("count", 2.0), ("sum", 2048.0), ("distinct", 1.0)] {
+            let mut spec = series_spec("time", metric);
+            spec.split = Some("source".into());
+            spec.unit = Some("bytes".into());
+            let result = crate::resources::with_analytics_limit(256 << 10, || compute_series(&events, &spec)).unwrap();
+            assert_eq!(result.series.iter().map(|s| &s.name).collect::<Vec<_>>(), labels.iter().collect::<Vec<_>>());
+            assert!(result.series.iter().all(|s| s.points == vec![point; 41] && s.samples == vec![2; 41]));
+            assert_eq!(result.incompatible_units, 0);
+            assert!(crate::resources::with_analytics_limit(4096, || compute_series(&events, &spec)).is_err(),
+                "selected labels and distinct values still share the finite budget");
+        }
+    }
+
+    #[test]
+    fn time_split_indices_preserve_typed_missing_and_empty_values() {
+        let mut events = Vec::new();
+        for value in [None, Some(json!("")), Some(json!(" ")), Some(json!(7)), Some(json!(false)), Some(Value::Null), Some(json!("null")), Some(json!({"a":1}))] {
+            let mut row = event("source", "1KB", 0);
+            if let Some(value) = value { row.fields.insert("group".into(), value); }
+            events.push(row);
+        }
+        let mut spec = series_spec("time", "count");
+        spec.split = Some("group".into());
+        let result = compute_series(&events, &spec).unwrap();
+        assert_eq!(result.series.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["null", " ", "7", "false", "{\"a\":1}"]);
+        assert_eq!(result.series.iter().map(|s| s.samples[0]).collect::<Vec<_>>(), vec![2,1,1,1,1]);
+        for row in &mut events { row.fields.remove("group"); }
+        let empty = compute_series(&events, &spec).unwrap();
+        assert_eq!(empty.series.len(), 1);
+        assert_eq!(empty.series[0].name, "message");
+        assert_eq!(empty.series[0].samples, vec![0]);
+        assert_eq!(empty.series[0].points, vec![0.0]);
     }
 
     #[test]

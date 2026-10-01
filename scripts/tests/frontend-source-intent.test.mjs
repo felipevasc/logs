@@ -115,6 +115,13 @@ releaseSource(); await settle(); assert.equal(await blockedA, false);
 assert.equal(blocked.pending.length, 1); blocked.pending[0].complete(); await blockedB;
 assert.equal(blocked.native, 'B');
 
+// Reusing a Case ID after delete/import does not revive an already captured source intent.
+const replacedCase = fixture(); let releaseCase;
+replacedCase.sourceWait(() => new Promise(resolve => { releaseCase = resolve; }));
+const oldCaseLoad = replacedCase.context.loadData(file('old-case')); await settle();
+replacedCase.state.cases.cases = [{ id: 'case', artifacts: [] }];
+releaseCase(); assert.equal(await oldCaseLoad, false); assert.equal(replacedCase.pending.length, 0);
+
 const emptyCase = fixture();
 const abandoned = emptyCase.context.loadData(file('A')); await settle();
 emptyCase.state.cases.active = 'empty'; emptyCase.state.cases.cases.push({ id: 'empty', artifacts: [] });
@@ -151,6 +158,7 @@ for (const kind of ['load', 'clear']) {
   committed.context.window.Tasks.cancelLatest('source-load'); await settle();
   committed.pending[0].respond(); assert.equal(await result, true);
   assert.equal(committed.state.loaded, kind === 'load');
+  assert.equal(committed.state.sourcePublication.generation, 1, 'load and clear both advance the admitted source generation');
   assert.equal(committed.state.currentArtifact?.path || null, kind === 'load' ? 'A' : null);
 }
 

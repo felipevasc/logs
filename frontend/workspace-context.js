@@ -18,6 +18,8 @@ window.WorkspaceContext = (() => {
   const validFilters = value => Array.isArray(value) ? value.filter(item => item && typeof item.column === "string" && typeof item.op === "string").slice(0, 200).map(item => ({ ...item, ...(item.value != null ? { value: String(item.value) } : {}), ...(item.value2 != null ? { value2: String(item.value2) } : {}) })) : [];
   function sanitize(raw) {
     const base = defaults(), input = record(raw), values = record(input.values), snapshot = { ...base, ...input, values: { ...base.values, ...values }, scroll: {} };
+    const temporal = record(input.explorerTimeline);
+    snapshot.explorerTimeline = { field: typeof temporal.field === "string" ? temporal.field : null, limit: [6, 12, 24].includes(temporal.limit) ? temporal.limit : 12, hidden: strings(temporal.hidden).slice(0, 27) };
     snapshot.queryDraft = typeof input.queryDraft?.value === "string" ? { value: input.queryDraft.value, start: input.queryDraft.start, end: input.queryDraft.end, direction: input.queryDraft.direction } : null;
     snapshot.page = ["summary", "compromises", "timeline", "case-timeline", "case-trails", "journeys", "explore", "compare", "evidence", "sources", "connections", "import"].includes(input.page) ? input.page : "summary";
     const v = snapshot.values;
@@ -41,7 +43,7 @@ window.WorkspaceContext = (() => {
     return snapshot;
   }
   function capture() {
-    const snapshot = { page: document.body.dataset.page || "summary", queryDraft: window.QueryBar?.captureDraft?.() || { value: $("#quick-search").value }, values: Object.fromEntries(stateKeys.map(name => [name, copy(state[name])])), tree: [...state.treeCollapsed], cubeCollapsed: [...cubeState.collapsed], density: document.body.dataset.density, wrap: document.body.dataset.wrap, sideCollapsed: document.querySelector(".shell").classList.contains("side-collapsed"), scroll: {}, discovery: window.Discovery?.capture(), workbench: window.WorkspaceAnalysis?.capture(), workspace: window.Workspace?.capture(), journeys: window.Journeys?.capture() };
+    const snapshot = { page: document.body.dataset.page || "summary", queryDraft: window.QueryBar?.captureDraft?.() || { value: $("#quick-search").value }, values: Object.fromEntries(stateKeys.map(name => [name, copy(state[name])])), tree: [...state.treeCollapsed], cubeCollapsed: [...cubeState.collapsed], density: document.body.dataset.density, wrap: document.body.dataset.wrap, sideCollapsed: document.querySelector(".shell").classList.contains("side-collapsed"), scroll: {}, discovery: window.Discovery?.capture(), workbench: window.WorkspaceAnalysis?.capture(), explorerTimeline: window.ExplorerTimeline?.capture(), workspace: window.Workspace?.capture(), journeys: window.Journeys?.capture() };
     for (const selector of scrollSelectors) { const node = document.querySelector(selector); if (node) snapshot.scroll[selector] = [node.scrollLeft, node.scrollTop]; }
     states.set(key(), snapshot); runtime.set(key(), Object.fromEntries(runtimeKeys.map(name => [name, state[name]])));
     const c = activeCase(); if (c) { c.workspace ||= defaultCaseWorkspace(); c.workspace.contextStates = record(c.workspace.contextStates); c.workspace.contextStates[scope] = snapshot; c.workspace.activeScope = scope; }
@@ -75,9 +77,15 @@ window.WorkspaceContext = (() => {
     if (window.QueryBar?.restoreDraft) window.QueryBar.restoreDraft(snapshot.queryDraft || { value: state.quick });
     else $("#quick-search").value = snapshot.queryDraft?.value ?? state.quick;
     window.Workspace?.restore(snapshot.workspace); window.Discovery?.restore(snapshot.discovery); window.WorkspaceAnalysis?.restore(snapshot.workbench);
-    window.Journeys?.restore(snapshot.journeys);
+    window.Journeys?.restore(snapshot.journeys); window.ExplorerTimeline?.restore(snapshot.explorerTimeline);
     fillColumnControls(); renderChips(); renderExploreTree(); updateContextBar();
     restoreVisiblePreferences();
+  }
+  function invalidateAnalysis(caseId) {
+    for (const area of ["dataset", "case"]) {
+      const cacheKey = `${caseId}:${area}`, saved = runtime.get(cacheKey);
+      if (saved) runtime.set(cacheKey, { ...saved, rows: [], total: null, dataPeriod: null, facetData: null, explorerCache: null, queryError: null });
+    }
   }
   function updateToggle() {
     document.documentElement.dataset.workspace = scope; document.body.dataset.workspace = scope;
@@ -127,8 +135,10 @@ window.WorkspaceContext = (() => {
     try {
       if (scope === "case") await setScope("dataset", { animate: false });
       if (request !== caseGeneration) return;
-      state.cases.active = id; state.activeStationId = null; state.stationAnalyticsId = null;
-      renderCaseBar(); updateAnalysisBadge(); await syncActiveCaseArtifacts();
+      state.cases.active = id; window.AnalysisContexts?.activate(); state.activeStationId = null; state.stationAnalyticsId = null;
+      renderCaseBar(); updateAnalysisBadge();
+      await loadDerivedFields(); if (request !== caseGeneration) return;
+      await syncActiveCaseArtifacts();
       if (request !== caseGeneration) return;
       // Each Case keeps its own analysis: its filters and views come back and
       // its records are queried again, never carried over from the previous Case.
@@ -155,6 +165,7 @@ window.WorkspaceContext = (() => {
     states.set(key("dataset"), fresh); states.set(key("case"), freshCase);
     c.workspace.contextStates = { dataset: fresh, case: freshCase }; c.workspace.activeScope = target;
     try {
+      if (window.AnalysisContexts && !await loadDerivedFields()) return;
       await setScope(target, { force: true, animate: false, skipCapture: true });
       if (state.loaded) await refresh();
     } finally { restoringCase = false; }
@@ -190,8 +201,8 @@ window.WorkspaceContext = (() => {
     restoringCase = true; initialized = false; caseGeneration++; generation++; state.refreshVersion++; detailRequest++;
     try {
       scope = "dataset"; state.analyticsScope = "dataset"; state.activeContext = "artifact";
-      state.cases = store; state.artifactSessions = new Map(); states.clear(); runtime.clear();
-      renderCaseBar(); updateAnalysisBadge(); await syncActiveCaseArtifacts(); await initialize();
+      state.cases = store; window.AnalysisContexts?.activate(); state.artifactSessions = new Map(); states.clear(); runtime.clear();
+      renderCaseBar(); updateAnalysisBadge(); await loadDerivedFields(); await syncActiveCaseArtifacts(); await initialize();
     } finally { restoringCase = false; }
   }
   let membershipSignature = "", refs = new Set(), identities = new Set();
@@ -212,5 +223,5 @@ window.WorkspaceContext = (() => {
   saveCases = function(...args) { if (initialized && !changing && !restoringCase) capture(); return originalSave(...args); };
   updateToggle();
   Promise.resolve(window.workspaceBootstrap).then(() => { if (!initialized) return initialize(); }).catch(error => toast(`Não foi possível restaurar a área de trabalho: ${error}`, "err"));
-  return { scope: () => scope, setScope, changeCase, initialize, capture, sourceChanged, replaceCases, waitForSource: () => sourceQueue.catch(() => {}), beforeCaseCreation, afterCaseCreation, deleteCase, isIncluded, refreshMembership, get sourceBusy() { return !!sourceBusy; }, get ready() { return initialized; }, get changing() { return changing || restoringCase; } };
+  return { invalidateAnalysis, scope: () => scope, setScope, changeCase, initialize, capture, sourceChanged, replaceCases, waitForSource: () => sourceQueue.catch(() => {}), beforeCaseCreation, afterCaseCreation, deleteCase, isIncluded, refreshMembership, get sourceBusy() { return !!sourceBusy; }, get ready() { return initialized; }, get changing() { return changing || restoringCase; } };
 })();

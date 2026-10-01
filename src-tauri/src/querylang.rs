@@ -1365,6 +1365,11 @@ impl Term {
 /// Resolved column reference, reusable across events.
 pub struct FieldRef(Field);
 
+impl FieldRef {
+    /// Canonical name/role used by Ctx::get, for conservative engine proofs.
+    pub(crate) fn parts(&self) -> (&str, Option<Role>) { (&self.0.name, self.0.role) }
+}
+
 pub fn field_ref(name: &str) -> FieldRef {
     FieldRef(resolve_field(name))
 }

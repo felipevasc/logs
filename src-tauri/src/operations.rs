@@ -117,6 +117,7 @@ static NAMED: LazyLock<Mutex<NamedRegistry>> =
 
 #[derive(Clone)]
 pub(crate) struct Cancellation {
+    analysis: Option<Arc<crate::analysis_runtime::Admitted>>,
     generation: Option<u64>,
     local: Option<Arc<Local>>,
     report_id: Option<String>,
@@ -209,6 +210,7 @@ pub(crate) fn token(id: Option<String>) -> Result<Cancellation, String> {
     });
     named.live.insert(id, Arc::downgrade(&local));
     Ok(Cancellation {
+        analysis: crate::analysis_runtime::current(),
         generation: Some(generation()),
         local: Some(local),
         report_id: None,
@@ -220,6 +222,7 @@ pub(crate) fn token(id: Option<String>) -> Result<Cancellation, String> {
 }
 pub(crate) fn current_token() -> Cancellation {
     Cancellation {
+        analysis: crate::analysis_runtime::current(),
         generation: current_generation(),
         local: LOCAL.with(|s| s.borrow().clone()),
         report_id: current_id(),
@@ -302,13 +305,14 @@ pub(crate) fn run_with_token<T>(token: Cancellation, f: impl FnOnce() -> T) -> R
         CHILD_STOPS.with(|s| s.replace(token.child_stops)),
     );
     check()?;
-    let result = f();
+    let result = crate::analysis_runtime::with(token.analysis, f);
     check()?;
     Ok(result)
 }
 pub fn run<T>(generation: u64, f: impl FnOnce() -> T) -> Result<T, String> {
     run_with_token(
         Cancellation {
+            analysis: crate::analysis_runtime::current(),
             generation: Some(generation),
             local: LOCAL.with(|s| s.borrow().clone()),
             report_id: current_id(),

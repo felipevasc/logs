@@ -7,7 +7,7 @@ let queried = 0, renderedFields = 0, openedTab = 0;
 const shell = { hidden: true };
 const context = vm.createContext({
   state: { loaded: true, rows: [{ id: 1 }], activeDatasetTab: 'table', queryError: null },
-  window: {}, workspaceScope: () => 'dataset', activeCase: () => null,
+  navigation: 0, window: {}, workspaceScope: () => 'dataset', activeCase: () => null,
   STRUCTURE: new Set(['sources', 'connections', 'import']), sourceKey: () => 'loaded-source', lastExploredKey: 'loaded-source',
   home: { hidden: false }, markPage() {}, closeDrawer() {},
   switchView: () => { shell.hidden = false; }, switchTab: () => { openedTab++; },

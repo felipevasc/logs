@@ -93,14 +93,14 @@ console.log('Summary pause/resume, exact-total reuse, stale generations and fail
   assert.match(f.context.currentCountLabel('eventos'), /pausado/);
   assert.equal(f.bars.at(-1)[0], 'Resumo pausado');
   assert.equal(f.bars.at(-1)[4], 'paused');
-  assert.match(f.node('#chart').children[0].textContent, /Histograma pausado/);
+  assert.match(f.node('#chart').children[0].textContent, /Timeline pausada/);
   assert.equal(f.node('.hist-panel').classList.contains('analytics-placeholder'), true);
   entry.status = 'queued'; f.context.showExplorerAnalytics(entry);
   assert.match(f.node('#context-summary').textContent, /aguardando cálculo/);
   assert.equal(f.bars.at(-1)[0], 'Resumo na fila');
   entry.status = 'failed'; entry.error = 'Spill budget'; f.context.showExplorerAnalytics(entry);
   assert.match(f.node('#context-summary').textContent, /não concluído/);
-  assert.match(f.node('#chart').children[0].textContent, /não concluído/);
+  assert.match(f.node('#chart').children[0].textContent, /não concluída/);
   assert.equal(f.bars.at(-1)[0], 'Resumo não concluído');
   const barsBefore = f.bars.length;
   for (const owner of [{loadOverlay:true},{activeOperation:{kind:'load'}},{progressOperationId:'another-task'}]) {
