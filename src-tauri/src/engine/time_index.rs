@@ -99,6 +99,28 @@ impl VerifiedCache {
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&String) -> bool) {
         self.entries.retain(|key, _| keep(key));
     }
+    /// An old query must not evict a newer reader installed under the same key.
+    pub(crate) fn remove_matching(&mut self, stale: &[Arc<TimeIndex>]) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, index| !stale.iter().any(|old| Arc::ptr_eq(index, old)));
+        self.entries.len() != before
+    }
+}
+pub(crate) fn shares_generation(readers: &[Arc<TimeIndex>], stale: &[Arc<TimeIndex>]) -> bool {
+    readers
+        .iter()
+        .any(|index| stale.iter().any(|old| Arc::ptr_eq(index, old)))
+}
+pub(crate) fn changed_readers(readers: &[Arc<TimeIndex>]) -> Result<Vec<Arc<TimeIndex>>> {
+    let mut changed = Vec::new();
+    for index in readers {
+        crate::operations::check()?;
+        if !index.data.unchanged() {
+            changed.push(Arc::clone(index));
+        }
+    }
+    Ok(changed)
 }
 
 fn read_u64(bytes: &[u8], at: usize) -> u64 {
@@ -999,5 +1021,28 @@ mod tests {
         );
         drop(readers);
         FileExt::try_lock_exclusive(&base).unwrap();
+    }
+    #[test]
+    fn stale_generation_eviction_preserves_a_newer_verified_handle() {
+        let (_directory, connection, store, identity) = fixture(&[(0, Some(5))]);
+        ensure(&connection, &store, &identity, &|| false).unwrap();
+        let old = open(&store, &identity).unwrap().unwrap();
+        // Metadata-only touch does not mutate mapped bytes. The old snapshot
+        // must fall back; a newly verified snapshot is a distinct generation.
+        let file = OpenOptions::new().write(true).open(path(&store)).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3))
+            .unwrap();
+        let newer = open(&store, &identity).unwrap().unwrap();
+        let stale = changed_readers(&[Arc::clone(&old)]).unwrap();
+        assert_eq!(stale.len(), 1);
+        let mut cache = VerifiedCache::default();
+        cache.insert("part".into(), Arc::clone(&newer));
+        assert!(!cache.remove_matching(&stale));
+        let current = cache.complete(["part"]).unwrap();
+        assert!(!shares_generation(&current, &stale));
+        assert_eq!(count(&current, &predicate(&[]).unwrap()).unwrap(), Some(1));
+        cache.insert("part".into(), old);
+        assert!(cache.remove_matching(&stale));
+        assert!(cache.complete(["part"]).is_none());
     }
 }

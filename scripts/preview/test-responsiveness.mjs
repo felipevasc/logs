@@ -144,6 +144,7 @@ try {
   await page.reload();
   await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && !state.loadOverlay);
   assert.equal(await page.locator('#quick-search').inputValue(), 'case-only draft');
+  assert.equal(await page.locator('#btn-add-search').isDisabled(), false, 'restored startup draft enables Add without typing');
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({first,local,cancel,errors},null,2));
 } catch (error) { await captureFailure(page, 'responsiveness', error, { errors }); throw error; }

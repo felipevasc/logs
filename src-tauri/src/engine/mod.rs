@@ -513,6 +513,31 @@ impl Session {
         self.time_indexes.read().clone()
     }
 
+    pub(crate) fn invalidate_exact_times(&self, readers: &time_index::ReadSet) -> Result<(), String> {
+        // Probe outside Registry. Only the precise stale Arc generations are
+        // evicted; a concurrent, freshly verified replacement remains usable.
+        let stale = time_index::changed_readers(readers)?;
+        if stale.is_empty() { return Ok(()); }
+        let clear = |session: &Session| {
+            let mut current = session.time_indexes.write();
+            let changed = current.as_ref().is_some_and(|set| time_index::shares_generation(set, &stale));
+            if changed { *current = None; }
+            changed
+        };
+        with_registry(|reg| {
+            reg.time_cache.remove_matching(&stale);
+            let mut retry = Vec::new();
+            for session in reg.base_session.iter().chain(reg.session.iter()) {
+                if clear(session) { retry.push(session.key.clone()); }
+            }
+            if clear(self) { retry.push(self.key.clone()); }
+            for key in retry { reg.time_attempts.remove(&key); }
+        });
+        // The caller drops its old ReadSet before exact SQL fallback. The next
+        // current-source request can enqueue repair without an own-reader lock.
+        Ok(())
+    }
+
     /// Lines (sorted) whose free text may contain `needle`, through the
     /// inverted indexes; `None` when they cannot narrow the search.
     pub(crate) fn free_candidates(&self, needle: &str, limit: usize) -> Result<Option<Vec<usize>>, String> {

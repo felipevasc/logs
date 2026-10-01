@@ -2006,10 +2006,15 @@ let currentEditFilter = null, currentEditFilterValue = null, currentFilterContex
 function filterContextKey() {
   return JSON.stringify([workspaceScope(), activeCase()?.id, state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields]);
 }
+function filterFocusTarget(origin) {
+  return [origin, $("#btn-add-filter"), $("#dr-close"), $("#quick-search")].find(node => node?.isConnected && !node.hidden && !node.disabled
+    && node.matches?.("button,input,select,textarea,[tabindex],a[href]") && !node.closest?.(".ctx-menu,#filter-pop,[hidden],[inert]")
+    && (!node.getClientRects || node.getClientRects().length));
+}
 function closeFilterPop(restoreFocus = true) {
   $("#filter-pop").hidden = true; filterComposing = false;
   currentEditFilterIndex = null; currentEditFilter = null; currentEditFilterValue = null; currentFilterContext = null;
-  if (restoreFocus) (filterReturnFocus?.isConnected ? filterReturnFocus : $("#btn-add-filter"))?.focus?.({ preventScroll: true });
+  if (restoreFocus) filterFocusTarget(filterReturnFocus)?.focus?.({ preventScroll: true });
   filterReturnFocus = null;
 }
 
@@ -2020,12 +2025,16 @@ function openFilterPop(anchor = null, editIndex = null, preset = null) {
   currentEditFilterValue = currentEditFilter ? JSON.stringify(currentEditFilter) : null;
   currentFilterContext = filterContextKey();
   const origin = anchor?.matches?.("button,input,select,textarea,[tabindex],a[href]") ? anchor : document.activeElement;
-  filterReturnFocus = origin?.isConnected && !origin.closest?.(".ctx-menu,#filter-pop") ? origin : $("#btn-add-filter");
+  filterReturnFocus = filterFocusTarget(origin);
   const pop = $("#filter-pop");
   const colSel = $("#fp-col");
   const opSel = $("#fp-op");
   const titleEl = pop.querySelector(".pop-title");
-  if (titleEl) titleEl.textContent = editIndex != null ? "Editar filtro" : "Novo filtro";
+  if (titleEl) { titleEl.id = "filter-pop-title"; titleEl.textContent = editIndex != null ? "Editar filtro" : "Novo filtro"; }
+  pop.setAttribute("role", "dialog"); pop.setAttribute("aria-modal", "false"); pop.setAttribute("aria-labelledby", "filter-pop-title");
+  colSel.setAttribute("aria-label", "Campo do filtro"); opSel.setAttribute("aria-label", "Operador do filtro");
+  $("#fp-val").setAttribute("aria-label", "Valor do filtro ou início do intervalo");
+  $("#fp-val2").setAttribute("aria-label", "Fim do intervalo");
 
   colSel.innerHTML = "";
   colSel.appendChild(el("option", "", colLabel("_all"))).value = "_all";

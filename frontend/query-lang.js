@@ -156,7 +156,9 @@ window.QueryLang = (() => {
     if (field.name === "timestamp") return ev.timestamp == null ? null : new Date(ev.timestamp).toISOString();
     if (standard.includes(field.name)) return ev[field.name] ?? "";
     const direct = scalar(ev.fields?.[field.name]);
-    if (direct != null && direct !== "") return direct;
+    // Rust Event::col_ref preserves explicit empty scalar fields. Keep role
+    // fallback behavior unchanged; only ordinary direct fields are authoritative here.
+    if (direct != null && (direct !== "" || !field.role)) return direct;
     const role = field.role;
     if (!role) return null;
     const annotated = scalar(ev.fields?.[role]);

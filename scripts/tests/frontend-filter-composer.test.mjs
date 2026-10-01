@@ -5,7 +5,7 @@ const app = readFileSync(new URL('../../frontend/app.js', import.meta.url), 'utf
 const nodes = new Map(), applied = [], messages = []; let scope = 'dataset', caseId = 'case-a', changed = 0, stopped = 0;
 const document = { activeElement: null, listeners: {}, addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); } };
 const node = id => {
-  if (!nodes.has(id)) nodes.set(id, { id, value: '', hidden: true, options: [], listeners: {}, isConnected: true,
+  if (!nodes.has(id)) nodes.set(id, { id, value: '', hidden: true, options: [], listeners: {}, isConnected: true, attributes: {}, setAttribute(key,value){this.attributes[key]=String(value);},
     set innerHTML(value) { this.options = []; }, get innerHTML() { return ''; },
     focus() { document.activeElement = this; }, matches() { return true; }, closest() { return null; },
     appendChild(option) { this.options.push(option); return option; }, querySelector() { return { textContent:'' }; },
@@ -21,7 +21,7 @@ vm.runInContext(app.slice(app.indexOf('const OPS ='),app.indexOf('const OP_SYMBO
 vm.runInContext(app.slice(app.indexOf('let currentEditFilterIndex ='),app.indexOf('\nfunction positionPop(')),context);
 const bindingStart = app.indexOf('  $("#btn-add-filter").onclick');
 vm.runInContext(app.slice(bindingStart,app.indexOf('  $("#np-ok").onclick',bindingStart)),context);
-const pop=node('#filter-pop'), first=node('#fp-val'), second=node('#fp-val2'), origin=node('#btn-add-filter');
+const pop=node('#filter-pop'), first=node('#fp-val'), second=node('#fp-val2'), origin=node('#btn-add-filter');origin.hidden=false;
 const key = (target, extras={}) => pop.listeners.keydown[0]({ key:'Enter', target, preventDefault(){}, stopPropagation(){stopped++;}, ...extras });
 context.openValueFilter('timestamp', 123, origin); assert.equal(document.activeElement, first);
 key(first,{repeat:true});key(first,{isComposing:true});key(first,{keyCode:229});assert.equal(applied.length,0);
@@ -52,3 +52,16 @@ const other=node('#unrelated-input');document.activeElement=other;
 document.listeners.click[0]({target:{closest:()=>null}});assert.equal(pop.hidden,true);assert.equal(document.activeElement,other,'outside click keeps its own focus');
 assert.ok(stopped>=3);
 console.log('Composer keyboard/IME, focus return, stale-editor protection and context-menu opening passed');
+
+// Non-modal accessible controls and focus recovery from non-focusable/disconnected origins.
+assert.equal(pop.attributes.role,'dialog');assert.equal(pop.attributes['aria-modal'],'false');
+assert.equal(node('#fp-col').attributes['aria-label'],'Campo do filtro');
+assert.equal(node('#fp-op').attributes['aria-label'],'Operador do filtro');
+assert.match(first.attributes['aria-label'],/Valor/);assert.match(second.attributes['aria-label'],/Fim/);
+document.activeElement={isConnected:true,hidden:false,matches:()=>false,focus(){throw Error('Body cannot be the return target');}};
+context.openFilterPop();context.closeFilterPop();assert.equal(document.activeElement,origin);
+origin.hidden=true;const drawerClose=node('#dr-close');drawerClose.hidden=false;
+context.openFilterPop();context.closeFilterPop();assert.equal(document.activeElement,drawerClose,'hidden toolbar falls back to the visible inspector control');
+origin.hidden=false;drawerClose.hidden=true;const transient=node('#temporary-trigger');transient.hidden=false;
+context.openFilterPop(transient);transient.isConnected=false;context.closeFilterPop();assert.equal(document.activeElement,origin);
+console.log('Composer accessible names and visible/focusable return targets passed');

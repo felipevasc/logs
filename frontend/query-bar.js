@@ -8,6 +8,8 @@ window.QueryBar = (() => {
   input.placeholder = "Digite e pressione Enter…";
   input.setAttribute("autocomplete", "off");
   input.setAttribute("role", "combobox");
+  input.setAttribute("aria-label", "Rascunho de busca; Enter adiciona como filtro");
+  input.setAttribute("aria-invalid", "false");
   input.setAttribute("aria-autocomplete", "list");
   input.setAttribute("aria-expanded", "false");
   input.setAttribute("aria-controls", "quick-search-suggestions");
@@ -18,6 +20,7 @@ window.QueryBar = (() => {
   help.innerHTML = '<i class="fas fa-circle-question" aria-hidden="true"></i>';
   box.append(help);
   const error = el("div", "query-error");
+  error.id = "quick-search-error";
   error.hidden = true;
   box.after(error);
   const list = el("div", "query-suggest");
@@ -57,6 +60,9 @@ window.QueryBar = (() => {
 
   function status(problem) {
     box.classList.toggle("invalid", !!problem);
+    input.setAttribute("aria-invalid", String(!!problem));
+    if (problem) input.setAttribute("aria-errormessage", error.id);
+    else input.removeAttribute("aria-errormessage");
     error.textContent = problem || "";
     error.hidden = !problem || document.activeElement !== input;
   }
@@ -134,7 +140,7 @@ window.QueryBar = (() => {
     const query = fold(prefix);
     const found = values.filter(v => fold(String(v.value)).includes(query)).slice(0, 8).map(v => {
       const text = String(v.value);
-      return { text: /[\s():"]/.test(text) ? `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : text, label: text, detail: `${fmtNum(v.count)} ${sampled ? "nesta página" : "no painel de campos"}` };
+      return { text: `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`, label: text, detail: `${fmtNum(v.count)} ${sampled ? "nesta página" : "no painel de campos"}` };
     });
     found.notice = valueCache.get(key)?.oversized ? "Valores longos foram omitidos das sugestões. Abra o evento e use Criar filtro para o valor completo." : "";
     return found;
@@ -241,5 +247,8 @@ window.QueryBar = (() => {
     const t = currentToken();
     return !!t && t.kind === "field" && t.prefix.startsWith("@") && ROLES.some(r => r !== t.prefix && r.startsWith(t.prefix));
   }
+  // Workspace restoration may run before this script. Synchronize the existing
+  // draft without applying it, querying, saving or moving keyboard focus.
+  restoreDraft(captureDraft());
   return { status, typingField, submit, clearDraft, captureDraft, restoreDraft, clearCache };
 })();

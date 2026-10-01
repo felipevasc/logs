@@ -33,8 +33,18 @@ const context = vm.createContext({ console, window: {}, document, state, structu
 context.window.Workspace = { sourceKey: () => source, capture: () => ({}), restore() {} };
 context.window.QueryLang = { resolve: field => ({ name: field }), fieldValue: (event, field) => event[field.name], validate: value => value.endsWith(':') ? 'Incomplete expression' : null };
 context.window.Security = { rules: () => ruleRequest };
+node('#quick-search').value='request_path:';node('#quick-search').setSelectionRange(3,8,'backward');
+node('#btn-add-search').disabled=true;
 vm.runInContext(barSource, context);
+assert.equal(node('#quick-search').value,'request_path:');assert.equal(node('#btn-add-search').disabled,false,'prefilled startup draft enables Add without an input event');
+assert.equal(node('#quick-search').attributes['aria-invalid'],'true','prefilled startup draft is validated');
+assert.equal(node('#quick-search').selectionStart,3);assert.equal(node('#quick-search').selectionEnd,8);
+assert.equal(document.activeElement,null,'startup synchronization does not steal focus');assert.equal(nativeCalls,0);assert.equal(saves,0);
+
 const bar = context.window.QueryBar, input = node('#quick-search'), list = node('.query-suggest');
+assert.match(input.attributes['aria-label'],/Enter/);
+bar.status('Incomplete expression');assert.equal(input.attributes['aria-invalid'],'true');assert.equal(input.attributes['aria-errormessage'],'quick-search-error');
+bar.status(null);assert.equal(input.attributes['aria-invalid'],'false');assert.equal(input.attributes['aria-errormessage'],undefined);
 const tick = async () => { await Promise.resolve(); await Promise.resolve(); };
 const flush = async () => { const pending = [...timers.values()]; timers.clear(); for (const fn of pending) fn(); await tick(); };
 const type = async text => { input.value = text; input.setSelectionRange(text.length, text.length); document.activeElement = input; input.dispatchEvent({ type: 'input' }); await flush(); };

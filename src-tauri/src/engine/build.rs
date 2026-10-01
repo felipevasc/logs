@@ -1251,7 +1251,7 @@ mod checkpoint_tests {
                 last_end: last.offset + u64::from(last.len),
             }],
         };
-        let session = super::super::Session::open(&spec).unwrap();
+        let session = super::super::Session::open(&spec, None).unwrap();
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

@@ -1,9 +1,10 @@
-# Optional exact time precomputation: structural stage
+# Optional exact time precomputation and count/statistics routing
 
 This stage publishes and verifies optional per-segment timestamp summaries in the
-existing background queue. Count, statistics and timeline routing are not enabled
-by this checkpoint. Missing or corrupt summaries continue to use the existing SQL
-route, and optional work never changes the main checkpoint's readiness or key.
+existing background queue. Count and statistics use complete verified reader sets
+for supported level equality and timestamp bounds. Missing or corrupt summaries
+continue to use the existing SQL route, and optional work never changes the main
+checkpoint's readiness or key. Timeline routing is a separate next consumer.
 
 ## Scheduling and ownership
 
@@ -55,8 +56,19 @@ new all-or-none cache ownership tests and queue preemption tests are included in
 source for the next coordinated focused native run. No 50M or cold-scale run is
 part of this structural checkpoint.
 
-Next consumers are capability-gated exact count/stats, then fixed-range timeline
-histograms. The latter should rank requested bucket boundaries in the sorted
+The count/statistics slice checks the optional capability before constructing a
+SQL Scope. Unsupported predicates and absent/changed sets use exact SQL; real
+cancellation and execution failures remain errors. A metadata mismatch evicts only
+the matching stale Arc generations from the cache and sessions, preserving newer
+verified replacements, then permits a current-source demand to queue repair.
+
+The standalone driver also passed matching-generation eviction and replacement
+preservation. Four added in-module routing tests cover two-part SQL parity (then
+drop the SQL table to prove the fast path), unsupported/incomplete fallback, stale
+reader release and cancellation. These tests await the coordinated native run;
+the standalone driver does not validate app routing or statistics.
+
+The next consumer is fixed-range timeline histograms. It should rank requested bucket boundaries in the sorted
 arrays instead of scanning every LineStore row on each zoom. Parity must preserve
 requested bounds, ceil bucket widths, final-bucket inclusion, ties, zero/missing
 and negative timestamps, error/warning classes, and all-part fallback.

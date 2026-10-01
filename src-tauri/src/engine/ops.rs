@@ -765,6 +765,92 @@ mod bounded_analytics_tests {
         assert!(!cacheable_filters(&filters("threat_rule", "whatever")));
         assert!(!cacheable_filters(&filters("detection", "whatever")));
     }
+
+    fn bare_scope(session: &Session) -> Scope<'_> {
+        Scope { session, cond: "TRUE".into(), names: false, _tests: Tests::default(), _selection: None, _free: Vec::new() }
+    }
+
+    fn latency_value(sample: crate::insights::LatencySample) -> Value {
+        let empty = crate::insights::overview(std::iter::empty::<Event>);
+        let result = crate::insights::finish_overview(empty, Vec::new(), HashMap::new(), sample, |_, _, _, _| {});
+        serde_json::to_value(result.latency).unwrap()
+    }
+
+    #[test]
+    fn latency_stream_preserves_selected_field_units_and_exact_reservoir_order() {
+        let mut session = session();
+        session.schema.fields.insert("latency_ms".into(), "latency_ms".into());
+        session.schema.fields.insert("duration_ms".into(), "duration_ms".into());
+        let conn = session.conn().unwrap();
+        super::super::udf::register(&conn).unwrap();
+        conn.execute_batch("SET threads=1; CREATE VIEW ev AS SELECT range::BIGINT AS id, \
+            CASE WHEN range=0 THEN NULL ELSE '9999' END AS latency_ms, \
+            CASE WHEN range=0 THEN '20' WHEN range%97=0 THEN NULL WHEN range%19=0 THEN 'invalid' \
+            WHEN range%7=0 THEN '2s' ELSE (range%200)::VARCHAR END AS duration_ms FROM range(12017)").unwrap();
+        drop(conn);
+        let mut expected = crate::insights::LatencySample::default();
+        for id in 0..12017 {
+            let duration = if id == 0 { Some("20".to_string()) } else if id % 97 == 0 { None }
+                else if id % 19 == 0 { Some("invalid".into()) } else if id % 7 == 0 { Some("2s".into()) }
+                else { Some((id % 200).to_string()) };
+            expected.push(|key| match key { "latency_ms" if id != 0 => Some("9999".into()), "duration_ms" => duration.clone(), _ => None });
+        }
+        let actual = latency_value(latency_of(&bare_scope(&session), "ev").unwrap());
+        assert_eq!(actual, latency_value(expected));
+        assert_eq!(actual["field"], "duration_ms");
+        assert_eq!(actual["sampled"], 10000);
+        assert!(actual["count"].as_u64().unwrap() > 10000);
+    }
+
+    #[test]
+    fn light_sql_stream_preserves_requested_values_and_pivot_results() {
+        let mut session = session();
+        session.schema.fields.insert("extra".into(), "extra".into());
+        session.conn().unwrap().execute_batch("SET threads=1; CREATE VIEW ev AS SELECT range::BIGINT AS id, \
+            CASE WHEN range%3=0 THEN NULL ELSE (range-2)*1000 END::BIGINT AS ts, \
+            CASE WHEN range%2=0 THEN NULL ELSE 'api' END AS source, \
+            'Mensagem '||range::VARCHAR AS message, \
+            CASE WHEN range%3=0 THEN NULL ELSE repeat('ação',128)||range::VARCHAR END AS extra \
+            FROM range(33) ORDER BY range DESC").unwrap();
+        let expected: Vec<Event> = (0..33).map(|id| {
+            let mut event = Event::empty(); event.id = id;
+            event.timestamp = (id % 3 != 0).then_some((id as i64 - 2) * 1000);
+            event.source = if id % 2 == 0 { "" } else { "api" }.into();
+            event.message = format!("Mensagem {id}");
+            if id % 3 != 0 { event.fields.insert("extra".into(), Value::String(format!("{}{id}", "ação".repeat(128)))); }
+            event
+        }).collect();
+        let columns = ["id", "timestamp", "source", "message", "extra"].map(str::to_string);
+        let work = LightStreamWork::default();
+        let actual = light_events_bounded(&bare_scope(&session), &columns, 8, 2048, &work, |events| events.collect::<Vec<_>>()).unwrap();
+        assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(&expected).unwrap());
+        assert_eq!(work.rows.load(Ordering::Relaxed), 33);
+        assert!(work.max_batch_rows.load(Ordering::Relaxed) <= 8);
+        assert!(work.max_batch_bytes.load(Ordering::Relaxed) <= 2048);
+        let spec: crate::analysis::PivotSpec = serde_json::from_value(serde_json::json!({
+            "rows":["source"],"cols":["extra"],"values":[{"column":"message","func":"count","alias":"n"}],"limit_rows":10
+        })).unwrap();
+        let actual = light_events(&bare_scope(&session), &columns, |events| crate::analysis::pivot_stream(events, &spec)).unwrap().unwrap();
+        let expected = crate::analysis::pivot(&expected, &spec).unwrap();
+        assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap());
+    }
+
+    #[test]
+    fn light_sql_and_latency_fetch_failures_do_not_publish_partial_results() {
+        let mut session = session();
+        session.schema.fields.insert("duration_ms".into(), "message".into());
+        let conn = session.conn().unwrap();
+        super::super::udf::register(&conn).unwrap();
+        conn.execute_batch("SET threads=1; CREATE VIEW ev AS SELECT range::BIGINT AS id, range::BIGINT AS ts, \
+            CASE WHEN range>=4096 THEN error('late light value') ELSE range::VARCHAR END AS message FROM range(5000)").unwrap();
+        drop(conn);
+        let scope = bare_scope(&session);
+        let error = light_events(&scope, &["message".into()], |events| events.count()).unwrap_err();
+        assert!(error.contains("late light value"), "{error}");
+        let error = latency_of(&scope, "ev").err().unwrap();
+        assert!(error.contains("late light value"), "{error}");
+        assert_eq!(session.conn().unwrap().query_row("SELECT 42", [], |row| row.get::<_, i64>(0)).unwrap(), 42);
+    }
 }
 
 // ---------------------------------------------------------------- matches
@@ -783,17 +869,24 @@ pub(crate) fn visit_matches(src: &Source, pfs: &[PreparedFilter], visit: impl Fn
     })
 }
 
+fn count_session(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<usize> {
+    if let (Some(predicate), Some(readers)) = (super::time_index::predicate(pfs), session.exact_time_indexes()) {
+        crate::operations::progress("analytics-time-index", "Lendo resumo temporal verificado", 0, 0, 0);
+        if let Some(total) = super::time_index::count(&readers, &predicate)? { return Ok(total); }
+        session.invalidate_exact_times(&readers)?;
+    }
+    let scope = scope(session, src, pfs)?;
+    let counted = rows(
+        session,
+        &format!("SELECT count(*) FROM {} WHERE {}", scope.from(false), scope.cond),
+        |r| r.get::<_, i64>(0),
+    )?;
+    Ok(counted.first().copied().unwrap_or(0) as usize)
+}
+
 pub(crate) fn count(src: &Source, filters: &[crate::query::Filter]) -> Result<Option<usize>> {
     let pfs = prepared(filters);
-    analytics_with(src, base_page_safe(&pfs, ""), |session| {
-        let scope = scope(session, src, &pfs)?;
-        let counted = rows(
-            session,
-            &format!("SELECT count(*) FROM {} WHERE {}", scope.from(false), scope.cond),
-            |r| r.get::<_, i64>(0),
-        )?;
-        Ok(counted.first().copied().unwrap_or(0) as usize)
-    })
+    analytics_with(src, base_page_safe(&pfs, ""), |session| count_session(session, src, &pfs))
 }
 
 // ---------------------------------------------------------------- stats
@@ -847,8 +940,147 @@ fn stats_of(scope: &Scope) -> Result<Stats> {
     Ok(build_stats(buckets, bucket_ms, levels))
 }
 
+fn stats_session(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Stats> {
+    if let (Some(predicate), Some(readers)) = (super::time_index::predicate(pfs), session.exact_time_indexes()) {
+        crate::operations::progress("analytics-time-index", "Lendo resumo temporal verificado", 0, 0, 0);
+        if let Some(stats) = super::time_index::stats(&readers, &predicate)? { return Ok(stats); }
+        session.invalidate_exact_times(&readers)?;
+    }
+    stats_of(&scope(session, src, pfs)?)
+}
+
 pub(crate) fn stats(src: &Source, pfs: &[PreparedFilter]) -> Result<Option<Stats>> {
-    analytics_with(src, base_page_safe(pfs, ""), |session| stats_of(&scope(session, src, pfs)?))
+    analytics_with(src, base_page_safe(pfs, ""), |session| stats_session(session, src, pfs))
+}
+
+#[cfg(test)]
+mod exact_time_routing_tests {
+    use super::*;
+    use super::super::time_index;
+    use parking_lot::{Mutex, RwLock};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn fixture() -> (tempfile::TempDir, Session, Vec<PathBuf>, time_index::ReadSet) {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = duckdb::Connection::open_in_memory().unwrap();
+        connection.execute_batch("SET threads=1; SET memory_limit='32MB'; SET max_temp_directory_size='1MB'; \
+            CREATE TABLE ev(id BIGINT, lvl UTINYINT, ts BIGINT, level VARCHAR, source VARCHAR)").unwrap();
+        let mut handles = Vec::new();
+        let mut paths = Vec::new();
+        let parts = [vec![(0, Some(5)), (1, Some(-100)), (2, None), (3, Some(0))],
+                     vec![(4, Some(5)), (5, Some(101)), (6, Some(-1)), (2, Some(101)), (0, None)]];
+        let mut id = 0i64;
+        for (part, rows) in parts.iter().enumerate() {
+            let store = dir.path().join(format!("part{part}.duckdb"));
+            let producer = duckdb::Connection::open_in_memory().unwrap();
+            producer.execute_batch("SET threads=1; SET memory_limit='32MB'; SET max_temp_directory_size='1MB'; CREATE TABLE ev(lvl UTINYINT, ts BIGINT)").unwrap();
+            for &(level, timestamp) in rows {
+                producer.execute("INSERT INTO ev VALUES (?, ?)", duckdb::params![level, timestamp]).unwrap();
+                let label = if level == 6 { "custom" } else { class_label(level) };
+                connection.execute("INSERT INTO ev VALUES (?, ?, ?, ?, ?)", duckdb::params![id, level, timestamp, label, if part == 0 { "api" } else { "auth" }]).unwrap();
+                id += 1;
+            }
+            std::fs::write(store.with_extension("complete.json"), json!({"key":format!("part{part}"), "rows":rows.len(), "version":5}).to_string()).unwrap();
+            let identity = time_index::identity(&store, rows.len()).unwrap();
+            time_index::ensure(&producer, &store, &identity, &|| false).unwrap();
+            handles.push(time_index::open(&store, &identity).unwrap().unwrap());
+            paths.push(store);
+        }
+        let session = Session {
+            key: "time-routing-test".into(), base: Mutex::new(connection), pool: Mutex::new(Vec::new()),
+            schema: super::super::sql::Schema::default(), timestamps_non_null: false, baked: true,
+            names: RwLock::new(None), names_version: AtomicU64::new(0), selections: Mutex::new(Vec::new()),
+            selection_builds: Mutex::new(std::collections::HashSet::new()), selection_changed: parking_lot::Condvar::new(),
+            garbage: Arc::new(Mutex::new(Vec::new())), texts: Vec::new(), time_indexes: RwLock::new(None), _leases: Vec::new(),
+        };
+        (dir, session, paths, handles.into())
+    }
+    fn index() -> FileIndex {
+        FileIndex { parts: Vec::new(), lines: Arc::new(crate::metadata_store::LineStore::default()), columns: Vec::new(), time_order: std::sync::OnceLock::new() }
+    }
+    fn filters(value: Value) -> Vec<PreparedFilter> {
+        prepared(&serde_json::from_value::<Vec<crate::query::Filter>>(value).unwrap())
+    }
+
+    #[test]
+    fn count_and_stats_use_complete_time_capability_with_exact_sql_parity() {
+        let (_dir, session, _paths, readers) = fixture();
+        let index = index();
+        let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let cases = [json!([]),
+            json!([{"column":"level","op":"equals_exact","value":"Informação"}]),
+            json!([{"column":"level","op":"equals_exact","value":"Erro"}]),
+            json!([{"column":"timestamp","op":"gt","value":"0"}]),
+            json!([{"column":"timestamp","op":"lte","value":"0"}]),
+            json!([{"column":"timestamp","op":"between","value":"-100","value2":"101"}]),
+            json!([{"column":"timestamp","op":"gte","value":"0.5"},{"column":"timestamp","op":"lt","value":"101"}]),
+            json!([{"column":"level","op":"equals_exact","value":"Erro"},{"column":"level","op":"equals_exact","value":"Aviso"}]),
+            json!([{"column":"timestamp","op":"gt","value":"invalid"}])];
+        let expectations: Vec<_> = cases.iter().map(|case| {
+            let pfs = filters(case.clone());
+            (count_session(&session, &source, &pfs).unwrap(), serde_json::to_value(stats_session(&session, &source, &pfs).unwrap()).unwrap())
+        }).collect();
+        *session.time_indexes.write() = Some(readers);
+        // The only SQL table is gone: supported queries must use the verified
+        // capability, not coincidentally pass by silently taking SQL fallback.
+        session.conn().unwrap().execute_batch("DROP TABLE ev").unwrap();
+        for (case, (count, stats)) in cases.iter().zip(expectations) {
+            let pfs = filters(case.clone());
+            assert_eq!(count_session(&session, &source, &pfs).unwrap(), count, "{case}");
+            assert_eq!(serde_json::to_value(stats_session(&session, &source, &pfs).unwrap()).unwrap(), stats, "{case}");
+        }
+    }
+
+    #[test]
+    fn missing_or_unsupported_time_capability_keeps_exact_sql_fallback() {
+        let (_dir, session, _paths, readers) = fixture();
+        let index = index(); let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let pfs = filters(json!([{"column":"source","op":"equals_exact","value":"api"}]));
+        let expected = serde_json::to_value(stats_session(&session, &source, &pfs).unwrap()).unwrap();
+        *session.time_indexes.write() = Some(Arc::clone(&readers));
+        assert_eq!(count_session(&session, &source, &pfs).unwrap(), 4);
+        assert_eq!(serde_json::to_value(stats_session(&session, &source, &pfs).unwrap()).unwrap(), expected);
+        let mut cache = time_index::VerifiedCache::default();
+        cache.insert("part0".into(), Arc::clone(&readers[0]));
+        *session.time_indexes.write() = cache.complete(["part0", "part1"]);
+        assert!(session.exact_time_indexes().is_none());
+        assert_eq!(count_session(&session, &source, &[]).unwrap(), 9);
+    }
+
+    #[test]
+    fn changed_time_capability_falls_back_and_releases_only_its_stale_readers() {
+        use fs2::FileExt;
+        let (_dir, session, paths, readers) = fixture();
+        let index = index(); let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let expected = serde_json::to_value(stats_session(&session, &source, &[]).unwrap()).unwrap();
+        *session.time_indexes.write() = Some(readers);
+        std::fs::OpenOptions::new().write(true).open(time_index::path(&paths[0])).unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3)).unwrap();
+        assert_eq!(count_session(&session, &source, &[]).unwrap(), 9);
+        assert!(session.exact_time_indexes().is_none());
+        assert_eq!(serde_json::to_value(stats_session(&session, &source, &[]).unwrap()).unwrap(), expected);
+        let lock = std::fs::OpenOptions::new().read(true).write(true).open(paths[0].with_extension("time.lock")).unwrap();
+        FileExt::try_lock_exclusive(&lock).unwrap();
+    }
+
+    #[test]
+    fn time_capability_cancellation_propagates_without_sql_fallback() {
+        let (_dir, session, _paths, readers) = fixture();
+        let index = index(); let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        *session.time_indexes.write() = Some(readers);
+        let token = crate::operations::token(Some("time-routing-cancel".into())).unwrap();
+        crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("time-routing-cancel");
+            assert!(count_session(&session, &source, &[]).unwrap_err().contains("cancelad"));
+            assert!(stats_session(&session, &source, &[]).err().unwrap().contains("cancelad"));
+        });
+        assert!(session.exact_time_indexes().is_some());
+    }
 }
 
 // ---------------------------------------------------------------- groups
@@ -2042,21 +2274,16 @@ fn latency_of(scope: &Scope, from: &str) -> Result<crate::insights::LatencySampl
         .map(|(_, e)| format!("li_nkey({e}) IS NOT NULL"))
         .collect::<Vec<_>>()
         .join(" OR ");
-    let conn = scope.session.conn()?;
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {columns} FROM {from} WHERE ({}) AND ({any}) ORDER BY id",
-            scope.cond
-        ))
-        .map_err(err)?;
-    let mut rows = stmt.query([]).map_err(err)?;
+    let sql = format!("SELECT {columns} FROM {from} WHERE ({}) AND ({any}) ORDER BY id", scope.cond);
     let mut values: Vec<Option<String>> = vec![None; present.len()];
-    while let Some(row) = rows.next().map_err(err)? {
+    stream_rows(scope.session, &sql, |row| {
+        crate::operations::check()?;
         for (i, slot) in values.iter_mut().enumerate() {
-            *slot = row.get(i).map_err(err)?;
+            *slot = row.get(i)?;
         }
         sample.push(|k| present.iter().position(|(f, _)| *f == k).and_then(|i| values[i].clone()));
-    }
+        Ok(())
+    })?;
     Ok(sample)
 }
 
@@ -2164,6 +2391,24 @@ fn light_events<T>(
     columns: &[String],
     consume: impl FnOnce(&mut dyn Iterator<Item = Event>) -> T,
 ) -> Result<T> {
+    light_events_bounded(
+        scope,
+        columns,
+        8192,
+        crate::resources::batch_bytes(),
+        &LightStreamWork::default(),
+        consume,
+    )
+}
+
+fn light_events_bounded<T>(
+    scope: &Scope,
+    columns: &[String],
+    batch_rows: usize,
+    batch_bytes: usize,
+    work: &LightStreamWork,
+    consume: impl FnOnce(&mut dyn Iterator<Item = Event>) -> T,
+) -> Result<T> {
     let mut names = false;
     let mut select = vec!["id".to_string(), "ts".to_string()];
     let mut slots = Vec::new();
@@ -2200,24 +2445,30 @@ fn light_events<T>(
         scope.from(names),
         scope.cond
     );
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<Event>(8192);
-    std::thread::scope(|threads| {
-        let producer = threads.spawn(move || -> Result<()> {
-            let conn = scope.session.conn()?;
-            let mut stmt = conn.prepare(&sql).map_err(err)?;
-            let mut rows = stmt.query([]).map_err(err)?;
-            while let Some(row) = rows.next().map_err(err)? {
+    transfer_events(
+        batch_rows,
+        batch_bytes,
+        work,
+        |send| {
+            stream_rows(scope.session, &sql, |row| {
+                crate::operations::check()?;
                 let mut ev = Event::empty();
-                ev.id = row.get::<_, i64>(0).map_err(err)? as usize;
-                ev.timestamp = row.get(1).map_err(err)?;
+                ev.id = row.get::<i64>(0)? as usize;
+                ev.timestamp = row.get(1)?;
                 let mut column = 2;
                 for slot in &slots {
                     if matches!(slot, Slot::Timestamp | Slot::Id) {
                         continue;
                     }
-                    let value: Option<String> = row.get(column).map_err(err)?;
+                    let value: Option<String> = row.get(column)?;
                     column += 1;
-                    let text = value.clone().unwrap_or_default();
+                    if let Slot::Field(name) = slot {
+                        if let Some(value) = value {
+                            ev.fields.insert(name.clone(), Value::String(value));
+                        }
+                        continue;
+                    }
+                    let text = value.unwrap_or_default();
                     match slot {
                         Slot::Source => ev.source = text,
                         Slot::Level => ev.level = text,
@@ -2226,25 +2477,314 @@ fn light_events<T>(
                         Slot::Name => ev.name = text,
                         Slot::Description => ev.description = text,
                         Slot::EventRef => ev.event_ref = text,
-                        Slot::Field(name) => {
-                            if let Some(value) = value {
-                                ev.fields.insert(name.clone(), Value::String(value));
-                            }
-                        }
-                        Slot::Timestamp | Slot::Id => {}
+                        Slot::Timestamp | Slot::Id | Slot::Field(_) => {}
                     }
                 }
-                if sender.send(ev).is_err() {
-                    break;
+                let size = crate::query::event_payload_bytes(&ev);
+                send(ev, size)
+            })
+        },
+        consume,
+    )
+}
+
+/// Byte-bounded transfer used by the light-event SQL reader. This helper is
+/// independent of DuckDB so its lifetime/backpressure rules can be tested
+/// without an application-wide build.
+#[derive(Default)]
+struct LightStreamWork {
+    rows: std::sync::atomic::AtomicUsize,
+    max_batch_rows: std::sync::atomic::AtomicUsize,
+    max_batch_bytes: std::sync::atomic::AtomicUsize,
+}
+impl LightStreamWork {
+    fn batch(&self, rows: usize, bytes: usize) {
+        self.rows.fetch_add(rows, Ordering::Relaxed);
+        self.max_batch_rows.fetch_max(rows, Ordering::Relaxed);
+        self.max_batch_bytes.fetch_max(bytes, Ordering::Relaxed);
+    }
+}
+
+/// One queued batch, one consumer batch and one producer batch. The event
+/// which triggers a byte-boundary flush may also be live. As with the source
+/// visitor, one oversized event travels alone; values are never truncated.
+fn transfer_events<E: Send, T>(
+    batch_rows: usize,
+    batch_bytes: usize,
+    work: &LightStreamWork,
+    produce: impl FnOnce(&mut dyn FnMut(E, usize) -> Result<()>) -> Result<()> + Send,
+    consume: impl FnOnce(&mut dyn Iterator<Item = E>) -> T,
+) -> Result<T> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<E>>(1);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    // Direct library callers may have no outer operation. Give the child a
+    // generation too, so the SQL interrupt watcher observes its private stop.
+    let token = if crate::operations::current_generation().is_none()
+        && crate::operations::current_id().is_none()
+    {
+        crate::operations::run(
+            crate::operations::generation(),
+            crate::operations::current_token,
+        )?
+    } else {
+        crate::operations::current_token()
+    }
+    .with_stop(Arc::clone(&stop));
+    struct StopProducer(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopProducer {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    std::thread::scope(|threads| {
+        let producer = std::thread::Builder::new()
+            .name("loginsight-pivot-stream".into())
+            .spawn_scoped(threads, move || -> Result<()> {
+                let result = crate::operations::run_with_token(token, || {
+                    let mut batch = Vec::new();
+                    let mut bytes = 0usize;
+                    produce(&mut |event, size| {
+                        crate::operations::check()?;
+                        if !batch.is_empty()
+                            && (batch.len() >= batch_rows.max(1)
+                                || bytes.saturating_add(size) > batch_bytes)
+                        {
+                            work.batch(batch.len(), bytes);
+                            if sender.send(std::mem::take(&mut batch)).is_err() {
+                                worker_stop.store(true, Ordering::Relaxed);
+                                return Err("Operação cancelada.".into());
+                            }
+                            bytes = 0;
+                        }
+                        bytes = bytes.saturating_add(size);
+                        batch.push(event);
+                        Ok(())
+                    })?;
+                    if !batch.is_empty() {
+                        work.batch(batch.len(), bytes);
+                        let _ = sender.send(batch);
+                    }
+                    Ok(())
+                })
+                .and_then(|result| result);
+                // Decide while the sender is still owned here. A real fetch error
+                // precedes channel EOF and is retained; an intentional early drop
+                // interrupts only this child and does not fail the parent query.
+                if worker_stop.load(Ordering::Relaxed) {
+                    Ok(())
+                } else {
+                    result
                 }
-            }
-            Ok(())
-        });
-        let result = consume(&mut receiver.iter());
-        drop(receiver);
+            })
+            .map_err(|error| error.to_string())?;
+        let mut events = receiver.into_iter().flatten();
+        let stop_guard = StopProducer(stop);
+        let result = consume(&mut events);
+        drop(stop_guard);
+        drop(events);
         producer
             .join()
             .map_err(|_| "Falha ao ler o motor de consultas.".to_string())??;
+        crate::operations::check()?;
         Ok(result)
     })
+}
+
+#[cfg(test)]
+mod light_transfer_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn light_transfer_preserves_order_with_row_and_byte_bounds() {
+        let work = LightStreamWork::default();
+        let found = transfer_events(
+            7,
+            512,
+            &work,
+            |send| {
+                for id in 0..137 {
+                    let value = vec![id as u8; 128 + id % 5];
+                    let bytes = value.len();
+                    send((id, value), bytes)?;
+                }
+                Ok(())
+            },
+            |events| {
+                events
+                    .map(|(id, value)| {
+                        assert_eq!(value, vec![id as u8; 128 + id % 5]);
+                        id
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .unwrap();
+        assert_eq!(found, (0..137).collect::<Vec<_>>());
+        assert_eq!(work.rows.load(Ordering::Relaxed), 137);
+        assert!(work.max_batch_rows.load(Ordering::Relaxed) <= 7);
+        assert!(work.max_batch_bytes.load(Ordering::Relaxed) <= 512);
+    }
+
+    #[test]
+    fn light_transfer_keeps_one_oversized_value_intact_in_its_own_batch() {
+        let work = LightStreamWork::default();
+        let found = transfer_events(
+            8,
+            128,
+            &work,
+            |send| {
+                for size in [10, 2048, 10] {
+                    send(vec![42u8; size], size)?;
+                }
+                Ok(())
+            },
+            |events| {
+                events
+                    .map(|value| {
+                        assert!(value.iter().all(|byte| *byte == 42));
+                        value.len()
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .unwrap();
+        assert_eq!(found, vec![10, 2048, 10]);
+        assert_eq!(work.max_batch_rows.load(Ordering::Relaxed), 1);
+        assert_eq!(work.max_batch_bytes.load(Ordering::Relaxed), 2048);
+    }
+
+    #[test]
+    fn light_transfer_early_drop_bounds_production_without_cancelling_parent() {
+        let work = LightStreamWork::default();
+        let produced = AtomicUsize::new(0);
+        let token = crate::operations::token(None).unwrap();
+        let parent = token.clone();
+        let found = crate::operations::run_with_token(token, || {
+            transfer_events(
+                4,
+                128,
+                &work,
+                |send| {
+                    for id in 0..10_000 {
+                        produced.fetch_add(1, Ordering::Relaxed);
+                        send(id, 8)?;
+                    }
+                    Ok(())
+                },
+                |events| events.take(1).collect::<Vec<_>>(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(found, vec![0]);
+        assert!(
+            produced.load(Ordering::Relaxed) <= 13,
+            "at most three batches and the boundary event"
+        );
+        assert!(work.rows.load(Ordering::Relaxed) <= 12);
+        assert!(!parent.cancelled());
+    }
+
+    #[test]
+    fn light_transfer_propagates_producer_failure_instead_of_partial_success() {
+        let work = LightStreamWork::default();
+        let seen = AtomicUsize::new(0);
+        let error = transfer_events(
+            2,
+            128,
+            &work,
+            |send| {
+                for id in 0..20 {
+                    send(id, 8)?;
+                }
+                Err("late reader failure".into())
+            },
+            |events| {
+                events.for_each(|_| {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("late reader failure"));
+        assert!(seen.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            transfer_events(
+                1,
+                128,
+                &work,
+                |send| send(42, 8),
+                |events| events.collect::<Vec<_>>()
+            )
+            .unwrap(),
+            vec![42]
+        );
+    }
+
+    #[test]
+    fn light_transfer_inherits_named_cancellation_and_progress_identity() {
+        let id = format!("light-transfer-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let unrelated = crate::operations::token(None).unwrap();
+        let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Arc::clone(&progress);
+        let reporter: crate::operations::Reporter =
+            Arc::new(move |event| capture.lock().unwrap().push(event));
+        let work = LightStreamWork::default();
+        let result = crate::operations::run_with_token(token, || {
+            crate::operations::with_reporter(reporter, || {
+                transfer_events(
+                    2,
+                    128,
+                    &work,
+                    |send| {
+                        crate::operations::progress("pivot-values", "Lendo valores", 0, 0, 0);
+                        for id in 0..1000 {
+                            send(id, 8)?;
+                        }
+                        Ok(())
+                    },
+                    |events| {
+                        assert_eq!(events.next(), Some(0));
+                        assert!(crate::operations::cancel_id(&id));
+                    },
+                )
+            })
+        });
+        assert!(result.is_err());
+        assert!(!unrelated.cancelled());
+        let progress = progress.lock().unwrap();
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].operation_id.as_deref(), Some(id.as_str()));
+        assert_eq!(progress[0].phase_id, "pivot-values");
+    }
+
+    #[test]
+    fn light_transfer_consumer_unwind_stops_the_child_without_hanging() {
+        let token = crate::operations::token(None).unwrap();
+        let parent = token.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::operations::run_with_token(token, || {
+                transfer_events::<usize, ()>(
+                    2,
+                    128,
+                    &LightStreamWork::default(),
+                    |send| {
+                        for id in 0..10_000 {
+                            send(id, 8)?;
+                        }
+                        Ok(())
+                    },
+                    |events| {
+                        assert_eq!(events.next(), Some(0));
+                        panic!("controlled consumer panic");
+                    },
+                )
+            })
+        }));
+        assert!(result.is_err());
+        assert!(!parent.cancelled());
+    }
 }
