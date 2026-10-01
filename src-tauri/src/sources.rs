@@ -1052,6 +1052,40 @@ fn extract_java_body(ev: &mut Event, body: &str) {
     }
 }
 
+/// Interpret only the already-framed Java block. Existing evidence fields and
+/// byte framing are unchanged. This infallible source parser uses the strictly
+/// bounded pure parser; outer indexing/query operation checks own cancellation.
+fn enrich_java_trace(ev: &mut Event, block: &str, body_start: usize) {
+    let Ok(trace) = crate::java_stacktrace::parse(block, body_start, Default::default()) else {
+        return;
+    };
+    ev.fields.extend(trace.scalar_fields());
+}
+
+/// Rich details are request-local metadata, not an indexed Event field. Missing
+/// historical raw or an unrecognized Java log header is explicitly unavailable.
+/// Header inspection is capped at64KiB; the pure trace parser inspects at most
+/// its256KiB suffix budget. Callers retain their outer operation checks.
+pub(crate) fn java_trace_for_event(event: &Event) -> Result<Option<crate::java_stacktrace::Trace>, String> {
+    if event.raw.is_empty() { return Ok(None); }
+    let mut end = event.raw.len().min(64 << 10);
+    while !event.raw.is_char_boundary(end) { end -= 1; }
+    let inspected = &event.raw[..end];
+    let head = inspected.split('\n').next().unwrap_or("").trim_end_matches('\r');
+    let body_start = [re_log4j(), re_jboss(), re_wildfly()].into_iter()
+        .find_map(|re| re.captures(head).and_then(|captures| captures.get(5).map(|body| body.start())));
+    let Some(body_start) = body_start else {
+        if end < event.raw.len() && !inspected.contains('\n') {
+            return Err("O cabeçalho excede o limite de inspeção da estrutura Java.".into());
+        }
+        return Ok(None);
+    };
+    let trace = crate::java_stacktrace::parse(&event.raw, body_start, Default::default())
+        .map_err(|error| error.to_string())?;
+    let limited = trace.diagnostics.iter().any(|d| d.code == crate::java_stacktrace::Code::InputLimit);
+    Ok((trace.observed() || limited).then_some(trace))
+}
+
 /// WildFly/JBoss: `00:00:00,001 WARN  [br.app.Classe] (EJB default - 4) mensagem`
 /// Só tem hora — a data costuma estar no nome do arquivo (server.log.2026-06-24),
 /// resolvida pela configuração de data/hora (TsConfig).
@@ -1072,6 +1106,7 @@ fn parse_wildfly(block: &str) -> Option<Event> {
         .insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
+    enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
 }
 
@@ -1091,6 +1126,7 @@ fn parse_jboss(block: &str) -> Option<Event> {
         .insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
+    enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
 }
 
@@ -1110,6 +1146,7 @@ fn parse_log4j(block: &str) -> Option<Event> {
     ev.source = c[4].to_string();
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
+    enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
 }
 
@@ -2185,7 +2222,8 @@ pub(crate) fn file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
 pub(crate) fn file_identity(_file: &std::fs::File) -> Option<(u64, u64)> { None }
 
 pub(crate) fn validate_source(part: &FilePart) -> Result<(), String> {
-    let file = std::fs::File::open(&part.physical_path).map_err(|e| format!("Fonte indisponível: {e}"))?;
+    crate::operations::check()?;
+    let file = crate::case_archive_format::open_regular(std::path::Path::new(&part.physical_path)).map_err(|e| format!("Fonte indisponível: {e}"))?;
     let metadata = file.metadata().map_err(|e| format!("Fonte indisponível: {e}"))?;
     part.calendar.validate_timezone()?;
     crate::workspace::validate_canonical_origin(std::path::Path::new(&part.physical_path))?;
@@ -3030,7 +3068,7 @@ impl PreparedIndex {
     pub(crate) fn multiline(&self) -> bool { self.descriptor.start_pattern.is_some() }
     pub(crate) fn validate(&self) -> Result<(), String> {
         crate::operations::check()?;
-        let file = std::fs::File::open(&self.part.physical_path).map_err(|e| e.to_string())?;
+        let file = crate::case_archive_format::open_regular(std::path::Path::new(&self.part.physical_path))?;
         if SourceStamp::read(&file, &self.part.physical_path)? != self.stamp {
             return Err("A fonte foi alterada durante a indexação. Reabra o arquivo para usar uma versão consistente.".into());
         }
@@ -3042,7 +3080,7 @@ pub(crate) fn prepare_index(path: &str, format: &str, custom: Option<CustomParse
     crate::operations::check()?;
     let canonical_lease = crate::workspace::canonical_source_lease(std::path::Path::new(path))?;
     let event_identity = crate::workspace::canonical_event_identity(std::path::Path::new(path))?;
-    let file = std::fs::File::open(path).map_err(|e| format!("Não foi possível abrir '{path}': {e}"))?;
+    let file = crate::case_archive_format::open_regular(std::path::Path::new(path)).map_err(|e| format!("Não foi possível abrir '{path}': {e}"))?;
     let stamp = SourceStamp::read(&file, path)?;
     if stamp.bytes == 0 { return Err("Arquivo vazio.".into()); }
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| format!("Falha ao mapear '{path}': {e}"))?;
@@ -3121,7 +3159,7 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
         resume.lines.flush()?;
         sink(&mut resume.lines, bytes.len(), true, None)?;
     }
-    let columns = match resume.columns {
+    let mut columns = match resume.columns {
         Some(columns) => columns,
         None => {
             let mut columns: Vec<String> = STANDARD_COLUMNS.iter().map(|s| s.to_string()).collect();
@@ -3151,6 +3189,10 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
             columns
         }
     };
+    // Supported parser fields remain discoverable even when an unchanged
+    // metadata journal predates Java structural enrichment. This does not
+    // rewrite its record offsets, saved catalog, or durable framing identity.
+    crate::java_stacktrace::extend_columns(&prepared.part.format, &mut columns);
     prepared.validate()?;
     crate::operations::check()?;
     let mut part = prepared.part.clone();
@@ -3726,6 +3768,98 @@ mod tests {
             "csv"
         );
         assert_eq!(super::detect_format(b"#Software: IIS\n#Fields: date time s-ip cs-method\n2024-01-31 08:00:01 10.0.0.1 GET\n"), "w3c");
+    }
+}
+
+#[cfg(test)]
+mod java_enrichment_tests {
+    use super::*;
+
+    const BODY: &str = "a.TopException: café\n\tat a.Top.run(Top.java:1)\n\tSuppressed: a.CloseException\n\t\tat a.Close.close(Native Method)\nCaused by: a.BottomException: actual cause\n\tat a.Bottom.run(Unknown Source)\n\t... 1 more\n";
+
+    #[test]
+    fn existing_java_parsers_preserve_legacy_evidence_and_add_real_typed_fields() {
+        for (head, parse) in [
+            ("00:00:00,001 ERROR [a.Logger] (worker) failed", parse_wildfly as fn(&str) -> Option<Event>),
+            ("2024-01-31 08:00:01,123 ERROR [a.Logger] (worker) failed", parse_jboss),
+            ("2024-01-31 08:00:01,123 ERROR [worker] a.Logger - failed", parse_log4j),
+        ] {
+            let raw = format!("{head}\n{BODY}");
+            let event = parse(&raw).unwrap();
+            let mut legacy = Event::empty();
+            extract_java_body(&mut legacy, BODY);
+            assert_eq!(event.raw, raw);
+            assert_eq!(event.message, "failed");
+            assert_eq!(event.source, "a.Logger");
+            assert_eq!(event.level, "Erro");
+            assert_eq!(event.fields["exception"], legacy.fields["exception"]);
+            assert_eq!(event.fields["stacktrace"], legacy.fields["stacktrace"]);
+            assert_eq!(event.fields["java.exception.class"], "a.TopException");
+            assert_eq!(event.fields["java.exception.message"], "café");
+            assert_eq!(event.fields["java.root_cause.class"], "a.BottomException");
+            assert_eq!(event.fields["java.trace.complete"], true);
+            assert!(!event.fields.contains_key("java.trace"), "ordinary Events keep only scalar summaries");
+            let detail = java_trace_for_event(&event).unwrap().unwrap();
+            assert!(detail.complete);
+            assert_eq!(detail.nodes[0].header.start, head.len() + 1);
+            assert_eq!(detail.root_cause_class(), Some("a.BottomException"));
+            let incomplete = parse(&format!("{head}\na.TopException\n\tat malformed frame\n")).unwrap();
+            assert_eq!(incomplete.fields["java.trace.complete"], false);
+            assert!(!incomplete.fields.contains_key("java.root_cause.class"));
+            assert!(!incomplete.fields.contains_key("java.trace.fingerprint"));
+            let ordinary = parse(head).unwrap();
+            assert!(!ordinary.fields.contains_key("java.trace.complete"));
+            assert!(java_trace_for_event(&ordinary).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn header_exception_spans_use_raw_coordinates_and_old_snapshots_remain_unavailable() {
+        let raw = "2024-01-31 08:00:01,123 ERROR [worker] a.Logger - a.TopException: 日\n\tat a.Top.run(Top.java:1)\n";
+        let event = parse_log4j(raw).unwrap();
+        assert_eq!(event.message, "a.TopException: 日");
+        assert_eq!(event.fields["java.exception.class"], "a.TopException");
+        assert_eq!(java_trace_for_event(&event).unwrap().unwrap().nodes[0].header.start, raw.find("a.TopException").unwrap());
+        for preserved_raw in ["", raw] {
+            let mut legacy = Event::empty();
+            legacy.raw = preserved_raw.into();
+            legacy.fields.insert("exception".into(), Value::String("a.TopException".into()));
+            legacy.fields.insert("stacktrace".into(), serde_json::json!(["at a.Top.run(Top.java:1)"]));
+            let bytes = serde_json::to_vec(&legacy).unwrap();
+            let restored = parse_line_at(&bytes, "snapshot", None, &[], 2026);
+            assert_eq!(restored.raw, preserved_raw);
+            assert_eq!(restored.fields["stacktrace"], legacy.fields["stacktrace"]);
+            assert!(!restored.fields.contains_key("java.trace"), "historical evidence is not silently reconstructed");
+            assert!(!restored.fields.contains_key("java.exception.class"));
+            let detail = java_trace_for_event(&restored).unwrap();
+            assert_eq!(detail.is_some(), !preserved_raw.is_empty());
+            if let Some(detail) = detail { assert_eq!(detail.exception_class(), Some("a.TopException")); }
+        }
+        let json = serde_json::json!({"message": raw});
+        let event = parse_line_at(&serde_json::to_vec(&json).unwrap(), "jsonl", None, &[], 2026);
+        assert!(!event.fields.contains_key("java.trace"));
+        assert!(java_trace_for_event(&event).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_trace_details_preserve_limits_and_leave_the_event_unchanged() {
+        let prefix = "2024-01-31 08:00:01,123 ERROR [worker] a.Logger - ";
+        let mut event = Event::empty();
+        event.raw = format!("{prefix}a.FailureException: {}", "x".repeat(8192));
+        let before = serde_json::to_value(&event).unwrap();
+        let trace = java_trace_for_event(&event).unwrap().unwrap();
+        assert!(!trace.complete);
+        assert!(trace.nodes.is_empty());
+        assert!(trace.diagnostics.iter().any(|d| d.code == crate::java_stacktrace::Code::StringLimit));
+        assert_eq!(before, serde_json::to_value(&event).unwrap());
+        event.raw = format!("{prefix}{}", "x".repeat(300 << 10));
+        let trace = java_trace_for_event(&event).unwrap().unwrap();
+        assert!(!trace.complete);
+        assert!(trace.diagnostics.iter().any(|d| d.code == crate::java_stacktrace::Code::InputLimit));
+        event.raw = "x".repeat(70 << 10);
+        assert!(java_trace_for_event(&event).unwrap_err().contains("limite"));
+        event.raw.clear();
+        assert!(java_trace_for_event(&event).unwrap().is_none());
     }
 }
 

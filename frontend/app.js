@@ -631,7 +631,7 @@ async function api(cmd, args = {}, opts = {}) {
     let casePublication = null;
     const preparedArgs = async (retry = false) => {
       const capturedArgs = retry && !Array.isArray(args.caseEvents) && Array.isArray(opts.caseEvents) ? { ...args, caseEvents: opts.caseEvents } : args;
-      const requiresCaseToken = cmd === "analysis_field_text" || cmd === "event_detail";
+      const requiresCaseToken = cmd === "analysis_field_text" || cmd === "event_detail" || cmd === "java_trace_detail";
       const prepared = await caseArgs(capturedArgs, retry, casePublication, { canonical: requiresCaseToken });
       if (prepared.caseKey) casePublication = caseTransport.synced.get(caseSyncKey(prepared.caseKey, prepared)) ?? null;
       if (opts.cancelled?.()) throw new Error("Operação cancelada.");
@@ -5253,9 +5253,26 @@ function currentIndex() {
 }
 
 let detailRequest = 0;
+let detailDeferredPane = null;
 function detailAdmissionCurrent(admission) {
   return !!admission && admission.scope === workspaceScope() && (!admission.owner || window.AnalysisContexts.isCurrent(admission.owner))
     && (admission.signature === null || admission.signature === caseSig());
+}
+async function loadJavaTraceDetail(event, admission, evidence, current) {
+  if (!admission || !current() || typeof event.event_ref !== "string" || !event.event_ref) throw Error("O contexto mudou. Abra o registro novamente.");
+  const owner = admission.owner;
+  let args = { id: event.id, eventRef: event.event_ref, analysisContext: owner?.identity ?? null, sourceGeneration: owner?.sourceGeneration ?? null };
+  if (admission.scope === "case") args = await caseArgs({ ...args, caseEvents: evidence }, false, null, { canonical: true });
+  if (!current()) throw Error("O contexto mudou. Abra o registro novamente.");
+  const response = await api("java_trace_detail", args, { silent: true, latest: "java-trace-detail", analysisOwner: owner, caseEvents: evidence,
+    onCasePrepared: () => { if (!current()) throw Error("O contexto mudou. Abra o registro novamente."); } });
+  if (!current()) throw Error("O contexto mudou. Abra o registro novamente.");
+  if (!response || !["available", "unavailable"].includes(response.state)) throw Error("Resposta de estrutura inválida.");
+  if (response.state === "unavailable" && response.reason === "record_unavailable" && response.row === null && response.trace === null) return response;
+  if (response.row?.id !== event.id || response.row?.eventRef !== event.event_ref) throw Error("A estrutura retornada não corresponde ao registro solicitado.");
+  if (response.state === "available" && response.reason === null && response.trace && typeof response.trace === "object") return response;
+  if (response.state === "unavailable" && ["raw_unavailable", "not_java"].includes(response.reason) && response.trace === null) return response;
+  throw Error("Resposta de estrutura inválida.");
 }
 async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
   if (!guard()) { toast("O contexto mudou. Abra o registro novamente.", "info"); return false; }
@@ -5264,6 +5281,7 @@ async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
   const evidence = scope === "case" ? caseEvents() : null, signature = scope === "case" ? caseSig() : null;
   const admission = { scope, owner, signature };
   window.Tasks?.cancelLatest("event-detail");
+  window.Tasks?.cancelLatest("java-trace-detail");
   showDetailLoading();
   const current = () => request === detailRequest && !$("#drawer").hidden && detailAdmissionCurrent(admission) && guard();
   const check = () => {
@@ -5537,7 +5555,7 @@ function showDetailValueMenu(event, node, selected = "", inModal = false) {
   showCtxMenu(event.clientX, event.clientY, items);
 }
 
-function renderDetailTree(entries) {
+function renderDetailTree(entries, collapsedPaths = new Set()) {
   const tree = el("div", "detail-tree");
   tree.setAttribute("role", "tree");
   tree.setAttribute("aria-label", "Campos do evento");
@@ -5550,7 +5568,7 @@ function renderDetailTree(entries) {
     row.dataset.col = node.original ? node.path : "";
     const head = el("div", "detail-tree-head");
     const hasChildren = node.children.length > 0;
-    const expanded = depth < 2;
+    const expanded = depth < 2 && !collapsedPaths.has(node.path);
     let children;
     if (hasChildren) {
       const toggle = el("button", "detail-tree-toggle");
@@ -5616,6 +5634,7 @@ function renderDetailTree(entries) {
 
 function showDetail(ev, sourceSpec = null, admission = null) {
   closeDetailValue();
+  window.Tasks?.cancelLatest("java-trace-detail");
   detailRequest++;
   state.detailId = ev.id;
   state.currentDetailEv = ev;
@@ -5641,6 +5660,28 @@ function showDetail(ev, sourceSpec = null, admission = null) {
   if (ev.code) badges.appendChild(el("span", "badge code", `#${ev.code}`));
   if (ev.name) badges.appendChild(el("span", "badge code", ev.name));
 
+  const javaRequest = detailRequest;
+  const javaCurrent = () => javaRequest === detailRequest && state.currentDetailEv === ev && !$("#drawer").hidden
+    && (!admission || detailAdmissionCurrent(admission));
+  const javaEvidence = admission?.scope === "case" ? caseEvents() : null;
+  const javaTrace = window.JavaTrace?.render(ev, {
+    admission,
+    isCurrent: javaCurrent,
+    load: admission ? () => loadJavaTraceDetail(ev, admission, javaEvidence, javaCurrent) : null,
+    cancel: () => window.Tasks?.cancelLatest("java-trace-detail"),
+    raw: () => switchDetailTab("raw"),
+    original: (column, anchor) => openDetailValue({ path: column, original: true, hasValue: true,
+      value: window.EvidenceUI ? EvidenceUI.redact({ [column]: ev.fields[column] })[column] : ev.fields[column],
+      filterValue: ev.fields[column], mono: true }, anchor),
+    scalarMenu: (event, column) => {
+      const anchor = event.currentTarget || event.target, box = anchor.getBoundingClientRect();
+      showDetailValueMenu({ target: anchor, clientX: event.clientX || box.left, clientY: event.clientY || box.bottom,
+        preventDefault: () => event.preventDefault(), stopPropagation: () => event.stopPropagation() },
+      { path: column, original: true, hasValue: true, value: ev.fields[column], filterValue: ev.fields[column] });
+    },
+    menu: (event, items) => showCtxMenu(event.clientX, event.clientY, items),
+    copied: () => toast("Valor copiado.", "ok"), copyFailed: () => toast("Não foi possível copiar.", "err"),
+  });
   const rows = [];
   const push = (key, value, mono, filterValue = value) => rows.push({
     key, value: window.EvidenceUI ? EvidenceUI.redact({ [key]: value ?? "" })[key] : value ?? "", mono, filterValue,
@@ -5654,15 +5695,29 @@ function showDetail(ev, sourceSpec = null, admission = null) {
   push("message", ev.message, true);
   const fieldEntries = Object.entries(ev.fields || {}).sort(([a], [b]) => a.localeCompare(b));
   for (const [k, v] of fieldEntries) {
+    if (javaTrace && k === "stacktrace") continue;
     push(k, v, true);
   }
 
   $("#pane-overview").innerHTML = "";
   const diagnostics = window.FieldTransforms?.renderDiagnostics(ev);
   if (diagnostics) $("#pane-overview").appendChild(diagnostics);
-  $("#pane-overview").appendChild(renderDetailTree(rows));
-  $("#pane-json").innerHTML = highlightJson(window.EvidenceUI ? EvidenceUI.redact(ev) : ev);
-  $("#pane-raw").textContent = (window.EvidenceUI ? EvidenceUI.redact(ev.raw) : ev.raw) || "(sem conteúdo bruto)";
+  if (javaTrace) $("#pane-overview").appendChild(javaTrace);
+  // Compatibility values stay on Event, accessible explicitly; the rich
+  // structure lives only in the opt-in controller and is never Case evidence.
+  $("#pane-overview").appendChild(renderDetailTree(rows, javaTrace ? new Set(["java.trace"]) : new Set()));
+  const renderedPanes = new Set();
+  const renderPane = which => {
+    if (javaRequest !== detailRequest || state.currentDetailEv !== ev || renderedPanes.has(which)) return;
+    if (javaTrace && ($("#drawer").hidden || admission && !detailAdmissionCurrent(admission))) return;
+    if (which === "json") $("#pane-json").innerHTML = highlightJson(window.EvidenceUI ? EvidenceUI.redact(ev) : ev);
+    else if (which === "raw") $("#pane-raw").textContent = (window.EvidenceUI ? EvidenceUI.redact(ev.raw) : ev.raw) || "(sem conteúdo bruto)";
+    else return;
+    renderedPanes.add(which);
+  };
+  detailDeferredPane = javaTrace ? renderPane : null;
+  if (javaTrace) { $("#pane-json").textContent = ""; $("#pane-raw").textContent = ""; }
+  else { renderPane("json"); renderPane("raw"); }
 
   $("#drawer").hidden = false;
   $("#drawer-scrim").hidden = false;
@@ -5692,8 +5747,10 @@ function detailStep(dir) {
 
 function closeDrawer() {
   detailRequest++;
+  detailDeferredPane = null;
   window.Tasks?.cancelLatest("field-inspector");
   window.Tasks?.cancelLatest("event-detail");
+  window.Tasks?.cancelLatest("java-trace-detail");
   state.detailId = null;
   closeDetailValue();
   $("#drawer").hidden = true;
@@ -5713,6 +5770,7 @@ async function copyDetail() {
 }
 
 function switchDetailTab(which) {
+  detailDeferredPane?.(which);
   document.querySelectorAll("#drawer .dtab").forEach((t) =>
     t.classList.toggle("active", t.dataset.pane === which)
   );

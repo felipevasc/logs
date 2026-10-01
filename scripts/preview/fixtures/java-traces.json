@@ -1,0 +1,781 @@
+{
+  "cases": [
+    {
+      "detail": {
+        "reason": null,
+        "row": {
+          "eventRef": "java-preview:0",
+          "id": 0
+        },
+        "state": "available",
+        "trace": {
+          "complete": true,
+          "diagnostics": [],
+          "fingerprint": "jvonehms3zawkthzfisqy3ixjpquvybivfnrnges2jpnnzaocdefmxcaa",
+          "fingerprintVersion": 1,
+          "frames": [
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 1,
+                  "name": "Serviço.java"
+                },
+                "method": "step0",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 166,
+                "start": 107
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 2,
+                  "name": "Serviço.java"
+                },
+                "method": "step1",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 226,
+                "start": 167
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 3,
+                  "name": "Serviço.java"
+                },
+                "method": "step2",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 286,
+                "start": 227
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 4,
+                  "name": "Serviço.java"
+                },
+                "method": "step3",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 346,
+                "start": 287
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 5,
+                  "name": "Serviço.java"
+                },
+                "method": "step4",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 406,
+                "start": 347
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 6,
+                  "name": "Serviço.java"
+                },
+                "method": "step5",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 466,
+                "start": 407
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 7,
+                  "name": "Serviço.java"
+                },
+                "method": "step6",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 526,
+                "start": 467
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 8,
+                  "name": "Serviço.java"
+                },
+                "method": "step7",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 586,
+                "start": 527
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 9,
+                  "name": "Serviço.java"
+                },
+                "method": "step8",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 646,
+                "start": 587
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 10,
+                  "name": "Serviço.java"
+                },
+                "method": "step9",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 707,
+                "start": 647
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 11,
+                  "name": "Serviço.java"
+                },
+                "method": "step10",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 769,
+                "start": 708
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 12,
+                  "name": "Serviço.java"
+                },
+                "method": "step11",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 831,
+                "start": 770
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 13,
+                  "name": "Serviço.java"
+                },
+                "method": "step12",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 893,
+                "start": 832
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 14,
+                  "name": "Serviço.java"
+                },
+                "method": "step13",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 955,
+                "start": 894
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 15,
+                  "name": "Serviço.java"
+                },
+                "method": "step14",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1017,
+                "start": 956
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 16,
+                  "name": "Serviço.java"
+                },
+                "method": "step15",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1079,
+                "start": 1018
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 17,
+                  "name": "Serviço.java"
+                },
+                "method": "step16",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1141,
+                "start": 1080
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 18,
+                  "name": "Serviço.java"
+                },
+                "method": "step17",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1203,
+                "start": 1142
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 19,
+                  "name": "Serviço.java"
+                },
+                "method": "step18",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1265,
+                "start": 1204
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 20,
+                  "name": "Serviço.java"
+                },
+                "method": "step19",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1327,
+                "start": 1266
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 21,
+                  "name": "Serviço.java"
+                },
+                "method": "step20",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1389,
+                "start": 1328
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 22,
+                  "name": "Serviço.java"
+                },
+                "method": "step21",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1451,
+                "start": 1390
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 23,
+                  "name": "Serviço.java"
+                },
+                "method": "step22",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1513,
+                "start": 1452
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 24,
+                  "name": "Serviço.java"
+                },
+                "method": "step23",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1575,
+                "start": 1514
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": "app",
+                "location": {
+                  "kind": "file",
+                  "line": 25,
+                  "name": "Serviço.java"
+                },
+                "method": "step24",
+                "module": "module",
+                "moduleVersion": "1"
+              },
+              "span": {
+                "end": 1637,
+                "start": 1576
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "java.lang.Thread",
+                "loader": null,
+                "location": {
+                  "kind": "native"
+                },
+                "method": "start",
+                "module": "java.base",
+                "moduleVersion": null
+              },
+              "span": {
+                "end": 1689,
+                "start": 1638
+              }
+            },
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Helper",
+                "loader": null,
+                "location": {
+                  "kind": "unknown"
+                },
+                "method": "dispatch",
+                "module": null,
+                "moduleVersion": null
+              },
+              "span": {
+                "end": 1737,
+                "start": 1690
+              }
+            },
+            {
+              "node": 1,
+              "parts": {
+                "class": "com.example.Resource",
+                "loader": null,
+                "location": {
+                  "kind": "file",
+                  "line": 90,
+                  "name": "Resource.java"
+                },
+                "method": "close",
+                "module": null,
+                "moduleVersion": null
+              },
+              "span": {
+                "end": 1850,
+                "start": 1801
+              }
+            },
+            {
+              "node": 2,
+              "parts": {
+                "class": "com.example.Resource",
+                "loader": null,
+                "location": {
+                  "kind": "file",
+                  "line": null,
+                  "name": "Resource.java"
+                },
+                "method": "flush",
+                "module": null,
+                "moduleVersion": null
+              },
+              "span": {
+                "end": 1964,
+                "start": 1918
+              }
+            },
+            {
+              "node": 3,
+              "parts": {
+                "class": "com.example.Storage",
+                "loader": null,
+                "location": {
+                  "kind": "file",
+                  "line": 42,
+                  "name": "Storage.java"
+                },
+                "method": "read",
+                "module": null,
+                "moduleVersion": null
+              },
+              "span": {
+                "end": 2081,
+                "start": 2036
+              }
+            }
+          ],
+          "nodes": [
+            {
+              "class": "com.example.RequestException",
+              "depth": 1,
+              "elidedFrames": null,
+              "frameCount": 27,
+              "frameStart": 0,
+              "header": {
+                "end": 106,
+                "start": 61
+              },
+              "message": "falha café 日",
+              "parent": null,
+              "relation": "root"
+            },
+            {
+              "class": "com.example.CloseException",
+              "depth": 2,
+              "elidedFrames": null,
+              "frameCount": 1,
+              "frameStart": 27,
+              "header": {
+                "end": 1800,
+                "start": 1738
+              },
+              "message": "recurso indisponível",
+              "parent": 0,
+              "relation": "suppressed"
+            },
+            {
+              "class": "com.example.SuppressedCause",
+              "depth": 3,
+              "elidedFrames": 1,
+              "frameCount": 1,
+              "frameStart": 28,
+              "header": {
+                "end": 1917,
+                "start": 1851
+              },
+              "message": "somente a causa suprimida",
+              "parent": 1,
+              "relation": "cause"
+            },
+            {
+              "class": "com.example.RootProblem",
+              "depth": 2,
+              "elidedFrames": 3,
+              "frameCount": 1,
+              "frameStart": 29,
+              "header": {
+                "end": 2035,
+                "start": 1978
+              },
+              "message": "causa final observada",
+              "parent": 0,
+              "relation": "cause"
+            }
+          ],
+          "root": 0,
+          "schemaVersion": 1,
+          "spanBasis": "utf8_bytes_in_raw_block"
+        }
+      },
+      "fields": {
+        "java.exception.class": "com.example.RequestException",
+        "java.exception.message": "falha café 日",
+        "java.root_cause.class": "com.example.RootProblem",
+        "java.trace.complete": true,
+        "java.trace.fingerprint": "jvonehms3zawkthzfisqy3ixjpquvybivfnrnges2jpnnzaocdefmxcaa"
+      },
+      "name": "complete",
+      "raw": "2026-10-01 12:00:00,001 ERROR [worker] com.example.Service - com.example.RequestException: falha café 日\n\tat app/module@1/com.example.Service.step0(Serviço.java:1)\n\tat app/module@1/com.example.Service.step1(Serviço.java:2)\n\tat app/module@1/com.example.Service.step2(Serviço.java:3)\n\tat app/module@1/com.example.Service.step3(Serviço.java:4)\n\tat app/module@1/com.example.Service.step4(Serviço.java:5)\n\tat app/module@1/com.example.Service.step5(Serviço.java:6)\n\tat app/module@1/com.example.Service.step6(Serviço.java:7)\n\tat app/module@1/com.example.Service.step7(Serviço.java:8)\n\tat app/module@1/com.example.Service.step8(Serviço.java:9)\n\tat app/module@1/com.example.Service.step9(Serviço.java:10)\n\tat app/module@1/com.example.Service.step10(Serviço.java:11)\n\tat app/module@1/com.example.Service.step11(Serviço.java:12)\n\tat app/module@1/com.example.Service.step12(Serviço.java:13)\n\tat app/module@1/com.example.Service.step13(Serviço.java:14)\n\tat app/module@1/com.example.Service.step14(Serviço.java:15)\n\tat app/module@1/com.example.Service.step15(Serviço.java:16)\n\tat app/module@1/com.example.Service.step16(Serviço.java:17)\n\tat app/module@1/com.example.Service.step17(Serviço.java:18)\n\tat app/module@1/com.example.Service.step18(Serviço.java:19)\n\tat app/module@1/com.example.Service.step19(Serviço.java:20)\n\tat app/module@1/com.example.Service.step20(Serviço.java:21)\n\tat app/module@1/com.example.Service.step21(Serviço.java:22)\n\tat app/module@1/com.example.Service.step22(Serviço.java:23)\n\tat app/module@1/com.example.Service.step23(Serviço.java:24)\n\tat app/module@1/com.example.Service.step24(Serviço.java:25)\n\tat java.base/java.lang.Thread.start(Native Method)\n\tat com.example.Helper.dispatch(Unknown Source)\n\tSuppressed: com.example.CloseException: recurso indisponível\n\t\tat com.example.Resource.close(Resource.java:90)\n\tCaused by: com.example.SuppressedCause: somente a causa suprimida\n\t\tat com.example.Resource.flush(Resource.java)\n\t\t... 1 more\nCaused by: com.example.RootProblem: causa final observada\n\tat com.example.Storage.read(Storage.java:42)\n\t... 3 more\n"
+    },
+    {
+      "detail": {
+        "reason": null,
+        "row": {
+          "eventRef": "java-preview:1",
+          "id": 1
+        },
+        "state": "available",
+        "trace": {
+          "complete": false,
+          "diagnostics": [
+            {
+              "code": "unknown_line",
+              "span": {
+                "end": 174,
+                "start": 160
+              }
+            },
+            {
+              "code": "orphan_frame",
+              "span": {
+                "end": 220,
+                "start": 175
+              }
+            },
+            {
+              "code": "unknown_frame",
+              "span": {
+                "end": 240,
+                "start": 221
+              }
+            },
+            {
+              "code": "orphan_frame",
+              "span": {
+                "end": 240,
+                "start": 221
+              }
+            }
+          ],
+          "fingerprint": null,
+          "fingerprintVersion": 1,
+          "frames": [
+            {
+              "node": 0,
+              "parts": {
+                "class": "com.example.Service",
+                "loader": null,
+                "location": {
+                  "kind": "file",
+                  "line": 3,
+                  "name": "Service.java"
+                },
+                "method": "request",
+                "module": null,
+                "moduleVersion": null
+              },
+              "span": {
+                "end": 159,
+                "start": 112
+              }
+            },
+            {
+              "node": null,
+              "parts": {
+                "class": "com.example.Storage",
+                "loader": null,
+                "location": {
+                  "kind": "file",
+                  "line": 8,
+                  "name": "Storage.java"
+                },
+                "method": "after",
+                "module": null,
+                "moduleVersion": null
+              },
+              "span": {
+                "end": 220,
+                "start": 175
+              }
+            },
+            {
+              "node": null,
+              "parts": null,
+              "span": {
+                "end": 240,
+                "start": 221
+              }
+            }
+          ],
+          "nodes": [
+            {
+              "class": "com.example.RequestException",
+              "depth": 1,
+              "elidedFrames": null,
+              "frameCount": 1,
+              "frameStart": 0,
+              "header": {
+                "end": 111,
+                "start": 61
+              },
+              "message": "tentativa incompleta",
+              "parent": null,
+              "relation": "root"
+            }
+          ],
+          "root": 0,
+          "schemaVersion": 1,
+          "spanBasis": "utf8_bytes_in_raw_block"
+        }
+      },
+      "fields": {
+        "java.exception.class": "com.example.RequestException",
+        "java.exception.message": "tentativa incompleta",
+        "java.trace.complete": false
+      },
+      "name": "incomplete",
+      "raw": "2026-10-01 12:00:00,001 ERROR [worker] com.example.Service - com.example.RequestException: tentativa incompleta\n\tat com.example.Service.request(Service.java:3)\nCaused by: ???\n\tat com.example.Storage.after(Storage.java:8)\n\tat malformed frame\n"
+    }
+  ],
+  "generatedBy": "actual java_stacktrace::parse + Trace::scalar_fields; exact Trace serialization, coordinator-defined detail envelope",
+  "parserCommit": "d0f8621cc047e028637aae2b442b40a5c0c07b5e",
+  "parserSourceSha256": "6335f49c2bc7bd9565e0ea5a3cb444e7cf22b5452f0f8487928c1a3b3162b201",
+  "spanBasis": "utf8_bytes_in_raw_block"
+}

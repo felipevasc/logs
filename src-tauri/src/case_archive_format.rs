@@ -261,7 +261,7 @@ pub(crate) fn open_regular(path: &Path) -> Result<File, String> {
     }
     let file = options.open(path).map_err(|e| e.to_string())?;
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("Selecione um arquivo regular para importar o Caso ou a imagem.".into());
+        return Err("A entrada precisa ser um arquivo regular.".into());
     }
     Ok(file)
 }

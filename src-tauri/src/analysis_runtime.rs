@@ -154,6 +154,13 @@ struct CompiledEntry {
     budget: usize,
 }
 static COMPILED: parking_lot::Mutex<Vec<CompiledEntry>> = parking_lot::Mutex::new(Vec::new());
+// Serialize cold construction separately from ready-cache access. This keeps
+// count/stats/facet misses from duplicating the same bounded regex programs.
+static COMPILING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+#[cfg(test)]
+thread_local! {
+    static BEFORE_COMPILE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
 
 /// Identity validation is deliberately outside this content cache: a hit never
 /// authorizes a deleted Case or a superseded config/visibility revision.
@@ -166,18 +173,40 @@ fn compile(
     ),
     String,
 > {
+    crate::operations::check()?;
     let identity = snapshot.identity();
-    let mut cache = COMPILED.lock();
-    if let Some(index) = cache.iter().position(|entry| entry.identity == identity) {
-        let entry = cache.remove(index);
-        let result = (Arc::clone(&entry.fields), Arc::clone(&entry.diagnostics));
-        cache.push(entry);
-        return Ok(result);
+    {
+        let mut cache = COMPILED.lock();
+        if let Some(index) = cache.iter().position(|entry| entry.identity == identity) {
+            let entry = cache.remove(index);
+            let result = (Arc::clone(&entry.fields), Arc::clone(&entry.diagnostics));
+            cache.push(entry);
+            return Ok(result);
+        }
     }
-    // Compile while holding this small cache lock to coalesce concurrent
-    // count/stats/facet admissions for the same revision.
+    // A cold Case must not block an unrelated ready cache hit. Only misses
+    // wait for the bounded constructor; recheck after a preceding build.
+    let compiling = loop {
+        crate::operations::check()?;
+        if let Some(guard) = COMPILING.try_lock() { break guard; }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    {
+        let mut cache = COMPILED.lock();
+        if let Some(index) = cache.iter().position(|entry| entry.identity == identity) {
+            let entry = cache.remove(index);
+            let result = (Arc::clone(&entry.fields), Arc::clone(&entry.diagnostics));
+            cache.push(entry);
+            return Ok(result);
+        }
+    }
     let mut diagnostics = snapshot.migration_diagnostics.clone();
-    let fields = Arc::new(match compile_uncached(snapshot) {
+    let compiled = compile_uncached(snapshot);
+    // Cancellation is not an invalid legacy definition and must not publish
+    // a successful empty configuration. Ordinary capture still precedes worker
+    // registration; this checkpoint serves callers with an existing token.
+    crate::operations::check()?;
+    let fields = Arc::new(match compiled {
         Ok(fields) => fields,
         Err(message) => {
             diagnostics.push(analysis_context::Diagnostic {
@@ -194,23 +223,36 @@ fn compile(
         + serde_json::to_vec(&snapshot.config)
             .map_err(|e| e.to_string())?
             .len();
-    while !cache.is_empty()
-        && (cache.len() >= 4
-            || cache
-                .iter()
-                .map(|entry| entry.budget)
-                .sum::<usize>()
-                .saturating_add(budget)
-                > COMPILED_CACHE_BYTES)
-    {
-        cache.remove(0);
-    }
-    cache.push(CompiledEntry {
-        identity,
-        fields: Arc::clone(&fields),
-        diagnostics: Arc::clone(&diagnostics),
-        budget,
-    });
+    let mut retired = Vec::new();
+    let winner = {
+        let mut cache = COMPILED.lock();
+        crate::operations::check()?;
+        if let Some(index) = cache.iter().position(|entry| entry.identity == identity) {
+            let entry = cache.remove(index);
+            let result = (Arc::clone(&entry.fields), Arc::clone(&entry.diagnostics));
+            cache.push(entry);
+            Some(result)
+        } else {
+            while !cache.is_empty()
+                && (cache.len() >= 4
+                    || cache.iter().map(|entry| entry.budget).sum::<usize>()
+                        .saturating_add(budget) > COMPILED_CACHE_BYTES)
+            {
+                retired.push(cache.remove(0));
+            }
+            cache.push(CompiledEntry {
+                identity,
+                fields: Arc::clone(&fields),
+                diagnostics: Arc::clone(&diagnostics),
+                budget,
+            });
+            None
+        }
+    };
+    // Final regex/metadata destruction happens after both locks are released.
+    drop(compiling);
+    drop(retired);
+    if let Some(winner) = winner { return Ok(winner); }
     Ok((fields, diagnostics))
 }
 
@@ -414,6 +456,9 @@ fn enabled_definitions(snapshot: &Snapshot) -> Vec<serde_json::Value> {
 }
 
 fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>, String> {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_COMPILE.with(|hook| hook.borrow_mut().take()) { hook(); }
+    crate::operations::check()?;
     let safe = enabled_definitions(snapshot);
     let rule_count = safe
         .iter()
@@ -437,17 +482,113 @@ fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>
     let regex_limit = limits.size_limit;
     let dfa_limit = limits.dfa_size_limit;
     analysis_context::definition_order(&safe)?.into_iter().map(|index| {
+        crate::operations::check()?;
         let definition: sources::DerivedFieldCompat = serde_json::from_value(safe[index].clone())
             .map_err(|_| "Campo derivado inválido no Caso.".to_string())?;
         let definition = definition.normalize();
         let rules = definition.rules.into_iter().map(|rule| {
-            regex::RegexBuilder::new(&rule.pattern).size_limit(regex_limit).dfa_size_limit(dfa_limit).build()
+            crate::operations::check()?;
+            let compiled = regex::RegexBuilder::new(&rule.pattern).size_limit(regex_limit).dfa_size_limit(dfa_limit).build();
+            crate::operations::check()?;
+            compiled
                 .map(|re| sources::CompiledRule { re, template: rule.template, filter: rule.filter })
                 .map_err(|_| "Expressão regular inválida ou excede o orçamento total de compilação do Caso.".to_string())
         }).collect::<Result<Vec<_>, _>>()?;
         Ok(sources::CompiledDerived { name: definition.name, source: definition.source, rules, steps: definition.steps,
             lookup: definition.lookup.map(crate::reference_lookup::Compiled::new) })
     }).collect()
+}
+
+#[cfg(test)]
+mod compiled_cache_lifetime_tests {
+    use super::*;
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            schema_version: 1,
+            case_id: uuid::Uuid::new_v4().to_string(),
+            analysis_id: uuid::Uuid::new_v4().to_string(),
+            config_revision: 0,
+            visibility_revision: 0,
+            config: analysis_context::Config::default(),
+            migration_diagnostics: Vec::new(),
+            legacy_raw: None,
+        }
+    }
+
+    #[test]
+    fn cold_compile_releases_global_lock_for_an_unrelated_ready_hit() {
+        let warm = snapshot();
+        let first = compile(&warm).unwrap().0;
+        let cold = snapshot();
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (release, waiting) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            BEFORE_COMPILE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                entered.send(()).unwrap();
+                waiting.recv().unwrap();
+            })));
+            compile(&cold).unwrap()
+        });
+        observed.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // Do not let a regression deadlock the test: release the cold worker
+        // before asserting when the old lock scope is observed.
+        let unlocked = COMPILED.try_lock().is_some();
+        let hit = unlocked.then(|| compile(&warm).unwrap().0);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(unlocked, "regex construction must not hold the shared cache lock");
+        assert!(Arc::ptr_eq(&first, &hit.unwrap()));
+    }
+
+    #[test]
+    fn concurrent_misses_reuse_one_cold_build_and_owned_result() {
+        let snapshot = snapshot();
+        let identity = snapshot.identity();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workers: Vec<_> = (0..2).map(|_| {
+            let snapshot = snapshot.clone();
+            let entered = entered.clone();
+            let builds = Arc::clone(&builds);
+            let (release, waiting) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                BEFORE_COMPILE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                    builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    entered.send(()).unwrap();
+                    waiting.recv().unwrap();
+                })));
+                compile(&snapshot).unwrap()
+            });
+            (worker, release)
+        }).collect();
+        drop(entered);
+        let started = observed.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        for (_, release) in &workers { let _ = release.send(()); }
+        let results: Vec<_> = workers.into_iter().map(|(worker, _)| worker.join().unwrap()).collect();
+        assert!(started);
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&results[0].0, &results[1].0));
+        assert!(Arc::ptr_eq(&results[0].1, &results[1].1));
+        assert_eq!(COMPILED.lock().iter().filter(|entry| entry.identity == identity).count(), 1);
+    }
+
+    #[test]
+    fn cancelled_compile_is_not_a_cached_disabled_configuration() {
+        let snapshot = snapshot();
+        let identity = snapshot.identity();
+        let id = format!("compile-case-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let result = crate::operations::run_with_token(token, || {
+            BEFORE_COMPILE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(crate::operations::cancel_id(&id));
+            })));
+            assert!(compile(&snapshot).is_err(), "cancellation must not become disabled definitions");
+        });
+        assert!(result.is_err());
+        assert!(!COMPILED.lock().iter().any(|entry| entry.identity == identity));
+        assert!(compile(&snapshot).unwrap().1.is_empty(), "an uncancelled retry remains valid");
+    }
 }
 
 pub(crate) fn same_owner(a: Option<&Identity>, b: Option<&Identity>) -> bool {
@@ -696,6 +837,7 @@ impl Admitted {
                         .saturating_add(self.definition_bytes)
                         .saturating_add(projection_bytes);
                     if budget <= PREPARED_CACHE_BYTES {
+                        let mut retired = Vec::new();
                         let mut cache = PREPARED_FIELDS.lock();
                         while !cache.is_empty()
                             && (cache.len() >= PREPARED_CACHE_ENTRIES
@@ -706,7 +848,7 @@ impl Admitted {
                                     .saturating_add(budget)
                                     > PREPARED_CACHE_BYTES)
                         {
-                            cache.remove(0);
+                            retired.push(cache.remove(0));
                         }
                         cache.push(PreparedFieldsEntry {
                             root: self.data_root.clone(),
@@ -715,6 +857,8 @@ impl Admitted {
                             fields: Arc::clone(&fields),
                             budget,
                         });
+                        drop(cache);
+                        drop(retired);
                     }
                     fields
                 }

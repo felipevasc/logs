@@ -340,6 +340,10 @@ fn spec(
                 hash.update(b"|logical-event-identity:");
                 hash.update(serde_json::to_vec(identity).ok()?);
             }
+            if let Some(revision) = crate::java_stacktrace::enrichment_signature(&part.format) {
+                hash.update(b"|parser-enrichment:");
+                hash.update(revision.as_bytes());
+            }
             let key = format!("{:x}", hash.finalize());
             parts.push(PartSpec {
                 path: dir.join(format!("{key}.duckdb")),
@@ -2539,6 +2543,63 @@ mod lifecycle_tests {
 #[cfg(test)]
 mod metadata_identity_tests {
     use super::*;
+
+    /// The key immediately before Java enrichment, including the existing
+    /// calendar/physical-file context. Tiny fixtures each have one segment.
+    fn pre_java_key(idx: &FileIndex) -> String {
+        let part = &idx.parts[0];
+        assert!(part.custom.is_none() && part.ts_config.is_none());
+        let first_offset = idx.lines.at(0).offset - part.base;
+        let last = idx.lines.last().unwrap();
+        let last_end = last.offset - part.base + u64::from(last.len);
+        let derived_sig = derived_signature(&[]).unwrap();
+        let tz = chrono::Local::now().offset().to_string();
+        let custom = ""; let ts = ""; let catalogs = "";
+        let mut hash = Sha256::new();
+        hash.update(format!(
+            "{}|{}|{}|{}|{:?}|{custom}|{ts}|{tz}|{}|{first_offset}|{last_end}|{derived_sig}|{catalogs}|{:?}",
+            build::STORE_VERSION, crate::index_cache::INDEX_DIR, part.identity,
+            part.format, part.header, idx.lines.len(), part.physical_file_id
+        ));
+        hash.update(b"|timezone-configuration:");
+        hash.update(part.calendar.timezone.as_bytes());
+        if matches!(part.format.as_str(), "syslog3164" | "firewall") {
+            hash.update(format!("|inferred-year:{}", part.calendar.year));
+        }
+        if let Some(identity) = &part.event_identity {
+            hash.update(b"|logical-event-identity:");
+            hash.update(serde_json::to_vec(identity).unwrap());
+        }
+        format!("{:x}", hash.finalize())
+    }
+
+    #[test]
+    fn java_enrichment_changes_only_java_store_keys_not_plain_nginx_or_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let codes = CodesConfig::default();
+        for (format, raw, java) in [
+            ("jsonl", "{\"timestamp\":\"2026-09-30T00:00:00Z\",\"message\":\"ordinary\"}\n", false),
+            ("apache", "127.0.0.1 - - [30/Sep/2026:12:00:00 +0000] \"GET /health HTTP/1.1\" 200 5 \"-\" \"client\"\n", false),
+            ("log4j", "2026-09-30 12:00:00,000 ERROR [worker] a.Logger - a.FailureException\n\tat a.Service.run(A.java:1)\n2026-09-30 12:00:01,000 INFO [worker] a.Logger - next\n", true),
+            ("wildfly", "12:00:00,000 ERROR [a.Logger] (worker) a.FailureException\n\tat a.Service.run(A.java:1)\n12:00:01,000 INFO [a.Logger] (worker) next\n", true),
+        ] {
+            let path = dir.path().join(format!("{format}.log"));
+            std::fs::write(&path, raw).unwrap();
+            let idx = crate::sources::index_file(path.to_str().unwrap(), format, None, None, None).unwrap();
+            let actual = spec(&idx, &codes, &codes, &[]).unwrap();
+            assert_eq!(actual.parts.len(), 1);
+            let old = pre_java_key(&idx);
+            assert_eq!(actual.parts[0].key == old, !java, "{format}");
+            if java {
+                assert_eq!(idx.lines.len(), 2, "enrichment preserves the existing two framed records");
+                for &column in crate::java_stacktrace::COLUMNS {
+                    assert!(idx.columns.iter().any(|value| value == column));
+                }
+            } else {
+                assert!(!idx.columns.iter().any(|value| value == "java.trace"));
+            }
+        }
+    }
 
     #[test]
     fn timezone_context_separates_new_engine_keys_from_unverifiable_legacy() {

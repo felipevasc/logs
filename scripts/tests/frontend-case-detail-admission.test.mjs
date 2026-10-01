@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import {readFileSync} from 'node:fs';
 const source=readFileSync(new URL('../../frontend/app.js',import.meta.url),'utf8');
 const journeys=readFileSync(new URL('../../frontend/journeys.js',import.meta.url),'utf8');
+const threats=readFileSync(new URL('../../frontend/threats.js',import.meta.url),'utf8');
 const section=(start,end)=>source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
 const plain=value=>JSON.parse(JSON.stringify(value));
 const settle=async()=>{for(let i=0;i<40;i++)await Promise.resolve();};
@@ -129,6 +130,70 @@ test('explicit saved-evidence detail stays separate and copies its complete orig
   await f.context.copyDetail();assert.deepEqual(JSON.parse(f.copied[0]),saved);
   const workspace=readFileSync(new URL('../../frontend/workspace.js',import.meta.url),'utf8');
   assert.match(workspace,/if \(action === "evidence-event"\) \{ showDetail\(item\.rows\[0\], item\.sourceSpec\); \}/);
+});
+
+// Threat results live inside the drawer being replaced by openDetail. Exercise
+// their actual list/row handler with real detail admission, not a local filter.
+function threatFixture(){
+  const f=fixture(),nodes=[];
+  const el=(tag,cls='',text='')=>{const node={tag,cls,textContent:text,children:[],isConnected:true,
+    append(...children){this.children.push(...children);},set innerHTML(_value){this.children=[];}};nodes.push(node);return node;};
+  Object.assign(f.context,{el,inspectorRequest:0,
+    inspector(_title,_subtitle,body){f.$('#drawer').hidden=false;body.isConnected=true;return ++f.context.inspectorRequest;},
+    contextKey:scope=>JSON.stringify([scope,f.state.owner.caseId]),analyticsRequest:()=>({filters:[],caseEvents:f.evidence()}),
+    fmtTsFull:String,fmtNum:String,
+  });
+  f.context.window.WorkspaceContext={scope:f.context.workspaceScope};
+  const loading=f.context.showDetailLoading;
+  f.context.showDetailLoading=()=>{for(const node of nodes)if(node.cls==='threat-records')node.isConnected=false;loading();};
+  vm.runInContext(threats.slice(threats.indexOf('  const button='),threats.indexOf('  function inspector(')),f.context);
+  vm.runInContext(threats.slice(threats.indexOf('  async function evidence('),threats.indexOf('  function ruleDetails(')),f.context);
+  return{...f,nodes,async list(event={id:0,event_ref:'source:original',message:'clipped preview'}){
+    const pending=f.context.records('case');await settle();const request=f.requests.at(-1);assert.equal(request.cmd,'threat_events');
+    request.resolve({rows:[event],total:1,complete:true});await pending;return nodes.find(node=>node.cls==='threat-record');
+  }};
+}
+
+test('current Case threat row opens token-bound native detail with its current overlay after replacing the list DOM',async()=>{
+  const f=threatFixture(),saved=structuredClone(f.evidence()),row=await f.list();
+  assert.deepEqual(plain(f.requests[0].opts.analysisOwner),f.state.owner);
+  const pending=row.onclick();await settle();assert.equal(f.requests.length,2);
+  const request=f.requests[1];assert.equal(request.cmd,'event_detail');assert.equal(request.args.caseKey,'captured-case');
+  assert.equal(request.args.caseContentToken,'captured-token');assert.equal(request.args.eventRef,'source:original');
+  assert.equal(request.args.caseEvents,undefined);assert.equal(request.opts.caseEvents,f.evidence());
+  assert.equal(f.nodes.find(node=>node.cls==='threat-records').isConnected,false,'the list is intentionally replaced while detail is loading');
+  const event={id:0,event_ref:'source:original',fields:{overlay:'current-B'},raw:'complete current native body'};
+  request.resolve(event);await pending;assert.equal(f.shown.length,1);assert.equal(f.shown[0],event);
+  assert.deepEqual(f.evidence(),saved);assert.equal(f.state.detailAdmission.scope,'case');assert.equal(f.$('.detail-quick-actions').hidden,true);
+});
+
+test('hidden, missing or replaced Case threat detail never falls back to saved or clipped Event values',async()=>{
+  for(const result of [null,{id:0,event_ref:'wrong',fields:{overlay:'wrong'}},new Error('visibility admission failed')]){
+    const f=threatFixture(),row=await f.list(),pending=row.onclick();await settle();
+    if(result instanceof Error)f.requests[1].reject(result);else f.requests[1].resolve(result);
+    await pending;assert.equal(f.shown.length,0);assert.equal(f.state.currentDetailEv,null);
+    assert.doesNotMatch(f.$('#pane-overview').textContent,/saved-A|clipped preview|preserved body/);
+  }
+});
+
+test('Case threat ownership expires before clicking, during synchronization and after native dispatch',async()=>{
+  for(const stage of ['before','preparation','reply'])for(const change of ['case','revision','evidence']){
+    const f=threatFixture(),row=await f.list(),gate=deferred();if(stage==='preparation')f.prepare(gate.promise);
+    let pending;if(stage!=='before'){pending=row.onclick();await settle();}
+    if(change==='case')f.state.owner.caseId='other-case';
+    if(change==='revision')f.state.owner.identity.visibilityRevision++;
+    if(change==='evidence')f.setEvidence([]);
+    if(stage==='before')pending=row.onclick();
+    else if(stage==='preparation')gate.resolve();
+    else f.requests[1].resolve({id:0,event_ref:'source:original',fields:{overlay:'obsolete'}});
+    await pending;assert.equal(f.shown.length,0,`${stage}/${change}`);
+    assert.equal(f.requests.length,stage==='reply'?2:1,`${stage}/${change}: no stale admission dispatch`);
+  }
+});
+
+test('Case threat rows without stable references require refresh instead of local identity fallback',async()=>{
+  const f=threatFixture(),row=await f.list({id:0,message:'unreferenced preview'});await row.onclick();
+  assert.equal(f.requests.length,1);assert.equal(f.shown.length,0);assert.match(f.messages.at(-1),/referência estável/);
 });
 
 // Exercise the installed journey rendering and row callback with the real

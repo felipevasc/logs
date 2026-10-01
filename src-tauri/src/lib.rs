@@ -40,6 +40,7 @@ mod index_cache;
 mod metadata_checkpoint;
 mod metadata_store;
 mod insights;
+mod java_stacktrace;
 mod journeys;
 mod mcp;
 mod model;
@@ -2301,6 +2302,7 @@ pub fn run() {
             tree_aggs,
             stats_events,
             detail_commands::event_detail,
+            detail_commands::java_trace_detail,
             get_codes,
             save_codes,
             get_codes_path,

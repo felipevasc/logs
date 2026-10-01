@@ -11,7 +11,7 @@ const identity=value=>Object.fromEntries(['caseId','analysisId','configRevision'
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return{promise,resolve,reject};};
 const reached=async(predicate,message)=>{for(let i=0;i<50;i++){if(predicate())return;await Promise.resolve();}assert.fail(message);};
 
-function transportFixture(){
+function transportFixture(detailCommand='event_detail'){
   const calls={sync:[],detail:[],prepared:[]},hooks={};
   const owner={caseId:'case-a',analysisId:'analysis-a',configRevision:2,visibilityRevision:3};
   const evidence=[{id:0,event_ref:'captured:0',raw:'complete captured body',fields:{input:'captured'}}];
@@ -20,7 +20,7 @@ function transportFixture(){
       if(command==='case_sync'){
         calls.sync.push(args);return hooks.sync?hooks.sync(args):{caseContentToken:`publication-${calls.sync.length}`};
       }
-      assert.equal(command,'event_detail');calls.detail.push(args);
+      assert.equal(command,detailCommand);calls.detail.push(args);
       return hooks.detail?hooks.detail(args):{...evidence[0],fields:{input:'admitted'}};
     },
   });
@@ -74,6 +74,22 @@ test('changed Case detail evidence is refused without a cache-miss resynchroniza
   const f=transportFixture();f.hooks.detail=()=>{throw Error('CASE_CACHE_CHANGED: evidence replaced');};
   await assert.rejects(f.context.api('event_detail',{...f.args,caseEvents:f.evidence},f.options),/CASE_CACHE_CHANGED/);
   assert.equal(f.calls.sync.length,1);assert.equal(f.calls.detail.length,1);
+});
+
+test('opt-in Java detail uses the same mandatory Case token and captured cache-miss retry transport',async()=>{
+  const f=transportFixture('java_trace_detail');
+  f.hooks.detail=()=>{if(f.calls.detail.length===1)throw Error('CASE_CACHE_MISS');return{state:'available',trace:{schemaVersion:1},reason:null,row:{id:0,eventRef:'captured:0'}};};
+  const response=await f.context.api('java_trace_detail',{...f.args,caseEvents:f.evidence},f.options);
+  assert.equal(response.state,'available');assert.equal(f.calls.sync.length,2);
+  assert.deepEqual(f.calls.detail.map(args=>args.caseContentToken),['publication-1','publication-2']);
+  assert.ok(f.calls.detail.every(args=>!Object.hasOwn(args,'caseEvents')));
+  assert.ok(f.calls.sync.every(args=>args.events===f.evidence));
+  const missing=transportFixture('java_trace_detail');missing.hooks.sync=()=>({});
+  await assert.rejects(missing.context.api('java_trace_detail',{...missing.args,caseEvents:missing.evidence},missing.options),/confirmar a versão exata/);
+  assert.equal(missing.calls.detail.length,0);
+  const changed=transportFixture('java_trace_detail');changed.hooks.detail=()=>{throw Error('CASE_CACHE_CHANGED');};
+  await assert.rejects(changed.context.api('java_trace_detail',{...changed.args,caseEvents:changed.evidence},changed.options),/CASE_CACHE_CHANGED/);
+  assert.equal(changed.calls.sync.length,1);
 });
 
 test('caller guards and cancellation stop initial and retried Case detail dispatch after synchronization',async()=>{

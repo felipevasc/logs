@@ -38,6 +38,26 @@ fn capture(
     Ok(Admission { admitted, events })
 }
 
+fn record_in_scope(
+    state: &AppState,
+    id: usize,
+    event_ref: Option<&str>,
+    visible_case: Option<Vec<Event>>,
+) -> Result<Option<Event>, String> {
+    crate::operations::check()?;
+    let event = match visible_case {
+        Some(events) => events.into_iter().find(|event| event.id == id),
+        None => crate::event_detail_raw(state, id),
+    };
+    if let Some(event) = &event {
+        if event_ref.is_some_and(|expected| expected.is_empty() || event.event_ref != expected) {
+            return Err("O registro retornado não corresponde à referência solicitada.".into());
+        }
+    }
+    crate::operations::check()?;
+    Ok(event)
+}
+
 pub(crate) fn detail_in_scope(
     state: &AppState,
     id: usize,
@@ -45,17 +65,8 @@ pub(crate) fn detail_in_scope(
     visible_case: Option<Vec<Event>>,
 ) -> Result<Option<Event>, String> {
     let _interactive = crate::operations::interactive();
-    crate::operations::check()?;
-    let mut event = match visible_case {
-        Some(events) => events.into_iter().find(|event| event.id == id),
-        None => crate::event_detail_raw(state, id),
-    };
-    if let Some(event) = &mut event {
-        if event_ref.is_some_and(|expected| expected.is_empty() || event.event_ref != expected) {
-            return Err("O registro retornado não corresponde à referência solicitada.".into());
-        }
-        crate::entities::annotate(event);
-    }
+    let mut event = record_in_scope(state, id, event_ref, visible_case)?;
+    if let Some(event) = &mut event { crate::entities::annotate(event); }
     crate::operations::check()?;
     Ok(event)
 }
@@ -66,6 +77,75 @@ fn detail_in_admission(state: &AppState, admitted: &analysis_runtime::Admitted, 
     // background aggregate, it must not publish after config/source changes.
     admitted.validate(state)?;
     Ok(result)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceRow {
+    id: usize,
+    event_ref: String,
+}
+
+/// Rich frames belong to an explicit detail request, never ordinary Event
+/// fields, page payloads, columnar values or automatic Case serialization.
+#[derive(serde::Serialize)]
+pub(crate) struct JavaTraceDetail {
+    state: &'static str,
+    trace: Option<crate::java_stacktrace::Trace>,
+    reason: Option<&'static str>,
+    row: Option<TraceRow>,
+}
+
+fn java_trace_in_admission(
+    state: &AppState,
+    admitted: &analysis_runtime::Admitted,
+    id: usize,
+    event_ref: &str,
+    visible_case: Option<Vec<Event>>,
+) -> Result<JavaTraceDetail, String> {
+    let _interactive = crate::operations::interactive();
+    if event_ref.is_empty() { return Err("Informe a referência exata do registro para interpretar a stack trace.".into()); }
+    let event = record_in_scope(state, id, Some(event_ref), visible_case)?;
+    let result = if let Some(event) = event {
+        let row = Some(TraceRow { id: event.id, event_ref: event.event_ref.clone() });
+        if event.raw.is_empty() {
+            JavaTraceDetail { state: "unavailable", trace: None, reason: Some("raw_unavailable"), row }
+        } else if let Some(trace) = crate::sources::java_trace_for_event(&event)? {
+            JavaTraceDetail { state: "available", trace: Some(trace), reason: None, row }
+        } else {
+            JavaTraceDetail { state: "unavailable", trace: None, reason: Some("not_java"), row }
+        }
+    } else {
+        JavaTraceDetail { state: "unavailable", trace: None, reason: Some("record_unavailable"), row: None }
+    };
+    crate::operations::check()?;
+    admitted.validate(state)?;
+    admitted.validate_visibility()?;
+    Ok(result)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn java_trace_detail(
+    id: usize,
+    event_ref: String,
+    case_events: Option<serde_json::Value>,
+    case_key: Option<String>,
+    case_content_token: Option<String>,
+    analysis_context: Option<Identity>,
+    source_generation: Option<u64>,
+    operation_id: Option<String>,
+    app: AppHandle,
+) -> Result<JavaTraceDetail, String> {
+    require_synchronized_evidence(&case_events)?;
+    if event_ref.is_empty() { return Err("Informe a referência exata do registro para interpretar a stack trace.".into()); }
+    let Admission { admitted, events } = capture(
+        app.state::<AppState>().inner(), analysis_context, source_generation, case_key, case_content_token,
+    )?;
+    let captured = Arc::clone(&admitted);
+    crate::offload_case_record(operation_id, app.clone(), admitted, events, id, Some(event_ref.clone()), move |events| {
+        java_trace_in_admission(app.state::<AppState>().inner(), &captured, id, &event_ref, events)
+    }).await?
 }
 
 #[tauri::command]
@@ -155,6 +235,89 @@ mod tests {
                 Ok(result)
             })
         }
+        fn replace_raw(&mut self, raw: &str) {
+            self.event.raw = raw.to_owned();
+            self.token = tauri::async_runtime::block_on(crate::case_cache::case_sync(
+                self.key.clone(), vec![self.event.clone()], Some(self.identity.clone()),
+            )).unwrap().case_content_token;
+        }
+        fn trace(&self, capture: Admission, id: usize, event_ref: &str) -> Result<JavaTraceDetail, String> {
+            let Admission { admitted, events } = capture;
+            analysis_runtime::with(Some(admitted.clone()), || {
+                admitted.validate(&self.state)?;
+                let events = admitted.prepare_visibility_record(events.as_deref().map(Vec::as_slice), id, Some(event_ref))?;
+                java_trace_in_admission(&self.state, &admitted, id, event_ref, events)
+            })
+        }
+    }
+
+    const JAVA: &str = "2026-09-30 12:00:00,000 ERROR [main] app.Service - java.lang.IllegalStateException: broken\n\tat app.Service.run(Service.java:17)\n";
+
+    #[test]
+    fn java_trace_metadata_is_exact_and_separate_from_saved_event_fields() {
+        let mut fixture = Fixture::new();
+        fixture.replace_raw(JAVA);
+        let before = serde_json::to_vec(&fixture.event).unwrap();
+        let result = fixture.trace(fixture.capture().unwrap(), 7, &fixture.event.event_ref).unwrap();
+        assert_eq!(result.state, "available");
+        assert!(result.reason.is_none());
+        assert_eq!(result.trace.as_ref().unwrap().exception_class(), Some("java.lang.IllegalStateException"));
+        let wire = serde_json::to_value(result).unwrap();
+        assert_eq!(wire["row"], json!({"id":7,"eventRef":fixture.event.event_ref}));
+        assert!(wire.get("fields").is_none());
+        assert!(wire.get("raw").is_none());
+        assert_eq!(serde_json::to_vec(&fixture.event).unwrap(), before);
+        assert!(!fixture.event.fields.contains_key("java.trace"));
+        assert!(fixture.trace(fixture.capture().unwrap(), 7, "different-reference").is_err());
+        assert!(fixture.trace(fixture.capture().unwrap(), 7, "").is_err());
+    }
+
+    #[test]
+    fn java_trace_unavailable_states_do_not_invent_raw_or_fall_back_to_dataset() {
+        let mut fixture = Fixture::new();
+        fixture.replace_raw("");
+        let unavailable = fixture.trace(fixture.capture().unwrap(), 7, &fixture.event.event_ref).unwrap();
+        assert_eq!(unavailable.reason, Some("raw_unavailable"));
+        assert!(unavailable.trace.is_none());
+        fixture.replace_raw("An ordinary event without a Java trace");
+        assert_eq!(fixture.trace(fixture.capture().unwrap(), 7, &fixture.event.event_ref).unwrap().reason, Some("not_java"));
+        fixture.replace_raw(JAVA);
+        *fixture.state.source.write() = SourceData::Memory(vec![fixture.event.clone()]);
+        let Admission { admitted, events: _ } = fixture.capture().unwrap();
+        analysis_runtime::with(Some(admitted.clone()), || {
+            admitted.prepare_visibility_record(Some(&[]), 7, Some(&fixture.event.event_ref)).unwrap();
+            let hidden = java_trace_in_admission(&fixture.state, &admitted, 7, &fixture.event.event_ref, Some(vec![])).unwrap();
+            assert_eq!(hidden.reason, Some("record_unavailable"));
+            assert!(hidden.row.is_none());
+            assert!(hidden.trace.is_none());
+        });
+    }
+
+    #[test]
+    fn java_trace_rejects_replaced_publications_config_and_cancellation() {
+        let mut fixture = Fixture::new();
+        fixture.replace_raw(JAVA);
+        let old = fixture.capture().unwrap();
+        fixture.replace_raw("replacement raw");
+        assert_eq!(fixture.trace(old, 7, &fixture.event.event_ref).err().unwrap(), crate::case_cache::CHANGED);
+        fixture.replace_raw(JAVA);
+        let Admission { admitted, events } = fixture.capture().unwrap();
+        analysis_runtime::with(Some(admitted.clone()), || {
+            let prepared = admitted.prepare_visibility_record(events.as_deref().map(Vec::as_slice), 7, Some(&fixture.event.event_ref)).unwrap();
+            let current = analysis_context::snapshot("detail-case").unwrap();
+            analysis_context::update(&current.identity(), current.config).unwrap();
+            assert!(java_trace_in_admission(&fixture.state, &admitted, 7, &fixture.event.event_ref, prepared).is_err());
+        });
+        fixture.identity = analysis_context::snapshot("detail-case").unwrap().identity();
+        fixture.replace_raw(JAVA);
+        let id = format!("java-trace-cancel-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let admission = fixture.capture().unwrap();
+        let result = crate::operations::run_with_token(token, || {
+            assert!(crate::operations::cancel_id(&id));
+            assert!(fixture.trace(admission, 7, &fixture.event.event_ref).is_err());
+        });
+        assert!(result.is_err());
     }
 
     #[test]

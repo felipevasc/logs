@@ -48,26 +48,33 @@
     for(const category of catalog.categories||[])details.append(el('p','',category));box.append(details);
     token=inspector('Regras','Arquivo local editável',box);
   }
-  function evidence(event,scope) {
-    if(scope==='dataset'){openDetail(event.id);return;}
-    const original=caseEvents().find(e=>event.event_ref&&e.event_ref===event.event_ref)||caseEvents().find(e=>e.id===event.id)||event;
-    showDetail(original);$('#dr-prev').hidden=true;$('#dr-next').hidden=true;$('.detail-quick-actions').hidden=true;
+  async function evidence(event,scope,current) {
+    if(!current())return;
+    if(scope==='dataset'){await openDetail(event.id);return;}
+    if(typeof event.event_ref!=='string'||!event.event_ref){toast('Este registro não tem uma referência estável. Atualize a lista.','info');return;}
+    if(!await openDetail(event.id,{eventRef:event.event_ref,guard:current})||!current())return;
+    if(state.currentDetailEv?.id!==event.id||state.currentDetailEv?.event_ref!==event.event_ref)return;
+    $('#dr-prev').hidden=true;$('#dr-next').hidden=true;$('.detail-quick-actions').hidden=true;
   }
   async function records(scope,ruleId='*',extra=[],name='Indícios') {
     const body=el('div','threat-records'),token=inspector(name,scope==='case'?'Registros salvos no caso':'Logs abertos',body);
     const base=analyticsRequest(scope),filters=[...base.filters,{column:'_all',op:'threat_rule',value:ruleId,value2:null},...extra];
-    const key=contextKey(scope);
+    const key=contextKey(scope),owner=window.AnalysisContexts?.capture(),signature=scope==='case'?caseSig():null;
     let page=0,version=0;
-    const current=()=>token===inspectorRequest&&key===contextKey(scope)&&body.isConnected&&!$('#drawer').hidden&&(!window.WorkspaceContext||window.WorkspaceContext.scope()===scope);
+    // Opening admitted detail replaces this list inside the drawer. Keep its
+    // captured owner guard independent of the intentionally detached list DOM.
+    const owned=()=>token===inspectorRequest&&key===contextKey(scope)&&(!window.WorkspaceContext||window.WorkspaceContext.scope()===scope)
+      &&(!owner||window.AnalysisContexts.isCurrent(owner))&&(signature===null||signature===caseSig());
+    const current=()=>owned()&&body.isConnected&&!$('#drawer').hidden;
     async function load(){
       const request=++version;body.textContent='Buscando registros…';
       try{
-        const data=await api('threat_events',{...base,filters,offset:page*50,limit:50});
+        const data=await api('threat_events',{...base,filters,offset:page*50,limit:50},{analysisOwner:owner});
         if(!current()||request!==version)return;body.innerHTML='';
         const head=el('div','threat-record-head');head.append(el('strong','',`${fmtNum(data.total)} registros`));body.append(head);
         if(data.complete===false)body.append(el('p','threat-partial','Varredura parcial · alguns registros não foram examinados integralmente.'));
         for(const event of data.rows||[]){
-          const row=button('',()=>evidence(event,scope),'threat-record');
+          const row=button('',()=>{if(current())return evidence(event,scope,owned);},'threat-record');
           row.append(el('small','',`${fmtTsFull(event.timestamp)} · ${event.source||'Sem origem'}`),el('span','',String(event.message||event.name||'(sem mensagem)').slice(0,260)));body.append(row);
         }
         if(!data.rows?.length)body.append(el('p','discovery-empty','Nenhum registro nesta seleção.'));

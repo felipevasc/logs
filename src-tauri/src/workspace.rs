@@ -1281,8 +1281,9 @@ mod canonical {
     }
     impl Input {
         pub(crate) fn open(path: &Path) -> Result<Self, String> {
+            crate::operations::check()?;
             let canonical = reader(path)?;
-            let file = File::open(path).map_err(|e| format!("Não foi possível abrir {}: {e}", path.display()))?;
+            let file = crate::case_archive_format::open_regular(path).map_err(|e| format!("Não foi possível abrir {}: {e}", path.display()))?;
             let origin = capture(path, &file)?;
             let (logical_identity, legacy, original, lease) = match canonical {
                 Some((lease, artifact, original)) => (artifact.logical_identity, artifact.legacy, original, Some(lease)),
@@ -1302,7 +1303,8 @@ mod canonical {
             self.legacy.as_ref().map(|alias| (alias.path.clone(), alias.identity.clone()))
         }
         fn validate(&self) -> Result<(), String> {
-            let current = File::open(&self.path).map_err(|e| format!("Fonte indisponível: {e}"))?;
+            crate::operations::check()?;
+            let current = crate::case_archive_format::open_regular(&self.path).map_err(|e| format!("Fonte indisponível: {e}"))?;
             if capture(&self.path, &current)? != self.origin || Stamp::of(&self.file)? != self.origin.stamp {
                 return Err("A fonte foi alterada durante a conversão; reabra uma cópia estável. A conversão incompleta será reiniciada.".into());
             }
@@ -1311,8 +1313,9 @@ mod canonical {
         }
     }
     fn validate_original(original: &Origin) -> Result<(), String> {
+        crate::operations::check()?;
         let path = Path::new(&original.requested_path);
-        let file = File::open(path).map_err(|_| "A fonte original da conversão não está disponível; reabra a fonte original.".to_string())?;
+        let file = crate::case_archive_format::open_regular(path).map_err(|_| "A fonte original da conversão não está disponível; reabra a fonte original.".to_string())?;
         if capture(path, &file)? != *original {
             return Err("A fonte original da conversão mudou; reabra a fonte antes de consultar ou calcular hashes.".into());
         }
@@ -1941,6 +1944,104 @@ mod canonical {
         }
 
         #[test]
+        fn utf32_signatures_do_not_publish_a_misdecoded_utf16_artifact() {
+            let fixture = Fixture::new();
+            for (name, bytes) in [
+                ("UTF-32LE", vec![0xff, 0xfe, 0, 0, b'A', 0, 0, 0, b'\n', 0, 0, 0]),
+                ("UTF-32BE", vec![0, 0, 0xfe, 0xff, 0, 0, 0, b'A', 0, 0, 0, b'\n']),
+            ] {
+                let path = fixture.file("events.log", &bytes);
+                assert!(super::super::sniff_encoding(&bytes).is_none(), "unsupported signatures cannot be reported as UTF-16");
+                let error = super::super::expand_encoding(&path).unwrap_err();
+                assert!(error.contains(name));
+                assert!(error.contains("UTF-8 ou UTF-16"));
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert!(!root().exists(), "reject before publishing any canonical output");
+            }
+            let ambiguous = [0xff, 0xfe, 0, 0, b'A', 0, b'\n', 0];
+            let path = fixture.file("utf16-leading-null.log", &ambiguous);
+            let error = super::super::expand_encoding(&path).unwrap_err();
+            assert!(error.contains("UTF-16LE com NUL inicial"));
+            assert_eq!(std::fs::read(path).unwrap(), ambiguous);
+            assert!(!root().exists());
+            // The same path can be corrected and retried without a stale output.
+            let text = "Falha de autenticação\r\n";
+            let utf16: Vec<u8> = [0xff, 0xfe].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+            let path = fixture.file("events.log", &utf16);
+            let converted = super::super::expand_encoding(&path).unwrap().unwrap();
+            assert_eq!(std::fs::read_to_string(converted).unwrap(), text);
+            assert_eq!(std::fs::read(path).unwrap(), utf16);
+        }
+
+        #[test]
+        fn supported_encoding_signatures_keep_the_existing_detection() {
+            assert_eq!(super::super::sniff_encoding(&[0xff, 0xfe, b'A', 0]).map(|encoding| encoding.name()), Some("UTF-16LE"));
+            assert_eq!(super::super::sniff_encoding(&[0xfe, 0xff, 0, b'A']).map(|encoding| encoding.name()), Some("UTF-16BE"));
+            assert!(super::super::sniff_encoding("\u{feff}ação\n".as_bytes()).is_none());
+            assert_eq!(super::super::sniff_encoding(b"a\xe7\xe3o\n").map(|encoding| encoding.name()), Some("windows-1252"));
+            assert_eq!(super::super::unsupported_encoding_bom(&[0xff, 0xfe]), None);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn source_inputs_and_replacements_decline_non_regular_files() {
+            use std::os::unix::{ffi::OsStrExt, fs::symlink};
+            const INPUT: &str = "LOGINSIGHT_TEST_SOURCE_NONREGULAR_ROOT";
+            if let Some(path) = std::env::var_os(INPUT) {
+                let directory = PathBuf::from(path);
+                std::env::set_var("LOGINSIGHT_DATA_DIR", directory.join("data"));
+                let fifo = |path: &Path| {
+                    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                };
+                let input_path = directory.join("input.jsonl");
+                fifo(&input_path);
+                assert!(Input::open(&input_path).err().unwrap().contains("regular"));
+                assert!(super::super::expand_encoding(&input_path).unwrap_err().contains("regular"));
+                assert!(crate::sources::prepare_index(input_path.to_str().unwrap(), "jsonl", None, None).err().unwrap().contains("regular"));
+
+                let path = directory.join("source.jsonl");
+                std::fs::write(&path, b"{\"message\":\"original\"}\n").unwrap();
+                let input = Input::open(&path).unwrap();
+                let original = input.original.clone();
+                let prepared = crate::sources::prepare_index(path.to_str().unwrap(), "jsonl", None, None).unwrap();
+                let moved = directory.join("source-kept.jsonl");
+                std::fs::rename(&path, &moved).unwrap();
+                fifo(&path);
+                assert!(input.validate().unwrap_err().contains("regular"));
+                assert!(validate_original(&original).is_err());
+                assert!(prepared.validate().unwrap_err().contains("regular"));
+                assert!(crate::sources::validate_source(&prepared.part).unwrap_err().contains("regular"));
+                let link = directory.join("regular-link.jsonl");
+                symlink(&moved, &link).unwrap();
+                let index = crate::index_source_file(link.to_str().unwrap(), "jsonl", None).unwrap();
+                assert_eq!(index.lines.len(), 1, "regular symlink targets remain supported");
+                assert_eq!(std::fs::read(&moved).unwrap(), b"{\"message\":\"original\"}\n");
+
+                let id = format!("source-open-cancel-{}", uuid::Uuid::new_v4());
+                let token = crate::operations::token(Some(id.clone())).unwrap();
+                assert!(crate::operations::run_with_token(token, || {
+                    assert!(crate::operations::cancel_id(&id));
+                    assert!(Input::open(&directory.join("missing")).err().unwrap().contains("cancelada"));
+                }).is_err());
+                return;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "workspace::canonical::tests::source_inputs_and_replacements_decline_non_regular_files", "--test-threads=1"])
+                .env(INPUT, directory.path()).stdout(std::process::Stdio::null()).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); break; }
+                if Instant::now() >= deadline {
+                    let _ = child.kill(); let _ = child.wait();
+                    panic!("source open or revalidation blocked on a non-regular input");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
         fn archive_rejects_missing_or_corrupt_members_and_preserves_virtual_paths() {
             let fixture = Fixture::new();
             let archive = fixture.dir.path().join("logs.zip");
@@ -2395,10 +2496,19 @@ pub fn expand_gzip(path: &Path) -> Result<PathBuf, String> {
     })
 }
 
+fn unsupported_encoding_bom(sample: &[u8]) -> Option<&'static str> {
+    // Check the longest signatures first: UTF-32LE shares UTF-16LE's prefix.
+    // UTF-16LE followed by an initial NUL is ambiguous and is declined too.
+    if sample.starts_with(&[0xFF, 0xFE, 0, 0]) { Some("UTF-32LE") }
+    else if sample.starts_with(&[0, 0, 0xFE, 0xFF]) { Some("UTF-32BE") }
+    else { None }
+}
+
 /// Text logs written by Windows tools in UTF-16 (PowerShell, Event Viewer
 /// exports) or in a legacy code page, recognized from a sample; UTF-8 and
-/// binary files are left as they are.
+/// binary files return None. Import separately rejects unsupported BOMs.
 pub fn sniff_encoding(sample: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    if unsupported_encoding_bom(sample).is_some() { return None; }
     if sample.starts_with(&[0xFF, 0xFE]) {
         return Some(encoding_rs::UTF_16LE);
     }
@@ -2462,6 +2572,10 @@ pub fn expand_encoding(path: &Path) -> Result<Option<PathBuf>, String> {
     let input = CanonicalInput::open(path)?;
     let mut sample = Vec::new();
     input.reader()?.take(1 << 20).read_to_end(&mut sample).map_err(|e| e.to_string())?;
+    if let Some(encoding) = unsupported_encoding_bom(&sample) {
+        let ambiguity = if encoding == "UTF-32LE" { " Também pode ser UTF-16LE com NUL inicial; a leitura automática é ambígua." } else { "" };
+        return Err(format!("A assinatura do arquivo é compatível com {encoding}, que ainda não é suportado.{ambiguity} Converta uma cópia para UTF-8 ou UTF-16 e tente novamente. O arquivo original não foi alterado."));
+    }
     let Some(encoding) = sniff_encoding(&sample) else { return Ok(None) };
     let legacy = input.legacy_source().map(|(path, id)| crate::config_dir().join("expanded").join(format!(
         "{}-utf8-{}", &id[..16], path.file_name().unwrap_or_default().to_string_lossy()

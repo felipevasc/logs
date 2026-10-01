@@ -454,6 +454,25 @@ mod tests {
     }
 
     #[test]
+    fn java_shape_fingerprint_is_a_selective_word_without_long_or_hex_inflation() {
+        let trace = crate::java_stacktrace::parse(
+            "a.FirstException: private message\n\tat a.Service.run(Service.java:12)\n",
+            0,
+            Default::default(),
+        ).unwrap();
+        assert!(trace.complete);
+        let fingerprint = trace.fingerprint.unwrap();
+        assert_eq!(words(&fingerprint), [fingerprint.clone()]);
+        assert!(fingerprint.len() <= MAX_WORD);
+        assert!(!is_hex_word(&fingerprint));
+        let hex = "0000000000000000000000006585cfa1";
+        let (_directory, text) = fixture(&[fingerprint.clone(), "ordinary record".into(), hex.into()]);
+        assert_eq!(text.max_hex_word, hex.len(), "a Java fingerprint must not widen the hex shortcut domain");
+        assert_eq!(text.candidates(&fingerprint, 1), Some(vec![0]));
+        assert_eq!(text.candidates(hex, 1), Some(vec![2]));
+    }
+
+    #[test]
     fn direct_probe_preserves_unicode_markers_and_mixed_piece_completeness() {
         let hex = "0000000000000000000000006585cfa1";
         let rows: Vec<String> = ["ação concluída", "事件记录已处理", "café com açúcar", "açaí pedido",
