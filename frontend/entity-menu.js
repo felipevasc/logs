@@ -36,7 +36,13 @@ window.EntityMenu = (() => {
   function items(entity) {
     const value = String(entity.value ?? "");
     const column = entity.column || guess(value);
+    // A highlighted literal has no proven source column. Keep its editable
+    // preset as all-event text instead of turning a guessed IP into src_ip.
+    const exactColumn = entity.column && (Object.hasOwn(LABELS, entity.column) || state.columns.includes(entity.column)) ? entity.column : "_all";
+    const composer = valueFilterMenuItem(exactColumn, value, null, { op: exactColumn === "_all" ? "contains" : "equals_exact" });
+    if (exactColumn === "_all") composer.label = "Criar filtro de texto em todo o evento";
     const list = [
+      composer,
       { icon: "fa-filter", label: "Filtrar por este valor", onClick: () => window.Workspace.applyFilters(filtersFor(column, value)) },
       { icon: "fa-filter-circle-xmark", label: "Ocultar este valor", onClick: () => window.Workspace.applyFilters([{ column: column || "_all", op: column ? "not_equals_exact" : "query", value: column ? value : `-"${value.replace(/"/g, '\\"')}"` }]) },
       { icon: "fa-timeline", label: "Ver na linha do tempo", onClick: () => window.Workspace.applyFilters(filtersFor(column, value), false, "timeline") },

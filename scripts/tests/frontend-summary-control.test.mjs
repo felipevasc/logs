@@ -6,13 +6,13 @@ const core = readFileSync(new URL('../../frontend/performance-core.js', import.m
 const code = app.slice(app.indexOf('const explorerAnalytics ='), app.indexOf('\nfunction scheduleRefresh()'));
 const tick = () => new Promise(resolve => setTimeout(resolve, 10));
 function setup({ knownTotal = null, rejectCancelled = true } = {}) {
-  const nodes = new Map(), calls = [], pending = [], cancelled = [];
+  const nodes = new Map(), calls = [], pending = [], cancelled = [], bars = [];
   const node = id => {
-    if (!nodes.has(id)) nodes.set(id, { attrs: {}, children: [], hidden: false, textContent: '', setAttribute(k,v) { this.attrs[k]=v; }, getAttribute(k) { return this.attrs[k]; }, replaceChildren(...children) { this.children = children; }, append(child) { this.children.push(child); }, before() {} });
+    if (!nodes.has(id)) { const classes = new Set(); nodes.set(id, { classList: { add: c => classes.add(c), contains: c => classes.has(c), toggle(c,on) { if (on) classes.add(c); else classes.delete(c); } }, closest: () => node(".hist-panel"), attrs: {}, children: [], hidden: false, textContent: '', setAttribute(k,v) { this.attrs[k]=v; }, getAttribute(k) { return this.attrs[k]; }, replaceChildren(...children) { this.children = children; }, append(child) { this.children.push(child); }, before() {} }); }
     return nodes.get(id);
   };
   const state = { loaded: true, rows: [], total: null, currentArtifact: { id: 'source', loadedAt: 1 }, datasetRevision: 1, filters: [], derivedFields: [], sortCol: 'timestamp', sortDir: 'desc', pageSize: 100, page: 0, refreshVersion: 0, activeDatasetTab: 'table' };
-  const context = vm.createContext({ window: {}, performance, setTimeout, clearTimeout, console, state, $: node, el: (tag,cls,text) => ({ tag, className: cls, textContent: text }), document: { createTextNode: String }, chart: null,
+  const context = vm.createContext({ window: {}, performance, setTimeout, clearTimeout, console, state, $: node, el: (tag,cls,text) => ({ tag, className: cls, textContent: text }), document: { createTextNode: String, body: { dataset: { page: "explore" } } }, chart: null, setWorkbar: (...args) => bars.push(args),
     workspaceScope: () => 'dataset', activeCase: () => null, caseSig: () => '', backendFilters: () => state.filters, caseEvents: () => [], fmtNum: String,
     renderTable() {}, renderChips() {}, updateContextBar() {}, renderChart() {}, refreshTreeAggs: async () => {},
     api: async (cmd,args,opts) => {
@@ -26,7 +26,9 @@ function setup({ knownTotal = null, rejectCancelled = true } = {}) {
   context.window.Tasks = { cancelLatest(key) { cancelled.push(key); if (rejectCancelled) for (const task of pending.filter(p => p.latest === key)) task.reject(Error('Operação cancelada.')); } };
   context.window.Workspace = { onRefresh() {}, onCountChanged() {} };
   vm.runInContext(code, context);
-  return { context, state, calls, pending, node, cancelled, entry: () => context.loadExplorerAnalytics(context.explorerKey(), 'dataset', state.filters) };
+  vm.runInContext(app.slice(app.indexOf("function updateContextBar()"),app.indexOf("const esc =")),context);
+  vm.runInContext(app.match(/function currentCountLabel\([^\n]+/)[0],context);
+  return { context, state, calls, pending, node, cancelled, bars, entry: () => context.loadExplorerAnalytics(context.explorerKey(), 'dataset', state.filters) };
 }
 
 // Pause keeps visible rows; resume repeats only the unfinished stage.
@@ -82,3 +84,42 @@ function setup({ knownTotal = null, rejectCancelled = true } = {}) {
   assert.equal(f.entry().status, 'done'); assert.equal(f.state.rows.length, 1);
 }
 console.log('Summary pause/resume, exact-total reuse, stale generations and failure recovery passed');
+
+// Every surface reflects the same current summary state, and blank charts collapse.
+{
+  const f = setup(); await f.context.refresh(); await tick(); const entry = f.entry();
+  entry.pause(); await tick();
+  assert.match(f.node('#context-summary').textContent, /pausado/);
+  assert.match(f.context.currentCountLabel('eventos'), /pausado/);
+  assert.equal(f.bars.at(-1)[0], 'Resumo pausado');
+  assert.equal(f.bars.at(-1)[4], 'paused');
+  assert.match(f.node('#chart').children[0].textContent, /Histograma pausado/);
+  assert.equal(f.node('.hist-panel').classList.contains('analytics-placeholder'), true);
+  entry.status = 'queued'; f.context.showExplorerAnalytics(entry);
+  assert.match(f.node('#context-summary').textContent, /aguardando cálculo/);
+  assert.equal(f.bars.at(-1)[0], 'Resumo na fila');
+  entry.status = 'failed'; entry.error = 'Spill budget'; f.context.showExplorerAnalytics(entry);
+  assert.match(f.node('#context-summary').textContent, /não concluído/);
+  assert.match(f.node('#chart').children[0].textContent, /não concluído/);
+  assert.equal(f.bars.at(-1)[0], 'Resumo não concluído');
+  const barsBefore = f.bars.length;
+  for (const owner of [{loadOverlay:true},{activeOperation:{kind:'load'}},{progressOperationId:'another-task'}]) {
+    Object.assign(f.state,{loadOverlay:false,activeOperation:null,progressOperationId:null},owner);
+    f.context.showExplorerAnalytics(entry);
+  }
+  assert.equal(f.bars.length,barsBefore,'summary state never overwrites another operation or import overlay');
+  const chart = {destroy(){throw Error('A completed current histogram must remain visible');}};
+  f.context.chart=chart;entry.stats={buckets:[[1,2]]};entry.status='paused';
+  const contents=f.node('#chart').children;f.context.showExplorerAnalytics(entry);
+  assert.equal(f.context.chart,chart);assert.equal(f.node('#chart').children,contents);
+}
+// Facet failure is not promoted to a completed summary merely because rows/counts succeeded.
+{
+  const f=setup();f.context.refreshTreeAggs=async()=>{f.state.treeAggError={dataset:'Grouping payload limit'};};
+  await f.context.refresh();await tick();f.pending.at(-1).resolve(12);await tick();
+  f.pending.at(-1).resolve({buckets:[],levels:[]});await f.entry().promise;
+  assert.equal(f.entry().status,'failed');assert.match(f.entry().error,/payload limit/);
+  assert.equal(f.state.total,12);assert.equal(f.context.currentCountLabel('eventos'),'12 eventos','valid completed counts are preserved');
+  assert.equal(f.bars.at(-1)[0],'Resumo não concluído');
+}
+console.log('Header, pager, footer and compact histogram use honest queued/paused/failed summary states');

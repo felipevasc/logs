@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static UPDATE_PAUSED: AtomicBool = AtomicBool::new(false);
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
+static INTERACTIVE: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static START: Cell<Option<u64>> = const { Cell::new(None) };
     static LOCAL: RefCell<Option<Arc<Local>>> = const { RefCell::new(None) };
@@ -135,6 +136,19 @@ impl Cancellation {
     }
     pub(crate) fn with_stop(mut self, stop: Arc<AtomicBool>) -> Self { self.child_stops.push(stop); self }
 }
+
+/// Foreground page/detail work can ask optional preparation to yield. Unlike
+/// the update barrier, short status polls and unrelated operations do not
+/// count as interaction and cannot starve a background accelerator forever.
+pub(crate) struct Interaction;
+impl Drop for Interaction {
+    fn drop(&mut self) { INTERACTIVE.fetch_sub(1, Ordering::Release); }
+}
+pub(crate) fn interactive() -> Interaction {
+    INTERACTIVE.fetch_add(1, Ordering::AcqRel);
+    Interaction
+}
+pub(crate) fn interactive_active() -> bool { INTERACTIVE.load(Ordering::Acquire) != 0 }
 
 /// The updater owns this reversible admission barrier until the installer
 /// takes over. Failure/timeout drops it and leaves the source usable.
@@ -310,6 +324,19 @@ pub fn run<T>(generation: u64, f: impl FnOnce() -> T) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interaction_priority_is_nested_scoped_and_unwind_safe() {
+        assert!(!interactive_active());
+        let foreground = interactive();
+        assert!(interactive_active());
+        { let nested = interactive(); drop(nested); }
+        assert!(interactive_active(), "nested completion must not clear outer work");
+        drop(foreground);
+        assert!(!interactive_active());
+        let _ = std::panic::catch_unwind(|| { let _foreground = interactive(); panic!("controlled interaction panic"); });
+        assert!(!interactive_active());
+    }
+
     #[test]
     fn update_pause_cancels_queued_work_blocks_new_admission_and_recovers() {
         let queued = token(Some(format!("update-queued-{}", uuid::Uuid::new_v4()))).unwrap();

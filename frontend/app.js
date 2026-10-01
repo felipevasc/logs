@@ -152,11 +152,13 @@ const el = (tag, cls, text) => {
   return e;
 };
 
-function setWorkbar(label, detail = "", progress = null, cancellable = false) {
+function setWorkbar(label, detail = "", progress = null, cancellable = false, summaryState = null) {
   const bar = $("#workbar");
   const progressEl = $("#workbar-progress");
   const fill = $("#workbar-progress-fill");
   const active = progress !== null || cancellable || !!state.activeOperation;
+  bar.dataset.summaryState = summaryState || "";
+  $("#workbar-idle-icon").className = `fas ${summaryState === "paused" ? "fa-circle-pause" : summaryState === "failed" ? "fa-triangle-exclamation" : summaryState && summaryState !== "done" ? "fa-clock" : "fa-circle-check"}`;
   bar.classList.toggle("active", active);
   $("#workbar-idle-icon").hidden = active;
   $("#workbar-spin").hidden = !active;
@@ -535,7 +537,7 @@ function updateContextBar() {
       : "Crie ou selecione um Caso para começar.";
     return;
   }
-  const bits = [state.total == null ? "Total do recorte em cálculo" : fmtNum(state.total) + " eventos"];
+  const bits = [state.total == null ? `Total do recorte ${pendingCountStatus()}` : fmtNum(state.total) + " eventos"];
   if (state.dataPeriod?.min != null && state.dataPeriod?.max != null) {
     bits.push(`${fmtTs(state.dataPeriod.min)} — ${fmtTs(state.dataPeriod.max)}`);
   }
@@ -692,7 +694,7 @@ function fmtNum(n) {
   return Number(n).toLocaleString("pt-BR");
 }
 
-function currentCountLabel(noun = "registros") { return state.total == null ? `Total de ${noun} em cálculo` : `${fmtNum(state.total)} ${noun}`; }
+function currentCountLabel(noun = "registros") { return state.total == null ? `Total de ${noun} ${pendingCountStatus()}` : `${fmtNum(state.total)} ${noun}`; }
 
 function countLabel(value, singular, plural = `${singular}s`) {
   return `${fmtNum(value)} ${Number(value) === 1 ? singular : plural}`;
@@ -1993,10 +1995,25 @@ function toggleFacet(column, value) {
 }
 
 let currentEditFilterIndex = null;
+let currentEditFilter = null, currentEditFilterValue = null, currentFilterContext = null, filterReturnFocus = null, filterComposing = false;
+function filterContextKey() {
+  return JSON.stringify([workspaceScope(), activeCase()?.id, state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields]);
+}
+function closeFilterPop(restoreFocus = true) {
+  $("#filter-pop").hidden = true; filterComposing = false;
+  currentEditFilterIndex = null; currentEditFilter = null; currentEditFilterValue = null; currentFilterContext = null;
+  if (restoreFocus) (filterReturnFocus?.isConnected ? filterReturnFocus : $("#btn-add-filter"))?.focus?.({ preventScroll: true });
+  filterReturnFocus = null;
+}
 
 // popover de novo filtro ou edição
 function openFilterPop(anchor = null, editIndex = null, preset = null) {
-  currentEditFilterIndex = editIndex;
+  currentEditFilterIndex = editIndex; filterComposing = false;
+  currentEditFilter = editIndex == null ? null : state.filters[editIndex];
+  currentEditFilterValue = currentEditFilter ? JSON.stringify(currentEditFilter) : null;
+  currentFilterContext = filterContextKey();
+  const origin = anchor?.matches?.("button,input,select,textarea,[tabindex],a[href]") ? anchor : document.activeElement;
+  filterReturnFocus = origin?.isConnected && !origin.closest?.(".ctx-menu,#filter-pop") ? origin : $("#btn-add-filter");
   const pop = $("#filter-pop");
   const colSel = $("#fp-col");
   const opSel = $("#fp-op");
@@ -2034,6 +2051,21 @@ function openValueFilter(column, value, anchor = null, op = null) {
   openFilterPop(anchor, null, { column, op: selectedOp, value: empty ? "" : String(value), value2: selectedOp === "between" ? String(value) : null });
 }
 
+
+// All value menus open the same editable composer; opening never applies a filter.
+function valueFilterMenuItem(column, value, anchor = null, { scope = workspaceScope(), op = null } = {}) {
+  return {
+    icon: "fa-filter", label: `Criar filtro: ${colLabel(column)}`,
+    onClick: async () => {
+      try {
+        if (scope !== workspaceScope()) await window.WorkspaceContext?.setScope(scope, { page: "explore", tab: "table" });
+        if (scope !== workspaceScope()) return;
+        openValueFilter(column, value, anchor?.isConnected ? anchor : null, op);
+      } catch (error) { toast(`Não foi possível abrir o filtro: ${error}`, "err"); }
+    },
+  };
+}
+
 function commitQuickSearch() {
   const input = $("#quick-search"), value = input.value.trim();
   if (!value) return false;
@@ -2042,16 +2074,24 @@ function commitQuickSearch() {
   if (problem) { input.focus(); return false; }
   // Existing saved quick searches remain effective. Pressing Add on that
   // same legacy expression converts it into an editable chip without doubling it.
-  if (state.quick.trim() === value) state.quick = "";
+  const normalizedLegacy = state.quick.trim() === value;
+  if (normalizedLegacy) state.quick = "";
   const duplicate = state.filters.some(filter => filter.column === "_all" && filter.op === "query" && filter.value.trim() === value);
   input.value = ""; $("#btn-add-search").disabled = true;
   window.QueryBar?.clearDraft?.();
   if (!duplicate) addFilter({ column: "_all", op: "query", value, value2: null });
+  else if (normalizedLegacy) { state.page = 0; filtersChanged(); }
   else renderChips();
   return true;
 }
 
 function applyFilterPop() {
+  if ($("#filter-pop").hidden || filterComposing) return false;
+  const index = currentEditFilterIndex == null ? null : state.filters.indexOf(currentEditFilter);
+  if (currentFilterContext !== filterContextKey() || index != null && (index < 0 || JSON.stringify(currentEditFilter) !== currentEditFilterValue)) {
+    toast("A fonte, a área ou o filtro mudou. Seu rascunho foi mantido; copie o valor e reabra o filtro na seleção atual.", "info");
+    return false;
+  }
   const column = $("#fp-col").value;
   const op = $("#fp-op").value;
   const value = $("#fp-val").value;
@@ -2064,8 +2104,8 @@ function applyFilterPop() {
     const problem = window.QueryLang?.validate(value);
     if (problem) { toast(problem, "info"); return; }
   }
-  if (currentEditFilterIndex != null && state.filters[currentEditFilterIndex]) {
-    state.filters[currentEditFilterIndex] = { column, op, value, value2: value2 || null };
+  if (index != null) {
+    state.filters[index] = { column, op, value, value2: value2 || null };
     currentEditFilterIndex = null;
     state.page = 0;
     filtersChanged();
@@ -2073,7 +2113,8 @@ function applyFilterPop() {
   } else {
     addFilter({ column, op, value, value2: value2 || null });
   }
-  $("#filter-pop").hidden = true;
+  closeFilterPop();
+  return true;
 }
 
 function positionPop(pop, anchor) {
@@ -2139,15 +2180,39 @@ function updatePager(qr = state.pageResult || { rows: state.rows, total: state.t
   $("#pg-next").disabled = known ? page >= pages - 1 : !qr.hasMore;
   const from = qr.rows.length ? page * state.pageSize + 1 : 0, to = page * state.pageSize + qr.rows.length;
   const summary = explorerAnalytics.get(explorerKey());
-  const pendingTotal = summary?.status === "paused" ? " · total pausado" : summary?.status === "failed" ? " · total não concluído" : " · total em cálculo";
+  const pendingTotal = ` · total ${pendingCountStatus(summary)}`;
   $("#result-count").textContent = state.loaded ? `${fmtNum(from)}–${fmtNum(to)}${known ? ` de ${fmtNum(qr.total)}` : pendingTotal}` : "";
+}
+function pendingCountStatus(entry = explorerAnalytics.get(explorerKey())) {
+  if (entry?.status === "paused") return "pausado";
+  if (entry?.status === "failed") return "não concluído";
+  if (["count", "stats", "facets"].includes(entry?.status)) return "em cálculo";
+  return "aguardando cálculo";
+}
+function showAnalyticsHistogram(entry) {
+  const box = $("#chart"), panel = box.closest?.(".hist-panel");
+  if (!panel || entry?.stats) return; // Keep a valid histogram if only facets are paused.
+  if (chart) { chart.destroy(); chart = null; }
+  panel.hidden = !state.loaded;
+  panel.classList.add("analytics-placeholder");
+  const label = entry?.status === "paused" ? "Histograma pausado. Os registros continuam disponíveis."
+    : entry?.status === "failed" ? "Histograma não concluído. Retome o resumo para tentar novamente."
+    : entry?.status === "stats" ? "Calculando histograma…" : "Histograma aguardando o resumo.";
+  const hint = el("p", "analytics-placeholder-text", label);
+  hint.setAttribute?.("role", "status"); box.replaceChildren(hint);
 }
 function showExplorerAnalytics(entry) {
   let note = $("#query-analytics-status");
   if (!note) { note = el("div", "query-analytics-status muted small"); note.id = "query-analytics-status"; note.setAttribute("role", "status"); $("#events-table").before(note); }
   note.hidden = !entry || entry.status === "done";
+  const labels = { queued: "Resumo na fila", count: "Calculando total exato", stats: "Calculando histograma", facets: "Atualizando campos", paused: "Resumo pausado", failed: "Resumo não concluído", done: "Resumo do recorte atualizado" };
+  showAnalyticsHistogram(entry);
+  updateContextBar(); window.Workspace?.onAnalyticsStateChanged?.();
+  // Never replace another operation's progress or the source-save overlay.
+  if (document.body?.dataset?.page === "explore" && !state.loadOverlay && !state.activeOperation && !state.progressOperationId) {
+    setWorkbar(labels[entry?.status] || "Resumo aguardando cálculo", entry?.error || "Os registros continuam disponíveis", null, false, entry?.status || "queued");
+  }
   if (note.hidden) return;
-  const labels = { queued: "Resumo na fila", count: "Calculando total exato", stats: "Calculando histograma", facets: "Atualizando campos", paused: "Resumo pausado", failed: "Resumo não concluído" };
   note.replaceChildren(document.createTextNode(`${labels[entry.status] || "Preparando resumo"}${entry.error ? `: ${entry.error}` : ""} · os registros continuam disponíveis`));
   const paused = entry.status === "paused" || entry.status === "failed";
   const button = el("button", "btn ghost small", paused ? "Retomar resumo" : "Pausar resumo");
@@ -2207,6 +2272,7 @@ function loadExplorerAnalytics(key, scope, filters, knownTotal = null) {
         if (entry.stats.buckets?.length) state.dataPeriod = { min: entry.stats.buckets[0][0], max: entry.stats.buckets.at(-1)[0] + (entry.stats.bucketMs ?? entry.stats.bucket_ms ?? 0) };
         entry.status = "facets"; render();
         await refreshTreeAggs(scope);
+        if (active() && state.treeAggError?.[scope]) throw new Error(state.treeAggError[scope]);
         if (active()) { entry.status = "done"; render(); }
       } catch (error) {
         if (!active()) return;
@@ -4589,6 +4655,17 @@ function sendVisibleToCase() {
 }
 
 // ------------------------------------------------------------------ tabela
+// Bound rendered text only. Event values remain complete for filters, copy,
+// details, export and Case evidence. JavaScript length is UTF-16 code units.
+function tableValuePreview(value, limit = 4096) {
+  const text = String(value ?? ""), marker = "… [prévia]";
+  if (text.length <= limit) return { text, marker: "", truncated: false };
+  let end = Math.max(0, limit - marker.length);
+  // Do not cut a valid surrogate pair in half.
+  if (end > 0 && /[\uD800-\uDBFF]/.test(text[end - 1]) && /[\uDC00-\uDFFF]/.test(text[end])) end--;
+  return { text: text.slice(0, end), marker, truncated: true };
+}
+
 function buildEventRow(ev, columns = state.visibleCols) {
   const quick = state.quick.trim();
   const quickRe = quick && (!window.QueryLang || window.QueryLang.isPlain(quick)) ? new RegExp(`(${escRe(esc(quick))})`, "gi") : null;
@@ -4618,33 +4695,40 @@ function buildEventRow(ev, columns = state.visibleCols) {
     const td = el("td"); td.dataset.column = col;
     const originalValue = col === "level" ? ev.level : cellValue(ev, col);
     const displayValue = window.EvidenceUI?.redact({ [col]: originalValue })[col] ?? originalValue;
+    const preview = tableValuePreview(displayValue), displayText = preview.text;
     if (col === "level") {
       const wrap = el("span", "lv-cell");
       const dot = el("span", "lv-dot");
       dot.style.background = levelColor(ev.level);
       dot.style.color = levelColor(ev.level);
       if (ev.level === "Crítico") dot.classList.add("pulse");
-      wrap.append(dot, el("span", "", ev.level));
+      wrap.append(dot, el("span", "", displayText));
       td.appendChild(wrap);
     } else if (col === "timestamp") {
       td.className = "t-mono t-ts";
-      td.textContent = displayValue;
+      td.textContent = displayText;
     } else if (col === "code") {
       td.className = "t-code";
-      td.textContent = displayValue;
+      td.textContent = displayText;
     } else if (col === "name") {
       td.className = "t-name";
-      td.textContent = displayValue;
+      td.textContent = displayText;
     } else if (col === "message") {
       td.className = "t-msg";
-      const pivots = !quickRe && window.EntityMenu?.highlight(displayValue);
-      if (quickRe) td.innerHTML = esc(displayValue).replace(quickRe, "<mark>$1</mark>");
+      // A clipped final token is not a complete IP/hash/URL to pivot on.
+      const pivots = !quickRe && !preview.truncated && window.EntityMenu?.highlight(displayText);
+      if (quickRe) td.innerHTML = esc(displayText).replace(quickRe, "<mark>$1</mark>");
       else if (pivots) td.innerHTML = pivots;
-      else td.textContent = displayValue;
+      else td.textContent = displayText;
     } else {
-      td.textContent = displayValue;
+      td.textContent = displayText;
     }
-    td.title = displayValue;
+    if (preview.truncated) {
+      td.dataset.previewTruncated = "true";
+      td.appendChild(el("span", "muted", preview.marker));
+      const hint = tableValuePreview(displayText, 256);
+      td.title = `${hint.text}${hint.marker}\nPrévia de texto limitada. Clique para ver os detalhes; use o botão direito para copiar ou filtrar o valor completo.`;
+    } else td.title = displayText;
     td.oncontextmenu = (e) => {
       e.preventDefault();
       if (!state.selectedEventRows?.has(ev.id)) {
@@ -4793,7 +4877,7 @@ function renderChart(stats) {
   const box = $("#chart");
   const panel = box.closest(".hist-panel");
   panel.hidden = !state.loaded;
-
+  panel.classList.toggle("analytics-placeholder", !stats.buckets?.length);
 
   if (!stats.buckets || stats.buckets.length === 0) {
     if (chart) { chart.destroy(); chart = null; }
@@ -5056,6 +5140,7 @@ function showDetailNameMenu(event, node) {
   const column = state.columns.includes(node.path) ? node.path : null;
   const items = [];
   if (column) {
+    items.push(valueFilterMenuItem(column, node.hasValue ? detailFieldFilterValue(node) : "", event.target, { op: node.hasValue ? null : "contains" }));
     if (column !== "timestamp") items.push({
       icon: state.visibleCols.includes(column) ? "fa-eye-slash" : "fa-table-columns",
       label: state.visibleCols.includes(column) ? "Remover coluna da tabela" : "Adicionar coluna à tabela",
@@ -5360,6 +5445,7 @@ async function runGroup() {
     tr2.oncontextmenu = (e) => {
       e.preventDefault();
       showCtxMenu(e.clientX, e.clientY, [
+        valueFilterMenuItem(state.groupCol, key, tr2, { op: key == null || key === "(vazio)" ? "empty" : "equals" }),
         { icon: "fa-filter", label: `Filtrar: ${colLabel(state.groupCol)} = ${trunc(key)}`, onClick: () => drillDown(key) },
         {
           icon: "fa-filter-circle-xmark",
@@ -5926,6 +6012,8 @@ function bindKeyboard() {
       e.preventDefault();
       $("#quick-search").focus();
     } else if (e.key === "Escape") {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (!$("#filter-pop").hidden) { e.preventDefault(); closeFilterPop(); return; }
       if (!$("#detail-value-modal").hidden) {
         closeDetailValue();
         return;
@@ -6013,11 +6101,19 @@ function bind() {
 
   $("#btn-add-filter").onclick = (e) => {
     e.stopPropagation();
-    $("#filter-pop").hidden ? openFilterPop() : ($("#filter-pop").hidden = true);
+    $("#filter-pop").hidden ? openFilterPop() : closeFilterPop();
   };
   $("#fp-apply").onclick = applyFilterPop;
-  $("#fp-cancel").onclick = () => { $("#filter-pop").hidden = true; };
-  $("#fp-val").addEventListener("keydown", (e) => { if (e.key === "Enter") applyFilterPop(); });
+  $("#fp-cancel").onclick = () => closeFilterPop();
+  $("#filter-pop").addEventListener("compositionstart", () => { filterComposing = true; });
+  $("#filter-pop").addEventListener("compositionend", () => { filterComposing = false; });
+  $("#filter-pop").addEventListener("keydown", e => {
+    if (e.isComposing || filterComposing || e.keyCode === 229) return;
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeFilterPop(); return; }
+    if (e.key === "Enter" && [$("#fp-val"), $("#fp-val2")].includes(e.target)) {
+      e.preventDefault(); e.stopPropagation(); if (!e.repeat) applyFilterPop();
+    }
+  });
   $("#np-ok").onclick = commitNamePop;
   $("#np-cancel").onclick = () => { $("#name-pop").hidden = true; namePopCb = null; };
   $("#np-val").addEventListener("keydown", (e) => { if (e.key === "Enter") commitNamePop(); });
@@ -6027,8 +6123,8 @@ function bind() {
     $("#col-pop").hidden ? openColPop() : ($("#col-pop").hidden = true);
   };
   document.addEventListener("click", (e) => {
-    if (!$("#filter-pop").hidden && !e.target.closest("#filter-pop") && !e.target.closest("#btn-add-filter"))
-      $("#filter-pop").hidden = true;
+    if (!$("#filter-pop").hidden && !e.target.closest("#filter-pop") && !e.target.closest("#btn-add-filter") && !e.target.closest(".ctx-menu"))
+      closeFilterPop(false);
     if (!$("#col-pop").hidden && !e.target.closest("#col-pop") && !e.target.closest("#btn-colpicker"))
       $("#col-pop").hidden = true;
     // .ctx-menu isento: o item que abriu o popover não pode fechá-lo no mesmo clique
@@ -6647,6 +6743,7 @@ function showChartValueActions(event, spec, value, scope) {
   event.preventDefault();
   const filter = { column: spec.field, op: value == null ? "empty" : "equals_exact", value: value == null ? "" : String(value), value2: null };
   const items = [
+    valueFilterMenuItem(spec.field, value, event.currentTarget || event.target, { scope, op: filter.op }),
     { icon: "fa-filter", label: `Filtrar: ${colLabel(spec.field)} = ${trunc(value ?? "(vazio)")}`, onClick: () => window.Discovery.applySelection([filter], scope) },
     { icon: "fa-table-list", label: "Abrir eventos correspondentes", onClick: () => window.Discovery.applySelection([filter], scope, true) },
     { icon: "fa-circle-info", label: "Inspecionar campo", onClick: () => showFieldInspector(spec.field) },
@@ -7161,6 +7258,7 @@ function showCubeFieldActions(event, field) {
   event.preventDefault();
   event.stopPropagation();
   showCtxMenu(event.clientX, event.clientY, [
+    valueFilterMenuItem(field, "", event.currentTarget || event.target, { op: "contains" }),
     { icon: "fa-arrow-down", label: "Adicionar a Linhas", onClick: () => cubeAdd("rows", field) },
     { icon: "fa-arrow-right", label: "Adicionar a Colunas", onClick: () => cubeAdd("cols", field) },
     { icon: "fa-sigma", label: "Adicionar a Valores", onClick: () => cubeAdd("values", field) },

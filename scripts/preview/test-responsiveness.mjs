@@ -53,6 +53,10 @@ try {
   await page.waitForFunction(()=>document.querySelector('#result-count').textContent.includes('total pausado'));
   assert.ok(await page.locator('#events-table tbody tr').count()>0,'paused summary keeps visible rows');
   assert.equal(await page.locator('#pg-next').isDisabled(),false,'paused summary keeps paging available');
+  assert.match(await page.locator('#context-summary').innerText(),/pausado/);
+  assert.doesNotMatch(await page.locator('#workbar-label').innerText(),/atualizado/i);
+  assert.match(await page.locator('#chart').innerText(),/Histograma pausado/);
+  assert.ok((await page.locator('.hist-panel').boundingBox()).height<80,'paused empty histogram uses a compact honest placeholder');
   await page.screenshot({path:'output/playwright/summary-paused.png',fullPage:true});
   await page.evaluate(()=>{window.__mockLatency={count_filtered:50,stats_events:50};});
   await page.locator('#query-analytics-status button').filter({hasText:'Retomar resumo'}).click();
@@ -73,8 +77,9 @@ try {
   assert.equal(await page.locator('#fp-op').inputValue(),'between');
   assert.ok(Number.isFinite(Number(await page.locator('#fp-val').inputValue())));
   for(const operator of ['contains','equals','gt','gte','lt','lte','between','regex','cidr']) assert.ok(await page.locator(`#fp-op option[value="${operator}"]`).count(),operator);
-  await page.locator('#fp-op').selectOption('gte');
-  await page.locator('#fp-cancel').click();
+  await page.locator('#fp-val2').press('Escape');
+  assert.equal(await page.locator('#filter-pop').isVisible(),false);
+  assert.equal(await page.evaluate(()=>document.activeElement.id),'btn-add-filter');
   assert.equal(await page.evaluate(()=>state.filters.length),beforeFilters+1,'cancelled composer never applies its draft');
   const failedImport=await page.evaluate(async()=>{
     window.__mockLatency={};
@@ -86,6 +91,25 @@ try {
   });
   assert.equal(failedImport.result,false);assert.equal(failedImport.loaded,true);assert.equal(failedImport.unconfirmed,false);
   assert.equal(failedImport.before.id,failedImport.after.id);assert.ok(failedImport.after.rows>0,'failed import preserves queryable old source');
+  const preview = await page.evaluate(() => {
+    const original = state.rows[0], value = '<long-request>'.repeat(80000);
+    const event = { ...original, message: value };
+    const cell = buildEventRow(event, ['message']).children[0];
+    return { length: cell.textContent.length, titleLength: cell.title.length, truncated: cell.dataset.previewTruncated, fullValue: event.message === value, originalUnchanged: state.rows[0] === original };
+  });
+  assert.ok(preview.length <= 4096); assert.ok(preview.titleLength < 500);
+  assert.equal(preview.truncated, 'true'); assert.equal(preview.fullValue, true); assert.equal(preview.originalUnchanged, true);
+  const chartDraft = await page.evaluate(() => {
+    const value = state.rows[0].source;
+    showChartValueActions({ preventDefault() {}, clientX: 300, clientY: 200, target: document.querySelector('#events-table') }, { chart: 'terms', field: 'source' }, value, workspaceScope());
+    return { value, filters: JSON.stringify(state.filters) };
+  });
+  await page.getByText('Criar filtro: Origem', { exact: true }).click();
+  assert.equal(await page.locator('#fp-val').inputValue(), chartDraft.value);
+  assert.equal(await page.locator('#fp-op').inputValue(), 'equals_exact');
+  await page.locator('#fp-op').selectOption('not_contains');
+  await page.locator('#fp-cancel').click();
+  assert.equal(await page.evaluate(() => JSON.stringify(state.filters)), chartDraft.filters, 'chart composer cancellation preserves active filters');
   // A draft belongs to its workspace and must never become an applied filter.
   await page.evaluate(async () => { await Workspace.showPage('explore'); await loadExplorerAnalytics(explorerKey(), workspaceScope(), backendFilters()).promise; });
   await page.waitForFunction(() => Tasks.pending() === 0);

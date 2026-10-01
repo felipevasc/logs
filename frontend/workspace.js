@@ -619,6 +619,7 @@
       markPage(which === "viz" || which === "trail" ? "explore" : which === "source" ? "sources" : which === "caso" && ["timeline", "vtimeline", "timeline-table"].includes(state.analysisView) ? "case-timeline" : "evidence");
     },
     onCountChanged: updateCounts,
+    onAnalyticsStateChanged: updateCounts,
     onRefresh() {
       rememberSelection();
       lastExploredKey = sourceKey();

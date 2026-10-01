@@ -123,3 +123,11 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 .page-tabs button:hover { background:var(--hover); color:var(--text-0); }
 .page-tabs button.selected { background:var(--accent-soft); color:var(--accent); font-weight:600; }
 #btn-back-drive { display:none!important; }
+
+/* Pending analytics should not leave an empty chart-sized gap above usable rows. */
+.hist-panel.analytics-placeholder{height:auto;min-height:32px;padding-bottom:8px}
+.hist-panel.analytics-placeholder .chart{min-height:0;cursor:default}
+.analytics-placeholder-text{margin:0;padding:4px 0;font-size:12px;color:var(--text-2)}
+.hist-panel.analytics-placeholder .hint-empty{padding-top:4px;padding-bottom:4px}
+.workbar[data-summary-state]:not([data-summary-state=""]):not([data-summary-state="done"]) #workbar-idle-icon{color:var(--text-2)}
+.workbar[data-summary-state="failed"] #workbar-idle-icon{color:var(--lv-aviso)}

@@ -9,9 +9,9 @@ const node = key => {
   return nodes.get(key);
 };
 const input=node('#quick-search');
-const applied=[],problems=[];
+const applied=[],problems=[];let refreshed=0;
 const state={filters:[],quick:'',columns:['timestamp','message','status'],page:0};
-const context=vm.createContext({state,$:node,el:(tag,cls,text)=>({tag,textContent:text}),colLabel:String,positionPop(){},toast(){},renderChips(){},filtersChanged(){},window:{QueryLang:{validate:value=>value.endsWith(':')?'Incomplete expression':null},QueryBar:{status:problem=>problems.push(problem)}},addFilter:filter=>{state.filters.push(filter);applied.push(filter);}});
+const context=vm.createContext({state,workspaceScope:()=>"dataset",activeCase:()=>null,document:{activeElement:null},$:node,el:(tag,cls,text)=>({tag,textContent:text}),colLabel:String,positionPop(){},toast(){},renderChips(){},filtersChanged(){refreshed++;},window:{QueryLang:{validate:value=>value.endsWith(':')?'Incomplete expression':null},QueryBar:{status:problem=>problems.push(problem)}},addFilter:filter=>{state.filters.push(filter);applied.push(filter);}});
 vm.runInContext(app.slice(app.indexOf('const OPS ='),app.indexOf('const OP_SYMBOL =')),context);
 vm.runInContext(app.slice(app.indexOf('let currentEditFilterIndex ='),app.indexOf('\nfunction positionPop(')),context);
 vm.runInContext(app.slice(app.indexOf('  $("#quick-search").addEventListener("input"'),app.indexOf('  $("#btn-add-filter").onclick',app.indexOf('  $("#quick-search").addEventListener("input"'))),context);
@@ -24,6 +24,8 @@ input.value='falha login';context.commitQuickSearch();assert.equal(applied.lengt
 input.value='status:';assert.equal(context.commitQuickSearch(),false);assert.equal(input.value,'status:');assert.equal(applied.length,1);
 input.value='status>=500';node('#btn-add-search').onclick();assert.equal(applied.length,2,'button applies a second chip');
 state.quick='legacy saved search';input.value=state.quick;context.commitQuickSearch();assert.equal(state.quick,'');assert.equal(applied.at(-1).value,'legacy saved search');
+state.quick='legacy saved search';state.page=7;input.value=state.quick;context.commitQuickSearch();assert.equal(state.quick,'');assert.equal(refreshed,1,'legacy normalization refreshes the changed backend selection once');assert.equal(state.page,0);assert.equal(applied.length,3,'the existing chip is reused');
+input.value='legacy saved search';context.commitQuickSearch();assert.equal(refreshed,1,'pure duplicate Add does not query again');
 
 // Enter commits once, Tab completes, composition/repeat cannot accidentally submit.
 let submits=0,accepts=0;

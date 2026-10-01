@@ -1223,6 +1223,7 @@ pub(crate) fn query_events_scope_impl(
     limit: usize,
     case_events: Option<&[Event]>,
 ) -> Result<query::QueryResult, String> {
+    let _interactive = operations::interactive();
     match case_events {
         Some(events) => Ok(query::query(
             events,
@@ -1742,6 +1743,7 @@ async fn event_detail(id: usize, app: AppHandle) -> Result<Option<Event>, String
 }
 
 pub(crate) fn event_detail_impl(state: &AppState, id: usize) -> Option<Event> {
+    let _interactive = operations::interactive();
     let mut event = event_detail_raw(state, id)?;
     entities::annotate(&mut event);
     Some(event)

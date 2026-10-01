@@ -220,6 +220,7 @@
         e.preventDefault();
         const filter=valueFilter(spec.field,value);
         showCtxMenu(e.clientX,e.clientY,[
+          valueFilterMenuItem(spec.field,value,row,{scope,op:filter.op}),
           {icon:'fa-filter',label:'Incluir este valor',onClick:()=>applySelection([filter],scope,true)},
           {icon:'fa-filter-circle-xmark',label:'Excluir este valor',onClick:()=>applySelection([{...filter,op:filter.op==='empty'?'not_empty':'not_equals_exact'}],scope,true)},
           {icon:'fa-copy',label:'Copiar valor',onClick:()=>navigator.clipboard.writeText(String(label)).catch(()=>toast('Não foi possível copiar.','err'))},

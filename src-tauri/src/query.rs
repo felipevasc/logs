@@ -1031,6 +1031,7 @@ pub fn query_page_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Result<QueryPage, String> {
+    let _interactive = crate::operations::interactive();
     if let Some(result) = crate::engine::query_page(
         &engine_source(idx, codes, system, derived), &prepare(filters),
         sort_column, sort_dir, offset, limit, cursor,

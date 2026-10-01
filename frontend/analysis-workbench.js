@@ -183,6 +183,7 @@
     for (const row of rows.slice(groupView.page * pageSize, (groupView.page + 1) * pageSize)) {
       const tr = el("tr"); const value = groupValue(row); tr.title = "Abrir os registros deste grupo"; tr.onclick = () => filterGroup(value);
       tr.oncontextmenu = event => { event.preventDefault(); showCtxMenu(event.clientX, event.clientY, [
+        valueFilterMenuItem(field, value, tr, { op: exactFilter(field, value).op }),
         { icon: "fa-filter", label: "Abrir registros do grupo", onClick: () => filterGroup(value) },
         { icon: "fa-filter-circle-xmark", label: "Excluir este grupo do recorte", onClick: () => filterGroup(value, true) },
         { icon: "fa-briefcase", label: "Adicionar grupo ao caso…", onClick: () => openNamePop(tr, name => { const filter = exactFilter(field, value); addGroupToAnalysis(field, filter.value, name, filter.op); }) },
@@ -326,7 +327,8 @@
       filtersChanged();
     };
     const label = cube.cols.length > 1 && !columnValues ? "Filtrar esta linha" : "Filtrar esta combinação";
-    const actions = [{ icon: "fa-filter", label, onClick: () => apply() }];
+    const actions = filters.map(filter => valueFilterMenuItem(filter.column, filter.value, event.currentTarget || event.target, { scope, op: filter.op }));
+    actions.push({ icon: "fa-filter", label, onClick: () => apply() });
     actions.push({ icon: "fa-table-list", label: "Abrir registros correspondentes", onClick: () => apply(true) });
     actions.push({ icon: "fa-circle-info", label: `Inspecionar ${colLabel(filters[filters.length - 1].column)}`, onClick: () => showFieldInspector(filters[filters.length - 1].column) });
     showCtxMenu(event.clientX, event.clientY, actions);
