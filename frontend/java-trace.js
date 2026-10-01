@@ -73,10 +73,22 @@ window.JavaTrace = (() => {
     const legacy = typeof event.fields.exception === "string" && event.fields.exception.length > 0
       || Array.isArray(event.fields.stacktrace) && event.fields.stacktrace.length > 0;
     if (!marked && !legacy) return null;
+    return renderStructure({ fields: event.fields, marked, source: event, hasRaw: typeof event.raw === "string" && event.raw.length > 0,
+      hasOriginalStacktrace: Object.hasOwn(event.fields, "stacktrace") }, options);
+  }
+  function renderPreserved(detail, options = {}) {
+    if (detail?.kind !== "preserved_member_detail" || detail.javaTraceAvailable !== true || !Array.isArray(detail.fields)) return null;
+    // Display metadata is not an Event and never supplies analytical values.
+    // Only actual complete native string fields receive a scalar action.
+    const fields = Object.fromEntries(detail.fields.filter(field => field.type === "string" && field.complete === true
+      && SCALARS.some(([column]) => column === field.column)).map(field => [field.column, field.text]));
+    return renderStructure({ fields, marked: false, source: detail.member, hasRaw: detail.raw?.text?.length > 0,
+      hasOriginalStacktrace: detail.fields.some(field => field.column === "stacktrace") }, options);
+  }
+  function renderStructure({ fields, marked, source, hasRaw, hasOriginalStacktrace }, options) {
     let trace = null;
     const current = () => options.isCurrent?.() !== false;
-    const hasRaw = typeof event.raw === "string" && event.raw.length > 0;
-    const raw = () => { if (current() && hasRaw) options.raw?.(event); };
+    const raw = () => { if (current() && hasRaw) options.raw?.(source); };
     const button = (label, action, className = "") => {
       const node = element("button", `btn ghost small ${className}`.trim(), label); node.type = "button";
       node.onclick = event => { event?.stopPropagation(); if (current()) return action(); };
@@ -87,7 +99,7 @@ window.JavaTrace = (() => {
       node.disabled = !hasRaw; return node;
     };
     function originalButton(container) {
-      if (!Object.hasOwn(event.fields, "stacktrace") || !options.original) return;
+      if (!hasOriginalStacktrace || !options.original) return;
       const original = button("Ver stacktrace original", () => options.original("stacktrace", original), "java-trace-original");
       container.append(original);
     }
@@ -109,7 +121,7 @@ window.JavaTrace = (() => {
     }
     const block = element("details", "java-trace");
     const summary = element("summary", "java-trace-summary"), summaryStatus = element("span", "java-trace-status", "Expandir estrutura observada");
-    const exceptionClass = event.fields["java.exception.class"];
+    const exceptionClass = fields["java.exception.class"];
     const title = element("strong", "", marked ? `Exceção Java${typeof exceptionClass === "string" ? ` · ${short(exceptionClass)}` : ""}` : "Interpretar stack trace");
     summary.append(title, summaryStatus);
     block.append(summary);
@@ -176,12 +188,12 @@ window.JavaTrace = (() => {
       }
       const scalars = element("div", "java-trace-scalars");
       for (const [column, label] of SCALARS) {
-        if (!Object.hasOwn(event.fields, column) || typeof event.fields[column] !== "string") continue;
+        if (!Object.hasOwn(fields, column) || typeof fields[column] !== "string") continue;
         if (!trace.complete && ["java.root_cause.class", "java.trace.fingerprint"].includes(column)) continue;
-        const line = element("div", "java-trace-scalar"), value = element("button", "java-trace-scalar-value", short(event.fields[column]));
-        value.type = "button"; value.title = display(event.fields[column]); value.dataset.column = column;
-        value.setAttribute("aria-label", `${label}: ${display(event.fields[column])}`);
-        // This is the actual literal Event.fields key, never a virtual node path.
+        const line = element("div", "java-trace-scalar"), value = element("button", "java-trace-scalar-value", short(fields[column]));
+        value.type = "button"; value.title = display(fields[column]); value.dataset.column = column;
+        value.setAttribute("aria-label", `${label}: ${display(fields[column])}`);
+        // This is an actual native literal field, never a virtual node path.
         value.oncontextmenu = domEvent => { domEvent.preventDefault(); domEvent.stopPropagation(); if (current()) options.scalarMenu?.(domEvent, column); };
         value.onclick = domEvent => { if (current()) options.scalarMenu?.(domEvent, column); };
         line.append(element("span", "java-trace-scalar-label", label), value); scalars.append(line);
@@ -241,5 +253,5 @@ window.JavaTrace = (() => {
     }
     return block;
   }
-  return { render };
+  return { render, renderPreserved };
 })();

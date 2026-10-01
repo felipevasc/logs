@@ -43,6 +43,7 @@ window.WorkspaceContext = (() => {
     return snapshot;
   }
   function capture() {
+    if (activeCase()?.kind === "preserved_case_unavailable") return defaults();
     const snapshot = { page: document.body.dataset.page || "summary", queryDraft: window.QueryBar?.captureDraft?.() || { value: $("#quick-search").value }, values: Object.fromEntries(stateKeys.map(name => [name, copy(state[name])])), tree: [...state.treeCollapsed], cubeCollapsed: [...cubeState.collapsed], density: document.body.dataset.density, wrap: document.body.dataset.wrap, sideCollapsed: document.querySelector(".shell").classList.contains("side-collapsed"), scroll: {}, discovery: window.Discovery?.capture(), workbench: window.WorkspaceAnalysis?.capture(), explorerTimeline: window.ExplorerTimeline?.capture(), workspace: window.Workspace?.capture(), journeys: window.Journeys?.capture() };
     for (const selector of scrollSelectors) { const node = document.querySelector(selector); if (node) snapshot.scroll[selector] = [node.scrollLeft, node.scrollTop]; }
     states.set(key(), snapshot); runtime.set(key(), Object.fromEntries(runtimeKeys.map(name => [name, state[name]])));
@@ -61,11 +62,14 @@ window.WorkspaceContext = (() => {
     state.quick = String(state.quick || "");
     Object.assign(state, runtime.get(key()) || {});
     if (scope === "case") {
-      const rows = caseEvents(); state.loaded = rows.length > 0; state.columns = [...caseEventsCache.summary.columns];
+      if (window.CaseEvidence?.active === true) {
+        const summary = caseAnalysisSummary(true); state.loaded = summary.ready; state.columns = summary.columns;
+      } else { const rows = caseEvents(); state.loaded = rows.length > 0; state.columns = [...caseEventsCache.summary.columns]; }
       // Saved evidence stays intact when records are excluded. Only an exact
       // count for this analysis, evidence signature and filter is a visible total.
       state.total = explorerAnalytics.get(explorerKey())?.total ?? null;
       if (!runtime.has(key())) { state.rows = []; state.dataPeriod = null; state.facetData = null; state.explorerCache = null; state.queryError = null; }
+      if (window.CaseEvidence?.active === true && !caseAnalysisSummary(true).ready) state.queryError = caseAnalysisSummary(true).message;
     }
     state.visibleCols = state.visibleCols.filter(column => state.columns.includes(column)); if (!state.visibleCols.includes("timestamp")) state.visibleCols.unshift("timestamp");
     if (!state.groupCol) state.groupCol = "level";
@@ -92,10 +96,18 @@ window.WorkspaceContext = (() => {
   }
   function updateToggle() {
     document.documentElement.dataset.workspace = scope; document.body.dataset.workspace = scope;
-    $("#context-case-count").textContent = String(caseEvents().length || "");
+    $("#context-case-count").textContent = window.CaseEvidence?.active === true ? String(caseAnalysisSummary(true).preservedCount ?? "—") : String(caseEvents().length || "");
     window.Workspace?.syncZone?.();
   }
+  async function showUnavailable() {
+    scope = "case"; state.analyticsScope = "case"; state.activeContext = "case";
+    state.loaded = false; state.rows = []; state.total = null; state.columns = []; state.dataPeriod = null; state.facetData = null; state.explorerCache = null;
+    state.derivedFields = []; state.analysisDefinitionsPending = false; state.activeStationId = null; state.stationAnalyticsId = null;
+    detailRequest++; state.refreshVersion++; closeDrawer(); window.Tasks?.cancelStaleAnalysis?.();
+    initialized = true; updateToggle(); await window.Workspace?.showPage("evidence");
+  }
   async function setScope(next, options = {}) {
+    if (activeCase()?.kind === "preserved_case_unavailable") return showUnavailable();
     if (!["dataset", "case"].includes(next)) return;
     if (sourceBusy && !options.internal) { toast("Atualizando as fontes externas. A troca de área estará disponível em instantes.", "info"); return; }
     if (state.loadOverlay && !options.force) { toast("Aguarde a abertura dos logs para trocar de área.", "info"); return; }
@@ -111,7 +123,8 @@ window.WorkspaceContext = (() => {
     const update = () => {
       if (request !== generation) return;
       scope = next; apply(snapshot); if (options.tab) state.activeDatasetTab = options.tab; updateToggle();
-      finishOperation(scope === "case" ? "Caso" : "Análise", scope === "case" ? `${fmtNum(caseEvents().length)} registros preservados no Caso` : `${currentCountLabel("registros")} na Análise`);
+      const nativeCase = scope === "case" && window.CaseEvidence?.active === true ? caseAnalysisSummary(true) : null;
+      finishOperation(scope === "case" ? "Caso" : "Análise", nativeCase ? nativeCase.ready ? `${fmtNum(nativeCase.preservedCount)} ocorrências preservadas no Caso` : nativeCase.message : scope === "case" ? `${fmtNum(caseEvents().length)} registros preservados no Caso` : `${currentCountLabel("registros")} na Análise`);
       document.dispatchEvent(new CustomEvent("workspace-context-change", { detail: { scope, previousScope } }));
       render = Workspace.showPage(["sources", "connections", "import"].includes(page) && scope === "case" ? "summary" : page).then(async () => {
         if (request !== generation) return;
@@ -128,18 +141,19 @@ window.WorkspaceContext = (() => {
       if (animate && document.startViewTransition) { const transition = document.startViewTransition(update); await transition.updateCallbackDone; transition.finished.catch(() => {}); }
       else { update(); if (animate) { const node = [...document.querySelectorAll("#workspace-home,.shell,#view-analysis")].find(node => !node.hidden); node?.animate([{ transform: `translateY(${down ? "32%" : "-32%"})`, opacity: .3 }, { transform: "translateY(0)", opacity: 1 }], { duration: 240, easing: "cubic-bezier(.2,.7,.2,1)" }); } }
       await render;
-      if (request === generation && activeCase()) { activeCase().workspace.activeScope = scope; saveCases(); }
+      if (request === generation && activeCase() && activeCase().kind !== "preserved_case_unavailable") { activeCase().workspace.activeScope = scope; saveCases(); }
     } finally { if (request === generation) changing = false; }
   }
   async function changeCase(id) {
     if (sourceBusy) { $("#case-select").value = state.cases.active || ""; toast("Aguarde a atualização das fontes para trocar de Caso.", "info"); return; }
-    if (!restoringCase) caseReturnScope = scope;
+    if (!restoringCase && activeCase()?.kind !== "preserved_case_unavailable") caseReturnScope = scope;
     const request = ++caseGeneration, previousScope = caseReturnScope; capture(); restoringCase = true;
     try {
       if (scope === "case") await setScope("dataset", { animate: false });
       if (request !== caseGeneration) return;
       state.cases.active = id; window.AnalysisContexts?.activate(); state.activeStationId = null; state.stationAnalyticsId = null;
       renderCaseBar(); updateAnalysisBadge();
+      if (activeCase()?.kind === "preserved_case_unavailable") { await showUnavailable(); return; }
       await loadDerivedFields(); if (request !== caseGeneration) return;
       await syncActiveCaseArtifacts();
       if (request !== caseGeneration) return;
@@ -174,6 +188,7 @@ window.WorkspaceContext = (() => {
     } finally { restoringCase = false; }
   }
   async function deleteCase(c) {
+    if (c?.kind === "preserved_case_unavailable" || !state.cases.cases.includes(c)) { toast("Este Caso preservado não está disponível para excluir por esta ação.", "info"); return false; }
     if (sourceBusy) { toast("Aguarde a atualização das fontes para excluir o Caso.", "info"); return; }
     const target = state.cases.cases.find(item => item.id !== c.id)?.id;
     if (target) await changeCase(target);
@@ -182,6 +197,7 @@ window.WorkspaceContext = (() => {
     renderCaseBar(); updateAnalysisBadge(); await saveCases();
   }
   async function initialize() {
+    if (activeCase()?.kind === "preserved_case_unavailable") { await showUnavailable(); return; }
     const target = activeCase()?.workspace?.activeScope === "case" ? "case" : "dataset";
     runtime.set(key("dataset"), Object.fromEntries(runtimeKeys.map(name => [name, state[name]])));
     if (!activeCase()?.workspace?.contextStates?.dataset) capture();
@@ -199,27 +215,64 @@ window.WorkspaceContext = (() => {
     sourceQueue = job.finally(() => { sourceBusy--; });
     return sourceQueue;
   }
-  async function replaceCases(store) {
+  async function replaceCases(store, { beforeReplace } = {}) {
     await sourceQueue.catch(() => {});
+    beforeReplace?.();
     restoringCase = true; initialized = false; caseGeneration++; generation++; state.refreshVersion++; detailRequest++;
     try {
       scope = "dataset"; state.analyticsScope = "dataset"; state.activeContext = "artifact";
       state.cases = store; window.AnalysisContexts?.activate(); state.artifactSessions = new Map(); states.clear(); runtime.clear();
-      renderCaseBar(); updateAnalysisBadge(); await loadDerivedFields(); await syncActiveCaseArtifacts(); await initialize();
+      renderCaseBar(); updateAnalysisBadge();
+      if (activeCase()?.kind === "preserved_case_unavailable") { await showUnavailable(); return; }
+      await loadDerivedFields(); await syncActiveCaseArtifacts(); await initialize();
     } finally { restoringCase = false; }
+  }
+  let nativeMembership = { key: null, state: "idle", rows: new Map() }, nativeMembershipScheduled = false;
+  const nativeRowKey = row => JSON.stringify([row?.id, row?.event_ref ?? row?.eventRef]);
+  let nativeMembershipKeyMemo = null;
+  function nativeMembershipKey() {
+    const c = activeCase(), store = state.cases, summary = store.caseEvidence?.find(entry => entry.owner?.caseId === c?.id), owner = window.AnalysisContexts?.capture();
+    const inputs = [store, c, store.store?.epoch, store.store?.revision, summary?.evidenceSignature, scope, JSON.stringify(owner), state.rows, state.currentDetailEv];
+    if (!nativeMembershipKeyMemo || inputs.some((value, index) => value !== nativeMembershipKeyMemo.inputs[index]))
+      nativeMembershipKeyMemo = { inputs, key: JSON.stringify([inputs.slice(2, 7), state.rows.map(nativeRowKey), nativeRowKey(state.currentDetailEv)]) };
+    return nativeMembershipKeyMemo.key;
+  }
+  function nativeMembershipRows() { const rows = new Map(); for (const row of [...state.rows, state.currentDetailEv].filter(Boolean)) if (row.event_ref || row.eventRef) rows.set(nativeRowKey(row), { id: row.id, eventRef: row.event_ref ?? row.eventRef }); return [...rows.values()]; }
+  function paintMembership() {
+    if (scope !== "dataset") return;
+    const apply = (node, event, detail = false) => { const result = nativeMembership.rows.get(nativeRowKey(event)), included = result && result.state !== "missing";
+      node.classList.toggle(detail ? "event-in-case-action" : "event-in-case", !!included);
+      node.title = nativeMembership.state === "loading" ? "Confirmando se o registro está preservado no Caso" : nativeMembership.state === "unavailable" ? "Pertencimento indisponível; atualize a seleção para confirmar" : included ? result.state === "ambiguous" ? `${result.matches.length} ocorrências deste registro estão preservadas no Caso` : "Este registro já está preservado no Caso" : detail ? "Salvar no Caso" : "";
+    };
+    for (const node of document.querySelectorAll("#events-table tbody tr[data-event-id]")) apply(node, state.rows.find(row => row.id === Number(node.dataset.eventId)));
+    if (state.currentDetailEv && !$("#drawer").hidden) apply($("#ws-detail-save"), state.currentDetailEv, true);
+  }
+  function scheduleNativeMembership() {
+    if (nativeMembershipScheduled || scope !== "dataset") return; nativeMembershipScheduled = true;
+    Promise.resolve().then(async () => {
+      nativeMembershipScheduled = false; const key = nativeMembershipKey(); if (nativeMembership.key === key) return;
+      const rows = nativeMembershipRows(); nativeMembership = { key, state: rows.length ? "loading" : "ready", rows: new Map() }; paintMembership(); if (!rows.length) return;
+      const guard = () => window.CaseEvidence?.active === true && scope === "dataset" && nativeMembership.key === key && nativeMembershipKey() === key;
+      try { const result = await nativeEvidenceServices().actions.membership(rows, { guard }); if (!guard()) return;
+        nativeMembership = { key, state: "ready", rows: new Map(result.rows.map(row => [nativeRowKey(row.row), row])) }; paintMembership();
+      } catch { if (guard()) { nativeMembership = { key, state: "unavailable", rows: new Map() }; paintMembership(); } }
+    });
   }
   let membershipSignature = "", refs = new Set(), identities = new Set();
   const identity = (event, artifact = state.currentArtifact?.id) => JSON.stringify([event.fields?.caminho || artifact || "", event.id, event.timestamp, event.source, event.code, event.message]);
   function indexMembership() {
+    if (activeCase()?.kind === "preserved_case_unavailable") { refs = new Set(); identities = new Set(); return; }
     const signature = caseSig(); if (signature === membershipSignature) return;
     membershipSignature = signature; refs = new Set(); identities = new Set();
     for (const item of activeCase()?.items || []) for (const row of item.rows || []) { if (row.event_ref) refs.add(row.event_ref); identities.add(identity(row, item.artifactId)); }
   }
-  function isIncluded(event) { indexMembership(); return !!event.event_ref && refs.has(event.event_ref) || identities.has(identity(event)); }
+  function isIncluded(event) { if (window.CaseEvidence?.active === true) { const key = nativeMembershipKey(); if (nativeMembership.key !== key) { scheduleNativeMembership(); return false; } const result = nativeMembership.rows.get(nativeRowKey(event)); return !!result && result.state !== "missing"; } indexMembership(); return !!event.event_ref && refs.has(event.event_ref) || identities.has(identity(event)); }
   function refreshMembership() {
+    if (window.CaseEvidence?.active === true) { nativeMembership = { key: null, state: "idle", rows: new Map() }; updateToggle(); scheduleNativeMembership(); return; }
     membershipSignature = ""; updateToggle();
     if (scope === "dataset") for (const node of document.querySelectorAll("#events-table tbody tr[data-event-id]")) { const event = state.rows.find(row => row.id === Number(node.dataset.eventId)), included = event && isIncluded(event); node.classList.toggle("event-in-case", !!included); if (included) node.title = "Este registro já está no Caso"; else node.removeAttribute("title"); }
   }
+  document.addEventListener("case-evidence-state", () => { if (window.CaseEvidence?.active === true) refreshMembership(); });
   const oldDetail = showDetail;
   showDetail = function(...args) { const result = oldDetail(...args); $("#ws-detail-save").hidden = scope === "case"; if (scope === "dataset") { const included = isIncluded(args[0]); $("#ws-detail-save").classList.toggle("event-in-case-action", included); $("#ws-detail-save").title = included ? "Este registro já está no Caso" : "Salvar no Caso"; } return result; };
   const originalSave = saveCases;

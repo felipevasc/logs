@@ -54,6 +54,7 @@ window.AnalysisContexts = (() => {
     if (!validSnapshot(value)) throw new Error("Resposta de configuração do Caso inválida.");
     if (owner.caseId !== value.caseId || !owns(owner)) return { accepted: false, reason: "owner" };
     const item = findCase(value.caseId), previous = context(value.caseId);
+    if (item?.kind === "preserved_case_unavailable") return { accepted: false, reason: "metadata_unavailable" };
     if (previous && previous.analysisId !== value.analysisId || owner.identity && owner.identity.analysisId !== value.analysisId)
       return { accepted: false, reason: "owner" };
     if (previous) {
@@ -80,6 +81,7 @@ window.AnalysisContexts = (() => {
     return { accepted: true, snapshot };
   }
   async function refresh(caseId = state.cases?.active, { owner = capture(caseId) } = {}) {
+    if (findCase(caseId)?.kind === "preserved_case_unavailable") throw Error("CASE_METADATA_UNAVAILABLE: Os metadados deste Caso estão indisponíveis; os originais permanecem preservados.");
     if (!owner.caseId || owner.caseId !== caseId || !owns(owner)) throw stale();
     const key = `${owner.instance}:${signature(owner.identity)}`;
     if (snapshots.has(key)) return snapshots.get(key);
@@ -91,6 +93,7 @@ window.AnalysisContexts = (() => {
     try { return await request; } finally { if (snapshots.get(key) === request) snapshots.delete(key); }
   }
   async function prepare(owner, { metadata = false } = {}) {
+    if (findCase(owner?.caseId)?.kind === "preserved_case_unavailable") throw Error("CASE_METADATA_UNAVAILABLE: Escolha outro Caso para analisar ou editar; os originais deste Caso permanecem preservados.");
     assertOwner(owner, { revisions: !!owner.identity });
     activate();
     const item = findCase(owner.caseId);

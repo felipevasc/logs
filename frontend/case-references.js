@@ -85,15 +85,24 @@ window.CaseReferences = (() => {
     draft.entries = result.references; return result.references;
   }
   function dependencies(id) { return (window.AnalysisContexts.context()?.config?.derivedFields || state.derivedFields || []).filter(field => field.lookup?.referenceId === id).map(field => field.name); }
+  const interpretation = descriptor => descriptor.interpretationVersion == null || descriptor.interpretationVersion === 1 ? "legada v1"
+    : descriptor.interpretationVersion === 2 ? "exata v2" : `não suportada (${String(descriptor.interpretationVersion)})`;
   function renderList(draft) {
     node("list").replaceChildren();
+    const diagnostics = window.AnalysisContexts.context()?.migrationDiagnostics || [];
+    if (diagnostics.length) {
+      const notices = el("div", "rf-diagnostics"); notices.setAttribute("role", "status"); notices.append(el("strong", "", "Avisos da interpretação preservada"));
+      for (const diagnostic of diagnostics.slice(0, 20)) notices.append(el("p", "muted small", trunc(diagnostic.message || diagnostic.code || "Aviso da investigação importada", 600)));
+      if (diagnostics.length > 20) notices.append(el("p", "muted small", `${fmtNum(diagnostics.length - 20)} avisos adicionais na configuração preservada.`));
+      node("list").append(notices);
+    }
     for (const entry of draft.entries) {
       const descriptor = entry.descriptor, card = el("article", "rf-reference"), name = el("strong", "", trunc(descriptor.name, 160)); name.title = trunc(descriptor.name, 512);
       card.append(name, el("span", entry.available ? "muted small" : "rf-error small", entry.available
         ? `Disponível · ${entry.rowCount == null ? "contagem indisponível" : `${fmtNum(entry.rowCount)} registros`} · JSONL` : `Indisponível: ${entry.reason || "não foi possível abrir o conteúdo"}`));
       card.append(el("span", "muted small", `Chaves: ${descriptor.keyColumns.join(" → ")}`));
       const details = el("details"), detailTitle = el("summary", "", "Detalhes da referência");
-      details.append(detailTitle, el("pre", "rf-details", `SHA-256: ${descriptor.contentSha256}\nColunas (${Math.min(32, descriptor.columns.length)} de ${descriptor.columns.length}): ${descriptor.columns.slice(0, 32).map(column => trunc(column, 80)).join(", ")}\nVersão do descritor: ${descriptor.schemaVersion}`)); card.append(details);
+      details.append(detailTitle, el("pre", "rf-details", `SHA-256: ${descriptor.contentSha256}\nColunas (${Math.min(32, descriptor.columns.length)} de ${descriptor.columns.length}): ${descriptor.columns.slice(0, 32).map(column => trunc(column, 80)).join(", ")}\nVersão do descritor: ${descriptor.schemaVersion}\nInterpretação numérica: ${interpretation(descriptor)}`)); card.append(details);
       const actions = el("div", "rf-tools"), create = el("button", "btn ghost small", "Criar campo por referência"), remove = el("button", "btn ghost small", "Remover referência do Caso");
       create.type = remove.type = "button"; create.disabled = !entry.available;
       create.onclick = () => { if (!draft.busy) void openLookup(null, { referenceId: descriptor.id, owner: draft.owner, anchor: create }); };
@@ -195,6 +204,7 @@ window.CaseReferences = (() => {
     options(node("reference"), draft.entries.map(entry => ({ value: entry.descriptor.id, label: `${entry.descriptor.name}${entry.available ? "" : " · indisponível"}` })), draft.referenceId);
     const entry = draft.entries.find(entry => entry.descriptor.id === draft.referenceId), descriptor = entry?.descriptor;
     node("availability").textContent = !entry ? "Escolha uma referência importada neste Caso." : entry.available ? "Referência disponível neste Caso." : `Referência indisponível: ${entry.reason || "conteúdo ausente"}. O campo não será tratado como uma busca sem correspondência.`;
+    if (descriptor) node("availability").textContent += ` Interpretação numérica: ${interpretation(descriptor)}.`;
     node("mappings").replaceChildren();
     for (const referenceColumn of descriptor?.keyColumns || []) {
       const row = el("label", "rf-mapping"), select = el("select"); row.append(el("span", "", `Chave da referência: ${referenceColumn}`));
@@ -214,7 +224,7 @@ window.CaseReferences = (() => {
     await refreshList(); if (current(draft)) (draft.editName ? node("reference") : node("field-name")).focus();
   }
   async function refreshFields(draft) {
-    const scope = workspaceScope(), evidence = scope === "case" ? caseEvents() : null, signature = scope === "case" ? caseSig() : null;
+    const scope = workspaceScope(), evidence = scope === "case" ? caseEvents("analysis") : null, signature = scope === "case" ? caseSig() : null;
     const profiles = await api("profile_fields", { filters: [], ...(evidence ? { caseEvents: evidence } : {}) }, { silent: true, analysisOwner: draft.owner });
     assertOwner(draft); if (scope !== workspaceScope() || signature !== (scope === "case" ? caseSig() : null)) throw Error("A área mudou depois de salvar. Atualize os campos nesta área.");
     const names = [...new Set([...(profiles || []).map(field => field.name), ...state.derivedFields.map(field => field.name)])];

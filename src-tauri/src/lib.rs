@@ -10,6 +10,19 @@ mod analysis_commands;
 mod analysis_visibility;
 mod attack;
 mod case_cache;
+mod case_evidence;
+mod case_evidence_anchors;
+mod case_evidence_budget;
+mod case_evidence_commands;
+mod case_evidence_display;
+mod case_evidence_display_policy;
+mod case_evidence_history;
+mod case_evidence_members;
+mod case_portable_native;
+mod case_portable_commands;
+mod case_recovery;
+mod case_recovery_commands;
+mod case_work_budget;
 mod case_archive_format;
 mod case_archive;
 mod case_archive_references;
@@ -74,6 +87,8 @@ mod workspace;
 mod detail_commands;
 #[cfg(test)]
 mod derived_surface_tests;
+#[cfg(test)]
+mod mapped_metadata_workload;
 
 use model::{CodesConfig, Event, STANDARD_COLUMNS};
 use parking_lot::{Mutex, RwLock};
@@ -153,6 +168,10 @@ fn emit_progress(
 }
 
 pub(crate) fn config_dir() -> PathBuf {
+    case_recovery::profiles::selected(&base_config_dir())
+}
+
+pub(crate) fn base_config_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("LOGINSIGHT_DATA_DIR") {
         return PathBuf::from(path);
     }
@@ -224,9 +243,9 @@ where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
 
 /// A detail/field action prepares only its selected record. Admission still
 /// binds the complete synchronized publication and validates its token at exit.
-async fn offload_case_record<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, case_events: Option<std::sync::Arc<Vec<Event>>>, id: usize, event_ref: Option<String>, f: F) -> Result<T, String>
+async fn offload_case_record<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, case_events: Option<std::sync::Arc<case_cache::Records>>, id: usize, event_ref: Option<String>, f: F) -> Result<T, String>
 where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
-    offload_case_input(operation_id, app, admitted, move |admitted| admitted.prepare_visibility_record(case_events.as_deref().map(Vec::as_slice), id, event_ref.as_deref()), f).await
+    offload_case_input(operation_id, app, admitted, move |admitted| admitted.prepare_visibility_record(case_events.as_deref().map(case_cache::Records::as_slice), id, event_ref.as_deref()), f).await
 }
 
 async fn offload_case_input<T, P, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, input: P, f: F) -> Result<T, String>
@@ -242,6 +261,7 @@ where T: Send + 'static, P: FnOnce(&analysis_runtime::Admitted) -> Result<Option
             operations::check()?;
             let result = f(case_events);
             admitted.validate_visibility()?;
+            admitted.validate_native_case_authority()?;
             admitted.schedule_derived_variant(app.state::<AppState>().inner());
             Ok(result)
         }))
@@ -2177,6 +2197,12 @@ pub fn run() {
     resources::init();
     #[cfg(feature = "update-e2e")]
     updates::e2e_arguments();
+    // Resolve a verified restart selection before any data, updater, catalog,
+    // MCP or cache initialization. This process then retains one fixed root.
+    case_recovery::profiles::initialize(&base_config_dir(), &case_recovery::Work {
+        cancelled: &|| false,
+        progress: &|_, _, _| {},
+    });
     let context = tauri::generate_context!();
     // Before anything reads the data folder: a new version backs it up first.
     let updates = updates::prepare(&context.package_info().version);
@@ -2311,6 +2337,26 @@ pub fn run() {
             system_codes_count,
             cases_load,
             cases_save,
+            case_evidence_commands::cases_load_view,
+            case_evidence_commands::cases_save_view,
+            case_evidence_commands::case_evidence_prepare,
+            case_evidence_commands::case_evidence_prepare_membership,
+            case_evidence_commands::case_evidence_discard,
+            case_evidence_commands::case_evidence_member_detail,
+            case_evidence_commands::case_evidence_member_field_text,
+            case_evidence_commands::case_evidence_member_java_trace,
+            case_evidence_commands::case_evidence_timeline,
+            case_evidence_commands::case_evidence_display_timeline,
+            case_evidence_commands::case_evidence_display_members,
+            case_evidence_commands::case_evidence_preview,
+            case_evidence_commands::case_evidence_source_receipt,
+            case_evidence_commands::case_evidence_find_members,
+            case_evidence_commands::case_evidence_open,
+            case_portable_commands::case_import_native,
+            case_portable_commands::case_export_native,
+            case_recovery_commands::case_recovery_status,
+            case_recovery_commands::case_recovery_prepare_restart,
+            case_recovery_commands::case_recovery_return_original,
             list_formats,
             save_custom_format,
             get_ts_config,

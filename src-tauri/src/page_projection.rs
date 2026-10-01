@@ -664,6 +664,49 @@ pub(crate) fn hydrate_projected_rows(
     )
 }
 
+/// Resolve Dataset capture rows directly into a native staging sink. Values do
+/// not cross JavaScript, so the exact Number variants remain intact. The sink
+/// must remain unpublished until this function and the target-owner validation
+/// succeed; a late identity change rejects the entire staged capture.
+///
+/// Case-origin capture uses its authoritative envelope/member map instead of
+/// serializing an analytical Event view, which may omit unknown JSON members.
+pub(crate) fn visit_native_dataset_rows(
+    state: &crate::AppState,
+    admitted: &Admitted,
+    receipt: &Receipt,
+    handles: &[RowHandle],
+    mut sink: impl FnMut(Event) -> Result<(), String>,
+) -> Result<(), String> {
+    if receipt.case_key.is_some() || admitted.case_key.is_some() {
+        return Err("NATIVE_EVIDENCE_CASE: Capture as evidências do Caso pelas referências nativas preservadas.".into());
+    }
+    if handles.is_empty() || handles.len() > 10_000 {
+        return Err("NATIVE_EVIDENCE_LIMIT: Selecione entre 1 e 10.000 registros por captura.".into());
+    }
+    serialized_len(&handles, 2 << 20)
+        .map_err(|_| "NATIVE_EVIDENCE_LIMIT: As referências excedem o limite da captura.".to_string())?;
+    // Complete one resolution before entering the staging sink. Slow disk
+    // writes must not hold the live catalog read locks, and only one decoded
+    // Event is retained here. The final check also covers the last sink call.
+    for handle in handles {
+        crate::operations::check()?;
+        let event = with_exact_rows(state, admitted, receipt, std::slice::from_ref(handle), None,
+            MAX_RECORD_OWNED, |resolve| resolve(handle))?;
+        // Provenance is attached by the shared resolver after its initial
+        // payload check. Charge the complete record entering native storage.
+        if !event_work_bounded(&event) || crate::query::event_payload_bytes(&event) > MAX_RECORD_OWNED {
+            return Err(EXACT_LIMIT.into());
+        }
+        sink(event)?;
+    }
+    crate::operations::check()?;
+    admitted.validate(state)?;
+    admitted.validate_visibility()?;
+    receipt.validate_catalogs(&state.codes.read(), &state.system_codes.read())?;
+    Ok(())
+}
+
 pub(crate) fn hydrate_projected_field(
     state: &crate::AppState,
     admitted: &Admitted,
@@ -1799,5 +1842,113 @@ mod admitted_action_tests {
             assert_eq!(exact[0].fields["request_time"], json!(1.25));
             assert_eq!(exact[0].raw, records[1]);
         });
+    }
+
+    #[test]
+    fn native_dataset_capture_streams_exact_numbers_and_originals_before_the_js_guard() {
+        let mut records = Vec::new();
+        for id in 0..40 {
+            let mut record = event(id);
+            record.fields.insert("integer".into(), serde_json::from_str("18446744073709551615").unwrap());
+            record.fields.insert("neighbor".into(), serde_json::from_str("18446744073709551614").unwrap());
+            record.fields.insert("float".into(), serde_json::from_str("1.0").unwrap());
+            record.fields.insert("negative_zero".into(), serde_json::from_str("-0.0").unwrap());
+            record.fields.insert("original".into(), json!("stale overlay"));
+            record.derived_originals.insert("original".into(), crate::model::DerivedOriginal::Present(json!("raw value")));
+            records.push(record);
+        }
+        let unchanged_source = records.iter().map(serde_json::to_string).collect::<Result<Vec<_>, _>>().unwrap();
+        // Current Dataset admission restores retained originals before applying
+        // its empty overlay. Capture must match that admitted native view.
+        let expected = records.iter().cloned().map(|mut record| {
+            record.fields.insert("original".into(), json!("raw value"));
+            record.derived_originals.clear();
+            serde_json::to_string(&record)
+        }).collect::<Result<Vec<_>, _>>().unwrap();
+        let fixture = Fixture::new(records);
+        let (admitted, receipt) = fixture.capture();
+        let handles: Vec<_> = (0..40).map(row).collect();
+        let mut captured = Vec::new();
+        analysis_runtime::with(Some(admitted.clone()), || {
+            assert!(hydrate_projected_rows(&fixture.state, &admitted, &receipt, &[row(0)], None).unwrap_err().starts_with("PROJECTED_HYDRATION_NUMBER:"));
+            visit_native_dataset_rows(&fixture.state, &admitted, &receipt, &handles, |event| {
+                captured.push(serde_json::to_string(&event).unwrap());
+                Ok(())
+            }).unwrap();
+        });
+        assert_eq!(captured, expected);
+        assert!(captured[0].contains("18446744073709551615"));
+        assert!(captured[0].contains("18446744073709551614"));
+        assert!(captured[0].contains("\"float\":1.0"));
+        assert!(captured[0].contains("\"negative_zero\":-0.0"));
+        let SourceData::Memory(originals) = &*fixture.state.source.read() else { panic!() };
+        assert_eq!(serde_json::to_string(&originals[0]).unwrap(), unchanged_source[0]);
+        let admitted_record: Event = serde_json::from_str(&captured[0]).unwrap();
+        assert_eq!(admitted_record.fields["original"], json!("raw value"));
+        assert!(admitted_record.derived_originals.is_empty());
+        assert_eq!(originals[0].fields["original"], json!("stale overlay"));
+        assert!(matches!(originals[0].derived_originals.get("original"), Some(crate::model::DerivedOriginal::Present(value)) if value == "raw value"));
+    }
+
+    #[test]
+    fn native_dataset_capture_rejects_case_origins_and_stops_on_sink_failure_or_cancellation() {
+        let fixture = Fixture::new((0..40).map(event).collect());
+        let (admitted, receipt) = fixture.capture();
+        let handles: Vec<_> = (0..40).map(row).collect();
+        let mut visited = 0;
+        analysis_runtime::with(Some(admitted.clone()), || {
+            let error = visit_native_dataset_rows(&fixture.state, &admitted, &receipt, &handles, |_| {
+                visited += 1;
+                if visited == 17 { Err("synthetic staging failure".into()) } else { Ok(()) }
+            }).unwrap_err();
+            assert_eq!(error, "synthetic staging failure");
+        });
+        assert_eq!(visited, 17);
+        let token = crate::operations::token(Some("native-capture-cancel".into())).unwrap();
+        visited = 0;
+        let result = crate::operations::run_with_token(token, || analysis_runtime::with(Some(admitted.clone()), || {
+            visit_native_dataset_rows(&fixture.state, &admitted, &receipt, &handles, |_| {
+                visited += 1;
+                crate::operations::cancel_id("native-capture-cancel");
+                Ok(())
+            })
+        }));
+        assert!(result.is_err());
+        assert_eq!(visited, 1);
+        let (case, case_receipt, _) = fixture.capture_case("native-capture-case", vec![event(0)]);
+        analysis_runtime::with(Some(case.clone()), || {
+            let error = visit_native_dataset_rows(&fixture.state, &case, &case_receipt, &[row(0)], |_| panic!("Case envelopes must use native authority")).unwrap_err();
+            assert!(error.starts_with("NATIVE_EVIDENCE_CASE:"));
+        });
+    }
+
+    #[test]
+    fn native_dataset_capture_rejects_late_source_and_config_changes_after_staging() {
+        for change_source in [true, false] {
+            let fixture = Fixture::new(vec![event(0)]);
+            let (admitted, receipt) = fixture.capture();
+            let mut staged = Vec::new();
+            let result = analysis_runtime::with(Some(admitted.clone()), || {
+                visit_native_dataset_rows(&fixture.state, &admitted, &receipt, &[row(0)], |record| {
+                    // A real staging sink may do file I/O. It must own no
+                    // catalog lock and can never publish before final checks.
+                    assert!(fixture.state.codes.try_write().is_some());
+                    assert!(fixture.state.system_codes.try_write().is_some());
+                    staged.push(serde_json::to_string(&record).unwrap());
+                    if change_source {
+                        let mut source = fixture.state.source.write();
+                        *source = SourceData::Memory(Vec::new());
+                        let next = crate::source_publication::prepare_touch_locked(&fixture.state)?;
+                        crate::source_publication::commit_touch_locked(&fixture.state, next);
+                    } else {
+                        let config = crate::analysis_context::snapshot(&fixture.identity.case_id)?.config;
+                        crate::analysis_context::update(&fixture.identity, config)?;
+                    }
+                    Ok(())
+                })
+            });
+            assert_eq!(staged.len(), 1, "the final sink call happened");
+            assert!(result.is_err(), "staged bytes cannot authorize a sealed capture after a late mutation");
+        }
     }
 }

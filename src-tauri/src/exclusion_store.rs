@@ -198,6 +198,66 @@ pub struct BatchInfo {
     pub restored_at_ms: Option<u64>,
     payload: PayloadMeta,
 }
+/// Decoded ledger metadata keeps its actual reservation until the last
+/// consumer finishes. Deliberately not Clone: duplicating a tree needs a new
+/// admission, while moving it into a response transfers this same lease.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct RetainedBatchInfo {
+    value: BatchInfo,
+    #[serde(skip)]
+    credit: crate::case_work_budget::Lease,
+}
+impl std::ops::Deref for RetainedBatchInfo {
+    type Target = BatchInfo;
+    fn deref(&self) -> &BatchInfo { &self.value }
+}
+impl RetainedBatchInfo {
+    pub(crate) fn into_parts(self) -> (BatchInfo, crate::case_work_budget::Lease) {
+        (self.value, self.credit)
+    }
+}
+// Native-only adapter: the app enables serde_json/raw_value, whose ordinary
+// Value visitor interprets its private object key. Legacy Deserialize stays as-is.
+#[derive(Deserialize)]
+#[serde(remote = "BatchInfo", rename_all = "camelCase", deny_unknown_fields)]
+struct NativeBatchInfo {
+    id: String,
+    analysis_id: String,
+    created_at_ms: u64,
+    label: String,
+    reason: String,
+    #[serde(deserialize_with = "crate::case_evidence::native_deserialize_value")]
+    scope: Value,
+    #[serde(deserialize_with = "crate::case_evidence::native_deserialize_value")]
+    source_receipt: Value,
+    members: u64,
+    active: bool,
+    restored_at_ms: Option<u64>,
+    payload: PayloadMeta,
+}
+fn decode_native_metadata<T>(
+    body: &str,
+    limit: usize,
+    decode: impl FnOnce(Value) -> Result<T, serde_json::Error>,
+) -> Result<T, String> {
+    if body.len() > limit {
+        return Err("Metadados portáteis persistidos excedem o limite.".into());
+    }
+    let raw = crate::case_evidence::checked_document(body)?;
+    let plan = crate::case_evidence::preflight_value(raw)?;
+    let _credit = crate::case_cache::reserve_work(
+        crate::case_work_budget::global(),
+        plan.materialization_credit
+            .checked_mul(2)
+            .ok_or("Metadados portáteis excessivos.")?,
+    )?;
+    decode(crate::case_evidence::materialize_value(raw, plan)?).map_err(|e| e.to_string())
+}
+fn decode_native_batch(body: &str) -> Result<BatchInfo, String> {
+    decode_native_metadata(body, MAX_RECEIPT_BYTES * 3, NativeBatchInfo::deserialize)
+}
+
 impl BatchInfo {
     pub(crate) fn payload(&self) -> &PayloadMeta {
         &self.payload
@@ -1302,21 +1362,114 @@ fn ensure_ledger(dir: &Path) -> Result<(), String> {
     let conn = crate::case_store::context_connection(dir)?;
     ledger_schema(&conn)
 }
-fn info(conn: &Connection, analysis_id: &str, id: &str) -> Result<BatchInfo, String> {
-    let body: String = conn
-        .query_row(
-            "SELECT body FROM exclusion_batches WHERE analysis_id=?1 AND id=?2",
-            params![analysis_id, id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
+/// Classify the already-selected analysis in the same read transaction. The
+/// native profile/restore barriers, rather than caller JSON, choose the decoder.
+fn native_ledger_owner(conn: &Connection, analysis_id: &str) -> Result<bool, String> {
+    for table in [
+        "native_evidence_cases",
+        "native_evidence_protected",
+        "case_recovery_protected",
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !exists {
+            continue;
+        }
+        let sql = if table == "case_recovery_protected" {
+            "SELECT EXISTS(SELECT 1 FROM case_recovery_protected p JOIN case_analysis a ON a.case_id=p.case_id WHERE json_extract(a.body,'$.analysisId')=?1)".to_string()
+        } else {
+            format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE analysis_id=?1)")
+        };
+        if conn
+            .query_row::<bool, _, _>(&sql, [analysis_id], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+fn info(conn: &Connection, analysis_id: &str, id: &str) -> Result<RetainedBatchInfo, String> {
+    info_with_pool(conn, analysis_id, id, crate::case_work_budget::global())
+}
+/// Called only after structural preflight bounds depth/nodes. Legacy serde can
+/// expand this private key's string as another JSON document; escaped key
+/// spellings must receive the same conservative allocation admission.
+fn has_legacy_value_expansion(raw: crate::case_evidence::RawJson<'_>) -> Result<bool, String> {
+    match raw.kind() {
+        b'{' => {
+            let mut fields = raw.members()?;
+            while let Some(field) = fields.next()? {
+                if field.key()? == "$serde_json::private::RawValue"
+                    || has_legacy_value_expansion(field.value)? {
+                    return Ok(true);
+                }
+            }
+        }
+        b'[' => {
+            let mut values = raw.elements()?;
+            while let Some(value) = values.next()? {
+                if has_legacy_value_expansion(value)? { return Ok(true); }
+            }
+        }
+        _ => (),
+    }
+    Ok(false)
+}
+fn info_with_pool(
+    conn: &Connection,
+    analysis_id: &str,
+    id: &str,
+    pool: &std::sync::Arc<crate::case_work_budget::Pool>,
+) -> Result<RetainedBatchInfo, String> {
+    let native = native_ledger_owner(conn, analysis_id)?;
+    // octet_length admits the encoded input before SQLite returns TEXT and
+    // Rust allocates its overlapping String. The codec choice stays unchanged.
+    let size: usize = conn.query_row(
+        "SELECT octet_length(body) FROM exclusion_batches WHERE analysis_id=?1 AND id=?2",
+        params![analysis_id, id], |row| row.get(0),
+    ).optional().map_err(|e| e.to_string())?
         .ok_or("Lote de exclusão não pertence a esta análise.")?;
-    let batch: BatchInfo = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    if size > MAX_RECEIPT_BYTES * 3 {
+        return Err("Metadados do lote de exclusão excedem o limite.".into());
+    }
+    let input_bytes = size.checked_mul(2).and_then(|bytes| bytes.checked_add(1024))
+        .ok_or("Metadados do lote de exclusão excessivos.")?;
+    let mut credit = crate::case_cache::reserve_work(pool, input_bytes)?;
+    let body: String = conn.query_row(
+        "SELECT CASE WHEN octet_length(body)=?3 THEN body END FROM exclusion_batches WHERE analysis_id=?1 AND id=?2",
+        params![analysis_id, id, size], |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    let raw = crate::case_evidence::checked_document(&body)?;
+    let plan = crate::case_evidence::preflight_value(raw)?;
+    // Decoded embedded JSON cannot have more nodes than the admitted source
+    // has bytes. Charge 256 bytes/node for each of two possible trees, in
+    // addition to the outer plan's string/input credit. This intentionally
+    // overestimates rare legacy private-token metadata; it never changes its
+    // codec or lets an over-budget decode become an empty visibility result.
+    let expansion = if !native && has_legacy_value_expansion(raw)? {
+        body.len().checked_mul(512).ok_or("Metadados do lote de exclusão excessivos.")?
+    } else { 0 };
+    credit.merge(crate::case_cache::reserve_work(pool,
+        plan.materialization_credit.checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(expansion))
+            .ok_or("Metadados do lote de exclusão excessivos.")?,
+    )?)?;
+    let batch: BatchInfo = if native {
+        NativeBatchInfo::deserialize(crate::case_evidence::materialize_value(raw, plan)?)
+            .map_err(|e| e.to_string())?
+    } else {
+        serde_json::from_str(&body).map_err(|e| e.to_string())?
+    };
     if batch.id != id || batch.analysis_id != analysis_id || batch.payload.id != id {
         return Err("Identidade do lote de exclusão inválida.".into());
     }
-    Ok(batch)
+    Ok(RetainedBatchInfo { value: batch, credit })
 }
 fn masks(conn: &Connection, id: &str) -> Result<Vec<PayloadMeta>, String> {
     let mut stmt = conn
@@ -1518,8 +1671,8 @@ pub fn restore_batch(
             if !batch.active {
                 return Err("O lote já foi restaurado integralmente.".into());
             }
-            batch.active = false;
-            batch.restored_at_ms = Some(now_ms());
+            batch.value.active = false;
+            batch.value.restored_at_ms = Some(now_ms());
             tx.execute(
                 "UPDATE exclusion_batches SET body=?1,active=0 WHERE id=?2",
                 params![encoded(&batch, MAX_RECEIPT_BYTES * 3)?, batch_id],
@@ -1541,7 +1694,7 @@ pub fn list(
     expected: &Identity,
     after: Option<&str>,
     limit: usize,
-) -> Result<Vec<BatchInfo>, String> {
+) -> Result<Vec<RetainedBatchInfo>, String> {
     ensure_ledger(dir)?;
     crate::analysis_context::visibility_read_at(dir, expected, |conn| {
         let before = match after {
@@ -1856,11 +2009,11 @@ pub struct ArchiveRow {
     pub event_ref: String,
     pub restored_from_batch: bool,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchivePage {
     pub analysis: Identity,
-    pub batch: BatchInfo,
+    pub batch: RetainedBatchInfo,
     pub rows: Vec<ArchiveRow>,
     pub active_members: Option<u64>,
     pub sources: BTreeMap<String, SourceDescriptor>,
@@ -1974,6 +2127,46 @@ pub(crate) struct PortableLedger {
     pub schema_version: u32,
     pub identity: Identity,
     pub batches: Vec<PortableBatch>,
+}
+#[derive(Deserialize)]
+#[serde(
+    remote = "PortableBatch",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+struct NativePortableBatchDef {
+    #[serde(with = "NativeBatchInfo")]
+    batch: BatchInfo,
+    masks: Vec<PayloadMeta>,
+}
+#[derive(Deserialize)]
+struct NativePortableBatch(#[serde(with = "NativePortableBatchDef")] PortableBatch);
+fn native_deserialize_batches<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<PortableBatch>, D::Error> {
+    Vec::<NativePortableBatch>::deserialize(d)
+        .map(|values| values.into_iter().map(|value| value.0).collect())
+}
+#[derive(Deserialize)]
+#[serde(
+    remote = "PortableLedger",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+struct NativePortableLedgerDef {
+    schema_version: u32,
+    identity: Identity,
+    #[serde(deserialize_with = "native_deserialize_batches")]
+    batches: Vec<PortableBatch>,
+}
+#[derive(Deserialize)]
+struct NativePortableLedger(#[serde(with = "NativePortableLedgerDef")] PortableLedger);
+/// Decode only after the native manifest reader has admitted an exact Value.
+pub(crate) fn native_deserialize_ledgers<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<PortableLedger>, D::Error> {
+    Vec::<NativePortableLedger>::deserialize(d)
+        .map(|values| values.into_iter().map(|value| value.0).collect())
 }
 pub(crate) struct PortableFile {
     meta: PayloadMeta,
@@ -2094,14 +2287,44 @@ pub(crate) fn capture_portable(
     snapshot: &Snapshot,
     budget: &Budget,
 ) -> Result<CapturedPortable, String> {
-    let current: Snapshot = conn
+    capture_portable_inner(conn, dir, snapshot, budget, &mut |_| Ok(()), false)
+}
+/// Native transport reserves/retains shared metadata credit before each typed
+/// JSON tree decode. The caller separately charges bounded SQLite TEXT scratch.
+pub(crate) fn capture_portable_admitted(
+    conn: &Connection,
+    dir: &Path,
+    snapshot: &Snapshot,
+    budget: &Budget,
+    admit_json: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> Result<CapturedPortable, String> {
+    capture_portable_inner(conn, dir, snapshot, budget, admit_json, true)
+}
+fn capture_portable_inner(
+    conn: &Connection,
+    dir: &Path,
+    snapshot: &Snapshot,
+    budget: &Budget,
+    admit_json: &mut dyn FnMut(&str) -> Result<(), String>,
+    native: bool,
+) -> Result<CapturedPortable, String> {
+    let body: String = conn
         .query_row(
-            "SELECT body FROM case_analysis WHERE case_id=?1",
+            "SELECT CASE WHEN octet_length(body)<=4194304 THEN body END FROM case_analysis WHERE case_id=?1",
             [&snapshot.case_id],
             |row| row.get::<_, String>(0),
         )
-        .map_err(|e| e.to_string())
-        .and_then(|body| serde_json::from_str(&body).map_err(|e| e.to_string()))?;
+        .map_err(|e| e.to_string())?;
+    admit_json(&body)?;
+    let current: Snapshot = if native {
+        decode_native_metadata(
+            &body,
+            4 << 20,
+            crate::case_evidence::native_snapshot_from_value,
+        )?
+    } else {
+        serde_json::from_str(&body).map_err(|e| e.to_string())?
+    };
     if current.identity() != snapshot.identity() {
         return Err("A configuração mudou durante a exportação; tente novamente.".into());
     }
@@ -2123,15 +2346,20 @@ pub(crate) fn capture_portable(
     let mut metadata_bytes = encoded(&captured.manifest, PORTABLE_METADATA_BYTES)?.len();
     let mut seen = std::collections::BTreeSet::new();
     let mut stmt = conn
-        .prepare("SELECT id,body,active FROM exclusion_batches WHERE analysis_id=?1 ORDER BY id")
+        .prepare("SELECT CASE WHEN octet_length(id)<=64 THEN id END,CASE WHEN octet_length(body)<=?2 THEN body END,active FROM exclusion_batches WHERE analysis_id=?1 ORDER BY id")
         .map_err(|e| e.to_string())?;
     let mut rows = stmt
-        .query([&snapshot.analysis_id])
+        .query(params![&snapshot.analysis_id, MAX_RECEIPT_BYTES * 3])
         .map_err(|e| e.to_string())?;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let body = portable_body(row, 1, MAX_RECEIPT_BYTES * 3)?;
         portable_charge(&mut metadata_bytes, body.len() + 32)?;
-        let batch: BatchInfo = serde_json::from_str(body).map_err(|e| e.to_string())?;
+        admit_json(body)?;
+        let batch: BatchInfo = if native {
+            decode_native_batch(body)?
+        } else {
+            serde_json::from_str(body).map_err(|e| e.to_string())?
+        };
         let id = portable_body(row, 0, 64)?;
         let active: bool = row.get(2).map_err(|e| e.to_string())?;
         if batch.id != id
@@ -2154,12 +2382,13 @@ pub(crate) fn capture_portable(
             .files
             .push(portable_file(dir, &group.batch.payload, budget)?);
         let mut masks = conn
-            .prepare("SELECT id,payload FROM exclusion_masks WHERE batch_id=?1 ORDER BY id")
+            .prepare("SELECT CASE WHEN octet_length(id)<=64 THEN id END,CASE WHEN octet_length(payload)<=4096 THEN payload END FROM exclusion_masks WHERE batch_id=?1 ORDER BY id")
             .map_err(|e| e.to_string())?;
         let mut mask_rows = masks.query([id]).map_err(|e| e.to_string())?;
         while let Some(row) = mask_rows.next().map_err(|e| e.to_string())? {
             let body = portable_body(row, 1, 4096)?;
             portable_charge(&mut metadata_bytes, body.len() + 1)?;
+            admit_json(body)?;
             let meta: PayloadMeta = serde_json::from_str(body).map_err(|e| e.to_string())?;
             if meta.id != portable_body(row, 0, 64)?
                 || captured.files.len() >= PORTABLE_PAYLOADS
@@ -2450,10 +2679,10 @@ pub(crate) fn prepare_portable(
     }
     Ok(prepared)
 }
-pub(crate) fn insert_prepared(
+fn prepared_database(
     tx: &rusqlite::Transaction<'_>,
     prepared: &PreparedPortable,
-) -> Result<Snapshot, String> {
+) -> Result<(), String> {
     let database: String = tx
         .query_row(
             "SELECT file FROM pragma_database_list WHERE name='main'",
@@ -2468,21 +2697,13 @@ pub(crate) fn insert_prepared(
     {
         return Err("Importação preparada pertence a outro armazenamento.".into());
     }
-    let exists: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM case_analysis WHERE case_id=?1)",
-            [&prepared.snapshot.case_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    if exists {
-        return crate::analysis_context::insert_portable_snapshot(tx, &prepared.snapshot);
-    }
-    for file in &prepared.files {
-        file.lease.validate()?;
-    }
-    ledger_schema(tx)?;
-    let snapshot = crate::analysis_context::insert_portable_snapshot(tx, &prepared.snapshot)?;
+    Ok(())
+}
+fn write_prepared_ledger(
+    tx: &rusqlite::Transaction<'_>,
+    prepared: &PreparedPortable,
+    snapshot: &Snapshot,
+) -> Result<(), String> {
     for group in &prepared.ledger.batches {
         tx.execute(
             "INSERT INTO exclusion_batches VALUES(?1,?2,?3,?4)",
@@ -2502,6 +2723,60 @@ pub(crate) fn insert_prepared(
             .map_err(|e| e.to_string())?;
         }
     }
+    Ok(())
+}
+/// Native publication has already installed this fresh Case context inside the
+/// same outer transaction. Existing context is therefore not a replay signal.
+pub(crate) fn insert_prepared_after_context(
+    tx: &rusqlite::Transaction<'_>,
+    prepared: &PreparedPortable,
+) -> Result<Snapshot, String> {
+    prepared_database(tx, prepared)?;
+    let expected = encoded(&prepared.snapshot, 4 << 20)?;
+    let matches:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM case_analysis a JOIN cases c ON c.id=a.case_id WHERE a.case_id=?1 AND a.body=?2)",params![prepared.snapshot.case_id,expected],|row|row.get(0)).map_err(|e|e.to_string())?;
+    if !matches {
+        return Err(
+            "CASE_PORTABLE_CONTEXT: A configuração instalada difere da preparação selada.".into(),
+        );
+    }
+    for file in &prepared.files {
+        file.lease.validate()?;
+    }
+    ledger_schema(tx)?;
+    let has_history: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM exclusion_batches WHERE analysis_id=?1)",
+            [&prepared.snapshot.analysis_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if has_history {
+        return Err("CASE_PORTABLE_CONTEXT: O histórico da nova análise já foi publicado.".into());
+    }
+    write_prepared_ledger(tx, prepared, &prepared.snapshot)?;
+    Ok(prepared.snapshot.clone())
+}
+pub(crate) fn insert_prepared(
+    tx: &rusqlite::Transaction<'_>,
+    prepared: &PreparedPortable,
+) -> Result<Snapshot, String> {
+    prepared_database(tx, prepared)?;
+    let exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM case_analysis WHERE case_id=?1)",
+            [&prepared.snapshot.case_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if exists {
+        return crate::analysis_context::insert_portable_snapshot(tx, &prepared.snapshot);
+    }
+    for file in &prepared.files {
+        file.lease.validate()?;
+    }
+    ledger_schema(tx)?;
+    let snapshot = crate::analysis_context::insert_portable_snapshot(tx, &prepared.snapshot)?;
+    write_prepared_ledger(tx, prepared, &snapshot)?;
     Ok(snapshot)
 }
 
@@ -2530,6 +2805,66 @@ mod tests {
             locator: Locator::ByteOffset(offset),
             event_ref: format!("version-one:{offset}"),
         })
+    }
+    #[test]
+    fn retained_batch_collection_refuses_then_releases_cumulative_credit() {
+        use crate::case_work_budget::{Limits, Pool, WORK_BUSY};
+        for native in [false, true] {
+            let fixture = Fixture::new();
+            let receipt = fixture.exclude(&[1]);
+            let identity = fixture.admission().analysis;
+            let conn = crate::case_store::context_connection(fixture.path()).unwrap();
+            let body: String = conn.query_row(
+                "SELECT body FROM exclusion_batches WHERE id=?1", [&receipt.batch_id],
+                |row| row.get(0),
+            ).unwrap();
+            let mut authored: Value = serde_json::from_str(&body).unwrap();
+            authored["scope"] = json!({"fraction": f64::from_bits(0x3e5b597464455d8a)});
+            if native {
+                authored["sourceReceipt"] = json!({"$serde_json::private::RawValue":"1","sibling":2});
+                conn.execute_batch("CREATE TABLE native_evidence_cases(analysis_id TEXT PRIMARY KEY);").unwrap();
+                conn.execute("INSERT INTO native_evidence_cases VALUES(?1)", [&identity.analysis_id]).unwrap();
+            } else {
+                authored["sourceReceipt"] = json!({"$serde_json::private::RawValue":"[0,0,0]"});
+            }
+            let body = serde_json::to_string(&authored).unwrap();
+            conn.execute("UPDATE exclusion_batches SET body=?1 WHERE id=?2", params![body,receipt.batch_id]).unwrap();
+            let expected: BatchInfo = if native { decode_native_batch(&body).unwrap() }
+                else { serde_json::from_str(&body).unwrap() };
+            let raw = crate::case_evidence::checked_document(&body).unwrap();
+            let plan = crate::case_evidence::preflight_value(raw).unwrap();
+            let one = body.len() * 2 + 1024 + plan.materialization_credit * 2
+                + if native { 0 } else { body.len() * 512 };
+            let pool = Pool::new(Limits { materialized: one * 2, retained: one * 2, live: one * 2 });
+            let mut retained = Vec::new();
+            for _ in 0..2 {
+                retained.push(info_with_pool(&conn, &identity.analysis_id, &receipt.batch_id, &pool).unwrap());
+            }
+            assert_eq!(pool.used(), one * 2);
+            assert!(info_with_pool(&conn, &identity.analysis_id, &receipt.batch_id, &pool)
+                .unwrap_err().starts_with(WORK_BUSY));
+            assert_eq!(pool.used(), one * 2);
+            assert_eq!(serde_json::to_string(&retained[0]).unwrap(), serde_json::to_string(&expected).unwrap());
+            drop(retained.pop());
+            assert_eq!(pool.used(), one);
+            retained.push(info_with_pool(&conn, &identity.analysis_id, &receipt.batch_id, &pool).unwrap());
+            let (moved, credit) = retained.pop().unwrap().into_parts();
+            assert_eq!(pool.used(), one * 2, "response move retains the actual charge");
+            assert_eq!(serde_json::to_string(&moved).unwrap(), serde_json::to_string(&expected).unwrap());
+            drop(moved);
+            drop(credit);
+            drop(retained);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+    #[test]
+    fn legacy_expansion_admission_recognizes_escaped_keys_without_interpreting_values() {
+        let text = r#"{"scope":[{"\u0024serde_json::private::RawValue":"[0,0]"}]}"#;
+        let raw = crate::case_evidence::checked_document(text).unwrap();
+        crate::case_evidence::preflight_value(raw).unwrap();
+        assert!(has_legacy_value_expansion(raw).unwrap());
+        let literal = crate::case_evidence::checked_document(r#"{"note":"$serde_json::private::RawValue","scope":{"x":1}}"#).unwrap();
+        assert!(!has_legacy_value_expansion(literal).unwrap());
     }
     struct Fixture {
         dir: tempfile::TempDir,
@@ -2710,6 +3045,56 @@ mod tests {
             conn.query_row::<u64, _, _>("SELECT count(*) FROM members", [], |row| row.get(0))
                 .unwrap(),
             1
+        );
+    }
+    #[test]
+    fn portable_capture_admits_metadata_before_decode_and_sql_bounds_large_bodies() {
+        let fixture = Fixture::new();
+        let receipt = fixture.exclude(&[1]);
+        let snapshot = receipt.analysis_context;
+        let conn = crate::case_store::connect(fixture.path()).unwrap();
+        conn.execute_batch("BEGIN DEFERRED").unwrap();
+        let admitted = Cell::new(0usize);
+        let result = capture_portable_admitted(
+            &conn,
+            fixture.path(),
+            &snapshot,
+            &Budget::default(),
+            &mut |_| {
+                admitted.set(admitted.get() + 1);
+                if admitted.get() == 2 {
+                    Err("fixture shared credit refusal".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.err().unwrap().contains("shared credit"));
+        assert_eq!(admitted.get(), 2);
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(fixture.offsets(), vec![1]);
+        conn.execute(
+            "UPDATE exclusion_batches SET body=?1 WHERE id=?2",
+            params!["x".repeat(MAX_RECEIPT_BYTES * 3 + 1), receipt.batch_id],
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN DEFERRED").unwrap();
+        admitted.set(0);
+        assert!(capture_portable_admitted(
+            &conn,
+            fixture.path(),
+            &snapshot,
+            &Budget::default(),
+            &mut |_| {
+                admitted.set(admitted.get() + 1);
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(
+            admitted.get(),
+            1,
+            "oversized batch TEXT must not reach the admission/decode callback"
         );
     }
     #[test]
@@ -3345,6 +3730,40 @@ mod tests {
             })
             .collect();
         (snapshot, capture, paths)
+    }
+
+    #[test]
+    fn native_portable_ledger_inserts_after_context_without_losing_masks() {
+        let source=Fixture::new();
+        let first=source.exclude(&[1,2]);
+        publish(source.path(),source.stage(Purpose::RestoreSelection {batch_id:first.batch_id},&[2]),"","",json!({}),&Budget::default(),&work()).unwrap();
+        let (mut snapshot,capture,paths)=captured(&source);
+        snapshot.legacy_raw=Some(json!({"fraction":f64::from_bits(0x3e5b597464455d8a)}));
+        let target=Fixture::new();
+        let prepared=prepare_portable(target.path(),&snapshot,&capture.manifest,"native-import",&paths,&Budget::default(),&work()).unwrap();
+        let mut conn=crate::case_store::connect(target.path()).unwrap();
+        for commit in [false,true] {
+            let tx=conn.transaction().unwrap();
+            tx.execute("INSERT INTO cases(id,position,body) VALUES('native-import',2,'{\"id\":\"native-import\"}')",[]).unwrap();
+            crate::analysis_context::insert_portable_snapshot(&tx,prepared.snapshot()).unwrap();
+            let imported=insert_prepared_after_context(&tx,&prepared).unwrap();
+            assert_eq!(imported, *prepared.snapshot());
+            assert_eq!(imported.legacy_raw.as_ref().unwrap()["fraction"].as_f64().unwrap().to_bits(),0x3e5b597464455d8a);
+            let masks:u64=tx.query_row("SELECT count(*) FROM exclusion_masks",[],|row|row.get(0)).unwrap();
+            assert_eq!(masks,1);
+            if commit {tx.commit().unwrap();} else {tx.rollback().unwrap();}
+        }
+        let view=visibility(target.path(),&prepared.snapshot().identity(),&Budget::default(),&work()).unwrap();
+        let mut offsets=Vec::new();
+        view.visit(&work(),|member| {if let Locator::ByteOffset(offset)=member.key.locator {offsets.push(offset)};Ok(true)}).unwrap();
+        assert_eq!(offsets,vec![1]);
+        let tx=conn.transaction().unwrap();
+        assert!(insert_prepared_after_context(&tx,&prepared).unwrap_err().contains("já foi publicado"));
+        tx.rollback().unwrap();
+        let tx=conn.transaction().unwrap();
+        tx.execute("UPDATE case_analysis SET body=body||' ' WHERE case_id='native-import'",[]).unwrap();
+        assert!(insert_prepared_after_context(&tx,&prepared).unwrap_err().contains("configuração instalada"));
+        tx.rollback().unwrap();
     }
     #[test]
     fn portable_pristine_case_needs_no_ledger_tables_and_keeps_fresh_identity() {

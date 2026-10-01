@@ -73,6 +73,9 @@ pub(crate) fn query_threads() -> usize {
 pub(crate) fn duckdb_memory_mb() -> u64 {
     budget().duckdb_bytes / MIB
 }
+pub(crate) fn effective_bytes() -> u64 {
+    budget().effective_bytes
+}
 pub(crate) fn text_threads() -> usize {
     budget().text_threads
 }

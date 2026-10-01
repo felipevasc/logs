@@ -234,7 +234,7 @@ window.FieldTransforms = (() => {
   async function refreshFields(draft) {
     if (!await loadDerivedFields(draft.owner)) throw Error("Configuração salva. Não foi possível atualizar os campos; tente novamente.");
     assertOwner(draft);
-    const scope = workspaceScope(), profiles = await api("profile_fields", { filters: [], ...(scope === "case" ? { caseEvents: caseEvents() } : {}) }, { silent: true, analysisOwner: draft.owner });
+    const scope = workspaceScope(), profiles = await api("profile_fields", { filters: [], ...(scope === "case" ? { caseEvents: caseEvents("analysis") } : {}) }, { silent: true, analysisOwner: draft.owner });
     assertOwner(draft);
     const names = [...new Set([...(profiles || []).map(field => field.name), ...state.derivedFields.map(field => field.name)])];
     if (state.columns.includes("comentario")) names.push("comentario");

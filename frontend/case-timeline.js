@@ -28,8 +28,31 @@ window.CaseTimeline = (() => {
   const dayLabel = value => { const date = new Date(value); return `${String(date.getDate()).padStart(2, "0")}/${months[date.getMonth()]}${date.getFullYear() === new Date().getFullYear() ? "" : `/${String(date.getFullYear()).slice(-2)}`}`; };
   const clockLabel = value => timeFormat.format(new Date(value));
   const shortWhen = value => `${dayLabel(value)} ${clockLabel(value)}`;
+  const recordCount = entry => entry.recordCount ?? entry.rows.length;
   const valid = value => Number.isFinite(value) && Math.abs(value) <= 8640000000000000;
   const uniqueId = prefix => `${prefix}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+  const sampledTime = (start, end, fraction) => clamp(start + (end - start) * fraction, -8640000000000000, 8640000000000000);
+  function noteResolver(notes, anchors) {
+    const first = new Map(), memo = new Map();
+    for (const note of notes) if (!first.has(note.id)) first.set(note.id, note);
+    return target => {
+      const chain = [], seen = new Set(); let value = null, id = target;
+      while (id) {
+        if (anchors.has(id)) { value = anchors.get(id); break; }
+        if (memo.has(id)) { value = memo.get(id); break; }
+        if (seen.has(id)) break;
+        seen.add(id); chain.push(id); const note = first.get(id); if (!note) break; id = note.anchor;
+      }
+      for (const key of chain) memo.set(key, value);
+      return value;
+    };
+  }
+  function nativeCallbacks(callbacks) {
+    if (!callbacks.nativeCurrent) return callbacks;
+    const canMutate = () => { if (callbacks.nativeCurrent()) return true; callbacks.notify?.("A cronologia mudou. Reabra a visualização."); return false; };
+    return { ...callbacks, canMutate, menu: (x, y, choices) => callbacks.menu(x, y, choices.map(choice => typeof choice.onClick !== "function" ? choice :
+      { ...choice, onClick: (...args) => canMutate() ? choice.onClick(...args) : false })) };
+  }
   function noteHelp(origin) {
     const title = 'Notas e setas', text = 'Para ligar uma nota a vários itens ou a outra nota, use o botão direito sobre a nota ou sobre o item e escolha "Ligar a…". Para mudar ou remover uma seta, use o botão direito sobre ela. Com teclado, selecione a seta e pressione Enter.';
     if (window.Discovery?.showExplanation) {
@@ -108,7 +131,7 @@ window.CaseTimeline = (() => {
     const anchors = new Map(), notes = new Map();
     for (const entry of entries) {
       anchors.set(entry.id, entry.id);
-      for (const member of entry.members || [entry]) { anchors.set(member.id, entry.id); if (member.id.startsWith("e:")) anchors.set(`a:${member.id}`, entry.id); }
+      for (const member of entry.members || [entry]) { anchors.set(member.id, entry.id); for (const alias of member.aliases || []) anchors.set(alias, entry.id); if (member.id.startsWith("e:") || member.id.startsWith("n:")) anchors.set(`a:${member.id}`, entry.id); }
     }
     for (const group of config.groups) if (!anchors.has(group.id)) {
       const member = group.ids?.find(id => anchors.has(id));
@@ -148,11 +171,25 @@ window.CaseTimeline = (() => {
   function exportRow(entry, notes) {
     return { id: entry.id, type: entry.type, start: entry.start, end: entry.end,
       title: String(entry.title || ""), detail: String(entry.detail || ""), source: String(entry.source || ""), count: entry.rows.length,
-      itemIds: [...new Set((entry.members || [entry]).map(member => member.itemId).filter(id => id != null))],
+      itemIds: [...new Set((entry.members || [entry]).filter(member => !member.itemRef).map(member => member.itemId).filter(id => id != null))],
+      ...((entry.members || [entry]).some(member => member.itemRef) ? { itemRefs: [...new Map((entry.members || [entry]).filter(member => member.itemRef).map(member => [JSON.stringify(member.itemRef), member.itemRef])).values()] } : {}),
       manualId: entry.manual?.id ?? null,
       notes: (notes.get(entry.id) || []).map(note => ({ id: note.id, anchor: note.anchor, text: String(note.text || ""), icon: note.icon || "", color: note.color || null })) };
   }
+  async function nativeRows(c, { limit, maxChars, includeUndated, signal }) {
+    const page = await window.CaseEvidenceTimeline.all(c, { limit, maxChars, signal }), copy = { ...c, timeline: structuredClone(c.timeline || {}) }, collected = window.CaseEvidenceTimeline.collect(copy, page, { includeUntimed: includeUndated, complete: true });
+    const notes = noteMap(collected.config, collected.entries), result = []; let chars = 0, eventCount = 0, start = null, end = null;
+    if (collected.entries.length > limit) throw Error("A cronologia e seus marcos excedem o limite deste relatório.");
+    for (const entry of collected.entries) {
+      if (signal?.aborted) throw new DOMException("Operação cancelada", "AbortError"); const row = exportRow(entry, notes);
+      chars += row.title.length + row.detail.length + row.source.length + row.notes.reduce((sum, note) => sum + note.text.length, 0);
+      if (chars > maxChars) throw Error("O texto completo da cronologia ultrapassa o limite do relatório. Nenhum texto foi omitido.");
+      result.push(row); eventCount += row.count; if (row.start !== null) start = start === null ? row.start : Math.min(start, row.start); if (row.end !== null) end = end === null ? row.end : Math.max(end, row.end);
+    }
+    return { start, end, eventCount, undated: collected.undated, complete: true, rows: result };
+  }
   function rows(c, passes = () => true, { limit = 10000, maxChars = 8000000, includeUndated = false, signal } = {}) {
+    if (window.CaseEvidence?.active === true) return nativeRows(c, { limit, maxChars, includeUndated, signal });
     if (signal?.aborted) throw new DOMException("Operação cancelada", "AbortError");
     limit = clamp(Math.floor(Number(limit) || 10000), 1, 100000);
     maxChars = clamp(Math.floor(Number(maxChars) || 8000000), 1, 16000000);
@@ -182,7 +219,7 @@ window.CaseTimeline = (() => {
     box.classList.add("case-timeline-host");
     if (!tableViews.has(c.id)) { tableViews.set(c.id, { query: "", page: 0 }); if (tableViews.size > 24) tableViews.delete(tableViews.keys().next().value); }
     const view = tableViews.get(c.id), notes = noteMap(config, entries), pageSize = 100;
-    box.innerHTML = `<section class="ct-table-shell"><div class="ct-table-tools"><label class="ct-table-search"><i class="fas fa-magnifying-glass" aria-hidden="true"></i><input type="search" aria-label="Buscar na tabela da timeline" placeholder="Buscar ocorrências ou notas" maxlength="200"></label><button type="button" class="btn ghost small" data-ct-report><i class="fas fa-file-pdf" aria-hidden="true"></i> Relatório PDF</button></div><div class="ct-table-scroll"><table class="ct-data-table"><caption class="sr-only">Timeline do caso em ordem cronológica</caption><thead><tr><th scope="col">Horário local</th><th scope="col">Ocorrência</th><th scope="col">Origem</th><th scope="col" class="ct-table-count">Registros</th><th scope="col">Notas</th></tr></thead><tbody></tbody></table></div><div class="ct-table-pager"><span role="status" aria-live="polite"></span><div><button type="button" class="btn ghost small" data-ct-page="previous" aria-label="Página anterior"><i class="fas fa-chevron-left" aria-hidden="true"></i></button><button type="button" class="btn ghost small" data-ct-page="next" aria-label="Próxima página"><i class="fas fa-chevron-right" aria-hidden="true"></i></button></div></div></section>`;
+    box.innerHTML = `<section class="ct-table-shell"><div class="ct-table-tools"><label class="ct-table-search"><i class="fas fa-magnifying-glass" aria-hidden="true"></i><input type="search" aria-label="${callbacks.nativePage ? "Buscar nesta página da cronologia" : "Buscar na tabela da timeline"}" placeholder="${callbacks.nativePage ? "Buscar nesta página carregada" : "Buscar ocorrências ou notas"}" maxlength="200"></label><button type="button" class="btn ghost small" data-ct-report><i class="fas fa-file-pdf" aria-hidden="true"></i> Relatório PDF</button></div><div class="ct-table-scroll"><table class="ct-data-table"><caption class="sr-only">Timeline do caso em ordem cronológica</caption><thead><tr><th scope="col">Horário local</th><th scope="col">Ocorrência</th><th scope="col">Origem</th><th scope="col" class="ct-table-count">Registros</th><th scope="col">Notas</th></tr></thead><tbody></tbody></table></div><div class="ct-table-pager"><span role="status" aria-live="polite"></span><div><button type="button" class="btn ghost small" data-ct-page="previous" aria-label="Página anterior"><i class="fas fa-chevron-left" aria-hidden="true"></i></button><button type="button" class="btn ghost small" data-ct-page="next" aria-label="Próxima página"><i class="fas fa-chevron-right" aria-hidden="true"></i></button></div></div></section>`;
     const body = box.querySelector("tbody"), search = box.querySelector("input"), status = box.querySelector('[role="status"]'), previous = box.querySelector('[data-ct-page="previous"]'), next = box.querySelector('[data-ct-page="next"]');
     const report = box.querySelector("[data-ct-report]"); report.onclick = () => { if (window.CaseReport?.open) window.CaseReport.open(); else callbacks.notify?.("O relatório PDF ainda está sendo preparado. Tente novamente em instantes."); };
     search.value = view.query;
@@ -198,7 +235,7 @@ window.CaseTimeline = (() => {
       for (const index of visible) {
         const entry = entries[index], rowNotes = notes.get(entry.id) || [], tr = document.createElement("tr"); tr.dataset.id = entry.id;
         const time = document.createElement("td"); time.className = "ct-table-time";
-        const first = document.createElement("time"); first.dateTime = new Date(entry.start).toISOString(); first.textContent = preciseTime(entry.start); time.append(first);
+        const first = document.createElement("time"); if (entry.start !== null) first.dateTime = new Date(entry.start).toISOString(); first.textContent = entry.start === null ? entry.timing === "unavailable" ? "Horário indisponível" : "Sem horário" : preciseTime(entry.start); time.append(first);
         if (entry.end !== entry.start) { const last = document.createElement("time"); last.dateTime = new Date(entry.end).toISOString(); last.textContent = `até ${preciseTime(entry.end)}`; time.append(last); }
         const main = document.createElement("td"), open = document.createElement(entry.rows.length ? "button" : "strong"); open.className = "ct-table-title"; open.textContent = preview(entry.title, 180); open.title = preview(entry.title, 600);
         if (entry.rows.length) { open.type = "button"; open.onclick = () => { if (entry.rows.length === 1) callbacks.detail(entry.rows[0]); else { const rect = open.getBoundingClientRect(); callbacks.bucket(rect.left, rect.bottom, entry.rows); } }; }
@@ -234,6 +271,9 @@ window.CaseTimeline = (() => {
   }
 
   function render(box, c, mode, callbacks) {
+    if (window.CaseEvidence?.active === true && !callbacks.collected) return mode === "table" ? window.CaseEvidenceDisplay.render(box, c) : window.CaseEvidenceDisplay.renderGraph(box, c, mode, callbacks);
+    callbacks = nativeCallbacks(callbacks);
+    const mayMutate = () => callbacks.canMutate?.() !== false;
     const isolated = !!callbacks.isolated, selection = isolated ? new Set() : sharedSelection;
     if (!isolated) {
       resizeObserver?.disconnect(); resizeObserver = null;
@@ -243,6 +283,9 @@ window.CaseTimeline = (() => {
     const scrollKey = JSON.stringify([c.id, mode]);
     const { config, entries } = callbacks.collected || collect(c, callbacks.passes);
     if (mode === "table") { renderTable(box, c, config, entries, callbacks); return; }
+    const visibleAnnotations = callbacks.visibleAnnotations || config.annotations, noteIds = new Set(config.annotations.map(note => note.id));
+    const membersFor = async entry => callbacks.members ? callbacks.members(entry) : entry.members || [entry];
+    const actionError = error => callbacks.notify?.(String(error.message || error));
     const presentIds = new Set(entries.map(entry => entry.id));
     for (const id of selection) if (!presentIds.has(id)) selection.delete(id);
     box.classList.add("case-timeline-host");
@@ -255,7 +298,7 @@ window.CaseTimeline = (() => {
       form.querySelector("[data-empty-cancel]").onclick = cancel;
       form.onkeydown = event => { if (event.key === "Escape") { event.preventDefault(); cancel(); } };
       form.onsubmit = event => {
-        event.preventDefault();
+        event.preventDefault(); if (!mayMutate()) return;
         const values = new FormData(form), name = String(values.get("name")).trim(), start = new Date(values.get("start")).getTime();
         if (!name || !valid(start)) { callbacks.notify("Preencha o nome e um horário válido."); return; }
         (c.manual ||= []).push({ id: uniqueId("m"), createdAt: Date.now(), name, start, end: null, description: "" });
@@ -274,22 +317,15 @@ window.CaseTimeline = (() => {
       if (!sourceLanes && !isolated) { sourceLanes = new Map(); laneMap.set(entry.source, sourceLanes); }
       let lane = isolated ? null : sourceLanes.get(entry.title);
       if (!lane) { lane = { index: matrixLanes.length, title: entry.title, source: entry.source, color: entry.color, entries: [], ids: new Set(), count: 0, noteCount: 0 }; if (!isolated) sourceLanes.set(entry.title, lane); matrixLanes.push(lane); }
-      lane.entries.push(index); lane.count += entry.rows.length; lane.ids.add(entry.id);
+      lane.entries.push(index); lane.count += recordCount(entry); lane.ids.add(entry.id);
       for (const member of entry.members || []) lane.ids.add(member.id);
       entryLane.set(entry.id, lane);
     });
     const noteLanes = new Map();
     for (const lane of matrixLanes) for (const id of lane.ids) { noteLanes.set(id, lane); if (id.startsWith("e:")) noteLanes.set(`a:${id}`, lane); }
     for (const group of config.groups) if (!noteLanes.has(group.id)) { const first = group.ids?.find(id => noteLanes.has(id)); if (first) noteLanes.set(group.id, noteLanes.get(first)); }
-    const resolveNoteLane = (targetId, visited = new Set()) => {
-      if (!targetId || visited.has(targetId)) return null;
-      visited.add(targetId);
-      if (noteLanes.has(targetId)) return noteLanes.get(targetId);
-      const parentNote = config.annotations.find(a => a.id === targetId);
-      if (parentNote) return resolveNoteLane(parentNote.anchor, visited);
-      return null;
-    };
-    for (const note of config.annotations) { const lane = noteLanes.get(note.anchor) || resolveNoteLane(note.anchor); if (lane) lane.noteCount++; }
+    const resolveNoteLane = noteResolver(config.annotations, noteLanes);
+    for (const note of visibleAnnotations) { const lane = noteLanes.get(note.anchor) || resolveNoteLane(note.anchor); if (lane) lane.noteCount++; }
     let matrixHeight = 48;
     for (const lane of matrixLanes) {
       lane.y = matrixHeight; lane.height = 44 + lane.noteCount * 64; matrixHeight += lane.height;
@@ -317,7 +353,7 @@ window.CaseTimeline = (() => {
       return coord(points.at(-1)) + Math.min(90, (time - entries.at(-1).start) / range * 90);
     };
     const timeAt = coordinate => {
-      if (horizontal) return Math.round(start + clamp((coordinate - labelWidth - 24) / plotWidth, 0, 1) * matrixRange);
+      if (horizontal) return Math.round(sampledTime(start, end, clamp((coordinate - labelWidth - 24) / plotWidth, 0, 1)));
       const coord = point => horizontal ? point.x : point.y;
       if (coordinate <= coord(points[0])) return entries[0].start;
       for (let i = 1; i < entries.length; i++) if (coordinate <= coord(points[i])) {
@@ -328,17 +364,17 @@ window.CaseTimeline = (() => {
       const tail = positionFor(end);
       return Math.round(entries.at(-1).start + clamp((coordinate - last) / Math.max(1, tail - last), 0, 1) * (end - entries.at(-1).start));
     };
-    const eventCount = entries.reduce((count, entry) => count + entry.rows.length, 0);
+    const eventCount = entries.reduce((count, entry) => count + recordCount(entry), 0);
     box.innerHTML = `<div class="ct-shell ${horizontal ? "ct-horizontal ct-matrix" : "ct-vertical"}">
       <div class="ct-top"><div><strong>${(horizontal ? matrixLanes.length : entries.length).toLocaleString("pt-BR")} ${horizontal ? "linhas" : "ocorrências"}</strong><span>${shortWhen(start)} — ${shortWhen(end)}</span></div>
       <div class="ct-top-actions">${horizontal ? `<div class="ct-zoom" aria-label="Escala da linha do tempo"><button type="button" class="btn ghost small" data-ct-zoom="out" aria-label="Diminuir escala" ${matrixZoom === 1 ? "disabled" : ""}>−</button><button type="button" class="btn ghost small" data-ct-zoom="fit" title="Mostrar todo o período">${matrixZoom === 1 ? "Todo o período" : `${matrixZoom}× · Enquadrar`}</button><button type="button" class="btn ghost small" data-ct-zoom="in" aria-label="Ampliar escala" ${matrixZoom === 8 ? "disabled" : ""}>+</button></div>` : ""}<button type="button" class="btn ghost small" data-ct-action="compact" aria-pressed="${config.compact !== false}" title="Resume eventos consecutivos do mesmo tipo, separados por até 5 minutos"><i class="fas fa-compress"></i> Resumir repetições</button><button type="button" class="btn ghost small" data-ct-action="add"><i class="fas fa-plus"></i> Marco</button><button type="button" class="btn ghost small" data-ct-action="note"><i class="fas fa-comment-dots"></i> Nota</button><button type="button" class="btn ghost small ct-group-action" data-ct-action="group" hidden>Agrupar seleção</button><button type="button" class="btn ghost small ct-clear-action" data-ct-action="clear" hidden>Limpar seleção</button></div></div>
-      <div class="ct-hint"><span>${eventCount.toLocaleString("pt-BR")} registros</span><button type="button" class="icon-btn ct-info" aria-label="Como usar a timeline" title="${horizontal ? "Posições proporcionais ao tempo; títulos iguais na mesma linha." : "Ordem cronológica, espaçamento adaptado para leitura."} Shift + clique: trecho · Ctrl + clique: adicionar · Enter: abrir · botão direito: editar"><i class="fas fa-circle-info"></i></button></div>
+      <div class="ct-hint"><span>${eventCount.toLocaleString("pt-BR")} registros${callbacks.pageLabel ? ` · ${safe(callbacks.pageLabel)}` : ""}</span><button type="button" class="icon-btn ct-info" aria-label="Como usar a timeline" title="${horizontal ? "Posições proporcionais ao tempo; títulos iguais na mesma linha." : "Ordem cronológica, espaçamento adaptado para leitura."} Shift + clique: trecho · Ctrl + clique: adicionar · Enter: abrir · botão direito: editar"><i class="fas fa-circle-info"></i></button></div>
       ${horizontal ? '<div class="ct-minimap" tabindex="0" role="scrollbar" aria-label="Navegar pela cronologia" aria-controls="ct-viewport" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" title="Clique ou use as setas para navegar"><div class="ct-minimap-track"></div><div class="ct-minimap-window"></div></div>' : ""}
       <div class="ct-scroll" id="ct-viewport"><div class="ct-board" style="${horizontal ? `width:${actualWidth}px;height:${height}px` : `height:${height}px`}">
         <div class="ct-axis"></div><svg class="ct-links" aria-hidden="true"></svg><div class="ct-items"></div><div class="ct-notes"></div><svg class="ct-controls" aria-label="Setas das notas"></svg></div></div>
       <div class="ct-editor-backdrop" hidden><form class="ct-editor" role="dialog" aria-modal="true" aria-labelledby="ct-editor-title"><div class="ct-editor-head"><strong id="ct-editor-title"></strong><button type="button" class="ct-close" aria-label="Fechar">×</button></div><div class="ct-editor-fields"></div><div class="ct-editor-actions"><button type="button" class="btn ghost small ct-cancel">Cancelar</button><button type="submit" class="btn primary small">Salvar</button></div></form></div></div>`;
     const shell = box.querySelector(".ct-shell"), board = shell.querySelector(".ct-board");
-    window.TimelineExport?.attach(shell.querySelector(".ct-top-actions"), { source: shell, type: horizontal ? "matrix" : "vertical", title: `${c.name || "Caso"} · Linha do tempo`, subtitle: `${when(start)} — ${when(end)} · ${eventCount.toLocaleString("pt-BR")} registros`, filename: `${c.name || "caso"}-timeline-${horizontal ? "horizontal" : "vertical"}` });
+    window.TimelineExport?.attach(shell.querySelector(".ct-top-actions"), { source: shell, type: horizontal ? "matrix" : "vertical", title: `${c.name || "Caso"} · Linha do tempo`, subtitle: `${when(start)} — ${when(end)} · ${eventCount.toLocaleString("pt-BR")} registros${callbacks.pageLabel ? ` · ${callbacks.pageLabel}` : ""}`, filename: `${c.name || "caso"}-timeline-${horizontal ? "horizontal" : "vertical"}` });
     const info = shell.querySelector(".ct-info");
     info.onclick = () => window.Discovery?.showExplanation("Como usar a timeline", info.title, info);
     const itemLayer = shell.querySelector(".ct-items"), noteLayer = shell.querySelector(".ct-notes");
@@ -362,6 +398,7 @@ window.CaseTimeline = (() => {
     };
     if (horizontal) shell.querySelectorAll("[data-ct-zoom]").forEach(button => {
       button.onclick = () => {
+        if (!mayMutate()) return;
         const viewport = shell.querySelector(".ct-scroll"), center = viewport.scrollLeft + viewport.clientWidth / 2;
         config.matrixZoom = button.dataset.ctZoom === "fit" ? 1 : clamp(matrixZoom * (button.dataset.ctZoom === "in" ? 2 : .5), 1, 8);
         callbacksSave();
@@ -374,7 +411,7 @@ window.CaseTimeline = (() => {
       shell.querySelectorAll(".ct-range-bar").forEach(bar => { bar.classList.toggle("is-selected", selection.has(bar.dataset.id)); });
       if (horizontal) shell.querySelectorAll(".ct-lane-label").forEach((label, index) => { const selected = matrixLanes[index].entries.every(i => selection.has(entries[i].id)); label.classList.toggle("is-selected", selected); label.setAttribute("aria-pressed", String(selected)); });
       const selected = selectedEntries();
-      const canGroup = selected.flatMap(entry => entry.members || [entry]).filter(entry => entry.type === "event").length >= 2;
+      const canGroup = selected.reduce((count, entry) => count + recordCount(entry), 0) >= 2;
       shell.querySelector(".ct-group-action").hidden = !canGroup || selected.length < 2;
       shell.querySelector(".ct-group-action").textContent = `Agrupar ${selected.length} selecionados`;
       shell.querySelector(".ct-clear-action").hidden = !selected.length;
@@ -382,7 +419,7 @@ window.CaseTimeline = (() => {
     // Pivots from a Case record to the same user, address, host or process anywhere.
     const entityPivots = (entry, event) => {
       const ev = entry.rows?.[0];
-      if (!ev || !window.EntityMenu || !window.QueryLang) return [];
+      if (!ev || ev.kind === "preserved_member" || !window.EntityMenu || !window.QueryLang) return [];
       const seen = new Set(), list = [];
       for (const role of ["@user", "@src_ip", "@dst_ip", "@host", "@process"]) {
         const value = window.QueryLang.fieldValue(ev, window.QueryLang.resolve(role));
@@ -394,21 +431,26 @@ window.CaseTimeline = (() => {
     };
     const colorMenu = (entry, x, y) => callbacks.menu(x, y, COLORS.map((color, index) => ({
       icon: "fa-circle", label: ["Verde", "Azul", "Lilás", "Âmbar", "Coral", "Cinza"][index],
-      onClick: () => {
+      onClick: async () => {
+        try {
+        if (callbacks.nativeCurrent && !callbacks.nativeCurrent()) throw Error("A cronologia mudou. Reabra a visualização.");
+        const members = entry.type === "auto" ? await membersFor(entry) : null;
         if (entry.type === "manual") entry.manual.color = color;
         else if (entry.type === "group") config.groups.find(g => g.id === entry.id).color = color;
-        else if (entry.type === "auto") entry.members.forEach(member => (config.edits[member.id] ||= {}).color = color);
+        else if (entry.type === "auto") members.forEach(member => (config.edits[member.id] ||= {}).color = color);
         else (config.edits[entry.id] ||= {}).color = color;
         callbacksSave();
+        } catch (error) { actionError(error); }
       },
     })));
     function openEditor(type, entry, time, noteAnchor = null) {
+      if (!mayMutate()) return;
       const backdrop = shell.querySelector(".ct-editor-backdrop"), form = backdrop.querySelector("form");
       const heading = backdrop.querySelector(".ct-editor-head strong"), fields = backdrop.querySelector(".ct-editor-fields");
-      const local = value => { const date = new Date(value); return new Date(value - date.getTimezoneOffset() * 60000).toISOString().slice(0, 23); };
+      const local = value => { const date = new Date(value); return new Date(clamp(value - date.getTimezoneOffset() * 60000, -8640000000000000, 8640000000000000)).toISOString().replace(/Z$/, ""); };
       if (type === "manual") {
         heading.textContent = entry ? "Editar marco" : "Novo marco";
-        fields.innerHTML = `<label>Nome<input name="name" maxlength="120" required value="${safe(entry?.title || "")}"></label><label>Início<input name="start" type="datetime-local" step="0.001" required value="${local(entry?.start ?? time ?? Date.now())}"></label><label>Fim <span>(opcional)</span><input name="end" type="datetime-local" step="0.001" value="${entry?.end > entry?.start ? local(entry.end) : ""}"></label><label>Descrição<textarea name="description" rows="3" maxlength="1200">${safe(entry?.detail || "")}</textarea></label>`;
+        fields.innerHTML = `<label>Nome<input name="name" maxlength="120" required value="${safe(entry?.editTitle ?? entry?.title ?? "")}"></label><label>Início<input name="start" type="datetime-local" step="0.001" required value="${local(entry?.start ?? time ?? Date.now())}"></label><label>Fim <span>(opcional)</span><input name="end" type="datetime-local" step="0.001" value="${entry?.end > entry?.start ? local(entry.end) : ""}"></label><label>Descrição<textarea name="description" rows="3" maxlength="1200">${safe(entry?.manual?.description ?? entry?.detail ?? "")}</textarea></label>`;
       } else if (type === "annotation") {
         heading.textContent = entry ? "Editar nota" : "Nova nota";
         fields.innerHTML = `<label>Texto <span>(opcional com ícone)</span><textarea name="text" rows="3" maxlength="1500">${safe(entry?.text || "")}</textarea></label><div class="ct-note-icon-host"></div>`;
@@ -426,7 +468,7 @@ window.CaseTimeline = (() => {
         fields.innerHTML = `<label>Pontas<select name="arrow"><option value="forward" ${!entry.arrow || entry.arrow === "forward" ? "selected" : ""}>${destLabel}</option><option value="back" ${entry.arrow === "back" ? "selected" : ""}>${srcLabel}</option><option value="both" ${entry.arrow === "both" ? "selected" : ""}>Nas duas pontas</option><option value="none" ${entry.arrow === "none" ? "selected" : ""}>Sem pontas</option></select></label><label>Traço<select name="lineStyle"><option value="solid" ${!entry.lineStyle || entry.lineStyle === "solid" ? "selected" : ""}>Contínuo</option><option value="dashed" ${entry.lineStyle === "dashed" ? "selected" : ""}>Tracejado</option><option value="dotted" ${entry.lineStyle === "dotted" ? "selected" : ""}>Pontilhado</option></select></label><label>${startSideLabel}<select name="startSide">${sideOptions(entry.endpoints?.[modeKey]?.start || "auto")}</select></label><label>${endSideLabel}<select name="endSide">${sideOptions(entry.endpoints?.[modeKey]?.end || "auto")}</select></label>`;
       } else {
         heading.textContent = "Editar título";
-        fields.innerHTML = `<label>Nome<input name="name" maxlength="120" required value="${safe(entry?.title || "")}"></label>`;
+        fields.innerHTML = `<label>Nome<input name="name" maxlength="120" required value="${safe(entry?.editTitle ?? entry?.title ?? "")}"></label>`;
       }
       const returnFocus = type === "arrow" ? arrowTarget(entry.id) || document.activeElement : document.activeElement;
       backdrop.hidden = false;
@@ -442,9 +484,14 @@ window.CaseTimeline = (() => {
       backdrop.querySelector(".ct-close").onclick = close;
       backdrop.querySelector(".ct-cancel").onclick = close;
       backdrop.onclick = event => { if (event.target === backdrop) close(); };
-      form.onsubmit = event => {
+      form.onsubmit = async event => {
         event.preventDefault();
         const values = new FormData(form);
+        const editorGeneration = fields.firstElementChild;
+        try {
+        const members = entry && !["manual", "annotation", "arrow"].includes(type) && entry.type !== "group" ? await membersFor(entry) : null;
+        if (backdrop.hidden || fields.firstElementChild !== editorGeneration) return;
+        if (callbacks.nativeCurrent && !callbacks.nativeCurrent()) throw Error("A cronologia mudou. Reabra a visualização.");
         if (!["annotation", "arrow"].includes(type) && !String(values.get("name")).trim()) { callbacks.notify("Dê um nome para identificar este item."); return; }
         if (type === "manual") {
           const from = new Date(values.get("start")).getTime(), to = values.get("end") ? new Date(values.get("end")).getTime() : null;
@@ -477,17 +524,23 @@ window.CaseTimeline = (() => {
           if (entry.type === "group") {
             const group = config.groups.find(group => group.id === entry.id);
             if (group) group.name = name;
-          } else for (const member of entry.members || [entry]) (config.edits[member.id] ||= {}).title = name;
+          } else for (const member of members) (config.edits[member.id] ||= {}).title = name;
         }
         close(); callbacksSave();
+        } catch (error) { actionError(error); }
       };
     }
+    callbacks.installNoteEditor?.(annotation => openEditor("annotation", annotation));
     shell.querySelector('[data-ct-action="add"]').onclick = () => openEditor("manual", null, entries[Math.floor(entries.length / 2)].start);
     shell.querySelector('[data-ct-action="note"]').onclick = () => openEditor("annotation", null);
-    shell.querySelector('[data-ct-action="compact"]').onclick = () => { config.compact = config.compact === false; selection.clear(); callbacksSave(); };
+    shell.querySelector('[data-ct-action="compact"]').onclick = () => { if (!mayMutate()) return; config.compact = config.compact === false; selection.clear(); callbacksSave(); };
     shell.querySelector('[data-ct-action="clear"]').onclick = () => { selection.clear(); selectionAnchor = null; syncSelection(); };
-    shell.querySelector('[data-ct-action="group"]').onclick = () => {
-      const members = selectedEntries().flatMap(entry => entry.members || [entry]).filter(entry => entry.type === "event");
+    shell.querySelector('[data-ct-action="group"]').onclick = async () => {
+      try {
+      const selected = selectedEntries(), members = [];
+      if (callbacks.members && selected.reduce((count, entry) => count + recordCount(entry), 0) > 10000) throw Error("Esta ação admite até 10.000 referências. Selecione menos entradas.");
+      for (const entry of selected) if (recordCount(entry)) members.push(...await membersFor(entry));
+      if (callbacks.nativeCurrent && !callbacks.nativeCurrent() || selected.some(entry => !selection.has(entry.id))) throw Error("A seleção da cronologia mudou. Selecione novamente.");
       const ids = [...new Set(members.map(entry => entry.id))];
       if (ids.length < 2) return;
       const idSet = new Set(ids);
@@ -503,6 +556,7 @@ window.CaseTimeline = (() => {
       });
       config.groups.push({ id: uniqueId("g"), ids, name: members[0].title, color: members[0].color });
       selection.clear(); callbacksSave();
+      } catch (error) { actionError(error); }
     };
     board.ondblclick = event => {
       if (!event.target.closest(".ct-entry,.ct-note,.ct-controls,.ct-lane-label,.ct-matrix-ruler")) {
@@ -530,7 +584,7 @@ window.CaseTimeline = (() => {
       const corner = document.createElement("span"); corner.className = "ct-matrix-corner"; corner.textContent = "Ocorrência / origem"; ruler.append(corner);
       const steps = Math.max(2, Math.floor(plotWidth / 135));
       for (let i = 0; i <= steps; i++) {
-        const time = start + matrixRange * i / steps, x = matrixPosition(time);
+        const time = sampledTime(start, end, i / steps), x = labelWidth + 24 + plotWidth * i / steps;
         const tick = document.createElement("span"); tick.className = "ct-matrix-time"; tick.style.left = `${x}px`; tick.dataset.edge = i === 0 ? "first" : i === steps ? "last" : "middle";
         tick.innerHTML = `<small>${safe(dayLabel(time))}</small><strong>${safe(clockLabel(time))}</strong>`; tick.title = when(time); ruler.append(tick);
         const line = document.createElement("span"); line.className = "ct-matrix-gridline"; line.style.left = `${x}px`; board.append(line);
@@ -544,7 +598,7 @@ window.CaseTimeline = (() => {
         label.onclick = event => { if (!event.ctrlKey && !event.metaKey) selection.clear(); lane.entries.forEach(index => selection.add(entries[index].id)); selectionAnchor = entries[lane.entries[0]].id; syncSelection(); };
         label.oncontextmenu = event => entryNodes.get(entries[lane.entries[0]].id)?.oncontextmenu(event);
         label.onkeydown = event => { if (event.key === "ContextMenu" || event.shiftKey && event.key === "F10") { event.preventDefault(); const rect = label.getBoundingClientRect(); label.oncontextmenu({ preventDefault() {}, clientX: rect.right, clientY: rect.bottom }); } else if (event.key === "ArrowRight") { event.preventDefault(); entryNodes.get(entries[lane.entries[0]].id)?.focus(); } };
-        label.ondblclick = event => { event.stopPropagation(); const rows = lane.entries.flatMap(index => entries[index].rows); const bounds = label.getBoundingClientRect(); if (rows.length === 1) callbacks.detail(rows[0]); else if (rows.length) callbacks.bucket(bounds.right, bounds.bottom, rows); else openEditor("manual", entries[lane.entries[0]]); };
+        label.ondblclick = event => { event.stopPropagation(); if (callbacks.openEntries && lane.count) { const rect = label.getBoundingClientRect(); return callbacks.openEntries(lane.entries.map(index => entries[index]), rect.right, rect.bottom); } const rows = lane.entries.flatMap(index => entries[index].rows); const bounds = label.getBoundingClientRect(); if (rows.length === 1) callbacks.detail(rows[0]); else if (rows.length) callbacks.bucket(bounds.right, bounds.bottom, rows); else openEditor("manual", entries[lane.entries[0]]); };
         row.append(label); board.append(row);
       }
     }
@@ -553,7 +607,7 @@ window.CaseTimeline = (() => {
       const side = saved.side || (index % 2 ? "right" : "left");
       const offset = clamp(saved.offset || 0, 0, 100);
       const lane = rangeLanes.get(entry.id) || 0, gutter = rangeGutter[side];
-      const isGrouped = entry.type === "group" || entry.type === "auto" || (entry.rows && entry.rows.length > 1);
+      const isGrouped = entry.type === "group" || entry.type === "auto" || (entry.rows && recordCount(entry) > 1);
       const hasRange = entry.end > entry.start;
       const isSingle = !isGrouped && !hasRange;
       const node = document.createElement("article");
@@ -564,13 +618,13 @@ window.CaseTimeline = (() => {
       node.dataset.id = entry.id; node.style.setProperty("--entry-color", entry.color);
       node.dataset.side = side;
       node.title = `${preview(entry.title)}\n${preview(entry.source, 180)} · ${when(entry.start)}${entry.end > entry.start ? ` → ${when(entry.end)}` : ""}${entry.detail ? `\n${preview(entry.detail, 800)}` : ""}`;
-      node.innerHTML = `<strong>${safe(preview(entry.title, 180))}</strong>${entry.rows.length > 1 ? `<span class="ct-entry-count" aria-label="${entry.rows.length} registros" title="${entry.type === "auto" ? "Repetições resumidas automaticamente" : "Registros agrupados no caso"}">${entry.rows.length.toLocaleString("pt-BR")}</span>` : ""}<button class="ct-open" type="button" tabindex="-1" title="Abrir detalhes" aria-label="Abrir detalhes de ${safe(preview(entry.title, 180))}"><i class="fas fa-arrow-up-right-from-square"></i></button>`;
+      node.innerHTML = `<strong>${safe(preview(entry.title, 180))}</strong>${recordCount(entry) > 1 ? `<span class="ct-entry-count" aria-label="${recordCount(entry)} registros" title="${entry.type === "auto" ? "Repetições resumidas automaticamente" : "Registros agrupados no caso"}">${recordCount(entry).toLocaleString("pt-BR")}</span>` : ""}<button class="ct-open" type="button" tabindex="-1" title="Abrir detalhes" aria-label="Abrir detalhes de ${safe(preview(entry.title, 180))}"><i class="fas fa-arrow-up-right-from-square"></i></button>`;
       node.style.setProperty("--entry-offset", `${offset}px`);
       node.style.setProperty("--range-gutter", `${gutter}px`);
       node.style.setProperty("--range-lane", `${lane * laneStep}px`);
       if (horizontal) { node.style.left = `${point.x - 7}px`; node.style.top = `${point.y - 10}px`; }
       else node.style.top = `${point.y - 11}px`;
-      const open = () => { if (entry.type === "manual") openEditor("manual", entry); else if (entry.rows.length === 1) callbacks.detail(entry.rows[0]); else callbacks.bucket(node.getBoundingClientRect().left, node.getBoundingClientRect().bottom, entry.rows); };
+      const open = () => { if (entry.type === "manual") openEditor("manual", entry); else if (callbacks.openEntry) callbacks.openEntry(entry); else if (recordCount(entry) === 1) callbacks.detail(entry.rows[0]); else callbacks.bucket(node.getBoundingClientRect().left, node.getBoundingClientRect().bottom, entry.rows); };
       node.querySelector(".ct-open").onclick = event => { event.stopPropagation(); open(); };
       node.ondblclick = event => { event.stopPropagation(); open(); };
       node.onclick = event => {
@@ -675,14 +729,16 @@ window.CaseTimeline = (() => {
             label: "Remover do caso",
             danger: true,
             onClick: async () => {
-              const members = entry.members || [entry], targets = members.map(member => member.occurrence);
+              let members; try { members = callbacks.members ? await callbacks.members(entry) : entry.members || [entry]; } catch (error) { callbacks.notify?.(String(error.message || error)); return; }
+              const targets = members.map(member => member.occurrence);
               if (!callbacks.removeOccurrences || targets.some(target => !target)) { callbacks.notify?.("Não foi possível identificar esta ocorrência. Atualize a Timeline."); return; }
               await callbacks.removeOccurrences(c, targets, [entry.id], callbacksSave);
             }
           });
         }
         if (entry.type === "group") menu.push({ icon: "fa-layer-group", label: "Desagrupar", onClick: () => {
-          const targetMemberId = entry.members[0].id;
+          const targetMemberId = entry.firstMemberEntryId || entry.members?.[0]?.id;
+          if (!targetMemberId || callbacks.nativeCurrent && !callbacks.nativeCurrent()) { actionError(Error("A cronologia mudou. Reabra a visualização.")); return; }
           config.annotations.forEach(note => {
             if (note.anchor === entry.id) note.anchor = targetMemberId;
             if (note.links) note.links.forEach(l => { if (l.targetId === entry.id) l.targetId = targetMemberId; });
@@ -694,9 +750,9 @@ window.CaseTimeline = (() => {
         callbacks.menu(event.clientX, event.clientY, menu);
       };
       let drag = null;
-      node.onpointerdown = event => { if (horizontal || event.button !== 0 || event.target.closest("button")) return; drag = { x: event.clientX, y: event.clientY, left: node.offsetLeft, top: node.offsetTop, originalLeft: node.style.left, originalTop: node.style.top, originalRight: node.style.right }; node.setPointerCapture(event.pointerId); };
+      node.onpointerdown = event => { if (horizontal || event.button !== 0 || event.target.closest("button") || !mayMutate()) return; drag = { x: event.clientX, y: event.clientY, left: node.offsetLeft, top: node.offsetTop, originalLeft: node.style.left, originalTop: node.style.top, originalRight: node.style.right }; node.setPointerCapture(event.pointerId); };
       node.onpointermove = event => { if (!drag) return; const delta = horizontal ? event.clientY - drag.y : event.clientX - drag.x; if (Math.abs(delta) < 4 && !drag.moved) return; drag.moved = true; node.classList.add("dragging"); if (horizontal) node.style.top = `${drag.top + delta}px`; else { node.style.right = "auto"; node.style.left = `${drag.left + delta}px`; } redrawLinks(); };
-      node.onpointerup = event => { if (!drag) return; if (drag.moved) {
+      node.onpointerup = event => { if (!drag) return; if (!mayMutate()) { node.onpointercancel(); return; } if (drag.moved) {
         const rect = board.getBoundingClientRect();
         const side = horizontal ? (node.offsetTop < centerY ? "left" : "right") : (node.offsetLeft + node.offsetWidth / 2 < rect.width / 2 ? "left" : "right");
         const sideGutter = rangeGutter[side];
@@ -708,7 +764,7 @@ window.CaseTimeline = (() => {
       itemLayer.appendChild(node);
       entryNodes.set(entry.id, node);
       if (horizontal) {
-        const members = entry.members || [entry];
+        const members = entry.nativeEntry ? [] : entry.members || [entry];
         for (const member of members) {
           const marker = document.createElement("span"); marker.className = "ct-matrix-dot"; marker.dataset.markerAnchor = member.id;
           marker.style.left = `${matrixPosition(member.start) - point.x + 2}px`;
@@ -731,7 +787,7 @@ window.CaseTimeline = (() => {
         else { day.style.left = "50%"; day.style.top = `${point.y - 32}px`; }
         itemLayer.appendChild(day);
       }
-      if (entry.end > entry.start && (!horizontal || entry.type === "manual")) {
+      if (entry.end > entry.start && (!horizontal || entry.type === "manual" || entry.nativeEntry)) {
         const bar = document.createElement("div"); bar.className = "ct-range-bar"; bar.dataset.id = entry.id; bar.style.background = entry.color;
         if (horizontal) { bar.style.left = `${point.x}px`; bar.style.width = `${Math.max(2, positionFor(entry.end) - point.x)}px`; bar.style.top = `${point.y - 3}px`; bar.title = `${entry.title} · ${when(entry.start)} → ${when(entry.end)}`; }
         else { bar.style.top = `${point.y}px`; bar.style.height = `${Math.max(14, positionFor(entry.end) - point.y)}px`; bar.style.left = `calc(50% ${side === "left" ? "-" : "+"} ${side === "left" ? 17 + lane * laneStep : 14 + lane * laneStep}px)`; }
@@ -745,25 +801,13 @@ window.CaseTimeline = (() => {
       const member = group.ids?.find(id => anchors.has(id));
       if (member) anchors.set(group.id, anchors.get(member));
     }
-    const resolveAnchorIndex = (annotation, visited = new Set()) => {
-      if (!annotation || visited.has(annotation.id)) return 0;
-      visited.add(annotation.id);
-      if (anchors.has(annotation.anchor)) return anchors.get(annotation.anchor);
-      const parentNote = config.annotations.find(a => a.id === annotation.anchor);
-      if (parentNote) return resolveAnchorIndex(parentNote, visited);
-      return 0;
-    };
-    const anchorIndex = annotation => resolveAnchorIndex(annotation);
-    const anchorPoint = target => {
-      const targetId = typeof target === "string" ? target : target?.anchor;
-      if (!targetId) return points[0] || { x: 0, y: 0 };
-      if (horizontal && markerPoints.has(targetId)) return markerPoints.get(targetId);
-      const idx = anchors.get(targetId);
-      if (idx != null && idx >= 0) return points[idx];
-      const parentNote = config.annotations.find(a => a.id === targetId);
-      if (parentNote) return anchorPoint(parentNote.anchor);
-      return points[0] || { x: 0, y: 0 };
-    };
+    const resolveAnchorIndex = noteResolver(config.annotations, anchors);
+    const anchorIndex = annotation => resolveAnchorIndex(annotation.anchor) ?? (callbacks.nativeCurrent ? -1 : 0);
+    const pointAnchors = new Map([...anchors].map(([id, index]) => [id, points[index]]));
+    if (horizontal) for (const [id, point] of markerPoints) pointAnchors.set(id, point);
+    const resolveAnchorPoint = noteResolver(config.annotations, pointAnchors);
+    const anchorPoint = target => resolveAnchorPoint(typeof target === "string" ? target : target?.anchor) || points[0] || { x: 0, y: 0 };
+
     const pointOnSide = (r, side) => {
       const middleX = r.left + r.width / 2, middleY = r.top + r.height / 2;
       if (side === "left") return { x: r.left - 7, y: middleY };
@@ -807,14 +851,14 @@ window.CaseTimeline = (() => {
 
     const getTimelineLinks = () => {
       const links = [];
-      for (const annotation of config.annotations) {
-        if (!annotation.arrowHidden && annotation.anchor) {
+      for (const annotation of visibleAnnotations) {
+        if (!annotation.arrowHidden && annotation.anchor && (!callbacks.targetVisible || callbacks.targetVisible(annotation.anchor))) {
           links.push({
             id: annotation.id,
             annotation,
             isPrimary: true,
             targetId: annotation.anchor,
-            isNoteToNote: config.annotations.some(n => n.id === annotation.anchor),
+            isNoteToNote: noteIds.has(annotation.anchor),
             arrow: annotation.arrow || "forward",
             lineStyle: annotation.lineStyle || "solid",
             color: annotation.color || "#d3a9fa",
@@ -823,14 +867,14 @@ window.CaseTimeline = (() => {
           });
         }
         for (const extra of annotation.links || []) {
-          if (!extra.targetId) continue;
+          if (!extra.targetId || callbacks.targetVisible && !callbacks.targetVisible(extra.targetId)) continue;
           links.push({
             id: extra.id,
             annotation,
             extra,
             isPrimary: false,
             targetId: extra.targetId,
-            isNoteToNote: config.annotations.some(n => n.id === extra.targetId),
+            isNoteToNote: noteIds.has(extra.targetId),
             arrow: extra.arrow || "forward",
             lineStyle: extra.lineStyle || "solid",
             color: extra.color || annotation.color || "#d3a9fa",
@@ -838,6 +882,10 @@ window.CaseTimeline = (() => {
             endpoints: extra.endpoints,
           });
         }
+      }
+      if (curveDrag?.draft) {
+        const link = links.find(value => value.id === curveDrag.link.id), property = curveDrag.kind === "endpoint" ? "endpoints" : "curve";
+        if (link) link[property] = { ...link[property], [horizontal ? "matrix" : "vertical"]: curveDrag.draft };
       }
       return links;
     };
@@ -1077,7 +1125,7 @@ window.CaseTimeline = (() => {
           handle.setAttribute("r", "7"); handle.setAttribute("fill", color);
           handle.setAttribute("title", "Arraste para ajustar a curva");
           handle.onpointerdown = event => {
-            event.preventDefault(); event.stopPropagation();
+            event.preventDefault(); event.stopPropagation(); if (!mayMutate()) return;
             const targetObj = link.extra || link.annotation;
             curveDrag = { kind: "midpoint", link, previous: targetObj.curve?.[modeKey] ? { ...targetObj.curve[modeKey] } : null, midX: defaultMidX, midY: defaultMidY, pointerId: event.pointerId };
             board.setPointerCapture(event.pointerId);
@@ -1090,7 +1138,7 @@ window.CaseTimeline = (() => {
             grip.setAttribute("stroke", color);
             grip.setAttribute("aria-label", endpoint === "start" ? (link.isNoteToNote ? "Mover saída da nota de origem" : "Mover saída do título") : (link.isNoteToNote ? "Mover chegada à nota de destino" : "Mover chegada à nota"));
             grip.onpointerdown = event => {
-              event.preventDefault(); event.stopPropagation();
+              event.preventDefault(); event.stopPropagation(); if (!mayMutate()) return;
               const targetObj = link.extra || link.annotation;
               curveDrag = { kind: "endpoint", link, previous: targetObj.endpoints?.[modeKey] ? { ...targetObj.endpoints[modeKey] } : null, endpoint, targetRect, pointerId: event.pointerId };
               board.setPointerCapture(event.pointerId);
@@ -1104,28 +1152,24 @@ window.CaseTimeline = (() => {
 
     board.onpointermove = event => {
       if (!curveDrag || event.pointerId !== curveDrag.pointerId) return;
-      const targetObj = curveDrag.link?.extra || curveDrag.link?.annotation || curveDrag.annotation;
+      if (!mayMutate()) { board.onpointercancel(); return; }
       if (curveDrag.kind === "endpoint") {
-        const modeKey = horizontal ? "matrix" : "vertical";
-        const endpoints = (targetObj.endpoints ||= {});
-        (endpoints[modeKey] ||= { start: "auto", end: "auto" })[curveDrag.endpoint] = nearestSide(curveDrag.targetRect, event.clientX, event.clientY);
-        redrawLinks();
-        return;
+        curveDrag.draft = { ...(curveDrag.draft || curveDrag.previous || { start: "auto", end: "auto" }), [curveDrag.endpoint]: nearestSide(curveDrag.targetRect, event.clientX, event.clientY) };
+      } else {
+        const rect = board.getBoundingClientRect();
+        curveDrag.draft = { dx: event.clientX - rect.left - curveDrag.midX, dy: event.clientY - rect.top - curveDrag.midY };
       }
-      const rect = board.getBoundingClientRect();
-      (targetObj.curve ||= {})[horizontal ? "matrix" : "vertical"] = {
-        dx: event.clientX - rect.left - curveDrag.midX,
-        dy: event.clientY - rect.top - curveDrag.midY,
-      };
       redrawLinks();
     };
-    board.onpointerup = event => { if (!curveDrag || event.pointerId !== curveDrag.pointerId) return; curveDrag = null; callbacksSave(); };
+    board.onpointerup = event => {
+      if (!curveDrag || event.pointerId !== curveDrag.pointerId) return;
+      if (!mayMutate()) { board.onpointercancel(); return; }
+      const gesture = curveDrag; curveDrag = null;
+      if (gesture.draft) { const targetObj = gesture.link.extra || gesture.link.annotation, property = gesture.kind === "endpoint" ? "endpoints" : "curve";
+        (targetObj[property] ||= {})[horizontal ? "matrix" : "vertical"] = gesture.draft; callbacksSave(); }
+    };
     board.onpointercancel = () => {
       if (!curveDrag) return;
-      const targetObj = curveDrag.link?.extra || curveDrag.link?.annotation || curveDrag.annotation;
-      const modeKey = horizontal ? "matrix" : "vertical", key = curveDrag.kind === "endpoint" ? "endpoints" : "curve";
-      if (curveDrag.previous) (targetObj[key] ||= {})[modeKey] = curveDrag.previous;
-      else if (targetObj[key]) delete targetObj[key][modeKey];
       if (board.hasPointerCapture(curveDrag.pointerId)) board.releasePointerCapture(curveDrag.pointerId);
       curveDrag = null; redrawLinks();
     };
@@ -1133,11 +1177,11 @@ window.CaseTimeline = (() => {
     const noteNodes = new Map();
     const noteRows = new Map();
     const boardRect = board.getBoundingClientRect();
-    const occupiedNotes = (config.annotations.length ? [...entryNodes.values()] : []).map(node => {
+    const occupiedNotes = (visibleAnnotations.length ? [...entryNodes.values()] : []).map(node => {
       const rect = node.getBoundingClientRect();
       return { left: rect.left - boardRect.left, top: rect.top - boardRect.top, right: rect.right - boardRect.left, bottom: rect.bottom - boardRect.top };
     });
-    for (const annotation of config.annotations) {
+    for (const annotation of visibleAnnotations) {
       const anchor = anchorIndex(annotation);
       if (anchor < 0) continue;
       const note = document.createElement("article"); note.className = "ct-note"; note.dataset.note = annotation.id;
@@ -1251,9 +1295,9 @@ window.CaseTimeline = (() => {
         ]);
       };
       let drag = null;
-      note.onpointerdown = event => { if (event.button !== 0) return; drag = { x: event.clientX, y: event.clientY, left: note.offsetLeft, top: note.offsetTop }; note.setPointerCapture(event.pointerId); };
+      note.onpointerdown = event => { if (event.button !== 0 || !mayMutate()) return; drag = { x: event.clientX, y: event.clientY, left: note.offsetLeft, top: note.offsetTop }; note.setPointerCapture(event.pointerId); };
       note.onpointermove = event => { if (!drag || !drag.moved && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 4) return; const left = drag.left + event.clientX - drag.x, top = drag.top + event.clientY - drag.y; note.style.left = `${clamp(left, minNoteX, board.clientWidth - note.offsetWidth - 8)}px`; note.style.top = `${clamp(top, horizontal ? 48 : 8, board.offsetHeight - note.offsetHeight - 8)}px`; drag.moved = true; redrawLinks(); };
-      note.onpointerup = () => { if (drag?.moved) { annotation[horizontal ? "matrix" : "vertical"] = { x: note.offsetLeft - (horizontal ? origin.x : board.clientWidth / 2), y: note.offsetTop - origin.y }; callbacksSave(); } drag = null; };
+      note.onpointerup = () => { if (!mayMutate()) { note.onpointercancel(); return; } if (drag?.moved) { annotation[horizontal ? "matrix" : "vertical"] = { x: note.offsetLeft - (horizontal ? origin.x : board.clientWidth / 2), y: note.offsetTop - origin.y }; callbacksSave(); } drag = null; };
       note.onpointercancel = () => { if (drag) { note.style.left = `${drag.left}px`; note.style.top = `${drag.top}px`; drag = null; redrawLinks(); } };
       noteLayer.appendChild(note);
       noteNodes.set(annotation.id, note);
@@ -1280,7 +1324,7 @@ window.CaseTimeline = (() => {
       const scroll = shell.querySelector(".ct-scroll"), minimap = shell.querySelector(".ct-minimap");
       const track = minimap.querySelector(".ct-minimap-track"), windowMark = minimap.querySelector(".ct-minimap-window");
       const bins = Array(100).fill(0);
-      entries.forEach(entry => (entry.members || [entry]).forEach(member => bins[clamp(Math.floor(matrixPosition(member.start) / actualWidth * 100), 0, 99)]++));
+      entries.forEach(entry => (entry.nativeEntry ? [] : entry.members || [entry]).forEach(member => bins[clamp(Math.floor(matrixPosition(member.start) / actualWidth * 100), 0, 99)]++));
       const max = Math.max(...bins);
       track.innerHTML = bins.map(count => `<i style="height:${count ? Math.max(2, Math.round(count / max * 22)) : 0}px"></i>`).join("");
       const updateWindow = () => { windowMark.style.left = `${scroll.scrollLeft / scroll.scrollWidth * 100}%`; windowMark.style.width = `${scroll.clientWidth / scroll.scrollWidth * 100}%`; minimap.setAttribute("aria-valuenow", String(Math.round(scroll.scrollLeft / Math.max(1, scroll.scrollWidth - scroll.clientWidth) * 100))); };
@@ -1334,7 +1378,7 @@ window.CaseTimeline = (() => {
     check(); if (!window.TimelineExport) throw new Error("O exportador de timeline não está disponível.");
     const copy = { ...c, timeline: structuredClone(c.timeline || {}) };
     copy.timeline.matrixZoom = 1;
-    const collected = collect(copy, passes, { signal }), { entries, config, undated } = collected;
+    const collected = window.CaseEvidence?.active === true ? window.CaseEvidenceTimeline.collect(copy, await window.CaseEvidenceTimeline.all(c, { signal }), { complete: true }) : collect(copy, passes, { signal }), { entries, config, undated } = collected;
     const eventCount = entries.reduce((count, entry) => count + entry.rows.length, 0);
     if (!entries.length) return { blob: null, width: 0, height: 0, complete: true, overview: false, eventCount, undated, summary: "Nenhum evento com horário neste recorte do caso." };
     const lanes = new Map(); let laneCount = 0;

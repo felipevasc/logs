@@ -183,11 +183,11 @@ impl Table {
             return Ok(None);
         };
         let entry = &self.entries[index];
-        serde_json::from_slice(
+        reference_store::interpreted_value(
             &self.bytes[entry.value_start as usize..(entry.value_start + entry.value_len) as usize],
+            self.version.store_version,
         )
         .map(Some)
-        .map_err(|_| reference_store::Error::Corrupt)
     }
 }
 
@@ -426,7 +426,7 @@ mod tests {
             analysis_id: "analysis".into(),
         };
         let descriptor = ReferenceDescriptor {
-            schema_version: 1,
+            interpretation_version: 1, schema_version: 1,
             id: "ref".into(),
             name: "Ref".into(),
             content_sha256: format!("{:x}", Sha256::digest(data)),

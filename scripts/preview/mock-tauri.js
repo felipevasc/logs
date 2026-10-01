@@ -1,10 +1,13 @@
+// Legacy browser fixtures deliberately retain their legacy mock contract.
+// The startup acceptance fixture selects native transport before production bootstrap.
+if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.CaseEvidence.active = false;
 /* Mock de window.__TAURI__ para pré-visualizar o frontend no navegador.
    Gera um dataset sintético em memória e implementa os comandos usados
    pela tela de exploração do artefato. Uso: servido por serve.mjs. */
 (() => {
   "use strict";
   // marcador ANTES do app rodar: só pula o auto-load se a store já existia ao abrir a página
-  const hadStore = !!localStorage.getItem("__mockStore");
+  const hadStore = !!window.__mockNativeCaseBootstrapEnabled || !!localStorage.getItem("__mockStore");
 
   // ---------------------------------------------------------------- dataset
   const LEVELS = ["Informação", "Informação", "Informação", "Aviso", "Erro", "Crítico", "Depuração"];
@@ -1003,6 +1006,10 @@
       if (stored) { const data = JSON.parse(stored), item = data.cases?.find(item => item.id === context.caseId); if (item) { item.analysisContext = context; localStorage.setItem("__mockStore", JSON.stringify(data)); } }
       return { analysisContext: structuredClone(context) };
     };
+  }
+  if (window.__mockNativeCaseBootstrapEnabled) {
+    if (window.CaseEvidence?.active !== true || !window.createMockNativeCase) throw Error("The native startup fixture requires the production native script order and active flag.");
+    const native = window.createMockNativeCase({ analysisContexts }); Object.assign(handlers, native.handlers); window.__mockNativeCaseBootstrap = native;
   }
   function analysisRows(rows, context) {
     if (!context) return rows;

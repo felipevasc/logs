@@ -938,6 +938,9 @@
         <button class="settings-tab" data-settings-tab="detection" type="button" role="tab">
           <i class="fas fa-shield-halved"></i> Detecção
         </button>
+        <button class="settings-tab" data-settings-tab="recovery" type="button" role="tab" hidden>
+          <i class="fas fa-clock-rotate-left"></i> Recuperação
+        </button>
         <button class="settings-tab" data-settings-tab="updates" type="button" role="tab">
           <i class="fas fa-rotate"></i> Atualizações
         </button>
@@ -947,6 +950,7 @@
         <section id="settings-pane-codes" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-mcp" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-detection" class="settings-pane" role="tabpanel" hidden></section>
+        <section id="settings-pane-recovery" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-updates" class="settings-pane" role="tabpanel" hidden></section>
       </div>
     </div>
@@ -1029,6 +1033,17 @@
   <script src="detail-fields.js"></script>
   <script src="java-trace.js"></script>
   <script src="performance-core.js"></script>
+  <script src="case-evidence.js"></script>
+  <script src="case-evidence-session.js"></script>
+  <script src="case-evidence-analysis.js"></script>
+  <script src="case-evidence-preserved.js"></script>
+  <script src="case-evidence-items.js"></script>
+  <script src="case-evidence-actions.js"></script>
+  <script src="case-evidence-detail.js"></script>
+  <script src="case-evidence-timeline.js"></script>
+  <script src="case-evidence-display.js"></script>
+  <script src="case-evidence-transfer.js"></script>
+  <script src="case-evidence-recovery.js"></script>
   <script src="app.js"></script>
   <script src="analysis-context.js"></script>
   <script src="tasks.js"></script>

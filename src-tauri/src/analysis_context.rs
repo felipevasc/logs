@@ -26,7 +26,7 @@ mod lookup_validation_tests {
     use super::*;
     use serde_json::json;
     fn reference() -> ReferenceDescriptor {
-        ReferenceDescriptor {schema_version:1,id:"ref".into(),name:"Ref".into(),content_sha256:"a".repeat(64),format:"jsonl".into(),columns:vec!["key".into(),"value".into()],key_columns:vec!["key".into()],duplicate_policy:"reject".into()}
+        ReferenceDescriptor {interpretation_version:1,schema_version:1,id:"ref".into(),name:"Ref".into(),content_sha256:"a".repeat(64),format:"jsonl".into(),columns:vec!["key".into(),"value".into()],key_columns:vec!["key".into()],duplicate_policy:"reject".into()}
     }
     fn lookup(source: &str) -> Value {
         json!({"name":"asset","lookup":{"schemaVersion":1,"referenceId":"ref","keys":[{"referenceColumn":"key","sourceField":source}],"valueColumn":"value"}})
@@ -119,6 +119,13 @@ pub struct Config {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReferenceDescriptor {
     pub schema_version: u32,
+    /// The descriptor schema stays v1; existing declarations keep their old
+    /// numeric interpretation unless a native input explicitly declares v2.
+    #[serde(
+        default = "legacy_reference_interpretation",
+        skip_serializing_if = "is_legacy_reference_interpretation"
+    )]
+    pub interpretation_version: u32,
     pub id: String,
     pub name: String,
     pub content_sha256: String,
@@ -126,6 +133,81 @@ pub struct ReferenceDescriptor {
     pub columns: Vec<String>,
     pub key_columns: Vec<String>,
     pub duplicate_policy: String,
+}
+
+fn legacy_reference_interpretation() -> u32 {
+    1
+}
+fn is_legacy_reference_interpretation(version: &u32) -> bool {
+    *version == 1
+}
+
+#[cfg(test)]
+mod reference_interpretation_tests {
+    use super::*;
+    #[test]
+    fn shared_interpretation_disclosures_are_bounded_and_deduplicated() {
+        assert!(reference_interpretation_diagnostics([], true).is_empty());
+        assert!(reference_interpretation_diagnostics([1,1], false).is_empty());
+        let diagnostics = reference_interpretation_diagnostics([1,2,1,2,1], true);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].code, "reference_interpretation_legacy");
+        assert_eq!(diagnostics[1].code, "reference_interpretation_exact");
+    }
+    #[test]
+    fn legacy_descriptor_wire_is_unchanged_and_explicit_interpretation_is_bounded() {
+        let original = serde_json::json!({"schemaVersion":1,"id":"r","name":"Reference","contentSha256":"a".repeat(64),"format":"jsonl","columns":["key","value"],"keyColumns":["key"],"duplicatePolicy":"reject"});
+        let legacy: ReferenceDescriptor = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(legacy.interpretation_version, 1);
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), original);
+        let mut exact = legacy.clone();
+        exact.interpretation_version = 2;
+        assert_eq!(
+            serde_json::to_value(&exact).unwrap()["interpretationVersion"],
+            2
+        );
+        validate(&Config {
+            references: vec![exact.clone()],
+            derived_fields: Vec::new(),
+        })
+        .unwrap();
+        exact.interpretation_version = 3;
+        assert!(validate(&Config {
+            references: vec![exact],
+            derived_fields: Vec::new()
+        })
+        .is_err());
+    }
+}
+
+
+/// Shared, bounded disclosure for native record preservation and declared
+/// reference interpretations. This does not change either numeric codec.
+pub(crate) fn reference_interpretation_diagnostics(
+    versions: impl IntoIterator<Item = u32>,
+    native_records: bool,
+) -> Vec<Diagnostic> {
+    let (mut legacy, mut exact) = (false, false);
+    for version in versions {
+        legacy |= version == 1;
+        exact |= version == 2;
+    }
+    let mut diagnostics = Vec::with_capacity(2);
+    if native_records && legacy {
+        diagnostics.push(Diagnostic {
+            definition_index: None,
+            code: "reference_interpretation_legacy".into(),
+            message: "A interpretação v1 das referências foi preservada. Decimais importados diretamente no Caso usam leitura exata; chaves que dependiam do arredondamento legado podem diferir. Revise a política numérica antes de interpretar resultados sem correspondência.".into(),
+        });
+    }
+    if exact {
+        diagnostics.push(Diagnostic {
+            definition_index: None,
+            code: "reference_interpretation_exact".into(),
+            message: "Os bytes e a interpretação numérica exata v2 declarada pelas referências foram preservados. Números já capturados pelo leitor legado mantêm seus valores anteriores e podem não corresponder a chaves decimais exatas. Não há conversão implícita entre interpretações.".into(),
+        });
+    }
+    diagnostics
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -444,6 +526,7 @@ pub(crate) fn validate(config: &Config) -> Result<(), String> {
     for reference in &config.references {
         let columns: HashSet<_> = reference.columns.iter().collect();
         if reference.schema_version != VERSION
+            || ![1, 2].contains(&reference.interpretation_version)
             || reference.id.trim().is_empty()
             || reference.id.len() > 256
             || reference.name.trim().is_empty()
@@ -502,8 +585,11 @@ fn legacy(dir: &Path) -> Result<(Config, Vec<Diagnostic>, Option<Value>), String
     let text = String::from_utf8(bytes).map_err(|_| {
         "Arquivo legado de campos derivados não é UTF-8; o original foi preservado.".to_string()
     })?;
-    match serde_json::from_str::<Value>(&text) {
-        Ok(Value::Array(derived_fields)) => {
+    legacy_value(serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)))
+}
+fn legacy_value(value:Value)->Result<(Config,Vec<Diagnostic>,Option<Value>),String>{
+    match value {
+        Value::Array(derived_fields) => {
             let config = Config {
                 derived_fields,
                 references: Vec::new(),
@@ -528,7 +614,7 @@ fn legacy(dir: &Path) -> Result<(Config, Vec<Diagnostic>, Option<Value>), String
                     "Arquivo legado inválido; conteúdo e original preservados para recuperação."
                         .into(),
             }],
-            Some(other.unwrap_or(Value::String(text))),
+            Some(other),
         )),
     }
 }
@@ -537,27 +623,77 @@ fn write(tx: &Transaction<'_>, snapshot: &Snapshot) -> Result<(), String> {
     tx.execute("INSERT INTO case_analysis(case_id,body) VALUES(?1,?2) ON CONFLICT(case_id) DO UPDATE SET body=excluded.body", params![snapshot.case_id, body]).map_err(|e| e.to_string())?;
     Ok(())
 }
-fn read(conn: &Connection, case_id: &str) -> Result<Snapshot, String> {
-    let body: String = conn
-        .query_row(
-            "SELECT a.body FROM case_analysis a JOIN cases c ON c.id=a.case_id WHERE a.case_id=?1",
-            [case_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
+fn native_context_owner(conn: &Connection, case_id: &str) -> Result<Option<String>, String> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_evidence_cases')",
+        [], |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    if !exists { return Ok(None); }
+    let owner: Option<String> = conn.query_row(
+        "SELECT CASE WHEN octet_length(analysis_id)=36 THEN analysis_id END FROM native_evidence_cases WHERE case_id=?1",
+        [case_id], |row| row.get(0),
+    ).optional().map_err(|e| e.to_string())?;
+    if owner.as_ref().is_some_and(|owner| uuid::Uuid::parse_str(owner).is_err()) {
+        return Err("Identidade nativa da configuração inválida.".into());
+    }
+    Ok(owner)
+}
+/// A protected native owner uses exact numeric metadata interpretation. Legacy
+/// contexts deliberately retain their existing effective parser until adoption
+/// canonicalizes that Snapshot under the verified recovery transaction.
+pub(crate) fn read(conn: &Connection, case_id: &str) -> Result<Snapshot, String> {
+    read_snapshot_leased(conn,case_id).map(|(snapshot, _credit)|snapshot)
+}
+/// Retain the returned exact-decoder credit through native compilation or IPC.
+/// A direct connection is wrapped in one read transaction so adoption cannot
+/// change legacy/native interpretation between the owner and body reads.
+pub(crate) fn read_snapshot_leased(conn: &Connection, case_id: &str)
+    -> Result<(Snapshot, Option<crate::case_work_budget::Lease>), String>
+{
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction().map_err(|e|e.to_string())?;
+        let result = read_snapshot_credited(&tx,case_id)?;
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(result)
+    } else { read_snapshot_credited(conn,case_id) }
+}
+fn read_snapshot_credited(conn: &Connection, case_id: &str) -> Result<(Snapshot, Option<crate::case_work_budget::Lease>), String> {
+    let native_owner = native_context_owner(conn, case_id)?;
+    let size: usize = conn.query_row(
+        "SELECT octet_length(a.body) FROM case_analysis a JOIN cases c ON c.id=a.case_id WHERE a.case_id=?1",
+        [case_id], |row| row.get(0),
+    ).optional().map_err(|e| e.to_string())?
         .ok_or("Caso inexistente ou contexto ainda não inicializado.")?;
-    let snapshot: Snapshot = serde_json::from_str(&body).map_err(|_| {
-        "Configuração persistida do Caso está inválida; preserve o banco para recuperação."
-            .to_string()
-    })?;
+    if size > MAX_BYTES { return Err("A configuração do Caso excede o limite de 4 MiB.".into()); }
+    // Includes SQLite TEXT + Rust input before the exact tree admission. The
+    // returned Snapshot follows the caller's existing ownership budget.
+    let mut credit = if native_owner.is_some() {
+        Some(crate::case_cache::reserve_work(crate::case_work_budget::global(),
+            size.checked_mul(3).and_then(|n| n.checked_add(64 << 10)).ok_or("Configuração excessiva.")?)?)
+    } else { None };
+    let body: String = conn.query_row(
+        "SELECT CASE WHEN octet_length(body)=?2 THEN body END FROM case_analysis WHERE case_id=?1",
+        params![case_id,size], |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    let snapshot: Snapshot = if let Some(credit) = credit.as_mut() {
+        let raw = crate::case_evidence::RawJson::checked(&body)?;
+        let plan = crate::case_evidence::preflight_value(raw)?;
+        credit.merge(crate::case_cache::reserve_work(crate::case_work_budget::global(), plan.materialization_credit)?)?;
+        crate::case_evidence::native_snapshot_from_value(crate::case_evidence::materialize_value(raw,plan)?)
+            .map_err(|e| e.to_string())?
+    } else {
+        serde_json::from_str(&body).map_err(|_| {
+            "Configuração persistida do Caso está inválida; preserve o banco para recuperação.".to_string()
+        })?
+    };
     if snapshot.case_id != case_id
         || snapshot.schema_version != VERSION
         || uuid::Uuid::parse_str(&snapshot.analysis_id).is_err()
+        || native_owner.as_ref().is_some_and(|owner| owner != &snapshot.analysis_id)
     {
         return Err("Identidade da configuração do Caso inválida ou não suportada.".into());
     }
-    Ok(snapshot)
+    Ok((snapshot, credit))
 }
 
 /// Called under the case-store write transaction BEFORE adding ordinary cases,
@@ -634,6 +770,52 @@ fn imported(case_id: &str, embedded: Option<&Value>) -> Result<Snapshot, String>
     }
     Ok(local)
 }
+/// Prepare an owner before evidence disk work, without creating a Case/context
+/// row. Publication still requires the existing transactional insert hook.
+pub(crate) fn prepare_new_case(case_id: &str) -> Result<Snapshot, String> {
+    if case_id.is_empty() || case_id.len() > 4096 {
+        return Err("Identificador de Caso inválido ou excessivo.".into());
+    }
+    Ok(Snapshot::empty(case_id))
+}
+
+/// The recovery/adoption caller chooses this only for the initial legacy
+/// migration. Existing contexts are retained verbatim; new ordinary Cases use
+/// prepare_new_case and never inherit global definitions implicitly.
+pub(crate) fn prepare_legacy_case(
+    case_id: &str,
+    embedded: Option<&Value>,
+    dir: &Path,
+) -> Result<Snapshot, String> {
+    if case_id.is_empty() || case_id.len() > 4096 {
+        return Err("Identificador de Caso inválido ou excessivo.".into());
+    }
+    let mut snapshot = imported(case_id, embedded)?;
+    if embedded.is_none() {
+        let (config, diagnostics, raw) = legacy(dir)?;
+        snapshot.config = config;
+        snapshot.migration_diagnostics = diagnostics;
+        snapshot.legacy_raw = raw;
+    }
+    Ok(snapshot)
+}
+/// Native adoption supplies a Value only after its bounded raw span and tree
+/// admission. Malformed legacy text is supplied as Value::String verbatim.
+pub(crate) fn prepare_legacy_value(case_id:&str,value:Value)->Result<Snapshot,String>{
+    let mut snapshot=prepare_new_case(case_id)?;
+    let (config,diagnostics,raw)=legacy_value(value)?;
+    snapshot.config=config;snapshot.migration_diagnostics=diagnostics;snapshot.legacy_raw=raw;
+    Ok(snapshot)
+}
+/// Called only inside verified native adoption after the complete copied
+/// context identities were compared and the writer permit was installed.
+/// Canonicalize the already-read legacy effective Snapshot, never reinterpret
+/// its original numeric text through the new native codec.
+pub(crate) fn canonicalize_native_adoption(tx:&Transaction<'_>, snapshot:&Snapshot)->Result<(),String>{
+    let present:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM cases WHERE id=?1)",[&snapshot.case_id],|row|row.get(0)).map_err(|e|e.to_string())?;
+    if !present {return Err("Caso inexistente durante adoção nativa.".into());}
+    write(tx,snapshot)
+}
 /// Only the portable ledger importer may preserve a nonzero visibility baseline.
 /// Its payloads are rebuilt/verified before this new identity can be published.
 pub(crate) fn prepare_portable_snapshot(
@@ -668,17 +850,22 @@ pub(crate) fn insert_portable_snapshot(
     if !exists {
         return Err("Caso inexistente durante a publicação portátil.".into());
     }
-    let current: Option<String> = tx
-        .query_row(
-            "SELECT body FROM case_analysis WHERE case_id=?1",
-            [&snapshot.case_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    if let Some(body) = current {
-        let current: Snapshot = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-        if current.case_id != snapshot.case_id || current.analysis_id != snapshot.analysis_id {
+    let current: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM case_analysis WHERE case_id=?1)",
+        [&snapshot.case_id], |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    if current {
+        // The new context may have been inserted by a sidecar before native
+        // ownership is installed. Compare sealed canonical bytes first so an
+        // exact fractional Snapshot never passes through the legacy parser.
+        let expected = bounded(snapshot)?;
+        let same: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM case_analysis WHERE case_id=?1 AND body=?2)",
+            params![snapshot.case_id,expected], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if same { return Ok(snapshot.clone()); }
+        let current = read(tx, &snapshot.case_id)?;
+        if current.analysis_id != snapshot.analysis_id {
             return Err("O Caso já possui outra configuração; importação recusada.".into());
         }
         return Ok(current);
@@ -751,11 +938,37 @@ pub fn update(expected: &Identity, config: Config) -> Result<Snapshot, String> {
     update_at(&crate::config_dir(), expected, config)
 }
 fn update_at(dir: &Path, expected: &Identity, config: Config) -> Result<Snapshot, String> {
+    update_at_inner(dir, expected, config, false)
+}
+/// The bulk browser codec is legacy-only. Its early command admission is
+/// repeated under the writer transaction because adoption preserves Identity.
+pub(crate) fn update_legacy_browser_at(
+    dir: &Path,
+    expected: &Identity,
+    config: Config,
+) -> Result<Snapshot, String> {
+    update_at_inner(dir, expected, config, true)
+}
+fn update_at_inner(dir: &Path, expected: &Identity, config: Config, legacy_browser: bool) -> Result<Snapshot, String> {
     validate(&config)?;
     let mut conn = crate::case_store::context_connection(dir)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
+    if legacy_browser {
+        for table in ["native_evidence_cases", "native_evidence_protected", "case_recovery_protected"] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if exists && tx.query_row::<bool, _, _>(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE case_id=?1)"),
+                [&expected.case_id], |row| row.get(0),
+            ).map_err(|e| e.to_string())? {
+                return Err("CASE_CONTEXT_TYPED_EDIT_REQUIRED: Use os editores de campos derivados e referências para alterar a configuração deste Caso preservado.".into());
+            }
+        }
+    }
     let mut current = read(&tx, &expected.case_id)?; // JOIN prevents resurrection after deletion.
     if current.analysis_id != expected.analysis_id
         || current.config_revision != expected.config_revision
@@ -882,6 +1095,39 @@ mod tests {
         assert_eq!(a.config_revision, 1);
         assert_eq!(a.visibility_revision, 0);
         assert_eq!(dir.load()["revision"], 1); // configuration does not bump case notes.
+    }
+    #[test]
+    fn bulk_browser_update_rechecks_late_native_or_restored_protection() {
+        for table in ["native_evidence_cases", "native_evidence_protected", "case_recovery_protected"] {
+            let dir = Directory::new();
+            dir.save(json!({"cases":[{"id":"a"}]}));
+            let before = dir.snapshot("a");
+            assert!(!crate::case_evidence::native_owner(&dir.0, &before.identity()).unwrap());
+            // A separate committed adoption/protection marker leaves the
+            // admitted analysis/config/visibility identity unchanged.
+            let conn = crate::case_store::connect(&dir.0).unwrap();
+            conn.execute_batch(&format!("CREATE TABLE {table}(case_id TEXT PRIMARY KEY,analysis_id TEXT);")).unwrap();
+            conn.execute(&format!("INSERT INTO {table} VALUES(?1,?2)"), params![before.case_id,before.analysis_id]).unwrap();
+            let raw: String = conn.query_row("SELECT body FROM case_analysis WHERE case_id='a'", [], |row|row.get(0)).unwrap();
+            let error = update_legacy_browser_at(&dir.0, &before.identity(), config("(changed)")).unwrap_err();
+            assert!(error.starts_with("CASE_CONTEXT_TYPED_EDIT_REQUIRED"), "{table}: {error}");
+            assert_eq!(conn.query_row::<String,_,_>("SELECT body FROM case_analysis WHERE case_id='a'", [], |row|row.get(0)).unwrap(), raw);
+            assert_eq!(dir.snapshot("a"), before);
+            // Typed editor mutation retains its existing native-capable path.
+            let edited = update_at(&dir.0, &before.identity(), config("(typed)")).unwrap();
+            assert_eq!(edited.config_revision, before.config_revision + 1);
+        }
+    }
+    #[test]
+    fn bulk_browser_update_keeps_legacy_context_cas_behavior() {
+        let dir = Directory::new();
+        dir.save(json!({"cases":[{"id":"a"}]}));
+        let before = dir.snapshot("a");
+        let edited = update_legacy_browser_at(&dir.0, &before.identity(), config("(legacy)")).unwrap();
+        assert_eq!(edited.config_revision, before.config_revision + 1);
+        assert_eq!(edited.config, config("(legacy)"));
+        assert!(update_legacy_browser_at(&dir.0, &before.identity(), Config::default()).is_err());
+        assert_eq!(dir.snapshot("a"), edited);
     }
     #[test]
     fn queued_body_save_cannot_overwrite_new_config_and_stale_config_cas_fails() {
@@ -1042,6 +1288,7 @@ mod tests {
                 json!({"name":"payload","source":"message","steps":["base64_decode","parse_json"]}),
             ],
             references: vec![ReferenceDescriptor {
+                interpretation_version: 1,
                 schema_version: 1,
                 id: "ref".into(),
                 name: "Inventory".into(),

@@ -1,6 +1,6 @@
 [package]
 name = "loginsight"
-version = "0.9.0"
+version = "0.10.0"
 description = "Visualizador e analisador de logs"
 edition = "2021"
 rust-version = "1.88"
@@ -31,7 +31,7 @@ rayon = "1"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "backup", "blob"] }
 rmcp = { version = "3.1", features = ["transport-streamable-http-server"] }
 schemars = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }

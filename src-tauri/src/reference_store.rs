@@ -15,6 +15,8 @@ use std::{
 };
 
 pub(crate) const VERSION: u32 = 1;
+/// Descriptor v1 remains stable. Only the interpretation/index identity changes.
+pub(crate) const PREPARATION_VERSION: u32 = 2;
 const PAGE_BYTES: u64 = 4096;
 const MANIFEST_BYTES: u64 = 4 << 20;
 const KEY_BYTES: usize = 64 << 10;
@@ -98,6 +100,7 @@ pub(crate) enum Error {
     Busy,
     Corrupt,
     Cancelled,
+    Interpretation(String),
     Io(io::Error),
     Database(rusqlite::Error),
 }
@@ -130,6 +133,7 @@ impl std::fmt::Display for Error {
             Self::Busy => f.write_str("A referência está em uso por uma operação exclusiva."),
             Self::Corrupt => f.write_str("A referência preparada está incompleta ou corrompida."),
             Self::Cancelled => f.write_str("Preparação ou consulta da referência cancelada."),
+            Self::Interpretation(message) => f.write_str(message),
             Self::Io(error) => write!(f, "Falha de leitura ou gravação da referência: {error}"),
             Self::Database(error) => write!(f, "Falha no índice da referência: {error}"),
         }
@@ -161,9 +165,20 @@ fn json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Error> {
     serde_json::to_vec(value).map_err(|_| Error::Corrupt)
 }
 fn version(owner: &Owner, descriptor: &ReferenceDescriptor) -> Result<Version, Error> {
+    version_for(owner, descriptor, descriptor.interpretation_version)
+}
+fn version_for(
+    owner: &Owner,
+    descriptor: &ReferenceDescriptor,
+    preparation: u32,
+) -> Result<Version, Error> {
+    if ![1, PREPARATION_VERSION].contains(&preparation) {
+        return Err(Error::InvalidDescriptor);
+    }
     let valid_text = |text: &str, max| !text.trim().is_empty() && text.len() <= max;
     let columns: HashSet<_> = descriptor.columns.iter().collect();
-    if !valid_text(&owner.case_id, 256)
+    if ![1, PREPARATION_VERSION].contains(&descriptor.interpretation_version)
+        || !valid_text(&owner.case_id, 256)
         || !valid_text(&owner.analysis_id, 256)
         || descriptor.schema_version != VERSION
         || !valid_text(&descriptor.id, 256)
@@ -193,7 +208,7 @@ fn version(owner: &Owner, descriptor: &ReferenceDescriptor) -> Result<Version, E
         return Err(Error::UnsupportedFormat);
     }
     let schema = json(&(
-        VERSION,
+        preparation,
         descriptor.schema_version,
         &descriptor.format,
         &descriptor.columns,
@@ -204,12 +219,26 @@ fn version(owner: &Owner, descriptor: &ReferenceDescriptor) -> Result<Version, E
         return Err(Error::InvalidDescriptor);
     }
     Ok(Version {
-        store_version: VERSION,
+        store_version: preparation,
         owner: owner.clone(),
         reference_id: descriptor.id.clone(),
         content_sha256: descriptor.content_sha256.to_ascii_lowercase(),
         schema_sha256: digest(&schema),
     })
+}
+pub(crate) fn validate_portable_schema(
+    descriptor: &ReferenceDescriptor,
+    preparation: u32,
+    sha256: &str,
+) -> Result<(), Error> {
+    let owner = Owner {
+        case_id: "portable-schema".into(),
+        analysis_id: "portable-schema".into(),
+    };
+    if version_for(&owner, descriptor, preparation)?.schema_sha256 != sha256 {
+        return Err(Error::Corrupt);
+    }
+    Ok(())
 }
 fn directory(root: &Path, version: &Version) -> Result<PathBuf, Error> {
     Ok(root
@@ -217,6 +246,16 @@ fn directory(root: &Path, version: &Version) -> Result<PathBuf, Error> {
         .join(digest(&json(&version.owner)?))
         .join(digest(&json(version)?)))
 }
+/// Application recovery may inspect absence before opening the complete triple.
+/// This path is derived solely from validated owner/version metadata.
+pub(crate) fn recovery_directory(
+    root: &Path,
+    owner: &Owner,
+    descriptor: &ReferenceDescriptor,
+) -> Result<PathBuf, Error> {
+    directory(root, &available_version(root, owner, descriptor)?)
+}
+
 fn bounded_limits(limits: Limits) -> Result<Limits, Error> {
     let max = Limits::default();
     if limits.source_bytes > max.source_bytes
@@ -310,6 +349,47 @@ pub(crate) fn parse_record(
         serde_json::from_slice::<Record>(bytes).map_err(|_| Error::InvalidRecord(row_number))?;
     Ok(row)
 }
+fn interpreted_record(
+    bytes: &[u8],
+    row_number: u64,
+    preparation: u32,
+) -> Result<
+    (
+        BTreeMap<String, Value>,
+        Option<crate::case_work_budget::Lease>,
+    ),
+    Error,
+> {
+    if preparation == 1 {
+        return parse_record(bytes, row_number).map(|row| (row, None));
+    }
+    if preparation != PREPARATION_VERSION || bytes.len() > Limits::default().record_bytes {
+        return Err(Error::InvalidRecord(row_number));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidRecord(row_number))?;
+    let exact = crate::case_evidence::parse_exact_value(text).map_err(Error::Interpretation)?;
+    let (value, credit) = exact.into_parts();
+    let Value::Object(fields) = value else {
+        return Err(Error::InvalidRecord(row_number));
+    };
+    Ok((fields.into_iter().collect(), Some(credit)))
+}
+pub(crate) fn interpreted_value(bytes: &[u8], preparation: u32) -> Result<Value, Error> {
+    if preparation == 1 {
+        return serde_json::from_slice(bytes).map_err(|_| Error::Corrupt);
+    }
+    if preparation != PREPARATION_VERSION || bytes.len() > Limits::default().record_bytes {
+        return Err(Error::Corrupt);
+    }
+    let exact = crate::case_evidence::parse_exact_value(
+        std::str::from_utf8(bytes).map_err(|_| Error::Corrupt)?,
+    )
+    .map_err(Error::Interpretation)?;
+    // The caller's bounded batch/event owns the returned value. Scratch parsing
+    // stays charged until the exact value has been constructed.
+    let (value, _credit) = exact.into_parts();
+    Ok(value)
+}
 
 fn hash_file(
     path: &Path,
@@ -359,8 +439,27 @@ pub(crate) fn prepare_jsonl(
     limits: Limits,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<PreparedReference, Error> {
+    prepare_jsonl_version(
+        root,
+        owner,
+        descriptor,
+        input,
+        limits,
+        cancelled,
+        descriptor.interpretation_version,
+    )
+}
+pub(crate) fn prepare_jsonl_version(
+    root: &Path,
+    owner: &Owner,
+    descriptor: &ReferenceDescriptor,
+    input: impl Read,
+    limits: Limits,
+    cancelled: &dyn Fn() -> bool,
+    preparation: u32,
+) -> Result<PreparedReference, Error> {
     let limits = bounded_limits(limits)?;
-    let version = version(owner, descriptor)?;
+    let version = version_for(owner, descriptor, preparation)?;
     check(cancelled)?;
     let target = directory(root, &version)?;
     let parent = target.parent().ok_or(Error::InvalidDescriptor)?;
@@ -423,7 +522,8 @@ pub(crate) fn prepare_jsonl(
             if row_count > limits.rows {
                 return Err(Error::Limit("registros"));
             }
-            let row = parse_record(&line, row_count)?;
+            let (row, _record_credit) =
+                interpreted_record(&line, row_count, version.store_version)?;
             if row.len() != descriptor.columns.len()
                 || descriptor
                     .columns
@@ -469,7 +569,11 @@ pub(crate) fn prepare_jsonl(
         .map_err(|(_, error)| Error::Database(error))?;
     // Windows FlushFileBuffers requires write access. SQLite is closed above;
     // no ordinary handle may be closed while its connection still owns locks.
-    OpenOptions::new().read(true).write(true).open(&database_path)?.sync_all()?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&database_path)?
+        .sync_all()?;
     let database_bytes = fs::metadata(&database_path)?.len();
     if database_bytes > limits.database_bytes {
         return Err(Error::Limit("disco do índice"));
@@ -503,7 +607,7 @@ pub(crate) fn prepare_jsonl(
         }
         Err(error) if target.exists() => {
             // Another complete publisher may have won. Never replace its bytes.
-            let existing = open(root, owner, descriptor, cancelled)?;
+            let existing = open_version(root, descriptor, prepared.version.clone(), cancelled)?;
             if existing.prepared.row_count != row_count
                 || existing.prepared.source_bytes != source_bytes
             {
@@ -568,7 +672,23 @@ pub(crate) fn portable_source(
     descriptor: &ReferenceDescriptor,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<PortableSource, Error> {
-    let reader = open(root, owner, descriptor, cancelled)?;
+    let reader = open_source(root, owner, descriptor, cancelled)?;
+    check(cancelled)?;
+    reader.into_portable()
+}
+pub(crate) fn portable_source_version(
+    root: &Path,
+    owner: &Owner,
+    descriptor: &ReferenceDescriptor,
+    preparation: u32,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<PortableSource, Error> {
+    let reader = open_version(
+        root,
+        descriptor,
+        version_for(owner, descriptor, preparation)?,
+        cancelled,
+    )?;
     check(cancelled)?;
     reader.into_portable()
 }
@@ -601,7 +721,98 @@ pub(crate) fn open(
     descriptor: &ReferenceDescriptor,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<ReferenceReader, Error> {
-    let expected = version(owner, descriptor)?;
+    open_interpretation(
+        root,
+        owner,
+        descriptor,
+        descriptor.interpretation_version,
+        cancelled,
+    )
+}
+/// Source/recovery capture is read-only. A missing selected index can still
+/// have verified immutable original bytes under the other owned version.
+pub(crate) fn open_source(
+    root: &Path,
+    owner: &Owner,
+    descriptor: &ReferenceDescriptor,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ReferenceReader, Error> {
+    open_version(
+        root,
+        descriptor,
+        available_version(root, owner, descriptor)?,
+        cancelled,
+    )
+}
+fn available_version(
+    root: &Path,
+    owner: &Owner,
+    descriptor: &ReferenceDescriptor,
+) -> Result<Version, Error> {
+    let current = version(owner, descriptor)?;
+    let alternate = version_for(
+        owner,
+        descriptor,
+        if descriptor.interpretation_version == 1 {
+            2
+        } else {
+            1
+        },
+    )?;
+    for candidate in [&current, &alternate] {
+        match fs::symlink_metadata(directory(root, candidate)?) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Ok(candidate.clone()),
+            Ok(_) => return Err(Error::Corrupt),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(current)
+}
+/// A v1 cache never supplies typed keys to the exact runtime. Its original
+/// immutable JSONL is verified and used to build a distinct v2 cache first.
+pub(crate) fn open_exact(
+    root: &Path,
+    owner: &Owner,
+    descriptor: &ReferenceDescriptor,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ReferenceReader, Error> {
+    open_interpretation(root, owner, descriptor, PREPARATION_VERSION, cancelled)
+}
+fn open_interpretation(
+    root: &Path,
+    owner: &Owner,
+    descriptor: &ReferenceDescriptor,
+    preparation: u32,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ReferenceReader, Error> {
+    let exact_version = version_for(owner, descriptor, preparation)?;
+    match fs::symlink_metadata(directory(root, &exact_version)?) {
+        Ok(_) => return open_version(root, descriptor, exact_version, cancelled),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    let reader = open_source(root, owner, descriptor, cancelled)?;
+    let legacy = reader.into_portable()?;
+    let input = legacy.source_reader()?;
+    prepare_jsonl_version(
+        root,
+        owner,
+        descriptor,
+        input,
+        Limits::default(),
+        cancelled,
+        preparation,
+    )?;
+    legacy.validate_unchanged()?;
+    open_version(root, descriptor, exact_version, cancelled)
+}
+fn open_version(
+    root: &Path,
+    descriptor: &ReferenceDescriptor,
+    expected: Version,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ReferenceReader, Error> {
     check(cancelled)?;
     let directory = directory(root, &expected)?;
     // The root is application-selected. No descriptor or manifest supplies a
@@ -748,8 +959,8 @@ impl ReferenceReader {
             if key.len() > KEY_BYTES || body.len() > self.prepared.max_record_bytes {
                 return Err(Error::Corrupt);
             }
-            let Record(mut body) =
-                serde_json::from_slice::<Record>(body).map_err(|_| Error::Corrupt)?;
+            let (mut body, _record_credit) =
+                interpreted_record(body, 0, self.prepared.version.store_version)?;
             let value = body.remove(column).ok_or(Error::Corrupt)?;
             let encoded = bounded_json(&value, self.prepared.max_record_bytes)?;
             visit(key, &encoded)?;
@@ -802,10 +1013,11 @@ impl ReferenceReader {
                     if blob.len() > self.prepared.max_record_bytes {
                         return Ok(Err(Error::Corrupt));
                     }
-                    let Record(mut body) = match serde_json::from_slice::<Record>(blob) {
-                        Ok(body) => body,
-                        Err(_) => return Ok(Err(Error::Corrupt)),
-                    };
+                    let (mut body, _record_credit) =
+                        match interpreted_record(blob, 0, self.prepared.version.store_version) {
+                            Ok(body) => body,
+                            Err(error) => return Ok(Err(error)),
+                        };
                     let Some(value) = body.remove(column) else {
                         return Ok(Err(Error::Corrupt));
                     };
@@ -837,6 +1049,7 @@ mod tests {
     }
     fn descriptor(data: &[u8]) -> ReferenceDescriptor {
         ReferenceDescriptor {
+            interpretation_version: 1,
             schema_version: 1,
             id: "reference-a".into(),
             name: "Hosts".into(),
@@ -1285,5 +1498,159 @@ mod tests {
             reader.lookup(&[serde_json::json!(2)], "value").unwrap(),
             Some(serde_json::json!("two"))
         );
+    }
+
+    #[test]
+    fn exact_reference_upgrade_preserves_v1_and_exposes_dataset_number_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let data = b"{\"key\":2.547114365375239e-8,\"value\":2.547114365375239e-8}\n";
+        let owner = owner("fraction-case");
+        let descriptor = descriptor(data);
+        let legacy = prepare_jsonl_version(
+            root.path(),
+            &owner,
+            &descriptor,
+            &data[..],
+            Limits::default(),
+            &|| false,
+            1,
+        )
+        .unwrap();
+        let legacy_path = directory(root.path(), &legacy.version).unwrap();
+        let before = fs::read(legacy_path.join("rows.sqlite")).unwrap();
+        let dataset: Value = serde_json::from_str("2.547114365375239e-8").unwrap();
+        let exact = crate::case_evidence::parse_exact_value("2.547114365375239e-8").unwrap();
+        assert_eq!(dataset.as_f64().unwrap().to_bits(), 0x3e5b597464455d8b);
+        assert_eq!(
+            exact.value().as_f64().unwrap().to_bits(),
+            0x3e5b597464455d8a
+        );
+        let old = open(root.path(), &owner, &descriptor, &|| false).unwrap();
+        assert_eq!(old.prepared().version.store_version, 1);
+        assert!(old.lookup(&[dataset.clone()], "value").unwrap().is_some());
+        assert!(old
+            .lookup(&[exact.value().clone()], "value")
+            .unwrap()
+            .is_none());
+        drop(old);
+        assert_eq!(
+            recovery_directory(root.path(), &owner, &descriptor).unwrap(),
+            legacy_path
+        );
+        let current = open_exact(root.path(), &owner, &descriptor, &|| false).unwrap();
+        assert_eq!(current.prepared().version.store_version, 2);
+        assert_ne!(current.prepared().version, legacy.version);
+        assert!(
+            current
+                .lookup(&[dataset.clone()], "value")
+                .unwrap()
+                .is_none(),
+            "different actual Numbers cannot be silently coerced"
+        );
+        let found = current
+            .lookup(&[exact.value().clone()], "value")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.as_f64().unwrap().to_bits(), 0x3e5b597464455d8a);
+        assert_eq!(fs::read(legacy_path.join("source.jsonl")).unwrap(), data);
+        assert_eq!(fs::read(legacy_path.join("rows.sqlite")).unwrap(), before);
+        let still_legacy = open(root.path(), &owner, &descriptor, &|| false).unwrap();
+        assert_eq!(still_legacy.prepared().version.store_version, 1);
+        assert!(still_legacy
+            .lookup(&[dataset.clone()], "value")
+            .unwrap()
+            .is_some());
+        // Capturing an already-decoded Dataset Number preserves that Number;
+        // importing raw text preserves and interprets the original decimal.
+        let captured = serde_json::to_string(&dataset).unwrap();
+        let captured = crate::case_evidence::parse_exact_value(&captured).unwrap();
+        assert_eq!(
+            captured.value().as_f64().unwrap().to_bits(),
+            0x3e5b597464455d8b
+        );
+    }
+
+    #[test]
+    fn exact_reference_keeps_string_integer_float_and_negative_zero_keys_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let data = b"{\"key\":\"1\",\"value\":\"text\"}\n{\"key\":1,\"value\":\"integer\"}\n{\"key\":1.0,\"value\":\"float\"}\n{\"key\":-0.0,\"value\":\"negative-zero\"}\n{\"key\":0,\"value\":\"zero\"}\n";
+        let prepared = prepare_jsonl_version(
+            root.path(),
+            &owner("case-a"),
+            &descriptor(data),
+            &data[..],
+            Limits::default(),
+            &|| false,
+            PREPARATION_VERSION,
+        )
+        .unwrap();
+        assert_eq!(prepared.version.store_version, 2);
+        let reader =
+            open_exact(root.path(), &owner("case-a"), &descriptor(data), &|| false).unwrap();
+        for (key, label) in [
+            ("\"1\"", "text"),
+            ("1", "integer"),
+            ("1.0", "float"),
+            ("-0.0", "negative-zero"),
+            ("0", "zero"),
+        ] {
+            let key = crate::case_evidence::parse_exact_value(key).unwrap();
+            assert_eq!(
+                reader.lookup(&[key.value().clone()], "value").unwrap(),
+                Some(Value::String(label.into()))
+            );
+        }
+    }
+    #[test]
+    fn explicit_v2_source_recovery_does_not_rebuild_or_switch_legacy_data() {
+        let root = tempfile::tempdir().unwrap();
+        let data = b"{\"key\":2.547114365375239e-8,\"value\":\"exact\"}\n";
+        let owner = owner("declared-version");
+        let legacy_descriptor = descriptor(data);
+        let legacy = prepare_jsonl(
+            root.path(),
+            &owner,
+            &legacy_descriptor,
+            &data[..],
+            Limits::default(),
+            &|| false,
+        )
+        .unwrap();
+        let legacy_path = directory(root.path(), &legacy.version).unwrap();
+        let mut selected = legacy_descriptor.clone();
+        selected.interpretation_version = 2;
+        let exact_path = directory(root.path(), &version(&owner, &selected).unwrap()).unwrap();
+        assert!(!exact_path.exists());
+        assert_eq!(
+            recovery_directory(root.path(), &owner, &selected).unwrap(),
+            legacy_path
+        );
+        let captured = open_source(root.path(), &owner, &selected, &|| false).unwrap();
+        assert_eq!(captured.prepared().version.store_version, 1);
+        drop(captured);
+        assert!(
+            !exact_path.exists(),
+            "read-only recovery must not build a cache"
+        );
+        let reader = open(root.path(), &owner, &selected, &|| false).unwrap();
+        assert_eq!(reader.prepared().version.store_version, 2);
+        let key = crate::case_evidence::parse_exact_value("2.547114365375239e-8").unwrap();
+        assert_eq!(
+            reader.lookup(&[key.value().clone()], "value").unwrap(),
+            Some(Value::String("exact".into()))
+        );
+        assert_eq!(
+            recovery_directory(root.path(), &owner, &selected).unwrap(),
+            exact_path
+        );
+        assert_eq!(
+            open(root.path(), &owner, &legacy_descriptor, &|| false)
+                .unwrap()
+                .prepared()
+                .version
+                .store_version,
+            1
+        );
+        assert_eq!(fs::read(legacy_path.join("source.jsonl")).unwrap(), data);
     }
 }

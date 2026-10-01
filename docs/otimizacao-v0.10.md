@@ -71,7 +71,9 @@ Pesquisa, implementação estrutural e experiência de uso avançam continuament
 
 O Chromium de CI confirmou os seis fluxos focados no snapshot `910bd69`: responsividade, recuperação de salvamento/instalação, Timeline agrupada, transformações, exclusão/restauração e referências do Caso. Também passaram 181 verificações rápidas de Node. O transporte de navegador usa fixtures sintéticos; isso não substitui execução instalada nativa nem a suíte completa.
 
-## Estado do checkpoint de 1º de outubro
+## Registro histórico: checkpoint de 1º de outubro
+
+Esta seção descreve um estágio anterior à integração da preservação nativa de evidências. A etapa de transferência, salvamento e exportação citada abaixo foi concluída por esse caminho; consulte o comportamento e os limites nas [notas da versão 0.10](releases/v0.10.0.md). As contagens de testes e medições deste registro continuam vinculadas aos respectivos checkpoints, sem representar os gates finais da versão.
 
 Campos e referências têm configuração autoritativa por Caso, com revisões e diagnóstico de conteúdo indisponível. O fluxo de transformação JSON foi verificado por filtro e gráfico; o campo obtido por referência foi verificado por filtro e pivot. O arquivo reversível preserva lotes, data e proveniência, e permite restauração parcial/integral sem apagar o arquivo original. O formato portátil carrega referências e histórico de exclusões com publicação transacional.
 

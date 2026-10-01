@@ -13,7 +13,7 @@ use tauri::{AppHandle, Manager};
 
 struct FieldTextAdmission {
     admitted: std::sync::Arc<analysis_runtime::Admitted>,
-    events: Option<std::sync::Arc<Vec<Event>>>,
+    events: Option<std::sync::Arc<crate::case_cache::Records>>,
     receipt: Receipt,
 }
 
@@ -357,7 +357,7 @@ mod tests {
         } = captured;
         analysis_runtime::with(Some(admitted.clone()), || {
             admitted.validate(state)?;
-            let events = admitted.prepare_visibility_record(events.as_deref().map(Vec::as_slice), 0, Some("memory:0"))?;
+            let events = admitted.prepare_visibility_record(events.as_deref().map(crate::case_cache::Records::as_slice), 0, Some("memory:0"))?;
             let _publication = crate::catalog_read_guard()?;
             crate::page_projection::hydrate_projected_field(
                 state,

@@ -101,6 +101,15 @@ impl Source {
         self.idx.lines.len()
     }
 
+    /// Storage accounting for the ignored library workload, not OS RSS/heap.
+    #[cfg(test)]
+    pub fn metadata_storage(&self) -> Value {
+        let rows = self.idx.lines.len();
+        let resident = self.idx.lines.resident_rows();
+        serde_json::json!({"rows": rows, "residentRows": resident, "mappedRows": rows - resident,
+            "residentPayloadBytes": resident as u64 * std::mem::size_of::<crate::model::LineMeta>() as u64})
+    }
+
     pub fn is_empty(&self) -> bool {
         self.idx.lines.is_empty()
     }

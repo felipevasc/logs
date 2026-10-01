@@ -36,6 +36,7 @@ window.Security = (() => {
   let fullCaseKey = "", fullCaseRows = [];
   function fullRequest() {
     if (workspaceScope() !== "case") return { filters: [] };
+    if (window.CaseEvidence?.active === true) return { filters: [], caseEvents: caseEvents("analysis-all") };
     const sig = caseSig(true);
     if (sig !== fullCaseKey) { fullCaseKey = sig; fullCaseRows = caseEventsCompute(true); }
     return { filters: [], caseEvents: fullCaseRows };
@@ -126,8 +127,31 @@ window.Security = (() => {
     if (workspaceScope() === "case") { toast("Estes registros já pertencem ao Caso.", "info"); return; }
     const contextBefore = universeKey();
     const ids = [...new Set(detections.flatMap(d => d.event_ids))];
-    const membersById=new Map();
-    for(const d of detections)for(const member of d.evidence_members || [])if(!membersById.has(member.event_id))membersById.set(member.event_id,member);
+    if (window.CaseEvidence?.active === true && (!ids.length || ids.length > 10000)) { toast("Selecione um achado com 1 a 10.000 registros de apoio para preservar.", "info"); return; }
+    const membersById=new Map(), ambiguousIds=new Set();
+    for(const d of detections)for(const member of d.evidence_members || []){if(!membersById.has(member.event_id))membersById.set(member.event_id,member);else if(membersById.get(member.event_id).event_ref!==member.event_ref)ambiguousIds.add(member.event_id);}
+    if (window.CaseEvidence?.active === true) {
+      try {
+        const c = ensureCase(), owner = await window.AnalysisContexts.prepare(window.AnalysisContexts.capture(), { metadata: true });
+        const current = () => activeCase() === c && workspaceScope() === "dataset" && universeKey() === contextBefore && window.AnalysisContexts.isCurrent(owner);
+        if (!current()) throw Error("O conjunto mudou. Reabra o achado antes de preservá-lo.");
+        const handles = ids.map(id => {
+          const member = membersById.get(id);
+          if (ambiguousIds.has(id) || !member?.event_ref) throw Error("A referência original do achado está ausente ou é ambígua.");
+          return { id, eventRef: member.event_ref };
+        });
+        const actions = nativeEvidenceServices().actions, selected = await actions.selection(handles, { guard: current });
+        if (!current()) throw Error("O conjunto mudou durante a preparação do achado.");
+        const references = [...new Set(handles.map(row => row.eventRef))], filters = [{ column: "event_ref", op: "in_exact", value: references.join("\n") }];
+        let start = Infinity, end = -Infinity; for (const detection of detections) { start = Math.min(start, detection.start ?? Infinity); end = Math.max(end, detection.end ?? -Infinity); }
+        const artifact = registerCurrentArtifact(c);
+        await actions.add(selected, { id: "i" + Date.now().toString(36) + Math.floor(Math.random() * 1e4), kind: "grupo", label: title, note: summary, createdAt: Date.now(),
+          sourceFilters: filters, sourceSpec: structuredClone(state.currentArtifact?.source), foundCount: handles.length, tags: ["detecção"], relevance: detections.some(d => SEVERITY[d.severity]?.[1] >= 3) ? "importante" : "normal", origin: state.currentOrigin, artifactId: artifact?.id || state.currentArtifact?.id, stationId: null,
+          detection: { ...evidence().exportMetadata(data, minimumEvidence, workspaceScope()), analyst_state: "unreviewed", ...(grouping ? { grouping: structuredClone(grouping) } : {}), detections: structuredClone(detections), start: Number.isFinite(start) ? start : null, end: Number.isFinite(end) ? end : null } }, { guard: current });
+        if (artifact) queueCustody(artifact); updateCountsSafe(); window.WorkspaceContext?.refreshMembership?.(); toast("Achado salvo com suas ocorrências preservadas no Caso.", "ok");
+      } catch (error) { toast(`Não foi possível preservar o achado: ${String(error.message || error)}`, "err"); }
+      return;
+    }
     const rows = [];
     for (const id of ids) { try {
       const member=membersById.get(id);

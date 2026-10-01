@@ -501,7 +501,7 @@ pub(crate) async fn exclusion_capabilities(
     .await?
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BatchSummary {
     id: String,
@@ -513,10 +513,14 @@ pub(crate) struct BatchSummary {
     members: u64,
     active: bool,
     restored_at_ms: Option<u64>,
+    #[serde(skip)]
+    _credit: crate::case_work_budget::Lease,
 }
-impl From<exclusion_store::BatchInfo> for BatchSummary {
-    fn from(batch: exclusion_store::BatchInfo) -> Self {
+impl From<exclusion_store::RetainedBatchInfo> for BatchSummary {
+    fn from(batch: exclusion_store::RetainedBatchInfo) -> Self {
+        let (batch, credit) = batch.into_parts();
         Self {
+            _credit: credit,
             id: batch.id,
             created_at_ms: batch.created_at_ms,
             label: batch.label,

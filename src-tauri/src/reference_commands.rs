@@ -207,7 +207,7 @@ fn import(
         return Err("Escolha colunas de chave distintas presentes na referência.".into());
     }
     let descriptor = ReferenceDescriptor {
-        schema_version: 1,
+        interpretation_version: 1, schema_version: 1,
         id: uuid::Uuid::new_v4().to_string(),
         name: name.into(),
         content_sha256: inspection.content_sha256,

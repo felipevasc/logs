@@ -74,6 +74,45 @@ impl Profile {
     }
 }
 
+// A synchronous historical compilation scope admits work before any cache-hit
+// clone or miss allocation. Ordinary callers have no scope and keep the same
+// API/behavior. The first failure survives callers that discard regex errors.
+type Admission = std::rc::Rc<std::cell::RefCell<CompilationAdmission>>;
+struct CompilationAdmission {
+    reserve: Box<dyn FnMut(usize) -> Result<(), String>>,
+    failure: Option<String>,
+}
+thread_local! {
+    static ADMISSION: std::cell::RefCell<Option<Admission>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn with_compilation_admission<T>(
+    reserve: impl FnMut(usize) -> Result<(), String> + 'static,
+    run: impl FnOnce() -> T,
+) -> Result<T, String> {
+    struct Reset(Option<Admission>);
+    impl Drop for Reset {
+        fn drop(&mut self) { ADMISSION.with(|slot| *slot.borrow_mut() = self.0.take()); }
+    }
+    let admission = std::rc::Rc::new(std::cell::RefCell::new(CompilationAdmission { reserve: Box::new(reserve), failure: None }));
+    let _reset = Reset(ADMISSION.with(|slot| slot.replace(Some(admission.clone()))));
+    let result = run();
+    let failure = admission.borrow().failure.clone();
+    match failure { Some(error) => Err(error), None => Ok(result) }
+}
+fn admit_compilation(pattern: &str, profile: Profile) -> Result<(), regex::Error> {
+    let Some(admission) = ADMISSION.with(|slot| slot.borrow().clone()) else { return Ok(()); };
+    let mut admission = admission.borrow_mut();
+    if admission.failure.is_none() {
+        let result = crate::operations::check().and_then(|()| {
+            let bytes = pattern.len().checked_mul(4).and_then(|text| profile.credit().checked_add(text))
+                .ok_or_else(|| "CASE_HISTORY_LIMIT".to_string())?;
+            (admission.reserve)(bytes)
+        });
+        if let Err(error) = result { admission.failure = Some(error); }
+    }
+    if admission.failure.is_some() { Err(regex::Error::Syntax("QUERY_REGEX_ADMISSION".into())) } else { Ok(()) }
+}
+
 #[derive(Clone, Copy)]
 struct Limits {
     entries: usize,
@@ -122,6 +161,7 @@ impl ProgramCache {
     }
 
     fn compile(&self, pattern: &str, profile: Profile, mut cancelled: impl FnMut() -> bool) -> Result<Regex, regex::Error> {
+        admit_compilation(pattern, profile)?;
         let hit = {
             let mut retained = self.retained.lock().unwrap_or_else(|e| e.into_inner());
             retained.entries.iter().position(|entry| entry.profile == profile && entry.pattern.as_ref() == pattern)
@@ -364,5 +404,46 @@ mod tests {
         assert_eq!(cache.retained.lock().unwrap().entries.len(), 1);
         assert!(compile(&cache, "(?i)shared", ORDINARY).is_match("shared"));
         assert_eq!(builds(&cache), 4);
+    }
+}
+
+#[cfg(test)]
+mod compilation_admission_tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+    #[test]
+    fn cache_hits_require_admission_before_the_caller_clone() {
+        let ((), builds) = testing::run(96 << 20, || {
+            compile("cached-history", ORDINARY).unwrap();
+            let called = Rc::new(Cell::new(0)); let captured = called.clone();
+            let error = with_compilation_admission(move |_| { captured.set(captured.get()+1); Err("CASE_WORK_BUSY".into()) }, || compile("cached-history", ORDINARY).ok()).unwrap_err();
+            assert_eq!(error, "CASE_WORK_BUSY"); assert_eq!(called.get(),1);
+            assert!(compile("cached-history", ORDINARY).is_ok());
+        });
+        assert_eq!(builds,1);
+    }
+    #[test]
+    fn invalid_regex_and_latched_budget_failure_remain_distinct() {
+        let invalid = with_compilation_admission(|_| Ok(()), || compile("[", ORDINARY)).unwrap().unwrap_err();
+        assert_eq!(invalid.to_string(), Regex::new("[").unwrap_err().to_string());
+        let called = Rc::new(Cell::new(0)); let captured = called.clone();
+        let denied = with_compilation_admission(move |_| {captured.set(captured.get()+1); Err("credit refused".into())}, || {
+            assert!(compile("valid", ORDINARY).ok().is_none());
+            assert!(compile("another", ORDINARY).ok().is_none());
+            Vec::<usize>::new()
+        }).unwrap_err();
+        assert_eq!(denied,"credit refused"); assert_eq!(called.get(),1);
+    }
+    #[test]
+    fn scoped_cancellation_cannot_be_swallowed_by_prepare_ok() {
+        let id = format!("history-regex-{}",uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let result = crate::operations::run_with_token(token, || {
+            assert!(crate::operations::cancel_id(&id));
+            let failure = with_compilation_admission(|_| panic!("cancel must precede reserve"), || compile("cancelled", ORDINARY).ok()).unwrap_err();
+            assert!(failure.contains("cancel"));
+        });
+        assert!(result.unwrap_err().contains("cancel"));
+        assert!(compile("normal-after-scope", ORDINARY).is_ok());
     }
 }

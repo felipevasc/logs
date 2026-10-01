@@ -117,7 +117,7 @@
 
   runGroup = async function ({ force = false } = {}) {
     groupShell(); clearTimeout(groupTimer);
-    if (!scopeHasEvents(workspaceScope())) { groupView.version++; groupView.result = null; groupView.computedKey = ""; $("#aw-group-summary").textContent = workspaceScope() === "case" ? "Adicione registros relevantes ao Caso para resumir." : "Abra um arquivo para resumir seus registros."; $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren(); return; }
+    if (!scopeHasEvents(workspaceScope())) { groupView.version++; groupView.result = null; groupView.computedKey = ""; const unavailable = window.CaseEvidence?.active === true ? caseAnalysisUnavailable(workspaceScope()) : null; $("#aw-group-summary").textContent = unavailable || (workspaceScope() === "case" ? "Adicione registros relevantes ao Caso para resumir." : "Abra um arquivo para resumir seus registros."); $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren(); return; }
     if (!state.groupCol) state.groupCol = state.columns[0];
     if (window.AnalysisFields && !window.AnalysisFields.available(state.groupCol)) {
       groupView.result = null; groupView.computedKey = "";
@@ -335,6 +335,12 @@
   };
   const originalRunCube = runCube;
   runCube = async function ({ force = false } = {}) {
+    const unavailable = window.CaseEvidence?.active === true ? caseAnalysisUnavailable() : null;
+    if (unavailable) {
+      pivotShell(); cubeState.requestVersion++; window.Tasks?.cancelLatest("pivot"); cubeState.result = null;
+      for (const selector of ["#cube-table thead", "#cube-table tbody", "#aw-pivot-pager"]) $(selector)?.replaceChildren();
+      $("#aw-pivot-summary").textContent = unavailable; return { status: "unavailable", error: unavailable };
+    }
     pivotShell(); const cube = activeCube();
     if (window.AnalysisFields && [...cube.rows, ...cube.cols].some(field => !window.AnalysisFields.available(field, state.analyticsScope))) {
       cubeState.requestVersion++; window.Tasks?.cancelLatest("pivot"); cubeState.result = null;

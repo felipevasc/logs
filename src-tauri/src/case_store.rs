@@ -13,6 +13,7 @@ pub(crate) fn connect(dir: &std::path::Path) -> Result<Connection, String> {
 /// Initializes only schema/migration metadata for context admission. Already
 /// migrated requests never deserialize the (potentially large) case evidence.
 pub(crate) fn context_connection(dir: &std::path::Path) -> Result<Connection, String> {
+    crate::case_evidence::bootstrap(dir)?;
     let mut conn = connect(dir)?;
     let exists: bool = conn
         .query_row(
@@ -68,6 +69,7 @@ pub fn load() -> Result<Value, String> {
     load_at(&crate::config_dir())
 }
 pub(crate) fn load_at(dir: &std::path::Path) -> Result<Value, String> {
+    crate::case_evidence::bootstrap(dir)?;
     let mut conn = connect(dir)?;
     let version: i64 = conn
         .query_row(
@@ -77,40 +79,21 @@ pub(crate) fn load_at(dir: &std::path::Path) -> Result<Value, String> {
         )
         .map_err(|e| e.to_string())?;
     if version == 0 {
-        drop(conn);
-        let paths = [dir.join("cases.json"), dir.join("cases.backup.json")];
-        let mut legacy = None;
-        for path in &paths {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                    if value.get("cases").is_some_and(Value::is_array) {
-                        legacy = Some(value);
-                        break;
-                    }
-                }
-            }
-        }
-        if legacy.is_none() && paths.iter().any(|p| p.exists()) {
-            return Err("Não foi possível recuperar os casos salvos. Os arquivos originais foram preservados.".into());
-        }
-        let is_legacy = legacy.is_some();
-        let mut legacy = legacy.unwrap_or(json!({"active":null,"cases":[]}));
-        if let Some(object) = legacy.as_object_mut() {
-            object.remove("revision");
-        }
-        save_initial_at(dir, legacy, is_legacy)?;
-        return load_at(dir);
+        return Err("CASE_BOOTSTRAP_INCOMPLETE: Inicialização incompleta; os arquivos originais foram preservados.".into());
     }
+
     {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        crate::case_evidence::require_legacy_store(&tx)?;
         crate::analysis_context::initialize(&tx, dir)?;
         tx.commit().map_err(|e| e.to_string())?;
     }
     // A read transaction keeps case bodies, configurations and revision together.
     conn.execute_batch("BEGIN DEFERRED")
         .map_err(|e| e.to_string())?;
+    crate::case_evidence::require_legacy_store(&conn)?;
     let revision: u64 = conn
         .query_row("SELECT value FROM metadata WHERE key='revision'", [], |r| {
             r.get::<_, String>(0)
@@ -182,6 +165,7 @@ fn save_initial_at(dir: &std::path::Path, data: Value, legacy: bool) -> Result<V
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
+    crate::case_evidence::require_legacy_store(&tx)?;
     let current: u64 = tx
         .query_row("SELECT value FROM metadata WHERE key='revision'", [], |r| {
             r.get::<_, String>(0)

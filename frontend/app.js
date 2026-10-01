@@ -501,6 +501,7 @@ async function activateArtifact(artifactId) {
 }
 
 async function syncActiveCaseArtifacts() {
+  if (activeCase()?.kind === "preserved_case_unavailable") { renderArtifactBar(); updateContextBar(); return; }
   const session = artifactSessionFor();
   renderArtifactBar();
   if (session?.activeId && session.artifacts.has(session.activeId)) {
@@ -512,6 +513,7 @@ async function syncActiveCaseArtifacts() {
 }
 
 function updateContextBar() {
+  if (activeCase()?.kind === "preserved_case_unavailable") { $("#context-summary").textContent = "Caso preservado · metadados indisponíveis"; return; }
   if (document.body.dataset.page === 'compromises') {
     const data=window.Security?.cached();
     $('#context-summary').textContent=`${data ? fmtNum(data.total)+' registros · ' : ''}${workspaceScope()==='case'?'Caso ativo completo':'Conjunto carregado completo'} · filtros do Explorar não se aplicam`;
@@ -520,8 +522,8 @@ function updateContextBar() {
   if (state.queryError) { $("#context-summary").textContent = "Consulta não concluída"; return; }
   // contexto de Caso: os números são sempre do conjunto do Caso, nunca do artefato
   if (state.activeContext !== "artifact" && activeCase()) {
-    const events = caseEvents(), summary = caseEventsCache.summary;
-    const bits = [activeCase().name, `${fmtNum(events.length)} registros preservados no Caso`];
+    const summary = window.CaseEvidence?.active === true ? caseAnalysisSummary() : (caseEvents(), { ...caseEventsCache.summary, preservedCount: caseEventsCache.events.length });
+    const bits = [activeCase().name, summary.preservedCount == null ? "Evidências indisponíveis para análise" : `${fmtNum(summary.preservedCount)} ocorrências preservadas no Caso`];
     if (summary.start != null) bits.push(`${fmtTs(summary.start)} — ${fmtTs(summary.end)}`);
     if (state.filters.length || state.quick.trim()) bits.push("recorte filtrado");
     if (state.stationAnalyticsId) {
@@ -586,8 +588,12 @@ const caseTransport = { keys: new WeakMap(), synced: new Map(), tokens: new Map(
   windowKey: window.crypto?.randomUUID?.() || Math.random().toString(36).slice(2) };
 const caseSyncKey = (key, args) => JSON.stringify([key, args.analysisContext?.caseId ?? null, args.analysisContext?.analysisId ?? null]);
 const validCaseContentToken = value => typeof value === "string" && value.length > 0 && value.length <= 128 && new TextEncoder().encode(value).length <= 128;
-async function caseArgs(args, resync = false, previousPublication = null, { canonical = false } = {}) {
+async function caseArgs(args, resync = false, previousPublication = null, { canonical = false, cancelled = () => false } = {}) {
   const events = args.caseEvents;
+  if (window.CaseEvidence?.active === true) {
+    if (window.CaseEvidenceAnalysis?.isCapture(events)) return window.CaseEvidenceAnalysis.prepare(args, resync, previousPublication, { canonical, cancelled });
+    if (events != null) throw Error("EVIDENCE_NATIVE_SCOPE_REQUIRED: Reabra o Caso para consultar suas evidências nativas.");
+  }
   if (!Array.isArray(events)) {
     if (canonical && args.caseKey && !validCaseContentToken(args.caseContentToken)) throw Error("Não foi possível confirmar a versão exata das evidências do Caso. Atualize a análise.");
     return args;
@@ -630,10 +636,13 @@ async function api(cmd, args = {}, opts = {}) {
     if (/^(load_|clear_|set_|save_|delete_|harvest_)/.test(cmd)) { state.explorerCache = null; state.datasetRevision++; explorerAnalytics.clear(); }
     let casePublication = null;
     const preparedArgs = async (retry = false) => {
-      const capturedArgs = retry && !Array.isArray(args.caseEvents) && Array.isArray(opts.caseEvents) ? { ...args, caseEvents: opts.caseEvents } : args;
+      const isCaptured = value => Array.isArray(value) || window.CaseEvidenceAnalysis?.isCapture(value);
+      const capturedArgs = retry && !isCaptured(args.caseEvents) && isCaptured(opts.caseEvents) ? { ...args, caseEvents: opts.caseEvents } : args;
       const requiresCaseToken = cmd === "analysis_field_text" || cmd === "event_detail" || cmd === "java_trace_detail";
-      const prepared = await caseArgs(capturedArgs, retry, casePublication, { canonical: requiresCaseToken });
-      if (prepared.caseKey) casePublication = caseTransport.synced.get(caseSyncKey(prepared.caseKey, prepared)) ?? null;
+      const prepared = await caseArgs(capturedArgs, retry, casePublication, { canonical: requiresCaseToken, cancelled: opts.cancelled });
+      if (prepared.caseKey) casePublication = window.CaseEvidenceAnalysis?.isCapture(capturedArgs.caseEvents || opts.caseEvents)
+        ? window.CaseEvidenceAnalysis.token(capturedArgs.caseEvents || opts.caseEvents)
+        : caseTransport.synced.get(caseSyncKey(prepared.caseKey, prepared)) ?? null;
       if (opts.cancelled?.()) throw new Error("Operação cancelada.");
       if (requiresCaseToken && prepared.caseKey) opts.onCasePrepared?.({ caseKey: prepared.caseKey, caseContentToken: prepared.caseContentToken });
       return prepared;
@@ -1555,15 +1564,17 @@ function caseTreeProfiles() {
   if (!c) return null;
   const owner = window.AnalysisContexts?.capture();
   const sig = JSON.stringify([caseSig(), owner?.instance, owner?.identity]);
-  const current = () => !owner || window.AnalysisContexts.isCurrent(owner);
+  const current = () => (!owner || window.AnalysisContexts.isCurrent(owner))
+    && sig === JSON.stringify([caseSig(), window.AnalysisContexts?.capture()?.instance, window.AnalysisContexts?.capture()?.identity]);
   const cached = state.caseTreeProfiles[c.id];
   if (cached && cached.sig === sig) return cached.profiles;
   if (!state.caseProfilesLoading) {
     state.caseProfilesLoading = true;
-    api("profile_fields", { filters: [], caseEvents: caseEvents() }, { silent: true })
+    const request = caseTreeProfiles.requestSerial = (caseTreeProfiles.requestSerial || 0) + 1;
+    Promise.resolve().then(() => api("profile_fields", { filters: [], caseEvents: caseEvents("analysis") }, { silent: true, analysisOwner: owner }))
       .then((profiles) => { if (current()) state.caseTreeProfiles[c.id] = { sig, profiles }; })
-      .catch(() => {})
-      .finally(() => { if (!current()) return; state.caseProfilesLoading = false; if (workspaceScope() === "case") refreshTreeAggs("case"); });
+      .catch(error => { if (current()) state.caseTreeProfiles[c.id] = { sig, profiles: [], error: String(error) }; })
+      .finally(() => { if (caseTreeProfiles.requestSerial !== request) return; state.caseProfilesLoading = false; if (current() && workspaceScope() === "case") refreshTreeAggs("case"); });
   }
   return null;
 }
@@ -1737,7 +1748,7 @@ async function refreshTreeAggs(scope, { force = false } = {}) {
     res = await api("tree_aggs", {
       columns: cols,
       filters,
-      ...(scope === "case" ? { caseEvents: caseEvents() } : {}),
+      ...(scope === "case" ? { caseEvents: caseEvents("analysis") } : {}),
     }, { silent: true, latest: "explore-tree" });
   } catch (error) {
     spinDone();
@@ -1779,6 +1790,16 @@ function includeDiscoveredFields(profiles, scope) {
 
 function renderExploreTreeInto(box, scope) {
   box.innerHTML = "";
+  const caseProfile = scope === "case" ? state.caseTreeProfiles[activeCase()?.id] : null;
+  if (caseProfile?.error && caseTreeProfilesPeek()) {
+    const failure = el("div", "muted small", `Perfil indisponível: ${caseProfile.error}`), retry = el("button", "btn ghost small", "Tentar perfil novamente");
+    retry.type = "button";
+    retry.onclick = () => {
+      const item = activeCase(); if (!item || state.caseTreeProfiles[item.id] !== caseProfile) return;
+      delete state.caseTreeProfiles[item.id]; renderExploreTree();
+    };
+    failure.appendChild(retry); box.appendChild(failure);
+  }
   if (state.treeAggError?.[scope]) {
     const error = el("p", "muted small", `Contagens não atualizadas; valores anteriores podem estar fora do recorte. ${state.treeAggError[scope]}`);
     error.setAttribute("role", "status"); box.append(error);
@@ -2390,7 +2411,7 @@ function loadExplorerAnalytics(key, scope, filters, knownTotal = null) {
     if (cached.status === "stale") cached.resume();
     return cached;
   }
-  const args = { filters, ...(scope === "case" ? { caseEvents: caseEvents() } : {}) };
+  const args = { filters, ...(scope === "case" ? { caseEvents: caseEvents("analysis") } : {}) };
   const entry = { total: Number.isFinite(knownTotal) ? knownTotal : null, stats: null, status: "queued", error: null, generation: 0 };
   const ownsEntry = () => explorerAnalytics.get(key) === entry;
   const current = () => ownsEntry() && key === explorerKey();
@@ -2476,7 +2497,7 @@ async function refresh({ analytics = true, resetAttempt = false } = {}) {
   $("#events-table").setAttribute("aria-busy", "true");
   $("#result-count").textContent = state.rows.length ? "Atualizando · registros anteriores" : "Consultando…";
   try {
-    const qr = await api("query_page", { filters, ...(scope === "case" ? { caseEvents: caseEvents() } : {}), sortColumn: state.sortCol, sortDir: state.sortDir, offset: state.page * state.pageSize, limit: state.pageSize, cursor: explorerCursors[state.page] || null }, { latest: "explore-page" });
+    const qr = await api("query_page", { filters, ...(scope === "case" ? { caseEvents: caseEvents("analysis") } : {}), sortColumn: state.sortCol, sortDir: state.sortDir, offset: state.page * state.pageSize, limit: state.pageSize, cursor: explorerCursors[state.page] || null }, { latest: "explore-page" });
     if (version !== state.refreshVersion || key !== explorerKey()) return false;
     const cached = explorerAnalytics.get(key);
     if (Number.isFinite(cached?.total)) qr.total = cached.total;
@@ -3240,7 +3261,7 @@ async function renderTrail() {
       before: t.before,
       after: t.after,
       filters: t.unfiltered ? [] : backendFilters(),
-      ...(t.onlyCase ? { caseEvents: caseEvents() } : {}),
+      ...(t.onlyCase ? { caseEvents: caseEvents("analysis") } : {}),
     });
   } catch (e) {
     finishOperation("Falha ao analisar trilha", String(e));
@@ -3287,7 +3308,7 @@ async function renderTrail() {
 const CURRENT_FILTER_ID = "__current__";
 function savedFilters() {
   const c = activeCase();
-  if (!c) return [];
+  if (!c || c.kind === "preserved_case_unavailable") return [];
   if (workspaceScope() === "case") { c.workspace ||= defaultCaseWorkspace(); return c.workspace.savedFilters ||= []; }
   c.savedFilters = c.savedFilters || [];
   return c.savedFilters;
@@ -3325,7 +3346,7 @@ function restoreCurrentSavedFilter() {
 
 function syncCurrentSavedFilter() {
   const c = activeCase();
-  if (!c) return null;
+  if (!c || c.kind === "preserved_case_unavailable") return null;
   const saved = savedFilters();
   let current = saved.find((filter) => filter.id === CURRENT_FILTER_ID);
   let changed = false;
@@ -3363,7 +3384,7 @@ function renderFilterTabs() {
   const bar = $("#filter-tabs");
   bar.innerHTML = "";
   const c = activeCase();
-  if (!c) {
+  if (!c || c.kind === "preserved_case_unavailable") {
     bar.hidden = true;
     updateFilterTabsLayout();
     return;
@@ -3401,6 +3422,7 @@ function renderFilterTabs() {
   add.onclick = (e) => {
     e.stopPropagation(); // evita o fechamento imediato pelo handler de documento
     openNamePop(add, (name) => {
+      if (activeCase() !== c || c.kind === "preserved_case_unavailable") { toast("O Caso mudou. Abra a criação de visualização novamente.", "info"); return; }
       savedFilters().push({ id: "f" + Date.now().toString(36), name, ...copyCurrentFilterState() });
       saveCases();
       renderFilterTabs();
@@ -3427,7 +3449,8 @@ const filterCountsPending = new Set();
 function runFilterTabCounts() {
   filterCountsTimer = null;
   const context = JSON.stringify([state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields, activeCase()?.id, window.AnalysisContexts?.identity(), caseSig()]);
-  const caseEvs = caseEvents();
+  let caseEvs, caseCaptureError;
+  try { caseEvs = caseEvents("analysis"); } catch (error) { caseCaptureError = error; }
   const updates = [];
   for (const f of savedFilters()) {
     const tab = document.querySelector(`.filter-tab[data-fid="${f.id}"] .filter-tab-counts`);
@@ -3437,7 +3460,7 @@ function runFilterTabCounts() {
     if (!result) {
       result = Promise.all([
         api("count_filtered", { filters }, { silent: true, background: true }),
-        caseEvs.length ? api("count_filtered", { filters, caseEvents: caseEvs }, { silent: true, background: true }) : Promise.resolve(0),
+        caseCaptureError ? Promise.reject(caseCaptureError) : (Array.isArray(caseEvs) ? caseEvs.length > 0 : true) ? api("count_filtered", { filters, caseEvents: caseEvs }, { silent: true, background: true }) : Promise.resolve(0),
       ]);
       filterCountsCache.set(key, result);
       if (filterCountsCache.size > 64) filterCountsCache.delete(filterCountsCache.keys().next().value);
@@ -3472,13 +3495,13 @@ async function settleFilterTabCounts() {
 // ------------------------------------------------------------------ estações
 function caseStations() {
   const c = activeCase();
-  if (!c) return [];
+  if (!c || c.kind === "preserved_case_unavailable") return [];
   c.stations = c.stations || [];
   return c.stations;
 }
 
 function caseArtifacts(c = activeCase()) {
-  if (!c) return [];
+  if (!c || c.kind === "preserved_case_unavailable") return [];
   c.artifacts = c.artifacts || [];
   return c.artifacts;
 }
@@ -3505,6 +3528,7 @@ function queueCustody(artifact) {
 }
 
 function registerCurrentArtifact(c = activeCase()) {
+  if (c?.kind === "preserved_case_unavailable") throw Error("CASE_METADATA_UNAVAILABLE: Não é possível editar este Caso; seus originais permanecem preservados.");
   if (!c || !state.currentArtifact) return null;
   c.activeArtifactId = state.currentArtifact.id; // restaura o artefato aberto ao reabrir
   const artifacts = caseArtifacts(c);
@@ -3628,7 +3652,7 @@ function renderStations() {
       row.appendChild(el("span", "kind", item.kind));
       row.appendChild(el("span", "label", item.label));
       row.appendChild(el("span", "spacer"));
-      row.appendChild(el("span", "count", `${fmtNum(item.includedCount ?? item.rows?.length ?? 0)} eventos`));
+      row.appendChild(el("span", "count", `${fmtNum(caseItemIncludedCount(item))} eventos`));
       box.appendChild(row);
     }
     return;
@@ -3693,12 +3717,37 @@ function createStation({ name, host = "", notes = "" }) {
 }
 
 // ------------------------------------------------------------------ casos de análise
+// Native evidence remains opt-in until every record consumer is migrated.
+let nativeEvidenceApp = null;
+const nativeEvidenceEnabled = () => window.CaseEvidence?.active === true;
+function nativeEvidenceServices() {
+  if (!nativeEvidenceEnabled()) throw Error("NATIVE_EVIDENCE_INACTIVE: O fluxo nativo de evidências ainda não foi ativado.");
+  if (nativeEvidenceApp) return nativeEvidenceApp;
+  const client = window.CaseEvidence.create({ enabled: true, invoke: (command, args) => api(command, args, { silent: true }) });
+  const session = window.CaseEvidenceSession.create({ client, getStore: () => state.cases,
+    setStore: value => { state.cases = value; window.AnalysisContexts?.activate(); }, normalize: normalizeCaseStore,
+    captureOwner: item => window.AnalysisContexts?.capture(item.id),
+    adoptContext: (snapshot, options) => window.AnalysisContexts?.adopt(snapshot, options),
+    draftBusy: () => !!document.querySelector?.(".case-content-editor,.case-trail-editor"),
+    changed: detail => document.dispatchEvent(new CustomEvent("case-evidence-state", { detail })) });
+  let actions;
+  nativeEvidenceApp = { client, session, get actions() { return actions ||= window.CaseEvidenceActions.create({ client, session, getStore: () => state.cases, currentCase: activeCase, save: () => saveCases(),
+    selectionOwner: () => window.AnalysisContexts.capture(), prepareSelectionOwner: owner => window.AnalysisContexts.prepare(owner, { metadata: true }), selectionCurrent: owner => window.AnalysisContexts.isCurrent(owner),
+    scope: workspaceScope, station: () => state.stationAnalyticsId || null }); } }; return nativeEvidenceApp;
+}
+async function loadCaseStore(options) {
+  if (nativeEvidenceEnabled()) return nativeEvidenceServices().session.load(options);
+  const loaded = await api("cases_load", {}, { silent: true });
+  return loaded && Array.isArray(loaded.cases) ? normalizeCaseStore(loaded) : null;
+}
+
 let casesSaveQueue = Promise.resolve();
 let caseSaveErrorShown = false;
 
 let caseSaveTimer = null;
 let caseSaveWaiters = [];
 function saveCases() {
+  if (window.CaseEvidence?.active === true) nativeEvidenceServices().session.markDirty();
   const store = state.cases;
   clearTimeout(caseSaveTimer);
   const result = new Promise((resolve, reject) => caseSaveWaiters.push({ resolve, reject, store }));
@@ -3708,6 +3757,15 @@ function saveCases() {
     const waiters = pending.filter(waiter => waiter.store === store);
     pending.filter(waiter => waiter.store !== store).forEach(waiter => waiter.resolve(false));
     if (store !== state.cases) { waiters.forEach(waiter => waiter.resolve(false)); return; }
+    if (window.CaseEvidence?.active === true) {
+      nativeEvidenceServices().session.save().then(() => {
+        caseSaveErrorShown = false; waiters.forEach(waiter => waiter.resolve(store === state.cases));
+      }).catch(error => {
+        if (!caseSaveErrorShown) { caseSaveErrorShown = true; toast(`Não foi possível salvar; o rascunho foi mantido: ${error}`, "err"); }
+        waiters.forEach(waiter => waiter.resolve(false));
+      });
+      return;
+    }
     const snapshot = JSON.parse(JSON.stringify({ ...store, schemaVersion: 2 }));
     const owners = new Map(snapshot.cases.map(item => [item.id, window.AnalysisContexts?.capture(item.id)]));
     casesSaveQueue = casesSaveQueue.catch(() => {}).then(() => store === state.cases ? api("cases_save", { data: { ...snapshot, revision: store.revision } }, { silent: true }) : null)
@@ -3770,7 +3828,7 @@ function setAnalysisView(view) {
 
 function saveCaseWorkspace(view = null) {
   const c = activeCase();
-  if (!c) return;
+  if (!c || c.kind === "preserved_case_unavailable") return;
   const workspace = normalizeCaseWorkspace(c.workspace);
   const stationIds = new Set((c.stations || []).map((station) => station.id));
   c.workspace = {
@@ -3786,7 +3844,7 @@ function saveCaseWorkspace(view = null) {
 
 function restoreCaseWorkspace() {
   const c = activeCase();
-  if (!c) return false;
+  if (!c || c.kind === "preserved_case_unavailable") return false;
   const workspace = normalizeCaseWorkspace(c.workspace);
   const stationIds = new Set((c.stations || []).map((station) => station.id));
   c.workspace = workspace;
@@ -3799,6 +3857,9 @@ function restoreCaseWorkspace() {
 }
 
 function normalizeCaseStore(loaded) {
+  const native = loaded?.evidenceViewVersion === 1;
+  if (native) { window.CaseEvidence.validate.document(loaded); return structuredClone(loaded); }
+  else if (window.CaseEvidence?.active === true) throw Error("EVIDENCE_VIEW_REQUIRED: A investigação nativa não pode ser substituída por registros locais.");
   const stored = Array.isArray(loaded?.cases) ? loaded.cases : [];
   const cases = stored.filter((item) => item && typeof item === "object").map((raw, index) => ({
     ...raw,
@@ -3831,6 +3892,7 @@ function activeCase() {
 }
 function ensureCase() {
   let c = activeCase();
+  if (c?.kind === "preserved_case_unavailable") throw Error("CASE_METADATA_UNAVAILABLE: Escolha outro Caso para editar; os originais deste Caso permanecem preservados.");
   if (!c) { newCase(undefined, { keepArtifact: true }); c = activeCase(); }
   return c;
 }
@@ -3866,7 +3928,7 @@ function newCase(name, { keepArtifact = false, contextSnapshot = null } = {}) {
 }
 function caseItems() {
   const c = activeCase();
-  return c ? c.items : [];
+  return c && Array.isArray(c.items) ? c.items : [];
 }
 
 function updateAnalysisBadge() {
@@ -3875,7 +3937,7 @@ function updateAnalysisBadge() {
   b.hidden = n === 0;
   b.textContent = n;
   const c = activeCase();
-  $("#analysis-count").textContent = c
+  $("#analysis-count").textContent = c?.kind === "preserved_case_unavailable" ? "Metadados indisponíveis · originais preservados" : c
     ? `${countLabel(n, "item", "itens")} · ${countLabel((c.manual || []).length, "marco manual", "marcos manuais")}`
     : "Sem caso ativo";
   renderStationShortcuts();
@@ -3888,7 +3950,7 @@ function renderCaseBar() {
   const sel = $("#case-select");
   sel.innerHTML = "";
   if (state.cases.cases.length) {
-    for (const c of state.cases.cases) sel.appendChild(el("option", "", c.name)).value = c.id;
+    for (const [index, c] of state.cases.cases.entries()) sel.appendChild(el("option", "", c.name || (c.kind === "preserved_case_unavailable" ? `Caso preservado ${index + 1}` : c.id))).value = c.id;
     sel.value = state.cases.active || "";
   } else {
     const empty = el("option", "", "Sem Caso ativo");
@@ -3898,7 +3960,7 @@ function renderCaseBar() {
     sel.appendChild(empty);
   }
   sel.disabled = state.cases.cases.length === 0;
-  $("#btn-case-menu").disabled = !activeCase();
+  $("#btn-case-menu").disabled = !activeCase() || activeCase().kind === "preserved_case_unavailable";
   renderArtifactBar();
   updateContextBar();
 }
@@ -3912,6 +3974,7 @@ function closeCaseNameInput() {
   caseInputMode = null;
 }
 function showCaseNameInput(mode) {
+  if (mode === "rename" && activeCase()?.kind === "preserved_case_unavailable") { toast("Os metadados deste Caso estão indisponíveis para renomear.", "info"); return; }
   if (mode === "rename" && !activeCase()) return;
   caseInputMode = mode;
   const inp = $("#case-name-input");
@@ -3928,6 +3991,7 @@ function commitCaseNameInput() {
   closeCaseNameInput();
   if (!v) return;
   if (mode === "rename" && activeCase()) {
+    if (activeCase().kind === "preserved_case_unavailable") { toast("O Caso mudou e não está disponível para renomear.", "info"); return; }
     activeCase().name = v;
     saveCases();
     renderCaseBar();
@@ -3935,9 +3999,10 @@ function commitCaseNameInput() {
     newCase(v);
   }
 }
-async function deleteActiveCase() {
+async function deleteActiveCase(expected = activeCase()) {
   const c = activeCase();
   if (!c) return;
+  if (c !== expected || c.kind === "preserved_case_unavailable") { toast("Este Caso preservado não está disponível para excluir por esta ação.", "info"); return false; }
   if (window.WorkspaceContext?.ready) { await window.WorkspaceContext.deleteCase(c); toast(`Caso "${c.name}" excluído.`, "ok"); return; }
   state.artifactSessions.delete(c.id);
   state.cases.cases = state.cases.cases.filter((x) => x.id !== c.id);
@@ -3964,6 +4029,18 @@ function openCaseAdd(request) {
   if (workspaceScope() === "case") { toast("Esses registros já pertencem ao Caso.", "info"); return; }
   const c = ensureCase();
   const artifact = currentCaseArtifact();
+  if (nativeEvidenceEnabled()) {
+    let owner = window.AnalysisContexts.capture(); const selectedCase = c, selectedScope = workspaceScope();
+    request = { ...request, nativeGuard: () => activeCase() === selectedCase && workspaceScope() === selectedScope && window.AnalysisContexts.isCurrent(owner), nativeCase: c };
+    const captured = request;
+    request.nativeOwnerReady = window.AnalysisContexts.prepare(owner, { metadata: true }).then(value => { owner = value; return true; }).catch(error => { captured.nativeFailure = error; return false; });
+    if (request.kind === "visible") request.nativeRows = nativeEvidenceServices().actions.handles(request.rows);
+    if (request.kind === "event") {
+      const row = state.rows.find(row => row.id === request.evId) || (state.currentDetailEv?.id === request.evId ? state.currentDetailEv : null);
+      if (!row?.event_ref) { toast("Abra o registro na página atual antes de preservá-lo.", "info"); return; }
+      request.nativeRows = nativeEvidenceServices().actions.handles([row]);
+    }
+  }
   pendingCaseAdd = request;
   const select = $("#case-add-station");
   select.innerHTML = '<option value="">Sem estação</option>';
@@ -4008,7 +4085,13 @@ function caseItemBase(kind, stationId, foundCount, includedCount) {
 
 async function confirmCaseAdd() {
   if (!pendingCaseAdd) return;
-  const c = ensureCase();
+  const capturedRequest = pendingCaseAdd, c = ensureCase();
+  if (nativeEvidenceEnabled() && capturedRequest.nativeOwnerReady) {
+    const ready = await capturedRequest.nativeOwnerReady; if (pendingCaseAdd !== capturedRequest) return;
+    if (!ready) { toast(String(capturedRequest.nativeFailure || "Confirme o salvamento inicial do Caso antes de preservar a seleção."), "err"); return; }
+  }
+  if (pendingCaseAdd !== capturedRequest) return;
+  if (nativeEvidenceEnabled() && (pendingCaseAdd.nativeCase !== c || !pendingCaseAdd.nativeGuard())) { toast("A seleção mudou. Abra a ação novamente.", "info"); return; }
   let stationId = $("#case-add-station").value || null;
   if (!$("#case-add-station-form").hidden) {
     const name = $("#case-add-station-name").value.trim();
@@ -4024,6 +4107,20 @@ async function confirmCaseAdd() {
   pendingCaseAdd = null;
   startOperation("case", "Adicionando ao Caso", "Organizando o contexto técnico");
   try {
+    if (nativeEvidenceEnabled()) {
+      const actions = nativeEvidenceServices().actions, guard = request.nativeGuard;
+      if (!guard()) throw Error("A seleção mudou. Abra a ação novamente.");
+      const filters = request.kind === "group" ? [...backendFilters(), { column: request.column, op: request.op || "equals_exact", value: request.value, value2: null }] : backendFilters();
+      const page = request.kind === "group" ? await api("query_page", { filters, sortColumn: "timestamp", sortDir: "desc", offset: 0, limit: 500, cursor: null }) : null;
+      const rows = page ? page.rows : request.nativeRows, matched = page ? (Number.isSafeInteger(page.total) ? page.total : null) : rows.length;
+      const selected = await actions.selection(rows, { guard });
+      const item = await actions.add(selected, { ...caseItemBase(request.kind === "event" ? "evento" : "grupo", stationId, matched, rows.length),
+        ...(page ? { captureScope: { kind: "bounded_query_page", limit: 500, hasMore: !!page.hasMore, matchedCount: matched } } : {}),
+        label: request.name || (request.kind === "group" ? chipLabel({ column: request.column, op: request.op || "equals_exact", value: request.value, value2: null }) : `${fmtNum(rows.length)} registros preservados`),
+        sourceFilters: structuredClone(filters), sourceSpec: structuredClone(state.currentArtifact?.source) }, { guard });
+      if (item) { updateAnalysisBadge(); window.WorkspaceContext?.refreshMembership(); renderAnalysis(); renderStations(); finishOperation("Caso atualizado", matched !== null ? `${fmtNum(rows.length)} de ${fmtNum(matched)} ocorrências preservadas.` : `${fmtNum(rows.length)} ocorrências preservadas da primeira página${page?.hasMore ? "; existem mais registros no recorte" : "; a contagem total ainda não foi concluída"}.`); }
+      return;
+    }
     if (request.kind === "visible") {
       c.items.push({
         ...caseItemBase("grupo", stationId, request.rows.length, request.rows.length),
@@ -4130,6 +4227,7 @@ function saveCaseItemContext() {
 }
 
 function caseItemIncludedCount(item) {
+  if (window.CaseEvidence?.active === true) return window.CaseEvidenceItems.count(item);
   return item.includedCount ?? item.rows?.length ?? 0;
 }
 
@@ -4215,6 +4313,7 @@ function appendCaseItemBody(card, c, item) {
     body.appendChild(filters);
   }
 
+  if (window.CaseEvidence?.active === true) { window.CaseEvidenceItems.attachRecords(body, c, item); card.appendChild(body); return; }
   const rows = item.rows || [];
   if (rows.length) {
     const events = document.createElement("details");
@@ -4475,6 +4574,7 @@ function renderAnalysis() {
   box.classList.remove("case-timeline-host");
   $("#view-analysis").classList.toggle("case-timeline-active", ["timeline", "vtimeline", "timeline-table"].includes(state.analysisView));
   const c = activeCase();
+  if (c?.kind === "preserved_case_unavailable") { void window.Workspace?.showPage("evidence"); return; }
   if (!c) {
     box.innerHTML = `<div class="analysis-empty">
       <i class="fas fa-briefcase"></i>
@@ -4558,7 +4658,7 @@ const caseTimelineCallbacks = {
   notify: message => toast(message, "info"),
   save: () => { const saved = saveCases(); updateAnalysisBadge(); renderAnalysis(); return saved; },
   removeOccurrences: (c, targets, entryIds, save) => removeCaseOccurrences(c, targets, { entryIds, save }),
-  canUndoRemoval: c => lastCaseRemoval?.c === c && lastCaseRemoval.transaction.canUndo(),
+  canUndoRemoval: c => lastCaseRemoval?.c === c && (lastCaseRemoval.native ? nativeEvidenceServices().actions.canUndo(lastCaseRemoval.receipt) : lastCaseRemoval.transaction.canUndo()),
   undoRemoval: () => undoCaseOccurrenceRemoval(),
   createAt: timestamp => {
     const date = new Date(timestamp);
@@ -4692,6 +4792,7 @@ function refreshCaseRemoval(c) {
   window.WorkspaceContext?.refreshMembership(); updateAnalysisBadge(); renderAnalysis(); filtersChanged();
 }
 async function undoCaseOccurrenceRemoval(record = lastCaseRemoval) {
+  if (record?.native) { try { if (record !== lastCaseRemoval) return false; await nativeEvidenceServices().actions.undo(record.receipt); lastCaseRemoval = null; refreshCaseRemoval(record.c); return true; } catch (error) { toast(String(error.message || error), "err"); return false; } }
   if (!record || record !== lastCaseRemoval || activeCase() !== record.c || record.owner && !window.AnalysisContexts.owns(record.owner)) {
     toast("O Caso mudou. Reabra o Caso da remoção antes de desfazer.", "info"); return false;
   }
@@ -4708,6 +4809,11 @@ async function undoCaseOccurrenceRemoval(record = lastCaseRemoval) {
   } finally { caseRemovalPending.delete(record.c); }
 }
 async function removeCaseOccurrences(c, targets, { entryIds = [], save = saveCases, owner = window.AnalysisContexts?.capture() } = {}) {
+  if (window.CaseEvidence?.active === true) {
+    try { const actions = nativeEvidenceServices().actions, receipt = await actions.remove(c, targets, { guard: () => activeCase() === c && (!owner || window.AnalysisContexts.isCurrent(owner)) });
+      lastCaseRemoval = { c, owner, native: true, receipt }; refreshCaseRemoval(c); toast(`${receipt.count} ocorrência(s) removida(s). Use Desfazer para restaurar.`, "ok"); return true;
+    } catch (error) { toast(String(error.message || error), "err"); return false; }
+  }
   if (activeCase() !== c || owner && !window.AnalysisContexts.isCurrent(owner)) { toast("O Caso mudou. Selecione a ocorrência novamente.", "info"); return false; }
   if (caseRemovalPending.has(c)) { toast("Aguarde o salvamento da alteração anterior.", "info"); return false; }
   caseRemovalPending.add(c);
@@ -4734,6 +4840,15 @@ async function removeEventFromCase(ev, { owner = window.AnalysisContexts?.captur
   const c = activeCase();
   const current = () => activeCase() === c && signature === caseSig() && (!owner || window.AnalysisContexts.isCurrent(owner));
   if (!c || !current()) { toast("O Caso mudou. Selecione a ocorrência novamente.", "info"); return false; }
+  if (window.CaseEvidence?.active === true) {
+    try {
+      const result = await nativeEvidenceServices().actions.membership([ev], { guard: current }); if (!current()) return false;
+      const matches = result.rows[0]?.matches || [], remove = match => current() ? removeCaseOccurrences(c, [{ item: c.items[match.itemIndex], member: match.member }], { owner }) : false;
+      if (!matches.length) { toast("Registro não encontrado nas evidências preservadas.", "info"); return false; }
+      if (matches.length === 1) return remove(matches[0]);
+      const rectangle = anchor?.getBoundingClientRect?.() || { left: 20, bottom: 80 }, show = page => { if (!current()) return; const choices = matches.slice(page * 20, page * 20 + 20).map(match => ({ icon: "fa-trash-can", label: `Item ${match.itemIndex + 1} · ${c.items[match.itemIndex]?.label || "Sem título"} · ocorrência ${match.member.occurrenceId}`, onClick: () => remove(match) })); if (page) choices.push({ label: "Ocorrências anteriores", onClick: () => show(page - 1) }); if ((page + 1) * 20 < matches.length) choices.push({ label: "Mais ocorrências", onClick: () => show(page + 1) }); showCtxMenu(rectangle.left, rectangle.bottom, choices); }; show(0); return false;
+    } catch (error) { toast(String(error.message || error), "err"); return false; }
+  }
   const matches = window.CaseRemovals.resolve(c, ev, { stationId: state.stationAnalyticsId, key: (row, item) => caseRecordKey(row, item.artifactId, item.origin) });
   if (!matches.length) { toast("Registro não encontrado no Caso.", "info"); return false; }
   const remove = target => current() ? removeCaseOccurrences(c, [target], { owner }) : (toast("O Caso mudou. Selecione a ocorrência novamente.", "info"), false);
@@ -4757,6 +4872,7 @@ function openSendToTrailModal(events) {
   if (!events || !events.length) return;
   const c = ensureCase();
   if (!c) return;
+  const nativeSelectionOwner = window.CaseEvidence?.active === true ? window.AnalysisContexts.capture() : null;
   const existingTrails = Array.isArray(c.caseTrails) ? c.caseTrails : [];
 
   let overlay = document.querySelector("#send-trail-modal");
@@ -4833,6 +4949,20 @@ function openSendToTrailModal(events) {
     try {
       const mode = overlay.querySelector('input[name="stm-mode"]:checked')?.value || "new";
       const artifact = registerCurrentArtifact();
+      if (window.CaseEvidence?.active === true) {
+        const preparedOwner = await window.AnalysisContexts.prepare(nativeSelectionOwner, { metadata: true });
+        const guard = () => overlay.isConnected && activeCase() === c && window.AnalysisContexts.isCurrent(preparedOwner);
+        const existing = mode === "existing" ? c.caseTrails?.find(trail => trail.id === overlay.querySelector("#stm-existing-select")?.value) : null;
+        if (mode === "existing" && !existing) throw Error("A trilha mudou. Reabra a ação.");
+        const title = existing?.title || overlay.querySelector("#stm-new-title")?.value?.trim() || defaultTitle;
+        const actions = nativeEvidenceServices().actions, selected = await actions.selection(events, { guard });
+        await actions.add(selected, { ...caseItemBase("grupo", artifact?.stationId || null, events.length, events.length), label: `${events.length} registros da exploração`, sourceFilters: structuredClone(state.filters), sourceSpec: structuredClone(state.currentArtifact?.source), summary: "", details: "", attachments: [] }, { guard, attach: item => {
+          const reference = window.CaseEvidenceItems.forItem(c, item);
+          if (existing) { const before = existing.itemRefs; existing.itemRefs = [...window.CaseEvidenceItems.associations(c, existing).map(entry => entry.reference), reference]; return () => { if (before === undefined) delete existing.itemRefs; else existing.itemRefs = before; }; }
+          const trail = { id: `ct-${nid()}`, title, summary: "", details: "", attachments: [], itemRefs: [reference], createdAt: Date.now(), updatedAt: Date.now() }; (c.caseTrails ||= []).push(trail); return () => { c.caseTrails = c.caseTrails.filter(value => value !== trail); };
+        } });
+        updateAnalysisBadge(); close(); toast(`${fmtNum(events.length)} ocorrências preservadas na trilha "${title}".`, "ok"); return;
+      }
       const groupItem = {
         ...caseItemBase("grupo", artifact?.stationId || null, events.length, events.length),
         label: events.length === 1 ? (events[0].message?.slice(0, 100) || "Evento") : `${events.length} eventos da exploração`,
@@ -4942,6 +5072,7 @@ function sendVisibleToCase() {
   if (workspaceScope() === "case") { toast("Esses registros já pertencem ao Caso.", "info"); return; }
   const c = ensureCase();
   if (!c) return;
+  if (window.CaseEvidence?.active === true) { openCaseAdd({ kind: "visible", rows: state.rows }); return; }
   const existing = new Set();
   for (const item of c.items || []) {
     for (const r of item.rows || []) {
@@ -5319,7 +5450,7 @@ async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
   if (!guard()) { toast("O contexto mudou. Abra o registro novamente.", "info"); return false; }
   const request = ++detailRequest;
   const scope = workspaceScope(), owner = window.AnalysisContexts?.capture();
-  const evidence = scope === "case" ? caseEvents() : null, signature = scope === "case" ? caseSig() : null;
+  const evidence = scope === "case" ? caseEvents("analysis") : null, signature = scope === "case" ? caseSig() : null;
   const admission = { scope, owner, signature };
   window.Tasks?.cancelLatest("event-detail");
   window.Tasks?.cancelLatest("java-trace-detail");
@@ -5353,6 +5484,7 @@ async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
 
 // abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
 function showDetailLoading() {
+  window.CaseEvidenceDetail?.clear(); detailDeferredPane = null;
   closeDetailValue();
   state.detailId = null; state.currentDetailEv = null; state.detailSourceSpec = null; state.detailAdmission = null;
   const actions = $("#drawer .detail-quick-actions"); if (actions) actions.hidden = true;
@@ -5371,6 +5503,7 @@ function showDetailLoading() {
 }
 
 function openContextInspector(title, subtitle, overview) {
+  window.CaseEvidenceDetail?.clear();
   closeDetailValue();
   detailRequest++;
   state.detailId = null;
@@ -5400,7 +5533,7 @@ function openContextInspector(title, subtitle, overview) {
 async function showFieldInspector(column) {
   const overview = el("div", "kv");
   const scope = workspaceScope(), owner = window.AnalysisContexts?.capture(), filters = structuredClone(backendFilters());
-  const evidence = scope === "case" ? caseEvents() : null, evidenceSignature = scope === "case" ? caseSig() : null;
+  const evidence = scope === "case" ? caseEvents("analysis") : null, evidenceSignature = scope === "case" ? caseSig() : null;
   window.Tasks?.cancelLatest("field-inspector");
   overview.appendChild(el("p", "muted small", "Calculando valores visíveis…"));
   openContextInspector("Campo", colLabel(column), overview);
@@ -5674,6 +5807,7 @@ function renderDetailTree(entries, collapsedPaths = new Set()) {
 }
 
 function showDetail(ev, sourceSpec = null, admission = null) {
+  window.CaseEvidenceDetail?.clear();
   closeDetailValue();
   window.Tasks?.cancelLatest("java-trace-detail");
   detailRequest++;
@@ -5704,7 +5838,7 @@ function showDetail(ev, sourceSpec = null, admission = null) {
   const javaRequest = detailRequest;
   const javaCurrent = () => javaRequest === detailRequest && state.currentDetailEv === ev && !$("#drawer").hidden
     && (!admission || detailAdmissionCurrent(admission));
-  const javaEvidence = admission?.scope === "case" ? caseEvents() : null;
+  const javaEvidence = admission?.scope === "case" ? caseEvents("analysis") : null;
   const javaTrace = window.JavaTrace?.render(ev, {
     admission,
     isCurrent: javaCurrent,
@@ -5787,6 +5921,7 @@ function detailStep(dir) {
 }
 
 function closeDrawer() {
+  window.CaseEvidenceDetail?.clear();
   detailRequest++;
   detailDeferredPane = null;
   window.Tasks?.cancelLatest("field-inspector");
@@ -5801,6 +5936,7 @@ function closeDrawer() {
 }
 
 async function copyDetail() {
+  if (window.CaseEvidenceDetail?.isOpen()) return window.CaseEvidenceDetail.copyEnvelope();
   const event = state.currentDetailEv;
   if (state.detailId == null || !event) return;
   if (state.detailAdmission && !detailAdmissionCurrent(state.detailAdmission)) {
@@ -6011,6 +6147,7 @@ function showSourceMode(mode) {
 }
 
 function switchView(which, { deferAnalytics = false } = {}) {
+  if (activeCase()?.kind === "preserved_case_unavailable" && which !== "workspace") return window.Workspace?.showPage("evidence");
   if (window.WorkspaceContext && !window.WorkspaceContext.changing && ["caso", "case-dashboard", "case-cube", "estacoes"].includes(which) && workspaceScope() !== "case") {
     return window.WorkspaceContext.setScope("case", { page: which === "caso" && ["timeline", "vtimeline", "timeline-table"].includes(state.analysisView) ? "case-timeline" : which === "case-dashboard" || which === "case-cube" ? "explore" : "evidence", tab: which === "case-cube" ? "cube" : which === "case-dashboard" ? "dashboard" : undefined });
   }
@@ -6205,12 +6342,14 @@ function switchSettingsTab(tab) {
 }
 
 async function openSettings(tab = "interface") {
+  const recoveryTab = document.querySelector('[data-settings-tab="recovery"]'); if (recoveryTab) recoveryTab.hidden = !nativeEvidenceEnabled();
   $("#settings-modal").hidden = false;
   switchSettingsTab(tab);
   if (tab === "interface") window.UiScale?.renderPane($("#settings-pane-interface"));
   if (tab === "codes") await renderCodesPane();
   if (tab === "mcp") await renderMcpPane();
   if (tab === "detection") await window.Security?.renderRulesPane($("#settings-pane-detection"));
+  if (tab === "recovery" && nativeEvidenceEnabled()) await window.CaseEvidenceRecovery?.renderPane($("#settings-pane-recovery"));
   if (tab === "updates") await window.Updates?.renderPane($("#settings-pane-updates"));
 }
 
@@ -6387,10 +6526,14 @@ async function mcpRefreshSource(contextual = false) {
 // cases.json mudou fora do app: relê e substitui o estado em memória (sem regravar)
 async function mcpReloadCases() {
   let loaded = null;
-  try { loaded = await api("cases_load", {}, { silent: true }); } catch { return; }
+  try { loaded = await loadCaseStore({ install: !window.WorkspaceContext?.ready }); } catch (error) { if (nativeEvidenceEnabled()) toast(String(error), "err"); return; }
   if (!loaded || !Array.isArray(loaded.cases)) return;
-  if (window.WorkspaceContext?.ready) { await window.WorkspaceContext.replaceCases(normalizeCaseStore(loaded)); return; }
-  state.cases = normalizeCaseStore(loaded);
+  if (window.WorkspaceContext?.ready) {
+    try { await window.WorkspaceContext.replaceCases(loaded, { beforeReplace: nativeEvidenceEnabled() ? () => nativeEvidenceServices().session.assertLoadCurrent(loaded) : undefined }); }
+    catch (error) { if (nativeEvidenceEnabled()) toast(String(error), "err"); else throw error; }
+    return;
+  }
+  state.cases = loaded;
   // sessões de artefatos foram derivadas do estado anterior dos casos
   state.artifactSessions = new Map();
   renderCaseBar();
@@ -6430,7 +6573,7 @@ function bindKeyboard() {
       $("#ts-modal").hidden = true;
       $("#manual-form").hidden = true;
       closeCaseNameInput();
-      $("#case-add-modal").hidden = true;
+      $("#case-add-modal").hidden = true; pendingCaseAdd = null;
       $("#case-item-modal").hidden = true;
       pendingCaseAdd = null;
       editingCaseItem = null;
@@ -6634,10 +6777,11 @@ function bind() {
   $("#btn-new-case").onclick = () => showCaseNameInput("new");
   $("#btn-case-menu").onclick = (e) => {
     e.stopPropagation();
+    const c = activeCase(); if (!c || c.kind === "preserved_case_unavailable") { toast("Os metadados deste Caso estão indisponíveis para edição.", "info"); return; }
     showCtxMenu(e.clientX, e.clientY, [
       { icon: "fa-pen", label: "Renomear caso", onClick: () => showCaseNameInput("rename") },
       ...(window.CaseReferences ? [{ icon: "fa-table-list", label: "Referências deste Caso", onClick: () => window.CaseReferences.openManager() }] : []),
-      { icon: "fa-trash-can", label: "Excluir caso", danger: true, onClick: deleteActiveCase },
+      { icon: "fa-trash-can", label: "Excluir caso", danger: true, onClick: () => deleteActiveCase(c) },
     ]);
   };
   $("#case-name-input").addEventListener("keydown", (e) => {
@@ -6700,6 +6844,7 @@ function bind() {
     if (event.target === $("#detail-value-modal")) closeDetailValue();
   };
   $("#detail-value-copy").onclick = async () => {
+    if (window.CaseEvidenceDetail?.ownsValue(detailValueNode)) return window.CaseEvidenceDetail.copyValue(detailValueNode, $("#detail-value-copy"));
     if (detailValueNode) await window.CanonicalFields.copy(detailCanonicalAction(detailFieldColumn(detailValueNode) || detailValueNode.path, detailValueNode, $("#detail-value-copy")));
   };
   $("#detail-value-content").oncontextmenu = (event) => {
@@ -6707,6 +6852,7 @@ function bind() {
     const selection = window.getSelection();
     const selected = selection && $("#detail-value-content").contains(selection.anchorNode)
       && $("#detail-value-content").contains(selection.focusNode) ? selection.toString() : "";
+    if (window.CaseEvidenceDetail?.ownsValue(detailValueNode)) return window.CaseEvidenceDetail.valueMenu(detailValueNode, event, selected);
     showDetailValueMenu(event, detailValueNode, selected, true);
   };
   $("#dr-prev").onclick = () => detailStep(-1);
@@ -6844,16 +6990,17 @@ window.workspaceBootstrap = (async () => {
   // Install context/task decorators before any Case-scoped bootstrap request.
   if (document.readyState === "loading") await new Promise(resolve => document.addEventListener("DOMContentLoaded", resolve, { once: true }));
   try {
-    const loaded = await api("cases_load", {}, { silent: true });
-    if (loaded && Array.isArray(loaded.cases)) {
-      state.cases = normalizeCaseStore(loaded);
+    const loaded = await loadCaseStore();
+    if (loaded) {
+      state.cases = loaded;
       window.AnalysisContexts?.activate();
-      saveCases();
+      if (!nativeEvidenceEnabled()) saveCases();
     }
   } catch (error) { toast(`Não foi possível abrir as investigações: ${error}`, "err"); }
   renderCaseBar();
   updateAnalysisBadge();
   if (activeCase()) {
+    if (activeCase().kind === "preserved_case_unavailable") { await window.WorkspaceContext?.initialize(); return; }
     await loadDerivedFields();
     setAnalysisView(activeCase().workspace?.analysisView || "vtimeline");
     await syncActiveCaseArtifacts();
@@ -6906,12 +7053,39 @@ function caseObjectKey(value) {
 function caseSig(allRecords = false) {
   const c = activeCase();
   if (!c) return "none";
+  if (window.CaseEvidence?.active === true) {
+    const evidence = state.cases.caseEvidence?.find(value => (value.owner?.caseId || value.caseId) === c.id);
+    return JSON.stringify([c.id, caseObjectKey(c), state.cases.store.storeId, state.cases.store.epoch, evidence?.state, evidence?.evidenceSignature ?? null,
+      evidence?.owner?.analysisId ?? null, allRecords ? null : state.stationAnalyticsId || null, window.CaseEvidence.analysisShape(c)]);
+  }
   return JSON.stringify([c.id, caseObjectKey(c), allRecords ? "" : state.stationAnalyticsId || "", (c.items || []).map(it => [it.id, caseObjectKey(it.rows), it.rows?.length || 0, it.stationId, it.artifactId, it.origin])]);
 }
 
 const caseEventsCache = { sig: null, events: [], summary: { start: null, end: null, columns: [] } };
 
-function caseEvents() {
+function caseAnalysisSummary(allRecords = false) {
+  if (window.CaseEvidence?.active !== true) {
+    const rows = allRecords ? caseEventsCompute(true) : caseEvents();
+    return { ready: true, preservedCount: rows.length, ...caseEventsCache.summary };
+  }
+  const item = activeCase(), evidence = state.cases.caseEvidence?.find(value => (value.owner?.caseId || value.caseId) === item?.id);
+  const ready = item?.kind !== "preserved_case_unavailable" && evidence?.state === "ready";
+  const preservedCount = ready && !allRecords && state.stationAnalyticsId
+    ? (item.items || []).filter(entry => entry.stationId === state.stationAnalyticsId).reduce((total, entry) => total + (entry.rows?.reference?.memberCount || 0), 0)
+    : evidence?.preservedCount ?? null;
+  const profiles = caseTreeProfilesPeek() || [];
+  return { ready, preservedCount, start: null, end: null, columns: [...new Set([...STANDARD, ...profiles.map(profile => profile.name)])],
+    message: ready ? null : evidence?.message || "As evidências estão preservadas, mas a análise deste Caso está indisponível." };
+}
+
+function caseEvents(mode = null) {
+  if (window.CaseEvidence?.active === true) {
+    if (mode !== "analysis" && mode !== "analysis-all") throw Error("EVIDENCE_NATIVE_SCOPE_REQUIRED: Este leitor precisa abrir uma projeção nativa das evidências.");
+    const { client, session } = nativeEvidenceServices(), all = mode === "analysis-all";
+    return window.CaseEvidenceAnalysis.capture({ client, session, store: state.cases, item: activeCase(), stationId: all ? null : state.stationAnalyticsId || null,
+      currentStore: () => state.cases, currentCase: () => activeCase(), currentStation: () => all ? null : state.stationAnalyticsId || null });
+  }
+  if (mode === "analysis-all") return caseEventsCompute(true);
   const sig = caseSig();
   if (caseEventsCache.sig === sig) return caseEventsCache.events;
   const events = caseEventsCompute();
@@ -6931,6 +7105,7 @@ function caseRecordKey(row, artifactId, origin) {
 }
 
 function caseEventsCompute(allRecords = false) {
+  if (window.CaseEvidence?.active === true) throw Error("EVIDENCE_NATIVE_SCOPE_REQUIRED: Registros preservados exigem uma leitura nativa explícita.");
   const events = [];
   const seen = new Set();
   for (const item of activeCase()?.items || []) {
@@ -6964,12 +7139,18 @@ function caseEventsCompute(allRecords = false) {
 
 function analyticsRequest(scope = state.analyticsScope) {
   return scope === "case"
-    ? { filters: backendFilters(), caseEvents: caseEvents() }
+    ? { filters: backendFilters(), caseEvents: caseEvents("analysis") }
     : { filters: backendFilters() };
 }
 
 function scopeHasEvents(scope = state.analyticsScope) {
+  if (scope === "case" && window.CaseEvidence?.active === true) { const summary = caseAnalysisSummary(); return summary.ready && summary.preservedCount > 0; }
   return scope === "case" ? caseEvents().length > 0 : state.loaded;
+}
+function caseAnalysisUnavailable(scope = state.analyticsScope) {
+  if (scope !== "case" || window.CaseEvidence?.active !== true) return null;
+  const summary = caseAnalysisSummary();
+  return summary.ready ? null : `${summary.preservedCount == null ? "Evidências preservadas" : `${fmtNum(summary.preservedCount)} ocorrências preservadas`} · ${summary.message}`;
 }
 
 function dashboardCharts(scope = state.analyticsScope) {
@@ -7002,7 +7183,8 @@ async function openDashboard(scope = "dataset") {
   startOperation("dashboard", "Atualizando painéis", "Preparando campos e gráficos");
   if (!scopeHasEvents(scope)) {
     await renderDashboard(scope);
-    finishOperation("Painéis prontos", "Sem eventos no escopo atual.");
+    const unavailable = window.CaseEvidence?.active === true ? caseAnalysisUnavailable(scope) : null;
+    finishOperation(unavailable ? "Análise indisponível" : "Painéis prontos", unavailable || "Sem eventos no escopo atual.");
     return;
   }
   if (!dashboardCharts(scope)) {
@@ -7065,7 +7247,9 @@ async function renderDashboard(scope = state.analyticsScope) {
     ? `${charts.length} ${charts.length === 1 ? "gráfico" : "gráficos"} · registros visíveis${station ? ` da estação ${station.name}` : " do Caso"}${state.filters.length ? " (filtros aplicados)" : ""}`
     : `${charts.length} ${charts.length === 1 ? "gráfico" : "gráficos"} · dados carregados${state.filters.length ? " (filtros aplicados)" : ""}`;
   if (!scopeHasEvents(scope)) {
-    grid.innerHTML = scope === "case"
+    const unavailable = window.CaseEvidence?.active === true ? caseAnalysisUnavailable(scope) : null;
+    if (unavailable) { grid.replaceChildren(el("div", "analysis-empty", unavailable)); $("#dash-info").textContent = "Análise indisponível · originais preservados"; }
+    else grid.innerHTML = scope === "case"
       ? '<div class="analysis-empty"><i class="fas fa-chart-pie"></i>Selecione eventos e envie-os ao caso para gerar painéis.</div>'
       : '<div class="analysis-empty"><i class="fas fa-chart-pie"></i>Carregue uma fonte de dados para gerar painéis.</div>';
     return;
@@ -7598,6 +7782,12 @@ async function openCube(scope = "dataset", { force = false } = {}) {
     cubeState.lastComputedSignature = null;
   }
   state.analyticsScope = scope;
+  const unavailable = window.CaseEvidence?.active === true ? caseAnalysisUnavailable(scope) : null;
+  if (unavailable) {
+    cubeState.result = null; cubeState.lastComputedSignature = null;
+    for (const selector of ["#cube-table thead", "#cube-table tbody"]) $(selector).replaceChildren();
+    $("#cube-info").textContent = unavailable; finishOperation("Análise indisponível", unavailable); return { status: "unavailable", error: unavailable };
+  }
   if (!scopeProfiles(scope) && scopeHasEvents(scope)) {
     try {
       const profiles = await api("profile_fields", analyticsRequest(scope));
@@ -7627,12 +7817,15 @@ function renderCubeFields() {
   const station = state.stationAnalyticsId
     ? caseStations().find((item) => item.id === state.stationAnalyticsId)
     : null;
-  $("#cube-info").textContent = state.analyticsScope === "case"
+  if (state.analyticsScope === "case" && window.CaseEvidence?.active === true) {
+    const summary = caseAnalysisSummary();
+    $("#cube-info").textContent = summary.ready ? `Caso: ${fmtNum(summary.preservedCount)} ocorrências preservadas${station ? ` da estação ${station.name}` : ""} · recorte calculado pela análise` : summary.message;
+  } else $("#cube-info").textContent = state.analyticsScope === "case"
     ? `${caseEvents().length} eventos${station ? ` da estação ${station.name}` : " selecionados no Caso"}`
     : state.loaded ? "Eventos da fonte carregada" : "Nenhuma fonte carregada";
-  if (state.analyticsScope === "case") {
+  if (state.analyticsScope === "case" && window.CaseEvidence?.active !== true) {
     $("#cube-info").textContent = `Caso: ${caseEvents().length} eventos enviados${station ? ` da estação ${station.name}` : ""}`;
-  } else {
+  } else if (state.analyticsScope !== "case") {
     $("#cube-info").textContent = state.loaded
       ? "Artefato aberto: eventos carregados"
       : "Artefato aberto: nenhuma fonte carregada";
@@ -7786,6 +7979,12 @@ function renderCubeZones() {
 async function runCube({ force = false } = {}) {
   const version = ++cubeState.requestVersion;
   const scope = state.analyticsScope;
+  const unavailable = window.CaseEvidence?.active === true ? caseAnalysisUnavailable(scope) : null;
+  if (unavailable) {
+    cubeState.result = null; cubeState.lastComputedSignature = null;
+    for (const selector of ["#cube-table thead", "#cube-table tbody"]) $(selector).replaceChildren();
+    $("#cube-info").textContent = unavailable; return { status: "unavailable", error: unavailable };
+  }
   const cube = activeCube(scope);
   const resultKey = cubeResultKey(scope, cube.id);
   const filters = backendFilters();

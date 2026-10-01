@@ -186,7 +186,7 @@ window.ExplorerTimeline = (() => {
     if (grouped?.base === base && grouped.result.field === field && grouped.result.limit === limit) { status = "done"; paint(); return; }
     const signature = JSON.stringify([base, field, limit]);
     if (pending?.signature === signature) return pending.promise;
-    cancel(); const version = serial, owner = window.AnalysisContexts?.capture(), scope = workspaceScope(), capturedEvents = scope === "case" ? caseEvents() : null;
+    cancel(); const version = serial, owner = window.AnalysisContexts?.capture(), scope = workspaceScope(), capturedEvents = scope === "case" ? caseEvents("analysis") : null;
     const current = () => version === serial && base === expectedBase && contextKey(grid) === expectedBase && preferences.field === field && preferences.limit === limit;
     status = "loading"; error = null; paint();
     const promise = (async () => {

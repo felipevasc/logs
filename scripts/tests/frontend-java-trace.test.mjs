@@ -535,3 +535,20 @@ test('expired ownership stops native Java detail before dispatch, after Case pre
     assert.equal(f.requests.length,stage==='preparation'?0:1);assert.equal(Object.hasOwn(f.event.fields,'java.trace'),false);
   }
 });
+
+test('preserved-member Java consumes only explicit display metadata and lazily requests its owned trace',async()=>{
+  const f=fixture(),event=traceEvent({frameCount:1}),member={containerId:'container',manifestId:'manifest',occurrenceId:'exact'},loads=[];
+  const detail={kind:'preserved_member_detail',member,javaTraceAvailable:true,raw:{text:'decoded raw',complete:false},fields:[
+    {column:'java.exception.class',type:'string',text:'PreservedClass',complete:true},
+    {column:'java.root_cause.class',type:'string',text:'clipped',complete:false},
+    {column:'java.exception.message',type:'object',text:'{"not":"a string"}',complete:true},
+    {column:'stacktrace',type:'array',text:'["frame"]',complete:true}]};
+  const before=structuredClone(detail),root=f.context.window.JavaTrace.renderPreserved(detail,{...f.options,load:async()=>{loads.push(member);return{state:'available',trace:nativeTrace(event),reason:null,member};}});
+  assert.ok(root);assert.equal(loads.length,0);await expand(root);assert.equal(loads.length,1);await expand(matching(root,'.java-trace-node')[0]);
+  assert.equal(matching(root,'.java-trace-scalar').length,1);const value=matching(root,'.java-trace-scalar-value')[0];assert.equal(value.textContent,'PreservedClass');await dispatch(value,'click');assert.equal(f.scalarMenus[0].column,'java.exception.class');
+  await button(root,/Ver texto decodificado/).onclick({stopPropagation(){}});assert.equal(f.rawCalls[0],member);assert.deepEqual(detail,before);
+});
+
+test('preserved Java declines unavailable metadata and does not manufacture an Event marker',()=>{
+  const f=fixture();for(const value of [{kind:'preserved_member_detail',javaTraceAvailable:false,fields:[]},{fields:{'java.trace.complete':true}},{kind:'evidence_preview',javaTraceAvailable:true,fields:[]}])assert.equal(f.context.window.JavaTrace.renderPreserved(value),null);
+});

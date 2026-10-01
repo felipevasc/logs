@@ -74,9 +74,11 @@ fn contained_file(directory: &Path, id: &str, thumbnail: bool) -> Result<PathBuf
     Ok(path)
 }
 fn read_bytes(path: &Path, max: usize) -> Result<Vec<u8>, String> {
-    let file = crate::case_archive_format::open_regular(path).map_err(|error| format!(
+    let file = crate::case_archive_format::open_regular(path).map_err(|error| {
+        format!(
         "Imagem do Caso não encontrada. Importe a investigação com os anexos originais. ({error})"
-    ))?;
+    )
+    })?;
     if file.metadata().map_err(|e| e.to_string())?.len() > max as u64 {
         return Err("Imagem excede o limite permitido.".into());
     }
@@ -312,13 +314,18 @@ pub async fn case_image_read(id: String, thumbnail: Option<bool>) -> Result<Imag
 }
 
 fn attachments<'a>(data: &'a Value) -> Result<Vec<&'a Value>, String> {
+    attachments_from(
+        data.get("cases")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten(),
+    )
+}
+fn attachments_from<'a>(
+    cases: impl IntoIterator<Item = &'a Value>,
+) -> Result<Vec<&'a Value>, String> {
     let mut result = Vec::new();
-    for case in data
-        .get("cases")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for case in cases {
         for container in ["items", "caseTrails"] {
             for item in case
                 .get(container)
@@ -343,8 +350,16 @@ fn attachments<'a>(data: &'a Value) -> Result<Vec<&'a Value>, String> {
     Ok(result)
 }
 pub(crate) fn references(data: &Value) -> Result<BTreeMap<String, String>, String> {
+    reference_list(attachments(data)?)
+}
+pub(crate) fn references_from_cases<'a>(
+    cases: impl IntoIterator<Item = &'a Value>,
+) -> Result<BTreeMap<String, String>, String> {
+    reference_list(attachments_from(cases)?)
+}
+fn reference_list(attachments: Vec<&Value>) -> Result<BTreeMap<String, String>, String> {
     let mut refs = BTreeMap::new();
-    for attachment in attachments(data)? {
+    for attachment in attachments {
         let object = attachment
             .as_object()
             .ok_or("Referência de imagem inválida.")?;
@@ -498,6 +513,229 @@ pub(crate) fn portable_image_sources(
     Ok(sources)
 }
 
+/// Native portable callers charge encoded/decoded ownership before image
+/// allocation. Each image is released before the next one is inspected.
+fn native_inspect(
+    bytes: &[u8],
+    credit: &mut crate::case_work_budget::Lease,
+) -> Result<ImageInfo, String> {
+    let format = image::guess_format(bytes).map_err(|_| "Formato de imagem não reconhecido.")?;
+    credit.merge(crate::case_cache::reserve_work(credit.pool(), 4 << 20)?)?;
+    let mut header = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(16_000);
+    limits.max_image_height = Some(16_000);
+    limits.max_alloc = Some(4 << 20);
+    header.limits(limits);
+    let (width, height) = header
+        .into_dimensions()
+        .map_err(|_| "Cabeçalho de imagem inválido.")?;
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .filter(|pixels| *pixels <= IMAGE_PIXELS)
+        .ok_or("A imagem excede 16 megapixels.")?;
+    let decoded = usize::try_from(pixels)
+        .map_err(|_| "Imagem excessiva.")?
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(64 << 10))
+        .ok_or("Imagem excessiva.")?;
+    credit.merge(crate::case_cache::reserve_work(credit.pool(), decoded)?)?;
+    let (mime, image) = inspect(bytes)?;
+    let info = ImageInfo {
+        id: hash(bytes),
+        name: String::new(),
+        mime: mime.into(),
+        bytes: bytes.len(),
+        width: image.width(),
+        height: image.height(),
+    };
+    drop(image);
+    Ok(info)
+}
+pub(crate) fn stage_native_embedded_image(
+    directory: &Path,
+    ordinal: usize,
+    raw: crate::case_evidence::RawJson<'_>,
+) -> Result<(String, PathBuf), String> {
+    let mut id = None;
+    let mut encoded = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut fields = raw.members()?;
+    while let Some(field) = fields.next()? {
+        if field.key.len() > 4096 {
+            return Err("Campo de imagem excessivo.".into());
+        }
+        let key = field.key()?;
+        if !seen.insert(key.clone()) {
+            return Err("Campo de imagem duplicado.".into());
+        }
+        match key.as_str() {
+            "id" => {
+                if field.value.get().len() > 128 {
+                    return Err("Identificador de imagem inválido.".into());
+                }
+                let value: String = serde_json::from_str(field.value.get())
+                    .map_err(|_| "Identificador de imagem inválido.")?;
+                valid_id(&value)?;
+                id = Some(value);
+            }
+            "base64" => encoded = Some(field.value),
+            _ => (),
+        }
+    }
+    let id = id.ok_or("Imagem incorporada sem identificador.")?;
+    let encoded = encoded.ok_or("Imagem incorporada sem conteúdo.")?;
+    if encoded.get().len() > IMAGE_BYTES.div_ceil(3) * 8 + 2 {
+        return Err("Imagem incorporada excessiva.".into());
+    }
+    let decoded_bound = encoded
+        .get()
+        .len()
+        .div_ceil(4)
+        .saturating_mul(3)
+        .min(IMAGE_BYTES);
+    let mut credit = crate::case_cache::reserve_work(
+        crate::case_work_budget::global(),
+        encoded
+            .get()
+            .len()
+            .checked_add(decoded_bound * 2 + (64 << 10))
+            .ok_or("Imagem excessiva.")?,
+    )?;
+    let encoded: String =
+        serde_json::from_str(encoded.get()).map_err(|_| "Base64 incorporado inválido.")?;
+    let bytes = decode_base64(&encoded)?;
+    if hash(&bytes) != id {
+        return Err("A integridade da imagem incorporada não confere.".into());
+    }
+    native_inspect(&bytes, &mut credit)?;
+    let path = directory.join(ordinal.to_string());
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok((id, path))
+}
+pub(crate) fn validate_native_images(
+    data: &mut Value,
+    files: &BTreeMap<String, PathBuf>,
+) -> Result<(), String> {
+    let refs = references(data)?;
+    if refs.len() != files.len() || refs.keys().any(|id| !files.contains_key(id)) {
+        return Err("As imagens portáteis não correspondem às referências do Caso.".into());
+    }
+    let (verified, _credit) = native_verified_images(files)?;
+    normalize_references(data, &verified);
+    Ok(())
+}
+fn native_verified_images(
+    files: &BTreeMap<String, PathBuf>,
+) -> Result<(BTreeMap<String, ImageInfo>, crate::case_work_budget::Lease), String> {
+    let credit = crate::case_cache::reserve_work(
+        crate::case_work_budget::global(),
+        files.len().checked_mul(2048).ok_or("Imagens excessivas.")?,
+    )?;
+    let mut verified = BTreeMap::new();
+    for (id, path) in files {
+        let bytes = fs::metadata(path).map_err(|e| e.to_string())?.len();
+        if bytes > IMAGE_BYTES as u64 {
+            return Err("Imagem excessiva.".into());
+        }
+        let mut credit = crate::case_cache::reserve_work(
+            crate::case_work_budget::global(),
+            bytes as usize * 2 + (64 << 10),
+        )?;
+        let bytes = read_bytes(path, IMAGE_BYTES)?;
+        if hash(&bytes) != *id {
+            return Err("A integridade da imagem portátil não confere.".into());
+        }
+        verified.insert(id.clone(), native_inspect(&bytes, &mut credit)?);
+    }
+    Ok((verified, credit))
+}
+pub(crate) fn publish_native_images(
+    root: &Path,
+    files: &BTreeMap<String, PathBuf>,
+) -> Result<(), String> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let directory = image_dir(root)?;
+    for (id, path) in files {
+        let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
+        if size > IMAGE_BYTES as u64 {
+            return Err("Imagem excessiva.".into());
+        }
+        let _credit = crate::case_cache::reserve_work(
+            crate::case_work_budget::global(),
+            size as usize * 4 + (64 << 10),
+        )?;
+        let bytes = read_bytes(path, IMAGE_BYTES)?;
+        if hash(&bytes) != *id {
+            return Err("A imagem mudou após a preparação.".into());
+        }
+        persist(&directory, id, &bytes, false)?;
+    }
+    Ok(())
+}
+pub(crate) fn native_image_sources(
+    root: &Path,
+    data: &Value,
+) -> Result<
+    (
+        Vec<crate::case_archive_format::Source>,
+        crate::case_work_budget::Lease,
+    ),
+    String,
+> {
+    let refs = references(data)?;
+    native_image_sources_from_refs(root, &refs)
+}
+pub(crate) fn native_image_sources_from_refs(
+    root: &Path,
+    refs: &BTreeMap<String, String>,
+) -> Result<
+    (
+        Vec<crate::case_archive_format::Source>,
+        crate::case_work_budget::Lease,
+    ),
+    String,
+> {
+    let credit = crate::case_cache::reserve_work(
+        crate::case_work_budget::global(),
+        refs.len().checked_mul(2048).ok_or("Imagens excessivas.")?,
+    )?;
+    if refs.is_empty() {
+        return Ok((Vec::new(), credit));
+    }
+    let directory = image_dir(root)?;
+    let paths = refs
+        .keys()
+        .map(|id| Ok((id.clone(), contained_file(&directory, id, false)?)))
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    native_verified_images(&paths)?;
+    let sources = paths
+        .into_iter()
+        .map(|(id, path)| {
+            let file = crate::case_archive_format::open_regular(&path)?;
+            let size = file.metadata().map_err(|e| e.to_string())?.len();
+            Ok(crate::case_archive_format::Source {
+                entry: crate::case_archive_format::Entry {
+                    kind: crate::case_archive_format::EntryKind::Image(id.clone()),
+                    bytes: size,
+                    sha256: id,
+                },
+                file,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((sources, credit))
+}
+
 pub(crate) fn validate_document(data: &Value) -> Result<(), String> {
     if data
         .get("schemaVersion")
@@ -558,7 +796,7 @@ fn export_at(root: &Path, path: &Path, mut data: Value, mask: bool) -> Result<()
     validate_document(&data)?;
     // Notes may be ahead of an autosave, but context/visibility never come from
     // the UI document. Capture all contexts from one authoritative read view.
-    refresh_export_contexts(root, &mut data)?;
+    let legacy_ids = refresh_export_contexts(root, &mut data)?;
     validate_json_contexts(&data)?;
     if mask {
         crate::workspace::redact_value(&mut data);
@@ -611,6 +849,7 @@ fn export_at(root: &Path, path: &Path, mut data: Value, mask: bool) -> Result<()
             .map_err(|e| e.to_string())?;
     }
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    crate::case_archive::recheck_legacy_export(root, &legacy_ids)?;
     crate::operations::check()?;
     temp.persist(path).map_err(|e| e.error.to_string())?;
     crate::operations::commit();
@@ -706,10 +945,11 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
     Ok(data)
 }
 
-fn refresh_export_contexts(root: &Path, data: &mut Value) -> Result<(), String> {
+fn refresh_export_contexts(root: &Path, data: &mut Value) -> Result<Vec<String>, String> {
     let conn = crate::case_store::context_connection(root)?;
     conn.execute_batch("BEGIN DEFERRED")
         .map_err(|e| e.to_string())?;
+    let legacy_ids = crate::case_archive::require_legacy_export(&conn, data)?;
     for case in data["cases"]
         .as_array_mut()
         .ok_or("Arquivo sem investigações.")?
@@ -718,7 +958,8 @@ fn refresh_export_contexts(root: &Path, data: &mut Value) -> Result<(), String> 
             format!("Não foi possível exportar a configuração atual do Caso. Salve e reabra o Caso antes de tentar novamente: {error}")
         })?;
     }
-    conn.execute_batch("COMMIT").map_err(|e| e.to_string())
+    conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+    Ok(legacy_ids)
 }
 
 fn validate_json_contexts(data: &Value) -> Result<(), String> {
@@ -922,6 +1163,109 @@ mod tests {
         let legacy = json!({"schemaVersion":1,"cases":[{"id":"legacy","items":[{"note":"old"}]}]});
         write_json(&path, &legacy);
         assert_eq!(import_at(destination.path(), &path).unwrap(), legacy);
+    }
+
+    #[test]
+    fn legacy_export_refuses_native_adoption_during_serialization() {
+        for extension in ["json", "licase"] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let data = save_document(
+                root.path(),
+                json!({"schemaVersion":2,"cases":[{"id":"case","items":[{"id":"item","rows":[{"id":1,"future":1.0}]}]}]}),
+            );
+            let path = outside.path().join(format!("existing.{extension}"));
+            fs::write(&path, b"original export").unwrap();
+            let native_root = root.path().to_path_buf();
+            crate::case_archive::BEFORE_LEGACY_EXPORT_RECHECK.with(|hook|*hook.borrow_mut()=Some(Box::new(move|| {
+                let conn=crate::case_store::connect(&native_root).unwrap();
+                conn.execute_batch("CREATE TABLE native_evidence_protected(case_id TEXT PRIMARY KEY,store_id TEXT NOT NULL,analysis_id TEXT NOT NULL);INSERT INTO native_evidence_protected VALUES('case','native-store','native-analysis');").unwrap();
+            })));
+            let error = export_at(root.path(), &path, data, false).unwrap_err();
+            assert!(error.starts_with("CASE_NATIVE_EXPORT_REQUIRED"), "{error}");
+            assert_eq!(fs::read(&path).unwrap(), b"original export");
+        }
+    }
+
+    #[test]
+    fn legacy_exports_refuse_restore_barrier_before_capture_and_publication() {
+        fn protect_restored_case(root: &Path) {
+            let conn = crate::case_store::connect(root).unwrap();
+            let native_tables: u32 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('native_evidence_protected','native_evidence_cases')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                native_tables, 0,
+                "restore protection must work before native adoption"
+            );
+            conn.execute_batch(
+                "CREATE TABLE case_recovery_protected(case_id TEXT PRIMARY KEY);INSERT INTO case_recovery_protected VALUES('case');",
+            )
+            .unwrap();
+        }
+
+        for extension in ["json", "licase"] {
+            for before_capture in [true, false] {
+                let root = tempfile::tempdir().unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                let mut data = save_document(
+                    root.path(),
+                    json!({"schemaVersion":2,"cases":[{"id":"case","items":[{"id":"item","rows":[{"id":1,"future":18446744073709551615u64}]}]}]}),
+                );
+                data["cases"][0]["items"][0]["rows"] =
+                    json!([{"id":1,"future":18446744073709551616.0,"fabricated":true}]);
+                let path = outside.path().join(format!("existing.{extension}"));
+                fs::write(&path, b"original export").unwrap();
+                if before_capture {
+                    protect_restored_case(root.path());
+                } else {
+                    let restored_root = root.path().to_path_buf();
+                    crate::case_archive::BEFORE_LEGACY_EXPORT_RECHECK.with(|hook| {
+                        *hook.borrow_mut() =
+                            Some(Box::new(move || protect_restored_case(&restored_root)));
+                    });
+                }
+                let error = export_at(root.path(), &path, data, false).unwrap_err();
+                assert!(error.starts_with("CASE_NATIVE_EXPORT_REQUIRED"), "{error}");
+                assert_eq!(fs::read(&path).unwrap(), b"original export");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_exports_refuse_protected_case_records_and_preserve_destination() {
+        let legacy = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        let data = save_document(
+            legacy.path(),
+            json!({"schemaVersion":2,"active":"case","cases":[{"id":"case","items":[{"id":"i","rows":[{"id":1,"future":18446744073709551615u64}]}]}]}),
+        );
+        for extension in ["json", "licase"] {
+            export_at(
+                legacy.path(),
+                &exports.path().join(format!("legacy.{extension}")),
+                data.clone(),
+                false,
+            )
+            .unwrap();
+        }
+        let conn = crate::case_store::connect(legacy.path()).unwrap();
+        conn.execute_batch("CREATE TABLE native_evidence_protected(case_id TEXT PRIMARY KEY,store_id TEXT NOT NULL,analysis_id TEXT NOT NULL);INSERT INTO native_evidence_protected VALUES('case','native-store','native-analysis');").unwrap();
+        drop(conn);
+        let mut forged = data;
+        forged["cases"][0]["items"][0]["rows"] =
+            json!([{"id":1,"future":18446744073709551616.0,"fabricated":true}]);
+        for extension in ["json", "licase"] {
+            let path = exports.path().join(format!("protected.{extension}"));
+            fs::write(&path, b"preserved destination").unwrap();
+            let error = export_at(legacy.path(), &path, forged.clone(), false).unwrap_err();
+            assert!(error.starts_with("CASE_NATIVE_EXPORT_REQUIRED"), "{error}");
+            assert_eq!(fs::read(&path).unwrap(), b"preserved destination");
+        }
     }
 
     #[test]

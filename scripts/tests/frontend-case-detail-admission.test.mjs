@@ -129,7 +129,9 @@ test('explicit saved-evidence detail stays separate and copies its complete orig
   f.context.closeDrawer();f.context.openRightInspector();assert.equal(f.requests.length,0);assert.equal(f.state.currentDetailEv,saved);
   await f.context.copyDetail();assert.deepEqual(JSON.parse(f.copied[0]),saved);
   const workspace=readFileSync(new URL('../../frontend/workspace.js',import.meta.url),'utf8');
-  assert.match(workspace,/if \(action === "evidence-event"\) \{ showDetail\(item\.rows\[0\], item\.sourceSpec\); \}/);
+  vm.runInContext(workspace.slice(workspace.indexOf('  const savedRecordCount ='),workspace.indexOf('  function rememberSelection()')),f.context);
+  f.context.historicalItem={rows:[saved],sourceSpec:{kind:'saved-evidence'}};vm.runInContext('openSavedRecord(historicalItem)',f.context);
+  assert.equal(f.state.currentDetailEv,saved);assert.equal(f.requests.length,0,'legacy preserved inspection does not route through current analysis');
 });
 
 // Threat results live inside the drawer being replaced by openDetail. Exercise

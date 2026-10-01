@@ -140,6 +140,35 @@ pub fn compile_rule(text: &str) -> Result<Expr, String> {
 }
 
 pub fn compile_with(text: &str, options: &Options<'_>) -> Result<Expr, String> {
+    compile_policy(text, options, true)
+}
+
+/// Preserved history resolves ordinary query terms against original values.
+/// Catalog-backed branches are rejected before loading mutable rule catalogs.
+pub(crate) fn compile_without_catalogs(text: &str) -> Result<Expr, String> {
+    compile_policy(text, &Options { threats: None, detections: false }, false)
+}
+/// Conservative retained/scratch credit before historical AST construction.
+/// Grouped lists may clone a long field name for each term, so input bytes plus
+/// a fixed per-node charge alone would undercount that amplification.
+pub(crate) fn historical_ast_credit(text: &str) -> Result<usize, String> {
+    if text.len() > 1_000_000 { return Err("A consulta excede 1 MB.".into()); }
+    let mut longest = 0usize;
+    let mut word = 0usize;
+    let mut chars = 0usize;
+    for character in text.chars() {
+        if chars % 4096 == 0 { crate::operations::check()?; }
+        chars += 1;
+        word = if is_field_char(character) { word + character.len_utf8() } else { 0 };
+        longest = longest.max(word);
+    }
+    let nodes = if is_plain(text.trim()) { 1 } else { chars.saturating_mul(2).saturating_add(1).min(MAX_QUERY_NODES) };
+    text.len().checked_mul(8)
+        .and_then(|bytes| nodes.checked_mul(256usize.saturating_add(longest.max(32))).and_then(|nodes| bytes.checked_add(nodes)))
+        .ok_or_else(|| "CASE_HISTORY_LIMIT".into())
+}
+
+fn compile_policy(text: &str, options: &Options<'_>, catalogs: bool) -> Result<Expr, String> {
     crate::operations::check()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -153,7 +182,7 @@ pub fn compile_with(text: &str, options: &Options<'_>) -> Result<Expr, String> {
         crate::operations::check()?;
         return Ok(expr);
     }
-    let mut parser = Parser { chars: trimmed.chars().collect(), pos: 0, options, depth: 0, nodes: 0 };
+    let mut parser = Parser { chars: trimmed.chars().collect(), pos: 0, options, catalogs, depth: 0, nodes: 0 };
     let expr = parser.parse_or()?;
     parser.skip_ws();
     if parser.pos < parser.chars.len() {
@@ -182,6 +211,7 @@ struct Parser<'a> {
     chars: Vec<char>,
     pos: usize,
     options: &'a Options<'a>,
+    catalogs: bool,
     depth: usize,
     nodes: usize,
 }
@@ -624,10 +654,12 @@ impl Parser<'_> {
             return Ok(Matcher::Level(crate::sources::normalize_level(value)));
         }
         if matches!(field.name.as_str(), "regra" | "rule" | "ameaca" | "ameaça" | "threat") {
+            if !self.catalogs { return Err("CASE_HISTORY_FILTER_CATALOG_UNAVAILABLE".into()); }
             let matcher = crate::threats::matcher(value, self.options.threats.cloned())?;
             return Ok(Matcher::Threat(Threat(matcher)));
         }
         if matches!(field.name.as_str(), "deteccao" | "detecção" | "detection") {
+            if !self.catalogs { return Err("CASE_HISTORY_FILTER_CATALOG_UNAVAILABLE".into()); }
             if !self.options.detections {
                 return Err("deteccao: não pode ser usado dentro de uma regra.".into());
             }
@@ -1674,7 +1706,7 @@ mod tests {
         let unrelated = crate::operations::token(None).unwrap();
         assert!(crate::operations::run_with_token(token, || {
             let options = Options { threats: None, detections: true };
-            let mut parser = Parser { chars: vec![], pos: 0, options: &options, depth: 0, nodes: 0 };
+            let mut parser = Parser { chars: vec![], pos: 0, options: &options, catalogs: true, depth: 0, nodes: 0 };
             parser.node().unwrap();
             assert!(crate::operations::cancel_id(&id));
             assert!(parser.node().is_err(), "check between parser nodes");
@@ -1682,5 +1714,34 @@ mod tests {
         }).is_err());
         assert!(!unrelated.cancelled());
         assert!(compile("message:match").is_ok(), "cancelled context was restored");
+    }
+}
+
+#[cfg(test)]
+mod history_policy_tests {
+    use super::*;
+    #[test]
+    fn preserved_query_policy_keeps_plain_numeric_boolean_and_regex_semantics() {
+        let mut event = Event::empty();
+        event.id = 17; event.message = "Preserved WARNING".into();
+        event.fields.insert("count".into(), serde_json::json!(12));
+        for query in ["warning", "count>=10 AND id<20", "message:/warning/", "NOT count<5", "count:(12 OR 13)"] {
+            assert_eq!(compile_without_catalogs(query).unwrap().matches(&event), compile(query).unwrap().matches(&event), "{query}");
+        }
+    }
+    #[test]
+    fn historical_ast_admission_accounts_for_repeated_long_field_names() {
+        let field = "x".repeat(20_000);
+        let query = format!("{field}:(a OR b OR c)");
+        assert!(historical_ast_credit(&query).unwrap() > 128 << 20);
+        assert!(historical_ast_credit("warning").unwrap() < 4096);
+    }
+    #[test]
+    fn preserved_query_rejects_catalog_names_before_loading_a_catalog() {
+        for name in ["regra", "rule", "ameaca", "ameaça", "threat", "deteccao", "detecção", "detection"] {
+            let error = compile_without_catalogs(&format!("{name}:nonexistent-history-catalog")).unwrap_err();
+            assert_eq!(error, "CASE_HISTORY_FILTER_CATALOG_UNAVAILABLE");
+        }
+        assert!(compile_rule("deteccao:x").unwrap_err().contains("dentro de uma regra"));
     }
 }

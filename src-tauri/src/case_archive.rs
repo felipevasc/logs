@@ -22,17 +22,18 @@ use std::{
 pub(crate) const TOKEN_FIELD: &str = "portableImportToken";
 const MAX_CASES: usize = 1024;
 const MAX_PENDING_BYTES: usize = 128 << 20;
-const MASKED_HISTORY: &str = "O arquivo portátil completo inclui a proveniência original das exclusões, que não pode ser mascarada nesta versão. Para transferi-lo, desmarque ‘Ocultar senhas e tokens nos textos’. Para compartilhar textos ocultando esses dados, exporte um relatório. O destino foi preservado.";
-const MASKED_REFERENCES: &str = "O arquivo portátil inclui referências com seus bytes e esquema originais, que não podem ser mascarados sem alterar os resultados das consultas. Para transferi-lo, desmarque ‘Ocultar senhas e tokens nos textos’. Para compartilhar textos ocultando esses dados, exporte um relatório. O destino foi preservado.";
+pub(crate) const MASKED_HISTORY: &str = "O arquivo portátil completo inclui a proveniência original das exclusões, que não pode ser mascarada nesta versão. Para transferi-lo, desmarque ‘Ocultar senhas e tokens nos textos’. Para compartilhar textos ocultando esses dados, exporte um relatório. O destino foi preservado.";
+pub(crate) const MASKED_REFERENCES: &str = "O arquivo portátil inclui referências com seus bytes e esquema originais, que não podem ser mascarados sem alterar os resultados das consultas. Para transferi-lo, desmarque ‘Ocultar senhas e tokens nos textos’. Para compartilhar textos ocultando esses dados, exporte um relatório. O destino foi preservado.";
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Metadata {
-    schema_version: u32,
-    ledgers: Vec<PortableLedger>,
+pub(crate) struct Metadata {
+    pub schema_version: u32,
+    pub ledgers: Vec<PortableLedger>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    reference_sets: Vec<ReferenceSet>,
+    pub reference_sets: Vec<ReferenceSet>,
 }
+
 struct Pending {
     root: PathBuf,
     prepared: PreparedPortable,
@@ -61,7 +62,7 @@ impl Write for ByteCounter {
     }
 }
 
-fn work() -> Work<'static> {
+pub(crate) fn work() -> Work<'static> {
     Work {
         cancelled: &crate::operations::cancelled,
         progress: &report_ledger_progress,
@@ -174,19 +175,130 @@ fn document_source(file: &mut File, data: &Value) -> Result<Source, String> {
         file: file.try_clone().map_err(|e| e.to_string())?,
     })
 }
-fn safe_export_destination(root: &Path, path: &Path) -> Result<(), String> {
+pub(crate) fn safe_export_destination(root: &Path, path: &Path) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    // A selected restored profile remains inside the application's original
+    // storage namespace. Export must preserve its base and sibling profiles.
+    let managed_profile = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| {
+            uuid::Uuid::parse_str(name)
+                .ok()
+                .filter(|id| id.to_string() == name)
+        })
+        .is_some()
+        && root.parent().and_then(Path::file_name)
+            == Some(std::ffi::OsStr::new("case-profiles-v1"));
+    let protected = if managed_profile {
+        root.parent()
+            .and_then(Path::parent)
+            .ok_or("Perfil gerenciado inválido.")?
+    } else {
+        root.as_path()
+    };
     if parent
         .canonicalize()
         .map_err(|e| e.to_string())?
-        .starts_with(root.canonicalize().map_err(|e| e.to_string())?)
+        .starts_with(protected)
     {
         return Err("Escolha um destino fora do armazenamento interno da aplicação para preservar os originais.".into());
     }
     Ok(())
+}
+
+/// Legacy exporters accept caller-owned record Values. Once an owner has
+/// native authority or restore protection, those Values cannot supply its
+/// portable evidence again.
+/// Call only inside the same read transaction that captures Case contexts.
+pub(crate) fn require_legacy_export(
+    conn: &Connection,
+    data: &Value,
+) -> Result<Vec<String>, String> {
+    let ids = data
+        .get("cases")
+        .and_then(Value::as_array)
+        .ok_or("Arquivo sem investigações.")?
+        .iter()
+        .map(|case| {
+            case.get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| "Caso sem identificador.".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    require_legacy_ids(conn, &ids)?;
+    Ok(ids)
+}
+fn require_legacy_ids(conn: &Connection, ids: &[String]) -> Result<(), String> {
+    let mut tables = Vec::new();
+    for table in [
+        "native_evidence_protected",
+        "native_evidence_cases",
+        "case_recovery_protected",
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if exists {
+            tables.push(table);
+        }
+    }
+    if tables.is_empty() {
+        return Ok(());
+    }
+    for id in ids {
+        crate::operations::check()?;
+        for table in &tables {
+            // Table names above are fixed application constants, never input.
+            let native: bool = conn
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE case_id=?1)"),
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if native {
+                return Err("CASE_NATIVE_EXPORT_REQUIRED: Este Caso preserva evidências nativas. Reabra a investigação e use a exportação nativa para manter os registros originais; o destino foi preservado.".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {pub(crate) static BEFORE_LEGACY_EXPORT_RECHECK:std::cell::RefCell<Option<Box<dyn FnOnce()>>>=std::cell::RefCell::new(None);}
+/// Recheck after slow serialization/file copying, when adoption may have
+/// committed since the old export released its initial read transaction.
+pub(crate) fn recheck_legacy_export(root: &Path, ids: &[String]) -> Result<(), String> {
+    #[cfg(test)]
+    BEFORE_LEGACY_EXPORT_RECHECK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    crate::operations::check()?;
+    let conn = Connection::open_with_flags(
+        root.join("investigations.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|e| e.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    conn.execute_batch("BEGIN DEFERRED")
+        .map_err(|e| e.to_string())?;
+    require_legacy_ids(&conn, ids)?;
+    conn.execute_batch("COMMIT").map_err(|e| e.to_string())
 }
 
 pub(crate) fn export_at(
@@ -201,6 +313,7 @@ pub(crate) fn export_at(
     safe_export_destination(root, path)?;
     conn.execute_batch("BEGIN DEFERRED")
         .map_err(|e| e.to_string())?;
+    let legacy_ids = require_legacy_export(&conn, &data)?;
     let mut captured = Vec::new();
     let mut snapshots = Vec::new();
     let mut metadata_budget = ByteCounter {
@@ -306,12 +419,21 @@ pub(crate) fn export_at(
             .map(|c| c.manifest.clone())
             .collect(),
     };
-    format::write(path, &metadata, &mut sources, &crate::operations::cancelled)?;
+    format::write_guarded(
+        path,
+        &metadata,
+        &mut sources,
+        &crate::operations::cancelled,
+        &mut |_| Ok(()),
+        &|| recheck_legacy_export(root, &legacy_ids),
+    )?;
     crate::operations::commit();
     Ok(())
 }
 
-fn payload_metadata(ledger: &PortableLedger) -> impl Iterator<Item = &ledger::PayloadMeta> {
+pub(crate) fn payload_metadata(
+    ledger: &PortableLedger,
+) -> impl Iterator<Item = &ledger::PayloadMeta> {
     ledger
         .batches
         .iter()
@@ -442,6 +564,7 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
         )?;
         let reference_sources =
             references::prepare(&root, staged.snapshot(), reference_set, &reference_paths)?;
+        references::interpretation_diagnostics(reference_set, &mut staged, false)?;
         references::preflight(&root, &mut staged)?;
         // Include readiness diagnostics added by preflight in the pending cap.
         serde_json::to_writer(
@@ -583,6 +706,43 @@ mod tests {
     use super::*;
     use crate::analysis_context::Config;
     use serde_json::json;
+
+    #[test]
+    fn managed_profile_export_destination_preserves_base_and_sibling_profiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("application");
+        let profiles = base.join("case-profiles-v1");
+        let selected = profiles.join(uuid::Uuid::new_v4().to_string());
+        let nil_profile = profiles.join(uuid::Uuid::nil().to_string());
+        let sibling = profiles.join(uuid::Uuid::new_v4().to_string());
+        let outside = directory.path().join("exports");
+        for path in [&selected, &nil_profile, &sibling, &outside] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for selected in [&selected, &nil_profile] {
+            for path in [
+                base.join("investigations.sqlite3"),
+                sibling.join("investigations.sqlite3"),
+                selected.join("case.json"),
+            ] {
+                assert!(
+                    safe_export_destination(selected, &path).is_err(),
+                    "{selected:?}: {path:?}"
+                );
+            }
+            let exported_path = outside
+                .join(selected.file_name().unwrap())
+                .with_extension("licase");
+            safe_export_destination(selected, &exported_path).unwrap();
+            create(selected, "managed-case");
+            exported(selected, &exported_path);
+            assert!(format::is_archive(&exported_path).unwrap());
+        }
+        let ordinary = profiles.join("not-a-canonical-profile");
+        std::fs::create_dir_all(&ordinary).unwrap();
+        safe_export_destination(&ordinary, &base.join("outside-this-test-root.licase")).unwrap();
+        assert!(safe_export_destination(&ordinary, &ordinary.join("inside.licase")).is_err());
+    }
 
     fn create(root: &Path, id: &str) {
         let context = Snapshot {
@@ -962,6 +1122,7 @@ mod tests {
     fn add_reference(root: &Path, id: &str, content: &[u8], available: bool) {
         let mut context = current(root, id);
         let descriptor = crate::analysis_context::ReferenceDescriptor {
+            interpretation_version: 1,
             schema_version: 1,
             id: "table".into(),
             name: "Portable table".into(),
@@ -1384,6 +1545,7 @@ mod tests {
         input.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
         let mut context = current(source.path(), "source");
         let descriptor = crate::analysis_context::ReferenceDescriptor {
+            interpretation_version: 1,
             schema_version: 1,
             id: "table".into(),
             name: "Large values".into(),

@@ -113,6 +113,8 @@
     const grid = $('#dash-grid'); grid.classList.toggle('discovery-grid', mode !== 'custom');
     grid.classList.toggle('dash-compact', state.dashboardCompact);
     $('#btn-dash-compact').setAttribute('aria-pressed', String(state.dashboardCompact));
+    const unavailable = window.CaseEvidence?.active === true ? caseAnalysisUnavailable(scope) : null;
+    if (unavailable) { clearCharts(); grid.innerHTML = ''; empty(grid, unavailable); $('#dash-info').textContent = 'Análise indisponível · originais preservados'; return; }
     if (mode === 'custom') {
       if (!dashboardCharts(scope)) setDashboardCharts([], scope);
       await legacyRender(scope);

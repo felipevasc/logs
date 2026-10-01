@@ -45,10 +45,10 @@ pub(crate) struct Entry {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Envelope<T> {
-    format_version: u32,
-    metadata: T,
-    entries: Vec<Entry>,
+pub(crate) struct Envelope<T> {
+    pub format_version: u32,
+    pub metadata: T,
+    pub entries: Vec<Entry>,
 }
 pub(crate) struct Source {
     pub entry: Entry,
@@ -58,6 +58,9 @@ pub(crate) struct Source {
 pub(crate) struct StagedArchive<T> {
     pub metadata: T,
     pub entries: Vec<Entry>,
+    pub format_version: u32,
+    pub source_bytes: u64,
+    pub source_sha256: String,
     directory: tempfile::TempDir,
 }
 impl<T> StagedArchive<T> {
@@ -190,18 +193,85 @@ pub(crate) fn write<T: Serialize>(
     sources: &mut [Source],
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(), String> {
+    write_guarded(
+        target,
+        metadata,
+        sources,
+        cancelled,
+        &mut |_| Ok(()),
+        &|| Ok(()),
+    )
+}
+/// Native callers reserve each owned allocation before it happens and perform
+/// their final StoreStamp/authority check immediately before publication.
+pub(crate) fn write_guarded<T: Serialize>(
+    target: &Path,
+    metadata: &T,
+    sources: &mut [Source],
+    cancelled: &dyn Fn() -> bool,
+    reserve: &mut dyn FnMut(usize) -> Result<(), String>,
+    validate: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    write_guarded_version(target, metadata, sources, cancelled, reserve, validate, 1)
+}
+pub(crate) fn write_native_guarded<T: Serialize>(
+    target: &Path,
+    metadata: &T,
+    sources: &mut [Source],
+    cancelled: &dyn Fn() -> bool,
+    reserve: &mut dyn FnMut(usize) -> Result<(), String>,
+    validate: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    write_guarded_version(target, metadata, sources, cancelled, reserve, validate, 3)
+}
+fn write_guarded_version<T: Serialize>(
+    target: &Path,
+    metadata: &T,
+    sources: &mut [Source],
+    cancelled: &dyn Fn() -> bool,
+    reserve: &mut dyn FnMut(usize) -> Result<(), String>,
+    validate: &dyn Fn() -> Result<(), String>,
+    format_version: u32,
+) -> Result<(), String> {
+    reserve(
+        sources
+            .len()
+            .checked_mul(512)
+            .ok_or("Manifesto portátil excessivo.")?,
+    )?;
     let entries: Vec<_> = sources.iter().map(|s| s.entry.clone()).collect();
     let bodies = validate_entries(&entries)?;
-    let mut encoded = BoundedManifest(Vec::new());
-    serde_json::to_writer(
-        &mut encoded,
-        &Envelope {
-            format_version: 1,
-            metadata,
-            entries,
-        },
-    )
-    .map_err(|e| e.to_string())?;
+    let envelope = Envelope {
+        format_version,
+        metadata,
+        entries,
+    };
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .filter(|size| *size as u64 <= MAX_MANIFEST_BYTES)
+                .ok_or_else(|| std::io::Error::other("O manifesto portátil excede8MiB."))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut size = Count(0);
+    serde_json::to_writer(&mut size, &envelope).map_err(|e| e.to_string())?;
+    reserve(
+        size.0
+            .checked_mul(2)
+            .ok_or("Manifesto portátil excessivo.")?,
+    )?;
+    let mut encoded = BoundedManifest(Vec::with_capacity(size.0));
+    serde_json::to_writer(&mut encoded, &envelope).map_err(|e| e.to_string())?;
+    if encoded.0.len() != size.0 {
+        return Err("O manifesto mudou durante a exportação.".into());
+    }
     let total = bodies
         .checked_add(24 + encoded.0.len() as u64)
         .ok_or("Arquivo portátil excessivo.")?;
@@ -216,7 +286,8 @@ pub(crate) fn write<T: Serialize>(
     {
         let mut output = std::io::BufWriter::new(temporary.as_file_mut());
         output
-            .write_all(MAGIC)
+            .write_all(&MAGIC[..12])
+            .and_then(|_| output.write_all(&format_version.to_le_bytes()))
             .and_then(|_| output.write_all(&(encoded.0.len() as u64).to_le_bytes()))
             .and_then(|_| output.write_all(&encoded.0))
             .map_err(|e| e.to_string())?;
@@ -239,6 +310,10 @@ pub(crate) fn write<T: Serialize>(
     if cancelled() {
         return Err("Operação cancelada.".into());
     }
+    validate()?;
+    if cancelled() {
+        return Err("Operação cancelada.".into());
+    }
     temporary.persist(target).map_err(|e| e.error.to_string())?;
     Ok(())
 }
@@ -255,7 +330,8 @@ pub(crate) fn is_archive(path: &Path) -> Result<bool, String> {
 pub(crate) fn open_regular(path: &Path) -> Result<File, String> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
@@ -273,18 +349,73 @@ pub(crate) fn read<T: DeserializeOwned>(
     staging_parent: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<StagedArchive<T>, String> {
-    if cancelled() { return Err("Operação cancelada.".into()); }
+    read_decoded(path, staging_parent, cancelled, &mut |_| Ok(()), |bytes| {
+        serde_json::from_slice(bytes).map_err(|e| format!("Manifesto portátil inválido: {e}"))
+    })
+}
+/// Admission precedes encoded-buffer allocation. The native decoder separately
+/// preflights/charges the typed tree while preserving exact numeric values.
+pub(crate) fn read_decoded<T>(
+    path: &Path,
+    staging_parent: &Path,
+    cancelled: &dyn Fn() -> bool,
+    reserve: &mut dyn FnMut(usize) -> Result<(), String>,
+    decode: impl FnOnce(&[u8]) -> Result<Envelope<T>, String>,
+) -> Result<StagedArchive<T>, String> {
+    read_decoded_versions(path, staging_parent, cancelled, reserve, decode, &[1])
+}
+pub(crate) fn read_native_decoded<T>(
+    path: &Path,
+    staging_parent: &Path,
+    cancelled: &dyn Fn() -> bool,
+    reserve: &mut dyn FnMut(usize) -> Result<(), String>,
+    decode: impl FnOnce(&[u8]) -> Result<Envelope<T>, String>,
+) -> Result<StagedArchive<T>, String> {
+    read_decoded_versions(path, staging_parent, cancelled, reserve, decode, &[1, 3])
+}
+fn read_decoded_versions<T>(
+    path: &Path,
+    staging_parent: &Path,
+    cancelled: &dyn Fn() -> bool,
+    reserve: &mut dyn FnMut(usize) -> Result<(), String>,
+    decode: impl FnOnce(&[u8]) -> Result<Envelope<T>, String>,
+    versions: &[u32],
+) -> Result<StagedArchive<T>, String> {
+    if cancelled() {
+        return Err("Operação cancelada.".into());
+    }
     let file = open_regular(path)?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     if size > MAX_ARCHIVE_BYTES {
         return Err("O arquivo portátil excede 32 GiB.".into());
     }
-    let mut input = std::io::BufReader::new(file);
+    struct Fingerprinted<R> {
+        inner: R,
+        digest: Sha256,
+        bytes: u64,
+    }
+    impl<R: Read> Read for Fingerprinted<R> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(output)?;
+            self.digest.update(&output[..count]);
+            self.bytes = self
+                .bytes
+                .checked_add(count as u64)
+                .ok_or_else(|| std::io::Error::other("Arquivo excessivo."))?;
+            Ok(count)
+        }
+    }
+    let mut input = Fingerprinted {
+        inner: std::io::BufReader::new(file),
+        digest: Sha256::new(),
+        bytes: 0,
+    };
     let mut magic = [0u8; MAGIC.len()];
     input
         .read_exact(&mut magic)
         .map_err(|_| "Cabeçalho portátil incompleto.")?;
-    if magic != *MAGIC {
+    let header_version = u32::from_le_bytes(magic[12..16].try_into().unwrap());
+    if magic[..12] != MAGIC[..12] || !versions.contains(&header_version) {
         return Err("Formato portátil não suportado.".into());
     }
     let mut length = [0u8; 8];
@@ -298,14 +429,14 @@ pub(crate) fn read<T: DeserializeOwned>(
     if cancelled() {
         return Err("Operação cancelada.".into());
     }
+    reserve(length as usize)?;
     let mut encoded = vec![0u8; length as usize];
     input
         .read_exact(&mut encoded)
         .map_err(|_| "Manifesto portátil incompleto.")?;
-    let manifest: Envelope<T> = serde_json::from_slice(&encoded)
-        .map_err(|e| format!("Manifesto portátil inválido: {e}"))?;
+    let manifest = decode(&encoded)?;
     drop(encoded);
-    if manifest.format_version != 1 {
+    if manifest.format_version != header_version || !versions.contains(&manifest.format_version) {
         return Err("O arquivo portátil exige uma versão mais recente.".into());
     }
     let bodies = validate_entries(&manifest.entries)?;
@@ -329,9 +460,15 @@ pub(crate) fn read<T: DeserializeOwned>(
     if cancelled() {
         return Err("Operação cancelada.".into());
     }
+    if input.bytes != size {
+        return Err("O arquivo mudou durante a importação.".into());
+    }
     Ok(StagedArchive {
+        format_version: manifest.format_version,
         metadata: manifest.metadata,
         entries: manifest.entries,
+        source_bytes: input.bytes,
+        source_sha256: format!("{:x}", input.digest.finalize()),
         directory,
     })
 }
@@ -342,10 +479,98 @@ mod tests {
     use serde_json::{json, Value};
 
     #[test]
+    fn cancellation_during_final_validation_preserves_existing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("existing.licase");
+        std::fs::write(&target, b"original destination").unwrap();
+        let mut sources = [source(root.path(), "document", EntryKind::Document, b"{}")];
+        for native in [false, true] {
+            let cancelled = std::cell::Cell::new(false);
+            let validate = || {
+                cancelled.set(true);
+                Ok(())
+            };
+            let result = if native {
+                write_native_guarded(
+                    &target,
+                    &json!({}),
+                    &mut sources,
+                    &|| cancelled.get(),
+                    &mut |_| Ok(()),
+                    &validate,
+                )
+            } else {
+                write_guarded(
+                    &target,
+                    &json!({}),
+                    &mut sources,
+                    &|| cancelled.get(),
+                    &mut |_| Ok(()),
+                    &validate,
+                )
+            };
+            assert!(result.unwrap_err().contains("cancelada"));
+            assert_eq!(std::fs::read(&target).unwrap(), b"original destination");
+        }
+    }
+    #[test]
+    fn native_version_three_requires_native_reader_and_preserves_legacy_read_support() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("native.licase");
+        let mut sources = [source(
+            root.path(),
+            "document",
+            EntryKind::Document,
+            b"{\"native\":true}",
+        )];
+        write_native_guarded(
+            &target,
+            &json!({"schemaVersion":3}),
+            &mut sources,
+            &|| false,
+            &mut |_| Ok(()),
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert!(is_archive(&target).unwrap());
+        assert!(read::<Value>(&target, root.path(), &|| false)
+            .unwrap_err()
+            .contains("não suportado"));
+        let opened = read_native_decoded::<Value>(
+            &target,
+            root.path(),
+            &|| false,
+            &mut |_| Ok(()),
+            |bytes| serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+        )
+        .unwrap();
+        assert_eq!(opened.format_version, 3);
+        assert_eq!(
+            std::fs::read(opened.path(0).unwrap()).unwrap(),
+            b"{\"native\":true}"
+        );
+        let legacy = root.path().join("legacy.licase");
+        write(&legacy, &json!({"schemaVersion":1}), &mut sources, &|| {
+            false
+        })
+        .unwrap();
+        let opened = read_native_decoded::<Value>(
+            &legacy,
+            root.path(),
+            &|| false,
+            &mut |_| Ok(()),
+            |bytes| serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+        )
+        .unwrap();
+        assert_eq!(opened.format_version, 1);
+    }
+    #[test]
     fn cancelled_archive_read_stops_before_opening_the_input() {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("does-not-exist.licase");
-        assert!(read::<Value>(&missing, directory.path(), &|| true).unwrap_err().contains("cancelada"));
+        assert!(read::<Value>(&missing, directory.path(), &|| true)
+            .unwrap_err()
+            .contains("cancelada"));
         assert!(open_regular(directory.path()).is_err());
     }
 
@@ -358,8 +583,12 @@ mod tests {
             let path = PathBuf::from(path);
             let root = tempfile::tempdir().unwrap();
             assert!(is_archive(&path).unwrap_err().contains("regular"));
-            assert!(read::<Value>(&path, root.path(), &|| false).unwrap_err().contains("regular"));
-            assert!(crate::case_images::import_at(root.path(), &path).unwrap_err().contains("regular"));
+            assert!(read::<Value>(&path, root.path(), &|| false)
+                .unwrap_err()
+                .contains("regular"));
+            assert!(crate::case_images::import_at(root.path(), &path)
+                .unwrap_err()
+                .contains("regular"));
             assert!(!root.path().join("investigations.sqlite3").exists());
             return;
         }
@@ -372,9 +601,13 @@ mod tests {
             .env(INPUT, &fifo).stdout(std::process::Stdio::null()).spawn().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); break; }
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill(); let _ = child.wait();
+                let _ = child.kill();
+                let _ = child.wait();
                 panic!("non-regular input blocked before cancellation/type validation");
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -383,7 +616,10 @@ mod tests {
         std::fs::write(&ordinary, b"{}").unwrap();
         let link = directory.path().join("regular-link.json");
         symlink(&ordinary, &link).unwrap();
-        assert!(!is_archive(&link).unwrap(), "regular symlink targets retain their existing input policy");
+        assert!(
+            !is_archive(&link).unwrap(),
+            "regular symlink targets retain their existing input policy"
+        );
     }
 
     fn entry(kind: EntryKind, bytes: &[u8]) -> Entry {
@@ -612,5 +848,49 @@ mod tests {
         write(&path, &json!({}), &mut sources, &|| false).unwrap();
         let staged = read::<Value>(&path, root.path(), &|| false).unwrap();
         assert_eq!(std::fs::metadata(staged.path(1).unwrap()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn native_manifest_admission_and_final_authority_fail_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("read.licase");
+        raw_archive(
+            &archive,
+            json!({}),
+            vec![entry(EntryKind::Document, b"{}")],
+            b"{}",
+        );
+        let decoded = std::cell::Cell::new(false);
+        let result = read_decoded::<Value>(
+            &archive,
+            root.path(),
+            &|| false,
+            &mut |_| Err("fixture credit denial".into()),
+            |bytes| {
+                decoded.set(true);
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!decoded.get());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        let target = root.path().join("target.licase");
+        std::fs::write(&target, b"preserved destination").unwrap();
+        let mut sources = [source(root.path(), "document", EntryKind::Document, b"{}")];
+        let admitted = std::cell::Cell::new(0usize);
+        let result = write_guarded(
+            &target,
+            &json!({}),
+            &mut sources,
+            &|| false,
+            &mut |bytes| {
+                admitted.set(admitted.get() + bytes);
+                Ok(())
+            },
+            &|| Err("stale StoreStamp".into()),
+        );
+        assert!(result.unwrap_err().contains("StoreStamp"));
+        assert!(admitted.get() > 0);
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserved destination");
     }
 }

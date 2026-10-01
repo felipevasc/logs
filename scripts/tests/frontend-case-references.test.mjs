@@ -128,3 +128,15 @@ test('Cancel restores a usable focus target and context menu ownership is captur
   const item=f.controller.lookupMenuItem('host.name',anchor);f.state.owner.instance++;await item.onClick();assert.equal(f.calls.filter(call=>call.cmd==='reference_list').length,1);
   assert.match(f.messages.at(-1),/Caso mudou/);
 });
+
+test('existing reference details disclose legacy and exact numeric interpretation without changing import defaults',async()=>{
+  const f=fixture();f.setEntries([{descriptor:descriptor('legacy'),available:true,rowCount:3,sourceBytes:123,reason:null},{descriptor:{...descriptor('exact'),interpretationVersion:2},available:false,rowCount:null,sourceBytes:null,reason:'content unavailable'}]);await f.controller.openManager();
+  const details=f.field('list').children.map(card=>card.children.find(node=>node.tag==='details').children[1].textContent);assert.match(details[0],/Interpretação numérica: legada v1/);assert.match(details[1],/Interpretação numérica: exata v2/);
+  await f.controller.chooseFile();f.addKey('host');f.field('import-name').value='Default import';await f.controller.importReference();assert.equal(Object.hasOwn(f.calls.find(call=>call.cmd==='reference_import').args,'interpretationVersion'),false);
+});
+
+test('reference manager keeps bounded native migration diagnostics visible with the captured Case',async()=>{
+  const f=fixture(),prior=f.context.window.AnalysisContexts.context;f.context.window.AnalysisContexts.context=()=>({...prior(),migrationDiagnostics:[{code:'legacy_reference_numeric_interpretation',message:'Decimais exatos do Caso coexistem com referência legada v1.'}]});await f.controller.openManager();
+  const notice=f.field('list').children[0];assert.equal(notice.className,'rf-diagnostics');assert.equal(notice.attrs.role,'status');assert.match(notice.children[1].textContent,/referência legada v1/);
+  assert.equal(f.calls.some(call=>call.cmd==='profile_fields'),false);
+});

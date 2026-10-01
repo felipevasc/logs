@@ -32,7 +32,7 @@ window.ExclusionVisibility = (() => {
     if (!captured.owner?.identity) return;
     if (!force && cached?.key === signature) return cached.value;
     if (pending?.key === signature) return pending.promise;
-    const request = ++serial, evidence = captured.scope === "case" ? caseEvents() : null;
+    const request = ++serial, evidence = captured.scope === "case" ? caseEvents("analysis") : null;
     const current = () => request === serial && signature === key(capture());
     const promise = (async () => {
       try {

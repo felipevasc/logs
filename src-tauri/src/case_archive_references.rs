@@ -28,6 +28,8 @@ pub(crate) struct PortableReference {
 #[serde(tag = "availability", rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) enum ReferenceState {
     Available {
+        #[serde(rename = "preparationVersion", default = "legacy_preparation")]
+        preparation_version: u32,
         #[serde(rename = "assetId")]
         asset_id: String,
         #[serde(rename = "sourceBytes")]
@@ -36,6 +38,9 @@ pub(crate) enum ReferenceState {
         schema_sha256: String,
     },
     Unavailable,
+}
+fn legacy_preparation() -> u32 {
+    1
 }
 pub(crate) struct Captured {
     pub manifest: ReferenceSet,
@@ -63,6 +68,7 @@ pub(crate) fn capture(root: &Path, snapshot: &Snapshot) -> Result<Captured, Stri
                 Ok(source) => {
                     let asset_id = uuid::Uuid::new_v4().to_string();
                     let state = ReferenceState::Available {
+                        preparation_version: source.prepared().version.store_version,
                         asset_id: asset_id.clone(),
                         source_bytes: source.prepared().source_bytes,
                         schema_sha256: source.prepared().version.schema_sha256.clone(),
@@ -92,7 +98,7 @@ pub(crate) fn validate(
     entries: &[Entry],
 ) -> Result<BTreeMap<String, Vec<PortableReference>>, String> {
     if (schema_version == 1 && !sets.is_empty())
-        || (schema_version == 2 && sets.len() != snapshots.len())
+        || ([2, 3].contains(&schema_version) && sets.len() != snapshots.len())
     {
         return Err("Documento e manifesto de referências não correspondem.".into());
     }
@@ -152,6 +158,7 @@ pub(crate) fn validate(
             }
             match &reference.state {
                 ReferenceState::Available {
+                    preparation_version,
                     asset_id,
                     source_bytes,
                     schema_sha256,
@@ -170,6 +177,12 @@ pub(crate) fn validate(
                     {
                         return Err("Os metadados de uma referência portátil não conferem.".into());
                     }
+                    store::validate_portable_schema(
+                        &reference.descriptor,
+                        *preparation_version,
+                        schema_sha256,
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
                 ReferenceState::Unavailable => {
                     missing.insert(reference.descriptor.id.clone());
@@ -181,6 +194,8 @@ pub(crate) fn validate(
                 "portable_references_unavailable",
                 "portable_reference_unavailable",
                 "portable_reference_runtime_budget",
+                "reference_interpretation_legacy",
+                "reference_interpretation_exact",
             ]
             .contains(&diagnostic.code.as_str())
         });
@@ -222,6 +237,7 @@ pub(crate) fn prepare(
     let mut prepared = Vec::new();
     for reference in references {
         let ReferenceState::Available {
+            preparation_version,
             asset_id,
             source_bytes,
             schema_sha256,
@@ -229,28 +245,32 @@ pub(crate) fn prepare(
         else {
             continue;
         };
+        store::validate_portable_schema(&reference.descriptor, *preparation_version, schema_sha256)
+            .map_err(|e| e.to_string())?;
         let input = File::open(paths.get(asset_id).ok_or("Referência portátil ausente.")?)
             .map_err(|e| e.to_string())?;
-        let expected = store::prepare_jsonl(
+        let expected = store::prepare_jsonl_version(
             root,
             &owner(local),
             &reference.descriptor,
             input,
             store::Limits::default(),
             &crate::operations::cancelled,
+            reference.descriptor.interpretation_version,
         )
         .map_err(|e| e.to_string())?;
         if expected.source_bytes != *source_bytes
-            || expected.version.schema_sha256 != *schema_sha256
+            || expected.version.store_version != reference.descriptor.interpretation_version
         {
             return Err(
                 "O esquema da referência preparada não corresponde ao arquivo portátil.".into(),
             );
         }
-        let source = store::portable_source(
+        let source = store::portable_source_version(
             root,
             &owner(local),
             &reference.descriptor,
+            reference.descriptor.interpretation_version,
             &crate::operations::cancelled,
         )
         .map_err(|e| e.to_string())?;
@@ -260,6 +280,19 @@ pub(crate) fn prepare(
         prepared.push(source);
     }
     Ok(prepared)
+}
+pub(crate) fn interpretation_diagnostics(
+    references: &[PortableReference],
+    prepared: &mut crate::exclusion_store::PreparedPortable,
+    native_records: bool,
+) -> Result<(), String> {
+    for diagnostic in crate::analysis_context::reference_interpretation_diagnostics(
+        references.iter().map(|reference| reference.descriptor.interpretation_version),
+        native_records,
+    ) {
+        prepared.add_import_diagnostic(diagnostic)?;
+    }
+    Ok(())
 }
 
 /// Validate executable projections before publication without retaining up to

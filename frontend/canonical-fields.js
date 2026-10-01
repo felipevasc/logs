@@ -11,7 +11,7 @@ window.CanonicalFields = (() => {
   function capture(event, column, options = {}) {
     const scope = workspaceScope();
     return { row: { id: event?.id, eventRef: event?.event_ref }, column, owner: window.AnalysisContexts?.capture(), scope,
-      signature: scope === "case" ? caseSig() : null, evidence: scope === "case" ? caseEvents() : null,
+      signature: scope === "case" ? caseSig() : null, evidence: scope === "case" ? caseEvents("analysis") : null,
       anchor: options.anchor || null, historical: !!options.historical, guard: options.guard || (() => true),
       literal: Object.hasOwn(options, "literal") ? options.literal : rawValue(event, column) };
   }

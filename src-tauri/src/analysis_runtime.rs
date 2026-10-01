@@ -48,6 +48,10 @@ pub(crate) struct Admitted {
     pub case_key: Option<String>,
     pub case_content_token: Option<String>,
     case_cache_bound: bool,
+    case_records: Option<Arc<crate::case_cache::Records>>,
+    case_budget: Arc<crate::case_work_budget::Pool>,
+    case_work: parking_lot::Mutex<Option<crate::case_work_budget::Lease>>,
+    preparing_visibility: std::sync::atomic::AtomicBool,
     mode: Mode,
     source: Option<Arc<SourceData>>,
     names: Vec<String>,
@@ -57,6 +61,7 @@ pub(crate) struct Admitted {
     definition_bytes: usize,
     pub diagnostics: Arc<Vec<analysis_context::Diagnostic>>,
     pub references: Arc<Vec<analysis_context::ReferenceDescriptor>>,
+    _reference_credit: Option<Arc<crate::case_work_budget::Lease>>,
     visibility: OnceLock<PreparedVisibility>,
     failure: parking_lot::Mutex<Option<String>>,
     source_set: OnceLock<Result<Arc<crate::analysis_visibility::SourceSet>, String>>,
@@ -136,12 +141,33 @@ pub(crate) fn with<T>(admitted: Option<Arc<Admitted>>, f: impl FnOnce() -> T) ->
     f()
 }
 
-pub(crate) fn validate_identity(identity: &Identity) -> Result<Snapshot, String> {
-    let snapshot = analysis_context::snapshot(&identity.case_id)?;
-    if snapshot.identity() != *identity {
-        return Err(STALE.into());
+/// Own the exact decoded context and its read credit together. The tree drops
+/// before its credit, including comparisons that discard the return value.
+pub(crate) struct LeasedSnapshot {
+    snapshot: Snapshot,
+    credit: Option<crate::case_work_budget::Lease>,
+}
+impl Deref for LeasedSnapshot {
+    type Target = Snapshot;
+    fn deref(&self) -> &Snapshot { &self.snapshot }
+}
+impl LeasedSnapshot {
+    fn into_references(self) -> (Arc<Vec<analysis_context::ReferenceDescriptor>>, Option<Arc<crate::case_work_budget::Lease>>) {
+        let Self { mut snapshot, credit } = self;
+        let references = std::mem::take(&mut snapshot.config.references);
+        drop(snapshot);
+        // The references are moved from the charged tree. Conservatively keep
+        // that same credit until every admission/cache owner releases them.
+        if references.is_empty() { drop(credit); return (Arc::new(references), None); }
+        (Arc::new(references), credit.map(Arc::new))
     }
-    Ok(snapshot)
+}
+pub(crate) fn validate_identity(identity: &Identity) -> Result<LeasedSnapshot, String> {
+    let conn = crate::case_store::context_connection(&crate::config_dir())?;
+    let (snapshot, credit) = analysis_context::read_snapshot_leased(&conn, &identity.case_id)?;
+    let leased = LeasedSnapshot { snapshot, credit };
+    if leased.identity() != *identity { return Err(STALE.into()); }
+    Ok(leased)
 }
 
 const REGEX_BYTES: usize = analysis_context::REGEX_SET_BYTES;
@@ -517,6 +543,30 @@ mod compiled_cache_lifetime_tests {
     }
 
     #[test]
+    fn decoded_snapshot_credit_follows_compilation_and_retained_reference_owners() {
+        use crate::case_work_budget::{Limits, Pool};
+        let pool = Pool::new(Limits { materialized: 1 << 20, retained: 1 << 20, live: 1 << 20 });
+        let mut source = snapshot();
+        source.config.references.push(analysis_context::ReferenceDescriptor {
+            interpretation_version: 1,
+            schema_version: 1, id: "reference".into(), name: "Reference".into(),
+            content_sha256: "a".repeat(64), format: "jsonl".into(),
+            columns: vec!["key".into()], key_columns: vec!["key".into()], duplicate_policy: "reject".into(),
+        });
+        let leased = LeasedSnapshot { snapshot: source, credit: Some(pool.reserve(8192).unwrap()) };
+        compile(&leased).unwrap();
+        assert_eq!(pool.used(), 8192);
+        let (references, credit) = leased.into_references();
+        assert_eq!(references.len(), 1); assert_eq!(pool.used(), 8192);
+        let retained = credit.as_ref().map(Arc::clone);
+        drop(references); drop(credit); assert_eq!(pool.used(), 8192);
+        drop(retained); assert_eq!(pool.used(), 0);
+        let empty = LeasedSnapshot { snapshot: snapshot(), credit: Some(pool.reserve(8192).unwrap()) };
+        let (references, credit) = empty.into_references();
+        assert!(references.is_empty()); assert!(credit.is_none()); assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
     fn cold_compile_releases_global_lock_for_an_unrelated_ready_hit() {
         let warm = snapshot();
         let first = compile(&warm).unwrap().0;
@@ -605,19 +655,17 @@ pub(crate) fn capture(
     expected_generation: Option<u64>,
     mode: Mode,
 ) -> Result<Arc<Admitted>, String> {
-    let (derived, diagnostics, references, definition_bytes) = match &identity {
+    // Reverse local-drop order keeps moved descriptor values charged even if
+    // a later source admission fails before constructing Admitted.
+    let (derived, diagnostics, reference_credit, references, definition_bytes) = match &identity {
         Some(identity) => {
             let snapshot = validate_identity(identity)?;
             let (derived, diagnostics) = compile(&snapshot)?;
             let definition_bytes = serde_json::to_vec(&snapshot.config)
                 .map_err(|e| e.to_string())?
                 .len();
-            (
-                derived,
-                diagnostics,
-                Arc::new(snapshot.config.references),
-                definition_bytes,
-            )
+            let (references, credit) = snapshot.into_references();
+            (derived, diagnostics, credit, references, definition_bytes)
         }
         None => {
             if analysis_context::active_snapshot()?.is_some() {
@@ -628,6 +676,7 @@ pub(crate) fn capture(
             (
                 Arc::new(state.derived.read().clone()),
                 Arc::new(Vec::new()),
+                None,
                 Arc::new(Vec::new()),
                 0,
             )
@@ -676,6 +725,10 @@ pub(crate) fn capture(
         case_key: None,
         case_content_token: None,
         case_cache_bound: false,
+        case_records: None,
+        case_budget: Arc::clone(crate::case_work_budget::global()),
+        case_work: parking_lot::Mutex::new(None),
+        preparing_visibility: std::sync::atomic::AtomicBool::new(false),
         mode,
         source,
         names,
@@ -685,6 +738,7 @@ pub(crate) fn capture(
         definition_bytes,
         diagnostics,
         references,
+        _reference_credit: reference_credit,
         visibility: OnceLock::new(),
         failure: parking_lot::Mutex::new(None),
         source_set: OnceLock::new(),
@@ -699,7 +753,15 @@ pub(crate) fn capture_case(
     key: Option<String>,
 ) -> Result<(Arc<Admitted>, Option<Vec<Event>>), String> {
     let (admitted, events) = capture_case_shared(state, identity, generation, events, key)?;
-    Ok((admitted, events.map(|events| Arc::try_unwrap(events).unwrap_or_else(|events| (*events).clone()))))
+    let events = events.map(|records| {
+        let (events, credit) = match Arc::try_unwrap(records) {
+            Ok(records) => records.into_work(),
+            Err(records) => records.clone_for_work()?,
+        };
+        admitted.retain_case_credit(credit)?;
+        Ok::<_, String>(events)
+    }).transpose()?;
+    Ok((admitted, events))
 }
 
 /// Read-only actions retain the synchronized publication without cloning every
@@ -710,7 +772,7 @@ pub(crate) fn capture_case_shared(
     generation: Option<u64>,
     events: Option<Vec<Event>>,
     key: Option<String>,
-) -> Result<(Arc<Admitted>, Option<Arc<Vec<Event>>>), String> {
+) -> Result<(Arc<Admitted>, Option<Arc<crate::case_cache::Records>>), String> {
     let case = events.is_some() || key.is_some();
     let cache_bound = events.is_none() && key.is_some();
     if case && identity.is_none() {
@@ -727,6 +789,10 @@ pub(crate) fn capture_case_shared(
     let captured = Arc::get_mut(&mut admitted).expect("new admission");
     captured.case_content_token = content_token;
     captured.case_cache_bound = cache_bound;
+    // Native origin authority and its live payload credit survive request-local
+    // overlay clones and cache eviction. Legacy arrays cannot acquire it.
+    captured.case_records = events.as_ref().filter(|records| records.native().is_some()).map(Arc::clone);
+    if let Some(records) = &events { captured.case_budget = Arc::clone(records.pool()); }
     Ok((admitted, events))
 }
 
@@ -740,6 +806,7 @@ struct PreparedFieldsEntry {
     root: std::path::PathBuf,
     identity: Identity,
     references: Arc<Vec<analysis_context::ReferenceDescriptor>>,
+    _reference_credit: Option<Arc<crate::case_work_budget::Lease>>,
     fields: Arc<Vec<sources::CompiledDerived>>,
     budget: usize,
 }
@@ -748,6 +815,56 @@ static PREPARED_FIELDS: parking_lot::Mutex<Vec<PreparedFieldsEntry>> =
 static PREPARING_FIELDS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 impl Admitted {
+    pub(crate) fn native_records(&self) -> Option<&Arc<crate::case_cache::Records>> { self.case_records.as_ref() }
+    fn case_pool(&self) -> &Arc<crate::case_work_budget::Pool> {
+        &self.case_budget
+    }
+    fn retain_case_credit(&self, credit: crate::case_work_budget::Lease) -> Result<(), String> {
+        let mut work = self.case_work.lock();
+        match work.as_mut() {
+            Some(existing) => existing.merge(credit),
+            None => { *work = Some(credit); Ok(()) }
+        }
+    }
+    fn begin_visibility(&self) -> Result<(), String> {
+        if self.preparing_visibility.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Err("Esta captura de consulta já foi executada.".into());
+        }
+        Ok(())
+    }
+    fn ensure_case_payload_credit(&self, events: &Vec<Event>) -> Result<(), String> {
+        let bytes = crate::case_cache::payload_bytes(events)?;
+        let mut work = self.case_work.lock();
+        match work.as_mut() {
+            Some(existing) if existing.bytes() < bytes => {
+                let additional = crate::case_cache::reserve_work(existing.pool(), bytes - existing.bytes())?;
+                existing.merge(additional)
+            },
+            Some(_) => Ok(()),
+            None => { *work = Some(crate::case_cache::reserve_work(self.case_pool(), bytes)?); Ok(()) }
+        }
+    }
+    fn apply_case_derived(&self, event: &mut Event, derived: &[sources::CompiledDerived]) -> Result<(), String> {
+        if derived.is_empty() && event.derived_originals.is_empty() {
+            sources::apply_derived(event, derived);
+            return Ok(());
+        }
+        let before = crate::query::event_payload_bytes(event);
+        // Existing derived evaluation retains at most 2 MiB of outputs per
+        // record. Include bounded transform intermediates and worst-case JSON
+        // string escaping of an input field; reserve BEFORE that expansion.
+        // This explicit one-record allowance is conservative, not measured RSS.
+        let scratch_bytes = before.checked_mul(6).and_then(|n| n.checked_add(8 << 20))
+            .ok_or(crate::case_work_budget::WORK_BUSY)?;
+        let mut scratch = crate::case_cache::reserve_work(self.case_pool(), scratch_bytes)?;
+        sources::apply_derived(event, derived);
+        crate::operations::check()?;
+        let added = crate::query::event_payload_bytes(event).saturating_sub(before);
+        // Transfer the retained growth out of the already admitted scratch;
+        // there is no interval in which enlarged rows are uncharged.
+        if added > 0 { self.retain_case_credit(scratch.split(added)?)?; }
+        Ok(())
+    }
     fn cached_prepared_fields(
         &self,
         identity: &Identity,
@@ -854,6 +971,7 @@ impl Admitted {
                             root: self.data_root.clone(),
                             identity: identity.clone(),
                             references: Arc::clone(&self.references),
+                            _reference_credit: self._reference_credit.as_ref().map(Arc::clone),
                             fields: Arc::clone(&fields),
                             budget,
                         });
@@ -920,6 +1038,7 @@ impl Admitted {
         &self,
         case_events: Option<Vec<Event>>,
     ) -> Result<Option<Vec<Event>>, String> {
+        self.begin_visibility()?;
         self.prepare_visibility_inner(case_events, None)
     }
 
@@ -930,10 +1049,64 @@ impl Admitted {
         &self, case_events: Option<&[Event]>, id: usize, event_ref: Option<&str>,
     ) -> Result<Option<Vec<Event>>, String> {
         let Some(events) = case_events else { return self.prepare_visibility(None); };
+        self.begin_visibility()?;
         if self.mode != Mode::Case { return Err("Registro de evidência fora de uma captura de Caso.".into()); }
         let position = crate::case_cache::record_position(events, id, event_ref)?;
+        let bytes = position.map_or(0, |position| crate::query::event_payload_bytes(&events[position]));
+        let credit = crate::case_cache::reserve_work(self.case_pool(), bytes)?;
         let selected = position.map(|position| events[position].clone()).into_iter().collect();
+        self.retain_case_credit(credit)?;
         self.prepare_visibility_inner(Some(selected), Some((events, position)))
+    }
+
+    /// Prepare the full immutable Case mask without cloning or transforming
+    /// Event payloads. Native capture reads each original stored envelope using
+    /// the member handle admitted by this publication.
+    pub(crate) fn prepare_native_case_visibility(&self) -> Result<(), String> {
+        if self.mode != Mode::Case || self.case_records.is_none() {
+            return Err("CASE_NATIVE_AUTHORITY_REQUIRED".into());
+        }
+        self.begin_visibility()?;
+        let records = self.case_records.as_ref().ok_or(STALE)?;
+        let identity = self.identity.as_ref().ok_or(STALE)?;
+        let token = crate::operations::current_token();
+        let cancelled = || token.cancelled();
+        let progress = |_: &str, completed: u64, total: Option<u64>| {
+            crate::operations::report_progress(
+                "análise", "visibility", "Preparando visibilidade da seleção",
+                completed.min(usize::MAX as u64) as usize,
+                total.unwrap_or(0).min(usize::MAX as u64) as usize,
+                "registros", 0,
+            );
+        };
+        let work = crate::exclusion_store::Work { cancelled: &cancelled, progress: &progress };
+        let scope = crate::exclusion_store::Scope::ActiveUnion;
+        let gate = evidence_row_gate(EVIDENCE_MASKS.get_or_prepare(
+            records.as_slice(), identity, &scope,
+            &crate::analysis_visibility::MaskBudget::default(), &work,
+            || crate::exclusion_store::visibility(
+                &self.data_root, identity, &crate::exclusion_store::Budget::default(), &work,
+            ),
+        )?)?;
+        gate.validate()?;
+        crate::operations::check()?;
+        self.visibility.set(PreparedVisibility { gate: Some(gate), source: None })
+            .map_err(|_| "Captura de visibilidade já publicada.")?;
+        self.validate_case_publication()?;
+        self.validate_visibility()
+    }
+
+    /// Exact native identity from an admitted full-publication mask. No dense
+    /// analytical id is ever treated as an original manifest ordinal.
+    pub(crate) fn native_case_member(
+        &self, row: &crate::page_projection::RowHandle,
+    ) -> Result<&crate::case_evidence::MemberHandle, String> {
+        let records = self.case_records.as_ref().ok_or("CASE_NATIVE_AUTHORITY_REQUIRED")?;
+        let gate = self.visibility.get().and_then(|v| v.gate.as_ref()).ok_or(STALE)?;
+        let member = records.original_member(row.id, Some(&row.event_ref))?;
+        // original_member proves this is a NativeBuilder-sealed dense position.
+        if !gate.allows(row.id)? { return Err(STALE.into()); }
+        Ok(member)
     }
 
     fn prepare_visibility_inner(
@@ -983,6 +1156,7 @@ impl Admitted {
                     let events = evidence
                         .as_mut()
                         .ok_or("Evidências do Caso ausentes na captura.")?;
+                    self.ensure_case_payload_credit(events)?;
                     if let Some(identity) = &self.identity {
                         gate = Some(evidence_row_gate(
                             EVIDENCE_MASKS.get_or_prepare(
@@ -993,18 +1167,23 @@ impl Admitted {
                     }
                     let mut row = 0;
                     let mut stopped = false;
+                    let mut work_error = None;
                     events.retain_mut(|event| {
                         if row % 256 == 0 && cancelled() {
                             stopped = true;
                         }
                         let mask_row = full_case.map_or(row, |(_, position)| position.unwrap_or(usize::MAX));
-                        let keep = !stopped && gate.as_ref().is_none_or(|gate| gate.allows_known_row(mask_row));
+                        let keep = !stopped && work_error.is_none() && gate.as_ref().is_none_or(|gate| gate.allows_known_row(mask_row));
                         row += 1;
                         if keep {
-                            sources::apply_derived(event, &derived);
+                            if let Err(error) = self.apply_case_derived(event, &derived) {
+                                work_error = Some(error);
+                                return false;
+                            }
                         }
                         keep
                     });
+                    if let Some(error) = work_error { return Err(error); }
                 }
                 (_, Some(SourceData::Indexed(index))) => {
                     if let Some(identity) = &self.identity {
@@ -1172,9 +1351,19 @@ impl Admitted {
         })
     }
 
+    /// Adoption preserves the context Identity, so a legacy Case request must
+    /// also recheck this authority boundary after its work completes.
+    pub(crate) fn validate_native_case_authority(&self) -> Result<(), String> {
+        if self.mode == Mode::Case && self.case_records.is_none() {
+            crate::case_cache::require_legacy_owner(self.identity.as_ref())?;
+        }
+        Ok(())
+    }
+
     /// Validate once before execution. The immutable snapshot remains valid if
     /// another request publishes a source/config while this query is running.
     pub(crate) fn validate(&self, state: &AppState) -> Result<(), String> {
+        self.validate_native_case_authority()?;
         self.validate_case_publication()?;
         if let Some(identity) = &self.identity {
             validate_identity(identity)?;
@@ -2330,7 +2519,7 @@ mod tests {
             let (single, shared) = capture_case_shared(&state, Some(directory.snapshot("a").identity()), None,
                 Some(reordered.clone()), Some("single-record-mask".into())).unwrap();
             with(Some(single.clone()), || {
-                let selected = single.prepare_visibility_record(shared.as_deref().map(Vec::as_slice), id, Some(&originals[original_position].event_ref)).unwrap().unwrap();
+                let selected = single.prepare_visibility_record(shared.as_deref().map(crate::case_cache::Records::as_slice), id, Some(&originals[original_position].event_ref)).unwrap().unwrap();
                 assert_eq!(selected.len(), usize::from(id == 500), "visibility uses vector positions even when IDs are sparse/reordered");
                 let summary = single.visibility_summary().unwrap();
                 assert_eq!(summary.total_rows, Some(12), "record actions reuse the complete Case mask domain");
@@ -2540,15 +2729,18 @@ mod tests {
             cancelled: &|| false,
             progress: &|_, _, _| {},
         };
-        let page = crate::exclusion_store::archive_page(
-            directory.path.path(),
-            &identity,
-            &batch.batch_id,
-            None,
-            10,
-            &work,
-        )
-        .unwrap();
+        let read_page = || {
+            crate::exclusion_store::archive_page(
+                directory.path.path(),
+                &identity,
+                &batch.batch_id,
+                None,
+                10,
+                &work,
+            )
+            .unwrap()
+        };
+        let page = read_page();
         assert_eq!(page.rows.len(), 2);
         assert!(page.rows.iter().all(|row| row.restored_from_batch));
         let archive = capture_archive_case(&state, identity.clone(), None, None, None).unwrap();
@@ -2563,10 +2755,10 @@ mod tests {
         assert!(records
             .iter()
             .all(|row| !row.active_in_batch && row.unavailable_reason.is_none()));
-        let mut wrong = page.clone();
+        let mut wrong = read_page();
         wrong.analysis = directory.snapshot("b").identity();
         assert!(archive.resolve(&state, &wrong).is_err());
-        let mut too_large = page.clone();
+        let mut too_large = read_page();
         too_large.rows = vec![page.rows[0].clone(); 501];
         assert!(archive.resolve(&state, &too_large).is_err());
         *state.source.write() = SourceData::None;
@@ -2701,7 +2893,7 @@ mod tests {
         use sha2::Digest;
         let bytes = (json!({"key":1,"value":value}).to_string() + "\n").into_bytes();
         let descriptor = analysis_context::ReferenceDescriptor {
-            schema_version: 1,
+            interpretation_version: 1, schema_version: 1,
             id: "shared-reference-id".into(),
             name: "Fixture reference".into(),
             content_sha256: format!("{:x}", sha2::Sha256::digest(&bytes)),
@@ -3024,7 +3216,7 @@ mod tests {
             .collect::<String>()
             .into_bytes();
         let descriptor = analysis_context::ReferenceDescriptor {
-            schema_version: 1,
+            interpretation_version: 1, schema_version: 1,
             id: "large".into(),
             name: "Large fixture".into(),
             content_sha256: format!("{:x}", sha2::Sha256::digest(&data)),
@@ -3059,5 +3251,100 @@ mod tests {
             directory.snapshot("a").config,
             analysis_context::Config::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod case_work_tests {
+    use super::*;
+    use crate::case_work_budget::{Limits, Pool};
+
+    fn admission(pool: Arc<Pool>) -> Admitted {
+        Admitted { identity: None, source_generation: None, case_key: None, case_content_token: None,
+            case_cache_bound: false, case_records: None, case_budget: pool, case_work: parking_lot::Mutex::new(None),
+            preparing_visibility: std::sync::atomic::AtomicBool::new(false), mode: Mode::Case, source: None,
+            names: Vec::new(), derived: Arc::new(Vec::new()), prepared_fields: OnceLock::new(), data_root: Default::default(),
+            definition_bytes: 0, diagnostics: Arc::new(Vec::new()), references: Arc::new(Vec::new()), _reference_credit: None, visibility: OnceLock::new(),
+            failure: parking_lot::Mutex::new(None), source_set: OnceLock::new() }
+    }
+    fn transform(bytes: usize) -> Vec<sources::CompiledDerived> {
+        vec![sources::CompiledDerived { name: "expanded".into(), source: "message".into(), steps: Vec::new(), lookup: None,
+            rules: vec![sources::CompiledRule { re: regex::Regex::new("^(.*)$").unwrap(), template: Some("x".repeat(bytes)), filter: None }] }]
+    }
+
+    #[test]
+    fn native_member_resolution_uses_dense_publication_identity_and_full_mask() {
+        use crate::case_evidence::{EvidenceOwner, MemberHandle, StoreIdentity};
+        let store = StoreIdentity { store_id: uuid::Uuid::new_v4().to_string(), epoch: uuid::Uuid::new_v4().to_string() };
+        let owner = EvidenceOwner { store_id: store.store_id.clone(), case_id: "test-case".into(), analysis_id: uuid::Uuid::new_v4().to_string() };
+        let authority = crate::case_cache::NativeAuthority { store, owner, case_evidence_signature: "a".repeat(64), evidence_signature: "b".repeat(64), station_id: None, preserved_count: 2 };
+        let guard = crate::case_cache::NativeGuard { validate: Arc::new(|_| Ok(())), lease: Arc::new(()), storage_bytes: 0 };
+        let mut builder = crate::case_cache::NativeBuilder::new(authority, guard).unwrap();
+        let mut origins = Vec::new();
+        for id in 0..2 {
+            let mut event = Event::empty(); event.id = 9000 + id; event.event_ref = format!("native:{id}");
+            let member = MemberHandle { container_id: uuid::Uuid::new_v4().to_string(), manifest_id: uuid::Uuid::new_v4().to_string(), occurrence_id: uuid::Uuid::new_v4().to_string() };
+            let credit = builder.record_admission().reserve(&member, 1024, crate::query::event_payload_bytes(&event) + 256).unwrap();
+            origins.push(member.clone());
+            builder.push(&crate::case_cache::AnalyticalItemContext { station_id: None, artifact_id: None, origin: None }, member, event, credit).unwrap();
+        }
+        let records = Arc::new(builder.finish().unwrap());
+        let mut admitted = admission(Arc::clone(records.pool()));
+        admitted.case_records = Some(Arc::clone(&records));
+        assert!(admitted.native_case_member(&crate::page_projection::RowHandle { id: 0, event_ref: "native:0".into() }).is_err());
+        let gate = Arc::new(RowGate::new(2, 1, None, |position| position == 0, || Ok(())).unwrap());
+        assert!(admitted.visibility.set(PreparedVisibility { gate: Some(gate), source: None }).is_ok());
+        let before = records.pool().used();
+        assert_eq!(admitted.native_case_member(&crate::page_projection::RowHandle { id: 0, event_ref: "native:0".into() }).unwrap(), &origins[0]);
+        for (id, reference) in [(0, "changed"), (1, "native:1"), (9000, "native:0")] {
+            assert!(admitted.native_case_member(&crate::page_projection::RowHandle { id, event_ref: reference.into() }).is_err());
+        }
+        assert_eq!(records.pool().used(), before);
+    }
+
+    #[test]
+    fn native_overlay_reserves_transient_expansion_before_mutating_a_record() {
+        let pool = Pool::new(Limits { materialized: 1 << 20, retained: 1 << 20, live: 1 << 20 });
+        let admitted = admission(Arc::clone(&pool));
+        let mut events = vec![Event::empty()]; events[0].message = "original".into();
+        admitted.ensure_case_payload_credit(&events).unwrap();
+        let before = serde_json::to_value(&events[0]).unwrap(); let used = pool.used();
+        assert!(admitted.apply_case_derived(&mut events[0], &transform(1024)).unwrap_err().contains("CASE_WORK_BUSY"));
+        assert_eq!(serde_json::to_value(&events[0]).unwrap(), before, "failed scratch admission precedes derived mutation");
+        assert_eq!(pool.used(), used);
+        drop(events); drop(admitted); assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn post_overlay_growth_stays_charged_while_one_record_scratch_is_released() {
+        let pool = Pool::new(Limits { materialized: 4 << 20, retained: 4 << 20, live: 32 << 20 });
+        let admitted = admission(Arc::clone(&pool));
+        let mut events = vec![Event::empty()]; events[0].message = "input".into();
+        admitted.ensure_case_payload_credit(&events).unwrap();
+        let base = pool.used(); let old = crate::query::event_payload_bytes(&events[0]);
+        admitted.apply_case_derived(&mut events[0], &transform(32 << 10)).unwrap();
+        let growth = crate::query::event_payload_bytes(&events[0]) - old;
+        assert!(growth >= 32 << 10);
+        assert_eq!(pool.used(), base + growth, "retained output replaces part of the pre-admitted scratch lease");
+        assert_eq!(events[0].fields["expanded"].as_str().unwrap().len(), 32 << 10);
+        drop(events); drop(admitted); assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn aggregate_overlay_growth_cannot_hide_behind_a_per_record_limit() {
+        let pool = Pool::new(Limits { materialized: 4 << 20, retained: 4 << 20, live: 9 << 20 });
+        let admitted = admission(Arc::clone(&pool));
+        let mut events: Vec<_> = (0..10).map(|id| { let mut event = Event::empty(); event.id = id; event.message = "input".into(); event }).collect();
+        admitted.ensure_case_payload_credit(&events).unwrap();
+        let transforms = transform(400 << 10); let mut expanded = 0; let mut blocked = false;
+        for event in &mut events {
+            match admitted.apply_case_derived(event, &transforms) {
+                Ok(()) => expanded += 1,
+                Err(error) => { assert!(error.contains("CASE_WORK_BUSY")); assert!(!event.fields.contains_key("expanded")); blocked = true; break; }
+            }
+            assert!(pool.used() <= pool.limits().live);
+        }
+        assert!(expanded > 0 && blocked);
+        drop(events); drop(admitted); assert_eq!(pool.used(), 0);
     }
 }

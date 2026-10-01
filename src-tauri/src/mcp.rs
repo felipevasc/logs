@@ -299,6 +299,8 @@ pub fn tool_catalog() -> Vec<(&'static str, &'static str)> {
         ),
         ("cases_load", "Carrega os casos de análise persistidos"),
         ("cases_save", "Persiste os casos de análise (muta estado)"),
+        ("cases_load_view", "Carrega metadados e referências nativas dos Casos; preserva os registros fora do transporte"),
+        ("cases_save_view", "Persiste metadados e referências nativas emitidas pelo backend, com revisão explícita"),
         (
             "discover_patterns",
             "Descoberta local de padrões: templates, anomalias numéricas e desvios",
@@ -771,6 +773,24 @@ pub struct SaveCodesParams {
 pub struct CasesSaveParams {
     /// Cases document as managed by the app ({active, cases: [...]}); stored as opaque JSON.
     pub data: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeCaseStoreParams {
+    pub store_id: String,
+    pub epoch: String,
+    pub revision: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CasesSaveViewParams {
+    /// Reuse this UUID and the identical request if a response is lost.
+    pub request_id: String,
+    pub expected_store: NativeCaseStoreParams,
+    /// Exact JSON text of the management document returned by cases_load_view.
+    /// Preserve opaque container references; never insert Event arrays/previews.
+    pub document_json: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1543,7 +1563,7 @@ impl LogInsightMcp {
     }
 
     #[tool(
-        description = "List regex/transform fields for an explicit Case analysisContext. Obtain its durable identity from cases_load; a missing context is never treated as another Case.",
+        description = "List regex/transform fields for an explicit Case analysisContext. Obtain its durable identity from cases_load_view (or cases_load for an unadopted legacy profile); a missing context is never treated as another Case.",
         annotations(read_only_hint = true)
     )]
     async fn list_derived_fields(&self, Parameters(p): Parameters<crate::analysis_runtime::Params>) -> Result<CallToolResult, McpError> {
@@ -1656,7 +1676,7 @@ impl LogInsightMcp {
     // ------------------------------------------------------------ casos
 
     #[tool(
-        description = "Load the persisted analysis cases document ({active, cases: [...]}).",
+        description = "Load an unadopted legacy Case document. Native/protected profiles refuse this record-array route; use cases_load_view to obtain native metadata and analysis contexts.",
         annotations(read_only_hint = true)
     )]
     async fn cases_load(&self) -> Result<CallToolResult, McpError> {
@@ -1664,7 +1684,7 @@ impl LogInsightMcp {
     }
 
     #[tool(
-        description = "Persist the analysis cases document (opaque JSON managed by the app). MUTATES app state: emits 'mcp-state-changed' {kind: 'cases'}.",
+        description = "Persist an unadopted legacy Case document. Native/protected profiles require cases_save_view with issued references and exact documentJson. MUTATES app state: emits 'mcp-state-changed' {kind: 'cases'}.",
         annotations(read_only_hint = false, idempotent_hint = true)
     )]
     async fn cases_save(
@@ -1677,6 +1697,34 @@ impl LogInsightMcp {
         if succeeded(&result) {
             notify_state_changed(&self.app, "cases");
         }
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Load native Case management metadata, analysis contexts and opaque evidence references. Exact records stay backend-owned. On first use, prepares verified recovery and adopts legacy Cases transactionally. Use cases_save_view for notes/metadata; capture and occurrence edits use the native Case interface, never fabricated inline Event arrays.",
+        annotations(read_only_hint = false, idempotent_hint = true)
+    )]
+    async fn cases_load_view(&self) -> Result<CallToolResult, McpError> {
+        self.run_domain_app(|_, app| {
+            let (view, changed) = crate::case_evidence_commands::load_view_with_transition(&crate::config_dir())?;
+            if changed { notify_state_changed(app, "cases"); }
+            Ok(view)
+        }).await
+    }
+
+    #[tool(
+        description = "Save native Case notes/metadata and issued opaque references with expected StoreStamp and a stable requestId. documentJson is the complete native management document as exact JSON text. Do not insert record arrays, previews or invented references. Returns committed/current stamps and reconciliation state; retry the identical request after a lost response. MUTATES Case metadata.",
+        annotations(read_only_hint = false, idempotent_hint = true)
+    )]
+    async fn cases_save_view(&self, Parameters(p): Parameters<CasesSaveViewParams>) -> Result<CallToolResult, McpError> {
+        let result = self.run_domain(move |_| {
+            crate::case_evidence::save_view(&crate::config_dir(), &crate::case_evidence::SaveViewRequest {
+                request_id: p.request_id,
+                expected_store: crate::case_evidence::StoreStamp { store_id: p.expected_store.store_id, epoch: p.expected_store.epoch, revision: p.expected_store.revision },
+                document_json: p.document_json,
+            })
+        }).await?;
+        if succeeded(&result) { notify_state_changed(&self.app, "cases"); }
         Ok(result)
     }
 
@@ -2018,7 +2066,7 @@ impl ServerHandler for LogInsightMcp {
                  column (or the stacktrace field) to search text that only appears inside a stacktrace.\n\
                  \n\
                  MUTATIONS: tools marked as mutating (load_*, clear_events, save_*, set_ts_config, \
-                 delete_derived_field, harvest_codes, cases_save, threat_catalog_update, export_events, remote_import) change the app state and live-refresh the \
+                 delete_derived_field, harvest_codes, cases_save, cases_save_view, threat_catalog_update, export_events, remote_import) change the app state and live-refresh the \
                  user's UI via the 'mcp-state-changed' event. Always tell the user before changing the loaded \
                  data source or any saved configuration on their behalf."
                     .to_string(),
@@ -2086,7 +2134,9 @@ mod tests {
         assert!(names.contains("remote_test"));
         assert!(names.contains("remote_import"));
 
-        assert_eq!(catalog.len(), 57);
+        assert!(names.contains("cases_load_view"));
+        assert!(names.contains("cases_save_view"));
+        assert_eq!(catalog.len(), 59);
     }
 
     #[test]

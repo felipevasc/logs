@@ -171,14 +171,58 @@ pub(crate) fn list_definitions(expected: &Identity) -> Result<Vec<sources::Deriv
         .collect())
 }
 
+/// The browser consumes native-safe context metadata. Keep its exact decoded
+/// tree charged through IPC, including the separately cloned diagnostics.
+pub(crate) struct SnapshotResponse {
+    snapshot: Snapshot,
+    _read_credit: Option<crate::case_work_budget::Lease>,
+    _diagnostic_credit: Option<crate::case_work_budget::Lease>,
+}
+impl serde::Serialize for SnapshotResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.snapshot.serialize(serializer)
+    }
+}
+const SNAPSHOT_NOT_READY: &str = "CASE_CONTEXT_NOT_READY: A configuração preservada não pode atravessar o transporte numérico do navegador sem perda. Os valores originais permanecem preservados.";
+fn snapshot_response(root: &std::path::Path, case_id: &str) -> Result<SnapshotResponse, String> {
+    let conn = crate::case_store::context_connection(root)?;
+    let (snapshot, credit) = analysis_context::read_snapshot_leased(&conn, case_id)?;
+    let mut response = SnapshotResponse { snapshot, _read_credit: credit, _diagnostic_credit: None };
+    crate::case_evidence::snapshot_transport_safe(&response.snapshot).map_err(|_| SNAPSHOT_NOT_READY)?;
+    // The bounded 4 MiB context can carry diagnostic strings and entries that
+    // the runtime cache clones. Reserve before that allocation is made.
+    response._diagnostic_credit = Some(crate::case_cache::reserve_work(crate::case_work_budget::global(), 16 << 20)?);
+    response.snapshot = crate::analysis_runtime::with_diagnostics(response.snapshot)?;
+    crate::case_evidence::snapshot_transport_safe(&response.snapshot).map_err(|_| SNAPSHOT_NOT_READY)?;
+    crate::operations::check()?;
+    Ok(response)
+}
 #[tauri::command]
-pub(crate) async fn analysis_context_snapshot(case_id: String) -> Result<Snapshot, String> {
-    crate::offload(move || {
-        crate::analysis_runtime::with_diagnostics(analysis_context::snapshot(&case_id)?)
-    })
-    .await?
+pub(crate) async fn analysis_context_snapshot(case_id: String) -> Result<SnapshotResponse, String> {
+    crate::offload(move || snapshot_response(&crate::config_dir(), &case_id)).await?
 }
 
+const BULK_NATIVE_UNSUPPORTED: &str = "CASE_CONTEXT_TYPED_EDIT_REQUIRED: Use os editores de campos derivados e referências para alterar a configuração deste Caso preservado.";
+fn update_context_from_browser_at(
+    root: &std::path::Path,
+    expected: &Identity,
+    config: Config,
+) -> Result<MutationReceipt, String> {
+    // Config's legacy Value decoder has already run at the IPC boundary. None
+    // of those caller values may replace a protected native configuration.
+    if crate::case_evidence::native_owner(root, expected)? {
+        return Err(BULK_NATIVE_UNSUPPORTED.into());
+    }
+    current_for_edit(expected)?;
+    validate_config(&config)?;
+    let _prepared = prepare_config(expected, &config)?;
+    crate::operations::check()?;
+    let snapshot = analysis_context::update_legacy_browser_at(root, expected, config)?;
+    crate::operations::commit();
+    Ok(MutationReceipt {
+        analysis_context: snapshot,
+    })
+}
 #[tauri::command]
 pub(crate) async fn analysis_context_update(
     analysis_context: Identity,
@@ -186,15 +230,7 @@ pub(crate) async fn analysis_context_update(
     operation_id: Option<String>,
 ) -> Result<MutationReceipt, String> {
     crate::offload_operation(operation_id, move || {
-        current_for_edit(&analysis_context)?;
-        validate_config(&config)?;
-        let _prepared = prepare_config(&analysis_context, &config)?;
-        crate::operations::check()?;
-        let snapshot = analysis_context::update(&analysis_context, config)?;
-        crate::operations::commit();
-        Ok(MutationReceipt {
-            analysis_context: snapshot,
-        })
+        update_context_from_browser_at(&crate::config_dir(), &analysis_context, config)
     })
     .await?
 }
@@ -266,4 +302,89 @@ mod tests {
         .unwrap();
         assert!(replace_definition(&config, "bad", "message", vec![bad], None).is_err());
     }
+    fn native_snapshot_fixture(raw: Option<Value>) -> (tempfile::TempDir, Snapshot) {
+        let root = tempfile::tempdir().unwrap();
+        let conn = crate::case_store::connect(root.path()).unwrap();
+        conn.execute_batch("INSERT INTO metadata VALUES('revision','1');INSERT INTO metadata VALUES('case-analysis-v1','1');INSERT INTO cases VALUES('snapshot-case','{\"id\":\"snapshot-case\"}',0);CREATE TABLE native_evidence_cases(case_id TEXT PRIMARY KEY,analysis_id TEXT NOT NULL);").unwrap();
+        let mut snapshot = analysis_context::prepare_new_case("snapshot-case").unwrap();
+        snapshot.legacy_raw = raw;
+        conn.execute("INSERT INTO case_analysis VALUES(?1,?2)",rusqlite::params![snapshot.case_id,serde_json::to_string(&snapshot).unwrap()]).unwrap();
+        conn.execute("INSERT INTO native_evidence_cases VALUES(?1,?2)",rusqlite::params![snapshot.case_id,snapshot.analysis_id]).unwrap();
+        drop(conn);
+        (root,snapshot)
+    }
+    #[test]
+    fn browser_snapshot_keeps_exact_decode_credit_through_serialization() {
+        let (root, snapshot) = native_snapshot_fixture(Some(json!({"fraction":1.25})));
+        let before = crate::case_work_budget::global().used();
+        let response = snapshot_response(root.path(), &snapshot.case_id).unwrap();
+        assert!(response._read_credit.as_ref().is_some_and(|credit| credit.bytes() > 0));
+        assert!(crate::case_work_budget::global().used() > before);
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["legacyRaw"]["fraction"].as_f64(),Some(1.25));
+        assert!(json.get("_readCredit").is_none());
+        assert!(crate::case_work_budget::global().used() > before);
+        drop(response); assert_eq!(crate::case_work_budget::global().used(),before);
+    }
+    #[test]
+    fn browser_snapshot_refuses_unsafe_number_variants_without_rewriting_storage() {
+        for raw in [json!(u64::MAX),json!(1.0),json!(-0.0)] {
+            let (root, snapshot) = native_snapshot_fixture(Some(raw));
+            let before = crate::case_work_budget::global().used();
+            let error = snapshot_response(root.path(), &snapshot.case_id).err().unwrap();
+            assert!(error.starts_with("CASE_CONTEXT_NOT_READY"));
+            assert_eq!(crate::case_work_budget::global().used(),before);
+            let conn=rusqlite::Connection::open(root.path().join("investigations.sqlite3")).unwrap();
+            let stored:String=conn.query_row("SELECT body FROM case_analysis WHERE case_id=?1",[&snapshot.case_id],|row|row.get(0)).unwrap();
+            assert_eq!(stored,serde_json::to_string(&snapshot).unwrap());
+        }
+    }
+    #[test]
+    fn bulk_browser_configuration_refuses_native_owner_before_compilation_or_mutation() {
+        let (root, snapshot) = native_snapshot_fixture(Some(json!({"wide":u64::MAX,"float":1.0})));
+        let conn = rusqlite::Connection::open(root.path().join("investigations.sqlite3")).unwrap();
+        let before: String = conn
+            .query_row(
+                "SELECT body FROM case_analysis WHERE case_id=?1",
+                [&snapshot.case_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let revision: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='revision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Invalid regex would fail during compilation if the protected-owner
+        // refusal were accidentally moved below the legacy Value path.
+        let replacement = Config {
+            derived_fields: vec![
+                json!({"name":"bad","source":"message","rules":[{"pattern":"("}]}),
+            ],
+            references: vec![],
+        };
+        let error = update_context_from_browser_at(root.path(), &snapshot.identity(), replacement)
+            .err()
+            .unwrap();
+        assert_eq!(error, BULK_NATIVE_UNSUPPORTED);
+        let after: String = conn
+            .query_row(
+                "SELECT body FROM case_analysis WHERE case_id=?1",
+                [&snapshot.case_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after_revision: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='revision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(revision, after_revision);
+    }
+
 }

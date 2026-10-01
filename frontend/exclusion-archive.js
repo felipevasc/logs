@@ -118,7 +118,7 @@ window.ExclusionArchive = (() => {
     try { window.AnalysisContexts.assertOwner(owner); } catch { toast("O contexto mudou. Abra a seleção novamente.", "info"); return; }
     if (!scope || scope.kind === "selected" && (!Array.isArray(scope.ids) || !scope.ids.every(count)) || scope.kind === "filtered" && !Array.isArray(scope.filters) || !["selected", "filtered"].includes(scope.kind)) { toast("Seleção inválida para arquivamento.", "err"); return; }
     const draft = start("preview", owner, anchor); draft.selection = clone(scope); draft.previewToken = null; draft.selectedMembers = null;
-    if (draft.scope === "case") { draft.caseEvents = caseEvents(); draft.caseSignature = caseSig(); }
+    if (draft.scope === "case") { draft.caseEvents = caseEvents("analysis"); draft.caseSignature = caseSig(); }
     node("label").value = ""; node("reason").value = ""; node("commit").disabled = true;
     node("preview-count").textContent = "Preparando a quantidade exata…";
     node("selection").textContent = scope.kind === "selected" ? `Seleção capturada: ${fmtNum(scope.ids.length)} registro(s).`
@@ -222,7 +222,7 @@ window.ExclusionArchive = (() => {
   async function loadMembers(draft, batchId, page = 0) {
     if (!draft || draft.busy) return;
     if (draft.batch?.id !== batchId) { draft.memberCursors = [null]; page = 0; node("members").hidden = true; }
-    const evidence = draft.scope === "case" ? { signature: caseSig(), rows: caseEvents() } : null;
+    const evidence = draft.scope === "case" ? { signature: caseSig(), rows: caseEvents("analysis") } : null;
     const checkEvidence = () => { if (evidence && evidence.signature !== caseSig()) throw Error("Os registros disponíveis do Caso mudaram. Atualize esta página do arquivo."); };
     const request = ++serial; draft.selected.clear(); setBusy(draft, true); status("Carregando registros arquivados…");
     try {

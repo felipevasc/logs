@@ -6,7 +6,7 @@ use tauri::{AppHandle, Manager};
 
 struct Admission {
     admitted: Arc<analysis_runtime::Admitted>,
-    events: Option<Arc<Vec<Event>>>,
+    events: Option<Arc<crate::case_cache::Records>>,
 }
 
 fn require_synchronized_evidence(events: &Option<serde_json::Value>) -> Result<(), String> {
@@ -229,7 +229,7 @@ mod tests {
             let Admission { admitted, events } = capture;
             analysis_runtime::with(Some(admitted.clone()), || {
                 admitted.validate(&self.state)?;
-                let events = admitted.prepare_visibility_record(events.as_deref().map(Vec::as_slice), id, Some(event_ref))?;
+                let events = admitted.prepare_visibility_record(events.as_deref().map(crate::case_cache::Records::as_slice), id, Some(event_ref))?;
                 let result = detail_in_admission(&self.state, &admitted, id, Some(event_ref), events)?;
                 admitted.validate_visibility()?;
                 Ok(result)
@@ -245,7 +245,7 @@ mod tests {
             let Admission { admitted, events } = capture;
             analysis_runtime::with(Some(admitted.clone()), || {
                 admitted.validate(&self.state)?;
-                let events = admitted.prepare_visibility_record(events.as_deref().map(Vec::as_slice), id, Some(event_ref))?;
+                let events = admitted.prepare_visibility_record(events.as_deref().map(crate::case_cache::Records::as_slice), id, Some(event_ref))?;
                 java_trace_in_admission(&self.state, &admitted, id, event_ref, events)
             })
         }
@@ -303,7 +303,7 @@ mod tests {
         fixture.replace_raw(JAVA);
         let Admission { admitted, events } = fixture.capture().unwrap();
         analysis_runtime::with(Some(admitted.clone()), || {
-            let prepared = admitted.prepare_visibility_record(events.as_deref().map(Vec::as_slice), 7, Some(&fixture.event.event_ref)).unwrap();
+            let prepared = admitted.prepare_visibility_record(events.as_deref().map(crate::case_cache::Records::as_slice), 7, Some(&fixture.event.event_ref)).unwrap();
             let current = analysis_context::snapshot("detail-case").unwrap();
             analysis_context::update(&current.identity(), current.config).unwrap();
             assert!(java_trace_in_admission(&fixture.state, &admitted, 7, &fixture.event.event_ref, prepared).is_err());
@@ -357,7 +357,7 @@ mod tests {
         let Admission { admitted, events } = fixture.capture().unwrap();
         analysis_runtime::with(Some(admitted.clone()), || {
             admitted.validate(&fixture.state).unwrap();
-            let prepared = admitted.prepare_visibility_record(events.as_deref().map(Vec::as_slice), 7, Some(&fixture.event.event_ref)).unwrap();
+            let prepared = admitted.prepare_visibility_record(events.as_deref().map(crate::case_cache::Records::as_slice), 7, Some(&fixture.event.event_ref)).unwrap();
             let current = analysis_context::snapshot("detail-case").unwrap();
             analysis_context::update(&current.identity(), current.config).unwrap();
             assert!(detail_in_admission(&fixture.state, &admitted, 7, Some(&fixture.event.event_ref), prepared).is_err());

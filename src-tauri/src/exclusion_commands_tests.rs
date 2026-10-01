@@ -9,6 +9,28 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn batch_summary_keeps_decoded_metadata_credit_through_serialization() {
+    let fixture = Fixture::new();
+    let receipt = fixture.exclude(&[0]);
+    let mut batches = fixture.batches();
+    assert_eq!(batches.len(), 1);
+    let batch = batches.pop().unwrap();
+    assert_eq!(batch.id, receipt.batch_id);
+    let expected_scope = serde_json::to_string(&batch.scope).unwrap();
+    let pool = crate::case_work_budget::global();
+    let before = pool.used();
+    let summary = BatchSummary::from(batch);
+    assert_eq!(pool.used(), before);
+    let wire = serde_json::to_value(&summary).unwrap();
+    assert!(wire.get("_credit").is_none());
+    assert_eq!(serde_json::to_string(&wire["scope"]).unwrap(), expected_scope);
+    assert_eq!(pool.used(), before);
+    let owned = summary._credit.bytes();
+    drop(summary);
+    assert_eq!(pool.used(), before - owned);
+}
+
 struct Fixture {
     state: AppState,
     originals: Vec<Event>,
@@ -189,7 +211,7 @@ impl Fixture {
         .unwrap()
     }
 
-    fn batches(&self) -> Vec<exclusion_store::BatchInfo> {
+    fn batches(&self) -> Vec<exclusion_store::RetainedBatchInfo> {
         exclusion_store::list(self.dir.path(), &self.identity(), None, 100).unwrap()
     }
 
