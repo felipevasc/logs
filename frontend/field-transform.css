@@ -1,5 +1,6 @@
 .field-transform-modal{width:min(760px,calc(100vw - 36px));max-height:90vh}
 .field-transform-modal .modal-body{overflow:auto;max-height:calc(90vh - 64px)}
+.field-transform-modal .code-pane{color:var(--text-0);background:var(--code-bg);user-select:text;overflow:auto}
 .ft-inputs{display:grid;grid-template-columns:1fr 1fr;gap:14px;min-width:0}
 .ft-inputs .fld{min-width:0}.ft-inputs pre{max-height:112px;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px}
 #ft-sample{width:100%;min-height:100px;max-height:190px;font:11px/1.5 var(--mono,monospace);resize:vertical;overflow-wrap:anywhere}

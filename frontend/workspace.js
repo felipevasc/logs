@@ -97,6 +97,9 @@
       // when returning from Summary even when the current rows are already cached.
       renderExploreTree();
       if (lastExploredKey === contextKey && state.rows?.length > 0 && !state.queryError) {
+        // Restoring an area's preferences clears its Timeline runtime even when
+        // source reopening already populated these rows and their summary.
+        showExplorerAnalytics(loadExplorerAnalytics(explorerKey(), workspaceScope(), backendFilters()));
         switchTab(state.activeDatasetTab, { deferAnalytics: false });
         return;
       }

@@ -354,6 +354,41 @@ test('capture and restore preserve grouping preferences, sanitize input and neve
   assert.deepEqual(plain(restored.timeline.capture()), { field: null, limit: 12, hidden: ['total'] });
 });
 
+test('cached Explore navigation redraws restored Timeline preferences without querying rows or statistics again', async () => {
+  const workspace = readFileSync(new URL('../../frontend/workspace.js', import.meta.url), 'utf8');
+  const showPage = workspace.slice(workspace.indexOf('  async function showPage('), workspace.indexOf('  async function getOverview('));
+  for (const status of ['done', 'paused']) {
+    const f = fixture(), entry = f.summary(status), summaries = [], tabs = [];
+    // Source reopening has already populated rows and the matching summary before
+    // WorkspaceContext applies the persisted per-area preferences during startup.
+    f.timeline.restore({ field: 'message', limit: 24, hidden: ['total'] });
+    Object.assign(f.context, {
+      navigation: 0, page: 'summary', lastExploredKey: 'loaded-source', home: {}, STRUCTURE: new Set(),
+      activeCase: () => ({ id: 'case-a' }), sourceKey: () => 'loaded-source',
+      markPage: page => { f.context.page = page; }, closeDrawer() {}, switchView() {}, renderExploreTree() {},
+      switchTab: (...args) => tabs.push(args), refresh: () => { throw Error('Cached rows must not be queried again'); },
+      loadExplorerAnalytics: (key, scope, filters) => { summaries.push({ key, scope, filters }); return entry; },
+      showExplorerAnalytics: value => f.timeline.summary(value),
+    });
+    vm.runInContext(showPage, f.context);
+    await f.context.showPage('explore'); await settle();
+    assert.equal(summaries.length, 1, 'returning to cached rows must also restore their matching summary');
+    assert.equal(tabs.length, 1);
+    assert.equal(f.timeline.capture().field, 'message');
+    assert.equal(f.plot.options.series[1].show, false, 'saved local visibility is restored');
+    if (status === 'paused') {
+      assert.equal(f.requests.length, 0, 'returning does not resume paused work');
+      assert.match(f.find('explorer-timeline-note').textContent, /pausado/);
+    } else {
+      assert.equal(f.requests.length, 1);
+      assert.equal(f.requests[0].args.field, 'message');
+      assert.equal(f.requests[0].args.limit, 24);
+      f.requests[0].resolve(f.response()); await settle();
+      assert.match(f.find('explorer-timeline-note').textContent, /grupos de maior volume/);
+    }
+  }
+});
+
 test('stale context menu actions never select a field or add filters', async () => {
   const f = fixture(); f.timeline.render(sparseStats());
   const item = f.timeline.menuItem('source');
