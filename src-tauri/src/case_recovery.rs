@@ -20,7 +20,9 @@ use std::{
 
 #[path = "case_recovery_restore.rs"]
 mod restore;
-pub(crate) use restore::{reconcile_restore, restore_current, restore_fresh, RestoreReceipt};
+pub(crate) use restore::{restore_fresh, RestoreReceipt};
+#[cfg(test)]
+use restore::restore_current;
 #[path = "case_profiles.rs"]
 pub(crate) mod profiles;
 

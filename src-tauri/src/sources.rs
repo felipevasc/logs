@@ -1752,7 +1752,7 @@ pub struct CompiledDerived {
     pub source: String,
     pub rules: Vec<CompiledRule>,
     pub steps: Vec<crate::field_transform::Step>,
-    pub lookup: Option<crate::reference_lookup::Compiled>,
+    pub(crate) lookup: Option<crate::reference_lookup::Compiled>,
 }
 
 /// Aplica os campos derivados a um evento. As regras de cada campo são

@@ -2,7 +2,7 @@
 //! investigation transaction. No frontend record representation is accepted.
 use super::*;
 use crate::{analysis_context::Snapshot, case_work_budget::Lease};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Transaction};
 use sha2::{Digest, Sha256};
 use std::{
     io::Write,
@@ -671,6 +671,7 @@ fn prepare_case_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use serde_json::json;
 
     #[test]

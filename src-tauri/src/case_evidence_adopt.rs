@@ -2,8 +2,7 @@
 //! preparation; a single immediate transaction installs the native boundary.
 use super::*;
 use crate::{case_recovery::VerifiedRecovery, case_work_budget::Lease};
-use rusqlite::{params, Connection, OptionalExtension};
-use sha2::{Digest, Sha256};
+use rusqlite::{params, Connection};
 use std::path::Path;
 const INVALID:&str="CASE_EVIDENCE_ADOPTION_CHANGED: A investigação mudou depois da recuperação; prepare uma nova recuperação antes de adotar.";
 

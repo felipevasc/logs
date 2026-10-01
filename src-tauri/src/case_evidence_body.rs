@@ -1,6 +1,5 @@
 //! Incremental compatibility-body I/O. This keeps the existing TEXT column
 //! readable by older binaries; native immutable envelopes remain authoritative.
-use super::*;
 use crate::case_work_budget::Lease;
 use rusqlite::{params, Connection, DatabaseName, Transaction};
 use sha2::{Digest, Sha256};
@@ -256,6 +255,7 @@ fn write_mirror_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::*;
     fn protected(root: &Path, request: &NativeCaseOpen) -> Connection {
         let mut conn = Connection::open(root.join("investigations.sqlite3")).unwrap();
         let owner = EvidenceOwner {

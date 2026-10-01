@@ -12,7 +12,6 @@ mod typed;
 pub(crate) use typed::{
     deserialize_value as native_deserialize_value,
     deserialize_values as native_deserialize_values,
-    deserialize_snapshot as native_deserialize_snapshot,
     deserialize_snapshots as native_deserialize_snapshots,
     snapshot_from_value as native_snapshot_from_value,
 };
@@ -36,17 +35,17 @@ pub(crate) use db::{
 mod authority;
 pub(crate) use authority::{
     native_owner, open_case, open_history, open_reference, require_legacy_store,
-    validate_case_authority, validate_view_stamp, CaseAuthorityLease, ReferenceAuthorityLease,
+    validate_view_stamp, CaseAuthorityLease, ReferenceAuthorityLease,
 };
 #[path = "case_evidence_adoption_gate.rs"]
 mod adoption_gate;
-pub(crate) use adoption_gate::{adoption_preparation, AdoptionPreparation};
+pub(crate) use adoption_gate::adoption_preparation;
 #[path = "case_evidence_bootstrap.rs"]
 mod bootstrap;
-pub(crate) use bootstrap::{bootstrap, BootstrapReceipt};
+pub(crate) use bootstrap::bootstrap;
 #[path = "case_evidence_adopt.rs"]
 mod adopt;
-pub(crate) use adopt::{adopt, PublishedAdoption};
+pub(crate) use adopt::adopt;
 #[path = "case_evidence_anchor_store.rs"]
 mod anchor_store;
 #[path = "case_evidence_assemble.rs"]
@@ -57,7 +56,7 @@ mod body;
 mod prepared_case;
 pub(crate) use prepared_case::{
     prepare_import_case, prepare_import_case_with_transfer, snapshot_transport_safe,
-    CommittedCaseView, PortableCaseMap, PortableContainerMap, PortableMemberMap, PreparedCase,
+    PortableCaseMap, PortableContainerMap, PortableMemberMap, PreparedCase,
 };
 #[path = "case_evidence_receipts.rs"]
 mod receipts;
@@ -73,7 +72,7 @@ pub(crate) use commit::{
 };
 #[path = "case_evidence_export.rs"]
 mod export;
-pub(crate) use export::{capture_export, capture_transfer_map, ExportCapture, ExportCase};
+pub(crate) use export::{capture_export, capture_transfer_map, ExportCapture};
 #[path = "case_evidence_prepare.rs"]
 mod prepare;
 pub(crate) use prepare::{discard_prepared, prepare_capture, prepare_membership};
@@ -81,23 +80,22 @@ pub(crate) use prepare::{discard_prepared, prepare_capture, prepare_membership};
 #[path = "case_evidence_storage.rs"]
 mod storage;
 pub(crate) use storage::{
-    clear_cached_readers, stage_records, PreparedContainer, RecordSink, VerifiedBatch,
+    stage_records, PreparedContainer, RecordSink,
     VerifiedContainer, Visit,
 };
 #[path = "case_evidence_decode.rs"]
 mod decode;
 pub(crate) use decode::{
     materialize_event, materialize_value, metadata_transport_safe, parse_exact_value,
-    parse_view_document, preflight_envelope, preflight_value, ExactValue, RecordPlan,
+    parse_view_document, preflight_envelope, preflight_value, RecordPlan,
 };
 #[path = "case_evidence_document.rs"]
 mod document;
 pub(crate) use document::{
-    extract_case, ContainerLocation, ExtractedCase, RawContainer, VerifiedCase,
+    extract_case, ContainerLocation, VerifiedCase,
 };
 
 pub(crate) const SCHEMA_VERSION: u32 = 1;
-pub(crate) const CAPTURE_SOURCE_BYTES: usize = 2 << 20;
 pub(crate) const EVENT_OWNED_BYTES: usize = 4 << 20;
 pub(crate) const ENVELOPE_BYTES: usize = 8 << 20;
 pub(crate) const CAPTURE_RECORDS: usize = 10_000;
@@ -108,7 +106,6 @@ pub(crate) const MANIFEST_MEMBERS: usize = 100_000;
 pub(crate) const MANIFEST_BYTES: u64 = 8 << 20;
 pub(crate) const PREVIEW_ROWS: u16 = 16;
 pub(crate) const PREVIEW_COLUMNS: usize = 8;
-pub(crate) const PREVIEW_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

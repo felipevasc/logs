@@ -936,10 +936,6 @@ async fn list_derived_fields(analysis_context: Option<analysis_context::Identity
     offload(move || analysis_commands::list_definitions(&analysis_commands::expected_identity(analysis_context)?)).await?
 }
 
-pub(crate) fn list_derived_fields_impl(_state: &AppState) -> Result<Vec<sources::DerivedField>, String> {
-    analysis_commands::list_definitions(&analysis_commands::expected_identity(None)?)
-}
-
 #[tauri::command]
 async fn save_derived_field(
     name: String, source: String, rules: Vec<sources::DerivedRule>,
@@ -948,17 +944,9 @@ async fn save_derived_field(
     offload(move || analysis_commands::save_definition(&analysis_commands::expected_identity(analysis_context)?, &name, &source, rules, steps)).await?
 }
 
-pub(crate) fn save_derived_field_impl(_state: &AppState, name: &str, source: &str, rules: Vec<sources::DerivedRule>) -> Result<(), String> {
-    analysis_commands::save_definition(&analysis_commands::expected_identity(None)?, name, source, rules, None).map(|_| ())
-}
-
 #[tauri::command]
 async fn delete_derived_field(name: String, analysis_context: Option<analysis_context::Identity>) -> Result<analysis_commands::MutationReceipt, String> {
     offload(move || analysis_commands::delete_definition(&analysis_commands::expected_identity(analysis_context)?, &name)).await?
-}
-
-pub(crate) fn delete_derived_field_impl(_state: &AppState, name: &str) -> Result<(), String> {
-    analysis_commands::delete_definition(&analysis_commands::expected_identity(None)?, name).map(|_| ())
 }
 
 #[tauri::command]
