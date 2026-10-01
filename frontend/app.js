@@ -582,17 +582,28 @@ function activityHide() {
 }
 
 // Case records travel once per version; commands then refer to them by key.
-const caseTransport = { keys: new WeakMap(), synced: new Set(), serial: 0 };
-async function caseArgs(args, resync = false) {
+const caseTransport = { keys: new WeakMap(), synced: new Map(), pending: new Map(), serial: 0, publication: 0 };
+const caseSyncKey = (key, args) => JSON.stringify([key, args.analysisContext?.caseId ?? null, args.analysisContext?.analysisId ?? null]);
+async function caseArgs(args, resync = false, previousPublication = null) {
   const events = args.caseEvents;
   if (!Array.isArray(events)) return args;
   let key = caseTransport.keys.get(events);
   if (!key) { key = `case-${++caseTransport.serial}-${events.length}`; caseTransport.keys.set(events, key); }
-  const syncKey = JSON.stringify([key, args.analysisContext?.caseId ?? null, args.analysisContext?.analysisId ?? null]);
-  if (resync || !caseTransport.synced.has(syncKey)) {
-    await invoke("case_sync", { key, events, analysisContext: args.analysisContext ?? null, sourceGeneration: args.sourceGeneration ?? null });
-    caseTransport.synced.add(syncKey);
-    if (caseTransport.synced.size > 3) caseTransport.synced.delete(caseTransport.synced.values().next().value);
+  const syncKey = caseSyncKey(key, args);
+  const force = resync && (previousPublication === null || caseTransport.synced.get(syncKey) === previousPublication);
+  if (force || !caseTransport.synced.has(syncKey)) {
+    let pending = caseTransport.pending.get(syncKey);
+    if (!pending) {
+      pending = Promise.resolve().then(async () => {
+        await invoke("case_sync", { key, events, analysisContext: args.analysisContext ?? null, sourceGeneration: args.sourceGeneration ?? null });
+        caseTransport.synced.set(syncKey, ++caseTransport.publication);
+        if (caseTransport.synced.size > 3) caseTransport.synced.delete(caseTransport.synced.keys().next().value);
+      }).finally(() => {
+        if (caseTransport.pending.get(syncKey) === pending) caseTransport.pending.delete(syncKey);
+      });
+      caseTransport.pending.set(syncKey, pending);
+    }
+    await pending;
   }
   const { caseEvents: _omit, ...rest } = args;
   return { ...rest, caseKey: key };
@@ -608,9 +619,11 @@ async function api(cmd, args = {}, opts = {}) {
     if (args.filters?.length) await invoke("validate_filters", { filters: args.filters });
     if (opts.cancelled?.()) throw new Error("Operação cancelada.");
     if (/^(load_|clear_|set_|save_|delete_|harvest_)/.test(cmd)) { state.explorerCache = null; state.datasetRevision++; explorerAnalytics.clear(); }
+    let casePublication = null;
     const preparedArgs = async (retry = false) => {
       const capturedArgs = retry && !Array.isArray(args.caseEvents) && Array.isArray(opts.caseEvents) ? { ...args, caseEvents: opts.caseEvents } : args;
-      const prepared = await caseArgs(capturedArgs, retry);
+      const prepared = await caseArgs(capturedArgs, retry, casePublication);
+      if (prepared.caseKey) casePublication = caseTransport.synced.get(caseSyncKey(prepared.caseKey, prepared)) ?? null;
       if (opts.cancelled?.()) throw new Error("Operação cancelada.");
       return prepared;
     };
@@ -761,7 +774,7 @@ function cellValue(ev, col) {
     case "message": return ev.message;
     default: {
       const v = ev.fields ? ev.fields[col] : undefined;
-      if (v === undefined || v === null) return "";
+      if (v === undefined) return "";
       return typeof v === "object" ? JSON.stringify(v) : String(v);
     }
   }

@@ -41,6 +41,18 @@ menus.at(-1).find(item=>item.label==='Criar filtro: message').onClick();assert.e
 row.onclick({target:{closest:()=>null}});assert.equal(details.at(-1),7);assert.equal(state.selectedEventRows.get(7),event);
 assert.equal(state.rows[0],event);assert.equal(event.fields.structured.body.length,100000,'Case/export Event data stays intact');
 
+// Dynamic JSON null is the native col_ref text "null", distinct from absence
+// and an explicit empty string. The actual cell menu receives that same value.
+const nullable=Object.freeze({id:10,fields:Object.freeze({explicit_null:null,empty:''})});
+const nullableRow=context.buildEventRow(nullable,['explicit_null','missing','empty']);
+assert.deepEqual(nullableRow.children.map(cell=>cell.textContent),['null','','']);
+nullableRow.children[0].oncontextmenu({preventDefault(){},clientX:1,clientY:1});
+menus.at(-1).find(item=>item.label==='Criar filtro: explicit_null').onClick();assert.equal(preset[1],'null');
+menus.at(-1).find(item=>item.label==='Copiar valor').onClick();assert.equal(copied.at(-1),'null');
+nullableRow.children[1].oncontextmenu({preventDefault(){},clientX:1,clientY:1});
+menus.at(-1).find(item=>item.label==='Criar filtro: missing').onClick();assert.equal(preset[1],'');
+assert.equal(nullable.fields.explicit_null,null);assert.equal(Object.hasOwn(nullable.fields,'missing'),false);
+
 // Redaction still sees the entire value before clipping, including a secret spanning the cut.
 const secret=Object.freeze({id:8,message:'start password="'+'s'.repeat(100000)+'" end',fields:{}});
 const safe=context.buildEventRow(secret,['message']).children[0];

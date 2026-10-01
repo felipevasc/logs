@@ -7,6 +7,10 @@ import {resolve} from 'node:path';
 const output=resolve('output/playwright');mkdirSync(output,{recursive:true});
 const browser=await launchBrowser(),page=await browser.newPage({viewport:{width:1440,height:960},reducedMotion:'reduce'});
 page.setDefaultTimeout(20000);const errors=[],results={};let phase='startup';page.on('pageerror',error=>errors.push(error.message));
+const settled=async()=>{
+  await page.waitForFunction(()=>Number.isFinite(state.total)&&explorerAnalytics.get(explorerKey())?.status==='done'&&document.querySelector('#events-table').getAttribute('aria-busy')==='false');
+  await page.evaluate(()=>settleFilterTabCounts());await page.waitForFunction(()=>Tasks.pending()===0);
+};
 const addStep=async value=>{await page.locator('#ft-step-choice').selectOption(value);await page.locator('#ft-add-step').click();};
 const openHeader=async()=>{await page.locator('#events-table th').filter({hasText:'mock_payload_b64'}).click({button:'right'});await page.getByRole('button',{name:'Transformar campo',exact:true}).click();};
 const readablePreview=async()=>{
@@ -41,10 +45,10 @@ try{
   assert.equal(results.typed.source,results.original);assert.equal(typeof results.typed.parent.allowed,'boolean');assert.equal(typeof results.typed.child,'boolean');
   await page.locator('#btn-colpicker').click();assert.equal(await page.locator('#col-list').getByText('decoded_payload.allowed',{exact:true}).count(),1);await page.locator('#btn-colpicker').click();
   // Real UI wiring against the preview transport; native transform semantics have separate tests.
-  phase='derived child filter and chart';
+  phase='derived child filter and chart';await settled();
   const analysisBefore=await page.evaluate(()=>({owner:AnalysisContexts.capture(),filters:structuredClone(state.filters),quick:state.quick,tab:state.activeDatasetTab,mode:Discovery.mode(),total:state.total,
     sourceRows:state.rows.filter(row=>row.fields?.mock_payload_b64).map(row=>({id:row.id,payload:row.fields.mock_payload_b64}))}));
-  assert.deepEqual(analysisBefore.filters,[]);assert.equal(analysisBefore.quick,'');assert.equal(analysisBefore.sourceRows.length,8,'all eight encoded fixture rows must be visible before filtering');
+  assert.equal(analysisBefore.total,6000);assert.deepEqual(analysisBefore.filters,[]);assert.equal(analysisBefore.quick,'');assert.equal(analysisBefore.sourceRows.length,8,'all eight encoded fixture rows must be visible before filtering');
   const expectedIds=analysisBefore.sourceRows.filter(row=>JSON.parse(Buffer.from(row.payload,'base64').toString()).allowed===true).map(row=>row.id).sort((a,b)=>a-b);
   assert.equal(expectedIds.length,4);
   await page.evaluate(()=>{
@@ -83,6 +87,7 @@ try{
   await page.waitForFunction(total=>state.total===total&&document.querySelector('#events-table').getAttribute('aria-busy')==='false'&&explorerAnalytics.get(explorerKey())?.status==='done',analysisBefore.total);
   assert.deepEqual(await page.evaluate(()=>({filters:state.filters,quick:state.quick,tab:state.activeDatasetTab,mode:Discovery.mode(),owner:AnalysisContexts.capture()})),
     {filters:analysisBefore.filters,quick:analysisBefore.quick,tab:analysisBefore.tab,mode:analysisBefore.mode,owner:analysisBefore.owner});
+  await settled();
   await page.evaluate(()=>{api=window.__fieldAnalysisApi;delete window.__fieldAnalysisApi;delete window.__fieldAnalysisCalls;});
   phase='JWT warning and retry';await openHeader();await page.locator('#ft-sample').fill('eyJhbGciOiJub25lIn0.eyJzdWIiOiJsb2NhbCJ9.');await addStep('jwt_payload');
   assert.ok(await page.locator('#ft-jwt-warning').isVisible());await page.locator('#ft-preview').click();

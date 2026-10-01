@@ -14,5 +14,6 @@
 .explorer-timeline-series small{color:var(--text-2);font-variant-numeric:tabular-nums}
 .explorer-timeline-series.is-hidden .explorer-timeline-series-label{text-decoration:line-through;opacity:.65}
 .explorer-timeline-note{font-size:10px;line-height:15px;overflow-wrap:anywhere}
+.explorer-timeline-legend:empty,.explorer-timeline-note:empty{display:none}
 .hist-panel.explorer-timeline.analytics-placeholder{min-height:32px}
 @media(max-width:850px){.explorer-timeline-heading{flex-wrap:wrap}.explorer-timeline-field{max-width:40vw}.explorer-timeline-legend{max-height:48px}}

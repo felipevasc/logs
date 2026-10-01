@@ -60,6 +60,9 @@ try {
   assert.match(await page.locator('#context-summary').innerText(),/pausado/);
   assert.doesNotMatch(await page.locator('#workbar-label').innerText(),/atualizado/i);
   assert.match(await page.locator('#chart').innerText(),/Timeline pausada/);
+  assert.equal(await page.getByRole('combobox',{name:'Agrupar Timeline por campo',exact:true}).isVisible(),true,'paused summary keeps the explicit field choice available');
+  assert.equal(await page.locator('.explorer-timeline-legend').isVisible(),false,'an empty legend reserves no paused placeholder space');
+  assert.equal(await page.locator('.explorer-timeline-note').isVisible(),false,'an empty note reserves no paused placeholder space');
   assert.ok((await page.locator('.hist-panel').boundingBox()).height<80,'paused empty histogram uses a compact honest placeholder');
   await page.screenshot({path:'output/playwright/summary-paused.png',fullPage:true});
   await page.evaluate(()=>{window.__mockLatency={count_filtered:50,stats_events:50};});
