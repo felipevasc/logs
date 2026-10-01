@@ -562,7 +562,7 @@ mod native_predicate_tests {
         let expected: Vec<_> = times.iter().map(|timestamp| {
             let mut event = crate::model::Event::empty();
             event.timestamp = *timestamp;
-            Some(expression.matches(&event))
+            Some(expression.matches_indexed(&event))
         }).collect();
         assert_eq!(actual, expected, "{expression:?}: {sql}");
     }
@@ -608,7 +608,7 @@ mod native_predicate_tests {
     }
 
     #[test]
-    fn timestamp_chips_and_event_verification_treat_zero_as_missing_but_ids_do_not() {
+    fn timestamp_chips_and_indexed_verification_treat_zero_as_missing_but_ids_do_not() {
         let (connection, times) = timestamp_connection();
         let schema = Schema::default();
         for (op, value, second) in [("gt", "-1000", None), ("gte", "0", None),
@@ -621,7 +621,7 @@ mod native_predicate_tests {
                 .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
             let expected: Vec<i32> = times.iter().enumerate().filter_map(|(ordinal, timestamp)| {
                 let mut event = crate::model::Event::empty(); event.timestamp = *timestamp;
-                crate::query::matches(&event, &pf).then_some(ordinal as i32)
+                crate::query::matches_indexed(&event, &pf).then_some(ordinal as i32)
             }).collect();
             assert_eq!(actual, expected, "{op} {value}");
             assert!(!actual.contains(&7), "epoch zero is absent for numeric timestamp filters");

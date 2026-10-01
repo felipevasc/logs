@@ -4556,7 +4556,10 @@ const caseTimelineCallbacks = {
   bucket: showBucketPop,
   menu: showCtxMenu,
   notify: message => toast(message, "info"),
-  save: () => { saveCases(); updateAnalysisBadge(); renderAnalysis(); },
+  save: () => { const saved = saveCases(); updateAnalysisBadge(); renderAnalysis(); return saved; },
+  removeOccurrences: (c, targets, entryIds, save) => removeCaseOccurrences(c, targets, { entryIds, save }),
+  canUndoRemoval: c => lastCaseRemoval?.c === c && lastCaseRemoval.transaction.canUndo(),
+  undoRemoval: () => undoCaseOccurrenceRemoval(),
   createAt: timestamp => {
     const date = new Date(timestamp);
     $("#mf-start").value = new Date(timestamp - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
@@ -4591,6 +4594,7 @@ function saveManualEvent() {
 // menu de contexto de uma célula de evento
 function eventCellMenu(ev, col, value, anchor = null) {
   ensureSelectionOwner();
+  const removalOwner = window.AnalysisContexts?.capture(), removalSignature = caseSig();
   const exact = window.CanonicalFields.capture(ev, col, { anchor, ...(col === "comentario" ? { historical: true, literal: eventComment(ev) } : {}) });
   const hasVal = value !== undefined && value !== null && String(value).trim() !== "";
   const items = [
@@ -4674,42 +4678,79 @@ function eventCellMenu(ev, col, value, anchor = null) {
       icon: "fa-trash-can",
       label: "Remover este registro do Caso",
       danger: true,
-      onClick: () => removeEventFromCase(ev),
+      onClick: () => removeEventFromCase(ev, { owner: removalOwner, signature: removalSignature, anchor }),
     });
     return caseItems;
   }
   return items;
 }
 
-async function removeEventFromCase(ev) {
-  const c = activeCase();
-  if (!c) return;
-  const key = caseRecordKey(ev, state.currentArtifact?.id, state.currentOrigin);
-  let removed = false;
-  for (let i = (c.items || []).length - 1; i >= 0; i--) {
-    const item = c.items[i];
-    if (item.rows && item.rows.length) {
-      const matchIdx = item.rows.findIndex(r => caseRecordKey(r, item.artifactId, item.origin) === key || r.id === ev.id);
-      if (matchIdx >= 0) {
-        if (item.rows.length === 1) {
-          c.items.splice(i, 1);
-        } else {
-          item.rows.splice(matchIdx, 1);
-          item.includedCount = item.rows.length;
-        }
-        removed = true;
-        break;
-      }
+let lastCaseRemoval = null;
+const caseRemovalPending = new WeakSet();
+function refreshCaseRemoval(c) {
+  if (activeCase() !== c) return;
+  window.WorkspaceContext?.refreshMembership(); updateAnalysisBadge(); renderAnalysis(); filtersChanged();
+}
+async function undoCaseOccurrenceRemoval(record = lastCaseRemoval) {
+  if (!record || record !== lastCaseRemoval || activeCase() !== record.c || record.owner && !window.AnalysisContexts.owns(record.owner)) {
+    toast("O Caso mudou. Reabra o Caso da remoção antes de desfazer.", "info"); return false;
+  }
+  if (caseRemovalPending.has(record.c)) { toast("Aguarde o salvamento da alteração anterior.", "info"); return false; }
+  caseRemovalPending.add(record.c);
+  let restored = false;
+  try {
+    record.transaction.undo(); restored = true;
+    if (await saveCases() === false) { record.transaction.redo(); restored = false; refreshCaseRemoval(record.c); return false; }
+    lastCaseRemoval = null; refreshCaseRemoval(record.c); toast("Remoção desfeita.", "ok"); return true;
+  } catch (error) {
+    if (restored) { try { record.transaction.redo(); } catch (rollbackError) { error = rollbackError; } }
+    refreshCaseRemoval(record.c); toast(String(error), "err"); return false;
+  } finally { caseRemovalPending.delete(record.c); }
+}
+async function removeCaseOccurrences(c, targets, { entryIds = [], save = saveCases, owner = window.AnalysisContexts?.capture() } = {}) {
+  if (activeCase() !== c || owner && !window.AnalysisContexts.isCurrent(owner)) { toast("O Caso mudou. Selecione a ocorrência novamente.", "info"); return false; }
+  if (caseRemovalPending.has(c)) { toast("Aguarde o salvamento da alteração anterior.", "info"); return false; }
+  caseRemovalPending.add(c);
+  try {
+    let transaction;
+    try {
+      transaction = window.CaseRemovals.prepare(c, targets, { entryIds }); transaction.apply();
+      if (await save() === false) { transaction.rollback(); refreshCaseRemoval(c); return false; }
+    } catch (error) {
+      if (transaction) { try { transaction.rollback(); } catch (rollbackError) { error = rollbackError; } }
+      refreshCaseRemoval(c); toast(String(error), "err"); return false;
     }
-  }
-  if (removed) {
-    await saveCases();
-    window.WorkspaceContext?.refreshMembership();
-    filtersChanged();
-    toast("Registro removido do Caso.", "ok");
-  } else {
-    toast("Registro não encontrado no Caso.", "info");
-  }
+    const record = { c, owner, transaction }; lastCaseRemoval = record;
+    refreshCaseRemoval(c);
+    if (activeCase() === c) {
+      const notice = el("div", "toast ok", `${transaction.count} ocorrência(s) removida(s). `), undo = el("button", "btn ghost small", "Desfazer");
+      undo.type = "button"; undo.onclick = async () => { undo.disabled = true; try { if (await undoCaseOccurrenceRemoval(record)) notice.remove(); } finally { undo.disabled = false; } };
+      notice.appendChild(undo); $("#toast-area").appendChild(notice); setTimeout(() => notice.remove(), 15000);
+    }
+    return true;
+  } finally { caseRemovalPending.delete(c); }
+}
+async function removeEventFromCase(ev, { owner = window.AnalysisContexts?.capture(), signature = caseSig(), anchor = null } = {}) {
+  const c = activeCase();
+  const current = () => activeCase() === c && signature === caseSig() && (!owner || window.AnalysisContexts.isCurrent(owner));
+  if (!c || !current()) { toast("O Caso mudou. Selecione a ocorrência novamente.", "info"); return false; }
+  const matches = window.CaseRemovals.resolve(c, ev, { stationId: state.stationAnalyticsId, key: (row, item) => caseRecordKey(row, item.artifactId, item.origin) });
+  if (!matches.length) { toast("Registro não encontrado no Caso.", "info"); return false; }
+  const remove = target => current() ? removeCaseOccurrences(c, [target], { owner }) : (toast("O Caso mudou. Selecione a ocorrência novamente.", "info"), false);
+  if (matches.length === 1) return remove(matches[0]);
+  // A deduplicated analytical row can belong to several preserved occurrences.
+  // Ask which occurrence; never silently select a matching numeric raw ID.
+  const box = anchor?.getBoundingClientRect?.() || { left: 20, bottom: 80 }, pageSize = 20;
+  const show = page => {
+    if (!current()) { toast("O Caso mudou. Selecione a ocorrência novamente.", "info"); return; }
+    const menu = matches.slice(page * pageSize, (page + 1) * pageSize).map(target => ({ icon: "fa-trash-can",
+      label: `Item ${target.itemIndex + 1} · ${String(target.item.label || "Sem título").slice(0, 60)} · ocorrência ${target.index + 1}`,
+      onClick: () => remove(target) }));
+    if (page) menu.push({ icon: "fa-arrow-left", label: "Ocorrências anteriores", onClick: () => show(page - 1) });
+    if ((page + 1) * pageSize < matches.length) menu.push({ icon: "fa-arrow-right", label: "Mais ocorrências", onClick: () => show(page + 1) });
+    showCtxMenu(box.left, box.bottom, menu);
+  };
+  show(0); return false;
 }
 
 function openSendToTrailModal(events) {

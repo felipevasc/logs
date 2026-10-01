@@ -233,6 +233,17 @@ fn value_as_num(column: &str, s: &str) -> Option<f64> {
 }
 
 pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
+    matches_in_domain(ev, pf, false)
+}
+
+/// Line metadata reserves zero for an absent timestamp. Only indexed residual
+/// verification inherits that sentinel; a standalone Event's Some(0) is a
+/// present timestamp and must remain distinct from None in Cases/memory views.
+pub(crate) fn matches_indexed(ev: &Event, pf: &PreparedFilter) -> bool {
+    matches_in_domain(ev, pf, true)
+}
+
+fn matches_in_domain(ev: &Event, pf: &PreparedFilter, indexed: bool) -> bool {
     let f = &pf.f;
     let op = f.op.as_str();
     match op {
@@ -244,7 +255,9 @@ pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
                     .is_some_and(|matcher| matcher.matches(ev))
         }
         // An invalid expression was rejected by validation; never match silently.
-        "query" => return pf.expr.as_ref().is_some_and(|expr| expr.matches(ev)),
+        "query" => return pf.expr.as_ref().is_some_and(|expr| {
+            if indexed { expr.matches_indexed(ev) } else { expr.matches(ev) }
+        }),
         "detection" => {
             return pf
                 .detection
@@ -265,7 +278,8 @@ pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
         };
     }
     if is_numeric_op(op) {
-        return number_matches(pf, ev.col_num(&f.column));
+        let number = ev.col_num(&f.column);
+        return number_matches(pf, number.filter(|value| !indexed || f.column != "timestamp" || *value != 0.0));
     }
     value_matches(pf, ev.col_ref(&f.column).as_deref())
 }
@@ -282,9 +296,6 @@ pub(crate) fn is_numeric_op(op: &str) -> bool {
 /// Numeric operators applied to the column's number (`None` when absent).
 pub(crate) fn number_matches(pf: &PreparedFilter, a: Option<f64>) -> bool {
     let Some(a) = a else { return false };
-    // Zero is the line index's absent-time sentinel. Full-event verification
-    // must not reintroduce it into a numeric timestamp selection.
-    if pf.f.column == "timestamp" && a == 0.0 { return false; }
     match pf.f.op.as_str() {
         "between" => match (pf.num, pf.num2) {
             (Some(lo), Some(hi)) => a >= lo && a <= hi,
@@ -299,6 +310,42 @@ pub(crate) fn number_matches(pf: &PreparedFilter, a: Option<f64>) -> bool {
                 _ => a <= b,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_domain_tests {
+    use super::*;
+
+    #[test]
+    fn preserved_epoch_zero_is_present_but_indexed_numeric_verification_uses_its_sentinel() {
+        for timestamp in [None, Some(-1), Some(0), Some(1)] {
+            let mut event = Event::empty(); event.timestamp = timestamp;
+            let mut indexed_reference = event.clone();
+            indexed_reference.timestamp = timestamp.filter(|value| *value != 0);
+            for op in ["gt", "gte", "lt", "lte", "between"] {
+                let filter = Filter { column: "timestamp".into(), op: op.into(), value: "0".into(), value2: Some("1".into()) };
+                let prepared = prepare(&[filter]);
+                assert_eq!(matches_indexed(&event, &prepared[0]), matches(&indexed_reference, &prepared[0]), "{timestamp:?} {op}");
+                if timestamp == Some(0) && matches!(op, "gte" | "lte" | "between") {
+                    assert!(matches(&event, &prepared[0]), "a preserved epoch value remains queryable");
+                    assert!(!matches_indexed(&event, &prepared[0]));
+                }
+            }
+            for source in ["timestamp>=0", "NOT timestamp>=0", "NOT (NOT timestamp>=0)",
+                "timestamp:0..1 OR code:missing", "timestamp>=0 AND NOT timestamp>1"] {
+                let expression = crate::querylang::compile_rule(source).unwrap();
+                assert_eq!(expression.matches_indexed(&event), expression.matches(&indexed_reference), "{timestamp:?} {source}");
+                let query = prepare(&[Filter { column: "_all".into(), op: "query".into(), value: source.into(), value2: None }]);
+                assert_eq!(matches(&event, &query[0]), expression.matches(&event));
+                assert_eq!(matches_indexed(&event, &query[0]), expression.matches_indexed(&event));
+            }
+        }
+        let object = serde_json::json!({"timestamp":0});
+        assert!(crate::querylang::compile_rule("timestamp>=0").unwrap().matches_object(object.as_object().unwrap()));
+        let zero = Event::empty();
+        let id = prepare(&[Filter { column: "id".into(), op: "gte".into(), value: "0".into(), value2: None }]);
+        assert!(matches(&zero, &id[0]) && matches_indexed(&zero, &id[0]));
     }
 }
 
@@ -972,7 +1019,7 @@ fn scan_indexed_control<T: Send>(
             }
             if need {
                 let ev = event_at(idx, i, codes, system, derived);
-                if pfs.iter().all(|pf| matches(&ev, pf)) {
+                if pfs.iter().all(|pf| matches_indexed(&ev, pf)) {
                     out.push(map(i, meta, Some(ev)));
                 }
             } else {
@@ -1090,13 +1137,13 @@ impl<'a> CandidateVerifier<'a> {
                 Tri::Pass => (),
                 Tri::NeedEvent => {
                     let ev = event.get_or_insert_with(|| event_at(self.idx, id, self.codes, self.system, self.derived));
-                    if !matches(ev, &self.pfs[i]) { return false; }
+                    if !matches_indexed(ev, &self.pfs[i]) { return false; }
                 }
             }
         }
         if !self.verify.is_empty() {
             let ev = event.get_or_insert_with(|| event_at(self.idx, id, self.codes, self.system, self.derived));
-            if !self.verify.iter().all(|&i| matches(ev, &self.pfs[i])) { return false; }
+            if !self.verify.iter().all(|&i| matches_indexed(ev, &self.pfs[i])) { return false; }
         }
         true
     }
@@ -1241,7 +1288,7 @@ fn select_page_lines(
         }
         if !eligible { continue; }
         let mut event = needs_event.then(|| event_at(idx, i, codes, system, derived));
-        if event.as_ref().is_some_and(|event| !pfs.iter().all(|pf| matches(event, pf))) { continue; }
+        if event.as_ref().is_some_and(|event| !pfs.iter().all(|pf| matches_indexed(event, pf))) { continue; }
         total += 1;
         let key = match sort_column {
             "" | "id" => RecoveryKey::Integer(i as i64),

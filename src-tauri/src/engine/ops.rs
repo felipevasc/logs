@@ -204,7 +204,7 @@ fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexFi
     for id in candidates {
         crate::operations::check()?;
         if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
-        if crate::query::matches(&src.event(id), filter) { confirmed.push(id); }
+        if crate::query::matches_indexed(&src.event(id), filter) { confirmed.push(id); }
     }
     let selected = selection(session, &confirmed)?;
     session.cache_selection(key, Arc::clone(&selected));
@@ -2361,7 +2361,7 @@ fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) ->
         if let Some(id) = selected.single_id.filter(|&id| gate.as_ref().is_none_or(|gate| gate.allows_known_row(id))) {
             crate::operations::check()?;
             let event = src.event(id);
-            if pfs.iter().all(|pf| crate::query::matches(&event, pf)) {
+            if pfs.iter().all(|pf| crate::query::matches_indexed(&event, pf)) {
                 ids.push(id);
             }
         }
@@ -2450,7 +2450,7 @@ fn select_page(
                 crate::operations::check()?;
                 if !exact {
                     let event = src.event(candidate.0);
-                    if !pfs.iter().all(|pf| crate::query::matches(&event, pf)) { continue; }
+                    if !pfs.iter().all(|pf| crate::query::matches_indexed(&event, pf)) { continue; }
                 }
                 if skip_matches > 0 { skip_matches -= 1; continue; }
                 found.push(candidate);

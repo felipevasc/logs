@@ -50,7 +50,11 @@ try {
   assert.equal(await page.locator('.java-trace-node').count(), Math.min(8, complete.detail.trace.nodes.length));
   assert.equal(await page.locator('.java-trace-frame').count(), 0);
   const frameNodeIndex = complete.detail.trace.nodes.findIndex(node => node.frameCount > 20), node = page.locator(`.java-trace-node[data-node="${frameNodeIndex}"]`);
-  await node.locator('summary').click(); assert.equal(await node.locator('.java-trace-frame').count(), 20);
+  await node.locator('summary').click();
+  // HTML details dispatches toggle in a queued task. Wait for the exact lazy
+  // batch, then keep the strict count check; clicking alone is not completion.
+  await page.waitForFunction(index => document.querySelector(`.java-trace-node[data-node="${index}"]`)?.querySelectorAll('.java-trace-frame').length === 20, frameNodeIndex);
+  assert.equal(await node.locator('.java-trace-frame').count(), 20);
   assert.match(await node.locator('.java-trace-count').textContent(), new RegExp(`20 de ${complete.detail.trace.nodes[frameNodeIndex].frameCount} frames`));
   await node.getByRole('button', { name: 'Mostrar mais frames', exact: true }).click();
   assert.equal(await node.locator('.java-trace-frame').count(), Math.min(40, complete.detail.trace.nodes[frameNodeIndex].frameCount));
@@ -103,6 +107,8 @@ try {
   assert.ok(await page.locator('.java-trace-diagnostics li').count() > 0);
   assert.equal(await page.locator('.java-trace-scalar-value[data-column="java.root_cause.class"],.java-trace-scalar-value[data-column="java.trace.fingerprint"]').count(), 0);
   for (const summary of await page.locator('.java-trace-node-title').all()) await summary.click();
+  await page.waitForFunction(expected => [...document.querySelectorAll('.java-trace-node')].every((node, index) =>
+    node.open && node.querySelectorAll('.java-trace-frame').length === Math.min(20, expected[index])), incomplete.detail.trace.nodes.map(node => node.frameCount));
   await page.setViewportSize({ width: 1024, height: 768 }); await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   await page.screenshot({ path: resolve(output, 'java-trace-incomplete-light-1024.png') });

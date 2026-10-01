@@ -760,6 +760,7 @@ pub(crate) fn any_value(ev: &Event, test: &dyn Fn(&str) -> bool) -> bool {
 pub struct Ctx<'a> {
     pub ev: &'a Event,
     object_only: bool,
+    indexed_time: bool,
     fields: std::cell::OnceCell<[Option<Cow<'a, str>>; 19]>,
     fallbacks: [std::cell::OnceCell<Option<Cow<'a, str>>>; 19],
     action: std::cell::OnceCell<(Option<&'static str>, Option<&'static str>)>,
@@ -771,6 +772,7 @@ impl<'a> Ctx<'a> {
         Ctx {
             ev,
             object_only: false,
+            indexed_time: false,
             fields: std::cell::OnceCell::new(),
             fallbacks: Default::default(),
             action: std::cell::OnceCell::new(),
@@ -845,9 +847,9 @@ impl<'a> Ctx<'a> {
     }
     fn number(&self, field: &Field) -> Option<f64> {
         if field.name == "timestamp" && !self.object_only {
-            // Line metadata reserves zero for an absent timestamp. Event
-            // verification must use the same numeric predicate semantics.
-            return self.ev.timestamp.filter(|t| *t != 0).map(|t| t as f64);
+            // Only verification against compact line metadata uses its zero
+            // sentinel. A preserved Event/Case can distinguish Some(0)/None.
+            return self.ev.timestamp.filter(|t| !self.indexed_time || *t != 0).map(|t| t as f64);
         }
         crate::model::text_number(&self.field(field)?)
     }
@@ -1103,6 +1105,12 @@ impl Expr {
     }
     pub fn matches(&self, ev: &Event) -> bool {
         self.matches_ctx(&Ctx::new(ev))
+    }
+
+    pub(crate) fn matches_indexed(&self, ev: &Event) -> bool {
+        let mut ctx = Ctx::new(ev);
+        ctx.indexed_time = true;
+        self.matches_ctx(&ctx)
     }
 
     pub fn matches_ctx(&self, ctx: &Ctx<'_>) -> bool {

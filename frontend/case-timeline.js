@@ -59,7 +59,7 @@ window.CaseTimeline = (() => {
         if (!valid(event.timestamp)) { undated++; return; }
         const id = `e:${item.id}:${event.event_ref || (event.id ?? index)}`;
         const edit = config.edits[id] || {};
-        events.push({ id, itemId: item.id, type: "event", start: event.timestamp, end: event.timestamp,
+        events.push({ id, itemId: item.id, occurrence: { item, itemIndex, index, row: event }, type: "event", start: event.timestamp, end: event.timestamp,
           title: display(edit.title || event.name || event.message || event.code || "Evento"),
           detail: display([event.message || event.description || "", window.EvidenceUI?.eventContext(item, event)].filter(Boolean).join("\n")), source: display(item.label || item.name || "Item do caso"),
           color: edit.color || item.timelineColor || COLORS[itemIndex % COLORS.length], rows: [event] });
@@ -350,7 +350,7 @@ window.CaseTimeline = (() => {
       const top = viewport.scrollTop, left = viewport.scrollLeft;
       const focused = document.activeElement;
       const focusedEntry = focused?.closest(".ct-entry")?.dataset.id, focusedNote = focused?.closest(".ct-note")?.dataset.note, focusedArrow = focused?.dataset.arrow, focusedAction = focused?.dataset.ctAction, focusedZoom = focused?.dataset.ctZoom;
-      callbacks.save();
+      const saved = callbacks.save();
       requestAnimationFrame(() => {
         box.scrollTop = scroll;
         const next = box.querySelector(".ct-scroll");
@@ -358,6 +358,7 @@ window.CaseTimeline = (() => {
         const focusTarget = [...box.querySelectorAll(".ct-entry,.ct-note,.ct-link-hit,[data-ct-action],[data-ct-zoom]")].find(node => focusedEntry && node.dataset.id === focusedEntry || focusedNote && node.dataset.note === focusedNote || focusedArrow && node.dataset.arrow === focusedArrow || focusedAction && node.dataset.ctAction === focusedAction || focusedZoom && node.dataset.ctZoom === focusedZoom);
         focusTarget?.focus({ preventScroll: true });
       });
+      return saved;
     };
     if (horizontal) shell.querySelectorAll("[data-ct-zoom]").forEach(button => {
       button.onclick = () => {
@@ -642,6 +643,7 @@ window.CaseTimeline = (() => {
           ...(entry.type === "manual" ? [] : [{ icon: "fa-pen", label: "Editar título", onClick: () => openEditor("title", entry) }]),
           { icon: "fa-palette", label: "Alterar cor", onClick: () => colorMenu(entry, event.clientX, event.clientY) },
           ...(!horizontal ? [{ icon: "fa-arrows-left-right", label: "Mover para o outro lado", onClick: () => { config.layout[entry.id] = { side: side === "left" ? "right" : "left", offset }; callbacksSave(); } }] : [])];
+        if (callbacks.canUndoRemoval?.(c)) menu.push({ icon: "fa-rotate-left", label: "Desfazer última remoção", onClick: () => callbacks.undoRemoval() });
         if (entry.type === "manual") {
           menu.push({ icon: "fa-pen", label: "Editar marco", onClick: () => openEditor("manual", entry) },
             { icon: "fa-trash-can", label: "Remover marco", danger: true, onClick: () => {
@@ -673,28 +675,9 @@ window.CaseTimeline = (() => {
             label: "Remover do caso",
             danger: true,
             onClick: async () => {
-              const idsToRemove = new Set(entry.members ? entry.members.map(m => m.id) : [entry.id]);
-              c.items = (c.items || []).filter(it => !idsToRemove.has(it.id));
-              config.groups = (config.groups || []).filter(g => !idsToRemove.has(g.id));
-              config.annotations = (config.annotations || []).filter(a => {
-                if (a.links) a.links = a.links.filter(l => !idsToRemove.has(l.targetId));
-                if (idsToRemove.has(a.anchor)) {
-                  if (a.links && a.links.length > 0) {
-                    const next = a.links.shift();
-                    a.anchor = next.targetId;
-                    a.arrow = next.arrow;
-                    a.lineStyle = next.lineStyle;
-                    a.color = next.color;
-                    a.curve = next.curve;
-                    a.endpoints = next.endpoints;
-                    return true;
-                  }
-                  return false;
-                }
-                return true;
-              });
-              await callbacksSave();
-              toast("Item removido do Caso.", "ok");
+              const members = entry.members || [entry], targets = members.map(member => member.occurrence);
+              if (!callbacks.removeOccurrences || targets.some(target => !target)) { callbacks.notify?.("Não foi possível identificar esta ocorrência. Atualize a Timeline."); return; }
+              await callbacks.removeOccurrences(c, targets, [entry.id], callbacksSave);
             }
           });
         }
