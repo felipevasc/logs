@@ -168,36 +168,75 @@ function setWorkbar(label, detail = "", progress = null, cancellable = false, su
   progressEl.hidden = progress === null;
   if (progress !== null) fill.style.width = `${Math.max(0, Math.min(100, progress))}%`;
   $("#workbar-cancel").hidden = !cancellable; $("#workbar-cancel").disabled = false;
-  if (state.loadOverlay) mirrorLoadOverlay(label, detail, progress, waiting);
+  if (state.loadOverlay) mirrorLoadOverlay(label, detail, progress, waiting, cancellable);
 }
 
 // ------------------------------------------------------------------ overlay de carga
 let loadStepCount = 0;
 let loadWaitingVisual = null;
 let loadWaitingReceipt = null;
+let loadReturnFocus = null;
+
+function syncLoadCancel(focused = document.activeElement) {
+  const button = $("#load-cancel");
+  const owned = state.loadOverlayOperationId && state.loadOverlayOperationId === window.Tasks?.operationFor(state.loadOverlayProgressKey);
+  button.disabled = !owned || !state.loadOverlayCancellable || state.loadOverlayCancelling;
+  button.textContent = state.loadOverlayCancelling ? "Cancelamento solicitado" : "Cancelar operação";
+  $("#load-cancel-help").textContent = state.loadOverlayCancelling
+    ? "Aguardando confirmação da operação."
+    : button.disabled ? "Cancelamento indisponível nesta etapa."
+    : "Solicita a interrupção desta operação. Pausar a animação mantém o trabalho em andamento.";
+  // A disappearing/disabled control must not strand keyboard focus. Do not
+  // move focus when the user is reading details or working elsewhere.
+  if ((focused === button && button.disabled) || (focused === $("#load-visual .wv-motion-toggle") && focused?.hidden)) {
+    $("#load-progress-details > summary").focus({ preventScroll: true });
+  }
+}
 
 function updateLoadWaiting(receipt) {
-  loadWaitingReceipt = receipt;
-  loadWaitingVisual?.update(receipt);
+  const focused = document.activeElement;
+  loadWaitingReceipt = state.loadOverlayCancelling ? { ...receipt, state: "cancelling", label: "" } : receipt;
+  loadWaitingVisual?.update(loadWaitingReceipt);
+  syncLoadCancel(focused);
+}
+
+function cancelLoadOperation() {
+  const operationId = state.loadOverlayOperationId;
+  // The card never falls back to whichever unrelated query last used the bar.
+  if (!state.loadOverlay || !operationId || !state.loadOverlayCancellable || state.loadOverlayCancelling
+      || operationId !== window.Tasks?.operationFor(state.loadOverlayProgressKey)) {
+    if (state.loadOverlay) syncLoadCancel();
+    return;
+  }
+  window.Tasks.cancelOperation(operationId);
 }
 document.addEventListener("task-state-change", event => {
   const change = event.detail;
   if (!state.loadOverlay || !change?.operationId) return;
-  if (change.started && change.latestKey === (state.loadOverlayProgressKey || "source-load")) {
-    // Bind before the first progress event, so cancelLatest can remove its map
-    // entry without losing the foreground owner's cancellation identity.
-    loadWaitingReceipt = { ...loadWaitingReceipt, operationId: change.operationId };
+  if (change.started && change.latestKey === state.loadOverlayProgressKey
+      && change.operationId === window.Tasks?.operationFor(state.loadOverlayProgressKey)) {
+    // Bind before progress. One source load owns one card; timestamp settings
+    // legitimately start a new named task for each file in the same foreground run.
+    if (state.loadOverlayOperationId && state.loadOverlayProgressKey !== "timestamp-config") { syncLoadCancel(); return; }
+    state.loadOverlayOperationId = change.operationId;
+    state.loadOverlayCancellable = false;
+    state.loadOverlayCancelling = false;
+    updateLoadWaiting({ operationId: change.operationId, phaseId: "", state: "running", label: state.loadOverlayLabel });
     return;
   }
-  if (change.state !== "cancelling") return;
-  const owned = window.Tasks?.operationFor(state.loadOverlayProgressKey || "source-load");
-  if (change.operationId !== loadWaitingReceipt?.operationId && change.operationId !== owned) return;
+  if (change.state !== "cancelling" || change.operationId !== state.loadOverlayOperationId) return;
+  state.loadOverlayCancelling = true;
   updateLoadWaiting({ ...loadWaitingReceipt, operationId: change.operationId, state: "cancelling", label: "" });
 });
 
-function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-load") {
+function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-load", returnFocus = document.activeElement) {
+  if (!state.loadOverlay) loadReturnFocus = returnFocus;
   state.loadOverlay = true;
   state.loadOverlayProgressKey = progressKey;
+  state.loadOverlayLabel = firstStep;
+  state.loadOverlayOperationId = null;
+  state.loadOverlayCancellable = false;
+  state.loadOverlayCancelling = false;
   state.loadOverlayVersion = (state.loadOverlayVersion || 0) + 1;
   loadStepCount = 0;
   $("#load-steps").innerHTML = "";
@@ -215,14 +254,28 @@ function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-
     operationId: `foreground-${state.loadOverlayVersion}`, phaseId: "", state: "running", label: firstStep,
   };
   loadWaitingVisual = window.WaitingVisuals.mount($("#load-visual"), loadWaitingReceipt);
+  syncLoadCancel();
 }
 
 function hideLoadOverlay(ok = true) {
+  const restoreFocus = $("#load-overlay").contains(document.activeElement);
   state.loadOverlay = false;
+  state.loadOverlayOperationId = null;
+  state.loadOverlayCancellable = false;
+  state.loadOverlayCancelling = false;
   // Work owns the lifetime, not the decorative animation cycle.
   loadWaitingVisual?.destroy(); loadWaitingVisual = null;
   loadWaitingReceipt = null;
   $("#load-overlay").hidden = true;
+  if (restoreFocus) {
+    for (const target of [loadReturnFocus, $(".nav-pages button.selected:not([hidden])"), $("#case-select")]) {
+      if (!target?.isConnected || target === document.body || target === document.documentElement
+          || target.disabled || !target.getClientRects().length) continue;
+      target.focus({ preventScroll: true });
+      if (document.activeElement === target) break;
+    }
+  }
+  loadReturnFocus = null;
   if (ok) {
     document.querySelectorAll("#load-steps li").forEach((li) => {
       li.classList.add("done");
@@ -247,7 +300,7 @@ function pushLoadStep(label) {
   while (steps.children.length > 4) steps.firstChild.remove();
 }
 
-function mirrorLoadOverlay(label, detail, progress, waiting = null) {
+function mirrorLoadOverlay(label, detail, progress, waiting = null, cancellable = false) {
   if (!state.loadOverlay) return;
   if (label && label !== $("#load-phase").textContent) pushLoadStep(label);
   $("#load-phase").textContent = label;
@@ -255,8 +308,9 @@ function mirrorLoadOverlay(label, detail, progress, waiting = null) {
   $("#load-bar-fill").parentElement.hidden = progress == null;
   if (progress != null) $("#load-bar-fill").style.width = `${Math.max(0, Math.min(100, progress))}%`;
   $("#load-eta").textContent = state.operationTiming || "";
+  state.loadOverlayCancellable = !!cancellable && waiting?.operationId === state.loadOverlayOperationId;
   updateLoadWaiting(waiting || {
-    operationId: `foreground-${state.loadOverlayVersion}`, phaseId: "", state: "running", label: label || "Processando",
+    operationId: state.loadOverlayOperationId || `foreground-${state.loadOverlayVersion}`, phaseId: "", state: "running", label: label || "Processando",
   });
 }
 
@@ -271,6 +325,7 @@ function updateOperation(label, detail = "", progress = null, cancellable = true
 }
 
 function cancelWorkbarTask() {
+  if (state.loadOverlay) { cancelLoadOperation(); return; }
   if (!state.progressOperationId) { window.Tasks?.open(); return; }
   window.Tasks?.cancelOperation(state.progressOperationId);
   $("#workbar-detail").textContent = "Cancelando · aguardando confirmação";
@@ -292,7 +347,8 @@ window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
   // Each task keeps its own progress above. The foreground import overlay
   // belongs only to its named foreground operation, including while session-save
   // acknowledgement is pending after that native task has already settled.
-  if (state.loadOverlay && (!payload.operationId || payload.operationId !== window.Tasks?.operationFor(state.loadOverlayProgressKey || "source-load"))) return;
+  if (state.loadOverlay && (!payload.operationId || payload.operationId !== state.loadOverlayOperationId
+      || payload.operationId !== window.Tasks?.operationFor(state.loadOverlayProgressKey))) return;
   const id = payload.operationId || payload.operation || "legacy-load";
   const estimate = task?.estimate || window.PerformanceTools.estimate(operationEstimates.get(id), payload);
   operationEstimates.set(id, estimate);
@@ -1119,6 +1175,7 @@ function sourceIdentityUnavailable(source) {
 }
 
 async function loadData(requestedSource = null, options = {}) {
+  const returnFocus = document.activeElement;
   const version = options.version ?? ++state.artifactSwitchVersion;
   let caseId = options.caseId ?? state.cases.active;
   let caseInstance = state.cases.cases.find(item => item.id === caseId) || null;
@@ -1138,7 +1195,7 @@ async function loadData(requestedSource = null, options = {}) {
   const status = $("#load-status");
   status.className = "load-status";
   startOperation("load", "Preparando artefato", "Validando fonte");
-  showLoadOverlay();
+  showLoadOverlay("Validando a fonte", "source-load", returnFocus);
   skeletonRows();
   try {
     let source = requestedSource ? { ...requestedSource } : sourceSpecFromControls();
@@ -1274,6 +1331,12 @@ async function loadData(requestedSource = null, options = {}) {
     return current();
   } catch (e) {
     if (!current()) return false;
+    // The native task has settled even if source recovery still needs to wait.
+    // Retire its control before reconciliation, without closing the waiting card.
+    if (state.loadOverlay && state.loadOverlayProgressKey === "source-load") {
+      state.loadOverlayCancellable = false;
+      syncLoadCancel();
+    }
     if (!sourceAccepted) {
       try {
         sourceAccepted = await reconcilePublishedSource(current);
@@ -3114,9 +3177,10 @@ async function applyTsConfig() {
   if (!paths.length) { toast("Carregue um arquivo primeiro.", "info"); return; }
   const cfg = buildTsConfig();
   const empty = cfg.sources.length === 0 || !cfg.format;
+  const returnFocus = document.activeElement;
   const done = btnBusy($("#ts-apply"), "Aplicando…");
   // status detalhado: passos + progresso por linha + resultado
-  showLoadOverlay("Aplicando configuração de data/hora", "timestamp-config");
+  showLoadOverlay("Aplicando configuração de data/hora", "timestamp-config", returnFocus);
   try {
     // cada arquivo do conjunto guarda a config pela própria chave (caminho)
     await commitTsConfig(paths, empty ? null : cfg);
@@ -7205,6 +7269,7 @@ function bind() {
     if (e.target === $("#case-item-modal")) { $("#case-item-modal").hidden = true; editingCaseItem = null; }
   });
   $("#workbar-cancel").onclick = cancelWorkbarTask;
+  $("#load-cancel").onclick = cancelLoadOperation;
   $("#group-col").onchange = () => { state.groupCol = $("#group-col").value; };
   $("#btn-add-agg").onclick = () => {
     state.aggs.push({ func: "count", column: "*", alias: "" });

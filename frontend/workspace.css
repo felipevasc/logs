@@ -93,6 +93,9 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 /* First 0.11 waiting pilots retain the existing compact load surface. */
 .semantic-load-stage { gap: 10px; max-height: calc(100vh - var(--topbar-h) - 40px); overflow-y: auto; }
 #load-visual { width: 100%; }
+.semantic-load-stage .load-operation-controls { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 100%; }
+.semantic-load-stage #load-cancel { min-height: 32px; font-size: 12px; }
+.semantic-load-stage #load-cancel-help { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.5; text-align: center; overflow-wrap: anywhere; }
 .load-progress-details { width: 100%; min-width: 0; }
 .load-progress-details > summary { padding: 5px 0; color: var(--text-1); font-size: 12px; cursor: pointer; }
 .load-progress-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

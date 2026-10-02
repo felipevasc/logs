@@ -11,7 +11,7 @@ const tasks = new Map([
 ]);
 const received = [], bars = [];
 let callback, owner = 'load-new';
-const state = { loadOverlay: true, progressOperationId: null };
+const state = { loadOverlay: true, loadOverlayProgressKey: 'source-load', loadOverlayOperationId: 'load-new', progressOperationId: null };
 const context = vm.createContext({
   state, performance: { now: () => 1000 }, fmtNum: String,
   setWorkbar: (...args) => bars.push(args),
@@ -60,7 +60,7 @@ emit('replaced', 'Resposta antiga');
 assert.equal(bars.length, 2, 'replaced tasks remain ignored');
 
 const nodes = new Map(), timers = [];
-context.$ = id => { if (!nodes.has(id)) nodes.set(id, { hidden: false, style: {}, parentElement: {} }); return nodes.get(id); };
+context.$ = id => { if (!nodes.has(id)) nodes.set(id, { hidden: false, style: {}, parentElement: {}, contains: () => false }); return nodes.get(id); };
 const presentationEvents = new Map();
 context.document = { querySelectorAll: () => [], addEventListener: (type, callback) => presentationEvents.set(type, callback) };
 context.pushLoadStep = () => {};
@@ -71,6 +71,7 @@ context.window.WaitingVisuals = { mount: (_host, snapshot) => {
 } };
 vm.runInContext(source.slice(source.indexOf('let loadStepCount ='), source.indexOf('\nfunction pushLoadStep')), context);
 context.showLoadOverlay('Aplicando configuração de data/hora', 'timestamp-config');
+presentationEvents.get('task-state-change')({ detail: { operationId: 'timestamps', latestKey: 'timestamp-config', state: 'running', started: true } });
 emit('timestamps', 'Recalculando timestamps');
 assert.equal(bars.at(-1)[0], 'Recalculando timestamps', 'timestamp configuration keeps its own foreground progress');
 emit('count-old', 'Contagem em segundo plano');
@@ -91,7 +92,7 @@ const analysis = {
 };
 timestampState.tsAnalysisOwner = analysis.capture();
 const timestampContext = vm.createContext({
-  state: timestampState, window: { AnalysisContexts: analysis }, $: () => ({}),
+  state: timestampState, window: { AnalysisContexts: analysis }, document: { activeElement: null }, $: () => ({}),
   tsConfigPaths: () => timestampPaths, buildTsConfig: () => timestampConfig,
   btnBusy: () => () => { timestampReleased++; },
   showLoadOverlay: (_label, key) => { timestampState.loadOverlay = true; timestampState.loadOverlayProgressKey = key; },
@@ -124,6 +125,7 @@ assert.equal(waitingViews[0].destroyed, true, 'settled foreground view releases 
 context.showLoadOverlay('Nova fonte');
 assert.equal(timers.length, 0, 'no previous success timer can hide a newer load');
 assert.equal(context.$('#load-overlay').hidden, false, 'previous success animation cannot hide a newer load');
+owner = 'load-before-progress';
 presentationEvents.get('task-state-change')({ detail: { operationId: 'load-before-progress', latestKey: 'source-load', state: 'running', started: true } });
 owner = null; // cancelLatest removes the owner map before emitting its cancellation.
 presentationEvents.get('task-state-change')({ detail: { operationId: 'load-before-progress', state: 'cancelling' } });

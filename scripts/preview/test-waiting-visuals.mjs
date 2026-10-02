@@ -68,13 +68,19 @@ await page.route('**/__mock__.js', async route => {
     held: new Set(), pending: [], emit: emitMock,
     beforeResult(command, operationId) {
       if (!this.held.has(command)) return;
-      return new Promise(resolve => this.pending.push({ command, operationId, release: resolve }));
+      return new Promise((resolve, reject) => this.pending.push({ command, operationId, release: resolve, reject }));
     },
     release(command) {
       this.held.delete(command);
       const ready = this.pending.filter(item => item.command === command);
       this.pending = this.pending.filter(item => item.command !== command);
       for (const item of ready) item.release();
+    },
+    fail(command, message) {
+      this.held.delete(command);
+      const ready = this.pending.filter(item => item.command === command);
+      this.pending = this.pending.filter(item => item.command !== command);
+      for (const item of ready) item.reject(new Error(message));
     }
   };`);
   code = code.replace(result, `          await window.__waitingPreviewBridge.beforeResult(cmd, args.operationId);\n${result}`);
@@ -367,6 +373,7 @@ try {
   assert.equal(results.builtInPreview.state, 'running', 'a phase ready event does not settle its pending owner');
   assert.equal(await load.locator('.wv-status').textContent(), 'Confirmando abertura', 'the ready phase cannot announce a confirmed load before owner settlement');
   assert.equal(results.builtInPreview.overlayVisible, true);
+  assert.equal(await page.locator('#load-cancel').isDisabled(), true, 'the real preview ready phase is noncancellable');
 
   phase = 'fixture receipts through real foreground progress adapter';
   await page.waitForFunction(() => performance.now() - window.__waitingLoadStarted >= 4100);
@@ -377,6 +384,14 @@ try {
   assert.equal(results.reading.status, 'Indexando registros'); assert.equal(results.reading.metric, '1.200 / 6.300 registros');
   assert.ok(results.reading.runningAnimations > 0); assertTypography(results.reading);
   assert.equal(await page.locator('#load-progress-details').evaluate(node => node.open), false);
+  assert.equal(await page.locator('#load-cancel').isEnabled(), true, 'the exact owner receipt makes its card Cancel reachable');
+  await assertFits(page.locator('#load-cancel'));
+  await page.locator('#load-cancel').focus();
+  await emitLoadPhase({ cancellable: false });
+  assert.equal(await page.locator('#load-cancel').isDisabled(), true);
+  assert.equal(await page.locator('#load-progress-details > summary').evaluate(node => node === document.activeElement), true,
+    'noncancellable transition transfers focus from the now-disabled button');
+  await emitLoadPhase();
   await assertFits(load);
   // Inspect real SVG/CSS contact poses, then restart only the decorative timeline
   // to record a complete story. This does not advance or alter operation progress.
@@ -478,11 +493,120 @@ try {
   await emitLoadPhase({ error: 'Falha simulada de progresso', completed: undefined, total: undefined, unit: '' });
   assert.equal((await renderedState(load)).state, 'error'); assert.equal((await renderedState(load)).motion, 'static');
   await emitLoadPhase();
-  results.loadSettlement = await page.evaluate(async () => { window.__waitingPreviewBridge.release('load_file'); return window.__waitingLoadWork; });
+  await page.locator('#load-cancel').focus();
+  // Hold an existing post-publication read to observe real frontend finalization,
+  // with the source task settled and the foreground controller still pending.
+  await page.evaluate(() => { window.__waitingPreviewBridge.held.add('get_ts_config'); window.__waitingPreviewBridge.release('load_file'); });
+  await page.waitForFunction(() => window.__waitingPreviewBridge.pending.some(item => item.command === 'get_ts_config'));
+  assert.equal(await page.locator('#load-cancel').isDisabled(), true);
+  assert.equal(await page.locator('#load-overlay').isVisible(), true);
+  assert.equal(await page.evaluate(() => Tasks.operationFor('source-load')), null);
+  assert.equal(await page.locator('#load-progress-details > summary').evaluate(node => node === document.activeElement), true);
+  await page.locator('#btn-theme').focus();
+  results.loadSettlement = await page.evaluate(async () => { window.__waitingPreviewBridge.release('get_ts_config'); return window.__waitingLoadWork; });
   assert.equal(results.loadSettlement.ok, true); assert.equal(results.loadSettlement.disposedAtSettlement, true); assert.equal(results.loadSettlement.overlayHiddenAtSettlement, true);
+  assert.equal(await page.locator('#btn-theme').evaluate(node => node === document.activeElement), true, 'settlement does not steal focus outside the overlay');
   assert.equal(await page.locator('#load-visual .waiting-visual').count(), 0, 'no cosmetic delay after owner settlement');
 
+  phase = 'foreground operation Cancel reached by actual mouse and keyboard';
+  results.foregroundCancel = [];
+  for (const input of ['mouse', 'keyboard']) {
+    await page.locator('#btn-theme').focus();
+    await page.evaluate(input => {
+      window.__waitingPreviewBridge.held.add('load_file');
+      window.__waitingLoadStarted = performance.now();
+      const path = `C:\\mock\\waiting-cancel-${input}.jsonl`;
+      window.__waitingLoadWork = loadData({ kind: 'file', path, paths: [path], format: 'auto' })
+        .then(ok => ({ ok, disposedAtSettlement: !document.querySelector('#load-visual .waiting-visual'), overlayHiddenAtSettlement: document.querySelector('#load-overlay').hidden }));
+    }, input);
+    await page.waitForFunction(() => window.__waitingPreviewBridge.pending.some(item => item.command === 'load_file'));
+    await emitLoadPhase();
+    const operationId = await page.evaluate(() => window.__waitingPreviewBridge.pending.find(item => item.command === 'load_file').operationId);
+    const countBefore = await page.evaluate(() => window.__mockCommandCalls.cancel_task || 0);
+    await assertFits(page.locator('#load-cancel'));
+    if (input === 'mouse') await page.locator('#load-cancel').click();
+    else {
+      await load.locator('.wv-motion-toggle').focus();
+      await page.keyboard.press('Tab');
+      assert.equal(await page.locator('#load-cancel').evaluate(node => node === document.activeElement), true, 'native tab order reaches operation Cancel after decorative Pause');
+      await page.keyboard.press('Enter');
+    }
+    await page.waitForFunction(() => document.querySelector('#load-visual .waiting-visual')?.dataset.state === 'cancelling');
+    const pending = await renderedState(load);
+    assert.equal(pending.motion, 'static'); assert.equal(pending.runningAnimations, 0);
+    assert.match(pending.status, /Cancelando/);
+    assert.equal(await page.locator('#load-cancel').isDisabled(), true);
+    assert.equal(await page.locator('#load-progress-details > summary').evaluate(node => node === document.activeElement), true);
+    assert.equal(await page.evaluate(() => window.__mockCommandCalls.cancel_task || 0), countBefore + 1);
+    assert.equal(await page.evaluate(() => window.__mockRequests.filter(item => item.cmd === 'cancel_task').at(-1).operationId), operationId,
+      'the actual button dispatches only its visible operation ID');
+    await page.keyboard.press('Enter'); // Focus is now on details, never a second Cancel.
+    assert.equal(await page.evaluate(() => window.__mockCommandCalls.cancel_task || 0), countBefore + 1);
+    assert.equal(await page.evaluate(id => window.__waitingPreviewBridge.pending.some(item => item.operationId === id), operationId), true,
+      'requesting cancellation never settles or hides the owner');
+    await emitLoadPhase();
+    assert.equal((await renderedState(load)).state, 'cancelling', 'a late receipt cannot restart the cancelled owner');
+    markVideo(`foreground-${input}-cancel-pending`, { fixtureReceipt: true, syntheticTransport: true });
+    await screenshot(`waiting-foreground-${input}-cancel-pending.png`, { fixture: true, syntheticTransport: true,
+      content: `Production Cancel activated by ${input}; exact source task remains pending, with a static waiting scene` });
+    // The first gate explicitly rejects as a cancellation fixture. The second
+    // releases the unchanged preview handler, modelling cancellation too late:
+    // a committed source result must remain accepted rather than claim rollback.
+    const settlement = await page.evaluate(async input => {
+      if (input === 'mouse') window.__waitingPreviewBridge.fail('load_file', 'Operação cancelada. (fixture)');
+      else window.__waitingPreviewBridge.release('load_file');
+      return window.__waitingLoadWork;
+    }, input);
+    assert.equal(settlement.ok, input === 'keyboard');
+    assert.equal(settlement.disposedAtSettlement, true); assert.equal(settlement.overlayHiddenAtSettlement, true);
+    assert.equal(await page.locator('#btn-theme').evaluate(node => node === document.activeElement), true, 'closing the owned overlay returns focus to the still-available origin');
+    results.foregroundCancel.push({ input, operationId, pending, settlement,
+      terminalTransport: input === 'mouse' ? 'explicit rejection fixture' : 'unchanged preview handler succeeds after cancellation request' });
+  }
+
+  phase = 'real load trigger keyboard activation and held source recovery';
+  await page.locator('.zone-switch [data-zone="structure"]').click();
+  await page.locator('.nav-pages [data-page="import"]').click();
+  await page.locator('#ws-windows').click();
+  await page.locator('#src-btn-file').click();
+  await page.locator('#file-path').fill('C:\\mock\\waiting-trigger-recovery.jsonl');
+  await page.evaluate(() => {
+    window.__waitingPreviewBridge.held.add('load_file');
+    window.__waitingPreviewBridge.held.add('source_snapshot');
+    window.__waitingLoadStarted = performance.now();
+  });
+  // Activate the actual bound UI trigger, so its synchronous disabled/blur
+  // behavior is covered rather than starting loadData from a theme-button focus.
+  await page.locator('#btn-load').focus(); await page.keyboard.press('Enter');
+  await page.waitForFunction(() => window.__waitingPreviewBridge.pending.some(item => item.command === 'load_file'));
+  assert.equal(await page.evaluate(() => loadReturnFocus === document.querySelector('#btn-load')), true,
+    'the logical trigger is saved before the load button is disabled');
+  await emitLoadPhase();
+  await page.locator('#load-cancel').focus();
+  const recoveryCancelBefore = await page.evaluate(() => window.__mockCommandCalls.cancel_task || 0);
+  await page.evaluate(() => window.__waitingPreviewBridge.fail('load_file', 'Falha de leitura (fixture de recuperação)'));
+  await page.waitForFunction(() => window.__waitingPreviewBridge.pending.some(item => item.command === 'source_snapshot'));
+  results.heldSourceRecovery = await page.evaluate(() => ({
+    owner: Tasks.operationFor('source-load'), overlayVisible: !document.querySelector('#load-overlay').hidden,
+    cancelDisabled: document.querySelector('#load-cancel').disabled,
+    help: document.querySelector('#load-cancel-help').textContent,
+    focusOnDetails: document.activeElement === document.querySelector('#load-progress-details > summary'),
+    returnFocusId: loadReturnFocus?.id,
+  }));
+  assert.equal(results.heldSourceRecovery.owner, null); assert.equal(results.heldSourceRecovery.overlayVisible, true);
+  assert.equal(results.heldSourceRecovery.cancelDisabled, true); assert.match(results.heldSourceRecovery.help, /indisponível/);
+  assert.equal(results.heldSourceRecovery.focusOnDetails, true); assert.equal(results.heldSourceRecovery.returnFocusId, 'btn-load');
+  assert.equal(await page.evaluate(() => window.__mockCommandCalls.cancel_task || 0), recoveryCancelBefore);
+  await screenshot('waiting-foreground-load-recovery.png', { fixture: true, syntheticTransport: true,
+    content: 'Actual keyboard-activated load trigger; settled native task has no active Cancel while source reconciliation is held' });
+  await page.evaluate(() => window.__waitingPreviewBridge.release('source_snapshot'));
+  await page.waitForFunction(() => !state.loadOverlay && !document.querySelector('#btn-load').disabled);
+  assert.equal(await page.evaluate(() => document.activeElement !== document.body && document.activeElement !== document.documentElement
+    && !document.querySelector('#load-overlay').contains(document.activeElement) && document.activeElement.getClientRects().length > 0), true,
+    'settlement lands on a usable origin or navigation fallback, never non-focusable body');
+
   phase = 'real grouping pilot, independent pause and prompt disposal';
+  await page.locator('.zone-switch [data-zone="analysis"]').click();
   await setTheme('dark');
   await page.getByRole('button', { name: 'Explorar', exact: true }).click();
   await page.getByRole('button', { name: 'Resumir', exact: true }).click();
