@@ -5059,12 +5059,74 @@ function buildRecordActions(ev, key) {
 
 let lastCaseRemoval = null;
 const caseRemovalPending = new WeakSet();
+const nativeRemovalNotices = new Map();
+function showNativeRemovalNotice(record, actions) {
+  const notice = el("div", "toast ok native-removal-notice", `${record.receipt.count} ocorrência(s) removida(s). `);
+  const undo = el("button", "btn ghost small", "Desfazer");
+  const events = ["case-evidence-state", "workspace-context-change", "analysis-context-change"];
+  let busy = false, disposed = false, timer, refreshTimer;
+  const available = () => record === lastCaseRemoval && actions.canUndo(record.receipt);
+  const restoreFocus = owned => {
+    if (!owned || document.activeElement && document.activeElement !== document.body && document.activeElement.isConnected) return;
+    // Stable controls only: a removed occurrence must never return to a reused
+    // record row, and a later Case must not inherit a stale focus target.
+    const candidates = activeCase() === record.c ? [$("#page-size"), $("#case-select")] : [$("#case-select")];
+    candidates.find(recordFocusAvailable)?.focus({ preventScroll: true });
+  };
+  const disable = value => {
+    const owned = notice.contains(document.activeElement);
+    undo.disabled = value; restoreFocus(owned);
+  };
+  const refresh = () => {
+    if (disposed) return;
+    if (!notice.isConnected) { dispose(); return; }
+    disable(busy || !available());
+    undo.title = undo.disabled ? "Desfazer indisponível enquanto o recibo ou o Caso não permitir esta ação." : "Desfazer esta remoção";
+  };
+  // Save/state events can arrive before the native mutation releases its lock.
+  // Recheck after that turn, without polling, changing authority or issuing IPC.
+  const scheduleRefresh = () => { clearTimeout(refreshTimer); refreshTimer = setTimeout(refresh, 0); };
+  const dispose = () => {
+    if (disposed) return;
+    const owned = notice.contains(document.activeElement);
+    disposed = true; clearTimeout(timer); clearTimeout(refreshTimer);
+    for (const name of events) document.removeEventListener(name, scheduleRefresh);
+    nativeRemovalNotices.delete(record); notice.remove(); restoreFocus(owned);
+  };
+  notice.setAttribute("role", "status"); notice.setAttribute("aria-atomic", "true");
+  undo.type = "button";
+  undo.onclick = async () => {
+    if (disposed || busy) return;
+    // This button owns exactly its receipt, never whichever removal came later.
+    if (!available()) { refresh(); return; }
+    busy = true; disable(true); undo.setAttribute("aria-busy", "true");
+    try { if (await undoCaseOccurrenceRemoval(record)) dispose(); }
+    finally { busy = false; undo.removeAttribute("aria-busy"); refresh(); }
+  };
+  notice.onpointerenter = refresh; notice.onfocusin = refresh;
+  notice.appendChild(undo); $("#toast-area").appendChild(notice);
+  nativeRemovalNotices.set(record, { refresh, dispose });
+  for (const name of events) document.addEventListener(name, scheduleRefresh);
+  // Only this receipt owns its 15 s shortcut lifetime; native Undo validity is
+  // still decided by the existing action service and remains available in-menu.
+  timer = setTimeout(dispose, 15000);
+  for (const entry of nativeRemovalNotices.values()) entry.refresh();
+}
 function refreshCaseRemoval(c) {
   if (activeCase() !== c) return;
   window.WorkspaceContext?.refreshMembership(); updateAnalysisBadge(); renderAnalysis(); filtersChanged();
 }
 async function undoCaseOccurrenceRemoval(record = lastCaseRemoval) {
-  if (record?.native) { try { if (record !== lastCaseRemoval) return false; await nativeEvidenceServices().actions.undo(record.receipt); lastCaseRemoval = null; refreshCaseRemoval(record.c); return true; } catch (error) { toast(String(error.message || error), "err"); return false; } }
+  if (record?.native) {
+    try {
+      if (record !== lastCaseRemoval) return false;
+      await nativeEvidenceServices().actions.undo(record.receipt);
+      if (lastCaseRemoval === record) lastCaseRemoval = null;
+      nativeRemovalNotices.get(record)?.dispose();
+      refreshCaseRemoval(record.c); toast("Remoção desfeita.", "ok"); return true;
+    } catch (error) { toast(String(error.message || error), "err"); return false; }
+    finally { nativeRemovalNotices.get(record)?.refresh(); }
+  }
   if (!record || record !== lastCaseRemoval || activeCase() !== record.c || record.owner && !window.AnalysisContexts.owns(record.owner)) {
     toast("O Caso mudou. Reabra o Caso da remoção antes de desfazer.", "info"); return false;
   }
@@ -5083,7 +5145,10 @@ async function undoCaseOccurrenceRemoval(record = lastCaseRemoval) {
 async function removeCaseOccurrences(c, targets, { entryIds = [], save = saveCases, owner = window.AnalysisContexts?.capture() } = {}) {
   if (window.CaseEvidence?.active === true) {
     try { const actions = nativeEvidenceServices().actions, receipt = await actions.remove(c, targets, { guard: () => activeCase() === c && (!owner || window.AnalysisContexts.isCurrent(owner)) });
-      lastCaseRemoval = { c, owner, native: true, receipt }; refreshCaseRemoval(c); toast(`${receipt.count} ocorrência(s) removida(s). Use Desfazer para restaurar.`, "ok"); return true;
+      const record = { c, owner, native: true, receipt }; lastCaseRemoval = record; refreshCaseRemoval(c);
+      if (activeCase() === c) showNativeRemovalNotice(record, actions);
+      else toast(`${receipt.count} ocorrência(s) removida(s).`, "ok");
+      return true;
     } catch (error) { toast(String(error.message || error), "err"); return false; }
   }
   if (activeCase() !== c || owner && !window.AnalysisContexts.isCurrent(owner)) { toast("O Caso mudou. Selecione a ocorrência novamente.", "info"); return false; }
