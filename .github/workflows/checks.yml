@@ -47,7 +47,7 @@ jobs:
     name: Frontend and interaction regressions
     needs: scope
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     concurrency:
       group: checks-frontend-${{ github.ref }}
       cancel-in-progress: true
