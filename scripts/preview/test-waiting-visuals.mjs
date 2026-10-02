@@ -9,6 +9,7 @@ import { mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { launchBrowser } from './browser.mjs';
 import { captureFailure } from './diagnostics.mjs';
+import { installMotionSampling } from './motion-sampling.mjs';
 
 const output = resolve('output/playwright');
 mkdirSync(output, { recursive: true });
@@ -21,6 +22,7 @@ const context = await browser.newContext({
 const videoStartedAt = Date.now();
 const page = await context.newPage();
 const video = page.video();
+await page.addInitScript(installMotionSampling);
 const videoMetadata = {
   filename: 'waiting-visuals-real-preview.webm', finalized: false,
   capture: 'Real Playwright browser recording of this production UI regression; no generated image assets',
@@ -161,11 +163,7 @@ async function inspectTaskRig(locator, family, pace = 'loop') {
     const hand = actor.querySelector('.wv-task-hand');
     const animations = art.getAnimations({ subtree: true });
     const duration = family === 'checkpoint' ? (pace === 'loop' ? 6800 : 2800) : (pace === 'loop' ? 6400 : 2600);
-    const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    const at = async fraction => {
-      for (const animation of animations) { animation.pause(); animation.currentTime = fraction * duration; }
-      await frames();
-    };
+    const at = fraction => sampling.seek(fraction * duration);
     const matrix = node => { const m = node.getScreenCTM(); return [m.a, m.b, m.c, m.d, m.e, m.f]; };
     const point = (node, x, y) => { const p = new DOMPoint(x, y).matrixTransform(node.getScreenCTM()); return { x: p.x, y: p.y }; };
     const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -181,6 +179,7 @@ async function inspectTaskRig(locator, family, pace = 'loop') {
       iterations: [...new Set(animations.map(animation => String(animation.effect.getTiming().iterations)))],
       animatedParts: animations.map(animation => animation.effect.target.getAttribute('class')),
     };
+    const sampling = await window.__waitingMotionSampling.begin(animations);
     try {
       await at(0);
       result.actorHeight = actor.getBoundingClientRect().height;
@@ -229,8 +228,7 @@ async function inspectTaskRig(locator, family, pace = 'loop') {
       }
       return result;
     } finally {
-      for (const animation of animations) { animation.currentTime = 0; animation.play(); }
-      await frames();
+      await sampling.restore();
     }
   }, { family, pace });
   assert.equal(rig.family, family); assert.equal(rig.pace, pace);
@@ -286,22 +284,26 @@ async function recordSceneCycle(locator, label, durationMs, attribution) {
   const capture = await locator.evaluate(async (root, durationMs) => {
     const animations = root.querySelector('.wv-art').getAnimations({ subtree: true });
     if (!animations.length) throw new Error('Cannot record an absent decorative timeline');
-    for (const animation of animations) { animation.currentTime = 0; animation.play(); }
-    await Promise.all(animations.map(animation => animation.ready));
-    const started = performance.now();
-    return new Promise((resolve, reject) => {
-      const frame = () => {
-        const times = animations.map(animation => animation.currentTime);
-        if (!root.isConnected || root.dataset.motion !== 'running') return reject(new Error('Scene stopped before its capture cycle ended'));
-        if (times.every(time => typeof time === 'number' && time >= durationMs)) {
-          return resolve({ requestedDurationMs: durationMs, elapsedMs: performance.now() - started,
-            minimumTimelineMs: Math.min(...times), playStates: [...new Set(animations.map(animation => animation.playState))] });
-        }
-        if (performance.now() - started > durationMs + 10000) return reject(new Error('Decorative capture cycle did not advance'));
+    const sampling = await window.__waitingMotionSampling.begin(animations);
+    try {
+      await sampling.seek(0);
+      await sampling.release();
+      await Promise.all(animations.map(animation => animation.ready));
+      const started = performance.now();
+      return await new Promise((resolve, reject) => {
+        const frame = () => {
+          const times = animations.map(animation => animation.currentTime);
+          if (!root.isConnected || root.dataset.motion !== 'running') return reject(new Error('Scene stopped before its capture cycle ended'));
+          if (times.every(time => typeof time === 'number' && time >= durationMs)) {
+            return resolve({ requestedDurationMs: durationMs, elapsedMs: performance.now() - started,
+              minimumTimelineMs: Math.min(...times), playStates: [...new Set(animations.map(animation => animation.playState))] });
+          }
+          if (performance.now() - started > durationMs + 10000) return reject(new Error('Decorative capture cycle did not advance'));
+          requestAnimationFrame(frame);
+        };
         requestAnimationFrame(frame);
-      };
-      requestAnimationFrame(frame);
-    });
+      });
+    } finally { await sampling.restore(); }
   }, durationMs);
   assert.ok(capture.minimumTimelineMs >= durationMs, 'video contains the complete real-time decorative cycle');
   markVideo(`${label}-end`, { ...attribution, ...capture });
@@ -309,16 +311,14 @@ async function recordSceneCycle(locator, label, durationMs, attribution) {
 }
 
 async function screenshotPose(locator, fraction, durationMs, filename, attribution) {
-  await locator.evaluate(async (root, { fraction, durationMs }) => {
-    const animations = root.querySelector('.wv-art').getAnimations({ subtree: true });
-    for (const animation of animations) { animation.pause(); animation.currentTime = fraction * durationMs; }
-    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-  }, { fraction, durationMs });
-  try { await screenshot(filename, { ...attribution, decorativePoseFraction: fraction, animationSeekForScreenshot: true }); }
-  finally {
-    await locator.evaluate(root => {
-      for (const animation of root.querySelector('.wv-art').getAnimations({ subtree: true })) { animation.currentTime = 0; animation.play(); }
-    });
+  const sampling = await locator.evaluateHandle(root => window.__waitingMotionSampling.begin(
+    root.querySelector('.wv-art').getAnimations({ subtree: true })));
+  try {
+    await sampling.evaluate((sample, time) => sample.seek(time), fraction * durationMs);
+    await screenshot(filename, { ...attribution, decorativePoseFraction: fraction, animationSeekForScreenshot: true });
+  } finally {
+    try { await sampling.evaluate(sample => sample.restore()); }
+    finally { await sampling.dispose(); }
   }
 }
 
@@ -393,18 +393,17 @@ try {
     'noncancellable transition transfers focus from the now-disabled button');
   await emitLoadPhase();
   await assertFits(load);
-  // Inspect real SVG/CSS contact poses, then restart only the decorative timeline
-  // to record a complete story. This does not advance or alter operation progress.
+  // Inspect real SVG/CSS contact poses, then restore their original timelines
+  // before recording a complete story. This does not advance or alter operation progress.
   results.readingRig = await load.evaluate(async root => {
     const art = root.querySelector('.wv-art'), actor = root.querySelector('.wv-reader');
     const hand = root.querySelector('.wv-reader-hand'), paper = root.querySelector('.wv-read-card');
     const animations = art.getAnimations({ subtree: true });
     const durations = [...new Set(animations.map(animation => animation.effect.getComputedTiming().duration))];
-    const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const sampling = await window.__waitingMotionSampling.begin(animations);
     const point = (node, x, y) => new DOMPoint(x, y).matrixTransform(node.getScreenCTM());
     const contact = async (fraction, target) => {
-      for (const animation of animations) { animation.pause(); animation.currentTime = fraction * 7200; }
-      await frames();
+      await sampling.seek(fraction * 7200);
       const distances = [[90, 34], [108, 62]].map(([x, y]) => {
         const carried = point(paper, x, y), station = point(root.querySelector(target), x, y);
         return Math.hypot(carried.x - station.x, carried.y - station.y);
@@ -418,8 +417,7 @@ try {
         height: actor.getBoundingClientRect().height, carriedByHand: paper.parentElement === hand,
         paperTransform: getComputedStyle(paper).transform, durations, pickup, deposit };
     } finally {
-      for (const animation of animations) { animation.currentTime = 0; animation.play(); }
-      await frames();
+      await sampling.restore();
     }
   });
   assert.equal(results.readingRig.actorCount, 1, 'one legible protagonist');
@@ -429,7 +427,7 @@ try {
   assert.deepEqual(results.readingRig.durations, [7200]);
   assert.ok(results.readingRig.pickup.distance < .75, 'hand and source sheet meet at pickup');
   assert.ok(results.readingRig.deposit.distance < .75, 'hand and destination sheet meet at release');
-  markVideo('reading-loop-start', { fixtureReceipt: true, animationRestartedForCapture: true, viewport: page.viewportSize() });
+  markVideo('reading-loop-start', { fixtureReceipt: true, animationRestartedForCapture: false, viewport: page.viewportSize() });
   await screenshot('waiting-fixture-reading-dark-1440.png', { fixture: true, content: 'Synthetic metadata receipt rendered by the production foreground adapter while its preview load command is pending' });
 
   // Capture-only dwell in the already pending command: one full 7.2s character

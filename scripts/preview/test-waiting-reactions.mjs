@@ -6,6 +6,7 @@ import { mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { launchBrowser } from './browser.mjs';
 import { captureFailure } from './diagnostics.mjs';
+import { installMotionSampling } from './motion-sampling.mjs';
 
 const output = resolve('output/playwright');
 mkdirSync(output, { recursive: true });
@@ -15,6 +16,7 @@ const context = await browser.newContext({
   recordVideo: { dir: resolve(output, 'video-raw'), size: { width: 1440, height: 960 } },
 });
 const started = Date.now(), page = await context.newPage(), video = page.video();
+await page.addInitScript(installMotionSampling);
 page.setDefaultTimeout(15000);
 const errors = [], results = {
   evidence: {
@@ -46,6 +48,42 @@ const states = () => roots.evaluateAll(nodes => nodes.map(root => ({
     currentTime: a.currentTime, playState: a.playState,
   })),
 })));
+// Run this both before any diagnostic seek and after sampling, so a fixture
+// cannot hide a native pause failure or silently disable future CSS governance.
+const pauseAndResumeReading = async (label, updateReceipt = false) => {
+  const before = await states();
+  await scene('reading').locator('.wv-motion-toggle').click();
+  const paused = (await states())[0];
+  assert.equal(paused.motion, 'static', `${label}: the real control pauses the scene`);
+  assert.equal(paused.moving, 0, `${label}: no artwork animation remains running`);
+  await page.waitForTimeout(300);
+  const stillPaused = (await states())[0];
+  assert.equal(stillPaused.episode, 'coffee');
+  assert.equal(stillPaused.moving, 0);
+  assert.deepEqual(stillPaused.animations.map(animation => animation.currentTime), paused.animations.map(animation => animation.currentTime),
+    `${label}: manual pause freezes every existing coffee timeline rather than restarting it`);
+  if (updateReceipt) {
+    await page.evaluate(() => {
+      const receipt = { ...__reactionPreview.receipts.reading, completed: 1300, elapsedMs: 61000 };
+      __reactionPreview.views.reading.update(receipt);
+    });
+    const updated = (await states())[0];
+    assert.equal(updated.motion, 'static');
+    assert.equal(updated.moving, 0);
+    assert.equal(updated.metric, '1.300 / 6.300 registros');
+    assert.equal(updated.status, before[0].status);
+  }
+  await scene('reading').locator('.wv-motion-toggle').click();
+  await page.waitForTimeout(200);
+  const resumed = await states();
+  assert.equal(resumed[0].episode, 'coffee');
+  assert.equal(resumed[0].motion, 'running');
+  assert.ok(resumed[0].moving > 0, `${label}: original CSS resumes the coffee tracks`);
+  assert.ok(resumed[0].animations.some((animation, index) => animation.currentTime > paused.animations[index].currentTime),
+    `${label}: the resumed timelines advance`);
+  mark(label);
+  return { before, paused, stillPaused, resumed };
+};
 const bothEpisode = episode => page.waitForFunction(episode => [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')]
   .length === 2 && [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')].every(root => root.dataset.episode === episode), episode, { timeout: 45000 });
 
@@ -134,6 +172,7 @@ try {
     }
   });
   await bothEpisode('coffee');
+  results.preSamplingPause = await pauseAndResumeReading('coffee-pause-resume-before-any-seek');
   phase = 'rendered coffee contacts after the uninterrupted video';
   results.rigs = [];
   for (const family of ['reading', 'checkpoint']) {
@@ -142,17 +181,13 @@ try {
       const held = root.querySelector('.wv-cup-held'), shelf = root.querySelector('.wv-cup-shelf');
       const hatch = root.querySelector('.wv-kitchen-hatch');
       const tracks = art.getAnimations({ subtree: true }).filter(animation => /^(?:wv-coffee-|wv-episode-boundary)/.test(animation.animationName));
-      const saved = tracks.map(animation => ({ animation, time: animation.currentTime, state: animation.playState }));
-      const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       const point = (node, x, y) => new DOMPoint(x, y).matrixTransform(node.getScreenCTM());
       const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-      const at = async fraction => {
-        for (const animation of tracks) { animation.pause(); animation.currentTime = fraction * 32000; }
-        await frame();
-      };
+      const at = fraction => sampling.seek(fraction * 32000);
       const result = { family: root.dataset.family, carriedByHand: held.parentElement === hand,
         contacts: [], hatchGrip: [], renderedSize: art.getBoundingClientRect().toJSON(),
         episodeDurationMs: [...new Set(tracks.map(animation => animation.effect.getComputedTiming().duration))] };
+      const sampling = await window.__waitingMotionSampling.begin(tracks);
       try {
         for (const fraction of [.28125, .828125]) {
           await at(fraction);
@@ -167,8 +202,7 @@ try {
         }
         return result;
       } finally {
-        for (const { animation, time, state } of saved) { animation.currentTime = time; if (state === 'running') animation.play(); }
-        await frame();
+        await sampling.restore();
       }
     });
     assert.equal(rig.carriedByHand, true, `${family}: the cup belongs to its articulated hand`);
@@ -178,26 +212,7 @@ try {
     results.rigs.push(rig);
   }
   phase = 'pause, receipts and hidden context';
-  const before = await states();
-  await scene('reading').locator('.wv-motion-toggle').click();
-  const paused = (await states())[0];
-  await page.waitForTimeout(300);
-  const stillPaused = (await states())[0];
-  assert.equal(stillPaused.episode, 'coffee');
-  assert.deepEqual(stillPaused.animations.map(animation => animation.currentTime), paused.animations.map(animation => animation.currentTime),
-    'manual pause freezes every existing coffee timeline rather than restarting it');
-  await page.evaluate(() => {
-    const receipt = { ...__reactionPreview.receipts.reading, completed: 1300, elapsedMs: 61000 };
-    __reactionPreview.views.reading.update(receipt);
-  });
-  assert.equal((await states())[0].motion, 'static');
-  assert.equal((await states())[0].moving, 0);
-  assert.equal((await states())[0].metric, '1.300 / 6.300 registros');
-  assert.equal((await states())[0].status, before[0].status);
-  await scene('reading').locator('.wv-motion-toggle').click();
-  await page.waitForTimeout(200);
-  results.midEpisodePause = { before, paused, resumed: await states() };
-  assert.equal(results.midEpisodePause.resumed[0].episode, 'coffee');
+  results.midEpisodePause = await pauseAndResumeReading('coffee-pause-resume-after-contact-sampling', true);
   await page.evaluate(() => Object.values(__reactionPreview.views).forEach(view => view.setVisible(false)));
   const hidden = await states();
   assert.ok(hidden.every(state => state.motion === 'static' && state.moving === 0));
