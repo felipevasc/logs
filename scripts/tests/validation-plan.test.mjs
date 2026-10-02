@@ -69,6 +69,9 @@ test('source views and shared menus retain exact-path and compact source actions
   }
   assert(fullPreview.includes('test-source-actions.mjs'));
   assert(fullPreview.includes('test-columns.mjs'));
+  assert(fullPreview.includes('test-settings-codes.mjs'));
+  assert(fullPreview.includes('test-timestamp-editor.mjs'));
+  contains(planValidation(['frontend/workspace.js']).preview, ['test-timestamp-editor.mjs']);
 });
 test('full request and missing comparison data cannot produce an empty or focused green', () => {
   for (const plan of [planValidation([]), planValidation(['docs/readme.md'], { full: true })]) {

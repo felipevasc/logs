@@ -521,6 +521,8 @@
         </button>
       </div>
       <div class="modal-body">
+        <p id="ts-status" class="muted small" role="status" aria-live="polite" style="overflow-wrap:anywhere"></p>
+        <button id="ts-retry" class="btn ghost small" type="button" hidden>Tentar novamente</button>
         <div id="ts-help" class="fmt-help" hidden>
           <p><strong>Como montar a data/hora:</strong></p>
           <p>1. <strong>Fontes</strong> — clique nos campos na ordem em que eles formam a data.
@@ -910,7 +912,11 @@
             <i class="fas fa-rotate"></i> Atualizar do sistema
           </button>
         </div>
-        <textarea id="codes-editor" spellcheck="false"></textarea>
+        <div class="codes-editor-tools">
+          <p id="codes-status" class="muted small" role="status" aria-live="polite" hidden></p>
+          <button id="codes-reload" class="btn ghost small" type="button">Recarregar</button>
+        </div>
+        <textarea id="codes-editor" spellcheck="false" aria-label="JSON do catálogo de códigos" aria-describedby="codes-status"></textarea>
         <div class="modal-actions">
           <button class="btn ghost" id="codes-cancel" type="button">Cancelar</button>
           <button class="btn primary" id="codes-save" type="button">
@@ -923,9 +929,9 @@
 
   <!-- ===================== MODAL: CONFIGURAÇÕES ===================== -->
   <div id="settings-modal" class="modal-overlay" hidden>
-    <div class="modal settings-modal">
+    <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <div class="modal-head">
-        <h3>Configurações</h3>
+        <h3 id="settings-title">Configurações</h3>
         <button class="icon-btn" id="settings-close" type="button" title="Fechar">
           <i class="fas fa-xmark"></i>
         </button>

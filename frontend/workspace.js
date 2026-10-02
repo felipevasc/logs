@@ -306,8 +306,7 @@
     if (!sourceActionAllowed(target)) return;
     const request = ++sourceDateRequest;
     const current = () => sourceActionCurrent(target) && request === sourceDateRequest;
-    await loadTsConfig(target.path, current);
-    if (current()) openTsModal(target.path);
+    await openTsModal(target.path, current, () => resolveSourceFocus(target, ".source-menu-trigger"));
   }
   async function hashSources(target) {
     if (!sourceActionAllowed(target) || target.view.hashing) return;

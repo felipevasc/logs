@@ -214,6 +214,7 @@ test('body and non-focusable return candidates cannot swallow settlement focus',
 test('timestamp configuration captures the logical Apply trigger before btnBusy blurs it', async () => {
   const f = fixture({ blurToBody: true }); let settle;
   Object.assign(f.context, {
+    tsEditor: { paths: ['/logs/a.jsonl'] }, tsEditorActionAllowed: () => true, tsEditorCurrent: () => true, setTsEditorEnabled() {}, clearTsTestResult() {},
     tsConfigPaths: () => ['/logs/a.jsonl'], buildTsConfig: () => ({ sources: ['message'], format: 'unix' }),
     btnBusy: button => { button.disabled = true; return () => { button.disabled = false; }; },
     commitTsConfig: () => new Promise(resolve => { settle = resolve; }), toast() {}, refresh() {},

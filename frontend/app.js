@@ -2931,6 +2931,7 @@ function renderTsSources() {
     chip.classList.toggle("active", idx >= 0);
     chip.textContent = (idx >= 0 ? `${idx + 1}· ` : "") + colLabel(opt);
     chip.onclick = () => {
+      clearTsTestResult();
       const i = state.tsSources.indexOf(opt);
       if (i >= 0) state.tsSources.splice(i, 1);
       else state.tsSources.push(opt);
@@ -2945,16 +2946,19 @@ function renderTsSources() {
 let tsExampleEv = null;
 
 async function updateTsExample() {
-  if (!state.loaded || !state.rows.length || currentSource() !== "file") {
+  const editor = tsEditor;
+  if (!tsEditorCurrent(editor) || !state.loaded || !state.rows.length || currentSource() !== "file") {
     tsExampleEv = null;
     renderTsExample();
     return;
   }
+  let example = null;
   try {
-    tsExampleEv = await api("event_detail", { id: state.rows[0].id }, { silent: true });
-  } catch {
-    tsExampleEv = null;
-  }
+    example = await api("event_detail", { id: state.rows[0].id }, { silent: true, analysisOwner: state.tsAnalysisOwner });
+  } catch { /* exemplo indisponível */ }
+  if (!tsEditorCurrent(editor)) return;
+  // Um exemplo de outra fonte do conjunto não descreve a fonte em edição.
+  tsExampleEv = editor.editingPath && cellValue(example || {}, "caminho") !== editor.editingPath ? null : example;
   renderTsExample();
 }
 
@@ -2975,7 +2979,7 @@ function tsRuleBlock(rule = {}) {
   const del = el("button", "icon-btn dv-rule-del");
   del.innerHTML = '<i class="fas fa-xmark"></i>';
   del.title = "Remover regra";
-  del.onclick = () => { block.remove(); tsRenumberRules(); renderTsExample(); };
+  del.onclick = () => { clearTsTestResult(); block.remove(); tsRenumberRules(); renderTsExample(); };
   head.appendChild(del);
   const pat = el("input");
   pat.className = "dv-rule-pattern";
@@ -3004,6 +3008,7 @@ function tsRenumberRules() {
 }
 
 function tsAddRule(rule = {}) {
+  clearTsTestResult();
   const block = tsRuleBlock(rule);
   $("#ts-rules").appendChild(block);
   tsRenumberRules();
@@ -3077,25 +3082,35 @@ async function commitTsConfig(paths, config) {
     if (result?.publication) {
       state.sourcePublication = result.publication;
       invalidateAnalysisComputedData({ caseId: owner?.caseId || state.cases.active });
+      const previousOwner = owner;
       owner = window.AnalysisContexts?.capture(owner?.caseId);
-      state.tsAnalysisOwner = owner;
+      if (state.tsAnalysisOwner === previousOwner) state.tsAnalysisOwner = owner;
     }
   }
 }
 
 async function resetTsConfig() {
-  const paths = tsConfigPaths();
-  state.tsSources = [];
-  $("#ts-rules").innerHTML = "";
-  tsAddRule();
-  $("#ts-complement").value = "";
-  fillTsFormats();
-  $("#ts-format-custom").hidden = true;
-  renderTsSources();
-  await commitTsConfig(paths, null);
-  if (paths.length) {
+  const editor = tsEditor;
+  if (!tsEditorActionAllowed(editor)) return;
+  const returnFocus = document.activeElement;
+  editor.busy = true;
+  clearTsTestResult();
+  setTsEditorEnabled(false);
+  try {
+    await commitTsConfig(editor.paths, null);
+    if (!tsEditorCurrent(editor)) return;
+    replaceTsEditorConfig(null);
     toast("Configuração removida — voltou à inferência automática.", "ok");
     refresh();
+  } catch (e) {
+    if (tsEditor === editor) toast(`Falha ao redefinir data/hora: ${e}`, "err");
+  } finally {
+    editor.busy = false;
+    if (tsEditor === editor) {
+      setTsEditorEnabled(tsEditorCurrent(editor));
+      if (tsEditorCurrent(editor) && document.activeElement === document.body && returnFocus?.isConnected && !returnFocus.disabled
+        && $("#ts-modal").contains(returnFocus)) returnFocus.focus({ preventScroll: true });
+    }
   }
 }
 
@@ -3108,46 +3123,98 @@ function buildTsConfig() {
   return {
     timezone_offset_minutes: $("#ts-zone").value === "" ? null : Number($("#ts-zone").value),
     clock_adjustment_ms: Number($("#ts-clock").value || 0) * 1000,
-    sources: state.tsSources,
+    sources: [...state.tsSources],
     rules: collectTsRules(),
     format: tsFormatValue(),
     complement: $("#ts-complement").value.trim() || null,
   };
 }
 
+// Only an explicit open owns the form. Source-load/MCP reads must never
+// become editor state, erase a draft, or turn a successful dataset load into an error.
 async function loadTsConfig(path, current = () => true) {
-  $("#ts-zone").value = ""; $("#ts-clock").value = "0";
-  state.tsSources = [];
-  $("#ts-regex").value = "";
-  $("#ts-complement").value = "";
   try {
-    const cfg = await api("get_ts_config", { path }, { silent: true });
-    if (!current()) return;
-    if (cfg) {
-      $("#ts-zone").value = cfg.timezone_offset_minutes == null ? "" : String(cfg.timezone_offset_minutes);
-      $("#ts-clock").value = String((cfg.clock_adjustment_ms || 0) / 1000);
-      state.tsSources = cfg.sources || [];
-      $("#ts-rules").innerHTML = "";
-      const rules = cfg.rules?.length ? cfg.rules : [{ regex: cfg.regex, template: cfg.template }];
-      for (const r of rules) tsAddRule(r);
-      if (!rules.length) tsAddRule();
-      $("#ts-complement").value = cfg.complement || "";
-      if (TS_FORMATS.some(([v]) => v === cfg.format)) $("#ts-format").value = cfg.format;
-      else {
-        $("#ts-format").value = "custom";
-        $("#ts-format-custom").hidden = false;
-        $("#ts-format-custom").value = cfg.format || "";
-      }
+    const config = await api("get_ts_config", { path }, { silent: true });
+    return current() ? { config } : null;
+  } catch (error) {
+    return current() ? { error } : null;
+  }
+}
+
+let tsEditor = null;
+
+function clearTsTestResult() {
+  if (tsEditor) tsEditor.testRequest = (tsEditor.testRequest || 0) + 1;
+  $("#ts-test-result").innerHTML = "";
+}
+
+function replaceTsEditorConfig(cfg) {
+  $("#ts-zone").value = cfg?.timezone_offset_minutes == null ? "" : String(cfg.timezone_offset_minutes);
+  $("#ts-clock").value = String((cfg?.clock_adjustment_ms || 0) / 1000);
+  state.tsSources = [...(cfg?.sources || [])];
+  $("#ts-regex").value = "";
+  $("#ts-template").value = "";
+  $("#ts-assembled").textContent = "";
+  $("#ts-rules").innerHTML = "";
+  const rules = cfg?.rules?.length ? cfg.rules : [{ regex: cfg?.regex, template: cfg?.template }];
+  for (const rule of rules) tsAddRule(rule);
+  $("#ts-complement").value = cfg?.complement || "";
+  const format = cfg ? cfg.format || "" : TS_FORMATS[1][0];
+  const custom = !TS_FORMATS.some(([value]) => value !== "custom" && value === format);
+  $("#ts-format").value = custom ? "custom" : format;
+  $("#ts-format-custom").value = custom ? format : "";
+  $("#ts-format-custom").hidden = !custom;
+  clearTsTestResult();
+  tsExampleEv = null;
+  renderTsSources();
+}
+
+function setTsEditorEnabled(enabled) {
+  document.querySelectorAll("#ts-modal .modal-body input, #ts-modal .modal-body select, #ts-modal .modal-body button")
+    .forEach(control => { if (control.id !== "ts-retry") control.disabled = !enabled; });
+}
+
+function tsEditorCurrent(editor = tsEditor) {
+  return !!editor && tsEditor === editor && editor.ready && !$("#ts-modal").hidden
+    && (!state.tsAnalysisOwner || window.AnalysisContexts.isCurrent(state.tsAnalysisOwner));
+}
+
+function tsEditorActionAllowed(editor = tsEditor) {
+  if (!tsEditorCurrent(editor) || editor.busy) {
+    if (editor?.ready && !editor.busy) {
+      setTsEditorEnabled(false);
+      $("#ts-status").textContent = "A fonte ou o Caso mudou. Reabra Data/hora no contexto atual.";
+      toast($("#ts-status").textContent, "info");
     }
-  } catch { /* sem config salva */ }
-  if (current()) renderTsSources();
+    return false;
+  }
+  if (!editor.paths.length) { toast("Carregue um arquivo primeiro.", "info"); return false; }
+  return true;
+}
+
+function closeTsModal(restoreFocus = true) {
+  const editor = tsEditor, modal = $("#ts-modal");
+  const restore = restoreFocus && !modal.hidden && (modal.contains(document.activeElement) || document.activeElement === document.body);
+  tsEditor = null;
+  modal.hidden = true;
+  state.tsEditingPath = null;
+  if (restore) {
+    const target = typeof editor?.returnFocus === "function" ? editor.returnFocus() : editor?.returnFocus;
+    if (target?.isConnected && !target.disabled && !target.closest('[hidden],[inert],[aria-hidden="true"]') && target.getClientRects().length) target.focus({ preventScroll: true });
+  }
 }
 
 async function testTsConfig() {
+  const editor = tsEditor;
+  if (!tsEditorActionAllowed(editor)) return;
+  const request = editor.testRequest = (editor.testRequest || 0) + 1;
+  const config = buildTsConfig(), signature = JSON.stringify(config);
+  const current = () => tsEditorCurrent(editor) && request === editor.testRequest && JSON.stringify(buildTsConfig()) === signature;
   const box = $("#ts-test-result");
   box.innerHTML = "";
   try {
-    const rows = await api("test_ts_config", { config: buildTsConfig(), path: tsConfigPath() }, { silent: true, analysisOwner: state.tsAnalysisOwner });
+    const rows = await api("test_ts_config", { config, path: editor.path }, { silent: true, analysisOwner: state.tsAnalysisOwner });
+    if (!current()) return;
     for (const [entrada, resultado] of rows) {
       const row = el("div", "tr-row");
       const ok = !resultado.includes("não reconhecido");
@@ -3156,7 +3223,7 @@ async function testTsConfig() {
     }
     if (!rows.length) box.innerHTML = '<span class="muted small">Sem linhas para testar.</span>';
   } catch (e) {
-    box.innerHTML = `<span class="tr-pair bad">${esc(String(e))}</span>`;
+    if (current()) box.innerHTML = `<span class="tr-pair bad">${esc(String(e))}</span>`;
   }
 }
 
@@ -3173,25 +3240,35 @@ function tsConfigPaths() {
 }
 
 async function applyTsConfig() {
-  const paths = tsConfigPaths();
-  if (!paths.length) { toast("Carregue um arquivo primeiro.", "info"); return; }
+  const editor = tsEditor;
+  if (!tsEditorActionAllowed(editor)) return;
+  const paths = [...editor.paths];
   const cfg = buildTsConfig();
   const empty = cfg.sources.length === 0 || !cfg.format;
   const returnFocus = document.activeElement;
   const done = btnBusy($("#ts-apply"), "Aplicando…");
+  editor.busy = true;
+  clearTsTestResult();
+  setTsEditorEnabled(false);
   // status detalhado: passos + progresso por linha + resultado
   showLoadOverlay("Aplicando configuração de data/hora", "timestamp-config", returnFocus);
+  const overlayVersion = state.loadOverlayVersion;
+  const ownsOverlay = () => state.loadOverlayVersion === overlayVersion && state.loadOverlayProgressKey === "timestamp-config";
   try {
     // cada arquivo do conjunto guarda a config pela própria chave (caminho)
     await commitTsConfig(paths, empty ? null : cfg);
+    if (!ownsOverlay()) return;
     hideLoadOverlay(true);
     toast(empty ? "Configuração de data/hora removida." : "Data/hora aplicada aos eventos.", "ok");
     refresh();
   } catch (e) {
+    if (!ownsOverlay()) return;
     hideLoadOverlay(false);
     toast(`Falha ao aplicar data/hora: ${e}`, "err");
   } finally {
-    done();
+    if (tsEditor === editor) done();
+    editor.busy = false;
+    if (tsEditor === editor) setTsEditorEnabled(tsEditorCurrent(editor));
   }
 }
 
@@ -5817,12 +5894,41 @@ function fillColumnControls() {
   renderAggs();
 }
 
-function openTsModal(path = null) {
+async function openTsModal(path = null, current = () => true, returnFocus = document.activeElement) {
+  if (!current()) return false;
   state.tsAnalysisOwner = window.AnalysisContexts?.capture();
   state.tsEditingPath = typeof path === "string" ? path : null;
-  if (!document.querySelector("#ts-rules .dv-rule")) tsAddRule();
-  updateTsExample();
+  const owner = state.tsAnalysisOwner;
+  const editor = tsEditor = { editingPath: state.tsEditingPath, path: tsConfigPath(), paths: [...tsConfigPaths()], returnFocus, ready: false, busy: false };
+  const owns = () => tsEditor === editor && !$("#ts-modal").hidden && current()
+    && (!owner || window.AnalysisContexts.isCurrent(owner));
+  replaceTsEditorConfig(null);
+  $("#ts-apply").textContent = "Aplicar";
+  $("#ts-help").hidden = true;
+  $("#ts-status").textContent = `Carregando configuração: ${editor.path || "nenhuma fonte"}`;
+  $("#ts-retry").hidden = true;
+  setTsEditorEnabled(false);
   $("#ts-modal").hidden = false;
+  $("#ts-close").focus({ preventScroll: true });
+  const result = await loadTsConfig(editor.path, owns);
+  if (!owns()) {
+    if (tsEditor === editor) closeTsModal(false);
+    return false;
+  }
+  if (!result || result.error) {
+    $("#ts-status").textContent = `Não foi possível ler a configuração de ${editor.path}: ${result?.error || "resposta indisponível"}`;
+    $("#ts-retry").hidden = false;
+    $("#ts-retry").onclick = () => openTsModal(path, current, returnFocus);
+    if ($("#ts-modal").contains(document.activeElement)) $("#ts-retry").focus({ preventScroll: true });
+    return false;
+  }
+  replaceTsEditorConfig(result.config);
+  editor.ready = true;
+  $("#ts-status").textContent = `Fonte: ${editor.path || "nenhuma fonte"}${editor.paths.length > 1 ? ` · Aplicar aos ${editor.paths.length} arquivos do conjunto` : ""}`;
+  setTsEditorEnabled(true);
+  updateTsExample();
+  if (document.activeElement === $("#ts-close")) $("#ts-sources button")?.focus({ preventScroll: true });
+  return true;
 }
 
 function setColumnVisible(column, visible) {
@@ -6699,12 +6805,95 @@ function openRightInspector() {
 // ------------------------------------------------------------------ códigos
 // The codes catalog is a section of Settings.
 function openCodes() { return openSettings("codes"); }
+let codesEditorSession = null, codesSaveOperation = null, settingsReturnFocus = null;
+function codesSessionCurrent(session) { return codesEditorSession === session && !$("#settings-modal").hidden; }
+function codesDraftChanged(session = codesEditorSession) {
+  return !!session && session.loaded && $("#codes-editor").value !== session.baseline;
+}
+function renderCodesStatus() {
+  const session = codesEditorSession;
+  if (!session) return;
+  const status = $("#codes-status"), dirty = codesDraftChanged(session);
+  const parts = [];
+  if (codesSaveOperation) parts.push(session.loaded ? "Salvando a versão enviada… Você pode continuar editando." : "Aguardando a gravação já enviada…");
+  else if (session.fetching) parts.push("Lendo catálogo…");
+  if (session.error) parts.push(session.error);
+  else if (!codesSaveOperation && !session.fetching && session.notice) parts.push(session.notice);
+  if (session.external) parts.push("O catálogo mudou fora deste editor. Recarregue para revisar a versão atual.");
+  if (dirty && !codesSaveOperation) parts.push("Há alterações não salvas.");
+  status.textContent = parts.join(" ");
+  status.hidden = !parts.length;
+  $("#codes-editor").disabled = !session.loaded;
+  $("#codes-editor").setAttribute("aria-busy", String(session.fetching));
+  $("#codes-save").disabled = !session.loaded || session.fetching || !!codesSaveOperation;
+  $("#codes-reload").disabled = session.fetching || !!codesSaveOperation;
+}
+function codesEdited() {
+  if (!codesEditorSession) return;
+  codesEditorSession.edit++;
+  codesEditorSession.notice = "";
+  renderCodesStatus();
+}
+async function reloadCodesPane({ deliberate = false } = {}) {
+  const session = codesEditorSession;
+  if (!session || session.fetching || deliberate && codesSaveOperation) return;
+  if (deliberate && codesDraftChanged(session)
+    && !confirm("Recarregar o catálogo e descartar as alterações não salvas deste editor?")) return;
+  const request = ++session.request, edit = session.edit, text = $("#codes-editor").value;
+  const current = () => codesSessionCurrent(session) && request === session.request;
+  if (session.loaded && document.activeElement === $("#codes-reload")) $("#codes-editor").focus({ preventScroll: true });
+  session.fetching = true; session.error = ""; session.notice = "";
+  renderCodesStatus();
+  try {
+    // A reopened editor reads only after a previously submitted save settles.
+    if (codesSaveOperation) await codesSaveOperation.promise;
+    if (!current()) return;
+    const catalog = await api("get_codes", {}, { silent: true });
+    if (!current()) return;
+    if (session.edit !== edit || $("#codes-editor").value !== text) {
+      session.external = true;
+      session.notice = "Sua edição mais recente foi mantida.";
+      return;
+    }
+    $("#codes-editor").value = catalog;
+    session.baseline = catalog; session.loaded = true; session.external = false;
+    session.notice = deliberate ? "Catálogo recarregado." : "";
+  } catch (error) {
+    if (current()) session.error = `Não foi possível ler o catálogo: ${error}. Use Recarregar para tentar novamente.`;
+  } finally {
+    if (current()) { session.fetching = false; renderCodesStatus(); }
+  }
+}
+function codesChangedExternally() {
+  const session = codesEditorSession;
+  if (!session || !codesSessionCurrent(session)) return;
+  session.request++; session.fetching = false; session.external = true; session.externalVersion++;
+  renderCodesStatus();
+}
 async function renderCodesPane() {
   const pane = $("#settings-pane-codes"), body = $("#codes-modal .modal-body");
   if (body && body.parentElement !== pane) { body.classList.add("codes-pane"); pane.append(body); }
-  $("#codes-editor").value = await api("get_codes");
-  $("#codes-path").textContent = await api("get_codes_path");
+  if (codesEditorSession) { renderCodesStatus(); return; }
+  const session = codesEditorSession = { baseline: "", loaded: false, edit: 0, request: 0, fetching: false, external: false, externalVersion: 0, error: "", notice: "" };
+  $("#codes-editor").value = ""; $("#codes-path").textContent = "";
+  api("get_codes_path", {}, { silent: true }).then(path => {
+    if (codesSessionCurrent(session)) $("#codes-path").textContent = path;
+  }).catch(() => {});
   updateSysCount();
+  await reloadCodesPane();
+}
+function closeSettings() {
+  const session = codesEditorSession, dirty = codesDraftChanged(session);
+  if (dirty || codesSaveOperation) {
+    const message = [dirty ? "Descartar as alterações não salvas e fechar Configurações?" : "Fechar Configurações?",
+      codesSaveOperation ? "A gravação já enviada continuará; fechar não a cancela nem a desfaz." : ""].filter(Boolean).join(" ");
+    if (!confirm(message)) return false;
+  }
+  $("#settings-modal").hidden = true;
+  codesEditorSession = null;
+  if (settingsReturnFocus?.isConnected && settingsReturnFocus.getClientRects().length) settingsReturnFocus.focus({ preventScroll: true });
+  settingsReturnFocus = null;
+  return true;
 }
 
 async function updateSysCount() {
@@ -6732,12 +6921,31 @@ async function runHarvest() {
 }
 
 async function saveCodes() {
-  try {
-    await api("save_codes", { text: $("#codes-editor").value });
-    $("#codes-modal").hidden = true;
-    toast("Catálogo salvo e reaplicado aos eventos.", "ok");
-    refresh();
-  } catch { /* toast de erro já exibido */ }
+  const session = codesEditorSession;
+  if (!session || !codesSessionCurrent(session) || !session.loaded || session.fetching || codesSaveOperation) return;
+  if (session.external && !confirm("O catálogo mudou fora deste editor. Salvar substituirá essa versão pelo texto deste editor. Continuar?")) return;
+  const text = $("#codes-editor").value, externalVersion = session.externalVersion;
+  const operation = codesSaveOperation = { promise: null };
+  if (document.activeElement === $("#codes-save")) $("#codes-editor").focus({ preventScroll: true });
+  session.error = ""; session.notice = ""; renderCodesStatus();
+  operation.promise = (async () => {
+    try {
+      await api("save_codes", { text }, { silent: true });
+      if (codesSessionCurrent(session)) {
+        session.baseline = text;
+        if (session.externalVersion === externalVersion) session.external = false;
+        session.notice = codesDraftChanged(session) ? "A versão enviada foi salva; a edição posterior ainda não foi salva." : "Catálogo salvo e reaplicado aos eventos.";
+      }
+      refresh();
+    } catch (error) {
+      if (codesSessionCurrent(session)) session.error = `Não foi possível salvar o catálogo: ${error}. Seu texto foi mantido; tente novamente.`;
+      else toast(`Não foi possível salvar o catálogo enviado: ${error}`, "err");
+    } finally {
+      if (codesSaveOperation === operation) codesSaveOperation = null;
+      if (codesEditorSession) renderCodesStatus();
+    }
+  })();
+  await operation.promise;
 }
 
 // ------------------------------------------------------------------ configurações / MCP
@@ -6796,17 +7004,26 @@ function mcpSnippet(title, code) {
 }
 
 function switchSettingsTab(tab) {
-  document.querySelectorAll("#settings-modal .settings-tab").forEach((b) =>
-    b.classList.toggle("active", b.dataset.settingsTab === tab));
+  document.querySelectorAll("#settings-modal .settings-tab").forEach((b) => {
+    const selected = b.dataset.settingsTab === tab;
+    b.classList.toggle("active", selected); b.tabIndex = selected ? 0 : -1;
+    b.id = `settings-tab-${b.dataset.settingsTab}`;
+    b.setAttribute("aria-selected", String(selected));
+    b.setAttribute("aria-controls", `settings-pane-${b.dataset.settingsTab}`);
+  });
   document.querySelectorAll("#settings-modal .settings-pane").forEach((p) => {
     p.hidden = p.id !== `settings-pane-${tab}`;
+    p.setAttribute("aria-labelledby", p.id.replace("settings-pane-", "settings-tab-"));
   });
 }
 
 async function openSettings(tab = "interface") {
   const recoveryTab = document.querySelector('[data-settings-tab="recovery"]'); if (recoveryTab) recoveryTab.hidden = !nativeEvidenceEnabled();
+  const opening = $("#settings-modal").hidden;
+  if (opening) { codesEditorSession = null; settingsReturnFocus = document.activeElement; }
   $("#settings-modal").hidden = false;
   switchSettingsTab(tab);
+  if (opening) document.querySelector(`#settings-tab-${tab}`)?.focus({ preventScroll: true });
   if (tab === "interface") window.UiScale?.renderPane($("#settings-pane-interface"));
   if (tab === "codes") await renderCodesPane();
   if (tab === "mcp") await renderMcpPane();
@@ -6952,8 +7169,8 @@ async function handleMcpStateChanged(kind) {
   }
   // codes / derived / ts_config / formats: recarrega painéis abertos e reconsulta a view
   try {
-    if (kind === "codes" && !$("#settings-modal").hidden && !$("#settings-pane-codes").hidden) {
-      $("#codes-editor").value = await api("get_codes", {}, { silent: true });
+    if (kind === "codes") {
+      codesChangedExternally();
       updateSysCount();
     } else if (kind === "derived") {
       const owner = window.AnalysisContexts?.capture();
@@ -7010,6 +7227,9 @@ async function mcpReloadCases() {
 function bindKeyboard() {
   document.addEventListener("keydown", (e) => {
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
+    // Settings keeps its own tab/field navigation; these explorer shortcuts
+    // must not move focus or selection behind the open dialog.
+    if (!$("#settings-modal").hidden && e.key !== "Escape") return;
     if (e.key === "/" && !typing) {
       e.preventDefault();
       $("#quick-search").focus();
@@ -7023,6 +7243,7 @@ function bindKeyboard() {
         closeDetailValue();
         return;
       }
+      if (!$("#settings-modal").hidden) { e.preventDefault(); e.stopImmediatePropagation(); closeSettings(); return; }
       closeCtxMenu();
       closeTlPop();
       closeDrawer();
@@ -7034,7 +7255,7 @@ function bindKeyboard() {
       $("#format-modal").hidden = true;
       $("#derive-modal").hidden = true;
       $("#chart-modal").hidden = true;
-      $("#ts-modal").hidden = true;
+      closeTsModal();
       $("#manual-form").hidden = true;
       closeCaseNameInput();
       $("#case-add-modal").hidden = true; pendingCaseAdd = null;
@@ -7326,8 +7547,10 @@ function bind() {
   });
 
   $("#codes-close").onclick = () => { $("#codes-modal").hidden = true; };
-  $("#codes-cancel").onclick = () => { $("#settings-modal").hidden = true; };
+  $("#codes-cancel").onclick = closeSettings;
   $("#codes-save").onclick = saveCodes;
+  $("#codes-editor").oninput = codesEdited;
+  $("#codes-reload").onclick = () => reloadCodesPane({ deliberate: true });
   $("#btn-harvest").onclick = runHarvest;
 
   // formatos de log
@@ -7350,8 +7573,10 @@ function bind() {
 
   // data/hora
   $("#ts-open").onclick = () => openTsModal();
-  $("#ts-close").onclick = () => { $("#ts-modal").hidden = true; };
-  $("#ts-modal").addEventListener("click", (e) => { if (e.target === $("#ts-modal")) $("#ts-modal").hidden = true; });
+  $("#ts-close").onclick = closeTsModal;
+  $("#ts-modal").addEventListener("click", (e) => { if (e.target === $("#ts-modal")) closeTsModal(); });
+  $("#ts-modal").addEventListener("input", clearTsTestResult);
+  $("#ts-modal").addEventListener("change", clearTsTestResult);
   $("#ts-help-btn").onclick = () => { $("#ts-help").hidden = !$("#ts-help").hidden; };
   $("#ts-format").onchange = () => {
     $("#ts-format-custom").hidden = $("#ts-format").value !== "custom";
@@ -7414,12 +7639,24 @@ function bind() {
   });
 
   $("#btn-settings").onclick = () => openSettings();
-  $("#settings-close").onclick = () => { $("#settings-modal").hidden = true; };
+  $("#settings-close").onclick = closeSettings;
   $("#settings-modal").addEventListener("click", (e) => {
-    if (e.target === $("#settings-modal")) $("#settings-modal").hidden = true;
+    if (e.target === $("#settings-modal")) closeSettings();
   });
   document.querySelectorAll("#settings-modal .settings-tab").forEach((b) => {
     b.onclick = () => openSettings(b.dataset.settingsTab);
+    b.onkeydown = event => {
+      if (event.isComposing || event.altKey || event.ctrlKey || event.metaKey) return;
+      const tabs = [...document.querySelectorAll("#settings-modal .settings-tab")].filter(button => !button.hidden);
+      const index = tabs.indexOf(b);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+        : event.key === "ArrowRight" ? (index + 1) % tabs.length : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length : -1;
+      if (next < 0) return;
+      event.preventDefault(); event.stopPropagation();
+      // Manual activation avoids loading remote panes merely to move focus.
+      tabs.forEach(button => { button.tabIndex = button === tabs[next] ? 0 : -1; });
+      tabs[next].focus();
+    };
   });
 
   $("#btn-theme").onclick = toggleTheme;

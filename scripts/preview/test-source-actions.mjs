@@ -169,8 +169,10 @@ try {
 
   phase = 'timestamp newest request and stale source response';
   await selectAction(0, 'Data/hora'); await page.waitForFunction(() => __sourceTest.configs.length === 1);
+  assert.equal(await page.locator('#ts-apply').isDisabled(), true);
+  await page.locator('#ts-close').click();
   await selectAction(1, 'Data/hora'); await page.waitForFunction(() => __sourceTest.configs.length === 2);
-  await page.evaluate(() => __sourceTest.configs[1].resolve(null)); await page.locator('#ts-modal').waitFor({ state: 'visible' });
+  await page.evaluate(() => __sourceTest.configs[1].resolve(null)); await page.waitForFunction(() => !document.querySelector('#ts-apply').disabled);
   assert.equal(await page.evaluate(() => state.tsEditingPath), fixtures[1].path);
   await page.locator('#ts-close').click(); await page.evaluate(() => __sourceTest.configs[0].resolve(null)); await settle();
   assert.equal(await page.locator('#ts-modal').isVisible(), false);
@@ -178,7 +180,7 @@ try {
   await page.evaluate(async () => { await Workspace.showPage('sources'); __sourceTest.configs[2].resolve(null); }); await settle();
   assert.equal(await page.locator('#ts-modal').isVisible(), false);
   await selectAction(0, 'Data/hora'); await page.waitForFunction(() => __sourceTest.configs.length === 4);
-  await page.locator('#ws-source-config').click();
+  await page.evaluate(() => document.querySelector('#ws-source-config').click());
   assert.equal(await page.locator('#workspace-home').isVisible(), false);
   // The timestamp draft lives in its closed modal; mark it to detect any late write.
   await page.evaluate(() => { document.querySelector('#ts-clock').value = '123'; });

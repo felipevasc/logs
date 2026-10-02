@@ -77,7 +77,7 @@ function fixture() {
     }, updatePager() { effects.renders++; }, focusRecordTarget() {},
     ctxEl: null, tlPop: null, namePopExact: false, closeCtxMenu() {}, closeTlPop() {}, closeDrawer() { effects.drawers++; $('#drawer').hidden = true; },
     closeFilterPop() { $('#filter-pop').hidden = true; }, closeNamePop() { $('#name-pop').hidden = true; }, closeDetailValue() {}, closeCaseNameInput() {},
-    detailStep() {}, pendingCaseAdd: null, editingCaseItem: null,
+    closeTsModal() { $('#ts-modal').hidden = true; }, detailStep() {}, pendingCaseAdd: null, editingCaseItem: null,
   });
   vm.runInContext(section('function visiblePreferenceKey()', '\nasync function removeArtifact'), context);
   vm.runInContext(section('function renderTable(', '// ------------------------------------------------------------------ histograma'), context);

@@ -93,6 +93,7 @@ const analysis = {
 timestampState.tsAnalysisOwner = analysis.capture();
 const timestampContext = vm.createContext({
   state: timestampState, window: { AnalysisContexts: analysis }, document: { activeElement: null }, $: () => ({}),
+  tsEditor: { paths: timestampPaths }, tsEditorActionAllowed: () => true, tsEditorCurrent: () => true, setTsEditorEnabled() {}, clearTsTestResult() {},
   tsConfigPaths: () => timestampPaths, buildTsConfig: () => timestampConfig,
   btnBusy: () => () => { timestampReleased++; },
   showLoadOverlay: (_label, key) => { timestampState.loadOverlay = true; timestampState.loadOverlayProgressKey = key; },

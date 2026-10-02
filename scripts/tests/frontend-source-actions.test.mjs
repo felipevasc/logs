@@ -50,8 +50,7 @@ function fixture() {
     sourceKey: () => key, navigator: { clipboard: { writeText: text => copy(text) } },
     toast: (text, type) => messages.push({ text, type }), fmtTs: value => `time ${value}`, fmtBytes: value => `${value} bytes`, fmtNum: String,
     activeCase: () => caseItem, recordCustody: (item, hashes) => { custody.push({ item, hashes }); return true; }, saveCases: () => custody.push('save'),
-    loadTsConfig: async (path, current) => { const pending = deferred(); timestamps.push({ path, current, ...pending }); await pending.promise; },
-    openTsModal: path => timestamps.push({ opened: path }),
+    openTsModal: async (path, current, returnFocus) => { const pending = deferred(); timestamps.push({ path, current, returnFocus, ...pending }); await pending.promise; if (current()) timestamps.push({ opened: path }); },
     api: (command, args) => { const pending = deferred(); requests.push({ command, args, ...pending }); return pending.promise; },
     removeSource: async index => removed.push(index),
   });
