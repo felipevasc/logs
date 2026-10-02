@@ -3,6 +3,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 const app = readFileSync(new URL('../../frontend/app.js', import.meta.url), 'utf8');
+const html = readFileSync(new URL('../../frontend/index.html', import.meta.url), 'utf8');
+const settingsTabs = [...html.matchAll(/data-settings-tab="([^"]+)"/g)].map(match => match[1]);
 const section = (start, end) => { const from = app.indexOf(start), to = app.indexOf(end, from); assert.ok(from >= 0 && to > from); return app.slice(from, to); };
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
@@ -19,7 +21,7 @@ function fixture({ ownership = false } = {}) {
     addEventListener(type, fn) { this['on' + type] = fn; }
   }
   const node = (id, tag) => { const value = new Node(id, tag); nodes.set('#' + id, value); return value; };
-  const tabs = ['interface', 'codes', 'mcp', 'detection', 'recovery', 'updates'].map(name => { const value = node('settings-tab-' + name, 'button'); value.dataset.settingsTab = name; return value; });
+  const tabs = settingsTabs.map(name => { const value = node('settings-tab-' + name, 'button'); value.dataset.settingsTab = name; return value; });
   const panes = tabs.map(tab => node('settings-pane-' + tab.dataset.settingsTab));
   for (const id of ['settings-modal','codes-modal','sys-count','codes-path','codes-status','codes-reload','codes-save','codes-cancel','codes-close','settings-close','btn-harvest','btn-settings','drawer','filter-pop','name-pop','detail-value-modal','col-pop']) node(id, /close|save|reload|cancel|btn-/.test(id) ? 'button' : 'div');
   const editor = node('codes-editor', 'textarea');
@@ -129,15 +131,20 @@ test('Escape declining discard stops before lower surfaces, then accepted close 
   f.allow(true); f.key('Escape'); assert.equal(f.$('#settings-modal').hidden, true); assert.equal(f.document.activeElement, f.$('#btn-settings'));
 });
 test('wrapped settings tabs retain manual activation, selected state and one roving tab stop', async () => {
+  assert.deepEqual(settingsTabs, ['interface', 'codes', 'mcp', 'detection', 'recovery', 'updates', 'resources']);
   const f = fixture(); await f.context.openSettings(); assert.equal(f.document.activeElement, f.tabs[0]);
   assert.equal(f.tabs[0].getAttribute('aria-selected'), 'true'); assert.equal(f.tabs[1].getAttribute('aria-controls'), 'settings-pane-codes');
   const e = key => ({ key, preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; } });
   const right = e('ArrowRight'); f.tabs[0].onkeydown(right); assert.equal(right.stopped, true); assert.equal(f.document.activeElement, f.tabs[1]);
   assert.equal(f.requests.length, 0, 'moving tab focus does not query'); assert.equal(f.$('#settings-pane-interface').hidden, false);
-  f.tabs[1].onkeydown(e('End')); assert.equal(f.document.activeElement, f.tabs[5]);
+  f.tabs[1].onkeydown(e('End')); assert.equal(f.document.activeElement, f.tabs[6]);
+  f.tabs[6].onkeydown(e('ArrowRight')); assert.equal(f.document.activeElement, f.tabs[0], 'Resources wraps to the first tab');
+  f.tabs[0].onkeydown(e('ArrowLeft')); assert.equal(f.document.activeElement, f.tabs[6]);
+  f.tabs[6].onkeydown(e('ArrowLeft')); assert.equal(f.document.activeElement, f.tabs[5]);
   f.tabs[5].onkeydown(e('ArrowLeft')); assert.equal(f.document.activeElement, f.tabs[3], 'hidden recovery tab is skipped');
   assert.equal(f.tabs.filter(tab => !tab.hidden && tab.tabIndex === 0).length, 1);
   const css = readFileSync(new URL('../../frontend/styles.css', import.meta.url), 'utf8');
+  assert.match(css, /\.settings-modal\s*\{\s*width:\s*min\(860px,\s*100%\)/, 'desktop modal provides space for all seven tabs without reducing text or hit targets');
   assert.match(css, /\.settings-tabs\s*\{[^}]*flex-wrap:\s*wrap/); assert.match(css, /\.settings-tab\s*\{[^}]*min-height:\s*36px/);
 });
 

@@ -722,8 +722,9 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
       };
     },
     load_files: ({ paths, merge } = {}) => {
-      if ((paths?.length > 1 || merge) && !merged) appendFirewallBatch();
-      return handlers.load_file();
+      // Case isolation clears the source before reopening it. Restore the base
+      // fixture before appending, including when a prior load was already merged.
+      return handlers.load_file({ merge: paths?.length > 1 || merge });
     },
     load_event_log: () => handlers.load_file(),
     load_bundle: ({ members }) => handlers.load_files({ paths: members.flatMap(s => s.paths || [s.path || s.channel]), merge: false }),

@@ -20,16 +20,34 @@ fn probe(path: &Path, format: &str, cache: &Path, uncached: bool) -> Value {
 
 #[test]
 fn http_mixed_metadata_matches_events_and_reopens_without_reparsing() {
+    assert_mixed_import(MIXED);
+}
+
+#[test]
+fn http_mixed_offsets_preserve_lf_crlf_and_unterminated_last_records() {
+    let lines = MIXED.lines().collect::<Vec<_>>();
+    for newline in ["\n", "\r\n"] {
+        let content = lines.join(newline);
+        assert_mixed_import(&content);
+        assert_mixed_import(&(content + newline));
+    }
+}
+
+fn assert_mixed_import(content: &str) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("mixed.log");
     let cache = root.path().join("cache");
-    std::fs::write(&path, MIXED).unwrap();
+    std::fs::write(&path, content).unwrap();
     let first = probe(&path, "auto", &cache, false);
     assert_eq!(first["format"], "mixed");
     assert_eq!(first["rows"], 7);
     let events = first["events"].as_array().unwrap();
     let mut offset = 0usize;
-    for (id, line) in MIXED.lines().enumerate() {
+    // Identity uses offsets into the original source bytes. `.lines()` drops
+    // CRLF, so counting `line.len() + 1` only works for LF checkouts.
+    for (id, record) in content.split_inclusive('\n').enumerate() {
+        let line = record.strip_suffix('\n').unwrap_or(record);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         assert_eq!(events[id]["raw"], line);
         assert_eq!(events[id]["id"], id);
         assert!(events[id]["event_ref"]
@@ -41,7 +59,7 @@ fn http_mixed_metadata_matches_events_and_reopens_without_reparsing() {
             first["metadata"][id][2].as_i64().unwrap(),
             events[id]["timestamp"].as_i64().unwrap_or(0)
         );
-        offset += line.len() + 1;
+        offset += record.len();
     }
     assert_eq!(events[0]["fields"]["client_ip"], "203.0.113.10");
     assert_eq!(events[1]["fields"]["pid"], "77");

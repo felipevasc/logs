@@ -161,11 +161,13 @@ try {
       return { width: innerWidth, theme: document.documentElement.dataset.theme, modal: { left: bounds.left, right: bounds.right, bottom: bounds.bottom }, overflow: strip.scrollWidth > strip.clientWidth + 1,
         bodyOverflow: body.scrollWidth > body.clientWidth + 1, tabs, rows: new Set(tabs.map(tab => Math.round(tab.top))).size };
     });
+    assert.deepEqual(layout.tabs.map(button => button.label), ['Interface', 'Códigos', 'MCP', 'Detecção', 'Recuperação', 'Atualizações', 'Recursos']);
     assert.equal(layout.overflow, false); assert.equal(layout.bodyOverflow, false); assert.ok(layout.modal.left >= 0 && layout.modal.right <= width);
     for (const button of layout.tabs) { assert.ok(button.left >= layout.modal.left && button.right <= layout.modal.right); assert.ok(button.font >= 12 && button.height >= 36); assert.equal(button.hit, true, button.label); }
     if (width === 320) assert.ok(layout.rows > 1); else assert.equal(layout.rows, 1);
     await tab('codes').focus(); await page.keyboard.press('End');
-    assert.equal(await tab('updates').evaluate(node => node === document.activeElement), true);
+    assert.equal(await tab('resources').evaluate(node => node === document.activeElement), true);
+    await page.keyboard.press('ArrowLeft'); assert.equal(await tab('updates').evaluate(node => node === document.activeElement), true);
     await page.keyboard.press('Home'); assert.equal(await tab('interface').evaluate(node => node === document.activeElement), true);
     await page.keyboard.press('ArrowRight'); await page.keyboard.press('Enter');
     assert.equal(await tab('codes').getAttribute('aria-selected'), 'true');
