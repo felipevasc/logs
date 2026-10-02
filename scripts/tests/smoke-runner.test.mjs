@@ -25,5 +25,7 @@ test('preview runner continues independent checks and still fails overall', asyn
     assert.equal(result.code, 1);
     assert.match(result.output, /subsequent fixture completed/);
     assert.match(result.output, /1\/2 preview regressions failed/);
+    assert.match(result.output, /Preview duration: .*\(failed\)/);
+    assert.match(result.output, /Preview duration: .*\(passed\)/);
   } finally { await Promise.all(paths.map(path => rm(path, { force: true }))); }
 });

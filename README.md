@@ -55,6 +55,8 @@ A versão publicada, com os instaladores de **Windows e Linux**, fica em [GitHub
 
 A partir da 0.6.0 o LogInsight se atualiza: ao abrir, consulta a última Release e, se houver versão nova, pergunta antes de baixar e instalar. Prefira o `.exe` no Windows e o `.AppImage` no Linux, que atualizam sem senha de administrador; `.msi`, `.deb` e `.rpm` também atualizam, mas pedem a senha. Quem usa a 0.5.x instala a 0.6.0 manualmente uma vez. Detalhes em [Atualizações](docs/atualizacoes.md).
 
+As verificações de PR usam [validação essencial e por área alterada](docs/ci-validation.md): testes rápidos sempre, navegador essencial mais subsistemas afetados e suíte nativa completa quando Rust/build/instalador mudam. O build portátil Windows é opcional; o disparo manual permite regressão completa.
+
 O workflow [Build Windows and Linux](https://github.com/felipevasc/logs/actions/workflows/build.yml) executa os testes do backend e gera instaladores x64 a cada push de codigo para `main`. Tambem pode ser iniciado pela opcao **Run workflow** no GitHub Actions. Os downloads ficam nos artefatos da execucao por 30 dias:
 
 - **Windows:** instalador `.exe` (NSIS) e `.msi`.
