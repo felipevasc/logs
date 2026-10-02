@@ -13,6 +13,65 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, red
 const errors = [], results = {};
 let phase = "startup";
 page.on("pageerror", error => errors.push(error.stack || error.message));
+
+// Only active pivot chip labels: resolve their translucent surface against the
+// actual opaque ancestor, rather than assuming white or the root background.
+function measurePivotChipContrast() {
+  const rgba = value => {
+    if (!/^rgba?\([\d.,\s]+\)$/.test(value)) throw Error(`Unsupported computed color: ${value}`);
+    const channels = value.match(/[\d.]+/g).map(Number);
+    return channels.length === 3 ? [...channels, 1] : channels;
+  };
+  const over = (front, back) => [...front.slice(0, 3).map((channel, index) => channel * front[3] + back[index] * (1 - front[3])), 1];
+  const luminance = color => color.slice(0, 3).map(channel => {
+    const value = channel / 255;
+    return value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4;
+  }).reduce((total, value, index) => total + value * [.2126, .7152, .0722][index], 0);
+  const describe = node => `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ""}${[...node.classList].map(name => `.${name}`).join("")}`;
+  return [...document.querySelectorAll("#aw-pivot-config-zones .cube-chip")].filter(chip => chip.getClientRects().length).map(chip => {
+    const label = chip.querySelector(":scope > span"), layers = [];
+    if (!label) throw Error("Active pivot chip has no label");
+    for (let node = label; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      const behindOpaque = layers.at(-1)?.rgba[3] === 1;
+      if ((!behindOpaque && style.backgroundImage !== "none") || Number(style.opacity) !== 1 || style.filter !== "none" || style.mixBlendMode !== "normal") {
+        throw Error(`Unsupported contrast layer: ${describe(node)}`);
+      }
+      if (!behindOpaque) layers.push({ element: describe(node), color: style.backgroundColor, rgba: rgba(style.backgroundColor) });
+    }
+    if (layers.at(-1)?.rgba[3] !== 1) throw Error("Pivot chip has no opaque ancestor background");
+    let background = layers.at(-1).rgba;
+    for (let index = layers.length - 2; index >= 0; index--) background = over(layers[index].rgba, background);
+    const color = getComputedStyle(label).color, foreground = over(rgba(color), background);
+    const light = luminance(foreground), dark = luminance(background);
+    return {
+      label: label.textContent, color, foreground, background, layers,
+      opaqueAncestor: layers.at(-1).element,
+      ratio: (Math.max(light, dark) + .05) / (Math.min(light, dark) + .05),
+    };
+  });
+}
+function assertPivotChipContrast(chips, description) {
+  assert.ok(chips.length > 0, `${description}: active pivot chips must be measured`);
+  for (const chip of chips) assert.ok(chip.ratio >= 4.5, `${description}: ${chip.label} is ${chip.ratio.toFixed(2)}:1 (${chip.color} over ${JSON.stringify(chip.background)})`);
+}
+const pivotRequests = () => page.evaluate(() => ({ calls: window.__mockCommandCalls.pivot || 0, requestVersion: cubeState.requestVersion }));
+async function setStableTheme(theme) {
+  await page.evaluate(async theme => {
+    if (document.documentElement.dataset.theme !== theme) toggleTheme();
+    const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await frames();
+    // Measure the settled palette, not a mixed intermediate background during
+    // the existing 140 ms cube-zone transition. Product timing stays unchanged.
+    for (;;) {
+      const transitions = document.getAnimations().filter(animation => animation instanceof CSSTransition
+        && (animation.playState === 'running' || animation.pending));
+      if (!transitions.length) return;
+      await Promise.all(transitions.map(animation => animation.finished.catch(() => {})));
+      await frames();
+    }
+  }, theme);
+}
 try {
   await page.goto(url);
   await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && state.loaded && state.rows.length > 0 && !state.loadOverlay && document.querySelector("#load-overlay").hidden);
@@ -231,7 +290,8 @@ try {
   });
   for (const width of [1440, 1024]) for (const theme of ["dark", "light"]) {
     await page.setViewportSize({ width, height: width === 1440 ? 960 : 768 });
-    await page.evaluate(theme => { if (document.documentElement.dataset.theme !== theme) toggleTheme(); }, theme);
+    const requestsBeforeTheme = await pivotRequests();
+    await setStableTheme(theme);
     await page.evaluate(() => {
       const table = document.querySelector("#cube-table-view"); table.scrollTop = 120; table.scrollLeft = 20;
       const cube = activeCube();
@@ -242,11 +302,14 @@ try {
       };
     });
     const expanded = await measureLayout();
+    const expandedChips = await page.evaluate(measurePivotChipContrast);
+    assertPivotChipContrast(expandedChips, `dataset/${theme}/${width}/expanded`);
     await page.screenshot({ path: resolve(output, `workbench-pivot-expanded-${theme}-${width}.png`) });
     await page.locator("#aw-pivot-config-toggle").focus(); await page.keyboard.press("Enter");
     assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "false");
     assert.equal(await page.locator("#aw-pivot-config-zones").isVisible(), false);
     assert.equal(await page.locator("#aw-pivot-fields").isVisible(), false);
+    assert.equal(await page.locator("#aw-pivot-config-zones .cube-chip:visible").count(), 0);
     const collapsed = await measureLayout();
     await page.screenshot({ path: resolve(output, `workbench-pivot-collapsed-${theme}-${width}.png`) });
     const preserved = await page.evaluate(() => {
@@ -275,7 +338,11 @@ try {
       const table = document.querySelector("#cube-table-view"), previous = window.__configurationProbe.scroll;
       return table.scrollLeft === previous[0] && table.scrollTop === previous[1];
     }), true, "reopening restores even positions clamped by the larger viewport");
-    results.configurationLayout.push({ width, theme, expanded, collapsed, preserved });
+    const reopenedChips = await page.evaluate(measurePivotChipContrast);
+    assertPivotChipContrast(reopenedChips, `dataset/${theme}/${width}/reopened`);
+    assert.deepEqual(reopenedChips, expandedChips, "folding preserves the active chip labels and their effective colors");
+    assert.deepEqual(await pivotRequests(), requestsBeforeTheme, "theme changes and the complete folding round-trip issue no pivot query");
+    results.configurationLayout.push({ width, theme, expanded, collapsed, preserved, chipContrast: { expanded: expandedChips, reopened: reopenedChips } });
   }
 
   phase = "folding preferences survive real workspace rotation";
@@ -292,6 +359,21 @@ try {
   await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "case");
   results.configurationRotation.case = await rotationState();
   assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "true", "a new context does not inherit the previous folding choice");
+  results.caseChipContrast = [];
+  for (const theme of ["dark", "light"]) {
+    const requestsBeforeTheme = await pivotRequests();
+    await setStableTheme(theme);
+    const expanded = await page.evaluate(measurePivotChipContrast);
+    assertPivotChipContrast(expanded, `case/${theme}/expanded`);
+    await page.getByRole("button", { name: "Recolher configuração", exact: true }).click();
+    assert.equal(await page.locator("#aw-pivot-config-zones .cube-chip:visible").count(), 0);
+    await page.getByRole("button", { name: "Editar configuração", exact: true }).click();
+    const reopened = await page.evaluate(measurePivotChipContrast);
+    assertPivotChipContrast(reopened, `case/${theme}/reopened`);
+    assert.deepEqual(reopened, expanded, "Case chip colors and labels survive folding");
+    assert.deepEqual(await pivotRequests(), requestsBeforeTheme, "Case theme/folding changes issue no pivot query");
+    results.caseChipContrast.push({ theme, expanded, reopened });
+  }
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", tab: "cube", animate: false }));
   results.configurationRotation.returning = await rotationState();
   await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "dataset" && document.querySelector("#cube-table tbody").rows.length > 1);
