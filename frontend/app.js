@@ -589,10 +589,99 @@ const esc = (s) =>
   );
 const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Only frequent, benign acknowledgements coalesce. Errors, context warnings and
+// evidence/Undo receipts keep their own identity and existing lifetime.
+const repeatableToastMessages = new Set([
+  "Copiado.", "Valor copiado.", "Nome copiado.", "JSON copiado.", "SHA-256 copiado.",
+  "Filtro atualizado.", "Filtro adicionado.",
+]);
+const toastFeedback = new Map();
+let toastFeedbackArea = null, toastFeedbackObserver = null;
+
+function positionToastFeedback() {
+  const area = toastFeedbackArea, focused = document.activeElement;
+  if (!area?.children.length || area.contains(focused)) return;
+  const inset = 18, gap = 8, size = area.getBoundingClientRect();
+  const right = Math.max(inset, window.innerWidth - size.width - inset);
+  const bottom = Math.max(inset, window.innerHeight - size.height - inset);
+  const obstacles = [...document.querySelectorAll(".popover:not([hidden]), .modal-actions")];
+  const interactiveArea = $("#toast-area");
+  if (interactiveArea?.children.length) obstacles.unshift(interactiveArea);
+  if (focused && focused !== document.body && focused !== document.documentElement) obstacles.unshift(focused);
+  const bounds = obstacles.filter(node => node.getClientRects().length).map(node => node.getBoundingClientRect());
+  const positions = [[right, bottom], [inset, bottom], [right, inset], [inset, inset]];
+  // A focused control near the middle can also leave room directly above/below
+  // it when neither vertical corner fits (for example at increased UI scale).
+  if (bounds.length) for (const y of [bounds[0].top - size.height - gap, bounds[0].bottom + gap]) {
+    if (y >= inset && y <= bottom) positions.push([right, y], [inset, y]);
+  }
+  const overlaps = ([x, y], rect) => x < rect.right + gap && x + size.width > rect.left - gap
+    && y < rect.bottom + gap && y + size.height > rect.top - gap;
+  const best = positions.find(point => bounds.every(rect => !overlaps(point, rect)))
+    || positions.find(point => !bounds.length || !overlaps(point, bounds[0])) || positions[0];
+  area.style.left = `${best[0]}px`; area.style.top = `${best[1]}px`;
+  area.style.right = "auto"; area.style.bottom = "auto";
+}
+
+function removeToastFeedback(node) {
+  const record = toastFeedback.get(node);
+  if (!record) return;
+  clearTimeout(record.timer); cancelAnimationFrame(record.announcement);
+  toastFeedback.delete(node); node.remove();
+  if (toastFeedback.size) positionToastFeedback();
+  else {
+    document.removeEventListener("focusin", positionToastFeedback);
+    document.removeEventListener("scroll", positionToastFeedback, true);
+    window.removeEventListener("resize", positionToastFeedback);
+    toastFeedbackObserver?.disconnect(); toastFeedbackObserver = null;
+    toastFeedbackArea?.remove(); toastFeedbackArea = null;
+  }
+}
+
 function toast(msg, type = "info") {
-  const t = el("div", `toast ${type}`, msg);
-  $("#toast-area").appendChild(t);
-  setTimeout(() => t.remove(), 4200);
+  const message = String(msg ?? ""), repeatable = type === "ok" && repeatableToastMessages.has(message);
+  if (repeatable) for (const [node, record] of toastFeedback) {
+    if (record.message !== message || record.type !== type) continue;
+    if (!node.isConnected) { removeToastFeedback(node); continue; }
+    record.count += 1;
+    record.badge.textContent = `×${record.count}`; record.badge.hidden = false;
+    clearTimeout(record.timer); record.timer = setTimeout(() => removeToastFeedback(node), 4200);
+    positionToastFeedback();
+    return;
+  }
+  const node = el("div", `toast ${type} toast-feedback${repeatable ? " toast-passive" : ""}`), text = el("span", "toast-message");
+  const badge = el("span", "toast-repeat-count");
+  node.setAttribute("role", type === "err" ? "alert" : "status");
+  node.setAttribute("aria-atomic", "true");
+  badge.setAttribute("aria-hidden", "true"); badge.hidden = true;
+  node.appendChild(text); node.appendChild(badge);
+  if (!toastFeedback.size) {
+    document.addEventListener("focusin", positionToastFeedback);
+    document.addEventListener("scroll", positionToastFeedback, true);
+    window.addEventListener("resize", positionToastFeedback);
+    const interactiveArea = $("#toast-area");
+    if (interactiveArea) {
+      // Legacy Undo owns its lane, layout and lifetime. Its growth may move only
+      // this separate feedback lane, never its button or another receipt.
+      toastFeedbackObserver = new MutationObserver(positionToastFeedback);
+      toastFeedbackObserver.observe(interactiveArea, { childList: true, subtree: true, characterData: true });
+    }
+  }
+  if (!toastFeedbackArea?.isConnected) {
+    toastFeedbackArea = el("div"); toastFeedbackArea.id = "toast-feedback-area";
+    document.body.appendChild(toastFeedbackArea);
+  }
+  toastFeedbackArea.appendChild(node);
+  const record = { message, type, badge, count: 1, timer: null, announcement: null };
+  toastFeedback.set(node, record);
+  // Register the live region before filling it; repetitions only update the
+  // aria-hidden counter, so rapid copies do not narrate the same text repeatedly.
+  record.announcement = requestAnimationFrame(() => {
+    if (!node.isConnected) { removeToastFeedback(node); return; }
+    text.textContent = message; positionToastFeedback();
+  });
+  record.timer = setTimeout(() => removeToastFeedback(node), 4200);
+  positionToastFeedback();
 }
 
 // ------------------------------------------------------------------ indicador global

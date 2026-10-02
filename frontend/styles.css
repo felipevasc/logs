@@ -893,6 +893,11 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1
   position: fixed; bottom: 18px; right: 18px; z-index: 120;
   display: flex; flex-direction: column; gap: 8px;
 }
+#toast-feedback-area {
+  position: fixed; bottom: 18px; right: 18px; z-index: 119;
+  display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
+  width: max-content; max-width: calc(100vw - 36px); pointer-events: none;
+}
 .toast {
   padding: 10px 16px; border-radius: 8px;
   background: var(--bg-3); color: var(--text-0);
@@ -900,9 +905,19 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1
   box-shadow: var(--shadow); font-size: 12.5px; max-width: 420px;
   animation: toast-in 0.18s ease-out;
 }
+.toast-feedback {
+  display: flex; align-items: baseline; gap: 10px;
+  max-width: min(420px, calc(100vw - 36px)); overflow-wrap: anywhere;
+  pointer-events: auto; user-select: text; animation-name: toast-feedback-in;
+}
+.toast-passive { pointer-events: none; }
+.toast-message { min-width: 0; }
+.toast-repeat-count { flex: none; color: var(--text-1); font-variant-numeric: tabular-nums; }
 .toast.ok { border-left-color: #3fb950; }
 .toast.err { border-left-color: var(--lv-erro); }
 @keyframes toast-in { from { transform: translateX(24px); opacity: 0; } }
+@keyframes toast-feedback-in { from { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .toast-feedback { animation: none; } }
 
 .spin { animation: li-spin 0.9s linear infinite; }
 @keyframes li-spin { to { transform: rotate(360deg); } }

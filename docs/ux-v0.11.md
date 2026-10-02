@@ -108,4 +108,10 @@ A infraestrutura já integrada à main foi incorporada preservando os dois pilot
 
 A primeira proposta de espera foi considerada discreta demais: o personagem parecia decorativo. A revisão mantém a identidade do robô e o torna agente da ação. O piloto de leitura/organização ganhou corpo, mãos, apoio alternado dos pés, contato com a folha, transporte, depósito e reação no visor. O ciclo longo dura 7,2 segundos; a espera curta tem gesto próprio de 2,4 segundos, sem acelerar o filme inteiro. A folha transportada é filha da mão, sem trajetória independente. Estados e contagens não são governados pelo movimento.
 
-A direção do estudo isolado foi aprovada pelo usuário. A integração em navegador ainda requer o próximo CI, com um ciclo completo gravado, comparação de dois cantos nas poses de contato e capturas escura/clara. As demais famílias só devem reutilizar essa linguagem após a validação do piloto. O tema claro tem contorno bronze de alto contraste e forced-colors conserva o desenho estático.
+A direção do estudo isolado foi aprovada pelo usuário. O CI54 confirmou a integração com um ciclo completo gravado, comparação de dois cantos nas poses de contato e capturas escura/clara; os dezenove roteiros de preview passaram. As demais famílias só devem reutilizar essa linguagem após a validação do piloto. O tema claro tem contorno bronze de alto contraste e forced-colors conserva o desenho estático.
+
+### Feedback de ações repetidas
+
+Confirmações benignas equivalentes de cópia e filtro passam a ocupar um único aviso com contador discreto, sem narrar a mesma mensagem várias vezes. Erros, avisos de contexto e recibos não são agregados. O feedback gerenciado usa um contêiner separado, para não mover, encurtar ou ocultar o Undo; somente os sete avisos benignos são transparentes ao ponteiro. Mensagens de erro continuam selecionáveis e copiáveis.
+
+O posicionamento evita foco, editor e ações quando houver espaço. Timers, frames, observer e listeners são encerrados ao remover o último aviso. A revisão independente fechou as regressões de geometria do Undo e seleção de erros; o roteiro de navegador próprio ainda depende de CI.
