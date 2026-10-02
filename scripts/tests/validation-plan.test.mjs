@@ -61,6 +61,15 @@ test('Timeline export and shared waiting changes retain both real output pilots'
   }
   assert(fullPreview.includes('test-timeline-export-waiting.mjs'));
 });
+test('source views and shared menus retain exact-path and compact source actions checks', () => {
+  for (const path of ['frontend/workspace.js', 'frontend/workspace.css', 'frontend/context-menu.js']) {
+    const plan = planValidation([path]);
+    assert.equal(plan.native, false, path);
+    contains(plan.preview, [...essentialPreview, 'test-source-actions.mjs']);
+  }
+  assert(fullPreview.includes('test-source-actions.mjs'));
+  assert(fullPreview.includes('test-columns.mjs'));
+});
 test('full request and missing comparison data cannot produce an empty or focused green', () => {
   for (const plan of [planValidation([]), planValidation(['docs/readme.md'], { full: true })]) {
     assert.equal(plan.native, true);

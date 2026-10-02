@@ -152,7 +152,9 @@ window.ContextMenu = (() => {
       if (event.defaultPrevented || event.repeat || event.ctrlKey || event.metaKey || event.altKey
         || !(event.key === "ContextMenu" || event.key === "F10" && event.shiftKey)) return;
       const target = document.activeElement;
-      if (!validFocus(target)) return;
+      // Explicit native-menu surfaces keep their browser/OS keyboard command.
+      // This opt-out applies only before a custom menu has been opened.
+      if (!validFocus(target) || target.getAttribute("data-native-context-menu") !== null) return;
       // Reuse the existing caller and its actions without adding every table cell
       // to the tab order. Delegated, non-focusable text still needs its own model.
       let caller = target;

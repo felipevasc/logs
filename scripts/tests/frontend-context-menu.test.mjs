@@ -166,9 +166,9 @@ test('empty and all-disabled menus keep keyboard focus and can be dismissed', ()
 });
 
 test('Shift+F10 and ContextMenu reuse the focused caller without firing its primary click', () => {
-  for (const key of ['F10', 'ContextMenu']) {
+  for (const key of ['F10', 'ContextMenu']) for (const [tag, className] of [['button', 'source-path-toggle'], ['button', 'source-menu-trigger'], ['input', 'source-check'], ['textarea', 'unmarked-editable']]) {
     const h = harness(); let calls = 0, primary = 0;
-    const row = h.node('div'), button = h.node('button', row);
+    const row = h.node('div'), button = h.node(tag, row); button.className = className;
     row.oncontextmenu = event => { calls++; event.preventDefault(); h.open([choice('Alternate')]); };
     button.onclick = () => primary++;
     button.focus();
@@ -177,6 +177,32 @@ test('Shift+F10 and ContextMenu reuse the focused caller without firing its prim
     assert.equal(h.controller.element.style.left, '20px'); assert.equal(h.controller.element.style.top, '70px');
     h.key('Escape'); assert.equal(h.document.activeElement, button);
   }
+});
+
+test('explicit native context-menu opt-out preserves both keyboard commands without synthetic dispatch', () => {
+  for (const key of ['F10', 'ContextMenu']) for (const marker of ['', 'true']) {
+    const h = harness(), row = h.node('div'), textarea = h.node('textarea', row);
+    let calls = 0, dispatches = 0;
+    row.oncontextmenu = () => { calls++; };
+    textarea.setAttribute('data-native-context-menu', marker);
+    textarea.dispatchEvent = () => { dispatches++; };
+    textarea.focus();
+    const event = h.key(key, { shiftKey: key === 'F10' });
+    assert.equal(event.defaultPrevented, false); assert.equal(event.stopped, false);
+    assert.equal(dispatches, 0); assert.equal(calls, 0); assert.equal(h.controller.element, null);
+    assert.equal(h.document.activeElement, textarea);
+  }
+});
+
+test('native-menu marker never bypasses key handling or Escape inside an already open custom menu', () => {
+  const h = harness(); h.open([choice('Action')]);
+  h.items()[0].setAttribute('data-native-context-menu', '');
+  for (const key of ['ContextMenu', 'F10']) {
+    assert.equal(h.key(key, { shiftKey: key === 'F10' }).defaultPrevented, true);
+    assert.ok(h.controller.element);
+  }
+  assert.equal(h.key('Escape').defaultPrevented, true);
+  assert.equal(h.controller.element, null); assert.equal(h.document.activeElement, h.origin);
 });
 
 test('invocation does not hijack unrelated controls, IME or modified shortcuts', () => {

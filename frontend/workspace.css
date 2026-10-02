@@ -162,3 +162,19 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 #settings-pane-interface .ui-pref { min-width: 0; grid-template-columns: minmax(0, 1fr); }
 #settings-pane-interface .ui-scale-choices { display: flex; width: 100%; min-width: 0; max-width: 100%; flex-wrap: wrap; }
 #settings-pane-interface .ui-scale-choices > .seg-btn { flex: 0 0 auto; }
+
+/* Sources: paths and occasional actions stay available without permanent rows of buttons. */
+.source-toolbar{flex-wrap:wrap}
+.source-table-scroll{max-width:100%;overflow-x:auto}.source-table-scroll:focus-visible{outline:2px solid var(--accent-strong,var(--accent));outline-offset:-2px}
+.sources-table{table-layout:fixed;min-width:650px}
+.sources-table th,.sources-table td{padding:10px 12px}
+.sources-table .source-selection-cell,.sources-table .source-menu-cell{width:48px;padding-inline:8px}
+.sources-table .source-format-cell{width:100px}.sources-table .source-number-cell{width:84px}.sources-table .source-reading-cell{width:158px}
+.sources-table .source-file-cell{min-width:0}.sources-table .tag{max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.source-path-toggle{display:flex;align-items:center;gap:7px;width:100%;min-height:28px;padding:0;border:0;background:transparent;color:var(--text-0);font:inherit;font-weight:600;text-align:left;cursor:pointer}
+.source-path-toggle>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-path-toggle>i{flex:none;font-size:9px;color:var(--text-2)}
+.source-path-toggle[aria-expanded="true"]>i{transform:rotate(90deg)}.source-path-toggle:hover{color:var(--accent-strong,var(--accent))}
+.source-path-details{margin-top:10px}.source-full-path{display:block;width:100%;max-width:100%;min-width:0;resize:vertical;box-sizing:border-box;padding:8px;border:1px solid var(--border-strong);border-radius:5px;background:var(--code-bg);color:var(--text-0);font:11px/1.5 var(--font-mono);overflow-wrap:anywhere;white-space:pre-wrap;user-select:text}
+.source-path-details>.text-button{margin-top:6px}.source-hashes{display:flex;flex-direction:column;align-items:flex-start;gap:5px;margin-top:6px}.source-hashes:empty{display:none}.source-hashes .hash-copy{max-width:100%;white-space:normal;overflow-wrap:anywhere;text-align:left}
+.source-path-toggle:focus-visible,.source-menu-trigger:focus-visible,.source-full-path:focus-visible{outline:2px solid var(--accent-strong,var(--accent));outline-offset:2px}
+@media(max-width:1100px){.sources-table .source-format-cell{width:78px}.sources-table .source-number-cell{width:72px}.sources-table .source-reading-cell{width:132px}}

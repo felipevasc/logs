@@ -260,48 +260,158 @@
       area.innerHTML = `<div class="metric-grid">${metric("Referência", fmtNum(res.before_total), "eventos")}${metric("Análise", fmtNum(res.after_total), "eventos")}${metric("Erros · referência", pct(res.before_errors / Math.max(1, res.before_total)), fmtNum(res.before_errors) + " erros", "error")}${metric("Erros · análise", pct(res.after_errors / Math.max(1, res.after_total)), fmtNum(res.after_errors) + " erros", "error")}</div>${res.limited ? note("Limite de padrões atingido. Refine os períodos para detalhar as diferenças.") : ""}${!res.before_total || !res.after_total ? note("Um dos períodos não contém eventos. Revise a cobertura antes de interpretar as diferenças.") : ""}<section class="ws-card"><div class="card-heading"><h2>O que mudou</h2><span>Participação no volume de cada período</span></div><table class="ws-table"><thead><tr><th>Padrão</th><th class="num">Referência</th><th class="num">Análise</th><th class="num">Diferença</th></tr></thead><tbody>${res.changes.map((c, i) => `<tr><td><button class="pattern-button" data-action="change" data-index="${i}">${esc(c.pattern)}</button>${!c.before && c.after ? '<div class="pattern-meta">Aparece somente no período de análise</div>' : ""}</td><td class="num">${fmtNum(c.before)}<div class="pattern-meta">${pct(c.before_rate)}</div></td><td class="num">${fmtNum(c.after)}<div class="pattern-meta">${pct(c.after_rate)}</div></td><td class="num ${c.delta > 0 ? "delta-plus" : "delta-minus"}">${c.delta > 0 ? "+" : ""}${(c.delta * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} pp</td></tr>`).join("")}</tbody></table></section>`;
     } catch (e) { if (compareCurrent() && contextKey === sourceKey() && area.isConnected) area.innerHTML = note(String(e)); } finally { button.disabled = false; }
   }
+  // Source actions capture a rendered source, not an index reused by a later list.
+  let sourceView = null, sourceDateRequest = 0;
+  const sourceContextCurrent = target => !!target && page === "sources" && !home.hidden && !content.hidden && target.view.key === sourceKey()
+    && (!target.view.owner || window.AnalysisContexts.isCurrent(target.view.owner));
+  const sourceActionCurrent = target => sourceContextCurrent(target) && sourceView === target.view
+    && sourceList === target.view.sources && target.view.table.isConnected
+    && sourceList.includes(target.source) && target.source.path === target.path;
+  function sourceActionAllowed(target) {
+    if (sourceActionCurrent(target)) return true;
+    toast("A fonte mudou. Abra suas ações novamente.", "info"); return false;
+  }
+  function sourceFocusFallback() {
+    return [$("#ws-source-add"), document.querySelector('.nav-pages button[aria-current="page"]')].filter(Boolean);
+  }
+  function resolveSourceFocus(target, selector) {
+    if (!sourceContextCurrent(target) || !sourceView?.table.isConnected) return null;
+    return [...sourceView.table.querySelectorAll("[data-source-row]")]
+      .find(row => row._sourceTarget?.path === target.path)?.querySelector(selector) || null;
+  }
+  const sourceMenu = window.ContextMenu.create({
+    captureReturnFocus: origin => {
+      const target = origin?.closest?.("[data-source-row]")?._sourceTarget;
+      const selector = origin?.closest?.(".source-path-toggle") ? ".source-path-toggle"
+        : origin?.closest?.(".source-check") ? ".source-check" : ".source-menu-trigger";
+      return target ? () => resolveSourceFocus(target, selector) : null;
+    },
+    fallbackFocus: sourceFocusFallback,
+  });
+  async function copySourceText(target, value, success) {
+    if (!sourceActionAllowed(target)) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      if (sourceActionCurrent(target)) toast(success, "ok");
+    } catch { if (sourceActionCurrent(target)) toast("Não foi possível copiar. Selecione o texto e tente novamente.", "err"); }
+  }
+  function toggleSourcePath(target, expanded = target.details.hidden) {
+    if (!sourceActionAllowed(target)) return;
+    const restore = !expanded && target.details.contains(document.activeElement);
+    target.details.hidden = !expanded;
+    target.toggle.setAttribute("aria-expanded", String(expanded));
+    if (restore) target.toggle.focus({ preventScroll: true });
+  }
+  async function configureSourceTime(target) {
+    if (!sourceActionAllowed(target)) return;
+    const request = ++sourceDateRequest;
+    const current = () => sourceActionCurrent(target) && request === sourceDateRequest;
+    await loadTsConfig(target.path, current);
+    if (current()) openTsModal(target.path);
+  }
+  async function hashSources(target) {
+    if (!sourceActionAllowed(target) || target.view.hashing) return;
+    const view = target.view, c = activeCase(), artifact = c?.artifacts?.find(a => a.id === state.currentArtifact?.id);
+    view.hashing = true;
+    target.status.textContent = "Calculando SHA-256…"; target.status.hidden = false;
+    try {
+      const hashes = await api("source_hashes", {}, { silent: true });
+      if (!sourceActionCurrent(target)) return;
+      for (const row of view.table.querySelectorAll("[data-source-row]")) {
+        const rowTarget = row._sourceTarget, own = hashes.find(hash => hash.path === rowTarget.path);
+        rowTarget.hashes.replaceChildren();
+        if (!own) continue;
+        const pack = rowTarget.path.includes("!/") ? hashes.find(hash => hash.path === rowTarget.path.split("!/")[0]) : null;
+        for (const [hash, label] of [[own, own.origin === "extraído" ? "SHA-256 (extraído)" : "SHA-256"], ...(pack ? [[pack, "SHA-256 do pacote"]] : [])]) {
+          const button = el("button", "hash-copy", `${label} ${hash.sha256.slice(0, 12)}…${hash.sha256.slice(-8)}`);
+          button.type = "button"; button.title = `${hash.name} · ${fmtBytes(hash.bytes)}\n${hash.sha256}\nClique para copiar`;
+          button.setAttribute("aria-label", `Copiar ${label} de ${hash.name}: ${hash.sha256}`);
+          button.onclick = () => copySourceText(rowTarget, hash.sha256, "SHA-256 copiado.");
+          rowTarget.hashes.append(button);
+        }
+      }
+      toggleSourcePath(target, true);
+      if (c === activeCase() && artifact && c.artifacts?.includes(artifact) && recordCustody(artifact, hashes)) saveCases();
+    } catch (error) { if (sourceActionCurrent(target)) toast(`Não foi possível calcular SHA-256: ${String(error)}`, "err"); }
+    finally {
+      view.hashing = false;
+      if (sourceActionCurrent(target)) { target.status.textContent = ""; target.status.hidden = true; }
+    }
+  }
+  function openSourceMenu(event, target) {
+    event.preventDefault(); event.stopPropagation();
+    if (!sourceActionAllowed(target)) return;
+    window.CanonicalFields?.cancel();
+    const origin = event.target?.closest?.(".source-path-toggle,.source-menu-trigger,.source-check") || target.menu;
+    const box = origin.getBoundingClientRect();
+    sourceMenu.open(event.type === "contextmenu" ? event.clientX : box.left, event.type === "contextmenu" ? event.clientY : box.bottom, [
+      { icon: "fa-folder-open", label: target.details.hidden ? "Ver caminho completo" : "Ocultar caminho completo", onClick: () => toggleSourcePath(target) },
+      { icon: "fa-copy", label: "Copiar caminho", onClick: () => copySourceText(target, target.path, "Caminho copiado.") },
+      { sep: true },
+      { icon: "fa-clock", label: "Data/hora", onClick: () => configureSourceTime(target) },
+      { icon: "fa-fingerprint", label: target.view.hashing ? "Calculando SHA-256…" : "Calcular SHA-256", disabled: target.view.hashing,
+        title: "Calcular o SHA-256 dos arquivos para a cadeia de custódia", onClick: () => hashSources(target) },
+      { sep: true },
+      { icon: "fa-trash-can", label: "Remover da análise", danger: true, onClick: async () => {
+        if (!sourceActionAllowed(target)) return;
+        await removeSource(sourceList.indexOf(target.source));
+        if (document.activeElement === document.body && page === "sources") $("#ws-source-add")?.focus({ preventScroll: true });
+      } },
+    ], { trigger: origin, label: `Ações da fonte ${target.source.name}` });
+  }
+  function buildSourceRow(source, index, view) {
+    const row = el("tr"); row.dataset.sourceRow = String(index);
+    const target = { source, path: source.path, view }; row._sourceTarget = target;
+    const selection = el("td", "source-selection-cell"), check = el("input", "source-check");
+    check.type = "checkbox"; check.checked = true; check.dataset.sourceIndex = String(index);
+    check.setAttribute("aria-label", `Selecionar ${source.name}: ${source.path}`); selection.append(check);
+    const file = el("td", "source-file-cell"), toggle = el("button", "source-path-toggle");
+    toggle.type = "button"; toggle.title = source.path;
+    toggle.setAttribute("aria-label", `Caminho completo de ${source.name}: ${source.path}`);
+    toggle.setAttribute("aria-expanded", "false"); toggle.setAttribute("aria-controls", `source-path-${view.version}-${index}`);
+    const chevron = el("i", "fas fa-chevron-right"); chevron.setAttribute("aria-hidden", "true");
+    toggle.append(chevron, el("span", "", source.name));
+    const range = el("div", "pattern-meta", source.start != null ? `${fmtTs(source.start)} — ${fmtTs(source.end)}` : "Sem horário reconhecido");
+    const details = el("div", "source-path-details"); details.id = `source-path-${view.version}-${index}`; details.hidden = true;
+    const path = el("textarea", "source-full-path"); path.readOnly = true; path.rows = 3; path.spellcheck = false; path.value = source.path;
+    path.setAttribute("aria-label", `Caminho completo de ${source.name}`);
+    path.setAttribute("data-native-context-menu", "");
+    const copy = el("button", "text-button", "Copiar caminho"); copy.type = "button";
+    const hashes = el("div", "source-hashes"), status = el("div", "pattern-meta source-action-status");
+    status.hidden = true; status.setAttribute("role", "status");
+    details.append(path, copy, hashes); file.append(toggle, range, status, details);
+    const format = el("td", "source-format-cell"); format.append(el("span", "tag", source.format));
+    const bytes = el("td", "num source-number-cell", source.bytes ? fmtBytes(source.bytes) : "—");
+    const count = el("td", "num source-number-cell", fmtNum(source.count));
+    const reading = el("td", "source-reading-cell");
+    reading.append(el("span", source.unparsed ? "tag" : "tag good", source.unparsed ? `${source.unparsed}/${source.sampled} não interpretados na amostra` : "Disponível"));
+    if (source.undated) reading.append(el("div", "pattern-meta", `${fmtNum(source.undated)} sem horário`));
+    const actions = el("td", "num source-menu-cell"), menu = el("button", "icon-btn source-menu-trigger");
+    menu.type = "button"; menu.title = `Ações de ${source.name}`;
+    menu.setAttribute("aria-label", `Ações de ${source.name}: ${source.path}`); menu.setAttribute("aria-haspopup", "menu");
+    const icon = el("i", "fas fa-ellipsis"); icon.setAttribute("aria-hidden", "true"); menu.append(icon); actions.append(menu);
+    Object.assign(target, { toggle, details, hashes, status, menu });
+    toggle.onclick = () => toggleSourcePath(target);
+    copy.onclick = () => copySourceText(target, target.path, "Caminho copiado.");
+    menu.onclick = event => openSourceMenu(event, target);
+    row.oncontextmenu = event => { if (!event.target?.closest?.("textarea")) openSourceMenu(event, target); };
+    row.append(selection, file, format, bytes, count, reading, actions);
+    return row;
+  }
   async function renderSources() {
-    const version = ++serial, contextKey = sourceKey();
+    const version = ++serial, contextKey = sourceKey(), owner = window.AnalysisContexts?.capture();
+    const current = () => page === "sources" && !home.hidden && !content.hidden && version === serial && contextKey === sourceKey() && (!owner || window.AnalysisContexts.isCurrent(owner));
     loading("Lendo fontes…");
     try {
-      const sources = await api("list_sources", {}, { silent: true }); if (page !== "sources" || version !== serial || contextKey !== sourceKey()) return; sourceList = sources; updateCounts();
-      content.innerHTML = `<div class="source-controls"><button id="ws-source-add" class="btn primary"><i class="fas fa-plus"></i> Adicionar arquivos</button><button id="ws-source-folder" class="btn ghost">Adicionar pasta</button><button id="ws-source-config" class="btn ghost">Formato e data/hora</button><div class="spacer"></div><button id="ws-source-clear" class="btn ghost danger" title="Descarregar todas as fontes da análise"><i class="fas fa-trash"></i> Limpar análise</button><button id="ws-source-apply" class="btn ghost" ${sourceList.length < 2 ? "disabled" : ""}>Explorar seleção</button></div><section class="ws-card"><table class="ws-table"><thead><tr><th></th><th>Arquivo</th><th>Formato</th><th class="num">Tamanho</th><th class="num">Eventos</th><th>Leitura</th><th class="num">Ação</th></tr></thead><tbody>${sourceList.map((s, i) => `<tr><td><input class="source-check" aria-label="Selecionar ${esc(s.name)}" type="checkbox" data-source-index="${i}" checked></td><td><strong>${esc(s.name)}</strong><div class="pattern-meta" title="${esc(s.path)}">${s.start != null ? `${esc(fmtTs(s.start))} — ${esc(fmtTs(s.end))}` : "Sem horário reconhecido"}</div></td><td><span class="tag">${esc(s.format)}</span></td><td class="num">${s.bytes ? fmtBytes(s.bytes) : "—"}</td><td class="num">${fmtNum(s.count)}</td><td>${s.unparsed ? `<span class="tag">${s.unparsed}/${s.sampled} não interpretados na amostra</span>` : '<span class="tag good">Disponível</span>'}${s.undated ? `<div class="pattern-meta">${fmtNum(s.undated)} sem horário</div>` : ""}</td><td class="num"><button class="icon-btn danger source-remove-btn" title="Remover da análise" data-remove-index="${i}"><i class="fas fa-trash-can"></i></button></td></tr>`).join("")}</tbody></table></section>`;
+      const sources = await api("list_sources", {}, { silent: true }); if (!current()) return; sourceList = sources; updateCounts();
+      content.innerHTML = `<div class="source-controls source-toolbar"><button id="ws-source-add" class="btn primary"><i class="fas fa-plus"></i> Adicionar arquivos</button><button id="ws-source-folder" class="btn ghost">Adicionar pasta</button><button id="ws-source-config" class="btn ghost">Formato e data/hora</button><div class="spacer"></div><button id="ws-source-clear" class="btn ghost danger" title="Descarregar todas as fontes da análise"><i class="fas fa-trash"></i> Limpar análise</button><button id="ws-source-apply" class="btn ghost" ${sourceList.length < 2 ? "disabled" : ""}>Explorar seleção</button></div><section class="ws-card source-table-card"><div class="source-table-scroll" role="region" aria-label="Arquivos carregados" tabindex="0"><table class="ws-table sources-table"><thead><tr><th class="source-selection-cell" aria-label="Seleção"></th><th>Arquivo</th><th class="source-format-cell">Formato</th><th class="num source-number-cell">Tamanho</th><th class="num source-number-cell">Eventos</th><th class="source-reading-cell">Leitura</th><th class="source-menu-cell" aria-label="Ações"></th></tr></thead><tbody></tbody></table></div></section>`;
+      const table = content.querySelector(".sources-table");
+      sourceView = { version, key: contextKey, owner, sources, table, hashing: false };
+      const tbody = table.querySelector("tbody");
+      sources.forEach((source, index) => tbody.append(buildSourceRow(source, index, sourceView)));
       const reload = el("button", "btn ghost", "Recarregar fontes");
       $("#ws-source-config").after(reload);
       reload.onclick = async () => { if (state.currentArtifact?.source && await loadData(state.currentArtifact.source)) await showPage("sources"); };
-      const short = hash => `${hash.slice(0, 12)}…${hash.slice(-8)}`;
-      const showHashes = list => content.querySelectorAll("tbody tr").forEach((row, i) => {
-        const path = sourceList[i].path, own = list.find(h => h.path === path);
-        const pack = path.includes("!/") ? list.find(h => h.path === path.split("!/")[0]) : null;
-        row.querySelector(".source-hash")?.remove();
-        if (!own) return;
-        const line = el("div", "pattern-meta source-hash");
-        const code = (hash, label) => { const b = el("button", "hash-copy", `${label} ${short(hash.sha256)}`); b.type = "button"; b.title = `${hash.name} · ${fmtBytes(hash.bytes)}\n${hash.sha256}\nClique para copiar`; b.onclick = () => navigator.clipboard?.writeText(hash.sha256).then(() => toast("SHA-256 copiado.", "ok")); return b; };
-        line.append(code(own, own.origin === "extraído" ? "SHA-256 (extraído)" : "SHA-256"));
-        if (pack) line.append(code(pack, "pacote"));
-        row.cells[1].append(line);
-      });
-      content.querySelectorAll("tbody tr").forEach((row, i) => {
-        const button = el("button", "text-button", "Data/hora");
-        button.onclick = async () => { await loadTsConfig(sourceList[i].path); openTsModal(sourceList[i].path); };
-        const hash = el("button", "text-button", "SHA-256");
-        hash.title = "Calcular o SHA-256 dos arquivos para a cadeia de custódia";
-        hash.onclick = async () => {
-          const restore = btnBusy(hash, "Calculando…");
-          try {
-            const list = await api("source_hashes", {});
-            showHashes(list);
-            const c = activeCase(), artifact = c?.artifacts?.find(a => a.id === state.currentArtifact?.id);
-            if (artifact && recordCustody(artifact, list)) saveCases();
-          } catch {} finally { restore(); }
-        };
-        const actions = el("div", "source-actions");
-        actions.append(button, hash);
-        row.cells[1].append(actions);
-      });
-      content.querySelectorAll(".source-remove-btn").forEach(btn => {
-        btn.onclick = async () => { await removeSource(+btn.dataset.removeIndex); };
-      });
       $("#ws-source-clear").onclick = async () => {
         if (!confirm("Deseja realmente descarregar todas as fontes e limpar a análise atual?")) return;
         await clearAnalysis();
@@ -310,12 +420,12 @@
       $("#ws-source-folder").onclick = () => openFiles(true, true);
       $("#ws-source-config").onclick = () => { home.hidden = true; switchView("source"); showSourceMode("load"); };
       $("#ws-source-apply").onclick = () => {
-        const selected = [...document.querySelectorAll("[data-source-index]:checked")].map(c => sourceList[+c.dataset.sourceIndex].path).filter(Boolean);
+        const selected = [...content.querySelectorAll("[data-source-index]:checked")].map(c => sourceList[+c.dataset.sourceIndex].path).filter(Boolean);
         if (!selected.length) { toast("Selecione ao menos uma fonte.", "info"); return; }
         const all = selected.length === sourceList.length;
         applyFilters([...state.filters.filter(f => f.column !== "caminho"), ...(all ? [] : [{ column: "caminho", op: "regex", value: `^(?:${selected.map(escapeRegex).join("|")})$` }])], true);
       };
-    } catch (e) { if (page === "sources" && version === serial && contextKey === sourceKey()) failed(e); }
+    } catch (e) { if (current()) failed(e); }
   }
   async function removeSource(index) {
     const target = sourceList[index];
