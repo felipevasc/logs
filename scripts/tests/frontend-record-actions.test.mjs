@@ -395,6 +395,7 @@ test('Ctrl/Cmd and Shift mouse selection remains unchanged; new button does not 
 // then Escape/Tab must resolve the replaced logical record at dismissal time.
 function recordMenuFixture() {
   const f = fixture(), windowListeners = new Map();
+  f.context.setTimeout = () => 0;
   f.window.addEventListener = (type, fn) => windowListeners.set(type, fn);
   f.document.documentElement = { clientWidth: 1200, clientHeight: 800 };
   vm.runInContext(readFileSync(new URL('../../frontend/context-menu.js', import.meta.url), 'utf8'), f.context);
@@ -402,7 +403,15 @@ function recordMenuFixture() {
   const controller = vm.runInContext('ctxMenu', f.context);
   const key = key => windowListeners.get('keydown')({ key, target: f.document.activeElement, preventDefault() {}, stopImmediatePropagation() {} });
   const open = id => { const trigger = f.button(id); trigger.focus(); trigger.onclick(f.event(trigger)); return trigger; };
-  return { ...f, controller, key, open };
+  const openCell = id => {
+    const cell = f.body.children.find(row => Number(row.dataset.eventId) === id).querySelector('td[data-column]');
+    const event = f.event(cell, { eventPhase: 1 });
+    for (const listener of f.listeners.get('contextmenu') || []) listener(event);
+    event.eventPhase = 2; cell.oncontextmenu(event); event.eventPhase = 0;
+    return cell;
+  };
+  const scroll = node => { for (const listener of f.listeners.get('scroll') || []) listener({ target: node }); };
+  return { ...f, controller, key, open, openCell, scroll };
 }
 
 test('menu Escape and Tab resolve the same event_ref after requery detaches the caller', () => {
@@ -452,4 +461,39 @@ test('record menu paging retains the original captured identity through replacem
   f.state.owner.sourceGeneration++; f.key('Escape');
   assert.equal(f.document.activeElement, f.$('#page-size'), 'paging never recaptures an obsolete logical caller');
   assert.equal(f.requests.length, 0);
+});
+
+
+// CI60 reached the removal fixture at the bottom of a reversed table. Native
+// scroll clamping is modeled explicitly here; the real shared controller must
+// dismiss after movement, while unchanged-scroll removal retains its guards.
+test('cell-menu removal at a clamped scroll boundary dismisses without invoking a stale detail action', () => {
+  const f = recordMenuFixture(); f.table.scrollTop = 1000; f.openCell(2);
+  const detail = f.controller.element.querySelector('[role="menuitem"]');
+  assert.equal(detail.children[1].textContent, 'Ver detalhes');
+  f.state.rows = f.rows.filter(row => row.id !== 2); f.render();
+  assert.ok(f.controller.element, 'removal itself does not force menu dismissal');
+  f.table.scrollTop = 968; f.scroll(f.table);
+  assert.equal(f.controller.element, null, 'moving the caller surface dismisses the menu');
+  detail.onclick();
+  assert.equal(f.requests.length, 0); assert.equal(f.$('#drawer').hidden, true);
+});
+
+test('cell-menu at a stable scroll position keeps exact-target guards through removal, ID reuse and source change', () => {
+  for (const change of ['removed', 'new-ref', 'source-connected']) {
+    const f = recordMenuFixture(); f.table.scrollTop = 0; f.openCell(2);
+    const menu = f.controller.element, detail = menu.querySelector('[role="menuitem"]');
+    assert.equal(detail.children[1].textContent, 'Ver detalhes');
+    if (change === 'source-connected') f.state.owner.sourceGeneration++;
+    else {
+      f.state.rows = change === 'removed' ? f.rows.filter(row => row.id !== 2)
+        : f.rows.map(row => row.id === 2 ? { ...row, event_ref: 'replacement:2' } : row);
+      f.render();
+    }
+    f.scroll(f.table);
+    assert.equal(f.controller.element, menu, change); assert.equal(f.document.activeElement, detail, change);
+    detail.onclick();
+    assert.equal(f.controller.element, null, change); assert.equal(f.requests.length, 0, change);
+    assert.equal(f.$('#drawer').hidden, true, change); assert.equal(f.messages.length, 1, change);
+  }
 });

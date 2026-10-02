@@ -215,10 +215,21 @@ try {
     });
   }
 
-  phase = 'ordinary cell menu rejects stale captured identities';
+  // Use a near-top caller at scrollTop=0. Removing the old near-bottom
+  // caller clamps scroll after the prior reverse and intentionally dismisses
+  // context menus, which tests scrolling rather than stale detail admission.
+  const staleCellId = await page.evaluate(() => state.rows[3].id);
+  results.staleCellMenus = [];
   for (const change of ['removed', 'new-ref', 'source-connected']) {
-    await rowCell(id).click({ button: 'right' }); await menu.waitFor({ state: 'visible' });
-    const before = await page.evaluate(() => window.__ordinaryDetailRequests.length);
+    phase = `ordinary cell menu rejects stale captured identities: ${change}`;
+    await page.evaluate(async () => {
+      document.querySelector('#events-table').closest('.table-scroll').scrollTop = 0;
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    await rowCell(staleCellId).click({ button: 'right' }); await menu.waitFor({ state: 'visible' });
+    const before = await page.evaluate(() => ({ requests: window.__ordinaryDetailRequests.length,
+      scrollTop: document.querySelector('#events-table').closest('.table-scroll').scrollTop }));
+    assert.equal(before.scrollTop, 0, 'stale-menu fixture must start clear of the scroll clamp boundary');
     await page.evaluate(({ id, change }) => {
       window.__ordinaryRows = state.rows; window.__ordinaryLoadedAt = state.currentArtifact.loadedAt;
       if (change === 'source-connected') state.currentArtifact.loadedAt = `${state.currentArtifact.loadedAt}-ordinary-menu`;
@@ -227,9 +238,21 @@ try {
           : state.rows.map(row => row.id === id ? { ...row, event_ref: `replacement:${id}` } : row);
         renderTable({ total: state.total, rows: state.rows });
       }
-    }, { id, change });
+    }, { id: staleCellId, change });
+    const after = await page.evaluate(async () => {
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const scroller = document.querySelector('#events-table').closest('.table-scroll');
+      const current = document.querySelector('.ctx-menu');
+      return { scrollTop: scroller.scrollTop, scrollHeight: scroller.scrollHeight, clientHeight: scroller.clientHeight,
+        menuVisible: !!current?.getClientRects().length, menuHasFocus: !!current?.contains(document.activeElement),
+        focusedTag: document.activeElement?.tagName, focusedId: document.activeElement?.id, rows: state.rows.length };
+    });
+    results.staleCellMenus.push({ change, before, after });
+    assert.equal(after.scrollTop, before.scrollTop, 'stale admission must be exercised without moving its surface');
+    assert.equal(after.menuVisible, true, 'stale menu stays available until its guarded action is invoked');
+    assert.equal(after.menuHasFocus, true, 'replacing the caller cannot steal menu focus');
     await menu.getByRole('menuitem', { name: 'Ver detalhes', exact: true }).click();
-    assert.equal(await page.evaluate(() => window.__ordinaryDetailRequests.length), before);
+    assert.equal(await page.evaluate(() => window.__ordinaryDetailRequests.length), before.requests);
     assert.equal(await page.locator('#drawer').isVisible(), false);
     await page.evaluate(() => {
       state.rows = window.__ordinaryRows; state.currentArtifact.loadedAt = window.__ordinaryLoadedAt;
