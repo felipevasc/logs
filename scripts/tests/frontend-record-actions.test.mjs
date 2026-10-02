@@ -66,7 +66,10 @@ function fixture(count = 5) {
   const rows = Array.from({ length: count }, (_, id) => ({ id, event_ref: `source:${id}`, message: `Full message ${id}`, fields: { exact: '  original  ' }, level: 'Informação' }));
   const state = { rows, loaded: true, quick: '', visibleCols: ['message', 'exact'], colWidths: { message: 100 }, cases: { active: 'a' }, selectedEventRows: new Map(), datasetRevision: 1,
     currentArtifact: { id: 'source', loadedAt: 1 }, owner: { caseId: 'a', instance: 1, identity: { analysisId: 'analysis-a', configRevision: 0, visibilityRevision: 0 }, sourceGeneration: 1, sourceKey: 'source-a' } };
-  const window = { AnalysisContexts: { capture: () => structuredClone(state.owner), isCurrent: owner => JSON.stringify(owner) === JSON.stringify(state.owner) },
+  const window = { CanonicalFields: { cancel() {},
+      capture: (event, column, options) => ({ event, column, ...options }),
+      filter: (target, options) => effects.push(['filter', target, options]), copy: target => effects.push(['copy', target]),
+    }, AnalysisContexts: { capture: () => structuredClone(state.owner), isCurrent: owner => JSON.stringify(owner) === JSON.stringify(state.owner) },
     Tasks: { cancelLatest() {} }, ExclusionArchive: { updateButtons() {}, selectedMenuItem(ev, anchor) { effects.push(['archive-menu', ev, anchor]); return { label: 'Archive', onClick: () => effects.push(['archive', ev]) }; } } };
   const context = vm.createContext({ state, window, document, $, structuredClone,
     getComputedStyle: () => ({ visibility: 'visible' }), el: (tag, cls, text) => new Element(tag, cls, text),
@@ -205,6 +208,164 @@ test('late detail reply/close cannot rebind an origin after source swap or remov
   }
 });
 
+
+// Both ordinary Explorer entry points must preserve the target captured by the
+// rendered row, including when a detached caller survives a query replacement.
+function enterOrdinaryDetail(f, entry, id = 2, sourceRow = null) {
+  const row = sourceRow || f.body.children.find(item => Number(item.dataset.eventId) === id);
+  const cell = row.querySelector('td[data-column]');
+  if (entry === 'row') return row.onclick(f.event(cell));
+  cell.oncontextmenu(f.event(cell));
+  return f.menus.at(-1).items.find(item => item.label === 'Ver detalhes').onClick();
+}
+
+for (const entry of ['row', 'cell-menu']) {
+  test(`${entry} opens once with captured native reference, focuses loading Close and returns after fresh reordered rows`, async () => {
+    const f = fixture(), old = f.button(2);
+    const pending = enterOrdinaryDetail(f, entry);
+    assert.equal(f.requests.length, 1, 'one interaction creates one request');
+    assert.equal(f.requests[0].command, 'event_detail');
+    assert.equal(f.requests[0].args.id, 2); assert.equal(f.requests[0].args.eventRef, 'source:2');
+    assert.deepEqual(plain(f.requests[0].args.analysisContext), f.state.owner.identity);
+    assert.equal(f.requests[0].args.sourceGeneration, f.state.owner.sourceGeneration);
+    assert.deepEqual([...f.state.selectedEventRows.keys()], [2]);
+    assert.equal(f.document.activeElement, f.$('#dr-close')); assert.equal(f.$('#drawer').hidden, false);
+    f.state.visibleCols.reverse(); f.state.rows = [...f.rows].reverse().map(row => ({ ...row })); f.render();
+    assert.notEqual(f.button(2), old); assert.equal(f.document.activeElement, f.$('#dr-close'));
+    f.requests[0].resolve(f.state.rows.find(row => row.id === 2)); await pending;
+    assert.equal(f.state.currentDetailEv.event_ref, 'source:2');
+    assert.equal(f.document.activeElement, f.$('#dr-close'));
+    f.context.closeDrawer(); assert.equal(f.document.activeElement, f.button(2));
+  });
+
+  test(`${entry} accepts a recreated matching record while retaining the original exact target`, async () => {
+    const f = fixture(), oldRow = f.body.children[2];
+    f.state.rows = [...f.rows].reverse().map(row => ({ ...row, message: 'new object' })); f.render();
+    const pending = enterOrdinaryDetail(f, entry, 2, oldRow);
+    assert.equal(f.requests.length, 1); assert.equal(f.requests[0].args.eventRef, 'source:2');
+    f.requests[0].resolve(f.state.rows.find(row => row.id === 2)); await pending;
+    f.context.closeDrawer(); assert.equal(f.document.activeElement, f.button(2));
+  });
+
+  test(`${entry} refuses stale row entry before selection, menu, or drawer side effects`, () => {
+    for (const change of ['source', 'case', 'analysis', 'revision', 'scope', 'evidence', 'removed', 'new-ref', 'mutated-ref', 'legacy-copy']) {
+      const f = fixture(); if (change === 'evidence') { f.scope('case'); f.render(); }
+      if (change === 'legacy-copy') { delete f.rows[2].event_ref; f.render(); }
+      const oldRow = f.body.children[2], cell = oldRow.querySelector('td[data-column]');
+      const selected = f.state.selectedEventRows = new Map([[0, f.rows[0]], [1, f.rows[1]]]);
+      f.state.lastSelectedRowId = 1; const selectionOwner = f.state.selectionOwner;
+      if (change === 'source') f.state.owner.sourceGeneration++;
+      if (change === 'case') f.state.cases.active = 'b';
+      if (change === 'analysis') f.state.owner.identity.analysisId = 'other';
+      if (change === 'revision') f.state.owner.identity.visibilityRevision++;
+      if (change === 'scope') f.scope('case'); if (change === 'evidence') f.signature('members-b');
+      if (change === 'removed') f.state.rows = f.rows.filter(row => row.id !== 2);
+      if (change === 'new-ref') f.state.rows = f.rows.map(row => row.id === 2 ? { ...row, event_ref: 'replacement:2' } : row);
+      if (change === 'mutated-ref') f.rows[2].event_ref = 'mutated:2';
+      if (change === 'legacy-copy') f.state.rows = f.rows.map(row => ({ ...row }));
+      if (entry === 'row') oldRow.onclick(f.event(cell)); else cell.oncontextmenu(f.event(cell));
+      assert.equal(f.state.selectedEventRows, selected, change); assert.equal(f.state.lastSelectedRowId, 1, change);
+      assert.equal(f.state.selectionOwner, selectionOwner, change); assert.equal(f.menus.length, 0, change);
+      assert.equal(f.requests.length, 0, change); assert.equal(f.$('#drawer').hidden, true, change);
+      assert.equal(f.document.activeElement, f.document.body, change); assert.equal(f.messages.length, 1, change);
+    }
+  });
+
+  test(`${entry} validates late replies against its exact target without stealing focus when the drawer remains open`, async () => {
+    for (const change of ['removed', 'new-ref', 'wrong-response', 'outside']) {
+      const f = fixture(), pending = enterOrdinaryDetail(f, entry);
+      if (change === 'removed') f.state.rows = f.rows.filter(row => row.id !== 2);
+      if (change === 'new-ref') f.state.rows = f.rows.map(row => row.id === 2 ? { ...row, event_ref: 'replacement:2' } : row);
+      if (change === 'removed' || change === 'new-ref') f.render();
+      if (change === 'outside') f.$('#quick-search').focus();
+      f.requests[0].resolve(change === 'wrong-response' ? { ...f.rows[2], event_ref: 'wrong:2' } : f.rows[2]); await pending;
+      assert.equal(f.state.currentDetailEv, change === 'outside' ? f.rows[2] : null, change);
+      assert.equal(f.document.activeElement, f.$(change === 'outside' ? '#quick-search' : '#dr-close'), change);
+      f.context.closeDrawer();
+      assert.equal(f.document.activeElement, change === 'outside' ? f.$('#quick-search')
+        : change === 'wrong-response' ? f.button(2) : f.$('#page-size'), change);
+    }
+  });
+
+  test(`${entry} pending Close uses a stable fallback for removed/reused identities and does not steal outside focus`, async () => {
+    for (const change of ['source', 'removed', 'new-ref', 'outside', 'closed']) {
+      const f = fixture(), pending = enterOrdinaryDetail(f, entry);
+      assert.equal(f.document.activeElement, f.$('#dr-close'));
+      if (change === 'source') { f.state.owner.sourceGeneration++; f.render(); }
+      if (change === 'removed') { f.state.rows = f.rows.filter(row => row.id !== 2); f.render(); }
+      if (change === 'new-ref') { f.state.rows = f.rows.map(row => row.id === 2 ? { ...row, event_ref: 'replacement:2' } : row); f.render(); }
+      if (change === 'outside') f.$('#quick-search').focus();
+      f.context.closeDrawer();
+      const expected = change === 'outside' ? f.$('#quick-search') : change === 'closed' ? f.button(2) : f.$('#page-size');
+      assert.equal(f.document.activeElement, expected, change);
+      f.requests[0].resolve(f.rows[2]); await pending;
+      assert.equal(f.document.activeElement, expected, change); assert.equal(f.state.currentDetailEv, null, change);
+    }
+  });
+}
+
+test('Explorer cell-menu detail survives replacement of its caller with the same native reference', async () => {
+  const f = fixture(), oldRow = f.body.children[2], cell = oldRow.querySelector('td[data-column]');
+  cell.oncontextmenu(f.event(cell)); const details = f.menus.at(-1).items.find(item => item.label === 'Ver detalhes');
+  f.state.rows = [...f.rows].reverse().map(row => ({ ...row })); f.render(); assert.equal(oldRow.isConnected, false);
+  const pending = details.onClick();
+  assert.equal(f.requests.length, 1); assert.equal(f.requests[0].args.eventRef, 'source:2');
+  assert.equal(f.document.activeElement, f.$('#dr-close'));
+  f.requests[0].resolve(f.state.rows.find(row => row.id === 2)); await pending;
+  f.context.closeDrawer(); assert.equal(f.document.activeElement, f.button(2));
+});
+
+test('Explorer cell-menu detail retains its captured target after menu opens, rejecting stale identities and owners', async () => {
+  for (const change of ['source', 'case', 'analysis', 'revision', 'scope', 'evidence', 'removed', 'new-ref', 'mutated-ref', 'legacy-copy']) {
+    const f = fixture(); if (change === 'evidence') { f.scope('case'); f.render(); }
+    if (change === 'legacy-copy') { delete f.rows[2].event_ref; f.render(); }
+    const cell = f.body.children[2].querySelector('td[data-column]'); cell.oncontextmenu(f.event(cell));
+    const details = f.menus.at(-1).items.find(item => item.label === 'Ver detalhes');
+    if (change === 'source') f.state.owner.sourceGeneration++;
+    if (change === 'case') f.state.cases.active = 'b';
+    if (change === 'analysis') f.state.owner.identity.analysisId = 'other';
+    if (change === 'revision') f.state.owner.identity.visibilityRevision++;
+    if (change === 'scope') f.scope('case'); if (change === 'evidence') f.signature('members-b');
+    if (change === 'removed') f.state.rows = f.rows.filter(row => row.id !== 2);
+    if (change === 'new-ref') f.state.rows = f.rows.map(row => row.id === 2 ? { ...row, event_ref: 'replacement:2' } : row);
+    if (change === 'mutated-ref') f.rows[2].event_ref = 'mutated:2';
+    if (change === 'legacy-copy') f.state.rows = f.rows.map(row => ({ ...row }));
+    const selected = f.state.selectedEventRows, selectionOwner = f.state.selectionOwner;
+    const pending = details.onClick();
+    assert.equal(f.requests.length, 0, change); assert.equal(f.$('#drawer').hidden, true, change);
+    assert.equal(f.state.selectedEventRows, selected, change); assert.equal(f.state.selectionOwner, selectionOwner, change);
+    await pending;
+  }
+});
+
+test('historical rows and direct cell menus keep the legacy detail API and do not acquire Explorer return focus', async () => {
+  for (const entry of ['row', 'cell-menu']) {
+    const f = fixture(), historical = { ...f.rows[2], event_ref: 'preserved:2' };
+    f.state.owner.sourceGeneration++;
+    const row = f.context.buildEventRow(historical);
+    assert.equal(row.querySelector('.record-actions-trigger'), null);
+    const pending = enterOrdinaryDetail(f, entry, 2, row);
+    assert.equal(f.requests.length, 1); assert.equal(Object.hasOwn(f.requests[0].args, 'eventRef'), false);
+    assert.equal(f.state.recordDrawerReturn, null); assert.equal(f.document.activeElement, f.document.body);
+    f.requests[0].resolve(historical); await pending;
+  }
+  const f = fixture(), menu = f.context.eventCellMenu(f.rows[2], 'message', f.rows[2].message);
+  const pending = menu.find(item => item.label === 'Ver detalhes').onClick();
+  assert.equal(Object.hasOwn(f.requests[0].args, 'eventRef'), false); assert.equal(f.state.recordDrawerReturn, null);
+  f.requests[0].resolve(f.rows[2]); await pending;
+});
+
+test('stale Explorer rows cannot change Ctrl/Cmd/Shift selection and interactive descendants do not open detail', () => {
+  const f = fixture(), row = f.body.children[2], cell = row.querySelector('td[data-column]');
+  for (const tag of ['input', 'button', 'a']) { const target = f.node(tag, `inline-${tag}`, cell); row.onclick(f.event(target)); }
+  assert.equal(f.requests.length, 0); assert.equal(f.state.selectedEventRows.size, 0);
+  const selected = f.state.selectedEventRows = new Map([[1, f.rows[1]]]); f.state.lastSelectedRowId = 1;
+  f.state.owner.sourceGeneration++;
+  for (const modifier of ['ctrlKey', 'metaKey', 'shiftKey']) row.onclick(f.event(cell, { [modifier]: true }));
+  assert.equal(f.state.selectedEventRows, selected); assert.deepEqual([...selected.keys()], [1]);
+  assert.equal(f.requests.length, 0); assert.equal(f.$('#drawer').hidden, true);
+});
+
 test('header decorators and resizing use data identifiers; action column has no field menu or saved width', () => {
   const f = fixture(); f.context.fieldTop = field => f.effects.push(['top', field]);
   vm.runInContext(discovery.slice(discovery.indexOf('  const oldTable=renderTable;'), discovery.indexOf('  const oldDetail=showDetail;')), f.context);
@@ -225,6 +386,7 @@ test('Ctrl/Cmd and Shift mouse selection remains unchanged; new button does not 
   assert.deepEqual([...f.state.selectedEventRows.keys()], [0, 2]);
   row(4).onclick(f.event(row(4), { shiftKey: true })); assert.deepEqual([...f.state.selectedEventRows.keys()], [2, 3, 4]);
   row(1).onclick(f.event(f.button(1))); assert.deepEqual([...f.state.selectedEventRows.keys()], [2, 3, 4]);
+  assert.equal(f.requests.length, 0); assert.equal(f.$('#drawer').hidden, true);
 });
 
 

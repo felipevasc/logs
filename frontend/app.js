@@ -4959,9 +4959,9 @@ function saveManualEvent() {
 }
 
 // menu de contexto de uma célula de evento
-function eventCellMenu(ev, col, value, anchor = null) {
+function eventCellMenu(ev, col, value, anchor = null, recordTarget = null) {
   ensureSelectionOwner();
-  const record = eventRecordMenuParts(ev, anchor);
+  const record = eventRecordMenuParts(ev, anchor, recordTarget ? () => openRecordDetail(recordTarget) : undefined);
   const exact = window.CanonicalFields.capture(ev, col, { anchor, ...(col === "comentario" ? { historical: true, literal: eventComment(ev) } : {}) });
   const hasVal = value !== undefined && value !== null && String(value).trim() !== "";
   const items = [...record.open];
@@ -5087,11 +5087,14 @@ function resolveRecordFocus(target) {
 function focusRecordTarget(target) {
   resolveRecordFocus(target)?.focus({ preventScroll: true });
 }
+function openRecordDetail(target) {
+  return openDetail(target.id, {
+    eventRef: target.eventRef, guard: () => recordTargetCurrent(target), recordFocus: target,
+  });
+}
 function eventRecordMenu(ev, anchor, target) {
   ensureSelectionOwner();
-  const parts = eventRecordMenuParts(ev, anchor, () => openDetail(target.id, {
-    eventRef: target.eventRef, guard: () => recordTargetCurrent(target), recordFocus: target,
-  }));
+  const parts = eventRecordMenuParts(ev, anchor, () => openRecordDetail(target));
   return parts.finish([...parts.open, { sep: true }, parts.send, { sep: true }, ...parts.tail])
     .map(item => item.sep ? item : { ...item, onClick: () => {
       if (!recordTargetCurrent(target)) { toast("O contexto mudou. Abra as ações do registro novamente.", "info"); return; }
@@ -5506,9 +5509,13 @@ function buildEventRow(ev, columns = state.visibleCols, { recordActions = false,
   if (ev.id === state.detailId) row.classList.add("selected");
   if (state.selectedEventRows?.has(ev.id)) row.classList.add("row-multi-selected");
 
-  if (recordActions) row.appendChild(buildRecordActions(ev, recordKey ?? recordContextKey()));
+  // Only live Explorer rows adopt the exact-reference detail/return contract.
+  // Keep this target across clicks and menus; numeric IDs can be reused later.
+  const recordTarget = recordActions ? captureRecordTarget(ev, recordKey ?? recordContextKey()) : null;
+  if (recordTarget) row.appendChild(buildRecordActions(ev, recordTarget.key));
 
   row.onclick = (e) => {
+    if (recordTarget && !recordTargetCurrent(recordTarget)) { toast("O contexto mudou. Abra o registro novamente.", "info"); return; }
     ensureSelectionOwner();
     if (e.target.closest("input, button, a")) return;
     if (e.ctrlKey || e.metaKey) {
@@ -5521,7 +5528,7 @@ function buildEventRow(ev, columns = state.visibleCols, { recordActions = false,
       state.selectedEventRows = new Map([[ev.id, ev]]);
       state.lastSelectedRowId = ev.id;
       updateRowSelectionStyles();
-      openDetail(ev.id);
+      return recordTarget ? openRecordDetail(recordTarget) : openDetail(ev.id);
     }
   };
 
@@ -5564,14 +5571,16 @@ function buildEventRow(ev, columns = state.visibleCols, { recordActions = false,
       td.title = `${hint.text}${hint.marker}\nPrévia de texto limitada. Clique para ver os detalhes; use o botão direito para copiar ou filtrar o valor completo.`;
     } else td.title = displayText;
     td.oncontextmenu = (e) => {
-      e.preventDefault(); ensureSelectionOwner();
+      e.preventDefault();
+      if (recordTarget && !recordTargetCurrent(recordTarget)) { toast("O contexto mudou. Abra o registro novamente.", "info"); return; }
+      ensureSelectionOwner();
       if (!state.selectedEventRows?.has(ev.id)) {
         state.selectedEventRows = new Map([[ev.id, ev]]);
         state.lastSelectedRowId = ev.id;
         updateRowSelectionStyles();
       }
       const value = col === "level" ? ev.level : cellValue(ev, col);
-      showCtxMenu(e.clientX, e.clientY, eventCellMenu(ev, col, value, td));
+      showCtxMenu(e.clientX, e.clientY, eventCellMenu(ev, col, value, td, recordTarget));
     };
     row.appendChild(td);
   }

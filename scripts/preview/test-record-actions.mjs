@@ -17,6 +17,11 @@ const triggers = page.locator('#events-table .record-actions-trigger');
 const menu = page.locator('.ctx-menu');
 const assertFocus = async locator => assert.equal(await locator.evaluate(node => node === document.activeElement), true);
 const rowButton = id => page.locator(`#events-table tr[data-event-id="${id}"] .record-actions-trigger`);
+const rowCell = id => page.locator(`#events-table tr[data-event-id="${id}"] td[data-column]`).first();
+async function openOrdinaryDetail(entry, id) {
+  await rowCell(id).click(entry === 'cell-menu' ? { button: 'right' } : {});
+  if (entry === 'cell-menu') await menu.getByRole('menuitem', { name: 'Ver detalhes', exact: true }).click();
+}
 async function screenshot(name) {
   await page.evaluate(() => {
     const label = document.createElement('div'); label.id = 'record-fixture-label';
@@ -139,6 +144,113 @@ try {
   await page.keyboard.press('Escape'); assert.equal(await page.locator('#drawer').isVisible(), false); await assertFocus(rowButton(id));
   await page.evaluate(() => { api = window.__recordBaseApi; });
   results.drawer = { loadingFocus: 'dr-close', eventRef: true, oneEscapePerLayer: true, returnAfterFreshRows: true };
+
+
+  phase = 'ordinary row and cell-menu exact detail return';
+  await page.evaluate(() => {
+    window.__ordinaryBaseApi = api; window.__ordinaryDetailRequests = [];
+    api = async (command, args, options) => {
+      if (command !== 'event_detail') return window.__ordinaryBaseApi(command, args, options);
+      window.__ordinaryDetailRequests.push(structuredClone(args));
+      const value = await window.__ordinaryBaseApi(command, args, options);
+      await new Promise(resolve => { window.__ordinaryDetailRelease = resolve; });
+      return value;
+    };
+  });
+  for (const entry of ['row', 'cell-menu']) {
+    const before = await page.evaluate(target => ({ requests: window.__ordinaryDetailRequests.length,
+      eventRef: state.rows.find(row => row.id === target).event_ref }), id);
+    await page.evaluate(() => { window.__ordinaryDetailRelease = null; });
+    if (entry === 'cell-menu') {
+      await rowCell(id).click({ button: 'right' });
+      await page.evaluate(() => {
+        state.rows = state.rows.map(row => ({ ...row })); renderTable({ total: state.total, rows: state.rows });
+        if (!document.activeElement.closest('.ctx-menu')) throw Error('Requery must preserve cell-menu focus');
+      });
+      await menu.getByRole('menuitem', { name: 'Ver detalhes', exact: true }).click();
+    } else await openOrdinaryDetail(entry, id);
+    await page.waitForFunction(() => typeof window.__ordinaryDetailRelease === 'function');
+    await assertFocus(page.locator('#dr-close'));
+    assert.deepEqual(await page.evaluate(() => [...state.selectedEventRows.keys()]), [id]);
+    assert.equal(await page.evaluate(() => window.__ordinaryDetailRequests.length), before.requests + 1);
+    assert.equal(await page.evaluate(() => window.__ordinaryDetailRequests.at(-1).eventRef), before.eventRef);
+    await page.evaluate(target => {
+      const old = document.querySelector(`#events-table tr[data-event-id="${target}"] .record-actions-trigger`);
+      state.rows = [...state.rows].reverse().map(row => ({ ...row })); renderTable({ total: state.total, rows: state.rows });
+      if (old.isConnected || document.activeElement.id !== 'dr-close') throw Error('Fresh reorder must preserve loading Close focus');
+      window.__ordinaryDetailRelease();
+    }, id);
+    await page.waitForFunction(target => state.currentDetailEv?.id === target, id);
+    await assertFocus(page.locator('#dr-close'));
+    await page.keyboard.press('Escape'); await assertFocus(rowButton(id));
+    assert.equal(await page.locator('#drawer').isVisible(), false);
+  }
+  for (const entry of ['row', 'cell-menu']) for (const change of ['removed', 'new-ref', 'source-connected', 'outside', 'closed']) {
+    phase = `ordinary ${entry} pending return: ${change}`;
+    await page.evaluate(() => {
+      window.__ordinaryRows = state.rows; window.__ordinaryLoadedAt = state.currentArtifact.loadedAt;
+      window.__ordinaryDetailRelease = null;
+    });
+    await openOrdinaryDetail(entry, id);
+    await page.waitForFunction(() => typeof window.__ordinaryDetailRelease === 'function');
+    await assertFocus(page.locator('#dr-close'));
+    await page.evaluate(({ id, change }) => {
+      if (change === 'source-connected') state.currentArtifact.loadedAt = `${state.currentArtifact.loadedAt}-ordinary-owner`;
+      if (change === 'removed' || change === 'new-ref') {
+        state.rows = change === 'removed' ? state.rows.filter(row => row.id !== id)
+          : state.rows.map(row => row.id === id ? { ...row, event_ref: `replacement:${id}` } : row);
+        renderTable({ total: state.total, rows: state.rows });
+      }
+      if (change === 'outside') document.querySelector('#quick-search').focus();
+      closeDrawer();
+    }, { id, change });
+    const expected = change === 'outside' ? page.locator('#quick-search') : change === 'closed' ? rowButton(id) : page.locator('#page-size');
+    await assertFocus(expected);
+    await page.evaluate(async () => { window.__ordinaryDetailRelease(); await new Promise(resolve => setTimeout(resolve, 0)); });
+    await assertFocus(expected); assert.equal(await page.locator('#drawer').isVisible(), false);
+    assert.equal(await page.evaluate(() => state.currentDetailEv), null, 'closed entry cannot accept a late reply');
+    await page.evaluate(() => {
+      state.rows = window.__ordinaryRows; state.currentArtifact.loadedAt = window.__ordinaryLoadedAt;
+      renderTable({ total: state.total, rows: state.rows });
+    });
+  }
+
+  phase = 'ordinary cell menu rejects stale captured identities';
+  for (const change of ['removed', 'new-ref', 'source-connected']) {
+    await rowCell(id).click({ button: 'right' }); await menu.waitFor({ state: 'visible' });
+    const before = await page.evaluate(() => window.__ordinaryDetailRequests.length);
+    await page.evaluate(({ id, change }) => {
+      window.__ordinaryRows = state.rows; window.__ordinaryLoadedAt = state.currentArtifact.loadedAt;
+      if (change === 'source-connected') state.currentArtifact.loadedAt = `${state.currentArtifact.loadedAt}-ordinary-menu`;
+      else {
+        state.rows = change === 'removed' ? state.rows.filter(row => row.id !== id)
+          : state.rows.map(row => row.id === id ? { ...row, event_ref: `replacement:${id}` } : row);
+        renderTable({ total: state.total, rows: state.rows });
+      }
+    }, { id, change });
+    await menu.getByRole('menuitem', { name: 'Ver detalhes', exact: true }).click();
+    assert.equal(await page.evaluate(() => window.__ordinaryDetailRequests.length), before);
+    assert.equal(await page.locator('#drawer').isVisible(), false);
+    await page.evaluate(() => {
+      state.rows = window.__ordinaryRows; state.currentArtifact.loadedAt = window.__ordinaryLoadedAt;
+      renderTable({ total: state.total, rows: state.rows });
+    });
+  }
+  phase = 'ordinary row modifier selection remains one-step';
+  const selectionIds = await page.evaluate(() => { state.selectedEventRows = new Map(); state.lastSelectedRowId = null; updateRowSelectionStyles(); return state.rows.slice(0, 5).map(row => row.id); });
+  const beforeModifiers = await page.evaluate(() => window.__ordinaryDetailRequests.length);
+  await rowCell(selectionIds[0]).click({ modifiers: ['Control'] });
+  await rowCell(selectionIds[2]).click({ modifiers: ['Meta'] });
+  assert.deepEqual(await page.evaluate(() => [...state.selectedEventRows.keys()]), [selectionIds[0], selectionIds[2]]);
+  await rowCell(selectionIds[4]).click({ modifiers: ['Shift'] });
+  assert.deepEqual(await page.evaluate(() => [...state.selectedEventRows.keys()]), selectionIds.slice(2, 5));
+  assert.equal(await page.evaluate(() => window.__ordinaryDetailRequests.length), beforeModifiers);
+  assert.equal(await page.locator('#drawer').isVisible(), false);
+  await rowButton(id).focus();
+  await page.evaluate(() => { api = window.__ordinaryBaseApi; });
+  results.ordinaryDetails = { oneClick: true, rowAndCellMenuExactRef: true, freshReorderedReturn: true,
+    removedAndReusedIdFallback: true, sourceSwapFallback: true, noOutsideFocusSteal: true, lateRepliesIgnored: true,
+    staleCellMenuBlocked: true, ctrlCmdShiftPreserved: true };
 
   phase = 'full requery and reused-row focus';
   await page.evaluate(() => { state.visibleCols = [...state.visibleCols].reverse(); renderTable({ total: state.total, rows: state.rows }, { reuseRows: true }); });
