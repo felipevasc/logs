@@ -103,3 +103,9 @@ Operadores especiais já existentes, como listas exatas de ocorrências e detec�
 ### Integração da validação essencial
 
 A infraestrutura já integrada à main foi incorporada preservando os dois pilotos no seletor de testes. A verificação local combinada passou com 725 testes Node. A comparação é acumulada contra a base do PR: este lote ainda requer a matriz nativa remota porque registra novos assets no empacotamento. A interface compartilhada conserva os dezenove roteiros completos de browser; alterações futuras realmente isoladas usam o conjunto essencial mais a área afetada. Não houve relaxamento das salvaguardas de instalação, atualização ou assinatura.
+
+### Robô protagonista: direção aprovada
+
+A primeira proposta de espera foi considerada discreta demais: o personagem parecia decorativo. A revisão mantém a identidade do robô e o torna agente da ação. O piloto de leitura/organização ganhou corpo, mãos, apoio alternado dos pés, contato com a folha, transporte, depósito e reação no visor. O ciclo longo dura 7,2 segundos; a espera curta tem gesto próprio de 2,4 segundos, sem acelerar o filme inteiro. A folha transportada é filha da mão, sem trajetória independente. Estados e contagens não são governados pelo movimento.
+
+A direção do estudo isolado foi aprovada pelo usuário. A integração em navegador ainda requer o próximo CI, com um ciclo completo gravado, comparação de dois cantos nas poses de contato e capturas escura/clara. As demais famílias só devem reutilizar essa linguagem após a validação do piloto. O tema claro tem contorno bronze de alto contraste e forced-colors conserva o desenho estático.

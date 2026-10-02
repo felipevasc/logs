@@ -19,7 +19,7 @@ try {
   const side=await page.locator('#workspace-side').boundingBox(), content=await page.locator('.shell .content').boundingBox();
   assert(side.x >= content.x+content.width-1,'Campos deve estar à direita');
   await page.locator('#explore-tree .field-row[data-column="source"] .field-item').click({button:'right'});
-  await page.getByRole('button',{name:'Top 10 de Origem',exact:true}).click();
+  await page.getByRole('menuitem',{name:'Top 10 de Origem',exact:true}).click();
   await page.locator('#drawer .discovery-rank').first().waitFor();
   const drawer=await page.locator('#drawer').boundingBox();assert(drawer.x<side.x && drawer.x+drawer.width>=side.x+side.width-1,'Detalhes sobrepõem os campos');
   assert.match(await page.locator('#drawer').innerText(),/6.000 registros/);
@@ -30,7 +30,7 @@ try {
   assert.doesNotMatch(await page.locator('.ctx-menu').innerText(),/Top 10/);
   await page.keyboard.press('Escape');await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
   await page.locator('#explore-tree .field-row[data-column="source"] .field-adv-btn').click();
-  await page.getByRole('button',{name:'Resumir por Origem',exact:true}).click();
+  await page.getByRole('menuitem',{name:'Resumir por Origem',exact:true}).click();
   await page.waitForFunction(()=>document.querySelector('#aw-group-summary')?.textContent.includes('5 grupos'));
   assert.equal(await page.locator('#group-col').inputValue(),'source');
   phase='overview and frequency filters';

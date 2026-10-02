@@ -28,7 +28,7 @@ const videoMetadata = {
   nativeEngineVerified: false,
   timingReference: 'Approximate wall-clock offsets since context.newPage() was requested; inspect the actual video before trimming',
   recordedSize: { width: 1440, height: 960 },
-  captureHoldBudgetMs: 4000,
+  captureHoldBudgetMs: 9200,
   markers: [],
 };
 const markVideo = (label, details = {}) => videoMetadata.markers.push({ label, offsetMs: Date.now() - videoStartedAt, ...details });
@@ -177,11 +177,48 @@ try {
   assert.ok(results.reading.runningAnimations > 0); assertTypography(results.reading);
   assert.equal(await page.locator('#load-progress-details').evaluate(node => node.open), false);
   await assertFits(load);
-  markVideo('reading-loop-start', { fixtureReceipt: true, viewport: page.viewportSize() });
+  // Inspect real SVG/CSS contact poses, then restart only the decorative timeline
+  // to record a complete story. This does not advance or alter operation progress.
+  results.readingRig = await load.evaluate(async root => {
+    const art = root.querySelector('.wv-art'), actor = root.querySelector('.wv-reader');
+    const hand = root.querySelector('.wv-reader-hand'), paper = root.querySelector('.wv-read-card');
+    const animations = art.getAnimations({ subtree: true });
+    const durations = [...new Set(animations.map(animation => animation.effect.getComputedTiming().duration))];
+    const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const point = (node, x, y) => new DOMPoint(x, y).matrixTransform(node.getScreenCTM());
+    const contact = async (fraction, target) => {
+      for (const animation of animations) { animation.pause(); animation.currentTime = fraction * 7200; }
+      await frames();
+      const distances = [[90, 34], [108, 62]].map(([x, y]) => {
+        const carried = point(paper, x, y), station = point(root.querySelector(target), x, y);
+        return Math.hypot(carried.x - station.x, carried.y - station.y);
+      });
+      return { fraction, distance: Math.max(...distances), distances };
+    };
+    try {
+      const pickup = await contact(.22, '.wv-reader-source');
+      const deposit = await contact(.67, '.wv-reader-filed');
+      return { actorCount: root.querySelectorAll('.wv-reader').length,
+        height: actor.getBoundingClientRect().height, carriedByHand: paper.parentElement === hand,
+        paperTransform: getComputedStyle(paper).transform, durations, pickup, deposit };
+    } finally {
+      for (const animation of animations) { animation.currentTime = 0; animation.play(); }
+      await frames();
+    }
+  });
+  assert.equal(results.readingRig.actorCount, 1, 'one legible protagonist');
+  assert.ok(results.readingRig.height >= 60, 'the character is not a tiny decorative bystander');
+  assert.equal(results.readingRig.carriedByHand, true, 'the payload belongs to the articulated hand');
+  assert.equal(results.readingRig.paperTransform, 'none', 'the carried paper has no independent movement');
+  assert.deepEqual(results.readingRig.durations, [7200]);
+  assert.ok(results.readingRig.pickup.distance < .75, 'hand and source sheet meet at pickup');
+  assert.ok(results.readingRig.deposit.distance < .75, 'hand and destination sheet meet at release');
+  markVideo('reading-loop-start', { fixtureReceipt: true, animationRestartedForCapture: true, viewport: page.viewportSize() });
   await screenshot('waiting-fixture-reading-dark-1440.png', { fixture: true, content: 'Synthetic metadata receipt rendered by the production foreground adapter while its preview load command is pending' });
 
-  // Capture-only dwell in the already pending command. Total added dwell is 4s.
-  await page.waitForTimeout(3300);
+  // Capture-only dwell in the already pending command: one full 7.2s character
+  // story before pause/resume. Total added dwell is 9.2s, never product latency.
+  await page.waitForTimeout(7600);
   const beforeForeign = await load.textContent();
   await page.evaluate(() => window.__waitingPreviewBridge.emit('operation-progress', {
     operationId: 'fixture-unowned-background', phaseId: 'analytics-sql', phase: 'Must not replace foreground', completed: 999, total: 999, unit: 'itens', fixture: true,
@@ -199,8 +236,11 @@ try {
   await load.locator('.wv-motion-toggle').focus(); await page.keyboard.press('Enter');
   await waitMotion('#load-visual .waiting-visual', 'running');
   markVideo('reading-resumed-by-keyboard', { fixtureReceipt: true });
-  await page.waitForTimeout(200);
+  await page.waitForTimeout(1100);
   markVideo('reading-segment-end', { fixtureReceipt: true });
+  await setTheme('light');
+  await assertFits(load);
+  await screenshot('waiting-fixture-reading-light-1440.png', { fixture: true, content: 'Articulated reader in the light theme; real component with a controlled metadata receipt' });
 
   await emitLoadPhase({ total: 0, completed: 1800 });
   assert.equal((await renderedState(load)).metric, '1.800 registros');
