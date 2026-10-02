@@ -33,7 +33,7 @@ try{
   phase='selected exact preview';
   for(const row of selected)await page.locator(`#events-table tr[data-event-id="${row.id}"] td[data-column="timestamp"]`).click({modifiers:['Control']});
   await page.locator(`#events-table tr[data-event-id="${selected[0].id}"] td[data-column="timestamp"]`).click({button:'right'});
-  await page.getByRole('button',{name:'Arquivar 3 registro(s) selecionado(s)…',exact:true}).click();
+  await page.getByRole('menuitem',{name:'Arquivar 3 registro(s) selecionado(s)…',exact:true}).click();
   await page.waitForFunction(()=>!document.querySelector('#ex-commit').disabled);
   assert.match(await page.locator('#ex-preview-count').textContent(),/^3 registro/);
   await page.locator('#ex-label').fill('Seleção de revisão');await page.locator('#ex-reason').fill('Lote reversível para revisar três registros preservados.');

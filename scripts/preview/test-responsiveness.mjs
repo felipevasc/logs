@@ -92,6 +92,78 @@ try {
   assert.equal(await page.locator('#filter-pop').isVisible(),false);
   assert.equal(await page.evaluate(()=>document.activeElement.id),'btn-add-filter');
   assert.equal(await page.evaluate(()=>state.filters.length),beforeFilters+1,'cancelled composer never applies its draft');
+  // Direct chip editing reuses the same composer without submitting a query.
+  // CI55 caught the saved-view Dataset/Case count pair still behind its 300 ms
+  // debounce: Tasks.pending() alone cannot include work not yet admitted.
+  await page.evaluate(()=>settleFilterTabCounts());
+  await page.waitForFunction(()=>Tasks.pending()===0,null,{timeout:30000});
+  const chipEditor=page.locator('#chips .chip-edit').first();
+  const chipState=await page.evaluate(()=>({filters:JSON.stringify(state.filters),value:state.filters[0].value,
+    calls:JSON.stringify(Object.entries(window.__mockCommandCalls).filter(([key])=>['query_page','count_filtered','stats_events','tree_aggs'].includes(key)))}));
+  for(const activation of ['click','Enter','Space']){
+    if(activation==='click')await chipEditor.click();else await chipEditor.press(activation);
+    await page.locator('#filter-pop').waitFor({state:'visible'});
+    assert.equal(await page.locator('#fp-val').inputValue(),chipState.value);
+    await page.locator('#fp-val').fill(chipState.value+' cancelled draft');
+    if(activation==='Enter')await page.locator('#fp-cancel').click();else await page.locator('#fp-val').press('Escape');
+    assert.equal(await chipEditor.evaluate(node=>node===document.activeElement),true,activation+' cancellation returns to its chip');
+    assert.equal(await page.evaluate(()=>JSON.stringify(state.filters)),chipState.filters);
+  }
+  assert.equal(await page.evaluate(()=>JSON.stringify(Object.entries(window.__mockCommandCalls).filter(([key])=>['query_page','count_filtered','stats_events','tree_aggs'].includes(key)))),chipState.calls,'opening and cancelling from click/Enter/Space starts no native data work');
+  await chipEditor.press('Enter');await page.locator('#fp-val').fill(chipState.value+' edited');await page.locator('#fp-apply').click();
+  await page.waitForFunction(()=>document.querySelector('#events-table').getAttribute('aria-busy')==='false'&&Tasks.pending()===0,null,{timeout:30000});
+  assert.equal(await page.evaluate(()=>state.filters[0].value),chipState.value+' edited');
+  assert.equal(await chipEditor.evaluate(node=>node===document.activeElement),true,'saving and query completion return to the replacement chip');
+  const previousLatency=await page.evaluate(()=>{const value=window.__mockLatency;window.__mockLatency={...value,query_page:600};return value;});
+  await chipEditor.press('Space');await page.locator('#fp-val').fill(chipState.value+' saved');await page.locator('#fp-apply').click();
+  await page.locator('#quick-search').focus();
+  await page.waitForFunction(()=>document.querySelector('#events-table').getAttribute('aria-busy')==='false'&&Tasks.pending()===0,null,{timeout:30000});
+  assert.equal(await page.locator('#quick-search').evaluate(node=>node===document.activeElement),true,'late query completion cannot steal focus moved by the user');
+  await page.evaluate(value=>{window.__mockLatency=value;},previousLatency);
+  await page.evaluate(()=>addFilter({column:'message',op:'not_contains',value:'__chip_remove_regression__',value2:null}));
+  await page.waitForFunction(()=>document.querySelector('#events-table').getAttribute('aria-busy')==='false'&&Tasks.pending()===0,null,{timeout:30000});
+  await page.locator('#chips .filter-chip').filter({hasText:'__chip_remove_regression__'}).locator('.x').click();
+  assert.equal(await page.locator('#filter-pop').isVisible(),false,'the separate remove action cannot bubble into editing');
+  await page.waitForFunction(()=>document.querySelector('#events-table').getAttribute('aria-busy')==='false'&&Tasks.pending()===0,null,{timeout:30000});
+  assert.equal(await page.evaluate(()=>state.filters.length),beforeFilters+1);
+  // Existing exact-list filters must survive the real DOM select unchanged.
+  const exactBefore=await page.evaluate(()=>({filters:JSON.stringify(state.filters),total:state.total,
+    value:[...new Set(state.rows.map(row=>row.event_ref))].slice(0,2).join('\n')}));
+  assert.equal(exactBefore.value.split('\n').length,2,'use two existing stable event references');
+  await page.evaluate(value=>addFilter({column:'event_ref',op:'in_exact',value,value2:null}),exactBefore.value);
+  await page.waitForFunction(()=>document.querySelector('#events-table').getAttribute('aria-busy')==='false'&&Tasks.pending()===0,null,{timeout:30000});
+  await page.evaluate(()=>settleFilterTabCounts());await page.waitForFunction(()=>Tasks.pending()===0);
+  const exactChip=page.locator('#chips .chip-edit').last();
+  const exactOpen=await page.evaluate(()=>({filters:JSON.stringify(state.filters),
+    calls:JSON.stringify(Object.entries(window.__mockCommandCalls).filter(([key])=>['query_page','count_filtered','stats_events','tree_aggs'].includes(key)))}));
+  await exactChip.click();await page.locator('#filter-pop').waitFor({state:'visible'});
+  assert.equal(await page.locator('#fp-op').inputValue(),'in_exact','native select retains the temporary exact-list option');
+  assert.match(await page.locator('#fp-op option:checked').textContent(),/lista exata.*por linha/);
+  assert.equal(await page.locator('#fp-val').inputValue(),exactBefore.value,'multiline list text is literal');
+  await page.locator('#fp-val').fill(exactBefore.value+'\ncancelled draft');await page.locator('#fp-cancel').click();
+  assert.equal(await page.evaluate(()=>JSON.stringify(state.filters)),exactOpen.filters);
+  assert.equal(await exactChip.evaluate(node=>node===document.activeElement),true);
+  assert.equal(await page.evaluate(()=>JSON.stringify(Object.entries(window.__mockCommandCalls).filter(([key])=>['query_page','count_filtered','stats_events','tree_aggs'].includes(key)))),exactOpen.calls,'opening/cancelling in_exact starts no data query');
+  await exactChip.press('Enter');assert.equal(await page.locator('#fp-op').inputValue(),'in_exact');
+  await page.locator('#fp-apply').click();
+  await page.waitForFunction(()=>document.querySelector('#events-table').getAttribute('aria-busy')==='false'&&Tasks.pending()===0,null,{timeout:30000});
+  assert.deepEqual(await page.evaluate(()=>state.filters.at(-1)),{column:'event_ref',op:'in_exact',value:exactBefore.value,value2:null});
+  assert.equal(await exactChip.evaluate(node=>node===document.activeElement),true);
+  await page.locator('#chips .filter-chip').last().locator('.x').click();
+  await page.waitForFunction(total=>state.total===total&&document.querySelector('#events-table').getAttribute('aria-busy')==='false'&&Tasks.pending()===0,exactBefore.total,{timeout:30000});
+  assert.equal(await page.evaluate(()=>JSON.stringify(state.filters)),exactBefore.filters,'removing the temporary list restores every prior filter');
+  assert.equal(await page.evaluate(()=>state.filters.length),beforeFilters+1);
+  for(const [width,height] of [[1440,900],[1024,768]]){
+    await page.setViewportSize({width,height});await chipEditor.focus();
+    assert.equal(await chipEditor.evaluate(node=>getComputedStyle(node).fontSize===getComputedStyle(node.parentElement).fontSize),true,'edit label keeps chip typography');
+    assert.ok(await chipEditor.evaluate(node=>node.getBoundingClientRect().height>=node.parentElement.getBoundingClientRect().height-2),'edit target fills existing chip height');
+    assert.equal(await chipEditor.locator('button').count(),0,'no nested buttons');
+    await page.screenshot({path:`output/playwright/filter-chip-edit-${width}.png`,fullPage:true});
+  }
+  await page.setViewportSize({width:1440,height:900});
+  await chipEditor.click();await page.locator('#filter-pop').waitFor({state:'visible'});
+  await page.screenshot({path:'output/playwright/filter-chip-editor-1440.png',fullPage:true});
+  await page.locator('#fp-cancel').click();
   const failedImport=await page.evaluate(async()=>{
     window.__mockLatency={};
     const before={id:state.currentArtifact.id,source:JSON.stringify(state.currentArtifact.source),rows:state.rows.length};

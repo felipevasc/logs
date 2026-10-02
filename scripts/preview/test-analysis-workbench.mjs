@@ -12,7 +12,66 @@ const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, reducedMotion: "reduce" });
 const errors = [], results = {};
 let phase = "startup";
-page.on("pageerror", error => errors.push(error.message));
+page.on("pageerror", error => errors.push(error.stack || error.message));
+
+// Only active pivot chip labels: resolve their translucent surface against the
+// actual opaque ancestor, rather than assuming white or the root background.
+function measurePivotChipContrast() {
+  const rgba = value => {
+    if (!/^rgba?\([\d.,\s]+\)$/.test(value)) throw Error(`Unsupported computed color: ${value}`);
+    const channels = value.match(/[\d.]+/g).map(Number);
+    return channels.length === 3 ? [...channels, 1] : channels;
+  };
+  const over = (front, back) => [...front.slice(0, 3).map((channel, index) => channel * front[3] + back[index] * (1 - front[3])), 1];
+  const luminance = color => color.slice(0, 3).map(channel => {
+    const value = channel / 255;
+    return value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4;
+  }).reduce((total, value, index) => total + value * [.2126, .7152, .0722][index], 0);
+  const describe = node => `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ""}${[...node.classList].map(name => `.${name}`).join("")}`;
+  return [...document.querySelectorAll("#aw-pivot-config-zones .cube-chip")].filter(chip => chip.getClientRects().length).map(chip => {
+    const label = chip.querySelector(":scope > span"), layers = [];
+    if (!label) throw Error("Active pivot chip has no label");
+    for (let node = label; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      const behindOpaque = layers.at(-1)?.rgba[3] === 1;
+      if ((!behindOpaque && style.backgroundImage !== "none") || Number(style.opacity) !== 1 || style.filter !== "none" || style.mixBlendMode !== "normal") {
+        throw Error(`Unsupported contrast layer: ${describe(node)}`);
+      }
+      if (!behindOpaque) layers.push({ element: describe(node), color: style.backgroundColor, rgba: rgba(style.backgroundColor) });
+    }
+    if (layers.at(-1)?.rgba[3] !== 1) throw Error("Pivot chip has no opaque ancestor background");
+    let background = layers.at(-1).rgba;
+    for (let index = layers.length - 2; index >= 0; index--) background = over(layers[index].rgba, background);
+    const color = getComputedStyle(label).color, foreground = over(rgba(color), background);
+    const light = luminance(foreground), dark = luminance(background);
+    return {
+      label: label.textContent, color, foreground, background, layers,
+      opaqueAncestor: layers.at(-1).element,
+      ratio: (Math.max(light, dark) + .05) / (Math.min(light, dark) + .05),
+    };
+  });
+}
+function assertPivotChipContrast(chips, description) {
+  assert.ok(chips.length > 0, `${description}: active pivot chips must be measured`);
+  for (const chip of chips) assert.ok(chip.ratio >= 4.5, `${description}: ${chip.label} is ${chip.ratio.toFixed(2)}:1 (${chip.color} over ${JSON.stringify(chip.background)})`);
+}
+const pivotRequests = () => page.evaluate(() => ({ calls: window.__mockCommandCalls.pivot || 0, requestVersion: cubeState.requestVersion }));
+async function setStableTheme(theme) {
+  await page.evaluate(async theme => {
+    if (document.documentElement.dataset.theme !== theme) toggleTheme();
+    const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await frames();
+    // Measure the settled palette, not a mixed intermediate background during
+    // the existing 140 ms cube-zone transition. Product timing stays unchanged.
+    for (;;) {
+      const transitions = document.getAnimations().filter(animation => animation instanceof CSSTransition
+        && (animation.playState === 'running' || animation.pending));
+      if (!transitions.length) return;
+      await Promise.all(transitions.map(animation => animation.finished.catch(() => {})));
+      await frames();
+    }
+  }, theme);
+}
 try {
   await page.goto(url);
   await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && state.loaded && state.rows.length > 0 && !state.loadOverlay && document.querySelector("#load-overlay").hidden);
@@ -95,6 +154,8 @@ try {
   await page.waitForFunction(() => document.querySelector("#cube-table tbody").rows.length > 1);
   assert.equal(await page.evaluate(() => activeCube() === activeCube()), true, "normalization must preserve table references");
   assert.ok(await page.evaluate(() => activeCube().lastDataSignature));
+  assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "true", "the builder starts expanded");
+  await page.getByRole("button", { name: "Recolher configuração", exact: true }).click();
   await page.evaluate(async () => {
     const original = api;
     api = async (name, args, opts) => { if (name === "pivot") throw new Error("Falha do cruzamento de teste"); return original(name, args, opts); };
@@ -107,6 +168,31 @@ try {
   await page.getByRole("button", { name: "Fechar explicação", exact: true }).click();
   await page.locator("#aw-pivot-summary").getByRole("button", { name: "Tentar novamente", exact: true }).click();
   await page.waitForFunction(() => document.querySelector("#cube-table tbody").rows.length > 1);
+  assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "false", "failure and retry do not reopen the builder");
+
+  phase = "pivot cancellation with folded configuration";
+  await page.evaluate(() => {
+    window.__mockLatency = { ...window.__mockLatency, pivot: 10_000 };
+    window.__configurationPending = runCube({ force: true });
+  });
+  await page.waitForFunction(() => Tasks.groups().some(group => group.tasks.some(task => task.cmd === "pivot")) && document.querySelector(".cube-output .area-loading-semantic"));
+  const pendingBefore = await page.evaluate(() => ({ pivot: window.__mockCommandCalls.pivot, cancels: window.__mockCommandCalls.cancel_task || 0, operation: Tasks.operationFor("pivot") }));
+  await page.getByRole("button", { name: "Editar configuração", exact: true }).click();
+  await page.getByRole("button", { name: "Recolher configuração", exact: true }).click();
+  assert.deepEqual(await page.evaluate(() => ({ pivot: window.__mockCommandCalls.pivot, cancels: window.__mockCommandCalls.cancel_task || 0, operation: Tasks.operationFor("pivot") })), pendingBefore,
+    "folding is available during calculation and never reruns or cancels it");
+  const taskId = await page.evaluate(() => Tasks.groups().flatMap(group => group.tasks).find(task => task.cmd === "pivot").id);
+  await page.locator("#workbar-tasks").click();
+  await page.locator(`.tasks-modal [data-cancel="${taskId}"]`).click();
+  await page.evaluate(async () => { await window.__configurationPending; delete window.__mockLatency.pivot; });
+  await page.locator(".tasks-modal [data-close]").click();
+  assert.equal(await page.locator(".cube-output .area-loading-semantic").count(), 0);
+  assert.equal(await page.locator("#cube-table tbody tr").count(), 0, "a cancelled calculation cannot leave stale totals");
+  assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "false");
+  await page.locator("#aw-pivot-summary").getByRole("button", { name: "Tentar novamente", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector("#cube-table tbody").rows.length > 1);
+  results.foldedRecovery = { errorDetailsAndRetry: true, realTaskCancellationAndRetry: true, toggleLeavesPendingOperationUntouched: true };
+  await page.getByRole("button", { name: "Editar configuração", exact: true }).click();
   await page.getByRole("combobox", { name: "Adicionar campo em colunas", exact: true }).selectOption("source");
   await page.waitForFunction(() => document.querySelector("#cube-table thead").rows.length === 2);
   await page.getByRole("combobox", { name: "Adicionar campo em linhas", exact: true }).selectOption("code");
@@ -127,7 +213,7 @@ try {
 
   // Each dimension opens the editable composer without applying the whole cell.
   await page.locator("#cube-table .cube-leaf-row .cube-value").first().click({ button: "right" });
-  await page.getByRole("button", { name: "Criar filtro: Nível", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Criar filtro: Nível", exact: true }).click();
   await page.locator("#filter-pop").waitFor({ state: "visible" });
   assert.equal(await page.locator("#fp-col").inputValue(), "level");
   assert.equal(await page.locator("#fp-op").inputValue(), "equals_exact");
@@ -181,6 +267,128 @@ try {
   assert.equal(results.compactViewport.toolsOverlapTable, false);
   assert.equal(results.compactViewport.tableWithinPanel, true);
   assert.ok(results.compactViewport.tableHeight >= 100);
+
+  phase = "explicit configuration folding, readable rows and keyboard";
+  results.configurationLayout = [];
+  const measureLayout = () => page.evaluate(() => {
+    const panel = document.querySelector("#view-cube").getBoundingClientRect(), table = document.querySelector("#cube-table-view").getBoundingClientRect();
+    const headerBottom = Math.max(...[...document.querySelectorAll("#cube-table thead th")].map(cell => cell.getBoundingClientRect().bottom));
+    const totalTop = Math.min(...[...document.querySelectorAll("#cube-table .total td")].map(cell => cell.getBoundingClientRect().top));
+    const tools = document.querySelector(".aw-pivot-result-tools").getBoundingClientRect(), toggle = document.querySelector("#aw-pivot-config-toggle");
+    const rows = [...document.querySelectorAll("#cube-table tbody tr:not(.total)")].map(row => row.getBoundingClientRect());
+    return {
+      tableHeight: Math.round(table.height), tableWidth: Math.round(table.width),
+      readableRows: rows.filter(row => row.top >= Math.max(table.top, headerBottom) - 1 && row.bottom <= Math.min(table.bottom, totalTop) + 1).length,
+      horizontalOverflow: document.documentElement.scrollWidth > innerWidth,
+      tableWithinPanel: table.top >= panel.top && table.bottom <= panel.bottom + 1,
+      toolsOverlapTable: tools.bottom > table.top + 1,
+      rowFont: Number.parseFloat(getComputedStyle(document.querySelector("#cube-table tbody td")).fontSize),
+      summaryFont: Number.parseFloat(getComputedStyle(document.querySelector("#aw-pivot-config-summary")).fontSize),
+      toggleHeight: toggle.getBoundingClientRect().height, toggleFocused: document.activeElement === toggle,
+      focusOutline: Number.parseFloat(getComputedStyle(toggle).outlineWidth),
+    };
+  });
+  for (const width of [1440, 1024]) for (const theme of ["dark", "light"]) {
+    await page.setViewportSize({ width, height: width === 1440 ? 960 : 768 });
+    const requestsBeforeTheme = await pivotRequests();
+    await setStableTheme(theme);
+    await page.evaluate(() => {
+      const table = document.querySelector("#cube-table-view"); table.scrollTop = 120; table.scrollLeft = 20;
+      const cube = activeCube();
+      window.__configurationProbe = {
+        firstRow: document.querySelector("#cube-table tbody tr"), result: cubeResultForTable(cube), schema: cubeSchemaSignature(cube),
+        requestVersion: cubeState.requestVersion, calls: window.__mockCommandCalls.pivot,
+        scroll: [table.scrollLeft, table.scrollTop], state: WorkspaceAnalysis.capture().pivot,
+      };
+    });
+    const expanded = await measureLayout();
+    const expandedChips = await page.evaluate(measurePivotChipContrast);
+    assertPivotChipContrast(expandedChips, `dataset/${theme}/${width}/expanded`);
+    await page.screenshot({ path: resolve(output, `workbench-pivot-expanded-${theme}-${width}.png`) });
+    await page.locator("#aw-pivot-config-toggle").focus(); await page.keyboard.press("Enter");
+    assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "false");
+    assert.equal(await page.locator("#aw-pivot-config-zones").isVisible(), false);
+    assert.equal(await page.locator("#aw-pivot-fields").isVisible(), false);
+    assert.equal(await page.locator("#aw-pivot-config-zones .cube-chip:visible").count(), 0);
+    const collapsed = await measureLayout();
+    await page.screenshot({ path: resolve(output, `workbench-pivot-collapsed-${theme}-${width}.png`) });
+    const preserved = await page.evaluate(() => {
+      const before = window.__configurationProbe, table = document.querySelector("#cube-table-view"), current = WorkspaceAnalysis.capture().pivot;
+      const { configurationCollapsed: _a, ...previous } = before.state, { configurationCollapsed: _b, ...after } = current;
+      return {
+        sameRow: before.firstRow === document.querySelector("#cube-table tbody tr"), sameResult: before.result === cubeResultForTable(activeCube()),
+        sameSchema: before.schema === cubeSchemaSignature(activeCube()), sameView: JSON.stringify(previous) === JSON.stringify(after),
+        noRequest: before.calls === window.__mockCommandCalls.pivot && before.requestVersion === cubeState.requestVersion,
+        sameScroll: Math.min(before.scroll[0], table.scrollWidth - table.clientWidth) === table.scrollLeft
+          && Math.min(before.scroll[1], table.scrollHeight - table.clientHeight) === table.scrollTop,
+      };
+    });
+    assert.ok(Object.values(preserved).every(Boolean), JSON.stringify(preserved));
+    assert.ok(collapsed.tableHeight >= expanded.tableHeight + 60, `${width}/${theme} must recover real data height`);
+    assert.ok(collapsed.readableRows >= expanded.readableRows + 2, `${width}/${theme} must expose more fully readable rows`);
+    assert.equal(collapsed.rowFont, expanded.rowFont, "more rows do not come from shrinking the text");
+    assert.ok(collapsed.summaryFont >= 12 && collapsed.toggleHeight >= 30);
+    assert.ok(collapsed.toggleFocused && collapsed.focusOutline >= 2);
+    assert.equal(collapsed.horizontalOverflow, false); assert.equal(collapsed.toolsOverlapTable, false); assert.equal(collapsed.tableWithinPanel, true);
+    await page.keyboard.press("Space");
+    assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "true");
+    assert.equal(await page.getByRole("combobox", { name: "Adicionar campo em linhas", exact: true }).isVisible(), true);
+    assert.equal(await page.evaluate(() => document.activeElement === document.querySelector("#aw-pivot-config-toggle")), true);
+    assert.equal(await page.evaluate(() => {
+      const table = document.querySelector("#cube-table-view"), previous = window.__configurationProbe.scroll;
+      return table.scrollLeft === previous[0] && table.scrollTop === previous[1];
+    }), true, "reopening restores even positions clamped by the larger viewport");
+    const reopenedChips = await page.evaluate(measurePivotChipContrast);
+    assertPivotChipContrast(reopenedChips, `dataset/${theme}/${width}/reopened`);
+    assert.deepEqual(reopenedChips, expandedChips, "folding preserves the active chip labels and their effective colors");
+    assert.deepEqual(await pivotRequests(), requestsBeforeTheme, "theme changes and the complete folding round-trip issue no pivot query");
+    results.configurationLayout.push({ width, theme, expanded, collapsed, preserved, chipContrast: { expanded: expandedChips, reopened: reopenedChips } });
+  }
+
+  phase = "folding preferences survive real workspace rotation";
+  const rotationState = () => page.evaluate(() => ({
+    scope: WorkspaceContext.scope(), changing: WorkspaceContext.changing, tab: state.activeDatasetTab,
+    tableRows: document.querySelector("#cube-table tbody").rows.length,
+    cachedResult: !!cubeState.result, cachedTableResult: !!cubeResultForTable(activeCube()),
+    requestVersion: cubeState.requestVersion, pendingOperation: Tasks.operationFor("pivot"),
+    expanded: document.querySelector("#aw-pivot-config-toggle").getAttribute("aria-expanded"),
+  }));
+  results.configurationRotation = { before: await rotationState() };
+  await page.getByRole("button", { name: "Recolher configuração", exact: true }).click();
+  await page.evaluate(() => WorkspaceContext.setScope("case", { page: "explore", tab: "cube", animate: false }));
+  await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "case");
+  // showPage/switchTab do not await openCube. Its profile lookup can still be
+  // pending here, so settle the initial Case result before the no-query baseline.
+  await page.waitForFunction(() => WorkspaceContext.scope() === "case" && state.analyticsScope === "case"
+    && !!cubeState.result && cubeResultForTable(activeCube(), "case") === cubeState.result
+    && document.querySelector("#cube-table tbody").rows.length > 1
+    && !Tasks.operationFor("pivot") && !document.querySelector(".cube-output .area-loading-semantic"));
+  results.configurationRotation.case = await rotationState();
+  assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "true", "a new context does not inherit the previous folding choice");
+  results.caseChipContrast = [];
+  for (const theme of ["dark", "light"]) {
+    const requestsBeforeTheme = await pivotRequests();
+    await setStableTheme(theme);
+    const expanded = await page.evaluate(measurePivotChipContrast);
+    assertPivotChipContrast(expanded, `case/${theme}/expanded`);
+    await page.getByRole("button", { name: "Recolher configuração", exact: true }).click();
+    assert.equal(await page.locator("#aw-pivot-config-zones .cube-chip:visible").count(), 0);
+    await page.getByRole("button", { name: "Editar configuração", exact: true }).click();
+    const reopened = await page.evaluate(measurePivotChipContrast);
+    assertPivotChipContrast(reopened, `case/${theme}/reopened`);
+    assert.deepEqual(reopened, expanded, "Case chip colors and labels survive folding");
+    assert.deepEqual(await pivotRequests(), requestsBeforeTheme, "Case theme/folding changes issue no pivot query");
+    results.caseChipContrast.push({ theme, expanded, reopened });
+  }
+  await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", tab: "cube", animate: false }));
+  results.configurationRotation.returning = await rotationState();
+  await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "dataset" && document.querySelector("#cube-table tbody").rows.length > 1);
+  results.configurationRotation.settled = await rotationState();
+  assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "false", "returning to the original context restores its explicit choice");
+  assert.match(await page.locator("#aw-pivot-config-summary").textContent(), /Nível.*Código.*Origem.*Registros/);
+  await page.getByRole("button", { name: "Editar configuração", exact: true }).click();
+  assert.equal(await page.getByRole("combobox", { name: "Adicionar campo em colunas", exact: true }).isVisible(), true);
+  results.configurationContexts = "Case starts expanded; dataset restores its closed builder and authored axes; edit remains available";
   assert.deepEqual(errors, []);
   results.pageErrors = errors;
   writeFileSync(resolve(output, "workbench-validation.json"), JSON.stringify(results, null, 2));

@@ -75,7 +75,9 @@ assert.deepEqual(Array.from(state.visibleCols),['timestamp','host'],'reopening s
 assert.deepEqual(Array.from(context.artifact.visibleCols),['timestamp','host'],'restored preferences also appear in exported artifact metadata');
 context.localStorage.getItem=()=>'{corrupt';assert.doesNotThrow(()=>context.restoreVisiblePreferences());
 context.localStorage.setItem=()=>{throw Error('full');};assert.doesNotThrow(()=>context.saveVisibleCols());assert.equal(toasts,1);
-assert.ok(!source.slice(source.indexOf('window.addEventListener("resize"'),source.indexOf('  bindKeyboard();',source.indexOf('window.addEventListener("resize"'))).includes('refresh()'),'resize is layout only');
+const resizeBinding = source.indexOf('window.addEventListener("resize", () => {');
+assert.ok(resizeBinding >= 0, 'main layout resize binding exists');
+assert.ok(!source.slice(resizeBinding, source.indexOf('  bindKeyboard();', resizeBinding)).includes('refresh()'), 'resize is layout only');
 console.log('Frontend responsiveness: queue, ETA isolation, first rows, cursor/count cache, local preferences and resize passed');
 
 // Real Tasks wrapper: cancellation is isolated; shared consumers keep useful work alive.

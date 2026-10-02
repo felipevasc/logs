@@ -153,7 +153,7 @@ const el = (tag, cls, text) => {
   return e;
 };
 
-function setWorkbar(label, detail = "", progress = null, cancellable = false, summaryState = null) {
+function setWorkbar(label, detail = "", progress = null, cancellable = false, summaryState = null, waiting = null) {
   const bar = $("#workbar");
   const progressEl = $("#workbar-progress");
   const fill = $("#workbar-progress-fill");
@@ -168,15 +168,75 @@ function setWorkbar(label, detail = "", progress = null, cancellable = false, su
   progressEl.hidden = progress === null;
   if (progress !== null) fill.style.width = `${Math.max(0, Math.min(100, progress))}%`;
   $("#workbar-cancel").hidden = !cancellable; $("#workbar-cancel").disabled = false;
-  if (state.loadOverlay) mirrorLoadOverlay(label, detail, progress);
+  if (state.loadOverlay) mirrorLoadOverlay(label, detail, progress, waiting, cancellable);
 }
 
 // ------------------------------------------------------------------ overlay de carga
 let loadStepCount = 0;
+let loadWaitingVisual = null;
+let loadWaitingReceipt = null;
+let loadReturnFocus = null;
 
-function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-load") {
+function syncLoadCancel(focused = document.activeElement) {
+  const button = $("#load-cancel");
+  const owned = state.loadOverlayOperationId && state.loadOverlayOperationId === window.Tasks?.operationFor(state.loadOverlayProgressKey);
+  button.disabled = !owned || !state.loadOverlayCancellable || state.loadOverlayCancelling;
+  button.textContent = state.loadOverlayCancelling ? "Cancelamento solicitado" : "Cancelar operação";
+  $("#load-cancel-help").textContent = state.loadOverlayCancelling
+    ? "Aguardando confirmação da operação."
+    : button.disabled ? "Cancelamento indisponível nesta etapa."
+    : "Solicita a interrupção desta operação. Pausar a animação mantém o trabalho em andamento.";
+  // A disappearing/disabled control must not strand keyboard focus. Do not
+  // move focus when the user is reading details or working elsewhere.
+  if ((focused === button && button.disabled) || (focused === $("#load-visual .wv-motion-toggle") && focused?.hidden)) {
+    $("#load-progress-details > summary").focus({ preventScroll: true });
+  }
+}
+
+function updateLoadWaiting(receipt) {
+  const focused = document.activeElement;
+  loadWaitingReceipt = state.loadOverlayCancelling ? { ...receipt, state: "cancelling", label: "" } : receipt;
+  loadWaitingVisual?.update(loadWaitingReceipt);
+  syncLoadCancel(focused);
+}
+
+function cancelLoadOperation() {
+  const operationId = state.loadOverlayOperationId;
+  // The card never falls back to whichever unrelated query last used the bar.
+  if (!state.loadOverlay || !operationId || !state.loadOverlayCancellable || state.loadOverlayCancelling
+      || operationId !== window.Tasks?.operationFor(state.loadOverlayProgressKey)) {
+    if (state.loadOverlay) syncLoadCancel();
+    return;
+  }
+  window.Tasks.cancelOperation(operationId);
+}
+document.addEventListener("task-state-change", event => {
+  const change = event.detail;
+  if (!state.loadOverlay || !change?.operationId) return;
+  if (change.started && change.latestKey === state.loadOverlayProgressKey
+      && change.operationId === window.Tasks?.operationFor(state.loadOverlayProgressKey)) {
+    // Bind before progress. One source load owns one card; timestamp settings
+    // legitimately start a new named task for each file in the same foreground run.
+    if (state.loadOverlayOperationId && state.loadOverlayProgressKey !== "timestamp-config") { syncLoadCancel(); return; }
+    state.loadOverlayOperationId = change.operationId;
+    state.loadOverlayCancellable = false;
+    state.loadOverlayCancelling = false;
+    updateLoadWaiting({ operationId: change.operationId, phaseId: "", state: "running", label: state.loadOverlayLabel });
+    return;
+  }
+  if (change.state !== "cancelling" || change.operationId !== state.loadOverlayOperationId) return;
+  state.loadOverlayCancelling = true;
+  updateLoadWaiting({ ...loadWaitingReceipt, operationId: change.operationId, state: "cancelling", label: "" });
+});
+
+function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-load", returnFocus = document.activeElement) {
+  if (!state.loadOverlay) loadReturnFocus = returnFocus;
   state.loadOverlay = true;
   state.loadOverlayProgressKey = progressKey;
+  state.loadOverlayLabel = firstStep;
+  state.loadOverlayOperationId = null;
+  state.loadOverlayCancellable = false;
+  state.loadOverlayCancelling = false;
   state.loadOverlayVersion = (state.loadOverlayVersion || 0) + 1;
   loadStepCount = 0;
   $("#load-steps").innerHTML = "";
@@ -188,10 +248,34 @@ function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-
   progressSamples.length = 0;
   pushLoadStep(firstStep);
   $("#load-overlay").hidden = false;
+  $("#load-progress-details").open = false;
+  loadWaitingVisual?.destroy();
+  loadWaitingReceipt = {
+    operationId: `foreground-${state.loadOverlayVersion}`, phaseId: "", state: "running", label: firstStep,
+  };
+  loadWaitingVisual = window.WaitingVisuals.mount($("#load-visual"), loadWaitingReceipt);
+  syncLoadCancel();
 }
 
 function hideLoadOverlay(ok = true) {
+  const restoreFocus = $("#load-overlay").contains(document.activeElement);
   state.loadOverlay = false;
+  state.loadOverlayOperationId = null;
+  state.loadOverlayCancellable = false;
+  state.loadOverlayCancelling = false;
+  // Work owns the lifetime, not the decorative animation cycle.
+  loadWaitingVisual?.destroy(); loadWaitingVisual = null;
+  loadWaitingReceipt = null;
+  $("#load-overlay").hidden = true;
+  if (restoreFocus) {
+    for (const target of [loadReturnFocus, $(".nav-pages button.selected:not([hidden])"), $("#case-select")]) {
+      if (!target?.isConnected || target === document.body || target === document.documentElement
+          || target.disabled || !target.getClientRects().length) continue;
+      target.focus({ preventScroll: true });
+      if (document.activeElement === target) break;
+    }
+  }
+  loadReturnFocus = null;
   if (ok) {
     document.querySelectorAll("#load-steps li").forEach((li) => {
       li.classList.add("done");
@@ -199,10 +283,6 @@ function hideLoadOverlay(ok = true) {
     });
     $("#load-bar-fill").parentElement.hidden = false; $("#load-bar-fill").style.width = "100%";
     $("#load-phase").textContent = "Pronto!";
-    const version = state.loadOverlayVersion;
-    setTimeout(() => { if (version === state.loadOverlayVersion) $("#load-overlay").hidden = true; }, 450);
-  } else {
-    $("#load-overlay").hidden = true;
   }
 }
 
@@ -220,7 +300,7 @@ function pushLoadStep(label) {
   while (steps.children.length > 4) steps.firstChild.remove();
 }
 
-function mirrorLoadOverlay(label, detail, progress) {
+function mirrorLoadOverlay(label, detail, progress, waiting = null, cancellable = false) {
   if (!state.loadOverlay) return;
   if (label && label !== $("#load-phase").textContent) pushLoadStep(label);
   $("#load-phase").textContent = label;
@@ -228,6 +308,10 @@ function mirrorLoadOverlay(label, detail, progress) {
   $("#load-bar-fill").parentElement.hidden = progress == null;
   if (progress != null) $("#load-bar-fill").style.width = `${Math.max(0, Math.min(100, progress))}%`;
   $("#load-eta").textContent = state.operationTiming || "";
+  state.loadOverlayCancellable = !!cancellable && waiting?.operationId === state.loadOverlayOperationId;
+  updateLoadWaiting(waiting || {
+    operationId: state.loadOverlayOperationId || `foreground-${state.loadOverlayVersion}`, phaseId: "", state: "running", label: label || "Processando",
+  });
 }
 
 function startOperation(kind, label, detail = "") {
@@ -241,6 +325,7 @@ function updateOperation(label, detail = "", progress = null, cancellable = true
 }
 
 function cancelWorkbarTask() {
+  if (state.loadOverlay) { cancelLoadOperation(); return; }
   if (!state.progressOperationId) { window.Tasks?.open(); return; }
   window.Tasks?.cancelOperation(state.progressOperationId);
   $("#workbar-detail").textContent = "Cancelando · aguardando confirmação";
@@ -262,7 +347,8 @@ window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
   // Each task keeps its own progress above. The foreground import overlay
   // belongs only to its named foreground operation, including while session-save
   // acknowledgement is pending after that native task has already settled.
-  if (state.loadOverlay && (!payload.operationId || payload.operationId !== window.Tasks?.operationFor(state.loadOverlayProgressKey || "source-load"))) return;
+  if (state.loadOverlay && (!payload.operationId || payload.operationId !== state.loadOverlayOperationId
+      || payload.operationId !== window.Tasks?.operationFor(state.loadOverlayProgressKey))) return;
   const id = payload.operationId || payload.operation || "legacy-load";
   const estimate = task?.estimate || window.PerformanceTools.estimate(operationEstimates.get(id), payload);
   operationEstimates.set(id, estimate);
@@ -280,7 +366,10 @@ window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
   state.operationTiming = timing.join(" · ");
   state.progressOperationId = task?.operationId || null;
   const volume = estimate.total > 0 ? `${fmtNum(estimate.completed)} / ${fmtNum(estimate.total)} ${payload.unit || "itens"}` : estimate.completed ? `${fmtNum(estimate.completed)} ${payload.unit || "itens"}` : "Total ainda desconhecido";
-  setWorkbar(payload.phase || "Processando", [volume, state.operationTiming, payload.error].filter(Boolean).join(" · "), estimate.percent, !!task && !!payload.cancellable);
+  const waiting = window.WaitingProgress.snapshot(payload, { operationId: id,
+    elapsedMs: elapsed == null ? undefined : elapsed * 1000,
+    estimateMs: estimate.eta == null ? undefined : estimate.eta * 1000 });
+  setWorkbar(payload.phase || "Processando", [volume, state.operationTiming, payload.error].filter(Boolean).join(" · "), estimate.percent, !!task && !!payload.cancellable, null, waiting);
 }).catch(() => {});
 
 // live-refresh quando uma tool MCP muta o estado do backend
@@ -556,10 +645,99 @@ const esc = (s) =>
   );
 const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Only frequent, benign acknowledgements coalesce. Errors, context warnings and
+// evidence/Undo receipts keep their own identity and existing lifetime.
+const repeatableToastMessages = new Set([
+  "Copiado.", "Valor copiado.", "Nome copiado.", "JSON copiado.", "SHA-256 copiado.", "Caminho copiado.",
+  "Filtro atualizado.", "Filtro adicionado.",
+]);
+const toastFeedback = new Map();
+let toastFeedbackArea = null, toastFeedbackObserver = null;
+
+function positionToastFeedback() {
+  const area = toastFeedbackArea, focused = document.activeElement;
+  if (!area?.children.length || area.contains(focused)) return;
+  const inset = 18, gap = 8, size = area.getBoundingClientRect();
+  const right = Math.max(inset, window.innerWidth - size.width - inset);
+  const bottom = Math.max(inset, window.innerHeight - size.height - inset);
+  const obstacles = [...document.querySelectorAll(".popover:not([hidden]), .modal-actions")];
+  const interactiveArea = $("#toast-area");
+  if (interactiveArea?.children.length) obstacles.unshift(interactiveArea);
+  if (focused && focused !== document.body && focused !== document.documentElement) obstacles.unshift(focused);
+  const bounds = obstacles.filter(node => node.getClientRects().length).map(node => node.getBoundingClientRect());
+  const positions = [[right, bottom], [inset, bottom], [right, inset], [inset, inset]];
+  // A focused control near the middle can also leave room directly above/below
+  // it when neither vertical corner fits (for example at increased UI scale).
+  if (bounds.length) for (const y of [bounds[0].top - size.height - gap, bounds[0].bottom + gap]) {
+    if (y >= inset && y <= bottom) positions.push([right, y], [inset, y]);
+  }
+  const overlaps = ([x, y], rect) => x < rect.right + gap && x + size.width > rect.left - gap
+    && y < rect.bottom + gap && y + size.height > rect.top - gap;
+  const best = positions.find(point => bounds.every(rect => !overlaps(point, rect)))
+    || positions.find(point => !bounds.length || !overlaps(point, bounds[0])) || positions[0];
+  area.style.left = `${best[0]}px`; area.style.top = `${best[1]}px`;
+  area.style.right = "auto"; area.style.bottom = "auto";
+}
+
+function removeToastFeedback(node) {
+  const record = toastFeedback.get(node);
+  if (!record) return;
+  clearTimeout(record.timer); cancelAnimationFrame(record.announcement);
+  toastFeedback.delete(node); node.remove();
+  if (toastFeedback.size) positionToastFeedback();
+  else {
+    document.removeEventListener("focusin", positionToastFeedback);
+    document.removeEventListener("scroll", positionToastFeedback, true);
+    window.removeEventListener("resize", positionToastFeedback);
+    toastFeedbackObserver?.disconnect(); toastFeedbackObserver = null;
+    toastFeedbackArea?.remove(); toastFeedbackArea = null;
+  }
+}
+
 function toast(msg, type = "info") {
-  const t = el("div", `toast ${type}`, msg);
-  $("#toast-area").appendChild(t);
-  setTimeout(() => t.remove(), 4200);
+  const message = String(msg ?? ""), repeatable = type === "ok" && repeatableToastMessages.has(message);
+  if (repeatable) for (const [node, record] of toastFeedback) {
+    if (record.message !== message || record.type !== type) continue;
+    if (!node.isConnected) { removeToastFeedback(node); continue; }
+    record.count += 1;
+    record.badge.textContent = `×${record.count}`; record.badge.hidden = false;
+    clearTimeout(record.timer); record.timer = setTimeout(() => removeToastFeedback(node), 4200);
+    positionToastFeedback();
+    return;
+  }
+  const node = el("div", `toast ${type} toast-feedback${repeatable ? " toast-passive" : ""}`), text = el("span", "toast-message");
+  const badge = el("span", "toast-repeat-count");
+  node.setAttribute("role", type === "err" ? "alert" : "status");
+  node.setAttribute("aria-atomic", "true");
+  badge.setAttribute("aria-hidden", "true"); badge.hidden = true;
+  node.appendChild(text); node.appendChild(badge);
+  if (!toastFeedback.size) {
+    document.addEventListener("focusin", positionToastFeedback);
+    document.addEventListener("scroll", positionToastFeedback, true);
+    window.addEventListener("resize", positionToastFeedback);
+    const interactiveArea = $("#toast-area");
+    if (interactiveArea) {
+      // Legacy Undo owns its lane, layout and lifetime. Its growth may move only
+      // this separate feedback lane, never its button or another receipt.
+      toastFeedbackObserver = new MutationObserver(positionToastFeedback);
+      toastFeedbackObserver.observe(interactiveArea, { childList: true, subtree: true, characterData: true });
+    }
+  }
+  if (!toastFeedbackArea?.isConnected) {
+    toastFeedbackArea = el("div"); toastFeedbackArea.id = "toast-feedback-area";
+    document.body.appendChild(toastFeedbackArea);
+  }
+  toastFeedbackArea.appendChild(node);
+  const record = { message, type, badge, count: 1, timer: null, announcement: null };
+  toastFeedback.set(node, record);
+  // Register the live region before filling it; repetitions only update the
+  // aria-hidden counter, so rapid copies do not narrate the same text repeatedly.
+  record.announcement = requestAnimationFrame(() => {
+    if (!node.isConnected) { removeToastFeedback(node); return; }
+    text.textContent = message; positionToastFeedback();
+  });
+  record.timer = setTimeout(() => removeToastFeedback(node), 4200);
+  positionToastFeedback();
 }
 
 // ------------------------------------------------------------------ indicador global
@@ -680,19 +858,45 @@ function btnBusy(btn, text) {
 }
 
 // overlay de espera sobre uma área; aparece só se a operação passar de ~250ms
-function areaLoading(container, text = "Consultando…") {
+let areaLoadingSerial = 0;
+function areaLoading(container, text = "Consultando…", { phaseId = "" } = {}) {
   if (!container) return { done() {} };
-  let ov = null;
+  let ov = null, visual = null, longWait = null, waitState = "running", closed = false;
+  const started = performance.now(); let operationId = `area-${++areaLoadingSerial}`;
+  const receipt = () => ({ operationId, phaseId, state: waitState, label: waitState === "running" ? text : "", elapsedMs: performance.now() - started });
+  const changed = event => {
+    if (closed || event.detail?.operationId !== operationId || event.detail.state !== "cancelling") return;
+    waitState = "cancelling"; clearTimeout(longWait);
+    visual?.update(receipt());
+  };
+  if (phaseId) document.addEventListener("task-state-change", changed);
   const timer = setTimeout(() => {
+    if (!container.isConnected) return;
     ov = el("div", "area-loading");
-    ov.innerHTML = `<i class="fas fa-circle-notch spin"></i><span>${esc(text)}</span>`;
     container.appendChild(ov);
+    if (phaseId) {
+      ov.classList.add("area-loading-semantic");
+      visual = window.WaitingVisuals.mount(ov, receipt());
+      // One measured threshold update, not a per-frame clock or query. Browser
+      // timeouts truncate fractions; round up so the only receipt is not early.
+      if (waitState === "running") longWait = setTimeout(() => visual?.update(receipt()), Math.max(0, Math.ceil(4000 - (performance.now() - started))));
+    } else ov.innerHTML = `<i class="fas fa-circle-notch spin"></i><span>${esc(text)}</span>`;
     requestAnimationFrame(() => ov?.classList.add("show"));
   }, 250);
   return {
+    bindOperation(id) {
+      if (closed || typeof id !== "string" || !id) return;
+      operationId = id;
+      visual?.update(receipt());
+    },
     done() {
+      closed = true;
+      if (phaseId) document.removeEventListener("task-state-change", changed);
       clearTimeout(timer);
+      clearTimeout(longWait);
+      visual?.destroy(); visual = null;
       if (!ov) return;
+      if (phaseId) { ov.remove(); ov = null; return; }
       ov.classList.remove("show");
       const elRef = ov;
       ov = null;
@@ -971,6 +1175,7 @@ function sourceIdentityUnavailable(source) {
 }
 
 async function loadData(requestedSource = null, options = {}) {
+  const returnFocus = document.activeElement;
   const version = options.version ?? ++state.artifactSwitchVersion;
   let caseId = options.caseId ?? state.cases.active;
   let caseInstance = state.cases.cases.find(item => item.id === caseId) || null;
@@ -990,7 +1195,7 @@ async function loadData(requestedSource = null, options = {}) {
   const status = $("#load-status");
   status.className = "load-status";
   startOperation("load", "Preparando artefato", "Validando fonte");
-  showLoadOverlay();
+  showLoadOverlay("Validando a fonte", "source-load", returnFocus);
   skeletonRows();
   try {
     let source = requestedSource ? { ...requestedSource } : sourceSpecFromControls();
@@ -1126,6 +1331,12 @@ async function loadData(requestedSource = null, options = {}) {
     return current();
   } catch (e) {
     if (!current()) return false;
+    // The native task has settled even if source recovery still needs to wait.
+    // Retire its control before reconciliation, without closing the waiting card.
+    if (state.loadOverlay && state.loadOverlayProgressKey === "source-load") {
+      state.loadOverlayCancellable = false;
+      syncLoadCancel();
+    }
     if (!sourceAccepted) {
       try {
         sourceAccepted = await reconcilePublishedSource(current);
@@ -1316,15 +1527,31 @@ function invertFilter(index) {
   toast(`Filtro invertido: ${chipLabel(f)}`, "ok");
 }
 
+const filterChipTargets = new WeakMap();
 function renderChips() {
+  const focused = document.activeElement, focusedChip = filterChipTargets.get(focused), context = filterContextKey();
+  let nextFocus = null;
   const boxes = document.querySelectorAll(".chips-sync");
   boxes.forEach((box) => (box.innerHTML = ""));
   state.filters.forEach((f, i) => {
     boxes.forEach((box) => {
-      const chip = el("span", "chip");
-      chip.title = `${f.op === "query" && f.label ? f.value : chipLabel(f)} (Botão direito: inverter ou editar)`;
-      chip.appendChild(el("span", "", chipLabel(f)));
+      const label = chipLabel(f), chip = el("span", "chip filter-chip");
+      chip.title = `${f.op === "query" && f.label ? f.value : label} (Clique para editar · botão direito para opções)`;
+      const edit = el("button", "chip-edit", label);
+      edit.type = "button";
+      edit.setAttribute("aria-label", `Editar filtro: ${label}`);
+      edit.title = `Editar filtro: ${f.op === "query" && f.label ? f.value : label}`;
+      filterChipTargets.set(edit, { filter: f, box, context });
+      const editFilter = () => {
+        const index = state.filters.indexOf(f);
+        if (edit.isConnected && index >= 0 && context === filterContextKey()) openFilterPop(edit, index);
+      };
+      edit.onclick = event => { event.stopPropagation(); editFilter(); };
+      chip.appendChild(edit);
+      if (focusedChip?.filter === f && focusedChip.box === box && focusedChip.context === context) nextFocus = edit;
       const x = el("button", "x");
+      x.type = "button";
+      x.setAttribute("aria-label", `Remover filtro: ${label}`);
       x.innerHTML = '<i class="fas fa-xmark"></i>';
       x.title = "Remover filtro";
       x.onclick = (e) => { e.stopPropagation(); removeFilter(i); };
@@ -1342,7 +1569,7 @@ function renderChips() {
           {
             icon: "fa-pen-to-square",
             label: "Editar filtro",
-            onClick: () => openFilterPop(chip, i),
+            onClick: editFilter,
           },
           { sep: true },
           {
@@ -1376,6 +1603,9 @@ function renderChips() {
   // moldura global: tudo na janela passa a refletir apenas a realidade filtrada
   document.body.classList.toggle("filters-active", hasActive);
   renderFilterTabs();
+  if (focusedChip && (document.activeElement === focused || document.activeElement === document.body)) {
+    filterFocusTarget(nextFocus || focused)?.focus({ preventScroll: true });
+  }
 }
 
 // ponto único de reação a mudanças de filtro: chips, árvore e a tela corrente
@@ -2103,6 +2333,11 @@ function toggleFacet(column, value) {
 
 let currentEditFilterIndex = null;
 let currentEditFilter = null, currentEditFilterValue = null, currentFilterContext = null, filterReturnFocus = null, filterComposing = false;
+// Preserve these existing native filters without expanding the new-filter menu.
+const existingFilterOperators = new Map([
+  ["in_exact", "está na lista exata (um valor por linha)"],
+  ["detection", "corresponde à detecção"],
+]);
 const filterValueFormats = new Map();
 function setFilterInputValue(selector, value) {
   const input = $(selector), text = String(value ?? ""), escaped = text.includes("\r");
@@ -2134,7 +2369,11 @@ function filterContextKey() {
   return JSON.stringify([workspaceScope(), activeCase()?.id, window.AnalysisContexts?.capture().instance, window.AnalysisContexts?.identity(), state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields]);
 }
 function filterFocusTarget(origin) {
-  return [origin, $("#btn-add-filter"), $("#dr-close"), $("#quick-search")].find(node => node?.isConnected && !node.hidden && !node.disabled
+  const chip = filterChipTargets.get(origin);
+  const currentChip = !chip || chip.context === filterContextKey();
+  const replacement = currentChip && chip?.box.isConnected && [...chip.box.querySelectorAll(".chip-edit")]
+    .find(button => filterChipTargets.get(button)?.filter === chip.filter);
+  return [currentChip ? origin : null, replacement, $("#btn-add-filter"), $("#dr-close"), $("#quick-search")].find(node => node?.isConnected && !node.hidden && !node.disabled
     && node.matches?.("button,input,select,textarea,[tabindex],a[href]") && !node.closest?.(".ctx-menu,#filter-pop,[hidden],[inert]")
     && (!node.getClientRects || node.getClientRects().length));
 }
@@ -2152,7 +2391,9 @@ function openFilterPop(anchor = null, editIndex = null, preset = null) {
   currentEditFilter = editIndex == null ? null : state.filters[editIndex];
   currentEditFilterValue = currentEditFilter ? JSON.stringify(currentEditFilter) : null;
   currentFilterContext = filterContextKey();
-  const origin = anchor?.matches?.("button,input,select,textarea,[tabindex],a[href]") ? anchor : document.activeElement;
+  // An explicit cell/text anchor owns the return path even when it cannot take
+  // focus itself; use the filter fallback, not unrelated restored menu focus.
+  const origin = anchor || document.activeElement;
   filterReturnFocus = filterFocusTarget(origin);
   const pop = $("#filter-pop");
   const colSel = $("#fp-col");
@@ -2175,6 +2416,9 @@ function openFilterPop(anchor = null, editIndex = null, preset = null) {
     const f = selected;
     if (![...colSel.options].some(option => option.value === f.column)) colSel.appendChild(el("option", "", colLabel(f.column))).value = f.column;
     colSel.value = f.column;
+    if (editIndex != null && existingFilterOperators.has(f.op)) {
+      opSel.appendChild(el("option", "", existingFilterOperators.get(f.op))).value = f.op;
+    }
     opSel.value = f.op;
     setFilterInputValue("#fp-val", f.value);
     setFilterInputValue("#fp-val2", f.value2);
@@ -2254,11 +2498,19 @@ function applyFilterPop() {
   }
   const column = $("#fp-col").value;
   const op = $("#fp-op").value;
+  const standard = operator => OPS.some(([value]) => value === operator);
+  const unsupportedExisting = currentEditFilter && !standard(currentEditFilter.op) && !existingFilterOperators.has(currentEditFilter.op);
+  if (unsupportedExisting || !standard(op) && !(existingFilterOperators.has(op) && currentEditFilter?.op === op)) {
+    toast(unsupportedExisting
+      ? "O operador deste filtro não está disponível para edição. Seu rascunho foi mantido; copie o valor e cancele para preservar o filtro original."
+      : "Selecione um operador de filtro válido. Seu rascunho foi mantido.", "info");
+    return false;
+  }
   let value, value2;
   try { value = ["empty", "not_empty"].includes(op) ? "" : readFilterInputValue("#fp-val"); value2 = op === "between" ? readFilterInputValue("#fp-val2") : ""; }
   catch (error) { toast(error.message, "info"); return false; }
   const literalWhitespace = ["contains", "not_contains", "starts_with", "ends_with", "regex"].includes(op) && value.length > 0;
-  if (!["empty", "not_empty", "equals_exact", "not_equals_exact"].includes(op) && !literalWhitespace && !value.trim()) {
+  if (!["empty", "not_empty", "equals_exact", "not_equals_exact", "in_exact"].includes(op) && !literalWhitespace && !value.trim()) {
     toast("Informe um valor para o filtro.", "info");
     return;
   }
@@ -2267,7 +2519,10 @@ function applyFilterPop() {
     if (problem) { toast(problem, "info"); return; }
   }
   if (index != null) {
-    state.filters[index] = { column, op, value, value2: value2 || null };
+    const updated = { column, op, value, value2: value2 || null };
+    const returnChip = filterChipTargets.get(filterReturnFocus);
+    if (returnChip?.filter === currentEditFilter) returnChip.filter = updated;
+    state.filters[index] = updated;
     currentEditFilterIndex = null;
     state.page = 0;
     filtersChanged();
@@ -2536,35 +2791,46 @@ function scheduleRefresh() {
 
 // ------------------------------------------------------------------ menu de contexto
 let ctxEl = null;
+const ctxMenu = window.ContextMenu.create({
+  onChange: menu => { ctxEl = menu; },
+  captureReturnFocus: source => {
+    const record = source?.closest?.(".record-actions-trigger"), target = record?._recordTarget;
+    if (target) return () => resolveRecordFocus(target);
+    const row = source?.closest?.(".field-row"), field = source?.closest?.(".field-item,.field-adv-btn");
+    const control = field?.matches(".field-adv-btn") ? ".field-adv-btn" : ".field-item";
+    const box = row?.closest(".explore-tree-sync"), column = row?.dataset.column;
+    if (!box || column == null) return null;
+    const scope = box.dataset.treeScope || "dataset", owner = window.AnalysisContexts?.capture();
+    return () => {
+      // Tree counts can replace the caller while its menu is open. Resolve only
+      // inside the original tree and ownership, even if the old node survived.
+      if (!box.isConnected || (box.dataset.treeScope || "dataset") !== scope
+        || owner && !window.AnalysisContexts.isCurrent(owner)) return null;
+      return [...box.querySelectorAll(control)]
+        .find(node => node.closest(".field-row")?.dataset.column === column) || null;
+    };
+  },
+  fallbackFocus: () => {
+    // A removed/hidden caller must never send focus behind an open surface.
+    const modal = [...document.querySelectorAll(".modal-overlay:not([hidden]),[role='dialog']:not([hidden])")]
+      .filter(node => node.getClientRects().length && !node.closest("[hidden],[inert]")).at(-1);
+    const surface = modal || (!$("#drawer").hidden ? $("#drawer") : null);
+    return surface ? [...surface.querySelectorAll("button,input,select,textarea,a[href],[tabindex]")]
+      : [$("#quick-search"), $("#btn-add-filter")];
+  },
+});
 
-function closeCtxMenu() {
-  if (ctxEl) { ctxEl.remove(); ctxEl = null; }
+function closeCtxMenu(restoreFocus = false) {
+  ctxMenu.close({ restoreFocus });
 }
 
-function showCtxMenu(x, y, items) {
+function showCtxMenu(x, y, items, options) {
   window.CanonicalFields?.cancel();
-  closeCtxMenu();
   const owner = window.AnalysisContexts?.capture();
-  const m = el("div", "ctx-menu");
-  for (const it of items) {
-    if (it.sep) { m.appendChild(el("div", "ctx-sep")); continue; }
-    const b = el("button", "ctx-item" + (it.danger ? " danger" : ""));
-    b.innerHTML = `<i class="fas ${it.icon}"></i><span>${esc(it.label)}</span>`;
-    if (it.color) b.querySelector("i").style.color = it.color;
-    b.disabled = !!it.disabled; if (it.title) b.title = it.title;
-    b.onclick = () => {
-      if (b.disabled) return;
-      closeCtxMenu();
-      if (owner && !window.AnalysisContexts.isCurrent(owner)) { toast("O contexto mudou. Abra o menu novamente no Caso e na fonte atuais.", "info"); return; }
-      it.onClick();
-    };
-    m.appendChild(b);
-  }
-  document.body.appendChild(m);
-  ctxEl = m;
-  const r = m.getBoundingClientRect();
-  m.style.left = `${Math.max(4, Math.min(x, innerWidth - r.width - 8))}px`;
-  m.style.top = `${Math.max(4, Math.min(y, innerHeight - r.height - 8))}px`;
+  return ctxMenu.open(x, y, items.map(item => item.sep ? item : { ...item, onClick: () => {
+    if (owner && !window.AnalysisContexts.isCurrent(owner)) { toast("O contexto mudou. Abra o menu novamente no Caso e na fonte atuais.", "info"); return; }
+    item.onClick();
+  } }), options);
 }
 
 const trunc = (s, n = 32) => {
@@ -2665,6 +2931,7 @@ function renderTsSources() {
     chip.classList.toggle("active", idx >= 0);
     chip.textContent = (idx >= 0 ? `${idx + 1}· ` : "") + colLabel(opt);
     chip.onclick = () => {
+      clearTsTestResult();
       const i = state.tsSources.indexOf(opt);
       if (i >= 0) state.tsSources.splice(i, 1);
       else state.tsSources.push(opt);
@@ -2679,16 +2946,19 @@ function renderTsSources() {
 let tsExampleEv = null;
 
 async function updateTsExample() {
-  if (!state.loaded || !state.rows.length || currentSource() !== "file") {
+  const editor = tsEditor;
+  if (!tsEditorCurrent(editor) || !state.loaded || !state.rows.length || currentSource() !== "file") {
     tsExampleEv = null;
     renderTsExample();
     return;
   }
+  let example = null;
   try {
-    tsExampleEv = await api("event_detail", { id: state.rows[0].id }, { silent: true });
-  } catch {
-    tsExampleEv = null;
-  }
+    example = await api("event_detail", { id: state.rows[0].id }, { silent: true, analysisOwner: state.tsAnalysisOwner });
+  } catch { /* exemplo indisponível */ }
+  if (!tsEditorCurrent(editor)) return;
+  // Um exemplo de outra fonte do conjunto não descreve a fonte em edição.
+  tsExampleEv = editor.editingPath && cellValue(example || {}, "caminho") !== editor.editingPath ? null : example;
   renderTsExample();
 }
 
@@ -2709,7 +2979,7 @@ function tsRuleBlock(rule = {}) {
   const del = el("button", "icon-btn dv-rule-del");
   del.innerHTML = '<i class="fas fa-xmark"></i>';
   del.title = "Remover regra";
-  del.onclick = () => { block.remove(); tsRenumberRules(); renderTsExample(); };
+  del.onclick = () => { clearTsTestResult(); block.remove(); tsRenumberRules(); renderTsExample(); };
   head.appendChild(del);
   const pat = el("input");
   pat.className = "dv-rule-pattern";
@@ -2738,6 +3008,7 @@ function tsRenumberRules() {
 }
 
 function tsAddRule(rule = {}) {
+  clearTsTestResult();
   const block = tsRuleBlock(rule);
   $("#ts-rules").appendChild(block);
   tsRenumberRules();
@@ -2811,25 +3082,35 @@ async function commitTsConfig(paths, config) {
     if (result?.publication) {
       state.sourcePublication = result.publication;
       invalidateAnalysisComputedData({ caseId: owner?.caseId || state.cases.active });
+      const previousOwner = owner;
       owner = window.AnalysisContexts?.capture(owner?.caseId);
-      state.tsAnalysisOwner = owner;
+      if (state.tsAnalysisOwner === previousOwner) state.tsAnalysisOwner = owner;
     }
   }
 }
 
 async function resetTsConfig() {
-  const paths = tsConfigPaths();
-  state.tsSources = [];
-  $("#ts-rules").innerHTML = "";
-  tsAddRule();
-  $("#ts-complement").value = "";
-  fillTsFormats();
-  $("#ts-format-custom").hidden = true;
-  renderTsSources();
-  await commitTsConfig(paths, null);
-  if (paths.length) {
+  const editor = tsEditor;
+  if (!tsEditorActionAllowed(editor)) return;
+  const returnFocus = document.activeElement;
+  editor.busy = true;
+  clearTsTestResult();
+  setTsEditorEnabled(false);
+  try {
+    await commitTsConfig(editor.paths, null);
+    if (!tsEditorCurrent(editor)) return;
+    replaceTsEditorConfig(null);
     toast("Configuração removida — voltou à inferência automática.", "ok");
     refresh();
+  } catch (e) {
+    if (tsEditor === editor) toast(`Falha ao redefinir data/hora: ${e}`, "err");
+  } finally {
+    editor.busy = false;
+    if (tsEditor === editor) {
+      setTsEditorEnabled(tsEditorCurrent(editor));
+      if (tsEditorCurrent(editor) && document.activeElement === document.body && returnFocus?.isConnected && !returnFocus.disabled
+        && $("#ts-modal").contains(returnFocus)) returnFocus.focus({ preventScroll: true });
+    }
   }
 }
 
@@ -2842,46 +3123,98 @@ function buildTsConfig() {
   return {
     timezone_offset_minutes: $("#ts-zone").value === "" ? null : Number($("#ts-zone").value),
     clock_adjustment_ms: Number($("#ts-clock").value || 0) * 1000,
-    sources: state.tsSources,
+    sources: [...state.tsSources],
     rules: collectTsRules(),
     format: tsFormatValue(),
     complement: $("#ts-complement").value.trim() || null,
   };
 }
 
+// Only an explicit open owns the form. Source-load/MCP reads must never
+// become editor state, erase a draft, or turn a successful dataset load into an error.
 async function loadTsConfig(path, current = () => true) {
-  $("#ts-zone").value = ""; $("#ts-clock").value = "0";
-  state.tsSources = [];
-  $("#ts-regex").value = "";
-  $("#ts-complement").value = "";
   try {
-    const cfg = await api("get_ts_config", { path }, { silent: true });
-    if (!current()) return;
-    if (cfg) {
-      $("#ts-zone").value = cfg.timezone_offset_minutes == null ? "" : String(cfg.timezone_offset_minutes);
-      $("#ts-clock").value = String((cfg.clock_adjustment_ms || 0) / 1000);
-      state.tsSources = cfg.sources || [];
-      $("#ts-rules").innerHTML = "";
-      const rules = cfg.rules?.length ? cfg.rules : [{ regex: cfg.regex, template: cfg.template }];
-      for (const r of rules) tsAddRule(r);
-      if (!rules.length) tsAddRule();
-      $("#ts-complement").value = cfg.complement || "";
-      if (TS_FORMATS.some(([v]) => v === cfg.format)) $("#ts-format").value = cfg.format;
-      else {
-        $("#ts-format").value = "custom";
-        $("#ts-format-custom").hidden = false;
-        $("#ts-format-custom").value = cfg.format || "";
-      }
+    const config = await api("get_ts_config", { path }, { silent: true });
+    return current() ? { config } : null;
+  } catch (error) {
+    return current() ? { error } : null;
+  }
+}
+
+let tsEditor = null;
+
+function clearTsTestResult() {
+  if (tsEditor) tsEditor.testRequest = (tsEditor.testRequest || 0) + 1;
+  $("#ts-test-result").innerHTML = "";
+}
+
+function replaceTsEditorConfig(cfg) {
+  $("#ts-zone").value = cfg?.timezone_offset_minutes == null ? "" : String(cfg.timezone_offset_minutes);
+  $("#ts-clock").value = String((cfg?.clock_adjustment_ms || 0) / 1000);
+  state.tsSources = [...(cfg?.sources || [])];
+  $("#ts-regex").value = "";
+  $("#ts-template").value = "";
+  $("#ts-assembled").textContent = "";
+  $("#ts-rules").innerHTML = "";
+  const rules = cfg?.rules?.length ? cfg.rules : [{ regex: cfg?.regex, template: cfg?.template }];
+  for (const rule of rules) tsAddRule(rule);
+  $("#ts-complement").value = cfg?.complement || "";
+  const format = cfg ? cfg.format || "" : TS_FORMATS[1][0];
+  const custom = !TS_FORMATS.some(([value]) => value !== "custom" && value === format);
+  $("#ts-format").value = custom ? "custom" : format;
+  $("#ts-format-custom").value = custom ? format : "";
+  $("#ts-format-custom").hidden = !custom;
+  clearTsTestResult();
+  tsExampleEv = null;
+  renderTsSources();
+}
+
+function setTsEditorEnabled(enabled) {
+  document.querySelectorAll("#ts-modal .modal-body input, #ts-modal .modal-body select, #ts-modal .modal-body button")
+    .forEach(control => { if (control.id !== "ts-retry") control.disabled = !enabled; });
+}
+
+function tsEditorCurrent(editor = tsEditor) {
+  return !!editor && tsEditor === editor && editor.ready && !$("#ts-modal").hidden
+    && (!state.tsAnalysisOwner || window.AnalysisContexts.isCurrent(state.tsAnalysisOwner));
+}
+
+function tsEditorActionAllowed(editor = tsEditor) {
+  if (!tsEditorCurrent(editor) || editor.busy) {
+    if (editor?.ready && !editor.busy) {
+      setTsEditorEnabled(false);
+      $("#ts-status").textContent = "A fonte ou o Caso mudou. Reabra Data/hora no contexto atual.";
+      toast($("#ts-status").textContent, "info");
     }
-  } catch { /* sem config salva */ }
-  if (current()) renderTsSources();
+    return false;
+  }
+  if (!editor.paths.length) { toast("Carregue um arquivo primeiro.", "info"); return false; }
+  return true;
+}
+
+function closeTsModal(restoreFocus = true) {
+  const editor = tsEditor, modal = $("#ts-modal");
+  const restore = restoreFocus && !modal.hidden && (modal.contains(document.activeElement) || document.activeElement === document.body);
+  tsEditor = null;
+  modal.hidden = true;
+  state.tsEditingPath = null;
+  if (restore) {
+    const target = typeof editor?.returnFocus === "function" ? editor.returnFocus() : editor?.returnFocus;
+    if (target?.isConnected && !target.disabled && !target.closest('[hidden],[inert],[aria-hidden="true"]') && target.getClientRects().length) target.focus({ preventScroll: true });
+  }
 }
 
 async function testTsConfig() {
+  const editor = tsEditor;
+  if (!tsEditorActionAllowed(editor)) return;
+  const request = editor.testRequest = (editor.testRequest || 0) + 1;
+  const config = buildTsConfig(), signature = JSON.stringify(config);
+  const current = () => tsEditorCurrent(editor) && request === editor.testRequest && JSON.stringify(buildTsConfig()) === signature;
   const box = $("#ts-test-result");
   box.innerHTML = "";
   try {
-    const rows = await api("test_ts_config", { config: buildTsConfig(), path: tsConfigPath() }, { silent: true, analysisOwner: state.tsAnalysisOwner });
+    const rows = await api("test_ts_config", { config, path: editor.path }, { silent: true, analysisOwner: state.tsAnalysisOwner });
+    if (!current()) return;
     for (const [entrada, resultado] of rows) {
       const row = el("div", "tr-row");
       const ok = !resultado.includes("não reconhecido");
@@ -2890,7 +3223,7 @@ async function testTsConfig() {
     }
     if (!rows.length) box.innerHTML = '<span class="muted small">Sem linhas para testar.</span>';
   } catch (e) {
-    box.innerHTML = `<span class="tr-pair bad">${esc(String(e))}</span>`;
+    if (current()) box.innerHTML = `<span class="tr-pair bad">${esc(String(e))}</span>`;
   }
 }
 
@@ -2907,24 +3240,35 @@ function tsConfigPaths() {
 }
 
 async function applyTsConfig() {
-  const paths = tsConfigPaths();
-  if (!paths.length) { toast("Carregue um arquivo primeiro.", "info"); return; }
+  const editor = tsEditor;
+  if (!tsEditorActionAllowed(editor)) return;
+  const paths = [...editor.paths];
   const cfg = buildTsConfig();
   const empty = cfg.sources.length === 0 || !cfg.format;
+  const returnFocus = document.activeElement;
   const done = btnBusy($("#ts-apply"), "Aplicando…");
+  editor.busy = true;
+  clearTsTestResult();
+  setTsEditorEnabled(false);
   // status detalhado: passos + progresso por linha + resultado
-  showLoadOverlay("Aplicando configuração de data/hora", "timestamp-config");
+  showLoadOverlay("Aplicando configuração de data/hora", "timestamp-config", returnFocus);
+  const overlayVersion = state.loadOverlayVersion;
+  const ownsOverlay = () => state.loadOverlayVersion === overlayVersion && state.loadOverlayProgressKey === "timestamp-config";
   try {
     // cada arquivo do conjunto guarda a config pela própria chave (caminho)
     await commitTsConfig(paths, empty ? null : cfg);
+    if (!ownsOverlay()) return;
     hideLoadOverlay(true);
     toast(empty ? "Configuração de data/hora removida." : "Data/hora aplicada aos eventos.", "ok");
     refresh();
   } catch (e) {
+    if (!ownsOverlay()) return;
     hideLoadOverlay(false);
     toast(`Falha ao aplicar data/hora: ${e}`, "err");
   } finally {
-    done();
+    if (tsEditor === editor) done();
+    editor.busy = false;
+    if (tsEditor === editor) setTsEditorEnabled(tsEditorCurrent(editor));
   }
 }
 
@@ -4692,15 +5036,12 @@ function saveManualEvent() {
 }
 
 // menu de contexto de uma célula de evento
-function eventCellMenu(ev, col, value, anchor = null) {
+function eventCellMenu(ev, col, value, anchor = null, recordTarget = null) {
   ensureSelectionOwner();
-  const removalOwner = window.AnalysisContexts?.capture(), removalSignature = caseSig();
+  const record = eventRecordMenuParts(ev, anchor, recordTarget ? () => openRecordDetail(recordTarget) : undefined);
   const exact = window.CanonicalFields.capture(ev, col, { anchor, ...(col === "comentario" ? { historical: true, literal: eventComment(ev) } : {}) });
   const hasVal = value !== undefined && value !== null && String(value).trim() !== "";
-  const items = [
-    { icon: "fa-eye", label: "Ver detalhes", onClick: () => openDetail(ev.id) },
-    { icon: "fa-route", label: "Investigar possível trilha", onClick: () => openTrail(ev) },
-  ];
+  const items = [...record.open];
   items.push({ sep: true });
   if (window.FieldTransforms) items.push(window.FieldTransforms.menuItem(col, { event: ev, anchor }));
   items.push({
@@ -4721,11 +5062,7 @@ function eventCellMenu(ev, col, value, anchor = null) {
     });
   }
   items.push({ sep: true });
-  items.push({
-    icon: "fa-microscope",
-    label: "Enviar evento ao caso",
-    onClick: () => addEventToAnalysis(ev.id),
-  });
+  items.push(record.send);
   if (hasVal) {
     items.push({
       icon: "fa-microscope",
@@ -4746,24 +5083,34 @@ function eventCellMenu(ev, col, value, anchor = null) {
       onClick: () => window.CanonicalFields.copy(exact),
     });
   }
-  items.push({ sep: true });
-  items.push({
+  return record.finish([...items, { sep: true }, ...record.tail]);
+}
+
+// Record actions share their real callbacks with cell menus. Column actions above
+// still capture CanonicalFields; the record trigger never invents a field/value.
+function eventRecordMenuParts(ev, anchor, onDetail = () => openDetail(ev.id)) {
+  const removalOwner = window.AnalysisContexts?.capture(), removalSignature = caseSig();
+  const open = [
+    { icon: "fa-eye", label: "Ver detalhes", onClick: onDetail },
+    { icon: "fa-route", label: "Investigar possível trilha", onClick: () => openTrail(ev) },
+  ];
+  const send = { icon: "fa-microscope", label: "Enviar evento ao caso", onClick: () => addEventToAnalysis(ev.id) };
+  const tail = [{
     icon: "fa-comment-dots",
     label: eventComment(ev) ? "Editar comentário" : "Adicionar comentário",
     onClick: () => openCommentModal(ev),
-  });
-  items.push({
+  }, {
     icon: "fa-briefcase",
     label: "Enviar todos visíveis ao caso",
     onClick: sendVisibleToCase,
-  });
+  }];
   const selectedList = (state.selectedEventRows?.has(ev.id) && state.selectedEventRows.size > 1)
     ? Array.from(state.selectedEventRows.values())
     : [ev];
 
-  items.push({ sep: true });
-  if (window.ExclusionArchive) items.push(window.ExclusionArchive.selectedMenuItem(ev, anchor));
-  items.push({
+  tail.push({ sep: true });
+  if (window.ExclusionArchive) tail.push(window.ExclusionArchive.selectedMenuItem(ev, anchor));
+  tail.push({
     icon: "fa-route",
     label: selectedList.length > 1
       ? `Jogar ${selectedList.length} eventos para uma trilha...`
@@ -4771,7 +5118,8 @@ function eventCellMenu(ev, col, value, anchor = null) {
     onClick: () => openSendToTrailModal(selectedList),
   });
 
-  if (workspaceScope() === "case") {
+  const finish = items => {
+    if (workspaceScope() !== "case") return items;
     const caseItems = items.filter(item => !["fa-microscope", "fa-briefcase"].includes(item.icon));
     caseItems.push({ sep: true });
     caseItems.push({
@@ -4781,18 +5129,148 @@ function eventCellMenu(ev, col, value, anchor = null) {
       onClick: () => removeEventFromCase(ev, { owner: removalOwner, signature: removalSignature, anchor }),
     });
     return caseItems;
-  }
-  return items;
+  };
+  return { open, send, tail, finish };
+}
+
+// Focus identity is captured when a row is rendered, never reconstructed from a
+// numeric ID after a source, Case or analysis swap. Legacy rows without a native
+// event_ref can only match the same object within their unchanged context.
+function recordContextKey() {
+  return JSON.stringify([workspaceScope(), state.cases?.active, window.AnalysisContexts?.capture()
+    || [state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.sourcePublication?.generation, !!state.sourceIdentityUnconfirmed],
+  workspaceScope() === "case" ? caseSig() : null]);
+}
+function captureRecordTarget(ev, key = recordContextKey()) {
+  return { key, id: ev.id, eventRef: typeof ev.event_ref === "string" && ev.event_ref ? ev.event_ref : null, event: ev };
+}
+function recordTargetMatches(target, ev) {
+  return !!target && ev?.id === target.id && (target.eventRef !== null
+    ? ev.event_ref === target.eventRef : ev === target.event);
+}
+function recordTargetCurrent(target) {
+  return !!target && target.key === recordContextKey() && state.rows.some(ev => recordTargetMatches(target, ev));
+}
+function recordFocusAvailable(node) {
+  return !!node?.isConnected && !node.disabled && !node.closest('[hidden],[inert],[aria-hidden="true"]')
+    && !!node.getClientRects().length && getComputedStyle(node).visibility !== "hidden";
+}
+function resolveRecordFocus(target) {
+  const origin = recordTargetCurrent(target) ? [...document.querySelectorAll("#events-table .record-actions-trigger")]
+    .find(button => button._recordTarget?.key === target.key && recordTargetMatches(target, button._recordTarget.event)) : null;
+  // Never choose a neighbouring row by its former index, even if IDs are reused.
+  return [origin, $("#page-size"), $("#quick-search"), $("#btn-add-filter")].find(recordFocusAvailable) || null;
+}
+function focusRecordTarget(target) {
+  resolveRecordFocus(target)?.focus({ preventScroll: true });
+}
+function openRecordDetail(target) {
+  return openDetail(target.id, {
+    eventRef: target.eventRef, guard: () => recordTargetCurrent(target), recordFocus: target,
+  });
+}
+function eventRecordMenu(ev, anchor, target) {
+  ensureSelectionOwner();
+  const parts = eventRecordMenuParts(ev, anchor, () => openRecordDetail(target));
+  return parts.finish([...parts.open, { sep: true }, parts.send, { sep: true }, ...parts.tail])
+    .map(item => item.sep ? item : { ...item, onClick: () => {
+      if (!recordTargetCurrent(target)) { toast("O contexto mudou. Abra as ações do registro novamente.", "info"); return; }
+      return item.onClick?.();
+    } });
+}
+function buildRecordActions(ev, key) {
+  const cell = el("td", "record-actions-cell"), button = el("button", "icon-btn record-actions-trigger");
+  const target = captureRecordTarget(ev, key);
+  button.type = "button";
+  button._recordTarget = target;
+  button.setAttribute("aria-label", `Ações do registro ${ev.id}`);
+  button.setAttribute("aria-haspopup", "menu");
+  button.title = `Ações do registro ${ev.id}`;
+  button.innerHTML = '<i class="fas fa-ellipsis" aria-hidden="true"></i>';
+  const open = event => {
+    event.preventDefault(); event.stopPropagation();
+    if (!recordTargetCurrent(target)) { toast("O contexto mudou. Abra as ações do registro novamente.", "info"); return; }
+    const box = button.getBoundingClientRect();
+    showCtxMenu(box.left, box.bottom, eventRecordMenu(ev, button, target), { trigger: button, label: button.title });
+  };
+  button.onclick = open; button.oncontextmenu = open;
+  // A menu may restore its still-mounted caller during a context transition.
+  // That DOM node is not sufficient proof that the record remains valid.
+  button.onfocus = () => { if (!recordTargetCurrent(target)) focusRecordTarget(target); };
+  cell.appendChild(button);
+  return cell;
 }
 
 let lastCaseRemoval = null;
 const caseRemovalPending = new WeakSet();
+const nativeRemovalNotices = new Map();
+function showNativeRemovalNotice(record, actions) {
+  const notice = el("div", "toast ok native-removal-notice", `${record.receipt.count} ocorrência(s) removida(s). `);
+  const undo = el("button", "btn ghost small", "Desfazer");
+  const events = ["case-evidence-state", "workspace-context-change", "analysis-context-change"];
+  let busy = false, disposed = false, timer, refreshTimer;
+  const available = () => record === lastCaseRemoval && actions.canUndo(record.receipt);
+  const restoreFocus = owned => {
+    if (!owned || document.activeElement && document.activeElement !== document.body && document.activeElement.isConnected) return;
+    // Stable controls only: a removed occurrence must never return to a reused
+    // record row, and a later Case must not inherit a stale focus target.
+    const candidates = activeCase() === record.c ? [$("#page-size"), $("#case-select")] : [$("#case-select")];
+    candidates.find(recordFocusAvailable)?.focus({ preventScroll: true });
+  };
+  const disable = value => {
+    const owned = notice.contains(document.activeElement);
+    undo.disabled = value; restoreFocus(owned);
+  };
+  const refresh = () => {
+    if (disposed) return;
+    if (!notice.isConnected) { dispose(); return; }
+    disable(busy || !available());
+    undo.title = undo.disabled ? "Desfazer indisponível enquanto o recibo ou o Caso não permitir esta ação." : "Desfazer esta remoção";
+  };
+  // Save/state events can arrive before the native mutation releases its lock.
+  // Recheck after that turn, without polling, changing authority or issuing IPC.
+  const scheduleRefresh = () => { clearTimeout(refreshTimer); refreshTimer = setTimeout(refresh, 0); };
+  const dispose = () => {
+    if (disposed) return;
+    const owned = notice.contains(document.activeElement);
+    disposed = true; clearTimeout(timer); clearTimeout(refreshTimer);
+    for (const name of events) document.removeEventListener(name, scheduleRefresh);
+    nativeRemovalNotices.delete(record); notice.remove(); restoreFocus(owned);
+  };
+  notice.setAttribute("role", "status"); notice.setAttribute("aria-atomic", "true");
+  undo.type = "button";
+  undo.onclick = async () => {
+    if (disposed || busy) return;
+    // This button owns exactly its receipt, never whichever removal came later.
+    if (!available()) { refresh(); return; }
+    busy = true; disable(true); undo.setAttribute("aria-busy", "true");
+    try { if (await undoCaseOccurrenceRemoval(record)) dispose(); }
+    finally { busy = false; undo.removeAttribute("aria-busy"); refresh(); }
+  };
+  notice.onpointerenter = refresh; notice.onfocusin = refresh;
+  notice.appendChild(undo); $("#toast-area").appendChild(notice);
+  nativeRemovalNotices.set(record, { refresh, dispose });
+  for (const name of events) document.addEventListener(name, scheduleRefresh);
+  // Only this receipt owns its 15 s shortcut lifetime; native Undo validity is
+  // still decided by the existing action service and remains available in-menu.
+  timer = setTimeout(dispose, 15000);
+  for (const entry of nativeRemovalNotices.values()) entry.refresh();
+}
 function refreshCaseRemoval(c) {
   if (activeCase() !== c) return;
   window.WorkspaceContext?.refreshMembership(); updateAnalysisBadge(); renderAnalysis(); filtersChanged();
 }
 async function undoCaseOccurrenceRemoval(record = lastCaseRemoval) {
-  if (record?.native) { try { if (record !== lastCaseRemoval) return false; await nativeEvidenceServices().actions.undo(record.receipt); lastCaseRemoval = null; refreshCaseRemoval(record.c); return true; } catch (error) { toast(String(error.message || error), "err"); return false; } }
+  if (record?.native) {
+    try {
+      if (record !== lastCaseRemoval) return false;
+      await nativeEvidenceServices().actions.undo(record.receipt);
+      if (lastCaseRemoval === record) lastCaseRemoval = null;
+      nativeRemovalNotices.get(record)?.dispose();
+      refreshCaseRemoval(record.c); toast("Remoção desfeita.", "ok"); return true;
+    } catch (error) { toast(String(error.message || error), "err"); return false; }
+    finally { nativeRemovalNotices.get(record)?.refresh(); }
+  }
   if (!record || record !== lastCaseRemoval || activeCase() !== record.c || record.owner && !window.AnalysisContexts.owns(record.owner)) {
     toast("O Caso mudou. Reabra o Caso da remoção antes de desfazer.", "info"); return false;
   }
@@ -4811,7 +5289,10 @@ async function undoCaseOccurrenceRemoval(record = lastCaseRemoval) {
 async function removeCaseOccurrences(c, targets, { entryIds = [], save = saveCases, owner = window.AnalysisContexts?.capture() } = {}) {
   if (window.CaseEvidence?.active === true) {
     try { const actions = nativeEvidenceServices().actions, receipt = await actions.remove(c, targets, { guard: () => activeCase() === c && (!owner || window.AnalysisContexts.isCurrent(owner)) });
-      lastCaseRemoval = { c, owner, native: true, receipt }; refreshCaseRemoval(c); toast(`${receipt.count} ocorrência(s) removida(s). Use Desfazer para restaurar.`, "ok"); return true;
+      const record = { c, owner, native: true, receipt }; lastCaseRemoval = record; refreshCaseRemoval(c);
+      if (activeCase() === c) showNativeRemovalNotice(record, actions);
+      else toast(`${receipt.count} ocorrência(s) removida(s).`, "ok");
+      return true;
     } catch (error) { toast(String(error.message || error), "err"); return false; }
   }
   if (activeCase() !== c || owner && !window.AnalysisContexts.isCurrent(owner)) { toast("O Caso mudou. Selecione a ocorrência novamente.", "info"); return false; }
@@ -5096,7 +5577,7 @@ function tableValuePreview(value, limit = 4096) {
   return { text: text.slice(0, end), marker, truncated: true };
 }
 
-function buildEventRow(ev, columns = state.visibleCols) {
+function buildEventRow(ev, columns = state.visibleCols, { recordActions = false, recordKey = null } = {}) {
   const quick = state.quick.trim();
   const quickRe = quick && (!window.QueryLang || window.QueryLang.isPlain(quick)) ? new RegExp(`(${escRe(esc(quick))})`, "gi") : null;
   const row = el("tr");
@@ -5105,7 +5586,13 @@ function buildEventRow(ev, columns = state.visibleCols) {
   if (ev.id === state.detailId) row.classList.add("selected");
   if (state.selectedEventRows?.has(ev.id)) row.classList.add("row-multi-selected");
 
+  // Only live Explorer rows adopt the exact-reference detail/return contract.
+  // Keep this target across clicks and menus; numeric IDs can be reused later.
+  const recordTarget = recordActions ? captureRecordTarget(ev, recordKey ?? recordContextKey()) : null;
+  if (recordTarget) row.appendChild(buildRecordActions(ev, recordTarget.key));
+
   row.onclick = (e) => {
+    if (recordTarget && !recordTargetCurrent(recordTarget)) { toast("O contexto mudou. Abra o registro novamente.", "info"); return; }
     ensureSelectionOwner();
     if (e.target.closest("input, button, a")) return;
     if (e.ctrlKey || e.metaKey) {
@@ -5118,7 +5605,7 @@ function buildEventRow(ev, columns = state.visibleCols) {
       state.selectedEventRows = new Map([[ev.id, ev]]);
       state.lastSelectedRowId = ev.id;
       updateRowSelectionStyles();
-      openDetail(ev.id);
+      return recordTarget ? openRecordDetail(recordTarget) : openDetail(ev.id);
     }
   };
 
@@ -5161,14 +5648,16 @@ function buildEventRow(ev, columns = state.visibleCols) {
       td.title = `${hint.text}${hint.marker}\nPrévia de texto limitada. Clique para ver os detalhes; use o botão direito para copiar ou filtrar o valor completo.`;
     } else td.title = displayText;
     td.oncontextmenu = (e) => {
-      e.preventDefault(); ensureSelectionOwner();
+      e.preventDefault();
+      if (recordTarget && !recordTargetCurrent(recordTarget)) { toast("O contexto mudou. Abra o registro novamente.", "info"); return; }
+      ensureSelectionOwner();
       if (!state.selectedEventRows?.has(ev.id)) {
         state.selectedEventRows = new Map([[ev.id, ev]]);
         state.lastSelectedRowId = ev.id;
         updateRowSelectionStyles();
       }
       const value = col === "level" ? ev.level : cellValue(ev, col);
-      showCtxMenu(e.clientX, e.clientY, eventCellMenu(ev, col, value, td));
+      showCtxMenu(e.clientX, e.clientY, eventCellMenu(ev, col, value, td, recordTarget));
     };
     row.appendChild(td);
   }
@@ -5180,6 +5669,9 @@ function renderTable(qr, { reuseRows = false } = {}) {
   $("#empty-state [data-retry]")?.remove();
   const thead = $("#events-table thead");
   const tbody = $("#events-table tbody");
+  const active = document.activeElement;
+  const focusedRecord = tbody.contains(active) && active.matches?.(".record-actions-trigger") ? active._recordTarget : null;
+  const recordKey = recordContextKey();
   const existingRows = reuseRows ? new Map([...tbody.children].map(row => [Number(row.dataset.eventId), row])) : new Map();
   thead.innerHTML = "";
   tbody.replaceChildren();
@@ -5188,17 +5680,25 @@ function renderTable(qr, { reuseRows = false } = {}) {
   const table = $("#events-table");
   table.querySelector("colgroup")?.remove();
   const colgroup = document.createElement("colgroup");
+  const actionCol = document.createElement("col"); actionCol.className = "record-actions-column";
+  colgroup.appendChild(actionCol);
+  const dataCols = new Map();
   for (const col of state.visibleCols) {
     const colEl = document.createElement("col");
+    colEl.dataset.column = col; dataCols.set(col, colEl);
     if (state.colWidths[col]) colEl.style.width = `${state.colWidths[col]}px`;
     colgroup.appendChild(colEl);
   }
   table.prepend(colgroup);
 
   const tr = el("tr");
+  const actionsHead = el("th", "record-actions-heading");
+  actionsHead.scope = "col"; actionsHead.setAttribute("aria-label", "Ações do registro");
+  tr.appendChild(actionsHead);
   let lastColumnDropAt = 0;
   for (const col of state.visibleCols) {
     const th = el("th", "", colLabel(col));
+    th.dataset.column = col;
     // arrastar para reordenar as colunas exibidas
     th.draggable = true;
     th.ondragstart = (e) => { e.dataTransfer.setData("text/col", col); th.classList.add("dragging"); };
@@ -5269,7 +5769,7 @@ function renderTable(qr, { reuseRows = false } = {}) {
       const onMove = (ev) => {
         const w = Math.max(48, Math.round(startW + (ev.clientX - startX)));
         th.style.width = `${w}px`;
-        colgroup.children[state.visibleCols.indexOf(col)].style.width = `${w}px`;
+        dataCols.get(col).style.width = `${w}px`;
       };
       const onUp = (ev) => {
         document.removeEventListener("mousemove", onMove);
@@ -5289,11 +5789,14 @@ function renderTable(qr, { reuseRows = false } = {}) {
   const fragment = document.createDocumentFragment();
   for (const ev of qr.rows) {
     const previous = existingRows.get(ev.id);
-    if (!previous) { fragment.append(buildEventRow(ev)); continue; }
+    const previousTarget = previous?.querySelector(".record-actions-trigger")?._recordTarget;
+    if (!previous || previousTarget?.key !== recordKey || !recordTargetMatches(previousTarget, ev) || previousTarget.event !== ev) {
+      fragment.append(buildEventRow(ev, state.visibleCols, { recordActions: true, recordKey })); continue;
+    }
     const cells = new Map([...previous.children].map(cell => [cell.dataset.column, cell]));
     const missing = state.visibleCols.filter(col => !cells.has(col));
     if (missing.length) for (const cell of [...buildEventRow(ev, missing).children]) cells.set(cell.dataset.column, cell);
-    previous.replaceChildren(...state.visibleCols.map(col => cells.get(col)));
+    previous.replaceChildren(previous.querySelector(".record-actions-cell"), ...state.visibleCols.map(col => cells.get(col)));
     fragment.append(previous);
   }
   tbody.append(fragment);
@@ -5305,6 +5808,15 @@ function renderTable(qr, { reuseRows = false } = {}) {
     : "Selecione uma fonte de dados.";
 
   updatePager({ ...state.pageResult, ...qr });
+  const skip = $("#skip-records");
+  if (skip) {
+    skip.hidden = !qr.rows.length;
+    skip.onclick = event => { event.preventDefault(); $("#page-size").focus(); };
+  }
+  // replaceChildren detaches even reused row objects. Restore synchronously only
+  // when this render removed the focused trigger; a pending query must never
+  // steal focus the user already moved to search, a menu, or another surface.
+  if (focusedRecord && (document.activeElement === document.body || document.activeElement === active)) focusRecordTarget(focusedRecord);
 }
 
 // ------------------------------------------------------------------ histograma
@@ -5382,12 +5894,64 @@ function fillColumnControls() {
   renderAggs();
 }
 
-function openTsModal(path = null) {
+async function openTsModal(path = null, current = () => true, returnFocus = document.activeElement) {
+  if (!current()) return false;
   state.tsAnalysisOwner = window.AnalysisContexts?.capture();
   state.tsEditingPath = typeof path === "string" ? path : null;
-  if (!document.querySelector("#ts-rules .dv-rule")) tsAddRule();
-  updateTsExample();
+  const owner = state.tsAnalysisOwner;
+  const editor = tsEditor = { editingPath: state.tsEditingPath, path: tsConfigPath(), paths: [...tsConfigPaths()], returnFocus, ready: false, busy: false };
+  const owns = () => tsEditor === editor && !$("#ts-modal").hidden && current()
+    && (!owner || window.AnalysisContexts.isCurrent(owner));
+  replaceTsEditorConfig(null);
+  $("#ts-apply").textContent = "Aplicar";
+  $("#ts-help").hidden = true;
+  $("#ts-status").textContent = `Carregando configuração: ${editor.path || "nenhuma fonte"}`;
+  $("#ts-retry").hidden = true;
+  setTsEditorEnabled(false);
   $("#ts-modal").hidden = false;
+  $("#ts-close").focus({ preventScroll: true });
+  const result = await loadTsConfig(editor.path, owns);
+  if (!owns()) {
+    if (tsEditor === editor) closeTsModal(false);
+    return false;
+  }
+  if (!result || result.error) {
+    $("#ts-status").textContent = `Não foi possível ler a configuração de ${editor.path}: ${result?.error || "resposta indisponível"}`;
+    $("#ts-retry").hidden = false;
+    $("#ts-retry").onclick = () => openTsModal(path, current, returnFocus);
+    if ($("#ts-modal").contains(document.activeElement)) $("#ts-retry").focus({ preventScroll: true });
+    return false;
+  }
+  replaceTsEditorConfig(result.config);
+  editor.ready = true;
+  $("#ts-status").textContent = `Fonte: ${editor.path || "nenhuma fonte"}${editor.paths.length > 1 ? ` · Aplicar aos ${editor.paths.length} arquivos do conjunto` : ""}`;
+  setTsEditorEnabled(true);
+  updateTsExample();
+  if (document.activeElement === $("#ts-close")) $("#ts-sources button")?.focus({ preventScroll: true });
+  return true;
+}
+
+function setColumnVisible(column, visible) {
+  if (!state.columns.includes(column) || column === "timestamp" && !visible) return false;
+  const next = state.visibleCols.filter(item => state.columns.includes(item) && (visible || item !== column));
+  if (visible && !next.includes(column)) next.push(column);
+  if (next.length === state.visibleCols.length && next.every((item, index) => item === state.visibleCols[index])) return false;
+  state.visibleCols = next;
+  saveVisibleCols();
+  // Visibility changes preserve the user's order and reuse the current page.
+  renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
+  return true;
+}
+
+function closeColPop(restoreFocus = true) {
+  const pop = $("#col-pop"), trigger = $("#btn-colpicker");
+  if (pop.hidden) return;
+  const active = document.activeElement;
+  pop.hidden = true;
+  trigger?.setAttribute("aria-expanded", "false");
+  if (restoreFocus && (active === document.body || pop.contains(active)) && trigger?.isConnected && !trigger.disabled
+    && !trigger.closest('[hidden],[inert],[aria-hidden="true"]') && trigger.getClientRects().length
+    && getComputedStyle(trigger).visibility !== "hidden") trigger.focus({ preventScroll: true });
 }
 
 function openColPop() {
@@ -5398,25 +5962,21 @@ function openColPop() {
     const item = el("label", "col-item");
     const cb = document.createElement("input");
     cb.type = "checkbox";
+    cb.dataset.column = col;
     cb.checked = state.visibleCols.includes(col);
     if (col === "timestamp") {
       cb.checked = true;
       cb.disabled = true;
-      item.title = "Data/hora é sempre a primeira coluna";
+      item.title = "Data/hora permanece visível";
     }
-    cb.onchange = () => {
-      const set = new Set(state.visibleCols);
-      cb.checked ? set.add(col) : set.delete(col);
-      state.visibleCols = state.columns.filter((c) => set.has(c));
-      saveVisibleCols();
-      // as linhas da página já estão no cliente: re-render local basta
-      renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
-    };
+    cb.onchange = () => setColumnVisible(col, cb.checked);
     item.append(cb, el("span", "", colLabel(col)));
     list.appendChild(item);
   }
   pop.hidden = false;
+  $("#btn-colpicker").setAttribute("aria-expanded", "true");
   positionPop(pop, $("#btn-colpicker"));
+  (list.querySelector("input:not(:disabled)") || pop).focus({ preventScroll: true });
 }
 
 // ------------------------------------------------------------------ drawer
@@ -5446,7 +6006,7 @@ async function loadJavaTraceDetail(event, admission, evidence, current) {
   if (response.state === "unavailable" && ["raw_unavailable", "not_java"].includes(response.reason) && response.trace === null) return response;
   throw Error("Resposta de estrutura inválida.");
 }
-async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
+async function openDetail(id, { eventRef = null, guard = () => true, recordFocus = null } = {}) {
   if (!guard()) { toast("O contexto mudou. Abra o registro novamente.", "info"); return false; }
   const request = ++detailRequest;
   const scope = workspaceScope(), owner = window.AnalysisContexts?.capture();
@@ -5455,6 +6015,8 @@ async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
   window.Tasks?.cancelLatest("event-detail");
   window.Tasks?.cancelLatest("java-trace-detail");
   showDetailLoading();
+  state.recordDrawerReturn = recordFocus;
+  if (recordFocus) $("#dr-close").focus({ preventScroll: true });
   const current = () => request === detailRequest && !$("#drawer").hidden && detailAdmissionCurrent(admission) && guard();
   const check = () => {
     if (current()) return true;
@@ -5484,6 +6046,7 @@ async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
 
 // abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
 function showDetailLoading() {
+  state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear(); detailDeferredPane = null;
   closeDetailValue();
   state.detailId = null; state.currentDetailEv = null; state.detailSourceSpec = null; state.detailAdmission = null;
@@ -5503,6 +6066,7 @@ function showDetailLoading() {
 }
 
 function openContextInspector(title, subtitle, overview) {
+  state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear();
   closeDetailValue();
   detailRequest++;
@@ -5656,13 +6220,7 @@ function detailCanonicalAction(column, node, anchor) {
 
 function toggleDetailColumn(column) {
   const visible = state.visibleCols.includes(column);
-  if (visible && column === "timestamp") return;
-  const next = new Set(state.visibleCols);
-  if (visible) next.delete(column);
-  else next.add(column);
-  state.visibleCols = state.columns.filter((item) => next.has(item));
-  saveVisibleCols();
-  renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
+  if (!setColumnVisible(column, !visible)) return;
   toast(visible ? "Coluna removida da tabela." : "Coluna adicionada à tabela.", "ok");
 }
 
@@ -5807,6 +6365,7 @@ function renderDetailTree(entries, collapsedPaths = new Set()) {
 }
 
 function showDetail(ev, sourceSpec = null, admission = null) {
+  if (!admission) state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear();
   closeDetailValue();
   window.Tasks?.cancelLatest("java-trace-detail");
@@ -5917,10 +6476,18 @@ function updateDetailNav() {
 function detailStep(dir) {
   const i = currentIndex();
   const n = i + dir;
-  if (n >= 0 && n < state.rows.length) openDetail(state.rows[n].id);
+  if (n >= 0 && n < state.rows.length) {
+    const ev = state.rows[n], origin = state.recordDrawerReturn;
+    if (origin && origin.key !== recordContextKey()) { toast("O contexto mudou. Abra o registro novamente.", "info"); return; }
+    openDetail(ev.id, { eventRef: ev.event_ref ?? null, recordFocus: origin });
+  }
 }
 
 function closeDrawer() {
+  const recordReturn = state.recordDrawerReturn;
+  const restoreRecord = recordReturn && ($("#drawer").contains(document.activeElement)
+    || $("#detail-value-modal").contains(document.activeElement) || document.activeElement === document.body);
+  state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear();
   detailRequest++;
   detailDeferredPane = null;
@@ -5933,6 +6500,7 @@ function closeDrawer() {
   $("#drawer-scrim").hidden = true;
   $("#btn-right-inspect").classList.remove("active");
   document.querySelectorAll("#events-table tbody tr").forEach((tr) => tr.classList.remove("selected"));
+  if (restoreRecord) focusRecordTarget(recordReturn);
 }
 
 async function copyDetail() {
@@ -6237,12 +6805,96 @@ function openRightInspector() {
 // ------------------------------------------------------------------ códigos
 // The codes catalog is a section of Settings.
 function openCodes() { return openSettings("codes"); }
+let codesEditorSession = null, codesSaveOperation = null, settingsReturnFocus = null;
+function codesSessionCurrent(session) { return codesEditorSession === session && !$("#settings-modal").hidden; }
+function codesDraftChanged(session = codesEditorSession) {
+  return !!session && session.loaded && $("#codes-editor").value !== session.baseline;
+}
+function renderCodesStatus() {
+  const session = codesEditorSession;
+  if (!session) return;
+  const status = $("#codes-status"), dirty = codesDraftChanged(session);
+  const parts = [];
+  if (codesSaveOperation) parts.push(session.loaded ? "Salvando a versão enviada… Você pode continuar editando." : "Aguardando a gravação já enviada…");
+  else if (session.fetching) parts.push("Lendo catálogo…");
+  if (session.error) parts.push(session.error);
+  else if (!codesSaveOperation && !session.fetching && session.notice) parts.push(session.notice);
+  if (session.external) parts.push("O catálogo mudou fora deste editor. Recarregue para revisar a versão atual.");
+  if (dirty && !codesSaveOperation) parts.push("Há alterações não salvas.");
+  const message = parts.join(" ");
+  if (status.textContent !== message) status.textContent = message;
+  status.hidden = !parts.length;
+  $("#codes-editor").disabled = !session.loaded;
+  $("#codes-editor").setAttribute("aria-busy", String(session.fetching));
+  $("#codes-save").disabled = !session.loaded || session.fetching || !!codesSaveOperation;
+  $("#codes-reload").disabled = session.fetching || !!codesSaveOperation;
+}
+function codesEdited() {
+  if (!codesEditorSession) return;
+  codesEditorSession.edit++;
+  codesEditorSession.notice = "";
+  renderCodesStatus();
+}
+async function reloadCodesPane({ deliberate = false } = {}) {
+  const session = codesEditorSession;
+  if (!session || session.fetching || deliberate && codesSaveOperation) return;
+  if (deliberate && codesDraftChanged(session)
+    && !confirm("Recarregar o catálogo e descartar as alterações não salvas deste editor?")) return;
+  const request = ++session.request, edit = session.edit, text = $("#codes-editor").value;
+  const current = () => codesSessionCurrent(session) && request === session.request;
+  if (session.loaded && document.activeElement === $("#codes-reload")) $("#codes-editor").focus({ preventScroll: true });
+  session.fetching = true; session.error = ""; session.notice = "";
+  renderCodesStatus();
+  try {
+    // A reopened editor reads only after a previously submitted save settles.
+    if (codesSaveOperation) await codesSaveOperation.promise;
+    if (!current()) return;
+    const catalog = await api("get_codes", {}, { silent: true });
+    if (!current()) return;
+    if (session.edit !== edit || $("#codes-editor").value !== text) {
+      session.external = true;
+      session.notice = "Sua edição mais recente foi mantida.";
+      return;
+    }
+    $("#codes-editor").value = catalog;
+    session.baseline = catalog; session.loaded = true; session.external = false;
+    session.notice = deliberate ? "Catálogo recarregado." : "";
+  } catch (error) {
+    if (current()) session.error = `Não foi possível ler o catálogo: ${error}. Use Recarregar para tentar novamente.`;
+  } finally {
+    if (current()) { session.fetching = false; renderCodesStatus(); }
+  }
+}
+function codesChangedExternally() {
+  const session = codesEditorSession;
+  if (!session || !codesSessionCurrent(session)) return;
+  session.request++; session.fetching = false; session.external = true; session.externalVersion++;
+  renderCodesStatus();
+}
 async function renderCodesPane() {
   const pane = $("#settings-pane-codes"), body = $("#codes-modal .modal-body");
   if (body && body.parentElement !== pane) { body.classList.add("codes-pane"); pane.append(body); }
-  $("#codes-editor").value = await api("get_codes");
-  $("#codes-path").textContent = await api("get_codes_path");
+  if (codesEditorSession) { renderCodesStatus(); return; }
+  const session = codesEditorSession = { baseline: "", loaded: false, edit: 0, request: 0, fetching: false, external: false, externalVersion: 0, error: "", notice: "" };
+  $("#codes-editor").value = ""; $("#codes-path").textContent = "";
+  api("get_codes_path", {}, { silent: true }).then(path => {
+    if (codesSessionCurrent(session)) $("#codes-path").textContent = path;
+  }).catch(() => {});
   updateSysCount();
+  await reloadCodesPane();
+}
+function closeSettings() {
+  const session = codesEditorSession, dirty = codesDraftChanged(session);
+  if (dirty || codesSaveOperation) {
+    const message = [dirty ? "Descartar as alterações não salvas e fechar Configurações?" : "Fechar Configurações?",
+      codesSaveOperation ? "A gravação já enviada continuará; fechar não a cancela nem a desfaz." : ""].filter(Boolean).join(" ");
+    if (!confirm(message)) return false;
+  }
+  $("#settings-modal").hidden = true;
+  codesEditorSession = null;
+  if (settingsReturnFocus?.isConnected && settingsReturnFocus.getClientRects().length) settingsReturnFocus.focus({ preventScroll: true });
+  settingsReturnFocus = null;
+  return true;
 }
 
 async function updateSysCount() {
@@ -6270,12 +6922,31 @@ async function runHarvest() {
 }
 
 async function saveCodes() {
-  try {
-    await api("save_codes", { text: $("#codes-editor").value });
-    $("#codes-modal").hidden = true;
-    toast("Catálogo salvo e reaplicado aos eventos.", "ok");
-    refresh();
-  } catch { /* toast de erro já exibido */ }
+  const session = codesEditorSession;
+  if (!session || !codesSessionCurrent(session) || !session.loaded || session.fetching || codesSaveOperation) return;
+  if (session.external && !confirm("O catálogo mudou fora deste editor. Salvar substituirá essa versão pelo texto deste editor. Continuar?")) return;
+  const text = $("#codes-editor").value, externalVersion = session.externalVersion;
+  const operation = codesSaveOperation = { promise: null };
+  if (document.activeElement === $("#codes-save")) $("#codes-editor").focus({ preventScroll: true });
+  session.error = ""; session.notice = ""; renderCodesStatus();
+  operation.promise = (async () => {
+    try {
+      await api("save_codes", { text }, { silent: true });
+      if (codesSessionCurrent(session)) {
+        session.baseline = text;
+        if (session.externalVersion === externalVersion) session.external = false;
+        session.notice = codesDraftChanged(session) ? "A versão enviada foi salva; a edição posterior ainda não foi salva." : "Catálogo salvo e reaplicado aos eventos.";
+      }
+      refresh();
+    } catch (error) {
+      if (codesSessionCurrent(session)) session.error = `Não foi possível salvar o catálogo: ${error}. Seu texto foi mantido; tente novamente.`;
+      else toast(`Não foi possível salvar o catálogo enviado: ${error}`, "err");
+    } finally {
+      if (codesSaveOperation === operation) codesSaveOperation = null;
+      if (codesEditorSession) renderCodesStatus();
+    }
+  })();
+  await operation.promise;
 }
 
 // ------------------------------------------------------------------ configurações / MCP
@@ -6334,17 +7005,26 @@ function mcpSnippet(title, code) {
 }
 
 function switchSettingsTab(tab) {
-  document.querySelectorAll("#settings-modal .settings-tab").forEach((b) =>
-    b.classList.toggle("active", b.dataset.settingsTab === tab));
+  document.querySelectorAll("#settings-modal .settings-tab").forEach((b) => {
+    const selected = b.dataset.settingsTab === tab;
+    b.classList.toggle("active", selected); b.tabIndex = selected ? 0 : -1;
+    b.id = `settings-tab-${b.dataset.settingsTab}`;
+    b.setAttribute("aria-selected", String(selected));
+    b.setAttribute("aria-controls", `settings-pane-${b.dataset.settingsTab}`);
+  });
   document.querySelectorAll("#settings-modal .settings-pane").forEach((p) => {
     p.hidden = p.id !== `settings-pane-${tab}`;
+    p.setAttribute("aria-labelledby", p.id.replace("settings-pane-", "settings-tab-"));
   });
 }
 
 async function openSettings(tab = "interface") {
   const recoveryTab = document.querySelector('[data-settings-tab="recovery"]'); if (recoveryTab) recoveryTab.hidden = !nativeEvidenceEnabled();
+  const opening = $("#settings-modal").hidden;
+  if (opening) { codesEditorSession = null; settingsReturnFocus = document.activeElement; }
   $("#settings-modal").hidden = false;
   switchSettingsTab(tab);
+  if (opening) document.querySelector(`#settings-tab-${tab}`)?.focus({ preventScroll: true });
   if (tab === "interface") window.UiScale?.renderPane($("#settings-pane-interface"));
   if (tab === "codes") await renderCodesPane();
   if (tab === "mcp") await renderMcpPane();
@@ -6490,8 +7170,8 @@ async function handleMcpStateChanged(kind) {
   }
   // codes / derived / ts_config / formats: recarrega painéis abertos e reconsulta a view
   try {
-    if (kind === "codes" && !$("#settings-modal").hidden && !$("#settings-pane-codes").hidden) {
-      $("#codes-editor").value = await api("get_codes", {}, { silent: true });
+    if (kind === "codes") {
+      codesChangedExternally();
       updateSysCount();
     } else if (kind === "derived") {
       const owner = window.AnalysisContexts?.capture();
@@ -6548,29 +7228,35 @@ async function mcpReloadCases() {
 function bindKeyboard() {
   document.addEventListener("keydown", (e) => {
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
+    // Settings keeps its own tab/field navigation; these explorer shortcuts
+    // must not move focus or selection behind the open dialog.
+    if (!$("#settings-modal").hidden && e.key !== "Escape") return;
     if (e.key === "/" && !typing) {
       e.preventDefault();
       $("#quick-search").focus();
     } else if (e.key === "Escape") {
       if (e.isComposing || e.keyCode === 229) return;
+      if (ctxEl) { e.preventDefault(); e.stopImmediatePropagation(); closeCtxMenu(true); return; }
       if (!$("#name-pop").hidden && namePopExact) { e.preventDefault(); closeNamePop(); return; }
       if (!$("#filter-pop").hidden) { e.preventDefault(); closeFilterPop(); return; }
+      if (!$("#col-pop").hidden) { e.preventDefault(); e.stopImmediatePropagation(); closeColPop(); return; }
       if (!$("#detail-value-modal").hidden) {
         closeDetailValue();
         return;
       }
+      if (!$("#settings-modal").hidden) { e.preventDefault(); e.stopImmediatePropagation(); closeSettings(); return; }
       closeCtxMenu();
       closeTlPop();
       closeDrawer();
       $("#filter-pop").hidden = true;
-      $("#col-pop").hidden = true;
+      closeColPop(false);
       $("#name-pop").hidden = true;
       $("#codes-modal").hidden = true;
       $("#settings-modal").hidden = true;
       $("#format-modal").hidden = true;
       $("#derive-modal").hidden = true;
       $("#chart-modal").hidden = true;
-      $("#ts-modal").hidden = true;
+      closeTsModal();
       $("#manual-form").hidden = true;
       closeCaseNameInput();
       $("#case-add-modal").hidden = true; pendingCaseAdd = null;
@@ -6591,11 +7277,9 @@ function bindKeyboard() {
   });
   // fecha o menu de contexto ao clicar/usar botão direito fora dele
   document.addEventListener("click", (e) => {
-    if (ctxEl && !e.target.closest(".ctx-menu")) closeCtxMenu();
     if (tlPop && !e.target.closest(".tl-pop")) closeTlPop();
   }, true);
   document.addEventListener("contextmenu", (e) => {
-    if (ctxEl && !e.target.closest(".ctx-menu")) closeCtxMenu();
     if (tlPop && !e.target.closest(".tl-pop")) closeTlPop();
   }, true);
 }
@@ -6666,13 +7350,13 @@ function bind() {
 
   $("#btn-colpicker").onclick = (e) => {
     e.stopPropagation();
-    $("#col-pop").hidden ? openColPop() : ($("#col-pop").hidden = true);
+    $("#col-pop").hidden ? openColPop() : closeColPop();
   };
   document.addEventListener("click", (e) => {
     if (!$("#filter-pop").hidden && !e.target.closest("#filter-pop") && !e.target.closest("#btn-add-filter") && !e.target.closest(".ctx-menu"))
       closeFilterPop(false);
     if (!$("#col-pop").hidden && !e.target.closest("#col-pop") && !e.target.closest("#btn-colpicker"))
-      $("#col-pop").hidden = true;
+      closeColPop(false);
     // .ctx-menu isento: o item que abriu o popover não pode fechá-lo no mesmo clique
     if (!$("#name-pop").hidden && !e.target.closest("#name-pop") && !e.target.closest(".ctx-menu") && !e.target.closest("[data-exact-field-picker]"))
       closeNamePop(false);
@@ -6830,6 +7514,7 @@ function bind() {
     if (e.target === $("#case-item-modal")) { $("#case-item-modal").hidden = true; editingCaseItem = null; }
   });
   $("#workbar-cancel").onclick = cancelWorkbarTask;
+  $("#load-cancel").onclick = cancelLoadOperation;
   $("#group-col").onchange = () => { state.groupCol = $("#group-col").value; };
   $("#btn-add-agg").onclick = () => {
     state.aggs.push({ func: "count", column: "*", alias: "" });
@@ -6863,8 +7548,10 @@ function bind() {
   });
 
   $("#codes-close").onclick = () => { $("#codes-modal").hidden = true; };
-  $("#codes-cancel").onclick = () => { $("#settings-modal").hidden = true; };
+  $("#codes-cancel").onclick = closeSettings;
   $("#codes-save").onclick = saveCodes;
+  $("#codes-editor").oninput = codesEdited;
+  $("#codes-reload").onclick = () => reloadCodesPane({ deliberate: true });
   $("#btn-harvest").onclick = runHarvest;
 
   // formatos de log
@@ -6887,8 +7574,10 @@ function bind() {
 
   // data/hora
   $("#ts-open").onclick = () => openTsModal();
-  $("#ts-close").onclick = () => { $("#ts-modal").hidden = true; };
-  $("#ts-modal").addEventListener("click", (e) => { if (e.target === $("#ts-modal")) $("#ts-modal").hidden = true; });
+  $("#ts-close").onclick = closeTsModal;
+  $("#ts-modal").addEventListener("click", (e) => { if (e.target === $("#ts-modal")) closeTsModal(); });
+  $("#ts-modal").addEventListener("input", clearTsTestResult);
+  $("#ts-modal").addEventListener("change", clearTsTestResult);
   $("#ts-help-btn").onclick = () => { $("#ts-help").hidden = !$("#ts-help").hidden; };
   $("#ts-format").onchange = () => {
     $("#ts-format-custom").hidden = $("#ts-format").value !== "custom";
@@ -6951,12 +7640,24 @@ function bind() {
   });
 
   $("#btn-settings").onclick = () => openSettings();
-  $("#settings-close").onclick = () => { $("#settings-modal").hidden = true; };
+  $("#settings-close").onclick = closeSettings;
   $("#settings-modal").addEventListener("click", (e) => {
-    if (e.target === $("#settings-modal")) $("#settings-modal").hidden = true;
+    if (e.target === $("#settings-modal")) closeSettings();
   });
   document.querySelectorAll("#settings-modal .settings-tab").forEach((b) => {
     b.onclick = () => openSettings(b.dataset.settingsTab);
+    b.onkeydown = event => {
+      if (event.isComposing || event.altKey || event.ctrlKey || event.metaKey) return;
+      const tabs = [...document.querySelectorAll("#settings-modal .settings-tab")].filter(button => !button.hidden);
+      const index = tabs.indexOf(b);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+        : event.key === "ArrowRight" ? (index + 1) % tabs.length : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length : -1;
+      if (next < 0) return;
+      event.preventDefault(); event.stopPropagation();
+      // Manual activation avoids loading remote panes merely to move focus.
+      tabs.forEach(button => { button.tabIndex = button === tabs[next] ? 0 : -1; });
+      tabs[next].focus();
+    };
   });
 
   $("#btn-theme").onclick = toggleTheme;
@@ -7805,7 +8506,7 @@ async function openCube(scope = "dataset", { force = false } = {}) {
 
   const cube = activeCube(scope);
   const currentSig = JSON.stringify([scope, cube.id, cubeSchemaSignature(cube), backendFilters(), scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, state.derivedFields]);
-  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody tr").length > 0) {
+  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody").rows.length > 0) {
     finishOperation("Cubo pronto", "Recorte exibido do cache.");
     return;
   }
@@ -7990,7 +8691,7 @@ async function runCube({ force = false } = {}) {
   const filters = backendFilters();
   const currentSig = JSON.stringify([scope, cube.id, cubeSchemaSignature(cube), filters, scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, state.derivedFields]);
 
-  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody tr").length > 0) {
+  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody").rows.length > 0) {
     return { status: "cached" };
   }
 
@@ -8004,13 +8705,15 @@ async function runCube({ force = false } = {}) {
     renderCubeViews();
     return { status: "empty" };
   }
-  const loading = areaLoading(document.querySelector(".cube-output"), "Calculando Cubo…");
+  const loading = areaLoading(document.querySelector(".cube-output"), "Cruzando dados", { phaseId: "command:pivot" });
   try {
     updateOperation("Calculando Cubo", "Agregando dimensões e valores");
-    const res = await api("pivot", {
+    const pending = api("pivot", {
       ...analyticsRequest(scope),
       spec: { rows: cube.rows, cols: cube.cols, values: cube.values, limit_rows: 2000 },
     }, { latest: "pivot" });
+    loading.bindOperation(window.Tasks?.operationFor("pivot"));
+    const res = await pending;
     if (version !== cubeState.requestVersion || scope !== state.analyticsScope || cube.id !== activeCube(scope).id) return { status: "stale" };
     if (res.complete === false) toast(`Resultado parcial: ${fmtNum(res.processed_events)} eventos analisados. Reduza as dimensões ou o período.`, "info");
     cubeState.result = res;

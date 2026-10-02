@@ -12,7 +12,7 @@ const node = key => {
 const input=node('#quick-search');
 const applied=[],problems=[];let refreshed=0;
 const state={filters:[],quick:'',columns:['timestamp','message','status'],page:0};
-const context=vm.createContext({state,workspaceScope:()=>"dataset",activeCase:()=>null,document:{activeElement:null},$:node,el:(tag,cls,text)=>({tag,textContent:text}),colLabel:String,positionPop(){},toast(){},renderChips(){},filtersChanged(){refreshed++;},window:{QueryLang:{validate:value=>value.endsWith(':')?'Incomplete expression':null},QueryBar:{status:problem=>problems.push(problem)}},addFilter:filter=>{state.filters.push(filter);applied.push(filter);}});
+const context=vm.createContext({filterChipTargets:new WeakMap(),state,workspaceScope:()=>"dataset",activeCase:()=>null,document:{activeElement:null},$:node,el:(tag,cls,text)=>({tag,textContent:text}),colLabel:String,positionPop(){},toast(){},renderChips(){},filtersChanged(){refreshed++;},window:{QueryLang:{validate:value=>value.endsWith(':')?'Incomplete expression':null},QueryBar:{status:problem=>problems.push(problem)}},addFilter:filter=>{state.filters.push(filter);applied.push(filter);}});
 vm.runInContext(app.slice(app.indexOf('const OPS ='),app.indexOf('const OP_SYMBOL =')),context);
 vm.runInContext(app.slice(app.indexOf('let currentEditFilterIndex ='),app.indexOf('\nfunction positionPop(')),context);
 vm.runInContext(app.slice(app.indexOf('  $("#quick-search").addEventListener("input"'),app.indexOf('  $("#btn-add-filter").onclick',app.indexOf('  $("#quick-search").addEventListener("input"'))),context);

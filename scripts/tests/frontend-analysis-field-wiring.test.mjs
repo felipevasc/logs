@@ -55,7 +55,7 @@ function fixture(scope='case'){
   vm.runInContext(part(app,'function dashboardCharts(','function scopeProfiles('),context);
   vm.runInContext(part(app,'let chartEditing =','// =========================================================================='),context);
   vm.runInContext(part(workbench,'  const measureLabels =','  function filterGroup('),context);
-  vm.runInContext(part(app,'function fillColumnControls(','function openTsModal('),context);
+  vm.runInContext(part(app,'function fillColumnControls(','async function openTsModal('),context);
   vm.runInContext(part(workspace,'  const copy =','  function capture()'),context);
   vm.runInContext(part(workspace,'  function apply(snapshot)','  function invalidateAnalysis('),context);
   vm.runInContext(part(app,'  $("#np-ok").onclick =','\n  $("#btn-colpicker").onclick ='),context);

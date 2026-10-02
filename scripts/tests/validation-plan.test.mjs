@@ -29,6 +29,23 @@ test('exclusion, field, timeline and Java edits select the corresponding regress
   contains(plan.preview, ['test-exclusion-archive.mjs', 'test-field-transform.mjs', 'test-canonical-field-actions.mjs', 'test-explorer-timeline.mjs', 'test-java-trace.mjs']);
   assert.equal(plan.native, false);
 });
+test('context menus and semantic waits retain their dedicated browser pilots', () => {
+  for (const [path, preview] of [
+    ['frontend/context-menu.js', 'test-context-menu.mjs'],
+    ['frontend/command-palette.js', 'test-context-menu.mjs'],
+    ['frontend/waiting-visuals.css', 'test-waiting-visuals.mjs'],
+    ['frontend/waiting-visuals.js', 'test-waiting-reactions.mjs'],
+    ['frontend/waiting-visuals.js', 'test-waiting-verification.mjs'],
+    ['frontend/waiting-visuals.js', 'test-waiting-manual.mjs'],
+    ['frontend/waiting-progress.js', 'test-waiting-visuals.mjs'],
+    ['frontend/tasks.js', 'test-waiting-visuals.mjs'],
+  ]) {
+    const plan = planValidation([path]);
+    assert.equal(plan.native, false, path);
+    contains(plan.preview, [...essentialPreview, preview]);
+    assert(fullPreview.includes(preview));
+  }
+});
 test('native, build, workflow and unknown changes retain the complete matrix', () => {
   for (const path of ['src-tauri/src/workspace/canonical.rs', 'src-tauri/Cargo.lock', 'src-tauri/windows/installer-hooks.nsh', 'package-lock.json', '.github/workflows/checks.yml', 'scripts/release/update-e2e.mjs', 'scripts/prepare-frontend.mjs', 'frontend/new-unmapped.js', 'new-tool.sh']) {
     const plan = planValidation([path]);
@@ -36,6 +53,28 @@ test('native, build, workflow and unknown changes retain the complete matrix', (
     assert.equal(plan.scope, 'full', path);
     contains(plan.preview, fullPreview);
   }
+});
+test('Timeline export and shared waiting changes retain both real output pilots', () => {
+  for (const path of ['frontend/timeline-export.js', 'frontend/timeline-export.css', 'frontend/waiting-visuals.js', 'frontend/waiting-visuals.css', 'frontend/tasks.js']) {
+    const plan = planValidation([path]);
+    assert.equal(plan.native, false, path);
+    contains(plan.preview, [...essentialPreview, 'test-timeline-export-waiting.mjs']);
+    if (path.startsWith('frontend/timeline-export.')) contains(plan.preview, ['test-explorer-timeline.mjs']);
+    else contains(plan.preview, ['test-case-report-waiting.mjs']);
+  }
+  assert(fullPreview.includes('test-timeline-export-waiting.mjs'));
+});
+test('source views and shared menus retain exact-path and compact source actions checks', () => {
+  for (const path of ['frontend/workspace.js', 'frontend/workspace.css', 'frontend/context-menu.js']) {
+    const plan = planValidation([path]);
+    assert.equal(plan.native, false, path);
+    contains(plan.preview, [...essentialPreview, 'test-source-actions.mjs']);
+  }
+  assert(fullPreview.includes('test-source-actions.mjs'));
+  assert(fullPreview.includes('test-columns.mjs'));
+  assert(fullPreview.includes('test-settings-codes.mjs'));
+  assert(fullPreview.includes('test-timestamp-editor.mjs'));
+  contains(planValidation(['frontend/workspace.js']).preview, ['test-timestamp-editor.mjs']);
 });
 test('full request and missing comparison data cannot produce an empty or focused green', () => {
   for (const plan of [planValidation([]), planValidation(['docs/readme.md'], { full: true })]) {

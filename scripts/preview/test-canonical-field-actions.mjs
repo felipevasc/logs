@@ -25,7 +25,7 @@ await page.addInitScript(() => {
 
 async function composerFrom(menuTarget, column, expected, operator = "equals_exact") {
   await menuTarget.click({ button: "right" });
-  await page.locator(".ctx-menu").getByRole("button", { name: `Criar filtro: ${column}`, exact: true }).click();
+  await page.locator(".ctx-menu").getByRole("menuitem", { name: `Criar filtro: ${column}`, exact: true }).click();
   await page.locator("#filter-pop").waitFor({ state: "visible" });
   assert.equal(await page.locator("#fp-col").inputValue(), column);
   assert.equal(await page.locator("#fp-op").inputValue(), operator);
@@ -44,7 +44,7 @@ async function cancelEditableDraft(expected) {
 async function copyFrom(menuTarget, expected) {
   const before = await page.evaluate(() => window.__canonicalClipboardWrites.length);
   await menuTarget.click({ button: "right" });
-  await page.locator(".ctx-menu").getByRole("button", { name: "Copiar valor", exact: true }).click();
+  await page.locator(".ctx-menu").getByRole("menuitem", { name: "Copiar valor", exact: true }).click();
   await page.waitForFunction(count => window.__canonicalClipboardWrites.length === count + 1, before);
   const copied = await page.evaluate(() => window.__canonicalClipboardWrites.at(-1));
   assert.equal(copied, expected);
@@ -167,7 +167,7 @@ try {
   assert.equal(await copyFrom(multilineCell, rawMultiline), rawMultiline);
   const editMultilineChip = async () => {
     await page.locator(".chips-sync:visible .chip").filter({ hasText: "native_multiline" }).first().click({ button: "right" });
-    await page.locator(".ctx-menu").getByRole("button", { name: "Editar filtro", exact: true }).click();
+    await page.locator(".ctx-menu").getByRole("menuitem", { name: "Editar filtro", exact: true }).click();
     await page.locator("#filter-pop").waitFor({ state: "visible" });
   };
   await editMultilineChip();

@@ -39,7 +39,7 @@ window.WorkspaceContext = (() => {
     const w = record(input.workspace), selection = value => ({ filters: validFilters(value?.filters), quick: typeof value?.quick === "string" ? value.quick : "" });
     snapshot.workspace = { history: Array.isArray(w.history) ? w.history.slice(-30).map(selection) : [], previousSelection: selection(w.previousSelection), lastFilters: typeof w.lastFilters === "string" ? w.lastFilters : "", timeline: record(w.timeline) };
     const workbench = record(input.workbench), group = record(workbench.group), pivot = record(workbench.pivot);
-    snapshot.workbench = { group: { search: typeof group.search === "string" ? group.search : "", sort: typeof group.sort === "string" ? group.sort : null, direction: group.direction === 1 ? 1 : -1, page: integer(group.page, 0) }, pivot: { search: typeof pivot.search === "string" ? pivot.search : "", page: integer(pivot.page, 0), columnPage: integer(pivot.columnPage, 0), heat: pivot.heat !== false, sort: typeof pivot.sort === "string" ? pivot.sort : "tree", tableKey: "" } };
+    snapshot.workbench = { group: { search: typeof group.search === "string" ? group.search : "", sort: typeof group.sort === "string" ? group.sort : null, direction: group.direction === 1 ? 1 : -1, page: integer(group.page, 0) }, pivot: { search: typeof pivot.search === "string" ? pivot.search : "", page: integer(pivot.page, 0), columnPage: integer(pivot.columnPage, 0), heat: pivot.heat !== false, sort: typeof pivot.sort === "string" ? pivot.sort : "tree", configurationCollapsed: pivot.configurationCollapsed === true, tableKey: "" } };
     return snapshot;
   }
   function capture() {

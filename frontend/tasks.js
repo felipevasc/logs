@@ -114,6 +114,9 @@ window.Tasks = (() => {
     }, error => { if (!entry.cancelled && !opts.silent) toast(String(error), "err"); throw error; })
       .finally(() => { tasks.delete(entry.id); schedule(); if (inflight.get(entry.key2) === entry) inflight.delete(entry.key2); for (const [key, owner] of latest) if (owner === entry) latest.delete(key); });
     if (opts.latest) latest.set(opts.latest, entry);
+    if (operationId && opts.latest && typeof CustomEvent === "function") document.dispatchEvent?.(new CustomEvent("task-state-change", {
+      detail: { operationId, state: entry.status, latestKey: opts.latest, started: true },
+    }));
     setTimeout(schedule, VISIBLE_AFTER + 10);
     return entry;
   }
@@ -174,6 +177,11 @@ window.Tasks = (() => {
   function cancel(entry) {
     if (!entry || entry.cancelled) return;
     entry.cancelled = true; entry.status = "cancelling";
+    // Notify presentation observers of this exact operation immediately. Native
+    // settlement still owns completion; no cancelled receipt may restart motion.
+    if (typeof CustomEvent === "function") document.dispatchEvent?.(new CustomEvent("task-state-change", {
+      detail: { operationId: entry.operationId, state: "cancelling" },
+    }));
     if (inflight.get(entry.key2) === entry) inflight.delete(entry.key2);
     // Never cancel unrelated engine work. Keep the row until the invocation settles.
     if (entry.operationId) base("cancel_task", { operationId: entry.operationId }, { silent: true }).catch(error => { entry.cancelError = String(error); schedule(); });

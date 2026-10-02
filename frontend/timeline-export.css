@@ -11,6 +11,8 @@
 .tx-dialog progress { display: block; width: 100%; height: 6px; margin: 17px 0; accent-color: var(--accent); }
 .tx-dialog [data-tx-status] { min-height: 40px; }
 .tx-dialog [data-tx-status].error { color: var(--lv-erro); }
+.tx-dialog [data-tx-waiting] { margin-block: 12px; }
+.tx-dialog [data-tx-waiting][hidden] { display: none; }
 .tx-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .tx-stage { position: fixed; left: -100000px; top: 0; pointer-events: none; z-index: -10; }
 .tx-sheet { position: relative; overflow: hidden; background: var(--bg-0); color: var(--text-0); font-family: var(--font-ui); padding: 0; }

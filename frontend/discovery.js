@@ -534,8 +534,8 @@
   const oldTable=renderTable;
   renderTable=function(qr, options) {
     oldTable(qr, options);
-    document.querySelectorAll('#events-table th').forEach((th,i)=>{
-      const column=state.visibleCols[i];
+    document.querySelectorAll('#events-table th[data-column]').forEach(th=>{
+      const column=th.dataset.column;
       th.title='Clique para ordenar · arraste para mover · botão direito para analisar o campo';
       th.oncontextmenu=e=>{e.preventDefault();showCtxMenu(e.clientX,e.clientY,[
         ...(window.ExplorerTimeline ? [window.ExplorerTimeline.menuItem(column)] : []),

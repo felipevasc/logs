@@ -13,15 +13,15 @@ function fixture(){
   const state={columns:['host.name','environment','message'],derivedFields:[],rows:[],owner:{caseId:'case-a',instance:1,identity:{caseId:'case-a',analysisId:'analysis-a',configRevision:2,visibilityRevision:3},sourceGeneration:7,sourceKey:'source-seven'}};
   let entries=[{descriptor:descriptor(),available:true,rowCount:3,sourceBytes:123,reason:null}],scope='dataset',reload=true,dialogPath='/fixtures/hosts.jsonl';
   function node(tag='div',className='',textContent=''){
-    const classes=new Set(),item={tag,className,textContent,hidden:false,disabled:false,isConnected:true,value:'',children:[],attrs:{},parent:null,
+    const classes=new Set(),item={tag,className,textContent,hidden:false,disabled:false,isConnected:true,value:'',children:[],attrs:{},listeners:{},parent:null,
       classList:{toggle(name,on){if(on)classes.add(name);else classes.delete(name);},contains:name=>classes.has(name)},
       get id(){return this.attrs.id;},set id(value){this.attrs.id=value;nodes.set(`#${value}`,this);},
       setAttribute(name,value){this.attrs[name]=String(value);},getAttribute(name){return this.attrs[name];},
       append(...children){for(const child of children){child.parent=this;this.children.push(child);}},replaceChildren(...children){this.children=[];this.append(...children);},
-      querySelector:selector=>nodes.get(selector),querySelectorAll(selector){const out=[];const visit=parent=>{for(const child of parent.children){if(selector.split(',').includes(child.tag))out.push(child);visit(child);}};visit(this);return out;},
-      addEventListener(){},matches:selector=>selector.split(',').includes(tag),focus(){document.activeElement=this;},
+      querySelector:selector=>nodes.get(selector),querySelectorAll(selector){const out=[];const visit=parent=>{for(const child of parent.children){if(child.matches(selector))out.push(child);visit(child);}};visit(this);return out;},
+      addEventListener(type,callback){(this.listeners[type]||=[]).push(callback);},matches(selector){return selector.split(',').some(part=>part===tag||part==='[tabindex="0"]'&&this.attrs.tabindex==='0');},focus(){document.activeElement=this;},
       closest(selector){for(let parent=this;parent;parent=parent.parent)if(selector.includes('[hidden]')&&parent.hidden)return parent;return null;},
-      set innerHTML(html){this.children=[];for(const match of html.matchAll(/<(\w+)\b([^>]*\bid="([^"]+)"[^>]*)>/g)){const child=node(match[1]);child.id=match[3];child.hidden=/\bhidden\b/.test(match[2]);this.append(child);}},
+      set innerHTML(html){this.children=[];for(const match of html.matchAll(/<(\w+)\b([^>]*\bid="([^"]+)"[^>]*)>/g)){const child=node(match[1]);child.id=match[3];child.hidden=/\bhidden\b/.test(match[2]);for(const attribute of match[2].matchAll(/\b(role|aria-live|tabindex)="([^"]*)"/g))child.setAttribute(attribute[1],attribute[2]);this.append(child);}},
     };return item;
   }
   document.body=node('body');const $=selector=>{if(!nodes.has(selector))nodes.set(selector,node('button'));return nodes.get(selector);};
@@ -52,7 +52,7 @@ function fixture(){
   const field=name=>nodes.get(`#rf-${name}`),controller=context.window.CaseReferences;
   const addKey=value=>{field('key-choice').value=value;field('add-key').onclick();};
   const map=(index,value)=>{const input=field('mappings').children[index].children.find(child=>child.tag==='select');input.value=value;input.onchange();};
-  return{context,controller,state,field,document,$,calls,messages,order,cancelled,native,receipt,capture,addKey,map,
+  return{context,controller,state,field,document,overlay:document.body.children[0],$,calls,messages,order,cancelled,native,receipt,capture,addKey,map,
     on:(cmd,handler)=>handlers.set(cmd,handler),setEntries:value=>{entries=value;},setReload:value=>{reload=value;},setScope:value=>{scope=value;},setDialog:value=>{dialogPath=value;}};
 }
 test('manager uses only the captured Case list and distinguishes unavailable references',async()=>{
@@ -127,6 +127,57 @@ test('Cancel restores a usable focus target and context menu ownership is captur
   await f.controller.openManager({anchor});f.controller.close();assert.equal(f.document.activeElement,anchor);
   const item=f.controller.lookupMenuItem('host.name',anchor);f.state.owner.instance++;await item.onClick();assert.equal(f.calls.filter(call=>call.cmd==='reference_list').length,1);
   assert.match(f.messages.at(-1),/Caso mudou/);
+});
+
+test('footer actions follow the current mode without leaking lookup actions into the manager',async()=>{
+  const f=fixture();await f.controller.openManager();
+  assert.equal(f.field('save-lookup').hidden,true);assert.equal(f.field('delete-lookup').hidden,true);
+  await f.controller.openLookup({name:'enriched',lookup:{referenceId:'ref-one'}});
+  assert.equal(f.field('save-lookup').hidden,false);assert.equal(f.field('delete-lookup').hidden,false);
+  await f.controller.openManager();
+  assert.equal(f.field('save-lookup').hidden,true);assert.equal(f.field('delete-lookup').hidden,true);
+  await f.controller.openLookup(null,{referenceId:'ref-one'});
+  assert.equal(f.field('save-lookup').hidden,false);assert.equal(f.field('delete-lookup').hidden,true);
+});
+
+test('closing a pending lookup is disclosed as Close and never cancels or rolls back its mutation',async()=>{
+  const f=fixture(),gate=deferred();await f.controller.openLookup(null,{referenceId:'ref-one'});
+  f.field('field-name').value='enriched';f.field('value-column').value='owner';f.map(0,'host.name');f.map(1,'environment');
+  f.on('reference_save_lookup',async args=>{await gate.promise;return f.native('reference_save_lookup',args);});
+  const pending=f.controller.saveLookup();await settle();
+  assert.equal(f.field('cancel').textContent,'Fechar');assert.equal(f.field('cancel').disabled,false);
+  assert.equal(f.field('close-note').hidden,false);assert.equal(f.field('save-lookup').disabled,true);
+  f.field('cancel').onclick();await f.controller.openManager();
+  assert.equal(f.field('cancel').textContent,'Cancelar');assert.equal(f.field('close-note').hidden,true);
+  gate.resolve();await pending;
+  assert.ok(f.state.derivedFields.some(field=>field.name==='enriched'),'the admitted mutation can still finish after Close');
+  assert.equal(f.context.document.body.children[0].hidden,false,'the old completion does not close the new manager');
+  assert.equal(f.field('save-lookup').hidden,true);assert.equal(f.field('status').textContent,'');
+  assert.ok(f.cancelled.every(key=>['reference-list','reference-inspect'].includes(key)));
+  assert.equal(f.calls.filter(call=>call.cmd==='reference_save_lookup').length,1);
+  assert.equal(f.calls.some(call=>call.cmd==='delete_derived_field'),false);
+});
+
+test('a recoverable save error restores Cancel while preserving the lookup draft',async()=>{
+  const f=fixture();await f.controller.openLookup(null,{referenceId:'ref-one'});
+  f.field('field-name').value='retry';f.field('value-column').value='owner';f.map(0,'host.name');f.map(1,'environment');
+  f.on('reference_save_lookup',()=>{throw Error('disk unavailable');});await f.controller.saveLookup();
+  assert.equal(f.field('cancel').textContent,'Cancelar');assert.equal(f.field('close-note').hidden,true);
+  assert.equal(f.field('save-lookup').disabled,false);assert.equal(f.field('field-name').value,'retry');
+  assert.match(f.field('status').textContent,/disk unavailable/);
+});
+
+test('non-empty reference status joins the keyboard trap without stealing focus or removing the live region',async()=>{
+  const f=fixture();await f.controller.openLookup(null,{referenceId:'ref-one'});const status=f.field('status'),anchor=f.document.activeElement;
+  assert.equal(status.attrs.tabindex,'-1');assert.equal(status.attrs.role,'status');assert.equal(status.attrs['aria-live'],'polite');
+  await f.controller.saveLookup();assert.equal(status.attrs.tabindex,'0');assert.equal(f.document.activeElement,anchor);
+  assert.equal(status.hidden,false);assert.equal(status.attrs.role,'status');assert.equal(status.attrs['aria-live'],'polite');
+  f.field('cancel').hidden=f.field('save-lookup').hidden=true;status.focus();
+  const keydown=f.overlay.listeners.keydown[0],tab=shiftKey=>({key:'Tab',shiftKey,preventDefault(){}});
+  keydown(tab(false));assert.equal(f.document.activeElement,f.field('close'));
+  keydown(tab(true));assert.equal(f.document.activeElement,status,'the trap includes the scrollable status');
+  await f.controller.refreshList();assert.equal(status.attrs.tabindex,'-1');assert.equal(status.hidden,false);
+  f.field('close').focus();keydown(tab(true));assert.equal(f.document.activeElement,f.field('value-column'),'the empty region leaves the Tab order');
 });
 
 test('existing reference details disclose legacy and exact numeric interpretation without changing import defaults',async()=>{

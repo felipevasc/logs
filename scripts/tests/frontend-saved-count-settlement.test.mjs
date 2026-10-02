@@ -18,6 +18,8 @@ assert.equal(timers.size,1,'normal work remains debounced');assert.equal(request
 let finished=false;const settled=context.settleFilterTabCounts().then(()=>{finished=true;});
 assert.equal(timers.size,0);assert.equal(requests.length,2,'barrier flushes the actual Dataset and Case requests');
 assert.ok(requests.every(r=>r.cmd==='count_filtered'&&r.opts.background));
+assert.equal(Object.hasOwn(requests[0].args,'caseEvents'),false,'the delayed pair starts with the Dataset count');
+assert.equal(requests[1].args.caseEvents.length,1,'the second delayed count belongs to the Case');
 await Promise.resolve();assert.equal(finished,false,'must await admitted work');
 requests[0].resolve(50);requests[1].resolve(3);await settled;
 assert.equal(tab.textContent,'3 · 50');assert.equal(finished,true);

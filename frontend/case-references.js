@@ -5,7 +5,7 @@ window.CaseReferences = (() => {
   const overlay = el("div", "modal-overlay"); overlay.id = "case-references-modal"; overlay.hidden = true;
   overlay.innerHTML = `<section class="modal case-references-modal" role="dialog" aria-modal="true" aria-labelledby="rf-title">
     <div class="modal-head"><h3 id="rf-title">Referências deste Caso</h3><button id="rf-close" class="icon-btn" type="button" aria-label="Fechar referências"><i class="fas fa-xmark"></i></button></div>
-    <div class="modal-body"><p id="rf-owner" class="muted small"></p><p id="rf-status" class="small" role="status" aria-live="polite"></p>
+    <div class="modal-body"><p id="rf-owner" class="muted small"></p>
       <div id="rf-manager"><div class="rf-tools"><button id="rf-choose" class="btn primary" type="button">Importar JSONL</button><button id="rf-reload" class="btn ghost" type="button">Atualizar referências</button></div>
         <p class="muted small">JSONL: um objeto por linha, com as mesmas colunas. Até 8 MiB e 100.000 registros. A referência importada fica vinculada somente a este Caso.</p>
         <div id="rf-import-pane" class="rf-import-pane" hidden><p id="rf-file" class="small"></p><p id="rf-inspection" class="muted small"></p>
@@ -19,8 +19,11 @@ window.CaseReferences = (() => {
         <div class="fld"><label for="rf-reference">Referência deste Caso</label><select id="rf-reference"></select></div><p id="rf-availability" class="muted small"></p>
         <div id="rf-mappings" class="rf-mappings"></div><div class="fld"><label for="rf-value-column">Coluna da referência que fornece o valor</label><select id="rf-value-column"></select></div>
         <p class="muted small">Mapeie cada chave explicitamente com texto, número ou booleano não nulos. Campos nativos usam texto, incluindo id e timestamp (ISO 8601); campos JSON mantêm seu tipo original. Um valor JSON null encontrado continua sendo null, diferente de uma chave sem correspondência. Esta etapa não multiplica linhas.</p>
-        <div class="rf-tools"><button id="rf-delete-lookup" class="btn ghost" type="button" hidden>Excluir campo</button><button id="rf-save-lookup" class="btn primary" type="button">Salvar campo</button></div>
-      </div><div class="modal-actions"><button id="rf-cancel" class="btn ghost" type="button">Cancelar</button></div>
+      </div>
+    </div><div class="rf-footer">
+      <p id="rf-status" class="small" role="status" aria-live="polite" tabindex="-1"></p>
+      <p id="rf-close-note" class="muted small" hidden>Fechar não interrompe nem desfaz a operação em andamento.</p>
+      <div class="modal-actions"><button id="rf-delete-lookup" class="btn ghost" type="button" hidden>Excluir campo</button><div class="rf-confirm-actions"><button id="rf-cancel" class="btn ghost" type="button">Cancelar</button><button id="rf-save-lookup" class="btn primary" type="button" hidden>Salvar campo</button></div></div>
     </div></section>`;
   document.body.append(overlay);
   const node = name => overlay.querySelector(`#rf-${name}`);
@@ -28,7 +31,7 @@ window.CaseReferences = (() => {
   const current = (draft, request = serial) => session === draft && !overlay.hidden && request === serial;
   const ownerLabel = () => activeCase()?.name || "Caso atual";
   function assertOwner(draft, revisions = true) { window.AnalysisContexts.assertOwner(draft.owner, { revisions }); }
-  function status(text, failed = false) { node("status").textContent = text; node("status").classList.toggle("rf-error", failed); }
+  function status(text, failed = false) { node("status").textContent = text; node("status").setAttribute("tabindex", text ? "0" : "-1"); node("status").classList.toggle("rf-error", failed); }
   function validDescriptor(value) {
     return value?.schemaVersion === 1 && typeof value.id === "string" && !!value.id && typeof value.name === "string"
       && value.format === "jsonl" && /^[a-f0-9]{64}$/i.test(value.contentSha256) && Array.isArray(value.columns) && value.columns.length > 0
@@ -59,6 +62,7 @@ window.CaseReferences = (() => {
       node("import").disabled = !draft.inspection || !draft.keys?.length || !!draft.needsRefresh;
       node("save-lookup").disabled = !!draft.deleted || !draft.entries?.some(entry => entry.descriptor.id === node("reference").value && entry.available);
     }
+    node("close-note").hidden = !(value && draft.mutating);
     node("cancel").textContent = value && draft.mutating ? "Fechar" : "Cancelar";
   }
   function close() {
@@ -72,6 +76,7 @@ window.CaseReferences = (() => {
     for (const key of ["reference-list", "reference-inspect"]) window.Tasks?.cancelLatest(key);
     serial++; session = { mode, owner, anchor, busy: false, entries: [], keys: [], mappings: Object.create(null), inspection: null, imported: null, needsRefresh: false };
     node("manager").hidden = mode !== "manager"; node("lookup-pane").hidden = mode !== "lookup"; node("import-pane").hidden = true;
+    node("save-lookup").hidden = mode !== "lookup"; node("delete-lookup").hidden = true;
     node("title").textContent = mode === "manager" ? "Referências deste Caso" : "Campo por referência"; node("owner").textContent = `Caso: ${ownerLabel()}`;
     node("list").replaceChildren(); status(""); overlay.hidden = false; busy(session, false); return session;
   }
@@ -281,7 +286,7 @@ window.CaseReferences = (() => {
   overlay.addEventListener("keydown", event => {
     if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); return; }
     if (event.key !== "Tab") return;
-    const controls = [...overlay.querySelectorAll("button,input,select")].filter(item => !item.disabled && !item.hidden && !item.closest("[hidden]"));
+    const controls = [...overlay.querySelectorAll('button,input,select,[tabindex="0"]')].filter(item => !item.disabled && !item.hidden && !item.closest("[hidden]"));
     const first = controls[0], last = controls.at(-1);
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
   });
