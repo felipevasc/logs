@@ -31,7 +31,7 @@ pub async fn load_bundle(
     analysis_context: Option<crate::analysis_context::Identity>,
     source_generation: Option<u64>,
 ) -> Result<crate::LoadSummary, String> {
-    let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Publish)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, crate::analysis_runtime::Mode::Publish, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     crate::offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         load_bundle_impl(state.inner(), members, Some(&app))
@@ -109,13 +109,13 @@ struct EventBatches {
 }
 impl Iterator for EventBatches {
     type Item = Vec<Event>;
-    fn next(&mut self) -> Option<Self::Item> { self.receiver.as_ref()?.recv().ok() }
+    fn next(&mut self) -> Option<Self::Item> { crate::global_scheduler::blocking(|| self.receiver.as_ref()?.recv().ok()) }
 }
 impl Drop for EventBatches {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.receiver.take();
-        if self.worker.take().is_some_and(|worker| worker.join().is_err()) {
+        if self.worker.take().is_some_and(|worker| crate::global_scheduler::blocking(|| worker.join()).is_err()) {
             *self.failure.lock() = Some("Falha na leitura em fluxo dos eventos.".into());
         }
     }
@@ -163,14 +163,14 @@ impl Selection<'_> {
                     hydrated.fetch_add(1, Ordering::Relaxed);
                     let size = query::event_payload_bytes(&event);
                     if !batch.is_empty() && (batch.len() >= 8192 || bytes.saturating_add(size) > crate::resources::batch_bytes()) {
-                        if sender.send(std::mem::take(&mut batch)).is_err() { disconnected = true; return Ok(false); }
+                        if crate::global_scheduler::blocking(|| sender.send(std::mem::take(&mut batch))).is_err() { disconnected = true; return Ok(false); }
                         bytes = 0;
                     }
                     bytes = bytes.saturating_add(size);
                     batch.push(event);
                     Ok(true)
                 })?;
-                if !disconnected && !batch.is_empty() { let _ = sender.send(batch); }
+                if !disconnected && !batch.is_empty() { let _ = crate::global_scheduler::blocking(|| sender.send(batch)); }
                 Ok::<(), String>(())
             }).and_then(|value| value);
             if let Err(error) = result {
@@ -187,19 +187,38 @@ impl Selection<'_> {
     }
     /// Each bounded wave folds in parallel; no complete-ID vector is required.
     pub fn par_fold<A: Send>(&self, init: impl Fn() -> A + Sync + Send, step: impl Fn(&mut A, &Event) + Sync + Send, merge: impl Fn(A, A) -> A + Sync + Send) -> A {
-        use rayon::prelude::*;
         let token = crate::operations::current_token();
         match self.source {
             SourceData::Indexed(idx) => {
                 let mut result = init();
                 for batch in self.batches(idx) {
-                    let next = batch.par_iter().fold(&init, |mut value, event| { if !token.cancelled() { step(&mut value, event); } value }).reduce(&init, &merge);
+                    let next = crate::global_scheduler::map(batch.chunks(batch.len().div_ceil(crate::resources::workers()).max(1)), |events| {
+                        let mut value = init();
+                        for event in events { if !token.cancelled() { step(&mut value, event); } }
+                        value
+                    }).into_iter().fold(init(), &merge);
                     result = merge(result, next);
                     if token.cancelled() { break; }
                 }
                 result
             }
-            SourceData::Memory(events) => events.par_iter().filter(|event| self.prepared.iter().all(|pf| query::matches(event, pf))).fold(&init, |mut value, event| { if !token.cancelled() { step(&mut value, event); } value }).reduce(&init, &merge),
+            SourceData::Memory(events) => {
+                let mut result = init();
+                // Retain at most one bounded wave's accumulators, never one
+                // accumulator per chunk across the entire in-memory source.
+                for wave in events.chunks(8192) {
+                    let next = crate::global_scheduler::map(wave.chunks(wave.len().div_ceil(crate::resources::workers()).max(1)), |events| {
+                        let mut value = init();
+                        for event in events {
+                            if !token.cancelled() && self.prepared.iter().all(|pf| query::matches(event, pf)) { step(&mut value, event); }
+                        }
+                        value
+                    }).into_iter().fold(init(), &merge);
+                    result = merge(result, next);
+                    if token.cancelled() { break; }
+                }
+                result
+            }
             SourceData::None => init(),
         }
     }
@@ -232,16 +251,16 @@ pub(crate) fn with_engine<T>(
 ) -> Result<Option<T>, String> {
     let source = crate::analysis_runtime::source(&state);
     let SourceData::Indexed(idx) = &*source else { return Ok(None) };
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
+    let codes = crate::analysis_runtime::codes(&state);
+    let system = crate::analysis_runtime::system_codes(&state);
     let derived = crate::analysis_runtime::derived(&state);
     f(&crate::engine::Source { idx, codes: &codes, system: &system, derived: &derived })
 }
 
 pub fn with_selection<T>(state: &AppState, filters: &[Filter], f: impl FnOnce(Selection<'_>) -> T) -> Result<T, String> {
     let source = crate::analysis_runtime::source(&state);
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
+    let codes = crate::analysis_runtime::codes(&state);
+    let system = crate::analysis_runtime::system_codes(&state);
     let derived = crate::analysis_runtime::derived(&state);
     if let SourceData::Indexed(idx) = &*source {
         for part in &idx.parts { sources::validate_source(part)?; }
@@ -346,8 +365,9 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
     Ok(())
 }
 #[tauri::command]
-pub fn validate_filters(filters: Vec<Filter>) -> Result<(), String> {
-    validate(&filters)
+pub async fn validate_filters(filters: Vec<Filter>, app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>) -> Result<(), String> {
+    let admitted = crate::case_editor_admission_async(app.clone(), analysis_context).await?;
+    crate::offload_admitted(None, app, admitted, move || validate(&filters)).await?
 }
 #[tauri::command]
 pub fn cancel_operation() {
@@ -390,7 +410,7 @@ pub async fn dataset_overview(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<insights::Overview, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         overview_scope_impl(
             app.state::<AppState>().inner(),
@@ -507,8 +527,8 @@ pub fn timeline_range_scope_impl(
         SourceData::Indexed(idx) => {
             let gate = crate::analysis_runtime::indexed_gate(idx)?;
             if scoped_filters.len() == 1 {
-                let codes = state.codes.read();
-                let system = state.system_codes.read();
+                let codes = crate::analysis_runtime::codes(&state);
+                let system = crate::analysis_runtime::system_codes(&state);
                 let derived = crate::analysis_runtime::derived(&state);
                 let input = crate::engine::Source { idx, codes: &codes, system: &system, derived: &derived };
                 if let Some(histogram) = crate::engine::timeline_histogram(&input, start, end, width, bucket_count)? {
@@ -532,8 +552,8 @@ pub fn timeline_range_scope_impl(
                     }
                 }
             } else {
-                let codes = state.codes.read();
-                let system = state.system_codes.read();
+                let codes = crate::analysis_runtime::codes(&state);
+                let system = crate::analysis_runtime::system_codes(&state);
                 let derived = crate::analysis_runtime::derived(&state);
                 query::visit_indexed_matches(idx, &scoped_filters, &codes, &system, &derived, |id| {
                     let meta = &idx.lines.at(id);
@@ -570,7 +590,7 @@ pub async fn timeline_range(
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<TimelineRange, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         if case_events.is_none() {
             return timeline_range_impl(
@@ -603,7 +623,7 @@ pub async fn compare_periods(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<insights::Comparison, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         if case_events.is_none() {
             compare_impl(app.state::<AppState>().inner(), filters, before, after)
@@ -747,7 +767,7 @@ pub fn sources_impl(state: &AppState) -> Result<Vec<SourceInfo>, String> {
 }
 #[tauri::command]
 pub async fn list_sources(app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<SourceInfo>, String> {
-    let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_admitted(None, app.clone(), admitted, move || sources_impl(app.state::<AppState>().inner())).await?
 }
 
@@ -867,7 +887,7 @@ pub async fn export_events(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<usize, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         validate(&filters)?;
         if !["csv", "jsonl"].contains(&format.as_str()) {
@@ -2617,7 +2637,7 @@ pub(crate) async fn grouped_timeline(
     operation_id: Option<String>,
     app: AppHandle,
 ) -> Result<crate::grouped_timeline::Response, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     let context = crate::grouped_timeline::Context {
         analysis: admitted.identity.clone(), source_generation: admitted.source_generation, case_key: admitted.case_key.clone(),
     };

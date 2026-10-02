@@ -664,6 +664,8 @@ pub struct PivotParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SaveCustomFormatParams {
+    #[serde(flatten)]
+    pub context: crate::analysis_runtime::Params,
     /// Format name (referenced later as format id "custom:<name>").
     pub name: String,
     /// Parser kind: "regex" (pattern with named groups) or "delimited" (separator + field names).
@@ -698,6 +700,8 @@ pub struct TestParseParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetTsConfigParams {
+    #[serde(flatten)]
+    pub context: crate::analysis_runtime::Params,
     /// Absolute path of the log file the timestamp config applies to.
     pub path: String,
 }
@@ -765,6 +769,8 @@ pub struct PreviewFieldTransformParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SaveCodesParams {
+    #[serde(flatten)]
+    pub context: crate::analysis_runtime::Params,
     /// Full codes catalog: {source ("*" = any): {code: {name, description}}}. Replaces the current catalog and re-enriches loaded events.
     pub codes: serde_json::Value,
 }
@@ -1156,11 +1162,21 @@ impl LogInsightMcp {
     async fn run_context<T, F>(&self, params: crate::analysis_runtime::Params, mode: crate::analysis_runtime::Mode, f: F) -> Result<CallToolResult, McpError>
     where T: Serialize + Send + 'static, F: FnOnce(&AppState, &AppHandle) -> Result<T, String> + Send + 'static {
         let app = self.app.clone();
-        let admitted = match crate::analysis_runtime::capture(app.state::<AppState>().inner(), params.analysis_context, params.source_generation, mode) {
+        let admitted = match crate::analysis_runtime::capture_async(app.clone(), params.analysis_context, params.source_generation, mode, None, crate::global_scheduler::Priority::Normal).await {
             Ok(admitted) => admitted,
             Err(error) => return from_domain::<T>(Err(error)),
         };
         let result = crate::offload_admitted(None, app.clone(), admitted, move || f(app.state::<AppState>().inner(), &app)).await;
+        from_domain(result.and_then(|result| result))
+    }
+
+    async fn run_interactive<T, F>(&self, params: crate::analysis_runtime::Params, f: F) -> Result<CallToolResult, McpError>
+    where T: Serialize + Send + 'static, F: FnOnce(&AppState) -> Result<T, String> + Send + 'static {
+        let app = self.app.clone();
+        let admitted = match crate::analysis_runtime::capture_async(app.clone(), params.analysis_context, params.source_generation, crate::analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Interactive).await {
+            Ok(admitted) => admitted, Err(error) => return from_domain::<T>(Err(error)),
+        };
+        let result = crate::offload_case_interactive(None, app.clone(), admitted, None, move |_| f(app.state::<AppState>().inner())).await;
         from_domain(result.and_then(|result| result))
     }
 
@@ -1172,6 +1188,16 @@ impl LogInsightMcp {
     async fn run_source_result<T, F>(&self, params: crate::analysis_runtime::Params, f: F) -> Result<CallToolResult, McpError>
     where T: Serialize + Send + 'static, F: FnOnce(&AppState) -> Result<T, String> + Send + 'static {
         self.run_context(params, crate::analysis_runtime::Mode::Dataset, move |state, _| f(state)).await
+    }
+
+    /// Validation and execution see the same immutable Case snapshot.
+    async fn run_filtered_source_result<T, F>(&self, params: crate::analysis_runtime::Params, filters: Vec<Filter>, f: F) -> Result<CallToolResult, McpError>
+    where T: Serialize + Send + 'static, F: FnOnce(&AppState) -> Result<T, String> + Send + 'static {
+        self.run_source_result(params, move |state| { crate::workspace::validate(&filters)?; f(state) }).await
+    }
+    async fn run_filtered_source<T, F>(&self, params: crate::analysis_runtime::Params, filters: Vec<Filter>, f: F) -> Result<CallToolResult, McpError>
+    where T: Serialize + Send + 'static, F: FnOnce(&AppState) -> T + Send + 'static {
+        self.run_filtered_source_result(params, filters, move |state| Ok(f(state))).await
     }
 
     /// Igual a `run_domain`, mas passa também o AppHandle (progresso para a UI).
@@ -1304,8 +1330,8 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| {
+        self.run_interactive(p.context.clone(), move |state| {
+            crate::workspace::validate(&p.filters)?;
             crate::query_events_impl(
                 state,
                 p.filters,
@@ -1326,7 +1352,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<EventDetailParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.run_source(p.context.clone(), move |state| crate::event_detail_impl(state, p.id))
+        self.run_interactive(p.context.clone(), move |state| Ok(crate::event_detail_impl(state, p.id)))
             .await
     }
 
@@ -1338,8 +1364,8 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
         self.run_context(p.context.clone(), crate::analysis_runtime::Mode::Dataset, move |state, app| {
+            crate::workspace::validate(&p.filters)?;
             crate::validate_current_source(state)?;
             crate::explore_snapshot_impl(
                 state,
@@ -1361,8 +1387,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<AggregateParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source(p.context.clone(), move |state| {
+        self.run_filtered_source(p.context.clone(), p.filters.clone(), move |state| {
             crate::aggregate_events_impl(state, &p.group_column, p.aggs, p.filters, None)
         })
         .await
@@ -1376,8 +1401,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<TrailParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| {
+        self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| {
             crate::trail_events_impl(state, p.center_id, p.before, p.after, p.filters, None)
         })
         .await
@@ -1391,8 +1415,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<FiltersParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| crate::count_filtered_impl(state, p.filters, None))
+        self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| crate::count_filtered_impl(state, p.filters, None))
             .await
     }
 
@@ -1404,8 +1427,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<TreeAggsParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source(p.context.clone(), move |state| crate::tree_aggs_impl(state, p.columns, p.filters, None))
+        self.run_filtered_source(p.context.clone(), p.filters.clone(), move |state| crate::tree_aggs_impl(state, p.columns, p.filters, None))
             .await
     }
 
@@ -1417,8 +1439,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<FiltersParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| crate::stats_events_impl(state, p.filters))
+        self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| crate::stats_events_impl(state, p.filters))
             .await
     }
 
@@ -1432,8 +1453,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<FiltersParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| crate::profile_fields_impl(state, p.filters, None))
+        self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| crate::profile_fields_impl(state, p.filters, None))
             .await
     }
 
@@ -1445,8 +1465,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<ComputeSeriesParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| crate::compute_series_impl(state, p.filters, None, p.spec))
+        self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| crate::compute_series_impl(state, p.filters, None, p.spec))
             .await
     }
 
@@ -1458,8 +1477,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<PivotParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| crate::pivot_impl(state, p.filters, None, p.spec))
+        self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| crate::pivot_impl(state, p.filters, None, p.spec))
             .await
     }
 
@@ -1469,8 +1487,8 @@ impl LogInsightMcp {
         description = "List available log formats (id + display name), including saved custom formats. Use the ids in load_file/load_files.",
         annotations(read_only_hint = true)
     )]
-    async fn list_formats(&self) -> Result<CallToolResult, McpError> {
-        self.run(|_| crate::list_formats_impl()).await
+    async fn list_formats(&self, Parameters(p): Parameters<crate::analysis_runtime::Params>) -> Result<CallToolResult, McpError> {
+        self.run_context(p, crate::analysis_runtime::Mode::Metadata, |_, _| Ok(crate::list_formats_impl())).await
     }
 
     #[tool(
@@ -1482,7 +1500,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<SaveCustomFormatParams>,
     ) -> Result<CallToolResult, McpError> {
         let result = self
-            .run_domain(move |_| {
+            .run_context(p.context.clone(), crate::analysis_runtime::Mode::Metadata, move |_, _| {
                 crate::save_custom_format_impl(&p.name, &p.kind, &p.pattern, &p.separator, p.fields)
             })
             .await?;
@@ -1516,7 +1534,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<GetTsConfigParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(move |_| crate::load_ts_config(&p.path)).await
+        self.run_context(p.context.clone(), crate::analysis_runtime::Mode::Metadata, move |_, _| Ok(crate::load_ts_config(&p.path))).await
     }
 
     #[tool(
@@ -1528,7 +1546,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<SetTsConfigParams>,
     ) -> Result<CallToolResult, McpError> {
         let result = self
-            .run_context(p.context.clone(), crate::analysis_runtime::Mode::Dataset, move |state, app| {
+            .run_context(p.context.clone(), crate::analysis_runtime::Mode::EditSource, move |state, app| {
                 crate::set_ts_config_impl(state, &p.path, p.config, Some(app))
             })
             .await?;
@@ -1610,19 +1628,15 @@ impl LogInsightMcp {
     // ------------------------------------------------------------ códigos
 
     #[tool(
-        description = "Get the user codes catalog (source -> code -> name/description) as JSON.",
+        description = "Get the explicit Case codes catalog (source -> code -> name/description) as JSON. Requires analysisContext.",
         annotations(read_only_hint = true)
     )]
-    async fn get_codes(&self) -> Result<CallToolResult, McpError> {
-        self.run(|state| {
-            serde_json::from_str::<serde_json::Value>(&crate::get_codes_impl(state))
-                .unwrap_or(serde_json::Value::Null)
-        })
-        .await
+    async fn get_codes(&self, Parameters(p): Parameters<crate::analysis_runtime::Params>) -> Result<CallToolResult, McpError> {
+        self.run_context(p, crate::analysis_runtime::Mode::Metadata, |state, _| Ok(serde_json::from_str::<serde_json::Value>(&crate::get_codes_impl(state)).unwrap_or(serde_json::Value::Null))).await
     }
 
     #[tool(
-        description = "Replace the user codes catalog and re-enrich loaded events. MUTATES app state: emits 'mcp-state-changed' {kind: 'codes'}.",
+        description = "Replace only the explicit Case codes catalog using config revision CAS; returns analysisContext. MUTATES app state: emits 'mcp-state-changed' {kind: 'codes'}.",
         annotations(read_only_hint = false, idempotent_hint = true)
     )]
     async fn save_codes(
@@ -1630,7 +1644,7 @@ impl LogInsightMcp {
         Parameters(p): Parameters<SaveCodesParams>,
     ) -> Result<CallToolResult, McpError> {
         let result = self
-            .run_domain(move |state| {
+            .run_context(p.context.clone(), crate::analysis_runtime::Mode::Metadata, move |state, _| {
                 let text = serde_json::to_string_pretty(&p.codes).map_err(|e| e.to_string())?;
                 crate::save_codes_impl(state, &text)
             })
@@ -1642,7 +1656,7 @@ impl LogInsightMcp {
     }
 
     #[tool(
-        description = "Get the on-disk path of the user codes catalog file (codes.json).",
+        description = "Get the legacy application catalog template path. Editing this file does not change any Case-effective catalog.",
         annotations(read_only_hint = true)
     )]
     async fn get_codes_path(&self) -> Result<CallToolResult, McpError> {
@@ -1651,12 +1665,12 @@ impl LogInsightMcp {
     }
 
     #[tool(
-        description = "Re-extract the operating system's event code catalog (slow, ~20s) and re-enrich loaded events. MUTATES app state: emits 'mcp-state-changed' {kind: 'codes'}.",
+        description = "Extract the operating system's event code catalog into the explicit Case only (slow, ~20s); returns analysisContext. MUTATES app state: emits 'mcp-state-changed' {kind: 'codes'}.",
         annotations(read_only_hint = false)
     )]
-    async fn harvest_codes(&self) -> Result<CallToolResult, McpError> {
+    async fn harvest_codes(&self, Parameters(p): Parameters<crate::analysis_runtime::Params>) -> Result<CallToolResult, McpError> {
         let result = self
-            .run_domain(|state| crate::harvest_codes_impl(state))
+            .run_context(p, crate::analysis_runtime::Mode::Metadata, |state, _| crate::harvest_codes_impl(state))
             .await?;
         if succeeded(&result) {
             notify_state_changed(&self.app, "codes");
@@ -1665,11 +1679,11 @@ impl LogInsightMcp {
     }
 
     #[tool(
-        description = "Number of codes in the catalog extracted from the operating system.",
+        description = "Number of codes in the explicit Case system catalog. Requires analysisContext.",
         annotations(read_only_hint = true)
     )]
-    async fn system_codes_count(&self) -> Result<CallToolResult, McpError> {
-        self.run(|state| crate::system_codes_count_impl(state))
+    async fn system_codes_count(&self, Parameters(p): Parameters<crate::analysis_runtime::Params>) -> Result<CallToolResult, McpError> {
+        self.run_context(p, crate::analysis_runtime::Mode::Metadata, |state, _| Ok(crate::system_codes_count_impl(state)))
             .await
     }
 
@@ -1738,8 +1752,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<DiscoverPatternsParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| crate::discover_patterns_impl(state, p.filters, None))
+        self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| crate::discover_patterns_impl(state, p.filters, None))
             .await
     }
 
@@ -1751,8 +1764,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<ComparePeriodsParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| {
+        self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| {
             crate::workspace::compare_impl(state, p.filters, p.before, p.after)
         })
         .await
@@ -1766,8 +1778,7 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<TimelineRangeParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| {
+        self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| {
             crate::workspace::timeline_range_impl(state, p.filters, p.start, p.end, p.bucket_count)
         })
         .await
@@ -1781,7 +1792,6 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<ExportEventsParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
         let count = crate::workspace::export_events(
             p.path,
             p.format,
@@ -1815,8 +1825,7 @@ impl LogInsightMcp {
         annotations(read_only_hint = true)
     )]
     async fn triage(&self, Parameters(p): Parameters<TriageParams>) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
-        self.run_source_result(p.context.clone(), move |state| {
+        self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| {
             crate::triage::triage_page(state, p.filters, None, p.force.unwrap_or(false), p.minimum_evidence.unwrap_or(5),p.episode_offset.unwrap_or(0),p.episode_limit.unwrap_or(100),None)
         })
         .await
@@ -1848,8 +1857,8 @@ impl LogInsightMcp {
         description = "List detection rules (built-in and imported Sigma), their ATT&CK techniques and whether they are enabled, plus Sigma import errors.",
         annotations(read_only_hint = true)
     )]
-    async fn detection_rules(&self) -> Result<CallToolResult, McpError> {
-        self.run_domain(|_| crate::triage::rules_impl()).await
+    async fn detection_rules(&self, Parameters(p): Parameters<crate::analysis_runtime::Params>) -> Result<CallToolResult, McpError> {
+        self.run_context(p, crate::analysis_runtime::Mode::Metadata, |_, _| crate::triage::rules_impl()).await
     }
 
     // ------------------------------------------------------------ ameaças
@@ -1862,7 +1871,6 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<ThreatScanParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
         from_domain(crate::threats::threat_scan(p.filters, None, None, p.context.analysis_context, p.context.source_generation, self.app.clone()).await)
     }
 
@@ -1874,7 +1882,6 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<ThreatEventsParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
         from_domain(
             crate::threats::threat_events(p.filters, None, None, p.context.analysis_context, p.context.source_generation, p.offset, p.limit, self.app.clone())
                 .await,
@@ -1885,16 +1892,16 @@ impl LogInsightMcp {
         description = "Inspect the catalog of 378 local threat rules: rule definitions, categories, severities, enabled states, and reference links.",
         annotations(read_only_hint = true)
     )]
-    async fn threat_catalog(&self) -> Result<CallToolResult, McpError> {
-        from_domain(crate::threats::threat_catalog().await)
+    async fn threat_catalog(&self, Parameters(p): Parameters<crate::analysis_runtime::Params>) -> Result<CallToolResult, McpError> {
+        from_domain(crate::threats::threat_catalog(p.analysis_context, self.app.clone()).await)
     }
 
     #[tool(
-        description = "Reload and update the local threat rules catalog from disk. MUTATES app state: emits 'mcp-state-changed' {kind: 'threats'}.",
+        description = "Add new immutable bundled threat IDs to the explicit Case catalog, preserving its overrides; returns analysisContext. MUTATES app state: emits 'mcp-state-changed' {kind: 'threats'}.",
         annotations(read_only_hint = false, idempotent_hint = true)
     )]
-    async fn threat_catalog_update(&self) -> Result<CallToolResult, McpError> {
-        let result = from_domain(crate::threats::threat_catalog_update().await)?;
+    async fn threat_catalog_update(&self, Parameters(p): Parameters<crate::analysis_runtime::Params>) -> Result<CallToolResult, McpError> {
+        let result = from_domain(crate::threats::threat_catalog_update(None, p.analysis_context, self.app.clone()).await)?;
         if succeeded(&result) {
             notify_state_changed(&self.app, "threats");
         }
@@ -1911,7 +1918,6 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<JourneyFieldsParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
         from_domain(crate::journeys::journey_fields(p.filters, None, None, p.context.analysis_context, p.context.source_generation, self.app.clone(), None).await)
     }
 
@@ -1923,7 +1929,6 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<JourneyIndexParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
         from_domain(
             crate::journeys::journey_index(
                 p.filters,
@@ -1953,7 +1958,6 @@ impl LogInsightMcp {
         &self,
         Parameters(p): Parameters<JourneyEventsParams>,
     ) -> Result<CallToolResult, McpError> {
-        crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
         from_domain(
             crate::journeys::journey_events(
                 p.filters,

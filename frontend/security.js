@@ -124,6 +124,7 @@ window.Security = (() => {
     window.Workspace.applyFilters(filters, true, "timeline");
   }
   async function saveToCase(data, detections, title, summary, grouping) {
+    try { episodeRequest(data); } catch (error) { toast(String(error), "err"); return; }
     if (workspaceScope() === "case") { toast("Estes registros já pertencem ao Caso.", "info"); return; }
     const contextBefore = universeKey();
     const ids = [...new Set(detections.flatMap(d => d.event_ids))];
@@ -177,8 +178,10 @@ window.Security = (() => {
     if (await saveCases()) { window.Workspace?.loaded && updateCountsSafe(); window.WorkspaceContext?.refreshMembership?.(); toast("Salvo no Caso com os registros de apoio.", "ok"); }
   }
   const updateCountsSafe = () => { try { document.querySelector("#ws-evidence-count").textContent = activeCase()?.items?.length || ""; } catch { /* navigation not ready */ } };
-  async function suppress(detection) {
-    const settings = (await rules()).settings;
+  async function suppress(detection, data) {
+    let owner;
+    try { owner = await window.AnalysisContexts.prepare(episodeRequest(data).owner, { metadata: true }); } catch (error) { toast(String(error), "err"); return; }
+    const settings = structuredClone((await rules(owner)).settings);
     const entity = detection.entities[0];
     const exception = await new Promise(resolve => {
       const dialog = document.createElement("dialog"); dialog.className = "evidence-exception";
@@ -192,7 +195,9 @@ window.Security = (() => {
     });
     if (!exception) return;
     settings.suppress = [...(settings.suppress || []), { rule: detection.rule, column: entity?.column || null, value: entity?.value || null, scope: detection.namespace || "", created: Date.now(), ...exception }];
-    await api("detection_settings_save", { settings });
+    window.AnalysisContexts.assertOwner(owner);
+    await api("detection_settings_save", { settings }, { analysisOwner: owner });
+    window.AnalysisContexts.assertOwner(owner, { revisions: false });
     results.clear(); rulesCache = null;
     toast(entity ? `Ocultado para ${entity.value}.` : "Detecção ocultada.", "ok");
     window.Workspace.showPage(window.Workspace.page());
@@ -362,7 +367,7 @@ window.Security = (() => {
       }
       let actionData=data;
       if(action && episode.members_complete===false && ["records","timeline","save"].includes(action)) {
-        try {const members=await completeEpisode(data,episode);actionData={...data,detections:members};episode={...episode,detections:members.map((_,i)=>i),event_refs:[...new Set(members.flatMap(d=>d.event_refs||[]))],members_complete:true};}
+        try {const members=await completeEpisode(data,episode);actionData={...data,detections:members};analysisRequests.set(actionData,episodeRequest(data));episode={...episode,detections:members.map((_,i)=>i),event_refs:[...new Set(members.flatMap(d=>d.event_refs||[]))],members_complete:true};}
         catch(error){toast(String(error),"err");return;}
       }
       const detection = event.target.closest("[data-detection]") && (article.__detailMembers || data.detections)[+event.target.closest("[data-detection]").dataset.detection];
@@ -372,7 +377,7 @@ window.Security = (() => {
       else if (action === "timeline") showTimeline(episodeFilters(actionData, episode), episode.start, episode.end);
       else if (action === "save") await saveToCase(actionData, episode.detections.map(i => actionData.detections[i]), episode.title, episode.summary, episode.grouping);
       else if (action === "d-records" && detection) openInlineEvents(event.target.closest('[data-detection]'), detection, data);
-      else if (action === "d-hide" && detection) await suppress(detection);
+      else if (action === "d-hide" && detection) await suppress(detection, data);
       else if (!detection) toggle(article);
       else openInlineEvents(event.target.closest('[data-detection]'), detection, data);
     });
@@ -389,7 +394,7 @@ window.Security = (() => {
       const detectionNode = event.target.closest("[data-detection]");
       const detection = detectionNode && (article.__detailMembers || data.detections)[+detectionNode.dataset.detection];
       if(!detection && episode.members_complete===false){
-        try {const members=await completeEpisode(data,episode);actionData={...data,detections:members};episode={...episode,detections:members.map((_,i)=>i),event_refs:[...new Set(members.flatMap(d=>d.event_refs||[]))]};}
+        try {const members=await completeEpisode(data,episode);actionData={...data,detections:members};analysisRequests.set(actionData,episodeRequest(data));episode={...episode,detections:members.map((_,i)=>i),event_refs:[...new Set(members.flatMap(d=>d.event_refs||[]))]};}
         catch(error){toast(String(error),"err");return;}
       }
       const target = detection ? { title: detection.name, summary: detection.summary, list: [detection], filters: detectionFilters(detection), start: detection.start, end: detection.end } : { title: episode.title, summary: episode.summary, list: episode.detections.map(i => actionData.detections[i]), filters: episodeFilters(actionData, episode), start: episode.start, end: episode.end };
@@ -398,7 +403,7 @@ window.Security = (() => {
         { icon: "fa-timeline", label: "Ver na linha do tempo", onClick: () => showTimeline(target.filters, target.start, target.end) },
         ...(workspaceScope() === "dataset" ? [{ icon: "fa-bookmark", label: "Salvar no Caso", onClick: () => saveToCase(actionData, target.list, target.title, target.summary, detection?undefined:episode.grouping) }] : []),
         { icon: "fa-copy", label: "Copiar resumo", onClick: () => navigator.clipboard?.writeText(`${target.title}\n${target.summary}\n${range(target.start, target.end)}\n${target.list.map(d => `- ${d.name}: ${d.summary} (${d.count})`).join("\n")}`) },
-        ...(detection ? [{ sep: true }, { icon: "fa-eye-slash", label: "Ocultar esta detecção", onClick: () => suppress(detection) }] : []),
+        ...(detection ? [{ sep: true }, { icon: "fa-eye-slash", label: "Ocultar esta detecção", onClick: () => suppress(detection, data) }] : []),
       ]);
     });
   }
@@ -547,24 +552,59 @@ window.Security = (() => {
 
   // ---------------------------------------------------------------- rules and settings
   let rulesCache = null;
-  async function rules() {
-    if (!rulesCache) rulesCache = await api("detection_rules", {}, { silent: true });
-    for (const r of rulesCache.rules) names.set(r.id, r.name);
-    return rulesCache;
+  const ruleOwners = new WeakMap(), rulePanes = new WeakMap(), rulePaneStates = new WeakMap(), liveRulePanes = new Set(), controlDisabled = new WeakMap();
+  function updateRulePaneState(pane) {
+    const view = rulePaneStates.get(pane); if (!view) return;
+    let stale = false; try { window.AnalysisContexts.assertOwner(view.owner); } catch { stale = true; }
+    view.notice.innerHTML = `<p class="small muted">Segurança do Caso ${esc(view.owner.caseId || "sem identificação")}</p>${stale ? '<p role="alert">O Caso ou sua configuração mudou. Este formulário anterior está bloqueado.</p><button type="button" class="btn ghost small">Reabrir regras do Caso ativo</button>' : ""}`;
+    const reopen = stale ? view.notice.querySelector("button") : null;
+    if (reopen) reopen.onclick = () => renderRulesPane(pane);
+    for (const control of pane.querySelectorAll("input, textarea, button")) {
+      if (control === reopen) continue;
+      if (stale) { if (!controlDisabled.has(control)) controlDisabled.set(control, control.disabled); control.disabled = true; }
+      else if (controlDisabled.has(control)) { control.disabled = controlDisabled.get(control); controlDisabled.delete(control); }
+    }
   }
+  async function rules(owner) {
+    owner ||= await window.AnalysisContexts.prepare(window.AnalysisContexts.capture(), { metadata: true });
+    window.AnalysisContexts.assertOwner(owner);
+    const signature = JSON.stringify(owner);
+    if (!rulesCache || rulesCache.signature !== signature) {
+      const value = await api("detection_rules", {}, { silent: true, analysisOwner: owner });
+      window.AnalysisContexts.assertOwner(owner);
+      ruleOwners.set(value, owner); rulesCache = { signature, value };
+    }
+    for (const r of rulesCache.value.rules) names.set(r.id, r.name);
+    return rulesCache.value;
+  }
+  for (const event of ["workspace-context-change", "analysis-context-change"]) document.addEventListener(event, () => { rulesCache = null; names.clear(); for (const pane of liveRulePanes) { if (!pane.isConnected) liveRulePanes.delete(pane); else updateRulePaneState(pane); } });
   async function renderRulesPane(pane) {
+    const token = {}; rulePanes.set(pane, token);
     pane.innerHTML = '<div class="ws-loading"><i class="fas fa-circle-notch spin"></i>Carregando regras…</div>';
     let overview;
-    try { rulesCache = null; overview = await rules(); } catch (error) { pane.innerHTML = `<p class="muted small">${esc(String(error))}</p>`; return; }
-    const settings = overview.settings;
-    const save = async (message) => { await api("detection_settings_save", { settings }); results.clear(); rulesCache = null; if (message) toast(message, "ok"); };
-    const groups = [["builtin", "Regras embutidas"], ["sigma", "Sigma importadas"]];
+    try { rulesCache = null; overview = await rules(); if (rulePanes.get(pane) !== token) return; } catch (error) { if (rulePanes.get(pane) !== token) return; pane.innerHTML = `<p class="muted small">${esc(String(error))}</p>`; return; }
+    const settings = structuredClone(overview.settings);
+    let owner = ruleOwners.get(overview);
+    const mutate = async (command, args) => {
+      window.AnalysisContexts.assertOwner(owner);
+      const result = await api(command, structuredClone(args), { analysisOwner: owner });
+      window.AnalysisContexts.assertOwner(owner, { revisions: false });
+      owner = window.AnalysisContexts.capture(); if (rulePaneStates.has(pane)) { rulePaneStates.get(pane).owner = owner; updateRulePaneState(pane); } results.clear(); rulesCache = null;
+      return result;
+    };
+    const save = async (message) => { await mutate("detection_settings_save", { settings }); if (message) toast(message, "ok"); };
+    const groups = [["builtin", "Modelos internos"], ["case", "Regras deste Caso"], ["sigma", "Sigma deste Caso"]];
     pane.innerHTML = `<div class="rules-top"><label class="check-line"><input type="checkbox" id="rules-threats" ${settings.threats ? "checked" : ""}> Incluir sinais do catálogo de ameaças na triagem</label>
-      <div class="rules-actions"><button type="button" class="btn ghost small" id="rules-import"><i class="fas fa-file-import"></i> Importar Sigma</button><button type="button" class="btn ghost small" id="rules-import-folder">Pasta Sigma</button>${overview.rules.some(r => r.origin === "sigma") ? '<button type="button" class="btn ghost small" id="rules-clear">Remover Sigma</button>' : ""}</div></div>
+      <div class="rules-actions"><button type="button" class="btn ghost small" id="rules-import"><i class="fas fa-file-import"></i> Importar Sigma</button><button type="button" class="btn ghost small" id="rules-import-folder">Pasta Sigma</button><button type="button" class="btn ghost small" id="rules-clear" title="Remove apenas as fontes Sigma deste Caso; também permite redefinir uma importação legada inválida">Limpar Sigma do Caso</button></div></div>
       <input type="search" class="rules-search" placeholder="Filtrar regras…" aria-label="Filtrar regras">
       ${settings.suppress?.length ? `<details class="rules-suppress"><summary>${settings.suppress.length} ${settings.suppress.length === 1 ? "detecção oculta" : "detecções ocultas"}</summary>${settings.suppress.map((s, i) => `<div class="rules-suppressed"><span>${esc(names.get(s.rule) || s.rule)}${s.value ? ` · ${esc(s.value)}` : ""}</span><button type="button" class="text-button" data-unsuppress="${i}">Mostrar novamente</button></div>`).join("")}</details>` : ""}
       ${overview.sigma_errors.length ? `<details class="rules-errors"><summary>${overview.sigma_errors.length} regras Sigma não convertidas</summary>${overview.sigma_errors.slice(0, 50).map(e => `<div>${esc(e)}</div>`).join("")}</details>` : ""}
       <div class="rules-list">${groups.map(([origin, label]) => { const list = overview.rules.filter(r => r.origin === origin); return list.length ? `<h4>${label} <span>${list.filter(r => r.enabled).length}/${list.length}</span></h4>${list.map(r => `<label class="rule-row" data-search="${esc(`${r.name} ${r.id} ${r.attack.map(a => a.id + " " + a.name).join(" ")}`.toLowerCase())}" title="${esc(r.description)}"><input type="checkbox" data-rule="${esc(r.id)}" ${r.enabled ? "checked" : ""} ${r.retired ? 'disabled title="Retirada da triagem: comportamento insuficiente isoladamente"' : ""}><span class="sec-dot sev-${esc(r.severity)}"></span><span class="rule-name">${esc(r.name)}</span><small>${r.evidence?.maturity === "unassessed" ? "Nível não avaliado" : evidence().label(r.evidence_level ?? r.evidence?.level)} · ${esc(r.evidence?.maturity || "legada")}</small><small>${esc(r.attack.map(a => a.id).join(" "))}</small></label>`).join("")}` : ""; }).join("")}</div>`;
+    const custom = el("details", "rules-mappings");
+    custom.innerHTML = '<summary>Regras personalizadas deste Caso</summary><p class="small muted">JSON com version: 1 e rules. IDs iguais substituem o modelo somente neste Caso. Deixe vazio para usar somente os modelos internos.</p><textarea class="source-mapping-editor" aria-label="Regras personalizadas do Caso (JSON)"></textarea><button type="button" class="btn ghost small">Salvar regras do Caso</button><pre aria-live="polite"></pre>';
+    custom.querySelector("textarea").value = overview.custom_rules_json || "";
+    custom.querySelector("button").onclick = async () => { try { await mutate("detection_settings_save", { settings, customRulesJson: custom.querySelector("textarea").value }); if (pane.isConnected) await renderRulesPane(pane); } catch (error) { custom.querySelector("pre").textContent = String(error); } };
+    pane.prepend(custom);
     const mappingsPane = el("details", "rules-mappings");
     mappingsPane.innerHTML = `<summary>Mapeamento de fontes e procedência</summary><p class="muted small">Cada fonte usa seu nome exato. Campos: timestamp, actor, target, namespace, host, service, action, outcome, request, session, connection, process, parent, file, command, credential, created_credential, resource, request_command, url, persistence_target, application, grant, token, repository, pipeline, run, revision, secret, certificate, certificate_issuer, certificate_subject, requester, beneficiary, delegator, resource_spn, destination, artifact, logon, remote_session, principal, source_address. Resultados: success, failure, blocked, unknown.</p><textarea class="source-mapping-editor" aria-label="Mapeamentos por fonte (JSON)"></textarea><button type="button" class="btn ghost small" data-preview-map>Prévia no evento aberto</button><button type="button" class="btn ghost small" data-save-map>Salvar mapeamentos</button><pre class="mapping-preview" aria-live="polite"></pre>`;
     pane.prepend(mappingsPane);
@@ -574,13 +614,13 @@ window.Security = (() => {
     coveragePane.innerHTML=`<summary>Cobertura explícita para regras por ausência</summary><p class="small muted">Declare somente intervalos completos comprovados. Cada declaração exige dataset_fingerprint, source, namespace, category, start/end em epoch ms, complete e justification. Uma declaração não vale para outro conjunto ou Caso.</p><code class="coverage-fingerprint"></code><textarea class="source-mapping-editor" aria-label="Cobertura por fonte (JSON)"></textarea><button type="button" class="btn ghost small" data-save-coverage>Salvar cobertura</button><pre aria-live="polite"></pre>`;
     coveragePane.querySelector("code").textContent=`Conjunto atual: ${cached()?.dataset_fingerprint || "Execute a triagem para obter a identificação"}`;
     coveragePane.querySelector("textarea").value=JSON.stringify(settings.coverage||[],null,2);
-    coveragePane.querySelector("button").onclick=async()=>{try{const coverage=JSON.parse(coveragePane.querySelector("textarea").value);if(!Array.isArray(coverage))throw Error("Informe uma lista de declarações");await api("detection_settings_save",{settings:{...settings,coverage}});settings.coverage=coverage;results.clear();rulesCache=null;coveragePane.querySelector("pre").textContent="Cobertura salva para o conjunto identificado.";}catch(e){coveragePane.querySelector("pre").textContent=String(e);}};
+    coveragePane.querySelector("button").onclick=async()=>{try{const coverage=JSON.parse(coveragePane.querySelector("textarea").value);if(!Array.isArray(coverage))throw Error("Informe uma lista de declarações");await mutate("detection_settings_save",{settings:{...settings,coverage}});settings.coverage=coverage;results.clear();rulesCache=null;coveragePane.querySelector("pre").textContent="Cobertura salva para o conjunto identificado.";}catch(e){coveragePane.querySelector("pre").textContent=String(e);}};
     pane.prepend(coveragePane);
     mappingsPane.querySelector("[data-preview-map]").onclick = async () => {
-      try { if (!state.currentDetailEv) throw Error("Abra um evento para conferir os campos reais da fonte."); const data = await api("normalization_preview", { event: state.currentDetailEv, mappings: JSON.parse(editor.value) }); preview.textContent = JSON.stringify(data, null, 2); } catch (e) { preview.textContent = String(e); }
+      try { window.AnalysisContexts.assertOwner(owner); if (!state.currentDetailEv) throw Error("Abra um evento para conferir os campos reais da fonte."); const data = await api("normalization_preview", { event: state.currentDetailEv, mappings: JSON.parse(editor.value) }); window.AnalysisContexts.assertOwner(owner); preview.textContent = JSON.stringify(data, null, 2); } catch (e) { preview.textContent = String(e); }
     };
     mappingsPane.querySelector("[data-save-map]").onclick = async () => {
-      try { const next = JSON.parse(editor.value); if (!Array.isArray(next)) throw Error("Informe uma lista de mapeamentos."); await api("detection_settings_save", { settings: { ...settings, mappings: next } }); settings.mappings = next; results.clear(); rulesCache = null; preview.textContent = "Mapeamentos salvos. A proxima analise usara a nova versao."; } catch (e) { preview.textContent = String(e); }
+      try { const next = JSON.parse(editor.value); if (!Array.isArray(next)) throw Error("Informe uma lista de mapeamentos."); await mutate("detection_settings_save", { settings: { ...settings, mappings: next } }); settings.mappings = next; results.clear(); rulesCache = null; preview.textContent = "Mapeamentos salvos. A proxima analise usara a nova versao."; } catch (e) { preview.textContent = String(e); }
     };
     pane.querySelector("#rules-threats").onchange = async e => { settings.threats = e.target.checked; await save(); };
     pane.querySelectorAll("[data-rule]").forEach(box => box.onchange = async () => {
@@ -593,14 +633,16 @@ window.Security = (() => {
     const importFrom = async folder => {
       const chosen = await dialogApi.open({ multiple: !folder, directory: folder, filters: folder ? undefined : [{ name: "Sigma", extensions: ["yml", "yaml"] }] });
       if (!chosen) return;
-      const result = await api("sigma_import", { paths: Array.isArray(chosen) ? chosen : [chosen] });
+      const result = await mutate("sigma_import", { paths: Array.isArray(chosen) ? chosen : [chosen] });
       results.clear();
       toast(`${fmtNum(result.rules)} regras Sigma importadas${result.failed.length ? ` · ${result.failed.length} arquivos não convertidos` : ""}.`, result.rules ? "ok" : "info");
       renderRulesPane(pane);
     };
     pane.querySelector("#rules-import").onclick = () => importFrom(false);
     pane.querySelector("#rules-import-folder").onclick = () => importFrom(true);
-    pane.querySelector("#rules-clear")?.addEventListener("click", async () => { if (!confirm("Remover todas as regras Sigma importadas?")) return; await api("sigma_clear", {}); results.clear(); renderRulesPane(pane); });
+    pane.querySelector("#rules-clear")?.addEventListener("click", async () => { if (!confirm("Remover todas as regras Sigma importadas deste Caso?")) return; await mutate("sigma_clear", {}); results.clear(); renderRulesPane(pane); });
+    const notice = el("div", "security-case-owner"); pane.prepend(notice);
+    rulePaneStates.set(pane, { owner, notice }); liveRulePanes.add(pane); updateRulePaneState(pane);
   }
 
   // ---------------------------------------------------------------- hunting recipes

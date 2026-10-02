@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tantivy::directory::Directory;
 use tantivy::query::{EnableScoring, Query, TermQuery};
 #[cfg(test)]
 use tantivy::query::{BooleanQuery, Occur, RegexQuery};
@@ -18,7 +19,9 @@ use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST,
 };
 use tantivy::tokenizer::{PreTokenizedString, Token};
-use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term, TERMINATED};
+use tantivy::{Index, IndexMeta, IndexReader, IndexSettings, SegmentMeta, SingleSegmentIndexWriter, TantivyDocument, Term, TERMINATED};
+#[cfg(test)]
+use tantivy::IndexWriter;
 
 /// Word standing for every word longer than [`MAX_WORD`] bytes.
 const LONG: &str = "\u{1}";
@@ -129,7 +132,7 @@ pub(crate) fn words(text: &str) -> Vec<String> {
 }
 
 pub(crate) struct Writer {
-    writer: IndexWriter,
+    writer: parking_lot::Mutex<SerialWriter>,
     lid: Field,
     text: Field,
     hex: Field,
@@ -137,16 +140,70 @@ pub(crate) struct Writer {
     dir: PathBuf,
 }
 
+/// The normal Tantivy writer starts indexing, segment-updater, merge and
+/// document-store threads even when configured with just one indexing worker.
+/// Keep all native CPU work on the admitted caller instead. A single-segment
+/// writer does not flush itself, so rotate explicitly at the memory threshold.
+/// Finalized segments remain immutable; only `finish` publishes their union.
+struct SerialWriter {
+    index: Index,
+    active: Option<SingleSegmentIndexWriter>,
+    segments: Vec<SegmentMeta>,
+    memory: usize,
+    flush_bytes: usize,
+}
+
+impl SerialWriter {
+    fn flush(&mut self) -> Result<(), String> {
+        let Some(writer) = self.active.take() else { return Ok(()); };
+        let index = writer.finalize().map_err(|e| e.to_string())?;
+        self.segments.extend(index.searchable_segment_metas().map_err(|e| e.to_string())?);
+        Ok(())
+    }
+
+    fn add(&mut self, doc: TantivyDocument) -> Result<(), String> {
+        if self.active.is_none() {
+            self.active = Some(SingleSegmentIndexWriter::new(self.index.clone(), self.memory)
+                .map_err(|e| e.to_string())?);
+        }
+        let writer = self.active.as_mut().expect("created segment writer");
+        writer.add_document(doc).map_err(|e| e.to_string())?;
+        // As in Tantivy's regular writer, a single document can exceed the
+        // threshold. Flush it before admitting the next document, without a
+        // second live segment arena or a background serialization task.
+        if writer.mem_usage() >= self.flush_bytes { self.flush()?; }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.flush()?;
+        let metas = IndexMeta {
+            index_settings: self.index.settings().clone(),
+            segments: self.segments,
+            schema: self.index.schema(),
+            opstamp: 0,
+            payload: None,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&metas).map_err(|e| e.to_string())?;
+        bytes.push(b'\n');
+        let directory = self.index.directory();
+        directory.sync_directory().map_err(|e| e.to_string())?;
+        directory.atomic_write(Path::new("meta.json"), &bytes).map_err(|e| e.to_string())?;
+        directory.sync_directory().map_err(|e| e.to_string())
+    }
+}
+
 impl Writer {
-    pub(crate) fn create(dir: &Path, threads: usize, memory: usize) -> Result<Writer, String> {
+    pub(crate) fn create(dir: &Path, _threads: usize, memory: usize) -> Result<Writer, String> {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let (schema, lid, text, hex) = schema();
-        let index = Index::create_in_dir(dir, schema).map_err(|e| e.to_string())?;
-        let writer = index
-            .writer_with_num_threads(threads.max(1), memory.max(threads.max(1) * (16 << 20)))
+        let settings = IndexSettings { docstore_compress_dedicated_thread: false, ..IndexSettings::default() };
+        let index = Index::builder().schema(schema).settings(settings).create_in_dir(dir)
             .map_err(|e| e.to_string())?;
-        Ok(Writer { writer, lid, text, hex, max_hex_word: AtomicUsize::new(0), dir: dir.to_path_buf() })
+        let memory = memory.max(16 << 20);
+        let writer = SerialWriter { index, active: None, segments: Vec::new(), memory, flush_bytes: memory };
+        Ok(Writer { writer: parking_lot::Mutex::new(writer), lid, text, hex, max_hex_word: AtomicUsize::new(0), dir: dir.to_path_buf() })
     }
 
     pub(crate) fn add(&self, lid: u32, words: Vec<String>) -> Result<(), String> {
@@ -173,13 +230,12 @@ impl Writer {
             .collect();
         doc.add_u64(self.lid, u64::from(lid));
         doc.add_pre_tokenized_text(self.text, PreTokenizedString { text: String::new(), tokens });
-        self.writer.add_document(doc).map(|_| ()).map_err(|e| e.to_string())
+        self.writer.lock().add(doc)
     }
 
-    pub(crate) fn finish(mut self) -> Result<(), String> {
+    pub(crate) fn finish(self) -> Result<(), String> {
         use std::io::Write;
-        self.writer.commit().map_err(|e| e.to_string())?;
-        self.writer.wait_merging_threads().map_err(|e| e.to_string())?;
+        self.writer.into_inner().finish()?;
         let mut metadata = std::fs::File::create(self.dir.join("hex-length")).map_err(|e| e.to_string())?;
         write!(metadata, "{}", self.max_hex_word.load(Ordering::Relaxed)).map_err(|e| e.to_string())?;
         metadata.sync_all().map_err(|e| e.to_string())
@@ -201,7 +257,9 @@ impl Text {
         }
         let index = Index::open_in_dir(dir).ok()?;
         let (_, lid, text, hex) = schema();
-        let reader = index.reader().ok()?;
+        // Checkpoints are immutable after publication. Manual reload avoids
+        // per-checkpoint polling threads and unadmitted background reloads.
+        let reader = index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().ok()?;
         let max_hex_word = std::fs::read_to_string(dir.join("hex-length")).ok()?.parse().ok()?;
         Some(Text { reader, lid, text, hex, max_hex_word })
     }
@@ -442,6 +500,80 @@ fn regex_syntax_escape(text: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn synchronous_writer_publishes_all_rolled_segments_with_query_parity() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = Writer::create(directory.path(), 8, 16 << 20).unwrap();
+        // Force each document through the production rollover path without
+        // allocating a large fixture. Indexing must ignore legacy thread counts.
+        writer.writer.lock().flush_bytes = 0;
+        let rows = [
+            "common ação café",
+            "common 0123456789abcdef",
+            "common rareword",
+            "common 事件记录已处理",
+            "common lastword",
+        ];
+        for (lid, row) in rows.iter().enumerate() {
+            writer.add(lid as u32, words(row)).unwrap();
+            let state = writer.writer.lock();
+            assert!(state.active.is_none(), "the old arena must be dropped before the next document");
+            assert_eq!(state.segments.len(), lid + 1);
+            assert!(!state.index.settings().docstore_compress_dedicated_thread);
+        }
+        writer.finish().unwrap();
+        let index = Index::open_in_dir(directory.path()).unwrap();
+        assert_eq!(index.searchable_segment_metas().unwrap().len(), rows.len());
+        assert!(!index.settings().docstore_compress_dedicated_thread);
+        let text = Text::open(directory.path()).unwrap();
+        assert_eq!(text.reader.searcher().num_docs(), rows.len() as u64);
+        assert_eq!(text.candidates("common", rows.len()), Some((0..rows.len() as u32).collect()));
+        assert_eq!(text.candidates("common", rows.len() - 1), None);
+        for needle in ["ação", "café", "0123456789abcdef", "rareword", "记录已", "lastword", "absent"] {
+            let expected = rows.iter().enumerate().filter_map(|(id, row)| row.contains(needle).then_some(id as u32)).collect::<Vec<_>>();
+            assert_eq!(text.candidates(needle, rows.len()), Some(expected.clone()), "{needle}");
+            let query = text.candidate_query(needle).unwrap();
+            assert_eq!(text.collect_candidates(&query, rows.len()), Some(expected), "legacy query {needle}");
+        }
+    }
+
+    #[test]
+    fn synchronous_writer_rolls_memory_without_retaining_a_second_arena() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = Writer::create(directory.path(), 1, 16 << 20).unwrap();
+        writer.add(0, words("initial uniquevalue")).unwrap();
+        {
+            let mut state = writer.writer.lock();
+            state.flush_bytes = state.active.as_ref().unwrap().mem_usage() + (32 << 10);
+        }
+        // Tantivy accounts its term arena in 1 MiB pages. 16 terms per
+        // document fit in the initial page; 128 distinct terms across this
+        // fixed 1024-document fixture must allocate another real arena page.
+        // Keep the dictionary below the probe's 262144-term safety limit.
+        for id in 1..1024u32 {
+            let tokens = (0..128).map(|word| format!("word{id:08}value{word:04}")).collect();
+            writer.add(id, tokens).unwrap();
+            let state = writer.writer.lock();
+            assert!(state.active.as_ref().is_none_or(|active| active.mem_usage() < state.flush_bytes),
+                "every document reaching the threshold must flush synchronously");
+        }
+        assert!(!writer.writer.lock().segments.is_empty(), "fixture must cross the memory threshold");
+        writer.finish().unwrap();
+        let text = Text::open(directory.path()).unwrap();
+        assert_eq!(text.reader.searcher().num_docs(), 1024);
+        assert_eq!(text.candidates("word00001023value0000", 1), Some(vec![1023]));
+        assert_eq!(text.candidates("initial", 1), Some(vec![0]));
+    }
+
+    #[test]
+    fn synchronous_writer_preserves_empty_index_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        Writer::create(directory.path(), 1, 16 << 20).unwrap().finish().unwrap();
+        let text = Text::open(directory.path()).unwrap();
+        assert_eq!(text.reader.searcher().num_docs(), 0);
+        assert_eq!(text.candidates("anything", 0), Some(Vec::new()));
+    }
+
     fn fixture(rows: &[String]) -> (tempfile::TempDir, Text) {
         let directory = tempfile::tempdir().unwrap();
         let writer = Writer::create(directory.path(), 1, 32 << 20).unwrap();
@@ -641,7 +773,7 @@ mod tests {
         // source-row locator must not be ignored because the first set worked.
         let mut invalid = TantivyDocument::default();
         invalid.add_text(writer.text, "short");
-        writer.writer.add_document(invalid).unwrap();
+        writer.writer.lock().add(invalid).unwrap();
         writer.finish().unwrap();
         let text = Text::open(directory.path()).unwrap();
         let limits = ProbeLimits::for_candidates(5_000);

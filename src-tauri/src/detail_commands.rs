@@ -16,6 +16,16 @@ fn require_synchronized_evidence(events: &Option<serde_json::Value>) -> Result<(
     Ok(())
 }
 
+fn validate_capture_request(case_key: Option<&str>, case_content_token: Option<&str>) -> Result<(), String> {
+    match (case_key, case_content_token) {
+        (None, None) => (),
+        (Some(key), Some(token)) if !key.is_empty() && key.len() <= 512
+            && !token.is_empty() && token.len() <= 128 => (),
+        _ => return Err("CASE_DETAIL_ADMISSION: Informe a chave e o recibo atuais de case_sync apenas ao consultar evidências do Caso.".into()),
+    }
+    Ok(())
+}
+
 fn capture(
     state: &AppState,
     identity: Option<Identity>,
@@ -23,12 +33,7 @@ fn capture(
     case_key: Option<String>,
     case_content_token: Option<String>,
 ) -> Result<Admission, String> {
-    match (case_key.as_deref(), case_content_token.as_deref()) {
-        (None, None) => (),
-        (Some(key), Some(token)) if !key.is_empty() && key.len() <= 512
-            && !token.is_empty() && token.len() <= 128 => (),
-        _ => return Err("CASE_DETAIL_ADMISSION: Informe a chave e o recibo atuais de case_sync apenas ao consultar evidências do Caso.".into()),
-    }
+    validate_capture_request(case_key.as_deref(), case_content_token.as_deref())?;
     // There is no inline Event argument: a detail refers to one synchronized
     // publication, including replacement under the same key/id/event_ref.
     let (admitted, events) = analysis_runtime::capture_case_shared(state, identity, generation, None, case_key)?;
@@ -139,9 +144,12 @@ pub(crate) async fn java_trace_detail(
 ) -> Result<JavaTraceDetail, String> {
     require_synchronized_evidence(&case_events)?;
     if event_ref.is_empty() { return Err("Informe a referência exata do registro para interpretar a stack trace.".into()); }
-    let Admission { admitted, events } = capture(
-        app.state::<AppState>().inner(), analysis_context, source_generation, case_key, case_content_token,
-    )?;
+    validate_capture_request(case_key.as_deref(), case_content_token.as_deref())?;
+    let pin = analysis_runtime::CapturePin::for_case(app.state::<AppState>().inner(), analysis_context, source_generation, false, case_key.as_deref())?;
+    let (admitted, events) = analysis_runtime::capture_prepared(app.clone(), pin, operation_id.clone(), crate::global_scheduler::Priority::Interactive, move |state, pin| {
+        let Admission { admitted, events } = capture(state, pin.identity(), pin.generation(), case_key, case_content_token)?;
+        Ok((admitted, events))
+    }).await?;
     let captured = Arc::clone(&admitted);
     crate::offload_case_record(operation_id, app.clone(), admitted, events, id, Some(event_ref.clone()), move |events| {
         java_trace_in_admission(app.state::<AppState>().inner(), &captured, id, &event_ref, events)
@@ -162,9 +170,12 @@ pub(crate) async fn event_detail(
     app: AppHandle,
 ) -> Result<Option<Event>, String> {
     require_synchronized_evidence(&case_events)?;
-    let Admission { admitted, events } = capture(
-        app.state::<AppState>().inner(), analysis_context, source_generation, case_key, case_content_token,
-    )?;
+    validate_capture_request(case_key.as_deref(), case_content_token.as_deref())?;
+    let pin = analysis_runtime::CapturePin::for_case(app.state::<AppState>().inner(), analysis_context, source_generation, false, case_key.as_deref())?;
+    let (admitted, events) = analysis_runtime::capture_prepared(app.clone(), pin, operation_id.clone(), crate::global_scheduler::Priority::Interactive, move |state, pin| {
+        let Admission { admitted, events } = capture(state, pin.identity(), pin.generation(), case_key, case_content_token)?;
+        Ok((admitted, events))
+    }).await?;
     let captured = Arc::clone(&admitted);
     crate::offload_case_record(operation_id, app.clone(), admitted, events, id, event_ref.clone(), move |events| {
         detail_in_admission(app.state::<AppState>().inner(), &captured, id, event_ref.as_deref(), events)

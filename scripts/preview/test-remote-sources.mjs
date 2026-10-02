@@ -29,7 +29,10 @@ try {
     assert.equal(await page.evaluate(()=>WorkspaceContext.scope()),'dataset','Opening sources returns to Analysis');
     result.contextRouting=true;
   }else await page.getByRole("button", { name: "Conexões", exact: true }).first().click();
-  await page.waitForFunction(() => !!window.__remoteMock && !WorkspaceContext.changing && document.body.dataset.page === "connections" && document.querySelector("#rs-secret-note").textContent.includes("Desmarcado"));
+  await page.waitForFunction(() => !!window.__remoteMock && !WorkspaceContext.changing && document.body.dataset.page === "connections");
+  assert.equal(await page.locator("#rs-list").isVisible(), false, "Global vault requires an explicit opening");
+  await page.locator("#rs-reload").click();
+  await page.waitForFunction(() => document.querySelector("#rs-secret-note").textContent.includes("Desmarcado"));
   phase = "connection form";
   await page.locator("#rs-name").fill("Produção · API");
   await page.locator("#rs-url").fill("https://elastic.example.test:9200");
@@ -51,6 +54,9 @@ try {
   await page.waitForFunction(() => document.body.dataset.page === "sources");
   assert.equal(await page.locator("#rs-password").inputValue(), "");
   await openConnections();
+  await page.waitForFunction(() => !!document.querySelector("#rs-url").value);
+  assert.equal(await page.locator("#rs-list").isVisible(), false);
+  await page.locator("#rs-reload").click();
   assert.equal(await page.locator("#rs-password").inputValue(), "");
   result.secretOutsideCase = await page.evaluate(() => !JSON.stringify(state.cases).includes("fixture-secret-only") && !JSON.stringify({ ...localStorage }).includes("fixture-secret-only"));
   assert.equal(result.secretOutsideCase, true);
@@ -111,6 +117,8 @@ try {
   assert.equal(result.importRequest.maxRecords, 100000); assert.ok(result.importRequest.from.endsWith("Z")); assert.deepEqual(result.importRequest.query, { match: { "service.name": "api" } }); assert.equal(result.importRequest.passwordProvided, false);
 
   await openConnections();
+  await page.waitForFunction(() => !document.querySelector("#rs-delete").hidden);
+  await page.locator("#rs-reload").click();
   await page.locator("#rs-delete").click(); await idle();
   assert.equal(await page.locator("#rs-list .remote-connection").count(), 0);
   result.deleteKeepsSnapshot = await page.evaluate(paths => {

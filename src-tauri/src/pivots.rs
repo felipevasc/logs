@@ -195,7 +195,7 @@ pub async fn timeline_lanes(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Lanes, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         lanes_impl(
             app.state::<AppState>().inner(),
@@ -340,7 +340,7 @@ pub async fn entity_summary(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Vec<EntityGroup>, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         entity_summary_impl(app.state::<AppState>().inner(), filters, limit.unwrap_or(50), case_events.as_deref())
     })
@@ -427,7 +427,7 @@ pub fn sightings_impl(state: &AppState, values: Vec<String>, filters: Vec<Filter
 
 #[tauri::command]
 pub async fn ioc_sightings(values: Vec<String>, filters: Vec<Filter>, app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<Sighting>, String> {
-    let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_admitted(None, app.clone(), admitted, move || sightings_impl(app.state::<AppState>().inner(), values, filters)).await?
 }
 
@@ -521,9 +521,8 @@ pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
             }
         }
     }
-    use rayon::prelude::*;
     let token = crate::operations::current_token();
-    let results: Vec<Result<(String, SourceHash, bool), String>> = jobs.into_par_iter().map(|(cache_key, id, path, name, physical, origin)| {
+    let results: Vec<Result<(String, SourceHash, bool), String>> = crate::global_scheduler::map(jobs, |(cache_key, id, path, name, physical, origin)| {
         crate::operations::run_with_token(token.clone(), || -> Result<(String, SourceHash, bool), String> {
             if let Some((_, hit)) = HASHES.lock().iter().find(|(key, _)| *key == cache_key) {
                 // Digest reuse must not reuse a previous display alias/name.
@@ -532,7 +531,7 @@ pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
             let (sha256, bytes) = sha256_file(&physical)?;
             Ok((cache_key, SourceHash { id, path, name, bytes, sha256, origin: origin.into() }, true))
         })?
-    }).collect();
+    });
     let results: Vec<_> = results.into_iter().collect::<Result<_, _>>()?;
     // This guard applies to cache hits too. Nothing computed from an altered
     // original enters HASHES, and no stale loaded ID labels newer source bytes.
@@ -549,7 +548,7 @@ pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
 
 #[tauri::command]
 pub async fn source_hashes(app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<SourceHash>, String> {
-    let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_admitted(None, app.clone(), admitted, move || hashes_impl(app.state::<AppState>().inner())).await?
 }
 

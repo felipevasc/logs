@@ -65,7 +65,7 @@ function fixture() {
     api: (command, args, options) => { const pending = deferred(); requests.push({ command, args: plain(args), options, ...pending }); return pending.promise; },
     toast: (text, type) => messages.push({ text, type }), invalidateAnalysisComputedData: value => invalidated.push(value), refresh() {},
     btnBusy: button => { button.disabled = true; return () => { button.disabled = false; }; },
-    showLoadOverlay: (...args) => { state.loadOverlayVersion = (state.loadOverlayVersion || 0) + 1; state.loadOverlayProgressKey = args[1]; overlays.push(args); }, hideLoadOverlay: value => overlays.push(value),
+    showLoadOverlay: (...args) => { state.loadOverlay = true; state.loadOverlayVersion = (state.loadOverlayVersion || 0) + 1; state.loadOverlayProgressKey = args[1]; overlays.push(args); }, hideLoadOverlay: value => { state.loadOverlay = false; overlays.push(value); },
   });
   vm.runInContext(section('// ------------------------------------------------------------------ data/hora', '// ------------------------------------------------------------------ campo derivado'), context);
   vm.runInContext(section('async function openTsModal(', 'function setColumnVisible('), context);
@@ -264,4 +264,21 @@ test('an example from a different file in the bundle is not shown for the indivi
 test('close does not focus a detached caller or displace deliberate outside focus', async () => {
   const f = fixture(); await f.read(A); f.trigger.remove(); f.$('#ts-close').focus(); f.context.closeTsModal(); assert.notEqual(f.document.activeElement, f.trigger);
   await f.read(A); f.outside.focus(); f.context.closeTsModal(); assert.equal(f.document.activeElement, f.outside);
+});
+test('same exact timestamp path is read with a different captured owner in each Case', async () => {
+  const f = fixture(); await f.read(A, configured); assert.equal(f.requests[0].options.analysisOwner.caseId, 'case-a');
+  f.context.closeTsModal(); f.state.cases.active = 'case-b'; await f.read(A, known);
+  assert.equal(f.requests[1].args.path, A); assert.equal(f.requests[1].options.analysisOwner.caseId, 'case-b'); assert.deepEqual(f.config(), known);
+});
+test('Case transition retires the timestamp overlay before an old failure can repaint it', async () => {
+  const f = fixture(); await f.read(A, configured); const applying = f.context.applyTsConfig();
+  f.state.cases.active = 'case-b'; f.state.loadOverlay = false; f.requests[1].reject(Error('old A failure')); await applying;
+  assert.equal(f.messages.length, 0); assert.equal(f.overlays.length, 1);
+});
+test('Case navigation immediately disables a timestamp draft and labels its original ownership', async () => {
+  const f = fixture(); await f.read(A, configured); f.state.cases.active = 'case-b';
+  Object.assign(f.context, { codesEditorSession: null, formatEditor: null });
+  vm.runInContext(section('function refreshCaseEditorOwnership()', '// ------------------------------------------------------------------ configurações / MCP'), f.context);
+  f.context.refreshCaseEditorOwnership();
+  assert.deepEqual(f.config(), configured); assert.equal(f.$('#ts-apply').disabled, true); assert.equal(f.$('#ts-test').disabled, true); assert.match(f.$('#ts-status').textContent, /contexto de origem/);
 });

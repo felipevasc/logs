@@ -117,7 +117,11 @@ static NAMED: LazyLock<Mutex<NamedRegistry>> =
 
 #[derive(Clone)]
 pub(crate) struct Cancellation {
+    execution: Option<crate::global_scheduler::Execution>,
+    priority: crate::global_scheduler::Priority,
     analysis: Option<Arc<crate::analysis_runtime::Admitted>>,
+    resource_policy: Option<Arc<crate::case_resources::Policy>>,
+    compiling_security: Option<Arc<crate::case_security::Settings>>,
     generation: Option<u64>,
     local: Option<Arc<Local>>,
     report_id: Option<String>,
@@ -127,6 +131,7 @@ pub(crate) struct Cancellation {
     child_stops: Vec<Arc<AtomicBool>>,
 }
 impl Cancellation {
+    pub(crate) fn with_priority(mut self, priority: crate::global_scheduler::Priority) -> Self { self.priority = priority; self }
     pub(crate) fn cancelled(&self) -> bool {
         self.child_stops.iter().any(|stop| stop.load(Ordering::Relaxed))
             || self.generation.is_some_and(|g| g != generation())
@@ -210,7 +215,10 @@ pub(crate) fn token(id: Option<String>) -> Result<Cancellation, String> {
     });
     named.live.insert(id, Arc::downgrade(&local));
     Ok(Cancellation {
+        execution: None, priority: crate::global_scheduler::Priority::Normal,
         analysis: crate::analysis_runtime::current(),
+        resource_policy: crate::case_resources::captured_override(),
+        compiling_security: crate::case_security::captured_compiling(),
         generation: Some(generation()),
         local: Some(local),
         report_id: None,
@@ -222,7 +230,10 @@ pub(crate) fn token(id: Option<String>) -> Result<Cancellation, String> {
 }
 pub(crate) fn current_token() -> Cancellation {
     Cancellation {
+        execution: crate::global_scheduler::current(), priority: crate::global_scheduler::Priority::Normal,
         analysis: crate::analysis_runtime::current(),
+        resource_policy: crate::case_resources::captured_override(),
+        compiling_security: crate::case_security::captured_compiling(),
         generation: current_generation(),
         local: LOCAL.with(|s| s.borrow().clone()),
         report_id: current_id(),
@@ -280,8 +291,10 @@ pub fn commit() {
     LOCAL.with(|s| *s.borrow_mut() = None);
     CHILD_STOPS.with(|s| s.borrow_mut().clear());
 }
-pub(crate) fn run_with_token<T>(token: Cancellation, f: impl FnOnce() -> T) -> Result<T, String> {
-    let _running = admit_running()?;
+/// Install captured operation/Case context without admitting, checking or
+/// transforming the closure result. Budgeted Rayon lanes use this scope so
+/// cancellation remains cooperative and never becomes an artificial panic.
+pub(crate) fn with_context<T>(token: Cancellation, f: impl FnOnce() -> T) -> T {
     struct Reset(Option<u64>, Option<Arc<Local>>, Option<String>, Option<Reporter>, Option<Instant>, Option<Arc<Mutex<PhaseClock>>>, Vec<Arc<AtomicBool>>);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -304,15 +317,29 @@ pub(crate) fn run_with_token<T>(token: Cancellation, f: impl FnOnce() -> T) -> R
         REPORT_PHASE.with(|s| s.replace(Some(token.report_phase.unwrap_or_else(|| Arc::new(Mutex::new(None)))))),
         CHILD_STOPS.with(|s| s.replace(token.child_stops)),
     );
-    check()?;
-    let result = crate::analysis_runtime::with(token.analysis, f);
-    check()?;
-    Ok(result)
+    crate::analysis_runtime::with(token.analysis, || crate::case_resources::with_optional(token.resource_policy,
+        || crate::case_security::with_compiling(token.compiling_security, f)))
+}
+
+pub(crate) fn run_with_token<T>(token: Cancellation, f: impl FnOnce() -> T) -> Result<T, String> {
+    let _running = admit_running()?;
+    let execution = token.execution.clone();
+    let priority = token.priority;
+    with_context(token, || {
+        check()?;
+        let _interactive = (priority == crate::global_scheduler::Priority::Interactive).then(interactive);
+        let result = crate::global_scheduler::run(execution, priority, &cancelled, f)?;
+        check()?;
+        Ok(result)
+    })
 }
 pub fn run<T>(generation: u64, f: impl FnOnce() -> T) -> Result<T, String> {
     run_with_token(
         Cancellation {
+        execution: crate::global_scheduler::current(), priority: crate::global_scheduler::Priority::Normal,
             analysis: crate::analysis_runtime::current(),
+        resource_policy: crate::case_resources::captured_override(),
+        compiling_security: crate::case_security::captured_compiling(),
             generation: Some(generation),
             local: LOCAL.with(|s| s.borrow().clone()),
             report_id: current_id(),
@@ -474,10 +501,11 @@ mod tests {
                 progress("stream", "Lendo", 0, 0, 0);
                 let stop = Arc::new(AtomicBool::new(false));
                 let child = current_token().with_stop(Arc::clone(&stop));
-                assert!(std::thread::spawn(move || run_with_token(child, || {
+                let worker = std::thread::spawn(move || run_with_token(child, || {
                     progress("stream", "Lendo", 1, 0, 1);
                     stop.store(true, Ordering::Relaxed);
-                })).join().unwrap().is_err());
+                }));
+                assert!(crate::global_scheduler::blocking(|| worker.join()).unwrap().is_err());
                 assert!(!cancelled());
                 progress("done", "Pronto", 1, 1, 1);
             });

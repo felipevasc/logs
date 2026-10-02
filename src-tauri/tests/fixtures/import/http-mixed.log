@@ -1,0 +1,7 @@
+203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] "GET /api?q=a%20b&n=2 HTTP/1.1" 200 512
+2026/10/02 13:20:30 [error] 77#88: *99 upstream timed out (110: Connection timed out), client: 2001:db8::7, server: example.test, request: "GET /api?q=1,2 HTTP/1.1", upstream: "http://192.0.2.2:8080/api", host: "example.test", referrer: "https://example.test/a,b"
+{"time_local": "02/Oct/2026:10:20:30 -0300", "remote_addr": "203.0.113.9", "request": "GET /health HTTP/1.1", "status": "503", "request_id": "000123", "body_bytes_sent": 9007199254740993}
+time_local="02/Oct/2026:10:20:30 -0300" remote_addr=203.0.113.8 status=502 request="GET /health HTTP/1.1" request_time=0.1234567890123456789
+unstructured record with café
+203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] "-" 400 - "-" "-"
+203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] "GET / HTTP/1.1" 200 1 "-" "client" request_time=0.001 upstream_addr="[2001:db8::8]:8080" request_id=000012345678901234567890 status=502 tag=a tag=b

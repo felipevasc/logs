@@ -75,8 +75,8 @@ try{
   assert.match(await page.locator('#ex-preview-count').textContent(),/^2[.\s]?000 registro/);
   await page.locator('#ex-label').fill('Firewall em revisão');await page.locator('#ex-reason').fill('Todos os registros do recorte capturado, com procedência preservada.');
   await page.locator('#ex-commit').click();await page.waitForFunction(()=>document.querySelector('#exclusion-modal').hidden);await countIs(0);
-  phase='Case isolation';await page.evaluate(()=>newCase('Caso sem exclusões',{keepArtifact:true}));
-  await page.waitForFunction(id=>activeCase()?.id!==id&&!WorkspaceContext.changing&&!state.analysisDefinitionsPending,caseId);await countIs(baseline);
+  phase='Case isolation';const originalSource=await page.evaluate(()=>structuredClone(state.currentArtifact.source));await page.evaluate(()=>newCase('Caso sem exclusões'));
+  await page.waitForFunction(id=>activeCase()?.id!==id&&!WorkspaceContext.changing&&!state.analysisDefinitionsPending,caseId);assert.equal(await page.evaluate(()=>state.loaded),false);await page.evaluate(source=>loadData(source),originalSource);await countIs(baseline);
   await page.locator('#btn-exclusion-archive').click();await page.waitForFunction(()=>document.querySelector('#ex-batches').textContent.includes('Nenhum lote'));
   assert.equal(await page.locator('.ex-batch').count(),0);await page.locator('#ex-close').click();
   await page.evaluate(id=>WorkspaceContext.changeCase(id),caseId);await countIs(0);await clearFilters();await countIs(4000);

@@ -32,7 +32,7 @@ function fixture(){
 const exact=f=>{assert.deepEqual(Object.keys(f.stub()).sort(),['code','id','kind']);f.ctx.window.CaseEvidence.validate.document(f.ctx.state.cases);};
 function contextRoutes(f){
   const ctx=f.ctx;Object.assign(ctx,{stateKeys:[],runtimeKeys:[],scrollSelectors:[],states:new Map(),runtime:new Map(),copy:structuredClone,record:value=>value||{},cubeState:{collapsed:new Set()},defaults:()=>({page:'summary',values:{},workspace:{}}),key:value=>`${ctx.state.cases.active}:${value||'case'}`,
-    updateToggle(){},renderCaseBar(){},loadDerivedFields:async()=>f.calls.push(['loadDerivedFields',ctx.activeCase()?.id]),syncActiveCaseArtifacts:async()=>f.calls.push(['syncActiveCaseArtifacts',ctx.activeCase()?.id]),refresh:async()=>f.calls.push(['refresh',ctx.activeCase()?.id])});
+    updateToggle(){},renderCaseBar(){},resetCaseSourceState(){},loadDerivedFields:async()=>f.calls.push(['loadDerivedFields',ctx.activeCase()?.id]),syncActiveCaseArtifacts:async()=>f.calls.push(['syncActiveCaseArtifacts',ctx.activeCase()?.id]),refresh:async()=>f.calls.push(['refresh',ctx.activeCase()?.id])});
   ctx.window.Workspace={showPage:async page=>f.routes.push([ctx.activeCase()?.id,page]),capture:()=>({})};ctx.window.Tasks={cancelStaleAnalysis(){}};
   vm.runInContext('let scope="case",changing=false,generation=0,restoringCase=false,initialized=false,caseGeneration=0,sourceBusy=0,sourceQueue=Promise.resolve(),caseReturnScope="dataset",detailRequest=0;',ctx);
   vm.runInContext(part(workspace,'  function capture()','  // Loaded source'),ctx);vm.runInContext(part(workspace,'  function sourceRuntime(','  function stored('),ctx);

@@ -96,6 +96,10 @@ pub(crate) fn open_with_progress(path: &str, format: &str, custom: Option<Custom
 }
 
 pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::path::Path, progress: crate::metadata_checkpoint::Reporter<'_>) -> Result<FileIndex, String> {
+    open_prepared_at_with_policy(prepared, dir, progress, crate::metadata_checkpoint::CheckpointPolicy::configured())
+}
+
+pub(crate) fn open_prepared_at_with_policy(prepared: &sources::PreparedIndex, dir: &std::path::Path, progress: crate::metadata_checkpoint::Reporter<'_>, policy: crate::metadata_checkpoint::CheckpointPolicy) -> Result<FileIndex, String> {
     use crate::metadata_checkpoint::{report, Journal, OpenError, Progress, Resume};
     let key = prepared.key()?;
     prepared.validate()?;
@@ -129,7 +133,7 @@ pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::pat
     let mut sink = |lines: &mut crate::metadata_store::LineBuilder, cursor, scan_complete, columns: Option<&[String]>| -> Result<(), String> {
         prepared.validate()?;
         if let Some(active) = journal.as_mut() {
-            if let Err(error) = active.checkpoint_rows(lines, cursor, scan_complete, columns, Some(&forward), &|| prepared.validate()) {
+            if let Err(error) = active.checkpoint_if_due(policy, lines, cursor, scan_complete, columns, Some(&forward), &|| prepared.validate()) {
                 crate::operations::check()?;
                 // A changed source is fatal even if the persistence operation
                 // failed at the same time. Never continue a mixed generation.

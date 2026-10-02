@@ -129,7 +129,7 @@ fn saved_path(
     hash.update(env!("CARGO_PKG_VERSION"));
     hash.update(crate::analysis_runtime::cache_namespace());
     hash.update(source);
-    hash.update(detections::fingerprint().to_le_bytes());
+    hash.update(detections::fingerprint());
     hash.update(serde_json::to_string(settings).unwrap_or_default());
     hash.update(catalog.map(|c| c.signature()).unwrap_or_default());
     hash.update(format!("{derived:?}{expired:?}"));
@@ -231,7 +231,7 @@ pub async fn triage_timeline(
     end: i64,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let case = case_events;
         timeline_impl(
@@ -415,7 +415,7 @@ pub async fn triage(
     tactic: Option<String>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         let events = case_events;
@@ -445,7 +445,7 @@ pub async fn triage_episode(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |_case_events| {
         detections::cached_analysis(&analysis_id).ok_or("Análise expirada; recarregue a triagem")?.episode_members(
             &episode_id,
@@ -492,7 +492,7 @@ pub async fn triage_evidence_event(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Event, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let case = case_events;
         evidence_event_impl(
@@ -606,7 +606,7 @@ pub async fn event_insights(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<EventInsights, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let case = case_events;
         if crate::analysis_runtime::visibility_restricted() {
@@ -634,11 +634,13 @@ pub async fn normalization_preview(
     event: Event,
     mappings: Vec<crate::security_normalize::SourceMapping>,
 ) -> Result<serde_json::Value, String> {
-    crate::security_normalize::validate_mappings(&mappings)?;
-    let (_, normalized) = crate::security_normalize::normalize(&event, &mappings);
-    let mut value = serde_json::to_value(normalized).map_err(|e| e.to_string())?;
-    crate::workspace::redact_value(&mut value);
-    Ok(value)
+    crate::offload(move || {
+        crate::security_normalize::validate_mappings(&mappings)?;
+        let (_, normalized) = crate::security_normalize::normalize(&event, &mappings);
+        let mut value = serde_json::to_value(normalized).map_err(|e| e.to_string())?;
+        crate::workspace::redact_value(&mut value);
+        Ok(value)
+    }).await?
 }
 
 #[derive(Serialize)]
@@ -664,6 +666,7 @@ pub struct RulesOverview {
     pub sigma_errors: Vec<String>,
     pub sigma_dir: String,
     pub settings: Settings,
+    pub custom_rules_json: Option<String>,
 }
 
 pub fn rules_impl() -> Result<RulesOverview, String> {
@@ -683,7 +686,12 @@ pub fn rules_impl() -> Result<RulesOverview, String> {
             retired: !r.def.enabled,
             evidence_level: r.def.evidence.assessed_level(),
             evidence_label: crate::evidence::label(r.def.evidence.assessed_level()).into(),
-            attack: r.def.attack.iter().map(|t| crate::attack::reference(t, &r.def.tactics)).collect(),
+            attack: r
+                .def
+                .attack
+                .iter()
+                .map(|t| crate::attack::reference(t, &r.def.tactics))
+                .collect(),
             evidence: r.def.evidence.clone(),
             provenance: r.def.provenance.clone(),
         })
@@ -692,122 +700,170 @@ pub fn rules_impl() -> Result<RulesOverview, String> {
     Ok(RulesOverview {
         rules,
         sigma_errors: set.sigma_errors.clone(),
-        sigma_dir: detections::sigma_dir().to_string_lossy().into_owned(),
+        sigma_dir: "Fontes Sigma preservadas neste Caso".into(),
         settings,
+        custom_rules_json: crate::case_security::with(|snapshot| {
+            snapshot.custom_rules_json.clone()
+        }),
     })
 }
 
 #[tauri::command]
-pub async fn detection_rules() -> Result<RulesOverview, String> {
-    crate::offload(rules_impl).await?
+pub async fn detection_rules(
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: AppHandle,
+) -> Result<RulesOverview, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, rules_impl).await?
 }
 
-pub fn save_settings_impl(settings: Settings) -> Result<(), String> {
-    detections::save_settings(&settings)?;
-    detections::invalidate();
-    detections::clear_cache();
-    Ok(())
+pub fn save_settings_impl(
+    settings: Settings,
+    custom_rules_json: Option<String>,
+) -> Result<crate::analysis_commands::MutationReceipt, String> {
+    let expected = crate::analysis_commands::expected_identity(None)?;
+    let domain = if custom_rules_json.is_some() { "security_rules" } else { "security_settings" };
+    let snapshot = crate::case_interpretation::update_domain(&expected, domain, |interpretation| {
+        detections::validate_settings(&settings, &interpretation.security.detection_settings()?)?;
+        interpretation.security.detection_settings_json =
+            serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+        if let Some(text) = custom_rules_json {
+            interpretation.security.custom_rules_json = (!text.trim().is_empty()).then_some(text);
+        }
+        Ok(())
+    })?;
+    Ok(crate::analysis_commands::MutationReceipt {
+        analysis_context: snapshot,
+    })
 }
-
 #[tauri::command]
-pub async fn detection_settings_save(settings: Settings) -> Result<(), String> {
-    crate::offload(move || save_settings_impl(settings)).await?
+pub async fn detection_settings_save(
+    settings: Settings,
+    custom_rules_json: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: AppHandle,
+) -> Result<crate::analysis_commands::MutationReceipt, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, move || {
+        save_settings_impl(settings, custom_rules_json)
+    })
+    .await?
 }
-
 #[derive(Serialize)]
 pub struct SigmaImport {
     pub imported: usize,
     pub rules: usize,
     pub failed: Vec<String>,
+    #[serde(rename = "analysisContext")]
+    #[serde(serialize_with = "crate::analysis_context::serialize_management_snapshot")]
+    pub analysis_context: crate::analysis_context::Snapshot,
 }
 
 pub fn sigma_import_impl(paths: Vec<String>) -> Result<SigmaImport, String> {
-    let target = detections::sigma_dir();
-    std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+    let expected = crate::analysis_commands::expected_identity(None)?;
+    if paths.len() > crate::case_security::MAX_SIGMA_FILES {
+        return Err("Selecione até 512 arquivos Sigma.".into());
+    }
     let mut files = Vec::new();
     for path in paths {
+        crate::operations::check()?;
         let path = std::path::PathBuf::from(path);
         if path.is_dir() {
             files.extend(crate::sigma::rule_files(&path));
         } else if path.is_file() {
             files.push(path);
         }
-    }
-    let mut prepared = Vec::new();
-    let mut unique = std::collections::HashSet::new();
-    let mut texts = Vec::new();
-    for file in crate::sigma::rule_files(&target) {
-        let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
-        if unique.insert(text.clone()) {
-            texts.push(text);
+        if files.len() > crate::case_security::MAX_SIGMA_FILES {
+            return Err("Importação Sigma excede 512 arquivos.".into());
         }
     }
-    let previous = crate::sigma::load_dir(&target).0.len();
+    // Read all selected bytes before the transaction. No global files are changed.
+    let mut prepared = Vec::new();
+    let mut bytes = 0usize;
     for file in files {
         crate::operations::check()?;
-        let name = file.file_name().ok_or("Arquivo sem nome")?.to_string_lossy().into_owned();
-        let text = std::fs::read_to_string(&file).map_err(|e| format!("{name}: {e}"))?;
-        if unique.insert(text.clone()) {
-            texts.push(text.clone());
-            prepared.push((name, text));
+        let name = file
+            .file_name()
+            .ok_or("Arquivo sem nome")?
+            .to_string_lossy()
+            .into_owned();
+        let text = crate::case_security::read_bounded(&file)?;
+        bytes = bytes.saturating_add(text.len());
+        if bytes > 2 << 20 {
+            return Err("Importação Sigma excede 2 MiB.".into());
         }
+        prepared.push(crate::case_security::SigmaSource { name, text });
     }
-    if prepared.is_empty() {
-        return Ok(SigmaImport { imported: 0, rules: 0, failed: vec![] });
-    }
-    // Resolve dependencies across the entire batch before publishing any file.
-    let found = crate::sigma::convert_texts(texts.iter().map(String::as_str))?;
-    let mut published = Vec::new();
-    let publish = (|| -> Result<(), String> {
-        for (name, text) in &prepared {
-            crate::operations::check()?;
-            let mut destination = target.join(name);
-            let mut n = 1;
-            while destination.exists() {
-                destination =
-                    target.join(format!("{}-{n}.yml", name.trim_end_matches(".yml").trim_end_matches(".yaml")));
-                n += 1;
+    let (mut imported, mut rules) = (0, 0);
+    let snapshot = crate::case_interpretation::update_domain(&expected, "security_sigma", |interpretation| {
+        let sources = &mut interpretation.security.sigma_sources;
+        let previous = if sources.is_empty() {
+            0
+        } else {
+            crate::sigma::convert_texts(sources.iter().map(|s| s.text.as_str()))?.len()
+        };
+        let mut unique: std::collections::HashSet<_> =
+            sources.iter().map(|s| s.text.clone()).collect();
+        for source in prepared {
+            if unique.insert(source.text.clone()) {
+                sources.push(source);
+                imported += 1;
             }
-            let pending = destination.with_extension("pending");
-            std::fs::write(&pending, text).map_err(|e| e.to_string())?;
-            if let Err(e) = std::fs::rename(&pending, &destination) {
-                let _ = std::fs::remove_file(&pending);
-                return Err(e.to_string());
-            }
-            published.push(destination);
+        }
+        if !sources.is_empty() {
+            rules = crate::sigma::convert_texts(sources.iter().map(|s| s.text.as_str()))?
+                .len()
+                .saturating_sub(previous);
         }
         Ok(())
-    })();
-    if let Err(error) = publish {
-        for path in published {
-            let _ = std::fs::remove_file(path);
-        }
-        return Err(error);
-    }
-    let imported = prepared.len();
-    let rules = found.len().saturating_sub(previous);
-    let failed = Vec::new();
-    detections::invalidate();
-    detections::clear_cache();
-    Ok(SigmaImport { imported, rules, failed })
+    })?;
+    Ok(SigmaImport {
+        imported,
+        rules,
+        failed: vec![],
+        analysis_context: snapshot,
+    })
 }
-
 #[tauri::command]
-pub async fn sigma_import(paths: Vec<String>) -> Result<SigmaImport, String> {
-    crate::offload(move || sigma_import_impl(paths)).await?
+pub async fn sigma_import(
+    paths: Vec<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: AppHandle,
+) -> Result<SigmaImport, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, move || sigma_import_impl(paths)).await?
 }
-
-pub fn sigma_clear_impl() -> Result<(), String> {
-    let dir = detections::sigma_dir();
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
-    }
-    detections::invalidate();
-    detections::clear_cache();
-    Ok(())
+pub fn sigma_clear_impl() -> Result<crate::analysis_commands::MutationReceipt, String> {
+    let expected = crate::analysis_commands::expected_identity(None)?;
+    let snapshot = crate::case_interpretation::update_domain(&expected, "security_sigma", |interpretation| {
+        interpretation.security.sigma_sources.clear();
+        Ok(())
+    })?;
+    Ok(crate::analysis_commands::MutationReceipt {
+        analysis_context: snapshot,
+    })
 }
-
 #[tauri::command]
-pub async fn sigma_clear() -> Result<(), String> {
-    crate::offload(sigma_clear_impl).await?
+pub async fn sigma_clear(
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: AppHandle,
+) -> Result<crate::analysis_commands::MutationReceipt, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, sigma_clear_impl).await?
 }

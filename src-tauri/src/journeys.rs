@@ -254,8 +254,8 @@ fn with_view<T>(
 ) -> Result<T, String> {
     crate::workspace::validate(filters)?;
     let source = crate::analysis_runtime::source(&state);
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
+    let codes = crate::analysis_runtime::codes(&state);
+    let system = crate::analysis_runtime::system_codes(&state);
     let derived = crate::analysis_runtime::derived(&state);
     let records = if let Some(events) = case {
         Records::Memory(events)
@@ -559,7 +559,7 @@ pub async fn journey_fields(
     app: tauri::AppHandle,
     operation_id: Option<String>,
 ) -> Result<Vec<JourneyField>, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         fields_impl(
             app.state::<AppState>().inner(),
@@ -586,7 +586,7 @@ pub async fn journey_index(
     app: tauri::AppHandle,
     operation_id: Option<String>,
 ) -> Result<JourneyIndex, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let filters = window_filters(&field, filters, from, to)?;
         index_impl(
@@ -618,7 +618,7 @@ pub async fn journey_events(
     app: tauri::AppHandle,
     operation_id: Option<String>,
 ) -> Result<JourneyEvents, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         events_impl(
             app.state::<AppState>().inner(),

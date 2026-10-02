@@ -1,0 +1,68 @@
+/* Synthetic transport: verifies UI state and restart semantics, not native RSS,
+   scheduler concurrency, atomic persistence or the installed WebView. */
+import assert from "node:assert/strict";
+import { mkdir } from "node:fs/promises";
+import { launchBrowser } from "./browser.mjs";
+const browser = await launchBrowser();
+const url = process.argv[2] || "http://127.0.0.1:4173";
+try {
+  const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+  const errors = []; page.on("pageerror", error => errors.push(error.message));
+  await page.goto(url);
+  await page.waitForFunction(() => window.ResourceSettings && state.loaded && !state.loadOverlay);
+  await page.evaluate(() => openSettings("resources"));
+  const pane = page.locator("#settings-pane-resources");
+  const mode = pane.locator("#resource-memory-mode"), memory = pane.locator("#resource-memory-limit");
+  const save = pane.getByRole("button", { name: "Salvar para próximo início", exact: true });
+  await mode.waitFor(); assert.equal(await mode.inputValue(), "automatic");
+  assert.equal(await memory.isDisabled(), true);
+  const before = await page.evaluate(() => ({ revision: state.datasetRevision, ids: state.rows.map(row => row.id), artifact: state.currentArtifact?.id }));
+  await mode.selectOption("custom"); await memory.fill("512");
+  await pane.locator("#resource-parallelism-mode").selectOption("custom");
+  await pane.locator("#resource-parallelism-limit").fill("2");
+  await page.getByRole("tab", { name: "Interface", exact: true }).click();
+  await page.getByRole("tab", { name: "Recursos", exact: true }).click();
+  assert.equal(await memory.inputValue(), "512", "tab switches retain unsaved edits");
+  await page.evaluate(() => { window.__mockLatency = { resource_settings_save: 250 }; });
+  await save.click(); assert.equal(await mode.isDisabled(), true);
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => document.querySelector("#resource-settings-feedback")?.textContent.includes("Preferência salva"));
+  assert.equal(await page.locator("#settings-modal").isHidden(), true, "save receipt does not reopen dismissed settings");
+  await page.evaluate(() => openSettings("resources"));
+  assert.match(await pane.textContent(), /aguardando o próximo início/);
+  assert.match(await pane.textContent(), /Orçamento de referência ativo: 2\.730 MiB/);
+  assert.match(await pane.textContent(), /Paralelismo global ativo: 7/);
+  assert.deepEqual(await page.evaluate(() => ({ revision: state.datasetRevision, ids: state.rows.map(row => row.id), artifact: state.currentArtifact?.id })), before);
+  assert.equal(await page.evaluate(() => window.__mockCommandCalls.resource_settings_save), 1);
+
+  await memory.fill("127"); await save.click();
+  assert.match(await pane.textContent(), /entre 128 e 4096/);
+  assert.equal(await page.evaluate(() => window.__mockCommandCalls.resource_settings_save), 1);
+  await memory.fill("256");
+  await page.evaluate(() => { window.__mockFailures = { resource_settings_save: "disk full" }; });
+  await save.click(); await page.waitForFunction(() => document.querySelector("#resource-settings-feedback")?.textContent.includes("disk full"));
+  assert.equal(await memory.inputValue(), "256"); assert.equal(await memory.isDisabled(), false);
+  await page.evaluate(() => { window.__mockFailures = {}; });
+  await pane.getByRole("button", { name: "Descartar alterações não salvas" }).click();
+  assert.equal(await memory.inputValue(), "512");
+
+  await page.reload();
+  await page.waitForFunction(() => window.ResourceSettings && state.loaded && !state.loadOverlay);
+  await page.evaluate(() => openSettings("resources")); await mode.waitFor();
+  assert.equal(await memory.inputValue(), "512");
+  assert.match(await pane.textContent(), /Orçamento de referência ativo: 512 MiB/);
+  assert.doesNotMatch(await pane.textContent(), /aguardando o próximo início/);
+  assert.match(await pane.textContent(), /não reserva RAM/);
+  assert.match(await pane.textContent(), /Paralelismo global ativo: 2/);
+  assert.match(await pane.textContent(), /não é a contagem total de threads/);
+  await page.setViewportSize({ width: 400, height: 850 });
+  assert.equal(await pane.evaluate(element => element.scrollWidth <= element.clientWidth + 1), true, "resource controls do not overflow narrow pane");
+  await mkdir(new URL("../../output/playwright/", import.meta.url), { recursive: true });
+  await page.screenshot({ path: new URL("../../output/playwright/resource-settings.png", import.meta.url).pathname });
+  await mode.selectOption("automatic");
+  await pane.locator("#resource-parallelism-mode").selectOption("automatic"); await save.click();
+  await page.waitForFunction(() => document.querySelector("#resource-settings-feedback")?.textContent.includes("Preferência salva"));
+  assert.match(await pane.textContent(), /aguardando o próximo início/);
+  assert.deepEqual(errors, []);
+  console.log("Resource settings: input, tab/close/reopen, pending save, failed save, unchanged query, synthetic restart and narrow layout passed");
+} finally { await browser.close(); }

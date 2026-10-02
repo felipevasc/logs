@@ -26,6 +26,7 @@
   <link rel="stylesheet" href="case-trails.css" />
   <link rel="stylesheet" href="security.css" />
   <link rel="stylesheet" href="updates.css" />
+  <link rel="stylesheet" href="resource-settings.css" />
 </head>
 <body>
   <nav class="workspace-nav" aria-label="Navegação principal">
@@ -901,7 +902,7 @@
       <div class="modal-body">
         <p class="muted small">
           <code>fonte → código → nome/descrição</code>; <code>"*"</code> vale para todas as fontes.
-          Arquivo: <code id="codes-path"></code>
+          Arquivo legado/modelo do aplicativo (não é o catálogo deste Caso): <code id="codes-path"></code>
         </p>
         <div class="sys-catalog">
           <span>
@@ -955,6 +956,9 @@
         <button class="settings-tab" data-settings-tab="updates" type="button" role="tab">
           <i class="fas fa-rotate"></i> Atualizações
         </button>
+        <button class="settings-tab" data-settings-tab="resources" type="button" role="tab">
+          <i class="fas fa-microchip"></i> Recursos
+        </button>
       </div>
       <div class="modal-body">
         <section id="settings-pane-interface" class="settings-pane" role="tabpanel"></section>
@@ -963,6 +967,7 @@
         <section id="settings-pane-detection" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-recovery" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-updates" class="settings-pane" role="tabpanel" hidden></section>
+        <section id="settings-pane-resources" class="settings-pane" role="tabpanel" hidden></section>
       </div>
     </div>
   </div>
@@ -1090,5 +1095,6 @@
   <script src="case-intel.js"></script>
   <script src="command-palette.js"></script>
   <script src="updates.js"></script>
+  <script src="resource-settings.js"></script>
 </body>
 </html>

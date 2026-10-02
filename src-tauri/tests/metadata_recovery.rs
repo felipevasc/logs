@@ -1,5 +1,6 @@
 //! Real-process recovery plus exact metadata/materialized-event parity. Tiny
-//! waves exercise production checkpoints without generating large fixtures.
+//! waves and explicit tiny durability thresholds exercise the production policy
+//! without generating large fixtures. smallWaves alone does not change policy.
 use loginsight_lib::testkit;
 use serde_json::{json, Value};
 use std::cell::Cell;
@@ -15,6 +16,12 @@ fn probe(
     options: &Value,
     progress: &dyn Fn(Value),
 ) -> Result<Value, String> {
+    let mut options = options.clone();
+    if options["smallWaves"].as_bool().unwrap_or(true) {
+        for (key, value) in [("checkpointRows", 8), ("checkpointSourceBytes", 1024), ("checkpointElapsedMs", 60000)] {
+            if options.get(key).is_none() { options[key] = value.into(); }
+        }
+    }
     testkit::metadata_probe(
         path.to_str().unwrap(),
         format,
@@ -239,6 +246,69 @@ fn multiline_tail_can_resume_with_no_sealed_record_yet() {
 }
 
 #[test]
+fn cancellation_at_each_commit_gate_restores_exactly_the_manifest_prefix() {
+    for phase in ["metadata-checkpoint-write", "metadata-checkpoint-sync", "metadata-checkpoint-publish",
+                  "metadata-checkpoint-manifest-ready", "metadata-checkpoint-committed"] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.jsonl");
+        std::fs::write(&path, jsonl(73)).unwrap();
+        let cache = root.path().join("cache");
+        let expected = oracle(&path, "jsonl", &cache, json!({}));
+        let id = format!("commit-gate-{}", uuid::Uuid::new_v4());
+        let durable = Cell::new(0u64);
+        let cancelled = Cell::new(false);
+        let result = probe(&path, "jsonl", &cache, &json!({"operationId":id}), &|p| {
+            let target = p["phaseId"] == phase && durable.get() > 0 && !cancelled.get();
+            if p["phaseId"] == "metadata-checkpoint-committed" {
+                durable.set(p["checkpointRows"].as_u64().unwrap());
+            }
+            if target {
+                cancelled.set(true);
+                assert!(testkit::cancel_metadata_probe(&id));
+            }
+        });
+        assert!(cancelled.get() && result.is_err(), "{phase} did not cancel at the second checkpoint");
+        let state: Value = serde_json::from_slice(&std::fs::read(files(&cache, "state").pop().unwrap()).unwrap()).unwrap();
+        assert_eq!(state["state"]["sealed_rows"], durable.get(), "{phase} published an unexpected prefix");
+        let resumed = probe(&path, "jsonl", &cache, &json!({}), &|_| {}).unwrap();
+        equivalent(&resumed, &expected);
+        assert_eq!(resumed["resumedRows"], durable.get());
+        assert_eq!(resumed["parsedRows"].as_u64().unwrap() + durable.get(), 73);
+        assert_eq!(std::fs::metadata(files(&cache, "lines").pop().unwrap()).unwrap().len(), 72 + 27 * 73);
+        let warm = probe(&path, "jsonl", &cache, &json!({}), &|_| {}).unwrap();
+        equivalent(&warm, &expected);
+        assert_eq!(warm["parsedRows"], 0);
+    }
+}
+
+#[test]
+fn deferred_small_waves_and_rollback_preserve_identical_results() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.jsonl");
+    std::fs::write(&path, jsonl(73)).unwrap();
+    let mut results = Vec::new();
+    let mut counts = Vec::new();
+    for (name, options) in [
+        ("wave", json!({"checkpointPolicy":"wave", "checkpointRows":1, "checkpointSourceBytes":1})),
+        ("batched", json!({"checkpointPolicy":"batched", "checkpointRows":16, "checkpointSourceBytes":4096})),
+    ] {
+        let cache = root.path().join(name);
+        let waves = Cell::new(0);
+        let commits = Cell::new(0);
+        let result = probe(&path, "jsonl", &cache, &options, &|p| {
+            if p["phaseId"] == "metadata-scan" && p["parsedRows"].as_u64().unwrap() > 0 { waves.set(waves.get() + 1); }
+            if p["phaseId"] == "metadata-checkpoint-committed" { commits.set(commits.get() + 1); }
+        }).unwrap();
+        assert!(commits.get() > 2, "fixture must cross multiple data checkpoints");
+        counts.push((waves.get(), commits.get()));
+        results.push(result);
+    }
+    equivalent(&results[0], &results[1]);
+    assert_eq!(counts[0].0, counts[1].0, "policy must not change parser waves");
+    assert!(counts[1].1 < counts[0].1, "batched policy must defer small waves");
+}
+
+#[test]
 fn raw_eof_checkpoint_survives_cancelled_column_discovery_and_restore() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("source.jsonl");
@@ -392,6 +462,9 @@ fn malformed_array_suffix_never_publishes_a_complete_index() {
 }
 
 fn child(root: &Path, mode: &str) -> Child {
+    child_format(root, mode, "jsonl")
+}
+fn child_format(root: &Path, mode: &str, format: &str) -> Child {
     Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -401,6 +474,7 @@ fn child(root: &Path, mode: &str) -> Child {
         ])
         .env("LOGINSIGHT_METADATA_TEST_ROOT", root)
         .env("LOGINSIGHT_METADATA_TEST_MODE", mode)
+        .env("LOGINSIGHT_METADATA_TEST_FORMAT", format)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -429,17 +503,23 @@ fn metadata_process_worker() {
     };
     let root = PathBuf::from(root);
     let mode = std::env::var("LOGINSIGHT_METADATA_TEST_MODE").unwrap();
+    let format = std::env::var("LOGINSIGHT_METADATA_TEST_FORMAT").unwrap_or_else(|_| "jsonl".into());
     let committed = Cell::new(false);
     let result = probe(
         &root.join("source.jsonl"),
-        "jsonl",
+        &format,
         &root.join("cache"),
         &json!({}),
         &|p| {
-            let hold = mode == "after-commit" && p["phaseId"] == "metadata-checkpoint-committed"
-                || mode == "after-data-sync"
-                    && committed.get()
-                    && p["phaseId"] == "metadata-checkpoint-publish";
+            let gate = match mode.as_str() {
+                "before-data-write" => "metadata-checkpoint-write",
+                "before-data-sync" => "metadata-checkpoint-sync",
+                "after-data-sync" => "metadata-checkpoint-publish",
+                "after-manifest-sync" => "metadata-checkpoint-manifest-ready",
+                "after-commit" => "metadata-checkpoint-committed",
+                _ => "",
+            };
+            let hold = committed.get() && p["phaseId"] == gate;
             if p["phaseId"] == "metadata-checkpoint-committed" {
                 committed.set(true);
             }
@@ -461,7 +541,7 @@ fn metadata_process_worker() {
 
 #[test]
 fn killed_process_resumes_without_reparsing_committed_rows_and_lock_protects_pruning() {
-    for mode in ["after-commit", "after-data-sync"] {
+    for mode in ["before-data-write", "before-data-sync", "after-data-sync", "after-manifest-sync", "after-commit"] {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("source.jsonl");
         std::fs::write(&path, jsonl(73)).unwrap();
@@ -474,6 +554,7 @@ fn killed_process_resumes_without_reparsing_committed_rows_and_lock_protects_pru
         assert!(marker["checkpointRows"].as_u64().unwrap() > 0);
         let state = files(&cache, "state").pop().unwrap();
         let old_state = std::fs::read(&state).unwrap();
+        let durable = serde_json::from_slice::<Value>(&old_state).unwrap()["state"]["sealed_rows"].as_u64().unwrap();
         testkit::prune_metadata_probe(cache.to_str().unwrap(), 0);
         assert_eq!(
             std::fs::read(&state).unwrap(),
@@ -497,7 +578,7 @@ fn killed_process_resumes_without_reparsing_committed_rows_and_lock_protects_pru
                 .unwrap();
         let resumed = result.unwrap();
         equivalent(&resumed, &expected);
-        assert!(resumed["resumedRows"].as_u64().unwrap() > 0);
+        assert_eq!(resumed["resumedRows"], durable, "{mode} reused a different prefix");
         assert_eq!(
             resumed["parsedRows"].as_u64().unwrap() + resumed["resumedRows"].as_u64().unwrap(),
             resumed["rows"].as_u64().unwrap()
@@ -510,6 +591,34 @@ fn killed_process_resumes_without_reparsing_committed_rows_and_lock_protects_pru
             serde_json::from_slice(&std::fs::read(root.path().join("result.json")).unwrap())
                 .unwrap();
         assert_eq!(result.unwrap()["parsedRows"], 0);
+    }
+}
+
+#[test]
+fn killed_process_preserves_mutable_multiline_tail_at_each_commit_gate() {
+    for mode in ["before-data-write", "before-data-sync", "after-data-sync", "after-manifest-sync", "after-commit"] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.jsonl");
+        let text = format!("2026-09-30 12:00:00,001 ERROR [main] a.Service - first\n{}2026-09-30 12:00:01,001 INFO [main] a.Service - second\n",
+            (0..170).map(|i| format!("\tat a.Service.call(Service.java:{i})\n")).collect::<String>());
+        std::fs::write(&path, text).unwrap();
+        let cache = root.path().join("cache");
+        let expected = oracle(&path, "log4j", &cache, json!({}));
+        let mut writer = child_format(root.path(), mode, "log4j");
+        wait_marker(&mut writer, &root.path().join("ready"));
+        let state: Value = serde_json::from_slice(&std::fs::read(files(&cache, "state").pop().unwrap()).unwrap()).unwrap();
+        assert_eq!(state["state"]["sealed_rows"], 0, "first long record must still be mutable");
+        assert!(state["state"]["tail"].is_object());
+        writer.kill().unwrap();
+        assert!(!writer.wait().unwrap().success());
+        let mut restarted = child_format(root.path(), "finish", "log4j");
+        assert!(restarted.wait().unwrap().success());
+        let result: Result<Value, String> = serde_json::from_slice(&std::fs::read(root.path().join("result.json")).unwrap()).unwrap();
+        let resumed = result.unwrap();
+        equivalent(&resumed, &expected);
+        assert_eq!(resumed["resumedRows"], 0);
+        assert_eq!(resumed["parsedRows"], 1, "{mode} reparsed or skipped the preserved multiline tail");
+        assert_eq!(resumed["rows"], 2);
     }
 }
 
@@ -532,6 +641,32 @@ fn unavailable_cache_reports_degradation_without_claiming_durable_rows() {
     assert_eq!(actual["rows"], 40);
     assert_eq!(actual["resumedRows"], 0);
     equivalent(&actual, &oracle(&path, "jsonl", &cache, json!({})));
+}
+
+#[test]
+fn deferred_wave_keeps_source_validation_and_cancellation_checks() {
+    for change_source in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.jsonl");
+        std::fs::write(&path, jsonl(40)).unwrap();
+        let cache = root.path().join("cache");
+        let id = format!("deferred-check-{}", uuid::Uuid::new_v4());
+        let changed = Cell::new(false);
+        let options = json!({"operationId":id,"checkpointRows":1000,"checkpointSourceBytes":1048576});
+        let result = probe(&path, "jsonl", &cache, &options, &|p| {
+            if p["phaseId"] == "metadata-scan" && p["parsedRows"].as_u64().unwrap() > 0 && !changed.replace(true) {
+                if change_source {
+                    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(jsonl(1).as_bytes()).unwrap();
+                } else { assert!(testkit::cancel_metadata_probe(&id)); }
+            }
+        });
+        assert!(changed.get() && result.is_err());
+        assert!(files(&cache, "state").is_empty(), "deferred wave must not publish after invalidation/cancel");
+        let fresh = probe(&path, "jsonl", &cache, &json!({}), &|_| {}).unwrap();
+        assert_eq!(fresh["rows"], if change_source { 41 } else { 40 });
+        assert_eq!(fresh["resumedRows"], 0);
+        equivalent(&fresh, &oracle(&path, "jsonl", &cache, json!({})));
+    }
 }
 
 #[test]

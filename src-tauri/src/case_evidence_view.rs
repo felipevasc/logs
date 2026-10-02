@@ -61,13 +61,27 @@ fn context(conn: &Connection, case: &mut Value, lease: &mut Lease) -> Result<(),
     if bytes > 4 << 20 {
         return Err(LIMIT.into());
     }
-    add_credit(lease, bytes.checked_mul(2).ok_or(LIMIT)?)?;
+    let _scratch = crate::case_cache::reserve_work(lease.pool(), bytes.checked_mul(3).and_then(|n| n.checked_add(64 << 10)).ok_or(LIMIT)?)?;
     let text:String=conn.query_row("SELECT CASE WHEN octet_length(body)=?2 THEN body END FROM case_analysis WHERE case_id=?1",rusqlite::params![id,bytes],|row|row.get(0)).map_err(|e|e.to_string())?;
     let raw = RawJson::checked_with_limit(&text, 4 << 20)?;
-    add_credit(
-        lease,
-        decode::preflight_metadata(raw)?.materialization_credit,
-    )?;
+    let mut projected = String::from("{");
+    let mut first = true;
+    let mut interpretation_seen = false;
+    let mut members = raw.members()?;
+    while let Some(field) = members.next()? {
+        if field.key.len() <= 128 && field.key()? == "interpretation" {
+            if interpretation_seen { return Err("CASE_EVIDENCE_DUPLICATE_KEY".into()); }
+            interpretation_seen = true;
+            continue;
+        }
+        if !first { projected.push(','); }
+        first = false;
+        projected.push_str(field.key); projected.push(':'); projected.push_str(field.value.get());
+    }
+    projected.push('}');
+    let raw = RawJson::checked_with_limit(&projected, 4 << 20)?;
+    add_credit(lease, projected.len().checked_mul(2).ok_or(LIMIT)?)?;
+    add_credit(lease, decode::preflight_metadata(raw)?.materialization_credit)?;
     let value = decode::MetadataDecoder::new().value(raw)?;
     if value.get("caseId").and_then(Value::as_str) != Some(id) {
         return Err(INVALID.into());
@@ -198,6 +212,10 @@ pub(crate) fn load_view(root: &Path) -> Result<LoadedView, String> {
     bootstrap(root)?;
     crate::operations::check()?;
     let root_guard = crate::case_recovery::RootLease::shared(root, &prepare::root_work())?;
+    {
+        let mut migration = authority::connect_readwrite(root)?;
+        crate::case_interpretation::initialize_native(&mut migration, root)?;
+    }
     let conn = authority::connect_readonly(root)?;
     conn.execute_batch("BEGIN DEFERRED")
         .map_err(|e| e.to_string())?;
@@ -385,4 +403,35 @@ mod tests {
         assert_eq!(json_size(&view, actual).unwrap(), actual);
         assert!(json_size(&view, actual - 1).is_err());
     }
+    #[test]
+    fn six_large_case_settings_do_not_expand_management_or_metadata_save_payloads() {
+        let (root, _, _) = authority::tests::fixture();
+        let loaded = load_view(root.path()).unwrap();
+        let mut document = serde_json::to_value(&loaded).unwrap();
+        for n in 0..6 { document["cases"].as_array_mut().unwrap().push(serde_json::json!({"id":format!("large-{n}"),"name":"Large settings","items":[]})); }
+        save_view(root.path(), &SaveViewRequest { request_id: "large-settings-create".into(), expected_store: loaded.document().store.clone(), document_json: document.to_string() }).unwrap();
+        drop(loaded);
+        for n in 0..6 {
+            let id = format!("large-{n}");
+            let conn = crate::case_store::context_connection(root.path()).unwrap();
+            let snapshot = crate::analysis_context::read(&conn, &id).unwrap(); drop(conn);
+            crate::case_interpretation::update_at(root.path(), &snapshot.identity(), |settings| {
+                settings.codes = serde_json::from_value(serde_json::json!({"application":{"1":{"name":format!("owner-{n}"),"description":"x".repeat(2_800_000)}}})).unwrap(); Ok(())
+            }).unwrap();
+        }
+        let loaded = load_view(root.path()).unwrap();
+        let mut document = serde_json::to_value(&loaded).unwrap();
+        assert!(document["cases"].as_array().unwrap().iter().all(|case| case["analysisContext"].get("interpretation").is_none()));
+        assert!(document.to_string().len() < 128 << 10, "the all-Case DTO excludes catalog payloads");
+        document["cases"][1]["name"] = serde_json::json!("Changed authored metadata");
+        save_view(root.path(), &SaveViewRequest { request_id: "large-settings-metadata".into(), expected_store: loaded.document().store.clone(), document_json: document.to_string() }).unwrap();
+        for n in 0..6 {
+            let conn = crate::case_store::context_connection(root.path()).unwrap();
+            let snapshot = crate::analysis_context::read(&conn, &format!("large-{n}")).unwrap();
+            let settings = snapshot.interpretation.unwrap();
+            assert_eq!(settings.codes.sources["application"]["1"].description.len(), 2_800_000);
+            assert_eq!(settings.codes.sources["application"]["1"].name, format!("owner-{n}"));
+        }
+    }
+
 }

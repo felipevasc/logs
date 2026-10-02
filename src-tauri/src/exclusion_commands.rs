@@ -312,13 +312,11 @@ pub(crate) async fn exclusion_preview(
     operation_id: Option<String>,
 ) -> Result<PreviewReply, String> {
     require_enabled()?;
-    let (admitted, events) = crate::analysis_runtime::capture_case(
-        app.state::<crate::AppState>().inner(),
+    let (admitted, events) = crate::analysis_runtime::capture_case_async(app.clone(),
         Some(analysis_context),
         source_generation,
         case_events,
-        case_key,
-    )?;
+        case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     let captured = admitted.clone();
     crate::offload_case(operation_id, app.clone(), admitted, events, move |events| {
         prepare_preview(
@@ -450,14 +448,15 @@ pub(crate) async fn exclusion_archive_page(
     case_key: Option<String>,
     operation_id: Option<String>,
 ) -> Result<ArchiveReply, String> {
-    let source = crate::analysis_runtime::capture_archive_case(
-        app.state::<crate::AppState>().inner(),
-        analysis_context.clone(),
-        source_generation,
-        case_events,
-        case_key,
-    )?;
+    // Pin the live receipt even when the requested generation has already
+    // closed: archive hydration may report it unavailable, never adopt B.
+    let mode = if case_events.is_some() || case_key.is_some() { crate::analysis_runtime::Mode::Case } else { crate::analysis_runtime::Mode::Publish };
+    let pin = crate::analysis_runtime::CapturePin::new(app.state::<crate::AppState>().inner(), Some(analysis_context.clone()), None, mode, if case_events.is_some() { None } else { case_key.as_deref() })?;
     offload_archive(operation_id, app.clone(), move || {
+        let state = app.state::<crate::AppState>();
+        pin.validate(state.inner())?;
+        let source = crate::analysis_runtime::capture_archive_case(state.inner(), analysis_context.clone(), source_generation.or(pin.generation()), case_events, case_key)?;
+        pin.validate(state.inner())?;
         let page = exclusion_store::archive_page(
             &crate::config_dir(),
             &analysis_context,

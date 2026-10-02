@@ -228,7 +228,7 @@ impl LineMeta {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CodeInfo {
     pub name: String,
     #[serde(default)]
@@ -236,7 +236,7 @@ pub struct CodeInfo {
 }
 
 /// Mapa de enriquecimento: fonte ("*" = qualquer) -> código -> nome/descrição.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CodesConfig {
     #[serde(flatten)]
     pub sources: HashMap<String, HashMap<String, CodeInfo>>,

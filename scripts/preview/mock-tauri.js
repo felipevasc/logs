@@ -9,6 +9,29 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
   // marcador ANTES do app rodar: só pula o auto-load se a store já existia ao abrir a página
   const hadStore = !!window.__mockNativeCaseBootstrapEnabled || !!localStorage.getItem("__mockStore");
 
+  // Synthetic restart-only resource preferences. These values do not measure
+  // browser RAM or native engines; reloading the preview simulates app restart.
+  const resourceDefault = { schemaVersion: 1, mode: "automatic", memoryLimitMib: null, parallelismLimit: null };
+  const resourceRead = () => {
+    try { return { ...resourceDefault, ...JSON.parse(localStorage.getItem("__mockResourceSettings")) }; }
+    catch { return resourceDefault; }
+  };
+  const resourceStartup = structuredClone(resourceRead());
+  const resourceBudget = resourceStartup.mode === "custom" ? resourceStartup.memoryLimitMib : 2730;
+  const resourceStatus = () => {
+    const saved = resourceRead();
+    return {
+      active: { memoryAvailableMib: 8192, memoryBudgetMib: resourceBudget, duckdbPerInstanceMib: Math.floor(resourceBudget / 4),
+        textIndexMib: Math.floor(resourceBudget / 8), selectionCacheMib: Math.floor(resourceBudget / 8),
+        globalParallelism: Math.min(resourceStartup.parallelismLimit ?? 7, 8), maximumParallelism: 8,
+        parserThreads: 4, queryThreadsPerSession: 3, textThreads: 1, environmentOverrideMib: null,
+        invalidEnvironmentOverride: false, conservativeBuilder: resourceBudget < 2730 },
+      activePreferences: resourceStartup, saved, minimumMemoryMib: 128, maximumMemoryMib: 4096, maximumParallelism: 8,
+      restartRequired: saved.mode !== resourceStartup.mode || saved.memoryLimitMib !== resourceStartup.memoryLimitMib || saved.parallelismLimit !== resourceStartup.parallelismLimit,
+      startupWarning: null, savedWarning: null,
+    };
+  };
+
   // ---------------------------------------------------------------- dataset
   const LEVELS = ["Informação", "Informação", "Informação", "Aviso", "Erro", "Crítico", "Depuração"];
   const SOURCES = ["API", "Worker", "Auth", "Scheduler"];
@@ -136,12 +159,13 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     COLUMNS.push(...Object.keys(values), "native_missing");
     window.__mockCanonicalFixture = { id: event.id, eventRef: event.event_ref, values };
   }
+  const baseSourceEvents = structuredClone(events), baseSourceColumns = [...COLUMNS];
   const loadedParts = ["mock.jsonl (preview)"];
   const derivedFields = [];
   const mockCalls = {};
   window.__mockCalls = mockCalls;
   let merged = false;
-  let sourceGeneration = 0, sourceOperationId = null;
+  let sourceGeneration = 0, sourceOperationId = null, sourceAnalysisContext = null;
   let sourceInputs = [{ kind: "file", paths: ["C:\\mock\\mock.jsonl"], format: "auto" }];
 
   // lote de uma segunda fonte para a opção "Unir"
@@ -582,7 +606,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     },
     clear_events: () => { events.length = 0; COLUMNS = []; return null; },
     source_snapshot: () => ({
-      generation: sourceGeneration, operationId: sourceOperationId,
+      generation: sourceGeneration, operationId: sourceOperationId, analysisContext: sourceAnalysisContext,
       count: events.length, columns: events.length ? [...COLUMNS] : [],
       sourceDesc: events.length ? loadedParts.join(" + ") : "",
       sourceNames: events.length ? [...loadedParts] : [], sources: events.length ? structuredClone(sourceInputs) : [],
@@ -595,6 +619,13 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     }),
     // The preview cannot zoom the browser; screenshots emulate a scale with the viewport.
     ui_zoom: () => false,
+    resource_settings_status: () => resourceStatus(),
+    resource_settings_save: ({ preferences }) => {
+      const valid = window.ResourceSettings.preferences(preferences.mode, String(preferences.memoryLimitMib), 4096, preferences.parallelismLimit, 8);
+      if (preferences.schemaVersion !== 1) throw Error("Versão de configuração não suportada.");
+      localStorage.setItem("__mockResourceSettings", JSON.stringify(valid));
+      return resourceStatus();
+    },
     // Updates (updates.js): nothing is announced unless a test sets window.__mockUpdate = { version, notes },
     // so the dialog never covers other previews.
     update_status: () => updateStatus(),
@@ -681,6 +712,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
       ],
     }),
     load_file: ({ merge } = {}) => {
+      if (!events.length) { events.push(...structuredClone(baseSourceEvents)); COLUMNS = [...baseSourceColumns]; merged = false; loadedParts.splice(0, loadedParts.length, "mock.jsonl (preview)"); }
       if (merge && !merged) appendFirewallBatch();
       return {
         count: events.length,
@@ -805,7 +837,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
 
   // ---------------------------------------------------------------- security (preview)
   const caseStore = new Map(); let casePublication = 0;
-  const detectionSettings = { disabled: [], suppress: [], threats: true };
+  const defaultDetectionSettings = () => ({ disabled: [], suppress: [], threats: true, mappings: [], coverage: [] });
   const MOCK_RULES = [
     { id: "auth.bruteforce.source", name: "Força bruta de senha", severity: "medium", kind: "threshold", attack: [{ id: "T1110.001", name: "Adivinhação de senha", tactics: ["credential-access"] }], description: "Muitas falhas de autenticação da mesma origem." },
     { id: "auth.bruteforce.success", name: "Acesso após força bruta", severity: "high", kind: "sequence", attack: [{ id: "T1110", name: "Força bruta", tactics: ["credential-access"] }, { id: "T1078", name: "Contas válidas", tactics: ["initial-access", "persistence"] }], description: "Falhas seguidas de acesso bem-sucedido da mesma origem." },
@@ -825,7 +857,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
   }
   const ipOf = ev => ev.fields?.ip_cliente || "";
   const scopeOf = ip => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip) ? "privado" : "público";
-  function mockTriage(rows) {
+  function mockTriage(rows, detectionSettings = defaultDetectionSettings()) {
     rows.forEach(e => e.event_ref ||= `preview:${e.id}`);
     const enabled = MOCK_RULES.filter(r => !detectionSettings.disabled.includes(r.id));
     const byIp = new Map();
@@ -881,10 +913,6 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
       const logon = event.code === "4624" || event.code === "4625";
       return { entities, action: logon ? "logon" : null, action_label: logon ? "Autenticação" : null, outcome: event.code === "4625" ? "failure" : event.code === "4624" ? "success" : null, decoded: [], threats: [], rules: event.code === "4625" ? [{ id: "auth.bruteforce.source", name: "Força bruta de senha", severity: "medium", kind: "builtin", attack: MOCK_RULES[0].attack }] : [] };
     },
-    detection_rules: () => ({ rules: MOCK_RULES.map(r => ({ ...r, origin: "builtin", enabled: !detectionSettings.disabled.includes(r.id) })), sigma_errors: [], sigma_dir: "C:\\mock\\LogInsight\\sigma", settings: structuredClone(detectionSettings) }),
-    detection_settings_save: ({ settings }) => { Object.assign(detectionSettings, structuredClone(settings)); return null; },
-    sigma_import: ({ paths }) => ({ imported: paths.length, rules: paths.length, failed: [] }),
-    sigma_clear: () => null,
     timeline_lanes: ({ filters, start, end, bucketCount, column, limit = 8, caseEvents }) => {
       let count = Math.max(1, Math.min(240, bucketCount || 120));
       const width = Math.max(1, Math.ceil((end - start + 1) / count)); count = Math.min(count, Math.floor((end - start) / width) + 1);
@@ -955,6 +983,85 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     const value = analysisContexts.get(args.analysisContext.caseId);
     if (!value || JSON.stringify(analysisIdentity(value)) !== JSON.stringify(analysisIdentity(args.analysisContext))) throw Error("ANALYSIS_CONTEXT_CHANGED: Atualize a configuração do Caso.");
     return value;
+  };
+  // These editor fixtures mirror Case-effective settings and CAS receipts.
+  const defaultInterpretation = () => ({ schemaVersion: 1, codes: {}, systemCodes: {}, timestamps: {}, formats: [] });
+  const interpretationFor = args => {
+    const context = analysisFor(args); if (!context) throw Error("ANALYSIS_CONTEXT_CHANGED: Escolha um Caso antes de editar.");
+    return { context, settings: structuredClone(context.interpretation || defaultInterpretation()) };
+  };
+  const saveInterpretation = (context, settings) => {
+    context.interpretation = settings; context.configRevision++;
+    const saved = localStorage.getItem("__mockStore");
+    if (saved) { const data = JSON.parse(saved), item = data.cases?.find(value => value.id === context.caseId); if (item) { item.analysisContext = structuredClone(context); localStorage.setItem("__mockStore", JSON.stringify(data)); } }
+    return { analysisContext: structuredClone(context) };
+  };
+  // Synthetic Case resource receipts. Native tests verify actual reservations.
+  const caseResourceStatus = context => {
+    const preferences = structuredClone(context.interpretation?.resources || { schemaVersion: 1, mode: "inherit", workLimitMib: null });
+    const limit = Math.min(preferences.workLimitMib ?? 1152, 1152);
+    return { analysisContext: structuredClone(context), preferences,
+      effective: { accountedLimitMib: limit, accountedUsedBytes: 0, workLiveMib: Math.min(limit, 128), materializedMib: Math.min(limit, 64),
+        selectionMib: Math.min(limit, 1024), selectionCacheMib: Math.min(limit, 128), collectedIdsMib: Math.min(limit, 32), analyticsMib: Math.min(limit, 32),
+        applicationWorkMib: 128, applicationSelectionMib: 1024 }, minimumWorkMib: 8, maximumWorkMib: 1152,
+      clamped: preferences.workLimitMib != null && preferences.workLimitMib > 1152 };
+  };
+  handlers.case_resource_settings_status = ({ identity }) => {
+    const context = analysisFor({ analysisContext: identity });
+    if (!context) throw Error("Escolha um Caso antes de configurar recursos.");
+    return caseResourceStatus(context);
+  };
+  handlers.case_resource_settings_save = ({ expected, preferences }) => {
+    const { context, settings } = interpretationFor({ analysisContext: expected });
+    if (preferences.schemaVersion !== 1) throw Error("Versão de recursos do Caso não suportada.");
+    settings.resources = window.ResourceSettings.casePreferences(preferences.mode, String(preferences.workLimitMib), 8192);
+    saveInterpretation(context, settings);
+    return caseResourceStatus(context);
+  };
+  const securityFor = args => {
+    const value = interpretationFor(args);
+    value.settings.security ||= { detectionSettingsJson: JSON.stringify(defaultDetectionSettings()), customRulesJson: null, sigmaSources: [], threatCatalogJson: null };
+    return { ...value, security: value.settings.security };
+  };
+  handlers.detection_rules = args => { const { security } = securityFor(args), preferences = JSON.parse(security.detectionSettingsJson); return { rules: MOCK_RULES.map(r => ({ ...r, origin: "builtin", enabled: !preferences.disabled.includes(r.id) })), sigma_errors: [], sigma_dir: "Fontes Sigma deste Caso (prévia)", settings: preferences, custom_rules_json: security.customRulesJson }; };
+  handlers.detection_settings_save = args => { const { context, settings, security } = securityFor(args); security.detectionSettingsJson = JSON.stringify(args.settings); if (args.customRulesJson != null) { if (args.customRulesJson.trim()) JSON.parse(args.customRulesJson); security.customRulesJson = args.customRulesJson.trim() ? args.customRulesJson : null; } return saveInterpretation(context, settings); };
+  handlers.sigma_import = args => { securityFor(args); throw Error("A prévia não pode importar arquivos Sigma; use o aplicativo nativo."); };
+  handlers.sigma_clear = args => { const { context, settings, security } = securityFor(args); security.sigmaSources = []; return saveInterpretation(context, settings); };
+  handlers.triage = args => mockTriage(poolOf(args.caseEvents), JSON.parse(securityFor(args).security.detectionSettingsJson));
+  const threatOverride = args => { const text = securityFor(args).security.threatCatalogJson; return text ? JSON.parse(text) : null; };
+  handlers.threat_catalog = async args => { const override = threatOverride(args); return (await import('/__mock-threats__.js')).threatCatalog(override); };
+  handlers.threat_catalog_update = async args => {
+    const { context, settings, security } = securityFor(args), module = await import('/__mock-threats__.js');
+    let result;
+    if (args.catalogJson != null) { const file = JSON.parse(args.catalogJson); if (!Array.isArray(file.rules) || file.version !== 1 || !file.name) throw Error("Catálogo inválido."); security.threatCatalogJson = args.catalogJson; result = { added: 0, backup_path: null, catalog: await module.threatCatalog(file) }; }
+    else { result = await module.threatCatalogUpdate(security.threatCatalogJson ? JSON.parse(security.threatCatalogJson) : null); const { version, name, rules } = result.catalog; security.threatCatalogJson = JSON.stringify({ version, name, rules }); }
+    analysisFor(args); return { ...result, ...saveInterpretation(context, settings) };
+  };
+  handlers.threat_scan = async args => { const override = threatOverride(args); return (await import('/__mock-threats__.js')).threatScan(applyFilters((args.filters || []).filter(f => f.op !== 'threat_rule'), poolOf(args.caseEvents)), args.filters, override); };
+  handlers.threat_events = async args => { const override = threatOverride(args); return (await import('/__mock-threats__.js')).threatEvents(applyFilters((args.filters || []).filter(f => f.op !== 'threat_rule'), poolOf(args.caseEvents)), args, override); };
+  const previewValidateFilters = handlers.validate_filters;
+  handlers.validate_filters = args => { interpretationFor(args); return previewValidateFilters(args); };
+  const builtinFormats = handlers.list_formats;
+  handlers.list_formats = args => { const { settings } = interpretationFor(args); return [...builtinFormats(), ...(settings.formats || []).map(format => ({ id: `custom:${format.name}`, name: format.name }))]; };
+  handlers.get_codes = args => JSON.stringify(interpretationFor(args).settings.codes || {}, null, 2);
+  handlers.save_codes = args => { const { context, settings } = interpretationFor(args); settings.codes = JSON.parse(args.text); return saveInterpretation(context, settings); };
+  handlers.system_codes_count = args => { interpretationFor(args); return 0; };
+  handlers.harvest_codes = args => { const { context, settings } = interpretationFor(args); settings.systemCodes = {}; return { count: 0, sources: 0, ...saveInterpretation(context, settings) }; };
+  handlers.save_custom_format = args => {
+    const { context, settings } = interpretationFor(args); if (!args.name?.trim()) throw Error("Nome de formato obrigatório.");
+    settings.formats = (settings.formats || []).filter(value => value.name !== args.name);
+    settings.formats.push(Object.fromEntries(["name", "kind", "pattern", "separator", "fields"].map(key => [key, args[key]])));
+    return saveInterpretation(context, settings);
+  };
+  handlers.get_ts_config = args => structuredClone(interpretationFor(args).settings.timestamps?.[args.path] || null);
+  const previewSetTimestamp = handlers.set_ts_config;
+  handlers.set_ts_config = async args => {
+    interpretationFor(args); await previewSetTimestamp(args);
+    const { context, settings } = interpretationFor(args); settings.timestamps ||= {};
+    if (args.config == null) delete settings.timestamps[args.path]; else settings.timestamps[args.path] = structuredClone(args.config);
+    const receipt = saveInterpretation(context, settings);
+    sourceGeneration++; sourceOperationId = args.operationId || null; sourceAnalysisContext = analysisIdentity(context);
+    return { ...receipt, publication: { generation: sourceGeneration, operationId: sourceOperationId, analysisContext: structuredClone(sourceAnalysisContext) } };
   };
   const initialCasesLoad = handlers.cases_load;
   handlers.cases_load = () => {
@@ -1164,7 +1271,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
           if (scopedCommands.includes(cmd) && args.analysisContext) args = { ...args, caseEvents: analysisRows(exclusions?.visible(args.analysisContext, poolOf(args.caseEvents)) || poolOf(args.caseEvents), analysisFor(args)) };
           if(scopedCommands.includes(cmd)&&args.filters?.some(filter=>filter.op==='threat_rule')){
             const module=await import('/__mock-threats__.js');
-            args={...args,caseEvents:await module.threatFilterRows(poolOf(args.caseEvents),args.filters.filter(filter=>filter.op==='threat_rule')),filters:args.filters.filter(filter=>filter.op!=='threat_rule')};
+            args={...args,caseEvents:await module.threatFilterRows(poolOf(args.caseEvents),args.filters.filter(filter=>filter.op==='threat_rule'),threatOverride(args)),filters:args.filters.filter(filter=>filter.op!=='threat_rule')};
           }
           // latência artificial para visualizar os estados de carregamento
           if (["load_file", "load_files", "load_event_log"].includes(cmd)) await simulateLoad("mock.jsonl", 6300, args.operationId);
@@ -1176,7 +1283,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
           let result = await h(args);
           if (window.__mockExclusionsEnabled && cmd === "cases_load") for (const item of result.cases || []) for (const group of item.items || []) for (const event of group.rows || []) event.event_ref = `preview:${event.id}`;
           if (["load_file", "load_files", "load_bundle", "load_event_log", "clear_events"].includes(cmd)) {
-            sourceGeneration++; sourceOperationId = args.operationId || null;
+            sourceGeneration++; sourceOperationId = args.operationId || null; sourceAnalysisContext = args.analysisContext ? structuredClone(args.analysisContext) : null;
             const inputs = cmd === "clear_events" ? [] : cmd === "load_bundle" ? args.members
               : cmd === "load_event_log" ? [{ kind: "eventlog", channel: args.channel, maxEvents: args.maxEvents }]
               : [{ kind: "file", paths: args.paths || [args.path], format: args.format || "auto" }];

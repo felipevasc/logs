@@ -54,21 +54,103 @@ impl Budget {
 fn budget() -> &'static Budget {
     static BUDGET: OnceLock<Budget> = OnceLock::new();
     BUDGET.get_or_init(|| {
-        let requested = std::env::var("LOGINSIGHT_MEMORY_LIMIT_MB").ok().and_then(|v| {
-            let parsed = v.parse::<u64>().ok().filter(|v| *v >= 128);
-            if parsed.is_none() { eprintln!("[recursos] LOGINSIGHT_MEMORY_LIMIT_MB inválido; usando orçamento automático"); }
-            parsed
-        });
-        Budget::for_machine(total_memory(), std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2), requested)
+        // A command only saves next-start preferences. Never re-read that file
+        // here or modify process environment while engines are already running.
+        let requested = environment_memory()
+            .value
+            .or(crate::resource_settings::startup_memory_mib());
+        Budget::for_machine(
+            total_memory(),
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2),
+            requested,
+        )
     })
 }
 
-/// Shared parser pool, bounded independently of the foreground SQL executor.
+struct EnvironmentMemory {
+    value: Option<u64>,
+    invalid: bool,
+}
+fn parse_requested_memory(value: &str) -> Option<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n >= 128 && n.checked_mul(MIB).is_some())
+}
+fn environment_memory() -> &'static EnvironmentMemory {
+    static VALUE: OnceLock<EnvironmentMemory> = OnceLock::new();
+    VALUE.get_or_init(|| {
+        let raw = std::env::var_os("LOGINSIGHT_MEMORY_LIMIT_MB");
+        let value = raw.as_ref().and_then(|s| s.to_str()).and_then(parse_requested_memory);
+        let invalid = raw.is_some() && value.is_none();
+        if invalid { eprintln!("[recursos] LOGINSIGHT_MEMORY_LIMIT_MB inválido; usando a preferência salva ou automática"); }
+        EnvironmentMemory { value, invalid }
+    })
+}
+
+pub(crate) fn maximum_memory_mib(memory: u64) -> u64 {
+    (memory / 2).clamp(128 * MIB, 8 << 30) / MIB
+}
+
+/// Nominal limits of the individual engines. Concurrent SQL sessions can
+/// multiply their allocations; this is not an aggregate process/RSS quota.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Snapshot {
+    memory_available_mib: u64,
+    memory_budget_mib: u64,
+    duckdb_per_instance_mib: u64,
+    text_index_mib: u64,
+    selection_cache_mib: u64,
+    parser_threads: usize,
+    query_threads_per_session: usize,
+    text_threads: usize,
+    environment_override_mib: Option<u64>,
+    invalid_environment_override: bool,
+    conservative_builder: bool,
+    global_parallelism: usize,
+    maximum_parallelism: usize,
+}
+pub(crate) fn snapshot() -> Snapshot {
+    let b = budget();
+    Snapshot {
+        memory_available_mib: total_memory() / MIB,
+        memory_budget_mib: b.effective_bytes / MIB,
+        duckdb_per_instance_mib: b.duckdb_bytes / MIB,
+        text_index_mib: b.text_bytes / MIB,
+        selection_cache_mib: application_selection_cache_bytes() / MIB,
+        parser_threads: workers(),
+        query_threads_per_session: query_threads(),
+        text_threads: text_threads(),
+        environment_override_mib: environment_memory().value,
+        invalid_environment_override: environment_memory().invalid,
+        conservative_builder: low_memory(),
+        global_parallelism: global_parallelism(),
+        maximum_parallelism: maximum_parallelism(),
+    }
+}
+
+/// Maximum width of a parser wave, further bounded by global admission.
 pub fn workers() -> usize {
-    budget().parser_threads
+    // Preserve existing byte/row wave sizes; more global slots must not
+    // silently multiply parser metadata buffers.
+    budget().parser_threads.min(global_parallelism())
 }
 pub(crate) fn query_threads() -> usize {
-    budget().query_threads
+    // All SQL sessions share global admission; native parallelism must not
+    // multiply it. Query CPU executes in the calling reservation.
+    1
+}
+pub(crate) fn maximum_parallelism() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 64)
+}
+pub(crate) fn global_parallelism() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| crate::resource_settings::startup_parallelism_limit()
+        .unwrap_or_else(|| maximum_parallelism().saturating_sub(1).max(1))
+        .clamp(1, maximum_parallelism()))
 }
 pub(crate) fn duckdb_memory_mb() -> u64 {
     budget().duckdb_bytes / MIB
@@ -77,7 +159,7 @@ pub(crate) fn effective_bytes() -> u64 {
     budget().effective_bytes
 }
 pub(crate) fn text_threads() -> usize {
-    budget().text_threads
+    1
 }
 pub(crate) fn text_memory_bytes() -> usize {
     budget().text_bytes as usize
@@ -94,54 +176,100 @@ pub(crate) fn queue_batches() -> usize {
 /// large to retain in the interactive cache on typical desktop budgets.
 pub(crate) fn selection_bytes() -> u64 {
     #[cfg(test)]
-    if let Some(limit) = TEST_SELECTION_LIMIT.with(std::cell::Cell::get) { return limit; }
-    configured_bytes("LOGINSIGHT_SELECTION_LIMIT_MB", (total_memory() / 2).clamp(1 << 30, 8 << 30))
+    if let Some(limit) = TEST_SELECTION_LIMIT.with(std::cell::Cell::get) {
+        return limit;
+    }
+    crate::case_resources::current().map_or_else(application_selection_bytes, |policy| policy.selection_bytes())
+}
+pub(crate) fn application_selection_bytes() -> u64 {
+    configured_bytes(
+        "LOGINSIGHT_SELECTION_LIMIT_MB",
+        (total_memory() / 2).clamp(1 << 30, 8 << 30),
+    )
 }
 #[cfg(test)]
 thread_local! { static TEST_SELECTION_LIMIT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
 pub(crate) fn with_selection_limit<T>(limit: u64, f: impl FnOnce() -> T) -> T {
     struct Reset(Option<u64>);
-    impl Drop for Reset { fn drop(&mut self) { TEST_SELECTION_LIMIT.with(|c| c.set(self.0)); } }
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SELECTION_LIMIT.with(|c| c.set(self.0));
+        }
+    }
     let _reset = Reset(TEST_SELECTION_LIMIT.with(|c| c.replace(Some(limit))));
     f()
 }
 pub(crate) fn selection_cache_bytes() -> u64 {
+    crate::case_resources::current().map_or_else(application_selection_cache_bytes, |policy| policy.selection_cache_bytes())
+}
+pub(crate) fn application_selection_cache_bytes() -> u64 {
     // One 50M-ID hot selection fits on the measured 10 GiB configuration.
     // The weighted LRU evicts older broad filters instead of retaining eight.
-    configured_bytes("LOGINSIGHT_SELECTION_CACHE_MB", (budget().duckdb_bytes / 2).min(512 * MIB))
+    configured_bytes(
+        "LOGINSIGHT_SELECTION_CACHE_MB",
+        (budget().duckdb_bytes / 2).min(512 * MIB),
+    )
 }
 pub(crate) fn collected_ids_bytes() -> usize {
     #[cfg(test)]
-    if let Some(limit) = TEST_COLLECTED_LIMIT.with(std::cell::Cell::get) { return limit; }
-    configured_bytes("LOGINSIGHT_COLLECTED_IDS_MB", (budget().effective_bytes / 32).min(128 * MIB)) as usize
+    if let Some(limit) = TEST_COLLECTED_LIMIT.with(std::cell::Cell::get) {
+        return limit;
+    }
+    crate::case_resources::current().map_or_else(application_collected_ids_bytes, |policy| policy.collected_ids_bytes())
+}
+pub(crate) fn application_collected_ids_bytes() -> usize {
+    configured_bytes(
+        "LOGINSIGHT_COLLECTED_IDS_MB",
+        (budget().effective_bytes / 32).min(128 * MIB),
+    ) as usize
 }
 #[cfg(test)]
 thread_local! { static TEST_COLLECTED_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
 pub(crate) fn with_collected_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
     struct Reset(Option<usize>);
-    impl Drop for Reset { fn drop(&mut self) { TEST_COLLECTED_LIMIT.with(|c| c.set(self.0)); } }
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_COLLECTED_LIMIT.with(|c| c.set(self.0));
+        }
+    }
     let _reset = Reset(TEST_COLLECTED_LIMIT.with(|c| c.replace(Some(limit))));
     f()
 }
 pub(crate) fn analytics_bytes() -> usize {
     #[cfg(test)]
-    if let Some(limit) = TEST_ANALYTICS_LIMIT.with(std::cell::Cell::get) { return limit; }
-    configured_bytes("LOGINSIGHT_ANALYTICS_LIMIT_MB", (budget().effective_bytes / 32).min(128 * MIB)) as usize
+    if let Some(limit) = TEST_ANALYTICS_LIMIT.with(std::cell::Cell::get) {
+        return limit;
+    }
+    crate::case_resources::current().map_or_else(application_analytics_bytes, |policy| policy.analytics_bytes())
+}
+pub(crate) fn application_analytics_bytes() -> usize {
+    configured_bytes(
+        "LOGINSIGHT_ANALYTICS_LIMIT_MB",
+        (budget().effective_bytes / 32).min(128 * MIB),
+    ) as usize
 }
 #[cfg(test)]
 thread_local! { static TEST_ANALYTICS_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
 pub(crate) fn with_analytics_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
     struct Reset(Option<usize>);
-    impl Drop for Reset { fn drop(&mut self) { TEST_ANALYTICS_LIMIT.with(|c| c.set(self.0)); } }
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_ANALYTICS_LIMIT.with(|c| c.set(self.0));
+        }
+    }
     let _reset = Reset(TEST_ANALYTICS_LIMIT.with(|c| c.replace(Some(limit))));
     f()
 }
 fn configured_bytes(name: &str, fallback: u64) -> u64 {
-    std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok())
-        .and_then(|n| n.checked_mul(MIB)).filter(|&n| n > 0).unwrap_or(fallback)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .and_then(|n| n.checked_mul(MIB))
+        .filter(|&n| n > 0)
+        .unwrap_or(fallback)
 }
 
 /// A limit on DuckDB spill, separate from source/checkpoint files and memory.
@@ -169,7 +297,10 @@ pub fn total_memory() -> u64 {
 }
 
 pub fn low_memory() -> bool {
-    total_memory() < 8 << 30
+    conservative_builder(total_memory(), effective_bytes())
+}
+fn conservative_builder(memory: u64, budget: u64) -> bool {
+    memory < 8 << 30 || budget < (8u64 << 30) / 3
 }
 
 fn parse_memory_limit(value: &str) -> Option<u64> {
@@ -262,7 +393,7 @@ pub fn lower_priority() {
 /// Configures the shared thread pool once, before any parallel work.
 pub fn init() {
     let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(workers())
+        .num_threads(global_parallelism())
         .thread_name(|i| format!("loginsight-worker-{i}"))
         .start_handler(|_| lower_priority())
         .build_global();
@@ -300,7 +431,10 @@ mod tests {
         assert_eq!(transient, 4 * MIB);
         // Three SQL instances, text writer, analytical values, collected IDs,
         // retained line IDs, and two queued batches with parser copies.
-        assert!(b.duckdb_bytes * 3 + b.text_bytes + transient * 3 + b.batch_bytes as u64 * 4 <= b.effective_bytes);
+        assert!(
+            b.duckdb_bytes * 3 + b.text_bytes + transient * 3 + b.batch_bytes as u64 * 4
+                <= b.effective_bytes
+        );
         let measured = Budget::for_machine(10 << 30, 9, None);
         assert!((measured.duckdb_bytes / 2).min(512 * MIB) >= 50_000_000 * 8);
     }
@@ -309,6 +443,22 @@ mod tests {
         assert_eq!(parse_memory_limit("1073741824\n"), Some(1 << 30));
         for value in ["max", "0", "garbage", "9223372036854771712"] {
             assert_eq!(parse_memory_limit(value), None);
+        }
+    }
+    #[test]
+    fn reduced_budget_on_large_machine_uses_conservative_builder() {
+        assert!(conservative_builder(64 << 30, 256 * MIB));
+        assert!(!conservative_builder(8 << 30, (8 << 30) / 3));
+        assert!(conservative_builder(4 << 30, 8 << 30));
+        assert_eq!(maximum_memory_mib(4 << 30), 2048);
+        assert_eq!(maximum_memory_mib(64 << 30), 8192);
+        assert_eq!(maximum_memory_mib(128 * MIB), 128);
+    }
+    #[test]
+    fn environment_memory_rejects_overflow_and_invalid_limits() {
+        assert_eq!(parse_requested_memory("512"), Some(512));
+        for value in ["0", "127", "-1", "garbage", "18446744073709551615"] {
+            assert_eq!(parse_requested_memory(value), None);
         }
     }
 }

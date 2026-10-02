@@ -426,6 +426,7 @@ pub(crate) struct SaveViewReceipt {
     pub current_store: StoreStamp,
     pub evidence: Vec<EvidenceRef>,
     #[serde(deserialize_with = "native_deserialize_snapshots")]
+    #[serde(serialize_with = "crate::analysis_context::serialize_management_snapshots")]
     pub analysis_contexts: Vec<crate::analysis_context::Snapshot>,
     /// Signatures at committed_store, never relabeled as current on replay.
     pub case_evidence: Vec<CaseEvidenceState>,

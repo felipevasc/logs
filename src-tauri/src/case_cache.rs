@@ -276,7 +276,7 @@ impl NativeBuilder {
         Self::with_pool(
             authority,
             guard,
-            Arc::clone(case_work_budget::global()),
+            case_work_budget::global().request_pool(),
             crate::case_evidence::ENVELOPE_BYTES,
         )
     }
@@ -471,21 +471,32 @@ static CACHE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 /// Release only inactive retention on credit pressure. Existing consumers keep
 /// their publication token and reservation; destruction runs after unlocking.
 pub(crate) fn reserve_work(pool: &Arc<Pool>, bytes: usize) -> Result<Lease, String> {
+    let pool = pool.request_pool();
+    let mut trimmed_selections = 0u8;
     loop {
         match pool.reserve(bytes) {
             Ok(credit) => return Ok(credit),
             Err(error) if error == case_work_budget::WORK_BUSY => {
+                // Do not evict another Case to fix A's own lower quota. A
+                // global eviction is justified only by a confirmed root cap.
+                let Some(pressure) = pool.pressure(bytes) else { return Err(error); };
                 let retired = {
                     let mut cache = CACHE.lock();
                     cache
                         .iter()
                         .position(|entry| {
-                            Arc::ptr_eq(entry.events.pool(), pool)
-                                && Arc::strong_count(&entry.events) == 1
+                            Arc::strong_count(&entry.events) == 1
+                                && pool.releases_pressure(entry.events.pool(), pressure)
                         })
                         .map(|position| cache.remove(position))
                 };
                 if retired.is_none() {
+                    let bit = match pressure { case_work_budget::Pressure::Owner => 1, case_work_budget::Pressure::Aggregate => 2 };
+                    if trimmed_selections & bit == 0 {
+                        trimmed_selections |= bit;
+                        crate::engine::trim_inactive_selection_caches(None, Some((&pool, pressure)))?;
+                        continue;
+                    }
                     return Err(error);
                 }
                 drop(retired);
@@ -571,21 +582,29 @@ fn store_records(key: String, events: Records, owner: Owner) -> Result<String, S
     {
         return Err("CASE_NATIVE_AUTHORITY_REQUIRED".into());
     }
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_STORE_PUBLICATION.with(|hook| hook.borrow_mut().take()) { hook(); }
+    // Payload accounting/reservation may be expensive. Recheck cancellation
+    // under the publication guard before replacing or evicting any entry.
+    crate::operations::check()?;
     for position in (0..cache.len()).rev() {
         if cache[position].owner == owner && cache[position].key == key {
             retired.push(cache.remove(position));
         }
     }
-    while !cache.is_empty()
-        && (cache.len() >= 3
-            || retained_bytes(
-                cache
-                    .iter()
-                    .map(|entry| entry.events.as_ref())
-                    .chain(std::iter::once(shared.as_ref())),
-            ) > limit)
-    {
-        retired.push(cache.remove(0));
+    let aggregate_limit = case_work_budget::global().base_limits().retained;
+    while !cache.is_empty() {
+        let owner_pressure = retained_bytes(cache.iter().filter(|entry| entry.owner == owner)
+            .map(|entry| entry.events.as_ref()).chain(std::iter::once(shared.as_ref()))) > limit;
+        let aggregate_pressure = retained_bytes(cache.iter().map(|entry| entry.events.as_ref())
+            .chain(std::iter::once(shared.as_ref()))) > aggregate_limit;
+        if cache.len() < 3 && !owner_pressure && !aggregate_pressure { break; }
+        // A's custom retention limit cannot evict B unless a genuinely shared
+        // application limit (or the small global entry bound) is also reached.
+        let position = if owner_pressure {
+            cache.iter().position(|entry| entry.owner == owner).unwrap_or(0)
+        } else { 0 };
+        retired.push(cache.remove(position));
     }
     cache.push(Entry {
         owner,
@@ -640,6 +659,14 @@ fn resolve_for(
 ) -> Result<Option<Arc<Records>>, String> {
     resolve_for_with_token(events, key, identity).map(|(events, _)| events)
 }
+/// Capture only the publication token. Native storage validation and payload
+/// ownership are acquired later, under global work admission.
+pub(crate) fn pin_publication(key: &str, identity: Option<&crate::analysis_context::Identity>) -> Result<String, String> {
+    let owner = owner(identity);
+    CACHE.lock().iter().find(|entry| entry.owner == owner && entry.key == key)
+        .map(|entry| entry.publication.clone()).ok_or_else(|| MISS.to_string())
+}
+
 pub(crate) fn resolve_for_with_token(
     events: Option<Vec<Event>>,
     key: Option<String>,
@@ -788,6 +815,12 @@ pub(crate) fn take_for_with_token(
         .transpose()?;
     Ok((events, publication))
 }
+#[cfg(test)]
+thread_local! {
+    static AFTER_SYNC_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static BEFORE_STORE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
 #[tauri::command]
 pub async fn case_sync(
     key: String,
@@ -797,10 +830,28 @@ pub async fn case_sync(
     if key.is_empty() || key.len() > 512 {
         return Err("Chave de caso inválida.".into());
     }
-    if let Some(identity) = &analysis_context {
-        crate::analysis_runtime::validate_identity(identity)?;
-    }
-    let case_content_token = store_for(key, events, analysis_context.as_ref())?;
+    // Keep only bounded argument validation on the async command thread.
+    // The moved identity is revalidated after global queue admission, never
+    // resolved from whichever Case happens to be active when this starts.
+    crate::offload(move || case_sync_impl(key, events, analysis_context)).await?
+}
+
+fn case_sync_impl(key: String, events: Vec<Event>, analysis_context: Option<crate::analysis_context::Identity>) -> Result<SyncReceipt, String> {
+    crate::operations::check()?;
+    let policy = if let Some(identity) = &analysis_context {
+        let snapshot = crate::analysis_runtime::validate_identity(identity)?;
+        let preferences = snapshot.interpretation.as_ref().map(|settings| settings.resources.clone()).unwrap_or_default();
+        crate::case_resources::Policy::capture(Some(identity), &preferences)?
+    } else {
+        crate::case_resources::Policy::capture(None, &Default::default())?
+    };
+    crate::operations::check()?;
+    let case_content_token = crate::case_resources::with(policy, || store_for(key, events, analysis_context.as_ref()))?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_SYNC_PUBLICATION.with(|hook| hook.borrow_mut().take()) { hook(); }
+    // Once the cache changed, return its committed token even if cancellation
+    // arrived at that boundary. A retry must not hide a successful publication.
+    crate::operations::commit();
     Ok(SyncReceipt { case_content_token })
 }
 
@@ -860,6 +911,111 @@ mod tests {
             }
         }
     }
+    struct HeldSyncSlot {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for HeldSyncSlot {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() { let _ = release.send(()); }
+            if let Some(worker) = self.worker.take() { worker.join().unwrap(); }
+        }
+    }
+    #[test]
+    fn legacy_sync_waits_for_global_admission_and_queued_cancel_cannot_publish() {
+        let _directory = OwnerDirectory::new();
+        for cancelled in [false, true] {
+            let scheduler = crate::global_scheduler::Scheduler::new(1);
+            let blocker_scheduler = Arc::clone(&scheduler);
+            let (ready, started) = std::sync::mpsc::channel();
+            let (release, waiting) = std::sync::mpsc::channel();
+            let blocker = std::thread::spawn(move || crate::global_scheduler::with_scheduler(blocker_scheduler, || {
+                crate::operations::run_with_token(crate::operations::token(None).unwrap(), || {
+                    ready.send(()).unwrap();
+                    let _ = waiting.recv();
+                }).unwrap();
+            }));
+            let slot = HeldSyncSlot { release: Some(release), worker: Some(blocker) };
+            started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            let key = format!("queued-sync-{}", uuid::Uuid::new_v4());
+            let sync_key = key.clone();
+            let token = crate::operations::token(Some(id.clone())).unwrap().with_priority(crate::global_scheduler::Priority::Interactive);
+            let worker_scheduler = Arc::clone(&scheduler);
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = Arc::clone(&entered);
+            let worker = std::thread::spawn(move || crate::global_scheduler::with_scheduler(worker_scheduler, || {
+                crate::operations::run_with_token(token, || {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    assert!(crate::global_scheduler::current().is_some());
+                    case_sync_impl(sync_key, vec![Event::empty()], None)
+                }).and_then(|result| result)
+            }));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !crate::global_scheduler::with_scheduler(Arc::clone(&scheduler), crate::global_scheduler::interactive_waiting) {
+                assert!(std::time::Instant::now() < deadline, "legacy sync did not reach admission");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(!entered.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(matches!(pin_publication(&key, None), Err(error) if error == MISS));
+            if cancelled {
+                crate::operations::cancel_id(&id);
+                assert!(matches!(worker.join().unwrap(), Err(error) if error == "Operação cancelada."));
+                assert!(!entered.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(matches!(pin_publication(&key, None), Err(error) if error == MISS));
+                drop(slot);
+            } else {
+                drop(slot);
+                let receipt = worker.join().unwrap().unwrap();
+                assert_eq!(pin_publication(&key, None).unwrap(), receipt.case_content_token);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_sync_cancel_after_accounting_preserves_the_previous_publication() {
+        let _directory = OwnerDirectory::new();
+        let key = format!("preserved-sync-{}", uuid::Uuid::new_v4());
+        let previous = case_sync_impl(key.clone(), vec![Event::empty()], None).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let mut replacement = Event::empty(); replacement.raw = "replacement payload ".repeat(100_000);
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&reached);
+        let result = crate::global_scheduler::with_limit(1, || crate::operations::run_with_token(token, || {
+            BEFORE_STORE_PUBLICATION.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                // The hook runs after Records::legacy accounted/reserved the
+                // replacement and after CACHE was acquired, before mutation.
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert!(crate::operations::cancel_id(&id));
+            })));
+            case_sync_impl(key.clone(), vec![replacement], None)
+        }));
+        assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(result, Err(error) if error == "Operação cancelada."));
+        assert_eq!(pin_publication(&key, None).unwrap(), previous.case_content_token);
+        let (records, _) = resolve_for_with_token(None, Some(key), None).unwrap();
+        assert!(records.unwrap()[0].raw.is_empty(), "cancelled replacement leaked into the cache");
+    }
+
+    #[test]
+    fn successful_legacy_sync_returns_its_receipt_after_late_cancellation() {
+        let _directory = OwnerDirectory::new();
+        let id = uuid::Uuid::new_v4().to_string();
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let key = format!("committed-sync-{}", uuid::Uuid::new_v4());
+        let expected_key = key.clone();
+        let receipt = crate::global_scheduler::with_limit(1, || crate::operations::run_with_token(token, || {
+            AFTER_SYNC_PUBLICATION.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(pin_publication(&expected_key, None).is_ok(), "publication must precede the simulated cancellation");
+                assert!(crate::operations::cancel_id(&id));
+                assert!(crate::operations::cancelled());
+            })));
+            case_sync_impl(key.clone(), vec![Event::empty()], None)
+        })).unwrap().unwrap();
+        assert_eq!(pin_publication(&key, None).unwrap(), receipt.case_content_token);
+    }
+
     #[test]
     fn adopted_and_restored_owners_reject_fresh_inline_and_pre_adoption_legacy_publications() {
         for native in [false, true] {
@@ -1202,6 +1358,28 @@ mod native_publication_tests {
                 .map(|position| cache.remove(position))
         };
         drop(removed);
+    }
+
+    #[test]
+    fn owner_pressure_preserves_other_case_cache_until_aggregate_is_full() {
+        use crate::case_work_budget::OwnerCounter;
+        let limits = Limits { materialized: 64, retained: 64, live: 64 };
+        let root = Pool::new(limits);
+        let owner_a = Arc::new(OwnerCounter::default());
+        let a = Pool::child(limits, Arc::clone(&root), Arc::clone(&owner_a), 24);
+        let b = Pool::child(limits, Arc::clone(&root), Arc::new(OwnerCounter::default()), 32);
+        let active_a = a.reserve(24).unwrap();
+        let key = format!("owner-pressure-{}", uuid::Uuid::new_v4());
+        store_records(key.clone(), Records { events: Vec::new(), native: None, credit: b.reserve(32).unwrap() }, Some((key.clone(), "b".into()))).unwrap();
+        assert!(reserve_work(&a, 1).is_err());
+        assert!(CACHE.lock().iter().any(|entry| entry.key == key), "A's local pressure must leave B cached");
+        assert_eq!(root.used(), 56);
+        let expanded_a = Pool::child(limits, Arc::clone(&root), owner_a, 48);
+        let added = reserve_work(&expanded_a, 16).unwrap();
+        assert!(!CACHE.lock().iter().any(|entry| entry.key == key), "confirmed aggregate pressure can evict inactive B");
+        assert_eq!(root.used(), 40);
+        drop((active_a, added));
+        assert_eq!(root.used(), 0);
     }
 
     #[test]

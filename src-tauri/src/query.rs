@@ -1,7 +1,7 @@
+use std::sync::Arc;
 use crate::model::CodesConfig;
 use crate::model::{label_class, Event, LineMeta, LV_OTHER};
 use crate::sources::{event_at, line_bytes, CompiledDerived, FileIndex};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -396,6 +396,19 @@ pub fn matches_filter(ev: &Event, filter: &Filter) -> bool {
 }
 
 pub fn filtered_indices(events: &[Event], filters: &[Filter]) -> Vec<usize> {
+    if crate::analysis_runtime::current().is_some() {
+        let prepared = prepare(filters);
+        let mut ids = Vec::new();
+        for (id, event) in events.iter().enumerate().take_while(|_| !crate::operations::cancelled()) {
+            if prepared.iter().all(|filter| matches(event, filter)) {
+                if let Err(error) = push_collected_id(&mut ids, id) {
+                    crate::analysis_runtime::record_failure(error);
+                    return Vec::new();
+                }
+            }
+        }
+        return ids;
+    }
     if filters.is_empty() {
         return (0..events.len()).collect();
     }
@@ -804,7 +817,11 @@ pub(crate) fn push_collected_id(ids: &mut Vec<usize>, id: usize) -> Result<(), S
     check_collected_ids(ids.len().saturating_add(1))?;
     if ids.len() == ids.capacity() {
         let left = crate::resources::collected_ids_bytes() / std::mem::size_of::<usize>() - ids.len();
-        ids.try_reserve_exact(left.min(8192)).map_err(|e| e.to_string())?;
+        let additional = left.min(8192);
+        if let Some(admitted) = crate::analysis_runtime::current() {
+            admitted.retain_resource_bytes(additional * std::mem::size_of::<usize>())?;
+        }
+        ids.try_reserve_exact(additional).map_err(|e| e.to_string())?;
     }
     ids.push(id);
     Ok(())
@@ -859,7 +876,7 @@ mod event_payload_budget_tests {
         let before = serde_json::to_value(&event).unwrap();
         let measured = event_payload_bytes(&event);
         assert!(measured >= baseline + 72_000 + 4_096 + 8_192);
-        let mut budget = AnalyticsBudget { used:0, limit:32 << 10 };
+        let mut budget = AnalyticsBudget { used: 0, limit: 32 << 10, admission: None };
         assert!(budget.charge(measured).is_err());
         assert_eq!(serde_json::to_value(&event).unwrap(), before, "accounting cannot strip evidence or diagnostics");
     }
@@ -897,8 +914,15 @@ mod event_payload_budget_tests {
 pub fn indexed_matches(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> Result<Vec<usize>, String> {
     if filters.is_empty() {
         let gate = crate::analysis_runtime::indexed_gate(idx)?;
-        check_collected_ids(gate.as_ref().map_or(idx.lines.len(), |gate| gate.visible_count()))?;
-        return Ok((0..idx.lines.len()).filter(|&id| gate.as_ref().is_none_or(|gate| gate.allows_known_row(id))).collect());
+        let count = gate.as_ref().map_or(idx.lines.len(), |gate| gate.visible_count());
+        check_collected_ids(count)?;
+        if let Some(admitted) = crate::analysis_runtime::current() {
+            admitted.retain_resource_bytes(count.saturating_mul(std::mem::size_of::<usize>()))?;
+        }
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(count).map_err(|error| error.to_string())?;
+        ids.extend((0..idx.lines.len()).filter(|&id| gate.as_ref().is_none_or(|gate| gate.allows_known_row(id))));
+        return Ok(ids);
     }
     let pfs = prepare(filters);
     if let Some(ids) = crate::engine::matches(&engine_source(idx, codes, system, derived), &pfs)? { return Ok(ids); }
@@ -937,11 +961,11 @@ pub(crate) fn visit_indexed_mapped<T: Send>(idx: &FileIndex, pfs: &[PreparedFilt
     let mut ids = Vec::new();
     let mut bytes = 0usize;
     let flush = |ids: &mut Vec<usize>, visit: &mut dyn FnMut(usize, &Event, T)| {
-        let events: Vec<_> = ids.par_iter().map(|&id| {
+        let events = crate::global_scheduler::map(ids.iter(), |&id| {
             let event = event_at(idx, id, codes, system, derived);
             let mapped = map(&event);
             (id, event, mapped)
-        }).collect();
+        });
         for (id, event, mapped) in events { visit(id, &event, mapped); }
         ids.clear();
     };
@@ -1029,7 +1053,7 @@ fn scan_indexed_control<T: Send>(
         out
     };
     let total = idx.lines.len();
-    let batch = SCAN_CHUNK * rayon::current_num_threads() * 2;
+    let batch = SCAN_CHUNK * crate::resources::workers() * 2;
     let mut start = 0;
     while start < total {
         if crate::operations::cancelled() {
@@ -1043,12 +1067,9 @@ fn scan_indexed_control<T: Send>(
             bytes = bytes.saturating_add(next);
             end += 1;
         }
-        let parts: Vec<Vec<T>> = (start..end)
-            .step_by(SCAN_CHUNK)
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|from| chunk(from, (from + SCAN_CHUNK).min(end)))
-            .collect();
+        let parts = crate::global_scheduler::map((start..end).step_by(SCAN_CHUNK), |from| {
+            chunk(from, (from + SCAN_CHUNK).min(end))
+        });
         for part in parts {
             for item in part {
                 if !visit(item) { return crate::operations::check(); }
@@ -1382,12 +1403,15 @@ fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
 // Agregações
 // ==========================================================================
 
-pub(crate) struct AnalyticsBudget { used: usize, limit: usize }
+pub(crate) struct AnalyticsBudget { used: usize, limit: usize, admission: Option<Arc<crate::analysis_runtime::Admitted>> }
 impl AnalyticsBudget {
-    pub(crate) fn new() -> Self { Self { used: 0, limit: crate::resources::analytics_bytes() } }
+    pub(crate) fn new() -> Self { Self { used: 0, limit: crate::resources::analytics_bytes(), admission: crate::analysis_runtime::current() } }
     pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), String> {
-        self.used = self.used.saturating_add(bytes);
-        if self.used > self.limit { Err("O resultado analítico excedeu o orçamento de valores (LOGINSIGHT_ANALYTICS_LIMIT_MB). Restrinja os filtros ou reduza os agrupamentos.".into()) } else { Ok(()) }
+        let next = self.used.checked_add(bytes).filter(|next| *next <= self.limit)
+            .ok_or("O resultado analítico excedeu o orçamento de valores deste Caso/aplicativo (LOGINSIGHT_ANALYTICS_LIMIT_MB). Restrinja os filtros ou reduza os agrupamentos.")?;
+        if let Some(admitted) = &self.admission { admitted.retain_resource_bytes(bytes)?; }
+        self.used = next;
+        Ok(())
     }
     pub(crate) fn group(&mut self, key: &Option<String>, specs: usize) -> Result<(), String> {
         self.charge(key.as_ref().map_or(0, |v| v.len()).saturating_mul(3).saturating_add(128).saturating_add(specs.saturating_mul(std::mem::size_of::<Acc>())))
@@ -1399,10 +1423,10 @@ mod analytics_budget_tests {
     use super::*;
     #[test]
     fn group_labels_and_text_values_share_one_byte_budget() {
-        let mut budget = AnalyticsBudget { used: 0, limit: 1024 };
+        let mut budget = AnalyticsBudget { used: 0, limit: 1024, admission: None };
         budget.group(&Some("日".repeat(40)), 1).unwrap();
         assert!(budget.group(&Some("x".repeat(400)), 1).is_err());
-        let mut budget = AnalyticsBudget { used: 0, limit: 64 };
+        let mut budget = AnalyticsBudget { used: 0, limit: 64, admission: None };
         let mut acc = Acc::StrAgg(Vec::new());
         let mut event = Event::empty();
         event.message = "日".repeat(30);
@@ -1411,7 +1435,7 @@ mod analytics_budget_tests {
     }
     #[test]
     fn distinct_groups_charge_only_new_values_to_the_shared_budget() {
-        let mut budget = AnalyticsBudget { used: 0, limit: 200 };
+        let mut budget = AnalyticsBudget { used: 0, limit: 200, admission: None };
         let mut a = Acc::CountDistinct(Default::default());
         let mut b = Acc::CountDistinct(Default::default());
         let mut event = Event::empty();
@@ -1556,37 +1580,35 @@ fn round2(v: f64) -> f64 {
 /// Contagens por valor para várias colunas de uma vez (árvore de exploração).
 /// Cada coluna é agregada com os filtros MENOS o filtro da própria coluna,
 /// garantindo que toda opção exibida exista no recorte complementar.
-/// As colunas são processadas em paralelo (rayon).
+/// As colunas compartilham o orçamento global de processamento paralelo.
 pub fn multi_count(
     events: &[Event],
     filters: &[Filter],
     columns: &[String],
 ) -> Vec<(String, AggResult)> {
     let cancellation = crate::operations::current_token();
-    columns
-        .par_iter()
-        .map(|col| {
-            let fs: Vec<Filter> = filters
-                .iter()
-                .filter(|f| f.column != *col)
-                .cloned()
-                .collect();
-            let run = || {
-                aggregate(
-                    events,
-                    &fs,
-                    col,
-                    &[AggSpec {
-                        func: "count".into(),
-                        column: "*".into(),
-                        alias: "n".into(),
-                    }],
-                )
-            };
-            let agg = crate::operations::run_with_token(cancellation.clone(), run).unwrap_or_default();
-            (col.clone(), agg)
-        })
-        .collect()
+    let admission = crate::analysis_runtime::current();
+    crate::global_scheduler::map(columns, |col| {
+        let fs: Vec<Filter> = filters
+            .iter()
+            .filter(|f| f.column != *col)
+            .cloned()
+            .collect();
+        let run = || {
+            aggregate(
+                events,
+                &fs,
+                col,
+                &[AggSpec {
+                    func: "count".into(),
+                    column: "*".into(),
+                    alias: "n".into(),
+                }],
+            )
+        };
+        let agg = crate::analysis_runtime::with(admission.clone(), || crate::operations::run_with_token(cancellation.clone(), run)).unwrap_or_default();
+        (col.clone(), agg)
+    })
 }
 
 /// Versão indexada (mmap) da multi-agregação.
@@ -1604,33 +1626,31 @@ pub fn multi_count_indexed(
         Ok(None) => (),
     }
     let cancellation = crate::operations::current_token();
-    columns
-        .par_iter()
-        .map(|col| {
-            let fs: Vec<Filter> = filters
-                .iter()
-                .filter(|f| f.column != *col)
-                .cloned()
-                .collect();
-            let run = || {
-                aggregate_indexed(
-                    idx,
-                    &fs,
-                    col,
-                    &[AggSpec {
-                        func: "count".into(),
-                        column: "*".into(),
-                        alias: "n".into(),
-                    }],
-                    codes,
-                    system,
-                    derived,
-                )
-            };
-            let agg = crate::operations::run_with_token(cancellation.clone(), run).unwrap_or_default();
-            (col.clone(), agg)
-        })
-        .collect()
+    let admission = crate::analysis_runtime::current();
+    crate::global_scheduler::map(columns, |col| {
+        let fs: Vec<Filter> = filters
+            .iter()
+            .filter(|f| f.column != *col)
+            .cloned()
+            .collect();
+        let run = || {
+            aggregate_indexed(
+                idx,
+                &fs,
+                col,
+                &[AggSpec {
+                    func: "count".into(),
+                    column: "*".into(),
+                    alias: "n".into(),
+                }],
+                codes,
+                system,
+                derived,
+            )
+        };
+        let agg = crate::analysis_runtime::with(admission.clone(), || crate::operations::run_with_token(cancellation.clone(), run)).unwrap_or_default();
+        (col.clone(), agg)
+    })
 }
 
 pub(crate) fn build_agg_result(

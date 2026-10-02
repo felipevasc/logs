@@ -5,6 +5,9 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod analysis;
 mod analysis_context;
+mod case_interpretation;
+mod case_resources;
+mod case_security;
 mod analysis_runtime;
 mod analysis_commands;
 mod analysis_visibility;
@@ -58,6 +61,7 @@ mod journeys;
 mod mcp;
 mod model;
 mod operations;
+mod global_scheduler;
 mod page_projection;
 mod projection_commands;
 mod pivots;
@@ -73,6 +77,7 @@ mod reference_store;
 mod reference_lookup;
 mod remote;
 mod resources;
+mod resource_settings;
 mod sigma;
 mod sources;
 mod source_publication;
@@ -193,7 +198,11 @@ where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
 
 async fn offload_operation<T, F>(operation_id: Option<String>, f: F) -> Result<T, String>
 where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
-    let token = operations::token(operation_id)?;
+    offload_operation_priority(operation_id, global_scheduler::Priority::Normal, f).await
+}
+async fn offload_operation_priority<T, F>(operation_id: Option<String>, priority: global_scheduler::Priority, f: F) -> Result<T, String>
+where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
+    let token = operations::token(operation_id)?.with_priority(priority);
     tauri::async_runtime::spawn_blocking(move || operations::run_with_token(token, f))
         .await.map_err(|e| e.to_string())?
 }
@@ -228,7 +237,7 @@ pub(crate) fn validate_current_source(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-/// Execute a snapshot admitted before enqueueing the blocking request.
+/// Execute the captured snapshot with its original cancellation registration.
 async fn offload_admitted<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, f: F) -> Result<T, String>
 where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
     offload_case(operation_id, app, admitted, None, move |_| f()).await
@@ -238,19 +247,25 @@ where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
 /// registration. Evidence and memory sources are filtered once in this worker.
 async fn offload_case<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, case_events: Option<Vec<Event>>, f: F) -> Result<T, String>
 where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
-    offload_case_input(operation_id, app, admitted, move |admitted| admitted.prepare_visibility(case_events), f).await
+    offload_case_input(operation_id, app, admitted, global_scheduler::Priority::Normal, move |admitted| admitted.prepare_visibility(case_events), f).await
+}
+
+async fn offload_case_interactive<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, case_events: Option<Vec<Event>>, f: F) -> Result<T, String>
+where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
+    offload_case_input(operation_id, app, admitted, global_scheduler::Priority::Interactive, move |admitted| admitted.prepare_visibility(case_events), f).await
 }
 
 /// A detail/field action prepares only its selected record. Admission still
 /// binds the complete synchronized publication and validates its token at exit.
 async fn offload_case_record<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, case_events: Option<std::sync::Arc<case_cache::Records>>, id: usize, event_ref: Option<String>, f: F) -> Result<T, String>
 where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
-    offload_case_input(operation_id, app, admitted, move |admitted| admitted.prepare_visibility_record(case_events.as_deref().map(case_cache::Records::as_slice), id, event_ref.as_deref()), f).await
+    offload_case_input(operation_id, app, admitted, global_scheduler::Priority::Interactive, move |admitted| admitted.prepare_visibility_record(case_events.as_deref().map(case_cache::Records::as_slice), id, event_ref.as_deref()), f).await
 }
 
-async fn offload_case_input<T, P, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, input: P, f: F) -> Result<T, String>
+async fn offload_case_input<T, P, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, priority: global_scheduler::Priority, input: P, f: F) -> Result<T, String>
 where T: Send + 'static, P: FnOnce(&analysis_runtime::Admitted) -> Result<Option<Vec<Event>>, String> + Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
-    offload_operation(operation_id, move || {
+    let token = admitted.take_operation(operation_id, priority)?;
+    tauri::async_runtime::spawn_blocking(move || operations::run_with_token(token, || {
         admitted.validate(app.state::<AppState>().inner())?;
         let progress_app = app.clone();
         analysis_runtime::with(Some(admitted.clone()), || operations::with_reporter(std::sync::Arc::new(move |progress| {
@@ -265,45 +280,25 @@ where T: Send + 'static, P: FnOnce(&analysis_runtime::Admitted) -> Result<Option
             admitted.schedule_derived_variant(app.state::<AppState>().inner());
             Ok(result)
         }))
-    }).await?
+    })).await.map_err(|error| error.to_string())??
 }
 
 #[tauri::command]
 fn cancel_task(operation_id: String) -> bool { operations::cancel_id(&operation_id) }
 
-const CATALOG_VERSION: u32 = 3;
-
+/// Legacy application templates are read-only during startup. In particular,
+/// a missing version marker never authorizes rewriting malformed originals
+/// before the explicit Case migration can diagnose/preserve them.
+fn read_legacy_catalog(path: &PathBuf) -> Option<CodesConfig> {
+    use std::io::Read;
+    let file = crate::case_archive_format::open_regular(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take((3 << 20) + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 3 << 20 { return None; }
+    serde_json::from_slice(&bytes).ok()
+}
 fn load_codes(path: &PathBuf) -> CodesConfig {
-    let mut cfg = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<CodesConfig>(&text).ok())
-        .unwrap_or_default();
-
-    // Catálogo versionado: mescla entradas novas do padrão embutido sem
-    // sobrescrever o que o usuário personalizou.
-    let version_path = path.with_file_name("codes.version");
-    let version = std::fs::read_to_string(&version_path)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(0);
-    if version < CATALOG_VERSION {
-        let default: CodesConfig =
-            serde_json::from_str(include_str!("default_codes.json")).unwrap_or_default();
-        for (source, codes) in default.sources {
-            let entry = cfg.sources.entry(source).or_default();
-            for (code, info) in codes {
-                entry.entry(code).or_insert(info);
-            }
-        }
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(text) = serde_json::to_string_pretty(&cfg) {
-            let _ = std::fs::write(path, text);
-        }
-        let _ = std::fs::write(&version_path, CATALOG_VERSION.to_string());
-    }
-    cfg
+    read_legacy_catalog(path).unwrap_or_else(|| serde_json::from_str(include_str!("default_codes.json")).unwrap_or_default())
 }
 
 fn all_columns(events: &[Event]) -> Vec<String> {
@@ -320,13 +315,10 @@ fn all_columns(events: &[Event]) -> Vec<String> {
     cols
 }
 
-/// Carrega o catálogo extraído do sistema, se existir. A extração inicial
-/// acontece em background na primeira execução (ver `run`).
+/// Read the legacy system template without writing or harvesting implicitly.
+/// A Case obtains a new system catalog only through its explicit editor action.
 fn load_system_codes(path: &PathBuf) -> CodesConfig {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<CodesConfig>(&text).ok())
-        .unwrap_or_default()
+    read_legacy_catalog(path).unwrap_or_default()
 }
 
 #[tauri::command]
@@ -344,7 +336,7 @@ async fn load_event_log(
     analysis_context: Option<analysis_context::Identity>,
     source_generation: Option<u64>,
 ) -> Result<LoadSummary, String> {
-    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Publish)?;
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Publish, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         load_event_log_impl(state.inner(), &channel, max_events, merge, Some(&app))
@@ -498,7 +490,7 @@ async fn load_file(
     analysis_context: Option<analysis_context::Identity>,
     source_generation: Option<u64>,
 ) -> Result<LoadSummary, String> {
-    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Publish)?;
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Publish, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         load_file_impl(state.inner(), &path, &format, merge, Some(&app))
@@ -557,8 +549,8 @@ pub(crate) fn load_file_impl(
 /// Builds the query engine's stores for newly indexed files (cached per
 /// file), so the first queries are already fast. Opening takes longer once.
 pub(crate) fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Option<&AppHandle>) -> Result<(), String> {
-    let codes = state.codes.read().clone();
-    let system = state.system_codes.read().clone();
+    let codes = crate::analysis_runtime::codes(&state).clone();
+    let system = crate::analysis_runtime::system_codes(&state).clone();
     let derived = crate::analysis_runtime::derived(&state).clone();
     let operation_id = operations::current_id();
     let started = std::time::Instant::now();
@@ -584,12 +576,12 @@ pub(crate) fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Op
 
 #[tauri::command]
 async fn engine_status(app: AppHandle, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<Option<engine::EngineStatus>, String> {
-    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Normal).await?;
     offload_admitted(None, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         let source = crate::analysis_runtime::source(&state);
         match &*source {
-            SourceData::Indexed(idx) => Some(engine::status(idx, &state.codes.read(), &state.system_codes.read(), &crate::analysis_runtime::derived(&state))),
+            SourceData::Indexed(idx) => Some(engine::status(idx, &crate::analysis_runtime::codes(&state), &crate::analysis_runtime::system_codes(&state), &crate::analysis_runtime::derived(&state))),
             _ => None,
         }
     }).await
@@ -597,14 +589,14 @@ async fn engine_status(app: AppHandle, analysis_context: Option<analysis_context
 
 #[tauri::command]
 async fn engine_retry(app: AppHandle, operation_id: Option<String>, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<Option<engine::EngineStatus>, String> {
-    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Dataset, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         let source = crate::analysis_runtime::source(&state);
         let SourceData::Indexed(idx) = &*source else { return Ok(None) };
-        engine::retry(idx, &state.codes.read(), &state.system_codes.read(), &crate::analysis_runtime::derived(&state));
+        engine::retry(idx, &crate::analysis_runtime::codes(&state), &crate::analysis_runtime::system_codes(&state), &crate::analysis_runtime::derived(&state));
         prepare_engine(state.inner(), idx, Some(&app))?;
-        let status = engine::status(idx, &state.codes.read(), &state.system_codes.read(), &crate::analysis_runtime::derived(&state));
+        let status = engine::status(idx, &crate::analysis_runtime::codes(&state), &crate::analysis_runtime::system_codes(&state), &crate::analysis_runtime::derived(&state));
         Ok(Some(status))
     }).await?
 }
@@ -619,7 +611,7 @@ async fn load_files(
     analysis_context: Option<analysis_context::Identity>,
     source_generation: Option<u64>,
 ) -> Result<LoadSummary, String> {
-    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Publish)?;
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Publish, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         load_files_impl(state.inner(), &paths, &format, merge, Some(&app))
@@ -674,139 +666,80 @@ pub(crate) fn load_files_impl(
 
 // ------------------------------------------------------- data/hora (TsConfig)
 
-fn ts_configs_path() -> PathBuf {
-    config_dir().join("ts_configs.json")
-}
-
 pub(crate) fn load_ts_config(path: &str) -> Option<sources::TsConfig> {
-    let map: std::collections::HashMap<String, sources::TsConfig> =
-        std::fs::read_to_string(ts_configs_path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())?;
-    map.get(path).cloned()
+    analysis_runtime::current().and_then(|admitted| admitted.interpretation.timestamps.get(path).cloned())
 }
 
 #[tauri::command]
-fn get_ts_config(path: String) -> Option<sources::TsConfig> {
-    load_ts_config(&path)
+async fn get_ts_config(path: String, app: AppHandle, analysis_context: Option<analysis_context::Identity>) -> Result<Option<sources::TsConfig>, String> {
+    let admitted = case_editor_admission_async(app.clone(), analysis_context).await?;
+    offload_admitted(None, app, admitted, move || load_ts_config(&path)).await
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TimestampMutation {
+    publication: source_publication::Receipt,
+    #[serde(serialize_with = "crate::analysis_context::serialize_management_snapshot")]
+    analysis_context: analysis_context::Snapshot,
 }
 
 #[tauri::command]
 async fn set_ts_config(
-    path: String,
-    config: Option<sources::TsConfig>,
-    app: AppHandle,
-    operation_id: Option<String>,
-    analysis_context: Option<analysis_context::Identity>,
-    source_generation: Option<u64>,
-) -> Result<source_publication::Mutation, String> {
-    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
-    offload_admitted(operation_id, app.clone(), admitted, move || {
-        let state = app.state::<AppState>();
-        set_ts_config_impl(state.inner(), &path, config, Some(&app))
-    })
-    .await?
+    path: String, config: Option<sources::TsConfig>, app: AppHandle, operation_id: Option<String>,
+    analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>,
+) -> Result<TimestampMutation, String> {
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::EditSource, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
+    offload_admitted(operation_id, app.clone(), admitted, move || set_ts_config_impl(app.state::<AppState>().inner(), &path, config, Some(&app))).await?
 }
 
-pub(crate) fn set_ts_config_impl(
-    state: &AppState,
-    path: &str,
-    config: Option<sources::TsConfig>,
-    app: Option<&AppHandle>,
-) -> Result<source_publication::Mutation, String> {
-    let compiled = config.as_ref().map(|c| c.compile()).transpose()?;
-    // Validate before touching the saved configuration.
-    let mut map: std::collections::HashMap<String, sources::TsConfig> =
-        std::fs::read_to_string(ts_configs_path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-    match &config {
-        Some(c) => {
-            map.insert(path.to_string(), c.clone());
-        }
-        None => {
-            map.remove(path);
-        }
+pub(crate) fn set_ts_config_impl(state: &AppState, path: &str, config: Option<sources::TsConfig>, app: Option<&AppHandle>) -> Result<TimestampMutation, String> {
+    let admitted = case_interpretation::current()?;
+    let expected = admitted.identity.as_ref().ok_or(analysis_runtime::STALE)?;
+    let compiled = config.as_ref().map(|value| value.compile()).transpose()?;
+    let mut source = source_write_checked(state)?;
+    let owner = source_publication::receipt_locked(state).analysis_context;
+    if !matches!(&*source, SourceData::None) && owner.as_ref().is_none_or(|owner| owner.case_id != expected.case_id || owner.analysis_id != expected.analysis_id) {
+        return Err("A fonte aberta pertence a outro Caso; reabra a fonte deste Caso antes de ajustar data/hora.".into());
     }
-    let text = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
-    let mut current_source = source_write_checked(state)?;
-    let next_receipt = source_publication::prepare_touch_locked(state)?;
-    match &mut *current_source {
-        SourceData::Indexed(idx) => {
-            if let Some(position) = idx.parts.iter().position(|p| p.path == path) {
-                let previous = std::mem::replace(&mut idx.parts[position].ts_config, compiled);
-                let previous_lines = std::sync::Arc::clone(&idx.lines);
-                let previous_order = std::sync::Arc::clone(&idx.time_order);
-                if let Err(error) = sources::retimestamp_index(
-                    idx,
-                    Some(&|done, total| {
-                        emit_progress(
-                            app,
-                            "data/hora",
-                            "Recalculando timestamps",
-                            done,
-                            total,
-                            "linhas",
-                            false,
-                        );
-                    }),
-                ) {
-                    idx.parts[position].ts_config = previous;
-                    return Err(error);
-                }
-                if let Err(error) = std::fs::write(ts_configs_path(), &text) {
-                    idx.parts[position].ts_config = previous;
-                    idx.lines = previous_lines;
-                    idx.time_order = previous_order;
-                    return Err(error.to_string());
-                }
-                engine::request_rebuild(idx, &state.codes.read(), &state.system_codes.read(), &crate::analysis_runtime::derived(&state));
-                return Ok(source_publication::commit_touch_locked(state, next_receipt));
-            }
+    let mut receipt = source_publication::prepare_touch_locked(state)?;
+    // Prepare replacement metadata without mutating the published source.
+    // Failure or a stale editor leaves both its source and saved settings intact.
+    let replacement = match &*source {
+        SourceData::Indexed(index) => {
+            let mut next = sources::FileIndex { parts: index.parts.clone(), lines: index.lines.clone(), columns: index.columns.clone(), time_order: index.time_order.clone() };
+            let position = next.parts.iter().position(|part| part.path == path).ok_or("O arquivo não pertence à fonte deste Caso.")?;
+            next.parts[position].ts_config = compiled;
+            sources::retimestamp_index(&mut next, Some(&|done, total| emit_progress(app, "data/hora", "Recalculando timestamps", done, total, "linhas", false)))?;
+            SourceData::Indexed(next)
         }
-        // fontes unidas/em memória: aplica aos eventos cujo arquivo de origem é este
-        SourceData::Memory(evs) => {
+        SourceData::Memory(events) => {
             let single = state.source_names.read().len() <= 1;
-            let mut replacement = evs.clone();
-            let total = replacement.len();
-            for (i, ev) in replacement.iter_mut().enumerate() {
-                let ev_path = ev.col_str("caminho").unwrap_or_default();
-                if ev_path == path || (ev_path.is_empty() && single) {
-                    if let Some(cc) = &compiled {
-                        sources::apply_ts_config_event(ev, cc);
-                    }
-                }
-                if i % 4096 == 0 {
-                    emit_progress(
-                        app,
-                        "data/hora",
-                        "Recalculando timestamps",
-                        i,
-                        total,
-                        "eventos",
-                        false,
-                    );
+            let mut events = events.clone();
+            for event in &mut events {
+                let event_path = event.col_str("caminho").unwrap_or_default();
+                if event_path == path || (event_path.is_empty() && single) {
+                    if let Some(config) = &compiled { sources::apply_ts_config_event(event, config); }
+                    else { return Err("Reabra o arquivo original para remover o ajuste de data/hora de uma fonte antiga em memória.".into()); }
                 }
             }
-            std::fs::write(ts_configs_path(), &text).map_err(|e| e.to_string())?;
-            *evs = replacement;
-            emit_progress(
-                app,
-                "data/hora",
-                "Data/hora aplicada",
-                total,
-                total,
-                "eventos",
-                false,
-            );
-            return Ok(source_publication::commit_touch_locked(state, next_receipt));
+            SourceData::Memory(events)
         }
-        SourceData::None => {}
+        SourceData::None => SourceData::None,
+    };
+    operations::check()?;
+    let snapshot = case_interpretation::update_domain(expected, "timestamps", |settings| {
+        if let Some(config) = config { settings.timestamps.insert(path.into(), config); }
+        else { settings.timestamps.remove(path); }
+        Ok(())
+    })?;
+    receipt.analysis_context = Some(snapshot.identity());
+    *source = replacement;
+    let mutation = source_publication::commit_touch_locked(state, receipt);
+    if let SourceData::Indexed(index) = &*source {
+        engine::request_rebuild(index, &snapshot.interpretation.as_ref().unwrap().codes, &snapshot.interpretation.as_ref().unwrap().system_codes, &analysis_runtime::derived(state));
     }
-    std::fs::write(ts_configs_path(), text).map_err(|e| e.to_string())?;
-    operations::commit();
-    Ok(source_publication::Mutation { publication: source_publication::receipt_locked(state) })
+    Ok(TimestampMutation { publication: mutation.publication, analysis_context: snapshot })
 }
 
 #[tauri::command]
@@ -814,7 +747,7 @@ async fn test_ts_config(
     config: sources::TsConfig,
     path: Option<String>,
     app: AppHandle, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<(String, String)>, String> {
-    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Normal).await?;
     offload_admitted(None, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         test_ts_config_impl(state.inner(), config, path.as_deref())
@@ -904,11 +837,7 @@ fn load_derived() -> Vec<sources::CompiledDerived> {
                 .filter_map(|r| {
                     regex::Regex::new(&r.pattern)
                         .ok()
-                        .map(|re| sources::CompiledRule {
-                            re,
-                            template: r.template.clone(),
-                            filter: r.filter.clone(),
-                        })
+                        .and_then(|re| sources::CompiledRule::new(re, r.template.clone(), r.filter.clone()).ok())
                 })
                 .collect();
             if !d.steps.is_empty() && rules.len() != d.rules.len() {
@@ -1002,8 +931,8 @@ fn build_custom_parse(
 
 // ------------------------------------------------------- formatos de log
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct CustomFormat {
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CustomFormat {
     name: String,
     #[serde(default = "kind_regex")]
     kind: String, // "regex" | "delimited"
@@ -1026,10 +955,7 @@ impl CustomFormat {
 }
 
 fn custom_formats() -> Vec<CustomFormat> {
-    std::fs::read_to_string(config_dir().join("formats.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    analysis_runtime::current().map(|admitted| admitted.interpretation.formats.clone()).unwrap_or_default()
 }
 
 #[derive(serde::Serialize)]
@@ -1039,8 +965,9 @@ pub(crate) struct FormatInfo {
 }
 
 #[tauri::command]
-fn list_formats() -> Vec<FormatInfo> {
-    list_formats_impl()
+async fn list_formats(app: AppHandle, analysis_context: Option<analysis_context::Identity>) -> Result<Vec<FormatInfo>, String> {
+    let admitted = case_editor_admission_async(app.clone(), analysis_context).await?;
+    offload_admitted(None, app, admitted, list_formats_impl).await
 }
 
 pub(crate) fn list_formats_impl() -> Vec<FormatInfo> {
@@ -1049,7 +976,9 @@ pub(crate) fn list_formats_impl() -> Vec<FormatInfo> {
         ("jsonl", "JSON / JSONL (CloudTrail, Azure, Okta, Suricata, Elastic)"),
         ("syslog3164", "Syslog (RFC 3164)"),
         ("syslog5424", "Syslog (RFC 5424)"),
-        ("apache", "Apache / Nginx (combined)"),
+        ("apache", "Apache / Nginx (common / combined)"),
+        ("nginx-error", "Nginx (error.log)"),
+        ("mixed", "Misto (registros estruturados por linha)"),
         ("firewall", "Firewall (iptables / netfilter)"),
         ("cef", "CEF (ArcSight)"),
         ("leef", "LEEF (QRadar)"),
@@ -1079,42 +1008,29 @@ pub(crate) fn list_formats_impl() -> Vec<FormatInfo> {
 
 #[tauri::command]
 async fn save_custom_format(
-    name: String,
-    kind: String,
-    pattern: String,
-    separator: String,
-    fields: Vec<String>,
-) -> Result<(), String> {
-    offload(move || save_custom_format_impl(&name, &kind, &pattern, &separator, fields)).await?
+    name: String, kind: String, pattern: String, separator: String, fields: Vec<String>,
+    app: AppHandle, analysis_context: Option<analysis_context::Identity>,
+) -> Result<analysis_commands::MutationReceipt, String> {
+    let admitted = case_editor_admission_async(app.clone(), analysis_context).await?;
+    offload_admitted(None, app, admitted, move || save_custom_format_impl(&name, &kind, &pattern, &separator, fields)).await?
 }
 
-pub(crate) fn save_custom_format_impl(
-    name: &str,
-    kind: &str,
-    pattern: &str,
-    separator: &str,
-    fields: Vec<String>,
-) -> Result<(), String> {
-    if name.trim().is_empty() {
-        return Err("Informe um nome para o formato.".into());
-    }
-    build_custom_parse(kind, pattern, separator, &fields)?; // valida
-    let mut fmts = custom_formats();
-    fmts.retain(|f| f.name != name);
-    fmts.push(CustomFormat {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        pattern: pattern.to_string(),
-        separator: separator.to_string(),
-        fields,
-    });
-    let text = serde_json::to_string_pretty(&fmts).map_err(|e| e.to_string())?;
-    std::fs::write(config_dir().join("formats.json"), text).map_err(|e| e.to_string())
+pub(crate) fn save_custom_format_impl(name: &str, kind: &str, pattern: &str, separator: &str, fields: Vec<String>) -> Result<analysis_commands::MutationReceipt, String> {
+    let admitted = case_interpretation::current()?;
+    let expected = admitted.identity.as_ref().ok_or(analysis_runtime::STALE)?;
+    let format = CustomFormat { name: name.into(), kind: kind.into(), pattern: pattern.into(), separator: separator.into(), fields };
+    format.to_parse()?;
+    let snapshot = case_interpretation::update_domain(expected, "formats", |settings| {
+        settings.formats.retain(|f| f.name != name);
+        settings.formats.push(format);
+        Ok(())
+    })?;
+    Ok(analysis_commands::MutationReceipt { analysis_context: snapshot })
 }
 
 #[tauri::command]
 async fn clear_events(app: AppHandle, operation_id: Option<String>, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<(), String> {
-    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Publish)?;
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Publish, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     // Waiting for existing source readers and releasing native sessions can
     // take time; neither belongs on the WebView's synchronous IPC callback.
     offload_admitted(operation_id, app.clone(), admitted, move || {
@@ -1148,7 +1064,7 @@ pub(crate) struct SourceSummary {
 
 #[tauri::command]
 async fn source_summary(app: AppHandle, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<SourceSummary, String> {
-    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Normal).await?;
     // Memory: a descoberta de colunas varre até 20k eventos — offload também.
     offload_admitted(None, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
@@ -1192,9 +1108,9 @@ async fn query_events(
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<query::QueryResult, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
-    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Interactive).await?;
+    offload_case_interactive(operation_id, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         let state = app.state::<AppState>();
         query_events_scope_impl(
             state.inner(),
@@ -1241,8 +1157,8 @@ pub(crate) fn query_events_impl(
     limit: usize,
 ) -> Result<query::QueryResult, String> {
     let source = crate::analysis_runtime::source(&state);
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
+    let codes = crate::analysis_runtime::codes(&state);
+    let system = crate::analysis_runtime::system_codes(&state);
     let derived = crate::analysis_runtime::derived(&state);
     let limit = limit.clamp(1, 2_000);
     match &*source {
@@ -1283,9 +1199,9 @@ async fn query_page(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<query::QueryPage, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
-    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Interactive).await?;
+    offload_case_interactive(operation_id, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         let limit = limit.clamp(1, 2_000);
         if let Some(events) = case_events.as_deref() {
             return Ok(query::QueryPage::from_exact(
@@ -1294,8 +1210,8 @@ async fn query_page(
         }
         let state = app.state::<AppState>();
         let source = crate::analysis_runtime::source(&state);
-        let codes = state.codes.read();
-        let system = state.system_codes.read();
+        let codes = crate::analysis_runtime::codes(&state);
+        let system = crate::analysis_runtime::system_codes(&state);
         let derived = crate::analysis_runtime::derived(&state);
         match &*source {
             SourceData::Indexed(idx) => query::query_page_indexed(
@@ -1325,9 +1241,9 @@ async fn explore_snapshot(
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<query::ExplorerSnapshot, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         let state = app.state::<AppState>();
         explore_snapshot_scope_impl(
             state.inner(),
@@ -1385,8 +1301,8 @@ pub(crate) fn explore_snapshot_impl(
         false,
     );
     let source = crate::analysis_runtime::source(&state);
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
+    let codes = crate::analysis_runtime::codes(&state);
+    let system = crate::analysis_runtime::system_codes(&state);
     let derived = crate::analysis_runtime::derived(&state);
     let limit = limit.clamp(1, 2_000);
     let snapshot = match &*source {
@@ -1452,13 +1368,13 @@ async fn aggregate_events(
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<query::AggResult, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         let state = app.state::<AppState>();
-        aggregate_events_impl(state.inner(), &group_column, aggs, filters, case_events)
+        Ok::<_, String>(aggregate_events_impl(state.inner(), &group_column, aggs, filters, case_events))
     })
-    .await
+    .await?
 }
 
 pub(crate) fn aggregate_events_impl(
@@ -1473,8 +1389,8 @@ pub(crate) fn aggregate_events_impl(
         return query::aggregate(&events, &filters, group_column, &aggs);
     }
     let source = crate::analysis_runtime::source(&state);
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
+    let codes = crate::analysis_runtime::codes(&state);
+    let system = crate::analysis_runtime::system_codes(&state);
     let derived = crate::analysis_runtime::derived(&state);
     match &*source {
         SourceData::Memory(events) => query::aggregate(events, &filters, group_column, &aggs),
@@ -1556,9 +1472,9 @@ async fn trail_events(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<TrailResult, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         let state = app.state::<AppState>();
         trail_events_impl(
             state.inner(),
@@ -1593,7 +1509,7 @@ pub(crate) fn trail_events_impl(
             let center = (center_meta.ts, center_id);
             let (mut previous, mut following) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
             let (mut left, mut right, mut found) = (0usize, 0usize, false);
-            let codes = state.codes.read(); let system = state.system_codes.read(); let derived = crate::analysis_runtime::derived(&state);
+            let codes = crate::analysis_runtime::codes(&state); let system = crate::analysis_runtime::system_codes(&state); let derived = crate::analysis_runtime::derived(&state);
             query::visit_indexed_matches(idx, &filters, &codes, &system, &derived, |id| {
                 let key = (idx.lines.at(id).ts, id);
                 if key < center { left += 1; previous.insert(key); if previous.len() > before { previous.pop_first(); } }
@@ -1631,9 +1547,9 @@ async fn count_filtered(
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<usize, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         let state = app.state::<AppState>();
         count_filtered_impl(state.inner(), filters, case_events)
     })
@@ -1652,7 +1568,7 @@ pub(crate) fn count_filtered_impl(
     Ok(match &*source {
         SourceData::Memory(events) => query::count_memory(events, &filters),
         SourceData::Indexed(idx) => {
-            let (codes, system, derived) = (state.codes.read(), state.system_codes.read(), crate::analysis_runtime::derived(&state));
+            let (codes, system, derived) = (crate::analysis_runtime::codes(&state), crate::analysis_runtime::system_codes(&state), crate::analysis_runtime::derived(&state));
             let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
             match engine::count(&src, &filters)? { Some(count) => count, None => query::count_lines(idx, &filters, &codes, &system, &derived)? }
         }
@@ -1671,13 +1587,13 @@ async fn tree_aggs(
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<Vec<(String, query::AggResult)>, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         let state = app.state::<AppState>();
-        tree_aggs_impl(state.inner(), columns, filters, case_events)
+        Ok::<_, String>(tree_aggs_impl(state.inner(), columns, filters, case_events))
     })
-    .await
+    .await?
 }
 
 pub(crate) fn tree_aggs_impl(
@@ -1696,8 +1612,8 @@ pub(crate) fn tree_aggs_impl(
             idx,
             &filters,
             &columns,
-            &state.codes.read(),
-            &state.system_codes.read(),
+            &crate::analysis_runtime::codes(&state),
+            &crate::analysis_runtime::system_codes(&state),
             &crate::analysis_runtime::derived(&state),
         ),
         SourceData::None => vec![],
@@ -1714,9 +1630,9 @@ async fn stats_events(
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<query::Stats, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         if let Some(events) = case_events {
             return Ok(query::stats(&events, &filters));
         }
@@ -1728,8 +1644,8 @@ async fn stats_events(
 
 pub(crate) fn stats_events_impl(state: &AppState, filters: Vec<query::Filter>) -> Result<query::Stats, String> {
     let source = crate::analysis_runtime::source(&state);
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
+    let codes = crate::analysis_runtime::codes(&state);
+    let system = crate::analysis_runtime::system_codes(&state);
     let derived = crate::analysis_runtime::derived(&state);
     match &*source {
         SourceData::Memory(events) => Ok(query::stats(events, &filters)),
@@ -1759,7 +1675,7 @@ fn event_detail_raw(state: &AppState, id: usize) -> Option<Event> {
                 Ok(true) => (), Ok(false) => return None,
                 Err(error) => { analysis_runtime::record_failure(error); return None; }
             }
-            let mut event = sources::event_at(idx, id, &state.codes.read(), &state.system_codes.read(), &analysis_runtime::derived(state));
+            let mut event = sources::event_at(idx, id, &crate::analysis_runtime::codes(&state), &crate::analysis_runtime::system_codes(&state), &analysis_runtime::derived(state));
             if let Err(error) = analysis_runtime::attach_provenance(idx, &mut event) { analysis_runtime::record_failure(error); return None; }
             Some(event)
         }
@@ -1779,9 +1695,8 @@ async fn discover_patterns(
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<discovery::Discovery, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
-    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| { workspace::validate(&filters)?; discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events) })
         .await?
 }
 
@@ -1813,8 +1728,8 @@ pub(crate) fn discover_patterns_impl(
     Ok(match &*source {
         SourceData::Memory(events) => memory(events),
         SourceData::Indexed(idx) => {
-            let codes = state.codes.read();
-            let system = state.system_codes.read();
+            let codes = crate::analysis_runtime::codes(&state);
+            let system = crate::analysis_runtime::system_codes(&state);
             let derived = crate::analysis_runtime::derived(&state);
             let mut sample = discovery::Sampler::new();
             let mut result = discovery::Discovery::default();
@@ -1853,8 +1768,8 @@ fn work_events(
             .collect());
     }
     let source = crate::analysis_runtime::source(&state);
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
+    let codes = crate::analysis_runtime::codes(&state);
+    let system = crate::analysis_runtime::system_codes(&state);
     let derived = crate::analysis_runtime::derived(&state);
     Ok(match &*source {
         SourceData::Indexed(idx) => {
@@ -1907,9 +1822,9 @@ async fn profile_fields(
     source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Vec<analysis::FieldProfile>, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         let state = app.state::<AppState>();
         profile_fields_impl(state.inner(), filters, case_events)
     })
@@ -1937,9 +1852,9 @@ async fn compute_series(
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<analysis::SeriesResult, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         let state = app.state::<AppState>();
         compute_series_impl(state.inner(), filters, case_events, spec)
     })
@@ -1971,9 +1886,9 @@ async fn pivot(
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<analysis::PivotResult, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
-    workspace::validate(&filters)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
         let state = app.state::<AppState>();
         pivot_impl(state.inner(), filters, case_events, spec)
     })
@@ -1994,107 +1909,76 @@ pub(crate) fn pivot_impl(
     workspace::with_selection(state, &filters, |selection| analysis::pivot_stream(selection.iter(), &spec))?
 }
 
+pub(crate) async fn case_editor_admission_async(app: AppHandle, identity: Option<analysis_context::Identity>) -> Result<std::sync::Arc<analysis_runtime::Admitted>, String> {
+    let identity = analysis_commands::expected_identity(identity)?;
+    analysis_runtime::capture_async(app, Some(identity), None, analysis_runtime::Mode::Metadata, None, global_scheduler::Priority::Normal).await
+}
+
+pub(crate) fn case_editor_admission(state: &AppState, identity: Option<analysis_context::Identity>) -> Result<std::sync::Arc<analysis_runtime::Admitted>, String> {
+    let identity = analysis_commands::expected_identity(identity)?;
+    analysis_runtime::capture(state, Some(identity), None, analysis_runtime::Mode::Metadata)
+}
+
 #[tauri::command]
-async fn get_codes(app: AppHandle) -> Result<String, String> {
-    offload(move || {
-        let state = app.state::<AppState>();
-        get_codes_impl(state.inner())
-    })
-    .await
+async fn get_codes(app: AppHandle, analysis_context: Option<analysis_context::Identity>) -> Result<String, String> {
+    let admitted = case_editor_admission_async(app.clone(), analysis_context).await?;
+    offload_admitted(None, app.clone(), admitted, move || get_codes_impl(app.state::<AppState>().inner())).await
 }
-
 pub(crate) fn get_codes_impl(state: &AppState) -> String {
-    serde_json::to_string_pretty(&*state.codes.read()).unwrap_or_default()
+    serde_json::to_string_pretty(&*analysis_runtime::codes(state)).unwrap_or_default()
 }
 
-// Catalog publication includes Memory enrichment. Projection readers must not
-// bind a receipt between the catalog swap and that associated publication.
+// Retained for legacy template publishers. Case-effective dictionaries are
+// immutable and never share the profile's mutable dictionaries.
 static CATALOG_PUBLICATION: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
 pub(crate) fn catalog_read_guard() -> Result<parking_lot::RwLockReadGuard<'static, ()>, String> {
     CATALOG_PUBLICATION.try_read().ok_or_else(|| "CATALOG_UPDATE_PENDING: O catálogo está sendo atualizado. Aguarde e recarregue a consulta.".into())
 }
-
 #[tauri::command]
-async fn save_codes(text: String, app: AppHandle) -> Result<(), String> {
-    offload(move || {
-        let state = app.state::<AppState>();
-        save_codes_impl(state.inner(), &text)
-    })
-    .await?
+async fn save_codes(text: String, app: AppHandle, analysis_context: Option<analysis_context::Identity>) -> Result<analysis_commands::MutationReceipt, String> {
+    let admitted = case_editor_admission_async(app.clone(), analysis_context).await?;
+    offload_admitted(None, app.clone(), admitted, move || save_codes_impl(app.state::<AppState>().inner(), &text)).await?
 }
-
-pub(crate) fn save_codes_impl(state: &AppState, text: &str) -> Result<(), String> {
+pub(crate) fn save_codes_impl(_state: &AppState, text: &str) -> Result<analysis_commands::MutationReceipt, String> {
+    if text.len() > 3 << 20 { return Err("O catálogo excede o limite de 3 MiB de configuração do Caso.".into()); }
     let cfg: CodesConfig = serde_json::from_str(text).map_err(|e| format!("JSON inválido: {e}"))?;
-    let _publication = CATALOG_PUBLICATION.write();
-    std::fs::write(&state.codes_path, text).map_err(|e| format!("Falha ao gravar: {e}"))?;
-    *state.codes.write() = cfg;
-    engine::catalogs_changed();
-    // Re-enriquece eventos em memória (fontes indexadas enriquecem sob demanda).
-    let codes = state.codes.read().clone();
-    let system = state.system_codes.read().clone();
-    if let SourceData::Memory(events) = &mut *state.source.write() {
-        for ev in events.iter_mut() {
-            ev.name.clear();
-            ev.description.clear();
-            ev.enrich(&codes, &system);
-        }
-    }
-    engine::catalogs_changed();
-    Ok(())
+    let admitted = case_interpretation::current()?;
+    let snapshot = case_interpretation::update_domain(admitted.identity.as_ref().ok_or(analysis_runtime::STALE)?, "codes", |settings| { settings.codes = cfg; Ok(()) })?;
+    Ok(analysis_commands::MutationReceipt { analysis_context: snapshot })
 }
 
 #[derive(serde::Serialize)]
 pub(crate) struct HarvestSummary {
     count: usize,
     sources: usize,
+    #[serde(rename = "analysisContext")]
+    #[serde(serialize_with = "crate::analysis_context::serialize_management_snapshot")]
+    analysis_context: analysis_context::Snapshot,
 }
 
 /// Extrai (ou reextrai) o catálogo completo de eventos do sistema operacional.
 #[tauri::command]
-async fn harvest_codes(app: AppHandle) -> Result<HarvestSummary, String> {
-    offload(move || {
-        let state = app.state::<AppState>();
-        harvest_codes_impl(state.inner())
-    })
-    .await?
+async fn harvest_codes(app: AppHandle, analysis_context: Option<analysis_context::Identity>) -> Result<HarvestSummary, String> {
+    let admitted = case_editor_admission_async(app.clone(), analysis_context).await?;
+    offload_admitted(None, app.clone(), admitted, move || harvest_codes_impl(app.state::<AppState>().inner())).await?
 }
 
-pub(crate) fn harvest_codes_impl(state: &AppState) -> Result<HarvestSummary, String> {
+pub(crate) fn harvest_codes_impl(_state: &AppState) -> Result<HarvestSummary, String> {
+    let admitted = case_interpretation::current()?;
     let (cfg, count) = sources::harvest_system_codes()?;
     let sources = cfg.sources.len();
-    publish_system_catalog(state, cfg)?;
-    Ok(HarvestSummary { count, sources })
-}
-
-fn publish_system_catalog(state: &AppState, cfg: CodesConfig) -> Result<(), String> {
-    let _publication = CATALOG_PUBLICATION.write();
-    let text = serde_json::to_string(&cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&state.system_codes_path, text).map_err(|e| format!("Falha ao gravar catálogo: {e}"))?;
-    *state.system_codes.write() = cfg;
-    engine::catalogs_changed();
-    // Re-enriquece eventos em memória (fontes indexadas enriquecem sob demanda).
-    let codes = state.codes.read().clone();
-    let system = state.system_codes.read().clone();
-    if let SourceData::Memory(events) = &mut *state.source.write() {
-        for ev in events.iter_mut() {
-            ev.name.clear();
-            ev.description.clear();
-            ev.enrich(&codes, &system);
-        }
-    }
-    engine::catalogs_changed();
-    Ok(())
+    let analysis_context = case_interpretation::update_domain(admitted.identity.as_ref().ok_or(analysis_runtime::STALE)?, "systemCodes", |settings| { settings.system_codes = cfg; Ok(()) })?;
+    Ok(HarvestSummary { count, sources, analysis_context })
 }
 
 #[tauri::command]
-fn system_codes_count(state: State<AppState>) -> usize {
-    system_codes_count_impl(state.inner())
+async fn system_codes_count(app: AppHandle, analysis_context: Option<analysis_context::Identity>) -> Result<usize, String> {
+    let admitted = case_editor_admission_async(app.clone(), analysis_context).await?;
+    offload_admitted(None, app.clone(), admitted, move || system_codes_count_impl(app.state::<AppState>().inner())).await
 }
 
 pub(crate) fn system_codes_count_impl(state: &AppState) -> usize {
-    state
-        .system_codes
-        .read()
+    analysis_runtime::system_codes(state)
         .sources
         .values()
         .map(|m| m.len())
@@ -2181,8 +2065,6 @@ fn relaunch_elevated() -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Parallel work leaves a core free and runs below normal priority.
-    resources::init();
     #[cfg(feature = "update-e2e")]
     updates::e2e_arguments();
     // Resolve a verified restart selection before any data, updater, catalog,
@@ -2194,6 +2076,10 @@ pub fn run() {
     let context = tauri::generate_context!();
     // Before anything reads the data folder: a new version backs it up first.
     let updates = updates::prepare(&context.package_info().version);
+    // Resolve the selected profile and preserve updater backup order before
+    // freezing the restart-only budget or starting any shared parser workers.
+    resource_settings::initialize(&config_dir());
+    resources::init();
     let codes_path = config_dir().join("codes.json");
     let codes = load_codes(&codes_path);
     let system_codes_path = config_dir().join("system_codes.json");
@@ -2223,21 +2109,9 @@ pub fn run() {
             mcp_token,
         ))
         .setup(move |app| {
-            // Primeira execução: extrai o catálogo do sistema em background
-            // (leva ~20s e não pode bloquear a abertura da janela).
-            let state = app.state::<AppState>();
-            let needs_harvest = state.system_codes.read().sources.is_empty();
-            if needs_harvest {
-                let handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    if let Ok((cfg, _)) = sources::harvest_system_codes() {
-                        let state = handle.state::<AppState>();
-                        if let Err(error) = publish_system_catalog(state.inner(), cfg) {
-                            eprintln!("[catálogo] {error}");
-                        }
-                    }
-                });
-            }
+            // No startup catalog writes/automatic harvest. The local v0.11
+            // migration must see original profile files unchanged; explicit
+            // harvest saves only the selected Case after migration and CAS.
             // Old parser caches and unused indexes do not accumulate on disk.
             std::thread::spawn(index_cache::prune);
             // Servidor MCP embutido (loopback) para automação por agentes.
@@ -2253,6 +2127,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ui_zoom,
+            resource_settings::resource_settings_status,
+            resource_settings::resource_settings_save,
+            resource_settings::case_resource_settings_status,
+            resource_settings::case_resource_settings_save,
             case_images::case_image_add,
             case_images::case_image_read,
             case_images::export_investigation,

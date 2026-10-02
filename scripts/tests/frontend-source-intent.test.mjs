@@ -15,7 +15,7 @@ function fixture() {
   const pending = [], calls = [], messages = [], refreshReads = [], refreshTotals = [], nodes = new Map(), cancelled = new Set();
   let physicalCount = 1, visibleCount = null;
   let createdNodes = 0;
-  let native = null, generation = 0, nativeInputs = [], publicationId = null, snapshotFailure = false, prepare = async args => args, sourceWait = async () => {};
+  let native = null, nativeOwner = null, generation = 0, nativeInputs = [], publicationId = null, snapshotFailure = false, prepare = async args => args, sourceWait = async () => {};
   const node = key => {
     if (!nodes.has(key)) nodes.set(key, { value: '', hidden: false, children: [], classList: { add() {}, toggle() {} }, appendChild() {}, before() {}, append(...children) { this.children.push(...children); }, replaceChildren(...children) { this.children = children; }, setAttribute() {}, querySelector() { return this; } });
     return nodes.get(key);
@@ -27,11 +27,11 @@ function fixture() {
     setTimeout() {}, clearTimeout() {}, setInterval() {}, clearInterval() {}, requestAnimationFrame() {},
     explorerAnalytics: new Map(), treeAggVersion: { dataset: 0 }, cubeState: { requestVersion: 0 }, workspaceScope: () => 'dataset', caseArgs: (...args) => prepare(...args),
     activeCase: () => state.cases.cases.find(c => c.id === state.cases.active), ensureCase: () => state.cases.cases[0], artifactIdFromSource: value => value.path || value.channel,
-    applySourceSpec() {}, startOperation() {}, updateOperation() {}, skeletonRows() {},
+    applySourceSpec() {}, setSource() {}, startOperation() {}, updateOperation() {}, skeletonRows() {},
     showLoadOverlay: () => { state.loadOverlay = true; }, hideLoadOverlay: () => { state.loadOverlay = false; },
     finishOperation: label => messages.push(label), fillColumnControls() {}, renderChips() {}, syncCurrentSavedFilter() {}, restoreCurrentSavedFilter() {},
     restoreVisiblePreferences: () => false, storeCurrentArtifactInSession: () => Promise.resolve(true), currentCaseArtifact: () => null,
-    loadTsConfig: async () => {}, caseStations: () => [], autoVisibleCols() {}, updateTsExample() {}, updateContextBar() {}, renderExploreTree() {},
+    loadTsConfig: async () => {}, loadFormatOptions: async () => true, caseStations: () => [], autoVisibleCols() {}, updateTsExample() {}, updateContextBar() {}, renderExploreTree() {},
     renderTable() {}, renderChart() {}, updateAnalysisBadge() {}, closeDrawer() {}, renderArtifactBar() {},
     refresh: async () => { refreshReads.push(native); refreshTotals.push(state.total); state.rows = [{ source: native }]; state.total = visibleCount; },
     invoke: async (cmd, args) => {
@@ -39,7 +39,7 @@ function fixture() {
       if (cmd === 'profile_fields') return [];
       if (cmd === 'source_snapshot') {
         if (snapshotFailure) throw Error('Receipt temporarily unavailable');
-        return { generation, operationId:publicationId, count:native?physicalCount:0, columns:native?['timestamp','message']:[], sourceDesc:native||'', sourceNames:native?[native]:[], sources:nativeInputs };
+        return { generation, operationId:publicationId, analysisContext:nativeOwner, count:native?physicalCount:0, columns:native?['timestamp','message']:[], sourceDesc:native||'', sourceNames:native?[native]:[], sources:nativeInputs };
       }
       if (cmd === 'cancel_task') {
         const target = pending.find(item => item.args.operationId === args.operationId);
@@ -48,19 +48,19 @@ function fixture() {
       }
       return new Promise((resolve, reject) => {
         const record = {
-          cmd, args, committed: false,
+          cmd, args, committed: false, owner: { caseId: state.cases.active, analysisId: `analysis-${state.cases.active}` },
           publish() {
             if (cancelled.has(args.operationId)) return false;
             if (['load_file', 'load_files', 'load_bundle', 'load_event_log', 'clear_events'].includes(cmd)) {
               native = cmd === 'clear_events' ? null : args.path || args.paths?.join(';') || args.members?.map(item => item.path).join(';') || args.channel;
-              generation++; publicationId=args.operationId;
+              generation++; publicationId=args.operationId; nativeOwner=record.owner;
               nativeInputs = cmd === 'clear_events' ? [] : cmd === 'load_bundle' ? args.members : cmd === 'load_event_log' ? [{kind:'eventlog',channel:args.channel,maxEvents:args.maxEvents}] : [{kind:'file',paths:args.paths||[args.path],format:args.format||'auto'}];
             }
             record.committed = true; return true;
           },
           respond() {
             if (!record.committed && cancelled.has(args.operationId)) { reject(Error('Operação cancelada.')); return; }
-            resolve({ count: physicalCount, columns: ['timestamp', 'message'], source_desc: native, publication:{generation,operationId:publicationId} });
+            resolve({ count: physicalCount, columns: ['timestamp', 'message'], source_desc: native, publication:{generation,operationId:publicationId,analysisContext:nativeOwner} });
           },
           complete() { record.publish(); record.respond(); }, reject,
         };
@@ -262,3 +262,35 @@ const slowList=listContext.loaded();listContext.key='D';listContext.sourceList=[
 assert.equal(listContext.sourceList[0].path,'D');
 assert.equal(visibilityRefreshes,2,'source metadata refresh requests a new admitted exclusion status');
 console.log('Receipt reconciliation, failed imports, and retained source-list generations passed');
+
+// A failed/cancelled B replacement cannot adopt A's still-published source.
+for (const cancelled of [false, true]) {
+  const f = fixture(), first = f.context.loadData(file('only-A')); await settle(); f.pending[0].complete(); await first;
+  const original = f.state.cases.cases[0], b = { id: 'b', artifacts: [] };
+  f.state.cases.cases.push(b); f.state.cases.active = b.id;
+  f.node('#file-path').value = 'only-A'; f.context.resetCaseSourceState();
+  const adopted = []; f.context.storeCurrentArtifactInSession = () => { adopted.push([f.state.cases.active, f.state.currentArtifact.path]); return Promise.resolve(true); };
+  assert.equal(f.node('#file-path').value, ''); assert.equal(f.state.columns.length, 0); assert.equal(f.state.rows.length, 0);
+  const replacement = f.context.loadData(file('missing-B')); await settle();
+  if (cancelled) { f.context.window.Tasks.cancelLatest('source-load'); await settle(); f.pending[1].complete(); }
+  else f.pending[1].reject(Error('missing-B unreadable'));
+  assert.equal(await replacement, false);
+  assert.equal(f.native, 'only-A', 'a failed replacement leaves the native publication intact for its owner');
+  assert.equal(f.state.currentArtifact, null); assert.equal(f.state.columns.length, 0); assert.equal(f.state.rows.length, 0);
+  assert.deepEqual(adopted, [], 'foreign source receipt cannot register or save an artifact into B');
+  assert.deepEqual(b.artifacts, []); assert.equal(f.state.sourceIdentityUnconfirmed, true);
+  f.state.cases.active = original.id; f.context.resetCaseSourceState(); await f.context.reconcilePublishedSource();
+  assert.deepEqual(adopted, [[original.id, 'only-A']], 'returning to A may reconcile its own publication');
+}
+
+// The receipt read itself owns the Case instance, including ID reuse after import.
+{
+  const f = fixture(), original = f.state.cases.cases[0]; let resolveSnapshot;
+  const nativeApi = f.context.api;
+  f.context.api = (command, ...args) => command === 'source_snapshot' ? new Promise(resolve => { resolveSnapshot = resolve; }) : nativeApi(command, ...args);
+  const reading = f.context.reconcilePublishedSource(); await settle();
+  f.state.cases.cases[0] = { id: original.id, artifacts: [] };
+  resolveSnapshot({ generation: 1, count: 1, columns: ['A_only'], sourceDesc: 'only-A', sources: [{ kind: 'file', paths: ['only-A'] }], analysisContext: { caseId: original.id, analysisId: 'analysis-case' } });
+  assert.equal(await reading, false); assert.equal(f.state.currentArtifact, undefined);
+}
+console.log('A→B failure/cancel, foreign receipt rejection, return-to-owner and replaced-Case receipt tests passed');

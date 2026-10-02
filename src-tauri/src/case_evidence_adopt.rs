@@ -67,7 +67,7 @@ fn missing_context(
     let path = assets.join("derived_fields.json");
     match std::fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return crate::analysis_context::prepare_new_case(case_id)
+            return crate::analysis_context::prepare_legacy_case(case_id, None, assets)
         }
         Err(error) => return Err(error.to_string()),
         Ok(_) => (),
@@ -102,7 +102,11 @@ fn missing_context(
             Value::String(text)
         }
     };
-    crate::analysis_context::prepare_legacy_value(case_id, value)
+    let mut snapshot = crate::analysis_context::prepare_legacy_value(case_id, value)?;
+    let (interpretation, diagnostics) = crate::case_interpretation::local_legacy(assets);
+    snapshot.interpretation = Some(interpretation);
+    snapshot.migration_diagnostics.extend(diagnostics);
+    Ok(snapshot)
 }
 fn existing_context(
     conn: &Connection,
@@ -247,6 +251,14 @@ pub(crate) fn adopt(
                 &mut credit,
             )?
         };
+        let unavailable_origin = !recovery.has_interpretation_assets() || crate::case_interpretation::origin_unavailable(&copied)?;
+        if unavailable_origin && (!context_exists || snapshot.interpretation.is_none()) {
+            crate::case_interpretation::mark_origin_unavailable(&mut snapshot);
+        } else if snapshot.interpretation.is_none() {
+            let (interpretation, diagnostics) = crate::case_interpretation::local_legacy(&recovery.snapshot_assets_root());
+            snapshot.interpretation = Some(interpretation);
+            snapshot.migration_diagnostics.extend(diagnostics);
+        }
         // At most two bounded messages; reserve their owned growth before
         // constructing them. The unchanged context-size gate follows below.
         add_credit(&mut credit, 8 << 10)?;
@@ -537,6 +549,38 @@ mod tests {
         assert_eq!(replay.receipt.after, result.receipt.after);
         backup.validate().unwrap();
     }
+    #[test]
+    fn restored_old_recovery_keeps_raw_view_and_export_with_blocked_unknown_interpretation() {
+        let root = legacy();
+        let conn = Connection::open(root.path().join("investigations.sqlite3")).unwrap();
+        let mut old = crate::analysis_context::read(&conn, "c").unwrap(); old.interpretation = None;
+        conn.execute("UPDATE case_analysis SET body=?1 WHERE case_id='c'", [serde_json::to_string(&old).unwrap()]).unwrap();
+        conn.execute("INSERT INTO metadata VALUES('case-interpretation-origin-unavailable','1')", []).unwrap();
+        drop(conn);
+        std::fs::write(root.path().join("codes.json"), br#"{"destination":{"1":{"name":"must not inherit"}}}"#).unwrap();
+        // A later verified generation cannot invent settings omitted by the
+        // earlier recovery from which this profile originated.
+        let backup = recovery(root.path());
+        adopt(root.path(), "old-origin-readable", &backup).unwrap();
+        let loaded = load_view(root.path()).unwrap();
+        assert_eq!(loaded.document().cases[0]["id"], "c");
+        assert!(matches!(loaded.document().case_evidence[0], CaseEvidenceState::Ready(_)));
+        let conn = authority::connect_readonly(root.path()).unwrap();
+        let snapshot = crate::analysis_context::read(&conn, "c").unwrap();
+        assert!(snapshot.migration_diagnostics.iter().any(|d| d.code == "legacy_interpretation_unavailable_origin"));
+        assert!(!snapshot.interpretation.as_ref().unwrap().codes.sources.contains_key("destination"));
+        drop(conn);
+        let external = tempfile::tempdir().unwrap();
+        let output = external.path().join("preserved.json");
+        crate::case_portable_native::export_at(root.path(), crate::case_portable_native::ExportRequest {
+            store: loaded.document().store.clone(), document_json: serde_json::to_string(&loaded).unwrap(),
+            path: output.to_string_lossy().into_owned(), mask: false, request_id: "export-old-origin".into(),
+        }).unwrap();
+        let text = std::fs::read_to_string(output).unwrap();
+        assert!(text.contains("18446744073709551615"));
+        assert!(text.contains("legacy_interpretation_unavailable_origin"));
+    }
+
     #[test]
     fn context_only_divergence_refuses_adoption_without_installing_native_schema() {
         let root = legacy();

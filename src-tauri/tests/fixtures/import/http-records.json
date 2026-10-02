@@ -1,0 +1,395 @@
+[
+  {
+    "name": "common_ipv4",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET /api?q=a%20b&n=2 HTTP/1.1\" 200 512",
+    "expected": {
+      "code": "200",
+      "level": "Informação",
+      "source": "203.0.113.10"
+    },
+    "fields": {
+      "method": "GET",
+      "path": "/api?q=a%20b&n=2",
+      "protocol": "HTTP/1.1",
+      "status": "200",
+      "size": "512",
+      "parser.format": "access.common",
+      "client_ip": "203.0.113.10"
+    },
+    "absent": [
+      "referer",
+      "agent"
+    ]
+  },
+  {
+    "name": "combined_ipv6",
+    "line": "2001:db8::7 - alice [02/Oct/2026:13:20:30 +0000] \"POST /v1 HTTP/2.0\" 503 9007199254740993 \"https://example.test/\" \"client/1.0\"",
+    "expected": {
+      "code": "503",
+      "level": "Erro",
+      "source": "2001:db8::7"
+    },
+    "fields": {
+      "user": "alice",
+      "size": "9007199254740993",
+      "referer": "https://example.test/",
+      "agent": "client/1.0",
+      "parser.format": "access.combined",
+      "client_ip": "2001:db8::7"
+    }
+  },
+  {
+    "name": "missing_request",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"-\" 400 - \"-\" \"-\"",
+    "expected": {
+      "code": "400",
+      "level": "Aviso"
+    },
+    "fields": {
+      "request": "-",
+      "size": "-",
+      "referer": "-",
+      "agent": "-"
+    },
+    "absent": [
+      "method",
+      "path",
+      "protocol"
+    ]
+  },
+  {
+    "name": "empty_request",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"\" 408 0",
+    "expected": {
+      "code": "408"
+    },
+    "fields": {
+      "request": ""
+    },
+    "absent": [
+      "method",
+      "path",
+      "protocol"
+    ]
+  },
+  {
+    "name": "malformed_http_request",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"bad request with spaces\" 400 0",
+    "expected": {
+      "code": "400"
+    },
+    "fields": {
+      "request": "bad request with spaces"
+    },
+    "absent": [
+      "method",
+      "path",
+      "protocol"
+    ]
+  },
+  {
+    "name": "json_escaped_quotes",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1\" 200 1 \"-\" \"agent \\\"broken\\\"\"",
+    "fields": {
+      "agent": "agent \\\"broken\\\""
+    }
+  },
+  {
+    "name": "default_escaped_bytes",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET /caf\\xC3\\xA9 HTTP/1.1\" 200 1 \"-\" \"agent\\x22quoted\\x22\"",
+    "fields": {
+      "path": "/caf\\xC3\\xA9",
+      "agent": "agent\\x22quoted\\x22"
+    }
+  },
+  {
+    "name": "unicode_literal",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET /café HTTP/1.1\" 200 1 \"-\" \"日本語\"",
+    "fields": {
+      "path": "/café",
+      "agent": "日本語"
+    }
+  },
+  {
+    "name": "named_custom_suffix",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1\" 200 1 \"-\" \"client\" request_time=0.001 upstream_addr=\"[2001:db8::8]:8080\" request_id=000012345678901234567890 status=502 tag=a tag=b",
+    "fields": {
+      "request_time": "0.001",
+      "upstream_addr": "[2001:db8::8]:8080",
+      "request_id": "000012345678901234567890",
+      "status": "200",
+      "tag": [
+        "a",
+        "b"
+      ],
+      "access.extra_fields": {
+        "request_time": "0.001",
+        "upstream_addr": "[2001:db8::8]:8080",
+        "request_id": "000012345678901234567890",
+        "status": "502",
+        "tag": [
+          "a",
+          "b"
+        ]
+      }
+    }
+  },
+  {
+    "name": "unlabeled_suffix",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1\" 200 1 \"-\" \"client\" 0.032 [backend] 192.0.2.9:8080 200 0.030 abc",
+    "fields": {
+      "access.extra": "0.032 [backend] 192.0.2.9:8080 200 0.030 abc"
+    },
+    "absent": [
+      "request_time",
+      "upstream_addr",
+      "request_id"
+    ]
+  },
+  {
+    "name": "one_extra_quote_is_not_combined",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1\" 200 1 \"unknown\"",
+    "fields": {
+      "access.extra": "\"unknown\"",
+      "parser.format": "access.common"
+    },
+    "absent": [
+      "referer",
+      "agent"
+    ]
+  },
+  {
+    "name": "error_http_context",
+    "line": "2026/10/02 13:20:30 [error] 77#88: *99 upstream timed out (110: Connection timed out), client: 2001:db8::7, server: example.test, request: \"GET /api?q=1,2 HTTP/1.1\", upstream: \"http://192.0.2.2:8080/api\", host: \"example.test\", referrer: \"https://example.test/a,b\"",
+    "expected": {
+      "source": "nginx",
+      "level": "Erro"
+    },
+    "fields": {
+      "pid": "77",
+      "tid": "88",
+      "connection": "99",
+      "client_ip": "2001:db8::7",
+      "server": "example.test",
+      "method": "GET",
+      "path": "/api?q=1,2",
+      "upstream": "http://192.0.2.2:8080/api",
+      "host": "example.test",
+      "referrer": "https://example.test/a,b",
+      "parser.format": "nginx.error"
+    }
+  },
+  {
+    "name": "error_lifecycle_no_connection",
+    "line": "2026/10/02 13:20:30 [notice] 77#0: start worker processes",
+    "expected": {
+      "level": "Informação",
+      "message": "start worker processes"
+    },
+    "fields": {
+      "pid": "77",
+      "tid": "0"
+    },
+    "absent": [
+      "connection",
+      "client_ip",
+      "request"
+    ]
+  },
+  {
+    "name": "error_empty_server",
+    "line": "2026/10/02 13:20:30 [warn] 77#0: *1 bad request, client: 192.0.2.3, server: , request: \"-\", host: \"example.test\"",
+    "fields": {
+      "server": "",
+      "request": "-",
+      "client_ip": "192.0.2.3"
+    },
+    "absent": [
+      "method",
+      "path"
+    ]
+  },
+  {
+    "name": "logfmt_dotted_case_repeated",
+    "line": "time=2026-10-02T13:20:30Z level=error msg=\"a \\\"quote\\\"\" Trace.ID=000123 tag=one tag=two empty=",
+    "expected": {
+      "level": "Erro"
+    },
+    "fields": {
+      "Trace.ID": "000123",
+      "tag": [
+        "one",
+        "two"
+      ],
+      "empty": ""
+    }
+  },
+  {
+    "name": "logfmt_http",
+    "line": "time_local=\"02/Oct/2026:10:20:30 -0300\" remote_addr=203.0.113.8 status=502 request=\"GET /health HTTP/1.1\" request_time=0.1234567890123456789",
+    "expected": {
+      "code": "502",
+      "level": "Erro",
+      "source": "203.0.113.8"
+    },
+    "fields": {
+      "status": "502",
+      "method": "GET",
+      "path": "/health",
+      "request_time": "0.1234567890123456789"
+    }
+  },
+  {
+    "name": "json_http",
+    "line": "{\"time_local\": \"02/Oct/2026:10:20:30 -0300\", \"remote_addr\": \"203.0.113.9\", \"request\": \"GET /health HTTP/1.1\", \"status\": \"503\", \"request_id\": \"000123\", \"body_bytes_sent\": 9007199254740993}",
+    "expected": {
+      "code": "503",
+      "level": "Erro",
+      "source": "203.0.113.9"
+    },
+    "fields": {
+      "status": "503",
+      "body_bytes_sent": 9007199254740993,
+      "request_id": "000123",
+      "time_local": "02/Oct/2026:10:20:30 -0300",
+      "method": "GET",
+      "path": "/health"
+    },
+    "absent": [
+      "parser.format"
+    ]
+  },
+  {
+    "name": "json_explicit_columns_win",
+    "line": "{\"timestamp\": \"2026-10-02T10:00:00Z\", \"time_iso8601\": \"2026-10-02T13:20:30Z\", \"level\": \"info\", \"code\": \"custom\", \"source\": \"proxy-a\", \"message\": \"explicit\", \"request\": \"GET /real HTTP/1.1\", \"path\": \"/explicit\", \"status\": 503}",
+    "expected": {
+      "code": "custom",
+      "level": "Informação",
+      "source": "proxy-a",
+      "message": "explicit"
+    },
+    "fields": {
+      "path": "/explicit",
+      "time_iso8601": "2026-10-02T13:20:30Z",
+      "status": 503
+    }
+  },
+  {
+    "name": "json_generic_status_is_not_http",
+    "line": "{\"status\":503,\"message\":\"job failed\",\"request\":\"maintenance\"}",
+    "expected": {
+      "code": "",
+      "level": "Informação",
+      "message": "job failed"
+    },
+    "absent": [
+      "method",
+      "path",
+      "protocol"
+    ]
+  },
+  {
+    "name": "plain_url_is_not_logfmt",
+    "line": "visit https://example.test/?a=1&b=2&c=3",
+    "parse_status": "unparsed",
+    "fields": {},
+    "absent": [
+      "method",
+      "client_ip",
+      "a",
+      "b",
+      "c"
+    ]
+  },
+  {
+    "name": "prose_is_not_logfmt",
+    "line": "something happened a=1 b=2 c=3",
+    "parse_status": "unparsed",
+    "fields": {},
+    "absent": [
+      "method",
+      "client_ip",
+      "a",
+      "b",
+      "c"
+    ]
+  },
+  {
+    "name": "unclosed_request",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1 200 1",
+    "parse_status": "unparsed",
+    "fields": {},
+    "absent": [
+      "method",
+      "client_ip",
+      "a",
+      "b",
+      "c"
+    ]
+  },
+  {
+    "name": "invalid_date",
+    "line": "203.0.113.10 - - [99/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1\" 200 1",
+    "parse_status": "unparsed",
+    "fields": {},
+    "absent": [
+      "method",
+      "client_ip",
+      "a",
+      "b",
+      "c"
+    ]
+  },
+  {
+    "name": "invalid_bytes",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1\" 200 invalid",
+    "parse_status": "unparsed",
+    "fields": {},
+    "absent": [
+      "method",
+      "client_ip",
+      "a",
+      "b",
+      "c"
+    ]
+  },
+  {
+    "name": "invalid_status",
+    "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1\" 20x 1",
+    "parse_status": "unparsed",
+    "fields": {},
+    "absent": [
+      "method",
+      "client_ip",
+      "a",
+      "b",
+      "c"
+    ]
+  },
+  {
+    "name": "unclosed_logfmt",
+    "line": "level=info msg=\"not finished",
+    "parse_status": "unparsed",
+    "fields": {},
+    "absent": [
+      "method",
+      "client_ip",
+      "a",
+      "b",
+      "c"
+    ]
+  },
+  {
+    "name": "single_expression",
+    "line": "token=abc",
+    "parse_status": "unparsed",
+    "fields": {},
+    "absent": [
+      "method",
+      "client_ip",
+      "a",
+      "b",
+      "c"
+    ]
+  }
+]

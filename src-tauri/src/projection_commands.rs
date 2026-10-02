@@ -17,6 +17,26 @@ struct FieldTextAdmission {
     receipt: Receipt,
 }
 
+fn validate_field_text_request(analysis_context: Option<&Identity>, source_generation: Option<u64>, case_key: Option<&String>, case_content_token: Option<&str>) -> Result<(), String> {
+    // Unlike a general query, an exact action must name the source shown by
+    // its caller. Missing context must never silently bind the current source.
+    if analysis_context.is_none() || (case_key.is_none() && source_generation.is_none()) {
+        return Err("ANALYSIS_FIELD_ADMISSION: Informe a identidade da análise e a geração da fonte ou a chave sincronizada do Caso.".into());
+    }
+    if case_key
+        .map(String::as_str)
+        .is_some_and(|key| key.is_empty() || key.len() > 512)
+    {
+        return Err("ANALYSIS_FIELD_ADMISSION: Chave sincronizada do Caso inválida.".into());
+    }
+    match (case_key, case_content_token) {
+        (None, None) => (),
+        (Some(_), Some(token)) if !token.is_empty() && token.len() <= 128 => (),
+        _ => return Err("ANALYSIS_FIELD_ADMISSION: Informe o recibo caseContentToken retornado por case_sync apenas ao consultar evidências do Caso.".into()),
+    }
+    Ok(())
+}
+
 fn capture_field_text(
     state: &AppState,
     analysis_context: Option<Identity>,
@@ -24,22 +44,7 @@ fn capture_field_text(
     case_key: Option<String>,
     case_content_token: Option<String>,
 ) -> Result<FieldTextAdmission, String> {
-    // Unlike a general query, an exact action must name the source shown by
-    // its caller. Missing context must never silently bind the current source.
-    if analysis_context.is_none() || (case_key.is_none() && source_generation.is_none()) {
-        return Err("ANALYSIS_FIELD_ADMISSION: Informe a identidade da análise e a geração da fonte ou a chave sincronizada do Caso.".into());
-    }
-    if case_key
-        .as_deref()
-        .is_some_and(|key| key.is_empty() || key.len() > 512)
-    {
-        return Err("ANALYSIS_FIELD_ADMISSION: Chave sincronizada do Caso inválida.".into());
-    }
-    match (case_key.as_ref(), case_content_token.as_deref()) {
-        (None, None) => (),
-        (Some(_), Some(token)) if !token.is_empty() && token.len() <= 128 => (),
-        _ => return Err("ANALYSIS_FIELD_ADMISSION: Informe o recibo caseContentToken retornado por case_sync apenas ao consultar evidências do Caso.".into()),
-    }
+    validate_field_text_request(analysis_context.as_ref(), source_generation, case_key.as_ref(), case_content_token.as_deref())?;
     let _publication = crate::catalog_read_guard()?;
     // No client-supplied Event/value is accepted. Case content and its token
     // are captured together from case_sync, including same-key replacement.
@@ -50,9 +55,7 @@ fn capture_field_text(
     if admitted.case_content_token.as_deref() != case_content_token.as_deref() {
         return Err(crate::case_cache::CHANGED.into());
     }
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
-    let receipt = Receipt::from_admitted(&admitted, &codes, &system)?;
+    let receipt = Receipt::from_admitted(&admitted, &admitted.interpretation.codes, &admitted.interpretation.system_codes)?;
     Ok(FieldTextAdmission {
         admitted,
         events,
@@ -76,17 +79,12 @@ pub(crate) async fn analysis_field_text(
     operation_id: Option<String>,
     app: AppHandle,
 ) -> Result<ExactField, String> {
-    let FieldTextAdmission {
-        admitted,
-        events,
-        receipt,
-    } = capture_field_text(
-        app.state::<AppState>().inner(),
-        analysis_context,
-        source_generation,
-        case_key,
-        case_content_token,
-    )?;
+    validate_field_text_request(analysis_context.as_ref(), source_generation, case_key.as_ref(), case_content_token.as_deref())?;
+    let pin = analysis_runtime::CapturePin::for_case(app.state::<AppState>().inner(), analysis_context, source_generation, false, case_key.as_deref())?;
+    let (admitted, (events, receipt)) = analysis_runtime::capture_prepared(app.clone(), pin, operation_id.clone(), crate::global_scheduler::Priority::Interactive, move |state, pin| {
+        let FieldTextAdmission { admitted, events, receipt } = capture_field_text(state, pin.identity(), pin.generation(), case_key, case_content_token)?;
+        Ok((admitted, (events, receipt)))
+    }).await?;
     let captured = admitted.clone();
     let row = RowHandle { id, event_ref };
     crate::offload_case_record(operation_id, app.clone(), admitted, events, id, Some(row.event_ref.clone()), move |events| {
@@ -131,27 +129,19 @@ pub(crate) async fn query_projected_page(
     app: AppHandle,
 ) -> Result<ProjectedPage, String> {
     require_synchronized_case(&case_events)?;
-    crate::workspace::validate(&filters)?;
-    let (admitted, case_events, receipt, plan) = {
-        // Publication read guard spans capture, but no catalog guard spans
-        // source acquisition. Writers use this same boundary through enrich.
+    let pin = analysis_runtime::CapturePin::for_case(app.state::<AppState>().inner(), analysis_context, source_generation, false, case_key.as_deref())?;
+    let (admitted, (case_events, receipt, plan, filters)) = analysis_runtime::capture_prepared(app.clone(), pin, operation_id.clone(), crate::global_scheduler::Priority::Interactive, move |state, pin| {
+        // This guard exists only in the admitted blocking stage, never while
+        // the command future waits for a scheduler slot.
         let _publication = crate::catalog_read_guard()?;
-        let state = app.state::<AppState>();
-        let (admitted, events) = analysis_runtime::capture_case(
-            state.inner(),
-            analysis_context,
-            source_generation,
-            case_events,
-            case_key,
-        )?;
-        let codes = state.codes.read();
-        let system = state.system_codes.read();
-        let receipt = Receipt::from_admitted(&admitted, &codes, &system)?;
+        let (admitted, events) = pin.capture_case(state, case_events, case_key)?;
+        analysis_runtime::with(Some(std::sync::Arc::clone(&admitted)), || crate::workspace::validate(&filters))?;
+        let receipt = Receipt::from_admitted(&admitted, &admitted.interpretation.codes, &admitted.interpretation.system_codes)?;
         let plan = ProjectionPlan::new(projection, limit, receipt.clone())?;
-        (admitted, events, receipt, plan)
-    };
+        Ok((admitted, (events, receipt, plan, filters)))
+    }).await?;
     let captured = admitted.clone();
-    crate::offload_case(
+    crate::offload_case_interactive(
         operation_id,
         app.clone(),
         admitted,
@@ -161,8 +151,8 @@ pub(crate) async fn query_projected_page(
             let _publication = crate::catalog_read_guard()?;
             let state = app.state::<AppState>();
             let source = analysis_runtime::source(state.inner());
-            let codes = state.codes.read();
-            let system = state.system_codes.read();
+            let codes = crate::analysis_runtime::codes(&state);
+            let system = crate::analysis_runtime::system_codes(&state);
             receipt.validate_admitted(&captured, &codes, &system)?;
             let derived = analysis_runtime::derived(state.inner());
             let result = if let Some(events) = events.as_deref() {
@@ -226,21 +216,16 @@ pub(crate) async fn hydrate_projected_rows(
     app: AppHandle,
 ) -> Result<Vec<Event>, String> {
     require_synchronized_case(&case_events)?;
-    let (admitted, events) = {
+    let pin = analysis_runtime::CapturePin::for_case(app.state::<AppState>().inner(), Some(receipt.analysis_context.clone()), receipt.source_generation, false, receipt.case_key.as_deref())?;
+    let capture_receipt = receipt.clone();
+    let (admitted, events) = analysis_runtime::capture_prepared(app.clone(), pin, operation_id.clone(), crate::global_scheduler::Priority::Interactive, move |state, pin| {
         let _publication = crate::catalog_read_guard()?;
-        let state = app.state::<AppState>();
-        let (admitted, events) = analysis_runtime::capture_case(
-            state.inner(),
-            Some(receipt.analysis_context.clone()),
-            receipt.source_generation,
-            case_events,
-            receipt.case_key.clone(),
-        )?;
-        receipt.validate_admitted(&admitted, &state.codes.read(), &state.system_codes.read())?;
-        (admitted, events)
-    };
+        let (admitted, events) = pin.capture_case(state, case_events, capture_receipt.case_key.clone())?;
+        capture_receipt.validate_admitted(&admitted, &admitted.interpretation.codes, &admitted.interpretation.system_codes)?;
+        Ok((admitted, events))
+    }).await?;
     let captured = admitted.clone();
-    crate::offload_case(operation_id, app.clone(), admitted, events, move |events| {
+    crate::offload_case_interactive(operation_id, app.clone(), admitted, events, move |events| {
         let _interactive = crate::operations::interactive();
         let _publication = crate::catalog_read_guard()?;
         crate::page_projection::hydrate_projected_rows(
@@ -264,21 +249,16 @@ pub(crate) async fn hydrate_projected_field(
     app: AppHandle,
 ) -> Result<ExactField, String> {
     require_synchronized_case(&case_events)?;
-    let (admitted, events) = {
+    let pin = analysis_runtime::CapturePin::for_case(app.state::<AppState>().inner(), Some(receipt.analysis_context.clone()), receipt.source_generation, false, receipt.case_key.as_deref())?;
+    let capture_receipt = receipt.clone();
+    let (admitted, events) = analysis_runtime::capture_prepared(app.clone(), pin, operation_id.clone(), crate::global_scheduler::Priority::Interactive, move |state, pin| {
         let _publication = crate::catalog_read_guard()?;
-        let state = app.state::<AppState>();
-        let (admitted, events) = analysis_runtime::capture_case(
-            state.inner(),
-            Some(receipt.analysis_context.clone()),
-            receipt.source_generation,
-            case_events,
-            receipt.case_key.clone(),
-        )?;
-        receipt.validate_admitted(&admitted, &state.codes.read(), &state.system_codes.read())?;
-        (admitted, events)
-    };
+        let (admitted, events) = pin.capture_case(state, case_events, capture_receipt.case_key.clone())?;
+        capture_receipt.validate_admitted(&admitted, &admitted.interpretation.codes, &admitted.interpretation.system_codes)?;
+        Ok((admitted, events))
+    }).await?;
     let captured = admitted.clone();
-    crate::offload_case(operation_id, app.clone(), admitted, events, move |events| {
+    crate::offload_case_interactive(operation_id, app.clone(), admitted, events, move |events| {
         let _interactive = crate::operations::interactive();
         let _publication = crate::catalog_read_guard()?;
         crate::page_projection::hydrate_projected_field(
@@ -527,55 +507,18 @@ mod tests {
     }
 
     #[test]
-    fn catalog_receipts_cannot_capture_partial_memory_publication() {
-        for system in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let state = state(directory.path());
-            let source = state.source.write();
-            let copied = state.clone();
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let worker = std::thread::spawn(move || {
-                let text = r#"{"service":{"200":{"name":"updated","description":"description"}}}"#;
-                let result = if system {
-                    crate::publish_system_catalog(&copied, serde_json::from_str(text).unwrap())
-                } else {
-                    crate::save_codes_impl(&copied, text)
-                };
-                sender.send(result).unwrap();
-            });
-            // Wait until the new dictionary is published but Memory enrichment
-            // is blocked by this test's source guard. No receipt may bind here.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            loop {
-                let ready = if system {
-                    !state.system_codes.read().sources.is_empty()
-                } else {
-                    !state.codes.read().sources.is_empty()
-                };
-                if ready {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "catalog publisher did not progress"
-                );
-                std::thread::yield_now();
-            }
-            assert!(crate::catalog_read_guard().is_err());
-            assert!(receiver.try_recv().is_err());
-            drop(source);
-            receiver
-                .recv_timeout(std::time::Duration::from_secs(3))
-                .unwrap()
-                .unwrap();
-            worker.join().unwrap();
-            let _catalog = crate::catalog_read_guard().unwrap();
-            let source = state.source.read();
-            let SourceData::Memory(events) = &*source else {
-                panic!()
-            };
-            assert_eq!(events[0].name, "updated");
-            assert_eq!(events[0].description, "description");
-        }
+    fn startup_catalog_reads_do_not_mutate_any_open_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let source = state.source.write();
+        let before = match &*source { SourceData::Memory(events) => serde_json::to_value(events).unwrap(), _ => panic!() };
+        let bytes = br#"{"service":{"200":{"name":"template-only","description":"description"}}}"#;
+        std::fs::write(&state.system_codes_path, bytes).unwrap();
+        let loaded = crate::load_system_codes(&state.system_codes_path);
+        let after = match &*source { SourceData::Memory(events) => serde_json::to_value(events).unwrap(), _ => panic!() };
+        assert_eq!(before, after);
+        assert!(state.system_codes.read().sources.is_empty());
+        assert_eq!(loaded.sources["service"]["200"].name, "template-only");
+        assert_eq!(std::fs::read(&state.system_codes_path).unwrap(), bytes);
     }
 }
