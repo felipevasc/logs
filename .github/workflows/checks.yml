@@ -5,13 +5,47 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      portable_windows:
+        description: Also build a portable Windows executable for manual review
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  scope:
+    name: Select required validation
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      native: ${{ steps.plan.outputs.native }}
+      browser: ${{ steps.plan.outputs.browser }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: mkdir -p output
+      - name: Select essential and affected checks
+        id: plan
+        env:
+          FULL_REGRESSION: ${{ github.event_name == 'workflow_dispatch' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/ci/validation-plan.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validation-plan
+          path: output/validation-plan.json
+          if-no-files-found: error
+
   frontend:
     name: Frontend and interaction regressions
+    needs: scope
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     concurrency:
@@ -27,16 +61,18 @@ jobs:
             package-lock.json
             scripts/preview/package-lock.json
       - run: npm ci
-      - run: npm ci --prefix scripts/preview
-      - run: npx --prefix scripts/preview playwright install --with-deps chromium
+      - if: needs.scope.outputs.browser == 'true'
+        run: npm ci --prefix scripts/preview
+      - if: needs.scope.outputs.browser == 'true'
+        run: npx --prefix scripts/preview playwright install --with-deps chromium
       - run: npm run check
       - run: npm run prepare:frontend
-      - name: Focused draft interaction checks
-        if: github.event_name == 'pull_request' && github.event.pull_request.draft
-        run: npm run test:preview -- test-responsiveness.mjs test-updates.mjs test-explorer-timeline.mjs test-field-transform.mjs test-exclusion-archive.mjs test-case-references.mjs test-canonical-field-actions.mjs test-journeys.mjs test-java-trace.mjs test-native-case-startup.mjs test-native-case-timeline.mjs test-context-menu.mjs test-waiting-visuals.mjs
-      - name: Full browser regression suite
-        if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-        run: npm run test:preview
+      - uses: actions/download-artifact@v4
+        with:
+          name: validation-plan
+          path: output
+      - name: Essential and affected browser checks
+        run: node scripts/ci/validation-plan.mjs preview
       - name: Preserve browser diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -45,10 +81,11 @@ jobs:
           path: output/playwright/
           if-no-files-found: ignore
 
-  # Draft development keeps fast checks active; ready-for-review/manual checks
-  # retain the complete native gate. Release/build signing gates are unchanged.
+  # Native changes run on both platforms, including draft PRs. UI-only changes
+  # do not recompile the native suite; the plan records this as not applicable.
   backend:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: scope
+    if: needs.scope.outputs.native == 'true' || inputs.portable_windows
     name: Backend tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -63,7 +100,7 @@ jobs:
         os: [ubuntu-22.04, windows-2022]
     env:
       CARGO_TERM_COLOR: always
-      # Avoid running several independent large fixture/index builds at once.
+      # Match the release cache environment; fixture execution stays serial.
       RUST_TEST_THREADS: '1'
     steps:
       - uses: actions/checkout@v7
@@ -80,6 +117,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+          shared-key: desktop-release-v1
       - run: npm ci
       - run: npm run prepare:frontend
       - name: Backend tests
@@ -103,10 +141,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
       - name: Build Windows portable review executable
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && inputs.portable_windows
         run: cargo build --manifest-path src-tauri/Cargo.toml --release --locked --bin loginsight
       - name: Verify Windows app manifest
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && inputs.portable_windows
         shell: pwsh
         run: ./scripts/ci/verify-windows-manifest.ps1 -Target app
       - name: Preserve Windows manifest verification
@@ -118,7 +156,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
       - name: Record portable executable identity
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && inputs.portable_windows
         shell: pwsh
         env:
           REVIEW_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -137,7 +175,7 @@ jobs:
             sha256 = $digest
           } | ConvertTo-Json | Set-Content "$destination/build-identity.json" -Encoding utf8
       - name: Upload Windows portable review build
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && inputs.portable_windows
         uses: actions/upload-artifact@v4
         with:
           name: LogInsight-Windows-x64-review-${{ github.event.pull_request.head.sha || github.sha }}
@@ -145,5 +183,28 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-# Portable review artifact only: no installers, updater runs, signing,
+# Optional portable review artifact only: no installers, updater runs, signing,
 # production configuration changes, repository writes or releases.
+
+  required:
+    name: Required validation
+    needs: [scope, frontend, backend]
+    if: always()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every selected gate to succeed
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          FRONTEND_RESULT: ${{ needs.frontend.result }}
+          NATIVE_REQUIRED: ${{ needs.scope.outputs.native == 'true' || inputs.portable_windows }}
+          BACKEND_RESULT: ${{ needs.backend.result }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          test "$FRONTEND_RESULT" = success
+          if [ "$NATIVE_REQUIRED" = true ]; then
+            test "$BACKEND_RESULT" = success
+          else
+            test "$BACKEND_RESULT" = skipped
+            echo 'Native checks were not applicable to these paths; no native pass is claimed.'
+          fi

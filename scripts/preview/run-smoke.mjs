@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { fullPreview } from "../ci/validation-plan.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const selected = process.argv.slice(2);
-const tests = selected.length ? selected : ["test-navigation.mjs", "test-ui-scale.mjs", "test-workspace-context.mjs", "test-responsiveness.mjs", "test-journeys.mjs", "test-remote-sources.mjs", "test-analysis-workbench.mjs", "test-discovery.mjs", "test-updates.mjs", "test-explorer-timeline.mjs", "test-field-transform.mjs", "test-exclusion-archive.mjs", "test-case-references.mjs", "test-canonical-field-actions.mjs", "test-java-trace.mjs", "test-native-case-startup.mjs", "test-native-case-timeline.mjs", "test-context-menu.mjs", "test-waiting-visuals.mjs"];
+const tests = selected.length ? selected : fullPreview;
 for (const name of tests) {
   if (!/^test-[a-z0-9-]+\.mjs$/.test(name)) throw new Error(`Invalid preview test name: ${name}`);
 }
@@ -26,19 +27,31 @@ try {
     server.once("error", error => { clearTimeout(timeout); reject(error); });
     server.once("exit", code => { clearTimeout(timeout); reject(new Error(`Preview server exited (${code})`)); });
   });
-  const failures = [];
+  const failures = [], timings = [];
+  const suiteStarted = performance.now();
   for (const test of tests) {
     console.log(`\nPreview regression: ${test}`);
+    const started = performance.now();
+    let passed = true;
     try { await new Promise((resolve, reject) => {
       active = spawn(process.execPath, [`scripts/preview/${test}`, url], { cwd: root, stdio: "inherit" });
       const timeout = setTimeout(() => { active.kill(); reject(new Error(`${test} timed out after 120s`)); }, 120_000);
       active.once("error", error => { clearTimeout(timeout); reject(error); });
       active.once("exit", code => { clearTimeout(timeout); code === 0 ? resolve() : reject(new Error(`${test} failed (${code})`)); });
     }); } catch (error) {
+      passed = false;
       failures.push({ test, message: String(error) });
       console.error(`Preview regression failed: ${test}: ${error.message}`);
+    } finally {
+      const elapsedMs = Math.round(performance.now() - started);
+      timings.push({ test, passed, elapsedMs });
+      console.log(`Preview duration: ${test}: ${elapsedMs}ms (${passed ? "passed" : "failed"})`);
     }
   }
+  await writeFile(new URL("../../output/playwright/smoke-summary.json", import.meta.url), JSON.stringify({
+    transport: "synthetic-preview", sourceCommit: process.env.GITHUB_SHA || null,
+    elapsedMs: Math.round(performance.now() - suiteStarted), tests: timings,
+  }, null, 2) + "\n");
   if (failures.length) {
     console.error(`\n${failures.length}/${tests.length} preview regressions failed: ${failures.map(f => f.test).join(", ")}`);
     process.exitCode = 1;
