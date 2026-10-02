@@ -82,7 +82,7 @@ try {
   const labels = await page.locator('.ctx-menu button').allTextContents();
   assert.ok(labels.some(label => label.includes('Copiar classe observada')));
   assert.ok(labels.every(label => !/filtr|Timeline|Transformar/i.test(label)), 'virtual node parts never acquire invented field actions');
-  await page.getByRole('button', { name: 'Copiar classe observada', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Copiar classe observada', exact: true }).click();
   await page.waitForFunction(() => window.__javaCopied.length === 1);
   assert.equal(await page.evaluate(() => window.__javaCopied[0]), complete.detail.trace.nodes[frameNodeIndex].class);
   assert.equal((await calls()).analysis_field_text, exactReads);

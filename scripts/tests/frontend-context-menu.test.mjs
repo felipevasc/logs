@@ -203,7 +203,23 @@ test('outside clicks, focus changes and scrolling dismiss without stealing focus
   assert.equal(h.controller.element, null); assert.notEqual(h.document.activeElement, h.origin);
   h.flush(); h.origin.focus(); h.open([choice('Action')]);
   h.dispatch('scroll', { target: h.controller.element }); assert.ok(h.controller.element);
+  h.document.documentElement.scrollTop = 50;
   h.dispatch('scroll', { target: h.document }); assert.equal(h.controller.element, null);
+});
+
+test('queued caller scroll notifications preserve a just-opened menu; new movement dismisses it', () => {
+  const h = harness(), drawer = h.node('div'), caller = h.node('button', drawer);
+  drawer.scrollTop = 420; caller.focus();
+  h.open([choice('Action')]); const menu = h.controller.element;
+  h.dispatch('scroll', { target: drawer });
+  assert.equal(h.controller.element, menu, 'the scroll position already existed at open');
+  h.dispatch('scroll', { target: h.document });
+  assert.equal(h.controller.element, menu, 'unchanged viewport notification is harmless');
+  const unrelated = h.node('div'); unrelated.scrollTop = 80;
+  h.dispatch('scroll', { target: unrelated });
+  assert.equal(h.controller.element, menu, 'an unrelated surface does not move the caller');
+  drawer.scrollTop = 440; h.dispatch('scroll', { target: drawer });
+  assert.equal(h.controller.element, null, 'actual originating-container movement dismisses');
 });
 
 test('Tab resumes from the caller and leaves enclosing modal tab handling available', () => {

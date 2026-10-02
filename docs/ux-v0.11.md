@@ -6,7 +6,7 @@ Refinar a organização atual, que o usuário quer preservar, com aparência esc
 
 Nas esperas, a animação é o foco visual, acompanhada de uma ação curta e contagens reais. Misturar objetos e um personagem discreto quando fizer sentido. Esperas curtas pedem gestos simples; esperas longas podem ter uma cena pequena, fluida e variada em loop. Informações técnicas ficam sob demanda, mantendo erros e ações importantes acessíveis.
 
-Desenvolvimento autorizado em 02/10/2026. A release 0.11 requer autorização própria. Base inicial local `97e5ad388f2b96111e12933cbc2de3eb14c7939e`, árvore `458245af9c48ba4d62c6a5a5aec2bbf0f38807b0`, equivalente ao candidato remoto 0.10 `675d7798c561535ab0fa7d4c55727db59781b7ba`. Correções finais da 0.10 devem ser incorporadas antes da integração.
+Desenvolvimento autorizado em 02/10/2026. A release 0.11 requer autorização própria. Base inicial local `97e5ad388f2b96111e12933cbc2de3eb14c7939e`, árvore `458245af9c48ba4d62c6a5a5aec2bbf0f38807b0`, equivalente ao candidato remoto 0.10 `675d7798c561535ab0fa7d4c55727db59781b7ba`. A 0.10 foi integrada à main em `4399c7777d76097bd13e72fac92dd7723e301fab`, com a mesma árvore, e publicada; o checkpoint remoto da 0.11 parte dessa main sem duplicar seu histórico.
 
 ## Primeiro recorte
 
@@ -90,6 +90,6 @@ Usar esses casos como referência de comportamento. As ilustrações e animaçõ
 
 Menus compartilhados e três famílias de espera estão implementados no frontend. Os pilotos usam abertura/indexação e checkpoint no overlay existente, além de Resumir e Cruzar dados. Controles de movimento não cancelam operações; cancelamento real interrompe a animação imediatamente, inclusive antes do primeiro progresso, mas aguarda a confirmação da tarefa.
 
-Verificação local: 699 testes Node, análise sintática dos scripts, consistência de versões, salvaguardas de release e preparação dos arquivos frontend aprovados. A revisão independente dos componentes e do vínculo entre tarefa e cena não deixou bloqueadores conhecidos. Nenhum backend Rust foi alterado ou compilado.
+Verificação local após os ajustes do primeiro CI: 701 testes Node, análise sintática dos scripts, consistência de versões, salvaguardas de release e preparação dos arquivos frontend aprovados. A revisão independente dos componentes e do vínculo entre tarefa e cena não deixou bloqueadores conhecidos. Nenhum backend Rust foi alterado ou compilado.
 
-A regressão visual e de navegador está pendente do CI: o ambiente local não permitiu iniciar o Chromium de testes nem abrir a URL de loopback no navegador gerenciado. Os novos roteiros registram capturas reais do aplicativo de preview com transporte sintético e estados explicitamente atribuídos; essas capturas ainda não foram produzidas neste checkpoint. Não é validação do WebView instalado nem aprovação definitiva do desenho.
+O primeiro CI de preview produziu capturas reais com transporte sintético e estados explicitamente atribuídos. O cenário dedicado do menu passou; sete dos treze roteiros encontraram regressões, incluindo seletores antigos, foco de retorno, scroll enfileirado e arredondamento do limiar de espera longa. Essas causas foram corrigidas com regressões locais; a confirmação do conjunto depende de novo CI. O ambiente local não permite iniciar o Chromium de testes, por isso a renderização é validada no CI. Essas capturas não validam o WebView instalado nem representam aprovação definitiva do desenho.

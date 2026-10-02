@@ -11,7 +11,7 @@ const errors=[],results={};let phase='startup';page.on('pageerror',error=>errors
 const settled=async()=>{await page.evaluate(()=>settleFilterTabCounts());await page.waitForFunction(()=>Tasks.pending()===0);};
 const chooseHeader=async(label)=>{
   await page.locator('#events-table th').filter({hasText:label}).first().click({button:'right'});
-  await page.getByRole('button',{name:`Representar ${label} na Timeline`,exact:true}).click();
+  await page.getByRole('menuitem',{name:`Representar ${label} na Timeline`,exact:true}).click();
 };
 try{
   await page.goto(process.argv[2]||'http://127.0.0.1:4174');

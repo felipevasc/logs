@@ -732,8 +732,9 @@ function areaLoading(container, text = "Consultando…", { phaseId = "" } = {}) 
     if (phaseId) {
       ov.classList.add("area-loading-semantic");
       visual = window.WaitingVisuals.mount(ov, receipt());
-      // One measured threshold update, not a per-frame clock or query.
-      if (waitState === "running") longWait = setTimeout(() => visual?.update(receipt()), Math.max(0, 4000 - (performance.now() - started)));
+      // One measured threshold update, not a per-frame clock or query. Browser
+      // timeouts truncate fractions; round up so the only receipt is not early.
+      if (waitState === "running") longWait = setTimeout(() => visual?.update(receipt()), Math.max(0, Math.ceil(4000 - (performance.now() - started))));
     } else ov.innerHTML = `<i class="fas fa-circle-notch spin"></i><span>${esc(text)}</span>`;
     requestAnimationFrame(() => ov?.classList.add("show"));
   }, 250);
@@ -2210,7 +2211,9 @@ function openFilterPop(anchor = null, editIndex = null, preset = null) {
   currentEditFilter = editIndex == null ? null : state.filters[editIndex];
   currentEditFilterValue = currentEditFilter ? JSON.stringify(currentEditFilter) : null;
   currentFilterContext = filterContextKey();
-  const origin = anchor?.matches?.("button,input,select,textarea,[tabindex],a[href]") ? anchor : document.activeElement;
+  // An explicit cell/text anchor owns the return path even when it cannot take
+  // focus itself; use the filter fallback, not unrelated restored menu focus.
+  const origin = anchor || document.activeElement;
   filterReturnFocus = filterFocusTarget(origin);
   const pop = $("#filter-pop");
   const colSel = $("#fp-col");

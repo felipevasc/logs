@@ -358,6 +358,26 @@ try {
   writeFileSync(resolve(output, 'waiting-visuals-results.json'), JSON.stringify(results, null, 2));
   console.log(JSON.stringify(results, null, 2));
 } catch (error) {
+  // Capture actual rendered state at the failing boundary, especially a threshold
+  // wait: screenshots alone cannot distinguish finished gestures from live loops.
+  try {
+    results.failureWaitingState = await page.evaluate(() => ({
+      documentHidden: document.hidden,
+      reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
+      pendingTransport: window.__waitingPreviewBridge?.pending.map(({ command, operationId }) => ({ command, operationId })),
+      tasks: window.Tasks?.groups().flatMap(group => group.tasks.map(task => ({
+        operationId: task.operationId, command: task.cmd, status: task.status, elapsedMs: performance.now() - task.started,
+      }))),
+      scenes: [...document.querySelectorAll('.waiting-visual')].map(root => ({
+        dataset: { ...root.dataset }, text: root.textContent,
+        connected: root.isConnected, hiddenAncestor: !!root.closest('[hidden]'),
+        bounds: root.getBoundingClientRect().toJSON(),
+        animations: root.getAnimations({ subtree: true }).map(animation => ({
+          playState: animation.playState, currentTime: animation.currentTime, timing: animation.effect.getComputedTiming(),
+        })),
+      })),
+    }));
+  } catch (captureError) { results.failureWaitingCaptureError = String(captureError); }
   results.ok = false;
   writeFileSync(resolve(output, 'waiting-visuals-results.json'), JSON.stringify({ ...results, phase, errors, error: String(error.stack || error) }, null, 2));
   await captureFailure(page, 'waiting-visuals', error, { phase, errors, results });

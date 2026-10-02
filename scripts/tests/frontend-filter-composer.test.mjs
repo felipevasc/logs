@@ -64,6 +64,12 @@ origin.hidden=true;const drawerClose=node('#dr-close');drawerClose.hidden=false;
 context.openFilterPop();context.closeFilterPop();assert.equal(document.activeElement,drawerClose,'hidden toolbar falls back to the visible inspector control');
 origin.hidden=false;drawerClose.hidden=true;const transient=node('#temporary-trigger');transient.hidden=false;
 context.openFilterPop(transient);transient.isConnected=false;context.closeFilterPop();assert.equal(document.activeElement,origin);
+const search=node('#quick-search');search.hidden=false;search.focus();
+const cell={isConnected:true,hidden:false,disabled:false,matches:()=>false,closest:()=>null};
+context.openValueFilter('timestamp',123,cell);context.closeFilterPop();
+assert.equal(document.activeElement,origin,'an explicit non-focusable cell uses filter fallback rather than unrelated previous focus');
+search.focus();context.openFilterPop();context.closeFilterPop();
+assert.equal(document.activeElement,search,'no explicit anchor still preserves the active control');
 console.log('Composer accessible names and visible/focusable return targets passed');
 
 // Textareas preserve LF; CR-containing values use a visible JSON-string view

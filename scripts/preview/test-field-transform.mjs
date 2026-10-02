@@ -13,7 +13,7 @@ const settled=async()=>{
   await page.evaluate(()=>settleFilterTabCounts());await page.waitForFunction(()=>Tasks.pending()===0);
 };
 const addStep=async value=>{await page.locator('#ft-step-choice').selectOption(value);await page.locator('#ft-add-step').click();};
-const openHeader=async()=>{await page.locator('#events-table th').filter({hasText:'mock_payload_b64'}).click({button:'right'});await page.getByRole('button',{name:'Transformar campo',exact:true}).click();};
+const openHeader=async()=>{await page.locator('#events-table th').filter({hasText:'mock_payload_b64'}).click({button:'right'});await page.getByRole('menuitem',{name:'Transformar campo',exact:true}).click();};
 const readablePreview=async()=>{
   const values=await page.locator('#ft-original,#ft-output').evaluateAll(nodes=>{
     const luminance=color=>{

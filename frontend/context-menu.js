@@ -13,6 +13,15 @@ window.ContextMenu = (() => {
     const returnTarget = entry => [entry.origin, ...fallbackFocus(entry.source)].find(validFocus);
     const consume = event => { event.preventDefault(); event.stopImmediatePropagation(); };
     const controls = () => current ? [...current.menu.querySelectorAll('[role="menuitem"]')].filter(visible) : [];
+    const scrollPosition = node => {
+      const element = node === document ? document.scrollingElement || document.documentElement : node;
+      return [element.scrollLeft || 0, element.scrollTop || 0];
+    };
+    function captureScroll(source) {
+      const positions = new Map([[document, scrollPosition(document)]]);
+      for (let node = source; node; node = node.parentElement) positions.set(node, scrollPosition(node));
+      return positions;
+    }
 
     function close({ restoreFocus = false } = {}) {
       if (!current) return;
@@ -81,7 +90,7 @@ window.ContextMenu = (() => {
         menu.appendChild(button);
       }
       const anchor = source?.getBoundingClientRect?.();
-      current = { menu, source, origin,
+      current = { menu, source, origin, scrollPositions: captureScroll(source),
         x: keyboard && anchor ? anchor.left : Number.isFinite(x) ? x : anchor?.left || 8,
         y: keyboard && anchor ? anchor.bottom : Number.isFinite(y) ? y : anchor?.bottom || 8 };
       document.body.appendChild(menu);
@@ -148,7 +157,13 @@ window.ContextMenu = (() => {
       } finally { keyboardTarget = null; }
     }, true);
     document.addEventListener("scroll", event => {
-      if (current && !current.menu.contains(event.target)) close();
+      if (!current || current.menu.contains(event.target)) return;
+      const before = current.scrollPositions.get(event.target);
+      if (!before) return;
+      const after = scrollPosition(event.target);
+      // A right-click may follow auto-scrolling the caller into view before its
+      // queued scroll event arrives. Dismiss only for movement after menu open.
+      if (after.some((value, index) => value !== before[index])) close();
     }, true);
     window.addEventListener("resize", position);
     return { open, close, get element() { return current?.menu || null; } };
