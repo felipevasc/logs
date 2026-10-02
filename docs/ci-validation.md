@@ -10,6 +10,8 @@
 - Apenas documentação: as verificações Node/versão/release continuam; navegador e nativo são declarados não aplicáveis.
 - `Required validation` só passa quando todos os gates selecionados passaram. Cancelamento, falha ou um gate obrigatório pulado bloqueia o resultado. O relatório de escopo e `validation-plan.json` registram exatamente a seleção.
 
+Marcar um PR como pronto para revisão não dispara de novo a mesma matriz: o escopo já é igual em draft e em revisão. Os eventos automáticos de validação são abertura, atualização de commits, reabertura e troca da branch base. Ajustar somente título/descrição não repete builds: esse evento usa nomes de checks separados, sem substituir um `Required validation` anterior por um resultado pulado. O disparo manual continua disponível.
+
 O executável portátil Windows deixou de ser reconstruído em todo PR. Pode ser pedido em `Pull request checks` → **Run workflow** → `portable_windows`. Mantém identidade SHA-256/commit e verificação do manifesto quando solicitado. O manifesto do harness Windows continua obrigatório sempre que o nativo roda.
 
 A regressão ampla não foi apagada: `npm run test:preview` mantém a lista completa existente, e o disparo manual de `Pull request checks` seleciona todas as plataformas e o navegador completo. Testes de navegador alterados entram diretamente na seleção. Ajustar apenas o seletor dispara a regressão de navegador completa; os testes Node verificam suas decisões sem exigir uma nova compilação Rust. Novas áreas devem ser mapeadas em `scripts/ci/validation-plan.mjs`; um módulo desconhecido força o conjunto completo até isso acontecer.
