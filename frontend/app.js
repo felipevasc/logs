@@ -648,7 +648,7 @@ const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // Only frequent, benign acknowledgements coalesce. Errors, context warnings and
 // evidence/Undo receipts keep their own identity and existing lifetime.
 const repeatableToastMessages = new Set([
-  "Copiado.", "Valor copiado.", "Nome copiado.", "JSON copiado.", "SHA-256 copiado.",
+  "Copiado.", "Valor copiado.", "Nome copiado.", "JSON copiado.", "SHA-256 copiado.", "Caminho copiado.",
   "Filtro atualizado.", "Filtro adicionado.",
 ]);
 const toastFeedback = new Map();

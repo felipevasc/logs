@@ -105,13 +105,41 @@ test('rapid copies reuse one confirmation and renew only its cleanup timer', () 
 
 test('each supported copy/filter message coalesces, but only an exact benign match', () => {
   const h = harness();
-  for (const message of ['Copiado.', 'Valor copiado.', 'Nome copiado.', 'JSON copiado.', 'SHA-256 copiado.', 'Filtro atualizado.', 'Filtro adicionado.']) {
+  for (const message of ['Copiado.', 'Valor copiado.', 'Nome copiado.', 'JSON copiado.', 'SHA-256 copiado.', 'Caminho copiado.', 'Filtro atualizado.', 'Filtro adicionado.']) {
     h.toast(message); h.toast(message);
   }
-  assert.equal(h.notices.length, 7);
+  assert.equal(h.notices.length, 8);
   for (const node of h.notices) assert.equal(node.children[1].textContent, '×2');
   h.toast('Filtro atualizado. ', 'ok'); h.toast('Filtro atualizado. ', 'ok');
-  assert.equal(h.notices.length, 9, 'no trimming or approximate matching can silently group different information');
+  assert.equal(h.notices.length, 10, 'no trimming or approximate matching can silently group different information');
+});
+
+test('source path and SHA-256 confirmations coalesce separately, retaining exact text and independent Undo', () => {
+  const h = harness(), undo = h.appendRealUndo(), before = undo.getBoundingClientRect();
+  for (let i = 0; i < 4; i++) h.toast('Caminho copiado.', 'ok');
+  for (let i = 0; i < 3; i++) h.toast('SHA-256 copiado.', 'ok');
+  assert.equal(h.notices.length, 2);
+  assert.deepEqual(h.notices.map(node => node.children[0].textContent), ['Caminho copiado.', 'SHA-256 copiado.']);
+  assert.deepEqual(h.notices.map(node => node.children[1].textContent), ['×4', '×3']);
+  assert.equal(h.notices.every(node => node.className.includes('toast-passive')), true);
+  assert.equal(h.interactiveArea.children.length, 1); assert.deepEqual(undo.getBoundingClientRect(), before);
+  h.advance(4200);
+  assert.equal(h.notices.length, 0); assert.equal(undo.isConnected, true);
+  assert.deepEqual(undo.getBoundingClientRect(), before); assert.equal(h.timers.size, 1, 'only independent Undo remains');
+});
+
+test('source copy wording variants, failures and non-success types are never coalesced', () => {
+  const h = harness();
+  for (const message of ['Caminho copiado.', 'SHA-256 copiado.']) {
+    for (const [text, type] of [[message, 'err'], [message, 'info'], [`${message} `, 'ok'], [message.slice(0, -1), 'ok']]) {
+      const count = h.notices.length; h.toast(text, type); h.toast(text, type);
+      assert.equal(h.notices.length, count + 2, `${type}: ${JSON.stringify(text)}`);
+    }
+  }
+  const failure = 'Não foi possível copiar. Selecione o texto e tente novamente.';
+  h.toast(failure, 'err'); h.toast(failure, 'err');
+  assert.equal(h.notices.every(node => !node.className.includes('toast-passive')), true);
+  assert.deepEqual(h.notices.slice(-2).map(node => node.getAttribute('role')), ['alert', 'alert']);
 });
 
 test('errors, context warnings and evidence receipts remain separate even when equal', () => {

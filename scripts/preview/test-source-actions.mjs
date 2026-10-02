@@ -63,7 +63,11 @@ try {
     await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme); await settle();
     const after = await page.evaluate(() => {
       const table = document.querySelector('.sources-table'), row = table.querySelector('tbody tr'), trigger = row.querySelector('.source-path-toggle');
+      const badge = table.querySelector('tbody tr:last-child .source-reading-cell .tag'), style = getComputedStyle(badge);
+      const cell = badge.closest('td'), cellStyle = getComputedStyle(cell);
       return { rowHeight: row.getBoundingClientRect().height, tableWidth: table.getBoundingClientRect().width, font: getComputedStyle(table).fontSize,
+        readingBadge: { text: badge.textContent, boxes: badge.getClientRects().length, display: style.display, boxSizing: style.boxSizing,
+          width: badge.getBoundingClientRect().width, available: cell.clientWidth - parseFloat(cellStyle.paddingLeft) - parseFloat(cellStyle.paddingRight), font: style.fontSize },
         nameHeight: trigger.getBoundingClientRect().height, actionHeight: row.querySelector('.source-menu-trigger').getBoundingClientRect().height,
         overflow: document.documentElement.scrollWidth > innerWidth, pathHidden: [...table.querySelectorAll('.source-path-details')].every(node => node.hidden) };
     });
@@ -80,6 +84,9 @@ try {
     await screenshot(`source-actions-before-${theme}-${width}.png`, 'Fontes · Preview sintético · Layout anterior reconstruído com os mesmos dados');
     await page.evaluate(() => { document.querySelector('#source-before').remove(); document.querySelector('.sources-table').hidden = false; document.querySelector('.sources-table').parentElement.classList.add('source-table-scroll'); document.querySelector('.source-controls').classList.add('source-toolbar'); });
     assert.equal(after.font, before.font); assert.equal(after.overflow, false); assert.equal(after.pathHidden, true);
+    assert.equal(after.readingBadge.text, '3/20 não interpretados na amostra');
+    assert.equal(after.readingBadge.boxes, 1); assert.equal(after.readingBadge.display, 'inline-block');
+    assert.equal(after.readingBadge.boxSizing, 'border-box'); assert.ok(after.readingBadge.width <= after.readingBadge.available + 1);
     assert.ok(after.actionHeight >= 32 && after.nameHeight >= 28);
     assert.ok(after.rowHeight < before.rowHeight, `${width}/${theme}: compact rows must actually save vertical space`);
     results.visuals.push({ width, theme, before, after, savedHeight: before.rowHeight - after.rowHeight });
@@ -195,6 +202,23 @@ try {
   await rows.nth(1).locator('.hash-copy').first().waitFor({ state: 'visible' }); assert.equal(await rows.nth(1).locator('.hash-copy').count(), 2);
   await rows.nth(1).locator('.hash-copy').last().click(); assert.equal(await page.evaluate(() => __sourceTest.copied.at(-1)), 'c'.repeat(64));
   assert.equal(await rows.nth(1).locator('.source-action-status').isVisible(), false);
+  // Reset only these benign fixture acknowledgements through production cleanup,
+  // then exercise real copy controls with a deterministic burst before capture.
+  await page.evaluate(() => {
+    for (const [node, record] of toastFeedback) if (['Caminho copiado.', 'SHA-256 copiado.'].includes(record.message)) removeToastFeedback(node);
+  });
+  for (let i = 0; i < 4; i++) await rows.nth(1).getByRole('button', { name: 'Copiar caminho', exact: true }).click();
+  for (let i = 0; i < 3; i++) await rows.nth(1).locator('.hash-copy').last().click();
+  await settle();
+  const copyFeedback = await page.evaluate(() => [...document.querySelectorAll('#toast-feedback-area .toast')]
+    .filter(node => ['Caminho copiado.', 'SHA-256 copiado.'].includes(node.querySelector('.toast-message')?.textContent))
+    .map(node => ({ text: node.querySelector('.toast-message').textContent, count: node.querySelector('.toast-repeat-count').textContent,
+      role: node.getAttribute('role'), passive: node.classList.contains('toast-passive') })));
+  assert.deepEqual(copyFeedback, [
+    { text: 'Caminho copiado.', count: '×4', role: 'status', passive: true },
+    { text: 'SHA-256 copiado.', count: '×3', role: 'status', passive: true },
+  ]);
+  results.copyFeedback = copyFeedback;
   await screenshot('source-actions-path-and-hashes-1024.png', 'Fontes · Preview sintético · Caminho e SHA-256 sob demanda');
   await selectAction(0, 'Calcular SHA-256'); await page.waitForFunction(() => __sourceTest.hashes.length === 2);
   const custodyBefore = await page.evaluate(() => __sourceTest.custody.length);

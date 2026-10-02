@@ -170,7 +170,7 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 .sources-table th,.sources-table td{padding:10px 12px}
 .sources-table .source-selection-cell,.sources-table .source-menu-cell{width:48px;padding-inline:8px}
 .sources-table .source-format-cell{width:100px}.sources-table .source-number-cell{width:84px}.sources-table .source-reading-cell{width:158px}
-.sources-table .source-file-cell{min-width:0}.sources-table .tag{max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.sources-table .source-file-cell{min-width:0}.sources-table .tag{display:inline-block;box-sizing:border-box;max-width:100%;white-space:normal;overflow-wrap:anywhere}
 .source-path-toggle{display:flex;align-items:center;gap:7px;width:100%;min-height:28px;padding:0;border:0;background:transparent;color:var(--text-0);font:inherit;font-weight:600;text-align:left;cursor:pointer}
 .source-path-toggle>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-path-toggle>i{flex:none;font-size:9px;color:var(--text-2)}
 .source-path-toggle[aria-expanded="true"]>i{transform:rotate(90deg)}.source-path-toggle:hover{color:var(--accent-strong,var(--accent))}
