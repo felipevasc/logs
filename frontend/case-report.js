@@ -2,7 +2,7 @@
 window.CaseReport = (() => {
   'use strict';
   const MAX_PAGES = 500, MAX_BYTES = 32 * 1024 * 1024, LEFT = 18, RIGHT = 192, BOTTOM = 277, WIDTH = RIGHT - LEFT;
-  let libraries, dialog;
+  let libraries, dialog, waitingSerial = 0;
   const check = signal => { if (signal?.aborted) throw new DOMException('Geração cancelada', 'AbortError'); };
   const pause = () => new Promise(resolve => setTimeout(resolve, 0));
   const toDataURL = blob => new Promise((resolve,reject) => { const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(Error('Não foi possível ler a imagem.'));reader.readAsDataURL(blob); });
@@ -118,7 +118,7 @@ window.CaseReport = (() => {
         y+=take*tableLine+4;pdf.setDrawColor(233,234,239);pdf.line(LEFT,y-1,RIGHT,y-1);offset+=take;
         if(offset<total){newPage();tableHead();draw('Continuação da ocorrência',LEFT+2,y+2,7,false,[116,107,134]);y+=6;}
       }
-      if(i%25===0){progress(`Organizando timeline: ${i+1} / ${timeline.rows.length}…`);await pause();}
+      if(i%25===0){progress(`Organizando timeline: ${i+1} / ${timeline.rows.length}…`, {label:'Organizando timeline…',completed:i+1,total:timeline.rows.length,unit:'ocorrências'});await pause();}
     }
     if(!timeline.rows.length)await paragraph('Nenhuma ocorrência registrada.');
     async function evidence(entry) {
@@ -131,7 +131,7 @@ window.CaseReport = (() => {
     }
     const associated=new Set();
     for(let i=0;i<trails.length;i++){
-      check(signal);const trail=trails[i];section=`Trilha ${i+1} · ${trail.title||'Sem título'}`;progress(`Organizando trilha ${i+1} / ${trails.length}…`);await heading(section,{fresh:true});
+      check(signal);const trail=trails[i];section=`Trilha ${i+1} · ${trail.title||'Sem título'}`;progress(`Organizando trilha ${i+1} / ${trails.length}…`, {label:'Organizando trilhas…',completed:i,total:trails.length,unit:'trilhas concluídas'});await heading(section,{fresh:true});
       const narrative=CaseContent.narrative(trail);await paragraph(narrative.summary,{bold:true});await paragraph(narrative.details);await gallery(trail);
       const linked=nativeBindings?nativeBindings.associations(trail):(trail.itemIds||[]).map(id=>({state:byId.get(id)?'unique':'missing',item:byId.get(id)?.item}));
       if(!linked.length)await paragraph('Nenhum item associado a esta trilha.',{size:9,color:[110,115,125]});
@@ -144,23 +144,56 @@ window.CaseReport = (() => {
     check(signal);const blob=pdf.output('blob');if(blob.size>MAX_BYTES)throw Error('O relatório excede 32 MB. Reduza a quantidade de imagens ou divida o Caso.');
     return {blob,pages,filename:filename(c),rows:timeline.rows.length,items:items.length,trails:trails.length,overview:overview.overview};
   }
+  // Decorates only the existing render promise. The renderer supplies real status and,
+  // when available, counts as a backward-compatible second progress argument.
+  // Appearance and a single measured threshold never delay settlement or add queries.
+  function renderWaiting(host, status, bar) {
+    const started = performance.now(), operationId = `case-report-${++waitingSerial}`;
+    let visual = null, longWait = null, finished = false, label = '', measurements = {};
+    const receipt = () => ({ operationId, phaseId:'command:case_report_render', state:'running',
+      label, ...measurements, elapsedMs:performance.now()-started });
+    const timer = setTimeout(() => {
+      if (finished || !host.isConnected || !window.WaitingVisuals) return;
+      host.hidden = false;
+      visual = window.WaitingVisuals.mount(host, receipt());
+      status.hidden = true; bar.hidden = true;
+      longWait = setTimeout(() => {
+        if (!finished && host.isConnected) visual?.update(receipt());
+      }, Math.max(0, Math.ceil(4000-(performance.now()-started))));
+    }, 250);
+    return {
+      progress(value, detail = {}) {
+        if (finished || !host.isConnected) return;
+        status.textContent = value;
+        label = typeof detail.label === 'string' ? detail.label : value;
+        // Replace measurements on every real callback; prior row totals do not leak into images/pages.
+        measurements = { completed:detail.completed, total:detail.total, unit:detail.unit };
+        visual?.update(receipt());
+      },
+      done() {
+        if (finished) return;
+        finished = true; clearTimeout(timer); clearTimeout(longWait);
+        visual?.destroy(); visual = null; host.hidden = true; status.hidden = false; bar.hidden = false;
+      }
+    };
+  }
   function open() {
     if(dialog)return;const c=activeCase();if(!c){toast('Selecione um Caso.','info');return;}
     const overlay=el('div','modal-overlay'),controller=new AbortController(),origin=document.activeElement;dialog=overlay;
-    overlay.innerHTML='<section class="modal case-report-dialog" role="dialog" aria-modal="true" aria-labelledby="case-report-title"><div class="modal-head"><h3 id="case-report-title">Relatório do Caso</h3><button class="icon-btn" data-close aria-label="Fechar"><i class="fas fa-xmark"></i></button></div><div class="modal-body"><p data-case></p><p class="muted small">Visão do Caso, timeline em tabela, trilhas e itens com suas explicações e imagens.</p><p class="muted small" data-status role="status"></p><progress hidden></progress><div class="modal-actions"><button class="btn ghost" data-cancel>Cancelar</button><button class="btn primary" data-generate><i class="fas fa-file-pdf"></i> Gerar PDF</button></div></div></section>';
+    overlay.innerHTML='<section class="modal case-report-dialog" role="dialog" aria-modal="true" aria-labelledby="case-report-title"><div class="modal-head"><h3 id="case-report-title">Relatório do Caso</h3><button class="icon-btn" data-close aria-label="Fechar"><i class="fas fa-xmark"></i></button></div><div class="modal-body"><p data-case></p><p class="muted small">Visão do Caso, timeline em tabela, trilhas e itens com suas explicações e imagens.</p><p class="muted small" data-status role="status"></p><progress hidden></progress><div data-waiting hidden></div><div class="modal-actions"><button class="btn ghost" data-cancel>Cancelar</button><button class="btn primary" data-generate><i class="fas fa-file-pdf"></i> Gerar PDF</button></div></div></section>';
     overlay.querySelector('[data-case]').textContent=`${c.name} · Caso completo · ${c.items?.length||0} itens`;
-    let running=false,saving=false;
-    const close=()=>{if(saving)return;controller.abort();overlay.remove();dialog=null;origin?.focus();};
+    let running=false,saving=false,waiting=null;
+    const close=()=>{if(saving)return;waiting?.done();controller.abort();overlay.remove();dialog=null;origin?.focus();};
     overlay.querySelector('[data-close]').onclick=close;overlay.querySelector('[data-cancel]').onclick=close;overlay.onclick=e=>{if(e.target===overlay)close();};overlay.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();e.stopPropagation();close();}};
     overlay.querySelector('[data-generate]').onclick=async()=>{
-      if(running)return;running=true;const button=overlay.querySelector('[data-generate]'),status=overlay.querySelector('[data-status]'),bar=overlay.querySelector('progress');button.disabled=true;bar.hidden=false;status.classList.remove('case-report-error');
+      if(running)return;running=true;const button=overlay.querySelector('[data-generate]'),status=overlay.querySelector('[data-status]'),bar=overlay.querySelector('progress');button.disabled=true;bar.hidden=false;status.classList.remove('case-report-error');waiting=renderWaiting(overlay.querySelector('[data-waiting]'),status,bar);
       try {
         // UI state may keep changing during a long export; the report represents this snapshot.
-        const snapshot=structuredClone(c);const result=await render(snapshot,{signal:controller.signal,progress:value=>{status.textContent=value;}});check(controller.signal);
+        const snapshot=structuredClone(c);const result=await render(snapshot,{signal:controller.signal,progress:waiting.progress});waiting.done();check(controller.signal);
         saving=true;status.textContent='Salvando PDF…';const data=await toDataURL(result.blob);const saved=await api('export_timeline',{format:'pdf',filename:result.filename,base64:data.slice(data.indexOf(',')+1)},{silent:true});saving=false;
         if(saved?.saved===false){status.textContent='Salvamento cancelado.';return;}toast(`Relatório salvo · ${result.pages} páginas.`,'ok');close();
-      }catch(error){saving=false;if(error.name!=='AbortError'){status.textContent=String(error.message||error);status.classList.add('case-report-error');}}
-      finally{running=false;button.disabled=false;bar.hidden=true;}
+      }catch(error){waiting?.done();saving=false;if(error.name!=='AbortError'){status.textContent=String(error.message||error);status.classList.add('case-report-error');}}
+      finally{waiting?.done();waiting=null;running=false;button.disabled=false;bar.hidden=true;}
     };
     document.body.append(overlay);overlay.querySelector('[data-generate]').focus();
   }

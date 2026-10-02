@@ -56,9 +56,10 @@ function fixture({ reduced = false, intersection = true, legacyMedia = false } =
   } };
 }
 
-test('only exact real phase IDs select one of three scene families', () => {
+test('only exact real phase IDs select a known scene family', () => {
   const { api } = fixture();
   assert.equal(api.derive(receipt()).family, 'reading');
+  assert.equal(api.derive(receipt({phaseId:'command:case_report_render'})).family, 'composition');
   for (const phaseId of ['metadata-checkpoint-write', 'metadata-checkpoint-sync', 'metadata-checkpoint-publish']) assert.equal(api.derive(receipt({ phaseId })).family, 'checkpoint');
   for (const phaseId of ['analytics-select', 'analytics-verify', 'analytics-sql', 'command:aggregate_events', 'command:pivot']) assert.equal(api.derive(receipt({ phaseId })).family, 'calculation');
   for (const phaseId of ['', 'future-phase', 'METADATA-SCAN', 'toString', '__proto__']) {
@@ -347,7 +348,7 @@ test('short inspection and long story have separate pacing and close without a j
   assert.match(css, /\.wv-reader-body\s*\{[^}]*transform:\s*rotate\(-4deg\)/, 'paused/reduced pose stays expressive');
   assert.match(css, /\[data-motion="running"\]\[data-pace="loop"\] \.wv-reader \{ animation: wv-reader-travel/);
   assert.doesNotMatch(css, /\[data-motion="running"\] \.wv-reader \{ animation:/, 'short gesture never walks');
-  assert.ok(Buffer.byteLength(source) < 20000 && Buffer.byteLength(css) < 46000, 'three robot families stay below 20 KB artwork/controller and 46 KB CSS, with no assets');
+  assert.ok(Buffer.byteLength(source) < 20000 && Buffer.byteLength(css) < 58000, 'four robot families stay below 20 KB artwork/controller and 58 KB CSS, with no assets');
 });
 
 test('two walking steps plant one foot while the other lifts, then return to the same stance', () => {
@@ -406,7 +407,7 @@ test('reading light palette has strong outline contrast and forced colors wins i
 });
 
 function artFor(family) {
-  const phaseId = { checkpoint: 'metadata-checkpoint-write', calculation: 'analytics-sql', neutral: 'future-phase', reading: 'metadata-scan' }[family];
+  const phaseId = { checkpoint: 'metadata-checkpoint-write', calculation: 'analytics-sql', neutral: 'future-phase', reading: 'metadata-scan', composition: 'command:case_report_render' }[family];
   const f = fixture(), view = f.api.mount(f.host, receipt({ phaseId }));
   const art = f.parts(view).art.innerHTML; view.destroy(); return art;
 }
@@ -550,8 +551,70 @@ test('new stages retain high-contrast light/dark palettes, compact dimensions an
 test('expanding art leaves the approved reading scene, choreography and receipt/controller code unchanged', () => {
   const hash = value => createHash('sha256').update(value).digest('hex');
   assert.equal(hash(source.slice(source.indexOf('    reading:'), source.indexOf('    checkpoint:'))), '24e668b03de07c74936eb5bd679000caebd4e4c8ee704a683caefd9a66b5185e');
-  assert.equal(hash(source.slice(source.indexOf('  const PHASES'), source.indexOf('  // Only these constant'))), 'a5e380b9fae154693fa42d3c63c06bc7196f5cea1cca719bec22448356012fce');
+  assert.equal(hash(source.slice(source.indexOf('  const PHASES'), source.indexOf('  // Only these constant')).replace(",\n    'command:case_report_render': 'composition'", '')), 'a5e380b9fae154693fa42d3c63c06bc7196f5cea1cca719bec22448356012fce');
   assert.equal(hash(source.slice(source.indexOf('  function mount('))), '7d79ee8914d95621609a892f70d149c24cedae5d7222bf5728612c8fa1300686');
   assert.equal(hash(css.slice(css.indexOf('/* Reading pilot:'), css.indexOf('/* Same protagonist,'))), '9a695f3a6e19798186cd55a3932434d81d9fca4f8cbe97610c5f0d4b95fcdc43');
   assert.doesNotMatch(source, /\b(?:invoke|listen|emit|fetch|setTimeout|setInterval|requestAnimationFrame)\s*\(/, 'no IPC, transport, timer or animation controller was introduced');
+});
+
+
+test('report proof belongs to its hand or press bed; the rigid grip cannot drift from its platen', () => {
+  const art=artFor('composition');
+  assert.ok(parentsOf(art,'wv-compose-held').includes('wv-task-hand'));
+  assert.ok(parentsOf(art,'wv-compose-loaded').includes('wv-compose-bed'));
+  assert.ok(parentsOf(art,'wv-compose-grip').includes('wv-compose-press'));
+  assert.doesNotMatch(art,/success|badge|checkmark|lock|<image|<filter|<foreignObject/i);
+  assert.equal((art.match(/class="wv-task-head"/g)||[]).length,1,'the same robot operates this station alone');
+  const offset=/class="wv-compose-loaded" transform="translate\(([^)]+)\)"/.exec(art)[1].split(/\s+/).map(Number);
+  for(const time of [28,86])for(const point of [[93,52],[109,63],[91,55]]) {
+    const hand=taskPoint(point,time,'compose',24);
+    assert.ok(hand.every((value,i)=>Math.abs(value-point[i]-offset[i])<.000001),`two-corner proof transfer at ${time}%`);
+  }
+  assert.equal(atContact('wv-compose-held',28,'opacity'),'0');assert.equal(atContact('wv-compose-loaded',28,'opacity'),'1');
+  assert.equal(atContact('wv-compose-held',86,'opacity'),'1');assert.equal(atContact('wv-compose-loaded',86,'opacity'),'0');
+  for(const part of ['held','loaded'])assert.ok(animationFrames().get(`wv-compose-${part}`).frames.every(frame=>Object.keys(frame.properties).join()==='opacity'),'proofs have no independent travel');
+});
+
+test('report press contact is continuous through both loaded strokes and the output reacts afterward', () => {
+  const frames=animationFrames();
+  function transform(name,time) {
+    const values=frames.get(name).frames,before=values.filter(frame=>frame.time<=time).at(-1),after=values.find(frame=>frame.time>=time);
+    const a=before.properties.transform,b=after.properties.transform,start=[...a.matchAll(/-?\d*\.?\d+/g)].map(m=>+m[0]),end=[...b.matchAll(/-?\d*\.?\d+/g)].map(m=>+m[0]);
+    const weight=before.time===after.time?0:(time-before.time)/(after.time-before.time);let i=0;
+    return a.replace(/-?\d*\.?\d+/g,()=>String(start[i]+(end[i]-start[i++])*weight));
+  }
+  for(let time=38;time<=76;time+=.25) {
+    let hand=[91,55];for(const [part,origin] of [['hand',[82,58]],['arm',[72,52]],['body',[65,64]]])hand=transformPoint(hand,transform(`wv-compose-${part}`,time),origin);
+    hand[0]+=24;const grip=transformPoint([114,46],transform('wv-compose-press',time));
+    assert.ok(Math.hypot(hand[0]-grip[0],hand[1]-grip[1])<.025,`continuous press contact at ${time}%: ${hand} / ${grip}`);
+  }
+  assert.equal(atContact('wv-compose-press',38),'translateY(0.00000000px)');
+  assert.equal(atContact('wv-compose-press',56),'translateY(7.00000000px)');
+  assert.equal(atContact('wv-compose-bed',54),'translateY(0)','bed does not react before the loaded downward press');
+  assert.equal(atContact('wv-compose-bed',56),'translateY(.7px)');
+  assert.equal(atContact('wv-compose-bed',84),'translateY(0)','output is stable before the robot retrieves it');
+});
+
+test('report has a distinct short alignment, a closed long story and complete accessible resting art', () => {
+  assert.match(css,/--wv-compose-cycle: 2\.8s/);assert.match(css,/--wv-compose-cycle: 7\.6s/);
+  for(const [name,{frames}] of animationFrames())if(name.startsWith('wv-compose-'))assert.deepEqual(frames[0].properties,frames.at(-1).properties,`${name} closes continuously`);
+  assert.equal(atContact('wv-align-body',42),'rotate(12deg)');assert.equal(atContact('wv-align-body',100),'rotate(-4deg)');
+  assert.doesNotMatch(css,/\[data-family="composition"\]\[data-motion="running"\] \.wv-compose-(press|bed|held|loaded) \{/,'short alignment retains the page in its hand and does not run the press loop faster');
+  for(const reduced of [false,true]) {
+    const f=fixture({reduced}),view=f.api.mount(f.host,receipt({phaseId:'command:case_report_render',elapsedMs:8000}));f.observers[0].deliver(true);
+    assert.equal(view.element.dataset.motion,reduced?'static':'running');assert.match(f.parts(view).art.innerHTML,/wv-compose-station/);
+    view.setMotionEnabled(false);assert.equal(view.element.dataset.motion,'static');
+    view.setMotionEnabled(true);f.observers[0].deliver(false);assert.equal(view.element.dataset.motion,'static');
+    for(const state of ['cancelling','cancelled','error','completed']) {view.update(receipt({phaseId:'command:case_report_render',state}));assert.equal(view.element.dataset.family,'neutral');assert.doesNotMatch(f.parts(view).art.innerHTML,/wv-compose-press/);}
+    view.destroy();assert.equal(f.observers[0].disconnected,true);assert.equal(f.document.count('visibilitychange'),0);
+  }
+  const palette=css.slice(css.indexOf('/* Report pilot:'));
+  assert.match(palette,/html\[data-theme="light"\] \.waiting-visual\[data-family="composition"\] \{\s*--wv-accent: #79501c/);
+  assert.match(palette,/@media \(forced-colors: active\)[\s\S]+--wv-accent: CanvasText/);
+});
+
+test('all three approved scenes and their exact CSS/controller remain frozen while report art is additive', () => {
+  const hash=value=>createHash('sha256').update(value).digest('hex');
+  assert.equal(hash(css.slice(0,css.indexOf('\n/* Report pilot:'))),'f6a413849eda16b9ee04f46c975bded9d378dee0c17d4d49b8bf0e0a8f78710a');
+  assert.equal(hash(source.slice(source.indexOf('    checkpoint:'),source.indexOf('    composition:'))),'827876243a4ceb9bf070094fd427ea0e71d55cd3fa1174f6018a11a5a53457c2');
 });

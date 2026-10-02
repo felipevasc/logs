@@ -28,7 +28,8 @@ window.WaitingVisuals = (() => {
     'analytics-select': 'calculation', 'analytics-verify': 'calculation',
     'analytics-sql': 'calculation',
     // Explicit adapter IDs for genuinely pending commands, not native subphases.
-    'command:aggregate_events': 'calculation', 'command:pivot': 'calculation'
+    'command:aggregate_events': 'calculation', 'command:pivot': 'calculation',
+    'command:case_report_render': 'composition'
   });
   const STATES = Object.freeze({
     running: 'Em andamento', queued: 'Na fila', paused: 'Pausado',
@@ -117,6 +118,8 @@ window.WaitingVisuals = (() => {
         </g>
       </g>`;
   const groupTile = `<rect class="wv-task-tile" x="93" y="47" width="10" height="10" rx="2.5"/><path class="wv-task-tile-mark" d="M96 50h4v4h-4Z"/>`;
+  // One proof is fed into a hand-operated press, then retrieved by the same hand.
+  const composeSheet = `<rect class="wv-task-paper" x="93" y="52" width="16" height="11" rx="1.3"/><path class="wv-task-detail" d="M96 55h9m-9 2.5h5m-5 2.5h9"/>`;
   const scenes = Object.freeze({
     // The carried sheet is a child of the forearm/hand, never an independently moving prop.
     // Source/destination transforms match the hand's 18° + 30° − 48° contact pose exactly.
@@ -187,6 +190,24 @@ window.WaitingVisuals = (() => {
         </g>
       </g>
       <g class="wv-group-actor" transform="translate(26 0)">${taskRobot(`<g class="wv-group-held">${groupTile}</g>`)}</g>`,
+    composition: `<path class="wv-rail" d="M39 83h132m-124-3v3m116-3v3"/>
+      <g class="wv-compose-station">
+        <path class="wv-task-machine" d="M116 69h47v6h-47Zm5 6v6m37-6v6M148 33h9v36h-9Z"/>
+        <path class="wv-task-edge" d="M151 38h3m-3 5h3m-3 5h3m-3 5h3m-3 5h3"/>
+        <path class="wv-task-machine" d="M128 27h29v8h-29Z"/>
+        <path class="wv-task-inset" d="M130 35h5v13h-5Z"/>
+        <g class="wv-compose-bed">
+          <path class="wv-task-inset" d="M117 66h28l4 3h-32Z"/>
+          <g class="wv-compose-loaded" transform="translate(26.341973495 1.717610627)">${composeSheet}</g>
+        </g>
+        <g class="wv-compose-press">
+          <path class="wv-task-machine" d="M121 46h22v5h-22Z"/>
+          <path class="wv-task-limb" d="M132 46V39h-18v7"/>
+          <path class="wv-compose-grip" d="M111 46h6"/>
+          <path class="wv-task-edge" d="M125 49h14"/>
+        </g>
+      </g>
+      <g class="wv-compose-actor" transform="translate(24 0)">${taskRobot(`<g class="wv-compose-held">${composeSheet}</g>`)}</g>`,
     neutral: `<path class="wv-rail" d="M70 83h56"/><g class="wv-idle-actor" transform="translate(29 0)">${taskRobot()}</g>`
   });
 

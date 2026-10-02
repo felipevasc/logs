@@ -982,3 +982,246 @@ html[data-theme="light"] .waiting-visual:is([data-family="checkpoint"], [data-fa
   .waiting-visual { --wv-accent: CanvasText; --wv-ink: CanvasText; --wv-surface: Canvas; }
   .waiting-visual .wv-guide { opacity: 1; }
 }
+
+/* Report pilot: align a proof, feed the bed, operate the press, retrieve and inspect.
+   The press and its grip are one rigid group. The proof never travels without a hand.
+   A complete static pose remains available for pause, reduced motion and offscreen. */
+.waiting-visual[data-family="composition"] {
+  --wv-accent: #d7b579; --wv-task-shell: #242933; --wv-task-paper: #141b25;
+  --wv-compose-cycle: 2.8s;
+}
+html[data-theme="light"] .waiting-visual[data-family="composition"] {
+  --wv-accent: #79501c; --wv-task-shell: #f3e7d5; --wv-task-paper: #fffdf8;
+}
+.waiting-visual[data-family="composition"] .wv-art {
+  inline-size: min(100%, 240px); block-size: 120px; flex-basis: 120px;
+}
+.waiting-visual[data-family="composition"][data-pace="loop"] { --wv-compose-cycle: 7.6s; }
+.waiting-visual .wv-compose-actor .wv-task-body { transform: rotate(-4deg); }
+.waiting-visual .wv-compose-actor .wv-task-head { transform: rotate(8deg); }
+.waiting-visual .wv-compose-actor .wv-task-arm { transform: rotate(-26deg); }
+.waiting-visual .wv-compose-actor .wv-task-hand { transform: rotate(0deg); }
+.waiting-visual .wv-compose-loaded { opacity: 0; }
+.waiting-visual .wv-compose-grip { stroke-width: 3; }
+.waiting-visual .wv-compose-actor .wv-task-visor { transform-origin: 64px 35px; }
+.case-report-dialog [data-waiting] { margin-block: 8px; }
+.case-report-dialog [data-waiting][hidden] { display: none; }
+@keyframes wv-compose-body {
+  0% { transform: rotate(-4.00000000deg); }
+  8% { transform: rotate(-4.00000000deg); }
+  24% { transform: rotate(12.00000000deg); }
+  28% { transform: rotate(12.00000000deg); }
+  38% { transform: rotate(0.00000000deg); }
+  40% { transform: rotate(0.41152263deg); }
+  42% { transform: rotate(1.51440329deg); }
+  44% { transform: rotate(3.11111111deg); }
+  46% { transform: rotate(5.00411523deg); }
+  48% { transform: rotate(6.99588477deg); }
+  50% { transform: rotate(8.88888889deg); }
+  52% { transform: rotate(10.48559671deg); }
+  54% { transform: rotate(11.58847737deg); }
+  56% { transform: rotate(12.00000000deg); }
+  62% { transform: rotate(12.00000000deg); }
+  64% { transform: rotate(11.33527697deg); }
+  66% { transform: rotate(9.62099125deg); }
+  68% { transform: rotate(7.27696793deg); }
+  70% { transform: rotate(4.72303207deg); }
+  72% { transform: rotate(2.37900875deg); }
+  74% { transform: rotate(0.66472303deg); }
+  76% { transform: rotate(0.00000000deg); }
+  84% { transform: rotate(12.00000000deg); }
+  86% { transform: rotate(12.00000000deg); }
+  94% { transform: rotate(-4.00000000deg); }
+  100% { transform: rotate(-4.00000000deg); }
+}
+@keyframes wv-align-body {
+  0% { transform: rotate(-4deg); }
+  12% { transform: rotate(-4deg); }
+  42% { transform: rotate(12deg); }
+  56% { transform: rotate(12deg); }
+  88% { transform: rotate(-4deg); }
+  100% { transform: rotate(-4deg); }
+}
+@keyframes wv-compose-arm {
+  0% { transform: rotate(-26.00000000deg); }
+  8% { transform: rotate(-26.00000000deg); }
+  24% { transform: rotate(-12.00000000deg); }
+  28% { transform: rotate(-12.00000000deg); }
+  38% { transform: rotate(-25.95264516deg); }
+  40% { transform: rotate(-25.15337585deg); }
+  42% { transform: rotate(-23.13366645deg); }
+  44% { transform: rotate(-20.45919915deg); }
+  46% { transform: rotate(-17.57063685deg); }
+  48% { transform: rotate(-14.77442539deg); }
+  50% { transform: rotate(-12.29394617deg); }
+  52% { transform: rotate(-10.31194384deg); }
+  54% { transform: rotate(-8.99518164deg); }
+  56% { transform: rotate(-8.51418688deg); }
+  62% { transform: rotate(-8.51418688deg); }
+  64% { transform: rotate(-9.29388387deg); }
+  66% { transform: rotate(-11.37359294deg); }
+  68% { transform: rotate(-14.39618372deg); }
+  70% { transform: rotate(-17.98363499deg); }
+  72% { transform: rotate(-21.65377491deg); }
+  74% { transform: rotate(-24.67480004deg); }
+  76% { transform: rotate(-25.95264516deg); }
+  84% { transform: rotate(-12.00000000deg); }
+  86% { transform: rotate(-12.00000000deg); }
+  94% { transform: rotate(-26.00000000deg); }
+  100% { transform: rotate(-26.00000000deg); }
+}
+@keyframes wv-align-arm {
+  0% { transform: rotate(-26deg); }
+  12% { transform: rotate(-26deg); }
+  42% { transform: rotate(-12deg); }
+  56% { transform: rotate(-12deg); }
+  88% { transform: rotate(-26deg); }
+  100% { transform: rotate(-26deg); }
+}
+@keyframes wv-compose-hand {
+  0% { transform: rotate(0.00000000deg); }
+  8% { transform: rotate(0.00000000deg); }
+  24% { transform: rotate(0.00000000deg); }
+  28% { transform: rotate(0.00000000deg); }
+  38% { transform: rotate(-3.32944283deg); }
+  40% { transform: rotate(-5.04345341deg); }
+  42% { transform: rotate(-9.31101608deg); }
+  44% { transform: rotate(-14.79116877deg); }
+  46% { transform: rotate(-20.43381027deg); }
+  48% { transform: rotate(-25.55769355deg); }
+  50% { transform: rotate(-29.77226544deg); }
+  52% { transform: rotate(-32.88614175deg); }
+  54% { transform: rotate(-34.81885515deg); }
+  56% { transform: rotate(-35.49630295deg); }
+  62% { transform: rotate(-35.49630295deg); }
+  64% { transform: rotate(-34.39035871deg); }
+  66% { transform: rotate(-31.24776290deg); }
+  68% { transform: rotate(-26.22166625deg); }
+  70% { transform: rotate(-19.64718575deg); }
+  72% { transform: rotate(-12.37031700deg); }
+  74% { transform: rotate(-6.06330940deg); }
+  76% { transform: rotate(-3.32944283deg); }
+  84% { transform: rotate(0.00000000deg); }
+  86% { transform: rotate(0.00000000deg); }
+  94% { transform: rotate(0.00000000deg); }
+  100% { transform: rotate(0.00000000deg); }
+}
+@keyframes wv-align-hand {
+  0% { transform: rotate(0deg); }
+  12% { transform: rotate(0deg); }
+  42% { transform: rotate(0deg); }
+  56% { transform: rotate(0deg); }
+  88% { transform: rotate(0deg); }
+  100% { transform: rotate(0deg); }
+}
+@keyframes wv-compose-press {
+  0% { transform: translateY(0.00000000px); }
+  38% { transform: translateY(0.00000000px); }
+  40% { transform: translateY(0.24005487px); }
+  42% { transform: translateY(0.88340192px); }
+  44% { transform: translateY(1.81481481px); }
+  46% { transform: translateY(2.91906722px); }
+  48% { transform: translateY(4.08093278px); }
+  50% { transform: translateY(5.18518519px); }
+  52% { transform: translateY(6.11659808px); }
+  54% { transform: translateY(6.75994513px); }
+  56% { transform: translateY(7.00000000px); }
+  62% { transform: translateY(7.00000000px); }
+  64% { transform: translateY(6.61224490px); }
+  66% { transform: translateY(5.61224490px); }
+  68% { transform: translateY(4.24489796px); }
+  70% { transform: translateY(2.75510204px); }
+  72% { transform: translateY(1.38775510px); }
+  74% { transform: translateY(0.38775510px); }
+  76% { transform: translateY(0.00000000px); }
+  100% { transform: translateY(0.00000000px); }
+}
+@keyframes wv-compose-held {
+  0% { opacity: 1; }
+  27.99% { opacity: 1; }
+  28% { opacity: 0; }
+  85.99% { opacity: 0; }
+  86% { opacity: 1; }
+  100% { opacity: 1; }
+}
+@keyframes wv-compose-loaded {
+  0% { opacity: 0; }
+  27.99% { opacity: 0; }
+  28% { opacity: 1; }
+  85.99% { opacity: 1; }
+  86% { opacity: 0; }
+  100% { opacity: 0; }
+}
+@keyframes wv-compose-bed {
+  0% { transform: translateY(0); }
+  54% { transform: translateY(0); }
+  56% { transform: translateY(.7px); }
+  62% { transform: translateY(.7px); }
+  64% { transform: translateY(0); }
+  100% { transform: translateY(0); }
+}
+@keyframes wv-compose-head {
+  0% { transform: rotate(8deg); }
+  24% { transform: rotate(-8deg); }
+  38% { transform: rotate(-3deg); }
+  56% { transform: rotate(-10deg); }
+  64% { transform: rotate(1deg); }
+  84% { transform: rotate(-8deg); }
+  94% { transform: rotate(8deg); }
+  100% { transform: rotate(8deg); }
+}
+@keyframes wv-align-head {
+  0% { transform: rotate(8deg); }
+  42% { transform: rotate(-8deg); }
+  56% { transform: rotate(-8deg); }
+  88% { transform: rotate(8deg); }
+  100% { transform: rotate(8deg); }
+}
+@keyframes wv-compose-arm-back {
+  0% { transform: rotate(0deg); }
+  24% { transform: rotate(-14deg); }
+  38% { transform: rotate(0deg); }
+  56% { transform: rotate(-22deg); }
+  62% { transform: rotate(-22deg); }
+  76% { transform: rotate(0deg); }
+  84% { transform: rotate(-14deg); }
+  94% { transform: rotate(0deg); }
+  100% { transform: rotate(0deg); }
+}
+@keyframes wv-compose-gaze {
+  0% { transform: translate(1px, 0); }
+  24% { transform: translate(2px, 2px); }
+  38% { transform: translate(2px, 1px); }
+  62% { transform: translate(2px, 2px); }
+  84% { transform: translate(2px, 2px); }
+  94% { transform: translate(1px, 0); }
+  100% { transform: translate(1px, 0); }
+}
+@keyframes wv-compose-visor {
+  0% { transform: scaleX(1); }
+  94% { transform: scaleX(1); }
+  96% { transform: scaleX(.65); }
+  98% { transform: scaleX(1); }
+  100% { transform: scaleX(1); }
+}
+.waiting-visual[data-family="composition"][data-motion="running"] .wv-task-body { animation: wv-align-body var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"] .wv-task-arm { animation: wv-align-arm var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"] .wv-task-hand { animation: wv-align-hand var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"] .wv-task-head { animation: wv-align-head var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-task-body { animation: wv-compose-body var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-task-arm { animation: wv-compose-arm var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-task-hand { animation: wv-compose-hand var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-task-head { animation: wv-compose-head var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-task-arm-back { animation: wv-compose-arm-back var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-task-gaze { animation: wv-compose-gaze var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-task-visor { animation: wv-compose-visor var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-compose-held { animation: wv-compose-held var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-compose-loaded { animation: wv-compose-loaded var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-compose-press { animation: wv-compose-press var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="composition"][data-motion="running"][data-pace="loop"] .wv-compose-bed { animation: wv-compose-bed var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+@media (forced-colors: active) {
+  .waiting-visual[data-family="composition"],
+  html[data-theme="light"] .waiting-visual[data-family="composition"] {
+    --wv-accent: CanvasText; --wv-task-shell: Canvas; --wv-task-paper: Canvas;
+  }
+}
