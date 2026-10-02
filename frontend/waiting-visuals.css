@@ -1386,11 +1386,53 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   overflow: hidden;
   opacity: 0;
 }
-.waiting-visual[data-animated="true"][data-family="reading"] .wv-work-boundary { animation: wv-work-boundary var(--wv-reader-cycle) linear var(--wv-repeat) both; }
-.waiting-visual[data-animated="true"][data-family="checkpoint"] .wv-work-boundary { animation: wv-work-boundary var(--wv-task-cycle) linear var(--wv-repeat) both; }
-.waiting-visual[data-animated="true"][data-family="calculation"] .wv-work-boundary { animation: wv-work-boundary var(--wv-task-cycle) linear var(--wv-repeat) both; }
-.waiting-visual[data-animated="true"][data-family="composition"] .wv-work-boundary { animation: wv-work-boundary var(--wv-compose-cycle) linear var(--wv-repeat) both; }
-.waiting-visual[data-animated="true"][data-family="verification"] .wv-work-boundary { animation: wv-work-boundary var(--wv-verify-cycle) linear var(--wv-repeat) both; }
+/* Short gestures need their own animation identities: changing only duration
+   retains CSSAnimation age and desynchronizes these joints from the new loop.
+   Alias bodies deliberately match the approved curves byte for byte. */
+.waiting-visual[data-family="checkpoint"][data-animated="true"][data-pace="gesture"] .wv-task-head { animation-name: wv-peek-head; }
+@keyframes wv-peek-head {
+  0% { transform: rotate(4deg); }
+  18% { transform: rotate(-6deg); }
+  34% { transform: rotate(-12deg); }
+  44% { transform: rotate(3deg); }
+  54% { transform: rotate(-10deg); }
+  70% { transform: rotate(5deg); }
+  86% { transform: rotate(4deg); }
+  100% { transform: rotate(4deg); }
+}
+.waiting-visual[data-family="checkpoint"][data-animated="true"][data-pace="gesture"] .wv-task-gaze { animation-name: wv-peek-gaze; }
+@keyframes wv-peek-gaze {
+  0% { transform: translate(1px, 0); }
+  28% { transform: translate(2px, 2px); }
+  48% { transform: translate(2px, 1px); }
+  76% { transform: translate(1px, 0); }
+  100% { transform: translate(1px, 0); }
+}
+.waiting-visual[data-family="checkpoint"][data-animated="true"][data-pace="gesture"] .wv-task-arm-back { animation-name: wv-peek-arm-back; }
+@keyframes wv-peek-arm-back {
+  0% { transform: rotate(0deg); }
+  18% { transform: rotate(-8deg); }
+  32% { transform: rotate(-20deg); }
+  46% { transform: rotate(-20deg); }
+  64% { transform: rotate(-8deg); }
+  86% { transform: rotate(0deg); }
+  100% { transform: rotate(0deg); }
+}
+.waiting-visual[data-family="calculation"][data-animated="true"][data-pace="gesture"] .wv-task-arm-back { animation-name: wv-sort-arm-back; }
+@keyframes wv-sort-arm-back {
+  0% { transform: rotate(0deg); }
+  18% { transform: rotate(-22deg); }
+  34% { transform: rotate(8deg); }
+  54% { transform: rotate(0deg); }
+  66% { transform: rotate(-8deg); }
+  86% { transform: rotate(0deg); }
+  100% { transform: rotate(0deg); }
+}
+.waiting-visual[data-animated="true"][data-family="reading"][data-pace="loop"] .wv-work-boundary { animation: wv-work-boundary var(--wv-reader-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-animated="true"][data-family="checkpoint"][data-pace="loop"] .wv-work-boundary { animation: wv-work-boundary var(--wv-task-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-animated="true"][data-family="calculation"][data-pace="loop"] .wv-work-boundary { animation: wv-work-boundary var(--wv-task-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-animated="true"][data-family="composition"][data-pace="loop"] .wv-work-boundary { animation: wv-work-boundary var(--wv-compose-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-animated="true"][data-family="verification"][data-pace="loop"] .wv-work-boundary { animation: wv-work-boundary var(--wv-verify-cycle) linear var(--wv-repeat) both; }
 @keyframes wv-work-boundary { 0%, 100% { opacity: 0; } }
 @keyframes wv-episode-boundary { 0%, 100% { opacity: 0; } }
 .waiting-visual .wv-reaction-actor { visibility: hidden; transform: translateX(var(--wv-home-x)); }

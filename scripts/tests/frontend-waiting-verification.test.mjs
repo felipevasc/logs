@@ -177,7 +177,7 @@ test('verification shares the checkpoint reaction anchor only after the empty-ha
   let selected = null;
   for (let i = 0; i < 100 && !selected; i++) selected = director.boundary(api.derive(receipt(phases[i % phases.length], { elapsedMs: 120000 })));
   assert.ok(selected && ['coffee', 'review', 'stretch'].includes(selected.episode));
-  assert.match(css, /data-family="verification"\] \.wv-work-boundary \{ animation: wv-work-boundary var\(--wv-verify-cycle\)/);
+  assert.match(css, /data-family="verification"\]\[data-pace="loop"\] \.wv-work-boundary \{ animation: wv-work-boundary var\(--wv-verify-cycle\)/);
   const coffee = css.split('\n').filter(line => line.includes('[data-family="verification"]') && line.includes('[data-episode="coffee"]'));
   assert.ok(coffee.length >= 7 && coffee.every(line => /wv-coffee-(?:travel-checkpoint|checkpoint-)/.test(line)), 'reuse the existing checkpoint walk rather than duplicate tracks');
   assert.match(css, /\.wv-compose-actor, \.wv-verify-actor\) \{ visibility: hidden/);
