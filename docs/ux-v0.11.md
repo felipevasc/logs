@@ -161,3 +161,15 @@ A exportação agora calcula escopo e ajuda por formato tanto na abertura quanto
 A confirmação de remoção nativa ganha Desfazer no próprio aviso, vinculado ao recibo exato. Ele permanece separado dos avisos benignos agregados. Sua validade continua pertencendo ao Caso, armazenamento e manifesto nativos; mudar a fonte analítica não invalida arbitrariamente o histórico. Cliques repetidos, confirmação perdida, recibo mais novo e troca de Caso têm regressões específicas. O prazo do aviso não altera a validade do comando existente no menu.
 
 Esses três recortes passaram por testes Node e revisão de código. O próximo CI deve confirmar seus cenários reais de navegador, incluindo layouts compactos, foco, erros e cancelamento; isso ainda não equivale a validação no WebView instalado.
+
+### Confirmações do CI57 e próximo piloto
+
+O CI57 confirmou o reflow dos controles de tamanho em 1024, 640 e 320 CSS px, os rodapés e a navegação dos erros longos. O roteiro completo das três famílias de espera passou: ciclos curtos e longos, contato, pausa, cancelamento, descarte, temas, movimento reduzido e cores forçadas. A medição identificou a transição restante como `color` do botão por 150 ms; a arte pausada tem zero animações em execução. A base opaca de Resumir foi conferida nas capturas reais.
+
+Dois roteiros novos pararam por inconsistências dos fixtures: um consultava a antiga lane de Undo para encontrar um erro de exportação; outro emitia uma preparação sintética sem os campos exigidos pelos leitores nativos. Ambos os testes foram corrigidos sem alterar o produto ou relaxar os validadores. A confirmação dos dois roteiros completos continua pendente.
+
+No tema claro, a captura do pivot revelou rótulos azul-pálido. A correção usa o token funcional `accent-strong` da Análise ou do Caso, preservando o tema escuro e a geometria. O teste passa a medir o contraste composto sobre a superfície real dos chips, após terminar a transição de tema; a medição no navegador ainda será executada.
+
+O próximo piloto acompanha somente a montagem real do PDF do Caso. O robô alinha uma folha em um gesto de 2,8 segundos; em esperas longas, alimenta e opera uma pequena prensa, recolhe e confere a prova em 7,6 segundos. As contagens vêm das ocorrências já desenhadas e trilhas já concluídas. O callback original de progresso permanece compatível; não foi criado denominador de páginas ou percentual por tempo.
+
+Fechar, falhar ou terminar a montagem encerra timers e cena imediatamente. Ela sai antes da codificação e do salvamento, cujos contratos continuam próprios. Há regressões de cancelamento, retry, snapshot e save cancelado, além de um novo roteiro que gera bytes PDF reais com dados sintéticos. Esta composição ainda depende da primeira validação visual no CI.
