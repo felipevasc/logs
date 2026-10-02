@@ -1375,15 +1375,31 @@ function invertFilter(index) {
   toast(`Filtro invertido: ${chipLabel(f)}`, "ok");
 }
 
+const filterChipTargets = new WeakMap();
 function renderChips() {
+  const focused = document.activeElement, focusedChip = filterChipTargets.get(focused), context = filterContextKey();
+  let nextFocus = null;
   const boxes = document.querySelectorAll(".chips-sync");
   boxes.forEach((box) => (box.innerHTML = ""));
   state.filters.forEach((f, i) => {
     boxes.forEach((box) => {
-      const chip = el("span", "chip");
-      chip.title = `${f.op === "query" && f.label ? f.value : chipLabel(f)} (Botão direito: inverter ou editar)`;
-      chip.appendChild(el("span", "", chipLabel(f)));
+      const label = chipLabel(f), chip = el("span", "chip filter-chip");
+      chip.title = `${f.op === "query" && f.label ? f.value : label} (Clique para editar · botão direito para opções)`;
+      const edit = el("button", "chip-edit", label);
+      edit.type = "button";
+      edit.setAttribute("aria-label", `Editar filtro: ${label}`);
+      edit.title = `Editar filtro: ${f.op === "query" && f.label ? f.value : label}`;
+      filterChipTargets.set(edit, { filter: f, box, context });
+      const editFilter = () => {
+        const index = state.filters.indexOf(f);
+        if (edit.isConnected && index >= 0 && context === filterContextKey()) openFilterPop(edit, index);
+      };
+      edit.onclick = event => { event.stopPropagation(); editFilter(); };
+      chip.appendChild(edit);
+      if (focusedChip?.filter === f && focusedChip.box === box && focusedChip.context === context) nextFocus = edit;
       const x = el("button", "x");
+      x.type = "button";
+      x.setAttribute("aria-label", `Remover filtro: ${label}`);
       x.innerHTML = '<i class="fas fa-xmark"></i>';
       x.title = "Remover filtro";
       x.onclick = (e) => { e.stopPropagation(); removeFilter(i); };
@@ -1401,7 +1417,7 @@ function renderChips() {
           {
             icon: "fa-pen-to-square",
             label: "Editar filtro",
-            onClick: () => openFilterPop(chip, i),
+            onClick: editFilter,
           },
           { sep: true },
           {
@@ -1435,6 +1451,9 @@ function renderChips() {
   // moldura global: tudo na janela passa a refletir apenas a realidade filtrada
   document.body.classList.toggle("filters-active", hasActive);
   renderFilterTabs();
+  if (focusedChip && (document.activeElement === focused || document.activeElement === document.body)) {
+    filterFocusTarget(nextFocus || focused)?.focus({ preventScroll: true });
+  }
 }
 
 // ponto único de reação a mudanças de filtro: chips, árvore e a tela corrente
@@ -2162,6 +2181,11 @@ function toggleFacet(column, value) {
 
 let currentEditFilterIndex = null;
 let currentEditFilter = null, currentEditFilterValue = null, currentFilterContext = null, filterReturnFocus = null, filterComposing = false;
+// Preserve these existing native filters without expanding the new-filter menu.
+const existingFilterOperators = new Map([
+  ["in_exact", "está na lista exata (um valor por linha)"],
+  ["detection", "corresponde à detecção"],
+]);
 const filterValueFormats = new Map();
 function setFilterInputValue(selector, value) {
   const input = $(selector), text = String(value ?? ""), escaped = text.includes("\r");
@@ -2193,7 +2217,11 @@ function filterContextKey() {
   return JSON.stringify([workspaceScope(), activeCase()?.id, window.AnalysisContexts?.capture().instance, window.AnalysisContexts?.identity(), state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.derivedFields]);
 }
 function filterFocusTarget(origin) {
-  return [origin, $("#btn-add-filter"), $("#dr-close"), $("#quick-search")].find(node => node?.isConnected && !node.hidden && !node.disabled
+  const chip = filterChipTargets.get(origin);
+  const currentChip = !chip || chip.context === filterContextKey();
+  const replacement = currentChip && chip?.box.isConnected && [...chip.box.querySelectorAll(".chip-edit")]
+    .find(button => filterChipTargets.get(button)?.filter === chip.filter);
+  return [currentChip ? origin : null, replacement, $("#btn-add-filter"), $("#dr-close"), $("#quick-search")].find(node => node?.isConnected && !node.hidden && !node.disabled
     && node.matches?.("button,input,select,textarea,[tabindex],a[href]") && !node.closest?.(".ctx-menu,#filter-pop,[hidden],[inert]")
     && (!node.getClientRects || node.getClientRects().length));
 }
@@ -2236,6 +2264,9 @@ function openFilterPop(anchor = null, editIndex = null, preset = null) {
     const f = selected;
     if (![...colSel.options].some(option => option.value === f.column)) colSel.appendChild(el("option", "", colLabel(f.column))).value = f.column;
     colSel.value = f.column;
+    if (editIndex != null && existingFilterOperators.has(f.op)) {
+      opSel.appendChild(el("option", "", existingFilterOperators.get(f.op))).value = f.op;
+    }
     opSel.value = f.op;
     setFilterInputValue("#fp-val", f.value);
     setFilterInputValue("#fp-val2", f.value2);
@@ -2315,11 +2346,19 @@ function applyFilterPop() {
   }
   const column = $("#fp-col").value;
   const op = $("#fp-op").value;
+  const standard = operator => OPS.some(([value]) => value === operator);
+  const unsupportedExisting = currentEditFilter && !standard(currentEditFilter.op) && !existingFilterOperators.has(currentEditFilter.op);
+  if (unsupportedExisting || !standard(op) && !(existingFilterOperators.has(op) && currentEditFilter?.op === op)) {
+    toast(unsupportedExisting
+      ? "O operador deste filtro não está disponível para edição. Seu rascunho foi mantido; copie o valor e cancele para preservar o filtro original."
+      : "Selecione um operador de filtro válido. Seu rascunho foi mantido.", "info");
+    return false;
+  }
   let value, value2;
   try { value = ["empty", "not_empty"].includes(op) ? "" : readFilterInputValue("#fp-val"); value2 = op === "between" ? readFilterInputValue("#fp-val2") : ""; }
   catch (error) { toast(error.message, "info"); return false; }
   const literalWhitespace = ["contains", "not_contains", "starts_with", "ends_with", "regex"].includes(op) && value.length > 0;
-  if (!["empty", "not_empty", "equals_exact", "not_equals_exact"].includes(op) && !literalWhitespace && !value.trim()) {
+  if (!["empty", "not_empty", "equals_exact", "not_equals_exact", "in_exact"].includes(op) && !literalWhitespace && !value.trim()) {
     toast("Informe um valor para o filtro.", "info");
     return;
   }
@@ -2328,7 +2367,10 @@ function applyFilterPop() {
     if (problem) { toast(problem, "info"); return; }
   }
   if (index != null) {
-    state.filters[index] = { column, op, value, value2: value2 || null };
+    const updated = { column, op, value, value2: value2 || null };
+    const returnChip = filterChipTargets.get(filterReturnFocus);
+    if (returnChip?.filter === currentEditFilter) returnChip.filter = updated;
+    state.filters[index] = updated;
     currentEditFilterIndex = null;
     state.page = 0;
     filtersChanged();

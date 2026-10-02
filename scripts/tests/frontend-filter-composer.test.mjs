@@ -13,7 +13,7 @@ const node = id => {
   }); return nodes.get(id);
 };
 const state = { filters: [], columns: ['code','timestamp'], datasetRevision: 1, currentArtifact: {id:'source-a',loadedAt:1}, derivedFields: [], page: 4 };
-const context = vm.createContext({ state, document, window: {QueryLang:{validate:() => null}}, $:node, el:() => ({}), colLabel:String, positionPop() {},
+const context = vm.createContext({ state, document, filterChipTargets:new WeakMap(), window: {QueryLang:{validate:() => null}}, $:node, el:() => ({}), colLabel:String, positionPop() {},
   activeCase:() => ({id:caseId}), workspaceScope:() => scope, toast:message => messages.push(message), renderChips(){},
   addFilter:filter => { applied.push(filter); state.filters.push(filter); }, filtersChanged:() => { changed++; },
 });

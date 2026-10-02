@@ -5,7 +5,7 @@
    component states are explicitly fixtures. This does NOT validate the native engine.
    No image assets are generated: screenshots capture the rendered application. */
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { launchBrowser } from './browser.mjs';
 import { captureFailure } from './diagnostics.mjs';
@@ -13,7 +13,26 @@ import { captureFailure } from './diagnostics.mjs';
 const output = resolve('output/playwright');
 mkdirSync(output, { recursive: true });
 const browser = await launchBrowser();
-const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, reducedMotion: 'no-preference' });
+const context = await browser.newContext({
+  viewport: { width: 1440, height: 960 }, reducedMotion: 'no-preference',
+  // Explicit size avoids Playwright's default downscaling to an 800px box.
+  recordVideo: { dir: resolve(output, 'video-raw'), size: { width: 1440, height: 960 } },
+});
+const videoStartedAt = Date.now();
+const page = await context.newPage();
+const video = page.video();
+const videoMetadata = {
+  filename: 'waiting-visuals-real-preview.webm', finalized: false,
+  capture: 'Real Playwright browser recording of this production UI regression; no generated image assets',
+  transport: 'Synthetic preview command transport with test-only gates; metadata/checkpoint receipts are explicit fixtures',
+  nativeEngineVerified: false,
+  timingReference: 'Approximate wall-clock offsets since context.newPage() was requested; inspect the actual video before trimming',
+  recordedSize: { width: 1440, height: 960 },
+  captureHoldBudgetMs: 4000,
+  markers: [],
+};
+const markVideo = (label, details = {}) => videoMetadata.markers.push({ label, offsetMs: Date.now() - videoStartedAt, ...details });
+let originalTestError = null;
 page.setDefaultTimeout(20_000);
 const errors = [];
 const results = {
@@ -27,6 +46,7 @@ const results = {
     generatedImageAssets: false,
   },
   screenshots: [],
+  videoMetadata: 'waiting-visuals-video.json',
 };
 let phase = 'startup';
 page.on('pageerror', error => errors.push(error.message));
@@ -157,21 +177,30 @@ try {
   assert.ok(results.reading.runningAnimations > 0); assertTypography(results.reading);
   assert.equal(await page.locator('#load-progress-details').evaluate(node => node.open), false);
   await assertFits(load);
+  markVideo('reading-loop-start', { fixtureReceipt: true, viewport: page.viewportSize() });
   await screenshot('waiting-fixture-reading-dark-1440.png', { fixture: true, content: 'Synthetic metadata receipt rendered by the production foreground adapter while its preview load command is pending' });
 
+  // Capture-only dwell in the already pending command. Total added dwell is 4s.
+  await page.waitForTimeout(3300);
   const beforeForeign = await load.textContent();
   await page.evaluate(() => window.__waitingPreviewBridge.emit('operation-progress', {
     operationId: 'fixture-unowned-background', phaseId: 'analytics-sql', phase: 'Must not replace foreground', completed: 999, total: 999, unit: 'itens', fixture: true,
   }));
   assert.equal(await load.textContent(), beforeForeign, 'foreign operation cannot replace the foreground scene');
   const cancelBefore = await page.evaluate(() => window.__mockCommandCalls.cancel_task || 0);
-  await load.locator('.wv-motion-toggle').click();
+  await load.locator('.wv-motion-toggle').focus(); await page.keyboard.press('Enter');
   assert.equal((await renderedState(load)).motion, 'static');
+  markVideo('reading-paused-by-keyboard', { fixtureReceipt: true });
+  await page.waitForTimeout(500);
   await emitLoadPhase({ completed: 1800 });
   assert.equal((await renderedState(load)).motion, 'static', 'new receipts preserve the user pause');
   assert.equal(await page.evaluate(() => window.__mockCommandCalls.cancel_task || 0), cancelBefore);
   assert.equal(await page.evaluate(() => window.__waitingPreviewBridge.pending.some(item => item.command === 'load_file')), true);
-  await load.locator('.wv-motion-toggle').click(); await waitMotion('#load-visual .waiting-visual', 'running');
+  await load.locator('.wv-motion-toggle').focus(); await page.keyboard.press('Enter');
+  await waitMotion('#load-visual .waiting-visual', 'running');
+  markVideo('reading-resumed-by-keyboard', { fixtureReceipt: true });
+  await page.waitForTimeout(200);
+  markVideo('reading-segment-end', { fixtureReceipt: true });
 
   await emitLoadPhase({ total: 0, completed: 1800 });
   assert.equal((await renderedState(load)).metric, '1.800 registros');
@@ -180,6 +209,7 @@ try {
   assert.equal((await renderedState(load)).family, 'checkpoint'); assert.equal((await renderedState(load)).metric, null);
   await emitLoadPhase({ phaseId: 'metadata-checkpoint-committed', phase: 'Checkpoint de metadados preservado (fixture)', completed: 6300, total: 6300, unit: 'bytes', checkpointRows: 1200 });
   results.partialCheckpoint = await renderedState(load);
+  markVideo('partial-checkpoint', { fixtureReceipt: true });
   assert.equal(results.partialCheckpoint.family, 'checkpoint'); assert.equal(results.partialCheckpoint.motion, 'static');
   assert.equal(results.partialCheckpoint.state, 'running'); assert.equal(results.partialCheckpoint.status, 'Checkpoint preservado');
   assert.equal(results.partialCheckpoint.metric, '6.300 / 6.300 bytes');
@@ -219,6 +249,7 @@ try {
   await waitMotion('#tab-group .waiting-visual', 'running');
   assert.equal(await page.locator('.waiting-visual:visible').count(), 1, 'one focused scene, not one per chart');
   results.group = await renderedState(group);
+  markVideo('group-command-loop', { syntheticTransport: true, viewport: page.viewportSize() });
   assert.equal(results.group.family, 'calculation'); assert.equal(results.group.status, 'Calculando resumo'); assert.equal(results.group.metric, null);
   assert.ok(results.group.runningAnimations > 0); assert.equal(results.group.buttonPointerEvents, 'auto'); assertTypography(results.group);
   const groupCancelBefore = await page.evaluate(() => window.__mockCommandCalls.cancel_task || 0);
@@ -250,6 +281,7 @@ try {
   });
   await page.waitForFunction(() => document.querySelector('#tab-group .waiting-visual')?.dataset.state === 'cancelling');
   results.cancelPendingGroup = await renderedState(group);
+  markVideo('group-cancelling-before-settlement', { syntheticTransport: true });
   assert.equal(results.cancelPendingGroup.motion, 'static'); assert.equal(results.cancelPendingGroup.runningAnimations, 0);
   assert.match(results.cancelPendingGroup.status, /Cancelando/);
   assert.equal(await page.evaluate(id => window.__waitingPreviewBridge.pending.some(item => item.operationId === id), cancelledOperation), true,
@@ -277,6 +309,7 @@ try {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await waitMotion('.cube-output .waiting-visual', 'static');
   results.pivotReducedMotion = await renderedState(pivot);
+  markVideo('pivot-reduced-motion', { syntheticTransport: true, viewport: page.viewportSize() });
   assert.equal(results.pivotReducedMotion.family, 'calculation'); assert.equal(results.pivotReducedMotion.status, 'Cruzando dados');
   assert.equal(results.pivotReducedMotion.metric, null); assert.equal(results.pivotReducedMotion.runningAnimations, 0); assert.equal(results.pivotReducedMotion.buttonHidden, true);
   assert.equal(await pivot.locator('svg').count(), 1, 'reduced motion retains the complete static scene');
@@ -358,6 +391,7 @@ try {
   writeFileSync(resolve(output, 'waiting-visuals-results.json'), JSON.stringify(results, null, 2));
   console.log(JSON.stringify(results, null, 2));
 } catch (error) {
+  originalTestError = error;
   // Capture actual rendered state at the failing boundary, especially a threshold
   // wait: screenshots alone cannot distinguish finished gestures from live loops.
   try {
@@ -383,5 +417,36 @@ try {
   await captureFailure(page, 'waiting-visuals', error, { phase, errors, results });
   throw error;
 } finally {
-  await browser.close();
+  // Closing the context finalizes the recording even when a UI assertion failed.
+  // Preserve the original test error if video finalization or metadata writing fails.
+  videoMetadata.testPassed = !originalTestError;
+  videoMetadata.lastPhase = phase;
+  videoMetadata.observedRunMs = Date.now() - videoStartedAt;
+  try {
+    await context.close();
+    if (!video) throw new Error('Playwright did not provide the requested recording');
+    const destination = resolve(output, videoMetadata.filename);
+    await video.saveAs(destination);
+    videoMetadata.bytes = statSync(destination).size;
+    if (!videoMetadata.bytes) throw new Error('The finalized recording is empty');
+    videoMetadata.finalized = true;
+    // Keep one verified copy in the artifact instead of uploading the raw duplicate.
+    try { await video.delete(); }
+    catch (cleanupError) { videoMetadata.rawCleanupError = String(cleanupError); }
+  } catch (videoError) {
+    videoMetadata.error = String(videoError.stack || videoError);
+    console.error('Waiting visuals video finalization failed:', videoMetadata.error);
+    if (!originalTestError) process.exitCode = 1;
+  }
+  try {
+    writeFileSync(resolve(output, 'waiting-visuals-video.json'), JSON.stringify(videoMetadata, null, 2));
+  } catch (metadataError) {
+    console.error('Waiting visuals video metadata could not be written:', String(metadataError));
+    if (!originalTestError) process.exitCode = 1;
+  }
+  try { await browser.close(); }
+  catch (closeError) {
+    console.error('Waiting visuals browser cleanup failed:', String(closeError));
+    if (!originalTestError) process.exitCode = 1;
+  }
 }

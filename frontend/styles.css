@@ -2234,6 +2234,15 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 
 /* chip longo: rótulo nunca empurra o ✕ para fora */
 .chips .chip, .side-chips .chip { max-width: min(320px, 100%); }
+.filter-chip { padding-left: 0; }
+.filter-chip .chip-edit {
+  min-width: 0; align-self: stretch; margin: -4px 0; padding: 0 0 0 9px;
+  border: 0; border-radius: inherit; background: transparent; color: inherit;
+  font: inherit; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  cursor: pointer;
+}
+.filter-chip .chip-edit:hover { text-decoration: underline; text-underline-offset: 2px; }
+.filter-chip .chip-edit:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 /* ===================== TRILHA: layout + timeline ===================== */
 #view-trail {
