@@ -19,17 +19,47 @@ const empty = { timezone_offset_minutes: null, clock_adjustment_ms: 0, sources: 
 const config = () => page.evaluate(() => structuredClone(buildTsConfig()));
 const ready = () => page.waitForFunction(() => !document.querySelector('#ts-modal').hidden && !document.querySelector('#ts-apply').disabled);
 const settle = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+function measureEditorReadability(node) {
+  const style = getComputedStyle(node);
+  const luminance = color => {
+    if (!/^rgba?\([\d.,\s]+\)$/.test(color)) throw Error(`Unsupported editor color: ${color}`);
+    const channels = color.match(/[\d.]+/g).map(Number);
+    if (channels.length !== 3 && (channels.length !== 4 || channels[3] !== 1)) throw Error(`Editor color must be opaque: ${color}`);
+    return channels.slice(0, 3).map(channel => {
+      const value = channel / 255;
+      return value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4;
+    }).reduce((total, value, index) => total + value * [.2126, .7152, .0722][index], 0);
+  };
+  const a = luminance(style.color), b = luminance(style.backgroundColor);
+  return { tag: node.tagName, color: style.color, background: style.backgroundColor, opacity: style.opacity,
+    contrast: (Math.max(a, b) + .05) / (Math.min(a, b) + .05), disabled: node.matches(':disabled'),
+    readOnly: Boolean(node.readOnly), text: node.value ?? node.textContent };
+}
+function assertEditorReadability(value, theme) {
+  const expected = theme === 'light' ? ['rgb(25, 43, 55)', 'rgb(237, 242, 245)'] : ['rgb(237, 242, 247)', 'rgb(14, 20, 27)'];
+  assert.deepEqual([value.color, value.background], expected, `${theme}: foreground and actual editor surface`);
+  assert.equal(value.opacity, '1'); assert.equal(value.disabled, false); assert.equal(value.readOnly, false);
+  assert.ok(value.text.length > 0, 'measure loaded content rather than an empty control');
+  assert.ok(value.contrast >= 4.5, `${theme}: editor contrast ${value.contrast.toFixed(3)}:1`);
+}
 async function sourceOpen(index) {
   await page.evaluate(() => Workspace.showPage('sources'));
   await page.locator('.sources-table tbody tr').nth(index).locator('.source-menu-trigger').click();
   await page.locator('.ctx-menu').getByRole('menuitem', { name: 'Data/hora', exact: true }).click();
 }
 async function snap(name) {
-  results.states.push(await page.evaluate(label => ({ label, config: buildTsConfig(), path: state.tsEditingPath,
+  results.states.push(await page.evaluate(label => ({ label, theme: document.documentElement.dataset.theme, config: buildTsConfig(), path: state.tsEditingPath,
     status: document.querySelector('#ts-status').textContent, activeElement: document.activeElement?.id || document.activeElement?.className,
     applyDisabled: document.querySelector('#ts-apply').disabled, customHidden: document.querySelector('#ts-format-custom').hidden,
     customValue: document.querySelector('#ts-format-custom').value, overflow: document.documentElement.scrollWidth > innerWidth,
   }), name));
+  const snapshot = results.states.at(-1);
+  if (!snapshot.applyDisabled) {
+    assert.equal(await rule.isDisabled(), false, 'timestamp controls are enabled before measuring the preview');
+    snapshot.readability = await page.locator('#ts-example').evaluate(measureEditorReadability);
+    assert.equal(snapshot.readability.tag, 'PRE');
+    assertEditorReadability(snapshot.readability, snapshot.theme);
+  }
   await page.screenshot({ path: resolve(output, `timestamp-editor-${name}.png`) });
 }
 try {
@@ -127,6 +157,7 @@ try {
   await page.waitForFunction(() => document.querySelector('#load-overlay').hidden && !document.querySelector('#ts-apply').disabled);
   assert.equal(await page.locator('#ts-complement').inputValue(), 'retry-me'); await snap('write-error-draft');
   results.writes = await page.evaluate(() => __timestampTest.writes); results.errors = errors;
+  assert.deepEqual([...new Set(results.states.filter(value => value.readability).map(value => value.theme))].sort(), ['dark', 'light']);
   assert.deepEqual(errors, []);
   writeFileSync(resolve(output, 'timestamp-editor.json'), JSON.stringify(results, null, 2) + '\n');
 } catch (error) {

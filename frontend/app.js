@@ -6821,7 +6821,8 @@ function renderCodesStatus() {
   else if (!codesSaveOperation && !session.fetching && session.notice) parts.push(session.notice);
   if (session.external) parts.push("O catálogo mudou fora deste editor. Recarregue para revisar a versão atual.");
   if (dirty && !codesSaveOperation) parts.push("Há alterações não salvas.");
-  status.textContent = parts.join(" ");
+  const message = parts.join(" ");
+  if (status.textContent !== message) status.textContent = message;
   status.hidden = !parts.length;
   $("#codes-editor").disabled = !session.loaded;
   $("#codes-editor").setAttribute("aria-busy", String(session.fetching));

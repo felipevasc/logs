@@ -2,6 +2,8 @@
 :root { --nav-w: 184px; --topbar-h: 64px; --context-rail-w: 0px; --radius: 12px; --radius-sm: 7px; --font-ui: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; --font-mono: "Cascadia Code", Consolas, monospace; }
 html[data-theme="dark"] { --bg-0:#0e1218; --bg-1:#141a22; --bg-2:#1a222c; --bg-3:#25303c; --border:#25303a; --border-strong:#3a4959; --text-0:#edf2f7; --text-1:#a8b6c5; --text-2:#8294a7; --accent:#83e3c3; --accent-strong:#a5f1d8; --accent-soft:#83e3c312; --hover:#ffffff05; --row-alt:#ffffff02; --shadow:0 24px 80px #0005; --code-bg:#0e141b; --scrim:#05080e88; --lv-erro:#ff8d93; --lv-critico:#ff6684; --lv-aviso:#edc379; --lv-informacao:#81b8dd; }
 html[data-theme="light"] { --bg-0:#f4f6f8; --bg-1:#fff; --bg-2:#f0f4f6; --bg-3:#e2e9ed; --border:#dce3e9; --border-strong:#b9c7d0; --text-0:#192b37; --text-1:#526575; --text-2:#637786; --accent:#14745c; --accent-strong:#095742; --accent-soft:#1686660d; --hover:#14745c06; --row-alt:#00000002; --shadow:0 24px 70px #20334620; --code-bg:#edf2f5; --scrim:#122b3d55; --lv-erro:#b93748; --lv-critico:#b92958; --lv-aviso:#95640c; --lv-informacao:#216f9f; }
+/* Plain editor text follows its themed surface; syntax palettes remain separate. */
+#codes-editor, #ts-example { color: var(--text-0); }
 html,body { font-size:13px; letter-spacing:.01em; }
 body { padding-left:var(--nav-w); padding-top:var(--topbar-h); }
 [hidden] { display:none!important; }

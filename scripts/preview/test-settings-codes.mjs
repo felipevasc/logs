@@ -18,6 +18,29 @@ const ask = async (accept, action, match) => {
   const question = page.waitForEvent('dialog'); const acting = action(); const dialog = await question;
   assert.match(dialog.message(), match); await (accept ? dialog.accept() : dialog.dismiss()); await acting;
 };
+function measureEditorReadability(node) {
+  const style = getComputedStyle(node);
+  const luminance = color => {
+    if (!/^rgba?\([\d.,\s]+\)$/.test(color)) throw Error(`Unsupported editor color: ${color}`);
+    const channels = color.match(/[\d.]+/g).map(Number);
+    if (channels.length !== 3 && (channels.length !== 4 || channels[3] !== 1)) throw Error(`Editor color must be opaque: ${color}`);
+    return channels.slice(0, 3).map(channel => {
+      const value = channel / 255;
+      return value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4;
+    }).reduce((total, value, index) => total + value * [.2126, .7152, .0722][index], 0);
+  };
+  const a = luminance(style.color), b = luminance(style.backgroundColor);
+  return { tag: node.tagName, color: style.color, background: style.backgroundColor, opacity: style.opacity,
+    contrast: (Math.max(a, b) + .05) / (Math.min(a, b) + .05), disabled: node.matches(':disabled'),
+    readOnly: Boolean(node.readOnly), text: node.value ?? node.textContent };
+}
+function assertEditorReadability(value, theme) {
+  const expected = theme === 'light' ? ['rgb(25, 43, 55)', 'rgb(237, 242, 245)'] : ['rgb(237, 242, 247)', 'rgb(14, 20, 27)'];
+  assert.deepEqual([value.color, value.background], expected, `${theme}: foreground and actual editor surface`);
+  assert.equal(value.opacity, '1'); assert.equal(value.disabled, false); assert.equal(value.readOnly, false);
+  assert.ok(value.text.length > 0, 'measure loaded content rather than an empty control');
+  assert.ok(value.contrast >= 4.5, `${theme}: editor contrast ${value.contrast.toFixed(3)}:1`);
+}
 async function screenshot(name) {
   await page.evaluate(() => {
     const label = document.createElement('div'); label.id = 'settings-fixture-label'; label.textContent = 'Configurações · Preview sintético · Recuperação visível por fixture · Sem validação WebView';
@@ -148,6 +171,11 @@ try {
     assert.equal(await tab('codes').getAttribute('aria-selected'), 'true');
     assert.equal(await editor.inputValue(), '{"currentDraft":7}');
     await tab('recovery').evaluate(node => { node.hidden = false; });
+    await usable();
+    layout.readability = await editor.evaluate(measureEditorReadability);
+    assert.equal(layout.readability.tag, 'TEXTAREA');
+    assert.equal(await editor.getAttribute('aria-busy'), 'false');
+    assertEditorReadability(layout.readability, theme);
     await screenshot(`settings-codes-${theme}-${width}.png`); results.layouts.push(layout);
   }
   assert.deepEqual(errors, []); results.errors = errors;

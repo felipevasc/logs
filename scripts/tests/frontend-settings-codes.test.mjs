@@ -166,3 +166,13 @@ test('pending save rejection after reopening reports failure and reads the still
   assert.equal(f.editor.value, '{"saved":1}'); assert.equal(f.editor.disabled, false); assert.equal(f.$('#codes-save').disabled, false);
   assert.doesNotMatch(f.$('#codes-status').textContent, /salvo|salva/);
 });
+
+test('catalog status writes once per state change rather than repeating unchanged dirty text on input', async () => {
+  const f = fixture(); await f.open(); const status = f.$('#codes-status');
+  let text = status.textContent, writes = 0;
+  Object.defineProperty(status, 'textContent', { get: () => text, set: value => { writes++; text = value; } });
+  f.edit('{"draft":2}'); assert.equal(writes, 1); assert.equal(text, 'Há alterações não salvas.');
+  f.edit('{"draft":3}'); f.edit('{"draft":4}');
+  assert.equal(writes, 1, 'two further dirty edits do not mutate the unchanged status text');
+  f.edit('{"saved":1}'); assert.equal(writes, 2); assert.equal(text, ''); assert.equal(status.hidden, true);
+});
