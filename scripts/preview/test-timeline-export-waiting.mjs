@@ -9,16 +9,24 @@ import { captureFailure } from './diagnostics.mjs';
 
 const output = resolve('output/playwright'); mkdirSync(output, { recursive: true });
 const browser = await launchBrowser(), page = await browser.newPage({ viewport: { width: 1440, height: 960 }, reducedMotion: 'no-preference' });
-const errors = [], results = { evidence: { app: 'Actual TimelineExport open/render/save and WaitingVisuals DOM/CSS', gates: 'Test-only waits at htmlToImage.toCanvas and preview export_timeline', data: 'Synthetic Case, real PNG/PDF output bytes and application pixels', nativeEngineVerified: false, generatedImageAssets: false }, screenshots: [] };
+const errors = [], results = { evidence: { app: 'Actual TimelineExport open/render/save and WaitingVisuals DOM/CSS', gates: 'Test-only waits at htmlToImage.toCanvas and preview export_timeline', data: 'Synthetic Case, real PNG/PDF output bytes and application pixels', nativeEngineVerified: false, generatedImageAssets: false }, screenshots: [], focus: [] };
 const dialog = page.locator('.tx-dialog'), scene = dialog.locator('.waiting-visual');
 let phase = 'startup';
 page.setDefaultTimeout(20000); page.on('pageerror', error => errors.push(error.message));
 const motion = state => page.waitForFunction(value => document.querySelector('.tx-dialog .waiting-visual')?.dataset.motion === value, state);
 const snap = async name => { await page.screenshot({ path: resolve(output, name), animations: 'allow' }); results.screenshots.push({ name, viewport: page.viewportSize(), theme: await page.evaluate(() => document.documentElement.dataset.theme) }); };
+const focusReceipt = async point => {
+  const receipt = await page.evaluate(() => {
+    const active = document.activeElement;
+    return { tag: active?.tagName, className: active?.className, insideDialog: !!active?.closest('.tx-dialog'), cancel: active?.hasAttribute('data-tx-cancel'), panel: active?.matches('.tx-dialog'), origin: active?.matches('.tx-trigger') };
+  });
+  results.focus.push({ point, phase, ...receipt }); return receipt;
+};
 const begin = async (format = 'pdf', reopen = true) => {
   await page.evaluate(() => { __timelineWaitGate.holdCanvas = true; });
   if (reopen) await page.locator('.tx-trigger:visible').click();
   await dialog.locator(`input[value="${format}"]`).check(); await dialog.locator('[data-tx-save]').click();
+  assert.equal((await focusReceipt(`submit-${format}`)).cancel, true, 'disabling Export must preserve keyboard focus on Cancel without a test focus call');
   await page.waitForFunction(() => __timelineWaitGate.pendingCanvas.length === 1);
   await scene.waitFor({ state: 'visible' }); await motion('running');
 };
@@ -91,24 +99,39 @@ try {
   assert.equal(await scene.count(), 0); assert.equal(await dialog.locator('progress').isVisible(), false);
   assert.equal(await dialog.locator('[data-tx-status]').textContent(), 'Escolha onde salvar o arquivo…');
   assert.equal(await dialog.locator('[data-tx-cancel]').isDisabled(), true);
+  assert.equal((await focusReceipt('save-pending')).panel, true, 'disabling Cancel must keep keyboard focus within the guarded dialog');
+  for (const key of ['Tab', 'Shift+Tab']) {
+    await page.keyboard.press(key); assert.equal((await focusReceipt(`save-pending-${key}`)).panel, true, 'Tab remains in the dialog while all controls are disabled');
+  }
   await page.keyboard.press('Escape'); assert.equal(await dialog.count(), 1, 'native-save guard stays intact');
   assert.equal(await page.evaluate(() => __timelineWaitGate.saveEntries.at(-1).sceneCount), 0);
   await page.evaluate(() => __timelineWaitGate.releaseSave());
   await page.waitForFunction(() => document.querySelector('[data-tx-status]')?.textContent.includes('Salvamento cancelado'));
   assert.equal(await scene.count(), 0); assert.equal(await page.evaluate(() => __timelineExportMock.files.length), 0);
-  await snap('timeline-export-wait-save-cancelled.png'); await dialog.locator('[data-tx-cancel]').click();
+  assert.equal((await focusReceipt('save-cancelled')).panel, true);
+  await snap('timeline-export-wait-save-cancelled.png'); await page.keyboard.press('Escape'); await dialog.waitFor({ state: 'detached' });
+  assert.equal((await focusReceipt('save-cancelled-close')).origin, true);
   phase = 'render-cancel-reopen'; await page.setViewportSize({ width: 1024, height: 800 });
   for (const action of ['Escape', 'Cancel']) {
     await begin('png'); assert.equal(await scene.locator('.wv-metric').textContent(), '0 / 1 imagem desenhada');
     const beforeCancel = await page.evaluate(() => __timelineWaitGate.saveEntries.length);
+    assert.equal((await focusReceipt(`before-${action}`)).cancel, true);
     if (action === 'Escape') await page.keyboard.press('Escape'); else await dialog.locator('[data-tx-cancel]').click();
     await dialog.waitFor({ state: 'detached' }); assert.equal(await scene.count(), 0);
+    assert.equal((await focusReceipt(`after-${action}`)).origin, true);
     await page.evaluate(() => __timelineWaitGate.releaseCanvas()); await page.waitForFunction(() => !document.querySelector('.tx-stage'));
     assert.equal(await page.evaluate(() => __timelineWaitGate.saveEntries.length), beforeCancel, 'late raster settlement after cancel cannot save');
   }
-  phase = 'error-retry'; await begin('png'); await page.evaluate(() => { __timelineWaitGate.failCanvas = true; __timelineWaitGate.releaseCanvas(); });
+  phase = 'error-retry'; await begin('png'); await scene.locator('.wv-motion-toggle').focus();
+  await page.evaluate(() => { __timelineWaitGate.failCanvas = true; __timelineWaitGate.releaseCanvas(); });
   await dialog.locator('[data-tx-status].error').waitFor({ state: 'visible' });
   assert.match(await dialog.locator('[data-tx-status]').textContent(), /Falha de desenho/); assert.equal(await scene.count(), 0); await snap('timeline-export-wait-error.png');
+  assert.equal((await focusReceipt('error-toggle-removed')).panel, true, 'only the removed focused toggle receives a replacement focus');
+  await page.keyboard.press('Shift+Tab'); assert.equal(await dialog.locator('[data-tx-save]').evaluate(node => node === document.activeElement), true, 'backward Tab from the fallback section remains inside the modal');
+  phase = 'unrelated-focus'; await begin('png', false); await page.locator('.tx-trigger:visible').focus();
+  await page.evaluate(() => __timelineWaitGate.releaseCanvas()); await dialog.locator('[data-tx-status].error').waitFor({ state: 'visible' });
+  assert.equal((await focusReceipt('error-unrelated-focus')).origin, true, 'a render settling after focus moved elsewhere must not take it back');
+  phase = 'error-retry';
   await page.evaluate(() => { __timelineWaitGate.failCanvas = false; __timelineExportMock.cancel = false; }); await begin('png', false);
   await page.evaluate(() => __timelineWaitGate.releaseCanvas()); await dialog.waitFor({ state: 'detached' });
   let file = await page.evaluate(() => __timelineExportMock.files.at(-1)), bytes = Buffer.from(file.base64, 'base64');
@@ -122,7 +145,7 @@ try {
   results.pdf = { filename: file.filename, bytes: bytes.length, pages }; writeFileSync(resolve(output, 'timeline-export-wait-output.pdf'), bytes);
   assert.equal(await scene.count(), 0); assert.equal(await page.locator('.tx-stage').count(), 0); assert.deepEqual(errors, []); results.ok = true;
 } catch (error) {
-  results.ok = false; results.error = String(error.stack || error); await captureFailure(page, 'timeline-export-waiting', error, { phase, errors, results }); throw error;
+  results.ok = false; results.error = String(error.stack || error); await focusReceipt('failure').catch(() => {}); await captureFailure(page, 'timeline-export-waiting', error, { phase, errors, results }); throw error;
 } finally {
   results.phase = phase; results.errors = errors; writeFileSync(resolve(output, 'timeline-export-waiting-results.json'), JSON.stringify(results, null, 2)); await browser.close();
 }

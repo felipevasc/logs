@@ -16,24 +16,28 @@ function fixture({ lateness = 0, visual = true } = {}) {
   class Node {
     constructor() { this.children = []; this.hidden = false; this.textContent = ''; this.classes = new Set(); this.classList = { add: name => this.classes.add(name), remove: name => this.classes.delete(name) }; }
     append(child) { child.parent = this; this.children.push(child); }
-    remove() { this.parent.children = this.parent.children.filter(child => child !== this); this.parent = null; }
+    remove() { if (this.contains(document.activeElement)) document.activeElement = document.body; this.parent.children = this.parent.children.filter(child => child !== this); this.parent = null; }
     removeAttribute(name) { delete this[name]; }
+    contains(node) { return node === this || this.children.some(child => child.contains(node)); }
+    get disabled() { return !!this.isDisabled; }
+    set disabled(value) { this.isDisabled = !!value; if (value && document.activeElement === this) document.activeElement = document.body; }
     get isConnected() { return this === document.body || !!this.parent?.isConnected; }
     set innerHTML(value) {
-      this.markup = value; this.parts = Object.fromEntries(['[data-tx-status]', '[data-tx-waiting]', '[data-tx-save]', '[data-tx-cancel]', 'progress'].map(selector => { const child = new Node(); this.append(child); return [selector, child]; }));
-      this.inputs = ['png', 'pdf'].map(value => { const child = new Node(); child.value = value; this.append(child); return child; });
+      this.markup = value; const panel = new Node(); this.append(panel);
+      this.parts = Object.fromEntries(['[data-tx-status]', '[data-tx-waiting]', '[data-tx-save]', '[data-tx-cancel]', 'progress'].map(selector => { const child = new Node(); panel.append(child); return [selector, child]; })); this.parts['.tx-dialog'] = panel;
+      this.inputs = ['png', 'pdf'].map(value => { const child = new Node(); child.value = value; panel.append(child); return child; });
       this.inputs[0].checked = true; this.parts['[data-tx-waiting]'].hidden = true; this.parts.progress.hidden = true;
     }
     querySelector(selector) { return selector === 'input:checked' ? this.inputs.find(input => input.checked) : this.parts[selector]; }
-    querySelectorAll(selector) { return selector === 'input' ? this.inputs : [...this.inputs, ...this.children.filter(child => child.isToggle), this.parts['[data-tx-cancel]'], this.parts['[data-tx-save]']]; }
-    focus(options) { document.activeElement = this; this.focuses = (this.focuses || 0) + 1; this.focusOptions = options; }
+    querySelectorAll(selector) { return selector === 'input' ? this.inputs : [...this.inputs, ...this.parts['[data-tx-waiting]'].children.filter(child => child.isToggle), this.parts['[data-tx-cancel]'], this.parts['[data-tx-save]']]; }
+    focus(options) { if (!this.isConnected || this.disabled || this.hidden) return; document.activeElement = this; this.focuses = (this.focuses || 0) + 1; this.focusOptions = options; }
   }
   const document = {}; document.body = new Node(); const origin = new Node(); document.body.append(origin); document.activeElement = origin;
   const render = (spec, options) => { const task = deferred(); renders.push({ ...task, spec, options }); options.progress(0, 2, 'Preparando fontes e desenho…', { label: 'Preparando fontes e desenho…' }); return task.promise; };
   const save = (blob, spec) => { const task = deferred(); saves.push({ ...task, blob, spec }); return task.promise; };
   const toast = (...args) => toasts.push(args);
   const window = { toast, ...(visual ? { WaitingVisuals: { mount(host, receipt) {
-    const toggle = new Node(); toggle.isToggle = true; host.parent.append(toggle);
+    const toggle = new Node(); toggle.isToggle = true; host.append(toggle);
     const view = { host, toggle, receipts: [receipt], destroyed: false, update(value) { this.receipts.push(value); }, destroy() { this.destroyed = true; toggle.remove(); } }; mounted.push(view); return view;
   } } } : {}) };
   const context = vm.createContext({ window, document, AbortController, DOMException, performance: { now: () => now },
@@ -45,7 +49,8 @@ function fixture({ lateness = 0, visual = true } = {}) {
   vm.runInContext(`let dialog, waitingSerial=0; ${ui}; window.ExportUI={open};`, context);
   const advance = to => { for (;;) { const next = [...timers].filter(([, task]) => task.at <= to).sort((a, b) => a[1].at - b[1].at)[0]; if (!next) break; timers.delete(next[0]); now = next[1].at; next[1].fn(); } now = to; };
   const open = (spec = { source: origin, type: 'matrix', title: 'Captured timeline', filename: 'captured-timeline' }) => { window.ExportUI.open(spec, origin); return document.body.children.at(-1); };
-  return { open, advance, mounted, timers, renders, saves, toasts, origin, document };
+  const key = (value, shiftKey = false) => { const event = { key: value, shiftKey, preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.stopped = true; } }; for (let node = document.activeElement; node; node = node.parent) { node.onkeydown?.(event); if (event.stopped) break; } return event; };
+  return { open, advance, mounted, timers, renders, saves, toasts, origin, document, key };
 }
 
 test('fast render never flashes or retains its result for animation; saving is distinct', async () => {
@@ -91,7 +96,7 @@ test('Cancel and Escape abort exact attempt before/after admission; late callbac
   for (const mounted of [false, true]) for (const escape of [false, true]) {
     const f = fixture(), modal = f.open(), run = modal.querySelector('[data-tx-save]').onclick();
     if (mounted) f.advance(300);
-    if (escape) modal.onkeydown({ key: 'Escape', preventDefault() {}, stopPropagation() {} }); else modal.querySelector('[data-tx-cancel]').onclick();
+    if (escape) f.key('Escape'); else modal.querySelector('[data-tx-cancel]').onclick();
     const status = modal.querySelector('[data-tx-status]').textContent;
     assert.equal(f.renders[0].options.signal.aborted, true); assert.equal(modal.isConnected, false); assert.equal(f.timers.size, 0);
     if (mounted) assert.equal(f.mounted[0].destroyed, true);
@@ -148,6 +153,59 @@ test('focus trap includes visible motion toggle and excludes it under reduced mo
   modal.onkeydown({ key: 'Tab', shiftKey: false, preventDefault() {} }); assert.equal(f.document.activeElement, toggle);
   toggle.hidden = true; cancel.focus(); modal.onkeydown({ key: 'Tab', shiftKey: true, preventDefault() {} }); assert.equal(f.document.activeElement, cancel);
   cancel.onclick(); f.renders[0].resolve(result()); await run;
+});
+
+test('disabling a focused Export or format input keeps keyboard Escape inside its pending modal', async () => {
+  for (const startOnInput of [false, true]) {
+    const f = fixture(), modal = f.open(), cancel = modal.querySelector('[data-tx-cancel]');
+    if (startOnInput) modal.inputs[0].focus();
+    const run = modal.querySelector('[data-tx-save]').onclick();
+    assert.equal(f.document.activeElement, cancel); assert.equal(cancel.focusOptions.preventScroll, true);
+    assert.equal(f.mounted.length, 0, 'focus is preserved before the appearance timer');
+    f.key('Escape'); assert.equal(modal.isConnected, false); assert.equal(f.document.activeElement, f.origin);
+    assert.equal(f.origin.focusOptions.preventScroll, true); assert.equal(f.renders[0].options.signal.aborted, true);
+    f.renders[0].resolve(result()); await run; assert.equal(f.saves.length, 0); assert.equal(f.document.activeElement, f.origin);
+  }
+});
+
+test('removing the focused animation control restores only its affected focus on renderer error', async () => {
+  const f = fixture(), modal = f.open(), run = modal.querySelector('[data-tx-save]').onclick(); f.advance(300);
+  const view = f.mounted[0]; view.toggle.focus(); assert.equal(f.document.activeElement, view.toggle);
+  f.renders[0].reject(Error('Render failed')); await run;
+  assert.equal(view.destroyed, true); assert.equal(f.document.activeElement, modal.querySelector('.tx-dialog'));
+  assert.equal(modal.querySelector('.tx-dialog').focusOptions.preventScroll, true); assert.equal(f.timers.size, 0);
+  assert.equal(f.key('Tab', true).defaultPrevented, true); assert.equal(f.document.activeElement, modal.querySelector('[data-tx-save]'));
+  assert.equal(f.key('Tab').defaultPrevented, true); assert.equal(f.document.activeElement, modal.inputs[0]);
+  f.key('Escape'); assert.equal(modal.isConnected, false); assert.equal(f.document.activeElement, f.origin);
+});
+
+test('save transition preserves focus from Cancel or removed toggle; cancelled save remains keyboard-closeable', async () => {
+  for (const fromToggle of [false, true]) {
+    const f = fixture(), modal = f.open(), run = modal.querySelector('[data-tx-save]').onclick(); f.advance(300);
+    if (fromToggle) f.mounted[0].toggle.focus();
+    f.renders[0].resolve(result()); await flush();
+    const panel = modal.querySelector('.tx-dialog'); assert.equal(f.document.activeElement, panel);
+    assert.equal(modal.querySelector('[data-tx-cancel]').disabled, true); assert.equal(f.mounted[0].destroyed, true);
+    for (const backwards of [false, true]) {
+      assert.equal(f.key('Tab', backwards).defaultPrevented, true, 'no eligible controls means Tab stays on the section');
+      assert.equal(f.document.activeElement, panel);
+    }
+    f.key('Escape'); assert.equal(modal.isConnected, true, 'keyboard reaches the existing write guard');
+    f.saves[0].resolve({ saved: false }); await run; assert.equal(f.document.activeElement, panel);
+    f.key('Escape'); assert.equal(modal.isConnected, false); assert.equal(f.document.activeElement, f.origin);
+  }
+});
+
+test('programmatic start, mount and late settlement never steal unrelated focus', async () => {
+  for (const outcome of ['error', 'save-cancel']) {
+    const f = fixture(), modal = f.open(); f.origin.focus(); const run = modal.querySelector('[data-tx-save]').onclick();
+    assert.equal(f.document.activeElement, f.origin); f.advance(300); assert.equal(f.document.activeElement, f.origin);
+    f.mounted[0].toggle.focus(); f.origin.focus();
+    if (outcome === 'error') f.renders[0].reject(Error('Render failed'));
+    else { f.renders[0].resolve(result()); await flush(); assert.equal(f.document.activeElement, f.origin); f.saves[0].resolve({ saved: false }); }
+    await run; assert.equal(f.document.activeElement, f.origin); assert.equal(modal.querySelector('.tx-dialog').focuses, undefined);
+    modal.querySelector('[data-tx-cancel]').onclick();
+  }
 });
 
 test('adapter does not parse stage strings, use polling, or alter source/filter/snapshot/native contracts', () => {

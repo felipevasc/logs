@@ -206,7 +206,7 @@ window.TimelineExport = (() => {
   }
   // Decorate only the real render promise, never the native save dialog/write.
   // One appearance timer and one measured threshold; neither retains a result.
-  function renderWaiting(host, status, meter, isCurrent) {
+  function renderWaiting(host, status, meter, isCurrent, focusTarget) {
     const started = performance.now(), operationId = `timeline-export-${++waitingSerial}`;
     let visual = null, longWait = null, finished = false, label = "", measurements = {};
     const receipt = () => ({ operationId, phaseId: "command:timeline_export_render", state: "running",
@@ -235,8 +235,11 @@ window.TimelineExport = (() => {
       },
       done() {
         if (finished) return;
+        const restoreFocus = current() && host.contains(document.activeElement);
         finished = true; clearTimeout(timer); clearTimeout(longWait);
         visual?.destroy(); visual = null; host.hidden = true; status.hidden = false; meter.hidden = true;
+        // Only replace focus that belonged to the disappearing motion control.
+        if (restoreFocus) focusTarget.focus({ preventScroll: true });
       }
     };
   }
@@ -246,9 +249,9 @@ window.TimelineExport = (() => {
     try { info = measure(spec); } catch (error) { if (window.toast) toast(error.message, "err"); return; }
     const png = pngPlan(info), pdfPages = planPages(info).length;
     const overlay = text("div", "tx-backdrop", ""); dialog = overlay;
-    overlay.innerHTML = '<section class="tx-dialog" role="dialog" aria-modal="true" aria-labelledby="tx-title"><h2 id="tx-title">Exportar timeline</h2><p>A visão completa, incluindo o conteúdo fora da rolagem, com o tema atual.</p><div class="tx-formats"><label><input type="radio" name="tx-format" value="png" checked><span><strong>Imagem PNG</strong><small>Um arquivo completo</small></span></label><label><input type="radio" name="tx-format" value="pdf"><span><strong>Documento PDF</strong><small>Páginas legíveis</small></span></label></div><p data-tx-status role="status" aria-live="polite"></p><progress hidden></progress><div data-tx-waiting hidden></div><div class="tx-actions"><button type="button" class="btn ghost" data-tx-cancel>Cancelar</button><button type="button" class="btn primary" data-tx-save>Exportar</button></div></section>';
+    overlay.innerHTML = '<section class="tx-dialog" role="dialog" aria-modal="true" aria-labelledby="tx-title" tabindex="-1"><h2 id="tx-title">Exportar timeline</h2><p>A visão completa, incluindo o conteúdo fora da rolagem, com o tema atual.</p><div class="tx-formats"><label><input type="radio" name="tx-format" value="png" checked><span><strong>Imagem PNG</strong><small>Um arquivo completo</small></span></label><label><input type="radio" name="tx-format" value="pdf"><span><strong>Documento PDF</strong><small>Páginas legíveis</small></span></label></div><p data-tx-status role="status" aria-live="polite"></p><progress hidden></progress><div data-tx-waiting hidden></div><div class="tx-actions"><button type="button" class="btn ghost" data-tx-cancel>Cancelar</button><button type="button" class="btn primary" data-tx-save>Exportar</button></div></section>';
     document.body.append(overlay);
-    const status = overlay.querySelector("[data-tx-status]"), submit = overlay.querySelector("[data-tx-save]"), cancel = overlay.querySelector("[data-tx-cancel]"), meter = overlay.querySelector("progress");
+    const status = overlay.querySelector("[data-tx-status]"), submit = overlay.querySelector("[data-tx-save]"), cancel = overlay.querySelector("[data-tx-cancel]"), meter = overlay.querySelector("progress"), panel = overlay.querySelector(".tx-dialog");
     let controller = null, writing = false, waiting = null;
     const selectedFormat = () => overlay.querySelector("input:checked").value;
     const update = () => { const format = selectedFormat(); status.classList.remove("error"); status.textContent = format === "png" ? png.allowed ? `${Math.round(png.width * png.ratio).toLocaleString("pt-BR")} × ${Math.round(png.height * png.ratio).toLocaleString("pt-BR")} pixels` : "Esta timeline é grande demais para uma única imagem. Escolha PDF para preservar a leitura." : pdfPages > MAX_PAGES ? `Mais de ${MAX_PAGES} páginas. Reduza a escala ou refine o recorte.` : `${pdfPages.toLocaleString("pt-BR")} ${pdfPages === 1 ? "página" : "páginas"} estimadas · conteúdo dividido sem reduzir tudo a uma miniatura.`; submit.disabled = format === "png" ? !png.allowed : pdfPages > MAX_PAGES; };
@@ -258,6 +261,8 @@ window.TimelineExport = (() => {
       if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); }
       if (event.key !== "Tab") return;
       const nodes = [...overlay.querySelectorAll("button,input")].filter(node => !node.disabled && !node.hidden);
+      if (!nodes.length) { event.preventDefault(); panel.focus({ preventScroll: true }); return; }
+      if (document.activeElement === panel) { event.preventDefault(); (event.shiftKey ? nodes.at(-1) : nodes[0]).focus(); return; }
       if (event.shiftKey && document.activeElement === nodes[0]) { event.preventDefault(); nodes.at(-1).focus(); }
       else if (!event.shiftKey && document.activeElement === nodes.at(-1)) { event.preventDefault(); nodes[0].focus(); }
     };
@@ -265,13 +270,18 @@ window.TimelineExport = (() => {
     submit.onclick = async () => {
       if (controller || writing || !overlay.isConnected) return;
       const format = selectedFormat(); controller = new AbortController();
-      const operation = controller; submit.disabled = true; overlay.querySelectorAll("input").forEach(input => input.disabled = true); meter.hidden = false; status.classList.remove("error");
+      const operation = controller, inputs = [...overlay.querySelectorAll("input")];
+      // Disabling the focused form control would otherwise send Escape to body.
+      if ([submit, ...inputs].includes(document.activeElement)) cancel.focus({ preventScroll: true });
+      submit.disabled = true; inputs.forEach(input => input.disabled = true); meter.hidden = false; status.classList.remove("error");
       const isCurrent = () => dialog === overlay && controller === operation && !operation.signal.aborted;
-      waiting = renderWaiting(overlay.querySelector("[data-tx-waiting]"), status, meter, isCurrent);
+      waiting = renderWaiting(overlay.querySelector("[data-tx-waiting]"), status, meter, isCurrent, panel);
       try {
         const result = await render({ ...spec, format }, { signal: operation.signal, progress: waiting.progress });
         waiting.done(); abort(operation.signal); if (!isCurrent() || !overlay.isConnected) return;
-        writing = true; cancel.disabled = true; status.textContent = "Escolha onde salvar o arquivo…";
+        writing = true;
+        if (document.activeElement === cancel) panel.focus({ preventScroll: true });
+        cancel.disabled = true; status.textContent = "Escolha onde salvar o arquivo…";
         const saved = await save(result.blob, { ...spec, format }); writing = false; controller = null;
         if (saved?.saved) { close(); if (window.toast) toast(`${format.toUpperCase()} exportado.`, "ok"); }
         else { status.textContent = "Salvamento cancelado. A timeline continua disponível."; }
