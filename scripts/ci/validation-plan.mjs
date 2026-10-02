@@ -11,7 +11,7 @@ export const fullPreview = [
   'test-explorer-timeline.mjs', 'test-field-transform.mjs', 'test-exclusion-archive.mjs',
   'test-case-references.mjs', 'test-canonical-field-actions.mjs', 'test-java-trace.mjs',
   'test-native-case-startup.mjs', 'test-native-case-timeline.mjs',
-  'test-context-menu.mjs', 'test-waiting-visuals.mjs', 'test-toast-feedback.mjs', 'test-record-actions.mjs', 'test-export-scope.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs',
+  'test-context-menu.mjs', 'test-waiting-visuals.mjs', 'test-toast-feedback.mjs', 'test-record-actions.mjs', 'test-export-scope.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs', 'test-columns.mjs',
 ];
 export const essentialPreview = [
   'test-navigation.mjs', 'test-responsiveness.mjs', 'test-updates.mjs',

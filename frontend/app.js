@@ -5816,6 +5816,29 @@ function openTsModal(path = null) {
   $("#ts-modal").hidden = false;
 }
 
+function setColumnVisible(column, visible) {
+  if (!state.columns.includes(column) || column === "timestamp" && !visible) return false;
+  const next = state.visibleCols.filter(item => state.columns.includes(item) && (visible || item !== column));
+  if (visible && !next.includes(column)) next.push(column);
+  if (next.length === state.visibleCols.length && next.every((item, index) => item === state.visibleCols[index])) return false;
+  state.visibleCols = next;
+  saveVisibleCols();
+  // Visibility changes preserve the user's order and reuse the current page.
+  renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
+  return true;
+}
+
+function closeColPop(restoreFocus = true) {
+  const pop = $("#col-pop"), trigger = $("#btn-colpicker");
+  if (pop.hidden) return;
+  const active = document.activeElement;
+  pop.hidden = true;
+  trigger?.setAttribute("aria-expanded", "false");
+  if (restoreFocus && (active === document.body || pop.contains(active)) && trigger?.isConnected && !trigger.disabled
+    && !trigger.closest('[hidden],[inert],[aria-hidden="true"]') && trigger.getClientRects().length
+    && getComputedStyle(trigger).visibility !== "hidden") trigger.focus({ preventScroll: true });
+}
+
 function openColPop() {
   const pop = $("#col-pop");
   const list = $("#col-list");
@@ -5824,25 +5847,21 @@ function openColPop() {
     const item = el("label", "col-item");
     const cb = document.createElement("input");
     cb.type = "checkbox";
+    cb.dataset.column = col;
     cb.checked = state.visibleCols.includes(col);
     if (col === "timestamp") {
       cb.checked = true;
       cb.disabled = true;
-      item.title = "Data/hora é sempre a primeira coluna";
+      item.title = "Data/hora permanece visível";
     }
-    cb.onchange = () => {
-      const set = new Set(state.visibleCols);
-      cb.checked ? set.add(col) : set.delete(col);
-      state.visibleCols = state.columns.filter((c) => set.has(c));
-      saveVisibleCols();
-      // as linhas da página já estão no cliente: re-render local basta
-      renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
-    };
+    cb.onchange = () => setColumnVisible(col, cb.checked);
     item.append(cb, el("span", "", colLabel(col)));
     list.appendChild(item);
   }
   pop.hidden = false;
+  $("#btn-colpicker").setAttribute("aria-expanded", "true");
   positionPop(pop, $("#btn-colpicker"));
+  (list.querySelector("input:not(:disabled)") || pop).focus({ preventScroll: true });
 }
 
 // ------------------------------------------------------------------ drawer
@@ -6086,13 +6105,7 @@ function detailCanonicalAction(column, node, anchor) {
 
 function toggleDetailColumn(column) {
   const visible = state.visibleCols.includes(column);
-  if (visible && column === "timestamp") return;
-  const next = new Set(state.visibleCols);
-  if (visible) next.delete(column);
-  else next.add(column);
-  state.visibleCols = state.columns.filter((item) => next.has(item));
-  saveVisibleCols();
-  renderTable({ total: state.total, rows: state.rows }, { reuseRows: true });
+  if (!setColumnVisible(column, !visible)) return;
   toast(visible ? "Coluna removida da tabela." : "Coluna adicionada à tabela.", "ok");
 }
 
@@ -6996,6 +7009,7 @@ function bindKeyboard() {
       if (ctxEl) { e.preventDefault(); e.stopImmediatePropagation(); closeCtxMenu(true); return; }
       if (!$("#name-pop").hidden && namePopExact) { e.preventDefault(); closeNamePop(); return; }
       if (!$("#filter-pop").hidden) { e.preventDefault(); closeFilterPop(); return; }
+      if (!$("#col-pop").hidden) { e.preventDefault(); e.stopImmediatePropagation(); closeColPop(); return; }
       if (!$("#detail-value-modal").hidden) {
         closeDetailValue();
         return;
@@ -7004,7 +7018,7 @@ function bindKeyboard() {
       closeTlPop();
       closeDrawer();
       $("#filter-pop").hidden = true;
-      $("#col-pop").hidden = true;
+      closeColPop(false);
       $("#name-pop").hidden = true;
       $("#codes-modal").hidden = true;
       $("#settings-modal").hidden = true;
@@ -7105,13 +7119,13 @@ function bind() {
 
   $("#btn-colpicker").onclick = (e) => {
     e.stopPropagation();
-    $("#col-pop").hidden ? openColPop() : ($("#col-pop").hidden = true);
+    $("#col-pop").hidden ? openColPop() : closeColPop();
   };
   document.addEventListener("click", (e) => {
     if (!$("#filter-pop").hidden && !e.target.closest("#filter-pop") && !e.target.closest("#btn-add-filter") && !e.target.closest(".ctx-menu"))
       closeFilterPop(false);
     if (!$("#col-pop").hidden && !e.target.closest("#col-pop") && !e.target.closest("#btn-colpicker"))
-      $("#col-pop").hidden = true;
+      closeColPop(false);
     // .ctx-menu isento: o item que abriu o popover não pode fechá-lo no mesmo clique
     if (!$("#name-pop").hidden && !e.target.closest("#name-pop") && !e.target.closest(".ctx-menu") && !e.target.closest("[data-exact-field-picker]"))
       closeNamePop(false);

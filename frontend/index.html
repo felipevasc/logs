@@ -267,7 +267,7 @@
         </div>
         <div class="spacer"></div>
         <span id="result-count" class="result-count"></span>
-        <button id="btn-colpicker" class="btn ghost small" type="button">
+        <button id="btn-colpicker" class="btn ghost small" type="button" aria-controls="col-pop" aria-expanded="false">
           <i class="fas fa-table-columns"></i> Colunas
         </button>
       </div>
@@ -872,8 +872,8 @@
   </div>
 
   <!-- ===================== POPOVER: COLUNAS ===================== -->
-  <div id="col-pop" class="popover" hidden>
-    <div class="pop-title">Colunas visíveis</div>
+  <div id="col-pop" class="popover" role="group" aria-labelledby="col-pop-title" tabindex="-1" hidden>
+    <div id="col-pop-title" class="pop-title">Colunas visíveis</div>
     <div id="col-list" class="col-list"></div>
   </div>
 
