@@ -114,13 +114,13 @@ A direção do estudo isolado foi aprovada pelo usuário. O CI54 confirmou a int
 
 Confirmações benignas equivalentes de cópia e filtro passam a ocupar um único aviso com contador discreto, sem narrar a mesma mensagem várias vezes. Erros, avisos de contexto e recibos não são agregados. O feedback gerenciado usa um contêiner separado, para não mover, encurtar ou ocultar o Undo; somente os sete avisos benignos são transparentes ao ponteiro. Mensagens de erro continuam selecionáveis e copiáveis.
 
-O posicionamento evita foco, editor e ações quando houver espaço. Timers, frames, observer e listeners são encerrados ao remover o último aviso. A revisão independente fechou as regressões de geometria do Undo e seleção de erros; o roteiro de navegador próprio ainda depende de CI.
+O posicionamento evita foco, editor e ações quando houver espaço. Timers, frames, observer e listeners são encerrados ao remover o último aviso. A revisão independente fechou as regressões de geometria do Undo e seleção de erros; o roteiro próprio passou no CI55, inclusive geometria do Undo e seleção de mensagens de erro.
 
 ### Mais espaço no cruzamento
 
 O construtor de Cruzar dados agora pode ser recolhido por uma escolha explícita. A apresentação fechada resume linhas, colunas e medidas e conserva a ação Editar configuração. O estado inicial continua expandido. Recolher não consulta novamente nem recria a tabela, e conserva foco e rolagem; a preferência é restaurada por contexto, com snapshots antigos assumindo o estado expandido.
 
-A paleta local recolhe junto do construtor; o catálogo principal permanece disponível. Nenhuma capacidade de edição é removida. O roteiro de CI compara temas claro/escuro em 1440 e 1024 px, mede ganho real da área de linhas e cobre erro, cancelamento, retry e troca entre Caso e Análise. A confirmação visual deste incremento ainda está pendente.
+A paleta local recolhe junto do construtor; o catálogo principal permanece disponível. Nenhuma capacidade de edição é removida. O CI55 mediu a área da tabela de 373 para 533 px (8 para 13 linhas) em 1440 px, e de 156 para 312 px (1 para 6 linhas) em 1024 px, mantendo a fonte e os dois temas. Encontrou também uma falha na reabertura do cache após trocar o contexto: uma linha ausente era tratada como uma coleção. A correção consulta a coleção de linhas real; regressões Node reproduzem o erro anterior. A repetição do fluxo completo no navegador está pendente.
 
 ### Ampliação acessível
 
@@ -129,3 +129,19 @@ Configurações e atalhos passam a oferecer escolhas até200%, mantendo o autom�
 Escala solicitada e aplicada são distintas. Escritas nativas são serializadas; respostas antigas não anunciam sucesso nem substituem a intenção atual. Voltar para Automático durante uma escrita aguarda o recibo e recalcula pela escala confirmada e geometria observada. Uma falha mantém a preferência e informa que não foi aplicada.
 
 O preview verifica seleção de200% e reflow dos controles em1024/640/320CSSpx. O transporte de preview retorna false para zoom; por isso não comprova zoom instalado a200% nem reflow global do app. Esses gates permanecem separados.
+
+### Ações de registro por teclado
+
+A tabela conserva HTML nativo e recebe uma coluna estreita de ações, com um botão nomeado por registro. Enter, Espaço e Shift+F10 abrem o mesmo menu contextual; Ver detalhes é a primeira ação, sem inventar um valor de célula. Uma ligação de salto permite alcançar a paginação sem atravessar os até 500 botões. A coluna de ações não participa de exportação, seleção de campos, ordenação ou larguras persistidas.
+
+O retorno resolve a mesma ocorrência por referência e contexto, inclusive quando a consulta recria as linhas com o menu aberto. Registros removidos, referência substituída e contexto antigo usam a paginação. O detalhe focaliza seu controle de fechamento imediatamente enquanto carrega e não rouba o foco que a pessoa moveu. O catálogo também preserva se a origem era o nome do campo ou sua elipse. Este recorte não implementa uma grade completa nem seleção de intervalos por teclado.
+
+### Novas ações do robô
+
+O checkpoint usa a mesma personagem para segurar a gaveta, abrir, conferir e fechar; pasta e etiqueta reagem a essa interação. Cálculo usa uma ficha presa à mão, levada ao visor e depositada em um grupo. As cenas longas duram 6,8 e 6,4 segundos; os gestos curtos têm coreografia própria de 2,8 e 2,6 segundos. Nenhuma duração controla progresso ou retenção de resultado.
+
+Os testes Node verificam a preservação do piloto de leitura, hierarquia dos objetos, contatos e estados. O roteiro de navegador foi ampliado para medir matrizes de contato no tamanho real de 240 × 120 CSS px, gravar ciclos completos e comparar temas, pausa, movimento reduzido e cores forçadas. Essa nova evidência visual aguarda o próximo CI. A gravação usa transporte sintético identificado e não valida o motor nativo.
+
+### Regressões de continuidade
+
+Os testes de menu passam a recriar deliberadamente o catálogo enquanto ele está aberto e exigem retorno ao controle lógico correspondente. O teste de edição por chip aguarda a barreira existente de contagens antes de medir consultas: tarefas ainda no debounce não estão incluídas em `Tasks.pending()`. A exigência de zero consultas ao abrir e cancelar continua estrita; não foi acrescentado atraso ao produto.

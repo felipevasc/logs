@@ -3,14 +3,17 @@ window.ContextMenu = (() => {
   "use strict";
   const focusable = "button,input,select,textarea,a[href],[tabindex]";
 
-  function create({ fallbackFocus = () => [], onChange = () => {} } = {}) {
+  function create({ fallbackFocus = () => [], captureReturnFocus = () => null, onChange = () => {} } = {}) {
     let current = null, invocation = null, keyboardTarget = null;
     const visible = node => !!node?.isConnected && !node.hidden
       && !node.closest?.('[hidden],[inert],[aria-hidden="true"]')
       && !!node.getClientRects?.().length && getComputedStyle(node).visibility !== "hidden";
     const validFocus = node => visible(node) && !node.disabled && node.getAttribute("aria-disabled") !== "true"
       && node.matches?.(focusable) && !node.closest(".ctx-menu");
-    const returnTarget = entry => [entry.origin, ...fallbackFocus(entry.source)].find(validFocus);
+    // A captured resolver owns the logical caller, including its context guard.
+    // Its null result must not fall through to an old but still-connected node.
+    const returnTarget = entry => [entry.resolveReturnFocus ? entry.resolveReturnFocus() : entry.origin,
+      ...fallbackFocus(entry.source)].find(validFocus);
     const consume = event => { event.preventDefault(); event.stopImmediatePropagation(); };
     const controls = () => current ? [...current.menu.querySelectorAll('[role="menuitem"]')].filter(visible) : [];
     const scrollPosition = node => {
@@ -29,7 +32,11 @@ window.ContextMenu = (() => {
       current = null;
       entry.menu.remove();
       onChange(null);
-      if (restoreFocus) returnTarget(entry)?.focus({ preventScroll: true });
+      if (restoreFocus) {
+        const target = returnTarget(entry);
+        target?.focus({ preventScroll: true });
+        return target;
+      }
     }
     function position() {
       if (!current) return;
@@ -42,11 +49,14 @@ window.ContextMenu = (() => {
       // Native dispatch can run microtasks between capture and target callbacks.
       // eventPhase stays nonzero for the dispatch, then resets before later work.
       const input = invocation?.event.eventPhase ? invocation : null;
-      const source = trigger || input?.target || document.activeElement;
+      const candidate = trigger || input?.target || document.activeElement;
+      const replacing = current?.menu.contains(candidate);
+      const source = replacing ? current.source : candidate;
       // Keep the original caller across a menu replaced by a paging action.
       const scope = source?.closest?.(".modal-overlay,[role='dialog'],.drawer");
       const origin = [source?.closest?.(focusable), current?.origin, document.activeElement]
         .find(node => validFocus(node) && (!scope || scope.contains(node)));
+      const resolveReturnFocus = replacing ? current.resolveReturnFocus : captureReturnFocus(source, origin);
       const keyboard = keyboardTarget || input?.keyboard;
       close();
       const menu = document.createElement("div");
@@ -78,19 +88,19 @@ window.ContextMenu = (() => {
         button.onclick = () => {
           if (button.getAttribute("aria-disabled") === "true" || current?.menu !== menu) return;
           const entry = current;
-          close({ restoreFocus: true });
+          const restored = close({ restoreFocus: true });
           item.onClick?.();
           // A synchronous delete/re-render can remove the restored caller. Do
           // not override focus deliberately moved into a new menu or editor.
-          if (!current && (document.activeElement === document.body
-            || document.activeElement === entry.origin && !validFocus(entry.origin))) {
-            returnTarget(entry)?.focus({ preventScroll: true });
+          if (!current && (document.activeElement === document.body || document.activeElement === restored)) {
+            const target = returnTarget(entry);
+            if (target !== document.activeElement) target?.focus({ preventScroll: true });
           }
         };
         menu.appendChild(button);
       }
       const anchor = source?.getBoundingClientRect?.();
-      current = { menu, source, origin, scrollPositions: captureScroll(source),
+      current = { menu, source, origin, resolveReturnFocus, scrollPositions: captureScroll(source),
         x: keyboard && anchor ? anchor.left : Number.isFinite(x) ? x : anchor?.left || 8,
         y: keyboard && anchor ? anchor.bottom : Number.isFinite(y) ? y : anchor?.bottom || 8 };
       document.body.appendChild(menu);

@@ -93,6 +93,9 @@ try {
   assert.equal(await page.evaluate(()=>document.activeElement.id),'btn-add-filter');
   assert.equal(await page.evaluate(()=>state.filters.length),beforeFilters+1,'cancelled composer never applies its draft');
   // Direct chip editing reuses the same composer without submitting a query.
+  // CI55 caught the saved-view Dataset/Case count pair still behind its 300 ms
+  // debounce: Tasks.pending() alone cannot include work not yet admitted.
+  await page.evaluate(()=>settleFilterTabCounts());
   await page.waitForFunction(()=>Tasks.pending()===0,null,{timeout:30000});
   const chipEditor=page.locator('#chips .chip-edit').first();
   const chipState=await page.evaluate(()=>({filters:JSON.stringify(state.filters),value:state.filters[0].value,

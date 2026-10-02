@@ -12,7 +12,7 @@ const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, reducedMotion: "reduce" });
 const errors = [], results = {};
 let phase = "startup";
-page.on("pageerror", error => errors.push(error.message));
+page.on("pageerror", error => errors.push(error.stack || error.message));
 try {
   await page.goto(url);
   await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && state.loaded && state.rows.length > 0 && !state.loadOverlay && document.querySelector("#load-overlay").hidden);
@@ -279,12 +279,23 @@ try {
   }
 
   phase = "folding preferences survive real workspace rotation";
+  const rotationState = () => page.evaluate(() => ({
+    scope: WorkspaceContext.scope(), changing: WorkspaceContext.changing, tab: state.activeDatasetTab,
+    tableRows: document.querySelector("#cube-table tbody").rows.length,
+    cachedResult: !!cubeState.result, cachedTableResult: !!cubeResultForTable(activeCube()),
+    requestVersion: cubeState.requestVersion, pendingOperation: Tasks.operationFor("pivot"),
+    expanded: document.querySelector("#aw-pivot-config-toggle").getAttribute("aria-expanded"),
+  }));
+  results.configurationRotation = { before: await rotationState() };
   await page.getByRole("button", { name: "Recolher configuração", exact: true }).click();
   await page.evaluate(() => WorkspaceContext.setScope("case", { page: "explore", tab: "cube", animate: false }));
   await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "case");
+  results.configurationRotation.case = await rotationState();
   assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "true", "a new context does not inherit the previous folding choice");
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", tab: "cube", animate: false }));
+  results.configurationRotation.returning = await rotationState();
   await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "dataset" && document.querySelector("#cube-table tbody").rows.length > 1);
+  results.configurationRotation.settled = await rotationState();
   assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "false", "returning to the original context restores its explicit choice");
   assert.match(await page.locator("#aw-pivot-config-summary").textContent(), /Nível.*Código.*Origem.*Registros/);
   await page.getByRole("button", { name: "Editar configuração", exact: true }).click();

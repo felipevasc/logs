@@ -28,7 +28,8 @@ const videoMetadata = {
   nativeEngineVerified: false,
   timingReference: 'Approximate wall-clock offsets since context.newPage() was requested; inspect the actual video before trimming',
   recordedSize: { width: 1440, height: 960 },
-  captureHoldBudgetMs: 9200,
+  captureHoldBudgetMs: 28600,
+  captureHoldBudgetNote: '9.2s reader/pause evidence plus full 6.8s checkpoint, 6.4s calculation, 2.8s/2.6s short gestures and frame overhead; test-only pending transport, never product latency',
   markers: [],
 };
 const markVideo = (label, details = {}) => videoMetadata.markers.push({ label, offsetMs: Date.now() - videoStartedAt, ...details });
@@ -41,7 +42,8 @@ const results = {
     transport: 'Synthetic preview data; a test-only gate holds existing mock commands before their unchanged handlers return',
     loadPhases: 'Built-in preview parse/ready events plus explicitly synthetic metadata/checkpoint/error receipts through the real operation-progress listener',
     calculationPhases: 'Real command-level pending waits with measured elapsed time; unchanged preview calculation handlers produce the final data',
-    componentStates: 'Explicit standalone fixture for paused, cancelling, error, unknown, reduced-motion and visibility states',
+    componentStates: 'Explicit standalone fixture for short gestures, paused, cancelling, error, unknown, reduced-motion, forced-colors and visibility states',
+    decorativeTiming: 'Rendered contact sampling and screenshot poses seek only CSS animation timelines; full-cycle video markers identify uninterrupted real-time playback',
     nativeEngineVerified: false,
     generatedImageAssets: false,
   },
@@ -82,9 +84,28 @@ await page.route('**/__mock__.js', async route => {
 const load = page.locator('#load-visual .waiting-visual');
 const group = page.locator('#tab-group .area-loading-semantic .waiting-visual');
 const pivot = page.locator('.cube-output .area-loading-semantic .waiting-visual');
-const setTheme = theme => page.evaluate(theme => {
-  if (document.documentElement.dataset.theme !== theme) toggleTheme();
-}, theme);
+// Theme changes transition many real app surfaces. Wait for those finite CSS
+// transitions to finish naturally; never fast-forward the robot's animations.
+const settleTransitions = () => page.evaluate(async () => {
+  const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const deadline = performance.now() + 5000;
+  await frames();
+  for (;;) {
+    const transitions = document.getAnimations().filter(animation => animation instanceof CSSTransition
+      && (animation.playState === 'running' || animation.pending));
+    if (!transitions.length) return;
+    if (performance.now() > deadline) throw new Error('App CSS transitions did not settle');
+    await Promise.all(transitions.map(animation => animation.finished.catch(() => {})));
+    await frames();
+  }
+});
+const setTheme = async theme => {
+  await page.evaluate(theme => {
+    if (document.documentElement.dataset.theme !== theme) toggleTheme();
+  }, theme);
+  await settleTransitions();
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), theme);
+};
 const waitMotion = (selector, value) => page.waitForFunction(({ selector, value }) => document.querySelector(selector)?.dataset.motion === value, { selector, value });
 const renderedState = locator => locator.evaluate(root => {
   const status = root.querySelector('.wv-status'), metric = root.querySelector('.wv-metric'), button = root.querySelector('.wv-motion-toggle');
@@ -112,9 +133,179 @@ const assertFits = async locator => {
     `scene fits the ${viewport.width}px viewport: ${JSON.stringify(box)}`);
 };
 async function screenshot(filename, attribution) {
+  await settleTransitions();
   await page.screenshot({ path: resolve(output, filename), animations: 'allow' });
   results.screenshots.push({ filename, ...attribution, viewport: page.viewportSize(), theme: await page.evaluate(() => document.documentElement.dataset.theme) });
 }
+// Contact evidence uses actual rendered SVG matrices at the shipping 240x120
+// CSS size. Only decorative CSS timelines are sought; receipts never advance.
+async function inspectTaskRig(locator, family, pace = 'loop') {
+  const rig = await locator.evaluate(async (root, { family, pace }) => {
+    const art = root.querySelector('.wv-art'), actor = root.querySelector('.wv-task');
+    const hand = actor.querySelector('.wv-task-hand');
+    const animations = art.getAnimations({ subtree: true });
+    const duration = family === 'checkpoint' ? (pace === 'loop' ? 6800 : 2800) : (pace === 'loop' ? 6400 : 2600);
+    const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const at = async fraction => {
+      for (const animation of animations) { animation.pause(); animation.currentTime = fraction * duration; }
+      await frames();
+    };
+    const matrix = node => { const m = node.getScreenCTM(); return [m.a, m.b, m.c, m.d, m.e, m.f]; };
+    const point = (node, x, y) => { const p = new DOMPoint(x, y).matrixTransform(node.getScreenCTM()); return { x: p.x, y: p.y }; };
+    const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+    const transform = node => {
+      const m = new DOMMatrix(getComputedStyle(node).transform);
+      return { a: m.a, b: m.b, c: m.c, d: m.d, x: m.e, y: m.f };
+    };
+    const opacity = node => Number(getComputedStyle(node).opacity);
+    const result = {
+      family: root.dataset.family, pace: root.dataset.pace, actorCount: root.querySelectorAll('.wv-task').length,
+      art: { width: art.getBoundingClientRect().width, height: art.getBoundingClientRect().height },
+      durations: [...new Set(animations.map(animation => animation.effect.getComputedTiming().duration))],
+      iterations: [...new Set(animations.map(animation => String(animation.effect.getTiming().iterations)))],
+      animatedParts: animations.map(animation => animation.effect.target.getAttribute('class')),
+    };
+    try {
+      await at(0);
+      result.actorHeight = actor.getBoundingClientRect().height;
+      if (family === 'checkpoint') {
+        const drawer = root.querySelector('.wv-archive-drawer'), folder = root.querySelector('.wv-archive-folder');
+        const label = root.querySelector('.wv-archive-label');
+        result.folderBelongsToDrawer = folder.parentElement === drawer;
+        result.folderTransform = getComputedStyle(folder).transform;
+        const from = pace === 'loop' ? 18 : 24, to = pace === 'loop' ? 64 : 76;
+        result.grip = [];
+        // One-percent samples include interpolated poses, not just authored keys.
+        for (let percent = from; percent <= to; percent++) {
+          await at(percent / 100);
+          const fingers = point(hand, 91, 55), handle = point(drawer, 110, 59);
+          result.grip.push({ fraction: percent / 100, distance: distance(fingers, handle),
+            ...([from, pace === 'loop' ? 39 : 49, to].includes(percent)
+              ? { handMatrix: matrix(hand), drawerMatrix: matrix(drawer), fingers, handle } : {}) });
+        }
+        result.reactions = [];
+        for (const fraction of (pace === 'loop' ? [0, .17, .32, .46, .64, .67, .82, .9] : [0, .23, .45, .52, .76, .9])) {
+          await at(fraction);
+          result.reactions.push({ fraction, drawer: transform(drawer), label: transform(label) });
+        }
+      } else {
+        const held = root.querySelector('.wv-group-held'), source = root.querySelector('.wv-group-source');
+        const filed = root.querySelector('.wv-group-filed'), well = root.querySelector('.wv-group-well');
+        result.carriedByHand = held.parentElement === hand;
+        result.contacts = [];
+        for (const [fraction, station] of (pace === 'loop' ? [[.22, source], [.66, filed]] : [[.35, source]])) {
+          await at(fraction);
+          const corners = [[93, 47], [103, 57]].map(([x, y]) => {
+            const carried = point(held, x, y), target = point(station, x, y);
+            return { carried, target, distance: distance(carried, target) };
+          });
+          result.contacts.push({ fraction, station: station.getAttribute('class'), corners,
+            distance: Math.max(...corners.map(corner => corner.distance)),
+            heldMatrix: matrix(held), stationMatrix: matrix(station) });
+        }
+        result.reactions = [];
+        for (const fraction of (pace === 'loop' ? [.21, .22, .4, .65, .66, .69, .74, .97] : [.34, .35, .68, .78, .88, 1])) {
+          await at(fraction);
+          result.reactions.push({ fraction, heldOpacity: opacity(held), sourceOpacity: opacity(source),
+            filedOpacity: opacity(filed), heldTransform: getComputedStyle(held).transform,
+            well: transform(well), visor: transform(root.querySelector('.wv-task-visor')) });
+        }
+      }
+      return result;
+    } finally {
+      for (const animation of animations) { animation.currentTime = 0; animation.play(); }
+      await frames();
+    }
+  }, { family, pace });
+  assert.equal(rig.family, family); assert.equal(rig.pace, pace);
+  assert.equal(rig.actorCount, 1, `${family}: one protagonist`);
+  assert.ok(rig.actorHeight >= 60, `${family}: robot is legible at actual rendered size`);
+  assert.ok(Math.abs(rig.art.width - 240) < .5 && Math.abs(rig.art.height - 120) < .5,
+    `${family}: production art is 240x120, not a scaled-up test fixture`);
+  assert.deepEqual(rig.durations, [family === 'checkpoint' ? (pace === 'loop' ? 6800 : 2800) : (pace === 'loop' ? 6400 : 2600)]);
+  assert.deepEqual(rig.iterations, [pace === 'loop' ? 'Infinity' : '1']);
+  for (const part of ['wv-task-body', 'wv-task-head', 'wv-task-arm', 'wv-task-hand', 'wv-task-gaze']) {
+    assert.ok(rig.animatedParts.includes(part), `${family}: articulated ${part} drives the story`);
+  }
+  const reaction = fraction => rig.reactions.find(sample => sample.fraction === fraction);
+  const near = (actual, expected, message) => assert.ok(Math.abs(actual - expected) < .02, `${message}: ${actual}`);
+  if (family === 'checkpoint') {
+    assert.equal(rig.folderBelongsToDrawer, true); assert.equal(rig.folderTransform, 'none');
+    assert.ok(rig.grip.every(sample => sample.distance < .75), 'fingers maintain the drawer grip throughout its travel');
+    near(reaction(pace === 'loop' ? .17 : .23).drawer.x, 0, 'drawer waits for hand contact');
+    near(reaction(pace === 'loop' ? .32 : .45).drawer.x, pace === 'loop' ? -10 : -3, 'drawer opens under the hand');
+    near(reaction(pace === 'loop' ? .64 : .76).drawer.x, 0, 'drawer closes before release');
+    for (const sample of rig.reactions.filter(sample => pace !== 'loop' || sample.fraction <= .64)) {
+      near(sample.label.b, 0, 'archive label does not react before the drawer closes');
+    }
+    if (pace === 'loop') {
+      assert.ok(Math.abs(reaction(.67).label.b) > .1, 'archive label reacts causally after closure');
+      near(reaction(.82).label.b, 0, 'archive reaction settles');
+    }
+  } else {
+    assert.equal(rig.carriedByHand, true, 'calculation tile is a direct child of the articulated hand');
+    assert.ok(rig.contacts.every(sample => sample.distance < .75), 'carried corners meet the source/destination exactly');
+    assert.ok(rig.reactions.every(sample => sample.heldTransform === 'none'), 'carried tile has no independent transform');
+    near(reaction(pace === 'loop' ? .21 : .34).heldOpacity, 0, 'tile is not carried before pickup');
+    near(reaction(pace === 'loop' ? .22 : .35).heldOpacity, 1, 'tile transfers into hand at pickup');
+    near(reaction(pace === 'loop' ? .22 : .35).sourceOpacity, .28, 'source reacts only once picked up');
+    if (pace === 'loop') {
+      near(reaction(.65).filedOpacity, 0, 'destination stays empty before drop');
+      near(reaction(.66).heldOpacity, 0, 'hand releases at drop'); near(reaction(.66).filedOpacity, 1, 'destination receives at drop');
+      for (const sample of rig.reactions.filter(sample => sample.fraction <= .66)) near(sample.well.y, 0, 'well waits for deposit');
+      near(reaction(.69).well.y, 1.2, 'well responds after deposit'); near(reaction(.74).well.y, 0, 'well settles');
+    } else {
+      near(reaction(1).heldOpacity, 1, 'short gesture ends still holding its card');
+      assert.ok(rig.reactions.every(sample => sample.filedOpacity === 0 && sample.well.y === 0), 'short inspection never invents a deposit');
+      near(reaction(.68).visor.a, 1, 'short inspection reaches the visor before squinting');
+      near(reaction(.78).visor.a, .65, 'short inspection squints at its own causal beat');
+      near(reaction(.88).visor.a, 1, 'short inspection reopens the visor');
+    }
+  }
+  return rig;
+}
+
+async function recordSceneCycle(locator, label, durationMs, attribution) {
+  markVideo(`${label}-start`, { ...attribution, durationMs, animationRestartedForCapture: true, viewport: page.viewportSize() });
+  const capture = await locator.evaluate(async (root, durationMs) => {
+    const animations = root.querySelector('.wv-art').getAnimations({ subtree: true });
+    if (!animations.length) throw new Error('Cannot record an absent decorative timeline');
+    for (const animation of animations) { animation.currentTime = 0; animation.play(); }
+    await Promise.all(animations.map(animation => animation.ready));
+    const started = performance.now();
+    return new Promise((resolve, reject) => {
+      const frame = () => {
+        const times = animations.map(animation => animation.currentTime);
+        if (!root.isConnected || root.dataset.motion !== 'running') return reject(new Error('Scene stopped before its capture cycle ended'));
+        if (times.every(time => typeof time === 'number' && time >= durationMs)) {
+          return resolve({ requestedDurationMs: durationMs, elapsedMs: performance.now() - started,
+            minimumTimelineMs: Math.min(...times), playStates: [...new Set(animations.map(animation => animation.playState))] });
+        }
+        if (performance.now() - started > durationMs + 10000) return reject(new Error('Decorative capture cycle did not advance'));
+        requestAnimationFrame(frame);
+      };
+      requestAnimationFrame(frame);
+    });
+  }, durationMs);
+  assert.ok(capture.minimumTimelineMs >= durationMs, 'video contains the complete real-time decorative cycle');
+  markVideo(`${label}-end`, { ...attribution, ...capture });
+  return capture;
+}
+
+async function screenshotPose(locator, fraction, durationMs, filename, attribution) {
+  await locator.evaluate(async (root, { fraction, durationMs }) => {
+    const animations = root.querySelector('.wv-art').getAnimations({ subtree: true });
+    for (const animation of animations) { animation.pause(); animation.currentTime = fraction * durationMs; }
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }, { fraction, durationMs });
+  try { await screenshot(filename, { ...attribution, decorativePoseFraction: fraction, animationSeekForScreenshot: true }); }
+  finally {
+    await locator.evaluate(root => {
+      for (const animation of root.querySelector('.wv-art').getAnimations({ subtree: true })) { animation.currentTime = 0; animation.play(); }
+    });
+  }
+}
+
 async function emitLoadPhase(overrides = {}) {
   return page.evaluate(overrides => {
     const pending = window.__waitingPreviewBridge.pending.find(item => item.command === 'load_file');
@@ -217,7 +408,7 @@ try {
   await screenshot('waiting-fixture-reading-dark-1440.png', { fixture: true, content: 'Synthetic metadata receipt rendered by the production foreground adapter while its preview load command is pending' });
 
   // Capture-only dwell in the already pending command: one full 7.2s character
-  // story before pause/resume. Total added dwell is 9.2s, never product latency.
+  // story before pause/resume. Reader-only dwell is 9.2s, never product latency.
   await page.waitForTimeout(7600);
   const beforeForeign = await load.textContent();
   await page.evaluate(() => window.__waitingPreviewBridge.emit('operation-progress', {
@@ -247,6 +438,16 @@ try {
   assert.equal(await page.locator('#load-bar-fill').evaluate(node => node.parentElement.hidden), true);
   await emitLoadPhase({ phaseId: 'metadata-checkpoint-sync', phase: 'Sincronizando checkpoint (fixture)', completed: 0, total: 0, unit: '' });
   assert.equal((await renderedState(load)).family, 'checkpoint'); assert.equal((await renderedState(load)).metric, null);
+  phase = 'real checkpoint pilot: rendered grip and full-cycle evidence';
+  await waitMotion('#load-visual .waiting-visual', 'running');
+  await setTheme('dark');
+  results.checkpointRig = await inspectTaskRig(load, 'checkpoint');
+  results.checkpointCapture = await recordSceneCycle(load, 'checkpoint-loop', 6800, { fixtureReceipt: true, syntheticTransport: true });
+  await screenshotPose(load, .4, 6800, 'waiting-fixture-checkpoint-dark-1440.png', {
+    fixture: true, syntheticTransport: true, content: 'Production foreground adapter, synthetic checkpoint-sync receipt; robot maintains grip on its open drawer' });
+  await setTheme('light');
+  await screenshotPose(load, .4, 6800, 'waiting-fixture-checkpoint-light-1440.png', {
+    fixture: true, syntheticTransport: true, content: 'Same checkpoint grip in the light theme after real app transitions settle' });
   await emitLoadPhase({ phaseId: 'metadata-checkpoint-committed', phase: 'Checkpoint de metadados preservado (fixture)', completed: 6300, total: 6300, unit: 'bytes', checkpointRows: 1200 });
   results.partialCheckpoint = await renderedState(load);
   markVideo('partial-checkpoint', { fixtureReceipt: true });
@@ -292,6 +493,8 @@ try {
   markVideo('group-command-loop', { syntheticTransport: true, viewport: page.viewportSize() });
   assert.equal(results.group.family, 'calculation'); assert.equal(results.group.status, 'Calculando resumo'); assert.equal(results.group.metric, null);
   assert.ok(results.group.runningAnimations > 0); assert.equal(results.group.buttonPointerEvents, 'auto'); assertTypography(results.group);
+  results.calculationRig = await inspectTaskRig(group, 'calculation');
+  results.calculationCapture = await recordSceneCycle(group, 'calculation-loop', 6400, { syntheticTransport: true, fixtureReceipt: false });
   const groupCancelBefore = await page.evaluate(() => window.__mockCommandCalls.cancel_task || 0);
   await group.locator('.wv-motion-toggle').click();
   assert.equal((await renderedState(group)).motion, 'static');
@@ -300,7 +503,10 @@ try {
   await group.locator('.wv-motion-toggle').focus(); await page.keyboard.press('Enter');
   await waitMotion('#tab-group .waiting-visual', 'running');
   await assertFits(group);
-  await screenshot('waiting-group-dark-1024.png', { fixture: false, syntheticTransport: true, content: 'Production group wait with actual elapsed time, pending gated preview command, no invented metrics' });
+  await screenshotPose(group, .4, 6400, 'waiting-group-dark-1024.png', { fixture: false, syntheticTransport: true, content: 'Production group wait with actual elapsed time, pending gated preview command, no invented metrics' });
+  await setTheme('light');
+  await screenshotPose(group, .4, 6400, 'waiting-group-light-1024.png', { fixture: false, syntheticTransport: true, content: 'Production calculation actor inspecting its held card; light theme transitions fully settled' });
+  await setTheme('dark');
   results.groupSettlement = await page.evaluate(async () => { window.__waitingPreviewBridge.release('aggregate_events'); return window.__waitingGroupWork; });
   assert.equal(results.groupSettlement.disposedAtSettlement, true); assert.ok(results.groupSettlement.rows > 0);
 
@@ -364,7 +570,10 @@ try {
     const host = document.createElement('section'); host.id = 'waiting-component-fixture';
     host.setAttribute('aria-label', 'Fixture controlado do componente');
     host.style.cssText = 'position:fixed;top:80px;right:24px;width:290px;z-index:4000;background:var(--bg-1);';
-    document.body.append(host);
+    const caption = document.createElement('div');
+    caption.textContent = 'Fixture sintético · componente isolado';
+    caption.style.cssText = 'padding:8px;color:var(--text-1);font-size:12px;text-align:center;';
+    host.append(caption); document.body.append(host);
     window.__waitingFixtureReceipt = { operationId: 'explicit-component-fixture', phaseId: 'metadata-scan', state: 'running', label: 'Fixture controlado', elapsedMs: 8000, completed: 7, total: 20, unit: 'registros', phaseIndex: 2, phaseCount: 4 };
     window.__waitingFixtureView = WaitingVisuals.mount(host, window.__waitingFixtureReceipt, { showDetails: true });
   });
@@ -416,6 +625,66 @@ try {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await waitMotion('#waiting-component-fixture .waiting-visual', 'static');
   assert.equal((await renderedState(fixture)).runningAnimations, 0);
+
+  phase = 'explicit robot fixtures: short, paused, reduced-motion and forced-color evidence';
+  results.componentFixture.robotFamilies = {};
+  for (const [family, phaseId, durationMs] of [
+    ['checkpoint', 'metadata-checkpoint-sync', 2800], ['calculation', 'command:aggregate_events', 2600],
+  ]) {
+    await page.emulateMedia({ reducedMotion: 'no-preference', forcedColors: 'none' });
+    await setTheme('dark');
+    await page.evaluate(({ family, phaseId }) => {
+      window.__waitingRobotReceipt = { operationId: `explicit-${family}-short-fixture`, phaseId, state: 'running',
+        label: `Fixture sintético: ${family}`, elapsedMs: 1000 };
+      window.__waitingFixtureView.update(window.__waitingRobotReceipt);
+      window.__waitingFixtureView.setMotionEnabled(true);
+    }, { family, phaseId });
+    await waitMotion('#waiting-component-fixture .waiting-visual', 'running');
+    const evidence = results.componentFixture.robotFamilies[family] = { synthetic: true };
+    evidence.shortRig = await inspectTaskRig(fixture, family, 'gesture');
+    evidence.shortCapture = await recordSceneCycle(fixture, `${family}-short-gesture`, durationMs, { fixture: true, syntheticTransport: true });
+    assert.deepEqual(evidence.shortCapture.playStates, ['finished'], 'short scene is a single real-duration gesture');
+    assert.equal((await renderedState(fixture)).runningAnimations, 0, 'short scene does not loop without a measured long-wait receipt');
+    await screenshotPose(fixture, family === 'checkpoint' ? .48 : .78, durationMs, `waiting-fixture-${family}-short-dark-1440.png`, {
+      fixture: true, content: 'Explicit standalone short gesture at actual 240x120 CSS size; fixture elapsed time is not native progress' });
+
+    await fixture.locator('.wv-motion-toggle').click();
+    evidence.paused = await renderedState(fixture);
+    assert.equal(evidence.paused.family, family); assert.equal(evidence.paused.motion, 'static');
+    assert.equal(evidence.paused.runningAnimations, 0); assert.equal(evidence.paused.metric, null);
+    assert.equal(await fixture.locator('.wv-task').count(), 1, 'pause retains the robot');
+    await assertFits(fixture);
+    await screenshot(`waiting-fixture-${family}-static-dark-1440.png`, { fixture: true, userPaused: true,
+      content: 'User-paused standalone component preserves its complete static robot scene' });
+
+    await setTheme('light');
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.evaluate(() => window.__waitingFixtureView.setMotionEnabled(true));
+    await waitMotion('#waiting-component-fixture .waiting-visual', 'static');
+    evidence.reduced = await renderedState(fixture);
+    assert.equal(evidence.reduced.family, family); assert.equal(evidence.reduced.runningAnimations, 0);
+    assert.equal(evidence.reduced.buttonHidden, true); assert.equal(await fixture.locator('svg').count(), 1);
+    await screenshot(`waiting-fixture-${family}-reduced-light-1440.png`, { fixture: true, reducedMotion: true,
+      content: 'Explicit standalone robot fixture under system reduced-motion with no running animation' });
+
+    await page.emulateMedia({ forcedColors: 'active' });
+    evidence.forcedColors = await fixture.evaluate(root => {
+      const art = root.querySelector('.wv-art'), shell = root.querySelector('.wv-task-shell'), paper = root.querySelector('.wv-task-visor-bed');
+      const canvas = document.createElement('span'); canvas.style.cssText = 'color:CanvasText;background-color:Canvas;'; root.append(canvas);
+      const result = { active: matchMedia('(forced-colors: active)').matches, color: getComputedStyle(art).color,
+        stroke: getComputedStyle(shell).stroke, fill: getComputedStyle(paper).fill,
+        canvasText: getComputedStyle(canvas).color, canvas: getComputedStyle(canvas).backgroundColor };
+      canvas.remove(); return result;
+    });
+    assert.equal(evidence.forcedColors.active, true);
+    assert.equal(evidence.forcedColors.color, evidence.forcedColors.canvasText);
+    assert.equal(evidence.forcedColors.stroke, evidence.forcedColors.canvasText);
+    assert.equal(evidence.forcedColors.fill, evidence.forcedColors.canvas);
+    assert.notEqual(evidence.forcedColors.canvasText, evidence.forcedColors.canvas, 'forced colors retain visible figure/background contrast');
+    await screenshot(`waiting-fixture-${family}-forced-colors-1440.png`, { fixture: true, reducedMotion: true, forcedColors: true,
+      content: 'Explicit standalone robot uses system Canvas/CanvasText in forced colors' });
+  }
+  await page.emulateMedia({ forcedColors: 'none' });
   results.componentFixture.disposal = await page.evaluate(() => {
     const root = window.__waitingFixtureView.element;
     window.__waitingFixtureView.destroy(); window.__waitingFixtureView.destroy();

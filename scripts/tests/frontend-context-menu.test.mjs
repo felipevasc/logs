@@ -8,11 +8,11 @@ const app = read('frontend/app.js');
 
 // Execute the installed controller. This deliberately small DOM models focus,
 // disabled/hidden controls and capture/bubble ordering; browser QA owns layout.
-function harness({ appWrapper = false, nativeCallbacks = false } = {}) {
+function harness({ appWrapper = false, nativeCallbacks = false, captureReturnFocus } = {}) {
   const listeners = new Map(), windowListeners = new Map(), microtasks = [], timers = [], changes = [], effects = [];
   let document;
   class Element {
-    constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.style = {}; this.attrs = {}; this.className = ''; this.tabIndex = tag === 'button' ? 0 : -1; this.rect = { left: 20, top: 40, bottom: 70, width: 230, height: 160 }; }
+    constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.style = {}; this.attrs = {}; this.dataset = {}; this.className = ''; this.tabIndex = tag === 'button' ? 0 : -1; this.rect = { left: 20, top: 40, bottom: 70, width: 230, height: 160 }; }
     get isConnected() { return this === document.body || !!this.parentElement?.isConnected; }
     setAttribute(key, value) { this.attrs[key] = String(value); }
     getAttribute(key) { return this.attrs[key] ?? null; }
@@ -67,6 +67,7 @@ function harness({ appWrapper = false, nativeCallbacks = false } = {}) {
     return event;
   }
   const fallback = document.body.appendChild(new Element('button'));
+  const drawer = document.body.appendChild(new Element('div')); drawer.hidden = true;
   const origin = document.body.appendChild(new Element('button'));
   const window = {
     addEventListener: (type, fn) => windowListeners.set(type, fn),
@@ -76,14 +77,14 @@ function harness({ appWrapper = false, nativeCallbacks = false } = {}) {
   const context = vm.createContext({ window, document, queueMicrotask: fn => microtasks.push(fn), setTimeout: fn => timers.push(fn),
     getComputedStyle: node => ({ visibility: node.visibility || 'visible' }),
     MouseEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
-    $: () => fallback, toast: text => effects.push(text),
+    $: selector => selector === '#drawer' ? drawer : fallback, toast: text => effects.push(text),
   });
   vm.runInContext(read('frontend/context-menu.js'), context);
   let controller;
   if (appWrapper) {
     vm.runInContext(app.slice(app.indexOf('let ctxEl = null;'), app.indexOf('\nconst trunc =')), context);
     controller = vm.runInContext('ctxMenu', context);
-  } else controller = window.ContextMenu.create({ fallbackFocus: () => [fallback], onChange: menu => changes.push(menu) });
+  } else controller = window.ContextMenu.create({ fallbackFocus: () => [fallback], captureReturnFocus, onChange: menu => changes.push(menu) });
   origin.focus();
   const open = (items, options) => appWrapper ? context.showCtxMenu(10, 20, items, options) : controller.open(10, 20, items, options);
   const key = (key, extras = {}) => dispatch('keydown', { key, ...extras });
@@ -246,6 +247,72 @@ test('replacement menus preserve original focus and ignore old detached actions'
   h.key('Escape'); assert.equal(h.document.activeElement, h.origin);
 });
 
+test('captured logical return resolves a replacement caller after rerender during the menu', () => {
+  let target, captured;
+  const h = harness({ captureReturnFocus: (source, origin) => { captured = [source, origin]; return () => target; } });
+  target = h.origin; h.open([choice('Action')]);
+  assert.deepEqual(captured, [h.origin, h.origin]);
+  h.origin.remove(); target = h.node();
+  h.key('Escape'); assert.equal(h.document.activeElement, target);
+  assert.equal(h.controller.element, null);
+});
+
+test('a stale logical owner rejects even a connected origin and uses the valid fallback', () => {
+  for (const disconnected of [false, true]) {
+    let owner = 'source-a/case-a', target;
+    const h = harness({ captureReturnFocus: () => { const captured = owner; return () => captured === owner ? target : null; } });
+    target = h.origin; h.open([choice('Action')]);
+    owner = 'source-b/case-b'; if (disconnected) h.origin.remove();
+    h.key('Escape'); assert.equal(h.document.activeElement, h.fallback);
+  }
+});
+
+test('missing, hidden or disabled logical replacements never fall back to the stale origin', () => {
+  for (const invalidate of [() => null, node => { node.hidden = true; return node; }, node => { node.disabled = true; return node; }]) {
+    let target;
+    const h = harness({ captureReturnFocus: () => () => target });
+    target = h.origin; h.open([choice('Action')]); target = invalidate(h.node());
+    h.key('Escape'); assert.equal(h.document.activeElement, h.fallback);
+  }
+});
+
+test('replacing an open menu preserves its original logical guard rather than recapturing a newer owner', () => {
+  let owner = 1, target, captures = 0;
+  const h = harness({ captureReturnFocus: () => { const captured = owner; captures++; return () => captured === owner ? target : null; } });
+  target = h.origin; h.open([choice('Page one')]);
+  h.origin.remove(); target = h.node();
+  h.open([choice('Page two')]); assert.equal(captures, 1);
+  owner = 2; h.open([choice('Page three')]); assert.equal(captures, 1);
+  h.key('Escape'); assert.equal(h.document.activeElement, h.fallback);
+});
+
+test('paging activation can reopen a menu after its caller rerenders and Escape returns to the logical caller', () => {
+  let target;
+  const h = harness({ captureReturnFocus: () => () => target });
+  target = h.origin;
+  h.open([choice('Next page', () => h.open([choice('Page two')]))]);
+  h.origin.remove(); target = h.node(); h.key('Enter');
+  assert.ok(h.controller.element); assert.equal(h.document.activeElement, h.items()[0]);
+  h.key('Escape'); assert.equal(h.document.activeElement, target);
+});
+
+test('an action rerender re-resolves its logical return but respects focus moved to an editor', () => {
+  for (const moveToEditor of [false, true]) {
+    let target;
+    const h = harness({ captureReturnFocus: () => () => target }), editor = h.node('input');
+    target = h.origin;
+    h.open([choice('Edit', () => { target.remove(); target = h.node(); if (moveToEditor) editor.focus(); })]);
+    h.key('Enter'); assert.equal(h.document.activeElement, moveToEditor ? editor : target);
+  }
+});
+
+test('closing a logical menu does not leak its return resolver into a later unrelated menu', () => {
+  const h = harness({ captureReturnFocus: source => { const target = source; return () => target; } });
+  h.open([choice('First')]); h.key('Escape');
+  const next = h.node(); next.focus(); h.open([choice('Later')]); h.key('Escape');
+  assert.equal(h.document.activeElement, next);
+});
+
 test('app admission remains captured at open and a new menu cancels canonical work', () => {
   const h = harness({ appWrapper: true }); let calls = 0;
   h.open([choice('Action', () => calls++)]);
@@ -306,4 +373,89 @@ test('controller loads before app and is copied into the frontend bundle', () =>
   const html = read('frontend/index.html'), bundle = read('scripts/prepare-frontend.mjs');
   assert.ok(html.indexOf('src="context-menu.js"') < html.indexOf('src="app.js"'));
   assert.ok(bundle.includes('"context-menu.js"'));
+});
+
+// App-owned logical targets use the field identity and originating tree, never
+// an index or a same-named field in another surface.
+function explorerField(h, box, column = 'message') {
+  const row = h.node('div', box); row.className = 'field-row'; row.dataset.column = column;
+  const field = h.node('button', row); field.className = 'field-item';
+  const more = h.node('button', row); more.className = 'field-adv-btn';
+  return { row, field, more };
+}
+function explorerBox(h, scope = 'dataset') {
+  const box = h.node('div'); box.className = 'explore-tree-sync'; box.dataset.treeScope = scope; return box;
+}
+
+test('app hook resolves only the same field in the originating tree after a background rerender', () => {
+  const h = harness({ appWrapper: true }), other = explorerBox(h), box = explorerBox(h);
+  const decoy = explorerField(h, other), original = explorerField(h, box);
+  const icon = h.node('i', original.field);
+  h.open([choice('Action')], { trigger: icon });
+  original.row.remove(); const replacement = explorerField(h, box);
+  h.key('Escape'); assert.equal(h.document.activeElement, replacement.field);
+  assert.notEqual(h.document.activeElement, decoy.field);
+});
+
+test('app hook rejects a changed AnalysisContext before considering a connected or replaced field', () => {
+  for (const rerender of [false, true]) {
+    const h = harness({ appWrapper: true }), box = explorerBox(h), original = explorerField(h, box);
+    h.open([choice('Action')], { trigger: original.field });
+    if (rerender) { original.row.remove(); explorerField(h, box); }
+    h.window.AnalysisContexts.isCurrent = () => false;
+    h.key('Escape'); assert.equal(h.document.activeElement, h.fallback);
+  }
+});
+
+test('app hook rejects removed fields, replaced containers and changes to tree scope', () => {
+  for (const change of ['field', 'container', 'scope']) {
+    const h = harness({ appWrapper: true }), box = explorerBox(h), original = explorerField(h, box);
+    h.open([choice('Action')], { trigger: original.field });
+    if (change === 'field') { original.row.remove(); explorerField(h, box, 'different_column'); }
+    if (change === 'container') { box.remove(); explorerField(h, explorerBox(h)); }
+    if (change === 'scope') box.dataset.treeScope = 'case';
+    h.key('Escape'); assert.equal(h.document.activeElement, h.fallback);
+  }
+});
+
+test('app hook keeps the captured owner when a field menu replaces itself after rerender', () => {
+  const h = harness({ appWrapper: true }), box = explorerBox(h), original = explorerField(h, box);
+  h.open([choice('Page one')], { trigger: original.field });
+  original.row.remove(); const replacement = explorerField(h, box);
+  h.open([choice('Page two')]); h.key('Escape');
+  assert.equal(h.document.activeElement, replacement.field);
+});
+
+
+test('app hook restores the equivalent field ellipsis after rerender for Escape and Tab', () => {
+  for (const key of ['Escape', 'Tab']) {
+    const h = harness({ appWrapper: true }), box = explorerBox(h), original = explorerField(h, box);
+    const icon = h.node('i', original.more);
+    h.open([choice('Action')], { trigger: icon });
+    original.row.remove(); const replacement = explorerField(h, box);
+    h.key(key); assert.equal(h.document.activeElement, replacement.more, key);
+    assert.notEqual(h.document.activeElement, replacement.field, 'the ellipsis and field-name controls have distinct return identities');
+  }
+});
+
+test('field ellipsis keeps its original tree and owner; missing controls never switch to the name button', () => {
+  for (const change of ['button', 'column', 'container', 'scope', 'owner-connected', 'owner-replaced']) {
+    const h = harness({ appWrapper: true }), box = explorerBox(h), original = explorerField(h, box);
+    h.open([choice('Action')], { trigger: original.more });
+    if (change === 'button') original.more.remove();
+    if (change === 'column') { original.row.remove(); explorerField(h, box, 'other'); }
+    if (change === 'container') { box.remove(); explorerField(h, explorerBox(h)); }
+    if (change === 'scope') box.dataset.treeScope = 'case';
+    if (change === 'owner-replaced') { original.row.remove(); explorerField(h, box); }
+    if (change.startsWith('owner')) h.window.AnalysisContexts.isCurrent = () => false;
+    h.key('Escape'); assert.equal(h.document.activeElement, h.fallback, change);
+  }
+});
+
+test('field ellipsis paging preserves the original logical control across replacement', () => {
+  const h = harness({ appWrapper: true }), box = explorerBox(h), original = explorerField(h, box);
+  h.open([choice('Page one')], { trigger: original.more });
+  original.row.remove(); const replacement = explorerField(h, box);
+  h.open([choice('Page two')]); h.key('Escape');
+  assert.equal(h.document.activeElement, replacement.more);
 });

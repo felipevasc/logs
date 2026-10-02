@@ -31,6 +31,30 @@ try {
   await assertFocus(menu.getByRole('menuitem').first());
   await page.keyboard.press('Escape'); await assertFocus(field);
   assert.equal(await menu.count(), 0);
+
+  phase = 'explorer rerender while menu is open';
+  const fieldColumn = await field.evaluate(origin => {
+    window.__contextMenuFieldOrigin = origin;
+    origin.focus();
+    return origin.closest('.field-row').dataset.column;
+  });
+  await page.keyboard.press('Shift+F10'); await menu.waitFor({ state: 'visible' });
+  await page.evaluate(() => {
+    const origin = window.__contextMenuFieldOrigin;
+    delete window.__contextMenuFieldOrigin;
+    renderExploreTree();
+    if (origin.isConnected) throw new Error('The regression must replace the original field control');
+  });
+  await assertFocus(menu.getByRole('menuitem').first());
+  await page.keyboard.press('Escape');
+  assert.deepEqual(await page.evaluate(() => ({
+    column: document.activeElement.closest('.field-row')?.dataset.column,
+    tree: document.activeElement.closest('.explore-tree-sync')?.id,
+    isField: document.activeElement.matches('.field-item'),
+  })), { column: fieldColumn, tree: 'explore-tree', isField: true }, 'Escape returns to the same field in its original tree after rerender');
+  results.explorerRerenderReturn = true;
+
+  phase = 'keyboard button invocation';
   await page.locator('#btn-case-menu').focus(); await page.keyboard.press('Enter');
   await menu.waitFor({ state: 'visible' });
   results.keyboardPlacement = await page.evaluate(() => {

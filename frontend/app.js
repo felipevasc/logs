@@ -2730,6 +2730,23 @@ function scheduleRefresh() {
 let ctxEl = null;
 const ctxMenu = window.ContextMenu.create({
   onChange: menu => { ctxEl = menu; },
+  captureReturnFocus: source => {
+    const record = source?.closest?.(".record-actions-trigger"), target = record?._recordTarget;
+    if (target) return () => resolveRecordFocus(target);
+    const row = source?.closest?.(".field-row"), field = source?.closest?.(".field-item,.field-adv-btn");
+    const control = field?.matches(".field-adv-btn") ? ".field-adv-btn" : ".field-item";
+    const box = row?.closest(".explore-tree-sync"), column = row?.dataset.column;
+    if (!box || column == null) return null;
+    const scope = box.dataset.treeScope || "dataset", owner = window.AnalysisContexts?.capture();
+    return () => {
+      // Tree counts can replace the caller while its menu is open. Resolve only
+      // inside the original tree and ownership, even if the old node survived.
+      if (!box.isConnected || (box.dataset.treeScope || "dataset") !== scope
+        || owner && !window.AnalysisContexts.isCurrent(owner)) return null;
+      return [...box.querySelectorAll(control)]
+        .find(node => node.closest(".field-row")?.dataset.column === column) || null;
+    };
+  },
   fallbackFocus: () => {
     // A removed/hidden caller must never send focus behind an open surface.
     const modal = [...document.querySelectorAll(".modal-overlay:not([hidden]),[role='dialog']:not([hidden])")]
@@ -4880,13 +4897,10 @@ function saveManualEvent() {
 // menu de contexto de uma célula de evento
 function eventCellMenu(ev, col, value, anchor = null) {
   ensureSelectionOwner();
-  const removalOwner = window.AnalysisContexts?.capture(), removalSignature = caseSig();
+  const record = eventRecordMenuParts(ev, anchor);
   const exact = window.CanonicalFields.capture(ev, col, { anchor, ...(col === "comentario" ? { historical: true, literal: eventComment(ev) } : {}) });
   const hasVal = value !== undefined && value !== null && String(value).trim() !== "";
-  const items = [
-    { icon: "fa-eye", label: "Ver detalhes", onClick: () => openDetail(ev.id) },
-    { icon: "fa-route", label: "Investigar possível trilha", onClick: () => openTrail(ev) },
-  ];
+  const items = [...record.open];
   items.push({ sep: true });
   if (window.FieldTransforms) items.push(window.FieldTransforms.menuItem(col, { event: ev, anchor }));
   items.push({
@@ -4907,11 +4921,7 @@ function eventCellMenu(ev, col, value, anchor = null) {
     });
   }
   items.push({ sep: true });
-  items.push({
-    icon: "fa-microscope",
-    label: "Enviar evento ao caso",
-    onClick: () => addEventToAnalysis(ev.id),
-  });
+  items.push(record.send);
   if (hasVal) {
     items.push({
       icon: "fa-microscope",
@@ -4932,24 +4942,34 @@ function eventCellMenu(ev, col, value, anchor = null) {
       onClick: () => window.CanonicalFields.copy(exact),
     });
   }
-  items.push({ sep: true });
-  items.push({
+  return record.finish([...items, { sep: true }, ...record.tail]);
+}
+
+// Record actions share their real callbacks with cell menus. Column actions above
+// still capture CanonicalFields; the record trigger never invents a field/value.
+function eventRecordMenuParts(ev, anchor, onDetail = () => openDetail(ev.id)) {
+  const removalOwner = window.AnalysisContexts?.capture(), removalSignature = caseSig();
+  const open = [
+    { icon: "fa-eye", label: "Ver detalhes", onClick: onDetail },
+    { icon: "fa-route", label: "Investigar possível trilha", onClick: () => openTrail(ev) },
+  ];
+  const send = { icon: "fa-microscope", label: "Enviar evento ao caso", onClick: () => addEventToAnalysis(ev.id) };
+  const tail = [{
     icon: "fa-comment-dots",
     label: eventComment(ev) ? "Editar comentário" : "Adicionar comentário",
     onClick: () => openCommentModal(ev),
-  });
-  items.push({
+  }, {
     icon: "fa-briefcase",
     label: "Enviar todos visíveis ao caso",
     onClick: sendVisibleToCase,
-  });
+  }];
   const selectedList = (state.selectedEventRows?.has(ev.id) && state.selectedEventRows.size > 1)
     ? Array.from(state.selectedEventRows.values())
     : [ev];
 
-  items.push({ sep: true });
-  if (window.ExclusionArchive) items.push(window.ExclusionArchive.selectedMenuItem(ev, anchor));
-  items.push({
+  tail.push({ sep: true });
+  if (window.ExclusionArchive) tail.push(window.ExclusionArchive.selectedMenuItem(ev, anchor));
+  tail.push({
     icon: "fa-route",
     label: selectedList.length > 1
       ? `Jogar ${selectedList.length} eventos para uma trilha...`
@@ -4957,7 +4977,8 @@ function eventCellMenu(ev, col, value, anchor = null) {
     onClick: () => openSendToTrailModal(selectedList),
   });
 
-  if (workspaceScope() === "case") {
+  const finish = items => {
+    if (workspaceScope() !== "case") return items;
     const caseItems = items.filter(item => !["fa-microscope", "fa-briefcase"].includes(item.icon));
     caseItems.push({ sep: true });
     caseItems.push({
@@ -4967,8 +4988,73 @@ function eventCellMenu(ev, col, value, anchor = null) {
       onClick: () => removeEventFromCase(ev, { owner: removalOwner, signature: removalSignature, anchor }),
     });
     return caseItems;
-  }
-  return items;
+  };
+  return { open, send, tail, finish };
+}
+
+// Focus identity is captured when a row is rendered, never reconstructed from a
+// numeric ID after a source, Case or analysis swap. Legacy rows without a native
+// event_ref can only match the same object within their unchanged context.
+function recordContextKey() {
+  return JSON.stringify([workspaceScope(), state.cases?.active, window.AnalysisContexts?.capture()
+    || [state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.sourcePublication?.generation, !!state.sourceIdentityUnconfirmed],
+  workspaceScope() === "case" ? caseSig() : null]);
+}
+function captureRecordTarget(ev, key = recordContextKey()) {
+  return { key, id: ev.id, eventRef: typeof ev.event_ref === "string" && ev.event_ref ? ev.event_ref : null, event: ev };
+}
+function recordTargetMatches(target, ev) {
+  return !!target && ev?.id === target.id && (target.eventRef !== null
+    ? ev.event_ref === target.eventRef : ev === target.event);
+}
+function recordTargetCurrent(target) {
+  return !!target && target.key === recordContextKey() && state.rows.some(ev => recordTargetMatches(target, ev));
+}
+function recordFocusAvailable(node) {
+  return !!node?.isConnected && !node.disabled && !node.closest('[hidden],[inert],[aria-hidden="true"]')
+    && !!node.getClientRects().length && getComputedStyle(node).visibility !== "hidden";
+}
+function resolveRecordFocus(target) {
+  const origin = recordTargetCurrent(target) ? [...document.querySelectorAll("#events-table .record-actions-trigger")]
+    .find(button => button._recordTarget?.key === target.key && recordTargetMatches(target, button._recordTarget.event)) : null;
+  // Never choose a neighbouring row by its former index, even if IDs are reused.
+  return [origin, $("#page-size"), $("#quick-search"), $("#btn-add-filter")].find(recordFocusAvailable) || null;
+}
+function focusRecordTarget(target) {
+  resolveRecordFocus(target)?.focus({ preventScroll: true });
+}
+function eventRecordMenu(ev, anchor, target) {
+  ensureSelectionOwner();
+  const parts = eventRecordMenuParts(ev, anchor, () => openDetail(target.id, {
+    eventRef: target.eventRef, guard: () => recordTargetCurrent(target), recordFocus: target,
+  }));
+  return parts.finish([...parts.open, { sep: true }, parts.send, { sep: true }, ...parts.tail])
+    .map(item => item.sep ? item : { ...item, onClick: () => {
+      if (!recordTargetCurrent(target)) { toast("O contexto mudou. Abra as ações do registro novamente.", "info"); return; }
+      return item.onClick?.();
+    } });
+}
+function buildRecordActions(ev, key) {
+  const cell = el("td", "record-actions-cell"), button = el("button", "icon-btn record-actions-trigger");
+  const target = captureRecordTarget(ev, key);
+  button.type = "button";
+  button._recordTarget = target;
+  button.setAttribute("aria-label", `Ações do registro ${ev.id}`);
+  button.setAttribute("aria-haspopup", "menu");
+  button.title = `Ações do registro ${ev.id}`;
+  button.innerHTML = '<i class="fas fa-ellipsis" aria-hidden="true"></i>';
+  const open = event => {
+    event.preventDefault(); event.stopPropagation();
+    if (!recordTargetCurrent(target)) { toast("O contexto mudou. Abra as ações do registro novamente.", "info"); return; }
+    const box = button.getBoundingClientRect();
+    showCtxMenu(box.left, box.bottom, eventRecordMenu(ev, button, target), { trigger: button, label: button.title });
+  };
+  button.onclick = open; button.oncontextmenu = open;
+  // A menu may restore its still-mounted caller during a context transition.
+  // That DOM node is not sufficient proof that the record remains valid.
+  button.onfocus = () => { if (!recordTargetCurrent(target)) focusRecordTarget(target); };
+  cell.appendChild(button);
+  return cell;
 }
 
 let lastCaseRemoval = null;
@@ -5282,7 +5368,7 @@ function tableValuePreview(value, limit = 4096) {
   return { text: text.slice(0, end), marker, truncated: true };
 }
 
-function buildEventRow(ev, columns = state.visibleCols) {
+function buildEventRow(ev, columns = state.visibleCols, { recordActions = false, recordKey = null } = {}) {
   const quick = state.quick.trim();
   const quickRe = quick && (!window.QueryLang || window.QueryLang.isPlain(quick)) ? new RegExp(`(${escRe(esc(quick))})`, "gi") : null;
   const row = el("tr");
@@ -5290,6 +5376,8 @@ function buildEventRow(ev, columns = state.visibleCols) {
   if (workspaceScope() === "dataset" && window.WorkspaceContext?.isIncluded(ev)) { row.classList.add("event-in-case"); row.title = "Este registro já está no Caso"; }
   if (ev.id === state.detailId) row.classList.add("selected");
   if (state.selectedEventRows?.has(ev.id)) row.classList.add("row-multi-selected");
+
+  if (recordActions) row.appendChild(buildRecordActions(ev, recordKey ?? recordContextKey()));
 
   row.onclick = (e) => {
     ensureSelectionOwner();
@@ -5366,6 +5454,9 @@ function renderTable(qr, { reuseRows = false } = {}) {
   $("#empty-state [data-retry]")?.remove();
   const thead = $("#events-table thead");
   const tbody = $("#events-table tbody");
+  const active = document.activeElement;
+  const focusedRecord = tbody.contains(active) && active.matches?.(".record-actions-trigger") ? active._recordTarget : null;
+  const recordKey = recordContextKey();
   const existingRows = reuseRows ? new Map([...tbody.children].map(row => [Number(row.dataset.eventId), row])) : new Map();
   thead.innerHTML = "";
   tbody.replaceChildren();
@@ -5374,17 +5465,25 @@ function renderTable(qr, { reuseRows = false } = {}) {
   const table = $("#events-table");
   table.querySelector("colgroup")?.remove();
   const colgroup = document.createElement("colgroup");
+  const actionCol = document.createElement("col"); actionCol.className = "record-actions-column";
+  colgroup.appendChild(actionCol);
+  const dataCols = new Map();
   for (const col of state.visibleCols) {
     const colEl = document.createElement("col");
+    colEl.dataset.column = col; dataCols.set(col, colEl);
     if (state.colWidths[col]) colEl.style.width = `${state.colWidths[col]}px`;
     colgroup.appendChild(colEl);
   }
   table.prepend(colgroup);
 
   const tr = el("tr");
+  const actionsHead = el("th", "record-actions-heading");
+  actionsHead.scope = "col"; actionsHead.setAttribute("aria-label", "Ações do registro");
+  tr.appendChild(actionsHead);
   let lastColumnDropAt = 0;
   for (const col of state.visibleCols) {
     const th = el("th", "", colLabel(col));
+    th.dataset.column = col;
     // arrastar para reordenar as colunas exibidas
     th.draggable = true;
     th.ondragstart = (e) => { e.dataTransfer.setData("text/col", col); th.classList.add("dragging"); };
@@ -5455,7 +5554,7 @@ function renderTable(qr, { reuseRows = false } = {}) {
       const onMove = (ev) => {
         const w = Math.max(48, Math.round(startW + (ev.clientX - startX)));
         th.style.width = `${w}px`;
-        colgroup.children[state.visibleCols.indexOf(col)].style.width = `${w}px`;
+        dataCols.get(col).style.width = `${w}px`;
       };
       const onUp = (ev) => {
         document.removeEventListener("mousemove", onMove);
@@ -5475,11 +5574,14 @@ function renderTable(qr, { reuseRows = false } = {}) {
   const fragment = document.createDocumentFragment();
   for (const ev of qr.rows) {
     const previous = existingRows.get(ev.id);
-    if (!previous) { fragment.append(buildEventRow(ev)); continue; }
+    const previousTarget = previous?.querySelector(".record-actions-trigger")?._recordTarget;
+    if (!previous || previousTarget?.key !== recordKey || !recordTargetMatches(previousTarget, ev) || previousTarget.event !== ev) {
+      fragment.append(buildEventRow(ev, state.visibleCols, { recordActions: true, recordKey })); continue;
+    }
     const cells = new Map([...previous.children].map(cell => [cell.dataset.column, cell]));
     const missing = state.visibleCols.filter(col => !cells.has(col));
     if (missing.length) for (const cell of [...buildEventRow(ev, missing).children]) cells.set(cell.dataset.column, cell);
-    previous.replaceChildren(...state.visibleCols.map(col => cells.get(col)));
+    previous.replaceChildren(previous.querySelector(".record-actions-cell"), ...state.visibleCols.map(col => cells.get(col)));
     fragment.append(previous);
   }
   tbody.append(fragment);
@@ -5491,6 +5593,15 @@ function renderTable(qr, { reuseRows = false } = {}) {
     : "Selecione uma fonte de dados.";
 
   updatePager({ ...state.pageResult, ...qr });
+  const skip = $("#skip-records");
+  if (skip) {
+    skip.hidden = !qr.rows.length;
+    skip.onclick = event => { event.preventDefault(); $("#page-size").focus(); };
+  }
+  // replaceChildren detaches even reused row objects. Restore synchronously only
+  // when this render removed the focused trigger; a pending query must never
+  // steal focus the user already moved to search, a menu, or another surface.
+  if (focusedRecord && (document.activeElement === document.body || document.activeElement === active)) focusRecordTarget(focusedRecord);
 }
 
 // ------------------------------------------------------------------ histograma
@@ -5632,7 +5743,7 @@ async function loadJavaTraceDetail(event, admission, evidence, current) {
   if (response.state === "unavailable" && ["raw_unavailable", "not_java"].includes(response.reason) && response.trace === null) return response;
   throw Error("Resposta de estrutura inválida.");
 }
-async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
+async function openDetail(id, { eventRef = null, guard = () => true, recordFocus = null } = {}) {
   if (!guard()) { toast("O contexto mudou. Abra o registro novamente.", "info"); return false; }
   const request = ++detailRequest;
   const scope = workspaceScope(), owner = window.AnalysisContexts?.capture();
@@ -5641,6 +5752,8 @@ async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
   window.Tasks?.cancelLatest("event-detail");
   window.Tasks?.cancelLatest("java-trace-detail");
   showDetailLoading();
+  state.recordDrawerReturn = recordFocus;
+  if (recordFocus) $("#dr-close").focus({ preventScroll: true });
   const current = () => request === detailRequest && !$("#drawer").hidden && detailAdmissionCurrent(admission) && guard();
   const check = () => {
     if (current()) return true;
@@ -5670,6 +5783,7 @@ async function openDetail(id, { eventRef = null, guard = () => true } = {}) {
 
 // abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
 function showDetailLoading() {
+  state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear(); detailDeferredPane = null;
   closeDetailValue();
   state.detailId = null; state.currentDetailEv = null; state.detailSourceSpec = null; state.detailAdmission = null;
@@ -5689,6 +5803,7 @@ function showDetailLoading() {
 }
 
 function openContextInspector(title, subtitle, overview) {
+  state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear();
   closeDetailValue();
   detailRequest++;
@@ -5993,6 +6108,7 @@ function renderDetailTree(entries, collapsedPaths = new Set()) {
 }
 
 function showDetail(ev, sourceSpec = null, admission = null) {
+  if (!admission) state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear();
   closeDetailValue();
   window.Tasks?.cancelLatest("java-trace-detail");
@@ -6103,10 +6219,18 @@ function updateDetailNav() {
 function detailStep(dir) {
   const i = currentIndex();
   const n = i + dir;
-  if (n >= 0 && n < state.rows.length) openDetail(state.rows[n].id);
+  if (n >= 0 && n < state.rows.length) {
+    const ev = state.rows[n], origin = state.recordDrawerReturn;
+    if (origin && origin.key !== recordContextKey()) { toast("O contexto mudou. Abra o registro novamente.", "info"); return; }
+    openDetail(ev.id, { eventRef: ev.event_ref ?? null, recordFocus: origin });
+  }
 }
 
 function closeDrawer() {
+  const recordReturn = state.recordDrawerReturn;
+  const restoreRecord = recordReturn && ($("#drawer").contains(document.activeElement)
+    || $("#detail-value-modal").contains(document.activeElement) || document.activeElement === document.body);
+  state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear();
   detailRequest++;
   detailDeferredPane = null;
@@ -6119,6 +6243,7 @@ function closeDrawer() {
   $("#drawer-scrim").hidden = true;
   $("#btn-right-inspect").classList.remove("active");
   document.querySelectorAll("#events-table tbody tr").forEach((tr) => tr.classList.remove("selected"));
+  if (restoreRecord) focusRecordTarget(recordReturn);
 }
 
 async function copyDetail() {
@@ -7990,7 +8115,7 @@ async function openCube(scope = "dataset", { force = false } = {}) {
 
   const cube = activeCube(scope);
   const currentSig = JSON.stringify([scope, cube.id, cubeSchemaSignature(cube), backendFilters(), scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, state.derivedFields]);
-  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody tr").length > 0) {
+  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody").rows.length > 0) {
     finishOperation("Cubo pronto", "Recorte exibido do cache.");
     return;
   }
@@ -8175,7 +8300,7 @@ async function runCube({ force = false } = {}) {
   const filters = backendFilters();
   const currentSig = JSON.stringify([scope, cube.id, cubeSchemaSignature(cube), filters, scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, state.derivedFields]);
 
-  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody tr").length > 0) {
+  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody").rows.length > 0) {
     return { status: "cached" };
   }
 

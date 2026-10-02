@@ -2456,3 +2456,16 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 .query-analytics-status .btn { margin-left: auto; flex-shrink: 0; }
 
 .filter-actions { flex-wrap: wrap; }
+
+/* One keyboard entry point per record, outside data-column sizing and export. */
+#tab-table { position: relative; }
+#events-table col.record-actions-column { width: 42px; }
+#events-table th.record-actions-heading,
+#events-table td.record-actions-cell { width: 42px; min-width: 42px; max-width: 42px; padding: 0 5px; box-sizing: border-box; }
+#events-table th.record-actions-heading { cursor: default; }
+#events-table .record-actions-trigger { width: 32px; height: 32px; color: var(--text-1); border: 1px solid transparent; }
+#events-table .record-actions-trigger:hover,
+#events-table .record-actions-trigger:focus-visible { color: var(--text-0); border-color: var(--border-strong); background: var(--bg-2); }
+#events-table .record-actions-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.record-skip { position: absolute; left: 6px; top: 6px; z-index: 5; padding: 8px 12px; background: var(--bg-2); color: var(--text-0); border: 1px solid var(--border-strong); border-radius: var(--radius); transform: translateY(-200%); }
+.record-skip:focus { transform: none; outline: 2px solid var(--accent); outline-offset: 1px; }

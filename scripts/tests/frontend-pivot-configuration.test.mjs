@@ -164,3 +164,80 @@ test('configuration CSS keeps readable labels and targets without affecting non-
   assert.match(css, /\.cube-panel \.aw-pivot-config-item dd[^}]*overflow-wrap: anywhere/);
   assert.match(source, /renderCubeZones = function[\s\S]*renderPivotConfiguration\(\);/);
 });
+
+// Real opening/calculation guards must tolerate the empty DOM left by workspace
+// restoration while the valid in-memory pivot result still exists.
+function cachedPivotFixture({ rows = 0, missingProfiles = false } = {}) {
+  const app = readFileSync(new URL('../../frontend/app.js', import.meta.url), 'utf8');
+  const calls = { queries: 0, fields: 0, zones: 0, rendered: 0, finished: [] };
+  const cube = { id: 'table-a', rows: ['level'], cols: [], values: [{ func: 'count', column: '*', alias: 'qtd' }] };
+  const body = { rows: Array.from({ length: rows }, () => ({})), set innerHTML(_value) { this.rows = []; }, replaceChildren() { this.rows = []; } };
+  const head = { innerHTML: '', replaceChildren() {} };
+  const nodes = new Map([
+    ['#view-cube', { hidden: false }], ['#cube-table tbody', body], ['#cube-table thead', head],
+    ['#cube-table', { querySelector: selector => selector === 'thead' ? head : body }],
+  ]);
+  const $ = selector => selector === '#cube-table tbody tr' ? body.rows[0] || null : nodes.get(selector);
+  const result = { complete: true, row_paths: [['a']], cells: [[[1]]], col_keys: [''], totals: [[1]], value_names: ['Registros'] };
+  const state = { analyticsScope: 'dataset', currentArtifact: { id: 'source-a', loadedAt: 100 }, derivedFields: [], filters: [] };
+  const signature = () => JSON.stringify(['dataset', cube.id, 'schema-a', state.filters, state.currentArtifact.loadedAt, state.derivedFields]);
+  const cubeState = { result, lastComputedSignature: signature(), results: new Map([['dataset:table-a', result]]), requestVersion: 1, collapsed: new Set() };
+  const context = vm.createContext({ $, state, cubeState, window: {}, document: { querySelector: $ },
+    workspaceScope: () => state.analyticsScope, activeCase: () => ({ id: 'case-a' }), activeCube: () => cube,
+    scopeHasEvents: () => true, scopeProfiles: () => missingProfiles ? null : [], setScopeProfiles() {},
+    caseSig: () => 'case-signature', cubeSchemaSignature: () => 'schema-a', backendFilters: () => state.filters,
+    cubeResultKey: (scope, id) => `${scope}:${id}`, analyticsRequest: () => ({ filters: state.filters }),
+    startOperation() {}, updateOperation() {}, finishOperation: (...args) => calls.finished.push(args),
+    renderCubeFields: () => calls.fields++, renderCubeZones: () => calls.zones++, renderCubeViews() {},
+    areaLoading: () => ({ bindOperation() {}, done() {} }),
+    api: async command => { if (command === 'pivot') calls.queries++; return result; },
+    cubeDataSignature: () => 'result-a', saveActiveCube() {},
+    renderCubeTable: () => { calls.rendered++; body.rows = [{}, {}]; },
+  });
+  vm.runInContext(part(app, 'async function openCube(', 'function renderCubeFields('), context);
+  vm.runInContext(part(app, 'async function runCube(', 'function cubeResultForTable('), context);
+  return { context, calls, body, state, result, cubeState };
+}
+
+test('actual pivot reopening recalculates after workspace restore clears rows but keeps cached results', async () => {
+  const f = cachedPivotFixture();
+  await f.context.openCube('dataset');
+  assert.equal(f.calls.queries, 1); assert.equal(f.calls.rendered, 1); assert.equal(f.body.rows.length, 2);
+  assert.equal(f.calls.fields, 1); assert.equal(f.calls.zones, 1);
+  assert.equal(f.cubeState.result, f.result);
+});
+
+test('actual pivot opening and calculation reuse valid cache only when its rendered rows exist', async () => {
+  for (const entry of ['openCube', 'runCube']) {
+    const f = cachedPivotFixture({ rows: 2 });
+    await (entry === 'openCube' ? f.context.openCube('dataset') : f.context.runCube());
+    assert.equal(f.calls.queries, 0, entry); assert.equal(f.calls.rendered, 0, entry); assert.equal(f.body.rows.length, 2, entry);
+  }
+  const f = cachedPivotFixture();
+  const outcome = await f.context.runCube();
+  assert.equal(outcome.status, 'success'); assert.equal(f.calls.queries, 1); assert.equal(f.body.rows.length, 2);
+});
+
+test('force, changed filters and changed source still invalidate the rendered pivot cache', async () => {
+  for (const change of ['force', 'filters', 'source']) for (const entry of ['openCube', 'runCube']) {
+    const f = cachedPivotFixture({ rows: 2 });
+    if (change === 'filters') f.state.filters = [{ column: 'level', op: 'equals_exact', value: 'Erro' }];
+    if (change === 'source') f.state.currentArtifact.loadedAt++;
+    const options = { force: change === 'force' };
+    await (entry === 'openCube' ? f.context.openCube('dataset', options) : f.context.runCube(options));
+    assert.equal(f.calls.queries, 1, `${entry}/${change}`); assert.equal(f.calls.rendered, 1);
+  }
+});
+
+test('opening and calculation still reject a result after its source or context changes', async () => {
+  for (const entry of ['openCube', 'runCube']) for (const change of ['scope', 'source']) {
+    const f = cachedPivotFixture({ missingProfiles: entry === 'openCube' }); let release;
+    f.context.api = () => new Promise(resolve => { release = resolve; });
+    const pending = entry === 'openCube' ? f.context.openCube('dataset') : f.context.runCube();
+    if (change === 'scope') f.state.analyticsScope = 'case';
+    else { f.state.currentArtifact.loadedAt++; f.cubeState.requestVersion++; }
+    release(f.result); await pending;
+    assert.equal(f.calls.rendered, 0, `${entry}/${change}`);
+    if (entry === 'openCube') { assert.equal(f.calls.fields, 0); assert.equal(f.calls.zones, 0); }
+  }
+});

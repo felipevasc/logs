@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFileSync} from 'node:fs';
 const source=readFileSync(new URL('../../frontend/discovery.js',import.meta.url),'utf8');
-const makeNode=()=>({title:'',attrs:{},getBoundingClientRect:()=>({right:50,bottom:80}),setAttribute(key,value){this.attrs[key]=value;}});
-const headers=[makeNode(),makeNode()],main=makeNode(),more=makeNode(),shown=[],opened=[],renders=[],filters=[];
+const makeNode=()=>({title:'',dataset:{},attrs:{},getBoundingClientRect:()=>({right:50,bottom:80}),setAttribute(key,value){this.attrs[key]=value;}});
+const actionHeader=makeNode(),headers=['source','mock_payload_b64'].map(column=>Object.assign(makeNode(),{dataset:{column}})),main=makeNode(),more=makeNode(),shown=[],opened=[],renders=[],filters=[];
 const row={dataset:{column:'source'},querySelector:selector=>selector==='.field-item'?main:more};
 const box={querySelectorAll:()=>[row]};
 const context=vm.createContext({
-  state:{visibleCols:['source','mock_payload_b64'],filters},document:{querySelectorAll:selector=>selector==='#events-table th'?headers:[]},
+  state:{visibleCols:['source','mock_payload_b64'],filters},document:{querySelectorAll:selector=>selector==='#events-table th[data-column]'?[actionHeader,...headers].filter(node=>node.dataset.column):selector==='#events-table th'?[actionHeader,...headers]:[]},
   workspaceScope:()=> 'dataset',colLabel:field=>field==='source'?'Origem':field,
   renderTable:(...args)=>renders.push(args),renderExploreTreeInto(){},showCtxMenu:(x,y,items)=>shown.push({x,y,items}),
   window:{ExplorerTimeline:{menuItem:field=>({label:`Representar ${field==='source'?'Origem':field} na Timeline`,onClick:()=>opened.push({kind:'timeline',field})})},
@@ -17,6 +17,8 @@ const context=vm.createContext({
 });
 vm.runInContext(source.slice(source.indexOf('  function fieldMenu('),source.indexOf('  const oldDetail=showDetail;')),context);
 const qr={rows:[{id:1}]},options={reuseRows:true};context.renderTable(qr,options);
+assert.equal(actionHeader.oncontextmenu,undefined,'the record-action column must never become a field menu');
+assert.equal(actionHeader.title,'');
 assert.equal(renders[0][0],qr);assert.equal(renders[0][1],options,'the installed decorator still forwards row reuse');
 const event={clientX:12,clientY:34,preventDefault(){},stopPropagation(){}};
 for(const [index,field] of ['source','mock_payload_b64'].entries()){
@@ -27,6 +29,10 @@ for(const [index,field] of ['source','mock_payload_b64'].entries()){
   const reference=menu.find(item=>item.label==='Criar campo por referência');assert.ok(reference);reference.onClick();assert.equal(opened.at(-1).field,field);assert.equal(opened.at(-1).anchor,headers[index]);
   for(const label of ['Resumir valores','Somente preenchidos','Somente vazios','Cruzar nas linhas','Cruzar nas colunas'])assert.ok(menu.some(item=>item.label===label),label);
 }
+// The DOM can be reordered before the decorator runs: fields follow their own identifiers.
+headers.reverse();context.renderTable(qr,options);
+for(const header of headers){header.oncontextmenu(event);shown.at(-1).items.find(item=>item.label==='Transformar campo').onClick();assert.equal(opened.at(-1).field,header.dataset.column);}
+assert.equal(actionHeader.oncontextmenu,undefined);
 context.renderExploreTreeInto(box,'dataset');
 for(const invoke of [()=>row.oncontextmenu(event),()=>more.onclick(event)]){
   invoke();const menu=shown.at(-1).items;
