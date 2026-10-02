@@ -16,6 +16,17 @@ Menus, edição por chip, foco das ações de registro, recolhimento do pivot, a
 
 O próximo recorte prioriza praticidade: Cancelar no cartão que cobre a carga, Colunas que conserve a ordem escolhida e tenha foco previsível, Fontes compactas com caminho completo acessível e continuidade do detalhe. A cena de composição também passa a acompanhar o render real de PNG/PDF da Timeline, reutilizando a arte aprovada. Esses incrementos novos exigem seus próprios gates antes de serem apresentados como verificados.
 
+Atualização de 06:20 UTC: o [CI59](https://github.com/felipevasc/logs/actions/runs/36971797249), no commit `77f0a69a`, aprovou 888 testes Node, 23 de 24 roteiros de navegador, o roteiro auxiliar e ambas as matrizes nativas. O Cancelar no cartão passou por mouse, teclado, ID exato, prevenção de duplicata, recuperação pendente e resposta tardia. O agregador falhou somente no Escape durante renderização da Timeline. O foco se perdia ao desabilitar Exportar; há correção e regressões locais, ainda sem confirmação do próximo navegador. PNG/PDF finais desse novo roteiro não chegaram a ser produzidos. `e885d674` continua sendo o último checkpoint com todos os gates verdes.
+
+### Recorte de praticidade em validação
+
+- **Colunas:** mostrar ou ocultar não desfaz a ordem escolhida por arraste. Campos novos entram no fim. A lista recebe foco ao abrir; Escape fecha apenas essa camada e clique externo conserva o foco escolhido. Persistência, seleção e elementos existentes da tabela são preservados, sem consulta adicional ou mudança de fonte/tamanho.
+- **Fontes:** o nome abre o caminho exato, selecionável e copiável. Elipse e botão direito oferecem as ações existentes de data/hora, SHA-256 e remoção confirmada. Há proteção contra fonte/lista/contexto substituídos e respostas antigas. A tabela rola em largura estreita, em vez de cortar caminhos ou ações. O textarea conserva seu menu nativo por mouse e teclado.
+- **Detalhe:** clique comum e menu da célula agora usam a mesma identidade exata e retorno de foco do botão de ações do registro. Uma linha recriada pode ser reencontrada; um ID reaproveitado ou contexto antigo não recebe a ação. Tabelas históricas mantêm seus contratos anteriores.
+- **Timeline:** a composição acompanha somente o render real; a contagem final inclui apêndices. Exportar passa o foco a Cancelar antes de ficar indisponível. A seção mantém foco quando todos os controles estão desabilitados durante a escrita, sem retirar o bloqueio de cancelamento dessa etapa.
+
+Esses recortes têm testes locais e roteiros remotos preparados. As comparações de Colunas usam a aplicação real em 1024/1440 px e os dois temas. Em Fontes, a referência anterior é uma reconstrução explicitamente identificada da marcação antiga no fixture, não uma captura histórica da versão instalada; as imagens novas são do frontend atual. Nenhuma dessas comparações deve ser anunciada como aprovada antes do CI correspondente.
+
 ## Primeiro recorte
 
 1. Menu compartilhado com foco, navegação de teclado, retorno ao alvo válido e fechamento de apenas uma camada por Escape
