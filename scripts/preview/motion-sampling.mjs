@@ -34,11 +34,15 @@ export function installMotionSampling() {
         // Resume only the original CSS policy for full-speed video capture. A
         // work track paused by the product must never be forced to run here.
         async release() { restoreCss(); await frames(); },
-        async restore() {
+        async restore({ restoreTime = true } = {}) {
           if (restored) return;
           try {
-            pauseCss();
-            for (const { animation, time } of times) animation.currentTime = time;
+            // Poses/rigs restore their snapshot; a completed natural capture
+            // keeps its final time so a finite gesture cannot start again.
+            if (restoreTime) {
+              pauseCss();
+              for (const { animation, time } of times) animation.currentTime = time;
+            }
           } finally {
             restoreCss();
             restored = true;

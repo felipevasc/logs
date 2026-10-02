@@ -109,7 +109,7 @@ try {
         if(performance.now()-started>17600)return reject(Error('Report scene did not finish its real-time capture cycle'));
         requestAnimationFrame(frame);
       };requestAnimationFrame(frame);});
-    } finally {await sampling.restore();}
+    } finally {await sampling.restore({ restoreTime: false });}
   });
   assert.ok(results.cycle.minimumTimelineMs>=7600);mark('long-cycle-end');await snap('case-report-wait-long-dark.png');
   phase='pause-and-context';await scene.locator('.wv-motion-toggle').focus();await page.keyboard.press('Enter');await motion('static');

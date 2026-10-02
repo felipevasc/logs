@@ -45,17 +45,32 @@ const states = () => roots.evaluateAll(nodes => nodes.map(root => ({
   moving: root.querySelector('.wv-art').getAnimations({ subtree: true }).filter(a => a.playState === 'running').length,
   animations: root.querySelector('.wv-art').getAnimations({ subtree: true }).map(a => ({
     name: a.animationName, target: a.effect.target.getAttribute('class'),
-    currentTime: a.currentTime, playState: a.playState,
+    currentTime: a.currentTime, playState: a.playState, pending: a.pending,
   })),
 })));
+// CSS pause can report playState=paused while its pending pause task still
+// awaits the next frame. Retain that immediate state as evidence, then compare
+// exact frozen times only once the browser has committed the pause.
+const settlePausedArtwork = () => roots.evaluateAll(async nodes => {
+  const animations = nodes.flatMap(root => root.querySelector('.wv-art').getAnimations({ subtree: true }));
+  await Promise.all(animations.map(animation => animation.ready));
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+});
 // Run this both before any diagnostic seek and after sampling, so a fixture
 // cannot hide a native pause failure or silently disable future CSS governance.
 const pauseAndResumeReading = async (label, updateReceipt = false) => {
   const before = await states();
   await scene('reading').locator('.wv-motion-toggle').click();
+  const requested = (await states())[0];
+  results.pauseRequests ??= [];
+  results.pauseRequests.push({ label, state: requested });
+  assert.equal(requested.motion, 'static', `${label}: the real control pauses the scene`);
+  assert.equal(requested.moving, 0, `${label}: no artwork animation remains running`);
+  await settlePausedArtwork();
   const paused = (await states())[0];
-  assert.equal(paused.motion, 'static', `${label}: the real control pauses the scene`);
-  assert.equal(paused.moving, 0, `${label}: no artwork animation remains running`);
+  assert.equal(paused.motion, 'static');
+  assert.equal(paused.moving, 0);
+  assert.ok(paused.animations.every(animation => !animation.pending), `${label}: CSS pause tasks have settled`);
   await page.waitForTimeout(300);
   const stillPaused = (await states())[0];
   assert.equal(stillPaused.episode, 'coffee');
@@ -82,7 +97,7 @@ const pauseAndResumeReading = async (label, updateReceipt = false) => {
   assert.ok(resumed[0].animations.some((animation, index) => animation.currentTime > paused.animations[index].currentTime),
     `${label}: the resumed timelines advance`);
   mark(label);
-  return { before, paused, stillPaused, resumed };
+  return { before, requested, paused, stillPaused, resumed };
 };
 const bothEpisode = episode => page.waitForFunction(episode => [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')]
   .length === 2 && [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')].every(root => root.dataset.episode === episode), episode, { timeout: 45000 });
@@ -214,10 +229,16 @@ try {
   phase = 'pause, receipts and hidden context';
   results.midEpisodePause = await pauseAndResumeReading('coffee-pause-resume-after-contact-sampling', true);
   await page.evaluate(() => Object.values(__reactionPreview.views).forEach(view => view.setVisible(false)));
-  const hidden = await states();
+  results.hiddenPause = { requested: await states() };
+  assert.ok(results.hiddenPause.requested.every(state => state.motion === 'static' && state.moving === 0));
+  await settlePausedArtwork();
+  const hidden = results.hiddenPause.settled = await states();
   assert.ok(hidden.every(state => state.motion === 'static' && state.moving === 0));
+  assert.ok(hidden.every(state => state.animations.every(animation => !animation.pending)), 'hidden CSS pause tasks have settled');
   await page.waitForTimeout(300);
-  assert.deepEqual((await states()).map(state => state.animations.map(animation => animation.currentTime)),
+  const stillHidden = results.hiddenPause.stillPaused = await states();
+  assert.ok(stillHidden.every(state => state.motion === 'static' && state.moving === 0));
+  assert.deepEqual(stillHidden.map(state => state.animations.map(animation => animation.currentTime)),
     hidden.map(state => state.animations.map(animation => animation.currentTime)), 'explicit hiding preserves paused timeline positions');
   await page.evaluate(() => Object.values(__reactionPreview.views).forEach(view => view.setVisible(true)));
   await page.waitForFunction(() => [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')].every(root => root.dataset.motion === 'running'));

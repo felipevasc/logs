@@ -22,13 +22,14 @@ function fixture() {
     targets.push(target);
     return target;
   };
-  const makeAnimation = (target, time) => ({ effect: { target },
+  const makeAnimation = (target, time, duration = Infinity) => ({ effect: { target },
     get currentTime() { return time; },
     set currentTime(value) {
       assert.equal(target.computed, 'paused', 'CSS is flushed before a timeline is sought');
       events.push(['seek', target.name, value]); time = value;
     },
-    get playState() { return target.computed; },
+    get playState() { return target.computed === 'running' && time >= duration ? 'finished' : target.computed; },
+    advance(elapsed) { if (this.playState === 'running') time = Math.min(time + elapsed, duration); },
     pause() { assert.fail('WAAPI pause must never override CSS governance'); },
     play() { assert.fail('WAAPI play must never override CSS governance'); },
   });
@@ -87,7 +88,7 @@ test('finally cleanup restores a failed sample without forcing paused work track
   assert.equal(target.style.getPropertyPriority('animation-play-state'), '');
 });
 
-test('natural capture release restores CSS policy, then final cleanup restores original times', async () => {
+test('temporary sampling release restores CSS policy while default cleanup still restores original times', async () => {
   const f = fixture(), moving = f.makeTarget('coffee'), still = f.makeTarget('work', '', '', 'paused');
   const a = f.makeAnimation(moving, 320), b = f.makeAnimation(still, 84);
   const sample = await f.sampling.begin([a, b]);
@@ -99,6 +100,40 @@ test('natural capture release restores CSS policy, then final cleanup restores o
   } finally { await sample.restore(); }
   assert.deepEqual([a.currentTime, b.currentTime], [320, 84]);
   assert.equal(a.playState, 'paused'); assert.equal(b.playState, 'paused');
+});
+
+test('natural capture cleanup preserves a completed finite gesture without restarting or seeking it', async () => {
+  const f = fixture(), target = f.makeTarget('short');
+  const animation = f.makeAnimation(target, 900, 2800);
+  const sample = await f.sampling.begin([animation]);
+  try {
+    await sample.seek(0); await sample.release();
+    animation.advance(2800);
+    assert.equal(animation.currentTime, 2800);
+    assert.equal(animation.playState, 'finished');
+  } finally { await sample.restore({ restoreTime: false }); }
+  assert.equal(animation.currentTime, 2800);
+  assert.equal(animation.playState, 'finished');
+  assert.deepEqual(f.events.filter(([type]) => type === 'seek'), [['seek', 'short', 0]], 'capture cleanup never rewinds time');
+  assert.equal(target.style.getPropertyValue('animation-play-state'), '');
+  await sample.restore();
+  assert.equal(animation.currentTime, 2800, 'cleanup remains idempotent across modes');
+});
+
+test('failed capture restores CSS declarations without rewinding the partially recorded timeline', async () => {
+  const f = fixture(), target = f.makeTarget('capture', 'running', 'important');
+  const animation = f.makeAnimation(target, 700, 2800);
+  await assert.rejects(async () => {
+    const sample = await f.sampling.begin([animation]);
+    try {
+      await sample.seek(0); await sample.release();
+      animation.advance(1300);
+      throw Error('capture interrupted');
+    } finally { await sample.restore({ restoreTime: false }); }
+  }, /capture interrupted/);
+  assert.equal(animation.currentTime, 1300);
+  assert.equal(target.style.getPropertyValue('animation-play-state'), 'running');
+  assert.equal(target.style.getPropertyPriority('animation-play-state'), 'important');
 });
 
 test('preview samplers never use WAAPI playback overrides and test pause before and after seeks', () => {
@@ -116,4 +151,25 @@ test('preview samplers never use WAAPI playback overrides and test pause before 
   assert.match(source, /timeMs - events\[firstCoffee\]\.timeMs >= 31000/);
   assert.match(source, /family === 'reading' \? 32 : 31/);
   assert.match(source, /elapsedMs: 60000/);
+});
+
+test('capture-only cleanup keeps time while pause checks wait for settled CSS and retain pending evidence', () => {
+  for (const [filename, functionStart] of [
+    ['test-waiting-visuals.mjs', 'async function recordSceneCycle('],
+    ['test-case-report-waiting.mjs', '  results.cycle=await scene.evaluate('],
+  ]) {
+    const source = readFileSync(new URL(`../preview/${filename}`, import.meta.url), 'utf8');
+    const capture = source.slice(source.indexOf(functionStart));
+    assert.match(capture, /finally \{\s*await sampling\.restore\(\{ restoreTime: false \}\)/, filename);
+    assert.match(source, /await sampling\.restore\(\)/, `${filename}: pose sampling still restores original times`);
+  }
+  const source = readFileSync(new URL('../preview/test-waiting-reactions.mjs', import.meta.url), 'utf8');
+  assert.match(source, /pending: a\.pending/);
+  assert.match(source, /Promise\.all\(animations\.map\(animation => animation\.ready\)\)/);
+  const request = source.indexOf('results.hiddenPause = { requested: await states() }');
+  const settle = source.indexOf('await settlePausedArtwork()', request);
+  const baseline = source.indexOf('const hidden = results.hiddenPause.settled = await states()', settle);
+  const final = source.indexOf('const stillHidden = results.hiddenPause.stillPaused = await states()', baseline);
+  assert.ok(request >= 0 && request < settle && settle < baseline && baseline < final);
+  assert.match(source.slice(baseline), /assert\.deepEqual\(stillHidden\.map/);
 });

@@ -303,7 +303,7 @@ async function recordSceneCycle(locator, label, durationMs, attribution) {
         };
         requestAnimationFrame(frame);
       });
-    } finally { await sampling.restore(); }
+    } finally { await sampling.restore({ restoreTime: false }); }
   }, durationMs);
   assert.ok(capture.minimumTimelineMs >= durationMs, 'video contains the complete real-time decorative cycle');
   markVideo(`${label}-end`, { ...attribution, ...capture });
