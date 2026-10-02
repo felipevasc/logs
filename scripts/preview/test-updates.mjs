@@ -2,7 +2,9 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 const url = process.argv[2] || "http://127.0.0.1:4173";
-const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chrome" });
+const browser = await chromium.launch(process.env.PLAYWRIGHT_EXECUTABLE_PATH
+  ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH }
+  : { channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" });
 const errors = [], results = {};
 const NOTES = "# LogInsight 0.6.0\n\n## Atualizações\n\n- Verifica versões **novas** ao abrir.\n- Instala com `um clique`.\n\nDetalhes em [Atualizações](https://example.org/docs).\n\n<img src=x onerror=alert(1)>";
 async function open(update) {
@@ -26,9 +28,35 @@ try {
   assert.ok(await page.locator("#btn-settings.has-update").count(), "settings button marks the pending update");
   results.announce = "diálogo ao abrir, notas como texto, marca em Configurações";
 
+  // Events and invoke replies use separate native transports. Hold the actual
+  // Downloading reply until the mock has emitted Ready, then let the production
+  // click handler process that older snapshot before asserting the final UI.
+  await page.evaluate(() => {
+    const invoke = window.__TAURI__.core.invoke;
+    const released = new Promise(resolve => { window.__releaseUpdateDownloadReply = resolve; });
+    window.__TAURI__.core.invoke = async (name, args) => {
+      const reply = await invoke(name, args);
+      if (name === "update_download") { window.__delayedUpdateSnapshot = reply; await released; }
+      return reply;
+    };
+    const button = [...document.querySelectorAll(".update-overlay button")].find(node => node.textContent.trim() === "Atualizar agora");
+    const click = button.onclick;
+    button.onclick = event => { window.__updateDownloadAction = click.call(button, event); return window.__updateDownloadAction; };
+  });
   await page.getByRole("button", { name: "Atualizar agora" }).click();
   await page.waitForSelector(".update-progress span");
   await page.getByRole("button", { name: "Reiniciar e instalar" }).waitFor({ timeout: 8000 });
+  const delayedSnapshot = await page.evaluate(async () => {
+    const reply = window.__delayedUpdateSnapshot;
+    window.__releaseUpdateDownloadReply();
+    await window.__updateDownloadAction;
+    return { phase: reply.phase, revision: reply.snapshotRevision };
+  });
+  assert.equal(delayedSnapshot.phase, "downloading");
+  assert.match(delayedSnapshot.revision, /^\d+$/);
+  assert.equal(await page.locator(".update-progress").count(), 0, "a delayed Downloading reply cannot regress Ready");
+  assert.equal(await page.getByRole("button", { name: "Reiniciar e instalar" }).isVisible(), true);
+  results.snapshotOrder = "Ready permanece após a resposta anterior de download chegar pelo outro transporte";
   await page.getByRole("button", { name: "Instalar ao fechar" }).click();
   await page.waitForSelector(".update-overlay[hidden]", { state: "attached" });
   assert.equal(await page.evaluate(() => window.__TAURI__.core.invoke("update_status").then(s => s.installOnClose)), true);
@@ -39,6 +67,40 @@ try {
   assert.equal(await page.locator(".update-overlay [data-close]").isHidden(), true, "the dialog stays open while installing");
   results.install = "download com progresso, instalar ao fechar, reiniciar e instalar";
   await page.close();
+
+  const retry = await open({ version: "0.6.0", notes: NOTES });
+  await retry.waitForSelector(dialog, { timeout: 8000 });
+  await retry.getByRole("button", { name: "Atualizar agora" }).click();
+  await retry.getByRole("button", { name: "Reiniciar e instalar" }).waitFor({ timeout: 8000 });
+  await retry.evaluate(() => {
+    window.__saveBeforeUpdate = saveCases;
+    saveCases = async () => false;
+    const invoke = window.__TAURI__.core.invoke;
+    window.__updateInstallCalls = 0;
+    window.__TAURI__.core.invoke = (name, args) => {
+      if (name === "update_install") {
+        window.__updateInstallCalls++;
+        if (window.__updateLaunchFailure) return Promise.reject("O instalador não iniciou.");
+      }
+      return invoke(name, args);
+    };
+  });
+  await retry.getByRole("button", { name: "Reiniciar e instalar" }).click();
+  await retry.getByRole("button", { name: "Tentar novamente" }).waitFor();
+  assert.match(await retry.textContent(".update-error"), /salvar os casos/);
+  assert.equal(await retry.evaluate(() => window.__updateInstallCalls), 0);
+  await retry.getByRole("button", { name: "Baixar manualmente" }).click();
+  assert.equal(await retry.evaluate(() => window.__mockOpenedRelease), "0.6.0");
+  await retry.evaluate(() => { saveCases = window.__saveBeforeUpdate; window.__updateLaunchFailure = true; });
+  await retry.getByRole("button", { name: "Tentar novamente" }).click();
+  await retry.waitForFunction(() => document.querySelector(".update-error")?.textContent.includes("instalador não iniciou"));
+  assert.equal(await retry.locator(".update-overlay [data-close]").isVisible(), true);
+  await retry.evaluate(() => { window.__updateLaunchFailure = false; });
+  await retry.getByRole("button", { name: "Tentar novamente" }).click();
+  await retry.waitForFunction(() => document.querySelector(".update-lead")?.textContent.startsWith("Instalando"));
+  assert.equal(await retry.evaluate(() => window.__updateInstallCalls), 2);
+  results.recovery = "salvamento rejeitado impede instalação; falha de lançamento mantém janela e oferece download manual e nova tentativa";
+  await retry.close();
 
   const skip = await open({ version: "0.6.0", notes: NOTES });
   await skip.waitForSelector(dialog, { timeout: 8000 });

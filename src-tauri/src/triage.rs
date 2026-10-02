@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
 fn source_key(state: &AppState) -> String {
-    match &*state.source.read() {
+    match &*crate::analysis_runtime::source(&state) {
         SourceData::Indexed(idx) => format!(
             "idx:{}:{}",
             idx.lines.len(),
@@ -51,12 +51,13 @@ pub fn stored_analysis(
         .map(|s| s.expires.is_some_and(|t| t <= chrono::Utc::now().timestamp_millis()))
         .collect();
     let key = format!(
-        "{}|{:p}|{:p}|{}|{}|{:?}",
+        "{}|{}|{:p}|{:p}|{}|{}|{:?}",
+        crate::analysis_runtime::cache_namespace(),
         case_events.map(case_key).unwrap_or_else(|| source_key(state)),
         Arc::as_ptr(&rules),
         catalog.as_ref().map(Arc::as_ptr).unwrap_or(std::ptr::null()),
         serde_json::to_string(&settings).unwrap_or_default(),
-        state.derived.read().len(),
+        crate::analysis_runtime::derived(&state).len(),
         expired,
     );
     if !force {
@@ -113,9 +114,7 @@ fn saved_path(
     if !source.starts_with("idx:") {
         return None;
     }
-    let derived: Vec<String> = state
-        .derived
-        .read()
+    let derived: Vec<String> = crate::analysis_runtime::derived(&state)
         .iter()
         .map(|d| {
             let rules: Vec<String> = d
@@ -128,6 +127,7 @@ fn saved_path(
         .collect();
     let mut hash = Sha256::new();
     hash.update(env!("CARGO_PKG_VERSION"));
+    hash.update(crate::analysis_runtime::cache_namespace());
     hash.update(source);
     hash.update(detections::fingerprint().to_le_bytes());
     hash.update(serde_json::to_string(settings).unwrap_or_default());
@@ -224,17 +224,20 @@ pub async fn triage_timeline(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     minimum_evidence: Option<u8>,
     start: i64,
     end: i64,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    crate::offload(move || {
-        let case = crate::case_cache::resolve(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        let case = case_events;
         timeline_impl(
             app.state::<AppState>().inner(),
             filters,
-            case.as_deref().map(|v| v.as_slice()),
+            case.as_deref(),
             minimum_evidence.unwrap_or(5),
             start,
             end,
@@ -403,6 +406,8 @@ pub async fn triage(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     force: Option<bool>,
     minimum_evidence: Option<u8>,
     episode_offset: Option<usize>,
@@ -410,13 +415,14 @@ pub async fn triage(
     tactic: Option<String>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
-        let events = crate::case_cache::resolve(case_events, case_key)?;
+        let events = case_events;
         triage_page(
             state.inner(),
             filters,
-            events.as_deref().map(|v| v.as_slice()),
+            events.as_deref(),
             force.unwrap_or(false),
             minimum_evidence.unwrap_or(5),
             episode_offset.unwrap_or(0),
@@ -433,8 +439,14 @@ pub async fn triage_episode(
     episode_id: String,
     offset: Option<usize>,
     limit: Option<usize>,
+    case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
+    app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |_case_events| {
         detections::cached_analysis(&analysis_id).ok_or("Análise expirada; recarregue a triagem")?.episode_members(
             &episode_id,
             offset.unwrap_or(0),
@@ -476,16 +488,19 @@ pub async fn triage_evidence_event(
     event_id: usize,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Event, String> {
-    crate::offload(move || {
-        let case = crate::case_cache::resolve(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        let case = case_events;
         evidence_event_impl(
             app.state::<AppState>().inner(),
             &analysis_id,
             &event_ref,
             event_id,
-            case.as_deref().map(|v| v.as_slice()),
+            case.as_deref(),
         )
     })
     .await?
@@ -587,11 +602,21 @@ pub async fn event_insights(
     event: Event,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<EventInsights, String> {
-    crate::offload(move || {
-        let case = crate::case_cache::resolve(case_events, case_key)?;
-        insights_in_context(app.state::<AppState>().inner(), &event, case.as_deref().map(|v| v.as_slice()))
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        let case = case_events;
+        if crate::analysis_runtime::visibility_restricted() {
+            let visible = match case.as_deref() {
+                Some(events) => events.iter().any(|candidate| candidate.event_ref == event.event_ref && candidate.id == event.id),
+                None => crate::event_detail_raw(app.state::<AppState>().inner(), event.id).is_some_and(|candidate| candidate.event_ref == event.event_ref),
+            };
+            if !visible { return Err("O evento não pertence à análise visível atual.".into()); }
+        }
+        insights_in_context(app.state::<AppState>().inner(), &event, case.as_deref())
     })
     .await?
 }

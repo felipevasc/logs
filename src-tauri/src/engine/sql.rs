@@ -67,14 +67,18 @@ fn literal(value: bool) -> String {
 /// casting it would hide its zonemaps from the optimizer. Exotic/non-finite
 /// bounds keep the established Rust comparison path.
 fn integer_range(column: &str, pf: &PreparedFilter) -> Option<String> {
-    const EXACT: f64 = 9_007_199_254_740_991.0;
     let (first, second) = pf.numeric_bounds();
+    integer_bounds(column, &pf.f.op, first, second)
+}
+
+fn integer_bounds(column: &str, op: &str, first: Option<f64>, second: Option<f64>) -> Option<String> {
+    const EXACT: f64 = 9_007_199_254_740_991.0;
     let first = match first {
         Some(n) if n.is_finite() && n.abs() <= EXACT => n,
         None => return Some("FALSE".into()),
         _ => return None,
     };
-    let comparison = match pf.f.op.as_str() {
+    let comparison = match op {
         "gt" => format!("{column} > {}", first.floor() as i64),
         "gte" => format!("{column} >= {}", first.ceil() as i64),
         "lt" => format!("{column} < {}", first.ceil() as i64),
@@ -161,13 +165,26 @@ impl Schema {
     /// guaranteed to contribute that token, including within a UUID.
     /// Metadata, role aliases, skipped path fields and structured values do
     /// not have that coverage proof and retain their existing SQL predicate.
+    /// A dot in an exact stored key is literal here (`Event::col_ref`), not
+    /// query-language nested traversal; the full key must exist in `fields`.
     fn exact_hex_field(&self, column: &str, value: &str) -> bool {
         super::text::exact_field_hex_word(value).is_some()
             && !column.starts_with(['@', '_'])
-            && !column.contains('.')
             && !matches!(column, "id" | "event_ref" | "timestamp" | "source" | "level" | "code" | "name" | "description" | "message" | "raw" | "arquivo" | "caminho")
             && self.fields.contains_key(column)
             && !self.structured.contains(column)
+    }
+
+    /// Exact grouping text as Ctx::get(field_ref(...)) sees it. Unsupported
+    /// nested/ambiguous fields keep the bounded event path; NULL stays absent,
+    /// while empty and whitespace-only strings remain real keys.
+    pub(crate) fn grouped_field(&self, field: &crate::querylang::FieldRef, names: &mut bool) -> Option<String> {
+        let (name, role) = field.parts();
+        match self.ctx_value(name, role, names) {
+            Val::Sql(value) => Some(value),
+            Val::Absent => Some(NULL_TEXT.into()),
+            Val::Unsupported => None,
+        }
     }
 
     /// Value the search language reads for a field (`Ctx::field`).
@@ -270,9 +287,10 @@ impl Schema {
             };
             if let Some(column) = direct {
                 if let Some(sql) = integer_range(column, pf) {
-                    return Decision::Sql(sql);
+                    return Decision::Sql(if column == "ts" { format!("(ts <> 0 AND {sql})") } else { sql });
                 }
-                return Decision::Sql(tests.number(column, Arc::new(move |n| number_matches(&owned, n))));
+                let value = if column == "ts" { "NULLIF(ts, 0)" } else { column };
+                return Decision::Sql(tests.number(value, Arc::new(move |n| number_matches(&owned, n))));
             }
             return match self.value(&f.column, names) {
                 Val::Sql(value) => Decision::Sql(tests.text(
@@ -334,8 +352,17 @@ impl Schema {
         match term.kind() {
             TermKind::Event => ("TRUE".into(), false),
             TermKind::Number if name == "timestamp" => {
+                if let Some((op, first, second)) = term.numeric_bounds() {
+                    if let Some(comparison) = integer_bounds("ts", op, Some(first), second) {
+                        // Unlike top-level filter chips, a term may appear
+                        // below NOT/OR. Rust treats an absent timestamp as
+                        // false, so retain a two-valued expression here.
+                        return (format!("(ts IS NOT NULL AND ts <> 0 AND {comparison})"), true);
+                    }
+                }
                 let term = term.clone();
-                (tests.number("ts", Arc::new(move |n| n.is_some_and(|n| term.number_matches(n)))), true)
+                let test = tests.number("NULLIF(ts, 0)", Arc::new(move |n| n.is_some_and(|n| term.number_matches(n))));
+                (format!("(ts IS NOT NULL AND ts <> 0 AND {test})"), true)
             }
             _ => match self.ctx_value(name, role, names) {
                 Val::Sql(value) => {
@@ -415,7 +442,7 @@ mod native_predicate_tests {
         assert!(plan.exact());
         assert_eq!(plan.tests.hex_fields.len(), 1);
         assert!(plan.tests.hex_fields[0].fallback_sql.contains("w0 ="));
-        for column in ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw", "arquivo", "caminho", "@user", "nested.id", "_meta"] {
+        for column in ["id", "event_ref", "timestamp", "source", "level", "code", "name", "description", "message", "raw", "arquivo", "caminho", "@user", "_meta"] {
             schema.fields.insert(column.into(), "w1".into());
             assert!(!schema.exact_hex_field(column, hex), "{column}");
         }
@@ -428,6 +455,55 @@ mod native_predicate_tests {
         assert!(schema.plan(&[filter("trace_id", "not_equals_exact", hex, None)]).tests.hex_fields.is_empty());
         schema.structured.insert("trace_id".into());
         assert!(!schema.exact_hex_field("trace_id", hex));
+    }
+
+    #[test]
+    fn dotted_hex_equality_requires_the_exact_stored_scalar_key() {
+        let mut schema = Schema::default();
+        let hex = "0123456789abcdef0123456789abcdef";
+        schema.fields.insert("trace.id".into(), "w0".into());
+        schema.fields.insert("Trace.ID".into(), "w1".into());
+        schema.fields.insert("trace".into(), "w2".into());
+        // A structured parent cannot manufacture a literal child column. It
+        // also cannot hide a separately stored exact child key.
+        schema.structured.insert("trace".into());
+        for (column, sql_column) in [("trace.id", "w0"), ("Trace.ID", "w1")] {
+            let plan = schema.plan(&[filter(column, "equals_exact", hex, None)]);
+            assert!(plan.exact());
+            assert_eq!(plan.tests.hex_fields.len(), 1);
+            let candidate = &plan.tests.hex_fields[0];
+            assert_eq!(candidate.filter.f.column, column);
+            assert_eq!(candidate.fallback_sql, format!("({sql_column} = '{hex}')"));
+        }
+        for column in ["trace.ID", "trace.nested.id", "missing.child", "@trace.id", "_trace.id"] {
+            assert!(!schema.exact_hex_field(column, hex), "{column}");
+        }
+        schema.structured.insert("trace.id".into());
+        assert!(schema.plan(&[filter("trace.id", "equals_exact", hex, None)]).tests.hex_fields.is_empty());
+        assert!(schema.exact_hex_field("Trace.ID", hex));
+    }
+
+    #[test]
+    fn dotted_query_expression_terms_never_establish_required_hex_equality() {
+        let mut schema = Schema::default();
+        let hex = "0123456789abcdef0123456789abcdef";
+        schema.fields.insert("trace.id".into(), "w0".into());
+        for op in ["equals", "not_equals_exact", "contains", "in_exact"] {
+            assert!(schema.plan(&[filter("trace.id", op, hex, None)]).tests.hex_fields.is_empty(), "{op}");
+        }
+        for expression in [
+            format!("trace.id:\"{hex}\""),
+            format!("NOT trace.id:\"{hex}\""),
+            format!("trace.id:\"{hex}\" OR source:other"),
+            format!("NOT (trace.id:\"{hex}\" OR NOT source:other)"),
+            format!("trace.id:\"{hex}\" AND source:other"),
+        ] {
+            let query = filter("_all", "query", &expression, None);
+            assert!(query.expr.is_some(), "fixture must compile: {expression}");
+            assert!(schema.plan(std::slice::from_ref(&query)).tests.hex_fields.is_empty(), "{expression}");
+            let plan = schema.plan(&[filter("trace.id", "equals_exact", hex, None), query]);
+            assert_eq!(plan.tests.hex_fields.len(), 1, "only the required top-level equality: {expression}");
+        }
     }
 
     #[test]
@@ -460,4 +536,147 @@ mod native_predicate_tests {
         assert!(!plan.sql.contains("li_test"));
         assert!(!plan.sql.contains("li_ntest"));
     }
+
+    fn timestamp_connection() -> (duckdb::Connection, Vec<Option<i64>>) {
+        let connection = duckdb::Connection::open_in_memory().unwrap();
+        super::super::udf::register(&connection).unwrap();
+        connection.execute_batch("SET threads=1; CREATE TABLE times (ordinal INTEGER, ts BIGINT)").unwrap();
+        let times = vec![None, Some(i64::MIN), Some(-9_007_199_254_740_993),
+            Some(-9_007_199_254_740_992), Some(-9_007_199_254_740_991),
+            Some(-2), Some(-1), Some(0), Some(1), Some(2), Some(10), Some(11),
+            Some(1_700_000_000_000), Some(9_007_199_254_740_991),
+            Some(9_007_199_254_740_992), Some(9_007_199_254_740_993), Some(i64::MAX)];
+        for (ordinal, timestamp) in times.iter().enumerate() {
+            connection.execute("INSERT INTO times VALUES (?, ?)", duckdb::params![ordinal as i32, timestamp]).unwrap();
+        }
+        (connection, times)
+    }
+
+    fn assert_timestamp_expression(connection: &duckdb::Connection, times: &[Option<i64>], expression: &Expr, native: bool) {
+        let mut tests = Tests::default();
+        let (sql, exact) = Schema::default().expr(expression, &mut tests, &mut false);
+        assert!(exact);
+        assert_eq!(!sql.contains("li_ntest"), native, "{expression:?}: {sql}");
+        let actual: Vec<Option<bool>> = connection.prepare(&format!("SELECT {sql} FROM times ORDER BY ordinal"))
+            .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        let expected: Vec<_> = times.iter().map(|timestamp| {
+            let mut event = crate::model::Event::empty();
+            event.timestamp = *timestamp;
+            Some(expression.matches_indexed(&event))
+        }).collect();
+        assert_eq!(actual, expected, "{expression:?}: {sql}");
+    }
+
+    #[test]
+    fn timestamp_terms_use_native_bounds_with_exact_nested_boolean_semantics() {
+        let (connection, times) = timestamp_connection();
+        for source in ["timestamp>10.5", "timestamp>=-1.5", "timestamp<10.5", "timestamp<=-1.5",
+            "timestamp:-1.5..2.5", "timestamp>=0", "timestamp<=0",
+            "time>=1700000000000", "timestamp>=9007199254740991", "timestamp<=-9007199254740991"] {
+            for text in [source.to_string(), format!("NOT ({source})"),
+                format!("NOT (NOT ({source}))"),
+                format!("({source}) OR timestamp>=1700000000000"),
+                format!("NOT (({source}) OR NOT (timestamp>=0))"),
+                format!("({source}) AND NOT (timestamp:0..2)")] {
+                let expression = crate::querylang::compile_rule(&text).unwrap();
+                assert_timestamp_expression(&connection, &times, &expression, true);
+            }
+        }
+    }
+
+    #[test]
+    fn timestamp_terms_keep_rust_comparison_for_extreme_and_nonfinite_bounds() {
+        use crate::querylang::{not, or, term, Spec};
+        let (connection, times) = timestamp_connection();
+        for bound in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 9_007_199_254_740_992.0,
+            -9_007_199_254_740_992.0, i64::MAX as f64, i64::MIN as f64] {
+            for operation in [Spec::Gt as fn(f64) -> Spec, Spec::Gte, Spec::Lt, Spec::Lte] {
+                for shape in 0..3 {
+                    let expression = term(Some("timestamp"), None, operation(bound)).unwrap();
+                    let expression = match shape {
+                        0 => expression,
+                        1 => not(expression),
+                        _ => not(or(vec![expression, term(Some("timestamp"), None, Spec::Gte(0.0)).unwrap()])),
+                    };
+                    assert_timestamp_expression(&connection, &times, &expression, false);
+                }
+            }
+        }
+        for source in ["timestamp:0..9007199254740992", "NOT timestamp:-9007199254740992..0"] {
+            assert_timestamp_expression(&connection, &times, &crate::querylang::compile_rule(source).unwrap(), false);
+        }
+    }
+
+    #[test]
+    fn timestamp_chips_and_indexed_verification_treat_zero_as_missing_but_ids_do_not() {
+        let (connection, times) = timestamp_connection();
+        let schema = Schema::default();
+        for (op, value, second) in [("gt", "-1000", None), ("gte", "0", None),
+            ("lt", "1000", None), ("lte", "0", None), ("between", "-1000", Some("1000")),
+            ("lt", "9007199254740992", None), ("gt", "-9007199254740992", None)] {
+            let pf = filter("timestamp", op, value, second);
+            let plan = schema.plan(std::slice::from_ref(&pf));
+            assert!(plan.exact());
+            let actual: Vec<i32> = connection.prepare(&format!("SELECT ordinal FROM times WHERE {} ORDER BY ordinal", plan.sql))
+                .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+            let expected: Vec<i32> = times.iter().enumerate().filter_map(|(ordinal, timestamp)| {
+                let mut event = crate::model::Event::empty(); event.timestamp = *timestamp;
+                crate::query::matches_indexed(&event, &pf).then_some(ordinal as i32)
+            }).collect();
+            assert_eq!(actual, expected, "{op} {value}");
+            assert!(!actual.contains(&7), "epoch zero is absent for numeric timestamp filters");
+        }
+        assert!(crate::query::number_matches(&filter("id", "gte", "0", None), Some(0.0)));
+        assert_eq!(integer_range("id", &filter("id", "gte", "0", None)).as_deref(), Some("(id >= 0)"));
+        // A field called timestamp inside a nested object is not event metadata.
+        assert!(crate::querylang::compile_rule("timestamp>=0").unwrap().matches_object(
+            &serde_json::json!({"timestamp":0}).as_object().unwrap().clone()));
+    }
+}
+
+#[cfg(test)]
+mod regex_program_reuse_tests {
+    use super::Schema;
+    use crate::query::{prepare, value_matches, Filter};
+    use crate::query_regex::testing;
+
+    fn filter(op: &str, value: &str) -> Filter {
+        Filter { column: "message".into(), op: op.into(), value: value.into(), value2: None }
+    }
+
+    #[test]
+    fn validation_execution_and_sql_planning_share_the_same_ordinary_program() {
+        for (credits, expected) in [(96 << 20, 1), (16 << 20, 8)] {
+            let (_, builds) = testing::run(credits, || {
+                let filters = [filter("regex", r"(?i)failed\s+login")];
+                // The UI and native command each validate before execution.
+                crate::workspace::validate(&filters).unwrap();
+                crate::workspace::validate(&filters).unwrap();
+                for _ in 0..3 {
+                    let pfs = prepare(&filters);
+                    assert!(value_matches(&pfs[0], Some("FAILED login")));
+                    assert!(!value_matches(&pfs[0], Some("successful login")));
+                    // SQL owns another PreparedFilter for its UDF.
+                    let plan = Schema::default().plan(&pfs);
+                    assert!(plan.exact());
+                }
+            });
+            assert_eq!(builds, expected);
+        }
+    }
+
+    #[test]
+    fn expression_literals_and_wildcard_lists_reuse_only_their_programs() {
+        let (_, builds) = testing::run(96 << 20, || {
+            let filters = [filter("query", "message:/alpha/ AND path:adm* AND field:(one* OR two*)")];
+            for _ in 0..3 {
+                crate::workspace::validate(&filters).unwrap();
+                let pfs = prepare(&filters);
+                assert!(pfs[0].expr.is_some());
+                let _plan = Schema::default().plan(&pfs);
+            }
+        });
+        assert_eq!(builds, 4, "the expression is rebuilt; its four immutable programs are reused");
+    }
+
 }

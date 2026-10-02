@@ -3,7 +3,7 @@ window.Security = (() => {
   "use strict";
   const SEVERITY = { critical: ["Crítica", 4], high: ["Alta", 3], medium: ["Média", 2], low: ["Baixa", 1], info: ["Informativa", 0] };
   const sevLabel = s => SEVERITY[s]?.[0] || s;
-  const results = new Map();
+  const results = new Map(), analysisRequests = new WeakMap();
   const pending = new Map();
   const names = new Map();
   let tacticFilter = null;
@@ -11,7 +11,7 @@ window.Security = (() => {
   let lastData = null;
   let minimumEvidence = 5, universe = "", summarySlots = null;
   const evidence = () => window.EvidenceUI;
-  const universeKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig(true) : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
+  const universeKey = () => JSON.stringify([window.AnalysisContexts?.capture(), workspaceScope(), workspaceScope() === "case" ? caseSig(true) : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
   function syncUniverse() { const next = universeKey(); if (next !== universe) { universe = next; minimumEvidence = 5; } }
   function setMinimum(n) {
     if (!Number.isInteger(n) || n < 1 || n > 5) return;
@@ -36,6 +36,7 @@ window.Security = (() => {
   let fullCaseKey = "", fullCaseRows = [];
   function fullRequest() {
     if (workspaceScope() !== "case") return { filters: [] };
+    if (window.CaseEvidence?.active === true) return { filters: [], caseEvents: caseEvents("analysis-all") };
     const sig = caseSig(true);
     if (sig !== fullCaseKey) { fullCaseKey = sig; fullCaseRows = caseEventsCompute(true); }
     return { filters: [], caseEvents: fullCaseRows };
@@ -59,9 +60,9 @@ window.Security = (() => {
     const k = key();
     if (!force && results.has(k)) return results.get(k);
     if (!force && pending.has(k)) return pending.get(k);
-    const request = fullRequest();
-    const promise = api("triage", { ...request, force, minimumEvidence: minimumEvidence, episodeLimit: 20 }, { silent: true }).then(data => {
-      remember(data);
+    const request = fullRequest(), owner = window.AnalysisContexts?.capture();
+    const promise = api("triage", { ...request, force, minimumEvidence: minimumEvidence, episodeLimit: 20 }, { silent: true, analysisOwner: owner }).then(data => {
+      analysisRequests.set(data, { request, owner }); remember(data);
       if (k === key()) { results.set(k, data); lastData = data; if (results.size > 8) results.delete(results.keys().next().value); }
       return data;
     }).finally(() => pending.delete(k));
@@ -72,16 +73,23 @@ window.Security = (() => {
   let pageGeneration = 0;
   async function loadStoredPage(offset) {
     const generation=++pageGeneration, context=key(), level=minimumEvidence;
-    const request=fullRequest();
-    const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter},{silent:true});
+    const request=fullRequest(),owner=window.AnalysisContexts?.capture();
+    const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter},{silent:true,analysisOwner:owner});
+    analysisRequests.set(data,{request,owner});
     if(generation!==pageGeneration || context!==key() || level!==minimumEvidence)return;
     results.set(context,data);lastData=data;remember(data);
     if(summarySlots?.attention?.isConnected){drawAttention(summarySlots.attention,data);if(summarySlots.entities)drawEntities(summarySlots.entities,data);}
   }
+  function episodeRequest(data) {
+    const captured = analysisRequests.get(data);
+    if (!captured && window.AnalysisContexts) throw new Error("Reabra a análise antes de consultar suas evidências.");
+    if (captured?.owner) window.AnalysisContexts.assertOwner(captured.owner);
+    return captured || { request: fullRequest(), owner: null };
+  }
   async function completeEpisode(data,episode) {
     if(episode.members_complete!==false)return episode.detections.map(i=>data.detections[i]);
-    const detections=[];let offset=0;
-    do {const page=await api("triage_episode",{analysisId:data.analysis_id,episodeId:episode.id,offset,limit:100},{silent:true});
+    const captured=episodeRequest(data),detections=[];let offset=0;
+    do {const page=await api("triage_episode",{...captured.request,analysisId:data.analysis_id,episodeId:episode.id,offset,limit:100},{silent:true,analysisOwner:captured.owner});
       if(page.analysis_id!==data.analysis_id)throw new Error("A análise mudou durante a leitura das evidências");
       detections.push(...page.detections);offset=page.next_offset;
     } while(offset!=null);
@@ -119,8 +127,31 @@ window.Security = (() => {
     if (workspaceScope() === "case") { toast("Estes registros já pertencem ao Caso.", "info"); return; }
     const contextBefore = universeKey();
     const ids = [...new Set(detections.flatMap(d => d.event_ids))];
-    const membersById=new Map();
-    for(const d of detections)for(const member of d.evidence_members || [])if(!membersById.has(member.event_id))membersById.set(member.event_id,member);
+    if (window.CaseEvidence?.active === true && (!ids.length || ids.length > 10000)) { toast("Selecione um achado com 1 a 10.000 registros de apoio para preservar.", "info"); return; }
+    const membersById=new Map(), ambiguousIds=new Set();
+    for(const d of detections)for(const member of d.evidence_members || []){if(!membersById.has(member.event_id))membersById.set(member.event_id,member);else if(membersById.get(member.event_id).event_ref!==member.event_ref)ambiguousIds.add(member.event_id);}
+    if (window.CaseEvidence?.active === true) {
+      try {
+        const c = ensureCase(), owner = await window.AnalysisContexts.prepare(window.AnalysisContexts.capture(), { metadata: true });
+        const current = () => activeCase() === c && workspaceScope() === "dataset" && universeKey() === contextBefore && window.AnalysisContexts.isCurrent(owner);
+        if (!current()) throw Error("O conjunto mudou. Reabra o achado antes de preservá-lo.");
+        const handles = ids.map(id => {
+          const member = membersById.get(id);
+          if (ambiguousIds.has(id) || !member?.event_ref) throw Error("A referência original do achado está ausente ou é ambígua.");
+          return { id, eventRef: member.event_ref };
+        });
+        const actions = nativeEvidenceServices().actions, selected = await actions.selection(handles, { guard: current });
+        if (!current()) throw Error("O conjunto mudou durante a preparação do achado.");
+        const references = [...new Set(handles.map(row => row.eventRef))], filters = [{ column: "event_ref", op: "in_exact", value: references.join("\n") }];
+        let start = Infinity, end = -Infinity; for (const detection of detections) { start = Math.min(start, detection.start ?? Infinity); end = Math.max(end, detection.end ?? -Infinity); }
+        const artifact = registerCurrentArtifact(c);
+        await actions.add(selected, { id: "i" + Date.now().toString(36) + Math.floor(Math.random() * 1e4), kind: "grupo", label: title, note: summary, createdAt: Date.now(),
+          sourceFilters: filters, sourceSpec: structuredClone(state.currentArtifact?.source), foundCount: handles.length, tags: ["detecção"], relevance: detections.some(d => SEVERITY[d.severity]?.[1] >= 3) ? "importante" : "normal", origin: state.currentOrigin, artifactId: artifact?.id || state.currentArtifact?.id, stationId: null,
+          detection: { ...evidence().exportMetadata(data, minimumEvidence, workspaceScope()), analyst_state: "unreviewed", ...(grouping ? { grouping: structuredClone(grouping) } : {}), detections: structuredClone(detections), start: Number.isFinite(start) ? start : null, end: Number.isFinite(end) ? end : null } }, { guard: current });
+        if (artifact) queueCustody(artifact); updateCountsSafe(); window.WorkspaceContext?.refreshMembership?.(); toast("Achado salvo com suas ocorrências preservadas no Caso.", "ok");
+      } catch (error) { toast(`Não foi possível preservar o achado: ${String(error.message || error)}`, "err"); }
+      return;
+    }
     const rows = [];
     for (const id of ids) { try {
       const member=membersById.get(id);
@@ -298,7 +329,9 @@ window.Security = (() => {
     const episodeOf = node => data.episodes[+node.closest("[data-episode]").dataset.episode];
     const loadMembers = async (article,offset) => {
       const episode=episodeOf(article),limit=episode.grouping?.kind==='pattern'?20:100;
-      const page=await api("triage_episode",{analysisId:data.analysis_id,episodeId:episode.id,offset,limit},{silent:true});
+      const captured=episodeRequest(data);
+      const page=await api("triage_episode",{...captured.request,analysisId:data.analysis_id,episodeId:episode.id,offset,limit},{silent:true,analysisOwner:captured.owner});
+      if (!article.isConnected) return;
       article.__detailMembers=page.detections.map(d=>({...d,context_only:(d.evidence_level||0)<minimumEvidence || !!(tacticFilter&&!d.tactics.includes(tacticFilter))}));
       article.querySelector(".sec-detections").innerHTML=detectionRows({...data,detections:article.__detailMembers},{...episode,detections:page.detections.map((_,i)=>i)})+`<p class="small">Indícios ${offset+1}–${offset+page.detections.length} de ${page.total}</p>${offset>0?`<button class="btn ghost" data-members-offset="${Math.max(0,offset-limit)}">Anteriores</button>`:""}${page.next_offset!=null?`<button class="btn ghost" data-members-offset="${page.next_offset}">Próximos indícios</button>`:""}`;
     };

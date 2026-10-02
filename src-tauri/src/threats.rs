@@ -817,13 +817,13 @@ fn visit(
         memory(events);
         return operations::check();
     }
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     match &*source {
         SourceData::Memory(events) => memory(events),
         SourceData::Indexed(index) => {
             let codes = state.codes.read();
             let system = state.system_codes.read();
-            let derived = state.derived.read();
+            let derived = crate::analysis_runtime::derived(&state);
             query::visit_indexed_mapped(index, &prepared, &codes, &system, &derived, analyze, |_, event, (body, ids)| {
                 visitor(event, body, ids)
             })?;
@@ -968,6 +968,12 @@ fn events_impl(
         filters.push(Filter { column: "_all".into(), op: "threat_rule".into(), value: "*".into(), value2: None });
     }
     validate_local(&filters, &catalog)?;
+    let proof_index = if case.is_none() {
+        let source = crate::analysis_runtime::source(state);
+        match &*source { SourceData::Indexed(index) => Some(crate::analysis_runtime::clone_index(index)), _ => None }
+    } else { None };
+    let binding = proof_index.as_ref().map(|index| crate::analysis_runtime::source_set(index).map(|binding| (index, binding))).transpose()?;
+    let mut provenance_failure = None;
     let (ordinary, predicates) = split_filters(&filters, &catalog)?;
     let mut result = EventResult { total: 0, rows: vec![], complete: true, clipped_records: 0, rows_clipped: 0 };
     visit(state, &ordinary, case.as_deref(), &catalog, false, |event, body, _| {
@@ -980,12 +986,14 @@ fn events_impl(
         }
         result.total += 1;
         if result.total > offset && result.rows.len() < limit.clamp(1, 200) {
-            let (row, clipped) = preview(event);
+            let (mut row, clipped) = preview(event);
+            if let Some((index, binding)) = &binding { if let Err(error) = crate::analysis_runtime::attach_provenance_with(index, binding, &mut row) { provenance_failure = Some(error); return; } }
             result.rows_clipped += usize::from(clipped);
             result.rows.push(row);
         }
     })?;
     operations::check()?;
+    if let Some(error) = provenance_failure { return Err(error); }
     result.complete = result.clipped_records == 0;
     Ok(result)
 }
@@ -1003,10 +1011,12 @@ pub async fn threat_scan(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: tauri::AppHandle,
 ) -> Result<ScanResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let path = path();
         let catalog = load_path(&path)?;
         scan_impl(
@@ -1027,12 +1037,14 @@ pub async fn threat_events(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     offset: Option<usize>,
     limit: Option<usize>,
     app: tauri::AppHandle,
 ) -> Result<EventResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         events_impl(
             app.state::<AppState>().inner(),
             filters,
@@ -1058,6 +1070,7 @@ mod tests {
     fn state(source: SourceData) -> AppState {
         AppState {
             source: parking_lot::RwLock::new(source),
+            source_publication: parking_lot::RwLock::new(Default::default()),
             source_names: parking_lot::RwLock::new(vec![]),
             codes: parking_lot::RwLock::new(Default::default()),
             system_codes: parking_lot::RwLock::new(Default::default()),

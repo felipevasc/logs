@@ -2629,6 +2629,7 @@ fn rarity(maps: &[HashMap<Box<str>, RareStat>; 5], totals: &[usize; 5]) -> Vec<R
 // ------------------------------------------------------------------ cache
 
 pub struct CachedTriage {
+    namespace: String,
     pub key: String,
     pub result: Arc<crate::security_results::Results>,
 }
@@ -2645,11 +2646,11 @@ pub fn remember(key: String, result: Arc<crate::security_results::Results>) {
     if cache.len() >= 4 {
         cache.remove(0);
     }
-    cache.push(CachedTriage { key, result });
+    cache.push(CachedTriage { key, result, namespace: crate::analysis_runtime::cache_namespace() });
 }
 
 pub fn cached_analysis(id: &str) -> Option<Arc<crate::security_results::Results>> {
-    TRIAGE_CACHE.lock().iter().find(|c| c.result.metadata["analysis_id"].as_str() == Some(id)).map(|c| c.result.clone())
+    TRIAGE_CACHE.lock().iter().find(|c| c.namespace == crate::analysis_runtime::cache_namespace() && c.result.metadata["analysis_id"].as_str() == Some(id)).map(|c| c.result.clone())
 }
 
 pub fn clear_cache() {

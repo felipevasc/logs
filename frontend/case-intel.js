@@ -5,7 +5,40 @@ window.CaseIntel = (() => {
   const HYPOTHESIS = ["aberta", "confirmada", "descartada"];
   const KIND_ICON = { ip: "fa-network-wired", domain: "fa-globe", hash: "fa-fingerprint", url: "fa-link", user: "fa-user", host: "fa-server", file: "fa-file", other: "fa-tag" };
   const COLUMN_KIND = { "@src_ip": "ip", "@dst_ip": "ip", "@domain": "domain", "@hash": "hash", "@url": "url", "@user": "user", "@host": "host", "@file": "file" };
-  let open = null;
+  let open = null, associationUndo = null;
+  const nativeItems = () => window.CaseEvidence?.active === true ? window.CaseEvidenceItems : null;
+  function linkedItems(c, h, bindings = nativeItems()?.index(c)) {
+    if (bindings) return bindings.associations(h, { legacyField: "items" });
+    return (h.items || []).map(id => { const matches = (c.items || []).filter(item => item.id === id); return { state: matches.length === 1 ? "unique" : matches.length ? "ambiguous" : "missing", item: matches.length === 1 ? matches[0] : null }; });
+  }
+  const associationLabel = entry => entry.item?.label || entry.item?.name || (entry.state === "ambiguous" ? "Associação ambígua" : "Associação indisponível");
+  async function editAssociations(c, h, references) {
+    try {
+      associationUndo = await nativeItems().edit(c, h, references, { legacyField: "items", save: saveCases, owns: () => activeCase() === c && (c.intel?.hypotheses || []).includes(h) });
+      refresh(); return true;
+    } catch (error) { toast(String(error.message || error), "err"); return false; }
+  }
+  async function linkItem(c, h, item) {
+    if (activeCase() !== c || !(c.items || []).includes(item) || !(c.intel?.hypotheses || []).includes(h)) return false;
+    if (nativeItems()) {
+      const refs = linkedItems(c, h).map(entry => entry.reference), reference = nativeItems().forItem(c, item);
+      if (refs.some(entry => nativeItems().key(entry) === nativeItems().key(reference))) return false;
+      return editAssociations(c, h, [...refs, reference]);
+    }
+    if (!(h.items || []).includes(item.id)) { (h.items ||= []).push(item.id); await persist(c, "Evidência vinculada à hipótese."); return true; }
+    return false;
+  }
+  function associationMenu(c, h, anchor) {
+    const entries = linkedItems(c, h), rectangle = anchor.getBoundingClientRect();
+    showCtxMenu(rectangle.left, rectangle.bottom, entries.map((entry, index) => ({ icon: "fa-link", label: `${index + 1}. ${associationLabel(entry)}`, onClick: () => {
+      if (activeCase() !== c || !(c.intel?.hypotheses || []).includes(h)) return;
+      const refs = entries.map(value => value.reference), actions = [];
+      if (entry.state === "unique") actions.push({ icon: "fa-eye", label: "Abrir item", onClick: () => nativeItems().open(entry.item) });
+      actions.push({ icon: "fa-link-slash", label: "Desassociar item", onClick: () => editAssociations(c, h, refs.filter((_, position) => position !== index)) });
+      for (const direction of [-1, 1]) if (index + direction >= 0 && index + direction < refs.length) actions.push({ icon: direction < 0 ? "fa-arrow-up" : "fa-arrow-down", label: direction < 0 ? "Mover acima" : "Mover abaixo", onClick: () => { const next = refs.slice(); [next[index], next[index + direction]] = [next[index + direction], next[index]]; return editAssociations(c, h, next); } });
+      showCtxMenu(rectangle.left, rectangle.bottom, actions);
+    } })));
+  }
   const uid = prefix => prefix + Date.now().toString(36) + Math.floor(Math.random() * 1e4);
   const intel = c => (c.intel ||= { indicators: [], hypotheses: [] });
   const kindOf = (value, column) => COLUMN_KIND[column] || COLUMN_KIND[window.EntityMenu?.guess(value)] || "other";
@@ -29,10 +62,12 @@ window.CaseIntel = (() => {
   }
 
   async function extract(c) {
-    const events = caseEvents();
-    if (!events.length) { toast("Inclua registros no Caso para extrair indicadores.", "info"); return; }
     let groups;
-    try { groups = await api("entity_summary", { filters: [], caseEvents: events, limit: 200 }); } catch { return; }
+    try {
+      const events = caseEvents("analysis");
+      if (Array.isArray(events) && !events.length) { toast("Inclua registros no Caso para extrair indicadores.", "info"); return; }
+      groups = await api("entity_summary", { filters: [], caseEvents: events, limit: 200 });
+    } catch { return; }
     let added = 0;
     for (const group of groups) {
       if (!["@src_ip", "@dst_ip", "@domain", "@hash", "@url"].includes(group.column)) continue;
@@ -97,12 +132,16 @@ window.CaseIntel = (() => {
   }
 
   function hypothesesPanel(c) {
-    const list = intel(c).hypotheses;
+    const list = intel(c).hypotheses, bindings = nativeItems()?.index(c);
     const items = c.items || [];
     const panel = el("div", "intel-panel");
     panel.innerHTML = `<div class="intel-add"><input type="text" placeholder="Nova hipótese: o que pode ter acontecido?" aria-label="Nova hipótese"></div>
-      <div class="intel-list">${list.map((h, index) => { const linked = h.items.map(id => items.find(i => i.id === id)).filter(Boolean); return `<div class="hyp-row hyp-${esc(h.status)}" data-index="${index}"><button type="button" class="hyp-status" title="Clique para mudar o estado">${esc(h.status)}</button><span class="hyp-text" title="Duplo clique para editar"></span><span class="hyp-links" title="${esc(linked.map(i => i.label || i.name).join("\n") || "Arraste evidências para cá ou use o botão direito nelas")}">${linked.length ? `${linked.length} ${linked.length === 1 ? "evidência" : "evidências"}` : "sem evidências"}</span><button type="button" class="icon-btn" data-row="remove" title="Remover" aria-label="Remover"><i class="fas fa-xmark"></i></button></div>`; }).join("")}</div>`;
+      <div class="intel-list">${list.map((h, index) => { const linked = linkedItems(c, h, bindings); return `<div class="hyp-row hyp-${esc(h.status)}" data-index="${index}"><button type="button" class="hyp-status" title="Clique para mudar o estado">${esc(h.status)}</button><span class="hyp-text" title="Duplo clique para editar"></span><button type="button" class="hyp-links" title="${esc(linked.map(associationLabel).join("\n") || "Arraste evidências para cá ou use o botão direito nelas")}">${linked.length ? `${linked.length} ${linked.length === 1 ? "evidência" : "evidências"}` : "sem evidências"}</button><button type="button" class="icon-btn" data-row="remove" title="Remover" aria-label="Remover"><i class="fas fa-xmark"></i></button></div>`; }).join("")}</div>`;
     panel.querySelectorAll(".hyp-row").forEach(row => { row.querySelector(".hyp-text").textContent = list[+row.dataset.index].text; });
+    if (associationUndo?.case === c) {
+      const undo = el("button", "btn ghost small", "Desfazer associação ou ordem"); undo.type = "button";
+      undo.onclick = async () => { const receipt = associationUndo; undo.disabled = true; try { await nativeItems().undo(receipt, { save: saveCases, owns: () => activeCase() === c }); if (associationUndo === receipt) associationUndo = null; refresh(); } catch (error) { toast(String(error.message || error), "err"); undo.disabled = false; } }; panel.append(undo);
+    }
     const input = panel.querySelector("input");
     input.onkeydown = event => {
       if (event.key !== "Enter" || !input.value.trim()) return;
@@ -113,6 +152,7 @@ window.CaseIntel = (() => {
       const row = event.target.closest(".hyp-row");
       if (!row) return;
       const h = list[+row.dataset.index];
+      if (nativeItems() && event.target.closest(".hyp-links")) return associationMenu(c, h, event.target.closest(".hyp-links"));
       if (event.target.closest(".hyp-status")) { h.status = HYPOTHESIS[(HYPOTHESIS.indexOf(h.status) + 1) % HYPOTHESIS.length]; return persist(c); }
       if (event.target.closest("[data-row='remove']")) { list.splice(+row.dataset.index, 1); return persist(c); }
     };
@@ -135,7 +175,9 @@ window.CaseIntel = (() => {
       if (!row || !id) return;
       event.preventDefault();
       const h = list[+row.dataset.index];
-      if (!h.items.includes(id)) { h.items.push(id); persist(c, "Evidência vinculada à hipótese."); }
+      if (nativeItems()) {
+        try { const payload = JSON.parse(id); if (payload.caseId !== c.id || payload.storeId !== state.cases.store.storeId) return; const entry = nativeItems().resolve(c, payload.reference); if (entry.state === "unique") void linkItem(c, h, entry.item); } catch { toast("A associação mudou. Arraste o item novamente.", "info"); }
+      } else { const matches = items.filter(item => item.id === id); if (matches.length === 1) void linkItem(c, h, matches[0]); }
     });
     return panel;
   }
@@ -157,18 +199,18 @@ window.CaseIntel = (() => {
       const item = c.items[+card.dataset.itemIndex];
       if (!item) continue;
       card.draggable = true;
-      card.addEventListener("dragstart", event => { event.dataTransfer.setData("text/case-item", item.id); event.dataTransfer.effectAllowed = "link"; });
+      card.addEventListener("dragstart", event => { if (activeCase() !== c || !c.items.includes(item)) { event.preventDefault(); return; } let data = item.id; if (nativeItems()) { try { data = JSON.stringify({ storeId: state.cases.store.storeId, caseId: c.id, reference: nativeItems().forItem(c, item) }); } catch { event.preventDefault(); return; } } event.dataTransfer.setData("text/case-item", data); event.dataTransfer.effectAllowed = "link"; });
     }
   }
   /** Extra context-menu entries for an evidence item. */
   function menuItems(item) {
-    const c = activeCase();
-    const list = c ? intel(c).hypotheses.filter(h => !h.items.includes(item.id)) : [];
-    return list.slice(0, 6).map(h => ({ icon: "fa-lightbulb", label: `Vincular a: ${h.text.slice(0, 48)}`, onClick: () => { h.items.push(item.id); persist(c, "Evidência vinculada à hipótese."); } }));
+    const c = activeCase(), bindings = nativeItems()?.index(c);
+    const list = c ? intel(c).hypotheses.filter(h => !linkedItems(c, h, bindings).some(entry => entry.item === item)) : [];
+    return list.slice(0, 6).map(h => ({ icon: "fa-lightbulb", label: `Vincular a: ${h.text.slice(0, 48)}`, onClick: () => linkItem(c, h, item) }));
   }
   /** What the reports state about the investigation; `ref(item)` names an item. */
   function synthesis(c, ref = item => item.label || "Item") {
-    const items = c?.items || [], byId = new Map(items.map(item => [item.id, item]));
+    const items = c?.items || [], bindings = nativeItems()?.index(c);
     const data = c?.intel || {};
     const techniques = new Map();
     for (const item of items) for (const d of item.detection?.detections || []) for (const a of d.attack || []) {
@@ -177,7 +219,7 @@ window.CaseIntel = (() => {
       if (r && !t.refs.includes(r)) t.refs.push(r);
     }
     return {
-      hypotheses: (data.hypotheses || []).map(h => ({ status: h.status, text: h.text, refs: (h.items || []).map(id => byId.get(id)).filter(Boolean).map(ref) })),
+      hypotheses: (data.hypotheses || []).map(h => ({ status: h.status, text: h.text, refs: linkedItems(c, h, bindings).map(entry => entry.state === "unique" ? ref(entry.item) : associationLabel(entry)) })),
       techniques: [...techniques.values()].sort((a, b) => a.id.localeCompare(b.id)),
       indicators: (data.indicators || []).map(i => ({ value: i.value, kind: i.kind, status: i.status, note: i.note || "", sightings: i.sightings || null })),
       custody: (c?.artifacts || []).filter(a => a.hashes?.files?.length).map(a => ({ label: a.label || a.path || "Artefato", at: a.hashes.at, files: a.hashes.files })),

@@ -7,7 +7,9 @@ use crate::config_dir;
 use parking_lot::Mutex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::{Error as UpdaterError, Update, UpdaterExt};
@@ -124,6 +126,8 @@ pub struct Available {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
+    /// Decimal text keeps ordering exact across JavaScript's number boundary.
+    snapshot_revision: String,
     current_version: String,
     install_kind: Kind,
     /// Why this copy cannot update itself; updates are then manual.
@@ -145,21 +149,36 @@ pub struct Status {
 }
 
 struct Inner {
+    /// Accessed only while `UpdateState::inner` is locked. Events and invoke
+    /// responses may arrive out of order, so phase names are not an ordering.
+    snapshot_revision: Cell<u128>,
     prefs: Prefs,
     phase: Phase,
     update: Option<Update>,
     /// Downloaded package, already verified against the signature and version.
-    package: Option<Vec<u8>>,
+    package: Option<Arc<Vec<u8>>>,
     downloaded: u64,
     total: Option<u64>,
     error: Option<String>,
     install_on_close: bool,
+    close_requested: Option<Instant>,
     notice: Option<Notice>,
     download: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// Abort schedules cancellation; ownership also guards synchronous work
+    /// already running between await points. Arc identity cannot wrap/reuse
+    /// while an older callback still retains its ticket.
+    download_owner: Option<Arc<()>>,
+}
+
+fn owns_download(inner: &Inner, ticket: &Arc<()>) -> bool {
+    inner.download_owner.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, ticket))
 }
 
 pub struct UpdateState {
     inner: Mutex<Inner>,
+    // A successful installer handoff must keep new work paused until exit,
+    // including when its awaiting IPC future is dropped before restart.
+    shutdown_pause: Mutex<Option<crate::operations::UpdatePause>>,
 }
 
 /// Runs before anything reads the data folder: on the first start of a version
@@ -179,7 +198,9 @@ pub fn prepare(current: &Version) -> UpdateState {
     prefs.last_run_version = Some(version);
     let _ = save_prefs(&dir, &prefs);
     UpdateState {
+        shutdown_pause: Mutex::new(None),
         inner: Mutex::new(Inner {
+            snapshot_revision: Cell::new(0),
             prefs,
             phase: Phase::Idle,
             update: None,
@@ -188,8 +209,10 @@ pub fn prepare(current: &Version) -> UpdateState {
             total: None,
             error: None,
             install_on_close: false,
+            close_requested: None,
             notice,
             download: None,
+            download_owner: None,
         }),
     }
 }
@@ -228,9 +251,11 @@ fn load_prefs(dir: &Path) -> Prefs {
 
 fn save_prefs(dir: &Path, prefs: &Prefs) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let temp = dir.join(format!("{PREFS_FILE}.tmp"));
-    std::fs::write(&temp, serde_json::to_vec_pretty(prefs).map_err(std::io::Error::other)?)?;
-    std::fs::rename(temp, dir.join(PREFS_FILE))
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    serde_json::to_writer_pretty(&mut temp, prefs).map_err(std::io::Error::other)?;
+    temp.as_file().sync_all()?;
+    temp.persist(dir.join(PREFS_FILE)).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Copies the data files (cases, settings and SQLite stores) and the imported
@@ -379,6 +404,14 @@ fn describe(error: &UpdaterError) -> String {
     }
 }
 
+fn next_snapshot_revision(sequence: &Cell<u128>) -> String {
+    // Never wrap into an older snapshot. Even one snapshot per nanosecond
+    // cannot exhaust u128 during a process lifetime.
+    let next = sequence.get().saturating_add(1);
+    sequence.set(next);
+    next.to_string()
+}
+
 fn status(app: &AppHandle, inner: &Inner) -> Status {
     let kind = Kind::current();
     let available = inner.update.as_ref().map(|update| Available {
@@ -387,6 +420,7 @@ fn status(app: &AppHandle, inner: &Inner) -> Status {
         date: update.raw_json.get("pub_date").and_then(|value| value.as_str()).map(str::to_owned),
     });
     Status {
+        snapshot_revision: next_snapshot_revision(&inner.snapshot_revision),
         current_version: app.package_info().version.to_string(),
         install_kind: kind,
         unavailable: unavailable(kind),
@@ -504,15 +538,19 @@ pub fn update_download(app: AppHandle) -> Result<Status, String> {
     inner.downloaded = 0;
     inner.total = None;
     inner.error = None;
+    let ticket = Arc::new(());
+    inner.download_owner = Some(Arc::clone(&ticket));
     let handle = app.clone();
     inner.download = Some(tauri::async_runtime::spawn(async move {
         let progress = handle.clone();
+        let progress_ticket = Arc::clone(&ticket);
         let mut shown = Instant::now();
         let result = update
             .download(
                 move |chunk, total| {
                     let state = progress.state::<UpdateState>();
                     let mut inner = state.inner.lock();
+                    if !owns_download(&inner, &progress_ticket) { return; }
                     inner.downloaded += chunk as u64;
                     inner.total = total;
                     if shown.elapsed() >= Duration::from_millis(200) {
@@ -525,10 +563,12 @@ pub fn update_download(app: AppHandle) -> Result<Status, String> {
             .await;
         let state = handle.state::<UpdateState>();
         let mut inner = state.inner.lock();
+        if !owns_download(&inner, &ticket) { return; }
         inner.download = None;
+        inner.download_owner = None;
         match result {
             Ok(package) => {
-                inner.package = Some(package);
+                inner.package = Some(Arc::new(package));
                 inner.phase = Phase::Ready;
             }
             Err(error) => {
@@ -545,6 +585,7 @@ pub fn update_download(app: AppHandle) -> Result<Status, String> {
 pub fn update_cancel(app: AppHandle, state: State<'_, UpdateState>) -> Status {
     let mut inner = state.inner.lock();
     if inner.phase == Phase::Downloading {
+        inner.download_owner = None;
         if let Some(task) = inner.download.take() {
             task.abort();
         }
@@ -557,7 +598,7 @@ pub fn update_cancel(app: AppHandle, state: State<'_, UpdateState>) -> Status {
 
 /// Takes the verified package and records the attempt, which the next start
 /// reports as installed or not.
-fn begin_install(app: &AppHandle, inner: &mut Inner) -> Result<(Update, Vec<u8>), String> {
+fn begin_install(app: &AppHandle, inner: &mut Inner) -> Result<(Update, Arc<Vec<u8>>), String> {
     let not_ready = || "Nenhuma atualização está pronta para instalar.".to_owned();
     if inner.phase != Phase::Ready {
         return Err(not_ready());
@@ -566,50 +607,91 @@ fn begin_install(app: &AppHandle, inner: &mut Inner) -> Result<(Update, Vec<u8>)
         return Err(reason);
     }
     let update = inner.update.clone().ok_or_else(not_ready)?;
-    let package = inner.package.take().ok_or_else(not_ready)?;
+    // Retain the verified bytes until process exit. A launch or worker failure
+    // must permit retry without a second download (and without losing the UI).
+    let package = inner.package.clone().ok_or_else(not_ready)?;
     inner.prefs.pending = Some(Pending {
         from: update.current_version.clone(),
         to: update.version.clone(),
     });
-    let _ = save_prefs(&config_dir(), &inner.prefs);
+    if let Err(error) = save_prefs(&config_dir(), &inner.prefs) {
+        inner.prefs.pending = None;
+        return Err(format!("Não foi possível registrar a atualização: {error}. O aplicativo continua aberto."));
+    }
     inner.phase = Phase::Installing;
     inner.install_on_close = false;
+    inner.close_requested = None;
     inner.error = None;
     publish(app, inner);
     Ok((update, package))
 }
 
-fn install_failed(app: &AppHandle, update: Update, package: Vec<u8>, error: &UpdaterError) -> String {
-    let state = app.state::<UpdateState>();
-    let mut inner = state.inner.lock();
+fn restore_failed_install(inner: &mut Inner, reason: &str) -> String {
     inner.prefs.pending = None;
-    let _ = save_prefs(&config_dir(), &inner.prefs);
-    inner.update = Some(update);
-    inner.package = Some(package);
     inner.phase = Phase::Ready;
-    let message = format!("A instalação não foi concluída: {}.", describe(error));
+    inner.install_on_close = false;
+    inner.close_requested = None;
+    let message = format!("A instalação não foi concluída: {reason}. Tente novamente ou baixe a versão manualmente. O aplicativo continua aberto.");
     inner.error = Some(message.clone());
-    publish(app, &inner);
     message
 }
 
+fn show_install_failure(app: &AppHandle, inner: &Inner) {
+    let _ = save_prefs(&config_dir(), &inner.prefs);
+    publish(app, &inner);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn install_failed(app: &AppHandle, reason: &str) -> String {
+    let state = app.state::<UpdateState>();
+    let mut inner = state.inner.lock();
+    let message = restore_failed_install(&mut inner, reason);
+    show_install_failure(app, &inner);
+    message
+}
+
+fn install_and_retain_pause(
+    pause: crate::operations::UpdatePause,
+    held: &Mutex<Option<crate::operations::UpdatePause>>,
+    install: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    // Errors and unwinding release the reversible guard. Success transfers it
+    // before the blocking task completes, leaving no admission gap at await.
+    install()?;
+    *held.lock() = Some(pause);
+    Ok(())
+}
+
 #[tauri::command]
-pub async fn update_install(app: AppHandle) -> Result<(), String> {
+pub async fn update_install(app: AppHandle, restart: Option<bool>) -> Result<(), String> {
+    let restart = restart.unwrap_or(true);
     let (update, package) = {
         let state = app.state::<UpdateState>();
         let mut inner = state.inner.lock();
+        if !restart && inner.close_requested.is_none() {
+            return Err("O pedido de instalar ao fechar foi cancelado. Tente novamente.".into());
+        }
         begin_install(&app, &mut inner)?
     };
     // On Windows the plugin starts the installer and ends this process; the installer reopens the app.
-    let (update, package, result) = tauri::async_runtime::spawn_blocking(move || {
-        let result = update.install(&package);
-        (update, package, result)
-    })
-    .await
-    .map_err(|error| error.to_string())?;
+    let handoff_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        // The guard pauses admission, cancels and joins app-owned work. On a
+        // failed launch its Drop makes the still-open source usable again.
+        let pause = crate::engine::prepare_for_update()?;
+        let state = handoff_app.state::<UpdateState>();
+        install_and_retain_pause(pause, &state.shutdown_pause, || {
+            update.restart_after_install(restart).install(package.as_slice()).map_err(|error| describe(&error))
+        })
+    }).await;
     match result {
-        Ok(()) => app.restart(),
-        Err(error) => Err(install_failed(&app, update, package, &error)),
+        Ok(Ok(())) if restart => app.restart(),
+        Ok(Ok(())) => { app.exit(0); Ok(()) }
+        Ok(Err(error)) => Err(install_failed(&app, &error)),
+        Err(error) => Err(install_failed(&app, &error.to_string())),
     }
 }
 
@@ -620,29 +702,44 @@ pub fn update_install_on_close(app: AppHandle, state: State<'_, UpdateState>, en
         return Err("Nenhuma atualização está pronta para instalar.".into());
     }
     inner.install_on_close = enabled;
+    if !enabled { inner.close_requested = None; }
     Ok(publish(&app, &inner))
 }
 
 /// Installs the downloaded update when the window closes, if the user chose so.
 pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+    if window.label() != "main" { return; }
     let tauri::WindowEvent::CloseRequested { api, .. } = event else { return };
     let app = window.app_handle().clone();
-    let job = {
+    let request = Instant::now();
+    {
         let state = app.state::<UpdateState>();
         let mut inner = state.inner.lock();
-        if !inner.install_on_close {
+        if inner.phase == Phase::Installing {
+            api.prevent_close();
             return;
         }
-        begin_install(&app, &mut inner)
-    };
-    // When the installation is blocked, the window simply closes.
-    let Ok((update, package)) = job else { return };
-    api.prevent_close();
-    let _ = window.hide();
-    std::thread::spawn(move || {
-        // Windows ends the process inside `install`; elsewhere the app exits once the files are replaced.
-        let _ = update.restart_after_install(false).install(&package);
-        app.exit(0);
+        if !inner.install_on_close || inner.phase != Phase::Ready {
+            return;
+        }
+        api.prevent_close();
+        if inner.close_requested.is_some() { return; }
+        inner.close_requested = Some(request);
+    }
+    // The webview owns pending case edits. It must acknowledge a durable save
+    // before invoking update_install(restart=false). Keep the window visible.
+    if app.emit("update-close-requested", ()).is_err() {
+        install_failed(&app, "não foi possível solicitar o salvamento dos casos");
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let state = app.state::<UpdateState>();
+        let mut inner = state.inner.lock();
+        if inner.close_requested == Some(request) {
+            restore_failed_install(&mut inner, "o salvamento dos casos não confirmou o encerramento a tempo");
+            show_install_failure(&app, &inner);
+        }
     });
 }
 
@@ -790,7 +887,7 @@ pub fn run_e2e(app: AppHandle) {
                 }
             }
             log("installing".into());
-            match tauri::async_runtime::block_on(update_install(app.clone())) {
+            match tauri::async_runtime::block_on(update_install(app.clone(), None)) {
                 Ok(()) => 0,
                 Err(error) => {
                     log(format!("error {error}"));
@@ -805,6 +902,28 @@ pub fn run_e2e(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_install_retains_pause_but_failure_and_unwind_release_it() {
+        let held = Mutex::new(None);
+        let pause = crate::operations::pause_for_update().unwrap();
+        assert!(install_and_retain_pause(pause, &held, || Err("installer unavailable".into())).is_err());
+        assert!(held.lock().is_none());
+        assert!(!crate::operations::update_paused());
+        let pause = crate::operations::pause_for_update().unwrap();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = install_and_retain_pause(pause, &held, || panic!("controlled installer unwind"));
+        }));
+        assert!(unwind.is_err());
+        assert!(!crate::operations::update_paused());
+        let pause = crate::operations::pause_for_update().unwrap();
+        install_and_retain_pause(pause, &held, || Ok(())).unwrap();
+        assert!(held.lock().is_some());
+        assert!(crate::operations::update_paused());
+        assert!(crate::operations::token(None).is_err());
+        drop(held);
+        assert!(!crate::operations::update_paused());
+    }
 
     fn version(text: &str) -> Version {
         Version::parse(text).unwrap()
@@ -830,6 +949,77 @@ mod tests {
         let prefs: Prefs = serde_json::from_str(r#"{"skippedVersion":"0.7.0"}"#).unwrap();
         assert!(prefs.check_on_start);
         assert_eq!(prefs.skipped_version.as_deref(), Some("0.7.0"));
+    }
+
+    #[test]
+    fn failed_install_retains_verified_bytes_and_allows_retry() {
+        let package = Arc::new(vec![1, 2, 3]);
+        let mut inner = Inner {
+            snapshot_revision: Cell::new(0),
+            prefs: Prefs { pending: Some(Pending { from: "0.9.0".into(), to: "0.10.0".into() }), ..Prefs::default() },
+            phase: Phase::Installing, update: None, package: Some(package.clone()),
+            downloaded: 3, total: Some(3), error: None, install_on_close: true,
+            close_requested: Some(Instant::now()), notice: None, download: None,
+            download_owner: None,
+        };
+        let message = restore_failed_install(&mut inner, "o instalador não iniciou");
+        assert_eq!(inner.phase, Phase::Ready);
+        assert!(Arc::ptr_eq(inner.package.as_ref().unwrap(), &package));
+        assert!(inner.prefs.pending.is_none());
+        assert!(!inner.install_on_close);
+        assert!(inner.close_requested.is_none());
+        assert!(message.contains("Tente novamente"));
+        assert!(message.contains("continua aberto"));
+    }
+
+    #[test]
+    fn download_tickets_do_not_rebind_cancelled_callbacks_to_new_requests() {
+        let first = Arc::new(());
+        let mut inner = Inner {
+            snapshot_revision: Cell::new(0),
+            prefs: Prefs::default(), phase: Phase::Downloading, update: None, package: None,
+            downloaded: 0, total: None, error: None, install_on_close: false,
+            close_requested: None, notice: None, download: None,
+            download_owner: Some(Arc::clone(&first)),
+        };
+        assert!(owns_download(&inner, &first));
+        inner.download_owner = None; inner.phase = Phase::Available;
+        assert!(!owns_download(&inner, &first));
+        let second = Arc::new(());
+        inner.download_owner = Some(Arc::clone(&second)); inner.phase = Phase::Downloading;
+        assert!(!owns_download(&inner, &first), "same phase never grants an old callback ownership");
+        assert!(owns_download(&inner, &second));
+        inner.download_owner = None; inner.phase = Phase::Ready;
+        assert!(!owns_download(&inner, &second));
+    }
+
+    #[test]
+    fn snapshot_revisions_remain_exact_across_reads_and_javascript_integer_boundary() {
+        let sequence = Cell::new(9_007_199_254_740_990);
+        let event = next_snapshot_revision(&sequence);
+        // A later status read must supersede the event even if its phase did
+        // not change; an invoke's delayed response retains the captured text.
+        let read = next_snapshot_revision(&sequence);
+        let completion = next_snapshot_revision(&sequence);
+        assert_eq!(event, "9007199254740991");
+        assert_eq!(read, "9007199254740992");
+        assert_eq!(completion, "9007199254740993");
+        assert_eq!(serde_json::to_string(&completion).unwrap(), "\"9007199254740993\"");
+        sequence.set(u128::MAX);
+        assert_eq!(next_snapshot_revision(&sequence), u128::MAX.to_string(), "never wrap to an older revision");
+    }
+
+    #[test]
+    fn pending_install_record_is_atomically_replaced_and_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        save_prefs(dir.path(), &Prefs::default()).unwrap();
+        let mut prefs = Prefs::default();
+        prefs.pending = Some(Pending { from: "0.9.0".into(), to: "0.10.0".into() });
+        save_prefs(dir.path(), &prefs).unwrap();
+        assert_eq!(load_prefs(dir.path()).pending.unwrap().to, "0.10.0");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(save_prefs(&dir.path().join(PREFS_FILE), &prefs).is_err());
+        assert_eq!(load_prefs(dir.path()).pending.unwrap().to, "0.10.0");
     }
 
     #[test]

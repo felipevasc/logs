@@ -15,6 +15,11 @@
   <link rel="stylesheet" href="threats.css" />
   <link rel="stylesheet" href="remote-sources.css" />
   <link rel="stylesheet" href="journeys.css" />
+  <link rel="stylesheet" href="explorer-timeline.css">
+  <link rel="stylesheet" href="field-transform.css">
+  <link rel="stylesheet" href="java-trace.css">
+  <link rel="stylesheet" href="exclusion-archive.css">
+  <link rel="stylesheet" href="case-references.css">
   <link rel="stylesheet" href="workspace-context.css" />
   <link rel="stylesheet" href="case-content.css" />
   <link rel="stylesheet" href="case-trails.css" />
@@ -56,7 +61,7 @@
   <div id="ws-export-modal" class="modal-overlay" hidden>
     <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="ws-export-title">
       <div class="modal-head"><h3 id="ws-export-title">Exportar</h3><button class="icon-btn" id="ws-export-close" aria-label="Fechar"><i class="fas fa-xmark"></i></button></div>
-      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Itens do Caso · Markdown</option><option value="case">Investigação · JSON</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask" checked> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
+      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Itens do Caso · Markdown</option><option value="case">Investigação portátil · LICASE</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask" checked> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
     </div>
   </div>
   <div id="ws-drop" hidden><i class="fas fa-arrow-down-to-bracket"></i><strong>Solte os logs aqui</strong></div>
@@ -107,7 +112,7 @@
       <div class="drive-table-wrap">
         <table id="drive-table">
           <thead>
-            <tr><th></th><th>Nome</th><th>Tipo</th><th>Arquivos</th><th>Eventos</th><th>Carregado</th><th></th>
+            <tr><th></th><th>Nome</th><th>Tipo</th><th>Arquivos</th><th>Importados</th><th>Carregado</th><th></th>
           </thead>
           <tbody></tbody>
         </table>
@@ -213,6 +218,7 @@
           <input id="quick-search" type="text" placeholder="Buscar nas mensagens…" spellcheck="false" />
         </div>
         <div class="filter-actions">
+          <button id="btn-add-search" class="btn primary small" type="button" disabled title="Adicionar busca como filtro (Enter)">Adicionar busca</button>
           <button id="btn-add-filter" class="btn ghost small" type="button"><i class="fas fa-plus"></i> Filtro</button>
           <button id="btn-clear-filters" class="btn ghost small" type="button" hidden>Limpar</button>
         </div>
@@ -764,7 +770,7 @@
           </button>
         </div>
         <div class="fld">
-          <label>Resultado no valor atual</label>
+          <label id="dv-preview-label">Resultado no valor atual</label>
           <pre id="dv-preview" class="code-pane dv-preview">—</pre>
         </div>
         <div class="modal-actions">
@@ -851,8 +857,9 @@
     <div class="pop-title">Novo filtro</div>
     <select id="fp-col"></select>
     <select id="fp-op"></select>
-    <input id="fp-val" type="text" placeholder="valor" spellcheck="false" />
-    <input id="fp-val2" type="text" placeholder="até" spellcheck="false" hidden />
+    <textarea id="fp-val" rows="1" placeholder="valor" spellcheck="false"></textarea>
+    <textarea id="fp-val2" rows="1" placeholder="até" spellcheck="false" hidden></textarea>
+    <small id="fp-text-hint" class="muted small"></small>
     <div class="pop-actions">
       <button class="btn ghost small" id="fp-cancel" type="button">Cancelar</button>
       <button class="btn primary small" id="fp-apply" type="button">Aplicar</button>
@@ -931,6 +938,9 @@
         <button class="settings-tab" data-settings-tab="detection" type="button" role="tab">
           <i class="fas fa-shield-halved"></i> Detecção
         </button>
+        <button class="settings-tab" data-settings-tab="recovery" type="button" role="tab" hidden>
+          <i class="fas fa-clock-rotate-left"></i> Recuperação
+        </button>
         <button class="settings-tab" data-settings-tab="updates" type="button" role="tab">
           <i class="fas fa-rotate"></i> Atualizações
         </button>
@@ -940,6 +950,7 @@
         <section id="settings-pane-codes" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-mcp" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-detection" class="settings-pane" role="tabpanel" hidden></section>
+        <section id="settings-pane-recovery" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-updates" class="settings-pane" role="tabpanel" hidden></section>
       </div>
     </div>
@@ -1017,11 +1028,32 @@
   <script src="timeline-export.js"></script>
   <script src="icon-picker.js"></script>
   <script src="case-timeline.js"></script>
+  <script src="case-removals.js"></script>
   <script src="vendor/js-yaml/js-yaml.min.js"></script>
   <script src="detail-fields.js"></script>
+  <script src="java-trace.js"></script>
   <script src="performance-core.js"></script>
+  <script src="case-evidence.js"></script>
+  <script src="case-evidence-session.js"></script>
+  <script src="case-evidence-analysis.js"></script>
+  <script src="case-evidence-preserved.js"></script>
+  <script src="case-evidence-items.js"></script>
+  <script src="case-evidence-actions.js"></script>
+  <script src="case-evidence-detail.js"></script>
+  <script src="case-evidence-timeline.js"></script>
+  <script src="case-evidence-display.js"></script>
+  <script src="case-evidence-transfer.js"></script>
+  <script src="case-evidence-recovery.js"></script>
   <script src="app.js"></script>
+  <script src="analysis-context.js"></script>
   <script src="tasks.js"></script>
+  <script src="canonical-fields.js"></script>
+  <script src="analysis-fields.js"></script>
+  <script src="explorer-timeline.js"></script>
+  <script src="field-transform.js"></script>
+  <script src="exclusion-archive.js"></script>
+  <script src="exclusion-visibility.js"></script>
+  <script src="case-references.js"></script>
   <script src="ui-scale.js"></script>
   <script src="timeline.js"></script>
   <script src="case-content.js"></script>

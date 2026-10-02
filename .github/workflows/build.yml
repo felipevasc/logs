@@ -64,9 +64,39 @@ jobs:
         run: node --test scripts/preview/test-detail-fields.cjs
       - run: npm run prepare:frontend
       - name: Backend tests
+        if: runner.os != 'Windows'
         run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+      - name: Windows backend tests with loader diagnostics
+        if: runner.os == 'Windows'
+        id: backend_windows
+        shell: pwsh
+        run: ./scripts/ci/windows-native-tests.ps1
+      - name: Verify Windows unit harness manifest
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/verify-windows-manifest.ps1 -Target harness
+      - name: Preserve Windows native failure evidence
+        if: failure() && runner.os == 'Windows' && steps.backend_windows.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/windows-native-diagnostics/
+          if-no-files-found: warn
+          retention-days: 30
       - name: Build installers
         run: npm run build -- --ci --bundles ${{ matrix.bundles }} -- --locked
+      - name: Verify Windows app manifest
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/verify-windows-manifest.ps1 -Target app
+      - name: Preserve Windows manifest verification
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-manifest-verification-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/windows-manifest-verification/
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:

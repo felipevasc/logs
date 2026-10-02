@@ -8,8 +8,10 @@
 //! engine, which also remains the fallback for any engine error.
 mod build;
 mod ops;
+mod sparse_timeline;
 mod sql;
 mod text;
+mod time_index;
 mod udf;
 
 pub(crate) use ops::*;
@@ -49,32 +51,30 @@ pub(crate) fn engine_dir() -> PathBuf {
 /// Derived fields: when present, names and descriptions are resolved while
 /// building (rules may test them), so the catalogs join the store key.
 fn derived_signature(derived: &[CompiledDerived]) -> Option<String> {
-    let mut text = String::new();
-    for d in derived {
-        text.push_str(&format!("{}\u{1}{}\u{1}", d.name, d.source));
-        for rule in &d.rules {
-            // A rule reading the line position would depend on file order.
+    if derived.is_empty() { return Some(String::new()); }
+    let mut definitions = Vec::with_capacity(derived.len());
+    let mut lookups = Vec::new();
+    for field in derived {
+        if field.source == "id" { return None; }
+        if let Some(lookup) = &field.lookup {
+            if lookup.definition.keys.iter().any(|key| key.source_field == "id") { return None; }
+            lookups.push((&field.name, &lookup.definition, lookup.version()?));
+        }
+        let mut rules = Vec::with_capacity(field.rules.len());
+        for rule in &field.rules {
             if let Some(filter) = &rule.filter {
-                if filter.column == "id" || (filter.op == "query" && query_reads_id(&filter.value))
-                {
-                    return None;
-                }
+                if filter.column == "id" || (filter.op == "query" && query_reads_id(&filter.value)) { return None; }
             }
-            text.push_str(&format!(
-                "{}\u{2}{:?}\u{2}{}\u{3}",
-                rule.re.as_str(),
-                rule.template,
-                rule.filter
-                    .as_ref()
-                    .map(|f| serde_json::to_string(f).unwrap_or_default())
-                    .unwrap_or_default()
-            ));
+            rules.push((rule.re.as_str(), &rule.template, &rule.filter));
         }
-        if d.source == "id" {
-            return None;
-        }
+        definitions.push((&field.name, &field.source, &field.steps, rules));
     }
-    Some(text)
+    // Version all derived overlays (including legacy regex) because bounded
+    // extraction/provenance semantics changed. Base immutable stores stay valid.
+    if lookups.is_empty() {
+        return Some(format!("derived-overlay-v2:{}:{}", crate::field_transform::VERSION, serde_json::to_string(&definitions).ok()?));
+    }
+    Some(format!("derived-overlay-v3:{}:{}:{}", crate::field_transform::VERSION, crate::reference_lookup::VERSION, serde_json::to_string(&(definitions, lookups)).ok()?))
 }
 
 fn query_reads_id(text: &str) -> bool {
@@ -96,23 +96,9 @@ fn catalogs_signature(codes: &CodesConfig, system: &CodesConfig) -> String {
             return sig.clone();
         }
     }
-    let mut hash = Sha256::new();
-    for catalog in [codes, system] {
-        let mut sources: Vec<_> = catalog.sources.iter().collect();
-        sources.sort_by(|a, b| a.0.cmp(b.0));
-        for (source, entries) in sources {
-            let mut entries: Vec<_> = entries.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            for (code, info) in entries {
-                hash.update(format!(
-                    "{source}\u{1}{code}\u{1}{}\u{1}{}\u{2}",
-                    info.name, info.description
-                ));
-            }
-        }
-        hash.update([3u8]);
-    }
-    let sig = format!("{:x}", hash.finalize());
+    // This version intentionally retires catalog-sensitive derived variants
+    // and old page cursors once; immutable base stores do not use this key.
+    let sig = format!("catalog-v2:{}", catalog_content_signature(codes, system));
     *CACHE.lock() = Some((key, sig.clone()));
     sig
 }
@@ -132,7 +118,9 @@ fn catalog_key(codes: &CodesConfig, system: &CodesConfig) -> CatalogKey {
     // Reader threads share source metadata but own catalog snapshots. Their
     // address must not invalidate a completed selection on every iterator pass.
     let mut hash = Sha256::new();
+    hash.update(b"loginsight-catalog-content-v2\0");
     for catalog in [codes, system] {
+        hash.update((catalog.sources.values().map(|entries| entries.len()).sum::<usize>() as u64).to_le_bytes());
         let mut sources: Vec<_> = catalog.sources.iter().collect();
         sources.sort_by(|a, b| a.0.cmp(b.0));
         for (source, entries) in sources {
@@ -148,6 +136,88 @@ fn catalog_key(codes: &CodesConfig, system: &CodesConfig) -> CatalogKey {
         hash.update([255]);
     }
     (CATALOG_EPOCH.load(Ordering::SeqCst), format!("{:x}", hash.finalize()))
+}
+
+/// Content identity for projected-row admission. Length-prefixed values and
+/// explicit catalog boundaries make control characters unambiguous. Compute
+/// under the catalogs' read guards; unlike planner pointer caches this proves
+/// the actual content even before a mutation increments CATALOG_EPOCH.
+pub(crate) fn catalog_content_signature(codes: &CodesConfig, system: &CodesConfig) -> String {
+    catalog_key(codes, system).1
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogToken {
+    pub signature: String,
+    pub epoch: u64,
+}
+
+/// Capture under both catalog read guards. Comparing before/after admission
+/// detects intervening edits even if the catalog content returns to its start.
+pub(crate) fn catalog_token(codes: &CodesConfig, system: &CodesConfig) -> CatalogToken {
+    let (epoch, signature) = catalog_key(codes, system);
+    CatalogToken { signature, epoch }
+}
+
+#[cfg(test)]
+mod catalog_identity_tests {
+    use super::*;
+    use crate::model::CodeInfo;
+
+    fn catalog(name: &str, description: &str) -> CodesConfig {
+        let mut config = CodesConfig::default();
+        config.sources.entry("source".into()).or_default().insert("1".into(), CodeInfo { name: name.into(), description: description.into() });
+        config
+    }
+
+    #[test]
+    fn persisted_catalog_signature_is_unambiguous_and_epoch_aware() {
+        let mut first = catalog("name\u{1}part", "description");
+        let second = catalog("name", "part\u{1}description");
+        let empty = CodesConfig::default();
+        let first_sig = catalogs_signature(&first, &empty);
+        let second_sig = catalogs_signature(&second, &empty);
+        assert!(first_sig.starts_with("catalog-v2:"));
+        assert_ne!(first_sig, second_sig, "separator data must not alias different enrichment");
+        assert_eq!(first_sig, format!("catalog-v2:{}", catalog_content_signature(&first, &empty)));
+        let _ = catalogs_signature(&first, &empty); // seed this pointer/count entry
+        first.sources.get_mut("source").unwrap().get_mut("1").unwrap().description = "changed".into();
+        catalogs_changed();
+        assert_ne!(first_sig, catalogs_signature(&first, &empty));
+        assert_ne!(catalogs_signature(&first, &empty), catalogs_signature(&empty, &first));
+    }
+
+    #[test]
+    fn catalog_token_detects_content_aba_during_admission() {
+        let first = catalog("A", "original");
+        let second = catalog("B", "changed");
+        let empty = CodesConfig::default();
+        let before = catalog_token(&first, &empty);
+        catalogs_changed();
+        let middle = catalog_token(&second, &empty);
+        catalogs_changed();
+        let after = catalog_token(&first, &empty);
+        assert_ne!(before.signature, middle.signature);
+        assert_eq!(before.signature, after.signature);
+        assert_ne!(before.epoch, after.epoch);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn persisted_catalog_signature_is_stable_across_insertion_order() {
+        let mut forward = CodesConfig::default();
+        let mut reverse = CodesConfig::default();
+        for (target, order) in [(&mut forward, ["a", "b"]), (&mut reverse, ["b", "a"])] {
+            for source in order {
+                for code in order {
+                    target.sources.entry(source.into()).or_default().insert(code.into(), CodeInfo { name: code.into(), description: source.into() });
+                }
+            }
+        }
+        let empty = CodesConfig::default();
+        assert_eq!(catalogs_signature(&forward, &empty), catalogs_signature(&reverse, &empty));
+        assert_eq!(catalog_content_signature(&forward, &empty), catalog_content_signature(&reverse, &empty));
+    }
 }
 
 #[derive(Clone)]
@@ -191,7 +261,7 @@ const SEGMENT_ROWS: usize = 1_000_000;
 const SEGMENT_BYTES: u64 = 256 << 20;
 
 fn segment_ranges(
-    lines: &[crate::model::LineMeta],
+    lines: &crate::metadata_store::LineStore,
     start: usize,
     end: usize,
 ) -> Vec<(usize, usize)> {
@@ -199,8 +269,8 @@ fn segment_ranges(
     let mut from = start;
     while from < end {
         let limit = (from + SEGMENT_ROWS).min(end);
-        let byte_end = lines[from].offset.saturating_add(SEGMENT_BYTES);
-        let count = lines[from..limit].partition_point(|line| line.offset < byte_end);
+        let byte_end = lines.at(from).offset.saturating_add(SEGMENT_BYTES);
+        let count = lines.range(from..limit).partition_point(|line| line.offset < byte_end);
         let to = (from + count.max(1)).min(limit);
         out.push((from, to));
         from = to;
@@ -250,8 +320,8 @@ fn spec(
         // Immutable record-aligned segments are independent recovery checkpoints.
         // Keep both row count and input bytes bounded, including very wide logs.
         for (from, to) in segment_ranges(&idx.lines, start, end) {
-            let first_offset = idx.lines[from].offset - part.base;
-            let last = &idx.lines[to - 1];
+            let first_offset = idx.lines.at(from).offset - part.base;
+            let last = &idx.lines.at(to - 1);
             let last_end = last.offset - part.base + u64::from(last.len);
             let mut hash = Sha256::new();
             hash.update(format!(
@@ -269,6 +339,10 @@ fn spec(
             if let Some(identity) = &part.event_identity {
                 hash.update(b"|logical-event-identity:");
                 hash.update(serde_json::to_vec(identity).ok()?);
+            }
+            if let Some(revision) = crate::java_stacktrace::enrichment_signature(&part.format) {
+                hash.update(b"|parser-enrichment:");
+                hash.update(revision.as_bytes());
             }
             let key = format!("{:x}", hash.finalize());
             parts.push(PartSpec {
@@ -316,6 +390,8 @@ pub(crate) struct Session {
     /// Inverted text index of each part with its first line; empty when a
     /// part has none (free text is then scanned).
     texts: Vec<(usize, text::Text)>,
+    /// Complete verified capabilities only; acquiring them never reads files.
+    time_indexes: RwLock<Option<time_index::ReadSet>>,
     /// Shared OS leases outlive database connections and mapped text readers.
     _leases: Vec<std::fs::File>,
 }
@@ -368,7 +444,7 @@ fn timestamp_non_null_proof(conn: &Connection) -> bool {
 }
 
 impl Session {
-    fn open(spec: &SourceSpec) -> Result<Session, String> {
+    fn open(spec: &SourceSpec, time_indexes: Option<time_index::ReadSet>) -> Result<Session, String> {
         let mut leases = Vec::with_capacity(spec.parts.len());
         for part in &spec.parts {
             let file = std::fs::OpenOptions::new()
@@ -501,32 +577,63 @@ impl Session {
             selection_changed: parking_lot::Condvar::new(),
             garbage: Arc::new(Mutex::new(Vec::new())),
             texts,
+            time_indexes: RwLock::new(time_indexes),
             _leases: leases,
         })
     }
 
-    /// Lines (sorted) whose free text may contain `needle`, through the
-    /// inverted indexes; `None` when they cannot narrow the search.
-    pub(crate) fn free_candidates(&self, needle: &str, limit: usize) -> Option<Vec<usize>> {
-        if self.texts.is_empty() {
-            return None;
-        }
-        let mut out = Vec::new();
-        for (start, text) in &self.texts {
-            let lids = text.candidates(needle, limit.checked_sub(out.len())?)?;
-            out.extend(lids.into_iter().map(|lid| start + lid as usize));
-        }
-        Some(out)
+    pub(crate) fn exact_time_indexes(&self) -> Option<time_index::ReadSet> {
+        self.time_indexes.read().clone()
     }
 
-    pub(crate) fn exact_hex_candidates(&self, value: &str, limit: usize) -> Option<Vec<usize>> {
-        if self.texts.is_empty() { return None; }
+    pub(crate) fn invalidate_exact_times(&self, readers: &time_index::ReadSet) -> Result<(), String> {
+        // Probe outside Registry. Only the precise stale Arc generations are
+        // evicted; a concurrent, freshly verified replacement remains usable.
+        let stale = time_index::changed_readers(readers)?;
+        if stale.is_empty() { return Ok(()); }
+        let clear = |session: &Session| {
+            let mut current = session.time_indexes.write();
+            let changed = current.as_ref().is_some_and(|set| time_index::shares_generation(set, &stale));
+            if changed { *current = None; }
+            changed
+        };
+        with_registry(|reg| {
+            reg.time_cache.remove_matching(&stale);
+            let mut retry = Vec::new();
+            for session in reg.base_session.iter().chain(reg.session.iter()) {
+                if clear(session) { retry.push(session.key.clone()); }
+            }
+            if clear(self) { retry.push(self.key.clone()); }
+            for key in retry { reg.time_attempts.remove(&key); }
+        });
+        // The caller drops its old ReadSet before exact SQL fallback. The next
+        // current-source request can enqueue repair without an own-reader lock.
+        Ok(())
+    }
+
+    /// Lines (sorted) whose free text may contain `needle`, through the
+    /// inverted indexes; `None` when they cannot narrow the search.
+    pub(crate) fn free_candidates(&self, needle: &str, limit: usize) -> Result<Option<Vec<usize>>, String> {
+        self.text_candidates(limit, |text, remaining| text.candidates(needle, remaining))
+    }
+
+    pub(crate) fn exact_hex_candidates(&self, value: &str, limit: usize) -> Result<Option<Vec<usize>>, String> {
+        self.text_candidates(limit, |text, remaining| text.exact_hex_candidates(value, remaining))
+    }
+
+    fn text_candidates(&self, limit: usize, mut probe: impl FnMut(&text::Text, usize) -> Option<Vec<u32>>) -> Result<Option<Vec<usize>>, String> {
+        crate::operations::check()?;
+        if self.texts.is_empty() { return Ok(None); }
         let mut out = Vec::new();
         for (start, text) in &self.texts {
-            let lids = text.exact_hex_candidates(value, limit.checked_sub(out.len())?)?;
+            crate::operations::check()?;
+            let candidates = probe(text, limit - out.len());
+            // A cancelled probe must not fall through to a full SQL scan.
+            crate::operations::check()?;
+            let Some(lids) = candidates else { return Ok(None) };
             out.extend(lids.into_iter().map(|lid| start + lid as usize));
         }
-        Some(out)
+        Ok(Some(out))
     }
 
     pub(crate) fn names_version(&self) -> u64 {
@@ -534,8 +641,9 @@ impl Session {
     }
 
     pub(crate) fn cached_selection(&self, key: &str) -> Option<Arc<ops::Selection>> {
+        let key = format!("{}|{key}", crate::analysis_runtime::cache_namespace());
         let mut selections = self.selections.lock();
-        let at = selections.iter().position(|(k, _)| k == key)?;
+        let at = selections.iter().position(|(k, _)| k == &key)?;
         let entry = selections.remove(at);
         let found = Arc::clone(&entry.1);
         selections.insert(0, entry);
@@ -552,6 +660,7 @@ impl Session {
     }
 
     pub(crate) fn cache_selection(&self, key: String, selection: Arc<ops::Selection>) {
+        let key = format!("{}|{key}", crate::analysis_runtime::cache_namespace());
         let mut selections = self.selections.lock();
         selections.retain(|(k, _)| *k != key);
         let budget = crate::resources::selection_cache_bytes();
@@ -566,8 +675,9 @@ impl Session {
     }
 
     pub(crate) fn begin_selection(&self, key: &str) -> Result<SelectionBuild<'_>, String> {
+        let key = format!("{}|{key}", crate::analysis_runtime::cache_namespace());
         let mut building = self.selection_builds.lock();
-        while building.contains(key) {
+        while building.contains(&key) {
             crate::operations::check()?;
             self.selection_changed.wait_for(&mut building, std::time::Duration::from_millis(25));
         }
@@ -585,13 +695,21 @@ impl Session {
     }
 
     pub(crate) fn collect_garbage(&self) -> Result<(), String> {
-        let unused = self.take_garbage();
-        if unused.is_empty() { return Ok(()); }
+        if self.garbage.lock().is_empty() { return Ok(()); }
+        // A failed connection acquisition must leave the cleanup queue intact.
         let conn = self.conn()?;
+        self.collect_garbage_on(&conn)
+    }
+
+    pub(crate) fn collect_garbage_on(&self, conn: &Connection) -> Result<(), String> {
+        let unused = self.take_garbage();
         for (i, name) in unused.iter().enumerate() {
-            if let Err(error) = conn.execute_batch(&format!("DROP TABLE IF EXISTS {name}")) {
+            let dropped = crate::operations::check().and_then(|_| {
+                conn.execute_batch(&format!("DROP TABLE IF EXISTS {name}")).map_err(|error| error.to_string())
+            });
+            if let Err(error) = dropped {
                 self.garbage.lock().extend_from_slice(&unused[i..]);
-                return Err(error.to_string());
+                return Err(error);
             }
         }
         Ok(())
@@ -844,9 +962,17 @@ struct Registry {
     /// need ownership independent of the currently opened session's identity.
     source_keys: HashMap<String, HashSet<String>>,
     progress: HashMap<String, BuildProgress>,
+    time_cache: time_index::VerifiedCache,
+    time_attempts: HashMap<String, std::time::Instant>,
 }
 
 impl Registry {
+    fn install_times(&mut self, spec: &SourceSpec) {
+        let Some(readers) = self.time_cache.complete(spec.parts.iter().map(|part|part.key.as_str())) else { return; };
+        for session in self.base_session.iter().chain(self.session.iter()) {
+            if session.key == spec.key { *session.time_indexes.write() = Some(Arc::clone(&readers)); }
+        }
+    }
     fn remember_spec(&mut self, idx: &FileIndex, spec: &SourceSpec) {
         self.source_keys
             .entry(source_identity(idx))
@@ -900,6 +1026,8 @@ impl Registry {
         self.wanted.retain(|key| keep.contains(key));
         self.failed.retain(|key, _| keep.contains(key));
         self.progress.retain(|key, _| keep.contains(key));
+        self.time_cache.retain(|key| keep.contains(key));
+        self.time_attempts.retain(|key,_| keep.contains(key));
         self.source_identity = identity.unwrap_or_default().to_string();
         // Active builders keep their claims until they unwind. Dropping the
         // claim here could let a foreground retry race the same segment.
@@ -986,7 +1114,9 @@ pub(crate) fn session_checked(
         };
         if let Some(current) = cached {
             if current.key == spec.key {
-                return Ok(Some(Arc::clone(current)));
+                let current = Arc::clone(current);
+                maybe_schedule_time(reg, idx, &spec, base.as_ref(), derived, codes, system);
+                return Ok(Some(current));
             }
         }
         if let Some(error) = reg.failed.get(&spec.key) {
@@ -998,11 +1128,12 @@ pub(crate) fn session_checked(
                 .iter()
                 .any(|part| !reg.failed.contains_key(&part.key))
             {
-                schedule(idx, &spec, base.as_ref(), derived, codes, system);
+                schedule(reg, idx, &spec, base.as_ref(), derived, codes, system);
             }
             return Ok(None);
         }
-        match Session::open(&spec) {
+        let time_indexes = reg.time_cache.complete(spec.parts.iter().map(|part|part.key.as_str()));
+        match Session::open(&spec, time_indexes) {
             Ok(session) => {
                 let session = Arc::new(session);
                 if derived.is_empty() {
@@ -1010,6 +1141,7 @@ pub(crate) fn session_checked(
                 } else {
                     reg.session = Some(Arc::clone(&session));
                 }
+                maybe_schedule_time(reg, idx, &spec, base.as_ref(), derived, codes, system);
                 Ok(Some(session))
             }
             Err(error) => {
@@ -1031,6 +1163,25 @@ struct Job {
     source: build::PartSource,
     derived: Vec<CompiledDerived>,
     catalogs: Option<(CodesConfig, CodesConfig)>,
+}
+
+/// A base-safe first page can finish without opening a derived Session. Queue
+/// its captured desired variant afterward, without clearing failures or changing
+/// the registry owner. Source publication remains the ownership authority.
+pub(crate) fn ensure_admitted_variant(idx: &FileIndex, codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) {
+    if !enabled() || idx.lines.is_empty() || derived.is_empty() { return; }
+    let Some(desired) = spec(idx, codes, system, derived) else { return; };
+    let base = spec(idx, codes, system, &[]);
+    let identity = source_identity(idx);
+    with_registry(|reg| {
+        if reg.source_identity != identity || reg.failed.contains_key(&desired.key)
+            || desired.parts.iter().any(|part| reg.failed.contains_key(&part.key))
+            || desired.parts.iter().all(store_ready) { return; }
+        reg.remember_spec(idx, &desired);
+        if let Some(base) = &base { reg.remember_spec(idx, base); }
+        reg.wanted = base.iter().flat_map(|spec| &spec.parts).chain(&desired.parts).map(|part| part.key.clone()).collect();
+        schedule(reg, idx, &desired, base.as_ref(), derived, codes, system);
+    });
 }
 
 /// Called when definitions change, independent of which UI query runs next.
@@ -1077,7 +1228,7 @@ pub(crate) fn request_rebuild(
         if reg.session.as_ref().is_some_and(|s| s.key != desired.key) {
             reg.session = None;
         }
-        schedule(idx, &desired, base.as_ref(), derived, codes, system);
+        schedule(reg, idx, &desired, base.as_ref(), derived, codes, system);
     });
 }
 
@@ -1130,6 +1281,7 @@ struct BackgroundQueue {
     state: Mutex<QueueState>,
     wake: parking_lot::Condvar,
     revision: AtomicU64,
+    running: AtomicBool,
 }
 
 static BACKGROUND_QUEUE: std::sync::OnceLock<Arc<BackgroundQueue>> = std::sync::OnceLock::new();
@@ -1162,11 +1314,34 @@ impl BackgroundQueue {
     }
 }
 
+/// Stop only this app's cooperative work. Never clear the loaded source,
+/// delete checkpoints, or terminate another process to install an update.
+pub(crate) fn prepare_for_update() -> Result<crate::operations::UpdatePause, String> {
+    let pause = crate::operations::pause_for_update()?;
+    if let Some(queue) = BACKGROUND_QUEUE.get() {
+        let mut state = queue.state.lock();
+        state.pending = None;
+        queue.revision.fetch_add(1, Ordering::SeqCst);
+        queue.wake.notify_all();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let building = with_registry(|reg| !reg.building.is_empty());
+        let background = BACKGROUND_QUEUE.get().is_some_and(|queue| queue.running.load(Ordering::Acquire));
+        if !building && !background && !crate::operations::update_work_active() { return Ok(pause); }
+        if std::time::Instant::now() >= deadline {
+            return Err("O trabalho em andamento ainda não confirmou o encerramento. A aplicação continua aberta; aguarde a tarefa terminar e tente instalar novamente.".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 fn supersedes(new: &RequestKey, current: &RequestKey) -> bool {
     new != current && !(new.source == current.source && !new.derived && current.derived)
 }
 
 fn schedule(
+    reg: &mut Registry,
     idx: &FileIndex,
     spec: &SourceSpec,
     base: Option<&SourceSpec>,
@@ -1174,14 +1349,18 @@ fn schedule(
     codes: &CodesConfig,
     system: &CodesConfig,
 ) {
-    let queue = BACKGROUND_QUEUE.get_or_init(|| {
+    if crate::operations::update_paused() { return; }
+    // All callers hold Registry's mutex, so initialization is serialized.
+    // A missing optional-worker resource must not panic an otherwise ready query.
+    let queue = if let Some(queue) = BACKGROUND_QUEUE.get() { queue } else {
         let queue = Arc::new(BackgroundQueue {
             state: Mutex::new(QueueState::default()),
             wake: parking_lot::Condvar::new(),
             revision: AtomicU64::new(0),
+            running: AtomicBool::new(false),
         });
         let worker = Arc::clone(&queue);
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("loginsight-engine".into())
             .spawn(move || {
                 crate::resources::lower_priority();
@@ -1193,22 +1372,33 @@ fn schedule(
                         }
                         let request = state.pending.take().expect("pending request");
                         state.active = Some(request.key.clone());
+                        worker.running.store(true, Ordering::Release);
                         request
                     };
+                    struct Running<'a>(&'a BackgroundQueue);
+                    impl Drop for Running<'_> {
+                        fn drop(&mut self) {
+                            self.0.state.lock().active = None;
+                            self.0.running.store(false, Ordering::Release);
+                            self.0.wake.notify_all();
+                        }
+                    }
+                    let _running = Running(&worker);
                     run_background(&worker, &request);
-                    // Never hold the queue mutex while acquiring the registry.
-                    worker.state.lock().active = None;
                 }
-            })
-            .expect("engine worker thread");
-        queue
-    });
+            });
+        if let Err(error) = spawned { eprintln!("[motor] preparação em segundo plano adiada: {error}"); return; }
+        let inserted = BACKGROUND_QUEUE.set(queue);
+        debug_assert!(inserted.is_ok(), "Registry serializes background queue initialization");
+        BACKGROUND_QUEUE.get().expect("background queue registered")
+    };
     let key = RequestKey {
         source: source_identity(idx),
         config: spec.key.clone(),
         derived: !derived.is_empty(),
     };
     let mut state = queue.state.lock();
+    if crate::operations::update_paused() { return; }
     let current = state
         .pending
         .as_ref()
@@ -1217,6 +1407,12 @@ fn schedule(
     if current.is_some_and(|current| !supersedes(&key, current)) {
         return;
     }
+    // Bound strong cache ownership to this accepted base/desired request,
+    // rather than retaining every historical derived variant of one source.
+    let keys: HashSet<String> = base.iter().flat_map(|s|&s.parts).chain(&spec.parts).map(|p|p.key.clone()).collect();
+    reg.time_cache.retain(|key|keys.contains(key));
+    reg.time_attempts.retain(|key,_|key==&spec.key || base.is_some_and(|base|key==&base.key));
+    reg.time_attempts.insert(spec.key.clone(),std::time::Instant::now());
     let revision = queue.revision.fetch_add(1, Ordering::SeqCst) + 1;
     state.pending = Some(BackgroundRequest {
         key,
@@ -1225,7 +1421,7 @@ fn schedule(
             parts: idx.parts.clone(),
             lines: Arc::clone(&idx.lines),
             columns: Vec::new(),
-            time_order: std::sync::OnceLock::new(),
+            time_order: Arc::clone(&idx.time_order),
         },
         spec: spec.clone(),
         base: base.cloned(),
@@ -1335,6 +1531,109 @@ fn run_background(queue: &BackgroundQueue, request: &BackgroundRequest) {
             }
         }
     }
+    prepare_optional_times(queue, request);
+}
+
+/// Optional work stays on the mandatory builder's single queue. A foreground
+/// interaction pauses it; background status polling is deliberately not a gate.
+fn optional_time_enabled() -> bool {
+    std::env::var("LOGINSIGHT_TIME_PRECOMPUTE").as_deref() != Ok("0")
+}
+fn maybe_schedule_time(
+    reg: &mut Registry, idx: &FileIndex, spec: &SourceSpec, base: Option<&SourceSpec>,
+    derived: &[CompiledDerived], codes: &CodesConfig, system: &CodesConfig,
+) {
+    if !optional_time_enabled() || crate::operations::update_paused() { return; }
+    reg.install_times(spec);
+    if spec.parts.iter().all(|part| reg.time_cache.contains(&part.key)) { return; }
+    let now = std::time::Instant::now();
+    if reg.time_attempts.get(&spec.key).is_some_and(|last| now.duration_since(*last) < std::time::Duration::from_secs(30)) { return; }
+    // Retry optional I/O failures at most once per 30 seconds on actual demand.
+    reg.time_attempts.insert(spec.key.clone(), now);
+    schedule(reg, idx, spec, base, derived, codes, system);
+}
+fn optional_quiet(cancelled: &dyn Fn() -> bool, quiet: std::time::Duration) -> bool {
+    let mut idle = std::time::Instant::now();
+    loop {
+        if cancelled() { return false; }
+        if crate::operations::interactive_active() { idle = std::time::Instant::now(); }
+        else if idle.elapsed() >= quiet { return true; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+fn load_optional_time(part: &PartSpec, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<Option<Arc<time_index::TimeIndex>>, String> {
+    if cancelled() { return Err("Preparação temporal pausada.".into()); }
+    // The immutable base is pinned before validation and before acquiring the
+    // sidecar lease; the returned handle retains its own base/sidecar leases.
+    let base = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(part.path.with_extension("build.lock")).map_err(|e| e.to_string())?;
+    if fs2::FileExt::try_lock_shared(&base).is_err() { return Ok(None); }
+    if !store_ready(part) { return Err("Checkpoint principal indisponível para resumo opcional.".into()); }
+    let identity = time_index::identity(&part.path, part.rows)?;
+    match time_index::open_cancellable(&part.path, &identity, cancelled) {
+        Ok(Some(index)) => return Ok(Some(index)),
+        Ok(None) | Err(_) => { if cancelled() { return Err("Preparação temporal pausada.".into()); } }
+    }
+    let parent = part.path.parent().ok_or("Checkpoint sem diretório.")?;
+    let needed = (part.rows as u64).checked_mul(8).and_then(|n| n.checked_add(1 << 30)).ok_or("Resumo temporal grande demais.")?;
+    if free_space(parent).is_some_and(|bytes| bytes < needed) { return Err("Resumo temporal adiado por espaço em disco.".into()); }
+    let scratch = tempfile::Builder::new().prefix(&format!("{}.time-spill.", part.key)).suffix(".pending")
+        .tempdir_in(parent).map_err(|e| e.to_string())?;
+    let config = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly).map_err(|e| e.to_string())?;
+    let conn = Connection::open_with_flags(&part.path, config).map_err(|e| e.to_string())?;
+    conn.execute_batch(&format!("SET temp_directory={}; SET preserve_insertion_order=false;", sql::lit(&scratch.path().to_string_lossy()))).map_err(|e| e.to_string())?;
+    limit_resources(&conn, true)?;
+    time_index::ensure(&conn, &part.path, &identity, cancelled)?;
+    drop(conn);
+    if cancelled() { return Err("Preparação temporal pausada.".into()); }
+    time_index::open_cancellable(&part.path, &identity, cancelled)
+}
+fn prepare_optional_times(queue: &BackgroundQueue, request: &BackgroundRequest) {
+    if !optional_time_enabled() { return; }
+    let obsolete = || queue.revision.load(Ordering::SeqCst) != request.revision || crate::operations::update_paused();
+    for spec in request.base.iter().chain(std::iter::once(&request.spec)) {
+        for part in &spec.parts {
+            if obsolete() || !still_wanted(&part.key) { return; }
+            if with_registry(|reg| reg.time_cache.contains(&part.key)) { continue; }
+            let mut quiet_ms = 250;
+            loop {
+                let stopped = || obsolete() || !still_wanted(&part.key);
+                if !optional_quiet(&stopped, std::time::Duration::from_millis(quiet_ms)) { return; }
+                let preempted = AtomicBool::new(false);
+                // Do not acquire Registry while validating/sorting: a foreground
+                // Session open may hold it. Revision/UpdatePause are atomic;
+                // ownership is checked at each part boundary and publication.
+                let cancelled = || {
+                    let interactive = crate::operations::interactive_active();
+                    if interactive { preempted.store(true, Ordering::Relaxed); }
+                    obsolete() || interactive
+                };
+                if let Err(error) = crate::sources::validate_source(&request.idx.parts[part.part]) {
+                    eprintln!("[motor] resumo temporal adiado: {error}"); return;
+                }
+                let result = load_optional_time(part, &cancelled);
+                if stopped() { return; }
+                if preempted.load(Ordering::Relaxed) || crate::operations::interactive_active() {
+                    // A preempted optional sort is not a failed source. Wait
+                    // for a quiet period, with bounded backoff, then retry it.
+                    quiet_ms = (quiet_ms * 2).min(2_000); continue;
+                }
+                match result {
+                    Ok(Some(index)) => {
+                        if crate::sources::validate_source(&request.idx.parts[part.part]).is_err() { return; }
+                        with_registry(|reg| {
+                            if obsolete() || !reg.wanted.contains(&part.key) { return; }
+                            reg.time_cache.insert(part.key.clone(), index);
+                            reg.install_times(spec);
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("[motor] resumo temporal opcional adiado: {error}"),
+                }
+                break;
+            }
+        }
+    }
 }
 
 fn run_job(
@@ -1354,9 +1653,9 @@ fn run_job(
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // Size estimated from the stores built so far (text-heavy logs make
     // stores as large as the file); 1 GB stays free besides.
-    let source_len = job.source.lines[job.source.range.clone()]
+    let source_len = job.source.lines.range(job.source.range.clone())
         .last()
-        .zip(job.source.lines[job.source.range.clone()].first())
+        .zip(job.source.lines.range(job.source.range.clone()).first())
         .map(|(last, first)| last.offset + u64::from(last.len) - first.offset)
         .unwrap_or(0);
     let needed = source_len / 1000 * STORE_RATIO.load(Ordering::Relaxed) + (1 << 30);
@@ -1403,6 +1702,7 @@ pub(crate) fn prepare_detailed(
     derived: &[CompiledDerived],
     progress: &(dyn Fn(BuildProgress) + Sync),
 ) -> Result<(), String> {
+    if crate::operations::update_paused() { return Err("Preparação suspensa para instalar a atualização.".into()); }
     if !enabled() || idx.lines.is_empty() {
         return Ok(());
     }
@@ -1452,7 +1752,7 @@ fn prepare_variant(
     let mut done = resumed;
     let mut segments = spec.parts.iter().filter(|p| store_ready(p)).count();
     let cancellation = crate::operations::current_token();
-    let cancelled = || cancellation.cancelled();
+    let cancelled = || cancellation.cancelled() || crate::operations::update_paused();
     let publish = |phase: &str,
                    completed: usize,
                    checkpoint_rows: usize,
@@ -1650,7 +1950,7 @@ fn prune(keep: &std::path::Path) {
                         .open(lock_path)
                     {
                         if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
-                            let _ = std::fs::remove_file(&path);
+                            let _ = if meta.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
                         }
                     }
                 }
@@ -1686,8 +1986,7 @@ fn prune(keep: &std::path::Path) {
             if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
                 continue;
             }
-            build::remove_database(&path);
-            total = total.saturating_sub(size);
+            if build::remove_database(&path) { total = total.saturating_sub(size); }
         }
     }
 }
@@ -1775,6 +2074,7 @@ mod segment_tests {
                 ..Default::default()
             },
         ];
+        let lines = crate::metadata_store::LineStore::from(lines);
         assert_eq!(segment_ranges(&lines, 0, 3), vec![(0, 2), (2, 3)]);
         assert_eq!(segment_ranges(&lines, 1, 3), vec![(1, 3)]);
         assert!(segment_ranges(&lines, 0, 0).is_empty());
@@ -1793,6 +2093,7 @@ mod segment_tests {
                 ..Default::default()
             },
         ];
+        let lines = crate::metadata_store::LineStore::from(lines);
         assert_eq!(segment_ranges(&lines, 0, 2), vec![(0, 1), (1, 2)]);
     }
     #[test]
@@ -1808,6 +2109,8 @@ mod segment_tests {
         let derived = vec![CompiledDerived {
             name: "extracted".into(),
             source: "message".into(),
+            lookup: None,
+            steps: Vec::new(),
             rules: vec![crate::sources::CompiledRule {
                 re: regex::Regex::new("(alpha)").unwrap(),
                 template: None,
@@ -1915,6 +2218,7 @@ mod lifecycle_tests {
             state: Mutex::new(QueueState::default()),
             wake: parking_lot::Condvar::new(),
             revision: AtomicU64::new(1),
+            running: AtomicBool::new(false),
         }
     }
 
@@ -1962,6 +2266,7 @@ mod lifecycle_tests {
             selection_changed: parking_lot::Condvar::new(),
             garbage: Arc::new(Mutex::new(Vec::new())),
             texts: Vec::new(),
+            time_indexes: RwLock::new(None),
             _leases: vec![lease],
         })
     }
@@ -2039,7 +2344,7 @@ mod lifecycle_tests {
         reg.wanted
             .extend([first.spec.parts[0].key.clone(), failed_key.clone()]);
         reg.failed.insert(failed_key.clone(), "disk full".into());
-        first.idx.append(second.idx);
+        first.idx.append(second.idx).unwrap();
         let codes = CodesConfig::default();
         let merged = spec(&first.idx, &codes, &codes, &[]).unwrap();
         assert_eq!(merged.parts[1].key, failed_key);
@@ -2239,6 +2544,63 @@ mod lifecycle_tests {
 mod metadata_identity_tests {
     use super::*;
 
+    /// The key immediately before Java enrichment, including the existing
+    /// calendar/physical-file context. Tiny fixtures each have one segment.
+    fn pre_java_key(idx: &FileIndex) -> String {
+        let part = &idx.parts[0];
+        assert!(part.custom.is_none() && part.ts_config.is_none());
+        let first_offset = idx.lines.at(0).offset - part.base;
+        let last = idx.lines.last().unwrap();
+        let last_end = last.offset - part.base + u64::from(last.len);
+        let derived_sig = derived_signature(&[]).unwrap();
+        let tz = chrono::Local::now().offset().to_string();
+        let custom = ""; let ts = ""; let catalogs = "";
+        let mut hash = Sha256::new();
+        hash.update(format!(
+            "{}|{}|{}|{}|{:?}|{custom}|{ts}|{tz}|{}|{first_offset}|{last_end}|{derived_sig}|{catalogs}|{:?}",
+            build::STORE_VERSION, crate::index_cache::INDEX_DIR, part.identity,
+            part.format, part.header, idx.lines.len(), part.physical_file_id
+        ));
+        hash.update(b"|timezone-configuration:");
+        hash.update(part.calendar.timezone.as_bytes());
+        if matches!(part.format.as_str(), "syslog3164" | "firewall") {
+            hash.update(format!("|inferred-year:{}", part.calendar.year));
+        }
+        if let Some(identity) = &part.event_identity {
+            hash.update(b"|logical-event-identity:");
+            hash.update(serde_json::to_vec(identity).unwrap());
+        }
+        format!("{:x}", hash.finalize())
+    }
+
+    #[test]
+    fn java_enrichment_changes_only_java_store_keys_not_plain_nginx_or_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let codes = CodesConfig::default();
+        for (format, raw, java) in [
+            ("jsonl", "{\"timestamp\":\"2026-09-30T00:00:00Z\",\"message\":\"ordinary\"}\n", false),
+            ("apache", "127.0.0.1 - - [30/Sep/2026:12:00:00 +0000] \"GET /health HTTP/1.1\" 200 5 \"-\" \"client\"\n", false),
+            ("log4j", "2026-09-30 12:00:00,000 ERROR [worker] a.Logger - a.FailureException\n\tat a.Service.run(A.java:1)\n2026-09-30 12:00:01,000 INFO [worker] a.Logger - next\n", true),
+            ("wildfly", "12:00:00,000 ERROR [a.Logger] (worker) a.FailureException\n\tat a.Service.run(A.java:1)\n12:00:01,000 INFO [a.Logger] (worker) next\n", true),
+        ] {
+            let path = dir.path().join(format!("{format}.log"));
+            std::fs::write(&path, raw).unwrap();
+            let idx = crate::sources::index_file(path.to_str().unwrap(), format, None, None, None).unwrap();
+            let actual = spec(&idx, &codes, &codes, &[]).unwrap();
+            assert_eq!(actual.parts.len(), 1);
+            let old = pre_java_key(&idx);
+            assert_eq!(actual.parts[0].key == old, !java, "{format}");
+            if java {
+                assert_eq!(idx.lines.len(), 2, "enrichment preserves the existing two framed records");
+                for &column in crate::java_stacktrace::COLUMNS {
+                    assert!(idx.columns.iter().any(|value| value == column));
+                }
+            } else {
+                assert!(!idx.columns.iter().any(|value| value == "java.trace"));
+            }
+        }
+    }
+
     #[test]
     fn timezone_context_separates_new_engine_keys_from_unverifiable_legacy() {
         let dir = tempfile::tempdir().unwrap();
@@ -2248,7 +2610,7 @@ mod metadata_identity_tests {
         let codes = CodesConfig::default();
         let actual = spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key.clone();
         let part = &idx.parts[0];
-        let first_offset = idx.lines[0].offset - part.base;
+        let first_offset = idx.lines.at(0).offset - part.base;
         let last = idx.lines.last().unwrap();
         let last_end = last.offset - part.base + u64::from(last.len);
         let custom = ""; let ts = ""; let catalogs = "";
@@ -2288,4 +2650,21 @@ mod metadata_identity_tests {
         idx.parts[0].event_identity = Some("other:event".into());
         assert_ne!(alias, spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key);
     }
+    #[test]
+    fn optional_worker_yields_to_interaction_and_quiesce_cancellation() {
+        let interacting = crate::operations::interactive();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancelled);
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done.send(optional_quiet(&|| stop.load(Ordering::Acquire), std::time::Duration::from_millis(1))).unwrap();
+        });
+        assert!(result.recv_timeout(std::time::Duration::from_millis(60)).is_err(), "optional work must not start during an interaction");
+        cancelled.store(true, Ordering::Release);
+        assert!(!result.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+        drop(interacting);
+        assert!(optional_quiet(&|| false, std::time::Duration::from_millis(1)), "idle retry is allowed without a new scheduler");
+    }
+
 }

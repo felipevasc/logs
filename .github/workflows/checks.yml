@@ -3,6 +3,7 @@ name: Pull request checks
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -30,16 +31,24 @@ jobs:
       - run: npx --prefix scripts/preview playwright install --with-deps chromium
       - run: npm run check
       - run: npm run prepare:frontend
-      - run: npm run test:preview
+      - name: Focused draft interaction checks
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft
+        run: npm run test:preview -- test-responsiveness.mjs test-updates.mjs test-explorer-timeline.mjs test-field-transform.mjs test-exclusion-archive.mjs test-case-references.mjs test-canonical-field-actions.mjs test-journeys.mjs test-java-trace.mjs test-native-case-startup.mjs test-native-case-timeline.mjs
+      - name: Full browser regression suite
+        if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+        run: npm run test:preview
       - name: Preserve browser diagnostics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: preview-diagnostics
           path: output/playwright/
           if-no-files-found: ignore
 
+  # Draft development keeps fast checks active; ready-for-review/manual checks
+  # retain the complete native gate. Release/build signing gates are unchanged.
   backend:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Backend tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -73,10 +82,41 @@ jobs:
           workspaces: src-tauri -> target
       - run: npm ci
       - run: npm run prepare:frontend
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+      - name: Backend tests
+        if: runner.os != 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+      - name: Windows backend tests with loader diagnostics
+        if: runner.os == 'Windows'
+        id: backend_windows
+        shell: pwsh
+        run: ./scripts/ci/windows-native-tests.ps1
+      - name: Verify Windows unit harness manifest
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/verify-windows-manifest.ps1 -Target harness
+      - name: Preserve Windows native failure evidence
+        if: failure() && runner.os == 'Windows' && steps.backend_windows.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/windows-native-diagnostics/
+          if-no-files-found: warn
+          retention-days: 30
       - name: Build Windows portable review executable
         if: runner.os == 'Windows'
         run: cargo build --manifest-path src-tauri/Cargo.toml --release --locked --bin loginsight
+      - name: Verify Windows app manifest
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/verify-windows-manifest.ps1 -Target app
+      - name: Preserve Windows manifest verification
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-manifest-verification-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/windows-manifest-verification/
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Record portable executable identity
         if: runner.os == 'Windows'
         shell: pwsh

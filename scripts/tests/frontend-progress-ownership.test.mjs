@@ -68,7 +68,45 @@ emit('timestamps', 'Recalculando timestamps');
 assert.equal(bars.at(-1)[0], 'Recalculando timestamps', 'timestamp configuration keeps its own foreground progress');
 emit('count-old', 'Contagem em segundo plano');
 assert.equal(bars.at(-1)[0], 'Recalculando timestamps');
-assert.ok(source.includes('config: empty ? null : cfg }, { latest: "timestamp-config" }'), 'timestamp command uses the matching progress owner');
+// Execute the real caller and shared receipt-bearing helper. Every file must
+// address the exact named operation shown by the timestamp progress overlay.
+const timestampState = { cases: { active: 'case-a' }, sourcePublication: { generation: 4 } };
+const timestampRequests = [], timestampNotices = [], timestampPaths = ['first.jsonl', 'second.jsonl'];
+const timestampConfig = { sources: ['message'], format: 'unix' };
+let timestampRefreshed = 0, timestampReleased = 0;
+const analysis = {
+  capture: () => ({ caseId: 'case-a', sourceGeneration: timestampState.sourcePublication.generation }),
+  assertOwner: value => assert.equal(value.sourceGeneration, timestampState.sourcePublication.generation),
+};
+timestampState.tsAnalysisOwner = analysis.capture();
+const timestampContext = vm.createContext({
+  state: timestampState, window: { AnalysisContexts: analysis }, $: () => ({}),
+  tsConfigPaths: () => timestampPaths, buildTsConfig: () => timestampConfig,
+  btnBusy: () => () => { timestampReleased++; },
+  showLoadOverlay: (_label, key) => { timestampState.loadOverlay = true; timestampState.loadOverlayProgressKey = key; },
+  hideLoadOverlay: () => { timestampState.loadOverlay = false; },
+  invalidateAnalysisComputedData() {}, refresh: () => { timestampRefreshed++; },
+  toast: message => timestampNotices.push(message),
+  api: async (cmd, args, opts) => {
+    assert.equal(cmd, 'set_ts_config');
+    assert.equal(timestampState.loadOverlay, true);
+    assert.equal(opts.latest, timestampState.loadOverlayProgressKey, 'native work uses the owner displayed by the active overlay');
+    assert.equal(opts.latest, 'timestamp-config');
+    analysis.assertOwner(opts.analysisOwner);
+    timestampRequests.push({ args, owner: opts.analysisOwner });
+    return { publication: { generation: timestampState.sourcePublication.generation + 1, operationId: `timestamp-${timestampRequests.length}` } };
+  },
+});
+vm.runInContext(source.slice(source.indexOf('async function commitTsConfig('), source.indexOf('async function resetTsConfig(')), timestampContext);
+vm.runInContext(source.slice(source.indexOf('async function applyTsConfig('), source.indexOf('// ------------------------------------------------------------------ campo derivado')), timestampContext);
+await timestampContext.applyTsConfig();
+assert.deepEqual(timestampRequests.map(request => request.args.path), timestampPaths);
+assert.ok(timestampRequests.every(request => request.args.config === timestampConfig));
+assert.deepEqual(timestampRequests.map(request => request.owner.sourceGeneration), [4, 5], 'the next file retains its progress owner after adopting the previous publication');
+assert.equal(timestampState.sourcePublication.generation, 6);
+assert.equal(timestampState.loadOverlay, false);
+assert.equal(timestampRefreshed, 1); assert.equal(timestampReleased, 1);
+assert.ok(!timestampNotices.some(message => message.includes('Falha')), 'the actual apply path completed successfully');
 context.hideLoadOverlay(true);
 context.showLoadOverlay('Nova fonte');
 timers.shift()();

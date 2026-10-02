@@ -28,59 +28,64 @@ pub async fn load_bundle(
     members: Vec<ImportSource>,
     app: AppHandle,
     operation_id: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
 ) -> Result<crate::LoadSummary, String> {
-    crate::offload_operation(operation_id, move || {
-        let mut combined: Option<sources::FileIndex> = None;
-        let mut names = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for member in members {
-            let inputs = match member {
-                ImportSource::File { paths, format } => paths
-                    .into_iter()
-                    .map(|path| (path, format.clone(), None))
-                    .collect::<Vec<_>>(),
-                ImportSource::Eventlog {
-                    channel,
-                    max_events,
-                } => vec![(channel, String::new(), Some(max_events.clamp(1, 100_000)))],
-            };
-            for (path, format, max_events) in inputs {
-                crate::operations::check()?;
-                let key = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
-                if !seen.insert(key) {
-                    continue;
-                }
-                let idx = if let Some(max) = max_events {
-                    index_channel(&path, max)?
-                } else {
-                    crate::index_source_file(&path, &format, Some(&app))?
-                };
-                if let Some(all) = &mut combined {
-                    all.append(idx);
-                } else {
-                    combined = Some(idx);
-                }
-                names.push(path);
-            }
-        }
-        let idx = combined.ok_or("Selecione ao menos uma fonte.")?;
-        crate::operations::check()?;
-        let summary = crate::LoadSummary {
-            count: idx.lines.len(),
-            columns: idx.columns.clone(),
-            source_desc: names.join(" + "),
-        };
+    let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Publish)?;
+    crate::offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
-        crate::prepare_engine(state.inner(), &idx, Some(&app))?;
-        crate::emit_progress(Some(&app), "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
-        let mut source = crate::source_write_checked(state.inner())?;
-        crate::operations::commit();
-        crate::engine::source_published(Some(&idx));
-        *source = SourceData::Indexed(idx);
-        *state.source_names.write() = names;
-        Ok(summary)
-    })
-    .await?
+        load_bundle_impl(state.inner(), members, Some(&app))
+    }).await?
+}
+
+pub(crate) fn load_bundle_impl(
+    state: &AppState,
+    members: Vec<ImportSource>,
+    app: Option<&AppHandle>,
+) -> Result<crate::LoadSummary, String> {
+    let mut combined: Option<sources::FileIndex> = None;
+    let mut names = Vec::new();
+    let mut published_inputs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for member in members {
+        let inputs = match member {
+            ImportSource::File { paths, format } => paths
+                .into_iter()
+                .map(|path| (path, format.clone(), None))
+                .collect::<Vec<_>>(),
+            ImportSource::Eventlog {
+                channel,
+                max_events,
+            } => vec![(channel, String::new(), Some(max_events.clamp(1, 100_000)))],
+        };
+        for (path, format, max_events) in inputs {
+            crate::operations::check()?;
+            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
+            if !seen.insert(key) {
+                continue;
+            }
+            let idx = if let Some(max) = max_events {
+                index_channel(&path, max)?
+            } else {
+                crate::index_source_file(&path, &format, app)?
+            };
+            if let Some(all) = &mut combined {
+                all.append(idx)?;
+            } else {
+                combined = Some(idx);
+            }
+            published_inputs.push(match max_events {
+                Some(max_events) => crate::source_publication::Input::Eventlog { channel: path.clone(), max_events },
+                None => crate::source_publication::Input::File { paths: vec![path.clone()], format },
+            });
+            names.push(path);
+        }
+    }
+    let idx = combined.ok_or("Selecione ao menos uma fonte.")?;
+    crate::operations::check()?;
+    crate::prepare_engine(state, &idx, app)?;
+    crate::emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
+    crate::source_publication::publish(state, idx, names, published_inputs, false)
 }
 
 pub struct Selection<'a> {
@@ -127,10 +132,17 @@ impl Iterator for OrderedEvents {
 }
 
 impl Selection<'_> {
+    /// A staging/preview consumer can stream exact row IDs from its admitted
+    /// indexed scope, retaining the caller's existing source/visibility guards.
+    pub(crate) fn visit_exact_ids(&self, visit: impl FnMut(usize) -> Result<bool, String>) -> Result<Option<()>, String> {
+        let SourceData::Indexed(index) = self.source else { return Ok(None); };
+        crate::engine::visit_exact_matches(&crate::engine::Source { idx: index, codes: self.codes, system: self.system, derived: self.derived }, &self.prepared, visit)
+    }
+
     fn batches(&self, idx: &sources::FileIndex) -> EventBatches {
         use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
         // The 50M line metadata and mmaps are shared; do not copy time_order.
-        let idx = sources::FileIndex { parts: idx.parts.clone(), lines: Arc::clone(&idx.lines), columns: idx.columns.clone(), time_order: std::sync::OnceLock::new() };
+        let idx = sources::FileIndex { parts: idx.parts.clone(), lines: Arc::clone(&idx.lines), columns: idx.columns.clone(), time_order: Arc::clone(&idx.time_order) };
         let (codes, system, derived) = ((*self.codes).clone(), (*self.system).clone(), self.derived.to_vec());
         let prepared = Arc::clone(&self.prepared);
         let failure = Arc::clone(&self.failure);
@@ -193,7 +205,11 @@ impl Selection<'_> {
     }
     pub fn event(&self, id: usize) -> Option<Event> {
         match self.source {
-            SourceData::Indexed(idx) => (id < idx.lines.len()).then(|| sources::event_at(idx, id, self.codes, self.system, self.derived)),
+            SourceData::Indexed(idx) => match crate::analysis_runtime::row_visible(idx, id) {
+                Ok(true) => Some(sources::event_at(idx, id, self.codes, self.system, self.derived)),
+                Ok(false) => None,
+                Err(error) => { crate::analysis_runtime::record_failure(error); None }
+            },
             SourceData::Memory(events) => events.get(id).filter(|event| event.id == id).or_else(|| events.iter().find(|event| event.id == id)).cloned(),
             SourceData::None => None,
         }
@@ -214,19 +230,19 @@ pub(crate) fn with_engine<T>(
     state: &AppState,
     f: impl FnOnce(&crate::engine::Source<'_>) -> Result<Option<T>, String>,
 ) -> Result<Option<T>, String> {
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let SourceData::Indexed(idx) = &*source else { return Ok(None) };
     let codes = state.codes.read();
     let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let derived = crate::analysis_runtime::derived(&state);
     f(&crate::engine::Source { idx, codes: &codes, system: &system, derived: &derived })
 }
 
 pub fn with_selection<T>(state: &AppState, filters: &[Filter], f: impl FnOnce(Selection<'_>) -> T) -> Result<T, String> {
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let codes = state.codes.read();
     let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let derived = crate::analysis_runtime::derived(&state);
     if let SourceData::Indexed(idx) = &*source {
         for part in &idx.parts { sources::validate_source(part)?; }
     }
@@ -294,7 +310,9 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
             }
         }
         if f.op == "regex" {
-            regex::Regex::new(&f.value).map_err(|e| format!("Expressão inválida: {e}"))?;
+            crate::operations::check()?;
+            crate::query_regex::compile(&f.value, crate::query_regex::ORDINARY).map_err(|e| format!("Expressão inválida: {e}"))?;
+            crate::operations::check()?;
         }
         if f.op == "threat_rule" {
             if f.column != "_all" {
@@ -368,10 +386,12 @@ pub async fn dataset_overview(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<insights::Overview, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         overview_scope_impl(
             app.state::<AppState>().inner(),
             filters,
@@ -482,16 +502,31 @@ pub fn timeline_range_scope_impl(
         }
         return Ok(result);
     }
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     match &*source {
         SourceData::Indexed(idx) => {
+            let gate = crate::analysis_runtime::indexed_gate(idx)?;
             if scoped_filters.len() == 1 {
+                let codes = state.codes.read();
+                let system = state.system_codes.read();
+                let derived = crate::analysis_runtime::derived(&state);
+                let input = crate::engine::Source { idx, codes: &codes, system: &system, derived: &derived };
+                if let Some(histogram) = crate::engine::timeline_histogram(&input, start, end, width, bucket_count)? {
+                    return Ok(TimelineRange {
+                        start, end, bucket_ms: width, total: histogram.total, errors: histogram.errors, warnings: histogram.warnings,
+                        buckets: histogram.buckets.into_iter().enumerate().map(|(i, b)| TimelineBucket {
+                            timestamp: start.saturating_add((i as i64).saturating_mul(width)),
+                            count: b.count, errors: b.errors, warnings: b.warnings,
+                        }).collect(),
+                    });
+                }
                 // The normal timeline reads only the compact index metadata.
                 // It never allocates an ID for every matching log line.
                 for (id, meta) in idx.lines.iter().enumerate() {
                     if id % 2048 == 0 {
                         crate::operations::check()?;
                     }
+                    if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
                     if meta.ts != 0 {
                         add(meta.ts, crate::model::class_label(meta.level));
                     }
@@ -499,9 +534,9 @@ pub fn timeline_range_scope_impl(
             } else {
                 let codes = state.codes.read();
                 let system = state.system_codes.read();
-                let derived = state.derived.read();
+                let derived = crate::analysis_runtime::derived(&state);
                 query::visit_indexed_matches(idx, &scoped_filters, &codes, &system, &derived, |id| {
-                    let meta = &idx.lines[id];
+                    let meta = &idx.lines.at(id);
                     if meta.ts != 0 { add(meta.ts, crate::model::class_label(meta.level)); }
                 })?;
             }
@@ -530,11 +565,13 @@ pub async fn timeline_range(
     bucket_count: usize,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<TimelineRange, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         if case_events.is_none() {
             return timeline_range_impl(
                 app.state::<AppState>().inner(),
@@ -562,10 +599,12 @@ pub async fn compare_periods(
     after: insights::Period,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<insights::Comparison, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         if case_events.is_none() {
             compare_impl(app.state::<AppState>().inner(), filters, before, after)
         } else {
@@ -639,10 +678,12 @@ pub struct SourceInfo {
     pub sampled: usize,
     pub unparsed: usize,
 }
-pub fn sources_impl(state: &AppState) -> Vec<SourceInfo> {
-    let source = state.source.read();
-    match &*source {
-        SourceData::Indexed(idx) => idx
+pub fn sources_impl(state: &AppState) -> Result<Vec<SourceInfo>, String> {
+    let source = crate::analysis_runtime::source(&state);
+    Ok(match &*source {
+        SourceData::Indexed(idx) => {
+            let gate = crate::analysis_runtime::indexed_gate(idx)?;
+            idx
             .parts
             .iter()
             .map(|p| {
@@ -650,45 +691,48 @@ pub fn sources_impl(state: &AppState) -> Vec<SourceInfo> {
                 let end = idx
                     .lines
                     .partition_point(|m| m.offset < p.base + p.mmap.len() as u64);
-                let lines = &idx.lines[start..end];
-                let min = lines
-                    .iter()
-                    .filter_map(|m| (m.ts != 0).then_some(m.ts))
-                    .min();
-                let max = lines
-                    .iter()
-                    .filter_map(|m| (m.ts != 0).then_some(m.ts))
-                    .max();
-                let sample = lines.len().min(200);
-                let mut unparsed = 0;
-                for n in 0..sample {
-                    let ev = sources::parse_part_line(
-                        p,
-                        sources::line_bytes(idx, start + n * lines.len() / sample),
-                    );
-                    if ev.parse_status == "unparsed" {
-                        unparsed += 1;
+                let mut count = 0usize;
+                let mut undated = 0usize;
+                let (mut min, mut max) = (None, None);
+                let mut sample = Vec::new();
+                for id in start..end {
+                    if id % 2048 == 0 { crate::operations::check()?; }
+                    if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
+                    let meta = idx.lines.at(id);
+                    count += 1;
+                    if meta.ts == 0 { undated += 1; } else {
+                        min = Some(min.map_or(meta.ts, |value: i64| value.min(meta.ts)));
+                        max = Some(max.map_or(meta.ts, |value: i64| value.max(meta.ts)));
+                    }
+                    // A fixed deterministic reservoir remains bounded even if
+                    // the visible source spans tens of millions of records.
+                    if sample.len() < 200 { sample.push(id); }
+                    else {
+                        let position = (id as u64).wrapping_mul(0x9e3779b97f4a7c15).rotate_left(17) % count as u64;
+                        if position < 200 { sample[position as usize] = id; }
                     }
                 }
-                SourceInfo {
+                let unparsed = sample.iter().filter(|&&id| sources::parse_part_line(p, sources::line_bytes(idx, id)).parse_status == "unparsed").count();
+                Ok(SourceInfo {
                     id: p.identity.clone(),
                     path: p.path.clone(),
                     name: p.file_name.clone(),
                     format: p.format.clone(),
                     bytes: p.mmap.len() as u64,
-                    count: lines.len(),
-                    undated: lines.iter().filter(|m| m.ts == 0).count(),
+                    count,
+                    undated,
                     start: min,
                     end: max,
-                    sampled: sample,
+                    sampled: sample.len(),
                     unparsed,
-                }
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, String>>()?
+        },
         SourceData::Memory(events) => vec![SourceInfo {
             id: "eventlog".into(),
             path: String::new(),
-            name: state.source_names.read().join(" + "),
+            name: crate::analysis_runtime::source_names(state).join(" + "),
             format: "Event Log".into(),
             bytes: 0,
             count: events.len(),
@@ -699,11 +743,12 @@ pub fn sources_impl(state: &AppState) -> Vec<SourceInfo> {
             unparsed: 0,
         }],
         SourceData::None => vec![],
-    }
+    })
 }
 #[tauri::command]
-pub async fn list_sources(app: AppHandle) -> Result<Vec<SourceInfo>, String> {
-    crate::offload(move || sources_impl(app.state::<AppState>().inner())).await
+pub async fn list_sources(app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<SourceInfo>, String> {
+    let admitted = crate::analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset)?;
+    crate::offload_admitted(None, app.clone(), admitted, move || sources_impl(app.state::<AppState>().inner())).await?
 }
 
 pub fn index_events(events: &[Event]) -> Result<sources::FileIndex, String> {
@@ -818,10 +863,12 @@ pub async fn export_events(
     mask: bool,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<usize, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         validate(&filters)?;
         if !["csv", "jsonl"].contains(&format.as_str()) {
             return Err("Formato de exportação inválido.".into());
@@ -829,7 +876,7 @@ pub async fn export_events(
         let state = app.state::<AppState>();
         let requested = PathBuf::from(&path);
         let canonical = requested.canonicalize().unwrap_or(requested.clone());
-        if let SourceData::Indexed(idx) = &*state.source.read() {
+        if let SourceData::Indexed(idx) = &*crate::analysis_runtime::source(&state) {
             if idx.parts.iter().any(|p| {
                 PathBuf::from(&p.path)
                     .canonicalize()
@@ -868,6 +915,7 @@ pub async fn export_events(
             file.get_ref().sync_all().map_err(|e| e.to_string())?;
             drop(file);
             crate::operations::check()?;
+            if let Some(admitted) = crate::analysis_runtime::current() { admitted.validate_visibility()?; }
             // Same-directory atomic replacement works for existing destinations
             // on Windows and Unix, after the save picker confirms overwriting.
             pending
@@ -1233,8 +1281,9 @@ mod canonical {
     }
     impl Input {
         pub(crate) fn open(path: &Path) -> Result<Self, String> {
+            crate::operations::check()?;
             let canonical = reader(path)?;
-            let file = File::open(path).map_err(|e| format!("Não foi possível abrir {}: {e}", path.display()))?;
+            let file = crate::case_archive_format::open_regular(path).map_err(|e| format!("Não foi possível abrir {}: {e}", path.display()))?;
             let origin = capture(path, &file)?;
             let (logical_identity, legacy, original, lease) = match canonical {
                 Some((lease, artifact, original)) => (artifact.logical_identity, artifact.legacy, original, Some(lease)),
@@ -1254,7 +1303,8 @@ mod canonical {
             self.legacy.as_ref().map(|alias| (alias.path.clone(), alias.identity.clone()))
         }
         fn validate(&self) -> Result<(), String> {
-            let current = File::open(&self.path).map_err(|e| format!("Fonte indisponível: {e}"))?;
+            crate::operations::check()?;
+            let current = crate::case_archive_format::open_regular(&self.path).map_err(|e| format!("Fonte indisponível: {e}"))?;
             if capture(&self.path, &current)? != self.origin || Stamp::of(&self.file)? != self.origin.stamp {
                 return Err("A fonte foi alterada durante a conversão; reabra uma cópia estável. A conversão incompleta será reiniciada.".into());
             }
@@ -1263,8 +1313,9 @@ mod canonical {
         }
     }
     fn validate_original(original: &Origin) -> Result<(), String> {
+        crate::operations::check()?;
         let path = Path::new(&original.requested_path);
-        let file = File::open(path).map_err(|_| "A fonte original da conversão não está disponível; reabra a fonte original.".to_string())?;
+        let file = crate::case_archive_format::open_regular(path).map_err(|_| "A fonte original da conversão não está disponível; reabra a fonte original.".to_string())?;
         if capture(path, &file)? != *original {
             return Err("A fonte original da conversão mudou; reabra a fonte antes de consultar ou calcular hashes.".into());
         }
@@ -1893,6 +1944,104 @@ mod canonical {
         }
 
         #[test]
+        fn utf32_signatures_do_not_publish_a_misdecoded_utf16_artifact() {
+            let fixture = Fixture::new();
+            for (name, bytes) in [
+                ("UTF-32LE", vec![0xff, 0xfe, 0, 0, b'A', 0, 0, 0, b'\n', 0, 0, 0]),
+                ("UTF-32BE", vec![0, 0, 0xfe, 0xff, 0, 0, 0, b'A', 0, 0, 0, b'\n']),
+            ] {
+                let path = fixture.file("events.log", &bytes);
+                assert!(super::super::sniff_encoding(&bytes).is_none(), "unsupported signatures cannot be reported as UTF-16");
+                let error = super::super::expand_encoding(&path).unwrap_err();
+                assert!(error.contains(name));
+                assert!(error.contains("UTF-8 ou UTF-16"));
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert!(!root().exists(), "reject before publishing any canonical output");
+            }
+            let ambiguous = [0xff, 0xfe, 0, 0, b'A', 0, b'\n', 0];
+            let path = fixture.file("utf16-leading-null.log", &ambiguous);
+            let error = super::super::expand_encoding(&path).unwrap_err();
+            assert!(error.contains("UTF-16LE com NUL inicial"));
+            assert_eq!(std::fs::read(path).unwrap(), ambiguous);
+            assert!(!root().exists());
+            // The same path can be corrected and retried without a stale output.
+            let text = "Falha de autenticação\r\n";
+            let utf16: Vec<u8> = [0xff, 0xfe].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+            let path = fixture.file("events.log", &utf16);
+            let converted = super::super::expand_encoding(&path).unwrap().unwrap();
+            assert_eq!(std::fs::read_to_string(converted).unwrap(), text);
+            assert_eq!(std::fs::read(path).unwrap(), utf16);
+        }
+
+        #[test]
+        fn supported_encoding_signatures_keep_the_existing_detection() {
+            assert_eq!(super::super::sniff_encoding(&[0xff, 0xfe, b'A', 0]).map(|encoding| encoding.name()), Some("UTF-16LE"));
+            assert_eq!(super::super::sniff_encoding(&[0xfe, 0xff, 0, b'A']).map(|encoding| encoding.name()), Some("UTF-16BE"));
+            assert!(super::super::sniff_encoding("\u{feff}ação\n".as_bytes()).is_none());
+            assert_eq!(super::super::sniff_encoding(b"a\xe7\xe3o\n").map(|encoding| encoding.name()), Some("windows-1252"));
+            assert_eq!(super::super::unsupported_encoding_bom(&[0xff, 0xfe]), None);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn source_inputs_and_replacements_decline_non_regular_files() {
+            use std::os::unix::{ffi::OsStrExt, fs::symlink};
+            const INPUT: &str = "LOGINSIGHT_TEST_SOURCE_NONREGULAR_ROOT";
+            if let Some(path) = std::env::var_os(INPUT) {
+                let directory = PathBuf::from(path);
+                std::env::set_var("LOGINSIGHT_DATA_DIR", directory.join("data"));
+                let fifo = |path: &Path| {
+                    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                };
+                let input_path = directory.join("input.jsonl");
+                fifo(&input_path);
+                assert!(Input::open(&input_path).err().unwrap().contains("regular"));
+                assert!(super::super::expand_encoding(&input_path).unwrap_err().contains("regular"));
+                assert!(crate::sources::prepare_index(input_path.to_str().unwrap(), "jsonl", None, None).err().unwrap().contains("regular"));
+
+                let path = directory.join("source.jsonl");
+                std::fs::write(&path, b"{\"message\":\"original\"}\n").unwrap();
+                let input = Input::open(&path).unwrap();
+                let original = input.original.clone();
+                let prepared = crate::sources::prepare_index(path.to_str().unwrap(), "jsonl", None, None).unwrap();
+                let moved = directory.join("source-kept.jsonl");
+                std::fs::rename(&path, &moved).unwrap();
+                fifo(&path);
+                assert!(input.validate().unwrap_err().contains("regular"));
+                assert!(validate_original(&original).is_err());
+                assert!(prepared.validate().unwrap_err().contains("regular"));
+                assert!(crate::sources::validate_source(&prepared.part).unwrap_err().contains("regular"));
+                let link = directory.join("regular-link.jsonl");
+                symlink(&moved, &link).unwrap();
+                let index = crate::index_source_file(link.to_str().unwrap(), "jsonl", None).unwrap();
+                assert_eq!(index.lines.len(), 1, "regular symlink targets remain supported");
+                assert_eq!(std::fs::read(&moved).unwrap(), b"{\"message\":\"original\"}\n");
+
+                let id = format!("source-open-cancel-{}", uuid::Uuid::new_v4());
+                let token = crate::operations::token(Some(id.clone())).unwrap();
+                assert!(crate::operations::run_with_token(token, || {
+                    assert!(crate::operations::cancel_id(&id));
+                    assert!(Input::open(&directory.join("missing")).err().unwrap().contains("cancelada"));
+                }).is_err());
+                return;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "workspace::canonical::tests::source_inputs_and_replacements_decline_non_regular_files", "--test-threads=1"])
+                .env(INPUT, directory.path()).stdout(std::process::Stdio::null()).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); break; }
+                if Instant::now() >= deadline {
+                    let _ = child.kill(); let _ = child.wait();
+                    panic!("source open or revalidation blocked on a non-regular input");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
         fn archive_rejects_missing_or_corrupt_members_and_preserves_virtual_paths() {
             let fixture = Fixture::new();
             let archive = fixture.dir.path().join("logs.zip");
@@ -1985,6 +2134,7 @@ mod canonical {
         fn indexed_state(index: sources::FileIndex) -> AppState {
             AppState {
                 source: parking_lot::RwLock::new(SourceData::Indexed(index)),
+                source_publication: parking_lot::RwLock::new(Default::default()),
                 source_names: parking_lot::RwLock::new(Vec::new()),
                 codes: parking_lot::RwLock::new(Default::default()),
                 system_codes: parking_lot::RwLock::new(Default::default()),
@@ -2346,10 +2496,19 @@ pub fn expand_gzip(path: &Path) -> Result<PathBuf, String> {
     })
 }
 
+fn unsupported_encoding_bom(sample: &[u8]) -> Option<&'static str> {
+    // Check the longest signatures first: UTF-32LE shares UTF-16LE's prefix.
+    // UTF-16LE followed by an initial NUL is ambiguous and is declined too.
+    if sample.starts_with(&[0xFF, 0xFE, 0, 0]) { Some("UTF-32LE") }
+    else if sample.starts_with(&[0, 0, 0xFE, 0xFF]) { Some("UTF-32BE") }
+    else { None }
+}
+
 /// Text logs written by Windows tools in UTF-16 (PowerShell, Event Viewer
 /// exports) or in a legacy code page, recognized from a sample; UTF-8 and
-/// binary files are left as they are.
+/// binary files return None. Import separately rejects unsupported BOMs.
 pub fn sniff_encoding(sample: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    if unsupported_encoding_bom(sample).is_some() { return None; }
     if sample.starts_with(&[0xFF, 0xFE]) {
         return Some(encoding_rs::UTF_16LE);
     }
@@ -2413,6 +2572,10 @@ pub fn expand_encoding(path: &Path) -> Result<Option<PathBuf>, String> {
     let input = CanonicalInput::open(path)?;
     let mut sample = Vec::new();
     input.reader()?.take(1 << 20).read_to_end(&mut sample).map_err(|e| e.to_string())?;
+    if let Some(encoding) = unsupported_encoding_bom(&sample) {
+        let ambiguity = if encoding == "UTF-32LE" { " Também pode ser UTF-16LE com NUL inicial; a leitura automática é ambígua." } else { "" };
+        return Err(format!("A assinatura do arquivo é compatível com {encoding}, que ainda não é suportado.{ambiguity} Converta uma cópia para UTF-8 ou UTF-16 e tente novamente. O arquivo original não foi alterado."));
+    }
     let Some(encoding) = sniff_encoding(&sample) else { return Ok(None) };
     let legacy = input.legacy_source().map(|(path, id)| crate::config_dir().join("expanded").join(format!(
         "{}-utf8-{}", &id[..16], path.file_name().unwrap_or_default().to_string_lossy()
@@ -2438,4 +2601,79 @@ pub fn expand_encoding(path: &Path) -> Result<Option<PathBuf>, String> {
         }
         Ok(())
     }).map(Some)
+}
+
+/// Exact grouped timeline over the same admitted scope as rows/count/facets.
+#[tauri::command]
+pub(crate) async fn grouped_timeline(
+    filters: Vec<Filter>,
+    field: String,
+    grid: crate::grouped_timeline::Grid,
+    limit: Option<usize>,
+    case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
+    operation_id: Option<String>,
+    app: AppHandle,
+) -> Result<crate::grouped_timeline::Response, String> {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let context = crate::grouped_timeline::Context {
+        analysis: admitted.identity.clone(), source_generation: admitted.source_generation, case_key: admitted.case_key.clone(),
+    };
+    let spec = crate::grouped_timeline::Spec::new(field, grid, limit, context)?;
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| grouped_timeline_impl(app.state::<AppState>().inner(), &filters, case_events.as_deref(), &spec)).await?
+}
+
+pub(crate) fn grouped_timeline_impl(
+    state: &AppState, filters: &[Filter], case_events: Option<&[Event]>, spec: &crate::grouped_timeline::Spec,
+) -> Result<crate::grouped_timeline::Response, String> {
+    validate(filters)?;
+    spec.validate()?;
+    let prepared = query::prepare(filters);
+    let mut accumulator = crate::grouped_timeline::Accumulator::new(spec)?;
+    if let Some(events) = case_events {
+        for event in events {
+            crate::operations::check()?;
+            if prepared.iter().all(|filter| query::matches(event, filter)) { accumulator.add_event(event)?; }
+        }
+    } else {
+        if let Some(result) = with_engine(state, |source| crate::engine::grouped_timeline(source, &prepared, spec))? { return Ok(result); }
+        with_selection(state, filters, |selection| {
+            let indexed = matches!(selection.source, SourceData::Indexed(_));
+            for event in selection.iter() {
+                if indexed { accumulator.add_indexed_event(&event)?; }
+                else { accumulator.add_event(&event)?; }
+            }
+            Ok::<(), String>(())
+        })??;
+    }
+    accumulator.finish()
+}
+
+#[cfg(test)]
+mod grouped_epoch_domain_tests {
+    use super::*;
+    #[test]
+    fn grouped_case_and_memory_keep_epoch_distinct_from_absent_time() {
+        let state = AppState {
+            source_publication: Default::default(), source: parking_lot::RwLock::new(SourceData::None),
+            source_names: Default::default(), codes: Default::default(), system_codes: Default::default(),
+            derived: Default::default(), case_store_lock: Default::default(),
+            codes_path: Default::default(), system_codes_path: Default::default(),
+        };
+        let mut epoch = Event::empty(); epoch.timestamp = Some(0); epoch.source = "epoch".into();
+        let mut absent = Event::empty(); absent.id = 1; absent.source = "absent".into();
+        let events = vec![epoch, absent];
+        let spec = crate::grouped_timeline::Spec::new("source".into(),
+            crate::grouped_timeline::Grid { start: 0, bucket_ms: 1, bucket_count: 1 },
+            None, Default::default()).unwrap();
+        let case = grouped_timeline_impl(&state, &[], Some(&events), &spec).unwrap();
+        *state.source.write() = SourceData::Memory(events);
+        let memory = grouped_timeline_impl(&state, &[], None, &spec).unwrap();
+        assert_eq!(case, memory);
+        assert_eq!((case.total.count, case.untimed), (1, 1));
+        assert_eq!(case.total.buckets, [1]);
+        assert_eq!(case.series[0].key, "epoch");
+    }
 }

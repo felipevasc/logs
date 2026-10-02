@@ -191,11 +191,13 @@ struct View<'a> {
     derived: &'a [CompiledDerived],
 }
 impl View<'_> {
-    fn fetch(&self, index: usize) -> Event {
+    fn fetch(&self, index: usize) -> Result<Event, String> {
         match self.records {
-            Records::Memory(events) => events[index].clone(),
+            Records::Memory(events) => Ok(events[index].clone()),
             Records::Indexed(file) => {
-                sources::event_at(file, index, self.codes, self.system, self.derived)
+                let mut event = sources::event_at(file, index, self.codes, self.system, self.derived);
+                crate::analysis_runtime::attach_provenance(file, &mut event)?;
+                Ok(event)
             }
             Records::Empty => unreachable!(),
         }
@@ -251,10 +253,10 @@ fn with_view<T>(
     run: impl FnOnce(&View<'_>) -> Result<T, String>,
 ) -> Result<T, String> {
     crate::workspace::validate(filters)?;
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let codes = state.codes.read();
     let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let derived = crate::analysis_runtime::derived(&state);
     let records = if let Some(events) = case {
         Records::Memory(events)
     } else {
@@ -529,11 +531,11 @@ pub(crate) fn events_impl(
         let rows = ids
             .into_iter()
             .map(|i| {
-                let (row, clipped) = crate::event_preview::preview(&view.fetch(i as usize));
+                let (row, clipped) = crate::event_preview::preview(&view.fetch(i as usize)?);
                 rows_clipped += usize::from(clipped);
-                row
+                Ok(row)
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         operations::check()?;
         Ok(JourneyEvents {
             total,
@@ -552,11 +554,13 @@ pub async fn journey_fields(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: tauri::AppHandle,
     operation_id: Option<String>,
 ) -> Result<Vec<JourneyField>, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         fields_impl(
             app.state::<AppState>().inner(),
             &filters,
@@ -570,6 +574,8 @@ pub async fn journey_index(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     field: String,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -580,8 +586,8 @@ pub async fn journey_index(
     app: tauri::AppHandle,
     operation_id: Option<String>,
 ) -> Result<JourneyIndex, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let filters = window_filters(&field, filters, from, to)?;
         index_impl(
             app.state::<AppState>().inner(),
@@ -601,6 +607,8 @@ pub async fn journey_events(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     field: String,
     value: String,
     from: Option<i64>,
@@ -610,8 +618,8 @@ pub async fn journey_events(
     app: tauri::AppHandle,
     operation_id: Option<String>,
 ) -> Result<JourneyEvents, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
-    crate::offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         events_impl(
             app.state::<AppState>().inner(),
             &filters,
@@ -633,6 +641,7 @@ mod tests {
     fn state() -> AppState {
         AppState {
             source: parking_lot::RwLock::new(SourceData::None),
+            source_publication: parking_lot::RwLock::new(Default::default()),
             source_names: parking_lot::RwLock::new(vec![]),
             derived: parking_lot::RwLock::new(vec![]),
             codes: parking_lot::RwLock::new(Default::default()),

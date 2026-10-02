@@ -5,9 +5,14 @@ window.QueryBar = (() => {
   if (!input) return { status() {} };
   const box = input.closest(".search-box");
   box.classList.add("query-box");
-  input.placeholder = "Buscar ou filtrar…";
+  input.placeholder = "Digite e pressione Enter…";
   input.setAttribute("autocomplete", "off");
+  input.setAttribute("role", "combobox");
+  input.setAttribute("aria-label", "Rascunho de busca; Enter adiciona como filtro");
+  input.setAttribute("aria-invalid", "false");
   input.setAttribute("aria-autocomplete", "list");
+  input.setAttribute("aria-expanded", "false");
+  input.setAttribute("aria-controls", "quick-search-suggestions");
 
   const help = el("button", "query-help");
   help.type = "button";
@@ -15,9 +20,11 @@ window.QueryBar = (() => {
   help.innerHTML = '<i class="fas fa-circle-question" aria-hidden="true"></i>';
   box.append(help);
   const error = el("div", "query-error");
+  error.id = "quick-search-error";
   error.hidden = true;
   box.after(error);
   const list = el("div", "query-suggest");
+  list.id = "quick-search-suggestions";
   list.setAttribute("role", "listbox");
   list.hidden = true;
   document.body.append(list);
@@ -25,7 +32,7 @@ window.QueryBar = (() => {
   const EXAMPLES = [
     ["falha login", "texto em qualquer campo"],
     ["user:admin", "valor de um campo"],
-    ["status>=500", "comparação numérica"],
+    ["code>=500", "comparação numérica"],
     ["ip:10.0.0.0/8", "rede"],
     ["host:web*", "curinga"],
     ["user:(ana OR bruno)", "lista de valores"],
@@ -53,17 +60,26 @@ window.QueryBar = (() => {
 
   function status(problem) {
     box.classList.toggle("invalid", !!problem);
+    input.setAttribute("aria-invalid", String(!!problem));
+    if (problem) input.setAttribute("aria-errormessage", error.id);
+    else input.removeAttribute("aria-errormessage");
     error.textContent = problem || "";
     error.hidden = !problem || document.activeElement !== input;
   }
-  input.addEventListener("focus", () => { error.hidden = !box.classList.contains("invalid"); });
-  input.addEventListener("blur", () => { setTimeout(() => { list.hidden = true; error.hidden = true; }, 150); });
+  input.addEventListener("focus", () => { error.hidden = !box.classList.contains("invalid"); suggest(); });
+  input.addEventListener("blur", () => { setTimeout(() => { if (document.activeElement !== input) { dismissSuggestions(); error.hidden = true; } }, 150); });
 
   // ---------------------------------------------------------------- completion
   const ROLES = ["@user", "@src_ip", "@dst_ip", "@host", "@process", "@parent_process", "@cmdline", "@url", "@domain", "@hash", "@dst_port", "@user_agent", "@file", "@status", "@action", "@outcome", "@src_scope", "@dst_scope", "@tool"];
   const ACTIONS = ["logon", "logoff", "process_start", "network_connection", "dns_query", "http_request", "service_install", "task_create", "account_create", "group_member_add", "password_change", "log_clear", "privilege_use", "script_execution", "file_create", "registry_change", "ids_alert", "malware_detected"];
-  let items = [], active = -1, token = null, valueCache = new Map(), serial = 0;
+  let items = [], active = -1, token = null, valueCache = new Map(), serial = 0, suggestionNotice = "";
   const fold = text => text.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+  const sourceIdentities = new WeakMap(); let nextSourceIdentity = 0;
+  function sourceIdentity(value) {
+    if (value == null || typeof value !== "object") return null;
+    if (!sourceIdentities.has(value)) sourceIdentities.set(value, ++nextSourceIdentity);
+    return sourceIdentities.get(value);
+  }
 
   function currentToken() {
     const caret = input.selectionStart ?? input.value.length;
@@ -95,38 +111,77 @@ window.QueryBar = (() => {
       return rules.filter(r => r.enabled && (fold(r.id).includes(q) || fold(r.name).includes(q))).slice(0, 8).map(r => ({ text: r.id, label: r.name, detail: r.id }));
     }
     if (resolved === "level") return ["erro", "aviso", "informação", "crítico", "depuração"].filter(a => fold(a).startsWith(fold(prefix))).map(a => ({ text: a, label: a, detail: "" }));
-    const key = JSON.stringify([workspaceScope(), window.Workspace?.sourceKey?.(), resolved]);
-    let values = valueCache.get(key);
+    const scope = workspaceScope(), sourceKey = window.Workspace?.sourceKey?.();
+    const key = JSON.stringify([scope, sourceKey, state.datasetRevision, resolved]);
+    // The tree retains useful previous results while refreshing. Only take
+    // counts whose selection/revision prefix still matches the current source.
+    const facetPrefix = [scope, state.datasetRevision, JSON.stringify(state.derivedFields), JSON.stringify(backendFilters())].join("|") + "|";
+    const cached = state.treeAggSig?.[scope]?.startsWith(facetPrefix) ? state.treeAgg?.[scope]?.[resolved] : null;
+    const prior = valueCache.get(key), rowToken = sourceIdentity(state.rows), facetToken = sourceIdentity(cached);
+    let values = prior?.facetToken === facetToken && prior?.rowToken === rowToken ? prior.values : null;
+    const sampled = !Array.isArray(cached);
     if (!values) {
-      try {
-        const request = typeof analyticsRequest === "function" ? analyticsRequest(workspaceScope()) : { filters: [] };
-        const result = await api("tree_aggs", { ...request, filters: (request.filters || []).filter(f => !f._quick && f.op !== "query"), columns: [resolved] }, { silent: true });
-        const agg = result?.[0]?.[1];
-        values = (agg?.rows || []).map((row, i) => ({ value: agg.group_values ? agg.group_values[i] : row[agg.columns[0]], count: row[agg.columns[1]] ?? 0 })).filter(v => v.value != null && v.value !== "").slice(0, 200);
-      } catch { values = []; }
-      valueCache.set(key, values);
+      let oversized = false;
+      // Completion is local while the search is a draft. Reuse already
+      // displayed facets/rows instead of launching a full aggregation per token.
+      if (Array.isArray(cached)) values = cached.slice(0, 200).map(([value, count]) => ({ value, count }));
+      else {
+        const seen = new Map();
+        for (const event of state.rows || []) {
+          const value = resolved.startsWith("@") ? window.QueryLang.fieldValue(event, window.QueryLang.resolve(resolved)) : cellValue(event, resolved);
+          const text = value == null ? "" : String(value);
+          if (text.length > 4096) { oversized = true; continue; }
+          if (text !== "") seen.set(text, (seen.get(text) || 0) + 1);
+          if (seen.size >= 200) break;
+        }
+        values = [...seen].map(([value, count]) => ({ value, count }));
+      }
+      // Completion is optional. Do not normalize/render or insert megabyte
+      // values into the search box; the full-value composer remains available.
+      oversized ||= values.some(item => String(item.value ?? "").length > 4096);
+      values = values.filter(item => item.value != null && String(item.value).length <= 4096);
+      // Tokens invalidate by identity without retaining whole old pages/facet arrays.
+      valueCache.set(key, { values, facetToken, rowToken, oversized });
       if (valueCache.size > 40) valueCache.delete(valueCache.keys().next().value);
     }
     const query = fold(prefix);
-    return values.filter(v => fold(String(v.value)).includes(query)).slice(0, 8).map(v => {
+    const found = values.filter(v => fold(String(v.value)).includes(query)).slice(0, 8).map(v => {
       const text = String(v.value);
-      return { text: /[\s():"]/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text, label: text, detail: fmtNum(v.count) };
+      return { text: `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`, label: text, detail: `${fmtNum(v.count)} ${sampled ? "nesta página" : "no painel de campos"}` };
     });
+    found.notice = valueCache.get(key)?.oversized ? "Valores longos foram omitidos das sugestões. Abra o evento e use Criar filtro para o valor completo." : "";
+    return found;
+  }
+  function suggestionLabel(value) {
+    const text = String(value ?? "");
+    if (text.length <= 200) return text;
+    let end = 199;
+    if (/[\uD800-\uDBFF]/.test(text[end - 1]) && /[\uDC00-\uDFFF]/.test(text[end])) end--;
+    return text.slice(0, end) + "…";
+  }
+  function dismissSuggestions() {
+    clearTimeout(suggestTimer); serial++; items = []; suggestionNotice = ""; active = -1; draw();
   }
   function draw() {
-    list.hidden = !items.length;
-    if (!items.length) return;
-    list.innerHTML = items.map((item, i) => `<div class="query-option${i === active ? " active" : ""}" role="option" data-index="${i}"><span>${esc(item.label)}</span><small>${esc(item.detail || "")}</small></div>`).join("");
+    list.hidden = !items.length && !suggestionNotice;
+    input.setAttribute("aria-expanded", String(!list.hidden));
+    if (!list.hidden && active >= 0 && items[active]) input.setAttribute("aria-activedescendant", `${list.id}-${active}`);
+    else input.removeAttribute("aria-activedescendant");
+    if (list.hidden) return;
+    list.innerHTML = items.map((item, i) => `<div id="${list.id}-${i}" class="query-option${i === active ? " active" : ""}" role="option" aria-selected="${i === active}" data-index="${i}"><span>${esc(suggestionLabel(item.label))}</span><small>${esc(suggestionLabel(item.detail || ""))}</small></div>`).join("")
+      + (suggestionNotice ? `<div class="query-option muted small" role="note">${esc(suggestionNotice)}</div>` : "");
     const r = box.getBoundingClientRect();
     list.style.left = `${r.left}px`; list.style.top = `${r.bottom + 4}px`; list.style.minWidth = `${Math.max(r.width, 260)}px`;
   }
   async function suggest() {
     const mine = ++serial;
-    token = currentToken();
-    if (!token || document.activeElement !== input) { items = []; draw(); return; }
+    const requestToken = currentToken();
+    token = requestToken;
+    if (!token || composing || document.activeElement !== input) { items = []; suggestionNotice = ""; draw(); return; }
     const found = token.kind === "field" ? fieldOptions(token.prefix) : await valueOptions(token.field, token.prefix);
-    if (mine !== serial) return;
+    if (mine !== serial || document.activeElement !== input) return;
     // A complete field name needs no suggestion of itself.
+    suggestionNotice = found.notice || "";
     items = found.filter(item => item.text !== (token.kind === "field" ? `${token.prefix}:` : token.prefix));
     active = items.length ? 0 : -1;
     draw();
@@ -139,7 +194,7 @@ window.QueryBar = (() => {
     input.value = value.slice(0, token.start) + insert + value.slice(token.end);
     const caret = token.start + insert.length;
     input.setSelectionRange(caret, caret);
-    items = []; draw();
+    items = []; suggestionNotice = ""; draw();
     input.dispatchEvent(new Event("input", { bubbles: true }));
     if (token.kind === "field") suggest();
     return true;
@@ -147,22 +202,44 @@ window.QueryBar = (() => {
   let suggestTimer = null;
   input.addEventListener("input", () => {
     clearTimeout(suggestTimer);
-    // Suggestions for another token are stale as soon as the text changes.
-    const next = currentToken();
-    if (!next || !token || next.kind !== token.kind || next.start !== token.start) { items = []; draw(); }
-    suggestTimer = setTimeout(suggest, 90);
+    // Invalidate before the debounce, including async suggestions for the
+    // same field/prefix. Typing never starts a native data query or a save.
+    serial++; items = []; suggestionNotice = ""; draw();
+    if (!composing) suggestTimer = setTimeout(suggest, 90);
   });
+  let composing = false;
+  input.addEventListener("compositionstart", () => { composing = true; clearTimeout(suggestTimer); serial++; items = []; suggestionNotice = ""; draw(); });
+  input.addEventListener("compositionend", () => { composing = false; clearTimeout(suggestTimer); suggestTimer = setTimeout(suggest, 90); });
+  function clearDraft() { clearTimeout(suggestTimer); serial++; items = []; suggestionNotice = ""; draw(); status(null); }
+  function clearCache() { valueCache.clear(); clearTimeout(suggestTimer); serial++; items = []; suggestionNotice = ""; draw(); }
+  function captureDraft() {
+    return { value: input.value, start: input.selectionStart, end: input.selectionEnd, direction: input.selectionDirection };
+  }
+  function restoreDraft(draft) {
+    clearDraft(); composing = false;
+    input.value = typeof draft?.value === "string" ? draft.value : "";
+    const bounded = n => Number.isInteger(n) ? Math.max(0, Math.min(input.value.length, n)) : input.value.length;
+    const start = bounded(draft?.start), end = Math.max(start, bounded(draft?.end));
+    input.setSelectionRange(start, end, ["forward", "backward"].includes(draft?.direction) ? draft.direction : "none");
+    $("#btn-add-search").disabled = !input.value.trim();
+    status(window.QueryLang?.validate(input.value) || null);
+  }
+  function submit() { if (composing) return false; const applied = commitQuickSearch(); if (applied) clearDraft(); return applied; }
   input.addEventListener("keydown", event => {
-    if (list.hidden) return;
+    if (event.isComposing || composing || event.keyCode === 229) return;
+    if (event.key === "Enter") { event.preventDefault(); if (!event.repeat) submit(); return; }
+    if (event.key === "Escape") {
+      if (!list.hidden) { event.preventDefault(); event.stopPropagation(); }
+      dismissSuggestions(); return;
+    }
+    if (list.hidden || !items.length) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       active = (active + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
       draw();
-    } else if ((event.key === "Tab" || event.key === "Enter") && active >= 0) {
+    } else if (event.key === "Tab" && active >= 0) {
       event.preventDefault();
       accept();
-    } else if (event.key === "Escape") {
-      items = []; draw();
     }
   });
   list.addEventListener("mousedown", event => {
@@ -171,11 +248,14 @@ window.QueryBar = (() => {
     event.preventDefault();
     accept(+option.dataset.index);
   });
-  document.addEventListener("workspace-context-change", () => valueCache.clear());
+  document.addEventListener("workspace-context-change", clearCache);
   // A canonical field name still being typed ("@us") is not a text search yet.
   function typingField() {
     const t = currentToken();
     return !!t && t.kind === "field" && t.prefix.startsWith("@") && ROLES.some(r => r !== t.prefix && r.startsWith(t.prefix));
   }
-  return { status, typingField, clearCache: () => valueCache.clear() };
+  // Workspace restoration may run before this script. Synchronize the existing
+  // draft without applying it, querying, saving or moving keyboard focus.
+  restoreDraft(captureDraft());
+  return { status, typingField, submit, clearDraft, captureDraft, restoreDraft, clearCache };
 })();

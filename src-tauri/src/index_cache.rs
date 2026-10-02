@@ -1,5 +1,4 @@
 //! Versioned on-disk line indexes. Raw files are never copied into the cache.
-use crate::model::LineMeta;
 use crate::sources::{self, CompiledTsConfig, CustomParse, FileIndex};
 use sha2::{Digest, Sha256};
 use std::io::{BufWriter, Write};
@@ -50,9 +49,16 @@ pub fn prune() {
     // Timestamp overlays are immutable; only aged temporaries are orphaned.
     if let Ok(entries) = std::fs::read_dir(base.join(INDEX_DIR)) {
         for entry in entries.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with("timestamps-") { continue; }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("timestamps-") || name.ends_with(".lock") { continue; }
             let stale = entry.metadata().ok().and_then(|m| m.accessed().or_else(|_| m.modified()).ok()).is_some_and(|t| t < cutoff);
-            if stale { let _ = std::fs::remove_file(entry.path()); }
+            if stale {
+                // Stable lock files are never removed. Active mapped readers
+                // keep this generation alive on every supported platform.
+                if let Ok(_lease) = crate::metadata_store::overlay_lease(&entry.path(), true) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
         }
     }
 }
@@ -92,6 +98,15 @@ pub(crate) fn open_with_progress(path: &str, format: &str, custom: Option<Custom
 pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::path::Path, progress: crate::metadata_checkpoint::Reporter<'_>) -> Result<FileIndex, String> {
     use crate::metadata_checkpoint::{report, Journal, OpenError, Progress, Resume};
     let key = prepared.key()?;
+    prepared.validate()?;
+    if let Some((lines, mut columns)) = crate::metadata_checkpoint::open_complete(dir, &key, prepared.part.mmap.len(), prepared.initial_cursor(), prepared.multiline(), progress)? {
+        prepared.validate()?;
+        // Completed journals bypass index_prepared. Refresh only the in-memory
+        // supported-field catalog; record framing and persisted bytes stay put.
+        crate::java_stacktrace::extend_columns(&prepared.part.format, &mut columns);
+        let mut part = prepared.part.clone(); part.metadata_identity = key;
+        return Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(lines), columns, time_order: std::sync::Arc::new(std::sync::OnceLock::new()) });
+    }
     let resumed = std::cell::Cell::new(0usize);
     let committed = std::cell::Cell::new(0usize);
     let parsed = std::cell::Cell::new(0usize);
@@ -111,10 +126,10 @@ pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::pat
             (None, Resume { cursor: prepared.initial_cursor(), ..Resume::default() })
         }
     };
-    let mut sink = |lines: &[LineMeta], cursor, scan_complete, columns: Option<&[String]>| -> Result<(), String> {
+    let mut sink = |lines: &mut crate::metadata_store::LineBuilder, cursor, scan_complete, columns: Option<&[String]>| -> Result<(), String> {
         prepared.validate()?;
         if let Some(active) = journal.as_mut() {
-            if let Err(error) = active.checkpoint(lines, cursor, scan_complete, columns, Some(&forward), &|| prepared.validate()) {
+            if let Err(error) = active.checkpoint_rows(lines, cursor, scan_complete, columns, Some(&forward), &|| prepared.validate()) {
                 crate::operations::check()?;
                 // A changed source is fatal even if the persistence operation
                 // failed at the same time. Never continue a mixed generation.
@@ -128,8 +143,21 @@ pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::pat
         }
         Ok(())
     };
-    let idx = sources::index_prepared(prepared, resume, &mut sink, Some(&forward))?;
+    let mut idx = sources::index_prepared(prepared, resume, &mut sink, Some(&forward))?;
     drop(sink);
+    let persisted = journal.is_some();
+    drop(journal);
+    if persisted {
+        // The post-write verification is visible, but these newly written rows
+        // are not falsely reported as resumed from a prior load.
+        let handoff = |p: &Progress| {
+            let mut p = p.clone(); p.resumed_rows = resumed.get(); forward(&p);
+        };
+        if let Some((lines, _)) = crate::metadata_checkpoint::open_complete(dir, &key, prepared.part.mmap.len(), prepared.initial_cursor(), prepared.multiline(), Some(&handoff))? {
+            prepared.validate()?;
+            idx.lines = std::sync::Arc::new(lines);
+        }
+    }
     crate::operations::check()?;
     if let Some(error) = warning {
         eprintln!("[índice] checkpoint de metadados indisponível: {error}");
@@ -138,6 +166,17 @@ pub(crate) fn open_prepared_at(prepared: &sources::PreparedIndex, dir: &std::pat
         forward(&p);
     }
     Ok(idx)
+}
+
+/// Only timestamp rules reading newly enriched fields (or their query-parameter
+/// descendants) depend on this parser revision. Raw/legacy-field rules do not.
+fn timestamp_enrichment_revision(format: &str, sources: &[String]) -> Option<&'static str> {
+    crate::java_stacktrace::enrichment_signature(format).filter(|_| {
+        sources.iter().any(|source| source == "event_ref" || crate::java_stacktrace::COLUMNS.iter().any(|column| {
+            source == column
+                || source.strip_prefix(column).is_some_and(|tail| tail.starts_with('.'))
+        }))
+    })
 }
 
 /// Corrected timestamps are cached only after the display path/file name have
@@ -162,6 +201,10 @@ fn timestamp_key(idx: &FileIndex) -> Option<String> {
     hash.update(part.calendar.timezone.as_bytes());
     if matches!(part.format.as_str(), "syslog3164" | "firewall") {
         hash.update(format!("|inferred-year:{}", part.calendar.year));
+    }
+    if let Some(revision) = timestamp_enrichment_revision(&part.format, &config.sources) {
+        hash.update(b"|timestamp-parser-enrichment:");
+        hash.update(revision.as_bytes());
     }
     Some(format!("{:x}", hash.finalize()))
 }
@@ -234,6 +277,7 @@ fn restore_timestamps(
     path: &std::path::Path,
     progress: Option<&(dyn Fn(&str, usize, usize) + Sync)>,
 ) -> Result<bool, String> {
+    let Ok(lease) = crate::metadata_store::overlay_lease(path, false) else { return Ok(false); };
     let Ok(file) = std::fs::File::open(path) else {
         return Ok(false);
     };
@@ -269,33 +313,12 @@ fn restore_timestamps(
     if hash.finalize().as_slice() != &mapped[payload_len..] {
         return Ok(false);
     }
-    let mut last_report = std::time::Instant::now();
-    // No additional full-length timestamp vector on a warm open. The mutable
-    // index belongs exclusively to this still-unpublished load transaction.
-    for (chunk_index, chunk) in std::sync::Arc::make_mut(&mut idx.lines)
-        .chunks_mut(8192)
-        .enumerate()
-    {
-        crate::operations::check()?;
-        let first = chunk_index * 8192;
-        for (i, line) in chunk.iter_mut().enumerate() {
-            let offset = 80 + (first + i) * 8;
-            line.ts = i64::from_le_bytes(mapped[offset..offset + 8].try_into().unwrap());
-        }
-        if last_report.elapsed() >= std::time::Duration::from_millis(150) {
-            if let Some(report) = progress {
-                report(
-                    "Reutilizando cache de data/hora",
-                    first + chunk.len(),
-                    count,
-                );
-            }
-            last_report = std::time::Instant::now();
-        }
-    }
     sources::validate_source(&idx.parts[0])?;
+    if let Some(report) = progress { report("Reutilizando cache de data/hora", count, count); }
     crate::operations::check()?;
-    idx.time_order.take();
+    let timestamps = crate::metadata_store::Timestamps::from_validated_map(mapped, 80, count, Some(lease))?;
+    idx.lines = std::sync::Arc::new(idx.lines.with_timestamps(timestamps)?);
+    idx.time_order = std::sync::Arc::new(std::sync::OnceLock::new());
     if let Some(report) = progress {
         report("Reutilizando cache de data/hora", count, count);
     }
@@ -310,6 +333,7 @@ fn write_timestamps(
     if let Some(report) = progress {
         report("Gravando cache de data/hora", 0, idx.lines.len());
     }
+    let _lease = crate::metadata_store::overlay_lease(path, true)?;
     let temporary = path.with_extension(format!("{}.pending", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut out = BufWriter::with_capacity(
@@ -393,14 +417,16 @@ mod timestamp_overlay_tests {
         assert!(!timestamps_at(&mut idx, &cache, None).unwrap());
         let expected: Vec<_> = idx.lines.iter().map(|m| m.ts).collect();
         assert_eq!(expected, vec![1700000001234, 1700000005678]);
-        for line in std::sync::Arc::make_mut(&mut idx.lines) {
-            line.ts = 0;
-        }
+        idx.lines = std::sync::Arc::new(idx.lines.iter().map(|mut line| { line.ts = 0; line }).collect::<Vec<_>>().into());
         assert!(timestamps_at(&mut idx, &cache, None).unwrap());
         assert_eq!(idx.lines.iter().map(|m| m.ts).collect::<Vec<_>>(), expected);
         let mut bytes = std::fs::read(&cache).unwrap();
         bytes[80] ^= 1;
-        std::fs::write(&cache, bytes).unwrap();
+        let corrupt = dir.path().join("corrupt.bin");
+        std::fs::write(&corrupt, bytes).unwrap();
+        // Release this test reader before replacing its cache generation.
+        idx.lines = std::sync::Arc::new(idx.lines.iter().collect::<Vec<_>>().into());
+        std::fs::rename(corrupt, &cache).unwrap();
         assert!(!timestamps_at(&mut idx, &cache, None).unwrap());
         assert_eq!(idx.lines.iter().map(|m| m.ts).collect::<Vec<_>>(), expected);
     }
@@ -422,9 +448,7 @@ mod timestamp_overlay_tests {
         let (dir, mut idx) = fixture();
         let cache = dir.path().join("timestamps.bin");
         timestamps_at(&mut idx, &cache, None).unwrap();
-        for line in std::sync::Arc::make_mut(&mut idx.lines) {
-            line.ts = 0;
-        }
+        idx.lines = std::sync::Arc::new(idx.lines.iter().map(|mut line| { line.ts = 0; line }).collect::<Vec<_>>().into());
         let published = std::sync::Arc::clone(&idx.lines);
         let token = crate::operations::token(Some("timestamp-restore-cancel".into())).unwrap();
         let result = crate::operations::run_with_token(token, || {
@@ -440,8 +464,171 @@ mod timestamp_overlay_tests {
             result.is_err(),
             "cancellation prevents publishing the new load"
         );
-        assert_eq!(published[0].ts, 0);
-        assert_eq!(published[1].ts, 0);
+        assert_eq!(published.at(0).ts, 0);
+        assert_eq!(published.at(1).ts, 0);
+    }
+}
+
+#[cfg(test)]
+mod java_warm_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn old_completed_java_journal_gains_scalar_columns_without_reparse_or_rewrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("java.log");
+        let cache = directory.path().join("metadata");
+        std::fs::write(&path, "2026-09-30 12:00:00,000 ERROR [worker] a.Logger - failure\n\
+a.FailureException: detail\n\tat a.Service.run(A.java:1)\n\
+2026-09-30 12:00:01,000 INFO [worker] a.Logger - next\n").unwrap();
+        let prepared = sources::prepare_index(path.to_str().unwrap(), "log4j", None, None).unwrap();
+        let key = prepared.key().unwrap();
+        let (mut journal, resume) = crate::metadata_checkpoint::Journal::open(
+            &cache, &key, prepared.part.mmap.len(), prepared.initial_cursor(), prepared.multiline(), None,
+        ).unwrap_or_else(|_| panic!("failed to create the tiny completed-journal fixture"));
+        let cold = sources::index_prepared(&prepared, resume, &mut |lines, cursor, complete, columns| {
+            // Publish a valid completed journal with the pre-enrichment catalog.
+            let old = columns.map(|columns| columns.iter().filter(|name| !name.starts_with("java.")).cloned().collect::<Vec<_>>());
+            journal.checkpoint_rows(lines, cursor, complete, old.as_deref(), None, &|| prepared.validate())
+        }, None).unwrap();
+        let expected: Vec<_> = cold.lines.iter().map(|row| (row.offset, row.len, row.ts, row.level, row.code_off, row.code_len)).collect();
+        drop(cold);
+        drop(journal);
+        let (_, old_columns) = crate::metadata_checkpoint::open_complete(
+            &cache, &key, prepared.part.mmap.len(), prepared.initial_cursor(), prepared.multiline(), None,
+        ).unwrap().unwrap();
+        assert!(!old_columns.iter().any(|name| name.starts_with("java.")));
+        let immutable = [cache.join(format!("{key}.lines")), cache.join(format!("{key}.state"))];
+        let before: Vec<_> = immutable.iter().map(|path| (std::fs::read(path).unwrap(), std::fs::metadata(path).unwrap().modified().unwrap())).collect();
+        let warm_prepared = sources::prepare_index(path.to_str().unwrap(), "log4j", None, None).unwrap();
+        assert_eq!(warm_prepared.key().unwrap(), key);
+        let warm = open_prepared_at(&warm_prepared, &cache, None).unwrap();
+        assert_eq!(warm_prepared.parsed_rows.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(warm.parts[0].metadata_identity, key);
+        assert_eq!(warm.lines.iter().map(|row| (row.offset, row.len, row.ts, row.level, row.code_off, row.code_len)).collect::<Vec<_>>(), expected);
+        for &column in crate::java_stacktrace::COLUMNS {
+            assert!(warm.columns.iter().any(|name| name == column));
+        }
+        assert!(!warm.columns.iter().any(|name| name == "java.trace"));
+        for (path, (bytes, modified)) in immutable.iter().zip(before) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), modified);
+        }
+    }
+}
+
+#[cfg(test)]
+mod java_timestamp_dependency_tests {
+    use super::*;
+
+    fn old_key(idx: &FileIndex) -> String {
+        let part = &idx.parts[0];
+        let config = part.ts_config.as_ref().unwrap();
+        let mut hash = Sha256::new();
+        hash.update(format!("timestamps-v1|{INDEX_DIR}|{}|{}|{}|{}|{}|{}|{:?}",
+            part.identity, part.path, part.file_name, config.signature(),
+            chrono::Local::now().offset(), idx.lines.len(), part.physical_file_id));
+        hash.update(b"|raw-metadata-identity:"); hash.update(part.metadata_identity.as_bytes());
+        hash.update(b"|timezone-configuration:"); hash.update(part.calendar.timezone.as_bytes());
+        if matches!(part.format.as_str(), "syslog3164" | "firewall") {
+            hash.update(format!("|inferred-year:{}", part.calendar.year));
+        }
+        format!("{:x}", hash.finalize())
+    }
+
+    fn old_overlay(path: &std::path::Path, idx: &FileIndex) {
+        let mut bytes = b"LTSO0001".to_vec();
+        bytes.extend_from_slice(&(idx.lines.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(old_key(idx).as_bytes());
+        for row in idx.lines.iter() { bytes.extend_from_slice(&row.ts.to_le_bytes()); }
+        let digest = Sha256::digest(&bytes); bytes.extend_from_slice(&digest);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn only_java_rules_reading_new_scalar_fields_change_overlay_keys() {
+        for format in ["log4j", "wildfly"] {
+            assert!(timestamp_enrichment_revision(format, &["event_ref".into()]).is_some());
+            for &column in crate::java_stacktrace::COLUMNS {
+                assert_eq!(timestamp_enrichment_revision(format, &[column.into()]), Some("java-trace-v1"));
+            }
+            assert!(timestamp_enrichment_revision(format, &["java.exception.message.ts".into()]).is_some());
+            for column in ["linha", "arquivo", "caminho", "timestamp", "hora_linha", "exception", "stacktrace", "message", "@host", "JAVA.exception.message", "java.unrelated", "java.exception.message_suffix"] {
+                assert!(timestamp_enrichment_revision(format, &[column.into()]).is_none(), "{column}");
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for (format, raw) in [
+            ("jsonl", "{\"timestamp\":\"2026-09-30T00:00:00Z\",\"message\":\"ordinary\"}\n"),
+            ("apache", "127.0.0.1 - - [30/Sep/2026:12:00:00 +0000] \"GET /health HTTP/1.1\" 200 5 \"-\" \"client\"\n"),
+        ] {
+            let path = directory.path().join(format!("{format}.log")); std::fs::write(&path, raw).unwrap();
+            let config = sources::TsConfig { sources: vec!["java.exception.message".into()], format: "epoch_ms".into(), ..Default::default() }.compile().unwrap();
+            let idx = sources::index_file(path.to_str().unwrap(), format, None, Some(config), None).unwrap();
+            assert_eq!(timestamp_key(&idx).unwrap(), old_key(&idx), "{format}");
+        }
+    }
+
+    #[test]
+    fn java_fields_change_synthesized_event_ref_timestamp_inputs() {
+        let raw = b"2026-09-30 12:00:00,000 ERROR [worker] a.Logger - a.FailureException: detail\n\tat a.Service.run(A.java:1)\n";
+        let mut current = sources::parse_line_at(raw, "log4j", None, &[], 2026);
+        let mut legacy = current.clone();
+        legacy.fields.retain(|name, _| !name.starts_with("java."));
+        assert!(current.event_ref.is_empty() && legacy.event_ref.is_empty());
+        let old_ref = legacy.col_str("event_ref").unwrap();
+        assert_ne!(old_ref, current.col_str("event_ref").unwrap());
+        let config = sources::TsConfig {
+            sources: vec!["event_ref".into()], format: "epoch_ms".into(),
+            rules: vec![
+                sources::TsRule { regex: Some(format!("^{}$", regex::escape(&old_ref))), template: Some("111".into()) },
+                sources::TsRule { regex: None, template: None },
+            ], ..Default::default()
+        }.compile().unwrap();
+        sources::apply_ts_config_event(&mut legacy, &config);
+        sources::apply_ts_config_event(&mut current, &config);
+        assert_eq!(legacy.timestamp, Some(111));
+        assert_ne!(current.timestamp, Some(111), "changed parsed fields can alter a rule over the synthesized reference");
+        assert!(timestamp_enrichment_revision("log4j", &config.sources).is_some());
+        assert!(timestamp_enrichment_revision("jsonl", &config.sources).is_none());
+        assert!(timestamp_enrichment_revision("apache", &config.sources).is_none());
+    }
+
+    #[test]
+    fn raw_journal_is_reused_but_an_old_java_rule_overlay_is_recomputed() {
+        let directory = tempfile::tempdir().unwrap(); let path = directory.path().join("java.log");
+        std::fs::write(&path, "2026-09-30 12:00:00,000 ERROR [worker] a.Logger - a.FailureException: 123456\n\tat a.Service.run(A.java:1)\n2026-09-30 12:00:01,000 INFO [worker] a.Logger - next\n").unwrap();
+        let config = sources::TsConfig { sources: vec!["java.exception.message".into()], format: "epoch_ms".into(), ..Default::default() }.compile().unwrap();
+        let prepared = sources::prepare_index(path.to_str().unwrap(), "log4j", None, Some(config.clone())).unwrap();
+        let plain = sources::prepare_index(path.to_str().unwrap(), "log4j", None, None).unwrap();
+        assert_eq!(prepared.key().unwrap(), plain.key().unwrap(), "raw metadata is independent of TsConfig");
+        let cache = directory.path().join("metadata");
+        let idx = open_prepared_at(&prepared, &cache, None).unwrap();
+        let raw_time = idx.lines.at(0).ts;
+        assert!(raw_time > 1_000_000_000_000, "cold metadata stores the original header timestamp");
+        let record_space = crate::analysis_visibility::SourceSet::new(&idx).unwrap().descriptors()[0].record_space.clone();
+        let key = prepared.key().unwrap();
+        let artifacts = [cache.join(format!("{key}.lines")), cache.join(format!("{key}.state"))];
+        let before: Vec<_> = artifacts.iter().map(|p| (std::fs::read(p).unwrap(), std::fs::metadata(p).unwrap().modified().unwrap())).collect();
+        let overlay = directory.path().join("old-timestamps.bin"); old_overlay(&overlay, &idx);
+        assert_ne!(timestamp_key(&idx).unwrap(), old_key(&idx));
+        drop(idx);
+        let warmed = sources::prepare_index(path.to_str().unwrap(), "log4j", None, Some(config)).unwrap();
+        let mut restored = open_prepared_at(&warmed, &cache, None).unwrap();
+        assert_eq!(warmed.parsed_rows.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(restored.lines.at(0).ts, raw_time, "completed journals still contain raw parser time");
+        let codes = crate::model::CodesConfig::default();
+        let reference = sources::event_at(&restored, 0, &codes, &codes, &[]).event_ref;
+        assert!(!timestamps_at(&mut restored, &overlay, None).unwrap(), "the old enrichment-dependent overlay is rejected");
+        assert_eq!(restored.lines.at(0).ts, 123456);
+        let event = sources::event_at(&restored, 0, &codes, &codes, &[]);
+        assert_eq!(event.timestamp, Some(123456)); assert_eq!(event.event_ref, reference);
+        assert_eq!(crate::analysis_visibility::SourceSet::new(&restored).unwrap().descriptors()[0].record_space, record_space);
+        assert!(timestamps_at(&mut restored, &overlay, None).unwrap(), "the current overlay remains reusable");
+        for (path, (bytes, modified)) in artifacts.iter().zip(before) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), modified);
+        }
     }
 }
 
@@ -459,9 +646,9 @@ mod metadata_timezone_tests {
         idx.parts[0].calendar.timezone = "different-rule-set-at-the-same-current-offset".into();
         assert_ne!(first, timestamp_key(&idx).unwrap());
         assert!(sources::validate_source(&idx.parts[0]).is_err());
-        let original = idx.lines[0].ts;
+        let original = idx.lines.at(0).ts;
         assert!(sources::retimestamp_index(&mut idx, None).is_err());
-        assert_eq!(idx.lines[0].ts, original, "invalid context must not publish timestamps");
+        assert_eq!(idx.lines.at(0).ts, original, "invalid context must not publish timestamps");
     }
 
     #[test]
@@ -479,11 +666,11 @@ mod metadata_timezone_tests {
         assert!(!timestamps_at(&mut first, &cache, None).unwrap());
         let mut next = make(2032); assert_ne!(timestamp_key(&first), timestamp_key(&next));
         assert!(!timestamps_at(&mut next, &cache, None).unwrap());
-        assert_ne!(first.lines[0].ts, next.lines[0].ts);
+        assert_ne!(first.lines.at(0).ts, next.lines.at(0).ts);
         let codes = crate::model::CodesConfig::default();
-        assert_eq!(Some(next.lines[0].ts), sources::event_at(&next, 0, &codes, &codes, &[]).timestamp);
+        assert_eq!(Some(next.lines.at(0).ts), sources::event_at(&next, 0, &codes, &codes, &[]).timestamp);
         let mut warm = make(2032); assert!(timestamps_at(&mut warm, &cache, None).unwrap());
-        assert_eq!(next.lines[0].ts, warm.lines[0].ts);
+        assert_eq!(next.lines.at(0).ts, warm.lines.at(0).ts);
     }
 
 
@@ -497,15 +684,15 @@ mod metadata_timezone_tests {
         let cache = dir.path().join("timestamps.bin"); assert!(!timestamps_at(&mut logfmt, &cache, None).unwrap());
         let mut text = sources::index_file(path.to_str().unwrap(), "text", None, Some(config.clone()), None).unwrap();
         assert_eq!(text.lines.len(), logfmt.lines.len()); assert_ne!(timestamp_key(&logfmt), timestamp_key(&text));
-        assert!(!timestamps_at(&mut text, &cache, None).unwrap()); assert_eq!(text.lines[0].ts, 0); assert_ne!(logfmt.lines[0].ts, 0);
+        assert!(!timestamps_at(&mut text, &cache, None).unwrap()); assert_eq!(text.lines.at(0).ts, 0); assert_ne!(logfmt.lines.at(0).ts, 0);
         let with_time = sources::CustomParse::Regex(regex::Regex::new(r"ts=(?P<timestamp>\S+) level=\S+ msg=(?P<message>.*)").unwrap());
         let without_time = sources::CustomParse::Regex(regex::Regex::new(r"(?P<message>.*)").unwrap());
         let mut first = sources::index_file(path.to_str().unwrap(), "custom", Some(with_time), Some(config.clone()), None).unwrap();
         assert!(!timestamps_at(&mut first, &cache, None).unwrap());
-        assert_ne!(first.lines[0].ts, 0, "the timestamp-bearing custom parser must exercise overlay fallback");
+        assert_ne!(first.lines.at(0).ts, 0, "the timestamp-bearing custom parser must exercise overlay fallback");
         let mut second = sources::index_file(path.to_str().unwrap(), "custom", Some(without_time), Some(config), None).unwrap();
         assert_ne!(timestamp_key(&first), timestamp_key(&second));
-        assert!(!timestamps_at(&mut second, &cache, None).unwrap()); assert_eq!(second.lines[0].ts, 0);
+        assert!(!timestamps_at(&mut second, &cache, None).unwrap()); assert_eq!(second.lines.at(0).ts, 0);
     }
 
 }

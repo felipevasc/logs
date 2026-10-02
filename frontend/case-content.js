@@ -170,6 +170,6 @@ window.CaseContent = (() => {
       };
     });
   }
-  async function editItem(itemId){const item=activeCase()?.items?.find(item=>item.id===itemId);if(!item)return false;const changed=await edit(item,{title:'Explicar item',onSave:saveCases});if(changed){window.CaseTrails?.refresh?.();if(Workspace.page()==='evidence')await Workspace.showPage('evidence');else if(Workspace.page()==='case-timeline')renderAnalysis();}return changed;}
+  async function editItem(itemId){const items=activeCase()?.items||[],matches=typeof itemId==='object'?items.filter(item=>item===itemId):items.filter(item=>item.id===itemId);if(matches.length!==1){if(matches.length>1)toast('A referência do item é ambígua. Abra sua edição pelo item desejado.','info');return false;}const item=matches[0];const changed=await edit(item,{title:'Explicar item',onSave:saveCases});if(changed){window.CaseTrails?.refresh?.();if(Workspace.page()==='evidence')await Workspace.showPage('evidence');else if(Workspace.page()==='case-timeline')renderAnalysis();}return changed;}
   return {narrative,attachments,imageData,importImage,mountAttachments,edit,editItem};
 })();

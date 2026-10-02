@@ -56,12 +56,13 @@ window.EvidenceUI = (() => {
   function exportMetadata(data, minimum, scope) {
     return { minimum_evidence: minimum, scope, analysis_id: data.analysis_id, policy_version: data.policy_version, normalization_version: data.normalization_version, attack_version: data.attack_version, limitations: structuredClone(data.limitations || []) };
   }
+  const isSensitiveKey = key => /(?:^|[.@])(password|passwd|token|secret|authorization|cookie|apikey|accesstoken|refreshtoken|secretaccesskey|clientsecret)$/i.test(key.replace(/[_-]/g, ""));
   function redact(value) {
     if (typeof value === "string") value = value.replace(/\$(?:[156y]|2[aby])\$[./A-Za-z0-9$=,-]{20,}/g, '[hash protegido]');
     if (typeof value === "string") value = value.replace(/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?(?:-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|$)/g, '[chave privada oculta]').replace(/((?:AWS_SECRET_ACCESS_KEY|DB_PASSWORD|DATABASE_PASSWORD)\s*=\s*)[^\r\n]+/g, '$1[oculto]');
     if (typeof value === "string") return value.replace(/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, "[chave privada oculta]").replace(/(password|passwd|access[_-]?token|refresh[_-]?token|secretAccessKey|client[_-]?secret|token|secret|authorization|cookie|api[_-]?key)(["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:Bearer|Basic)\s+[^\s",;]+|[^\s",;]+)/gi, '$1$2"[oculto]"');
     if (Array.isArray(value)) return value.map(redact);
-    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, val]) => [key, /(?:^|[.@])(password|passwd|token|secret|authorization|cookie|apikey|accesstoken|refreshtoken|secretaccesskey|clientsecret)$/i.test(key.replace(/[_-]/g, "")) ? "[oculto]" : redact(val)]));
+    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, val]) => [key, isSensitiveKey(key) ? "[oculto]" : redact(val)]));
     return value;
   }
   const eventContext = (item, event) => (item.detection?.detections || []).filter(d => d.event_refs?.includes(event.event_ref)).map(d => `${label(d.evidence_level)}: ${d.name}`).join("; ");
@@ -85,5 +86,5 @@ window.EvidenceUI = (() => {
     select.onchange = async () => { item.detection.analyst_state = select.value; item.detection.reviewed_at = Date.now(); await saveCases(); };
     field.append(select); box.append(field); host.append(box);
   }
-  return { names, rigidity, level, label, badge, outcome, claim, excerpts, explanation, inspect, control, exportMetadata, redact, eventContext, report, mountCase };
+  return { names, rigidity, level, label, badge, outcome, claim, excerpts, explanation, inspect, control, exportMetadata, redact, isSensitiveKey, eventContext, report, mountCase };
 })();

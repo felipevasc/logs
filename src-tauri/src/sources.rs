@@ -1052,6 +1052,40 @@ fn extract_java_body(ev: &mut Event, body: &str) {
     }
 }
 
+/// Interpret only the already-framed Java block. Existing evidence fields and
+/// byte framing are unchanged. This infallible source parser uses the strictly
+/// bounded pure parser; outer indexing/query operation checks own cancellation.
+fn enrich_java_trace(ev: &mut Event, block: &str, body_start: usize) {
+    let Ok(trace) = crate::java_stacktrace::parse(block, body_start, Default::default()) else {
+        return;
+    };
+    ev.fields.extend(trace.scalar_fields());
+}
+
+/// Rich details are request-local metadata, not an indexed Event field. Missing
+/// historical raw or an unrecognized Java log header is explicitly unavailable.
+/// Header inspection is capped at64KiB; the pure trace parser inspects at most
+/// its256KiB suffix budget. Callers retain their outer operation checks.
+pub(crate) fn java_trace_for_event(event: &Event) -> Result<Option<crate::java_stacktrace::Trace>, String> {
+    if event.raw.is_empty() { return Ok(None); }
+    let mut end = event.raw.len().min(64 << 10);
+    while !event.raw.is_char_boundary(end) { end -= 1; }
+    let inspected = &event.raw[..end];
+    let head = inspected.split('\n').next().unwrap_or("").trim_end_matches('\r');
+    let body_start = [re_log4j(), re_jboss(), re_wildfly()].into_iter()
+        .find_map(|re| re.captures(head).and_then(|captures| captures.get(5).map(|body| body.start())));
+    let Some(body_start) = body_start else {
+        if end < event.raw.len() && !inspected.contains('\n') {
+            return Err("O cabeçalho excede o limite de inspeção da estrutura Java.".into());
+        }
+        return Ok(None);
+    };
+    let trace = crate::java_stacktrace::parse(&event.raw, body_start, Default::default())
+        .map_err(|error| error.to_string())?;
+    let limited = trace.diagnostics.iter().any(|d| d.code == crate::java_stacktrace::Code::InputLimit);
+    Ok((trace.observed() || limited).then_some(trace))
+}
+
 /// WildFly/JBoss: `00:00:00,001 WARN  [br.app.Classe] (EJB default - 4) mensagem`
 /// Só tem hora — a data costuma estar no nome do arquivo (server.log.2026-06-24),
 /// resolvida pela configuração de data/hora (TsConfig).
@@ -1072,6 +1106,7 @@ fn parse_wildfly(block: &str) -> Option<Event> {
         .insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
+    enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
 }
 
@@ -1091,6 +1126,7 @@ fn parse_jboss(block: &str) -> Option<Event> {
         .insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
+    enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
 }
 
@@ -1110,6 +1146,7 @@ fn parse_log4j(block: &str) -> Option<Event> {
     ev.source = c[4].to_string();
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
+    enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
 }
 
@@ -1656,12 +1693,17 @@ pub struct DerivedField {
     pub name: String,
     pub source: String,
     pub rules: Vec<DerivedRule>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<crate::field_transform::Step>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup: Option<crate::reference_lookup::Definition>,
 }
 
 /// Formato de leitura tolerante ao legado (regra única na raiz do objeto).
 #[derive(serde::Deserialize)]
 pub struct DerivedFieldCompat {
     pub name: String,
+    #[serde(default)]
     pub source: String,
     #[serde(default)]
     pub pattern: String,
@@ -1671,6 +1713,10 @@ pub struct DerivedFieldCompat {
     pub filter: Option<crate::query::Filter>,
     #[serde(default)]
     pub rules: Vec<DerivedRule>,
+    #[serde(default)]
+    pub steps: Vec<crate::field_transform::Step>,
+    #[serde(default)]
+    pub lookup: Option<crate::reference_lookup::Definition>,
 }
 
 impl DerivedFieldCompat {
@@ -1687,6 +1733,8 @@ impl DerivedFieldCompat {
             name: self.name,
             source: self.source,
             rules,
+            steps: self.steps,
+            lookup: self.lookup,
         }
     }
 }
@@ -1703,13 +1751,144 @@ pub struct CompiledDerived {
     pub name: String,
     pub source: String,
     pub rules: Vec<CompiledRule>,
+    pub steps: Vec<crate::field_transform::Step>,
+    pub(crate) lookup: Option<crate::reference_lookup::Compiled>,
 }
 
 /// Aplica os campos derivados a um evento. As regras de cada campo são
 /// tentadas em ordem (OU): a primeira que extrai valor não vazio vence.
 pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
+    const BUDGET: usize = 2 << 20;
+    for (name, original) in std::mem::take(&mut ev.derived_originals) {
+        match original {
+            crate::model::DerivedOriginal::Missing => { ev.fields.remove(&name); }
+            crate::model::DerivedOriginal::Present(value) => { ev.fields.insert(name, value); }
+        }
+    }
+    ev.derived_diagnostics.clear();
+    let mut remaining = BUDGET;
+    fn diagnostic(ev: &mut Event, field: &str, code: &str, message: String, warning: bool) {
+        if ev.derived_diagnostics.len() < 31 {
+            ev.derived_diagnostics.push(crate::model::DerivedDiagnostic {
+                field: field.chars().take(128).collect(), code: code.into(), message, warning,
+            });
+        } else if ev.derived_diagnostics.len() == 31 {
+            ev.derived_diagnostics.push(crate::model::DerivedDiagnostic {
+                field: String::new(), code: "diagnostic_limit".into(), message: "Outros diagnósticos de campos foram omitidos neste registro.".into(), warning: true,
+            });
+        }
+    }
     for d in derived {
-        let Some(val) = ev.col_str(&d.source) else {
+        if let Some(lookup) = &d.lookup {
+            if !crate::field_transform::valid_typed_target(&d.name) {
+                diagnostic(ev, &d.name, "reserved_target", crate::field_transform::TARGET_NAME_ERROR.into(), false);
+                continue;
+            }
+            let value = match lookup.evaluate(ev) {
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
+                Err(error) => { diagnostic(ev, &d.name, "lookup_error", error, false); continue; }
+            };
+            let limits = crate::field_transform::Limits { output_bytes: (1 << 20).min(remaining), ..Default::default() };
+            let fields = match crate::field_transform::expanded_fields(&d.name, &value, limits, 512) {
+                Ok(fields) => fields,
+                Err(error) => { diagnostic(ev, &d.name, "lookup_error", error.to_string(), false); continue; }
+            };
+            if fields.keys().any(|name| ev.fields.contains_key(name)) {
+                diagnostic(ev, &d.name, "target_conflict", "O nome do campo consultado ou de um subcampo já existe no registro original.".into(), false);
+                continue;
+            }
+            let bytes = fields.iter().try_fold(0usize, |size, (key, value)| {
+                Ok::<_, crate::field_transform::Error>(size.saturating_add(key.len().saturating_mul(2)).saturating_add(crate::field_transform::payload_bytes(value, remaining)?).saturating_add(32))
+            });
+            let bytes = match bytes {
+                Ok(bytes) if bytes <= remaining => bytes,
+                _ => { diagnostic(ev, &d.name, "lookup_error", crate::field_transform::Error::OutputLimit.to_string(), false); continue; }
+            };
+            remaining -= bytes;
+            for name in fields.keys() { ev.derived_originals.insert(name.clone(), crate::model::DerivedOriginal::Missing); }
+            ev.fields.extend(fields);
+            continue;
+        }
+        if !d.steps.is_empty() {
+            if !crate::field_transform::valid_typed_target(&d.name) {
+                diagnostic(ev, &d.name, "reserved_target", crate::field_transform::TARGET_NAME_ERROR.into(), false);
+                continue;
+            }
+            let limits = crate::field_transform::Limits { output_bytes: (512 << 10).min(remaining), ..Default::default() };
+            let canonical = matches!(d.source.as_str(), "id" | "event_ref" | "timestamp" | "source" | "level" | "code" | "name" | "description" | "message" | "raw");
+            let source = match (!canonical).then(|| ev.fields.get(&d.source)).flatten() {
+                Some(value) => std::borrow::Cow::Borrowed(value),
+                None => match ev.col_ref(&d.source) {
+                    Some(value) => {
+                        if value.len() > limits.input_bytes {
+                            diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::InputLimit.to_string(), false);
+                            continue;
+                        }
+                        std::borrow::Cow::Owned(Value::String(value.into_owned()))
+                    }
+                    None => continue,
+                },
+            };
+            // Validate before regex stringification or capture expansion. A
+            // structured source can otherwise allocate before pipeline limits.
+            let source = match crate::field_transform::transform(source.as_ref(), &[], limits) {
+                Ok(output) => output.value,
+                Err(error) => { diagnostic(ev, &d.name, "transform_error", error.to_string(), false); continue; }
+            };
+            let extracted;
+            let input = if d.rules.is_empty() { &source } else {
+                let value = source.as_str().map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|| std::borrow::Cow::Owned(source.to_string()));
+                let found = d.rules.iter().filter(|r| r.filter.as_ref().is_none_or(|f| crate::query::matches_filter(ev, f))).find_map(|r| {
+                    let captures = r.re.captures(&value)?;
+                    let output = match &r.template {
+                        Some(template) if !template.is_empty() => {
+                            match crate::field_transform::expand_capture(&captures, template, limits.output_bytes) {
+                                Ok(value) => value,
+                                Err(error) => return Some(Err(error)),
+                            }
+                        }
+                        _ => captures.get(1).or_else(|| captures.get(0)).map(|m| m.as_str().to_owned()).unwrap_or_default(),
+                    };
+                    (!output.is_empty()).then_some(Ok(Value::String(output)))
+                });
+                let Some(value) = found else { continue };
+                extracted = match value {
+                    Ok(value) => value,
+                    Err(error) => { diagnostic(ev, &d.name, "transform_error", error.to_string(), false); continue; }
+                }; &extracted
+            };
+            let result = crate::field_transform::transform(input, &d.steps, limits).and_then(|output| {
+                let expanded = crate::field_transform::expanded_fields(&d.name, &output.value,
+                    crate::field_transform::Limits { output_bytes: (1 << 20).min(remaining), ..limits }, 512)?;
+                Ok((expanded, output.notices))
+            });
+            match result {
+                Ok((fields, notices)) => {
+                    // A new transform creates another field; a raw same-named
+                    // field or child must never be silently overwritten.
+                    if fields.keys().any(|name| ev.fields.contains_key(name)) {
+                        diagnostic(ev, &d.name, "target_conflict", "O nome do campo transformado ou de um subcampo já existe no registro original.".into(), false);
+                        continue;
+                    }
+                    let bytes = fields.iter().try_fold(0usize, |size, (key, value)| {
+                        Ok::<_, crate::field_transform::Error>(size.saturating_add(key.len().saturating_mul(2)).saturating_add(crate::field_transform::payload_bytes(value, remaining)?).saturating_add(32))
+                    });
+                    let bytes = match bytes {
+                        Ok(bytes) if bytes <= remaining => bytes,
+                        _ => { diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::OutputLimit.to_string(), false); continue; }
+                    };
+                    remaining -= bytes;
+                    for name in fields.keys() { ev.derived_originals.insert(name.clone(), crate::model::DerivedOriginal::Missing); }
+                    ev.fields.extend(fields);
+                    for notice in notices { diagnostic(ev, &d.name, notice, "Payload JWT decodificado. A assinatura e as declarações não foram verificadas.".into(), true); }
+                }
+                Err(error) => diagnostic(ev, &d.name, "transform_error", error.to_string(), false),
+            }
+            continue;
+        }
+        let Some(val) = ev.col_ref(&d.source) else {
             continue;
         }; // owned: liberado para inserir o campo
         for r in &d.rules {
@@ -1721,22 +1900,148 @@ pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
             if let Some(cap) = r.re.captures(&val) {
                 let extracted = match &r.template {
                     Some(t) if !t.is_empty() => {
-                        let mut out = String::new();
-                        cap.expand(t, &mut out);
-                        out
+                        match crate::field_transform::expand_capture(&cap, t, remaining) {
+                            Ok(value) => value,
+                            Err(error) => { diagnostic(ev, &d.name, "transform_error", error.to_string(), false); break; }
+                        }
                     }
-                    _ => cap
-                        .get(1)
-                        .or_else(|| cap.get(0))
-                        .map(|m| m.as_str().to_string())
-                        .unwrap_or_default(),
+                    _ => {
+                        let value = cap.get(1).or_else(|| cap.get(0));
+                        if value.is_some_and(|m| m.len() > remaining) {
+                            diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::OutputLimit.to_string(), false);
+                            break;
+                        }
+                        value.map(|m| m.as_str().to_owned()).unwrap_or_default()
+                    },
                 };
                 if !extracted.is_empty() {
+                    let previous = if ev.derived_originals.contains_key(&d.name) { None } else { ev.fields.get(&d.name) };
+                    let bytes = previous.map(|value| crate::field_transform::payload_bytes(value, remaining)).transpose()
+                        .map(|n| n.unwrap_or(0).saturating_add(extracted.len()).saturating_add(d.name.len().saturating_mul(2)).saturating_add(32));
+                    let bytes = match bytes {
+                        Ok(bytes) if bytes <= remaining => bytes,
+                        _ => { diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::OutputLimit.to_string(), false); break; }
+                    };
+                    let original = previous.cloned().map(crate::model::DerivedOriginal::Present).unwrap_or(crate::model::DerivedOriginal::Missing);
+                    ev.derived_originals.entry(d.name.clone()).or_insert(original);
+                    remaining -= bytes;
                     ev.fields.insert(d.name.clone(), Value::from(extracted));
                     break;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod derived_transform_tests {
+    use super::*;
+    use crate::field_transform::Step;
+    use serde_json::json;
+    fn definition(name: &str, source: &str, steps: Vec<Step>) -> CompiledDerived {
+        CompiledDerived { name: name.into(), source: source.into(), rules: Vec::new(), steps, lookup: None }
+    }
+    #[test]
+    fn transformed_parent_and_children_keep_types_and_query_visibility() {
+        let mut event = Event::empty();
+        event.fields.insert("encoded".into(), json!("eyJjb2RlIjo1MDMsIm9rIjpmYWxzZSwiZW1wdHkiOiIifQ=="));
+        let original = event.fields.clone();
+        apply_derived(&mut event, &[definition("decoded", "encoded", vec![Step::Base64Decode, Step::ParseJson])]);
+        assert_eq!(event.fields["encoded"], original["encoded"]);
+        assert_eq!(event.fields["decoded.code"], 503);
+        assert_eq!(event.fields["decoded.ok"], false);
+        assert_eq!(event.fields["decoded.empty"], "");
+        assert!(event.fields["decoded"].is_object());
+        let filter: crate::query::Filter = serde_json::from_value(json!({"column":"decoded.code","op":"gte","value":"500"})).unwrap();
+        assert!(crate::query::matches_filter(&event, &filter));
+        assert!(event.derived_diagnostics.is_empty());
+    }
+    #[test]
+    fn transform_failure_keeps_original_and_other_fields_queryable() {
+        let mut event = Event::empty();
+        event.message = "visible original".into();
+        event.fields.insert("token".into(), json!("invalid-secret"));
+        event.fields.insert("path".into(), json!("%2Fapi"));
+        apply_derived(&mut event, &[
+            definition("decoded", "token", vec![Step::Base64Decode]),
+            definition("url", "path", vec![Step::UrlDecode]),
+        ]);
+        assert_eq!(event.message, "visible original");
+        assert_eq!(event.fields["token"], "invalid-secret");
+        assert!(!event.fields.contains_key("decoded"));
+        assert_eq!(event.fields["url"], "/api");
+        assert_eq!(event.derived_diagnostics.len(), 1);
+        assert!(!event.derived_diagnostics[0].message.contains("secret"));
+    }
+    #[test]
+    fn transform_children_never_overwrite_an_original_field() {
+        let mut event = Event::empty();
+        event.fields.insert("json".into(), json!("{\"code\":503}"));
+        event.fields.insert("decoded.code".into(), json!(200));
+        apply_derived(&mut event, &[definition("decoded", "json", vec![Step::ParseJson])]);
+        assert_eq!(event.fields["decoded.code"], 200);
+        assert!(!event.fields.contains_key("decoded"), "collision rejects the entire field, not just one child");
+        assert_eq!(event.derived_diagnostics[0].code, "target_conflict");
+    }
+    #[test]
+    fn regex_then_transform_preserves_existing_extraction_order() {
+        let mut event = Event::empty(); event.message = "value=%2Fapi".into();
+        let mut field = definition("decoded", "message", vec![Step::UrlDecode]);
+        field.rules.push(CompiledRule { re: regex::Regex::new("value=(.*)").unwrap(), template: None, filter: None });
+        apply_derived(&mut event, &[field]);
+        assert_eq!(event.fields["decoded"], "/api");
+    }
+    #[test]
+    fn transform_limits_and_diagnostics_are_bounded_per_record() {
+        let mut event = Event::empty(); event.message = "x".repeat((256 << 10) + 1);
+        let fields = (0..64).map(|n| definition(&format!("decoded{n}"), "message", vec![Step::Base64Decode])).collect::<Vec<_>>();
+        apply_derived(&mut event, &fields);
+        assert!(event.fields.is_empty());
+        assert_eq!(event.derived_diagnostics.len(), 32);
+        assert_eq!(event.derived_diagnostics.last().unwrap().code, "diagnostic_limit");
+        assert_eq!(event.message.len(), (256 << 10) + 1);
+    }
+    #[test]
+    fn transform_source_uses_canonical_columns_before_raw_aliases() {
+        let mut event = Event::empty(); event.level = "Erro".into(); event.id = 42;
+        event.fields.insert("level".into(), json!("ERROR"));
+        event.fields.insert("id".into(), json!("raw-id"));
+        event.fields.insert("timestamp".into(), json!("raw-time"));
+        apply_derived(&mut event, &[
+            definition("level_copy", "level", vec![Step::Base64Encode, Step::Base64Decode]),
+            definition("id_copy", "id", vec![Step::Base64Encode, Step::Base64Decode]),
+            definition("time_copy", "timestamp", vec![Step::Base64Encode, Step::Base64Decode]),
+        ]);
+        assert_eq!(event.fields["level_copy"], "Erro");
+        assert_eq!(event.fields["id_copy"], "42");
+        assert!(!event.fields.contains_key("time_copy"));
+        apply_derived(&mut event, &[definition("LEVEL", "id", vec![Step::Base64Encode])]);
+        assert!(!event.fields.contains_key("LEVEL"));
+        assert_eq!(event.derived_diagnostics[0].code, "reserved_target");
+    }
+    #[test]
+    fn case_overlay_recomputes_from_provenance_and_empty_config_restores_original() {
+        let mut original = Event::empty(); original.fields.insert("input".into(), json!("%2Fapi"));
+        original.fields.insert("native_null".into(), Value::Null);
+        let first = definition("decoded", "input", vec![Step::UrlDecode]);
+        let mut captured = original.clone(); apply_derived(&mut captured, &[first.clone()]);
+        let serialized = serde_json::to_string(&captured).unwrap();
+        let evidence: Event = serde_json::from_str(&serialized).unwrap();
+        let mut overlay = evidence.clone(); apply_derived(&mut overlay, &[first]);
+        assert_eq!(overlay.fields["decoded"], "/api"); assert!(overlay.derived_diagnostics.is_empty());
+        let mut second = definition("native_null", "input", Vec::new());
+        second.rules.push(CompiledRule { re: regex::Regex::new("(.*)").unwrap(), template: Some("replacement".into()), filter: None });
+        apply_derived(&mut overlay, &[second]);
+        assert!(!overlay.fields.contains_key("decoded"));
+        assert_eq!(overlay.fields["native_null"], "replacement");
+        let mut restored: Event = serde_json::from_str(&serde_json::to_string(&overlay).unwrap()).unwrap();
+        apply_derived(&mut restored, &[]);
+        assert_eq!(restored.fields, original.fields);
+        assert!(restored.derived_originals.is_empty());
+        assert_eq!(serde_json::to_string(&evidence).unwrap(), serialized, "saved evidence was never changed");
+        let mut legacy = original.clone(); legacy.fields.insert("historical_unmarked".into(), json!("keep"));
+        apply_derived(&mut legacy, &[]);
+        assert_eq!(legacy.fields["historical_unmarked"], "keep", "never guess that an unmarked captured field was generated");
     }
 }
 
@@ -1839,9 +2144,9 @@ pub struct FilePart {
 
 pub struct FileIndex {
     pub parts: Vec<FilePart>,
-    pub lines: std::sync::Arc<Vec<LineMeta>>,
+    pub lines: std::sync::Arc<crate::metadata_store::LineStore>,
     pub columns: Vec<String>,
-    pub time_order: std::sync::OnceLock<Vec<usize>>,
+    pub time_order: std::sync::Arc<std::sync::OnceLock<Vec<usize>>>,
 }
 
 // Single-source configuration remains available to the existing format editor.
@@ -1858,32 +2163,32 @@ impl std::ops::DerefMut for FileIndex {
 }
 impl FileIndex {
     pub fn part_at(&self, i: usize) -> &FilePart {
-        let offset = self.lines[i].offset;
+        let offset = self.lines.at(i).offset;
         &self.parts[self
             .parts
             .partition_point(|p| p.base <= offset)
             .saturating_sub(1)]
     }
-    pub fn append(&mut self, mut other: FileIndex) {
-        let base = self
-            .parts
-            .last()
-            .map(|p| p.base + p.mmap.len() as u64 + 1)
-            .unwrap_or(0);
-        for p in &mut other.parts {
-            p.base += base;
-        }
-        for m in std::sync::Arc::make_mut(&mut other.lines).iter_mut() {
-            m.offset += base;
-        }
+    pub fn append(&mut self, mut other: FileIndex) -> Result<(), String> {
+        let base = self.parts.last().map(|p| p.base.checked_add(p.mmap.len() as u64).and_then(|n| n.checked_add(1)).ok_or("Posição de fonte excedida."))
+            .transpose()?.unwrap_or(0);
+        let bases = other.parts.iter().map(|p| {
+            let relocated = p.base.checked_add(base).ok_or("Posição de fonte excedida.")?;
+            relocated.checked_add(p.mmap.len() as u64).ok_or("Tamanho de fonte excedido.")?;
+            Ok(relocated)
+        }).collect::<Result<Vec<_>, &str>>()?;
+        // Build cheap immutable views before changing either source. This also
+        // checks all row/offset arithmetic before a staged import can publish.
+        let mut lines = (*self.lines).clone();
+        lines.append_relocated(&other.lines, base)?;
+        for (part, relocated) in other.parts.iter_mut().zip(bases) { part.base = relocated; }
         self.parts.append(&mut other.parts);
-        std::sync::Arc::make_mut(&mut self.lines).append(std::sync::Arc::make_mut(&mut other.lines));
+        self.lines = std::sync::Arc::new(lines);
         for c in other.columns {
-            if !self.columns.contains(&c) {
-                self.columns.push(c);
-            }
+            if !self.columns.contains(&c) { self.columns.push(c); }
         }
-        self.time_order.take();
+        self.time_order = std::sync::Arc::new(std::sync::OnceLock::new());
+        Ok(())
     }
     pub fn bytes_len(&self) -> u64 {
         self.parts.iter().map(|p| p.mmap.len() as u64).sum()
@@ -1891,7 +2196,7 @@ impl FileIndex {
     pub fn ordered(&self) -> &[usize] {
         self.time_order.get_or_init(|| {
             let mut order: Vec<usize> = (0..self.lines.len()).collect();
-            order.sort_unstable_by_key(|&i| (self.lines[i].ts, i));
+            order.sort_unstable_by_key(|&i| (self.lines.at(i).ts, i));
             order
         })
     }
@@ -1917,7 +2222,8 @@ pub(crate) fn file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
 pub(crate) fn file_identity(_file: &std::fs::File) -> Option<(u64, u64)> { None }
 
 pub(crate) fn validate_source(part: &FilePart) -> Result<(), String> {
-    let file = std::fs::File::open(&part.physical_path).map_err(|e| format!("Fonte indisponível: {e}"))?;
+    crate::operations::check()?;
+    let file = crate::case_archive_format::open_regular(std::path::Path::new(&part.physical_path)).map_err(|e| format!("Fonte indisponível: {e}"))?;
     let metadata = file.metadata().map_err(|e| format!("Fonte indisponível: {e}"))?;
     part.calendar.validate_timezone()?;
     crate::workspace::validate_canonical_origin(std::path::Path::new(&part.physical_path))?;
@@ -1933,7 +2239,7 @@ pub(crate) fn validate_source(part: &FilePart) -> Result<(), String> {
 }
 
 pub fn line_bytes(idx: &FileIndex, i: usize) -> &[u8] {
-    let m = &idx.lines[i];
+    let m = &idx.lines.at(i);
     let part = idx.part_at(i);
     let start = (m.offset - part.base) as usize;
     let end = (start + m.len as usize).min(part.mmap.len());
@@ -2099,16 +2405,17 @@ pub fn retimestamp_index(
 ) -> Result<(), String> {
     for part in &idx.parts { validate_source(part)?; }
     let total = idx.lines.len();
-    let mut timestamps = Vec::with_capacity(total);
+    let mut timestamps = crate::metadata_store::TimestampWriter::new()?;
+    let mut completed = 0;
     let cancellation = crate::operations::current_token();
     let wave = crate::resources::workers() * 8192;
     let index: &FileIndex = idx;
-    while timestamps.len() < total {
+    while completed < total {
         crate::operations::check()?;
         if let Some(cb) = progress {
-            cb(timestamps.len(), total);
+            cb(completed, total);
         }
-        let start = timestamps.len();
+        let start = completed;
         let end = (start + wave).min(total);
         let part: Vec<i64> = (start..end)
             .into_par_iter()
@@ -2126,14 +2433,16 @@ pub fn retimestamp_index(
                 ev.timestamp.unwrap_or(0)
             })
             .collect();
-        timestamps.extend(part);
+        for timestamp in part { timestamps.push(timestamp)?; }
+        completed = end;
     }
     crate::operations::check()?;
     for part in &idx.parts { validate_source(part)?; }
-    for (line, timestamp) in std::sync::Arc::make_mut(&mut idx.lines).iter_mut().zip(timestamps) {
-        line.ts = timestamp;
-    }
-    idx.time_order.take();
+    let timestamps = timestamps.finish()?;
+    crate::operations::check()?;
+    for part in &idx.parts { validate_source(part)?; }
+    idx.lines = std::sync::Arc::new(idx.lines.with_timestamps(timestamps)?);
+    idx.time_order = std::sync::Arc::new(std::sync::OnceLock::new());
     if let Some(cb) = progress {
         cb(total, total);
     }
@@ -2153,7 +2462,7 @@ pub fn event_at(
     let mut ev = parse_part_line(part, bytes);
     ev.id = i;
     if ev.event_ref.is_empty() {
-        ev.event_ref = format!("{}:{}", part.event_identity.as_deref().unwrap_or(&part.identity), idx.lines[i].offset - part.base);
+        ev.event_ref = format!("{}:{}", part.event_identity.as_deref().unwrap_or(&part.identity), idx.lines.at(i).offset - part.base);
     }
     ev.enrich(codes, system);
     ev.fields
@@ -2481,7 +2790,7 @@ fn push_meta(lines: &mut Vec<LineMeta>, line: &[u8], offset: u64, part: &FilePar
     Ok(())
 }
 
-type CheckpointSink<'a> = dyn FnMut(&[LineMeta], usize, bool, Option<&[String]>) -> Result<(), String> + 'a;
+type CheckpointSink<'a> = dyn FnMut(&mut crate::metadata_store::LineBuilder, usize, bool, Option<&[String]>) -> Result<(), String> + 'a;
 
 /// At most 4 MiB or 65,536 physical lines per worker, whichever comes first.
 /// This bounds temporary metadata even for very short records. A single long
@@ -2508,7 +2817,7 @@ fn next_line_bound(bytes: &[u8], from: usize, limits: &IndexLimits) -> Result<us
     Ok(bytes.len())
 }
 
-fn index_lines(prepared: &PreparedIndex, lines: &mut Vec<LineMeta>, mut cursor: usize, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
+fn index_lines(prepared: &PreparedIndex, lines: &mut crate::metadata_store::LineBuilder, mut cursor: usize, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
     use crate::metadata_checkpoint::{report, Progress};
     let part = &prepared.part;
     let bytes: &[u8] = &part.mmap;
@@ -2561,16 +2870,18 @@ fn index_lines(prepared: &PreparedIndex, lines: &mut Vec<LineMeta>, mut cursor: 
                 match lines.last_mut() {
                     Some(entry) => entry.len = u32::try_from(stop as u64 - entry.offset).map_err(|_| "Um registro multilinha excede 4 GB.")?,
                     None => {
+                        let mut initial = Vec::new();
                         let mut offset = start;
                         for raw in bytes[start..stop].split(|&b| b == b'\n') {
                             let line = raw.strip_suffix(b"\r").unwrap_or(raw);
-                            if keep(line, offset, true) { push_meta(lines, line, offset as u64, part, start_re.as_ref())?; }
+                            if keep(line, offset, true) { push_meta(&mut initial, line, offset as u64, part, start_re.as_ref())?; }
                             offset += raw.len() + 1;
                         }
+                        lines.extend(initial)?;
                     }
                 }
             }
-            lines.extend(chunk.lines);
+            lines.extend(chunk.lines)?;
         }
         cursor = *bounds.last().unwrap();
         let parsed = prepared.parsed_rows.fetch_add(lines.len() - previous_rows, std::sync::atomic::Ordering::Relaxed) + lines.len() - previous_rows;
@@ -2662,7 +2973,7 @@ impl<'a> JsonScanner<'a> {
     }
 }
 
-fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, cursor: usize, lines: &mut Vec<LineMeta>, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
+fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, cursor: usize, lines: &mut crate::metadata_store::LineBuilder, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
     use crate::metadata_checkpoint::{report, Progress};
     let bytes: &[u8] = &prepared.part.mmap;
     let mut scanner = JsonScanner::new(bytes, start, cursor, envelope);
@@ -2683,7 +2994,7 @@ fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, curs
             meta_for_line(&bytes[begin..end], begin as u64, &prepared.part)
         }).collect();
         crate::operations::check()?;
-        lines.extend(metas?);
+        lines.extend(metas?)?;
         let parsed = prepared.parsed_rows.fetch_add(records.len(), std::sync::atomic::Ordering::Relaxed) + records.len();
         let mut progress = Progress::new("metadata-scan", "Indexando metadados JSON", scanner.cursor, bytes.len(), "bytes");
         progress.parsed_rows = parsed;
@@ -2757,7 +3068,7 @@ impl PreparedIndex {
     pub(crate) fn multiline(&self) -> bool { self.descriptor.start_pattern.is_some() }
     pub(crate) fn validate(&self) -> Result<(), String> {
         crate::operations::check()?;
-        let file = std::fs::File::open(&self.part.physical_path).map_err(|e| e.to_string())?;
+        let file = crate::case_archive_format::open_regular(std::path::Path::new(&self.part.physical_path))?;
         if SourceStamp::read(&file, &self.part.physical_path)? != self.stamp {
             return Err("A fonte foi alterada durante a indexação. Reabra o arquivo para usar uma versão consistente.".into());
         }
@@ -2769,7 +3080,7 @@ pub(crate) fn prepare_index(path: &str, format: &str, custom: Option<CustomParse
     crate::operations::check()?;
     let canonical_lease = crate::workspace::canonical_source_lease(std::path::Path::new(path))?;
     let event_identity = crate::workspace::canonical_event_identity(std::path::Path::new(path))?;
-    let file = std::fs::File::open(path).map_err(|e| format!("Não foi possível abrir '{path}': {e}"))?;
+    let file = crate::case_archive_format::open_regular(std::path::Path::new(path)).map_err(|e| format!("Não foi possível abrir '{path}': {e}"))?;
     let stamp = SourceStamp::read(&file, path)?;
     if stamp.bytes == 0 { return Err("Arquivo vazio.".into()); }
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| format!("Falha ao mapear '{path}': {e}"))?;
@@ -2840,15 +3151,15 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
     };
     if !safe_cursor { return Err("Limite de retomada dos metadados inválido.".into()); }
     if !resume.scan_complete {
-        if resume.lines.is_empty() { resume.lines.reserve((bytes.len() / 160).min(1 << 24)); }
         match prepared.descriptor.array {
             Some((start, envelope)) => index_json_array(&prepared, start, envelope, resume.cursor, &mut resume.lines, sink, reporter)?,
             None => index_lines(&prepared, &mut resume.lines, resume.cursor, sink, reporter)?,
         }
         prepared.validate()?;
-        sink(&resume.lines, bytes.len(), true, None)?;
+        resume.lines.flush()?;
+        sink(&mut resume.lines, bytes.len(), true, None)?;
     }
-    let columns = match resume.columns {
+    let mut columns = match resume.columns {
         Some(columns) => columns,
         None => {
             let mut columns: Vec<String> = STANDARD_COLUMNS.iter().map(|s| s.to_string()).collect();
@@ -2861,7 +3172,7 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
                     report(reporter, Progress::new("metadata-columns", "Descobrindo colunas", sample, count, "amostras"));
                 }
                 let i = sample * resume.lines.len() / count;
-                let m = &resume.lines[i];
+                let m = resume.lines.at(i)?;
                 let ev = parse_part_line(&prepared.part, &bytes[m.offset as usize..m.offset as usize + m.len as usize]);
                 extra.extend(ev.fields.keys().cloned()); sampled.push(ev);
             }
@@ -2873,16 +3184,20 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
                 if !columns.iter().any(|c| c == extra) { columns.push(extra.into()); }
             }
             prepared.validate()?;
-            sink(&resume.lines, bytes.len(), true, Some(&columns))?;
+            sink(&mut resume.lines, bytes.len(), true, Some(&columns))?;
             report(reporter, Progress::new("metadata-columns", "Colunas identificadas", count, count, "amostras"));
             columns
         }
     };
+    // Supported parser fields remain discoverable even when an unchanged
+    // metadata journal predates Java structural enrichment. This does not
+    // rewrite its record offsets, saved catalog, or durable framing identity.
+    crate::java_stacktrace::extend_columns(&prepared.part.format, &mut columns);
     prepared.validate()?;
     crate::operations::check()?;
     let mut part = prepared.part.clone();
     part.metadata_identity = prepared.key()?;
-    Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(resume.lines), columns, time_order: std::sync::OnceLock::new() })
+    Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(resume.lines.finish()?), columns, time_order: std::sync::Arc::new(std::sync::OnceLock::new()) })
 }
 
 /// Uncached entry point, also used as the semantic oracle in recovery tests.
@@ -3453,6 +3768,98 @@ mod tests {
             "csv"
         );
         assert_eq!(super::detect_format(b"#Software: IIS\n#Fields: date time s-ip cs-method\n2024-01-31 08:00:01 10.0.0.1 GET\n"), "w3c");
+    }
+}
+
+#[cfg(test)]
+mod java_enrichment_tests {
+    use super::*;
+
+    const BODY: &str = "a.TopException: café\n\tat a.Top.run(Top.java:1)\n\tSuppressed: a.CloseException\n\t\tat a.Close.close(Native Method)\nCaused by: a.BottomException: actual cause\n\tat a.Bottom.run(Unknown Source)\n\t... 1 more\n";
+
+    #[test]
+    fn existing_java_parsers_preserve_legacy_evidence_and_add_real_typed_fields() {
+        for (head, parse) in [
+            ("00:00:00,001 ERROR [a.Logger] (worker) failed", parse_wildfly as fn(&str) -> Option<Event>),
+            ("2024-01-31 08:00:01,123 ERROR [a.Logger] (worker) failed", parse_jboss),
+            ("2024-01-31 08:00:01,123 ERROR [worker] a.Logger - failed", parse_log4j),
+        ] {
+            let raw = format!("{head}\n{BODY}");
+            let event = parse(&raw).unwrap();
+            let mut legacy = Event::empty();
+            extract_java_body(&mut legacy, BODY);
+            assert_eq!(event.raw, raw);
+            assert_eq!(event.message, "failed");
+            assert_eq!(event.source, "a.Logger");
+            assert_eq!(event.level, "Erro");
+            assert_eq!(event.fields["exception"], legacy.fields["exception"]);
+            assert_eq!(event.fields["stacktrace"], legacy.fields["stacktrace"]);
+            assert_eq!(event.fields["java.exception.class"], "a.TopException");
+            assert_eq!(event.fields["java.exception.message"], "café");
+            assert_eq!(event.fields["java.root_cause.class"], "a.BottomException");
+            assert_eq!(event.fields["java.trace.complete"], true);
+            assert!(!event.fields.contains_key("java.trace"), "ordinary Events keep only scalar summaries");
+            let detail = java_trace_for_event(&event).unwrap().unwrap();
+            assert!(detail.complete);
+            assert_eq!(detail.nodes[0].header.start, head.len() + 1);
+            assert_eq!(detail.root_cause_class(), Some("a.BottomException"));
+            let incomplete = parse(&format!("{head}\na.TopException\n\tat malformed frame\n")).unwrap();
+            assert_eq!(incomplete.fields["java.trace.complete"], false);
+            assert!(!incomplete.fields.contains_key("java.root_cause.class"));
+            assert!(!incomplete.fields.contains_key("java.trace.fingerprint"));
+            let ordinary = parse(head).unwrap();
+            assert!(!ordinary.fields.contains_key("java.trace.complete"));
+            assert!(java_trace_for_event(&ordinary).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn header_exception_spans_use_raw_coordinates_and_old_snapshots_remain_unavailable() {
+        let raw = "2024-01-31 08:00:01,123 ERROR [worker] a.Logger - a.TopException: 日\n\tat a.Top.run(Top.java:1)\n";
+        let event = parse_log4j(raw).unwrap();
+        assert_eq!(event.message, "a.TopException: 日");
+        assert_eq!(event.fields["java.exception.class"], "a.TopException");
+        assert_eq!(java_trace_for_event(&event).unwrap().unwrap().nodes[0].header.start, raw.find("a.TopException").unwrap());
+        for preserved_raw in ["", raw] {
+            let mut legacy = Event::empty();
+            legacy.raw = preserved_raw.into();
+            legacy.fields.insert("exception".into(), Value::String("a.TopException".into()));
+            legacy.fields.insert("stacktrace".into(), serde_json::json!(["at a.Top.run(Top.java:1)"]));
+            let bytes = serde_json::to_vec(&legacy).unwrap();
+            let restored = parse_line_at(&bytes, "snapshot", None, &[], 2026);
+            assert_eq!(restored.raw, preserved_raw);
+            assert_eq!(restored.fields["stacktrace"], legacy.fields["stacktrace"]);
+            assert!(!restored.fields.contains_key("java.trace"), "historical evidence is not silently reconstructed");
+            assert!(!restored.fields.contains_key("java.exception.class"));
+            let detail = java_trace_for_event(&restored).unwrap();
+            assert_eq!(detail.is_some(), !preserved_raw.is_empty());
+            if let Some(detail) = detail { assert_eq!(detail.exception_class(), Some("a.TopException")); }
+        }
+        let json = serde_json::json!({"message": raw});
+        let event = parse_line_at(&serde_json::to_vec(&json).unwrap(), "jsonl", None, &[], 2026);
+        assert!(!event.fields.contains_key("java.trace"));
+        assert!(java_trace_for_event(&event).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_trace_details_preserve_limits_and_leave_the_event_unchanged() {
+        let prefix = "2024-01-31 08:00:01,123 ERROR [worker] a.Logger - ";
+        let mut event = Event::empty();
+        event.raw = format!("{prefix}a.FailureException: {}", "x".repeat(8192));
+        let before = serde_json::to_value(&event).unwrap();
+        let trace = java_trace_for_event(&event).unwrap().unwrap();
+        assert!(!trace.complete);
+        assert!(trace.nodes.is_empty());
+        assert!(trace.diagnostics.iter().any(|d| d.code == crate::java_stacktrace::Code::StringLimit));
+        assert_eq!(before, serde_json::to_value(&event).unwrap());
+        event.raw = format!("{prefix}{}", "x".repeat(300 << 10));
+        let trace = java_trace_for_event(&event).unwrap().unwrap();
+        assert!(!trace.complete);
+        assert!(trace.diagnostics.iter().any(|d| d.code == crate::java_stacktrace::Code::InputLimit));
+        event.raw = "x".repeat(70 << 10);
+        assert!(java_trace_for_event(&event).unwrap_err().contains("limite"));
+        event.raw.clear();
+        assert!(java_trace_for_event(&event).unwrap().is_none());
     }
 }
 

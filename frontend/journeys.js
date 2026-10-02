@@ -52,7 +52,9 @@ window.Journeys = (() => {
     return "custom";
   }
   function preferred(fields) {
-    const count = view.scope === "case" ? caseEvents().filter(rowPassesFilters).length : state.total;
+    // A preserved evidence size cannot be used as the visible denominator.
+    // Without a matching admitted total, keep the backend's suggested order.
+    const count = explorerAnalytics.get(explorerKey())?.total;
     const repeated = field => Number.isFinite(count) && field.distinct != null && field.distinct < Math.round(field.coverage * count);
     return fields.find(field => field.suggested && repeated(field)) || fields.find(field => field.suggested) || fields.find(field => ["user", "ip"].includes(field.kind)) || fields.find(repeated) || fields[0];
   }
@@ -145,6 +147,10 @@ window.Journeys = (() => {
   async function loadDetail() {
     if (!view.selected) return;
     const token = view.token, version = ++view.detailToken, detail = host.querySelector(".journey-detail"), selected = view.selected;
+    const caseOwner = view.scope === "case" ? window.AnalysisContexts?.capture() : null;
+    const evidenceSignature = view.scope === "case" ? caseSig() : null;
+    const current = () => isActive(token) && version === view.detailToken && (evidenceSignature === null
+      || globalScope() === "case" && caseSig() === evidenceSignature && (!caseOwner || window.AnalysisContexts.isCurrent(caseOwner)));
     detail.innerHTML = "";
     const head = el("header", "journey-detail-head"), title = el("div", "journey-detail-title"), name = el("strong", "", selected.value); name.title = selected.value;
     const copy = button("", () => navigator.clipboard.writeText(selected.value).then(() => toast("Identificador copiado.")).catch(() => toast("Não foi possível copiar.", "err")), "icon-btn"); copy.innerHTML = '<i class="fas fa-copy"></i>'; copy.title = "Copiar identificador"; copy.setAttribute("aria-label", copy.title); title.append(name, copy); head.append(title);
@@ -157,8 +163,8 @@ window.Journeys = (() => {
     if (heuristic() && !hasWindow()) { records.append(el("div", "journey-empty", "Escolha um período para consultar relações por usuário ou IP.")); explore.disabled = true; return; }
     busy(records, "Lendo a sequência…", "journey-detail");
     try {
-      const data = await api("journey_events", { ...base(), ...timeArgs(), field: view.field, value: selected.value, offset: view.detailPage * 100, limit: 100 }, { latest: "journey-detail" });
-      if (!isActive(token) || version !== view.detailToken) return;
+      const data = await api("journey_events", { ...base(), ...timeArgs(), field: view.field, value: selected.value, offset: view.detailPage * 100, limit: 100 }, { latest: "journey-detail", ...(caseOwner ? { analysisOwner: caseOwner } : {}) });
+      if (!current()) return;
       preserve.disabled = !data.total;
       const lastPage = Math.max(0, Math.ceil(data.total / 100) - 1);
       if (view.detailPage > lastPage) { view.detailPage = lastPage; view.detailScroll = 0; return loadDetail(); }
@@ -166,10 +172,15 @@ window.Journeys = (() => {
       metadata.textContent = `${view.field} · ${fmtNum(data.total)} registros${group && !heuristic() ? ` · ${duration(group.duration_ms)}` : ""}${data.missing_time ? ` · ${fmtNum(data.missing_time)} sem horário` : ""}${data.complete === false ? " · parcial" : ""}`;
       for (const [index, event] of (data.rows || []).entries()) {
         const row = button("", async () => {
+          if (!current()) { toast("O contexto mudou. Abra a sequência novamente.", "info"); return; }
           const scope = view.scope;
           if (scope === "dataset") await openDetail(event.id);
-          else { const events = caseEvents(), original = (event.event_ref && events.find(candidate => candidate.event_ref === event.event_ref)) || events.find(candidate => candidate.id === event.id && candidate.timestamp === event.timestamp); showDetail(original || event); }
-          if (!isActive(token) || version !== view.detailToken) return;
+          else {
+            if (typeof event.event_ref !== "string" || !event.event_ref) { toast("Este registro não tem uma referência estável. Atualize a sequência.", "info"); return; }
+            if (!await openDetail(event.id, { eventRef: event.event_ref, guard: current })) return;
+          }
+          if (!current()) return;
+          if (scope === "case" && (state.currentDetailEv?.id !== event.id || state.currentDetailEv?.event_ref !== event.event_ref)) return;
           drawerSource = { event: state.currentDetailEv, scope }; $("#dr-prev").hidden = $("#dr-next").hidden = true;
         }, "journey-record"); row.style.setProperty("--event-color", levelColor(event.level)); row.title = `${fullTime(event.timestamp)} · ${event.source}\n${event.message || event.name || ""}`;
         if (view.seed && (event.event_ref && event.event_ref === view.seed.event_ref || event.id === view.seed.id && event.timestamp === view.seed.timestamp && event.source === view.seed.source)) row.classList.add("journey-focus");
@@ -180,11 +191,11 @@ window.Journeys = (() => {
       }
       if (!data.rows?.length) records.append(el("div", "journey-empty", "Nenhum registro com este valor e período no recorte atual."));
       if (data.rows_clipped > 0) detail.append(el("p", "journey-preview-note", "Prévia reduzida; abra o registro para ver o conteúdo completo."));
-      const current = view;
-      records.onscroll = () => { current.detailScroll = records.scrollTop; };
+      const currentView = view;
+      records.onscroll = () => { currentView.detailScroll = records.scrollTop; };
       pager(detail, view.detailPage, data.total, 100, page => { view.detailPage = page; view.detailScroll = 0; loadDetail(); });
-      records.scrollTop = current.detailScroll;
-    } catch (error) { if (isActive(token) && version === view.detailToken) failure(records, error, loadDetail); }
+      records.scrollTop = currentView.detailScroll;
+    } catch (error) { if (current()) failure(records, error, loadDetail); }
   }
   async function render(container) {
     syncContext();

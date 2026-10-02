@@ -5,7 +5,7 @@
 
 use crate::model::Event;
 use crate::sources::{column_role, date_time_ms, naive_to_ms, normalize_level, parse_timestamp, ColumnRole};
-use calamine::{open_workbook_auto, Data, DataRef, ExcelDateTime, Reader, SheetType, SheetVisible, Sheets};
+use calamine::{open_workbook_from_rs, Data, DataRef, ExcelDateTime, Reader, SheetType, SheetVisible, Sheets, Xls, Xlsb, Xlsx, Ods};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
@@ -27,10 +27,36 @@ pub fn is_spreadsheet(path: &Path) -> bool {
 
 /// Workbooks start with a ZIP (xlsx, xlsm, xlsb, ods) or OLE (xls) signature.
 /// Exports named .xls that are really text are read by the text parsers.
-fn is_workbook(path: &Path) -> bool {
+fn is_workbook(input: &crate::workspace::CanonicalInput) -> Result<bool, String> {
     let mut head = [0u8; 8];
-    std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut head)).is_ok()
-        && (head.starts_with(b"PK\x03\x04") || head == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
+    let mut file = input.reader()?;
+    match file.read_exact(&mut head) {
+        Ok(()) => Ok(head.starts_with(b"PK\x03\x04") || head == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Feed calamine the already validated regular-file handle. Its path adapter
+/// opens the pathname again, which can block on a replaced FIFO before source
+/// validation gets a chance to reject that generation. Preserve its exact
+/// extension dispatch and fallback order without buffering the whole workbook.
+fn open_checked_workbook(input: &crate::workspace::CanonicalInput) -> Result<Sheets<std::io::BufReader<std::fs::File>>, String> {
+    let reader = || input.reader().map(std::io::BufReader::new);
+    let book = match input.path.extension().and_then(|extension| extension.to_str()) {
+        Some("xls" | "xla") => Sheets::Xls(open_workbook_from_rs::<Xls<_>, _>(reader()?).map_err(|e| describe(&e.to_string()))?),
+        Some("xlsx" | "xlsm" | "xlam") => Sheets::Xlsx(open_workbook_from_rs::<Xlsx<_>, _>(reader()?).map_err(|e| describe(&e.to_string()))?),
+        Some("xlsb") => Sheets::Xlsb(open_workbook_from_rs::<Xlsb<_>, _>(reader()?).map_err(|e| describe(&e.to_string()))?),
+        Some("ods") => Sheets::Ods(open_workbook_from_rs::<Ods<_>, _>(reader()?).map_err(|e| describe(&e.to_string()))?),
+        _ => {
+            if let Ok(book) = open_workbook_from_rs::<Xls<_>, _>(reader()?) { return Ok(Sheets::Xls(book)); }
+            if let Ok(book) = open_workbook_from_rs::<Xlsx<_>, _>(reader()?) { return Ok(Sheets::Xlsx(book)); }
+            if let Ok(book) = open_workbook_from_rs::<Xlsb<_>, _>(reader()?) { return Ok(Sheets::Xlsb(book)); }
+            if let Ok(book) = open_workbook_from_rs::<Ods<_>, _>(reader()?) { return Ok(Sheets::Ods(book)); }
+            return Err(describe("Não foi possível identificar o formato."));
+        }
+    };
+    Ok(book)
 }
 
 #[derive(Clone, Debug)]
@@ -495,8 +521,8 @@ fn describe(error: &str) -> String {
 }
 
 /// Writes one event per row of every worksheet; returns how many were written.
-fn convert(path: &Path, workbook_id: &str, year: i32, out: &mut dyn Write, progress: &dyn Fn(usize)) -> Result<usize, String> {
-    let mut book = open_workbook_auto(path).map_err(|e| describe(&e.to_string()))?;
+fn convert(input: &crate::workspace::CanonicalInput, workbook_id: &str, year: i32, out: &mut dyn Write, progress: &dyn Fn(usize)) -> Result<usize, String> {
+    let mut book = open_checked_workbook(input)?;
     let sheets: Vec<_> = book.sheets_metadata().to_vec();
     let mut written = 0usize;
     let mut failures = Vec::new();
@@ -570,8 +596,8 @@ fn convert(path: &Path, workbook_id: &str, year: i32, out: &mut dyn Write, progr
 /// Converts the workbook once and returns the event snapshots to index, or
 /// `None` when the file is not a workbook and must be read as text.
 pub fn expand(path: &Path, progress: &dyn Fn(usize)) -> Result<Option<PathBuf>, String> {
-    if !is_workbook(path) { return Ok(None); }
     let input = crate::workspace::CanonicalInput::open(path)?;
+    if !is_workbook(&input)? { return Ok(None); }
     let legacy = input.legacy_source().map(|(path, id)| {
         let stem: String = path.file_stem().unwrap_or_default().to_string_lossy().chars()
             .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' }).take(60).collect();
@@ -584,7 +610,7 @@ pub fn expand(path: &Path, progress: &dyn Fn(usize)) -> Result<Option<PathBuf>, 
     calendar.validate_timezone()?;
     let output = crate::workspace::canonical_file(input, &converter, legacy, |input, out| {
         calendar.validate_timezone()?;
-        convert(&input.path, &input.logical_identity, calendar.year, out, progress)?;
+        convert(input, &input.logical_identity, calendar.year, out, progress)?;
         calendar.validate_timezone()
     })?;
     calendar.validate_timezone()?;
@@ -605,5 +631,86 @@ mod calendar_tests {
         let timestamp = event.timestamp.expect("syslog timestamp");
         use chrono::TimeZone;
         assert_eq!(chrono::Datelike::year(&chrono::Local.timestamp_millis_opt(timestamp).single().unwrap()), 2021);
+    }
+}
+
+#[cfg(test)]
+mod checked_reader_tests {
+    use super::*;
+
+    fn workbook(path: &Path) {
+        let mut book = rust_xlsxwriter::Workbook::new();
+        let sheet = book.add_worksheet();
+        sheet.write_string(0, 0, "message").unwrap();
+        sheet.write_string(1, 0, "preserved value").unwrap();
+        book.save(path).unwrap();
+    }
+
+    #[test]
+    fn regular_workbooks_keep_extension_fallback_and_text_xls_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["events.xlsx", "events.XLSX", "events.unknown"] {
+            let path = directory.path().join(name);
+            workbook(&path);
+            let input = crate::workspace::CanonicalInput::open(&path).unwrap();
+            assert!(is_workbook(&input).unwrap());
+            let mut book = open_checked_workbook(&input).unwrap();
+            let sheet = book.sheet_names()[0].clone();
+            assert_eq!(book.worksheet_range(&sheet).unwrap().get_value((1, 0)), Some(&Data::String("preserved value".into())));
+        }
+        let text = directory.path().join("export.xls");
+        std::fs::write(&text, b"message\ntext export\n").unwrap();
+        assert!(expand(&text, &|_| {}).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workbook_special_file_child() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let Some(root) = std::env::var_os("LOGINSIGHT_WORKBOOK_SPECIAL_ROOT") else { return };
+        let root = PathBuf::from(root);
+        let fifo = |path: &Path| {
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        };
+        let path = root.join("blocked.xlsx");
+        fifo(&path);
+        assert!(expand(&path, &|_| {}).unwrap_err().contains("regular"));
+        std::fs::remove_file(&path).unwrap();
+        workbook(&path);
+        let input = crate::workspace::CanonicalInput::open(&path).unwrap();
+        let retained = root.join("retained.xlsx");
+        std::fs::rename(&path, &retained).unwrap();
+        fifo(&path);
+        assert!(is_workbook(&input).unwrap_err().contains("regular"));
+        assert!(open_checked_workbook(&input).is_err());
+        let link = root.join("regular-link.xlsx");
+        symlink(&retained, &link).unwrap();
+        let linked = crate::workspace::CanonicalInput::open(&link).unwrap();
+        assert!(is_workbook(&linked).unwrap());
+        assert!(open_checked_workbook(&linked).is_ok());
+        let token = crate::operations::token(Some("cancel-workbook-probe".into())).unwrap();
+        assert!(crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("cancel-workbook-probe");
+            expand(&path, &|_| {})
+        }).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_and_replaced_workbook_fifos_never_wait_for_a_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "spreadsheet::checked_reader_tests::workbook_special_file_child", "--test-threads=1"])
+            .env("LOGINSIGHT_WORKBOOK_SPECIAL_ROOT", directory.path()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); break; }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill(); let _ = child.wait();
+                panic!("workbook admission waited on a special file");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

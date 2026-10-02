@@ -423,6 +423,7 @@ input:focus, select:focus, textarea:focus {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 select { appearance: auto; cursor: pointer; }
+#filter-pop textarea { resize: vertical; max-height: 160px; }
 
 .muted { color: var(--text-1); }
 .small { font-size: 12px; }
@@ -778,6 +779,7 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1
 @keyframes pop-in { from { transform: translateY(-4px); opacity: 0; } }
 .pop-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-2); }
 .pop-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+#name-pop.field-path-pop { z-index: 210; max-width: calc(100vw - 24px); }
 
 .col-list { display: flex; flex-direction: column; max-height: 320px; overflow: auto; }
 .col-item {
@@ -2420,3 +2422,10 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
   #detail-value-modal { padding: 9px; }
   .detail-value-modal { max-height: 96vh; }
 }
+
+/* Exact summaries can pause without blocking the visible event page. */
+.query-analytics-status { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; padding: .4rem .6rem; }
+.query-analytics-status[hidden] { display: none; }
+.query-analytics-status .btn { margin-left: auto; flex-shrink: 0; }
+
+.filter-actions { flex-wrap: wrap; }

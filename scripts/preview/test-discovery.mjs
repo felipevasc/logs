@@ -117,9 +117,9 @@ try {
   await page.locator('#btn-side-toggle').click();assert.equal(await page.locator('#btn-side-toggle').getAttribute('aria-expanded'),'false');
   await page.locator('#btn-side-toggle').click();
   await page.locator('#btn-theme').click();await page.screenshot({path:new URL('descobrir-claro-1024.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
-  await page.locator('#quick-search').fill('__no_such_record_987654__');await page.waitForFunction(()=>state.total===0);await waitAnalysis();
+  await page.locator('#quick-search').fill('__no_such_record_987654__');await page.locator('#quick-search').press('Enter');await page.waitForFunction(()=>state.total===0);await waitAnalysis();
   assert.match(await page.locator('#dash-grid').innerText(),/Sem horários|Nenhum campo|Sem valores/);
-  await page.locator('#quick-search').fill('');await page.waitForFunction(()=>state.total===6000);
+  await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
   // Case fixture exercises the same UI against saved rows, never the loaded dataset.
   phase='saved Case analysis';
   await page.evaluate(async()=>{state.stationAnalyticsId=null;await WorkspaceContext.setScope('case',{page:'explore',tab:'dashboard',animate:false});});

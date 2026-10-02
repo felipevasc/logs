@@ -1,0 +1,19 @@
+.hist-panel.explorer-timeline{height:auto;min-height:130px;flex-direction:column;gap:5px;padding-bottom:10px}
+.explorer-timeline-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px;min-height:25px;font-size:11px}
+.explorer-timeline-heading strong{font-size:12px;font-weight:600;color:var(--text-0)}
+.explorer-timeline-field{color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:30vw}
+.explorer-timeline-heading .btn{font-size:10px;padding:3px 7px;white-space:nowrap}
+.explorer-timeline-field-select{margin-left:auto;font-size:10px;width:min(220px,27vw);max-width:100%;padding:3px 5px}
+.explorer-timeline-limit{font-size:10px;max-width:100px;padding:3px 5px}
+.explorer-timeline .chart{flex:none;width:100%;min-width:0}
+.explorer-timeline-legend{display:flex;flex-wrap:wrap;gap:4px 12px;max-height:64px;overflow:auto;padding:1px 2px}
+.explorer-timeline-series{display:flex;align-items:center;gap:5px;min-width:0;max-width:320px;font-size:10px;cursor:pointer;line-height:17px}
+.explorer-timeline-series input{width:12px;height:12px;flex:none;margin:0;accent-color:var(--accent)}
+.explorer-timeline-swatch{width:10px;height:3px;flex:none;border-radius:2px}
+.explorer-timeline-series-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.explorer-timeline-series small{color:var(--text-2);font-variant-numeric:tabular-nums}
+.explorer-timeline-series.is-hidden .explorer-timeline-series-label{text-decoration:line-through;opacity:.65}
+.explorer-timeline-note{font-size:10px;line-height:15px;overflow-wrap:anywhere}
+.explorer-timeline-legend:empty,.explorer-timeline-note:empty{display:none}
+.hist-panel.explorer-timeline.analytics-placeholder{min-height:32px}
+@media(max-width:850px){.explorer-timeline-heading{flex-wrap:wrap}.explorer-timeline-field{max-width:40vw}.explorer-timeline-legend{max-height:48px}}

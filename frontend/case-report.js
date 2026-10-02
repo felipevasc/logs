@@ -25,7 +25,9 @@ window.CaseReport = (() => {
     c = window.EvidenceUI ? EvidenceUI.redact(structuredClone(c)) : c;
     const fonts=await prepare();check(signal);
     const timeline=await CaseTimeline.rows(c,()=>true,{signal,limit:10000,maxChars:8000000,includeUndated:true});
-    const items=c.items||[], trails=c.caseTrails||[], byId=new Map(items.map((item,i)=>[item.id,{item,ref:`I${String(i+1).padStart(3,'0')}`} ]));
+    const items=c.items||[], trails=c.caseTrails||[], byItem=new Map(items.map((item,i)=>[item,{item,ref:`I${String(i+1).padStart(3,'0')}`} ])), byId=new Map();
+    for(const item of items) { if(byId.has(item.id)) byId.set(item.id,null); else byId.set(item.id,byItem.get(item)); }
+    const nativeBindings=window.CaseEvidence?.active===true?window.CaseEvidenceItems.index(c):null;
     if(items.length>10000||trails.length>1000)throw Error('O relatório aceita até 10.000 itens e 1.000 trilhas. Divida o Caso para gerar o PDF.');
     const narrativeChars=[...items,...trails].reduce((total,target)=>{const n=CaseContent.narrative(target);return total+clean(n.summary).length+clean(n.details).length+clean(target.title||target.label).length;},0);
     if(narrativeChars>8000000)throw Error('Os textos do Caso excedem o limite de 8 milhões de caracteres por relatório.');
@@ -89,7 +91,7 @@ window.CaseReport = (() => {
     if(overview.blob)await image(await toDataURL(overview.blob),overview.width,overview.height,overview.overview?overview.summary:'Visão temporal dos registros preservados no Caso.',125);
     else await paragraph('Os registros deste Caso não têm horário reconhecido. A tabela a seguir inclui as ocorrências sem data.',{size:10});
     if(timeline.undated)await paragraph(`${timeline.undated} registros sem horário estão identificados na tabela.`,{size:8,color:[112,117,129]});
-    const facts=window.CaseIntel?.synthesis(c,item=>byId.get(item.id)?.ref);
+    const facts=window.CaseIntel?.synthesis(c,item=>byItem.get(item)?.ref);
     if(facts&&(facts.hypotheses.length||facts.techniques.length||facts.indicators.length||facts.custody.length)){
       section='Síntese da investigação';progress('Incluindo hipóteses, indicadores e integridade…');await heading(section,{fresh:true});
       if(facts.hypotheses.length){await heading('Hipóteses',{level:2});for(const h of facts.hypotheses)await paragraph(`${h.status.toUpperCase()} · ${h.text}${h.refs.length?`\nEvidências: ${h.refs.join(', ')}`:''}`,{size:9.5});y+=3;}
@@ -106,7 +108,7 @@ window.CaseReport = (() => {
       check(signal);const row=timeline.rows[i];
       const dateText=row.start==null?'Sem horário':stamp(row.start)+(row.end!=null&&row.end!==row.start?`\naté ${stamp(row.end)}`:'');
       const body=[row.title,row.detail&&row.detail!==row.title?row.detail:'',row.source?`Origem: ${row.source}`:'',...(row.notes||[]).map(note=>`Nota: ${note.text}`)].filter(Boolean).join('\n');
-      const refs=(row.itemIds||[]).map(id=>byId.get(id)?.ref).filter(Boolean).join(', ');
+      const refs=(nativeBindings&&row.itemRefs?row.itemRefs.map(reference=>{const entry=nativeBindings.resolve(reference);return entry.state==='unique'?byItem.get(entry.item)?.ref:'Associação indisponível';}):(row.itemIds||[]).map(id=>byId.get(id)?.ref)).filter(Boolean).join(', ');
       const parts=[wrap(dateText,31,7.7),wrap(body,99,8),wrap([refs,row.count?`${row.count} registros`:'Manual'].filter(Boolean).join('\n'),30,7.7)];
       let offset=0,total=Math.max(...parts.map(lines=>lines.length));
       while(offset<total){
@@ -120,10 +122,10 @@ window.CaseReport = (() => {
     }
     if(!timeline.rows.length)await paragraph('Nenhuma ocorrência registrada.');
     async function evidence(entry) {
-      const {item,ref}=entry;if(pageMap.has(item.id)){await paragraph(`${ref} · ${item.label||'Item do Caso'} — explicação e imagens na página ${pageMap.get(item.id)}.`,{size:9});return;}
-      ensure(28);pageMap.set(item.id,pdf.getNumberOfPages());await heading(`${ref} · ${item.label||'Item do Caso'}`,{level:2});
-      const rows=item.rows||[], sources=[...new Set(rows.map(row=>row.source).filter(Boolean))];
-      await paragraph(`${rows.length} registros preservados${sources.length?` · ${sources.slice(0,6).join(', ')}${sources.length>6?` e mais ${sources.length-6} origens`:''}`:''}`,{size:8,color:[108,114,127]});
+      const {item,ref}=entry;if(pageMap.has(item)){await paragraph(`${ref} · ${item.label||'Item do Caso'} — explicação e imagens na página ${pageMap.get(item)}.`,{size:9});return;}
+      ensure(28);pageMap.set(item,pdf.getNumberOfPages());await heading(`${ref} · ${item.label||'Item do Caso'}`,{level:2});
+      const rows=nativeBindings?[]:item.rows||[], count=nativeBindings?window.CaseEvidenceItems.count(item):rows.length, sources=[...new Set(rows.map(row=>row.source).filter(Boolean))];
+      await paragraph(`${count} registros preservados${sources.length?` · ${sources.slice(0,6).join(', ')}${sources.length>6?` e mais ${sources.length-6} origens`:''}`:''}`,{size:8,color:[108,114,127]});
       if(item.detection)await paragraph(window.EvidenceUI?.report(item)||"",{size:8.5});
       const narrative=CaseContent.narrative(item);await paragraph(narrative.summary,{bold:true});await paragraph(narrative.details);await gallery(item);y+=4;
     }
@@ -131,11 +133,12 @@ window.CaseReport = (() => {
     for(let i=0;i<trails.length;i++){
       check(signal);const trail=trails[i];section=`Trilha ${i+1} · ${trail.title||'Sem título'}`;progress(`Organizando trilha ${i+1} / ${trails.length}…`);await heading(section,{fresh:true});
       const narrative=CaseContent.narrative(trail);await paragraph(narrative.summary,{bold:true});await paragraph(narrative.details);await gallery(trail);
-      const ids=[...new Set(trail.itemIds||[])];if(!ids.length)await paragraph('Nenhum item associado a esta trilha.',{size:9,color:[110,115,125]});
-      for(const id of ids){if(!byId.has(id))continue;associated.add(id);await evidence(byId.get(id));check(signal);}
+      const linked=nativeBindings?nativeBindings.associations(trail):(trail.itemIds||[]).map(id=>({state:byId.get(id)?'unique':'missing',item:byId.get(id)?.item}));
+      if(!linked.length)await paragraph('Nenhum item associado a esta trilha.',{size:9,color:[110,115,125]});
+      for(const entry of linked){if(entry.state!=='unique'){await paragraph(entry.state==='ambiguous'?'Associação ambígua preservada.':'Associação indisponível preservada.',{size:9});continue;}associated.add(entry.item);await evidence(byItem.get(entry.item));check(signal);}
     }
-    const remaining=items.filter(item=>!associated.has(item.id));
-    if(remaining.length){section=trails.length?'Itens sem trilha':'Itens do Caso';await heading(section,{fresh:true});for(const item of remaining){await evidence(byId.get(item.id));check(signal);}}
+    const remaining=items.filter(item=>!associated.has(item));
+    if(remaining.length){section=trails.length?'Itens sem trilha':'Itens do Caso';await heading(section,{fresh:true});for(const item of remaining){await evidence(byItem.get(item));check(signal);}}
     progress('Finalizando páginas…');
     const pages=pdf.getNumberOfPages();for(let page=1;page<=pages;page++){pdf.setPage(page);pdf.setDrawColor(225,226,232);pdf.line(LEFT,284,RIGHT,284);draw('LogInsight · Relatório do Caso',LEFT,289,7,false,[123,126,138]);const number=`${page} / ${pages}`;draw(number,RIGHT-textWidth(number,7,false),289,7,false,[123,126,138]);}
     check(signal);const blob=pdf.output('blob');if(blob.size>MAX_BYTES)throw Error('O relatório excede 32 MB. Reduza a quantidade de imagens ou divida o Caso.');

@@ -194,6 +194,7 @@ fn every_canonical_parser_resumes_with_exact_offsets_ids_headers_and_columns() {
         assert!(result.is_err(), "{name} must not publish a partial index");
         let resumed = probe(&path, format, &cache, &options, &|_| {}).unwrap();
         equivalent(&resumed, &expected);
+        assert_eq!(resumed["metadataResidentRows"], 0, "{name} resumed metadata must be file-backed");
         assert!(
             resumed["parsedRows"].as_u64().unwrap() < resumed["rows"].as_u64().unwrap(),
             "{name} reparsed a prefix"
@@ -201,6 +202,7 @@ fn every_canonical_parser_resumes_with_exact_offsets_ids_headers_and_columns() {
         let warm = probe(&path, format, &cache, &options, &|_| {}).unwrap();
         equivalent(&warm, &expected);
         assert_eq!(warm["parsedRows"], 0, "{name} warm metadata parse");
+        assert_eq!(warm["metadataResidentRows"], 0, "{name} warm metadata must be file-backed");
         assert_eq!(warm["resumedRows"], warm["rows"]);
     }
 }
@@ -258,7 +260,7 @@ fn raw_eof_checkpoint_survives_cancelled_column_discovery_and_restore() {
     let id = format!("restore-{}", uuid::Uuid::new_v4());
     assert!(
         probe(&path, "jsonl", &cache, &json!({"operationId":id}), &|p| {
-            if p["phaseId"] == "metadata-restore" {
+            if p["phaseId"] == "metadata-restore" || p["phaseId"] == "metadata-map-validate" {
                 testkit::cancel_metadata_probe(&id);
             }
         })
@@ -280,16 +282,19 @@ fn corrupt_committed_payload_and_manifest_are_rejected_but_trailing_bytes_are_ig
     let payload = files(&cache, "lines").pop().unwrap();
     let state = files(&cache, "state").pop().unwrap();
     let size = std::fs::metadata(&payload).unwrap().len();
+    let tail = b"uncommitted torn record";
     std::fs::OpenOptions::new()
         .append(true)
         .open(&payload)
         .unwrap()
-        .write_all(b"uncommitted torn record")
+        .write_all(tail)
         .unwrap();
     let warm = probe(&path, "jsonl", &cache, &json!({}), &|_| {}).unwrap();
     equivalent(&warm, &expected);
     assert_eq!(warm["parsedRows"], 0);
-    assert_eq!(std::fs::metadata(&payload).unwrap().len(), size);
+    // Shared mapped admission reads only the committed prefix. It cannot
+    // truncate a file that another reader may currently have mapped.
+    assert_eq!(std::fs::metadata(&payload).unwrap().len(), size + tail.len() as u64);
     let mut bytes = std::fs::read(&payload).unwrap();
     bytes[72 + 12] ^= 0x40;
     std::fs::write(&payload, bytes).unwrap();

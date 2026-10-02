@@ -125,16 +125,31 @@ try {
   assert.equal(results.pivot.total, 6000);
   assert.ok(results.pivot.mergedDimensionCells > 0);
 
+  // Each dimension opens the editable composer without applying the whole cell.
+  await page.locator("#cube-table .cube-leaf-row .cube-value").first().click({ button: "right" });
+  await page.getByRole("button", { name: "Criar filtro: Nível", exact: true }).click();
+  await page.locator("#filter-pop").waitFor({ state: "visible" });
+  assert.equal(await page.locator("#fp-col").inputValue(), "level");
+  assert.equal(await page.locator("#fp-op").inputValue(), "equals_exact");
+  assert.ok((await page.locator("#fp-val").inputValue()).length > 0);
+  assert.deepEqual(await page.evaluate(() => state.filters), [], "opening the dimension composer leaves the current recorte intact");
+  await page.locator("#fp-cancel").click();
+  await page.locator("#filter-pop").waitFor({ state: "hidden" });
+  assert.deepEqual(await page.evaluate(() => state.filters), [], "cancel does not apply any pivot dimension");
+
   results.pivotFilters = await page.evaluate(() => {
     let menu;
     const originalMenu = showCtxMenu, originalFiltersChanged = filtersChanged, originalFilters = state.filters;
     showCtxMenu = (x, y, items) => { menu = items; }; filtersChanged = () => {}; state.filters = [];
     try {
       document.querySelector("#cube-table .cube-leaf-row .cube-value").oncontextmenu({ preventDefault() {}, clientX: 0, clientY: 0 });
-      menu[0].onClick(); return state.filters;
+      const combination = menu.find(item => item.label === "Filtrar esta combinação");
+      if (!combination) throw Error("The pivot combination action is missing");
+      combination.onClick(); return state.filters;
     } finally { showCtxMenu = originalMenu; filtersChanged = originalFiltersChanged; state.filters = originalFilters; }
   });
   assert.deepEqual(results.pivotFilters.map(filter => filter.column), ["level", "code", "source"]);
+  assert.ok(results.pivotFilters.every(filter => filter.op === "equals_exact" && typeof filter.value === "string"), "the named combination action retains exact native dimension keys");
 
   phase = "bounded pivot rendering";
   results.pivotBounded = await page.evaluate(() => {

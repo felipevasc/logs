@@ -4,10 +4,39 @@ window.Tasks = (() => {
   "use strict";
   const base = api;
   // Commands that only read: identical requests in flight are shared and survive a selective cancel.
-  const READS = new Set(["threat_catalog", "threat_scan", "threat_events", "journey_fields", "journey_index", "journey_events", "dataset_overview", "triage", "triage_evidence_event", "event_insights", "detection_rules", "timeline_lanes", "entity_summary", "ioc_sightings", "source_hashes", "timeline_range", "compare_periods", "list_sources", "source_summary", "query_page", "query_events", "explore_snapshot", "aggregate_events", "trail_events", "count_filtered", "tree_aggs", "stats_events", "event_detail", "profile_fields", "discover_patterns", "compute_series", "pivot", "list_channels", "list_formats", "list_derived_fields", "get_codes", "get_codes_path", "system_codes_count", "remote_list", "get_ts_config"]);
+  const READS = new Set(["threat_catalog", "threat_scan", "threat_events", "journey_fields", "journey_index", "journey_events", "dataset_overview", "triage", "triage_evidence_event", "event_insights", "detection_rules", "timeline_lanes", "entity_summary", "ioc_sightings", "source_hashes", "timeline_range", "compare_periods", "list_sources", "source_summary", "source_snapshot", "query_page", "query_events", "explore_snapshot", "aggregate_events", "trail_events", "count_filtered", "tree_aggs", "stats_events", "event_detail", "profile_fields", "discover_patterns", "compute_series", "pivot", "list_channels", "list_formats", "list_derived_fields", "get_codes", "get_codes_path", "system_codes_count", "remote_list", "get_ts_config"]);
   // Bookkeeping calls never show as work.
   const QUIET = new Set(["validate_filters", "case_sync", "ui_zoom", "cancel_operation", "cancel_task", "engine_status", "cases_save", "cases_load", "mcp_status", "get_codes_path", "system_codes_count", "list_formats"]);
-  const WHAT = { dataset_overview: "Visão geral", triage: "Comprometimentos", triage_evidence_event: "Evento da evidência", timeline_range: "Volume no tempo", timeline_lanes: "Faixas", query_page: "Registros", engine_retry: "Preparando índices", query_events: "Registros", explore_snapshot: "Registros e campos", tree_aggs: "Campos", aggregate_events: "Grupos", profile_fields: "Perfil dos campos", compute_series: "Gráficos", pivot: "Tabela dinâmica", discover_patterns: "Padrões", threat_scan: "Ameaças", threat_events: "Registros de ameaça", compare_periods: "Comparação de períodos", journey_index: "Possíveis trilhas", journey_events: "Registros da trilha", journey_fields: "Campos de ligação", entity_summary: "Entidades", ioc_sightings: "Indicadores nas fontes", source_hashes: "SHA-256 das fontes", stats_events: "Histograma", count_filtered: "Contagem", trail_events: "Vizinhança do registro", load_file: "Abrindo logs", load_files: "Abrindo logs", load_bundle: "Abrindo logs", load_event_log: "Lendo o Event Log", remote_import: "Importação remota", remote_test: "Teste de conexão", export_events: "Exportação", export_investigation: "Exportação", import_investigation: "Importação da investigação", harvest_codes: "Catálogo do sistema", sigma_import: "Importação Sigma", expand_paths: "Lendo pastas", event_detail: "Detalhe do registro", list_sources: "Fontes", event_insights: "Detalhe do registro" };
+  QUIET.add("analysis_context_snapshot"); QUIET.add("exclusion_capabilities"); QUIET.add("exclusion_discard");
+  const SCOPED = new Set(["exclusion_capabilities", "exclusion_preview", "exclusion_commit", "exclusion_list", "exclusion_archive_page", "exclusion_restore_batch", "exclusion_restore_selected", "engine_status", "engine_retry", "source_hashes", "triage_episode", "test_ts_config", "set_ts_config", "clear_events", "load_file", "load_files", "load_bundle", "load_event_log", "threat_scan", "threat_events", "journey_fields", "journey_index", "journey_events", "dataset_overview", "triage", "triage_evidence_event", "event_insights", "timeline_lanes", "grouped_timeline", "entity_summary", "ioc_sightings", "timeline_range", "compare_periods", "query_page", "query_events", "explore_snapshot", "aggregate_events", "trail_events", "count_filtered", "tree_aggs", "stats_events", "event_detail", "profile_fields", "discover_patterns", "compute_series", "pivot", "list_derived_fields", "save_derived_field", "delete_derived_field", "export_events"]);
+  for (const command of ["exclusion_capabilities", "exclusion_preview", "exclusion_list", "exclusion_archive_page", "preview_field_transform", "grouped_timeline", "engine_status", "triage_episode", "test_ts_config"]) READS.add(command);
+  const METADATA = new Set(["exclusion_capabilities", "exclusion_list", "exclusion_archive_page", "exclusion_restore_batch", "exclusion_restore_selected", "list_derived_fields", "engine_status", "engine_retry", "test_ts_config", "set_ts_config"]);
+  for (const command of ["list_sources", "source_summary"]) { SCOPED.add(command); METADATA.add(command); }
+  SCOPED.add("exclusion_visibility"); READS.add("exclusion_visibility"); METADATA.add("exclusion_visibility"); QUIET.add("exclusion_visibility");
+  for (const command of ["reference_inspect", "reference_list", "reference_import", "reference_remove", "reference_save_lookup"]) { SCOPED.add(command); METADATA.add(command); }
+  READS.add("reference_inspect"); READS.add("reference_list");
+  READS.add("analysis_field_text"); SCOPED.add("analysis_field_text");
+  READS.add("java_trace_detail"); SCOPED.add("java_trace_detail");
+  // Native evidence requests own their admission inside request; never inject
+  // the currently selected Case over their captured store/member identity.
+  for (const command of ["cases_load_view", "cases_save_view", "case_evidence_discard", "case_export_native", "case_recovery_status", "case_recovery_prepare_restart", "case_recovery_return_original"]) QUIET.add(command);
+  const evidenceReads = ["case_evidence_source_receipt", "case_evidence_find_members", "case_evidence_open", "case_evidence_preview", "case_evidence_member_detail", "case_evidence_member_field_text", "case_evidence_member_java_trace", "case_evidence_timeline", "case_evidence_display_timeline", "case_evidence_display_members"];
+  for (const command of evidenceReads) READS.add(command);
+  const evidencePreparations = new Set(["case_evidence_prepare", "case_evidence_prepare_membership"]);
+  const evidenceCommits = new Set(["case_import_native"]);
+  const WHAT = { exclusion_preview: "Prévia da exclusão", exclusion_commit: "Arquivando registros", exclusion_list: "Lotes excluídos", exclusion_archive_page: "Registros arquivados", exclusion_restore_batch: "Restaurando lote", exclusion_restore_selected: "Restaurando seleção", dataset_overview: "Visão geral", triage: "Comprometimentos", triage_evidence_event: "Evento da evidência", timeline_range: "Volume no tempo", timeline_lanes: "Faixas", query_page: "Registros", engine_retry: "Preparando índices", query_events: "Registros", explore_snapshot: "Registros e campos", tree_aggs: "Campos", aggregate_events: "Grupos", profile_fields: "Perfil dos campos", compute_series: "Gráficos", pivot: "Tabela dinâmica", discover_patterns: "Padrões", threat_scan: "Ameaças", threat_events: "Registros de ameaça", compare_periods: "Comparação de períodos", journey_index: "Possíveis trilhas", journey_events: "Registros da trilha", journey_fields: "Campos de ligação", entity_summary: "Entidades", ioc_sightings: "Indicadores nas fontes", source_hashes: "SHA-256 das fontes", stats_events: "Timeline", grouped_timeline: "Timeline por campo", preview_field_transform: "Prévia da transformação", count_filtered: "Contagem", trail_events: "Vizinhança do registro", load_file: "Abrindo logs", load_files: "Abrindo logs", load_bundle: "Abrindo logs", load_event_log: "Lendo o Event Log", remote_import: "Importação remota", remote_test: "Teste de conexão", export_events: "Exportação", export_investigation: "Exportação", import_investigation: "Importação da investigação", harvest_codes: "Catálogo do sistema", sigma_import: "Importação Sigma", expand_paths: "Lendo pastas", event_detail: "Detalhe do registro", list_sources: "Fontes", event_insights: "Detalhe do registro" };
+  Object.assign(WHAT, { reference_inspect: "Inspecionando referência", reference_list: "Referências do Caso", reference_import: "Importando referência", reference_remove: "Removendo referência", reference_save_lookup: "Salvando campo por referência" });
+  WHAT.analysis_field_text = "Valor exato do campo";
+  WHAT.java_trace_detail = "Estrutura Java do registro";
+  Object.assign(WHAT, { case_evidence_source_receipt: "Confirmando a seleção", case_evidence_open: "Abrindo evidências do Caso", case_evidence_preview: "Prévia das evidências", case_evidence_prepare: "Preservando a seleção", case_evidence_prepare_membership: "Preparando ocorrências", case_evidence_member_detail: "Evidência preservada", case_evidence_member_field_text: "Valor original do campo", case_evidence_member_java_trace: "Estrutura Java preservada", case_import_native: "Importando a investigação" });
+  WHAT.case_recovery_return_original = "Preparando o retorno ao perfil original";
+  WHAT.case_recovery_status = "Recuperações de Casos disponíveis";
+  WHAT.case_recovery_prepare_restart = "Verificando e preparando a recuperação de Casos";
+  WHAT.case_export_native = "Exportando a investigação preservada";
+  WHAT.case_evidence_display_timeline = "Buscando na cronologia completa do Caso";
+  WHAT.case_evidence_display_members = "Ocorrências preservadas da entrada da cronologia";
+  WHAT.case_evidence_timeline = "Cronologia das evidências preservadas";
+  WHAT.case_evidence_find_members = "Identificando ocorrências preservadas";
   const ZONES = { analysis: "Análise", case: "Caso", structure: "Estrutura" };
   const PAGES = { summary: "Resumo", compromises: "Comprometimentos", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas" };
   const TABS = { table: "Registros", group: "Resumir", dashboard: "Descobrir", cube: "Cruzar dados" };
@@ -15,9 +44,12 @@ window.Tasks = (() => {
   const tasks = new Map(), inflight = new Map(), ids = new WeakMap();
   let serial = 0, arrays = 0, dialog = null, ticker = null;
   const named = new Set(["set_ts_config", "remote_import", "remote_test", "load_bundle", "journey_fields", "journey_index", "journey_events", "discover_patterns", "timeline_range", "query_page", "query_events", "explore_snapshot", "count_filtered", "stats_events", "tree_aggs", "aggregate_events", "compute_series", "pivot", "load_file", "load_files", "load_event_log", "engine_retry"]);
-  const sourceMutations = new Set(["load_file", "load_files", "load_bundle", "load_event_log", "clear_events"]);
-  named.add("clear_events");
+  const sourceMutations = new Set(["set_ts_config", "load_file", "load_files", "load_bundle", "load_event_log", "clear_events"]);
+  named.add("clear_events"); named.add("grouped_timeline"); named.add("preview_field_transform"); for (const command of ["exclusion_visibility", "exclusion_preview", "exclusion_list", "exclusion_archive_page"]) named.add(command);
   const latest = new Map();
+  named.add("analysis_field_text"); named.add("event_detail"); named.add("java_trace_detail");
+  for (const command of ["reference_inspect", "reference_list", "reference_import", "reference_remove", "reference_save_lookup"]) named.add(command);
+  for (const command of [...evidenceReads, ...evidencePreparations, ...evidenceCommits]) named.add(command);
   const background = window.PerformanceTools.queue(1);
 
   // Where the work was asked from: the menu item, its tab and its area.
@@ -45,20 +77,39 @@ window.Tasks = (() => {
   async function run(entry) {
     const execute = async () => {
       if (entry.cancelled) throw new Error("Operação cancelada.");
+      if (entry.analysisOwner) {
+        entry.analysisOwner = await window.AnalysisContexts.prepare(entry.analysisOwner, { metadata: METADATA.has(entry.cmd) || sourceMutations.has(entry.cmd) });
+        if (entry.cancelled) throw new Error("Operação cancelada.");
+        entry.args = { ...entry.args, analysisContext: entry.analysisOwner.identity, sourceGeneration: entry.analysisOwner.sourceGeneration };
+      }
       entry.status = "running";
-      return base(entry.cmd, entry.args, { ...entry.opts, silent: true, cancelled: () => entry.cancelled });
+      return base(entry.cmd, entry.args, { ...entry.opts, silent: true,
+        cancelled: () => entry.cancelled || !!entry.analysisOwner && !window.AnalysisContexts.isCurrent(entry.analysisOwner) });
     };
     return entry.opts.background ? background.add(execute, () => !entry.cancelled) : execute();
   }
-  function start(cmd, args, opts) {
+  function start(cmd, args, opts, analysisOwner) {
     const from = origin(), id = ++serial, operationId = named.has(cmd) ? `ui-${Date.now()}-${id}` : null;
-    const entry = { id, cmd, args: operationId ? { ...args, operationId } : args, operationId, opts, read: READS.has(cmd), cancelled: false, owners: new Set(opts.latest ? [opts.latest] : []), keepAlive: !opts.latest, status: opts.background ? "queued" : "running", started: performance.now(), ...from };
+    const entry = { id, cmd, analysisOwner, args: operationId ? { ...args, operationId } : args, operationId, opts, read: READS.has(cmd), cancelled: false, owners: new Set(opts.latest ? [opts.latest] : []), keepAlive: !opts.latest, status: opts.background ? "queued" : "running", started: performance.now(), ...from };
     tasks.set(entry.id, entry);
-    entry.promise = run(entry).then(result => {
+    entry.promise = run(entry).then(async result => {
+      // A prepared payload can finish just before Cancel reaches the native task.
+      // Release that uncommitted token even when its result is rejected by the UI.
+      if (entry.cmd === "exclusion_preview" && result?.previewToken && entry.analysisOwner && (entry.cancelled || !window.AnalysisContexts.isCurrent(entry.analysisOwner))) {
+        void base("exclusion_discard", { previewToken: result.previewToken, analysisContext: entry.analysisOwner.identity, sourceGeneration: result.sourceGeneration }, { silent: true }).catch(() => {});
+      }
+      if (entry.cancelled && evidencePreparations.has(entry.cmd)) {
+        const reference = entry.cmd === "case_evidence_prepare" ? result : result?.reference, store = entry.args.request?.expectedStore;
+        if (reference?.kind === "pending_native_evidence" && store) void base("case_evidence_discard", {
+          request: { store: { storeId: store.storeId, epoch: store.epoch }, reference }
+        }, { silent: true }).catch(() => {});
+      }
+      if (entry.analysisOwner && window.AnalysisContexts.validSnapshot(result?.analysisContext)) await window.AnalysisContexts.receipt(result, entry.analysisOwner);
+      if (entry.read && entry.analysisOwner) window.AnalysisContexts.assertOwner(entry.analysisOwner);
       // A successful source mutation already crossed the native commit boundary.
       // Cancellation may have arrived too late; retain the committed result so the
       // source intent guard can reconcile it instead of pretending it rolled back.
-      if (entry.cancelled && !sourceMutations.has(entry.cmd)) throw new Error("Operação cancelada.");
+      if (entry.cancelled && !sourceMutations.has(entry.cmd) && !evidenceCommits.has(entry.cmd) && !window.AnalysisContexts?.validSnapshot(result?.analysisContext)) throw new Error("Operação cancelada.");
       return result;
     }, error => { if (!entry.cancelled && !opts.silent) toast(String(error), "err"); throw error; })
       .finally(() => { tasks.delete(entry.id); schedule(); if (inflight.get(entry.key2) === entry) inflight.delete(entry.key2); for (const [key, owner] of latest) if (owner === entry) latest.delete(key); });
@@ -67,18 +118,19 @@ window.Tasks = (() => {
     return entry;
   }
   api = function(cmd, args = {}, opts = {}) {
-    if (QUIET.has(cmd)) return base(cmd, args, opts);
+    if (QUIET.has(cmd) && !SCOPED.has(cmd)) return base(cmd, args, opts);
     // Dataset identity belongs to the signature; identical arguments on a replacement source are different work.
-    const context = JSON.stringify([state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.cases?.active, state.derivedFields]);
+    const analysisOwner = SCOPED.has(cmd) ? opts.analysisOwner || window.AnalysisContexts?.capture() : null;
+    const context = JSON.stringify([state.datasetRevision, state.currentArtifact?.id, state.currentArtifact?.loadedAt, state.cases?.active, state.derivedFields, analysisOwner]);
     const key = READS.has(cmd) ? context + signature(cmd, args) : null, shared = key && inflight.get(key);
     if (shared && !shared.cancelled) { if (opts.latest) { if (latest.get(opts.latest) !== shared) cancelLatest(opts.latest); latest.set(opts.latest, shared); shared.owners.add(opts.latest); } else shared.keepAlive = true; return shared.promise; }
     if (opts.latest) cancelLatest(opts.latest);
-    const entry = start(cmd, args, opts); entry.key2 = key;
+    const entry = start(cmd, args, opts, analysisOwner); entry.key2 = key;
     if (entry.read) inflight.set(key, entry);
     return entry.promise;
   };
 
-  const visible = () => [...tasks.values()].filter(t => performance.now() - t.started >= VISIBLE_AFTER);
+  const visible = () => [...tasks.values()].filter(t => !QUIET.has(t.cmd) && performance.now() - t.started >= VISIBLE_AFTER);
   function groups() {
     const map = new Map();
     for (const t of visible()) { const g = map.get(t.key) || map.set(t.key, { key: t.key, label: t.label, marks: t.marks, tasks: [] }).get(t.key); g.tasks.push(t); }
@@ -128,6 +180,9 @@ window.Tasks = (() => {
     schedule();
   }
   function cancelLatest(key) { const entry = latest.get(key); latest.delete(key); if (!entry) return; entry.owners.delete(key); if (!entry.keepAlive && !entry.owners.size) cancel(entry); }
+  function cancelStaleAnalysis() {
+    for (const entry of tasks.values()) if (entry.read && entry.analysisOwner?.identity && !window.AnalysisContexts.isCurrent(entry.analysisOwner)) cancel(entry);
+  }
   function cancelAll() { for (const task of tasks.values()) cancel(task); inflight.clear(); latest.clear(); schedule(); }
   function progress(payload) {
     if (!payload?.operationId) return null;
@@ -188,5 +243,5 @@ window.Tasks = (() => {
   button.innerHTML = '<i class="li-pulse" aria-hidden="true"></i><span></span>';
   button.onclick = openDialog;
   $("#workbar-label").before(button);
-  return { cancelAll, cancelLatest, cancelOperation: id => cancel([...tasks.values()].find(t => t.operationId === id)), progress, detail, operationFor: key => latest.get(key)?.operationId || null, pendingSources: () => [...tasks.values()].some(task => sourceMutations.has(task.cmd)), pending: () => tasks.size, open: openDialog, running: () => visible().length, groups };
+  return { cancelAll, cancelStaleAnalysis, cancelLatest, cancelOperation: id => cancel([...tasks.values()].find(t => t.operationId === id)), progress, detail, operationFor: key => latest.get(key)?.operationId || null, pendingSources: () => [...tasks.values()].some(task => sourceMutations.has(task.cmd)), pending: () => tasks.size, open: openDialog, running: () => visible().length, groups };
 })();

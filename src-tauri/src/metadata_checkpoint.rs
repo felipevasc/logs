@@ -59,7 +59,7 @@ pub(crate) fn report(reporter: Reporter<'_>, progress: Progress) {
 
 #[derive(Default)]
 pub(crate) struct Resume {
-    pub lines: Vec<LineMeta>,
+    pub lines: crate::metadata_store::LineBuilder,
     pub cursor: usize,
     pub scan_complete: bool,
     pub columns: Option<Vec<String>>,
@@ -174,6 +174,84 @@ fn valid_record(m: &LineMeta, cursor: u64, previous_end: Option<u64>) -> bool {
 fn state_digest(state: &State) -> Result<String, String> {
     let data = serde_json::to_vec(state).map_err(|e| e.to_string())?;
     Ok(format!("{:x}", Sha256::digest(data)))
+}
+
+/// Open only a fully committed, column-complete journal without decoding it
+/// into a per-row heap allocation. The shared lease outlives every cloned view.
+pub(crate) fn open_complete(
+    dir: &Path, key: &str, source_bytes: usize, initial_cursor: usize,
+    multiline: bool, reporter: Reporter<'_>,
+) -> Result<Option<(crate::metadata_store::LineStore, Vec<String>)>, String> {
+    crate::operations::check()?;
+    let lock_path = dir.join(format!("{key}.lock"));
+    let Ok(lock) = OpenOptions::new().read(true).write(true).open(lock_path) else { return Ok(None); };
+    // A writer may be advancing a partial checkpoint. Leave its bounded,
+    // cancellable exclusive-lock wait to Journal::open rather than racing it.
+    if FileExt::try_lock_shared(&lock).is_err() { return Ok(None); }
+    let path = dir.join(format!("{key}.lines"));
+    let state_path = dir.join(format!("{key}.state"));
+    let Some((state, file)) = read_state(&path, &state_path, key, source_bytes, initial_cursor, multiline) else { return Ok(None); };
+    if !state.scan_complete || state.columns.is_none() { return Ok(None); }
+    let payload_bytes = usize::try_from(state.payload_bytes).map_err(|_| "Metadados excedem o espaço de endereçamento.")?;
+    let generation = file.metadata().map_err(|e| e.to_string())?;
+    // SAFETY: cooperating writers and pruning require the same stable lock
+    // exclusively. This shared lease is retained by the immutable LineStore.
+    // The map covers only the manifest's committed prefix, never transient tail.
+    let Ok(mapped) = (unsafe { memmap2::MmapOptions::new().len(payload_bytes).map(&file) }) else { return Ok(None); };
+    if &mapped[..8] != MAGIC || &mapped[8..HEADER_BYTES] != key.as_bytes() { return Ok(None); }
+    let mut hash = Sha256::new(); hash.update(&mapped[..HEADER_BYTES]);
+    let mut previous_end = None; let mut completed = 0; let mut last_report = Instant::now();
+    report(reporter, Progress::new("metadata-map-validate", "Verificando metadados mapeados", 0, state.sealed_rows, "registros"));
+    for chunk in mapped[HEADER_BYTES..].chunks(BLOCK_ROWS * RECORD_BYTES) {
+        crate::operations::check()?; hash.update(chunk);
+        for bytes in chunk.chunks_exact(RECORD_BYTES) {
+            let Some(meta) = decode_record(bytes) else { return Ok(None); };
+            if !valid_record(&meta, state.cursor, previous_end) { return Ok(None); }
+            previous_end = meta.offset.checked_add(u64::from(meta.len));
+            completed += 1;
+        }
+        if last_report.elapsed() >= Duration::from_millis(150) {
+            report(reporter, Progress::new("metadata-map-validate", "Verificando metadados mapeados", completed, state.sealed_rows, "registros"));
+            last_report = Instant::now();
+        }
+    }
+    if completed != state.sealed_rows || format!("{:x}", hash.finalize()) != state.payload_sha256 { return Ok(None); }
+    crate::operations::check()?;
+    // Verification touches every page. Drop that view, then remap the SAME
+    // opened file under the SAME retained shared lease, so later queries fault
+    // only the pages they need into this process. The OS page cache stays
+    // reclaimable; this is not a physical-RAM limit or cache-dropping operation.
+    drop(mapped);
+    let current = file.metadata().map_err(|e| e.to_string())?;
+    if current.len() != generation.len() || current.modified().ok() != generation.modified().ok() {
+        return Err("Metadados mudaram durante a validação.".into());
+    }
+    // SAFETY: the file descriptor and shared writer/pruner lease were retained
+    // without interruption; no references into the old mapping survive.
+    let mapped = unsafe { memmap2::MmapOptions::new().len(payload_bytes).map(&file) }
+        .map_err(|e| format!("Não foi possível remapear metadados verificados: {e}"))?;
+    crate::operations::check()?;
+    let lines = crate::metadata_store::LineStore::from_validated_journal(mapped, std::sync::Arc::new(lock), HEADER_BYTES, state.sealed_rows)?;
+    let mut done = Progress::new("metadata-map-validate", "Metadados mapeados verificados", completed, completed, "registros");
+    done.resumed_rows = completed; done.checkpoint_rows = completed; report(reporter, done);
+    Ok(Some((lines, state.columns.unwrap())))
+}
+
+fn read_state(path: &Path, state_path: &Path, key: &str, source_bytes: usize, initial_cursor: usize, multiline: bool) -> Option<(State, File)> {
+    let metadata = std::fs::metadata(state_path).ok()?;
+    if metadata.len() > MAX_MANIFEST_BYTES { return None; }
+    let envelope: Envelope = serde_json::from_slice(&std::fs::read(state_path).ok()?).ok()?;
+    if state_digest(&envelope.state).ok()? != envelope.sha256 { return None; }
+    let state = envelope.state;
+    let expected = (state.sealed_rows as u64).checked_mul(RECORD_BYTES as u64)?.checked_add(HEADER_BYTES as u64)?;
+    if state.version != VERSION || state.key != key || state.source_bytes != source_bytes as u64
+        || state.payload_bytes != expected || state.sealed_rows > source_bytes || state.sealed_rows > 500_000_000
+        || state.cursor < initial_cursor as u64 || state.cursor > source_bytes as u64
+        || state.columns.is_some() && !state.scan_complete || state.tail.is_some() && (!multiline || state.scan_complete)
+        || state.scan_complete && state.cursor != source_bytes as u64 { return None; }
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() < expected { return None; }
+    Some((state, file))
 }
 
 impl Journal {
@@ -301,9 +379,16 @@ impl Journal {
         ))
     }
 
-    pub(crate) fn checkpoint(
+    #[cfg(test)]
+    fn checkpoint(&mut self, rows: &[LineMeta], cursor: usize, complete: bool, columns: Option<&[String]>, reporter: Reporter<'_>, validate: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+        let mut spool = crate::metadata_store::LineBuilder::default();
+        spool.extend(rows.iter().copied())?;
+        self.checkpoint_rows(&mut spool, cursor, complete, columns, reporter, validate)
+    }
+
+    pub(crate) fn checkpoint_rows(
         &mut self,
-        lines: &[LineMeta],
+        lines: &mut crate::metadata_store::LineBuilder,
         cursor: usize,
         scan_complete: bool,
         columns: Option<&[String]>,
@@ -312,6 +397,7 @@ impl Journal {
     ) -> Result<(), String> {
         crate::operations::check()?;
         validate()?;
+        lines.flush()?;
         let sealed = if self.multiline && !scan_complete {
             lines.len().saturating_sub(1)
         } else {
@@ -335,10 +421,11 @@ impl Journal {
         report(reporter, progress.clone());
         let mut buffer = Vec::with_capacity(BLOCK_ROWS * RECORD_BYTES);
         let old_sealed = self.sealed_rows;
-        for chunk in lines[old_sealed..sealed].chunks(BLOCK_ROWS) {
+        for start in (old_sealed..sealed).step_by(BLOCK_ROWS) {
             crate::operations::check()?;
+            let chunk = lines.read_chunk(start..(start + BLOCK_ROWS).min(sealed))?;
             buffer.clear();
-            for m in chunk {
+            for m in &chunk {
                 encode_record(m, &mut buffer);
             }
             self.file.write_all(&buffer).map_err(|e| e.to_string())?;
@@ -379,7 +466,7 @@ impl Journal {
             payload_sha256: format!("{:x}", self.hash.clone().finalize()),
             sealed_rows: sealed,
             cursor: cursor as u64,
-            tail: (sealed < lines.len()).then(|| lines[sealed].into()),
+            tail: if sealed < lines.len() { Some(lines.at(sealed)?.into()) } else { None },
             scan_complete,
             columns: columns.map(<[String]>::to_vec),
         };
@@ -410,41 +497,7 @@ fn restore(
     multiline: bool,
     reporter: Reporter<'_>,
 ) -> Result<Option<(Resume, Sha256, u64, usize)>, String> {
-    let Some((state, file)) = (|| {
-        let metadata = std::fs::metadata(state_path).ok()?;
-        if metadata.len() > MAX_MANIFEST_BYTES {
-            return None;
-        }
-        let envelope: Envelope = serde_json::from_slice(&std::fs::read(state_path).ok()?).ok()?;
-        if state_digest(&envelope.state).ok()? != envelope.sha256 {
-            return None;
-        }
-        let state = envelope.state;
-        let expected = (state.sealed_rows as u64)
-            .checked_mul(RECORD_BYTES as u64)?
-            .checked_add(HEADER_BYTES as u64)?;
-        if state.version != VERSION
-            || state.key != key
-            || state.source_bytes != source_bytes as u64
-            || state.payload_bytes != expected
-            || state.sealed_rows > source_bytes
-            || state.sealed_rows > 500_000_000
-            || state.cursor < initial_cursor as u64
-            || state.cursor > source_bytes as u64
-            || state.columns.is_some() && !state.scan_complete
-            || state.tail.is_some() && (!multiline || state.scan_complete)
-            || state.scan_complete && state.cursor != source_bytes as u64
-        {
-            return None;
-        }
-        let file = File::open(path).ok()?;
-        if file.metadata().ok()?.len() < expected {
-            return None;
-        }
-        Some((state, file))
-    })() else {
-        return Ok(None);
-    };
+    let Some((state, file)) = read_state(path, state_path, key, source_bytes, initial_cursor, multiline) else { return Ok(None); };
     let mut file = BufReader::with_capacity(1 << 20, file);
     let mut header = [0u8; HEADER_BYTES];
     if file.read_exact(&mut header).is_err()
@@ -455,7 +508,7 @@ fn restore(
     }
     let mut hash = Sha256::new();
     hash.update(header);
-    let mut lines = Vec::with_capacity(state.sealed_rows.min(1_000_000));
+    let mut lines = crate::metadata_store::LineBuilder::default();
     let mut buffer = vec![0; BLOCK_ROWS * RECORD_BYTES];
     let mut last_report = Instant::now();
     let mut previous_end = None;
@@ -475,7 +528,7 @@ fn restore(
                 return Ok(None);
             }
             previous_end = m.offset.checked_add(u64::from(m.len));
-            lines.push(m);
+            lines.push(m)?;
         }
         if last_report.elapsed() >= Duration::from_millis(150) {
             report(
@@ -499,8 +552,9 @@ fn restore(
         if !valid_record(&m, state.cursor, previous_end) {
             return Ok(None);
         }
-        lines.push(m);
+        lines.push(m)?;
     }
+    lines.flush()?;
     crate::operations::check()?;
     let mut progress = Progress::new(
         "metadata-restore",
@@ -662,7 +716,7 @@ mod tests {
             Journal::open(dir.path(), &key, 300, 0, true, None).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(restored.resumed_rows, 0);
         assert_eq!(restored.lines.len(), 1);
-        assert_eq!(restored.lines[0].ts, 123);
+        assert_eq!(restored.lines.at(0).unwrap().ts, 123);
         let path = dir.path().join(format!("{key}.state"));
         let mut envelope: Envelope =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -709,4 +763,58 @@ mod tests {
             assert!(restored.lines.is_empty());
         }
     }
+
+    #[test]
+    fn complete_mapping_is_remapped_verified_and_protected_from_pruning() {
+        let dir = tempfile::tempdir().unwrap(); let key = "c".repeat(64);
+        let (mut journal, _) = Journal::open(dir.path(), &key, 300, 0, false, None).unwrap_or_else(|e| panic!("{e}"));
+        journal.checkpoint(&[LineMeta { offset: 0, len: 11, ts: 123, ..Default::default() }, LineMeta { offset: 12, len: 10, ts: -7, ..Default::default() }], 300, true, Some(&["field".into()]), None, &|| Ok(())).unwrap();
+        drop(journal);
+        let (first, columns) = open_complete(dir.path(), &key, 300, 0, false, None).unwrap().unwrap();
+        let (second, _) = open_complete(dir.path(), &key, 300, 0, false, None).unwrap().unwrap();
+        assert_eq!(first.resident_rows(), 0); assert_eq!(first.at(1).ts, -7); assert_eq!(columns, ["field"]);
+        let mut mapped_rows = Vec::new();
+        for row in first.iter() { encode_record(&row, &mut mapped_rows); }
+        assert_eq!(mapped_rows, std::fs::read(dir.path().join(format!("{key}.lines"))).unwrap()[HEADER_BYTES..], "remapping must preserve every metadata field");
+        let writer = OpenOptions::new().read(true).write(true).open(dir.path().join(format!("{key}.lock"))).unwrap();
+        assert!(FileExt::try_lock_exclusive(&writer).is_err());
+        prune(dir.path(), std::time::SystemTime::now() + Duration::from_secs(60));
+        assert!(dir.path().join(format!("{key}.lines")).exists());
+        drop(first); drop(second);
+        FileExt::try_lock_exclusive(&writer).unwrap(); FileExt::unlock(&writer).unwrap();
+        let path = dir.path().join(format!("{key}.lines"));
+        let mut bytes = std::fs::read(&path).unwrap(); bytes[HEADER_BYTES + 12] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(open_complete(dir.path(), &key, 300, 0, false, None).unwrap().is_none(), "full payload checksum must reject changed timestamps");
+    }
+    #[test]
+    fn shared_complete_read_retains_tail_and_exclusive_resume_truncates_it() {
+        let dir = tempfile::tempdir().unwrap(); let key = "e".repeat(64);
+        let (mut journal, _) = Journal::open(dir.path(), &key, 300, 0, false, None).unwrap_or_else(|e| panic!("{e}"));
+        journal.checkpoint(&[LineMeta { offset: 0, len: 11, ts: 123, ..Default::default() }, LineMeta { offset: 12, len: 10, ts: -7, ..Default::default() }], 300, true, Some(&["field".into()]), None, &|| Ok(())).unwrap();
+        drop(journal);
+        let path = dir.path().join(format!("{key}.lines"));
+        let committed = std::fs::read(&path).unwrap();
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(b"unfinished").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (mapped, _) = open_complete(dir.path(), &key, 300, 0, false, None).unwrap().unwrap();
+        assert_eq!(mapped.len(), 2); assert_eq!(mapped.at(1).ts, -7);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), committed.len() as u64 + 10);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        let writer = OpenOptions::new().read(true).write(true).open(dir.path().join(format!("{key}.lock"))).unwrap();
+        assert!(FileExt::try_lock_exclusive(&writer).is_err());
+        drop(mapped); drop(writer);
+        let (_writer, resumed) = Journal::open(dir.path(), &key, 300, 0, false, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(resumed.resumed_rows, 2);
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+    }
+    #[test]
+    fn incomplete_journal_never_publishes_a_mapped_index() {
+        let dir = tempfile::tempdir().unwrap(); let key = "d".repeat(64);
+        let (mut journal, _) = Journal::open(dir.path(), &key, 300, 0, false, None).unwrap_or_else(|e| panic!("{e}"));
+        journal.checkpoint(&[LineMeta { len: 11, ..Default::default() }], 12, false, None, None, &|| Ok(())).unwrap();
+        drop(journal);
+        assert!(open_complete(dir.path(), &key, 300, 0, false, None).unwrap().is_none());
+    }
+
 }

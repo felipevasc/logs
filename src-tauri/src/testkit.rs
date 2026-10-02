@@ -65,7 +65,7 @@ impl Source {
         for path in paths {
             let part = crate::index_source_file(path, "auto", None)?;
             match &mut idx {
-                Some(all) => all.append(part),
+                Some(all) => all.append(part)?,
                 None => idx = Some(part),
             }
         }
@@ -76,6 +76,8 @@ impl Source {
             .map(|d| CompiledDerived {
                 name: d.name,
                 source: d.source,
+                steps: d.steps,
+                lookup: d.lookup.map(crate::reference_lookup::Compiled::new),
                 rules: d
                     .rules
                     .iter()
@@ -97,6 +99,15 @@ impl Source {
 
     pub fn len(&self) -> usize {
         self.idx.lines.len()
+    }
+
+    /// Storage accounting for the ignored library workload, not OS RSS/heap.
+    #[cfg(test)]
+    pub fn metadata_storage(&self) -> Value {
+        let rows = self.idx.lines.len();
+        let resident = self.idx.lines.resident_rows();
+        serde_json::json!({"rows": rows, "residentRows": resident, "mappedRows": rows - resident,
+            "residentPayloadBytes": resident as u64 * std::mem::size_of::<crate::model::LineMeta>() as u64})
     }
 
     pub fn is_empty(&self) -> bool {
@@ -479,6 +490,7 @@ pub fn metadata_probe(
             "key": key, "format": idx.format, "header": idx.header, "columns": idx.columns,
             "timezone": idx.parts[0].calendar.timezone, "currentOffset": chrono::Local::now().offset().to_string(),
             "metadata": rows, "events": events, "rows": idx.lines.len(),
+            "metadataResidentRows": idx.lines.resident_rows(),
             "resumedRows": restored_rows.get(), "checkpointRows": committed_rows.get(),
             "parsedRows": prepared.parsed_rows.load(std::sync::atomic::Ordering::Relaxed),
         }))

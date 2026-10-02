@@ -4,12 +4,34 @@
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod analysis;
+mod analysis_context;
+mod analysis_runtime;
+mod analysis_commands;
+mod analysis_visibility;
 mod attack;
 mod case_cache;
+mod case_evidence;
+mod case_evidence_anchors;
+mod case_evidence_budget;
+mod case_evidence_commands;
+mod case_evidence_display;
+mod case_evidence_display_policy;
+mod case_evidence_history;
+mod case_evidence_members;
+mod case_portable_native;
+mod case_portable_commands;
+mod case_recovery;
+mod case_recovery_commands;
+mod case_work_budget;
+mod case_archive_format;
+mod case_archive;
+mod case_archive_references;
 mod case_images;
 mod case_store;
 mod detections;
 mod evidence;
+mod exclusion_store;
+mod exclusion_commands;
 mod security_normalize;
 mod security_content;
 mod security_store;
@@ -25,24 +47,35 @@ mod distinct;
 mod engine;
 mod entities;
 mod event_preview;
+mod field_transform;
+mod grouped_timeline;
 mod index_cache;
 mod metadata_checkpoint;
+mod metadata_store;
 mod insights;
+mod java_stacktrace;
 mod journeys;
 mod mcp;
 mod model;
 mod operations;
+mod page_projection;
+mod projection_commands;
 mod pivots;
 mod query;
+mod query_regex;
 mod querylang;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
 mod publication_tests;
+mod reference_commands;
+mod reference_store;
+mod reference_lookup;
 mod remote;
 mod resources;
 mod sigma;
 mod sources;
+mod source_publication;
 mod spreadsheet;
 #[doc(hidden)]
 pub mod testkit;
@@ -51,6 +84,11 @@ mod timeline_export;
 mod triage;
 mod updates;
 mod workspace;
+mod detail_commands;
+#[cfg(test)]
+mod derived_surface_tests;
+#[cfg(test)]
+mod mapped_metadata_workload;
 
 use model::{CodesConfig, Event, STANDARD_COLUMNS};
 use parking_lot::{Mutex, RwLock};
@@ -68,6 +106,7 @@ pub enum SourceData {
 }
 
 pub struct AppState {
+    pub(crate) source_publication: RwLock<source_publication::Publication>,
     pub source: RwLock<SourceData>,
     /// nomes das fontes carregadas (mais de uma quando arquivos são unidos)
     pub source_names: RwLock<Vec<String>>,
@@ -81,6 +120,7 @@ pub struct AppState {
 
 #[derive(Serialize)]
 pub(crate) struct LoadSummary {
+    publication: source_publication::Receipt,
     count: usize,
     columns: Vec<String>,
     source_desc: String,
@@ -128,6 +168,10 @@ fn emit_progress(
 }
 
 pub(crate) fn config_dir() -> PathBuf {
+    case_recovery::profiles::selected(&base_config_dir())
+}
+
+pub(crate) fn base_config_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("LOGINSIGHT_DATA_DIR") {
         return PathBuf::from(path);
     }
@@ -165,6 +209,10 @@ pub(crate) fn source_write_checked(
             // Cancellation could arrive at the same instant the final reader
             // released the lock. Check again before allowing any mutation.
             operations::check()?;
+            if let Some(admitted) = analysis_runtime::current() {
+                if let Some(identity) = &admitted.identity { analysis_runtime::validate_identity(identity)?; }
+                admitted.validate_publication(state, false)?;
+            }
             return Ok(source);
         }
     }
@@ -173,21 +221,50 @@ pub(crate) fn source_write_checked(
 /// Reject a changed/truncated mapped source before an infallible legacy reader
 /// can mistake a refused engine session for permission to scan stale offsets.
 pub(crate) fn validate_current_source(state: &AppState) -> Result<(), String> {
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     if let SourceData::Indexed(idx) = &*source {
         for part in &idx.parts { sources::validate_source(part)?; }
     }
     Ok(())
 }
 
-async fn offload_source<T, F>(operation_id: Option<String>, app: AppHandle, dataset: bool, f: F) -> Result<T, String>
+/// Execute a snapshot admitted before enqueueing the blocking request.
+async fn offload_admitted<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, f: F) -> Result<T, String>
 where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
+    offload_case(operation_id, app, admitted, None, move |_| f()).await
+}
+
+/// Expensive ledger verification/mask compilation runs only after cancellation
+/// registration. Evidence and memory sources are filtered once in this worker.
+async fn offload_case<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, case_events: Option<Vec<Event>>, f: F) -> Result<T, String>
+where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
+    offload_case_input(operation_id, app, admitted, move |admitted| admitted.prepare_visibility(case_events), f).await
+}
+
+/// A detail/field action prepares only its selected record. Admission still
+/// binds the complete synchronized publication and validates its token at exit.
+async fn offload_case_record<T, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, case_events: Option<std::sync::Arc<case_cache::Records>>, id: usize, event_ref: Option<String>, f: F) -> Result<T, String>
+where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
+    offload_case_input(operation_id, app, admitted, move |admitted| admitted.prepare_visibility_record(case_events.as_deref().map(case_cache::Records::as_slice), id, event_ref.as_deref()), f).await
+}
+
+async fn offload_case_input<T, P, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, input: P, f: F) -> Result<T, String>
+where T: Send + 'static, P: FnOnce(&analysis_runtime::Admitted) -> Result<Option<Vec<Event>>, String> + Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
     offload_operation(operation_id, move || {
-        if dataset { validate_current_source(app.state::<AppState>().inner())?; }
+        admitted.validate(app.state::<AppState>().inner())?;
         let progress_app = app.clone();
-        Ok(operations::with_reporter(std::sync::Arc::new(move |progress| {
+        analysis_runtime::with(Some(admitted.clone()), || operations::with_reporter(std::sync::Arc::new(move |progress| {
             let _ = progress_app.emit("operation-progress", progress);
-        }), f))
+        }), || {
+            let case_events = input(&admitted)?;
+            admitted.validate(app.state::<AppState>().inner())?;
+            operations::check()?;
+            let result = f(case_events);
+            admitted.validate_visibility()?;
+            admitted.validate_native_case_authority()?;
+            admitted.schedule_derived_variant(app.state::<AppState>().inner());
+            Ok(result)
+        }))
     }).await?
 }
 
@@ -264,8 +341,11 @@ async fn load_event_log(
     merge: Option<bool>,
     app: AppHandle,
     operation_id: Option<String>,
+    analysis_context: Option<analysis_context::Identity>,
+    source_generation: Option<u64>,
 ) -> Result<LoadSummary, String> {
-    offload_operation(operation_id, move || {
+    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Publish)?;
+    offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         load_event_log_impl(state.inner(), &channel, max_events, merge, Some(&app))
     })
@@ -289,43 +369,15 @@ pub(crate) fn load_event_log_impl(
         "eventos",
         false,
     );
-    let mut idx = workspace::index_channel(channel, max_events)?;
+    let idx = workspace::index_channel(channel, max_events)?;
     operations::check()?;
     prepare_engine(state, &idx, app)?;
     emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
-    let mut source = source_write_checked(state)?;
-    let mut names = vec![format!("Event Log: {channel}")];
-    if merge.unwrap_or(false) {
-        match std::mem::replace(&mut *source, SourceData::None) {
-            SourceData::Indexed(mut previous) => {
-                previous.append(idx);
-                idx = previous;
-            }
-            SourceData::Memory(events) => match workspace::index_events(&events) {
-                Ok(mut previous) => {
-                    previous.append(idx);
-                    idx = previous;
-                }
-                Err(error) => {
-                    *source = SourceData::Memory(events);
-                    return Err(error);
-                }
-            },
-            SourceData::None => {}
-        }
-        let mut previous = state.source_names.read().clone();
-        previous.append(&mut names);
-        names = previous;
-    }
-    let summary = LoadSummary {
-        count: idx.lines.len(),
-        columns: idx.columns.clone(),
-        source_desc: names.join(" + "),
-    };
-    crate::operations::commit();
-    engine::source_published(Some(&idx));
-    *source = SourceData::Indexed(idx);
-    *state.source_names.write() = names;
+    let summary = source_publication::publish(
+        state, idx, vec![format!("Event Log: {channel}")],
+        vec![source_publication::Input::Eventlog { channel: channel.into(), max_events }],
+        merge.unwrap_or(false),
+    )?;
     emit_progress(
         app,
         "carregamento",
@@ -443,8 +495,11 @@ async fn load_file(
     merge: Option<bool>,
     app: AppHandle,
     operation_id: Option<String>,
+    analysis_context: Option<analysis_context::Identity>,
+    source_generation: Option<u64>,
 ) -> Result<LoadSummary, String> {
-    offload_operation(operation_id, move || {
+    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Publish)?;
+    offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         load_file_impl(state.inner(), &path, &format, merge, Some(&app))
     })
@@ -481,42 +536,11 @@ pub(crate) fn load_file_impl(
     );
     prepare_engine(state, &idx, app)?;
     emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
-    let mut source = source_write_checked(state)?;
-    let mut idx = idx;
-    let mut names = vec![format!("Arquivo: {path}")];
-    if merge.unwrap_or(false) {
-        // Prepare the replacement before mutating the current source.
-        let old = std::mem::replace(&mut *source, SourceData::None);
-        match old {
-            SourceData::Indexed(mut previous) => {
-                previous.append(idx);
-                idx = previous;
-            }
-            SourceData::Memory(events) => match workspace::index_events(&events) {
-                Ok(mut previous) => {
-                    previous.append(idx);
-                    idx = previous;
-                }
-                Err(e) => {
-                    *source = SourceData::Memory(events);
-                    return Err(e);
-                }
-            },
-            SourceData::None => {}
-        }
-        let mut previous_names = state.source_names.read().clone();
-        previous_names.append(&mut names);
-        names = previous_names;
-    }
-    let summary = LoadSummary {
-        count: idx.lines.len(),
-        columns: idx.columns.clone(),
-        source_desc: names.join(" + "),
-    };
-    crate::operations::commit();
-    engine::source_published(Some(&idx));
-    *source = SourceData::Indexed(idx);
-    *state.source_names.write() = names;
+    let summary = source_publication::publish(
+        state, idx, vec![format!("Arquivo: {path}")],
+        vec![source_publication::Input::File { paths: vec![path.into()], format: format.into() }],
+        merge.unwrap_or(false),
+    )?;
     emit_progress(
         app,
         "carregamento",
@@ -535,7 +559,7 @@ pub(crate) fn load_file_impl(
 pub(crate) fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Option<&AppHandle>) -> Result<(), String> {
     let codes = state.codes.read().clone();
     let system = state.system_codes.read().clone();
-    let derived = state.derived.read().clone();
+    let derived = crate::analysis_runtime::derived(&state).clone();
     let operation_id = operations::current_id();
     let started = std::time::Instant::now();
     let phase_clock = Mutex::new((String::new(), std::time::Instant::now()));
@@ -559,26 +583,28 @@ pub(crate) fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Op
 }
 
 #[tauri::command]
-async fn engine_status(app: AppHandle) -> Result<Option<engine::EngineStatus>, String> {
-    offload(move || {
+async fn engine_status(app: AppHandle, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<Option<engine::EngineStatus>, String> {
+    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
+    offload_admitted(None, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
-        let source = state.source.read();
+        let source = crate::analysis_runtime::source(&state);
         match &*source {
-            SourceData::Indexed(idx) => Some(engine::status(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read())),
+            SourceData::Indexed(idx) => Some(engine::status(idx, &state.codes.read(), &state.system_codes.read(), &crate::analysis_runtime::derived(&state))),
             _ => None,
         }
     }).await
 }
 
 #[tauri::command]
-async fn engine_retry(app: AppHandle, operation_id: Option<String>) -> Result<Option<engine::EngineStatus>, String> {
-    offload_operation(operation_id, move || {
+async fn engine_retry(app: AppHandle, operation_id: Option<String>, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<Option<engine::EngineStatus>, String> {
+    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
+    offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
-        let source = state.source.read();
+        let source = crate::analysis_runtime::source(&state);
         let SourceData::Indexed(idx) = &*source else { return Ok(None) };
-        engine::retry(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read());
+        engine::retry(idx, &state.codes.read(), &state.system_codes.read(), &crate::analysis_runtime::derived(&state));
         prepare_engine(state.inner(), idx, Some(&app))?;
-        let status = engine::status(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read());
+        let status = engine::status(idx, &state.codes.read(), &state.system_codes.read(), &crate::analysis_runtime::derived(&state));
         Ok(Some(status))
     }).await?
 }
@@ -590,8 +616,11 @@ async fn load_files(
     merge: Option<bool>,
     app: AppHandle,
     operation_id: Option<String>,
+    analysis_context: Option<analysis_context::Identity>,
+    source_generation: Option<u64>,
 ) -> Result<LoadSummary, String> {
-    offload_operation(operation_id, move || {
+    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Publish)?;
+    offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         load_files_impl(state.inner(), &paths, &format, merge, Some(&app))
     })
@@ -615,7 +644,7 @@ pub(crate) fn load_files_impl(
         operations::check()?;
         let idx = index_source_file(path, format, app)?;
         if let Some(ref mut all) = indices {
-            all.append(idx);
+            all.append(idx)?;
         } else {
             indices = Some(idx);
         }
@@ -625,39 +654,11 @@ pub(crate) fn load_files_impl(
     let idx = indices.unwrap();
     prepare_engine(state, &idx, app)?;
     emit_progress(app, "carregamento", "Ativando fonte carregada", 0, 0, "registros", true);
-    let mut source = source_write_checked(state)?;
-    let mut idx = idx;
-    if merge.unwrap_or(false) {
-        match std::mem::replace(&mut *source, SourceData::None) {
-            SourceData::Indexed(mut previous) => {
-                previous.append(idx);
-                idx = previous;
-            }
-            SourceData::Memory(events) => match workspace::index_events(&events) {
-                Ok(mut previous) => {
-                    previous.append(idx);
-                    idx = previous;
-                }
-                Err(e) => {
-                    *source = SourceData::Memory(events);
-                    return Err(e);
-                }
-            },
-            SourceData::None => {}
-        }
-        let mut previous = state.source_names.read().clone();
-        previous.append(&mut names);
-        names = previous;
-    }
-    let summary = LoadSummary {
-        count: idx.lines.len(),
-        columns: idx.columns.clone(),
-        source_desc: names.join(" + "),
-    };
-    crate::operations::commit();
-    engine::source_published(Some(&idx));
-    *source = SourceData::Indexed(idx);
-    *state.source_names.write() = names;
+    let summary = source_publication::publish(
+        state, idx, names,
+        vec![source_publication::Input::File { paths: paths.to_vec(), format: format.into() }],
+        merge.unwrap_or(false),
+    )?;
     emit_progress(
         app,
         "carregamento",
@@ -696,8 +697,11 @@ async fn set_ts_config(
     config: Option<sources::TsConfig>,
     app: AppHandle,
     operation_id: Option<String>,
-) -> Result<(), String> {
-    offload_operation(operation_id, move || {
+    analysis_context: Option<analysis_context::Identity>,
+    source_generation: Option<u64>,
+) -> Result<source_publication::Mutation, String> {
+    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
+    offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         set_ts_config_impl(state.inner(), &path, config, Some(&app))
     })
@@ -709,7 +713,7 @@ pub(crate) fn set_ts_config_impl(
     path: &str,
     config: Option<sources::TsConfig>,
     app: Option<&AppHandle>,
-) -> Result<(), String> {
+) -> Result<source_publication::Mutation, String> {
     let compiled = config.as_ref().map(|c| c.compile()).transpose()?;
     // Validate before touching the saved configuration.
     let mut map: std::collections::HashMap<String, sources::TsConfig> =
@@ -726,11 +730,14 @@ pub(crate) fn set_ts_config_impl(
         }
     }
     let text = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
-    match &mut *state.source.write() {
+    let mut current_source = source_write_checked(state)?;
+    let next_receipt = source_publication::prepare_touch_locked(state)?;
+    match &mut *current_source {
         SourceData::Indexed(idx) => {
             if let Some(position) = idx.parts.iter().position(|p| p.path == path) {
                 let previous = std::mem::replace(&mut idx.parts[position].ts_config, compiled);
-                let timestamps: Vec<i64> = idx.lines.iter().map(|m| m.ts).collect();
+                let previous_lines = std::sync::Arc::clone(&idx.lines);
+                let previous_order = std::sync::Arc::clone(&idx.time_order);
                 if let Err(error) = sources::retimestamp_index(
                     idx,
                     Some(&|done, total| {
@@ -750,21 +757,20 @@ pub(crate) fn set_ts_config_impl(
                 }
                 if let Err(error) = std::fs::write(ts_configs_path(), &text) {
                     idx.parts[position].ts_config = previous;
-                    for (line, ts) in std::sync::Arc::make_mut(&mut idx.lines).iter_mut().zip(timestamps) {
-                        line.ts = ts;
-                    }
-                    idx.time_order.take();
+                    idx.lines = previous_lines;
+                    idx.time_order = previous_order;
                     return Err(error.to_string());
                 }
-                engine::request_rebuild(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read());
-                return Ok(());
+                engine::request_rebuild(idx, &state.codes.read(), &state.system_codes.read(), &crate::analysis_runtime::derived(&state));
+                return Ok(source_publication::commit_touch_locked(state, next_receipt));
             }
         }
         // fontes unidas/em memória: aplica aos eventos cujo arquivo de origem é este
         SourceData::Memory(evs) => {
             let single = state.source_names.read().len() <= 1;
-            let total = evs.len();
-            for (i, ev) in evs.iter_mut().enumerate() {
+            let mut replacement = evs.clone();
+            let total = replacement.len();
+            for (i, ev) in replacement.iter_mut().enumerate() {
                 let ev_path = ev.col_str("caminho").unwrap_or_default();
                 if ev_path == path || (ev_path.is_empty() && single) {
                     if let Some(cc) = &compiled {
@@ -783,6 +789,8 @@ pub(crate) fn set_ts_config_impl(
                     );
                 }
             }
+            std::fs::write(ts_configs_path(), &text).map_err(|e| e.to_string())?;
+            *evs = replacement;
             emit_progress(
                 app,
                 "data/hora",
@@ -792,20 +800,22 @@ pub(crate) fn set_ts_config_impl(
                 "eventos",
                 false,
             );
+            return Ok(source_publication::commit_touch_locked(state, next_receipt));
         }
         SourceData::None => {}
     }
     std::fs::write(ts_configs_path(), text).map_err(|e| e.to_string())?;
-    Ok(())
+    operations::commit();
+    Ok(source_publication::Mutation { publication: source_publication::receipt_locked(state) })
 }
 
 #[tauri::command]
 async fn test_ts_config(
     config: sources::TsConfig,
     path: Option<String>,
-    app: AppHandle,
-) -> Result<Vec<(String, String)>, String> {
-    offload(move || {
+    app: AppHandle, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<(String, String)>, String> {
+    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
+    offload_admitted(None, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         test_ts_config_impl(state.inner(), config, path.as_deref())
     })
@@ -817,7 +827,7 @@ pub(crate) fn test_ts_config_impl(
     config: sources::TsConfig,
     path: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let cc = config.compile()?;
     let joined_of = |ev: &Event, line: &str, idx: Option<&sources::FilePart>| {
         config
@@ -838,7 +848,9 @@ pub(crate) fn test_ts_config_impl(
     let mut out = Vec::new();
     match &*source {
         SourceData::Indexed(idx) => {
+            let visibility = analysis_runtime::indexed_gate(idx)?;
             for i in (0..idx.lines.len())
+                .filter(|&i| visibility.as_ref().is_none_or(|gate| gate.allows_known_row(i)))
                 .filter(|&i| path.is_none_or(|path| idx.part_at(i).path == path))
                 .take(5)
             {
@@ -899,13 +911,20 @@ fn load_derived() -> Vec<sources::CompiledDerived> {
                         })
                 })
                 .collect();
-            if rules.is_empty() {
+            if !d.steps.is_empty() && rules.len() != d.rules.len() {
+                // Invalid regex extraction cannot silently become a transform
+                // of the entire source when legacy parsing skips that rule.
+                return None;
+            }
+            if rules.is_empty() && d.steps.is_empty() && d.lookup.is_none() {
                 None
             } else {
                 Some(sources::CompiledDerived {
                     name: d.name,
                     source: d.source,
                     rules,
+                    steps: d.steps,
+                    lookup: d.lookup.map(crate::reference_lookup::Compiled::new),
                 })
             }
         })
@@ -913,137 +932,21 @@ fn load_derived() -> Vec<sources::CompiledDerived> {
 }
 
 #[tauri::command]
-fn list_derived_fields(state: State<AppState>) -> Vec<sources::DerivedField> {
-    list_derived_fields_impl(state.inner())
-}
-
-pub(crate) fn list_derived_fields_impl(state: &AppState) -> Vec<sources::DerivedField> {
-    let defs: Vec<sources::DerivedFieldCompat> = std::fs::read_to_string(derived_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    if !defs.is_empty() {
-        return defs.into_iter().map(|d| d.normalize()).collect();
-    }
-    state
-        .derived
-        .read()
-        .iter()
-        .map(|d| sources::DerivedField {
-            name: d.name.clone(),
-            source: d.source.clone(),
-            rules: d
-                .rules
-                .iter()
-                .map(|r| sources::DerivedRule {
-                    pattern: r.re.as_str().to_string(),
-                    template: r.template.clone(),
-                    filter: r.filter.clone(),
-                })
-                .collect(),
-        })
-        .collect()
+async fn list_derived_fields(analysis_context: Option<analysis_context::Identity>) -> Result<Vec<sources::DerivedField>, String> {
+    offload(move || analysis_commands::list_definitions(&analysis_commands::expected_identity(analysis_context)?)).await?
 }
 
 #[tauri::command]
 async fn save_derived_field(
-    name: String,
-    source: String,
-    rules: Vec<sources::DerivedRule>,
-    app: AppHandle,
-) -> Result<(), String> {
-    offload(move || {
-        let state = app.state::<AppState>();
-        save_derived_field_impl(state.inner(), &name, &source, rules)
-    })
-    .await?
-}
-
-pub(crate) fn save_derived_field_impl(
-    state: &AppState,
-    name: &str,
-    source: &str,
-    rules: Vec<sources::DerivedRule>,
-) -> Result<(), String> {
-    if name.trim().is_empty() {
-        return Err("Informe um nome para o campo.".into());
-    }
-    if rules.is_empty() {
-        return Err("Informe ao menos uma regra (regex).".into());
-    }
-    let compiled: Vec<sources::CompiledRule> = rules
-        .iter()
-        .map(|r| {
-            regex::Regex::new(&r.pattern)
-                .map(|re| sources::CompiledRule {
-                    re,
-                    template: r.template.clone(),
-                    filter: r.filter.clone(),
-                })
-                .map_err(|e| format!("Regex inválida em regra ({}): {e}", r.pattern))
-        })
-        .collect::<Result<_, _>>()?;
-    let defs: Vec<sources::DerivedFieldCompat> = std::fs::read_to_string(derived_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    let mut defs: Vec<sources::DerivedField> = defs.into_iter().map(|d| d.normalize()).collect();
-    defs.retain(|d| d.name != name);
-    defs.push(sources::DerivedField {
-        name: name.to_string(),
-        source: source.to_string(),
-        rules,
-    });
-    let text = serde_json::to_string_pretty(&defs).map_err(|e| e.to_string())?;
-    std::fs::write(derived_path(), text).map_err(|e| e.to_string())?;
-    state.derived.write().retain(|d| d.name != name);
-    state.derived.write().push(sources::CompiledDerived {
-        name: name.to_string(),
-        source: source.to_string(),
-        rules: compiled,
-    });
-    // fonte em memória (união/Event Log): aplica já; indexada aplica por linha sob demanda
-    if let SourceData::Memory(evs) = &mut *state.source.write() {
-        let derived = state.derived.read();
-        for ev in evs.iter_mut() {
-            sources::apply_derived(ev, &derived);
-        }
-    }
-    if let SourceData::Indexed(idx) = &*state.source.read() {
-        engine::request_rebuild(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read());
-    }
-    Ok(())
+    name: String, source: String, rules: Vec<sources::DerivedRule>,
+    steps: Option<Vec<field_transform::Step>>, analysis_context: Option<analysis_context::Identity>,
+) -> Result<analysis_commands::MutationReceipt, String> {
+    offload(move || analysis_commands::save_definition(&analysis_commands::expected_identity(analysis_context)?, &name, &source, rules, steps)).await?
 }
 
 #[tauri::command]
-async fn delete_derived_field(name: String, app: AppHandle) -> Result<(), String> {
-    offload(move || {
-        let state = app.state::<AppState>();
-        delete_derived_field_impl(state.inner(), &name)
-    })
-    .await?
-}
-
-pub(crate) fn delete_derived_field_impl(state: &AppState, name: &str) -> Result<(), String> {
-    let defs: Vec<sources::DerivedFieldCompat> = std::fs::read_to_string(derived_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    let mut defs: Vec<sources::DerivedField> = defs.into_iter().map(|d| d.normalize()).collect();
-    defs.retain(|d| d.name != name);
-    let text = serde_json::to_string_pretty(&defs).map_err(|e| e.to_string())?;
-    std::fs::write(derived_path(), text).map_err(|e| e.to_string())?;
-    state.derived.write().retain(|d| d.name != name);
-    // remove o campo dos eventos em memória imediatamente
-    if let SourceData::Memory(evs) = &mut *state.source.write() {
-        for ev in evs.iter_mut() {
-            ev.fields.remove(name);
-        }
-    }
-    if let SourceData::Indexed(idx) = &*state.source.read() {
-        engine::request_rebuild(idx, &state.codes.read(), &state.system_codes.read(), &state.derived.read());
-    }
-    Ok(())
+async fn delete_derived_field(name: String, analysis_context: Option<analysis_context::Identity>) -> Result<analysis_commands::MutationReceipt, String> {
+    offload(move || analysis_commands::delete_definition(&analysis_commands::expected_identity(analysis_context)?, &name)).await?
 }
 
 #[tauri::command]
@@ -1210,33 +1113,33 @@ pub(crate) fn save_custom_format_impl(
 }
 
 #[tauri::command]
-async fn clear_events(app: AppHandle, operation_id: Option<String>) -> Result<(), String> {
+async fn clear_events(app: AppHandle, operation_id: Option<String>, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<(), String> {
+    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Publish)?;
     // Waiting for existing source readers and releasing native sessions can
     // take time; neither belongs on the WebView's synchronous IPC callback.
-    offload_operation(operation_id, move || {
+    offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         clear_events_impl(state.inner())
-    }).await
+    }).await?
 }
 
-pub(crate) fn clear_events_impl(state: &AppState) {
-    let Ok(mut source) = source_write_checked(state) else {
-        // Keep the token cancelled so the desktop/MCP operation wrapper
-        // reports cancellation; no source or engine state has changed.
-        return;
-    };
-    // Once clearing starts, report it as committed even if Cancel All arrives
-    // while native sessions and metadata are being released.
-    operations::commit();
-    engine::source_published(None);
-    *source = SourceData::None;
-    state.source_names.write().clear();
-    query::clear_match_cache();
+pub(crate) fn clear_events_impl(state: &AppState) -> Result<(), String> {
+    source_publication::clear(state)
+}
+
+#[tauri::command]
+async fn source_snapshot(app: AppHandle) -> Result<source_publication::Snapshot, String> {
+    offload(move || {
+        let state = app.state::<AppState>();
+        source_publication::snapshot(state.inner())
+    }).await
 }
 
 /// Resumo da fonte carregada no momento (para MCP/UI saberem o que há no app).
 #[derive(Serialize)]
 pub(crate) struct SourceSummary {
+    #[serde(rename = "analysisDiagnostics")]
+    analysis_diagnostics: Vec<analysis_context::Diagnostic>,
     count: usize,
     columns: Vec<String>,
     source_desc: String,
@@ -1244,33 +1147,35 @@ pub(crate) struct SourceSummary {
 }
 
 #[tauri::command]
-async fn source_summary(app: AppHandle) -> Result<SourceSummary, String> {
+async fn source_summary(app: AppHandle, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<SourceSummary, String> {
+    let admitted = analysis_runtime::capture(app.state::<AppState>().inner(), analysis_context, source_generation, analysis_runtime::Mode::Dataset)?;
     // Memory: a descoberta de colunas varre até 20k eventos — offload também.
-    offload(move || {
+    offload_admitted(None, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         source_summary_impl(state.inner())
     })
-    .await
+    .await?
 }
 
-pub(crate) fn source_summary_impl(state: &AppState) -> SourceSummary {
-    let source_names = state.source_names.read().clone();
-    let source = state.source.read();
+pub(crate) fn source_summary_impl(state: &AppState) -> Result<SourceSummary, String> {
+    let source = crate::analysis_runtime::source(&state);
+    let source_names = crate::analysis_runtime::source_names(&state);
     let (count, columns, source_desc) = match &*source {
         SourceData::None => (0, vec![], String::new()),
         SourceData::Memory(evs) => (evs.len(), all_columns(evs), source_names.join(" + ")),
         SourceData::Indexed(idx) => (
-            idx.lines.len(),
+            analysis_runtime::visible_total(idx)?,
             idx.columns.clone(),
             source_names.join(" + "),
         ),
     };
-    SourceSummary {
+    Ok(SourceSummary {
+        analysis_diagnostics: analysis_runtime::current().map(|admitted| (*admitted.diagnostics).clone()).unwrap_or_default(),
         count,
         columns,
         source_desc,
         source_names,
-    }
+    })
 }
 
 #[tauri::command]
@@ -1282,12 +1187,14 @@ async fn query_events(
     limit: usize,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<query::QueryResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         query_events_scope_impl(
             state.inner(),
@@ -1311,6 +1218,7 @@ pub(crate) fn query_events_scope_impl(
     limit: usize,
     case_events: Option<&[Event]>,
 ) -> Result<query::QueryResult, String> {
+    let _interactive = operations::interactive();
     match case_events {
         Some(events) => Ok(query::query(
             events,
@@ -1332,10 +1240,10 @@ pub(crate) fn query_events_impl(
     offset: usize,
     limit: usize,
 ) -> Result<query::QueryResult, String> {
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let codes = state.codes.read();
     let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let derived = crate::analysis_runtime::derived(&state);
     let limit = limit.clamp(1, 2_000);
     match &*source {
         SourceData::Memory(events) => {
@@ -1371,11 +1279,13 @@ async fn query_page(
     operation_id: Option<String>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<query::QueryPage, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_operation(operation_id, move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let limit = limit.clamp(1, 2_000);
         if let Some(events) = case_events.as_deref() {
             return Ok(query::QueryPage::from_exact(
@@ -1383,10 +1293,10 @@ async fn query_page(
             ));
         }
         let state = app.state::<AppState>();
-        let source = state.source.read();
+        let source = crate::analysis_runtime::source(&state);
         let codes = state.codes.read();
         let system = state.system_codes.read();
-        let derived = state.derived.read();
+        let derived = crate::analysis_runtime::derived(&state);
         match &*source {
             SourceData::Indexed(idx) => query::query_page_indexed(
                 idx, &filters, &sort_column, &sort_dir, offset, limit, cursor.as_deref(), &codes, &system, &derived,
@@ -1410,12 +1320,14 @@ async fn explore_snapshot(
     limit: usize,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<query::ExplorerSnapshot, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         explore_snapshot_scope_impl(
             state.inner(),
@@ -1472,10 +1384,10 @@ pub(crate) fn explore_snapshot_impl(
         "eventos",
         false,
     );
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let codes = state.codes.read();
     let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let derived = crate::analysis_runtime::derived(&state);
     let limit = limit.clamp(1, 2_000);
     let snapshot = match &*source {
         SourceData::Memory(events) => {
@@ -1535,12 +1447,14 @@ async fn aggregate_events(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<query::AggResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         aggregate_events_impl(state.inner(), &group_column, aggs, filters, case_events)
     })
@@ -1558,10 +1472,10 @@ pub(crate) fn aggregate_events_impl(
     if let Some(events) = case_events {
         return query::aggregate(&events, &filters, group_column, &aggs);
     }
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let codes = state.codes.read();
     let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let derived = crate::analysis_runtime::derived(&state);
     match &*source {
         SourceData::Memory(events) => query::aggregate(events, &filters, group_column, &aggs),
         SourceData::Indexed(idx) => query::aggregate_indexed(
@@ -1638,11 +1552,13 @@ async fn trail_events(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<TrailResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || {
+    offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         trail_events_impl(
             state.inner(),
@@ -1668,7 +1584,7 @@ pub(crate) fn trail_events_impl(
         return Ok(trail_from_events(&events, &filters, center_id, before, after));
     }
     query::check_collected_ids(before.saturating_add(after).saturating_add(1))?;
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     Ok(match &*source {
         SourceData::Memory(events) => trail_from_events(events, &filters, center_id, before, after),
         SourceData::Indexed(idx) => {
@@ -1677,9 +1593,9 @@ pub(crate) fn trail_events_impl(
             let center = (center_meta.ts, center_id);
             let (mut previous, mut following) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
             let (mut left, mut right, mut found) = (0usize, 0usize, false);
-            let codes = state.codes.read(); let system = state.system_codes.read(); let derived = state.derived.read();
+            let codes = state.codes.read(); let system = state.system_codes.read(); let derived = crate::analysis_runtime::derived(&state);
             query::visit_indexed_matches(idx, &filters, &codes, &system, &derived, |id| {
-                let key = (idx.lines[id].ts, id);
+                let key = (idx.lines.at(id).ts, id);
                 if key < center { left += 1; previous.insert(key); if previous.len() > before { previous.pop_first(); } }
                 else if key > center { right += 1; following.insert(key); if following.len() > after { following.pop_last(); } }
                 else { found = true; }
@@ -1689,6 +1605,7 @@ pub(crate) fn trail_events_impl(
             let mut events = Vec::new();
             for (_, id) in previous.into_iter().chain(std::iter::once(center)).chain(following) {
                 let mut event = sources::event_at(idx, id, &codes, &system, &derived);
+                analysis_runtime::attach_provenance(idx, &mut event)?;
                 entities::annotate(&mut event);
                 budget.charge(query::event_payload_bytes(&event))?;
                 events.push(event);
@@ -1709,12 +1626,14 @@ async fn count_filtered(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<usize, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         count_filtered_impl(state.inner(), filters, case_events)
     })
@@ -1729,14 +1648,13 @@ pub(crate) fn count_filtered_impl(
     if let Some(events) = case_events {
         return Ok(query::count_memory(&events, &filters));
     }
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     Ok(match &*source {
         SourceData::Memory(events) => query::count_memory(events, &filters),
         SourceData::Indexed(idx) => {
-            let (codes, system, derived) = (state.codes.read(), state.system_codes.read(), state.derived.read());
+            let (codes, system, derived) = (state.codes.read(), state.system_codes.read(), crate::analysis_runtime::derived(&state));
             let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
-            engine::count(&src, &filters)?
-                .unwrap_or_else(|| query::count_lines(idx, &filters, &codes, &system, &derived))
+            match engine::count(&src, &filters)? { Some(count) => count, None => query::count_lines(idx, &filters, &codes, &system, &derived)? }
         }
         SourceData::None => 0,
     })
@@ -1748,12 +1666,14 @@ async fn tree_aggs(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<Vec<(String, query::AggResult)>, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         tree_aggs_impl(state.inner(), columns, filters, case_events)
     })
@@ -1769,7 +1689,7 @@ pub(crate) fn tree_aggs_impl(
     if let Some(events) = case_events {
         return query::multi_count(&events, &filters, &columns);
     }
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     match &*source {
         SourceData::Memory(events) => query::multi_count(events, &filters, &columns),
         SourceData::Indexed(idx) => query::multi_count_indexed(
@@ -1778,7 +1698,7 @@ pub(crate) fn tree_aggs_impl(
             &columns,
             &state.codes.read(),
             &state.system_codes.read(),
-            &state.derived.read(),
+            &crate::analysis_runtime::derived(&state),
         ),
         SourceData::None => vec![],
     }
@@ -1789,12 +1709,14 @@ async fn stats_events(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<query::Stats, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         if let Some(events) = case_events {
             return Ok(query::stats(&events, &filters));
         }
@@ -1805,10 +1727,10 @@ async fn stats_events(
 }
 
 pub(crate) fn stats_events_impl(state: &AppState, filters: Vec<query::Filter>) -> Result<query::Stats, String> {
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let codes = state.codes.read();
     let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let derived = crate::analysis_runtime::derived(&state);
     match &*source {
         SourceData::Memory(events) => Ok(query::stats(events, &filters)),
         SourceData::Indexed(idx) => query::stats_indexed(idx, &filters, &codes, &system, &derived),
@@ -1820,37 +1742,26 @@ pub(crate) fn stats_events_impl(state: &AppState, filters: Vec<query::Filter>) -
     }
 }
 
-#[tauri::command]
-async fn event_detail(id: usize, app: AppHandle) -> Result<Option<Event>, String> {
-    offload_source(None, app.clone(), true, move || {
-        let state = app.state::<AppState>();
-        event_detail_impl(state.inner(), id)
-    })
-    .await
-}
-
 pub(crate) fn event_detail_impl(state: &AppState, id: usize) -> Option<Event> {
+    let _interactive = operations::interactive();
     let mut event = event_detail_raw(state, id)?;
     entities::annotate(&mut event);
     Some(event)
 }
 
 fn event_detail_raw(state: &AppState, id: usize) -> Option<Event> {
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     match &*source {
-        SourceData::Memory(events) => events.get(id).cloned(),
+        SourceData::Memory(events) => events.get(id).filter(|event| event.id == id).or_else(|| events.iter().find(|event| event.id == id)).cloned(),
         SourceData::Indexed(idx) => {
-            if id < idx.lines.len() {
-                Some(sources::event_at(
-                    idx,
-                    id,
-                    &state.codes.read(),
-                    &state.system_codes.read(),
-                    &state.derived.read(),
-                ))
-            } else {
-                None
+            if id >= idx.lines.len() { return None; }
+            match analysis_runtime::row_visible(idx, id) {
+                Ok(true) => (), Ok(false) => return None,
+                Err(error) => { analysis_runtime::record_failure(error); return None; }
             }
+            let mut event = sources::event_at(idx, id, &state.codes.read(), &state.system_codes.read(), &analysis_runtime::derived(state));
+            if let Err(error) = analysis_runtime::attach_provenance(idx, &mut event) { analysis_runtime::record_failure(error); return None; }
+            Some(event)
         }
         SourceData::None => None,
     }
@@ -1863,12 +1774,14 @@ async fn discover_patterns(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<discovery::Discovery, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_source(operation_id, app.clone(), case_events.is_none(), move || discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
         .await?
 }
 
@@ -1896,17 +1809,17 @@ pub(crate) fn discover_patterns_impl(
     if let Some(events) = case_events {
         return Ok(memory(&events));
     }
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     Ok(match &*source {
         SourceData::Memory(events) => memory(events),
         SourceData::Indexed(idx) => {
             let codes = state.codes.read();
             let system = state.system_codes.read();
-            let derived = state.derived.read();
+            let derived = crate::analysis_runtime::derived(&state);
             let mut sample = discovery::Sampler::new();
             let mut result = discovery::Discovery::default();
             query::visit_indexed_matches(idx, &filters, &codes, &system, &derived, |i| {
-                let meta = &idx.lines[i];
+                let meta = &idx.lines.at(i);
                 result.observe(
                     (meta.ts != 0).then_some(meta.ts),
                     matches!(meta.level, model::LV_ERR | model::LV_CRIT),
@@ -1939,14 +1852,14 @@ fn work_events(
             .map(|s| events[matched[s * matched.len() / matched.len().min(ANALYSIS_CAP)]].clone())
             .collect());
     }
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     let codes = state.codes.read();
     let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let derived = crate::analysis_runtime::derived(&state);
     Ok(match &*source {
         SourceData::Indexed(idx) => {
             let src = engine::Source { idx, codes: &codes, system: &system, derived: &derived };
-            let total = engine::count(&src, &filters)?.unwrap_or_else(|| query::count_lines(idx, &filters, &codes, &system, &derived));
+            let total = match engine::count(&src, &filters)? { Some(count) => count, None => query::count_lines(idx, &filters, &codes, &system, &derived)? };
             let limit = total.min(ANALYSIS_CAP);
             let mut ids = Vec::with_capacity(limit);
             let mut position = 0usize;
@@ -1990,11 +1903,13 @@ async fn profile_fields(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Vec<analysis::FieldProfile>, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload(move || {
+    offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         profile_fields_impl(state.inner(), filters, case_events)
     })
@@ -2016,13 +1931,15 @@ async fn compute_series(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     spec: analysis::SeriesSpec,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<analysis::SeriesResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         compute_series_impl(state.inner(), filters, case_events, spec)
     })
@@ -2048,13 +1965,15 @@ async fn pivot(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     spec: analysis::PivotSpec,
     app: AppHandle,
     operation_id: Option<String>,
 ) -> Result<analysis::PivotResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
     workspace::validate(&filters)?;
-    offload_source(operation_id, app.clone(), case_events.is_none(), move || {
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         pivot_impl(state.inner(), filters, case_events, spec)
     })
@@ -2088,6 +2007,13 @@ pub(crate) fn get_codes_impl(state: &AppState) -> String {
     serde_json::to_string_pretty(&*state.codes.read()).unwrap_or_default()
 }
 
+// Catalog publication includes Memory enrichment. Projection readers must not
+// bind a receipt between the catalog swap and that associated publication.
+static CATALOG_PUBLICATION: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+pub(crate) fn catalog_read_guard() -> Result<parking_lot::RwLockReadGuard<'static, ()>, String> {
+    CATALOG_PUBLICATION.try_read().ok_or_else(|| "CATALOG_UPDATE_PENDING: O catálogo está sendo atualizado. Aguarde e recarregue a consulta.".into())
+}
+
 #[tauri::command]
 async fn save_codes(text: String, app: AppHandle) -> Result<(), String> {
     offload(move || {
@@ -2099,6 +2025,7 @@ async fn save_codes(text: String, app: AppHandle) -> Result<(), String> {
 
 pub(crate) fn save_codes_impl(state: &AppState, text: &str) -> Result<(), String> {
     let cfg: CodesConfig = serde_json::from_str(text).map_err(|e| format!("JSON inválido: {e}"))?;
+    let _publication = CATALOG_PUBLICATION.write();
     std::fs::write(&state.codes_path, text).map_err(|e| format!("Falha ao gravar: {e}"))?;
     *state.codes.write() = cfg;
     engine::catalogs_changed();
@@ -2112,6 +2039,7 @@ pub(crate) fn save_codes_impl(state: &AppState, text: &str) -> Result<(), String
             ev.enrich(&codes, &system);
         }
     }
+    engine::catalogs_changed();
     Ok(())
 }
 
@@ -2134,9 +2062,14 @@ async fn harvest_codes(app: AppHandle) -> Result<HarvestSummary, String> {
 pub(crate) fn harvest_codes_impl(state: &AppState) -> Result<HarvestSummary, String> {
     let (cfg, count) = sources::harvest_system_codes()?;
     let sources = cfg.sources.len();
-    if let Ok(text) = serde_json::to_string(&cfg) {
-        let _ = std::fs::write(&state.system_codes_path, text);
-    }
+    publish_system_catalog(state, cfg)?;
+    Ok(HarvestSummary { count, sources })
+}
+
+fn publish_system_catalog(state: &AppState, cfg: CodesConfig) -> Result<(), String> {
+    let _publication = CATALOG_PUBLICATION.write();
+    let text = serde_json::to_string(&cfg).map_err(|e| e.to_string())?;
+    std::fs::write(&state.system_codes_path, text).map_err(|e| format!("Falha ao gravar catálogo: {e}"))?;
     *state.system_codes.write() = cfg;
     engine::catalogs_changed();
     // Re-enriquece eventos em memória (fontes indexadas enriquecem sob demanda).
@@ -2149,7 +2082,8 @@ pub(crate) fn harvest_codes_impl(state: &AppState) -> Result<HarvestSummary, Str
             ev.enrich(&codes, &system);
         }
     }
-    Ok(HarvestSummary { count, sources })
+    engine::catalogs_changed();
+    Ok(())
 }
 
 #[tauri::command]
@@ -2251,6 +2185,12 @@ pub fn run() {
     resources::init();
     #[cfg(feature = "update-e2e")]
     updates::e2e_arguments();
+    // Resolve a verified restart selection before any data, updater, catalog,
+    // MCP or cache initialization. This process then retains one fixed root.
+    case_recovery::profiles::initialize(&base_config_dir(), &case_recovery::Work {
+        cancelled: &|| false,
+        progress: &|_, _, _| {},
+    });
     let context = tauri::generate_context!();
     // Before anything reads the data folder: a new version backs it up first.
     let updates = updates::prepare(&context.package_info().version);
@@ -2267,6 +2207,7 @@ pub fn run() {
         .on_window_event(updates::on_window_event)
         .manage(AppState {
             source: RwLock::new(SourceData::None),
+            source_publication: RwLock::new(Default::default()),
             source_names: RwLock::new(vec![]),
             derived: RwLock::new(load_derived()),
             codes: RwLock::new(codes),
@@ -2291,11 +2232,9 @@ pub fn run() {
                 std::thread::spawn(move || {
                     if let Ok((cfg, _)) = sources::harvest_system_codes() {
                         let state = handle.state::<AppState>();
-                        if let Ok(text) = serde_json::to_string(&cfg) {
-                            let _ = std::fs::write(&state.system_codes_path, text);
+                        if let Err(error) = publish_system_catalog(state.inner(), cfg) {
+                            eprintln!("[catálogo] {error}");
                         }
-                        *state.system_codes.write() = cfg;
-                        engine::catalogs_changed();
                     }
                 });
             }
@@ -2348,6 +2287,7 @@ pub fn run() {
             pivots::ioc_sightings,
             pivots::source_hashes,
             workspace::timeline_range,
+            workspace::grouped_timeline,
             workspace::import_investigation,
             workspace::load_bundle,
             workspace::compare_periods,
@@ -2366,6 +2306,7 @@ pub fn run() {
             load_files,
             clear_events,
             source_summary,
+            source_snapshot,
             query_events,
             query_page,
             explore_snapshot,
@@ -2374,7 +2315,8 @@ pub fn run() {
             count_filtered,
             tree_aggs,
             stats_events,
-            event_detail,
+            detail_commands::event_detail,
+            detail_commands::java_trace_detail,
             get_codes,
             save_codes,
             get_codes_path,
@@ -2383,12 +2325,54 @@ pub fn run() {
             system_codes_count,
             cases_load,
             cases_save,
+            case_evidence_commands::cases_load_view,
+            case_evidence_commands::cases_save_view,
+            case_evidence_commands::case_evidence_prepare,
+            case_evidence_commands::case_evidence_prepare_membership,
+            case_evidence_commands::case_evidence_discard,
+            case_evidence_commands::case_evidence_member_detail,
+            case_evidence_commands::case_evidence_member_field_text,
+            case_evidence_commands::case_evidence_member_java_trace,
+            case_evidence_commands::case_evidence_timeline,
+            case_evidence_commands::case_evidence_display_timeline,
+            case_evidence_commands::case_evidence_display_members,
+            case_evidence_commands::case_evidence_preview,
+            case_evidence_commands::case_evidence_source_receipt,
+            case_evidence_commands::case_evidence_find_members,
+            case_evidence_commands::case_evidence_open,
+            case_portable_commands::case_import_native,
+            case_portable_commands::case_export_native,
+            case_recovery_commands::case_recovery_status,
+            case_recovery_commands::case_recovery_prepare_restart,
+            case_recovery_commands::case_recovery_return_original,
             list_formats,
             save_custom_format,
             get_ts_config,
             set_ts_config,
             test_ts_config,
             test_parse,
+            analysis_commands::analysis_context_snapshot,
+            analysis_commands::analysis_context_update,
+            analysis_commands::preview_field_transform,
+            reference_commands::reference_inspect,
+            reference_commands::reference_import,
+            reference_commands::reference_list,
+            reference_commands::reference_remove,
+            reference_commands::reference_save_lookup,
+            projection_commands::analysis_field_text,
+            projection_commands::query_projected_page,
+            projection_commands::hydrate_projected_rows,
+            projection_commands::hydrate_projected_field,
+            analysis_runtime::exclusion_visibility,
+            exclusion_commands::exclusion_capabilities,
+            exclusion_commands::exclusion_preview,
+            exclusion_commands::exclusion_commit,
+            exclusion_commands::exclusion_discard,
+            exclusion_commands::exclusion_list,
+            exclusion_commands::exclusion_archive_page,
+            exclusion_commands::exclusion_restore_batch,
+            exclusion_commands::exclusion_restore_selected,
+
             list_derived_fields,
             save_derived_field,
             delete_derived_field,

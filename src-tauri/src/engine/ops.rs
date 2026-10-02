@@ -18,7 +18,8 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -191,24 +192,30 @@ fn resolve_free(session: &Session, src: &Source, sql: &str, tests: &Tests) -> Re
 }
 
 fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexField) -> Result<Option<Arc<Selection>>> {
+    let gate = crate::analysis_runtime::indexed_gate(src.idx)?;
     // A selective lookup must not replace cheap vectorized filtering with an
     // unbounded amount of record hydration. Dense terms retain native SQL.
     const LIMIT: usize = 4_096;
     let filter = &term.filter;
     let key = format!("exact-hex#{}", serde_json::to_string(&(&filter.f.column, &filter.f.value)).map_err(err)?);
     if let Some(found) = session.cached_selection(&key) { return Ok(Some(found)); }
-    let Some(candidates) = session.exact_hex_candidates(&term.word, LIMIT) else { return Ok(None) };
+    let Some(candidates) = session.exact_hex_candidates(&term.word, LIMIT)? else { return Ok(None) };
     let mut confirmed = Vec::with_capacity(candidates.len());
     for id in candidates {
         crate::operations::check()?;
-        if crate::query::matches(&src.event(id), filter) { confirmed.push(id); }
+        if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
+        if crate::query::matches_indexed(&src.event(id), filter) { confirmed.push(id); }
     }
     let selected = selection(session, &confirmed)?;
     session.cache_selection(key, Arc::clone(&selected));
     Ok(Some(selected))
 }
 
+#[cfg(test)]
+thread_local! { static FREE_CANDIDATE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) -> Result<Option<Arc<Selection>>> {
+    let gate = crate::analysis_runtime::indexed_gate(src.idx)?;
     let needle = &term.needle;
     let key = format!("free-v2#{needle}");
     if let Some(found) = session.cached_selection(&key) {
@@ -216,7 +223,9 @@ fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) 
     }
     // The text index covers stored values AND intrinsic names/descriptions.
     // Catalog overrides are a separate, small source/code relation.
-    let Some(mut candidates) = session.free_candidates(needle, FREE_LIMIT) else { return Ok(None) };
+    #[cfg(test)]
+    FREE_CANDIDATE_PROBES.with(|probes| probes.set(probes.get() + 1));
+    let Some(mut candidates) = session.free_candidates(needle, FREE_LIMIT)? else { return Ok(None) };
     if !session.baked {
         let catalog = read_ids(session, &catalog_candidates_sql(&term.names_sql))?;
         if catalog.len() > FREE_LIMIT { return Ok(None); }
@@ -232,6 +241,7 @@ fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) 
         let mut confirmed = Vec::with_capacity(candidates.len());
         for id in candidates {
             crate::operations::check()?;
+            if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
             let event = src.event(id);
             if crate::querylang::any_value(&event, &|value| {
                 crate::query::ci_contains_bytes(value.as_bytes(), needle.as_bytes())
@@ -332,7 +342,7 @@ fn read_ids(session: &Session, sql: &str) -> Result<Vec<usize>> {
 /// The all-ID API is explicitly bounded; analytics and callbacks use the
 /// database selection/stream instead of collecting this result.
 fn matching_ids(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Vec<usize>> {
-    if pfs.is_empty() { crate::query::check_collected_ids(src.idx.lines.len())?; }
+    if pfs.is_empty() { crate::query::check_collected_ids(crate::analysis_runtime::visible_total(src.idx)?)?; }
     let scope = scope(session, src, pfs)?;
     read_ids(session, &format!("SELECT id FROM {} WHERE {} ORDER BY id", scope.from(false), scope.cond))
 }
@@ -359,9 +369,51 @@ fn cacheable_filters(pfs: &[PreparedFilter]) -> bool {
     pfs.iter().all(|pf| !matches!(pf.f.op.as_str(), "detection" | "threat_rule") && pf.expr.as_ref().is_none_or(stable))
 }
 
+/// Mandatory visibility is independent of the user predicate and of whether
+/// that predicate was compiled exactly or recovered through a selection table.
+fn visible_sql(src: &Source, sql: String, tests: &mut Tests) -> Result<String> {
+    let Some(gate) = crate::analysis_runtime::indexed_gate(src.idx)? else { return Ok(sql); };
+    if gate.is_unrestricted() { return Ok(sql); }
+    let predicate = tests.row("id", Arc::new(move |id| {
+        let id = usize::try_from(id).map_err(|_| "Identidade de linha negativa na visibilidade.".to_string())?;
+        gate.allows(id)
+    }));
+    Ok(format!("({sql}) AND ({predicate})"))
+}
+
+fn complete_selection_key(session: &Session, pfs: &[PreparedFilter]) -> Option<String> {
+    // Detection/threat registries are mutable independently of the source;
+    // do not reuse those until their revisions become part of this key.
+    cacheable_filters(pfs).then(|| {
+        let filters: Vec<&crate::query::Filter> = pfs.iter().map(|pf| &pf.f).collect();
+        format!("{}#{}", serde_json::to_string(&filters).unwrap_or_default(), session.names_version())
+    })
+}
+
 fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Scope<'s>> {
-    let plan = session.schema.plan(pfs);
+    crate::operations::check()?;
+    let mut plan = session.schema.plan(pfs);
+    // Cheap exact plans without markers never materialize a whole selection;
+    // preserve their allocation-free key path.
+    let may_materialize = !plan.exact() || costly(&plan.sql)
+        || !plan.tests.free.is_empty() || !plan.tests.hex_fields.is_empty();
+    let key = if may_materialize { complete_selection_key(session, pfs) } else { None };
+    // A complete retained result already includes every required text term.
+    // Re-probing those terms first can churn the shared LRU and evict this
+    // result before it is used. The Session still binds the key to the full
+    // admitted namespace, and visible_sql revalidates mandatory visibility.
+    if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
+        return Ok(Scope {
+            session,
+            cond: visible_sql(src, found.predicate(), &mut plan.tests)?,
+            names: false,
+            _tests: plan.tests,
+            _selection: Some(found),
+            _free: Vec::new(),
+        });
+    }
     let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    let sql = visible_sql(src, sql, &mut plan.tests)?;
     if plan.exact() && !costly(&sql) {
         return Ok(Scope {
             session,
@@ -372,25 +424,9 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
             _free: free,
         });
     }
-    // Detection/threat registries are mutable independently of the source;
-    // do not reuse those until their revisions become part of this key.
-    let key = cacheable_filters(pfs).then(|| {
-        let filters: Vec<&crate::query::Filter> = pfs.iter().map(|pf| &pf.f).collect();
-        format!("{}#{}", serde_json::to_string(&filters).unwrap_or_default(), session.names_version())
-    });
-    if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
-        return Ok(Scope {
-            session,
-            cond: found.predicate(),
-            names: false,
-            _tests: Tests::default(),
-            _selection: Some(found),
-            _free: Vec::new(),
-        });
-    }
     let _build = key.as_deref().map(|key| session.begin_selection(key)).transpose()?;
     if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
-        return Ok(Scope { session, cond: found.predicate(), names: false, _tests: Tests::default(), _selection: Some(found), _free: Vec::new() });
+        return Ok(Scope { session, cond: visible_sql(src, found.predicate(), &mut plan.tests)?, names: false, _tests: plan.tests, _selection: Some(found), _free: Vec::new() });
     }
     let selection = if plan.exact() {
         let from = if plan.names || free_names { "evn" } else { "ev" };
@@ -416,9 +452,10 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
 /// A page must not first materialize every match to populate an analytics
 /// cache. Non-exact predicates are verified in bounded sorted batches below.
 fn page_scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<(Scope<'s>, bool)> {
-    let plan = session.schema.plan(pfs);
+    let mut plan = session.schema.plan(pfs);
     let exact = plan.exact();
     let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    let sql = visible_sql(src, sql, &mut plan.tests)?;
     Ok((Scope { session, cond: sql, names: plan.names || free_names, _tests: plan.tests, _selection: None, _free: free }, exact))
 }
 
@@ -467,12 +504,11 @@ fn check_selection_size(rows: u64) -> Result<()> {
 }
 
 /// The table becomes visible only after complete verification and commit.
-/// Both a failed COMMIT and a failed cleanup discard this pooled connection.
+/// Cleanup failures retain their pending tables; failed transaction rollback
+/// discards the pooled connection instead of reusing an unknown state.
 fn selection_write(session: &Session, selection: &Selection, fill: impl FnOnce(&duckdb::Connection) -> Result<u64>) -> Result<()> {
     let mut conn = session.conn()?;
-    for unused in session.take_garbage() {
-        conn.execute_batch(&format!("DROP TABLE IF EXISTS {unused}")).map_err(err)?;
-    }
+    session.collect_garbage_on(&conn)?;
     let cancel = interruptible(&conn)?;
     conn.execute_batch("BEGIN TRANSACTION").map_err(err)?;
     let result: Result<()> = (|| {
@@ -510,7 +546,7 @@ fn verified_selection(session: &Session, src: &Source, pfs: &[PreparedFilter], p
         // Arrow's Iterator::next panics on a late fetch error. Start streaming,
         // then use the public fallible step API so no partial result is cached.
         drop(stmt.stream_arrow([]).map_err(err)?);
-        let verifier = crate::query::CandidateVerifier::new(src.idx, pfs, &plan.lines, &plan.verify, src.codes, src.system, src.derived);
+        let verifier = crate::query::CandidateVerifier::new(src.idx, pfs, &plan.lines, &plan.verify, src.codes, src.system, src.derived)?;
         let cancellation = crate::operations::current_token();
         let mut appender = writer.appender(&selection.name).map_err(err)?;
         let mut examined = 0usize;
@@ -619,8 +655,194 @@ mod bounded_analytics_tests {
             timestamps_non_null: false, baked: false, names: RwLock::new(None),
             names_version: AtomicU64::new(0), selections: Mutex::new(Vec::new()),
             selection_builds: Mutex::new(std::collections::HashSet::new()), selection_changed: parking_lot::Condvar::new(),
-            garbage: Arc::new(Mutex::new(Vec::new())), texts: Vec::new(), _leases: Vec::new(),
+            garbage: Arc::new(Mutex::new(Vec::new())), texts: Vec::new(),
+            time_indexes: RwLock::new(None), _leases: Vec::new(),
         }
+    }
+
+    fn chart(session: &Session, spec: serde_json::Value) -> Result<SeriesResult> {
+        let spec: SeriesSpec = serde_json::from_value(spec).unwrap();
+        let scope = Scope { session, cond: "TRUE".into(), names: false, _tests: Tests::default(), _selection: None, _free: Vec::new() };
+        series_of(&scope, &spec)
+    }
+
+    #[test]
+    fn series_count_stream_retains_only_top_keys_under_small_value_budget() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("SET threads=1; SET memory_limit='32MB'; \
+            CREATE VIEW ev AS SELECT range::BIGINT AS id, repeat('x',64) || lpad(range::VARCHAR,4,'0') AS level FROM range(4096)").unwrap();
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        let result = crate::resources::with_analytics_limit(8192, || chart(&session, serde_json::json!({"chart":"terms","metric":"count","limit":10}))).unwrap();
+        assert_eq!(result.x_values, (0..10).map(|i| Some(format!("{}{i:04}", "x".repeat(64)))).collect::<Vec<_>>());
+        assert_eq!(result.series[0].samples, vec![1;10]);
+        assert!(chart(&session, serde_json::json!({"chart":"terms","metric":"count","limit":0})).unwrap().x.is_empty());
+        assert_eq!(chart(&session, serde_json::json!({"chart":"terms","metric":"count","limit":900})).unwrap().x.len(), 500);
+    }
+
+    #[test]
+    fn series_numeric_terms_count_incompatible_units_below_top_n() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE TABLE ev(id BIGINT, source VARCHAR); \
+            INSERT INTO ev VALUES (0,'1KB'),(1,'2KB'),(2,'3s'),(3,'3s'),(4,'4s')").unwrap();
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        for metric in ["sum", "avg", "min", "max"] {
+            for limit in [0, 1, 3] {
+                let result = chart(&session, serde_json::json!({"chart":"terms","metric":metric,"field":"source","unit":"bytes","limit":limit})).unwrap();
+                assert_eq!(result.incompatible_units, 3);
+                if limit > 0 {
+                    assert_eq!(result.x_values[0], Some("2KB".into()));
+                    assert_eq!(result.series[0].points[0], 2048.0);
+                    assert_eq!(result.series[0].samples[0], 1);
+                }
+                assert_eq!(result.x.len(), limit);
+            }
+        }
+        let distinct = chart(&session, serde_json::json!({"chart":"terms","metric":"distinct","field":"source","unit":"bytes","limit":1})).unwrap();
+        assert_eq!(distinct.x_values, vec![Some("1KB".into())]);
+        assert_eq!(distinct.incompatible_units, 0);
+    }
+
+    #[test]
+    fn series_split_stream_keeps_six_raw_key_ties_without_other() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE TABLE ev(id BIGINT, ts BIGINT, level VARCHAR)").unwrap();
+        for (id, key) in ["\n", "\"", "\\", "a", "b", "c", "d", "é"].into_iter().enumerate() {
+            conn.execute("INSERT INTO ev VALUES (?,1,?)", duckdb::params![id as i64,key]).unwrap();
+        }
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        let result = chart(&session, serde_json::json!({"chart":"time","metric":"count","split":"level"})).unwrap();
+        assert_eq!(result.series.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["\n", "\"", "\\", "a", "b", "c"]);
+        assert!(result.series.iter().all(|s| s.samples == [1] && s.points == [1.0]));
+    }
+
+    #[test]
+    fn series_budget_and_sql_errors_do_not_publish_partial_charts() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE VIEW ev AS SELECT range::BIGINT AS id, repeat('x',4096) AS level FROM range(2)").unwrap();
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        let error = crate::resources::with_analytics_limit(1024, || chart(&session, serde_json::json!({"chart":"terms","metric":"count","limit":1}))).err().unwrap();
+        assert!(error.contains("LOGINSIGHT_ANALYTICS_LIMIT_MB"));
+        session.conn().unwrap().execute_batch("DROP VIEW ev; CREATE VIEW ev AS SELECT range::BIGINT AS id, \
+            CASE WHEN range>=4096 THEN error('chart fetch failure') ELSE range::VARCHAR END AS level FROM range(5000)").unwrap();
+        let error = chart(&session, serde_json::json!({"chart":"terms","metric":"count","limit":1})).err().unwrap();
+        assert!(error.contains("chart fetch failure"));
+        assert_eq!(session.conn().unwrap().query_row("SELECT 42", [], |r| r.get::<_,i64>(0)).unwrap(), 42);
+    }
+
+    #[test]
+    fn series_cancelled_stream_is_an_error_and_can_retry() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE TABLE ev(level VARCHAR); INSERT INTO ev VALUES ('a')").unwrap();
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        let token = crate::operations::token(Some("series-top-cancel".into())).unwrap();
+        let cancelled = crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("series-top-cancel");
+            let error = chart(&session, serde_json::json!({"chart":"terms","metric":"count"})).err().unwrap();
+            assert!(error.contains("cancelad"));
+        });
+        assert!(cancelled.is_err());
+        assert_eq!(chart(&session, serde_json::json!({"chart":"terms","metric":"count"})).unwrap().series[0].samples, vec![1]);
+    }
+
+    #[test]
+    fn series_metric_projection_plans_omit_unrequested_aggregates() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE TABLE ev(id BIGINT, source VARCHAR, level VARCHAR)").unwrap();
+        // Count/distinct must bind and execute without the numeric UDFs.
+        for metric in ["count", "distinct"] {
+            let (inner, outer) = metric_columns(Some("source"), None, metric);
+            let mut statement = conn.prepare(&format!("SELECT k,{outer} FROM (SELECT id,level AS k,{inner} FROM ev) GROUP BY k")).unwrap();
+            assert!(statement.query([]).unwrap().next().unwrap().is_none());
+        }
+        super::super::udf::register(&conn).unwrap();
+        for metric in ["count", "distinct", "sum", "avg", "min", "max"] {
+            let (inner, outer) = metric_columns(Some("source"), Some(UnitKind::Bytes), metric);
+            let plan: String = conn.query_row(&format!("EXPLAIN SELECT k,{outer} FROM (SELECT id,level AS k,{inner} FROM ev) GROUP BY k"), [], |r| r.get(1)).unwrap();
+            assert_eq!(plan.contains("count(DISTINCT"), metric == "distinct", "{metric}: {plan}");
+            assert_eq!(plan.contains("sum("), matches!(metric, "sum" | "avg"), "{metric}: {plan}");
+            assert_eq!(plan.contains("min("), metric == "min", "{metric}: {plan}");
+            assert_eq!(plan.contains("max("), metric == "max", "{metric}: {plan}");
+            assert_eq!(outer.contains("ORDER BY id"), matches!(metric, "sum" | "avg"));
+        }
+    }
+
+    #[test]
+    fn series_metric_projection_keeps_file_order_samples_and_warning_counts() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("CREATE TABLE ev(id BIGINT, ts BIGINT, source VARCHAR); INSERT INTO ev VALUES \
+            (3,1,'3'),(2,1,'-10000000000000000'),(1,1,'1'),(0,1,'10000000000000000'), \
+            (4,1,'2KB'),(5,1,''),(6,1,NULL)").unwrap();
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        for (metric, point, samples, warnings) in [
+            ("count", 7.0, 7, 0), ("distinct", 5.0, 5, 0), ("sum", 3.0, 4, 1),
+            ("avg", 0.75, 4, 1), ("min", -1e16, 4, 1), ("max", 1e16, 4, 1), ("unknown", 0.0, 4, 1),
+        ] {
+            let result = chart(&session, serde_json::json!({"chart":"time","metric":metric,"field":"source","unit":"number"})).unwrap();
+            assert_eq!(result.series[0].points, vec![point], "{metric}");
+            assert_eq!(result.series[0].samples, vec![samples], "{metric}");
+            assert_eq!(result.incompatible_units, warnings, "{metric}");
+            if metric != "count" {
+                let absent = chart(&session, serde_json::json!({"chart":"time","metric":metric,"unit":"number"})).unwrap();
+                assert_eq!(absent.series[0].points, vec![0.0]);
+                assert_eq!(absent.series[0].samples, vec![0]);
+                assert_eq!(absent.incompatible_units, 0);
+            }
+        }
+        let unrestricted = chart(&session, serde_json::json!({"chart":"time","metric":"sum","field":"source","unit":"unspecified"})).unwrap();
+        assert_eq!(unrestricted.series[0].points, vec![2051.0]);
+        assert_eq!(unrestricted.series[0].samples, vec![5]);
+        assert_eq!(unrestricted.incompatible_units, 0);
+        session.conn().unwrap().execute_batch("DELETE FROM ev WHERE id<4").unwrap();
+        for metric in ["sum", "avg", "min", "max"] {
+            let empty = chart(&session, serde_json::json!({"chart":"time","metric":metric,"field":"source","unit":"number"})).unwrap();
+            assert_eq!(empty.series[0].points, vec![0.0]);
+            assert_eq!(empty.series[0].samples, vec![0]);
+            assert_eq!(empty.incompatible_units, 1);
+        }
+    }
+
+    #[test]
+    fn series_indexed_buckets_keep_long_split_labels_and_sparse_values() {
+        let session = session();
+        let conn = session.conn().unwrap();
+        conn.execute_batch("SET threads=1; SET memory_limit='32MB'; CREATE TABLE ev(id BIGINT, ts BIGINT, level VARCHAR, source VARCHAR)").unwrap();
+        let names: Vec<_> = ["a'", "b\\", "c\n", "dé", "e日", "f", "z"].into_iter().map(|prefix| format!("{prefix}{}", "x".repeat(1024))).collect();
+        for (index, name) in names.iter().enumerate() {
+            conn.execute("INSERT INTO ev VALUES (?,1,?,'1KB'),(?,101,?,'3s')", duckdb::params![index as i64*2,name,index as i64*2+1,name]).unwrap();
+        }
+        super::super::udf::register(&conn).unwrap();
+        drop(conn);
+        for metric in ["sum", "avg", "min", "max"] {
+            let result = chart(&session, serde_json::json!({"chart":"time","metric":metric,"field":"source","split":"level","interval_ms":10,"unit":"bytes"})).unwrap();
+            assert_eq!(result.series.iter().map(|s| &s.name).collect::<Vec<_>>(), names.iter().take(6).collect::<Vec<_>>());
+            assert_eq!(result.incompatible_units, 6, "only selected split groups contribute legacy time warnings");
+            for series in result.series {
+                let mut points = vec![0.0; 11]; points[0] = 1024.0;
+                let mut samples = vec![0; 11]; samples[0] = 1;
+                assert_eq!(series.points, points);
+                assert_eq!(series.samples, samples);
+            }
+        }
+        session.conn().unwrap().execute_batch("UPDATE ev SET level=NULL").unwrap();
+        let empty = chart(&session, serde_json::json!({"chart":"time","metric":"count","split":"level","interval_ms":10})).unwrap();
+        assert_eq!(empty.series.len(), 1);
+        assert_eq!(empty.series[0].name, "eventos");
+        assert_eq!(empty.series[0].points, vec![0.0; 11]);
+        assert_eq!(empty.series[0].samples, vec![0; 11]);
+        assert_eq!(empty.incompatible_units, 0);
     }
 
     #[test]
@@ -713,6 +935,30 @@ mod bounded_analytics_tests {
     }
 
     #[test]
+    fn failed_or_cancelled_selection_cleanup_retains_every_pending_table_for_retry() {
+        let session = session();
+        session.conn().unwrap().execute_batch("CREATE VIEW retired_wrong_type AS SELECT 1; CREATE TABLE retired_later(id BIGINT)").unwrap();
+        session.garbage().lock().extend(["retired_wrong_type".to_string(), "retired_later".to_string()]);
+        let next = new_selection(&session, false, None);
+        let mut filled = false;
+        assert!(selection_write(&session, &next, |_| { filled = true; Ok(0) }).is_err());
+        assert!(!filled, "failed cleanup cannot begin publishing another selection");
+        assert_eq!(*session.garbage().lock(), vec!["retired_wrong_type", "retired_later"]);
+        session.conn().unwrap().execute_batch("DROP VIEW retired_wrong_type").unwrap();
+        let token = crate::operations::token(Some("selection-cleanup-cancel".into())).unwrap();
+        assert!(crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("selection-cleanup-cancel");
+            session.collect_garbage()
+        }).is_err());
+        assert_eq!(*session.garbage().lock(), vec!["retired_wrong_type", "retired_later"]);
+        session.collect_garbage().unwrap();
+        assert!(session.garbage().lock().is_empty());
+        assert_eq!(session.conn().unwrap().query_row("SELECT count(*) FROM information_schema.tables WHERE table_name='retired_later'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        selection_write(&session, &next, |conn| { conn.execute(&format!("INSERT INTO {} VALUES(7)", next.name), []).map_err(err)?; Ok(1) }).unwrap();
+        assert_eq!(next.accounted_bytes(), 8);
+    }
+
+    #[test]
     fn waiting_for_same_selection_is_cancellable_without_poisoning_builder() {
         let session = Arc::new(session());
         let held = session.begin_selection("filter").unwrap();
@@ -764,6 +1010,147 @@ mod bounded_analytics_tests {
         assert!(!cacheable_filters(&filters("threat_rule", "whatever")));
         assert!(!cacheable_filters(&filters("detection", "whatever")));
     }
+
+    #[test]
+    fn complete_filter_cache_precedes_eight_term_lru_churn_and_cancel_checks() {
+        struct Restore(Option<std::ffi::OsString>, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 { Some(value) => std::env::set_var("LOGINSIGHT_ENGINE_DIR", value), None => std::env::remove_var("LOGINSIGHT_ENGINE_DIR") }
+                crate::engine::set_enabled(self.1);
+            }
+        }
+        let _restore = Restore(std::env::var_os("LOGINSIGHT_ENGINE_DIR"), super::super::enabled());
+        let directory = tempfile::tempdir().unwrap();
+        std::env::set_var("LOGINSIGHT_ENGINE_DIR", directory.path().join("engine"));
+        crate::engine::set_enabled(true);
+        let words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"];
+        let path = directory.path().join("cache-order.jsonl");
+        let records: Vec<_> = (0..80).map(|id| serde_json::json!({
+            "timestamp":"2026-01-01T00:00:00Z", "message":words.join(" "), "keep":id % 2 == 0,
+        }).to_string()).collect();
+        std::fs::write(&path, records.join("\n")).unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let config = CodesConfig::default();
+        crate::engine::prepare(&index, &config, &config, &[], &|_, _| {}).unwrap();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let session = super::super::session_checked(&index, &config, &config, &[]).unwrap().unwrap();
+        let mut filters: Vec<_> = words.iter().map(|word| crate::query::Filter {
+            column:"_all".into(), op:"query".into(), value:(*word).into(), value2:None,
+        }).collect();
+        filters.push(crate::query::Filter { column:"raw".into(), op:"contains".into(), value:"\"keep\":true".into(), value2:None });
+        let pfs = prepared(&filters);
+        assert_eq!(session.schema.plan(&pfs).tests.free.len(), 8, "all eight required words have real text probes");
+        assert!(!session.schema.plan(&pfs).exact(), "the complete result must include canonical residual verification");
+        FREE_CANDIDATE_PROBES.with(|probes| probes.set(0));
+        assert_eq!(count_session(&session, &source, &pfs).unwrap(), 40);
+        assert_eq!(FREE_CANDIDATE_PROBES.with(std::cell::Cell::get), 8);
+        let before = session.selection_snapshot();
+        assert_eq!(before["entries"], 8, "whole-filter and term selections share the bounded LRU");
+        FREE_CANDIDATE_PROBES.with(|probes| probes.set(0));
+        assert_eq!(count_session(&session, &source, &pfs).unwrap(), 40);
+        assert_eq!(FREE_CANDIDATE_PROBES.with(std::cell::Cell::get), 0, "a completed filter must skip all repeated term probes");
+        assert_eq!(session.selection_snapshot(), before, "the retained selection must not be evicted by term churn");
+        let token = crate::operations::token(Some("complete-filter-hit-cancel".into())).unwrap();
+        let cancelled = crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("complete-filter-hit-cancel");
+            count_session(&session, &source, &pfs)
+        });
+        assert!(cancelled.is_err());
+        assert_eq!(FREE_CANDIDATE_PROBES.with(std::cell::Cell::get), 0);
+        assert_eq!(session.selection_snapshot(), before);
+        let key = complete_selection_key(&session, &pfs).unwrap();
+        session.names_version.fetch_add(1, Ordering::SeqCst);
+        assert_ne!(complete_selection_key(&session, &pfs).unwrap(), key, "catalog versions cannot reuse an earlier complete result");
+        filters[0].value = "changed".into();
+        assert_ne!(complete_selection_key(&session, &prepared(&filters)).unwrap(), complete_selection_key(&session, &pfs).unwrap());
+    }
+
+    fn bare_scope(session: &Session) -> Scope<'_> {
+        Scope { session, cond: "TRUE".into(), names: false, _tests: Tests::default(), _selection: None, _free: Vec::new() }
+    }
+
+    fn latency_value(sample: crate::insights::LatencySample) -> Value {
+        let empty = crate::insights::overview(std::iter::empty::<Event>);
+        let result = crate::insights::finish_overview(empty, Vec::new(), HashMap::new(), sample, |_, _, _, _| {});
+        serde_json::to_value(result.latency).unwrap()
+    }
+
+    #[test]
+    fn latency_stream_preserves_selected_field_units_and_exact_reservoir_order() {
+        let mut session = session();
+        session.schema.fields.insert("latency_ms".into(), "latency_ms".into());
+        session.schema.fields.insert("duration_ms".into(), "duration_ms".into());
+        let conn = session.conn().unwrap();
+        super::super::udf::register(&conn).unwrap();
+        conn.execute_batch("SET threads=1; CREATE VIEW ev AS SELECT range::BIGINT AS id, \
+            CASE WHEN range=0 THEN NULL ELSE '9999' END AS latency_ms, \
+            CASE WHEN range=0 THEN '20' WHEN range%97=0 THEN NULL WHEN range%19=0 THEN 'invalid' \
+            WHEN range%7=0 THEN '2s' ELSE (range%200)::VARCHAR END AS duration_ms FROM range(12017)").unwrap();
+        drop(conn);
+        let mut expected = crate::insights::LatencySample::default();
+        for id in 0..12017 {
+            let duration = if id == 0 { Some("20".to_string()) } else if id % 97 == 0 { None }
+                else if id % 19 == 0 { Some("invalid".into()) } else if id % 7 == 0 { Some("2s".into()) }
+                else { Some((id % 200).to_string()) };
+            expected.push(|key| match key { "latency_ms" if id != 0 => Some("9999".into()), "duration_ms" => duration.clone(), _ => None });
+        }
+        let actual = latency_value(latency_of(&bare_scope(&session), "ev").unwrap());
+        assert_eq!(actual, latency_value(expected));
+        assert_eq!(actual["field"], "duration_ms");
+        assert_eq!(actual["sampled"], 10000);
+        assert!(actual["count"].as_u64().unwrap() > 10000);
+    }
+
+    #[test]
+    fn light_sql_stream_preserves_requested_values_and_pivot_results() {
+        let mut session = session();
+        session.schema.fields.insert("extra".into(), "extra".into());
+        session.conn().unwrap().execute_batch("SET threads=1; CREATE VIEW ev AS SELECT range::BIGINT AS id, \
+            CASE WHEN range%3=0 THEN NULL ELSE (range-2)*1000 END::BIGINT AS ts, \
+            CASE WHEN range%2=0 THEN NULL ELSE 'api' END AS source, \
+            'Mensagem '||range::VARCHAR AS message, \
+            CASE WHEN range%3=0 THEN NULL ELSE repeat('ação',128)||range::VARCHAR END AS extra \
+            FROM range(33) ORDER BY range DESC").unwrap();
+        let expected: Vec<Event> = (0..33).map(|id| {
+            let mut event = Event::empty(); event.id = id;
+            event.timestamp = (id % 3 != 0).then_some((id as i64 - 2) * 1000);
+            event.source = if id % 2 == 0 { "" } else { "api" }.into();
+            event.message = format!("Mensagem {id}");
+            if id % 3 != 0 { event.fields.insert("extra".into(), Value::String(format!("{}{id}", "ação".repeat(128)))); }
+            event
+        }).collect();
+        let columns = ["id", "timestamp", "source", "message", "extra"].map(str::to_string);
+        let work = LightStreamWork::default();
+        let actual = light_events_bounded(&bare_scope(&session), &columns, 8, 2048, &work, |events| events.collect::<Vec<_>>()).unwrap();
+        assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(&expected).unwrap());
+        assert_eq!(work.rows.load(Ordering::Relaxed), 33);
+        assert!(work.max_batch_rows.load(Ordering::Relaxed) <= 8);
+        assert!(work.max_batch_bytes.load(Ordering::Relaxed) <= 2048);
+        let spec: crate::analysis::PivotSpec = serde_json::from_value(serde_json::json!({
+            "rows":["source"],"cols":["extra"],"values":[{"column":"message","func":"count","alias":"n"}],"limit_rows":10
+        })).unwrap();
+        let actual = light_events(&bare_scope(&session), &columns, |events| crate::analysis::pivot_stream(events, &spec)).unwrap().unwrap();
+        let expected = crate::analysis::pivot(&expected, &spec).unwrap();
+        assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap());
+    }
+
+    #[test]
+    fn light_sql_and_latency_fetch_failures_do_not_publish_partial_results() {
+        let mut session = session();
+        session.schema.fields.insert("duration_ms".into(), "message".into());
+        let conn = session.conn().unwrap();
+        super::super::udf::register(&conn).unwrap();
+        conn.execute_batch("SET threads=1; CREATE VIEW ev AS SELECT range::BIGINT AS id, range::BIGINT AS ts, \
+            CASE WHEN range>=4096 THEN error('late light value') ELSE range::VARCHAR END AS message FROM range(5000)").unwrap();
+        drop(conn);
+        let scope = bare_scope(&session);
+        let error = light_events(&scope, &["message".into()], |events| events.count()).unwrap_err();
+        assert!(error.contains("late light value"), "{error}");
+        let error = latency_of(&scope, "ev").err().unwrap();
+        assert!(error.contains("late light value"), "{error}");
+        assert_eq!(session.conn().unwrap().query_row("SELECT 42", [], |row| row.get::<_, i64>(0)).unwrap(), 42);
+    }
 }
 
 // ---------------------------------------------------------------- matches
@@ -782,17 +1169,47 @@ pub(crate) fn visit_matches(src: &Source, pfs: &[PreparedFilter], visit: impl Fn
     })
 }
 
+/// Stream exactly matching global row IDs without materializing a selection
+/// table or formatting Events. None means unavailable/residual capability, never
+/// an execution/cancellation/visibility failure.
+pub(crate) fn visit_exact_matches(src: &Source, pfs: &[PreparedFilter], visit: impl FnMut(usize) -> Result<bool>) -> Result<Option<()>> {
+    Ok(analytics_with(src, base_page_safe(pfs, ""), |session| {
+        if !session.schema.plan(pfs).exact() { return Ok(None); }
+        let (scope, exact) = page_scope(session, src, pfs)?;
+        if !exact { return Ok(None); }
+        visit_ids(session, &format!("SELECT id FROM {} WHERE {} ORDER BY id", scope.from(false), scope.cond), visit)?;
+        Ok(Some(()))
+    })?.flatten())
+}
+
+fn count_session(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<usize> {
+    if pfs.is_empty() {
+        crate::operations::check()?;
+        // The admitted gate already counts exact visible positional rows. Its
+        // accessor validates source/payload leases before this scan-free return.
+        if let Some(gate) = crate::analysis_runtime::indexed_gate(src.idx)? {
+            return Ok(gate.visible_count());
+        }
+    }
+    if crate::analysis_runtime::visibility_unrestricted(src.idx)? {
+    if let (Some(predicate), Some(readers)) = (super::time_index::predicate(pfs), session.exact_time_indexes()) {
+        crate::operations::progress("analytics-time-index", "Lendo resumo temporal verificado", 0, 0, 0);
+        if let Some(total) = super::time_index::count(&readers, &predicate)? { return Ok(total); }
+        session.invalidate_exact_times(&readers)?;
+    }
+    }
+    let scope = scope(session, src, pfs)?;
+    let counted = rows(
+        session,
+        &format!("SELECT count(*) FROM {} WHERE {}", scope.from(false), scope.cond),
+        |r| r.get::<_, i64>(0),
+    )?;
+    Ok(counted.first().copied().unwrap_or(0) as usize)
+}
+
 pub(crate) fn count(src: &Source, filters: &[crate::query::Filter]) -> Result<Option<usize>> {
     let pfs = prepared(filters);
-    analytics_with(src, base_page_safe(&pfs, ""), |session| {
-        let scope = scope(session, src, &pfs)?;
-        let counted = rows(
-            session,
-            &format!("SELECT count(*) FROM {} WHERE {}", scope.from(false), scope.cond),
-            |r| r.get::<_, i64>(0),
-        )?;
-        Ok(counted.first().copied().unwrap_or(0) as usize)
-    })
+    analytics_with(src, base_page_safe(&pfs, ""), |session| count_session(session, src, &pfs))
 }
 
 // ---------------------------------------------------------------- stats
@@ -803,14 +1220,25 @@ const LEVEL_LABEL: &str = "CASE lvl WHEN 1 THEN 'Crítico' WHEN 2 THEN 'Erro' WH
 fn stats_of(scope: &Scope) -> Result<Stats> {
     let from = scope.from(false);
     let cond = &scope.cond;
-    let bounds = rows(
+    // Histogram boundaries depend on the selected timestamp range. Obtain
+    // that range and the level counts together, so the exact histogram needs
+    // only one further pass instead of scanning for levels separately.
+    // lvl is a stored UTINYINT; this aggregation has at most 256 groups.
+    let summaries = rows(
         scope.session,
-        &format!("SELECT min(NULLIF(ts, 0)), max(NULLIF(ts, 0)) FROM {from} WHERE {cond}"),
-        |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        &format!("SELECT lvl, count(*), min(NULLIF(ts, 0)), max(NULLIF(ts, 0)) FROM {from} WHERE {cond} GROUP BY lvl"),
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<i64>>(3)?)),
     )?;
+    let mut merged: HashMap<&'static str, i64> = HashMap::new();
+    let (mut min_ts, mut max_ts): (Option<i64>, Option<i64>) = (None, None);
+    for (lvl, count, lower, upper) in summaries {
+        *merged.entry(class_label(lvl as u8)).or_default() += count;
+        if let Some(lower) = lower { min_ts = Some(min_ts.map_or(lower, |min| min.min(lower))); }
+        if let Some(upper) = upper { max_ts = Some(max_ts.map_or(upper, |max| max.max(upper))); }
+    }
     let mut buckets = Vec::new();
     let mut bucket_ms = 0;
-    if let Some((Some(min_ts), Some(max_ts))) = bounds.first().copied() {
+    if let (Some(min_ts), Some(max_ts)) = (min_ts, max_ts) {
         let count;
         (bucket_ms, count) = stats_layout(min_ts, max_ts);
         let mut counts = vec![0i64; count];
@@ -830,21 +1258,551 @@ fn stats_of(scope: &Scope) -> Result<Stats> {
             .map(|(b, c)| (min_ts.saturating_add((b as i64).saturating_mul(bucket_ms)), c))
             .collect();
     }
-    let mut merged: HashMap<&'static str, i64> = HashMap::new();
-    for (lvl, c) in rows(
-        scope.session,
-        &format!("SELECT lvl, count(*) FROM {from} WHERE {cond} GROUP BY lvl"),
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-    )? {
-        *merged.entry(class_label(lvl as u8)).or_default() += c;
-    }
     let mut levels: Vec<(String, i64)> = merged.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     sort_levels(&mut levels);
     Ok(build_stats(buckets, bucket_ms, levels))
 }
 
+fn stats_session(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Stats> {
+    if crate::analysis_runtime::visibility_unrestricted(src.idx)? {
+    if let (Some(predicate), Some(readers)) = (super::time_index::predicate(pfs), session.exact_time_indexes()) {
+        crate::operations::progress("analytics-time-index", "Lendo resumo temporal verificado", 0, 0, 0);
+        if let Some(stats) = super::time_index::stats(&readers, &predicate)? { return Ok(stats); }
+        session.invalidate_exact_times(&readers)?;
+    }
+    }
+    stats_of(&scope(session, src, pfs)?)
+}
+
 pub(crate) fn stats(src: &Source, pfs: &[PreparedFilter]) -> Result<Option<Stats>> {
-    analytics_with(src, base_page_safe(pfs, ""), |session| stats_of(&scope(session, src, pfs)?))
+    analytics_with(src, base_page_safe(pfs, ""), |session| stats_session(session, src, pfs))
+}
+
+fn timeline_session(session: &Session, start: i64, end: i64, width: i64, buckets: usize) -> Result<Option<super::time_index::Histogram>> {
+    let Some(readers) = session.exact_time_indexes() else { return Ok(None); };
+    crate::operations::progress("analytics-time-index", "Lendo resumo temporal verificado", 0, 0, 0);
+    let result = super::time_index::histogram(&readers, start, end, width, buckets)?;
+    if result.is_none() { session.invalidate_exact_times(&readers)?; }
+    Ok(result)
+}
+
+fn sparse_timeline_session(
+    session: &Session, src: &Source, mask: &crate::analysis_visibility::Mask,
+    plan: super::sparse_timeline::Plan, start: i64, end: i64, width: i64, buckets: usize,
+) -> Result<Option<super::time_index::Histogram>> {
+    let readers = session.exact_time_indexes();
+    let result = super::sparse_timeline::histogram(plan, &src.idx.lines, mask, readers.as_ref(), start, end, width, buckets)?;
+    if result.is_none() {
+        if let Some(readers) = &readers { session.invalidate_exact_times(readers)?; }
+    }
+    Ok(result.map(|(histogram, _work)| histogram))
+}
+
+/// The caller has already bound this mask to the admitted indexed source.
+/// A visible remainder needs only those retained metadata/source/payload leases;
+/// waiting for a Session here would otherwise trigger an unnecessary full scan.
+fn sparse_timeline_query(
+    src: &Source, mask: &crate::analysis_visibility::Mask,
+    plan: super::sparse_timeline::Plan, start: i64, end: i64, width: i64, buckets: usize,
+) -> Result<Option<super::time_index::Histogram>> {
+    if !plan.requires_base() {
+        return Ok(super::sparse_timeline::histogram(
+            plan, &src.idx.lines, mask, None, start, end, width, buckets,
+        )?.map(|(histogram, _work)| histogram));
+    }
+    Ok(analytics_with(src, true, |session|
+        sparse_timeline_session(session, src, mask, plan, start, end, width, buckets)
+    )?.flatten())
+}
+
+/// Optional exact acceleration for the unfiltered indexed timeline. Callers
+/// retain their existing source scan when no complete verified capability exists.
+pub(crate) fn timeline_histogram(src: &Source, start: i64, end: i64, width: i64, buckets: usize) -> Result<Option<super::time_index::Histogram>> {
+    if let Some(gate) = crate::analysis_runtime::indexed_gate(src.idx)? {
+        if !gate.is_unrestricted() {
+            if src.idx.lines.len() < super::sparse_timeline::MIN_SOURCE_ROWS { return Ok(None); }
+            let Some(mask) = gate.indexed_mask() else { return Ok(None); };
+            let Some(plan) = super::sparse_timeline::Plan::new(src.idx, mask)? else { return Ok(None); };
+            return sparse_timeline_query(src, mask, plan, start, end, width, buckets);
+        }
+    }
+    Ok(analytics_with(src, true, |session| timeline_session(session, start, end, width, buckets))?.flatten())
+}
+
+#[cfg(test)]
+mod exact_time_routing_tests {
+    use super::*;
+    use super::super::time_index;
+    use parking_lot::{Mutex, RwLock};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn fixture() -> (tempfile::TempDir, Session, Vec<PathBuf>, time_index::ReadSet) {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = duckdb::Connection::open_in_memory().unwrap();
+        connection.execute_batch("SET threads=1; SET memory_limit='32MB'; SET max_temp_directory_size='1MB'; \
+            CREATE TABLE ev(id BIGINT, lvl UTINYINT, ts BIGINT, level VARCHAR, source VARCHAR)").unwrap();
+        let mut handles = Vec::new();
+        let mut paths = Vec::new();
+        let parts = [vec![(0, Some(5)), (1, Some(-100)), (2, None), (3, Some(0))],
+                     vec![(4, Some(5)), (5, Some(101)), (6, Some(-1)), (2, Some(101)), (0, None)]];
+        let mut id = 0i64;
+        for (part, rows) in parts.iter().enumerate() {
+            let store = dir.path().join(format!("part{part}.duckdb"));
+            let producer = duckdb::Connection::open_in_memory().unwrap();
+            producer.execute_batch("SET threads=1; SET memory_limit='32MB'; SET max_temp_directory_size='1MB'; CREATE TABLE ev(lvl UTINYINT, ts BIGINT)").unwrap();
+            for &(level, timestamp) in rows {
+                producer.execute("INSERT INTO ev VALUES (?, ?)", duckdb::params![level, timestamp]).unwrap();
+                let label = if level == 6 { "custom" } else { class_label(level) };
+                connection.execute("INSERT INTO ev VALUES (?, ?, ?, ?, ?)", duckdb::params![id, level, timestamp, label, if part == 0 { "api" } else { "auth" }]).unwrap();
+                id += 1;
+            }
+            std::fs::write(store.with_extension("complete.json"), json!({"key":format!("part{part}"), "rows":rows.len(), "version":5}).to_string()).unwrap();
+            let identity = time_index::identity(&store, rows.len()).unwrap();
+            time_index::ensure(&producer, &store, &identity, &|| false).unwrap();
+            handles.push(time_index::open(&store, &identity).unwrap().unwrap());
+            paths.push(store);
+        }
+        let session = Session {
+            key: "time-routing-test".into(), base: Mutex::new(connection), pool: Mutex::new(Vec::new()),
+            schema: super::super::sql::Schema::default(), timestamps_non_null: false, baked: true,
+            names: RwLock::new(None), names_version: AtomicU64::new(0), selections: Mutex::new(Vec::new()),
+            selection_builds: Mutex::new(std::collections::HashSet::new()), selection_changed: parking_lot::Condvar::new(),
+            garbage: Arc::new(Mutex::new(Vec::new())), texts: Vec::new(), time_indexes: RwLock::new(None), _leases: Vec::new(),
+        };
+        (dir, session, paths, handles.into())
+    }
+    fn index() -> FileIndex {
+        FileIndex { parts: Vec::new(), lines: Arc::new(crate::metadata_store::LineStore::default()), columns: Vec::new(), time_order: std::sync::Arc::new(std::sync::OnceLock::new()) }
+    }
+    fn filters(value: Value) -> Vec<PreparedFilter> {
+        prepared(&serde_json::from_value::<Vec<crate::query::Filter>>(value).unwrap())
+    }
+
+    #[test]
+    fn admitted_mask_answers_empty_count_without_sql_but_rejects_corrupted_membership() {
+        use crate::{
+            analysis_context::Snapshot,
+            analysis_runtime::{self, Mode},
+            exclusion_store::{self, Admission, Purpose, Work},
+            source_publication, AppState, SourceData,
+        };
+        struct Environment(Option<std::ffi::OsString>);
+        impl Drop for Environment {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("LOGINSIGHT_DATA_DIR", value),
+                    None => std::env::remove_var("LOGINSIGHT_DATA_DIR"),
+                }
+            }
+        }
+        let (directory, session, _, _) = fixture();
+        let _environment = Environment(std::env::var_os("LOGINSIGHT_DATA_DIR"));
+        std::env::set_var("LOGINSIGHT_DATA_DIR", directory.path());
+        crate::case_store::save_at(directory.path(), json!({"cases":[{"id":"a"}]})).unwrap();
+        let initial: Snapshot = serde_json::from_value(
+            crate::case_store::load_at(directory.path()).unwrap()["cases"][0]["analysisContext"]
+                .clone(),
+        )
+        .unwrap();
+        let raw = directory.path().join("source.jsonl");
+        std::fs::write(
+            &raw,
+            "{\"message\":\"one\",\"timestamp\":\"1970-01-01T00:00:10Z\",\"level\":\"ERROR\"}\n{\"message\":\"two\",\"timestamp\":\"1970-01-01T00:00:20Z\",\"level\":\"WARN\"}\n{\"message\":\"three\",\"timestamp\":\"1970-01-01T00:00:30Z\"}\n",
+        )
+        .unwrap();
+        let index =
+            crate::sources::index_file(raw.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        assert_eq!(index.lines.iter().map(|row| (row.ts, row.level)).collect::<Vec<_>>(),
+            vec![(10_000, crate::model::LV_ERR), (20_000, crate::model::LV_WARN), (30_000, crate::model::LV_INFO)]);
+        let state = AppState {
+            source: RwLock::new(SourceData::None),
+            source_publication: RwLock::new(Default::default()),
+            source_names: RwLock::new(Vec::new()),
+            codes: RwLock::new(Default::default()),
+            system_codes: RwLock::new(Default::default()),
+            derived: RwLock::new(Vec::new()),
+            case_store_lock: Mutex::new(()),
+            codes_path: Default::default(),
+            system_codes_path: Default::default(),
+        };
+        let owner = analysis_runtime::capture(&state, Some(initial.identity()), Some(0), Mode::Publish)
+            .unwrap();
+        analysis_runtime::with(Some(owner), || {
+            source_publication::publish(&state, index, vec!["fixture".into()], vec![], false)
+        })
+        .unwrap();
+        let work = Work {
+            cancelled: &|| false,
+            progress: &|_, _, _| {},
+        };
+        let staged = {
+            let source = state.source.read();
+            let SourceData::Indexed(index) = &*source else {
+                panic!()
+            };
+            let binding = crate::analysis_visibility::SourceSet::new(index).unwrap();
+            exclusion_store::stage(
+                directory.path(),
+                Admission {
+                    analysis: initial.identity(),
+                    source_receipt: json!({}),
+                },
+                Purpose::Exclude,
+                binding.descriptors(),
+                [binding.member_row(index, 1, &Default::default())],
+                &Default::default(),
+                &work,
+            )
+            .unwrap()
+        };
+        let receipt = exclusion_store::publish(
+            directory.path(),
+            staged,
+            "fixture",
+            "",
+            json!({}),
+            &Default::default(),
+            &work,
+        )
+        .unwrap();
+        let admitted = analysis_runtime::capture(
+            &state,
+            Some(receipt.analysis_context.identity()),
+            Some(source_publication::receipt_locked(&state).generation),
+            Mode::Dataset,
+        )
+        .unwrap();
+        admitted.validate(&state).unwrap();
+        admitted.prepare_visibility(None).unwrap();
+        session
+            .conn()
+            .unwrap()
+            .execute_batch("DROP TABLE ev")
+            .unwrap();
+        analysis_runtime::with(Some(admitted), || {
+            let captured = analysis_runtime::source(&state);
+            let SourceData::Indexed(index) = &*captured else {
+                panic!()
+            };
+            let codes = CodesConfig::default();
+            let source = Source {
+                idx: index,
+                codes: &codes,
+                system: &codes,
+                derived: &[],
+            };
+            assert_eq!(count_session(&session, &source, &[]).unwrap(), 2);
+            let gate = analysis_runtime::indexed_gate(index).unwrap().unwrap();
+            let mask = gate.indexed_mask().expect("Dataset mask retains its exact positional capability");
+            let plan = super::super::sparse_timeline::Plan::new(index, mask).unwrap().unwrap();
+            assert!(sparse_timeline_session(&session, &source, mask, plan, 1, 40_000, 20_000, 2).unwrap().is_none());
+            let store = directory.path().join("admitted-timeline.duckdb");
+            let producer = duckdb::Connection::open_in_memory().unwrap();
+            producer.execute_batch("SET threads=1; CREATE TABLE ev(lvl UTINYINT, ts BIGINT)").unwrap();
+            for row in index.lines.iter() {
+                producer.execute("INSERT INTO ev VALUES (?, ?)", duckdb::params![row.level, row.ts]).unwrap();
+            }
+            std::fs::write(store.with_extension("complete.json"), json!({"key":"admitted-timeline","rows":3,"version":5}).to_string()).unwrap();
+            let identity = time_index::identity(&store, 3).unwrap();
+            time_index::ensure(&producer, &store, &identity, &|| false).unwrap();
+            *session.time_indexes.write() = Some(vec![time_index::open(&store, &identity).unwrap().unwrap()].into());
+            let visible = sparse_timeline_session(&session, &source, mask, plan, 1, 40_000, 20_000, 2).unwrap().unwrap();
+            assert_eq!((visible.total, visible.errors, visible.warnings), (2, 1, 0));
+            std::fs::OpenOptions::new().write(true).open(time_index::path(&store)).unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3)).unwrap();
+            assert!(sparse_timeline_session(&session, &source, mask, plan, 1, 40_000, 20_000, 2).unwrap().is_none());
+            assert!(session.exact_time_indexes().is_none());
+            assert!(count_session(
+                &session,
+                &source,
+                &filters(json!([{"column":"source","op":"equals_exact","value":"other"}]))
+            )
+            .is_err());
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(
+                    directory
+                        .path()
+                        .join("exclusions-v1")
+                        .join(format!("{}.sqlite3", receipt.batch_id)),
+                )
+                .unwrap();
+            file.write_all(b"changed").unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            assert!(
+                count_session(&session, &source, &[]).is_err(),
+                "a cached count must not bypass membership integrity"
+            );
+            assert!(sparse_timeline_session(&session, &source, mask, plan, 1, 40_000, 20_000, 2).is_err(),
+                "optional temporal fallback must not bypass changed membership");
+        });
+    }
+
+    #[test]
+    fn sparse_visible_timeline_requires_no_session_but_keeps_source_and_cancellation_guards() {
+        use crate::{analysis_context::Snapshot, analysis_visibility::{Cache, SourceSet}, exclusion_store::{self, Admission, Purpose, Work}};
+        let directory = tempfile::tempdir().unwrap();
+        crate::case_store::save_at(directory.path(), json!({"cases":[{"id":"sparse"}]})).unwrap();
+        let initial: Snapshot = serde_json::from_value(
+            crate::case_store::load_at(directory.path()).unwrap()["cases"][0]["analysisContext"].clone(),
+        ).unwrap();
+        let raw = directory.path().join("visible.jsonl");
+        std::fs::write(&raw, "{\"timestamp\":\"1970-01-01T00:00:01Z\"}\n{\"timestamp\":\"1970-01-01T00:00:02Z\"}\n{\"timestamp\":\"1970-01-01T00:00:03Z\",\"level\":\"WARN\"}\n").unwrap();
+        let index = crate::sources::index_file(raw.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        assert_eq!(index.lines.iter().map(|row| row.ts).collect::<Vec<_>>(), vec![1_000, 2_000, 3_000]);
+        let work = Work { cancelled: &|| false, progress: &|_, _, _| {} };
+        let binding = SourceSet::new(&index).unwrap();
+        let staged = exclusion_store::stage(directory.path(), Admission {
+            analysis: initial.identity(), source_receipt: json!({}),
+        }, Purpose::Exclude, binding.descriptors(), [0, 1].map(|row|
+            binding.member_row(&index, row, &Default::default())
+        ), &Default::default(), &work).unwrap();
+        let receipt = exclusion_store::publish(directory.path(), staged, "fixture", "", json!({}), &Default::default(), &work).unwrap();
+        let identity = receipt.analysis_context.identity();
+        let view = exclusion_store::visibility(directory.path(), &identity, &Default::default(), &work).unwrap();
+        let mask = Cache::new().get_or_compile(&index, 1, &identity, &view, &Default::default(), &work).unwrap();
+        let plan = super::super::sparse_timeline::Plan::new(&index, &mask).unwrap().unwrap();
+        assert!(!plan.requires_base());
+        let codes = CodesConfig::default();
+        let source = Source { idx: &index, codes: &codes, system: &codes, derived: &[] };
+        struct EngineRestore(bool);
+        impl Drop for EngineRestore { fn drop(&mut self) { super::super::set_enabled(self.0); } }
+        let _engine = EngineRestore(super::super::ENABLED.load(Ordering::SeqCst));
+        super::super::set_enabled(false);
+        assert!(ready_session(&source, true).unwrap().is_none());
+        let result = sparse_timeline_query(&source, &mask, plan, 1, 4_000, 1_000, 4).unwrap().unwrap();
+        assert_eq!((result.total, result.errors, result.warnings), (1, 0, 1));
+        let token = crate::operations::token(Some("sparse-visible-no-session".into())).unwrap();
+        crate::operations::cancel_id("sparse-visible-no-session");
+        assert!(crate::operations::run_with_token(token, ||
+            sparse_timeline_query(&source, &mask, plan, 1, 4_000, 1_000, 4)
+        ).unwrap_err().contains("cancelad"));
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&raw).unwrap().write_all(b"changed").unwrap();
+        assert!(sparse_timeline_query(&source, &mask, plan, 1, 4_000, 1_000, 4).is_err());
+    }
+
+    #[test]
+    fn count_and_stats_use_complete_time_capability_with_exact_sql_parity() {
+        let (_dir, session, _paths, readers) = fixture();
+        let index = index();
+        let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let cases = [json!([]),
+            json!([{"column":"level","op":"equals_exact","value":"Informação"}]),
+            json!([{"column":"level","op":"equals_exact","value":"Erro"}]),
+            json!([{"column":"timestamp","op":"gt","value":"0"}]),
+            json!([{"column":"timestamp","op":"lte","value":"0"}]),
+            json!([{"column":"timestamp","op":"between","value":"-100","value2":"101"}]),
+            json!([{"column":"timestamp","op":"gte","value":"0.5"},{"column":"timestamp","op":"lt","value":"101"}]),
+            json!([{"column":"level","op":"equals_exact","value":"Erro"},{"column":"level","op":"equals_exact","value":"Aviso"}]),
+            json!([{"column":"timestamp","op":"gt","value":"invalid"}])];
+        let expectations: Vec<_> = cases.iter().map(|case| {
+            let pfs = filters(case.clone());
+            (count_session(&session, &source, &pfs).unwrap(), serde_json::to_value(stats_session(&session, &source, &pfs).unwrap()).unwrap())
+        }).collect();
+        *session.time_indexes.write() = Some(readers);
+        // The only SQL table is gone: supported queries must use the verified
+        // capability, not coincidentally pass by silently taking SQL fallback.
+        session.conn().unwrap().execute_batch("DROP TABLE ev").unwrap();
+        for (case, (count, stats)) in cases.iter().zip(expectations) {
+            let pfs = filters(case.clone());
+            assert_eq!(count_session(&session, &source, &pfs).unwrap(), count, "{case}");
+            assert_eq!(serde_json::to_value(stats_session(&session, &source, &pfs).unwrap()).unwrap(), stats, "{case}");
+        }
+    }
+
+    #[test]
+    fn missing_or_unsupported_time_capability_keeps_exact_sql_fallback() {
+        let (_dir, session, _paths, readers) = fixture();
+        let index = index(); let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let pfs = filters(json!([{"column":"source","op":"equals_exact","value":"api"}]));
+        let expected = serde_json::to_value(stats_session(&session, &source, &pfs).unwrap()).unwrap();
+        *session.time_indexes.write() = Some(Arc::clone(&readers));
+        assert_eq!(count_session(&session, &source, &pfs).unwrap(), 4);
+        assert_eq!(serde_json::to_value(stats_session(&session, &source, &pfs).unwrap()).unwrap(), expected);
+        let mut cache = time_index::VerifiedCache::default();
+        cache.insert("part0".into(), Arc::clone(&readers[0]));
+        *session.time_indexes.write() = cache.complete(["part0", "part1"]);
+        assert!(session.exact_time_indexes().is_none());
+        assert_eq!(count_session(&session, &source, &[]).unwrap(), 9);
+    }
+
+    #[test]
+    fn changed_time_capability_falls_back_and_releases_only_its_stale_readers() {
+        use fs2::FileExt;
+        let (_dir, session, paths, readers) = fixture();
+        let index = index(); let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let expected = serde_json::to_value(stats_session(&session, &source, &[]).unwrap()).unwrap();
+        *session.time_indexes.write() = Some(readers);
+        std::fs::OpenOptions::new().write(true).open(time_index::path(&paths[0])).unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3)).unwrap();
+        assert_eq!(count_session(&session, &source, &[]).unwrap(), 9);
+        assert!(session.exact_time_indexes().is_none());
+        assert_eq!(serde_json::to_value(stats_session(&session, &source, &[]).unwrap()).unwrap(), expected);
+        let lock = std::fs::OpenOptions::new().read(true).write(true).open(paths[0].with_extension("time.lock")).unwrap();
+        FileExt::try_lock_exclusive(&lock).unwrap();
+    }
+
+    #[test]
+    fn requested_timeline_uses_complete_capability_and_declines_stale_sets() {
+        let (_dir, session, paths, readers) = fixture();
+        assert!(timeline_session(&session, -100, 101, 51, 4).unwrap().is_none());
+        *session.time_indexes.write() = Some(readers);
+        session.conn().unwrap().execute_batch("DROP TABLE ev").unwrap();
+        let result = timeline_session(&session, -100, 101, 51, 4).unwrap().unwrap();
+        assert_eq!((result.total, result.errors, result.warnings), (6, 2, 0));
+        assert_eq!(result.buckets.iter().map(|b| b.count).collect::<Vec<_>>(), vec![1, 1, 2, 2]);
+        std::fs::OpenOptions::new().write(true).open(time_index::path(&paths[0])).unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3)).unwrap();
+        assert!(timeline_session(&session, -100, 101, 51, 4).unwrap().is_none());
+        assert!(session.exact_time_indexes().is_none());
+    }
+
+    #[test]
+    fn grouped_timeline_sql_matches_bounded_canonical_fallback() {
+        use crate::grouped_timeline::{Accumulator, Context, Grid, Spec};
+        let (_dir, mut session, _paths, _readers) = fixture();
+        let index = index(); let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        session.schema.fields.insert("group".into(), "grouping".into());
+        session.schema.lower.insert("group".into(), vec!["group".into()]);
+        session.conn().unwrap().execute_batch("ALTER TABLE ev ADD COLUMN grouping VARCHAR").unwrap();
+        let times = [Some(5),Some(-100),None,Some(0),Some(5),Some(101),Some(-1),Some(101),None];
+        let keys = [Some("".to_string()),Some(" ".to_string()),None,Some("ignored".into()),Some("a".into()),Some("a".into()),Some("null".into()),Some("x".repeat(400)),Some("untimed".into())];
+        let mut events = Vec::new();
+        for (id, (timestamp, key)) in times.into_iter().zip(keys).enumerate() {
+            session.conn().unwrap().execute("UPDATE ev SET grouping=? WHERE id=?", duckdb::params![key.as_deref(),id as i64]).unwrap();
+            let mut event = Event::empty(); event.id=id;event.timestamp=timestamp;event.source=if id<4{"api"}else{"auth"}.into();
+            if let Some(key)=key { event.fields.insert("group".into(),Value::String(key)); }
+            events.push(event);
+        }
+        for field in ["group","GROUP","origem","absent"] {
+            for filters in [vec![],vec![crate::query::Filter{column:"source".into(),op:"equals_exact".into(),value:"auth".into(),value2:None}]] {
+                let pfs=prepared(&filters);
+                for grid in [Grid{start:-100,bucket_ms:51,bucket_count:4},Grid{start:0,bucket_ms:1,bucket_count:6},Grid{start:0,bucket_ms:0,bucket_count:0}] {
+                    let spec=Spec::new(field.into(),grid,Some(2),Context::default()).unwrap();
+                    let mut expected=Accumulator::new(&spec).unwrap();
+                    for event in &events { if pfs.iter().all(|filter|crate::query::matches_indexed(event,filter)) { expected.add_indexed_event(event).unwrap(); } }
+                    assert_eq!(grouped_timeline_session(&session,&source,&pfs,&spec).unwrap().unwrap(),expected.finish().unwrap(),"{field} {grid:?}");
+                }
+            }
+        }
+        session.schema.structured.insert("nested".into());
+        let spec=Spec::new("nested.name".into(),Grid{start:0,bucket_ms:10,bucket_count:1},None,Context::default()).unwrap();
+        assert!(grouped_timeline_session(&session,&source,&[],&spec).unwrap().is_none());
+    }
+
+    #[test]
+    fn grouped_timeline_limits_and_cancellation_are_errors_not_fallback() {
+        use crate::grouped_timeline::{Context, Grid, Spec};
+        let (_dir, session, _paths, _readers) = fixture();
+        let index = index(); let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let spec=Spec::new("source".into(),Grid{start:-100,bucket_ms:51,bucket_count:4},None,Context::default()).unwrap();
+        let limited=crate::resources::with_analytics_limit(128,||grouped_timeline_session(&session,&source,&[],&spec));
+        assert!(limited.unwrap_err().contains("LOGINSIGHT_ANALYTICS_LIMIT_MB"));
+        let token=crate::operations::token(Some("grouped-timeline-cancel".into())).unwrap();
+        let result=crate::operations::run_with_token(token,||{
+            crate::operations::cancel_id("grouped-timeline-cancel");
+            assert!(grouped_timeline_session(&session,&source,&[],&spec).unwrap_err().contains("cancelad"));
+        });
+        assert!(result.unwrap_err().contains("cancelad"));
+    }
+
+    #[test]
+    fn time_capability_cancellation_propagates_without_sql_fallback() {
+        let (_dir, session, _paths, readers) = fixture();
+        let index = index(); let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        *session.time_indexes.write() = Some(readers);
+        let token = crate::operations::token(Some("time-routing-cancel".into())).unwrap();
+        let result = crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("time-routing-cancel");
+            assert!(count_session(&session, &source, &[]).unwrap_err().contains("cancelad"));
+            assert!(stats_session(&session, &source, &[]).err().unwrap().contains("cancelad"));
+            assert!(timeline_session(&session, -100, 100, 20, 11).unwrap_err().contains("cancelad"));
+        });
+        assert!(result.unwrap_err().contains("cancelad"));
+        assert!(session.exact_time_indexes().is_some());
+    }
+}
+
+// ------------------------------------------------------- grouped timeline
+
+fn grouped_timeline_session(session: &Session, src: &Source, pfs: &[PreparedFilter], spec: &crate::grouped_timeline::Spec) -> Result<Option<crate::grouped_timeline::Response>> {
+    use crate::grouped_timeline::{Response, Series};
+    spec.validate()?;
+    let mut budget = crate::query::AnalyticsBudget::new();
+    budget.charge(spec.base_bytes())?;
+    let mut names = false;
+    let Some(key) = session.schema.grouped_field(&crate::querylang::field_ref(&spec.field), &mut names) else { return Ok(None); };
+    let scope = scope(session, src, pfs)?;
+    let projection = format!("SELECT {key} AS k, NULLIF(ts, 0) AS t FROM {} WHERE {}", scope.from(names), scope.cond);
+    let start = spec.grid.start;
+    let end = spec.grid.end();
+    let inside = format!("t IS NOT NULL AND t::HUGEINT >= ({start})::HUGEINT AND t::HUGEINT < ({end})::HUGEINT");
+    let mut result = Response::empty(spec)?;
+    let mut expected = Vec::new();
+    if spec.grid.bucket_count > 0 {
+        stream_rows(session, &format!("SELECT k, count(*)::BIGINT AS n FROM ({projection}) WHERE ({inside}) AND k IS NOT NULL GROUP BY k ORDER BY n DESC, k ASC LIMIT {}", spec.limit), |row| {
+            let key: String = row.get(0)?;
+            budget.charge(spec.key_bytes(&key))?;
+            expected.push(usize::try_from(row.get::<i64>(1)?).map_err(err)?);
+            result.series.push(Series { key, count: 0, buckets: vec![0; spec.grid.bucket_count] });
+            Ok(())
+        })?;
+    }
+    let mut group = String::from("CASE WHEN t IS NULL THEN -3 WHEN NOT (");
+    group.push_str(&inside); group.push_str(") THEN -4 WHEN k IS NULL THEN -1");
+    for (index, series) in result.series.iter().enumerate() {
+        group.push_str(&format!(" WHEN k = {} THEN {index}", lit(&series.key)));
+    }
+    group.push_str(" ELSE -2 END");
+    // BIGINT subtraction can overflow before division. HUGEINT matches the
+    // exact i128 half-open grid, including a final edge beyond i64::MAX.
+    let bucket = if spec.grid.bucket_count == 0 { "0::BIGINT".into() } else {
+        format!("CASE WHEN ({inside}) THEN ((t::HUGEINT - ({start})::HUGEINT) // {})::BIGINT ELSE 0::BIGINT END", spec.grid.bucket_ms)
+    };
+    let histogram = format!("SELECT g::BIGINT, b::BIGINT, count(*)::BIGINT FROM (SELECT {group} AS g, {bucket} AS b FROM ({projection})) GROUP BY g,b");
+    stream_rows(session, &histogram, |row| {
+        let group: i64 = row.get(0)?;
+        let count = usize::try_from(row.get::<i64>(2)?).map_err(err)?;
+        match group {
+            -3 => result.untimed = result.untimed.checked_add(count).ok_or("Contagem temporal excedeu o limite.")?,
+            -4 => result.outside_grid = result.outside_grid.checked_add(count).ok_or("Contagem temporal excedeu o limite.")?,
+            group => {
+                let bucket = usize::try_from(row.get::<i64>(1)?).map_err(err)?;
+                match group {
+                    -1 => result.missing.add(bucket, count)?,
+                    -2 => result.other.add(bucket, count)?,
+                    index => {
+                        let series = usize::try_from(index).ok().and_then(|i|result.series.get_mut(i)).ok_or("Série temporal fora da seleção.")?;
+                        let value = series.buckets.get_mut(bucket).ok_or("Faixa temporal fora da grade.")?;
+                        *value = value.checked_add(count).ok_or("Contagem temporal excedeu o limite.")?;
+                        series.count = series.count.checked_add(count).ok_or("Contagem temporal excedeu o limite.")?;
+                    }
+                }
+                result.total.add(bucket, count)?;
+            }
+        }
+        Ok(())
+    })?;
+    if result.series.iter().zip(expected).any(|(series,count)|series.count!=count) {
+        return Err("A seleção temporal mudou durante o agrupamento.".into());
+    }
+    Ok(Some(result))
+}
+
+/// Fast path only when the engine proves the same canonical grouping key.
+/// Unsupported fields fall back; budget, spill and cancellation failures do not.
+pub(crate) fn grouped_timeline(src: &Source, pfs: &[PreparedFilter], spec: &crate::grouped_timeline::Spec) -> Result<Option<crate::grouped_timeline::Response>> {
+    Ok(analytics_with(src, base_page_safe(pfs, &spec.field), |session| grouped_timeline_session(session, src, pfs, spec))?.flatten())
 }
 
 // ---------------------------------------------------------------- groups
@@ -1348,6 +2306,7 @@ fn page_fingerprint(src: &Source, pfs: &[PreparedFilter], sort_column: &str, sor
     let filters: Vec<_> = pfs.iter().map(|pf| &pf.f).collect();
     let mut hash = Sha256::new();
     hash.update(source_key);
+    hash.update(crate::analysis_runtime::cache_namespace());
     hash.update(super::catalogs_signature(src.codes, src.system));
     hash.update(serde_json::to_vec(&(filters, sort_column, sort_dir)).map_err(err)?);
     Ok(format!("{:x}", hash.finalize()))
@@ -1387,29 +2346,28 @@ fn page_statement(scope: &Scope, sort: &[SortKey], names: bool, seek: &PageSeek,
 /// A required top-level equality bounds the entire conjunction. Only a
 /// complete, canonically verified empty/singleton set may bypass page SQL;
 /// free-text OR/NOT terms never establish this proof.
-fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Option<crate::query::QueryPage>> {
+fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Option<crate::query::SelectedPage>> {
     // Planner invariant: hex_fields contains required top-level equals_exact
     // clauses only. OR/NOT query-expression terms must never enter this list.
     if !pfs.iter().any(|pf| pf.f.op == "equals_exact" && super::text::exact_field_hex_word(&pf.f.value).is_some()) {
         return Ok(None);
     }
+    let gate = crate::analysis_runtime::indexed_gate(src.idx)?;
     let plan = session.schema.plan(pfs);
     for term in &plan.tests.hex_fields {
         let Some(selected) = exact_hex_selection(session, src, term)? else { continue; };
         if !selected.known_empty && selected.single_id.is_none() { continue; }
-        let mut rows = Vec::new();
-        if let Some(id) = selected.single_id {
+        let mut ids = Vec::new();
+        if let Some(id) = selected.single_id.filter(|&id| gate.as_ref().is_none_or(|gate| gate.allows_known_row(id))) {
             crate::operations::check()?;
-            let mut event = src.event(id);
-            if pfs.iter().all(|pf| crate::query::matches(&event, pf)) {
-                crate::entities::annotate(&mut event);
-                event.raw.clear();
-                rows.push(event);
+            let event = src.event(id);
+            if pfs.iter().all(|pf| crate::query::matches_indexed(&event, pf)) {
+                ids.push(id);
             }
         }
         crate::operations::check()?;
-        return Ok(Some(crate::query::QueryPage {
-            total: Some(rows.len()), rows, has_more: false, next_cursor: None,
+        return Ok(Some(crate::query::SelectedPage {
+            total: Some(ids.len()), ids, has_more: false, next_cursor: None,
             engine: "columnar".into(), warning: None,
         }));
     }
@@ -1427,6 +2385,32 @@ pub(crate) fn query_page(
     limit: usize,
     cursor: Option<&str>,
 ) -> Option<Result<crate::query::QueryPage>> {
+    select_page(src, pfs, sort_column, sort_dir, offset, limit, cursor).map(|result| {
+        let selected = result?;
+        let rows = page_rows(src, selected.ids.clone())?;
+        crate::operations::check()?;
+        Ok(selected.into_full(rows))
+    })
+}
+
+pub(crate) fn query_projected_page(
+    src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str,
+    offset: usize, cursor: Option<&str>, plan: &crate::page_projection::ProjectionPlan,
+) -> Option<Result<crate::page_projection::ProjectedPage>> {
+    select_page(src, pfs, sort_column, sort_dir, offset, plan.limit, cursor).map(|result| {
+        let selected = result?;
+        let items = selected.ids.iter().map(|&id| crate::page_projection::project_indexed_row(
+            src.idx, id, src.codes, src.system, src.derived, plan,
+        )).collect::<Result<Vec<_>>>()?;
+        crate::operations::check()?;
+        plan.finish(selected, items)
+    })
+}
+
+fn select_page(
+    src: &Source, pfs: &[PreparedFilter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize, cursor: Option<&str>,
+) -> Option<Result<crate::query::SelectedPage>> {
     for part in &src.idx.parts {
         if let Err(error) = crate::sources::validate_source(part) { return Some(Err(error)); }
     }
@@ -1466,7 +2450,7 @@ pub(crate) fn query_page(
                 crate::operations::check()?;
                 if !exact {
                     let event = src.event(candidate.0);
-                    if !pfs.iter().all(|pf| crate::query::matches(&event, pf)) { continue; }
+                    if !pfs.iter().all(|pf| crate::query::matches_indexed(&event, pf)) { continue; }
                 }
                 if skip_matches > 0 { skip_matches -= 1; continue; }
                 found.push(candidate);
@@ -1483,13 +2467,13 @@ pub(crate) fn query_page(
         let next_cursor = if has_more {
             found.last().map(|(_, keys)| serde_json::to_string(&PageCursor { version: 1, fingerprint, position: position.saturating_add(found.len()), keys: keys.clone() }).map_err(err)).transpose()?
         } else { None };
-        let total = if pfs.is_empty() { Some(src.idx.lines.len()) }
+        let total = if pfs.is_empty() { Some(crate::analysis_runtime::visible_total(src.idx)?) }
             else if !has_more && (position == 0 || !found.is_empty()) { Some(position.saturating_add(found.len())) }
             else { None };
-        let rows = page_rows(src, found.into_iter().map(|(id, _)| id).collect());
+        let ids = found.into_iter().map(|(id, _)| id).collect();
         crate::operations::check()?;
-        Ok(crate::query::QueryPage {
-            rows, total, has_more, next_cursor, engine: "columnar".into(),
+        Ok(crate::query::SelectedPage {
+            ids, total, has_more, next_cursor, engine: "columnar".into(),
             warning: (!exact).then(|| "Este filtro exige confirmação nos registros; consultas amplas podem demorar mais.".into()),
         })
     })())
@@ -1581,15 +2565,120 @@ fn page_ids(scope: &Scope, sort_column: &str, sort_dir: &str, offset: usize, lim
 }
 
 /// Rows of a page, read in parallel (pages of trails reach thousands).
-fn page_rows(src: &Source, ids: Vec<usize>) -> Vec<Event> {
+fn page_rows(src: &Source, ids: Vec<usize>) -> Result<Vec<Event>> {
+    let binding = crate::analysis_runtime::source_set(src.idx)?;
     ids.into_par_iter()
         .map(|i| {
             let mut event = src.event(i);
+            crate::analysis_runtime::attach_provenance_with(src.idx, &binding, &mut event)?;
             crate::entities::annotate(&mut event);
-            event.raw.clear();
-            event
+            // A page excludes raw text. Clearing it would keep the entire input
+            // allocation alive alongside fields until response serialization.
+            event.raw = String::new();
+            Ok(event)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod page_payload_tests {
+    use super::*;
+
+    #[test]
+    fn projected_columnar_pages_share_exact_cursor_and_singleton_selection() {
+        struct Restore(Option<std::ffi::OsString>, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 { Some(value) => std::env::set_var("LOGINSIGHT_ENGINE_DIR", value), None => std::env::remove_var("LOGINSIGHT_ENGINE_DIR") }
+                crate::engine::set_enabled(self.1);
+            }
+        }
+        let _restore = Restore(std::env::var_os("LOGINSIGHT_ENGINE_DIR"), super::super::enabled());
+        let directory = tempfile::tempdir().unwrap();
+        std::env::set_var("LOGINSIGHT_ENGINE_DIR", directory.path().join("engine"));
+        crate::engine::set_enabled(true);
+        let path = directory.path().join("projected-pages.jsonl");
+        let records: Vec<_> = (0..6).map(|i| serde_json::json!({
+            "message": format!("record {i}"), "timestamp": ([Some("1969-12-31T23:59:59.999Z"), None, Some("1970-01-01T00:00:00Z")][i % 3]),
+            "request_id": format!("{i:032x}"), "body": "日".repeat(24_000),
+        }).to_string()).collect();
+        std::fs::write(&path, records.join("\n")).unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let config = CodesConfig::default();
+        crate::engine::prepare(&index, &config, &config, &[], &|_, _| {}).unwrap();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let plan = crate::page_projection::ProjectionPlan::new(crate::page_projection::ProjectionRequest {
+            projection_version: 1, columns: vec!["timestamp".into(), "body".into()], cell_bytes: None, response_bytes: None,
+        }, 2, crate::page_projection::Receipt {
+            analysis_context: crate::analysis_context::Identity { case_id: "test".into(), analysis_id: "analysis".into(), config_revision: 1, visibility_revision: 0 },
+            source_generation: Some(1), case_key: None,
+            case_content_token: None,
+            catalog_signature: crate::engine::catalog_content_signature(&CodesConfig::default(), &CodesConfig::default()),
+            catalog_epoch: crate::engine::catalog_token(&CodesConfig::default(), &CodesConfig::default()).epoch,
+        }).unwrap();
+        for pfs in [Vec::new(), crate::query::prepare(&[crate::query::Filter { column: "request_id".into(), op: "equals_exact".into(), value: format!("{:032x}", 3), value2: None }])] {
+            for direction in ["asc", "desc"] {
+                let mut cursor: Option<String> = None;
+                let mut offset = 0;
+                loop {
+                    let full = query_page(&source, &pfs, "timestamp", direction, offset, 2, cursor.as_deref()).unwrap().unwrap();
+                    let projected = query_projected_page(&source, &pfs, "timestamp", direction, offset, cursor.as_deref(), &plan).unwrap().unwrap();
+                    assert_eq!(projected.items.iter().map(|r| r.row.id).collect::<Vec<_>>(), full.rows.iter().map(|e| e.id).collect::<Vec<_>>());
+                    assert_eq!(projected.total, full.total);
+                    assert_eq!(projected.has_more, full.has_more);
+                    assert_eq!(projected.next_cursor, full.next_cursor);
+                    assert_eq!(projected.warning, full.warning);
+                    if !full.has_more { break; }
+                    offset += full.rows.len();
+                    cursor = full.next_cursor;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hydrated_page_releases_raw_capacity_and_preserves_full_evidence_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wide-page.jsonl");
+        let body = "日".repeat(24_000);
+        let raw = serde_json::to_string(&serde_json::json!({
+            "message":"request", "payload":body, "encoded":"日", "code":200
+        })).unwrap();
+        std::fs::write(&path, format!("{raw}\n")).unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let config = CodesConfig::default();
+        // Legacy regex overlays may replace a field while retaining its exact
+        // original. Typed transform pipelines deliberately reject that collision.
+        let derived = vec![CompiledDerived {
+            name:"payload".into(), source:"encoded".into(),
+            rules:vec![crate::sources::CompiledRule {
+                re:regex::Regex::new("^(.*)$").unwrap(), template:None, filter:None,
+            }], steps:Vec::new(), lookup:None,
+        }];
+        let source = Source { idx:&index, codes:&config, system:&config, derived:&derived };
+        let original = source.event(0);
+        assert!(original.raw.capacity() >= body.len());
+        let rows = page_rows(&source, vec![0]).unwrap();
+        assert_eq!(rows.len(), 1);
+        let event = &rows[0];
+        assert!(event.raw.is_empty());
+        assert_eq!(event.raw.capacity(), 0, "raw must not retain the source record buffer");
+        assert_eq!(event.fields["payload"], Value::from("日"));
+        assert!(matches!(event.derived_originals.get("payload"), Some(crate::model::DerivedOriginal::Present(Value::String(value))) if value == &body));
+        assert_eq!(serde_json::to_value(&event.derived_originals).unwrap(), serde_json::to_value(&original.derived_originals).unwrap());
+        assert_eq!(event.event_ref, original.event_ref);
+        assert!(event.evidence_provenance.is_some());
+        let mut expected = original;
+        crate::analysis_runtime::attach_provenance(&index, &mut expected).unwrap();
+        crate::entities::annotate(&mut expected);
+        expected.raw.clear();
+        assert_eq!(serde_json::to_value(event).unwrap(), serde_json::to_value(expected).unwrap());
+        let recovery = crate::query::query_page_lines(&index, &[], "id", "asc", 0, 1, &config, &config, &derived).unwrap();
+        assert_eq!(recovery.rows.len(), 1);
+        assert_eq!(recovery.rows[0].raw.capacity(), 0);
+        assert_eq!(serde_json::to_value(&recovery.rows[0]).unwrap(), serde_json::to_value(event).unwrap());
+        assert_eq!(source.event(0).raw, raw, "page hydration must not mutate original detail/evidence data");
+    }
 }
 
 pub(crate) fn query(
@@ -1605,7 +2694,7 @@ pub(crate) fn query(
         let (total, ids) = page_ids(&scope, sort_column, sort_dir, offset, limit)?;
         Ok(QueryResult {
             total,
-            rows: page_rows(src, ids),
+            rows: page_rows(src, ids)?,
         })
     })
 }
@@ -1629,7 +2718,7 @@ pub(crate) fn explore(
         Ok(ExplorerSnapshot {
             query: QueryResult {
                 total,
-                rows: page_rows(src, ids),
+                rows: page_rows(src, ids)?,
             },
             stats,
             sources,
@@ -1645,31 +2734,38 @@ pub(crate) fn series(src: &Source, pfs: &[PreparedFilter], spec: &SeriesSpec) ->
     analytics_with(src, false, |session| series_of(&scope(session, src, pfs)?, spec))
 }
 
-/// Metric columns shared by terms and time charts: count, distinct values,
-/// numeric sum (file order), valid count, min, max and incompatible units.
-fn metric_columns(value: Option<&str>, expected: Option<UnitKind>) -> (String, String) {
+/// Only the requested metric, its admitted sample count and unit warnings cross
+/// the engine boundary. Avoid DISTINCT state and ordered sums for other metrics.
+/// The first numeric column is a sum for avg; division stays in Rust to preserve
+/// the existing arithmetic and the file-order sum used by the line engine.
+fn metric_columns(value: Option<&str>, expected: Option<UnitKind>, metric: &str) -> (String, String) {
+    if metric == "count" {
+        return ("NULL::DOUBLE AS num".into(), "count(*), count(*), 0::BIGINT".into());
+    }
     let Some(value) = value else {
+        return ("NULL::DOUBLE AS num".into(), "NULL::DOUBLE, 0::BIGINT, 0::BIGINT".into());
+    };
+    if metric == "distinct" {
         return (
-            "NULL AS v, NULL::DOUBLE AS num, NULL::INTEGER AS u".into(),
-            "count(*), 0, 0, NULL::DOUBLE, 0, NULL::DOUBLE, NULL::DOUBLE, 0".into(),
+            format!("{value} AS v"),
+            "count(DISTINCT CASE WHEN v <> '' THEN v END), count(*) FILTER (WHERE v <> ''), 0::BIGINT".into(),
         );
-    };
-    let ok = match expected {
-        Some(unit) => format!("num IS NOT NULL AND u = {}", unit as i32),
-        None => "num IS NOT NULL".into(),
-    };
-    let bad = match expected {
-        Some(unit) => format!("num IS NOT NULL AND u <> {}", unit as i32),
-        None => "FALSE".into(),
-    };
-    (
-        format!("{value} AS v, li_num({value}) AS num, li_unit({value}) AS u"),
-        format!(
-            "count(*), count(DISTINCT CASE WHEN v <> '' THEN v END), count(*) FILTER (WHERE v <> ''), \
-             sum(CASE WHEN {ok} THEN num END ORDER BY id), count(*) FILTER (WHERE {ok}), \
-             min(CASE WHEN {ok} THEN num END), max(CASE WHEN {ok} THEN num END), count(*) FILTER (WHERE {bad})"
+    }
+    let (inner, ok, incompatible) = match expected {
+        Some(unit) => (
+            format!("li_num({value}) AS num, li_unit({value}) AS u"),
+            format!("num IS NOT NULL AND u = {}", unit as i32),
+            format!("count(*) FILTER (WHERE num IS NOT NULL AND u <> {})", unit as i32),
         ),
-    )
+        None => (format!("li_num({value}) AS num"), "num IS NOT NULL".into(), "0::BIGINT".into()),
+    };
+    let numeric = match metric {
+        "sum" | "avg" => format!("sum(CASE WHEN {ok} THEN num END ORDER BY id)"),
+        "min" => format!("min(CASE WHEN {ok} THEN num END)"),
+        "max" => format!("max(CASE WHEN {ok} THEN num END)"),
+        _ => "NULL::DOUBLE".into(),
+    };
+    (inner, format!("{numeric}, count(*) FILTER (WHERE {ok}), {incompatible}"))
 }
 
 struct Metric {
@@ -1678,38 +2774,198 @@ struct Metric {
     incompatible: usize,
 }
 
-/// Reads the eight metric columns starting at `at` (see [`metric_columns`]).
-fn metric_at(row: &duckdb::Row<'_>, at: usize, metric: &str, field: bool) -> duckdb::Result<Metric> {
-    let count = row.get::<_, i64>(at)? as usize;
-    let distinct = row.get::<_, i64>(at + 1)? as usize;
-    let nonempty = row.get::<_, i64>(at + 2)? as usize;
-    let sum = row.get::<_, Option<f64>>(at + 3)?.unwrap_or(0.0);
-    let valid = row.get::<_, i64>(at + 4)? as usize;
-    let min = row.get::<_, Option<f64>>(at + 5)?;
-    let max = row.get::<_, Option<f64>>(at + 6)?;
-    let incompatible = row.get::<_, i64>(at + 7)? as usize;
-    Ok(match (metric, field) {
-        ("count", _) => Metric { value: count as f64, n: count, incompatible: 0 },
-        (_, false) => Metric { value: 0.0, n: 0, incompatible: 0 },
-        ("distinct", true) => Metric { value: distinct as f64, n: nonempty, incompatible: 0 },
-        (metric, true) => Metric {
-            value: match metric {
-                "sum" => sum,
-                "avg" => {
-                    if valid == 0 {
-                        0.0
-                    } else {
-                        sum / valid as f64
-                    }
+/// Reads value (or avg's ordered sum), admitted samples and incompatible units.
+fn metric_at(row: &StreamRow<'_>, at: usize, metric: &str) -> Result<Metric> {
+    let n = row.get::<i64>(at + 1)? as usize;
+    let incompatible = row.get::<i64>(at + 2)? as usize;
+    let value = match metric {
+        "count" | "distinct" => row.get::<Option<i64>>(at)?.unwrap_or(0) as usize as f64,
+        _ => row.get::<Option<f64>>(at)?.unwrap_or(0.0),
+    };
+    let value = if metric == "avg" {
+        if n == 0 { 0.0 } else { value / n as f64 }
+    } else { value };
+    Ok(Metric { value, n, incompatible })
+}
+
+/// The heap root is the worst retained group. Rank tuples use the existing
+/// Rust ordering, which SQL collation/NULL/float ordering cannot substitute.
+/// Account live keys plus one candidate, releasing evicted keys immediately;
+/// DuckDB's grouping state and Arrow fetch chunks are outside this retention budget.
+struct SeriesTopK<T: Ord> {
+    heap: BinaryHeap<(T, usize)>,
+    limit: usize,
+    key_bytes: usize,
+    base_bytes: usize,
+    byte_limit: usize,
+}
+
+impl<T: Ord> SeriesTopK<T> {
+    fn new(limit: usize) -> Result<Self> {
+        let base_bytes = limit.saturating_add(1).saturating_mul(std::mem::size_of::<(T, usize)>());
+        let byte_limit = crate::resources::analytics_bytes();
+        Self::check_bytes(base_bytes, byte_limit)?;
+        Ok(Self { heap: BinaryHeap::with_capacity(limit), limit, key_bytes: 0, base_bytes, byte_limit })
+    }
+
+    fn push(&mut self, rank: T, bytes: usize) -> Result<()> {
+        Self::check_bytes(self.base_bytes.saturating_add(self.key_bytes).saturating_add(bytes), self.byte_limit)?;
+        if self.limit == 0 { return Ok(()); }
+        if self.heap.len() == self.limit {
+            if rank >= self.heap.peek().expect("nonempty top groups").0 { return Ok(()); }
+            let (_, removed) = self.heap.pop().expect("nonempty top groups");
+            self.key_bytes -= removed;
+        }
+        self.key_bytes += bytes;
+        self.heap.push((rank, bytes));
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<T> {
+        self.heap.into_sorted_vec().into_iter().map(|(rank, _)| rank).collect()
+    }
+
+    fn check_bytes(bytes: usize, limit: usize) -> Result<()> {
+        if bytes > limit {
+            Err("O resultado analítico excedeu o orçamento de valores (LOGINSIGHT_ANALYTICS_LIMIT_MB). Restrinja os filtros ou reduza os agrupamentos.".into())
+        } else { Ok(()) }
+    }
+}
+
+/// Descending total float order, including NaN payloads and signed zero.
+#[derive(Clone, Copy, Debug)]
+struct SeriesMetricRank(f64);
+impl PartialEq for SeriesMetricRank {
+    fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() }
+}
+impl Eq for SeriesMetricRank {}
+impl PartialOrd for SeriesMetricRank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for SeriesMetricRank {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { other.0.total_cmp(&self.0) }
+}
+
+/// Own each label once and fill the final numeric buffers by stable series ID.
+/// Label storage is independent of bucket count; empty buckets start at zero.
+fn time_series_buffers(names: Vec<String>, buckets: usize) -> Vec<SeriesData> {
+    names.into_iter().map(|name| SeriesData {
+        name,
+        samples: vec![0; buckets],
+        points: vec![0.0; buckets],
+    }).collect()
+}
+
+#[cfg(test)]
+mod series_retention_tests {
+    use super::*;
+
+    #[test]
+    fn time_bucket_label_storage_is_independent_of_bucket_count() {
+        let buckets = 2001;
+        let names: Vec<_> = (0..6).map(|i| format!("{i}{}", "x".repeat((64 << 10) - 1))).collect();
+        let pointers: Vec<_> = names.iter().map(|s| s.as_ptr()).collect();
+        let label_bytes = names.iter().map(String::capacity).sum::<usize>();
+        let series = time_series_buffers(names, buckets);
+        assert_eq!(series.iter().map(|s| s.name.as_ptr()).collect::<Vec<_>>(), pointers,
+            "transfer the selected strings without cloning their allocation");
+        assert_eq!(series.iter().map(|s| s.name.capacity()).sum::<usize>(), label_bytes);
+        assert!(series.iter().all(|s| s.points.len() == buckets && s.samples.len() == buckets));
+        let numeric_bytes = series.iter().map(|s| s.points.capacity() * std::mem::size_of::<f64>()
+            + s.samples.capacity() * std::mem::size_of::<usize>()).sum::<usize>();
+        let old_repeated_key_bytes = label_bytes * buckets;
+        assert!(old_repeated_key_bytes > (label_bytes + numeric_bytes) * 1000,
+            "structural allocation comparison only, not a measured RSS claim");
+    }
+
+    #[test]
+    fn count_terms_keep_json_key_ties_in_every_input_order() {
+        let keys = [None, Some(""), Some("\n"), Some("\""), Some("\\"), Some("a"), Some("é"), Some("日"), Some("null")];
+        let original: Vec<_> = keys.into_iter().enumerate().map(|(i, key)| {
+            let key = key.map(str::to_string);
+            (serde_json::to_string(&key).unwrap(), key, i % 3)
+        }).collect();
+        for limit in [0, 1, 3, 10, 500] {
+            let mut expected = original.clone();
+            expected.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            expected.truncate(limit);
+            for offset in 0..original.len() {
+                let mut selected = SeriesTopK::new(limit).unwrap();
+                for (serialized, key, n) in original.iter().cycle().skip(offset).take(original.len()) {
+                    let bytes = serialized.capacity() + key.as_ref().map_or(0, String::capacity);
+                    selected.push((Reverse(*n), serialized.clone(), key.clone()), bytes).unwrap();
                 }
-                "min" => min.unwrap_or(0.0),
-                "max" => max.unwrap_or(0.0),
-                _ => 0.0,
-            },
-            n: valid,
-            incompatible,
-        },
-    })
+                let found: Vec<_> = selected.finish().into_iter().map(|(Reverse(n), serialized, key)| (serialized, key, n)).collect();
+                assert_eq!(found, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn metric_terms_keep_total_float_and_optional_key_ties() {
+        let values = [f64::NEG_INFINITY, -1.0, -0.0, 0.0, 1.0, f64::INFINITY,
+            f64::from_bits(0x7ff8000000000000), f64::from_bits(0x7ff8000000000001), f64::from_bits(0xfff8000000000000)];
+        let original: Vec<_> = values.into_iter().flat_map(|value| [None, Some("".into()), Some("a".into()), Some("日".into())]
+            .into_iter().map(move |key| (key, value, 3usize))).collect();
+        for limit in [0, 1, 7, 500] {
+            let mut expected = original.clone();
+            expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            expected.truncate(limit);
+            for backwards in [false, true] {
+                let mut input = original.clone();
+                if backwards { input.reverse(); }
+                let mut selected = SeriesTopK::new(limit).unwrap();
+                for (key, value, n) in input {
+                    let bytes = key.as_ref().map_or(0, String::capacity);
+                    selected.push((SeriesMetricRank(value), key, n), bytes).unwrap();
+                }
+                let found: Vec<_> = selected.finish().into_iter().map(|(SeriesMetricRank(value), key, n)| (key, value.to_bits(), n)).collect();
+                let expected: Vec<_> = expected.iter().map(|(key, value, n)| (key.clone(), value.to_bits(), *n)).collect();
+                assert_eq!(found, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn split_names_keep_raw_string_ties() {
+        let mut original: Vec<_> = ["\n", "\"", "\\", "a", "b", "c", "d", "é", "日"]
+            .into_iter().map(|key| (key.to_string(), 1i64)).collect();
+        original.push(("popular".into(), 5));
+        let mut selected = SeriesTopK::new(6).unwrap();
+        for (key, n) in original.iter().rev() {
+            selected.push((Reverse(*n), key.clone()), key.capacity()).unwrap();
+        }
+        original.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        original.truncate(6);
+        assert_eq!(selected.finish().into_iter().map(|(Reverse(n), key)| (key, n)).collect::<Vec<_>>(), original);
+    }
+
+    #[test]
+    fn retained_bytes_are_released_on_eviction_and_discard() {
+        crate::resources::with_analytics_limit(4096, || {
+            let mut selected = SeriesTopK::new(6).unwrap();
+            for i in 0..10_000usize {
+                let key = format!("{i:05}{}", "x".repeat(200));
+                let bytes = key.capacity();
+                selected.push((Reverse(i), key), bytes).unwrap();
+                assert!(selected.heap.len() <= 6);
+                assert_eq!(selected.key_bytes, selected.heap.iter().map(|(_, bytes)| bytes).sum::<usize>());
+                assert!(selected.base_bytes + selected.key_bytes <= 4096);
+            }
+            assert_eq!(selected.finish().iter().map(|(Reverse(n), _)| *n).collect::<Vec<_>>(), (9994..10_000).rev().collect::<Vec<_>>());
+        });
+    }
+
+    #[test]
+    fn candidate_bytes_are_checked_even_when_it_would_be_discarded() {
+        crate::resources::with_analytics_limit(1024, || {
+            let mut selected = SeriesTopK::new(1).unwrap();
+            selected.push((Reverse(2), "best".to_string()), 4).unwrap();
+            let key = "x".repeat(1024);
+            assert!(selected.push((Reverse(1), key), 1024).unwrap_err().contains("LOGINSIGHT_ANALYTICS_LIMIT_MB"));
+            assert_eq!(selected.finish(), vec![(Reverse(2), "best".to_string())]);
+        });
+    }
 }
 
 fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
@@ -1720,30 +2976,32 @@ fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
         let key_column = field.unwrap_or("level");
         let (key, time) = key_of(scope, key_column, false, &mut names)?;
         let from = scope.from(names);
-        let mut counted = Vec::new();
-        for (key, n) in rows(
+        let mut counted = SeriesTopK::new(limit)?;
+        stream_rows(
             scope.session,
             &format!("SELECT k, count(*) FROM (SELECT {key} AS k FROM {from} WHERE {}) GROUP BY k", scope.cond),
-            |r| Ok((key_text(r, 0, time)?, r.get::<_, i64>(1)? as usize)),
-        )? {
-            let key = key?;
-            counted.push((serde_json::to_string(&key).map_err(err)?, key, n));
-        }
-        counted.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-        counted.truncate(limit);
+            |r| {
+                let key = stream_key(&r, 0, time)?;
+                let n = r.get::<i64>(1)? as usize;
+                let serialized = serde_json::to_string(&key).map_err(err)?;
+                let bytes = serialized.capacity().saturating_add(key.as_ref().map_or(0, String::capacity));
+                counted.push((Reverse(n), serialized, key), bytes)
+            },
+        )?;
+        let counted = counted.finish();
         return Ok(SeriesResult {
             kind: "terms".into(),
             unit: "number".into(),
             interval_ms: 0,
             x: counted
                 .iter()
-                .map(|(_, value, _)| Value::from(value.clone().unwrap_or_else(|| "(vazio)".into())))
+                .map(|(_, _, value)| Value::from(value.clone().unwrap_or_else(|| "(vazio)".into())))
                 .collect(),
-            x_values: counted.iter().map(|(_, value, _)| value.clone()).collect(),
+            x_values: counted.iter().map(|(_, _, value)| value.clone()).collect(),
             series: vec![SeriesData {
                 name: key_column.into(),
-                samples: counted.iter().map(|(_, _, n)| *n).collect(),
-                points: counted.iter().map(|(_, _, n)| *n as f64).collect(),
+                samples: counted.iter().map(|(Reverse(n), _, _)| *n).collect(),
+                points: counted.iter().map(|(Reverse(n), _, _)| *n as f64).collect(),
             }],
             incompatible_units: 0,
         });
@@ -1780,58 +3038,66 @@ fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
         Some(column) => {
             let split = text_of(scope, column, false, &mut names)?;
             let from = scope.from(names);
-            let mut counted = rows(
+            let mut counted = SeriesTopK::new(6)?;
+            stream_rows(
                 scope.session,
                 &format!(
                     "SELECT s, count(*) FROM (SELECT {split} AS s FROM {from} WHERE {}) WHERE s <> '' GROUP BY s",
                     scope.cond
                 ),
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                |r| {
+                    let key = r.get::<String>(0)?;
+                    let bytes = key.capacity();
+                    counted.push((Reverse(r.get::<i64>(1)?), key), bytes)
+                },
             )?;
-            counted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            counted.into_iter().take(6).map(|(s, _)| s).collect()
+            counted.finish().into_iter().map(|(_, key)| key).collect()
         }
         None => Vec::new(),
     };
-    let split_names: Vec<String> = if splits.is_empty() {
+    let has_splits = !splits.is_empty();
+    let split_names: Vec<String> = if !has_splits {
         vec![spec.field.clone().unwrap_or_else(|| "eventos".into())]
     } else {
-        splits.clone()
+        splits
     };
-    let (metric_inner, metric_outer) = metric_columns(value.as_deref(), expected);
+    let (metric_inner, metric_outer) = metric_columns(value.as_deref(), expected, &spec.metric);
 
     if spec.chart == "terms" {
         let key_column = spec.field.clone().unwrap_or_else(|| "level".into());
         let (key, time) = key_of(scope, &key_column, false, &mut names)?;
         let from = scope.from(names);
-        let mut items = Vec::new();
+        let mut items = SeriesTopK::new(limit)?;
         let mut incompatible = 0;
-        for (key, metric) in rows(
+        stream_rows(
             scope.session,
             &format!(
                 "SELECT k, {metric_outer} FROM (SELECT id, {key} AS k, {metric_inner} FROM {from} WHERE {}) GROUP BY k",
                 scope.cond
             ),
-            |r| Ok((key_text(r, 0, time)?, metric_at(r, 1, &spec.metric, field.is_some())?)),
-        )? {
-            incompatible += metric.incompatible;
-            items.push((key?, metric.value, metric.n));
-        }
-        items.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        items.truncate(limit);
+            |r| {
+                let key = stream_key(&r, 0, time)?;
+                let metric = metric_at(&r, 1, &spec.metric)?;
+                // Unit warnings cover all groups, including those below Top N.
+                incompatible += metric.incompatible;
+                let bytes = key.as_ref().map_or(0, String::capacity);
+                items.push((SeriesMetricRank(metric.value), key, metric.n), bytes)
+            },
+        )?;
+        let items = items.finish();
         return Ok(SeriesResult {
             kind: "terms".into(),
             unit,
             interval_ms: 0,
             x: items
                 .iter()
-                .map(|(k, _, _)| Value::from(k.clone().unwrap_or_else(|| "(vazio)".into())))
+                .map(|(_, k, _)| Value::from(k.clone().unwrap_or_else(|| "(vazio)".into())))
                 .collect(),
-            x_values: items.iter().map(|(key, _, _)| key.clone()).collect(),
+            x_values: items.iter().map(|(_, key, _)| key.clone()).collect(),
             series: vec![SeriesData {
                 name: split_names[0].clone(),
                 samples: items.iter().map(|(_, _, n)| *n).collect(),
-                points: items.into_iter().map(|(_, v, _)| v).collect(),
+                points: items.into_iter().map(|(SeriesMetricRank(value), _, _)| value).collect(),
             }],
             incompatible_units: incompatible,
         });
@@ -1854,43 +3120,44 @@ fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
         });
     };
     let (interval, n_buckets) = crate::analysis::series_interval(spec, tmin, tmax);
-    let (name_sql, keep) = match &spec.split {
-        Some(column) => {
+    let series_sql = match &spec.split {
+        Some(column) if has_splits => {
             let split = text_of(scope, column, false, &mut names)?;
-            let list = splits.iter().map(|s| lit(s)).collect::<Vec<_>>().join(", ");
-            let keep = if splits.is_empty() {
-                "FALSE".to_string()
-            } else {
-                format!("COALESCE({split}, '') IN ({list})")
-            };
-            (format!("COALESCE({split}, '')"), keep)
+            let mut cases = format!("CASE COALESCE({split}, '')");
+            for (index, name) in split_names.iter().enumerate() {
+                cases.push_str(&format!(" WHEN {} THEN {index}", lit(name)));
+            }
+            cases.push_str(" ELSE -1 END");
+            cases
         }
-        None => (lit(&split_names[0]), "TRUE".to_string()),
+        Some(_) => "-1".into(),
+        None => "0".into(),
     };
     let from = scope.from(names);
-    let mut accs: Vec<HashMap<String, Metric>> = (0..n_buckets).map(|_| HashMap::new()).collect();
+    let mut series = time_series_buffers(split_names, n_buckets);
     let mut incompatible = 0;
-    for (b, name, metric) in rows(
+    stream_rows(
         scope.session,
         &format!(
-            "SELECT b, name, {metric_outer} FROM (SELECT id, (ts - ({tmin})) // {interval} AS b, {name_sql} AS name, \
-             {metric_inner} FROM {from} WHERE ({}) AND ts IS NOT NULL AND {keep}) GROUP BY b, name",
+            "SELECT b, series_id, {metric_outer} FROM (SELECT id, (ts - ({tmin})) // {interval} AS b, {series_sql} AS series_id, \
+             {metric_inner} FROM {from} WHERE ({}) AND ts IS NOT NULL) WHERE series_id >= 0 GROUP BY b, series_id",
             scope.cond
         ),
         |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                metric_at(r, 2, &spec.metric, field.is_some())?,
-            ))
+            let b = r.get::<i64>(0)?;
+            let series_id = r.get::<i64>(1)?;
+            let metric = metric_at(&r, 2, &spec.metric)?;
+            if b < 0 || b as usize >= n_buckets { return Ok(()); }
+            incompatible += metric.incompatible;
+            if let Ok(index) = usize::try_from(series_id) {
+                if let Some(series) = series.get_mut(index) {
+                    series.samples[b as usize] = metric.n;
+                    series.points[b as usize] = metric.value;
+                }
+            }
+            Ok(())
         },
-    )? {
-        if b < 0 || b as usize >= n_buckets {
-            continue;
-        }
-        incompatible += metric.incompatible;
-        accs[b as usize].insert(name, metric);
-    }
+    )?;
     Ok(SeriesResult {
         kind: "time".into(),
         unit,
@@ -1899,14 +3166,7 @@ fn series_of(scope: &Scope, spec: &SeriesSpec) -> Result<SeriesResult> {
             .map(|b| Value::from(tmin.saturating_add((b as i64).saturating_mul(interval))))
             .collect(),
         x_values: vec![],
-        series: split_names
-            .iter()
-            .map(|name| SeriesData {
-                name: name.clone(),
-                samples: accs.iter().map(|m| m.get(name).map(|a| a.n).unwrap_or(0)).collect(),
-                points: accs.iter().map(|m| m.get(name).map(|a| a.value).unwrap_or(0.0)).collect(),
-            })
-            .collect(),
+        series,
         incompatible_units: incompatible,
     })
 }
@@ -2038,21 +3298,16 @@ fn latency_of(scope: &Scope, from: &str) -> Result<crate::insights::LatencySampl
         .map(|(_, e)| format!("li_nkey({e}) IS NOT NULL"))
         .collect::<Vec<_>>()
         .join(" OR ");
-    let conn = scope.session.conn()?;
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {columns} FROM {from} WHERE ({}) AND ({any}) ORDER BY id",
-            scope.cond
-        ))
-        .map_err(err)?;
-    let mut rows = stmt.query([]).map_err(err)?;
+    let sql = format!("SELECT {columns} FROM {from} WHERE ({}) AND ({any}) ORDER BY id", scope.cond);
     let mut values: Vec<Option<String>> = vec![None; present.len()];
-    while let Some(row) = rows.next().map_err(err)? {
+    stream_rows(scope.session, &sql, |row| {
+        crate::operations::check()?;
         for (i, slot) in values.iter_mut().enumerate() {
-            *slot = row.get(i).map_err(err)?;
+            *slot = row.get(i)?;
         }
         sample.push(|k| present.iter().position(|(f, _)| *f == k).and_then(|i| values[i].clone()));
-    }
+        Ok(())
+    })?;
     Ok(sample)
 }
 
@@ -2160,6 +3415,24 @@ fn light_events<T>(
     columns: &[String],
     consume: impl FnOnce(&mut dyn Iterator<Item = Event>) -> T,
 ) -> Result<T> {
+    light_events_bounded(
+        scope,
+        columns,
+        8192,
+        crate::resources::batch_bytes(),
+        &LightStreamWork::default(),
+        consume,
+    )
+}
+
+fn light_events_bounded<T>(
+    scope: &Scope,
+    columns: &[String],
+    batch_rows: usize,
+    batch_bytes: usize,
+    work: &LightStreamWork,
+    consume: impl FnOnce(&mut dyn Iterator<Item = Event>) -> T,
+) -> Result<T> {
     let mut names = false;
     let mut select = vec!["id".to_string(), "ts".to_string()];
     let mut slots = Vec::new();
@@ -2196,24 +3469,30 @@ fn light_events<T>(
         scope.from(names),
         scope.cond
     );
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<Event>(8192);
-    std::thread::scope(|threads| {
-        let producer = threads.spawn(move || -> Result<()> {
-            let conn = scope.session.conn()?;
-            let mut stmt = conn.prepare(&sql).map_err(err)?;
-            let mut rows = stmt.query([]).map_err(err)?;
-            while let Some(row) = rows.next().map_err(err)? {
+    transfer_events(
+        batch_rows,
+        batch_bytes,
+        work,
+        |send| {
+            stream_rows(scope.session, &sql, |row| {
+                crate::operations::check()?;
                 let mut ev = Event::empty();
-                ev.id = row.get::<_, i64>(0).map_err(err)? as usize;
-                ev.timestamp = row.get(1).map_err(err)?;
+                ev.id = row.get::<i64>(0)? as usize;
+                ev.timestamp = row.get(1)?;
                 let mut column = 2;
                 for slot in &slots {
                     if matches!(slot, Slot::Timestamp | Slot::Id) {
                         continue;
                     }
-                    let value: Option<String> = row.get(column).map_err(err)?;
+                    let value: Option<String> = row.get(column)?;
                     column += 1;
-                    let text = value.clone().unwrap_or_default();
+                    if let Slot::Field(name) = slot {
+                        if let Some(value) = value {
+                            ev.fields.insert(name.clone(), Value::String(value));
+                        }
+                        continue;
+                    }
+                    let text = value.unwrap_or_default();
                     match slot {
                         Slot::Source => ev.source = text,
                         Slot::Level => ev.level = text,
@@ -2222,25 +3501,314 @@ fn light_events<T>(
                         Slot::Name => ev.name = text,
                         Slot::Description => ev.description = text,
                         Slot::EventRef => ev.event_ref = text,
-                        Slot::Field(name) => {
-                            if let Some(value) = value {
-                                ev.fields.insert(name.clone(), Value::String(value));
-                            }
-                        }
-                        Slot::Timestamp | Slot::Id => {}
+                        Slot::Timestamp | Slot::Id | Slot::Field(_) => {}
                     }
                 }
-                if sender.send(ev).is_err() {
-                    break;
+                let size = crate::query::event_payload_bytes(&ev);
+                send(ev, size)
+            })
+        },
+        consume,
+    )
+}
+
+/// Byte-bounded transfer used by the light-event SQL reader. This helper is
+/// independent of DuckDB so its lifetime/backpressure rules can be tested
+/// without an application-wide build.
+#[derive(Default)]
+struct LightStreamWork {
+    rows: std::sync::atomic::AtomicUsize,
+    max_batch_rows: std::sync::atomic::AtomicUsize,
+    max_batch_bytes: std::sync::atomic::AtomicUsize,
+}
+impl LightStreamWork {
+    fn batch(&self, rows: usize, bytes: usize) {
+        self.rows.fetch_add(rows, Ordering::Relaxed);
+        self.max_batch_rows.fetch_max(rows, Ordering::Relaxed);
+        self.max_batch_bytes.fetch_max(bytes, Ordering::Relaxed);
+    }
+}
+
+/// One queued batch, one consumer batch and one producer batch. The event
+/// which triggers a byte-boundary flush may also be live. As with the source
+/// visitor, one oversized event travels alone; values are never truncated.
+fn transfer_events<E: Send, T>(
+    batch_rows: usize,
+    batch_bytes: usize,
+    work: &LightStreamWork,
+    produce: impl FnOnce(&mut dyn FnMut(E, usize) -> Result<()>) -> Result<()> + Send,
+    consume: impl FnOnce(&mut dyn Iterator<Item = E>) -> T,
+) -> Result<T> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<E>>(1);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    // Direct library callers may have no outer operation. Give the child a
+    // generation too, so the SQL interrupt watcher observes its private stop.
+    let token = if crate::operations::current_generation().is_none()
+        && crate::operations::current_id().is_none()
+    {
+        crate::operations::run(
+            crate::operations::generation(),
+            crate::operations::current_token,
+        )?
+    } else {
+        crate::operations::current_token()
+    }
+    .with_stop(Arc::clone(&stop));
+    struct StopProducer(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopProducer {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    std::thread::scope(|threads| {
+        let producer = std::thread::Builder::new()
+            .name("loginsight-pivot-stream".into())
+            .spawn_scoped(threads, move || -> Result<()> {
+                let result = crate::operations::run_with_token(token, || {
+                    let mut batch = Vec::new();
+                    let mut bytes = 0usize;
+                    produce(&mut |event, size| {
+                        crate::operations::check()?;
+                        if !batch.is_empty()
+                            && (batch.len() >= batch_rows.max(1)
+                                || bytes.saturating_add(size) > batch_bytes)
+                        {
+                            work.batch(batch.len(), bytes);
+                            if sender.send(std::mem::take(&mut batch)).is_err() {
+                                worker_stop.store(true, Ordering::Relaxed);
+                                return Err("Operação cancelada.".into());
+                            }
+                            bytes = 0;
+                        }
+                        bytes = bytes.saturating_add(size);
+                        batch.push(event);
+                        Ok(())
+                    })?;
+                    if !batch.is_empty() {
+                        work.batch(batch.len(), bytes);
+                        let _ = sender.send(batch);
+                    }
+                    Ok(())
+                })
+                .and_then(|result| result);
+                // Decide while the sender is still owned here. A real fetch error
+                // precedes channel EOF and is retained; an intentional early drop
+                // interrupts only this child and does not fail the parent query.
+                if worker_stop.load(Ordering::Relaxed) {
+                    Ok(())
+                } else {
+                    result
                 }
-            }
-            Ok(())
-        });
-        let result = consume(&mut receiver.iter());
-        drop(receiver);
+            })
+            .map_err(|error| error.to_string())?;
+        let mut events = receiver.into_iter().flatten();
+        let stop_guard = StopProducer(stop);
+        let result = consume(&mut events);
+        drop(stop_guard);
+        drop(events);
         producer
             .join()
             .map_err(|_| "Falha ao ler o motor de consultas.".to_string())??;
+        crate::operations::check()?;
         Ok(result)
     })
+}
+
+#[cfg(test)]
+mod light_transfer_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn light_transfer_preserves_order_with_row_and_byte_bounds() {
+        let work = LightStreamWork::default();
+        let found = transfer_events(
+            7,
+            512,
+            &work,
+            |send| {
+                for id in 0..137 {
+                    let value = vec![id as u8; 128 + id % 5];
+                    let bytes = value.len();
+                    send((id, value), bytes)?;
+                }
+                Ok(())
+            },
+            |events| {
+                events
+                    .map(|(id, value)| {
+                        assert_eq!(value, vec![id as u8; 128 + id % 5]);
+                        id
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .unwrap();
+        assert_eq!(found, (0..137).collect::<Vec<_>>());
+        assert_eq!(work.rows.load(Ordering::Relaxed), 137);
+        assert!(work.max_batch_rows.load(Ordering::Relaxed) <= 7);
+        assert!(work.max_batch_bytes.load(Ordering::Relaxed) <= 512);
+    }
+
+    #[test]
+    fn light_transfer_keeps_one_oversized_value_intact_in_its_own_batch() {
+        let work = LightStreamWork::default();
+        let found = transfer_events(
+            8,
+            128,
+            &work,
+            |send| {
+                for size in [10, 2048, 10] {
+                    send(vec![42u8; size], size)?;
+                }
+                Ok(())
+            },
+            |events| {
+                events
+                    .map(|value| {
+                        assert!(value.iter().all(|byte| *byte == 42));
+                        value.len()
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .unwrap();
+        assert_eq!(found, vec![10, 2048, 10]);
+        assert_eq!(work.max_batch_rows.load(Ordering::Relaxed), 1);
+        assert_eq!(work.max_batch_bytes.load(Ordering::Relaxed), 2048);
+    }
+
+    #[test]
+    fn light_transfer_early_drop_bounds_production_without_cancelling_parent() {
+        let work = LightStreamWork::default();
+        let produced = AtomicUsize::new(0);
+        let token = crate::operations::token(None).unwrap();
+        let parent = token.clone();
+        let found = crate::operations::run_with_token(token, || {
+            transfer_events(
+                4,
+                128,
+                &work,
+                |send| {
+                    for id in 0..10_000 {
+                        produced.fetch_add(1, Ordering::Relaxed);
+                        send(id, 8)?;
+                    }
+                    Ok(())
+                },
+                |events| events.take(1).collect::<Vec<_>>(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(found, vec![0]);
+        assert!(
+            produced.load(Ordering::Relaxed) <= 13,
+            "at most three batches and the boundary event"
+        );
+        assert!(work.rows.load(Ordering::Relaxed) <= 12);
+        assert!(!parent.cancelled());
+    }
+
+    #[test]
+    fn light_transfer_propagates_producer_failure_instead_of_partial_success() {
+        let work = LightStreamWork::default();
+        let seen = AtomicUsize::new(0);
+        let error = transfer_events(
+            2,
+            128,
+            &work,
+            |send| {
+                for id in 0..20 {
+                    send(id, 8)?;
+                }
+                Err("late reader failure".into())
+            },
+            |events| {
+                events.for_each(|_| {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("late reader failure"));
+        assert!(seen.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            transfer_events(
+                1,
+                128,
+                &work,
+                |send| send(42, 8),
+                |events| events.collect::<Vec<_>>()
+            )
+            .unwrap(),
+            vec![42]
+        );
+    }
+
+    #[test]
+    fn light_transfer_inherits_named_cancellation_and_progress_identity() {
+        let id = format!("light-transfer-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let unrelated = crate::operations::token(None).unwrap();
+        let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Arc::clone(&progress);
+        let reporter: crate::operations::Reporter =
+            Arc::new(move |event| capture.lock().unwrap().push(event));
+        let work = LightStreamWork::default();
+        let result = crate::operations::run_with_token(token, || {
+            crate::operations::with_reporter(reporter, || {
+                transfer_events(
+                    2,
+                    128,
+                    &work,
+                    |send| {
+                        crate::operations::progress("pivot-values", "Lendo valores", 0, 0, 0);
+                        for id in 0..1000 {
+                            send(id, 8)?;
+                        }
+                        Ok(())
+                    },
+                    |events| {
+                        assert_eq!(events.next(), Some(0));
+                        assert!(crate::operations::cancel_id(&id));
+                    },
+                )
+            })
+        });
+        assert!(result.is_err());
+        assert!(!unrelated.cancelled());
+        let progress = progress.lock().unwrap();
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].operation_id.as_deref(), Some(id.as_str()));
+        assert_eq!(progress[0].phase_id, "pivot-values");
+    }
+
+    #[test]
+    fn light_transfer_consumer_unwind_stops_the_child_without_hanging() {
+        let token = crate::operations::token(None).unwrap();
+        let parent = token.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::operations::run_with_token(token, || {
+                transfer_events::<usize, ()>(
+                    2,
+                    128,
+                    &LightStreamWork::default(),
+                    |send| {
+                        for id in 0..10_000 {
+                            send(id, 8)?;
+                        }
+                        Ok(())
+                    },
+                    |events| {
+                        assert_eq!(events.next(), Some(0));
+                        panic!("controlled consumer panic");
+                    },
+                )
+            })
+        }));
+        assert!(result.is_err());
+        assert!(!parent.cancelled());
+    }
 }
