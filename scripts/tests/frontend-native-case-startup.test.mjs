@@ -1,3 +1,4 @@
+import { fullPreview, essentialPreview } from '../ci/validation-plan.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import vm from 'node:vm';
@@ -52,5 +53,5 @@ test('queued native reload cannot overwrite a metadata draft authored while the 
 
 test('native startup browser acceptance uses production scripts and services and is selected by both CI smoke lists',()=>{
  const browser=read('scripts/preview/test-native-case-startup.mjs'),mock=read('scripts/preview/mock-tauri.js'),server=read('scripts/preview/serve.mjs'),html=read('frontend/index.html');
- assert.doesNotMatch(browser,/addScriptTag|CaseEvidence\.active\s*=|nativeEvidenceServices\s*=|state\.cases\s*=(?!=)/);assert.match(browser,/__mockNativeCaseBootstrapEnabled=true/);assert.match(mock,/if \(window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled\) window.CaseEvidence.active = false/);assert.match(mock,/Object.assign\(handlers, native.handlers\)/);assert.match(server,/__mock-native-case__\.js/);assert.ok(html.indexOf('src="case-evidence-session.js"')<html.indexOf('src="app.js"'));for(const path of ['scripts/preview/run-smoke.mjs','.github/workflows/checks.yml'])assert.match(read(path),/test-native-case-startup\.mjs/);
+ assert.doesNotMatch(browser,/addScriptTag|CaseEvidence\.active\s*=|nativeEvidenceServices\s*=|state\.cases\s*=(?!=)/);assert.match(browser,/__mockNativeCaseBootstrapEnabled=true/);assert.match(mock,/if \(window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled\) window.CaseEvidence.active = false/);assert.match(mock,/Object.assign\(handlers, native.handlers\)/);assert.match(server,/__mock-native-case__\.js/);assert.ok(html.indexOf('src="case-evidence-session.js"')<html.indexOf('src="app.js"'));for(const list of [fullPreview,essentialPreview])assert.ok(list.includes('test-native-case-startup.mjs'));assert.match(read('scripts/preview/run-smoke.mjs'),/selected.length \? selected : fullPreview/);assert.match(read('.github/workflows/checks.yml'),/node scripts\/ci\/validation-plan\.mjs preview/);
 });
