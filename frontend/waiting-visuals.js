@@ -12,6 +12,7 @@
    phaseIndex is one-based. phaseCount, elapsedMs and estimateMs are optional measured/
    supplied values; estimateMs is remaining time for THIS phase. No value is inferred.
    Long scenes loop only when supplied elapsedMs >= 4000. Short scenes make one gesture.
+   Lock access is always gesture-only: elapsedMs describes the whole operation.
    Reactions are chosen only at CSS cycle boundaries, from supplied elapsed time.
    They never hold results, change receipts or estimate progress. Pauses freeze all tracks.
    An unknown phase/state is static, even if its human label sounds like a known operation.
@@ -21,6 +22,7 @@ window.WaitingVisuals = (() => {
 
   // Exact protocol IDs, not fuzzy matches against localized labels or opaque operation IDs.
   const PHASES = Object.freeze({
+    'metadata-lock': 'access', 'metadata-restore': 'restoration',
     'metadata-scan': 'reading', 'metadata-json-boundaries': 'reading',
     'metadata-columns': 'reading', 'metadata-validate': 'verification',
     'metadata-map-validate': 'verification', 'analytics-time-index': 'reading',
@@ -80,7 +82,7 @@ window.WaitingVisuals = (() => {
     if (elapsedMs !== null) details.push(`${duration(elapsedMs)} decorridos`);
     if (estimateMs !== null && state === 'running' && !partialCheckpoint) details.push(`≈ ${duration(estimateMs)} restantes nesta etapa`);
     return { operationId, phaseId, state, family, canAnimate, partialCheckpoint, label, status,
-      metric, details, elapsedMs, variant: variantFor(operationId, family), motionMode: elapsedMs !== null && elapsedMs >= 4000 ? 'loop' : 'gesture' };
+      metric, details, elapsedMs, variant: variantFor(operationId, family), motionMode: !adapters[family]?.gestureOnly && elapsedMs !== null && elapsedMs >= 4000 ? 'loop' : 'gesture' };
   }
 
   // A shared repertoire with explicit family safe points. Adapters must release
@@ -90,7 +92,10 @@ window.WaitingVisuals = (() => {
     coffee: Object.freeze({ minElapsedMs: 45000, durationMs: 32000, cooldown: 4, weight: 1, long: true }),
     manual: Object.freeze({ minElapsedMs: 60000, durationMs: 32000, cooldown: 5, weight: 1, long: true }),
     review: Object.freeze({ minElapsedMs: 15000, durationMs: 10000, cooldown: 2, weight: 4 }),
-    stretch: Object.freeze({ minElapsedMs: 28000, durationMs: 12000, cooldown: 3, weight: 2 })
+    stretch: Object.freeze({ minElapsedMs: 28000, durationMs: 12000, cooldown: 3, weight: 2 }),
+    // Small empty-hand gestures share every safe adapter, with low selection weight.
+    visor: Object.freeze({ minElapsedMs: 24000, durationMs: 4800, cooldown: 4, weight: 1 }),
+    wave: Object.freeze({ minElapsedMs: 36000, durationMs: 3600, cooldown: 4, weight: 1 })
   });
   const adapters = Object.freeze({
     reading: Object.freeze({ reactions: true, homeX: 0, head: -4, cycleMs: 7200, safePoint: 'filed-sheet-empty-hand' }),
@@ -98,7 +103,10 @@ window.WaitingVisuals = (() => {
     calculation: Object.freeze({ reactions: true, homeX: 26, anchorX: 20, head: 4, cycleMs: 6400, bridgeMs: 1200, safePoint: 'filed-tile-empty-hand' }),
     composition: Object.freeze({ reactions: true, homeX: 24, anchorX: 20, head: 8, cycleMs: 7600, bridgeMs: 3200, safePoint: 'proof-parked-on-existing-bed' }),
     // Empty hand at both endpoints; shares the checkpoint reaction anchor without a bridge.
-    verification: Object.freeze({ reactions: true, homeX: 20, head: 4, cycleMs: 9600, safePoint: 'lens-docked-empty-hand' })
+    verification: Object.freeze({ reactions: true, homeX: 20, head: 4, cycleMs: 9600, safePoint: 'lens-docked-empty-hand' }),
+    // The supplied age belongs to the whole operation, not this short lock wait.
+    access: Object.freeze({ reactions: false, gestureOnly: true, homeX: 20, head: 4, cycleMs: 2400, safePoint: 'empty-hands-closed-terminal' }),
+    restoration: Object.freeze({ reactions: true, homeX: 20, head: 4, cycleMs: 7200, safePoint: 'record-reseated-empty-hand' })
   });
   // Measured decoration age is private. It is never written back to derive(),
   // status/details or the application's operation receipt. A quiet pending promise
@@ -207,6 +215,10 @@ window.WaitingVisuals = (() => {
   // The same lens is either docked or carried by the hand. Its handle passes through
   // the existing palm at (91,55); no independent translation can detach the tool.
   const verifyLens = `<path class="wv-verify-handle" d="m91 55 6.5-5.3"/><circle class="wv-verify-lens" cx="102" cy="46" r="6.3"/><path class="wv-verify-glint" d="M98.2 44.7a4 4 0 0 1 3-2.6"/>`;
+  // An existing index dot is read, never added as a checkmark or completion cue.
+  // The tab is inside the unchanged palm at (91,55); the seated copy is translated
+  // by the actor's x20 only, matching body/arm/hand 0° at both transfers.
+  const restoreRecord = `<path class="wv-task-paper" d="M94 50h17v12H94v-5h-3v-4h3Z"/><circle class="wv-restore-marker" cx="99" cy="55" r="1.4"/><path class="wv-task-detail" d="M104 54h4m-4 4h4"/>`;
   const scenes = Object.freeze({
     // The carried sheet is a child of the forearm/hand, never an independently moving prop.
     // Source/destination transforms match the hand's 18° + 30° − 48° contact pose exactly.
@@ -310,6 +322,25 @@ window.WaitingVisuals = (() => {
         <path class="wv-verify-cradle" d="M113 65v4h14v-4m-7 4v2"/>
       </g>
       <g class="wv-verify-actor" transform="translate(20 0)">${taskRobot(`<g class="wv-verify-held">${verifyLens}</g>`)}</g>`,
+    // A closed local terminal conveys journal contention, never permission/login.
+    access: `<path class="wv-rail" d="M39 83h119m-111-3v3m104-3v3"/>
+      <g class="wv-access-station">
+        <path class="wv-task-machine" d="M120 43h38v31h-38Z"/>
+        <path class="wv-task-inset" d="M124 47h30v17h-30Z"/>
+        <path class="wv-access-slot" d="M129 55h20"/>
+        <path class="wv-task-edge" d="M125 74v7m28-7v7m-26-12h7"/>
+      </g>
+      <g class="wv-access-actor" transform="translate(20 0)">${taskRobot()}</g>`,
+    // Low open archive and a fixed support; no checkpoint drawer or moving press.
+    restoration: `<path class="wv-rail" d="M39 83h122m-114-3v3m108-3v3"/>
+      <g class="wv-restore-station">
+        <path class="wv-task-machine" d="M119 55h39v19h-43V60Z"/>
+        <path class="wv-task-inset" d="M121 51h31v15h-31Z"/>
+        <path class="wv-task-edge" d="M136 54v9m5-9v9m5-9v9m-26 11v7m34-7v7"/>
+        <path class="wv-restore-support" d="M109 58v4h24v-4m-20 4v11"/>
+        <g class="wv-restore-seated" transform="matrix(1 0 0 1 20 0)">${restoreRecord}</g>
+      </g>
+      <g class="wv-restore-actor" transform="translate(20 0)">${taskRobot(`<g class="wv-restore-held">${restoreRecord}</g>`)}</g>`,
     neutral: `<path class="wv-rail" d="M70 83h56"/><g class="wv-idle-actor" transform="translate(29 0)">${taskRobot()}</g>`
   });
 

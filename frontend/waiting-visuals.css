@@ -1428,6 +1428,8 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   86% { transform: rotate(0deg); }
   100% { transform: rotate(0deg); }
 }
+/* Work clocks start with the long prop/hand tracks, never with the preceding
+   finite glance. Retaining a short clock would enter a reaction before release. */
 .waiting-visual[data-animated="true"][data-family="reading"][data-pace="loop"] .wv-work-boundary { animation: wv-work-boundary var(--wv-reader-cycle) linear var(--wv-repeat) both; }
 .waiting-visual[data-animated="true"][data-family="checkpoint"][data-pace="loop"] .wv-work-boundary { animation: wv-work-boundary var(--wv-task-cycle) linear var(--wv-repeat) both; }
 .waiting-visual[data-animated="true"][data-family="calculation"][data-pace="loop"] .wv-work-boundary { animation: wv-work-boundary var(--wv-task-cycle) linear var(--wv-repeat) both; }
@@ -2489,7 +2491,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: translateX(20.000000px); }
   100.00000% { transform: translateX(20.000000px); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-reaction-actor { animation: wv-coffee-travel-checkpoint var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"], [data-family="restoration"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-reaction-actor { animation: wv-coffee-travel-checkpoint var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-leg-front {
   0.00000% { transform: rotate(-56.043deg); }
   6.25000% { transform: rotate(-56.043deg); }
@@ -2562,7 +2564,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-56.043deg); }
   100.00000% { transform: rotate(-56.043deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-leg-front { animation: wv-coffee-checkpoint-leg-front var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"], [data-family="restoration"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-leg-front { animation: wv-coffee-checkpoint-leg-front var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-knee-front {
   0.00000% { transform: rotate(78.6876deg); }
   6.25000% { transform: rotate(78.6876deg); }
@@ -2635,7 +2637,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(78.6876deg); }
   100.00000% { transform: rotate(78.6876deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-knee-front { animation: wv-coffee-checkpoint-knee-front var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"], [data-family="restoration"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-knee-front { animation: wv-coffee-checkpoint-knee-front var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-foot-front {
   0.00000% { transform: rotate(-22.6445deg); }
   6.25000% { transform: rotate(-22.6445deg); }
@@ -2708,7 +2710,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-22.6445deg); }
   100.00000% { transform: rotate(-22.6445deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-foot-front { animation: wv-coffee-checkpoint-foot-front var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"], [data-family="restoration"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-foot-front { animation: wv-coffee-checkpoint-foot-front var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-leg-back {
   0.00000% { transform: rotate(-19.0077deg); }
   6.25000% { transform: rotate(-19.0077deg); }
@@ -2781,7 +2783,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-19.0077deg); }
   100.00000% { transform: rotate(-19.0077deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-leg-back { animation: wv-coffee-checkpoint-leg-back var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"], [data-family="restoration"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-leg-back { animation: wv-coffee-checkpoint-leg-back var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-knee-back {
   0.00000% { transform: rotate(76.5955deg); }
   6.25000% { transform: rotate(76.5955deg); }
@@ -2854,7 +2856,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(76.5955deg); }
   100.00000% { transform: rotate(76.5955deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-knee-back { animation: wv-coffee-checkpoint-knee-back var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"], [data-family="restoration"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-knee-back { animation: wv-coffee-checkpoint-knee-back var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-foot-back {
   0.00000% { transform: rotate(-57.5878deg); }
   6.25000% { transform: rotate(-57.5878deg); }
@@ -2927,7 +2929,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-57.5878deg); }
   100.00000% { transform: rotate(-57.5878deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-foot-back { animation: wv-coffee-checkpoint-foot-back var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"], [data-family="restoration"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-foot-back { animation: wv-coffee-checkpoint-foot-back var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-review-body {
   0.00000% { transform: rotate(0deg); }
   14.00000% { transform: rotate(0deg); }
@@ -4237,3 +4239,293 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   28.12500%, 82.81240% { opacity: 0; }
   82.81250%, 100% { opacity: 1; }
 }
+/* Journal access is a single 2.4s gesture, even with an old operation receipt.
+   The local terminal remains closed. Empty hands and one planted back foot never
+   imply security, network activity, queue position or elapsed-time progress. */
+.waiting-visual:is([data-family="access"], [data-family="restoration"]) {
+  --wv-accent: #d7b579; --wv-task-shell: #242933; --wv-task-paper: #141b25;
+}
+html[data-theme="light"] .waiting-visual:is([data-family="access"], [data-family="restoration"]) {
+  --wv-accent: #79501c; --wv-task-shell: #f3e7d5; --wv-task-paper: #fffdf8;
+}
+.waiting-visual:is([data-family="access"], [data-family="restoration"]) .wv-art {
+  inline-size: min(100%, 240px); block-size: 120px; flex-basis: 120px;
+}
+.waiting-visual .wv-access-slot { stroke-width: 2; }
+.waiting-visual[data-animated="true"] .wv-access-actor .wv-task-head { animation: wv-access-head 2.4s ease-in-out 1 both; }
+.waiting-visual[data-animated="true"] .wv-access-actor .wv-task-gaze { animation: wv-access-gaze 2.4s ease-in-out 1 both; }
+.waiting-visual[data-animated="true"] .wv-access-actor .wv-task-knee-front { animation: wv-access-knee 2.4s ease-in-out 1 both; }
+.waiting-visual[data-animated="true"] .wv-access-actor .wv-task-foot-front { animation: wv-access-foot 2.4s ease-in-out 1 both; }
+@keyframes wv-access-head {
+  0%, 100% { transform: rotate(4deg); }
+  24% { transform: rotate(12deg); }
+  45% { transform: rotate(-5deg); }
+  65% { transform: rotate(8deg); }
+}
+@keyframes wv-access-gaze {
+  0%, 100% { transform: translate(1px, 0); }
+  24%, 45% { transform: translate(2px, 1px); }
+  65% { transform: translate(1px, 3px); }
+}
+@keyframes wv-access-knee {
+  0%, 45%, 88%, 100% { transform: rotate(78.688deg); }
+  65% { transform: rotate(85deg); }
+}
+@keyframes wv-access-foot {
+  0%, 45%, 88%, 100% { transform: rotate(-22.645deg); }
+  65% { transform: rotate(-28.957deg); }
+}
+
+/* Restoration reads an existing marker, then reseats the very same record.
+   The short glance never picks it up. Long playback has stationary contact holds
+   at 14–20% and 78–84%; ownership changes only inside those identical matrices. */
+.waiting-visual[data-family="restoration"] {
+  --wv-restore-cycle: 2.4s;
+  --wv-home-x: 20px; --wv-home-head: 4deg; --wv-home-gaze: 1px;
+}
+.waiting-visual[data-family="restoration"][data-pace="loop"] { --wv-restore-cycle: 7.2s; }
+.waiting-visual .wv-restore-marker { fill: currentColor; stroke-width: .8; }
+.waiting-visual .wv-restore-support { stroke-width: 1.5; }
+.waiting-visual .wv-restore-held { opacity: 0; }
+.waiting-visual .wv-restore-seated { opacity: 1; }
+.waiting-visual[data-animated="true"] .wv-restore-actor .wv-task-head { animation: wv-restore-glance-head var(--wv-restore-cycle) ease-in-out var(--wv-repeat) both; }
+.waiting-visual[data-animated="true"] .wv-restore-actor .wv-task-gaze { animation: wv-restore-glance-gaze var(--wv-restore-cycle) ease-in-out var(--wv-repeat) both; }
+.waiting-visual[data-animated="true"][data-pace="loop"] .wv-restore-actor .wv-task-head { animation-name: wv-restore-head; }
+.waiting-visual[data-animated="true"][data-pace="loop"] .wv-restore-actor .wv-task-gaze { animation-name: wv-restore-gaze; }
+.waiting-visual[data-animated="true"][data-pace="loop"] .wv-restore-actor .wv-task-arm { animation: wv-restore-arm var(--wv-restore-cycle) ease-in-out var(--wv-repeat) both; }
+.waiting-visual[data-animated="true"][data-pace="loop"] .wv-restore-actor .wv-task-hand { animation: wv-restore-hand var(--wv-restore-cycle) ease-in-out var(--wv-repeat) both; }
+.waiting-visual[data-animated="true"][data-pace="loop"] .wv-restore-held { animation: wv-restore-held var(--wv-restore-cycle) steps(1, end) var(--wv-repeat) both; }
+.waiting-visual[data-animated="true"][data-pace="loop"] .wv-restore-seated { animation: wv-restore-seated var(--wv-restore-cycle) steps(1, end) var(--wv-repeat) both; }
+@keyframes wv-restore-glance-head {
+  0%, 100% { transform: rotate(4deg); }
+  30% { transform: rotate(12deg); }
+  65% { transform: rotate(-4deg); }
+}
+@keyframes wv-restore-glance-gaze {
+  0%, 100% { transform: translate(1px, 0); }
+  30%, 65% { transform: translate(2px, 2px); }
+}
+@keyframes wv-restore-head {
+  0%, 6%, 94%, 100% { transform: rotate(4deg); }
+  14%, 20% { transform: rotate(12deg); }
+  30% { transform: rotate(8deg); }
+  42%, 48% { transform: rotate(-6deg); }
+  58%, 64% { transform: rotate(4deg); }
+  78%, 84% { transform: rotate(12deg); }
+}
+@keyframes wv-restore-gaze {
+  0%, 6%, 94%, 100% { transform: translate(1px, 0); }
+  14%, 20%, 30%, 78%, 84% { transform: translate(2px, 2px); }
+  42%, 48% { transform: translate(2px, 0); }
+  58%, 64% { transform: translate(2px, 1px); }
+}
+@keyframes wv-restore-arm {
+  0%, 6%, 94%, 100% { transform: rotate(40deg); }
+  14%, 20%, 78%, 84% { transform: rotate(0deg); }
+  30% { transform: rotate(5deg); }
+  42%, 48% { transform: rotate(0deg); }
+  58%, 64% { transform: rotate(10deg); }
+}
+@keyframes wv-restore-hand {
+  0%, 6%, 94%, 100% { transform: rotate(-85deg); }
+  14%, 20%, 78%, 84% { transform: rotate(0deg); }
+  30% { transform: rotate(-35deg); }
+  42%, 48% { transform: rotate(-85deg); }
+  58%, 64% { transform: rotate(-95deg); }
+}
+@keyframes wv-restore-held {
+  0% { opacity: 0; }
+  17% { opacity: 1; }
+  81%, 100% { opacity: 0; }
+}
+@keyframes wv-restore-seated {
+  0% { opacity: 1; }
+  17% { opacity: 0; }
+  81%, 100% { opacity: 1; }
+}
+/* The short gesture has no boundary clock: starting it only in loop keeps the
+   newly assigned arm/hand/record tracks and their first safe point in phase.
+   Empty-hand endpoint is exactly the existing checkpoint reaction anchor.
+   Reuse its entire walk; no duplicated locomotion tracks or preparation bridge. */
+.waiting-visual[data-animated="true"][data-family="restoration"][data-pace="loop"] .wv-work-boundary { animation: wv-work-boundary var(--wv-restore-cycle) linear var(--wv-repeat) both; }
+.waiting-visual[data-family="restoration"]:not([data-episode="work"]) .wv-work > .wv-restore-actor { visibility: hidden; }
+@media (forced-colors: active) {
+  .waiting-visual:is([data-family="access"], [data-family="restoration"]),
+  html[data-theme="light"] .waiting-visual:is([data-family="access"], [data-family="restoration"]) {
+    --wv-accent: CanvasText; --wv-task-shell: Canvas; --wv-task-paper: Canvas;
+  }
+}
+
+/* Empty-hand micro-reactions stay at anchor0/anchor20. Feet, task station and
+   parked tools never move. The same front palm touches the visor face; no cloth
+   or duplicate limb is created. Angles use the existing two-link arm geometry.
+   Contact sweep: (71.5,36.5) <-> (69,36.5), head neutral from 20% to 72%. */
+.waiting-visual[data-episode="visor"][data-adapter="react"] { --wv-reaction-cycle: 4.8s; }
+.waiting-visual[data-episode="wave"][data-adapter="react"] { --wv-reaction-cycle: 3.6s; }
+@keyframes wv-visor-arm {
+  0% { transform: rotate(40.00000000deg); }
+  10% { transform: rotate(40.00000000deg); }
+  20% { transform: rotate(-18.74740523deg); }
+  30% { transform: rotate(-67.59975394deg); }
+  36% { transform: rotate(-85.19144298deg); }
+  43% { transform: rotate(-95.22136171deg); }
+  48% { transform: rotate(-85.19144298deg); }
+  55% { transform: rotate(-95.22136171deg); }
+  62% { transform: rotate(-85.19144298deg); }
+  72% { transform: rotate(-56.81516974deg); }
+  84% { transform: rotate(-1.78926809deg); }
+  94% { transform: rotate(40.00000000deg); }
+  100% { transform: rotate(40.00000000deg); }
+}
+.waiting-visual[data-animated="true"][data-episode="visor"][data-adapter="react"] .wv-react-arm { animation: wv-visor-arm var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-visor-hand {
+  0% { transform: rotate(-85.00000000deg); }
+  10% { transform: rotate(-85.00000000deg); }
+  20% { transform: rotate(-49.17836827deg); }
+  30% { transform: rotate(-46.04726610deg); }
+  36% { transform: rotate(-36.84394809deg); }
+  43% { transform: rotate(-34.56976721deg); }
+  48% { transform: rotate(-36.84394809deg); }
+  55% { transform: rotate(-34.56976721deg); }
+  62% { transform: rotate(-36.84394809deg); }
+  72% { transform: rotate(-57.95558259deg); }
+  84% { transform: rotate(-46.04726610deg); }
+  94% { transform: rotate(-85.00000000deg); }
+  100% { transform: rotate(-85.00000000deg); }
+}
+.waiting-visual[data-animated="true"][data-episode="visor"][data-adapter="react"] .wv-react-hand { animation: wv-visor-hand var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-wave-arm {
+  0% { transform: rotate(40.00000000deg); }
+  12% { transform: rotate(40.00000000deg); }
+  28% { transform: rotate(-43.44831372deg); }
+  38% { transform: rotate(-59.33760607deg); }
+  66% { transform: rotate(-59.33760607deg); }
+  76% { transform: rotate(-43.44831372deg); }
+  92% { transform: rotate(40.00000000deg); }
+  100% { transform: rotate(40.00000000deg); }
+}
+.waiting-visual[data-animated="true"][data-episode="wave"][data-adapter="react"] .wv-react-arm { animation: wv-wave-arm var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-wave-hand {
+  0% { transform: rotate(-85.00000000deg); }
+  12% { transform: rotate(-85.00000000deg); }
+  28% { transform: rotate(-30.44953699deg); }
+  38% { transform: rotate(-7.75916423deg); }
+  66% { transform: rotate(-7.75916423deg); }
+  76% { transform: rotate(-30.44953699deg); }
+  92% { transform: rotate(-85.00000000deg); }
+  100% { transform: rotate(-85.00000000deg); }
+}
+.waiting-visual[data-animated="true"][data-episode="wave"][data-adapter="react"] .wv-react-hand { animation: wv-wave-hand var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-visor-head {
+  0% { transform: rotate(var(--wv-home-head)); }
+  10% { transform: rotate(0deg); }
+  20% { transform: rotate(0deg); }
+  72% { transform: rotate(0deg); }
+  82% { transform: rotate(5deg); }
+  94% { transform: rotate(var(--wv-home-head)); }
+  100% { transform: rotate(var(--wv-home-head)); }
+}
+.waiting-visual[data-animated="true"][data-episode="visor"][data-adapter="react"] .wv-react-head { animation: wv-visor-head var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-visor-gaze {
+  0% { transform: translateX(var(--wv-home-gaze)); }
+  20% { transform: translateX(2px); }
+  32% { transform: translateX(1px); }
+  62% { transform: translateX(1px); }
+  78% { transform: translateX(0px); }
+  94% { transform: translateX(var(--wv-home-gaze)); }
+  100% { transform: translateX(var(--wv-home-gaze)); }
+}
+.waiting-visual[data-animated="true"][data-episode="visor"][data-adapter="react"] .wv-react-gaze { animation: wv-visor-gaze var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-visor-brow {
+  0% { transform: translateY(0px); }
+  26% { transform: translateY(.6px); }
+  62% { transform: translateY(.6px); }
+  78% { transform: translateY(-.5px); }
+  94% { transform: translateY(0px); }
+  100% { transform: translateY(0px); }
+}
+.waiting-visual[data-animated="true"][data-episode="visor"][data-adapter="react"] .wv-react-brow { animation: wv-visor-brow var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-visor-visor {
+  0% { opacity: 1; }
+  30% { opacity: 1; }
+  36% { opacity: .55; }
+  62% { opacity: .55; }
+  72% { opacity: 1; }
+  100% { opacity: 1; }
+}
+.waiting-visual[data-animated="true"][data-episode="visor"][data-adapter="react"] .wv-react-visor { animation: wv-visor-visor var(--wv-reaction-cycle) ease-in-out 1 both; }
+/* The existing palm and finger mark pivot together at the forearm endpoint.
+   Rotating only those two paths makes this a wrist wave, not a broad arm sweep. */
+.waiting-visual[data-episode="wave"] .wv-react-hand > :is(.wv-react-palm, .wv-react-fingers) { transform-origin: 91px 55px; }
+@keyframes wv-wave-wrist {
+  0%, 32% { transform: rotate(0deg); }
+  40% { transform: rotate(-18deg); }
+  48% { transform: rotate(16deg); }
+  56% { transform: rotate(-14deg); }
+  64% { transform: rotate(10deg); }
+  72%, 100% { transform: rotate(0deg); }
+}
+.waiting-visual[data-animated="true"][data-episode="wave"][data-adapter="react"] .wv-react-hand > :is(.wv-react-palm, .wv-react-fingers) { animation: wv-wave-wrist var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-wave-head {
+  0% { transform: rotate(var(--wv-home-head)); }
+  14% { transform: rotate(-4deg); }
+  32% { transform: rotate(-7deg); }
+  64% { transform: rotate(-7deg); }
+  78% { transform: rotate(-2deg); }
+  92% { transform: rotate(var(--wv-home-head)); }
+  100% { transform: rotate(var(--wv-home-head)); }
+}
+.waiting-visual[data-animated="true"][data-episode="wave"][data-adapter="react"] .wv-react-head { animation: wv-wave-head var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-wave-gaze {
+  0% { transform: translateX(var(--wv-home-gaze)); }
+  20% { transform: translateX(-1px); }
+  68% { transform: translateX(-1px); }
+  92% { transform: translateX(var(--wv-home-gaze)); }
+  100% { transform: translateX(var(--wv-home-gaze)); }
+}
+.waiting-visual[data-animated="true"][data-episode="wave"][data-adapter="react"] .wv-react-gaze { animation: wv-wave-gaze var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-wave-smile {
+  0% { opacity: 0; }
+  20% { opacity: 0; }
+  32% { opacity: .9; }
+  68% { opacity: .9; }
+  82% { opacity: 0; }
+  100% { opacity: 0; }
+}
+.waiting-visual[data-animated="true"][data-episode="wave"][data-adapter="react"] .wv-react-smile { animation: wv-wave-smile var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-wave-visor {
+  0% { opacity: 1; }
+  20% { opacity: 1; }
+  32% { opacity: .15; }
+  68% { opacity: .15; }
+  82% { opacity: 1; }
+  100% { opacity: 1; }
+}
+.waiting-visual[data-animated="true"][data-episode="wave"][data-adapter="react"] .wv-react-visor { animation: wv-wave-visor var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-wave-brow {
+  0% { transform: translateY(0px); }
+  26% { transform: translateY(-.7px); }
+  68% { transform: translateY(-.7px); }
+  92% { transform: translateY(0px); }
+  100% { transform: translateY(0px); }
+}
+.waiting-visual[data-animated="true"][data-episode="wave"][data-adapter="react"] .wv-react-brow { animation: wv-wave-brow var(--wv-reaction-cycle) ease-in-out 1 both; }
+@keyframes wv-visor-head-b {
+  0% { transform: rotate(var(--wv-home-head)); }
+  10% { transform: rotate(0deg); }
+  72% { transform: rotate(0deg); }
+  82% { transform: rotate(-3deg); }
+  94% { transform: rotate(var(--wv-home-head)); }
+  100% { transform: rotate(var(--wv-home-head)); }
+}
+.waiting-visual[data-episode="visor"][data-adapter="react"][data-reaction-variant="b"] .wv-react-head { animation-name: wv-visor-head-b; }
+@keyframes wv-wave-head-b {
+  0% { transform: rotate(var(--wv-home-head)); }
+  14% { transform: rotate(-4deg); }
+  32% { transform: rotate(-3deg); }
+  64% { transform: rotate(-3deg); }
+  78% { transform: rotate(-2deg); }
+  92% { transform: rotate(var(--wv-home-head)); }
+  100% { transform: rotate(var(--wv-home-head)); }
+}
+.waiting-visual[data-episode="wave"][data-adapter="react"][data-reaction-variant="b"] .wv-react-head { animation-name: wv-wave-head-b; }

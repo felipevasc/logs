@@ -1,5 +1,31 @@
 # Experiência desktop da versão 0.11
 
+## Estado atual em 02/10/2026
+
+O [CI68](https://github.com/felipevasc/logs/actions/runs/37009604310), head `75252f37b39afb179aa76304f64002e418d6e921`, concluiu às 13:10:14 UTC com 1.055 testes Node, 32 roteiros de navegador, sanity Node, Windows/Linux e agregado verdes. A prova renderizada de gesto→loop mostrou diferença de 0 ms entre os clocks nas cinco famílias e nas cinco trocas de família, pausa exata e preservação de identidades na troca de fase da mesma família. A correção mantém os keyframes originais, inicia os clocks somente no loop e usa aliases próprios para os gestos curtos que antes reaproveitavam nomes.
+
+O último checkpoint aprovado é o [CI69](https://github.com/felipevasc/logs/actions/runs/37012075252), head `c656c813faad4acd59917f35da32bcf8ddfc2090`: 1.066 testes Node, 33 roteiros de navegador, sanity Node, Windows/Linux e agregado verdes. A prateleira própria do manual foi observada sem elementos do café. A alternância de movimento reduzido preservou identidades, tempos e matrizes das animações, com zero movimento enquanto ativa; também preservou a pausa manual e o fallback inicialmente estático. Esse resultado ainda não aprova os incrementos abaixo. O [Build51](https://github.com/felipevasc/logs/actions/runs/36982867719) aprovou instalação Windows/Linux apenas do checkpoint `81870a5a7cedaf91de722aafd2a71485885b8cc5`, anterior a todas as reações; não valida estes incrementos no WebView instalado.
+
+A consulta ao manual foi tecnicamente validada no [CI67](https://github.com/felipevasc/logs/actions/runs/37006349352): episódios naturais de 32 s em duas famílias. A cenografia seguinte, incluída no CI69, separa cada acessório: portinha, caneca e vapor são exclusivos do café; o livro aparece em uma prateleira temporária própria e permanece associado à mão que o sustenta. Envio de vídeo e aprovação técnica não substituem revisão visual.
+
+### Próximo lote: acesso, retomada, visor e aceno
+
+- `metadata-lock` representa a espera pelo acesso ao journal local. O código nativo já repete a tentativa a cada 100 ms e limita essa espera a aproximadamente cinco segundos. A decoração faz apenas um gesto de 2,4 s, sem loop ou reação, mesmo com idade global recebida de 120 s. Não representa desbloqueio, segurança, posição de fila ou progresso estimado
+- `metadata-restore` retoma registros preservados: gesto breve sem pegar a ficha; em espera longa, ciclo de 7,2 s, retirada a 17% e devolução a 81%. O apoio x20 deixa as mãos livres antes das reações compartilhadas, inclusive manual e microgestos
+- Contagem N/N permanece em andamento. Não substitui validação final ou reconhecimento do proprietário. Nova operação, erro ou término interrompem a decoração imediatamente
+- Visor e aceno são microgestos compartilhados de 4,8 s e 3,6 s, com baixa frequência, seleção em fronteira segura e cooldown. Usam as mãos e articulações existentes, sem acessório extra. Composição estaciona a prova antes da reação e a recupera antes de continuar
+- Pausa, ocultação, saída da área visível e movimento reduzido preservam estado e contagem. Ao alternar reduce em uma cena já animada, os roteiros exigem as mesmas identidades CSSAnimation, zero tracks ativos e poses/tempos congelados. Ao retomar, nada é reiniciado; o gesto de acesso já terminado continua terminado. A montagem inicialmente reduzida permanece estática, sem atribuir animações
+
+O roteiro `test-waiting-restore-access.mjs` grava a passagem curta→longa, acesso ainda curto com idade global alta, visor contextual da retomada e retorno natural a 1×. O roteiro `test-waiting-micro-reactions.mjs` mostra visor/aceno em leitura e composição, incluindo preparação e retorno. Ambos finalizam os WebM antes de abrir outro contexto para diagnóstico e poses. Todos os gates de manual, café, verificação, fronteiras, reduced-motion, relatório e exportação permanecem registrados em fullPreview e no conjunto afetado.
+
+Os vídeos novos são preservados em `preview-recordings-other`, junto do manual. Orçamento inicial: 6 MB para retomada/acesso, 6 MB para microgestos e 5.614.425 bytes observados no manual do CI67, cerca de 17,6 MB combinados; reserva conservadora de 22 MB ao admitir 10 MB para o manual. Cada evidência deve permanecer abaixo de 32 MiB. O vídeo micro tem ainda teto próprio de 30 s/6 MB. Nenhuma evidência é descartada ou transcodificada para cumprir esses limites; os valores finais dependem do CI.
+
+Inventário do componente ampliado: dois arquivos com SVG/CSS inline, `waiting-visuals.js` com 37.963 bytes e `waiting-visuals.css` com 229.457 bytes, total bruto de 267.420 bytes. Não há imagens, fontes ou assets externos adicionais. Os asserts mantêm tetos explícitos de 40 KB JS, 240 KB CSS e 280 KB total; isso mede tamanho de fonte, não consumo de CPU/GPU. Os cinco SVG anteriores, cenografia do manual/café e todos os 183 keyframes da base são preservados.
+
+Este lote ainda requer execução do navegador no CI e revisão visual. A cobertura das 22 superfícies permanece um plano por jornadas, não uma declaração de conclusão integral. Não há medição nova de CPU/GPU, fluidez instalada ou desempenho em corpus grande. Nenhuma release decorre desses checkpoints.
+
+As seções seguintes preservam decisões e resultados históricos. Referências antigas a duas famílias, portinha persistente ou próximos passos não descrevem o estado atual acima.
+
 ## Direção
 
 Refinar a organização atual, que o usuário quer preservar, com aparência escura, futurista e compacta de aplicativo desktop. A referência de interação é o Windows Explorer: clique, arraste e menu de contexto; capacidades acessíveis sem expor todos os controles permanentemente. O ganho de espaço vem da hierarquia e da redução de repetição, sem diminuir indiscriminadamente texto, zoom ou alvos.
@@ -8,7 +34,7 @@ Nas esperas, a animação é o foco visual, acompanhada de uma ação curta e co
 
 Desenvolvimento autorizado em 02/10/2026. A release 0.11 requer autorização própria. Base inicial local `97e5ad388f2b96111e12933cbc2de3eb14c7939e`, árvore `458245af9c48ba4d62c6a5a5aec2bbf0f38807b0`, equivalente ao candidato remoto 0.10 `675d7798c561535ab0fa7d4c55727db59781b7ba`. A 0.10 foi integrada à main em `4399c7777d76097bd13e72fac92dd7723e301fab`, com a mesma árvore, e publicada; o checkpoint remoto da 0.11 parte dessa main sem duplicar seu histórico.
 
-## Estado verificado em 02/10, 05:40 UTC
+## Histórico: estado verificado em 02/10, 05:40 UTC
 
 O checkpoint `e885d674` passou no [CI58](https://github.com/felipevasc/logs/actions/runs/36968667789): 863 testes Node, 23 roteiros reais de navegador, um roteiro auxiliar Node e os gates nativos Linux/Windows. As capturas são do aplicativo com transporte e dados sintéticos identificados. Não comprovam o WebView instalado, ampliação nativa a 200%, atualização instalada ou desempenho em um corpus grande.
 

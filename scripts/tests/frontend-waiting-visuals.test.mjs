@@ -353,8 +353,8 @@ test('short inspection and long story have separate pacing and close without a j
   assert.match(css, /\[data-animated="true"\]\[data-pace="loop"\] \.wv-reader \{ animation: wv-reader-travel/);
   assert.doesNotMatch(css, /\[data-animated="true"\] \.wv-reader \{ animation:/, 'short gesture never walks');
   const sourceBytes = Buffer.byteLength(source), cssBytes = Buffer.byteLength(css);
-  assert.ok(sourceBytes < 36000 && cssBytes < 215000 && sourceBytes + cssBytes < 250000,
-    'five families plus shared CSS-only stories stay under a bounded 250 KB source budget, with no external assets');
+  assert.ok(sourceBytes < 40000 && cssBytes < 240000 && sourceBytes + cssBytes < 280000,
+    'seven families plus shared CSS-only stories stay under a bounded 280 KB total / 40 KB JS / 240 KB CSS source budget, with no external assets');
 });
 
 test('two walking steps plant one foot while the other lifts, then return to the same stance', () => {
@@ -633,7 +633,7 @@ function reactionBoundary(f, visual, type = 'animationiteration', overrides = {}
 
 function coffeeFixture() {
   const f = fixture();
-  const visual = f.api.mount(f.host, receipt({ elapsedMs: 60000 }), { reactionSeed: 53 });
+  const visual = f.api.mount(f.host, receipt({ elapsedMs: 60000 }), { reactionSeed: 17 });
   f.observers[0].deliver(true); reactionBoundary(f, visual);
   assert.equal(visual.element.dataset.episode, 'coffee');
   return { f, visual };
@@ -651,7 +651,7 @@ test('repertoire is seeded, gated by real elapsed time, visibly varied and anti-
     return events;
   };
   const events = run('same'); assert.deepEqual(events, run('same')); assert.notDeepEqual(events, run('different'));
-  assert.deepEqual([...new Set(events.map(event => event.episode))].sort(), ['coffee', 'manual', 'review', 'stretch']);
+  assert.deepEqual([...new Set(events.map(event => event.episode))].sort(), ['coffee', 'manual', 'review', 'stretch', 'visor', 'wave']);
   assert.deepEqual([...new Set(events.map(event => event.variant))].sort(), ['a', 'b']);
   for (let index = 1; index < events.length; index++) {
     assert.notEqual(events[index].episode, events[index - 1].episode);
@@ -816,7 +816,7 @@ test('a monotonic measured decoration clock extrapolates only private eligibilit
 test('quiet operations qualify at a real boundary without receipts, timers, synthetic metrics or live announcements', () => {
   let now = 0;
   const f = fixture({ now: () => now });
-  const visual = f.api.mount(f.host, receipt({ elapsedMs: 4000 }), { reactionSeed: 4, showDetails: true });
+  const visual = f.api.mount(f.host, receipt({ elapsedMs: 4000 }), { reactionSeed: 47, showDetails: true });
   const { status, metric, details, art } = f.parts(visual), announced = status.writes;
   f.observers[0].deliver(true);
   now = 42000;
@@ -839,7 +839,7 @@ function adapterBoundary(f, visual, stage = visual.element.dataset.adapter, over
 }
 function adaptedCoffeeFixture(phaseId) {
   const f = fixture();
-  const visual = f.api.mount(f.host, receipt({ phaseId, elapsedMs: 60000 }), { reactionSeed: 53 });
+  const visual = f.api.mount(f.host, receipt({ phaseId, elapsedMs: 60000 }), { reactionSeed: 17 });
   f.observers[0].deliver(true); reactionBoundary(f, visual);
   assert.equal(visual.element.dataset.episode, 'coffee'); assert.equal(visual.element.dataset.adapter, 'prepare');
   return { f, visual };
@@ -850,7 +850,7 @@ test('calculation has an empty hand only at the completed long loop and reuses t
   assert.equal(api.adapters.calculation.homeX, 26); assert.equal(api.adapters.calculation.anchorX, 20);
   assert.equal(atContact('wv-group-held', 100, 'opacity'), '0');
   assert.equal(atContact('wv-sort-held', 100, 'opacity'), '1');
-  const director = api.createDirector('load-17', 53);
+  const director = api.createDirector('load-17', 17);
   assert.equal(director.boundary(api.derive(receipt({ phaseId: 'analytics-sql', elapsedMs: 3999 }))), null);
   assert.equal(director.boundary(api.derive(receipt({ phaseId: 'analytics-sql', elapsedMs: 60000 }))).episode, 'coffee');
   const { f, visual } = adaptedCoffeeFixture('analytics-sql'), art = f.parts(visual).art;
@@ -859,7 +859,7 @@ test('calculation has an empty hand only at the completed long loop and reuses t
   assert.equal(visual.inspect().cooldown, 0, 'cooldown begins only after returning to the task anchor');
   adapterBoundary(f, visual); assert.equal(visual.element.dataset.adapter, 'work'); assert.equal(visual.element.dataset.episode, 'work');
   assert.equal(visual.inspect().cooldown, 4); assert.equal(art.htmlWrites, 1);
-  assert.match(css, /:is\(\[data-family="checkpoint"\], \[data-family="calculation"\], \[data-family="composition"\], \[data-family="verification"\]\):is\(\[data-episode="coffee"\], \[data-episode="manual"\]\)\[data-adapter="react"\] \.wv-reaction-actor \{ animation: wv-coffee-travel-checkpoint/);
+  assert.match(css, /:is\(\[data-family="checkpoint"\], \[data-family="calculation"\], \[data-family="composition"\], \[data-family="verification"\], \[data-family="restoration"\]\):is\(\[data-episode="coffee"\], \[data-episode="manual"\]\)\[data-adapter="react"\] \.wv-reaction-actor \{ animation: wv-coffee-travel-checkpoint/);
   assert.doesNotMatch(css, /@keyframes wv-coffee-(?:calculation|composition)/, 'whole excursions are shared, never duplicated per family');
   visual.destroy();
 });
@@ -1131,7 +1131,7 @@ test('manual shares travel but owns its open shelf, closes its path, and never e
 
 test('manual uses every existing adapter and respects pauses, pending completion and terminal removal', () => {
   for (const phaseId of ['metadata-scan','metadata-checkpoint-write','analytics-sql','command:case_report_render','metadata-validate']) {
-    const f=fixture(), visual=f.api.mount(f.host,receipt({phaseId,elapsedMs:60000}),{reactionSeed:5});
+    const f=fixture(), visual=f.api.mount(f.host,receipt({phaseId,elapsedMs:60000}),{reactionSeed:4});
     f.observers[0].deliver(true); reactionBoundary(f,visual);
     assert.equal(visual.element.dataset.episode,'manual');
     const bridge=f.api.adapters[visual.element.dataset.family].bridgeMs;
