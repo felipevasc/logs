@@ -115,3 +115,9 @@ A direção do estudo isolado foi aprovada pelo usuário. O CI54 confirmou a int
 Confirmações benignas equivalentes de cópia e filtro passam a ocupar um único aviso com contador discreto, sem narrar a mesma mensagem várias vezes. Erros, avisos de contexto e recibos não são agregados. O feedback gerenciado usa um contêiner separado, para não mover, encurtar ou ocultar o Undo; somente os sete avisos benignos são transparentes ao ponteiro. Mensagens de erro continuam selecionáveis e copiáveis.
 
 O posicionamento evita foco, editor e ações quando houver espaço. Timers, frames, observer e listeners são encerrados ao remover o último aviso. A revisão independente fechou as regressões de geometria do Undo e seleção de erros; o roteiro de navegador próprio ainda depende de CI.
+
+### Mais espaço no cruzamento
+
+O construtor de Cruzar dados agora pode ser recolhido por uma escolha explícita. A apresentação fechada resume linhas, colunas e medidas e conserva a ação Editar configuração. O estado inicial continua expandido. Recolher não consulta novamente nem recria a tabela, e conserva foco e rolagem; a preferência é restaurada por contexto, com snapshots antigos assumindo o estado expandido.
+
+A paleta local recolhe junto do construtor; o catálogo principal permanece disponível. Nenhuma capacidade de edição é removida. O roteiro de CI compara temas claro/escuro em 1440 e 1024 px, mede ganho real da área de linhas e cobre erro, cancelamento, retry e troca entre Caso e Análise. A confirmação visual deste incremento ainda está pendente.

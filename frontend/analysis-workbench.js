@@ -4,8 +4,9 @@
   const measureLabels = { count: "Contagem", count_distinct: "Valores únicos", sum: "Soma", avg: "Média", min: "Mínimo", max: "Máximo", string_agg: "Textos reunidos" };
   const numericKinds = new Set(["number", "duration", "bytes", "bits", "percent"]);
   const groupView = { result: null, field: null, aggs: [], search: "", sort: null, direction: -1, page: 0, busy: false, queued: false, version: 0, computedKey: "" };
-  const pivotView = { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "" };
+  const pivotView = { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "", configurationCollapsed: false };
   const pivotTask = { busy: false, queued: false };
+  let pivotConfigurationScroll = null;
   let groupTimer;
   let groupKeys = new WeakMap();
   const number = value => typeof value === "number" ? fmtNum(value) : String(value ?? "—");
@@ -246,14 +247,59 @@
     footer.append(prev, el("span", "", `${groupView.page + 1} / ${pages}`), next);
   }
 
+  function renderPivotConfiguration() {
+    const toggle = $("#aw-pivot-config-toggle"), summary = $("#aw-pivot-config-summary");
+    if (!toggle || !summary) return;
+    const collapsed = pivotView.configurationCollapsed === true, cube = activeCube();
+    const fieldLabel = field => `${colLabel(field)}${window.AnalysisFields && !window.AnalysisFields.available(field, state.analyticsScope) ? " (indisponível)" : ""}`;
+    const measures = cube.values.map(item => {
+      const calculation = `${measureLabels[item.func] || item.func} · ${item.column === "*" ? "Registros" : fieldLabel(item.column)}`;
+      return item.func === "count" && item.column === "*" && ["qtd", "Registros", ""].includes(item.alias || "")
+        ? "Registros" : item.alias ? `${item.alias} (${calculation})` : calculation;
+    });
+    summary.replaceChildren();
+    for (const [label, value] of [["Linhas", cube.rows.map(fieldLabel).join(" › ") || "Total"], ["Colunas", cube.cols.map(fieldLabel).join(" › ") || "Sem divisão"], ["Medidas", measures.join("; ") || "Nenhuma"]]) {
+      const item = el("div", "aw-pivot-config-item"); item.append(el("dt", "", label), el("dd", "", value)); summary.append(item);
+    }
+    toggle.textContent = collapsed ? "Editar configuração" : "Recolher configuração";
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    summary.hidden = !collapsed;
+    for (const selector of ["#aw-pivot-config-actions", "#aw-pivot-config-zones", "#aw-pivot-fields"]) $(selector).hidden = collapsed;
+  }
+  function setPivotConfigurationCollapsed(collapsed) {
+    if (pivotView.configurationCollapsed === collapsed) return;
+    const table = $("#cube-table-view"), fields = $("#aw-pivot-fields"), row = $("#cube-table tbody")?.firstElementChild;
+    const point = node => [node.scrollLeft, node.scrollTop];
+    let tablePoint = point(table), fieldsPoint = point(fields);
+    const previous = pivotConfigurationScroll;
+    if (!collapsed && previous) {
+      // Re-expanding restores a position clamped by the larger viewport, unless
+      // the person has since scrolled or the result has been replaced.
+      if (previous.row === row && tablePoint.every((value, i) => value === previous.after[i])) tablePoint = previous.before;
+      fieldsPoint = previous.fields;
+    }
+    if (collapsed && [fields, $("#aw-pivot-config-actions"), $("#aw-pivot-config-zones")].some(node => node.contains(document.activeElement))) {
+      $("#aw-pivot-config-toggle").focus({ preventScroll: true });
+    }
+    pivotView.configurationCollapsed = collapsed;
+    renderPivotConfiguration();
+    [table.scrollLeft, table.scrollTop] = tablePoint;
+    if (!collapsed) [fields.scrollLeft, fields.scrollTop] = fieldsPoint;
+    pivotConfigurationScroll = collapsed ? { row, before: tablePoint, after: point(table), fields: fieldsPoint } : null;
+  }
   function pivotShell() {
     if ($("#aw-pivot-tools")) return;
     const main = $(".cube-main"); if (!main) return;
     const top = el("div", "aw-pivot-presets"); top.id = "aw-pivot-tools";
-    top.append(el("span", "aw-caption", "Comece com"), button("Contagem por campo", () => pivotPreset(false), "aw-preset"), button("Cruzar dois campos", () => pivotPreset(true), "aw-preset"), button("⇄ Trocar eixos", () => {
+    const actions = el("div", "aw-pivot-config-actions"); actions.id = "aw-pivot-config-actions";
+    actions.append(el("span", "aw-caption", "Comece com"), button("Contagem por campo", () => pivotPreset(false), "aw-preset"), button("Cruzar dois campos", () => pivotPreset(true), "aw-preset"), button("⇄ Trocar eixos", () => {
       const cube = activeCube(); [cube.rows, cube.cols] = [cube.cols, cube.rows]; cubeState.collapsed.clear(); markCubeTableChanged(); renderCubeZones(); runCube();
-    })); main.prepend(top);
-    top.append($("#btn-cube-clear"));
+    }), $("#btn-cube-clear"));
+    const configuration = el("dl", "aw-pivot-config-summary"); configuration.id = "aw-pivot-config-summary"; configuration.setAttribute("aria-label", "Configuração do cruzamento");
+    const toggle = button("Recolher configuração", () => setPivotConfigurationCollapsed(!pivotView.configurationCollapsed), "btn ghost small aw-pivot-config-toggle"); toggle.id = "aw-pivot-config-toggle";
+    $(".cube-zones").id = "aw-pivot-config-zones"; $(".cube-fields").id = "aw-pivot-fields";
+    toggle.setAttribute("aria-controls", "aw-pivot-config-actions aw-pivot-config-zones aw-pivot-fields");
+    top.append(actions, configuration, toggle); main.prepend(top);
     const tools = el("div", "aw-result-tools aw-pivot-result-tools");
     const search = el("input", "aw-search"); search.type = "search"; search.placeholder = "Buscar nas linhas…"; search.setAttribute("aria-label", "Buscar linhas do cruzamento"); search.id = "aw-pivot-search";
     search.oninput = () => { pivotView.search = search.value; pivotView.page = 0; redrawPivot(); };
@@ -269,6 +315,7 @@
     const input = el("input", "aw-search"); input.type = "search"; input.placeholder = "Buscar campo…"; input.setAttribute("aria-label", "Buscar campo do cruzamento"); input.id = "aw-field-search";
     input.oninput = () => { for (const row of document.querySelectorAll("#cube-field-list .cube-field")) row.hidden = !row.dataset.field.toLocaleLowerCase().includes(input.value.toLocaleLowerCase()); };
     $("#cube-field-list").before(input);
+    renderPivotConfiguration();
   }
   function pivotPreset(cross) {
     const fields = candidates(state.analyticsScope), cube = activeCube();
@@ -322,6 +369,7 @@
         fixed: [["", "+ Campo"], ...(zone === "values" && !items.some(v => v.func === "count" && v.column === "*") ? [["*", "Contar registros"]] : [])],
         choose: field => { if (field) cubeAdd(zone, field); } });
     }
+    renderPivotConfiguration();
   };
   cubeAdd = function (zone, field) {
     if (!["rows", "cols", "values"].includes(zone) || !field) return;
@@ -496,6 +544,7 @@
   };
   window.WorkspaceAnalysis = {
     invalidateAnalysis: () => {
+      pivotConfigurationScroll = null;
       groupPresentationCache = null; pivotPresentationCache = null; groupView.version++; clearTimeout(groupTimer);
       groupView.result = null; groupView.page = 0; pivotView.page = 0;
       for (const selector of ["#group-table thead", "#group-table tbody", "#cube-table thead", "#cube-table tbody", "#aw-group-pager", "#aw-pivot-pager"]) $(selector)?.replaceChildren();
@@ -503,8 +552,10 @@
     capture: () => ({ group: { search: groupView.search, sort: groupView.sort, direction: groupView.direction, page: groupView.page }, pivot: { ...pivotView } }),
     restore: saved => {
       groupPresentationCache = null; pivotPresentationCache = null;
+      pivotConfigurationScroll = null;
       groupView.version++; clearTimeout(groupTimer); Object.assign(groupView, { result: null, field: null, search: "", sort: null, direction: -1, page: 0 }, saved?.group);
-      Object.assign(pivotView, { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "" }, saved?.pivot, { restoring: true });
+      Object.assign(pivotView, { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "" }, saved?.pivot, { configurationCollapsed: saved?.pivot?.configurationCollapsed === true, restoring: true });
+      renderPivotConfiguration();
       if ($("#aw-group-tools input")) $("#aw-group-tools input").value = groupView.search;
       if ($("#aw-pivot-search")) $("#aw-pivot-search").value = pivotView.search;
       if ($("#aw-pivot-order")) $("#aw-pivot-order").value = pivotView.sort;

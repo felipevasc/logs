@@ -95,6 +95,8 @@ try {
   await page.waitForFunction(() => document.querySelector("#cube-table tbody").rows.length > 1);
   assert.equal(await page.evaluate(() => activeCube() === activeCube()), true, "normalization must preserve table references");
   assert.ok(await page.evaluate(() => activeCube().lastDataSignature));
+  assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "true", "the builder starts expanded");
+  await page.getByRole("button", { name: "Recolher configuração", exact: true }).click();
   await page.evaluate(async () => {
     const original = api;
     api = async (name, args, opts) => { if (name === "pivot") throw new Error("Falha do cruzamento de teste"); return original(name, args, opts); };
@@ -107,6 +109,31 @@ try {
   await page.getByRole("button", { name: "Fechar explicação", exact: true }).click();
   await page.locator("#aw-pivot-summary").getByRole("button", { name: "Tentar novamente", exact: true }).click();
   await page.waitForFunction(() => document.querySelector("#cube-table tbody").rows.length > 1);
+  assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "false", "failure and retry do not reopen the builder");
+
+  phase = "pivot cancellation with folded configuration";
+  await page.evaluate(() => {
+    window.__mockLatency = { ...window.__mockLatency, pivot: 10_000 };
+    window.__configurationPending = runCube({ force: true });
+  });
+  await page.waitForFunction(() => Tasks.groups().some(group => group.tasks.some(task => task.cmd === "pivot")) && document.querySelector(".cube-output .area-loading-semantic"));
+  const pendingBefore = await page.evaluate(() => ({ pivot: window.__mockCommandCalls.pivot, cancels: window.__mockCommandCalls.cancel_task || 0, operation: Tasks.operationFor("pivot") }));
+  await page.getByRole("button", { name: "Editar configuração", exact: true }).click();
+  await page.getByRole("button", { name: "Recolher configuração", exact: true }).click();
+  assert.deepEqual(await page.evaluate(() => ({ pivot: window.__mockCommandCalls.pivot, cancels: window.__mockCommandCalls.cancel_task || 0, operation: Tasks.operationFor("pivot") })), pendingBefore,
+    "folding is available during calculation and never reruns or cancels it");
+  const taskId = await page.evaluate(() => Tasks.groups().flatMap(group => group.tasks).find(task => task.cmd === "pivot").id);
+  await page.locator("#workbar-tasks").click();
+  await page.locator(`.tasks-modal [data-cancel="${taskId}"]`).click();
+  await page.evaluate(async () => { await window.__configurationPending; delete window.__mockLatency.pivot; });
+  await page.locator(".tasks-modal [data-close]").click();
+  assert.equal(await page.locator(".cube-output .area-loading-semantic").count(), 0);
+  assert.equal(await page.locator("#cube-table tbody tr").count(), 0, "a cancelled calculation cannot leave stale totals");
+  assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "false");
+  await page.locator("#aw-pivot-summary").getByRole("button", { name: "Tentar novamente", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector("#cube-table tbody").rows.length > 1);
+  results.foldedRecovery = { errorDetailsAndRetry: true, realTaskCancellationAndRetry: true, toggleLeavesPendingOperationUntouched: true };
+  await page.getByRole("button", { name: "Editar configuração", exact: true }).click();
   await page.getByRole("combobox", { name: "Adicionar campo em colunas", exact: true }).selectOption("source");
   await page.waitForFunction(() => document.querySelector("#cube-table thead").rows.length === 2);
   await page.getByRole("combobox", { name: "Adicionar campo em linhas", exact: true }).selectOption("code");
@@ -181,6 +208,88 @@ try {
   assert.equal(results.compactViewport.toolsOverlapTable, false);
   assert.equal(results.compactViewport.tableWithinPanel, true);
   assert.ok(results.compactViewport.tableHeight >= 100);
+
+  phase = "explicit configuration folding, readable rows and keyboard";
+  results.configurationLayout = [];
+  const measureLayout = () => page.evaluate(() => {
+    const panel = document.querySelector("#view-cube").getBoundingClientRect(), table = document.querySelector("#cube-table-view").getBoundingClientRect();
+    const headerBottom = Math.max(...[...document.querySelectorAll("#cube-table thead th")].map(cell => cell.getBoundingClientRect().bottom));
+    const totalTop = Math.min(...[...document.querySelectorAll("#cube-table .total td")].map(cell => cell.getBoundingClientRect().top));
+    const tools = document.querySelector(".aw-pivot-result-tools").getBoundingClientRect(), toggle = document.querySelector("#aw-pivot-config-toggle");
+    const rows = [...document.querySelectorAll("#cube-table tbody tr:not(.total)")].map(row => row.getBoundingClientRect());
+    return {
+      tableHeight: Math.round(table.height), tableWidth: Math.round(table.width),
+      readableRows: rows.filter(row => row.top >= Math.max(table.top, headerBottom) - 1 && row.bottom <= Math.min(table.bottom, totalTop) + 1).length,
+      horizontalOverflow: document.documentElement.scrollWidth > innerWidth,
+      tableWithinPanel: table.top >= panel.top && table.bottom <= panel.bottom + 1,
+      toolsOverlapTable: tools.bottom > table.top + 1,
+      rowFont: Number.parseFloat(getComputedStyle(document.querySelector("#cube-table tbody td")).fontSize),
+      summaryFont: Number.parseFloat(getComputedStyle(document.querySelector("#aw-pivot-config-summary")).fontSize),
+      toggleHeight: toggle.getBoundingClientRect().height, toggleFocused: document.activeElement === toggle,
+      focusOutline: Number.parseFloat(getComputedStyle(toggle).outlineWidth),
+    };
+  });
+  for (const width of [1440, 1024]) for (const theme of ["dark", "light"]) {
+    await page.setViewportSize({ width, height: width === 1440 ? 960 : 768 });
+    await page.evaluate(theme => { if (document.documentElement.dataset.theme !== theme) toggleTheme(); }, theme);
+    await page.evaluate(() => {
+      const table = document.querySelector("#cube-table-view"); table.scrollTop = 120; table.scrollLeft = 20;
+      const cube = activeCube();
+      window.__configurationProbe = {
+        firstRow: document.querySelector("#cube-table tbody tr"), result: cubeResultForTable(cube), schema: cubeSchemaSignature(cube),
+        requestVersion: cubeState.requestVersion, calls: window.__mockCommandCalls.pivot,
+        scroll: [table.scrollLeft, table.scrollTop], state: WorkspaceAnalysis.capture().pivot,
+      };
+    });
+    const expanded = await measureLayout();
+    await page.screenshot({ path: resolve(output, `workbench-pivot-expanded-${theme}-${width}.png`) });
+    await page.locator("#aw-pivot-config-toggle").focus(); await page.keyboard.press("Enter");
+    assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "false");
+    assert.equal(await page.locator("#aw-pivot-config-zones").isVisible(), false);
+    assert.equal(await page.locator("#aw-pivot-fields").isVisible(), false);
+    const collapsed = await measureLayout();
+    await page.screenshot({ path: resolve(output, `workbench-pivot-collapsed-${theme}-${width}.png`) });
+    const preserved = await page.evaluate(() => {
+      const before = window.__configurationProbe, table = document.querySelector("#cube-table-view"), current = WorkspaceAnalysis.capture().pivot;
+      const { configurationCollapsed: _a, ...previous } = before.state, { configurationCollapsed: _b, ...after } = current;
+      return {
+        sameRow: before.firstRow === document.querySelector("#cube-table tbody tr"), sameResult: before.result === cubeResultForTable(activeCube()),
+        sameSchema: before.schema === cubeSchemaSignature(activeCube()), sameView: JSON.stringify(previous) === JSON.stringify(after),
+        noRequest: before.calls === window.__mockCommandCalls.pivot && before.requestVersion === cubeState.requestVersion,
+        sameScroll: Math.min(before.scroll[0], table.scrollWidth - table.clientWidth) === table.scrollLeft
+          && Math.min(before.scroll[1], table.scrollHeight - table.clientHeight) === table.scrollTop,
+      };
+    });
+    assert.ok(Object.values(preserved).every(Boolean), JSON.stringify(preserved));
+    assert.ok(collapsed.tableHeight >= expanded.tableHeight + 60, `${width}/${theme} must recover real data height`);
+    assert.ok(collapsed.readableRows >= expanded.readableRows + 2, `${width}/${theme} must expose more fully readable rows`);
+    assert.equal(collapsed.rowFont, expanded.rowFont, "more rows do not come from shrinking the text");
+    assert.ok(collapsed.summaryFont >= 12 && collapsed.toggleHeight >= 30);
+    assert.ok(collapsed.toggleFocused && collapsed.focusOutline >= 2);
+    assert.equal(collapsed.horizontalOverflow, false); assert.equal(collapsed.toolsOverlapTable, false); assert.equal(collapsed.tableWithinPanel, true);
+    await page.keyboard.press("Space");
+    assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "true");
+    assert.equal(await page.getByRole("combobox", { name: "Adicionar campo em linhas", exact: true }).isVisible(), true);
+    assert.equal(await page.evaluate(() => document.activeElement === document.querySelector("#aw-pivot-config-toggle")), true);
+    assert.equal(await page.evaluate(() => {
+      const table = document.querySelector("#cube-table-view"), previous = window.__configurationProbe.scroll;
+      return table.scrollLeft === previous[0] && table.scrollTop === previous[1];
+    }), true, "reopening restores even positions clamped by the larger viewport");
+    results.configurationLayout.push({ width, theme, expanded, collapsed, preserved });
+  }
+
+  phase = "folding preferences survive real workspace rotation";
+  await page.getByRole("button", { name: "Recolher configuração", exact: true }).click();
+  await page.evaluate(() => WorkspaceContext.setScope("case", { page: "explore", tab: "cube", animate: false }));
+  await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "case");
+  assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "true", "a new context does not inherit the previous folding choice");
+  await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", tab: "cube", animate: false }));
+  await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "dataset" && document.querySelector("#cube-table tbody").rows.length > 1);
+  assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "false", "returning to the original context restores its explicit choice");
+  assert.match(await page.locator("#aw-pivot-config-summary").textContent(), /Nível.*Código.*Origem.*Registros/);
+  await page.getByRole("button", { name: "Editar configuração", exact: true }).click();
+  assert.equal(await page.getByRole("combobox", { name: "Adicionar campo em colunas", exact: true }).isVisible(), true);
+  results.configurationContexts = "Case starts expanded; dataset restores its closed builder and authored axes; edit remains available";
   assert.deepEqual(errors, []);
   results.pageErrors = errors;
   writeFileSync(resolve(output, "workbench-validation.json"), JSON.stringify(results, null, 2));
