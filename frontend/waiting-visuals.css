@@ -1,0 +1,163 @@
+/* Animation-first, compact desktop scenes. Motion is decorative, never a progress meter. */
+.waiting-visual {
+  --wv-accent: var(--accent, #83b7f3);
+  --wv-ink: var(--text-1, #a9b6ca);
+  --wv-surface: var(--bg-1, #11161f);
+  --wv-cycle: 1.6s;
+  --wv-repeat: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  inline-size: min(100%, 290px);
+  min-inline-size: 0;
+  margin-inline: auto;
+  color: var(--text-0, #e6eaf2);
+  text-align: center;
+  font-family: var(--font-ui, system-ui, sans-serif);
+}
+.waiting-visual[hidden], .waiting-visual [hidden] { display: none !important; }
+.waiting-visual .wv-art {
+  inline-size: min(100%, 192px);
+  block-size: 96px;
+  flex: 0 0 96px;
+  contain: layout paint;
+  overflow: hidden;
+  color: var(--wv-accent);
+}
+.waiting-visual .wv-art svg {
+  display: block;
+  inline-size: 100%;
+  block-size: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.35;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.waiting-visual .wv-guide { opacity: .23; }
+.waiting-visual .wv-rail { stroke: var(--wv-ink); opacity: .3; }
+.waiting-visual .wv-stack { opacity: .55; }
+.waiting-visual .wv-read-card rect,
+.waiting-visual .wv-save-card rect,
+.waiting-visual .wv-helper rect { fill: var(--wv-surface); }
+.waiting-visual .wv-tray { fill: var(--wv-surface); }
+.waiting-visual .wv-tray-line { opacity: .45; }
+.waiting-visual .wv-helper { opacity: .8; }
+.waiting-visual .wv-visor { stroke-width: 2; }
+.waiting-visual .wv-arm { transform-origin: 138px 44px; }
+.waiting-visual .wv-point { fill: currentColor; stroke: none; }
+.waiting-visual .wv-neutral { color: var(--wv-ink); opacity: .65; }
+.waiting-visual[data-checkpoint="preserved"] .wv-save-card { transform: translateY(10px); }
+.waiting-visual .wv-status {
+  max-inline-size: 100%;
+  color: var(--text-0, #e6eaf2);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.waiting-visual .wv-metric, .waiting-visual .wv-details {
+  max-inline-size: 100%;
+  color: var(--wv-ink);
+  font-size: 12px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.waiting-visual .wv-motion-toggle {
+  min-block-size: 24px;
+  margin: 2px 0 0;
+  padding: 3px 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--wv-ink);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+/* A legacy loading veil passes pointer events through; its independent pause stays usable. */
+.area-loading-semantic .wv-motion-toggle { pointer-events: auto; }
+.waiting-visual .wv-motion-toggle:hover { color: var(--text-0, #e6eaf2); text-decoration-color: currentColor; }
+.waiting-visual .wv-motion-toggle:focus-visible { outline: 2px solid var(--wv-accent); outline-offset: 2px; }
+.waiting-visual[data-pace="loop"] { --wv-cycle: 3.8s; --wv-repeat: infinite; }
+/* Animate only transform/opacity on a handful of small SVG elements; never layout, blur or shadow.
+   Not visible/reduced/stopped means no animation at all, including its underlying timeline. */
+.waiting-visual[data-motion="running"] .wv-read-card {
+  animation: wv-organize var(--wv-cycle) cubic-bezier(.35, 0, .2, 1) var(--wv-repeat) both;
+}
+.waiting-visual[data-motion="running"] .wv-save-card {
+  animation: wv-file-away var(--wv-cycle) cubic-bezier(.35, 0, .2, 1) var(--wv-repeat) both;
+}
+.waiting-visual[data-motion="running"] .wv-arm {
+  animation: wv-guide-hand var(--wv-cycle) ease-in-out var(--wv-repeat) both;
+}
+.waiting-visual[data-motion="running"] .wv-point {
+  animation: wv-group-points var(--wv-cycle) cubic-bezier(.35, 0, .2, 1) var(--wv-repeat) both;
+}
+/* The second composition is deterministic per operation, never shuffled by a progress tick. */
+.waiting-visual[data-motion="running"][data-variant="b"] .wv-read-card { animation-name: wv-organize-low; }
+.waiting-visual[data-motion="running"][data-variant="b"] .wv-save-card { animation-name: wv-file-away-tilt; transform-origin: 96px 48px; }
+.waiting-visual[data-motion="running"][data-variant="b"] .wv-arm { animation-name: wv-guide-hand-low; }
+.waiting-visual[data-variant="b"] .wv-point-a { --wv-x: 8px; --wv-y: -5px; }
+.waiting-visual[data-variant="b"] .wv-point-b { --wv-x: -9px; --wv-y: 3px; }
+.waiting-visual[data-variant="b"] .wv-point-c { --wv-x: 10px; --wv-y: 6px; }
+.waiting-visual[data-variant="b"] .wv-point-d { --wv-x: -8px; --wv-y: -4px; }
+.waiting-visual .wv-point-a { --wv-x: -9px; --wv-y: 5px; }
+.waiting-visual .wv-point-b { --wv-x: 10px; --wv-y: 4px; }
+.waiting-visual .wv-point-c { --wv-x: -11px; --wv-y: -6px; }
+.waiting-visual .wv-point-d { --wv-x: 8px; --wv-y: -3px; }
+@keyframes wv-organize {
+  0%, 100% { transform: translate(-17px, 3px); opacity: .45; }
+  18% { transform: translate(-17px, 3px); opacity: .85; }
+  56%, 72% { transform: translate(30px, -1px); opacity: 1; }
+  87% { transform: translate(30px, -1px); opacity: 0; }
+  88% { transform: translate(-17px, 3px); opacity: 0; }
+}
+@keyframes wv-file-away {
+  0%, 100% { transform: translateY(-7px); opacity: .55; }
+  22% { transform: translateY(-7px); opacity: 1; }
+  58%, 75% { transform: translateY(12px); opacity: 1; }
+  86% { transform: translateY(12px); opacity: 0; }
+  87% { transform: translateY(-7px); opacity: 0; }
+}
+@keyframes wv-guide-hand {
+  0%, 18%, 85%, 100% { transform: rotate(0); }
+  46%, 62% { transform: rotate(13deg); }
+}
+@keyframes wv-group-points {
+  0%, 100% { transform: translate(var(--wv-x), var(--wv-y)); opacity: .55; }
+  45%, 72% { transform: translate(0, 0); opacity: 1; }
+}
+@keyframes wv-organize-low {
+  0%, 100% { transform: translate(-17px, 9px) rotate(-3deg); opacity: .45; }
+  18% { transform: translate(-17px, 9px) rotate(-3deg); opacity: .85; }
+  56%, 72% { transform: translate(30px, 1px) rotate(0); opacity: 1; }
+  87% { transform: translate(30px, 1px); opacity: 0; }
+  88% { transform: translate(-17px, 9px); opacity: 0; }
+}
+@keyframes wv-file-away-tilt {
+  0%, 100% { transform: translate(3px, -7px) rotate(6deg); opacity: .55; }
+  22% { transform: translate(3px, -7px) rotate(6deg); opacity: 1; }
+  58%, 75% { transform: translate(0, 12px) rotate(0); opacity: 1; }
+  86% { transform: translateY(12px); opacity: 0; }
+  87% { transform: translate(3px, -7px) rotate(6deg); opacity: 0; }
+}
+@keyframes wv-guide-hand-low {
+  0%, 18%, 85%, 100% { transform: rotate(0); }
+  46%, 62% { transform: rotate(-8deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .waiting-visual .wv-art * { animation: none !important; }
+  .waiting-visual .wv-motion-toggle { display: none; }
+}
+@media (forced-colors: active) {
+  .waiting-visual { --wv-accent: CanvasText; --wv-ink: CanvasText; --wv-surface: Canvas; }
+  .waiting-visual .wv-guide, .waiting-visual .wv-neutral, .waiting-visual .wv-helper { opacity: 1; }
+}

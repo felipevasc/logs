@@ -143,8 +143,11 @@
     $("#group-table").setAttribute("aria-busy", "true"); $("#aw-group-summary").textContent = "Calculando todos os registros do recorte…";
     $("#group-table").inert = true;
     startOperation("group", "Calculando resumo", `Por ${colLabel(field)}`);
+    const waiting = areaLoading($("#tab-group"), "Calculando resumo", { phaseId: "command:aggregate_events" });
     try {
-      const result = await api("aggregate_events", { ...analyticsRequest(scope), groupColumn: field, aggs, filters }, { latest: "group" });
+      const pending = api("aggregate_events", { ...analyticsRequest(scope), groupColumn: field, aggs, filters }, { latest: "group" });
+      waiting.bindOperation(window.Tasks?.operationFor("group"));
+      const result = await pending;
       if (result.error) throw new Error(result.error);
       if (version !== groupView.version || source !== (scope === "case" ? caseSig() : state.currentArtifact?.id) || signature !== JSON.stringify([workspaceScope(), scope === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt, backendFilters(), field, aggs, state.derivedFields])) return;
       groupView.result = result; groupView.field = field; groupView.aggs = aggs; groupView.computedKey = signature;
@@ -161,6 +164,7 @@
       $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren();
       calculationError($("#aw-group-summary"), error, () => runGroup({ force: true })); finishOperation("Falha ao resumir", String(error));
     } finally {
+      waiting.done();
       groupView.busy = false; run.disabled = false; $("#group-table").setAttribute("aria-busy", "false");
       $("#group-table").inert = false;
       if (groupView.queued) { groupView.queued = false; runGroup({ force: true }); }

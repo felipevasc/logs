@@ -153,7 +153,7 @@ const el = (tag, cls, text) => {
   return e;
 };
 
-function setWorkbar(label, detail = "", progress = null, cancellable = false, summaryState = null) {
+function setWorkbar(label, detail = "", progress = null, cancellable = false, summaryState = null, waiting = null) {
   const bar = $("#workbar");
   const progressEl = $("#workbar-progress");
   const fill = $("#workbar-progress-fill");
@@ -168,11 +168,32 @@ function setWorkbar(label, detail = "", progress = null, cancellable = false, su
   progressEl.hidden = progress === null;
   if (progress !== null) fill.style.width = `${Math.max(0, Math.min(100, progress))}%`;
   $("#workbar-cancel").hidden = !cancellable; $("#workbar-cancel").disabled = false;
-  if (state.loadOverlay) mirrorLoadOverlay(label, detail, progress);
+  if (state.loadOverlay) mirrorLoadOverlay(label, detail, progress, waiting);
 }
 
 // ------------------------------------------------------------------ overlay de carga
 let loadStepCount = 0;
+let loadWaitingVisual = null;
+let loadWaitingReceipt = null;
+
+function updateLoadWaiting(receipt) {
+  loadWaitingReceipt = receipt;
+  loadWaitingVisual?.update(receipt);
+}
+document.addEventListener("task-state-change", event => {
+  const change = event.detail;
+  if (!state.loadOverlay || !change?.operationId) return;
+  if (change.started && change.latestKey === (state.loadOverlayProgressKey || "source-load")) {
+    // Bind before the first progress event, so cancelLatest can remove its map
+    // entry without losing the foreground owner's cancellation identity.
+    loadWaitingReceipt = { ...loadWaitingReceipt, operationId: change.operationId };
+    return;
+  }
+  if (change.state !== "cancelling") return;
+  const owned = window.Tasks?.operationFor(state.loadOverlayProgressKey || "source-load");
+  if (change.operationId !== loadWaitingReceipt?.operationId && change.operationId !== owned) return;
+  updateLoadWaiting({ ...loadWaitingReceipt, operationId: change.operationId, state: "cancelling", label: "" });
+});
 
 function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-load") {
   state.loadOverlay = true;
@@ -188,10 +209,20 @@ function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-
   progressSamples.length = 0;
   pushLoadStep(firstStep);
   $("#load-overlay").hidden = false;
+  $("#load-progress-details").open = false;
+  loadWaitingVisual?.destroy();
+  loadWaitingReceipt = {
+    operationId: `foreground-${state.loadOverlayVersion}`, phaseId: "", state: "running", label: firstStep,
+  };
+  loadWaitingVisual = window.WaitingVisuals.mount($("#load-visual"), loadWaitingReceipt);
 }
 
 function hideLoadOverlay(ok = true) {
   state.loadOverlay = false;
+  // Work owns the lifetime, not the decorative animation cycle.
+  loadWaitingVisual?.destroy(); loadWaitingVisual = null;
+  loadWaitingReceipt = null;
+  $("#load-overlay").hidden = true;
   if (ok) {
     document.querySelectorAll("#load-steps li").forEach((li) => {
       li.classList.add("done");
@@ -199,10 +230,6 @@ function hideLoadOverlay(ok = true) {
     });
     $("#load-bar-fill").parentElement.hidden = false; $("#load-bar-fill").style.width = "100%";
     $("#load-phase").textContent = "Pronto!";
-    const version = state.loadOverlayVersion;
-    setTimeout(() => { if (version === state.loadOverlayVersion) $("#load-overlay").hidden = true; }, 450);
-  } else {
-    $("#load-overlay").hidden = true;
   }
 }
 
@@ -220,7 +247,7 @@ function pushLoadStep(label) {
   while (steps.children.length > 4) steps.firstChild.remove();
 }
 
-function mirrorLoadOverlay(label, detail, progress) {
+function mirrorLoadOverlay(label, detail, progress, waiting = null) {
   if (!state.loadOverlay) return;
   if (label && label !== $("#load-phase").textContent) pushLoadStep(label);
   $("#load-phase").textContent = label;
@@ -228,6 +255,9 @@ function mirrorLoadOverlay(label, detail, progress) {
   $("#load-bar-fill").parentElement.hidden = progress == null;
   if (progress != null) $("#load-bar-fill").style.width = `${Math.max(0, Math.min(100, progress))}%`;
   $("#load-eta").textContent = state.operationTiming || "";
+  updateLoadWaiting(waiting || {
+    operationId: `foreground-${state.loadOverlayVersion}`, phaseId: "", state: "running", label: label || "Processando",
+  });
 }
 
 function startOperation(kind, label, detail = "") {
@@ -280,7 +310,10 @@ window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
   state.operationTiming = timing.join(" · ");
   state.progressOperationId = task?.operationId || null;
   const volume = estimate.total > 0 ? `${fmtNum(estimate.completed)} / ${fmtNum(estimate.total)} ${payload.unit || "itens"}` : estimate.completed ? `${fmtNum(estimate.completed)} ${payload.unit || "itens"}` : "Total ainda desconhecido";
-  setWorkbar(payload.phase || "Processando", [volume, state.operationTiming, payload.error].filter(Boolean).join(" · "), estimate.percent, !!task && !!payload.cancellable);
+  const waiting = window.WaitingProgress.snapshot(payload, { operationId: id,
+    elapsedMs: elapsed == null ? undefined : elapsed * 1000,
+    estimateMs: estimate.eta == null ? undefined : estimate.eta * 1000 });
+  setWorkbar(payload.phase || "Processando", [volume, state.operationTiming, payload.error].filter(Boolean).join(" · "), estimate.percent, !!task && !!payload.cancellable, null, waiting);
 }).catch(() => {});
 
 // live-refresh quando uma tool MCP muta o estado do backend
@@ -680,19 +713,44 @@ function btnBusy(btn, text) {
 }
 
 // overlay de espera sobre uma área; aparece só se a operação passar de ~250ms
-function areaLoading(container, text = "Consultando…") {
+let areaLoadingSerial = 0;
+function areaLoading(container, text = "Consultando…", { phaseId = "" } = {}) {
   if (!container) return { done() {} };
-  let ov = null;
+  let ov = null, visual = null, longWait = null, waitState = "running", closed = false;
+  const started = performance.now(); let operationId = `area-${++areaLoadingSerial}`;
+  const receipt = () => ({ operationId, phaseId, state: waitState, label: waitState === "running" ? text : "", elapsedMs: performance.now() - started });
+  const changed = event => {
+    if (closed || event.detail?.operationId !== operationId || event.detail.state !== "cancelling") return;
+    waitState = "cancelling"; clearTimeout(longWait);
+    visual?.update(receipt());
+  };
+  if (phaseId) document.addEventListener("task-state-change", changed);
   const timer = setTimeout(() => {
+    if (!container.isConnected) return;
     ov = el("div", "area-loading");
-    ov.innerHTML = `<i class="fas fa-circle-notch spin"></i><span>${esc(text)}</span>`;
     container.appendChild(ov);
+    if (phaseId) {
+      ov.classList.add("area-loading-semantic");
+      visual = window.WaitingVisuals.mount(ov, receipt());
+      // One measured threshold update, not a per-frame clock or query.
+      if (waitState === "running") longWait = setTimeout(() => visual?.update(receipt()), Math.max(0, 4000 - (performance.now() - started)));
+    } else ov.innerHTML = `<i class="fas fa-circle-notch spin"></i><span>${esc(text)}</span>`;
     requestAnimationFrame(() => ov?.classList.add("show"));
   }, 250);
   return {
+    bindOperation(id) {
+      if (closed || typeof id !== "string" || !id) return;
+      operationId = id;
+      visual?.update(receipt());
+    },
     done() {
+      closed = true;
+      if (phaseId) document.removeEventListener("task-state-change", changed);
       clearTimeout(timer);
+      clearTimeout(longWait);
+      visual?.destroy(); visual = null;
       if (!ov) return;
+      if (phaseId) { ov.remove(); ov = null; return; }
       ov.classList.remove("show");
       const elRef = ov;
       ov = null;
@@ -2536,35 +2594,29 @@ function scheduleRefresh() {
 
 // ------------------------------------------------------------------ menu de contexto
 let ctxEl = null;
+const ctxMenu = window.ContextMenu.create({
+  onChange: menu => { ctxEl = menu; },
+  fallbackFocus: () => {
+    // A removed/hidden caller must never send focus behind an open surface.
+    const modal = [...document.querySelectorAll(".modal-overlay:not([hidden]),[role='dialog']:not([hidden])")]
+      .filter(node => node.getClientRects().length && !node.closest("[hidden],[inert]")).at(-1);
+    const surface = modal || (!$("#drawer").hidden ? $("#drawer") : null);
+    return surface ? [...surface.querySelectorAll("button,input,select,textarea,a[href],[tabindex]")]
+      : [$("#quick-search"), $("#btn-add-filter")];
+  },
+});
 
-function closeCtxMenu() {
-  if (ctxEl) { ctxEl.remove(); ctxEl = null; }
+function closeCtxMenu(restoreFocus = false) {
+  ctxMenu.close({ restoreFocus });
 }
 
-function showCtxMenu(x, y, items) {
+function showCtxMenu(x, y, items, options) {
   window.CanonicalFields?.cancel();
-  closeCtxMenu();
   const owner = window.AnalysisContexts?.capture();
-  const m = el("div", "ctx-menu");
-  for (const it of items) {
-    if (it.sep) { m.appendChild(el("div", "ctx-sep")); continue; }
-    const b = el("button", "ctx-item" + (it.danger ? " danger" : ""));
-    b.innerHTML = `<i class="fas ${it.icon}"></i><span>${esc(it.label)}</span>`;
-    if (it.color) b.querySelector("i").style.color = it.color;
-    b.disabled = !!it.disabled; if (it.title) b.title = it.title;
-    b.onclick = () => {
-      if (b.disabled) return;
-      closeCtxMenu();
-      if (owner && !window.AnalysisContexts.isCurrent(owner)) { toast("O contexto mudou. Abra o menu novamente no Caso e na fonte atuais.", "info"); return; }
-      it.onClick();
-    };
-    m.appendChild(b);
-  }
-  document.body.appendChild(m);
-  ctxEl = m;
-  const r = m.getBoundingClientRect();
-  m.style.left = `${Math.max(4, Math.min(x, innerWidth - r.width - 8))}px`;
-  m.style.top = `${Math.max(4, Math.min(y, innerHeight - r.height - 8))}px`;
+  return ctxMenu.open(x, y, items.map(item => item.sep ? item : { ...item, onClick: () => {
+    if (owner && !window.AnalysisContexts.isCurrent(owner)) { toast("O contexto mudou. Abra o menu novamente no Caso e na fonte atuais.", "info"); return; }
+    item.onClick();
+  } }), options);
 }
 
 const trunc = (s, n = 32) => {
@@ -6553,6 +6605,7 @@ function bindKeyboard() {
       $("#quick-search").focus();
     } else if (e.key === "Escape") {
       if (e.isComposing || e.keyCode === 229) return;
+      if (ctxEl) { e.preventDefault(); e.stopImmediatePropagation(); closeCtxMenu(true); return; }
       if (!$("#name-pop").hidden && namePopExact) { e.preventDefault(); closeNamePop(); return; }
       if (!$("#filter-pop").hidden) { e.preventDefault(); closeFilterPop(); return; }
       if (!$("#detail-value-modal").hidden) {
@@ -6591,11 +6644,9 @@ function bindKeyboard() {
   });
   // fecha o menu de contexto ao clicar/usar botão direito fora dele
   document.addEventListener("click", (e) => {
-    if (ctxEl && !e.target.closest(".ctx-menu")) closeCtxMenu();
     if (tlPop && !e.target.closest(".tl-pop")) closeTlPop();
   }, true);
   document.addEventListener("contextmenu", (e) => {
-    if (ctxEl && !e.target.closest(".ctx-menu")) closeCtxMenu();
     if (tlPop && !e.target.closest(".tl-pop")) closeTlPop();
   }, true);
 }
@@ -8004,13 +8055,15 @@ async function runCube({ force = false } = {}) {
     renderCubeViews();
     return { status: "empty" };
   }
-  const loading = areaLoading(document.querySelector(".cube-output"), "Calculando Cubo…");
+  const loading = areaLoading(document.querySelector(".cube-output"), "Cruzando dados", { phaseId: "command:pivot" });
   try {
     updateOperation("Calculando Cubo", "Agregando dimensões e valores");
-    const res = await api("pivot", {
+    const pending = api("pivot", {
       ...analyticsRequest(scope),
       spec: { rows: cube.rows, cols: cube.cols, values: cube.values, limit_rows: 2000 },
     }, { latest: "pivot" });
+    loading.bindOperation(window.Tasks?.operationFor("pivot"));
+    const res = await pending;
     if (version !== cubeState.requestVersion || scope !== state.analyticsScope || cube.id !== activeCube(scope).id) return { status: "stale" };
     if (res.complete === false) toast(`Resultado parcial: ${fmtNum(res.processed_events)} eventos analisados. Reduza as dimensões ou o período.`, "info");
     cubeState.result = res;

@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const selected = process.argv.slice(2);
-const tests = selected.length ? selected : ["test-navigation.mjs", "test-ui-scale.mjs", "test-workspace-context.mjs", "test-responsiveness.mjs", "test-journeys.mjs", "test-remote-sources.mjs", "test-analysis-workbench.mjs", "test-discovery.mjs", "test-updates.mjs", "test-explorer-timeline.mjs", "test-field-transform.mjs", "test-exclusion-archive.mjs", "test-case-references.mjs", "test-canonical-field-actions.mjs", "test-java-trace.mjs", "test-native-case-startup.mjs", "test-native-case-timeline.mjs"];
+const tests = selected.length ? selected : ["test-navigation.mjs", "test-ui-scale.mjs", "test-workspace-context.mjs", "test-responsiveness.mjs", "test-journeys.mjs", "test-remote-sources.mjs", "test-analysis-workbench.mjs", "test-discovery.mjs", "test-updates.mjs", "test-explorer-timeline.mjs", "test-field-transform.mjs", "test-exclusion-archive.mjs", "test-case-references.mjs", "test-canonical-field-actions.mjs", "test-java-trace.mjs", "test-native-case-startup.mjs", "test-native-case-timeline.mjs", "test-context-menu.mjs", "test-waiting-visuals.mjs"];
 for (const name of tests) {
   if (!/^test-[a-z0-9-]+\.mjs$/.test(name)) throw new Error(`Invalid preview test name: ${name}`);
 }

@@ -69,7 +69,7 @@ try {
   for (const column of ['java.exception.class', 'java.root_cause.class', 'java.trace.fingerprint']) {
     assert.equal(typeof complete.fields[column], 'string');
     await page.locator(`.java-trace-scalar-value[data-column="${column}"]`).click({ button: 'right' });
-    await page.getByRole('button', { name: `Criar filtro: ${column}`, exact: true }).click();
+    await page.getByRole('menuitem', { name: `Criar filtro: ${column}`, exact: true }).click();
     await page.waitForFunction(() => !document.querySelector('#filter-pop').hidden);
     assert.equal(await page.locator('#fp-col').inputValue(), column); assert.equal(await page.locator('#fp-val').inputValue(), complete.fields[column]);
     const request = await page.evaluate(() => window.__mockRequests.findLast(item => item.cmd === 'analysis_field_text'));
@@ -93,7 +93,7 @@ try {
   phase = 'exact scalar filter';
   const column = 'java.trace.fingerprint', fingerprint = complete.fields[column];
   await page.locator(`.java-trace-scalar-value[data-column="${column}"]`).click({ button: 'right' });
-  await page.getByRole('button', { name: `Criar filtro: ${column}`, exact: true }).click(); await page.locator('#fp-apply').click();
+  await page.getByRole('menuitem', { name: `Criar filtro: ${column}`, exact: true }).click(); await page.locator('#fp-apply').click();
   await page.waitForFunction(value => state.total === 1 && state.rows.length === 1 && state.rows[0].fields['java.trace.fingerprint'] === value, fingerprint);
   results.scalarFilter = await page.evaluate(() => ({ filters: state.filters, eventRef: state.rows[0].event_ref }));
   assert.equal(results.scalarFilter.eventRef, row.eventRef);

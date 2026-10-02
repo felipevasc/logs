@@ -588,9 +588,9 @@ test('clipboard failure remains a failure, and an old clipboard completion canno
 });
 
 function openNewContextMenu(h) {
-  h.context.el = () => ({ style: {}, remove() {}, getBoundingClientRect: () => ({ width: 120, height: 80 }) });
-  h.context.document.body = { appendChild() {} };
-  h.context.innerWidth = 800; h.context.innerHeight = 600;
+  // This test owns the app's cancellation boundary; controller DOM behavior has
+  // separate executable coverage in frontend-context-menu.test.mjs.
+  h.context.window.ContextMenu = { create: () => ({ open() {}, close() {} }) };
   vm.runInContext(app.slice(app.indexOf('let ctxEl = null;'), app.indexOf('\nconst trunc =')), h.context, { filename: 'app.js:showCtxMenu' });
   h.context.showCtxMenu(10, 10, []);
 }

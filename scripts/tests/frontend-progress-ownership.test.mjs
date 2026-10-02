@@ -28,12 +28,14 @@ const context = vm.createContext({
     },
   },
 });
+vm.runInContext(readFileSync(new URL('../../frontend/waiting-progress.js', import.meta.url), 'utf8'), context);
 vm.runInContext(listener, context);
 const emit = (operationId, phase, extra = {}) => callback({ payload: { operationId, phase, phaseId: phase, completed: 10, total: 100, unit: 'registros', cancellable: true, ...extra } });
 
 emit('load-new', 'Retomando metadados');
 assert.equal(bars.at(-1)[0], 'Retomando metadados');
 assert.equal(state.progressOperationId, 'load-new');
+assert.equal(bars.at(-1)[5].operationId, 'load-new', 'the animation receives the same admitted operation');
 emit('count-old', 'Confirmando filtro anterior');
 assert.equal(received.at(-1), 'count-old', 'each task still receives its own detailed progress');
 assert.equal(bars.length, 1, 'an unrelated query must not overwrite the active source load overlay');
@@ -59,15 +61,24 @@ assert.equal(bars.length, 2, 'replaced tasks remain ignored');
 
 const nodes = new Map(), timers = [];
 context.$ = id => { if (!nodes.has(id)) nodes.set(id, { hidden: false, style: {}, parentElement: {} }); return nodes.get(id); };
-context.document = { querySelectorAll: () => [] };
+const presentationEvents = new Map();
+context.document = { querySelectorAll: () => [], addEventListener: (type, callback) => presentationEvents.set(type, callback) };
 context.pushLoadStep = () => {};
 context.setTimeout = fn => timers.push(fn);
+const waitingViews = [];
+context.window.WaitingVisuals = { mount: (_host, snapshot) => {
+  const view = { snapshot, destroyed: false, update(next) { this.snapshot = next; }, destroy() { this.destroyed = true; } }; waitingViews.push(view); return view;
+} };
 vm.runInContext(source.slice(source.indexOf('let loadStepCount ='), source.indexOf('\nfunction pushLoadStep')), context);
 context.showLoadOverlay('Aplicando configuração de data/hora', 'timestamp-config');
 emit('timestamps', 'Recalculando timestamps');
 assert.equal(bars.at(-1)[0], 'Recalculando timestamps', 'timestamp configuration keeps its own foreground progress');
 emit('count-old', 'Contagem em segundo plano');
 assert.equal(bars.at(-1)[0], 'Recalculando timestamps');
+presentationEvents.get('task-state-change')({ detail: { operationId: 'count-old', state: 'cancelling' } });
+assert.equal(waitingViews[0].snapshot.state, 'running', 'unrelated cancellation cannot stop the foreground scene');
+presentationEvents.get('task-state-change')({ detail: { operationId: 'timestamps', state: 'cancelling' } });
+assert.equal(waitingViews[0].snapshot.state, 'cancelling', 'the owning cancellation immediately stops the foreground scene');
 // Execute the real caller and shared receipt-bearing helper. Every file must
 // address the exact named operation shown by the timestamp progress overlay.
 const timestampState = { cases: { active: 'case-a' }, sourcePublication: { generation: 4 } };
@@ -108,9 +119,15 @@ assert.equal(timestampState.loadOverlay, false);
 assert.equal(timestampRefreshed, 1); assert.equal(timestampReleased, 1);
 assert.ok(!timestampNotices.some(message => message.includes('Falha')), 'the actual apply path completed successfully');
 context.hideLoadOverlay(true);
+assert.equal(context.$('#load-overlay').hidden, true, 'success never waits for a decorative animation to finish');
+assert.equal(waitingViews[0].destroyed, true, 'settled foreground view releases its observers');
 context.showLoadOverlay('Nova fonte');
-timers.shift()();
+assert.equal(timers.length, 0, 'no previous success timer can hide a newer load');
 assert.equal(context.$('#load-overlay').hidden, false, 'previous success animation cannot hide a newer load');
+presentationEvents.get('task-state-change')({ detail: { operationId: 'load-before-progress', latestKey: 'source-load', state: 'running', started: true } });
+owner = null; // cancelLatest removes the owner map before emitting its cancellation.
+presentationEvents.get('task-state-change')({ detail: { operationId: 'load-before-progress', state: 'cancelling' } });
+assert.equal(waitingViews.at(-1).snapshot.state, 'cancelling', 'cancelLatest before first progress retains the bound foreground identity');
 vm.runInContext(source.slice(source.indexOf('function updateOperation('), source.indexOf('\nfunction cancelWorkbarTask')), context);
 state.activeOperation = { kind: 'load' };
 context.updateOperation('Artefato carregado', 'Sessão em gravação', null, false);

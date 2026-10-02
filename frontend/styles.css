@@ -962,6 +962,9 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1
 .ctx-item:hover i { color: var(--accent); }
 .ctx-item.danger:hover { background: rgba(255, 123, 114, 0.12); color: var(--lv-erro); }
 .ctx-item.danger:hover i { color: var(--lv-erro); }
+.ctx-item[aria-disabled="true"] { opacity: .45; cursor: default; }
+.ctx-item[aria-disabled="true"]:hover { background: transparent; color: var(--text-0); }
+.ctx-item[aria-disabled="true"]:hover i { color: var(--text-2); }
 .ctx-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ctx-sep { height: 1px; margin: 5px 8px; background: var(--border); }
 

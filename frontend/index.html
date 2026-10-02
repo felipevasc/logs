@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="vendor/uplot/uPlot.min.css" />
   <link rel="stylesheet" href="styles.css" />
   <link rel="stylesheet" href="workspace.css" />
+  <link rel="stylesheet" href="waiting-visuals.css" />
   <link rel="stylesheet" href="analysis-workbench.css" />
   <link rel="stylesheet" href="timeline-refinements.css" />
   <link rel="stylesheet" href="timeline-export.css" />
@@ -129,17 +130,16 @@
 
   <!-- ===================== OVERLAY DE CARREGAMENTO ===================== -->
   <div id="load-overlay" class="load-overlay" hidden>
-    <div class="load-stage">
-      <div class="load-anim" aria-hidden="true">
-        <div class="load-ring"></div>
-        <div class="load-doc"><i class="fas fa-file-lines"></i><span class="load-scan"></span></div>
-        <span class="load-bit b1"></span><span class="load-bit b2"></span><span class="load-bit b3"></span>
-      </div>
+    <div class="load-stage semantic-load-stage">
+      <div id="load-visual"></div>
+      <details id="load-progress-details" class="load-progress-details">
+      <summary>Detalhes do processamento</summary>
       <div id="load-phase" class="load-phase">Preparando…</div>
       <div id="load-volume" class="load-volume"></div>
       <div id="load-eta" class="load-eta"></div>
       <div class="load-bar"><div id="load-bar-fill"></div></div>
       <ol id="load-steps" class="load-steps"></ol>
+      </details>
     </div>
   </div>
 
@@ -1033,6 +1033,8 @@
   <script src="detail-fields.js"></script>
   <script src="java-trace.js"></script>
   <script src="performance-core.js"></script>
+  <script src="waiting-visuals.js"></script>
+  <script src="waiting-progress.js"></script>
   <script src="case-evidence.js"></script>
   <script src="case-evidence-session.js"></script>
   <script src="case-evidence-analysis.js"></script>
@@ -1044,6 +1046,7 @@
   <script src="case-evidence-display.js"></script>
   <script src="case-evidence-transfer.js"></script>
   <script src="case-evidence-recovery.js"></script>
+  <script src="context-menu.js"></script>
   <script src="app.js"></script>
   <script src="analysis-context.js"></script>
   <script src="tasks.js"></script>

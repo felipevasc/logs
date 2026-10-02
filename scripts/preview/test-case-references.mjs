@@ -8,7 +8,7 @@ const output=resolve('output/playwright');mkdirSync(output,{recursive:true});
 const browser=await launchBrowser(),page=await browser.newPage({viewport:{width:1440,height:960},reducedMotion:'reduce'});
 page.setDefaultTimeout(20000);let phase='startup';const errors=[],results={};page.on('pageerror',error=>errors.push(error.message));
 const settled=async()=>{await page.waitForFunction(()=>explorerAnalytics.get(explorerKey())?.status==='done');await page.evaluate(()=>settleFilterTabCounts());await page.waitForFunction(()=>Tasks.pending()===0);};
-const manager=async()=>{await page.locator('#btn-case-menu').click();await page.getByRole('button',{name:'Referências deste Caso',exact:true}).click();await page.waitForFunction(()=>!document.querySelector('#rf-reload').disabled&&document.querySelector('#rf-status').textContent==='');};
+const manager=async()=>{await page.locator('#btn-case-menu').click();await page.getByRole('menuitem',{name:'Referências deste Caso',exact:true}).click();await page.waitForFunction(()=>!document.querySelector('#rf-reload').disabled&&document.querySelector('#rf-status').textContent==='');};
 try{
   await page.goto(process.argv[2]||'http://127.0.0.1:4174');
   await page.waitForFunction(()=>window.WorkspaceContext?.ready&&!WorkspaceContext.changing&&state.loaded&&!state.loadOverlay&&document.querySelector('#load-overlay').hidden);

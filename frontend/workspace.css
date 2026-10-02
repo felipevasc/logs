@@ -90,6 +90,18 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 @media(max-width:1200px){:root{--nav-w:158px}.workspace-nav{padding-left:10px;padding-right:10px}.workspace-brand{font-size:16px}.workspace-page{padding:23px}.metric{padding:18px}.metric-value{font-size:26px}.overview-grid{grid-template-columns:1fr}.compare-form{gap:12px}.compare-period>div{flex-direction:column}.compare-period input{width:100%}.side{width:205px;min-width:205px}.topbar{padding:0 20px}.topbar-case .case-select{width:140px}.viewbar{flex-wrap:wrap}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 
+/* First 0.11 waiting pilots retain the existing compact load surface. */
+.semantic-load-stage { gap: 10px; max-height: calc(100vh - var(--topbar-h) - 40px); overflow-y: auto; }
+#load-visual { width: 100%; }
+.load-progress-details { width: 100%; min-width: 0; }
+.load-progress-details > summary { padding: 5px 0; color: var(--text-1); font-size: 12px; cursor: pointer; }
+.load-progress-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.load-progress-details[open] > summary { margin-bottom: 8px; }
+.load-progress-details .load-phase { font-size: 13px; overflow-wrap: anywhere; }
+.load-progress-details .load-volume, .load-progress-details .load-eta { overflow-wrap: anywhere; }
+.load-progress-details .load-steps { margin-top: 10px; }
+.area-loading-semantic .wv-art { inline-size: 144px; block-size: 72px; flex-basis: 72px; }
+
 .source-filter{background:transparent;border:0;border-top:1px solid var(--border);width:100%;text-align:left;color:var(--text-0);cursor:pointer}.source-filter:hover{background:var(--hover)}
 .latency-values{display:flex;justify-content:space-between;padding:6px 22px 0;gap:20px}.latency-values span{display:block;color:var(--text-2);font-size:10px;margin-bottom:8px}.latency-values strong{font-size:21px;font-weight:550;font-variant-numeric:tabular-nums}.recipe-list{padding:0 10px 10px}.recipe-list button{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:14px 11px;color:var(--text-1);background:transparent;border:0;border-top:1px solid var(--border);cursor:pointer;font-size:12px}.recipe-list button:hover{color:var(--accent)}.recipe-list button i:last-child{margin-left:auto;font-size:10px}
 

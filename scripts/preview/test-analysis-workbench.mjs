@@ -127,7 +127,7 @@ try {
 
   // Each dimension opens the editable composer without applying the whole cell.
   await page.locator("#cube-table .cube-leaf-row .cube-value").first().click({ button: "right" });
-  await page.getByRole("button", { name: "Criar filtro: Nível", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Criar filtro: Nível", exact: true }).click();
   await page.locator("#filter-pop").waitFor({ state: "visible" });
   assert.equal(await page.locator("#fp-col").inputValue(), "level");
   assert.equal(await page.locator("#fp-op").inputValue(), "equals_exact");
