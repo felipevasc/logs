@@ -22,12 +22,12 @@ window.WaitingVisuals = (() => {
   // Exact protocol IDs, not fuzzy matches against localized labels or opaque operation IDs.
   const PHASES = Object.freeze({
     'metadata-scan': 'reading', 'metadata-json-boundaries': 'reading',
-    'metadata-columns': 'reading', 'metadata-validate': 'reading',
-    'metadata-map-validate': 'reading', 'analytics-time-index': 'reading',
-    'pivot-values': 'reading', 'canonical-verify': 'reading',
+    'metadata-columns': 'reading', 'metadata-validate': 'verification',
+    'metadata-map-validate': 'verification', 'analytics-time-index': 'reading',
+    'pivot-values': 'reading', 'canonical-verify': 'verification',
     'metadata-checkpoint-write': 'checkpoint', 'metadata-checkpoint-sync': 'checkpoint',
     'metadata-checkpoint-publish': 'checkpoint', 'metadata-checkpoint-committed': 'checkpoint',
-    'analytics-select': 'calculation', 'analytics-verify': 'calculation',
+    'analytics-select': 'calculation', 'analytics-verify': 'verification',
     'analytics-sql': 'calculation',
     // Explicit adapter IDs for genuinely pending commands, not native subphases.
     'command:aggregate_events': 'calculation', 'command:pivot': 'calculation',
@@ -83,8 +83,9 @@ window.WaitingVisuals = (() => {
       metric, details, elapsedMs, variant: variantFor(operationId, family), motionMode: elapsedMs !== null && elapsedMs >= 4000 ? 'loop' : 'gesture' };
   }
 
-  // A shared repertoire, with explicit family safe points. New adapters must prove
-  // an empty hand / parked tool at BOTH cycle endpoints before enabling reactions.
+  // A shared repertoire with explicit family safe points. Adapters must release
+  // or park their tool before the shared reaction starts, and recover it before
+  // resuming the exact task pose. Only the long work loop may enter this bridge.
   const repertoire = Object.freeze({
     coffee: Object.freeze({ minElapsedMs: 45000, durationMs: 32000, cooldown: 4, weight: 1 }),
     review: Object.freeze({ minElapsedMs: 15000, durationMs: 10000, cooldown: 2, weight: 4 }),
@@ -93,9 +94,34 @@ window.WaitingVisuals = (() => {
   const adapters = Object.freeze({
     reading: Object.freeze({ reactions: true, homeX: 0, head: -4, cycleMs: 7200, safePoint: 'filed-sheet-empty-hand' }),
     checkpoint: Object.freeze({ reactions: true, homeX: 20, head: 4, cycleMs: 6800, safePoint: 'closed-drawer-released-handle' }),
-    calculation: Object.freeze({ reactions: false, safePoint: 'tile-in-hand-needs-parking' }),
-    composition: Object.freeze({ reactions: false, safePoint: 'proof-in-hand-needs-parking' })
+    calculation: Object.freeze({ reactions: true, homeX: 26, anchorX: 20, head: 4, cycleMs: 6400, bridgeMs: 1200, safePoint: 'filed-tile-empty-hand' }),
+    composition: Object.freeze({ reactions: true, homeX: 24, anchorX: 20, head: 8, cycleMs: 7600, bridgeMs: 3200, safePoint: 'proof-parked-on-existing-bed' }),
+    // Empty hand at both endpoints; shares the checkpoint reaction anchor without a bridge.
+    verification: Object.freeze({ reactions: true, homeX: 20, head: 4, cycleMs: 9600, safePoint: 'lens-docked-empty-hand' })
   });
+  // Measured decoration age is private. It is never written back to derive(),
+  // status/details or the application's operation receipt. A quiet pending promise
+  // can become eligible without transport events, polling or a scheduling timer.
+  function createElapsedClock(now) {
+    let scope = '', base = null, anchor = 0, lastNow = 0;
+    function tick() {
+      const sampled = measured(now());
+      if (sampled !== null) lastNow = Math.max(lastNow, sampled);
+      return lastNow;
+    }
+    return Object.freeze({
+      observe(model) {
+        const nextScope = `${model.operationId}\u0000${model.phaseId}`;
+        const supplied = measured(model.elapsedMs);
+        if (nextScope !== scope) {
+          scope = nextScope; base = supplied; anchor = tick();
+        } else if (supplied !== null) { base = supplied; anchor = tick(); }
+        // A sparse same-phase receipt replaces displayed values, but cannot erase
+        // an earlier measured anchor used only for decorative eligibility.
+      },
+      read() { return base === null ? null : Math.min(Number.MAX_SAFE_INTEGER, base + tick() - anchor); }
+    });
+  }
   function seedFor(value) {
     let hash = 2166136261;
     for (const character of String(value)) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619) >>> 0;
@@ -175,6 +201,9 @@ window.WaitingVisuals = (() => {
   const groupTile = `<rect class="wv-task-tile" x="93" y="47" width="10" height="10" rx="2.5"/><path class="wv-task-tile-mark" d="M96 50h4v4h-4Z"/>`;
   // One proof is fed into a hand-operated press, then retrieved by the same hand.
   const composeSheet = `<rect class="wv-task-paper" x="93" y="52" width="16" height="11" rx="1.3"/><path class="wv-task-detail" d="M96 55h9m-9 2.5h5m-5 2.5h9"/>`;
+  // The same lens is either docked or carried by the hand. Its handle passes through
+  // the existing palm at (91,55); no independent translation can detach the tool.
+  const verifyLens = `<path class="wv-verify-handle" d="m91 55 6.5-5.3"/><circle class="wv-verify-lens" cx="102" cy="46" r="6.3"/><path class="wv-verify-glint" d="M98.2 44.7a4 4 0 0 1 3-2.6"/>`;
   const scenes = Object.freeze({
     // The carried sheet is a child of the forearm/hand, never an independently moving prop.
     // Source/destination transforms match the hand's 18° + 30° − 48° contact pose exactly.
@@ -263,10 +292,25 @@ window.WaitingVisuals = (() => {
         </g>
       </g>
       <g class="wv-compose-actor" transform="translate(24 0)">${taskRobot(`<g class="wv-compose-held">${composeSheet}</g>`)}</g>`,
+    // Station ends at x162, leaving the future coffee hatch region clear.
+    // Dock matrix = translate(20,0) · arm(35°) · hand(-5°), using the shared pivots.
+    verification: `<path class="wv-verify-rail wv-rail" d="M39 83h123m-115-3v3m110-3v3"/>
+      <g class="wv-verify-station">
+        <path class="wv-task-machine" d="M106 71h56l-3 5h-50Zm6 5v5m43-5v5"/>
+        <path class="wv-task-edge" d="M121 60v11m31-16v16"/>
+        <rect class="wv-task-inset" x="117" y="29" width="20" height="32" rx="2"/>
+        <g class="wv-verify-document"><path class="wv-task-paper" d="M120 33h10l4 4v21h-14Z"/>
+          <path class="wv-task-detail" d="M130 33v4h4m-11 5h8m-8 5h5m-5 5h8"/></g>
+        <g class="wv-verify-reference"><rect class="wv-task-inset" x="142" y="30" width="17" height="25" rx="2"/>
+          <path class="wv-task-detail" d="M146 36h9m-9 6h7m-7 5h9"/></g>
+        <g class="wv-verify-docked" transform="matrix(0.866025403784 0.5 -0.5 0.866025403784 54.735978714537 -28.578796792173)">${verifyLens}</g>
+        <path class="wv-verify-cradle" d="M113 65v4h14v-4m-7 4v2"/>
+      </g>
+      <g class="wv-verify-actor" transform="translate(20 0)">${taskRobot(`<g class="wv-verify-held">${verifyLens}</g>`)}</g>`,
     neutral: `<path class="wv-rail" d="M70 83h56"/><g class="wv-idle-actor" transform="translate(29 0)">${taskRobot()}</g>`
   });
 
-  const coffeeCup = `<path class="wv-cup-shell" d="M92 50h7v6a2 2 0 0 1-2 2h-3a2 2 0 0 1-2-2Z"/><path class="wv-cup-handle" d="M92 52h-2v4h2"/><path class="wv-cup-rim" d="M93 50h5"/>`;
+  const coffeeCup = `<g class="wv-cup-steam"><path d="M94 47c-1-1 1-2 0-3"/><path d="M97 46c-1-1 1-2 0-3"/></g><path class="wv-cup-shell" d="M92 50h7v6a2 2 0 0 1-2 2h-3a2 2 0 0 1-2-2Z"/><path class="wv-cup-handle" d="M92 52h-2v4h2"/><path class="wv-cup-rim" d="M93 50h5"/>`;
   function reactionScenery(family) {
     if (!adapters[family]?.reactions) return '';
     // The hatch and cup share the same measured contact coordinates as the hand.
@@ -277,8 +321,10 @@ window.WaitingVisuals = (() => {
       <g class="wv-kitchen-hatch"><path class="wv-kitchen-wall" d="M168 43h19v18h-19Z"/><path class="wv-kitchen-handle" d="M171 55h4"/>
         <path class="wv-kitchen-detail" d="M172 47h11"/></g><path class="wv-kitchen-detail" d="M170 72h13m-13 3h9"/>
       <path class="wv-rail" d="M165 83h25"/></g>`;
-    const actor = taskRobot(`<g class="wv-cup-held"><g class="wv-cup-wrist">${coffeeCup}</g></g>`).replaceAll('wv-task', 'wv-react');
-    return `${kitchen}<g class="wv-reaction-actor">${actor}</g>`;
+    const proof = family === 'composition' ? `<g class="wv-proof-held">${composeSheet}</g>` : '';
+    const parked = family === 'composition' ? `<g class="wv-proof-parked" transform="translate(26.341973495 1.717610627)">${composeSheet}</g>` : '';
+    const actor = taskRobot(`${proof}<g class="wv-cup-held"><g class="wv-cup-wrist">${coffeeCup}</g></g>`).replaceAll('wv-task', 'wv-react');
+    return `${kitchen}${parked}<g class="wv-reaction-actor">${actor}</g>`;
   }
 
   function mount(host, initialSnapshot = {}, options = {}) {
@@ -293,8 +339,9 @@ window.WaitingVisuals = (() => {
     const control = document.createElement('button'); control.className = 'wv-motion-toggle'; control.type = 'button';
     root.append(art, status, metric, details, control); host.append(root);
     let current, sceneKey = '', destroyed = false, visible = true, intersecting = false;
-    let director, directorOwner = '', workSignal, episodeSignal, moving = false;
+    let director, directorOwner = '', workSignal, episodeSignal, adapterSignal, moving = false, deferredCompletion = null;
     let motionEnabled = options.motionEnabled !== false;
+    const elapsedClock = createElapsedClock(typeof view.performance?.now === 'function' ? () => view.performance.now() : () => 0);
     const media = typeof view.matchMedia === 'function' ? view.matchMedia('(prefers-reduced-motion: reduce)') : null;
 
     function syncMotion() {
@@ -310,30 +357,41 @@ window.WaitingVisuals = (() => {
       control.textContent = motionEnabled ? 'Pausar animação' : 'Retomar animação';
       control.setAttribute('aria-label', motionEnabled ? 'Pausar apenas a animação; a operação continua' : 'Retomar apenas a animação; a operação continua');
       control.setAttribute('aria-pressed', String(!motionEnabled));
+      // CSS can finish just before a pause but deliver its end event afterward.
+      // Resume consumes that one already-reached endpoint, never a queue of work
+      // iterations or future reactions. Every other paused event is discarded.
+      if (moving && deferredCompletion) {
+        const completion = deferredCompletion; deferredCompletion = null;
+        if (completion.stage === root.dataset.adapter && completion.episode === root.dataset.episode) boundary(completion);
+      }
     }
     function update(snapshot = {}) {
       if (destroyed) return false;
       current = derive(snapshot);
+      elapsedClock.observe(current);
       // Counters/elapsed receipts do not rebuild SVG or restart its CSS timeline.
       const key = `${current.operationId}\u0000${current.family}`;
       if (key !== sceneKey) {
+        deferredCompletion = null;
         art.innerHTML = `<svg viewBox="0 0 192 96" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg"><g class="wv-work">${scenes[current.family]}</g>${reactionScenery(current.family)}</svg>`;
         // Actual DOM targets, never selectors from an event or an old SVG instance.
-        workSignal?.remove(); episodeSignal?.remove();
+        workSignal?.remove(); episodeSignal?.remove(); adapterSignal?.remove();
         workSignal = document.createElement('span'); workSignal.className = 'wv-work-boundary';
         episodeSignal = document.createElement('span'); episodeSignal.className = 'wv-episode-boundary';
-        workSignal.setAttribute('aria-hidden', 'true'); episodeSignal.setAttribute('aria-hidden', 'true');
-        art.append(workSignal, episodeSignal);
+        adapterSignal = document.createElement('span'); adapterSignal.className = 'wv-adapter-boundary';
+        workSignal.setAttribute('aria-hidden', 'true'); episodeSignal.setAttribute('aria-hidden', 'true'); adapterSignal.setAttribute('aria-hidden', 'true');
+        art.append(workSignal, episodeSignal, adapterSignal);
         if (!director || directorOwner !== current.operationId) {
           director = createDirector(current.operationId, options.reactionSeed ?? current.operationId);
           directorOwner = current.operationId;
         } else director.finish();
-        root.dataset.episode = 'work'; root.dataset.reactionVariant = 'a'; root.dataset.animated = 'false';
+        root.dataset.episode = 'work'; root.dataset.adapter = 'work'; root.dataset.reactionVariant = 'a'; root.dataset.animated = 'false';
         sceneKey = key;
       }
+      if (!current.canAnimate) deferredCompletion = null;
       if (!current.canAnimate && root.dataset.episode !== 'work') {
         director.finish();
-        root.dataset.episode = 'work';
+        root.dataset.episode = 'work'; root.dataset.adapter = 'work';
       }
       root.dataset.family = current.family;
       root.dataset.variant = current.variant;
@@ -350,12 +408,34 @@ window.WaitingVisuals = (() => {
       return true;
     }
     function boundary(event) {
-      if (destroyed || !moving || !current?.canAnimate || !root.isConnected || document.hidden || media?.matches || !visible || !intersecting || !motionEnabled || event.pseudoElement) return;
+      if (destroyed || !current?.canAnimate || !root.isConnected || event.pseudoElement) return;
+      if (!moving || document.hidden || media?.matches || !visible || !intersecting || !motionEnabled) {
+        let completedDuration = null;
+        if (event.type === 'animationend') {
+          if (event.target === episodeSignal && event.animationName === 'wv-episode-boundary' && root.dataset.adapter === 'react') completedDuration = repertoire[root.dataset.episode]?.durationMs;
+          else if (event.target === adapterSignal && ['prepare', 'resume'].includes(root.dataset.adapter) && event.animationName === `wv-${root.dataset.adapter}-boundary`) completedDuration = adapters[current.family]?.bridgeMs;
+        }
+        const elapsed = measured(event.elapsedTime);
+        if (completedDuration > 0 && elapsed !== null && Math.abs(elapsed * 1000 - completedDuration) < 1) {
+          deferredCompletion = { type: event.type, target: event.target, animationName: event.animationName,
+            elapsedTime: elapsed, stage: root.dataset.adapter, episode: root.dataset.episode };
+        }
+        return;
+      }
       if (event.target === workSignal && event.type === 'animationiteration' && event.animationName === 'wv-work-boundary' && root.dataset.episode === 'work') {
-        const next = director.boundary(current);
-        if (next) { root.dataset.episode = next.episode; root.dataset.reactionVariant = next.variant; }
-      } else if (event.target === episodeSignal && event.type === 'animationend' && event.animationName === 'wv-episode-boundary' && root.dataset.episode !== 'work') {
-        director.finish(); root.dataset.episode = 'work'; syncMotion();
+        const next = director.boundary({ ...current, elapsedMs: elapsedClock.read() });
+        if (next) {
+          root.dataset.episode = next.episode; root.dataset.reactionVariant = next.variant;
+          root.dataset.adapter = adapters[current.family].bridgeMs ? 'prepare' : 'react';
+        }
+      } else if (event.target === episodeSignal && event.type === 'animationend' && event.animationName === 'wv-episode-boundary' && root.dataset.adapter === 'react') {
+        if (adapters[current.family].bridgeMs) root.dataset.adapter = 'resume';
+        else { director.finish(); root.dataset.episode = 'work'; root.dataset.adapter = 'work'; syncMotion(); }
+      } else if (event.target === adapterSignal && event.type === 'animationend' && root.dataset.episode !== 'work') {
+        if (root.dataset.adapter === 'prepare' && event.animationName === 'wv-prepare-boundary') root.dataset.adapter = 'react';
+        else if (root.dataset.adapter === 'resume' && event.animationName === 'wv-resume-boundary') {
+          director.finish(); root.dataset.episode = 'work'; root.dataset.adapter = 'work'; syncMotion();
+        }
       }
     }
     function setMotionEnabled(enabled) { if (destroyed) return; motionEnabled = !!enabled; syncMotion(); }
@@ -381,10 +461,10 @@ window.WaitingVisuals = (() => {
     update(initialSnapshot);
     return Object.freeze({
       element: root, update, setVisible, setMotionEnabled,
-      inspect: () => director?.inspect(),
+      inspect: () => ({ ...director?.inspect(), adapterStage: root.dataset.adapter }),
       destroy() {
         if (destroyed) return;
-        destroyed = true;
+        destroyed = true; deferredCompletion = null;
         root.dataset.motion = 'static';
         observer?.disconnect();
         document.removeEventListener('visibilitychange', syncMotion);
@@ -397,5 +477,5 @@ window.WaitingVisuals = (() => {
       }
     });
   }
-  return Object.freeze({ derive, mount, repertoire, adapters, createDirector });
+  return Object.freeze({ derive, mount, repertoire, adapters, createDirector, createElapsedClock });
 })();

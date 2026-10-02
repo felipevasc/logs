@@ -30,6 +30,7 @@ const errors = [], results = {
 page.on('pageerror', error => errors.push(error.message));
 const mark = label => results.markers.push({ label, offsetMs: Date.now() - started });
 const roots = page.locator('#waiting-reaction-fixture .waiting-visual');
+const families = ['reading', 'checkpoint', 'calculation', 'composition'];
 const scene = family => page.locator(`#reaction-${family} .waiting-visual`);
 let phase = 'startup', failure = null;
 const snap = async filename => {
@@ -37,7 +38,8 @@ const snap = async filename => {
   results.screenshots.push(filename);
 };
 const states = () => roots.evaluateAll(nodes => nodes.map(root => ({
-  family: root.dataset.family, episode: root.dataset.episode, motion: root.dataset.motion,
+  family: root.dataset.family, episode: root.dataset.episode, adapter: root.dataset.adapter, motion: root.dataset.motion,
+  kitchenOpacity: root.querySelector('.wv-kitchen') ? Number(getComputedStyle(root.querySelector('.wv-kitchen')).opacity) : null,
   variant: root.dataset.reactionVariant, status: root.querySelector('.wv-status').textContent,
   metric: root.querySelector('.wv-metric').textContent,
   art: root.querySelector('.wv-art').getBoundingClientRect().toJSON(),
@@ -99,8 +101,9 @@ const pauseAndResumeReading = async (label, updateReceipt = false) => {
   mark(label);
   return { before, requested, paused, stillPaused, resumed };
 };
-const bothEpisode = episode => page.waitForFunction(episode => [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')]
-  .length === 2 && [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')].every(root => root.dataset.episode === episode), episode, { timeout: 45000 });
+const allEpisode = episode => page.waitForFunction(episode => [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')]
+  .length === 4 && [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')].every(root => root.dataset.episode === episode
+    && root.dataset.adapter === (episode === 'coffee' ? 'react' : 'work')), episode, { timeout: 50000 });
 
 try {
   await page.goto(process.argv[2] || 'http://127.0.0.1:4173');
@@ -113,11 +116,11 @@ try {
     const transitions = document.getAnimations().filter(animation => animation instanceof CSSTransition);
     await Promise.all(transitions.map(animation => animation.finished.catch(() => {})));
   });
-  phase = 'two real component families';
+  phase = 'four real component families';
   await page.evaluate(() => {
     const panel = document.createElement('section'); panel.id = 'waiting-reaction-fixture';
     panel.setAttribute('aria-label', 'Comparação de reações: dados sintéticos');
-    Object.assign(panel.style, { position: 'fixed', inset: '160px auto auto 50%', transform: 'translateX(-50%)',
+    Object.assign(panel.style, { position: 'fixed', inset: '100px auto auto 50%', transform: 'translateX(-50%)',
       width: '720px', maxWidth: 'calc(100vw - 32px)', padding: '24px', zIndex: '20000',
       border: '1px solid var(--border)', borderRadius: '12px', background: 'var(--bg-1)', color: 'var(--text-0)' });
     const heading = document.createElement('h2'); heading.textContent = 'Um assistente, tarefas diferentes';
@@ -128,7 +131,8 @@ try {
     const pair = document.createElement('div'); Object.assign(pair.style, { display: 'flex', gap: '20px', justifyContent: 'center', flexWrap: 'wrap' });
     panel.append(heading, attribution, pair); document.body.append(panel);
     window.__reactionPreview = { views: {}, receipts: {}, events: [], observers: [], svg: {} };
-    for (const [family, phaseId, label] of [['reading', 'metadata-scan', 'Indexando registros'], ['checkpoint', 'metadata-checkpoint-sync', 'Confirmando gravação']]) {
+    for (const [family, phaseId, label] of [['reading', 'metadata-scan', 'Indexando registros'], ['checkpoint', 'metadata-checkpoint-sync', 'Confirmando gravação'],
+      ['calculation', 'command:aggregate_events', 'Calculando o recorte'], ['composition', 'command:case_report_render', 'Compondo relatório']]) {
       const host = document.createElement('section'); host.id = `reaction-${family}`;
       Object.assign(host.style, { width: '310px', padding: '12px 8px', border: '1px solid var(--border)', borderRadius: '8px' });
       pair.append(host);
@@ -136,71 +140,83 @@ try {
         completed: 1200, total: 6300, unit: 'registros', elapsedMs: 60000 };
       // Seeds select coffee at the first safe boundary, without changing eligibility,
       // choreography speed or the product's normal random-selection contract.
-      const reactionSeed = family === 'reading' ? 32 : 31;
+      const reactionSeed = { reading: 32, checkpoint: 31, calculation: 7, composition: 6 }[family];
       const view = WaitingVisuals.mount(host, receipt, { reactionSeed });
       __reactionPreview.views[family] = view; __reactionPreview.receipts[family] = receipt;
       __reactionPreview.svg[family] = view.element.querySelector('svg');
-      const observer = new MutationObserver(records => {
-        for (const record of records) if (record.attributeName === 'data-episode') {
-          __reactionPreview.events.push({ family, episode: view.element.dataset.episode, timeMs: performance.now() });
-        }
+      let previous = `${view.element.dataset.episode}:${view.element.dataset.adapter}`;
+      const observer = new MutationObserver(() => {
+        const { episode, adapter } = view.element.dataset, key = `${episode}:${adapter}`;
+        if (key !== previous) { __reactionPreview.events.push({ family, episode, adapter, timeMs: performance.now() }); previous = key; }
       });
-      observer.observe(view.element, { attributes: true, attributeFilter: ['data-episode'] });
+      observer.observe(view.element, { attributes: true, attributeFilter: ['data-episode', 'data-adapter'] });
       __reactionPreview.observers.push(observer);
     }
   });
   await page.waitForFunction(() => [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')].every(root => root.dataset.motion === 'running'));
   results.initial = await states();
-  assert.deepEqual(results.initial.map(s => s.family), ['reading', 'checkpoint']);
+  assert.deepEqual(results.initial.map(s => s.family), families);
   for (const state of results.initial) {
     assert.equal(state.svgCount, 1); assert.equal(state.episode, 'work');
+    assert.equal(state.kitchenOpacity, 0, 'coffee cabinet is absent from the normal task');
     assert.ok(Math.abs(state.art.width - 240) < .5 && Math.abs(state.art.height - 120) < .5);
   }
   mark('natural-work-start');
-  await bothEpisode('coffee');
-  mark('both-coffee-started');
-  await snap('waiting-reactions-coffee-two-families-dark.png');
+  await allEpisode('coffee');
+  mark('all-coffee-started');
+  // Let each transient cabinet finish its entrance at natural speed; the robot
+  // starts approaching only after the cabinet is fully available.
+  await page.waitForTimeout(1800);
+  await snap('waiting-reactions-coffee-four-families-dark.png');
   // No seeking, playback-rate change or artificial DOM pose during this segment.
-  await bothEpisode('work');
-  mark('both-returned-to-work');
+  await allEpisode('work');
+  mark('all-returned-to-work');
   results.sequence = await page.evaluate(() => ({
     events: __reactionPreview.events,
     stableSvg: Object.entries(__reactionPreview.views).every(([family, view]) => view.element.querySelector('svg') === __reactionPreview.svg[family]),
     inspection: Object.fromEntries(Object.entries(__reactionPreview.views).map(([family, view]) => [family, view.inspect()])),
   }));
   assert.equal(results.sequence.stableSvg, true, 'episodes retain each scene and its mounted SVG');
-  for (const family of ['reading', 'checkpoint']) {
+  for (const family of families) {
     const events = results.sequence.events.filter(event => event.family === family);
-    const firstCoffee = events.findIndex(event => event.episode === 'coffee');
-    assert.ok(firstCoffee >= 0); assert.equal(events[firstCoffee + 1]?.episode, 'work');
+    const firstCoffee = events.findIndex(event => event.episode === 'coffee' && event.adapter === 'react');
+    assert.ok(firstCoffee >= 0);
+    assert.ok(['work', 'resume'].includes(events[firstCoffee + 1]?.adapter));
     assert.ok(events[firstCoffee + 1].timeMs - events[firstCoffee].timeMs >= 31000, 'coffee plays a complete natural-speed episode');
+    assert.equal(events.at(-1)?.episode, 'work');
+    assert.equal(events.at(-1)?.adapter, 'work');
   }
+  results.returned = await states();
+  assert.ok(results.returned.every(state => state.kitchenOpacity === 0), 'cabinet leaves only after the coffee returns');
   await snap('waiting-reactions-returned-dark.png');
 
   phase = 'pause during a second explicit reaction fixture';
   await page.evaluate(() => {
     __reactionPreview.observers.forEach(observer => observer.disconnect());
-    for (const family of ['reading', 'checkpoint']) {
+    for (const family of ['reading', 'checkpoint', 'calculation', 'composition']) {
       __reactionPreview.views[family].destroy();
       __reactionPreview.views[family] = WaitingVisuals.mount(document.querySelector(`#reaction-${family}`),
-        __reactionPreview.receipts[family], { reactionSeed: family === 'reading' ? 32 : 31 });
+        __reactionPreview.receipts[family], { reactionSeed: { reading: 32, checkpoint: 31, calculation: 7, composition: 6 }[family] });
     }
   });
-  await bothEpisode('coffee');
+  await allEpisode('coffee');
   results.preSamplingPause = await pauseAndResumeReading('coffee-pause-resume-before-any-seek');
   phase = 'rendered coffee contacts after the uninterrupted video';
   results.rigs = [];
-  for (const family of ['reading', 'checkpoint']) {
+  for (const family of ['reading', 'checkpoint', 'calculation', 'composition']) {
     const rig = await scene(family).evaluate(async root => {
       const art = root.querySelector('.wv-art'), hand = root.querySelector('.wv-react-hand');
       const held = root.querySelector('.wv-cup-held'), shelf = root.querySelector('.wv-cup-shelf');
       const hatch = root.querySelector('.wv-kitchen-hatch');
+      const kitchen = root.querySelector('.wv-kitchen'), steam = held.querySelector('.wv-cup-steam');
       const tracks = art.getAnimations({ subtree: true }).filter(animation => /^(?:wv-coffee-|wv-episode-boundary)/.test(animation.animationName));
       const point = (node, x, y) => new DOMPoint(x, y).matrixTransform(node.getScreenCTM());
       const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
       const at = fraction => sampling.seek(fraction * 32000);
       const result = { family: root.dataset.family, carriedByHand: held.parentElement === hand,
-        contacts: [], hatchGrip: [], renderedSize: art.getBoundingClientRect().toJSON(),
+        contacts: [], hatchGrip: [], appearance: [], renderedSize: art.getBoundingClientRect().toJSON(),
+        steam: { belongsToWrist: steam.parentElement === held.querySelector('.wv-cup-wrist'),
+          pathCount: steam.querySelectorAll('path').length, filter: getComputedStyle(steam).filter },
         episodeDurationMs: [...new Set(tracks.map(animation => animation.effect.getComputedTiming().duration))] };
       const sampling = await window.__waitingMotionSampling.begin(tracks);
       try {
@@ -215,6 +231,12 @@ try {
             result.hatchGrip.push({ fraction, distance: distance(point(hand, 91, 55), point(hatch, 173, 55)) });
           }
         }
+        for (const fraction of [.0001, .05, .0625, .5, .97, .9999]) {
+          await at(fraction);
+          result.appearance.push({ fraction, kitchenOpacity: Number(getComputedStyle(kitchen).opacity),
+            steamOpacity: Number(getComputedStyle(steam).opacity),
+            actorX: new DOMMatrix(getComputedStyle(root.querySelector('.wv-reaction-actor')).transform).e });
+        }
         return result;
       } finally {
         await sampling.restore();
@@ -224,6 +246,16 @@ try {
     assert.deepEqual(rig.episodeDurationMs, [32000]);
     assert.ok(rig.contacts.every(contact => contact.corners.every(distance => distance < .2)), `${family}: both cup handovers meet exactly`);
     assert.ok(rig.hatchGrip.every(sample => sample.distance < .75), `${family}: hand keeps contact throughout hatch travel`);
+    assert.equal(rig.steam.belongsToWrist, true); assert.equal(rig.steam.pathCount, 2); assert.equal(rig.steam.filter, 'none');
+    assert.ok(rig.appearance.every(sample => sample.steamOpacity >= 0 && sample.steamOpacity <= .43), 'steam stays restrained');
+    const entrance = rig.appearance.find(sample => sample.fraction === .05);
+    const beforeWalking = rig.appearance.find(sample => sample.fraction === .0625);
+    const returnPose = rig.appearance.find(sample => sample.fraction === .97);
+    const homeX = family === 'reading' ? 0 : 20;
+    assert.equal(entrance.kitchenOpacity, 1); assert.equal(beforeWalking.kitchenOpacity, 1);
+    assert.ok(Math.abs(beforeWalking.actorX - homeX) < .01, 'cabinet is present before the first step');
+    assert.ok(Math.abs(returnPose.actorX - homeX) < .01, 'cabinet leaves only after the robot returns');
+    assert.ok(rig.appearance[0].kitchenOpacity < .01 && rig.appearance.at(-1).kitchenOpacity < .01);
     results.rigs.push(rig);
   }
   phase = 'pause, receipts and hidden context';
@@ -251,6 +283,8 @@ try {
   results.terminal = await page.evaluate(() => {
     __reactionPreview.views.checkpoint.update({ ...__reactionPreview.receipts.checkpoint, phaseId: 'metadata-checkpoint-committed' });
     __reactionPreview.views.reading.update({ ...__reactionPreview.receipts.reading, state: 'cancelling' });
+    __reactionPreview.views.calculation.update({ ...__reactionPreview.receipts.calculation, state: 'error' });
+    __reactionPreview.views.composition.update({ ...__reactionPreview.receipts.composition, state: 'completed' });
     return Object.values(__reactionPreview.views).map(view => ({ state: view.element.dataset.state, motion: view.element.dataset.motion, inspection: view.inspect() }));
   });
   assert.ok(results.terminal.every(state => state.motion === 'static'));

@@ -143,13 +143,13 @@ test('preview samplers never use WAAPI playback overrides and test pause before 
     assert.match(source, /addInitScript\(installMotionSampling\)/, filename);
   }
   const source = readFileSync(new URL('../preview/test-waiting-reactions.mjs', import.meta.url), 'utf8');
-  const naturalEnd = source.indexOf("mark('both-returned-to-work')");
+  const naturalEnd = source.indexOf("mark('all-returned-to-work')");
   const before = source.indexOf("results.preSamplingPause =");
   const sampling = source.indexOf('const sampling = await window.__waitingMotionSampling.begin(tracks)');
   const after = source.indexOf('results.midEpisodePause =');
   assert.ok(naturalEnd >= 0 && naturalEnd < before && before < sampling && sampling < after);
   assert.match(source, /timeMs - events\[firstCoffee\]\.timeMs >= 31000/);
-  assert.match(source, /family === 'reading' \? 32 : 31/);
+  assert.match(source, /reading: 32, checkpoint: 31, calculation: 7, composition: 6/);
   assert.match(source, /elapsedMs: 60000/);
 });
 

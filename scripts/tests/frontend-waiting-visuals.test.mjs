@@ -9,7 +9,7 @@ const css = readFileSync(new URL('../../frontend/waiting-visuals.css', import.me
 const plain = value => JSON.parse(JSON.stringify(value));
 const receipt = (overrides = {}) => ({ operationId: 'load-17', phaseId: 'metadata-scan', state: 'running', label: 'Indexando metadados', ...overrides });
 
-function fixture({ reduced = false, intersection = true, legacyMedia = false } = {}) {
+function fixture({ reduced = false, intersection = true, legacyMedia = false, now = () => 0 } = {}) {
   class Target {
     listeners = new Map();
     addEventListener(type, callback) { if (!this.listeners.has(type)) this.listeners.set(type, new Set()); this.listeners.get(type).add(callback); }
@@ -46,7 +46,7 @@ function fixture({ reduced = false, intersection = true, legacyMedia = false } =
     deliver(isIntersecting, intersectionRatio = isIntersecting ? 1 : 0) { this.callback([{ target: this.target, isIntersecting, intersectionRatio }]); }
     disconnect() { this.disconnected = true; }
   }
-  const window = { matchMedia: () => media, ...(intersection ? { IntersectionObserver: Observer } : {}) };
+  const window = { performance: { now }, matchMedia: () => media, ...(intersection ? { IntersectionObserver: Observer } : {}) };
   document.defaultView = window;
   const context = vm.createContext({ window, document, Intl }); vm.runInContext(source, context);
   const api = window.WaitingVisuals;
@@ -61,7 +61,7 @@ test('only exact real phase IDs select a known scene family', () => {
   assert.equal(api.derive(receipt()).family, 'reading');
   assert.equal(api.derive(receipt({phaseId:'command:case_report_render'})).family, 'composition');
   for (const phaseId of ['metadata-checkpoint-write', 'metadata-checkpoint-sync', 'metadata-checkpoint-publish']) assert.equal(api.derive(receipt({ phaseId })).family, 'checkpoint');
-  for (const phaseId of ['analytics-select', 'analytics-verify', 'analytics-sql', 'command:aggregate_events', 'command:pivot']) assert.equal(api.derive(receipt({ phaseId })).family, 'calculation');
+  for (const phaseId of ['analytics-select', 'analytics-sql', 'command:aggregate_events', 'command:pivot']) assert.equal(api.derive(receipt({ phaseId })).family, 'calculation');
   for (const phaseId of ['', 'future-phase', 'METADATA-SCAN', 'toString', '__proto__']) {
     const model = api.derive(receipt({ phaseId, label: 'Calculando estatísticas 100%' }));
     assert.equal(model.family, 'neutral'); assert.equal(model.canAnimate, false);
@@ -348,7 +348,7 @@ test('short inspection and long story have separate pacing and close without a j
   assert.match(css, /\.wv-reader-body\s*\{[^}]*transform:\s*rotate\(-4deg\)/, 'paused/reduced pose stays expressive');
   assert.match(css, /\[data-animated="true"\]\[data-pace="loop"\] \.wv-reader \{ animation: wv-reader-travel/);
   assert.doesNotMatch(css, /\[data-animated="true"\] \.wv-reader \{ animation:/, 'short gesture never walks');
-  assert.ok(Buffer.byteLength(source) < 32000 && Buffer.byteLength(css) < 160000, 'four families plus shared CSS-only stories stay under a bounded 192 KB source budget, with no external assets');
+  assert.ok(Buffer.byteLength(source) < 34000 && Buffer.byteLength(css) < 180000, 'four families plus shared CSS-only stories stay under a bounded 214 KB source budget, with no external assets');
 });
 
 test('two walking steps plant one foot while the other lifts, then return to the same stance', () => {
@@ -551,7 +551,7 @@ test('new stages retain high-contrast light/dark palettes, compact dimensions an
 test('shared reactions preserve approved reading artwork, base choreography and transport-free controller', () => {
   const hash = value => createHash('sha256').update(value).digest('hex');
   assert.equal(hash(source.slice(source.indexOf('    reading:', source.indexOf('  const scenes')), source.indexOf('    checkpoint:', source.indexOf('  const scenes')))), '24e668b03de07c74936eb5bd679000caebd4e4c8ee704a683caefd9a66b5185e');
-  assert.match(source, /Object\.freeze\(\{ derive, mount, repertoire, adapters, createDirector \}\)/);
+  assert.match(source, /Object\.freeze\(\{ derive, mount, repertoire, adapters, createDirector, createElapsedClock \}\)/);
   assert.equal(hash(css.slice(css.indexOf('/* Reading pilot:'), css.indexOf('/* Same protagonist,')).replaceAll('[data-animated="true"]', '[data-motion="running"]')), '9a695f3a6e19798186cd55a3932434d81d9fca4f8cbe97610c5f0d4b95fcdc43');
   assert.doesNotMatch(source, /\b(?:invoke|listen|emit|fetch|setTimeout|setInterval|requestAnimationFrame)\s*\(/, 'no IPC, transport, timer or per-frame animation controller was introduced');
 });
@@ -655,7 +655,7 @@ test('repertoire is seeded, gated by real elapsed time, visibly varied and anti-
   for (const elapsedMs of [undefined, 0, 500, 3999, 4000, 14999]) for (let i = 0; i < 50; i++) {
     assert.equal(director.boundary(api.derive(receipt({ elapsedMs }))), null);
   }
-  for (const phaseId of ['analytics-sql', 'command:case_report_render', 'metadata-checkpoint-committed', 'future-phase']) {
+  for (const phaseId of ['metadata-checkpoint-committed', 'future-phase']) {
     assert.equal(director.boundary(api.derive(receipt({ phaseId, elapsedMs: 60000 }))), null, 'unproven handoffs never enter a shared episode');
   }
 });
@@ -783,4 +783,239 @@ test('reaction paths close at their adapters and all travel is CSS transform/opa
   }
   assert.match(css, /--wv-reaction-cycle: 32s/); assert.match(css, /--wv-reaction-cycle: 12s/); assert.match(css, /--wv-reaction-cycle: 10s/);
   assert.doesNotMatch(source, /\b(?:setTimeout|setInterval|requestAnimationFrame|fetch|XMLHttpRequest)\s*\(/);
+});
+
+test('a monotonic measured decoration clock extrapolates only private eligibility between sparse receipts', () => {
+  let now = 100;
+  const { api } = fixture(); const clock = api.createElapsedClock(() => now);
+  const model = overrides => api.derive(receipt(overrides));
+  clock.observe(model({ elapsedMs: 4000 }));
+  now = 42100; assert.equal(clock.read(), 46000);
+  now = 41000; assert.equal(clock.read(), 46000, 'a backwards clock cannot rewind decoration age');
+  clock.observe(model({ completed: 2 }));
+  now = 43100; assert.equal(clock.read(), 47000, 'missing displayed elapsed does not erase an existing private measurement');
+  assert.deepEqual(plain(model({ completed: 2 }).details), [], 'no private age is copied into user-facing receipts');
+  clock.observe(model({ elapsedMs: 8000 }));
+  assert.equal(clock.read(), 8000, 'an authoritative new measurement rebases the clock');
+  now += 1000; assert.equal(clock.read(), 9000);
+  clock.observe(model({ phaseId: 'metadata-columns' }));
+  now += 10000; assert.equal(clock.read(), null, 'new phase without a measurement cannot inherit old eligibility');
+  clock.observe(model({ phaseId: 'metadata-columns', elapsedMs: 5000 }));
+  now += 1000; assert.equal(clock.read(), 6000);
+  clock.observe(model({ operationId: 'new-owner', elapsedMs: 100 }));
+  now += 1000; assert.equal(clock.read(), 1100);
+});
+
+test('quiet operations qualify at a real boundary without receipts, timers, synthetic metrics or live announcements', () => {
+  let now = 0;
+  const f = fixture({ now: () => now });
+  const visual = f.api.mount(f.host, receipt({ elapsedMs: 4000 }), { reactionSeed: 4, showDetails: true });
+  const { status, metric, details, art } = f.parts(visual), announced = status.writes;
+  f.observers[0].deliver(true);
+  now = 42000;
+  assert.equal(visual.element.dataset.episode, 'work', 'wall time alone schedules no work');
+  reactionBoundary(f, visual);
+  assert.equal(visual.element.dataset.episode, 'coffee', 'the boundary observes measured 4s plus real 42s');
+  assert.equal(status.writes, announced); assert.equal(status.textContent, 'Indexando metadados');
+  assert.equal(metric.hidden, true); assert.equal(details.textContent, '4 s decorridos'); assert.equal(art.htmlWrites, 1);
+  const state = plain(visual.inspect());
+  visual.setMotionEnabled(false); now += 100000; reactionBoundary(f, visual, 'animationend');
+  assert.deepEqual(plain(visual.inspect()), state, 'elapsed time during pause does not drain or queue episodes');
+  visual.setMotionEnabled(true); assert.deepEqual(plain(visual.inspect()), state);
+  visual.destroy();
+});
+
+function adapterBoundary(f, visual, stage = visual.element.dataset.adapter, overrides = {}) {
+  const art = f.parts(visual).art;
+  art.emit('animationend', { target: art.children.find(node => node.className === 'wv-adapter-boundary'),
+    animationName: `wv-${stage}-boundary`, pseudoElement: '', ...overrides });
+}
+function adaptedCoffeeFixture(phaseId) {
+  const f = fixture();
+  const visual = f.api.mount(f.host, receipt({ phaseId, elapsedMs: 60000 }), { reactionSeed: 4 });
+  f.observers[0].deliver(true); reactionBoundary(f, visual);
+  assert.equal(visual.element.dataset.episode, 'coffee'); assert.equal(visual.element.dataset.adapter, 'prepare');
+  return { f, visual };
+}
+
+test('calculation has an empty hand only at the completed long loop and reuses the shared anchor', () => {
+  const { api } = fixture(); assert.equal(api.adapters.calculation.reactions, true);
+  assert.equal(api.adapters.calculation.homeX, 26); assert.equal(api.adapters.calculation.anchorX, 20);
+  assert.equal(atContact('wv-group-held', 100, 'opacity'), '0');
+  assert.equal(atContact('wv-sort-held', 100, 'opacity'), '1');
+  const director = api.createDirector('load-17', 4);
+  assert.equal(director.boundary(api.derive(receipt({ phaseId: 'analytics-sql', elapsedMs: 3999 }))), null);
+  assert.equal(director.boundary(api.derive(receipt({ phaseId: 'analytics-sql', elapsedMs: 60000 }))).episode, 'coffee');
+  const { f, visual } = adaptedCoffeeFixture('analytics-sql'), art = f.parts(visual).art;
+  adapterBoundary(f, visual); assert.equal(visual.element.dataset.adapter, 'react');
+  reactionBoundary(f, visual, 'animationend'); assert.equal(visual.element.dataset.adapter, 'resume');
+  assert.equal(visual.inspect().cooldown, 0, 'cooldown begins only after returning to the task anchor');
+  adapterBoundary(f, visual); assert.equal(visual.element.dataset.adapter, 'work'); assert.equal(visual.element.dataset.episode, 'work');
+  assert.equal(visual.inspect().cooldown, 4); assert.equal(art.htmlWrites, 1);
+  assert.match(css, /:is\(\[data-family="checkpoint"\], \[data-family="calculation"\], \[data-family="composition"\], \[data-family="verification"\]\)\[data-episode="coffee"\]\[data-adapter="react"\] \.wv-reaction-actor \{ animation: wv-coffee-travel-checkpoint/);
+  assert.doesNotMatch(css, /@keyframes wv-coffee-(?:calculation|composition)/, 'whole excursions are shared, never duplicated per family');
+  visual.destroy();
+});
+
+test('composition stages park the same proof, complete the shared reaction and recover before work resumes', () => {
+  const { f, visual } = adaptedCoffeeFixture('command:case_report_render');
+  const { art, status } = f.parts(visual), initial = plain(visual.inspect());
+  assert.equal(initial.adapterStage, 'prepare'); assert.equal(initial.episode, 'coffee');
+  assert.ok(parentsOf(art.innerHTML, 'wv-proof-held').includes('wv-react-hand'));
+  assert.match(art.innerHTML, /class="wv-proof-parked" transform="translate\(26\.341973495 1\.717610627\)"/);
+  reactionBoundary(f, visual, 'animationend'); assert.equal(visual.element.dataset.adapter, 'prepare', 'an old coffee end cannot skip parking');
+  adapterBoundary(f, visual, 'resume'); assert.equal(visual.element.dataset.adapter, 'prepare');
+  adapterBoundary(f, visual); assert.equal(visual.element.dataset.adapter, 'react');
+  reactionBoundary(f, visual); assert.equal(visual.element.dataset.adapter, 'react', 'work boundaries cannot stack reactions');
+  reactionBoundary(f, visual, 'animationend'); assert.equal(visual.element.dataset.adapter, 'resume');
+  adapterBoundary(f, visual, 'prepare'); assert.equal(visual.element.dataset.adapter, 'resume', 'a late preparation end cannot skip retrieval');
+  adapterBoundary(f, visual); assert.equal(visual.element.dataset.adapter, 'work');
+  assert.equal(visual.element.dataset.episode, 'work'); assert.equal(visual.inspect().cooldown, 4);
+  assert.equal(art.htmlWrites, 1); assert.equal(status.textContent, 'Indexando metadados');
+  visual.destroy();
+});
+
+test('pauses freeze every adapter stage while terminal, owner and family changes remove it immediately', () => {
+  for (const phaseId of ['analytics-sql', 'command:case_report_render']) for (const stage of ['prepare', 'react', 'resume']) {
+    const { f, visual } = adaptedCoffeeFixture(phaseId);
+    if (stage !== 'prepare') adapterBoundary(f, visual);
+    if (stage === 'resume') reactionBoundary(f, visual, 'animationend');
+    const before = plain(visual.inspect());
+    visual.setMotionEnabled(false); adapterBoundary(f, visual); reactionBoundary(f, visual, 'animationend');
+    assert.deepEqual(plain(visual.inspect()), before); assert.equal(visual.element.dataset.animated, 'true');
+    visual.setMotionEnabled(true); assert.deepEqual(plain(visual.inspect()), before);
+    visual.update(receipt({ phaseId, state: 'cancelling' }));
+    assert.equal(visual.element.dataset.adapter, 'work'); assert.equal(visual.element.dataset.episode, 'work');
+    assert.equal(visual.element.dataset.family, 'neutral'); assert.equal(visual.element.dataset.animated, 'false');
+    assert.doesNotMatch(f.parts(visual).art.innerHTML, /wv-proof-parked|wv-reaction-actor/);
+    adapterBoundary(f, visual, stage); assert.equal(visual.element.dataset.adapter, 'work');
+    visual.destroy();
+  }
+  const { f, visual } = adaptedCoffeeFixture('command:case_report_render');
+  const stale = f.parts(visual).art.children.find(node => node.className === 'wv-adapter-boundary');
+  visual.update(receipt({ phaseId: 'metadata-checkpoint-committed', elapsedMs: 60000 }));
+  adapterBoundary(f, visual, 'prepare', { target: stale });
+  assert.equal(visual.element.dataset.adapter, 'work'); assert.equal(visual.element.dataset.motion, 'static');
+  assert.equal(visual.inspect().cooldown, 4); assert.deepEqual(plain(visual.inspect().history), ['coffee']);
+  visual.update(receipt({ operationId: 'new', phaseId: 'analytics-sql', elapsedMs: 60000 }));
+  adapterBoundary(f, visual, 'prepare', { target: stale }); assert.equal(visual.element.dataset.adapter, 'work');
+  assert.deepEqual(plain(visual.inspect().history), []); visual.destroy();
+});
+
+function bridgePoint(point, stage, time) {
+  for (const [part, origin] of [['hand', [82, 58]], ['arm', [72, 52]], ['body', [65, 64]]]) {
+    point = transformPoint(point, interpolated(`wv-bridge-composition-${stage}-${part}`, time), origin);
+  }
+  return transformPoint(point, interpolated(`wv-bridge-composition-${stage}-travel`, time));
+}
+
+test('composition deposits and retrieves both proof corners at the already-validated bed contact', () => {
+  for (const [stage, time] of [['prepare', 40], ['resume', 60]]) {
+    for (const point of [[93, 52], [109, 63], [91, 55]]) {
+      const actual = bridgePoint(point, stage, time), offset = [26.341973495, 1.717610627];
+      assert.ok(actual.every((value, axis) => Math.abs(value - point[axis] - offset[axis]) < .000001), `${stage} keeps proof attached through contact`);
+    }
+    assert.equal(atContact(`wv-bridge-composition-${stage}-proof-held`, time, 'opacity'), stage === 'prepare' ? '0' : '1');
+    assert.equal(atContact(`wv-bridge-composition-${stage}-proof-parked`, time, 'opacity'), stage === 'prepare' ? '1' : '0');
+  }
+  assert.match(css, /data-family="composition"\]\[data-adapter="react"\] \.wv-proof-parked \{ opacity: 1;/);
+  for (const [stage, time, expected] of [['prepare', 0, [-4, -26, 0, 8, 24]], ['prepare', 100, [0, 40, -85, 4, 20]], ['resume', 0, [0, 40, -85, 4, 20]], ['resume', 100, [-4, -26, 0, 8, 24]]]) {
+    for (const [index, part] of ['body', 'arm', 'hand', 'head', 'travel'].entries()) {
+      const transform = atContact(`wv-bridge-composition-${stage}-${part}`, time);
+      const value = Number(/\((-?[\d.]+)/.exec(transform)[1]); assert.equal(value, expected[index], `${stage} ${part} endpoint matches exact ownership pose`);
+    }
+  }
+});
+
+test('adapter shuffles keep one planted foot and reverse to the same stance', () => {
+  const frames = animationFrames();
+  for (const family of ['calculation', 'composition']) for (const stage of ['prepare', 'resume']) {
+    const allTimes = frames.get(`wv-bridge-${family}-${stage}-leg-front`).frames.map(frame => frame.time);
+    const foot = (side, time) => {
+      const x = side === 'front' ? 68 : 61; let point = [x, 88];
+      for (const [part, origin] of [['foot', [x, 88]], ['knee', [x, 74.5]], ['leg', [x, 61]]]) point = transformPoint(point, interpolated(`wv-bridge-${family}-${stage}-${part}-${side}`, time), origin);
+      return transformPoint(point, interpolated(`wv-bridge-${family}-${stage}-travel`, time));
+    };
+    for (const time of allTimes) {
+      const a = foot('front', time), b = foot('back', time);
+      assert.ok(Math.min(Math.abs(a[1] - 81), Math.abs(b[1] - 81)) < .00001, `${family} ${stage} always has a planted support at ${time}%`);
+      assert.ok(a[1] <= 81.00001 && b[1] <= 81.00001, 'feet never sink through the ground');
+    }
+    const startX = family === 'calculation' ? 26 : 24;
+    assert.equal(atContact(`wv-bridge-${family}-${stage}-travel`, 0), `translateX(${(stage === 'prepare' ? startX : 20).toFixed(8)}px)`);
+    assert.equal(atContact(`wv-bridge-${family}-${stage}-travel`, 100), `translateX(${(stage === 'prepare' ? 20 : startX).toFixed(8)}px)`);
+  }
+});
+
+test('coffee nook appears only for coffee, before approach, and leaves after the complete return', () => {
+  assert.match(css, /\.waiting-visual \.wv-kitchen \{ opacity: 0; \}/);
+  assert.match(css, /\[data-episode="coffee"\]\[data-adapter="react"\] \.wv-kitchen \{\s*animation: wv-coffee-kitchen/);
+  assert.doesNotMatch(css, /\[data-episode="(?:work|review|stretch)"\][^{]*\.wv-kitchen\s*\{/);
+  assert.equal(atContact('wv-coffee-kitchen', 0, 'opacity'), '0');
+  assert.equal(atContact('wv-coffee-kitchen', 5, 'opacity'), '1');
+  assert.equal(atContact('wv-coffee-travel-reading', 5), 'translateX(0.000000px)', 'nook is established before the first step');
+  assert.equal(atContact('wv-coffee-kitchen', 97, 'opacity'), '1');
+  assert.equal(atContact('wv-coffee-travel-checkpoint', 97), 'translateX(20.000000px)', 'the robot is home before the nook fades out');
+  assert.equal(atContact('wv-coffee-kitchen', 100, 'opacity'), '0');
+});
+
+test('subtle vector steam stays inside the articulated cup and shares paused reaction clocks', () => {
+  const art = artFor('reading'), steamParents = parentsOf(art, 'wv-cup-steam');
+  // The first copy is the stored cup; the carried copy is explicitly wrist-owned.
+  assert.ok(steamParents.includes('wv-cup-shelf'));
+  assert.match(art, /class="wv-cup-held"><g class="wv-cup-wrist"><g class="wv-cup-steam"><path d="M94 47c-1-1 1-2 0-3"\/><path d="M97 46c-1-1 1-2 0-3"\/>/);
+  assert.match(css, /\.wv-cup-held \.wv-cup-steam \{\s*animation: wv-coffee-steam var\(--wv-reaction-cycle\)/);
+  assert.doesNotMatch(css, /\b(?:filter|backdrop-filter|will-change)\s*:/);
+  const frames = animationFrames().get('wv-coffee-steam').frames;
+  for (const { properties } of frames) {
+    assert.ok(Number(properties.opacity) <= .42);
+    assert.ok(Math.abs(Number(/\((-?[\d.]+)/.exec(properties.transform)[1])) <= .8);
+  }
+});
+
+test('an already completed endpoint delivered during a pause is reconciled exactly once on resume', () => {
+  for (const [phaseId, bridgeMs] of [['analytics-sql', 1200], ['command:case_report_render', 3200]]) for (const stage of ['prepare', 'react', 'resume']) {
+    for (const mode of ['manual', 'offscreen', 'hidden', 'panel', 'reduced']) {
+      const { f, visual } = adaptedCoffeeFixture(phaseId);
+      if (stage !== 'prepare') adapterBoundary(f, visual);
+      if (stage === 'resume') reactionBoundary(f, visual, 'animationend');
+      const frozen = plain(visual.inspect());
+      const toggle = paused => {
+        if (mode === 'manual') visual.setMotionEnabled(!paused);
+        if (mode === 'offscreen') f.observers[0].deliver(!paused);
+        if (mode === 'hidden') { f.document.hidden = paused; f.document.emit('visibilitychange'); }
+        if (mode === 'panel') visual.setVisible(!paused);
+        if (mode === 'reduced') { f.media.matches = paused; f.media.emit('change'); }
+      };
+      const completed = () => stage === 'react'
+        ? reactionBoundary(f, visual, 'animationend', { elapsedTime: 32 })
+        : adapterBoundary(f, visual, stage, { elapsedTime: bridgeMs / 1000 });
+      toggle(true); completed(); completed();
+      assert.deepEqual(plain(visual.inspect()), frozen, `${mode} preserves the completed pose until resumed`);
+      toggle(false);
+      const expected = stage === 'prepare' ? 'react' : stage === 'react' ? 'resume' : 'work';
+      assert.equal(visual.element.dataset.adapter, expected);
+      assert.deepEqual(plain(visual.inspect().history), ['coffee'], 'reconciliation cannot draw another episode');
+      const reconciled = plain(visual.inspect()); completed();
+      assert.deepEqual(plain(visual.inspect()), reconciled, 'duplicate stale completion cannot advance again');
+      visual.destroy();
+    }
+  }
+});
+
+test('a deferred completion is duration-validated, never stores work iterations and dies with its scene owner', () => {
+  for (const invalid of [undefined, null, -1, 0, .5, 1.1, 1.3, 32, Infinity, NaN]) {
+    const { f, visual } = adaptedCoffeeFixture('analytics-sql');
+    visual.setMotionEnabled(false); adapterBoundary(f, visual, 'prepare', { elapsedTime: invalid });
+    visual.setMotionEnabled(true); assert.equal(visual.element.dataset.adapter, 'prepare'); visual.destroy();
+  }
+  const { f, visual } = adaptedCoffeeFixture('command:case_report_render');
+  visual.setMotionEnabled(false); adapterBoundary(f, visual, 'prepare', { elapsedTime: 3.2 });
+  visual.update(receipt({ operationId: 'new-owner', phaseId: 'analytics-sql', elapsedMs: 60000 }));
+  visual.setMotionEnabled(true);
+  assert.equal(visual.element.dataset.adapter, 'work'); assert.deepEqual(plain(visual.inspect().history), []);
+  visual.setMotionEnabled(false);
+  reactionBoundary(f, visual, 'animationiteration', { elapsedTime: 64 });
+  const before = plain(visual.inspect()); visual.setMotionEnabled(true); assert.deepEqual(plain(visual.inspect()), before);
+  visual.destroy();
 });

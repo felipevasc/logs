@@ -73,12 +73,61 @@ jobs:
           path: output
       - name: Essential and affected browser checks
         run: node scripts/ci/validation-plan.mjs preview
+      - name: Record browser evidence identity
+        if: always()
+        env:
+          EVIDENCE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node scripts/preview/record-evidence.mjs
       - name: Preserve browser diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: preview-diagnostics
-          path: output/playwright/
+          path: |
+            output/playwright/
+            !output/playwright/**/*.webm
+          if-no-files-found: ignore
+      # Keep the original recordings intact, in scenario-sized archives. This
+      # avoids growing one diagnostic ZIP beyond the evidence transfer limit.
+      - name: Preserve waiting scene recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-recordings-scenes
+          path: output/playwright/waiting-visuals-real-preview.webm
+          if-no-files-found: ignore
+      - name: Preserve reaction recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-recordings-reactions
+          path: output/playwright/waiting-reactions-real-preview.webm
+          if-no-files-found: ignore
+      - name: Preserve verification recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-recordings-verification
+          path: output/playwright/waiting-verification-real-preview.webm
+          if-no-files-found: ignore
+      - name: Preserve report recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-recordings-report
+          path: output/playwright/case-report-waiting-real-preview.webm
+          if-no-files-found: ignore
+      - name: Preserve other browser recordings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-recordings-other
+          path: |
+            output/playwright/**/*.webm
+            !output/playwright/waiting-visuals-real-preview.webm
+            !output/playwright/waiting-reactions-real-preview.webm
+            !output/playwright/waiting-verification-real-preview.webm
+            !output/playwright/case-report-waiting-real-preview.webm
           if-no-files-found: ignore
 
   # Native changes run on both platforms, including draft PRs. UI-only changes
