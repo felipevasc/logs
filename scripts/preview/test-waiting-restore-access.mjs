@@ -11,6 +11,42 @@ import { installMotionSampling } from './motion-sampling.mjs';
 const families = ['access', 'restoration'];
 const phases = ['metadata-lock', 'metadata-restore'];
 const labels = ['Aguardando acesso', 'Retomando metadados'];
+// CI70 observed the previous owner at the exact 17% and 81% steps, while
+// both copies had coincident matrices and exactly one was visible. The saved
+// exact-time samples did not expose the expected right side. Keep their geometry
+// gate, plus strict probes one integer millisecond before/after each transfer.
+const restorationSampling = Object.freeze({ cycleMs: 7200, sideMarginMs: 1, maxTimeErrorMs: .01,
+  transferFractions: [.17, .81],
+  fractions: [0, .14, .16999, .17, .20, .30, .42, .48, .58, .64, .78, .80999, .81, .84, .94, .99999] });
+function restorationProbePlan(contract = restorationSampling) {
+  const probes = contract.fractions.map(fraction => ({ fraction, requestedTimeMs: contract.cycleMs * fraction,
+    kind: contract.transferFractions.includes(fraction) ? 'exact-transfer' : 'ordinary',
+    expectedHeld: contract.transferFractions.includes(fraction) ? null : fraction >= .17 && fraction < .81 ? 1 : 0 }));
+  for (const [index, transferFraction] of contract.transferFractions.entries()) for (const side of [-1, 1]) {
+    const requestedTimeMs = contract.cycleMs * transferFraction + side * contract.sideMarginMs;
+    probes.push({ fraction: requestedTimeMs / contract.cycleMs, requestedTimeMs, transferFraction,
+      kind: side < 0 ? 'before-transfer' : 'after-transfer', expectedHeld: index === 0 ? Number(side > 0) : Number(side < 0) });
+  }
+  return probes.sort((a, b) => a.requestedTimeMs - b.requestedTimeMs);
+}
+function assertRestorationOwnership(sample, contract = restorationSampling) {
+  assert.ok([0, 1].includes(sample.heldOpacity) && [0, 1].includes(sample.seatedOpacity), 'ownership is binary at every sample');
+  assert.equal(sample.heldOpacity + sample.seatedOpacity, 1, 'exactly one record, including at exact transfers');
+  if (sample.kind === 'exact-transfer') {
+    assert.ok(contract.transferFractions.includes(sample.fraction));
+    assert.equal(sample.expectedHeld, null, 'only the two exact discontinuities have no one-sided expectation');
+  } else assert.equal(sample.heldOpacity, sample.expectedHeld, `${sample.kind} at ${sample.requestedTimeMs} ms`);
+  assert.equal(sample.timeline.length, 7, 'observe all six restoration tracks and the work clock');
+  for (const name of ['wv-restore-held', 'wv-restore-seated']) assert.equal(sample.timeline.filter(t => t.name === name).length, 1);
+  for (const track of sample.timeline) {
+    assert.equal(track.durationMs, contract.cycleMs);
+    assert.ok(Number.isFinite(track.currentTime) && Number.isFinite(track.progress));
+    assert.ok(Math.abs(track.currentTime - sample.requestedTimeMs) < contract.maxTimeErrorMs,
+      `${track.name}: requested side must be observable within ${contract.maxTimeErrorMs} ms`);
+    assert.equal(track.playState, 'paused'); assert.equal(track.pending, false);
+  }
+}
+
 const output = resolve('output/playwright'), started = Date.now();
 const viewport = { width: 1440, height: 960 };
 mkdirSync(output, { recursive: true });
@@ -27,7 +63,7 @@ const results = {
     evidenceFileLimitBytes: 32 * 1024 * 1024,
     estimatedNaturalBytes: 6000000, estimatedOtherArchiveBytes: 16000000,
     estimateBasis: 'CI66 verification: 5,769,239 bytes / 58.061s; CI67 manual: 5,614,425 bytes. Use 200kB/s allowance plus 10MB manual reserve; estimate, not a measured output guarantee' },
-  sourceCommit: process.env.GITHUB_SHA || null, families, phases, markers: [], screenshots: [],
+  sourceCommit: process.env.GITHUB_SHA || null, families, phases, restorationSampling, markers: [], screenshots: [],
 };
 let browser, context, page, video, failure = null, phase = 'startup';
 const errors = [];
@@ -237,7 +273,7 @@ try {
   results.preSamplingPause = await pauseArtwork('product-pause-before-any-seek');
   for (const control of await roots().locator('.wv-motion-toggle').all()) await control.click();
   await waitMotion('static'); await settle();
-  results.rig = await scene('restoration').evaluate(async root => {
+  results.rig = await scene('restoration').evaluate(async (root, { contract, probes }) => {
     const held = root.querySelector('.wv-restore-held'), seated = root.querySelector('.wv-restore-seated');
     const point = (node, x, y) => new DOMPoint(x, y).matrixTransform(node.getScreenCTM());
     const matrix = node => { const m = node.getScreenCTM(); return [m.a, m.b, m.c, m.d, m.e, m.f]; };
@@ -246,28 +282,37 @@ try {
       parkedAtStation: seated.parentElement === root.querySelector('.wv-restore-station'),
       actorTransform: root.querySelector('.wv-restore-actor').getAttribute('transform'),
       fixed: Object.fromEntries(fixedSelectors.map(selector => [selector, matrix(root.querySelector(selector))])), contacts: [], samples: [] };
-    const sampling = await window.__waitingMotionSampling.begin(root.querySelector('.wv-art').getAnimations({ subtree: true }));
+    const animations = root.querySelector('.wv-art').getAnimations({ subtree: true });
+    const sampling = await window.__waitingMotionSampling.begin(animations);
     try {
-      for (const fraction of [0, .14, .16999, .17, .20, .30, .42, .48, .58, .64, .78, .80999, .81, .84, .94, .99999]) {
-        await sampling.seek(7200 * fraction);
+      for (const probe of probes) {
+        const { fraction } = probe;
+        await sampling.seek(probe.requestedTimeMs);
         const heldOpacity = Number(getComputedStyle(held).opacity), seatedOpacity = Number(getComputedStyle(seated).opacity);
         const inverse = root.querySelector('svg').getScreenCTM().inverse();
         const points = [[91, 55], [94, 50], [111, 50], [111, 62], [94, 62], [99, 55]];
-        rig.samples.push({ fraction, heldOpacity, seatedOpacity,
+        rig.samples.push({ ...probe, heldOpacity, seatedOpacity,
+          timeline: animations.map(animation => ({ name: animation.animationName, target: animation.effect.target.getAttribute('class'),
+            currentTime: animation.currentTime, progress: animation.effect.getComputedTiming().progress,
+            durationMs: animation.effect.getComputedTiming().duration, easing: animation.effect.getTiming().easing,
+            playState: animation.playState, pending: animation.pending,
+            ...(animation.animationName === 'wv-restore-held' || animation.animationName === 'wv-restore-seated'
+              ? { keyframes: animation.effect.getKeyframes().map(frame => ({ offset: frame.computedOffset, easing: frame.easing, opacity: frame.opacity })) } : {}) })),
           fixed: Object.fromEntries(fixedSelectors.map(selector => [selector, matrix(root.querySelector(selector))])),
           points: heldOpacity === 1 ? points.map(([x, y]) => { const p = point(held, x, y).matrixTransform(inverse); return { x: p.x, y: p.y }; }) : [] });
-        if ([.14, .17, .20, .78, .81, .84].includes(fraction)) rig.contacts.push({ fraction,
+        if ([.14, .17, .20, .78, .81, .84].includes(fraction) || probe.transferFraction !== undefined) rig.contacts.push({ fraction,
+          kind: probe.kind, requestedTimeMs: probe.requestedTimeMs,
           distances: points.map(([x, y]) => { const a = point(held, x, y), b = point(seated, x, y); return Math.hypot(a.x - b.x, a.y - b.y); }) });
       }
       return rig;
     } finally { await sampling.restore(); }
-  });
+  }, { contract: restorationSampling, probes: restorationProbePlan() });
   assert.equal(results.rig.carriedByHand, true); assert.equal(results.rig.parkedAtStation, true);
   assert.equal(results.rig.actorTransform, 'translate(20 0)');
+  assert.equal(results.rig.samples.length, 20); assert.equal(results.rig.contacts.length, 10);
   assert.ok(results.rig.contacts.every(contact => contact.distances.every(d => d < results.limits.contactToleranceCssPx)));
   for (const sample of results.rig.samples) {
-    assert.equal(sample.heldOpacity + sample.seatedOpacity, 1);
-    assert.equal(sample.heldOpacity, sample.fraction >= .17 && sample.fraction < .81 ? 1 : 0);
+    assertRestorationOwnership(sample);
     assert.ok(sample.points.every(p => p.x > 0 && p.x < 164 && p.y > 0 && p.y < 96));
     for (const [selector, baseline] of Object.entries(results.rig.fixed)) assert.ok(sample.fixed[selector].every((v, i) => Math.abs(v - baseline[i]) < results.limits.staticMatrixTolerance));
   }

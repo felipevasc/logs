@@ -96,7 +96,9 @@ test('rendered diagnostics measure both 17%/81% transfers and restore clocks gov
   assert.match(source, /\[\.14, \.17, \.20, \.78, \.81, \.84\]/);
   assert.match(source, /\[\[91, 55\], \[94, 50\], \[111, 50\], \[111, 62\], \[94, 62\], \[99, 55\]\]/);
   assert.match(source, /sample\.heldOpacity \+ sample\.seatedOpacity, 1/);
-  assert.match(source, /sample\.fraction >= \.17 && sample\.fraction < \.81 \? 1 : 0/);
+  assert.match(source, /assertRestorationOwnership\(sample\)/);
+  assert.match(source, /sample\.heldOpacity, sample\.expectedHeld/);
+  assert.match(source, /sample\.kind === 'exact-transfer'/);
   assert.match(source, /finally \{ await sampling\.restore\(\); \}/);
   assert.match(source, /finally \{ await pose\.evaluate\(sampling => sampling\.restore\(\)\)/);
   assert.match(source, /product-pause-before-any-seek/); assert.match(source, /product-pause-after-restored-seek/);
@@ -176,4 +178,57 @@ test('new families preserve animation identities and frozen clocks under reduced
   assert.match(source, /if \(sample\.family === 'restoration'\)/);
   assert.match(source, /mountFixture\('diagnostic', 'static'\)/);
   assert.match(source, /results\.initiallyReduced\.every\(s => s\.animations\.length === 0 && s\.motion === 'static'\)/);
+});
+
+
+const probeSource = source.slice(source.indexOf('const restorationSampling ='), source.indexOf("const output = resolve('output/playwright')"));
+const probeApi = vm.runInNewContext(probeSource + '\n({ restorationSampling, restorationProbePlan, assertRestorationOwnership })', { assert });
+const plainProbes = () => JSON.parse(JSON.stringify(probeApi.restorationProbePlan()));
+const ownershipSample = (probe, heldOpacity = probe.expectedHeld ?? 0, seatedOpacity = 1 - heldOpacity) => ({ ...probe, heldOpacity, seatedOpacity,
+  timeline: ['wv-restore-held', 'wv-restore-seated', 'wv-restore-head', 'wv-restore-gaze', 'wv-restore-arm', 'wv-restore-hand', 'wv-work-boundary']
+    .map(name => ({ name, durationMs: 7200, currentTime: probe.requestedTimeMs, progress: probe.requestedTimeMs / 7200, playState: 'paused', pending: false })) });
+
+test('ownership probes keep all prior samples and bound both sides of each discontinuity to one millisecond', () => {
+  const probes = plainProbes();
+  assert.equal(probes.length, 20);
+  assert.deepEqual(probes.filter(p => p.kind === 'exact-transfer').map(p => [p.fraction, p.requestedTimeMs]), [[.17, 1224], [.81, 5832]]);
+  assert.deepEqual(probes.filter(p => p.transferFraction !== undefined).map(p => [p.kind, p.requestedTimeMs, p.expectedHeld]),
+    [['before-transfer', 1223, 0], ['after-transfer', 1225, 1], ['before-transfer', 5831, 1], ['after-transfer', 5833, 0]]);
+  for (const fraction of [0, .14, .16999, .17, .20, .30, .42, .48, .58, .64, .78, .80999, .81, .84, .94, .99999]) assert.ok(probes.some(p => p.fraction === fraction));
+  assert.equal(probeApi.restorationSampling.maxTimeErrorMs, .01);
+  assert.ok(probeApi.restorationSampling.maxTimeErrorMs < 7200 * .00001 / 4, 'even the preserved 0.072ms pre-edge probes remain on their measured side');
+  assert.ok(probes.filter(p => p.transferFraction !== undefined).every(p => Math.abs(p.requestedTimeMs - 7200 * p.transferFraction) === 1));
+});
+
+test('CI70 ownership evidence isolates the exact-edge ambiguity without accepting a wrong side, duplication or disappearance', () => {
+  // CI70 run37014947141, head726ca2c3, checkout27812756: distilled browser JSON,
+  // not a new rendered execution or evidence of the engine internal precision.
+  const observed = [[0,0],[.14,0],[.16999,0],[.17,0],[.20,1],[.30,1],[.42,1],[.48,1],
+    [.58,1],[.64,1],[.78,1],[.80999,1],[.81,1],[.84,0],[.94,0],[.99999,0]];
+  assert.deepEqual(observed.filter(([fraction, held]) => held !== (fraction >= .17 && fraction < .81 ? 1 : 0)).map(([fraction]) => fraction), [.17, .81]);
+  const probes = plainProbes();
+  for (const [fraction, held] of observed) {
+    const probe = probes.find(p => p.fraction === fraction);
+    // Synthetic observable clocks isolate this pure gate. CI70 did not save seek clocks.
+    assert.doesNotThrow(() => probeApi.assertRestorationOwnership(ownershipSample(probe, held)));
+  }
+  for (const probe of probes) {
+    for (const pair of [[0,0],[1,1],[.5,.5]]) assert.throws(() => probeApi.assertRestorationOwnership(ownershipSample(probe, ...pair)));
+    if (probe.kind !== 'exact-transfer') assert.throws(() => probeApi.assertRestorationOwnership(ownershipSample(probe, 1 - probe.expectedHeld)));
+    else for (const held of [0,1]) assert.doesNotThrow(() => probeApi.assertRestorationOwnership(ownershipSample(probe, held)));
+  }
+});
+
+test('every sampled clock must expose the requested side at the stated precision and paused state', () => {
+  const probe = plainProbes().find(p => p.kind === 'after-transfer');
+  for (const mutate of [s => s.timeline.pop(), s => { s.timeline[0].currentTime += .02; }, s => { s.timeline[0].currentTime = null; },
+    s => { s.timeline[0].progress = null; }, s => { s.timeline[0].durationMs = 2400; }, s => { s.timeline[0].playState = 'running'; },
+    s => { s.timeline[0].pending = true; }]) {
+    const sample = ownershipSample(probe); mutate(sample); assert.throws(() => probeApi.assertRestorationOwnership(sample));
+  }
+  assert.match(source, /currentTime: animation\.currentTime, progress: animation\.effect\.getComputedTiming\(\)\.progress/);
+  assert.match(source, /keyframes: animation\.effect\.getKeyframes\(\)\.map/);
+  assert.match(source, /results\.rig\.samples\.length, 20/);
+  assert.match(source, /results\.rig\.contacts\.length, 10/);
+  assert.match(source, /probe\.transferFraction !== undefined/);
 });
