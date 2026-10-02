@@ -87,7 +87,8 @@ window.WaitingVisuals = (() => {
   // or park their tool before the shared reaction starts, and recover it before
   // resuming the exact task pose. Only the long work loop may enter this bridge.
   const repertoire = Object.freeze({
-    coffee: Object.freeze({ minElapsedMs: 45000, durationMs: 32000, cooldown: 4, weight: 1 }),
+    coffee: Object.freeze({ minElapsedMs: 45000, durationMs: 32000, cooldown: 4, weight: 1, long: true }),
+    manual: Object.freeze({ minElapsedMs: 60000, durationMs: 32000, cooldown: 5, weight: 1, long: true }),
     review: Object.freeze({ minElapsedMs: 15000, durationMs: 10000, cooldown: 2, weight: 4 }),
     stretch: Object.freeze({ minElapsedMs: 28000, durationMs: 12000, cooldown: 3, weight: 2 })
   });
@@ -145,7 +146,9 @@ window.WaitingVisuals = (() => {
         cycle++;
         if (cooldown > 0) { cooldown--; return null; }
         const elapsed = measured(model.elapsedMs);
-        const eligible = Object.entries(repertoire).filter(([name, item]) => elapsed !== null && elapsed >= item.minElapsedMs && name !== history.at(-1));
+        const previous = history.at(-1);
+        const eligible = Object.entries(repertoire).filter(([name, item]) => elapsed !== null && elapsed >= item.minElapsedMs
+          && name !== previous && !(item.long && repertoire[previous]?.long));
         if (!eligible.length) return null;
         // Work remains dominant; only one in three eligible safe points starts a break.
         if (draw() % 3 !== 0) return null;
@@ -311,19 +314,32 @@ window.WaitingVisuals = (() => {
   });
 
   const coffeeCup = `<g class="wv-cup-steam"><path d="M94 47c-1-1 1-2 0-3"/><path d="M97 46c-1-1 1-2 0-3"/></g><path class="wv-cup-shell" d="M92 50h7v6a2 2 0 0 1-2 2h-3a2 2 0 0 1-2-2Z"/><path class="wv-cup-handle" d="M92 52h-2v4h2"/><path class="wv-cup-rim" d="M93 50h5"/>`;
+  // Closed transport grips the left edge at (64, 58.7). During consultation the
+  // original rear palm supports (64, 62.6619), reachable without changing its rig.
+  // The right cover and one loose page hinge at x=74.5, following the front hand.
+  const manualClosed = `<path class="wv-manual-cover" d="M64 48.5q5.25-1.5 10.5.5v14q-5.25-2-10.5-.5Z"/><path class="wv-manual-detail" d="M66 51.5h5m-5 2.5h4m2.5-5v13"/>`;
+  const manualLeft = `<path class="wv-manual-leaf" d="M64 48.5q5.25-1.5 10.5.5v14q-5.25-2-10.5-.5Z"/><path class="wv-manual-lines" d="M66 52h6m-6 3h6m-6 3h4"/>`;
+  const manualRight = `<path class="wv-manual-leaf" d="M74.5 49q5.25-2 10.5-.5v14q-5.25-1.5-10.5.5Z"/><path class="wv-manual-lines" d="M77 52h6m-6 3h6m-6 3h4"/>`;
+  const manualOpen = `${manualLeft}<g class="wv-manual-cover-fold">${manualRight}<g class="wv-manual-cover-face"><g transform="translate(149 0) scale(-1 1)">${manualClosed}</g></g></g><g class="wv-manual-page">${manualRight}</g><path class="wv-manual-spine" d="M74.5 49v14"/>`;
   function reactionScenery(family) {
     if (!adapters[family]?.reactions) return '';
-    // The hatch and cup share the same measured contact coordinates as the hand.
-    // The hatch stays open while the cup is out, and only closes under the empty hand.
+    // The hatch and stored prop share measured contact coordinates with the hand.
+    // The hatch stays open while a prop is out, and closes under the empty hand.
     const kitchen = `<g class="wv-kitchen"><path class="wv-kitchen-wall" d="M166 34h23v47h-23Z"/>
       <path class="wv-kitchen-recess" d="M169 43h17v21h-17Z"/><path class="wv-kitchen-shelf" d="M168 59h19m-19 6h19"/>
       <g class="wv-cup-shelf" transform="translate(82 0)">${coffeeCup}</g>
+      <g class="wv-manual-shelf" transform="translate(109 -3.7)">${manualClosed}</g>
       <g class="wv-kitchen-hatch"><path class="wv-kitchen-wall" d="M168 43h19v18h-19Z"/><path class="wv-kitchen-handle" d="M171 55h4"/>
         <path class="wv-kitchen-detail" d="M172 47h11"/></g><path class="wv-kitchen-detail" d="M170 72h13m-13 3h9"/>
       <path class="wv-rail" d="M165 83h25"/></g>`;
     const proof = family === 'composition' ? `<g class="wv-proof-held">${composeSheet}</g>` : '';
     const parked = family === 'composition' ? `<g class="wv-proof-parked" transform="translate(26.341973495 1.717610627)">${composeSheet}</g>` : '';
-    const actor = taskRobot(`${proof}<g class="wv-cup-held"><g class="wv-cup-wrist">${coffeeCup}</g></g>`).replaceAll('wv-task', 'wv-react');
+    const backArm = `<g class="wv-task-arm-back"><path class="wv-task-limb" d="m56 51-7 9 5 5"/><circle class="wv-task-palm" cx="54" cy="65" r="2.5"/></g>`;
+    const supportingArm = `<g class="wv-task-arm-back"><path class="wv-task-limb" d="m56 51-7 9 5 5"/><g class="wv-manual-supported"><g class="wv-manual-support-wrist"><g transform="translate(-10 2.33809621)">${manualOpen}</g></g></g><circle class="wv-task-palm" cx="54" cy="65" r="2.5"/></g>`;
+    // Keep the rear hand's prop in its actual hierarchy, but draw that arm above
+    // the torso so the supported book cannot disappear behind the chest shell.
+    const actor = taskRobot(`${proof}<g class="wv-cup-held"><g class="wv-cup-wrist">${coffeeCup}</g></g><g class="wv-manual-held"><g class="wv-manual-wrist"><g transform="translate(27 -3.7)">${manualClosed}</g></g></g>`)
+      .replace(backArm, '').replace('<g class="wv-task-arm">', `${supportingArm}<g class="wv-task-arm">`).replaceAll('wv-task', 'wv-react');
     return `${kitchen}${parked}<g class="wv-reaction-actor">${actor}</g>`;
   }
 

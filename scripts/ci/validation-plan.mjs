@@ -11,7 +11,7 @@ export const fullPreview = [
   'test-explorer-timeline.mjs', 'test-field-transform.mjs', 'test-exclusion-archive.mjs',
   'test-case-references.mjs', 'test-canonical-field-actions.mjs', 'test-java-trace.mjs',
   'test-native-case-startup.mjs', 'test-native-case-timeline.mjs',
-  'test-context-menu.mjs', 'test-waiting-visuals.mjs', 'test-waiting-reactions.mjs', 'test-waiting-verification.mjs', 'test-toast-feedback.mjs', 'test-record-actions.mjs', 'test-export-scope.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs', 'test-columns.mjs', 'test-source-actions.mjs', 'test-settings-codes.mjs', 'test-timestamp-editor.mjs',
+  'test-context-menu.mjs', 'test-waiting-visuals.mjs', 'test-waiting-reactions.mjs', 'test-waiting-verification.mjs', 'test-waiting-manual.mjs', 'test-toast-feedback.mjs', 'test-record-actions.mjs', 'test-export-scope.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs', 'test-columns.mjs', 'test-source-actions.mjs', 'test-settings-codes.mjs', 'test-timestamp-editor.mjs',
 ];
 export const essentialPreview = [
   'test-navigation.mjs', 'test-responsiveness.mjs', 'test-updates.mjs',
@@ -30,7 +30,7 @@ const affected = [
   [/^frontend\/case-report\./, ['test-case-report-waiting.mjs']],
   [/^frontend\/(?:ui-scale|styles|index\.html)/, ['test-ui-scale.mjs']],
   [/^frontend\/(?:context-menu|command-palette)/, ['test-navigation.mjs', 'test-context-menu.mjs', 'test-source-actions.mjs']],
-  [/^frontend\/(?:waiting-|tasks)/, ['test-responsiveness.mjs', 'test-waiting-visuals.mjs', 'test-waiting-reactions.mjs', 'test-waiting-verification.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs']],
+  [/^frontend\/(?:waiting-|tasks)/, ['test-responsiveness.mjs', 'test-waiting-visuals.mjs', 'test-waiting-reactions.mjs', 'test-waiting-verification.mjs', 'test-waiting-manual.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs']],
 ];
 const nativePath = /^(?:src-tauri\/|\.github\/|\.cargo\/|rust-toolchain(?:\.toml)?$|package(?:-lock)?\.json$|scripts\/(?:ci\/|release\/|tauri-build\.mjs$|prepare-frontend\.mjs$))/;
 const documentationPath = /^(?:docs\/|README\.md$|LICENSE(?:\.[^/]*)?$|\.gitignore$|\.gitattributes$)/;

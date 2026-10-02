@@ -137,7 +137,7 @@ test('failed capture restores CSS declarations without rewinding the partially r
 });
 
 test('preview samplers never use WAAPI playback overrides and test pause before and after seeks', () => {
-  for (const filename of ['test-waiting-visuals.mjs', 'test-case-report-waiting.mjs', 'test-waiting-reactions.mjs']) {
+  for (const filename of ['test-waiting-visuals.mjs', 'test-case-report-waiting.mjs', 'test-waiting-reactions.mjs', 'test-waiting-manual.mjs']) {
     const source = readFileSync(new URL(`../preview/${filename}`, import.meta.url), 'utf8');
     assert.doesNotMatch(source, /\.(?:pause|play)\s*\(/, filename);
     assert.match(source, /addInitScript\(installMotionSampling\)/, filename);
@@ -149,7 +149,9 @@ test('preview samplers never use WAAPI playback overrides and test pause before 
   const after = source.indexOf('results.midEpisodePause =');
   assert.ok(naturalEnd >= 0 && naturalEnd < before && before < sampling && sampling < after);
   assert.match(source, /timeMs - events\[firstCoffee\]\.timeMs >= 31000/);
-  assert.match(source, /reading: 32, checkpoint: 31, calculation: 7, composition: 6/);
+  assert.match(source, /seed < 4096/);
+  assert.match(source, /WaitingVisuals\.createDirector\(receipt\.operationId, seed\)\.boundary\(model\)\?\.episode === 'coffee'/);
+  assert.match(source, /results\.seeds = await page\.evaluate\(\(\) => __reactionPreview\.seeds\)/);
   assert.match(source, /elapsedMs: 60000/);
 });
 

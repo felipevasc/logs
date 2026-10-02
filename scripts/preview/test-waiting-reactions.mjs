@@ -130,7 +130,7 @@ try {
     Object.assign(attribution.style, { fontSize: '12px', color: 'var(--text-1)', margin: '0 0 24px' });
     const pair = document.createElement('div'); Object.assign(pair.style, { display: 'flex', gap: '20px', justifyContent: 'center', flexWrap: 'wrap' });
     panel.append(heading, attribution, pair); document.body.append(panel);
-    window.__reactionPreview = { views: {}, receipts: {}, events: [], observers: [], svg: {} };
+    window.__reactionPreview = { views: {}, receipts: {}, events: [], observers: [], svg: {}, seeds: {} };
     for (const [family, phaseId, label] of [['reading', 'metadata-scan', 'Indexando registros'], ['checkpoint', 'metadata-checkpoint-sync', 'Confirmando gravação'],
       ['calculation', 'command:aggregate_events', 'Calculando o recorte'], ['composition', 'command:case_report_render', 'Compondo relatório']]) {
       const host = document.createElement('section'); host.id = `reaction-${family}`;
@@ -140,7 +140,13 @@ try {
         completed: 1200, total: 6300, unit: 'registros', elapsedMs: 60000 };
       // Seeds select coffee at the first safe boundary, without changing eligibility,
       // choreography speed or the product's normal random-selection contract.
-      const reactionSeed = { reading: 32, checkpoint: 31, calculation: 7, composition: 6 }[family];
+      const model = WaitingVisuals.derive(receipt);
+      let reactionSeed;
+      for (let seed = 0; seed < 4096; seed++) {
+        if (WaitingVisuals.createDirector(receipt.operationId, seed).boundary(model)?.episode === 'coffee') { reactionSeed = seed; break; }
+      }
+      if (reactionSeed === undefined) throw Error(`No first-boundary coffee seed found for ${family}`);
+      __reactionPreview.seeds[family] = reactionSeed;
       const view = WaitingVisuals.mount(host, receipt, { reactionSeed });
       __reactionPreview.views[family] = view; __reactionPreview.receipts[family] = receipt;
       __reactionPreview.svg[family] = view.element.querySelector('svg');
@@ -154,6 +160,7 @@ try {
     }
   });
   await page.waitForFunction(() => [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')].every(root => root.dataset.motion === 'running'));
+  results.seeds = await page.evaluate(() => __reactionPreview.seeds);
   results.initial = await states();
   assert.deepEqual(results.initial.map(s => s.family), families);
   for (const state of results.initial) {
@@ -196,7 +203,7 @@ try {
     for (const family of ['reading', 'checkpoint', 'calculation', 'composition']) {
       __reactionPreview.views[family].destroy();
       __reactionPreview.views[family] = WaitingVisuals.mount(document.querySelector(`#reaction-${family}`),
-        __reactionPreview.receipts[family], { reactionSeed: { reading: 32, checkpoint: 31, calculation: 7, composition: 6 }[family] });
+        __reactionPreview.receipts[family], { reactionSeed: __reactionPreview.seeds[family] });
     }
   });
   await allEpisode('coffee');
@@ -258,6 +265,27 @@ try {
     assert.ok(rig.appearance[0].kitchenOpacity < .01 && rig.appearance.at(-1).kitchenOpacity < .01);
     results.rigs.push(rig);
   }
+  // The manual adds rear-hand support in front of the torso. Capture the old
+  // coffee pose explicitly: unchanged keyframes alone do not prove pixel parity.
+  results.layeringReview = { note: 'Rear arm is now above the torso for manual support; compare this coffee pose visually with the approved reference', poses: [] };
+  const coffeePose = await page.evaluateHandle(async () => {
+    const nodes = [...document.querySelectorAll('#waiting-reaction-fixture .waiting-visual')];
+    const sampling = await __waitingMotionSampling.begin(nodes.flatMap(root => root.querySelector('.wv-art').getAnimations({ subtree: true })
+      .filter(animation => /^(?:wv-coffee-|wv-episode-boundary)/.test(animation.animationName))));
+    await sampling.seek(16000);
+    return sampling;
+  });
+  try {
+    results.layeringReview.poses = await roots.evaluateAll(nodes => nodes.map(root => {
+      const back = root.querySelector('.wv-react-arm-back'), torso = root.querySelector('.wv-react-body > .wv-react-shell');
+      return { family: root.dataset.family, timeMs: 16000,
+        rearArmAfterTorso: !!(torso.compareDocumentPosition(back) & Node.DOCUMENT_POSITION_FOLLOWING),
+        rearArmOpacity: Number(getComputedStyle(back).opacity), rearArmMatrix: ['a', 'b', 'c', 'd', 'e', 'f'].map(key => back.getScreenCTM()[key]),
+        torsoMatrix: ['a', 'b', 'c', 'd', 'e', 'f'].map(key => torso.getScreenCTM()[key]), heldCupOpacity: Number(getComputedStyle(root.querySelector('.wv-cup-held')).opacity) };
+    }));
+    assert.ok(results.layeringReview.poses.every(pose => pose.heldCupOpacity === 1));
+    await snap('waiting-reactions-coffee-layering-diagnostic-dark.png');
+  } finally { await coffeePose.evaluate(sampling => sampling.restore()); await coffeePose.dispose(); }
   phase = 'pause, receipts and hidden context';
   results.midEpisodePause = await pauseAndResumeReading('coffee-pause-resume-after-contact-sampling', true);
   await page.evaluate(() => Object.values(__reactionPreview.views).forEach(view => view.setVisible(false)));

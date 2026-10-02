@@ -1403,7 +1403,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
 .waiting-visual .wv-cup-rim { stroke-width: .8; }
 .waiting-visual .wv-kitchen-detail { opacity: .55; stroke-width: .9; }
 .waiting-visual .wv-kitchen-handle { stroke-width: 2; }
-.waiting-visual[data-episode="coffee"][data-adapter="react"] { --wv-reaction-cycle: 32s; }
+.waiting-visual:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] { --wv-reaction-cycle: 32s; }
 .waiting-visual[data-episode="stretch"][data-adapter="react"] { --wv-reaction-cycle: 12s; }
 .waiting-visual[data-episode="review"][data-adapter="react"] { --wv-reaction-cycle: 10s; }
 .waiting-visual:not([data-episode="work"]) .wv-work > :is(.wv-reader, .wv-archive-actor, .wv-group-actor, .wv-compose-actor, .wv-verify-actor) { visibility: hidden; }
@@ -1565,7 +1565,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   90.62500% { transform: translateY(0px); }
   100.00000% { transform: translateY(0px); }
 }
-.waiting-visual[data-animated="true"][data-episode="coffee"][data-adapter="react"] .wv-kitchen-hatch { animation: wv-coffee-hatch var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-kitchen-hatch { animation: wv-coffee-hatch var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-head {
   0.00000% { transform: rotate(var(--wv-home-head)); }
   6.00000% { transform: rotate(-6deg); }
@@ -1744,7 +1744,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: translateX(0.000000px); }
   100.00000% { transform: translateX(0.000000px); }
 }
-.waiting-visual[data-animated="true"][data-family="reading"][data-episode="coffee"][data-adapter="react"] .wv-reaction-actor { animation: wv-coffee-travel-reading var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"][data-family="reading"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-reaction-actor { animation: wv-coffee-travel-reading var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-reading-leg-front {
   0.00000% { transform: rotate(-56.043deg); }
   6.25000% { transform: rotate(-56.043deg); }
@@ -1849,7 +1849,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-56.043deg); }
   100.00000% { transform: rotate(-56.043deg); }
 }
-.waiting-visual[data-animated="true"][data-family="reading"][data-episode="coffee"][data-adapter="react"] .wv-react-leg-front { animation: wv-coffee-reading-leg-front var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"][data-family="reading"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-leg-front { animation: wv-coffee-reading-leg-front var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-reading-knee-front {
   0.00000% { transform: rotate(78.6876deg); }
   6.25000% { transform: rotate(78.6876deg); }
@@ -1954,7 +1954,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(78.6876deg); }
   100.00000% { transform: rotate(78.6876deg); }
 }
-.waiting-visual[data-animated="true"][data-family="reading"][data-episode="coffee"][data-adapter="react"] .wv-react-knee-front { animation: wv-coffee-reading-knee-front var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"][data-family="reading"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-knee-front { animation: wv-coffee-reading-knee-front var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-reading-foot-front {
   0.00000% { transform: rotate(-22.6445deg); }
   6.25000% { transform: rotate(-22.6445deg); }
@@ -2059,7 +2059,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-22.6445deg); }
   100.00000% { transform: rotate(-22.6445deg); }
 }
-.waiting-visual[data-animated="true"][data-family="reading"][data-episode="coffee"][data-adapter="react"] .wv-react-foot-front { animation: wv-coffee-reading-foot-front var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"][data-family="reading"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-foot-front { animation: wv-coffee-reading-foot-front var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-reading-leg-back {
   0.00000% { transform: rotate(-19.0077deg); }
   6.25000% { transform: rotate(-19.0077deg); }
@@ -2164,7 +2164,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-19.0077deg); }
   100.00000% { transform: rotate(-19.0077deg); }
 }
-.waiting-visual[data-animated="true"][data-family="reading"][data-episode="coffee"][data-adapter="react"] .wv-react-leg-back { animation: wv-coffee-reading-leg-back var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"][data-family="reading"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-leg-back { animation: wv-coffee-reading-leg-back var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-reading-knee-back {
   0.00000% { transform: rotate(76.5955deg); }
   6.25000% { transform: rotate(76.5955deg); }
@@ -2269,7 +2269,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(76.5955deg); }
   100.00000% { transform: rotate(76.5955deg); }
 }
-.waiting-visual[data-animated="true"][data-family="reading"][data-episode="coffee"][data-adapter="react"] .wv-react-knee-back { animation: wv-coffee-reading-knee-back var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"][data-family="reading"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-knee-back { animation: wv-coffee-reading-knee-back var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-reading-foot-back {
   0.00000% { transform: rotate(-57.5878deg); }
   6.25000% { transform: rotate(-57.5878deg); }
@@ -2374,7 +2374,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-57.5878deg); }
   100.00000% { transform: rotate(-57.5878deg); }
 }
-.waiting-visual[data-animated="true"][data-family="reading"][data-episode="coffee"][data-adapter="react"] .wv-react-foot-back { animation: wv-coffee-reading-foot-back var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"][data-family="reading"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-foot-back { animation: wv-coffee-reading-foot-back var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-travel-checkpoint {
   0.00000% { transform: translateX(20.000000px); }
   6.25000% { transform: translateX(20.000000px); }
@@ -2447,7 +2447,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: translateX(20.000000px); }
   100.00000% { transform: translateX(20.000000px); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"])[data-episode="coffee"][data-adapter="react"] .wv-reaction-actor { animation: wv-coffee-travel-checkpoint var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-reaction-actor { animation: wv-coffee-travel-checkpoint var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-leg-front {
   0.00000% { transform: rotate(-56.043deg); }
   6.25000% { transform: rotate(-56.043deg); }
@@ -2520,7 +2520,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-56.043deg); }
   100.00000% { transform: rotate(-56.043deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"])[data-episode="coffee"][data-adapter="react"] .wv-react-leg-front { animation: wv-coffee-checkpoint-leg-front var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-leg-front { animation: wv-coffee-checkpoint-leg-front var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-knee-front {
   0.00000% { transform: rotate(78.6876deg); }
   6.25000% { transform: rotate(78.6876deg); }
@@ -2593,7 +2593,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(78.6876deg); }
   100.00000% { transform: rotate(78.6876deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"])[data-episode="coffee"][data-adapter="react"] .wv-react-knee-front { animation: wv-coffee-checkpoint-knee-front var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-knee-front { animation: wv-coffee-checkpoint-knee-front var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-foot-front {
   0.00000% { transform: rotate(-22.6445deg); }
   6.25000% { transform: rotate(-22.6445deg); }
@@ -2666,7 +2666,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-22.6445deg); }
   100.00000% { transform: rotate(-22.6445deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"])[data-episode="coffee"][data-adapter="react"] .wv-react-foot-front { animation: wv-coffee-checkpoint-foot-front var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-foot-front { animation: wv-coffee-checkpoint-foot-front var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-leg-back {
   0.00000% { transform: rotate(-19.0077deg); }
   6.25000% { transform: rotate(-19.0077deg); }
@@ -2739,7 +2739,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-19.0077deg); }
   100.00000% { transform: rotate(-19.0077deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"])[data-episode="coffee"][data-adapter="react"] .wv-react-leg-back { animation: wv-coffee-checkpoint-leg-back var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-leg-back { animation: wv-coffee-checkpoint-leg-back var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-knee-back {
   0.00000% { transform: rotate(76.5955deg); }
   6.25000% { transform: rotate(76.5955deg); }
@@ -2812,7 +2812,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(76.5955deg); }
   100.00000% { transform: rotate(76.5955deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"])[data-episode="coffee"][data-adapter="react"] .wv-react-knee-back { animation: wv-coffee-checkpoint-knee-back var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-knee-back { animation: wv-coffee-checkpoint-knee-back var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-checkpoint-foot-back {
   0.00000% { transform: rotate(-57.5878deg); }
   6.25000% { transform: rotate(-57.5878deg); }
@@ -2885,7 +2885,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   96.87500% { transform: rotate(-57.5878deg); }
   100.00000% { transform: rotate(-57.5878deg); }
 }
-.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"])[data-episode="coffee"][data-adapter="react"] .wv-react-foot-back { animation: wv-coffee-checkpoint-foot-back var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"]:is([data-family="checkpoint"], [data-family="calculation"], [data-family="composition"], [data-family="verification"]):is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-react-foot-back { animation: wv-coffee-checkpoint-foot-back var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-review-body {
   0.00000% { transform: rotate(0deg); }
   14.00000% { transform: rotate(0deg); }
@@ -3529,7 +3529,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
    Steam belongs to the cup's wrist, so it cannot drift away while carried. */
 .waiting-visual .wv-kitchen { opacity: 0; }
 .waiting-visual .wv-cup-steam { opacity: .38; stroke-width: .8; }
-.waiting-visual[data-animated="true"][data-episode="coffee"][data-adapter="react"] .wv-kitchen {
+.waiting-visual[data-animated="true"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-kitchen {
   animation: wv-coffee-kitchen var(--wv-reaction-cycle) linear 1 both;
 }
 .waiting-visual[data-animated="true"][data-episode="coffee"][data-adapter="react"] .wv-cup-held .wv-cup-steam {
@@ -3544,3 +3544,602 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   0%, 24%, 48%, 72%, 100% { transform: translateY(0); opacity: .22; }
   12%, 36%, 60%, 84% { transform: translateY(-.8px); opacity: .42; }
 }
+
+/* One manual, one support hand. The front hand opens/closes the cover and turns
+   a single page; the rear arm retains its original rigid silhouette and length.
+   The same excursion, feet, hatch and temporary kit are shared with coffee. */
+.waiting-visual .wv-manual-held, .waiting-visual .wv-manual-supported, .waiting-visual .wv-manual-shelf { opacity: 0; }
+.waiting-visual .wv-manual-wrist { transform-origin: 91px 55px; }
+.waiting-visual .wv-manual-support-wrist { transform-origin: 54px 65px; }
+.waiting-visual .wv-manual-cover-fold, .waiting-visual .wv-manual-page { transform-origin: 74.5px 0; }
+.waiting-visual .wv-manual-cover-fold { transform: scaleX(-1); }
+.waiting-visual .wv-manual-cover { fill: var(--wv-react-shell); }
+.waiting-visual .wv-manual-leaf { fill: var(--wv-react-paper); stroke-width: .9; }
+.waiting-visual .wv-manual-lines, .waiting-visual .wv-manual-detail { stroke-width: .7; opacity: .65; }
+.waiting-visual .wv-manual-spine { stroke-width: .8; }
+.waiting-visual[data-episode="manual"] .wv-cup-shelf { visibility: hidden; }
+.waiting-visual[data-episode="manual"] .wv-react-arm-back { opacity: 1; }
+.waiting-visual[data-episode="manual"] .wv-react-arm-back > :is(.wv-react-limb, .wv-react-palm) { opacity: .65; }
+@keyframes wv-manual-arm {
+  0.00000% { transform: rotate(40.00000000deg); }
+  6.25000% { transform: rotate(40.00000000deg); }
+  17.81250% { transform: rotate(40.00000000deg); }
+  20.31250% { transform: rotate(0.00000000deg); }
+  21.09375% { transform: rotate(-2.22690000deg); }
+  21.87500% { transform: rotate(-4.79009000deg); }
+  22.65625% { transform: rotate(-7.65994000deg); }
+  23.43750% { transform: rotate(-10.81570000deg); }
+  24.21875% { transform: rotate(-14.24490000deg); }
+  25.00000% { transform: rotate(-17.94530000deg); }
+  25.78125% { transform: rotate(-21.92770000deg); }
+  26.56250% { transform: rotate(-26.22380000deg); }
+  28.12500% { transform: rotate(0.00000000deg); }
+  29.68750% { transform: rotate(0.00000000deg); }
+  31.25000% { transform: rotate(-20.00000000deg); }
+  43.75000% { transform: rotate(-20.00000000deg); }
+  44.14062% { transform: rotate(2.30450213deg); }
+  44.53125% { transform: rotate(17.55662699deg); }
+  44.92188% { transform: rotate(31.99366548deg); }
+  45.31250% { transform: rotate(48.89442436deg); }
+  45.70312% { transform: rotate(76.28732112deg); }
+  46.09375% { transform: rotate(121.70486904deg); }
+  46.48438% { transform: rotate(150.99974616deg); }
+  46.87500% { transform: rotate(159.56619828deg); }
+  47.00521% { transform: rotate(157.40915009deg); }
+  47.13542% { transform: rotate(154.59449431deg); }
+  47.26562% { transform: rotate(151.05577771deg); }
+  47.39583% { transform: rotate(146.73773522deg); }
+  47.52604% { transform: rotate(141.61270149deg); }
+  47.65625% { transform: rotate(135.70177705deg); }
+  47.78646% { transform: rotate(129.09550521deg); }
+  47.91667% { transform: rotate(121.96340981deg); }
+  48.04688% { transform: rotate(114.54035376deg); }
+  48.17708% { transform: rotate(107.08664418deg); }
+  48.30729% { transform: rotate(99.83589536deg); }
+  48.43750% { transform: rotate(92.95473945deg); }
+  48.56771% { transform: rotate(86.52989367deg); }
+  48.69792% { transform: rotate(80.57974153deg); }
+  48.82812% { transform: rotate(75.07688684deg); }
+  48.95833% { transform: rotate(69.96974617deg); }
+  49.08854% { transform: rotate(65.19789414deg); }
+  49.21875% { transform: rotate(60.70091852deg); }
+  49.34896% { transform: rotate(56.42252679deg); }
+  49.47917% { transform: rotate(52.31175321deg); }
+  49.60938% { transform: rotate(48.32258504deg); }
+  49.73958% { transform: rotate(44.41277115deg); }
+  49.86979% { transform: rotate(40.54216026deg); }
+  50.00000% { transform: rotate(36.67062052deg); }
+  50.31250% { transform: rotate(39.98385881deg); }
+  50.62500% { transform: rotate(41.44724322deg); }
+  51.87500% { transform: rotate(41.44724322deg); }
+  52.18750% { transform: rotate(48.32476188deg); }
+  52.50000% { transform: rotate(50.10515046deg); }
+  52.81250% { transform: rotate(44.11810988deg); }
+  53.12500% { transform: rotate(21.53201501deg); }
+  53.43750% { transform: rotate(23.43745516deg); }
+  53.75000% { transform: rotate(22.91283712deg); }
+  54.06250% { transform: rotate(21.09066699deg); }
+  54.37500% { transform: rotate(18.42561256deg); }
+  54.68750% { transform: rotate(33.40793075deg); }
+  55.00000% { transform: rotate(53.96812093deg); }
+  55.31250% { transform: rotate(48.18979435deg); }
+  55.62500% { transform: rotate(42.92597596deg); }
+  55.93750% { transform: rotate(37.87207988deg); }
+  56.25000% { transform: rotate(32.85234498deg); }
+  56.56250% { transform: rotate(36.02697886deg); }
+  56.87500% { transform: rotate(36.67062052deg); }
+  57.01172% { transform: rotate(39.57596467deg); }
+  57.14844% { transform: rotate(42.47504626deg); }
+  57.28516% { transform: rotate(45.38499893deg); }
+  57.42188% { transform: rotate(48.32258504deg); }
+  57.55859% { transform: rotate(51.30476398deg); }
+  57.69531% { transform: rotate(54.34916843deg); }
+  57.83203% { transform: rotate(57.47451095deg); }
+  57.96875% { transform: rotate(60.70091852deg); }
+  58.10547% { transform: rotate(64.05016678deg); }
+  58.24219% { transform: rotate(67.54575150deg); }
+  58.37891% { transform: rotate(71.21268987deg); }
+  58.51563% { transform: rotate(75.07688684deg); }
+  58.65234% { transform: rotate(79.16383842deg); }
+  58.78906% { transform: rotate(83.49639799deg); }
+  58.92578% { transform: rotate(88.09135360deg); }
+  59.06250% { transform: rotate(92.95473945deg); }
+  59.19922% { transform: rotate(98.07622569deg); }
+  59.33594% { transform: rotate(103.42361821deg); }
+  59.47266% { transform: rotate(108.93924970deg); }
+  59.60938% { transform: rotate(114.54035376deg); }
+  59.74609% { transform: rotate(120.12479426deg); }
+  59.88281% { transform: rotate(125.58168358deg); }
+  60.01953% { transform: rotate(130.80431213deg); }
+  60.15625% { transform: rotate(135.70177705deg); }
+  60.29297% { transform: rotate(140.20643168deg); }
+  60.42969% { transform: rotate(144.27618175deg); }
+  60.56641% { transform: rotate(147.89248009deg); }
+  60.70312% { transform: rotate(151.05577771deg); }
+  60.83984% { transform: rotate(153.78015125deg); }
+  60.97656% { transform: rotate(156.08828680deg); }
+  61.11328% { transform: rotate(158.00739614deg); }
+  61.25000% { transform: rotate(159.56619828deg); }
+  61.71875% { transform: rotate(149.38377410deg); }
+  62.18750% { transform: rotate(139.90864116deg); }
+  62.42187% { transform: rotate(122.86678789deg); }
+  62.65625% { transform: rotate(95.32709162deg); }
+  62.89062% { transform: rotate(67.39998394deg); }
+  63.12500% { transform: rotate(41.44724322deg); }
+  64.37500% { transform: rotate(41.44724322deg); }
+  65.00000% { transform: rotate(39.98385881deg); }
+  65.62500% { transform: rotate(36.67062052deg); }
+  65.75521% { transform: rotate(40.54216026deg); }
+  65.88542% { transform: rotate(44.41277115deg); }
+  66.01562% { transform: rotate(48.32258504deg); }
+  66.14583% { transform: rotate(52.31175321deg); }
+  66.27604% { transform: rotate(56.42252679deg); }
+  66.40625% { transform: rotate(60.70091852deg); }
+  66.53646% { transform: rotate(65.19789414deg); }
+  66.66667% { transform: rotate(69.96974617deg); }
+  66.79688% { transform: rotate(75.07688684deg); }
+  66.92708% { transform: rotate(80.57974153deg); }
+  67.05729% { transform: rotate(86.52989367deg); }
+  67.18750% { transform: rotate(92.95473945deg); }
+  67.31771% { transform: rotate(99.83589536deg); }
+  67.44792% { transform: rotate(107.08664418deg); }
+  67.57812% { transform: rotate(114.54035376deg); }
+  67.70833% { transform: rotate(121.96340981deg); }
+  67.83854% { transform: rotate(129.09550521deg); }
+  67.96875% { transform: rotate(135.70177705deg); }
+  68.09896% { transform: rotate(141.61270149deg); }
+  68.22917% { transform: rotate(146.73773522deg); }
+  68.35938% { transform: rotate(151.05577771deg); }
+  68.48958% { transform: rotate(154.59449431deg); }
+  68.61979% { transform: rotate(157.40915009deg); }
+  68.75000% { transform: rotate(159.56619828deg); }
+  69.14062% { transform: rotate(150.99974616deg); }
+  69.53125% { transform: rotate(121.70486904deg); }
+  69.92188% { transform: rotate(76.28732112deg); }
+  70.31250% { transform: rotate(48.89442436deg); }
+  70.70312% { transform: rotate(31.99366548deg); }
+  71.09375% { transform: rotate(17.55662699deg); }
+  71.48438% { transform: rotate(2.30450213deg); }
+  71.87500% { transform: rotate(-20.00000000deg); }
+  81.25000% { transform: rotate(-20.00000000deg); }
+  82.81250% { transform: rotate(0.00000000deg); }
+  84.37500% { transform: rotate(0.00000000deg); }
+  85.93750% { transform: rotate(-26.22380000deg); }
+  86.52344% { transform: rotate(-21.92770000deg); }
+  87.10938% { transform: rotate(-17.94530000deg); }
+  87.69531% { transform: rotate(-14.24490000deg); }
+  88.28125% { transform: rotate(-10.81570000deg); }
+  88.86719% { transform: rotate(-7.65994000deg); }
+  89.45312% { transform: rotate(-4.79009000deg); }
+  90.03906% { transform: rotate(-2.22690000deg); }
+  90.62500% { transform: rotate(0.00000000deg); }
+  91.56250% { transform: rotate(40.00000000deg); }
+  96.87500% { transform: rotate(40.00000000deg); }
+  100.00000% { transform: rotate(40.00000000deg); }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-react-arm { animation: wv-manual-arm var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-hand {
+  0.00000% { transform: rotate(-85.00000000deg); }
+  6.25000% { transform: rotate(-85.00000000deg); }
+  17.81250% { transform: rotate(-85.00000000deg); }
+  20.31250% { transform: rotate(-0.00000000deg); }
+  21.09375% { transform: rotate(-1.68426000deg); }
+  21.87500% { transform: rotate(-2.67580000deg); }
+  22.65625% { transform: rotate(-3.00334000deg); }
+  23.43750% { transform: rotate(-2.67580000deg); }
+  24.21875% { transform: rotate(-1.68426000deg); }
+  25.00000% { transform: rotate(-0.00000000deg); }
+  25.78125% { transform: rotate(2.43230000deg); }
+  26.56250% { transform: rotate(5.70985000deg); }
+  28.12500% { transform: rotate(0.00000000deg); }
+  29.68750% { transform: rotate(0.00000000deg); }
+  31.25000% { transform: rotate(20.00000000deg); }
+  43.75000% { transform: rotate(20.00000000deg); }
+  44.14062% { transform: rotate(-25.03074380deg); }
+  44.53125% { transform: rotate(-52.85051156deg); }
+  44.92188% { transform: rotate(-75.38934161deg); }
+  45.31250% { transform: rotate(-94.37692728deg); }
+  45.70312% { transform: rotate(-107.62475334deg); }
+  46.09375% { transform: rotate(-106.44175031deg); }
+  46.48438% { transform: rotate(-92.04009545deg); }
+  46.87500% { transform: rotate(-72.55711025deg); }
+  47.00521% { transform: rotate(-76.69278541deg); }
+  47.13542% { transform: rotate(-80.53996580deg); }
+  47.26562% { transform: rotate(-84.06839047deg); }
+  47.39583% { transform: rotate(-87.23578927deg); }
+  47.52604% { transform: rotate(-89.98781621deg); }
+  47.65625% { transform: rotate(-92.25985344deg); }
+  47.78646% { transform: rotate(-93.98205998deg); }
+  47.91667% { transform: rotate(-95.08855199deg); }
+  48.04688% { transform: rotate(-95.52974316deg); }
+  48.17708% { transform: rotate(-95.28404484deg); }
+  48.30729% { transform: rotate(-94.36361485deg); }
+  48.43750% { transform: rotate(-92.81107094deg); }
+  48.56771% { transform: rotate(-90.68896683deg); }
+  48.69792% { transform: rotate(-88.06712910deg); }
+  48.82812% { transform: rotate(-85.01235702deg); }
+  48.95833% { transform: rotate(-81.58223154deg); }
+  49.08854% { transform: rotate(-77.82252353deg); }
+  49.21875% { transform: rotate(-73.76685787deg); }
+  49.34896% { transform: rotate(-69.43740679deg); }
+  49.47917% { transform: rotate(-64.84579158deg); }
+  49.60938% { transform: rotate(-59.99371543deg); }
+  49.73958% { transform: rotate(-54.87304015deg); }
+  49.86979% { transform: rotate(-49.46506205deg); }
+  50.00000% { transform: rotate(-43.73864572deg); }
+  50.31250% { transform: rotate(-35.84193250deg); }
+  50.62500% { transform: rotate(-25.76005928deg); }
+  51.87500% { transform: rotate(-25.76005928deg); }
+  52.18750% { transform: rotate(-51.29467053deg); }
+  52.50000% { transform: rotate(-72.39579075deg); }
+  52.81250% { transform: rotate(-90.75999393deg); }
+  53.12500% { transform: rotate(-105.88595796deg); }
+  53.43750% { transform: rotate(-96.74493994deg); }
+  53.75000% { transform: rotate(-87.66741856deg); }
+  54.06250% { transform: rotate(-78.44477099deg); }
+  54.37500% { transform: rotate(-68.93039739deg); }
+  54.68750% { transform: rotate(-86.81880147deg); }
+  55.00000% { transform: rotate(-100.79626587deg); }
+  55.31250% { transform: rotate(-92.76461208deg); }
+  55.62500% { transform: rotate(-84.34754929deg); }
+  55.93750% { transform: rotate(-75.54924073deg); }
+  56.25000% { transform: rotate(-66.31412894deg); }
+  56.56250% { transform: rotate(-55.92560652deg); }
+  56.87500% { transform: rotate(-43.73864572deg); }
+  57.01172% { transform: rotate(-48.06484309deg); }
+  57.14844% { transform: rotate(-52.20658673deg); }
+  57.28516% { transform: rotate(-56.17921978deg); }
+  57.42188% { transform: rotate(-59.99371543deg); }
+  57.55859% { transform: rotate(-63.65733815deg); }
+  57.69531% { transform: rotate(-67.17403498deg); }
+  57.83203% { transform: rotate(-70.54462861deg); }
+  57.96875% { transform: rotate(-73.76685787deg); }
+  58.10547% { transform: rotate(-76.83529851deg); }
+  58.24219% { transform: rotate(-79.74119468deg); }
+  58.37891% { transform: rotate(-82.47223887deg); }
+  58.51563% { transform: rotate(-85.01235702deg); }
+  58.65234% { transform: rotate(-87.34158630deg); }
+  58.78906% { transform: rotate(-89.43617576deg); }
+  58.92578% { transform: rotate(-91.26908409deg); }
+  59.06250% { transform: rotate(-92.81107094deg); }
+  59.19922% { transform: rotate(-94.03253775deg); }
+  59.33594% { transform: rotate(-94.90612259deg); }
+  59.47266% { transform: rotate(-95.40977859deg); }
+  59.60938% { transform: rotate(-95.52974316deg); }
+  59.74609% { transform: rotate(-95.26261702deg); }
+  59.88281% { transform: rotate(-94.61590467deg); }
+  60.01953% { transform: rotate(-93.60683546deg); }
+  60.15625% { transform: rotate(-92.25985344deg); }
+  60.29297% { transform: rotate(-90.60351909deg); }
+  60.42969% { transform: rotate(-88.66756211deg); }
+  60.56641% { transform: rotate(-86.48055922deg); }
+  60.70312% { transform: rotate(-84.06839047deg); }
+  60.83984% { transform: rotate(-81.45339660deg); }
+  60.97656% { transform: rotate(-78.65405536deg); }
+  61.11328% { transform: rotate(-75.68498414deg); }
+  61.25000% { transform: rotate(-72.55711025deg); }
+  61.71875% { transform: rotate(-63.65316637deg); }
+  62.18750% { transform: rotate(-53.21600933deg); }
+  62.42187% { transform: rotate(-68.86020373deg); }
+  62.65625% { transform: rotate(-69.24675488deg); }
+  62.89062% { transform: rotate(-54.26301204deg); }
+  63.12500% { transform: rotate(-25.76005928deg); }
+  64.37500% { transform: rotate(-25.76005928deg); }
+  65.00000% { transform: rotate(-35.84193250deg); }
+  65.62500% { transform: rotate(-43.73864572deg); }
+  65.75521% { transform: rotate(-49.46506205deg); }
+  65.88542% { transform: rotate(-54.87304015deg); }
+  66.01562% { transform: rotate(-59.99371543deg); }
+  66.14583% { transform: rotate(-64.84579158deg); }
+  66.27604% { transform: rotate(-69.43740679deg); }
+  66.40625% { transform: rotate(-73.76685787deg); }
+  66.53646% { transform: rotate(-77.82252353deg); }
+  66.66667% { transform: rotate(-81.58223154deg); }
+  66.79688% { transform: rotate(-85.01235702deg); }
+  66.92708% { transform: rotate(-88.06712910deg); }
+  67.05729% { transform: rotate(-90.68896683deg); }
+  67.18750% { transform: rotate(-92.81107094deg); }
+  67.31771% { transform: rotate(-94.36361485deg); }
+  67.44792% { transform: rotate(-95.28404484deg); }
+  67.57812% { transform: rotate(-95.52974316deg); }
+  67.70833% { transform: rotate(-95.08855199deg); }
+  67.83854% { transform: rotate(-93.98205998deg); }
+  67.96875% { transform: rotate(-92.25985344deg); }
+  68.09896% { transform: rotate(-89.98781621deg); }
+  68.22917% { transform: rotate(-87.23578927deg); }
+  68.35938% { transform: rotate(-84.06839047deg); }
+  68.48958% { transform: rotate(-80.53996580deg); }
+  68.61979% { transform: rotate(-76.69278541deg); }
+  68.75000% { transform: rotate(-72.55711025deg); }
+  69.14062% { transform: rotate(-92.04009545deg); }
+  69.53125% { transform: rotate(-106.44175031deg); }
+  69.92188% { transform: rotate(-107.62475334deg); }
+  70.31250% { transform: rotate(-94.37692728deg); }
+  70.70312% { transform: rotate(-75.38934161deg); }
+  71.09375% { transform: rotate(-52.85051156deg); }
+  71.48438% { transform: rotate(-25.03074380deg); }
+  71.87500% { transform: rotate(20.00000000deg); }
+  81.25000% { transform: rotate(20.00000000deg); }
+  82.81250% { transform: rotate(0.00000000deg); }
+  84.37500% { transform: rotate(0.00000000deg); }
+  85.93750% { transform: rotate(5.70985000deg); }
+  86.52344% { transform: rotate(2.43230000deg); }
+  87.10938% { transform: rotate(-0.00000000deg); }
+  87.69531% { transform: rotate(-1.68426000deg); }
+  88.28125% { transform: rotate(-2.67580000deg); }
+  88.86719% { transform: rotate(-3.00334000deg); }
+  89.45312% { transform: rotate(-2.67580000deg); }
+  90.03906% { transform: rotate(-1.68426000deg); }
+  90.62500% { transform: rotate(-0.00000000deg); }
+  91.56250% { transform: rotate(-85.00000000deg); }
+  96.87500% { transform: rotate(-85.00000000deg); }
+  100.00000% { transform: rotate(-85.00000000deg); }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-react-hand { animation: wv-manual-hand var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-wrist {
+  0.00000% { transform: rotate(45.00000000deg); }
+  6.25000% { transform: rotate(45.00000000deg); }
+  17.81250% { transform: rotate(45.00000000deg); }
+  20.31250% { transform: rotate(0.00000000deg); }
+  21.09375% { transform: rotate(3.91116000deg); }
+  21.87500% { transform: rotate(7.46588000deg); }
+  22.65625% { transform: rotate(10.66330000deg); }
+  23.43750% { transform: rotate(13.49150000deg); }
+  24.21875% { transform: rotate(15.92920000deg); }
+  25.00000% { transform: rotate(17.94530000deg); }
+  25.78125% { transform: rotate(19.49540000deg); }
+  26.56250% { transform: rotate(20.51390000deg); }
+  28.12500% { transform: rotate(0.00000000deg); }
+  29.68750% { transform: rotate(0.00000000deg); }
+  31.25000% { transform: rotate(0.00000000deg); }
+  43.75000% { transform: rotate(0.00000000deg); }
+  44.14062% { transform: rotate(22.72624167deg); }
+  44.53125% { transform: rotate(35.29388457deg); }
+  44.92188% { transform: rotate(43.39567614deg); }
+  45.31250% { transform: rotate(45.48250291deg); }
+  45.70312% { transform: rotate(31.33743223deg); }
+  46.09375% { transform: rotate(-15.26311873deg); }
+  46.48438% { transform: rotate(-58.95965071deg); }
+  46.87500% { transform: rotate(-87.00908803deg); }
+  47.00521% { transform: rotate(-80.71636467deg); }
+  47.13542% { transform: rotate(-74.05452851deg); }
+  47.26562% { transform: rotate(-66.98738724deg); }
+  47.39583% { transform: rotate(-59.50194594deg); }
+  47.52604% { transform: rotate(-51.62488528deg); }
+  47.65625% { transform: rotate(-43.44192361deg); }
+  47.78646% { transform: rotate(-35.11344522deg); }
+  47.91667% { transform: rotate(-26.87485783deg); }
+  48.04688% { transform: rotate(-19.01061061deg); }
+  48.17708% { transform: rotate(-11.80259934deg); }
+  48.30729% { transform: rotate(-5.47228051deg); }
+  48.43750% { transform: rotate(-0.14366851deg); }
+  48.56771% { transform: rotate(4.15907316deg); }
+  48.69792% { transform: rotate(7.48738757deg); }
+  48.82812% { transform: rotate(9.93547018deg); }
+  48.95833% { transform: rotate(11.61248537deg); }
+  49.08854% { transform: rotate(12.62462939deg); }
+  49.21875% { transform: rotate(13.06593935deg); }
+  49.34896% { transform: rotate(13.01488000deg); }
+  49.47917% { transform: rotate(12.53403837deg); }
+  49.60938% { transform: rotate(11.67113039deg); }
+  49.73958% { transform: rotate(10.46026899deg); }
+  49.86979% { transform: rotate(8.92290179deg); }
+  50.00000% { transform: rotate(7.06802520deg); }
+  50.31250% { transform: rotate(-4.14192631deg); }
+  50.62500% { transform: rotate(-15.68718394deg); }
+  51.87500% { transform: rotate(-15.68718394deg); }
+  52.18750% { transform: rotate(2.96990864deg); }
+  52.50000% { transform: rotate(22.29064028deg); }
+  52.81250% { transform: rotate(46.64188405deg); }
+  53.12500% { transform: rotate(84.35394295deg); }
+  53.43750% { transform: rotate(73.30748478deg); }
+  53.75000% { transform: rotate(64.75458144deg); }
+  54.06250% { transform: rotate(57.35410400deg); }
+  54.37500% { transform: rotate(50.50478483deg); }
+  54.68750% { transform: rotate(53.41087072deg); }
+  55.00000% { transform: rotate(46.82814494deg); }
+  55.31250% { transform: rotate(44.57481772deg); }
+  55.62500% { transform: rotate(41.42157333deg); }
+  55.93750% { transform: rotate(37.67716086deg); }
+  56.25000% { transform: rotate(33.46178396deg); }
+  56.56250% { transform: rotate(19.89862766deg); }
+  56.87500% { transform: rotate(7.06802520deg); }
+  57.01172% { transform: rotate(8.48887841deg); }
+  57.14844% { transform: rotate(9.73154047deg); }
+  57.28516% { transform: rotate(10.79422085deg); }
+  57.42188% { transform: rotate(11.67113039deg); }
+  57.55859% { transform: rotate(12.35257418deg); }
+  57.69531% { transform: rotate(12.82486655deg); }
+  57.83203% { transform: rotate(13.07011766deg); }
+  57.96875% { transform: rotate(13.06593935deg); }
+  58.10547% { transform: rotate(12.78513173deg); }
+  58.24219% { transform: rotate(12.19544318deg); }
+  58.37891% { transform: rotate(11.25954900deg); }
+  58.51563% { transform: rotate(9.93547018deg); }
+  58.65234% { transform: rotate(8.17774787deg); }
+  58.78906% { transform: rotate(5.93977778deg); }
+  58.92578% { transform: rotate(3.17773049deg); }
+  59.06250% { transform: rotate(-0.14366851deg); }
+  59.19922% { transform: rotate(-4.04368794deg); }
+  59.33594% { transform: rotate(-8.51749561deg); }
+  59.47266% { transform: rotate(-13.52947111deg); }
+  59.60938% { transform: rotate(-19.01061061deg); }
+  59.74609% { transform: rotate(-24.86217724deg); }
+  59.88281% { transform: rotate(-30.96577892deg); }
+  60.01953% { transform: rotate(-37.19747666deg); }
+  60.15625% { transform: rotate(-43.44192361deg); }
+  60.29297% { transform: rotate(-49.60291259deg); }
+  60.42969% { transform: rotate(-55.60861964deg); }
+  60.56641% { transform: rotate(-61.41192087deg); }
+  60.70312% { transform: rotate(-66.98738724deg); }
+  60.83984% { transform: rotate(-72.32675466deg); }
+  60.97656% { transform: rotate(-77.43423143deg); }
+  61.11328% { transform: rotate(-82.32241200deg); }
+  61.25000% { transform: rotate(-87.00908803deg); }
+  61.71875% { transform: rotate(-85.73060773deg); }
+  62.18750% { transform: rotate(-86.69263183deg); }
+  62.42187% { transform: rotate(-54.00658416deg); }
+  62.65625% { transform: rotate(-26.08033674deg); }
+  62.89062% { transform: rotate(-13.13697190deg); }
+  63.12500% { transform: rotate(-15.68718394deg); }
+  64.37500% { transform: rotate(-15.68718394deg); }
+  65.00000% { transform: rotate(-4.14192631deg); }
+  65.62500% { transform: rotate(7.06802520deg); }
+  65.75521% { transform: rotate(8.92290179deg); }
+  65.88542% { transform: rotate(10.46026899deg); }
+  66.01562% { transform: rotate(11.67113039deg); }
+  66.14583% { transform: rotate(12.53403837deg); }
+  66.27604% { transform: rotate(13.01488000deg); }
+  66.40625% { transform: rotate(13.06593935deg); }
+  66.53646% { transform: rotate(12.62462939deg); }
+  66.66667% { transform: rotate(11.61248537deg); }
+  66.79688% { transform: rotate(9.93547018deg); }
+  66.92708% { transform: rotate(7.48738757deg); }
+  67.05729% { transform: rotate(4.15907316deg); }
+  67.18750% { transform: rotate(-0.14366851deg); }
+  67.31771% { transform: rotate(-5.47228051deg); }
+  67.44792% { transform: rotate(-11.80259934deg); }
+  67.57812% { transform: rotate(-19.01061061deg); }
+  67.70833% { transform: rotate(-26.87485783deg); }
+  67.83854% { transform: rotate(-35.11344522deg); }
+  67.96875% { transform: rotate(-43.44192361deg); }
+  68.09896% { transform: rotate(-51.62488528deg); }
+  68.22917% { transform: rotate(-59.50194594deg); }
+  68.35938% { transform: rotate(-66.98738724deg); }
+  68.48958% { transform: rotate(-74.05452851deg); }
+  68.61979% { transform: rotate(-80.71636467deg); }
+  68.75000% { transform: rotate(-87.00908803deg); }
+  69.14062% { transform: rotate(-58.95965071deg); }
+  69.53125% { transform: rotate(-15.26311873deg); }
+  69.92188% { transform: rotate(31.33743223deg); }
+  70.31250% { transform: rotate(45.48250291deg); }
+  70.70312% { transform: rotate(43.39567614deg); }
+  71.09375% { transform: rotate(35.29388457deg); }
+  71.48438% { transform: rotate(22.72624167deg); }
+  71.87500% { transform: rotate(0.00000000deg); }
+  81.25000% { transform: rotate(0.00000000deg); }
+  82.81250% { transform: rotate(0.00000000deg); }
+  84.37500% { transform: rotate(0.00000000deg); }
+  85.93750% { transform: rotate(20.51390000deg); }
+  86.52344% { transform: rotate(19.49540000deg); }
+  87.10938% { transform: rotate(17.94530000deg); }
+  87.69531% { transform: rotate(15.92920000deg); }
+  88.28125% { transform: rotate(13.49150000deg); }
+  88.86719% { transform: rotate(10.66330000deg); }
+  89.45312% { transform: rotate(7.46588000deg); }
+  90.03906% { transform: rotate(3.91116000deg); }
+  90.62500% { transform: rotate(0.00000000deg); }
+  91.56250% { transform: rotate(45.00000000deg); }
+  96.87500% { transform: rotate(45.00000000deg); }
+  100.00000% { transform: rotate(45.00000000deg); }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-wrist { animation: wv-manual-wrist var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-arm-back {
+  0.00000% { transform: rotate(0.00000000deg); }
+  43.75000% { transform: rotate(0.00000000deg); }
+  46.87500% { transform: rotate(-42.58000434deg); }
+  68.75000% { transform: rotate(-42.58000434deg); }
+  71.87500% { transform: rotate(0.00000000deg); }
+  100.00000% { transform: rotate(0.00000000deg); }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-react-arm-back { animation: wv-manual-arm-back var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-support-wrist {
+  0.00000% { transform: rotate(0.00000000deg); }
+  43.75000% { transform: rotate(0.00000000deg); }
+  46.87500% { transform: rotate(42.58000434deg); }
+  68.75000% { transform: rotate(42.58000434deg); }
+  71.87500% { transform: rotate(0.00000000deg); }
+  100.00000% { transform: rotate(0.00000000deg); }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-support-wrist { animation: wv-manual-support-wrist var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-held {
+  0.00000% { opacity: 0; }
+  28.12490% { opacity: 0; }
+  28.12500% { opacity: 1; }
+  46.87490% { opacity: 1; }
+  46.87500% { opacity: 0; }
+  68.74990% { opacity: 0; }
+  68.75000% { opacity: 1; }
+  82.81240% { opacity: 1; }
+  82.81250% { opacity: 0; }
+  100.00000% { opacity: 0; }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-held { animation: wv-manual-held var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-supported {
+  0.00000% { opacity: 0; }
+  46.87490% { opacity: 0; }
+  46.87500% { opacity: 1; }
+  68.74990% { opacity: 1; }
+  68.75000% { opacity: 0; }
+  100.00000% { opacity: 0; }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-supported { animation: wv-manual-supported var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-shelf { animation: wv-coffee-shelf var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-cover-fold {
+  0.00000% { transform: scaleX(-1); }
+  46.87500% { transform: scaleX(-1); }
+  50.00000% { transform: scaleX(1); }
+  65.62500% { transform: scaleX(1); }
+  68.75000% { transform: scaleX(-1); }
+  100.00000% { transform: scaleX(-1); }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-cover-fold { animation: wv-manual-cover-fold var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-cover-face {
+  0.00000% { opacity: 1; }
+  48.37500% { opacity: 1; }
+  48.50000% { opacity: 0; }
+  67.12500% { opacity: 0; }
+  67.25000% { opacity: 1; }
+  100.00000% { opacity: 1; }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-cover-face { animation: wv-manual-cover-face var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-page {
+  0.00000% { transform: scaleX(1); }
+  56.87500% { transform: scaleX(1); }
+  61.25000% { transform: scaleX(-1); }
+  68.75000% { transform: scaleX(-1); }
+  68.78125% { transform: scaleX(1); }
+  100.00000% { transform: scaleX(1); }
+}
+@keyframes wv-manual-page-visible {
+  0.00000% { opacity: 0; }
+  56.87490% { opacity: 0; }
+  56.87500% { opacity: 1; }
+  65.62490% { opacity: 1; }
+  65.62500% { opacity: 0; }
+  100.00000% { opacity: 0; }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-page { animation: wv-manual-page var(--wv-reaction-cycle) linear 1 both, wv-manual-page-visible var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-head {
+  0.00000% { transform: rotate(var(--wv-home-head)); }
+  6.25000% { transform: rotate(6deg); }
+  18.75000% { transform: rotate(9deg); }
+  31.25000% { transform: rotate(4deg); }
+  43.75000% { transform: rotate(4deg); }
+  46.87500% { transform: rotate(13deg); }
+  53.12500% { transform: rotate(16deg); }
+  61.25000% { transform: rotate(11deg); }
+  63.12500% { transform: rotate(-5deg); }
+  64.37500% { transform: rotate(-5deg); }
+  65.62500% { transform: rotate(13deg); }
+  71.87500% { transform: rotate(4deg); }
+  90.62500% { transform: rotate(-5deg); }
+  96.87500% { transform: rotate(var(--wv-home-head)); }
+  100.00000% { transform: rotate(var(--wv-home-head)); }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-react-head { animation: wv-manual-head var(--wv-reaction-cycle) linear 1 both; }
+@keyframes wv-manual-gaze {
+  0.00000% { transform: translateX(var(--wv-home-gaze)); }
+  6.25000% { transform: translateX(2px); }
+  43.75000% { transform: translateX(1px); }
+  46.87500% { transform: translate(0px, 2px); }
+  53.12500% { transform: translate(2px, 2px); }
+  56.87500% { transform: translate(2px, 2px); }
+  61.25000% { transform: translate(-1px, 2px); }
+  63.12500% { transform: translate(3px, 0px); }
+  64.37500% { transform: translate(3px, 0px); }
+  65.62500% { transform: translate(1px, 2px); }
+  71.87500% { transform: translateX(1px); }
+  100.00000% { transform: translateX(var(--wv-home-gaze)); }
+}
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-react-gaze { animation: wv-manual-gaze var(--wv-reaction-cycle) linear 1 both; }
