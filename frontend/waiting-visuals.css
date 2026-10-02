@@ -1607,7 +1607,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   90.62500% { transform: translateY(0px); }
   100.00000% { transform: translateY(0px); }
 }
-.waiting-visual[data-animated="true"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-kitchen-hatch { animation: wv-coffee-hatch var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"][data-episode="coffee"][data-adapter="react"] .wv-kitchen-hatch { animation: wv-coffee-hatch var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-coffee-head {
   0.00000% { transform: rotate(var(--wv-home-head)); }
   6.00000% { transform: rotate(-6deg); }
@@ -3571,7 +3571,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
    Steam belongs to the cup's wrist, so it cannot drift away while carried. */
 .waiting-visual .wv-kitchen { opacity: 0; }
 .waiting-visual .wv-cup-steam { opacity: .38; stroke-width: .8; }
-.waiting-visual[data-animated="true"]:is([data-episode="coffee"], [data-episode="manual"])[data-adapter="react"] .wv-kitchen {
+.waiting-visual[data-animated="true"][data-episode="coffee"][data-adapter="react"] .wv-kitchen {
   animation: wv-coffee-kitchen var(--wv-reaction-cycle) linear 1 both;
 }
 .waiting-visual[data-animated="true"][data-episode="coffee"][data-adapter="react"] .wv-cup-held .wv-cup-steam {
@@ -3589,8 +3589,11 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
 
 /* One manual, one support hand. The front hand opens/closes the cover and turns
    a single page; the rear arm retains its original rigid silhouette and length.
-   The same excursion, feet, hatch and temporary kit are shared with coffee. */
-.waiting-visual .wv-manual-held, .waiting-visual .wv-manual-supported, .waiting-visual .wv-manual-shelf { opacity: 0; }
+   Only the excursion and feet are shared with coffee. The open manual shelf
+   has its own appearance and the empty hand reaches/retracts without a hatch. */
+.waiting-visual .wv-manual-held, .waiting-visual .wv-manual-supported, .waiting-visual .wv-manual-shelf, .waiting-visual .wv-manual-kit { opacity: 0; }
+.waiting-visual .wv-manual-shelf-board { fill: var(--wv-react-shell); }
+.waiting-visual .wv-manual-shelf-bracket { stroke-width: 1.2; opacity: .6; }
 .waiting-visual .wv-manual-wrist { transform-origin: 91px 55px; }
 .waiting-visual .wv-manual-support-wrist { transform-origin: 54px 65px; }
 .waiting-visual .wv-manual-cover-fold, .waiting-visual .wv-manual-page { transform-origin: 74.5px 0; }
@@ -3604,17 +3607,23 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
 .waiting-visual[data-episode="manual"] .wv-react-arm-back > :is(.wv-react-limb, .wv-react-palm) { opacity: .65; }
 @keyframes wv-manual-arm {
   0.00000% { transform: rotate(40.00000000deg); }
-  6.25000% { transform: rotate(40.00000000deg); }
-  17.81250% { transform: rotate(40.00000000deg); }
-  20.31250% { transform: rotate(0.00000000deg); }
-  21.09375% { transform: rotate(-2.22690000deg); }
-  21.87500% { transform: rotate(-4.79009000deg); }
-  22.65625% { transform: rotate(-7.65994000deg); }
-  23.43750% { transform: rotate(-10.81570000deg); }
-  24.21875% { transform: rotate(-14.24490000deg); }
-  25.00000% { transform: rotate(-17.94530000deg); }
-  25.78125% { transform: rotate(-21.92770000deg); }
-  26.56250% { transform: rotate(-26.22380000deg); }
+  20.31250% { transform: rotate(40.00000000deg); }
+  20.75195% { transform: rotate(38.05848853deg); }
+  21.19141% { transform: rotate(36.08714746deg); }
+  21.63086% { transform: rotate(34.08138604deg); }
+  22.07031% { transform: rotate(32.03608427deg); }
+  22.50977% { transform: rotate(29.94541408deg); }
+  22.94922% { transform: rotate(27.80261784deg); }
+  23.38867% { transform: rotate(25.59971879deg); }
+  23.82812% { transform: rotate(23.32712636deg); }
+  24.26758% { transform: rotate(20.97307824deg); }
+  24.70703% { transform: rotate(18.52282270deg); }
+  25.14648% { transform: rotate(15.95737087deg); }
+  25.58594% { transform: rotate(13.25150156deg); }
+  26.02539% { transform: rotate(10.37038174deg); }
+  26.46484% { transform: rotate(7.26340552deg); }
+  26.90430% { transform: rotate(3.85180448deg); }
+  27.34375% { transform: rotate(0.00000000deg); }
   28.12500% { transform: rotate(0.00000000deg); }
   29.68750% { transform: rotate(0.00000000deg); }
   31.25000% { transform: rotate(-20.00000000deg); }
@@ -3745,34 +3754,45 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   71.87500% { transform: rotate(-20.00000000deg); }
   81.25000% { transform: rotate(-20.00000000deg); }
   82.81250% { transform: rotate(0.00000000deg); }
-  84.37500% { transform: rotate(0.00000000deg); }
-  85.93750% { transform: rotate(-26.22380000deg); }
-  86.52344% { transform: rotate(-21.92770000deg); }
-  87.10938% { transform: rotate(-17.94530000deg); }
-  87.69531% { transform: rotate(-14.24490000deg); }
-  88.28125% { transform: rotate(-10.81570000deg); }
-  88.86719% { transform: rotate(-7.65994000deg); }
-  89.45312% { transform: rotate(-4.79009000deg); }
-  90.03906% { transform: rotate(-2.22690000deg); }
-  90.62500% { transform: rotate(0.00000000deg); }
-  91.56250% { transform: rotate(40.00000000deg); }
-  96.87500% { transform: rotate(40.00000000deg); }
+  84.06250% { transform: rotate(0.00000000deg); }
+  84.37500% { transform: rotate(3.85180448deg); }
+  84.68750% { transform: rotate(7.26340552deg); }
+  85.00000% { transform: rotate(10.37038174deg); }
+  85.31250% { transform: rotate(13.25150156deg); }
+  85.62500% { transform: rotate(15.95737087deg); }
+  85.93750% { transform: rotate(18.52282270deg); }
+  86.25000% { transform: rotate(20.97307824deg); }
+  86.56250% { transform: rotate(23.32712636deg); }
+  86.87500% { transform: rotate(25.59971879deg); }
+  87.18750% { transform: rotate(27.80261784deg); }
+  87.50000% { transform: rotate(29.94541408deg); }
+  87.81250% { transform: rotate(32.03608427deg); }
+  88.12500% { transform: rotate(34.08138604deg); }
+  88.43750% { transform: rotate(36.08714746deg); }
+  88.75000% { transform: rotate(38.05848853deg); }
+  89.06250% { transform: rotate(40.00000000deg); }
   100.00000% { transform: rotate(40.00000000deg); }
 }
 .waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-react-arm { animation: wv-manual-arm var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-manual-hand {
   0.00000% { transform: rotate(-85.00000000deg); }
-  6.25000% { transform: rotate(-85.00000000deg); }
-  17.81250% { transform: rotate(-85.00000000deg); }
-  20.31250% { transform: rotate(-0.00000000deg); }
-  21.09375% { transform: rotate(-1.68426000deg); }
-  21.87500% { transform: rotate(-2.67580000deg); }
-  22.65625% { transform: rotate(-3.00334000deg); }
-  23.43750% { transform: rotate(-2.67580000deg); }
-  24.21875% { transform: rotate(-1.68426000deg); }
-  25.00000% { transform: rotate(-0.00000000deg); }
-  25.78125% { transform: rotate(2.43230000deg); }
-  26.56250% { transform: rotate(5.70985000deg); }
+  20.31250% { transform: rotate(-85.00000000deg); }
+  20.75195% { transform: rotate(-80.92259884deg); }
+  21.19141% { transform: rotate(-76.77644541deg); }
+  21.63086% { transform: rotate(-72.55231723deg); }
+  22.07031% { transform: rotate(-68.23962882deg); }
+  22.50977% { transform: rotate(-63.82609737deg); }
+  22.94922% { transform: rotate(-59.29729429deg); }
+  23.38867% { transform: rotate(-54.63603368deg); }
+  23.82812% { transform: rotate(-49.82152042deg); }
+  24.26758% { transform: rotate(-44.82813195deg); }
+  24.70703% { transform: rotate(-39.62362156deg); }
+  25.14648% { transform: rotate(-34.16636744deg); }
+  25.58594% { transform: rotate(-28.40096428deg); }
+  26.02539% { transform: rotate(-22.25074562deg); }
+  26.46484% { transform: rotate(-15.60413738deg); }
+  26.90430% { transform: rotate(-8.28718874deg); }
+  27.34375% { transform: rotate(0.00000000deg); }
   28.12500% { transform: rotate(0.00000000deg); }
   29.68750% { transform: rotate(0.00000000deg); }
   31.25000% { transform: rotate(20.00000000deg); }
@@ -3903,34 +3923,45 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   71.87500% { transform: rotate(20.00000000deg); }
   81.25000% { transform: rotate(20.00000000deg); }
   82.81250% { transform: rotate(0.00000000deg); }
-  84.37500% { transform: rotate(0.00000000deg); }
-  85.93750% { transform: rotate(5.70985000deg); }
-  86.52344% { transform: rotate(2.43230000deg); }
-  87.10938% { transform: rotate(-0.00000000deg); }
-  87.69531% { transform: rotate(-1.68426000deg); }
-  88.28125% { transform: rotate(-2.67580000deg); }
-  88.86719% { transform: rotate(-3.00334000deg); }
-  89.45312% { transform: rotate(-2.67580000deg); }
-  90.03906% { transform: rotate(-1.68426000deg); }
-  90.62500% { transform: rotate(-0.00000000deg); }
-  91.56250% { transform: rotate(-85.00000000deg); }
-  96.87500% { transform: rotate(-85.00000000deg); }
+  84.06250% { transform: rotate(0.00000000deg); }
+  84.37500% { transform: rotate(-8.28718874deg); }
+  84.68750% { transform: rotate(-15.60413738deg); }
+  85.00000% { transform: rotate(-22.25074562deg); }
+  85.31250% { transform: rotate(-28.40096428deg); }
+  85.62500% { transform: rotate(-34.16636744deg); }
+  85.93750% { transform: rotate(-39.62362156deg); }
+  86.25000% { transform: rotate(-44.82813195deg); }
+  86.56250% { transform: rotate(-49.82152042deg); }
+  86.87500% { transform: rotate(-54.63603368deg); }
+  87.18750% { transform: rotate(-59.29729429deg); }
+  87.50000% { transform: rotate(-63.82609737deg); }
+  87.81250% { transform: rotate(-68.23962882deg); }
+  88.12500% { transform: rotate(-72.55231723deg); }
+  88.43750% { transform: rotate(-76.77644541deg); }
+  88.75000% { transform: rotate(-80.92259884deg); }
+  89.06250% { transform: rotate(-85.00000000deg); }
   100.00000% { transform: rotate(-85.00000000deg); }
 }
 .waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-react-hand { animation: wv-manual-hand var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-manual-wrist {
   0.00000% { transform: rotate(45.00000000deg); }
-  6.25000% { transform: rotate(45.00000000deg); }
-  17.81250% { transform: rotate(45.00000000deg); }
-  20.31250% { transform: rotate(0.00000000deg); }
-  21.09375% { transform: rotate(3.91116000deg); }
-  21.87500% { transform: rotate(7.46588000deg); }
-  22.65625% { transform: rotate(10.66330000deg); }
-  23.43750% { transform: rotate(13.49150000deg); }
-  24.21875% { transform: rotate(15.92920000deg); }
-  25.00000% { transform: rotate(17.94530000deg); }
-  25.78125% { transform: rotate(19.49540000deg); }
-  26.56250% { transform: rotate(20.51390000deg); }
+  20.31250% { transform: rotate(45.00000000deg); }
+  20.75195% { transform: rotate(42.86411031deg); }
+  21.19141% { transform: rotate(40.68929796deg); }
+  21.63086% { transform: rotate(38.47093119deg); }
+  22.07031% { transform: rotate(36.20354455deg); }
+  22.50977% { transform: rotate(33.88068329deg); }
+  22.94922% { transform: rotate(31.49467645deg); }
+  23.38867% { transform: rotate(29.03631489deg); }
+  23.82812% { transform: rotate(26.49439406deg); }
+  24.26758% { transform: rotate(23.85505370deg); }
+  24.70703% { transform: rotate(21.10079886deg); }
+  25.14648% { transform: rotate(18.20899657deg); }
+  25.58594% { transform: rotate(15.14946271deg); }
+  26.02539% { transform: rotate(11.88036388deg); }
+  26.46484% { transform: rotate(8.34073186deg); }
+  26.90430% { transform: rotate(4.43538426deg); }
+  27.34375% { transform: rotate(0.00000000deg); }
   28.12500% { transform: rotate(0.00000000deg); }
   29.68750% { transform: rotate(0.00000000deg); }
   31.25000% { transform: rotate(0.00000000deg); }
@@ -4061,18 +4092,23 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   71.87500% { transform: rotate(0.00000000deg); }
   81.25000% { transform: rotate(0.00000000deg); }
   82.81250% { transform: rotate(0.00000000deg); }
-  84.37500% { transform: rotate(0.00000000deg); }
-  85.93750% { transform: rotate(20.51390000deg); }
-  86.52344% { transform: rotate(19.49540000deg); }
-  87.10938% { transform: rotate(17.94530000deg); }
-  87.69531% { transform: rotate(15.92920000deg); }
-  88.28125% { transform: rotate(13.49150000deg); }
-  88.86719% { transform: rotate(10.66330000deg); }
-  89.45312% { transform: rotate(7.46588000deg); }
-  90.03906% { transform: rotate(3.91116000deg); }
-  90.62500% { transform: rotate(0.00000000deg); }
-  91.56250% { transform: rotate(45.00000000deg); }
-  96.87500% { transform: rotate(45.00000000deg); }
+  84.06250% { transform: rotate(0.00000000deg); }
+  84.37500% { transform: rotate(4.43538426deg); }
+  84.68750% { transform: rotate(8.34073186deg); }
+  85.00000% { transform: rotate(11.88036388deg); }
+  85.31250% { transform: rotate(15.14946271deg); }
+  85.62500% { transform: rotate(18.20899657deg); }
+  85.93750% { transform: rotate(21.10079886deg); }
+  86.25000% { transform: rotate(23.85505370deg); }
+  86.56250% { transform: rotate(26.49439406deg); }
+  86.87500% { transform: rotate(29.03631489deg); }
+  87.18750% { transform: rotate(31.49467645deg); }
+  87.50000% { transform: rotate(33.88068329deg); }
+  87.81250% { transform: rotate(36.20354455deg); }
+  88.12500% { transform: rotate(38.47093119deg); }
+  88.43750% { transform: rotate(40.68929796deg); }
+  88.75000% { transform: rotate(42.86411031deg); }
+  89.06250% { transform: rotate(45.00000000deg); }
   100.00000% { transform: rotate(45.00000000deg); }
 }
 .waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-wrist { animation: wv-manual-wrist var(--wv-reaction-cycle) linear 1 both; }
@@ -4116,7 +4152,7 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   100.00000% { opacity: 0; }
 }
 .waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-supported { animation: wv-manual-supported var(--wv-reaction-cycle) linear 1 both; }
-.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-shelf { animation: wv-coffee-shelf var(--wv-reaction-cycle) linear 1 both; }
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-shelf { animation: wv-manual-shelf-book var(--wv-reaction-cycle) linear 1 both; }
 @keyframes wv-manual-cover-fold {
   0.00000% { transform: scaleX(-1); }
   46.87500% { transform: scaleX(-1); }
@@ -4185,3 +4221,19 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   100.00000% { transform: translateX(var(--wv-home-gaze)); }
 }
 .waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-react-gaze { animation: wv-manual-gaze var(--wv-reaction-cycle) linear 1 both; }
+
+/* The shelf is established before the first step and leaves after the robot is
+   back at its adapter. The stored book never travels outside a hand owner. */
+.waiting-visual[data-animated="true"][data-episode="manual"][data-adapter="react"] .wv-manual-kit {
+  animation: wv-manual-kit var(--wv-reaction-cycle) linear 1 both;
+}
+@keyframes wv-manual-kit {
+  0% { opacity: 0; }
+  5%, 97% { opacity: 1; }
+  100% { opacity: 0; }
+}
+@keyframes wv-manual-shelf-book {
+  0%, 28.12490% { opacity: 1; }
+  28.12500%, 82.81240% { opacity: 0; }
+  82.81250%, 100% { opacity: 1; }
+}

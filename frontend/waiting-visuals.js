@@ -323,15 +323,18 @@ window.WaitingVisuals = (() => {
   const manualOpen = `${manualLeft}<g class="wv-manual-cover-fold">${manualRight}<g class="wv-manual-cover-face"><g transform="translate(149 0) scale(-1 1)">${manualClosed}</g></g></g><g class="wv-manual-page">${manualRight}</g><path class="wv-manual-spine" d="M74.5 49v14"/>`;
   function reactionScenery(family) {
     if (!adapters[family]?.reactions) return '';
-    // The hatch and stored prop share measured contact coordinates with the hand.
-    // The hatch stays open while a prop is out, and closes under the empty hand.
+    // The coffee hatch and cup share measured contact coordinates with the hand.
+    // The hatch stays open while the cup is out, and closes under the empty hand.
     const kitchen = `<g class="wv-kitchen"><path class="wv-kitchen-wall" d="M166 34h23v47h-23Z"/>
       <path class="wv-kitchen-recess" d="M169 43h17v21h-17Z"/><path class="wv-kitchen-shelf" d="M168 59h19m-19 6h19"/>
       <g class="wv-cup-shelf" transform="translate(82 0)">${coffeeCup}</g>
-      <g class="wv-manual-shelf" transform="translate(109 -3.7)">${manualClosed}</g>
       <g class="wv-kitchen-hatch"><path class="wv-kitchen-wall" d="M168 43h19v18h-19Z"/><path class="wv-kitchen-handle" d="M171 55h4"/>
         <path class="wv-kitchen-detail" d="M172 47h11"/></g><path class="wv-kitchen-detail" d="M170 72h13m-13 3h9"/>
       <path class="wv-rail" d="M165 83h25"/></g>`;
+    // The manual has its own open shelf, never a door or a coffee fixture.
+    const manualKit = `<g class="wv-manual-kit"><path class="wv-manual-shelf-board" d="M167 59.7h22V62h-22Z"/>
+      <path class="wv-manual-shelf-bracket" d="M170 62v6h5m11-6v6h-5"/>
+      <g class="wv-manual-shelf" transform="translate(109 -3.7)">${manualClosed}</g></g>`;
     const proof = family === 'composition' ? `<g class="wv-proof-held">${composeSheet}</g>` : '';
     const parked = family === 'composition' ? `<g class="wv-proof-parked" transform="translate(26.341973495 1.717610627)">${composeSheet}</g>` : '';
     const backArm = `<g class="wv-task-arm-back"><path class="wv-task-limb" d="m56 51-7 9 5 5"/><circle class="wv-task-palm" cx="54" cy="65" r="2.5"/></g>`;
@@ -340,7 +343,7 @@ window.WaitingVisuals = (() => {
     // the torso so the supported book cannot disappear behind the chest shell.
     const actor = taskRobot(`${proof}<g class="wv-cup-held"><g class="wv-cup-wrist">${coffeeCup}</g></g><g class="wv-manual-held"><g class="wv-manual-wrist"><g transform="translate(27 -3.7)">${manualClosed}</g></g></g>`)
       .replace(backArm, '').replace('<g class="wv-task-arm">', `${supportingArm}<g class="wv-task-arm">`).replaceAll('wv-task', 'wv-react');
-    return `${kitchen}${parked}<g class="wv-reaction-actor">${actor}</g>`;
+    return `${kitchen}${manualKit}${parked}<g class="wv-reaction-actor">${actor}</g>`;
   }
 
   function mount(host, initialSnapshot = {}, options = {}) {

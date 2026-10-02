@@ -352,7 +352,9 @@ test('short inspection and long story have separate pacing and close without a j
   assert.match(css, /\.wv-reader-body\s*\{[^}]*transform:\s*rotate\(-4deg\)/, 'paused/reduced pose stays expressive');
   assert.match(css, /\[data-animated="true"\]\[data-pace="loop"\] \.wv-reader \{ animation: wv-reader-travel/);
   assert.doesNotMatch(css, /\[data-animated="true"\] \.wv-reader \{ animation:/, 'short gesture never walks');
-  assert.ok(Buffer.byteLength(source) < 36000 && Buffer.byteLength(css) < 214000, 'five families plus shared CSS-only stories stay under a bounded 250 KB source budget, with no external assets');
+  const sourceBytes = Buffer.byteLength(source), cssBytes = Buffer.byteLength(css);
+  assert.ok(sourceBytes < 36000 && cssBytes < 215000 && sourceBytes + cssBytes < 250000,
+    'five families plus shared CSS-only stories stay under a bounded 250 KB source budget, with no external assets');
 });
 
 test('two walking steps plant one foot while the other lifts, then return to the same stance', () => {
@@ -952,9 +954,9 @@ test('adapter shuffles keep one planted foot and reverse to the same stance', ()
   }
 });
 
-test('shared nook appears only for a long episode, before approach, and leaves after the complete return', () => {
+test('coffee nook remains exclusive to coffee, before approach, and leaves after the complete return', () => {
   assert.match(css, /\.waiting-visual \.wv-kitchen \{ opacity: 0; \}/);
-  assert.match(css, /:is\(\[data-episode="coffee"\], \[data-episode="manual"\]\)\[data-adapter="react"\] \.wv-kitchen \{\s*animation: wv-coffee-kitchen/);
+  assert.match(css, /\[data-episode="coffee"\]\[data-adapter="react"\] \.wv-kitchen \{\s*animation: wv-coffee-kitchen/);
   assert.doesNotMatch(css, /\[data-episode="(?:work|review|stretch)"\][^{]*\.wv-kitchen\s*\{/);
   assert.equal(atContact('wv-coffee-kitchen', 0, 'opacity'), '0');
   assert.equal(atContact('wv-coffee-kitchen', 5, 'opacity'), '1');
@@ -1052,7 +1054,8 @@ test('manual has a closed front-hand transport, one rear-hand support and exact 
     assert.ok(parentsOf(art, 'wv-manual-supported').includes('wv-react-arm-back'));
     assert.ok(parentsOf(art, 'wv-manual-cover-fold').includes('wv-manual-supported'));
     assert.ok(parentsOf(art, 'wv-manual-page').includes('wv-manual-supported'));
-    assert.ok(parentsOf(art, 'wv-manual-shelf').includes('wv-kitchen'));
+    assert.ok(parentsOf(art, 'wv-manual-shelf').includes('wv-manual-kit'));
+    assert.ok(!parentsOf(art, 'wv-manual-shelf').includes('wv-kitchen'), 'book owns an open shelf outside the coffee fixture');
     assert.match(art, /class="wv-manual-shelf" transform="translate\(109 -3.7\)"/);
     assert.equal([...art.matchAll(/class="wv-react-arm-back"/g)].length, 1, 'no second supporting arm');
     assert.match(art, /class="wv-react-arm-back"><path class="wv-react-limb" d="m56 51-7 9 5 5"/, 'the original rear silhouette is retained');
@@ -1066,7 +1069,7 @@ test('manual has a closed front-hand transport, one rear-hand support and exact 
   }
   for (const [seconds, shelf, front, back] of [[0,1,0,0],[9,0,1,0],[14.5,0,1,0],[15,0,0,1],[20,0,0,1],[22,0,1,0],[26.5,1,0,0],[32,1,0,0]]) {
     const time = seconds / 32 * 100;
-    assert.equal(atContact('wv-coffee-shelf', time, 'opacity'), String(shelf));
+    assert.equal(atContact('wv-manual-shelf-book', time, 'opacity'), String(shelf));
     assert.equal(atContact('wv-manual-held', time, 'opacity'), String(front));
     assert.equal(atContact('wv-manual-supported', time, 'opacity'), String(back));
     assert.equal(shelf + front + back, 1, 'one owner at a time');
@@ -1088,12 +1091,6 @@ test('manual is supported by both palms, and cover/page edges follow actual fron
         nearPoint(manualBackPoint([54,65], seconds, family), [64 + home,y], .00001, 'rear support cannot drift while front hand works');
       }
     }
-    for (const [start,end] of [[6.5,8.5],[27.5,29]]) for (let seconds=start; seconds<=end; seconds+=.125) {
-      const time=seconds/32*100;
-      nearPoint(manualFrontPoint([91,55],seconds,family), transformPoint([173,55],interpolated('wv-coffee-hatch',time)), .02, 'the empty manual hand also operates the shared hatch by contact');
-      assert.equal(atContact('wv-manual-held',time,'opacity'),'0');
-      assert.equal(atContact('wv-manual-supported',time,'opacity'),'0');
-    }
     for (const [seconds,point] of [[17,[77,52]],[17.4,[83,52]],[17.6,[77,55]],[18,[83,55]]]) {
       nearPoint(manualFrontPoint([91,55], seconds, family), [point[0]+home,point[1]], .00001, 'finger follows the printed lines');
     }
@@ -1106,7 +1103,7 @@ test('manual is supported by both palms, and cover/page edges follow actual fron
   assert.ok(page.find(frame => frame.properties.transform === 'scaleX(1)' && frame.time > 61.25).time > 68.75, 'reset happens only while the supported book is invisible');
 });
 
-test('manual shares all travel and kit tracks, closes its path, and never enters a short operation', () => {
+test('manual shares travel but owns its open shelf, closes its path, and never enters a short operation', () => {
   const { api } = fixture();
   assert.deepEqual(plain(api.repertoire.manual), { minElapsedMs:60000, durationMs:32000, cooldown:5, weight:1, long:true });
   for (const age of [3999,45000,59999]) {
@@ -1152,5 +1149,46 @@ test('manual uses every existing adapter and respects pauses, pending completion
     visual.update(receipt({phaseId,state:'completed'}));
     assert.doesNotMatch(art.innerHTML,/wv-manual|wv-kitchen|wv-reaction-actor/);
     visual.destroy();
+  }
+});
+
+test('manual shelf and coffee nook are exclusive props, with the shelf established before approach and removed after return', () => {
+  const art = artFor('checkpoint');
+  assert.ok(parentsOf(art,'wv-cup-shelf').includes('wv-kitchen'));
+  assert.ok(!parentsOf(art,'wv-cup-shelf').includes('wv-manual-kit'));
+  assert.ok(parentsOf(art,'wv-manual-shelf-board').includes('wv-manual-kit'));
+  assert.ok(parentsOf(art,'wv-manual-shelf-bracket').includes('wv-manual-kit'));
+  assert.match(css, /\.wv-manual-kit \{ opacity: 0; \}/, 'the shelf has no resting scenery outside the episode');
+  for (const part of ['kitchen','kitchen-hatch']) {
+    const animated = css.split('\n').filter(line => line.includes(`] .wv-${part} {`) && line.includes('data-animated'));
+    assert.equal(animated.length,1);
+    assert.ok(animated[0].includes('[data-episode="coffee"][data-adapter="react"]'));
+    assert.ok(!animated[0].includes('manual'), `${part} never appears or animates during manual`);
+  }
+  assert.match(css, /\[data-episode="manual"\]\[data-adapter="react"\] \.wv-manual-kit \{\s*animation: wv-manual-kit/);
+  assert.match(css, /\[data-episode="manual"\]\[data-adapter="react"\] \.wv-manual-shelf \{ animation: wv-manual-shelf-book/);
+  for (const [time,opacity] of [[0,'0'],[5,'1'],[97,'1'],[100,'0']]) assert.equal(atContact('wv-manual-kit',time,'opacity'),opacity);
+  for (const family of ['reading','checkpoint']) {
+    const home=family==='reading' ? 0 : 20;
+    for (const time of [5,97]) assert.equal(atContact(`wv-coffee-travel-${family}`,time),`translateX(${home}.000000px)`, 'shelf precedes the first step and outlasts the complete return');
+  }
+});
+
+test('manual reaches directly toward its visible book and retracts after returning it, without a phantom hatch gesture', () => {
+  for (const family of ['reading','checkpoint']) {
+    const neutral = manualFrontPoint([91,55],6.5,family);
+    for (const seconds of [8.75,9,26.5,26.9]) nearPoint(manualFrontPoint([91,55],seconds,family),[173,55],.00001,'hand meets the closed book at shelf height');
+    const point = (seconds) => manualFrontPoint([91,55],seconds,family);
+    for (const [start,end,from,to] of [[6.5,8.75,neutral,[173,55]],[26.9,28.5,[173,55],neutral]]) {
+      for (let seconds=start;seconds<=end+.00001;seconds+=.025) {
+        const fraction=(seconds-start)/(end-start), expected=from.map((v,axis)=>v+(to[axis]-v)*fraction);
+        nearPoint(point(seconds),expected,.02,'direct reach/retract stays at book height instead of pulling a door upward');
+        const time=seconds/32*100;
+        assert.equal(atContact('wv-manual-held',time,'opacity'),'0');
+        assert.equal(atContact('wv-manual-supported',time,'opacity'),'0');
+      }
+    }
+    nearPoint(point(28.5),neutral,.00001,'empty hand is settled before walking home');
+    nearPoint(point(29.3),neutral,.00001,'no trailing closing gesture');
   }
 });

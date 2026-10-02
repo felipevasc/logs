@@ -158,3 +158,29 @@ test('manual preview is budgeted below smoke timeout and selected for full/share
   }
   assert.ok(fullPreview.includes('test-waiting-manual.mjs'));
 });
+
+test('manual evidence requires its own temporary open shelf and hides all effective coffee artwork', () => {
+  assert.match(source, /manualKitOpacity: opacity\('\.wv-manual-kit'\)/);
+  assert.match(source, /hatchOpacity: effectiveOpacity\(root\.querySelector\('\.wv-kitchen-hatch'\)\)/);
+  assert.match(source, /steamOpacity: Math\.max/);
+  for (const prop of ['kitchenOpacity','hatchOpacity','cupOpacity','steamOpacity']) assert.ok(source.includes(`assert.equal(state.${prop}, 0)`));
+  assert.match(source, /results\.initial\.every\(s => [^\n]+s\.manualKitOpacity === 0/);
+  assert.match(source, /results\.naturalSupported\.every\(s => [^\n]+s\.manualKitOpacity === 1 && s\.shelfOpacity === 0/);
+  assert.match(source, /results\.returned\.every\(s => [^\n]+s\.manualKitOpacity === 0/);
+  assert.match(source, /shelfParentIsKit: shelf\.parentElement === kit, shelfOutsideKitchen: !kitchen\.contains\(shelf\)/);
+  assert.match(source, /p\.kitchen === 0 && p\.hatch === 0 && p\.cup === 0 && p\.steam === 0/);
+  assert.match(source, /p\.seconds >= 1\.6 && p\.seconds <= 31\.04/);
+  assert.match(source, /\[1\.6, 31\.04\].*actorX/);
+  assert.match(source, /sample\.after\.manualKitPresent, false/);
+  assert.doesNotMatch(source, /(?:state|s)\.kitchenOpacity\s*(?:>|===)\s*1/);
+});
+
+test('manual preview measures direct empty-hand reach and retract rather than operating the coffee hatch', () => {
+  assert.match(source, /\[8\.75, 9, 26\.5, 26\.9\]/);
+  assert.match(source, /\[\[6\.5, 8\.75\], \[26\.9, 28\.5\]\]/);
+  assert.match(source, /result\.reachPaths\.push/);
+  assert.match(source, /rig\.reachContacts\.every\(p => p\.distance < \.15\)/);
+  assert.match(source, /p\.distance < \.15 && p\.verticalSpan < 1 && p\.frontOwner === 0 && p\.backOwner === 0/);
+  assert.match(coffee, /wv-kitchen-hatch/);
+  assert.match(coffee, /wv-cup-steam/);
+});

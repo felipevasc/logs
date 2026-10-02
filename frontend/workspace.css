@@ -90,7 +90,14 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 .ws-loading{padding:65px 20px;display:flex;align-items:center;justify-content:center;gap:12px;color:var(--text-2)}.ws-loading i{color:var(--accent)}.source-controls{display:flex;gap:8px;margin-bottom:18px;align-items:center}.source-check{width:16px;height:16px;accent-color:var(--accent)}.explore-tools{display:flex;gap:5px;align-items:center}.ws-scope-pill{font-size:11px;padding:6px 9px;color:var(--text-1);border:1px solid var(--border);border-radius:5px}
 @media(min-width:1700px){.workspace-page{padding:34px 48px}.overview-grid{grid-template-columns:minmax(0,1.8fr) minmax(320px,1fr)}}
 @media(max-width:1200px){:root{--nav-w:158px}.workspace-nav{padding-left:10px;padding-right:10px}.workspace-brand{font-size:16px}.workspace-page{padding:23px}.metric{padding:18px}.metric-value{font-size:26px}.overview-grid{grid-template-columns:1fr}.compare-form{gap:12px}.compare-period>div{flex-direction:column}.compare-period input{width:100%}.side{width:205px;min-width:205px}.topbar{padding:0 20px}.topbar-case .case-select{width:140px}.viewbar{flex-wrap:wrap}}
-@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+@media(prefers-reduced-motion:reduce){
+  *{transition:none!important;scroll-behavior:auto!important}
+  /* Existing waiting timelines are paused by waiting-visuals.css. Cancelling
+     their names here would lose the pose and restart the episode on resume.
+     The latch excludes only artwork that has already been allowed to animate;
+     a scene mounted under reduced motion keeps the normal static fallback. */
+  *:not(.waiting-visual[data-animated="true"] .wv-art *){animation:none!important}
+}
 
 /* First 0.11 waiting pilots retain the existing compact load surface. */
 .semantic-load-stage { gap: 10px; max-height: calc(100vh - var(--topbar-h) - 40px); overflow-y: auto; }

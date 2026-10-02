@@ -20,6 +20,7 @@ const results = {
     timing: 'Complete 32s manual at 1x plus natural work/prepare/resume; no seeks during recording',
     eligibility: 'Supplied elapsedMs=60000 is synthetic input, never native latency or progress',
     poseSampling: 'Only after WebM finalization, in a separate context without recordVideo',
+    scenery: 'Temporary open manual shelf; coffee kitchen, hatch, cup and steam remain invisible',
     generatedImageAssets: false, nativeEngineVerified: false, installedWebViewVerified: false,
   },
   limits: { totalTimeoutMs: 110000, targetRuntimeMs: [70000, 90000], seedSearchLimit: 4096,
@@ -40,10 +41,22 @@ const scene = family => page.locator(`#manual-${family} .waiting-visual`);
 const states = () => roots().evaluateAll(nodes => nodes.map(root => {
   const art = root.querySelector('.wv-art');
   const opacity = selector => Number(getComputedStyle(root.querySelector(selector)).opacity);
+  const effectiveOpacity = node => {
+    let value = 1;
+    for (; node && node !== art; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.visibility === 'hidden' || style.display === 'none') return 0;
+      value *= Number(style.opacity);
+    }
+    return value;
+  };
   return { family: root.dataset.family, episode: root.dataset.episode, adapter: root.dataset.adapter,
     motion: root.dataset.motion, state: root.dataset.state, status: root.querySelector('.wv-status').textContent,
     metric: root.querySelector('.wv-metric').textContent, svgCount: art.querySelectorAll('svg').length,
     size: art.getBoundingClientRect().toJSON(), kitchenOpacity: opacity('.wv-kitchen'),
+    manualKitOpacity: opacity('.wv-manual-kit'), hatchOpacity: effectiveOpacity(root.querySelector('.wv-kitchen-hatch')),
+    cupOpacity: Math.max(...['.wv-cup-held', '.wv-cup-shelf'].map(selector => effectiveOpacity(root.querySelector(selector)))),
+    steamOpacity: Math.max(...[...root.querySelectorAll('.wv-cup-steam')].map(effectiveOpacity)),
     heldOpacity: opacity('.wv-manual-held'), supportedOpacity: opacity('.wv-manual-supported'),
     shelfOpacity: opacity('.wv-manual-shelf'),
     animations: art.getAnimations({ subtree: true }).map(animation => ({ name: animation.animationName,
@@ -150,6 +163,8 @@ function assertReceiptStates(actual, baseline) {
   assert.deepEqual(actual.map(s => s.family), families);
   for (const [i, state] of actual.entries()) {
     assert.equal(state.state, 'running'); assert.equal(state.svgCount, 1);
+    assert.equal(state.kitchenOpacity, 0); assert.equal(state.hatchOpacity, 0);
+    assert.equal(state.cupOpacity, 0); assert.equal(state.steamOpacity, 0);
     assert.equal(state.status, baseline[i].status); assert.equal(state.metric, baseline[i].metric);
     assert.ok(Math.abs(state.size.width - 240) < .5 && Math.abs(state.size.height - 120) < .5);
   }
@@ -192,7 +207,7 @@ try {
   results.seeds = await page.evaluate(() => __manualPreview.seeds);
   results.initial = await states();
   assertReceiptStates(results.initial, results.initial);
-  assert.ok(results.initial.every(s => s.episode === 'work' && s.adapter === 'work' && s.kitchenOpacity === 0));
+  assert.ok(results.initial.every(s => s.episode === 'work' && s.adapter === 'work' && s.kitchenOpacity === 0 && s.manualKitOpacity === 0));
   assert.deepEqual(results.initial.map(s => s.metric), ['1.200 / 6.300 registros', '7 / 18 seções']);
   mark('natural-work-start');
   await waitEpisode('manual', 15000);
@@ -209,13 +224,13 @@ try {
     view.element.querySelector('.wv-episode-boundary').getAnimations()[0]?.currentTime >= 16300), null, { timeout: 18000 });
   results.naturalSupported = await states();
   assertReceiptStates(results.naturalSupported, results.initial);
-  assert.ok(results.naturalSupported.every(s => s.supportedOpacity === 1 && s.heldOpacity === 0));
+  assert.ok(results.naturalSupported.every(s => s.supportedOpacity === 1 && s.heldOpacity === 0 && s.manualKitOpacity === 1 && s.shelfOpacity === 0));
   await snap('waiting-manual-natural-two-hands-dark.png', 'natural consultation, both production families');
   await waitEpisode('work', 22000);
   mark('both-natural-returned-to-work');
   results.returned = await states();
   assertReceiptStates(results.returned, results.initial);
-  assert.ok(results.returned.every(s => s.kitchenOpacity === 0));
+  assert.ok(results.returned.every(s => s.kitchenOpacity === 0 && s.manualKitOpacity === 0));
   results.sequence = await page.evaluate(() => ({ events: __manualPreview.events,
     stableSvg: Object.entries(__manualPreview.views).every(([family, view]) => view.element.querySelector('svg') === __manualPreview.svg[family]),
     inspections: Object.fromEntries(Object.entries(__manualPreview.views).map(([family, view]) => [family, view.inspect()])),
@@ -259,18 +274,51 @@ try {
     const frontBook = held.querySelector('.wv-manual-wrist > g');
     const backBook = supported.querySelector('.wv-manual-support-wrist > g');
     const shelf = root.querySelector('.wv-manual-shelf'), cover = root.querySelector('.wv-manual-cover-fold');
-    const leaf = root.querySelector('.wv-manual-page');
+    const leaf = root.querySelector('.wv-manual-page'), kit = root.querySelector('.wv-manual-kit');
+    const kitchen = root.querySelector('.wv-kitchen'), hatch = root.querySelector('.wv-kitchen-hatch');
     const tracks = art.getAnimations({ subtree: true }).filter(a => /^(?:wv-manual-|wv-coffee-|wv-episode-boundary)/.test(a.animationName));
     const point = (node, x, y) => new DOMPoint(x, y).matrixTransform(node.getScreenCTM());
     const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
     const opacity = node => Number(getComputedStyle(node).opacity);
+    const effectiveOpacity = node => {
+      let value = 1;
+      for (; node && node !== art; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (style.visibility === 'hidden' || style.display === 'none') return 0;
+        value *= Number(style.opacity);
+      }
+      return value;
+    };
     const result = { family: root.dataset.family, heldByFront: held.parentElement === front,
       supportedByBack: supported.parentElement === back, leafOwnedByBook: leaf.parentElement === backBook,
       sharedTravel: tracks.some(a => a.animationName === `wv-coffee-travel-${root.dataset.family === 'reading' ? 'reading' : 'checkpoint'}`),
-      shelfContacts: [], handoffs: [], palms: [], edges: [], owners: [], reading: [], pageTurns: [] };
+      shelfParentIsKit: shelf.parentElement === kit, shelfOutsideKitchen: !kitchen.contains(shelf),
+      propStates: [], reachContacts: [], reachPaths: [], shelfContacts: [], handoffs: [], palms: [], edges: [], owners: [], reading: [], pageTurns: [] };
     const sampling = await window.__waitingMotionSampling.begin(tracks);
     try {
       const at = seconds => sampling.seek(seconds * 1000);
+      for (const seconds of [0, 1.6, 2, 6.5, 8.75, 9, 26.5, 28.5, 31.04, 31.9]) {
+        await at(seconds);
+        result.propStates.push({ seconds, kit: opacity(kit), kitchen: opacity(kitchen), hatch: effectiveOpacity(hatch),
+          cup: Math.max(...['.wv-cup-held', '.wv-cup-shelf'].map(selector => effectiveOpacity(root.querySelector(selector)))),
+          steam: Math.max(...[...root.querySelectorAll('.wv-cup-steam')].map(effectiveOpacity)),
+          shelf: opacity(shelf), actorX: new DOMMatrix(getComputedStyle(root.querySelector('.wv-reaction-actor')).transform).e });
+      }
+      for (const seconds of [8.75, 9, 26.5, 26.9]) {
+        await at(seconds);
+        result.reachContacts.push({ seconds, distance: distance(point(front, 91, 55), point(shelf, 64, 58.7)) });
+      }
+      for (const [start, end] of [[6.5, 8.75], [26.9, 28.5]]) {
+        await at(start); const first = point(front, 91, 55);
+        await at(end); const last = point(front, 91, 55);
+        for (let step = 0; step <= 16; step++) {
+          const fraction = step / 16, seconds = start + (end - start) * fraction;
+          await at(seconds);
+          result.reachPaths.push({ seconds, distance: distance(point(front, 91, 55),
+            { x: first.x + (last.x - first.x) * fraction, y: first.y + (last.y - first.y) * fraction }),
+            verticalSpan: Math.abs(last.y - first.y), frontOwner: opacity(held), backOwner: opacity(supported) });
+        }
+      }
       for (const seconds of [9, 26.5]) {
         await at(seconds);
         result.shelfContacts.push({ seconds, distances: [[64, 48.5], [74.5, 63], [64, 58.7]].map(([x, y]) => distance(point(frontBook, x, y), point(shelf, x, y))) });
@@ -312,7 +360,15 @@ try {
   })));
   for (const rig of results.rigs) {
     assert.equal(rig.heldByFront, true); assert.equal(rig.supportedByBack, true); assert.equal(rig.leafOwnedByBook, true);
-    assert.equal(rig.sharedTravel, true);
+    assert.equal(rig.sharedTravel, true); assert.equal(rig.shelfParentIsKit, true); assert.equal(rig.shelfOutsideKitchen, true);
+    assert.ok(rig.propStates.every(p => p.kitchen === 0 && p.hatch === 0 && p.cup === 0 && p.steam === 0), 'coffee props never enter the manual episode');
+    assert.equal(rig.propStates.find(p => p.seconds === 0).kit, 0);
+    assert.ok(rig.propStates.filter(p => p.seconds >= 1.6 && p.seconds <= 31.04).every(p => p.kit === 1), 'open shelf exists throughout approach, pickup and return');
+    assert.ok(rig.propStates.find(p => p.seconds === 31.9).kit < 1, 'shelf fades only after returning home');
+    for (const seconds of [1.6, 31.04]) assert.equal(rig.propStates.find(p => p.seconds === seconds).actorX, rig.family === 'reading' ? 0 : 20);
+    for (const seconds of [1.6, 8.75, 26.5, 31.04]) assert.equal(rig.propStates.find(p => p.seconds === seconds).shelf, 1, 'book is visible at rest on its own shelf');
+    assert.ok(rig.reachContacts.every(p => p.distance < .15), 'the empty hand meets the visible book directly');
+    assert.ok(rig.reachPaths.every(p => p.distance < .15 && p.verticalSpan < 1 && p.frontOwner === 0 && p.backOwner === 0), 'reach and retract stay at shelf height without a phantom hatch gesture');
     for (const contact of [...rig.shelfContacts, ...rig.handoffs]) assert.ok(contact.distances.every(d => d < .15), `${rig.family}: complete book matrices coincide`);
     assert.ok([...rig.palms, ...rig.edges].every(p => p.front < .15 && p.back < .15), `${rig.family}: both hands keep measured contact`);
     assert.ok(rig.reading.every(p => p.distance < .15));
@@ -362,7 +418,7 @@ try {
   results.terminal = await page.evaluate(() => Object.entries(__manualPreview.views).map(([family, view]) => {
     const read = () => ({ family: view.element.dataset.family, state: view.element.dataset.state, episode: view.element.dataset.episode,
       motion: view.element.dataset.motion, status: view.element.querySelector('.wv-status').textContent,
-      manualPresent: !!view.element.querySelector('.wv-manual-held'), kitchenPresent: !!view.element.querySelector('.wv-kitchen'),
+      manualPresent: !!view.element.querySelector('.wv-manual-held'), manualKitPresent: !!view.element.querySelector('.wv-manual-kit'), kitchenPresent: !!view.element.querySelector('.wv-kitchen'),
       moving: view.element.querySelector('.wv-art').getAnimations({ subtree: true }).filter(a => a.playState === 'running').length });
     const before = read();
     view.update({ ...__manualPreview.receipts[family], state: family === 'reading' ? 'error' : 'completed' });
@@ -371,7 +427,7 @@ try {
   for (const sample of results.terminal) {
     assert.equal(sample.before.episode, 'manual'); assert.equal(sample.before.motion, 'running');
     assert.equal(sample.after.motion, 'static'); assert.equal(sample.after.episode, 'work');
-    assert.equal(sample.after.manualPresent, false); assert.equal(sample.after.kitchenPresent, false); assert.equal(sample.after.moving, 0);
+    assert.equal(sample.after.manualPresent, false); assert.equal(sample.after.manualKitPresent, false); assert.equal(sample.after.kitchenPresent, false); assert.equal(sample.after.moving, 0);
     assert.equal(sample.after.state, sample.family === 'reading' ? 'error' : 'completed');
   }
   results.applicationUnchanged = await page.evaluate(() => JSON.stringify(__manualPreview.application)
