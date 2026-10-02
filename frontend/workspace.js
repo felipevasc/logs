@@ -668,7 +668,7 @@
     if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); undo(); }
     if (e.key === "Tab") {
       const modal = [...document.querySelectorAll(".modal-overlay:not([hidden])")].at(-1);
-      const controls = modal ? [...modal.querySelectorAll("button,input,select,textarea,a[href],[tabindex='0']")].filter(n => !n.disabled && n.getClientRects().length) : [];
+      const controls = modal ? [...modal.querySelectorAll("button,input,select,textarea,a[href],[tabindex='0']")].filter(n => !n.disabled && n.tabIndex >= 0 && n.getClientRects().length) : [];
       if (controls.length) { const first=controls[0], last=controls.at(-1); if (e.shiftKey && (document.activeElement===first || !modal.contains(document.activeElement))) {e.preventDefault();last.focus();} else if (!e.shiftKey && (document.activeElement===last || !modal.contains(document.activeElement))) {e.preventDefault();first.focus();} }
     }
     if (e.key === "Escape") { $("#ws-export-modal").hidden = true; $("#ws-drop").hidden = true; }

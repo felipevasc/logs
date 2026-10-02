@@ -121,3 +121,11 @@ O posicionamento evita foco, editor e ações quando houver espaço. Timers, fra
 O construtor de Cruzar dados agora pode ser recolhido por uma escolha explícita. A apresentação fechada resume linhas, colunas e medidas e conserva a ação Editar configuração. O estado inicial continua expandido. Recolher não consulta novamente nem recria a tabela, e conserva foco e rolagem; a preferência é restaurada por contexto, com snapshots antigos assumindo o estado expandido.
 
 A paleta local recolhe junto do construtor; o catálogo principal permanece disponível. Nenhuma capacidade de edição é removida. O roteiro de CI compara temas claro/escuro em 1440 e 1024 px, mede ganho real da área de linhas e cobre erro, cancelamento, retry e troca entre Caso e Análise. A confirmação visual deste incremento ainda está pendente.
+
+### Ampliação acessível
+
+Configurações e atalhos passam a oferecer escolhas até200%, mantendo o automático e Ctrl0 existentes. A preferência manual permanece ao redimensionar. Os grupos de tamanho/tema têm navegação por setas, Home/End e foco preservado; o trap do modal respeita os controles fora da ordem de Tab.
+
+Escala solicitada e aplicada são distintas. Escritas nativas são serializadas; respostas antigas não anunciam sucesso nem substituem a intenção atual. Voltar para Automático durante uma escrita aguarda o recibo e recalcula pela escala confirmada e geometria observada. Uma falha mantém a preferência e informa que não foi aplicada.
+
+O preview verifica seleção de200% e reflow dos controles em1024/640/320CSSpx. O transporte de preview retorna false para zoom; por isso não comprova zoom instalado a200% nem reflow global do app. Esses gates permanecem separados.

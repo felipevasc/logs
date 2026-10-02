@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
-/* Interface scale (automatic, settings, shortcuts, persistence) and layouts that must fit small windows. */
+/* Requested scale, accessible settings, shortcuts, persistence and control reflow.
+   Preview ui_zoom returns false: these checks do not verify installed native zoom. */
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import { launchBrowser } from "./browser.mjs";
@@ -7,6 +8,8 @@ const url = process.argv[2] || "http://127.0.0.1:4173";
 const browser = await launchBrowser();
 const errors = [], results = {};
 const consoleErrors = [], failedRequests = [];
+const directory = new URL("../../output/playwright/", import.meta.url);
+await mkdir(directory, { recursive: true });
 let page, phase = "initial load";
 try {
   // A 2000×1054 screen at 150% system scaling: the window is 1333×703 CSS pixels.
@@ -17,8 +20,15 @@ try {
   page.on("requestfailed", request => failedRequests.push({ url: request.url(), error: request.failure()?.errorText }));
   await page.goto(url);
   await page.waitForFunction(() => window.WorkspaceContext?.ready && state.loaded && !state.loadOverlay && window.UiScale);
-  assert.equal(await page.evaluate(() => UiScale.current()), 0.85, "automatic scale zooms out on a small high-DPI window");
+  const settled = () => page.waitForFunction(() => UiScale.status().state !== "pending");
+  await settled();
+  assert.equal(await page.evaluate(() => UiScale.current()), 0.85, "automatic mode requests the existing small/high-DPI scale");
+  assert.deepEqual(await page.evaluate(() => [UiScale.status().state, UiScale.status().applied]), ["failed", 1], "preview does not apply native zoom");
+  results.transport = "synthetic-preview; ui_zoom returns false";
+  results.nativeZoomAt200Percent = "not verified; requires the installed app";
+  results.fullApplication320CssPixelReflow = "not verified; only settings controls are covered here";
   await page.keyboard.press("Control+Minus");
+  await settled();
   assert.equal(await page.evaluate(() => UiScale.current()), 0.8);
   assert.equal(await page.evaluate(() => localStorage.getItem("li-ui-scale")), "0.8");
   assert.equal(await page.evaluate(() => {
@@ -28,21 +38,107 @@ try {
   phase = "restore after reload";
   await page.reload();
   await page.waitForFunction(() => window.UiScale && state.loaded);
+  await settled();
   assert.equal(await page.evaluate(() => UiScale.current()), 0.8, "a chosen size survives a restart");
   await page.keyboard.press("Control+0");
+  await settled();
   assert.deepEqual(await page.evaluate(() => [UiScale.current(), UiScale.setting()]), [0.85, "auto"]);
   results.shortcuts = "Ctrl − / Ctrl 0 e persistência";
 
-  phase = "settings";
+  phase = "settings and keyboard";
   await page.evaluate(() => openSettings());
   await page.waitForSelector("#settings-pane-interface [data-scale]");
-  await page.locator('#settings-pane-interface [data-scale="1"]').click();
-  assert.equal(await page.evaluate(() => UiScale.current()), 1);
-  assert.equal(await page.locator('#settings-pane-interface [data-scale="1"]').getAttribute("aria-checked"), "true");
-  await page.locator('#settings-pane-interface [data-scale="auto"]').click();
+  const scales = page.locator('#settings-pane-interface [data-scale]');
+  const choice = value => page.locator(`#settings-pane-interface [data-scale="${value}"]`);
+  assert.deepEqual(await scales.evaluateAll(nodes => nodes.map(node => node.dataset.scale)),
+    ["auto", "0.7", "0.75", "0.8", "0.85", "0.9", "1", "1.1", "1.25", "1.4", "1.5", "1.75", "2"]);
+  await choice(2).click(); await settled();
+  assert.equal(await page.evaluate(() => UiScale.current()), 2);
+  assert.equal(await choice(2).getAttribute("aria-checked"), "true");
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.scale), "2", "focus survives the asynchronous pane render");
+  assert.match(await page.locator("#ui-scale-status").textContent(), /200% selecionado.*Não foi possível aplicar.*100%/);
+  assert.equal(await page.locator('#settings-pane-interface [data-scale][tabindex="0"]').count(), 1);
+  await page.keyboard.press("ArrowLeft"); await settled();
+  assert.equal(await page.evaluate(() => UiScale.setting()), 1.75);
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.scale), "1.75");
+  await page.keyboard.press("End"); await settled();
+  assert.equal(await page.evaluate(() => UiScale.setting()), 2);
+  await page.keyboard.press("Tab");
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.themeChoice), "dark", "Tab leaves the scale group once");
+  await page.keyboard.press("Tab");
+  assert.equal(await page.evaluate(() => document.activeElement?.id), "settings-close", "the modal trap skips the inactive theme radio");
+  await page.keyboard.press("Shift+Tab");
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.themeChoice), "dark");
+  await page.keyboard.press("ArrowRight");
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), "light");
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.themeChoice), "light");
+  await page.keyboard.press("Shift+Tab");
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.scale), "2");
+  await page.keyboard.press("Home"); await settled();
   assert.equal(await page.evaluate(() => UiScale.setting()), "auto");
-  await page.evaluate(() => { document.querySelector("#settings-modal").hidden = true; });
-  results.settings = "Configurações → Interface";
+  await choice(2).focus(); await page.keyboard.press("Space"); await settled();
+  assert.equal(await choice(2).getAttribute("aria-checked"), "true", "Space uses the button's native activation");
+  await choice(1.5).focus(); await page.keyboard.press("Enter"); await settled();
+  assert.equal(await choice(1.5).getAttribute("aria-checked"), "true", "Enter uses the button's native activation");
+  await page.keyboard.press("Control+Equal"); await settled();
+  assert.equal(await page.evaluate(() => UiScale.current()), 1.75);
+  await page.keyboard.press("Control+Equal"); await settled();
+  await page.keyboard.press("Control+Equal"); await settled();
+  assert.equal(await page.evaluate(() => UiScale.current()), 2, "Ctrl + reaches and stops at 200%");
+  await page.evaluate(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "-", ctrlKey: true, isComposing: true, bubbles: true })));
+  assert.equal(await page.evaluate(() => UiScale.current()), 2, "IME composition does not change scale");
+  results.settings = "70–200% e Automático; setas/Home/End, Enter/Espaço, tabulação e foco";
+
+  phase = "manual enlargement persistence";
+  await page.reload();
+  await page.waitForFunction(() => window.UiScale && state.loaded); await settled();
+  assert.deepEqual(await page.evaluate(() => [UiScale.current(), UiScale.setting(), UiScale.status().applied]), [2, 2, 1],
+    "200% remains selected across reload without claiming preview zoom");
+  await page.evaluate(() => openSettings());
+  results.controlReflow = [];
+  for (const { width, height } of [{ width: 1024, height: 720 }, { width: 640, height: 420 }, { width: 320, height: 720 }]) {
+    phase = `settings control reflow at ${width} CSS px`;
+    await page.setViewportSize({ width, height });
+    await page.locator(`#settings-pane-interface [data-theme-choice="${width === 1024 ? "dark" : "light"}"]`).click();
+    await page.waitForTimeout(300); // Wait through the actual resize debounce.
+    assert.deepEqual(await page.evaluate(() => [UiScale.current(), UiScale.setting()]), [2, 2], "resize preserves the manual choice");
+    await choice(2).focus();
+    const layout = await page.evaluate(() => {
+      const pane = document.querySelector("#settings-pane-interface");
+      const group = pane.querySelector(".ui-scale-choices");
+      const box = group.getBoundingClientRect(), paneBox = pane.getBoundingClientRect();
+      const controls = [...pane.querySelectorAll("[role=radio]")].map(node => {
+        const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
+        return { label: node.textContent.trim(), left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
+          width: rect.width, height: rect.height, fontSize: Number.parseFloat(style.fontSize) };
+      });
+      return { viewport: innerWidth, groupWidth: box.width, paneWidth: paneBox.width,
+        horizontalOverflow: pane.scrollWidth > pane.clientWidth + 1,
+        rows: new Set([...group.children].map(node => Math.round(node.getBoundingClientRect().top))).size,
+        controls, focused: document.activeElement?.dataset.scale,
+        groupFits: box.left >= paneBox.left - 1 && box.right <= paneBox.right + 1,
+        controlsFit: controls.every(control => control.left >= paneBox.left - 1 && control.right <= paneBox.right + 1
+          && control.left >= 0 && control.right <= innerWidth),
+      };
+    });
+    assert.equal(layout.viewport, width, "the preview has not faked native zoom");
+    assert.equal(layout.horizontalOverflow, false, `settings pane has no horizontal overflow: ${JSON.stringify(layout)}`);
+    assert.equal(layout.groupFits && layout.controlsFit, true, `scale and theme controls fit at ${width}px: ${JSON.stringify(layout)}`);
+    assert.ok(layout.controls.every(control => control.width >= 24 && control.height >= 30 && control.fontSize >= 12), "options keep their existing readable text and target size");
+    if (width <= 640) assert.ok(layout.rows > 1, "scale choices wrap instead of shrinking");
+    assert.equal(layout.focused, "2");
+    await page.keyboard.press("Tab");
+    const themeInView = await page.evaluate(() => {
+      const node = document.activeElement, box = node.getBoundingClientRect();
+      return !!node.dataset.themeChoice && box.top >= 0 && box.bottom <= innerHeight;
+    });
+    assert.equal(themeInView, true, "theme remains reachable by keyboard in a short or narrow settings dialog");
+    await choice(2).focus();
+    await page.screenshot({ path: fileURLToPath(new URL(`ui-scale-settings-${width}.png`, directory)), fullPage: true });
+    results.controlReflow.push({ width, height, rows: layout.rows, paneWidth: layout.paneWidth, groupWidth: layout.groupWidth });
+  }
+  await page.setViewportSize({ width: 1333, height: 703 });
+  await page.evaluate(async () => { await UiScale.set(1, false); document.querySelector("#settings-modal").hidden = true; });
 
   // Layouts at 100% in the same small window.
   phase = "layouts";
@@ -71,8 +167,6 @@ try {
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ ...results, errors }, null, 2));
 } catch (error) {
-  const directory = new URL("../../output/playwright/", import.meta.url);
-  await mkdir(directory, { recursive: true });
   const diagnostics = { phase, error: String(error.stack || error), errors, consoleErrors, failedRequests, results };
   try {
     diagnostics.page = await page?.evaluate(() => {
@@ -81,7 +175,7 @@ try {
       const caseSummary = item => item && ({ id: item.id, activeArtifactId: item.activeArtifactId, artifacts: item.artifacts?.map(({ id, path, source }) => ({ id, path, source })) });
       return {
         url: location.href, readyState: document.readyState,
-        scale: window.UiScale?.current(), workspaceReady: window.WorkspaceContext?.ready,
+        scale: window.UiScale?.status(), workspaceReady: window.WorkspaceContext?.ready,
         workspaceChanging: window.WorkspaceContext?.changing, scope: window.WorkspaceContext?.scope(),
         loaded: current?.loaded, loadOverlay: current?.loadOverlay, queryError: current?.queryError,
         active: current?.cases?.active, currentArtifact: current?.currentArtifact,
