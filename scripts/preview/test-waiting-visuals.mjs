@@ -109,6 +109,8 @@ const setTheme = async theme => {
 const waitMotion = (selector, value) => page.waitForFunction(({ selector, value }) => document.querySelector(selector)?.dataset.motion === value, { selector, value });
 const renderedState = locator => locator.evaluate(root => {
   const status = root.querySelector('.wv-status'), metric = root.querySelector('.wv-metric'), button = root.querySelector('.wv-motion-toggle');
+  const art = root.querySelector('.wv-art');
+  const running = root.getAnimations({ subtree: true }).filter(animation => animation.playState === 'running');
   const rect = root.getBoundingClientRect();
   return {
     family: root.dataset.family, motion: root.dataset.motion, pace: root.dataset.pace, state: root.dataset.state, variant: root.dataset.variant,
@@ -116,7 +118,15 @@ const renderedState = locator => locator.evaluate(root => {
     statusFont: Number.parseFloat(getComputedStyle(status).fontSize), metricFont: Number.parseFloat(getComputedStyle(metric).fontSize),
     buttonFont: Number.parseFloat(getComputedStyle(button).fontSize), buttonMinHeight: Number.parseFloat(getComputedStyle(button).minHeight),
     buttonPointerEvents: getComputedStyle(button).pointerEvents, buttonHidden: button.hidden,
-    runningAnimations: root.getAnimations({ subtree: true }).filter(animation => animation.playState === 'running').length,
+    // Pausing the scene must be immediate. A finite button hover transition is
+    // not a running robot loop (CI56 captured one 150 ms color transition).
+    runningAnimations: art.getAnimations({ subtree: true }).filter(animation => animation.playState === 'running').length,
+    controlAnimations: running.filter(animation => !art.contains(animation.effect.target)).map(animation => ({
+      type: animation.constructor.name, target: animation.effect.target.className,
+      property: animation.transitionProperty || null, duration: animation.effect.getComputedTiming().duration,
+      iterations: animation.effect.getTiming().iterations,
+    })),
+    surface: { background: getComputedStyle(root).backgroundColor, opacity: getComputedStyle(root).opacity },
     bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
   };
 });
@@ -493,6 +503,8 @@ try {
   markVideo('group-command-loop', { syntheticTransport: true, viewport: page.viewportSize() });
   assert.equal(results.group.family, 'calculation'); assert.equal(results.group.status, 'Calculando resumo'); assert.equal(results.group.metric, null);
   assert.ok(results.group.runningAnimations > 0); assert.equal(results.group.buttonPointerEvents, 'auto'); assertTypography(results.group);
+  assert.equal(results.group.surface.opacity, '1');
+  assert.match(results.group.surface.background, /^rgb\(\d+, \d+, \d+\)$/, 'the local scene surface is opaque so table values do not show through its status');
   results.calculationRig = await inspectTaskRig(group, 'calculation');
   results.calculationCapture = await recordSceneCycle(group, 'calculation-loop', 6400, { syntheticTransport: true, fixtureReceipt: false });
   const groupCancelBefore = await page.evaluate(() => window.__mockCommandCalls.cancel_task || 0);
@@ -652,6 +664,8 @@ try {
     evidence.paused = await renderedState(fixture);
     assert.equal(evidence.paused.family, family); assert.equal(evidence.paused.motion, 'static');
     assert.equal(evidence.paused.runningAnimations, 0); assert.equal(evidence.paused.metric, null);
+    assert.ok(evidence.paused.controlAnimations.every(animation => animation.type === 'CSSTransition'
+      && animation.duration <= 200 && animation.iterations === 1), 'only finite interaction feedback may continue outside the paused scene');
     assert.equal(await fixture.locator('.wv-task').count(), 1, 'pause retains the robot');
     await assertFits(fixture);
     await screenshot(`waiting-fixture-${family}-static-dark-1440.png`, { fixture: true, userPaused: true,
@@ -716,6 +730,9 @@ try {
         connected: root.isConnected, hiddenAncestor: !!root.closest('[hidden]'),
         bounds: root.getBoundingClientRect().toJSON(),
         animations: root.getAnimations({ subtree: true }).map(animation => ({
+          type: animation.constructor.name, target: animation.effect.target.getAttribute('class'),
+          belongsToArt: !!animation.effect.target.closest('.wv-art'),
+          transitionProperty: animation.transitionProperty || null, animationName: animation.animationName || null,
           playState: animation.playState, currentTime: animation.currentTime, timing: animation.effect.getComputedTiming(),
         })),
       })),

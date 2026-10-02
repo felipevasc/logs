@@ -72,6 +72,14 @@
 }
 /* A legacy loading veil passes pointer events through; its independent pause stays usable. */
 .area-loading-semantic .wv-motion-toggle { pointer-events: auto; }
+/* The area veil remains translucent, but old table values must not show through
+   the robot or its status. Keep this local surface compact and fully opaque. */
+.area-loading-semantic > .waiting-visual {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-1);
+}
 .waiting-visual .wv-motion-toggle:hover { color: var(--text-0, #e6eaf2); text-decoration-color: currentColor; }
 .waiting-visual .wv-motion-toggle:focus-visible { outline: 2px solid var(--wv-accent); outline-offset: 2px; }
 .waiting-visual[data-pace="loop"] { --wv-cycle: 3.8s; --wv-repeat: infinite; }

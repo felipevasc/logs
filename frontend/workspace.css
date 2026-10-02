@@ -154,3 +154,8 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 .hist-panel.analytics-placeholder .hint-empty{padding-top:4px;padding-bottom:4px}
 .workbar[data-summary-state]:not([data-summary-state=""]):not([data-summary-state="done"]) #workbar-idle-icon{color:var(--text-2)}
 .workbar[data-summary-state="failed"] #workbar-idle-icon{color:var(--lv-aviso)}
+
+/* Interface scale: bound the grid track before wrapping its intrinsic-width radios. */
+#settings-pane-interface .ui-pref { min-width: 0; grid-template-columns: minmax(0, 1fr); }
+#settings-pane-interface .ui-scale-choices { display: flex; width: 100%; min-width: 0; max-width: 100%; flex-wrap: wrap; }
+#settings-pane-interface .ui-scale-choices > .seg-btn { flex: 0 0 auto; }

@@ -301,3 +301,20 @@ test('Auto supersedes a not-yet-started manual request without using its unconfi
   assert.equal(h.ui.status().automaticPending, false); assert.equal(h.timers.size, 0);
   assert.deepEqual(h.toasts, [{ message: 'Tamanho 85% selecionado, mas não foi possível aplicar nesta janela.', type: 'info' }]);
 });
+
+test('scale layout bounds its grid track and wraps natural-size radios without shrinking text or targets (CSS contract)', () => {
+  const css = readFileSync(new URL('../../frontend/workspace.css', import.meta.url), 'utf8');
+  const preference = css.match(/#settings-pane-interface \.ui-pref\s*\{([^}]+)\}/)?.[1];
+  const group = css.match(/#settings-pane-interface \.ui-scale-choices\s*\{([^}]+)\}/)?.[1];
+  const radio = css.match(/#settings-pane-interface \.ui-scale-choices > \.seg-btn\s*\{([^}]+)\}/)?.[1];
+  assert.match(preference, /min-width:\s*0\s*;/);
+  assert.match(preference, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s*;/);
+  assert.match(group, /display:\s*flex\s*;/);
+  assert.match(group, /(?:^|;)\s*width:\s*100%\s*;/);
+  assert.match(group, /min-width:\s*0\s*;/);
+  assert.match(group, /max-width:\s*100%\s*;/);
+  assert.match(group, /flex-wrap:\s*wrap\s*;/);
+  assert.match(radio, /flex:\s*0\s+0\s+auto\s*;/);
+  assert.doesNotMatch(`${preference}${group}${radio}`, /(?:font-size|zoom|transform|min-height|padding)\s*:/,
+    'the scoped fix retains existing typography, padding and target heights; real reflow is verified in browser CI');
+});

@@ -234,6 +234,14 @@ test('motion budget is CSS-only, constrained and independently reduced-motion sa
   }
 });
 
+test('area scenes hide stale table values behind an opaque local surface without altering the art', () => {
+  const body = css.split('.area-loading-semantic > .waiting-visual {')[1]?.split('}')[0];
+  assert.ok(body, 'the surface is scoped to regional waits, not the foreground loading card');
+  assert.match(body, /background:\s*var\(--bg-1\)/);
+  assert.match(body, /padding:\s*8px 10px/);
+  assert.doesNotMatch(body, /opacity:|font-size:|transform:|animation:|filter:|height:/);
+});
+
 
 // Parse balanced keyframe blocks: normal rules between animations are not motion.
 function animationFrames() {

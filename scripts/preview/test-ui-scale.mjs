@@ -103,16 +103,22 @@ try {
     await page.waitForTimeout(300); // Wait through the actual resize debounce.
     assert.deepEqual(await page.evaluate(() => [UiScale.current(), UiScale.setting()]), [2, 2], "resize preserves the manual choice");
     await choice(2).focus();
+    await page.keyboard.press("ArrowLeft"); await settled();
+    assert.equal(await page.evaluate(() => document.activeElement?.dataset.scale), "1.75", "roving focus follows wrapped choices");
+    await page.keyboard.press("ArrowRight"); await settled();
+    assert.deepEqual(await page.evaluate(() => [UiScale.setting(), document.activeElement?.dataset.scale]), [2, "2"], "reflow preserves keyboard selection and restored focus");
     const layout = await page.evaluate(() => {
       const pane = document.querySelector("#settings-pane-interface");
       const group = pane.querySelector(".ui-scale-choices");
       const box = group.getBoundingClientRect(), paneBox = pane.getBoundingClientRect();
+      const groupStyle = getComputedStyle(group), preferenceStyle = getComputedStyle(group.parentElement);
       const controls = [...pane.querySelectorAll("[role=radio]")].map(node => {
         const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
         return { label: node.textContent.trim(), left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
           width: rect.width, height: rect.height, fontSize: Number.parseFloat(style.fontSize) };
       });
       return { viewport: innerWidth, groupWidth: box.width, paneWidth: paneBox.width,
+        gridColumns: preferenceStyle.gridTemplateColumns, groupDisplay: groupStyle.display, groupWrap: groupStyle.flexWrap,
         horizontalOverflow: pane.scrollWidth > pane.clientWidth + 1,
         rows: new Set([...group.children].map(node => Math.round(node.getBoundingClientRect().top))).size,
         controls, focused: document.activeElement?.dataset.scale,
