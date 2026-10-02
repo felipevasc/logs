@@ -125,6 +125,21 @@ test('workflow contract retains native and installed-update gates, shares cache 
   assert.match(build, /run: node scripts\/release\/update-e2e\.mjs/);
   assert.match(build, /needs: build/);
   assert.match(build, /run: node scripts\/release\/publish\.mjs release-assets/);
-  assert.match(checks, /name: Required validation/);
+  assert.doesNotMatch(checks, /ready_for_review/, 'draft state does not change scope; readiness must not repeat native builds');
+  assert.match(checks, /'Required validation'/);
   assert.match(checks, /if: always\(\)/);
+});
+
+test('base retargeting validates while metadata edits cannot overwrite required check results', () => {
+  const checks = readFileSync(new URL('../../.github/workflows/checks.yml', import.meta.url), 'utf8');
+  assert.match(checks, /types: \[opened, synchronize, reopened, edited\]/);
+  const condition = "github.event.action == 'edited' && !github.event.changes.base";
+  for (const [job, label] of [['scope', 'scope not requested'], ['frontend', 'frontend not requested'], ['backend', 'native not requested'], ['required', 'no validation result']]) {
+    const block = checks.split(`  ${job}:\n`)[1].split(/\n  [a-z]+:/)[0];
+    assert(block.includes(`name: \${{ ${condition} && 'Metadata edit (${label})'`), job);
+    if (job === 'scope') assert.match(block, /if: github.event.action != 'edited' \|\| github.event.changes.base/);
+    if (job === 'frontend' || job === 'backend') assert.match(block, /needs: scope/);
+  }
+  assert.match(checks, /if: always\(\) && \(github.event.action != 'edited' \|\| github.event.changes.base\)/);
+  assert.match(checks, /No source validation ran, and no required check was replaced/);
 });

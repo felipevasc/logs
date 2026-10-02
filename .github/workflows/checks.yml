@@ -3,7 +3,7 @@ name: Pull request checks
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
     inputs:
       portable_windows:
@@ -16,7 +16,9 @@ permissions:
 
 jobs:
   scope:
-    name: Select required validation
+    # Metadata edits must not create a skipped success under a required check name.
+    name: ${{ github.event.action == 'edited' && !github.event.changes.base && 'Metadata edit (scope not requested)' || 'Select required validation' }}
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     outputs:
@@ -44,7 +46,7 @@ jobs:
           if-no-files-found: error
 
   frontend:
-    name: Frontend and interaction regressions
+    name: ${{ github.event.action == 'edited' && !github.event.changes.base && 'Metadata edit (frontend not requested)' || 'Frontend and interaction regressions' }}
     needs: scope
     runs-on: ubuntu-22.04
     timeout-minutes: 20
@@ -135,7 +137,7 @@ jobs:
   backend:
     needs: scope
     if: needs.scope.outputs.native == 'true' || inputs.portable_windows
-    name: Backend tests (${{ matrix.os }})
+    name: ${{ github.event.action == 'edited' && !github.event.changes.base && 'Metadata edit (native not requested)' || format('Backend tests ({0})', matrix.os) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     # Keep an expensive native build alive while newer UI-only fixes validate.
@@ -236,9 +238,9 @@ jobs:
 # production configuration changes, repository writes or releases.
 
   required:
-    name: Required validation
+    name: ${{ github.event.action == 'edited' && !github.event.changes.base && 'Metadata edit (no validation result)' || 'Required validation' }}
     needs: [scope, frontend, backend]
-    if: always()
+    if: always() && (github.event.action != 'edited' || github.event.changes.base)
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
@@ -257,3 +259,12 @@ jobs:
             test "$BACKEND_RESULT" = skipped
             echo 'Native checks were not applicable to these paths; no native pass is claimed.'
           fi
+
+  metadata:
+    name: Metadata edit only
+    if: github.event.action == 'edited' && !github.event.changes.base
+    runs-on: ubuntu-22.04
+    timeout-minutes: 2
+    steps:
+      - name: Preserve existing validation results
+        run: echo 'Only PR metadata changed. No source validation ran, and no required check was replaced.' >> "$GITHUB_STEP_SUMMARY"

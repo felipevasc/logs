@@ -1,0 +1,61 @@
+name: Promote validated Windows and Linux release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Build Windows and Linux run ID (same complete Git tree as current main)
+        type: string
+        required: true
+      source_run_attempt:
+        description: Latest successful attempt of that build run (usually 1)
+        type: string
+        required: true
+        default: '1'
+      publish_release:
+        description: Publish the validated installers; false only validates without publishing
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    name: Verify prior build and promote exact installers
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    concurrency:
+      group: release-publication
+      cancel-in-progress: false
+    permissions:
+      # Ephemeral GITHUB_TOKEN only. No PAT, new credential or persistent grant.
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Verify promotion safeguards
+        run: node --test scripts/tests/artifact-promotion.test.mjs
+      - name: Verify source, download exact artifacts and optionally publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+        run: node scripts/release/promote.mjs
+      - name: Preserve promotion identity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-promotion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: promotion-record.json
+          if-no-files-found: ignore
+          retention-days: 90
