@@ -357,6 +357,12 @@ try {
   await page.getByRole("button", { name: "Recolher configuração", exact: true }).click();
   await page.evaluate(() => WorkspaceContext.setScope("case", { page: "explore", tab: "cube", animate: false }));
   await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "case");
+  // showPage/switchTab do not await openCube. Its profile lookup can still be
+  // pending here, so settle the initial Case result before the no-query baseline.
+  await page.waitForFunction(() => WorkspaceContext.scope() === "case" && state.analyticsScope === "case"
+    && !!cubeState.result && cubeResultForTable(activeCube(), "case") === cubeState.result
+    && document.querySelector("#cube-table tbody").rows.length > 1
+    && !Tasks.operationFor("pivot") && !document.querySelector(".cube-output .area-loading-semantic"));
   results.configurationRotation.case = await rotationState();
   assert.equal(await page.locator("#aw-pivot-config-toggle").getAttribute("aria-expanded"), "true", "a new context does not inherit the previous folding choice");
   results.caseChipContrast = [];
