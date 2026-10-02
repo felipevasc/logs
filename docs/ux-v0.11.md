@@ -145,3 +145,19 @@ Os testes Node verificam a preservação do piloto de leitura, hierarquia dos ob
 ### Regressões de continuidade
 
 Os testes de menu passam a recriar deliberadamente o catálogo enquanto ele está aberto e exigem retorno ao controle lógico correspondente. O teste de edição por chip aguarda a barreira existente de contagens antes de medir consultas: tarefas ainda no debounce não estão incluídas em `Tasks.pending()`. A exigência de zero consultas ao abrir e cancelar continua estrita; não foi acrescentado atraso ao produto.
+
+### Resultado do CI56 e ajustes localizados
+
+O CI56 aprovou 809 testes Node e 19 dos 21 roteiros de navegador. Pivot, menus, chips e as novas ações de registro passaram. O seletor de tamanho revelou uma largura intrínseca maior que o painel; a correção limita a coluna e quebra os botões em linhas, sem reduzir texto ou alvos. O teste de pausa havia contado uma transição finita de 150 ms junto da cena; a medição passa a separar a arte das transições de interação e a registrar seu alvo. Não se mudou a duração ou o comportamento do robô para satisfazer o teste.
+
+As novas cenas longas foram renderizadas em 240 × 120 CSS px. A mão manteve contato com a gaveta em 47 amostras do ciclo longo, com desvio máximo de 0,068 px. Na ficha, os dois cantos coincidiram nas poses de pegar e depositar. O gesto curto de checkpoint terminou em 2,8 segundos. Os estados posteriores do roteiro ainda aguardam a repetição completa. A captura também mostrou números antigos da tabela atrás da cena em Resumir: uma pequena superfície opaca local passa a separar arte e texto dos resultados anteriores.
+
+### Diálogos, exportação e Desfazer
+
+Referências e Transformação passam a manter status e ações em um rodapé estável enquanto o formulário rola. Cancelar/Salvar seguem a mesma ordem e Excluir permanece separado. Erros longos continuam selecionáveis, têm foco próprio e rolagem por teclado, sem roubar o foco quando chegam. Durante uma gravação, Fechar explicita que não interrompe nem desfaz a operação. Limites, tipos e avisos críticos não foram recolhidos.
+
+A exportação agora calcula escopo e ajuda por formato tanto na abertura quanto na mudança: recorte filtrado, Markdown, PDF e investigação portátil têm descrições distintas. Contagem indisponível não vira zero. As diferenças de JSON nativo/legado, LICASE e proteção de textos ficam explícitas sem mudar valores de máscara, extensão, IPC ou recibos.
+
+A confirmação de remoção nativa ganha Desfazer no próprio aviso, vinculado ao recibo exato. Ele permanece separado dos avisos benignos agregados. Sua validade continua pertencendo ao Caso, armazenamento e manifesto nativos; mudar a fonte analítica não invalida arbitrariamente o histórico. Cliques repetidos, confirmação perdida, recibo mais novo e troca de Caso têm regressões específicas. O prazo do aviso não altera a validade do comando existente no menu.
+
+Esses três recortes passaram por testes Node e revisão de código. O próximo CI deve confirmar seus cenários reais de navegador, incluindo layouts compactos, foco, erros e cancelamento; isso ainda não equivale a validação no WebView instalado.
