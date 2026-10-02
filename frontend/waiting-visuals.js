@@ -1,4 +1,4 @@
-/* One small, decorative scene for a real operation. No timers, progress estimation or IPC.
+/* Decorative scenes for real operations. No timers, progress estimation or IPC.
    Load as a classic script and pair with waiting-visuals.css.
 
    const view = WaitingVisuals.mount(host, {
@@ -12,6 +12,8 @@
    phaseIndex is one-based. phaseCount, elapsedMs and estimateMs are optional measured/
    supplied values; estimateMs is remaining time for THIS phase. No value is inferred.
    Long scenes loop only when supplied elapsedMs >= 4000. Short scenes make one gesture.
+   Reactions are chosen only at CSS cycle boundaries, from supplied elapsed time.
+   They never hold results, change receipts or estimate progress. Pauses freeze all tracks.
    An unknown phase/state is static, even if its human label sounds like a known operation.
 */
 window.WaitingVisuals = (() => {
@@ -78,7 +80,60 @@ window.WaitingVisuals = (() => {
     if (elapsedMs !== null) details.push(`${duration(elapsedMs)} decorridos`);
     if (estimateMs !== null && state === 'running' && !partialCheckpoint) details.push(`≈ ${duration(estimateMs)} restantes nesta etapa`);
     return { operationId, phaseId, state, family, canAnimate, partialCheckpoint, label, status,
-      metric, details, variant: variantFor(operationId, family), motionMode: elapsedMs !== null && elapsedMs >= 4000 ? 'loop' : 'gesture' };
+      metric, details, elapsedMs, variant: variantFor(operationId, family), motionMode: elapsedMs !== null && elapsedMs >= 4000 ? 'loop' : 'gesture' };
+  }
+
+  // A shared repertoire, with explicit family safe points. New adapters must prove
+  // an empty hand / parked tool at BOTH cycle endpoints before enabling reactions.
+  const repertoire = Object.freeze({
+    coffee: Object.freeze({ minElapsedMs: 45000, durationMs: 32000, cooldown: 4, weight: 1 }),
+    review: Object.freeze({ minElapsedMs: 15000, durationMs: 10000, cooldown: 2, weight: 4 }),
+    stretch: Object.freeze({ minElapsedMs: 28000, durationMs: 12000, cooldown: 3, weight: 2 })
+  });
+  const adapters = Object.freeze({
+    reading: Object.freeze({ reactions: true, homeX: 0, head: -4, cycleMs: 7200, safePoint: 'filed-sheet-empty-hand' }),
+    checkpoint: Object.freeze({ reactions: true, homeX: 20, head: 4, cycleMs: 6800, safePoint: 'closed-drawer-released-handle' }),
+    calculation: Object.freeze({ reactions: false, safePoint: 'tile-in-hand-needs-parking' }),
+    composition: Object.freeze({ reactions: false, safePoint: 'proof-in-hand-needs-parking' })
+  });
+  function seedFor(value) {
+    let hash = 2166136261;
+    for (const character of String(value)) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619) >>> 0;
+    return hash || 1;
+  }
+  // Pure, boundary-driven scheduling. Receipts, visibility and count changes never
+  // consume randomness. Cooldowns count completed visible work cycles, not timers.
+  function createDirector(operationId, seed = operationId) {
+    const initialSeed = seedFor(`${operationId}:${seed}`);
+    let random = initialSeed, cycle = 0, cooldown = 0, episode = 'work', variant = 'a';
+    const history = [];
+    function draw() {
+      random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
+      return random >>> 0;
+    }
+    function inspect() { return { episode, variant, cycle, cooldown, history: history.slice(), seed: initialSeed }; }
+    return Object.freeze({
+      inspect,
+      boundary(model) {
+        if (episode !== 'work' || !model?.canAnimate || model.motionMode !== 'loop' || !adapters[model.family]?.reactions) return null;
+        cycle++;
+        if (cooldown > 0) { cooldown--; return null; }
+        const elapsed = measured(model.elapsedMs);
+        const eligible = Object.entries(repertoire).filter(([name, item]) => elapsed !== null && elapsed >= item.minElapsedMs && name !== history.at(-1));
+        if (!eligible.length) return null;
+        // Work remains dominant; only one in three eligible safe points starts a break.
+        if (draw() % 3 !== 0) return null;
+        let choice = draw() % eligible.reduce((sum, [, item]) => sum + item.weight, 0);
+        episode = eligible.find(([, item]) => (choice -= item.weight) < 0)[0];
+        variant = draw() % 2 ? 'b' : 'a';
+        history.push(episode); if (history.length > 4) history.shift();
+        return inspect();
+      },
+      finish() {
+        if (episode === 'work') return false;
+        cooldown = repertoire[episode].cooldown; episode = 'work'; return true;
+      }
+    });
   }
 
   // Only these constant SVG strings enter innerHTML. All receipt text uses textContent.
@@ -211,6 +266,21 @@ window.WaitingVisuals = (() => {
     neutral: `<path class="wv-rail" d="M70 83h56"/><g class="wv-idle-actor" transform="translate(29 0)">${taskRobot()}</g>`
   });
 
+  const coffeeCup = `<path class="wv-cup-shell" d="M92 50h7v6a2 2 0 0 1-2 2h-3a2 2 0 0 1-2-2Z"/><path class="wv-cup-handle" d="M92 52h-2v4h2"/><path class="wv-cup-rim" d="M93 50h5"/>`;
+  function reactionScenery(family) {
+    if (!adapters[family]?.reactions) return '';
+    // The hatch and cup share the same measured contact coordinates as the hand.
+    // The hatch stays open while the cup is out, and only closes under the empty hand.
+    const kitchen = `<g class="wv-kitchen"><path class="wv-kitchen-wall" d="M166 34h23v47h-23Z"/>
+      <path class="wv-kitchen-recess" d="M169 43h17v21h-17Z"/><path class="wv-kitchen-shelf" d="M168 59h19m-19 6h19"/>
+      <g class="wv-cup-shelf" transform="translate(82 0)">${coffeeCup}</g>
+      <g class="wv-kitchen-hatch"><path class="wv-kitchen-wall" d="M168 43h19v18h-19Z"/><path class="wv-kitchen-handle" d="M171 55h4"/>
+        <path class="wv-kitchen-detail" d="M172 47h11"/></g><path class="wv-kitchen-detail" d="M170 72h13m-13 3h9"/>
+      <path class="wv-rail" d="M165 83h25"/></g>`;
+    const actor = taskRobot(`<g class="wv-cup-held"><g class="wv-cup-wrist">${coffeeCup}</g></g>`).replaceAll('wv-task', 'wv-react');
+    return `${kitchen}<g class="wv-reaction-actor">${actor}</g>`;
+  }
+
   function mount(host, initialSnapshot = {}, options = {}) {
     if (!host?.ownerDocument?.createElement || typeof host.append !== 'function') throw new TypeError('WaitingVisuals.mount precisa de um elemento.');
     const document = host.ownerDocument, view = document.defaultView || window;
@@ -223,15 +293,19 @@ window.WaitingVisuals = (() => {
     const control = document.createElement('button'); control.className = 'wv-motion-toggle'; control.type = 'button';
     root.append(art, status, metric, details, control); host.append(root);
     let current, sceneKey = '', destroyed = false, visible = true, intersecting = false;
+    let director, directorOwner = '', workSignal, episodeSignal, moving = false;
     let motionEnabled = options.motionEnabled !== false;
     const media = typeof view.matchMedia === 'function' ? view.matchMedia('(prefers-reduced-motion: reduce)') : null;
 
     function syncMotion() {
       if (destroyed || !current) return;
       const reduced = !!media?.matches;
-      const moving = current.canAnimate && motionEnabled && !reduced && visible && intersecting && !document.hidden && root.isConnected;
+      moving = current.canAnimate && motionEnabled && !reduced && visible && intersecting && !document.hidden && root.isConnected;
       root.dataset.motion = moving ? 'running' : 'static';
-      root.dataset.pace = current.motionMode;
+      // Latch animation assignment. Pausing changes only play-state, never its name.
+      if (moving) root.dataset.animated = 'true';
+      if (!current.canAnimate) root.dataset.animated = 'false';
+      if (root.dataset.episode === 'work') root.dataset.pace = current.motionMode;
       control.hidden = !current.canAnimate || reduced;
       control.textContent = motionEnabled ? 'Pausar animação' : 'Retomar animação';
       control.setAttribute('aria-label', motionEnabled ? 'Pausar apenas a animação; a operação continua' : 'Retomar apenas a animação; a operação continua');
@@ -243,8 +317,23 @@ window.WaitingVisuals = (() => {
       // Counters/elapsed receipts do not rebuild SVG or restart its CSS timeline.
       const key = `${current.operationId}\u0000${current.family}`;
       if (key !== sceneKey) {
-        art.innerHTML = `<svg viewBox="0 0 192 96" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">${scenes[current.family]}</svg>`;
+        art.innerHTML = `<svg viewBox="0 0 192 96" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg"><g class="wv-work">${scenes[current.family]}</g>${reactionScenery(current.family)}</svg>`;
+        // Actual DOM targets, never selectors from an event or an old SVG instance.
+        workSignal?.remove(); episodeSignal?.remove();
+        workSignal = document.createElement('span'); workSignal.className = 'wv-work-boundary';
+        episodeSignal = document.createElement('span'); episodeSignal.className = 'wv-episode-boundary';
+        workSignal.setAttribute('aria-hidden', 'true'); episodeSignal.setAttribute('aria-hidden', 'true');
+        art.append(workSignal, episodeSignal);
+        if (!director || directorOwner !== current.operationId) {
+          director = createDirector(current.operationId, options.reactionSeed ?? current.operationId);
+          directorOwner = current.operationId;
+        } else director.finish();
+        root.dataset.episode = 'work'; root.dataset.reactionVariant = 'a'; root.dataset.animated = 'false';
         sceneKey = key;
+      }
+      if (!current.canAnimate && root.dataset.episode !== 'work') {
+        director.finish();
+        root.dataset.episode = 'work';
       }
       root.dataset.family = current.family;
       root.dataset.variant = current.variant;
@@ -260,10 +349,25 @@ window.WaitingVisuals = (() => {
       syncMotion();
       return true;
     }
+    function boundary(event) {
+      if (destroyed || !moving || !current?.canAnimate || !root.isConnected || document.hidden || media?.matches || !visible || !intersecting || !motionEnabled || event.pseudoElement) return;
+      if (event.target === workSignal && event.type === 'animationiteration' && event.animationName === 'wv-work-boundary' && root.dataset.episode === 'work') {
+        const next = director.boundary(current);
+        if (next) { root.dataset.episode = next.episode; root.dataset.reactionVariant = next.variant; }
+      } else if (event.target === episodeSignal && event.type === 'animationend' && event.animationName === 'wv-episode-boundary' && root.dataset.episode !== 'work') {
+        director.finish(); root.dataset.episode = 'work'; syncMotion();
+      }
+    }
     function setMotionEnabled(enabled) { if (destroyed) return; motionEnabled = !!enabled; syncMotion(); }
     function toggleMotion() { setMotionEnabled(!motionEnabled); }
-    function setVisible(shown) { if (destroyed) return; visible = !!shown; root.hidden = !visible; syncMotion(); }
+    function setVisible(shown) {
+      if (destroyed) return;
+      visible = !!shown; root.dataset.visible = String(visible); root.inert = !visible;
+      root.setAttribute('aria-hidden', String(!visible)); syncMotion();
+    }
     control.addEventListener('click', toggleMotion);
+    art.addEventListener('animationiteration', boundary);
+    art.addEventListener('animationend', boundary);
     document.addEventListener('visibilitychange', syncMotion);
     if (media?.addEventListener) media.addEventListener('change', syncMotion);
     else if (media?.addListener) media.addListener(syncMotion);
@@ -277,6 +381,7 @@ window.WaitingVisuals = (() => {
     update(initialSnapshot);
     return Object.freeze({
       element: root, update, setVisible, setMotionEnabled,
+      inspect: () => director?.inspect(),
       destroy() {
         if (destroyed) return;
         destroyed = true;
@@ -286,9 +391,11 @@ window.WaitingVisuals = (() => {
         if (media?.removeEventListener) media.removeEventListener('change', syncMotion);
         else if (media?.removeListener) media.removeListener(syncMotion);
         control.removeEventListener('click', toggleMotion);
+        art.removeEventListener('animationiteration', boundary);
+        art.removeEventListener('animationend', boundary);
         root.remove();
       }
     });
   }
-  return Object.freeze({ derive, mount });
+  return Object.freeze({ derive, mount, repertoire, adapters, createDirector });
 })();

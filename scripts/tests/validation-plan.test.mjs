@@ -34,6 +34,7 @@ test('context menus and semantic waits retain their dedicated browser pilots', (
     ['frontend/context-menu.js', 'test-context-menu.mjs'],
     ['frontend/command-palette.js', 'test-context-menu.mjs'],
     ['frontend/waiting-visuals.css', 'test-waiting-visuals.mjs'],
+    ['frontend/waiting-visuals.js', 'test-waiting-reactions.mjs'],
     ['frontend/waiting-progress.js', 'test-waiting-visuals.mjs'],
     ['frontend/tasks.js', 'test-waiting-visuals.mjs'],
   ]) {
