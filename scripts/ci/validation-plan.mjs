@@ -11,7 +11,7 @@ export const fullPreview = [
   'test-explorer-timeline.mjs', 'test-field-transform.mjs', 'test-exclusion-archive.mjs',
   'test-case-references.mjs', 'test-canonical-field-actions.mjs', 'test-java-trace.mjs',
   'test-native-case-startup.mjs', 'test-native-case-timeline.mjs',
-  'test-context-menu.mjs', 'test-waiting-visuals.mjs', 'test-toast-feedback.mjs', 'test-record-actions.mjs',
+  'test-context-menu.mjs', 'test-waiting-visuals.mjs', 'test-toast-feedback.mjs', 'test-record-actions.mjs', 'test-export-scope.mjs',
 ];
 export const essentialPreview = [
   'test-navigation.mjs', 'test-responsiveness.mjs', 'test-updates.mjs',
@@ -25,7 +25,7 @@ const affected = [
   [/^frontend\/(?:java-trace)/, ['test-java-trace.mjs']],
   [/^frontend\/(?:journeys|case-trails|threats|security|participants-ui)/, ['test-journeys.mjs']],
   [/^frontend\/remote-sources/, ['test-remote-sources.mjs']],
-  [/^frontend\/workspace/, ['test-workspace-context.mjs']],
+  [/^frontend\/workspace/, ['test-workspace-context.mjs', 'test-export-scope.mjs']],
   [/^frontend\/(?:ui-scale|styles|index\.html)/, ['test-ui-scale.mjs']],
   [/^frontend\/(?:context-menu|command-palette)/, ['test-navigation.mjs', 'test-context-menu.mjs']],
   [/^frontend\/(?:waiting-|tasks)/, ['test-responsiveness.mjs', 'test-waiting-visuals.mjs']],

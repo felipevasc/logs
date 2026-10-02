@@ -569,7 +569,27 @@
     }
     return `# ${c?.name || "Investigação"}\n\n${synthesisMarkdown(c)}${(c?.items || []).map(it => `## ${it.label}\n\n${Object.values(CaseContent.narrative(it)).filter(Boolean).join("\n\n")}\n\n${window.EvidenceUI?.redact(window.EvidenceUI.report(it)) || ""}\n\n${it.rows?.length || 0} eventos preservados.\n\n${(it.rows || []).map(e => `- ${fmtTsFull(e.timestamp)} · ${e.source} · ${e.message.replaceAll("\n", " ")}\n  Referência: ${e.event_ref || e.id}`).join("\n")}\n\nFiltros: ${JSON.stringify(it.sourceFilters || [])}`).join("\n\n")}`;
   }
-  function openExport() { $("#ws-export-modal").hidden = false; $("#ws-export-kind").focus(); $("#ws-export-kind").dispatchEvent(new Event("change")); $("#ws-export-scope").textContent = `${currentCountLabel("eventos")} no recorte atual. A exportação de eventos inclui todos os resultados.`; }
+  function renderExportScope() {
+    const kind = $("#ws-export-kind").value, c = activeCase(), scope = $("#ws-export-scope");
+    const wholeCase = ["case", "case-pdf", "report"].includes(kind);
+    scope.textContent = wholeCase
+      ? !c ? "Nenhum Caso selecionado." : `${c.kind === "preserved_case_unavailable" ? "Caso preservado" : "Caso completo"} · ${Array.isArray(c.items) ? `${fmtNum(c.items.length)} itens` : "quantidade de itens indisponível"}. Os filtros do Explorar não se aplicam.`
+      : `Recorte atual ${workspaceScope() === "case" ? "do Caso" : "da Análise"} · ${currentCountLabel("registros")}.`;
+    let help = $("#ws-export-help");
+    if (!help) { help = el("p", "muted small"); help.id = "ws-export-help"; scope.after(help); $("#ws-export-kind").setAttribute("aria-describedby", "ws-export-scope ws-export-help"); }
+    if (kind === "case") {
+      const json = window.CaseEvidence?.active === true ? "JSON recusa Casos com referências ou histórico de exclusões." : "JSON legado não transporta os arquivos das referências e recusa histórico de exclusões.";
+      help.textContent = `LICASE com evidências, configuração, imagens, referências e histórico de exclusões. ${json} A exportação integral com referências originais ou proveniência de exclusões é recusada quando a ocultação de textos está marcada. Imagens não recebem ocultação.`;
+    } else if (kind === "case-pdf") {
+      help.textContent = "PDF com cronologia, trilhas, explicações e imagens. O próximo passo abre a geração do relatório, com proteção de textos própria.";
+    } else if (kind === "report") {
+      help.textContent = `Markdown com textos dos itens e ${window.CaseEvidence?.active === true ? "cronologia preservada" : "registros preservados"}, sem imagens.`;
+    } else {
+      help.textContent = `${kind.toUpperCase()} com todos os resultados dos filtros, além da página visível.`;
+    }
+    $("#ws-mask").closest("label").hidden = kind === "case-pdf";
+  }
+  function openExport() { renderExportScope(); $("#ws-export-modal").hidden = false; $("#ws-export-kind").focus(); }
   async function exportFile() {
     const kind = $("#ws-export-kind").value, mask = $("#ws-mask").checked;
     if (window.CaseEvidence?.active === true && kind === "case") {
@@ -633,7 +653,7 @@
   $("#ws-reload").onclick = async () => { cacheKey = ""; timeline.invalidate(); window.Security?.invalidate(); await showPage(page); };
   $("#ws-clear-scope").onclick = () => { state.filters = []; state.quick = ""; setQuickSearchDraft(); state.page = 0; renderChips(); syncCurrentSavedFilter(); refresh().then(() => showPage(page)); };
   $("#ws-export").onclick = openExport; $("#ws-export-close").onclick = () => { $("#ws-export-modal").hidden = true; }; $("#ws-export-save").onclick = exportFile;
-  $("#ws-export-kind").onchange = () => { const wholeCase=["case", "case-pdf", "report"].includes($("#ws-export-kind").value);$("#ws-export-scope").textContent=wholeCase?`Caso completo · ${fmtNum(activeCase()?.items?.length||0)} itens. Imagens acompanham a investigação JSON e o relatório PDF.`:`${currentCountLabel("registros")} no recorte atual.`;$("#ws-mask").closest("label").hidden=$("#ws-export-kind").value==="case-pdf"; };
+  $("#ws-export-kind").onchange = renderExportScope;
   $("#ws-export-modal").onclick = e => { if (e.target.id === "ws-export-modal") e.target.hidden = true; };
   $("#btn-load").onclick = async () => { if (await loadData()) await showPage("summary"); };
   $("#btn-merge").onclick = async () => { if (await loadData(null, { merge: true })) await showPage("summary"); };
