@@ -82,9 +82,41 @@ window.WaitingVisuals = (() => {
 
   // Only these constant SVG strings enter innerHTML. All receipt text uses textContent.
   // No external assets, SVG IDs, clip paths or filters: scenes can coexist safely.
-  const helper = `<g class="wv-helper"><rect x="139" y="35" width="15" height="13" rx="4"/><path class="wv-visor" d="M144 40h5"/><path d="M143 49v6m7-6v6m-10 0h5m3 0h5"/><path class="wv-arm" d="m138 44-8 5-5-2"/></g>`;
-  const rail = `<path class="wv-rail" d="M32 78h128M38 75v3m116-3v3"/>`;
   const readerSheet = `<rect class="wv-reader-paper" x="90" y="34" width="18" height="28" rx="2"/><path class="wv-reader-paper-lines" d="M102 34v6h6m-13 5h8m-8 4h6m-6 4h8"/>`;
+  // The approved robot silhouette, scoped away from reading's fixed choreography.
+  // held is always constant artwork and remains a direct child of the articulated hand.
+  const taskRobot = (held = '') => `      <g class="wv-task">
+        <g class="wv-task-leg-back"><path class="wv-task-limb" d="M61 61v13.5"/>
+          <g class="wv-task-knee-back"><path class="wv-task-limb" d="M61 74.5V88"/><circle class="wv-task-joint" cx="61" cy="74.5" r="1.6"/>
+            <g class="wv-task-foot-back"><path class="wv-task-boot" d="M58 86h5l4 2v2h-10v-2Z"/></g>
+          </g>
+        </g>
+        <g class="wv-task-leg-front"><path class="wv-task-limb" d="M68 61v13.5"/>
+          <g class="wv-task-knee-front"><path class="wv-task-limb" d="M68 74.5V88"/><circle class="wv-task-joint" cx="68" cy="74.5" r="1.6"/>
+            <g class="wv-task-foot-front"><path class="wv-task-boot" d="M65 86h5l4 2v2h-10v-2Z"/></g>
+          </g>
+        </g>
+        <g class="wv-task-body">
+          <g class="wv-task-arm-back"><path class="wv-task-limb" d="m56 51-7 9 5 5"/><circle class="wv-task-palm" cx="54" cy="65" r="2.5"/></g>
+          <path class="wv-task-shell" d="M59 47h10l6 7-3 10H57l-4-10Z"/>
+          <path class="wv-task-seam" d="M59 59h10m-7-10v3h5v-3"/>
+          <g class="wv-task-head"><path class="wv-task-neck" d="M61 45v5h7v-5"/>
+            <rect class="wv-task-shell" x="50" y="23" width="28" height="24" rx="7"/>
+            <path class="wv-task-ear" d="M48 32v6m32-6v6"/>
+            <rect class="wv-task-visor-bed" x="55" y="29" width="18" height="12" rx="5"/>
+            <g class="wv-task-gaze"><path class="wv-task-visor" d="M59 35h10"/><path class="wv-task-smile" d="m59 34 3 2h4l3-2"/></g>
+            <path class="wv-task-brow" d="M57 26h7"/>
+          </g>
+          <g class="wv-task-arm"><path class="wv-task-limb" d="m72 52 10 6"/><circle class="wv-task-joint" cx="72" cy="52" r="2"/>
+            <g class="wv-task-hand">${held}
+              <path class="wv-task-limb" d="m82 58 9-3"/><circle class="wv-task-joint" cx="82" cy="58" r="1.8"/>
+              <path class="wv-task-palm" d="M90 53h3v5h-3l-2-2Z"/>
+              <path class="wv-task-fingers" d="M91 55h2"/>
+            </g>
+          </g>
+        </g>
+      </g>`;
+  const groupTile = `<rect class="wv-task-tile" x="93" y="47" width="10" height="10" rx="2.5"/><path class="wv-task-tile-mark" d="M96 50h4v4h-4Z"/>`;
   const scenes = Object.freeze({
     // The carried sheet is a child of the forearm/hand, never an independently moving prop.
     // Source/destination transforms match the hand's 18° + 30° − 48° contact pose exactly.
@@ -125,9 +157,37 @@ window.WaitingVisuals = (() => {
           </g>
         </g>
       </g>`,
-    checkpoint: `${rail}<path class="wv-guide" d="M71 27h52m-52 0v7m52-7v7"/><g class="wv-save-card"><rect x="84" y="34" width="24" height="29" rx="3"/><path d="M90 41h12m-12 6h9"/></g><g class="wv-tray"><path d="m74 58 4 13h40l4-13m-48 0h10l3 6h22l3-6h10"/><path class="wv-tray-line" d="M88 69h18"/></g>${helper}`,
-    calculation: `${rail}<g class="wv-guide"><rect x="51" y="30" width="30" height="37" rx="8"/><rect x="96" y="30" width="30" height="37" rx="8"/></g><g class="wv-point wv-point-a"><circle cx="62" cy="41" r="3"/></g><g class="wv-point wv-point-b"><circle cx="72" cy="54" r="3"/></g><g class="wv-point wv-point-c"><circle cx="106" cy="42" r="3"/></g><g class="wv-point wv-point-d"><circle cx="117" cy="54" r="3"/></g>${helper}`,
-    neutral: `<g class="wv-neutral"><rect x="77" y="32" width="38" height="34" rx="7"/><path d="M87 44h18m-18 9h11"/><circle cx="113" cy="64" r="3"/></g>`
+    checkpoint: `<path class="wv-rail" d="M39 83h132m-124-3v3m116-3v3"/>
+      <g class="wv-archive-station">
+        <path class="wv-task-machine" d="M124 38h35l5 5v33h-45V43Z"/>
+        <path class="wv-task-edge" d="m124 38 4 5h36m-36 0v31m-5 2v5m35-5v5"/>
+        <rect class="wv-task-inset" x="131" y="49" width="27" height="21" rx="2"/>
+        <g class="wv-archive-label"><rect class="wv-task-paper" x="137" y="40" width="14" height="7" rx="2"/><path class="wv-task-detail" d="M141 43.5h6"/></g>
+        <g class="wv-archive-drawer">
+          <path class="wv-task-inset" d="m114 55 8-5h32v18h-40Z"/>
+          <g class="wv-archive-folder"><path class="wv-task-folder" d="M121 52V45h10l3 3h16v18h-29Z"/><path class="wv-task-detail" d="M125 53h20m-18 4h14"/></g>
+          <path class="wv-task-machine" d="M112 54h8v16h-8Zm8 10h34v6h-34Z"/>
+          <path class="wv-task-edge" d="M123 67h25"/>
+          <path class="wv-archive-handle" d="M112 57h-3v4h3"/>
+        </g>
+      </g>
+      <g class="wv-archive-actor" transform="translate(20 0)">${taskRobot()}</g>`,
+    calculation: `<path class="wv-rail" d="M39 83h132m-124-3v3m116-3v3"/>
+      <g class="wv-group-station">
+        <path class="wv-task-machine" d="M114 68h51l-3 5h-45Zm5 5v8m39-8v8"/>
+        <path class="wv-task-inset" d="M118 30h44v31h-44Z"/>
+        <path class="wv-task-edge" d="M120 58h40m-20-26v23"/>
+        <rect class="wv-task-paper" x="120" y="33" width="10" height="6" rx="2"/><path class="wv-task-detail" d="M124 35h2v2h-2Z"/>
+        <rect class="wv-task-paper" x="144" y="33" width="10" height="6" rx="2"/><circle class="wv-task-detail" cx="149" cy="36" r="1.3"/>
+        <rect class="wv-task-ghost" x="144" y="43" width="10" height="10" rx="2.5"/><circle class="wv-task-detail" cx="149" cy="48" r="2"/>
+        <path class="wv-task-edge" d="M113 66h16m-14-2h12"/>
+        <g class="wv-group-source" transform="matrix(1.000000000 0.000000000 -0.000000000 1.000000000 21.598036657 8.196672658)">${groupTile}</g>
+        <g class="wv-group-well"><path class="wv-task-guide" d="M121 43v12h12"/>
+          <g class="wv-group-filed" transform="matrix(1.000000000 0.000000000 -0.000000000 1.000000000 29.121431799 -3.091967925)">${groupTile}</g>
+        </g>
+      </g>
+      <g class="wv-group-actor" transform="translate(26 0)">${taskRobot(`<g class="wv-group-held">${groupTile}</g>`)}</g>`,
+    neutral: `<path class="wv-rail" d="M70 83h56"/><g class="wv-idle-actor" transform="translate(29 0)">${taskRobot()}</g>`
   });
 
   function mount(host, initialSnapshot = {}, options = {}) {

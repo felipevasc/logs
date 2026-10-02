@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 const source = readFileSync(new URL('../../frontend/waiting-visuals.js', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../../frontend/waiting-visuals.css', import.meta.url), 'utf8');
@@ -338,7 +339,7 @@ test('short inspection and long story have separate pacing and close without a j
   assert.match(css, /\.wv-reader-body\s*\{[^}]*transform:\s*rotate\(-4deg\)/, 'paused/reduced pose stays expressive');
   assert.match(css, /\[data-motion="running"\]\[data-pace="loop"\] \.wv-reader \{ animation: wv-reader-travel/);
   assert.doesNotMatch(css, /\[data-motion="running"\] \.wv-reader \{ animation:/, 'short gesture never walks');
-  assert.ok(Buffer.byteLength(source) < 16000 && Buffer.byteLength(css) < 26000, 'embedded artwork and motion stay small');
+  assert.ok(Buffer.byteLength(source) < 20000 && Buffer.byteLength(css) < 46000, 'three robot families stay below 20 KB artwork/controller and 46 KB CSS, with no assets');
 });
 
 test('two walking steps plant one foot while the other lifts, then return to the same stance', () => {
@@ -394,4 +395,155 @@ test('reading light palette has strong outline contrast and forced colors wins i
     assert.equal(system['--wv-reader-shell'], 'Canvas');
     assert.equal(system['--wv-reader-paper'], 'Canvas');
   }
+});
+
+function artFor(family) {
+  const phaseId = { checkpoint: 'metadata-checkpoint-write', calculation: 'analytics-sql', neutral: 'future-phase', reading: 'metadata-scan' }[family];
+  const f = fixture(), view = f.api.mount(f.host, receipt({ phaseId }));
+  const art = f.parts(view).art.innerHTML; view.destroy(); return art;
+}
+function parentsOf(art, child) {
+  const stack = [];
+  for (const tag of art.matchAll(/<(\/?)([a-z]+)\b([^>]*)>/g)) {
+    if (tag[1]) { stack.pop(); continue; }
+    const classes = /class="([^"]+)"/.exec(tag[3])?.[1]?.split(' ') || [];
+    if (classes.includes(child)) return stack.flat();
+    if (!tag[3].endsWith('/')) stack.push(classes);
+  }
+  assert.fail(`missing artwork ${child}`);
+}
+function taskPoint(point, time, prefix, offset) {
+  for (const [part, origin] of [['hand', [82, 58]], ['arm', [72, 52]], ['body', [65, 64]]]) {
+    point = transformPoint(point, atContact(`wv-${prefix}-${part}`, time), origin);
+  }
+  return [point[0] + offset, point[1]];
+}
+function matrixPoint(point, matrix) {
+  const [a, b, c, d, e, f] = matrix;
+  return [a * point[0] + c * point[1] + e, b * point[0] + d * point[1] + f];
+}
+
+test('archive and sorting keep the approved protagonist and direct hand/object ownership', () => {
+  for (const family of ['checkpoint', 'calculation', 'neutral']) {
+    const art = artFor(family);
+    assert.equal([...art.matchAll(/class="wv-task"/g)].length, 1, `${family}: exactly one robot`);
+    assert.match(art, /x="50" y="23" width="28" height="24" rx="7"/, 'approved head silhouette');
+    assert.match(art, /d="M59 47h10l6 7-3 10H57l-4-10Z"/, 'approved torso silhouette');
+    for (const side of ['front', 'back']) for (const joint of ['leg', 'knee', 'foot']) assert.match(art, new RegExp(`wv-task-${joint}-${side}`));
+    assert.doesNotMatch(art, /wv-helper|wv-point|wv-save-card|<text\b|\b(?:id|href)=|<image\b/, 'no old mascot, counted labels or external SVG assets');
+  }
+  const heldParents = parentsOf(artFor('calculation'), 'wv-group-held');
+  assert.equal(heldParents.at(-1), 'wv-task-hand');
+  assert.ok(heldParents.includes('wv-task-arm') && heldParents.includes('wv-task-body'));
+  assert.ok(parentsOf(artFor('checkpoint'), 'wv-archive-folder').includes('wv-archive-drawer'), 'folder is carried by the actual drawer');
+  assert.ok(parentsOf(artFor('checkpoint'), 'wv-archive-handle').includes('wv-archive-drawer'), 'handle and drawer cannot drift apart');
+  assert.doesNotMatch(artFor('neutral'), /wv-(?:archive|group)-(?:station|held|drawer)/, 'stopped robot does not continue working');
+});
+
+test('sorting transfers the same tile at both exact contact poses, including the short gesture', () => {
+  const art = artFor('calculation');
+  const matrix = target => /transform="matrix\(([^)]+)\)"/.exec(art.match(new RegExp(`<g class="wv-group-${target}"[^>]*>`))[0])[1].split(/\s+/).map(Number);
+  for (const [prefix, time, target] of [['group', 22, 'source'], ['group', 66, 'filed'], ['sort', 35, 'source']]) {
+    for (const point of [[93, 47], [103, 57], [91, 55]]) {
+      const hand = taskPoint(point, time, prefix, 26), prop = matrixPoint(point, matrix(target));
+      assert.ok(hand.every((n, i) => Math.abs(n - prop[i]) < .000001), `${prefix} ${target} at ${time}%: ${hand} = ${prop}`);
+    }
+  }
+  assert.equal(atContact('wv-group-held', 22, 'opacity'), '1');
+  assert.equal(atContact('wv-group-held', 66, 'opacity'), '0');
+  assert.equal(atContact('wv-group-filed', 66, 'opacity'), '1');
+  assert.equal(atContact('wv-group-well', 66), 'translateY(0)', 'reaction begins after release, not before contact');
+  assert.equal(atContact('wv-sort-held', 100, 'opacity'), '1', 'short gesture ends holding the tile');
+  assert.equal(atContact('wv-sort-head', 100), 'rotate(8deg)');
+  assert.equal(atContact('wv-sort-visor', 68), 'scaleX(1)', 'short squint waits for its own inspection pose');
+  for (const name of ['wv-group-held', 'wv-sort-held']) {
+    assert.ok(animationFrames().get(name).frames.every(frame => Object.keys(frame.properties).join() === 'opacity'), 'the carried tile never moves independently of the hand');
+  }
+});
+
+test('archive fingers stay on the sliding handle throughout each pull and push, not only key poses', () => {
+  const frames = animationFrames();
+  function interpolated(name, time) {
+    const values = frames.get(name).frames.filter(f => f.properties.transform);
+    const before = values.filter(f => f.time <= time).at(-1), after = values.find(f => f.time >= time);
+    const a = before.properties.transform, b = after.properties.transform;
+    const start = [...a.matchAll(/-?\d*\.?\d+/g)].map(m => +m[0]), end = [...b.matchAll(/-?\d*\.?\d+/g)].map(m => +m[0]);
+    const t = before.time === after.time ? 0 : (time - before.time) / (after.time - before.time);
+    let i = 0; return a.replace(/-?\d*\.?\d+/g, () => String(start[i] + (end[i] - start[i++]) * t));
+  }
+  for (const [prefix, first, last, open, distance] of [['archive', 18, 64, 32, -10], ['peek', 24, 76, 45, -3]]) {
+    for (let t = first; t <= last; t += .25) {
+      let hand = [91, 55];
+      for (const [part, origin] of [['hand', [82, 58]], ['arm', [72, 52]], ['body', [65, 64]]]) {
+        hand = transformPoint(hand, interpolated(`wv-${prefix}-${part}`, t), origin);
+      }
+      hand[0] += 20;
+      const handle = transformPoint([110, 59], interpolated(`wv-${prefix}-drawer`, t));
+      assert.ok(Math.hypot(hand[0] - handle[0], hand[1] - handle[1]) < .06, `${prefix} has subpixel grip at ${t}%: ${hand} / ${handle}`);
+    }
+    assert.equal(parseFloat(/\(([^)]+)/.exec(atContact(`wv-${prefix}-drawer`, open))[1]), distance);
+    for (const part of ['body', 'arm', 'hand']) assert.match(css, new RegExp(`animation: wv-${prefix}-${part}[^;]+ linear `), 'coupled joints and drawer use the same timing curve');
+  }
+  assert.equal(atContact('wv-archive-label', 64), 'rotate(0deg)', 'label only reacts once the drawer arrives');
+});
+
+test('task loops close smoothly, short stories are distinct, and all static states are complete', () => {
+  for (const [name, { frames }] of animationFrames()) {
+    if (/^wv-(archive|group)-/.test(name)) assert.deepEqual(frames[0].properties, frames.at(-1).properties, `${name} closes continuously`);
+  }
+  assert.match(css, /--wv-task-cycle: 2\.8s/); assert.match(css, /--wv-task-cycle: 6\.8s/);
+  assert.match(css, /--wv-task-cycle: 2\.6s/); assert.match(css, /--wv-task-cycle: 6\.4s/);
+  assert.match(css, /\[data-family="checkpoint"\]\[data-motion="running"\] \.wv-task-arm \{ animation: wv-peek-arm/);
+  assert.match(css, /\[data-family="calculation"\]\[data-motion="running"\] \.wv-task-arm \{ animation: wv-sort-arm/);
+  assert.doesNotMatch(css, /\[data-family="neutral"\][^{]*\{[^}]*animation:/);
+  for (const phaseId of ['metadata-checkpoint-write', 'analytics-sql']) {
+    const f = fixture({ reduced: true }), view = f.api.mount(f.host, receipt({ phaseId, elapsedMs: 8000 }));
+    f.observers[0].deliver(true);
+    assert.equal(view.element.dataset.motion, 'static'); assert.equal(f.parts(view).control.hidden, true);
+    assert.match(f.parts(view).art.innerHTML, /wv-task-head/);
+    for (const state of ['cancelling', 'cancelled', 'error', 'paused', 'completed']) {
+      view.update(receipt({ phaseId, state }));
+      assert.equal(view.element.dataset.family, 'neutral'); assert.equal(view.element.dataset.motion, 'static');
+      assert.doesNotMatch(f.parts(view).art.innerHTML, /wv-archive-drawer|wv-group-held/);
+    }
+    view.destroy();
+  }
+  const f = fixture(), partial = f.api.mount(f.host, receipt({ phaseId: 'metadata-checkpoint-committed', completed: 100, total: 100 }));
+  f.observers[0].deliver(true);
+  assert.equal(partial.element.dataset.motion, 'static'); assert.equal(partial.element.dataset.checkpoint, 'preserved');
+  assert.doesNotMatch(f.parts(partial).art.innerHTML, /lock|checkmark|success|badge/i); partial.destroy();
+});
+
+test('new stages retain high-contrast light/dark palettes, compact dimensions and forced colors', () => {
+  const selector = '.waiting-visual:is([data-family="checkpoint"], [data-family="calculation"], [data-family="neutral"])';
+  function properties(marker, start = 0) {
+    const index = css.indexOf(marker, start); assert.ok(index >= 0);
+    const body = css.slice(css.indexOf('{', index) + 1, css.indexOf('}', index));
+    return Object.fromEntries([...body.matchAll(/(--[\w-]+):\s*([^;]+);/g)].map(m => [m[1], m[2].trim()]));
+  }
+  function luminance(hex) {
+    const rgb = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255).map(c => c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4);
+    return rgb[0] * .2126 + rgb[1] * .7152 + rgb[2] * .0722;
+  }
+  for (const [marker, surface] of [[selector, '#0d1117'], [`html[data-theme="light"] ${selector}`, '#ffffff']]) {
+    const palette = properties(marker);
+    for (const background of [surface, palette['--wv-task-shell'], palette['--wv-task-paper']]) {
+      const l = [luminance(palette['--wv-accent']), luminance(background)].sort((a, b) => b - a);
+      assert.ok((l[0] + .05) / (l[1] + .05) >= 4.5, `robot and machine outline contrasts with ${background}`);
+    }
+    const forced = properties(marker, css.indexOf('@media (forced-colors: active)'));
+    assert.equal(forced['--wv-accent'], 'CanvasText'); assert.equal(forced['--wv-task-shell'], 'Canvas'); assert.equal(forced['--wv-task-paper'], 'Canvas');
+  }
+  const dimensions = css.slice(css.indexOf(`${selector} .wv-art`)).split('}')[0];
+  assert.match(dimensions, /240px/); assert.match(dimensions, /block-size: 120px/);
+  assert.doesNotMatch(css, /wv-(?:group|archive)[^{]*\{[^}]*animation[^;]*(?:filter|blur|shadow)/);
+});
+
+test('expanding art leaves the approved reading scene, choreography and receipt/controller code unchanged', () => {
+  const hash = value => createHash('sha256').update(value).digest('hex');
+  assert.equal(hash(source.slice(source.indexOf('    reading:'), source.indexOf('    checkpoint:'))), '24e668b03de07c74936eb5bd679000caebd4e4c8ee704a683caefd9a66b5185e');
+  assert.equal(hash(source.slice(source.indexOf('  const PHASES'), source.indexOf('  // Only these constant'))), 'a5e380b9fae154693fa42d3c63c06bc7196f5cea1cca719bec22448356012fce');
+  assert.equal(hash(source.slice(source.indexOf('  function mount('))), '7d79ee8914d95621609a892f70d149c24cedae5d7222bf5728612c8fa1300686');
+  assert.equal(hash(css.slice(css.indexOf('/* Reading pilot:'), css.indexOf('/* Same protagonist,'))), '9a695f3a6e19798186cd55a3932434d81d9fca4f8cbe97610c5f0d4b95fcdc43');
+  assert.doesNotMatch(source, /\b(?:invoke|listen|emit|fetch|setTimeout|setInterval|requestAnimationFrame)\s*\(/, 'no IPC, transport, timer or animation controller was introduced');
 });
