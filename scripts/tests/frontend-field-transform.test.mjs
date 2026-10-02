@@ -34,10 +34,11 @@ function fixture({ definitions = [], event = { id: 7, message: 'original message
       append(...items) { for (const child of items) { child.parent = this; this.children.push(child); if (this.tag === 'select' && this.children.length === 1) this.value = child.value; } },
       replaceChildren(...items) { this.children = []; this.append(...items); },
       querySelector(selector) { return nodes.get(selector) || null; },
-      querySelectorAll() { return [...nodes.values()].filter(value => ['button', 'input', 'select', 'textarea'].includes(value.tag)); },
+      querySelectorAll(selector) { return [...nodes.values()].filter(value => value.matches(selector)); },
       addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); },
       closest(selector) { let current = this; while (current) { if (selector.includes('[hidden]') && current.hidden) return current; current = current.parent; } return null; },
       matches(selector) { return selector.split(',').some(part => part === this.tag
+        || part === '[tabindex="0"]' && this.attrs.tabindex === '0'
         || part === '[tabindex]' && Object.hasOwn(this.attrs, 'tabindex')
         || part === 'a[href]' && this.tag === 'a' && Object.hasOwn(this.attrs, 'href')); },
       focus() { document.activeElement = this; },
@@ -45,6 +46,7 @@ function fixture({ definitions = [], event = { id: 7, message: 'original message
         this.children = [];
         for (const match of html.matchAll(/<(\w+)\b([^>]*\bid="([^"]+)"[^>]*)>/g)) {
           const child = node(match[1]); child.id = match[3]; child.hidden = /\bhidden\b/.test(match[2]);
+          for (const attribute of match[2].matchAll(/\b(role|aria-live|tabindex)="([^"]*)"/g)) child.setAttribute(attribute[1], attribute[2]);
           nodes.set(`#${child.id}`, child); this.append(child);
         }
       },
@@ -399,10 +401,42 @@ test('a failed native save keeps the draft open and a retry performs the save on
   assert.equal(f.field('name').value, 'retry_name');
   assert.equal(f.field('step-count').textContent, '1 / 8');
   assert.equal(f.field('save').disabled, false);
+  assert.equal(f.field('cancel').textContent, 'Cancelar');
+  assert.equal(f.field('close-note').hidden, true);
   assert.match(f.field('status').textContent, /disk unavailable/);
   await f.editor.save();
   assert.equal(attempts, 2);
   assert.equal(f.overlay.hidden, true);
+});
+
+test('Close during a pending save preserves the mutation and cannot dismiss a newer editor', async () => {
+  const f = fixture(), gate = deferred(); f.editor.open('payload'); f.add('base64_decode');
+  f.setNative(async (cmd, args) => { assert.equal(cmd, 'save_derived_field'); await gate.promise; return f.commit(args); });
+  const pending = f.editor.save(); await settle();
+  assert.equal(f.field('cancel').textContent, 'Fechar'); assert.equal(f.field('cancel').disabled, false);
+  assert.equal(f.field('close-note').hidden, false); assert.equal(f.field('save').disabled, true);
+  f.field('cancel').onclick(); f.editor.open('message');
+  assert.equal(f.field('cancel').textContent, 'Cancelar'); assert.equal(f.field('close-note').hidden, true);
+  gate.resolve(); await pending;
+  assert.equal(f.nativeDefinitions.has('payload_transformado'), true, 'Close does not roll back the pending save');
+  assert.equal(f.overlay.hidden, false); assert.equal(f.field('name').value, 'message_transformado');
+  assert.equal(f.field('status').textContent, ''); assert.equal(f.field('save').disabled, false);
+  assert.ok(f.cancelled.every(key => key === 'field-transform-preview'));
+  assert.equal(f.calls.filter(call => call.cmd === 'save_derived_field').length, 1);
+});
+
+test('non-empty transform status joins the keyboard trap without stealing focus or removing the live region', async () => {
+  const f = fixture(); f.editor.open('payload'); const status = f.field('status'), anchor = f.document.activeElement;
+  assert.equal(status.attrs.tabindex, '-1'); assert.equal(status.attrs.role, 'status'); assert.equal(status.attrs['aria-live'], 'polite');
+  f.setNative(async () => { throw Error('Long error '.repeat(100)); }); await f.editor.preview();
+  assert.equal(status.attrs.tabindex, '0'); assert.equal(f.document.activeElement, anchor);
+  assert.equal(status.hidden, false); assert.equal(status.attrs.role, 'status'); assert.equal(status.attrs['aria-live'], 'polite');
+  f.field('cancel').hidden = f.field('save').hidden = true; status.focus();
+  const keydown = f.overlay.listeners.keydown[0], tab = shiftKey => ({ key: 'Tab', shiftKey, preventDefault() {} });
+  keydown(tab(false)); assert.equal(f.document.activeElement, f.field('close'));
+  keydown(tab(true)); assert.equal(f.document.activeElement, status, 'the trap includes the scrollable status');
+  f.field('sample').oninput(); assert.equal(status.attrs.tabindex, '-1'); assert.equal(status.hidden, false);
+  f.field('close').focus(); keydown(tab(true)); assert.equal(f.document.activeElement, f.field('preview'), 'the empty region leaves the Tab order');
 });
 
 test('after a committed save, catalog/profile/view failure preserves the draft and retry never re-saves', async () => {

@@ -14,6 +14,24 @@ const settled=async()=>{
 };
 const addStep=async value=>{await page.locator('#ft-step-choice').selectOption(value);await page.locator('#ft-add-step').click();};
 const openHeader=async()=>{await page.locator('#events-table th').filter({hasText:'mock_payload_b64'}).click({button:'right'});await page.getByRole('menuitem',{name:'Transformar campo',exact:true}).click();};
+// Run in real CI browser geometry; this covers form reflow rather than native WebView zoom.
+const dialogLayout=async()=>{
+  const layout=await page.locator('.field-transform-modal').evaluate(modal=>{
+    const body=modal.querySelector('.modal-body'),footer=modal.querySelector('.ft-footer'),bounds=modal.getBoundingClientRect();
+    body.scrollTop=0;const before=footer.getBoundingClientRect().top;body.scrollTop=body.scrollHeight;
+    const after=footer.getBoundingClientRect(),controls=[...footer.querySelectorAll('button')];
+    return{width:innerWidth,inViewport:bounds.left>=0&&bounds.right<=innerWidth&&bounds.top>=0&&bounds.bottom<=innerHeight,
+      bodyWidth:body.clientWidth,bodyScrollWidth:body.scrollWidth,bodyBottom:body.getBoundingClientRect().bottom,footerTop:after.top,footerShift:after.top-before,
+      statusOutsideBody:!body.contains(document.querySelector('#ft-status')),actionsOutsideBody:controls.every(button=>!body.contains(button)),
+      controls:controls.map(button=>{const rect=button.getBoundingClientRect();return{id:button.id,height:rect.height,fontSize:parseFloat(getComputedStyle(button).fontSize),reachable:rect.left>=0&&rect.right<=innerWidth&&rect.top>=0&&rect.bottom<=innerHeight&&button.contains(document.elementFromPoint(rect.x+rect.width/2,rect.y+rect.height/2))};})};
+  });
+  assert.equal(layout.inViewport,true);assert.ok(layout.bodyScrollWidth<=layout.bodyWidth+1,`transform form overflows at ${layout.width}px`);
+  assert.ok(layout.bodyBottom<=layout.footerTop+1);assert.equal(layout.footerShift,0);assert.equal(layout.statusOutsideBody,true);assert.equal(layout.actionsOutsideBody,true);
+  for(const control of layout.controls){assert.equal(control.reachable,true,`${control.id} remains reachable at ${layout.width}px`);assert.ok(control.height>=30);assert.ok(control.fontSize>=12);}
+  await page.locator('#ft-save').focus();await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>document.activeElement.id),'ft-close');
+  await page.keyboard.press('Shift+Tab');assert.equal(await page.evaluate(()=>document.activeElement.id),'ft-save');
+  return layout;
+};
 const readablePreview=async()=>{
   const values=await page.locator('#ft-original,#ft-output').evaluateAll(nodes=>{
     const luminance=color=>{
@@ -95,6 +113,28 @@ try{
   await page.waitForFunction(()=>document.querySelector('#ft-result-type').textContent==='Objeto');assert.match(await page.locator('#ft-jwt-warning').textContent(),/assinatura não foi verificada/);
   await page.locator('#ft-sample').fill('invalid-token');await page.locator('#ft-preview').click();await page.waitForFunction(()=>document.querySelector('#ft-status').classList.contains('ft-error'));
   assert.ok(await page.locator('#field-transform-modal').isVisible());assert.equal(await page.locator('#ft-sample').inputValue(),'invalid-token');
+  results.compactDialogs=[];
+  for(const width of [1024,640,320]){
+    await page.setViewportSize({width,height:640});results.compactDialogs.push(await dialogLayout());
+    assert.equal(await page.locator('#ft-sample').inputValue(),'invalid-token');assert.equal(await page.locator('#ft-jwt-warning').isVisible(),true);
+    assert.equal(await page.locator('.field-transform-modal .modal-body p').filter({hasText:'Até 8 etapas'}).count(),1);
+    await page.screenshot({path:resolve(output,`field-transform-actions-error-dark-${width}.png`)});
+  }
+  phase='long transform error keyboard scrolling';
+  await page.evaluate(()=>{window.__transformLongErrorApi=api;api=async(command,args,options)=>{if(command==='preview_field_transform')return new Promise((resolve,reject)=>{window.__transformLongErrorReject=()=>reject(Error('Falha de prévia recuperável. '.repeat(100)));});return window.__transformLongErrorApi(command,args,options);};});
+  await page.locator('#ft-preview').click();await page.waitForFunction(()=>typeof window.__transformLongErrorReject==='function');
+  await page.locator('#ft-cancel').focus();await page.evaluate(()=>window.__transformLongErrorReject());
+  await page.waitForFunction(()=>document.querySelector('#ft-status').textContent.includes('Falha de prévia recuperável'));
+  await page.evaluate(()=>{api=window.__transformLongErrorApi;delete window.__transformLongErrorApi;delete window.__transformLongErrorReject;});
+  assert.equal(await page.evaluate(()=>document.activeElement.id),'ft-cancel','incoming error does not steal focus');
+  results.longError=await dialogLayout();
+  await page.locator('#ft-preview').focus();await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>document.activeElement.id),'ft-status');
+  results.longError.status=await page.locator('#ft-status').evaluate(node=>({scrollable:node.scrollHeight>node.clientHeight,height:node.getBoundingClientRect().height,maxHeight:innerHeight*.2,selection:getComputedStyle(node).userSelect,tabIndex:node.tabIndex,role:node.getAttribute('role'),live:node.getAttribute('aria-live')}));
+  assert.equal(results.longError.status.scrollable,true);assert.ok(results.longError.status.height<=results.longError.status.maxHeight+1);
+  assert.equal(results.longError.status.selection,'text');assert.equal(results.longError.status.tabIndex,0);assert.equal(results.longError.status.role,'status');assert.equal(results.longError.status.live,'polite');
+  await page.keyboard.press('End');await page.waitForFunction(()=>{const node=document.querySelector('#ft-status');return node.scrollTop>0&&node.scrollTop+node.clientHeight>=node.scrollHeight-2;});
+  assert.equal(await page.evaluate(()=>document.activeElement.id),'ft-status');await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>document.activeElement.id),'ft-cancel');
+  phase='JWT warning and retry';
   await page.setViewportSize({width:1024,height:768});await page.locator('#btn-theme').evaluate(button=>button.click());
   await page.locator('#ft-sample').fill('eyJhbGciOiJub25lIn0.eyJzdWIiOiJsb2NhbCJ9.');await page.locator('#ft-preview').click();
   await page.waitForFunction(()=>document.querySelector('#ft-result-type').textContent==='Objeto');assert.match(await page.locator('#ft-output').textContent(),/local/);

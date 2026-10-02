@@ -23,8 +23,10 @@ window.FieldTransforms = (() => {
       <p id="ft-rules-note" class="notice" hidden></p><p id="ft-jwt-warning" class="notice" role="note" hidden>JWT: apenas o conteúdo é decodificado. A assinatura não foi verificada.</p>
       <div class="ft-preview-head"><button id="ft-preview" type="button" class="btn ghost">Prévia</button><span id="ft-result-type" class="muted small"></span></div>
       <pre id="ft-output" class="code-pane" aria-label="Resultado da prévia"></pre><p id="ft-notices" class="muted small"></p>
-      <p id="ft-status" class="small" role="status" aria-live="polite"></p>
       <p class="muted small">Até 8 etapas. Valores incompatíveis são sinalizados por registro; os demais registros continuam disponíveis.</p>
+    </div><div class="ft-footer">
+      <p id="ft-status" class="small" role="status" aria-live="polite" tabindex="-1"></p>
+      <p id="ft-close-note" class="muted small" hidden>Fechar não interrompe nem desfaz a operação em andamento.</p>
       <div class="modal-actions"><button id="ft-cancel" type="button" class="btn ghost">Cancelar</button><button id="ft-save" type="button" class="btn primary">Salvar campo</button></div>
     </div></section>`;
   document.body.append(overlay);
@@ -130,7 +132,7 @@ window.FieldTransforms = (() => {
   }
   const current = draft => session === draft && !overlay.hidden;
   function assertOwner(draft, revisions = true) { if (draft.owner) window.AnalysisContexts.assertOwner(draft.owner, { revisions }); }
-  function status(message, failed = false) { node("status").textContent = message; node("status").classList.toggle("ft-error", failed); }
+  function status(message, failed = false) { node("status").textContent = message; node("status").setAttribute("tabindex", message ? "0" : "-1"); node("status").classList.toggle("ft-error", failed); }
   function focusBack(anchor) {
     const target = [anchor, $("#btn-colpicker"), $("#quick-search")].find(item => item?.isConnected && !item.disabled && !item.hidden && item.matches?.("button,input,select,textarea,[tabindex],a[href]") && !item.closest?.("[hidden],[inert]"));
     target?.focus();
@@ -174,6 +176,7 @@ window.FieldTransforms = (() => {
   function busy(value) {
     if (!session) return;
     session.busy = value;
+    node("cancel").textContent = value ? "Fechar" : "Cancelar"; node("close-note").hidden = !value;
     for (const id of ["sample", "step-choice", "preview", "save"]) node(id).disabled = value;
     node("name").disabled = value || !!session.editName; renderSteps();
   }
@@ -270,7 +273,7 @@ window.FieldTransforms = (() => {
   overlay.addEventListener("keydown", event => {
     if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); return; }
     if (event.key !== "Tab") return;
-    const targets = [...overlay.querySelectorAll("button,input,select,textarea")].filter(item => !item.disabled && !item.hidden && !item.closest("[hidden]"));
+    const targets = [...overlay.querySelectorAll('button,input,select,textarea,[tabindex="0"]')].filter(item => !item.disabled && !item.hidden && !item.closest("[hidden]"));
     const first = targets[0], last = targets.at(-1);
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }

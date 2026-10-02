@@ -9,6 +9,25 @@ const browser=await launchBrowser(),page=await browser.newPage({viewport:{width:
 page.setDefaultTimeout(20000);let phase='startup';const errors=[],results={};page.on('pageerror',error=>errors.push(error.message));
 const settled=async()=>{await page.waitForFunction(()=>explorerAnalytics.get(explorerKey())?.status==='done');await page.evaluate(()=>settleFilterTabCounts());await page.waitForFunction(()=>Tasks.pending()===0);};
 const manager=async()=>{await page.locator('#btn-case-menu').click();await page.getByRole('menuitem',{name:'Referências deste Caso',exact:true}).click();await page.waitForFunction(()=>!document.querySelector('#rf-reload').disabled&&document.querySelector('#rf-status').textContent==='');};
+// Real browser geometry, run by CI. These checks cover the dialog, not full-app 320px reflow or native zoom.
+const dialogLayout=async()=>{
+  const layout=await page.locator('.case-references-modal').evaluate(modal=>{
+    const body=modal.querySelector('.modal-body'),footer=modal.querySelector('.rf-footer'),bounds=modal.getBoundingClientRect();
+    body.scrollTop=0;const before=footer.getBoundingClientRect().top;body.scrollTop=body.scrollHeight;
+    const after=footer.getBoundingClientRect(),controls=[...footer.querySelectorAll('button')].filter(button=>!button.hidden);
+    return{width:innerWidth,inViewport:bounds.left>=0&&bounds.right<=innerWidth&&bounds.top>=0&&bounds.bottom<=innerHeight,
+      bodyWidth:body.clientWidth,bodyScrollWidth:body.scrollWidth,bodyBottom:body.getBoundingClientRect().bottom,footerTop:after.top,footerShift:after.top-before,
+      statusOutsideBody:!body.contains(document.querySelector('#rf-status')),actionsOutsideBody:controls.every(button=>!body.contains(button)),
+      controls:controls.map(button=>{const rect=button.getBoundingClientRect();return{id:button.id,height:rect.height,fontSize:parseFloat(getComputedStyle(button).fontSize),reachable:rect.left>=0&&rect.right<=innerWidth&&rect.top>=0&&rect.bottom<=innerHeight&&button.contains(document.elementFromPoint(rect.x+rect.width/2,rect.y+rect.height/2))};}),
+      lastEnabled:controls.filter(button=>!button.disabled).at(-1)?.id};
+  });
+  assert.equal(layout.inViewport,true);assert.ok(layout.bodyScrollWidth<=layout.bodyWidth+1,`reference form overflows at ${layout.width}px`);
+  assert.ok(layout.bodyBottom<=layout.footerTop+1);assert.equal(layout.footerShift,0);assert.equal(layout.statusOutsideBody,true);assert.equal(layout.actionsOutsideBody,true);
+  for(const control of layout.controls){assert.equal(control.reachable,true,`${control.id} remains reachable at ${layout.width}px`);assert.ok(control.height>=30);assert.ok(control.fontSize>=12);}
+  await page.locator(`#${layout.lastEnabled}`).focus();await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>document.activeElement.id),'rf-close');
+  await page.keyboard.press('Shift+Tab');assert.equal(await page.evaluate(()=>document.activeElement.id),layout.lastEnabled);
+  return layout;
+};
 try{
   await page.goto(process.argv[2]||'http://127.0.0.1:4174');
   await page.waitForFunction(()=>window.WorkspaceContext?.ready&&!WorkspaceContext.changing&&state.loaded&&!state.loadOverlay&&document.querySelector('#load-overlay').hidden);
@@ -19,6 +38,10 @@ try{
   assert.match(await page.locator('#rf-inspection').textContent(),/5 registros/);
   await page.locator('#rf-import-name').fill('Equipes por serviço');
   for(const key of ['service','environment']){await page.locator('#rf-key-choice').selectOption(key);await page.locator('#rf-add-key').click();}
+  await page.setViewportSize({width:320,height:640});results.importCompact=await dialogLayout();
+  assert.equal(await page.locator('#rf-save-lookup').isVisible(),false);assert.equal(await page.locator('#rf-delete-lookup').isVisible(),false);
+  assert.match(await page.locator('#rf-import-pane').textContent(),/Chaves repetidas são rejeitadas; nenhum registro é escolhido arbitrariamente/);
+  await page.setViewportSize({width:1440,height:960});
   assert.equal(await page.evaluate(()=>window.__mockCommandCalls.reference_inspect),1);
   assert.equal(await page.evaluate(()=>window.__mockCommandCalls.reference_import||0),0,'form edits never import automatically');
   await page.locator('#rf-import').click();await page.waitForFunction(()=>document.querySelector('#rf-status').textContent.includes('Referência importada')&&!document.querySelector('#rf-reload').disabled);
@@ -32,6 +55,35 @@ try{
   await page.locator('#rf-value-column').selectOption('team');
   assert.equal(await page.evaluate(()=>window.__mockCommandCalls.reference_save_lookup||0),0,'mapping edits never run or save a lookup');
   await page.screenshot({path:resolve(output,'case-reference-lookup-dark-1440.png')});
+  await page.locator('#rf-value-column').selectOption('');
+  await page.locator('#rf-save-lookup').click();assert.match(await page.locator('#rf-status').textContent(),/Mapeie todas as chaves/);
+  results.compactDialogs=[];
+  for(const width of [1024,640,320]){
+    await page.setViewportSize({width,height:640});results.compactDialogs.push(await dialogLayout());
+    assert.equal(await page.locator('#rf-field-name').inputValue(),'reference_team');
+    assert.equal(await page.getByLabel('Campo do log para service',{exact:true}).inputValue(),'source');
+    assert.equal(await page.getByLabel('Campo do log para environment',{exact:true}).inputValue(),'ambiente');
+    await page.screenshot({path:resolve(output,`case-reference-actions-error-dark-${width}.png`)});
+  }
+  assert.equal(await page.locator('#rf-lookup-pane p').filter({hasText:'Os tipos são preservados'}).count(),1);
+  assert.equal(await page.locator('#rf-lookup-pane p').filter({hasText:'diferente de uma chave sem correspondência'}).count(),1);
+  await page.locator('#rf-value-column').selectOption('team');
+  phase='long lookup error keyboard scrolling';
+  await page.evaluate(()=>{window.__referenceLongErrorApi=api;api=async(command,args,options)=>{if(command==='reference_save_lookup')return new Promise((resolve,reject)=>{window.__referenceLongErrorReject=()=>reject(Error('Falha de gravação recuperável. '.repeat(100)));});return window.__referenceLongErrorApi(command,args,options);};});
+  await page.locator('#rf-save-lookup').click();await page.waitForFunction(()=>typeof window.__referenceLongErrorReject==='function');
+  await page.locator('#rf-cancel').focus();await page.evaluate(()=>window.__referenceLongErrorReject());
+  await page.waitForFunction(()=>document.querySelector('#rf-status').textContent.includes('Falha de gravação recuperável'));
+  await page.evaluate(()=>{api=window.__referenceLongErrorApi;delete window.__referenceLongErrorApi;delete window.__referenceLongErrorReject;});
+  assert.equal(await page.evaluate(()=>document.activeElement.id),'rf-cancel','incoming error does not steal focus');
+  assert.equal(await page.evaluate(()=>window.__mockCommandCalls.reference_save_lookup||0),0,'the recoverable failure has not saved the draft');
+  results.longError=await dialogLayout();
+  await page.locator('#rf-value-column').focus();await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>document.activeElement.id),'rf-status');
+  results.longError.status=await page.locator('#rf-status').evaluate(node=>({scrollable:node.scrollHeight>node.clientHeight,height:node.getBoundingClientRect().height,maxHeight:innerHeight*.2,selection:getComputedStyle(node).userSelect,tabIndex:node.tabIndex,role:node.getAttribute('role'),live:node.getAttribute('aria-live')}));
+  assert.equal(results.longError.status.scrollable,true);assert.ok(results.longError.status.height<=results.longError.status.maxHeight+1);
+  assert.equal(results.longError.status.selection,'text');assert.equal(results.longError.status.tabIndex,0);assert.equal(results.longError.status.role,'status');assert.equal(results.longError.status.live,'polite');
+  await page.keyboard.press('End');await page.waitForFunction(()=>{const node=document.querySelector('#rf-status');return node.scrollTop>0&&node.scrollTop+node.clientHeight>=node.scrollHeight-2;});
+  assert.equal(await page.evaluate(()=>document.activeElement.id),'rf-status');await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>document.activeElement.id),'rf-cancel');
+  await page.setViewportSize({width:1440,height:960});phase='save lookup after recoverable error';
   await page.locator('#rf-save-lookup').click();await page.waitForFunction(()=>document.querySelector('#case-references-modal').hidden);await settled();
   assert.equal(await page.evaluate(()=>state.total),baseline,'lookup does not multiply rows');
   results.lookup=await page.evaluate(()=>{const row=state.rows.find(row=>Object.hasOwn(row.fields||{},'reference_team'));return{source:row?.source,value:row?.fields.reference_team,definition:state.derivedFields.find(field=>field.name==='reference_team')};});
@@ -110,7 +162,9 @@ try{
   await page.locator('#rf-close').click();await page.locator('#explore-tree').getByTitle('Editar campo reference_team',{exact:true}).click();
   await page.waitForFunction(()=>document.querySelector('#rf-availability').textContent.includes('indisponível')&&!document.querySelector('#rf-delete-lookup').disabled);
   assert.equal(await page.locator('#rf-field-name').inputValue(),'reference_team');assert.equal(await page.locator('#rf-save-lookup').isDisabled(),true);
+  await page.setViewportSize({width:320,height:640});results.unavailableEditCompact=await dialogLayout();
   phase='remove dependent field then descriptor';await page.locator('#rf-delete-lookup').click();await page.waitForFunction(()=>document.querySelector('#case-references-modal').hidden);await settled();
+  await page.setViewportSize({width:1024,height:768});
   assert.equal(await page.evaluate(()=>state.derivedFields.some(field=>field.name==='reference_team')),false);assert.equal(await page.evaluate(()=>AnalysisContexts.context().config.references.length),1);
   await manager();assert.equal(await page.getByRole('button',{name:'Remover referência do Caso',exact:true}).isDisabled(),false);
   await page.getByRole('button',{name:'Remover referência do Caso',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#rf-status').textContent.includes('Referência removida')&&!document.querySelector('#rf-reload').disabled);
