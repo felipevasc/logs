@@ -108,7 +108,14 @@ try {
     await page.locator('#ws-export-save').click();
     await page.waitForFunction(() => !document.querySelector('#ws-export-save').disabled && __exportTest.calls.length === 1);
     assert.equal(await modal.isVisible(), true); assert.equal(await mask.isChecked(), true); assert.equal(await select.inputValue(), 'case');
-    assert.match(await page.locator('#toast-area').innerText(), /EXPORT_TEST_REFUSAL/);
+    // Error feedback owns a separate lane from Undo. Its live-region text is
+    // filled on the next animation frame, after the export button is restored.
+    const refusalText = 'EXPORT_TEST_REFUSAL: preserved target; retry available';
+    const refusal = page.getByRole('alert').filter({ hasText: refusalText });
+    await refusal.waitFor({ state: 'visible' });
+    assert.equal(await refusal.count(), 1);
+    const refusalEvidence = { text: await refusal.innerText(), role: await refusal.getAttribute('role'), lane: await refusal.evaluate(node => node.parentElement.id), visible: await refusal.isVisible() };
+    assert.deepEqual(refusalEvidence, { text: refusalText, role: 'alert', lane: 'toast-feedback-area', visible: true });
     // Legacy capture is allowed to refresh view preferences; preserve the
     // authored Case texts/items and filter draft across the failed transfer.
     const after = await page.evaluate(() => ({ draft: structuredClone(activeCase()), filters: structuredClone(state.filters) }));
@@ -152,7 +159,7 @@ try {
         await page.screenshot({ path: resolve(output, `export-scope-${mode}-${theme}-${width}.png`) }); layouts.push(layout);
       }
     }
-    assert.deepEqual(errors, []); results.modes[mode] = { retainedFormats: formats, scopeAndCounts: true, maskPreferenceRetained: true, cancelAndRetry: true, dispatch: nativeCase ? 'case_export_native' : 'export_investigation', pdfHandoff: true, keyboardTrap: true, layouts, errors };
+    assert.deepEqual(errors, []); results.modes[mode] = { retainedFormats: formats, scopeAndCounts: true, maskPreferenceRetained: true, cancelAndRetry: true, refusal: refusalEvidence, dispatch: nativeCase ? 'case_export_native' : 'export_investigation', pdfHandoff: true, keyboardTrap: true, layouts, errors };
     await page.close(); page = null;
   }
   writeFileSync(resolve(output, 'export-scope-results.json'), JSON.stringify(results, null, 2));

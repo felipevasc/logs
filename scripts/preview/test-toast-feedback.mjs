@@ -195,15 +195,24 @@ try {
       prepare: async ({ request }) => {
         f.calls.push(structuredClone(request)); const before = request.reference;
         const count = request.action.kind === 'remove' ? before.memberCount - request.action.members.length : request.action.target.memberCount;
-        return { reference: { ...before, kind: 'pending_native_evidence', manifestId: `prepared-${++f.sequence}`, token: `token-${f.sequence}`, memberCount: count },
-          undo: before, changedCount: Math.abs(before.memberCount - count), remainingCount: count };
+        const sequence = ++f.sequence;
+        const reference = { ...before, kind: 'pending_native_evidence', manifestId: `prepared-${sequence}`, token: `token-${sequence}`,
+          requestId: `toast-request-${sequence}`, memberCount: count, bytes: 128, expiresAt: '2099-01-01T00:00:00Z',
+          purpose: before.kind === 'pending_native_evidence' ? structuredClone(before.purpose)
+            : { kind: 'replace_container', baseManifestId: before.manifestId, baseManifestSha256: before.manifestSha256 } };
+        // Real state listeners inspect pending descriptors too, especially after
+        // a lost acknowledgement. The synthetic transport must honor that schema.
+        CaseEvidence.validate.pendingReference(reference);
+        return { reference, undo: before, changedCount: Math.abs(before.memberCount - count), remainingCount: count };
       }, discard: async () => true };
     const actions = CaseEvidenceActions.create({ client, session: { status: () => f.status }, getStore: () => store, currentCase: () => f.current,
       save: async () => {
         f.status = 'saving'; if (f.hold) await new Promise(resolve => { f.release = resolve; });
         if (f.fail) { f.status = 'retry_required'; document.dispatchEvent(new CustomEvent('case-evidence-state')); return false; }
         for (const item of c.items) if (item.rows.reference.kind === 'pending_native_evidence') {
-          const reference = { ...item.rows.reference, kind: 'native_evidence' }; delete reference.token; item.rows = view(reference);
+          const { token, requestId, bytes, expiresAt, purpose, ...committed } = item.rows.reference;
+          const reference = { ...committed, kind: 'native_evidence' };
+          CaseEvidence.validate.reference(reference); item.rows = view(reference);
         }
         document.dispatchEvent(new CustomEvent('case-evidence-state')); f.status = 'ready'; return true;
       }, selectionOwner: () => null, selectionCurrent: () => true, scope: () => 'dataset', station: () => null });
