@@ -29,7 +29,7 @@ window.WaitingVisuals = (() => {
     'analytics-sql': 'calculation',
     // Explicit adapter IDs for genuinely pending commands, not native subphases.
     'command:aggregate_events': 'calculation', 'command:pivot': 'calculation',
-    'command:case_report_render': 'composition'
+    'command:case_report_render': 'composition', 'command:timeline_export_render': 'composition'
   });
   const STATES = Object.freeze({
     running: 'Em andamento', queued: 'Na fila', paused: 'Pausado',

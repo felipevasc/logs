@@ -551,7 +551,7 @@ test('new stages retain high-contrast light/dark palettes, compact dimensions an
 test('expanding art leaves the approved reading scene, choreography and receipt/controller code unchanged', () => {
   const hash = value => createHash('sha256').update(value).digest('hex');
   assert.equal(hash(source.slice(source.indexOf('    reading:'), source.indexOf('    checkpoint:'))), '24e668b03de07c74936eb5bd679000caebd4e4c8ee704a683caefd9a66b5185e');
-  assert.equal(hash(source.slice(source.indexOf('  const PHASES'), source.indexOf('  // Only these constant')).replace(",\n    'command:case_report_render': 'composition'", '')), 'a5e380b9fae154693fa42d3c63c06bc7196f5cea1cca719bec22448356012fce');
+  assert.equal(hash(source.slice(source.indexOf('  const PHASES'), source.indexOf('  // Only these constant')).replace(", 'command:timeline_export_render': 'composition'", '').replace(",\n    'command:case_report_render': 'composition'", '')), 'a5e380b9fae154693fa42d3c63c06bc7196f5cea1cca719bec22448356012fce');
   assert.equal(hash(source.slice(source.indexOf('  function mount('))), '7d79ee8914d95621609a892f70d149c24cedae5d7222bf5728612c8fa1300686');
   assert.equal(hash(css.slice(css.indexOf('/* Reading pilot:'), css.indexOf('/* Same protagonist,'))), '9a695f3a6e19798186cd55a3932434d81d9fca4f8cbe97610c5f0d4b95fcdc43');
   assert.doesNotMatch(source, /\b(?:invoke|listen|emit|fetch|setTimeout|setInterval|requestAnimationFrame)\s*\(/, 'no IPC, transport, timer or animation controller was introduced');

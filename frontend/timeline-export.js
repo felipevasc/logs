@@ -3,7 +3,7 @@ window.TimelineExport = (() => {
   "use strict";
   const MAX_PIXELS = 24_000_000, MAX_EDGE = 16_000, MAX_PAGES = 500, MAX_BYTES = 32 * 1024 * 1024;
   const PDF_WIDTH = 1060, PDF_BODY = 660, HEADER = 84, FOOTER = 26;
-  let libraries, embeddedFonts, dialog = null;
+  let libraries, embeddedFonts, dialog = null, waitingSerial = 0;
   const abort = signal => { if (signal?.aborted) throw new DOMException("Exportação cancelada", "AbortError"); };
   const nextFrame = () => new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
   const text = (tag, className, value) => { const node = document.createElement(tag); node.className = className; node.textContent = value; return node; };
@@ -142,7 +142,8 @@ window.TimelineExport = (() => {
     const firstChild = info.board.firstElementChild;
     if (spec.format === "png" && !png.allowed) throw new Error("A timeline é grande demais para uma única imagem sem perder legibilidade. Exporte em PDF, que divide o conteúdo em páginas.");
     if (pages.length > MAX_PAGES) throw new Error(`Esta visão excede ${MAX_PAGES} páginas. Reduza a escala horizontal ou refine o recorte e exporte novamente.`);
-    progress(0, pages.length, "Preparando fontes e desenho…");
+    // The legacy page estimate excludes note appendices. No count is final yet.
+    progress(0, pages.length, "Preparando fontes e desenho…", { label: "Preparando fontes e desenho…" });
     const fontEmbedCSS = await loadLibraries(); abort(signal); await document.fonts.ready; abort(signal);
     const current = measure(spec);
     if (current.board !== info.board || current.board.firstElementChild !== firstChild || current.width !== info.width || current.height !== info.height) throw new Error("A timeline mudou durante a preparação. Abra a exportação novamente.");
@@ -167,7 +168,10 @@ window.TimelineExport = (() => {
     }
     try {
       for (let index = 0; index < tasks.length; index++) {
-        abort(signal); progress(index, tasks.length, spec.format === "pdf" ? `Desenhando página ${index + 1} de ${tasks.length}…` : "Desenhando imagem completa…");
+        abort(signal); progress(index, tasks.length, spec.format === "pdf" ? `Desenhando página ${index + 1} de ${tasks.length}…` : "Desenhando imagem completa…", {
+          label: spec.format === "pdf" ? "Desenhando páginas…" : "Desenhando imagem completa…",
+          completed: index, total: tasks.length, unit: spec.format === "pdf" ? "páginas desenhadas" : "imagem desenhada"
+        });
         const task = tasks[index], tile = task.tile, sheet = pageNode(task.spec, task.info, task.frozen, tile, index, tasks.length);
         if (!pdf && appendix) { appendix.style.width = "100%"; appendix.prepend(text("h3", "", "Notas completas")); sheet.insertBefore(appendix, sheet.lastElementChild); }
         stage.replaceChildren(sheet); await nextFrame(); abort(signal);
@@ -185,7 +189,7 @@ window.TimelineExport = (() => {
       }
       if (pdf) blob = pdf.output("blob");
       if (!blob || blob.size > MAX_BYTES) throw new Error("O arquivo ultrapassa 32 MB. Reduza a escala ou refine o recorte e tente novamente.");
-      progress(tasks.length, tasks.length, "Arquivo pronto.");
+      progress(tasks.length, tasks.length, "Arquivo pronto.", { label: "Arquivo pronto." });
       return { blob, width: outputWidth, height: outputHeight, pages: pdf ? pdf.getNumberOfPages() : 1 };
     } finally { stage.remove(); }
   }
@@ -200,39 +204,79 @@ window.TimelineExport = (() => {
     if (window.__TAURI__?.core?.invoke) return window.__TAURI__.core.invoke("export_timeline", { format: spec.format, filename, base64: await base64(blob) });
     const url = URL.createObjectURL(blob), link = document.createElement("a"); link.href = url; link.download = filename; link.hidden = true; document.body.append(link); link.click(); setTimeout(() => { link.remove(); URL.revokeObjectURL(url); }, 30000); return { saved: true };
   }
+  // Decorate only the real render promise, never the native save dialog/write.
+  // One appearance timer and one measured threshold; neither retains a result.
+  function renderWaiting(host, status, meter, isCurrent) {
+    const started = performance.now(), operationId = `timeline-export-${++waitingSerial}`;
+    let visual = null, longWait = null, finished = false, label = "", measurements = {};
+    const receipt = () => ({ operationId, phaseId: "command:timeline_export_render", state: "running",
+      label, ...measurements, elapsedMs: performance.now() - started });
+    const current = () => !finished && host.isConnected && isCurrent();
+    const timer = setTimeout(() => {
+      if (!current() || !window.WaitingVisuals) return;
+      host.hidden = false; visual = window.WaitingVisuals.mount(host, receipt());
+      status.hidden = true; meter.hidden = true;
+      longWait = setTimeout(() => {
+        if (current()) visual?.update(receipt());
+      }, Math.max(0, Math.ceil(4000 - (performance.now() - started))));
+    }, 250);
+    return {
+      progress(done, total, message, detail = {}) {
+        if (!current()) return;
+        status.textContent = message;
+        label = typeof detail.label === "string" ? detail.label : message;
+        // Only explicit drawing receipts carry a final task denominator.
+        // Replace measurements so preparation/assembly cannot inherit page counts.
+        measurements = { completed: detail.completed, total: detail.total, unit: detail.unit };
+        if (Number.isFinite(detail.completed) && detail.completed >= 0 && Number.isFinite(detail.total) && detail.total > 0 && detail.completed <= detail.total) {
+          meter.max = detail.total; meter.value = detail.completed;
+        } else meter.removeAttribute("value");
+        visual?.update(receipt());
+      },
+      done() {
+        if (finished) return;
+        finished = true; clearTimeout(timer); clearTimeout(longWait);
+        visual?.destroy(); visual = null; host.hidden = true; status.hidden = false; meter.hidden = true;
+      }
+    };
+  }
   function open(spec, origin) {
     if (dialog) return;
     let info;
     try { info = measure(spec); } catch (error) { if (window.toast) toast(error.message, "err"); return; }
     const png = pngPlan(info), pdfPages = planPages(info).length;
     const overlay = text("div", "tx-backdrop", ""); dialog = overlay;
-    overlay.innerHTML = '<section class="tx-dialog" role="dialog" aria-modal="true" aria-labelledby="tx-title"><h2 id="tx-title">Exportar timeline</h2><p>A visão completa, incluindo o conteúdo fora da rolagem, com o tema atual.</p><div class="tx-formats"><label><input type="radio" name="tx-format" value="png" checked><span><strong>Imagem PNG</strong><small>Um arquivo completo</small></span></label><label><input type="radio" name="tx-format" value="pdf"><span><strong>Documento PDF</strong><small>Páginas legíveis</small></span></label></div><p data-tx-status role="status" aria-live="polite"></p><progress hidden></progress><div class="tx-actions"><button type="button" class="btn ghost" data-tx-cancel>Cancelar</button><button type="button" class="btn primary" data-tx-save>Exportar</button></div></section>';
+    overlay.innerHTML = '<section class="tx-dialog" role="dialog" aria-modal="true" aria-labelledby="tx-title"><h2 id="tx-title">Exportar timeline</h2><p>A visão completa, incluindo o conteúdo fora da rolagem, com o tema atual.</p><div class="tx-formats"><label><input type="radio" name="tx-format" value="png" checked><span><strong>Imagem PNG</strong><small>Um arquivo completo</small></span></label><label><input type="radio" name="tx-format" value="pdf"><span><strong>Documento PDF</strong><small>Páginas legíveis</small></span></label></div><p data-tx-status role="status" aria-live="polite"></p><progress hidden></progress><div data-tx-waiting hidden></div><div class="tx-actions"><button type="button" class="btn ghost" data-tx-cancel>Cancelar</button><button type="button" class="btn primary" data-tx-save>Exportar</button></div></section>';
     document.body.append(overlay);
     const status = overlay.querySelector("[data-tx-status]"), submit = overlay.querySelector("[data-tx-save]"), cancel = overlay.querySelector("[data-tx-cancel]"), meter = overlay.querySelector("progress");
-    let controller = null, writing = false;
+    let controller = null, writing = false, waiting = null;
     const selectedFormat = () => overlay.querySelector("input:checked").value;
     const update = () => { const format = selectedFormat(); status.classList.remove("error"); status.textContent = format === "png" ? png.allowed ? `${Math.round(png.width * png.ratio).toLocaleString("pt-BR")} × ${Math.round(png.height * png.ratio).toLocaleString("pt-BR")} pixels` : "Esta timeline é grande demais para uma única imagem. Escolha PDF para preservar a leitura." : pdfPages > MAX_PAGES ? `Mais de ${MAX_PAGES} páginas. Reduza a escala ou refine o recorte.` : `${pdfPages.toLocaleString("pt-BR")} ${pdfPages === 1 ? "página" : "páginas"} estimadas · conteúdo dividido sem reduzir tudo a uma miniatura.`; submit.disabled = format === "png" ? !png.allowed : pdfPages > MAX_PAGES; };
-    const close = () => { if (writing) return; controller?.abort(); overlay.remove(); dialog = null; origin?.focus({ preventScroll: true }); };
+    const close = () => { if (writing) return; waiting?.done(); controller?.abort(); overlay.remove(); dialog = null; origin?.focus({ preventScroll: true }); };
     cancel.onclick = close; overlay.onclick = event => { if (event.target === overlay && !controller) close(); };
     overlay.onkeydown = event => {
       if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); }
       if (event.key !== "Tab") return;
-      const nodes = [...overlay.querySelectorAll("button,input")].filter(node => !node.disabled);
+      const nodes = [...overlay.querySelectorAll("button,input")].filter(node => !node.disabled && !node.hidden);
       if (event.shiftKey && document.activeElement === nodes[0]) { event.preventDefault(); nodes.at(-1).focus(); }
       else if (!event.shiftKey && document.activeElement === nodes.at(-1)) { event.preventDefault(); nodes[0].focus(); }
     };
     overlay.querySelectorAll("input").forEach(input => input.onchange = update);
     submit.onclick = async () => {
+      if (controller || writing || !overlay.isConnected) return;
       const format = selectedFormat(); controller = new AbortController();
       const operation = controller; submit.disabled = true; overlay.querySelectorAll("input").forEach(input => input.disabled = true); meter.hidden = false; status.classList.remove("error");
+      const isCurrent = () => dialog === overlay && controller === operation && !operation.signal.aborted;
+      waiting = renderWaiting(overlay.querySelector("[data-tx-waiting]"), status, meter, isCurrent);
       try {
-        const result = await render({ ...spec, format }, { signal: operation.signal, progress: (done, total, message) => { meter.max = total; meter.value = done; status.textContent = message; } });
-        abort(operation.signal); writing = true; cancel.disabled = true; status.textContent = "Escolha onde salvar o arquivo…";
+        const result = await render({ ...spec, format }, { signal: operation.signal, progress: waiting.progress });
+        waiting.done(); abort(operation.signal); if (!isCurrent() || !overlay.isConnected) return;
+        writing = true; cancel.disabled = true; status.textContent = "Escolha onde salvar o arquivo…";
         const saved = await save(result.blob, { ...spec, format }); writing = false; controller = null;
         if (saved?.saved) { close(); if (window.toast) toast(`${format.toUpperCase()} exportado.`, "ok"); }
         else { status.textContent = "Salvamento cancelado. A timeline continua disponível."; }
-      } catch (error) { if (error.name !== "AbortError" && overlay.isConnected) { status.textContent = String(error.message || error); status.classList.add("error"); } }
-      finally { writing = false; controller = null; meter.hidden = true; submit.disabled = false; cancel.disabled = false; overlay.querySelectorAll("input").forEach(input => input.disabled = false); }
+      } catch (error) { waiting?.done(); if (error.name !== "AbortError" && overlay.isConnected) { status.textContent = String(error.message || error); status.classList.add("error"); } }
+      finally { waiting?.done(); waiting = null; writing = false; controller = null; meter.hidden = true; submit.disabled = false; cancel.disabled = false; overlay.querySelectorAll("input").forEach(input => input.disabled = false); }
     };
     update(); submit.focus();
   }

@@ -51,6 +51,16 @@ test('native, build, workflow and unknown changes retain the complete matrix', (
     contains(plan.preview, fullPreview);
   }
 });
+test('Timeline export and shared waiting changes retain both real output pilots', () => {
+  for (const path of ['frontend/timeline-export.js', 'frontend/timeline-export.css', 'frontend/waiting-visuals.js', 'frontend/waiting-visuals.css', 'frontend/tasks.js']) {
+    const plan = planValidation([path]);
+    assert.equal(plan.native, false, path);
+    contains(plan.preview, [...essentialPreview, 'test-timeline-export-waiting.mjs']);
+    if (path.startsWith('frontend/timeline-export.')) contains(plan.preview, ['test-explorer-timeline.mjs']);
+    else contains(plan.preview, ['test-case-report-waiting.mjs']);
+  }
+  assert(fullPreview.includes('test-timeline-export-waiting.mjs'));
+});
 test('full request and missing comparison data cannot produce an empty or focused green', () => {
   for (const plan of [planValidation([]), planValidation(['docs/readme.md'], { full: true })]) {
     assert.equal(plan.native, true);
