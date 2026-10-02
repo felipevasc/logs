@@ -8,6 +8,14 @@ Nas esperas, a animação é o foco visual, acompanhada de uma ação curta e co
 
 Desenvolvimento autorizado em 02/10/2026. A release 0.11 requer autorização própria. Base inicial local `97e5ad388f2b96111e12933cbc2de3eb14c7939e`, árvore `458245af9c48ba4d62c6a5a5aec2bbf0f38807b0`, equivalente ao candidato remoto 0.10 `675d7798c561535ab0fa7d4c55727db59781b7ba`. A 0.10 foi integrada à main em `4399c7777d76097bd13e72fac92dd7723e301fab`, com a mesma árvore, e publicada; o checkpoint remoto da 0.11 parte dessa main sem duplicar seu histórico.
 
+## Estado verificado em 02/10, 05:40 UTC
+
+O checkpoint `e885d674` passou no [CI58](https://github.com/felipevasc/logs/actions/runs/36968667789): 863 testes Node, 23 roteiros reais de navegador, um roteiro auxiliar Node e os gates nativos Linux/Windows. As capturas são do aplicativo com transporte e dados sintéticos identificados. Não comprovam o WebView instalado, ampliação nativa a 200%, atualização instalada ou desempenho em um corpus grande.
+
+Menus, edição por chip, foco das ações de registro, recolhimento do pivot, avisos/Desfazer, escala, rodapés de Referências/Transformação, escopo de exportação e quatro cenas do robô têm regressões aprovadas. O PDF do Caso gerou um arquivo real de duas páginas; o fixture é mínimo, com uma ocorrência manual, e não substitui cobertura de relatórios extensos. As correções dos fixtures de exportação/Undo e o contraste dos chips claros também passaram. As notas de checkpoints abaixo são históricas; pendências antigas resolvidas não prevalecem sobre este estado.
+
+O próximo recorte prioriza praticidade: Cancelar no cartão que cobre a carga, Colunas que conserve a ordem escolhida e tenha foco previsível, Fontes compactas com caminho completo acessível e continuidade do detalhe. A cena de composição também passa a acompanhar o render real de PNG/PDF da Timeline, reutilizando a arte aprovada. Esses incrementos novos exigem seus próprios gates antes de serem apresentados como verificados.
+
 ## Primeiro recorte
 
 1. Menu compartilhado com foco, navegação de teclado, retorno ao alvo válido e fechamento de apenas uma camada por Escape
@@ -42,7 +50,7 @@ O primeiro recorte não resolve sozinho o modelo de teclado de toda a tabela, a 
 
 ## Esperas e personalidade
 
-O estudo considera 67 pontos de tarefa e subetapas nativas em onze famílias: ler, organizar, guardar, conferir, relacionar, calcular, transformar, transferir, compor, retomar e esperar. Não equivale a 67 animações independentes: o repertório deve ser pequeno e reutilizável.
+O levantamento inicial considerou 67 pontos de tarefa e subetapas nativas em onze famílias: ler, organizar, guardar, conferir, relacionar, calcular, transformar, transferir, compor, retomar e esperar. A reconciliação com o código atual percorreu os 53 módulos JavaScript próprios do frontend e os contratos de progresso nativo. Esses números têm unidades diferentes: pontos de espera não equivalem a módulos nem a animações independentes. Quatro famílias visuais estão implementadas; o restante é cobertura de estudo, não promessa de personagem em cada spinner.
 
 Variação segue tarefa e etapa reais; dentro da mesma família, poucas alternativas coerentes evitam repetição imediata. Não sortear uma nova cena a cada atualização do contador. Uma tarefa instantânea não ganha atraso para mostrar arte. Várias regiões simultâneas não devem produzir vários personagens competindo pela atenção.
 
