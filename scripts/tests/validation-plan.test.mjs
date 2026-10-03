@@ -132,7 +132,7 @@ test('workflow contract retains native and installed-update gates, shares cache 
   }
   assert.match(build, /run: node scripts\/release\/update-e2e\.mjs/);
   assert.match(build, /needs: \[build, validate\]/);
-  assert.match(build, /name: Full browser regression\s+run: npm run test:preview/);
+  assert.match(build, /name: Full browser regression\s+if: needs.checks-proof.outputs.reused != 'true'\s+run: npm run test:preview/);
   assert.match(build, /run: node scripts\/release\/verify-trigger\.mjs/);
   assert.match(build, /run: node scripts\/preview\/test-native-desktop\.mjs src-tauri\/target\/release\/loginsight\.exe/);
   assert.match(build, /run: node scripts\/release\/publish\.mjs release-assets/);
