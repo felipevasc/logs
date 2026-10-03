@@ -1,6 +1,7 @@
 import { readdir, mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { spawnManaged, waitManaged, previewEnvironment } from "./managed-process.mjs";
+import { fullPreview } from "../ci/validation-plan.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const selected = process.argv.slice(2);
@@ -9,7 +10,7 @@ const selected = process.argv.slice(2);
 const separateTests = new Set(["test-restore.mjs", "test-restore2.mjs", "test-native-desktop.mjs"]);
 const available = (await readdir(new URL("./", import.meta.url)))
   .filter(name => /^test-[a-z0-9-]+\.mjs$/.test(name) && !separateTests.has(name)).sort();
-const tests = selected.length ? selected : available;
+const tests = selected.length ? selected : fullPreview;
 for (const name of tests) if (!available.includes(name)) throw new Error(`Unknown regression test: ${name}`);
 await mkdir(new URL("../../output/playwright/", import.meta.url), { recursive: true });
 const environment = previewEnvironment();
@@ -28,6 +29,7 @@ for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
   process.on(signal, () => { interrupted = true; process.exitCode = code; void stop(); });
 }
 const results = [];
+const suiteStarted = performance.now();
 try {
   const url = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("Preview startup timed out")), 15_000);
@@ -55,7 +57,9 @@ try {
       if (failure.fatalCleanup) cleanupFailure = error;
       console.error(`${test}: ${error}`);
     } finally { active = null; }
-    results.push({ test, passed: error === null, elapsedMs: Math.round(performance.now() - started), error });
+    const elapsedMs = Math.round(performance.now() - started);
+    results.push({ test, passed: error === null, elapsedMs, error });
+    console.log(`Preview duration: ${test}: ${elapsedMs}ms (${error === null ? "passed" : "failed"})`);
   }
 } catch (failure) {
   runError = String(failure);
@@ -63,9 +67,12 @@ try {
 } finally {
   await stop();
   await writeFile(new URL("../../output/playwright/smoke-summary.json", import.meta.url), JSON.stringify({
-    transport: "synthetic-preview", interrupted, cleanupFailure, runError,
+    transport: "synthetic-preview", sourceCommit: process.env.GITHUB_SHA || null,
+    elapsedMs: Math.round(performance.now() - suiteStarted), interrupted, cleanupFailure, runError,
     passed: !interrupted && !cleanupFailure && !runError && results.length === tests.length && results.every(result => result.passed),
     tests: results,
   }, null, 2) + "\n");
 }
-if (!interrupted && (cleanupFailure || results.some(result => !result.passed))) process.exitCode = 1;
+const failures = results.filter(result => !result.passed);
+if (failures.length) console.error(`${failures.length}/${tests.length} preview regressions failed: ${failures.map(result => result.test).join(", ")}`);
+if (!interrupted && (cleanupFailure || failures.length)) process.exitCode = 1;

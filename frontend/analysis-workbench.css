@@ -36,6 +36,8 @@
 .cube-fields > .aw-search { width:calc(100% - 20px); margin:0 10px 10px; }
 .aw-zone-add { max-width:150px; min-width:85px; width:auto; padding:4px 6px; font-size:11px; border:1px dashed var(--border-strong); border-radius:5px; background:var(--bg-1); color:var(--text-1); }
 .aw-chip-move { cursor:pointer; background:none; border:0; color:var(--text-1); padding:0 3px; font-size:11px; }
+/* Match light filter chips while retaining each workspace's functional accent. */
+html[data-theme="light"] .cube-chip { color:var(--accent-strong); }
 .cube-zone-items { align-content:flex-start; }
 .aw-pivot-result-tools { padding:8px 10px; gap:6px; }
 .aw-pivot-result-tools .aw-search { flex:1; min-width:130px; max-width:250px; }

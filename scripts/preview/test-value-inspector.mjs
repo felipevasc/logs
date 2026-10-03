@@ -1,13 +1,8 @@
 import assert from "node:assert/strict";
-import { chromium } from "playwright";
-import { existsSync, mkdirSync } from "node:fs";
+import { launchBrowser } from './browser.mjs';
+import { mkdirSync } from "node:fs";
 
-let executablePath = chromium.executablePath();
-if (!existsSync(executablePath)) executablePath = [
-  "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-  "C:/Program Files/Google/Chrome/Application/chrome.exe",
-].find(existsSync);
-const browser = await chromium.launch(executablePath ? { executablePath } : {});
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
 const errors = []; page.on("pageerror", error => errors.push(error.message));
 try {
@@ -67,7 +62,7 @@ try {
   assert.equal(await page.evaluate(() => window.__insightPending.length), 0, "visibility changes must reuse insights");
   await page.locator("#dr-reveal").click();
   await page.locator("#dr-close").click();
-  assert.equal(await page.evaluate(() => state.currentDetailEv), null);
+  assert.equal(await page.evaluate(() => detailRevealed), false, "reopening retains canonical ownership but never the revealed state");
   assert.ok(!(await drawer.innerHTML()).includes("fixture-secret"));
   await page.evaluate(() => showDetail(window.__detailFixture));
   assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "false");

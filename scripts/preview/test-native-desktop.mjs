@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, open, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,7 +20,7 @@ const executable = await realpath(resolve(process.argv[2]));
 const outputParent = resolve(repo, "output");
 await mkdir(outputParent, { recursive: true });
 const output = await mkdtemp(resolve(outputParent, "native-desktop-"));
-const dataDir = resolve(output, "data"), profileDir = resolve(output, "webview");
+const dataDir = resolve(output, "data"), profileDir = resolve(output, "webview"), engineDir = resolve(dataDir, "engine-v1");
 await mkdir(dataDir);
 await writeFile(resolve(dataDir, "system_codes.json"), JSON.stringify({ validation: {} }));
 // A new installation must keep MCP disabled; do not inherit the user's config.
@@ -93,10 +93,10 @@ async function freePort() {
 
 async function ready(page) {
   await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing
-    && !bigDataRuntime.busy && !state.loadOverlay && !state.activeOperation, null, { timeout: 120_000 });
+    && !WorkspaceContext.sourceBusy && !state.loadOverlay && !state.activeOperation, null, { timeout: 120_000 });
 }
 
-async function launch() {
+async function launch(engineEnabled = true) {
   const port = await freePort();
   const number = sessions.length + 1;
   const stdoutPath = resolve(output, `launch-${number}-stdout.log`);
@@ -106,7 +106,7 @@ async function launch() {
   try {
     child = spawn(executable, [], { cwd: repo, windowsHide: true, stdio: ["ignore", stdout.fd, stderr.fd], env: {
       ...process.env, LOGINSIGHT_DATA_DIR: dataDir, WEBVIEW2_USER_DATA_FOLDER: profileDir,
-      RUST_BACKTRACE: "1",
+      RUST_BACKTRACE: "1", LOGINSIGHT_ENGINE: engineEnabled ? "1" : "0", LOGINSIGHT_ENGINE_DIR: engineDir,
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port}`,
     } });
     session = { child, port, stdoutPath, stderrPath, browser: null, page: null, exited: false, error: null };
@@ -120,7 +120,7 @@ async function launch() {
     // output, and direct file descriptors avoid pipe backpressure during builds.
     await stdout.close(); await stderr.close();
   }
-  checkpoint("launch", { number, pid: child.pid, port, stdoutPath, stderrPath });
+  checkpoint("launch", { number, engineEnabled, pid: child.pid, port, stdoutPath, stderrPath });
   const endpoint = `http://127.0.0.1:${port}`;
   let connected = false;
   for (let attempt = 0; attempt < 180; attempt++) {
@@ -174,24 +174,23 @@ async function launch() {
 
 async function diagnostics(page) {
   const frontend = await page.evaluate(() => ({
-    case: { id: activeCase()?.id, bigData: activeCase()?.bigData },
+    case: { id: activeCase()?.id, native: window.CaseEvidence?.active, context: window.AnalysisContexts?.identity() },
     loaded: state.loaded, total: state.total, loadOverlay: state.loadOverlay,
     operation: state.activeOperation && { kind: state.activeOperation.kind, cancelled: state.activeOperation.cancelled },
-    bigData: { error: bigDataRuntime.error, status: bigDataRuntime.status, busy: bigDataRuntime.busy },
-    button: document.querySelector("#btn-big-data")?.outerHTML,
+    sourcePublication: state.sourcePublication,
     footer: document.querySelector("#workbar")?.textContent,
   }));
   const backend = await page.evaluate(async () => {
     const bounded = async command => {
       let timer;
       try {
-        return await Promise.race([window.__TAURI__.core.invoke(command), new Promise((_, reject) => {
+        return await Promise.race([api(command, {}, { silent: true }), new Promise((_, reject) => {
           timer = setTimeout(() => reject(new Error("diagnostic IPC timed out")), 5000);
         })]);
       } catch (error) { return { error: String(error) }; }
       finally { clearTimeout(timer); }
     };
-    const [mode, source, resources] = await Promise.all([bounded("big_data_status"), bounded("source_summary"), bounded("resource_snapshot")]);
+    const [mode, source, resources] = await Promise.all([bounded("engine_status"), bounded("source_summary"), bounded("resource_snapshot")]);
     return { mode, source, resources: resources.error ? resources : { app: resources.app, actions: resources.actions } };
   });
   return { frontend, backend };
@@ -267,27 +266,27 @@ const scenarios = [
 async function queries(page) {
   return page.evaluate(async scenarios => {
     const output = {};
-    for (const { name, ...args } of scenarios) output[name] = await window.__TAURI__.core.invoke("query_events", { ...args, caseEvents: null, caseKey: null });
+    for (const { name, ...args } of scenarios) output[name] = await api("query_events", { ...args, caseEvents: null, caseKey: null }, { silent: true });
     return output;
   }, scenarios);
 }
 
 async function detailInspection(page) {
   const show = id => page.evaluate(async id => {
-    const event = await window.__TAURI__.core.invoke("event_detail", { id });
+    const event = await api("event_detail", { id, caseEvents: null, caseKey: null }, { silent: true });
     if (!event || event.id !== id) throw new Error("Native detail IPC returned the wrong event");
     showDetail(event);
   }, id);
-  const authorization = page.locator('.kv-row[data-col="authorization"]');
+  const authorization = page.locator('.detail-tree-row[data-col="authorization"]');
   const dialog = page.locator("dialog.value-inspector");
   try {
     await show(0);
     assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "false");
-    assert.ok((await authorization.locator(".kv-v").innerText()) === "[oculto]", "authorization is masked by default");
+    assert.ok((await authorization.locator(".detail-tree-value").innerText()) === "[oculto]", "authorization is masked by default");
     assert.ok(!(await page.locator("#drawer").innerHTML()).includes(jwt), "JWT is absent from the masked drawer DOM");
     await page.locator("#dr-reveal").click();
     assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "true");
-    assert.ok((await authorization.locator(".kv-v").innerText()) === `Bearer ${jwt}`, "revealed value equals the original IPC value");
+    assert.ok((await authorization.locator(".detail-tree-value").innerText()) === `Bearer ${jwt}`, "revealed value equals the original IPC value");
     await authorization.locator(".kv-inspect").click();
     await dialog.waitFor({ state: "visible" });
     await dialog.locator("details.value-node").evaluateAll(nodes => nodes.forEach(node => { node.open = true; }));
@@ -306,14 +305,14 @@ async function detailInspection(page) {
     }
     await dialog.getByRole("button", { name: "Fechar", exact: true }).click();
     await page.locator("#dr-reveal").click();
-    assert.ok((await authorization.locator(".kv-v").innerText()) === "[oculto]", "hiding masks authorization again");
+    assert.ok((await authorization.locator(".detail-tree-value").innerText()) === "[oculto]", "hiding masks authorization again");
     await page.locator("#dr-reveal").click();
     await page.locator("#dr-close").click();
-    assert.equal(await page.evaluate(() => state.currentDetailEv === null), true, "closing clears the current event");
+    assert.equal(await page.evaluate(() => !detailRevealed && document.querySelector("#drawer").hidden), true, "closing resets revealed presentation while preserving canonical event identity");
     assert.ok(!(await page.locator("#drawer").innerHTML()).includes(jwt), "closing removes revealed values");
     await show(0);
     assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "false");
-    assert.ok((await authorization.locator(".kv-v").innerText()) === "[oculto]", "reopening starts with masked authorization");
+    assert.ok((await authorization.locator(".detail-tree-value").innerText()) === "[oculto]", "reopening starts with masked authorization");
     await page.locator("#dr-reveal").click();
     await authorization.locator(".kv-inspect").click();
     await dialog.waitFor({ state: "visible" });
@@ -321,7 +320,7 @@ async function detailInspection(page) {
     assert.equal(await dialog.count(), 0, "changing the real event closes and clears the old inspector");
     assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "false");
     assert.equal(await authorization.count(), 0);
-    assert.ok((await page.locator('.kv-row[data-col="token"] .kv-v').innerText()) === "[oculto]", "switching events masks token fields");
+    assert.ok((await page.locator('.detail-tree-row[data-col="token"] .detail-tree-value').innerText()) === "[oculto]", "switching events masks token fields");
     assert.ok(!(await page.locator("#drawer").innerHTML()).includes(jwt));
     checkpoint("native-value-inspector", { realIpc: true, maskedByDefault: true, exactInteger: true,
       unicodeAndRoles: true, hideClearsTree: true, closeAndSwitchReset: true });
@@ -337,7 +336,7 @@ async function exportsFor(page, mode) {
   for (const format of ["jsonl", "csv"]) for (const mask of [false, true]) {
     const path = resolve(output, `${mode}-${mask ? "masked" : "plain"}.${format}`);
     assert.ok(relative(output, path) && !relative(output, path).startsWith(".."));
-    const count = await page.evaluate(args => window.__TAURI__.core.invoke("export_events", args),
+    const count = await page.evaluate(args => api("export_events", args, { silent: true }),
       { path, format, mask, filters: filters("source", "equals_exact", "svc-2"), caseEvents: null, caseKey: null });
     assert.equal(count, events.filter(event => event.source === "svc-2").length);
     const bytes = await readFile(path);
@@ -347,30 +346,44 @@ async function exportsFor(page, mode) {
   return outputs;
 }
 
-async function toggle(page, enabled) {
-  checkpoint("big-data-toggle-start", { enabled });
-  await page.locator("#btn-big-data").click();
-  await page.waitForFunction(() => !!bigDataRuntime.error || (!bigDataRuntime.busy && !state.activeOperation), null, { timeout: 120_000 });
-  const completion = await page.evaluate(() => ({ enabled: activeCase()?.bigData === true, error: bigDataRuntime.error }));
-  assert.equal(completion.error, null, `native Big Data failed: ${completion.error}`);
-  assert.equal(completion.enabled, enabled, "Big Data action finished without the requested state");
-  assert.equal(await page.evaluate(() => flushCaseSaves()), true);
-  const status = await page.evaluate(() => window.__TAURI__.core.invoke("big_data_status"));
-  assert.equal(status.enabled, enabled); assert.equal(status.ready, enabled);
-  checkpoint("big-data-toggle-complete", status);
+async function engineState(page, enabled) {
+  const status = await page.evaluate(() => api("engine_status", {}, { silent: true }));
+  assert.ok(status, "indexed source reports engine status");
+  assert.equal(status.error, null, `native engine failed: ${status.error}`);
+  assert.equal(status.state, enabled ? "ready" : "disabled");
+  if (enabled) {
+    assert.equal(status.baseReady, true);
+    assert.equal(status.derivedReady, true);
+    assert.equal(status.completedRows, eventCount);
+    assert.equal(status.completedSegments, status.totalSegments);
+  }
   return status;
 }
 
+async function engineManifests() {
+  let entries;
+  try { entries = await readdir(engineDir, { withFileTypes: true }); }
+  catch (error) { if (error.code === "ENOENT") return []; throw error; }
+  const manifests = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".complete.json")) continue;
+    const path = resolve(engineDir, entry.name), bytes = await readFile(path), metadata = await stat(path);
+    manifests.push({ name: entry.name, bytes: bytes.length, modified: metadata.mtimeMs, sha256: hash(bytes) });
+  }
+  return manifests.sort((a, b) => a.name.localeCompare(b.name));
+}
+
 try {
-  current = await launch();
+  current = await launch(false);
   let page = current.page;
   await page.evaluate(() => { newCase("Native desktop acceptance"); });
   await ready(page);
   await page.evaluate(path => loadData({ kind: "file", path, paths: [path], format: "jsonl" }), fixture);
   await ready(page);
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
-  assert.equal(await page.evaluate(() => state.total), eventCount);
-  assert.equal(await page.evaluate(() => activeCase().bigData), false);
+  assert.equal(await page.evaluate(() => CaseEvidence.active), true, "native Case session is active");
+  await engineState(page, false);
+  assert.deepEqual(await engineManifests(), [], "disabled baseline must not construct advanced stores");
   checkpoint("source-loaded", { eventCount, fixture });
   await detailInspection(page);
   const baseline = await queries(page);
@@ -385,22 +398,24 @@ try {
   checkpoint("baseline-queries", { scenarios: scenarios.length });
   const exportedOff = await exportsFor(page, "off");
   checkpoint("baseline-exports", { formats: Object.keys(exportedOff) });
-  const cold = await toggle(page, true);
-  assert.equal(cold.reused, false, "first activation builds the private cold index");
-  assert.deepEqual(await queries(page), baseline, "Big Data must preserve complete query results");
-  const exportedOn = await exportsFor(page, "on");
+  assert.equal(await page.evaluate(() => flushCaseSaves()), true);
+  await nativeClose(current); await waitForExit(current);
+  current = await launch(true); page = current.page;
+  await page.evaluate(path => loadData({ kind: "file", path, paths: [path], format: "jsonl" }), fixture);
+  await ready(page);
+  await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
+  const cold = await engineState(page, true);
+  assert.deepEqual(await queries(page), baseline, "DuckDB/Tantivy must preserve canonical query results");
+  const exportedOn = await exportsFor(page, "engine");
   const exportResults = {};
   for (const key of Object.keys(exportedOff)) {
     assert.deepEqual(exportedOn[key], exportedOff[key], `byte parity: ${key}`);
     exportResults[key] = { bytes: exportedOn[key].length, sha256: hash(exportedOn[key]) };
   }
-  await toggle(page, false);
-  assert.deepEqual(await queries(page), baseline);
-  const reused = await toggle(page, true);
-  assert.equal(reused.reused, true, "reactivation reopens the immutable generation");
-  assert.deepEqual(await queries(page), baseline);
-  checkpoint("big-data-parity", { scenarios: scenarios.length, cold, reused, exports: exportResults });
-  await page.screenshot({ path: resolve(output, "big-data.png"), fullPage: true });
+  const manifests = await engineManifests();
+  assert.ok(manifests.length > 0, "advanced engine publishes completed, checksummed stores");
+  checkpoint("engine-parity", { scenarios: scenarios.length, cold, manifests, exports: exportResults });
+  await page.screenshot({ path: resolve(output, "engine.png"), fullPage: true });
 
   await page.locator("#btn-resources").click();
   await page.waitForFunction(() => !!window.Resources?.snapshot() && Resources.snapshot().history.length >= 2);
@@ -425,7 +440,7 @@ try {
   await page.evaluate(() => {
     window.__nativeOriginalApi = api; window.__nativeFailedSaveAttempts = 0;
     api = async (command, ...args) => {
-      if (command === "cases_save") { window.__nativeFailedSaveAttempts++; throw new Error("Isolated native test: rejected save"); }
+      if (command === "cases_save_view") { window.__nativeFailedSaveAttempts++; throw new Error("Isolated native test: rejected save"); }
       return window.__nativeOriginalApi(command, ...args);
     };
     activeCase().name = "rejected close edit";
@@ -434,25 +449,31 @@ try {
   await page.waitForFunction(() => window.__nativeFailedSaveAttempts > 0 && !caseSaveActive);
   const failuresBeforeClose = await page.evaluate(() => window.__nativeFailedSaveAttempts);
   await nativeClose(current);
-  await page.waitForFunction(previous => window.__nativeFailedSaveAttempts > previous
-    && !caseSaveActive && caseSavesPending(), failuresBeforeClose);
+  await page.waitForFunction(() => !caseSaveActive && caseSavesPending()
+    && nativeEvidenceServices().session.hasUnconfirmedSave());
+  assert.equal(await page.evaluate(() => window.__nativeFailedSaveAttempts), failuresBeforeClose,
+    "close must preserve native retry semantics rather than silently retry a rejected receipt");
   await delay(500);
   assert.equal(current.exited, false, "a failed flush must leave the native window open");
   assert.equal(page.isClosed(), false);
   await page.screenshot({ path: resolve(output, "close-rejected.png"), fullPage: true });
-  const durable = await page.evaluate(() => {
+  await page.evaluate(async () => {
     api = window.__nativeOriginalApi;
+    await nativeEvidenceServices().session.retry();
+    if (!await flushCaseSaves()) throw Error("Native retry did not restore a clean session");
+  });
+  const durable = await page.evaluate(() => {
     const c = activeCase(); c.name = "Persisted by real WM_CLOSE";
     c.manual.push({ id: "native-manual", createdAt: 1, name: "Native evidence", description: "ação 東京 preserved",
       start: 1_700_000_000_000, end: 1_700_000_001_000 });
     // Delay only this isolated page's transport so WM_CLOSE necessarily meets
     // an in-flight real disk write, then drain the existing production queue.
     api = async (command, ...args) => {
-      if (command === "cases_save") await new Promise(done => setTimeout(done, 1500));
+      if (command === "cases_save_view") await new Promise(done => setTimeout(done, 1500));
       return window.__nativeOriginalApi(command, ...args);
     };
     void saveCases();
-    return { id: c.id, name: c.name, manual: c.manual.at(-1), priorRevision: state.cases.revision };
+    return { id: c.id, name: c.name, manual: c.manual.at(-1), priorRevision: state.cases.store.revision };
   });
   await page.waitForFunction(() => !!caseSaveActive);
   await nativeClose(current);
@@ -461,21 +482,22 @@ try {
 
   current = await launch(); page = current.page;
   const restored = await page.evaluate(() => ({ id: activeCase()?.id, name: activeCase()?.name,
-    manual: activeCase()?.manual.find(item => item.id === "native-manual"), bigData: activeCase()?.bigData,
-    revision: state.cases.revision }));
+    manual: activeCase()?.manual.find(item => item.id === "native-manual"), native: CaseEvidence.active,
+    revision: state.cases.store.revision }));
   assert.equal(restored.id, durable.id); assert.equal(restored.name, durable.name);
-  assert.deepEqual(restored.manual, durable.manual); assert.equal(restored.bigData, true);
-  assert.ok(restored.revision > durable.priorRevision);
-  const disk = await page.evaluate(() => window.__TAURI__.core.invoke("cases_load"));
+  assert.deepEqual(restored.manual, durable.manual); assert.equal(restored.native, true);
+  assert.ok(BigInt(restored.revision) > BigInt(durable.priorRevision));
+  const disk = await page.evaluate(() => window.__TAURI__.core.invoke("cases_load_view"));
   assert.equal(disk.cases.find(item => item.id === durable.id).name, durable.name);
   // An application reopen may restore a Case page instead of the dataset page.
   await page.evaluate(path => loadData({ kind: "file", path, paths: [path], format: "jsonl" }), fixture);
   await ready(page);
-  const reopened = await page.evaluate(() => window.__TAURI__.core.invoke("big_data_status"));
-  assert.ok(reopened.enabled && reopened.ready && reopened.reused);
+  await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
+  const reopened = await engineState(page, true);
+  assert.deepEqual(await engineManifests(), manifests, "restart reuses immutable completed stores without replacing manifests");
   assert.deepEqual(await queries(page), baseline, "process restart preserves cached index results");
   await page.screenshot({ path: resolve(output, "reopened.png"), fullPage: true });
-  checkpoint("persistence-and-reopen", { restored, indexReused: reopened.reused });
+  checkpoint("persistence-and-reopen", { restored, engine: reopened, immutableManifestsReused: true });
   assert.deepEqual(pageErrors, [], "native frontend pageerrors must be zero");
   await nativeClose(current); await waitForExit(current);
 } catch (error) {

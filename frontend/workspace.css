@@ -2,6 +2,8 @@
 :root { --nav-w: 184px; --topbar-h: 64px; --context-rail-w: 0px; --radius: 12px; --radius-sm: 7px; --font-ui: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; --font-mono: "Cascadia Code", Consolas, monospace; }
 html[data-theme="dark"] { --bg-0:#0e1218; --bg-1:#141a22; --bg-2:#1a222c; --bg-3:#25303c; --border:#25303a; --border-strong:#3a4959; --text-0:#edf2f7; --text-1:#a8b6c5; --text-2:#8294a7; --accent:#83e3c3; --accent-strong:#a5f1d8; --accent-soft:#83e3c312; --hover:#ffffff05; --row-alt:#ffffff02; --shadow:0 24px 80px #0005; --code-bg:#0e141b; --scrim:#05080e88; --lv-erro:#ff8d93; --lv-critico:#ff6684; --lv-aviso:#edc379; --lv-informacao:#81b8dd; }
 html[data-theme="light"] { --bg-0:#f4f6f8; --bg-1:#fff; --bg-2:#f0f4f6; --bg-3:#e2e9ed; --border:#dce3e9; --border-strong:#b9c7d0; --text-0:#192b37; --text-1:#526575; --text-2:#637786; --accent:#14745c; --accent-strong:#095742; --accent-soft:#1686660d; --hover:#14745c06; --row-alt:#00000002; --shadow:0 24px 70px #20334620; --code-bg:#edf2f5; --scrim:#122b3d55; --lv-erro:#b93748; --lv-critico:#b92958; --lv-aviso:#95640c; --lv-informacao:#216f9f; }
+/* Plain editor text follows its themed surface; syntax palettes remain separate. */
+#codes-editor, #ts-example { color: var(--text-0); }
 html,body { font-size:13px; letter-spacing:.01em; }
 body { padding-left:var(--nav-w); padding-top:var(--topbar-h); }
 [hidden] { display:none!important; }
@@ -88,7 +90,40 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 .ws-loading{padding:65px 20px;display:flex;align-items:center;justify-content:center;gap:12px;color:var(--text-2)}.ws-loading i{color:var(--accent)}.source-controls{display:flex;gap:8px;margin-bottom:18px;align-items:center}.source-check{width:16px;height:16px;accent-color:var(--accent)}.explore-tools{display:flex;gap:5px;align-items:center}.ws-scope-pill{font-size:11px;padding:6px 9px;color:var(--text-1);border:1px solid var(--border);border-radius:5px}
 @media(min-width:1700px){.workspace-page{padding:34px 48px}.overview-grid{grid-template-columns:minmax(0,1.8fr) minmax(320px,1fr)}}
 @media(max-width:1200px){:root{--nav-w:158px}.workspace-nav{padding-left:10px;padding-right:10px}.workspace-brand{font-size:16px}.workspace-page{padding:23px}.metric{padding:18px}.metric-value{font-size:26px}.overview-grid{grid-template-columns:1fr}.compare-form{gap:12px}.compare-period>div{flex-direction:column}.compare-period input{width:100%}.side{width:205px;min-width:205px}.topbar{padding:0 20px}.topbar-case .case-select{width:140px}.viewbar{flex-wrap:wrap}}
-@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+@media(prefers-reduced-motion:reduce){
+  *{transition:none!important;scroll-behavior:auto!important}
+  /* Existing waiting timelines are paused by waiting-visuals.css. Cancelling
+     their names here would lose the pose and restart the episode on resume.
+     The latch excludes only artwork that has already been allowed to animate;
+     a scene mounted under reduced motion keeps the normal static fallback. */
+  *:not(.waiting-visual[data-animated="true"] .wv-art *){animation:none!important}
+}
+
+/* First 0.11 waiting pilots retain the existing compact load surface. */
+.semantic-load-stage { gap: 10px; max-height: calc(100vh - var(--topbar-h) - 40px); overflow-y: auto; }
+#load-visual { width: 100%; }
+.semantic-load-stage .load-operation-controls { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 100%; }
+.semantic-load-stage #load-cancel { min-height: 32px; font-size: 12px; }
+.semantic-load-stage #load-cancel-help { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.5; text-align: center; overflow-wrap: anywhere; }
+.load-progress-details { width: 100%; min-width: 0; }
+.load-progress-details > summary { padding: 5px 0; color: var(--text-1); font-size: 12px; cursor: pointer; }
+.load-progress-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.load-progress-details[open] > summary { margin-bottom: 8px; }
+.load-progress-details .load-phase { font-size: 13px; overflow-wrap: anywhere; }
+.load-progress-details .load-volume, .load-progress-details .load-eta { overflow-wrap: anywhere; }
+.load-progress-details .load-steps { margin-top: 10px; }
+.area-loading-semantic .wv-art { inline-size: 144px; block-size: 72px; flex-basis: 72px; }
+
+/* The pivot builder only folds after an explicit choice; its controls stay live. */
+.cube-panel #aw-pivot-tools { flex: 0 0 auto; }
+.cube-panel .aw-pivot-config-actions { display: contents; }
+.cube-panel #aw-pivot-tools #btn-cube-clear { margin-left: 0; }
+.cube-panel .aw-pivot-config-toggle { margin-left: auto; flex: 0 0 auto; min-height: 30px; }
+.cube-panel .aw-pivot-config-summary { display: flex; flex: 1 1 260px; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; min-width: 0; margin: 0; color: var(--text-0); font-size: 12px; line-height: 1.5; }
+.cube-panel .aw-pivot-config-item { display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: baseline; gap: 0 6px; min-width: 0; max-width: 100%; }
+.cube-panel .aw-pivot-config-item dt { color: var(--text-1); font-weight: 600; }
+.cube-panel .aw-pivot-config-item dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.cube-panel #cube-table-view { overflow-anchor: none; }
 
 .source-filter{background:transparent;border:0;border-top:1px solid var(--border);width:100%;text-align:left;color:var(--text-0);cursor:pointer}.source-filter:hover{background:var(--hover)}
 .latency-values{display:flex;justify-content:space-between;padding:6px 22px 0;gap:20px}.latency-values span{display:block;color:var(--text-2);font-size:10px;margin-bottom:8px}.latency-values strong{font-size:21px;font-weight:550;font-variant-numeric:tabular-nums}.recipe-list{padding:0 10px 10px}.recipe-list button{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:14px 11px;color:var(--text-1);background:transparent;border:0;border-top:1px solid var(--border);cursor:pointer;font-size:12px}.recipe-list button:hover{color:var(--accent)}.recipe-list button i:last-child{margin-left:auto;font-size:10px}
@@ -123,3 +158,32 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 .page-tabs button:hover { background:var(--hover); color:var(--text-0); }
 .page-tabs button.selected { background:var(--accent-soft); color:var(--accent); font-weight:600; }
 #btn-back-drive { display:none!important; }
+
+/* Pending analytics should not leave an empty chart-sized gap above usable rows. */
+.hist-panel.analytics-placeholder{height:auto;min-height:32px;padding-bottom:8px}
+.hist-panel.analytics-placeholder .chart{min-height:0;cursor:default}
+.analytics-placeholder-text{margin:0;padding:4px 0;font-size:12px;color:var(--text-2)}
+.hist-panel.analytics-placeholder .hint-empty{padding-top:4px;padding-bottom:4px}
+.workbar[data-summary-state]:not([data-summary-state=""]):not([data-summary-state="done"]) #workbar-idle-icon{color:var(--text-2)}
+.workbar[data-summary-state="failed"] #workbar-idle-icon{color:var(--lv-aviso)}
+
+/* Interface scale: bound the grid track before wrapping its intrinsic-width radios. */
+#settings-pane-interface .ui-pref { min-width: 0; grid-template-columns: minmax(0, 1fr); }
+#settings-pane-interface .ui-scale-choices { display: flex; width: 100%; min-width: 0; max-width: 100%; flex-wrap: wrap; }
+#settings-pane-interface .ui-scale-choices > .seg-btn { flex: 0 0 auto; }
+
+/* Sources: paths and occasional actions stay available without permanent rows of buttons. */
+.source-toolbar{flex-wrap:wrap}
+.source-table-scroll{max-width:100%;overflow-x:auto}.source-table-scroll:focus-visible{outline:2px solid var(--accent-strong,var(--accent));outline-offset:-2px}
+.sources-table{table-layout:fixed;min-width:650px}
+.sources-table th,.sources-table td{padding:10px 12px}
+.sources-table .source-selection-cell,.sources-table .source-menu-cell{width:48px;padding-inline:8px}
+.sources-table .source-format-cell{width:100px}.sources-table .source-number-cell{width:84px}.sources-table .source-reading-cell{width:158px}
+.sources-table .source-file-cell{min-width:0}.sources-table .tag{display:inline-block;box-sizing:border-box;max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.source-path-toggle{display:flex;align-items:center;gap:7px;width:100%;min-height:28px;padding:0;border:0;background:transparent;color:var(--text-0);font:inherit;font-weight:600;text-align:left;cursor:pointer}
+.source-path-toggle>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-path-toggle>i{flex:none;font-size:9px;color:var(--text-2)}
+.source-path-toggle[aria-expanded="true"]>i{transform:rotate(90deg)}.source-path-toggle:hover{color:var(--accent-strong,var(--accent))}
+.source-path-details{margin-top:10px}.source-full-path{display:block;width:100%;max-width:100%;min-width:0;resize:vertical;box-sizing:border-box;padding:8px;border:1px solid var(--border-strong);border-radius:5px;background:var(--code-bg);color:var(--text-0);font:11px/1.5 var(--font-mono);overflow-wrap:anywhere;white-space:pre-wrap;user-select:text}
+.source-path-details>.text-button{margin-top:6px}.source-hashes{display:flex;flex-direction:column;align-items:flex-start;gap:5px;margin-top:6px}.source-hashes:empty{display:none}.source-hashes .hash-copy{max-width:100%;white-space:normal;overflow-wrap:anywhere;text-align:left}
+.source-path-toggle:focus-visible,.source-menu-trigger:focus-visible,.source-full-path:focus-visible{outline:2px solid var(--accent-strong,var(--accent));outline-offset:2px}
+@media(max-width:1100px){.sources-table .source-format-cell{width:78px}.sources-table .source-number-cell{width:72px}.sources-table .source-reading-cell{width:132px}}

@@ -1,0 +1,259 @@
+name: Pull request checks
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      portable_windows:
+        description: Also build a portable Windows executable for manual review
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  scope:
+    name: Select required validation
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      native: ${{ steps.plan.outputs.native }}
+      browser: ${{ steps.plan.outputs.browser }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: mkdir -p output
+      - name: Select essential and affected checks
+        id: plan
+        env:
+          FULL_REGRESSION: ${{ github.event_name == 'workflow_dispatch' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/ci/validation-plan.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validation-plan
+          path: output/validation-plan.json
+          if-no-files-found: error
+
+  frontend:
+    name: Frontend and interaction regressions
+    needs: scope
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    concurrency:
+      group: checks-frontend-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            scripts/preview/package-lock.json
+      - run: npm ci
+      - if: needs.scope.outputs.browser == 'true'
+        run: npm ci --prefix scripts/preview
+      - if: needs.scope.outputs.browser == 'true'
+        run: npx --prefix scripts/preview playwright install --with-deps chromium
+      - run: npm run check
+      - run: npm run prepare:frontend
+      - uses: actions/download-artifact@v4
+        with:
+          name: validation-plan
+          path: output
+      - name: Essential and affected browser checks
+        run: node scripts/ci/validation-plan.mjs preview
+      - name: Record browser evidence identity
+        if: always()
+        env:
+          EVIDENCE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node scripts/preview/record-evidence.mjs
+      - name: Preserve browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-diagnostics
+          path: |
+            output/playwright/
+            !output/playwright/**/*.webm
+          if-no-files-found: ignore
+      # Keep the original recordings intact, in scenario-sized archives. This
+      # avoids growing one diagnostic ZIP beyond the evidence transfer limit.
+      - name: Preserve waiting scene recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-recordings-scenes
+          path: output/playwright/waiting-visuals-real-preview.webm
+          if-no-files-found: ignore
+      - name: Preserve reaction recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-recordings-reactions
+          path: output/playwright/waiting-reactions-real-preview.webm
+          if-no-files-found: ignore
+      - name: Preserve verification recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-recordings-verification
+          path: output/playwright/waiting-verification-real-preview.webm
+          if-no-files-found: ignore
+      - name: Preserve report recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-recordings-report
+          path: output/playwright/case-report-waiting-real-preview.webm
+          if-no-files-found: ignore
+      - name: Preserve other browser recordings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-recordings-other
+          path: |
+            output/playwright/**/*.webm
+            !output/playwright/waiting-visuals-real-preview.webm
+            !output/playwright/waiting-reactions-real-preview.webm
+            !output/playwright/waiting-verification-real-preview.webm
+            !output/playwright/case-report-waiting-real-preview.webm
+          if-no-files-found: ignore
+
+  # Native changes run on both platforms, including draft PRs. UI-only changes
+  # do not recompile the native suite; the plan records this as not applicable.
+  backend:
+    needs: scope
+    if: needs.scope.outputs.native == 'true' || inputs.portable_windows
+    name: Backend tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    # Keep an expensive native build alive while newer UI-only fixes validate.
+    # GitHub retains only the latest pending run in this per-platform group.
+    concurrency:
+      group: checks-backend-${{ matrix.os }}-${{ github.ref }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    env:
+      CARGO_TERM_COLOR: always
+      # Match the release cache environment; fixture execution stays serial.
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential pkg-config libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: desktop-release-v1
+      - run: npm ci
+      - run: npm run prepare:frontend
+      - name: Backend tests
+        if: runner.os != 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+      - name: Windows backend tests with loader diagnostics
+        if: runner.os == 'Windows'
+        id: backend_windows
+        shell: pwsh
+        run: ./scripts/ci/windows-native-tests.ps1
+      - name: Verify Windows unit harness manifest
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/verify-windows-manifest.ps1 -Target harness
+      - name: Preserve Windows native failure evidence
+        if: failure() && runner.os == 'Windows' && steps.backend_windows.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/windows-native-diagnostics/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Build Windows portable review executable
+        if: runner.os == 'Windows' && inputs.portable_windows
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --locked --bin loginsight
+      - name: Verify Windows app manifest
+        if: runner.os == 'Windows' && inputs.portable_windows
+        shell: pwsh
+        run: ./scripts/ci/verify-windows-manifest.ps1 -Target app
+      - name: Preserve Windows manifest verification
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-manifest-verification-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/windows-manifest-verification/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Record portable executable identity
+        if: runner.os == 'Windows' && inputs.portable_windows
+        shell: pwsh
+        env:
+          REVIEW_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $destination = 'output/windows-portable-review'
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          Copy-Item 'src-tauri/target/release/loginsight.exe' "$destination/LogInsight.exe"
+          $digest = (Get-FileHash "$destination/LogInsight.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          @{
+            kind = 'portable-review-build'
+            platform = 'windows-x64'
+            sourceCommit = $env:REVIEW_SOURCE_SHA
+            buildCommit = (git rev-parse HEAD)
+            executable = 'LogInsight.exe'
+            sha256 = $digest
+          } | ConvertTo-Json | Set-Content "$destination/build-identity.json" -Encoding utf8
+      - name: Upload Windows portable review build
+        if: runner.os == 'Windows' && inputs.portable_windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: LogInsight-Windows-x64-review-${{ github.event.pull_request.head.sha || github.sha }}
+          path: output/windows-portable-review/
+          if-no-files-found: error
+          retention-days: 30
+
+# Optional portable review artifact only: no installers, updater runs, signing,
+# production configuration changes, repository writes or releases.
+
+  required:
+    name: Required validation
+    needs: [scope, frontend, backend]
+    if: always()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every selected gate to succeed
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          FRONTEND_RESULT: ${{ needs.frontend.result }}
+          NATIVE_REQUIRED: ${{ needs.scope.outputs.native == 'true' || inputs.portable_windows }}
+          BACKEND_RESULT: ${{ needs.backend.result }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          test "$FRONTEND_RESULT" = success
+          if [ "$NATIVE_REQUIRED" = true ]; then
+            test "$BACKEND_RESULT" = success
+          else
+            test "$BACKEND_RESULT" = skipped
+            echo 'Native checks were not applicable to these paths; no native pass is claimed.'
+          fi

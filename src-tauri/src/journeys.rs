@@ -191,18 +191,25 @@ struct View<'a> {
     derived: &'a [CompiledDerived],
 }
 impl View<'_> {
-    fn fetch(&self, index: usize) -> Event {
+    fn fetch(&self, index: usize) -> Result<Event, String> {
         match self.records {
-            Records::Memory(events) => events[index].clone(),
+            Records::Memory(events) => Ok(events[index].clone()),
             Records::Indexed(file) => {
-                sources::event_at(file, index, self.codes, self.system, self.derived)
+                let mut event = sources::event_at(file, index, self.codes, self.system, self.derived);
+                crate::analysis_runtime::attach_provenance(file, &mut event)?;
+                Ok(event)
             }
             Records::Empty => unreachable!(),
         }
     }
-    fn scan(
+    fn scan(&self, mut visit: impl FnMut(usize, &Event) -> Result<(), String>) -> Result<(), String> {
+        self.scan_mapped(|_| (), |i, event, ()| visit(i, event))
+    }
+    /// Like `scan`, with `map` run in parallel on each indexed event.
+    fn scan_mapped<T: Send>(
         &self,
-        mut visit: impl FnMut(usize, &Event) -> Result<(), String>,
+        map: impl Fn(&Event) -> T + Sync,
+        mut visit: impl FnMut(usize, &Event, T) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut failure = None;
         match self.records {
@@ -212,24 +219,25 @@ impl View<'_> {
                         operations::check()?;
                     }
                     if self.prepared.iter().all(|f| query::matches(event, f)) {
-                        visit(i, event)?;
+                        visit(i, event, map(event))?;
                     }
                 }
             }
-            Records::Indexed(file) => query::visit_indexed_prepared(
+            Records::Indexed(file) => query::visit_indexed_mapped(
                 file,
                 &self.prepared,
                 self.codes,
                 self.system,
                 self.derived,
-                |i| {
+                map,
+                |i, event, mapped| {
                     if failure.is_none() {
-                        if let Err(error) = visit(i, &self.fetch(i)) {
+                        if let Err(error) = visit(i, event, mapped) {
                             failure = Some(error);
                         }
                     }
                 },
-            ),
+            )?,
             Records::Empty => {}
         }
         if let Some(error) = failure {
@@ -245,10 +253,10 @@ fn with_view<T>(
     run: impl FnOnce(&View<'_>) -> Result<T, String>,
 ) -> Result<T, String> {
     crate::workspace::validate(filters)?;
-    let source = state.source.read();
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
-    let derived = state.derived.read();
+    let source = crate::analysis_runtime::source(&state);
+    let codes = crate::analysis_runtime::codes(&state);
+    let system = crate::analysis_runtime::system_codes(&state);
+    let derived = crate::analysis_runtime::derived(&state);
     let records = if let Some(events) = case {
         Records::Memory(events)
     } else {
@@ -289,11 +297,22 @@ pub(crate) fn fields_impl(
     with_view(state, filters, case, |view| {
         let mut fields = BTreeMap::<String, FieldAcc>::new();
         let (mut total, mut bytes, mut limited) = (0, 0usize, false);
-        view.scan(|_, event| {
+        // Values are extracted in parallel; counting stays in file order.
+        let extract = |event: &Event| {
+            let canonical: Vec<(&str, String)> =
+                CANONICAL.iter().filter_map(|column| key(event, column).map(|value| (*column, value))).collect();
+            let own: Vec<(String, String)> = event
+                .fields
+                .iter()
+                .filter(|(name, value)| valid_field(name).is_ok() && (value.is_string() || value.is_number()))
+                .filter_map(|(name, _)| key(event, name).map(|value| (name.clone(), value)))
+                .collect();
+            (canonical, own)
+        };
+        view.scan_mapped(extract, |_, _, (canonical, own)| {
             total += 1;
             // Canonical entities link the same user, address or host across formats.
-            for column in CANONICAL {
-                let Some(value) = key(event, column) else { continue };
+            for (column, value) in canonical {
                 let acc = fields.entry((*column).to_string()).or_default();
                 acc.present += 1;
                 if !acc.values.contains(&value) {
@@ -305,18 +324,12 @@ pub(crate) fn fields_impl(
                     }
                 }
             }
-            for (name, value) in &event.fields {
-                if valid_field(name).is_err() || !value.is_string() && !value.is_number() {
-                    continue;
-                }
-                let Some(value) = key(event, name) else {
-                    continue;
-                };
-                if !fields.contains_key(name) && fields.len() >= FIELD_CAP {
+            for (name, value) in own {
+                if !fields.contains_key(&name) && fields.len() >= FIELD_CAP {
                     limited = true;
                     continue;
                 }
-                let acc = fields.entry(name.clone()).or_default();
+                let acc = fields.entry(name).or_default();
                 acc.present += 1;
                 if !acc.values.contains(&value) {
                     if acc.values.len() >= DISTINCT_CAP
@@ -518,11 +531,11 @@ pub(crate) fn events_impl(
         let rows = ids
             .into_iter()
             .map(|i| {
-                let (row, clipped) = crate::event_preview::preview(&view.fetch(i as usize));
+                let (row, clipped) = crate::event_preview::preview(&view.fetch(i as usize)?);
                 rows_clipped += usize::from(clipped);
-                row
+                Ok(row)
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         operations::check()?;
         Ok(JourneyEvents {
             total,
@@ -541,14 +554,17 @@ pub async fn journey_fields(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: tauri::AppHandle,
+    operation_id: Option<String>,
 ) -> Result<Vec<JourneyField>, String> {
-    let case_events = crate::case_cache::resolve(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         fields_impl(
             app.state::<AppState>().inner(),
             &filters,
-            case_events.as_deref().map(Vec::as_slice),
+            case_events.as_deref(),
         )
     })
     .await?
@@ -558,6 +574,8 @@ pub async fn journey_index(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     field: String,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -566,14 +584,15 @@ pub async fn journey_index(
     from: Option<i64>,
     to: Option<i64>,
     app: tauri::AppHandle,
+    operation_id: Option<String>,
 ) -> Result<JourneyIndex, String> {
-    let case_events = crate::case_cache::resolve(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let filters = window_filters(&field, filters, from, to)?;
         index_impl(
             app.state::<AppState>().inner(),
             &filters,
-            case_events.as_deref().map(Vec::as_slice),
+            case_events.as_deref(),
             &field,
             offset.unwrap_or(0),
             limit.unwrap_or(50),
@@ -588,6 +607,8 @@ pub async fn journey_events(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     field: String,
     value: String,
     from: Option<i64>,
@@ -595,13 +616,14 @@ pub async fn journey_events(
     offset: Option<usize>,
     limit: Option<usize>,
     app: tauri::AppHandle,
+    operation_id: Option<String>,
 ) -> Result<JourneyEvents, String> {
-    let case_events = crate::case_cache::resolve(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         events_impl(
             app.state::<AppState>().inner(),
             &filters,
-            case_events.as_deref().map(Vec::as_slice),
+            case_events.as_deref(),
             &field,
             &value,
             from,
@@ -619,7 +641,7 @@ mod tests {
     fn state() -> AppState {
         AppState {
             source: parking_lot::RwLock::new(SourceData::None),
-            big_data_enabled: std::sync::atomic::AtomicBool::new(false),
+            source_publication: parking_lot::RwLock::new(Default::default()),
             source_names: parking_lot::RwLock::new(vec![]),
             derived: parking_lot::RwLock::new(vec![]),
             codes: parking_lot::RwLock::new(Default::default()),

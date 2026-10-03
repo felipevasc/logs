@@ -16,22 +16,27 @@ window.EventInsights = (() => {
 
   async function render(ev, pane) {
     const mine = ++serial;
-    const view = current = { ev, pane, revealed: false, data: null };
+    const owner = window.AnalysisContexts?.capture();
+    const isCurrent = () => mine === serial && state.currentDetailEv === ev && pane.isConnected && !$("#drawer").hidden
+      && (!owner || window.AnalysisContexts.isCurrent(owner));
+    const view = current = { ev, pane, revealed: false, data: null, isCurrent };
     pane.querySelector(".insight-block")?.remove();
     let data;
     try { data = await api("event_insights", { event: ev, ...analyticsRequest(workspaceScope()) }, { silent: true }); } catch { return; }
-    if (mine !== serial || state.currentDetailEv !== ev || !pane.isConnected) return;
+    if (!isCurrent()) return;
     view.data = data;
     present(view);
   }
 
-  function present({ ev, pane, data: original, revealed }) {
+  function present({ ev, pane, data: original, revealed, isCurrent }) {
+    if (!isCurrent()) return;
     pane.querySelector(".insight-block")?.remove();
     const data = revealed ? original : window.EvidenceUI.redact(original);
     const entities = data.entities.filter(e => ENTITY_ROLES.has(e.column));
     const rules = [...data.rules.map(r => ({ ...r, snippet: "", source: "detecção" })), ...data.threats.map(t => ({ ...t, source: t.category }))];
     if (!entities.length && !data.action && !rules.length && !data.decoded.length) return;
     const block = el("section", "insight-block");
+    if (data.related_findings_calculated === false) block.append(el("p", "small muted", "Correlações do conjunto ainda não calculadas. Use Calcular comprometimentos para consultar os achados relacionados."));
     if(data.related_findings_total > (data.related_findings||[]).length) block.append(el("p","small muted",`Prévia de ${(data.related_findings||[]).length} de ${data.related_findings_total} achados relacionados. Consulte Indícios com este registro selecionado para navegar pelo resultado completo.`));
     for (const finding of data.related_findings || []) {
       if (!finding.relationships?.length) continue;
@@ -75,7 +80,7 @@ window.EventInsights = (() => {
       const pre = el("pre", "code-pane", protectedText);
       const inspect = el("button", "btn ghost small", "Inspecionar subcampos"); inspect.type = "button";
       // Keep the original only in the click closure, never in hidden DOM attributes.
-      inspect.onclick = () => window.ValueInspector?.open(raw.text, { label: `${d.kind} · ${d.source}`, path: `$::decoded[${data.decoded.indexOf(d)}]`, revealed });
+      inspect.onclick = () => window.ValueInspector?.open(raw.text, { label: `${d.kind} · ${d.source}`, path: `$::decoded[${data.decoded.indexOf(d)}]`, revealed, isCurrent });
       details.append(summary, el("p", "small muted", "Conteúdo interpretado localmente; não comprova autenticidade e não é executado."), pre, inspect);
       block.append(details);
     }

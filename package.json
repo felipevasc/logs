@@ -1,22 +1,24 @@
 {
   "name": "loginsight",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.12.1",
   "type": "module",
   "scripts": {
-    "test": "node scripts/test-case-autosave.mjs && node scripts/preview/test-workspace-scope.mjs && node scripts/preview/test-value-inspector-unit.mjs && node scripts/release/test-release.mjs && node scripts/release/test-process-supervision.mjs",
-    "test:preview": "node scripts/preview/run-smoke.mjs",
-    "check": "npm test && node scripts/release/verify-version.mjs && npm run prepare:frontend",
     "prepare:frontend": "node scripts/prepare-frontend.mjs",
     "preview": "node --watch scripts/preview/serve.mjs 4173",
     "vendor:timeline": "node scripts/vendor-timeline-export.mjs",
     "vendor:icons": "node scripts/vendor-note-icons.mjs",
     "dev": "npm run prepare:frontend && tauri dev",
-    "build": "npm run prepare:frontend && tauri build",
-    "icon": "tauri icon"
+    "build": "npm run prepare:frontend && node scripts/tauri-build.mjs",
+    "release": "node scripts/release/release.mjs",
+    "icon": "tauri icon",
+    "check:js": "node scripts/check-js.mjs",
+    "test": "node scripts/test.mjs",
+    "test:preview": "node scripts/preview/run-smoke.mjs",
+    "check": "npm run check:js && npm test && node scripts/release/verify-version.mjs && node scripts/release/test-release.mjs"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "^2.12.0"
   },
   "dependencies": {
     "html-to-image": "1.11.13",

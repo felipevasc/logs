@@ -1,6 +1,21 @@
 //! Exact distinct count with a bounded in-memory set and a temporary disk spill.
 use std::collections::HashSet;
 
+#[cfg(test)]
+thread_local! { static SPILL_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(crate) fn with_spill_failure<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset { fn drop(&mut self) { SPILL_FAILURE.with(|flag| flag.set(self.0)); } }
+    let _reset = Reset(SPILL_FAILURE.with(|flag| flag.replace(true)));
+    f()
+}
+fn check_spill_failure() -> Result<(), String> {
+    #[cfg(test)]
+    if SPILL_FAILURE.with(std::cell::Cell::get) { return Err("Falha de disco temporário injetada no teste.".into()); }
+    Ok(())
+}
+
 /// Exact frequency ranking. Spill before either the key budget or estimated
 /// string storage exceeds the in-memory budget; SQLite's page cache is 2 MiB.
 #[derive(Default)]
@@ -13,65 +28,49 @@ impl Terms {
     const KEYS: usize = 25_000;
     const BYTES: usize = 8 * 1024 * 1024;
 
-    pub fn insert(&mut self, value: String) {
+    pub fn insert(&mut self, value: String) { self.insert_impl(value, false).expect("Falha ao contar ranking no disco"); }
+    pub(crate) fn try_insert(&mut self, value: String) -> Result<usize, String> { self.insert_impl(value, true) }
+    fn insert_impl(&mut self, value: String, bounded: bool) -> Result<usize, String> {
+        if bounded { check_spill_failure()?; }
+        let bytes = value.len().saturating_add(64);
         if self.disk.is_none() {
-            if let Some(count) = self.values.get_mut(&value) {
-                *count += 1;
-                return;
-            }
-            let bytes = value.len().saturating_add(64);
+            if let Some(count) = self.values.get_mut(&value) { *count += 1; return Ok(0); }
             if self.values.len() < Self::KEYS && self.bytes.saturating_add(bytes) <= Self::BYTES {
                 self.bytes += bytes;
                 self.values.insert(value, 1);
-                return;
+                return Ok(bytes);
             }
-            let db = rusqlite::Connection::open("")
-                .expect("Não foi possível criar arquivo temporário para o ranking");
+            let db = rusqlite::Connection::open("").map_err(|e| e.to_string())?;
             db.progress_handler(10_000, Some(crate::operations::cancelled));
-            db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; CREATE TABLE terms(v TEXT PRIMARY KEY,n INTEGER NOT NULL) WITHOUT ROWID; BEGIN").expect("Falha ao preparar ranking no disco");
+            let cap = if bounded { format!("PRAGMA max_page_count={};", (crate::resources::analytics_bytes() / 4096).max(16)) } else { String::new() };
+            db.execute_batch(&format!("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; {cap} CREATE TABLE terms(v TEXT PRIMARY KEY,n INTEGER NOT NULL) WITHOUT ROWID; BEGIN")).map_err(|e| e.to_string())?;
             {
-                let mut insert = db
-                    .prepare("INSERT INTO terms(v,n) VALUES(?1,?2)")
-                    .expect("Falha ao preparar ranking");
-                for (value, count) in self.values.drain() {
-                    insert
-                        .execute(rusqlite::params![value, count as i64])
-                        .expect("Falha ao transferir ranking para o disco");
-                }
+                let mut insert = db.prepare("INSERT INTO terms(v,n) VALUES(?1,?2)").map_err(|e| e.to_string())?;
+                for (value, count) in self.values.drain() { insert.execute(rusqlite::params![value, count as i64]).map_err(|e| e.to_string())?; }
             }
             self.values.shrink_to_fit();
             self.bytes = 0;
             self.disk = Some(db);
         }
-        self.disk
-            .as_ref()
-            .unwrap()
-            .prepare_cached(
-                "INSERT INTO terms(v,n) VALUES(?1,1) ON CONFLICT(v) DO UPDATE SET n=n+1",
-            )
-            .expect("Falha ao preparar contagem do ranking")
-            .execute([value])
-            .expect("Falha ao contar ranking no disco");
+        let n: i64 = self.disk.as_ref().unwrap().prepare_cached(
+            "INSERT INTO terms(v,n) VALUES(?1,1) ON CONFLICT(v) DO UPDATE SET n=n+1 RETURNING n",
+        ).map_err(|e| e.to_string())?.query_row([value], |row| row.get(0)).map_err(|e| e.to_string())?;
+        Ok(if n == 1 { bytes } else { 0 })
     }
-
-    pub fn top(self, limit: usize) -> Vec<(String, usize)> {
+    pub fn top(self, limit: usize) -> Vec<(String, usize)> { self.try_top(limit).expect("Falha ao ler ranking") }
+    pub(crate) fn try_top(self, limit: usize) -> Result<Vec<(String, usize)>, String> {
         if let Some(db) = self.disk {
-            let mut select = db
-                .prepare("SELECT v,n FROM terms ORDER BY n DESC,v ASC LIMIT ?1")
-                .expect("Falha ao ordenar ranking no disco");
-            return select
-                .query_map([limit.min(i64::MAX as usize) as i64], |row| {
-                    Ok((row.get(0)?, row.get::<_, i64>(1)? as usize))
-                })
-                .expect("Falha ao consultar ranking")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("Falha ao ler ranking");
+            let mut select = db.prepare("SELECT v,n FROM terms ORDER BY n DESC,v ASC LIMIT ?1").map_err(|e| e.to_string())?;
+            let values = select.query_map([limit.min(i64::MAX as usize) as i64], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as usize)))
+                .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+            return Ok(values);
         }
         let mut values: Vec<_> = self.values.into_iter().collect();
         values.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         values.truncate(limit);
-        values
+        Ok(values)
     }
+
 }
 
 #[cfg(test)]
@@ -132,51 +131,69 @@ impl Default for Counter {
 impl Counter {
     const BYTES: usize = 2 * 1024 * 1024;
     pub fn insert(&mut self, value: String) {
+        self.insert_impl(value, false).expect("Falha ao contar valores distintos no disco");
+    }
+    /// Returns newly retained key payload, for a shared aggregate budget.
+    /// Callers that need recoverable resource errors must use this API.
+    pub(crate) fn try_insert(&mut self, value: String) -> Result<usize, String> {
+        self.insert_impl(value, true)
+    }
+    fn insert_impl(&mut self, value: String, bounded: bool) -> Result<usize, String> {
+        if bounded { check_spill_failure()?; }
+        let bytes = value.len().saturating_add(64);
         if let Some(db) = &self.disk {
-            self.count += db
-                .prepare_cached("INSERT OR IGNORE INTO vals(v) VALUES(?1)")
-                .expect("Falha ao preparar contagem de valores distintos no disco")
-                .execute([value])
-                .expect("Falha ao contar valores distintos no disco");
-            return;
+            let added = db.prepare_cached("INSERT OR IGNORE INTO vals(v) VALUES(?1)")
+                .and_then(|mut statement| statement.execute([value]))
+                .map_err(|e| e.to_string())?;
+            self.count += added;
+            return Ok(if added > 0 { bytes } else { 0 });
         }
-        if self.values.contains(&value) {
-            return;
-        }
-        self.bytes = self.bytes.saturating_add(value.len().saturating_add(64));
+        if self.values.contains(&value) { return Ok(0); }
+        self.bytes = self.bytes.saturating_add(bytes);
         self.values.insert(value);
         self.count = self.values.len();
         if self.values.len() >= 25_000 || self.bytes >= Self::BYTES {
-            let mut db = rusqlite::Connection::open("")
-                .expect("Não foi possível criar arquivo temporário para a contagem");
+            let mut db = rusqlite::Connection::open("").map_err(|e| e.to_string())?;
             db.progress_handler(10_000, Some(crate::operations::cancelled));
-            db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-512; PRAGMA temp_store=FILE; CREATE TABLE vals(v TEXT PRIMARY KEY) WITHOUT ROWID;").expect("Falha ao preparar contagem");
+            let pages = (crate::resources::analytics_bytes() / 4096).max(16);
+            let cap = if bounded { format!("PRAGMA max_page_count={pages};") } else { String::new() };
+            db.execute_batch(&format!("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-512; PRAGMA temp_store=FILE; {cap} CREATE TABLE vals(v TEXT PRIMARY KEY) WITHOUT ROWID;")).map_err(|e| e.to_string())?;
             {
-                let tx = db.transaction().expect("Falha na contagem");
+                let tx = db.transaction().map_err(|e| e.to_string())?;
                 {
-                    let mut stmt = tx
-                        .prepare("INSERT INTO vals(v) VALUES(?1)")
-                        .expect("Falha na contagem");
-                    for v in self.values.drain() {
-                        stmt.execute([v]).expect("Falha na contagem");
-                    }
+                    let mut stmt = tx.prepare("INSERT INTO vals(v) VALUES(?1)").map_err(|e| e.to_string())?;
+                    for v in self.values.drain() { stmt.execute([v]).map_err(|e| e.to_string())?; }
                 }
-                tx.commit().expect("Falha na contagem");
+                tx.commit().map_err(|e| e.to_string())?;
             }
-            db.execute_batch("BEGIN").expect("Falha na contagem");
+            db.execute_batch("BEGIN").map_err(|e| e.to_string())?;
             self.disk = Some(db);
             self.values.shrink_to_fit();
             self.bytes = 0;
         }
+        Ok(bytes)
     }
-    pub fn len(&self) -> usize {
-        self.count
-    }
+    pub fn len(&self) -> usize { self.count }
 }
 
 #[cfg(test)]
 mod counter_tests {
     use super::Counter;
+
+    #[test]
+    fn cached_spill_statement_preserves_fallible_counts_and_new_payload_budget() {
+        let mut counter = Counter::default();
+        let first = "日".repeat(Counter::BYTES / 3 + 1);
+        assert_eq!(counter.try_insert(first.clone()).unwrap(), first.len() + 64);
+        assert!(counter.disk.is_some());
+        assert_eq!(counter.try_insert(first).unwrap(), 0);
+        for n in 0..1000 {
+            let value = format!("東京-{n}");
+            assert_eq!(counter.try_insert(value.clone()).unwrap(), value.len() + 64);
+            assert_eq!(counter.try_insert(value).unwrap(), 0);
+        }
+        assert_eq!(counter.len(), 1001);
+    }
 
     #[test]
     fn distinct_spills_by_bytes_before_key_count() {
@@ -188,49 +205,5 @@ mod counter_tests {
         counter.insert(value);
         counter.insert("another".into());
         assert_eq!(counter.len(), 2);
-    }
-
-    #[test]
-    #[ignore = "manual performance benchmark; validates exact counts after spilling"]
-    fn benchmark_counter_spill() {
-        for (name, count, cardinality) in [
-            ("unique_100k", 100_000, 100_000),
-            ("mixed_1m", 1_000_000, 50_000),
-        ] {
-            // Prepare identical data outside the timed region. The mixed case
-            // crosses the disk threshold and then repeatedly revisits keys.
-            let values: Vec<_> = (0..count)
-                .map(|i| format!("value-{:06}-ação-東京", i % cardinality))
-                .collect();
-            let expected = values
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            assert_eq!(expected, cardinality);
-            let mut samples = Vec::new();
-            for _ in 0..5 {
-                let start = std::time::Instant::now();
-                let mut counter = Counter::default();
-                for value in &values {
-                    counter.insert(value.clone());
-                }
-                assert!(counter.disk.is_some());
-                assert_eq!(counter.len(), expected);
-                samples.push(start.elapsed().as_secs_f64() * 1000.0);
-            }
-            let mut sorted = samples.clone();
-            sorted.sort_by(f64::total_cmp);
-            println!(
-                "COUNTER_BENCH {}",
-                serde_json::json!({
-                    "workload": name,
-                    "events": count,
-                    "distinct": expected,
-                    "samplesMs": samples,
-                    "medianMs": sorted[2],
-                    "p95Ms": sorted[4],
-                })
-            );
-        }
     }
 }

@@ -43,6 +43,8 @@ try {
   // another run's evidence in the repository's output/playwright directory.
   const preview = join(directory, 'scripts', 'preview');
   await mkdir(preview, { recursive: true });
+  await mkdir(join(directory, 'scripts', 'ci'), { recursive: true });
+  await copyFile(resolve('scripts/ci/validation-plan.mjs'), join(directory, 'scripts', 'ci', 'validation-plan.mjs'));
   for (const name of ['run-smoke.mjs', 'managed-process.mjs', 'windows-job.ps1']) {
     await copyFile(resolve('scripts/preview', name), join(preview, name));
   }

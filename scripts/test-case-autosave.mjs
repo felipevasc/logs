@@ -6,8 +6,8 @@ import vm from "node:vm";
 
 const current = readFileSync(new URL("../frontend/app.js", import.meta.url), "utf8");
 const workspace = readFileSync(new URL("../frontend/workspace-context.js", import.meta.url), "utf8");
-const replacement = workspace.slice(workspace.indexOf("async function replaceCases(store)"), workspace.indexOf("  let membershipSignature"));
-assert.ok(replacement.startsWith("async function replaceCases(store)"));
+const replacement = workspace.slice(workspace.indexOf("async function replaceCases(store,"), workspace.indexOf("  let nativeMembership ="));
+assert.ok(replacement.startsWith("async function replaceCases(store,"));
 const copy = value => JSON.parse(JSON.stringify(value));
 const turn = () => new Promise(resolve => setImmediate(resolve));
 const store = (revision = 1, name = "local") => ({ revision, active: "c1", cases: [{ id: "c1", name }], schemaVersion: 2 });
@@ -20,7 +20,7 @@ function harness(source, responder) {
     state: { cases: store(), refreshVersion: 0 },
     sourceQueue: Promise.resolve(), restoringCase: false, initialized: true,
     caseGeneration: 0, generation: 0, detailRequest: 0, scope: "case", states: new Map(), runtime: new Map(),
-    renderCaseBar() {}, updateAnalysisBadge() {}, async syncActiveCaseArtifacts() {}, async initialize() {},
+    renderCaseBar() {}, updateAnalysisBadge() {}, activeCase() { return context.state.cases.cases[0]; }, async loadDerivedFields() {}, async syncActiveCaseArtifacts() {}, async initialize() {},
     setTimeout(fn) { const id = ++serial; timers.set(id, fn); return id; },
     clearTimeout(id) { timers.delete(id); },
     toast(message, kind) { toasts.push({ message, kind }); },
@@ -37,7 +37,7 @@ function harness(source, responder) {
         .finally(() => { inFlight--; });
     },
   });
-  const start = source.includes("let caseSaveActive =") ? source.indexOf("let caseSaveActive =") : source.indexOf("let casesSaveQueue =");
+  const start = source.indexOf("let casesSaveQueue =");
   assert.ok(start >= 0);
   const block = source.slice(start, source.indexOf("function defaultCaseWorkspace()"));
   vm.runInContext(block + "\n" + replacement, context);

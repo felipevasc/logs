@@ -1,2 +1,8 @@
+# Source-based regression fixtures and approved animation hashes use LF on all platforms.
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.css text eol=lf
+*.html text eol=lf
 # Keep upstream browser bundles intact, including whitespace in license notices.
-frontend/vendor/** -whitespace
+frontend/vendor/** -text -whitespace

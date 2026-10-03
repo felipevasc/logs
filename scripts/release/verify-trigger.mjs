@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 
 // Also called by the publisher itself: invoking it directly must not bypass the
 // same check used before dependency installation and builds in CI.
@@ -13,4 +14,6 @@ export function verifyTrigger(version, env = process.env) {
   return tag;
 }
 
-verifyTrigger(JSON.parse(readFileSync('package.json', 'utf8')).version);
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  verifyTrigger(JSON.parse(readFileSync('package.json', 'utf8')).version);
+}

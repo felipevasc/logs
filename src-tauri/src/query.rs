@@ -1,13 +1,10 @@
+use std::sync::Arc;
 use crate::model::CodesConfig;
 use crate::model::{label_class, Event, LineMeta, LV_OTHER};
 use crate::sources::{event_at, line_bytes, CompiledDerived, FileIndex};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use parking_lot::Mutex;
-use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Filter {
@@ -30,13 +27,21 @@ pub struct PreparedFilter {
     num2: Option<f64>,
     threat: Option<crate::threats::RuleMatcher>,
     /// Compiled search expression (`op = "query"`).
-    expr: Option<crate::querylang::Expr>,
+    pub(crate) expr: Option<crate::querylang::Expr>,
     /// Lowercased values for `in` / `not_in`.
     set: Option<std::collections::HashSet<String>>,
     /// Networks for `cidr` / `not_cidr`.
     nets: Vec<crate::querylang::IpNet>,
     /// Detection rule reproduced as evidence filter (`op = "detection"`).
     detection: Option<(std::sync::Arc<crate::detections::RuleSet>, usize)>,
+}
+
+impl PreparedFilter {
+    /// Parsed numeric bounds, shared with the SQL compiler so native range
+    /// predicates use exactly the same timestamp/unit parsing as the reader.
+    pub(crate) fn numeric_bounds(&self) -> (Option<f64>, Option<f64>) {
+        (self.num, self.num2)
+    }
 }
 
 /// Values of an `in` filter: one per line (commas also separate).
@@ -61,7 +66,7 @@ pub(crate) fn prepare_with_threat_catalog(
             let is_re = f.op == "regex";
             let is_query = f.op == "query";
             PreparedFilter {
-                regex: is_re.then(|| regex::Regex::new(&f.value).ok()).flatten(),
+                regex: is_re.then(|| crate::query_regex::compile(&f.value, crate::query_regex::ORDINARY).ok()).flatten(),
                 needle_lower: if is_query { String::new() } else { f.value.to_lowercase() },
                 num: value_as_num(&f.column, &f.value),
                 num2: value_as_num(&f.column, f.value2.as_deref().unwrap_or("")),
@@ -108,6 +113,54 @@ pub struct QueryResult {
     pub rows: Vec<Event>,
 }
 
+/// Interactive pages do not wait for an exact global count. The exact APIs
+/// remain available to analytics, exports and MCP callers.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryPage {
+    pub rows: Vec<Event>,
+    pub total: Option<usize>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub engine: String,
+    pub warning: Option<String>,
+}
+
+impl QueryPage {
+    pub(crate) fn from_exact(result: QueryResult, offset: usize, engine: &str, warning: Option<String>) -> Self {
+        let has_more = offset.saturating_add(result.rows.len()) < result.total;
+        Self {
+            rows: result.rows,
+            total: Some(result.total),
+            has_more,
+            next_cursor: None,
+            engine: engine.into(),
+            warning,
+        }
+    }
+}
+
+/// Exact page membership, shared by full Event and opt-in projected responses.
+/// IDs are memory positions on the memory route and indexed IDs otherwise.
+pub(crate) struct SelectedPage {
+    pub ids: Vec<usize>,
+    pub total: Option<usize>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub engine: String,
+    pub warning: Option<String>,
+}
+impl SelectedPage {
+    pub(crate) fn into_full(self, rows: Vec<Event>) -> QueryPage {
+        QueryPage { rows, total: self.total, has_more: self.has_more,
+            next_cursor: self.next_cursor, engine: self.engine, warning: self.warning }
+    }
+    fn exact(ids: Vec<usize>, total: usize, offset: usize, engine: &str, warning: Option<String>) -> Self {
+        Self { has_more: offset.saturating_add(ids.len()) < total, ids,
+            total: Some(total), next_cursor: None, engine: engine.into(), warning }
+    }
+}
+
 #[derive(Serialize, Default)]
 pub struct AggResult {
     pub columns: Vec<String>,
@@ -116,7 +169,29 @@ pub struct AggResult {
     pub group_values: Vec<Option<String>>,
     pub incompatible_units: Vec<usize>,
     pub value_units: Vec<String>,
+    /// Groups left out beyond [`MAX_GROUPS`] (the smallest by the first measure).
+    pub omitted_groups: usize,
+    /// Records counted in the omitted groups, when a count is among the measures.
+    pub omitted_records: u64,
+    /// Explicit bounded-work failure. Never publish a partial aggregate as exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
+
+impl AggResult {
+    pub(crate) fn failure(error: String) -> Self { Self { error: Some(error), ..Self::default() } }
+    pub(crate) fn budget_error() -> Self {
+        Self { error: Some("Agrupamento excede o orçamento de grupos. Reduza o período/filtros, escolha um campo menos distinto ou use uma contagem simples.".into()), ..Self::default() }
+    }
+}
+
+fn group_budget(specs: &[AggSpec]) -> usize {
+    if !specs.is_empty() && specs.iter().all(|spec| spec.func == "count") { MAX_GROUPS * 2 } else { MAX_GROUPS }
+}
+
+/// Groups returned at most. Values with millions of distinct groups (ids,
+/// messages) would otherwise produce payloads the interface cannot render.
+pub(crate) const MAX_GROUPS: usize = 50_000;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,119 +233,158 @@ fn value_as_num(column: &str, s: &str) -> Option<f64> {
 }
 
 pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
+    matches_in_domain(ev, pf, false)
+}
+
+/// Line metadata reserves zero for an absent timestamp. Only indexed residual
+/// verification inherits that sentinel; a standalone Event's Some(0) is a
+/// present timestamp and must remain distinct from None in Cases/memory views.
+pub(crate) fn matches_indexed(ev: &Event, pf: &PreparedFilter) -> bool {
+    matches_in_domain(ev, pf, true)
+}
+
+fn matches_in_domain(ev: &Event, pf: &PreparedFilter, indexed: bool) -> bool {
     let f = &pf.f;
-    if f.op == "threat_rule" {
-        return f.column == "_all"
-            && pf
-                .threat
-                .as_ref()
-                .is_some_and(|matcher| matcher.matches(ev));
-    }
-    if f.op == "query" {
+    let op = f.op.as_str();
+    match op {
+        "threat_rule" => {
+            return f.column == "_all"
+                && pf
+                    .threat
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.matches(ev))
+        }
         // An invalid expression was rejected by validation; never match silently.
-        return pf.expr.as_ref().is_some_and(|expr| expr.matches(ev));
+        "query" => return pf.expr.as_ref().is_some_and(|expr| {
+            if indexed { expr.matches_indexed(ev) } else { expr.matches(ev) }
+        }),
+        "detection" => {
+            return pf
+                .detection
+                .as_ref()
+                .is_some_and(|(set, index)| set.rules[*index].matches(ev))
+        }
+        "pattern" => return crate::insights::pattern_of(&ev.message) == f.value,
+        _ => {}
     }
-    if f.op == "detection" {
-        return pf
-            .detection
-            .as_ref()
-            .is_some_and(|(set, index)| set.rules[*index].matches(ev));
-    }
-    let col = f.column.as_str();
-    let needle = pf.needle_lower.as_str();
-    if let Some(set) = &pf.set {
-        if f.op == "in_exact" { return ev.col_ref(col).is_some_and(|v| set.contains(v.as_ref())); }
-        let hit = ev
-            .col_ref(col)
-            .is_some_and(|v| set.contains(&v.trim().to_lowercase()));
-        return (f.op == "in") == hit;
-    }
-    if matches!(f.op.as_str(), "cidr" | "not_cidr") {
-        let hit = ev
-            .col_ref(col)
-            .and_then(|v| crate::entities::parse_ip(&v))
-            .is_some_and(|ip| pf.nets.iter().any(|n| n.contains(ip)));
-        return (f.op == "cidr") == hit;
-    }
-    if f.op == "pattern" {
-        return crate::insights::pattern_of(&ev.message) == f.value;
-    }
-
-    if f.op == "regex" {
-        let hay: Cow<'_, str> = if col == "_all" {
-            Cow::Owned(format!("{}\n{}", ev.message, ev.raw))
-        } else {
-            ev.col_ref(col).unwrap_or(Cow::Borrowed(""))
-        };
-        return match &pf.regex {
-            Some(re) => re.is_match(&hay),
-            // regex inválida → contém (case-insensitive ASCII, como ci_contains_bytes)
-            None => false,
-        };
-    }
-
-    if col == "_all" {
+    if f.column == "_all" && !reads_all_as_column(op) {
         let text = format!("{}\n{}", ev.message, ev.raw);
-        return match f.op.as_str() {
-            "contains" => ci_contains_bytes(text.as_bytes(), needle.as_bytes()),
-            "not_contains" => !ci_contains_bytes(text.as_bytes(), needle.as_bytes()),
+        let needle = pf.needle_lower.as_bytes();
+        return match op {
+            "regex" => pf.regex.as_ref().is_some_and(|re| re.is_match(&text)),
+            "contains" => ci_contains_bytes(text.as_bytes(), needle),
+            "not_contains" => !ci_contains_bytes(text.as_bytes(), needle),
             _ => false,
         };
     }
-    match f.op.as_str() {
-        "contains" => ev
-            .col_ref(col)
-            .map(|s| ci_contains_bytes(s.as_bytes(), needle.as_bytes()))
-            .unwrap_or(false),
-        "not_contains" => ev
-            .col_ref(col)
-            .map(|s| !ci_contains_bytes(s.as_bytes(), needle.as_bytes()))
-            .unwrap_or(true),
-        "equals" => ev
-            .col_ref(col)
-            .map(|s| s.eq_ignore_ascii_case(f.value.trim()))
-            .unwrap_or(false),
-        "not_equals" => ev
-            .col_ref(col)
-            .map(|s| !s.eq_ignore_ascii_case(f.value.trim()))
-            .unwrap_or(true),
-        "equals_exact" => ev
-            .col_ref(col)
-            .map(|s| s.as_ref() == f.value)
-            .unwrap_or(false),
-        "not_equals_exact" => ev
-            .col_ref(col)
-            .map(|s| s.as_ref() != f.value)
-            .unwrap_or(true),
-        "starts_with" => ev
-            .col_ref(col)
-            .map(|s| {
-                let (hay, ndl) = (s.as_bytes(), needle.as_bytes());
-                hay.len() >= ndl.len() && hay[..ndl.len()].eq_ignore_ascii_case(ndl)
-            })
-            .unwrap_or(false),
-        "empty" => ev.col_ref(col).map(|s| s.trim().is_empty()).unwrap_or(true),
-        "not_empty" => ev
-            .col_ref(col)
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false),
-        "gt" | "gte" | "lt" | "lte" => {
-            let (Some(a), Some(b)) = (ev.col_num(col), pf.num) else {
-                return false;
-            };
-            match f.op.as_str() {
+    if is_numeric_op(op) {
+        let number = ev.col_num(&f.column);
+        return number_matches(pf, number.filter(|value| !indexed || f.column != "timestamp" || *value != 0.0));
+    }
+    value_matches(pf, ev.col_ref(&f.column).as_deref())
+}
+
+/// List and network operators read a column literally named `_all`.
+pub(crate) fn reads_all_as_column(op: &str) -> bool {
+    matches!(op, "in" | "not_in" | "in_exact" | "cidr" | "not_cidr")
+}
+
+pub(crate) fn is_numeric_op(op: &str) -> bool {
+    matches!(op, "gt" | "gte" | "lt" | "lte" | "between")
+}
+
+/// Numeric operators applied to the column's number (`None` when absent).
+pub(crate) fn number_matches(pf: &PreparedFilter, a: Option<f64>) -> bool {
+    let Some(a) = a else { return false };
+    match pf.f.op.as_str() {
+        "between" => match (pf.num, pf.num2) {
+            (Some(lo), Some(hi)) => a >= lo && a <= hi,
+            _ => false,
+        },
+        op => {
+            let Some(b) = pf.num else { return false };
+            match op {
                 "gt" => a > b,
                 "gte" => a >= b,
                 "lt" => a < b,
                 _ => a <= b,
             }
         }
-        "between" => {
-            let (Some(a), Some(lo), Some(hi)) = (ev.col_num(col), pf.num, pf.num2) else {
-                return false;
-            };
-            a >= lo && a <= hi
+    }
+}
+
+#[cfg(test)]
+mod timestamp_domain_tests {
+    use super::*;
+
+    #[test]
+    fn preserved_epoch_zero_is_present_but_indexed_numeric_verification_uses_its_sentinel() {
+        for timestamp in [None, Some(-1), Some(0), Some(1)] {
+            let mut event = Event::empty(); event.timestamp = timestamp;
+            let mut indexed_reference = event.clone();
+            indexed_reference.timestamp = timestamp.filter(|value| *value != 0);
+            for op in ["gt", "gte", "lt", "lte", "between"] {
+                let filter = Filter { column: "timestamp".into(), op: op.into(), value: "0".into(), value2: Some("1".into()) };
+                let prepared = prepare(&[filter]);
+                assert_eq!(matches_indexed(&event, &prepared[0]), matches(&indexed_reference, &prepared[0]), "{timestamp:?} {op}");
+                if timestamp == Some(0) && matches!(op, "gte" | "lte" | "between") {
+                    assert!(matches(&event, &prepared[0]), "a preserved epoch value remains queryable");
+                    assert!(!matches_indexed(&event, &prepared[0]));
+                }
+            }
+            for source in ["timestamp>=0", "NOT timestamp>=0", "NOT (NOT timestamp>=0)",
+                "timestamp:0..1 OR code:missing", "timestamp>=0 AND NOT timestamp>1"] {
+                let expression = crate::querylang::compile_rule(source).unwrap();
+                assert_eq!(expression.matches_indexed(&event), expression.matches(&indexed_reference), "{timestamp:?} {source}");
+                let query = prepare(&[Filter { column: "_all".into(), op: "query".into(), value: source.into(), value2: None }]);
+                assert_eq!(matches(&event, &query[0]), expression.matches(&event));
+                assert_eq!(matches_indexed(&event, &query[0]), expression.matches_indexed(&event));
+            }
         }
+        let object = serde_json::json!({"timestamp":0});
+        assert!(crate::querylang::compile_rule("timestamp>=0").unwrap().matches_object(object.as_object().unwrap()));
+        let zero = Event::empty();
+        let id = prepare(&[Filter { column: "id".into(), op: "gte".into(), value: "0".into(), value2: None }]);
+        assert!(matches(&zero, &id[0]) && matches_indexed(&zero, &id[0]));
+    }
+}
+
+/// Text operators applied to the column's value (`None` when absent).
+pub(crate) fn value_matches(pf: &PreparedFilter, value: Option<&str>) -> bool {
+    let f = &pf.f;
+    let needle = pf.needle_lower.as_str();
+    if let Some(set) = &pf.set {
+        if f.op == "in_exact" {
+            return value.is_some_and(|v| set.contains(v));
+        }
+        let hit = value.is_some_and(|v| set.contains(&v.trim().to_lowercase()));
+        return (f.op == "in") == hit;
+    }
+    match f.op.as_str() {
+        "cidr" | "not_cidr" => {
+            let hit = value
+                .and_then(crate::entities::parse_ip)
+                .is_some_and(|ip| pf.nets.iter().any(|n| n.contains(ip)));
+            (f.op == "cidr") == hit
+        }
+        // Regex inválida é rejeitada na validação; aqui nunca casa.
+        "regex" => pf
+            .regex
+            .as_ref()
+            .is_some_and(|re| re.is_match(value.unwrap_or(""))),
+        "contains" => value.is_some_and(|s| ci_contains_bytes(s.as_bytes(), needle.as_bytes())),
+        "not_contains" => value.is_none_or(|s| !ci_contains_bytes(s.as_bytes(), needle.as_bytes())),
+        "equals" => value.is_some_and(|s| s.eq_ignore_ascii_case(f.value.trim())),
+        "not_equals" => value.is_none_or(|s| !s.eq_ignore_ascii_case(f.value.trim())),
+        "equals_exact" => value.is_some_and(|s| s == f.value),
+        "not_equals_exact" => value.is_none_or(|s| s != f.value),
+        "starts_with" => value.is_some_and(|s| {
+            let (hay, ndl) = (s.as_bytes(), needle.as_bytes());
+            hay.len() >= ndl.len() && hay[..ndl.len()].eq_ignore_ascii_case(ndl)
+        }),
+        "empty" => value.is_none_or(|s| s.trim().is_empty()),
+        "not_empty" => value.is_some_and(|s| !s.trim().is_empty()),
+        op if is_numeric_op(op) => number_matches(pf, value.and_then(crate::model::text_number)),
         _ => false,
     }
 }
@@ -282,18 +396,23 @@ pub fn matches_filter(ev: &Event, filter: &Filter) -> bool {
 }
 
 pub fn filtered_indices(events: &[Event], filters: &[Filter]) -> Vec<usize> {
+    if crate::analysis_runtime::current().is_some() {
+        let prepared = prepare(filters);
+        let mut ids = Vec::new();
+        for (id, event) in events.iter().enumerate().take_while(|_| !crate::operations::cancelled()) {
+            if prepared.iter().all(|filter| matches(event, filter)) {
+                if let Err(error) = push_collected_id(&mut ids, id) {
+                    crate::analysis_runtime::record_failure(error);
+                    return Vec::new();
+                }
+            }
+        }
+        return ids;
+    }
     if filters.is_empty() {
         return (0..events.len()).collect();
     }
     let pfs = prepare(filters);
-    if let (Some(engine), Some(predicate)) = (crate::case_cache::engine_for(events), index_predicate(&pfs)) {
-        if let Ok(Some(candidates)) = engine.candidates_if_selective(&predicate, events.len()) {
-            return candidates.into_iter()
-                .take_while(|_| !crate::operations::cancelled())
-                .filter(|&i| events.get(i).is_some_and(|ev| pfs.iter().all(|pf| matches(ev, pf))))
-                .collect();
-        }
-    }
     events
         .iter()
         .enumerate()
@@ -301,6 +420,18 @@ pub fn filtered_indices(events: &[Event], filters: &[Filter]) -> Vec<usize> {
         .filter(|(_, ev)| pfs.iter().all(|pf| matches(ev, pf)))
         .map(|(i, _)| i)
         .collect()
+}
+
+pub(crate) fn count_memory(events: &[Event], filters: &[Filter]) -> usize {
+    let pfs = prepare(filters);
+    events.iter().take_while(|_| !crate::operations::cancelled()).filter(|event| pfs.iter().all(|pf| matches(event, pf))).count()
+}
+
+pub(crate) fn count_lines(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> Result<usize, String> {
+    if filters.is_empty() { return crate::analysis_runtime::visible_total(idx); }
+    let mut count = 0usize;
+    scan_indexed(idx, &prepare(filters), codes, system, derived, |_, _, _| (), |()| count += 1)?;
+    Ok(count)
 }
 
 pub fn sort_indices(events: &[Event], indices: &mut [usize], column: &str, desc: bool) {
@@ -334,7 +465,7 @@ pub fn sort_indices(events: &[Event], indices: &mut [usize], column: &str, desc:
 
 // A mixed numeric/text comparator must keep the two kinds in a fixed order.
 // Falling back to text only for mixed pairs creates cycles (2 < 10 < 11x < 2).
-fn compare_sort_keys(a: Option<f64>, sa: &str, b: Option<f64>, sb: &str) -> std::cmp::Ordering {
+pub(crate) fn compare_sort_keys(a: Option<f64>, sa: &str, b: Option<f64>, sb: &str) -> std::cmp::Ordering {
     match (a.filter(|n| n.is_finite()), b.filter(|n| n.is_finite())) {
         (Some(a), Some(b)) => a.total_cmp(&b).then_with(|| sa.cmp(sb)),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -351,23 +482,33 @@ pub fn query(
     offset: usize,
     limit: usize,
 ) -> QueryResult {
-    let mut idx = filtered_indices(events, filters);
-    if !sort_column.is_empty() {
-        sort_indices(events, &mut idx, sort_column, sort_dir == "desc");
-    }
-    let total = idx.len();
-    let rows = idx
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|i| {
-            let mut e = events[i].clone();
-            crate::entities::annotate(&mut e);
-            e.raw = String::new();
-            e
-        })
-        .collect();
-    QueryResult { total, rows }
+    let selected = select_memory_page(events, filters, sort_column, sort_dir, offset, limit);
+    let rows = selected.ids.into_iter().map(|i| {
+        let mut event = events[i].clone();
+        crate::entities::annotate(&mut event);
+        event.raw = String::new();
+        event
+    }).collect();
+    QueryResult { total: selected.total.unwrap_or(0), rows }
+}
+
+fn select_memory_page(events: &[Event], filters: &[Filter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize) -> SelectedPage {
+    let mut ids = filtered_indices(events, filters);
+    if !sort_column.is_empty() { sort_indices(events, &mut ids, sort_column, sort_dir == "desc"); }
+    let total = ids.len();
+    SelectedPage::exact(ids.into_iter().skip(offset).take(limit).collect(), total, offset, "memory", None)
+}
+
+pub(crate) fn query_projected_memory(events: &[Event], filters: &[Filter], sort_column: &str,
+    sort_dir: &str, offset: usize, plan: &crate::page_projection::ProjectionPlan,
+) -> Result<crate::page_projection::ProjectedPage, String> {
+    let selected = select_memory_page(events, filters, sort_column, sort_dir, offset, plan.limit);
+    let items = selected.ids.iter().map(|&i| {
+        crate::operations::check()?;
+        plan.project_memory(&events[i])
+    }).collect::<Result<Vec<_>, String>>()?;
+    plan.finish(selected, items)
 }
 
 fn query_from_memory_matches(
@@ -389,7 +530,7 @@ fn query_from_memory_matches(
         .map(|i| {
             let mut event = events[i].clone();
             crate::entities::annotate(&mut event);
-            event.raw.clear();
+            event.raw = String::new();
             event
         })
         .collect();
@@ -402,20 +543,21 @@ fn aggregate_from_memory_matches(
     group_column: &str,
     specs: &[AggSpec],
 ) -> AggResult {
+    let mut budget = AnalyticsBudget::new();
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order = Vec::new();
     for &i in matched {
+        if groups.len() > group_budget(specs) { return AggResult::budget_error(); }
         if crate::operations::cancelled() {
             break;
         }
         let event = &events[i];
-        push_group(
+        if let Err(error) = push_group(
             &mut groups,
             &mut order,
             event,
             event.col_str(group_column),
-            specs,
-        );
+            specs, &mut budget) { return AggResult::failure(error); }
     }
     build_agg_result(groups, order, group_column, specs)
 }
@@ -458,111 +600,6 @@ enum Tri {
     Pass,
     Fail,
     NeedEvent,
-}
-
-/// Index predicates are necessary conditions only. Every candidate is checked
-/// by the original matcher; unsupported/negative conditions stay in that stage.
-pub(crate) fn index_predicate(filters: &[PreparedFilter]) -> Option<crate::big_data::Predicate> {
-    use crate::big_data::{ExactMode, Predicate};
-    let parts: Vec<_> = filters.iter().filter_map(|pf| {
-        let f = &pf.f;
-        let scoped = (f.column != "_all").then(|| f.column.clone());
-        let equals = |value: String, mode| Predicate::Equals { column: scoped.clone(), value, mode };
-        match f.op.as_str() {
-            "query" => pf.expr.as_ref()?.index_predicate(),
-            "regex" => regex_index_predicate(pf.regex.as_ref()?.as_str()),
-            "equals" if scoped.is_some() => Some(equals(f.value.trim().into(), ExactMode::AsciiInsensitive)),
-            "equals_exact" if scoped.is_some() => Some(equals(f.value.clone(), ExactMode::Sensitive)),
-            "in" if scoped.is_some() => Some(Predicate::Or(list_values(&f.value)
-                .map(|v| equals(v.into(), ExactMode::TrimLower)).collect())),
-            "in_exact" if scoped.is_some() => Some(Predicate::Or(f.value.lines().filter(|v| !v.is_empty())
-                .map(|v| equals(v.into(), ExactMode::Sensitive)).collect())),
-            "contains" | "starts_with" | "ends_with" if pf.needle_lower.chars().count() >= 3 => {
-                Some(Predicate::Contains(pf.needle_lower.clone()))
-            }
-            "gt" | "gte" | "lt" | "lte" | "between" if f.column == "timestamp" => {
-                timestamp_predicate(&f.op, pf.num?, pf.num2)
-            }
-            _ => None,
-        }
-    }).collect();
-    (!parts.is_empty()).then_some(Predicate::And(parts))
-}
-
-/// The regex parser proves a prefix/suffix is necessary for every alternative.
-/// Empty, infinite, short or non-ASCII literal sets keep the streaming path.
-pub(crate) fn regex_index_predicate(pattern: &str) -> Option<crate::big_data::Predicate> {
-    use regex_syntax::hir::literal::{ExtractKind, Extractor};
-    use crate::big_data::Predicate;
-    let hir = regex_syntax::parse(pattern).ok()?;
-    let plans: Vec<_> = [ExtractKind::Prefix, ExtractKind::Suffix].into_iter().filter_map(|kind| {
-        let sequence = Extractor::new().kind(kind).extract(&hir);
-        let mut values = Vec::new();
-        for literal in sequence.literals()? {
-            let text = std::str::from_utf8(literal.as_bytes()).ok()?;
-            // Unicode lowercasing can depend on surrounding characters. ASCII
-            // literals avoid that ambiguity and are necessary in the folded pool.
-            if !text.is_ascii() || text.len() < 3 { return None; }
-            values.push(text.to_ascii_lowercase());
-        }
-        values.sort_unstable();
-        values.dedup();
-        (!values.is_empty()).then(|| Predicate::Or(values.into_iter().map(Predicate::Contains).collect()))
-    }).collect();
-    (!plans.is_empty()).then_some(Predicate::And(plans))
-}
-
-/// Round outwards so floating point thresholds cannot exclude a matching
-/// integer timestamp. The event matcher retains inclusive/exclusive semantics.
-pub(crate) fn timestamp_predicate(op: &str, a: f64, b: Option<f64>) -> Option<crate::big_data::Predicate> {
-    let bound = |n: f64, lower: bool| {
-        (n.is_finite() && n.abs() < 9_007_199_254_740_992.0)
-            .then(|| (if lower { n.floor() } else { n.ceil() } as i64, true))
-    };
-    let (lower, upper) = match op {
-        "gt" | "gte" => (Some(bound(a, true)?), None),
-        "lt" | "lte" => (None, Some(bound(a, false)?)),
-        "between" => (Some(bound(a, true)?), Some(bound(b?, false)?)),
-        _ => return None,
-    };
-    Some(crate::big_data::Predicate::Timestamp { lower, upper })
-}
-
-// These predicates depend only on standard string columns. Evaluate the
-// original matcher over their FAST projection, avoiding stored-event block
-// decompression for scattered matches. Other predicates need the full event.
-fn fast_filter_columns(filters: &[PreparedFilter]) -> Option<[bool; 3]> {
-    let mut columns = [false; 3];
-    for pf in filters {
-        if !matches!(pf.f.op.as_str(), "contains" | "not_contains" | "equals" | "not_equals" |
-            "equals_exact" | "not_equals_exact" | "in" | "in_exact" | "not_in" | "regex" |
-            "starts_with" | "ends_with" | "empty" | "not_empty" | "gt" | "gte" | "lt" | "lte" | "between") {
-            return None;
-        }
-        let slot = match pf.f.column.as_str() { "source" => 0, "code" => 1, "level" => 2, _ => return None };
-        columns[slot] = true;
-    }
-    Some(columns)
-}
-
-fn fast_candidate_matches(engine: &crate::big_data::BigDataIndex, row: usize, filters: &[PreparedFilter], columns: [bool; 3]) -> bool {
-    let mut event = Event::empty();
-    if columns[0] { event.source = engine.col_str(row, "source").unwrap_or_default(); }
-    if columns[1] { event.code = engine.col_str(row, "code").unwrap_or_default(); }
-    if columns[2] { event.level = engine.col_str(row, "level").unwrap_or_default(); }
-    filters.iter().all(|pf| matches(&event, pf))
-}
-
-type FastProjectionKey = (u32, [Option<u64>; 3]);
-
-fn cached_fast_candidate(engine: &crate::big_data::BigDataIndex, row: usize, filters: &[PreparedFilter], columns: [bool; 3], cache: &mut HashMap<FastProjectionKey, bool>) -> bool {
-    let key = engine.projection_key(row, columns);
-    if let Some(result) = key.and_then(|key| cache.get(&key)) { return *result; }
-    let result = fast_candidate_matches(engine, row, filters, columns);
-    // The original predicate is constant for an identical projection within
-    // this query. Bound reuse when a categorical field has high cardinality.
-    if cache.len() < 4096 { if let Some(key) = key { cache.insert(key, result); } }
-    result
 }
 
 pub(crate) fn ci_contains_bytes(hay: &[u8], needle_lower: &[u8]) -> bool {
@@ -624,11 +661,11 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8], enriched: bool)
         return Tri::NeedEvent;
     }
     match f.column.as_str() {
-        // Zero is both the metadata sentinel and the valid Unix epoch. Only
-        // the event can distinguish an absent date from Some(0).
-        "timestamp" if meta.ts == 0 => Tri::NeedEvent,
         "timestamp" => match op {
             "gt" | "gte" | "lt" | "lte" | "between" => {
+                if meta.ts == 0 {
+                    return Tri::Fail;
+                }
                 let a = meta.ts as f64;
                 // limites pré-computados em prepare (pf.num/pf.num2)
                 let pass = match op {
@@ -647,8 +684,20 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8], enriched: bool)
                     None => Tri::NeedEvent,
                 }
             }
-            "empty" => Tri::Fail,
-            "not_empty" => Tri::Pass,
+            "empty" => {
+                if meta.ts == 0 {
+                    Tri::Pass
+                } else {
+                    Tri::Fail
+                }
+            }
+            "not_empty" => {
+                if meta.ts != 0 {
+                    Tri::Pass
+                } else {
+                    Tri::Fail
+                }
+            }
             _ => Tri::NeedEvent,
         },
         "level" => match (op, label_class(v)) {
@@ -754,158 +803,186 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8], enriched: bool)
     }
 }
 
-struct MatchCacheEntry {
-    idx_id: usize,
-    idx_identity: String,
-    lines_count: usize,
-    filters_key: String,
-    derived_count: usize,
-    codes_count: usize,
-    matches: Arc<Vec<usize>>,
+/// Complete-ID collection is a compatibility API with an explicit result
+/// budget. The database selection cache owns shared work; no second Rust copy
+/// is retained under the old pointer/count-based line-cache identity.
+pub fn clear_match_cache() {}
+
+pub(crate) fn check_collected_ids(rows: usize) -> Result<(), String> {
+    if rows.saturating_mul(std::mem::size_of::<usize>()) > crate::resources::collected_ids_bytes() {
+        Err("A lista completa de IDs excedeu LOGINSIGHT_COLLECTED_IDS_MB. Use paginação ou uma operação de leitura em fluxo.".into())
+    } else { Ok(()) }
 }
-
-static MATCH_CACHE: Mutex<Vec<MatchCacheEntry>> = Mutex::new(Vec::new());
-const MATCH_CACHE_BYTES: usize = 32 * 1024 * 1024;
-
-/// Capacity accounting over at most 16 cache entries, without cloning matches.
-pub(crate) fn resource_cache_metrics() -> Option<(usize, u64)> {
-    let cache = MATCH_CACHE.try_lock()?;
-    let mut bytes = (cache.capacity() as u64).saturating_mul(std::mem::size_of::<MatchCacheEntry>() as u64);
-    let mut seen = std::collections::HashSet::new();
-    for entry in cache.iter() {
-        bytes = bytes.saturating_add(entry.idx_identity.capacity() as u64).saturating_add(entry.filters_key.capacity() as u64);
-        if seen.insert(Arc::as_ptr(&entry.matches) as usize) {
-            bytes = bytes.saturating_add((entry.matches.capacity() as u64).saturating_mul(std::mem::size_of::<usize>() as u64))
-                .saturating_add(std::mem::size_of::<Vec<usize>>() as u64 + 2 * std::mem::size_of::<usize>() as u64);
+pub(crate) fn push_collected_id(ids: &mut Vec<usize>, id: usize) -> Result<(), String> {
+    check_collected_ids(ids.len().saturating_add(1))?;
+    if ids.len() == ids.capacity() {
+        let left = crate::resources::collected_ids_bytes() / std::mem::size_of::<usize>() - ids.len();
+        let additional = left.min(8192);
+        if let Some(admitted) = crate::analysis_runtime::current() {
+            admitted.retain_resource_bytes(additional * std::mem::size_of::<usize>())?;
+        }
+        ids.try_reserve_exact(additional).map_err(|e| e.to_string())?;
+    }
+    ids.push(id);
+    Ok(())
+}
+/// Estimate owned event payload without serializing a second copy. This includes
+/// retained string capacity and overlay provenance, not all allocator/RSS costs.
+pub(crate) fn event_payload_bytes(event: &Event) -> usize {
+    fn value_bytes(value: &Value) -> usize {
+        match value {
+            Value::String(value) => value.capacity().saturating_add(32),
+            Value::Array(values) => values.iter().fold(32usize, |n, v| n.saturating_add(value_bytes(v))),
+            Value::Object(values) => values.iter().fold(32usize, |n, (k, v)| n.saturating_add(k.capacity()).saturating_add(64).saturating_add(value_bytes(v))),
+            _ => 32,
         }
     }
-    Some((cache.len(), bytes))
+    [&event.event_ref, &event.parse_status, &event.source, &event.level, &event.code, &event.name, &event.description, &event.message, &event.raw]
+        .iter().fold(std::mem::size_of::<Event>(), |n, v| n.saturating_add(v.capacity()))
+        .saturating_add(event.fields.iter().fold(0usize, |n, (k, v)| n.saturating_add(k.capacity()).saturating_add(64).saturating_add(value_bytes(v))))
+        .saturating_add(event.derived_originals.iter().fold(0usize, |n, (key, original)| {
+            n.saturating_add(key.capacity()).saturating_add(64).saturating_add(match original {
+                crate::model::DerivedOriginal::Missing => 32,
+                crate::model::DerivedOriginal::Present(value) => value_bytes(value),
+            })
+        }))
+        .saturating_add(event.derived_diagnostics.capacity().saturating_mul(std::mem::size_of::<crate::model::DerivedDiagnostic>()))
+        .saturating_add(event.derived_diagnostics.iter().fold(0usize, |n, diagnostic| {
+            n.saturating_add(diagnostic.field.capacity()).saturating_add(diagnostic.code.capacity()).saturating_add(diagnostic.message.capacity())
+        }))
+        .saturating_add(event.evidence_provenance.as_ref().map_or(0, |proof| {
+            proof.source.version.capacity().saturating_add(proof.source.record_space.capacity()).saturating_add(proof.source.label.capacity())
+                .saturating_add(proof.source.event_ref_prefix.as_ref().map_or(0, String::capacity))
+                .saturating_add(match &proof.locator { crate::exclusion_store::Locator::StableRecord(key) => key.capacity(), _ => 0 }).saturating_add(128)
+        }))
 }
 
-fn filters_cache_key(filters: &[Filter]) -> String {
-    // JSON escaping makes arbitrary field names/values unambiguous.
-    serde_json::to_string(filters).expect("serializable filters")
-}
+#[cfg(test)]
+mod event_payload_budget_tests {
+    use super::*;
 
-pub fn clear_match_cache() {
-    MATCH_CACHE.lock().clear();
-}
-
-/// Filtra as linhas do índice; materializa apenas quando necessário.
-pub fn indexed_matches(
-    idx: &FileIndex,
-    filters: &[Filter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-) -> Vec<usize> {
-    Arc::unwrap_or_clone(indexed_matches_shared(idx, filters, codes, system, derived))
-}
-
-/// Read-only consumers share the cached selection. A full copy is needed only
-/// by the compatibility API above or when a caller actually reorders IDs.
-pub(crate) fn indexed_matches_shared(
-    idx: &FileIndex,
-    filters: &[Filter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-) -> Arc<Vec<usize>> {
-    if filters.is_empty() {
-        return Arc::new((0..idx.lines.len()).collect());
-    }
-    let idx_id = idx.lines.as_ptr() as usize;
-    let lines_count = idx.lines.len();
-    let idx_identity = idx.parts.iter().map(|p| p.identity.as_str()).collect::<Vec<_>>().join(",");
-    let fkey = filters_cache_key(filters);
-    let derived_count = derived.len();
-    let codes_count = codes.sources.len() + system.sources.len();
-    let same_entry = |e: &MatchCacheEntry| {
-        e.idx_id == idx_id
-            && e.lines_count == lines_count
-            && e.derived_count == derived_count
-            && e.codes_count == codes_count
-            && e.idx_identity == idx_identity
-            && e.filters_key == fkey
-    };
-
-    {
-        let cache = MATCH_CACHE.lock();
-        if let Some(entry) = cache.iter().find(|e| same_entry(e)) {
-            return Arc::clone(&entry.matches);
-        }
-    }
-
-    let mut matched = Vec::new();
-    visit_indexed_matches(idx, filters, codes, system, derived, |i| matched.push(i));
-    let matched = Arc::new(matched);
-
-    // Vec capacity is the actual retained allocation, which can exceed len.
-    let bytes = matched.capacity().saturating_mul(std::mem::size_of::<usize>());
-    if !crate::operations::cancelled() && bytes <= MATCH_CACHE_BYTES / 4 {
-        let mut cache = MATCH_CACHE.lock();
-        // Concurrent misses may already have published this same selection.
-        if let Some(entry) = cache.iter().find(|e| same_entry(e)) {
-            return Arc::clone(&entry.matches);
-        }
-        while !cache.is_empty() && (cache.len() >= 16 ||
-            cache.iter().map(|e| e.matches.capacity() * std::mem::size_of::<usize>()).sum::<usize>() + bytes > MATCH_CACHE_BYTES) {
-            cache.remove(0);
-        }
-        cache.push(MatchCacheEntry {
-            idx_id,
-            idx_identity,
-            lines_count,
-            filters_key: fkey,
-            derived_count,
-            codes_count,
-            matches: Arc::clone(&matched),
+    #[test]
+    fn hidden_derived_originals_and_diagnostics_share_the_event_budget() {
+        let mut event = Event::empty();
+        event.fields.insert("payload".into(), Value::from("small replacement"));
+        let baseline = event_payload_bytes(&event);
+        event.derived_originals.insert("payload".into(), crate::model::DerivedOriginal::Present(
+            serde_json::json!({"nested":["日".repeat(24_000), {"original":"x".repeat(4_096)}]})
+        ));
+        event.derived_originals.insert("new_child".into(), crate::model::DerivedOriginal::Missing);
+        event.derived_diagnostics.push(crate::model::DerivedDiagnostic {
+            field:"payload".into(), code:"transform_input_limit".into(), message:"d".repeat(8_192), warning:false,
         });
+        let before = serde_json::to_value(&event).unwrap();
+        let measured = event_payload_bytes(&event);
+        assert!(measured >= baseline + 72_000 + 4_096 + 8_192);
+        let mut budget = AnalyticsBudget { used: 0, limit: 32 << 10, admission: None };
+        assert!(budget.charge(measured).is_err());
+        assert_eq!(serde_json::to_value(&event).unwrap(), before, "accounting cannot strip evidence or diagnostics");
     }
 
-    matched
+    #[test]
+    fn retained_empty_string_capacity_remains_accounted_until_released() {
+        let mut event = Event::empty();
+        let baseline = event_payload_bytes(&event);
+        event.raw = "x".repeat(64 << 10);
+        event.raw.clear();
+        assert!(event_payload_bytes(&event) >= baseline + (64 << 10));
+        event.raw = String::new();
+        assert_eq!(event_payload_bytes(&event), baseline);
+    }
+
+    #[test]
+    fn memory_page_routes_release_raw_without_mutating_saved_evidence() {
+        let mut original = Event::empty();
+        original.raw = "x".repeat(64 << 10);
+        original.fields.insert("body".into(), Value::from("日".repeat(1_024)));
+        original.event_ref = "saved:1".into();
+        let events = vec![original];
+        let before = serde_json::to_value(&events).unwrap();
+        for page in [query(&events, &[], "id", "asc", 0, 1), query_from_memory_matches(&events, vec![0], "id", "asc", 0, 1)] {
+            assert_eq!(page.rows.len(), 1);
+            assert!(page.rows[0].raw.is_empty());
+            assert_eq!(page.rows[0].raw.capacity(), 0);
+            assert_eq!(page.rows[0].fields["body"], events[0].fields["body"]);
+            assert_eq!(page.rows[0].event_ref, events[0].event_ref);
+        }
+        assert_eq!(serde_json::to_value(&events).unwrap(), before);
+        assert_eq!(events[0].raw.len(), 64 << 10);
+    }
+}
+pub fn indexed_matches(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived]) -> Result<Vec<usize>, String> {
+    if filters.is_empty() {
+        let gate = crate::analysis_runtime::indexed_gate(idx)?;
+        let count = gate.as_ref().map_or(idx.lines.len(), |gate| gate.visible_count());
+        check_collected_ids(count)?;
+        if let Some(admitted) = crate::analysis_runtime::current() {
+            admitted.retain_resource_bytes(count.saturating_mul(std::mem::size_of::<usize>()))?;
+        }
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(count).map_err(|error| error.to_string())?;
+        ids.extend((0..idx.lines.len()).filter(|&id| gate.as_ref().is_none_or(|gate| gate.allows_known_row(id))));
+        return Ok(ids);
+    }
+    let pfs = prepare(filters);
+    if let Some(ids) = crate::engine::matches(&engine_source(idx, codes, system, derived), &pfs)? { return Ok(ids); }
+    let mut ids = Vec::new();
+    let mut error = None;
+    scan_indexed_control(idx, &pfs, codes, system, derived, |i, _, _| i, |i| {
+        if let Err(e) = push_collected_id(&mut ids, i) { error = Some(e); return false; }
+        true
+    })?;
+    if let Some(error) = error { return Err(error); }
+    crate::operations::check()?;
+    Ok(ids)
 }
 
-/// A few legacy raw-line shortcuts normalize whitespace differently from the
-/// decoded event matcher. Preserve that tri-state path for those queries: a
-/// selective index plan could otherwise remove rows before metadata is checked.
-/// In-memory Cases have no raw metadata shortcuts and keep their normal plan.
-fn needs_metadata_filter_path(filters: &[PreparedFilter]) -> bool {
-    filters.iter().any(|pf| {
-        (pf.f.column == "code" && matches!(pf.f.op.as_str(), "empty" | "not_empty"))
-            || (matches!(pf.f.column.as_str(), "code" | "message" | "_all")
-                && matches!(pf.f.op.as_str(), "contains" | "not_contains")
-                && pf.f.value != pf.f.value.trim())
-    })
+fn engine_source<'a>(
+    idx: &'a FileIndex,
+    codes: &'a CodesConfig,
+    system: &'a CodesConfig,
+    derived: &'a [CompiledDerived],
+) -> crate::engine::Source<'a> {
+    crate::engine::Source { idx, codes, system, derived }
 }
 
 /// Visit matching positions without allocating a vector proportional to the file.
-pub fn visit_indexed_matches(
-    idx: &FileIndex,
-    filters: &[Filter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-    mut visit: impl FnMut(usize),
-) {
-    let pfs = prepare(filters);
-    if let (Some(engine), Some(predicate)) = (&idx.big_data, (!needs_metadata_filter_path(&pfs)).then(|| index_predicate(&pfs)).flatten()) {
-        if let Ok(Some(candidates)) = engine.candidates_if_selective(&predicate, idx.lines.len()) {
-            let fast_columns = fast_filter_columns(&pfs);
-            let mut verification = HashMap::new();
-            for i in candidates {
-                if crate::operations::cancelled() { break; }
-                if let Some(columns) = fast_columns {
-                    if cached_fast_candidate(engine, i, &pfs, columns, &mut verification) { visit(i); }
-                    continue;
-                }
-                let ev = event_at(idx, i, codes, system, derived);
-                if pfs.iter().all(|pf| matches(&ev, pf)) { visit(i); }
-            }
-            return;
+pub fn visit_indexed_matches(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], visit: impl FnMut(usize)) -> Result<(), String> {
+    visit_indexed_prepared(idx, &prepare(filters), codes, system, derived, visit)
+}
+
+pub(crate) fn visit_indexed_events(idx: &FileIndex, pfs: &[PreparedFilter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], mut visit: impl FnMut(usize, &Event)) -> Result<(), String> {
+    visit_indexed_mapped(idx, pfs, codes, system, derived, |_| (), |i, event, ()| visit(i, event))
+}
+
+/// Preserves file order while hydrating only a byte-bounded wave of IDs.
+/// There is no preliminary vector proportional to the complete match set.
+pub(crate) fn visit_indexed_mapped<T: Send>(idx: &FileIndex, pfs: &[PreparedFilter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], map: impl Fn(&Event) -> T + Sync, mut visit: impl FnMut(usize, &Event, T)) -> Result<(), String> {
+    let mut ids = Vec::new();
+    let mut bytes = 0usize;
+    let flush = |ids: &mut Vec<usize>, visit: &mut dyn FnMut(usize, &Event, T)| {
+        let events = crate::global_scheduler::map(ids.iter(), |&id| {
+            let event = event_at(idx, id, codes, system, derived);
+            let mapped = map(&event);
+            (id, event, mapped)
+        });
+        for (id, event, mapped) in events { visit(id, &event, mapped); }
+        ids.clear();
+    };
+    visit_indexed_prepared_control(idx, pfs, codes, system, derived, |id| {
+        let size = idx.lines.at(id).len as usize;
+        if !ids.is_empty() && (ids.len() >= 8192 || bytes.saturating_add(size) > crate::resources::batch_bytes()) {
+            flush(&mut ids, &mut visit);
+            bytes = 0;
+            crate::operations::check()?;
         }
-    }
-    visit_indexed_prepared(idx, &pfs, codes, system, derived, visit);
+        ids.push(id);
+        bytes = bytes.saturating_add(size);
+        Ok(true)
+    })?;
+    crate::operations::check()?;
+    flush(&mut ids, &mut visit);
+    crate::operations::check()
 }
 
 /// Lines per parallel work unit. Batches keep memory bounded and results in order.
@@ -913,77 +990,41 @@ const SCAN_CHUNK: usize = 8192;
 
 /// Scans the index in parallel chunks, calling `map` for each matching line
 /// (with the parsed event when one was needed) and `visit` in file order.
-/// Statistics request the legacy metadata/event projection; selection-only
-/// callers can verify FAST columns without materializing a full event.
 pub(crate) fn scan_indexed<T: Send>(
     idx: &FileIndex,
     pfs: &[PreparedFilter],
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-    preserve_event_projection: bool,
     map: impl Fn(usize, &LineMeta, Option<Event>) -> T + Sync,
     mut visit: impl FnMut(T),
-) {
-    if let (Some(engine), Some(predicate)) = (&idx.big_data, (!needs_metadata_filter_path(pfs)).then(|| index_predicate(pfs)).flatten()) {
-        if let Ok(Some(candidates)) = engine.candidates_if_selective(&predicate, idx.lines.len()) {
-            // Bounded ordered batches share parsed-event blocks between workers.
-            let generation = crate::operations::current_generation();
-            let fast_columns = fast_filter_columns(pfs);
-            let mut verification = HashMap::new();
-            let enriched: Vec<_> = pfs.iter()
-                .map(|pf| query_needs_enrichment(pf, codes, system, derived)).collect();
-            // Preserve statistics' existing distinction between metadata-only
-            // filters and filters that require the original decoded event.
-            let needs_event = |i: usize| preserve_event_projection && pfs.iter().zip(&enriched)
-                .any(|(pf, enriched)| matches!(meta_check(pf, &idx.lines[i], line_bytes(idx, i), *enriched), Tri::NeedEvent));
-            for batch in candidates.chunks(SCAN_CHUNK) {
-                if crate::operations::cancelled() { break; }
-                if let Some(columns) = fast_columns {
-                    let selected: Vec<_> = batch.iter().copied().filter(|&i|
-                        !crate::operations::cancelled_for(generation) && cached_fast_candidate(engine, i, pfs, columns, &mut verification)).collect();
-                    let items: Vec<_> = selected.par_iter().take_any_while(|_| !crate::operations::cancelled_for(generation))
-                        .map(|&i| {
-                            let ev = needs_event(i).then(|| event_at(idx, i, codes, system, derived));
-                            map(i, &idx.lines[i], ev)
-                        }).collect();
-                    for item in items { visit(item); }
-                    continue;
-                }
-                let items: Vec<_> = batch.par_iter().filter_map(|&i| {
-                    if crate::operations::cancelled_for(generation) { return None; }
-                    let ev = event_at(idx, i, codes, system, derived);
-                    pfs.iter().all(|pf| matches(&ev, pf)).then(|| {
-                        let projected = (!preserve_event_projection || needs_event(i)).then_some(ev);
-                        map(i, &idx.lines[i], projected)
-                    })
-                }).collect();
-                for item in items { visit(item); }
-            }
-            return;
-        }
-    }
+) -> Result<(), String> {
+    scan_indexed_control(idx, pfs, codes, system, derived, map, |item| { visit(item); true })
+}
+
+fn scan_indexed_control<T: Send>(
+    idx: &FileIndex,
+    pfs: &[PreparedFilter],
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+    map: impl Fn(usize, &LineMeta, Option<Event>) -> T + Sync,
+    mut visit: impl FnMut(T) -> bool,
+) -> Result<(), String> {
+    let gate = crate::analysis_runtime::indexed_gate(idx)?;
     let enriched: Vec<bool> = pfs
         .iter()
         .map(|pf| query_needs_enrichment(pf, codes, system, derived))
         .collect();
-    let generation = crate::operations::current_generation();
-    // Broad or negative categorical filters may have no selective postings.
-    // Their original matcher still needs only these persisted string columns.
-    // Keep metadata tri-state checks first: their raw-span normalization can
-    // differ from decoded values. FAST replaces only an otherwise needed event.
-    // Statistics retain their metadata/event projection policy below.
-    let broad_projection = (!preserve_event_projection && !pfs.is_empty())
-        .then(|| idx.big_data.as_ref().zip(fast_filter_columns(pfs)))
-        .flatten();
+    let cancellation = crate::operations::current_token();
     let chunk = |from: usize, to: usize| -> Vec<T> {
         let mut out = Vec::new();
-        let mut verification = HashMap::new();
         for i in from..to {
-            if (i - from) % 2048 == 0 && crate::operations::cancelled_for(generation) {
+            if (i - from) % 2048 == 0 && cancellation.cancelled() {
                 break;
             }
-            let meta = &idx.lines[i];
+            if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(i)) { continue; }
+            let meta = &idx.lines.at(i);
             let line = line_bytes(idx, i);
             let mut need = false;
             let mut ok = true;
@@ -1001,14 +1042,8 @@ pub(crate) fn scan_indexed<T: Send>(
                 continue;
             }
             if need {
-                if let Some((engine, columns)) = broad_projection {
-                    if cached_fast_candidate(engine, i, pfs, columns, &mut verification) {
-                        out.push(map(i, meta, None));
-                    }
-                    continue;
-                }
                 let ev = event_at(idx, i, codes, system, derived);
-                if pfs.iter().all(|pf| matches(&ev, pf)) {
+                if pfs.iter().all(|pf| matches_indexed(&ev, pf)) {
                     out.push(map(i, meta, Some(ev)));
                 }
             } else {
@@ -1018,46 +1053,58 @@ pub(crate) fn scan_indexed<T: Send>(
         out
     };
     let total = idx.lines.len();
-    if total <= SCAN_CHUNK * 2 || rayon::current_num_threads() <= 1 {
-        for item in chunk(0, total) {
-            visit(item);
-        }
-        return;
-    }
-    let batch = SCAN_CHUNK * rayon::current_num_threads() * 2;
+    let batch = SCAN_CHUNK * crate::resources::workers() * 2;
     let mut start = 0;
     while start < total {
         if crate::operations::cancelled() {
             break;
         }
-        let end = (start + batch).min(total);
-        let parts: Vec<Vec<T>> = (start..end)
-            .step_by(SCAN_CHUNK)
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|from| chunk(from, (from + SCAN_CHUNK).min(end)))
-            .collect();
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < total && end - start < batch {
+            let next = idx.lines.at(end).len as usize;
+            if end > start && bytes.saturating_add(next) > crate::resources::batch_bytes() { break; }
+            bytes = bytes.saturating_add(next);
+            end += 1;
+        }
+        let parts = crate::global_scheduler::map((start..end).step_by(SCAN_CHUNK), |from| {
+            chunk(from, (from + SCAN_CHUNK).min(end))
+        });
         for part in parts {
             for item in part {
-                visit(item);
+                if !visit(item) { return crate::operations::check(); }
             }
         }
         start = end;
     }
+    crate::operations::check()
 }
 
-pub(crate) fn visit_indexed_prepared(
-    idx: &FileIndex,
-    pfs: &[PreparedFilter],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-    visit: impl FnMut(usize),
-) {
-    scan_indexed(idx, pfs, codes, system, derived, false, |i, _, _| i, visit);
+pub(crate) fn visit_indexed_prepared(idx: &FileIndex, pfs: &[PreparedFilter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], mut visit: impl FnMut(usize)) -> Result<(), String> {
+    visit_indexed_prepared_control(idx, pfs, codes, system, derived, |id| { visit(id); Ok(true) })
 }
 
-/// Free text in a search expression may match code names/descriptions from
+pub(crate) fn visit_indexed_prepared_control(idx: &FileIndex, pfs: &[PreparedFilter], codes: &CodesConfig, system: &CodesConfig, derived: &[CompiledDerived], mut visit: impl FnMut(usize) -> Result<bool, String>) -> Result<(), String> {
+    let gate = crate::analysis_runtime::indexed_gate(idx)?;
+    if pfs.is_empty() {
+        for id in 0..idx.lines.len() {
+            if id % 2048 == 0 { crate::operations::check()?; }
+            if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { continue; }
+            if !visit(id)? { break; }
+        }
+        return crate::operations::check();
+    }
+    if crate::engine::visit_matches(&engine_source(idx, codes, system, derived), pfs, &mut visit)?.is_some() { return Ok(()); }
+    let mut failure = None;
+    scan_indexed_control(idx, pfs, codes, system, derived, |i, _, _| i, |id| match visit(id) {
+        Ok(keep) => keep,
+        Err(error) => { failure = Some(error); false }
+    })?;
+    if let Some(error) = failure { return Err(error); }
+    crate::operations::check()
+}
+
+
 /// the catalogs or derived fields, which are not part of the raw line.
 fn query_needs_enrichment(
     pf: &PreparedFilter,
@@ -1083,6 +1130,46 @@ fn query_needs_enrichment(
     })
 }
 
+/// Reuses the line engine's per-filter raw/meta decision without scanning
+/// unrelated rows. SQL already checked exact predicates; only residual tests
+/// belong here. A candidate is hydrated at most once, even with several tests.
+pub(crate) struct CandidateVerifier<'a> {
+    visibility: Option<std::sync::Arc<crate::analysis_runtime::RowGate>>,
+    idx: &'a FileIndex,
+    pfs: &'a [PreparedFilter],
+    lines: Vec<(usize, bool)>,
+    verify: &'a [usize],
+    codes: &'a CodesConfig,
+    system: &'a CodesConfig,
+    derived: &'a [CompiledDerived],
+}
+impl<'a> CandidateVerifier<'a> {
+    pub(crate) fn new(idx: &'a FileIndex, pfs: &'a [PreparedFilter], lines: &[usize], verify: &'a [usize], codes: &'a CodesConfig, system: &'a CodesConfig, derived: &'a [CompiledDerived]) -> Result<Self, String> {
+        Ok(Self { visibility: crate::analysis_runtime::indexed_gate(idx)?, idx, pfs, lines: lines.iter().map(|&i| (i, query_needs_enrichment(&pfs[i], codes, system, derived))).collect(), verify, codes, system, derived })
+    }
+    pub(crate) fn matches(&self, id: usize) -> bool {
+        if self.visibility.as_ref().is_some_and(|gate| !gate.allows_known_row(id)) { return false; }
+        let meta = &self.idx.lines.at(id);
+        let raw = line_bytes(self.idx, id);
+        let mut event = None;
+        for &(i, enriched) in &self.lines {
+            match meta_check(&self.pfs[i], meta, raw, enriched) {
+                Tri::Fail => return false,
+                Tri::Pass => (),
+                Tri::NeedEvent => {
+                    let ev = event.get_or_insert_with(|| event_at(self.idx, id, self.codes, self.system, self.derived));
+                    if !matches_indexed(ev, &self.pfs[i]) { return false; }
+                }
+            }
+        }
+        if !self.verify.is_empty() {
+            let ev = event.get_or_insert_with(|| event_at(self.idx, id, self.codes, self.system, self.derived));
+            if !self.verify.iter().all(|&i| matches_indexed(ev, &self.pfs[i])) { return false; }
+        }
+        true
+    }
+}
+
 pub fn query_indexed(
     idx: &FileIndex,
     filters: &[Filter],
@@ -1093,38 +1180,181 @@ pub fn query_indexed(
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-) -> QueryResult {
-    let matched = indexed_matches_shared(idx, filters, codes, system, derived);
-    query_from_indexed_matches(
-        idx,
-        matched,
+) -> Result<QueryResult, String> {
+    if let Some(result) = crate::engine::query(
+        &engine_source(idx, codes, system, derived),
+        &prepare(filters),
         sort_column,
         sort_dir,
         offset,
         limit,
-        codes,
-        system,
-        derived,
-    )
+    )? {
+        return Ok(result);
+    }
+    let page = query_page_lines(idx, filters, sort_column, sort_dir, offset, limit, codes, system, derived)?;
+    let total = count_lines(idx, filters, codes, system, derived)?;
+    crate::operations::check()?;
+    Ok(QueryResult { total, rows: page.rows })
 }
 
-/// Same-binary benchmark reference: explicitly recover an owned selection,
-/// reproducing the previous warm-cache Vec clone before identical page work.
-/// This is not the historical binary or a second production implementation.
-#[cfg(test)]
-pub(crate) fn query_indexed_owned_reference(
+#[allow(clippy::too_many_arguments)]
+pub fn query_page_indexed(
     idx: &FileIndex,
     filters: &[Filter],
     sort_column: &str,
     sort_dir: &str,
     offset: usize,
     limit: usize,
+    cursor: Option<&str>,
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-) -> QueryResult {
-    let matched = Arc::new(indexed_matches(idx, filters, codes, system, derived));
-    query_from_indexed_matches(idx, matched, sort_column, sort_dir, offset, limit, codes, system, derived)
+) -> Result<QueryPage, String> {
+    let _interactive = crate::operations::interactive();
+    if let Some(result) = crate::engine::query_page(
+        &engine_source(idx, codes, system, derived), &prepare(filters),
+        sort_column, sort_dir, offset, limit, cursor,
+    ) {
+        return result;
+    }
+    if cursor.is_some() {
+        return Err("PAGINATION_RESET_REQUIRED: O índice desta paginação não está disponível. Recarregue a primeira página para usar a recuperação.".into());
+    }
+    // Fallback remains explicit in the response; consumers can distinguish a
+    // ready indexed page from slower recovery while stores are being prepared.
+    query_page_lines(idx, filters, sort_column, sort_dir, offset, limit, codes, system, derived)
+}
+
+#[derive(Debug)]
+enum RecoveryKey {
+    Integer(i64),
+    Text(Option<f64>, String),
+}
+
+#[derive(Debug)]
+struct RecoveryRow { id: usize, key: RecoveryKey, desc: bool }
+
+impl RecoveryRow {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + match &self.key { RecoveryKey::Text(_, text) => text.len(), _ => 0 }
+    }
+}
+
+impl PartialEq for RecoveryRow { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
+impl Eq for RecoveryRow {}
+impl PartialOrd for RecoveryRow { fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) } }
+impl Ord for RecoveryRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let order = match (&self.key, &other.key) {
+            (RecoveryKey::Integer(a), RecoveryKey::Integer(b)) => a.cmp(b),
+            (RecoveryKey::Text(a, at), RecoveryKey::Text(b, bt)) => compare_sort_keys(*a, at, *b, bt),
+            _ => self.id.cmp(&other.id),
+        };
+        (if self.desc { order.reverse() } else { order }).then(self.id.cmp(&other.id))
+    }
+}
+
+/// Recovery is slower, but never allocates one id or sort key per matching
+/// event. Deep random access waits for the persistent index instead of risking
+/// a desktop OOM. Ordinary forward indexed navigation uses cursors above.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn query_page_lines(
+    idx: &FileIndex, filters: &[Filter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize, codes: &CodesConfig, system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> Result<QueryPage, String> {
+    let selected = select_page_lines(idx, filters, sort_column, sort_dir, offset, limit, codes, system, derived)?;
+    let binding = crate::analysis_runtime::source_set(idx)?;
+    let rows = selected.ids.iter().map(|&id| {
+        let mut event = event_at(idx, id, codes, system, derived);
+        crate::analysis_runtime::attach_provenance_with(idx, &binding, &mut event)?;
+        crate::entities::annotate(&mut event);
+        event.raw = String::new();
+        Ok(event)
+    }).collect::<Result<Vec<_>, String>>()?;
+    Ok(selected.into_full(rows))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_page_lines(
+    idx: &FileIndex, filters: &[Filter], sort_column: &str, sort_dir: &str,
+    offset: usize, limit: usize, codes: &CodesConfig, system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> Result<SelectedPage, String> {
+    for part in &idx.parts { crate::sources::validate_source(part)?; }
+    const WINDOW: usize = 10_000;
+    const KEY_BUDGET: usize = 32 << 20;
+    let keep = offset.saturating_add(limit).saturating_add(1);
+    if keep > WINDOW {
+        return Err("Navegação profunda aguarda o índice de consultas. Reduza o recorte ou conclua/repare a preparação.".into());
+    }
+    let gate = crate::analysis_runtime::indexed_gate(idx)?;
+    let pfs = prepare(filters);
+    let enriched: Vec<_> = pfs.iter().map(|pf| query_needs_enrichment(pf, codes, system, derived)).collect();
+    let mut selected: std::collections::BinaryHeap<RecoveryRow> = std::collections::BinaryHeap::new();
+    let (mut total, mut bytes) = (0usize, 0usize);
+    for i in 0..idx.lines.len() {
+        if i % 2048 == 0 { crate::operations::check()?; }
+        if gate.as_ref().is_some_and(|gate| !gate.allows_known_row(i)) { continue; }
+        let meta = &idx.lines.at(i);
+        let line = line_bytes(idx, i);
+        let mut needs_event = false;
+        let mut eligible = true;
+        for (pf, enriched) in pfs.iter().zip(&enriched) {
+            match meta_check(pf, meta, line, *enriched) {
+                Tri::Fail => { eligible = false; break; }
+                Tri::NeedEvent => needs_event = true,
+                Tri::Pass => {}
+            }
+        }
+        if !eligible { continue; }
+        let mut event = needs_event.then(|| event_at(idx, i, codes, system, derived));
+        if event.as_ref().is_some_and(|event| !pfs.iter().all(|pf| matches_indexed(event, pf))) { continue; }
+        total += 1;
+        let key = match sort_column {
+            "" | "id" => RecoveryKey::Integer(i as i64),
+            "timestamp" => RecoveryKey::Integer(meta.ts),
+            "level" => RecoveryKey::Integer(meta.level as i64),
+            column => {
+                let event = event.get_or_insert_with(|| event_at(idx, i, codes, system, derived));
+                let text = event.col_ref(column).unwrap_or_default().to_lowercase();
+                if text.len() > KEY_BUDGET { return Err("Campo de ordenação excede o orçamento de recuperação. Escolha outra coluna ou conclua a preparação.".into()); }
+                RecoveryKey::Text(event.col_num(column), text)
+            }
+        };
+        let item = RecoveryRow { id: i, key, desc: !sort_column.is_empty() && sort_dir == "desc" };
+        if selected.len() < keep || selected.peek().is_some_and(|worst| item < *worst) {
+            if selected.len() == keep { bytes = bytes.saturating_sub(selected.pop().unwrap().bytes()); }
+            bytes = bytes.saturating_add(item.bytes());
+            if bytes > KEY_BUDGET { return Err("Ordenação excede o orçamento de recuperação. Reduza o recorte ou conclua a preparação.".into()); }
+            selected.push(item);
+        }
+    }
+    crate::operations::check()?;
+    let ids = selected.into_sorted_vec().into_iter().skip(offset).take(limit).map(|row| row.id).collect();
+    Ok(SelectedPage::exact(ids, total, offset, "lines", Some(
+        "Modo de recuperação: índice indisponível, leitura mais lenta e navegação limitada a 10 mil registros.".into(),
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn query_projected_indexed(
+    idx: &FileIndex, filters: &[Filter], sort_column: &str, sort_dir: &str,
+    offset: usize, cursor: Option<&str>, codes: &CodesConfig, system: &CodesConfig,
+    derived: &[CompiledDerived], plan: &crate::page_projection::ProjectionPlan,
+) -> Result<crate::page_projection::ProjectedPage, String> {
+    let _interactive = crate::operations::interactive();
+    if let Some(result) = crate::engine::query_projected_page(
+        &engine_source(idx, codes, system, derived), &prepare(filters),
+        sort_column, sort_dir, offset, cursor, plan,
+    ) { return result; }
+    if cursor.is_some() {
+        return Err("PAGINATION_RESET_REQUIRED: O índice desta paginação não está disponível. Recarregue a primeira página para usar a recuperação.".into());
+    }
+    let selected = select_page_lines(idx, filters, sort_column, sort_dir, offset, plan.limit, codes, system, derived)?;
+    let items = selected.ids.iter().map(|&id| crate::page_projection::project_indexed_row(idx, id, codes, system, derived, plan))
+        .collect::<Result<Vec<_>, String>>()?;
+    plan.finish(selected, items)
 }
 
 fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
@@ -1149,7 +1379,7 @@ fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
             while start < matched.len() {
                 let mut end = start + 1;
                 while end < matched.len()
-                    && idx.lines[matched[end]].ts == idx.lines[matched[start]].ts
+                    && idx.lines.at(matched[end]).ts == idx.lines.at(matched[start]).ts
                 {
                     end += 1;
                 }
@@ -1159,7 +1389,7 @@ fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
         }
     } else {
         matched.sort_by(|&a, &b| {
-            let ord = idx.lines[a].ts.cmp(&idx.lines[b].ts);
+            let ord = idx.lines.at(a).ts.cmp(&idx.lines.at(b).ts);
             if desc {
                 ord.reverse()
             } else {
@@ -1173,9 +1403,58 @@ fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
 // Agregações
 // ==========================================================================
 
-enum Acc {
+pub(crate) struct AnalyticsBudget { used: usize, limit: usize, admission: Option<Arc<crate::analysis_runtime::Admitted>> }
+impl AnalyticsBudget {
+    pub(crate) fn new() -> Self { Self { used: 0, limit: crate::resources::analytics_bytes(), admission: crate::analysis_runtime::current() } }
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        let next = self.used.checked_add(bytes).filter(|next| *next <= self.limit)
+            .ok_or("O resultado analítico excedeu o orçamento de valores deste Caso/aplicativo (LOGINSIGHT_ANALYTICS_LIMIT_MB). Restrinja os filtros ou reduza os agrupamentos.")?;
+        if let Some(admitted) = &self.admission { admitted.retain_resource_bytes(bytes)?; }
+        self.used = next;
+        Ok(())
+    }
+    pub(crate) fn group(&mut self, key: &Option<String>, specs: usize) -> Result<(), String> {
+        self.charge(key.as_ref().map_or(0, |v| v.len()).saturating_mul(3).saturating_add(128).saturating_add(specs.saturating_mul(std::mem::size_of::<Acc>())))
+    }
+}
+
+#[cfg(test)]
+mod analytics_budget_tests {
+    use super::*;
+    #[test]
+    fn group_labels_and_text_values_share_one_byte_budget() {
+        let mut budget = AnalyticsBudget { used: 0, limit: 1024, admission: None };
+        budget.group(&Some("日".repeat(40)), 1).unwrap();
+        assert!(budget.group(&Some("x".repeat(400)), 1).is_err());
+        let mut budget = AnalyticsBudget { used: 0, limit: 64, admission: None };
+        let mut acc = Acc::StrAgg(Vec::new());
+        let mut event = Event::empty();
+        event.message = "日".repeat(30);
+        assert!(acc.push(&event, "message", &mut budget).is_err());
+        assert!(matches!(acc, Acc::StrAgg(ref values) if values.is_empty()));
+    }
+    #[test]
+    fn distinct_groups_charge_only_new_values_to_the_shared_budget() {
+        let mut budget = AnalyticsBudget { used: 0, limit: 200, admission: None };
+        let mut a = Acc::CountDistinct(Default::default());
+        let mut b = Acc::CountDistinct(Default::default());
+        let mut event = Event::empty();
+        event.message = "same".into();
+        a.push(&event, "message", &mut budget).unwrap();
+        let used = budget.used;
+        a.push(&event, "message", &mut budget).unwrap();
+        assert_eq!(used, budget.used);
+        b.push(&event, "message", &mut budget).unwrap();
+        event.message = "another".into();
+        assert!(b.push(&event, "message", &mut budget).is_err());
+    }
+}
+
+pub(crate) enum Acc {
     Count(u64),
     CountDistinct(crate::distinct::Counter),
+    /// Distinct count computed elsewhere (query engine).
+    Distinct(u64),
     Sum(f64, [usize; 5]),
     Avg(f64, u64, [usize; 5]),
     Min(Option<f64>, [usize; 5]),
@@ -1196,7 +1475,7 @@ impl Acc {
         }
     }
 
-    fn push(&mut self, ev: &Event, column: &str) {
+    fn push(&mut self, ev: &Event, column: &str, budget: &mut AnalyticsBudget) -> Result<(), String> {
         let numeric = || {
             if matches!(column, "timestamp" | "id") {
                 ev.col_num(column)
@@ -1210,9 +1489,10 @@ impl Acc {
             Acc::Count(n) => *n += 1,
             Acc::CountDistinct(set) => {
                 if let Some(s) = ev.col_str(column) {
-                    set.insert(s);
+                    budget.charge(set.try_insert(s)?)?;
                 }
             }
+            Acc::Distinct(_) => {}
             Acc::Sum(n, units) => {
                 if let Some((v, unit)) = numeric() {
                     *n += v;
@@ -1242,12 +1522,14 @@ impl Acc {
                 if items.len() < 100 {
                     if let Some(s) = ev.col_str(column) {
                         if !s.is_empty() {
+                            budget.charge(s.len().saturating_mul(2).saturating_add(32))?;
                             items.push(s);
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn units(&self) -> &[usize; 5] {
@@ -1264,6 +1546,7 @@ impl Acc {
         match self {
             Acc::Count(n) => Value::from(*n),
             Acc::CountDistinct(set) => Value::from(set.len() as u64),
+            Acc::Distinct(n) => Value::from(*n),
             Acc::Sum(n, _) => round2(*n).into(),
             Acc::Avg(sum, n, _) => {
                 if *n == 0 {
@@ -1297,40 +1580,35 @@ fn round2(v: f64) -> f64 {
 /// Contagens por valor para várias colunas de uma vez (árvore de exploração).
 /// Cada coluna é agregada com os filtros MENOS o filtro da própria coluna,
 /// garantindo que toda opção exibida exista no recorte complementar.
-/// As colunas são processadas em paralelo (rayon).
+/// As colunas compartilham o orçamento global de processamento paralelo.
 pub fn multi_count(
     events: &[Event],
     filters: &[Filter],
     columns: &[String],
 ) -> Vec<(String, AggResult)> {
-    let generation = crate::operations::current_generation();
-    columns
-        .par_iter()
-        .map(|col| {
-            let fs: Vec<Filter> = filters
-                .iter()
-                .filter(|f| f.column != *col)
-                .cloned()
-                .collect();
-            let run = || {
-                aggregate(
-                    events,
-                    &fs,
-                    col,
-                    &[AggSpec {
-                        func: "count".into(),
-                        column: "*".into(),
-                        alias: "n".into(),
-                    }],
-                )
-            };
-            let agg = match generation {
-                Some(g) => crate::operations::run(g, run).unwrap_or_default(),
-                None => run(),
-            };
-            (col.clone(), agg)
-        })
-        .collect()
+    let cancellation = crate::operations::current_token();
+    let admission = crate::analysis_runtime::current();
+    crate::global_scheduler::map(columns, |col| {
+        let fs: Vec<Filter> = filters
+            .iter()
+            .filter(|f| f.column != *col)
+            .cloned()
+            .collect();
+        let run = || {
+            aggregate(
+                events,
+                &fs,
+                col,
+                &[AggSpec {
+                    func: "count".into(),
+                    column: "*".into(),
+                    alias: "n".into(),
+                }],
+            )
+        };
+        let agg = crate::analysis_runtime::with(admission.clone(), || crate::operations::run_with_token(cancellation.clone(), run)).unwrap_or_default();
+        (col.clone(), agg)
+    })
 }
 
 /// Versão indexada (mmap) da multi-agregação.
@@ -1342,45 +1620,46 @@ pub fn multi_count_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Vec<(String, AggResult)> {
-    let generation = crate::operations::current_generation();
-    columns
-        .par_iter()
-        .map(|col| {
-            let fs: Vec<Filter> = filters
-                .iter()
-                .filter(|f| f.column != *col)
-                .cloned()
-                .collect();
-            let run = || {
-                aggregate_indexed(
-                    idx,
-                    &fs,
-                    col,
-                    &[AggSpec {
-                        func: "count".into(),
-                        column: "*".into(),
-                        alias: "n".into(),
-                    }],
-                    codes,
-                    system,
-                    derived,
-                )
-            };
-            let agg = match generation {
-                Some(g) => crate::operations::run(g, run).unwrap_or_default(),
-                None => run(),
-            };
-            (col.clone(), agg)
-        })
-        .collect()
+    match crate::engine::multi_count(&engine_source(idx, codes, system, derived), filters, columns) {
+        Ok(Some(result)) => return result,
+        Err(error) => return columns.iter().map(|column| (column.clone(), AggResult::failure(error.clone()))).collect(),
+        Ok(None) => (),
+    }
+    let cancellation = crate::operations::current_token();
+    let admission = crate::analysis_runtime::current();
+    crate::global_scheduler::map(columns, |col| {
+        let fs: Vec<Filter> = filters
+            .iter()
+            .filter(|f| f.column != *col)
+            .cloned()
+            .collect();
+        let run = || {
+            aggregate_indexed(
+                idx,
+                &fs,
+                col,
+                &[AggSpec {
+                    func: "count".into(),
+                    column: "*".into(),
+                    alias: "n".into(),
+                }],
+                codes,
+                system,
+                derived,
+            )
+        };
+        let agg = crate::analysis_runtime::with(admission.clone(), || crate::operations::run_with_token(cancellation.clone(), run)).unwrap_or_default();
+        (col.clone(), agg)
+    })
 }
 
-fn build_agg_result(
+pub(crate) fn build_agg_result(
     groups: HashMap<Option<String>, Vec<Acc>>,
     mut order: Vec<Option<String>>,
     group_column: &str,
     specs: &[AggSpec],
 ) -> AggResult {
+    if groups.len() > group_budget(specs) { return AggResult::budget_error(); }
     order.sort_by(|a, b| {
         let (sa, sb) = (a.as_deref().unwrap_or(""), b.as_deref().unwrap_or(""));
         compare_sort_keys(
@@ -1421,6 +1700,31 @@ fn build_agg_result(
         }
     }
 
+    // Only the largest groups by the first measure are returned.
+    let mut omitted_groups = 0;
+    let mut omitted_records = 0u64;
+    if order.len() > MAX_GROUPS && !specs.is_empty() {
+        let score = |key: &Option<String>| match groups[key][0].finish(&specs[0].column) {
+            Value::Number(n) => n.as_f64().unwrap_or(f64::NEG_INFINITY),
+            _ => f64::NEG_INFINITY,
+        };
+        let scores: Vec<f64> = order.iter().map(score).collect();
+        let mut ranked: Vec<usize> = (0..order.len()).collect();
+        ranked.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+        let mut kept = vec![false; order.len()];
+        for &i in &ranked[..MAX_GROUPS] {
+            kept[i] = true;
+        }
+        let counted = specs.iter().position(|s| s.func == "count");
+        omitted_groups = order.len() - MAX_GROUPS;
+        for (key, _) in order.iter().zip(&kept).filter(|(_, kept)| !**kept) {
+            if let Some(Acc::Count(n)) = counted.map(|c| &groups[key][c]) {
+                omitted_records += n;
+            }
+        }
+        order = order.into_iter().zip(kept).filter(|(_, kept)| *kept).map(|(key, _)| key).collect();
+    }
+
     let group_values = order.clone();
     let rows = order
         .into_iter()
@@ -1451,6 +1755,9 @@ fn build_agg_result(
         group_values,
         incompatible_units,
         value_units,
+        omitted_groups,
+        omitted_records,
+        error: None,
     }
 }
 
@@ -1461,15 +1768,17 @@ pub fn aggregate(
     specs: &[AggSpec],
 ) -> AggResult {
     let idx = filtered_indices(events, filters);
+    let mut budget = AnalyticsBudget::new();
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order: Vec<Option<String>> = Vec::new();
 
     for i in idx {
+        if groups.len() > group_budget(specs) { return AggResult::budget_error(); }
         if crate::operations::cancelled() {
             break;
         }
         let ev = &events[i];
-        push_group(&mut groups, &mut order, ev, ev.col_str(group_column), specs);
+        if let Err(error) = push_group(&mut groups, &mut order, ev, ev.col_str(group_column), specs, &mut budget) { return AggResult::failure(error); }
     }
     build_agg_result(groups, order, group_column, specs)
 }
@@ -1480,32 +1789,35 @@ fn push_group(
     ev: &Event,
     key: Option<String>,
     specs: &[AggSpec],
-) {
+    budget: &mut AnalyticsBudget,
+) -> Result<(), String> {
     let key = key.filter(|value| !value.trim().is_empty());
     // Caminho quente é o grupo já existente: get_mut evita clonar a chave
     // a cada linha; só clona ao criar um grupo novo.
     if let Some(accs) = groups.get_mut(&key) {
         for (acc, spec) in accs.iter_mut().zip(specs.iter()) {
-            acc.push(ev, &spec.column);
+            acc.push(ev, &spec.column, budget)?;
         }
-        return;
+        return Ok(());
     }
+    budget.group(&key, specs.len())?;
     order.push(key.clone());
     let mut accs: Vec<Acc> = specs.iter().map(|s| Acc::new(&s.func)).collect();
     for (acc, spec) in accs.iter_mut().zip(specs.iter()) {
-        acc.push(ev, &spec.column);
+        acc.push(ev, &spec.column, budget)?;
     }
     groups.insert(key, accs);
+    Ok(())
 }
 
 /// Colunas disponíveis direto dos metadados (sem parse da linha).
-fn is_meta_column(col: &str) -> bool {
+pub(crate) fn is_meta_column(col: &str) -> bool {
     matches!(col, "*" | "timestamp" | "level")
 }
 
 /// Evento parcial montado só com os campos dos metadados.
 fn meta_event(idx: &FileIndex, i: usize) -> Event {
-    let m = &idx.lines[i];
+    let m = &idx.lines.at(i);
     let mut ev = Event::empty();
     ev.id = i;
     if m.ts != 0 {
@@ -1528,284 +1840,36 @@ pub fn aggregate_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> AggResult {
-    let matched = indexed_matches_shared(idx, filters, codes, system, derived);
-    if let Some(result) = fast_count_aggregation(idx, &matched, group_column, specs) { return result; }
+    match crate::engine::aggregate(&engine_source(idx, codes, system, derived), &prepare(filters), group_column, specs) {
+        Ok(Some(result)) => return result,
+        Err(error) => return AggResult::failure(error),
+        Ok(None) => (),
+    }
+    let mut budget = AnalyticsBudget::new();
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order: Vec<Option<String>> = Vec::new();
-
-    // Caminho rápido: grupo e agregações só sobre colunas de metadados
-    // (timestamp, level, code) — zero parse por linha.
     let meta_only = is_meta_column(group_column) && specs.iter().all(|s| is_meta_column(&s.column));
-    for &i in matched.iter() {
-        if crate::operations::cancelled() {
-            break;
+    let mut failure = None;
+    let exceeded = std::sync::atomic::AtomicBool::new(false);
+    let scan = scan_indexed(idx, &prepare(filters), codes, system, derived, |i, _, event| {
+        if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+        Some(if meta_only { meta_event(idx, i) } else { event.unwrap_or_else(|| event_at(idx, i, codes, system, derived)) })
+    }, |event| {
+        if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return; }
+        if let Some(event) = event {
+            if let Err(error) = push_group(&mut groups, &mut order, &event, event.col_str(group_column), specs, &mut budget) { failure = Some(error); exceeded.store(true, std::sync::atomic::Ordering::Relaxed); }
+            if groups.len() > group_budget(specs) { exceeded.store(true, std::sync::atomic::Ordering::Relaxed); }
         }
-        if meta_only {
-            let ev = meta_event(idx, i);
-            push_group(
-                &mut groups,
-                &mut order,
-                &ev,
-                ev.col_str(group_column),
-                specs,
-            );
-        } else {
-            let ev = event_at(idx, i, codes, system, derived);
-            push_group(
-                &mut groups,
-                &mut order,
-                &ev,
-                ev.col_str(group_column),
-                specs,
-            );
-        }
-    }
+    });
+    if let Err(error) = scan { return AggResult::failure(error); }
+    if let Some(error) = failure { return AggResult::failure(error); }
+    if exceeded.load(std::sync::atomic::Ordering::Relaxed) { return AggResult::budget_error(); }
     build_agg_result(groups, order, group_column, specs)
 }
 
 // ==========================================================================
 // Estatísticas (histograma + níveis)
 // ==========================================================================
-
-/// Rank the distinct categorical sort keys, then select the requested range
-/// within each rank. Deep pages do not require sorting or decoding the prefix.
-/// The key comparator and position tie-break exactly match the stable legacy
-/// sort, including numeric strings, units, Unicode folding and segment overlap.
-fn categorical_page(
-    engine: &crate::big_data::BigDataIndex,
-    matched: &[usize],
-    column: &str,
-    desc: bool,
-    offset: usize,
-    limit: usize,
-) -> Option<Vec<usize>> {
-    let slot = match column { "source" => 0, "code" => 1, _ => return None };
-    let mut columns = [false; 3];
-    columns[slot] = true;
-    let generation = crate::operations::current_generation();
-    let mut dictionary = HashMap::new();
-    let mut keys: Vec<(Option<f64>, String, usize)> = Vec::new();
-    let mut row_keys = Vec::with_capacity(matched.len());
-    for (position, &row) in matched.iter().enumerate() {
-        if position % 2048 == 0 && crate::operations::cancelled_for(generation) {
-            return None;
-        }
-        let (segment, ordinals) = engine.projection_key(row, columns)?;
-        let ordinal = ordinals[slot];
-        let key = match dictionary.entry((segment, ordinal)) {
-            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                // A missing ordinal represents the empty string. A dictionary
-                // decoding error requests the original stored-event path.
-                let value = match ordinal {
-                    Some(_) => engine.col_str(row, column)?,
-                    None => String::new(),
-                };
-                let mut event = Event::empty();
-                if slot == 0 { event.source = value; } else { event.code = value; }
-                let key = keys.len();
-                keys.push((event.col_num(column), event.col_ref(column)?.to_lowercase(), 0));
-                entry.insert(key);
-                key
-            }
-        };
-        keys[key].2 += 1;
-        row_keys.push(key);
-    }
-    drop(dictionary);
-    let compare = |a: usize, b: usize| {
-        let order = compare_sort_keys(keys[a].0, &keys[a].1, keys[b].0, &keys[b].1);
-        if desc { order.reverse() } else { order }
-    };
-    let mut ordered: Vec<_> = (0..keys.len()).collect();
-    ordered.sort_unstable_by(|&a, &b| compare(a, b));
-    let mut ranks = vec![0; keys.len()];
-    let mut counts: Vec<usize> = Vec::new();
-    let mut previous = None;
-    for key in ordered {
-        if !previous.is_some_and(|prev| compare(prev, key).is_eq()) {
-            counts.push(0);
-        }
-        let rank = counts.len() - 1;
-        ranks[key] = rank;
-        counts[rank] += keys[key].2;
-        previous = Some(key);
-    }
-    // Equal comparison keys from different segments share a rank, preserving
-    // the original row order across all segments rather than segment order.
-    let page_end = offset.saturating_add(limit).min(matched.len());
-    let mut base = 0usize;
-    let ranges: Vec<_> = counts.iter().map(|&count| {
-        let range = (offset.saturating_sub(base).min(count), page_end.saturating_sub(base).min(count));
-        base += count;
-        range
-    }).collect();
-    let mut seen = vec![0usize; counts.len()];
-    let mut page = Vec::with_capacity(page_end.saturating_sub(offset));
-    for (position, (&row, key)) in matched.iter().zip(row_keys).enumerate() {
-        if position % 2048 == 0 && crate::operations::cancelled_for(generation) {
-            return None;
-        }
-        let rank = ranks[key];
-        let within = seen[rank];
-        seen[rank] += 1;
-        let (from, to) = ranges[rank];
-        if within >= from && within < to { page.push((rank, row)); }
-    }
-    if crate::operations::cancelled_for(generation) { return None; }
-    page.sort_unstable();
-    Some(page.into_iter().map(|(_, row)| row).collect())
-}
-
-fn query_from_indexed_matches(
-    idx: &FileIndex,
-    mut matched: Arc<Vec<usize>>,
-    sort_column: &str,
-    sort_dir: &str,
-    offset: usize,
-    limit: usize,
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-) -> QueryResult {
-    let desc = sort_dir == "desc";
-    let total = matched.len();
-    if limit == 0 || offset >= total {
-        return QueryResult { total, rows: Vec::new() };
-    }
-    let page_end = offset.saturating_add(limit).min(total);
-    let mut page_offset = offset;
-    let categorical = idx.big_data.as_ref()
-        .and_then(|engine| categorical_page(engine, &matched, sort_column, desc, offset, limit));
-    if let Some(page) = categorical {
-        matched = Arc::new(page);
-        page_offset = 0;
-    } else if idx.big_data.is_some() && matches!(sort_column, "timestamp" | "level") && page_end < total {
-        let matched = Arc::make_mut(&mut matched);
-        // Only the requested prefix needs ordering. Include the source position
-        // in ties to reproduce the stable ordering of the full legacy sort.
-        let compare = |&a: &usize, &b: &usize| {
-            let order = if sort_column == "timestamp" { idx.lines[a].ts.cmp(&idx.lines[b].ts) }
-                else { idx.lines[a].level.cmp(&idx.lines[b].level) };
-            (if desc { order.reverse() } else { order }).then_with(|| a.cmp(&b))
-        };
-        matched.select_nth_unstable_by(page_end, compare);
-        matched.truncate(page_end);
-        matched.sort_unstable_by(compare);
-    } else {
-    match sort_column {
-        "" => {}
-        "timestamp" => sort_time(idx, Arc::make_mut(&mut matched), desc),
-        "level" => Arc::make_mut(&mut matched).sort_by(|&a, &b| {
-            let ord = idx.lines[a].level.cmp(&idx.lines[b].level);
-            if desc {
-                ord.reverse()
-            } else {
-                ord
-            }
-        }),
-        col => {
-            let keys: HashMap<usize, (Option<f64>, String)> = matched
-                .iter()
-                .take_while(|_| !crate::operations::cancelled())
-                .map(|&i| {
-                    let event = event_at(idx, i, codes, system, derived);
-                    (
-                        i,
-                        (
-                            event.col_num(col),
-                            event.col_ref(col).unwrap_or_default().to_lowercase(),
-                        ),
-                    )
-                })
-                .collect();
-            if keys.len() != matched.len() {
-                return QueryResult {
-                    total: 0,
-                    rows: vec![],
-                };
-            }
-            Arc::make_mut(&mut matched).sort_by(|a, b| {
-                let ord = compare_sort_keys(keys[a].0, &keys[a].1, keys[b].0, &keys[b].1);
-                if desc {
-                    ord.reverse()
-                } else {
-                    ord
-                }
-            });
-        }
-    }
-    }
-    let rows = matched
-        .iter()
-        .copied()
-        .skip(page_offset)
-        .take(limit)
-        .map(|i| {
-            let mut event = event_at(idx, i, codes, system, derived);
-            crate::entities::annotate(&mut event);
-            event.raw.clear();
-            event
-        })
-        .collect();
-    QueryResult { total, rows }
-}
-
-fn aggregate_from_indexed_matches(
-    idx: &FileIndex,
-    matched: &[usize],
-    group_column: &str,
-    specs: &[AggSpec],
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-) -> AggResult {
-    if let Some(result) = fast_count_aggregation(idx, matched, group_column, specs) { return result; }
-    let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
-    let mut order = Vec::new();
-    let meta_only =
-        is_meta_column(group_column) && specs.iter().all(|spec| is_meta_column(&spec.column));
-    for &i in matched {
-        if crate::operations::cancelled() {
-            break;
-        }
-        if meta_only {
-            let event = meta_event(idx, i);
-            push_group(
-                &mut groups,
-                &mut order,
-                &event,
-                event.col_str(group_column),
-                specs,
-            );
-        } else {
-            let event = event_at(idx, i, codes, system, derived);
-            push_group(
-                &mut groups,
-                &mut order,
-                &event,
-                event.col_str(group_column),
-                specs,
-            );
-        }
-    }
-    build_agg_result(groups, order, group_column, specs)
-}
-
-fn fast_count_aggregation(idx: &FileIndex, matched: &[usize], group_column: &str, specs: &[AggSpec]) -> Option<AggResult> {
-    if !specs.iter().all(|spec| spec.func == "count") { return None; }
-    // Preserve the existing metadata classification of levels, including
-    // unknown labels in snapshot events. Other count projections use text.
-    if is_meta_column(group_column) && specs.iter().all(|spec| is_meta_column(&spec.column)) { return None; }
-    let terms = idx.big_data.as_ref()?.count_terms(matched, group_column)?;
-    let mut groups = HashMap::new();
-    let mut order = Vec::with_capacity(terms.len());
-    for (key, count) in terms {
-        order.push(key.clone());
-        groups.insert(key, specs.iter().map(|_| Acc::Count(count)).collect());
-    }
-    Some(build_agg_result(groups, order, group_column, specs))
-}
 
 pub fn explore_indexed(
     idx: &FileIndex,
@@ -1817,43 +1881,27 @@ pub fn explore_indexed(
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-) -> ExplorerSnapshot {
-    let matched = indexed_matches_shared(idx, filters, codes, system, derived);
-    let stats = stats_from(matched.iter().map(|&i| {
-        (
-            (idx.lines[i].ts != 0).then_some(idx.lines[i].ts),
-            crate::model::class_label(idx.lines[i].level),
-        )
-    }));
-    let count = [AggSpec {
-        func: "count".into(),
-        column: "*".into(),
-        alias: "n".into(),
-    }];
-    let sources =
-        aggregate_from_indexed_matches(idx, &matched, "source", &count, codes, system, derived);
-    let codes_agg =
-        aggregate_from_indexed_matches(idx, &matched, "code", &count, codes, system, derived);
-    let query = query_from_indexed_matches(
-        idx,
-        matched,
+) -> Result<ExplorerSnapshot, String> {
+    if let Some(snapshot) = crate::engine::explore(
+        &engine_source(idx, codes, system, derived),
+        &prepare(filters),
         sort_column,
         sort_dir,
         offset,
         limit,
-        codes,
-        system,
-        derived,
-    );
-    ExplorerSnapshot {
-        query,
-        stats,
-        sources,
-        codes: codes_agg,
+    )? {
+        return Ok(snapshot);
     }
+    let query = query_indexed(idx, filters, sort_column, sort_dir, offset, limit, codes, system, derived)?;
+    let stats = stats_indexed(idx, filters, codes, system, derived)?;
+    let count = [AggSpec { func: "count".into(), column: "*".into(), alias: "n".into() }];
+    let sources = aggregate_indexed(idx, filters, "source", &count, codes, system, derived);
+    let codes_agg = aggregate_indexed(idx, filters, "code", &count, codes, system, derived);
+    crate::operations::check()?;
+    Ok(ExplorerSnapshot { query, stats, sources, codes: codes_agg })
 }
 
-fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i64)>) -> Stats {
+pub(crate) fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i64)>) -> Stats {
     Stats {
         buckets,
         bucket_ms,
@@ -1863,63 +1911,70 @@ fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i6
 
 const N_BUCKETS: usize = 60;
 
-fn histogram_from_bounds(
-    iter: impl Iterator<Item = Option<i64>>,
-    min_ts: i64,
-    max_ts: i64,
-    generation: Option<u64>,
-) -> Option<(Vec<(i64, i64)>, i64)> {
-    if min_ts > max_ts { return Some((Vec::new(), 0)); }
+/// Width and number of histogram buckets covering `[min_ts, max_ts]`.
+pub(crate) fn stats_layout(min_ts: i64, max_ts: i64) -> (i64, usize) {
     let span = max_ts.saturating_sub(min_ts).saturating_add(1);
     let bucket_ms = (span / N_BUCKETS as i64)
         .saturating_add(i64::from(span % N_BUCKETS as i64 != 0))
         .max(1);
     let count = (((span - 1) / bucket_ms + 1) as usize).min(N_BUCKETS);
-    let mut counts = vec![0i64; count];
-    for (position, ts) in iter.enumerate() {
-        if position % 2048 == 0 && crate::operations::cancelled_for(generation) { return None; }
-        let Some(t) = ts else { continue };
-        let b = (t.saturating_sub(min_ts) / bucket_ms) as usize;
-        counts[b.min(count - 1)] += 1;
-    }
-    let buckets = counts.into_iter().enumerate().map(|(b, c)| {
-        (min_ts.saturating_add((b as i64).saturating_mul(bucket_ms)), c)
-    }).collect();
-    Some((buckets, bucket_ms))
+    (bucket_ms, count)
 }
 
-fn stats_from<'a>(iter: impl Iterator<Item = (Option<i64>, &'a str)> + Clone) -> Stats {
-    // Callers replay borrowed projections over existing selections. Keep only
-    // bounds and level counts; do not allocate another timestamp per event.
-    let generation = crate::operations::current_generation();
+/// Level counts, most frequent first; ties by label keep the order stable.
+pub(crate) fn sort_levels(levels: &mut [(String, i64)]) {
+    levels.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
+fn stats_from<'a>(iter: impl Iterator<Item = (Option<i64>, &'a str)>) -> Stats {
+    // Chaveia por &str emprestada (zero alocação por linha); converte para
+    // String apenas no Vec final.
     let mut levels: HashMap<&'a str, i64> = HashMap::new();
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
-    for (position, (ts, level)) in iter.clone().enumerate() {
-        if position % 2048 == 0 && crate::operations::cancelled_for(generation) {
-            return build_stats(Vec::new(), 0, Vec::new());
-        }
+    let mut items = Vec::new();
+    for (ts, level) in iter {
         *levels.entry(level).or_default() += 1;
         if let Some(ts) = ts {
             min_ts = min_ts.min(ts);
             max_ts = max_ts.max(ts);
+            items.push(ts);
         }
     }
 
-    let Some((buckets, bucket_ms)) = histogram_from_bounds(iter.map(|(ts, _)| ts), min_ts, max_ts, generation)
-        else { return build_stats(Vec::new(), 0, Vec::new()); };
+    let mut buckets = Vec::new();
+    let mut bucket_ms = 0i64;
+    if min_ts <= max_ts {
+        let count;
+        (bucket_ms, count) = stats_layout(min_ts, max_ts);
+        let mut counts = vec![0i64; count];
+        for t in items {
+            let b = (t.saturating_sub(min_ts) / bucket_ms) as usize;
+            counts[b.min(count - 1)] += 1;
+        }
+        buckets = counts
+            .into_iter()
+            .enumerate()
+            .map(|(b, c)| {
+                (
+                    min_ts.saturating_add((b as i64).saturating_mul(bucket_ms)),
+                    c,
+                )
+            })
+            .collect();
+    }
 
     let mut levels: Vec<(String, i64)> = levels
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-    levels.sort_by(|a, b| b.1.cmp(&a.1));
+    sort_levels(&mut levels);
     build_stats(buckets, bucket_ms, levels)
 }
 
 pub fn stats(events: &[Event], filters: &[Filter]) -> Stats {
     let idx = filtered_indices(events, filters);
-    stats_from(idx.iter().map(|&i| {
+    stats_from(idx.into_iter().map(|i| {
         let ev = &events[i];
         (ev.timestamp, ev.level.as_str())
     }))
@@ -1931,253 +1986,167 @@ pub fn stats_indexed(
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-) -> Stats {
+) -> Result<Stats, String> {
     let pfs = prepare(filters);
-    let generation = crate::operations::current_generation();
-    let mut timestamps = Vec::new();
-    let mut levels: HashMap<Cow<'static, str>, i64> = HashMap::new();
-    let mut min_ts = i64::MAX;
-    let mut max_ts = i64::MIN;
+    if let Some(stats) = crate::engine::stats(&engine_source(idx, codes, system, derived), &pfs)? {
+        return Ok(stats);
+    }
+    // Two bounded passes trade recovery CPU for predictable memory. No vector
+    // of timestamps/matches proportional to a 50M-row source is retained.
+    let (mut min_ts, mut max_ts) = (i64::MAX, i64::MIN);
+    let mut levels: HashMap<&'static str, i64> = HashMap::new();
     scan_indexed(
-        idx,
-        &pfs,
-        codes,
-        system,
-        derived,
-        true,
-        |_, meta, ev| match ev {
-            Some(ev) => (ev.timestamp, Cow::Owned(ev.level)),
-            // rótulo fixo da classe: sem String por linha
-            None => (
-                (meta.ts != 0).then_some(meta.ts),
-                Cow::Borrowed(crate::model::class_label(meta.level)),
-            ),
-        },
-        |(timestamp, level)| {
+        idx, &pfs, codes, system, derived,
+        |_, meta, _| (meta.ts, crate::model::class_label(meta.level)),
+        |(ts, level)| {
             *levels.entry(level).or_default() += 1;
-            if let Some(timestamp) = timestamp {
-                min_ts = min_ts.min(timestamp);
-                max_ts = max_ts.max(timestamp);
-                timestamps.push(timestamp);
-            }
+            if ts != 0 { min_ts = min_ts.min(ts); max_ts = max_ts.max(ts); }
         },
-    );
-    // Preserve the exact metadata/event projection without retaining its level
-    // String and Option discriminant per row or decoding/filtering a second time.
-    if crate::operations::cancelled_for(generation) { return build_stats(Vec::new(), 0, Vec::new()); }
-    let Some((buckets, bucket_ms)) = histogram_from_bounds(timestamps.iter().copied().map(Some), min_ts, max_ts, generation)
-        else { return build_stats(Vec::new(), 0, Vec::new()); };
-    let mut levels: Vec<_> = levels.into_iter().map(|(level, count)| (level.into_owned(), count)).collect();
-    levels.sort_by(|a, b| b.1.cmp(&a.1));
-    build_stats(buckets, bucket_ms, levels)
+    )?;
+    let (mut buckets, mut bucket_ms) = (Vec::new(), 0);
+    if min_ts <= max_ts && !crate::operations::cancelled() {
+        let count;
+        (bucket_ms, count) = stats_layout(min_ts, max_ts);
+        let mut counts = vec![0i64; count];
+        scan_indexed(idx, &pfs, codes, system, derived, |_, meta, _| meta.ts, |ts| {
+            if ts != 0 {
+                let bucket = (ts.saturating_sub(min_ts) / bucket_ms) as usize;
+                counts[bucket.min(count - 1)] += 1;
+            }
+        })?;
+        buckets = counts.into_iter().enumerate().map(|(i, n)| (min_ts.saturating_add((i as i64).saturating_mul(bucket_ms)), n)).collect();
+    }
+    let mut levels: Vec<_> = levels.into_iter().map(|(key, n)| (key.to_string(), n)).collect();
+    sort_levels(&mut levels);
+    crate::operations::check()?;
+    Ok(build_stats(buckets, bucket_ms, levels))
 }
 
 #[cfg(test)]
-mod shared_selection_tests {
+mod projected_page_parity_tests {
     use super::*;
+    use crate::page_projection::{ProjectionPlan, ProjectionRequest, Receipt};
+
+    fn plan(columns: &[&str], limit: usize) -> ProjectionPlan {
+        ProjectionPlan::new(ProjectionRequest {
+            projection_version: 1, columns: columns.iter().map(|s| s.to_string()).collect(),
+            cell_bytes: None, response_bytes: None,
+        }, limit, Receipt {
+            analysis_context: crate::analysis_context::Identity { case_id: "test".into(), analysis_id: "test-analysis".into(), config_revision: 1, visibility_revision: 0 },
+            source_generation: Some(1), case_key: None,
+            case_content_token: None,
+            catalog_signature: crate::engine::catalog_content_signature(&CodesConfig::default(), &CodesConfig::default()),
+            catalog_epoch: crate::engine::catalog_token(&CodesConfig::default(), &CodesConfig::default()).epoch,
+        }).unwrap()
+    }
 
     #[test]
-    fn shared_selection_survives_sorting_owned_callers_and_cache_clear() {
-        let folder = tempfile::tempdir().unwrap();
-        let path = folder.path().join("shared-selection.jsonl");
-        let records = [
-            serde_json::json!({"timestamp":1700000003000i64,"level":"info","source":"c","code":"300","message":"z"}),
-            serde_json::json!({"timestamp":1700000001000i64,"level":"info","source":"a","code":"100","message":"x"}),
-            serde_json::json!({"timestamp":1700000002000i64,"level":"info","source":"b","code":"200","message":"y"}),
-        ];
-        std::fs::write(&path, records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
-        let idx = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
-        // Numeric timestamps below 1e8 are intentionally not recognized as
-        // epochs by the parser. Verify this fixture really exercises sorting.
-        assert_eq!(idx.lines.iter().map(|meta| meta.ts).collect::<Vec<_>>(),
-            [1700000003000i64, 1700000001000, 1700000002000]);
-        let codes = CodesConfig::default();
-        let filters = [Filter { column:"level".into(), op:"equals".into(), value:"Informação".into(), value2:None }];
-        let selection = indexed_matches_shared(&idx, &filters, &codes, &codes, &[]);
-        assert_eq!(*selection, [0, 1, 2]);
-        for (column, expected) in [("", [0, 1, 2]), ("timestamp", [1, 2, 0]),
-            ("level", [0, 1, 2]), ("source", [1, 2, 0]), ("code", [1, 2, 0]), ("message", [1, 2, 0])] {
-            let result = query_from_indexed_matches(&idx, Arc::clone(&selection), column, "asc", 0, 10, &codes, &codes, &[]);
-            assert_eq!(result.total, 3);
-            assert_eq!(result.rows.iter().map(|event| event.id).collect::<Vec<_>>(), expected, "{column}");
-            assert_eq!(*selection, [0, 1, 2], "sorting {column} modified a shared selection");
+    fn projected_memory_uses_full_page_filter_order_and_count() {
+        let events: Vec<_> = [Some(-1), None, Some(0), Some(1)].into_iter().enumerate().map(|(i, timestamp)| {
+            let mut event = Event::empty();
+            event.id = 10 + i;
+            event.event_ref = format!("memory:{i}");
+            event.timestamp = timestamp;
+            event.fields.insert("value".into(), serde_json::json!((["10", "2", "11x", "1"][i])));
+            event.fields.insert("structured".into(), serde_json::json!({"n": i, "null": null}));
+            event
+        }).collect();
+        let filters = [Filter { column: "id".into(), op: "gte".into(), value: "11".into(), value2: None }];
+        for column in ["id", "timestamp", "value"] {
+            for direction in ["asc", "desc"] {
+                for offset in [0, 1, 4] {
+                    let full = query(&events, &filters, column, direction, offset, 2);
+                    let projected = query_projected_memory(&events, &filters, column, direction, offset, &plan(&["timestamp", "structured"], 2)).unwrap();
+                    assert_eq!(projected.items.iter().map(|r| r.row.id).collect::<Vec<_>>(), full.rows.iter().map(|e| e.id).collect::<Vec<_>>());
+                    assert_eq!(projected.total, Some(full.total));
+                    assert_eq!(projected.has_more, offset + full.rows.len() < full.total);
+                    assert!(projected.next_cursor.is_none());
+                    for (item, event) in projected.items.iter().zip(&full.rows) {
+                        assert_eq!(item.row.event_ref, event.event_ref);
+                        assert_eq!(serde_json::to_value(&item.cells[1]).unwrap()["value"], event.fields["structured"]);
+                    }
+                }
+            }
         }
-        let mut owned = indexed_matches(&idx, &filters, &codes, &codes, &[]);
-        owned.reverse();
-        assert_eq!(owned, [2, 1, 0]);
-        assert_eq!(*indexed_matches_shared(&idx, &filters, &codes, &codes, &[]), [0, 1, 2]);
-        clear_match_cache();
-        assert_eq!(*selection, [0, 1, 2]);
-        let result = query_from_indexed_matches(&idx, selection, "", "asc", 1, 1, &codes, &codes, &[]);
-        assert_eq!(result.rows[0].id, 1);
+    }
+
+    #[test]
+    fn projected_line_selection_preserves_order_and_wide_row_membership() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("projected-lines.jsonl");
+        let raw = [serde_json::json!({"message":"first", "timestamp":"1969-12-31T23:59:59.999Z", "body":"x".repeat(64 << 10)}),
+            serde_json::json!({"message":"second", "timestamp": null, "body": {"nested": true}}),
+            serde_json::json!({"message":"third", "timestamp":"1970-01-01T00:00:00Z", "body": ""})];
+        std::fs::write(&path, raw.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let config = CodesConfig::default();
+        for direction in ["asc", "desc"] {
+            let full = query_page_lines(&index, &[], "timestamp", direction, 0, 2, &config, &config, &[]).unwrap();
+            let selected = select_page_lines(&index, &[], "timestamp", direction, 0, 2, &config, &config, &[]).unwrap();
+            let plan = plan(&["message", "body"], 2);
+            let items = selected.ids.iter().map(|&id| crate::page_projection::project_indexed_row(&index, id, &config, &config, &[], &plan).unwrap()).collect();
+            let projected = plan.finish(selected, items).unwrap();
+            assert_eq!(projected.items.iter().map(|r| r.row.id).collect::<Vec<_>>(), full.rows.iter().map(|e| e.id).collect::<Vec<_>>());
+            assert_eq!(projected.total, full.total);
+            assert_eq!(projected.has_more, full.has_more);
+            assert_eq!(projected.next_cursor, full.next_cursor);
+            assert_eq!(projected.engine, full.engine);
+            assert_eq!(projected.warning, full.warning);
+        }
+        // Membership is known from metadata, so an over-wide original can
+        // retain its exact ordinary source handle without source hydration.
+        let wide_path = directory.path().join("too-wide.jsonl");
+        std::fs::write(&wide_path, serde_json::json!({"message":"wide", "body":"x".repeat((2 << 20) + 1)}).to_string()).unwrap();
+        let wide = crate::sources::index_file(wide_path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let plan = plan(&["message"], 1);
+        let projected = crate::page_projection::project_indexed_row(&wide, 0, &config, &config, &[], &plan).unwrap();
+        assert_eq!(projected.row.event_ref, event_at(&wide, 0, &config, &config, &[]).event_ref);
+        assert!(matches!(projected.cells[0], crate::page_projection::Cell::Unavailable { reason: "record_too_wide" }));
     }
 }
 
 #[cfg(test)]
-mod histogram_tests {
+mod regex_program_reuse_tests {
     use super::*;
+    use crate::query_regex::testing;
 
-    // Frozen projection-retention path for parity and isolated RSS comparison.
-    fn retained_stats_reference(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig) -> Stats {
-        let pfs = prepare(filters);
-        let mut matched: Vec<(Option<i64>, Cow<'static, str>)> = Vec::new();
-        scan_indexed(idx, &pfs, codes, codes, &[], true,
-            |_, meta, event| match event {
-                Some(event) => (event.timestamp, Cow::Owned(event.level)),
-                None => ((meta.ts != 0).then_some(meta.ts), Cow::Borrowed(crate::model::class_label(meta.level))),
-            }, |item| matched.push(item));
-        stats_from(matched.iter().map(|(timestamp, level)| (*timestamp, level.as_ref())))
-    }
-
-    fn normalized_stats(mut stats: Stats) -> Value {
-        // Equal-frequency levels have no defined order in either HashMap path.
-        stats.levels.sort();
-        serde_json::to_value(stats).unwrap()
+    fn filter(op: &str, value: &str) -> Filter {
+        Filter { column: "message".into(), op: op.into(), value: value.into(), value2: None }
     }
 
     #[test]
-    fn indexed_histogram_compaction_preserves_metadata_and_decoded_projections() {
-        let folder = tempfile::tempdir().unwrap();
-        let path = folder.path().join("histogram-projections.jsonl");
-        let records = [
-            serde_json::json!({"timestamp":"1970-01-01T00:00:00Z","source":"a","level":"custom","message":"first"}),
-            serde_json::json!({"timestamp":1700000000000i64,"source":"a","level":"info","message":"second"}),
-            serde_json::json!({"source":"b","level":"warn","message":"missing date"}),
-            serde_json::json!({"timestamp":1700000000060i64,"source":"b","level":"error","message":"fourth"}),
-            serde_json::json!({"source":"b","level":"","message":"missing level"}),
-            serde_json::json!({"timestamp":1700000000119i64,"source":"a","level":"custom","message":"sixth"}),
-        ];
-        std::fs::write(&path, records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
-        let idx = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
-        let codes = CodesConfig::default();
-        assert_eq!(idx.lines[0].ts, 0);
-        assert_eq!(crate::sources::event_at(&idx, 0, &codes, &codes, &[]).timestamp, Some(0));
-        for filters in [vec![],
-            vec![Filter { column:"source".into(), op:"regex".into(), value:".*".into(), value2:None }],
-            vec![Filter { column:"source".into(), op:"equals".into(), value:"b".into(), value2:None }],
-            vec![Filter { column:"message".into(), op:"contains".into(), value:"missing".into(), value2:None }],
-            vec![Filter { column:"level".into(), op:"equals".into(), value:"absent".into(), value2:None }]] {
-            let expected = normalized_stats(retained_stats_reference(&idx, &filters, &codes));
-            let actual = normalized_stats(stats_indexed(&idx, &filters, &codes, &codes, &[]));
-            assert_eq!(actual, expected, "{filters:?}");
-        }
-    }
-
-    #[test]
-    fn histogram_bucket_pass_remains_cancellable() {
-        let reads = std::cell::Cell::new(0usize);
-        let result = crate::operations::run(crate::operations::generation(), || {
-            let generation = crate::operations::current_generation();
-            histogram_from_bounds((0..100_000).map(|timestamp| {
-                reads.set(reads.get() + 1);
-                if reads.get() == 10 { crate::operations::cancel(); }
-                Some(timestamp)
-            }), 0, 99_999, generation)
+    fn invalid_regex_errors_and_infallible_prepare_fallback_remain_unchanged() {
+        let (_, builds) = testing::run(96 << 20, || {
+            let filters = [filter("regex", "[")];
+            let error = regex::Regex::new("[").unwrap_err();
+            for _ in 0..2 {
+                assert_eq!(crate::workspace::validate(&filters).unwrap_err(), format!("Expressão inválida: {error}"));
+                let pfs = prepare(&filters);
+                assert!(pfs[0].regex.is_none());
+                assert!(!value_matches(&pfs[0], Some("anything")));
+            }
         });
-        assert!(result.is_err());
-        assert!(reads.get() <= 2049);
+        assert_eq!(builds, 4, "invalid programs are not cached");
     }
 
     #[test]
-    #[ignore = "Indexed histogram retention timing/RSS; STATS_INDEXED_BENCH_EVENTS, STATS_INDEXED_REFERENCE=1"]
-    fn benchmark_indexed_histogram_retention() {
-        use std::io::Write;
-        let count = std::env::var("STATS_INDEXED_BENCH_EVENTS").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1_000_000).max(1);
-        let reference = std::env::var("STATS_INDEXED_REFERENCE").ok().as_deref() == Some("1");
-        let folder = tempfile::tempdir().unwrap();
-        let path = folder.path().join("histogram-memory.jsonl");
-        let mut output = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
-        for i in 0..count {
-            writeln!(output, "{}", serde_json::json!({"timestamp":1700000000000i64+i as i64,"level":"info","source":"worker","message":"completed"})).unwrap();
+    fn cancellation_between_regex_and_list_compilations_is_explicit() {
+        for text in ["message:/first/ AND message:/second/", "path:(first* OR second* OR third*)"] {
+            let (_, builds) = testing::run(96 << 20, || {
+                let id = format!("regex-cancel-{}", uuid::Uuid::new_v4());
+                let token = crate::operations::token(Some(id.clone())).unwrap();
+                let result = testing::with_after_build(move || { crate::operations::cancel_id(&id); }, || {
+                    crate::operations::run_with_token(token, || {
+                        assert_eq!(crate::querylang::compile(text).unwrap_err(), "Operação cancelada.");
+                    })
+                });
+                assert_eq!(result.unwrap_err(), "Operação cancelada.");
+                // The cancelled first program was never published. A retry must
+                // compile all programs, including the first, then can reuse them.
+                crate::querylang::compile(text).unwrap();
+                crate::querylang::compile(text).unwrap();
+            });
+            assert_eq!(builds, if text.starts_with("path:") { 4 } else { 3 });
         }
-        output.flush().unwrap(); drop(output);
-        let idx = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
-        let codes = CodesConfig::default();
-        let expected = normalized_stats(stats_from(idx.lines.iter().map(|meta|
-            ((meta.ts != 0).then_some(meta.ts), crate::model::class_label(meta.level)))));
-        let mut samples = Vec::new();
-        for _ in 0..7 {
-            let started = std::time::Instant::now();
-            let actual = if reference { retained_stats_reference(&idx, &[], &codes) }
-                else { stats_indexed(&idx, &[], &codes, &codes, &[]) };
-            samples.push(started.elapsed().as_secs_f64() * 1000.0);
-            assert_eq!(normalized_stats(actual), expected);
-        }
-        samples.sort_by(f64::total_cmp);
-        println!("INDEXED_HISTOGRAM_REVIEW {}", serde_json::json!({"events":count,"reference":reference,
-            "median_ms":samples[3],"p95_ms":samples[6],"samples":samples.len(),"parity":true,
-            "retained_item_bytes":if reference { std::mem::size_of::<(Option<i64>, Cow<'static, str>)>() } else { std::mem::size_of::<i64>() }}));
-    }
-
-    #[test]
-    fn histogram_preserves_boundaries_missing_dates_and_levels() {
-        let items = [(None, "custom"), (None, "custom"), (Some(0), "Info"),
-            (Some(59), "Error"), (Some(60), "Error"), (Some(119), "Info")];
-        let result = stats_from(items.into_iter());
-        assert_eq!(result.bucket_ms, 2);
-        assert_eq!(result.buckets.len(), 60);
-        for (position, &(start, count)) in result.buckets.iter().enumerate() {
-            assert_eq!(start, position as i64 * 2);
-            assert_eq!(count, i64::from([0, 29, 30, 59].contains(&position)));
-        }
-        let mut levels = result.levels;
-        levels.sort();
-        assert_eq!(levels, vec![("Error".into(), 2), ("Info".into(), 2), ("custom".into(), 2)]);
-        let empty = stats_from(std::iter::empty());
-        assert!(empty.buckets.is_empty());
-        assert!(empty.levels.is_empty());
-        assert_eq!(empty.bucket_ms, 0);
-        let missing = stats_from([(None, "unknown")].into_iter());
-        assert!(missing.buckets.is_empty());
-        assert_eq!(missing.levels, vec![("unknown".into(), 1)]);
-        let equal = stats_from([(Some(-42), "Info"); 3].into_iter());
-        assert_eq!(equal.buckets, vec![(-42, 3)]);
-        assert_eq!(equal.bucket_ms, 1);
-        let extremes = stats_from([i64::MIN, 0, i64::MAX].into_iter().map(|t| (Some(t), "Info")));
-        assert_eq!(extremes.buckets.len(), 60);
-        assert_eq!(extremes.buckets.iter().map(|(_, n)| n).sum::<i64>(), 3);
-        assert_eq!(extremes.buckets.first(), Some(&(i64::MIN, 1)));
-        assert_eq!(extremes.buckets.last().unwrap().1, 2);
-    }
-
-    #[test]
-    fn histogram_stops_reading_after_cancellation() {
-        let reads = std::cell::Cell::new(0usize);
-        let result = crate::operations::run(crate::operations::generation(), || {
-            stats_from((0..100_000).map(|i| {
-                reads.set(reads.get() + 1);
-                if reads.get() == 100 { crate::operations::cancel(); }
-                (Some(i), "Info")
-            }))
-        });
-        assert!(result.is_err());
-        assert!(reads.get() <= 2049, "read {} events after cancellation", reads.get());
-    }
-
-    #[test]
-    #[ignore = "manual histogram timing/RSS benchmark; HISTOGRAM_BENCH_EVENTS controls size"]
-    fn benchmark_histogram_memory() {
-        let count = std::env::var("HISTOGRAM_BENCH_EVENTS").ok()
-            .and_then(|n| n.parse::<usize>().ok()).unwrap_or(1_000_000).max(1);
-        // A compact existing timestamp column; fixture allocation is outside timing.
-        let timestamps: Vec<_> = (0..count).map(|i| 1_700_000_000_000 + i as i64).collect();
-        let mut samples = Vec::new();
-        let mut expected = None;
-        for _ in 0..7 {
-            let started = std::time::Instant::now();
-            let result = stats_from(timestamps.iter().enumerate().map(|(i, &t)|
-                (Some(t), if i % 10 == 0 { "Error" } else { "Info" })));
-            samples.push(started.elapsed().as_secs_f64() * 1000.0);
-            assert_eq!(result.buckets.iter().map(|(_, n)| n).sum::<i64>(), count as i64);
-            assert_eq!(result.levels.iter().map(|(_, n)| n).sum::<i64>(), count as i64);
-            let result = serde_json::to_value(result).unwrap();
-            if let Some(expected) = &expected { assert_eq!(&result, expected); } else { expected = Some(result); }
-        }
-        let mut sorted = samples.clone();
-        sorted.sort_by(f64::total_cmp);
-        println!("HISTOGRAM_BENCH {}", serde_json::json!({
-            "events": count, "samplesMs": samples, "medianMs": sorted[3], "p95Ms": sorted[6],
-            "fixtureBytes": timestamps.capacity() * std::mem::size_of::<i64>()
-        }));
     }
 }

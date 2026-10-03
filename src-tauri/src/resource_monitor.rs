@@ -200,7 +200,7 @@ pub fn operation_label<F>() -> String {
     let label = match name.trim_end_matches("_impl") {
         "load_file" | "load_files" | "load_bundle" => "Carregar logs",
         "load_event_log" => "Ler Windows Event Log",
-        "set_big_data_mode" => "Preparar Big Data",
+        "engine_prepare" | "prepare_source" => "Preparar motor de consultas",
         "case_sync" => "Sincronizar e indexar eventos do Caso",
         "dataset_overview" => "Analisar visão geral",
         "explore_snapshot" => "Explorar registros e facetas",

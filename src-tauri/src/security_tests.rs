@@ -487,7 +487,7 @@ fn content_separate_responses_require_exact_scoped_request_and_chronology() {
 fn content_original_event_lookup_checks_analysis_and_membership() {
     let state = crate::AppState {
         source: parking_lot::RwLock::new(crate::SourceData::None),
-        big_data_enabled: std::sync::atomic::AtomicBool::new(false),
+        source_publication: parking_lot::RwLock::new(Default::default()),
         source_names: parking_lot::RwLock::new(vec![]),
         codes: parking_lot::RwLock::new(Default::default()),
         system_codes: parking_lot::RwLock::new(Default::default()),

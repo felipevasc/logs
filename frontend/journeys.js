@@ -52,8 +52,10 @@ window.Journeys = (() => {
     return "custom";
   }
   function preferred(fields) {
-    const count = view.scope === "case" ? caseEvents().filter(rowPassesFilters).length : state.total;
-    const repeated = field => field.distinct != null && field.distinct < Math.round(field.coverage * count);
+    // A preserved evidence size cannot be used as the visible denominator.
+    // Without a matching admitted total, keep the backend's suggested order.
+    const count = explorerAnalytics.get(explorerKey())?.total;
+    const repeated = field => Number.isFinite(count) && field.distinct != null && field.distinct < Math.round(field.coverage * count);
     return fields.find(field => field.suggested && repeated(field)) || fields.find(field => field.suggested) || fields.find(field => ["user", "ip"].includes(field.kind)) || fields.find(repeated) || fields[0];
   }
   const duration = value => { if (value == null) return "Sem duração"; if (value < 1000) return `${value} ms`; if (value < 60000) return `${(value / 1000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} s`; if (value < 3600000) return `${(value / 60000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} min`; return `${(value / 3600000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} h`; };
@@ -66,9 +68,9 @@ window.Journeys = (() => {
     node.append(previous, el("span", "", `${page + 1} / ${pages}`), next); target.append(node);
   }
   function status(message, warning = false) { const node = host?.querySelector(".journey-status"); if (node) { node.textContent = message; node.classList.toggle("journey-warning", warning); } }
-  function busy(target, message) {
+  function busy(target, message, taskKey) {
     target.innerHTML = ""; const block = el("div", "journey-empty", message);
-    const cancel = button("Cancelar", async () => { cancel.disabled = true; try { await api("cancel_operation"); } catch {} }); block.append(document.createElement("br"), cancel); target.append(block);
+    const cancel = button("Cancelar", () => { cancel.disabled = true; cancel.textContent = "Cancelando…"; window.Tasks?.cancelLatest(taskKey); }); block.append(document.createElement("br"), cancel); target.append(block);
   }
   function failure(target, error, retry) { target.innerHTML = ""; const node = el("div", "journey-empty", String(error)); node.append(document.createElement("br"), button("Tentar novamente", retry)); target.append(node); }
   function controls() {
@@ -114,9 +116,9 @@ window.Journeys = (() => {
     const token = view.token, version = ++view.indexToken, list = host.querySelector(".journey-list-panel");
     if (!view.field) { list.innerHTML = '<p class="journey-empty">Escolha um campo para ligar os registros.</p>'; return; }
     if (heuristic() && !hasWindow()) { list.innerHTML = '<p class="journey-empty">Escolha início e fim para investigar este usuário ou IP no tempo.</p>'; status("Informe um período para evitar ligar registros sem relação."); return; }
-    busy(list, "Relacionando registros…");
+    busy(list, "Relacionando registros…", "journey-index");
     try {
-      const data = await api("journey_index", { ...base(), ...timeArgs(), field: view.field, offset: view.page * 50, limit: 50, sort: view.sort, includeSingles: view.singles });
+      const data = await api("journey_index", { ...base(), ...timeArgs(), field: view.field, offset: view.page * 50, limit: 50, sort: view.sort, includeSingles: view.singles }, { latest: "journey-index" });
       if (!isActive(token) || version !== view.indexToken) return;
       const lastPage = Math.max(0, Math.ceil(data.total / 50) - 1);
       if (view.page > lastPage) { view.page = lastPage; view.listScroll = 0; return loadIndex(); }
@@ -145,6 +147,10 @@ window.Journeys = (() => {
   async function loadDetail() {
     if (!view.selected) return;
     const token = view.token, version = ++view.detailToken, detail = host.querySelector(".journey-detail"), selected = view.selected;
+    const caseOwner = view.scope === "case" ? window.AnalysisContexts?.capture() : null;
+    const evidenceSignature = view.scope === "case" ? caseSig() : null;
+    const current = () => isActive(token) && version === view.detailToken && (evidenceSignature === null
+      || globalScope() === "case" && caseSig() === evidenceSignature && (!caseOwner || window.AnalysisContexts.isCurrent(caseOwner)));
     detail.innerHTML = "";
     const head = el("header", "journey-detail-head"), title = el("div", "journey-detail-title"), name = el("strong", "", selected.value); name.title = selected.value;
     const copy = button("", () => navigator.clipboard.writeText(selected.value).then(() => toast("Identificador copiado.")).catch(() => toast("Não foi possível copiar.", "err")), "icon-btn"); copy.innerHTML = '<i class="fas fa-copy"></i>'; copy.title = "Copiar identificador"; copy.setAttribute("aria-label", copy.title); title.append(name, copy); head.append(title);
@@ -155,10 +161,10 @@ window.Journeys = (() => {
     actions.append(explore, preserve); head.append(actions); detail.append(head);
     const records = el("div", "journey-records"); detail.append(records);
     if (heuristic() && !hasWindow()) { records.append(el("div", "journey-empty", "Escolha um período para consultar relações por usuário ou IP.")); explore.disabled = true; return; }
-    busy(records, "Lendo a sequência…");
+    busy(records, "Lendo a sequência…", "journey-detail");
     try {
-      const data = await api("journey_events", { ...base(), ...timeArgs(), field: view.field, value: selected.value, offset: view.detailPage * 100, limit: 100 });
-      if (!isActive(token) || version !== view.detailToken) return;
+      const data = await api("journey_events", { ...base(), ...timeArgs(), field: view.field, value: selected.value, offset: view.detailPage * 100, limit: 100 }, { latest: "journey-detail", ...(caseOwner ? { analysisOwner: caseOwner } : {}) });
+      if (!current()) return;
       preserve.disabled = !data.total;
       const lastPage = Math.max(0, Math.ceil(data.total / 100) - 1);
       if (view.detailPage > lastPage) { view.detailPage = lastPage; view.detailScroll = 0; return loadDetail(); }
@@ -166,10 +172,15 @@ window.Journeys = (() => {
       metadata.textContent = `${view.field} · ${fmtNum(data.total)} registros${group && !heuristic() ? ` · ${duration(group.duration_ms)}` : ""}${data.missing_time ? ` · ${fmtNum(data.missing_time)} sem horário` : ""}${data.complete === false ? " · parcial" : ""}`;
       for (const [index, event] of (data.rows || []).entries()) {
         const row = button("", async () => {
+          if (!current()) { toast("O contexto mudou. Abra a sequência novamente.", "info"); return; }
           const scope = view.scope;
           if (scope === "dataset") await openDetail(event.id);
-          else { const events = caseEvents(), original = (event.event_ref && events.find(candidate => candidate.event_ref === event.event_ref)) || events.find(candidate => candidate.id === event.id && candidate.timestamp === event.timestamp); showDetail(original || event); }
-          if (!isActive(token) || version !== view.detailToken) return;
+          else {
+            if (typeof event.event_ref !== "string" || !event.event_ref) { toast("Este registro não tem uma referência estável. Atualize a sequência.", "info"); return; }
+            if (!await openDetail(event.id, { eventRef: event.event_ref, guard: current })) return;
+          }
+          if (!current()) return;
+          if (scope === "case" && (state.currentDetailEv?.id !== event.id || state.currentDetailEv?.event_ref !== event.event_ref)) return;
           drawerSource = { event: state.currentDetailEv, scope }; $("#dr-prev").hidden = $("#dr-next").hidden = true;
         }, "journey-record"); row.style.setProperty("--event-color", levelColor(event.level)); row.title = `${fullTime(event.timestamp)} · ${event.source}\n${event.message || event.name || ""}`;
         if (view.seed && (event.event_ref && event.event_ref === view.seed.event_ref || event.id === view.seed.id && event.timestamp === view.seed.timestamp && event.source === view.seed.source)) row.classList.add("journey-focus");
@@ -180,11 +191,11 @@ window.Journeys = (() => {
       }
       if (!data.rows?.length) records.append(el("div", "journey-empty", "Nenhum registro com este valor e período no recorte atual."));
       if (data.rows_clipped > 0) detail.append(el("p", "journey-preview-note", "Prévia reduzida; abra o registro para ver o conteúdo completo."));
-      const current = view;
-      records.onscroll = () => { current.detailScroll = records.scrollTop; };
+      const currentView = view;
+      records.onscroll = () => { currentView.detailScroll = records.scrollTop; };
       pager(detail, view.detailPage, data.total, 100, page => { view.detailPage = page; view.detailScroll = 0; loadDetail(); });
-      records.scrollTop = current.detailScroll;
-    } catch (error) { if (isActive(token) && version === view.detailToken) failure(records, error, loadDetail); }
+      records.scrollTop = currentView.detailScroll;
+    } catch (error) { if (current()) failure(records, error, loadDetail); }
   }
   async function render(container) {
     syncContext();
@@ -193,9 +204,9 @@ window.Journeys = (() => {
     if (signature !== view.signature && !view.restorePending) { view.page = 0; view.selected = null; view.listScroll = view.detailScroll = 0; }
     view.signature = signature; view.restorePending = false;
     container.innerHTML = ""; host = el("div", "journey-workspace"); container.append(host);
-    busy(host, "Identificando chaves de correlação…");
+    busy(host, "Identificando chaves de correlação…", "journey-fields");
     try {
-      const fields = await api("journey_fields", base());
+      const fields = await api("journey_fields", base(), { latest: "journey-fields" });
       if (!isActive(token)) return;
       view.fields = [...fields, ...view.customFields.filter(custom => !fields.some(field => field.field === custom.field))];
       const seedFields = view.seedPending && view.seed ? view.fields.filter(field => valueOf(view.seed, field.field) != null) : [];

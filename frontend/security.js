@@ -3,15 +3,17 @@ window.Security = (() => {
   "use strict";
   const SEVERITY = { critical: ["Crítica", 4], high: ["Alta", 3], medium: ["Média", 2], low: ["Baixa", 1], info: ["Informativa", 0] };
   const sevLabel = s => SEVERITY[s]?.[0] || s;
-  const results = new Map();
-  const pending = new Map();
+  const results = new Map(), analysisRequests = new WeakMap();
+  // A calculation is admitted only by an explicit action. Rendering never starts it.
+  const pending = new Map(), previous = new Map(), failures = new Map(), resultOwners = new Map(), views = new Map();
+  const scopeKey = () => JSON.stringify([window.AnalysisContexts?.capture()?.caseId, window.AnalysisContexts?.capture()?.instance, workspaceScope()]);
+  const notify = () => document.dispatchEvent(new CustomEvent("security-analysis-change"));
   const names = new Map();
   let tacticFilter = null;
   let shownEpisodes = 3;
-  let lastData = null;
   let minimumEvidence = 5, universe = "", summarySlots = null;
   const evidence = () => window.EvidenceUI;
-  const universeKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig(true) : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
+  const universeKey = () => JSON.stringify([window.AnalysisContexts?.capture(), workspaceScope(), workspaceScope() === "case" ? caseSig(true) : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
   function syncUniverse() { const next = universeKey(); if (next !== universe) { universe = next; minimumEvidence = 5; } }
   function setMinimum(n) {
     if (!Number.isInteger(n) || n < 1 || n > 5) return;
@@ -36,6 +38,7 @@ window.Security = (() => {
   let fullCaseKey = "", fullCaseRows = [];
   function fullRequest() {
     if (workspaceScope() !== "case") return { filters: [] };
+    if (window.CaseEvidence?.active === true) return { filters: [], caseEvents: caseEvents("analysis-all") };
     const sig = caseSig(true);
     if (sig !== fullCaseKey) { fullCaseKey = sig; fullCaseRows = caseEventsCompute(true); }
     return { filters: [], caseEvents: fullCaseRows };
@@ -54,40 +57,91 @@ window.Security = (() => {
   function remember(data) {
     for (const d of data?.detections || []) names.set(d.rule, d.name);
   }
-  async function get({ force = false } = {}) {
+  function status() {
+    const scope = scopeKey(), run = pending.get(scope), failure = failures.get(scope);
+    if (run) return { state: run.cancelled || run.key !== key() ? "cancelling" : "calculating" };
+    if (failure?.key === key()) return failure;
+    if (cached()) return { state: "ready" };
+    return { state: previous.has(scope) ? "stale" : "idle" };
+  }
+  function cancel() {
+    const run = pending.get(scopeKey());
+    if (!run || run.cancelled) return;
+    run.cancelled = true;
+    window.Tasks?.cancelLatest(run.latest);
+    notify();
+  }
+  function invalidate() {
+    const caseId = window.AnalysisContexts?.capture()?.caseId;
+    for (const [k, owner] of resultOwners) if (owner.caseId === caseId) { results.delete(k); resultOwners.delete(k); }
+    for (const run of pending.values()) if (run.owner?.caseId === caseId && !(run.preparing && !run.owner?.identity)) {
+      run.cancelled = true; window.Tasks?.cancelLatest(run.latest);
+    }
+    failures.clear(); pageGeneration++; notify();
+  }
+  function get({ force = false } = {}) {
     syncUniverse();
-    const k = key();
-    if (!force && results.has(k)) return results.get(k);
-    if (!force && pending.has(k)) return pending.get(k);
-    const request = fullRequest();
-    const promise = api("triage", { ...request, force, minimumEvidence: minimumEvidence, episodeLimit: 20 }, { silent: true }).then(data => {
-      remember(data);
-      if (k === key()) { results.set(k, data); lastData = data; if (results.size > 8) results.delete(results.keys().next().value); }
+    const scope = scopeKey(), k = key();
+    if (pending.has(scope)) return pending.get(scope).promise;
+    if (!force && results.has(k)) return Promise.resolve(results.get(k));
+    const run = { key: k, scope, owner: window.AnalysisContexts?.capture(), latest: `security:${scope}`, preparing: true, cancelled: false };
+    failures.delete(scope); pageGeneration++;
+    // Start in a microtask so repeated clicks join the same admitted request.
+    run.promise = Promise.resolve().then(async () => {
+      if (run.owner) run.owner = await window.AnalysisContexts.prepare(run.owner);
+      if (run.cancelled || scope !== scopeKey()) throw Error("Operação cancelada.");
+      run.key = key(); run.preparing = false; notify();
+      const request = fullRequest();
+      const data = await api("triage", { ...request, force, minimumEvidence, episodeLimit: 20 }, { silent: true, analysisOwner: run.owner, latest: run.latest });
+      if (run.cancelled || run.key !== key() || scope !== scopeKey()) throw Error("Operação cancelada: o Caso, os dados ou as regras mudaram.");
+      if (run.owner) window.AnalysisContexts.assertOwner(run.owner);
+      analysisRequests.set(data, { request, owner: run.owner }); remember(data);
+      results.set(run.key, data); resultOwners.set(run.key, run.owner || {}); previous.set(scope, true);
+      if (results.size > 8) { const oldest = results.keys().next().value; results.delete(oldest); resultOwners.delete(oldest); }
       return data;
-    }).finally(() => pending.delete(k));
-    pending.set(k, promise);
-    return promise;
+    }).catch(error => {
+      if (run.key === key() && scope === scopeKey()) failures.set(scope, { key: run.key, state: run.cancelled || /cancelad|ANALYSIS_CONTEXT_CHANGED/i.test(String(error)) ? "cancelled" : "failed", error: String(error) });
+      throw error;
+    }).finally(() => { if (pending.get(scope) === run) pending.delete(scope); notify(); });
+    pending.set(scope, run); notify();
+    return run.promise;
   }
   const cached = () => results.get(key()) || null;
   let pageGeneration = 0;
   async function loadStoredPage(offset) {
+    if (!cached() || pending.has(scopeKey())) return;
     const generation=++pageGeneration, context=key(), level=minimumEvidence;
-    const request=fullRequest();
-    const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter},{silent:true});
+    const request=fullRequest(),owner=window.AnalysisContexts?.capture();
+    const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter,cacheOnly:true},{silent:true,analysisOwner:owner});
+    analysisRequests.set(data,{request,owner});
     if(generation!==pageGeneration || context!==key() || level!==minimumEvidence)return;
-    results.set(context,data);lastData=data;remember(data);
+    results.set(context,data);resultOwners.set(context,owner || {});remember(data);
     if(summarySlots?.attention?.isConnected){drawAttention(summarySlots.attention,data);if(summarySlots.entities)drawEntities(summarySlots.entities,data);}
+  }
+  function episodeRequest(data) {
+    const captured = analysisRequests.get(data);
+    if (!captured && window.AnalysisContexts) throw new Error("Reabra a análise antes de consultar suas evidências.");
+    if (captured?.owner) window.AnalysisContexts.assertOwner(captured.owner);
+    return captured || { request: fullRequest(), owner: null };
   }
   async function completeEpisode(data,episode) {
     if(episode.members_complete!==false)return episode.detections.map(i=>data.detections[i]);
-    const detections=[];let offset=0;
-    do {const page=await api("triage_episode",{analysisId:data.analysis_id,episodeId:episode.id,offset,limit:100},{silent:true});
+    const captured=episodeRequest(data),detections=[];let offset=0;
+    do {const page=await api("triage_episode",{...captured.request,analysisId:data.analysis_id,episodeId:episode.id,offset,limit:100},{silent:true,analysisOwner:captured.owner});
       if(page.analysis_id!==data.analysis_id)throw new Error("A análise mudou durante a leitura das evidências");
       detections.push(...page.detections);offset=page.next_offset;
     } while(offset!=null);
     return detections;
   }
-  document.addEventListener("workspace-context-change", () => { tacticFilter = null; shownEpisodes = 3; minimumEvidence = 5; universe = universeKey(); });
+  document.addEventListener("workspace-context-change", () => {
+    tacticFilter = null; shownEpisodes = 3; minimumEvidence = 5; universe = universeKey();
+    for (const run of pending.values()) if (run.key !== key()) { run.cancelled = true; window.Tasks?.cancelLatest(run.latest); }
+    notify();
+  });
+  document.addEventListener("task-state-change", event => {
+    if (!event.detail?.operationId || event.detail.state !== "cancelling") return;
+    for (const run of pending.values()) if (window.Tasks?.operationFor(run.latest) === event.detail.operationId) { run.cancelled = true; notify(); }
+  });
 
   // ---------------------------------------------------------------- evidence
   function detectionFilters(d) {
@@ -116,11 +170,35 @@ window.Security = (() => {
     window.Workspace.applyFilters(filters, true, "timeline");
   }
   async function saveToCase(data, detections, title, summary, grouping) {
+    try { episodeRequest(data); } catch (error) { toast(String(error), "err"); return; }
     if (workspaceScope() === "case") { toast("Estes registros já pertencem ao Caso.", "info"); return; }
     const contextBefore = universeKey();
     const ids = [...new Set(detections.flatMap(d => d.event_ids))];
-    const membersById=new Map();
-    for(const d of detections)for(const member of d.evidence_members || [])if(!membersById.has(member.event_id))membersById.set(member.event_id,member);
+    if (window.CaseEvidence?.active === true && (!ids.length || ids.length > 10000)) { toast("Selecione um achado com 1 a 10.000 registros de apoio para preservar.", "info"); return; }
+    const membersById=new Map(), ambiguousIds=new Set();
+    for(const d of detections)for(const member of d.evidence_members || []){if(!membersById.has(member.event_id))membersById.set(member.event_id,member);else if(membersById.get(member.event_id).event_ref!==member.event_ref)ambiguousIds.add(member.event_id);}
+    if (window.CaseEvidence?.active === true) {
+      try {
+        const c = ensureCase(), owner = await window.AnalysisContexts.prepare(window.AnalysisContexts.capture(), { metadata: true });
+        const current = () => activeCase() === c && workspaceScope() === "dataset" && universeKey() === contextBefore && window.AnalysisContexts.isCurrent(owner);
+        if (!current()) throw Error("O conjunto mudou. Reabra o achado antes de preservá-lo.");
+        const handles = ids.map(id => {
+          const member = membersById.get(id);
+          if (ambiguousIds.has(id) || !member?.event_ref) throw Error("A referência original do achado está ausente ou é ambígua.");
+          return { id, eventRef: member.event_ref };
+        });
+        const actions = nativeEvidenceServices().actions, selected = await actions.selection(handles, { guard: current });
+        if (!current()) throw Error("O conjunto mudou durante a preparação do achado.");
+        const references = [...new Set(handles.map(row => row.eventRef))], filters = [{ column: "event_ref", op: "in_exact", value: references.join("\n") }];
+        let start = Infinity, end = -Infinity; for (const detection of detections) { start = Math.min(start, detection.start ?? Infinity); end = Math.max(end, detection.end ?? -Infinity); }
+        const artifact = registerCurrentArtifact(c);
+        await actions.add(selected, { id: "i" + Date.now().toString(36) + Math.floor(Math.random() * 1e4), kind: "grupo", label: title, note: summary, createdAt: Date.now(),
+          sourceFilters: filters, sourceSpec: structuredClone(state.currentArtifact?.source), foundCount: handles.length, tags: ["detecção"], relevance: detections.some(d => SEVERITY[d.severity]?.[1] >= 3) ? "importante" : "normal", origin: state.currentOrigin, artifactId: artifact?.id || state.currentArtifact?.id, stationId: null,
+          detection: { ...evidence().exportMetadata(data, minimumEvidence, workspaceScope()), analyst_state: "unreviewed", ...(grouping ? { grouping: structuredClone(grouping) } : {}), detections: structuredClone(detections), start: Number.isFinite(start) ? start : null, end: Number.isFinite(end) ? end : null } }, { guard: current });
+        if (artifact) queueCustody(artifact); updateCountsSafe(); window.WorkspaceContext?.refreshMembership?.(); toast("Achado salvo com suas ocorrências preservadas no Caso.", "ok");
+      } catch (error) { toast(`Não foi possível preservar o achado: ${String(error.message || error)}`, "err"); }
+      return;
+    }
     const rows = [];
     for (const id of ids) { try {
       const member=membersById.get(id);
@@ -146,8 +224,10 @@ window.Security = (() => {
     if (await saveCases()) { window.Workspace?.loaded && updateCountsSafe(); window.WorkspaceContext?.refreshMembership?.(); toast("Salvo no Caso com os registros de apoio.", "ok"); }
   }
   const updateCountsSafe = () => { try { document.querySelector("#ws-evidence-count").textContent = activeCase()?.items?.length || ""; } catch { /* navigation not ready */ } };
-  async function suppress(detection) {
-    const settings = (await rules()).settings;
+  async function suppress(detection, data) {
+    let owner;
+    try { owner = await window.AnalysisContexts.prepare(episodeRequest(data).owner, { metadata: true }); } catch (error) { toast(String(error), "err"); return; }
+    const settings = structuredClone((await rules(owner)).settings);
     const entity = detection.entities[0];
     const exception = await new Promise(resolve => {
       const dialog = document.createElement("dialog"); dialog.className = "evidence-exception";
@@ -161,8 +241,10 @@ window.Security = (() => {
     });
     if (!exception) return;
     settings.suppress = [...(settings.suppress || []), { rule: detection.rule, column: entity?.column || null, value: entity?.value || null, scope: detection.namespace || "", created: Date.now(), ...exception }];
-    await api("detection_settings_save", { settings });
-    results.clear(); rulesCache = null;
+    window.AnalysisContexts.assertOwner(owner);
+    await api("detection_settings_save", { settings }, { analysisOwner: owner });
+    window.AnalysisContexts.assertOwner(owner, { revisions: false });
+    invalidate(); rulesCache = null;
     toast(entity ? `Ocultado para ${entity.value}.` : "Detecção ocultada.", "ok");
     window.Workspace.showPage(window.Workspace.page());
   }
@@ -201,8 +283,7 @@ window.Security = (() => {
             const rows=entries=>entries.map(([k,v])=>`<div class="sec-event-field"><dt>${esc(k)}</dt><dd><pre>${esc(typeof v==='string'?v:JSON.stringify(v,null,2))}</pre></dd></div>`).join('');
             body.innerHTML=`<h5>Evento</h5><dl>${rows(meta)}</dl><h5>Campos (${fields.length})</h5><dl>${rows(fields)}</dl><details class="sec-raw"><summary>Conteúdo bruto original</summary><pre>${esc(safe.raw || '(não registrado)')}</pre></details>`;
             const inspect=el('button','btn ghost small','Inspecionar valores e subcampos');inspect.type='button';
-            inspect.onclick=()=>{closeInspector=window.ValueInspector?.open(event,{label:`Evento ${member.event_id}`});};
-            body.prepend(inspect);
+            inspect.onclick=()=>{closeInspector=window.ValueInspector?.open(event,{label:`Evento ${member.event_id}`,isCurrent:()=>details.isConnected && details.open && context===key()});};body.prepend(inspect);
             loaded=true;
           }catch(error){body.textContent=`Não foi possível abrir este evento: ${error}`;const retry=el('button','text-button','Tentar novamente');retry.onclick=()=>{details.open=false;requestAnimationFrame(()=>details.open=true);};body.append(retry);}
           finally{loading=false;}
@@ -261,8 +342,9 @@ window.Security = (() => {
     syncUniverse();
     const eligibleEpisodes = data.episodes.filter(e => e.detections.some(i => visibleDetection(data.detections[i])));
     const matching = data.episodes.map((e, i) => ({ e, i })).filter(({ e }) => eligibleEpisodes.includes(e) && (!tacticFilter || e.tactics.includes(tacticFilter)));
-    const controls = evidence().control(data, minimumEvidence);
-    const bindRigidity = () => slot.querySelectorAll("[data-evidence-min]").forEach(b => b.onclick = () => setMinimum(+b.dataset.evidenceMin));
+    const controls = previousNotice() + '<div class="sec-calculation-actions"><button type="button" class="btn ghost small" data-calculate-compromises>Recalcular comprometimentos</button></div>' + evidence().control(data, minimumEvidence);
+    slot.dataset.analysisState = "ready"; slot.removeAttribute("aria-busy");
+    const bindRigidity = () => { bindCalculation(slot); slot.querySelectorAll("[data-evidence-min]").forEach(b => b.onclick = () => setMinimum(+b.dataset.evidenceMin)); };
     const stored=data.storage?.kind==="sqlite";
     const episodes = stored ? matching : matching.slice(0, shownEpisodes);
     const hidden = matching.length - episodes.length;
@@ -302,7 +384,9 @@ window.Security = (() => {
     const episodeOf = node => data.episodes[+node.closest("[data-episode]").dataset.episode];
     const loadMembers = async (article,offset) => {
       const episode=episodeOf(article),limit=episode.grouping?.kind==='pattern'?20:100;
-      const page=await api("triage_episode",{analysisId:data.analysis_id,episodeId:episode.id,offset,limit},{silent:true});
+      const captured=episodeRequest(data);
+      const page=await api("triage_episode",{...captured.request,analysisId:data.analysis_id,episodeId:episode.id,offset,limit},{silent:true,analysisOwner:captured.owner});
+      if (!article.isConnected) return;
       article.__detailMembers=page.detections.map(d=>({...d,context_only:(d.evidence_level||0)<minimumEvidence || !!(tacticFilter&&!d.tactics.includes(tacticFilter))}));
       article.querySelector(".sec-detections").innerHTML=detectionRows({...data,detections:article.__detailMembers},{...episode,detections:page.detections.map((_,i)=>i)})+`<p class="small">Indícios ${offset+1}–${offset+page.detections.length} de ${page.total}</p>${offset>0?`<button class="btn ghost" data-members-offset="${Math.max(0,offset-limit)}">Anteriores</button>`:""}${page.next_offset!=null?`<button class="btn ghost" data-members-offset="${page.next_offset}">Próximos indícios</button>`:""}`;
     };
@@ -333,7 +417,7 @@ window.Security = (() => {
       }
       let actionData=data;
       if(action && episode.members_complete===false && ["records","timeline","save"].includes(action)) {
-        try {const members=await completeEpisode(data,episode);actionData={...data,detections:members};episode={...episode,detections:members.map((_,i)=>i),event_refs:[...new Set(members.flatMap(d=>d.event_refs||[]))],members_complete:true};}
+        try {const members=await completeEpisode(data,episode);actionData={...data,detections:members};analysisRequests.set(actionData,episodeRequest(data));episode={...episode,detections:members.map((_,i)=>i),event_refs:[...new Set(members.flatMap(d=>d.event_refs||[]))],members_complete:true};}
         catch(error){toast(String(error),"err");return;}
       }
       const detection = event.target.closest("[data-detection]") && (article.__detailMembers || data.detections)[+event.target.closest("[data-detection]").dataset.detection];
@@ -343,7 +427,7 @@ window.Security = (() => {
       else if (action === "timeline") showTimeline(episodeFilters(actionData, episode), episode.start, episode.end);
       else if (action === "save") await saveToCase(actionData, episode.detections.map(i => actionData.detections[i]), episode.title, episode.summary, episode.grouping);
       else if (action === "d-records" && detection) openInlineEvents(event.target.closest('[data-detection]'), detection, data);
-      else if (action === "d-hide" && detection) await suppress(detection);
+      else if (action === "d-hide" && detection) await suppress(detection, data);
       else if (!detection) toggle(article);
       else openInlineEvents(event.target.closest('[data-detection]'), detection, data);
     });
@@ -360,7 +444,7 @@ window.Security = (() => {
       const detectionNode = event.target.closest("[data-detection]");
       const detection = detectionNode && (article.__detailMembers || data.detections)[+detectionNode.dataset.detection];
       if(!detection && episode.members_complete===false){
-        try {const members=await completeEpisode(data,episode);actionData={...data,detections:members};episode={...episode,detections:members.map((_,i)=>i),event_refs:[...new Set(members.flatMap(d=>d.event_refs||[]))]};}
+        try {const members=await completeEpisode(data,episode);actionData={...data,detections:members};analysisRequests.set(actionData,episodeRequest(data));episode={...episode,detections:members.map((_,i)=>i),event_refs:[...new Set(members.flatMap(d=>d.event_refs||[]))]};}
         catch(error){toast(String(error),"err");return;}
       }
       const target = detection ? { title: detection.name, summary: detection.summary, list: [detection], filters: detectionFilters(detection), start: detection.start, end: detection.end } : { title: episode.title, summary: episode.summary, list: episode.detections.map(i => actionData.detections[i]), filters: episodeFilters(actionData, episode), start: episode.start, end: episode.end };
@@ -369,7 +453,7 @@ window.Security = (() => {
         { icon: "fa-timeline", label: "Ver na linha do tempo", onClick: () => showTimeline(target.filters, target.start, target.end) },
         ...(workspaceScope() === "dataset" ? [{ icon: "fa-bookmark", label: "Salvar no Caso", onClick: () => saveToCase(actionData, target.list, target.title, target.summary, detection?undefined:episode.grouping) }] : []),
         { icon: "fa-copy", label: "Copiar resumo", onClick: () => navigator.clipboard?.writeText(`${target.title}\n${target.summary}\n${range(target.start, target.end)}\n${target.list.map(d => `- ${d.name}: ${d.summary} (${d.count})`).join("\n")}`) },
-        ...(detection ? [{ sep: true }, { icon: "fa-eye-slash", label: "Ocultar esta detecção", onClick: () => suppress(detection) }] : []),
+        ...(detection ? [{ sep: true }, { icon: "fa-eye-slash", label: "Ocultar esta detecção", onClick: () => suppress(detection, data) }] : []),
       ]);
     });
   }
@@ -460,82 +544,130 @@ window.Security = (() => {
       }
       if (before && before.parentElement === host) host.insertBefore(strip, before); else host.append(strip);
     };
-    const refresh = () => { if (host.isConnected) draw(cached()); else document.removeEventListener("evidence-rigidity-change", refresh); };
+    const refresh = () => { if (host.isConnected) draw(cached()); else { document.removeEventListener("evidence-rigidity-change", refresh); document.removeEventListener("security-analysis-change", refresh); } };
     document.addEventListener("evidence-rigidity-change", refresh);
-    const now = cached();
-    if (now) draw(now); else get().then(draw, () => {});
+    document.addEventListener("security-analysis-change", refresh);
+    draw(cached());
   }
 
   // ---------------------------------------------------------------- summary
-  async function loadAttention({ attention, entities, rare }) {
-    if (!attention) return;
-    summarySlots = { attention, entities, rare };
-    syncUniverse();
-    attention.className = "sec-loading";
-    attention.innerHTML = '<i class="fas fa-circle-notch spin" aria-hidden="true"></i><span>Procurando padrões de ataque…</span>';
-    attention.hidden = false;
-    const k = key();
-    try {
-      const data = await get();
-      if (!attention.isConnected || k !== key()) return;
-      updateContextBar();
-      drawAttention(attention, data);
-      if(document.body.dataset.page==='compromises' && !state.activeOperation)finishOperation('Comprometimentos',`${fmtNum(data.total)} registros no conjunto completo`);
-      if (entities) drawEntities(entities, data);
-      if (rare) drawRare(rare, data);
-    } catch (error) {
-      if (!attention.isConnected) return;
-      attention.className = "sec-clear sec-failed";
-      attention.innerHTML = `<i class="fas fa-triangle-exclamation" aria-hidden="true"></i><span>Triagem indisponível</span><small></small><button type="button" class="text-button">Tentar novamente</button>`;
-      attention.querySelector("small").textContent = String(error).slice(0, 200);
-      attention.querySelector("button").onclick = () => { results.delete(k); loadAttention({ attention, entities, rare }); };
-    }
+  function bindCalculation(slot) {
+    slot.querySelector("[data-calculate-compromises]")?.addEventListener("click", () => { get({ force: !!cached() }).catch(() => {}); });
+    slot.querySelector("[data-cancel-compromises]")?.addEventListener("click", cancel);
   }
-
+  function previousNotice() {
+    const current = status();
+    if (!cached() || !["failed", "cancelled"].includes(current.state)) return "";
+    const message = current.state === "cancelled" ? "Recálculo cancelado." : `O recálculo falhou: ${current.error}`;
+    return `<p class="small muted" role="status">${esc(message)} Exibindo o resultado válido anterior.</p>`;
+  }
+  function drawStatus(slot, summary = false) {
+    const current = status();
+    if (current.state === "ready" || cached() && ["failed", "cancelled"].includes(current.state)) return false;
+    const busy = ["calculating", "cancelling"].includes(current.state);
+    const labels = { idle: "Comprometimentos ainda não calculados", stale: "Resultado desatualizado", calculating: "Calculando comprometimentos…", cancelling: "Cancelando cálculo…", cancelled: "Cálculo cancelado", failed: "Não foi possível calcular os comprometimentos" };
+    const detail = current.state === "stale" ? "Os dados ou as regras mudaram. Calcule novamente para ver os indícios atuais."
+      : busy ? "Analisando o conjunto completo. Você pode continuar usando as outras páginas."
+      : current.state === "failed" ? current.error : current.state === "cancelled" ? "Nenhum resultado parcial foi aplicado. Você pode iniciar o cálculo novamente."
+      : "O cálculo só começa quando você pedir. Importar logs ou abrir esta página não inicia a análise.";
+    slot.className = summary ? "ws-card sec-summary sec-calculation-state" : "ws-card sec-calculation-state";
+    slot.dataset.analysisState = current.state; slot.setAttribute("aria-busy", String(busy)); slot.hidden = false;
+    slot.innerHTML = `<div class="card-heading"><h2>${summary ? "Comprometimentos" : labels[current.state]}</h2></div><p role="status">${summary ? `<strong>${labels[current.state]}</strong><br>` : ""}${esc(detail)}</p>${busy ? `<button type="button" class="btn ghost small" data-cancel-compromises ${current.state === "cancelling" ? "disabled" : ""}>${current.state === "cancelling" ? "Aguardando cancelamento" : "Cancelar cálculo"}</button>` : `<button type="button" class="btn primary small" data-calculate-compromises>${["stale", "failed", "cancelled"].includes(current.state) ? "Calcular novamente" : "Calcular comprometimentos"}</button>`}`;
+    bindCalculation(slot); return true;
+  }
+  function registerView(attention, summary, extras = {}) {
+    for (const slot of views.keys()) if (!slot.isConnected) views.delete(slot);
+    views.set(attention, { scope: scopeKey(), summary, ...extras });
+    drawView(attention, views.get(attention));
+  }
+  function drawView(attention, view) {
+    if (!attention.isConnected || view.scope !== scopeKey()) return;
+    syncUniverse();
+    if (drawStatus(attention, view.summary)) return;
+    const data = cached();
+    if (view.summary) drawSummary(attention, data);
+    else {
+      summarySlots = { attention, entities: view.entities, rare: view.rare };
+      drawAttention(attention, data);
+      if (view.entities) drawEntities(view.entities, data);
+      if (view.rare) drawRare(view.rare, data);
+    }
+    updateContextBar();
+  }
+  document.addEventListener("security-analysis-change", () => {
+    for (const [slot, view] of views) { if (!slot.isConnected) views.delete(slot); else drawView(slot, view); }
+  });
   async function renderPage(host) {
-    host.innerHTML = `<section class="sec-intro"><div><p>Abra um indício para percorrer as evidências até os eventos originais.<br>Use o botão direito para filtrar um evento no Explorar.</p></div><small>Força da evidência, impacto potencial e resultado são informações distintas. “Quase confirmado” também pode descrever uma tentativa muito específica, inclusive bloqueada.</small></section><div class="sec-page-results"></div>`;
-    await loadAttention({ attention: host.querySelector('.sec-page-results') });
+    host.innerHTML = `<section class="sec-intro"><div><p>Calcule os indícios quando quiser investigar o conjunto completo.<br>Abra um indício para percorrer as evidências até os eventos originais.</p></div><small>Força da evidência, impacto potencial e resultado são informações distintas. “Quase confirmado” também pode descrever uma tentativa muito específica, inclusive bloqueada.</small></section><div class="sec-page-results" data-compromises-results></div>`;
+    registerView(host.querySelector('[data-compromises-results]'), false);
   }
   async function fillSummary({ attention }) {
-    if (!attention) return;
-    attention.hidden = false; attention.className = 'ws-card sec-summary';
-    attention.textContent = 'Calculando indícios no conjunto completo…';
-    const context = key();
-    try {
-      const data = await get();
-      if (!attention.isConnected || context !== key()) return;
-      const counts = data.universe_counts_by_level || data.counts_by_level || [0,0,0,0,0], max = Math.max(1,...counts);
-      attention.innerHTML = `<div class="card-heading"><h2>Comprometimentos</h2><button class="text-button" data-open-compromises>Abrir análise <i class="fas fa-arrow-right"></i></button></div><p class="small muted">Indícios por força da evidência · ${fmtNum(data.total)} registros no conjunto completo · filtros do Explorar não se aplicam</p><div class="sec-count-chart" role="group" aria-label="Número de indícios por força da evidência">${[5,4,3,2,1].map(n=>`<button class="sec-chart-row evidence-e${n}" data-chart-level="${n}" aria-label="${evidence().label(n)}: ${counts[n-1]} indícios"><span>${evidence().label(n)}</span><span class="sec-chart-track"><span style="width:${100*counts[n-1]/max}%"></span></span><strong>${fmtNum(counts[n-1])}</strong></button>`).join('')}</div>`;
-      const open=async level=>{const hadTactic=!!tacticFilter;tacticFilter=null;if(hadTactic)results.delete(key());await Workspace.showPage('compromises');if(level)setMinimum(level);};
-      attention.querySelector('[data-open-compromises]').onclick=()=>open();
-      attention.querySelectorAll('[data-chart-level]').forEach(b=>b.onclick=()=>open(+b.dataset.chartLevel));
-    } catch(error) {
-      if(!attention.isConnected)return;
-      attention.textContent=`Não foi possível calcular os indícios: ${error}`;
-      const retry=el('button','text-button','Tentar novamente');retry.onclick=()=>fillSummary({attention});attention.append(retry);
-    }
+    if (attention) registerView(attention, true);
+  }
+  function drawSummary(attention, data) {
+    attention.hidden = false; attention.className = 'ws-card sec-summary'; attention.dataset.analysisState = "ready"; attention.removeAttribute("aria-busy");
+    const counts = data.universe_counts_by_level || data.counts_by_level || [0,0,0,0,0], max = Math.max(1,...counts);
+    attention.innerHTML = `${previousNotice()}<div class="card-heading"><h2>Comprometimentos</h2><button class="text-button" data-open-compromises>Abrir análise <i class="fas fa-arrow-right"></i></button></div><p class="small muted">Indícios por força da evidência · ${fmtNum(data.total)} registros no conjunto completo · filtros do Explorar não se aplicam</p><div class="sec-count-chart" role="group" aria-label="Número de indícios por força da evidência">${[5,4,3,2,1].map(n=>`<button class="sec-chart-row evidence-e${n}" data-chart-level="${n}" aria-label="${evidence().label(n)}: ${counts[n-1]} indícios"><span>${evidence().label(n)}</span><span class="sec-chart-track"><span style="width:${100*counts[n-1]/max}%"></span></span><strong>${fmtNum(counts[n-1])}</strong></button>`).join('')}</div>`;
+    const open=async level=>{const hadTactic=!!tacticFilter;tacticFilter=null;await Workspace.showPage('compromises');if(level)setMinimum(level);else if(hadTactic&&cached()?.storage?.kind==='sqlite')loadStoredPage(0).catch(error=>toast(String(error),'err'));};
+    attention.querySelector('[data-open-compromises]').onclick=()=>open();
+    attention.querySelectorAll('[data-chart-level]').forEach(b=>b.onclick=()=>open(+b.dataset.chartLevel));
   }
 
   // ---------------------------------------------------------------- rules and settings
   let rulesCache = null;
-  async function rules() {
-    if (!rulesCache) rulesCache = await api("detection_rules", {}, { silent: true });
-    for (const r of rulesCache.rules) names.set(r.id, r.name);
-    return rulesCache;
+  const ruleOwners = new WeakMap(), rulePanes = new WeakMap(), rulePaneStates = new WeakMap(), liveRulePanes = new Set(), controlDisabled = new WeakMap();
+  function updateRulePaneState(pane) {
+    const view = rulePaneStates.get(pane); if (!view) return;
+    let stale = false; try { window.AnalysisContexts.assertOwner(view.owner); } catch { stale = true; }
+    view.notice.innerHTML = `<p class="small muted">Segurança do Caso ${esc(view.owner.caseId || "sem identificação")}</p>${stale ? '<p role="alert">O Caso ou sua configuração mudou. Este formulário anterior está bloqueado.</p><button type="button" class="btn ghost small">Reabrir regras do Caso ativo</button>' : ""}`;
+    const reopen = stale ? view.notice.querySelector("button") : null;
+    if (reopen) reopen.onclick = () => renderRulesPane(pane);
+    for (const control of pane.querySelectorAll("input, textarea, button")) {
+      if (control === reopen) continue;
+      if (stale) { if (!controlDisabled.has(control)) controlDisabled.set(control, control.disabled); control.disabled = true; }
+      else if (controlDisabled.has(control)) { control.disabled = controlDisabled.get(control); controlDisabled.delete(control); }
+    }
   }
+  async function rules(owner) {
+    owner ||= await window.AnalysisContexts.prepare(window.AnalysisContexts.capture(), { metadata: true });
+    window.AnalysisContexts.assertOwner(owner);
+    const signature = JSON.stringify(owner);
+    if (!rulesCache || rulesCache.signature !== signature) {
+      const value = await api("detection_rules", {}, { silent: true, analysisOwner: owner });
+      window.AnalysisContexts.assertOwner(owner);
+      ruleOwners.set(value, owner); rulesCache = { signature, value };
+    }
+    for (const r of rulesCache.value.rules) names.set(r.id, r.name);
+    return rulesCache.value;
+  }
+  for (const event of ["workspace-context-change", "analysis-context-change"]) document.addEventListener(event, () => { rulesCache = null; names.clear(); for (const pane of liveRulePanes) { if (!pane.isConnected) liveRulePanes.delete(pane); else updateRulePaneState(pane); } });
   async function renderRulesPane(pane) {
+    const token = {}; rulePanes.set(pane, token);
     pane.innerHTML = '<div class="ws-loading"><i class="fas fa-circle-notch spin"></i>Carregando regras…</div>';
     let overview;
-    try { rulesCache = null; overview = await rules(); } catch (error) { pane.innerHTML = `<p class="muted small">${esc(String(error))}</p>`; return; }
-    const settings = overview.settings;
-    const save = async (message) => { await api("detection_settings_save", { settings }); results.clear(); rulesCache = null; if (message) toast(message, "ok"); };
-    const groups = [["builtin", "Regras embutidas"], ["sigma", "Sigma importadas"]];
+    try { rulesCache = null; overview = await rules(); if (rulePanes.get(pane) !== token) return; } catch (error) { if (rulePanes.get(pane) !== token) return; pane.innerHTML = `<p class="muted small">${esc(String(error))}</p>`; return; }
+    const settings = structuredClone(overview.settings);
+    let owner = ruleOwners.get(overview);
+    const mutate = async (command, args) => {
+      window.AnalysisContexts.assertOwner(owner);
+      const result = await api(command, structuredClone(args), { analysisOwner: owner });
+      window.AnalysisContexts.assertOwner(owner, { revisions: false });
+      owner = window.AnalysisContexts.capture(); if (rulePaneStates.has(pane)) { rulePaneStates.get(pane).owner = owner; updateRulePaneState(pane); } invalidate(); rulesCache = null;
+      return result;
+    };
+    const save = async (message) => { await mutate("detection_settings_save", { settings }); if (message) toast(message, "ok"); };
+    const groups = [["builtin", "Modelos internos"], ["case", "Regras deste Caso"], ["sigma", "Sigma deste Caso"]];
     pane.innerHTML = `<div class="rules-top"><label class="check-line"><input type="checkbox" id="rules-threats" ${settings.threats ? "checked" : ""}> Incluir sinais do catálogo de ameaças na triagem</label>
-      <div class="rules-actions"><button type="button" class="btn ghost small" id="rules-import"><i class="fas fa-file-import"></i> Importar Sigma</button><button type="button" class="btn ghost small" id="rules-import-folder">Pasta Sigma</button>${overview.rules.some(r => r.origin === "sigma") ? '<button type="button" class="btn ghost small" id="rules-clear">Remover Sigma</button>' : ""}</div></div>
+      <div class="rules-actions"><button type="button" class="btn ghost small" id="rules-import"><i class="fas fa-file-import"></i> Importar Sigma</button><button type="button" class="btn ghost small" id="rules-import-folder">Pasta Sigma</button><button type="button" class="btn ghost small" id="rules-clear" title="Remove apenas as fontes Sigma deste Caso; também permite redefinir uma importação legada inválida">Limpar Sigma do Caso</button></div></div>
       <input type="search" class="rules-search" placeholder="Filtrar regras…" aria-label="Filtrar regras">
       ${settings.suppress?.length ? `<details class="rules-suppress"><summary>${settings.suppress.length} ${settings.suppress.length === 1 ? "detecção oculta" : "detecções ocultas"}</summary>${settings.suppress.map((s, i) => `<div class="rules-suppressed"><span>${esc(names.get(s.rule) || s.rule)}${s.value ? ` · ${esc(s.value)}` : ""}</span><button type="button" class="text-button" data-unsuppress="${i}">Mostrar novamente</button></div>`).join("")}</details>` : ""}
       ${overview.sigma_errors.length ? `<details class="rules-errors"><summary>${overview.sigma_errors.length} regras Sigma não convertidas</summary>${overview.sigma_errors.slice(0, 50).map(e => `<div>${esc(e)}</div>`).join("")}</details>` : ""}
       <div class="rules-list">${groups.map(([origin, label]) => { const list = overview.rules.filter(r => r.origin === origin); return list.length ? `<h4>${label} <span>${list.filter(r => r.enabled).length}/${list.length}</span></h4>${list.map(r => `<label class="rule-row" data-search="${esc(`${r.name} ${r.id} ${r.attack.map(a => a.id + " " + a.name).join(" ")}`.toLowerCase())}" title="${esc(r.description)}"><input type="checkbox" data-rule="${esc(r.id)}" ${r.enabled ? "checked" : ""} ${r.retired ? 'disabled title="Retirada da triagem: comportamento insuficiente isoladamente"' : ""}><span class="sec-dot sev-${esc(r.severity)}"></span><span class="rule-name">${esc(r.name)}</span><small>${r.evidence?.maturity === "unassessed" ? "Nível não avaliado" : evidence().label(r.evidence_level ?? r.evidence?.level)} · ${esc(r.evidence?.maturity || "legada")}</small><small>${esc(r.attack.map(a => a.id).join(" "))}</small></label>`).join("")}` : ""; }).join("")}</div>`;
+    const custom = el("details", "rules-mappings");
+    custom.innerHTML = '<summary>Regras personalizadas deste Caso</summary><p class="small muted">JSON com version: 1 e rules. IDs iguais substituem o modelo somente neste Caso. Deixe vazio para usar somente os modelos internos.</p><textarea class="source-mapping-editor" aria-label="Regras personalizadas do Caso (JSON)"></textarea><button type="button" class="btn ghost small">Salvar regras do Caso</button><pre aria-live="polite"></pre>';
+    custom.querySelector("textarea").value = overview.custom_rules_json || "";
+    custom.querySelector("button").onclick = async () => { try { await mutate("detection_settings_save", { settings, customRulesJson: custom.querySelector("textarea").value }); if (pane.isConnected) await renderRulesPane(pane); } catch (error) { custom.querySelector("pre").textContent = String(error); } };
+    pane.prepend(custom);
     const mappingsPane = el("details", "rules-mappings");
     mappingsPane.innerHTML = `<summary>Mapeamento de fontes e procedência</summary><p class="muted small">Cada fonte usa seu nome exato. Campos: timestamp, actor, target, namespace, host, service, action, outcome, request, session, connection, process, parent, file, command, credential, created_credential, resource, request_command, url, persistence_target, application, grant, token, repository, pipeline, run, revision, secret, certificate, certificate_issuer, certificate_subject, requester, beneficiary, delegator, resource_spn, destination, artifact, logon, remote_session, principal, source_address. Resultados: success, failure, blocked, unknown.</p><textarea class="source-mapping-editor" aria-label="Mapeamentos por fonte (JSON)"></textarea><button type="button" class="btn ghost small" data-preview-map>Prévia no evento aberto</button><button type="button" class="btn ghost small" data-save-map>Salvar mapeamentos</button><pre class="mapping-preview" aria-live="polite"></pre>`;
     pane.prepend(mappingsPane);
@@ -545,13 +677,13 @@ window.Security = (() => {
     coveragePane.innerHTML=`<summary>Cobertura explícita para regras por ausência</summary><p class="small muted">Declare somente intervalos completos comprovados. Cada declaração exige dataset_fingerprint, source, namespace, category, start/end em epoch ms, complete e justification. Uma declaração não vale para outro conjunto ou Caso.</p><code class="coverage-fingerprint"></code><textarea class="source-mapping-editor" aria-label="Cobertura por fonte (JSON)"></textarea><button type="button" class="btn ghost small" data-save-coverage>Salvar cobertura</button><pre aria-live="polite"></pre>`;
     coveragePane.querySelector("code").textContent=`Conjunto atual: ${cached()?.dataset_fingerprint || "Execute a triagem para obter a identificação"}`;
     coveragePane.querySelector("textarea").value=JSON.stringify(settings.coverage||[],null,2);
-    coveragePane.querySelector("button").onclick=async()=>{try{const coverage=JSON.parse(coveragePane.querySelector("textarea").value);if(!Array.isArray(coverage))throw Error("Informe uma lista de declarações");await api("detection_settings_save",{settings:{...settings,coverage}});settings.coverage=coverage;results.clear();rulesCache=null;coveragePane.querySelector("pre").textContent="Cobertura salva para o conjunto identificado.";}catch(e){coveragePane.querySelector("pre").textContent=String(e);}};
+    coveragePane.querySelector("button").onclick=async()=>{try{const coverage=JSON.parse(coveragePane.querySelector("textarea").value);if(!Array.isArray(coverage))throw Error("Informe uma lista de declarações");await mutate("detection_settings_save",{settings:{...settings,coverage}});settings.coverage=coverage;invalidate();rulesCache=null;coveragePane.querySelector("pre").textContent="Cobertura salva para o conjunto identificado.";}catch(e){coveragePane.querySelector("pre").textContent=String(e);}};
     pane.prepend(coveragePane);
     mappingsPane.querySelector("[data-preview-map]").onclick = async () => {
-      try { if (!state.currentDetailEv) throw Error("Abra um evento para conferir os campos reais da fonte."); const data = await api("normalization_preview", { event: state.currentDetailEv, mappings: JSON.parse(editor.value) }); preview.textContent = JSON.stringify(data, null, 2); } catch (e) { preview.textContent = String(e); }
+      try { window.AnalysisContexts.assertOwner(owner); if (!state.currentDetailEv) throw Error("Abra um evento para conferir os campos reais da fonte."); const data = await api("normalization_preview", { event: state.currentDetailEv, mappings: JSON.parse(editor.value) }); window.AnalysisContexts.assertOwner(owner); preview.textContent = JSON.stringify(data, null, 2); } catch (e) { preview.textContent = String(e); }
     };
     mappingsPane.querySelector("[data-save-map]").onclick = async () => {
-      try { const next = JSON.parse(editor.value); if (!Array.isArray(next)) throw Error("Informe uma lista de mapeamentos."); await api("detection_settings_save", { settings: { ...settings, mappings: next } }); settings.mappings = next; results.clear(); rulesCache = null; preview.textContent = "Mapeamentos salvos. A proxima analise usara a nova versao."; } catch (e) { preview.textContent = String(e); }
+      try { const next = JSON.parse(editor.value); if (!Array.isArray(next)) throw Error("Informe uma lista de mapeamentos."); await mutate("detection_settings_save", { settings: { ...settings, mappings: next } }); settings.mappings = next; invalidate(); rulesCache = null; preview.textContent = "Mapeamentos salvos. A proxima analise usara a nova versao."; } catch (e) { preview.textContent = String(e); }
     };
     pane.querySelector("#rules-threats").onchange = async e => { settings.threats = e.target.checked; await save(); };
     pane.querySelectorAll("[data-rule]").forEach(box => box.onchange = async () => {
@@ -564,14 +696,16 @@ window.Security = (() => {
     const importFrom = async folder => {
       const chosen = await dialogApi.open({ multiple: !folder, directory: folder, filters: folder ? undefined : [{ name: "Sigma", extensions: ["yml", "yaml"] }] });
       if (!chosen) return;
-      const result = await api("sigma_import", { paths: Array.isArray(chosen) ? chosen : [chosen] });
-      results.clear();
+      const result = await mutate("sigma_import", { paths: Array.isArray(chosen) ? chosen : [chosen] });
+      invalidate();
       toast(`${fmtNum(result.rules)} regras Sigma importadas${result.failed.length ? ` · ${result.failed.length} arquivos não convertidos` : ""}.`, result.rules ? "ok" : "info");
       renderRulesPane(pane);
     };
     pane.querySelector("#rules-import").onclick = () => importFrom(false);
     pane.querySelector("#rules-import-folder").onclick = () => importFrom(true);
-    pane.querySelector("#rules-clear")?.addEventListener("click", async () => { if (!confirm("Remover todas as regras Sigma importadas?")) return; await api("sigma_clear", {}); results.clear(); renderRulesPane(pane); });
+    pane.querySelector("#rules-clear")?.addEventListener("click", async () => { if (!confirm("Remover todas as regras Sigma importadas deste Caso?")) return; await mutate("sigma_clear", {}); invalidate(); renderRulesPane(pane); });
+    const notice = el("div", "security-case-owner"); pane.prepend(notice);
+    rulePaneStates.set(pane, { owner, notice }); liveRulePanes.add(pane); updateRulePaneState(pane);
   }
 
   // ---------------------------------------------------------------- hunting recipes
@@ -590,8 +724,8 @@ window.Security = (() => {
   function recipesMenu(x, y) { showCtxMenu(x, y, recipes().map(r => ({ icon: r.icon, label: r.label, onClick: r.run }))); }
 
   async function openEpisode(index) {
-    const data = lastData, episode = data?.episodes?.[index];
+    const data = cached(), episode = data?.episodes?.[index];
     if (episode) { await Workspace.showPage('compromises'); document.querySelector(`[data-episode="${index}"] [data-act="expand"]`)?.click(); }
   }
-  return { setMinimum, minimum: () => { syncUniverse(); return minimumEvidence; }, get, cached, fillSummary, renderPage, markers, renderRulesPane, recipes, recipesMenu, openEpisode, ruleName: id => names.get(id) || null, rules: async () => (await rules()).rules, invalidate: () => results.clear(), last: () => lastData };
+  return { setMinimum, minimum: () => { syncUniverse(); return minimumEvidence; }, get, cached, fillSummary, renderPage, markers, renderRulesPane, recipes, recipesMenu, openEpisode, ruleName: id => names.get(id) || null, rules: async () => (await rules()).rules, invalidate, cancel, status, last: cached };
 })();

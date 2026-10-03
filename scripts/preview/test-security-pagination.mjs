@@ -1,7 +1,7 @@
 /* UI contract for disk-backed pages; native Rust tests validate real storage. */
 import assert from 'node:assert/strict';
-import {chromium} from 'playwright';
-const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL||'chrome'});
+import { launchBrowser } from "./browser.mjs";
+const browser=await launchBrowser();
 const page=await browser.newPage({viewport:{width:1400,height:1000},reducedMotion:'reduce'});
 const errors=[];page.on('pageerror',e=>errors.push(e.message));
 try {
@@ -9,6 +9,7 @@ try {
   await page.waitForFunction(()=>WorkspaceContext.ready&&state.loaded&&!state.loadOverlay);
   await page.evaluate(()=>WorkspaceContext.setScope('dataset',{animate:false}));
   await page.evaluate(()=>Workspace.showPage('compromises'));
+  await page.evaluate(() => Security.get());
   await page.waitForSelector('.evidence-control');
   await page.evaluate(()=>{
     const source=structuredClone(Security.cached()),original=api;

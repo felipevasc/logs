@@ -11,10 +11,10 @@ use std::path::Path;
 pub(super) fn atomic_write_metadata(
     path: &Path,
     data: &[u8],
-    generation: Option<u64>,
+    cancelled: impl Fn() -> bool,
 ) -> io::Result<()> {
     let check_cancel = || {
-        if crate::operations::cancelled_for(generation) {
+        if cancelled() {
             Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "Operação cancelada.",
@@ -78,7 +78,7 @@ mod tests {
             assert_eq!(error.raw_os_error(), Some(5));
             assert_eq!(std::fs::read(&path).unwrap(), b"old-complete");
         }
-        atomic_write_metadata(&path, b"new-complete", None).unwrap();
+        atomic_write_metadata(&path, b"new-complete", || false).unwrap();
         let mut old = Vec::new();
         old_reader.read_to_end(&mut old).unwrap();
         assert_eq!(old, b"old-complete");
@@ -108,13 +108,29 @@ mod tests {
             .share_mode(1 | 2)
             .open(&path)
             .unwrap();
-        let error = atomic_write_metadata(&path, b"new-complete", None).unwrap_err();
+        let error = atomic_write_metadata(&path, b"new-complete", || false).unwrap_err();
         assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"old-complete");
         assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 1);
         drop(blocker);
-        atomic_write_metadata(&path, b"new-complete", None).unwrap();
+        atomic_write_metadata(&path, b"new-complete", || false).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new-complete");
+        assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_metadata_cancellation_before_publication_cleans_written_pending_file() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("meta.json");
+        std::fs::write(&path, b"old-complete").unwrap();
+        let checks = std::cell::Cell::new(0);
+        let error = atomic_write_metadata(&path, b"new-complete", || {
+            checks.set(checks.get() + 1);
+            checks.get() == 2
+        }).unwrap_err();
+        assert_eq!(checks.get(), 2);
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(std::fs::read(&path).unwrap(), b"old-complete");
         assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 1);
     }
 
@@ -123,8 +139,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("meta.json");
         std::fs::write(&path, b"old-complete").unwrap();
-        let stale = Some(crate::operations::generation().wrapping_sub(1));
-        let error = atomic_write_metadata(&path, b"new-complete", stale).unwrap_err();
+        let error = atomic_write_metadata(&path, b"new-complete", || true).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(std::fs::read(&path).unwrap(), b"old-complete");
         assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 1);

@@ -113,6 +113,8 @@
     const grid = $('#dash-grid'); grid.classList.toggle('discovery-grid', mode !== 'custom');
     grid.classList.toggle('dash-compact', state.dashboardCompact);
     $('#btn-dash-compact').setAttribute('aria-pressed', String(state.dashboardCompact));
+    const unavailable = window.CaseEvidence?.active === true ? caseAnalysisUnavailable(scope) : null;
+    if (unavailable) { clearCharts(); grid.innerHTML = ''; empty(grid, unavailable); $('#dash-info').textContent = 'Análise indisponível · originais preservados'; return; }
     if (mode === 'custom') {
       if (!dashboardCharts(scope)) setDashboardCharts([], scope);
       await legacyRender(scope);
@@ -220,6 +222,7 @@
         e.preventDefault();
         const filter=valueFilter(spec.field,value);
         showCtxMenu(e.clientX,e.clientY,[
+          valueFilterMenuItem(spec.field,value,row,{scope,op:filter.op}),
           {icon:'fa-filter',label:'Incluir este valor',onClick:()=>applySelection([filter],scope,true)},
           {icon:'fa-filter-circle-xmark',label:'Excluir este valor',onClick:()=>applySelection([{...filter,op:filter.op==='empty'?'not_empty':'not_equals_exact'}],scope,true)},
           {icon:'fa-copy',label:'Copiar valor',onClick:()=>navigator.clipboard.writeText(String(label)).catch(()=>toast('Não foi possível copiar.','err'))},
@@ -505,6 +508,9 @@
   function fieldMenu(event,column,scope,anchor) {
     event.preventDefault();event.stopPropagation();
     const items=[
+      ...(window.ExplorerTimeline ? [window.ExplorerTimeline.menuItem(column)] : []),
+      ...(window.FieldTransforms ? [window.FieldTransforms.menuItem(column,{anchor})] : []),
+      ...(window.CaseReferences ? [window.CaseReferences.lookupMenuItem(column,anchor)] : []),
       {icon:'fa-ranking-star',label:`Top 10 de ${colLabel(column)}`,onClick:()=>fieldTop(column,scope)},
       {icon:'fa-filter',label:'Filtro avançado',onClick:()=>{openFilterPop(anchor);const select=$('#fp-col');if(![...select.options].some(o=>o.value===column)){const option=el('option','',colLabel(column));option.value=column;select.append(option);}select.value=column;}},
       {icon:'fa-filter-circle-xmark',label:'Somente vazios',onClick:()=>applySelection([{column,op:'empty',value:''}],scope)},
@@ -526,12 +532,15 @@
     });
   };
   const oldTable=renderTable;
-  renderTable=function(qr) {
-    oldTable(qr);
-    document.querySelectorAll('#events-table th').forEach((th,i)=>{
-      const column=state.visibleCols[i];
+  renderTable=function(qr, options) {
+    oldTable(qr, options);
+    document.querySelectorAll('#events-table th[data-column]').forEach(th=>{
+      const column=th.dataset.column;
       th.title='Clique para ordenar · arraste para mover · botão direito para analisar o campo';
       th.oncontextmenu=e=>{e.preventDefault();showCtxMenu(e.clientX,e.clientY,[
+        ...(window.ExplorerTimeline ? [window.ExplorerTimeline.menuItem(column)] : []),
+        ...(window.FieldTransforms ? [window.FieldTransforms.menuItem(column,{anchor:th})] : []),
+        ...(window.CaseReferences ? [window.CaseReferences.lookupMenuItem(column,th)] : []),
         {icon:'fa-ranking-star',label:`Top 10 de ${colLabel(column)}`,onClick:()=>fieldTop(column)},
         {icon:'fa-layer-group',label:'Resumir valores',onClick:()=>{state.groupCol=column;$('#group-col').value=column;switchTab('group');}},
         {icon:'fa-filter',label:'Somente preenchidos',onClick:()=>addFilter({column,op:'not_empty',value:''})},

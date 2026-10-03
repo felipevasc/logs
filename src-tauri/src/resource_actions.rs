@@ -1,6 +1,6 @@
 //! Bounded timing of native operations, measured on their initiating worker.
 //!
-//! Wall time includes waits; thread CPU excludes Rayon/Tantivy worker threads and
+//! Wall time includes waits; thread CPU excludes work on other threads and
 //! the WebView. Nested actions are inclusive, so their CPU must not be summed.
 //! A completed record means the scope ended, including errors or unwinding; it
 //! does not report success. Construct the guard inside the worker being measured.
@@ -18,7 +18,7 @@ const MAX_ACTIVE: usize = 128;
 const MAX_RECENT: usize = 128;
 const MAX_LABEL_CHARS: usize = 256;
 const MAX_PHASE_CHARS: usize = 128;
-const CPU_BASIS: &str = "Tempo de CPU da thread iniciadora (usuário + kernel); exclui workers Rayon/Tantivy e WebView. Operações aninhadas incluem o trabalho interno e não devem ser somadas.";
+const CPU_BASIS: &str = "Tempo de CPU da thread iniciadora (usuário + kernel), incluindo motores executados nessa thread; exclui workers paralelos e WebView. Operações aninhadas incluem o trabalho interno e não devem ser somadas.";
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 thread_local! { static CURRENT_ACTION: Cell<Option<u64>> = const { Cell::new(None) }; }

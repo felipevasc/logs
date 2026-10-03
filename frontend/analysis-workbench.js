@@ -4,8 +4,9 @@
   const measureLabels = { count: "Contagem", count_distinct: "Valores únicos", sum: "Soma", avg: "Média", min: "Mínimo", max: "Máximo", string_agg: "Textos reunidos" };
   const numericKinds = new Set(["number", "duration", "bytes", "bits", "percent"]);
   const groupView = { result: null, field: null, aggs: [], search: "", sort: null, direction: -1, page: 0, busy: false, queued: false, version: 0, computedKey: "" };
-  const pivotView = { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "" };
+  const pivotView = { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "", configurationCollapsed: false };
   const pivotTask = { busy: false, queued: false };
+  let pivotConfigurationScroll = null;
   let groupTimer;
   let groupKeys = new WeakMap();
   const number = value => typeof value === "number" ? fmtNum(value) : String(value ?? "—");
@@ -24,7 +25,7 @@
   const exactFilter = (field, value, exclude = false) => ({ column: field, op: value == null ? (exclude ? "not_empty" : "empty") : (exclude ? "not_equals_exact" : "equals_exact"), value: value == null ? "" : String(value), value2: null });
   const displayGroup = value => value == null ? "(vazio)" : value === "(vazio)" ? '“(vazio)”' : String(value);
   const groupValue = row => groupKeys.has(row) ? groupKeys.get(row) : row[groupView.field] === "(vazio)" ? null : row[groupView.field];
-  const fieldNames = (scope = workspaceScope()) => [...new Set(scope === "case" ? [...state.columns, ...STANDARD, ...(scopeProfiles(scope) || []).map(p => p.name)] : state.columns)];
+  const fieldNames = (scope = workspaceScope()) => [...new Set([...(window.AnalysisFields?.names(scope) || state.columns), ...(scope === "case" ? [...STANDARD, ...(scopeProfiles(scope) || []).map(p => p.name)] : [])])];
   const candidates = (scope = workspaceScope()) => {
     const columns = fieldNames(scope), profiles = scopeProfiles(scope) || [];
     const best = profiles.filter(p => p.cardinality > 1 && p.cardinality <= 80 && !["time", "text", "id"].includes(p.kind))
@@ -40,6 +41,7 @@
   function checkMeasures(measures, dimension) {
     const names = new Set(dimension ? [dimension] : []);
     for (const item of measures) {
+      if (item.column !== "*" && window.AnalysisFields && !window.AnalysisFields.available(item.column)) { toast("Uma medida usa um campo indisponível neste contexto. Escolha outro campo.", "info"); return false; }
       if (item.column === "*" && item.func !== "count") { toast("Escolha um campo para calcular essa medida.", "info"); return false; }
       const key = item.alias || `${item.func}(${item.column})`;
       if (names.has(key)) { toast("Cada medida precisa de um nome diferente dos demais campos.", "info"); return false; }
@@ -82,6 +84,8 @@
 
   renderAggs = function () {
     groupShell(); renderGroupShortcuts();
+    window.AnalysisFields?.control($("#group-col"), { value: state.groupCol,
+      choose: field => { state.groupCol = field; groupView.page = 0; renderAggs(); scheduleGroup(); } });
     const box = $("#agg-list"); box.replaceChildren();
     if (!state.aggs.length) state.aggs.push({ func: "count", column: "*", alias: "Registros" });
     for (const [index, agg] of state.aggs.entries()) {
@@ -90,9 +94,11 @@
       for (const [value, label] of Object.entries(measureLabels)) option(fn, value, label);
       fn.value = agg.func;
       const field = el("select"); field.setAttribute("aria-label", `Campo da medida ${index + 1}`);
-      if (agg.func === "count") option(field, "*", "Todos os registros");
-      for (const name of state.columns) option(field, name, colLabel(name));
-      field.value = agg.column;
+      if (!window.AnalysisFields) {
+        if (agg.func === "count") option(field, "*", "Todos os registros");
+        for (const name of fieldNames()) option(field, name, colLabel(name));
+        field.value = agg.column;
+      }
       fn.onchange = () => {
         if (agg.func === "count" && agg.column === "*" && ["qtd", "Registros"].includes(agg.alias)) agg.alias = "";
         agg.func = fn.value;
@@ -100,6 +106,8 @@
         renderAggs(); scheduleGroup();
       };
       field.onchange = () => { agg.column = field.value; scheduleGroup(); };
+      window.AnalysisFields?.control(field, { value: agg.column, fixed: agg.func === "count" ? [["*", "Todos os registros"]] : [],
+        choose: value => { agg.column = value; scheduleGroup(); } });
       const alias = el("input"); alias.type = "text"; alias.placeholder = "Nome opcional"; alias.value = agg.alias || ""; alias.setAttribute("aria-label", `Nome da medida ${index + 1}`);
       alias.onchange = () => { agg.alias = alias.value.trim(); scheduleGroup(); };
       const remove = button("×", () => { state.aggs.splice(index, 1); renderAggs(); scheduleGroup(); }, "icon-btn");
@@ -110,8 +118,13 @@
 
   runGroup = async function ({ force = false } = {}) {
     groupShell(); clearTimeout(groupTimer);
-    if (!scopeHasEvents(workspaceScope())) { groupView.version++; groupView.result = null; groupView.computedKey = ""; $("#aw-group-summary").textContent = workspaceScope() === "case" ? "Adicione registros relevantes ao Caso para resumir." : "Abra um arquivo para resumir seus registros."; $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren(); return; }
-    if (!state.columns.includes(state.groupCol)) state.groupCol = state.columns[0];
+    if (!scopeHasEvents(workspaceScope())) { groupView.version++; groupView.result = null; groupView.computedKey = ""; const unavailable = window.CaseEvidence?.active === true ? caseAnalysisUnavailable(workspaceScope()) : null; $("#aw-group-summary").textContent = unavailable || (workspaceScope() === "case" ? "Adicione registros relevantes ao Caso para resumir." : "Abra um arquivo para resumir seus registros."); $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren(); return; }
+    if (!state.groupCol) state.groupCol = state.columns[0];
+    if (window.AnalysisFields && !window.AnalysisFields.available(state.groupCol)) {
+      groupView.result = null; groupView.computedKey = "";
+      $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren();
+      $("#aw-group-summary").textContent = "O campo salvo está indisponível neste contexto. Escolha um campo para resumir."; return;
+    }
     if (!state.aggs.length) { state.aggs = [{ func: "count", column: "*", alias: "Registros" }]; renderAggs(); }
     if (!checkMeasures(state.aggs, state.groupCol)) return;
 
@@ -124,15 +137,19 @@
       return;
     }
 
-    if (groupView.busy) { groupView.version++; groupView.queued = true; return; }
+    if (groupView.busy) { groupView.version++; groupView.queued = true; window.Tasks?.cancelLatest("group"); return; }
     groupView.busy = true;
     const version = ++groupView.version;
     const run = $("#btn-run-group"); run.disabled = true;
     $("#group-table").setAttribute("aria-busy", "true"); $("#aw-group-summary").textContent = "Calculando todos os registros do recorte…";
     $("#group-table").inert = true;
     startOperation("group", "Calculando resumo", `Por ${colLabel(field)}`);
+    const waiting = areaLoading($("#tab-group"), "Calculando resumo", { phaseId: "command:aggregate_events" });
     try {
-      const result = await api("aggregate_events", { ...analyticsRequest(scope), groupColumn: field, aggs, filters });
+      const pending = api("aggregate_events", { ...analyticsRequest(scope), groupColumn: field, aggs, filters }, { latest: "group" });
+      waiting.bindOperation(window.Tasks?.operationFor("group"));
+      const result = await pending;
+      if (result.error) throw new Error(result.error);
       if (version !== groupView.version || source !== (scope === "case" ? caseSig() : state.currentArtifact?.id) || signature !== JSON.stringify([workspaceScope(), scope === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt, backendFilters(), field, aggs, state.derivedFields])) return;
       groupView.result = result; groupView.field = field; groupView.aggs = aggs; groupView.computedKey = signature;
       groupKeys = new WeakMap(); if (result.group_values?.length === result.rows.length) result.rows.forEach((row, index) => groupKeys.set(row, result.group_values[index]));
@@ -144,10 +161,11 @@
       renderGroupShortcuts(); renderGroups(); finishOperation("Resumo atualizado", `${fmtNum(result.rows.length)} grupos`);
     } catch (error) {
       if (version !== groupView.version || source !== (scope === "case" ? caseSig() : state.currentArtifact?.id) || signature !== JSON.stringify([workspaceScope(), scope === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt, backendFilters(), field, aggs, state.derivedFields])) return;
-      groupView.result = null; groupView.computedKey = "";
+      groupView.result = null; groupView.computedKey = ""; groupPresentationCache = null;
       $("#group-table thead").replaceChildren(); $("#group-table tbody").replaceChildren(); $("#aw-group-pager").replaceChildren();
       calculationError($("#aw-group-summary"), error, () => runGroup({ force: true })); finishOperation("Falha ao resumir", String(error));
     } finally {
+      waiting.done();
       groupView.busy = false; run.disabled = false; $("#group-table").setAttribute("aria-busy", "false");
       $("#group-table").inert = false;
       if (groupView.queued) { groupView.queued = false; runGroup({ force: true }); }
@@ -157,16 +175,41 @@
   function filterGroup(value, exclude = false) {
     state.filters.push(exactFilter(groupView.field, value, exclude)); state.page = 0; switchTab("table"); filtersChanged();
   }
+  let groupPresentationCache = null;
+  function groupPresentation(result, view, countKey) {
+    const field = view.field, sort = view.sort, direction = view.direction, query = view.search.toLocaleLowerCase();
+    const omittedRecords = Number(result.omitted_records) || 0, cached = groupPresentationCache;
+    // Reuse sorting/filtering, but do not assume IPC results remain immutable.
+    // This linear identity/value check also catches edits to rows in place.
+    if (cached && cached.result === result && cached.sourceRows === result.rows && cached.revision === view.computedKey
+      && cached.field === field && cached.sort === sort && cached.direction === direction && cached.query === query
+      && cached.countKey === countKey && cached.omittedRecords === omittedRecords && cached.inputs.length === result.rows.length
+      && result.rows.every((row, i) => {
+        const prior = cached.inputs[i];
+        return prior[0] === row && Object.is(prior[1], row[field]) && Object.is(prior[2], row[sort]) && Object.is(prior[3], countKey ? row[countKey] : null);
+      })) return cached.presentation;
+    const rows = result.rows.filter(row => String(row[field] ?? "").toLocaleLowerCase().includes(query));
+    rows.sort((a, b) => {
+      const aa = a[sort], bb = b[sort];
+      const comparison = typeof aa === "number" && typeof bb === "number" ? aa - bb : String(aa ?? "").localeCompare(String(bb ?? ""), "pt-BR", { numeric: true });
+      return direction * comparison;
+    });
+    const total = countKey ? result.rows.reduce((sum, row) => sum + (Number(row[countKey]) || 0), 0) + omittedRecords : 0;
+    const max = countKey ? result.rows.reduce((n, row) => Math.max(n, Number(row[countKey]) || 0), 1) : 1;
+    const presentation = { rows, total, max };
+    // One result only; snapshots retain scalar references, never clone log text.
+    const scalar = value => value == null || ["string", "number", "boolean", "undefined"].includes(typeof value);
+    const cacheable = result.rows.length <= 50000 && result.rows.every(row => scalar(row[field]) && scalar(row[sort]) && (!countKey || scalar(row[countKey])));
+    groupPresentationCache = cacheable ? { result, sourceRows: result.rows, revision: view.computedKey, field, sort, direction, query, countKey, omittedRecords, presentation,
+      inputs: result.rows.map(row => [row, row[field], row[sort], countKey ? row[countKey] : null]) } : null;
+    return presentation;
+  }
   function renderGroups() {
     const result = groupView.result; if (!result) return;
     const field = groupView.field, countIndex = groupView.aggs.findIndex(a => a.func === "count" && a.column === "*"), countKey = countIndex >= 0 ? result.columns[countIndex + 1] : null;
-    const total = countKey ? result.rows.reduce((sum, row) => sum + (Number(row[countKey]) || 0), 0) : 0;
-    let rows = result.rows.filter(row => String(row[field] ?? "").toLocaleLowerCase().includes(groupView.search.toLocaleLowerCase()));
-    rows = rows.slice().sort((a, b) => {
-      const aa = a[groupView.sort], bb = b[groupView.sort];
-      const comparison = typeof aa === "number" && typeof bb === "number" ? aa - bb : String(aa ?? "").localeCompare(String(bb ?? ""), "pt-BR", { numeric: true });
-      return groupView.direction * comparison;
-    });
+    // Beyond 50 000 groups only the largest come back; their records still count in the total.
+    const omitted = Number(result.omitted_groups) || 0;
+    const { rows, total, max } = groupPresentation(result, groupView, countKey);
     const pageSize = 100, pages = Math.max(1, Math.ceil(rows.length / pageSize)); groupView.page = Math.min(groupView.page, pages - 1);
     const head = $("#group-table thead"), body = $("#group-table tbody"); head.replaceChildren(); body.replaceChildren();
     const hr = el("tr");
@@ -176,10 +219,10 @@
       th.append(button(`${label}${groupView.sort === key ? (groupView.direction < 0 ? " ↓" : " ↑") : ""}`, () => { groupView.direction = groupView.sort === key ? -groupView.direction : index ? -1 : 1; groupView.sort = key; groupView.page = 0; renderGroups(); }, "aw-sort")); hr.append(th);
     });
     if (countKey) hr.append(el("th", "aw-number", "% do recorte")); hr.append(el("th", "", "")); head.append(hr);
-    const max = countKey ? result.rows.reduce((n, row) => Math.max(n, Number(row[countKey]) || 0), 1) : 1;
     for (const row of rows.slice(groupView.page * pageSize, (groupView.page + 1) * pageSize)) {
       const tr = el("tr"); const value = groupValue(row); tr.title = "Abrir os registros deste grupo"; tr.onclick = () => filterGroup(value);
       tr.oncontextmenu = event => { event.preventDefault(); showCtxMenu(event.clientX, event.clientY, [
+        valueFilterMenuItem(field, value, tr, { op: exactFilter(field, value).op }),
         { icon: "fa-filter", label: "Abrir registros do grupo", onClick: () => filterGroup(value) },
         { icon: "fa-filter-circle-xmark", label: "Excluir este grupo do recorte", onClick: () => filterGroup(value, true) },
         { icon: "fa-briefcase", label: "Adicionar grupo ao caso…", onClick: () => openNamePop(tr, name => { const filter = exactFilter(field, value); addGroupToAnalysis(field, filter.value, name, filter.op); }) },
@@ -194,23 +237,69 @@
       const action = el("td", "aw-row-action"); const open = button("Ver registros →", event => { event.stopPropagation(); filterGroup(value); }); action.append(open); tr.append(action); body.append(tr);
     }
     if (!rows.length) { const tr = el("tr"), td = el("td", "aw-empty", groupView.search ? "Nenhum grupo corresponde à busca. Altere o termo acima." : "Nenhum registro neste recorte. Revise os filtros."); td.colSpan = result.columns.length + 2; tr.append(td); body.append(tr); }
-    $("#aw-group-summary").textContent = `${fmtNum(result.rows.length)} grupos${countKey ? ` · ${fmtNum(total)} registros` : ""}${groupView.search ? ` · ${fmtNum(rows.length)} encontrados` : ""}`;
+    const groupsText = omitted ? `${fmtNum(result.rows.length)} maiores de ${fmtNum(result.rows.length + omitted)} grupos` : `${fmtNum(result.rows.length)} grupos`;
+    $("#aw-group-summary").textContent = `${groupsText}${countKey ? ` · ${fmtNum(total)} registros` : ""}${groupView.search ? ` · ${fmtNum(rows.length)} encontrados` : ""}`;
     const incompatible = (result.incompatible_units || []).map((count, index) => count ? `${measureName(groupView.aggs[index])} (${fmtNum(count)} valores)` : null).filter(Boolean);
     if (incompatible.length) $("#aw-group-summary").append(el("span", "aw-partial", ` · Unidades incompatíveis em ${incompatible.join(", ")}. Separe os registros por unidade para calcular essas medidas.`));
-    const footer = $("#aw-group-pager"); footer.replaceChildren(el("span", "muted small", "Busca e ordenação usam todos os grupos calculados. Clique em um grupo para investigar."));
+    const footer = $("#aw-group-pager"); footer.replaceChildren(el("span", "muted small", omitted ? "Busca e ordenação usam os maiores grupos calculados; refine o recorte para ver os demais." : "Busca e ordenação usam todos os grupos calculados. Clique em um grupo para investigar."));
     const prev = button("←", () => { groupView.page--; renderGroups(); }); prev.disabled = !groupView.page; prev.setAttribute("aria-label", "Grupos anteriores");
     const next = button("→", () => { groupView.page++; renderGroups(); }); next.disabled = groupView.page >= pages - 1; next.setAttribute("aria-label", "Próximos grupos");
     footer.append(prev, el("span", "", `${groupView.page + 1} / ${pages}`), next);
   }
 
+  function renderPivotConfiguration() {
+    const toggle = $("#aw-pivot-config-toggle"), summary = $("#aw-pivot-config-summary");
+    if (!toggle || !summary) return;
+    const collapsed = pivotView.configurationCollapsed === true, cube = activeCube();
+    const fieldLabel = field => `${colLabel(field)}${window.AnalysisFields && !window.AnalysisFields.available(field, state.analyticsScope) ? " (indisponível)" : ""}`;
+    const measures = cube.values.map(item => {
+      const calculation = `${measureLabels[item.func] || item.func} · ${item.column === "*" ? "Registros" : fieldLabel(item.column)}`;
+      return item.func === "count" && item.column === "*" && ["qtd", "Registros", ""].includes(item.alias || "")
+        ? "Registros" : item.alias ? `${item.alias} (${calculation})` : calculation;
+    });
+    summary.replaceChildren();
+    for (const [label, value] of [["Linhas", cube.rows.map(fieldLabel).join(" › ") || "Total"], ["Colunas", cube.cols.map(fieldLabel).join(" › ") || "Sem divisão"], ["Medidas", measures.join("; ") || "Nenhuma"]]) {
+      const item = el("div", "aw-pivot-config-item"); item.append(el("dt", "", label), el("dd", "", value)); summary.append(item);
+    }
+    toggle.textContent = collapsed ? "Editar configuração" : "Recolher configuração";
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    summary.hidden = !collapsed;
+    for (const selector of ["#aw-pivot-config-actions", "#aw-pivot-config-zones", "#aw-pivot-fields"]) $(selector).hidden = collapsed;
+  }
+  function setPivotConfigurationCollapsed(collapsed) {
+    if (pivotView.configurationCollapsed === collapsed) return;
+    const table = $("#cube-table-view"), fields = $("#aw-pivot-fields"), row = $("#cube-table tbody")?.firstElementChild;
+    const point = node => [node.scrollLeft, node.scrollTop];
+    let tablePoint = point(table), fieldsPoint = point(fields);
+    const previous = pivotConfigurationScroll;
+    if (!collapsed && previous) {
+      // Re-expanding restores a position clamped by the larger viewport, unless
+      // the person has since scrolled or the result has been replaced.
+      if (previous.row === row && tablePoint.every((value, i) => value === previous.after[i])) tablePoint = previous.before;
+      fieldsPoint = previous.fields;
+    }
+    if (collapsed && [fields, $("#aw-pivot-config-actions"), $("#aw-pivot-config-zones")].some(node => node.contains(document.activeElement))) {
+      $("#aw-pivot-config-toggle").focus({ preventScroll: true });
+    }
+    pivotView.configurationCollapsed = collapsed;
+    renderPivotConfiguration();
+    [table.scrollLeft, table.scrollTop] = tablePoint;
+    if (!collapsed) [fields.scrollLeft, fields.scrollTop] = fieldsPoint;
+    pivotConfigurationScroll = collapsed ? { row, before: tablePoint, after: point(table), fields: fieldsPoint } : null;
+  }
   function pivotShell() {
     if ($("#aw-pivot-tools")) return;
     const main = $(".cube-main"); if (!main) return;
     const top = el("div", "aw-pivot-presets"); top.id = "aw-pivot-tools";
-    top.append(el("span", "aw-caption", "Comece com"), button("Contagem por campo", () => pivotPreset(false), "aw-preset"), button("Cruzar dois campos", () => pivotPreset(true), "aw-preset"), button("⇄ Trocar eixos", () => {
+    const actions = el("div", "aw-pivot-config-actions"); actions.id = "aw-pivot-config-actions";
+    actions.append(el("span", "aw-caption", "Comece com"), button("Contagem por campo", () => pivotPreset(false), "aw-preset"), button("Cruzar dois campos", () => pivotPreset(true), "aw-preset"), button("⇄ Trocar eixos", () => {
       const cube = activeCube(); [cube.rows, cube.cols] = [cube.cols, cube.rows]; cubeState.collapsed.clear(); markCubeTableChanged(); renderCubeZones(); runCube();
-    })); main.prepend(top);
-    top.append($("#btn-cube-clear"));
+    }), $("#btn-cube-clear"));
+    const configuration = el("dl", "aw-pivot-config-summary"); configuration.id = "aw-pivot-config-summary"; configuration.setAttribute("aria-label", "Configuração do cruzamento");
+    const toggle = button("Recolher configuração", () => setPivotConfigurationCollapsed(!pivotView.configurationCollapsed), "btn ghost small aw-pivot-config-toggle"); toggle.id = "aw-pivot-config-toggle";
+    $(".cube-zones").id = "aw-pivot-config-zones"; $(".cube-fields").id = "aw-pivot-fields";
+    toggle.setAttribute("aria-controls", "aw-pivot-config-actions aw-pivot-config-zones aw-pivot-fields");
+    top.append(actions, configuration, toggle); main.prepend(top);
     const tools = el("div", "aw-result-tools aw-pivot-result-tools");
     const search = el("input", "aw-search"); search.type = "search"; search.placeholder = "Buscar nas linhas…"; search.setAttribute("aria-label", "Buscar linhas do cruzamento"); search.id = "aw-pivot-search";
     search.oninput = () => { pivotView.search = search.value; pivotView.page = 0; redrawPivot(); };
@@ -226,6 +315,7 @@
     const input = el("input", "aw-search"); input.type = "search"; input.placeholder = "Buscar campo…"; input.setAttribute("aria-label", "Buscar campo do cruzamento"); input.id = "aw-field-search";
     input.oninput = () => { for (const row of document.querySelectorAll("#cube-field-list .cube-field")) row.hidden = !row.dataset.field.toLocaleLowerCase().includes(input.value.toLocaleLowerCase()); };
     $("#cube-field-list").before(input);
+    renderPivotConfiguration();
   }
   function pivotPreset(cross) {
     const fields = candidates(state.analyticsScope), cube = activeCube();
@@ -236,7 +326,7 @@
   const originalFields = renderCubeFields;
   renderCubeFields = function () {
     pivotShell(); originalFields();
-    $("#cube-info").textContent = state.analyticsScope === "case" ? `${fmtNum(caseEvents().length)} registros do caso · filtros ativos aplicados` : `${backendFilters().length ? "Recorte filtrado" : "Todos os registros"} do arquivo aberto`;
+    $("#cube-info").textContent = state.analyticsScope === "case" ? "Registros visíveis do Caso · filtros ativos aplicados" : `${backendFilters().length ? "Recorte filtrado" : "Todos os registros"} do arquivo aberto`;
     const available = new Set(fieldNames(state.analyticsScope));
     for (const row of [...$("#cube-field-list").children]) if (!available.has(row.dataset.field)) row.remove();
     const existing = new Set([...$("#cube-field-list").children].map(e => e.dataset.field));
@@ -252,6 +342,8 @@
       const box = $(`#cz-${zone}`); const items = cube[zone];
       [...box.querySelectorAll(".cube-chip")].forEach((chip, index) => {
         const item = items[index]; chip.querySelector("span").textContent = zone === "values" ? measureName(item) : colLabel(item);
+        const field = zone === "values" ? item.column : item;
+        if (field !== "*" && window.AnalysisFields && !window.AnalysisFields.available(field, state.analyticsScope)) chip.querySelector("span").textContent += " (indisponível)";
         chip.querySelector(".x")?.setAttribute("aria-label", `Remover ${zone === "values" ? measureName(item) : colLabel(item)}`);
         if (zone === "values") {
           const remove = chip.querySelector(".x");
@@ -265,14 +357,23 @@
         if (index > 0) { const move = button("←", event => { event.stopPropagation(); [items[index - 1], items[index]] = [items[index], items[index - 1]]; cubeState.collapsed.clear(); markCubeTableChanged(); renderCubeZones(); runCube(); }, "aw-chip-move"); move.title = "Mover antes"; move.setAttribute("aria-label", "Mover campo antes"); chip.prepend(move); }
       });
       const empty = box.querySelector(".cube-zone-empty"); if (empty) empty.textContent = zone === "rows" ? "Um grupo por linha" : zone === "cols" ? "Opcional: comparar lado a lado" : "Escolha uma medida";
-      const select = el("select", "aw-zone-add"); select.setAttribute("aria-label", `Adicionar campo em ${zone === "rows" ? "linhas" : zone === "cols" ? "colunas" : "valores"}`); option(select, "", "+ Campo");
-      if (zone === "values" && !items.some(v => v.func === "count" && v.column === "*")) option(select, "*", "Contar registros");
-      for (const name of fieldNames(state.analyticsScope)) if (zone === "values" || !items.includes(name)) option(select, name, colLabel(name));
+      const select = el("select", "aw-zone-add"); select.setAttribute("aria-label", `Adicionar campo em ${zone === "rows" ? "linhas" : zone === "cols" ? "colunas" : "valores"}`);
+      if (!window.AnalysisFields) {
+        option(select, "", "+ Campo");
+        if (zone === "values" && !items.some(v => v.func === "count" && v.column === "*")) option(select, "*", "Contar registros");
+        for (const name of fieldNames(state.analyticsScope)) if (zone === "values" || !items.includes(name)) option(select, name, colLabel(name));
+      }
       select.onchange = () => { if (select.value) cubeAdd(zone, select.value); }; box.append(select);
+      window.AnalysisFields?.control(select, { value: "", scope: state.analyticsScope,
+        exclude: zone === "values" ? [] : items,
+        fixed: [["", "+ Campo"], ...(zone === "values" && !items.some(v => v.func === "count" && v.column === "*") ? [["*", "Contar registros"]] : [])],
+        choose: field => { if (field) cubeAdd(zone, field); } });
     }
+    renderPivotConfiguration();
   };
   cubeAdd = function (zone, field) {
     if (!["rows", "cols", "values"].includes(zone) || !field) return;
+    if (field !== "*" && window.AnalysisFields && !window.AnalysisFields.available(field, state.analyticsScope)) { toast("Este campo não está disponível no contexto atual.", "info"); return; }
     const cube = activeCube();
     if (zone === "values") {
       const kind = (scopeProfiles() || []).find(p => p.name === field)?.kind;
@@ -286,10 +387,21 @@
   };
   const originalRunCube = runCube;
   runCube = async function ({ force = false } = {}) {
+    const unavailable = window.CaseEvidence?.active === true ? caseAnalysisUnavailable() : null;
+    if (unavailable) {
+      pivotShell(); cubeState.requestVersion++; window.Tasks?.cancelLatest("pivot"); cubeState.result = null;
+      for (const selector of ["#cube-table thead", "#cube-table tbody", "#aw-pivot-pager"]) $(selector)?.replaceChildren();
+      $("#aw-pivot-summary").textContent = unavailable; return { status: "unavailable", error: unavailable };
+    }
     pivotShell(); const cube = activeCube();
+    if (window.AnalysisFields && [...cube.rows, ...cube.cols].some(field => !window.AnalysisFields.available(field, state.analyticsScope))) {
+      cubeState.requestVersion++; window.Tasks?.cancelLatest("pivot"); cubeState.result = null;
+      for (const selector of ["#cube-table thead", "#cube-table tbody", "#aw-pivot-pager"]) $(selector)?.replaceChildren();
+      $("#aw-pivot-summary").textContent = "O cruzamento salvo usa um campo indisponível neste contexto. Escolha outro campo."; return;
+    }
     if (!cube.values.length) { cube.values = [{ func: "count", column: "*", alias: "Registros" }]; renderCubeZones(); }
     if (!checkMeasures(cube.values)) return;
-    if (pivotTask.busy) { pivotTask.queued = true; cubeState.requestVersion++; return; }
+    if (pivotTask.busy) { pivotTask.queued = true; cubeState.requestVersion++; window.Tasks?.cancelLatest("pivot"); return; }
     pivotTask.busy = true;
     $("#aw-pivot-summary").textContent = "Calculando o recorte…";
     try {
@@ -322,10 +434,39 @@
       filtersChanged();
     };
     const label = cube.cols.length > 1 && !columnValues ? "Filtrar esta linha" : "Filtrar esta combinação";
-    const actions = [{ icon: "fa-filter", label, onClick: () => apply() }];
+    const actions = filters.map(filter => valueFilterMenuItem(filter.column, filter.value, event.currentTarget || event.target, { scope, op: filter.op }));
+    actions.push({ icon: "fa-filter", label, onClick: () => apply() });
     actions.push({ icon: "fa-table-list", label: "Abrir registros correspondentes", onClick: () => apply(true) });
     actions.push({ icon: "fa-circle-info", label: `Inspecionar ${colLabel(filters[filters.length - 1].column)}`, onClick: () => showFieldInspector(filters[filters.length - 1].column) });
     showCtxMenu(event.clientX, event.clientY, actions);
+  }
+  let pivotPresentationCache = null;
+  function pivotPresentation(result, paths, depth, view, collapsed, revision) {
+    const query = view.search.toLocaleLowerCase(), sort = view.sort, collapsedKey = JSON.stringify(collapsed), cached = pivotPresentationCache;
+    const measure = ri => sort === "tree" ? null : result.cells[ri]?.[0]?.[0];
+    if (cached && cached.result === result && cached.paths === paths && cached.depth === depth && cached.revision === revision
+      && cached.query === query && cached.sort === sort && cached.collapsedKey === collapsedKey && cached.inputs.length === paths.length
+      && paths.every((path, i) => {
+        const prior = cached.inputs[i];
+        return prior[0] === path && prior[1].length === path.length && path.every((value, j) => Object.is(value, prior[1][j])) && Object.is(prior[2], measure(i));
+      })) return cached.presentation;
+    const pathKey = path => JSON.stringify(path);
+    const parents = new Set(paths.filter(path => path.length > 1).map(path => pathKey(path.slice(0, -1))));
+    let rows = paths.map((path, ri) => ({ path, ri })).filter(({ path }) => {
+      if (!depth) return true;
+      if (collapsed.some(prefix => prefix.length < path.length && prefix.every((value, i) => path[i] === value))) return false;
+      return path.length === depth || !parents.has(pathKey(path)) || collapsed.some(prefix => pathKey(prefix) === pathKey(path));
+    });
+    if (query) rows = rows.filter(row => row.path.some(value => displayGroup(value).toLocaleLowerCase().includes(query)));
+    if (sort !== "tree") rows.sort((a, b) => ((Number(result.cells[a.ri]?.[0]?.[0]) || 0) - (Number(result.cells[b.ri]?.[0]?.[0]) || 0)) * (sort === "desc" ? -1 : 1));
+    const presentation = { rows, parents };
+    const scalar = value => value == null || ["string", "number", "boolean", "undefined"].includes(typeof value);
+    const cacheable = paths.length <= 50000 && paths.reduce((n, path) => n + path.length, 0) <= 250000
+      && paths.every((path, i) => path.every(scalar) && scalar(measure(i)));
+    // Keep one current view. Validation copies array structure, not field text.
+    pivotPresentationCache = cacheable ? { result, paths, depth, revision, query, sort, collapsedKey, presentation,
+      inputs: paths.map((path, i) => [path, path.slice(), measure(i)]) } : null;
+    return presentation;
   }
   renderCubeTable = function (cube, result) {
     pivotShell();
@@ -334,15 +475,9 @@
     const head = $("#cube-table thead"), body = $("#cube-table tbody"); head.replaceChildren(); body.replaceChildren();
     const exact = Array.isArray(result.row_values) && result.row_values.length === result.row_paths?.length;
     const pathKey = path => JSON.stringify(path), paths = exact ? result.row_values : result.row_paths || [], depth = cube.rows.length;
-    const parents = new Set(paths.filter(path => path.length > 1).map(path => pathKey(path.slice(0, -1))));
     const collapsed = [...cubeState.collapsed];
-    let rows = paths.map((path, ri) => ({ path, ri })).filter(({ path }) => {
-      if (!depth) return true;
-      if (collapsed.some(prefix => prefix.length < path.length && prefix.every((v, i) => path[i] === v))) return false;
-      return path.length === depth || !parents.has(pathKey(path)) || collapsed.some(prefix => pathKey(prefix) === pathKey(path));
-    });
-    const query = pivotView.search.toLocaleLowerCase(); if (query) rows = rows.filter(row => row.path.some(value => displayGroup(value).toLocaleLowerCase().includes(query)));
-    if (pivotView.sort !== "tree") rows.sort((a, b) => ((Number(result.cells[a.ri]?.[0]?.[0]) || 0) - (Number(result.cells[b.ri]?.[0]?.[0]) || 0)) * (pivotView.sort === "desc" ? -1 : 1));
+    const { rows, parents } = pivotPresentation(result, paths, depth, pivotView, collapsed, `${key}:${exact}`);
+    const query = pivotView.search.toLocaleLowerCase();
     const pageSize = 100, pages = Math.max(1, Math.ceil(rows.length / pageSize)), names = result.value_names?.length ? result.value_names : ["Registros"], columnKeys = result.col_keys?.length ? result.col_keys : ["(total)"];
     const columnSize = Math.max(1, Math.floor(24 / names.length)), columnPages = Math.max(1, Math.ceil(columnKeys.length / columnSize));
     pivotView.page = Math.min(pivotView.page, pages - 1); pivotView.columnPage = Math.min(pivotView.columnPage, columnPages - 1);
@@ -408,10 +543,19 @@
     for (const element of document.querySelectorAll(".aw-pivot-result-tools, #aw-pivot-summary, #aw-pivot-pager")) element.hidden = chart;
   };
   window.WorkspaceAnalysis = {
+    invalidateAnalysis: () => {
+      pivotConfigurationScroll = null;
+      groupPresentationCache = null; pivotPresentationCache = null; groupView.version++; clearTimeout(groupTimer);
+      groupView.result = null; groupView.page = 0; pivotView.page = 0;
+      for (const selector of ["#group-table thead", "#group-table tbody", "#cube-table thead", "#cube-table tbody", "#aw-group-pager", "#aw-pivot-pager"]) $(selector)?.replaceChildren();
+    },
     capture: () => ({ group: { search: groupView.search, sort: groupView.sort, direction: groupView.direction, page: groupView.page }, pivot: { ...pivotView } }),
     restore: saved => {
+      groupPresentationCache = null; pivotPresentationCache = null;
+      pivotConfigurationScroll = null;
       groupView.version++; clearTimeout(groupTimer); Object.assign(groupView, { result: null, field: null, search: "", sort: null, direction: -1, page: 0 }, saved?.group);
-      Object.assign(pivotView, { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "" }, saved?.pivot, { restoring: true });
+      Object.assign(pivotView, { search: "", page: 0, columnPage: 0, heat: true, sort: "tree", tableKey: "" }, saved?.pivot, { configurationCollapsed: saved?.pivot?.configurationCollapsed === true, restoring: true });
+      renderPivotConfiguration();
       if ($("#aw-group-tools input")) $("#aw-group-tools input").value = groupView.search;
       if ($("#aw-pivot-search")) $("#aw-pivot-search").value = pivotView.search;
       if ($("#aw-pivot-order")) $("#aw-pivot-order").value = pivotView.sort;
@@ -422,5 +566,9 @@
       if ($("#aw-pivot-summary")) $("#aw-pivot-summary").textContent = "";
     }
   };
+  document.addEventListener?.("analysis-fields-change", () => {
+    renderAggs();
+    if (!$("#view-cube")?.hidden) { renderCubeFields(); renderCubeZones(); }
+  });
   groupShell(); renderAggs(); pivotShell();
 })();

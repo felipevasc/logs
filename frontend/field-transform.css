@@ -1,0 +1,18 @@
+.field-transform-modal{width:min(760px,calc(100vw - 36px));max-height:90vh;min-width:0}
+.field-transform-modal .modal-head,.ft-footer{flex-shrink:0}.field-transform-modal .modal-body{overflow:auto;max-height:none;min-height:0;overflow-wrap:anywhere}
+.ft-footer{padding:12px 18px;border-top:1px solid var(--border);overflow-wrap:anywhere}.ft-footer>p{margin:0 0 8px}.ft-footer>p:empty{margin:0}.ft-footer .modal-actions{margin-top:0;flex-wrap:wrap}
+/* Keep the empty live region mounted; only non-empty messages join keyboard navigation. */
+#ft-status{max-height:20vh;overflow:auto;user-select:text}#ft-status:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.field-transform-modal .code-pane{color:var(--text-0);background:var(--code-bg);user-select:text;overflow:auto}
+.ft-inputs{display:grid;grid-template-columns:1fr 1fr;gap:14px;min-width:0}
+.ft-inputs .fld{min-width:0}.ft-inputs pre{max-height:112px;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px}
+#ft-sample{width:100%;min-height:100px;max-height:190px;font:11px/1.5 var(--mono,monospace);resize:vertical;overflow-wrap:anywhere}
+.ft-steps{padding-left:22px;margin:5px 0 10px}.ft-step{padding:4px 0;font-size:12px}.ft-step>span{display:inline-block;min-width:210px;max-width:100%;margin-right:8px}
+.ft-step .btn{margin-left:4px;padding:2px 7px;font-size:11px}.ft-add-row,.ft-preview-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.ft-add-row select{min-width:220px;max-width:100%}
+#ft-output{max-height:190px;white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto;font-size:11px;margin-top:8px}.ft-error{color:var(--danger,#e55e68)}
+#ft-jwt-warning{border-left:3px solid var(--lv-aviso,#d18c19);padding:8px 10px;font-size:12px}#ft-rules-note{font-size:11px;padding:8px 10px}
+@media(max-width:650px){.ft-inputs{grid-template-columns:1fr}.ft-step>span{display:block;margin-bottom:4px}.field-transform-modal .modal-body,.ft-footer{padding:12px}}
+
+.ft-diagnostics{border:1px solid var(--border);border-radius:7px;padding:10px;margin-bottom:12px;font-size:11px;display:flex;flex-direction:column;gap:7px}
+.ft-diagnostic{display:flex;flex-direction:column;align-items:flex-start;gap:3px;padding:6px 8px;border-left:3px solid var(--danger,#e55e68);overflow-wrap:anywhere}
+.ft-diagnostic.is-warning{border-left-color:var(--lv-aviso,#d18c19)}.ft-diagnostic .btn{font-size:10px;padding:2px 6px}

@@ -20,7 +20,7 @@ pub enum Expr {
     Term(Term),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Term {
     field: Option<Field>,
     matcher: Matcher,
@@ -43,6 +43,7 @@ enum Cmp {
     Lte,
 }
 
+#[derive(Clone)]
 pub struct Threat(crate::threats::RuleMatcher);
 impl std::fmt::Debug for Threat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,6 +52,7 @@ impl std::fmt::Debug for Threat {
 }
 
 /// `deteccao:<id>`: records a detection rule selects (any of its steps).
+#[derive(Clone)]
 pub struct Detection(std::sync::Arc<crate::detections::RuleSet>, usize);
 impl std::fmt::Debug for Detection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -58,7 +60,7 @@ impl std::fmt::Debug for Detection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Matcher {
     Contains(String),
     Equals(String),
@@ -138,6 +140,36 @@ pub fn compile_rule(text: &str) -> Result<Expr, String> {
 }
 
 pub fn compile_with(text: &str, options: &Options<'_>) -> Result<Expr, String> {
+    compile_policy(text, options, true)
+}
+
+/// Preserved history resolves ordinary query terms against original values.
+/// Catalog-backed branches are rejected before loading mutable rule catalogs.
+pub(crate) fn compile_without_catalogs(text: &str) -> Result<Expr, String> {
+    compile_policy(text, &Options { threats: None, detections: false }, false)
+}
+/// Conservative retained/scratch credit before historical AST construction.
+/// Grouped lists may clone a long field name for each term, so input bytes plus
+/// a fixed per-node charge alone would undercount that amplification.
+pub(crate) fn historical_ast_credit(text: &str) -> Result<usize, String> {
+    if text.len() > 1_000_000 { return Err("A consulta excede 1 MB.".into()); }
+    let mut longest = 0usize;
+    let mut word = 0usize;
+    let mut chars = 0usize;
+    for character in text.chars() {
+        if chars % 4096 == 0 { crate::operations::check()?; }
+        chars += 1;
+        word = if is_field_char(character) { word + character.len_utf8() } else { 0 };
+        longest = longest.max(word);
+    }
+    let nodes = if is_plain(text.trim()) { 1 } else { chars.saturating_mul(2).saturating_add(1).min(MAX_QUERY_NODES) };
+    text.len().checked_mul(8)
+        .and_then(|bytes| nodes.checked_mul(256usize.saturating_add(longest.max(32))).and_then(|nodes| bytes.checked_add(nodes)))
+        .ok_or_else(|| "CASE_HISTORY_LIMIT".into())
+}
+
+fn compile_policy(text: &str, options: &Options<'_>, catalogs: bool) -> Result<Expr, String> {
+    crate::operations::check()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(Expr::All);
@@ -146,9 +178,11 @@ pub fn compile_with(text: &str, options: &Options<'_>) -> Result<Expr, String> {
         return Err("A consulta excede 1 MB.".into());
     }
     if is_plain(trimmed) {
-        return Ok(Expr::Term(Term { field: None, matcher: Matcher::Contains(trimmed.to_lowercase()) }));
+        let expr = Expr::Term(Term { field: None, matcher: Matcher::Contains(trimmed.to_lowercase()) });
+        crate::operations::check()?;
+        return Ok(expr);
     }
-    let mut parser = Parser { chars: trimmed.chars().collect(), pos: 0, options, depth: 0 };
+    let mut parser = Parser { chars: trimmed.chars().collect(), pos: 0, options, catalogs, depth: 0, nodes: 0 };
     let expr = parser.parse_or()?;
     parser.skip_ws();
     if parser.pos < parser.chars.len() {
@@ -158,6 +192,7 @@ pub fn compile_with(text: &str, options: &Options<'_>) -> Result<Expr, String> {
             "Trecho inesperado"
         }));
     }
+    crate::operations::check()?;
     Ok(simplify(expr))
 }
 
@@ -176,8 +211,16 @@ struct Parser<'a> {
     chars: Vec<char>,
     pos: usize,
     options: &'a Options<'a>,
+    catalogs: bool,
     depth: usize,
+    nodes: usize,
 }
+
+// Bound both recursive consumers (simplify/evaluation/drop) and broad query
+// structures. List entries consume the same work budget even when later folded
+// into a compact set or CIDR matcher. Regex program budgets are separate.
+const MAX_QUERY_DEPTH: usize = 64;
+const MAX_QUERY_NODES: usize = 16_384;
 
 const TEXT_COLUMNS: &[&str] = &["message", "_all", "raw", "description", "name", "@cmdline", "@url", "@user_agent", "@file"];
 
@@ -220,6 +263,14 @@ const AND_WORDS: &[&str] = &["AND", "E", "&&"];
 const NOT_WORDS: &[&str] = &["NOT", "NÃO", "NAO"];
 
 impl Parser<'_> {
+    fn node(&mut self) -> Result<(), String> {
+        crate::operations::check()?;
+        if self.nodes >= MAX_QUERY_NODES {
+            return Err(self.error("Consulta com estrutura excessiva"));
+        }
+        self.nodes += 1;
+        Ok(())
+    }
     fn error(&self, message: &str) -> String {
         let column = self.pos + 1;
         format!("{message} (posição {column}).")
@@ -253,13 +304,14 @@ impl Parser<'_> {
     }
     fn parse_or(&mut self) -> Result<Expr, String> {
         self.depth += 1;
-        if self.depth > 64 {
+        if self.depth > MAX_QUERY_DEPTH {
             return Err(self.error("Consulta com aninhamento excessivo"));
         }
         let mut items = vec![self.parse_and()?];
         loop {
             self.skip_ws();
             if self.take_keyword(OR_WORDS) {
+                if items.len() == 1 { self.node()?; }
                 self.skip_ws();
                 items.push(self.parse_and()?);
             } else {
@@ -282,24 +334,39 @@ impl Parser<'_> {
             }
             self.take_keyword(AND_WORDS);
             self.skip_ws();
+            if items.len() == 1 { self.node()?; }
             items.push(self.parse_unary()?);
         }
         Ok(if items.len() == 1 { items.remove(0) } else { Expr::And(items) })
     }
     fn parse_unary(&mut self) -> Result<Expr, String> {
-        self.skip_ws();
-        if self.take_keyword(NOT_WORDS) {
+        // Unary chains must share the parentheses budget. Previously each NOT
+        // recursively called this function without touching `depth`, so a short
+        // query could overflow parsing, simplify, evaluation or recursive Drop.
+        let mut negations = 0;
+        loop {
             self.skip_ws();
-            return Ok(Expr::Not(Box::new(self.parse_unary()?)));
-        }
-        if let Some(c) = self.peek() {
-            let next = self.chars.get(self.pos + 1).copied();
-            if (c == '-' || c == '!') && next.is_some_and(|n| !n.is_whitespace() && n != '=') {
+            let prefix = self.peek().is_some_and(|c| {
+                let next = self.chars.get(self.pos + 1).copied();
+                (c == '-' || c == '!') && next.is_some_and(|n| !n.is_whitespace() && n != '=')
+            });
+            if prefix {
                 self.pos += 1;
-                return Ok(Expr::Not(Box::new(self.parse_unary()?)));
+            } else if !self.take_keyword(NOT_WORDS) {
+                break;
             }
+            negations += 1;
+            if self.depth + negations > MAX_QUERY_DEPTH {
+                return Err(self.error("Consulta com aninhamento excessivo"));
+            }
+            self.node()?;
         }
-        self.parse_primary()
+        self.depth += negations;
+        let result = self.parse_primary();
+        self.depth -= negations;
+        let mut expr = result?;
+        for _ in 0..negations { expr = Expr::Not(Box::new(expr)); }
+        Ok(expr)
     }
     fn parse_primary(&mut self) -> Result<Expr, String> {
         self.skip_ws();
@@ -426,11 +493,11 @@ impl Parser<'_> {
             j += 1;
         }
         self.pos = close + 1;
-        regex::RegexBuilder::new(&pattern)
-            .case_insensitive(true)
-            .size_limit(1 << 22)
-            .build()
-            .map_err(|e| format!("Expressão regular inválida: {e}"))
+        crate::operations::check()?;
+        let re = crate::query_regex::compile(&pattern, crate::query_regex::QUERY_LITERAL)
+            .map_err(|e| format!("Expressão regular inválida: {e}"))?;
+        crate::operations::check()?;
+        Ok(re)
     }
     fn read_bare(&mut self) -> String {
         let start = self.pos;
@@ -443,6 +510,7 @@ impl Parser<'_> {
         self.chars[start..self.pos].iter().collect()
     }
     fn parse_term(&mut self) -> Result<Expr, String> {
+        self.node()?;
         if let Some((name, end)) = self.field_ahead() {
             self.pos = end;
             let op = self.read_op();
@@ -513,6 +581,7 @@ impl Parser<'_> {
                     }
                     continue;
                 }
+                self.node()?;
                 let (value, quoted) = self.read_value_token()?;
                 items.push((value, quoted));
             }
@@ -529,6 +598,7 @@ impl Parser<'_> {
         let matcher = match op {
             "=" => Matcher::Exact(value),
             "!=" => {
+                self.node()?;
                 let inner = self.smart(&field, &value, true)?;
                 return Ok(Expr::Not(Box::new(Expr::Term(Term { field: Some(field), matcher: inner }))));
             }
@@ -584,10 +654,12 @@ impl Parser<'_> {
             return Ok(Matcher::Level(crate::sources::normalize_level(value)));
         }
         if matches!(field.name.as_str(), "regra" | "rule" | "ameaca" | "ameaça" | "threat") {
+            if !self.catalogs { return Err("CASE_HISTORY_FILTER_CATALOG_UNAVAILABLE".into()); }
             let matcher = crate::threats::matcher(value, self.options.threats.cloned())?;
             return Ok(Matcher::Threat(Threat(matcher)));
         }
         if matches!(field.name.as_str(), "deteccao" | "detecção" | "detection") {
+            if !self.catalogs { return Err("CASE_HISTORY_FILTER_CATALOG_UNAVAILABLE".into()); }
             if !self.options.detections {
                 return Err("deteccao: não pode ser usado dentro de uma regra.".into());
             }
@@ -641,6 +713,7 @@ impl Parser<'_> {
         let mut nets = Vec::new();
         let mut rest = Vec::new();
         for (value, quoted) in items {
+            crate::operations::check()?;
             match self.smart(&field, &value, quoted)? {
                 Matcher::Cidr(mut found) => nets.append(&mut found),
                 other => rest.push(Expr::Term(Term { field: Some(field.clone()), matcher: other })),
@@ -654,6 +727,7 @@ impl Parser<'_> {
 }
 
 fn wildcard(pattern: &str, anchored: bool) -> Result<regex::Regex, String> {
+    crate::operations::check()?;
     let mut re = String::from(if anchored { "(?is)^" } else { "(?is)" });
     for c in pattern.chars() {
         match c {
@@ -665,7 +739,10 @@ fn wildcard(pattern: &str, anchored: bool) -> Result<regex::Regex, String> {
     if anchored {
         re.push('$');
     }
-    regex::Regex::new(&re).map_err(|e| format!("Curinga inválido: {e}"))
+    crate::operations::check()?;
+    let program = crate::query_regex::compile(&re, crate::query_regex::ORDINARY).map_err(|e| format!("Curinga inválido: {e}"))?;
+    crate::operations::check()?;
+    Ok(program)
 }
 
 fn number_for(field: &str, value: &str) -> Option<f64> {
@@ -692,7 +769,7 @@ pub(crate) fn literal_role(role: Role) -> bool {
     !matches!(role, Role::Action | Role::Outcome | Role::SrcScope | Role::DstScope | Role::Tool)
 }
 
-fn any_value(ev: &Event, test: &dyn Fn(&str) -> bool) -> bool {
+pub(crate) fn any_value(ev: &Event, test: &dyn Fn(&str) -> bool) -> bool {
     if test(&ev.message) || test(&ev.source) || test(&ev.code) || test(&ev.name) || test(&ev.description) {
         return true;
     }
@@ -715,6 +792,7 @@ fn any_value(ev: &Event, test: &dyn Fn(&str) -> bool) -> bool {
 pub struct Ctx<'a> {
     pub ev: &'a Event,
     object_only: bool,
+    indexed_time: bool,
     fields: std::cell::OnceCell<[Option<Cow<'a, str>>; 19]>,
     fallbacks: [std::cell::OnceCell<Option<Cow<'a, str>>>; 19],
     action: std::cell::OnceCell<(Option<&'static str>, Option<&'static str>)>,
@@ -726,6 +804,7 @@ impl<'a> Ctx<'a> {
         Ctx {
             ev,
             object_only: false,
+            indexed_time: false,
             fields: std::cell::OnceCell::new(),
             fallbacks: Default::default(),
             action: std::cell::OnceCell::new(),
@@ -800,60 +879,15 @@ impl<'a> Ctx<'a> {
     }
     fn number(&self, field: &Field) -> Option<f64> {
         if field.name == "timestamp" && !self.object_only {
-            return self.ev.timestamp.map(|t| t as f64);
+            // Only verification against compact line metadata uses its zero
+            // sentinel. A preserved Event/Case can distinguish Some(0)/None.
+            return self.ev.timestamp.filter(|t| !self.indexed_time || *t != 0).map(|t| t as f64);
         }
-        let text = self.field(field)?;
-        let text = text.trim();
-        text.parse::<f64>()
-            .ok()
-            .or_else(|| crate::analysis::parse_num_unit(text).map(|(n, _)| n))
-            .filter(|n| n.is_finite())
+        crate::model::text_number(&self.field(field)?)
     }
 }
 
 impl Expr {
-    /// Conservative plan for the embedded index. AND may use any supported
-    /// branch; OR needs every branch. Negating approximate candidates is unsafe.
-    pub(crate) fn index_predicate(&self) -> Option<crate::big_data::Predicate> {
-        use crate::big_data::{ExactMode, Predicate};
-        match self {
-            Expr::And(items) => {
-                let parts: Vec<_> = items.iter().filter_map(Self::index_predicate).collect();
-                (!parts.is_empty()).then_some(Predicate::And(parts))
-            }
-            Expr::Or(items) => Some(Predicate::Or(items.iter().map(Self::index_predicate).collect::<Option<_>>()?)),
-            Expr::Term(term) => {
-                // Alias and case-insensitive field resolution can fall back to
-                // another field; searching all indexed values is a safe superset.
-                let eq = |value: String, mode| Predicate::Equals { column: None, value, mode };
-                match &term.matcher {
-                    Matcher::Contains(s) if s.chars().count() >= 3 => Some(Predicate::Contains(s.clone())),
-                    // read_regex enables Unicode case folding through the
-                    // builder, which as_str() does not expose. Treat every
-                    // regex as case-insensitive for this necessary condition;
-                    // that is also a safe superset for programmatic regexes.
-                    Matcher::Regex(re) => crate::query::regex_index_predicate(&format!("(?i:{})", re.as_str())),
-                    Matcher::Wildcard(re) => crate::query::regex_index_predicate(re.as_str()),
-                    Matcher::Exact(s) => Some(eq(s.clone(), ExactMode::Sensitive)),
-                    Matcher::Equals(s) if term.field.as_ref().is_some_and(|f| f.name == "_all") => {
-                        (s.chars().count() >= 3).then(|| Predicate::Contains(s.clone()))
-                    }
-                    Matcher::Equals(s) => Some(eq(s.clone(), ExactMode::TrimLower)),
-                    Matcher::Level(s) => Some(eq(s.clone(), ExactMode::Sensitive)),
-                    Matcher::Set(values) => Some(Predicate::Or(values.iter().map(|v| eq(v.clone(), ExactMode::TrimLower)).collect())),
-                    Matcher::Cmp(cmp, n) if term.field.as_ref().is_some_and(|f| f.name == "timestamp") => {
-                        crate::query::timestamp_predicate(match cmp { Cmp::Gt => "gt", Cmp::Gte => "gte", Cmp::Lt => "lt", Cmp::Lte => "lte" }, *n, None)
-                    }
-                    Matcher::Range(a, b) if term.field.as_ref().is_some_and(|f| f.name == "timestamp") => {
-                        crate::query::timestamp_predicate("between", *a, Some(*b))
-                    }
-                    _ => None,
-                }
-            }
-            Expr::All | Expr::Not(_) => None,
-        }
-    }
-
     /// Explain only predicates that actually matched. NOT/absence and derived
     /// identities have no textual match and never fabricate a highlighted span.
     pub fn evidence_excerpts(
@@ -1105,6 +1139,12 @@ impl Expr {
         self.matches_ctx(&Ctx::new(ev))
     }
 
+    pub(crate) fn matches_indexed(&self, ev: &Event) -> bool {
+        let mut ctx = Ctx::new(ev);
+        ctx.indexed_time = true;
+        self.matches_ctx(&ctx)
+    }
+
     pub fn matches_ctx(&self, ctx: &Ctx<'_>) -> bool {
         match self {
             Expr::All => true,
@@ -1147,6 +1187,16 @@ impl Expr {
         }
     }
 
+    /// Names of the fields the expression reads.
+    pub(crate) fn field_names(&self, out: &mut Vec<String>) {
+        match self {
+            Expr::And(items) | Expr::Or(items) => items.iter().for_each(|e| e.field_names(out)),
+            Expr::Not(inner) => inner.field_names(out),
+            Expr::Term(Term { field: Some(field), .. }) => out.push(field.name.clone()),
+            _ => {}
+        }
+    }
+
     /// Free-text needles, which could also match catalog enrichment.
     pub fn free_text_needles(&self, out: &mut Vec<String>) {
         match self {
@@ -1186,6 +1236,18 @@ fn longest_literal(pattern: &str) -> Option<String> {
         .filter(|chunk| chunk.chars().count() >= 3)
 }
 
+/// What a term tests, for the query engine's translation.
+pub(crate) enum TermKind<'a> {
+    /// Case-insensitive substring (lowercase needle).
+    Contains(&'a str),
+    /// Tested on the text value with [`Term::value_matches`].
+    Value,
+    /// Tested on a number with [`Term::number_matches`].
+    Number,
+    /// Needs the whole event (threat and detection rules).
+    Event,
+}
+
 impl Term {
     fn matches(&self, ctx: &Ctx<'_>) -> bool {
         let ev = ctx.ev;
@@ -1209,33 +1271,89 @@ impl Term {
         match &self.matcher {
             Matcher::Threat(threat) => threat.0.matches(ev),
             Matcher::Detection(d) => d.0.rules[d.1].matches(ev),
-            Matcher::Cmp(cmp, bound) => ctx.number(field).is_some_and(|n| match cmp {
+            Matcher::Cmp(..) | Matcher::Range(..) => ctx.number(field).is_some_and(|n| self.number_matches(n)),
+            _ => ctx.field(field).is_some_and(|value| self.value_matches(&value)),
+        }
+    }
+
+    /// Field name, role fallback and case-insensitive lookup of a field term.
+    pub(crate) fn field(&self) -> Option<(&str, Option<Role>, bool)> {
+        self.field.as_ref().map(|f| (f.name.as_str(), f.role, f.ci))
+    }
+
+    pub(crate) fn kind(&self) -> TermKind<'_> {
+        match &self.matcher {
+            Matcher::Contains(needle) => TermKind::Contains(needle),
+            Matcher::Cmp(..) | Matcher::Range(..) => TermKind::Number,
+            Matcher::Threat(_) | Matcher::Detection(_) => TermKind::Event,
+            _ => TermKind::Value,
+        }
+    }
+
+    /// Whether a free-text term is a wildcard or regular expression.
+    pub(crate) fn is_pattern(&self) -> bool {
+        matches!(self.matcher, Matcher::Wildcard(_) | Matcher::Regex(_))
+    }
+
+    /// Longest literal a wildcard term requires, when it has one.
+    pub(crate) fn wildcard_literal(&self) -> Option<String> {
+        match &self.matcher {
+            Matcher::Wildcard(_) => self.required_literals().and_then(|mut v| (v.len() == 1).then(|| v.remove(0))),
+            _ => None,
+        }
+    }
+
+    /// Comparison or range against a number.
+    /// Exposes the parsed bounds without reparsing the user's text. Consumers
+    /// must preserve `number_matches`' f64 and absent-value semantics.
+    pub(crate) fn numeric_bounds(&self) -> Option<(&'static str, f64, Option<f64>)> {
+        match self.matcher {
+            Matcher::Cmp(cmp, bound) => Some((match cmp {
+                Cmp::Gt => "gt",
+                Cmp::Gte => "gte",
+                Cmp::Lt => "lt",
+                Cmp::Lte => "lte",
+            }, bound, None)),
+            Matcher::Range(lo, hi) => Some(("between", lo, Some(hi))),
+            _ => None,
+        }
+    }
+
+    /// Comparison or range against a number.
+    pub(crate) fn number_matches(&self, n: f64) -> bool {
+        match &self.matcher {
+            Matcher::Cmp(cmp, bound) => match cmp {
                 Cmp::Gt => n > *bound,
                 Cmp::Gte => n >= *bound,
                 Cmp::Lt => n < *bound,
                 Cmp::Lte => n <= *bound,
-            }),
-            Matcher::Range(lo, hi) => ctx.number(field).is_some_and(|n| n >= *lo && n <= *hi),
-            _ => {
-                let Some(value) = ctx.field(field) else { return false };
-                match &self.matcher {
-                    Matcher::Contains(needle) => contains_ci(&value, needle),
-                    Matcher::Equals(needle) => {
-                        let v = value.trim();
-                        v.len() == needle.len() && v.eq_ignore_ascii_case(needle) || v.to_lowercase() == *needle
-                    }
-                    Matcher::Exact(expected) => value.as_ref() == expected,
-                    Matcher::Wildcard(re) | Matcher::Regex(re) => re.is_match(&value),
-                    Matcher::Cidr(nets) => entities::parse_ip(&value).is_some_and(|ip| nets.iter().any(|n| n.contains(ip))),
-                    Matcher::Exists => !value.trim().is_empty(),
-                    Matcher::Set(set) => {
-                        let v = value.trim();
-                        set.contains(v) || set.contains(&v.to_lowercase())
-                    }
-                    Matcher::Level(label) => value.as_ref() == label,
-                    _ => false,
-                }
+            },
+            Matcher::Range(lo, hi) => n >= *lo && n <= *hi,
+            _ => false,
+        }
+    }
+
+    /// Test of the resolved text value of the term's field.
+    pub(crate) fn value_matches(&self, value: &str) -> bool {
+        match &self.matcher {
+            Matcher::Contains(needle) => contains_ci(value, needle),
+            Matcher::Equals(needle) => {
+                let v = value.trim();
+                v.len() == needle.len() && v.eq_ignore_ascii_case(needle) || v.to_lowercase() == *needle
             }
+            Matcher::Exact(expected) => value == expected,
+            Matcher::Wildcard(re) | Matcher::Regex(re) => re.is_match(value),
+            Matcher::Cidr(nets) => entities::parse_ip(value).is_some_and(|ip| nets.iter().any(|n| n.contains(ip))),
+            Matcher::Exists => !value.trim().is_empty(),
+            Matcher::Set(set) => {
+                let v = value.trim();
+                set.contains(v) || set.contains(&v.to_lowercase())
+            }
+            Matcher::Level(label) => value == label,
+            Matcher::Cmp(..) | Matcher::Range(..) => {
+                crate::model::text_number(value).is_some_and(|n| self.number_matches(n))
+            }
+            Matcher::Threat(_) | Matcher::Detection(_) => false,
         }
     }
 
@@ -1290,7 +1408,7 @@ impl Term {
             }
             (Some(field), Matcher::Cmp(cmp, bound)) if field.name == "timestamp" => {
                 if meta.ts == 0 {
-                    return None;
+                    return Some(false);
                 }
                 let t = meta.ts as f64;
                 Some(match cmp {
@@ -1302,7 +1420,7 @@ impl Term {
             }
             (Some(field), Matcher::Range(lo, hi)) if field.name == "timestamp" => {
                 if meta.ts == 0 {
-                    return None;
+                    return Some(false);
                 }
                 Some((meta.ts as f64) >= *lo && (meta.ts as f64) <= *hi)
             }
@@ -1329,6 +1447,11 @@ impl Term {
 
 /// Resolved column reference, reusable across events.
 pub struct FieldRef(Field);
+
+impl FieldRef {
+    /// Canonical name/role used by Ctx::get, for conservative engine proofs.
+    pub(crate) fn parts(&self) -> (&str, Option<Role>) { (&self.0.name, self.0.role) }
+}
 
 pub fn field_ref(name: &str) -> FieldRef {
     FieldRef(resolve_field(name))
@@ -1519,5 +1642,106 @@ mod tests {
         assert!(!expr.matches(&ev("x", json!({"src_ip": "11.0.0.1"}))));
         let v6 = IpNet::parse("2001:db8::/32").unwrap();
         assert!(v6.contains("2001:db8::5".parse().unwrap()));
+    }
+
+    #[test]
+    fn unary_prefixes_share_the_parentheses_depth_budget() {
+        let event = ev("match", json!({}));
+        // This bounded 128-prefix fixture was accepted by the old parser: the
+        // recursive unary branch never incremented its depth guard.
+        for prefix in ["NOT ", "!", "-", "NÃO ", "NAO "] {
+            let near = format!("{}message:match", prefix.repeat(MAX_QUERY_DEPTH - 1));
+            assert!(!compile(&near).unwrap().matches(&event));
+            let over = format!("{}message:match", prefix.repeat(MAX_QUERY_DEPTH));
+            assert!(compile(&over).unwrap_err().contains("aninhamento"));
+            let long = format!("{}message:match", prefix.repeat(128));
+            assert!(compile(&long).unwrap_err().contains("aninhamento"));
+        }
+        let grouped = |parentheses: usize, negations: usize| format!(
+            "{}{}message:match{}", "(".repeat(parentheses), "NOT ".repeat(negations), ")".repeat(parentheses),
+        );
+        assert!(!compile(&grouped(32, 31)).unwrap().matches(&event));
+        assert!(compile(&grouped(32, 32)).unwrap_err().contains("aninhamento"));
+        let alternate = format!("{}message:match{}", "NOT (".repeat(32), ")".repeat(32));
+        assert!(compile(&alternate).unwrap_err().contains("aninhamento"));
+        assert!(compile(&format!("{}message:match{}", "(".repeat(63), ")".repeat(63))).is_ok());
+    }
+
+    #[test]
+    fn iterative_unary_parsing_preserves_boolean_and_missing_field_semantics() {
+        let event = ev("match", json!({"value":null,"empty":"","number":1}));
+        for text in ["message:match", "missing:*", "value:null", "empty:\"\"", "number!=2", "(message:match OR missing:*)"] {
+            let original = compile(text).unwrap().matches(&event);
+            for count in 0..12 {
+                let tokens: String = (0..count).map(|n| match n % 3 { 0 => "NOT ", 1 => "!", _ => "-" }).collect();
+                let found = compile(&format!("{tokens}{text}")).unwrap().matches(&event);
+                assert_eq!(found, if count % 2 == 0 { original } else { !original }, "{count}: {text}");
+            }
+        }
+        // Prefix-looking text protected by a quoted value remains literal.
+        assert!(compile("message:\"!!match\"").unwrap().matches(&ev("!!match", json!({}))));
+        assert!(compile("message:\"NOT match\"").unwrap().matches(&ev("NOT match", json!({}))));
+    }
+
+    #[test]
+    fn flat_terms_and_value_lists_are_bounded_before_growth() {
+        let near = std::iter::repeat_n("value:x", MAX_QUERY_NODES - 1).collect::<Vec<_>>().join(" OR ");
+        let over = format!("{near} OR value:x");
+        assert!(near.len() < 1_000_000);
+        assert!(compile(&near).is_ok());
+        assert!(compile(&over).unwrap_err().contains("estrutura"));
+        let values = std::iter::repeat_n("x", MAX_QUERY_NODES - 1).collect::<Vec<_>>().join(" OR ");
+        assert!(compile(&format!("value:({values})")).is_ok());
+        assert!(compile(&format!("value:({values} OR x)")).unwrap_err().contains("estrutura"));
+        // Existing large, useful set queries fit; the work cap is not a
+        // 64-item restriction disguised as a recursion-depth check.
+        let values = (0..5000).map(|i| format!("value{i}")).collect::<Vec<_>>().join(" OR ");
+        assert!(compile(&format!("field:({values})")).unwrap().matches(&ev("", json!({"field":"value4999"}))));
+    }
+
+    #[test]
+    fn parser_resource_checks_observe_named_cancellation() {
+        let id = format!("parser-bounds-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let unrelated = crate::operations::token(None).unwrap();
+        assert!(crate::operations::run_with_token(token, || {
+            let options = Options { threats: None, detections: true };
+            let mut parser = Parser { chars: vec![], pos: 0, options: &options, catalogs: true, depth: 0, nodes: 0 };
+            parser.node().unwrap();
+            assert!(crate::operations::cancel_id(&id));
+            assert!(parser.node().is_err(), "check between parser nodes");
+            assert!(compile("message:match").is_err(), "check before parsing");
+        }).is_err());
+        assert!(!unrelated.cancelled());
+        assert!(compile("message:match").is_ok(), "cancelled context was restored");
+    }
+}
+
+#[cfg(test)]
+mod history_policy_tests {
+    use super::*;
+    #[test]
+    fn preserved_query_policy_keeps_plain_numeric_boolean_and_regex_semantics() {
+        let mut event = Event::empty();
+        event.id = 17; event.message = "Preserved WARNING".into();
+        event.fields.insert("count".into(), serde_json::json!(12));
+        for query in ["warning", "count>=10 AND id<20", "message:/warning/", "NOT count<5", "count:(12 OR 13)"] {
+            assert_eq!(compile_without_catalogs(query).unwrap().matches(&event), compile(query).unwrap().matches(&event), "{query}");
+        }
+    }
+    #[test]
+    fn historical_ast_admission_accounts_for_repeated_long_field_names() {
+        let field = "x".repeat(20_000);
+        let query = format!("{field}:(a OR b OR c)");
+        assert!(historical_ast_credit(&query).unwrap() > 128 << 20);
+        assert!(historical_ast_credit("warning").unwrap() < 4096);
+    }
+    #[test]
+    fn preserved_query_rejects_catalog_names_before_loading_a_catalog() {
+        for name in ["regra", "rule", "ameaca", "ameaça", "threat", "deteccao", "detecção", "detection"] {
+            let error = compile_without_catalogs(&format!("{name}:nonexistent-history-catalog")).unwrap_err();
+            assert_eq!(error, "CASE_HISTORY_FILTER_CATALOG_UNAVAILABLE");
+        }
+        assert!(compile_rule("deteccao:x").unwrap_err().contains("dentro de uma regra"));
     }
 }

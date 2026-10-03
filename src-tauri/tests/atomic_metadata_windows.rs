@@ -4,6 +4,3 @@
 
 #[path = "../src/atomic_metadata.rs"]
 mod atomic_metadata;
-#[allow(dead_code)] // Other operation APIs belong to the complete application.
-#[path = "../src/operations.rs"]
-mod operations;

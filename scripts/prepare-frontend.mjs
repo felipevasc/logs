@@ -9,12 +9,19 @@ const output = resolve(source, "dist");
 rmSync(output, { recursive: true, force: true });
 mkdirSync(output, { recursive: true });
 
-for (const item of ["index.html", "icon-picker.js", "case-timeline.js", "case-content.js", "case-content.css", "case-trails.js", "case-trails.css", "case-report.js", "app.js", "timeline.js", "timeline-export.js", "workspace.js", "workspace-context.js", "analysis-workbench.js", "discovery.js", "threats.js", "remote-sources.js", "journeys.js", "styles.css", "workspace.css", "workspace-context.css", "analysis-workbench.css", "timeline-refinements.css", "timeline-export.css", "discovery.css", "threats.css", "remote-sources.css", "journeys.css", "query-lang.js", "entity-menu.js", "query-bar.js", "evidence-ui.js", "value-inspector.js", "security.js", "security.css", "event-insights.js", "case-intel.js", "command-palette.js", "ui-scale.js", "tasks.js", "resources.js", "resources.css", "vendor"]) {
+for (const item of ["index.html", "icon-picker.js", "case-timeline.js", "case-removals.js", "case-content.js", "case-content.css", "case-trails.js", "case-trails.css", "case-report.js", "context-menu.js", "app.js", "analysis-context.js", "canonical-fields.js", "analysis-fields.js", "explorer-timeline.js", "explorer-timeline.css", "field-transform.js", "field-transform.css", "exclusion-archive.js", "exclusion-visibility.js", "exclusion-archive.css", "case-references.js", "case-references.css", "performance-core.js", "detail-fields.js", "java-trace.js", "java-trace.css", "timeline.js", "timeline-export.js", "workspace.js", "workspace-context.js", "analysis-workbench.js", "discovery.js", "threats.js", "remote-sources.js", "journeys.js", "styles.css", "workspace.css", "workspace-context.css", "analysis-workbench.css", "timeline-refinements.css", "timeline-export.css", "discovery.css", "threats.css", "remote-sources.css", "journeys.css", "query-lang.js", "entity-menu.js", "query-bar.js", "evidence-ui.js", "security.js", "security.css", "event-insights.js", "case-intel.js", "command-palette.js", "updates.js", "updates.css", "ui-scale.js", "tasks.js", "vendor"]) {
   cpSync(resolve(source, item), resolve(output, item), { recursive: true });
 }
 
 // A successful build must include every local script referenced by the entrypoint.
-for (const item of ["participants-ui.js", "assets"]) {
+for (const item of [
+  "participants-ui.js", "assets", "waiting-visuals.js", "waiting-visuals.css", "waiting-progress.js",
+  "case-evidence.js", "case-evidence-session.js", "case-evidence-analysis.js",
+  "case-evidence-preserved.js", "case-evidence-items.js", "case-evidence-actions.js",
+  "case-evidence-detail.js", "case-evidence-timeline.js", "case-evidence-display.js",
+  "case-evidence-transfer.js", "case-evidence-recovery.js", "resource-settings.js", "resource-settings.css",
+  "resources.js", "resources.css", "value-inspector.js",
+]) {
   cpSync(resolve(source, item), resolve(output, item), { recursive: true });
 }
 

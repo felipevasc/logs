@@ -5,8 +5,22 @@ use crate::model::{
 use chrono::Datelike;
 use serde_json::{Map, Value};
 
+mod web_logs;
+
+/// Scoped parsed-data revision; raw source and stable event identities never change.
+pub(crate) fn parser_semantics_signature(format: &str) -> Option<&'static str> {
+    matches!(format, "apache" | "nginx" | "nginx-error" | "jsonl" | "logfmt" | "auto" | "mixed")
+        .then_some("web-logs-v2")
+}
+
+/// Embedded syslog inherits the source's pinned calendar just like a direct
+/// syslog source; its engine/time cache must not survive a year-context change.
+pub(crate) fn uses_inferred_calendar_year(format: &str) -> bool {
+    matches!(format, "syslog3164" | "firewall" | "zeek") || parser_semantics_signature(format).is_some()
+}
+
 /// Interpreta data/hora "naive" (sem fuso) como horário LOCAL da máquina.
-fn naive_to_ms(ndt: chrono::NaiveDateTime) -> i64 {
+pub(crate) fn naive_to_ms(ndt: chrono::NaiveDateTime) -> i64 {
     ndt.and_local_timezone(chrono::Local)
         .single()
         .map(|d| d.timestamp_millis())
@@ -27,14 +41,24 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_millis());
     }
+    // Spreadsheets and exports often drop the seconds or use slashes.
     const FORMATS: &[&str] = &[
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+        "%Y/%m/%d %H:%M:%S%.f",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
         "%d/%m/%Y %H:%M:%S%.f",
         "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d-%m-%Y %H:%M:%S",
         "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
     ];
     for fmt in FORMATS {
         if let Ok(n) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
@@ -166,16 +190,91 @@ fn flatten_json(
     }
 }
 
-fn event_from_json(input: Map<String, Value>, raw: &str) -> Event {
+fn event_from_json_at(input: Map<String, Value>, raw: &str, year: i32) -> Event {
+    event_from_json_embedded(input, raw, year, 0, &mut EmbeddedBudget::default())
+}
+
+// Limits apply across the entire record, including nested encoded JSON. Exact
+// original values/raw remain available when enrichment reaches a limit.
+struct EmbeddedBudget { bytes: usize, candidates: usize }
+impl Default for EmbeddedBudget {
+    fn default() -> Self { Self { bytes: 256 * 1024, candidates: 32 } }
+}
+
+// Automatic embedding uses a stricter subset than the explicit legacy parser.
+// Requiring PRI and NILVALUE structured data prevents ordinary prose from
+// matching its permissive seven-token header. Structured-data blocks need a
+// dedicated grammar before this automatic path can accept them reliably.
+fn embedded_syslog5424(line: &str) -> Option<Event> {
+    let mut words = line.split_ascii_whitespace();
+    let (priority, version) = words.next()?.strip_prefix('<')?.split_once('>')?;
+    if version != "1" || priority.is_empty() || !priority.bytes().all(|b| b.is_ascii_digit())
+        || priority.parse::<u16>().ok()? > 191 { return None; }
+    let timestamp = words.next()?;
+    if timestamp != "-" && chrono::DateTime::parse_from_rfc3339(timestamp).is_err() { return None; }
+    for _ in 0..4 { words.next()?; }
+    if words.next()? != "-" { return None; }
+    parse_syslog5424(line)
+}
+
+fn embedded_log(raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget) -> Option<Event> {
+    if depth >= 3 || raw.len() > 64 * 1024 || raw.len() > budget.bytes || budget.candidates == 0 {
+        return None;
+    }
+    budget.bytes -= raw.len();
+    budget.candidates -= 1;
+    let line = raw.trim();
+    let (mut event, format) = if line.starts_with('{') {
+        let Value::Object(map) = serde_json::from_str::<Value>(line).ok()? else { return None; };
+        (event_from_json_embedded(map, raw, year, depth + 1, budget), "json")
+    } else {
+        // Header-dependent formats (CSV, W3C, Zeek), arbitrary text and custom
+        // schemas have no trustworthy per-value detector. Never guess them.
+        if line.contains(['\n', '\r']) || !line.contains(char::is_whitespace) && !(line.starts_with("CEF:") || line.starts_with("LEEF:")) { return None; }
+        if let Some(event) = web_logs::parse_access(line) { (event, "access") }
+        else if let Some(event) = web_logs::parse_error(line) { (event, "nginx.error") }
+        else if let Some(event) = embedded_syslog5424(line) { (event, "syslog5424") }
+        else if let Some(event) = parse_syslog3164(line, year).filter(|event| event.timestamp.is_some()) {
+            if line.contains("SRC=") || line.contains("PROTO=") || line.contains("DPT=") {
+                (parse_firewall(line, year)?, "firewall")
+            } else { (event, "syslog3164") }
+        }
+        else if let Some(event) = parse_log4j(line) { (event, "log4j") }
+        else if let Some(event) = parse_jboss(line) { (event, "jboss") }
+        else if let Some(event) = parse_wildfly(line) { (event, "wildfly") }
+        else if let Some(event) = parse_cef(line) { (event, "cef") }
+        else if let Some(event) = parse_leef(line) { (event, "leef") }
+        // Strict whole-record logfmt only: no regex mining inside prose/URLs.
+        else if let Some(event) = web_logs::parse_logfmt(line) { (event, "logfmt") }
+        else { return None; }
+    };
+    event.fields.entry("parser.format").or_insert_with(|| Value::from(format));
+    Some(event)
+}
+
+fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget) -> Event {
     let mut ev = Event::empty();
     ev.raw = raw.to_string();
     let mut map = Map::new();
     flatten_json(input, "", 0, &mut map);
+    // Common collector keys get priority, but any bounded string field may
+    // contain a full supported record. Nested object paths remain namespaced.
+    let mut candidates: Vec<_> = map.iter().filter(|(key, _)| key.len() <= 512)
+        .filter_map(|(key, value)| value.as_str().map(|text| (key, text))).collect();
+    candidates.sort_by_key(|(key, _)| !matches!(key.rsplit('.').next().unwrap_or(key), "line" | "message" | "msg" | "log" | "body" | "text"));
+    let wrapped: Vec<_> = candidates.into_iter().filter_map(|(key, text)| {
+        embedded_log(text, year, depth, budget).map(|event| (key.clone(), event))
+    }).collect();
+    let original = (!wrapped.is_empty() || depth > 0).then(|| map.clone());
     // Keep normalized aliases useful for filtering even when they also fill
     // a standard column (for example service.name and log.level).
     if let Some(v) = take_key(&mut map, TS_KEYS) {
         ev.timestamp = value_to_ms(&v);
     }
+    let explicit_level = LEVEL_KEYS.iter().any(|alias| map.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case(alias) && (value.is_string() || value.is_number() || value.is_boolean())
+            && value.as_str().is_none_or(|text| !text.trim().is_empty())
+    }));
     if let Some(v) = take_key(&mut map, LEVEL_KEYS) {
         ev.level = normalize_level(
             &v.as_str()
@@ -202,7 +301,58 @@ fn event_from_json(input: Map<String, Value>, raw: &str) -> Event {
             .unwrap_or_else(|| v.to_string());
     }
     ev.fields = map;
-    describe_known_json(&mut ev);
+    let outer_http = web_logs::enrich_http(&mut ev, explicit_level);
+    if let Some(original) = original {
+        for (key, value) in original { ev.fields.entry(key).or_insert(value); }
+    }
+    // Describe only the outer record, never a mixture assembled from promoted
+    // fields. On envelopes, explicit outer columns retain precedence even when
+    // the outer record itself belongs to a known JSON family. Direct JSON keeps
+    // its established family-specific interpretation.
+    let outer_columns = (!wrapped.is_empty()).then(|| (ev.timestamp, ev.source.clone(),
+        (explicit_level || outer_http).then(|| ev.level.clone()), ev.code.clone(), ev.message.clone()));
+    let outer_known = describe_known_json(&mut ev);
+    if let Some((timestamp, source, level, code, message)) = outer_columns {
+        ev.timestamp = timestamp.or(ev.timestamp);
+        if !source.is_empty() { ev.source = source; }
+        if let Some(level) = level { ev.level = level; }
+        if !code.is_empty() { ev.code = code; }
+        if !message.is_empty() { ev.message = message; }
+    }
+    let unambiguous = wrapped.len() == 1;
+    let mut added = 0usize;
+    for (field, inner) in wrapped {
+        // Multiple recognized values remain independently namespaced. Do not
+        // choose an arbitrary sibling as the canonical record.
+        if unambiguous {
+            ev.timestamp = ev.timestamp.or(inner.timestamp);
+            if ev.code.is_empty() { ev.code = inner.code.clone(); }
+            if ev.source.is_empty() { ev.source = inner.source.clone(); }
+            if ev.message.is_empty() { ev.message = inner.raw.clone(); }
+            if !explicit_level && !outer_http && !outer_known { ev.level = inner.level.clone(); }
+        }
+        if added < 512 {
+            if let Some(timestamp) = inner.timestamp {
+                ev.fields.entry(format!("{field}.timestamp")).or_insert_with(||
+                    inner.fields.get("timestamp").cloned().unwrap_or_else(|| Value::from(timestamp)));
+                added += 1;
+            }
+        }
+        for (name, value) in [("source", &inner.source), ("code", &inner.code), ("level", &inner.level), ("message", &inner.message)] {
+            if !value.is_empty() && added < 512 {
+                ev.fields.entry(format!("{field}.{name}")).or_insert_with(||
+                    inner.fields.get(name).cloned().unwrap_or_else(|| Value::from(value.clone())));
+                added += 1;
+            }
+        }
+        for (key, value) in inner.fields {
+            if added >= 512 { break; }
+            if key.len() > 512 { continue; }
+            ev.fields.entry(format!("{field}.{key}")).or_insert_with(|| value.clone());
+            added += 1;
+            if unambiguous && added < 512 { ev.fields.entry(key).or_insert(value); added += 1; }
+        }
+    }
     if ev.message.is_empty() {
         ev.message = raw.chars().take(500).collect();
     }
@@ -221,7 +371,7 @@ fn field_text(ev: &Event, key: &str) -> Option<String> {
 /// Readable message, code and level for well-known JSON families whose
 /// records carry no message: CloudTrail, Suricata EVE, Zeek, Okta, GCP and
 /// Kubernetes audit. Original fields are kept.
-fn describe_known_json(ev: &mut Event) {
+fn describe_known_json(ev: &mut Event) -> bool {
     let synthesized = ev.message.is_empty();
     // AWS CloudTrail: eventID is a UUID; the operation is eventName.
     if let (Some(source), Some(name)) = (field_text(ev, "eventSource"), field_text(ev, "eventName")) {
@@ -245,7 +395,7 @@ fn describe_known_json(ev: &mut Event) {
         } else if synthesized {
             ev.message = format!("{name} · {who} · {from}");
         }
-        return;
+        return true;
     }
     // Suricata EVE
     if let Some(kind) = field_text(ev, "event_type") {
@@ -275,7 +425,7 @@ fn describe_known_json(ev: &mut Event) {
         if ev.code.is_empty() {
             ev.code = kind;
         }
-        return;
+        return true;
     }
     // Zeek (JSON or TSV converted to JSON)
     if let (Some(orig), Some(resp)) = (field_text(ev, "id.orig_h"), field_text(ev, "id.resp_h")) {
@@ -292,7 +442,7 @@ fn describe_known_json(ev: &mut Event) {
         if ev.source.is_empty() {
             ev.source = "zeek".into();
         }
-        return;
+        return true;
     }
     // Okta System Log
     if let Some(kind) = field_text(ev, "eventType") {
@@ -305,7 +455,7 @@ fn describe_known_json(ev: &mut Event) {
         if field_text(ev, "outcome.result").is_some_and(|r| r.eq_ignore_ascii_case("FAILURE")) && ev.level == "Informação" {
             ev.level = "Aviso".into();
         }
-        return;
+        return true;
     }
     // Google Cloud audit logs
     if let Some(method) = field_text(ev, "protoPayload.methodName") {
@@ -316,7 +466,7 @@ fn describe_known_json(ev: &mut Event) {
             let who = field_text(ev, "protoPayload.authenticationInfo.principalEmail").unwrap_or_default();
             ev.message = format!("{method} · {who}");
         }
-        return;
+        return true;
     }
     // Kubernetes audit
     if let (Some(verb), Some(stage)) = (field_text(ev, "verb"), field_text(ev, "stage")) {
@@ -333,7 +483,9 @@ fn describe_known_json(ev: &mut Event) {
         if field_text(ev, "responseStatus.code").is_some_and(|c| c.starts_with('4') || c.starts_with('5')) {
             ev.level = "Aviso".into();
         }
+        return true;
     }
+    false
 }
 
 fn event_from_text(line: &str) -> Event {
@@ -408,13 +560,6 @@ fn re_syslog5424() -> &'static regex::Regex {
     })
 }
 
-fn re_apache() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        regex::Regex::new(r#"^(\S+)\s+(\S+)\s+(\S+)\s+\[([^\]]+)\]\s+"(\S+)\s+(\S+)\s+(\S+)"\s+(\d{3})\s+(\S+)(?:\s+"([^"]*)"\s+"([^"]*)")?"#).unwrap()
-    })
-}
-
 fn month_num(mon: &str) -> Option<u32> {
     Some(match mon {
         "Jan" => 1,
@@ -433,8 +578,7 @@ fn month_num(mon: &str) -> Option<u32> {
     })
 }
 
-fn syslog_ts(mon: &str, day: &str, h: &str, mi: &str, s: &str) -> Option<i64> {
-    let year = chrono::Utc::now().year();
+fn syslog_ts(mon: &str, day: &str, h: &str, mi: &str, s: &str, year: i32) -> Option<i64> {
     let (d, h, mi, s) = (
         day.parse().ok()?,
         h.parse().ok()?,
@@ -446,11 +590,11 @@ fn syslog_ts(mon: &str, day: &str, h: &str, mi: &str, s: &str) -> Option<i64> {
         .map(naive_to_ms)
 }
 
-fn parse_syslog3164(line: &str) -> Option<Event> {
+fn parse_syslog3164(line: &str, year: i32) -> Option<Event> {
     let c = re_syslog3164().captures(line)?;
     let mut ev = Event::empty();
     ev.raw = line.to_string();
-    ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6]);
+    ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6], year);
     ev.source = c[7].to_string();
     let proc = c[8].to_string();
     ev.fields
@@ -481,43 +625,10 @@ fn parse_syslog5424(line: &str) -> Option<Event> {
 }
 
 fn parse_apache(line: &str) -> Option<Event> {
-    let c = re_apache().captures(line)?;
-    let mut ev = Event::empty();
-    ev.raw = line.to_string();
-    // [10/Oct/2000:13:55:36 -0700]
-    if let Ok(dt) = chrono::DateTime::parse_from_str(&c[4], "%d/%b/%Y:%H:%M:%S %z") {
-        ev.timestamp = Some(dt.timestamp_millis());
-    }
-    ev.source = c[1].to_string(); // IP do cliente
-    if &c[3] != "-" {
-        ev.fields
-            .insert("user".into(), Value::from(c[3].to_string()));
-    }
-    ev.fields
-        .insert("method".into(), Value::from(c[5].to_string()));
-    ev.fields
-        .insert("path".into(), Value::from(c[6].to_string()));
-    ev.fields
-        .insert("protocol".into(), Value::from(c[7].to_string()));
-    ev.code = c[8].to_string(); // status HTTP
-    ev.level = match c[8].chars().next() {
-        Some('5') => "Erro".into(),
-        Some('4') => "Aviso".into(),
-        _ => "Informação".into(),
-    };
-    ev.fields
-        .insert("size".into(), Value::from(c[9].to_string()));
-    if let Some(r) = c.get(10) {
-        ev.fields.insert("referer".into(), Value::from(r.as_str()));
-    }
-    if let Some(a) = c.get(11) {
-        ev.fields.insert("agent".into(), Value::from(a.as_str()));
-    }
-    ev.message = format!("{} {} {} → {}", &c[5], &c[6], &c[7], &c[8]);
-    Some(ev)
+    web_logs::parse_access(line)
 }
 
-fn parse_firewall(line: &str) -> Option<Event> {
+fn parse_firewall(line: &str, year: i32) -> Option<Event> {
     // iptables/netfilter: prefixo estilo syslog + pares CHAVE=VALOR
     let c = re_syslog3164().captures(line)?;
     let msg = c[10].to_string();
@@ -527,7 +638,7 @@ fn parse_firewall(line: &str) -> Option<Event> {
     };
     let mut ev = Event::empty();
     ev.raw = line.to_string();
-    ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6]);
+    ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6], year);
     ev.source = c[7].to_string();
     ev.fields
         .insert("process".into(), Value::from(c[8].to_string()));
@@ -710,7 +821,7 @@ fn envelope_in_object(bytes: &[u8], open: usize, depth: usize) -> Option<usize> 
 }
 
 /// Zeek TSV: `#fields` header, `-` unset and `(empty)` values.
-fn parse_zeek(line: &str, header: &[String]) -> Option<Event> {
+fn parse_zeek(line: &str, header: &[String], year: i32) -> Option<Event> {
     if header.is_empty() || line.starts_with('#') {
         return None;
     }
@@ -725,7 +836,7 @@ fn parse_zeek(line: &str, header: &[String]) -> Option<Event> {
         };
         map.insert(key.clone(), v);
     }
-    let mut ev = event_from_json(map, line);
+    let mut ev = event_from_json_at(map, line, year);
     ev.raw = line.to_string();
     Some(ev)
 }
@@ -801,7 +912,7 @@ fn parse_auditd(line: &str) -> Option<Event> {
 }
 
 /// Inferência automática do formato pela amostra inicial do arquivo.
-fn detect_format(bytes: &[u8]) -> &'static str {
+pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     let trimmed = bytes
         .iter()
@@ -831,15 +942,14 @@ fn detect_format(bytes: &[u8]) -> &'static str {
         }
     }
     let mut n = 0usize;
+    let mut nginx_error = 0usize;
     let (mut json, mut s3164, mut s5424, mut apache, mut fw, mut log4j, mut logfmt, mut wildfly) =
         (0, 0, 0, 0, 0, 0, 0, 0);
     // linhas de corpo de stacktrace Java contam como evidência de log4j/wildfly
     // (arquivos com muitos stacktraces teriam poucas linhas de cabeçalho)
     let mut stack = 0usize;
-    let mut csv_hint = false;
-    let mut csv_checked = false;
     let mut w3c_hint = false;
-    for (li, line_b) in bytes.split(|&b| b == b'\n').take(60).enumerate() {
+    for line_b in bytes.split(|&b| b == b'\n').take(60) {
         let line = std::str::from_utf8(line_b).unwrap_or("").trim();
         if line.is_empty() {
             continue;
@@ -860,27 +970,15 @@ fn detect_format(bytes: &[u8]) -> &'static str {
         if line.starts_with("LEEF:") {
             return "leef";
         }
-        if !csv_checked {
-            csv_checked = true;
-            if looks_like_csv_header(line) {
-                // próxima linha precisa ter o mesmo número de vírgulas
-                csv_hint = bytes
-                    .split(|&b| b == b'\n')
-                    .nth(li + 1)
-                    .map(|l2| {
-                        l2.iter().filter(|&&b| b == b',').count() == line.matches(',').count()
-                    })
-                    .unwrap_or(false);
-                continue;
-            }
-        }
         n += 1;
         if line.starts_with('{') {
             json += 1;
         } else if re_syslog5424().is_match(line) {
             s5424 += 1;
-        } else if re_apache().is_match(line) {
+        } else if web_logs::parse_access(line).is_some() {
             apache += 1;
+        } else if web_logs::parse_error(line).is_some() {
+            nginx_error += 1;
         } else if re_log4j().is_match(line) {
             log4j += 1;
         } else if re_wildfly().is_match(line) || re_jboss().is_match(line) {
@@ -891,15 +989,15 @@ fn detect_format(bytes: &[u8]) -> &'static str {
             } else {
                 s3164 += 1;
             }
-        } else if re_logfmt().captures_iter(line).count() >= 3 {
+        } else if web_logs::parse_logfmt(line).is_some() {
             logfmt += 1;
         }
     }
     if w3c_hint {
         return "w3c";
     }
-    if csv_hint {
-        return "csv";
+    if let Some(format) = detect_delimited(bytes) {
+        return format;
     }
     if n == 0 {
         return "text";
@@ -911,6 +1009,8 @@ fn detect_format(bytes: &[u8]) -> &'static str {
         "syslog5424"
     } else if apache > half {
         "apache"
+    } else if nginx_error > half {
+        "nginx-error"
     } else if fw > half {
         "firewall"
     } else if wildfly > half || (wildfly > 0 && wildfly + stack > half) {
@@ -921,6 +1021,8 @@ fn detect_format(bytes: &[u8]) -> &'static str {
         "syslog3164"
     } else if logfmt > half {
         "logfmt"
+    } else if json + apache + nginx_error + logfmt > 0 {
+        "mixed"
     } else {
         "text"
     }
@@ -931,11 +1033,6 @@ fn re_log4j() -> &'static regex::Regex {
     RE.get_or_init(|| {
         regex::Regex::new(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d{3})\s+(\w+)\s+\[([^\]]*)\]\s+(\S+)\s+-\s+(.*)$").unwrap()
     })
-}
-
-fn re_logfmt() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r#"(\w+)=("([^"]*)"|\S+)"#).unwrap())
 }
 
 fn re_kv_key() -> &'static regex::Regex {
@@ -1058,6 +1155,40 @@ fn extract_java_body(ev: &mut Event, body: &str) {
     }
 }
 
+/// Interpret only the already-framed Java block. Existing evidence fields and
+/// byte framing are unchanged. This infallible source parser uses the strictly
+/// bounded pure parser; outer indexing/query operation checks own cancellation.
+fn enrich_java_trace(ev: &mut Event, block: &str, body_start: usize) {
+    let Ok(trace) = crate::java_stacktrace::parse(block, body_start, Default::default()) else {
+        return;
+    };
+    ev.fields.extend(trace.scalar_fields());
+}
+
+/// Rich details are request-local metadata, not an indexed Event field. Missing
+/// historical raw or an unrecognized Java log header is explicitly unavailable.
+/// Header inspection is capped at64KiB; the pure trace parser inspects at most
+/// its256KiB suffix budget. Callers retain their outer operation checks.
+pub(crate) fn java_trace_for_event(event: &Event) -> Result<Option<crate::java_stacktrace::Trace>, String> {
+    if event.raw.is_empty() { return Ok(None); }
+    let mut end = event.raw.len().min(64 << 10);
+    while !event.raw.is_char_boundary(end) { end -= 1; }
+    let inspected = &event.raw[..end];
+    let head = inspected.split('\n').next().unwrap_or("").trim_end_matches('\r');
+    let body_start = [re_log4j(), re_jboss(), re_wildfly()].into_iter()
+        .find_map(|re| re.captures(head).and_then(|captures| captures.get(5).map(|body| body.start())));
+    let Some(body_start) = body_start else {
+        if end < event.raw.len() && !inspected.contains('\n') {
+            return Err("O cabeçalho excede o limite de inspeção da estrutura Java.".into());
+        }
+        return Ok(None);
+    };
+    let trace = crate::java_stacktrace::parse(&event.raw, body_start, Default::default())
+        .map_err(|error| error.to_string())?;
+    let limited = trace.diagnostics.iter().any(|d| d.code == crate::java_stacktrace::Code::InputLimit);
+    Ok((trace.observed() || limited).then_some(trace))
+}
+
 /// WildFly/JBoss: `00:00:00,001 WARN  [br.app.Classe] (EJB default - 4) mensagem`
 /// Só tem hora — a data costuma estar no nome do arquivo (server.log.2026-06-24),
 /// resolvida pela configuração de data/hora (TsConfig).
@@ -1078,6 +1209,7 @@ fn parse_wildfly(block: &str) -> Option<Event> {
         .insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
+    enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
 }
 
@@ -1097,6 +1229,7 @@ fn parse_jboss(block: &str) -> Option<Event> {
         .insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
+    enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
 }
 
@@ -1116,48 +1249,33 @@ fn parse_log4j(block: &str) -> Option<Event> {
     ev.source = c[4].to_string();
     ev.message = c[5].to_string();
     extract_java_body(&mut ev, body);
+    enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
 }
 
 /// Logfmt (Heroku/estilo key=value): `ts=... level=info msg="..." k=v`
 fn parse_logfmt(line: &str) -> Option<Event> {
-    let kvs: Vec<_> = re_logfmt().captures_iter(line).collect();
-    if kvs.len() < 3 {
+    web_logs::parse_logfmt(line)
+}
+
+/// Only strict, self-describing single-line formats participate in fallback.
+/// Explicit text, snapshots, custom schemas and multiline framing stay intact.
+fn parse_structured_line(line: &str, year: i32) -> Option<Event> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
+            return Some(event_from_json_at(map, line, year));
+        }
         return None;
     }
-    let mut ev = Event::empty();
-    ev.raw = line.to_string();
-    for cap in kvs {
-        let key = cap[1].to_lowercase();
-        let val = cap
-            .get(3)
-            .map(|m| m.as_str())
-            .unwrap_or_else(|| cap[2].trim_matches('"'));
-        match key.as_str() {
-            "ts" | "time" | "timestamp" => {
-                ev.timestamp = parse_timestamp(val).or_else(|| {
-                    val.parse::<f64>().ok().map(|f| {
-                        if f > 1e12 {
-                            f as i64
-                        } else {
-                            (f * 1000.0) as i64
-                        }
-                    })
-                });
-            }
-            "level" | "lvl" | "severity" => ev.level = normalize_level(val),
-            "msg" | "message" => ev.message = val.to_string(),
-            "code" | "event" => ev.code = val.to_string(),
-            "host" | "source" | "app" | "service" => ev.source = val.to_string(),
-            other => {
-                ev.fields.insert(other.into(), Value::from(val));
-            }
-        }
+    if web_logs::error_candidate(trimmed) {
+        return web_logs::parse_error(line);
     }
-    if ev.message.is_empty() {
-        ev.message = line.to_string();
+    if web_logs::access_candidate(trimmed) {
+        if let Some(event) = parse_apache(line) { return Some(event); }
     }
-    Some(ev)
+    if web_logs::logfmt_candidate(trimmed) { return parse_logfmt(line); }
+    None
 }
 
 /// CEF (ArcSight): `CEF:0|Vendor|Product|Version|SignatureID|Name|Severity|extensão`
@@ -1260,8 +1378,17 @@ fn parse_leef(line: &str) -> Option<Event> {
     Some(ev)
 }
 
-/// Divide linha CSV respeitando aspas duplas com escape "".
-fn split_csv(line: &str) -> Vec<String> {
+//// Formatos tabulares com cabeçalho e o separador de cada um: CSV com vírgula,
+/// CSV com ponto e vírgula (Excel em português e outros idiomas com vírgula
+/// decimal), TSV e barra vertical.
+const DELIMITED: [(&str, char); 4] = [("csv", ','), ("csv-semicolon", ';'), ("tsv", '\t'), ("csv-pipe", '|')];
+
+pub(crate) fn delimiter_of(format: &str) -> Option<char> {
+    DELIMITED.iter().find(|(id, _)| *id == format).map(|(_, delimiter)| *delimiter)
+}
+
+/// Divide uma linha pelo separador, respeitando aspas duplas com escape "".
+fn split_delimited(line: &str, delimiter: char) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_q = false;
@@ -1280,7 +1407,7 @@ fn split_csv(line: &str) -> Vec<String> {
             }
         } else if c == '"' {
             in_q = true;
-        } else if c == ',' {
+        } else if c == delimiter {
             out.push(std::mem::take(&mut cur));
         } else {
             cur.push(c);
@@ -1290,52 +1417,207 @@ fn split_csv(line: &str) -> Vec<String> {
     out
 }
 
-/// Mapeia colunas (de cabeçalho CSV ou #Fields do W3C) para o evento.
+#[cfg(test)]
+fn split_csv(line: &str) -> Vec<String> {
+    split_delimited(line, ',')
+}
+
+/// Nome de coluna plausível num cabeçalho: texto curto com letras, que não é
+/// data, JSON nem chave=valor.
+fn plausible_column_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name.chars().count() <= 64
+        && name.chars().any(char::is_alphabetic)
+        && !name.chars().any(|c| c.is_control() || matches!(c, '{' | '}' | '[' | ']' | '=' | '"'))
+        && name.split_whitespace().count() <= 6
+        && parse_timestamp(name).is_none()
+}
+
+/// Texto tabular com cabeçalho: o separador que divide a primeira linha em
+/// nomes de coluna plausíveis e a maioria das linhas seguintes no mesmo número
+/// de valores (ou um a mais, como a mensagem sem nome das exportações do
+/// Visualizador de Eventos do Windows).
+fn detect_delimited(bytes: &[u8]) -> Option<&'static str> {
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let lines: Vec<&str> = bytes
+        .split(|&b| b == b'\n')
+        .take(60)
+        .filter_map(|line| std::str::from_utf8(line.strip_suffix(b"\r").unwrap_or(line)).ok())
+        .filter(|line| !line.trim().is_empty())
+        .take(30)
+        .collect();
+    let (header, rows) = lines.split_first()?;
+    if rows.is_empty() || header.trim_start().starts_with(['{', '[', '#']) {
+        return None;
+    }
+    let mut best: Option<(&'static str, usize)> = None;
+    for (format, delimiter) in DELIMITED {
+        let names = split_delimited(header, delimiter);
+        let minimum = if matches!(delimiter, ',' | '|') { 3 } else { 2 };
+        if names.len() < minimum || !names.iter().all(|name| plausible_column_name(name)) {
+            continue;
+        }
+        let consistent = rows
+            .iter()
+            .filter(|row| {
+                let count = split_delimited(row, delimiter).len();
+                count == names.len() || count == names.len() + 1
+            })
+            .count();
+        if consistent * 10 >= rows.len() * 8 && best.is_none_or(|(_, columns)| names.len() > columns) {
+            best = Some((format, names.len()));
+        }
+    }
+    best.map(|(format, _)| format)
+}
+
+/// Significado de um nome de coluna em fontes tabulares (CSV, TSV, IIS e
+/// planilhas), em inglês ou português.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColumnRole {
+    Timestamp,
+    Date,
+    Time,
+    Level,
+    Code,
+    Source,
+    Message,
+    Other,
+}
+
+/// Minúsculas sem acentos e com separadores uniformes ("Data/Hora" → "data hora").
+fn column_key(name: &str) -> String {
+    let folded: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            '_' | '-' | '/' | '.' | ':' => ' ',
+            other => other,
+        })
+        .collect();
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub(crate) fn column_role(name: &str) -> ColumnRole {
+    let key = column_key(name);
+    let is = |names: &[&str]| names.contains(&key.as_str());
+    if is(&[
+        "timestamp", "@timestamp", "ts", "datetime", "date time", "time stamp", "event created", "event time",
+        "eventtime", "time generated", "timegenerated", "time created", "timecreated", "created", "created at",
+        "data hora", "data e hora", "datahora", "carimbo de data hora", "momento", "registrado em", "ocorrido em",
+    ]) {
+        ColumnRole::Timestamp
+    } else if is(&["date", "data", "dia", "day"]) {
+        ColumnRole::Date
+    } else if is(&["time", "hora", "horario", "hour"]) {
+        ColumnRole::Time
+    } else if is(&[
+        "level", "severity", "lvl", "log level", "loglevel", "severity text", "severitytext", "nivel", "severidade",
+        "criticidade", "gravidade",
+    ]) {
+        ColumnRole::Level
+    } else if is(&[
+        "code", "id", "event id", "eventid", "event code", "status", "sc status", "codigo", "codigo do evento",
+        "id do evento", "identificacao do evento",
+    ]) {
+        ColumnRole::Code
+    } else if is(&[
+        "source", "provider", "logger", "service", "channel", "service name", "host name", "s ip", "c ip", "origem",
+        "fonte", "servidor", "host", "hostname", "computador", "computer", "maquina", "sistema", "servico",
+        "aplicacao", "aplicativo", "equipamento", "dispositivo",
+    ]) {
+        ColumnRole::Source
+    } else if is(&[
+        "message", "msg", "log", "body", "text", "displaymessage", "description", "details", "detail", "mensagem",
+        "descricao", "detalhes", "detalhe", "evento", "ocorrencia", "historico", "observacao", "texto", "conteudo",
+        "resumo",
+    ]) {
+        ColumnRole::Message
+    } else {
+        ColumnRole::Other
+    }
+}
+
+/// Data e hora vindas de uma coluna só ou de uma coluna de data e outra de hora.
+pub(crate) fn date_time_ms(date: Option<&str>, time: Option<&str>) -> Option<i64> {
+    match (date, time) {
+        (Some(date), Some(time)) => parse_timestamp(&format!("{date} {time}"))
+            .or_else(|| parse_timestamp(date))
+            .or_else(|| parse_timestamp(time)),
+        (Some(value), None) | (None, Some(value)) => parse_timestamp(value),
+        (None, None) => None,
+    }
+}
+
+/// Mapeia colunas nomeadas (cabeçalho CSV/TSV ou #Fields do IIS) para o evento.
+/// Valores além do cabeçalho recebem o nome da posição ("coluna 6").
 fn event_from_columns(vals: Vec<String>, header: &[String], raw: &str) -> Event {
     let mut ev = Event::empty();
     ev.raw = raw.to_string();
-    for (i, h) in header.iter().enumerate() {
-        let v = vals.get(i).map(|s| s.trim()).unwrap_or("");
+    let mut level_set = false;
+    // Resolved after every column is seen: a timestamp column wins, a date and a time are combined.
+    let (mut stamp, mut date, mut time): (Option<(String, String)>, Option<(String, String)>, Option<(String, String)>) =
+        (None, None, None);
+    let mut unnamed: Option<(String, String)> = None;
+    for (i, value) in vals.iter().enumerate() {
+        let v = value.trim();
         if v.is_empty() || v == "-" {
             continue;
         }
-        let hl = h.to_lowercase();
-        if TS_KEYS.contains(&hl.as_str()) {
-            if ev.timestamp.is_none() {
-                ev.timestamp = parse_timestamp(v).or_else(|| {
-                    v.parse::<f64>().ok().map(|f| {
-                        if f > 1e12 {
-                            f as i64
-                        } else {
-                            (f * 1000.0) as i64
-                        }
-                    })
-                });
+        let Some(name) = header.get(i).map(|h| h.trim()).filter(|h| !h.is_empty()).map(str::to_string) else {
+            // Windows Event Viewer exports leave the message column unnamed.
+            let name = format!("coluna {}", i + 1);
+            match unnamed {
+                None => unnamed = Some((name, v.to_string())),
+                Some(_) => {
+                    ev.fields.insert(name, Value::from(v));
+                }
             }
-        } else if hl == "date" {
-            // W3C: combina date + time
-            let time = header
-                .iter()
-                .position(|x| x.eq_ignore_ascii_case("time"))
-                .and_then(|p| vals.get(p))
-                .map(|s| s.trim());
-            ev.timestamp = parse_timestamp(&format!("{} {}", v, time.unwrap_or("00:00:00")));
-        } else if hl == "time" {
-            // tratado junto com date
-        } else if LEVEL_KEYS.contains(&hl.as_str()) {
-            ev.level = normalize_level(v);
-        } else if CODE_KEYS.contains(&hl.as_str()) || hl == "status" || hl == "sc-status" {
-            ev.code = v.to_string();
-        } else if SOURCE_KEYS.contains(&hl.as_str()) || hl == "s-ip" || hl == "c-ip" {
-            if ev.source.is_empty() {
-                ev.source = v.to_string();
-            } else {
-                ev.fields.insert(h.clone(), Value::from(v));
+            continue;
+        };
+        match column_role(&name) {
+            ColumnRole::Timestamp if stamp.is_none() => stamp = Some((name, v.to_string())),
+            ColumnRole::Date if date.is_none() => date = Some((name, v.to_string())),
+            ColumnRole::Time if time.is_none() => time = Some((name, v.to_string())),
+            ColumnRole::Level if !level_set => {
+                ev.level = normalize_level(v);
+                level_set = true;
             }
-        } else if MSG_KEYS.contains(&hl.as_str()) {
-            ev.message = v.to_string();
+            ColumnRole::Code if ev.code.is_empty() => ev.code = v.to_string(),
+            ColumnRole::Source if ev.source.is_empty() => ev.source = v.to_string(),
+            ColumnRole::Message if ev.message.is_empty() => ev.message = v.to_string(),
+            _ => {
+                ev.fields.insert(name, Value::from(v));
+            }
+        }
+    }
+    let text = |pair: &Option<(String, String)>| pair.as_ref().map(|(_, v)| v.clone());
+    ev.timestamp = text(&stamp).and_then(|v| parse_timestamp(&v));
+    let stamp_used = ev.timestamp.is_some();
+    let parts_used = !stamp_used && {
+        ev.timestamp = date_time_ms(text(&date).as_deref(), text(&time).as_deref());
+        ev.timestamp.is_some()
+    };
+    // Columns that did not become the event time remain available as fields.
+    for (used, pair) in [(stamp_used, stamp), (parts_used, date), (parts_used, time)] {
+        if let (false, Some((name, value))) = (used, pair) {
+            ev.fields.insert(name, Value::from(value));
+        }
+    }
+    if let Some((name, value)) = unnamed {
+        if ev.message.is_empty() {
+            ev.message = value;
         } else {
-            ev.fields.insert(h.clone(), Value::from(v));
+            ev.fields.insert(name, Value::from(value));
         }
     }
     if ev.message.is_empty() {
@@ -1352,25 +1634,16 @@ fn parse_w3c(line: &str, header: &[String]) -> Option<Event> {
     Some(event_from_columns(vals, header, line))
 }
 
-fn parse_csv_line(line: &str, header: &[String]) -> Option<Event> {
+fn parse_delimited(line: &str, header: &[String], delimiter: char) -> Option<Event> {
     if header.is_empty() {
         return None;
     }
-    Some(event_from_columns(split_csv(line), header, line))
+    Some(event_from_columns(split_delimited(line, delimiter), header, line))
 }
 
-/// Parece um cabeçalho CSV? (≥3 colunas, tokens simples, sem espaços longos)
-fn looks_like_csv_header(line: &str) -> bool {
-    let cols: Vec<&str> = line.split(',').collect();
-    cols.len() >= 3
-        && cols.iter().all(|c| {
-            let c = c.trim();
-            !c.is_empty()
-                && c.len() <= 32
-                && c.chars()
-                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ' '))
-                && c.chars().filter(|ch| ch.is_whitespace()).count() <= 2
-        })
+#[cfg(test)]
+fn parse_csv_line(line: &str, header: &[String]) -> Option<Event> {
+    parse_delimited(line, header, ',')
 }
 
 // ==========================================================================
@@ -1382,7 +1655,7 @@ fn looks_like_csv_header(line: &str) -> bool {
 /// `regex`: opcional, extrai o texto da data (2 grupos = data + hora).
 /// `format`: padrão chrono, "epoch_ms" ou "epoch_s".
 /// `complement`: data literal ("2026-06-24") quando o formato só tem hora.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct TsConfig {
     #[serde(default)]
     pub timezone_offset_minutes: Option<i32>,
@@ -1407,7 +1680,7 @@ pub struct TsConfig {
 }
 
 /// Uma alternativa de extração de data/hora (regex + montagem opcional).
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct TsRule {
     #[serde(default)]
     pub regex: Option<String>,
@@ -1416,7 +1689,10 @@ pub struct TsRule {
 }
 
 /// TsConfig com as regexes já compiladas.
+#[derive(Clone)]
 pub struct CompiledTsConfig {
+    /// Pin an omitted date once, rather than changing semantics across midnight.
+    pub reference_date: chrono::NaiveDate,
     pub timezone_offset_minutes: Option<i32>,
     pub clock_adjustment_ms: i64,
     pub sources: Vec<String>,
@@ -1424,6 +1700,27 @@ pub struct CompiledTsConfig {
     pub complement: Option<String>,
     /// (regex compilada, template) por regra, na ordem do OU
     pub rules: Vec<(Option<regex::Regex>, Option<String>)>,
+}
+
+impl CompiledTsConfig {
+    /// Stable cache fingerprint shared by metadata and columnar stores.
+    pub(crate) fn signature(&self) -> String {
+        let rules: Vec<_> = self.rules.iter()
+            .map(|(re, template)| (re.as_ref().map(|r| r.as_str()), template.as_ref())).collect();
+        let fallback_date = self.complement.as_deref()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
+            .is_none()
+            && !self.format.starts_with("epoch")
+            && chrono::format::StrftimeItems::new(&self.format).any(|item| {
+                use chrono::format::{Fixed, Item, Numeric};
+                matches!(item, Item::Numeric(Numeric::Hour | Numeric::Hour12 | Numeric::Minute | Numeric::Second | Numeric::Timestamp, _)
+                    | Item::Fixed(Fixed::RFC2822 | Fixed::RFC3339))
+            });
+        let mut signature = format!("{:?}|{}|{:?}|{:?}|{}|{:?}", self.sources, self.format,
+            self.complement, self.timezone_offset_minutes, self.clock_adjustment_ms, rules);
+        if fallback_date { signature.push_str(&format!("|reference-date:{}", self.reference_date)); }
+        signature
+    }
 }
 
 impl TsConfig {
@@ -1453,6 +1750,7 @@ impl TsConfig {
             rules.push((re, r.template));
         }
         Ok(CompiledTsConfig {
+            reference_date: chrono::Utc::now().date_naive(),
             timezone_offset_minutes: self.timezone_offset_minutes,
             clock_adjustment_ms: self.clock_adjustment_ms,
             sources: self.sources.clone(),
@@ -1482,12 +1780,17 @@ pub struct DerivedField {
     pub name: String,
     pub source: String,
     pub rules: Vec<DerivedRule>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<crate::field_transform::Step>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup: Option<crate::reference_lookup::Definition>,
 }
 
 /// Formato de leitura tolerante ao legado (regra única na raiz do objeto).
 #[derive(serde::Deserialize)]
 pub struct DerivedFieldCompat {
     pub name: String,
+    #[serde(default)]
     pub source: String,
     #[serde(default)]
     pub pattern: String,
@@ -1497,6 +1800,10 @@ pub struct DerivedFieldCompat {
     pub filter: Option<crate::query::Filter>,
     #[serde(default)]
     pub rules: Vec<DerivedRule>,
+    #[serde(default)]
+    pub steps: Vec<crate::field_transform::Step>,
+    #[serde(default)]
+    pub lookup: Option<crate::reference_lookup::Definition>,
 }
 
 impl DerivedFieldCompat {
@@ -1513,54 +1820,344 @@ impl DerivedFieldCompat {
             name: self.name,
             source: self.source,
             rules,
+            steps: self.steps,
+            lookup: self.lookup,
         }
     }
 }
 
+#[derive(Clone)]
 pub struct CompiledRule {
     pub re: regex::Regex,
     pub template: Option<String>,
     pub filter: Option<crate::query::Filter>,
+    /// Frozen condition, including any Case-local detection/threat catalog.
+    /// Hydration must never re-resolve a raw filter on a Rayon/background thread.
+    prepared_filter: Option<std::sync::Arc<crate::query::PreparedFilter>>,
+    pub(crate) filter_security_signature: Option<String>,
+}
+impl CompiledRule {
+    pub(crate) fn new(re: regex::Regex, template: Option<String>, filter: Option<crate::query::Filter>) -> Result<Self, String> {
+        let (prepared_filter, filter_security_signature) = match &filter {
+            Some(filter) => {
+                crate::operations::check()?;
+                crate::workspace::validate(std::slice::from_ref(filter))?;
+                let prepared = crate::query::prepare(std::slice::from_ref(filter)).pop().ok_or("Condição derivada não compilada.")?;
+                crate::operations::check()?;
+                (Some(std::sync::Arc::new(prepared)), Some(crate::detections::fingerprint()))
+            }
+            None => (None, None),
+        };
+        Ok(Self { re, template, filter, prepared_filter, filter_security_signature })
+    }
+    pub(crate) fn filter_reads_id(&self) -> bool {
+        let Some(filter) = &self.filter else { return false; };
+        // Catalog detections may themselves read id. Keep such fields on the
+        // authoritative event path rather than bake segment-relative ids.
+        if filter.column == "id" || filter.op == "detection" { return true; }
+        if filter.op != "query" { return false; }
+        let Some(expr) = self.prepared_filter.as_ref().and_then(|prepared| prepared.expr.as_ref()) else { return true; };
+        let mut names = Vec::new(); expr.field_names(&mut names);
+        names.iter().any(|name| matches!(name.as_str(), "id" | "deteccao" | "detecção" | "detection"))
+    }
 }
 
+#[derive(Clone)]
 pub struct CompiledDerived {
     pub name: String,
     pub source: String,
     pub rules: Vec<CompiledRule>,
+    pub steps: Vec<crate::field_transform::Step>,
+    pub(crate) lookup: Option<crate::reference_lookup::Compiled>,
 }
 
 /// Aplica os campos derivados a um evento. As regras de cada campo são
 /// tentadas em ordem (OU): a primeira que extrai valor não vazio vence.
 pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
+    const BUDGET: usize = 2 << 20;
+    for (name, original) in std::mem::take(&mut ev.derived_originals) {
+        match original {
+            crate::model::DerivedOriginal::Missing => { ev.fields.remove(&name); }
+            crate::model::DerivedOriginal::Present(value) => { ev.fields.insert(name, value); }
+        }
+    }
+    ev.derived_diagnostics.clear();
+    let mut remaining = BUDGET;
+    fn diagnostic(ev: &mut Event, field: &str, code: &str, message: String, warning: bool) {
+        if ev.derived_diagnostics.len() < 31 {
+            ev.derived_diagnostics.push(crate::model::DerivedDiagnostic {
+                field: field.chars().take(128).collect(), code: code.into(), message, warning,
+            });
+        } else if ev.derived_diagnostics.len() == 31 {
+            ev.derived_diagnostics.push(crate::model::DerivedDiagnostic {
+                field: String::new(), code: "diagnostic_limit".into(), message: "Outros diagnósticos de campos foram omitidos neste registro.".into(), warning: true,
+            });
+        }
+    }
     for d in derived {
-        let Some(val) = ev.col_str(&d.source) else {
+        if let Some(lookup) = &d.lookup {
+            if !crate::field_transform::valid_typed_target(&d.name) {
+                diagnostic(ev, &d.name, "reserved_target", crate::field_transform::TARGET_NAME_ERROR.into(), false);
+                continue;
+            }
+            let value = match lookup.evaluate(ev) {
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
+                Err(error) => { diagnostic(ev, &d.name, "lookup_error", error, false); continue; }
+            };
+            let limits = crate::field_transform::Limits { output_bytes: (1 << 20).min(remaining), ..Default::default() };
+            let fields = match crate::field_transform::expanded_fields(&d.name, &value, limits, 512) {
+                Ok(fields) => fields,
+                Err(error) => { diagnostic(ev, &d.name, "lookup_error", error.to_string(), false); continue; }
+            };
+            if fields.keys().any(|name| ev.fields.contains_key(name)) {
+                diagnostic(ev, &d.name, "target_conflict", "O nome do campo consultado ou de um subcampo já existe no registro original.".into(), false);
+                continue;
+            }
+            let bytes = fields.iter().try_fold(0usize, |size, (key, value)| {
+                Ok::<_, crate::field_transform::Error>(size.saturating_add(key.len().saturating_mul(2)).saturating_add(crate::field_transform::payload_bytes(value, remaining)?).saturating_add(32))
+            });
+            let bytes = match bytes {
+                Ok(bytes) if bytes <= remaining => bytes,
+                _ => { diagnostic(ev, &d.name, "lookup_error", crate::field_transform::Error::OutputLimit.to_string(), false); continue; }
+            };
+            remaining -= bytes;
+            for name in fields.keys() { ev.derived_originals.insert(name.clone(), crate::model::DerivedOriginal::Missing); }
+            ev.fields.extend(fields);
+            continue;
+        }
+        if !d.steps.is_empty() {
+            if !crate::field_transform::valid_typed_target(&d.name) {
+                diagnostic(ev, &d.name, "reserved_target", crate::field_transform::TARGET_NAME_ERROR.into(), false);
+                continue;
+            }
+            let limits = crate::field_transform::Limits { output_bytes: (512 << 10).min(remaining), ..Default::default() };
+            let canonical = matches!(d.source.as_str(), "id" | "event_ref" | "timestamp" | "source" | "level" | "code" | "name" | "description" | "message" | "raw");
+            let source = match (!canonical).then(|| ev.fields.get(&d.source)).flatten() {
+                Some(value) => std::borrow::Cow::Borrowed(value),
+                None => match ev.col_ref(&d.source) {
+                    Some(value) => {
+                        if value.len() > limits.input_bytes {
+                            diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::InputLimit.to_string(), false);
+                            continue;
+                        }
+                        std::borrow::Cow::Owned(Value::String(value.into_owned()))
+                    }
+                    None => continue,
+                },
+            };
+            // Validate before regex stringification or capture expansion. A
+            // structured source can otherwise allocate before pipeline limits.
+            let source = match crate::field_transform::transform(source.as_ref(), &[], limits) {
+                Ok(output) => output.value,
+                Err(error) => { diagnostic(ev, &d.name, "transform_error", error.to_string(), false); continue; }
+            };
+            let extracted;
+            let input = if d.rules.is_empty() { &source } else {
+                let value = source.as_str().map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|| std::borrow::Cow::Owned(source.to_string()));
+                let found = d.rules.iter().filter(|r| r.prepared_filter.as_ref().is_none_or(|f| crate::query::matches(ev, f))).find_map(|r| {
+                    let captures = r.re.captures(&value)?;
+                    let output = match &r.template {
+                        Some(template) if !template.is_empty() => {
+                            match crate::field_transform::expand_capture(&captures, template, limits.output_bytes) {
+                                Ok(value) => value,
+                                Err(error) => return Some(Err(error)),
+                            }
+                        }
+                        _ => captures.get(1).or_else(|| captures.get(0)).map(|m| m.as_str().to_owned()).unwrap_or_default(),
+                    };
+                    (!output.is_empty()).then_some(Ok(Value::String(output)))
+                });
+                let Some(value) = found else { continue };
+                extracted = match value {
+                    Ok(value) => value,
+                    Err(error) => { diagnostic(ev, &d.name, "transform_error", error.to_string(), false); continue; }
+                }; &extracted
+            };
+            let result = crate::field_transform::transform(input, &d.steps, limits).and_then(|output| {
+                let expanded = crate::field_transform::expanded_fields(&d.name, &output.value,
+                    crate::field_transform::Limits { output_bytes: (1 << 20).min(remaining), ..limits }, 512)?;
+                Ok((expanded, output.notices))
+            });
+            match result {
+                Ok((fields, notices)) => {
+                    // A new transform creates another field; a raw same-named
+                    // field or child must never be silently overwritten.
+                    if fields.keys().any(|name| ev.fields.contains_key(name)) {
+                        diagnostic(ev, &d.name, "target_conflict", "O nome do campo transformado ou de um subcampo já existe no registro original.".into(), false);
+                        continue;
+                    }
+                    let bytes = fields.iter().try_fold(0usize, |size, (key, value)| {
+                        Ok::<_, crate::field_transform::Error>(size.saturating_add(key.len().saturating_mul(2)).saturating_add(crate::field_transform::payload_bytes(value, remaining)?).saturating_add(32))
+                    });
+                    let bytes = match bytes {
+                        Ok(bytes) if bytes <= remaining => bytes,
+                        _ => { diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::OutputLimit.to_string(), false); continue; }
+                    };
+                    remaining -= bytes;
+                    for name in fields.keys() { ev.derived_originals.insert(name.clone(), crate::model::DerivedOriginal::Missing); }
+                    ev.fields.extend(fields);
+                    for notice in notices { diagnostic(ev, &d.name, notice, "Payload JWT decodificado. A assinatura e as declarações não foram verificadas.".into(), true); }
+                }
+                Err(error) => diagnostic(ev, &d.name, "transform_error", error.to_string(), false),
+            }
+            continue;
+        }
+        let Some(val) = ev.col_ref(&d.source) else {
             continue;
         }; // owned: liberado para inserir o campo
         for r in &d.rules {
-            if let Some(f) = &r.filter {
-                if !crate::query::matches_filter(ev, f) {
+            if let Some(f) = &r.prepared_filter {
+                if !crate::query::matches(ev, f) {
                     continue; // condição não atendida: tenta a próxima regra
                 }
             }
             if let Some(cap) = r.re.captures(&val) {
                 let extracted = match &r.template {
                     Some(t) if !t.is_empty() => {
-                        let mut out = String::new();
-                        cap.expand(t, &mut out);
-                        out
+                        match crate::field_transform::expand_capture(&cap, t, remaining) {
+                            Ok(value) => value,
+                            Err(error) => { diagnostic(ev, &d.name, "transform_error", error.to_string(), false); break; }
+                        }
                     }
-                    _ => cap
-                        .get(1)
-                        .or_else(|| cap.get(0))
-                        .map(|m| m.as_str().to_string())
-                        .unwrap_or_default(),
+                    _ => {
+                        let value = cap.get(1).or_else(|| cap.get(0));
+                        if value.is_some_and(|m| m.len() > remaining) {
+                            diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::OutputLimit.to_string(), false);
+                            break;
+                        }
+                        value.map(|m| m.as_str().to_owned()).unwrap_or_default()
+                    },
                 };
                 if !extracted.is_empty() {
+                    let previous = if ev.derived_originals.contains_key(&d.name) { None } else { ev.fields.get(&d.name) };
+                    let bytes = previous.map(|value| crate::field_transform::payload_bytes(value, remaining)).transpose()
+                        .map(|n| n.unwrap_or(0).saturating_add(extracted.len()).saturating_add(d.name.len().saturating_mul(2)).saturating_add(32));
+                    let bytes = match bytes {
+                        Ok(bytes) if bytes <= remaining => bytes,
+                        _ => { diagnostic(ev, &d.name, "transform_error", crate::field_transform::Error::OutputLimit.to_string(), false); break; }
+                    };
+                    let original = previous.cloned().map(crate::model::DerivedOriginal::Present).unwrap_or(crate::model::DerivedOriginal::Missing);
+                    ev.derived_originals.entry(d.name.clone()).or_insert(original);
+                    remaining -= bytes;
                     ev.fields.insert(d.name.clone(), Value::from(extracted));
                     break;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod derived_transform_tests {
+    use super::*;
+    use crate::field_transform::Step;
+    use serde_json::json;
+    fn definition(name: &str, source: &str, steps: Vec<Step>) -> CompiledDerived {
+        CompiledDerived { name: name.into(), source: source.into(), rules: Vec::new(), steps, lookup: None }
+    }
+    #[test]
+    fn transformed_parent_and_children_keep_types_and_query_visibility() {
+        let mut event = Event::empty();
+        event.fields.insert("encoded".into(), json!("eyJjb2RlIjo1MDMsIm9rIjpmYWxzZSwiZW1wdHkiOiIifQ=="));
+        let original = event.fields.clone();
+        apply_derived(&mut event, &[definition("decoded", "encoded", vec![Step::Base64Decode, Step::ParseJson])]);
+        assert_eq!(event.fields["encoded"], original["encoded"]);
+        assert_eq!(event.fields["decoded.code"], 503);
+        assert_eq!(event.fields["decoded.ok"], false);
+        assert_eq!(event.fields["decoded.empty"], "");
+        assert!(event.fields["decoded"].is_object());
+        let filter: crate::query::Filter = serde_json::from_value(json!({"column":"decoded.code","op":"gte","value":"500"})).unwrap();
+        assert!(crate::query::matches_filter(&event, &filter));
+        assert!(event.derived_diagnostics.is_empty());
+    }
+    #[test]
+    fn transform_failure_keeps_original_and_other_fields_queryable() {
+        let mut event = Event::empty();
+        event.message = "visible original".into();
+        event.fields.insert("token".into(), json!("invalid-secret"));
+        event.fields.insert("path".into(), json!("%2Fapi"));
+        apply_derived(&mut event, &[
+            definition("decoded", "token", vec![Step::Base64Decode]),
+            definition("url", "path", vec![Step::UrlDecode]),
+        ]);
+        assert_eq!(event.message, "visible original");
+        assert_eq!(event.fields["token"], "invalid-secret");
+        assert!(!event.fields.contains_key("decoded"));
+        assert_eq!(event.fields["url"], "/api");
+        assert_eq!(event.derived_diagnostics.len(), 1);
+        assert!(!event.derived_diagnostics[0].message.contains("secret"));
+    }
+    #[test]
+    fn transform_children_never_overwrite_an_original_field() {
+        let mut event = Event::empty();
+        event.fields.insert("json".into(), json!("{\"code\":503}"));
+        event.fields.insert("decoded.code".into(), json!(200));
+        apply_derived(&mut event, &[definition("decoded", "json", vec![Step::ParseJson])]);
+        assert_eq!(event.fields["decoded.code"], 200);
+        assert!(!event.fields.contains_key("decoded"), "collision rejects the entire field, not just one child");
+        assert_eq!(event.derived_diagnostics[0].code, "target_conflict");
+    }
+    #[test]
+    fn regex_then_transform_preserves_existing_extraction_order() {
+        let mut event = Event::empty(); event.message = "value=%2Fapi".into();
+        let mut field = definition("decoded", "message", vec![Step::UrlDecode]);
+        field.rules.push(CompiledRule::new(regex::Regex::new("value=(.*)").unwrap(), None, None).unwrap());
+        apply_derived(&mut event, &[field]);
+        assert_eq!(event.fields["decoded"], "/api");
+    }
+    #[test]
+    fn transform_limits_and_diagnostics_are_bounded_per_record() {
+        let mut event = Event::empty(); event.message = "x".repeat((256 << 10) + 1);
+        let fields = (0..64).map(|n| definition(&format!("decoded{n}"), "message", vec![Step::Base64Decode])).collect::<Vec<_>>();
+        apply_derived(&mut event, &fields);
+        assert!(event.fields.is_empty());
+        assert_eq!(event.derived_diagnostics.len(), 32);
+        assert_eq!(event.derived_diagnostics.last().unwrap().code, "diagnostic_limit");
+        assert_eq!(event.message.len(), (256 << 10) + 1);
+    }
+    #[test]
+    fn transform_source_uses_canonical_columns_before_raw_aliases() {
+        let mut event = Event::empty(); event.level = "Erro".into(); event.id = 42;
+        event.fields.insert("level".into(), json!("ERROR"));
+        event.fields.insert("id".into(), json!("raw-id"));
+        event.fields.insert("timestamp".into(), json!("raw-time"));
+        apply_derived(&mut event, &[
+            definition("level_copy", "level", vec![Step::Base64Encode, Step::Base64Decode]),
+            definition("id_copy", "id", vec![Step::Base64Encode, Step::Base64Decode]),
+            definition("time_copy", "timestamp", vec![Step::Base64Encode, Step::Base64Decode]),
+        ]);
+        assert_eq!(event.fields["level_copy"], "Erro");
+        assert_eq!(event.fields["id_copy"], "42");
+        assert!(!event.fields.contains_key("time_copy"));
+        apply_derived(&mut event, &[definition("LEVEL", "id", vec![Step::Base64Encode])]);
+        assert!(!event.fields.contains_key("LEVEL"));
+        assert_eq!(event.derived_diagnostics[0].code, "reserved_target");
+    }
+    #[test]
+    fn case_overlay_recomputes_from_provenance_and_empty_config_restores_original() {
+        let mut original = Event::empty(); original.fields.insert("input".into(), json!("%2Fapi"));
+        original.fields.insert("native_null".into(), Value::Null);
+        let first = definition("decoded", "input", vec![Step::UrlDecode]);
+        let mut captured = original.clone(); apply_derived(&mut captured, &[first.clone()]);
+        let serialized = serde_json::to_string(&captured).unwrap();
+        let evidence: Event = serde_json::from_str(&serialized).unwrap();
+        let mut overlay = evidence.clone(); apply_derived(&mut overlay, &[first]);
+        assert_eq!(overlay.fields["decoded"], "/api"); assert!(overlay.derived_diagnostics.is_empty());
+        let mut second = definition("native_null", "input", Vec::new());
+        second.rules.push(CompiledRule::new(regex::Regex::new("(.*)").unwrap(), Some("replacement".into()), None).unwrap());
+        apply_derived(&mut overlay, &[second]);
+        assert!(!overlay.fields.contains_key("decoded"));
+        assert_eq!(overlay.fields["native_null"], "replacement");
+        let mut restored: Event = serde_json::from_str(&serde_json::to_string(&overlay).unwrap()).unwrap();
+        apply_derived(&mut restored, &[]);
+        assert_eq!(restored.fields, original.fields);
+        assert!(restored.derived_originals.is_empty());
+        assert_eq!(serde_json::to_string(&evidence).unwrap(), serialized, "saved evidence was never changed");
+        let mut legacy = original.clone(); legacy.fields.insert("historical_unmarked".into(), json!("keep"));
+        apply_derived(&mut legacy, &[]);
+        assert_eq!(legacy.fields["historical_unmarked"], "keep", "never guess that an unmarked captured field was generated");
     }
 }
 
@@ -1571,25 +2168,101 @@ pub enum CustomParse {
     Delimited { sep: char, fields: Vec<String> },
 }
 
+/// Calendar-sensitive parsers infer their year once per source load. Local
+/// timezone configuration remains part of the cache identity; the mapped
+/// source and system timezone must stay stable while a load is in progress.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct ParserCalendar {
+    pub year: i32,
+    pub timezone: String,
+}
+impl ParserCalendar {
+    pub(crate) fn current() -> Result<Self, String> {
+        Ok(Self { year: chrono::Utc::now().year(), timezone: Self::timezone_signature()? })
+    }
+    fn timezone_signature() -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"timezone-configuration-v1");
+        hash.update(chrono::Local::now().offset().to_string());
+        let tz = std::env::var_os("TZ").unwrap_or_default();
+        hash.update(tz.to_string_lossy().as_bytes());
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            let mut paths = vec![std::path::PathBuf::from("/etc/localtime")];
+            let name = tz.to_string_lossy();
+            let name = name.trim_start_matches(':');
+            let tzdir = std::env::var_os("TZDIR");
+            if let Some(dir) = &tzdir { hash.update(dir.to_string_lossy().as_bytes()); }
+            if !name.is_empty() {
+                if std::path::Path::new(name).is_absolute() { paths.push(name.into()); }
+                else {
+                    if let Some(dir) = tzdir { paths.push(std::path::PathBuf::from(dir).join(name)); }
+                    for dir in ["/usr/share/zoneinfo", "/share/zoneinfo", "/etc/zoneinfo"] { paths.push(std::path::Path::new(dir).join(name)); }
+                }
+            }
+            for path in paths {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    hash.update(path.to_string_lossy().as_bytes()); hash.update(bytes);
+                }
+            }
+            // The relevant TZif bytes are hashed above. Also include the tzdb
+            // version header when the distribution makes it available.
+            if let Ok(file) = std::fs::File::open("/usr/share/zoneinfo/tzdata.zi") {
+                let mut version = Vec::new(); file.take(1024).read_to_end(&mut version).map_err(|e| e.to_string())?;
+                hash.update(version.split(|&b| b == b'\n').next().unwrap_or_default());
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Time::{GetDynamicTimeZoneInformation, DYNAMIC_TIME_ZONE_INFORMATION, TIME_ZONE_ID_INVALID};
+            let mut zone = DYNAMIC_TIME_ZONE_INFORMATION::default();
+            if unsafe { GetDynamicTimeZoneInformation(&mut zone) } == TIME_ZONE_ID_INVALID {
+                return Err("Não foi possível identificar a configuração de fuso horário do Windows.".into());
+            }
+            // Includes dynamic zone key, enabled/disabled DST and current rules.
+            // This is not a hash of the entire historical Windows rule database.
+            hash.update(format!("{zone:?}"));
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    }
+    pub(crate) fn validate_timezone(&self) -> Result<(), String> {
+        if self.timezone != Self::timezone_signature()? {
+            return Err("O fuso horário mudou durante a indexação. Reabra a fonte para preservar horários consistentes.".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct FilePart {
     pub path: String,
+    /// Actual immutable input backing the mapping (display paths may be virtual).
+    pub physical_path: String,
+    pub physical_file_id: Option<(u64, u64)>,
+    pub(crate) calendar: ParserCalendar,
+    pub(crate) event_identity: Option<String>,
+    /// Complete raw source/parser/calendar identity, fixed before publication.
+    pub(crate) metadata_identity: String,
+    /// Protects a canonical expanded file from another process's pruning.
+    pub(crate) canonical_lease: Option<std::sync::Arc<std::fs::File>>,
     pub file_name: String,
     pub format: String,
     pub custom: Option<CustomParse>,
     pub ts_config: Option<CompiledTsConfig>,
     pub header: Vec<String>,
-    pub mmap: memmap2::Mmap,
+    /// Shared so the query engine can read lines while it builds its store.
+    pub mmap: std::sync::Arc<memmap2::Mmap>,
     pub base: u64,
     pub identity: String,
 }
 
 pub struct FileIndex {
     pub parts: Vec<FilePart>,
-    pub lines: Vec<LineMeta>,
+    pub lines: std::sync::Arc<crate::metadata_store::LineStore>,
     pub columns: Vec<String>,
-    pub time_order: std::sync::OnceLock<Vec<usize>>,
-    /// Optional persistent search/column store for this exact source generation.
-    pub big_data: Option<std::sync::Arc<crate::big_data::BigDataIndex>>,
+    pub time_order: std::sync::Arc<std::sync::OnceLock<Vec<usize>>>,
 }
 
 // Single-source configuration remains available to the existing format editor.
@@ -1606,34 +2279,32 @@ impl std::ops::DerefMut for FileIndex {
 }
 impl FileIndex {
     pub fn part_at(&self, i: usize) -> &FilePart {
-        let offset = self.lines[i].offset;
+        let offset = self.lines.at(i).offset;
         &self.parts[self
             .parts
             .partition_point(|p| p.base <= offset)
             .saturating_sub(1)]
     }
-    pub fn append(&mut self, mut other: FileIndex) {
-        // Row positions and the corpus fingerprint change when sources are joined.
-        self.big_data = None;
-        let base = self
-            .parts
-            .last()
-            .map(|p| p.base + p.mmap.len() as u64 + 1)
-            .unwrap_or(0);
-        for p in &mut other.parts {
-            p.base += base;
-        }
-        for m in &mut other.lines {
-            m.offset += base;
-        }
+    pub fn append(&mut self, mut other: FileIndex) -> Result<(), String> {
+        let base = self.parts.last().map(|p| p.base.checked_add(p.mmap.len() as u64).and_then(|n| n.checked_add(1)).ok_or("Posição de fonte excedida."))
+            .transpose()?.unwrap_or(0);
+        let bases = other.parts.iter().map(|p| {
+            let relocated = p.base.checked_add(base).ok_or("Posição de fonte excedida.")?;
+            relocated.checked_add(p.mmap.len() as u64).ok_or("Tamanho de fonte excedido.")?;
+            Ok(relocated)
+        }).collect::<Result<Vec<_>, &str>>()?;
+        // Build cheap immutable views before changing either source. This also
+        // checks all row/offset arithmetic before a staged import can publish.
+        let mut lines = (*self.lines).clone();
+        lines.append_relocated(&other.lines, base)?;
+        for (part, relocated) in other.parts.iter_mut().zip(bases) { part.base = relocated; }
         self.parts.append(&mut other.parts);
-        self.lines.append(&mut other.lines);
+        self.lines = std::sync::Arc::new(lines);
         for c in other.columns {
-            if !self.columns.contains(&c) {
-                self.columns.push(c);
-            }
+            if !self.columns.contains(&c) { self.columns.push(c); }
         }
-        self.time_order.take();
+        self.time_order = std::sync::Arc::new(std::sync::OnceLock::new());
+        Ok(())
     }
     pub fn bytes_len(&self) -> u64 {
         self.parts.iter().map(|p| p.mmap.len() as u64).sum()
@@ -1641,14 +2312,50 @@ impl FileIndex {
     pub fn ordered(&self) -> &[usize] {
         self.time_order.get_or_init(|| {
             let mut order: Vec<usize> = (0..self.lines.len()).collect();
-            order.sort_unstable_by_key(|&i| (self.lines[i].ts, i));
+            order.sort_unstable_by_key(|&i| (self.lines.at(i).ts, i));
             order
         })
     }
 }
 
+/// Identity of the opened file object, distinct from a reusable path. This
+/// catches atomic replacement even if byte length and modification time match.
+#[cfg(unix)]
+pub(crate) fn file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata().ok()?; Some((m.dev(), m.ino()))
+}
+#[cfg(windows)]
+pub(crate) fn file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }.ok()?;
+    Some((u64::from(info.dwVolumeSerialNumber), (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)))
+}
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn file_identity(_file: &std::fs::File) -> Option<(u64, u64)> { None }
+
+pub(crate) fn validate_source(part: &FilePart) -> Result<(), String> {
+    crate::operations::check()?;
+    let file = crate::case_archive_format::open_regular(std::path::Path::new(&part.physical_path)).map_err(|e| format!("Fonte indisponível: {e}"))?;
+    let metadata = file.metadata().map_err(|e| format!("Fonte indisponível: {e}"))?;
+    part.calendar.validate_timezone()?;
+    crate::workspace::validate_canonical_origin(std::path::Path::new(&part.physical_path))?;
+    // Reject changes observed before touching the mapping. This is not an
+    // atomic snapshot: external writers must not modify/truncate the backing
+    // file during use, including between this guard and subsequent mmap reads.
+    if metadata.len() != part.mmap.len() as u64
+        || part.physical_file_id.is_some_and(|id| file_identity(&file) != Some(id))
+        || crate::index_cache::identity(&part.physical_path, &part.mmap) != part.identity {
+        return Err("A fonte foi alterada durante a preparação. Reabra o arquivo para indexar uma versão consistente; checkpoints anteriores permanecem separados.".into());
+    }
+    Ok(())
+}
+
 pub fn line_bytes(idx: &FileIndex, i: usize) -> &[u8] {
-    let m = &idx.lines[i];
+    let m = &idx.lines.at(i);
     let part = idx.part_at(i);
     let start = (m.offset - part.base) as usize;
     let end = (start + m.len as usize).min(part.mmap.len());
@@ -1662,7 +2369,11 @@ fn file_name_of(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+#[cfg(test)]
 fn parse_with_format(s: &str, fmt: &str, complement: Option<&str>) -> Option<i64> {
+    parse_with_format_at(s, fmt, complement, chrono::Utc::now().date_naive())
+}
+fn parse_with_format_at(s: &str, fmt: &str, complement: Option<&str>, reference_date: chrono::NaiveDate) -> Option<i64> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -1693,7 +2404,7 @@ fn parse_with_format(s: &str, fmt: &str, complement: Option<&str>) -> Option<i64
         if let Ok(t) = chrono::NaiveTime::parse_from_str(cand, fmt) {
             let date = complement
                 .and_then(|c| chrono::NaiveDate::parse_from_str(c.trim(), "%Y-%m-%d").ok())
-                .unwrap_or_else(|| chrono::Utc::now().date_naive());
+                .unwrap_or(reference_date);
             return Some(naive_to_ms(date.and_time(t)));
         }
     }
@@ -1739,7 +2450,7 @@ fn ts_from_joined(joined: &str, cc: &CompiledTsConfig) -> Option<i64> {
             },
             None => joined.trim().to_string(),
         };
-        if let Some(mut ts) = parse_with_format(&candidate, &cc.format, cc.complement.as_deref()) {
+        if let Some(mut ts) = parse_with_format_at(&candidate, &cc.format, cc.complement.as_deref(), cc.reference_date) {
             if let Some(minutes) = cc.timezone_offset_minutes {
                 if !cc.format.contains("%z")
                     && !cc.format.contains("%:z")
@@ -1808,29 +2519,44 @@ pub fn retimestamp_index(
     idx: &mut FileIndex,
     progress: Option<&(dyn Fn(usize, usize) + Sync)>,
 ) -> Result<(), String> {
+    for part in &idx.parts { validate_source(part)?; }
     let total = idx.lines.len();
-    let mut timestamps = Vec::with_capacity(total);
-    for i in 0..total {
-        if i % 2048 == 0 {
-            crate::operations::check()?;
-            if let Some(cb) = progress {
-                cb(i, total);
-            }
+    let mut timestamps = crate::metadata_store::TimestampWriter::new()?;
+    let mut completed = 0;
+    let cancellation = crate::operations::current_token();
+    let wave = crate::resources::workers() * 8192;
+    let index: &FileIndex = idx;
+    while completed < total {
+        crate::operations::check()?;
+        if let Some(cb) = progress {
+            cb(completed, total);
         }
-        let part = idx.part_at(i);
-        let bytes = line_bytes(idx, i);
-        let mut ev = parse_line(bytes, &part.format, part.custom.as_ref(), &part.header);
-        if let Some(cc) = &part.ts_config {
-            apply_ts_config(&mut ev, cc, part, &String::from_utf8_lossy(bytes));
-        }
-        timestamps.push(ev.timestamp.unwrap_or(0));
+        let start = completed;
+        let end = (start + wave).min(total);
+        let parts = crate::global_scheduler::map((start..end).step_by(1024), |from| {
+            (from..(from + 1024).min(end)).map(|i| {
+                if cancellation.cancelled() {
+                    return 0;
+                }
+                let part = index.part_at(i);
+                let bytes = line_bytes(index, i);
+                let mut ev = parse_part_line(part, bytes);
+                if let Some(cc) = &part.ts_config {
+                    apply_ts_config(&mut ev, cc, part, &String::from_utf8_lossy(bytes));
+                }
+                ev.timestamp.unwrap_or(0)
+            }).collect::<Vec<_>>()
+        });
+        for timestamp in parts.into_iter().flatten() { timestamps.push(timestamp)?; }
+        completed = end;
     }
     crate::operations::check()?;
-    for (line, timestamp) in idx.lines.iter_mut().zip(timestamps) {
-        line.ts = timestamp;
-    }
-    idx.time_order.take();
-    idx.big_data = None;
+    for part in &idx.parts { validate_source(part)?; }
+    let timestamps = timestamps.finish()?;
+    crate::operations::check()?;
+    for part in &idx.parts { validate_source(part)?; }
+    idx.lines = std::sync::Arc::new(idx.lines.with_timestamps(timestamps)?);
+    idx.time_order = std::sync::Arc::new(std::sync::OnceLock::new());
     if let Some(cb) = progress {
         cb(total, total);
     }
@@ -1845,26 +2571,12 @@ pub fn event_at(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Event {
-    if let Some(event) = idx.big_data.as_ref().and_then(|engine| engine.event(i)) {
-        return event;
-    }
-    event_at_uncached(idx, i, codes, system, derived)
-}
-
-/// Used by the index builder and as a recovery path for an unavailable store.
-pub fn event_at_uncached(
-    idx: &FileIndex,
-    i: usize,
-    codes: &CodesConfig,
-    system: &CodesConfig,
-    derived: &[CompiledDerived],
-) -> Event {
     let part = idx.part_at(i);
     let bytes = line_bytes(idx, i);
-    let mut ev = parse_line(bytes, &part.format, part.custom.as_ref(), &part.header);
+    let mut ev = parse_part_line(part, bytes);
     ev.id = i;
     if ev.event_ref.is_empty() {
-        ev.event_ref = format!("{}:{}", part.identity, idx.lines[i].offset - part.base);
+        ev.event_ref = format!("{}:{}", part.event_identity.as_deref().unwrap_or(&part.identity), idx.lines.at(i).offset - part.base);
     }
     ev.enrich(codes, system);
     ev.fields
@@ -1889,7 +2601,8 @@ pub fn percent_decode(s: &str) -> String {
             out.push(b' ');
             i += 1;
         } else if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            let hex = |b: u8| (b as char).to_digit(16).map(|n| n as u8);
+            if let Some(byte) = hex(bytes[i + 1]).zip(hex(bytes[i + 2])).map(|(hi, lo)| hi * 16 + lo) {
                 out.push(byte);
                 i += 3;
             } else {
@@ -1906,99 +2619,73 @@ pub fn percent_decode(s: &str) -> String {
 
 pub fn extract_query_params(field_name: &str, raw_val: &str) -> Option<Vec<(String, String)>> {
     let s = raw_val.trim();
-    if s.len() < 3 || !s.contains('=') {
-        return None;
-    }
-
-    let qs = if let Some(pos) = s.find('?') {
-        let after = &s[pos + 1..];
+    if s.len() < 3 || s.len() > 64 * 1024 || !s.contains('=') { return None; }
+    let lower_field = field_name.to_ascii_lowercase();
+    let field_suggests_params = lower_field.contains("query")
+        || lower_field.contains("param") || lower_field.contains("qs") || lower_field.contains("search");
+    // Request grammar gives an exact target. A URI occupies the whole value,
+    // rather than '?' found inside access lines, user agents or prose.
+    let target = web_logs::request_query_target(s).unwrap_or(s);
+    let target = target.split('#').next().unwrap_or(target);
+    let first_equal = s.find('=').unwrap();
+    let bare_params = field_suggests_params
+        && !s[..first_equal].chars().any(|c| c.is_whitespace() || matches!(c, '?' | '/' | ':'));
+    if !bare_params && s.contains('#') && !target.contains('?') { return None; }
+    let qs = if !bare_params && target.contains('?') {
+        if target.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>')) { return None; }
+        let (_, after) = target.split_once('?')?;
         after.split('#').next().unwrap_or(after)
     } else {
-        let lower_field = field_name.to_ascii_lowercase();
-        let field_suggests_params = lower_field.contains("query")
-            || lower_field.contains("param")
-            || lower_field.contains("qs")
-            || lower_field.contains("search");
-        if !s.contains('&') && !field_suggests_params {
-            return None;
-        }
+        if !s.contains('&') && !field_suggests_params { return None; }
         s
     };
-
-    if qs.is_empty() || !qs.contains('=') {
-        return None;
-    }
-
-    let parts: Vec<&str> = qs.split('&').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        return None;
-    }
-
-    let lower_field = field_name.to_ascii_lowercase();
-    if !s.contains('?') && !lower_field.contains("query") && !lower_field.contains("param") && parts.len() < 2 {
-        return None;
-    }
-
+    if qs.is_empty() || !qs.contains('=') { return None; }
+    // Refuse excessive expansion rather than publishing a partial query.
+    let parts: Vec<&str> = qs.split('&').filter(|p| !p.is_empty()).take(257).collect();
+    if parts.is_empty() || parts.len() > 256 { return None; }
+    if !s.contains('?') && !field_suggests_params && parts.len() < 2 { return None; }
     let mut pairs = Vec::new();
     for part in parts {
         let (raw_k, raw_v) = part.split_once('=')?;
         let key = percent_decode(raw_k.trim());
         let val = percent_decode(raw_v.trim());
-
-        if key.is_empty() || key.len() > 100 {
-            return None;
-        }
-        if key.chars().any(|c| {
-            c.is_whitespace()
-                || c.is_control()
-                || c == '='
-                || c == '&'
-                || c == '<'
-                || c == '>'
-                || c == '"'
-                || c == '\''
-        }) {
-            return None;
-        }
+        if key.is_empty() || key.len() > 100 { return None; }
+        if key.chars().any(|c| c.is_whitespace() || c.is_control()
+            || matches!(c, '=' | '&' | '<' | '>' | '"' | '\'')) { return None; }
         pairs.push((key, val));
     }
-
-    if pairs.is_empty() {
-        None
-    } else {
-        Some(pairs)
-    }
+    if pairs.is_empty() { None } else { Some(pairs) }
 }
 
 pub fn expand_query_param_fields(ev: &mut Event) {
-    let mut additions: Vec<(String, String)> = Vec::new();
-
-    for (k, v) in &ev.fields {
-        if k.matches('.').count() >= 8 {
-            continue;
-        }
-        if let serde_json::Value::String(s) = v {
-            if let Some(params) = extract_query_params(k, s) {
-                for (sub_k, sub_v) in params {
-                    additions.push((format!("{k}.{sub_k}"), sub_v));
-                }
-            }
+    // Parents precede descendants even with serde_json preserve_order. Decoded
+    // values cannot become another query on a later normalization pass.
+    let mut sources: Vec<_> = ev.fields.iter().filter(|(key, value)|
+        key.len() <= 512 && key.matches('.').count() < 8 && value.is_string()).collect();
+    sources.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let mut generated = std::collections::HashSet::new();
+    let mut additions = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let (mut inspected, mut bytes, mut output) = (0usize, 0usize, 0usize);
+    for (key, value) in sources {
+        if generated.contains(key) { continue; }
+        let text = value.as_str().unwrap();
+        if !text.contains('=') || text.len() > 64 * 1024 { continue; }
+        if inspected >= 64 || bytes.saturating_add(text.len()) > 256 * 1024 { break; }
+        inspected += 1;
+        bytes += text.len();
+        let Some(params) = extract_query_params(key, text) else { continue; };
+        for (sub_key, value) in params {
+            let name = format!("{key}.{sub_key}");
+            generated.insert(name.clone());
+            if output >= 512 { continue; }
+            let values = additions.entry(name).or_default();
+            if !values.contains(&value) { values.push(value); }
+            output += 1;
         }
     }
-
-    for (sub_field, sub_val) in additions {
-        match ev.fields.get_mut(&sub_field) {
-            Some(serde_json::Value::String(existing)) => {
-                if !existing.is_empty() && !existing.split(", ").any(|part| part == sub_val) {
-                    existing.push_str(", ");
-                    existing.push_str(&sub_val);
-                }
-            }
-            Some(_) => {}
-            None => {
-                ev.fields.insert(sub_field, serde_json::Value::String(sub_val));
-            }
-        }
+    for (key, values) in additions {
+        // Whole values inserted once; explicit dotted values/types win.
+        ev.fields.entry(key).or_insert_with(|| Value::String(values.join(", ")));
     }
 }
 
@@ -2031,6 +2718,14 @@ pub fn parse_line(
     custom: Option<&CustomParse>,
     header: &[String],
 ) -> Event {
+    parse_line_at(bytes, format, custom, header, chrono::Utc::now().year())
+}
+
+pub(crate) fn parse_part_line(part: &FilePart, bytes: &[u8]) -> Event {
+    parse_line_at(bytes, &part.format, part.custom.as_ref(), &part.header, part.calendar.year)
+}
+
+pub(crate) fn parse_line_at(bytes: &[u8], format: &str, custom: Option<&CustomParse>, header: &[String], year: i32) -> Event {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     let text = String::from_utf8_lossy(bytes);
     let mut ev = match format {
@@ -2038,13 +2733,15 @@ pub fn parse_line(
             serde_json::from_str::<Event>(&text).unwrap_or_else(|_| event_from_text(&text))
         }
         "jsonl" => match serde_json::from_str::<Value>(&text) {
-            Ok(Value::Object(map)) => event_from_json(map, &text),
+            Ok(Value::Object(map)) => event_from_json_at(map, &text, year),
             _ => event_from_text(&text),
         },
-        "syslog3164" => parse_syslog3164(&text).unwrap_or_else(|| event_from_text(&text)),
+        "syslog3164" => parse_syslog3164(&text, year).unwrap_or_else(|| event_from_text(&text)),
         "syslog5424" => parse_syslog5424(&text).unwrap_or_else(|| event_from_text(&text)),
         "apache" => parse_apache(&text).unwrap_or_else(|| event_from_text(&text)),
-        "firewall" => parse_firewall(&text).unwrap_or_else(|| event_from_text(&text)),
+        "nginx-error" => web_logs::parse_error(&text).unwrap_or_else(|| event_from_text(&text)),
+        "nginx" | "auto" | "mixed" => parse_structured_line(&text, year).unwrap_or_else(|| event_from_text(&text)),
+        "firewall" => parse_firewall(&text, year).unwrap_or_else(|| event_from_text(&text)),
         "wildfly" => parse_wildfly(&text)
             .or_else(|| parse_jboss(&text))
             .or_else(|| parse_log4j(&text))
@@ -2056,9 +2753,12 @@ pub fn parse_line(
             .or_else(|| parse_wildfly(&text))
             .unwrap_or_else(|| event_from_text(&text)),
         "logfmt" => parse_logfmt(&text).unwrap_or_else(|| event_from_text(&text)),
-        "csv" => parse_csv_line(&text, header).unwrap_or_else(|| event_from_text(&text)),
+        tabular if delimiter_of(tabular).is_some() => {
+            parse_delimited(&text, header, delimiter_of(tabular).unwrap_or(','))
+                .unwrap_or_else(|| event_from_text(&text))
+        }
         "w3c" => parse_w3c(&text, header).unwrap_or_else(|| event_from_text(&text)),
-        "zeek" => parse_zeek(&text, header).unwrap_or_else(|| event_from_text(&text)),
+        "zeek" => parse_zeek(&text, header, year).unwrap_or_else(|| event_from_text(&text)),
         "auditd" => parse_auditd(&text).unwrap_or_else(|| event_from_text(&text)),
         "custom" => match custom {
             Some(CustomParse::Regex(re)) => {
@@ -2072,6 +2772,9 @@ pub fn parse_line(
         },
         _ => event_from_text(&text),
     };
+    if ev.parse_status == "text" && matches!(format, "apache" | "nginx-error" | "jsonl" | "logfmt") {
+        if let Some(recognized) = parse_structured_line(&text, year) { ev = recognized; }
+    }
     if ev.parse_status == "text" && format != "text" {
         ev.parse_status = "unparsed".into();
     }
@@ -2151,348 +2854,465 @@ fn text_level_class(line: &[u8]) -> u8 {
     LV_INFO
 }
 
-fn meta_for_line(
-    line: &[u8],
-    offset: u64,
-    format: &str,
-    custom: Option<&CustomParse>,
-    header: &[String],
-) -> LineMeta {
-    let mut m = LineMeta {
-        offset,
-        len: line.len() as u32,
-        ..Default::default()
-    };
-    let ev = parse_line(line, format, custom, header);
+fn meta_for_line(line: &[u8], offset: u64, part: &FilePart) -> Result<LineMeta, String> {
+    let mut m = LineMeta { offset, len: u32::try_from(line.len()).map_err(|_| "Um registro excede 4 GB.")?, ..Default::default() };
+    let ev = parse_part_line(part, line);
     m.ts = ev.timestamp.unwrap_or(0);
     m.level = label_class(&ev.level).unwrap_or(LV_OTHER);
-    // Offset is an optimization only; non-JSON codes are resolved from the event.
-    if format == "jsonl" {
+    if part.format == "jsonl" {
         if let Some((a, b)) = find_json_value(line, CODE_KEYS) {
             if line.get(a..b) == Some(ev.code.as_bytes()) && b - a <= u16::MAX as usize {
-                m.code_off = a as u32;
+                m.code_off = u32::try_from(a).map_err(|_| "Posição de código excede 4 GB.")?;
                 m.code_len = (b - a) as u16;
             }
         }
     }
-    m
+    Ok(m)
 }
 
-/// Adiciona uma linha ao índice. Em formatos multi-linha (`start_re`), uma
-/// linha que NÃO casa o padrão de início é continuação (corpo de stacktrace):
-/// estende o `len` do evento anterior em vez de virar evento próprio.
-/// Continuações antes do primeiro evento viram linhas soltas (o comportamento
-/// normal de uma linha qualquer).
-#[allow(clippy::too_many_arguments)]
-fn push_meta(
-    lines: &mut Vec<LineMeta>,
-    line: &[u8],
-    offset: u64,
-    fmt: &str,
-    custom: Option<&CustomParse>,
-    header: &[String],
-    start_re: Option<&regex::Regex>,
-) {
+fn push_meta(lines: &mut Vec<LineMeta>, line: &[u8], offset: u64, part: &FilePart, start_re: Option<&regex::Regex>) -> Result<(), String> {
     if let Some(re) = start_re {
-        let text = std::str::from_utf8(line).unwrap_or("");
-        if !re.is_match(text) {
+        if !re.is_match(std::str::from_utf8(line).unwrap_or("")) {
             if let Some(last) = lines.last_mut() {
-                let end = offset as usize + line.len();
-                last.len = (end - last.offset as usize) as u32;
-                return;
-            }
-        }
-    }
-    lines.push(meta_for_line(line, offset, fmt, custom, header));
-}
-
-/// Index JSON array objects directly in the mapped file, including pretty JSON.
-/// Only positions and nesting are kept; the array is never deserialized as a Vec.
-fn index_json_array(
-    bytes: &[u8],
-    start: usize,
-    lines: &mut Vec<LineMeta>,
-    custom: Option<&CustomParse>,
-    header: &[String],
-    progress: Option<&dyn Fn(usize, usize)>,
-    envelope: bool,
-) -> Result<(), String> {
-    let mut stack = Vec::new();
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut record_start = None;
-    let mut need_separator = false;
-    let mut after_comma = false;
-    for (i, &byte) in bytes.iter().enumerate().skip(start + 1) {
-        if i % 65_536 == 0 {
-            crate::operations::check()?;
-        }
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                quoted = false;
-            }
-            continue;
-        }
-        if let Some(begin) = record_start {
-            match byte {
-                b'"' => quoted = true,
-                b'{' | b'[' => {
-                    if stack.len() >= 128 {
-                        return Err("JSON excede 128 níveis de aninhamento.".into());
-                    }
-                    stack.push(byte);
-                }
-                b'}' | b']' => {
-                    let opening = if byte == b'}' { b'{' } else { b'[' };
-                    if stack.pop() != Some(opening) {
-                        return Err(format!("Estrutura JSON inválida no byte {i}."));
-                    }
-                    if stack.is_empty() {
-                        if i - begin >= u32::MAX as usize {
-                            return Err("Um registro JSON excede 4 GB.".into());
-                        }
-                        lines.push(meta_for_line(
-                            &bytes[begin..=i],
-                            begin as u64,
-                            "jsonl",
-                            custom,
-                            header,
-                        ));
-                        record_start = None;
-                        need_separator = true;
-                        if lines.len().is_multiple_of(2048) {
-                            if let Some(cb) = progress {
-                                cb(i, bytes.len());
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            continue;
-        }
-        if byte.is_ascii_whitespace() {
-            continue;
-        }
-        match byte {
-            b']' if !after_comma => {
-                // The rest of an envelope document follows the records array.
-                if !envelope && bytes[i + 1..].iter().any(|b| !b.is_ascii_whitespace()) {
-                    return Err("Há conteúdo após o fim do array JSON.".into());
-                }
+                let end = offset.checked_add(line.len() as u64).ok_or("Posição de registro inválida.")?;
+                last.len = u32::try_from(end - last.offset).map_err(|_| "Um registro multilinha excede 4 GB.")?;
                 return Ok(());
             }
-            b',' if need_separator => {
-                need_separator = false;
-                after_comma = true;
-            }
-            b'{' if !need_separator => {
-                record_start = Some(i);
-                stack.push(byte);
-                after_comma = false;
-            }
-            _ => {
-                return Err(format!(
-                    "Esperado um objeto ou separador no array JSON (byte {i})."
-                ))
-            }
         }
     }
-    Err("Array JSON incompleto: falta fechar um objeto ou o array.".into())
+    lines.push(meta_for_line(line, offset, part)?);
+    Ok(())
 }
 
-/// Indexa um arquivo inteiro em uma única passada, guardando apenas
-/// metadados compactos por linha (~32 bytes/linha).
-pub fn index_file(
-    path: &str,
-    format: &str,
-    custom: Option<CustomParse>,
-    saved_ts: Option<CompiledTsConfig>,
-    progress: Option<&dyn Fn(usize, usize)>,
-) -> Result<FileIndex, String> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("Não foi possível abrir '{path}': {e}"))?;
-    if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-        return Err("Arquivo vazio.".into());
+type CheckpointSink<'a> = dyn FnMut(&mut crate::metadata_store::LineBuilder, usize, bool, Option<&[String]>) -> Result<(), String> + 'a;
+
+/// At most 4 MiB or 65,536 physical lines per worker, whichever comes first.
+/// This bounds temporary metadata even for very short records. A single long
+/// physical/logical record is still an indivisible parsing unit.
+const INDEX_CHUNK: usize = 4 << 20;
+const INDEX_CHUNK_LINES: usize = 65_536;
+struct ChunkLines {
+    lines: Vec<LineMeta>,
+    leading: Option<(usize, usize)>,
+}
+
+fn next_line_bound(bytes: &[u8], from: usize, limits: &IndexLimits) -> Result<usize, String> {
+    let target = from.saturating_add(limits.chunk_bytes);
+    let mut line_count = 0usize;
+    for (block, bytes) in bytes[from..].chunks(65_536).enumerate() {
+        crate::operations::check()?;
+        let base = from + block * 65_536;
+        for nl in memchr::memchr_iter(b'\n', bytes) {
+            line_count += 1;
+            let end = base + nl + 1;
+            if end >= target || line_count >= limits.chunk_lines { return Ok(end); }
+        }
     }
-    let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-        .map_err(|e| format!("Falha ao mapear '{path}': {e}"))?;
+    Ok(bytes.len())
+}
 
-    let fmt = if format == "auto" {
-        detect_format(&mmap).to_string()
-    } else if format == "custom" || format.starts_with("custom:") {
-        "custom".to_string()
-    } else {
-        format.to_string()
+fn index_lines(prepared: &PreparedIndex, lines: &mut crate::metadata_store::LineBuilder, mut cursor: usize, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
+    use crate::metadata_checkpoint::{report, Progress};
+    let part = &prepared.part;
+    let bytes: &[u8] = &part.mmap;
+    let start_re = prepared.descriptor.start_pattern.as_deref().map(regex::Regex::new).transpose().map_err(|e| e.to_string())?;
+    let comments = matches!(part.format.as_str(), "w3c" | "zeek");
+    let keep = |line: &[u8], offset: usize, terminated: bool| {
+        !line.is_empty() && (!terminated || (Some(offset) != prepared.descriptor.header_at && !(comments && line[0] == b'#')))
     };
-    let fmt = fmt.as_str();
+    let cancellation = crate::operations::current_token();
+    while cursor < bytes.len() {
+        prepared.validate()?;
+        crate::operations::check()?;
+        let mut bounds = vec![cursor];
+        for _ in 0..prepared.limits.wave_chunks {
+            let from = *bounds.last().unwrap();
+            if from == bytes.len() { break; }
+            bounds.push(next_line_bound(bytes, from, &prepared.limits)?);
+        }
+        let chunk = |k: usize| -> Result<ChunkLines, String> {
+            let (from, to) = (bounds[k], bounds[k + 1]);
+            let mut out = ChunkLines { lines: Vec::new(), leading: None };
+            let visit = |line: &[u8], offset: usize, terminated: bool, out: &mut ChunkLines| -> Result<(), String> {
+                if !keep(line, offset, terminated) { return Ok(()); }
+                if let Some(re) = start_re.as_ref() {
+                    if from > 0 && out.lines.is_empty() && !re.is_match(std::str::from_utf8(line).unwrap_or("")) {
+                        let end = offset + line.len();
+                        out.leading = Some((out.leading.map_or(offset, |(start, _)| start), end));
+                        return Ok(());
+                    }
+                }
+                push_meta(&mut out.lines, line, offset as u64, part, start_re.as_ref())
+            };
+            let mut offset = from;
+            for (n, nl) in memchr::memchr_iter(b'\n', &bytes[from..to]).enumerate() {
+                if n % 4096 == 0 && cancellation.cancelled() { return Err("Operação cancelada.".into()); }
+                let end = from + nl;
+                let raw = &bytes[offset..end];
+                visit(raw.strip_suffix(b"\r").unwrap_or(raw), offset, true, &mut out)?;
+                offset = end + 1;
+            }
+            if offset < to { visit(&bytes[offset..to], offset, false, &mut out)?; }
+            Ok(out)
+        };
+        report(reporter, Progress::new("metadata-scan", "Indexando metadados", cursor, bytes.len(), "bytes"));
+        let parts: Result<Vec<ChunkLines>, String> = crate::global_scheduler::map(0..bounds.len() - 1, chunk).into_iter().collect();
+        crate::operations::check()?;
+        let previous_rows = lines.len();
+        for chunk in parts? {
+            if let Some((start, stop)) = chunk.leading {
+                match lines.last_mut() {
+                    Some(entry) => entry.len = u32::try_from(stop as u64 - entry.offset).map_err(|_| "Um registro multilinha excede 4 GB.")?,
+                    None => {
+                        let mut initial = Vec::new();
+                        let mut offset = start;
+                        for raw in bytes[start..stop].split(|&b| b == b'\n') {
+                            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+                            if keep(line, offset, true) { push_meta(&mut initial, line, offset as u64, part, start_re.as_ref())?; }
+                            offset += raw.len() + 1;
+                        }
+                        lines.extend(initial)?;
+                    }
+                }
+            }
+            lines.extend(chunk.lines)?;
+        }
+        cursor = *bounds.last().unwrap();
+        let parsed = prepared.parsed_rows.fetch_add(lines.len() - previous_rows, std::sync::atomic::Ordering::Relaxed) + lines.len() - previous_rows;
+        let mut progress = Progress::new("metadata-scan", "Indexando metadados", cursor, bytes.len(), "bytes");
+        progress.parsed_rows = parsed;
+        report(reporter, progress);
+        if cursor < bytes.len() { sink(lines, cursor, false, None)?; }
+    }
+    Ok(())
+}
 
-    // Cabeçalho (csv: primeira linha; w3c: linha "#Fields:")
+/// Scanner checkpoints only between complete objects, never inside a string,
+/// escape, or nesting stack. The array itself is never collected in memory.
+struct JsonScanner<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+    need_separator: bool,
+    after_comma: bool,
+    envelope: bool,
+    done: bool,
+    stack: Vec<u8>,
+    last_report: std::time::Instant,
+}
+impl<'a> JsonScanner<'a> {
+    fn new(bytes: &'a [u8], start: usize, cursor: usize, envelope: bool) -> Self {
+        Self { bytes, cursor, need_separator: cursor != start + 1, after_comma: false, envelope, done: false, stack: Vec::with_capacity(32), last_report: std::time::Instant::now() }
+    }
+    fn next(&mut self, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<Option<(usize, usize)>, String> {
+        use crate::metadata_checkpoint::{report, Progress};
+        if self.done { return Ok(None); }
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut record_start = None;
+        while self.cursor < self.bytes.len() {
+            let i = self.cursor;
+            let byte = self.bytes[i];
+            self.cursor += 1;
+            if i % 65_536 == 0 {
+                crate::operations::check()?;
+                if self.last_report.elapsed() >= std::time::Duration::from_millis(150) {
+                    report(reporter, Progress::new("metadata-json-boundaries", "Localizando registros JSON", i, self.bytes.len(), "bytes"));
+                    self.last_report = std::time::Instant::now();
+                }
+            }
+            if quoted {
+                if escaped { escaped = false; }
+                else if byte == b'\\' { escaped = true; }
+                else if byte == b'"' { quoted = false; }
+                continue;
+            }
+            if let Some(begin) = record_start {
+                match byte {
+                    b'"' => quoted = true,
+                    b'{' | b'[' => {
+                        if self.stack.len() >= 128 { return Err("JSON excede 128 níveis de aninhamento.".into()); }
+                        self.stack.push(byte);
+                    }
+                    b'}' | b']' => {
+                        let opening = if byte == b'}' { b'{' } else { b'[' };
+                        if self.stack.pop() != Some(opening) { return Err(format!("Estrutura JSON inválida no byte {i}.")); }
+                        if self.stack.is_empty() {
+                            if i - begin >= u32::MAX as usize { return Err("Um registro JSON excede 4 GB.".into()); }
+                            self.need_separator = true;
+                            return Ok(Some((begin, i + 1)));
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if byte.is_ascii_whitespace() { continue; }
+            match byte {
+                b']' if !self.after_comma => {
+                    if !self.envelope {
+                        for suffix in self.bytes[self.cursor..].chunks(65_536) {
+                            crate::operations::check()?;
+                            if suffix.iter().any(|b| !b.is_ascii_whitespace()) { return Err("Há conteúdo após o fim do array JSON.".into()); }
+                        }
+                    }
+                    self.done = true;
+                    return Ok(None);
+                }
+                b',' if self.need_separator => { self.need_separator = false; self.after_comma = true; }
+                b'{' if !self.need_separator => { record_start = Some(i); self.stack.push(byte); self.after_comma = false; }
+                _ => return Err(format!("Esperado um objeto ou separador no array JSON (byte {i}).")),
+            }
+        }
+        Err("Array JSON incompleto: falta fechar um objeto ou o array.".into())
+    }
+}
+
+fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, cursor: usize, lines: &mut crate::metadata_store::LineBuilder, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
+    use crate::metadata_checkpoint::{report, Progress};
+    let bytes: &[u8] = &prepared.part.mmap;
+    let mut scanner = JsonScanner::new(bytes, start, cursor, envelope);
+    let cancellation = crate::operations::current_token();
+    let max_records = prepared.limits.json_records;
+    while !scanner.done {
+        prepared.validate()?;
+        crate::operations::check()?;
+        let wave_start = scanner.cursor;
+        let mut records = Vec::with_capacity(max_records);
+        while records.len() < max_records {
+            let Some(record) = scanner.next(reporter)? else { break; };
+            records.push(record);
+            if scanner.cursor - wave_start >= prepared.limits.json_bytes { break; }
+        }
+        let metas: Result<Vec<LineMeta>, String> = crate::global_scheduler::map(&records, |&(begin, end)| {
+            if cancellation.cancelled() { return Err("Operação cancelada.".into()); }
+            meta_for_line(&bytes[begin..end], begin as u64, &prepared.part)
+        }).into_iter().collect();
+        crate::operations::check()?;
+        lines.extend(metas?)?;
+        let parsed = prepared.parsed_rows.fetch_add(records.len(), std::sync::atomic::Ordering::Relaxed) + records.len();
+        let mut progress = Progress::new("metadata-scan", "Indexando metadados JSON", scanner.cursor, bytes.len(), "bytes");
+        progress.parsed_rows = parsed;
+        report(reporter, progress);
+        if !scanner.done { sink(lines, scanner.cursor, false, None)?; }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+struct SourceStamp {
+    canonical_path: String,
+    bytes: u64,
+    modified: Option<(u64, u32)>,
+    file_id: Option<(u64, u64)>,
+}
+impl SourceStamp {
+    fn read(file: &std::fs::File, path: &str) -> Result<Self, String> {
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        Ok(Self {
+            canonical_path: std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path)).to_string_lossy().into_owned(),
+            bytes: meta.len(),
+            modified: meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|t| (t.as_secs(), t.subsec_nanos())),
+            file_id: file_identity(file),
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+struct IndexDescriptor {
+    requested_format: String,
+    format: String,
+    custom: serde_json::Value,
+    header: Vec<String>,
+    header_at: Option<usize>,
+    start_pattern: Option<String>,
+    array: Option<(usize, bool)>,
+}
+
+/// Chunking affects work scheduling only, never the cache identity or parser
+/// semantics. Integration tests use tiny waves to exercise every boundary.
+pub(crate) struct IndexLimits {
+    pub chunk_bytes: usize,
+    pub chunk_lines: usize,
+    pub wave_chunks: usize,
+    pub json_records: usize,
+    pub json_bytes: usize,
+}
+impl Default for IndexLimits {
+    fn default() -> Self {
+        let workers = crate::resources::workers();
+        Self { chunk_bytes: INDEX_CHUNK, chunk_lines: INDEX_CHUNK_LINES, wave_chunks: workers * 2,
+            json_records: workers * 4 * 1024, json_bytes: INDEX_CHUNK * workers }
+    }
+}
+
+pub(crate) struct PreparedIndex {
+    pub(crate) limits: IndexLimits,
+    pub(crate) parsed_rows: std::sync::atomic::AtomicUsize,
+    pub part: FilePart,
+    descriptor: IndexDescriptor,
+    stamp: SourceStamp,
+}
+impl PreparedIndex {
+    pub(crate) fn key(&self) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(&(crate::index_cache::INDEX_DIR, crate::metadata_checkpoint::VERSION, &self.stamp, &self.part.identity, &self.descriptor, &self.part.calendar)).map_err(|e| e.to_string())?;
+        // Keep unaffected formats byte-for-byte compatible with prior keys.
+        let mut hash = Sha256::new();
+        hash.update(bytes);
+        if let Some(revision) = parser_semantics_signature(&self.part.format) {
+            hash.update(b"|structured-parser:");
+            hash.update(revision.as_bytes());
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    }
+    pub(crate) fn initial_cursor(&self) -> usize { self.descriptor.array.map_or(0, |(start, _)| start + 1) }
+    pub(crate) fn multiline(&self) -> bool { self.descriptor.start_pattern.is_some() }
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        crate::operations::check()?;
+        let file = crate::case_archive_format::open_regular(std::path::Path::new(&self.part.physical_path))?;
+        if SourceStamp::read(&file, &self.part.physical_path)? != self.stamp {
+            return Err("A fonte foi alterada durante a indexação. Reabra o arquivo para usar uma versão consistente.".into());
+        }
+        validate_source(&self.part)
+    }
+}
+
+pub(crate) fn prepare_index(path: &str, format: &str, custom: Option<CustomParse>, saved_ts: Option<CompiledTsConfig>) -> Result<PreparedIndex, String> {
+    crate::operations::check()?;
+    let canonical_lease = crate::workspace::canonical_source_lease(std::path::Path::new(path))?;
+    let event_identity = crate::workspace::canonical_event_identity(std::path::Path::new(path))?;
+    let file = crate::case_archive_format::open_regular(std::path::Path::new(path)).map_err(|e| format!("Não foi possível abrir '{path}': {e}"))?;
+    let stamp = SourceStamp::read(&file, path)?;
+    if stamp.bytes == 0 { return Err("Arquivo vazio.".into()); }
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| format!("Falha ao mapear '{path}': {e}"))?;
+    let fmt = if format == "auto" {
+        // An inconclusive prefix must not disable recognition for later rows.
+        // Explicitly requested plain text still keeps its literal semantics.
+        match detect_format(&mmap) { "text" => "mixed", detected => detected }.to_string()
+    }
+        else if format == "custom" || format.starts_with("custom:") { "custom".to_string() }
+        else if format == "csv" { detect_delimited(&mmap).unwrap_or("csv").to_string() }
+        else { format.to_string() };
     let mut header: Vec<String> = Vec::new();
-    if fmt == "csv" {
-        if let Some(first) = mmap.split(|&b| b == b'\n').next() {
+    if let Some(delimiter) = delimiter_of(&fmt) {
+        let body = mmap.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&mmap);
+        if let Some(first) = body.split(|&b| b == b'\n').find(|line| !line.trim_ascii().is_empty()) {
             let first = String::from_utf8_lossy(first).trim().to_string();
-            header = split_csv(&first)
-                .iter()
-                .map(|s| s.trim().to_string())
-                .collect();
+            header = split_delimited(&first, delimiter).iter().map(|s| s.trim().to_string()).collect();
         }
     } else if fmt == "zeek" {
         for line in mmap.split(|&b| b == b'\n').take(40) {
             let l = String::from_utf8_lossy(line);
             if let Some(rest) = l.trim_end().strip_prefix("#fields") {
-                header = rest.split('\t').filter(|f| !f.is_empty()).map(|f| f.to_string()).collect();
-                break;
+                header = rest.split('\t').filter(|f| !f.is_empty()).map(|f| f.to_string()).collect(); break;
             }
         }
     } else if fmt == "w3c" {
         for line in mmap.split(|&b| b == b'\n').take(20) {
             let l = String::from_utf8_lossy(line);
-            let l = l.trim();
-            if let Some(rest) = l.to_lowercase().strip_prefix("#fields:") {
-                header = rest.split_whitespace().map(|s| s.to_string()).collect();
-                break;
+            if let Some(rest) = l.trim().to_lowercase().strip_prefix("#fields:") {
+                header = rest.split_whitespace().map(|s| s.to_string()).collect(); break;
             }
         }
     }
-
-    // total de linhas por contagem rápida (memchr é SIMD, custo desprezível)
-    let total_lines = progress
-        .map(|_| memchr::memchr_iter(b'\n', &mmap).count() + 1)
-        .unwrap_or(0);
-    let mut lines: Vec<LineMeta> = Vec::with_capacity((mmap.len() / 160).min(1_000_000) + 16);
-    let mut offset = 0usize;
-    let mut first_line = true;
-    let mut last_report = 0usize;
-    // Formatos multi-linha (stacktrace Java): linha que casa o padrão do
-    // formato inicia um evento; as demais estendem o evento anterior.
-    let start_re: Option<regex::Regex> = match fmt {
-        "log4j" | "wildfly" => detect_entry_start(&mmap),
-        _ => None,
-    };
-    let content_start = if mmap.starts_with(&[0xef, 0xbb, 0xbf]) {
-        3
-    } else {
-        0
-    };
+    let header_at = if delimiter_of(&fmt).is_some() {
+        let mut offset = 0usize; let mut found = None;
+        for line in mmap.split(|&b| b == b'\n') {
+            if !line.trim_ascii().is_empty() { found = Some(offset); break; }
+            offset += line.len() + 1;
+        }
+        found
+    } else { None };
+    let start_pattern = match fmt.as_str() { "log4j" | "wildfly" => detect_entry_start(&mmap).map(|re| re.as_str().to_string()), _ => None };
+    let content_start = if mmap.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
     let first_byte = (content_start..mmap.len()).find(|&i| !mmap[i].is_ascii_whitespace());
-    let array_start = first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'[');
-    // A single document wrapping the records (CloudTrail, Azure, exports).
-    let envelope_start = first_byte
-        .filter(|&i| fmt == "jsonl" && mmap[i] == b'{' && !looks_like_jsonl(&mmap[i..]))
-        .and_then(|_| json_envelope_array(&mmap));
-    if let Some(start) = array_start {
-        index_json_array(&mmap, start, &mut lines, custom.as_ref(), &header, progress, false)?;
-    } else if let Some(start) = envelope_start {
-        index_json_array(&mmap, start, &mut lines, custom.as_ref(), &header, progress, true)?;
-    } else {
-        for (physical_line, nl) in memchr::memchr_iter(b'\n', &mmap).enumerate() {
-            if physical_line % 2048 == 0 {
-                crate::operations::check()?;
-            }
-            let raw = &mmap[offset..nl];
-            let line = if raw.last() == Some(&b'\r') {
-                &raw[..raw.len() - 1]
-            } else {
-                raw
-            };
-            if !line.is_empty() {
-                let skip = (fmt == "csv" && first_line) || (matches!(fmt, "w3c" | "zeek") && line[0] == b'#');
-                if !skip {
-                    push_meta(
-                        &mut lines,
-                        line,
-                        offset as u64,
-                        fmt,
-                        custom.as_ref(),
-                        &header,
-                        start_re.as_ref(),
-                    );
-                }
-            }
-            first_line = false;
-            offset = nl + 1;
-            if let Some(cb) = progress {
-                if lines.len() >= last_report + 2048 {
-                    last_report = lines.len();
-                    cb(lines.len(), total_lines);
-                }
-            }
-        }
-        if offset < mmap.len() {
-            let line = &mmap[offset..];
-            if !line.is_empty() {
-                push_meta(
-                    &mut lines,
-                    line,
-                    offset as u64,
-                    fmt,
-                    custom.as_ref(),
-                    &header,
-                    start_re.as_ref(),
-                );
-            }
-        }
-    }
-
-    // Descoberta de colunas: amostra das primeiras 2.000 linhas.
-    let mut columns: Vec<String> = STANDARD_COLUMNS.iter().map(|s| s.to_string()).collect();
-    let mut extra = std::collections::HashSet::new();
-    let mut sampled = Vec::with_capacity(lines.len().min(4_000));
-    for sample in 0..lines.len().min(4_000) {
-        let i = sample * lines.len() / lines.len().min(4_000);
-        let m = &lines[i];
-        let ev = parse_line(
-            &mmap[m.offset as usize..(m.offset as usize + m.len as usize)],
-            fmt,
-            custom.as_ref(),
-            &header,
-        );
-        for k in ev.fields.keys() {
-            extra.insert(k.clone());
-        }
-        sampled.push(ev);
-    }
-    let mut extra: Vec<String> = extra.into_iter().collect();
-    extra.sort();
-    columns.extend(extra);
-    // Canonical entities (@user, @src_ip…) observed in the sample.
-    for column in crate::entities::observed_columns(sampled.iter()) {
-        if !columns.contains(&column) {
-            columns.push(column);
-        }
-    }
-    drop(sampled);
-
-    // campos de origem sempre disponíveis como colunas
-    for extra_col in ["arquivo", "caminho"] {
-        if !columns.iter().any(|c| c == extra_col) {
-            columns.push(extra_col.to_string());
-        }
-    }
-
+    let array = first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'[').map(|start| (start, false))
+        .or_else(|| first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'{' && !looks_like_jsonl(&mmap[i..]))
+            .and_then(|_| json_envelope_array(&mmap)).map(|start| (start, true)));
+    let custom_descriptor = match &custom {
+        Some(CustomParse::Regex(re)) => serde_json::json!(["regex", re.as_str()]),
+        Some(CustomParse::Delimited { sep, fields }) => serde_json::json!(["delimited", sep, fields]),
+        None => serde_json::Value::Null,
+    };
     let identity = crate::index_cache::identity(path, &mmap);
-    Ok(FileIndex {
-        parts: vec![FilePart {
-            path: path.into(),
-            file_name: file_name_of(path),
-            format: fmt.into(),
-            custom,
-            ts_config: saved_ts,
-            header,
-            mmap,
-            base: 0,
-            identity,
-        }],
-        lines,
-        columns,
-        time_order: std::sync::OnceLock::new(),
-        big_data: None,
-    })
+    let prepared = PreparedIndex {
+        limits: IndexLimits::default(), parsed_rows: std::sync::atomic::AtomicUsize::new(0),
+        descriptor: IndexDescriptor { requested_format: format.into(), format: fmt.clone(), custom: custom_descriptor, header: header.clone(), header_at, start_pattern, array },
+        stamp,
+        part: FilePart { path: path.into(), physical_path: path.into(), physical_file_id: file_identity(&file), calendar: ParserCalendar::current()?, canonical_lease, event_identity, metadata_identity: String::new(),
+            file_name: file_name_of(path), format: fmt, custom, ts_config: saved_ts, header, mmap: std::sync::Arc::new(mmap), base: 0, identity },
+    };
+    prepared.validate()?;
+    Ok(prepared)
+}
+
+pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metadata_checkpoint::Resume, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<FileIndex, String> {
+    use crate::metadata_checkpoint::{report, Progress};
+    prepared.validate()?;
+    let bytes: &[u8] = &prepared.part.mmap;
+    let safe_cursor = resume.cursor == bytes.len() || match prepared.descriptor.array {
+        Some((start, _)) => resume.cursor == start + 1 || resume.cursor > start + 1 && bytes.get(resume.cursor - 1) == Some(&b'}'),
+        None => resume.cursor == 0 || bytes.get(resume.cursor - 1) == Some(&b'\n'),
+    };
+    if !safe_cursor { return Err("Limite de retomada dos metadados inválido.".into()); }
+    if !resume.scan_complete {
+        match prepared.descriptor.array {
+            Some((start, envelope)) => index_json_array(&prepared, start, envelope, resume.cursor, &mut resume.lines, sink, reporter)?,
+            None => index_lines(&prepared, &mut resume.lines, resume.cursor, sink, reporter)?,
+        }
+        prepared.validate()?;
+        resume.lines.flush()?;
+        sink(&mut resume.lines, bytes.len(), true, None)?;
+    }
+    let mut columns = match resume.columns {
+        Some(columns) => columns,
+        None => {
+            let mut columns: Vec<String> = STANDARD_COLUMNS.iter().map(|s| s.to_string()).collect();
+            let mut extra = std::collections::HashSet::new();
+            let count = resume.lines.len().min(4_000);
+            let mut sampled = Vec::with_capacity(count);
+            for sample in 0..count {
+                if sample % 32 == 0 {
+                    crate::operations::check()?;
+                    report(reporter, Progress::new("metadata-columns", "Descobrindo colunas", sample, count, "amostras"));
+                }
+                let i = sample * resume.lines.len() / count;
+                let m = resume.lines.at(i)?;
+                let ev = parse_part_line(&prepared.part, &bytes[m.offset as usize..m.offset as usize + m.len as usize]);
+                extra.extend(ev.fields.keys().cloned()); sampled.push(ev);
+            }
+            let mut extra: Vec<String> = extra.into_iter().filter(|name| !STANDARD_COLUMNS.contains(&name.as_str())).collect(); extra.sort(); columns.extend(extra);
+            for column in crate::entities::observed_columns(sampled.iter()) {
+                if !columns.contains(&column) { columns.push(column); }
+            }
+            for extra in ["arquivo", "caminho"] {
+                if !columns.iter().any(|c| c == extra) { columns.push(extra.into()); }
+            }
+            prepared.validate()?;
+            sink(&mut resume.lines, bytes.len(), true, Some(&columns))?;
+            report(reporter, Progress::new("metadata-columns", "Colunas identificadas", count, count, "amostras"));
+            columns
+        }
+    };
+    // Supported parser fields remain discoverable even when an unchanged
+    // metadata journal predates Java structural enrichment. This does not
+    // rewrite its record offsets, saved catalog, or durable framing identity.
+    crate::java_stacktrace::extend_columns(&prepared.part.format, &mut columns);
+    prepared.validate()?;
+    crate::operations::check()?;
+    let mut part = prepared.part.clone();
+    part.metadata_identity = prepared.key()?;
+    Ok(FileIndex { parts: vec![part], lines: std::sync::Arc::new(resume.lines.finish()?), columns, time_order: std::sync::Arc::new(std::sync::OnceLock::new()) })
+}
+
+/// Uncached entry point, also used as the semantic oracle in recovery tests.
+pub fn index_file(path: &str, format: &str, custom: Option<CustomParse>, saved_ts: Option<CompiledTsConfig>, progress: Option<&dyn Fn(usize, usize)>) -> Result<FileIndex, String> {
+    let prepared = prepare_index(path, format, custom, saved_ts)?;
+    let resume = crate::metadata_checkpoint::Resume { cursor: prepared.initial_cursor(), ..Default::default() };
+    let report = |p: &crate::metadata_checkpoint::Progress| {
+        if p.phase_id == "metadata-scan" { if let Some(cb) = progress { cb(p.completed, p.total); } }
+    };
+    index_prepared(&prepared, resume, &mut |_, _, _, _| Ok(()), Some(&report))
 }
 
 // ------------------------------------------------------- Windows Event Log
@@ -2612,7 +3432,11 @@ pub fn visit_evtx_file(
     max_events: usize,
     mut visit: impl FnMut(Event) -> Result<(), String>,
 ) -> Result<usize, String> {
-    let mut parser = evtx::EvtxParser::from_path(path).map_err(|e| format!("Não foi possível abrir o EVTX: {e}"))?;
+    // EVTX parsing runs in the caller's globally admitted lane; its native
+    // chunk workers must not multiply the application's shared CPU budget.
+    let mut parser = evtx::EvtxParser::from_path(path)
+        .map_err(|e| format!("Não foi possível abrir o EVTX: {e}"))?
+        .with_configuration(evtx::ParserSettings::default().num_threads(1));
     let mut count = 0usize;
     let mut skipped = 0usize;
     for record in parser.records() {
@@ -2954,7 +3778,7 @@ mod tests {
             &codes,
             &codes,
             &[],
-        );
+        ).unwrap();
         eprintln!(
             "QUERY contains(message=timeout): {} resultados em {:?}",
             r.total,
@@ -2971,7 +3795,7 @@ mod tests {
             &codes,
             &codes,
             &[],
-        );
+        ).unwrap();
         eprintln!(
             "QUERY regex(_all): {} resultados em {:?}",
             r2.total,
@@ -3057,11 +3881,197 @@ mod tests {
 }
 
 #[cfg(test)]
+mod java_enrichment_tests {
+    use super::*;
+
+    const BODY: &str = "a.TopException: café\n\tat a.Top.run(Top.java:1)\n\tSuppressed: a.CloseException\n\t\tat a.Close.close(Native Method)\nCaused by: a.BottomException: actual cause\n\tat a.Bottom.run(Unknown Source)\n\t... 1 more\n";
+
+    #[test]
+    fn existing_java_parsers_preserve_legacy_evidence_and_add_real_typed_fields() {
+        for (head, parse) in [
+            ("00:00:00,001 ERROR [a.Logger] (worker) failed", parse_wildfly as fn(&str) -> Option<Event>),
+            ("2024-01-31 08:00:01,123 ERROR [a.Logger] (worker) failed", parse_jboss),
+            ("2024-01-31 08:00:01,123 ERROR [worker] a.Logger - failed", parse_log4j),
+        ] {
+            let raw = format!("{head}\n{BODY}");
+            let event = parse(&raw).unwrap();
+            let mut legacy = Event::empty();
+            extract_java_body(&mut legacy, BODY);
+            assert_eq!(event.raw, raw);
+            assert_eq!(event.message, "failed");
+            assert_eq!(event.source, "a.Logger");
+            assert_eq!(event.level, "Erro");
+            assert_eq!(event.fields["exception"], legacy.fields["exception"]);
+            assert_eq!(event.fields["stacktrace"], legacy.fields["stacktrace"]);
+            assert_eq!(event.fields["java.exception.class"], "a.TopException");
+            assert_eq!(event.fields["java.exception.message"], "café");
+            assert_eq!(event.fields["java.root_cause.class"], "a.BottomException");
+            assert_eq!(event.fields["java.trace.complete"], true);
+            assert!(!event.fields.contains_key("java.trace"), "ordinary Events keep only scalar summaries");
+            let detail = java_trace_for_event(&event).unwrap().unwrap();
+            assert!(detail.complete);
+            assert_eq!(detail.nodes[0].header.start, head.len() + 1);
+            assert_eq!(detail.root_cause_class(), Some("a.BottomException"));
+            let incomplete = parse(&format!("{head}\na.TopException\n\tat malformed frame\n")).unwrap();
+            assert_eq!(incomplete.fields["java.trace.complete"], false);
+            assert!(!incomplete.fields.contains_key("java.root_cause.class"));
+            assert!(!incomplete.fields.contains_key("java.trace.fingerprint"));
+            let ordinary = parse(head).unwrap();
+            assert!(!ordinary.fields.contains_key("java.trace.complete"));
+            assert!(java_trace_for_event(&ordinary).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn header_exception_spans_use_raw_coordinates_and_old_snapshots_remain_unavailable() {
+        let raw = "2024-01-31 08:00:01,123 ERROR [worker] a.Logger - a.TopException: 日\n\tat a.Top.run(Top.java:1)\n";
+        let event = parse_log4j(raw).unwrap();
+        assert_eq!(event.message, "a.TopException: 日");
+        assert_eq!(event.fields["java.exception.class"], "a.TopException");
+        assert_eq!(java_trace_for_event(&event).unwrap().unwrap().nodes[0].header.start, raw.find("a.TopException").unwrap());
+        for preserved_raw in ["", raw] {
+            let mut legacy = Event::empty();
+            legacy.raw = preserved_raw.into();
+            legacy.fields.insert("exception".into(), Value::String("a.TopException".into()));
+            legacy.fields.insert("stacktrace".into(), serde_json::json!(["at a.Top.run(Top.java:1)"]));
+            let bytes = serde_json::to_vec(&legacy).unwrap();
+            let restored = parse_line_at(&bytes, "snapshot", None, &[], 2026);
+            assert_eq!(restored.raw, preserved_raw);
+            assert_eq!(restored.fields["stacktrace"], legacy.fields["stacktrace"]);
+            assert!(!restored.fields.contains_key("java.trace"), "historical evidence is not silently reconstructed");
+            assert!(!restored.fields.contains_key("java.exception.class"));
+            let detail = java_trace_for_event(&restored).unwrap();
+            assert_eq!(detail.is_some(), !preserved_raw.is_empty());
+            if let Some(detail) = detail { assert_eq!(detail.exception_class(), Some("a.TopException")); }
+        }
+        let json = serde_json::json!({"message": raw});
+        let event = parse_line_at(&serde_json::to_vec(&json).unwrap(), "jsonl", None, &[], 2026);
+        assert!(!event.fields.contains_key("java.trace"));
+        assert!(java_trace_for_event(&event).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_trace_details_preserve_limits_and_leave_the_event_unchanged() {
+        let prefix = "2024-01-31 08:00:01,123 ERROR [worker] a.Logger - ";
+        let mut event = Event::empty();
+        event.raw = format!("{prefix}a.FailureException: {}", "x".repeat(8192));
+        let before = serde_json::to_value(&event).unwrap();
+        let trace = java_trace_for_event(&event).unwrap().unwrap();
+        assert!(!trace.complete);
+        assert!(trace.nodes.is_empty());
+        assert!(trace.diagnostics.iter().any(|d| d.code == crate::java_stacktrace::Code::StringLimit));
+        assert_eq!(before, serde_json::to_value(&event).unwrap());
+        event.raw = format!("{prefix}{}", "x".repeat(300 << 10));
+        let trace = java_trace_for_event(&event).unwrap().unwrap();
+        assert!(!trace.complete);
+        assert!(trace.diagnostics.iter().any(|d| d.code == crate::java_stacktrace::Code::InputLimit));
+        event.raw = "x".repeat(70 << 10);
+        assert!(java_trace_for_event(&event).unwrap_err().contains("limite"));
+        event.raw.clear();
+        assert!(java_trace_for_event(&event).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
 mod ts_tests {
     #[test]
     fn parse_data_com_virgula() {
         let r = super::parse_with_format("2026-06-24 00:00:00,001", "%Y-%m-%d %H:%M:%S%.f", None);
         eprintln!("resultado: {:?}", r);
         assert!(r.is_some(), "falhou ao parsear com vírgula");
+    }
+}
+
+#[cfg(test)]
+mod metadata_calendar_tests {
+    use super::*;
+
+    fn configured(format: &str, complement: Option<&str>) -> CompiledTsConfig {
+        TsConfig { sources: vec!["linha".into()], format: format.into(), complement: complement.map(str::to_string), ..Default::default() }.compile().unwrap()
+    }
+    fn old_signature(cc: &CompiledTsConfig) -> String {
+        let rules: Vec<_> = cc.rules.iter().map(|(re, template)| (re.as_ref().map(|re| re.as_str()), template.as_ref())).collect();
+        format!("{:?}|{}|{:?}|{:?}|{}|{:?}", cc.sources, cc.format, cc.complement, cc.timezone_offset_minutes, cc.clock_adjustment_ms, rules)
+    }
+
+    #[test]
+    fn fallback_date_is_pinned_and_part_of_only_semantically_relevant_signatures() {
+        let day = chrono::NaiveDate::from_ymd_opt(2030, 1, 2).unwrap();
+        let next = day.succ_opt().unwrap();
+        for format in ["%H:%M:%S", "%H:%M:%S %%Y", "%Y-%m-%d %H:%M:%S"] {
+            let mut cc = configured(format, None); cc.reference_date = day;
+            let first = cc.signature(); cc.reference_date = next;
+            assert_ne!(first, cc.signature(), "{format} can use an omitted/invalid date");
+        }
+        let mut cc = configured("%H:%M:%S", None); cc.reference_date = day;
+        assert_eq!(ts_from_joined("12:30:00", &cc), Some(naive_to_ms(day.and_hms_opt(12, 30, 0).unwrap())));
+        cc.reference_date = next;
+        assert_eq!(ts_from_joined("12:30:00", &cc), Some(naive_to_ms(next.and_hms_opt(12, 30, 0).unwrap())));
+        for (format, complement) in [("epoch_ms", None), ("epoch_s", None), ("%Y-%m-%d", None), ("%H:%M:%S", Some("2020-02-03"))] {
+            let mut cc = configured(format, complement); cc.reference_date = day;
+            let first = cc.signature(); assert_eq!(first, old_signature(&cc));
+            cc.reference_date = next; assert_eq!(first, cc.signature());
+        }
+    }
+
+    #[test]
+    fn explicit_year_parser_covers_syslog_and_firewall_without_clock_reads() {
+        for (format, line) in [
+            ("syslog3164", "Sep 30 12:30:00 host app: hello"),
+            ("firewall", "Sep 30 12:30:00 host kernel: SRC=10.0.0.1 DST=10.0.0.2"),
+        ] {
+            let event = parse_line_at(line.as_bytes(), format, None, &[], 2032);
+            let expected = chrono::NaiveDate::from_ymd_opt(2032, 9, 30).unwrap().and_hms_opt(12, 30, 0).unwrap();
+            assert_eq!(event.timestamp, Some(naive_to_ms(expected)), "{format}");
+        }
+    }
+
+    #[test]
+    fn overflowing_multiline_length_is_rejected_instead_of_wrapped() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("source.log");
+        std::fs::write(&path, "first\n").unwrap();
+        let prepared = prepare_index(path.to_str().unwrap(), "text", None, None).unwrap();
+        let mut lines = vec![LineMeta { offset: 0, len: 1, ..Default::default() }];
+        let re = regex::Regex::new("^START").unwrap();
+        assert!(push_meta(&mut lines, b"continuation", u64::from(u32::MAX), &prepared.part, Some(&re)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod wrapped_cache_migration_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    #[test]
+    fn old_web_v1_metadata_is_rebuilt_once_without_changing_record_identity() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("wrapped.jsonl");
+        let cache = dir.path().join("metadata");
+        let raw = serde_json::json!({"labels":{},"line":"192.0.2.80 - - [16/Sep/2026:20:55:04 -0300] \"GET /x?page=1 HTTP/1.1\" 204 0"}).to_string();
+        std::fs::write(&path, &raw).unwrap();
+        let prepared = prepare_index(path.to_str().unwrap(), "jsonl", None, None).unwrap();
+        let mut old = Sha256::new();
+        old.update(serde_json::to_vec(&("indexes-v6", crate::metadata_checkpoint::VERSION,
+            &prepared.stamp,&prepared.part.identity,&prepared.descriptor,&prepared.part.calendar)).unwrap());
+        old.update(b"|structured-parser:web-logs-v1");
+        let old_key = format!("{:x}", old.finalize());
+        assert_ne!(prepared.key().unwrap(), old_key);
+        let (mut journal, _) = crate::metadata_checkpoint::Journal::open(&cache, &old_key,
+            prepared.part.mmap.len(), prepared.initial_cursor(), prepared.multiline(), None)
+            .unwrap_or_else(|_| panic!("old journal fixture"));
+        let mut old_rows = crate::metadata_store::LineBuilder::default();
+        old_rows.push(LineMeta { offset:0,len:raw.len() as u32,ts:0,level:LV_INFO,..Default::default() }).unwrap();
+        journal.checkpoint_rows(&mut old_rows, raw.len(), true, Some(&["line".into()]), None, &|| prepared.validate()).unwrap();
+        drop(journal);
+        let old_ref = format!("{}:0", prepared.part.event_identity.as_deref().unwrap_or(&prepared.part.identity));
+        let reopened = crate::index_cache::open_prepared_at(&prepared, &cache, None).unwrap();
+        assert_eq!(prepared.parsed_rows.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(reopened.lines.len(), 1); assert_eq!(reopened.lines.at(0).offset, 0);
+        assert_eq!(reopened.lines.at(0).ts, 1789602904000);
+        assert!(reopened.columns.iter().any(|column| column == "method"));
+        let empty = CodesConfig::default(); let event = event_at(&reopened, 0, &empty, &empty, &[]);
+        assert_eq!(event.event_ref, old_ref); assert_eq!(event.raw, raw); assert_eq!(event.fields["path.page"], "1");
+        let warm_prepared = prepare_index(path.to_str().unwrap(), "jsonl", None, None).unwrap();
+        let warm = crate::index_cache::open_prepared_at(&warm_prepared, &cache, None).unwrap();
+        assert_eq!(warm_prepared.parsed_rows.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(warm.lines.at(0).ts, reopened.lines.at(0).ts); assert_eq!(warm.columns, reopened.columns);
     }
 }

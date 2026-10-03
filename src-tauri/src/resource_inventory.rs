@@ -15,9 +15,12 @@ pub struct Component {
     pub memory_bytes: Option<u64>,
     pub mapped_bytes: Option<u64>,
     pub storage_bytes: Option<u64>,
+    pub accounted_bytes: Option<u64>,
+    pub budget_bytes: Option<u64>,
     pub items: Option<u64>,
     /// measured: known capacities; estimated: sampled/partial owned allocations;
-    /// logical: file/map lengths; unavailable: no inexpensive current value.
+    /// logical: file/map lengths; accounted: credits, not RAM;
+    /// configured: limit, not usage; unavailable: no inexpensive current value.
     pub basis: &'static str,
     pub note: String,
 }
@@ -44,6 +47,8 @@ fn component(
         memory_bytes,
         mapped_bytes: None,
         storage_bytes: None,
+        accounted_bytes: None,
+        budget_bytes: None,
         items,
         basis,
         note,
@@ -58,12 +63,20 @@ fn vec_bytes<T>(capacity: usize) -> u64 {
     (capacity as u64).saturating_mul(std::mem::size_of::<T>() as u64)
 }
 
-fn strings_bytes(strings: &[String], capacity: usize) -> u64 {
-    strings
-        .iter()
-        .fold(vec_bytes::<String>(capacity), |bytes, value| {
-            bytes.saturating_add(value.capacity() as u64)
-        })
+fn strings_bytes(strings: &[String], capacity: usize, remaining: &mut usize, partial: &mut bool) -> u64 {
+    let count = strings.len().min(*remaining);
+    *remaining -= count;
+    *partial |= count < strings.len();
+    strings.iter().take(count).fold(vec_bytes::<String>(capacity), |bytes, value| {
+        bytes.saturating_add(value.capacity() as u64)
+    })
+}
+
+fn accounted(id: &str, label: &str, bytes: u64, limit: Option<u64>, note: &str) -> Component {
+    let mut entry = component(id, label, None, None, "accounted", note.into());
+    entry.accounted_bytes = Some(bytes);
+    entry.budget_bytes = limit;
+    entry
 }
 
 // A pathological single nested field must not turn a 1 Hz inventory into a
@@ -169,25 +182,13 @@ fn memory_events_estimate(events: &[Event], capacity: usize) -> (u64, usize, boo
 pub fn snapshot(state: &AppState) -> Inventory {
     let mut components = Vec::new();
     let mut partial = false;
-    let mut engines: Vec<Arc<crate::big_data::BigDataIndex>> = Vec::new();
     match state.source.try_read() {
         None => {
             partial = true;
-            components.push(unavailable(
-                "source",
-                "Fonte atual",
-                "Fonte ocupada; a coleta não aguardou o lock.",
-            ));
+            components.push(unavailable("source", "Fonte atual", "Fonte ocupada; a coleta não aguardou o lock."));
         }
         Some(source) => match &*source {
-            SourceData::None => components.push(component(
-                "source",
-                "Fonte atual",
-                Some(0),
-                Some(0),
-                "measured",
-                "Nenhuma fonte carregada.".into(),
-            )),
+            SourceData::None => components.push(component("source", "Fonte atual", Some(0), Some(0), "measured", "Nenhuma fonte carregada.".into())),
             SourceData::Memory(events) => {
                 let (bytes, samples, clipped) = memory_events_estimate(events, events.capacity());
                 partial |= clipped;
@@ -195,103 +196,86 @@ pub fn snapshot(state: &AppState) -> Inventory {
                     format!("Capacidade do vetor + conteúdo estimado por até 64 eventos distribuídos ({samples} amostras); overhead de campos aproximado.{}", if clipped { " Campos complexos excederam o limite da amostra." } else { "" })));
             }
             SourceData::Indexed(index) => {
+                let metadata = index.lines.resource_usage();
+                let mut clipped = metadata.partial || index.parts.len() > 1024;
+                let mut text_budget = 4096;
                 let mut bytes = (std::mem::size_of::<crate::sources::FileIndex>() as u64)
-                    .saturating_add(vec_bytes::<crate::model::LineMeta>(index.lines.capacity()))
-                    .saturating_add(vec_bytes::<crate::sources::FilePart>(
-                        index.parts.capacity(),
-                    ))
-                    .saturating_add(strings_bytes(&index.columns, index.columns.capacity()));
+                    .saturating_add(metadata.heap_bytes)
+                    .saturating_add(vec_bytes::<crate::sources::FilePart>(index.parts.capacity()))
+                    .saturating_add(strings_bytes(&index.columns, index.columns.capacity(), &mut text_budget, &mut clipped));
                 if let Some(order) = index.time_order.get() {
                     bytes = bytes.saturating_add(vec_bytes::<usize>(order.capacity()));
                 }
-                let mapped = index.parts.iter().fold(0u64, |total, part| {
-                    total.saturating_add(part.mmap.len() as u64)
-                });
-                for part in &index.parts {
-                    for value in [&part.path, &part.file_name, &part.format, &part.identity] {
+                let mut mapped = 0u64;
+                let mut maps = HashSet::new();
+                for part in index.parts.iter().take(1024) {
+                    if maps.insert(Arc::as_ptr(&part.mmap) as usize) { mapped = mapped.saturating_add(part.mmap.len() as u64); }
+                    for value in [&part.path, &part.physical_path, &part.file_name, &part.format, &part.identity, &part.metadata_identity] {
                         bytes = bytes.saturating_add(value.capacity() as u64);
                     }
-                    bytes =
-                        bytes.saturating_add(strings_bytes(&part.header, part.header.capacity()));
+                    bytes = bytes.saturating_add(part.event_identity.as_ref().map_or(0, |value| value.capacity() as u64));
+                    bytes = bytes.saturating_add(strings_bytes(&part.header, part.header.capacity(), &mut text_budget, &mut clipped));
                 }
-                components.push(component("source-index", "Índice de linhas e ordenação", Some(bytes), Some(index.lines.len() as u64), "estimated",
-                    "Capacidades dos metadados, ordenação já criada e descritores; exclui memória interna de parsers e regex. Não inicializa a ordenação.".into()));
-                let mut maps = component("source-maps", "Arquivos mapeados da fonte", None, Some(index.parts.len() as u64), "logical",
-                    "Extensão lógica dos mapas mmap; páginas podem ser compartilhadas e não representam RAM residente. Fontes originais não são atribuídas ao cache do aplicativo.".into());
-                maps.mapped_bytes = Some(mapped);
-                components.push(maps);
-                if let Some(engine) = &index.big_data {
-                    engines.push(engine.clone());
-                }
+                partial |= clipped;
+                let mut rows = component("source-index", "Metadados de linhas e ordenação", Some(bytes), Some(index.lines.len() as u64), "estimated",
+                    format!("Capacidades de descritores e metadados próprios; mapas de journals/checkpoints separados do heap. Arcs compartilhados contados uma vez por fonte. Não lê linhas nem inicializa a ordenação; exclui parsers e regex.{}", if clipped { " Limite de 1.024 descritores ou 4.096 textos atingido; subtotal parcial." } else { "" }));
+                rows.mapped_bytes = Some(metadata.mapped_bytes);
+                components.push(rows);
+                let mut files = component("source-maps", "Arquivos mapeados da fonte", None, Some(index.parts.len() as u64), "logical",
+                    "Extensão lógica dos mapas mmap observados (até 1.024 partes); páginas podem ser compartilhadas. Não representa RAM residente nem cache em disco do aplicativo.".into());
+                files.mapped_bytes = Some(mapped);
+                components.push(files);
             }
         },
     }
-    match crate::case_cache::resource_metrics() {
-        Some(metrics) => {
-            components.push(component("case-records", "Eventos preservados dos Casos", Some(metrics.event_estimated_bytes.saturating_add(metrics.overhead_bytes)), Some(metrics.event_count), "estimated",
-                format!("{} versões; estimativa mantida na inserção + capacidade excedente. Arcs de eventos compartilhados contados uma vez; não revarre eventos.", metrics.versions)));
-            engines.extend(metrics.engines);
-        }
-        None => {
-            partial = true;
-            components.push(unavailable(
-                "case-records",
-                "Eventos preservados dos Casos",
-                "Cache de Casos ocupado; coleta não aguardou o lock.",
-            ));
-        }
+    let work = crate::case_work_budget::global();
+    components.push(accounted("work-credits", "Trabalho analítico em uso", work.used() as u64, Some(work.base_limits().live as u64),
+        "Créditos vivos de payloads/scratch admitidos no processo; inclui trabalho de Casos e fontes. Não é medição de RAM, nem reserva física; excluído do subtotal de heap."));
+    let cases = crate::case_resources::resource_snapshot();
+    partial |= cases.partial;
+    components.push(accounted("selection-credits", "IDs de seleções em uso", cases.selection_bytes, Some(cases.selection_limit),
+        "Contabilidade global de IDs lógicos; podem estar em tabelas em disco. Inclui créditos compartilhados por Casos; não somar ao detalhamento por Caso ou ao cache do motor."));
+    for (index, owner) in cases.owners.iter().enumerate() {
+        components.push(accounted(&format!("case-work-{index}"), &format!("Caso {} · análise {}", owner.case_id, owner.analysis_id), owner.accounted_bytes, None,
+            "Créditos de trabalho e seleções desta identidade, compartilhados entre revisões. Já incluídos nos totais globais. A cota depende da política capturada por cada operação; não é RAM."));
     }
-    let mut readers = HashSet::new();
-    let mut generations = HashSet::new();
-    let mut engine_heap = 0u64;
-    let mut engine_storage = 0u64;
-    let mut engine_events = 0u64;
-    for engine in engines {
-        if readers.insert(Arc::as_ptr(&engine) as usize) {
-            engine_heap = engine_heap.saturating_add(engine.resource_heap_bytes());
-            let info = engine.info();
-            engine_events = engine_events.saturating_add(info.event_count as u64);
-            if generations.insert(engine.resource_storage_path().to_path_buf()) {
-                engine_storage = engine_storage.saturating_add(info.index_bytes);
-            }
+    if cases.partial { components.push(unavailable("case-owners", "Detalhamento dos Casos", "Registro ocupado ou mais de 128 identidades; detalhamento parcial, totais globais continuam disponíveis.")); }
+    match crate::engine::resource_snapshot() {
+        Some(engine) => {
+            partial |= engine.partial;
+            let mut entry = accounted("engine-selections", "Cache de seleções DuckDB", engine.selection_bytes, None,
+                "IDs lógicos das seleções nas sessões registradas; não é heap. Sobrepõe a contabilidade global de seleções. Sessões retiradas ainda usadas por consultas não entram neste detalhe. Não executa SQL.");
+            entry.items = Some(engine.selections as u64);
+            if engine.partial { entry.note.push_str(" Cache ocupado ou limite de entradas atingido: subtotal parcial."); }
+            components.push(entry);
+            components.push(component("engine-readers", "Motor DuckDB + Tantivy", None, Some(engine.sessions as u64), "unavailable",
+                format!("{} sessões registradas, {} leitores de texto e {} preparações ativas. RAM interna e spill não são consultados por este coletor; seu consumo está nos processos do aplicativo.", engine.sessions, engine.text_readers, engine.building)));
         }
+        None => { partial = true; components.push(unavailable("engine-readers", "Motor DuckDB + Tantivy", "Registro ocupado; a coleta não aguardou o lock.")); }
     }
-    let mut big_data = component("big-data", "Leitores e índice Big Data", Some(engine_heap), Some(engine_events), "estimated",
-        format!("{} leitores únicos: vetores de endereços e descritores conhecidos; exclui caches internos do Tantivy. {} gerações em disco, contadas uma vez; bytes lógicos do manifesto, sem nova varredura.", readers.len(), generations.len()));
-    big_data.storage_bytes = Some(engine_storage);
-    components.push(big_data);
-    match crate::query::resource_cache_metrics() {
-        Some((entries, bytes)) => components.push(component("match-cache", "Cache de filtros", Some(bytes), Some(entries as u64), "estimated",
-            "Capacidades de até 16 vetores de posições e chaves; Arcs compartilhados contados uma vez. Cópias em consultas ativas não entram neste subtotal.".into())),
-        None => { partial = true; components.push(unavailable("match-cache", "Cache de filtros", "Cache de filtros ocupado; coleta não aguardou o lock.")); }
+    for (id, label, bytes, note) in [
+        ("duckdb-budget", "Limite DuckDB por instância", crate::resources::duckdb_memory_mb().saturating_mul(1 << 20), "Limite configurado por instância DuckDB; não significa uso atual ou limite total de RSS."),
+        ("text-budget", "Orçamento do escritor Tantivy", crate::resources::text_memory_bytes() as u64, "Orçamento configurado para cada escritor de texto; não representa memória ocupada pelos leitores."),
+    ] {
+        let mut entry = component(id, label, None, None, "configured", note.into());
+        entry.budget_bytes = Some(bytes);
+        components.push(entry);
+    }
+    match crate::global_scheduler::resource_snapshot() {
+        Some(scheduler) => components.push(component("scheduler", "Agendador global", None, Some(scheduler.reserved as u64), "accounted",
+            format!("{} de {} vagas de trabalho reservadas; {} aguardando admissão; pico {}. Vagas não são threads do SO nem uso de CPU. I/O pode ceder a vaga enquanto aguarda.", scheduler.reserved, scheduler.limit, scheduler.queued, scheduler.peak))),
+        None => { partial = true; components.push(unavailable("scheduler", "Agendador global", "Agendador ocupado; a coleta não aguardou o lock.")); }
     }
     match crate::detections::resource_cache_metrics() {
         Some((entries, bytes)) => {
-            partial |= entries > 0;
             components.push(component("security-cache", "Resultados de segurança", Some(bytes), Some(entries as u64), "estimated",
-                "Subtotal conhecido de descritores/chaves. Resultados completos ficam em SQLite temporário; RAM interna, conteúdo de metadados e arquivo temporário sem contador rápido não estão incluídos. Não consulta conexões nem confunde orçamento com uso.".into()));
+                "Subtotal conhecido de descritores/chaves. Resultados completos ficam em SQLite temporário; RAM interna e arquivo temporário sem contador rápido não estão incluídos. Não consulta conexões nem confunde orçamento com uso.".into()));
         }
-        None => {
-            partial = true;
-            components.push(unavailable(
-                "security-cache",
-                "Resultados de segurança",
-                "Cache de segurança ocupado; coleta não aguardou o lock.",
-            ));
-        }
+        None => { partial = true; components.push(unavailable("security-cache", "Resultados de segurança", "Cache ocupado; coleta não aguardou o lock.")); }
     }
-    partial |= components
-        .iter()
-        .any(|component| component.basis == "unavailable");
-    let memory_known_bytes = components
-        .iter()
-        .filter_map(|component| component.memory_bytes)
-        .fold(0u64, u64::saturating_add);
-    Inventory {
-        memory_known_bytes,
-        partial,
-        components,
-    }
+    partial |= components.iter().any(|component| component.basis == "unavailable");
+    let memory_known_bytes = components.iter().filter_map(|component| component.memory_bytes).fold(0u64, u64::saturating_add);
+    Inventory { memory_known_bytes, partial, components }
 }
 
 #[derive(Clone, Serialize)]
@@ -457,10 +441,20 @@ pub fn storage_snapshot(root: &Path) -> StorageSnapshot {
 mod tests {
     use super::*;
 
+    #[test]
+    fn accounted_credits_and_configured_limits_never_enter_heap_totals() {
+        let inventory = snapshot(&state());
+        let credits: Vec<_> = inventory.components.iter().filter(|entry| entry.accounted_bytes.is_some() || entry.budget_bytes.is_some()).collect();
+        assert!(credits.len() >= 4);
+        assert!(credits.iter().all(|entry| entry.memory_bytes.is_none()));
+        assert_eq!(inventory.memory_known_bytes, inventory.components.iter().filter_map(|entry| entry.memory_bytes).sum::<u64>());
+        assert!(!inventory.components.iter().any(|entry| matches!(entry.id.as_str(), "big-data" | "match-cache" | "case-records")));
+    }
+
     fn state() -> AppState {
         AppState {
             source: parking_lot::RwLock::new(SourceData::None),
-            big_data_enabled: std::sync::atomic::AtomicBool::new(false),
+            source_publication: parking_lot::RwLock::new(Default::default()),
             source_names: parking_lot::RwLock::new(vec![]),
             codes: parking_lot::RwLock::new(Default::default()),
             system_codes: parking_lot::RwLock::new(Default::default()),

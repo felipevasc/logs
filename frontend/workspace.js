@@ -2,10 +2,12 @@
 (() => {
   "use strict";
   const home = $("#workspace-home"), content = $("#ws-content"), empty = $("#ws-empty");
-  let page = "summary", overview = null, sourceList = [], serial = 0, cacheKey = "", pendingOverview = null, lastExploredKey = "";
+  let page = "summary", overview = null, sourceList = [], serial = 0, cacheKey = "", pendingOverview = null, lastExploredKey = "", navigation = 0;
   const history = [];
   let lastFilters = "[]", importing = false, removedEvidence = null;
   let previousSelection = { filters: [], quick: "" };
+  const savedRecordCount = item => window.CaseEvidence?.active === true ? window.CaseEvidenceItems.count(item) : item?.rows?.length || 0;
+  const openSavedRecord = item => window.CaseEvidence?.active === true ? window.CaseEvidenceItems.open(item) : showDetail(item.rows[0], item.sourceSpec);
   function rememberSelection() {
     const current = { filters: structuredClone(state.filters), quick: state.quick };
     const signature = JSON.stringify(current);
@@ -48,7 +50,7 @@
   const fmtBytes = n => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${fmtNum(Math.ceil(n / 1000))} KB`;
   const pct = n => `${(n * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
   const localInput = t => { const d = new Date(t); return new Date(t - d.getTimezoneOffset() * 60000).toISOString().slice(0, 23); };
-  const sourceKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt, backendFilters(), state.derivedFields, activeCase()?.bigData === true, state.bigDataRevision]);
+  const sourceKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt, backendFilters(), state.derivedFields]);
   const note = text => `<div class="notice">${esc(text)}</div>`;
   const iconButton = (action, icon, title, index) => `<button class="icon-btn" data-action="${action}" data-index="${index}" title="${esc(title)}" aria-label="${esc(title)}"><i class="fas ${icon}"></i></button>`;
   const metric = (label, value, foot, cls = "") => `<div class="metric ${cls}"><div class="metric-label">${label}</div><div class="metric-value">${value}</div><div class="metric-foot">${foot}</div></div>`;
@@ -69,15 +71,22 @@
   function updateCounts() {
     $("#ws-evidence-count").textContent = activeCase()?.items?.length || "";
     $("#ws-source-count").textContent = sourceList.length || "";
-    $("#ws-subtitle").textContent = page === "compromises" ? `Todo o ${workspaceScope() === "case" ? "Caso ativo" : "conjunto carregado"} · independente dos filtros do Explorar` : page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${fmtNum(state.total)} registros do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${fmtNum(state.total)} eventos${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
+    $("#ws-subtitle").textContent = page === "compromises" ? `Todo o ${workspaceScope() === "case" ? "Caso ativo" : "conjunto carregado"} · independente dos filtros do Explorar` : page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${currentCountLabel("registros")} do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${currentCountLabel("eventos")}${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
   }
   async function showPage(next) {
+    const request = ++navigation;
     window.RemoteSources?.unmount?.();
+    if (activeCase()?.kind === "preserved_case_unavailable") {
+      markPage("evidence"); closeDrawer(); switchView("workspace"); home.hidden = false; empty.hidden = true; content.hidden = false;
+      renderUnavailableCase(); return;
+    }
     // Comparar lives in Explorar → Descobrir.
     if (next === "compare") { window.Discovery?.setMode?.("compare"); state.activeDatasetTab = "dashboard"; next = "explore"; }
     if (next === "case-timeline" && workspaceScope() === "case" && activeCase()?.workspace?.timelineMode === "volume") next = "timeline";
     if (workspaceScope() === "case" && STRUCTURE.has(next)) { await window.WorkspaceContext.setScope("dataset", { page: next }); return; }
     if (workspaceScope() === "dataset" && ["evidence", "case-trails"].includes(next) && window.WorkspaceContext && !window.WorkspaceContext.changing) { await window.WorkspaceContext.setScope("case", { page: next }); return; }
+    if (window.AnalysisContexts && activeCase() && state.analysisDefinitionsPending && !await loadDerivedFields()) return;
+    if (request !== navigation) return;
     markPage(next); closeDrawer();
     if (next === "case-timeline" && workspaceScope() === "case") {
       home.hidden = true;
@@ -90,10 +99,13 @@
       if (workspaceScope() === "dataset" && !state.loaded) { await showPage("summary"); return; }
       const contextKey = sourceKey();
       switchView("viz", { deferAnalytics: true }); home.hidden = true;
+      // Background load/profile updates skip hidden field trees. Populate the catalog
+      // when returning from Summary even when the current rows are already cached.
+      renderExploreTree();
       if (lastExploredKey === contextKey && state.rows?.length > 0 && !state.queryError) {
-        // Metadata may have finished while Summary hid the field tree. Repaint
-        // on the cached reveal too; no query is needed to present those fields.
-        renderExploreTree();
+        // Restoring an area's preferences clears its Timeline runtime even when
+        // source reopening already populated these rows and their summary.
+        showExplorerAnalytics(loadExplorerAnalytics(explorerKey(), workspaceScope(), backendFilters()));
         switchTab(state.activeDatasetTab, { deferAnalytics: false });
         return;
       }
@@ -117,6 +129,20 @@
     if (next === "sources") { await renderSources(); return; }
     if (next === "timeline" || next === "case-timeline") { await timeline.load(); return; }
     await renderSummary();
+  }
+  function renderUnavailableCase() {
+    const c = activeCase(), diagnostic = state.cases.diagnostics?.find(value => value.caseId === c?.id);
+    content.replaceChildren();
+    const card = el("section", "ws-card"), title = el("h2", "", "Caso preservado · metadados indisponíveis"), explanation = el("p", "", diagnostic?.message || "Os metadados deste Caso não podem ser editados nesta sessão. O conteúdo original continua preservado."), controls = el("div", "evidence-actions");
+    card.append(title, explanation);
+    if (diagnostic?.preservedCount != null) card.append(el("p", "muted small", `${fmtNum(diagnostic.preservedCount)} ocorrências preservadas · análise indisponível`));
+    const canExport = typeof window.CaseEvidenceTransfer?.openExport === "function";
+    card.append(el("p", "muted small", `Selecione outro Caso ou crie um novo para continuar a análise.${canExport ? " Você pode exportar o conteúdo original deste Caso." : ""}`));
+    const exportButton = el("button", "btn ghost small", "Exportar Caso preservado"); exportButton.type = "button";
+    exportButton.hidden = !canExport;
+    exportButton.onclick = () => { if (activeCase() !== c || !canExport) return; void window.CaseEvidenceTransfer.openExport(c).catch(error => toast(String(error.message || error), "err")); };
+    const create = el("button", "btn primary small", "Novo Caso"); create.type = "button"; create.onclick = () => newCase();
+    controls.append(exportButton, create); card.append(controls); content.append(card);
   }
   async function getOverview(force = false) {
     const key = sourceKey();
@@ -175,7 +201,7 @@
     return showPage(target);
   }
   function search(text) {
-    state.quick = text; $("#quick-search").value = text; state.page = 0; renderChips(); syncCurrentSavedFilter();
+    state.quick = text; setQuickSearchDraft(text); state.page = 0; renderChips(); syncCurrentSavedFilter();
     rememberSelection();
     return showPage("explore");
   }
@@ -186,7 +212,7 @@
   async function contextAround(start, end = start, margin = 5 * 60000) {
     if (workspaceScope() === "case") await window.WorkspaceContext?.setScope("dataset", { animate: false });
     if (!state.loaded) { toast("Abra os registros de origem para ver o contexto.", "info"); return; }
-    state.quick = ""; $("#quick-search").value = ""; window.QueryBar?.status(null);
+    state.quick = ""; setQuickSearchDraft();
     return applyFilters([{ column: "timestamp", op: "between", value: String(start - margin), value2: String(end + margin) }], true);
   }
   const timeline = window.createTimelineView({
@@ -197,7 +223,7 @@
     applyRange,
     onMode: mode => { setAnalysisView(mode === "table" ? "timeline-table" : mode === "horizontal" ? "timeline" : "vtimeline"); if (activeCase()) { activeCase().workspace.analysisView = state.analysisView; activeCase().workspace.timelineMode = mode; } showPage("case-timeline"); },
   });
-  function undo() { const previous = history.pop(); if (!previous) return; Object.assign(state, previous); state.page = 0; previousSelection = structuredClone(previous); lastFilters = JSON.stringify(previous); $("#quick-search").value = state.quick; renderChips(); syncCurrentSavedFilter(); refresh(); }
+  function undo() { const previous = history.pop(); if (!previous) return; Object.assign(state, previous); state.page = 0; previousSelection = structuredClone(previous); lastFilters = JSON.stringify(previous); setQuickSearchDraft(state.quick); renderChips(); syncCurrentSavedFilter(); refresh(); }
   // Comparar is a mode of Explorar → Descobrir: it renders into the host it is given.
   let compareHost = null, compareCurrent = () => false;
   async function renderCompare(host, isCurrent) {
@@ -234,48 +260,157 @@
       area.innerHTML = `<div class="metric-grid">${metric("Referência", fmtNum(res.before_total), "eventos")}${metric("Análise", fmtNum(res.after_total), "eventos")}${metric("Erros · referência", pct(res.before_errors / Math.max(1, res.before_total)), fmtNum(res.before_errors) + " erros", "error")}${metric("Erros · análise", pct(res.after_errors / Math.max(1, res.after_total)), fmtNum(res.after_errors) + " erros", "error")}</div>${res.limited ? note("Limite de padrões atingido. Refine os períodos para detalhar as diferenças.") : ""}${!res.before_total || !res.after_total ? note("Um dos períodos não contém eventos. Revise a cobertura antes de interpretar as diferenças.") : ""}<section class="ws-card"><div class="card-heading"><h2>O que mudou</h2><span>Participação no volume de cada período</span></div><table class="ws-table"><thead><tr><th>Padrão</th><th class="num">Referência</th><th class="num">Análise</th><th class="num">Diferença</th></tr></thead><tbody>${res.changes.map((c, i) => `<tr><td><button class="pattern-button" data-action="change" data-index="${i}">${esc(c.pattern)}</button>${!c.before && c.after ? '<div class="pattern-meta">Aparece somente no período de análise</div>' : ""}</td><td class="num">${fmtNum(c.before)}<div class="pattern-meta">${pct(c.before_rate)}</div></td><td class="num">${fmtNum(c.after)}<div class="pattern-meta">${pct(c.after_rate)}</div></td><td class="num ${c.delta > 0 ? "delta-plus" : "delta-minus"}">${c.delta > 0 ? "+" : ""}${(c.delta * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} pp</td></tr>`).join("")}</tbody></table></section>`;
     } catch (e) { if (compareCurrent() && contextKey === sourceKey() && area.isConnected) area.innerHTML = note(String(e)); } finally { button.disabled = false; }
   }
+  // Source actions capture a rendered source, not an index reused by a later list.
+  let sourceView = null, sourceDateRequest = 0;
+  const sourceContextCurrent = target => !!target && page === "sources" && !home.hidden && !content.hidden && target.view.key === sourceKey()
+    && (!target.view.owner || window.AnalysisContexts.isCurrent(target.view.owner));
+  const sourceActionCurrent = target => sourceContextCurrent(target) && sourceView === target.view
+    && sourceList === target.view.sources && target.view.table.isConnected
+    && sourceList.includes(target.source) && target.source.path === target.path;
+  function sourceActionAllowed(target) {
+    if (sourceActionCurrent(target)) return true;
+    toast("A fonte mudou. Abra suas ações novamente.", "info"); return false;
+  }
+  function sourceFocusFallback() {
+    return [$("#ws-source-add"), document.querySelector('.nav-pages button[aria-current="page"]')].filter(Boolean);
+  }
+  function resolveSourceFocus(target, selector) {
+    if (!sourceContextCurrent(target) || !sourceView?.table.isConnected) return null;
+    return [...sourceView.table.querySelectorAll("[data-source-row]")]
+      .find(row => row._sourceTarget?.path === target.path)?.querySelector(selector) || null;
+  }
+  const sourceMenu = window.ContextMenu.create({
+    captureReturnFocus: origin => {
+      const target = origin?.closest?.("[data-source-row]")?._sourceTarget;
+      const selector = origin?.closest?.(".source-path-toggle") ? ".source-path-toggle"
+        : origin?.closest?.(".source-check") ? ".source-check" : ".source-menu-trigger";
+      return target ? () => resolveSourceFocus(target, selector) : null;
+    },
+    fallbackFocus: sourceFocusFallback,
+  });
+  async function copySourceText(target, value, success) {
+    if (!sourceActionAllowed(target)) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      if (sourceActionCurrent(target)) toast(success, "ok");
+    } catch { if (sourceActionCurrent(target)) toast("Não foi possível copiar. Selecione o texto e tente novamente.", "err"); }
+  }
+  function toggleSourcePath(target, expanded = target.details.hidden) {
+    if (!sourceActionAllowed(target)) return;
+    const restore = !expanded && target.details.contains(document.activeElement);
+    target.details.hidden = !expanded;
+    target.toggle.setAttribute("aria-expanded", String(expanded));
+    if (restore) target.toggle.focus({ preventScroll: true });
+  }
+  async function configureSourceTime(target) {
+    if (!sourceActionAllowed(target)) return;
+    const request = ++sourceDateRequest;
+    const current = () => sourceActionCurrent(target) && request === sourceDateRequest;
+    await openTsModal(target.path, current, () => resolveSourceFocus(target, ".source-menu-trigger"));
+  }
+  async function hashSources(target) {
+    if (!sourceActionAllowed(target) || target.view.hashing) return;
+    const view = target.view, c = activeCase(), artifact = c?.artifacts?.find(a => a.id === state.currentArtifact?.id);
+    view.hashing = true;
+    target.status.textContent = "Calculando SHA-256…"; target.status.hidden = false;
+    try {
+      const hashes = await api("source_hashes", {}, { silent: true });
+      if (!sourceActionCurrent(target)) return;
+      for (const row of view.table.querySelectorAll("[data-source-row]")) {
+        const rowTarget = row._sourceTarget, own = hashes.find(hash => hash.path === rowTarget.path);
+        rowTarget.hashes.replaceChildren();
+        if (!own) continue;
+        const pack = rowTarget.path.includes("!/") ? hashes.find(hash => hash.path === rowTarget.path.split("!/")[0]) : null;
+        for (const [hash, label] of [[own, own.origin === "extraído" ? "SHA-256 (extraído)" : "SHA-256"], ...(pack ? [[pack, "SHA-256 do pacote"]] : [])]) {
+          const button = el("button", "hash-copy", `${label} ${hash.sha256.slice(0, 12)}…${hash.sha256.slice(-8)}`);
+          button.type = "button"; button.title = `${hash.name} · ${fmtBytes(hash.bytes)}\n${hash.sha256}\nClique para copiar`;
+          button.setAttribute("aria-label", `Copiar ${label} de ${hash.name}: ${hash.sha256}`);
+          button.onclick = () => copySourceText(rowTarget, hash.sha256, "SHA-256 copiado.");
+          rowTarget.hashes.append(button);
+        }
+      }
+      toggleSourcePath(target, true);
+      if (c === activeCase() && artifact && c.artifacts?.includes(artifact) && recordCustody(artifact, hashes)) saveCases();
+    } catch (error) { if (sourceActionCurrent(target)) toast(`Não foi possível calcular SHA-256: ${String(error)}`, "err"); }
+    finally {
+      view.hashing = false;
+      if (sourceActionCurrent(target)) { target.status.textContent = ""; target.status.hidden = true; }
+    }
+  }
+  function openSourceMenu(event, target) {
+    event.preventDefault(); event.stopPropagation();
+    if (!sourceActionAllowed(target)) return;
+    window.CanonicalFields?.cancel();
+    const origin = event.target?.closest?.(".source-path-toggle,.source-menu-trigger,.source-check") || target.menu;
+    const box = origin.getBoundingClientRect();
+    sourceMenu.open(event.type === "contextmenu" ? event.clientX : box.left, event.type === "contextmenu" ? event.clientY : box.bottom, [
+      { icon: "fa-folder-open", label: target.details.hidden ? "Ver caminho completo" : "Ocultar caminho completo", onClick: () => toggleSourcePath(target) },
+      { icon: "fa-copy", label: "Copiar caminho", onClick: () => copySourceText(target, target.path, "Caminho copiado.") },
+      { sep: true },
+      { icon: "fa-clock", label: "Data/hora", onClick: () => configureSourceTime(target) },
+      { icon: "fa-fingerprint", label: target.view.hashing ? "Calculando SHA-256…" : "Calcular SHA-256", disabled: target.view.hashing,
+        title: "Calcular o SHA-256 dos arquivos para a cadeia de custódia", onClick: () => hashSources(target) },
+      { sep: true },
+      { icon: "fa-trash-can", label: "Remover da análise", danger: true, onClick: async () => {
+        if (!sourceActionAllowed(target)) return;
+        await removeSource(sourceList.indexOf(target.source));
+        if (document.activeElement === document.body && page === "sources") $("#ws-source-add")?.focus({ preventScroll: true });
+      } },
+    ], { trigger: origin, label: `Ações da fonte ${target.source.name}` });
+  }
+  function buildSourceRow(source, index, view) {
+    const row = el("tr"); row.dataset.sourceRow = String(index);
+    const target = { source, path: source.path, view }; row._sourceTarget = target;
+    const selection = el("td", "source-selection-cell"), check = el("input", "source-check");
+    check.type = "checkbox"; check.checked = true; check.dataset.sourceIndex = String(index);
+    check.setAttribute("aria-label", `Selecionar ${source.name}: ${source.path}`); selection.append(check);
+    const file = el("td", "source-file-cell"), toggle = el("button", "source-path-toggle");
+    toggle.type = "button"; toggle.title = source.path;
+    toggle.setAttribute("aria-label", `Caminho completo de ${source.name}: ${source.path}`);
+    toggle.setAttribute("aria-expanded", "false"); toggle.setAttribute("aria-controls", `source-path-${view.version}-${index}`);
+    const chevron = el("i", "fas fa-chevron-right"); chevron.setAttribute("aria-hidden", "true");
+    toggle.append(chevron, el("span", "", source.name));
+    const range = el("div", "pattern-meta", source.start != null ? `${fmtTs(source.start)} — ${fmtTs(source.end)}` : "Sem horário reconhecido");
+    const details = el("div", "source-path-details"); details.id = `source-path-${view.version}-${index}`; details.hidden = true;
+    const path = el("textarea", "source-full-path"); path.readOnly = true; path.rows = 3; path.spellcheck = false; path.value = source.path;
+    path.setAttribute("aria-label", `Caminho completo de ${source.name}`);
+    path.setAttribute("data-native-context-menu", "");
+    const copy = el("button", "text-button", "Copiar caminho"); copy.type = "button";
+    const hashes = el("div", "source-hashes"), status = el("div", "pattern-meta source-action-status");
+    status.hidden = true; status.setAttribute("role", "status");
+    details.append(path, copy, hashes); file.append(toggle, range, status, details);
+    const format = el("td", "source-format-cell"); format.append(el("span", "tag", source.format));
+    const bytes = el("td", "num source-number-cell", source.bytes ? fmtBytes(source.bytes) : "—");
+    const count = el("td", "num source-number-cell", fmtNum(source.count));
+    const reading = el("td", "source-reading-cell");
+    reading.append(el("span", source.unparsed ? "tag" : "tag good", source.unparsed ? `${source.unparsed}/${source.sampled} não interpretados na amostra` : "Disponível"));
+    if (source.undated) reading.append(el("div", "pattern-meta", `${fmtNum(source.undated)} sem horário`));
+    const actions = el("td", "num source-menu-cell"), menu = el("button", "icon-btn source-menu-trigger");
+    menu.type = "button"; menu.title = `Ações de ${source.name}`;
+    menu.setAttribute("aria-label", `Ações de ${source.name}: ${source.path}`); menu.setAttribute("aria-haspopup", "menu");
+    const icon = el("i", "fas fa-ellipsis"); icon.setAttribute("aria-hidden", "true"); menu.append(icon); actions.append(menu);
+    Object.assign(target, { toggle, details, hashes, status, menu });
+    toggle.onclick = () => toggleSourcePath(target);
+    copy.onclick = () => copySourceText(target, target.path, "Caminho copiado.");
+    menu.onclick = event => openSourceMenu(event, target);
+    row.oncontextmenu = event => { if (!event.target?.closest?.("textarea")) openSourceMenu(event, target); };
+    row.append(selection, file, format, bytes, count, reading, actions);
+    return row;
+  }
   async function renderSources() {
-    const version = ++serial, contextKey = sourceKey();
+    const version = ++serial, contextKey = sourceKey(), owner = window.AnalysisContexts?.capture();
+    const current = () => page === "sources" && !home.hidden && !content.hidden && version === serial && contextKey === sourceKey() && (!owner || window.AnalysisContexts.isCurrent(owner));
     loading("Lendo fontes…");
     try {
-      const sources = await api("list_sources", {}, { silent: true }); if (page !== "sources" || version !== serial || contextKey !== sourceKey()) return; sourceList = sources; updateCounts();
-      content.innerHTML = `<div class="source-controls"><button id="ws-source-add" class="btn primary"><i class="fas fa-plus"></i> Adicionar arquivos</button><button id="ws-source-folder" class="btn ghost">Adicionar pasta</button><button id="ws-source-config" class="btn ghost">Formato e data/hora</button><div class="spacer"></div><button id="ws-source-clear" class="btn ghost danger" title="Descarregar todas as fontes da análise"><i class="fas fa-trash"></i> Limpar análise</button><button id="ws-source-apply" class="btn ghost" ${sourceList.length < 2 ? "disabled" : ""}>Explorar seleção</button></div><section class="ws-card"><table class="ws-table"><thead><tr><th></th><th>Arquivo</th><th>Formato</th><th class="num">Tamanho</th><th class="num">Eventos</th><th>Leitura</th><th class="num">Ação</th></tr></thead><tbody>${sourceList.map((s, i) => `<tr><td><input class="source-check" aria-label="Selecionar ${esc(s.name)}" type="checkbox" data-source-index="${i}" checked></td><td><strong>${esc(s.name)}</strong><div class="pattern-meta" title="${esc(s.path)}">${s.start != null ? `${esc(fmtTs(s.start))} — ${esc(fmtTs(s.end))}` : "Sem horário reconhecido"}</div></td><td><span class="tag">${esc(s.format)}</span></td><td class="num">${s.bytes ? fmtBytes(s.bytes) : "—"}</td><td class="num">${fmtNum(s.count)}</td><td>${s.unparsed ? `<span class="tag">${s.unparsed}/${s.sampled} não interpretados na amostra</span>` : '<span class="tag good">Disponível</span>'}${s.undated ? `<div class="pattern-meta">${fmtNum(s.undated)} sem horário</div>` : ""}</td><td class="num"><button class="icon-btn danger source-remove-btn" title="Remover da análise" data-remove-index="${i}"><i class="fas fa-trash-can"></i></button></td></tr>`).join("")}</tbody></table></section>`;
+      const sources = await api("list_sources", {}, { silent: true }); if (!current()) return; sourceList = sources; updateCounts();
+      content.innerHTML = `<div class="source-controls source-toolbar"><button id="ws-source-add" class="btn primary"><i class="fas fa-plus"></i> Adicionar arquivos</button><button id="ws-source-folder" class="btn ghost">Adicionar pasta</button><button id="ws-source-config" class="btn ghost">Formato e data/hora</button><div class="spacer"></div><button id="ws-source-clear" class="btn ghost danger" title="Descarregar todas as fontes da análise"><i class="fas fa-trash"></i> Limpar análise</button><button id="ws-source-apply" class="btn ghost" ${sourceList.length < 2 ? "disabled" : ""}>Explorar seleção</button></div><section class="ws-card source-table-card"><div class="source-table-scroll" role="region" aria-label="Arquivos carregados" tabindex="0"><table class="ws-table sources-table"><thead><tr><th class="source-selection-cell" aria-label="Seleção"></th><th>Arquivo</th><th class="source-format-cell">Formato</th><th class="num source-number-cell">Tamanho</th><th class="num source-number-cell">Eventos</th><th class="source-reading-cell">Leitura</th><th class="source-menu-cell" aria-label="Ações"></th></tr></thead><tbody></tbody></table></div></section>`;
+      const table = content.querySelector(".sources-table");
+      sourceView = { version, key: contextKey, owner, sources, table, hashing: false };
+      const tbody = table.querySelector("tbody");
+      sources.forEach((source, index) => tbody.append(buildSourceRow(source, index, sourceView)));
       const reload = el("button", "btn ghost", "Recarregar fontes");
       $("#ws-source-config").after(reload);
       reload.onclick = async () => { if (state.currentArtifact?.source && await loadData(state.currentArtifact.source)) await showPage("sources"); };
-      const short = hash => `${hash.slice(0, 12)}…${hash.slice(-8)}`;
-      const showHashes = list => content.querySelectorAll("tbody tr").forEach((row, i) => {
-        const path = sourceList[i].path, own = list.find(h => h.path === path);
-        const pack = path.includes("!/") ? list.find(h => h.path === path.split("!/")[0]) : null;
-        row.querySelector(".source-hash")?.remove();
-        if (!own) return;
-        const line = el("div", "pattern-meta source-hash");
-        const code = (hash, label) => { const b = el("button", "hash-copy", `${label} ${short(hash.sha256)}`); b.type = "button"; b.title = `${hash.name} · ${fmtBytes(hash.bytes)}\n${hash.sha256}\nClique para copiar`; b.onclick = () => navigator.clipboard?.writeText(hash.sha256).then(() => toast("SHA-256 copiado.", "ok")); return b; };
-        line.append(code(own, own.origin === "extraído" ? "SHA-256 (extraído)" : "SHA-256"));
-        if (pack) line.append(code(pack, "pacote"));
-        row.cells[1].append(line);
-      });
-      content.querySelectorAll("tbody tr").forEach((row, i) => {
-        const button = el("button", "text-button", "Data/hora");
-        button.onclick = async () => { await loadTsConfig(sourceList[i].path); openTsModal(sourceList[i].path); };
-        const hash = el("button", "text-button", "SHA-256");
-        hash.title = "Calcular o SHA-256 dos arquivos para a cadeia de custódia";
-        hash.onclick = async () => {
-          const restore = btnBusy(hash, "Calculando…");
-          try {
-            const list = await api("source_hashes", {});
-            showHashes(list);
-            const c = activeCase(), artifact = c?.artifacts?.find(a => a.id === state.currentArtifact?.id);
-            if (artifact && recordCustody(artifact, list)) saveCases();
-          } catch {} finally { restore(); }
-        };
-        const actions = el("div", "source-actions");
-        actions.append(button, hash);
-        row.cells[1].append(actions);
-      });
-      content.querySelectorAll(".source-remove-btn").forEach(btn => {
-        btn.onclick = async () => { await removeSource(+btn.dataset.removeIndex); };
-      });
       $("#ws-source-clear").onclick = async () => {
         if (!confirm("Deseja realmente descarregar todas as fontes e limpar a análise atual?")) return;
         await clearAnalysis();
@@ -284,12 +419,12 @@
       $("#ws-source-folder").onclick = () => openFiles(true, true);
       $("#ws-source-config").onclick = () => { home.hidden = true; switchView("source"); showSourceMode("load"); };
       $("#ws-source-apply").onclick = () => {
-        const selected = [...document.querySelectorAll("[data-source-index]:checked")].map(c => sourceList[+c.dataset.sourceIndex].path).filter(Boolean);
+        const selected = [...content.querySelectorAll("[data-source-index]:checked")].map(c => sourceList[+c.dataset.sourceIndex].path).filter(Boolean);
         if (!selected.length) { toast("Selecione ao menos uma fonte.", "info"); return; }
         const all = selected.length === sourceList.length;
         applyFilters([...state.filters.filter(f => f.column !== "caminho"), ...(all ? [] : [{ column: "caminho", op: "regex", value: `^(?:${selected.map(escapeRegex).join("|")})$` }])], true);
       };
-    } catch (e) { if (page === "sources" && version === serial && contextKey === sourceKey()) failed(e); }
+    } catch (e) { if (current()) failed(e); }
   }
   async function removeSource(index) {
     const target = sourceList[index];
@@ -345,6 +480,7 @@
     }
   }
   async function clearAnalysis() {
+    if (!await clearData({ removeCurrent: true })) return;
     state.loaded = false;
     state.currentArtifact = null;
     state.columns = [];
@@ -373,13 +509,47 @@
   }
   async function loaded() {
     cacheKey = ""; overview = null;
+    void window.ExclusionVisibility?.refresh();
     history.length = 0; previousSelection = { filters: structuredClone(state.filters), quick: state.quick }; lastFilters = JSON.stringify(previousSelection);
-    try { sourceList = await api("list_sources", {}, { silent: true }); } catch { sourceList = []; }
+    const contextKey = sourceKey();
+    try {
+      const confirmed = await api("list_sources", {}, { silent: true });
+      if (contextKey !== sourceKey()) return;
+      sourceList = confirmed;
+    } catch {
+      // A transient listing error cannot mean that every imported file vanished.
+      // The Sources page retries the authoritative list before offering actions.
+    }
     updateCounts();
+  }
+  async function saveNativeRows(rows, metadata, { guard = () => true } = {}) {
+    try {
+      const c = ensureCase(), owner = await window.AnalysisContexts.prepare(window.AnalysisContexts.capture(), { metadata: true }), current = () => guard() && activeCase() === c && window.AnalysisContexts.isCurrent(owner);
+      const actions = nativeEvidenceServices().actions, selected = await actions.selection(rows, { guard: current });
+      const item = await actions.add(selected, { id: nid(), createdAt: Date.now(), note: "", tags: [], relevance: "normal", origin: state.currentOrigin, artifactId: state.currentArtifact?.id, stationId: null,
+        sourceFilters: structuredClone(backendFilters()), sourceSpec: structuredClone(state.currentArtifact?.source), ...metadata }, { guard: current });
+      if (item) { updateCounts(); window.WorkspaceContext?.refreshMembership(); toast("Ocorrências preservadas no Caso.", "ok"); return item; }
+    } catch (error) { toast(String(error.message || error), "err"); }
+    return null;
+  }
+  async function removeSavedItem(c, item) {
+    if (window.CaseEvidence?.active === true) {
+      try { const receipt = await nativeEvidenceServices().actions.detach(c, item); removedEvidence = { native: true, receipt, caseId: c.id }; if (activeCase() === c) renderEvidence(); return true; }
+      catch (error) { toast(String(error.message || error), "err"); return false; }
+    }
+    const index = c.items.indexOf(item); if (index < 0) return false;
+    removedEvidence = { item, caseId: c.id, index }; c.items.splice(index, 1); await saveCases(); renderEvidence(); return true;
   }
   async function saveFinding(finding) {
     if (workspaceScope() === "case") { toast("Estes registros já pertencem ao Caso.", "info"); return; }
     const c = ensureCase();
+    if (window.CaseEvidence?.active === true) {
+      const owner = window.AnalysisContexts.capture(), guard = () => activeCase() === c && window.AnalysisContexts.isCurrent(owner);
+      if (finding.event_id == null) { toast("Abra os registros do achado para escolher as ocorrências a preservar.", "info"); return; }
+      const row = state.rows.find(row => row.id === finding.event_id);
+      if (!row?.event_ref) { toast("Abra o registro do achado na Análise antes de preservá-lo.", "info"); return; }
+      return saveNativeRows([row], { kind: "grupo", label: finding.title, note: finding.detail, foundCount: 1 }, { guard });
+    }
     const row = finding.event_id != null ? await api("event_detail", { id: finding.event_id }) : null;
     const filters = [...backendFilters().filter(f => f.column !== "timestamp")];
     if (finding.start != null && finding.end != null) filters.push({ column: "timestamp", op: "between", value: String(finding.start), value2: String(finding.end) });
@@ -390,6 +560,7 @@
   async function saveEvent(ev) {
     if (!ev) return;
     if (workspaceScope() === "case") { toast("Este registro já pertence ao Caso.", "info"); return; }
+    if (window.CaseEvidence?.active === true) return saveNativeRows([ev], { kind: "evento", label: String(ev.message || ev.name || "Registro preservado").split("\n")[0].slice(0, 140), foundCount: 1 });
     const c = ensureCase(); const key = caseRecordKey(ev, state.currentArtifact?.id, state.currentOrigin);
     if (c.items.some(it => it.rows?.some(r => caseRecordKey(r, it.artifactId, it.origin) === key))) { toast("Este evento já está nas evidências.", "info"); return; }
     queueCustody(registerCurrentArtifact(c));
@@ -403,7 +574,15 @@
     const query = evidenceSearch.toLocaleLowerCase("pt-BR"), selected = items.map((item,index)=>({item,index})).filter(({item})=>!query||[item.label,...Object.values(CaseContent.narrative(item))].join(" ").toLocaleLowerCase("pt-BR").includes(query));
     const pages = Math.max(1, Math.ceil(selected.length / 40)); evidencePage = Math.min(evidencePage, pages-1);
     const visible = selected.slice(evidencePage*40,evidencePage*40+40);
-    content.innerHTML = `<div class="source-controls"><button class="btn primary" id="ws-evidence-pdf"><i class="fas fa-file-pdf"></i> Relatório PDF</button><button class="btn ghost" id="ws-evidence-trails"><i class="fas fa-route"></i> Trilhas</button><button class="btn ghost" id="ws-evidence-advanced">Linha do tempo</button><button class="btn ghost" id="ws-evidence-export" title="Exportar a investigação com seus textos e imagens"><i class="fas fa-arrow-up-from-bracket"></i> Exportar</button></div><div class="evidence-list-controls"><input id="ws-evidence-search" type="search" placeholder="Buscar nos itens…" aria-label="Buscar nos itens do Caso" value="${esc(evidenceSearch)}"><span class="muted small">${fmtNum(selected.length)} itens</span><div class="spacer"></div><button class="icon-btn" id="ws-evidence-prev" aria-label="Página anterior" ${evidencePage===0?'disabled':''}><i class="fas fa-chevron-left"></i></button><span class="muted small">${evidencePage+1} / ${pages}</span><button class="icon-btn" id="ws-evidence-next" aria-label="Próxima página" ${evidencePage+1===pages?'disabled':''}><i class="fas fa-chevron-right"></i></button></div>${visible.length ? visible.map(({item:it,index:i}) => { const narrative=CaseContent.narrative(it);return `<article class="ws-card evidence-card" data-item-index="${i}"><div class="evidence-top"><div><h2>${esc(it.label || "Item do Caso")}</h2><span class="subtle">${esc(fmtTs(it.createdAt))}${it.rows?.length ? ` · ${fmtNum(it.rows.length)} registros preservados` : " · Recorte salvo"}</span></div>${iconButton("remove-evidence", "fa-trash-can", "Remover item do Caso", i)}</div>${narrative.summary?`<p class="case-narrative-summary">${esc(narrative.summary)}</p>`:''}${narrative.details?`<details class="case-item-details"><summary>Detalhes</summary><p>${esc(narrative.details)}</p></details>`:''}<div data-item-images></div><div class="evidence-actions"><button class="btn ghost small" data-action="explain-evidence" data-index="${i}"><i class="fas fa-pen-to-square"></i> Explicação e imagens</button>${it.rows?.length ? `<button class="btn ghost small" data-action="evidence-event" data-index="${i}">${it.rows.length>1?'Primeiro registro':'Ver registro'}</button>` : ""}<button class="btn ghost small" data-action="reopen-evidence" data-index="${i}">Reabrir recorte</button>${it.relevance&&it.relevance!=='normal'?`<span class="tag">${esc(it.relevance)}</span>`:''}</div></article>`; }).join("") : '<section class="ws-card"><p class="quiet-empty">Nenhum item encontrado. Salve registros da Análise para reuni-los no Caso.</p></section>'}`;
+    content.innerHTML = `<div class="source-controls"><button class="btn primary" id="ws-evidence-pdf"><i class="fas fa-file-pdf"></i> Relatório PDF</button><button class="btn ghost" id="ws-evidence-trails"><i class="fas fa-route"></i> Trilhas</button><button class="btn ghost" id="ws-evidence-advanced">Linha do tempo</button><button class="btn ghost" id="ws-evidence-export" title="Exportar a investigação com seus textos e imagens"><i class="fas fa-arrow-up-from-bracket"></i> Exportar</button></div><div class="evidence-list-controls"><input id="ws-evidence-search" type="search" placeholder="Buscar nos itens…" aria-label="Buscar nos itens do Caso" value="${esc(evidenceSearch)}"><span class="muted small">${fmtNum(selected.length)} itens</span><div class="spacer"></div><button class="icon-btn" id="ws-evidence-prev" aria-label="Página anterior" ${evidencePage===0?'disabled':''}><i class="fas fa-chevron-left"></i></button><span class="muted small">${evidencePage+1} / ${pages}</span><button class="icon-btn" id="ws-evidence-next" aria-label="Próxima página" ${evidencePage+1===pages?'disabled':''}><i class="fas fa-chevron-right"></i></button></div>${visible.length ? visible.map(({item:it,index:i}) => { const narrative=CaseContent.narrative(it);return `<article class="ws-card evidence-card" data-item-index="${i}"><div class="evidence-top"><div><h2>${esc(it.label || "Item do Caso")}</h2><span class="subtle">${esc(fmtTs(it.createdAt))}${savedRecordCount(it) ? ` · ${fmtNum(savedRecordCount(it))} registros preservados` : " · Recorte salvo"}</span></div>${iconButton("remove-evidence", "fa-trash-can", "Remover item do Caso", i)}</div>${narrative.summary?`<p class="case-narrative-summary">${esc(narrative.summary)}</p>`:''}${narrative.details?`<details class="case-item-details"><summary>Detalhes</summary><p>${esc(narrative.details)}</p></details>`:''}<div data-item-images></div><div class="evidence-actions"><button class="btn ghost small" data-action="explain-evidence" data-index="${i}"><i class="fas fa-pen-to-square"></i> Explicação e imagens</button>${savedRecordCount(it) ? `<button class="btn ghost small" data-action="evidence-event" data-index="${i}">${savedRecordCount(it)>1?'Primeiro registro':'Ver registro'}</button>` : ""}<button class="btn ghost small" data-action="reopen-evidence" data-index="${i}">Reabrir recorte</button>${it.relevance&&it.relevance!=='normal'?`<span class="tag">${esc(it.relevance)}</span>`:''}</div></article>`; }).join("") : '<section class="ws-card"><p class="quiet-empty">Nenhum item encontrado. Salve registros da Análise para reuni-los no Caso.</p></section>'}`;
+    if (window.CaseEvidence?.active === true) {
+      const services = nativeEvidenceServices(), status = services.session.status();
+      if (status === "retry_required" || status === "reconcile_required") {
+        const notice = el("div", "ws-card", status === "retry_required" ? "O último salvamento aguarda confirmação. O rascunho e as ocorrências preparadas permanecem preservados." : "A investigação mudou em outra revisão. Preserve o rascunho antes de reabrir a investigação.");
+        if (status === "retry_required") { const retry = el("button", "btn ghost small", "Repetir salvamento"); retry.type = "button"; retry.onclick = async () => { retry.disabled = true; try { await services.session.retry(); if (activeCase() === c) renderEvidence(); window.WorkspaceContext?.refreshMembership(); } catch (error) { toast(String(error.message || error), "err"); retry.disabled = false; } }; notice.append(retry); }
+        content.prepend(notice);
+      }
+    }
     window.CaseIntel?.mount(content, c);
     $("#ws-evidence-pdf").onclick = () => CaseReport.open();
     $("#ws-evidence-trails").onclick = () => showPage("case-trails");
@@ -416,6 +595,7 @@
       const index = +card.dataset.itemIndex;
       const item = items[index];
       window.EvidenceUI?.mountCase(card, item);
+      if (window.CaseEvidence?.active === true) window.CaseEvidenceItems.attachRecords(card, c, item);
       if(item?.attachments?.length)CaseContent.mountAttachments(card.querySelector("[data-item-images]"),item);
       card.oncontextmenu = (e) => {
         e.preventDefault();
@@ -425,24 +605,20 @@
             label: "Remover item do Caso",
             danger: true,
             onClick: async () => {
-              removedEvidence = { item, caseId: c.id, index };
-              c.items.splice(index, 1);
-              await saveCases();
-              renderEvidence();
-              toast("Item removido do Caso.", "ok");
+              if (await removeSavedItem(c, item)) toast("Item removido do Caso.", "ok");
             }
           },
           { sep: true },
           {
             icon: "fa-pen-to-square",
             label: "Explicação e imagens",
-            onClick: () => CaseContent.editItem(item.id)
+            onClick: () => CaseContent.editItem(item)
           },
           ...(window.CaseIntel?.menuItems(item) || []),
-          ...(item.rows?.length ? [{
+          ...(savedRecordCount(item) ? [{
             icon: "fa-eye",
-            label: item.rows.length > 1 ? "Primeiro registro" : "Ver registro",
-            onClick: () => showDetail(item.rows[0], item.sourceSpec)
+            label: savedRecordCount(item) > 1 ? "Primeiro registro" : "Ver registro",
+            onClick: () => openSavedRecord(item)
           }] : []),
           {
             icon: "fa-rotate-left",
@@ -460,16 +636,23 @@
     if (removedEvidence?.caseId === c?.id) {
       const restore = el("button", "btn ghost", "Desfazer remoção");
       $("#ws-evidence-advanced").after(restore);
-      restore.onclick = async () => { c.items.splice(removedEvidence.index, 0, removedEvidence.item); removedEvidence = null; await saveCases(); renderEvidence(); };
+      restore.onclick = async () => {
+        const captured = removedEvidence; restore.disabled = true;
+        try { if (captured.native) await nativeEvidenceServices().actions.undo(captured.receipt); else { c.items.splice(captured.index, 0, captured.item); if (await saveCases() === false) return; }
+          if (removedEvidence === captured) removedEvidence = null; if (activeCase() === c) renderEvidence();
+        } catch (error) { toast(String(error.message || error), "err"); } finally { restore.disabled = false; }
+      };
     }
     const importButton = el("button", "btn ghost", "Importar investigação");
     $("#ws-evidence-advanced").after(importButton);
+    if (window.CaseEvidence?.active === true && window.CaseEvidenceTransfer?.service().status() !== "ready") importButton.textContent = "Repetir importação pendente";
     importButton.onclick = async () => {
       try {
-        const path = await dialogApi.open({ multiple: false, filters: [{ name: "Investigação", extensions: ["json"] }] });
+        if (window.CaseEvidence?.active === true) { importButton.disabled = true; try { await window.CaseEvidenceTransfer.openImport(); } finally { importButton.disabled = false; } return; }
+        const path = await dialogApi.open({ multiple: false, filters: [{ name: "Investigação", extensions: ["licase", "json"] }] });
         if (!path) return;
         const data = normalizeCaseStore(await api("import_investigation", { path }));
-        for (const c of data.cases) { if (state.cases.cases.some(saved => saved.id === c.id)) c.id = nid(); state.cases.cases.push(c); }
+        for (const c of data.cases) { if (state.cases.cases.some(saved => saved.id === c.id)) c.id = nid(); clearVisiblePreferences([c.id]); state.cases.cases.push(c); }
         if (await saveCases()) { renderCaseBar(); toast("Investigação importada. Selecione-a no menu de casos.", "ok"); }
       } catch (error) { toast(String(error), "err"); }
     };
@@ -484,20 +667,54 @@
     if (facts.custody.length) parts.push(`## Integridade das fontes (SHA-256)\n\n${facts.custody.map(a => a.files.map(f => `- ${a.label} · ${f.name}${f.origin === "extraído" ? " (extraído do pacote)" : ""} · ${fmtBytes(f.bytes)}\n  \`${f.sha256}\``).join("\n")).join("\n")}`);
     return parts.length ? `${parts.join("\n\n")}\n\n` : "";
   }
-  function report() {
+  async function report() {
     const c = activeCase();
+    if (window.CaseEvidence?.active === true) {
+      const timeline = await window.CaseTimeline.rows(c, () => true, { includeUndated: true }), lines = [`# ${c.name || "Investigação"}`, synthesisMarkdown(c)];
+      for (const item of c.items || []) lines.push(`## ${item.label || "Item do Caso"}`, Object.values(CaseContent.narrative(item)).filter(Boolean).join("\n\n"), `${savedRecordCount(item)} ocorrências preservadas.`);
+      lines.push("## Cronologia preservada");
+      for (const row of timeline.rows) lines.push(`- ${row.start === null ? "Sem horário" : fmtTsFull(row.start)} · ${row.title} · ${row.source}\n  ${row.detail}${row.notes?.length ? `\n  ${row.notes.map(note => note.text).join("; ")}` : ""}`);
+      return lines.join("\n\n");
+    }
     return `# ${c?.name || "Investigação"}\n\n${synthesisMarkdown(c)}${(c?.items || []).map(it => `## ${it.label}\n\n${Object.values(CaseContent.narrative(it)).filter(Boolean).join("\n\n")}\n\n${window.EvidenceUI?.redact(window.EvidenceUI.report(it)) || ""}\n\n${it.rows?.length || 0} eventos preservados.\n\n${(it.rows || []).map(e => `- ${fmtTsFull(e.timestamp)} · ${e.source} · ${e.message.replaceAll("\n", " ")}\n  Referência: ${e.event_ref || e.id}`).join("\n")}\n\nFiltros: ${JSON.stringify(it.sourceFilters || [])}`).join("\n\n")}`;
   }
-  function openExport() { $("#ws-export-modal").hidden = false; $("#ws-export-kind").focus(); $("#ws-export-kind").dispatchEvent(new Event("change")); $("#ws-export-scope").textContent = `${fmtNum(state.total)} eventos no recorte atual. A exportação de eventos inclui todos os resultados.`; }
+  function renderExportScope() {
+    const kind = $("#ws-export-kind").value, c = activeCase(), scope = $("#ws-export-scope");
+    const wholeCase = ["case", "case-pdf", "report"].includes(kind);
+    scope.textContent = wholeCase
+      ? !c ? "Nenhum Caso selecionado." : `${c.kind === "preserved_case_unavailable" ? "Caso preservado" : "Caso completo"} · ${Array.isArray(c.items) ? `${fmtNum(c.items.length)} itens` : "quantidade de itens indisponível"}. Os filtros do Explorar não se aplicam.`
+      : `Recorte atual ${workspaceScope() === "case" ? "do Caso" : "da Análise"} · ${currentCountLabel("registros")}.`;
+    let help = $("#ws-export-help");
+    if (!help) { help = el("p", "muted small"); help.id = "ws-export-help"; scope.after(help); $("#ws-export-kind").setAttribute("aria-describedby", "ws-export-scope ws-export-help"); }
+    if (kind === "case") {
+      const json = window.CaseEvidence?.active === true ? "JSON recusa Casos com referências ou histórico de exclusões." : "JSON legado não transporta os arquivos das referências e recusa histórico de exclusões.";
+      help.textContent = `LICASE com evidências, configuração, imagens, referências e histórico de exclusões. ${json} A exportação integral com referências originais ou proveniência de exclusões é recusada quando a ocultação de textos está marcada. Imagens não recebem ocultação.`;
+    } else if (kind === "case-pdf") {
+      help.textContent = "PDF com cronologia, trilhas, explicações e imagens. O próximo passo abre a geração do relatório, com proteção de textos própria.";
+    } else if (kind === "report") {
+      help.textContent = `Markdown com textos dos itens e ${window.CaseEvidence?.active === true ? "cronologia preservada" : "registros preservados"}, sem imagens.`;
+    } else {
+      help.textContent = `${kind.toUpperCase()} com todos os resultados dos filtros, além da página visível.`;
+    }
+    $("#ws-mask").closest("label").hidden = kind === "case-pdf";
+  }
+  function openExport() { renderExportScope(); $("#ws-export-modal").hidden = false; $("#ws-export-kind").focus(); }
   async function exportFile() {
     const kind = $("#ws-export-kind").value, mask = $("#ws-mask").checked;
+    if (window.CaseEvidence?.active === true && kind === "case") {
+      const restore = btnBusy($("#ws-export-save"), "Exportando…");
+      try { const result = await window.CaseEvidenceTransfer.openExport(activeCase(), { mask }); if (result) $("#ws-export-modal").hidden = true; }
+      catch (error) { toast(String(error.message || error), "err"); } finally { restore(); } return;
+    }
     if (kind === "case-pdf") { $("#ws-export-modal").hidden = true; window.CaseReport.open(); return; }
-    const extension = kind === "report" ? "md" : kind === "case" ? "json" : kind;
-    const path = await dialogApi.save({ defaultPath: `loginsight.${extension}`, filters: [{ name: extension.toUpperCase(), extensions: [extension] }] });
+    const extension = kind === "report" ? "md" : kind === "case" ? "licase" : kind;
+    const filters = kind === "case" ? [{ name: "Investigação portátil", extensions: ["licase"] }, { name: "JSON legado · sem exclusões", extensions: ["json"] }] : [{ name: extension.toUpperCase(), extensions: [extension] }];
+    const path = await dialogApi.save({ defaultPath: `loginsight.${extension}`, filters });
     if (!path) return; const button = $("#ws-export-save"), restore = btnBusy(button, "Exportando…");
     try {
       if (kind === "report" || kind === "case") {
-        const data = kind === "report" ? report() : { schemaVersion: 2, active: activeCase()?.id, cases: activeCase() ? [activeCase()] : [] };
+        if (kind === "case") { window.WorkspaceContext?.capture(); syncVisiblePreferenceMetadata(); }
+        const data = kind === "report" ? await report() : { schemaVersion: 2, active: activeCase()?.id, cases: activeCase() ? [activeCase()] : [] };
         if (kind === "case") await api("export_investigation", { path, data, mask });
         else await api("export_document", { path, content: mask ? redactValue(data) : data });
       } else { await api("export_events", { path, format: kind, ...analyticsRequest(workspaceScope()), mask }); }
@@ -523,9 +740,9 @@
     if (action === "save-finding") { await saveFinding(overview.findings[i]); return; }
     if (action === "change") { const c = comparison.changes[i], period = c.after ? comparisonPeriods.after : comparisonPeriods.before; applyFilters([...state.filters.filter(f => f.column !== "timestamp"), { column: "message", op: "pattern", value: c.pattern }, { column: "timestamp", op: "between", value: String(period.start), value2: String(period.end) }], true); return; }
     const item = activeCase()?.items?.[i]; if (!item) return;
-    if (action === "remove-evidence") { removedEvidence = { item, caseId: activeCase().id, index: i }; activeCase().items.splice(i, 1); await saveCases(); renderEvidence(); }
-    if (action === "evidence-event") { showDetail(item.rows[0], item.sourceSpec); }
-    if (action === "explain-evidence") { await CaseContent.editItem(item.id); }
+    if (action === "remove-evidence") { await removeSavedItem(activeCase(), item); }
+    if (action === "evidence-event") { await openSavedRecord(item); }
+    if (action === "explain-evidence") { await CaseContent.editItem(item); }
     if (action === "reopen-evidence") {
       await window.WorkspaceContext?.setScope("dataset", { animate: false });
       if (item.sourceSpec && JSON.stringify(item.sourceSpec) !== JSON.stringify(state.currentArtifact?.source) && !await loadData(item.sourceSpec)) return;
@@ -543,13 +760,13 @@
   // The Linha do tempo menu reopens the section last used in this area.
   $('.nav-pages [data-page="case-timeline"]').onclick = () => showPage(lastGroupPage[workspaceScope()] || "case-timeline");
   $("#ws-reload").onclick = async () => { cacheKey = ""; timeline.invalidate(); window.Security?.invalidate(); await showPage(page); };
-  $("#ws-clear-scope").onclick = () => { state.filters = []; state.quick = ""; $("#quick-search").value = ""; state.page = 0; renderChips(); syncCurrentSavedFilter(); refresh().then(() => showPage(page)); };
+  $("#ws-clear-scope").onclick = () => { state.filters = []; state.quick = ""; setQuickSearchDraft(); state.page = 0; renderChips(); syncCurrentSavedFilter(); refresh().then(() => showPage(page)); };
   $("#ws-export").onclick = openExport; $("#ws-export-close").onclick = () => { $("#ws-export-modal").hidden = true; }; $("#ws-export-save").onclick = exportFile;
-  $("#ws-export-kind").onchange = () => { const wholeCase=["case", "case-pdf", "report"].includes($("#ws-export-kind").value);$("#ws-export-scope").textContent=wholeCase?`Caso completo · ${fmtNum(activeCase()?.items?.length||0)} itens. Imagens acompanham a investigação JSON e o relatório PDF.`:`${fmtNum(state.total)} registros no recorte atual.`;$("#ws-mask").closest("label").hidden=$("#ws-export-kind").value==="case-pdf"; };
+  $("#ws-export-kind").onchange = renderExportScope;
   $("#ws-export-modal").onclick = e => { if (e.target.id === "ws-export-modal") e.target.hidden = true; };
-  $("#btn-load").onclick = async () => { await loadData(); if (state.loaded) { await loaded(); await showPage("summary"); } };
-  $("#btn-merge").onclick = async () => { await loadData(null, { merge: true }); if (state.loaded) { await loaded(); await showPage("summary"); } };
-  $("#workbar-cancel").onclick = async () => { window.Tasks?.cancelAll(); await api("cancel_operation", {}, { silent: true }); state.refreshVersion++; serial++; finishOperation("Operação cancelada"); };
+  $("#btn-load").onclick = async () => { if (await loadData()) await showPage("summary"); };
+  $("#btn-merge").onclick = async () => { if (await loadData(null, { merge: true })) await showPage("summary"); };
+  $("#workbar-cancel").onclick = cancelWorkbarTask;
   $("#tabbtn-group").innerHTML = '<i class="fas fa-layer-group"></i> Agrupar';
   $("#tabbtn-dashboard").innerHTML = '<i class="fas fa-chart-line"></i> Gráficos';
   $("#tabbtn-cube").innerHTML = '<i class="fas fa-table-cells"></i> Tabela dinâmica';
@@ -557,9 +774,10 @@
   const tools = el("div", "explore-tools"); tools.innerHTML = '<button class="icon-btn" id="ws-undo" title="Desfazer filtro (Alt + ←)" aria-label="Desfazer filtro"><i class="fas fa-rotate-left"></i></button><button class="icon-btn" id="ws-wrap" title="Quebrar linhas" aria-label="Quebrar linhas"><i class="fas fa-align-left"></i></button><button class="icon-btn" id="ws-density" title="Alternar densidade" aria-label="Alternar densidade"><i class="fas fa-grip-lines"></i></button>';
   $(".viewbar").appendChild(tools); $("#ws-undo").onclick = undo;
   $("#ws-wrap").onclick = () => { document.body.dataset.wrap = document.body.dataset.wrap !== "true"; };
-  $("#ws-density").onclick = () => { const d = document.body.dataset.density === "compact" ? "comfortable" : "compact"; document.body.dataset.density = d; localStorage.setItem("workspace.density", d); };
-  document.body.dataset.density = localStorage.getItem("workspace.density") || "comfortable";
-  try { state.favoriteFields = JSON.parse(localStorage.getItem("workspace.fields") || "[]"); } catch { state.favoriteFields = []; }
+  $("#ws-density").onclick = () => { const d = document.body.dataset.density === "compact" ? "comfortable" : "compact"; document.body.dataset.density = d; void saveCases(); };
+  // Legacy profile-wide values are preserved in storage, but have no proved Case owner.
+  document.body.dataset.density = "comfortable";
+  state.favoriteFields = [];
   const detailActions = el("div", "detail-quick-actions"); detailActions.innerHTML = '<button class="btn ghost small" id="ws-detail-save"><i class="fas fa-bookmark"></i> Salvar</button><button class="btn ghost small" id="ws-detail-context">Ver contexto</button><button class="btn ghost small" id="ws-detail-follow">Seguir requisição</button>';
   $(".drawer-tabs").after(detailActions);
   $("#ws-detail-save").onclick = () => saveEvent(state.currentDetailEv);
@@ -580,7 +798,7 @@
     if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); undo(); }
     if (e.key === "Tab") {
       const modal = [...document.querySelectorAll(".modal-overlay:not([hidden])")].at(-1);
-      const controls = modal ? [...modal.querySelectorAll("button,input,select,textarea,a[href],[tabindex='0']")].filter(n => !n.disabled && n.getClientRects().length) : [];
+      const controls = modal ? [...modal.querySelectorAll("button,input,select,textarea,a[href],[tabindex='0']")].filter(n => !n.disabled && n.tabIndex >= 0 && n.getClientRects().length) : [];
       if (controls.length) { const first=controls[0], last=controls.at(-1); if (e.shiftKey && (document.activeElement===first || !modal.contains(document.activeElement))) {e.preventDefault();last.focus();} else if (!e.shiftKey && (document.activeElement===last || !modal.contains(document.activeElement))) {e.preventDefault();first.focus();} }
     }
     if (e.key === "Escape") { $("#ws-export-modal").hidden = true; $("#ws-drop").hidden = true; }
@@ -598,16 +816,19 @@
   window.Workspace = {
     loaded, showPage, saveEvent, applyFilters, applyRange, contextAround, search, sourceKey, focusTimeline, syncZone, renderCompare,
     overview: () => getOverview(),
-    openItem: itemId => { const item=activeCase()?.items?.find(item=>item.id===itemId);if(item?.rows?.length)showDetail(item.rows[0],item.sourceSpec); },
+    openItem: itemId => { const c=activeCase(), matches=typeof itemId === "object" && window.CaseEvidence?.active === true ? [window.CaseEvidenceItems.resolve(c,itemId)].filter(value=>value.state === "unique").map(value=>value.item) : (c?.items||[]).filter(item=>item.id===itemId);if(matches.length !== 1){toast("A associação está ausente ou é ambígua. Abra o item desejado em Evidências.","info");return;}if(savedRecordCount(matches[0]))return openSavedRecord(matches[0]); },
     page: () => page,
     capture: () => ({ history: structuredClone(history), previousSelection: structuredClone(previousSelection), lastFilters, timeline: timeline.capture() }),
     restore: snapshot => { serial++; cacheKey = ""; overview = null; pendingOverview = null; history.splice(0, history.length, ...(snapshot?.history || [])); previousSelection = snapshot?.previousSelection || { filters: structuredClone(state.filters), quick: state.quick }; lastFilters = snapshot?.lastFilters || JSON.stringify(previousSelection); timeline.restore(snapshot?.timeline); },
+    invalidateAnalysis: () => { serial++; cacheKey = ""; overview = null; pendingOverview = null; lastExploredKey = ""; timeline.invalidate(); },
     onFiltersChanged: () => { lastExploredKey = ""; if (["summary", "timeline", "case-timeline", "compare", "journeys"].includes(page)) showPage(page); },
     onView(which) {
       if (which === "workspace") return;
       home.hidden = true;
       markPage(which === "viz" || which === "trail" ? "explore" : which === "source" ? "sources" : which === "caso" && ["timeline", "vtimeline", "timeline-table"].includes(state.analysisView) ? "case-timeline" : "evidence");
     },
+    onCountChanged: updateCounts,
+    onAnalyticsStateChanged: updateCounts,
     onRefresh() {
       rememberSelection();
       lastExploredKey = sourceKey();

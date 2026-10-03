@@ -145,7 +145,7 @@ pub fn lanes_impl(
             }
             acc
         }
-        None => workspace::with_selection(state, &scoped, |selection| selection.par_fold(LaneAcc::default, step, merge)),
+        None => workspace::with_selection(state, &scoped, |selection| selection.par_fold(LaneAcc::default, step, merge))?,
     };
     crate::operations::check()?;
     let mut all: Vec<(Box<str>, (usize, usize, Vec<u32>, Vec<u32>))> = acc.lanes.into_iter().collect();
@@ -191,10 +191,12 @@ pub async fn timeline_lanes(
     limit: Option<usize>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Lanes, String> {
-    let case_events = crate::case_cache::resolve(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         lanes_impl(
             app.state::<AppState>().inner(),
             filters,
@@ -203,7 +205,7 @@ pub async fn timeline_lanes(
             bucket_count,
             column,
             limit.unwrap_or(8),
-            case_events.as_deref().map(|v| v.as_slice()),
+            case_events.as_deref(),
         )
     })
     .await?
@@ -296,7 +298,7 @@ pub fn entity_summary_impl(
             }
             acc
         }
-        None => workspace::with_selection(state, &filters, |selection| selection.par_fold(init, step, merge)),
+        None => workspace::with_selection(state, &filters, |selection| selection.par_fold(init, step, merge))?,
     };
     crate::operations::check()?;
     let limit = limit.clamp(1, 500);
@@ -334,11 +336,13 @@ pub async fn entity_summary(
     limit: Option<usize>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Vec<EntityGroup>, String> {
-    let case_events = crate::case_cache::resolve(case_events, case_key)?;
-    crate::offload(move || {
-        entity_summary_impl(app.state::<AppState>().inner(), filters, limit.unwrap_or(50), case_events.as_deref().map(|v| v.as_slice()))
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        entity_summary_impl(app.state::<AppState>().inner(), filters, limit.unwrap_or(50), case_events.as_deref())
     })
     .await?
 }
@@ -416,14 +420,15 @@ pub fn sightings_impl(state: &AppState, values: Vec<String>, filters: Vec<Filter
         }
         a
     };
-    let acc = workspace::with_selection(state, &filters, |selection| selection.par_fold(init, step, merge));
+    let acc = workspace::with_selection(state, &filters, |selection| selection.par_fold(init, step, merge))?;
     crate::operations::check()?;
     Ok(acc)
 }
 
 #[tauri::command]
-pub async fn ioc_sightings(values: Vec<String>, filters: Vec<Filter>, app: AppHandle) -> Result<Vec<Sighting>, String> {
-    crate::offload(move || sightings_impl(app.state::<AppState>().inner(), values, filters)).await?
+pub async fn ioc_sightings(values: Vec<String>, filters: Vec<Filter>, app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<Sighting>, String> {
+    let admitted = crate::analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app.clone(), admitted, move || sightings_impl(app.state::<AppState>().inner(), values, filters)).await?
 }
 
 // ------------------------------------------------------------------ custody
@@ -464,59 +469,87 @@ fn sha256_file(path: &std::path::Path) -> Result<(String, u64), String> {
 }
 
 pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
-    let parts: Vec<(String, String, String)> = match &*state.source.read() {
-        SourceData::Indexed(idx) => idx.parts.iter().map(|p| (p.identity.clone(), p.path.clone(), p.file_name.clone())).collect(),
+    // Keep the mapped-source leases alive for the entire request. Display
+    // paths alone cannot identify which canonical generation was loaded.
+    let parts = match &*crate::analysis_runtime::source(&state) {
+        SourceData::Indexed(idx) => idx.parts.clone(),
         _ => Vec::new(),
     };
+    let validate = || -> Result<(), String> {
+        for part in &parts {
+            crate::sources::validate_source(part)?;
+            workspace::validate_canonical_origin(std::path::Path::new(&part.physical_path))?;
+        }
+        crate::operations::check()
+    };
+    validate()?;
     // A package member is hashed as extracted, and the package itself as the
-    // user opened it. Live channels and other non-file sources have no hash.
-    let mut jobs: Vec<(String, String, String, std::path::PathBuf, &'static str)> = Vec::new();
-    for (id, path, name) in parts {
-        match workspace::resolve_member(&path)? {
+    // user opened it. Resolve relative/aliased originals from recorded custody
+    // rather than redirecting a loaded source through a newer display path.
+    let mut jobs: Vec<(String, String, String, String, std::path::PathBuf, &'static str)> = Vec::new();
+    for part in &parts {
+        let id = part.identity.clone();
+        let path = part.path.clone();
+        let name = part.file_name.clone();
+        let original = workspace::canonical_original(std::path::Path::new(&part.physical_path))?;
+        let resolved_path = match (&original, path.split_once("!/")) {
+            (Some((original, _)), Some((_, member))) => format!("{}!/{member}", original.to_string_lossy()),
+            _ => path.clone(),
+        };
+        match workspace::resolve_member(&resolved_path)? {
             Some(member) => {
                 let container = path.split("!/").next().unwrap_or(&path).to_string();
-                if !jobs.iter().any(|job| job.1 == container) {
-                    let file = std::path::Path::new(&container);
-                    let stamp = std::fs::metadata(file).ok().map(|m| (m.len(), m.modified().ok()));
-                    let label = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| container.clone());
-                    jobs.push((format!("package:{container}:{stamp:?}"), container.clone(), label, file.to_path_buf(), "original"));
+                if !jobs.iter().any(|job| job.2 == container) {
+                    let physical = original.as_ref().map(|(path, _)| path.clone()).unwrap_or_else(|| std::path::PathBuf::from(&container));
+                    let generation = match &original {
+                        Some((_, generation)) => generation.clone(),
+                        None => {
+                            let file = std::fs::File::open(&physical).map_err(|e| e.to_string())?;
+                            let metadata = file.metadata().map_err(|e| e.to_string())?;
+                            format!("{:?}:{}:{:?}:{id}", crate::sources::file_identity(&file), metadata.len(), metadata.modified().ok())
+                        }
+                    };
+                    let label = std::path::Path::new(&container).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| container.clone());
+                    let stamp = std::fs::metadata(&physical).ok().map(|metadata| (metadata.len(), metadata.modified().ok()));
+                    jobs.push((format!("package-generation:{container}:{generation}"), format!("package:{container}:{stamp:?}"), container, label, physical, "original"));
                 }
-                jobs.push((id, path, name, member, "extraído"));
+                jobs.push((format!("source:{id}:{:?}", part.physical_file_id), id, path, name, member, "extraído"));
             }
-            None if std::path::Path::new(&path).is_file() => {
-                let physical = std::path::PathBuf::from(&path);
-                jobs.push((id, path, name, physical, "original"));
+            None => {
+                let physical = original.map(|(path, _)| path).unwrap_or_else(|| std::path::PathBuf::from(&path));
+                if physical.is_file() { jobs.push((format!("source:{id}:{:?}", part.physical_file_id), id, path, name, physical, "original")); }
             }
-            None => {}
         }
     }
-    use rayon::prelude::*;
-    let generation = crate::operations::current_generation();
-    let results: Vec<Result<SourceHash, String>> = jobs
-        .into_par_iter()
-        .map(|(id, path, name, physical, origin)| {
-            if let Some((_, hit)) = HASHES.lock().iter().find(|(k, _)| *k == id) {
-                return Ok(hit.clone());
-            }
-            if crate::operations::cancelled_for(generation) {
-                return Err("Operação cancelada.".into());
+    let token = crate::operations::current_token();
+    let results: Vec<Result<(String, SourceHash, bool), String>> = crate::global_scheduler::map(jobs, |(cache_key, id, path, name, physical, origin)| {
+        crate::operations::run_with_token(token.clone(), || -> Result<(String, SourceHash, bool), String> {
+            if let Some((_, hit)) = HASHES.lock().iter().find(|(key, _)| *key == cache_key) {
+                // Digest reuse must not reuse a previous display alias/name.
+                return Ok((cache_key, SourceHash { id, path, name, bytes: hit.bytes, sha256: hit.sha256.clone(), origin: origin.into() }, false));
             }
             let (sha256, bytes) = sha256_file(&physical)?;
-            let hash = SourceHash { id: id.clone(), path, name, bytes, sha256, origin: origin.into() };
-            let mut cache = HASHES.lock();
-            if cache.len() > 512 {
-                cache.remove(0);
-            }
-            cache.push((id, hash.clone()));
-            Ok(hash)
-        })
-        .collect();
-    results.into_iter().collect()
+            Ok((cache_key, SourceHash { id, path, name, bytes, sha256, origin: origin.into() }, true))
+        })?
+    });
+    let results: Vec<_> = results.into_iter().collect::<Result<_, _>>()?;
+    // This guard applies to cache hits too. Nothing computed from an altered
+    // original enters HASHES, and no stale loaded ID labels newer source bytes.
+    validate()?;
+    let mut cache = HASHES.lock();
+    for (cache_key, hash, fresh) in &results {
+        if *fresh {
+            if cache.len() >= 512 { cache.remove(0); }
+            cache.push((cache_key.clone(), hash.clone()));
+        }
+    }
+    Ok(results.into_iter().map(|(_, hash, _)| hash).collect())
 }
 
 #[tauri::command]
-pub async fn source_hashes(app: AppHandle) -> Result<Vec<SourceHash>, String> {
-    crate::offload(move || hashes_impl(app.state::<AppState>().inner())).await?
+pub async fn source_hashes(app: AppHandle, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>) -> Result<Vec<SourceHash>, String> {
+    let admitted = crate::analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, crate::analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app.clone(), admitted, move || hashes_impl(app.state::<AppState>().inner())).await?
 }
 
 #[cfg(test)]

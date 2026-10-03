@@ -1,97 +1,91 @@
-/* Exercise the real autosave/store replacement and lifecycle through the preview. */
+/* Production bounded scheduling over native metadata tickets, receipts and retry. */
 import assert from "node:assert/strict";
-import { chromium } from "playwright";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { launchBrowser } from "./browser.mjs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const url = process.argv[2] || "http://127.0.0.1:4181", output = resolve("output/playwright");
-mkdirSync(output, { recursive: true });
-const fallback = `${process.env.LOCALAPPDATA}/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-win64/chrome-headless-shell.exe`;
-const browser = await chromium.launch({ executablePath: existsSync(chromium.executablePath()) ? undefined : fallback });
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, reducedMotion: "reduce" });
 const errors = [], results = {};
 page.on("pageerror", error => errors.push(error.message));
-// A private browser context contains only synthetic Cases. The mock's native
-// close surface calls the same registered callback as Tauri, without closing
-// the runner's browser. Root/native smoke also exercises actual WebView close.
 await page.addInitScript(() => {
-  if (!localStorage.getItem("__mockStore")) localStorage.setItem("__mockStore", JSON.stringify({
-    schemaVersion: 2, revision: 1, active: "autosave-test", cases: [{ id: "autosave-test", name: "Autosave synthetic",
-      createdAt: 1, items: [], manual: [], stations: [], artifacts: [], workspace: { view: "source", analysisView: "overview" } }],
-  }));
+  window.__mockNativeCaseBootstrapEnabled = true;
   Object.defineProperty(window, "__TAURI__", { configurable: true, set(value) {
     value.window = { getCurrentWindow: () => ({ onCloseRequested(handler) { window.__testClose = handler; return Promise.resolve(() => {}); } }) };
     Object.defineProperty(window, "__TAURI__", { value, configurable: true, writable: true });
   } });
 });
-const ready = async () => {
-  await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && !bigDataRuntime.busy && document.querySelector("#load-overlay").hidden);
-  assert.equal(await page.evaluate(() => flushCaseSaves()), true);
-};
-
 try {
-  await page.goto(url); await ready();
-  const bounded = await page.evaluate(async () => {
-    const before = window.__mockCommandCalls.cases_save || 0;
-    window.__mockLatency = { cases_save: 1500 };
-    activeCase().name = "first snapshot";
-    const first = saveCases();
-    while ((window.__mockCommandCalls.cases_save || 0) === before) await new Promise(resolve => setTimeout(resolve, 10));
-    const promises = new Set();
-    for (let i = 0; i < 5; i++) {
-      activeCase().name = `latest edit ${i}`; promises.add(saveCases());
-      await new Promise(resolve => setTimeout(resolve, 225));
-    }
-    const whileBusy = (window.__mockCommandCalls.cases_save || 0) - before;
-    window.__mockLatency = {};
-    const saved = await first, pending = await Promise.all(promises);
-    return { saved, pending, pendingPromises: promises.size, whileBusy,
-      writes: (window.__mockCommandCalls.cases_save || 0) - before,
-      disk: JSON.parse(localStorage.getItem("__mockStore")).cases[0].name, name: activeCase().name,
-      revision: state.cases.revision, diskRevision: JSON.parse(localStorage.getItem("__mockStore")).revision };
+  await page.goto(process.argv[2] || process.env.PREVIEW_URL || "http://127.0.0.1:4181");
+  await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && CaseEvidence.active && nativeEvidenceServices().session.isClean());
+  results.bounded = await page.evaluate(async () => {
+    const original = api, requests = [];
+    let release, started;
+    const firstStarted = new Promise(resolve => { started = resolve; });
+    api = async (command, args, options) => {
+      if (command === "cases_save_view") {
+        requests.push(args.request);
+        if (requests.length === 1) { started(); await new Promise(resolve => { release = resolve; }); }
+      }
+      return original(command, args, options);
+    };
+    try {
+      activeCase().name = "first snapshot"; const first = saveCases(); await firstStarted;
+      const pending = new Set();
+      for (let i = 0; i < 1000; i++) { activeCase().name = `latest edit ${i}`; pending.add(saveCases()); }
+      await new Promise(resolve => setTimeout(resolve, 250));
+      const activeWrites = requests.length, closing = flushCaseSaves(); release();
+      const saved = await first, confirmations = await Promise.all(pending), flushed = await closing;
+      const native = __mockNativeCaseBootstrap.document();
+      return { saved, confirmations, flushed, pendingPromises: pending.size, activeWrites, writes: requests.length,
+        names: requests.map(request => JSON.parse(request.documentJson).cases[0].name),
+        revisions: requests.map(request => request.expectedStore.revision),
+        name: activeCase().name, nativeName: native.cases[0].name, revisionMatches: native.store.revision === state.cases.store.revision,
+        referenceMatches: JSON.stringify(native.cases[0].items[0].rows.reference) === JSON.stringify(activeCase().items[0].rows.reference) };
+    } finally { api = original; }
   });
-  assert.equal(bounded.saved, true); assert.deepEqual(bounded.pending, [true]);
-  assert.equal(bounded.pendingPromises, 1); assert.equal(bounded.whileBusy, 1); assert.equal(bounded.writes, 2);
-  assert.equal(bounded.disk, "latest edit 4"); assert.equal(bounded.name, bounded.disk); assert.equal(bounded.revision, bounded.diskRevision);
-  results.bounded = bounded;
+  assert.equal(results.bounded.saved, true); assert.deepEqual(results.bounded.confirmations, [true]);
+  assert.equal(results.bounded.flushed, true); assert.equal(results.bounded.pendingPromises, 1);
+  assert.equal(results.bounded.activeWrites, 1); assert.equal(results.bounded.writes, 2);
+  assert.deepEqual(results.bounded.names, ["first snapshot", "latest edit 999"]);
+  assert.equal(BigInt(results.bounded.revisions[1]), BigInt(results.bounded.revisions[0]) + 1n);
+  assert.equal(results.bounded.name, results.bounded.nativeName); assert.equal(results.bounded.revisionMatches, true); assert.equal(results.bounded.referenceMatches, true);
 
-  const conflict = await page.evaluate(async () => {
-    const external = JSON.parse(localStorage.getItem("__mockStore"));
-    external.revision++; external.cases[0].name = "external revision";
-    localStorage.setItem("__mockStore", JSON.stringify(external));
-    activeCase().name = "stale local edit";
-    const failed = saveCases(); const flushed = await flushCaseSaves();
-    const diskAfterFailure = JSON.parse(localStorage.getItem("__mockStore"));
-    await WorkspaceContext.replaceCases(normalizeCaseStore(await api("cases_load", {}, { silent: true })));
-    activeCase().name = "fresh edit";
-    const fresh = saveCases(); await flushCaseSaves();
-    return { failed: await failed, flushed, diskAfterFailure: diskAfterFailure.cases[0].name,
-      fresh: await fresh, disk: JSON.parse(localStorage.getItem("__mockStore")).cases[0].name, dirty: caseSavesPending() };
+  results.close = await page.evaluate(async () => {
+    const original = api, requests = []; let fail = true;
+    const attempt = async () => { const event = { prevented: false, preventDefault() { this.prevented = true; } }; await __testClose(event); return event.prevented; };
+    api = async (command, args, options) => {
+      if (command === "cases_save_view") { requests.push(args.request); if (fail) throw Error("Disco cheio (teste)"); }
+      return original(command, args, options);
+    };
+    try {
+      activeCase().name = "failed native draft"; const saving = saveCases();
+      const blocked = await attempt(), confirmed = await saving, blockedAgain = await attempt(), attemptsBeforeRetry = requests.length;
+      fail = false; activeCase().name = "newer draft after failure";
+      await nativeEvidenceServices().session.retry();
+      const sameTicket = JSON.stringify(requests[0]) === JSON.stringify(requests[1]);
+      const prevented = await attempt(), before = requests.length;
+      await flushCaseSaves(); await flushCaseSaves();
+      return { blocked, confirmed, blockedAgain, attemptsBeforeRetry, sameTicket, prevented, idleWrites: requests.length - before,
+        dirty: caseSavesPending(), name: __mockNativeCaseBootstrap.document().cases[0].name };
+    } finally { api = original; }
   });
-  assert.deepEqual(conflict, { failed: false, flushed: false, diskAfterFailure: "external revision", fresh: true, disk: "fresh edit", dirty: false });
-  results.conflict = conflict;
+  assert.deepEqual(results.close, { blocked: true, confirmed: false, blockedAgain: true, attemptsBeforeRetry: 1, sameTicket: true,
+    prevented: false, idleWrites: 0, dirty: false, name: "newer draft after failure" });
 
-  const close = await page.evaluate(async () => {
-    const attempt = async () => { const event = { prevented: false, preventDefault() { this.prevented = true; } }; await window.__testClose(event); return event.prevented; };
-    window.__mockErrors = { cases_save: "Disco cheio (teste)" };
-    activeCase().name = "close failure"; const failedSave = saveCases();
-    const blocked = await attempt(), failed = await failedSave, dirty = caseSavesPending();
-    window.__mockErrors = {}; activeCase().name = "durable before close";
-    const prevented = await attempt();
-    const before = window.__mockCommandCalls.cases_save;
-    await flushCaseSaves(); await flushCaseSaves();
-    const event = new Event("beforeunload", { cancelable: true }); window.dispatchEvent(event);
-    return { blocked, failed, dirty, prevented, pending: caseSavesPending(), idleWrites: window.__mockCommandCalls.cases_save - before,
-      unloadBlocked: event.defaultPrevented, disk: JSON.parse(localStorage.getItem("__mockStore")).cases[0].name };
+  results.conflict = await page.evaluate(async () => {
+    __mockNativeCaseBootstrap.publishName("external native revision");
+    activeCase().name = "local draft kept for reconciliation"; const store = state.cases;
+    const saving = saveCases(), flushed = await flushCaseSaves(), confirmed = await saving;
+    const result = await nativeEvidenceServices().session.reconcile();
+    return { confirmed, flushed, sameStore: state.cases === store, live: activeCase().name, draft: result.draft.cases[0].name,
+      authoritative: result.authoritative.cases[0].name, retryTicketRetained: !!result.failedRequest, dirty: caseSavesPending(),
+      legacyCalls: __mockNativeCaseBootstrap.calls.filter(call => ["cases_load", "cases_save", "case_sync"].includes(call.command)).length };
   });
-  assert.deepEqual(close, { blocked: true, failed: false, dirty: true, prevented: false, pending: false, idleWrites: 0, unloadBlocked: false, disk: "durable before close" });
-  results.close = close;
-  await page.reload(); await ready();
-  assert.equal(await page.evaluate(() => activeCase().name), "durable before close");
-  results.reload = "latest committed content restored";
+  assert.deepEqual(results.conflict, { confirmed: false, flushed: false, sameStore: true, live: "local draft kept for reconciliation",
+    draft: "local draft kept for reconciliation", authoritative: "external native revision", retryTicketRetained: true, dirty: true, legacyCalls: 0 });
   assert.deepEqual(errors, []);
-  writeFileSync(resolve(output, "case-autosave.json"), JSON.stringify(results, null, 2));
-  console.log(JSON.stringify(results, null, 2));
-} finally {
-  await browser.close();
-}
+  mkdirSync("output/playwright", { recursive: true });
+  writeFileSync(resolve("output/playwright/case-autosave.json"), JSON.stringify(results, null, 2));
+  console.log("Native autosave: one active/pending intent, exact retry, close flush, and non-destructive reconciliation passed.");
+} finally { await browser.close(); }

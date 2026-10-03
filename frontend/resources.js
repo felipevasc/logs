@@ -15,7 +15,7 @@ window.Resources = (() => {
   const rate = value => number(value) ? `${bytes(value)}/s` : "Indisponível";
   const time = value => number(value) ? new Date(value).toLocaleTimeString("pt-BR") : "—";
   const badge = (kind, label) => `<span class="resource-badge" data-kind="${kind}">${label}</span>`;
-  const basis = value => ({ measured: ["measured", "Medido"], estimated: ["estimate", "Estimativa"], logical: ["logical", "Tamanho lógico"], unavailable: ["unavailable", "Indisponível"] }[value] || ["unavailable", "Indisponível"]);
+  const basis = value => ({ measured: ["measured", "Medido"], estimated: ["estimate", "Estimativa"], logical: ["logical", "Tamanho lógico"], accounted: ["logical", "Contabilizado"], configured: ["logical", "Limite configurado"], unavailable: ["unavailable", "Indisponível"] }[value] || ["unavailable", "Indisponível"]);
   let dialog = null, timer = null, version = 0, pending = null, latest = null, previousFocus = null, background = [], paused = false;
 
   function metric(label, value, detail, available = true) {
@@ -48,10 +48,12 @@ window.Resources = (() => {
     dialog.querySelector("[data-resource-processes]").innerHTML = table(["Processo próprio", "CPU", "RAM residente", snapshot.memoryVirtualLabel || "Memória virtual", "Leitura", "Gravação"], (snapshot.processes || []).map(process => `<tr><td>${esc(process.name || "Processo")}<small>PID ${esc(process.pid)} · ${esc(process.role || "Aplicativo")}${number(process.parentPid) ? ` · pai ${esc(process.parentPid)}` : ""}</small></td><td>${esc(percent(process.cpuPercent))}</td><td>${esc(bytes(process.residentBytes))}</td><td>${esc(bytes(process.virtualBytes))}</td><td>${esc(rate(process.readBytesPerSec))}</td><td>${esc(rate(process.writtenBytesPerSec))}</td></tr>`), "Nenhum processo próprio disponível nesta amostra.");
     dialog.querySelector("[data-resource-disks]").innerHTML = table(["Volume do sistema", "Capacidade", "Disponível", "Leitura", "Gravação"], (snapshot.disks || []).map(disk => `<tr><td>${esc(disk.name || disk.mountPoint || "Volume")}${disk.isAppVolume ? ` ${badge("measured", "Volume do aplicativo")}` : ""}<small>${esc(disk.mountPoint || "")} · ${esc(disk.kind || "Tipo indisponível")}</small></td><td>${esc(bytes(disk.totalBytes))}</td><td>${esc(bytes(disk.availableBytes))}</td><td>${esc(rate(disk.readBytesPerSec))}</td><td>${esc(rate(disk.writtenBytesPerSec))}</td></tr>`), "Volumes indisponíveis nesta amostra.");
     const inventory = snapshot.inventory || {};
-    dialog.querySelector("[data-resource-inventory-description]").textContent = `Heap conhecido: ${bytes(inventory.memoryKnownBytes)} · soma parcial das estruturas internas; não corresponde à RAM residente dos processos.`;
-    dialog.querySelector("[data-resource-inventory]").innerHTML = table(["Componente interno", "Heap", "Mapa lógico", "Disco lógico", "Itens"], (inventory.components || []).map(component => {
+    dialog.querySelector("[data-resource-inventory-description]").textContent = `Heap conhecido: ${bytes(inventory.memoryKnownBytes)} · soma parcial das estruturas internas; não corresponde à RAM residente dos processos. Créditos e limites são exibidos separadamente e não entram nessa soma.`;
+    dialog.querySelector("[data-resource-inventory]").innerHTML = table(["Componente interno", "Heap", "Mapa lógico", "Disco lógico", "Contabilizado / limite", "Itens"], (inventory.components || []).map(component => {
       const [kind, label] = basis(component.basis);
-      return `<tr><td>${esc(component.label || component.id)} ${badge(kind, label)}<small>${esc(component.note || "")}</small></td><td>${esc(bytes(component.memoryBytes))}</td><td>${esc(bytes(component.mappedBytes))}</td><td>${esc(bytes(component.storageBytes))}</td><td>${esc(decimal(component.items))}</td></tr>`;
+      const credit = number(component.accountedBytes) ? bytes(component.accountedBytes) : "—";
+      const budget = number(component.budgetBytes) ? ` / ${bytes(component.budgetBytes)}` : "";
+      return `<tr><td>${esc(component.label || component.id)} ${badge(kind, label)}<small>${esc(component.note || "")}</small></td><td>${esc(bytes(component.memoryBytes))}</td><td>${esc(bytes(component.mappedBytes))}</td><td>${esc(bytes(component.storageBytes))}</td><td>${esc(credit + budget)}</td><td>${esc(decimal(component.items))}</td></tr>`;
     }), "Inventário interno indisponível nesta amostra.");
     renderStorage(snapshot.storage);
     renderActions(snapshot.actions || {});

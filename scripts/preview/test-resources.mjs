@@ -1,13 +1,12 @@
 /* Resource monitoring stays independent from Cases and analysis requests. */
 import assert from "node:assert/strict";
-import { chromium } from "playwright";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { launchBrowser } from "./browser.mjs";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const url = process.argv[2] || "http://127.0.0.1:4181", output = resolve("output/playwright");
 mkdirSync(output, { recursive: true });
-const fallback = `${process.env.LOCALAPPDATA}/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-win64/chrome-headless-shell.exe`;
-const browser = await chromium.launch({ executablePath: existsSync(chromium.executablePath()) ? undefined : fallback });
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, reducedMotion: "reduce" });
 const errors = [], results = {};
 page.on("pageerror", error => errors.push(error.message));
@@ -82,18 +81,18 @@ try {
   assert.equal((await page.locator("[data-resource-storage-description]").innerText()).includes("% da capacidade"), false, "partial accounting cannot claim an exact capacity percentage");
   results.unavailable = "null counters never become zero; first-sample rates, missing storage and stale partial scans are labelled; measured zero is preserved";
 
-  await page.evaluate(() => { window.__mockErrors = { resource_snapshot: "Falha de medição para teste" }; });
+  await page.evaluate(() => { window.__mockFailures = { resource_snapshot: "Falha de medição para teste" }; });
   await update();
   assert.match(await page.locator("[data-resource-status]").innerText(), /Amostra anterior.*mantida.*Falha de medição/s);
   assert.equal(await page.locator("[data-resource-status]").getAttribute("data-error"), "true");
   await close();
-  await page.evaluate(() => { window.__mockResourceSnapshot = null; window.__mockErrors = { resource_snapshot: "Primeira coleta de recursos em andamento." }; });
+  await page.evaluate(() => { window.__mockResourceSnapshot = null; window.__mockFailures = { resource_snapshot: "Primeira coleta de recursos em andamento." }; });
   await page.locator("#btn-resources").click();
   await page.waitForFunction(() => document.querySelector("[data-resource-status]").textContent.includes("Aguardando a primeira coleta"));
   assert.equal(await page.locator("[data-resource-status]").getAttribute("data-error"), "false");
   assert.match(await page.locator("[data-resource-app]").innerText(), /Aguardando a primeira amostra/);
   assert.equal(await page.locator("[data-resource-export]").isDisabled(), true);
-  await page.evaluate(() => { window.__mockErrors = {}; });
+  await page.evaluate(() => { window.__mockFailures = {}; });
   await page.waitForFunction(() => !!Resources.snapshot());
   results.failures = "failed samples retain old measurements with timestamp; initial collection retries normally and cannot export missing data";
 

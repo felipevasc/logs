@@ -4,7 +4,7 @@ use crate::{
     model::Event,
     operations,
     query::{self, Filter},
-    sources, AppState, SourceData,
+    AppState, SourceData,
 };
 use parking_lot::Mutex;
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
@@ -82,6 +82,7 @@ struct Cached {
     result: Result<Arc<CompiledCatalog>, String>,
 }
 static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+#[cfg(test)]
 static UPDATE_LOCK: Mutex<()> = Mutex::new(());
 
 fn compile(bytes: &[u8]) -> Result<Arc<CompiledCatalog>, String> {
@@ -154,9 +155,7 @@ fn compile(bytes: &[u8]) -> Result<Arc<CompiledCatalog>, String> {
     Ok(Arc::new(CompiledCatalog { file, regexes, set, enabled }))
 }
 
-fn path() -> PathBuf {
-    crate::config_dir().join("threat-rules.json")
-}
+#[cfg(test)]
 fn load_path(path: &Path) -> Result<Arc<CompiledCatalog>, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Não foi possível preparar o catálogo: {e}"))?;
@@ -197,8 +196,28 @@ pub(crate) fn builtin_catalog() -> Arc<CompiledCatalog> {
 }
 
 /// The active editable catalog (compiled once and cached by content hash).
+pub(crate) fn compile_snapshot(text: &str) -> Result<Arc<CompiledCatalog>, String> {
+    let hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+    if let Some(cached) = CACHE
+        .lock()
+        .as_ref()
+        .filter(|entry| entry.path.as_os_str().is_empty() && entry.hash == hash)
+    {
+        return cached.result.clone();
+    }
+    let result = compile(text.as_bytes());
+    operations::check()?;
+    *CACHE.lock() = Some(Cached {
+        path: PathBuf::new(),
+        hash,
+        result: result.clone(),
+    });
+    result
+}
 pub(crate) fn load_active() -> Result<Arc<CompiledCatalog>, String> {
-    load_path(&path())
+    crate::case_security::with(|security| {
+        compile_snapshot(security.threat_catalog_json.as_deref().unwrap_or(BUILTIN))
+    })
 }
 
 fn bundled_attack() -> &'static std::collections::HashMap<String, Vec<String>> {
@@ -230,6 +249,11 @@ pub(crate) struct Hit {
 }
 
 impl CompiledCatalog {
+    /// Text identifying the catalog rules (saved analyses depend on it).
+    pub(crate) fn signature(&self) -> String {
+        serde_json::to_string(&self.file).unwrap_or_default()
+    }
+
     pub(crate) fn rule(&self, index: usize) -> &Rule {
         &self.file.rules[index]
     }
@@ -283,12 +307,13 @@ impl CompiledCatalog {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RuleMatcher {
     catalog: Arc<CompiledCatalog>,
     rule: Option<usize>,
 }
 pub(crate) fn matcher(id: &str, catalog: Option<Arc<CompiledCatalog>>) -> Result<RuleMatcher, String> {
-    let catalog = catalog.map(Ok).unwrap_or_else(|| load_path(&path()))?;
+    let catalog = catalog.map(Ok).unwrap_or_else(load_active)?;
     let rule = if id == "*" {
         None
     } else {
@@ -589,9 +614,13 @@ fn info_for(path: &Path, catalog: &CompiledCatalog, bundled: &CatalogFile) -> Ca
     }
 }
 fn catalog_info() -> CatalogInfo {
-    let path = path();
-    match load_path(&path) {
-        Ok(catalog) => info_for(&path, &catalog, &serde_json::from_str(BUILTIN).expect("bundled catalog JSON")),
+    let path = PathBuf::from("Catálogo preservado neste Caso");
+    match load_active() {
+        Ok(catalog) => info_for(
+            &path,
+            &catalog,
+            &serde_json::from_str(BUILTIN).expect("bundled catalog JSON"),
+        ),
         Err(error) => CatalogInfo {
             path: path.to_string_lossy().into_owned(),
             name: "Catálogo de ameaças".into(),
@@ -610,7 +639,10 @@ pub struct CatalogUpdate {
     added: usize,
     backup_path: Option<String>,
     catalog: CatalogInfo,
+    #[serde(rename = "analysisContext", skip_serializing_if = "Option::is_none")]
+    analysis_context: Option<crate::analysis_context::Snapshot>,
 }
+#[cfg(test)]
 fn read_catalog_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     fs::File::open(path)
@@ -621,6 +653,7 @@ fn read_catalog_bytes(path: &Path) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
+#[cfg(test)]
 fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, String> {
     let _guard = UPDATE_LOCK.lock();
     let original = read_catalog_bytes(path)?;
@@ -631,7 +664,7 @@ fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, Str
     let additions: Vec<_> = bundled.rules.iter().filter(|rule| !ids.contains(rule.id.as_str())).cloned().collect();
     let added = additions.len();
     if added == 0 {
-        return Ok(CatalogUpdate { added, backup_path: None, catalog: info_for(path, &existing, &bundled) });
+        return Ok(CatalogUpdate { added, backup_path: None, analysis_context: None, catalog: info_for(path, &existing, &bundled) });
     }
     let mut merged = existing.file.clone();
     merged.rules.extend(additions);
@@ -674,6 +707,7 @@ fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, Str
     *CACHE.lock() =
         Some(Cached { path: path.to_owned(), hash: Sha256::digest(&bytes).into(), result: Ok(checked.clone()) });
     Ok(CatalogUpdate {
+        analysis_context: None,
         added,
         backup_path: Some(backup_path.to_string_lossy().into_owned()),
         catalog: info_for(path, &checked, &bundled),
@@ -786,36 +820,45 @@ fn visit(
     filters: &[Filter],
     case: Option<&[Event]>,
     catalog: &Arc<CompiledCatalog>,
-    mut visitor: impl FnMut(&Event),
-) {
+    hits: bool,
+    mut visitor: impl FnMut(&Event, Corpus, Vec<usize>),
+) -> Result<(), String> {
     let prepared = query::prepare_with_threat_catalog(filters, Some(catalog));
+    // Text and rule hits are computed in parallel with the parsing.
+    let analyze = |event: &Event| {
+        let body = corpus(event);
+        let ids = if hits && !catalog.enabled.is_empty() { body.hits(catalog) } else { Vec::new() };
+        (body, ids)
+    };
     let mut memory = |events: &[Event]| {
         for event in events {
             if operations::cancelled() {
                 break;
             }
             if prepared.iter().all(|pf| query::matches(event, pf)) {
-                visitor(event);
+                let (body, ids) = analyze(event);
+                visitor(event, body, ids);
             }
         }
     };
     if let Some(events) = case {
         memory(events);
-        return;
+        return operations::check();
     }
-    let source = state.source.read();
+    let source = crate::analysis_runtime::source(&state);
     match &*source {
         SourceData::Memory(events) => memory(events),
         SourceData::Indexed(index) => {
-            let codes = state.codes.read();
-            let system = state.system_codes.read();
-            let derived = state.derived.read();
-            query::visit_indexed_prepared(index, &prepared, &codes, &system, &derived, |i| {
-                visitor(&sources::event_at(index, i, &codes, &system, &derived))
-            });
+            let codes = crate::analysis_runtime::codes(&state);
+            let system = crate::analysis_runtime::system_codes(&state);
+            let derived = crate::analysis_runtime::derived(&state);
+            query::visit_indexed_mapped(index, &prepared, &codes, &system, &derived, analyze, |_, event, (body, ids)| {
+                visitor(event, body, ids)
+            })?;
         }
         SourceData::None => {}
     }
+    operations::check()
 }
 fn snippet(text: &str, start: usize, end: usize) -> String {
     let mut from = start.saturating_sub(90);
@@ -828,7 +871,7 @@ fn snippet(text: &str, start: usize, end: usize) -> String {
 fn scan_impl(
     state: &AppState,
     filters: Vec<Filter>,
-    case: Option<Arc<Vec<Event>>>,
+    case: Option<Vec<Event>>,
     catalog: Arc<CompiledCatalog>,
     catalog_path: String,
     mut progress: impl FnMut(usize),
@@ -844,11 +887,10 @@ fn scan_impl(
     let mut sources = crate::distinct::Terms::default();
     let mut timeline = Timeline::new();
     let (mut start, mut end) = (None, None);
-    visit(state, &ordinary, case.as_deref().map(Vec::as_slice), &catalog, |event| {
+    visit(state, &ordinary, case.as_deref(), &catalog, true, |event, body, ids| {
         if operations::cancelled() {
             return;
         }
-        let body = corpus(event);
         clipped += usize::from(body.clipped);
         if !predicates.iter().all(|predicate| predicate.matches_corpus(&body)) {
             return;
@@ -860,7 +902,6 @@ fn scan_impl(
         if catalog.enabled.is_empty() {
             return;
         }
-        let ids = body.hits(&catalog);
         if ids.is_empty() {
             return;
         }
@@ -897,7 +938,7 @@ fn scan_impl(
         } else {
             undated += 1;
         }
-    });
+    })?;
     operations::check()?;
     progress(total);
     let mut rules: Vec<_> = catalog
@@ -946,7 +987,7 @@ pub struct EventResult {
 fn events_impl(
     state: &AppState,
     mut filters: Vec<Filter>,
-    case: Option<Arc<Vec<Event>>>,
+    case: Option<Vec<Event>>,
     offset: usize,
     limit: usize,
     catalog: Arc<CompiledCatalog>,
@@ -955,46 +996,111 @@ fn events_impl(
         filters.push(Filter { column: "_all".into(), op: "threat_rule".into(), value: "*".into(), value2: None });
     }
     validate_local(&filters, &catalog)?;
+    let proof_index = if case.is_none() {
+        let source = crate::analysis_runtime::source(state);
+        match &*source { SourceData::Indexed(index) => Some(crate::analysis_runtime::clone_index(index)), _ => None }
+    } else { None };
+    let binding = proof_index.as_ref().map(|index| crate::analysis_runtime::source_set(index).map(|binding| (index, binding))).transpose()?;
+    let mut provenance_failure = None;
     let (ordinary, predicates) = split_filters(&filters, &catalog)?;
     let mut result = EventResult { total: 0, rows: vec![], complete: true, clipped_records: 0, rows_clipped: 0 };
-    visit(state, &ordinary, case.as_deref().map(Vec::as_slice), &catalog, |event| {
+    visit(state, &ordinary, case.as_deref(), &catalog, false, |event, body, _| {
         if operations::cancelled() {
             return;
         }
-        let body = corpus(event);
         result.clipped_records += usize::from(body.clipped);
         if !predicates.iter().all(|predicate| predicate.matches_corpus(&body)) {
             return;
         }
         result.total += 1;
         if result.total > offset && result.rows.len() < limit.clamp(1, 200) {
-            let (row, clipped) = preview(event);
+            let (mut row, clipped) = preview(event);
+            if let Some((index, binding)) = &binding { if let Err(error) = crate::analysis_runtime::attach_provenance_with(index, binding, &mut row) { provenance_failure = Some(error); return; } }
             result.rows_clipped += usize::from(clipped);
             result.rows.push(row);
         }
-    });
+    })?;
     operations::check()?;
+    if let Some(error) = provenance_failure { return Err(error); }
     result.complete = result.clipped_records == 0;
     Ok(result)
 }
 
 #[tauri::command]
-pub async fn threat_catalog() -> Result<CatalogInfo, String> {
-    crate::offload(catalog_info).await
+pub async fn threat_catalog(
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: tauri::AppHandle,
+) -> Result<CatalogInfo, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, catalog_info).await
 }
 #[tauri::command]
-pub async fn threat_catalog_update(app: tauri::AppHandle) -> Result<CatalogUpdate, String> {
-    crate::offload(move || {
-        let state = app.state::<AppState>();
-        let mut source = state.source.write();
-        operations::check()?;
-        let update = update_catalog_path(&path(), BUILTIN.as_bytes())?;
-        operations::commit();
-        if let SourceData::Indexed(idx) = &mut *source {
-            idx.big_data = None;
-        }
-        crate::big_data_commands::clear_results();
-        Ok(update)
+pub async fn threat_catalog_update(
+    catalog_json: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: tauri::AppHandle,
+) -> Result<CatalogUpdate, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity.clone()),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, move || {
+        let mut added = 0;
+        let snapshot = crate::case_interpretation::update_domain(&identity, "security_threats", |settings| {
+            let text = match catalog_json {
+                Some(text) => {
+                    compile_snapshot(&text)?;
+                    text
+                }
+                None => {
+                    let mut existing: CatalogFile = serde_json::from_str(
+                        settings
+                            .security
+                            .threat_catalog_json
+                            .as_deref()
+                            .unwrap_or(BUILTIN),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let bundled: CatalogFile =
+                        serde_json::from_str(BUILTIN).map_err(|e| e.to_string())?;
+                    let ids: HashSet<_> =
+                        existing.rules.iter().map(|rule| rule.id.clone()).collect();
+                    let additions: Vec<_> = bundled
+                        .rules
+                        .into_iter()
+                        .filter(|rule| !ids.contains(&rule.id))
+                        .collect();
+                    added = additions.len();
+                    existing.rules.extend(additions);
+                    serde_json::to_string(&existing).map_err(|e| e.to_string())?
+                }
+            };
+            settings.security.threat_catalog_json = Some(text);
+            Ok(())
+        })?;
+        let security = &snapshot
+            .interpretation
+            .as_ref()
+            .ok_or("Interpretação indisponível")?
+            .security;
+        let compiled =
+            compile_snapshot(security.threat_catalog_json.as_deref().unwrap_or(BUILTIN))?;
+        let catalog = info_for(
+            Path::new("Catálogo preservado neste Caso"),
+            &compiled,
+            &serde_json::from_str(BUILTIN).expect("bundled catalog"),
+        );
+        Ok(CatalogUpdate {
+            added,
+            backup_path: None,
+            catalog,
+            analysis_context: Some(snapshot),
+        })
     })
     .await?
 }
@@ -1003,18 +1109,19 @@ pub async fn threat_scan(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: tauri::AppHandle,
 ) -> Result<ScanResult, String> {
-    let case_events = crate::case_cache::resolve(case_events, case_key)?;
-    crate::offload(move || {
-        let path = path();
-        let catalog = load_path(&path)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        let catalog = load_active()?;
         scan_impl(
             app.state::<AppState>().inner(),
             filters,
             case_events,
             catalog,
-            path.to_string_lossy().into_owned(),
+            "Catálogo preservado neste Caso".into(),
             |count| {
                 crate::emit_progress(Some(&app), "ameaças", "Conferindo regras locais", count, 0, "registros", true)
             },
@@ -1027,19 +1134,21 @@ pub async fn threat_events(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     offset: Option<usize>,
     limit: Option<usize>,
     app: tauri::AppHandle,
 ) -> Result<EventResult, String> {
-    let case_events = crate::case_cache::resolve(case_events, case_key)?;
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         events_impl(
             app.state::<AppState>().inner(),
             filters,
             case_events,
             offset.unwrap_or(0),
             limit.unwrap_or(100),
-            load_path(&path())?,
+            load_active()?,
         )
     })
     .await?
@@ -1058,7 +1167,7 @@ mod tests {
     fn state(source: SourceData) -> AppState {
         AppState {
             source: parking_lot::RwLock::new(source),
-            big_data_enabled: std::sync::atomic::AtomicBool::new(false),
+            source_publication: parking_lot::RwLock::new(Default::default()),
             source_names: parking_lot::RwLock::new(vec![]),
             codes: parking_lot::RwLock::new(Default::default()),
             system_codes: parking_lot::RwLock::new(Default::default()),
@@ -1163,7 +1272,7 @@ mod tests {
         let pfs = query::prepare_with_threat_catalog(&[filter("test.alpha")], Some(&catalog));
         assert_eq!(events.iter().filter(|e| query::matches(e, &pfs[0])).count(), 2);
         let page =
-            events_impl(&state(SourceData::None), vec![filter("test.alpha")], Some(events.into()), 1, 1, catalog).unwrap();
+            events_impl(&state(SourceData::None), vec![filter("test.alpha")], Some(events), 1, 1, catalog).unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].id, 2);
@@ -1175,10 +1284,10 @@ mod tests {
             writeln!(file,"{}",serde_json::json!({"timestamp":1700000000000i64+i*1000,"source":if i%2==0{"API"}else{"api"},"message":if i>=10000{"attack alpha"}else{"ordinary"}})).unwrap();
         }
         file.flush().unwrap();
-        let index = sources::index_file(file.path().to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let index = crate::sources::index_file(file.path().to_str().unwrap(), "jsonl", None, None, None).unwrap();
         let codes = crate::model::CodesConfig::default();
         let events: Vec<_> =
-            (0..index.lines.len()).map(|i| sources::event_at(&index, i, &codes, &codes, &[])).collect();
+            (0..index.lines.len()).map(|i| crate::sources::event_at(&index, i, &codes, &codes, &[])).collect();
         let indexed = state(SourceData::Indexed(index));
         let memory = state(SourceData::Memory(events.clone()));
         let catalog = catalog();
@@ -1195,11 +1304,11 @@ mod tests {
         assert_eq!(expected["matched"], 10);
         assert_eq!(expected["rules"][0]["count"], 10);
         assert_eq!(scan(&indexed, None), expected);
-        assert_eq!(scan(&state(SourceData::None), Some(events.clone().into())), expected);
+        assert_eq!(scan(&state(SourceData::None), Some(events.clone())), expected);
         let pfs = query::prepare_with_threat_catalog(&[filter("test.alpha")], Some(&catalog));
         let mut matches = vec![];
         if let SourceData::Indexed(index) = &*indexed.source.read() {
-            query::visit_indexed_prepared(index, &pfs, &codes, &codes, &[], |i| matches.push(i));
+            query::visit_indexed_prepared(index, &pfs, &codes, &codes, &[], |i| matches.push(i)).unwrap();
         }
         assert_eq!(matches, (10000..10020).collect::<Vec<_>>());
     }

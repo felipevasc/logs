@@ -1,6 +1,6 @@
 [package]
 name = "loginsight"
-version = "0.5.0"
+version = "0.12.1"
 description = "Visualizador e analisador de logs"
 edition = "2021"
 rust-version = "1.88"
@@ -10,25 +10,28 @@ name = "loginsight_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2.12", features = [] }
 tauri-plugin-dialog = "2"
+# Updates from GitHub Releases; native TLS matches the reqwest client of remote sources.
+tauri-plugin-updater = { version = "2.13", default-features = false, features = ["native-tls", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
 regex = "1"
-regex-syntax = "0.8"
 roxmltree = "0.20"
 parking_lot = "0.12"
 memmap2 = "0.9"
+# Cross-process checkpoint publication locks; released automatically on crash.
+fs2 = "0.4"
 memchr = "2"
 rayon = "1"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "backup", "blob"] }
 rmcp = { version = "3.1", features = ["transport-streamable-http-server"] }
 schemars = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -42,11 +45,22 @@ tar = "0.4.46"
 evtx = { version = "0.12.3", default-features = false, features = ["multithreading"] }
 yaml_serde = "0.10.7"
 aho-corasick = "1.1"
-tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "lz4-compression"] }
+semver = "1"
+# Excel (xlsx, xlsm, xlsb, xls) and OpenDocument (ods) spreadsheets as log sources.
+calamine = { version = "0.36", features = ["dates"] }
+# Text logs in UTF-16 or Windows-1252 are converted to UTF-8 before indexing.
+encoding_rs = "0.8"
+# Columnar query engine (embedded, no server): filters and aggregations over large files.
+duckdb = { version = "1.10505", features = ["bundled", "appender-arrow", "vscalar"] }
+# Allocator that scales with many threads parsing events at once.
+mimalloc = { version = "0.1", default-features = false }
+# Inverted index of the free text (word -> rows), as search engines use.
+tantivy = { version = "0.26", default-features = false, features = ["mmap"] }
 sysinfo = { version = "=0.37.2", default-features = false, features = ["system", "disk"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+[dev-dependencies]
+# Workbooks for the spreadsheet tests.
+rust_xlsxwriter = "0.99"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -54,8 +68,26 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+# Background threads run with a lower scheduling priority.
+libc = "0.2"
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Test builds only: accepts the announced update without asking (scripts/release/update-e2e.mjs).
+update-e2e = []
+
+# The bundled DuckDB is large C++: without optimizations it is slow and its
+# debug information alone takes gigabytes, so it is always built optimized.
+[profile.dev.package.libduckdb-sys]
+opt-level = 3
+debug = false

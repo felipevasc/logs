@@ -1,0 +1,921 @@
+{
+  "schemaVersion": 1,
+  "redaction": [
+    {
+      "name": "ordinary",
+      "input": "Ação concluída; fonte Σ; π",
+      "expected": "Ação concluída; fonte Σ; π"
+    },
+    {
+      "name": "all secret keys",
+      "input": "password=a passwd=b access_token=c refresh-token=d secretAccessKey=e client_secret=f token=g secret=h authorization=i cookie=j api-key=k",
+      "expected": "password=\"[oculto]\" passwd=\"[oculto]\" access_token=\"[oculto]\" refresh-token=\"[oculto]\" secretAccessKey=\"[oculto]\" client_secret=\"[oculto]\" token=\"[oculto]\" secret=\"[oculto]\" authorization=\"[oculto]\" cookie=\"[oculto]\" api-key=\"[oculto]\""
+    },
+    {
+      "name": "ascii case",
+      "input": "PASSWORD=One pAsSwD=Two ToKeN=Three",
+      "expected": "PASSWORD=\"[oculto]\" pAsSwD=\"[oculto]\" ToKeN=\"[oculto]\""
+    },
+    {
+      "name": "quoted and escaped",
+      "input": "password=\"a\\\"b\" cookie='c\\'d' token=\"\"",
+      "expected": "password=\"[oculto]\" cookie=\"[oculto]\" token=\"[oculto]\""
+    },
+    {
+      "name": "bearer and basic",
+      "input": "Authorization: Bearer abc.def Cookie=Basic Zm9v==",
+      "expected": "Authorization: \"[oculto]\" Cookie=\"[oculto]\""
+    },
+    {
+      "name": "not a word boundary",
+      "input": "prefixpassword=x and xclient-secret=y",
+      "expected": "prefixpassword=\"[oculto]\" and xclient-secret=\"[oculto]\""
+    },
+    {
+      "name": "long s is not ascii s",
+      "input": "ſecret=visible paſſword=visible",
+      "expected": "ſecret=visible paſſword=visible"
+    },
+    {
+      "name": "kelvin sign is not ascii k",
+      "input": "apiKey=visible",
+      "expected": "apiKey=visible"
+    },
+    {
+      "name": "js BOM whitespace",
+      "input": "token﻿=﻿secret﻿tail",
+      "expected": "token﻿=﻿\"[oculto]\"﻿tail"
+    },
+    {
+      "name": "NEL is not js whitespace",
+      "input": "token=secrettail",
+      "expected": "token=\"[oculto]\""
+    },
+    {
+      "name": "MVS is not js whitespace",
+      "input": "token=secret᠎tail",
+      "expected": "token=\"[oculto]\""
+    },
+    {
+      "name": "line separator value boundary",
+      "input": "token=secret tail",
+      "expected": "token=\"[oculto]\" tail"
+    },
+    {
+      "name": "escaped line separator is not dot",
+      "input": "password=\"foo\\ bar\"",
+      "expected": "password=\"foo\\ bar\""
+    },
+    {
+      "name": "escaped newline is not dot",
+      "input": "password=\"foo\\\nbar\"",
+      "expected": "password=\"foo\\\nbar\""
+    },
+    {
+      "name": "unescaped quoted newline",
+      "input": "password=\"foo\nbar\"",
+      "expected": "password=\"[oculto]\""
+    },
+    {
+      "name": "hash twenty chars",
+      "input": "$6$abcdefghijklmnopqrst tail",
+      "expected": "[hash protegido] tail"
+    },
+    {
+      "name": "hash nineteen chars",
+      "input": "$6$abcdefghijklmnopqrs tail",
+      "expected": "$6$abcdefghijklmnopqrs tail"
+    },
+    {
+      "name": "bcrypt and allowed punctuation",
+      "input": "$2b$abcABC123./$=,-abcABC123 trailing",
+      "expected": "[hash protegido] trailing"
+    },
+    {
+      "name": "complete PEM",
+      "input": "before -----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY----- after",
+      "expected": "before [chave privada oculta] after"
+    },
+    {
+      "name": "truncated PEM",
+      "input": "before -----BEGIN PRIVATE KEY-----\nabc\n",
+      "expected": "before [chave privada oculta]"
+    },
+    {
+      "name": "mismatched PEM type",
+      "input": "-----BEGIN EC PRIVATE KEY-----abc-----END OPENSSH PRIVATE KEY----- tail",
+      "expected": "[chave privada oculta] tail"
+    },
+    {
+      "name": "environment whole line",
+      "input": "DB_PASSWORD=one two three\nDATABASE_PASSWORD=four five\r\nAWS_SECRET_ACCESS_KEY=six seven",
+      "expected": "DB_PASSWORD=\"[oculto]\"\nDATABASE_PASSWORD=\"[oculto]\"\r\nAWS_SECRET_ACCESS_KEY=[oculto]"
+    },
+    {
+      "name": "environment case sensitivity",
+      "input": "db_password=one two\nDB_PASSWORD=three four",
+      "expected": "db_password=\"[oculto]\" two\nDB_PASSWORD=\"[oculto]\""
+    },
+    {
+      "name": "environment crosses whitespace newline",
+      "input": "DB_PASSWORD=\n secret next\nremaining",
+      "expected": "DB_PASSWORD=\n \"[oculto]\"\nremaining"
+    },
+    {
+      "name": "multiple passes",
+      "input": "token=$6$abcdefghijklmnopqrst end",
+      "expected": "token=\"[oculto]\" protegido] end"
+    },
+    {
+      "name": "empty secret",
+      "input": "password=; token=, cookie=\"\"",
+      "expected": "password=; token=, cookie=\"[oculto]\""
+    },
+    {
+      "name": "regexp whitespace U+9",
+      "input": "token\t=\tvalue\ttail",
+      "expected": "token\t=\t\"[oculto]\"\ttail"
+    },
+    {
+      "name": "regexp whitespace U+A",
+      "input": "token\n=\nvalue\ntail",
+      "expected": "token\n=\n\"[oculto]\"\ntail"
+    },
+    {
+      "name": "regexp whitespace U+B",
+      "input": "token\u000b=\u000bvalue\u000btail",
+      "expected": "token\u000b=\u000b\"[oculto]\"\u000btail"
+    },
+    {
+      "name": "regexp whitespace U+C",
+      "input": "token\f=\fvalue\ftail",
+      "expected": "token\f=\f\"[oculto]\"\ftail"
+    },
+    {
+      "name": "regexp whitespace U+D",
+      "input": "token\r=\rvalue\rtail",
+      "expected": "token\r=\r\"[oculto]\"\rtail"
+    },
+    {
+      "name": "regexp whitespace U+20",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+A0",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+1680",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2000",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2001",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2002",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2003",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2004",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2005",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2006",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2007",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2008",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2009",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+200A",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2028",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+2029",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+202F",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+205F",
+      "input": "token = value tail",
+      "expected": "token = \"[oculto]\" tail"
+    },
+    {
+      "name": "regexp whitespace U+3000",
+      "input": "token　=　value　tail",
+      "expected": "token　=　\"[oculto]\"　tail"
+    },
+    {
+      "name": "regexp whitespace U+FEFF",
+      "input": "token﻿=﻿value﻿tail",
+      "expected": "token﻿=﻿\"[oculto]\"﻿tail"
+    }
+  ],
+  "search": [
+    {
+      "name": "Portuguese accents",
+      "query": "  AÇÃO  ",
+      "fields": [
+        "Uma ação registrada"
+      ],
+      "normalized": "ação",
+      "expected": true
+    },
+    {
+      "name": "accents remain distinct",
+      "query": "acao",
+      "fields": [
+        "ação"
+      ],
+      "normalized": "acao",
+      "expected": false
+    },
+    {
+      "name": "final sigma",
+      "query": "ΟΣ",
+      "fields": [
+        "ΟΣ"
+      ],
+      "normalized": "ος",
+      "expected": true
+    },
+    {
+      "name": "sigma stays contextual",
+      "query": "οσ",
+      "fields": [
+        "ΟΣ"
+      ],
+      "normalized": "οσ",
+      "expected": false
+    },
+    {
+      "name": "isolated sigma",
+      "query": "Σ",
+      "fields": [
+        "σ"
+      ],
+      "normalized": "σ",
+      "expected": true
+    },
+    {
+      "name": "sigma before cased letter",
+      "query": "ΟΣΑ",
+      "fields": [
+        "οσα"
+      ],
+      "normalized": "οσα",
+      "expected": true
+    },
+    {
+      "name": "sigma combining case ignorable",
+      "query": "AΣ́",
+      "fields": [
+        "aς́"
+      ],
+      "normalized": "aς́",
+      "expected": true
+    },
+    {
+      "name": "sigma combining followed by cased",
+      "query": "AΣͅB",
+      "fields": [
+        "aσͅb"
+      ],
+      "normalized": "aσͅb",
+      "expected": true
+    },
+    {
+      "name": "sigma apostrophe",
+      "query": "AΣ’",
+      "fields": [
+        "aς’"
+      ],
+      "normalized": "aς’",
+      "expected": true
+    },
+    {
+      "name": "sigma underscore stops context",
+      "query": "AΣ_B",
+      "fields": [
+        "aς_b"
+      ],
+      "normalized": "aς_b",
+      "expected": true
+    },
+    {
+      "name": "sigma joiner case ignorable",
+      "query": "AΣ‍",
+      "fields": [
+        "aς‍"
+      ],
+      "normalized": "aς‍",
+      "expected": true
+    },
+    {
+      "name": "Latin capital dotted I",
+      "query": "İ",
+      "fields": [
+        "i̇"
+      ],
+      "normalized": "i̇",
+      "expected": true
+    },
+    {
+      "name": "BOM is trimmed",
+      "query": "﻿query﻿",
+      "fields": [
+        "query"
+      ],
+      "normalized": "query",
+      "expected": true
+    },
+    {
+      "name": "NEL is preserved",
+      "query": "query",
+      "fields": [
+        "query"
+      ],
+      "normalized": "query",
+      "expected": false
+    },
+    {
+      "name": "MVS is preserved",
+      "query": "᠎query᠎",
+      "fields": [
+        "query"
+      ],
+      "normalized": "᠎query᠎",
+      "expected": false
+    },
+    {
+      "name": "no cross field match",
+      "query": "abc",
+      "fields": [
+        "ab",
+        "c"
+      ],
+      "normalized": "abc",
+      "expected": false
+    },
+    {
+      "name": "fields are not trimmed",
+      "query": "a b",
+      "fields": [
+        "a  b"
+      ],
+      "normalized": "a b",
+      "expected": false
+    },
+    {
+      "name": "replacement can match",
+      "query": "[OCULTO]",
+      "fields": [
+        "token=\"[oculto]\""
+      ],
+      "normalized": "[oculto]",
+      "expected": true
+    },
+    {
+      "name": "hidden secret cannot match",
+      "query": "secret",
+      "fields": [
+        "token=\"[oculto]\""
+      ],
+      "normalized": "secret",
+      "expected": false
+    },
+    {
+      "name": "empty query",
+      "query": " ﻿ ",
+      "fields": [
+        ""
+      ],
+      "normalized": "",
+      "expected": true
+    },
+    {
+      "name": "astral case pair",
+      "query": "𐐀",
+      "fields": [
+        "𐐨"
+      ],
+      "normalized": "𐐨",
+      "expected": true
+    },
+    {
+      "name": "trim U+9",
+      "query": "\tx\t",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+A",
+      "query": "\nx\n",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+B",
+      "query": "\u000bx\u000b",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+C",
+      "query": "\fx\f",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+D",
+      "query": "\rx\r",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+20",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+A0",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+1680",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2000",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2001",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2002",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2003",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2004",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2005",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2006",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2007",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2008",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2009",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+200A",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2028",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+2029",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+202F",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+205F",
+      "query": " x ",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+3000",
+      "query": "　x　",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    },
+    {
+      "name": "trim U+FEFF",
+      "query": "﻿x﻿",
+      "fields": [
+        "x"
+      ],
+      "normalized": "x",
+      "expected": true
+    }
+  ],
+  "context": [
+    {
+      "name": "ordered levels and duplicate matches",
+      "eventRef": "e",
+      "message": "body",
+      "description": "fallback",
+      "detections": [
+        {
+          "event_refs": [
+            "e"
+          ],
+          "evidence_level": 5,
+          "name": "primeiro"
+        },
+        {
+          "event_refs": [
+            "other"
+          ],
+          "evidence_level": 3,
+          "name": "ignorado"
+        },
+        {
+          "event_refs": [
+            "e",
+            "e"
+          ],
+          "evidence_level": 0,
+          "name": "salvo"
+        },
+        {
+          "event_refs": [
+            "e",
+            "e"
+          ],
+          "evidence_level": 1,
+          "name": "salvo"
+        },
+        {
+          "event_refs": [
+            "e",
+            "e"
+          ],
+          "evidence_level": 2,
+          "name": "salvo"
+        },
+        {
+          "event_refs": [
+            "e",
+            "e"
+          ],
+          "evidence_level": 3,
+          "name": "salvo"
+        },
+        {
+          "event_refs": [
+            "e",
+            "e"
+          ],
+          "evidence_level": 4,
+          "name": "salvo"
+        },
+        {
+          "event_refs": [
+            "e",
+            "e"
+          ],
+          "evidence_level": 5,
+          "name": "salvo"
+        },
+        {
+          "event_refs": [
+            "e",
+            "e"
+          ],
+          "evidence_level": 6,
+          "name": "salvo"
+        },
+        {
+          "event_refs": [
+            "e",
+            "e"
+          ],
+          "evidence_level": 1.5,
+          "name": "salvo"
+        },
+        {
+          "event_refs": [
+            "e",
+            "e"
+          ],
+          "evidence_level": "5",
+          "name": "salvo"
+        },
+        {
+          "event_refs": [
+            "e",
+            "e"
+          ],
+          "evidence_level": null,
+          "name": "salvo"
+        }
+      ],
+      "expected": "Quase confirmado: primeiro; Nível não avaliado: salvo; Inconclusivo: salvo; Suspeita: salvo; Indício: salvo; Forte indício: salvo; Quase confirmado: salvo; Nível não avaliado: salvo; Nível não avaliado: salvo; Nível não avaliado: salvo; Nível não avaliado: salvo",
+      "detail": "body\nQuase confirmado: primeiro; Nível não avaliado: salvo; Inconclusivo: salvo; Suspeita: salvo; Indício: salvo; Forte indício: salvo; Quase confirmado: salvo; Nível não avaliado: salvo; Nível não avaliado: salvo; Nível não avaliado: salvo; Nível não avaliado: salvo"
+    },
+    {
+      "name": "description fallback and secret suffix",
+      "eventRef": "e",
+      "message": "",
+      "description": "description",
+      "detections": [
+        {
+          "event_refs": [
+            "e"
+          ],
+          "evidence_level": 2,
+          "name": "token=secret"
+        }
+      ],
+      "expected": "Suspeita: token=secret",
+      "detail": "description\nSuspeita: token=\"[oculto]\""
+    },
+    {
+      "name": "redact after joining",
+      "eventRef": "e",
+      "message": "token=",
+      "description": "ignored",
+      "detections": [
+        {
+          "event_refs": [
+            "e"
+          ],
+          "evidence_level": 3,
+          "name": "context"
+        }
+      ],
+      "expected": "Indício: context",
+      "detail": "token=\n\"[oculto]\" context"
+    },
+    {
+      "name": "missing references and name",
+      "eventRef": "e",
+      "message": "",
+      "description": "",
+      "detections": [
+        {},
+        {
+          "event_refs": null
+        },
+        {
+          "event_refs": [
+            "e"
+          ]
+        },
+        {
+          "event_refs": [
+            "e"
+          ],
+          "name": null
+        }
+      ],
+      "expected": "Nível não avaliado: undefined; Nível não avaliado: null",
+      "detail": "Nível não avaliado: undefined; Nível não avaliado: null"
+    },
+    {
+      "name": "empty reference stays present",
+      "eventRef": "",
+      "message": "",
+      "description": "",
+      "detections": [
+        {
+          "event_refs": [
+            ""
+          ],
+          "name": "empty"
+        }
+      ],
+      "expected": "Nível não avaliado: empty",
+      "detail": "Nível não avaliado: empty"
+    },
+    {
+      "name": "missing reference is undefined",
+      "message": "",
+      "description": "",
+      "detections": [
+        {
+          "event_refs": [
+            "",
+            null,
+            "undefined"
+          ],
+          "name": "array does not match"
+        },
+        {
+          "event_refs": "contains undefined",
+          "name": "string includes matches"
+        }
+      ],
+      "expected": "Nível não avaliado: string includes matches",
+      "detail": "Nível não avaliado: string includes matches"
+    },
+    {
+      "name": "string includes receiver",
+      "eventRef": "e",
+      "message": "",
+      "description": "",
+      "detections": [
+        {
+          "event_refs": "prefix-e-suffix",
+          "name": "string reference"
+        }
+      ],
+      "expected": "Nível não avaliado: string reference",
+      "detail": "Nível não avaliado: string reference"
+    }
+  ],
+  "presentation": [
+    {
+      "id": "g",
+      "type": "group",
+      "title": "token=group-secret",
+      "detail": "2 eventos",
+      "source": "token=\"[oculto]\"",
+      "notes": [
+        "token=note-secret"
+      ]
+    },
+    {
+      "id": "e:i:3",
+      "type": "event",
+      "title": "single",
+      "detail": "single body",
+      "source": "token=\"[oculto]\"",
+      "notes": []
+    },
+    {
+      "id": "m:m",
+      "type": "manual",
+      "title": "token=manual-secret",
+      "detail": "password=manual-detail",
+      "source": "Marco do caso",
+      "notes": []
+    }
+  ]
+}

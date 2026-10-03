@@ -22,15 +22,11 @@ concurrency:
 
 jobs:
   validate:
-    name: Frontend and release regressions
+    name: Release frontend and interaction regressions
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
-    env:
-      PLAYWRIGHT_CHANNEL: chromium
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - name: Verify triggering tag before dependency installation
-        run: node scripts/release/verify-trigger.mjs
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
@@ -38,26 +34,29 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             scripts/preview/package-lock.json
+      - name: Verify triggering tag
+        run: node scripts/release/verify-trigger.mjs
       - run: npm ci
       - run: npm ci --prefix scripts/preview
-      - name: Install browser
-        working-directory: scripts/preview
-        run: npx playwright install --with-deps chromium
+      - run: npx --prefix scripts/preview playwright install --with-deps chromium
       - run: npm run check
-      - run: npm run test:preview
-      - name: Upload browser evidence
+      - run: npm run prepare:frontend
+      - name: Full browser regression
+        run: npm run test:preview
+      - name: Preserve browser diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: browser-validation
-          path: output/playwright/
-          if-no-files-found: warn
-          retention-days: 14
+          name: release-preview-diagnostics
+          path: |
+            output/playwright/
+            !output/playwright/**/*.webm
+          if-no-files-found: ignore
 
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -72,64 +71,95 @@ jobs:
             bundles: deb,appimage,rpm
     env:
       CARGO_TERM_COLOR: always
+      RUST_TEST_THREADS: '1'
       APPIMAGE_EXTRACT_AND_RUN: '1'
     steps:
       - uses: actions/checkout@v7
-      - name: Verify triggering tag before dependencies and build
-        run: node scripts/release/verify-trigger.mjs
       - name: Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential pkg-config curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential pkg-config curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils xvfb
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: npm
+      - name: Verify triggering tag
+        run: node scripts/release/verify-trigger.mjs
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+          shared-key: desktop-release-v1
       - run: npm ci
-      - name: Native acceptance dependencies
-        if: runner.os == 'Windows'
-        run: npm ci --prefix scripts/preview
-      - name: Verify Windows desktop and WebView2 runtime
-        if: runner.os == 'Windows'
-        timeout-minutes: 10
-        shell: pwsh
-        run: ./scripts/release/ensure-webview2.ps1 -InstallMissing
-      - name: Verify Windows process cleanup
-        if: runner.os == 'Windows'
-        run: node scripts/release/test-process-supervision.mjs
       - name: Verify version
         run: node scripts/release/verify-version.mjs
       - name: Verify release safeguards
         run: node scripts/release/test-release.mjs
+      - name: Verify Windows process cleanup
+        if: runner.os == 'Windows'
+        run: node scripts/release/test-process-supervision.mjs
+      - name: Test event detail tree and formatters
+        run: node --test scripts/preview/test-detail-fields.cjs
       - run: npm run prepare:frontend
       - name: Backend tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --lib -- --test-threads=1
-      - name: Windows atomic metadata regressions
+        if: runner.os != 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+      - name: Windows backend tests with loader diagnostics
         if: runner.os == 'Windows'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --test atomic_metadata_windows -- --test-threads=1
+        id: backend_windows
+        shell: pwsh
+        run: ./scripts/ci/windows-native-tests.ps1
+      - name: Verify Windows unit harness manifest
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/verify-windows-manifest.ps1 -Target harness
+      - name: Preserve Windows native failure evidence
+        if: failure() && runner.os == 'Windows' && steps.backend_windows.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-diagnostics-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/windows-native-diagnostics/
+          if-no-files-found: warn
+          retention-days: 30
       - name: Build installers
         run: npm run build -- --ci --bundles ${{ matrix.bundles }} -- --locked
-      - name: Native Windows acceptance
+      - name: Verify Windows app manifest
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/verify-windows-manifest.ps1 -Target app
+      - name: Install native acceptance tooling
+        if: runner.os == 'Windows'
+        run: npm ci --prefix scripts/preview
+      - name: Ensure WebView2 runtime
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./scripts/release/ensure-webview2.ps1 -InstallMissing
+      - name: Windows desktop acceptance
         if: runner.os == 'Windows'
         timeout-minutes: 10
         run: node scripts/preview/test-native-desktop.mjs src-tauri/target/release/loginsight.exe
-      - name: Upload native acceptance evidence
+      - name: Preserve native acceptance evidence
         if: always() && runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: native-windows-validation
-          if-no-files-found: warn
-          retention-days: 14
+          name: windows-native-acceptance
           path: |
             output/native-environment.json
             output/native-desktop-*/results.json
             output/native-desktop-*/*.png
             output/native-desktop-*/*.log
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Preserve Windows manifest verification
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-manifest-verification-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/windows-manifest-verification/
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
@@ -138,14 +168,24 @@ jobs:
           retention-days: 30
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
             src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.sig
             src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/deb/*.deb.sig
             src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
             src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/rpm/*.rpm.sig
+      # Proves that this code, once installed, updates itself to the next version (after the upload, so the
+      # test builds never mix with the installers).
+      - name: Update end to end
+        timeout-minutes: 30
+        run: node scripts/release/update-e2e.mjs
 
   release:
     name: Publish Windows and Linux release
-    needs: [validate, build]
+    needs: [build, validate]
     if: (github.event_name == 'workflow_dispatch' && inputs.publish_release && github.ref == 'refs/heads/main') || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -153,8 +193,10 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      - name: Verify triggering tag before downloads or publication
-        run: node scripts/release/verify-trigger.mjs
+        with:
+          fetch-depth: 0
+      - name: Only commits already in main are published
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - uses: actions/setup-node@v6
         with:
           node-version: '22'

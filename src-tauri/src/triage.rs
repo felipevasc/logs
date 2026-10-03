@@ -11,98 +11,40 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
 fn source_key(state: &AppState) -> String {
-    match &*state.source.read() {
-        SourceData::Indexed(idx) => {
-            use sha2::{Digest, Sha256};
-            let mut hash = Sha256::new();
-            digest(&mut hash, &(crate::index_cache::INDEX_DIR, idx.lines.len()));
-            // The cache key tracks parser/settings semantics without rescanning
-            // all line metadata on every page of an already completed analysis.
-            for part in &idx.parts {
-                digest(
-                    &mut hash,
-                    &(
-                        &part.identity,
-                        &part.path,
-                        &part.file_name,
-                        &part.format,
-                        &part.header,
-                        part.base,
-                        part.mmap.len(),
-                    ),
-                );
-                match &part.custom {
-                    Some(crate::sources::CustomParse::Regex(re)) => digest(&mut hash, &re.as_str()),
-                    Some(crate::sources::CustomParse::Delimited { sep, fields }) => {
-                        digest(&mut hash, &(sep, fields))
-                    }
-                    None => digest(&mut hash, &"default"),
-                }
-                if let Some(ts) = &part.ts_config {
-                    digest(
-                        &mut hash,
-                        &(
-                            ts.timezone_offset_minutes,
-                            ts.clock_adjustment_ms,
-                            &ts.sources,
-                            &ts.format,
-                            &ts.complement,
-                        ),
-                    );
-                    for (re, template) in &ts.rules {
-                        digest(
-                            &mut hash,
-                            &(re.as_ref().map(regex::Regex::as_str), template),
-                        );
-                    }
-                } else {
-                    digest(&mut hash, &"no-ts-config");
-                }
-            }
-            digest(&mut hash, &*state.codes.read());
-            digest(&mut hash, &*state.system_codes.read());
-            for field in &*state.derived.read() {
-                digest(&mut hash, &(&field.name, &field.source));
-                for rule in &field.rules {
-                    digest(&mut hash, &(rule.re.as_str(), &rule.template, &rule.filter));
-                }
-            }
-            format!("idx:{:x}", hash.finalize())
-        }
-        SourceData::Memory(events) => case_key(events),
+    match &*crate::analysis_runtime::source(&state) {
+        SourceData::Indexed(idx) => format!(
+            "idx:{}:{}",
+            idx.lines.len(),
+            idx.parts.iter().map(|p| p.identity.as_str()).collect::<Vec<_>>().join(",")
+        ),
+        SourceData::Memory(events) => format!("mem:{}:{:p}", events.len(), events.as_ptr()),
         SourceData::None => "none".into(),
     }
 }
 
-fn digest(hash: &mut sha2::Sha256, value: &impl serde::Serialize) {
-    use sha2::Digest;
-    struct Sink<'a>(&'a mut sha2::Sha256);
-    impl std::io::Write for Sink<'_> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            use sha2::Digest;
-            self.0.update(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+fn case_key(events: &[Event]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for e in events {
+        e.id.hash(&mut hasher);
+        e.event_ref.hash(&mut hasher);
+        e.timestamp.hash(&mut hasher);
     }
-    serde_json::to_writer(Sink(&mut *hash), value).expect("analysis cache fingerprint serializable");
-    hash.update([0]);
+    format!("case:{}:{:x}", events.len(), hasher.finish())
 }
 
-fn case_key(events: &[Event]) -> String {
-    if let Some(key) = crate::case_cache::content_key_for(events) {
-        return format!("case:{}:{key}", events.len());
+// All rule stores share one analysis budget, but waiting remains cancellable.
+static ANALYSIS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+fn analysis_lock(cache_only: bool) -> Result<parking_lot::MutexGuard<'static, ()>, String> {
+    if cache_only {
+        return ANALYSIS.try_lock().ok_or_else(|| "TRIAGE_NOT_CALCULATED: O cálculo está em andamento; o resultado anterior ainda não está disponível.".to_string());
     }
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for e in events {
-        // Stable IDs may survive an evidence edit. Hash one complete record at a
-        // time so changed messages/fields cannot reuse an older security result.
-        digest(&mut hasher, e);
+    loop {
+        crate::operations::check()?;
+        if let Some(guard) = ANALYSIS.try_lock_for(std::time::Duration::from_millis(25)) {
+            return Ok(guard);
+        }
     }
-    format!("case:{}:{:x}", events.len(), hasher.finalize())
 }
 
 pub fn stored_analysis(
@@ -110,37 +52,34 @@ pub fn stored_analysis(
     case_events: Option<&[Event]>,
     force: bool,
 ) -> Result<Arc<crate::security_results::Results>, String> {
-    // One analysis worker: all rule stores share the application's analysis budget.
-    static ANALYSIS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-    let _working = ANALYSIS.lock();
+    stored_analysis_mode(state, case_events, force, false)
+}
+
+// Cache-only reads must never turn pagination or navigation into a new scan.
+pub(crate) fn stored_analysis_mode(
+    state: &AppState,
+    case_events: Option<&[Event]>,
+    force: bool,
+    cache_only: bool,
+) -> Result<Arc<crate::security_results::Results>, String> {
+    let _working = analysis_lock(cache_only)?;
     crate::operations::check()?;
     let rules = detections::ruleset()?;
     let settings = detections::load_settings();
-    let catalog = if settings.threats {
-        Some(crate::threats::load_active()?)
-    } else {
-        None
-    };
+    let catalog = if settings.threats { Some(crate::threats::load_active()?) } else { None };
     let expired: Vec<_> = settings
         .suppress
         .iter()
-        .map(|s| {
-            s.expires
-                .is_some_and(|t| t <= chrono::Utc::now().timestamp_millis())
-        })
+        .map(|s| s.expires.is_some_and(|t| t <= chrono::Utc::now().timestamp_millis()))
         .collect();
     let key = format!(
-        "{}|{:p}|{:p}|{}|{}|{:?}",
-        case_events
-            .map(case_key)
-            .unwrap_or_else(|| source_key(state)),
+        "{}|{}|{:p}|{:p}|{}|{}|{:?}",
+        crate::analysis_runtime::cache_namespace(),
+        case_events.map(case_key).unwrap_or_else(|| source_key(state)),
         Arc::as_ptr(&rules),
-        catalog
-            .as_ref()
-            .map(Arc::as_ptr)
-            .unwrap_or(std::ptr::null()),
+        catalog.as_ref().map(Arc::as_ptr).unwrap_or(std::ptr::null()),
         serde_json::to_string(&settings).unwrap_or_default(),
-        state.derived.read().len(),
+        crate::analysis_runtime::derived(&state).len(),
         expired,
     );
     if !force {
@@ -148,27 +87,94 @@ pub fn stored_analysis(
             return Ok(hit);
         }
     }
-    let inputs = detections::Inputs {
-        rules: &rules,
-        catalog: catalog.as_deref(),
-        settings: &settings,
-    };
+    // Analyses of indexed files are kept on disk across sessions.
+    let saved = case_events
+        .is_none()
+        .then(|| saved_path(state, &settings, catalog.as_deref(), &expired))
+        .flatten();
+    if let (Some(path), false) = (&saved, force) {
+        if path.exists() {
+            if let Ok(hit) = crate::security_results::Results::open(path) {
+                detections::remember(key, hit.clone());
+                return Ok(hit);
+            }
+        }
+    }
+    if cache_only {
+        return Err("TRIAGE_NOT_CALCULATED: A análise está ausente ou desatualizada. Clique em Calcular comprometimentos.".into());
+    }
+    crate::operations::report_progress("comprometimentos", "calculate", "Calculando comprometimentos", 0, 0, "registros", 0);
+    let inputs = detections::Inputs { rules: &rules, catalog: catalog.as_deref(), settings: &settings };
     let result = match case_events {
         Some(events) => detections::run_stored(&inputs, &Source::Events(events.iter().collect()))?,
         None => workspace::with_selection(state, &[], |selection| {
             detections::run_stored(&inputs, &Source::Selection(&selection))
-        })?,
+        })??,
     };
     crate::operations::check()?;
-    if result
-        .metadata
-        .get("complete")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+    if result.metadata.get("complete").and_then(|v| v.as_bool()).unwrap_or(false) {
         detections::remember(key, result.clone());
+        if let Some(path) = saved {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+                prune_saved(dir);
+            }
+            if let Err(error) = result.save(&path) {
+                eprintln!("[triage] análise não salva: {error}");
+            }
+        }
     }
     Ok(result)
+}
+
+/// File of the saved analysis of the indexed source with the current rules,
+/// catalog, settings and derived fields; `None` for sources held in memory.
+fn saved_path(
+    state: &AppState,
+    settings: &Settings,
+    catalog: Option<&crate::threats::CompiledCatalog>,
+    expired: &[bool],
+) -> Option<std::path::PathBuf> {
+    use sha2::{Digest, Sha256};
+    let source = source_key(state);
+    if !source.starts_with("idx:") {
+        return None;
+    }
+    let derived: Vec<String> = crate::analysis_runtime::derived(&state)
+        .iter()
+        .map(|d| {
+            let rules: Vec<String> = d
+                .rules
+                .iter()
+                .map(|r| format!("{}|{:?}|{}", r.re.as_str(), r.template, serde_json::to_string(&r.filter).unwrap_or_default()))
+                .collect();
+            format!("{}|{}|{rules:?}", d.name, d.source)
+        })
+        .collect();
+    let mut hash = Sha256::new();
+    hash.update(env!("CARGO_PKG_VERSION"));
+    hash.update(crate::analysis_runtime::cache_namespace());
+    hash.update(source);
+    hash.update(detections::fingerprint());
+    hash.update(serde_json::to_string(settings).unwrap_or_default());
+    hash.update(catalog.map(|c| c.signature()).unwrap_or_default());
+    hash.update(format!("{derived:?}{expired:?}"));
+    Some(crate::config_dir().join("triage-v1").join(format!("{:x}.sqlite", hash.finalize())))
+}
+
+/// Keeps the 8 most recently saved analyses.
+fn prune_saved(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut saved: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "sqlite"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    saved.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in saved.into_iter().skip(7) {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json"));
+    }
 }
 
 #[cfg(test)]
@@ -177,9 +183,7 @@ pub fn analysis_impl(
     case_events: Option<&[Event]>,
     force: bool,
 ) -> Result<Arc<serde_json::Value>, String> {
-    Ok(Arc::new(
-        stored_analysis(state, case_events, force)?.page(1, 0, 500, None, None)?,
-    ))
+    Ok(Arc::new(stored_analysis(state, case_events, force)?.page(1, 0, 500, None, None)?))
 }
 
 /// Filtering selects related findings after the full universe has been correlated.
@@ -194,27 +198,38 @@ pub fn triage_page(
     limit: usize,
     tactic: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    triage_page_mode(state, filters, case, force, minimum, offset, limit, tactic, false)
+}
+
+fn triage_page_mode(
+    state: &AppState,
+    filters: Vec<Filter>,
+    case: Option<&[Event]>,
+    force: bool,
+    minimum: u8,
+    offset: usize,
+    limit: usize,
+    tactic: Option<&str>,
+    cache_only: bool,
+) -> Result<serde_json::Value, String> {
     if !(1..=5).contains(&minimum) {
         return Err("minimum_evidence must be between 1 and 5".into());
     }
     workspace::validate(&filters)?;
-    let full = stored_analysis(state, case, force)?;
+    let full = stored_analysis_mode(state, case, force, cache_only)?;
     if filters.is_empty() {
         return full.page(minimum, offset, limit, None, tactic);
     }
     match case {
         Some(events) => {
             let prepared = query::prepare(&filters);
-            let mut ids = events
-                .iter()
-                .filter(|e| prepared.iter().all(|f| query::matches(e, f)))
-                .map(|e| e.id);
+            let mut ids = events.iter().filter(|e| prepared.iter().all(|f| query::matches(e, f))).map(|e| e.id);
             full.page(minimum, offset, limit, Some(&mut ids), tactic)
         }
         None => workspace::with_selection(state, &filters, |selection| {
             let mut ids = selection.iter().map(|e| e.id);
             full.page(minimum, offset, limit, Some(&mut ids), tactic)
-        }),
+        })?,
     }
 }
 
@@ -226,24 +241,33 @@ pub fn timeline_impl(
     start: i64,
     end: i64,
 ) -> Result<serde_json::Value, String> {
+    timeline_mode(state, filters, case, minimum, start, end, false)
+}
+
+pub(crate) fn timeline_mode(
+    state: &AppState,
+    filters: Vec<Filter>,
+    case: Option<&[Event]>,
+    minimum: u8,
+    start: i64,
+    end: i64,
+    cache_only: bool,
+) -> Result<serde_json::Value, String> {
     workspace::validate(&filters)?;
-    let full = stored_analysis(state, case, false)?;
+    let full = stored_analysis_mode(state, case, false, cache_only)?;
     if filters.is_empty() {
         return full.timeline(minimum, start, end, None);
     }
     match case {
         Some(events) => {
             let prepared = query::prepare(&filters);
-            let mut ids = events
-                .iter()
-                .filter(|e| prepared.iter().all(|f| query::matches(e, f)))
-                .map(|e| e.id);
+            let mut ids = events.iter().filter(|e| prepared.iter().all(|f| query::matches(e, f))).map(|e| e.id);
             full.timeline(minimum, start, end, Some(&mut ids))
         }
         None => workspace::with_selection(state, &filters, |selection| {
             let mut ids = selection.iter().map(|e| e.id);
             full.timeline(minimum, start, end, Some(&mut ids))
-        }),
+        })?,
     }
 }
 
@@ -252,20 +276,24 @@ pub async fn triage_timeline(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     minimum_evidence: Option<u8>,
     start: i64,
     end: i64,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    crate::offload(move || {
-        let case = crate::case_cache::resolve(case_events, case_key)?;
-        timeline_impl(
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        let case = case_events;
+        timeline_mode(
             app.state::<AppState>().inner(),
             filters,
-            case.as_deref().map(|v| v.as_slice()),
+            case.as_deref(),
             minimum_evidence.unwrap_or(5),
             start,
             end,
+            true,
         )
     })
     .await?
@@ -284,10 +312,9 @@ pub fn project(
         .enumerate()
         .filter(|(_, d)| {
             related.is_none_or(|ids| {
-                d["event_ids"].as_array().is_some_and(|a| {
-                    a.iter()
-                        .any(|id| ids.contains(&(id.as_u64().unwrap_or(u64::MAX) as usize)))
-                })
+                d["event_ids"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|id| ids.contains(&(id.as_u64().unwrap_or(u64::MAX) as usize))))
             })
         })
         .map(|(i, _)| i)
@@ -298,22 +325,16 @@ pub fn project(
         .filter(|&i| all[i]["evidence_level"].as_u64().unwrap_or(0) >= minimum as u64)
         .collect();
     let counts: Vec<_> = (1..=5)
-        .map(|level| {
-            related_indices
-                .iter()
-                .filter(|&&i| all[i]["evidence_level"].as_u64() == Some(level))
-                .count()
-        })
+        .map(|level| related_indices.iter().filter(|&&i| all[i]["evidence_level"].as_u64() == Some(level)).count())
         .collect();
     let episodes: Vec<_> = full["episodes"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|e| {
-            e["detections"].as_array().is_some_and(|a| {
-                a.iter()
-                    .any(|i| visible.contains(&(i.as_u64().unwrap_or(u64::MAX) as usize)))
-            })
+            e["detections"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|i| visible.contains(&(i.as_u64().unwrap_or(u64::MAX) as usize))))
         })
         .cloned()
         .collect();
@@ -377,20 +398,14 @@ pub fn project(
             let matches: Vec<_> = visible
                 .iter()
                 .map(|&i| &all[i])
-                .filter(|d| {
-                    d["tactics"]
-                        .as_array()
-                        .is_some_and(|a| a.contains(&t["key"]))
-                })
+                .filter(|d| d["tactics"].as_array().is_some_and(|a| a.contains(&t["key"])))
                 .collect();
             t["count"] = json!(matches.len());
             let mut techniques = std::collections::BTreeMap::<String, Value>::new();
             for d in matches {
                 for a in d["attack"].as_array().into_iter().flatten() {
                     let id = a["id"].as_str().unwrap_or_default().to_string();
-                    let entry = techniques
-                        .entry(id.clone())
-                        .or_insert(json!({"id":id,"name":a["name"],"count":0}));
+                    let entry = techniques.entry(id.clone()).or_insert(json!({"id":id,"name":a["name"],"count":0}));
                     entry["count"] = json!(entry["count"].as_u64().unwrap_or(0) + 1);
                 }
             }
@@ -401,25 +416,15 @@ pub fn project(
 }
 
 /// Paginate episodes after correlation and classification, keeping every context member.
-pub fn paginate(
-    mut result: serde_json::Value,
-    offset: usize,
-    limit: usize,
-) -> Result<serde_json::Value, String> {
+pub fn paginate(mut result: serde_json::Value, offset: usize, limit: usize) -> Result<serde_json::Value, String> {
     use serde_json::json;
     if !(1..=500).contains(&limit) {
         return Err("episode_limit deve estar entre 1 e 500".into());
     }
     let all = result["detections"].as_array().cloned().unwrap_or_default();
     let total = result["episodes"].as_array().map_or(0, Vec::len);
-    let mut episodes: Vec<_> = result["episodes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .skip(offset)
-        .take(limit)
-        .cloned()
-        .collect();
+    let mut episodes: Vec<_> =
+        result["episodes"].as_array().into_iter().flatten().skip(offset).take(limit).cloned().collect();
     let included: std::collections::HashSet<_> = episodes
         .iter()
         .flat_map(|e| e["detections"].as_array().into_iter().flatten())
@@ -443,8 +448,7 @@ pub fn paginate(
             .collect::<Vec<_>>());
     }
     result["page"] = json!({"episode_offset":offset,"episode_limit":limit,"total_episodes":total,"returned_episodes":episodes.len(),"next_offset":if offset.saturating_add(limit)<total {Some(offset+limit)}else{None}});
-    result["returned_detections"] =
-        json!(rows.iter().filter(|d| d["context_only"] != true).count());
+    result["returned_detections"] = json!(rows.iter().filter(|d| d["context_only"] != true).count());
     result["episodes"] = json!(episodes);
     result["detections"] = json!(rows);
     Ok(result)
@@ -455,25 +459,31 @@ pub async fn triage(
     filters: Vec<Filter>,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     force: Option<bool>,
+    cache_only: Option<bool>,
+    operation_id: Option<String>,
     minimum_evidence: Option<u8>,
     episode_offset: Option<usize>,
     episode_limit: Option<usize>,
     tactic: Option<String>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    crate::offload(move || {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
-        let events = crate::case_cache::resolve(case_events, case_key)?;
-        triage_page(
+        let events = case_events;
+        triage_page_mode(
             state.inner(),
             filters,
-            events.as_deref().map(|v| v.as_slice()),
+            events.as_deref(),
             force.unwrap_or(false),
             minimum_evidence.unwrap_or(5),
             episode_offset.unwrap_or(0),
             episode_limit.unwrap_or(20),
             tactic.as_deref(),
+            cache_only.unwrap_or(false),
         )
     })
     .await?
@@ -485,11 +495,19 @@ pub async fn triage_episode(
     episode_id: String,
     offset: Option<usize>,
     limit: Option<usize>,
+    case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
+    app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    crate::offload(move || {
-        detections::cached_analysis(&analysis_id)
-            .ok_or("Análise expirada; recarregue a triagem")?
-            .episode_members(&episode_id, offset.unwrap_or(0), limit.unwrap_or(100))
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |_case_events| {
+        detections::cached_analysis(&analysis_id).ok_or("Análise expirada; recarregue a triagem")?.episode_members(
+            &episode_id,
+            offset.unwrap_or(0),
+            limit.unwrap_or(100),
+        )
     })
     .await?
 }
@@ -501,7 +519,7 @@ pub fn evidence_event_impl(
     id: usize,
     case: Option<&[Event]>,
 ) -> Result<Event, String> {
-    let full = stored_analysis(state, case, false)?;
+    let full = stored_analysis_mode(state, case, false, true)?;
     if full.metadata["analysis_id"].as_str() != Some(analysis_id) {
         return Err("O conjunto ou a análise mudou; recarregue Comprometimentos".into());
     }
@@ -526,16 +544,19 @@ pub async fn triage_evidence_event(
     event_id: usize,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<Event, String> {
-    crate::offload(move || {
-        let case = crate::case_cache::resolve(case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        let case = case_events;
         evidence_event_impl(
             app.state::<AppState>().inner(),
             &analysis_id,
             &event_ref,
             event_id,
-            case.as_deref().map(|v| v.as_slice()),
+            case.as_deref(),
         )
     })
     .await?
@@ -577,6 +598,7 @@ pub struct EventInsights {
     pub normalization: crate::security_normalize::Normalized,
     pub related_findings: Vec<serde_json::Value>,
     pub related_findings_total: usize,
+    pub related_findings_calculated: bool,
 }
 
 pub fn insights_impl(event: &Event) -> Result<EventInsights, String> {
@@ -598,20 +620,13 @@ pub fn insights_impl(event: &Event) -> Result<EventInsights, String> {
                     snippet: hit.snippet,
                     normalized: hit.normalized,
                     provenance: hit.provenance,
-                    attack: crate::threats::attack_for(rule)
-                        .iter()
-                        .map(|t| crate::attack::reference(t, &[]))
-                        .collect(),
+                    attack: crate::threats::attack_for(rule).iter().map(|t| crate::attack::reference(t, &[])).collect(),
                 });
             }
         }
     }
     let set = detections::ruleset()?;
-    let input = detections::Inputs {
-        rules: &set,
-        catalog: None,
-        settings: &settings,
-    };
+    let input = detections::Inputs { rules: &set, catalog: None, settings: &settings };
     let assessed = detections::run(&input, &Source::Events(vec![event]))?;
     let rules = assessed
         .detections
@@ -636,6 +651,7 @@ pub fn insights_impl(event: &Event) -> Result<EventInsights, String> {
         normalization,
         related_findings: Vec::new(),
         related_findings_total: 0,
+        related_findings_calculated: false,
     })
 }
 
@@ -644,28 +660,38 @@ pub async fn event_insights(
     event: Event,
     case_events: Option<Vec<Event>>,
     case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
     app: AppHandle,
 ) -> Result<EventInsights, String> {
-    crate::offload(move || {
-        let case = crate::case_cache::resolve(case_events, case_key)?;
-        insights_in_context(
-            app.state::<AppState>().inner(),
-            &event,
-            case.as_deref().map(|v| v.as_slice()),
-        )
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        let case = case_events;
+        if crate::analysis_runtime::visibility_restricted() {
+            let visible = match case.as_deref() {
+                Some(events) => events.iter().any(|candidate| candidate.event_ref == event.event_ref && candidate.id == event.id),
+                None => crate::event_detail_raw(app.state::<AppState>().inner(), event.id).is_some_and(|candidate| candidate.event_ref == event.event_ref),
+            };
+            if !visible { return Err("O evento não pertence à análise visível atual.".into()); }
+        }
+        insights_in_context(app.state::<AppState>().inner(), &event, case.as_deref())
     })
     .await?
 }
 
-pub fn insights_in_context(
-    state: &AppState,
-    event: &Event,
-    case: Option<&[Event]>,
-) -> Result<EventInsights, String> {
+pub fn insights_in_context(state: &AppState, event: &Event, case: Option<&[Event]>) -> Result<EventInsights, String> {
     let mut result = insights_impl(event)?;
-    let full = stored_analysis(state, case, false)?;
-    let reference = crate::security_normalize::event_ref(event);
-    (result.related_findings, result.related_findings_total) = full.related_page(&reference)?;
+    // Opening one record must not trigger full-universe correlation. Its local
+    // normalization/rules stay available even before Comprometimentos is asked for.
+    match stored_analysis_mode(state, case, false, true) {
+        Ok(full) => {
+            let reference = crate::security_normalize::event_ref(event);
+            (result.related_findings, result.related_findings_total) = full.related_page(&reference)?;
+            result.related_findings_calculated = true;
+        }
+        Err(error) if error.starts_with("TRIAGE_NOT_CALCULATED:") => {}
+        Err(error) => return Err(error),
+    }
     Ok(result)
 }
 
@@ -674,11 +700,13 @@ pub async fn normalization_preview(
     event: Event,
     mappings: Vec<crate::security_normalize::SourceMapping>,
 ) -> Result<serde_json::Value, String> {
-    crate::security_normalize::validate_mappings(&mappings)?;
-    let (_, normalized) = crate::security_normalize::normalize(&event, &mappings);
-    let mut value = serde_json::to_value(normalized).map_err(|e| e.to_string())?;
-    crate::workspace::redact_value(&mut value);
-    Ok(value)
+    crate::offload(move || {
+        crate::security_normalize::validate_mappings(&mappings)?;
+        let (_, normalized) = crate::security_normalize::normalize(&event, &mappings);
+        let mut value = serde_json::to_value(normalized).map_err(|e| e.to_string())?;
+        crate::workspace::redact_value(&mut value);
+        Ok(value)
+    }).await?
 }
 
 #[derive(Serialize)]
@@ -704,6 +732,7 @@ pub struct RulesOverview {
     pub sigma_errors: Vec<String>,
     pub sigma_dir: String,
     pub settings: Settings,
+    pub custom_rules_json: Option<String>,
 }
 
 pub fn rules_impl() -> Result<RulesOverview, String> {
@@ -737,77 +766,94 @@ pub fn rules_impl() -> Result<RulesOverview, String> {
     Ok(RulesOverview {
         rules,
         sigma_errors: set.sigma_errors.clone(),
-        sigma_dir: detections::sigma_dir().to_string_lossy().into_owned(),
+        sigma_dir: "Fontes Sigma preservadas neste Caso".into(),
         settings,
+        custom_rules_json: crate::case_security::with(|snapshot| {
+            snapshot.custom_rules_json.clone()
+        }),
     })
 }
 
 #[tauri::command]
-pub async fn detection_rules() -> Result<RulesOverview, String> {
-    crate::offload(rules_impl).await?
+pub async fn detection_rules(
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: AppHandle,
+) -> Result<RulesOverview, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, rules_impl).await?
 }
 
-pub fn save_settings_impl(settings: Settings) -> Result<(), String> {
-    detections::save_settings(&settings)?;
-    detections::invalidate();
-    detections::clear_cache();
-    Ok(())
+pub fn save_settings_impl(
+    settings: Settings,
+    custom_rules_json: Option<String>,
+) -> Result<crate::analysis_commands::MutationReceipt, String> {
+    let expected = crate::analysis_commands::expected_identity(None)?;
+    let domain = if custom_rules_json.is_some() { "security_rules" } else { "security_settings" };
+    let snapshot = crate::case_interpretation::update_domain(&expected, domain, |interpretation| {
+        detections::validate_settings(&settings, &interpretation.security.detection_settings()?)?;
+        interpretation.security.detection_settings_json =
+            serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+        if let Some(text) = custom_rules_json {
+            interpretation.security.custom_rules_json = (!text.trim().is_empty()).then_some(text);
+        }
+        Ok(())
+    })?;
+    Ok(crate::analysis_commands::MutationReceipt {
+        analysis_context: snapshot,
+    })
 }
-
 #[tauri::command]
-pub async fn detection_settings_save(settings: Settings, app: AppHandle) -> Result<(), String> {
-    crate::offload(move || {
-        mutate_detection_semantics(app.state::<AppState>().inner(), || save_settings_impl(settings))
+pub async fn detection_settings_save(
+    settings: Settings,
+    custom_rules_json: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: AppHandle,
+) -> Result<crate::analysis_commands::MutationReceipt, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, move || {
+        save_settings_impl(settings, custom_rules_json)
     })
     .await?
 }
-
-fn mutate_detection_semantics<T>(
-    state: &AppState,
-    mutation: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
-    // Derived fields can depend on detection/threat predicates. Publish the rule
-    // mutation and discard parsed/indexed values under the same source lock.
-    let mut source = state.source.write();
-    crate::operations::check()?;
-    let value = mutation()?;
-    crate::operations::commit();
-    if let SourceData::Indexed(idx) = &mut *source {
-        idx.big_data = None;
-    }
-    crate::big_data_commands::clear_results();
-    Ok(value)
-}
-
 #[derive(Serialize)]
 pub struct SigmaImport {
     pub imported: usize,
     pub rules: usize,
     pub failed: Vec<String>,
+    #[serde(rename = "analysisContext")]
+    #[serde(serialize_with = "crate::analysis_context::serialize_management_snapshot")]
+    pub analysis_context: crate::analysis_context::Snapshot,
 }
 
 pub fn sigma_import_impl(paths: Vec<String>) -> Result<SigmaImport, String> {
-    let target = detections::sigma_dir();
-    std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+    let expected = crate::analysis_commands::expected_identity(None)?;
+    if paths.len() > crate::case_security::MAX_SIGMA_FILES {
+        return Err("Selecione até 512 arquivos Sigma.".into());
+    }
     let mut files = Vec::new();
     for path in paths {
+        crate::operations::check()?;
         let path = std::path::PathBuf::from(path);
         if path.is_dir() {
             files.extend(crate::sigma::rule_files(&path));
         } else if path.is_file() {
             files.push(path);
         }
-    }
-    let mut prepared = Vec::new();
-    let mut unique = std::collections::HashSet::new();
-    let mut texts = Vec::new();
-    for file in crate::sigma::rule_files(&target) {
-        let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
-        if unique.insert(text.clone()) {
-            texts.push(text);
+        if files.len() > crate::case_security::MAX_SIGMA_FILES {
+            return Err("Importação Sigma excede 512 arquivos.".into());
         }
     }
-    let previous = crate::sigma::load_dir(&target).0.len();
+    // Read all selected bytes before the transaction. No global files are changed.
+    let mut prepared = Vec::new();
+    let mut bytes = 0usize;
     for file in files {
         crate::operations::check()?;
         let name = file
@@ -815,84 +861,102 @@ pub fn sigma_import_impl(paths: Vec<String>) -> Result<SigmaImport, String> {
             .ok_or("Arquivo sem nome")?
             .to_string_lossy()
             .into_owned();
-        let text = std::fs::read_to_string(&file).map_err(|e| format!("{name}: {e}"))?;
-        if unique.insert(text.clone()) {
-            texts.push(text.clone());
-            prepared.push((name, text));
+        let text = crate::case_security::read_bounded(&file)?;
+        bytes = bytes.saturating_add(text.len());
+        if bytes > 2 << 20 {
+            return Err("Importação Sigma excede 2 MiB.".into());
         }
+        prepared.push(crate::case_security::SigmaSource { name, text });
     }
-    if prepared.is_empty() {
-        return Ok(SigmaImport {
-            imported: 0,
-            rules: 0,
-            failed: vec![],
-        });
-    }
-    // Resolve dependencies across the entire batch before publishing any file.
-    let found = crate::sigma::convert_texts(texts.iter().map(String::as_str))?;
-    let mut published = Vec::new();
-    let publish = (|| -> Result<(), String> {
-        for (name, text) in &prepared {
-            crate::operations::check()?;
-            let mut destination = target.join(name);
-            let mut n = 1;
-            while destination.exists() {
-                destination = target.join(format!(
-                    "{}-{n}.yml",
-                    name.trim_end_matches(".yml").trim_end_matches(".yaml")
-                ));
-                n += 1;
+    let (mut imported, mut rules) = (0, 0);
+    let snapshot = crate::case_interpretation::update_domain(&expected, "security_sigma", |interpretation| {
+        let sources = &mut interpretation.security.sigma_sources;
+        let previous = if sources.is_empty() {
+            0
+        } else {
+            crate::sigma::convert_texts(sources.iter().map(|s| s.text.as_str()))?.len()
+        };
+        let mut unique: std::collections::HashSet<_> =
+            sources.iter().map(|s| s.text.clone()).collect();
+        for source in prepared {
+            if unique.insert(source.text.clone()) {
+                sources.push(source);
+                imported += 1;
             }
-            let pending = destination.with_extension("pending");
-            std::fs::write(&pending, text).map_err(|e| e.to_string())?;
-            if let Err(e) = std::fs::rename(&pending, &destination) {
-                let _ = std::fs::remove_file(&pending);
-                return Err(e.to_string());
-            }
-            published.push(destination);
+        }
+        if !sources.is_empty() {
+            rules = crate::sigma::convert_texts(sources.iter().map(|s| s.text.as_str()))?
+                .len()
+                .saturating_sub(previous);
         }
         Ok(())
-    })();
-    if let Err(error) = publish {
-        for path in published {
-            let _ = std::fs::remove_file(path);
-        }
-        return Err(error);
-    }
-    let imported = prepared.len();
-    let rules = found.len().saturating_sub(previous);
-    let failed = Vec::new();
-    detections::invalidate();
-    detections::clear_cache();
+    })?;
     Ok(SigmaImport {
         imported,
         rules,
-        failed,
+        failed: vec![],
+        analysis_context: snapshot,
     })
 }
-
 #[tauri::command]
-pub async fn sigma_import(paths: Vec<String>, app: AppHandle) -> Result<SigmaImport, String> {
-    crate::offload(move || {
-        mutate_detection_semantics(app.state::<AppState>().inner(), || sigma_import_impl(paths))
+pub async fn sigma_import(
+    paths: Vec<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: AppHandle,
+) -> Result<SigmaImport, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, move || sigma_import_impl(paths)).await?
+}
+pub fn sigma_clear_impl() -> Result<crate::analysis_commands::MutationReceipt, String> {
+    let expected = crate::analysis_commands::expected_identity(None)?;
+    let snapshot = crate::case_interpretation::update_domain(&expected, "security_sigma", |interpretation| {
+        interpretation.security.sigma_sources.clear();
+        Ok(())
+    })?;
+    Ok(crate::analysis_commands::MutationReceipt {
+        analysis_context: snapshot,
     })
-    .await?
+}
+#[tauri::command]
+pub async fn sigma_clear(
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: AppHandle,
+) -> Result<crate::analysis_commands::MutationReceipt, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, sigma_clear_impl).await?
 }
 
-pub fn sigma_clear_impl() -> Result<(), String> {
-    let dir = detections::sigma_dir();
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+#[cfg(test)]
+mod on_demand_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_triage_does_not_wait_for_another_analysis_to_finish() {
+        let working = ANALYSIS.lock();
+        assert!(analysis_lock(true).err().unwrap().starts_with("TRIAGE_NOT_CALCULATED:"));
+        let id = format!("triage-wait-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let result = crate::operations::run_with_token(token, || analysis_lock(false).map(drop));
+            done_tx.send(matches!(result, Err(_) | Ok(Err(_)))).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        assert!(crate::operations::cancel_id(&id));
+        let cancelled = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Always unlock/join before asserting, so a regression cannot hang the suite.
+        drop(working);
+        waiter.join().unwrap();
+        assert_eq!(cancelled.unwrap(), true, "cancel must settle while the other analysis still holds the lock");
     }
-    detections::invalidate();
-    detections::clear_cache();
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn sigma_clear(app: AppHandle) -> Result<(), String> {
-    crate::offload(move || {
-        mutate_detection_semantics(app.state::<AppState>().inner(), sigma_clear_impl)
-    })
-    .await?
 }

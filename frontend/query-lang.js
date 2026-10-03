@@ -155,8 +155,11 @@ window.QueryLang = (() => {
     const standard = ["source", "level", "code", "name", "description", "message", "raw"];
     if (field.name === "timestamp") return ev.timestamp == null ? null : new Date(ev.timestamp).toISOString();
     if (standard.includes(field.name)) return ev[field.name] ?? "";
-    const direct = scalar(ev.fields?.[field.name]);
-    if (direct != null && direct !== "") return direct;
+    // Event::col_ref serializes an ordinary present JSON null as "null".
+    // Missing fields and the existing canonical-role fallback remain distinct.
+    const direct = !field.role && Object.hasOwn(ev.fields || {}, field.name) && ev.fields[field.name] === null
+      ? "null" : scalar(ev.fields?.[field.name]);
+    if (direct != null && (direct !== "" || !field.role)) return direct;
     const role = field.role;
     if (!role) return null;
     const annotated = scalar(ev.fields?.[role]);

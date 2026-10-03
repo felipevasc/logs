@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import {readFileSync} from 'node:fs';
+const bar=readFileSync(new URL('../../frontend/query-bar.js',import.meta.url),'utf8');
+const language=readFileSync(new URL('../../frontend/query-lang.js',import.meta.url),'utf8');
+assert.match(bar,/\["code>=500", "comparação numérica"\]/);
+const context=vm.createContext({window:{}});vm.runInContext(language,context);
+const filter={column:'_all',op:'query',value:'code>=500'};
+assert.equal(context.window.QueryLang.validate(filter.value),null);
+assert.equal(context.window.QueryLang.matchFilter({code:'503',fields:{}},filter),true);
+assert.equal(context.window.QueryLang.matchFilter({code:'200',fields:{}},filter),false);
+assert.equal(context.window.QueryLang.matchFilter({code:'ALLOW',fields:{}},filter),false);
+assert.equal(context.window.QueryLang.matchFilter({code:'503',fields:{status:'200'}},filter),true,'canonical code does not override or depend on a custom status field');
+console.log('Numeric search help uses the canonical code field without assuming an HTTP-only format');

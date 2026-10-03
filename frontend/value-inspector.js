@@ -212,7 +212,8 @@ window.ValueInspector = (() => {
 
   const element = (tag, className, text) => { const node = document.createElement(tag); node.className = className; if (text !== undefined) node.textContent = text; return node; };
   function close() { active?.(); }
-  function open(value, { label = "Valor", path = "$", revealed = false } = {}) {
+  function open(value, { label = "Valor", path = "$", revealed = false, isCurrent = () => true } = {}) {
+    if (!isCurrent()) return;
     close();
     const previous = document.activeElement, dialog = element("dialog", "evidence-inspector value-inspector");
     dialog.setAttribute("aria-label", "Inspecionar estrutura do valor");
@@ -233,6 +234,7 @@ window.ValueInspector = (() => {
     };
     active = cleanup;
     const copy = async getter => {
+      if (!isCurrent()) { cleanup(); return; }
       const text = getter();
       if (text === null) { status.textContent = "Valor não copiado: excede os limites da inspeção ou contém uma referência não serializável."; return; }
       try { await navigator.clipboard.writeText(text); if (dialog.isConnected) status.textContent = "Copiado."; }
@@ -266,7 +268,7 @@ window.ValueInspector = (() => {
       tree.append(renderNode(model.root));
       if (model.notices.length) status.textContent = model.notices.join(". ") + ". A evidência original permanece intacta.";
     }
-    toggle.onclick = () => { visible = !visible; render(); };
+    toggle.onclick = () => { if (!isCurrent()) { cleanup(); return; } visible = !visible; render(); };
     dismiss.onclick = cleanup;
     dialog.addEventListener("cancel", event => { event.preventDefault(); cleanup(); });
     dialog.addEventListener("click", event => { if (event.target === dialog) { const r = dialog.getBoundingClientRect(); if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) cleanup(); } });
@@ -274,5 +276,6 @@ window.ValueInspector = (() => {
     return cleanup;
   }
   if (typeof document !== "undefined") document.addEventListener("workspace-context-change", close);
+  if (typeof document !== "undefined") document.addEventListener("analysis-context-change", close);
   return { analyze, copyText, open, close, limits: LIMITS };
 })();

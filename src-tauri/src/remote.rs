@@ -468,7 +468,8 @@ impl RemoteClient {
                 .header("Content-Type", "application/json")
                 .body("{}");
         }
-        let response = request.send().map_err(|e| {
+        // This client owns no source/catalog/store guard or producer child here.
+        let response = crate::global_scheduler::unreserved_io(|| request.send()).map_err(|e| {
             if e.is_timeout() {
                 "Tempo de conexão esgotado. Verifique endereço e disponibilidade do serviço."
             } else {
@@ -490,13 +491,14 @@ impl RemoteClient {
             return Err(match status { 401 => "Autenticação recusada (401). Revise usuário e senha; login SSO não é suportado.", 403 => "Acesso negado (403). A conta precisa de permissão de leitura/PIT e, no Kibana, acesso ao Console.", 301..=399 => "O serviço redirecionou a conexão. Use a URL final diretamente; credenciais não são encaminhadas a redirecionamentos.", 404 => "Endpoint ou índice não encontrado (404). Confirme o índice, Elasticsearch 7.10+ e, no Kibana, URL base/space e Console habilitado.", _ => "O serviço recusou a consulta. Confira o índice, Query DSL e permissões de leitura." }.into());
         }
         let mut bytes = Vec::new();
-        response
+        crate::global_scheduler::unreserved_io(|| response
             .take(RESPONSE_LIMIT + 1)
-            .read_to_end(&mut bytes)
+            .read_to_end(&mut bytes))
             .map_err(|_| "Falha ao ler a resposta do serviço.")?;
         if bytes.len() as u64 > RESPONSE_LIMIT {
             return Err("Uma página excedeu 32 MiB. Restrinja a consulta ou reduza o tamanho dos documentos.".into());
         }
+        if !cleanup { operations::check()?; }
         let data: Value = serde_json::from_slice(&bytes).map_err(|_| "O serviço não retornou JSON válido. Confirme o endereço da API; páginas de login/SSO não são aceitas.")?;
         if data.get("error").is_some_and(|e| !e.is_null()) {
             return Err("O serviço retornou erro na consulta. Confira a Query DSL, o índice e as permissões de leitura.".into());
@@ -852,8 +854,9 @@ pub async fn remote_delete(id: String) -> Result<(), String> {
 pub async fn remote_test(
     connection: RemoteConfig,
     password: Option<String>,
+    operation_id: Option<String>,
 ) -> Result<TestResult, String> {
-    crate::offload(move || test_impl(&client_for(&crate::config_dir(), connection, password)?))
+    crate::offload_operation(operation_id, move || test_impl(&client_for(&crate::config_dir(), connection, password)?))
         .await?
 }
 #[tauri::command]
@@ -863,8 +866,9 @@ pub async fn remote_import(
     from: Option<String>,
     to: Option<String>,
     app: tauri::AppHandle,
+    operation_id: Option<String>,
 ) -> Result<ImportResult, String> {
-    crate::offload(move || {
+    crate::offload_operation(operation_id, move || {
         let root = crate::config_dir();
         import_impl(
             &client_for(&root, connection, password)?,
@@ -1038,6 +1042,49 @@ mod tests {
     }
     fn snapshot_count(root: &Path) -> usize {
         fs::read_dir(root.join("remote-snapshots")).unwrap().count()
+    }
+
+    #[test]
+    fn single_slot_page_progresses_while_remote_http_waits_for_body() {
+        use crate::global_scheduler::{Scheduler, Priority, with_scheduler};
+        let scheduler = Scheduler::new(1);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = client(&format!("http://{}", listener.local_addr().unwrap()));
+        let (received, waiting) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            loop { let mut line = String::new(); reader.read_line(&mut line).unwrap(); if line == "\r\n" { break; } }
+            // Send headers first, then keep read_to_end blocked independently
+            // of the connection establishment / response-header wait.
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n").unwrap();
+            socket.flush().unwrap(); received.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            socket.write_all(b"{\"ok\":true}").unwrap();
+        });
+        let other = Arc::clone(&scheduler);
+        let importer = thread::spawn(move || with_scheduler(other, || {
+            let token = operations::token(None).unwrap();
+            operations::run_with_token(token, || remote.request(Method::GET, "/", None, false)).unwrap().unwrap()
+        }));
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (page_done, page_result) = std::sync::mpsc::channel();
+        let other = Arc::clone(&scheduler);
+        let page = thread::spawn(move || with_scheduler(other, || {
+            let token = operations::token(None).unwrap().with_priority(Priority::Interactive);
+            let value = operations::run_with_token(token, || {
+                let conn = duckdb::Connection::open_in_memory().unwrap(); conn.execute_batch("SET threads=1").unwrap();
+                conn.query_row("SELECT 42", [], |row| row.get::<_, i64>(0)).unwrap()
+            }).unwrap();
+            page_done.send(value).unwrap();
+        }));
+        let value = page_result.recv_timeout(Duration::from_secs(3));
+        // Always unblock the server before asserting, including a regression.
+        release.send(()).unwrap(); server.join().unwrap();
+        assert_eq!(value.unwrap(), 42);
+        assert_eq!(importer.join().unwrap(), json!({"ok":true})); page.join().unwrap();
     }
 
     // One test keeps cancellation-generation changes isolated from other remote cases.

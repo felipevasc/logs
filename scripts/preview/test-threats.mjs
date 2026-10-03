@@ -1,10 +1,10 @@
 /* UI/catalog contract checks against local preview data, not the native scanner. */
-import { chromium } from 'playwright';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { launchBrowser } from './browser.mjs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
 
-const browser = await chromium.launch({headless:true,...(!existsSync(chromium.executablePath()) ? {executablePath:'C:/Users/felip/AppData/Local/ms-playwright/chromium-1217/chrome-win64/chrome.exe'} : {})});
+const browser = await launchBrowser({headless:true});
 const page = await browser.newPage({viewport:{width:1440,height:1000}});
 page.setDefaultTimeout(15000);
 const errors=[];page.on('pageerror',error=>errors.push(String(error)));
@@ -18,7 +18,7 @@ const ready=()=>page.waitForFunction(()=>!!document.querySelector('.threat-summa
 const close=()=>page.evaluate(()=>closeDrawer());
 try {
   await page.goto(previewUrl);
-  await page.waitForFunction(()=>state.loaded&&state.total===6000);
+  await page.waitForFunction(()=>state.loaded&&state.total===6000&&window.WorkspaceContext?.ready&&!WorkspaceContext.changing&&!state.loadOverlay);
   result.catalog=await page.evaluate(async()=>{
     const catalog=await api('threat_catalog',{});
     return {rules:catalog.rules.length,enabled:catalog.enabled,categories:catalog.categories.length};
@@ -136,24 +136,24 @@ try {
   await page.locator('#btn-dash-refresh').click();await ready();
   assert.match(await page.locator('#dash-grid > .threat-partial').innerText(),/Análise parcial/);
   result.partialVisible=true;
-  await page.evaluate(catalog=>{
+  await page.evaluate(async catalog=>{
     const existing={...catalog.rules[0],name:'Minha regra preservada',enabled:false,pattern:'local-custom-pattern'};
     const custom={...catalog.rules[1],id:'user.custom',name:'Regra própria',pattern:'CUSTOM_ONLY_SENTINEL'};
     window.__preservedThreatRules=[existing,custom];
-    window.__mockThreatCatalog={version:1,name:'Catálogo customizado',rules:[existing,custom]};Discovery.clearCache();
+    await api('threat_catalog_update',{catalogJson:JSON.stringify({version:1,name:'Catálogo customizado',rules:[existing,custom]})});Discovery.clearCache();
   },expectedCatalog);
   await page.locator('#btn-dash-refresh').click();await ready();
   await page.getByRole('button',{name:'Regras',exact:true}).click();
   await page.getByRole('button',{name:`Adicionar ${expectedCatalog.rules.length-1} regras novas`,exact:true}).click();
-  await page.waitForFunction(count=>window.__mockThreatCatalog.rules.length===count+1,expectedCatalog.rules.length);
-  await page.waitForFunction(()=>!!document.querySelector('.threat-catalog')&&!document.querySelector('.threat-catalog .btn.primary'));
-  assert(await page.evaluate(()=>window.__preservedThreatRules.every(expected=>JSON.stringify(window.__mockThreatCatalog.rules.find(rule=>rule.id===expected.id))===JSON.stringify(expected))),'Additive update preserves disabled/custom rules exactly');
-  assert.equal(await page.evaluate(()=>window.__mockThreatCatalog.name),'Catálogo customizado');
+  await page.waitForFunction(count=>JSON.parse(currentAnalysisContext().interpretation.security.threatCatalogJson).rules.length===count+1,expectedCatalog.rules.length);
+  await page.waitForFunction(()=>!!document.querySelector('.threat-catalog')&&![...document.querySelectorAll('.threat-catalog button')].some(button=>button.textContent.startsWith('Adicionar ')));
+  assert(await page.evaluate(()=>window.__preservedThreatRules.every(expected=>JSON.stringify(JSON.parse(currentAnalysisContext().interpretation.security.threatCatalogJson).rules.find(rule=>rule.id===expected.id))===JSON.stringify(expected))),'Additive update preserves disabled/custom rules exactly');
+  assert.equal(await page.evaluate(()=>JSON.parse(currentAnalysisContext().interpretation.security.threatCatalogJson).name),'Catálogo customizado');
   await ready();
   assert.match(await page.locator('#dash-info').innerText(),/65|66/,'Update refreshes the current selection');
   result.additiveUpdatePreservesCustom=true;
   await close();
-  await page.evaluate(()=>{window.__mockThreatCatalog={version:1,name:'Invalid fixture',rules:[],error:'Regex inválida na regra fixture.invalid'};Discovery.clearCache();});
+  await page.evaluate(async()=>{await api('threat_catalog_update',{catalogJson:JSON.stringify({version:1,name:'Invalid fixture',rules:[],error:'Regex inválida na regra fixture.invalid'})});Discovery.clearCache();});
   await page.locator('#btn-dash-refresh').click();
   await page.waitForFunction(()=>document.querySelector('#dash-grid .threat-error')?.textContent.includes('fixture.invalid'));
   result.catalogErrorVisible=true;

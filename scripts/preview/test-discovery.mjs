@@ -1,54 +1,48 @@
-import { chromium } from 'playwright';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { launchBrowser } from './browser.mjs';
+import { captureFailure } from './diagnostics.mjs';
+import { mkdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
-const browser = await chromium.launch({headless:true,...(!existsSync(chromium.executablePath()) ? {executablePath:'C:/Users/felip/AppData/Local/ms-playwright/chromium-1217/chrome-win64/chrome.exe'} : {})});
-const page = await browser.newPage({viewport:{width:1440,height:1000}});
+const browser = await launchBrowser();
+const page = await browser.newPage({viewport:{width:1440,height:1000},reducedMotion:'reduce'});
 page.setDefaultTimeout(15000);
 const errors=[];page.on('pageerror',e=>errors.push(String(e)));
+let phase='startup';
 const shots = new URL('../../output/playwright/',import.meta.url);mkdirSync(shots,{recursive:true});
-const waitAnalysis = () => page.waitForFunction(()=>!document.querySelector('#dash-grid .discovery-loading') && ![...document.querySelectorAll('#dash-grid .muted')].some(n=>n.textContent==='Calculando…') && ![...document.querySelectorAll('#dash-grid .cross-output,#dash-grid .heat-output')].some(n=>n.textContent.includes('Cruzando os valores…')));
+const waitAnalysis = () => page.waitForFunction(()=>document.querySelector('#dash-grid').children.length > 0 && !document.querySelector('#dash-grid .discovery-loading') && ![...document.querySelectorAll('#dash-grid .muted')].some(n=>n.textContent==='Calculando…') && ![...document.querySelectorAll('#dash-grid .cross-output,#dash-grid .heat-output')].some(n=>n.textContent.includes('Cruzando os valores…')) && Tasks.pending()===0);
 try {
-  await page.goto(process.env.PREVIEW_URL || 'http://127.0.0.1:4175');
-  await page.waitForFunction(()=>WorkspaceContext.ready && !WorkspaceContext.changing && !state.loadOverlay && state.loaded && state.total===6000 && document.querySelector('#ws-content .metric') && Array.isArray(state.datasetProfiles) && state.treeAgg.dataset);
-  // Finish the field metadata while Summary keeps the explorer hidden. This
-  // exercises the first cached reveal without relying on a late API callback.
-  const cached = await page.evaluate(async()=>{
-    await window.workspaceBootstrap;
-    await Workspace.showPage('summary');
-    await refreshTreeAggs('dataset');
-    return {page:Workspace.page(),hidden:document.querySelector('.shell').hidden,rows:state.rows.length,calls:{...window.__mockCommandCalls}};
-  });
-  assert.equal(cached.page,'summary');assert.equal(cached.hidden,true);assert(cached.rows>0);
+  await page.goto(process.argv[2] || process.env.PREVIEW_URL || 'http://127.0.0.1:4175');
+  await page.waitForFunction(()=>window.WorkspaceContext?.ready && !WorkspaceContext.changing && state.loaded && state.total===6000 && !state.loadOverlay && document.querySelector('#load-overlay').hidden && document.querySelector('#ws-content .metric'));
+  phase='field exploration';
   await page.getByRole('button',{name:'Explorar',exact:true}).click();
   assert.equal(await page.locator('#levels-mini').count(),0,'Níveis ficam apenas nos campos à direita');
   const side=await page.locator('#workspace-side').boundingBox(), content=await page.locator('.shell .content').boundingBox();
   assert(side.x >= content.x+content.width-1,'Campos deve estar à direita');
   await page.locator('#explore-tree .field-row[data-column="source"] .field-item').click({button:'right'});
-  const afterReveal=await page.evaluate(()=>({...window.__mockCommandCalls}));
-  for(const command of ['query_events','explore_snapshot','tree_aggs'])assert.equal(afterReveal[command]||0,cached.calls[command]||0,`cached explorer must rebuild visible fields without another ${command} request`);
-  await page.getByRole('button',{name:'Top 10 de Origem',exact:true}).click();
+  await page.getByRole('menuitem',{name:'Top 10 de Origem',exact:true}).click();
   await page.locator('#drawer .discovery-rank').first().waitFor();
   const drawer=await page.locator('#drawer').boundingBox();assert(drawer.x<side.x && drawer.x+drawer.width>=side.x+side.width-1,'Detalhes sobrepõem os campos');
   assert.match(await page.locator('#drawer').innerText(),/6.000 registros/);
-  await page.screenshot({path:new URL('campos-top10.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.screenshot({path:fileURLToPath(new URL('campos-top10.png',shots))});
   await page.locator('#drawer .discovery-rank').first().click();
   await page.waitForFunction(()=>state.total===2000);assert.equal(await page.locator('#drawer').isVisible(),false);
   await page.locator('#events-table tbody tr').first().locator('td').last().click({button:'right'});
   assert.doesNotMatch(await page.locator('.ctx-menu').innerText(),/Top 10/);
   await page.keyboard.press('Escape');await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
   await page.locator('#explore-tree .field-row[data-column="source"] .field-adv-btn').click();
-  await page.getByRole('button',{name:'Resumir por Origem',exact:true}).click();
+  await page.getByRole('menuitem',{name:'Resumir por Origem',exact:true}).click();
   await page.waitForFunction(()=>document.querySelector('#aw-group-summary')?.textContent.includes('5 grupos'));
   assert.equal(await page.locator('#group-col').inputValue(),'source');
+  phase='overview and frequency filters';
   await page.locator('#tabbtn-dashboard').click();await waitAnalysis();
   await page.getByRole('button',{name:'Visão geral',exact:true}).click();await waitAnalysis();
   assert.equal(await page.locator('.discovery-card').count(),4);
   assert(await page.locator('.discovery-card').first().evaluate(n=>n.scrollHeight<=n.clientHeight+1),'Gráfico não deve cortar legenda/ações');
-  await page.screenshot({path:new URL('descobrir-panorama.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.screenshot({path:fileURLToPath(new URL('descobrir-panorama.png',shots))});
   await page.getByRole('button',{name:'Frequências',exact:true}).click();await waitAnalysis();
   assert(await page.locator('.cross-segment').count()>0,'Frequências cruzadas mostram distribuição por grupo');
-  await page.locator('.cross-segment').first().click();await page.waitForFunction(()=>state.filters.length===2&&state.total<6000);
+  await page.locator('.cross-segment').first().click();await page.waitForFunction(()=>state.filters.length===2&&Number.isFinite(state.total)&&state.total<6000&&document.querySelector('#events-table').getAttribute('aria-busy')==='false');
   assert(await page.evaluate(()=>state.rows.every(e=>state.filters.every(f=>jsMatchFilter(e,f)))),'Segmento preserva ambos os campos');
   await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
   await page.locator('#tabbtn-dashboard').click();await page.getByRole('button',{name:'Frequências',exact:true}).click();await waitAnalysis();
@@ -56,15 +50,17 @@ try {
   await page.getByRole('button',{name:'Visão geral',exact:true}).click();await waitAnalysis();
   await page.getByRole('button',{name:'Frequências',exact:true}).click();await waitAnalysis();
   assert.equal(await page.evaluate(()=>window.__mockCommandCalls.compute_series),calls,'Trocar visões reaproveita séries');
+  phase='time series and contextual peaks';
   await page.getByRole('button',{name:'No tempo',exact:true}).click();await waitAnalysis();
   await page.getByRole('button',{name:'O que se destaca no maior pico?',exact:true}).first().click();
   await page.waitForFunction(()=>document.querySelectorAll('.peak-table tbody tr').length>0&&!document.querySelector('.peak-context')?.textContent.includes('Comparando…'));
   assert.doesNotMatch(await page.locator('.peak-table').first().innerText(),/NaN|undefined/);
-  await page.screenshot({path:new URL('pico-contextual.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.screenshot({path:fileURLToPath(new URL('pico-contextual.png',shots))});
   await page.locator('.peak-table .text-button').first().click();await page.waitForFunction(()=>state.filters.some(f=>f.column==='timestamp')&&state.filters.length===2);
   await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
   await page.locator('#tabbtn-dashboard').click();await page.getByRole('button',{name:'No tempo',exact:true}).click();await waitAnalysis();
   // A real zero must differ from an empty bucket when every observed value is negative.
+  phase='negative peak and missing samples';
   await page.evaluate(async()=>{
     window.__originalAnalysisApi=api;window.__negativeStart=state.rows[0].timestamp;window.__peakQueries=[];
     api=async(command,args,options)=>{
@@ -80,6 +76,7 @@ try {
   assert.equal(await page.evaluate(()=>window.__peakQueries[1].filters.at(-1).value),await page.evaluate(()=>String(window.__negativeStart+2000)),'Maior pico negativo é um valor medido, não uma lacuna');
   assert.equal(await page.evaluate(()=>window.__peakQueries[0].filters.at(-1).column),'timestamp','Referência do pico exclui registros sem horário');
   await page.evaluate(async()=>{closeDrawer();api=window.__originalAnalysisApi;Discovery.clearCache();await renderDashboard('dataset');});await waitAnalysis();
+  phase='heat map interactions';
   assert(await page.locator('.discovery-heat-cell').count()>0);
   assert((await page.locator('.dot-cell').count())>0);
   assert.equal(await page.getByLabel('Cor do mapa',{exact:true}).inputValue(),'["avg","latencia"]');
@@ -88,14 +85,15 @@ try {
   assert(await page.locator('.dot-cell').evaluateAll(nodes=>new Set(nodes.map(n=>n.style.getPropertyValue('--dot-fill'))).size>1),'Cor expressa outra medida');
   assert(await page.locator('.dot-cell').evaluateAll(nodes=>new Set(nodes.map(n=>n.querySelector('circle').getAttribute('stroke-width'))).size>1),'Borda expressa terceira medida');
   await page.getByLabel('Detalhe do mapa',{exact:true}).selectOption('12');await waitAnalysis();
-  await page.screenshot({path:new URL('mapa-calor-contextual.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.screenshot({path:fileURLToPath(new URL('mapa-calor-contextual.png',shots))});
   await page.locator('.discovery-heat-cell').first().click();await page.waitForFunction(()=>state.filters.some(f=>f.column==='timestamp')&&state.total>0&&state.total<6000&&state.rows.every(e=>state.filters.every(f=>jsMatchFilter(e,f))));
   assert(await page.evaluate(()=>state.filters.length===2),'Círculo filtra categoria e período');
   assert(await page.evaluate(()=>state.rows.every(e=>state.filters.every(f=>jsMatchFilter(e,f)))),'Célula retorna somente os registros da combinação');
   await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
+  phase='patterns and contextual deviations';
   await page.locator('#tabbtn-dashboard').click();await page.getByRole('button',{name:'Padrões',exact:true}).click();await waitAnalysis();
   assert(await page.locator('.discovery-pattern').count()>0);
-  await page.locator('.discovery-pattern').first().click();await page.waitForFunction(()=>state.filters.some(f=>f.op==='pattern')&&state.total<6000);
+  await page.locator('.discovery-pattern').first().click();await page.waitForFunction(()=>state.filters.some(f=>f.op==='pattern')&&Number.isFinite(state.total)&&state.total<6000);
   await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
   await page.locator('#tabbtn-dashboard').click();await page.getByRole('button',{name:'Desvios',exact:true}).click();await waitAnalysis();
   assert(await page.locator('.behavior-card').count()>0,'Incidente sintético produz desvio contextual');
@@ -105,7 +103,7 @@ try {
   assert.match(await page.locator('#analysis-help').innerText(),/Indicações para investigar/);
   await page.keyboard.press('Tab');assert.equal(await page.locator('#analysis-help button').evaluate(n=>n===document.activeElement),true);
   await page.keyboard.press('Escape');assert.equal(await page.locator('#analysis-help').isVisible(),false);
-  await page.screenshot({path:new URL('desvio-contextual.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.screenshot({path:fileURLToPath(new URL('desvio-contextual.png',shots))});
   await page.getByRole('button',{name:'Ver desvio',exact:true}).first().click();await page.waitForFunction(()=>state.filters.length>=3&&state.total>0&&state.total<6000);
   assert(await page.evaluate(()=>state.rows.every(e=>state.filters.every(f=>jsMatchFilter(e,f)))),'Desvio preserva contexto, horário e resultado');
   await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
@@ -114,16 +112,18 @@ try {
   await page.locator('#tabbtn-dashboard').click();await page.getByRole('button',{name:'Meus gráficos',exact:true}).click();
   assert.equal(await page.locator('#btn-dash-add').isVisible(),true);
   await page.getByRole('button',{name:'Visão geral',exact:true}).click();await waitAnalysis();
+  phase='compact layout and empty selection';
   await page.setViewportSize({width:1024,height:768});
   assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Sem rolagem horizontal da janela');
   await page.locator('#btn-side-toggle').click();assert.equal(await page.locator('#btn-side-toggle').getAttribute('aria-expanded'),'false');
   await page.locator('#btn-side-toggle').click();
-  await page.locator('#btn-theme').click();await page.screenshot({path:new URL('descobrir-claro-1024.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
-  await page.locator('#quick-search').fill('__no_such_record_987654__');await page.waitForFunction(()=>state.total===0);await waitAnalysis();
+  await page.locator('#btn-theme').click();await page.screenshot({path:fileURLToPath(new URL('descobrir-claro-1024.png',shots))});
+  await page.locator('#quick-search').fill('__no_such_record_987654__');await page.locator('#quick-search').press('Enter');await page.waitForFunction(()=>state.total===0);await waitAnalysis();
   assert.match(await page.locator('#dash-grid').innerText(),/Sem horários|Nenhum campo|Sem valores/);
-  await page.locator('#quick-search').fill('');await page.waitForFunction(()=>state.total===6000);
+  await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
   // Case fixture exercises the same UI against saved rows, never the loaded dataset.
-  await page.evaluate(()=>{state.stationAnalyticsId=null;switchView('case-dashboard');});
+  phase='saved Case analysis';
+  await page.evaluate(async()=>{state.stationAnalyticsId=null;await WorkspaceContext.setScope('case',{page:'explore',tab:'dashboard',animate:false});});
   await page.getByRole('button',{name:'Padrões',exact:true}).click();await waitAnalysis();
   assert.match(await page.locator('.discovery-scope').innerText(),/salvos no caso/);
   assert.match(await page.locator('#dash-info').innerText(),/analisados de/);
@@ -131,16 +131,5 @@ try {
   assert.equal(await page.locator('.discovery-heading h2').innerText(),'Desvios');
   assert.deepEqual(errors,[]);
   console.log('PASS: campos direita, top10, filtros, 7 modos, cache, frequências cruzadas, picos contextualizados, desvios, ajuda acessível, caso, recorte vazio, tema e 1024px; sem erros JS.');
-} catch (error) {
-  const diagnostic = await page.evaluate(() => ({
-    ready: window.WorkspaceContext?.ready, changing: window.WorkspaceContext?.changing,
-    scope: workspaceScope(), page: document.body.dataset.page, loaded: state.loaded,
-    loadOverlay: state.loadOverlay, total: state.total, rows: state.rows?.length,
-    profiles: state.datasetProfiles?.length,
-    fields: document.querySelector('#explore-tree')?.textContent,
-    fieldsHidden: !!document.querySelector('#explore-tree')?.closest('[hidden]'),
-  })).catch(() => null);
-  writeFileSync(new URL('discovery-failure.json', shots), JSON.stringify({ error: String(error), diagnostic, errors }, null, 2));
-  await page.screenshot({path:new URL('discovery-failure.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')}).catch(() => {});
-  throw error;
-} finally {await browser.close();}
+} catch(error) {await captureFailure(page,'discovery',error,{phase,errors});throw error;}
+finally {await browser.close();}

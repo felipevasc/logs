@@ -1,8 +1,8 @@
 /* Browser contract for grouping; Rust tests exercise the actual full-universe grouping. */
 import assert from 'node:assert/strict';
 import {mkdir} from 'node:fs/promises';
-import {chromium} from 'playwright';
-const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL||'chrome'});
+import { launchBrowser } from "./browser.mjs";
+const browser=await launchBrowser();
 const page=await browser.newPage({viewport:{width:1440,height:1050},reducedMotion:'reduce'});
 const errors=[];page.on('pageerror',e=>errors.push(e.message));
 try {
@@ -10,6 +10,7 @@ try {
   await page.waitForFunction(()=>WorkspaceContext.ready&&state.loaded&&!state.loadOverlay);
   await page.evaluate(()=>WorkspaceContext.setScope('dataset',{animate:false}));
   await page.evaluate(()=>Workspace.showPage('compromises'));
+  await page.evaluate(() => Security.get());
   await page.waitForSelector('.evidence-control');
   await page.evaluate(()=>{
     const original=api,source=structuredClone(Security.cached());
@@ -39,6 +40,7 @@ try {
     Security.invalidate();
   });
   await page.evaluate(()=>Workspace.showPage('compromises'));
+  await page.evaluate(() => Security.get());
   await page.waitForSelector('.evidence-control');
   assert.equal(await page.locator('.sec-episode').count(),0,'default level is unchanged');
   await page.locator('[data-evidence-min="4"]').click();

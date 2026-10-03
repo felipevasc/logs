@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="vendor/uplot/uPlot.min.css" />
   <link rel="stylesheet" href="styles.css" />
   <link rel="stylesheet" href="workspace.css" />
+  <link rel="stylesheet" href="waiting-visuals.css" />
   <link rel="stylesheet" href="analysis-workbench.css" />
   <link rel="stylesheet" href="timeline-refinements.css" />
   <link rel="stylesheet" href="timeline-export.css" />
@@ -15,10 +16,17 @@
   <link rel="stylesheet" href="threats.css" />
   <link rel="stylesheet" href="remote-sources.css" />
   <link rel="stylesheet" href="journeys.css" />
+  <link rel="stylesheet" href="explorer-timeline.css">
+  <link rel="stylesheet" href="field-transform.css">
+  <link rel="stylesheet" href="java-trace.css">
+  <link rel="stylesheet" href="exclusion-archive.css">
+  <link rel="stylesheet" href="case-references.css">
   <link rel="stylesheet" href="workspace-context.css" />
   <link rel="stylesheet" href="case-content.css" />
   <link rel="stylesheet" href="case-trails.css" />
   <link rel="stylesheet" href="security.css" />
+  <link rel="stylesheet" href="updates.css" />
+  <link rel="stylesheet" href="resource-settings.css" />
   <link rel="stylesheet" href="resources.css" />
 </head>
 <body>
@@ -49,14 +57,14 @@
       <p>Arraste arquivos ou uma pasta para começar.</p>
       <div class="empty-actions"><button id="ws-empty-open" class="btn primary"><i class="fas fa-folder-open"></i> Escolher arquivos</button><button id="ws-folder" class="btn ghost">Abrir pasta</button></div>
       <button id="ws-windows" class="text-button">Windows Event Log <i class="fas fa-arrow-right"></i></button>
-      <span class="supported-formats">JSON · Syslog · EVTX · CloudTrail · Zeek · auditd · CSV · IIS · CEF · ZIP · GZ</span>
+      <span class="supported-formats">JSON · Syslog · EVTX · Excel · ODS · CSV/TSV · CloudTrail · Zeek · auditd · IIS · CEF · ZIP · GZ</span>
     </div>
     <div id="ws-content" hidden></div>
   </main>
   <div id="ws-export-modal" class="modal-overlay" hidden>
     <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="ws-export-title">
       <div class="modal-head"><h3 id="ws-export-title">Exportar</h3><button class="icon-btn" id="ws-export-close" aria-label="Fechar"><i class="fas fa-xmark"></i></button></div>
-      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Itens do Caso · Markdown</option><option value="case">Investigação · JSON</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask" checked> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
+      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Itens do Caso · Markdown</option><option value="case">Investigação portátil · LICASE</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask" checked> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
     </div>
   </div>
   <div id="ws-drop" hidden><i class="fas fa-arrow-down-to-bracket"></i><strong>Solte os logs aqui</strong></div>
@@ -76,7 +84,6 @@
         <input id="case-name-input" type="text" placeholder="Nome do Caso" hidden />
         <button id="btn-new-case" class="icon-btn" type="button" title="Novo Caso"><i class="fas fa-plus"></i></button>
         <button id="btn-case-menu" class="icon-btn" type="button" title="Opções do Caso"><i class="fas fa-ellipsis"></i></button>
-        <button id="btn-big-data" class="btn ghost small big-data-toggle" type="button" aria-pressed="false" title="Habilitar Big Data neste Caso" disabled><i class="fas fa-bolt" aria-hidden="true"></i><span>Big Data</span></button>
       </div>
       <button id="ws-export" class="icon-btn" type="button" title="Exportar" aria-label="Exportar"><i class="fas fa-arrow-up-from-bracket"></i></button>
       <button id="btn-resources" class="icon-btn" type="button" title="Gerenciador de recursos" aria-label="Gerenciador de recursos" aria-haspopup="dialog"><i class="fas fa-gauge-high" aria-hidden="true"></i></button>
@@ -109,7 +116,7 @@
       <div class="drive-table-wrap">
         <table id="drive-table">
           <thead>
-            <tr><th></th><th>Nome</th><th>Tipo</th><th>Arquivos</th><th>Eventos</th><th>Carregado</th><th></th>
+            <tr><th></th><th>Nome</th><th>Tipo</th><th>Arquivos</th><th>Importados</th><th>Carregado</th><th></th>
           </thead>
           <tbody></tbody>
         </table>
@@ -126,17 +133,20 @@
 
   <!-- ===================== OVERLAY DE CARREGAMENTO ===================== -->
   <div id="load-overlay" class="load-overlay" hidden>
-    <div class="load-stage">
-      <div class="load-anim" aria-hidden="true">
-        <div class="load-ring"></div>
-        <div class="load-doc"><i class="fas fa-file-lines"></i><span class="load-scan"></span></div>
-        <span class="load-bit b1"></span><span class="load-bit b2"></span><span class="load-bit b3"></span>
+    <div class="load-stage semantic-load-stage">
+      <div id="load-visual"></div>
+      <div class="load-operation-controls">
+        <button id="load-cancel" class="btn ghost small" type="button" aria-describedby="load-cancel-help" disabled>Cancelar operação</button>
+        <p id="load-cancel-help">Cancelamento indisponível nesta etapa.</p>
       </div>
+      <details id="load-progress-details" class="load-progress-details">
+      <summary>Detalhes do processamento</summary>
       <div id="load-phase" class="load-phase">Preparando…</div>
       <div id="load-volume" class="load-volume"></div>
       <div id="load-eta" class="load-eta"></div>
       <div class="load-bar"><div id="load-bar-fill"></div></div>
       <ol id="load-steps" class="load-steps"></ol>
+      </details>
     </div>
   </div>
 
@@ -215,6 +225,7 @@
           <input id="quick-search" type="text" placeholder="Buscar nas mensagens…" spellcheck="false" />
         </div>
         <div class="filter-actions">
+          <button id="btn-add-search" class="btn primary small" type="button" disabled title="Adicionar busca como filtro (Enter)">Adicionar busca</button>
           <button id="btn-add-filter" class="btn ghost small" type="button"><i class="fas fa-plus"></i> Filtro</button>
           <button id="btn-clear-filters" class="btn ghost small" type="button" hidden>Limpar</button>
         </div>
@@ -259,12 +270,13 @@
         </div>
         <div class="spacer"></div>
         <span id="result-count" class="result-count"></span>
-        <button id="btn-colpicker" class="btn ghost small" type="button">
+        <button id="btn-colpicker" class="btn ghost small" type="button" aria-controls="col-pop" aria-expanded="false">
           <i class="fas fa-table-columns"></i> Colunas
         </button>
       </div>
 
       <section id="tab-table" class="table-panel">
+        <a id="skip-records" class="record-skip" href="#page-size" hidden>Pular registros</a>
         <div class="table-scroll">
           <table id="events-table">
             <thead></thead>
@@ -512,6 +524,8 @@
         </button>
       </div>
       <div class="modal-body">
+        <p id="ts-status" class="muted small" role="status" aria-live="polite" style="overflow-wrap:anywhere"></p>
+        <button id="ts-retry" class="btn ghost small" type="button" hidden>Tentar novamente</button>
         <div id="ts-help" class="fmt-help" hidden>
           <p><strong>Como montar a data/hora:</strong></p>
           <p>1. <strong>Fontes</strong> — clique nos campos na ordem em que eles formam a data.
@@ -766,7 +780,7 @@
           </button>
         </div>
         <div class="fld">
-          <label>Resultado no valor atual</label>
+          <label id="dv-preview-label">Resultado no valor atual</label>
           <pre id="dv-preview" class="code-pane dv-preview">—</pre>
         </div>
         <div class="modal-actions">
@@ -837,14 +851,25 @@
     </div>
   </aside>
   <div id="drawer-scrim" class="drawer-scrim" hidden></div>
+  <div id="detail-value-modal" class="modal-overlay" hidden>
+    <div class="modal detail-value-modal" role="dialog" aria-modal="true" aria-labelledby="detail-value-title">
+      <div class="modal-head">
+        <div class="detail-value-heading"><span class="detail-eyebrow">Conteúdo do campo</span><h3 id="detail-value-title"></h3></div>
+        <button class="icon-btn" id="detail-value-close" type="button" aria-label="Fechar conteúdo"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div class="detail-value-toolbar"><span id="detail-value-type"></span><button class="btn ghost small" id="detail-value-copy" type="button"><i class="fas fa-copy"></i> Copiar valor</button></div>
+      <div class="modal-body"><pre id="detail-value-content" class="detail-value-content"></pre></div>
+    </div>
+  </div>
 
   <!-- ===================== POPOVER: NOVO FILTRO ===================== -->
   <div id="filter-pop" class="popover" hidden>
     <div class="pop-title">Novo filtro</div>
     <select id="fp-col"></select>
     <select id="fp-op"></select>
-    <input id="fp-val" type="text" placeholder="valor" spellcheck="false" />
-    <input id="fp-val2" type="text" placeholder="até" spellcheck="false" hidden />
+    <textarea id="fp-val" rows="1" placeholder="valor" spellcheck="false"></textarea>
+    <textarea id="fp-val2" rows="1" placeholder="até" spellcheck="false" hidden></textarea>
+    <small id="fp-text-hint" class="muted small"></small>
     <div class="pop-actions">
       <button class="btn ghost small" id="fp-cancel" type="button">Cancelar</button>
       <button class="btn primary small" id="fp-apply" type="button">Aplicar</button>
@@ -852,8 +877,8 @@
   </div>
 
   <!-- ===================== POPOVER: COLUNAS ===================== -->
-  <div id="col-pop" class="popover" hidden>
-    <div class="pop-title">Colunas visíveis</div>
+  <div id="col-pop" class="popover" role="group" aria-labelledby="col-pop-title" tabindex="-1" hidden>
+    <div id="col-pop-title" class="pop-title">Colunas visíveis</div>
     <div id="col-list" class="col-list"></div>
   </div>
 
@@ -879,7 +904,7 @@
       <div class="modal-body">
         <p class="muted small">
           <code>fonte → código → nome/descrição</code>; <code>"*"</code> vale para todas as fontes.
-          Arquivo: <code id="codes-path"></code>
+          Arquivo legado/modelo do aplicativo (não é o catálogo deste Caso): <code id="codes-path"></code>
         </p>
         <div class="sys-catalog">
           <span>
@@ -890,7 +915,11 @@
             <i class="fas fa-rotate"></i> Atualizar do sistema
           </button>
         </div>
-        <textarea id="codes-editor" spellcheck="false"></textarea>
+        <div class="codes-editor-tools">
+          <p id="codes-status" class="muted small" role="status" aria-live="polite" hidden></p>
+          <button id="codes-reload" class="btn ghost small" type="button">Recarregar</button>
+        </div>
+        <textarea id="codes-editor" spellcheck="false" aria-label="JSON do catálogo de códigos" aria-describedby="codes-status"></textarea>
         <div class="modal-actions">
           <button class="btn ghost" id="codes-cancel" type="button">Cancelar</button>
           <button class="btn primary" id="codes-save" type="button">
@@ -903,9 +932,9 @@
 
   <!-- ===================== MODAL: CONFIGURAÇÕES ===================== -->
   <div id="settings-modal" class="modal-overlay" hidden>
-    <div class="modal settings-modal">
+    <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <div class="modal-head">
-        <h3>Configurações</h3>
+        <h3 id="settings-title">Configurações</h3>
         <button class="icon-btn" id="settings-close" type="button" title="Fechar">
           <i class="fas fa-xmark"></i>
         </button>
@@ -923,12 +952,24 @@
         <button class="settings-tab" data-settings-tab="detection" type="button" role="tab">
           <i class="fas fa-shield-halved"></i> Detecção
         </button>
+        <button class="settings-tab" data-settings-tab="recovery" type="button" role="tab" hidden>
+          <i class="fas fa-clock-rotate-left"></i> Recuperação
+        </button>
+        <button class="settings-tab" data-settings-tab="updates" type="button" role="tab">
+          <i class="fas fa-rotate"></i> Atualizações
+        </button>
+        <button class="settings-tab" data-settings-tab="resources" type="button" role="tab">
+          <i class="fas fa-microchip"></i> Recursos
+        </button>
       </div>
       <div class="modal-body">
         <section id="settings-pane-interface" class="settings-pane" role="tabpanel"></section>
         <section id="settings-pane-codes" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-mcp" class="settings-pane" role="tabpanel" hidden></section>
         <section id="settings-pane-detection" class="settings-pane" role="tabpanel" hidden></section>
+        <section id="settings-pane-recovery" class="settings-pane" role="tabpanel" hidden></section>
+        <section id="settings-pane-updates" class="settings-pane" role="tabpanel" hidden></section>
+        <section id="settings-pane-resources" class="settings-pane" role="tabpanel" hidden></section>
       </div>
     </div>
   </div>
@@ -1005,9 +1046,36 @@
   <script src="timeline-export.js"></script>
   <script src="icon-picker.js"></script>
   <script src="case-timeline.js"></script>
+  <script src="case-removals.js"></script>
+  <script src="vendor/js-yaml/js-yaml.min.js"></script>
+  <script src="detail-fields.js"></script>
+  <script src="java-trace.js"></script>
+  <script src="performance-core.js"></script>
+  <script src="waiting-visuals.js"></script>
+  <script src="waiting-progress.js"></script>
+  <script src="case-evidence.js"></script>
+  <script src="case-evidence-session.js"></script>
+  <script src="case-evidence-analysis.js"></script>
+  <script src="case-evidence-preserved.js"></script>
+  <script src="case-evidence-items.js"></script>
+  <script src="case-evidence-actions.js"></script>
+  <script src="case-evidence-detail.js"></script>
+  <script src="case-evidence-timeline.js"></script>
+  <script src="case-evidence-display.js"></script>
+  <script src="case-evidence-transfer.js"></script>
+  <script src="case-evidence-recovery.js"></script>
+  <script src="context-menu.js"></script>
   <script src="app.js"></script>
+  <script src="analysis-context.js"></script>
   <script src="tasks.js"></script>
   <script src="resources.js"></script>
+  <script src="canonical-fields.js"></script>
+  <script src="analysis-fields.js"></script>
+  <script src="explorer-timeline.js"></script>
+  <script src="field-transform.js"></script>
+  <script src="exclusion-archive.js"></script>
+  <script src="exclusion-visibility.js"></script>
+  <script src="case-references.js"></script>
   <script src="ui-scale.js"></script>
   <script src="timeline.js"></script>
   <script src="case-content.js"></script>
@@ -1030,5 +1098,7 @@
   <script src="event-insights.js"></script>
   <script src="case-intel.js"></script>
   <script src="command-palette.js"></script>
+  <script src="updates.js"></script>
+  <script src="resource-settings.js"></script>
 </body>
 </html>

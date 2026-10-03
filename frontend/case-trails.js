@@ -7,9 +7,13 @@ window.CaseTrails = (() => {
   const button = (text, action, cls = "btn ghost small") => { const node = el("button", cls, text); node.type = "button"; node.onclick = action; return node; };
   const icon = (name, label, action) => { const node = button("", action, "icon-btn"); node.innerHTML = `<i class="fas ${name}" aria-hidden="true"></i>`; node.title = label; node.setAttribute("aria-label", label); return node; };
   const itemName = item => item?.label || item?.name || "Item sem título";
+  const nativeItems = () => window.CaseEvidence?.active === true ? window.CaseEvidenceItems : null;
+  const recordCount = item => nativeItems() ? nativeItems().count(item) : item?.rows?.length || 0;
+  const associationCount = trail => Array.isArray(trail.itemRefs) ? trail.itemRefs.length : trail.itemIds?.length || 0;
+  const openRecord = item => nativeItems() ? nativeItems().open(item) : showDetail(item.rows[0], item.sourceSpec);
   const trails = c => Array.isArray(c?.caseTrails) ? c.caseTrails : [];
   const narrative = target => window.CaseContent?.narrative(target) || { summary: target.summary || target.note || "", details: target.details || "" };
-  const active = () => host?.isConnected && document.body.dataset.page === "case-trails" && activeCase()?.id === currentCase?.id && workspaceScope() === "case";
+  const active = () => host?.isConnected && document.body.dataset.page === "case-trails" && activeCase() === currentCase && workspaceScope() === "case";
   const exists = (c, trail) => state.cases.cases.some(item => item === c) && (!trail || trails(c).includes(trail));
   function notifyChanged(c) {
     if (activeCase()?.id === c.id) updateAnalysisBadge();
@@ -51,13 +55,20 @@ window.CaseTrails = (() => {
     const c = currentCase, index = trails(c).indexOf(trail); if (index < 0) return;
     c.caseTrails.splice(index, 1); undo = { caseId: c.id, trail, index }; view.selected = null; notifyChanged(c); draw();
   }
-  function restoreTrail() {
+  async function restoreTrail() {
+    if (undo?.kind === "associations") {
+      const previous = undo, c = previous.receipt.case;
+      try { await nativeItems().undo(previous.receipt, { save: () => notifyChanged(c), owns: () => exists(c, previous.receipt.trail) }); if (undo === previous) undo = null; if (active()) draw(); }
+      catch (error) { toast(String(error.message || error), "err"); }
+      return;
+    }
     const c = state.cases.cases.find(item => item.id === undo?.caseId); if (!c) { undo = null; return; }
     if (!trails(c).some(trail => trail.id === undo.trail.id)) { c.caseTrails ||= []; c.caseTrails.splice(Math.min(undo.index, c.caseTrails.length), 0, undo.trail); }
     if (c === currentCase) view.selected = undo.trail.id;
     undo = null; notifyChanged(c); if (active()) draw();
   }
   function selectItems(trail) {
+    if (nativeItems()) return selectNativeItems(trail);
     const c = currentCase, focus = document.activeElement;
     const selected = new Set(trail.itemIds || []), known = new Set((c.items || []).map(item => item.id));
     const choices = [...(c.items || []), ...[...selected].filter(id => !known.has(id)).map(id => ({ id, label: "Item indisponível", missing: true }))];
@@ -90,27 +101,71 @@ window.CaseTrails = (() => {
       if (event.key === "Tab") { const nodes = [...modal.querySelectorAll("button:not(:disabled),input:not(:disabled)")].filter(node => node.offsetParent !== null); const first = nodes[0], last = nodes.at(-1); if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } }
     };
   }
+  async function saveNativeAssociations(c, trail, references) {
+    try {
+      const receipt = await nativeItems().edit(c, trail, references, { save: () => notifyChanged(c), owns: () => exists(c, trail) });
+      undo = { kind: "associations", caseId: c.id, receipt }; if (active()) draw(); return true;
+    } catch (error) { toast(String(error.message || error), "err"); return false; }
+  }
+  function selectNativeItems(trail) {
+    const c = currentCase, focus = document.activeElement, adapter = nativeItems(), bindings = adapter.index(c), selected = new Map(), choices = [];
+    for (const item of c.items || []) {
+      try { const reference = bindings.forItem(item); choices.push({ key: adapter.key(reference), reference, item, label: itemName(item) }); }
+      catch { choices.push({ key: `unavailable:${choices.length}`, reference: null, item, label: `${itemName(item)} · identidade ambígua`, disabled: true }); }
+    }
+    for (const [index, entry] of bindings.associations(trail).entries()) {
+      if (entry.state === "unique") { const reference = entry.reference; selected.set(`existing:${index}`, reference); }
+      else { const key = `unresolved:${index}`; selected.set(key, entry.reference); choices.push({ key, reference: entry.reference, item: null, label: entry.state === "ambiguous" ? "Associação ambígua · escolha o item novamente" : "Associação indisponível", unresolved: true }); }
+    }
+    let query = "", page = 0;
+    const overlay = el("div", "modal-overlay case-trail-picker"), modal = el("section", "modal"), head = el("header", "modal-head"), list = el("div", "case-trail-picker-list"), tools = el("div", "case-trail-picker-tools"), search = el("input"), status = el("span"), navigation = el("div"), footer = el("footer", "case-trail-picker-footer");
+    modal.setAttribute("role", "dialog"); modal.setAttribute("aria-modal", "true"); modal.setAttribute("aria-label", "Associar itens preservados");
+    const close = () => { overlay.remove(); if (activeCase() === c && focus?.isConnected) focus.focus(); };
+    head.append(el("h3", "", "Associar itens"), icon("fa-xmark", "Fechar seleção de itens", close)); search.type = "search"; search.placeholder = "Buscar nos itens do Caso…"; search.setAttribute("aria-label", "Buscar item para associar"); status.setAttribute("aria-live", "polite"); tools.append(search, status);
+    function paint() {
+      const rows = choices.filter(choice => choice.label.toLocaleLowerCase().includes(query)); page = Math.min(page, Math.max(0, Math.ceil(rows.length / PAGE) - 1)); list.replaceChildren(); navigation.replaceChildren(); status.textContent = `${fmtNum(selected.size)} associados`;
+      for (const choice of rows.slice(page * PAGE, (page + 1) * PAGE)) {
+        const label = el("label", "case-trail-choice"), check = el("input"), text = el("span"); check.type = "checkbox"; check.checked = choice.unresolved ? selected.has(choice.key) : [...selected.values()].some(reference => adapter.key(reference) === adapter.key(choice.reference)); check.disabled = !!choice.disabled; check.setAttribute("aria-label", choice.label);
+        check.onchange = () => { if (check.checked) selected.set(choice.key, choice.reference); else if (choice.unresolved) selected.delete(choice.key); else for (const [key, reference] of selected) { if (adapter.key(reference) === adapter.key(choice.reference)) selected.delete(key); } status.textContent = `${fmtNum(selected.size)} associados`; };
+        text.append(el("strong", "", choice.label), el("small", "", choice.item ? `${fmtNum(recordCount(choice.item))} ocorrências preservadas` : "Remova esta associação ou escolha um item com referência própria.")); label.append(check, text); list.append(label);
+      }
+      pager(navigation, page, rows.length, next => { page = next; paint(); list.scrollTop = 0; }, "Itens");
+    }
+    const apply = button("Aplicar", async () => {
+      if (!exists(c, trail)) { close(); return; }
+      apply.disabled = true; if (await saveNativeAssociations(c, trail, [...selected.values()])) close(); else apply.disabled = false;
+    }, "btn primary");
+    search.oninput = () => { query = search.value.toLocaleLowerCase(); page = 0; paint(); };
+    footer.append(button("Cancelar", close), apply); modal.append(head, tools, list, navigation, footer); overlay.append(modal); document.body.append(overlay); paint(); search.focus();
+    overlay.onclick = event => { if (event.target === overlay) close(); }; overlay.onkeydown = event => {
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); }
+      if (event.key === "Tab") { const nodes = [...modal.querySelectorAll("button:not(:disabled),input:not(:disabled)")].filter(node => node.offsetParent !== null); if (event.shiftKey && document.activeElement === nodes[0]) { event.preventDefault(); nodes.at(-1)?.focus(); } else if (!event.shiftKey && document.activeElement === nodes.at(-1)) { event.preventDefault(); nodes[0]?.focus(); } }
+    };
+  }
   function drawDetail(parent, trail, token) {
     if (!trail) { const empty = el("div", "case-trails-empty"); empty.append(el("p", "", "Organize os itens do Caso em uma sequência com a sua interpretação."), button("Criar trilha", () => editTrail(), "btn primary")); parent.append(empty); return; }
-    const header = el("header", "case-trail-head"), title = el("div"); title.append(el("h2", "", trail.title || "Trilha sem título"), el("small", "", `${fmtNum(trail.itemIds?.length || 0)} itens associados`));
+    const header = el("header", "case-trail-head"), title = el("div"); title.append(el("h2", "", trail.title || "Trilha sem título"), el("small", "", `${fmtNum(associationCount(trail))} itens associados`));
     const actions = el("div", "case-trail-actions"); actions.append(button("Associar itens", () => selectItems(trail), "btn primary small"), icon("fa-pen", "Editar trilha", () => editTrail(trail)), icon("fa-trash-can", "Remover trilha", () => removeTrail(trail))); header.append(title, actions); parent.append(header);
     const body = el("div", "case-trail-body"); showNarrative(body, trail); images(body, trail, token);
-    const ids = trail.itemIds || [], byId = new Map((currentCase.items || []).map(item => [item.id, item])); view.itemPage = Math.min(view.itemPage, Math.max(0, Math.ceil(ids.length / PAGE) - 1));
+    const bindings = nativeItems()?.index(currentCase), associations = bindings?.associations(trail), ids = associations || trail.itemIds || [], byId = new Map((currentCase.items || []).map(item => [item.id, item])); view.itemPage = Math.min(view.itemPage, Math.max(0, Math.ceil(ids.length / PAGE) - 1));
     for (let index = view.itemPage * PAGE; index < Math.min(ids.length, (view.itemPage + 1) * PAGE); index++) {
-      const id = ids[index], item = byId.get(id), card = el("article", "case-trail-item"); card.dataset.itemId = id;
-      const itemHead = el("div", "case-trail-item-head"), number = el("span", "case-trail-position", String(index + 1)), content = el("div", "case-trail-item-title"); content.append(el("h3", "", item ? itemName(item) : "Item indisponível"));
-      if (item?.rows?.length) content.append(el("small", "", `${fmtNum(item.rows.length)} registros preservados`));
+      const id = ids[index], item = associations ? id.item : byId.get(id), card = el("article", "case-trail-item"); card.dataset.itemId = associations ? item?.id || "" : id;
+      const itemHead = el("div", "case-trail-item-head"), number = el("span", "case-trail-position", String(index + 1)), content = el("div", "case-trail-item-title"); content.append(el("h3", "", item ? itemName(item) : associations && id.state === "ambiguous" ? "Associação ambígua" : "Item indisponível"));
+      if (recordCount(item)) content.append(el("small", "", `${fmtNum(recordCount(item))} registros preservados`));
       const itemActions = el("div", "case-trail-item-actions");
-      const move = direction => { const next = index + direction; if (next < 0 || next >= ids.length) return; [ids[index], ids[next]] = [ids[next], ids[index]]; trail.updatedAt = Date.now(); view.itemPage = Math.floor(next / PAGE); notifyChanged(currentCase); draw(); };
+      const nativeReferences = () => associations.map(entry => entry.reference);
+      const move = direction => { const next = index + direction; if (next < 0 || next >= ids.length) return;
+        if (associations) { const references = nativeReferences(); [references[index], references[next]] = [references[next], references[index]]; return saveNativeAssociations(currentCase, trail, references); }
+        [ids[index], ids[next]] = [ids[next], ids[index]]; trail.updatedAt = Date.now(); view.itemPage = Math.floor(next / PAGE); notifyChanged(currentCase); draw(); };
       const up = icon("fa-arrow-up", "Mover item acima", () => move(-1)), down = icon("fa-arrow-down", "Mover item abaixo", () => move(1)); up.disabled = index === 0; down.disabled = index === ids.length - 1;
-      itemActions.append(up, down, icon("fa-link-slash", "Desassociar item", () => { trail.itemIds = ids.filter((_, position) => position !== index); trail.updatedAt = Date.now(); notifyChanged(currentCase); draw(); }));
+      itemActions.append(up, down, icon("fa-link-slash", "Desassociar item", () => { if (associations) return saveNativeAssociations(currentCase, trail, nativeReferences().filter((_, position) => position !== index)); trail.itemIds = ids.filter((_, position) => position !== index); trail.updatedAt = Date.now(); notifyChanged(currentCase); draw(); }));
       itemHead.append(number, content, itemActions); card.append(itemHead);
       if (item) {
         showNarrative(card, item); images(card, item, token);
-        const actions = el("div", "case-trail-item-footer"); actions.append(button("Editar item", async () => { await window.CaseContent?.editItem(id); if (active()) draw(); }));
-        if (item.rows?.length) actions.append(button(item.rows.length === 1 ? "Ver registro" : "Primeiro registro", () => { showDetail(item.rows[0], item.sourceSpec); $("#dr-prev").hidden = $("#dr-next").hidden = true; }));
+        const actions = el("div", "case-trail-item-footer"); actions.append(button("Editar item", async () => { await window.CaseContent?.editItem(associations ? item : id); if (active()) draw(); }));
+        if (recordCount(item)) actions.append(button(recordCount(item) === 1 ? "Ver registro" : "Primeiro registro", () => { openRecord(item); $("#dr-prev").hidden = $("#dr-next").hidden = true; }));
         card.append(actions);
-      } else card.append(el("p", "muted small", "O item foi removido do Caso. Você pode desassociar esta referência."));
+      } else card.append(el("p", "muted small", associations && id.state === "ambiguous" ? "Mais de um item usa a referência antiga. Escolha novamente os itens desta trilha." : "O item foi removido ou está indisponível. Você pode desassociar esta referência."));
       body.append(card);
     }
     if (!ids.length) body.append(el("p", "case-trails-empty", "Associe os itens que sustentam esta trilha. Eles continuam disponíveis no Caso."));
@@ -123,13 +178,13 @@ window.CaseTrails = (() => {
     const toolbar = el("div", "case-trails-toolbar"), search = el("input"); search.type = "search"; search.placeholder = "Buscar trilha…"; search.setAttribute("aria-label", "Buscar trilha"); search.value = view.search;
     search.oninput = () => { view.search = search.value; view.listPage = 0; drawList(); };
     toolbar.append(search, button("Nova trilha", () => editTrail(), "btn primary small"), button("Possíveis trilhas", () => Workspace.showPage("journeys")));
-    if (undo?.caseId === currentCase.id) toolbar.append(button("Desfazer remoção", restoreTrail)); host.append(toolbar);
+    if (undo?.caseId === currentCase.id) toolbar.append(button(undo.kind === "associations" ? "Desfazer associação ou ordem" : "Desfazer remoção", restoreTrail)); host.append(toolbar);
     const grid = el("div", "case-trails-grid"), listPanel = el("section", "case-trails-list-panel"), detail = el("section", "case-trails-detail"); listPanel.setAttribute("aria-label", "Trilhas do Caso"); detail.setAttribute("aria-label", "Narrativa da trilha"); grid.append(listPanel, detail); host.append(grid);
     const available = trails(currentCase); if (!available.some(trail => trail.id === view.selected)) view.selected = available[0]?.id || null;
     function drawList() {
       listPanel.replaceChildren(); const rows = available.filter(trail => `${trail.title} ${narrative(trail).summary}`.toLocaleLowerCase().includes(view.search.toLocaleLowerCase())); view.listPage = Math.min(view.listPage, Math.max(0, Math.ceil(rows.length / PAGE) - 1));
       const list = el("div", "case-trails-list");
-      for (const trail of rows.slice(view.listPage * PAGE, (view.listPage + 1) * PAGE)) { const entry = button("", () => { view.selected = trail.id; view.itemPage = 0; view.itemScroll = 0; draw(); }, "case-trail-list-item"); entry.setAttribute("aria-current", String(view.selected === trail.id)); entry.append(el("strong", "", trail.title || "Trilha sem título"), el("small", "", `${fmtNum(trail.itemIds?.length || 0)} itens`)); const summary = narrative(trail).summary; if (summary) entry.append(el("p", "", summary)); list.append(entry); }
+      for (const trail of rows.slice(view.listPage * PAGE, (view.listPage + 1) * PAGE)) { const entry = button("", () => { view.selected = trail.id; view.itemPage = 0; view.itemScroll = 0; draw(); }, "case-trail-list-item"); entry.setAttribute("aria-current", String(view.selected === trail.id)); entry.append(el("strong", "", trail.title || "Trilha sem título"), el("small", "", `${fmtNum(associationCount(trail))} itens`)); const summary = narrative(trail).summary; if (summary) entry.append(el("p", "", summary)); list.append(entry); }
       if (!rows.length) list.append(el("p", "case-trails-empty", available.length ? "Nenhuma trilha encontrada." : "Nenhuma trilha criada.")); listPanel.append(list);
       if (rows.length > PAGE) pager(listPanel, view.listPage, rows.length, next => { view.listPage = next; drawList(); }, "Trilhas");
     }
@@ -141,7 +196,53 @@ window.CaseTrails = (() => {
     if (!contexts.has(c.id)) { contexts.set(c.id, { selected: null, search: "", listPage: 0, itemPage: 0, itemScroll: 0 }); if (contexts.size > 12) contexts.delete(contexts.keys().next().value); }
     view = contexts.get(c.id); draw();
   }
+  async function fromNativeJourney({ scope, field, value, filters, from, to }) {
+    const c = activeCase(); if (!c) return;
+    let owner = window.AnalysisContexts.capture(); const artifact = state.currentArtifact ? { ...state.currentArtifact } : null;
+    const queryFilters = [...structuredClone(filters || []), { column: field, op: "equals_exact", value, value2: null }];
+    if (from != null && to != null) queryFilters.push({ column: "timestamp", op: "between", value: String(from), value2: String(to) });
+    const overlay = el("div", "modal-overlay case-trail-convert"), panel = el("section", "modal"), head = el("header", "modal-head"), body = el("div", "modal-body"), message = el("p", "", "Lendo as referências de todos os registros deste recorte…"), footer = el("footer", "modal-actions");
+    let closed = false; const close = () => { closed = true; overlay.remove(); document.removeEventListener("workspace-context-change", close); };
+    const guard = () => !closed && overlay.isConnected && activeCase() === c && workspaceScope() === scope && window.AnalysisContexts.isCurrent(owner);
+    panel.setAttribute("role", "dialog"); panel.setAttribute("aria-modal", "true"); panel.setAttribute("aria-label", "Guardar em trilha"); head.append(el("h3", "", "Guardar em trilha"), icon("fa-xmark", "Fechar", close)); body.append(message); footer.append(button("Cancelar", close)); panel.append(head, body, footer); overlay.append(panel); document.body.append(overlay); document.addEventListener("workspace-context-change", close);
+    overlay.onkeydown = event => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); } };
+    try {
+      owner = await window.AnalysisContexts.prepare(owner, { metadata: true }); if (!guard()) return;
+      const actions = nativeEvidenceServices().actions, selected = await actions.source({ guard }), handles = [], seen = new Set(), cursors = new Set(); let cursor = null, offset = 0;
+      do {
+        const result = await api("query_page", { ...analyticsRequest(scope), filters: queryFilters, sortColumn: "timestamp", sortDir: "asc", offset, limit: 2000, cursor }, { silent: true });
+        if (!guard()) return;
+        if (Number.isSafeInteger(result.total) && result.total > 10000 || handles.length + result.rows.length > 10000) throw Error("Esta possível trilha excede 10.000 registros. Refine o período ou os filtros antes de preservá-la.");
+        for (const row of actions.handles(result.rows)) { const key = JSON.stringify([row.id, row.eventRef]); if (seen.has(key)) throw Error("A página repetiu um registro. Reabra a possível trilha."); seen.add(key); handles.push(row); }
+        offset += result.rows.length; cursor = result.nextCursor || null;
+        if (cursor && (!result.rows.length || cursors.has(cursor))) throw Error("A paginação da seleção mudou. Reabra a possível trilha."); if (cursor) cursors.add(cursor);
+        if (result.hasMore && !cursor) throw Error("A leitura não recebeu a próxima página; nenhum recorte parcial foi guardado.");
+        if (!cursor && Number.isSafeInteger(result.total) && offset !== result.total) throw Error("A leitura terminou antes de confirmar todos os registros.");
+        message.textContent = `Preparando ${fmtNum(handles.length)} referências de registros…`;
+      } while (cursor);
+      if (!handles.length) throw Error("Nenhum registro encontrado nesta possível trilha.");
+      message.textContent = `${fmtNum(handles.length)} ocorrências serão preservadas em um novo item desta trilha.`;
+      const label = el("label", "fld", "Trilha de destino"), select = el("select"), title = el("input"); select.setAttribute("aria-label", "Trilha de destino"); const fresh = el("option", "", "Criar nova trilha"); fresh.value = ""; select.append(fresh);
+      for (const trail of trails(c)) { const option = el("option", "", trail.title || "Trilha sem título"); option.value = trail.id; select.append(option); }
+      title.value = `${field}: ${value}`.slice(0, 200); title.setAttribute("aria-label", "Título da nova trilha"); select.onchange = () => { title.hidden = !!select.value; }; label.append(select, title); body.append(label);
+      const commit = button("Preservar e guardar", async () => {
+        commit.disabled = true;
+        try {
+          if (!guard()) throw Error("A seleção mudou. Reabra a possível trilha.");
+          const existing = select.value ? trails(c).find(trail => trail.id === select.value) : null;
+          if (select.value && !existing || !existing && !title.value.trim()) throw Error("Escolha uma trilha válida e informe seu título.");
+          const target = existing || { id: `ct-${nid()}`, title: title.value.trim(), summary: "", details: "", attachments: [], itemRefs: [], createdAt: Date.now(), updatedAt: Date.now() };
+          await actions.add({ ...selected, rows: handles }, { ...caseItemBase("grupo", artifact?.stationId || null, handles.length, handles.length), label: `${field}: ${value}`.slice(0, 200), sourceFilters: structuredClone(queryFilters), sourceSpec: structuredClone(artifact ? sourceSpecFromArtifact(artifact) : sourceSpecFromControls()), summary: "", details: "", attachments: [] }, { guard, attach: item => {
+            const priorRefs = target.itemRefs, priorTime = target.updatedAt; target.itemRefs = [...nativeItems().associations(c, target).map(entry => entry.reference), nativeItems().forItem(c, item)]; target.updatedAt = Date.now(); if (!existing) (c.caseTrails ||= []).push(target);
+            return () => { if (priorRefs === undefined) delete target.itemRefs; else target.itemRefs = priorRefs; target.updatedAt = priorTime; if (!existing) c.caseTrails = c.caseTrails.filter(trail => trail !== target); };
+          } });
+          close(); contexts.set(c.id, { selected: target.id, search: "", listPage: 0, itemPage: 0, itemScroll: 0 }); if (workspaceScope() !== "case") await WorkspaceContext.setScope("case", { page: "case-trails" }); else await Workspace.showPage("case-trails"); toast("Possível trilha preservada no Caso.", "ok");
+        } catch (error) { if (!closed) { message.textContent = String(error.message || error); commit.disabled = false; } }
+      }, "btn primary"); footer.append(commit); select.focus();
+    } catch (error) { if (!closed) message.textContent = String(error.message || error); }
+  }
   async function fromJourney({ scope, field, value, filters, from, to }) {
+    if (nativeItems()) return fromNativeJourney({ scope, field, value, filters, from, to });
     const c = activeCase(); if (!c) { toast("Crie um Caso antes de guardar uma trilha.", "info"); return; }
     const artifact = state.currentArtifact ? { ...state.currentArtifact } : null, origin = state.currentOrigin;
     const sourceSpec = artifact ? sourceSpecFromArtifact(artifact) : sourceSpecFromControls();

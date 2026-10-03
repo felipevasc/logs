@@ -15,11 +15,30 @@ pub const STANDARD_COLUMNS: &[&str] = &[
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DerivedDiagnostic {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub warning: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum DerivedOriginal {
+    Missing,
+    Present(Value),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub id: usize,
     /// Stable source/version/record identity; independent of result ordering.
     #[serde(default)]
     pub event_ref: String,
+    /// Verified original-record provenance for saved evidence; never a data column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_provenance: Option<crate::analysis_visibility::EvidenceProvenance>,
     #[serde(default)]
     pub parse_status: String,
     /// Epoch em milissegundos (UTC). `None` quando a linha não tem data reconhecível.
@@ -33,6 +52,11 @@ pub struct Event {
     pub raw: String,
     #[serde(default)]
     pub fields: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_diagnostics: Vec<DerivedDiagnostic>,
+    /// Provenance for recomputing an overlay on a request-local copy.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub derived_originals: std::collections::BTreeMap<String, DerivedOriginal>,
 }
 
 impl Event {
@@ -40,6 +64,7 @@ impl Event {
         Event {
             id: 0,
             event_ref: String::new(),
+            evidence_provenance: None,
             parse_status: "parsed".into(),
             timestamp: None,
             source: String::new(),
@@ -50,6 +75,8 @@ impl Event {
             message: String::new(),
             raw: String::new(),
             fields: Map::new(),
+            derived_diagnostics: Vec::new(),
+            derived_originals: std::collections::BTreeMap::new(),
         }
     }
 
@@ -121,16 +148,18 @@ impl Event {
         match col {
             "id" => Some(self.id as f64),
             "timestamp" => self.timestamp.map(|t| t as f64),
-            _ => self.col_str(col).and_then(|s| {
-                let s = s.trim();
-                // aceita valores com unidade ("20 MB", "120 ms") além de números puros
-                s.parse::<f64>()
-                    .ok()
-                    .or_else(|| crate::analysis::parse_num_unit(s).map(|(n, _)| n))
-                    .filter(|n| n.is_finite())
-            }),
+            _ => self.col_str(col).and_then(|s| text_number(&s)),
         }
     }
+}
+
+/// Number written in a column value; accepts units ("20 MB", "120 ms").
+pub fn text_number(s: &str) -> Option<f64> {
+    let s = s.trim();
+    s.parse::<f64>()
+        .ok()
+        .or_else(|| crate::analysis::parse_num_unit(s).map(|(n, _)| n))
+        .filter(|n| n.is_finite())
 }
 
 pub fn ts_to_iso(ms: i64) -> String {
@@ -199,7 +228,7 @@ impl LineMeta {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CodeInfo {
     pub name: String,
     #[serde(default)]
@@ -207,7 +236,7 @@ pub struct CodeInfo {
 }
 
 /// Mapa de enriquecimento: fonte ("*" = qualquer) -> código -> nome/descrição.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CodesConfig {
     #[serde(flatten)]
     pub sources: HashMap<String, HashMap<String, CodeInfo>>,
