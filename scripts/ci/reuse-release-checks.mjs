@@ -11,7 +11,8 @@ export const approvedChecks = Object.freeze({
   head: '24a1b2d53638c40949fc4ea66e28c95e72263e46',
   tree: 'b7beef8bd61d20789d1c5dbc4f1dd7191ae87616',
 });
-// Exact paths only: the seven reviewed supervisor/CI changes plus this opt-in.
+// Exact paths only: the reviewed supervisor/CI changes, Windows path assertion,
+// and this opt-in. Native desktop acceptance still runs on the release build.
 // Never allow product code, dependencies, native sources or build inputs here.
 export const allowedReusePaths = Object.freeze([
   '.github/workflows/checks.yml',
@@ -19,6 +20,7 @@ export const allowedReusePaths = Object.freeze([
   'scripts/preview/managed-child.mjs',
   'scripts/preview/supervisor-handshake.mjs',
   'scripts/preview/windows-job.ps1',
+  'scripts/preview/test-native-desktop.mjs',
   'scripts/tests/supervisor-handshake.test.mjs',
   'scripts/tests/validation-plan.test.mjs',
   '.github/workflows/build.yml',

@@ -165,7 +165,9 @@ async function launch(engineEnabled = true) {
     throw new Error("Resource collector did not initialize");
   });
   assert.equal(environment.resources.app.pid, child.pid, "IPC belongs to the spawned app");
-  assert.equal(resolve(environment.resources.storage.root).toLowerCase(), dataDir.toLowerCase(), "configuration must be isolated");
+  // Rust canonicalization can return a Windows \\?\ path. Resolve both existing
+  // directories through the filesystem before enforcing exact isolation.
+  assert.equal(await realpath(environment.resources.storage.root), await realpath(dataDir), "configuration must be isolated");
   assert.equal(environment.mcp.enabled, false, "MCP is opt-in on a clean installation");
   assert.equal(environment.mcp.running, false);
   checkpoint("native-ready", { launch: number, pid: child.pid, dataDir: environment.resources.storage.root });
