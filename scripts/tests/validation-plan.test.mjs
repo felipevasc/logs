@@ -123,6 +123,7 @@ test('workflow contract retains native and installed-update gates, shares cache 
     assert.match(workflow, /cargo test --manifest-path src-tauri\/Cargo.toml --release --locked --tests -- --test-threads=1/);
     assert.match(workflow, /windows-native-tests\.ps1/);
     assert.match(workflow, /verify-windows-manifest\.ps1 -Target harness/);
+    assert.match(workflow, /name: Verify Windows process cleanup\s+if: runner\.os == 'Windows'\s+run: node scripts\/release\/test-process-supervision\.mjs/);
     assert.doesNotMatch(workflow, /continue-on-error/);
   }
   for (const name of ['Build Windows portable review executable', 'Verify Windows app manifest', 'Record portable executable identity', 'Upload Windows portable review build']) {
@@ -131,7 +132,7 @@ test('workflow contract retains native and installed-update gates, shares cache 
   }
   assert.match(build, /run: node scripts\/release\/update-e2e\.mjs/);
   assert.match(build, /needs: \[build, validate\]/);
-  assert.match(build, /name: Full browser regression\s+run: npm run test:preview/);
+  assert.match(build, /name: Full browser regression\s+if: needs.checks-proof.outputs.reused != 'true'\s+run: npm run test:preview/);
   assert.match(build, /run: node scripts\/release\/verify-trigger\.mjs/);
   assert.match(build, /run: node scripts\/preview\/test-native-desktop\.mjs src-tauri\/target\/release\/loginsight\.exe/);
   assert.match(build, /run: node scripts\/release\/publish\.mjs release-assets/);
@@ -167,5 +168,14 @@ test('full browser jobs budget setup and evidence in addition to every regressio
     assert(minutes >= 40 && minutes <= 60, `${path}: browser budget must cover the complete suite with bounded headroom`);
     assert.match(body, /if: always\(\)/, `${path}: keep failure evidence`);
     assert.doesNotMatch(body, /continue-on-error/, `${path}: failures stay blocking`);
+  }
+});
+
+test('Windows supervisor-only changes require the Windows process-tree gate', () => {
+  for (const file of ['windows-job.ps1', 'managed-child.mjs', 'managed-process.mjs', 'supervisor-handshake.mjs']) {
+    const plan = planValidation([`scripts/preview/${file}`]);
+    assert.equal(plan.native, true, file);
+    assert.equal(plan.scope, 'full', file);
+    contains(plan.preview, fullPreview);
   }
 });

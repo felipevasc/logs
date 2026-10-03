@@ -8,6 +8,11 @@ on:
         type: boolean
         required: false
         default: false
+      reuse_checks_run_id:
+        description: Reuse reviewed full CI run 37134532695 for unchanged product code (main only)
+        type: string
+        required: false
+        default: ''
   push:
     branches: [main]
     tags:
@@ -21,8 +26,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  checks-proof:
+    name: Verify prior regression evidence
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reused: ${{ steps.proof.outputs.reused }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Verify focused release reuse and supervisor contracts
+        run: node --test scripts/tests/reuse-release-checks.test.mjs scripts/tests/validation-plan.test.mjs scripts/tests/supervisor-handshake.test.mjs
+      - name: Prove prior full regression and unchanged product
+        id: proof
+        env:
+          REUSE_CHECKS_RUN_ID: ${{ inputs.reuse_checks_run_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/ci/reuse-release-checks.mjs
+
   validate:
-    name: Release frontend and interaction regressions
+    name: Release regressions (fresh or proven)
+    needs: checks-proof
     runs-on: ubuntu-22.04
     # The full UI suite now takes about 20 minutes before setup and evidence.
     # Keep every selected regression and leave room for slower hosted runners.
@@ -38,12 +69,18 @@ jobs:
             scripts/preview/package-lock.json
       - name: Verify triggering tag
         run: node scripts/release/verify-trigger.mjs
-      - run: npm ci
-      - run: npm ci --prefix scripts/preview
-      - run: npx --prefix scripts/preview playwright install --with-deps chromium
-      - run: npm run check
-      - run: npm run prepare:frontend
+      - if: needs.checks-proof.outputs.reused != 'true'
+        run: npm ci
+      - if: needs.checks-proof.outputs.reused != 'true'
+        run: npm ci --prefix scripts/preview
+      - if: needs.checks-proof.outputs.reused != 'true'
+        run: npx --prefix scripts/preview playwright install --with-deps chromium
+      - if: needs.checks-proof.outputs.reused != 'true'
+        run: npm run check
+      - if: needs.checks-proof.outputs.reused != 'true'
+        run: npm run prepare:frontend
       - name: Full browser regression
+        if: needs.checks-proof.outputs.reused != 'true'
         run: npm run test:preview
       - name: Preserve browser diagnostics
         if: always()
@@ -56,6 +93,7 @@ jobs:
           if-no-files-found: ignore
 
   build:
+    needs: checks-proof
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -102,18 +140,19 @@ jobs:
         if: runner.os == 'Windows'
         run: node scripts/release/test-process-supervision.mjs
       - name: Test event detail tree and formatters
+        if: needs.checks-proof.outputs.reused != 'true'
         run: node --test scripts/preview/test-detail-fields.cjs
       - run: npm run prepare:frontend
       - name: Backend tests
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && needs.checks-proof.outputs.reused != 'true'
         run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
       - name: Windows backend tests with loader diagnostics
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs.checks-proof.outputs.reused != 'true'
         id: backend_windows
         shell: pwsh
         run: ./scripts/ci/windows-native-tests.ps1
       - name: Verify Windows unit harness manifest
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs.checks-proof.outputs.reused != 'true'
         shell: pwsh
         run: ./scripts/ci/verify-windows-manifest.ps1 -Target harness
       - name: Preserve Windows native failure evidence
