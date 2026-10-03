@@ -201,6 +201,22 @@ impl Default for EmbeddedBudget {
     fn default() -> Self { Self { bytes: 256 * 1024, candidates: 32 } }
 }
 
+// Automatic embedding uses a stricter subset than the explicit legacy parser.
+// Requiring PRI and NILVALUE structured data prevents ordinary prose from
+// matching its permissive seven-token header. Structured-data blocks need a
+// dedicated grammar before this automatic path can accept them reliably.
+fn embedded_syslog5424(line: &str) -> Option<Event> {
+    let mut words = line.split_ascii_whitespace();
+    let (priority, version) = words.next()?.strip_prefix('<')?.split_once('>')?;
+    if version != "1" || priority.is_empty() || !priority.bytes().all(|b| b.is_ascii_digit())
+        || priority.parse::<u16>().ok()? > 191 { return None; }
+    let timestamp = words.next()?;
+    if timestamp != "-" && chrono::DateTime::parse_from_rfc3339(timestamp).is_err() { return None; }
+    for _ in 0..4 { words.next()?; }
+    if words.next()? != "-" { return None; }
+    parse_syslog5424(line)
+}
+
 fn embedded_log(raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget) -> Option<Event> {
     if depth >= 3 || raw.len() > 64 * 1024 || raw.len() > budget.bytes || budget.candidates == 0 {
         return None;
@@ -217,9 +233,7 @@ fn embedded_log(raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget)
         if line.contains(['\n', '\r']) || !line.contains(char::is_whitespace) && !(line.starts_with("CEF:") || line.starts_with("LEEF:")) { return None; }
         if let Some(event) = web_logs::parse_access(line) { (event, "access") }
         else if let Some(event) = web_logs::parse_error(line) { (event, "nginx.error") }
-        else if let Some(event) = parse_syslog5424(line).filter(|event| {
-            event.timestamp.is_some() || line.split_ascii_whitespace().nth(1) == Some("-")
-        }) { (event, "syslog5424") }
+        else if let Some(event) = embedded_syslog5424(line) { (event, "syslog5424") }
         else if let Some(event) = parse_syslog3164(line, year).filter(|event| event.timestamp.is_some()) {
             if line.contains("SRC=") || line.contains("PROTO=") || line.contains("DPT=") {
                 (parse_firewall(line, year)?, "firewall")
@@ -291,6 +305,20 @@ fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, dep
     if let Some(original) = original {
         for (key, value) in original { ev.fields.entry(key).or_insert(value); }
     }
+    // Describe only the outer record, never a mixture assembled from promoted
+    // fields. On envelopes, explicit outer columns retain precedence even when
+    // the outer record itself belongs to a known JSON family. Direct JSON keeps
+    // its established family-specific interpretation.
+    let outer_columns = (!wrapped.is_empty()).then(|| (ev.timestamp, ev.source.clone(),
+        (explicit_level || outer_http).then(|| ev.level.clone()), ev.code.clone(), ev.message.clone()));
+    let outer_known = describe_known_json(&mut ev);
+    if let Some((timestamp, source, level, code, message)) = outer_columns {
+        ev.timestamp = timestamp.or(ev.timestamp);
+        if !source.is_empty() { ev.source = source; }
+        if let Some(level) = level { ev.level = level; }
+        if !code.is_empty() { ev.code = code; }
+        if !message.is_empty() { ev.message = message; }
+    }
     let unambiguous = wrapped.len() == 1;
     let mut added = 0usize;
     for (field, inner) in wrapped {
@@ -301,7 +329,7 @@ fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, dep
             if ev.code.is_empty() { ev.code = inner.code.clone(); }
             if ev.source.is_empty() { ev.source = inner.source.clone(); }
             if ev.message.is_empty() { ev.message = inner.raw.clone(); }
-            if !explicit_level && !outer_http { ev.level = inner.level.clone(); }
+            if !explicit_level && !outer_http && !outer_known { ev.level = inner.level.clone(); }
         }
         if added < 512 {
             if let Some(timestamp) = inner.timestamp {
@@ -325,7 +353,6 @@ fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, dep
             if unambiguous && added < 512 { ev.fields.entry(key).or_insert(value); added += 1; }
         }
     }
-    describe_known_json(&mut ev);
     if ev.message.is_empty() {
         ev.message = raw.chars().take(500).collect();
     }
@@ -344,7 +371,7 @@ fn field_text(ev: &Event, key: &str) -> Option<String> {
 /// Readable message, code and level for well-known JSON families whose
 /// records carry no message: CloudTrail, Suricata EVE, Zeek, Okta, GCP and
 /// Kubernetes audit. Original fields are kept.
-fn describe_known_json(ev: &mut Event) {
+fn describe_known_json(ev: &mut Event) -> bool {
     let synthesized = ev.message.is_empty();
     // AWS CloudTrail: eventID is a UUID; the operation is eventName.
     if let (Some(source), Some(name)) = (field_text(ev, "eventSource"), field_text(ev, "eventName")) {
@@ -368,7 +395,7 @@ fn describe_known_json(ev: &mut Event) {
         } else if synthesized {
             ev.message = format!("{name} · {who} · {from}");
         }
-        return;
+        return true;
     }
     // Suricata EVE
     if let Some(kind) = field_text(ev, "event_type") {
@@ -398,7 +425,7 @@ fn describe_known_json(ev: &mut Event) {
         if ev.code.is_empty() {
             ev.code = kind;
         }
-        return;
+        return true;
     }
     // Zeek (JSON or TSV converted to JSON)
     if let (Some(orig), Some(resp)) = (field_text(ev, "id.orig_h"), field_text(ev, "id.resp_h")) {
@@ -415,7 +442,7 @@ fn describe_known_json(ev: &mut Event) {
         if ev.source.is_empty() {
             ev.source = "zeek".into();
         }
-        return;
+        return true;
     }
     // Okta System Log
     if let Some(kind) = field_text(ev, "eventType") {
@@ -428,7 +455,7 @@ fn describe_known_json(ev: &mut Event) {
         if field_text(ev, "outcome.result").is_some_and(|r| r.eq_ignore_ascii_case("FAILURE")) && ev.level == "Informação" {
             ev.level = "Aviso".into();
         }
-        return;
+        return true;
     }
     // Google Cloud audit logs
     if let Some(method) = field_text(ev, "protoPayload.methodName") {
@@ -439,7 +466,7 @@ fn describe_known_json(ev: &mut Event) {
             let who = field_text(ev, "protoPayload.authenticationInfo.principalEmail").unwrap_or_default();
             ev.message = format!("{method} · {who}");
         }
-        return;
+        return true;
     }
     // Kubernetes audit
     if let (Some(verb), Some(stage)) = (field_text(ev, "verb"), field_text(ev, "stage")) {
@@ -456,7 +483,9 @@ fn describe_known_json(ev: &mut Event) {
         if field_text(ev, "responseStatus.code").is_some_and(|c| c.starts_with('4') || c.starts_with('5')) {
             ev.level = "Aviso".into();
         }
+        return true;
     }
+    false
 }
 
 fn event_from_text(line: &str) -> Event {

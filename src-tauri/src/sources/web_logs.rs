@@ -867,3 +867,86 @@ mod generic_envelope_tests {
         assert!(!event.fields.contains_key("payload.parser.format"));
     }
 }
+
+#[cfg(test)]
+mod envelope_priority_tests {
+    use crate::sources::parse_line;
+    use serde_json::{json, Value};
+
+    fn parse(value: &Value) -> crate::model::Event {
+        parse_line(&serde_json::to_vec(value).unwrap(), "jsonl", None, &[])
+    }
+
+    #[test]
+    fn promoted_known_families_cannot_reinterpret_explicit_outer_columns() {
+        let families = [
+            json!({"eventSource":"s3.amazonaws.com","eventName":"PutObject","errorCode":"Denied"}),
+            json!({"event_type":"alert","alert":{"signature":"inner alert","signature_id":9001,"severity":1}}),
+            json!({"eventType":"user.session.start","uuid":"synthetic-id","outcome":{"result":"FAILURE"}}),
+            json!({"verb":"get","stage":"ResponseComplete","responseStatus":{"code":403}}),
+        ];
+        for inner in families {
+            let raw = json!({"timestamp":"2026-09-16T23:55:04.987654321Z","source":"collector",
+                "code":"EXPLICIT","level":"INFO","message":"outer message","payload":inner.to_string()});
+            let event = parse(&raw);
+            assert_eq!(event.timestamp, Some(1789602904987));
+            assert_eq!(event.source, "collector"); assert_eq!(event.code, "EXPLICIT");
+            assert_eq!(event.level, "Informação"); assert_eq!(event.message, "outer message");
+            assert_eq!(event.raw, raw.to_string());
+            for key in ["timestamp","source","code","level","message"] { assert_eq!(event.fields[key], raw[key]); }
+            assert!(!event.fields.contains_key("eventID"), "outer code must not be repurposed as inner eventID");
+        }
+    }
+
+    #[test]
+    fn aliases_and_non_string_outer_types_keep_their_priorities() {
+        let inner = json!({"event_type":"alert","alert":{"signature":"inner alert","signature_id":9001,"severity":1}});
+        let raw = json!({"@timestamp":"2026-09-16T23:55:04.987654321Z", "service":{"name":12},
+            "event":{"code":false},"log":{"level":true},"displayMessage":42,"payload":inner.to_string()});
+        let event = parse(&raw);
+        assert_eq!(event.timestamp, Some(1789602904987)); assert_eq!(event.source, "12");
+        assert_eq!(event.code, "false"); assert_eq!(event.level, "true"); assert_eq!(event.message, "42");
+        assert_eq!(event.fields["service.name"], 12); assert_eq!(event.fields["event.code"], false);
+        assert_eq!(event.fields["log.level"], true); assert_eq!(event.fields["displayMessage"], 42);
+        assert_eq!(event.fields["payload.alert.signature_id"], 9001);
+        assert_eq!(event.fields["payload.code"], "9001");
+    }
+
+    #[test]
+    fn direct_known_json_behavior_stays_intact_and_outer_family_beats_inner_family() {
+        let direct = json!({"eventSource":"s3.amazonaws.com","eventName":"PutObject","errorCode":"Denied",
+            "code":"original-id","level":"INFO"});
+        let event = parse(&direct);
+        assert_eq!(event.code, "PutObject"); assert_eq!(event.level, "Aviso");
+        assert_eq!(event.fields["eventID"], "original-id");
+        let suricata = json!({"event_type":"alert","alert":{"signature":"direct alert","signature_id":7,"severity":1},
+            "message":"legacy message","code":"legacy-code","level":"INFO"});
+        let event = parse(&suricata);
+        assert_eq!(event.message, "direct alert"); assert_eq!(event.code, "7"); assert_eq!(event.level, "Erro");
+        let outer = json!({"eventSource":"s3.amazonaws.com","eventName":"PutObject","errorCode":"Denied",
+            "payload":json!({"event_type":"alert","alert":{"signature":"inner alert","severity":1}}).to_string()});
+        let event = parse(&outer);
+        assert_eq!(event.code, "PutObject"); assert_eq!(event.level, "Aviso");
+        assert!(event.message.starts_with("PutObject negado")); assert_eq!(event.source, "s3");
+        let mut explicit = outer;
+        explicit["code"] = json!(false); explicit["level"] = json!(true); explicit["message"] = json!(42);
+        let event = parse(&explicit);
+        assert_eq!(event.code, "false"); assert_eq!(event.level, "true"); assert_eq!(event.message, "42");
+    }
+
+    #[test]
+    fn embedded_syslog_requires_a_real_header_while_explicit_parser_stays_tolerant() {
+        for line in ["1 - this is a simple saying hello", "<34>1 - host app pid msg saying hello",
+            "<192>1 - host app pid msg - hello", "<34>1 not-a-time host app pid msg - hello",
+            "<34>1 - host app pid msg [example key=\"value\"] hello"] {
+            let event = parse(&json!({"payload":line}));
+            assert!(!event.fields.contains_key("payload.parser.format"), "{line}");
+        }
+        for timestamp in ["-", "2026-09-16T23:55:04Z"] {
+            let line = format!("<34>1 {timestamp} host app pid msg - hello");
+            assert_eq!(parse(&json!({"payload":line})).fields["payload.app"], "app");
+        }
+        let event = parse_line(b"1 - this is a simple saying hello", "syslog5424", None, &[]);
+        assert_eq!(event.fields["app"], "is");
+    }
+}

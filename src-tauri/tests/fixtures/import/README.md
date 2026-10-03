@@ -35,6 +35,10 @@ reinterpreted by HTTP fallback. JSON collector envelopes are enriched only
 when a whole string field is a recognized self-describing record: Nginx/Apache
 access, Nginx error, JSON, syslog, Java headers, CEF/LEEF or strict whole-record
 logfmt. Known message keys receive priority, but arbitrary/nested names qualify.
+Embedded RFC5424 recognition conservatively requires an explicit PRI, version 1,
+a valid RFC3339 timestamp or `-`, and `-` structured data. Structured-data blocks
+are retained as raw text rather than guessed by this automatic path; the
+existing explicitly selected syslog parser is unchanged.
 Enrichment is bounded to 3 levels, 32 inspected values, 64 KiB per value,
 256 KiB inspected per record and 512 generated fields. Embedded source/inner
 field names are capped at 512 bytes. Query expansion separately limits each
