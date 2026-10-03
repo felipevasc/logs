@@ -6,6 +6,7 @@ import vm from 'node:vm';
 const contextSource = readFileSync(new URL('../../frontend/analysis-context.js', import.meta.url), 'utf8');
 const tasksSource = readFileSync(new URL('../../frontend/tasks.js', import.meta.url), 'utf8');
 const appSource = readFileSync(new URL('../../frontend/app.js', import.meta.url), 'utf8');
+const workspaceSource = readFileSync(new URL('../../frontend/workspace-context.js', import.meta.url), 'utf8');
 const transportSource = appSource.slice(appSource.indexOf('const caseTransport ='), appSource.indexOf('// ------------------------------------------------------------------ helpers de espera'));
 const plain = value => JSON.parse(JSON.stringify(value));
 const settle = async () => { for (let i = 0; i < 50; i++) await Promise.resolve(); };
@@ -195,6 +196,113 @@ test('a pending definition read for an old source cannot block or overwrite the 
   assert.match(String(await oldRead), /ANALYSIS_CONTEXT_CHANGED/);
   assert.deepEqual(plain(f.state.derivedFields), [{ name: 'new_source' }]);
   assert.equal(f.state.analysisDefinitionsPending, false);
+});
+
+test('first Case save is shared across source reset without poisoning the current definition load', async () => {
+  for (const change of ['reset', 'replacement']) for (const receipt of [true, false]) {
+    const saved = deferred(), f = fixture({ cases: [caseWith('new', null)], tasks: true });
+    const firstOwner = f.contexts.capture();
+    f.setNative(async command => {
+      if (command === 'analysis_context_snapshot') return snapshot('new', 0, 0);
+      assert.equal(command, 'list_derived_fields');
+      return [];
+    });
+    f.setSave(async () => {
+      await saved.promise;
+      if (receipt) await f.contexts.adopt(snapshot('new', 0, 0), { owner: firstOwner });
+      return true;
+    });
+    f.context.renderExploreTree = () => {};
+    const start = appSource.indexOf('async function loadDerivedFields(');
+    vm.runInContext(appSource.slice(start, appSource.indexOf('\nfunction renderExploreTree(', start)), f.context);
+    // newCase renders its first reads before afterCaseCreation resets the old
+    // source. Both callers must share persistence, but not source ownership.
+    const staleRead = f.context.api('profile_fields', { filters: [] }).then(() => null, error => error);
+    await settle();
+    f.state.currentArtifact = change === 'reset' ? null : { id: 'replacement', loadedAt: 200 };
+    if (change === 'replacement') f.state.sourcePublication = { generation: 11 };
+    const currentRead = f.context.loadDerivedFields();
+    await settle();
+    assert.equal(f.saveCount, 1, 'simultaneous first reads keep one durable save');
+    assert.equal(f.calls.length, 0, 'nothing is admitted before persistence');
+    saved.resolve();
+    assert.equal(await currentRead, true, `${change}/${receipt ? 'receipt' : 'snapshot'}: current definitions must finish after shared persistence`);
+    assert.match(String(await staleRead), /ANALYSIS_CONTEXT_CHANGED/);
+    assert.equal(f.state.analysisDefinitionsPending, false);
+    assert.deepEqual(plain(f.state.derivedFields), []);
+    assert.deepEqual(f.calls.map(call => call.cmd), [...(receipt ? [] : ['analysis_context_snapshot']), 'list_derived_fields'], 'the old source query never reaches native code');
+    assert.equal(f.calls.at(-1).args.sourceGeneration, change === 'reset' ? 10 : 11);
+    assert.equal(f.calls.at(-1).args.analysisContext.caseId, 'new');
+  }
+});
+
+test('actual newCase and afterCaseCreation finish empty isolation while an initial render waits for persistence', async () => {
+  for (const scope of ['dataset', 'case']) {
+    const saved = deferred(), f = fixture({ tasks: true });
+    f.state.loaded = true; f.state.total = 6000; f.state.columns = ['timestamp', 'previous_only'];
+    f.state.cases.cases[0].artifacts = [{ id: 'source', path: '/previous-only.jsonl' }];
+    f.setSave(async () => {
+      const owner = f.contexts.capture();
+      await saved.promise;
+      await f.contexts.adopt(snapshot(owner.caseId, 0, 0), { owner });
+      return true;
+    });
+    let completion, staleRead;
+    const c = f.context;
+    Object.assign(c, {
+      CURRENT_FILTER_ID: '__current__', defaultCaseWorkspace: () => ({}),
+      activeCase: () => f.state.cases.cases.find(item => item.id === f.state.cases.active),
+      caseGeneration: 0, restoringCase: false, runtime: new Map(), states: new Map(),
+      key: value => `${f.state.cases.active}:${value}`,
+      setAnalysisView() {}, renderCaseBar() {}, updateAnalysisBadge() {}, renderExploreTree() {},
+      renderAnalysis: () => { staleRead = c.api('profile_fields', { filters: [] }).then(() => null, error => error); },
+      resetCaseSourceState: () => Object.assign(f.state, { loaded: false, currentArtifact: null, currentOrigin: '',
+        columns: [], rows: [], total: 0, dataPeriod: null, queryError: null }),
+      syncActiveCaseArtifacts: async () => { await c.api('clear_events'); },
+      setScope: async target => { f.state.activeContext = target; },
+      refresh: async () => { throw Error('an empty new Case must not refresh the previous source'); },
+    });
+    const install = (source, start, end) => {
+      const from = source.indexOf(start); assert.ok(from >= 0);
+      vm.runInContext(source.slice(from, source.indexOf(end, from)), c);
+    };
+    install(appSource, 'async function loadDerivedFields(', '\nfunction renderExploreTree(');
+    install(appSource, 'function newCase(', '\nfunction caseItems(');
+    install(workspaceSource, '  function defaults()', '  const record =');
+    install(workspaceSource, '  function sourceRuntime(', '  function stored(');
+    install(workspaceSource, '  async function afterCaseCreation(', '  async function deleteCase(');
+    Object.assign(c.window.WorkspaceContext, {
+      beforeCaseCreation: () => { c.caseGeneration++; c.restoringCase = true; return { scope, snapshot: { page: 'explore' } }; },
+      afterCaseCreation: previous => { completion = c.afterCaseCreation(previous); return completion; },
+    });
+    const created = c.newCase('Isolated');
+    await settle(); assert.equal(f.calls.length, 0);
+    saved.resolve(); await completion;
+    assert.match(String(await staleRead), /ANALYSIS_CONTEXT_CHANGED/);
+    assert.equal(c.restoringCase, false); assert.equal(f.state.analysisDefinitionsPending, false);
+    assert.equal(f.state.activeContext, scope); assert.equal(f.state.loaded, false); assert.equal(f.state.total, 0);
+    assert.equal(f.state.currentArtifact, null); assert.deepEqual(plain(f.state.columns), []);
+    assert.deepEqual(plain(created.artifacts), []); assert.equal(created.workspace.activeScope, scope);
+    assert.equal(f.state.cases.cases[0].artifacts[0].path, '/previous-only.jsonl');
+    assert.deepEqual(f.calls.map(call => call.cmd), ['list_derived_fields', 'clear_events']);
+    assert.ok(f.calls.every(call => call.args.analysisContext.caseId === created.id));
+  }
+});
+
+test('shared first-save completion cannot admit a switched or recreated Case caller', async () => {
+  for (const change of ['switch', 'recreate']) {
+    const saved = deferred(), f = fixture({ cases: [caseWith('a', null), caseWith('b')], tasks: true });
+    f.setSave(() => saved.promise);
+    const pending = f.context.api('clear_events').then(() => null, error => error);
+    await settle();
+    if (change === 'switch') f.state.cases.active = 'b';
+    else f.state.cases.cases[0] = caseWith('a');
+    f.contexts.activate(); f.prime([{ name: 'current_fields' }]);
+    saved.resolve(true);
+    assert.match(String(await pending), /ANALYSIS_CONTEXT_CHANGED/);
+    assert.equal(f.calls.some(call => call.cmd === 'clear_events'), false);
+    assert.deepEqual(plain(f.state.derivedFields), [{ name: 'current_fields' }]);
+  }
 });
 
 test('pending definition requests are isolated across visibility-only revisions too', async () => {
