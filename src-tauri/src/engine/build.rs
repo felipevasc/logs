@@ -764,7 +764,7 @@ fn write(
         .map(|(last, first)| last.offset + u64::from(last.len) - first.offset)
         .unwrap_or(0);
     let text_memory = crate::resources::text_memory_bytes()
-        .min(input_bytes.saturating_mul(2).saturating_add(32 << 20) as usize);
+        .min(crate::resources::allocation_bytes(input_bytes.saturating_mul(2).saturating_add(32 << 20)));
     let text = super::text::Writer::create(&super::text::dir_of(path), text_threads, text_memory)?;
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     super::limit_resources(&conn, true)?;

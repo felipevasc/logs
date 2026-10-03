@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {mkdir} from 'node:fs/promises';
-import {chromium} from 'playwright';
-const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL||'chrome'});
+import { launchBrowser } from "./browser.mjs";
+const browser=await launchBrowser();
 const page=await browser.newPage({viewport:{width:1440,height:1150},reducedMotion:'reduce'});
 const errors=[];page.on('pageerror',e=>errors.push(e.message));
 try {
@@ -9,6 +9,7 @@ try {
   await page.waitForFunction(()=>WorkspaceContext.ready&&state.loaded&&!state.loadOverlay);
   await page.evaluate(()=>WorkspaceContext.setScope('dataset',{animate:false}));
   await page.evaluate(()=>Workspace.showPage('compromises'));
+  await page.evaluate(() => Security.get());
   await page.waitForSelector('.evidence-control');
   await page.evaluate(()=>{
     const original=api,data=structuredClone(Security.cached()),base=data.detections[0],e=structuredClone(state.rows[0]);
@@ -30,6 +31,7 @@ try {
     };Security.invalidate();
   });
   await page.evaluate(()=>Workspace.showPage('compromises'));
+  await page.evaluate(() => Security.get());
   await page.waitForSelector('.evidence-control');
   await page.locator('[data-evidence-min="4"]').click();
   await page.waitForSelector('.sec-personas');

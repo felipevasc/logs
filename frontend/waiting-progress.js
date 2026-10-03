@@ -26,7 +26,7 @@ window.WaitingProgress = (() => {
     const phaseId = typeof payload.phaseId === "string" ? payload.phaseId : "";
     const unit = typeof payload.unit === "string" ? payload.unit : "";
     const hasCount = measured(payload.completed) !== undefined && (unit || payload.total > 0);
-    const awaitingLoadSettlement = payload.operation === "carregamento" && ["ready", "Pronto", "Concluído"].includes(phaseId);
+    const awaitingLoadSettlement = payload.operation === "carregamento" && ["ready", "Pronto", "Concluído", "source-settle"].includes(phaseId);
     return {
       operationId: payload.operationId || operationId || "",
       phaseId,

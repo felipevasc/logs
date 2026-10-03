@@ -33,14 +33,36 @@ fn case_key(events: &[Event]) -> String {
     format!("case:{}:{:x}", events.len(), hasher.finish())
 }
 
+// All rule stores share one analysis budget, but waiting remains cancellable.
+static ANALYSIS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+fn analysis_lock(cache_only: bool) -> Result<parking_lot::MutexGuard<'static, ()>, String> {
+    if cache_only {
+        return ANALYSIS.try_lock().ok_or_else(|| "TRIAGE_NOT_CALCULATED: O cálculo está em andamento; o resultado anterior ainda não está disponível.".to_string());
+    }
+    loop {
+        crate::operations::check()?;
+        if let Some(guard) = ANALYSIS.try_lock_for(std::time::Duration::from_millis(25)) {
+            return Ok(guard);
+        }
+    }
+}
+
 pub fn stored_analysis(
     state: &AppState,
     case_events: Option<&[Event]>,
     force: bool,
 ) -> Result<Arc<crate::security_results::Results>, String> {
-    // One analysis worker: all rule stores share the application's analysis budget.
-    static ANALYSIS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-    let _working = ANALYSIS.lock();
+    stored_analysis_mode(state, case_events, force, false)
+}
+
+// Cache-only reads must never turn pagination or navigation into a new scan.
+pub(crate) fn stored_analysis_mode(
+    state: &AppState,
+    case_events: Option<&[Event]>,
+    force: bool,
+    cache_only: bool,
+) -> Result<Arc<crate::security_results::Results>, String> {
+    let _working = analysis_lock(cache_only)?;
     crate::operations::check()?;
     let rules = detections::ruleset()?;
     let settings = detections::load_settings();
@@ -78,6 +100,10 @@ pub fn stored_analysis(
             }
         }
     }
+    if cache_only {
+        return Err("TRIAGE_NOT_CALCULATED: A análise está ausente ou desatualizada. Clique em Calcular comprometimentos.".into());
+    }
+    crate::operations::report_progress("comprometimentos", "calculate", "Calculando comprometimentos", 0, 0, "registros", 0);
     let inputs = detections::Inputs { rules: &rules, catalog: catalog.as_deref(), settings: &settings };
     let result = match case_events {
         Some(events) => detections::run_stored(&inputs, &Source::Events(events.iter().collect()))?,
@@ -172,11 +198,25 @@ pub fn triage_page(
     limit: usize,
     tactic: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    triage_page_mode(state, filters, case, force, minimum, offset, limit, tactic, false)
+}
+
+fn triage_page_mode(
+    state: &AppState,
+    filters: Vec<Filter>,
+    case: Option<&[Event]>,
+    force: bool,
+    minimum: u8,
+    offset: usize,
+    limit: usize,
+    tactic: Option<&str>,
+    cache_only: bool,
+) -> Result<serde_json::Value, String> {
     if !(1..=5).contains(&minimum) {
         return Err("minimum_evidence must be between 1 and 5".into());
     }
     workspace::validate(&filters)?;
-    let full = stored_analysis(state, case, force)?;
+    let full = stored_analysis_mode(state, case, force, cache_only)?;
     if filters.is_empty() {
         return full.page(minimum, offset, limit, None, tactic);
     }
@@ -201,8 +241,20 @@ pub fn timeline_impl(
     start: i64,
     end: i64,
 ) -> Result<serde_json::Value, String> {
+    timeline_mode(state, filters, case, minimum, start, end, false)
+}
+
+pub(crate) fn timeline_mode(
+    state: &AppState,
+    filters: Vec<Filter>,
+    case: Option<&[Event]>,
+    minimum: u8,
+    start: i64,
+    end: i64,
+    cache_only: bool,
+) -> Result<serde_json::Value, String> {
     workspace::validate(&filters)?;
-    let full = stored_analysis(state, case, false)?;
+    let full = stored_analysis_mode(state, case, false, cache_only)?;
     if filters.is_empty() {
         return full.timeline(minimum, start, end, None);
     }
@@ -234,13 +286,14 @@ pub async fn triage_timeline(
     let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         let case = case_events;
-        timeline_impl(
+        timeline_mode(
             app.state::<AppState>().inner(),
             filters,
             case.as_deref(),
             minimum_evidence.unwrap_or(5),
             start,
             end,
+            true,
         )
     })
     .await?
@@ -409,17 +462,19 @@ pub async fn triage(
     analysis_context: Option<crate::analysis_context::Identity>,
     source_generation: Option<u64>,
     force: Option<bool>,
+    cache_only: Option<bool>,
+    operation_id: Option<String>,
     minimum_evidence: Option<u8>,
     episode_offset: Option<usize>,
     episode_limit: Option<usize>,
     tactic: Option<String>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
-    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         let state = app.state::<AppState>();
         let events = case_events;
-        triage_page(
+        triage_page_mode(
             state.inner(),
             filters,
             events.as_deref(),
@@ -428,6 +483,7 @@ pub async fn triage(
             episode_offset.unwrap_or(0),
             episode_limit.unwrap_or(20),
             tactic.as_deref(),
+            cache_only.unwrap_or(false),
         )
     })
     .await?
@@ -463,7 +519,7 @@ pub fn evidence_event_impl(
     id: usize,
     case: Option<&[Event]>,
 ) -> Result<Event, String> {
-    let full = stored_analysis(state, case, false)?;
+    let full = stored_analysis_mode(state, case, false, true)?;
     if full.metadata["analysis_id"].as_str() != Some(analysis_id) {
         return Err("O conjunto ou a análise mudou; recarregue Comprometimentos".into());
     }
@@ -542,6 +598,7 @@ pub struct EventInsights {
     pub normalization: crate::security_normalize::Normalized,
     pub related_findings: Vec<serde_json::Value>,
     pub related_findings_total: usize,
+    pub related_findings_calculated: bool,
 }
 
 pub fn insights_impl(event: &Event) -> Result<EventInsights, String> {
@@ -594,6 +651,7 @@ pub fn insights_impl(event: &Event) -> Result<EventInsights, String> {
         normalization,
         related_findings: Vec::new(),
         related_findings_total: 0,
+        related_findings_calculated: false,
     })
 }
 
@@ -623,9 +681,17 @@ pub async fn event_insights(
 
 pub fn insights_in_context(state: &AppState, event: &Event, case: Option<&[Event]>) -> Result<EventInsights, String> {
     let mut result = insights_impl(event)?;
-    let full = stored_analysis(state, case, false)?;
-    let reference = crate::security_normalize::event_ref(event);
-    (result.related_findings, result.related_findings_total) = full.related_page(&reference)?;
+    // Opening one record must not trigger full-universe correlation. Its local
+    // normalization/rules stay available even before Comprometimentos is asked for.
+    match stored_analysis_mode(state, case, false, true) {
+        Ok(full) => {
+            let reference = crate::security_normalize::event_ref(event);
+            (result.related_findings, result.related_findings_total) = full.related_page(&reference)?;
+            result.related_findings_calculated = true;
+        }
+        Err(error) if error.starts_with("TRIAGE_NOT_CALCULATED:") => {}
+        Err(error) => return Err(error),
+    }
     Ok(result)
 }
 
@@ -866,4 +932,31 @@ pub async fn sigma_clear(
         None,
         crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_admitted(None, app, admitted, sigma_clear_impl).await?
+}
+
+#[cfg(test)]
+mod on_demand_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_triage_does_not_wait_for_another_analysis_to_finish() {
+        let working = ANALYSIS.lock();
+        assert!(analysis_lock(true).err().unwrap().starts_with("TRIAGE_NOT_CALCULATED:"));
+        let id = format!("triage-wait-{}", uuid::Uuid::new_v4());
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let result = crate::operations::run_with_token(token, || analysis_lock(false).map(drop));
+            done_tx.send(matches!(result, Err(_) | Ok(Err(_)))).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        assert!(crate::operations::cancel_id(&id));
+        let cancelled = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Always unlock/join before asserting, so a regression cannot hang the suite.
+        drop(working);
+        waiter.join().unwrap();
+        assert_eq!(cancelled.unwrap(), true, "cancel must settle while the other analysis still holds the lock");
+    }
 }

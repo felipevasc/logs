@@ -17,6 +17,7 @@ window.EventInsights = (() => {
     const rules = [...data.rules.map(r => ({ ...r, snippet: "", source: "detecção" })), ...data.threats.map(t => ({ ...t, source: t.category }))];
     if (!entities.length && !data.action && !rules.length && !data.decoded.length) return;
     const block = el("section", "insight-block");
+    if (data.related_findings_calculated === false) block.append(el("p", "small muted", "Correlações do conjunto ainda não calculadas. Use Calcular comprometimentos para consultar os achados relacionados."));
     if(data.related_findings_total > (data.related_findings||[]).length) block.append(el("p","small muted",`Prévia de ${(data.related_findings||[]).length} de ${data.related_findings_total} achados relacionados. Consulte Indícios com este registro selecionado para navegar pelo resultado completo.`));
     for (const finding of data.related_findings || []) {
       if (!finding.relationships?.length) continue;

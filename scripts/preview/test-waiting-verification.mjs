@@ -131,7 +131,7 @@ async function mountFixture(mode) {
     const grid = document.createElement('div');
     Object.assign(grid.style, { display: 'flex', gap: '16px', justifyContent: 'center', flexWrap: 'wrap' });
     panel.append(heading, attribution, grid); document.body.append(panel);
-    const fixture = window.__verificationPreview = { views: [], receipts: [], observers: [], events: [], svg: [], mode, seed: null };
+    const fixture = window.__verificationPreview = { views: [], receipts: [], observers: [], events: [], svg: [], naturalEnds: [], mode, seed: null };
     for (const phaseId of mode === 'coffee' ? [phases[0]] : phases) {
       const host = document.createElement('section'); host.dataset.phaseId = phaseId;
       Object.assign(host.style, { width: '310px', padding: '10px 8px', border: '1px solid var(--border)', borderRadius: '8px' });
@@ -153,6 +153,17 @@ async function mountFixture(mode) {
       }
       const view = WaitingVisuals.mount(host, receipt, { reactionSeed });
       fixture.views.push(view); fixture.receipts.push(receipt); fixture.svg.push(view.element.querySelector('svg'));
+      view.element.addEventListener('animationend', event => {
+        if (event.animationName !== 'wv-gesture-boundary' || event.target !== view.element.querySelector('.wv-work-boundary')) return;
+        const animations = view.element.querySelector('.wv-art').getAnimations({ subtree: true });
+        fixture.naturalEnds.push({ phaseId, isTrusted: event.isTrusted, elapsedTime: event.elapsedTime,
+          pace: view.element.dataset.pace, stableSvg: view.element.querySelector('svg') === fixture.svg[fixture.views.indexOf(view)],
+          heldOpacity: Number(getComputedStyle(view.element.querySelector('.wv-verify-held')).opacity),
+          dockedOpacity: Number(getComputedStyle(view.element.querySelector('.wv-verify-docked')).opacity),
+          times: animations.map(a => a.currentTime), durationsMs: [...new Set(animations.map(a => a.effect.getComputedTiming().duration))],
+          iterations: [...new Set(animations.map(a => String(a.effect.getTiming().iterations)))],
+          playbackRates: [...new Set(animations.map(a => a.playbackRate))] });
+      }, true);
       const record = () => ({ phaseId, episode: view.element.dataset.episode, adapter: view.element.dataset.adapter, timeMs: performance.now() });
       fixture.events.push(record());
       let previous = `${view.element.dataset.episode}:${view.element.dataset.adapter}`;
@@ -170,34 +181,28 @@ async function recordNaturalCycle(durationMs) {
   return roots().evaluateAll(async (nodes, durationMs) => {
     const animations = nodes.flatMap(root => root.querySelector('.wv-art').getAnimations({ subtree: true }));
     if (!animations.length) throw Error('Verification artwork has no CSS tracks');
-    const sampling = await window.__waitingMotionSampling.begin(animations);
-    try {
-      await sampling.seek(0);
-      const started = performance.now();
-      await sampling.release();
-      await Promise.all(animations.map(animation => animation.ready));
-      return await new Promise((resolve, reject) => {
-        const frame = () => {
-          if (nodes.some(root => !root.isConnected || root.dataset.motion !== 'running' || root.dataset.episode !== 'work'))
-            return reject(Error('Verification changed or reacted during its natural work capture'));
-          if (animations.some(animation => animation.playbackRate !== 1)) return reject(Error('Capture playback rate is not 1x'));
-          const times = animations.map(animation => animation.currentTime);
-          if (times.every(time => typeof time === 'number' && time >= durationMs)) return resolve({
-            elapsedMs: performance.now() - started, minimumTimelineMs: Math.min(...times), maximumTimelineMs: Math.max(...times),
-            durationsMs: [...new Set(animations.map(animation => animation.effect.getComputedTiming().duration))],
-            iterations: [...new Set(animations.map(animation => String(animation.effect.getTiming().iterations)))],
-            playbackRates: [...new Set(animations.map(animation => animation.playbackRate))],
-            tracks: animations.map(animation => animation.animationName),
-            inspections: __verificationPreview.views.map(view => view.inspect()),
-          });
-          if (performance.now() - started > durationMs + 3000) return reject(Error('Natural work cycle did not finish within its budget'));
-          requestAnimationFrame(frame);
-        };
+    const started = performance.now();
+    return await new Promise((resolve, reject) => {
+      const frame = () => {
+        if (nodes.some(root => !root.isConnected || root.dataset.motion !== 'running' || root.dataset.episode !== 'work'))
+          return reject(Error('Verification changed or reacted during its natural work capture'));
+        if (animations.some(animation => animation.playbackRate !== 1)) return reject(Error('Capture playback rate is not 1x'));
+        const finite = durationMs === 2600;
+        const ends = __verificationPreview.naturalEnds;
+        const times = finite ? ends.flatMap(end => end.times) : animations.map(animation => animation.currentTime);
+        if ((finite ? ends.length === nodes.length : times.every(time => typeof time === 'number' && time >= durationMs))) return resolve({
+          elapsedMs: performance.now() - started, minimumTimelineMs: Math.min(...times), maximumTimelineMs: Math.max(...times),
+          durationsMs: finite ? [...new Set(ends.flatMap(end => end.durationsMs))] : [...new Set(animations.map(animation => animation.effect.getComputedTiming().duration))],
+          iterations: finite ? [...new Set(ends.flatMap(end => end.iterations))] : [...new Set(animations.map(animation => String(animation.effect.getTiming().iterations)))],
+          playbackRates: finite ? [...new Set(ends.flatMap(end => end.playbackRates))] : [...new Set(animations.map(animation => animation.playbackRate))],
+          tracks: animations.map(animation => animation.animationName), endpoints: finite ? ends : [],
+          inspections: __verificationPreview.views.map(view => view.inspect()),
+        });
+        if (performance.now() - started > durationMs + 3000) return reject(Error('Natural work cycle did not finish within its budget'));
         requestAnimationFrame(frame);
-      });
-    } finally {
-      await sampling.restore({ restoreTime: false });
-    }
+      };
+      requestAnimationFrame(frame);
+    });
   }, durationMs);
 }
 function assertWorkStates(states, pace) {
@@ -256,11 +261,13 @@ try {
   results.short = await recordNaturalCycle(2600);
   mark('short-natural-end');
   results.short.states = await states();
-  assertWorkStates(results.short.states, 'gesture');
+  assertWorkStates(results.short.states, 'loop');
   assert.deepEqual(results.short.durationsMs, [2600]); assert.deepEqual(results.short.iterations, ['1']);
   assert.ok(results.short.minimumTimelineMs >= 2600 && results.short.elapsedMs >= 2500);
-  assert.ok(results.short.states.every(state => state.heldOpacity === 0 && state.dockedOpacity === 1));
-  await snap('waiting-verification-short-dark.png', 'natural completed 2.6s gesture');
+  assert.ok(results.short.endpoints.every(end => end.isTrusted && end.elapsedTime === 2.6 && end.pace === 'gesture' && end.stableSvg));
+  assert.ok(results.short.endpoints.every(end => end.heldOpacity === 0 && end.dockedOpacity === 1));
+  assert.ok(results.short.states.every(state => state.animations.every(a => a.durationMs === 9600 && a.iterations === 'Infinity')));
+  await snap('waiting-verification-short-dark.png', 'natural 2.6s gesture endpoint followed automatically by continuous work');
 
   phase = 'natural full verification loop';
   await mountFixture('loop');

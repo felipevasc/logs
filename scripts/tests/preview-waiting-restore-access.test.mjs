@@ -48,6 +48,19 @@ test('existing native lock retries at 100ms with a five-second deadline, never a
   assert.match(source, /fixture\.receipts\[family\].*elapsedMs: family === 'access' \? 120000 : 4000/);
 });
 
+test('restoration promotes without receipts and access defers only the latest known family', () => {
+  assert.match(source, /results\.shortEndpoints\.every\(s => s\.isTrusted && s\.elapsedTime === 2\.4/);
+  assert.match(source, /results\.short\[1\]\.pace, 'loop'/);
+  assert.match(source, /event\.animationName !== 'wv-gesture-boundary'/);
+  assert.match(source, /\['metadata-restore', 'metadata-scan', 'metadata-checkpoint-sync'\]/);
+  assert.match(source, /pendingAccessReceipt\.family, 'access'/);
+  assert.match(source, /pendingAccessReceipt\.stableSvg && results\.pendingAccessReceipt\.stableTracks/);
+  assert.match(source, /pendingAccessReceipt\.afterTimes, results\.pendingAccessReceipt\.beforeTimes/);
+  assert.match(source, /pendingAccessApplied\.endpoint, \{ isTrusted: true, elapsedTime: 2\.4, family: 'access'/);
+  assert.match(source, /pendingAccessApplied\.family, 'checkpoint'/);
+  assert.match(source, /pendingAccessApplied\.replacedSvg && results\.pendingAccessApplied\.freshTracks/);
+});
+
 test('first eligible natural visor and diagnostic manual have stable real director seeds', () => {
   for (const episode of ['visor', 'manual']) {
     const { seed, model, operationId } = choose(episode);

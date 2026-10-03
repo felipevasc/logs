@@ -47,6 +47,8 @@ window.Tasks = (() => {
   let serial = 0, arrays = 0, dialog = null, ticker = null;
   const named = new Set(["set_ts_config", "remote_import", "remote_test", "load_bundle", "journey_fields", "journey_index", "journey_events", "discover_patterns", "timeline_range", "query_page", "query_events", "explore_snapshot", "count_filtered", "stats_events", "tree_aggs", "aggregate_events", "compute_series", "pivot", "load_file", "load_files", "load_event_log", "engine_retry"]);
   const sourceMutations = new Set(["set_ts_config", "load_file", "load_files", "load_bundle", "load_event_log", "clear_events"]);
+  named.add("triage");
+  SCOPED.add("triage_timeline"); READS.add("triage_timeline");
   named.add("clear_events"); named.add("grouped_timeline"); named.add("preview_field_transform"); for (const command of ["exclusion_visibility", "exclusion_preview", "exclusion_list", "exclusion_archive_page"]) named.add(command);
   const latest = new Map();
   named.add("analysis_field_text"); named.add("event_detail"); named.add("java_trace_detail");

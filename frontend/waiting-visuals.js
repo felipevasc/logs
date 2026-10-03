@@ -1,21 +1,18 @@
 /* Decorative scenes for real operations. No timers, progress estimation or IPC.
    Load as a classic script and pair with waiting-visuals.css.
 
-   const view = WaitingVisuals.mount(host, {
-     operationId, phaseId, state: 'running', label: 'Indexando metadados',
-     completed, total, unit, elapsedMs
-   }, { showDetails: false, motionEnabled: true });
-   view.update(nextSnapshot); // Replaces, rather than merges, the previous receipt.
-   view.setVisible(false);    // Call when the host's panel is hidden by the application.
-   view.destroy();            // Call before removing/replacing the host.
+   mount(host, receipt, options); update replaces the receipt.
+   setVisible(false) pauses hidden panels; destroy before removing the host.
 
    phaseIndex is one-based. phaseCount, elapsedMs and estimateMs are optional measured/
    supplied values; estimateMs is remaining time for THIS phase. No value is inferred.
-   Long scenes loop only when supplied elapsedMs >= 4000. Short scenes make one gesture.
+   Long scenes start directly when elapsedMs >= 4000; otherwise the complete finite
+   gesture promotes at its own CSS boundary if work is still pending.
    Lock access is always gesture-only: elapsedMs describes the whole operation.
    Reactions are chosen only at CSS cycle boundaries, from supplied elapsed time.
    They never hold results, change receipts or estimate progress. Pauses freeze all tracks.
-   An unknown phase/state is static, even if its human label sounds like a known operation.
+   Same-operation phase changes coalesce at complete scene boundaries. Receipts
+   stay immediate. Unknown and terminal states are static.
 */
 window.WaitingVisuals = (() => {
   "use strict";
@@ -27,6 +24,16 @@ window.WaitingVisuals = (() => {
     'metadata-columns': 'reading', 'metadata-validate': 'verification',
     'metadata-map-validate': 'verification', 'analytics-time-index': 'reading',
     'pivot-values': 'reading', 'canonical-verify': 'verification',
+    'canonical-convert': 'reading', 'canonical-extract': 'reading',
+    'canonical-publish': 'checkpoint', 'canonical-lock': 'access',
+    'engine-validate': 'verification', 'engine-validated': 'verification',
+    'engine-restore': 'restoration', 'engine-prepare': 'reading',
+    'engine-columns': 'reading', 'engine-index': 'reading',
+    'engine-checkpoint-write': 'checkpoint', 'engine-text-merge': 'calculation',
+    'engine-checkpoint-sync': 'checkpoint', 'engine-checkpoint-publish': 'checkpoint',
+    'engine-checkpoint-committed': 'checkpoint', 'engine-open': 'restoration',
+    'engine-ready': 'restoration', 'source-prepare': 'reading', 'source-indexed': 'reading',
+    'source-activate': 'restoration', 'source-settle': 'restoration',
     'metadata-checkpoint-write': 'checkpoint', 'metadata-checkpoint-sync': 'checkpoint',
     'metadata-checkpoint-publish': 'checkpoint', 'metadata-checkpoint-committed': 'checkpoint',
     'analytics-select': 'calculation', 'analytics-verify': 'verification',
@@ -62,7 +69,7 @@ window.WaitingVisuals = (() => {
     const input = snapshot && typeof snapshot === 'object' ? snapshot : {};
     const operationId = text(input.operationId), phaseId = text(input.phaseId);
     const state = Object.hasOwn(STATES, input.state) ? input.state : 'unknown';
-    const partialCheckpoint = phaseId === 'metadata-checkpoint-committed';
+    const partialCheckpoint = ['metadata-checkpoint-committed', 'engine-checkpoint-committed'].includes(phaseId);
     const knownFamily = Object.hasOwn(PHASES, phaseId) ? PHASES[phaseId] : 'neutral';
     const family = operationId && state === 'running' ? knownFamily : 'neutral';
     const canAnimate = family !== 'neutral' && !partialCheckpoint;
@@ -150,7 +157,7 @@ window.WaitingVisuals = (() => {
     return Object.freeze({
       inspect,
       boundary(model) {
-        if (episode !== 'work' || !model?.canAnimate || model.motionMode !== 'loop' || !adapters[model.family]?.reactions) return null;
+        if (episode !== 'work' || model?.partialCheckpoint || !model?.canAnimate || model.motionMode !== 'loop' || !adapters[model.family]?.reactions) return null;
         cycle++;
         if (cooldown > 0) { cooldown--; return null; }
         const elapsed = measured(model.elapsedMs);
@@ -377,8 +384,13 @@ window.WaitingVisuals = (() => {
     return `${kitchen}${manualKit}${parked}<g class="wv-reaction-actor">${actor}</g>`;
   }
 
+  const gestureDuration = family => ['checkpoint', 'composition'].includes(family) ? 2800
+    : ['calculation', 'verification'].includes(family) ? 2600 : 2400;
+  let dismissCompletion = null;
+  const mounted = new Set();
   function mount(host, initialSnapshot = {}, options = {}) {
     if (!host?.ownerDocument?.createElement || typeof host.append !== 'function') throw new TypeError('WaitingVisuals.mount precisa de um elemento.');
+    dismissCompletion?.();
     const document = host.ownerDocument, view = document.defaultView || window;
     const root = document.createElement('div'); root.className = 'waiting-visual';
     const art = document.createElement('div'); art.className = 'wv-art'; art.setAttribute('aria-hidden', 'true');
@@ -387,8 +399,8 @@ window.WaitingVisuals = (() => {
     const metric = document.createElement('div'); metric.className = 'wv-metric';
     const details = document.createElement('div'); details.className = 'wv-details';
     const control = document.createElement('button'); control.className = 'wv-motion-toggle'; control.type = 'button';
-    root.append(art, status, metric, details, control); host.append(root);
-    let current, sceneKey = '', destroyed = false, visible = true, intersecting = false;
+    root.append(art, status, metric, details, control); host.append(root); mounted.add(root);
+    let current, sceneKey = '', destroyed = false, finishing = false, gestureFinished = false, visible = true, intersecting = false;
     let director, directorOwner = '', workSignal, episodeSignal, adapterSignal, moving = false, deferredCompletion = null;
     let motionEnabled = options.motionEnabled !== false;
     const elapsedClock = createElapsedClock(typeof view.performance?.now === 'function' ? () => view.performance.now() : () => 0);
@@ -398,12 +410,13 @@ window.WaitingVisuals = (() => {
       if (destroyed || !current) return;
       const reduced = !!media?.matches;
       moving = current.canAnimate && motionEnabled && !reduced && visible && intersecting && !document.hidden && root.isConnected;
+      if (finishing && !moving) { destroy(); return; }
       root.dataset.motion = moving ? 'running' : 'static';
       // Latch animation assignment. Pausing changes only play-state, never its name.
       if (moving) root.dataset.animated = 'true';
       if (!current.canAnimate) root.dataset.animated = 'false';
-      if (root.dataset.episode === 'work') root.dataset.pace = current.motionMode;
-      control.hidden = !current.canAnimate || reduced;
+      // Receipts cannot cut a gesture, replace paused tracks, or demote a loop.
+      control.hidden = finishing || !current.canAnimate || reduced;
       control.textContent = motionEnabled ? 'Pausar animação' : 'Retomar animação';
       control.setAttribute('aria-label', motionEnabled ? 'Pausar apenas a animação; a operação continua' : 'Retomar apenas a animação; a operação continua');
       control.setAttribute('aria-pressed', String(!motionEnabled));
@@ -415,36 +428,52 @@ window.WaitingVisuals = (() => {
         if (completion.stage === root.dataset.adapter && completion.episode === root.dataset.episode) boundary(completion);
       }
     }
-    function update(snapshot = {}) {
-      if (destroyed) return false;
-      current = derive(snapshot);
-      elapsedClock.observe(current);
-      // Counters/elapsed receipts do not rebuild SVG or restart its CSS timeline.
+    function selectScene(force = false) {
       const key = `${current.operationId}\u0000${current.family}`;
-      if (key !== sceneKey) {
-        deferredCompletion = null;
-        art.innerHTML = `<svg viewBox="0 0 192 96" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg"><g class="wv-work">${scenes[current.family]}</g>${reactionScenery(current.family)}</svg>`;
-        // Actual DOM targets, never selectors from an event or an old SVG instance.
-        workSignal?.remove(); episodeSignal?.remove(); adapterSignal?.remove();
-        workSignal = document.createElement('span'); workSignal.className = 'wv-work-boundary';
-        episodeSignal = document.createElement('span'); episodeSignal.className = 'wv-episode-boundary';
-        adapterSignal = document.createElement('span'); adapterSignal.className = 'wv-adapter-boundary';
-        workSignal.setAttribute('aria-hidden', 'true'); episodeSignal.setAttribute('aria-hidden', 'true'); adapterSignal.setAttribute('aria-hidden', 'true');
-        art.append(workSignal, episodeSignal, adapterSignal);
-        if (!director || directorOwner !== current.operationId) {
-          director = createDirector(current.operationId, options.reactionSeed ?? current.operationId);
-          directorOwner = current.operationId;
-        } else director.finish();
-        root.dataset.episode = 'work'; root.dataset.adapter = 'work'; root.dataset.reactionVariant = 'a'; root.dataset.animated = 'false';
-        sceneKey = key;
-      }
+      if (key === sceneKey) return false;
+      // Retain only the latest desired family, never a queue of stale phases.
+      if (!force && current.canAnimate && directorOwner === current.operationId
+          && root.dataset.animated === 'true' && adapters[root.dataset.family]
+          && !(adapters[root.dataset.family].gestureOnly && gestureFinished)) return false;
+      deferredCompletion = null; gestureFinished = false;
+      art.innerHTML = `<svg viewBox="0 0 192 96" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg"><g class="wv-work">${scenes[current.family]}</g>${reactionScenery(current.family)}</svg>`;
+      workSignal?.remove(); episodeSignal?.remove(); adapterSignal?.remove();
+      workSignal = document.createElement('span'); workSignal.className = 'wv-work-boundary';
+      episodeSignal = document.createElement('span'); episodeSignal.className = 'wv-episode-boundary';
+      adapterSignal = document.createElement('span'); adapterSignal.className = 'wv-adapter-boundary';
+      workSignal.setAttribute('aria-hidden', 'true'); episodeSignal.setAttribute('aria-hidden', 'true'); adapterSignal.setAttribute('aria-hidden', 'true');
+      art.append(workSignal, episodeSignal, adapterSignal);
+      const sameOperation = director && directorOwner === current.operationId;
+      if (!sameOperation) {
+        director = createDirector(current.operationId, options.reactionSeed ?? current.operationId);
+        directorOwner = current.operationId;
+      } else director.finish();
+      const wasLooping = sameOperation && root.dataset.pace === 'loop';
+      root.dataset.episode = 'work'; root.dataset.adapter = 'work'; root.dataset.reactionVariant = 'a'; root.dataset.animated = 'false';
+      root.dataset.family = current.family; root.dataset.variant = current.variant;
+      root.dataset.pace = wasLooping && !adapters[current.family]?.gestureOnly ? 'loop' : current.motionMode;
+      sceneKey = key;
+      return true;
+    }
+    function finishReaction() {
+      if (finishing) { destroy(); return; }
+      director.finish(); root.dataset.episode = 'work'; root.dataset.adapter = 'work';
+      selectScene(true); syncMotion();
+    }
+    function update(snapshot = {}) {
+      if (destroyed || finishing) return false;
+      const previous = current;
+      current = derive(snapshot);
+      // A committed segment remains inside the pending operation, except on an
+      // explicit terminal/cancelling state, which must always stop immediately.
+      if (current.state === 'running' && current.partialCheckpoint && previous?.canAnimate && current.operationId === previous.operationId)
+        current = { ...current, family: root.dataset.family, canAnimate: true };
+      elapsedClock.observe(current);
+      selectScene();
       if (!current.canAnimate) deferredCompletion = null;
       if (!current.canAnimate && root.dataset.episode !== 'work') {
-        director.finish();
-        root.dataset.episode = 'work'; root.dataset.adapter = 'work';
+        director.finish(); root.dataset.episode = 'work'; root.dataset.adapter = 'work';
       }
-      root.dataset.family = current.family;
-      root.dataset.variant = current.variant;
       root.dataset.state = current.state;
       root.dataset.checkpoint = current.partialCheckpoint ? 'preserved' : 'pending';
       // Announce concise semantic changes only, never every count or elapsed update.
@@ -462,8 +491,9 @@ window.WaitingVisuals = (() => {
       if (!moving || document.hidden || media?.matches || !visible || !intersecting || !motionEnabled) {
         let completedDuration = null;
         if (event.type === 'animationend') {
-          if (event.target === episodeSignal && event.animationName === 'wv-episode-boundary' && root.dataset.adapter === 'react') completedDuration = repertoire[root.dataset.episode]?.durationMs;
-          else if (event.target === adapterSignal && ['prepare', 'resume'].includes(root.dataset.adapter) && event.animationName === `wv-${root.dataset.adapter}-boundary`) completedDuration = adapters[current.family]?.bridgeMs;
+          if (event.target === workSignal && event.animationName === 'wv-gesture-boundary' && root.dataset.pace === 'gesture') completedDuration = gestureDuration(root.dataset.family);
+          else if (event.target === episodeSignal && event.animationName === 'wv-episode-boundary' && root.dataset.adapter === 'react') completedDuration = repertoire[root.dataset.episode]?.durationMs;
+          else if (event.target === adapterSignal && ['prepare', 'resume'].includes(root.dataset.adapter) && event.animationName === `wv-${root.dataset.adapter}-boundary`) completedDuration = adapters[root.dataset.family]?.bridgeMs;
         }
         const elapsed = measured(event.elapsedTime);
         if (completedDuration > 0 && elapsed !== null && Math.abs(elapsed * 1000 - completedDuration) < 1) {
@@ -472,19 +502,27 @@ window.WaitingVisuals = (() => {
         }
         return;
       }
-      if (event.target === workSignal && event.type === 'animationiteration' && event.animationName === 'wv-work-boundary' && root.dataset.episode === 'work') {
-        const next = director.boundary({ ...current, elapsedMs: elapsedClock.read() });
+      if (event.target === workSignal && event.type === 'animationend' && event.animationName === 'wv-gesture-boundary'
+          && root.dataset.episode === 'work' && root.dataset.pace === 'gesture') {
+        if (finishing) { destroy(); return; }
+        gestureFinished = true;
+        if (!adapters[root.dataset.family]?.gestureOnly) root.dataset.pace = 'loop';
+        selectScene(true); syncMotion();
+      } else if (event.target === workSignal && event.type === 'animationiteration' && event.animationName === 'wv-work-boundary' && root.dataset.episode === 'work') {
+        if (finishing) { destroy(); return; }
+        if (selectScene(true)) { syncMotion(); return; }
+        const next = director.boundary({ ...current, family: root.dataset.family, motionMode: root.dataset.pace, elapsedMs: elapsedClock.read() });
         if (next) {
           root.dataset.episode = next.episode; root.dataset.reactionVariant = next.variant;
-          root.dataset.adapter = adapters[current.family].bridgeMs ? 'prepare' : 'react';
+          root.dataset.adapter = adapters[root.dataset.family].bridgeMs ? 'prepare' : 'react';
         }
       } else if (event.target === episodeSignal && event.type === 'animationend' && event.animationName === 'wv-episode-boundary' && root.dataset.adapter === 'react') {
-        if (adapters[current.family].bridgeMs) root.dataset.adapter = 'resume';
-        else { director.finish(); root.dataset.episode = 'work'; root.dataset.adapter = 'work'; syncMotion(); }
+        if (adapters[root.dataset.family].bridgeMs) root.dataset.adapter = 'resume';
+        else finishReaction();
       } else if (event.target === adapterSignal && event.type === 'animationend' && root.dataset.episode !== 'work') {
         if (root.dataset.adapter === 'prepare' && event.animationName === 'wv-prepare-boundary') root.dataset.adapter = 'react';
         else if (root.dataset.adapter === 'resume' && event.animationName === 'wv-resume-boundary') {
-          director.finish(); root.dataset.episode = 'work'; root.dataset.adapter = 'work'; syncMotion();
+          finishReaction();
         }
       }
     }
@@ -492,8 +530,8 @@ window.WaitingVisuals = (() => {
     function toggleMotion() { setMotionEnabled(!motionEnabled); }
     function setVisible(shown) {
       if (destroyed) return;
-      visible = !!shown; root.dataset.visible = String(visible); root.inert = !visible;
-      root.setAttribute('aria-hidden', String(!visible)); syncMotion();
+      visible = !!shown; root.dataset.visible = String(visible); root.inert = finishing || !visible;
+      root.setAttribute('aria-hidden', String(finishing || !visible)); syncMotion();
     }
     control.addEventListener('click', toggleMotion);
     art.addEventListener('animationiteration', boundary);
@@ -509,23 +547,38 @@ window.WaitingVisuals = (() => {
     }, { threshold: 0 }) : null;
     observer?.observe(root);
     update(initialSnapshot);
-    return Object.freeze({
-      element: root, update, setVisible, setMotionEnabled,
-      inspect: () => ({ ...director?.inspect(), adapterStage: root.dataset.adapter }),
-      destroy() {
-        if (destroyed) return;
-        destroyed = true; deferredCompletion = null;
-        root.dataset.motion = 'static';
-        observer?.disconnect();
-        document.removeEventListener('visibilitychange', syncMotion);
-        if (media?.removeEventListener) media.removeEventListener('change', syncMotion);
-        else if (media?.removeListener) media.removeListener(syncMotion);
-        control.removeEventListener('click', toggleMotion);
-        art.removeEventListener('animationiteration', boundary);
-        art.removeEventListener('animationend', boundary);
-        root.remove();
-      }
-    });
+    function complete() {
+      if (destroyed || finishing) return false;
+      // Results settle immediately. Only the existing moving sequence may finish
+      // outside its blocking host, with no new reaction, focus or input capture.
+      if (!moving || !root.isConnected || (gestureFinished && root.dataset.pace === 'gesture') || mounted.size > 1) { destroy(); return false; }
+      finishing = true; dismissCompletion = destroy;
+      root.dataset.finishing = 'true'; root.dataset.state = 'completed';
+      root.inert = true; root.setAttribute('aria-hidden', 'true');
+      status.textContent = 'Concluído'; metric.hidden = true; details.hidden = true; control.hidden = true;
+      document.body.append(root);
+      document.addEventListener('workspace-context-change', destroy);
+      document.addEventListener('analysis-context-change', destroy);
+      return true;
+    }
+    function destroy() {
+      if (destroyed) return;
+      destroyed = true; deferredCompletion = null; mounted.delete(root);
+      if (dismissCompletion === destroy) dismissCompletion = null;
+      root.dataset.motion = 'static';
+      observer?.disconnect();
+      document.removeEventListener('visibilitychange', syncMotion);
+      document.removeEventListener('workspace-context-change', destroy);
+      document.removeEventListener('analysis-context-change', destroy);
+      if (media?.removeEventListener) media.removeEventListener('change', syncMotion);
+      else if (media?.removeListener) media.removeListener(syncMotion);
+      control.removeEventListener('click', toggleMotion);
+      art.removeEventListener('animationiteration', boundary);
+      art.removeEventListener('animationend', boundary);
+      root.remove();
+    }
+    return Object.freeze({ element: root, update, setVisible, setMotionEnabled, complete, destroy,
+      inspect: () => ({ ...director?.inspect(), adapterStage: root.dataset.adapter, finishing }) });
   }
   return Object.freeze({ derive, mount, repertoire, adapters, createDirector, createElapsedClock });
 })();

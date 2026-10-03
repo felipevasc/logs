@@ -20,11 +20,14 @@ impl Default for Preferences {
 }
 impl Preferences {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        self.validate_for_machine(crate::resources::MAX_MEMORY_PREFERENCE_MIB)
+    }
+    pub(crate) fn validate_for_machine(&self, maximum: u64) -> Result<(), String> {
         if self.schema_version != 1 { return Err("Versão de recursos do Caso não suportada.".into()); }
         match (&self.mode, self.work_limit_mib) {
             (Mode::Inherit, None) => Ok(()),
-            (Mode::Custom, Some(value)) if (8..=8192).contains(&value) => Ok(()),
-            _ => Err("Recursos do Caso: use Herdar ou uma cota inteira entre 8 e 8192 MiB.".into()),
+            (Mode::Custom, Some(value)) if (8..=maximum.min(crate::resources::MAX_MEMORY_PREFERENCE_MIB)).contains(&value) => Ok(()),
+            _ => Err(format!("Recursos do Caso: use Herdar ou uma cota inteira entre 8 e {maximum} MiB.")),
         }
     }
 }
@@ -52,9 +55,25 @@ fn registry() -> &'static parking_lot::Mutex<Registry> {
 fn selection_global() -> &'static Arc<Pool> {
     static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
     POOL.get_or_init(|| {
-        let bytes = usize::try_from(crate::resources::application_selection_bytes()).unwrap_or(usize::MAX);
+        let bytes = crate::resources::allocation_bytes(crate::resources::application_selection_bytes());
         Pool::new(Limits { materialized: bytes, retained: bytes, live: bytes })
     })
+}
+/// A Case only narrows the application's actual component pools. Logical IDs
+/// can live on disk; this limit neither enlarges DuckDB nor reserves RAM.
+fn maximum_work_bytes(work: usize, selection: usize, memory: u64) -> usize {
+    work.saturating_add(selection).min(crate::resources::allocation_bytes(memory))
+}
+pub(crate) fn maximum_work_mib() -> u64 {
+    crate::resources::maximum_memory_mib(crate::resources::total_memory())
+}
+pub(crate) fn effective_maximum_work_mib() -> u64 {
+    maximum_work_bytes(crate::case_work_budget::global().base_limits().live,
+        selection_global().base_limits().live, crate::resources::total_memory()) as u64 / MIB
+}
+fn requested_work_bytes(preferences: &Preferences, maximum: usize) -> usize {
+    preferences.work_limit_mib.map(|mib| crate::resources::allocation_bytes(mib.saturating_mul(MIB)))
+        .unwrap_or(maximum).min(maximum)
 }
 impl Policy {
     /// Called before offloading, using the same committed identity/settings.
@@ -65,7 +84,10 @@ impl Policy {
         let work = aggregate.base_limits();
         let selection = selection_global();
         let inherited = work.live.saturating_add(selection.base_limits().live);
-        let limit = preferences.work_limit_mib.map(|mib| (mib * MIB) as usize).unwrap_or(inherited).min(inherited);
+        let maximum = maximum_work_bytes(work.live, selection.base_limits().live, crate::resources::total_memory());
+        // Inherit preserves the existing per-component behavior. Custom only
+        // restricts it, including when a Case is opened on a smaller machine.
+        let limit = if preferences.mode == Mode::Inherit { inherited } else { requested_work_bytes(preferences, maximum) };
         let build = |owner: Option<Arc<OwnerCounter>>| {
             let pool = owner.as_ref().map(|owner| Pool::child(Limits {
                 materialized: work.materialized.min(limit), retained: work.retained.min(limit), live: work.live.min(limit),
@@ -74,8 +96,8 @@ impl Policy {
                 materialized: selection.base_limits().materialized.min(limit), retained: selection.base_limits().retained.min(limit), live: selection.base_limits().live.min(limit),
             }, Arc::clone(selection), Arc::clone(owner), limit)).unwrap_or_else(|| Arc::clone(selection));
             Arc::new(Self { pool, selections, owner, owner_limit: limit,
-                selection_bytes: crate::resources::application_selection_bytes().min(limit as u64),
-                selection_cache_bytes: crate::resources::application_selection_cache_bytes().min(limit as u64),
+                selection_bytes: (selection.base_limits().live.min(limit)) as u64,
+                selection_cache_bytes: crate::resources::application_selection_cache_bytes().min(selection.base_limits().live.min(limit) as u64),
                 collected_ids_bytes: crate::resources::application_collected_ids_bytes().min(limit),
                 analytics_bytes: crate::resources::application_analytics_bytes().min(limit),
             })
@@ -148,10 +170,35 @@ mod tests {
     #[test]
     fn preferences_are_explicit_bounded_and_round_trip() {
         assert!(Preferences::default().validate().is_ok());
-        for value in [0, 7, 8193, u64::MAX] { assert!(custom(value).validate().is_err()); }
+        for value in [0, 7, crate::resources::MAX_MEMORY_PREFERENCE_MIB + 1, u64::MAX] { assert!(custom(value).validate().is_err()); }
         let value = custom(32);
         assert_eq!(serde_json::from_str::<Preferences>(&serde_json::to_string(&value).unwrap()).unwrap(), value);
         assert!(serde_json::from_str::<Preferences>(r#"{"schemaVersion":1,"mode":"custom","workLimitMib":8.5}"#).is_err());
+    }
+    #[test]
+    fn large_preferences_survive_machine_changes_without_enlarging_components() {
+        for mib in [8193, 65536, 131072] {
+            let preferences = custom(mib);
+            assert!(preferences.validate().is_ok());
+            assert!(preferences.validate_for_machine(mib).is_ok());
+            assert!(preferences.validate_for_machine(mib - 1).is_err());
+            let loaded: Preferences = serde_json::from_str(&serde_json::to_string(&preferences).unwrap()).unwrap();
+            assert_eq!(loaded, preferences);
+            assert_eq!(requested_work_bytes(&loaded, 128 << 20), 128 << 20);
+        }
+        let work = 128 << 20;
+        let selection = crate::resources::allocation_bytes(8 << 30);
+        let maximum = maximum_work_bytes(work, selection, 128 << 30);
+        assert_eq!(maximum, work.saturating_add(selection).min(isize::MAX as usize));
+        assert_eq!(maximum_work_bytes(work, selection, 256 << 20), 256 << 20);
+        assert_eq!(maximum_work_bytes(usize::MAX, usize::MAX, u64::MAX), isize::MAX as usize);
+        let id = identity("moved-large-quota");
+        let policy = Policy::capture(Some(&id), &custom(131072)).unwrap();
+        assert_eq!(policy.owner_limit as u64 / MIB, effective_maximum_work_mib());
+        assert!(policy.pool().base_limits().live <= crate::case_work_budget::global().base_limits().live);
+        assert!(policy.selection_bytes() <= crate::resources::application_selection_bytes());
+        assert!(policy.analytics_bytes() <= crate::resources::application_analytics_bytes());
+        assert!(policy.collected_ids_bytes() <= crate::resources::application_collected_ids_bytes());
     }
     #[test]
     fn revisions_share_owner_credit_but_cases_do_not() {
@@ -204,9 +251,10 @@ mod tests {
     #[test]
     fn test_operation_limit_does_not_poison_application_pool() {
         let configured = crate::resources::application_selection_bytes();
+        let addressable = crate::resources::allocation_bytes(configured) as u64;
         crate::resources::with_selection_limit(16, || {
             assert_eq!(crate::resources::selection_bytes(), 16);
-            assert_eq!(current_selection_pool().base_limits().live as u64, configured);
+            assert_eq!(current_selection_pool().base_limits().live as u64, addressable);
         });
         assert_eq!(crate::resources::selection_bytes(), configured);
         let credit = current_selection_pool().reserve(24).unwrap();
@@ -215,7 +263,7 @@ mod tests {
     #[test]
     fn inherited_type_limits_are_not_reduced_to_evidence_work_limit() {
         let policy = Policy::capture(Some(&identity("inherit")), &Preferences::default()).unwrap();
-        assert_eq!(policy.selection_bytes(), crate::resources::application_selection_bytes());
+        assert_eq!(policy.selection_bytes(), crate::resources::allocation_bytes(crate::resources::application_selection_bytes()) as u64);
         assert_eq!(policy.collected_ids_bytes(), crate::resources::application_collected_ids_bytes());
         assert_eq!(policy.analytics_bytes(), crate::resources::application_analytics_bytes());
     }

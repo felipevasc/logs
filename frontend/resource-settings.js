@@ -14,10 +14,10 @@ window.ResourceSettings = (() => {
   let caseOwner = null, caseStatus = null, caseDraft = null, caseLoading = null, caseSaving = false, caseMessage = "", caseFailed = false;
   const contexts = () => window.AnalysisContexts;
   const caseKey = owner => JSON.stringify([owner?.instance, owner?.identity || null]);
-  function casePreferences(mode, text, maximum = 8192) {
+  function casePreferences(mode, text, maximum) {
     if (mode === "inherit") return { schemaVersion: 1, mode, workLimitMib: null };
     const value = Number(text);
-    if (mode !== "custom" || !/^[1-9]\d*$/.test(String(text)) || !Number.isSafeInteger(value) || value < 8 || value > maximum) {
+    if (mode !== "custom" || !/^[1-9]\d*$/.test(String(text)) || !Number.isSafeInteger(value) || value < 8 || !Number.isSafeInteger(maximum) || value > maximum) {
       throw Error(`Informe uma cota inteira entre 8 e ${maximum} MiB.`);
     }
     return { schemaVersion: 1, mode, workLimitMib: value };
@@ -64,7 +64,7 @@ window.ResourceSettings = (() => {
   }
   function renderCase() {
     const box = node("section", "ui-pref");
-    box.append(node("strong", "", "Recursos deste Caso"));
+    box.append(node("strong", "", "Cota lógica deste Caso"));
     box.append(node("p", "muted small", "Cota independente de volume lógico contabilizado: agregações e rankings, materialização analítica de evidências e IDs de seleções, inclusive IDs em tabelas ou spill. Não configura RAM do DuckDB, disco temporário ou threads; esses motores seguem os padrões do aplicativo. Paginação e hidratação conservam seus limites específicos. Histórico, prévias, recuperação e importação/exportação de arquivos preservados continuam sob as cotas globais."));
     if (!caseOwner?.identity) { box.append(node("p", "muted small", "Abra e salve um Caso para configurar sua cota independente.")); return box; }
     if (!caseStatus) {
@@ -73,10 +73,11 @@ window.ResourceSettings = (() => {
       return box;
     }
     const effective = caseStatus.effective;
-    box.append(node("p", "", `Cota total do Caso: ${mib(effective.accountedLimitMib)} · Trabalho: até ${mib(effective.workLiveMib)} · Seleção lógica: até ${mib(effective.selectionMib)}`));
+    box.append(node("p", "", `Cota lógica efetiva do Caso: ${mib(effective.accountedLimitMib)} · Trabalho: até ${mib(effective.workLiveMib)} · Seleção lógica: até ${mib(effective.selectionMib)}`));
     box.append(node("p", "muted small", `Materialização de evidências: ${mib(effective.materializedMib)} · Valores analíticos: ${mib(effective.analyticsMib)} · Lista completa de IDs: ${mib(effective.collectedIdsMib)} · Cache de seleção: ${mib(effective.selectionCacheMib)}`));
     box.append(node("p", "muted small", `As revisões deste Caso compartilham a cota enquanto houver consumidores. Limites agregados do aplicativo: trabalho ${mib(effective.applicationWorkMib)} e seleções lógicas ${mib(effective.applicationSelectionMib)}. A soma contabilizada não representa memória física.`));
-    if (caseStatus.clamped) box.append(node("p", "update-warn", "A cota salva ultrapassa o limite deste aplicativo e foi reduzida para a execução nesta máquina. A preferência original foi preservada."));
+    if (caseStatus.preferences.workLimitMib != null) box.append(node("p", "muted small", `Preferência salva do Caso: ${mib(caseStatus.preferences.workLimitMib)}. O valor efetivo acima respeita os pools globais e a máquina atual.`));
+    if (caseStatus.clamped) box.append(node("p", "update-warn", "A preferência salva excede os pools globais efetivos ou a memória desta máquina. A execução usa a cota efetiva mostrada acima; o valor salvo foi preservado. Aumentar esta cota não amplia os motores nem os limites individuais."));
     const form = node("form"); form.noValidate = true;
     const mode = node("select"); mode.id = "case-resource-mode"; mode.disabled = caseSaving;
     for (const [value, label] of [["inherit", "Herdar limites do aplicativo"], ["custom", "Cota deste Caso"]]) { const option = node("option", "", label); option.value = value; mode.append(option); }
@@ -87,7 +88,7 @@ window.ResourceSettings = (() => {
     work.oninput = () => { caseDraft.work = work.value; caseMessage = "Alterações deste Caso ainda não salvas."; feedback.textContent = caseMessage; };
     const feedback = node("p", caseFailed ? "update-error" : "muted small", caseMessage); feedback.id = "case-resource-feedback"; feedback.setAttribute("role", "status"); feedback.setAttribute("aria-live", "polite");
     work.setAttribute("aria-describedby", feedback.id);
-    form.append(field("Modo do Caso", mode), field("Volume lógico contabilizado (MiB)", work), node("p", "muted small", `Entre 8 e ${caseStatus.maximumWorkMib} MiB. Herdar mantém os limites individuais do aplicativo. Uma cota própria pode apenas restringi-los; não reserva RAM.`));
+    form.append(field("Modo do Caso", mode), field("Volume lógico contabilizado (MiB)", work), node("p", "muted small", `Entre 8 e ${caseStatus.maximumWorkMib} MiB. Herdar mantém os limites individuais do aplicativo. O máximo configurável acompanha a memória total detectada. A cota efetiva fica limitada aos pools globais, atualmente até ${mib(caseStatus.maximumEffectiveWorkMib ?? Math.min(caseStatus.maximumWorkMib, effective.applicationWorkMib + effective.applicationSelectionMib))}. O orçamento de memória do aplicativo pode ser ajustado abaixo para o próximo início, mas esta cota não amplia limites individuais nem reserva RAM.`));
     const actions = node("div", "modal-actions");
     const discard = button("Descartar alterações do Caso", () => { resetCaseDraft(); caseMessage = ""; render(); }); discard.disabled = caseSaving;
     const submit = button(caseSaving ? "Salvando Caso…" : "Salvar recursos deste Caso", () => {}, "btn primary small"); submit.type = "submit"; submit.id = "case-resource-save"; submit.disabled = caseSaving;
@@ -106,7 +107,7 @@ window.ResourceSettings = (() => {
     const parallelismLimit = parallelismPreference(parallelism, maximumParallelism);
     if (mode === "automatic") return { schemaVersion: 1, mode, memoryLimitMib: null, parallelismLimit };
     const value = Number(text);
-    if (mode !== "custom" || !/^[1-9]\d*$/.test(String(text)) || !Number.isSafeInteger(value) || value < 128 || value > maximum) {
+    if (mode !== "custom" || !/^[1-9]\d*$/.test(String(text)) || !Number.isSafeInteger(value) || value < 128 || !Number.isSafeInteger(maximum) || value > maximum) {
       throw Error(`Informe um orçamento inteiro entre 128 e ${maximum} MiB.`);
     }
     return { schemaVersion: 1, mode, memoryLimitMib: value, parallelismLimit };
@@ -170,8 +171,8 @@ window.ResourceSettings = (() => {
     }
     const active = status.active;
     const summary = node("div", "ui-pref");
-    summary.append(node("strong", "", "Padrões do aplicativo nesta sessão"));
-    summary.append(node("p", "", `Orçamento de referência ativo: ${mib(active.memoryBudgetMib)} · Memória detectada: ${mib(active.memoryAvailableMib)}`));
+    summary.append(node("strong", "", "Orçamento de memória do aplicativo nesta sessão"));
+    summary.append(node("p", "", `Orçamento de referência ativo: ${mib(active.memoryBudgetMib)} · Memória total detectada: ${mib(active.memoryAvailableMib)}`));
     summary.append(node("p", "muted small", "Os buffers e o cache são usados sob demanda. Este orçamento não reserva RAM e não é um teto de memória total do aplicativo: arquivos mapeados, metadados, bibliotecas e sessões simultâneas podem usar memória adicional."));
     summary.append(node("p", "muted small", `DuckDB: ${mib(active.duckdbPerInstanceMib)} por instância · Índice textual: ${mib(active.textIndexMib)} · Cache de seleções: ${mib(active.selectionCacheMib)}`));
     summary.append(node("p", "muted small", `Paralelismo global ativo: ${active.globalParallelism} unidades de trabalho CPU gerenciado. Parsers: até ${active.parserThreads} trabalhadores · SQL: até ${active.queryThreadsPerSession} por sessão · Índice textual: até ${active.textThreads}, sujeitos à admissão compartilhada.`));
@@ -179,6 +180,7 @@ window.ResourceSettings = (() => {
     if (active.conservativeBuilder) summary.append(node("p", "muted small", "Preparação em modo conservador: um gravador e lotes menores."));
     if (active.environmentOverrideMib != null) summary.append(node("p", "update-warn", `LOGINSIGHT_MEMORY_LIMIT_MB tem prioridade sobre a preferência salva (${mib(active.environmentOverrideMib)}, sujeito ao teto da máquina). Enquanto essa variável estiver definida, reiniciar mantém a prioridade dela.`));
     if (active.invalidEnvironmentOverride) summary.append(node("p", "update-warn", "LOGINSIGHT_MEMORY_LIMIT_MB é inválido e foi ignorado nesta sessão."));
+    if (active.memoryBudgetMib >= status.maximumMemoryMib) summary.append(node("p", "update-warn", "O orçamento ativo usa o total de memória detectada. Outras alocações do aplicativo e do sistema continuam precisando de RAM; pode haver lentidão ou encerramento por falta de memória."));
     if (status.activePreferences.mode === "custom" && status.activePreferences.memoryLimitMib > status.maximumMemoryMib) {
       summary.append(node("p", "update-warn", "A preferência foi criada para uma máquina com mais memória. O valor ativo foi reduzido ao teto desta máquina."));
     }
@@ -187,7 +189,7 @@ window.ResourceSettings = (() => {
     pane.append(summary);
 
     const form = node("form", "ui-pref"); form.noValidate = true;
-    form.append(node("strong", "", "Padrões do aplicativo para o próximo início"));
+    form.append(node("strong", "", "Orçamento de memória do aplicativo para o próximo início"));
     const mode = node("select"); mode.id = "resource-memory-mode";
     for (const [value, label] of [["automatic", "Automático (recomendado)"], ["custom", "Personalizado"]]) {
       const option = node("option", "", label); option.value = value; mode.append(option);
@@ -197,14 +199,21 @@ window.ResourceSettings = (() => {
     const memory = node("input"); memory.id = "resource-memory-limit"; memory.type = "number";
     memory.min = String(status.minimumMemoryMib); memory.max = String(status.maximumMemoryMib); memory.step = "1";
     memory.value = draft.memory; memory.disabled = saving || draft.mode !== "custom";
-    memory.setAttribute("aria-describedby", "resource-memory-help resource-settings-feedback");
+    memory.setAttribute("aria-describedby", "resource-memory-help resource-memory-warning resource-settings-feedback");
     memory.oninput = () => {
       draft.memory = memory.value; notice(""); feedback.className = "muted small";
-      feedback.textContent = "Alterações ainda não salvas."; discard.disabled = !changed();
+      feedback.textContent = "Alterações ainda não salvas."; discard.disabled = !changed(); updateMemoryWarning();
     };
-    const help = node("p", "muted small", `Entre ${status.minimumMemoryMib} e ${status.maximumMemoryMib} MiB. Automático adapta o orçamento à memória detectada. As mudanças só valem após fechar e abrir o aplicativo; as consultas atuais continuam com os valores desta sessão.`);
+    const warning = node("p", "update-warn"); warning.id = "resource-memory-warning"; warning.setAttribute("aria-live", "polite");
+    const updateMemoryWarning = () => {
+      warning.textContent = draft.mode === "custom" && Number(draft.memory) >= status.maximumMemoryMib
+        ? "Usar toda a memória detectada não deixa folga neste orçamento para o sistema e outras alocações. Pode causar lentidão ou encerramento por falta de memória. A escolha é permitida; o valor não reserva RAM nem limita o consumo total do aplicativo."
+        : "";
+    };
+    updateMemoryWarning();
+    const help = node("p", "muted small", `Entre ${status.minimumMemoryMib} e ${status.maximumMemoryMib} MiB. O máximo corresponde à memória total detectada, respeitando o limite do contêiner quando houver; não é a RAM livre. Automático mantém folga para o sistema e outras alocações. As mudanças só valem após fechar e abrir o aplicativo; as consultas atuais continuam com os valores desta sessão.`);
     help.id = "resource-memory-help";
-    form.append(field("Modo de memória", mode), field("Orçamento personalizado de processamento (MiB)", memory), help);
+    form.append(field("Modo de memória", mode), field("Orçamento personalizado de processamento (MiB)", memory), help, warning);
     const parallelismMode = node("select"); parallelismMode.id = "resource-parallelism-mode"; parallelismMode.disabled = saving;
     for (const [value, label] of [["automatic", "Automático (recomendado)"], ["custom", "Limite personalizado"]]) {
       const option = node("option", "", label); option.value = value; parallelismMode.append(option);

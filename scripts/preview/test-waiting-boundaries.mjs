@@ -1,6 +1,6 @@
 /* CI-only rendered regression for the five EXISTING WaitingVisuals families.
    Run: node scripts/preview/run-smoke.mjs test-waiting-boundaries.mjs
-   Synthetic receipts select modes; all animation boundaries run at natural speed.
+   Synthetic receipts select eligibility; every boundary runs at natural speed.
    Screenshots/JSON are evidence, not a native engine or installed WebView claim. */
 import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -9,19 +9,19 @@ import { launchBrowser } from './browser.mjs';
 import { captureFailure } from './diagnostics.mjs';
 
 const definitions = [
-  { family: 'reading', phaseId: 'metadata-scan', cycleMs: 7200, workCount: 17 },
-  { family: 'checkpoint', phaseId: 'metadata-checkpoint-sync', cycleMs: 6800, workCount: 8 },
-  { family: 'calculation', phaseId: 'command:aggregate_events', cycleMs: 6400, workCount: 11 },
-  { family: 'composition', phaseId: 'command:case_report_render', cycleMs: 7600, workCount: 11 },
-  { family: 'verification', phaseId: 'metadata-validate', cycleMs: 9600, workCount: 7 },
+  { family: 'reading', phaseId: 'metadata-scan', gestureMs: 2400, cycleMs: 7200, workCount: 17 },
+  { family: 'checkpoint', phaseId: 'metadata-checkpoint-sync', gestureMs: 2800, cycleMs: 6800, workCount: 8 },
+  { family: 'calculation', phaseId: 'command:aggregate_events', gestureMs: 2600, cycleMs: 6400, workCount: 11 },
+  { family: 'composition', phaseId: 'command:case_report_render', gestureMs: 2800, cycleMs: 7600, workCount: 11 },
+  { family: 'verification', phaseId: 'metadata-validate', gestureMs: 2600, cycleMs: 9600, workCount: 7 },
 ];
 const output = resolve('output/playwright'); mkdirSync(output, { recursive: true });
 const started = Date.now(), errors = [];
 const results = {
-  evidence: { component: 'Production WaitingVisuals SVG/CSS/controller', receipts: 'Explicitly synthetic mode/eligibility fixtures',
-    timing: 'Natural browser time, trusted CSS animationiteration, no seeks or speed overrides',
+  evidence: { component: 'Production WaitingVisuals SVG/CSS/controller', receipts: 'Explicitly synthetic eligibility fixtures',
+    timing: 'Natural browser time, trusted CSS animationend/animationiteration, no seeks or speed overrides',
     nativeEngineVerified: false, installedWebViewVerified: false, videoRequired: false },
-  timingBudget: { expectedNaturalMs: [30000, 45000], runnerTimeoutMs: 120000 },
+  timingBudget: { expectedNaturalMs: [40000, 65000], runnerTimeoutMs: 120000 },
   sourceCommit: process.env.GITHUB_SHA || null, screenshots: [],
 };
 let browser, context, page, phase = 'startup';
@@ -56,44 +56,67 @@ async function mountFixture(batch) {
       }
       if (reactionSeed === undefined) throw Error(`No review seed for ${definition.family}`);
       const view = WaitingVisuals.mount(host, receipt, { reactionSeed }), root = view.element;
-      const entry = { definition, initialFamily: definition.family, receipt, view, reactionSeed,
-        initialSvg: root.querySelector('svg'), firstBoundary: null, afterBoundary: null, boundaryEvents: [], phaseChange: null };
-      // Include every work joint/prop and the separate controller clock. Never
-      // substitute just the front arm for the rest of the rig.
+      const entry = { definition, receipt, view, initialSvg: root.querySelector('svg'), gestureEnd: null,
+        firstBoundary: null, afterBoundary: null, boundaryEvents: [], phaseChange: null, familyApplied: null, returnEvents: [] };
+      // Include every work joint/prop and the separate finite/loop controller clock.
       entry.animations = () => [...root.querySelector('.wv-work').getAnimations({ subtree: true }),
         ...root.querySelector('.wv-work-boundary').getAnimations()];
       entry.read = () => ({ family: root.dataset.family, pace: root.dataset.pace, motion: root.dataset.motion,
         episode: root.dataset.episode, adapter: root.dataset.adapter, cycle: view.inspect().cycle,
         metric: root.querySelector('.wv-metric').textContent, tracks: sample(entry.animations()) });
-      entry.beginLoop = () => {
-        const before = entry.animations();
-        view.update({ ...entry.receipt, elapsedMs: 60000 });
-        entry.loopTracks = entry.animations(); entry.loopSvg = root.querySelector('svg');
-        entry.loopStart = { ...entry.read(), stableSvg: entry.loopSvg === entry.initialSvg,
-          freshIdentities: entry.loopTracks.every(animation => !before.includes(animation)) };
-      };
-      // Capture before the product's bubbling handler pauses work for a reaction.
+      const pose = () => entry.animations().filter(a => a.effect.target instanceof SVGElement).map(a => {
+        const node = a.effect.target, matrix = node.getScreenCTM(), style = getComputedStyle(node);
+        return { name: a.animationName, target: node.getAttribute('class'), opacity: Number(style.opacity), transform: style.transform,
+          screenMatrix: matrix ? [matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f] : null };
+      });
+      // Capture before the product's bubbling handler changes the pace or family.
       // isTrusted rejects manufactured events; no event is dispatched by this test.
+      root.addEventListener('animationend', event => {
+        if (event.animationName === 'wv-gesture-boundary' && event.target === root.querySelector('.wv-work-boundary') && !entry.gestureEnd) {
+          entry.gestureEnd = { ...entry.read(), elapsedTime: event.elapsedTime, isTrusted: event.isTrusted,
+            stableSvg: root.querySelector('svg') === entry.initialSvg,
+            stableTracks: entry.animations().length === entry.gestureTracks.length && entry.animations().every(a => entry.gestureTracks.includes(a)),
+            endpointPose: pose() };
+        }
+        if (['wv-episode-boundary', 'wv-resume-boundary'].includes(event.animationName))
+          entry.returnEvents.push({ name: event.animationName, isTrusted: event.isTrusted, family: root.dataset.family,
+            episode: root.dataset.episode, adapter: root.dataset.adapter, elapsedTime: event.elapsedTime });
+      }, true);
       root.addEventListener('animationiteration', event => {
         if (event.animationName !== 'wv-work-boundary') return;
         const isCurrentClock = event.target === root.querySelector('.wv-work-boundary');
         entry.boundaryEvents.push({ isTrusted: event.isTrusted, isCurrentClock, family: root.dataset.family, elapsedTime: event.elapsedTime });
         if (entry.firstBoundary || !isCurrentClock) return;
         entry.firstBoundary = { ...entry.read(), elapsedTime: event.elapsedTime, isTrusted: event.isTrusted,
-          stableSvg: root.querySelector('svg') === entry.loopSvg,
+          stableSvg: root.querySelector('svg') === entry.initialSvg,
           stableTracks: entry.animations().length === entry.loopTracks.length && entry.animations().every(a => entry.loopTracks.includes(a)),
-          endpointPose: entry.animations().filter(a => a.effect.target instanceof SVGElement).map(a => {
-            const node = a.effect.target, matrix = node.getScreenCTM(), style = getComputedStyle(node);
-            return { name: a.animationName, target: node.getAttribute('class'), opacity: Number(style.opacity), transform: style.transform,
-              screenMatrix: matrix ? [matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f] : null };
-          }) };
+          endpointPose: pose() };
       }, true);
       entry.observer = new MutationObserver(() => {
-        if (entry.firstBoundary && !entry.afterBoundary && root.dataset.episode !== 'work') {
-          entry.afterBoundary = { family: root.dataset.family, episode: root.dataset.episode, adapter: root.dataset.adapter, cycle: view.inspect().cycle };
+        if (!entry.loopStart && root.dataset.pace === 'loop') {
+          entry.loopTracks = entry.animations();
+          entry.loopStart = { ...entry.read(), stableSvg: root.querySelector('svg') === entry.initialSvg,
+            freshIdentities: entry.loopTracks.every(animation => !entry.gestureTracks.includes(animation)) };
         }
+        if (entry.firstBoundary && !entry.afterBoundary && root.dataset.episode !== 'work')
+          entry.afterBoundary = { family: root.dataset.family, episode: root.dataset.episode, adapter: root.dataset.adapter, cycle: view.inspect().cycle };
+        if (entry.phaseChange && !entry.familyApplied && root.dataset.family === entry.phaseChange.nextFamily)
+          entry.familyApplied = { ...entry.read(), replacedSvg: root.querySelector('svg') !== entry.initialSvg,
+            oldClockDetached: !entry.oldClock.effect.target.isConnected,
+            freshIdentities: entry.animations().every(a => !entry.previousTracks.includes(a)), returnEvents: [...entry.returnEvents] };
       });
-      entry.observer.observe(root, { attributes: true, attributeFilter: ['data-episode', 'data-adapter'] });
+      entry.observer.observe(root, { attributes: true, attributeFilter: ['data-pace', 'data-family', 'data-episode', 'data-adapter'] });
+      entry.changeFamily = () => {
+        const next = definitions[(index + 1) % definitions.length], before = entry.read();
+        entry.previousTracks = entry.animations(); entry.oldClock = entry.previousTracks.find(a => a.animationName === 'wv-work-boundary');
+        const remainingMs = definition.cycleMs - Number(entry.oldClock.currentTime) % definition.cycleMs;
+        entry.receipt = { ...entry.receipt, phaseId: next.phaseId, elapsedMs: 60000, label: `Fixture sintético: ${next.family}` };
+        view.update(entry.receipt);
+        entry.phaseChange = { nextFamily: next.family, remainingMs, before, after: entry.read(),
+          stableSvg: root.querySelector('svg') === entry.initialSvg,
+          stableTracks: entry.animations().length === entry.previousTracks.length && entry.animations().every(a => entry.previousTracks.includes(a)),
+          hadNoBoundary: entry.firstBoundary === null };
+      };
       return entry;
     });
     fixture.changeCheckpointPhaseNearBoundary = () => {
@@ -102,14 +125,12 @@ async function mountFixture(batch) {
         const beforeTracks = entry.animations(), clock = beforeTracks.find(a => a.animationName === 'wv-work-boundary');
         const remainingMs = entry.definition.cycleMs - clock.currentTime;
         if (remainingMs > 600) { fixture.raf = requestAnimationFrame(tick); return; }
-        const before = entry.read(), svg = entry.loopSvg, root = entry.view.element;
-        const beforeStatus = root.querySelector('.wv-status').textContent;
-        entry.receipt = { ...entry.receipt, phaseId: 'metadata-checkpoint-write', elapsedMs: 60000,
-          label: 'Fixture sintético: guardando checkpoint' };
+        const before = entry.read(), root = entry.view.element, beforeStatus = root.querySelector('.wv-status').textContent;
+        entry.receipt = { ...entry.receipt, phaseId: 'metadata-checkpoint-write', elapsedMs: 60000, label: 'Fixture sintético: guardando checkpoint' };
         entry.view.update(entry.receipt);
         entry.sameFamilyChange = { fromPhase: 'metadata-checkpoint-sync', toPhase: entry.receipt.phaseId,
           remainingMs, before, after: entry.read(), beforeStatus, afterStatus: root.querySelector('.wv-status').textContent,
-          stableSvg: root.querySelector('svg') === svg,
+          stableSvg: root.querySelector('svg') === entry.initialSvg,
           stableTracks: entry.animations().length === beforeTracks.length && entry.animations().every(a => beforeTracks.includes(a)),
           hadNoBoundary: entry.firstBoundary === null, history: entry.view.inspect().history };
       };
@@ -117,20 +138,10 @@ async function mountFixture(batch) {
     };
     fixture.changePhasesNearBoundary = () => {
       const tick = () => {
-        for (const [index, entry] of fixture.entries.entries()) {
+        for (const entry of fixture.entries) {
           if (entry.phaseChange) continue;
           const clock = entry.animations().find(a => a.animationName === 'wv-work-boundary');
-          const remainingMs = entry.definition.cycleMs - clock.currentTime;
-          if (remainingMs > 600) continue;
-          const next = definitions[(index + 1) % definitions.length], oldSvg = entry.loopSvg, oldClock = clock;
-          const before = entry.read(), previousTracks = entry.animations();
-          entry.receipt = { ...entry.receipt, phaseId: next.phaseId, elapsedMs: 60000, label: `Fixture sintético: ${next.family}` };
-          entry.view.update(entry.receipt); entry.definition = next;
-          entry.loopSvg = entry.view.element.querySelector('svg'); entry.loopTracks = entry.animations();
-          entry.phaseChange = { initialFamily: entry.initialFamily, nextFamily: next.family, remainingMs, before,
-            after: entry.read(), hadNoBoundary: entry.firstBoundary === null,
-            replacedSvg: oldSvg !== entry.loopSvg, oldClockDetached: !oldClock.effect.target.isConnected,
-            freshIdentities: entry.loopTracks.every(a => !previousTracks.includes(a)) };
+          if (entry.definition.cycleMs - clock.currentTime <= 600) entry.changeFamily();
         }
         if (fixture.entries.some(entry => !entry.phaseChange)) fixture.raf = requestAnimationFrame(tick);
       };
@@ -138,6 +149,7 @@ async function mountFixture(batch) {
     };
   }, { definitions, batch });
   await page.waitForFunction(() => __boundaryPreview.entries.every(e => e.view.element.dataset.motion === 'running'));
+  await page.evaluate(() => __boundaryPreview.entries.forEach(e => { e.gestureTracks = e.animations(); }));
 }
 async function settle() {
   await page.evaluate(async () => {
@@ -174,10 +186,26 @@ function assertRig(sample, definition) {
     }
   }
 }
-async function collectBoundaries() {
-  await page.waitForFunction(() => __boundaryPreview.entries.every(e => e.afterBoundary), null, { timeout: 22000 });
-  const entries = await page.evaluate(() => __boundaryPreview.entries.map(e => ({ initialFamily: e.initialFamily, definition: e.definition,
-    loopStart: e.loopStart, firstBoundary: e.firstBoundary, afterBoundary: e.afterBoundary, phaseChange: e.phaseChange, sameFamilyChange: e.sameFamilyChange, boundaryEvents: e.boundaryEvents })));
+async function collectPromotions() {
+  await page.waitForFunction(() => __boundaryPreview.entries.every(e => e.gestureEnd && e.loopStart));
+  await settle();
+  const entries = await page.evaluate(() => __boundaryPreview.entries.map(e => ({ definition: e.definition, gestureEnd: e.gestureEnd, loopStart: e.loopStart, settled: e.read() })));
+  for (const { definition, gestureEnd, loopStart, settled } of entries) {
+    assert.equal(gestureEnd.isTrusted, true); assert.equal(gestureEnd.elapsedTime * 1000, definition.gestureMs);
+    assert.ok(gestureEnd.stableSvg && gestureEnd.stableTracks); assert.equal(gestureEnd.pace, 'gesture');
+    assert.ok(gestureEnd.tracks.length > 1 && gestureEnd.tracks.every(t => t.durationMs === definition.gestureMs && t.iterations === '1' && t.playbackRate === 1));
+    assert.ok(gestureEnd.tracks.every(t => Math.abs(t.currentTime - definition.gestureMs) < 1));
+    assert.ok(gestureEnd.endpointPose.every(p => p.screenMatrix?.length === 6 && p.screenMatrix.every(Number.isFinite)));
+    assert.equal(loopStart.pace, 'loop'); assert.ok(loopStart.stableSvg && loopStart.freshIdentities); assert.equal(loopStart.cycle, 0);
+    assertRig(settled, definition);
+  }
+  return entries;
+}
+async function collectBoundaries(expectReview = true) {
+  await page.waitForFunction(review => __boundaryPreview.entries.every(e => review ? e.afterBoundary : e.familyApplied), expectReview, { timeout: 22000 });
+  const entries = await page.evaluate(() => __boundaryPreview.entries.map(e => ({ definition: e.definition,
+    firstBoundary: e.firstBoundary, afterBoundary: e.afterBoundary, phaseChange: e.phaseChange, familyApplied: e.familyApplied,
+    sameFamilyChange: e.sameFamilyChange, boundaryEvents: e.boundaryEvents })));
   for (const entry of entries) {
     const sample = entry.firstBoundary;
     assertRig(sample, entry.definition); assert.equal(sample.isTrusted, true);
@@ -187,8 +215,10 @@ async function collectBoundaries() {
     assert.equal(sample.cycle, 0); assert.equal(sample.episode, 'work');
     assert.equal(sample.elapsedTime * 1000, entry.definition.cycleMs, 'the FIRST real iteration, never a later boundary');
     assert.ok(sample.tracks.every(t => Math.abs(t.currentTime - entry.definition.cycleMs) < 300), 'every work track reaches its first complete loop');
-    assert.equal(entry.afterBoundary.cycle, 1); assert.equal(entry.afterBoundary.episode, 'review');
-    assert.equal(entry.afterBoundary.adapter, ['calculation', 'composition'].includes(entry.definition.family) ? 'prepare' : 'react');
+    if (expectReview) {
+      assert.equal(entry.afterBoundary.cycle, 1); assert.equal(entry.afterBoundary.episode, 'review');
+      assert.equal(entry.afterBoundary.adapter, ['calculation', 'composition'].includes(entry.definition.family) ? 'prepare' : 'react');
+    }
     assert.equal(entry.boundaryEvents.length, 1); assert.ok(entry.boundaryEvents.every(e => e.isTrusted && e.isCurrentClock));
   }
   return entries;
@@ -201,20 +231,16 @@ try {
   await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && state.loaded && state.rows.length > 0 && !state.loadOverlay);
   await page.waitForFunction(() => Tasks.pending() === 0);
   results.applicationBefore = await page.evaluate(() => ({ rows: state.rows.length, loaded: state.loaded }));
-  phase = 'finished gesture to loop, all five families'; await mountFixture('finished');
-  await page.waitForFunction(() => __boundaryPreview.entries.every(e => e.animations().length > 0 && e.animations().every(a => a.playState === 'finished')));
-  results.finishedGestures = await states();
-  assert.ok(results.finishedGestures.every(s => s.pace === 'gesture' && s.cycle === 0 && !s.tracks.some(t => t.name === 'wv-work-boundary')));
-  await snap('waiting-boundaries-finished-gestures.png');
-  await page.evaluate(() => __boundaryPreview.entries.forEach(e => e.beginLoop())); await settle();
-  results.loopStart = await page.evaluate(() => __boundaryPreview.entries.map(e => e.loopStart));
-  assert.ok(results.loopStart.every(s => s.stableSvg && s.freshIdentities));
+  phase = 'quiet gestures promote at their own endpoints'; await mountFixture('quiet');
+  results.quietPromotions = await collectPromotions();
+  await snap('waiting-boundaries-auto-promotions.png');
+  await page.evaluate(() => __boundaryPreview.entries.forEach(e => { e.receipt = { ...e.receipt, elapsedMs: 60000 }; e.view.update(e.receipt); }));
   phase = 'real pause and resume before the first natural boundary'; results.pause = await pauseAndResume();
   for (const [index, sample] of results.pause.resumed.entries()) assertRig(sample, definitions[index]);
   await page.evaluate(() => __boundaryPreview.changeCheckpointPhaseNearBoundary());
   phase = 'first natural boundary across every work track'; results.firstBoundaries = await collectBoundaries();
-  results.sameFamilyChange = results.firstBoundaries.find(e => e.definition.family === 'checkpoint').sameFamilyChange;
-  const same = results.sameFamilyChange;
+  const same = results.firstBoundaries.find(e => e.definition.family === 'checkpoint').sameFamilyChange;
+  results.sameFamilyChange = same;
   assert.ok(same.remainingMs > 0 && same.remainingMs <= 600);
   assert.equal(same.fromPhase, 'metadata-checkpoint-sync'); assert.equal(same.toPhase, 'metadata-checkpoint-write');
   assert.notEqual(same.afterStatus, same.beforeStatus); assert.equal(same.afterStatus, 'Fixture sintético: guardando checkpoint');
@@ -224,22 +250,47 @@ try {
   assert.deepEqual(same.after.tracks, same.before.tracks, 'same-family phase receipt cannot reset any work identity, origin or clock');
   await snap('waiting-boundaries-first-review.png');
 
-  phase = 'active gesture to loop followed by phase change near the first boundary'; await mountFixture('interrupted');
-  await page.waitForFunction(() => __boundaryPreview.entries.every(e => e.animations().every(a => a.currentTime >= 700 && a.playState === 'running')));
-  results.activeGestures = await states();
-  assert.ok(results.activeGestures.every(s => s.pace === 'gesture' && !s.tracks.some(t => t.name === 'wv-work-boundary')));
-  await page.evaluate(() => { __boundaryPreview.entries.forEach(e => e.beginLoop()); __boundaryPreview.changePhasesNearBoundary(); });
-  await settle();
-  results.activeLoopStart = await page.evaluate(() => __boundaryPreview.entries.map(e => e.loopStart));
-  assert.ok(results.activeLoopStart.every(s => s.stableSvg && s.freshIdentities));
-  results.phaseBoundaries = await collectBoundaries();
-  for (const { phaseChange } of results.phaseBoundaries) {
-    assert.ok(phaseChange.remainingMs > 0 && phaseChange.remainingMs <= 600, 'phase changes within the final 600ms BEFORE the old boundary');
-    assert.equal(phaseChange.before.cycle, 0); assert.equal(phaseChange.before.episode, 'work');
-    assert.equal(phaseChange.after.cycle, 0); assert.equal(phaseChange.after.episode, 'work');
-    assert.ok(phaseChange.hadNoBoundary && phaseChange.replacedSvg && phaseChange.oldClockDetached && phaseChange.freshIdentities);
+  phase = 'family changes preserve the full reaction and return';
+  await page.evaluate(() => __boundaryPreview.entries.forEach(e => e.changeFamily()));
+  results.reactionChanges = await page.evaluate(() => __boundaryPreview.entries.map(e => e.phaseChange));
+  for (const change of results.reactionChanges) {
+    assert.ok(change.stableSvg && change.stableTracks);
+    assert.equal(change.after.family, change.before.family); assert.equal(change.after.episode, 'review');
+    assert.equal(change.after.adapter, change.before.adapter); assert.deepEqual(change.after.tracks, change.before.tracks);
   }
-  await snap('waiting-boundaries-new-phase-review.png');
+  await page.waitForFunction(() => __boundaryPreview.entries.every(e => e.familyApplied), null, { timeout: 20000 });
+  results.reactionReturns = await page.evaluate(() => __boundaryPreview.entries.map(e => ({ definition: e.definition, applied: e.familyApplied })));
+  for (const { definition, applied } of results.reactionReturns) {
+    assert.ok(applied.replacedSvg && applied.oldClockDetached && applied.freshIdentities); assert.equal(applied.episode, 'work');
+    const names = ['calculation', 'composition'].includes(definition.family) ? ['wv-episode-boundary', 'wv-resume-boundary'] : ['wv-episode-boundary'];
+    assert.deepEqual(applied.returnEvents.map(e => e.name), names);
+    assert.ok(applied.returnEvents.every(e => e.isTrusted && e.family === definition.family && e.episode === 'review'));
+    assert.equal(applied.returnEvents[0].elapsedTime, 10, 'the whole review finishes before a pending family applies');
+  }
+
+  phase = 'aged receipts cannot cut active gestures'; await mountFixture('aged');
+  await page.waitForFunction(() => __boundaryPreview.entries.every(e => e.animations().every(a => a.currentTime >= 700 && a.playState === 'running')));
+  results.agedReceipts = await page.evaluate(() => __boundaryPreview.entries.map(e => {
+    const before = e.read(), tracks = e.animations(); e.receipt = { ...e.receipt, elapsedMs: 60000 }; e.view.update(e.receipt);
+    return { before, after: e.read(), stableSvg: e.view.element.querySelector('svg') === e.initialSvg,
+      stableTracks: e.animations().length === tracks.length && e.animations().every(a => tracks.includes(a)) };
+  }));
+  for (const sample of results.agedReceipts) {
+    assert.ok(sample.stableSvg && sample.stableTracks); assert.equal(sample.after.pace, 'gesture');
+    assert.deepEqual(sample.after.tracks, sample.before.tracks, 'crossing four seconds never cuts a running gesture');
+  }
+  results.agedPromotions = await collectPromotions();
+  await page.evaluate(() => __boundaryPreview.changePhasesNearBoundary());
+  phase = 'pending family waits for the old complete work cycle'; results.phaseBoundaries = await collectBoundaries(false);
+  for (const { phaseChange, familyApplied } of results.phaseBoundaries) {
+    assert.ok(phaseChange.remainingMs > 0 && phaseChange.remainingMs <= 600);
+    assert.ok(phaseChange.hadNoBoundary && phaseChange.stableSvg && phaseChange.stableTracks);
+    assert.equal(phaseChange.after.family, phaseChange.before.family);
+    assert.deepEqual(phaseChange.after.tracks, phaseChange.before.tracks, 'known family receipt cannot reset a running work rig');
+    assert.equal(familyApplied.family, phaseChange.nextFamily); assert.equal(familyApplied.episode, 'work');
+    assert.ok(familyApplied.replacedSvg && familyApplied.oldClockDetached && familyApplied.freshIdentities);
+  }
+  await snap('waiting-boundaries-deferred-phase.png');
   results.applicationAfter = await page.evaluate(() => ({ rows: state.rows.length, loaded: state.loaded }));
   assert.deepEqual(results.applicationAfter, results.applicationBefore); assert.deepEqual(errors, []);
   await page.evaluate(() => __boundaryPreview.destroy()); results.ok = true;

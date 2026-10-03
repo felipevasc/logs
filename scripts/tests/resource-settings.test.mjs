@@ -11,7 +11,7 @@ const automatic = { schemaVersion: 1, mode: "automatic", memoryLimitMib: null, p
 const snapshot = (saved = automatic) => ({
   active: { memoryAvailableMib: 8192, memoryBudgetMib: 2730, duckdbPerInstanceMib: 682, textIndexMib: 341, selectionCacheMib: 341,
     globalParallelism: 7, maximumParallelism: 8, parserThreads: 4, queryThreadsPerSession: 3, textThreads: 1, environmentOverrideMib: null, invalidEnvironmentOverride: false, conservativeBuilder: false },
-  activePreferences: automatic, saved, minimumMemoryMib: 128, maximumMemoryMib: 4096, maximumParallelism: 8,
+  activePreferences: automatic, saved, minimumMemoryMib: 128, maximumMemoryMib: 8192, maximumParallelism: 8,
   restartRequired: saved.mode !== "automatic" || saved.parallelismLimit != null, startupWarning: null, savedWarning: null,
 });
 
@@ -83,7 +83,7 @@ test("save is explicit, deduplicated and leaves dataset and active resources unc
 });
 test("failed save retains editable draft and can retry, invalid input sends nothing", async () => {
   const f = fixture(); await f.open(); f.edit("custom", "1"); f.submit();
-  assert.equal(f.requests.length, 1); assert.match(f.pane.textContent, /entre 128 e 4096/);
+  assert.equal(f.requests.length, 1); assert.match(f.pane.textContent, /entre 128 e 8192/);
   f.edit("custom", "256"); f.submit(); f.requests[1].reject(Error("disk full")); await tick();
   assert.match(f.pane.textContent, /disk full/); assert.equal(f.control("resource-memory-limit").value, "256");
   assert.equal(f.control("resource-memory-limit").disabled, false);
@@ -142,7 +142,7 @@ const caseStatus = (caseId, revision = 0, workLimitMib = null) => ({
   analysisContext: caseSnapshot(caseId, revision), preferences: { schemaVersion: 1, mode: workLimitMib == null ? "inherit" : "custom", workLimitMib },
   effective: { accountedLimitMib: workLimitMib ?? 1152, workLiveMib: Math.min(workLimitMib ?? 128, 128), selectionMib: workLimitMib ?? 1024,
     materializedMib: 64, analyticsMib: 32, collectedIdsMib: 32, selectionCacheMib: 128, applicationWorkMib: 128, applicationSelectionMib: 1024 },
-  minimumWorkMib: 8, maximumWorkMib: 1152, clamped: false,
+  minimumWorkMib: 8, maximumWorkMib: 8192, maximumEffectiveWorkMib: 1152, clamped: false,
 });
 function attachCases(f) {
   const saved = new Map([['a', caseSnapshot('a')], ['b', caseSnapshot('b')]]); let active = 'a';
@@ -219,4 +219,56 @@ test("parallelism-only save keeps active capacity until restart and discard rest
   f.submit(); assert.deepEqual(plain(f.requests[2].args.preferences), automatic);
   f.requests[2].resolve(snapshot()); await tick();
   assert.equal(f.control("resource-parallelism-limit").disabled, true);
+});
+
+
+test("large detected-memory limits are accepted with a non-blocking full-memory warning", async () => {
+  for (const maximum of [65536, 131072]) {
+    const f = fixture(), status = snapshot();
+    status.maximumMemoryMib = maximum; status.active.memoryAvailableMib = maximum;
+    await f.open(status);
+    assert.equal(f.control("resource-memory-limit").max, String(maximum));
+    f.edit("custom", String(maximum));
+    assert.match(f.control("resource-memory-warning").textContent, /A escolha é permitida/);
+    assert.match(f.pane.textContent, /não é a RAM livre/);
+    f.submit();
+    assert.equal(f.requests[1].args.preferences.memoryLimitMib, maximum);
+    const saved = { ...status, saved: f.requests[1].args.preferences, restartRequired: true };
+    f.requests[1].resolve(saved); await tick();
+    assert.equal(f.control("resource-memory-limit").value, String(maximum));
+    f.edit("custom", String(maximum + 1)); f.submit();
+    assert.equal(f.requests.length, 2, "only above-machine capacity must be rejected");
+    f.edit("custom", "512");
+    assert.equal(f.control("resource-memory-warning").textContent, "");
+    f.edit("automatic");
+    assert.equal(f.control("resource-memory-warning").textContent, "");
+  }
+});
+test("a moved 128 GiB preference is shown unchanged while active memory is clamped", async () => {
+  const saved = { ...automatic, mode: "custom", memoryLimitMib: 131072 };
+  const status = snapshot(saved); status.activePreferences = saved; status.restartRequired = false;
+  status.active.memoryBudgetMib = status.maximumMemoryMib;
+  const f = fixture(); await f.open(status);
+  assert.equal(f.control("resource-memory-limit").value, "131072");
+  assert.match(f.pane.textContent, /máquina com mais memória/);
+  assert.match(f.pane.textContent, /orçamento ativo usa o total/);
+  f.edit("custom", "8192"); f.submit();
+  assert.equal(f.requests[1].args.preferences.memoryLimitMib, 8192);
+});
+test("Case accepts a detected-memory-sized preference but clearly reports its effective component limits", async () => {
+  const f = fixture(); await f.open(); const cases = attachCases(f);
+  const status = caseStatus('a'); status.maximumWorkMib = 131072;
+  const opened = f.module.renderPane(f.pane); f.requests[1].resolve(status); await opened;
+  assert.equal(f.control('case-resource-work').max, '131072');
+  cases.edit('custom', '131072'); cases.submit();
+  assert.equal(f.requests[2].args.preferences.workLimitMib, 131072);
+  f.requests[2].resolve({ ...status, analysisContext: caseSnapshot('a', 1),
+    preferences: f.requests[2].args.preferences, clamped: true }); await tick();
+  assert.equal(f.control('case-resource-work').value, '131072');
+  assert.match(f.pane.textContent, /Preferência salva do Caso: 131\.072 MiB/);
+  assert.match(f.pane.textContent, /Cota lógica efetiva do Caso: 1\.152 MiB/);
+  assert.match(f.pane.textContent, /não amplia os motores/);
+  assert.match(f.pane.textContent, /orçamento de memória do aplicativo pode ser ajustado abaixo/);
+  cases.edit('custom', '131073'); cases.submit(); assert.equal(f.requests.length, 3);
+  assert.throws(() => f.module.casePreferences('custom', '65536'), 'a missing native maximum must fail closed');
 });

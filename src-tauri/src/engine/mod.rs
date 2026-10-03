@@ -398,7 +398,7 @@ fn spec(
             // rules. Old stores have no proof of this context and are rebuilt.
             hash.update(b"|timezone-configuration:");
             hash.update(part.calendar.timezone.as_bytes());
-            if matches!(part.format.as_str(), "syslog3164" | "firewall") {
+            if crate::sources::uses_inferred_calendar_year(&part.format) {
                 hash.update(format!("|inferred-year:{}", part.calendar.year));
             }
             if let Some(identity) = &part.event_identity {
@@ -2707,6 +2707,10 @@ mod metadata_identity_tests {
     /// Key without Java enrichment, optionally retaining the independent web
     /// parser revision. Tiny fixtures each have one segment.
     fn pre_java_key(idx: &FileIndex, include_web_revision: bool) -> String {
+        key_for_parser_revisions(idx, crate::index_cache::INDEX_DIR,
+            include_web_revision.then(|| crate::sources::parser_semantics_signature(&idx.parts[0].format)).flatten())
+    }
+    fn key_for_parser_revisions(idx: &FileIndex, index_version: &str, web_revision: Option<&str>) -> String {
         let part = &idx.parts[0];
         assert!(part.custom.is_none() && part.ts_config.is_none());
         let first_offset = idx.lines.at(0).offset - part.base;
@@ -2718,23 +2722,21 @@ mod metadata_identity_tests {
         let mut hash = Sha256::new();
         hash.update(format!(
             "{}|{}|{}|{}|{:?}|{custom}|{ts}|{tz}|{}|{first_offset}|{last_end}|{derived_sig}|{catalogs}|{:?}",
-            build::STORE_VERSION, crate::index_cache::INDEX_DIR, part.identity,
+            build::STORE_VERSION, index_version, part.identity,
             part.format, part.header, idx.lines.len(), part.physical_file_id
         ));
         hash.update(b"|timezone-configuration:");
         hash.update(part.calendar.timezone.as_bytes());
-        if matches!(part.format.as_str(), "syslog3164" | "firewall") {
+        if crate::sources::uses_inferred_calendar_year(&part.format) {
             hash.update(format!("|inferred-year:{}", part.calendar.year));
         }
         if let Some(identity) = &part.event_identity {
             hash.update(b"|logical-event-identity:");
             hash.update(serde_json::to_vec(identity).unwrap());
         }
-        if include_web_revision {
-            if let Some(revision) = crate::sources::parser_semantics_signature(&part.format) {
-                hash.update(b"|structured-parser:");
-                hash.update(revision.as_bytes());
-            }
+        if let Some(revision) = web_revision {
+            hash.update(b"|structured-parser:");
+            hash.update(revision.as_bytes());
         }
         format!("{:x}", hash.finalize())
     }
@@ -2793,6 +2795,12 @@ mod metadata_identity_tests {
             assert_eq!(actual.parts.len(), 1);
             assert_eq!(actual.parts[0].key != pre_java_key(&idx, false), affected, "{format}");
             assert_eq!(actual.parts[0].key, pre_java_key(&idx, true));
+            assert_ne!(actual.parts[0].key, key_for_parser_revisions(&idx, "indexes-v6",
+                affected.then_some("web-logs-v1")), "query expansion migration: {format}");
+            if affected {
+                assert_ne!(actual.parts[0].key, key_for_parser_revisions(&idx, crate::index_cache::INDEX_DIR,
+                    Some("web-logs-v1")), "wrapped parser migration: {format}");
+            }
             assert_eq!(idx.parts[0].identity, identity);
             assert_eq!(idx.parts[0].event_identity, logical_identity);
             assert_eq!(crate::sources::event_at(&idx, 0, &codes, &codes, &[]).event_ref, event_ref);
@@ -2826,6 +2834,9 @@ mod metadata_identity_tests {
         assert_ne!(actual, spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key);
         idx.parts[0].calendar.timezone = original_zone;
         idx.parts[0].calendar.year += 1;
+        // JSON can hold year-less syslog; the pinned year is parser context.
+        assert_ne!(actual, spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key);
+        idx.parts[0].calendar.year -= 1;
         assert_eq!(actual, spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key);
         idx.parts[0].event_identity = Some("stable-logical-source".into());
         assert_ne!(actual, spec(&idx, &codes, &codes, &[]).unwrap().parts[0].key);

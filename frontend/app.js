@@ -263,8 +263,10 @@ function hideLoadOverlay(ok = true) {
   state.loadOverlayOperationId = null;
   state.loadOverlayCancellable = false;
   state.loadOverlayCancelling = false;
-  // Work owns the lifetime, not the decorative animation cycle.
-  loadWaitingVisual?.destroy(); loadWaitingVisual = null;
+  // Release results/focus immediately; a visible successful gesture may finish inertly.
+  if (ok) loadWaitingVisual?.complete();
+  else loadWaitingVisual?.destroy();
+  loadWaitingVisual = null;
   loadWaitingReceipt = null;
   $("#load-overlay").hidden = true;
   if (restoreFocus) {

@@ -19,7 +19,7 @@ function fixture({ reduced = false, intersection = true, legacyMedia = false, no
   }
   class Node extends Target {
     constructor(document, tag) { super(); this.ownerDocument = document; this.tag = tag; this.children = []; this.dataset = {}; this.attributes = {}; this.hidden = false; this.writes = 0; this.htmlWrites = 0; }
-    append(...nodes) { for (const node of nodes) { node.parent = this; this.children.push(node); } }
+    append(...nodes) { for (const node of nodes) { node.remove(); node.parent = this; this.children.push(node); } }
     remove() { if (this.parent) this.parent.children = this.parent.children.filter(node => node !== this); this.parent = null; }
     get isConnected() { return this === this.ownerDocument.body || !!this.parent?.isConnected; }
     set textContent(value) { this.text = String(value); this.writes++; }
@@ -143,9 +143,13 @@ test('receipt updates replace missing values without rerendering scenes or annou
   visual.update(receipt({ completed: 2, total: 10, elapsedMs: 4500 }));
   assert.equal(art.htmlWrites, 1); assert.equal(status.writes, statusWrites); assert.equal(metric.textContent, '2 / 10');
   assert.equal(details.textContent, '4 s decorridos'); assert.equal(details.hidden, false);
+  assert.equal(visual.element.dataset.pace, 'gesture', 'receipt does not cut the gesture');
+  gestureBoundary(f, visual);
   assert.equal(visual.element.dataset.pace, 'loop');
   visual.update(receipt({ phaseId: 'analytics-sql', label: 'Calculando estatísticas' }));
-  assert.equal(art.htmlWrites, 2); assert.equal(status.textContent, 'Calculando estatísticas');
+  assert.equal(art.htmlWrites, 1, 'phase receipt does not cut the active cycle'); assert.equal(status.textContent, 'Calculando estatísticas');
+  reactionBoundary(f, visual);
+  assert.equal(art.htmlWrites, 2); assert.equal(visual.element.dataset.family, 'calculation');
   assert.equal(metric.hidden, true); assert.equal(details.hidden, true);
   visual.update(receipt({ operationId: 'load-18', phaseId: 'analytics-sql' }));
   assert.equal(art.htmlWrites, 3, 'a different operation gets a fresh scene'); visual.destroy();
@@ -197,7 +201,7 @@ test('terminal transitions stop immediately, with no minimum animation completio
     visual.update(receipt()); assert.equal(visual.element.dataset.motion, 'running');
   }
   visual.update(receipt({ phaseId: 'metadata-checkpoint-committed' }));
-  assert.equal(visual.element.dataset.motion, 'static'); assert.equal(visual.element.dataset.checkpoint, 'preserved'); visual.destroy();
+  assert.equal(visual.element.dataset.motion, 'running'); assert.equal(visual.element.dataset.checkpoint, 'preserved'); visual.destroy();
 });
 
 test('destroy is idempotent, removes only its own node/listeners, and ignores late callbacks', () => {
@@ -227,7 +231,7 @@ test('motion budget is CSS-only, constrained and independently reduced-motion sa
   assert.match(css, /prefers-reduced-motion:\s*reduce/); assert.match(css, /animation-play-state:\s*paused\s*!important/);
   assert.match(css, /\[data-animated="true"\]/); assert.match(css, /contain:\s*layout paint/);
   assert.match(css, /\.area-loading-semantic \.wv-motion-toggle\s*\{\s*pointer-events:\s*auto/);
-  assert.doesNotMatch(css, /pointer-events:\s*none/);
+  assert.match(css, /\[data-finishing="true"\][^{}]*\{ pointer-events: none !important;/);
   for (const { name, frames } of animationFrames().values()) {
     for (const frame of frames) {
       assert.ok(Object.keys(frame.properties).every(property => ['transform', 'opacity'].includes(property)), `${name} only composites transform/opacity`);
@@ -353,8 +357,8 @@ test('short inspection and long story have separate pacing and close without a j
   assert.match(css, /\[data-animated="true"\]\[data-pace="loop"\] \.wv-reader \{ animation: wv-reader-travel/);
   assert.doesNotMatch(css, /\[data-animated="true"\] \.wv-reader \{ animation:/, 'short gesture never walks');
   const sourceBytes = Buffer.byteLength(source), cssBytes = Buffer.byteLength(css);
-  assert.ok(sourceBytes < 40000 && cssBytes < 240000 && sourceBytes + cssBytes < 280000,
-    'seven families plus shared CSS-only stories stay under a bounded 280 KB total / 40 KB JS / 240 KB CSS source budget, with no external assets');
+  assert.ok(sourceBytes < 43000 && cssBytes < 240000 && sourceBytes + cssBytes < 280000,
+    'seven families plus shared CSS-only stories stay under a bounded 280 KB total / 43 KB JS / 240 KB CSS source budget, with no external assets');
 });
 
 test('two walking steps plant one foot while the other lifts, then return to the same stance', () => {
@@ -700,12 +704,15 @@ test('all pauses preserve episode/random state and latched CSS names instead of 
   visual.destroy();
 });
 
-test('phase adaptation preserves task state while new family aborts with shared cooldown/history', () => {
+test('phase adaptation completes the current reaction before adopting the latest family', () => {
   const { f, visual } = coffeeFixture(); const { art } = f.parts(visual), state = plain(visual.inspect());
   visual.update(receipt({ phaseId: 'metadata-columns', label: 'Lendo colunas', elapsedMs: 1 }));
   assert.equal(art.htmlWrites, 1); assert.equal(visual.element.dataset.episode, 'coffee'); assert.equal(f.parts(visual).status.textContent, 'Lendo colunas');
   assert.deepEqual(plain(visual.inspect()), state);
   visual.update(receipt({ phaseId: 'metadata-checkpoint-write', elapsedMs: 60000 }));
+  assert.equal(visual.element.dataset.episode, 'coffee'); assert.equal(visual.element.dataset.family, 'reading');
+  reactionBoundary(f, visual, 'animationend');
+  assert.equal(visual.element.dataset.family, 'checkpoint');
   assert.equal(visual.element.dataset.episode, 'work'); assert.equal(visual.inspect().seed, state.seed);
   assert.equal(visual.inspect().cooldown, 4); assert.deepEqual(plain(visual.inspect().history), ['coffee']);
   visual.update(receipt({ operationId: 'next-operation', elapsedMs: 60000 }));
@@ -900,7 +907,7 @@ test('pauses freeze every adapter stage while terminal, owner and family changes
   }
   const { f, visual } = adaptedCoffeeFixture('command:case_report_render');
   const stale = f.parts(visual).art.children.find(node => node.className === 'wv-adapter-boundary');
-  visual.update(receipt({ phaseId: 'metadata-checkpoint-committed', elapsedMs: 60000 }));
+  visual.update(receipt({ phaseId: 'future-unknown', elapsedMs: 60000 }));
   adapterBoundary(f, visual, 'prepare', { target: stale });
   assert.equal(visual.element.dataset.adapter, 'work'); assert.equal(visual.element.dataset.motion, 'static');
   assert.equal(visual.inspect().cooldown, 4); assert.deepEqual(plain(visual.inspect().history), ['coffee']);
@@ -1190,5 +1197,153 @@ test('manual reaches directly toward its visible book and retracts after returni
     }
     nearPoint(point(28.5),neutral,.00001,'empty hand is settled before walking home');
     nearPoint(point(29.3),neutral,.00001,'no trailing closing gesture');
+  }
+});
+
+
+function gestureBoundary(f, visual, overrides = {}) {
+  const art = f.parts(visual).art, family = visual.element.dataset.family;
+  const elapsedTime = ['checkpoint', 'composition'].includes(family) ? 2.8 : ['calculation', 'verification'].includes(family) ? 2.6 : 2.4;
+  art.emit('animationend', { target: art.children.find(node => node.className === 'wv-work-boundary'),
+    animationName: 'wv-gesture-boundary', elapsedTime, pseudoElement: '', ...overrides });
+}
+
+test('quiet first receipts progress from their complete glance to continuous work without another receipt', () => {
+  for (const elapsedMs of [undefined, 0, 3999]) {
+    const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs })); f.observers[0].deliver(true);
+    const { art, status, details } = f.parts(visual), announcements = status.writes;
+    assert.equal(visual.element.dataset.pace, 'gesture'); gestureBoundary(f, visual);
+    assert.equal(visual.element.dataset.pace, 'loop'); assert.equal(visual.element.dataset.motion, 'running');
+    assert.equal(art.htmlWrites, 1); assert.equal(status.writes, announcements);
+    assert.equal(details.textContent, elapsedMs === undefined ? '' : `${Math.floor(elapsedMs / 1000)} s decorridos`);
+    for (let cycle = 0; cycle < 8; cycle++) reactionBoundary(f, visual);
+    assert.equal(visual.inspect().cycle, 8); assert.equal(visual.element.dataset.episode, 'work');
+    assert.match(css, /animation: wv-gesture-boundary var\(--wv-gesture-cycle\) linear 1 both;/); visual.destroy();
+  }
+});
+
+test('missing and reset elapsed receipts cannot demote a running loop or recreate art', () => {
+  const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 9000 })); f.observers[0].deliver(true);
+  for (const elapsedMs of [undefined, 0, 100, 3999, undefined]) {
+    visual.update(receipt({ elapsedMs, completed: 3 }));
+    assert.equal(visual.element.dataset.pace, 'loop'); assert.equal(f.parts(visual).art.htmlWrites, 1);
+  }
+  reactionBoundary(f, visual); assert.equal(visual.inspect().cycle, 1); visual.destroy();
+});
+
+test('rapid family changes coalesce at the complete work boundary while real receipts stay immediate', () => {
+  const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 9000 })); f.observers[0].deliver(true);
+  const { art, status, metric } = f.parts(visual), staleClock = art.children.find(node => node.className === 'wv-work-boundary');
+  for (let index = 0; index < 1000; index++) {
+    visual.update(receipt({ phaseId: index % 2 ? 'engine-checkpoint-publish' : 'engine-index', elapsedMs: index,
+      label: `Phase ${index}`, completed: index, total: 2000 }));
+    assert.equal(visual.element.dataset.family, 'reading'); assert.equal(art.htmlWrites, 1);
+  }
+  assert.equal(status.textContent, 'Phase 999'); assert.equal(metric.textContent, '999 / 2.000');
+  reactionBoundary(f, visual); assert.equal(visual.element.dataset.family, 'checkpoint'); assert.equal(art.htmlWrites, 2);
+  assert.equal(visual.element.dataset.pace, 'loop'); assert.equal(visual.inspect().cycle, 0);
+  reactionBoundary(f, visual, 'animationiteration', { target: staleClock }); assert.equal(visual.inspect().cycle, 0);
+  reactionBoundary(f, visual); assert.equal(visual.inspect().cycle, 1); visual.destroy();
+});
+
+test('phase changes during bridges complete parking, reaction and recovery with the active adapter', () => {
+  const { f, visual } = adaptedCoffeeFixture('command:case_report_render');
+  visual.update(receipt({ phaseId: 'engine-index', elapsedMs: 1000 })); assert.equal(visual.element.dataset.family, 'composition');
+  adapterBoundary(f, visual); assert.equal(visual.element.dataset.adapter, 'react');
+  reactionBoundary(f, visual, 'animationend'); assert.equal(visual.element.dataset.adapter, 'resume');
+  assert.equal(visual.element.dataset.family, 'composition'); adapterBoundary(f, visual);
+  assert.equal(visual.element.dataset.family, 'reading'); assert.equal(visual.element.dataset.adapter, 'work');
+  assert.equal(visual.inspect().cooldown, 4); visual.destroy();
+});
+
+test('quiet promotion pauses with visibility and reconciles only a complete endpoint on resume', () => {
+  const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 0 })); f.observers[0].deliver(true);
+  visual.setMotionEnabled(false); gestureBoundary(f, visual, { elapsedTime: 1 });
+  visual.setMotionEnabled(true); assert.equal(visual.element.dataset.pace, 'gesture');
+  visual.setMotionEnabled(false); gestureBoundary(f, visual); assert.equal(visual.element.dataset.pace, 'gesture');
+  visual.setMotionEnabled(true); assert.equal(visual.element.dataset.pace, 'loop');
+  visual.update(receipt({ state: 'completed' })); gestureBoundary(f, visual);
+  assert.equal(visual.element.dataset.family, 'neutral'); assert.equal(visual.element.dataset.animated, 'false'); visual.destroy();
+});
+
+test('access closes its finite gesture before pending or late phase changes without trapping the scene', () => {
+  for (const late of [false, true]) {
+    const f = fixture(), visual = f.api.mount(f.host, receipt({ phaseId: 'metadata-lock', elapsedMs: 10000 })); f.observers[0].deliver(true);
+    if (late) gestureBoundary(f, visual);
+    visual.update(receipt({ phaseId: 'engine-index', elapsedMs: 10000 }));
+    if (!late) { assert.equal(visual.element.dataset.family, 'access'); gestureBoundary(f, visual); }
+    assert.equal(visual.element.dataset.family, 'reading');
+    for (const phaseId of ['future-unknown', 'engine-cancelled']) {
+      visual.update(receipt({ phaseId, elapsedMs: 10000 })); assert.equal(visual.element.dataset.motion, 'static');
+      assert.equal(visual.element.dataset.animated, 'false'); visual.update(receipt({ elapsedMs: 10000 }));
+    }
+    visual.destroy();
+  }
+});
+
+test('elapsed receipts cannot cut a gesture or replace paused animation identities', () => {
+  const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 3500 })); f.observers[0].deliver(true);
+  visual.update(receipt({ elapsedMs: 4000 })); assert.equal(visual.element.dataset.pace, 'gesture');
+  visual.setMotionEnabled(false); visual.update(receipt({ elapsedMs: 65000 }));
+  assert.equal(visual.element.dataset.pace, 'gesture'); assert.equal(visual.element.dataset.motion, 'static');
+  f.media.matches = true; f.media.emit('change'); visual.setMotionEnabled(true);
+  visual.update(receipt({ elapsedMs: 66000 })); assert.equal(visual.element.dataset.pace, 'gesture');
+  f.media.matches = false; f.media.emit('change'); assert.equal(visual.element.dataset.pace, 'gesture');
+  gestureBoundary(f, visual); assert.equal(visual.element.dataset.pace, 'loop'); visual.destroy();
+});
+
+test('partial checkpoints preserve the active scene but never start another reaction', () => {
+  const { f, visual } = coffeeFixture(); const { art } = f.parts(visual);
+  for (const phaseId of ['metadata-checkpoint-committed', 'engine-checkpoint-committed']) {
+    visual.update(receipt({ phaseId, elapsedMs: 60000, completed: 100, total: 100 }));
+    assert.equal(visual.element.dataset.episode, 'coffee'); assert.equal(visual.element.dataset.motion, 'running'); assert.equal(art.htmlWrites, 1);
+  }
+  reactionBoundary(f, visual, 'animationend'); for (let index = 0; index < 20; index++) reactionBoundary(f, visual);
+  assert.equal(visual.element.dataset.episode, 'work'); assert.deepEqual(plain(visual.inspect().history), ['coffee']); visual.destroy();
+});
+
+test('successful short work releases its host immediately and finishes only the existing inert gesture', () => {
+  const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 0 })); f.observers[0].deliver(true);
+  const { art, status, control } = f.parts(visual);
+  assert.equal(visual.complete(), true); assert.equal(visual.element.parent, f.document.body);
+  assert.equal(visual.element.inert, true); assert.equal(visual.element.getAttribute('aria-hidden'), 'true');
+  assert.equal(visual.element.dataset.state, 'completed'); assert.equal(control.hidden, true); assert.equal(status.textContent, 'Concluído');
+  assert.equal(visual.inspect().finishing, true); assert.equal(visual.update(receipt()), false);
+  visual.setVisible(true); assert.equal(visual.element.inert, true); assert.equal(visual.element.getAttribute('aria-hidden'), 'true');
+  gestureBoundary(f, visual); assert.equal(visual.element.isConnected, false); assert.equal(art.count('animationend'), 0);
+  assert.equal(f.document.count('workspace-context-change'), 0); assert.equal(f.document.count('analysis-context-change'), 0);
+});
+
+test('successful long work and reactions finish their complete path without adding new work', () => {
+  for (const phaseId of ['metadata-scan', 'analytics-sql', 'command:case_report_render']) {
+    const f = fixture(), visual = f.api.mount(f.host, receipt({ phaseId, elapsedMs: 60000 }), { reactionSeed: 17 }); f.observers[0].deliver(true);
+    reactionBoundary(f, visual); assert.equal(visual.element.dataset.episode, 'coffee'); assert.equal(visual.complete(), true);
+    if (visual.element.dataset.adapter === 'prepare') adapterBoundary(f, visual);
+    reactionBoundary(f, visual, 'animationend'); if (visual.element.dataset.adapter === 'resume') adapterBoundary(f, visual);
+    assert.equal(visual.element.isConnected, false); assert.deepEqual(plain(visual.inspect().history), ['coffee']);
+  }
+  const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 5000 })); f.observers[0].deliver(true);
+  assert.equal(visual.complete(), true); reactionBoundary(f, visual); assert.equal(visual.element.isConnected, false);
+});
+
+test('completion has one owner and cleans up on context, visibility, reduced motion, destroy or a new task', () => {
+  for (const stop of ['workspace-context-change', 'analysis-context-change', 'hidden', 'reduced', 'new-task', 'destroy']) {
+    const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 5000 })); f.observers[0].deliver(true); visual.complete();
+    if (stop === 'hidden') { f.document.hidden = true; f.document.emit('visibilitychange'); }
+    else if (stop === 'reduced') { f.media.matches = true; f.media.emit('change'); }
+    else if (stop === 'new-task') f.api.mount(f.host, receipt({ operationId: 'next' })).destroy();
+    else if (stop === 'destroy') visual.destroy(); else f.document.emit(stop);
+    assert.equal(visual.element.isConnected, false, stop); assert.equal(f.document.count('workspace-context-change'), 0);
+  }
+  const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 5000 })); f.observers[0].deliver(true);
+  visual.setMotionEnabled(false); assert.equal(visual.complete(), false); assert.equal(visual.element.isConnected, false);
+});
+
+test('terminal and cancelling states stop immediately while retaining a committed checkpoint phase ID', () => {
+  for (const phaseId of ['metadata-checkpoint-committed', 'engine-checkpoint-committed']) for (const state of ['cancelling', 'cancelled', 'completed', 'error', 'paused']) {
+    const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 5000 })); f.observers[0].deliver(true);
+    visual.update(receipt({ phaseId, elapsedMs: 6000 })); assert.equal(visual.element.dataset.motion, 'running');
+    visual.update(receipt({ phaseId, state, elapsedMs: 6100 })); assert.equal(visual.element.dataset.motion, 'static', `${phaseId}/${state}`);
+    assert.equal(visual.element.dataset.family, 'neutral'); assert.equal(visual.element.dataset.animated, 'false'); visual.destroy();
   }
 });

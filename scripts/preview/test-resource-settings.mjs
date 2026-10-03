@@ -35,8 +35,12 @@ try {
   assert.deepEqual(await page.evaluate(() => ({ revision: state.datasetRevision, ids: state.rows.map(row => row.id), artifact: state.currentArtifact?.id })), before);
   assert.equal(await page.evaluate(() => window.__mockCommandCalls.resource_settings_save), 1);
 
+  assert.equal(await memory.getAttribute("max"), "8192", "custom maximum follows detected total, not half of it");
+  await memory.fill("8192");
+  assert.match(await pane.locator("#resource-memory-warning").textContent(), /A escolha é permitida/);
+  assert.equal(await save.isDisabled(), false, "full-memory warning must not block saving");
   await memory.fill("127"); await save.click();
-  assert.match(await pane.textContent(), /entre 128 e 4096/);
+  assert.match(await pane.textContent(), /entre 128 e 8192/);
   assert.equal(await page.evaluate(() => window.__mockCommandCalls.resource_settings_save), 1);
   await memory.fill("256");
   await page.evaluate(() => { window.__mockFailures = { resource_settings_save: "disk full" }; });

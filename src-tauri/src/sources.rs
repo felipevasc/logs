@@ -10,7 +10,13 @@ mod web_logs;
 /// Scoped parsed-data revision; raw source and stable event identities never change.
 pub(crate) fn parser_semantics_signature(format: &str) -> Option<&'static str> {
     matches!(format, "apache" | "nginx" | "nginx-error" | "jsonl" | "logfmt" | "auto" | "mixed")
-        .then_some("web-logs-v1")
+        .then_some("web-logs-v2")
+}
+
+/// Embedded syslog inherits the source's pinned calendar just like a direct
+/// syslog source; its engine/time cache must not survive a year-context change.
+pub(crate) fn uses_inferred_calendar_year(format: &str) -> bool {
+    matches!(format, "syslog3164" | "firewall" | "zeek") || parser_semantics_signature(format).is_some()
 }
 
 /// Interpreta data/hora "naive" (sem fuso) como horário LOCAL da máquina.
@@ -184,11 +190,68 @@ fn flatten_json(
     }
 }
 
-fn event_from_json(input: Map<String, Value>, raw: &str) -> Event {
+fn event_from_json_at(input: Map<String, Value>, raw: &str, year: i32) -> Event {
+    event_from_json_embedded(input, raw, year, 0, &mut EmbeddedBudget::default())
+}
+
+// Limits apply across the entire record, including nested encoded JSON. Exact
+// original values/raw remain available when enrichment reaches a limit.
+struct EmbeddedBudget { bytes: usize, candidates: usize }
+impl Default for EmbeddedBudget {
+    fn default() -> Self { Self { bytes: 256 * 1024, candidates: 32 } }
+}
+
+fn embedded_log(raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget) -> Option<Event> {
+    if depth >= 3 || raw.len() > 64 * 1024 || raw.len() > budget.bytes || budget.candidates == 0 {
+        return None;
+    }
+    budget.bytes -= raw.len();
+    budget.candidates -= 1;
+    let line = raw.trim();
+    let (mut event, format) = if line.starts_with('{') {
+        let Value::Object(map) = serde_json::from_str::<Value>(line).ok()? else { return None; };
+        (event_from_json_embedded(map, raw, year, depth + 1, budget), "json")
+    } else {
+        // Header-dependent formats (CSV, W3C, Zeek), arbitrary text and custom
+        // schemas have no trustworthy per-value detector. Never guess them.
+        if line.contains(['\n', '\r']) || !line.contains(char::is_whitespace) && !(line.starts_with("CEF:") || line.starts_with("LEEF:")) { return None; }
+        if let Some(event) = web_logs::parse_access(line) { (event, "access") }
+        else if let Some(event) = web_logs::parse_error(line) { (event, "nginx.error") }
+        else if let Some(event) = parse_syslog5424(line).filter(|event| {
+            event.timestamp.is_some() || line.split_ascii_whitespace().nth(1) == Some("-")
+        }) { (event, "syslog5424") }
+        else if let Some(event) = parse_syslog3164(line, year).filter(|event| event.timestamp.is_some()) {
+            if line.contains("SRC=") || line.contains("PROTO=") || line.contains("DPT=") {
+                (parse_firewall(line, year)?, "firewall")
+            } else { (event, "syslog3164") }
+        }
+        else if let Some(event) = parse_log4j(line) { (event, "log4j") }
+        else if let Some(event) = parse_jboss(line) { (event, "jboss") }
+        else if let Some(event) = parse_wildfly(line) { (event, "wildfly") }
+        else if let Some(event) = parse_cef(line) { (event, "cef") }
+        else if let Some(event) = parse_leef(line) { (event, "leef") }
+        // Strict whole-record logfmt only: no regex mining inside prose/URLs.
+        else if let Some(event) = web_logs::parse_logfmt(line) { (event, "logfmt") }
+        else { return None; }
+    };
+    event.fields.entry("parser.format").or_insert_with(|| Value::from(format));
+    Some(event)
+}
+
+fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget) -> Event {
     let mut ev = Event::empty();
     ev.raw = raw.to_string();
     let mut map = Map::new();
     flatten_json(input, "", 0, &mut map);
+    // Common collector keys get priority, but any bounded string field may
+    // contain a full supported record. Nested object paths remain namespaced.
+    let mut candidates: Vec<_> = map.iter().filter(|(key, _)| key.len() <= 512)
+        .filter_map(|(key, value)| value.as_str().map(|text| (key, text))).collect();
+    candidates.sort_by_key(|(key, _)| !matches!(key.rsplit('.').next().unwrap_or(key), "line" | "message" | "msg" | "log" | "body" | "text"));
+    let wrapped: Vec<_> = candidates.into_iter().filter_map(|(key, text)| {
+        embedded_log(text, year, depth, budget).map(|event| (key.clone(), event))
+    }).collect();
+    let original = (!wrapped.is_empty() || depth > 0).then(|| map.clone());
     // Keep normalized aliases useful for filtering even when they also fill
     // a standard column (for example service.name and log.level).
     if let Some(v) = take_key(&mut map, TS_KEYS) {
@@ -224,7 +287,44 @@ fn event_from_json(input: Map<String, Value>, raw: &str) -> Event {
             .unwrap_or_else(|| v.to_string());
     }
     ev.fields = map;
-    web_logs::enrich_http(&mut ev, explicit_level);
+    let outer_http = web_logs::enrich_http(&mut ev, explicit_level);
+    if let Some(original) = original {
+        for (key, value) in original { ev.fields.entry(key).or_insert(value); }
+    }
+    let unambiguous = wrapped.len() == 1;
+    let mut added = 0usize;
+    for (field, inner) in wrapped {
+        // Multiple recognized values remain independently namespaced. Do not
+        // choose an arbitrary sibling as the canonical record.
+        if unambiguous {
+            ev.timestamp = ev.timestamp.or(inner.timestamp);
+            if ev.code.is_empty() { ev.code = inner.code.clone(); }
+            if ev.source.is_empty() { ev.source = inner.source.clone(); }
+            if ev.message.is_empty() { ev.message = inner.raw.clone(); }
+            if !explicit_level && !outer_http { ev.level = inner.level.clone(); }
+        }
+        if added < 512 {
+            if let Some(timestamp) = inner.timestamp {
+                ev.fields.entry(format!("{field}.timestamp")).or_insert_with(||
+                    inner.fields.get("timestamp").cloned().unwrap_or_else(|| Value::from(timestamp)));
+                added += 1;
+            }
+        }
+        for (name, value) in [("source", &inner.source), ("code", &inner.code), ("level", &inner.level), ("message", &inner.message)] {
+            if !value.is_empty() && added < 512 {
+                ev.fields.entry(format!("{field}.{name}")).or_insert_with(||
+                    inner.fields.get(name).cloned().unwrap_or_else(|| Value::from(value.clone())));
+                added += 1;
+            }
+        }
+        for (key, value) in inner.fields {
+            if added >= 512 { break; }
+            if key.len() > 512 { continue; }
+            ev.fields.entry(format!("{field}.{key}")).or_insert_with(|| value.clone());
+            added += 1;
+            if unambiguous && added < 512 { ev.fields.entry(key).or_insert(value); added += 1; }
+        }
+    }
     describe_known_json(&mut ev);
     if ev.message.is_empty() {
         ev.message = raw.chars().take(500).collect();
@@ -692,7 +792,7 @@ fn envelope_in_object(bytes: &[u8], open: usize, depth: usize) -> Option<usize> 
 }
 
 /// Zeek TSV: `#fields` header, `-` unset and `(empty)` values.
-fn parse_zeek(line: &str, header: &[String]) -> Option<Event> {
+fn parse_zeek(line: &str, header: &[String], year: i32) -> Option<Event> {
     if header.is_empty() || line.starts_with('#') {
         return None;
     }
@@ -707,7 +807,7 @@ fn parse_zeek(line: &str, header: &[String]) -> Option<Event> {
         };
         map.insert(key.clone(), v);
     }
-    let mut ev = event_from_json(map, line);
+    let mut ev = event_from_json_at(map, line, year);
     ev.raw = line.to_string();
     Some(ev)
 }
@@ -1131,11 +1231,11 @@ fn parse_logfmt(line: &str) -> Option<Event> {
 
 /// Only strict, self-describing single-line formats participate in fallback.
 /// Explicit text, snapshots, custom schemas and multiline framing stay intact.
-fn parse_structured_line(line: &str) -> Option<Event> {
+fn parse_structured_line(line: &str, year: i32) -> Option<Event> {
     let trimmed = line.trim();
     if trimmed.starts_with('{') {
         if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
-            return Some(event_from_json(map, line));
+            return Some(event_from_json_at(map, line, year));
         }
         return None;
     }
@@ -2472,7 +2572,8 @@ pub fn percent_decode(s: &str) -> String {
             out.push(b' ');
             i += 1;
         } else if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            let hex = |b: u8| (b as char).to_digit(16).map(|n| n as u8);
+            if let Some(byte) = hex(bytes[i + 1]).zip(hex(bytes[i + 2])).map(|(hi, lo)| hi * 16 + lo) {
                 out.push(byte);
                 i += 3;
             } else {
@@ -2489,99 +2590,73 @@ pub fn percent_decode(s: &str) -> String {
 
 pub fn extract_query_params(field_name: &str, raw_val: &str) -> Option<Vec<(String, String)>> {
     let s = raw_val.trim();
-    if s.len() < 3 || !s.contains('=') {
-        return None;
-    }
-
-    let qs = if let Some(pos) = s.find('?') {
-        let after = &s[pos + 1..];
+    if s.len() < 3 || s.len() > 64 * 1024 || !s.contains('=') { return None; }
+    let lower_field = field_name.to_ascii_lowercase();
+    let field_suggests_params = lower_field.contains("query")
+        || lower_field.contains("param") || lower_field.contains("qs") || lower_field.contains("search");
+    // Request grammar gives an exact target. A URI occupies the whole value,
+    // rather than '?' found inside access lines, user agents or prose.
+    let target = web_logs::request_query_target(s).unwrap_or(s);
+    let target = target.split('#').next().unwrap_or(target);
+    let first_equal = s.find('=').unwrap();
+    let bare_params = field_suggests_params
+        && !s[..first_equal].chars().any(|c| c.is_whitespace() || matches!(c, '?' | '/' | ':'));
+    if !bare_params && s.contains('#') && !target.contains('?') { return None; }
+    let qs = if !bare_params && target.contains('?') {
+        if target.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>')) { return None; }
+        let (_, after) = target.split_once('?')?;
         after.split('#').next().unwrap_or(after)
     } else {
-        let lower_field = field_name.to_ascii_lowercase();
-        let field_suggests_params = lower_field.contains("query")
-            || lower_field.contains("param")
-            || lower_field.contains("qs")
-            || lower_field.contains("search");
-        if !s.contains('&') && !field_suggests_params {
-            return None;
-        }
+        if !s.contains('&') && !field_suggests_params { return None; }
         s
     };
-
-    if qs.is_empty() || !qs.contains('=') {
-        return None;
-    }
-
-    let parts: Vec<&str> = qs.split('&').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        return None;
-    }
-
-    let lower_field = field_name.to_ascii_lowercase();
-    if !s.contains('?') && !lower_field.contains("query") && !lower_field.contains("param") && parts.len() < 2 {
-        return None;
-    }
-
+    if qs.is_empty() || !qs.contains('=') { return None; }
+    // Refuse excessive expansion rather than publishing a partial query.
+    let parts: Vec<&str> = qs.split('&').filter(|p| !p.is_empty()).take(257).collect();
+    if parts.is_empty() || parts.len() > 256 { return None; }
+    if !s.contains('?') && !field_suggests_params && parts.len() < 2 { return None; }
     let mut pairs = Vec::new();
     for part in parts {
         let (raw_k, raw_v) = part.split_once('=')?;
         let key = percent_decode(raw_k.trim());
         let val = percent_decode(raw_v.trim());
-
-        if key.is_empty() || key.len() > 100 {
-            return None;
-        }
-        if key.chars().any(|c| {
-            c.is_whitespace()
-                || c.is_control()
-                || c == '='
-                || c == '&'
-                || c == '<'
-                || c == '>'
-                || c == '"'
-                || c == '\''
-        }) {
-            return None;
-        }
+        if key.is_empty() || key.len() > 100 { return None; }
+        if key.chars().any(|c| c.is_whitespace() || c.is_control()
+            || matches!(c, '=' | '&' | '<' | '>' | '"' | '\'')) { return None; }
         pairs.push((key, val));
     }
-
-    if pairs.is_empty() {
-        None
-    } else {
-        Some(pairs)
-    }
+    if pairs.is_empty() { None } else { Some(pairs) }
 }
 
 pub fn expand_query_param_fields(ev: &mut Event) {
-    let mut additions: Vec<(String, String)> = Vec::new();
-
-    for (k, v) in &ev.fields {
-        if k.matches('.').count() >= 8 {
-            continue;
-        }
-        if let serde_json::Value::String(s) = v {
-            if let Some(params) = extract_query_params(k, s) {
-                for (sub_k, sub_v) in params {
-                    additions.push((format!("{k}.{sub_k}"), sub_v));
-                }
-            }
+    // Parents precede descendants even with serde_json preserve_order. Decoded
+    // values cannot become another query on a later normalization pass.
+    let mut sources: Vec<_> = ev.fields.iter().filter(|(key, value)|
+        key.len() <= 512 && key.matches('.').count() < 8 && value.is_string()).collect();
+    sources.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let mut generated = std::collections::HashSet::new();
+    let mut additions = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let (mut inspected, mut bytes, mut output) = (0usize, 0usize, 0usize);
+    for (key, value) in sources {
+        if generated.contains(key) { continue; }
+        let text = value.as_str().unwrap();
+        if !text.contains('=') || text.len() > 64 * 1024 { continue; }
+        if inspected >= 64 || bytes.saturating_add(text.len()) > 256 * 1024 { break; }
+        inspected += 1;
+        bytes += text.len();
+        let Some(params) = extract_query_params(key, text) else { continue; };
+        for (sub_key, value) in params {
+            let name = format!("{key}.{sub_key}");
+            generated.insert(name.clone());
+            if output >= 512 { continue; }
+            let values = additions.entry(name).or_default();
+            if !values.contains(&value) { values.push(value); }
+            output += 1;
         }
     }
-
-    for (sub_field, sub_val) in additions {
-        match ev.fields.get_mut(&sub_field) {
-            Some(serde_json::Value::String(existing)) => {
-                if !existing.is_empty() && !existing.split(", ").any(|part| part == sub_val) {
-                    existing.push_str(", ");
-                    existing.push_str(&sub_val);
-                }
-            }
-            Some(_) => {}
-            None => {
-                ev.fields.insert(sub_field, serde_json::Value::String(sub_val));
-            }
-        }
+    for (key, values) in additions {
+        // Whole values inserted once; explicit dotted values/types win.
+        ev.fields.entry(key).or_insert_with(|| Value::String(values.join(", ")));
     }
 }
 
@@ -2629,14 +2704,14 @@ pub(crate) fn parse_line_at(bytes: &[u8], format: &str, custom: Option<&CustomPa
             serde_json::from_str::<Event>(&text).unwrap_or_else(|_| event_from_text(&text))
         }
         "jsonl" => match serde_json::from_str::<Value>(&text) {
-            Ok(Value::Object(map)) => event_from_json(map, &text),
+            Ok(Value::Object(map)) => event_from_json_at(map, &text, year),
             _ => event_from_text(&text),
         },
         "syslog3164" => parse_syslog3164(&text, year).unwrap_or_else(|| event_from_text(&text)),
         "syslog5424" => parse_syslog5424(&text).unwrap_or_else(|| event_from_text(&text)),
         "apache" => parse_apache(&text).unwrap_or_else(|| event_from_text(&text)),
         "nginx-error" => web_logs::parse_error(&text).unwrap_or_else(|| event_from_text(&text)),
-        "nginx" | "auto" | "mixed" => parse_structured_line(&text).unwrap_or_else(|| event_from_text(&text)),
+        "nginx" | "auto" | "mixed" => parse_structured_line(&text, year).unwrap_or_else(|| event_from_text(&text)),
         "firewall" => parse_firewall(&text, year).unwrap_or_else(|| event_from_text(&text)),
         "wildfly" => parse_wildfly(&text)
             .or_else(|| parse_jboss(&text))
@@ -2654,7 +2729,7 @@ pub(crate) fn parse_line_at(bytes: &[u8], format: &str, custom: Option<&CustomPa
                 .unwrap_or_else(|| event_from_text(&text))
         }
         "w3c" => parse_w3c(&text, header).unwrap_or_else(|| event_from_text(&text)),
-        "zeek" => parse_zeek(&text, header).unwrap_or_else(|| event_from_text(&text)),
+        "zeek" => parse_zeek(&text, header, year).unwrap_or_else(|| event_from_text(&text)),
         "auditd" => parse_auditd(&text).unwrap_or_else(|| event_from_text(&text)),
         "custom" => match custom {
             Some(CustomParse::Regex(re)) => {
@@ -2669,7 +2744,7 @@ pub(crate) fn parse_line_at(bytes: &[u8], format: &str, custom: Option<&CustomPa
         _ => event_from_text(&text),
     };
     if ev.parse_status == "text" && matches!(format, "apache" | "nginx-error" | "jsonl" | "logfmt") {
-        if let Some(recognized) = parse_structured_line(&text) { ev = recognized; }
+        if let Some(recognized) = parse_structured_line(&text, year) { ev = recognized; }
     }
     if ev.parse_status == "text" && format != "text" {
         ev.parse_status = "unparsed".into();
@@ -3930,5 +4005,44 @@ mod metadata_calendar_tests {
         let mut lines = vec![LineMeta { offset: 0, len: 1, ..Default::default() }];
         let re = regex::Regex::new("^START").unwrap();
         assert!(push_meta(&mut lines, b"continuation", u64::from(u32::MAX), &prepared.part, Some(&re)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod wrapped_cache_migration_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    #[test]
+    fn old_web_v1_metadata_is_rebuilt_once_without_changing_record_identity() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("wrapped.jsonl");
+        let cache = dir.path().join("metadata");
+        let raw = serde_json::json!({"labels":{},"line":"192.0.2.80 - - [16/Sep/2026:20:55:04 -0300] \"GET /x?page=1 HTTP/1.1\" 204 0"}).to_string();
+        std::fs::write(&path, &raw).unwrap();
+        let prepared = prepare_index(path.to_str().unwrap(), "jsonl", None, None).unwrap();
+        let mut old = Sha256::new();
+        old.update(serde_json::to_vec(&("indexes-v6", crate::metadata_checkpoint::VERSION,
+            &prepared.stamp,&prepared.part.identity,&prepared.descriptor,&prepared.part.calendar)).unwrap());
+        old.update(b"|structured-parser:web-logs-v1");
+        let old_key = format!("{:x}", old.finalize());
+        assert_ne!(prepared.key().unwrap(), old_key);
+        let (mut journal, _) = crate::metadata_checkpoint::Journal::open(&cache, &old_key,
+            prepared.part.mmap.len(), prepared.initial_cursor(), prepared.multiline(), None)
+            .unwrap_or_else(|_| panic!("old journal fixture"));
+        let mut old_rows = crate::metadata_store::LineBuilder::default();
+        old_rows.push(LineMeta { offset:0,len:raw.len() as u32,ts:0,level:LV_INFO,..Default::default() }).unwrap();
+        journal.checkpoint_rows(&mut old_rows, raw.len(), true, Some(&["line".into()]), None, &|| prepared.validate()).unwrap();
+        drop(journal);
+        let old_ref = format!("{}:0", prepared.part.event_identity.as_deref().unwrap_or(&prepared.part.identity));
+        let reopened = crate::index_cache::open_prepared_at(&prepared, &cache, None).unwrap();
+        assert_eq!(prepared.parsed_rows.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(reopened.lines.len(), 1); assert_eq!(reopened.lines.at(0).offset, 0);
+        assert_eq!(reopened.lines.at(0).ts, 1789602904000);
+        assert!(reopened.columns.iter().any(|column| column == "method"));
+        let empty = CodesConfig::default(); let event = event_at(&reopened, 0, &empty, &empty, &[]);
+        assert_eq!(event.event_ref, old_ref); assert_eq!(event.raw, raw); assert_eq!(event.fields["path.page"], "1");
+        let warm_prepared = prepare_index(path.to_str().unwrap(), "jsonl", None, None).unwrap();
+        let warm = crate::index_cache::open_prepared_at(&warm_prepared, &cache, None).unwrap();
+        assert_eq!(warm_prepared.parsed_rows.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(warm.lines.at(0).ts, reopened.lines.at(0).ts); assert_eq!(warm.columns, reopened.columns);
     }
 }

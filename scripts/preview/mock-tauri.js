@@ -17,7 +17,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     catch { return resourceDefault; }
   };
   const resourceStartup = structuredClone(resourceRead());
-  const resourceBudget = resourceStartup.mode === "custom" ? resourceStartup.memoryLimitMib : 2730;
+  const resourceBudget = resourceStartup.mode === "custom" ? Math.max(128, Math.min(resourceStartup.memoryLimitMib, 8192)) : 2730;
   const resourceStatus = () => {
     const saved = resourceRead();
     return {
@@ -26,7 +26,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
         globalParallelism: Math.min(resourceStartup.parallelismLimit ?? 7, 8), maximumParallelism: 8,
         parserThreads: 4, queryThreadsPerSession: 3, textThreads: 1, environmentOverrideMib: null,
         invalidEnvironmentOverride: false, conservativeBuilder: resourceBudget < 2730 },
-      activePreferences: resourceStartup, saved, minimumMemoryMib: 128, maximumMemoryMib: 4096, maximumParallelism: 8,
+      activePreferences: resourceStartup, saved, minimumMemoryMib: 128, maximumMemoryMib: 8192, maximumParallelism: 8,
       restartRequired: saved.mode !== resourceStartup.mode || saved.memoryLimitMib !== resourceStartup.memoryLimitMib || saved.parallelismLimit !== resourceStartup.parallelismLimit,
       startupWarning: null, savedWarning: null,
     };
@@ -621,7 +621,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     ui_zoom: () => false,
     resource_settings_status: () => resourceStatus(),
     resource_settings_save: ({ preferences }) => {
-      const valid = window.ResourceSettings.preferences(preferences.mode, String(preferences.memoryLimitMib), 4096, preferences.parallelismLimit, 8);
+      const valid = window.ResourceSettings.preferences(preferences.mode, String(preferences.memoryLimitMib), 8192, preferences.parallelismLimit, 8);
       if (preferences.schemaVersion !== 1) throw Error("Versão de configuração não suportada.");
       localStorage.setItem("__mockResourceSettings", JSON.stringify(valid));
       return resourceStatus();
@@ -1004,7 +1004,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     return { analysisContext: structuredClone(context), preferences,
       effective: { accountedLimitMib: limit, accountedUsedBytes: 0, workLiveMib: Math.min(limit, 128), materializedMib: Math.min(limit, 64),
         selectionMib: Math.min(limit, 1024), selectionCacheMib: Math.min(limit, 128), collectedIdsMib: Math.min(limit, 32), analyticsMib: Math.min(limit, 32),
-        applicationWorkMib: 128, applicationSelectionMib: 1024 }, minimumWorkMib: 8, maximumWorkMib: 1152,
+        applicationWorkMib: 128, applicationSelectionMib: 1024 }, minimumWorkMib: 8, maximumWorkMib: 8192, maximumEffectiveWorkMib: 1152,
       clamped: preferences.workLimitMib != null && preferences.workLimitMib > 1152 };
   };
   handlers.case_resource_settings_status = ({ identity }) => {
@@ -1015,7 +1015,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
   handlers.case_resource_settings_save = ({ expected, preferences }) => {
     const { context, settings } = interpretationFor({ analysisContext: expected });
     if (preferences.schemaVersion !== 1) throw Error("Versão de recursos do Caso não suportada.");
-    settings.resources = window.ResourceSettings.casePreferences(preferences.mode, String(preferences.workLimitMib), 8192);
+    settings.resources = window.ResourceSettings.casePreferences(preferences.mode, String(preferences.workLimitMib), caseResourceStatus(context).maximumWorkMib);
     saveInterpretation(context, settings);
     return caseResourceStatus(context);
   };

@@ -131,6 +131,10 @@ fn request_parts(request: &str) -> Option<(&str, &str, &str)> {
     Some((method, target, protocol))
 }
 
+pub(super) fn request_query_target(request: &str) -> Option<&str> {
+    request_parts(request).map(|(_, target, _)| target)
+}
+
 fn add_request_fields(fields: &mut Map<String, Value>, request: &str) {
     if let Some((method, path, protocol)) = request_parts(request) {
         insert_once(fields, "method", method);
@@ -338,9 +342,9 @@ fn http_field<'a>(fields: &'a Map<String, Value>, key: &str) -> Option<&'a Value
         .then_some(value)
 }
 
-pub(super) fn enrich_http(event: &mut Event, explicit_level: bool) {
+pub(super) fn enrich_http(event: &mut Event, explicit_level: bool) -> bool {
     let Some(status) = http_field(&event.fields, "status").and_then(http_status) else {
-        return;
+        return false;
     };
     let request = http_field(&event.fields, "request")
         .and_then(Value::as_str)
@@ -357,7 +361,7 @@ pub(super) fn enrich_http(event: &mut Event, explicit_level: bool) {
         && !(method.as_deref().is_some_and(method_token)
             && uri.as_deref().is_some_and(request_target))
     {
-        return;
+        return false;
     }
     if event.timestamp.is_none() {
         event.timestamp = event
@@ -403,6 +407,7 @@ pub(super) fn enrich_http(event: &mut Event, explicit_level: bool) {
             event.message = format!("{method} {uri} → {status}");
         }
     }
+    true
 }
 
 // Error-log context uses explicit comma-delimited labels, with quoted request,
@@ -681,5 +686,184 @@ mod tests {
                 .unwrap();
         assert_eq!(event.fields["remote_host"], "host.example");
         assert!(!event.fields.contains_key("client_ip"));
+    }
+}
+
+#[cfg(test)]
+mod wrapped_tests {
+    use super::*;
+    use crate::sources::{expand_query_param_fields, extract_query_params, parse_line};
+    use serde_json::json;
+    const LINE: &str = "192.0.2.80 - - [16/Sep/2026:20:55:04 -0300] \"GET /api/items?page=1&isAssigned=false&tags=one%2C+two&next=%2Ffind%3Fx%3D1%26y%3D2 HTTP/1.1\" 204 0 \"https://example.org/?ref=a\" \"client/1.0 (one, two)\"";
+    const STAMP: &str = "2026-09-16T20:55:04.550942594-03:00";
+
+    #[test]
+    fn wrapped_access_preserves_envelope_and_exact_timestamp_with_namespaced_http_fields() {
+        let raw = json!({"labels":{},"line":LINE,"timestamp":STAMP,"enabled":false,
+            "count":9007199254740993u64,"items":[1,"two"],"empty":null}).to_string();
+        let mut event = parse_line(raw.as_bytes(), "jsonl", None, &[]);
+        assert_eq!(event.raw, raw);
+        assert_eq!(event.message, LINE);
+        assert_eq!(event.timestamp, Some(1789602904550));
+        assert_eq!(event.fields["timestamp"], STAMP);
+        assert_eq!(event.fields["line"], LINE);
+        assert_eq!(event.fields["labels"], json!({}));
+        assert_eq!(event.fields["enabled"], false);
+        assert_eq!(event.fields["count"], 9007199254740993u64);
+        assert_eq!(event.fields["items"], json!([1,"two"]));
+        assert_eq!(event.fields["empty"], Value::Null);
+        for prefix in ["", "line."] {
+            for (key, expected) in [("method","GET"),("status","204"),("client_ip","192.0.2.80"),
+                ("request.page","1"),("path.isAssigned","false"),("path.tags","one, two"),
+                ("path.next","/find?x=1&y=2"),("referer.ref","a")] {
+                assert_eq!(event.fields[&format!("{prefix}{key}")], expected);
+            }
+        }
+        assert!(!event.fields.contains_key("line.page"));
+        assert!(!event.fields.contains_key("path.next.x"));
+        let before = event.fields.clone();
+        for _ in 0..3 { expand_query_param_fields(&mut event); }
+        assert_eq!(event.fields, before);
+    }
+
+    #[test]
+    fn wrapped_collisions_keep_explicit_fields_types_and_standard_columns() {
+        let raw = json!({"line":LINE,"timestamp":STAMP,"source":"collector","code":"outer-code",
+            "message":"explicit message","level":"debug","method":false,"status":201,
+            "path":["external"],"request.page":7,"line.path.page":"authored","labels":{"host":"edge"}}).to_string();
+        let event = parse_line(raw.as_bytes(), "jsonl", None, &[]);
+        assert_eq!(event.source, "collector"); assert_eq!(event.code, "outer-code");
+        assert_eq!(event.message, "explicit message"); assert_eq!(event.level, "Depuração");
+        assert_eq!(event.fields["method"], false); assert_eq!(event.fields["status"], 201);
+        assert_eq!(event.fields["path"], json!(["external"]));
+        assert_eq!(event.fields["request.page"], 7); assert_eq!(event.fields["line.path.page"], "authored");
+        assert_eq!(event.fields["line.method"], "GET"); assert_eq!(event.fields["line.status"], "204");
+        assert_eq!(event.fields["labels.host"], "edge");
+        for key in ["timestamp","source","code","message","level"] {
+            assert_eq!(event.fields[key], serde_json::from_str::<Value>(&raw).unwrap()[key]);
+        }
+    }
+
+    #[test]
+    fn wrapped_recognition_is_conservative_and_snapshot_evidence_stays_captured() {
+        for line in ["request failed for /api/items?page=1 HTTP/1.1\" 204 0", "GET /api/items?page=1 HTTP/1.1", "arbitrary prose", "{\"line\":\"nested\"}"] {
+            let raw = json!({"line":line}).to_string();
+            let event = parse_line(raw.as_bytes(), "jsonl", None, &[]);
+            assert_eq!(event.raw, raw); assert!(!event.fields.contains_key("method"));
+        }
+        let raw = json!({"line":LINE}).to_string();
+        assert_eq!(parse_line(raw.as_bytes(), "jsonl", None, &[]).timestamp, Some(1789602904000));
+        let mut captured = Event::empty(); captured.raw = raw; captured.event_ref = "preserved:17".into();
+        captured.fields.insert("line".into(), Value::from(LINE));
+        let restored = parse_line(&serde_json::to_vec(&captured).unwrap(), "snapshot", None, &[]);
+        assert_eq!(restored.raw, captured.raw); assert_eq!(restored.event_ref, captured.event_ref);
+        assert!(!restored.fields.contains_key("method")); assert!(!restored.fields.contains_key("line.page"));
+    }
+
+    #[test]
+    fn query_expansion_limits_preserve_source_values_and_remain_idempotent() {
+        let many = (0..257).map(|i| format!("k{i}=v")).collect::<Vec<_>>().join("&");
+        assert!(extract_query_params("query", &many).is_none());
+        assert!(extract_query_params("query", &format!("x={}", "v".repeat(64 * 1024))).is_none());
+        let values: serde_json::Map<String, Value> = (0..80).map(|i| (format!("query{i:02}"),
+            Value::from("first=%2Fx%3Fp%3D1%26q%3D2&second=one%2C+two"))).collect();
+        let mut event = parse_line(&serde_json::to_vec(&values).unwrap(), "jsonl", None, &[]);
+        let first = event.fields.clone();
+        for _ in 0..3 { expand_query_param_fields(&mut event); }
+        assert_eq!(event.fields, first); assert!(event.fields.len() <= values.len() + 512);
+        for (key, value) in values { assert_eq!(event.fields[&key], value); }
+    }
+
+    #[test]
+    fn query_expansion_has_request_boundaries_and_is_idempotent_for_commas_and_nested_urls() {
+        let mut event = parse_line(br#"{"query":"a=one%2C+two&a=three&a=one%2C+two&next=%2Fx%3Fp%3D1%26q%3D2","query.explicit":false,"url":"/x?page=1#ignored=two"}"#, "jsonl", None, &[]);
+        assert_eq!(event.fields["query.a"], "one, two, three");
+        assert_eq!(event.fields["query.next"], "/x?p=1&q=2");
+        let before = event.fields.clone();
+        for _ in 0..3 { expand_query_param_fields(&mut event); }
+        assert_eq!(event.fields, before);
+        for text in [LINE,"see /x?page=1","/x?page=1 HTTP/1.1\" 200 0","/x#fragment?page=1","/x#fragment?page=1&z=2"] {
+            assert!(extract_query_params("line", text).is_none(), "{text}");
+        }
+        assert_eq!(extract_query_params("request", "GET /x?page=1 HTTP/1.1").unwrap(), vec![("page".into(), "1".into())]);
+        assert_eq!(extract_query_params("query", "redirect=/x?p=1&count=2").unwrap(), vec![("redirect".into(), "/x?p=1".into()), ("count".into(), "2".into())]);
+        assert_eq!(extract_query_params("query", "x=%€").unwrap(), vec![("x".into(), "%€".into())]);
+    }
+}
+
+#[cfg(test)]
+mod generic_envelope_tests {
+    use crate::sources::{parse_line, parse_line_at};
+    use serde_json::{json, Value};
+
+    #[test]
+    fn embedded_formats_are_recognized_in_arbitrary_and_nested_fields() {
+        for (field, line, key, expected) in [
+            ("payload", "192.0.2.1 - alice [16/Sep/2026:20:55:04 -0300] \"GET /apache HTTP/1.1\" 200 42", "user", "alice"),
+            ("message", "<34>1 2026-09-16T23:55:04Z host app 123 ID47 - connection accepted", "app", "app"),
+            ("body", "Sep 16 23:55:04 host sshd[123]: connection accepted", "process", "sshd"),
+            ("value", "2026-09-16 23:55:04,123 ERROR [worker] example.Service - failure", "thread", "worker"),
+            ("custom", "time=2026-09-16T23:55:04Z level=error msg=failed request_id=0042", "request_id", "0042"),
+            ("record", "CEF:0|Example|Product|1|42|Example event|5|src=192.0.2.1", "vendor", "Example"),
+        ] {
+            let raw = json!({"container":{field:line},"timestamp":"2026-09-16T23:55:04.987654321Z","enabled":false}).to_string();
+            let event = parse_line_at(raw.as_bytes(), "jsonl", None, &[], 2026);
+            assert_eq!(event.raw, raw); assert_eq!(event.fields[&format!("container.{field}")], line);
+            assert_eq!(event.fields[&format!("container.{field}.{key}")], expected, "{field}");
+            assert_eq!(event.fields[key], expected, "canonical {field}");
+            assert_eq!(event.fields["enabled"], false); assert_eq!(event.timestamp, Some(1789602904987));
+        }
+    }
+
+    #[test]
+    fn embedded_json_preserves_standard_column_source_types() {
+        let inner = json!({"timestamp":"2026-09-16T23:55:04.987654321Z","code":500,"source":12,"message":false,"level":true});
+        let raw = json!({"payload":inner.to_string()}).to_string();
+        let event = parse_line(raw.as_bytes(), "jsonl", None, &[]);
+        for key in ["timestamp","code","source","message","level"] {
+            assert_eq!(event.fields[&format!("payload.{key}")], inner[key], "{key}");
+        }
+    }
+
+    #[test]
+    fn oversized_field_names_do_not_amplify_embedded_or_query_outputs() {
+        let name = "x".repeat(2048);
+        for text in ["time=2026-09-16T23:55:04Z msg=hello", "/x?page=1&tags=two"] {
+            let raw = json!({name.clone():text}).to_string();
+            let event = parse_line(raw.as_bytes(), "jsonl", None, &[]);
+            assert_eq!(event.fields.len(), 1); assert!(event.fields.contains_key(&name));
+        }
+    }
+
+    #[test]
+    fn embedded_sibling_records_are_namespaced_without_arbitrary_canonical_choice() {
+        let raw = json!({"first":"<34>1 2026-09-16T23:55:04Z a first-app 123 ID47 - one",
+            "second":"<34>1 2026-09-16T23:55:05Z b second-app 456 ID48 - two"}).to_string();
+        let event = parse_line(raw.as_bytes(), "jsonl", None, &[]);
+        assert_eq!(event.fields["first.app"], "first-app"); assert_eq!(event.fields["second.app"], "second-app");
+        assert!(!event.fields.contains_key("app")); assert!(event.timestamp.is_none()); assert!(event.source.is_empty());
+    }
+
+    #[test]
+    fn encoded_json_recurses_with_limits_and_does_not_guess_prose_or_csv() {
+        let inner = json!({"line":"192.0.2.1 - - [16/Sep/2026:20:55:04 -0300] \"GET /nested?page=1 HTTP/1.1\" 200 2"}).to_string();
+        let raw = json!({"payload":inner}).to_string();
+        let event = parse_line(raw.as_bytes(), "jsonl", None, &[]);
+        assert_eq!(event.fields["payload.line.method"], "GET"); assert_eq!(event.fields["method"], "GET");
+        let mut deep = raw;
+        for _ in 0..4 { deep = json!({"payload":deep}).to_string(); }
+        let event = parse_line(deep.as_bytes(), "jsonl", None, &[]);
+        assert_eq!(event.raw, deep); assert!(!event.fields.contains_key("method")); assert!(event.fields.len() < 128);
+        for value in ["ordinary prose key=value tail","alpha,beta,gamma","request /x?page=1 failed",
+            "prefix CEF:0|Example|Product|1|42|Event|5|src=192.0.2.1","1 not-a-time host app pid msg - prose"] {
+            let raw = json!({"payload":value}).to_string();
+            let event = parse_line(raw.as_bytes(), "jsonl", None, &[]);
+            assert!(!event.fields.contains_key("payload.parser.format"), "{value}");
+        }
+        let huge = format!("time=2026-09-16T23:55:04Z msg={} id=42", "a".repeat(70 * 1024));
+        let raw = json!({"payload":huge}).to_string();
+        let event = parse_line(raw.as_bytes(), "jsonl", None, &[]);
+        assert_eq!(event.fields["payload"], serde_json::from_str::<Value>(&raw).unwrap()["payload"]);
+        assert!(!event.fields.contains_key("payload.parser.format"));
     }
 }

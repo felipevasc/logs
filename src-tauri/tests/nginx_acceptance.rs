@@ -53,22 +53,30 @@ fn write_fixture(root: &Path, kind: &str) -> PathBuf {
             );
             contents.push('\n');
         } else {
-            contents.push_str(&format!(
+            let line = format!(
                 "{} - - [{}] \"GET {} HTTP/1.1\" {} {} \"-\" \"nginx-acceptance/1.0\"\n",
                 ip(id),
                 time.format("%d/%b/%Y:%H:%M:%S %z"),
                 uri(id),
                 code(id),
                 100 + id,
-            ));
+            );
+            if kind == "wrapped" {
+                contents.push_str(&json!({"labels":{"job":"synthetic"},"line":line.trim_end(),
+                    "timestamp":time.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)}).to_string());
+                contents.push('\n');
+            } else {
+                contents.push_str(&line);
+            }
         }
     }
     let path = root.join(match kind {
         "json" => "nginx.jsonl",
         "gzip" => "access.log.gz",
+        "wrapped" => "wrapped.json.gz",
         _ => "access.log",
     });
-    if kind == "gzip" {
+    if matches!(kind, "gzip" | "wrapped") {
         let mut writer = GzEncoder::new(std::fs::File::create(&path).unwrap(), Compression::fast());
         writer.write_all(contents.as_bytes()).unwrap();
         writer.finish().unwrap();
@@ -139,6 +147,12 @@ fn exercise(source: &Source, kind: &str) -> Value {
             (0..ROWS).collect(),
         ));
     }
+    if kind == "wrapped" {
+        for field in ["path.limit", "request.limit", "line.path.limit"] {
+            cases.push((field, vec![filter(field, "equals_exact", "10")],
+                (0..ROWS).filter(|id| id % 4 == 0).collect()));
+        }
+    }
     let mut results = BTreeMap::new();
     for (name, filters, expected_ids) in cases {
         let filters = serde_json::to_string(&filters).unwrap();
@@ -200,10 +214,11 @@ fn nginx_process_worker() {
     let input = root.join(match kind.as_str() {
         "json" => "nginx.jsonl",
         "gzip" => "access.log.gz",
+        "wrapped" => "wrapped.json.gz",
         _ => "access.log",
     });
     let (format, events) = testkit::load(input.to_str().unwrap()).unwrap();
-    assert_eq!(format, if kind == "json" { "jsonl" } else { "apache" });
+    assert_eq!(format, if matches!(kind.as_str(), "json" | "wrapped") { "jsonl" } else { "apache" });
     assert_eq!(events.len(), ROWS);
     for (id, event) in events.iter().enumerate() {
         assert_eq!(event.timestamp, Some(timestamp(id)));
@@ -216,6 +231,20 @@ fn nginx_process_worker() {
         } else {
             assert_eq!(event.source, ip(id));
             assert_eq!(event.fields["path"], uri(id));
+            if kind == "wrapped" {
+                let original: Value = serde_json::from_str(&event.raw).unwrap();
+                assert_eq!(event.fields["line"], original["line"]);
+                assert_eq!(event.message, original["line"].as_str().unwrap());
+                assert_eq!(event.fields["timestamp"], original["timestamp"]);
+                assert_eq!(event.fields["labels.job"], "synthetic");
+                assert_eq!(event.fields["line.method"], "GET");
+                if id % 4 == 0 {
+                    assert_eq!(event.fields["path.limit"], "10");
+                    assert_eq!(event.fields["request.limit"], "10");
+                    assert_eq!(event.fields["line.path.limit"], "10");
+                    assert!(!event.fields.contains_key("line.limit"));
+                }
+            }
         }
     }
     let source = Source::open(&[input.to_str().unwrap()], "{}", "[]").unwrap();
@@ -280,7 +309,7 @@ fn files(root: &Path, out: &mut Vec<PathBuf>) {
 
 fn snapshot(root: &Path) -> BTreeMap<String, (u64, u128, String)> {
     let mut artifacts = Vec::new();
-    files(&root.join("data/indexes-v6/metadata-v1"), &mut artifacts);
+    files(&root.join("data/indexes-v7/metadata-v1"), &mut artifacts);
     files(&root.join("engine"), &mut artifacts);
     assert!(artifacts
         .iter()
@@ -328,7 +357,7 @@ fn snapshot(root: &Path) -> BTreeMap<String, (u64, u128, String)> {
 #[test]
 fn nginx_combined_json_and_gzip_reopen_without_rebuilding_artifacts() {
     let temp = tempfile::tempdir().unwrap();
-    for kind in ["combined", "json", "gzip"] {
+    for kind in ["combined", "json", "gzip", "wrapped"] {
         let root = temp.path().join(kind);
         std::fs::create_dir_all(&root).unwrap();
         write_fixture(&root, kind);

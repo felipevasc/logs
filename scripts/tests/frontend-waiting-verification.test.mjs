@@ -69,9 +69,9 @@ function parentsOf(art, target) {
   assert.fail(`missing ${target}`);
 }
 
-test('verification adapts exactly four existing protocol phases and keeps their received labels', () => {
+test('verification adapts explicit metadata, analytics and engine protocol IDs', () => {
   const mapping = [...source.slice(source.indexOf('const PHASES'), source.indexOf('const STATES')).matchAll(/'([^']+)': 'verification'/g)].map(m => m[1]);
-  assert.deepEqual(mapping.sort(), [...phases].sort());
+  assert.deepEqual(mapping.sort(), [...phases, 'engine-validate', 'engine-validated'].sort());
   for (const phaseId of phases) {
     const progress = window.WaitingProgress.snapshot({ ...receipt(phaseId), completed: 4, total: 4, unit: 'registros' });
     const model = api.derive(progress);

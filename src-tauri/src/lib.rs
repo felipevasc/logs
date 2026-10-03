@@ -160,7 +160,13 @@ fn emit_progress(
         "operation-progress",
         OperationProgress {
             operation_id: operations::current_id(),
-            phase_id: phase.into(),
+            phase_id: match (operation, phase) {
+                ("carregamento", "Preparando arquivo" | "Preparando entrada para indexação") => "source-prepare",
+                ("carregamento", "Indexando linhas") => "source-indexed",
+                ("carregamento", "Ativando fonte carregada") => "source-activate",
+                ("carregamento", "Concluído" | "Pronto") => "source-settle",
+                _ => phase,
+            }.into(),
             operation: operation.into(),
             phase: phase.into(),
             completed,
@@ -546,6 +552,28 @@ pub(crate) fn load_file_impl(
     })
 }
 
+// Human labels remain display text; only stable IDs cross the scene protocol.
+fn engine_progress_phase_id(phase: &str) -> &'static str {
+    match phase {
+        "Validando índices salvos" => "engine-validate",
+        "Índices salvos validados" => "engine-validated",
+        "Retomando índices; partes ausentes ou inválidas" => "engine-restore",
+        "Preparando índices ausentes ou inválidos" => "engine-prepare",
+        "Escolhendo colunas" => "engine-columns",
+        "Convertendo e indexando registros" => "engine-index",
+        "Confirmando gravação do checkpoint" => "engine-checkpoint-write",
+        "Concluindo e unindo o índice de texto" => "engine-text-merge",
+        "Sincronizando checkpoint no disco" => "engine-checkpoint-sync",
+        "Publicando checkpoint validado" => "engine-checkpoint-publish",
+        "Checkpoint concluído e validado" => "engine-checkpoint-committed",
+        "Abrindo índices salvos" | "Abrindo índices preparados" => "engine-open",
+        "Consultas prontas" => "engine-ready",
+        "Interrompido; checkpoints concluídos preservados" => "engine-cancelled",
+        "Motor de linhas ativo; preparação pode ser retomada" | "Motor de linhas ativo" => "engine-degraded",
+        _ => "engine-unknown",
+    }
+}
+
 /// Builds the query engine's stores for newly indexed files (cached per
 /// file), so the first queries are already fast. Opening takes longer once.
 pub(crate) fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Option<&AppHandle>) -> Result<(), String> {
@@ -563,7 +591,7 @@ pub(crate) fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Op
             phase.1.elapsed().as_millis() as u64
         };
         let _ = app.emit("operation-progress", serde_json::json!({
-            "operationId": operation_id, "operation": "carregamento", "phaseId": p.phase,
+            "operationId": operation_id, "operation": "carregamento", "phaseId": engine_progress_phase_id(&p.phase),
             "phase": p.phase, "completed": p.completed, "total": p.total, "unit": "registros",
             "cancellable": p.state == "indexing", "state": p.state,
             "checkpointRows": p.checkpoint_rows, "completedSegments": p.completed_segments,

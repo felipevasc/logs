@@ -1428,6 +1428,12 @@ html[data-theme="light"] .waiting-visual[data-family="verification"] {
   86% { transform: rotate(0deg); }
   100% { transform: rotate(0deg); }
 }
+/* A finite visible clock promotes quiet pending work without another receipt. */
+.waiting-visual { --wv-gesture-cycle: 2.4s; }
+.waiting-visual[data-family="checkpoint"], .waiting-visual[data-family="composition"] { --wv-gesture-cycle: 2.8s; }
+.waiting-visual[data-family="calculation"], .waiting-visual[data-family="verification"] { --wv-gesture-cycle: 2.6s; }
+.waiting-visual[data-animated="true"][data-pace="gesture"] .wv-work-boundary { animation: wv-gesture-boundary var(--wv-gesture-cycle) linear 1 both; }
+@keyframes wv-gesture-boundary { 0%, 100% { opacity: 0; } }
 /* Work clocks start with the long prop/hand tracks, never with the preceding
    finite glance. Retaining a short clock would enter a reaction before release. */
 .waiting-visual[data-animated="true"][data-family="reading"][data-pace="loop"] .wv-work-boundary { animation: wv-work-boundary var(--wv-reader-cycle) linear var(--wv-repeat) both; }
@@ -4529,3 +4535,14 @@ html[data-theme="light"] .waiting-visual:is([data-family="access"], [data-family
   100% { transform: rotate(var(--wv-home-head)); }
 }
 .waiting-visual[data-episode="wave"][data-adapter="react"][data-reaction-variant="b"] .wv-react-head { animation-name: wv-wave-head-b; }
+
+/* One inert continuation may finish after successful foreground settlement. */
+.waiting-visual[data-finishing="true"] {
+  position: fixed; inset: auto 14px 14px auto; z-index: 900;
+  inline-size: min(168px, 35vw); padding: 6px; gap: 0;
+  border: 1px solid var(--border, #38495a); border-radius: 10px;
+  background: var(--wv-surface); margin: 0;
+}
+.waiting-visual[data-finishing="true"], .waiting-visual[data-finishing="true"] * { pointer-events: none !important; }
+.waiting-visual[data-finishing="true"] .wv-art { inline-size: 160px; block-size: 80px; flex-basis: 80px; }
+.waiting-visual[data-finishing="true"] .wv-status { font-size: 11px; }

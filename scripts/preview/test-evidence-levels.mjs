@@ -1,8 +1,8 @@
 /* UI contract fixtures only: evidence strength is supplied by the backend. */
 import assert from "node:assert/strict";
 import { mkdir } from "node:fs/promises";
-import { chromium } from "playwright";
-const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL || "chrome"});
+import { launchBrowser } from "./browser.mjs";
+const browser=await launchBrowser();
 const page=await browser.newPage({viewport:{width:1440,height:1050},reducedMotion:"reduce"});
 const errors=[]; page.on("pageerror",error=>errors.push(error.message));
 try {
@@ -23,6 +23,7 @@ try {
   assert.equal(redaction.field,"[oculto]");
   await page.evaluate(()=>WorkspaceContext.setScope("dataset",{animate:false}));
   await page.evaluate(()=>Workspace.showPage("compromises"));
+  await page.evaluate(() => Security.get());
   await page.waitForSelector(".evidence-control");
   assert.equal(await page.evaluate(()=>Security.minimum()),5);
   assert.equal(await page.locator(".sec-episode").count(),0);
@@ -51,6 +52,7 @@ try {
   }
   await page.evaluate(()=>Workspace.showPage("explore"));
   await page.evaluate(()=>Workspace.showPage("compromises"));
+  await page.evaluate(() => Security.get());
   await page.waitForSelector(".evidence-control");
   assert.equal(await page.evaluate(()=>Security.minimum()),1,"navigation within a universe preserves selection");
   await page.locator(".evidence-counts [data-evidence-min='5']").click();

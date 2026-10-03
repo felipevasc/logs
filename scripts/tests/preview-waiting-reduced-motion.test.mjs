@@ -34,7 +34,7 @@ test('existing controller latch leaves initial reduced scenes static and does no
   assert.match(controller, /moving = current.canAnimate && motionEnabled && !reduced/);
   assert.match(controller, /if \(moving\) root.dataset.animated = 'true'/);
   assert.match(controller, /if \(!current.canAnimate\) root.dataset.animated = 'false'/);
-  assert.match(controller, /control.hidden = !current.canAnimate \|\| reduced/);
+  assert.match(controller, /control.hidden = finishing \|\| !current.canAnimate \|\| reduced/);
   assert.doesNotMatch(controller, /setTimeout|setInterval|requestAnimationFrame|animation\.currentTime/);
   assert.match(source, /reducedMotion: 'reduce'/);
   assert.match(source, /s\.animated === 'false'.*s\.animations\.length === 0.*!s\.controlVisible/);
