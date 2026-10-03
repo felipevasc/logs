@@ -10,7 +10,7 @@ function fixture() {
   const capture = () => ({ caseId: state.active, instance: state.active, identity: { revision: state.revision }, source: state.currentArtifact.id });
   const helper = { capture, prepare: async owner => { helper.assertOwner(owner); return owner; }, assertOwner: owner => { if (JSON.stringify(owner) !== JSON.stringify(capture())) throw Error('ANALYSIS_CONTEXT_CHANGED'); } };
   const document = { body: { dataset: {} }, addEventListener(name, fn) { if (!listeners.has(name)) listeners.set(name, []); listeners.get(name).push(fn); }, dispatchEvent(event) { for (const fn of listeners.get(event.type) || []) fn(event); } };
-  const context = vm.createContext({ state, window: { EvidenceUI: { label: String }, AnalysisContexts: helper, Tasks: { operationFor: () => null, cancelLatest: key => cancelled.push(key) } }, document,
+  const context = vm.createContext({ state, window: { EvidenceUI: { label: String, control: () => '<div class="evidence-control"></div>' }, AnalysisContexts: helper, Tasks: { operationFor: () => null, cancelLatest: key => cancelled.push(key) } }, document,
     CustomEvent: class { constructor(type, options = {}) { this.type = type; this.detail = options.detail; } }, workspaceScope: () => 'dataset', caseSig: () => '',
     esc: String, fmtNum: String, updateContextBar() {}, api: (command, args, opts) => new Promise((resolve, reject) => calls.push({ command, args, opts, resolve, reject })) });
   vm.runInContext(source, context);
@@ -68,7 +68,7 @@ test('summary, page and Timeline rendering never invoke triage', async () => {
     await f.security.fillSummary({ attention: summary }); await f.security.renderPage(page);
     f.security.markers(timeline, 1, 10, () => {});
     assert.equal(summary.dataset.analysisState, 'idle');
-    assert.equal(page.querySelector('.sec-page-results').dataset.analysisState, 'idle');
+    assert.equal(page.querySelector('[data-compromises-results]').dataset.analysisState, 'idle');
     assert.match(summary.innerHTML, /ainda não calculados/);
     assert.doesNotMatch(summary.innerHTML, /Nenhum indício/);
   }
@@ -90,4 +90,41 @@ test('cancelling an unrelated unnamed task cannot cancel a preparing calculation
   f.document.dispatchEvent({ type: 'task-state-change', detail: { operationId: null, state: 'cancelling' } });
   await tick(); assert.equal(f.calls.length, 1); assert.equal(f.security.status().state, 'calculating');
   f.calls[0].resolve(f.data('requested')); await request; assert.equal(f.security.status().state, 'ready');
+});
+
+test('the results DOM marker survives idle, busy, ready, stale, failed and cancelled views', async () => {
+  const f = fixture();
+  const node = () => ({ isConnected: true, dataset: {}, innerHTML: '', children: new Map(), setAttribute() {}, removeAttribute() {},
+    querySelector(selector) { if (!this.children.has(selector)) this.children.set(selector, node()); return this.children.get(selector); },
+    querySelectorAll: () => [], addEventListener() {}, remove() {},
+  });
+  const host = node(); await f.security.renderPage(host);
+  assert.match(host.innerHTML, /class="sec-page-results" data-compromises-results/);
+  const slot = host.querySelector('[data-compromises-results]');
+  assert.equal(slot.dataset.analysisState, 'idle');
+  const first = f.security.get(); await tick(); assert.equal(slot.dataset.analysisState, 'calculating');
+  f.calls.at(-1).resolve(f.data('empty')); await first; assert.equal(slot.dataset.analysisState, 'ready');
+  assert.equal(slot.className, 'sec-clear', 'state styling can change without replacing the stable DOM marker');
+  f.security.invalidate(); assert.equal(slot.dataset.analysisState, 'stale');
+  const failure = f.security.get(); await tick(); f.calls.at(-1).reject(Error('read failed')); await assert.rejects(failure);
+  assert.equal(slot.dataset.analysisState, 'failed');
+  const cancelled = f.security.get(); await tick(); f.security.cancel();
+  assert.equal(slot.dataset.analysisState, 'cancelling');
+  f.calls.at(-1).resolve(f.data('late')); await assert.rejects(cancelled);
+  assert.equal(slot.dataset.analysisState, 'cancelled');
+  assert.equal(host.querySelector('[data-compromises-results]'), slot);
+});
+
+test('submitting a search creates a persistent filter that clearing the legacy draft does not remove', () => {
+  const app = readFileSync(new URL('../../frontend/app.js', import.meta.url), 'utf8');
+  const commit = app.slice(app.indexOf('function commitQuickSearch()'), app.indexOf('function applyFilterPop()'));
+  const expression = '@action:logon @outcome:failure', input = { value: expression }, state = { quick: '', filters: [] };
+  const context = vm.createContext({ state, $: selector => selector === '#quick-search' ? input : {},
+    window: { QueryLang: { validate: () => null }, QueryBar: { status() {}, clearDraft() {} } },
+    addFilter: filter => state.filters.push(filter), renderChips() {}, filtersChanged() {},
+  });
+  vm.runInContext(commit + '\nthis.commit = commitQuickSearch;', context);
+  assert.equal(context.commit(), true); input.value = ''; state.quick = '';
+  assert.equal(state.filters.length, 1); assert.equal(state.filters[0].value, expression);
+  assert.equal(state.filters[0].op, 'query', 'Timeline still receives the committed search chip');
 });

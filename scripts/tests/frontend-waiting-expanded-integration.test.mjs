@@ -13,7 +13,7 @@ vm.runInNewContext(source.replace('  function mount(', '  window.integrationArtw
 
 test('the complete seven-family six-reaction component has two bounded source assets and no external artwork', () => {
   const jsBytes = Buffer.byteLength(source), cssBytes = Buffer.byteLength(css);
-  assert.ok(jsBytes < 43000 && cssBytes < 240000 && jsBytes + cssBytes < 280000);
+  assert.ok(jsBytes < 46000 && cssBytes < 240000 && jsBytes + cssBytes < 280000);
   assert.deepEqual(Object.keys(window.WaitingVisuals.adapters).sort(), ['access', 'calculation', 'checkpoint', 'composition', 'reading', 'restoration', 'verification']);
   assert.deepEqual(Object.keys(window.WaitingVisuals.repertoire).sort(), ['coffee', 'manual', 'review', 'stretch', 'visor', 'wave']);
   assert.doesNotMatch(css, /url\(|@import|@font-face/i);

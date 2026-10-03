@@ -7,7 +7,7 @@ const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
 const errors = []; page.on('pageerror', error => errors.push(error.message));
 const calls = () => page.evaluate(() => window.__mockCommandCalls?.triage || 0);
-const stateIs = value => page.waitForFunction(value => document.querySelector('.sec-page-results')?.dataset.analysisState === value, value);
+const stateIs = value => page.waitForFunction(value => document.querySelector('[data-compromises-results]')?.dataset.analysisState === value, value);
 let phase = 'startup';
 try {
   await mkdir('output/playwright', { recursive: true });
@@ -21,8 +21,8 @@ try {
   await page.screenshot({ path: 'output/playwright/compromises-demand-summary.png' });
   for (const name of ['compromises', 'case-timeline', 'summary', 'compromises']) await page.evaluate(name => Workspace.showPage(name), name);
   await stateIs('idle'); assert.equal(await calls(), 0);
-  assert.match(await page.locator('.sec-page-results').innerText(), /ainda não calculados/);
-  assert.doesNotMatch(await page.locator('.sec-page-results').innerText(), /Nenhum indício/);
+  assert.match(await page.locator('[data-compromises-results]').innerText(), /ainda não calculados/);
+  assert.doesNotMatch(await page.locator('[data-compromises-results]').innerText(), /Nenhum indício/);
   await page.screenshot({ path: 'output/playwright/compromises-demand-idle.png' });
   phase = 'navigation during calculation and cancellation';
   await page.evaluate(() => { window.__mockLatency = { triage: 2000 }; });
@@ -31,14 +31,14 @@ try {
   await page.evaluate(() => Workspace.showPage('explore'));
   await page.evaluate(() => Workspace.showPage('compromises')); await stateIs('calculating');
   assert.equal(await calls(), 1);
-  assert.equal(await page.locator('.sec-page-results').getAttribute('aria-busy'), 'true');
+  assert.equal(await page.locator('[data-compromises-results]').getAttribute('aria-busy'), 'true');
   await page.locator('[data-cancel-compromises]').click(); await stateIs('cancelled');
   assert.equal(await calls(), 1); assert.equal(await page.evaluate(() => Security.cached()), null);
   assert.ok(await page.evaluate(() => __mockRequests.some(call => call.cmd === 'cancel_task' && call.operationId)));
   phase = 'failure and explicit retry';
   await page.evaluate(() => { window.__mockLatency = {}; window.__mockFailures = { triage: 'Falha sintética de leitura' }; });
   await page.locator('[data-calculate-compromises]').click(); await stateIs('failed');
-  assert.match(await page.locator('.sec-page-results').innerText(), /Falha sintética/);
+  assert.match(await page.locator('[data-compromises-results]').innerText(), /Falha sintética/);
   await page.evaluate(() => { window.__mockFailures = {}; });
   await page.locator('[data-calculate-compromises]').click(); await stateIs('ready');
   assert.equal(await calls(), 3);
@@ -58,9 +58,9 @@ try {
   await page.locator('[data-calculate-compromises]').click(); await stateIs('ready'); assert.equal(await calls(), 4);
   phase = 'reimport';
   await page.evaluate(() => Workspace.showPage('import'));
-  const beforeLoad = await page.evaluate(() => window.__mockCommandCalls.load_file || 0);
+  const beforeLoad = await page.evaluate(() => state.sourcePublication?.generation ?? 0);
   await page.locator('#btn-load').click();
-  await page.waitForFunction(before => (window.__mockCommandCalls.load_file || 0) > before && !state.loadOverlay && state.loaded, beforeLoad);
+  await page.waitForFunction(before => (state.sourcePublication?.generation ?? 0) > before && !state.loadOverlay && state.loaded && !WorkspaceContext.changing && !WorkspaceContext.sourceBusy, beforeLoad);
   await page.evaluate(() => Workspace.showPage('compromises')); await stateIs('stale'); assert.equal(await calls(), 4);
   phase = 'Case isolation';
   await page.evaluate(() => newCase('Comprometimentos sob demanda B'));

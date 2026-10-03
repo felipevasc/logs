@@ -112,7 +112,12 @@ test('rendered geometry measures shelf matrices, handoffs, both palms, reading a
 test('pause before/after sampling settles CSS tasks, preserves exact clocks and never uses WAAPI overrides', () => {
   assert.match(source, /addInitScript\(installMotionSampling\)/);
   assert.doesNotMatch(source, /\.(?:pause|play)\s*\(|dispatchEvent|new AnimationEvent|playbackRate\s*=(?!=)|reactionPreview/);
-  assert.doesNotMatch(visualSource, /reactionPreview|setTimeout|requestAnimationFrame|animation\.currentTime/);
+  const completionStart = visualSource.indexOf('    function moveCompletion() {');
+  const completionEnd = visualSource.indexOf('    function complete() {', completionStart);
+  assert.ok(completionStart >= 0 && completionEnd > completionStart);
+  const liveController = visualSource.slice(0, completionStart) + visualSource.slice(completionEnd);
+  assert.doesNotMatch(liveController, /reactionPreview|setTimeout|requestAnimationFrame|animation\.currentTime/);
+  assert.doesNotMatch(visualSource, /animation\.(?:play|pause)\(/, 'CSS retains control when legacy completion restores clocks');
   const run = source.slice(source.indexOf('  browser = await launchBrowser();'));
   assert.ok(run.indexOf('results.preSamplingPause =') < run.indexOf('results.rigs ='));
   assert.ok(run.indexOf('results.postSamplingPause =') > run.indexOf('results.rigs ='));

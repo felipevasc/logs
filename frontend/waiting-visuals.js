@@ -402,6 +402,7 @@ window.WaitingVisuals = (() => {
     root.append(art, status, metric, details, control); host.append(root); mounted.add(root);
     let current, sceneKey = '', destroyed = false, finishing = false, gestureFinished = false, visible = true, intersecting = false;
     let director, directorOwner = '', workSignal, episodeSignal, adapterSignal, moving = false, deferredCompletion = null;
+    let completionWorkEnd = null;
     let motionEnabled = options.motionEnabled !== false;
     const elapsedClock = createElapsedClock(typeof view.performance?.now === 'function' ? () => view.performance.now() : () => 0);
     const media = typeof view.matchMedia === 'function' ? view.matchMedia('(prefers-reduced-motion: reduce)') : null;
@@ -488,6 +489,10 @@ window.WaitingVisuals = (() => {
     }
     function boundary(event) {
       if (destroyed || !current?.canAnimate || !root.isConnected || event.pseudoElement) return;
+      // Restoring an older WebView's clock can enqueue an iteration that was
+      // already consumed. Only the still-pending work boundary may end the tail.
+      if (finishing && completionWorkEnd !== null && event.target === workSignal && event.type === 'animationiteration'
+          && (measured(event.elapsedTime) ?? 0) * 1000 < completionWorkEnd - 1) return;
       if (!moving || document.hidden || media?.matches || !visible || !intersecting || !motionEnabled) {
         let completedDuration = null;
         if (event.type === 'animationend') {
@@ -547,6 +552,42 @@ window.WaitingVisuals = (() => {
     }, { threshold: 0 }) : null;
     observer?.observe(root);
     update(initialSnapshot);
+    function moveCompletion() {
+      // Atomic DOM moves retain CSSAnimation identities (Chromium 133+). Older
+      // WebViews remove/reinsert on append, so retain their clocks explicitly.
+      // https://developer.chrome.com/blog/movebefore-api
+      if (typeof document.body.moveBefore === 'function') {
+        try { document.body.moveBefore(root, null); return 'atomic'; } catch { /* use the compatible clock transfer */ }
+      }
+      const tracks = art.getAnimations?.({ subtree: true }).map(animation => ({
+        target: animation.effect?.target, name: animation.animationName,
+        time: animation.currentTime, start: animation.startTime, timeline: animation.timeline,
+        state: animation.playState, duration: animation.effect?.getComputedTiming?.().duration,
+      }));
+      if (!tracks?.length || tracks.some(track => !track.target || !Number.isFinite(track.time))) return null;
+      const work = tracks.find(track => track.target === workSignal && track.name === 'wv-work-boundary');
+      if (root.dataset.episode === 'work' && root.dataset.pace === 'loop') {
+        if (!work || !(work.duration > 0)) return null;
+        completionWorkEnd = (Math.floor(work.time / work.duration) + 1) * work.duration;
+      }
+      document.body.append(root);
+      const remaining = art.getAnimations({ subtree: true });
+      const pairs = tracks.map(track => {
+        const index = remaining.findIndex(animation => animation.effect?.target === track.target && animation.animationName === track.name);
+        return [track, index < 0 ? null : remaining.splice(index, 1)[0]];
+      });
+      if (remaining.length || pairs.some(([, animation]) => !animation)) return null;
+      // All assignments occur before rendering. Running tracks keep the original
+      // document-timeline origin; paused work stays parked throughout a reaction.
+      for (const [track, animation] of pairs) {
+        animation.currentTime = track.time;
+        if (track.state === 'running' && Number.isFinite(track.start) && animation.timeline === track.timeline)
+          animation.startTime = track.start;
+        // Do not call play()/pause(): CSS must retain control of parked tracks.
+        if (animation.playState !== track.state) return null;
+      }
+      return 'clock-transfer';
+    }
     function complete() {
       if (destroyed || finishing) return false;
       // Results settle immediately. Only the existing moving sequence may finish
@@ -556,7 +597,8 @@ window.WaitingVisuals = (() => {
       root.dataset.finishing = 'true'; root.dataset.state = 'completed';
       root.inert = true; root.setAttribute('aria-hidden', 'true');
       status.textContent = 'Concluído'; metric.hidden = true; details.hidden = true; control.hidden = true;
-      document.body.append(root);
+      try { root.dataset.completionTransfer = moveCompletion() || ''; } catch { root.dataset.completionTransfer = ''; }
+      if (!root.dataset.completionTransfer) { destroy(); return false; }
       document.addEventListener('workspace-context-change', destroy);
       document.addEventListener('analysis-context-change', destroy);
       return true;

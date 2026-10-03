@@ -1,10 +1,12 @@
 /* Triage, search language, entity pivots, palette, lanes and Case intel in the preview. */
 import assert from "node:assert/strict";
 import { launchBrowser } from "./browser.mjs";
+import { captureFailure } from "./diagnostics.mjs";
 const url = process.argv[2] || "http://127.0.0.1:4173";
 const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, reducedMotion: "reduce" });
 const errors = [], results = {};
+let phase = "triage and search";
 page.on("pageerror", error => errors.push(error.message));
 try {
   await page.goto(url);
@@ -87,6 +89,10 @@ try {
   assert.equal(await page.locator(".palette-overlay").isHidden(), true);
   results.palette = palette.length;
 
+  // Enter created a persistent search chip. Clearing the legacy quick draft
+  // above must not silently widen Timeline to every source.
+  phase = "filtered Timeline lanes";
+  assert.ok(await page.evaluate(() => backendFilters().some(f => f.op === "query" && f.value === "@action:logon @outcome:failure")));
   // Timeline lanes stay off until asked, then align with the chart.
   await page.evaluate(() => Workspace.showPage("case-timeline"));
   await page.waitForSelector("[data-lanes]");
@@ -94,12 +100,30 @@ try {
   await page.click("[data-lanes]");
   await page.locator(".ctx-menu .ctx-item", { hasText: /^Origem$/ }).click();
   await page.waitForSelector(".tl-swim .tl-swim-strip");
+  const filteredLanes = await page.locator(".tl-swim-label span").allTextContents();
+  assert.deepEqual(filteredLanes, ["Auth"], "the applied logon-failure search limits the source lanes");
+  results.filteredLanes = filteredLanes;
+  phase = "full Timeline lanes";
+  await page.locator("#ws-clear-scope").click();
+  await page.waitForFunction(() => !backendFilters().length && document.querySelectorAll(".tl-swim").length >= 2);
+  assert.deepEqual(await page.evaluate(() => backendFilters()), []);
   const lanes = await page.locator(".tl-swim").count();
-  const strip = await page.locator(".tl-swim-strip").first().boundingBox();
-  await page.mouse.click(strip.x + strip.width * 0.5, strip.y + 5);
-  const selection = await page.evaluate(() => document.querySelector("#tl-selected-band")?.style.left);
-  assert.ok(lanes >= 2 && selection);
-  results.lanes = lanes;
+  results.fullLaneCount = lanes;
+  assert.ok(lanes >= 2, "clearing the applied filter restores multiple source lanes");
+  const strip = page.locator(".tl-swim-strip").first();
+  await strip.scrollIntoViewIfNeeded();
+  const box = await strip.boundingBox();
+  const beforeSelection = await page.locator("#tl-selected-band").evaluate(node => node.style.left);
+  const fraction = parseFloat(beforeSelection) < 50 ? 0.75 : 0.25;
+  await strip.click({ position: { x: box.width * fraction, y: 5 } });
+  await page.waitForFunction(before => {
+    const band = document.querySelector("#tl-selected-band");
+    return band && !band.hidden && band.style.left !== before && parseFloat(band.style.width) > 0;
+  }, beforeSelection);
+  const selection = await page.locator("#tl-selected-band").evaluate(node => node.style.left);
+  assert.ok(selection); assert.notEqual(selection, beforeSelection, "a real lane click moves the selection");
+  results.lanes = lanes; results.selection = selection;
+  phase = "Case investigation";
 
   // Case: pivots on the case timeline, hypotheses and report synthesis.
   await page.evaluate(() => WorkspaceContext.setScope("case", { animate: false }));
@@ -129,6 +153,12 @@ try {
 
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ ...results, errors }, null, 2));
+} catch (error) {
+  const timeline = await page.evaluate(() => ({ filters: backendFilters(),
+    lanes: [...document.querySelectorAll(".tl-swim-label span")].map(node => node.textContent),
+    selection: document.querySelector("#tl-selected-band")?.style.left,
+  })).catch(() => null);
+  await captureFailure(page, "test-security-triage", error, { phase, results, errors, timeline }); throw error;
 } finally {
   await browser.close();
 }

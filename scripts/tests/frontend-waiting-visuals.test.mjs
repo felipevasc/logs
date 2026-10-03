@@ -20,6 +20,7 @@ function fixture({ reduced = false, intersection = true, legacyMedia = false, no
   class Node extends Target {
     constructor(document, tag) { super(); this.ownerDocument = document; this.tag = tag; this.children = []; this.dataset = {}; this.attributes = {}; this.hidden = false; this.writes = 0; this.htmlWrites = 0; }
     append(...nodes) { for (const node of nodes) { node.remove(); node.parent = this; this.children.push(node); } }
+    moveBefore(node, before) { assert.equal(before, null); this.append(node); }
     remove() { if (this.parent) this.parent.children = this.parent.children.filter(node => node !== this); this.parent = null; }
     get isConnected() { return this === this.ownerDocument.body || !!this.parent?.isConnected; }
     set textContent(value) { this.text = String(value); this.writes++; }
@@ -357,8 +358,8 @@ test('short inspection and long story have separate pacing and close without a j
   assert.match(css, /\[data-animated="true"\]\[data-pace="loop"\] \.wv-reader \{ animation: wv-reader-travel/);
   assert.doesNotMatch(css, /\[data-animated="true"\] \.wv-reader \{ animation:/, 'short gesture never walks');
   const sourceBytes = Buffer.byteLength(source), cssBytes = Buffer.byteLength(css);
-  assert.ok(sourceBytes < 43000 && cssBytes < 240000 && sourceBytes + cssBytes < 280000,
-    'seven families plus shared CSS-only stories stay under a bounded 280 KB total / 43 KB JS / 240 KB CSS source budget, with no external assets');
+  assert.ok(sourceBytes < 46000 && cssBytes < 240000 && sourceBytes + cssBytes < 280000,
+    'seven families plus shared CSS-only stories stay under a bounded 280 KB total / 46 KB JS / 240 KB CSS source budget, with no external assets');
 });
 
 test('two walking steps plant one foot while the other lifts, then return to the same stance', () => {
@@ -1346,4 +1347,56 @@ test('terminal and cancelling states stop immediately while retaining a committe
     visual.update(receipt({ phaseId, state, elapsedMs: 6100 })); assert.equal(visual.element.dataset.motion, 'static', `${phaseId}/${state}`);
     assert.equal(visual.element.dataset.family, 'neutral'); assert.equal(visual.element.dataset.animated, 'false'); visual.destroy();
   }
+});
+
+test('atomic completion preserves native animation state without reading or rewriting clocks', () => {
+  const f = fixture(), visual = f.api.mount(f.host, receipt()); f.observers[0].deliver(true);
+  f.parts(visual).art.getAnimations = () => { throw Error('atomic transfer must not inspect clocks'); };
+  assert.equal(visual.complete(), true); assert.equal(visual.element.dataset.completionTransfer, 'atomic');
+  gestureBoundary(f, visual); assert.equal(visual.element.isConnected, false);
+});
+
+for (const atomic of ['missing', 'rejected']) test(`compatible completion restores running and parked clocks when atomic move is ${atomic}`, () => {
+  const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 0 })); f.observers[0].deliver(true);
+  f.document.body.moveBefore = atomic === 'missing' ? undefined : () => { throw Error('unsupported atomic move'); };
+  const timeline = {}, a = {}, b = {};
+  const animation = (target, name, time, start, state) => ({ effect: { target }, animationName: name,
+    currentTime: time, startTime: start, timeline, playState: state,
+    pause() { this.playState = 'paused'; this.startTime = null; } });
+  const old = [animation(a, 'parked-work', 7216, null, 'paused'), animation(b, 'bridge', 800, 1200, 'running'), animation(a, 'bridge', 400, 1600, 'running')];
+  const fresh = [animation(a, 'bridge', 0, null, 'running'), animation(a, 'parked-work', 0, null, 'paused'), animation(b, 'bridge', 0, null, 'running')];
+  f.parts(visual).art.getAnimations = () => [...(visual.element.parent === f.document.body ? fresh : old)];
+  assert.equal(visual.complete(), true); assert.equal(visual.element.dataset.completionTransfer, 'clock-transfer');
+  assert.deepEqual(fresh.map(a => [a.currentTime, a.startTime, a.playState]), [[400, 1600, 'running'], [7216, null, 'paused'], [800, 1200, 'running']]);
+  assert.equal(visual.element.inert, true); visual.destroy();
+  assert.equal(f.document.count('workspace-context-change'), 0);
+});
+
+test('incompatible completion transfer removes decoration instead of restarting or blocking results', () => {
+  for (const mode of ['no-animation-api', 'missing-track', 'unresolved-time']) {
+    const f = fixture(), visual = f.api.mount(f.host, receipt()); f.observers[0].deliver(true);
+    f.document.body.moveBefore = undefined;
+    if (mode !== 'no-animation-api') {
+      const target = {}, track = { effect: { target }, animationName: 'gesture', currentTime: mode === 'unresolved-time' ? null : 500 };
+      f.parts(visual).art.getAnimations = () => visual.element.parent === f.document.body ? [] : [track];
+    }
+    assert.equal(visual.complete(), false, mode); assert.equal(visual.element.isConnected, false);
+    assert.equal(f.document.count('workspace-context-change'), 0);
+  }
+});
+
+test('legacy clock transfer ignores a consumed iteration and ends at the pending complete boundary', () => {
+  const f = fixture(), visual = f.api.mount(f.host, receipt({ elapsedMs: 9000 })); f.observers[0].deliver(true);
+  f.document.body.moveBefore = undefined;
+  const { art } = f.parts(visual), target = art.children.find(node => node.className === 'wv-work-boundary'), timeline = {};
+  const animation = time => ({ effect: { target, getComputedTiming: () => ({ duration: 7200 }) }, animationName: 'wv-work-boundary', currentTime: time, startTime: 0, timeline, playState: 'running' });
+  const old = animation(8500), fresh = animation(0);
+  art.getAnimations = () => [visual.element.parent === f.document.body ? fresh : old];
+  assert.equal(visual.complete(), true);assert.equal(fresh.currentTime,8500);
+  art.emit('animationiteration',{target,animationName:'wv-work-boundary',elapsedTime:7.2});
+  assert.equal(visual.element.isConnected,true,'restoring iteration one must not terminate iteration two');
+  art.emit('animationcancel',{target,animationName:'wv-work-boundary',elapsedTime:8.5});
+  assert.equal(visual.element.isConnected,true);
+  art.emit('animationiteration',{target,animationName:'wv-work-boundary',elapsedTime:14.4});
+  assert.equal(visual.element.isConnected,false);
 });

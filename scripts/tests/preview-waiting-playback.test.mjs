@@ -19,3 +19,16 @@ test('completion playback checks actual identity/time preservation, available in
   assert.ok(fullPreview.includes('test-waiting-playback.mjs'));
   assert.ok(planValidation(['frontend/waiting-visuals.js']).preview.includes('test-waiting-playback.mjs'));
 });
+test('legacy completion gate covers consumed loops, parked reaction tracks and strict original remainder',()=>{
+  const fallback=readFileSync(new URL('../preview/test-waiting-completion-fallback.mjs',import.meta.url),'utf8');
+  assert.match(fallback,/Object\.defineProperty\(document\.body,'moveBefore',\{value:undefined/);
+  assert.match(fallback,/\['short-gesture','later-work-loop','coffee-react','bridge-prepare','bridge-resume'\]/);
+  assert.match(fallback,/sameAnimations,false/);assert.match(fallback,/currentTime>8000/);
+  assert.match(fallback,/before\.state==='running'/);assert.match(fallback,/e\.elapsedTime===14\.4/);
+  assert.match(fallback,/removedAfterMs-handoff\.expectedRemainingMs-extra/);
+  assert.doesNotMatch(fallback,/new AnimationEvent|sampling\.seek|playbackRate\s*=(?!=)|\.currentTime\s*=(?!=)/);
+  assert.ok(fullPreview.includes('test-waiting-completion-fallback.mjs'));
+  assert.ok(planValidation(['frontend/waiting-visuals.js']).preview.includes('test-waiting-completion-fallback.mjs'));
+  assert.match(source,/report\.capabilities\.atomicMove,true/);
+  assert.match(source,/tailBoundary\.afterCompletionMs-report\.tailHandoff\.expectedRemainingMs/);
+});

@@ -595,8 +595,8 @@ window.Security = (() => {
     for (const [slot, view] of views) { if (!slot.isConnected) views.delete(slot); else drawView(slot, view); }
   });
   async function renderPage(host) {
-    host.innerHTML = `<section class="sec-intro"><div><p>Calcule os indícios quando quiser investigar o conjunto completo.<br>Abra um indício para percorrer as evidências até os eventos originais.</p></div><small>Força da evidência, impacto potencial e resultado são informações distintas. “Quase confirmado” também pode descrever uma tentativa muito específica, inclusive bloqueada.</small></section><div class="sec-page-results"></div>`;
-    registerView(host.querySelector('.sec-page-results'), false);
+    host.innerHTML = `<section class="sec-intro"><div><p>Calcule os indícios quando quiser investigar o conjunto completo.<br>Abra um indício para percorrer as evidências até os eventos originais.</p></div><small>Força da evidência, impacto potencial e resultado são informações distintas. “Quase confirmado” também pode descrever uma tentativa muito específica, inclusive bloqueada.</small></section><div class="sec-page-results" data-compromises-results></div>`;
+    registerView(host.querySelector('[data-compromises-results]'), false);
   }
   async function fillSummary({ attention }) {
     if (attention) registerView(attention, true);

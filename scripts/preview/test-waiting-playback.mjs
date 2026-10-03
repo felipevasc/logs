@@ -14,6 +14,8 @@ try {
   await page.addStyleTag({content:'body{background:#0e131b;color:#e6eaf2;font:16px system-ui;padding:30px}h1{font-size:20px}main{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}section{padding:22px;border:1px solid #3e5065;border-radius:12px;background:#141b25}h2{font-size:14px;font-weight:normal}'});
   await page.addStyleTag({content:readFileSync('frontend/waiting-visuals.css','utf8')});
   await page.addScriptTag({content:readFileSync('frontend/waiting-visuals.js','utf8')});
+  report.capabilities=await page.evaluate(()=>({atomicMove:typeof document.body.moveBefore==='function',userAgent:navigator.userAgent}));
+  assert.equal(report.capabilities.atomicMove,true,'this Chromium gate must exercise identity-preserving atomic moves; legacy fallback has its own gate');
   await page.evaluate(()=>{
     window.playback={entries:[],events:[],started:performance.now()};
     for(const [name,elapsedMs] of [['quiet',0],['sparse',9000],['churn',9000]]) {
@@ -55,19 +57,22 @@ try {
   await page.waitForFunction(()=>tail.element.dataset.motion==='running');await page.waitForTimeout(500);
   report.tailHandoff=await page.evaluate(()=>{
     const art=tail.element.querySelector('.wv-art'),before=art.getAnimations({subtree:true}),times=before.map(a=>a.currentTime),focus=document.activeElement;
+    const clock=before.find(a=>a.animationName==='wv-gesture-boundary'),expectedRemainingMs=2400-clock.currentTime;
     const started=performance.now(),continued=tail.complete(),after=art.getAnimations({subtree:true});window.tailBoundary=null;
     tail.element.addEventListener('animationend',event=>{if(event.animationName==='wv-gesture-boundary')tailBoundary={trusted:event.isTrusted,elapsedTime:event.elapsedTime,afterCompletionMs:performance.now()-started};},true);
     return{continued,inert:tail.element.inert,parentIsBody:tail.element.parentElement===document.body,sameFocus:focus===document.activeElement,
-      sameAnimations:before.length===after.length&&after.every((a,i)=>a===before[i]),beforeTimes:times,afterTimes:after.map(a=>a.currentTime),pointerEvents:getComputedStyle(tail.element).pointerEvents};
+      sameAnimations:before.length===after.length&&after.every((a,i)=>a===before[i]),beforeTimes:times,afterTimes:after.map(a=>a.currentTime),expectedRemainingMs,
+      transfer:tail.element.dataset.completionTransfer,pointerEvents:getComputedStyle(tail.element).pointerEvents};
   });
   for(const key of ['continued','inert','parentIsBody','sameFocus','sameAnimations'])assert.equal(report.tailHandoff[key],true,key);
   assert.equal(report.tailHandoff.pointerEvents,'none');
+  assert.equal(report.tailHandoff.transfer,'atomic');
   assert.ok(report.tailHandoff.afterTimes.every((t,i)=>t>=report.tailHandoff.beforeTimes[i]),'moving to the completion region never rewinds a track');
   await page.locator('#tail-target').click();assert.equal(await page.evaluate(()=>tailClicked),true,'real result remains clickable through the inert continuation');
   await page.screenshot({path:resolve(output,'waiting-playback-short-completion.png'),animations:'allow'});
   await page.waitForFunction(()=>!tail.element.isConnected);report.tailBoundary=await page.evaluate(()=>tailBoundary);
   assert.equal(report.tailBoundary.trusted,true);assert.equal(report.tailBoundary.elapsedTime,2.4);
-  assert.ok(report.tailBoundary.afterCompletionMs>1000&&report.tailBoundary.afterCompletionMs<4000,'only the original remaining gesture completes');
+  assert.ok(Math.abs(report.tailBoundary.afterCompletionMs-report.tailHandoff.expectedRemainingMs)<250,'only the original remaining gesture completes; a full restart must fail');
   // Longest adapter: park proof, complete coffee, return, recover proof. Natural1x.
   await page.evaluate(()=>{
     const receipt={operationId:'complete-coffee',phaseId:'command:case_report_render',state:'running',elapsedMs:60000,label:'Compondo relatório'};
