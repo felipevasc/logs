@@ -70,7 +70,14 @@ public static class PreviewJob {
       });
       // The handle came from Process.Start, not from a later PID lookup.
       Check(AssignProcessToJobObject(job, child.Handle));
-      child.StandardInput.WriteLine("run"); child.StandardInput.Close();
+      // .NET Framework uses Console.InputEncoding for StandardInput and may
+      // already emit its UTF-8 BOM while enabling AutoFlush in Process.Start.
+      // Send a fixed ASCII frame, independent of the console's text encoder;
+      // managed-child accepts that one optional preamble, never arbitrary text.
+      var release = Encoding.ASCII.GetBytes("run\n");
+      child.StandardInput.BaseStream.Write(release, 0, release.Length);
+      child.StandardInput.BaseStream.Flush();
+      child.StandardInput.Close();
       var stop = Task.Run(() => Console.ReadLine());
       while (!child.WaitForExit(50)) { if (stop.IsCompleted) return 130; }
       return child.ExitCode;

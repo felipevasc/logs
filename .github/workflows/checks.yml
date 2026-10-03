@@ -170,6 +170,11 @@ jobs:
           workspaces: src-tauri -> target
           shared-key: desktop-release-v1
       - run: npm ci
+      # This Windows-specific handshake must pass before merging, not first
+      # surface when the release builds its installers.
+      - name: Verify Windows process cleanup
+        if: runner.os == 'Windows'
+        run: node scripts/release/test-process-supervision.mjs
       - run: npm run prepare:frontend
       - name: Backend tests
         if: runner.os != 'Windows'

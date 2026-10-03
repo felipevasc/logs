@@ -59,6 +59,11 @@ export function planValidation(files, { full = false, deleted = [] } = {}) {
     // safely narrow its browser coverage, but it does not require Rust rebuilds.
     if (/^frontend\/(?:app\.js|index\.html|styles\.css|analysis-context\.js|performance-core\.js)$/.test(path)) { broad = true; continue; }
     if (/^scripts\/tests\//.test(path)) continue; // all Node tests always run
+    // These helpers have a Windows-only Job Object/stdio handshake. Linux's
+    // frontend suite cannot approve their Windows process-tree behavior.
+    if (/^scripts\/preview\/(?:windows-job\.ps1|managed-child\.mjs|managed-process\.mjs|supervisor-handshake\.mjs)$/.test(path)) {
+      native = true; broad = true; continue;
+    }
     if (path === 'scripts/preview/test-native-desktop.mjs') {
       native = true; broad = true; continue; // real Windows executable, never mock Chromium
     }
