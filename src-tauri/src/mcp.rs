@@ -978,6 +978,7 @@ impl LogInsightMcp {
         let app = self.app.clone();
         let generation = crate::operations::generation();
         let value = tokio::task::spawn_blocking(move || {
+            let _resource_action = crate::resource_actions::begin(format!("MCP · {}", crate::resource_monitor::operation_label::<F>()));
             crate::operations::run(generation, || {
                 let state = app.state::<AppState>();
                 f(state.inner())
@@ -997,6 +998,7 @@ impl LogInsightMcp {
         let app = self.app.clone();
         let generation = crate::operations::generation();
         let result = tokio::task::spawn_blocking(move || {
+            let _resource_action = crate::resource_actions::begin(format!("MCP · {}", crate::resource_monitor::operation_label::<F>()));
             crate::operations::run(generation, || {
                 let state = app.state::<AppState>();
                 f(state.inner())
@@ -1016,6 +1018,7 @@ impl LogInsightMcp {
         let app = self.app.clone();
         let generation = crate::operations::generation();
         let result = tokio::task::spawn_blocking(move || {
+            let _resource_action = crate::resource_actions::begin(format!("MCP · {}", crate::resource_monitor::operation_label::<F>()));
             crate::operations::run(generation, || {
                 let state = app.state::<AppState>();
                 f(state.inner(), &app)
@@ -1174,6 +1177,7 @@ impl LogInsightMcp {
         crate::workspace::validate(&p.filters).map_err(|e| McpError::invalid_params(e, None))?;
         let app = self.app.clone();
         let snapshot = tokio::task::spawn_blocking(move || {
+            let _resource_action = crate::resource_actions::begin("MCP · Explorar registros e facetas");
             let state = app.state::<AppState>();
             crate::explore_snapshot_impl(
                 state.inner(),
@@ -1691,7 +1695,7 @@ impl LogInsightMcp {
         annotations(read_only_hint = false, idempotent_hint = true)
     )]
     async fn threat_catalog_update(&self) -> Result<CallToolResult, McpError> {
-        let result = from_domain(crate::threats::threat_catalog_update().await)?;
+        let result = from_domain(crate::threats::threat_catalog_update(self.app.clone()).await)?;
         if succeeded(&result) {
             notify_state_changed(&self.app, "threats");
         }

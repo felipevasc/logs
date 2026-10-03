@@ -4,6 +4,9 @@
   "version": "0.5.0",
   "type": "module",
   "scripts": {
+    "test": "node scripts/test-case-autosave.mjs && node scripts/preview/test-workspace-scope.mjs && node scripts/preview/test-value-inspector-unit.mjs && node scripts/release/test-release.mjs && node scripts/release/test-process-supervision.mjs",
+    "test:preview": "node scripts/preview/run-smoke.mjs",
+    "check": "npm test && node scripts/release/verify-version.mjs && npm run prepare:frontend",
     "prepare:frontend": "node scripts/prepare-frontend.mjs",
     "preview": "node --watch scripts/preview/serve.mjs 4173",
     "vendor:timeline": "node scripts/vendor-timeline-export.mjs",

@@ -56,12 +56,12 @@ window.EntityMenu = (() => {
   function open(x, y, entity) { showCtxMenu(x, y, items(entity)); }
 
   /** Compact chip that opens the pivots on click or right-click. */
-  function chip(entity, extra = "") {
+  function chip(entity, extra = "", { revealed = false } = {}) {
     const column = entity.column || guess(entity.value);
     const node = el("button", `entity-chip ${extra}`.trim());
     node.type = "button";
     node.innerHTML = `<i class="fas ${icon(column)}" aria-hidden="true"></i><span></span>`;
-    const display = value => window.EvidenceUI?.redact({ [column]: value })[column] ?? value;
+    const display = value => revealed ? value : window.EvidenceUI?.redact({ [column]: value })[column] ?? value;
     node.querySelector("span").textContent = display(entity.display || entity.value);
     node.title = `${label(column)}: ${display(entity.value)}${entity.scope ? ` · rede ${entity.scope}` : ""}\nClique para ações`;
     const act = event => { event.preventDefault(); event.stopPropagation(); const r = node.getBoundingClientRect(); open(event.clientX || r.left, event.clientY || r.bottom, { ...entity, column }); };

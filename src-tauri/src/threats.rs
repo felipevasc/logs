@@ -828,7 +828,7 @@ fn snippet(text: &str, start: usize, end: usize) -> String {
 fn scan_impl(
     state: &AppState,
     filters: Vec<Filter>,
-    case: Option<Vec<Event>>,
+    case: Option<Arc<Vec<Event>>>,
     catalog: Arc<CompiledCatalog>,
     catalog_path: String,
     mut progress: impl FnMut(usize),
@@ -844,7 +844,7 @@ fn scan_impl(
     let mut sources = crate::distinct::Terms::default();
     let mut timeline = Timeline::new();
     let (mut start, mut end) = (None, None);
-    visit(state, &ordinary, case.as_deref(), &catalog, |event| {
+    visit(state, &ordinary, case.as_deref().map(Vec::as_slice), &catalog, |event| {
         if operations::cancelled() {
             return;
         }
@@ -946,7 +946,7 @@ pub struct EventResult {
 fn events_impl(
     state: &AppState,
     mut filters: Vec<Filter>,
-    case: Option<Vec<Event>>,
+    case: Option<Arc<Vec<Event>>>,
     offset: usize,
     limit: usize,
     catalog: Arc<CompiledCatalog>,
@@ -957,7 +957,7 @@ fn events_impl(
     validate_local(&filters, &catalog)?;
     let (ordinary, predicates) = split_filters(&filters, &catalog)?;
     let mut result = EventResult { total: 0, rows: vec![], complete: true, clipped_records: 0, rows_clipped: 0 };
-    visit(state, &ordinary, case.as_deref(), &catalog, |event| {
+    visit(state, &ordinary, case.as_deref().map(Vec::as_slice), &catalog, |event| {
         if operations::cancelled() {
             return;
         }
@@ -983,8 +983,20 @@ pub async fn threat_catalog() -> Result<CatalogInfo, String> {
     crate::offload(catalog_info).await
 }
 #[tauri::command]
-pub async fn threat_catalog_update() -> Result<CatalogUpdate, String> {
-    crate::offload(|| update_catalog_path(&path(), BUILTIN.as_bytes())).await?
+pub async fn threat_catalog_update(app: tauri::AppHandle) -> Result<CatalogUpdate, String> {
+    crate::offload(move || {
+        let state = app.state::<AppState>();
+        let mut source = state.source.write();
+        operations::check()?;
+        let update = update_catalog_path(&path(), BUILTIN.as_bytes())?;
+        operations::commit();
+        if let SourceData::Indexed(idx) = &mut *source {
+            idx.big_data = None;
+        }
+        crate::big_data_commands::clear_results();
+        Ok(update)
+    })
+    .await?
 }
 #[tauri::command]
 pub async fn threat_scan(
@@ -993,7 +1005,7 @@ pub async fn threat_scan(
     case_key: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<ScanResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     crate::offload(move || {
         let path = path();
         let catalog = load_path(&path)?;
@@ -1019,7 +1031,7 @@ pub async fn threat_events(
     limit: Option<usize>,
     app: tauri::AppHandle,
 ) -> Result<EventResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     crate::offload(move || {
         events_impl(
             app.state::<AppState>().inner(),
@@ -1046,6 +1058,7 @@ mod tests {
     fn state(source: SourceData) -> AppState {
         AppState {
             source: parking_lot::RwLock::new(source),
+            big_data_enabled: std::sync::atomic::AtomicBool::new(false),
             source_names: parking_lot::RwLock::new(vec![]),
             codes: parking_lot::RwLock::new(Default::default()),
             system_codes: parking_lot::RwLock::new(Default::default()),
@@ -1150,7 +1163,7 @@ mod tests {
         let pfs = query::prepare_with_threat_catalog(&[filter("test.alpha")], Some(&catalog));
         assert_eq!(events.iter().filter(|e| query::matches(e, &pfs[0])).count(), 2);
         let page =
-            events_impl(&state(SourceData::None), vec![filter("test.alpha")], Some(events), 1, 1, catalog).unwrap();
+            events_impl(&state(SourceData::None), vec![filter("test.alpha")], Some(events.into()), 1, 1, catalog).unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].id, 2);
@@ -1182,7 +1195,7 @@ mod tests {
         assert_eq!(expected["matched"], 10);
         assert_eq!(expected["rules"][0]["count"], 10);
         assert_eq!(scan(&indexed, None), expected);
-        assert_eq!(scan(&state(SourceData::None), Some(events.clone())), expected);
+        assert_eq!(scan(&state(SourceData::None), Some(events.clone().into())), expected);
         let pfs = query::prepare_with_threat_catalog(&[filter("test.alpha")], Some(&catalog));
         let mut matches = vec![];
         if let SourceData::Indexed(index) = &*indexed.source.read() {

@@ -8,7 +8,8 @@ import { handlePreviewDownload } from "./downloads.mjs";
 
 const root = resolve(fileURLToPath(new URL("../../frontend", import.meta.url)));
 const mockFile = fileURLToPath(new URL("./mock-tauri.js", import.meta.url));
-const port = Number(process.argv[2]) || 4173;
+const port = process.argv[2] === undefined ? 4173 : Number(process.argv[2]);
+if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Invalid preview port");
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -22,7 +23,7 @@ const MIME = {
   ".ttf": "font/ttf",
 };
 
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
     if (await handlePreviewDownload(req, res, url)) return;
@@ -77,4 +78,4 @@ createServer(async (req, res) => {
     res.writeHead(404);
     res.end("not found");
   }
-}).listen(port, "127.0.0.1", () => console.log(`preview em http://127.0.0.1:${port}`));
+}).listen(port, "127.0.0.1", () => console.log(`preview em http://127.0.0.1:${server.address().port}`));

@@ -1,0 +1,98 @@
+import assert from "node:assert/strict";
+import { chromium } from "playwright";
+import { existsSync, mkdirSync } from "node:fs";
+
+let executablePath = chromium.executablePath();
+if (!existsSync(executablePath)) executablePath = [
+  "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+  "C:/Program Files/Google/Chrome/Application/chrome.exe",
+].find(existsSync);
+const browser = await chromium.launch(executablePath ? { executablePath } : {});
+const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+const errors = []; page.on("pageerror", error => errors.push(error.message));
+try {
+  await page.goto(process.argv[2] || "http://127.0.0.1:4173");
+  await page.waitForFunction(() => WorkspaceContext.ready && state.loaded && state.rows.length > 0);
+  await page.evaluate(() => {
+    const original = api;
+    window.__detailCalls = 0; window.__insightPending = []; window.__copies = [];
+    api = (command, args, options) => {
+      if (command === "event_insights") return new Promise(resolve => window.__insightPending.push(resolve));
+      if (command === "event_detail") window.__detailCalls++;
+      return original(command, args, options);
+    };
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async value => { window.__copies.push(value); } } });
+    const b64 = obj => btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(obj)))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+    const token = `${b64({ alg: "HS256", typ: "JWT" })}.${b64({ sub: "José 🔐", roles: ["admin"], exp: 1700000000, html: '<img src=x onerror="window.__injected=true">' })}.c2ln`;
+    window.__detailFixture = { ...state.rows[0], id: 999901, level: "Informação", raw: 'password="fixture-secret"', message: "password=fixture-secret", fields: { password: "fixture-secret", token, structured: { password: "nested-secret", arr: [1, 2] } } };
+    window.__fixtureBefore = JSON.stringify(window.__detailFixture);
+    window.__insightsFixture = { entities: [], rules: [], threats: [], decoded: [{ kind: "Base64", source: "token", text: '{"sub":"decoded-private-subject"}' }], normalization: { fields: { password: "normalized-secret" } } };
+    showDetail(window.__detailFixture);
+  });
+  const drawer = page.locator("#drawer");
+  assert.ok(!(await drawer.innerHTML()).includes("fixture-secret"));
+  assert.ok(!(await drawer.innerHTML()).includes("nested-secret"));
+  await page.locator("#dr-copy").click();
+  assert.ok(!(await page.evaluate(() => window.__copies.at(-1))).includes("fixture-secret"));
+  assert.equal(await page.evaluate(() => window.__detailCalls), 0, "copy uses the displayed event, including Case/evidence records");
+
+  await page.locator('[data-col="token"] .kv-inspect').click();
+  const dialog = page.locator("dialog.value-inspector");
+  assert.ok(!(await dialog.innerHTML()).includes("José"));
+  assert.equal(await page.evaluate(() => window.__copies.length), 1, "opening must not copy automatically");
+  await dialog.getByRole("button", { name: "Mostrar valor e subcampos", exact: true }).click();
+  assert.ok((await dialog.innerHTML()).includes("José"));
+  assert.equal(await dialog.locator("img,a,iframe,script").count(), 0, "decoded text must not become markup or navigation");
+  assert.equal(await dialog.locator(".kv-filter").count(), 0, "virtual fields must not offer backend filters");
+  await dialog.locator("details.value-node").evaluateAll(nodes => nodes.forEach(node => node.open = true));
+  const sub = dialog.locator(".value-node").filter({ has: page.locator(".value-node-key", { hasText: /^sub$/ }) }).last();
+  await sub.getByRole("button", { name: "Copiar caminho", exact: true }).click();
+  assert.match(await page.evaluate(() => window.__copies.at(-1)), /::jwt\["payload"\]\["sub"\]/);
+  await sub.getByRole("button", { name: "Copiar valor", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.__copies.at(-1)), "José 🔐");
+  await dialog.getByRole("button", { name: "Ocultar valor e subcampos", exact: true }).click();
+  assert.ok(!(await dialog.innerHTML()).includes("José"));
+  await dialog.getByRole("button", { name: "Fechar", exact: true }).click();
+
+  // A reply after reveal must respect the current state, without another IPC.
+  await page.locator("#dr-reveal").click();
+  await page.evaluate(() => window.__insightPending.shift()(window.__insightsFixture));
+  await page.waitForSelector(".insight-decoded");
+  assert.ok((await drawer.innerHTML()).includes("decoded-private-subject"));
+  assert.ok((await drawer.innerHTML()).includes("normalized-secret"));
+  await page.locator("#dr-copy").click();
+  assert.ok((await page.evaluate(() => window.__copies.at(-1))).includes("fixture-secret"));
+  await page.locator("#dr-reveal").click();
+  for (const secret of ["fixture-secret", "nested-secret", "normalized-secret", "decoded-private-subject"]) assert.ok(!(await drawer.innerHTML()).includes(secret), `hide must remove ${secret} from DOM`);
+  assert.equal(await page.evaluate(() => window.__insightPending.length), 0, "visibility changes must reuse insights");
+  await page.locator("#dr-reveal").click();
+  await page.locator("#dr-close").click();
+  assert.equal(await page.evaluate(() => state.currentDetailEv), null);
+  assert.ok(!(await drawer.innerHTML()).includes("fixture-secret"));
+  await page.evaluate(() => showDetail(window.__detailFixture));
+  assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "false");
+  await page.locator("#dr-reveal").click();
+  await page.evaluate(() => showDetail({ ...window.__detailFixture, id: 999902 }));
+  assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "false");
+  await page.evaluate(() => window.__insightPending.shift()(window.__insightsFixture));
+  assert.equal(await page.locator(".insight-block").count(), 0, "stale previous-event replies must not render");
+  await page.evaluate(() => window.__insightPending.shift()(window.__insightsFixture));
+  await page.waitForSelector(".insight-decoded");
+  assert.ok(!(await drawer.innerHTML()).includes("decoded-private-subject"), "masked default must apply sensitivity of the decoded source field");
+  await page.locator("#dr-reveal").click();
+  await page.evaluate(() => showDetailLoading());
+  assert.ok(!(await drawer.innerHTML()).includes("fixture-secret"));
+  await page.evaluate(() => { showDetail(window.__detailFixture); closeDrawer(); window.__insightPending.shift()(window.__insightsFixture); });
+  assert.equal(await page.locator(".insight-block").count(), 0, "closing invalidates pending insights");
+  assert.equal(await page.evaluate(() => JSON.stringify(window.__detailFixture) === window.__fixtureBefore), true);
+  assert.equal(await page.evaluate(() => window.__injected), undefined);
+  assert.equal(await page.locator("#ws-mask").isChecked(), true, "reveal must not change export masking");
+  await page.evaluate(() => { showDetail(window.__detailFixture); ValueInspector.open(window.__detailFixture.fields.token, { label: "JWT do registro", revealed: true }); });
+  await page.locator("dialog.value-inspector details.value-node").evaluateAll(nodes => nodes.forEach(node => node.open = true));
+  mkdirSync("output/playwright", { recursive: true });
+  await page.screenshot({ path: "output/playwright/value-inspector.png" });
+  await page.evaluate(() => closeDrawer());
+  assert.equal(await page.locator("dialog.value-inspector").count(), 0);
+  assert.deepEqual(errors, []);
+  console.log("Detail reveal and inspector UI checks passed (mask/copy/reset, JWT tree, XSS, stale insights, source-sensitive decode).");
+} finally { await browser.close(); }

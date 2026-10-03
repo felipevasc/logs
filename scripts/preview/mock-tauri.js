@@ -88,6 +88,7 @@
   const loadedParts = ["mock.jsonl (preview)"];
   const derivedFields = [];
   const mockCalls = {};
+  let mockBigData = false;
   window.__mockCalls = mockCalls;
   let merged = false;
 
@@ -424,11 +425,27 @@
       }
       return null;
     },
-    cases_save: ({ data }) => { localStorage.setItem("__mockStore", JSON.stringify(data)); return null; },
+    cases_save: ({ data }) => {
+      const current = JSON.parse(localStorage.getItem("__mockStore") || "null");
+      const revision = current?.revision || 0;
+      if (revision > 0 && data.revision == null) throw new Error("Reabra a investigação antes de salvar: revisão ausente.");
+      if (data.revision != null && data.revision !== revision) throw new Error("A investigação foi alterada em outra sessão. Reabra-a antes de salvar.");
+      const next = { ...data, schemaVersion: 2, revision: revision + 1 };
+      localStorage.setItem("__mockStore", JSON.stringify(next));
+      return { schemaVersion: 2, revision: next.revision };
+    },
     cases_load: () => {
       const saved = localStorage.getItem("__mockStore");
-      if (saved) return JSON.parse(saved);
-      return {
+      if (saved) {
+        const data = JSON.parse(saved);
+        if (!Number.isSafeInteger(data.revision)) {
+          data.revision = 1; data.schemaVersion = 2;
+          localStorage.setItem("__mockStore", JSON.stringify(data));
+        }
+        return data;
+      }
+      const data = {
+        revision: 1, schemaVersion: 2,
         active: "case-demo",
         cases: [{
           id: "case-demo", name: "Caso Demo", createdAt: now,
@@ -467,6 +484,8 @@
         workspace: { view: "source", analysisView: "overview" },
       }],
       };
+      localStorage.setItem("__mockStore", JSON.stringify(data));
+      return data;
     },
     get_codes: () => "{}",
     get_codes_path: () => "C:\\mock\\codes.json",
@@ -731,7 +750,33 @@
     return { analysis_id: "preview-analysis", policy_version: "evidence-1", normalization_version: "normalization-1", attack_version: "19.2", counts_by_level: [1,2,3,4,5].map(n => shaped.filter(d => d.evidence_level === n).length), rule_coverage: [{ rule: "execution", status: "missing_fields", missing: ["process.entity_id"] }], limitations: ["Cenario sintetico de demonstracao"], total: rows.length, undated: rows.length - times.length, start: times.length ? Math.min(...times) : null, end: times.length ? Math.max(...times) : null, complete: true, limited: false, detections: shaped, episodes, entities, rare, tactics, coverage: [{ column: "@user", label: "Usuário", count: rows.filter(e => e.fields?.usuario).length }, { column: "@src_ip", label: "IP de origem", count: rows.filter(e => e.fields?.ip_cliente).length }], suppressed, rules: MOCK_RULES.length - detectionSettings.disabled.length, sigma_rules: 0, sigma_errors: [], threat_rules: detectionSettings.threats ? 378 : 0, elapsed_ms: 120 };
   }
   Object.assign(handlers, {
-    case_sync: ({ key, events }) => { caseStore.set(key, events); if (caseStore.size > 3) caseStore.delete(caseStore.keys().next().value); return null; },
+    resource_snapshot: () => {
+      if (window.__mockResourceSnapshot) return structuredClone(window.__mockResourceSnapshot);
+      const sampledAtMs = Date.now(), startedAtMs = now - 60000;
+      const memory = 16 * 1024 ** 3;
+      const historyLength = Math.min(900, Math.floor((sampledAtMs - startedAtMs) / 1000) + 1);
+      const history = Array.from({ length: historyLength }, (_, index) => {
+        const timestampMs = sampledAtMs - (historyLength - index - 1) * 1000;
+        const phase = (timestampMs - startedAtMs) / 1000;
+        return { timestampMs, appCpuPercent: 8 + 6 * Math.sin(phase / 9), hostCpuPercent: 32 + 14 * Math.sin(phase / 12), appMemoryBytes: 380 * 1024 ** 2 + 12 * 1024 ** 2 * Math.sin(phase / 20), hostMemoryUsedBytes: 7 * 1024 ** 3 + 140 * 1024 ** 2 * Math.sin(phase / 30), readBytesPerSec: 2 * 1024 ** 2 + 1024 ** 2 * Math.sin(phase / 5), writtenBytesPerSec: 200 * 1024 + 100 * 1024 * Math.sin(phase / 6), activeOperations: 1 };
+      });
+      const last = history[history.length - 1];
+      return { preview: true, sampleIntervalMs: 1000, historyLimit: 900, startedAtMs, sampledAtMs, warmingUp: false,
+        host: { os: "Windows · simulação", cpuBrand: "CPU de demonstração", logicalCpus: 8, physicalCores: 4, cpuFrequencyMhz: 3200, totalMemoryBytes: memory, availableMemoryBytes: memory - last.hostMemoryUsedBytes, usedMemoryBytes: last.hostMemoryUsedBytes, totalSwapBytes: 4 * 1024 ** 3, usedSwapBytes: 256 * 1024 ** 2, cpuPercent: last.hostCpuPercent },
+        app: { pid: 4100, processCount: 2, cpuPercent: last.appCpuPercent, oneCoreCpuPercent: last.appCpuPercent * 8, residentBytes: last.appMemoryBytes, virtualBytes: 800 * 1024 ** 2, memoryPercent: 100 * last.appMemoryBytes / memory, readBytesPerSec: last.readBytesPerSec, writtenBytesPerSec: last.writtenBytesPerSec, totalReadBytes: 120 * 1024 ** 2, totalWrittenBytes: 30 * 1024 ** 2 },
+        processes: [{ pid: 4100, parentPid: null, name: "loginsight.exe", role: "Principal", cpuPercent: last.appCpuPercent, residentBytes: last.appMemoryBytes - 80 * 1024 ** 2, virtualBytes: 600 * 1024 ** 2, readBytesPerSec: last.readBytesPerSec, writtenBytesPerSec: last.writtenBytesPerSec, totalReadBytes: 120 * 1024 ** 2, totalWrittenBytes: 30 * 1024 ** 2 }, { pid: 4101, parentPid: 4100, name: "msedgewebview2.exe", role: "WebView", cpuPercent: 0, residentBytes: 80 * 1024 ** 2, virtualBytes: 200 * 1024 ** 2, readBytesPerSec: 0, writtenBytesPerSec: 0, totalReadBytes: 0, totalWrittenBytes: 0 }],
+        history, disks: [{ name: "C:", mountPoint: "C:\\", totalBytes: 512 * 1024 ** 3, availableBytes: 250 * 1024 ** 3, kind: "SSD", readBytesPerSec: null, writtenBytesPerSec: null, isAppVolume: true }],
+        inventory: { memoryKnownBytes: 64 * 1024 ** 2, partial: true, components: [{ id: "query", label: "Cache de consultas", memoryBytes: 16 * 1024 ** 2, mappedBytes: null, storageBytes: null, items: 12, basis: "estimated", note: "Estimativa de estruturas internas; exclui overhead do alocador." }, { id: "source", label: "Fonte carregada", memoryBytes: 48 * 1024 ** 2, mappedBytes: 80 * 1024 ** 2, storageBytes: 80 * 1024 ** 2, items: events.length, basis: "logical", note: "Mapa e disco são tamanhos lógicos; não representam RAM residente." }, { id: "busy", label: "Estrutura ocupada", memoryBytes: null, mappedBytes: null, storageBytes: null, items: null, basis: "unavailable", note: "Lock ocupado; indisponível nesta amostra." }] },
+        storage: { root: "C:\\mock\\LogInsight", bytes: 80 * 1024 ** 2, files: 5, entries: 7, sampledAt: sampledAtMs, elapsedMs: 12, partial: false, stale: false, paths: [{ path: "workspace", bytes: 80 * 1024 ** 2, files: 5, partial: false }], note: "Tamanho lógico dos arquivos do aplicativo; não mede setores físicos." },
+        actions: { active: [{ id: 1, label: "Indexando fonte", state: "active", startedAtMs: sampledAtMs - 3500, elapsedMs: 3500, threadCpuMs: 120, progress: { operation: "index", phase: "Lendo eventos", completed: 5000, total: 6000, unit: "eventos" } }], recent: [{ id: 2, label: "Resumo", state: "completed", startedAtMs: sampledAtMs - 6000, elapsedMs: 700, threadCpuMs: null, progress: null }], untrackedActive: 0, totalCompleted: 3, cpuBasis: "CPU da thread iniciadora; exclui workers Rayon/Tantivy e o renderizador." },
+        notes: ["Prévia do navegador: todos os valores deste painel são simulados.", "RAM residente soma processos próprios e pode contar páginas compartilhadas mais de uma vez.", "GPU, largura de banda da RAM e chipset: medição indisponível."] };
+    },
+    set_big_data_mode: ({ enabled }) => {
+      const reused = mockBigData && enabled;
+      mockBigData = enabled === true;
+      return { enabled: mockBigData, ready: mockBigData && events.length > 0, eventCount: events.length, indexBytes: mockBigData ? events.length * 240 : 0, reused, buildMs: reused ? 0 : 25, engine: "tantivy" };
+    },
+    case_sync: ({ key, events, bigData = false }) => { caseStore.set(key, events); if (caseStore.size > 3) caseStore.delete(caseStore.keys().next().value); const ready = bigData && events.length > 0; return { enabled: bigData, ready, eventCount: events.length, indexBytes: ready ? events.length * 240 : 0, reused: false, buildMs: ready ? 25 : 0, engine: "tantivy" }; },
     triage: ({ filters, caseEvents }) => mockTriage(poolOf(caseEvents)),
     triage_evidence_event: ({eventId,eventRef,caseEvents}) => { const e=poolOf(caseEvents).find(e=>e.id===eventId && (e.event_ref || `preview:${e.id}`)===eventRef); if(!e)throw Error("Evento indisponível"); return structuredClone(e); },
     event_insights: ({ event }) => {
@@ -811,6 +856,8 @@
           args = { ...args, caseEvents: caseStore.get(args.caseKey) };
         }
         try {
+          if (window.__mockErrors?.[cmd]) throw new Error(window.__mockErrors[cmd]);
+          if (cmd === "set_big_data_mode" && args.enabled) emitMock("operation-progress", { operation: "bigdata", phase: "Indexando Big Data", completed: 0, total: events.length, unit: "eventos", cancellable: true });
           const scopedCommands=['query_events','explore_snapshot','stats_events','dataset_overview','timeline_range','compare_periods','export_events','aggregate_events','profile_fields','discover_patterns','compute_series','pivot','count_filtered','tree_aggs','trail_events','journey_fields','journey_index','journey_events'];
           if(scopedCommands.includes(cmd)&&args.filters?.some(filter=>filter.op==='threat_rule')){
             const module=await import('/__mock-threats__.js');

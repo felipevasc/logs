@@ -812,6 +812,48 @@ impl<'a> Ctx<'a> {
 }
 
 impl Expr {
+    /// Conservative plan for the embedded index. AND may use any supported
+    /// branch; OR needs every branch. Negating approximate candidates is unsafe.
+    pub(crate) fn index_predicate(&self) -> Option<crate::big_data::Predicate> {
+        use crate::big_data::{ExactMode, Predicate};
+        match self {
+            Expr::And(items) => {
+                let parts: Vec<_> = items.iter().filter_map(Self::index_predicate).collect();
+                (!parts.is_empty()).then_some(Predicate::And(parts))
+            }
+            Expr::Or(items) => Some(Predicate::Or(items.iter().map(Self::index_predicate).collect::<Option<_>>()?)),
+            Expr::Term(term) => {
+                // Alias and case-insensitive field resolution can fall back to
+                // another field; searching all indexed values is a safe superset.
+                let eq = |value: String, mode| Predicate::Equals { column: None, value, mode };
+                match &term.matcher {
+                    Matcher::Contains(s) if s.chars().count() >= 3 => Some(Predicate::Contains(s.clone())),
+                    // read_regex enables Unicode case folding through the
+                    // builder, which as_str() does not expose. Treat every
+                    // regex as case-insensitive for this necessary condition;
+                    // that is also a safe superset for programmatic regexes.
+                    Matcher::Regex(re) => crate::query::regex_index_predicate(&format!("(?i:{})", re.as_str())),
+                    Matcher::Wildcard(re) => crate::query::regex_index_predicate(re.as_str()),
+                    Matcher::Exact(s) => Some(eq(s.clone(), ExactMode::Sensitive)),
+                    Matcher::Equals(s) if term.field.as_ref().is_some_and(|f| f.name == "_all") => {
+                        (s.chars().count() >= 3).then(|| Predicate::Contains(s.clone()))
+                    }
+                    Matcher::Equals(s) => Some(eq(s.clone(), ExactMode::TrimLower)),
+                    Matcher::Level(s) => Some(eq(s.clone(), ExactMode::Sensitive)),
+                    Matcher::Set(values) => Some(Predicate::Or(values.iter().map(|v| eq(v.clone(), ExactMode::TrimLower)).collect())),
+                    Matcher::Cmp(cmp, n) if term.field.as_ref().is_some_and(|f| f.name == "timestamp") => {
+                        crate::query::timestamp_predicate(match cmp { Cmp::Gt => "gt", Cmp::Gte => "gte", Cmp::Lt => "lt", Cmp::Lte => "lte" }, *n, None)
+                    }
+                    Matcher::Range(a, b) if term.field.as_ref().is_some_and(|f| f.name == "timestamp") => {
+                        crate::query::timestamp_predicate("between", *a, Some(*b))
+                    }
+                    _ => None,
+                }
+            }
+            Expr::All | Expr::Not(_) => None,
+        }
+    }
+
     /// Explain only predicates that actually matched. NOT/absence and derived
     /// identities have no textual match and never fabricate a highlighted span.
     pub fn evidence_excerpts(
@@ -1248,7 +1290,7 @@ impl Term {
             }
             (Some(field), Matcher::Cmp(cmp, bound)) if field.name == "timestamp" => {
                 if meta.ts == 0 {
-                    return Some(false);
+                    return None;
                 }
                 let t = meta.ts as f64;
                 Some(match cmp {
@@ -1260,7 +1302,7 @@ impl Term {
             }
             (Some(field), Matcher::Range(lo, hi)) if field.name == "timestamp" => {
                 if meta.ts == 0 {
-                    return Some(false);
+                    return None;
                 }
                 Some((meta.ts as f64) >= *lo && (meta.ts as f64) <= *hi)
             }

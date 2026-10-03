@@ -1,5 +1,7 @@
 mod analysis;
 mod attack;
+mod big_data;
+mod big_data_commands;
 mod case_cache;
 mod case_images;
 mod case_store;
@@ -30,7 +32,14 @@ mod query;
 mod querylang;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod big_data_tests;
 mod remote;
+mod resource_actions;
+mod resource_inventory;
+mod resource_io;
+mod resource_monitor;
+mod resource_system;
 mod sigma;
 mod sources;
 mod threats;
@@ -55,6 +64,7 @@ pub enum SourceData {
 
 pub struct AppState {
     pub source: RwLock<SourceData>,
+    pub big_data_enabled: std::sync::atomic::AtomicBool,
     /// nomes das fontes carregadas (mais de uma quando arquivos são unidos)
     pub source_names: RwLock<Vec<String>>,
     pub codes: RwLock<CodesConfig>,
@@ -94,6 +104,7 @@ fn emit_progress(
     unit: &str,
     cancellable: bool,
 ) {
+    resource_actions::phase(operation, phase, completed, total, unit);
     let Some(app) = app else { return };
     let _ = app.emit(
         "operation-progress",
@@ -130,7 +141,10 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let generation = operations::generation();
-    tauri::async_runtime::spawn_blocking(move || operations::run(generation, f))
+    tauri::async_runtime::spawn_blocking(move || {
+        let _resource_action = resource_actions::begin(resource_monitor::operation_label::<F>());
+        operations::run(generation, f)
+    })
         .await
         .map_err(|e| e.to_string())?
 }
@@ -263,6 +277,7 @@ pub(crate) fn load_event_log_impl(
     crate::operations::commit();
     *source = SourceData::Indexed(idx);
     *state.source_names.write() = names;
+    big_data_commands::clear_results();
     emit_progress(
         app,
         "carregamento",
@@ -418,6 +433,7 @@ pub(crate) fn load_file_impl(
     crate::operations::commit();
     *source = SourceData::Indexed(idx);
     *state.source_names.write() = names;
+    big_data_commands::clear_results();
     emit_progress(
         app,
         "carregamento",
@@ -499,6 +515,7 @@ pub(crate) fn load_files_impl(
     crate::operations::commit();
     *source = SourceData::Indexed(idx);
     *state.source_names.write() = names;
+    big_data_commands::clear_results();
     emit_progress(
         app,
         "carregamento",
@@ -595,6 +612,7 @@ pub(crate) fn set_ts_config_impl(
                     idx.time_order.take();
                     return Err(error.to_string());
                 }
+                big_data_commands::clear_results();
                 return Ok(());
             }
         }
@@ -634,6 +652,7 @@ pub(crate) fn set_ts_config_impl(
         SourceData::None => {}
     }
     std::fs::write(ts_configs_path(), text).map_err(|e| e.to_string())?;
+    big_data_commands::clear_results();
     Ok(())
 }
 
@@ -839,19 +858,25 @@ pub(crate) fn save_derived_field_impl(
     });
     let text = serde_json::to_string_pretty(&defs).map_err(|e| e.to_string())?;
     std::fs::write(derived_path(), text).map_err(|e| e.to_string())?;
-    state.derived.write().retain(|d| d.name != name);
-    state.derived.write().push(sources::CompiledDerived {
+    let mut source_data = state.source.write();
+    let mut derived = state.derived.write();
+    derived.retain(|d| d.name != name);
+    derived.push(sources::CompiledDerived {
         name: name.to_string(),
         source: source.to_string(),
         rules: compiled,
     });
     // fonte em memória (união/Event Log): aplica já; indexada aplica por linha sob demanda
-    if let SourceData::Memory(evs) = &mut *state.source.write() {
-        let derived = state.derived.read();
-        for ev in evs.iter_mut() {
-            sources::apply_derived(ev, &derived);
+    match &mut *source_data {
+        SourceData::Memory(evs) => {
+            for ev in evs.iter_mut() {
+                sources::apply_derived(ev, &derived);
+            }
         }
+        SourceData::Indexed(idx) => idx.big_data = None,
+        SourceData::None => {}
     }
+    big_data_commands::clear_results();
     Ok(())
 }
 
@@ -873,13 +898,19 @@ pub(crate) fn delete_derived_field_impl(state: &AppState, name: &str) -> Result<
     defs.retain(|d| d.name != name);
     let text = serde_json::to_string_pretty(&defs).map_err(|e| e.to_string())?;
     std::fs::write(derived_path(), text).map_err(|e| e.to_string())?;
+    let mut source_data = state.source.write();
     state.derived.write().retain(|d| d.name != name);
     // remove o campo dos eventos em memória imediatamente
-    if let SourceData::Memory(evs) = &mut *state.source.write() {
-        for ev in evs.iter_mut() {
-            ev.fields.remove(name);
+    match &mut *source_data {
+        SourceData::Memory(evs) => {
+            for ev in evs.iter_mut() {
+                ev.fields.remove(name);
+            }
         }
+        SourceData::Indexed(idx) => idx.big_data = None,
+        SourceData::None => {}
     }
+    big_data_commands::clear_results();
     Ok(())
 }
 
@@ -1054,7 +1085,7 @@ fn clear_events(state: State<AppState>) {
 pub(crate) fn clear_events_impl(state: &AppState) {
     *state.source.write() = SourceData::None;
     state.source_names.write().clear();
-    query::clear_match_cache();
+    big_data_commands::clear_results();
 }
 
 /// Resumo da fonte carregada no momento (para MCP/UI saberem o que há no app).
@@ -1107,7 +1138,7 @@ async fn query_events(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<query::QueryResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1118,7 +1149,7 @@ async fn query_events(
             &sort_dir,
             offset,
             limit,
-            case_events.as_deref(),
+            case_events.as_deref().map(Vec::as_slice),
         )
     })
     .await
@@ -1192,7 +1223,7 @@ async fn explore_snapshot(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<query::ExplorerSnapshot, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1204,7 +1235,7 @@ async fn explore_snapshot(
             offset,
             limit,
             Some(&app),
-            case_events.as_deref(),
+            case_events.as_deref().map(Vec::as_slice),
         )
     })
     .await
@@ -1316,7 +1347,7 @@ async fn aggregate_events(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<query::AggResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1330,7 +1361,7 @@ pub(crate) fn aggregate_events_impl(
     group_column: &str,
     aggs: Vec<query::AggSpec>,
     filters: Vec<query::Filter>,
-    case_events: Option<Vec<Event>>,
+    case_events: Option<std::sync::Arc<Vec<Event>>>,
 ) -> query::AggResult {
     // eventos do Caso: aplica os filtros recebidos e agrega sobre o recorte
     if let Some(events) = case_events {
@@ -1418,7 +1449,7 @@ async fn trail_events(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<TrailResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1440,7 +1471,7 @@ pub(crate) fn trail_events_impl(
     before: usize,
     after: usize,
     filters: Vec<query::Filter>,
-    case_events: Option<Vec<Event>>,
+    case_events: Option<std::sync::Arc<Vec<Event>>>,
 ) -> TrailResult {
     if let Some(events) = case_events {
         return trail_from_events(&events, &filters, center_id, before, after);
@@ -1501,7 +1532,7 @@ async fn count_filtered(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<usize, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1513,7 +1544,7 @@ async fn count_filtered(
 pub(crate) fn count_filtered_impl(
     state: &AppState,
     filters: Vec<query::Filter>,
-    case_events: Option<Vec<Event>>,
+    case_events: Option<std::sync::Arc<Vec<Event>>>,
 ) -> usize {
     if let Some(events) = case_events {
         return query::filtered_indices(&events, &filters).len();
@@ -1541,7 +1572,7 @@ async fn tree_aggs(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<Vec<(String, query::AggResult)>, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1554,7 +1585,7 @@ pub(crate) fn tree_aggs_impl(
     state: &AppState,
     columns: Vec<String>,
     filters: Vec<query::Filter>,
-    case_events: Option<Vec<Event>>,
+    case_events: Option<std::sync::Arc<Vec<Event>>>,
 ) -> Vec<(String, query::AggResult)> {
     if let Some(events) = case_events {
         return query::multi_count(&events, &filters, &columns);
@@ -1581,7 +1612,7 @@ async fn stats_events(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<query::Stats, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         if let Some(events) = case_events {
@@ -1654,7 +1685,7 @@ async fn discover_patterns(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<discovery::Discovery, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || discover_patterns_impl(app.state::<AppState>().inner(), filters, case_events))
         .await
@@ -1663,7 +1694,7 @@ async fn discover_patterns(
 pub(crate) fn discover_patterns_impl(
     state: &AppState,
     filters: Vec<query::Filter>,
-    case_events: Option<Vec<Event>>,
+    case_events: Option<std::sync::Arc<Vec<Event>>>,
 ) -> discovery::Discovery {
     let memory = |events: &[Event]| {
         let prepared = query::prepare(&filters);
@@ -1719,7 +1750,7 @@ const ANALYSIS_CAP: usize = 3_000; // Distributed sample used only by field prof
 fn work_events(
     state: &AppState,
     filters: Vec<query::Filter>,
-    case_events: Option<Vec<Event>>,
+    case_events: Option<std::sync::Arc<Vec<Event>>>,
 ) -> Vec<Event> {
     if let Some(events) = case_events {
         let matched = query::filtered_indices(&events, &filters);
@@ -1782,7 +1813,7 @@ async fn profile_fields(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<Vec<analysis::FieldProfile>, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1794,7 +1825,7 @@ async fn profile_fields(
 pub(crate) fn profile_fields_impl(
     state: &AppState,
     filters: Vec<query::Filter>,
-    case_events: Option<Vec<Event>>,
+    case_events: Option<std::sync::Arc<Vec<Event>>>,
 ) -> Vec<analysis::FieldProfile> {
     let evs = work_events(state, filters, case_events);
     let columns = work_columns(&evs);
@@ -1809,7 +1840,7 @@ async fn compute_series(
     spec: analysis::SeriesSpec,
     app: AppHandle,
 ) -> Result<analysis::SeriesResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1821,7 +1852,7 @@ async fn compute_series(
 pub(crate) fn compute_series_impl(
     state: &AppState,
     filters: Vec<query::Filter>,
-    case_events: Option<Vec<Event>>,
+    case_events: Option<std::sync::Arc<Vec<Event>>>,
     spec: analysis::SeriesSpec,
 ) -> analysis::SeriesResult {
     if let Some(events) = case_events {
@@ -1863,7 +1894,7 @@ async fn pivot(
     spec: analysis::PivotSpec,
     app: AppHandle,
 ) -> Result<analysis::PivotResult, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     workspace::validate(&filters)?;
     offload(move || {
         let state = app.state::<AppState>();
@@ -1875,7 +1906,7 @@ async fn pivot(
 pub(crate) fn pivot_impl(
     state: &AppState,
     filters: Vec<query::Filter>,
-    case_events: Option<Vec<Event>>,
+    case_events: Option<std::sync::Arc<Vec<Event>>>,
     spec: analysis::PivotSpec,
 ) -> analysis::PivotResult {
     if let Some(events) = case_events {
@@ -1929,17 +1960,23 @@ async fn save_codes(text: String, app: AppHandle) -> Result<(), String> {
 pub(crate) fn save_codes_impl(state: &AppState, text: &str) -> Result<(), String> {
     let cfg: CodesConfig = serde_json::from_str(text).map_err(|e| format!("JSON inválido: {e}"))?;
     std::fs::write(&state.codes_path, text).map_err(|e| format!("Falha ao gravar: {e}"))?;
+    let mut source_data = state.source.write();
     *state.codes.write() = cfg;
     // Re-enriquece eventos em memória (fontes indexadas enriquecem sob demanda).
     let codes = state.codes.read().clone();
     let system = state.system_codes.read().clone();
-    if let SourceData::Memory(events) = &mut *state.source.write() {
-        for ev in events.iter_mut() {
-            ev.name.clear();
-            ev.description.clear();
-            ev.enrich(&codes, &system);
+    match &mut *source_data {
+        SourceData::Memory(events) => {
+            for ev in events.iter_mut() {
+                ev.name.clear();
+                ev.description.clear();
+                ev.enrich(&codes, &system);
+            }
         }
+        SourceData::Indexed(idx) => idx.big_data = None,
+        SourceData::None => {}
     }
+    big_data_commands::clear_results();
     Ok(())
 }
 
@@ -1965,17 +2002,23 @@ pub(crate) fn harvest_codes_impl(state: &AppState) -> Result<HarvestSummary, Str
     if let Ok(text) = serde_json::to_string(&cfg) {
         let _ = std::fs::write(&state.system_codes_path, text);
     }
+    let mut source_data = state.source.write();
     *state.system_codes.write() = cfg;
     // Re-enriquece eventos em memória (fontes indexadas enriquecem sob demanda).
     let codes = state.codes.read().clone();
     let system = state.system_codes.read().clone();
-    if let SourceData::Memory(events) = &mut *state.source.write() {
-        for ev in events.iter_mut() {
-            ev.name.clear();
-            ev.description.clear();
-            ev.enrich(&codes, &system);
+    match &mut *source_data {
+        SourceData::Memory(events) => {
+            for ev in events.iter_mut() {
+                ev.name.clear();
+                ev.description.clear();
+                ev.enrich(&codes, &system);
+            }
         }
+        SourceData::Indexed(idx) => idx.big_data = None,
+        SourceData::None => {}
     }
+    big_data_commands::clear_results();
     Ok(HarvestSummary { count, sources })
 }
 
@@ -2004,6 +2047,7 @@ pub(crate) fn cases_load_impl() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn cases_save(data: serde_json::Value, app: AppHandle) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _resource_action = resource_actions::begin("Salvar Casos");
         cases_save_impl(app.state::<AppState>().inner(), data)
     })
     .await
@@ -2082,8 +2126,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(resource_monitor::ResourceMonitor::new())
         .manage(AppState {
             source: RwLock::new(SourceData::None),
+            big_data_enabled: std::sync::atomic::AtomicBool::new(false),
             source_names: RwLock::new(vec![]),
             derived: RwLock::new(load_derived()),
             codes: RwLock::new(codes),
@@ -2099,6 +2145,7 @@ pub fn run() {
             mcp_token,
         ))
         .setup(move |app| {
+            app.state::<resource_monitor::ResourceMonitor>().start(app.handle().clone());
             // Primeira execução: extrai o catálogo do sistema em background
             // (leva ~20s e não pode bloquear a abertura da janela).
             let state = app.state::<AppState>();
@@ -2106,17 +2153,26 @@ pub fn run() {
             if needs_harvest {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
+                    let _resource_action = resource_actions::begin("Catalogar eventos do sistema");
                     if let Ok((cfg, _)) = sources::harvest_system_codes() {
                         let state = handle.state::<AppState>();
                         if let Ok(text) = serde_json::to_string(&cfg) {
                             let _ = std::fs::write(&state.system_codes_path, text);
                         }
+                        let mut source = state.source.write();
                         *state.system_codes.write() = cfg;
+                        if let SourceData::Indexed(idx) = &mut *source {
+                            idx.big_data = None;
+                        }
+                        big_data_commands::clear_results();
                     }
                 });
             }
             // Old parser caches and unused indexes do not accumulate on disk.
-            std::thread::spawn(index_cache::prune);
+            std::thread::spawn(|| {
+                let _resource_action = resource_actions::begin("Limpar índices antigos");
+                index_cache::prune();
+            });
             // Servidor MCP embutido (loopback) para automação por agentes.
             if mcp_enabled {
                 let handle = app.handle().clone();
@@ -2126,7 +2182,13 @@ pub fn run() {
             }
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                window.state::<resource_monitor::ResourceMonitor>().stop();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
+            resource_monitor::resource_snapshot,
             ui_zoom,
             case_images::case_image_add,
             case_images::case_image_read,
@@ -2157,6 +2219,8 @@ pub fn run() {
             triage::sigma_import,
             triage::sigma_clear,
             case_cache::case_sync,
+            big_data_commands::set_big_data_mode,
+            big_data_commands::big_data_status,
             pivots::timeline_lanes,
             pivots::entity_summary,
             pivots::ioc_sightings,

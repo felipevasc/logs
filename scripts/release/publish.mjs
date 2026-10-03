@@ -1,10 +1,11 @@
 import { readFileSync, readdirSync, statSync, createReadStream } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { verifyTrigger } from './verify-trigger.mjs';
 
 const directory = process.argv[2], token = process.env.GITHUB_TOKEN, repo = process.env.GITHUB_REPOSITORY, sha = process.env.GITHUB_SHA;
 if (!directory || !token || !/^[\w.-]+\/[\w.-]+$/.test(repo || '') || !/^[a-f0-9]{40}$/.test(sha || '')) throw Error('Missing trusted release environment.');
-const version = JSON.parse(readFileSync('package.json', 'utf8')).version, tag = `v${version}`;
+const version = JSON.parse(readFileSync('package.json', 'utf8')).version, tag = verifyTrigger(version);
 const names = readdirSync(directory).sort();
 const extensions = ['.exe', '.msi', '.deb', '.rpm', '.AppImage'];
 if (names.length !== 6 || !names.includes('SHA256SUMS.txt') || extensions.some(ext => names.filter(name => name.endsWith(ext)).length !== 1)) throw Error('Release assets are incomplete.');

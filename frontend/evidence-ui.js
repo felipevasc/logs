@@ -21,8 +21,8 @@ window.EvidenceUI = (() => {
       return `<figure><figcaption><code>${esc(x.field)}</code><span>${esc(x.transformation === 'original' || !x.transformation ? 'Conteúdo original' : x.transformation)}</span></figcaption><pre>${x.prefix_omitted ? '…' : ''}${body}${x.suffix_omitted ? '…' : ''}</pre></figure>`;
     }).join('')}</section>`;
   }
-  function explanation(d) {
-    const list = (title, values) => values?.length ? `<div class="evidence-explanation"><strong>${title}</strong><ul>${values.map(v => `<li>${esc(redact(v))}</li>`).join("")}</ul></div>` : "";
+  function explanation(d, { revealed = false } = {}) {
+    const list = (title, values) => values?.length ? `<div class="evidence-explanation"><strong>${title}</strong><ul>${values.map(v => `<li>${esc(revealed ? v : redact(v))}</li>`).join("")}</ul></div>` : "";
     return `<p><strong>${claim(d.claim)}</strong> · ${outcome(d.outcome)}. O nível não confirma comprometimento.</p>` + (d.maturity === "experimental" ? '<p class="muted small">Regra experimental: a precisão em ambiente real ainda exige validação representativa.</p>' : "") + list("Por que recebeu este nível", d.evidence_reasons)
       + list("Evidências faltantes e limitações", d.missing_evidence)
       + list("Condições satisfeitas", d.conditions_satisfied)

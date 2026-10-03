@@ -2635,6 +2635,22 @@ pub struct CachedTriage {
 
 static TRIAGE_CACHE: Mutex<Vec<CachedTriage>> = Mutex::new(Vec::new());
 
+/// Results are SQLite-backed; count readers without querying busy connections
+/// or presenting a configured page-cache limit as allocated RAM.
+pub(crate) fn resource_cache_metrics() -> Option<(usize, u64)> {
+    let cache = TRIAGE_CACHE.try_lock()?;
+    let mut bytes = (cache.capacity() as u64).saturating_mul(std::mem::size_of::<CachedTriage>() as u64);
+    let mut seen = std::collections::HashSet::new();
+    for entry in cache.iter() {
+        bytes = bytes.saturating_add(entry.key.capacity() as u64);
+        if seen.insert(Arc::as_ptr(&entry.result) as usize) {
+            bytes = bytes.saturating_add(std::mem::size_of::<crate::security_results::Results>() as u64)
+                .saturating_add(2 * std::mem::size_of::<usize>() as u64);
+        }
+    }
+    Some((cache.len(), bytes))
+}
+
 pub fn cached(key: &str) -> Option<Arc<crate::security_results::Results>> {
     TRIAGE_CACHE.lock().iter().find(|c| c.key == key).map(|c| c.result.clone())
 }

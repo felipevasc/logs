@@ -134,7 +134,9 @@ impl Counter {
     pub fn insert(&mut self, value: String) {
         if let Some(db) = &self.disk {
             self.count += db
-                .execute("INSERT OR IGNORE INTO vals(v) VALUES(?1)", [value])
+                .prepare_cached("INSERT OR IGNORE INTO vals(v) VALUES(?1)")
+                .expect("Falha ao preparar contagem de valores distintos no disco")
+                .execute([value])
                 .expect("Falha ao contar valores distintos no disco");
             return;
         }
@@ -186,5 +188,49 @@ mod counter_tests {
         counter.insert(value);
         counter.insert("another".into());
         assert_eq!(counter.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "manual performance benchmark; validates exact counts after spilling"]
+    fn benchmark_counter_spill() {
+        for (name, count, cardinality) in [
+            ("unique_100k", 100_000, 100_000),
+            ("mixed_1m", 1_000_000, 50_000),
+        ] {
+            // Prepare identical data outside the timed region. The mixed case
+            // crosses the disk threshold and then repeatedly revisits keys.
+            let values: Vec<_> = (0..count)
+                .map(|i| format!("value-{:06}-ação-東京", i % cardinality))
+                .collect();
+            let expected = values
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            assert_eq!(expected, cardinality);
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                let mut counter = Counter::default();
+                for value in &values {
+                    counter.insert(value.clone());
+                }
+                assert!(counter.disk.is_some());
+                assert_eq!(counter.len(), expected);
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            let mut sorted = samples.clone();
+            sorted.sort_by(f64::total_cmp);
+            println!(
+                "COUNTER_BENCH {}",
+                serde_json::json!({
+                    "workload": name,
+                    "events": count,
+                    "distinct": expected,
+                    "samplesMs": samples,
+                    "medianMs": sorted[2],
+                    "p95Ms": sorted[4],
+                })
+            );
+        }
     }
 }

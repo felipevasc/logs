@@ -543,12 +543,12 @@ pub async fn journey_fields(
     case_key: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<Vec<JourneyField>, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     crate::offload(move || {
         fields_impl(
             app.state::<AppState>().inner(),
             &filters,
-            case_events.as_deref(),
+            case_events.as_deref().map(Vec::as_slice),
         )
     })
     .await?
@@ -567,13 +567,13 @@ pub async fn journey_index(
     to: Option<i64>,
     app: tauri::AppHandle,
 ) -> Result<JourneyIndex, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     crate::offload(move || {
         let filters = window_filters(&field, filters, from, to)?;
         index_impl(
             app.state::<AppState>().inner(),
             &filters,
-            case_events.as_deref(),
+            case_events.as_deref().map(Vec::as_slice),
             &field,
             offset.unwrap_or(0),
             limit.unwrap_or(50),
@@ -596,12 +596,12 @@ pub async fn journey_events(
     limit: Option<usize>,
     app: tauri::AppHandle,
 ) -> Result<JourneyEvents, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     crate::offload(move || {
         events_impl(
             app.state::<AppState>().inner(),
             &filters,
-            case_events.as_deref(),
+            case_events.as_deref().map(Vec::as_slice),
             &field,
             &value,
             from,
@@ -619,6 +619,7 @@ mod tests {
     fn state() -> AppState {
         AppState {
             source: parking_lot::RwLock::new(SourceData::None),
+            big_data_enabled: std::sync::atomic::AtomicBool::new(false),
             source_names: parking_lot::RwLock::new(vec![]),
             derived: parking_lot::RwLock::new(vec![]),
             codes: parking_lot::RwLock::new(Default::default()),

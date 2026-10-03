@@ -286,6 +286,14 @@ pub fn filtered_indices(events: &[Event], filters: &[Filter]) -> Vec<usize> {
         return (0..events.len()).collect();
     }
     let pfs = prepare(filters);
+    if let (Some(engine), Some(predicate)) = (crate::case_cache::engine_for(events), index_predicate(&pfs)) {
+        if let Ok(Some(candidates)) = engine.candidates_if_selective(&predicate, events.len()) {
+            return candidates.into_iter()
+                .take_while(|_| !crate::operations::cancelled())
+                .filter(|&i| events.get(i).is_some_and(|ev| pfs.iter().all(|pf| matches(ev, pf))))
+                .collect();
+        }
+    }
     events
         .iter()
         .enumerate()
@@ -452,6 +460,111 @@ enum Tri {
     NeedEvent,
 }
 
+/// Index predicates are necessary conditions only. Every candidate is checked
+/// by the original matcher; unsupported/negative conditions stay in that stage.
+pub(crate) fn index_predicate(filters: &[PreparedFilter]) -> Option<crate::big_data::Predicate> {
+    use crate::big_data::{ExactMode, Predicate};
+    let parts: Vec<_> = filters.iter().filter_map(|pf| {
+        let f = &pf.f;
+        let scoped = (f.column != "_all").then(|| f.column.clone());
+        let equals = |value: String, mode| Predicate::Equals { column: scoped.clone(), value, mode };
+        match f.op.as_str() {
+            "query" => pf.expr.as_ref()?.index_predicate(),
+            "regex" => regex_index_predicate(pf.regex.as_ref()?.as_str()),
+            "equals" if scoped.is_some() => Some(equals(f.value.trim().into(), ExactMode::AsciiInsensitive)),
+            "equals_exact" if scoped.is_some() => Some(equals(f.value.clone(), ExactMode::Sensitive)),
+            "in" if scoped.is_some() => Some(Predicate::Or(list_values(&f.value)
+                .map(|v| equals(v.into(), ExactMode::TrimLower)).collect())),
+            "in_exact" if scoped.is_some() => Some(Predicate::Or(f.value.lines().filter(|v| !v.is_empty())
+                .map(|v| equals(v.into(), ExactMode::Sensitive)).collect())),
+            "contains" | "starts_with" | "ends_with" if pf.needle_lower.chars().count() >= 3 => {
+                Some(Predicate::Contains(pf.needle_lower.clone()))
+            }
+            "gt" | "gte" | "lt" | "lte" | "between" if f.column == "timestamp" => {
+                timestamp_predicate(&f.op, pf.num?, pf.num2)
+            }
+            _ => None,
+        }
+    }).collect();
+    (!parts.is_empty()).then_some(Predicate::And(parts))
+}
+
+/// The regex parser proves a prefix/suffix is necessary for every alternative.
+/// Empty, infinite, short or non-ASCII literal sets keep the streaming path.
+pub(crate) fn regex_index_predicate(pattern: &str) -> Option<crate::big_data::Predicate> {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
+    use crate::big_data::Predicate;
+    let hir = regex_syntax::parse(pattern).ok()?;
+    let plans: Vec<_> = [ExtractKind::Prefix, ExtractKind::Suffix].into_iter().filter_map(|kind| {
+        let sequence = Extractor::new().kind(kind).extract(&hir);
+        let mut values = Vec::new();
+        for literal in sequence.literals()? {
+            let text = std::str::from_utf8(literal.as_bytes()).ok()?;
+            // Unicode lowercasing can depend on surrounding characters. ASCII
+            // literals avoid that ambiguity and are necessary in the folded pool.
+            if !text.is_ascii() || text.len() < 3 { return None; }
+            values.push(text.to_ascii_lowercase());
+        }
+        values.sort_unstable();
+        values.dedup();
+        (!values.is_empty()).then(|| Predicate::Or(values.into_iter().map(Predicate::Contains).collect()))
+    }).collect();
+    (!plans.is_empty()).then_some(Predicate::And(plans))
+}
+
+/// Round outwards so floating point thresholds cannot exclude a matching
+/// integer timestamp. The event matcher retains inclusive/exclusive semantics.
+pub(crate) fn timestamp_predicate(op: &str, a: f64, b: Option<f64>) -> Option<crate::big_data::Predicate> {
+    let bound = |n: f64, lower: bool| {
+        (n.is_finite() && n.abs() < 9_007_199_254_740_992.0)
+            .then(|| (if lower { n.floor() } else { n.ceil() } as i64, true))
+    };
+    let (lower, upper) = match op {
+        "gt" | "gte" => (Some(bound(a, true)?), None),
+        "lt" | "lte" => (None, Some(bound(a, false)?)),
+        "between" => (Some(bound(a, true)?), Some(bound(b?, false)?)),
+        _ => return None,
+    };
+    Some(crate::big_data::Predicate::Timestamp { lower, upper })
+}
+
+// These predicates depend only on standard string columns. Evaluate the
+// original matcher over their FAST projection, avoiding stored-event block
+// decompression for scattered matches. Other predicates need the full event.
+fn fast_filter_columns(filters: &[PreparedFilter]) -> Option<[bool; 3]> {
+    let mut columns = [false; 3];
+    for pf in filters {
+        if !matches!(pf.f.op.as_str(), "contains" | "not_contains" | "equals" | "not_equals" |
+            "equals_exact" | "not_equals_exact" | "in" | "in_exact" | "not_in" | "regex" |
+            "starts_with" | "ends_with" | "empty" | "not_empty" | "gt" | "gte" | "lt" | "lte" | "between") {
+            return None;
+        }
+        let slot = match pf.f.column.as_str() { "source" => 0, "code" => 1, "level" => 2, _ => return None };
+        columns[slot] = true;
+    }
+    Some(columns)
+}
+
+fn fast_candidate_matches(engine: &crate::big_data::BigDataIndex, row: usize, filters: &[PreparedFilter], columns: [bool; 3]) -> bool {
+    let mut event = Event::empty();
+    if columns[0] { event.source = engine.col_str(row, "source").unwrap_or_default(); }
+    if columns[1] { event.code = engine.col_str(row, "code").unwrap_or_default(); }
+    if columns[2] { event.level = engine.col_str(row, "level").unwrap_or_default(); }
+    filters.iter().all(|pf| matches(&event, pf))
+}
+
+type FastProjectionKey = (u32, [Option<u64>; 3]);
+
+fn cached_fast_candidate(engine: &crate::big_data::BigDataIndex, row: usize, filters: &[PreparedFilter], columns: [bool; 3], cache: &mut HashMap<FastProjectionKey, bool>) -> bool {
+    let key = engine.projection_key(row, columns);
+    if let Some(result) = key.and_then(|key| cache.get(&key)) { return *result; }
+    let result = fast_candidate_matches(engine, row, filters, columns);
+    // The original predicate is constant for an identical projection within
+    // this query. Bound reuse when a categorical field has high cardinality.
+    if cache.len() < 4096 { if let Some(key) = key { cache.insert(key, result); } }
+    result
+}
+
 pub(crate) fn ci_contains_bytes(hay: &[u8], needle_lower: &[u8]) -> bool {
     if !hay.is_ascii() || !needle_lower.is_ascii() {
         return String::from_utf8_lossy(hay)
@@ -511,11 +624,11 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8], enriched: bool)
         return Tri::NeedEvent;
     }
     match f.column.as_str() {
+        // Zero is both the metadata sentinel and the valid Unix epoch. Only
+        // the event can distinguish an absent date from Some(0).
+        "timestamp" if meta.ts == 0 => Tri::NeedEvent,
         "timestamp" => match op {
             "gt" | "gte" | "lt" | "lte" | "between" => {
-                if meta.ts == 0 {
-                    return Tri::Fail;
-                }
                 let a = meta.ts as f64;
                 // limites pré-computados em prepare (pf.num/pf.num2)
                 let pass = match op {
@@ -534,20 +647,8 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8], enriched: bool)
                     None => Tri::NeedEvent,
                 }
             }
-            "empty" => {
-                if meta.ts == 0 {
-                    Tri::Pass
-                } else {
-                    Tri::Fail
-                }
-            }
-            "not_empty" => {
-                if meta.ts != 0 {
-                    Tri::Pass
-                } else {
-                    Tri::Fail
-                }
-            }
+            "empty" => Tri::Fail,
+            "not_empty" => Tri::Pass,
             _ => Tri::NeedEvent,
         },
         "level" => match (op, label_class(v)) {
@@ -664,22 +765,26 @@ struct MatchCacheEntry {
 }
 
 static MATCH_CACHE: Mutex<Vec<MatchCacheEntry>> = Mutex::new(Vec::new());
+const MATCH_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Capacity accounting over at most 16 cache entries, without cloning matches.
+pub(crate) fn resource_cache_metrics() -> Option<(usize, u64)> {
+    let cache = MATCH_CACHE.try_lock()?;
+    let mut bytes = (cache.capacity() as u64).saturating_mul(std::mem::size_of::<MatchCacheEntry>() as u64);
+    let mut seen = std::collections::HashSet::new();
+    for entry in cache.iter() {
+        bytes = bytes.saturating_add(entry.idx_identity.capacity() as u64).saturating_add(entry.filters_key.capacity() as u64);
+        if seen.insert(Arc::as_ptr(&entry.matches) as usize) {
+            bytes = bytes.saturating_add((entry.matches.capacity() as u64).saturating_mul(std::mem::size_of::<usize>() as u64))
+                .saturating_add(std::mem::size_of::<Vec<usize>>() as u64 + 2 * std::mem::size_of::<usize>() as u64);
+        }
+    }
+    Some((cache.len(), bytes))
+}
 
 fn filters_cache_key(filters: &[Filter]) -> String {
-    let mut s = String::new();
-    for f in filters {
-        s.push_str(&f.column);
-        s.push(':');
-        s.push_str(&f.op);
-        s.push('=');
-        s.push_str(&f.value);
-        if let Some(v2) = &f.value2 {
-            s.push(',');
-            s.push_str(v2);
-        }
-        s.push(';');
-    }
-    s
+    // JSON escaping makes arbitrary field names/values unambiguous.
+    serde_json::to_string(filters).expect("serializable filters")
 }
 
 pub fn clear_match_cache() {
@@ -694,50 +799,84 @@ pub fn indexed_matches(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> Vec<usize> {
+    Arc::unwrap_or_clone(indexed_matches_shared(idx, filters, codes, system, derived))
+}
+
+/// Read-only consumers share the cached selection. A full copy is needed only
+/// by the compatibility API above or when a caller actually reorders IDs.
+pub(crate) fn indexed_matches_shared(
+    idx: &FileIndex,
+    filters: &[Filter],
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> Arc<Vec<usize>> {
     if filters.is_empty() {
-        return (0..idx.lines.len()).collect();
+        return Arc::new((0..idx.lines.len()).collect());
     }
     let idx_id = idx.lines.as_ptr() as usize;
     let lines_count = idx.lines.len();
-    let idx_identity = idx.parts.first().map(|p| p.identity.as_str()).unwrap_or("");
+    let idx_identity = idx.parts.iter().map(|p| p.identity.as_str()).collect::<Vec<_>>().join(",");
     let fkey = filters_cache_key(filters);
     let derived_count = derived.len();
     let codes_count = codes.sources.len() + system.sources.len();
+    let same_entry = |e: &MatchCacheEntry| {
+        e.idx_id == idx_id
+            && e.lines_count == lines_count
+            && e.derived_count == derived_count
+            && e.codes_count == codes_count
+            && e.idx_identity == idx_identity
+            && e.filters_key == fkey
+    };
 
     {
         let cache = MATCH_CACHE.lock();
-        if let Some(entry) = cache.iter().find(|e| {
-            e.idx_id == idx_id
-                && e.lines_count == lines_count
-                && e.derived_count == derived_count
-                && e.codes_count == codes_count
-                && e.idx_identity == idx_identity
-                && e.filters_key == fkey
-        }) {
-            return (*entry.matches).clone();
+        if let Some(entry) = cache.iter().find(|e| same_entry(e)) {
+            return Arc::clone(&entry.matches);
         }
     }
 
     let mut matched = Vec::new();
     visit_indexed_matches(idx, filters, codes, system, derived, |i| matched.push(i));
+    let matched = Arc::new(matched);
 
-    if !crate::operations::cancelled() {
+    // Vec capacity is the actual retained allocation, which can exceed len.
+    let bytes = matched.capacity().saturating_mul(std::mem::size_of::<usize>());
+    if !crate::operations::cancelled() && bytes <= MATCH_CACHE_BYTES / 4 {
         let mut cache = MATCH_CACHE.lock();
-        if cache.len() >= 16 {
+        // Concurrent misses may already have published this same selection.
+        if let Some(entry) = cache.iter().find(|e| same_entry(e)) {
+            return Arc::clone(&entry.matches);
+        }
+        while !cache.is_empty() && (cache.len() >= 16 ||
+            cache.iter().map(|e| e.matches.capacity() * std::mem::size_of::<usize>()).sum::<usize>() + bytes > MATCH_CACHE_BYTES) {
             cache.remove(0);
         }
         cache.push(MatchCacheEntry {
             idx_id,
-            idx_identity: idx_identity.to_string(),
+            idx_identity,
             lines_count,
             filters_key: fkey,
             derived_count,
             codes_count,
-            matches: Arc::new(matched.clone()),
+            matches: Arc::clone(&matched),
         });
     }
 
     matched
+}
+
+/// A few legacy raw-line shortcuts normalize whitespace differently from the
+/// decoded event matcher. Preserve that tri-state path for those queries: a
+/// selective index plan could otherwise remove rows before metadata is checked.
+/// In-memory Cases have no raw metadata shortcuts and keep their normal plan.
+fn needs_metadata_filter_path(filters: &[PreparedFilter]) -> bool {
+    filters.iter().any(|pf| {
+        (pf.f.column == "code" && matches!(pf.f.op.as_str(), "empty" | "not_empty"))
+            || (matches!(pf.f.column.as_str(), "code" | "message" | "_all")
+                && matches!(pf.f.op.as_str(), "contains" | "not_contains")
+                && pf.f.value != pf.f.value.trim())
+    })
 }
 
 /// Visit matching positions without allocating a vector proportional to the file.
@@ -747,9 +886,25 @@ pub fn visit_indexed_matches(
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
-    visit: impl FnMut(usize),
+    mut visit: impl FnMut(usize),
 ) {
     let pfs = prepare(filters);
+    if let (Some(engine), Some(predicate)) = (&idx.big_data, (!needs_metadata_filter_path(&pfs)).then(|| index_predicate(&pfs)).flatten()) {
+        if let Ok(Some(candidates)) = engine.candidates_if_selective(&predicate, idx.lines.len()) {
+            let fast_columns = fast_filter_columns(&pfs);
+            let mut verification = HashMap::new();
+            for i in candidates {
+                if crate::operations::cancelled() { break; }
+                if let Some(columns) = fast_columns {
+                    if cached_fast_candidate(engine, i, &pfs, columns, &mut verification) { visit(i); }
+                    continue;
+                }
+                let ev = event_at(idx, i, codes, system, derived);
+                if pfs.iter().all(|pf| matches(&ev, pf)) { visit(i); }
+            }
+            return;
+        }
+    }
     visit_indexed_prepared(idx, &pfs, codes, system, derived, visit);
 }
 
@@ -758,22 +913,72 @@ const SCAN_CHUNK: usize = 8192;
 
 /// Scans the index in parallel chunks, calling `map` for each matching line
 /// (with the parsed event when one was needed) and `visit` in file order.
+/// Statistics request the legacy metadata/event projection; selection-only
+/// callers can verify FAST columns without materializing a full event.
 pub(crate) fn scan_indexed<T: Send>(
     idx: &FileIndex,
     pfs: &[PreparedFilter],
     codes: &CodesConfig,
     system: &CodesConfig,
     derived: &[CompiledDerived],
+    preserve_event_projection: bool,
     map: impl Fn(usize, &LineMeta, Option<Event>) -> T + Sync,
     mut visit: impl FnMut(T),
 ) {
+    if let (Some(engine), Some(predicate)) = (&idx.big_data, (!needs_metadata_filter_path(pfs)).then(|| index_predicate(pfs)).flatten()) {
+        if let Ok(Some(candidates)) = engine.candidates_if_selective(&predicate, idx.lines.len()) {
+            // Bounded ordered batches share parsed-event blocks between workers.
+            let generation = crate::operations::current_generation();
+            let fast_columns = fast_filter_columns(pfs);
+            let mut verification = HashMap::new();
+            let enriched: Vec<_> = pfs.iter()
+                .map(|pf| query_needs_enrichment(pf, codes, system, derived)).collect();
+            // Preserve statistics' existing distinction between metadata-only
+            // filters and filters that require the original decoded event.
+            let needs_event = |i: usize| preserve_event_projection && pfs.iter().zip(&enriched)
+                .any(|(pf, enriched)| matches!(meta_check(pf, &idx.lines[i], line_bytes(idx, i), *enriched), Tri::NeedEvent));
+            for batch in candidates.chunks(SCAN_CHUNK) {
+                if crate::operations::cancelled() { break; }
+                if let Some(columns) = fast_columns {
+                    let selected: Vec<_> = batch.iter().copied().filter(|&i|
+                        !crate::operations::cancelled_for(generation) && cached_fast_candidate(engine, i, pfs, columns, &mut verification)).collect();
+                    let items: Vec<_> = selected.par_iter().take_any_while(|_| !crate::operations::cancelled_for(generation))
+                        .map(|&i| {
+                            let ev = needs_event(i).then(|| event_at(idx, i, codes, system, derived));
+                            map(i, &idx.lines[i], ev)
+                        }).collect();
+                    for item in items { visit(item); }
+                    continue;
+                }
+                let items: Vec<_> = batch.par_iter().filter_map(|&i| {
+                    if crate::operations::cancelled_for(generation) { return None; }
+                    let ev = event_at(idx, i, codes, system, derived);
+                    pfs.iter().all(|pf| matches(&ev, pf)).then(|| {
+                        let projected = (!preserve_event_projection || needs_event(i)).then_some(ev);
+                        map(i, &idx.lines[i], projected)
+                    })
+                }).collect();
+                for item in items { visit(item); }
+            }
+            return;
+        }
+    }
     let enriched: Vec<bool> = pfs
         .iter()
         .map(|pf| query_needs_enrichment(pf, codes, system, derived))
         .collect();
     let generation = crate::operations::current_generation();
+    // Broad or negative categorical filters may have no selective postings.
+    // Their original matcher still needs only these persisted string columns.
+    // Keep metadata tri-state checks first: their raw-span normalization can
+    // differ from decoded values. FAST replaces only an otherwise needed event.
+    // Statistics retain their metadata/event projection policy below.
+    let broad_projection = (!preserve_event_projection && !pfs.is_empty())
+        .then(|| idx.big_data.as_ref().zip(fast_filter_columns(pfs)))
+        .flatten();
     let chunk = |from: usize, to: usize| -> Vec<T> {
         let mut out = Vec::new();
+        let mut verification = HashMap::new();
         for i in from..to {
             if (i - from) % 2048 == 0 && crate::operations::cancelled_for(generation) {
                 break;
@@ -796,6 +1001,12 @@ pub(crate) fn scan_indexed<T: Send>(
                 continue;
             }
             if need {
+                if let Some((engine, columns)) = broad_projection {
+                    if cached_fast_candidate(engine, i, pfs, columns, &mut verification) {
+                        out.push(map(i, meta, None));
+                    }
+                    continue;
+                }
                 let ev = event_at(idx, i, codes, system, derived);
                 if pfs.iter().all(|pf| matches(&ev, pf)) {
                     out.push(map(i, meta, Some(ev)));
@@ -843,7 +1054,7 @@ pub(crate) fn visit_indexed_prepared(
     derived: &[CompiledDerived],
     visit: impl FnMut(usize),
 ) {
-    scan_indexed(idx, pfs, codes, system, derived, |i, _, _| i, visit);
+    scan_indexed(idx, pfs, codes, system, derived, false, |i, _, _| i, visit);
 }
 
 /// Free text in a search expression may match code names/descriptions from
@@ -883,7 +1094,7 @@ pub fn query_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> QueryResult {
-    let matched = indexed_matches(idx, filters, codes, system, derived);
+    let matched = indexed_matches_shared(idx, filters, codes, system, derived);
     query_from_indexed_matches(
         idx,
         matched,
@@ -895,6 +1106,25 @@ pub fn query_indexed(
         system,
         derived,
     )
+}
+
+/// Same-binary benchmark reference: explicitly recover an owned selection,
+/// reproducing the previous warm-cache Vec clone before identical page work.
+/// This is not the historical binary or a second production implementation.
+#[cfg(test)]
+pub(crate) fn query_indexed_owned_reference(
+    idx: &FileIndex,
+    filters: &[Filter],
+    sort_column: &str,
+    sort_dir: &str,
+    offset: usize,
+    limit: usize,
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> QueryResult {
+    let matched = Arc::new(indexed_matches(idx, filters, codes, system, derived));
+    query_from_indexed_matches(idx, matched, sort_column, sort_dir, offset, limit, codes, system, derived)
 }
 
 fn sort_time(idx: &FileIndex, matched: &mut Vec<usize>, desc: bool) {
@@ -1298,15 +1528,15 @@ pub fn aggregate_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> AggResult {
-    let matched = indexed_matches(idx, filters, codes, system, derived);
+    let matched = indexed_matches_shared(idx, filters, codes, system, derived);
+    if let Some(result) = fast_count_aggregation(idx, &matched, group_column, specs) { return result; }
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order: Vec<Option<String>> = Vec::new();
 
     // Caminho rápido: grupo e agregações só sobre colunas de metadados
     // (timestamp, level, code) — zero parse por linha.
     let meta_only = is_meta_column(group_column) && specs.iter().all(|s| is_meta_column(&s.column));
-
-    for i in matched {
+    for &i in matched.iter() {
         if crate::operations::cancelled() {
             break;
         }
@@ -1337,9 +1567,99 @@ pub fn aggregate_indexed(
 // Estatísticas (histograma + níveis)
 // ==========================================================================
 
+/// Rank the distinct categorical sort keys, then select the requested range
+/// within each rank. Deep pages do not require sorting or decoding the prefix.
+/// The key comparator and position tie-break exactly match the stable legacy
+/// sort, including numeric strings, units, Unicode folding and segment overlap.
+fn categorical_page(
+    engine: &crate::big_data::BigDataIndex,
+    matched: &[usize],
+    column: &str,
+    desc: bool,
+    offset: usize,
+    limit: usize,
+) -> Option<Vec<usize>> {
+    let slot = match column { "source" => 0, "code" => 1, _ => return None };
+    let mut columns = [false; 3];
+    columns[slot] = true;
+    let generation = crate::operations::current_generation();
+    let mut dictionary = HashMap::new();
+    let mut keys: Vec<(Option<f64>, String, usize)> = Vec::new();
+    let mut row_keys = Vec::with_capacity(matched.len());
+    for (position, &row) in matched.iter().enumerate() {
+        if position % 2048 == 0 && crate::operations::cancelled_for(generation) {
+            return None;
+        }
+        let (segment, ordinals) = engine.projection_key(row, columns)?;
+        let ordinal = ordinals[slot];
+        let key = match dictionary.entry((segment, ordinal)) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                // A missing ordinal represents the empty string. A dictionary
+                // decoding error requests the original stored-event path.
+                let value = match ordinal {
+                    Some(_) => engine.col_str(row, column)?,
+                    None => String::new(),
+                };
+                let mut event = Event::empty();
+                if slot == 0 { event.source = value; } else { event.code = value; }
+                let key = keys.len();
+                keys.push((event.col_num(column), event.col_ref(column)?.to_lowercase(), 0));
+                entry.insert(key);
+                key
+            }
+        };
+        keys[key].2 += 1;
+        row_keys.push(key);
+    }
+    drop(dictionary);
+    let compare = |a: usize, b: usize| {
+        let order = compare_sort_keys(keys[a].0, &keys[a].1, keys[b].0, &keys[b].1);
+        if desc { order.reverse() } else { order }
+    };
+    let mut ordered: Vec<_> = (0..keys.len()).collect();
+    ordered.sort_unstable_by(|&a, &b| compare(a, b));
+    let mut ranks = vec![0; keys.len()];
+    let mut counts: Vec<usize> = Vec::new();
+    let mut previous = None;
+    for key in ordered {
+        if !previous.is_some_and(|prev| compare(prev, key).is_eq()) {
+            counts.push(0);
+        }
+        let rank = counts.len() - 1;
+        ranks[key] = rank;
+        counts[rank] += keys[key].2;
+        previous = Some(key);
+    }
+    // Equal comparison keys from different segments share a rank, preserving
+    // the original row order across all segments rather than segment order.
+    let page_end = offset.saturating_add(limit).min(matched.len());
+    let mut base = 0usize;
+    let ranges: Vec<_> = counts.iter().map(|&count| {
+        let range = (offset.saturating_sub(base).min(count), page_end.saturating_sub(base).min(count));
+        base += count;
+        range
+    }).collect();
+    let mut seen = vec![0usize; counts.len()];
+    let mut page = Vec::with_capacity(page_end.saturating_sub(offset));
+    for (position, (&row, key)) in matched.iter().zip(row_keys).enumerate() {
+        if position % 2048 == 0 && crate::operations::cancelled_for(generation) {
+            return None;
+        }
+        let rank = ranks[key];
+        let within = seen[rank];
+        seen[rank] += 1;
+        let (from, to) = ranges[rank];
+        if within >= from && within < to { page.push((rank, row)); }
+    }
+    if crate::operations::cancelled_for(generation) { return None; }
+    page.sort_unstable();
+    Some(page.into_iter().map(|(_, row)| row).collect())
+}
+
 fn query_from_indexed_matches(
     idx: &FileIndex,
-    mut matched: Vec<usize>,
+    mut matched: Arc<Vec<usize>>,
     sort_column: &str,
     sort_dir: &str,
     offset: usize,
@@ -1349,10 +1669,34 @@ fn query_from_indexed_matches(
     derived: &[CompiledDerived],
 ) -> QueryResult {
     let desc = sort_dir == "desc";
+    let total = matched.len();
+    if limit == 0 || offset >= total {
+        return QueryResult { total, rows: Vec::new() };
+    }
+    let page_end = offset.saturating_add(limit).min(total);
+    let mut page_offset = offset;
+    let categorical = idx.big_data.as_ref()
+        .and_then(|engine| categorical_page(engine, &matched, sort_column, desc, offset, limit));
+    if let Some(page) = categorical {
+        matched = Arc::new(page);
+        page_offset = 0;
+    } else if idx.big_data.is_some() && matches!(sort_column, "timestamp" | "level") && page_end < total {
+        let matched = Arc::make_mut(&mut matched);
+        // Only the requested prefix needs ordering. Include the source position
+        // in ties to reproduce the stable ordering of the full legacy sort.
+        let compare = |&a: &usize, &b: &usize| {
+            let order = if sort_column == "timestamp" { idx.lines[a].ts.cmp(&idx.lines[b].ts) }
+                else { idx.lines[a].level.cmp(&idx.lines[b].level) };
+            (if desc { order.reverse() } else { order }).then_with(|| a.cmp(&b))
+        };
+        matched.select_nth_unstable_by(page_end, compare);
+        matched.truncate(page_end);
+        matched.sort_unstable_by(compare);
+    } else {
     match sort_column {
         "" => {}
-        "timestamp" => sort_time(idx, &mut matched, desc),
-        "level" => matched.sort_by(|&a, &b| {
+        "timestamp" => sort_time(idx, Arc::make_mut(&mut matched), desc),
+        "level" => Arc::make_mut(&mut matched).sort_by(|&a, &b| {
             let ord = idx.lines[a].level.cmp(&idx.lines[b].level);
             if desc {
                 ord.reverse()
@@ -1381,7 +1725,7 @@ fn query_from_indexed_matches(
                     rows: vec![],
                 };
             }
-            matched.sort_by(|a, b| {
+            Arc::make_mut(&mut matched).sort_by(|a, b| {
                 let ord = compare_sort_keys(keys[a].0, &keys[a].1, keys[b].0, &keys[b].1);
                 if desc {
                     ord.reverse()
@@ -1391,10 +1735,11 @@ fn query_from_indexed_matches(
             });
         }
     }
-    let total = matched.len();
+    }
     let rows = matched
-        .into_iter()
-        .skip(offset)
+        .iter()
+        .copied()
+        .skip(page_offset)
         .take(limit)
         .map(|i| {
             let mut event = event_at(idx, i, codes, system, derived);
@@ -1415,6 +1760,7 @@ fn aggregate_from_indexed_matches(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> AggResult {
+    if let Some(result) = fast_count_aggregation(idx, matched, group_column, specs) { return result; }
     let mut groups: HashMap<Option<String>, Vec<Acc>> = HashMap::new();
     let mut order = Vec::new();
     let meta_only =
@@ -1446,6 +1792,21 @@ fn aggregate_from_indexed_matches(
     build_agg_result(groups, order, group_column, specs)
 }
 
+fn fast_count_aggregation(idx: &FileIndex, matched: &[usize], group_column: &str, specs: &[AggSpec]) -> Option<AggResult> {
+    if !specs.iter().all(|spec| spec.func == "count") { return None; }
+    // Preserve the existing metadata classification of levels, including
+    // unknown labels in snapshot events. Other count projections use text.
+    if is_meta_column(group_column) && specs.iter().all(|spec| is_meta_column(&spec.column)) { return None; }
+    let terms = idx.big_data.as_ref()?.count_terms(matched, group_column)?;
+    let mut groups = HashMap::new();
+    let mut order = Vec::with_capacity(terms.len());
+    for (key, count) in terms {
+        order.push(key.clone());
+        groups.insert(key, specs.iter().map(|_| Acc::Count(count)).collect());
+    }
+    Some(build_agg_result(groups, order, group_column, specs))
+}
+
 pub fn explore_indexed(
     idx: &FileIndex,
     filters: &[Filter],
@@ -1457,7 +1818,7 @@ pub fn explore_indexed(
     system: &CodesConfig,
     derived: &[CompiledDerived],
 ) -> ExplorerSnapshot {
-    let matched = indexed_matches(idx, filters, codes, system, derived);
+    let matched = indexed_matches_shared(idx, filters, codes, system, derived);
     let stats = stats_from(matched.iter().map(|&i| {
         (
             (idx.lines[i].ts != 0).then_some(idx.lines[i].ts),
@@ -1502,46 +1863,51 @@ fn build_stats(buckets: Vec<(i64, i64)>, bucket_ms: i64, levels: Vec<(String, i6
 
 const N_BUCKETS: usize = 60;
 
-fn stats_from<'a>(iter: impl Iterator<Item = (Option<i64>, &'a str)>) -> Stats {
-    // Chaveia por &str emprestada (zero alocação por linha); converte para
-    // String apenas no Vec final.
+fn histogram_from_bounds(
+    iter: impl Iterator<Item = Option<i64>>,
+    min_ts: i64,
+    max_ts: i64,
+    generation: Option<u64>,
+) -> Option<(Vec<(i64, i64)>, i64)> {
+    if min_ts > max_ts { return Some((Vec::new(), 0)); }
+    let span = max_ts.saturating_sub(min_ts).saturating_add(1);
+    let bucket_ms = (span / N_BUCKETS as i64)
+        .saturating_add(i64::from(span % N_BUCKETS as i64 != 0))
+        .max(1);
+    let count = (((span - 1) / bucket_ms + 1) as usize).min(N_BUCKETS);
+    let mut counts = vec![0i64; count];
+    for (position, ts) in iter.enumerate() {
+        if position % 2048 == 0 && crate::operations::cancelled_for(generation) { return None; }
+        let Some(t) = ts else { continue };
+        let b = (t.saturating_sub(min_ts) / bucket_ms) as usize;
+        counts[b.min(count - 1)] += 1;
+    }
+    let buckets = counts.into_iter().enumerate().map(|(b, c)| {
+        (min_ts.saturating_add((b as i64).saturating_mul(bucket_ms)), c)
+    }).collect();
+    Some((buckets, bucket_ms))
+}
+
+fn stats_from<'a>(iter: impl Iterator<Item = (Option<i64>, &'a str)> + Clone) -> Stats {
+    // Callers replay borrowed projections over existing selections. Keep only
+    // bounds and level counts; do not allocate another timestamp per event.
+    let generation = crate::operations::current_generation();
     let mut levels: HashMap<&'a str, i64> = HashMap::new();
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
-    let mut items = Vec::new();
-    for (ts, level) in iter {
+    for (position, (ts, level)) in iter.clone().enumerate() {
+        if position % 2048 == 0 && crate::operations::cancelled_for(generation) {
+            return build_stats(Vec::new(), 0, Vec::new());
+        }
         *levels.entry(level).or_default() += 1;
         if let Some(ts) = ts {
             min_ts = min_ts.min(ts);
             max_ts = max_ts.max(ts);
-            items.push(ts);
         }
     }
 
-    let mut buckets = Vec::new();
-    let mut bucket_ms = 0i64;
-    if min_ts <= max_ts {
-        let span = max_ts.saturating_sub(min_ts).saturating_add(1);
-        bucket_ms = (span / N_BUCKETS as i64)
-            .saturating_add(i64::from(span % N_BUCKETS as i64 != 0))
-            .max(1);
-        let count = (((span - 1) / bucket_ms + 1) as usize).min(N_BUCKETS);
-        let mut counts = vec![0i64; count];
-        for t in items {
-            let b = (t.saturating_sub(min_ts) / bucket_ms) as usize;
-            counts[b.min(count - 1)] += 1;
-        }
-        buckets = counts
-            .into_iter()
-            .enumerate()
-            .map(|(b, c)| {
-                (
-                    min_ts.saturating_add((b as i64).saturating_mul(bucket_ms)),
-                    c,
-                )
-            })
-            .collect();
-    }
+    let Some((buckets, bucket_ms)) = histogram_from_bounds(iter.map(|(ts, _)| ts), min_ts, max_ts, generation)
+        else { return build_stats(Vec::new(), 0, Vec::new()); };
 
     let mut levels: Vec<(String, i64)> = levels
         .into_iter()
@@ -1553,7 +1919,7 @@ fn stats_from<'a>(iter: impl Iterator<Item = (Option<i64>, &'a str)>) -> Stats {
 
 pub fn stats(events: &[Event], filters: &[Filter]) -> Stats {
     let idx = filtered_indices(events, filters);
-    stats_from(idx.into_iter().map(|i| {
+    stats_from(idx.iter().map(|&i| {
         let ev = &events[i];
         (ev.timestamp, ev.level.as_str())
     }))
@@ -1567,13 +1933,18 @@ pub fn stats_indexed(
     derived: &[CompiledDerived],
 ) -> Stats {
     let pfs = prepare(filters);
-    let mut matched: Vec<(Option<i64>, Cow<'static, str>)> = Vec::new();
+    let generation = crate::operations::current_generation();
+    let mut timestamps = Vec::new();
+    let mut levels: HashMap<Cow<'static, str>, i64> = HashMap::new();
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
     scan_indexed(
         idx,
         &pfs,
         codes,
         system,
         derived,
+        true,
         |_, meta, ev| match ev {
             Some(ev) => (ev.timestamp, Cow::Owned(ev.level)),
             // rótulo fixo da classe: sem String por linha
@@ -1582,7 +1953,231 @@ pub fn stats_indexed(
                 Cow::Borrowed(crate::model::class_label(meta.level)),
             ),
         },
-        |item| matched.push(item),
+        |(timestamp, level)| {
+            *levels.entry(level).or_default() += 1;
+            if let Some(timestamp) = timestamp {
+                min_ts = min_ts.min(timestamp);
+                max_ts = max_ts.max(timestamp);
+                timestamps.push(timestamp);
+            }
+        },
     );
-    stats_from(matched.iter().map(|(t, l)| (*t, l.as_ref())))
+    // Preserve the exact metadata/event projection without retaining its level
+    // String and Option discriminant per row or decoding/filtering a second time.
+    if crate::operations::cancelled_for(generation) { return build_stats(Vec::new(), 0, Vec::new()); }
+    let Some((buckets, bucket_ms)) = histogram_from_bounds(timestamps.iter().copied().map(Some), min_ts, max_ts, generation)
+        else { return build_stats(Vec::new(), 0, Vec::new()); };
+    let mut levels: Vec<_> = levels.into_iter().map(|(level, count)| (level.into_owned(), count)).collect();
+    levels.sort_by(|a, b| b.1.cmp(&a.1));
+    build_stats(buckets, bucket_ms, levels)
+}
+
+#[cfg(test)]
+mod shared_selection_tests {
+    use super::*;
+
+    #[test]
+    fn shared_selection_survives_sorting_owned_callers_and_cache_clear() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("shared-selection.jsonl");
+        let records = [
+            serde_json::json!({"timestamp":1700000003000i64,"level":"info","source":"c","code":"300","message":"z"}),
+            serde_json::json!({"timestamp":1700000001000i64,"level":"info","source":"a","code":"100","message":"x"}),
+            serde_json::json!({"timestamp":1700000002000i64,"level":"info","source":"b","code":"200","message":"y"}),
+        ];
+        std::fs::write(&path, records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let idx = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        // Numeric timestamps below 1e8 are intentionally not recognized as
+        // epochs by the parser. Verify this fixture really exercises sorting.
+        assert_eq!(idx.lines.iter().map(|meta| meta.ts).collect::<Vec<_>>(),
+            [1700000003000i64, 1700000001000, 1700000002000]);
+        let codes = CodesConfig::default();
+        let filters = [Filter { column:"level".into(), op:"equals".into(), value:"Informação".into(), value2:None }];
+        let selection = indexed_matches_shared(&idx, &filters, &codes, &codes, &[]);
+        assert_eq!(*selection, [0, 1, 2]);
+        for (column, expected) in [("", [0, 1, 2]), ("timestamp", [1, 2, 0]),
+            ("level", [0, 1, 2]), ("source", [1, 2, 0]), ("code", [1, 2, 0]), ("message", [1, 2, 0])] {
+            let result = query_from_indexed_matches(&idx, Arc::clone(&selection), column, "asc", 0, 10, &codes, &codes, &[]);
+            assert_eq!(result.total, 3);
+            assert_eq!(result.rows.iter().map(|event| event.id).collect::<Vec<_>>(), expected, "{column}");
+            assert_eq!(*selection, [0, 1, 2], "sorting {column} modified a shared selection");
+        }
+        let mut owned = indexed_matches(&idx, &filters, &codes, &codes, &[]);
+        owned.reverse();
+        assert_eq!(owned, [2, 1, 0]);
+        assert_eq!(*indexed_matches_shared(&idx, &filters, &codes, &codes, &[]), [0, 1, 2]);
+        clear_match_cache();
+        assert_eq!(*selection, [0, 1, 2]);
+        let result = query_from_indexed_matches(&idx, selection, "", "asc", 1, 1, &codes, &codes, &[]);
+        assert_eq!(result.rows[0].id, 1);
+    }
+}
+
+#[cfg(test)]
+mod histogram_tests {
+    use super::*;
+
+    // Frozen projection-retention path for parity and isolated RSS comparison.
+    fn retained_stats_reference(idx: &FileIndex, filters: &[Filter], codes: &CodesConfig) -> Stats {
+        let pfs = prepare(filters);
+        let mut matched: Vec<(Option<i64>, Cow<'static, str>)> = Vec::new();
+        scan_indexed(idx, &pfs, codes, codes, &[], true,
+            |_, meta, event| match event {
+                Some(event) => (event.timestamp, Cow::Owned(event.level)),
+                None => ((meta.ts != 0).then_some(meta.ts), Cow::Borrowed(crate::model::class_label(meta.level))),
+            }, |item| matched.push(item));
+        stats_from(matched.iter().map(|(timestamp, level)| (*timestamp, level.as_ref())))
+    }
+
+    fn normalized_stats(mut stats: Stats) -> Value {
+        // Equal-frequency levels have no defined order in either HashMap path.
+        stats.levels.sort();
+        serde_json::to_value(stats).unwrap()
+    }
+
+    #[test]
+    fn indexed_histogram_compaction_preserves_metadata_and_decoded_projections() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("histogram-projections.jsonl");
+        let records = [
+            serde_json::json!({"timestamp":"1970-01-01T00:00:00Z","source":"a","level":"custom","message":"first"}),
+            serde_json::json!({"timestamp":1700000000000i64,"source":"a","level":"info","message":"second"}),
+            serde_json::json!({"source":"b","level":"warn","message":"missing date"}),
+            serde_json::json!({"timestamp":1700000000060i64,"source":"b","level":"error","message":"fourth"}),
+            serde_json::json!({"source":"b","level":"","message":"missing level"}),
+            serde_json::json!({"timestamp":1700000000119i64,"source":"a","level":"custom","message":"sixth"}),
+        ];
+        std::fs::write(&path, records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let idx = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let codes = CodesConfig::default();
+        assert_eq!(idx.lines[0].ts, 0);
+        assert_eq!(crate::sources::event_at(&idx, 0, &codes, &codes, &[]).timestamp, Some(0));
+        for filters in [vec![],
+            vec![Filter { column:"source".into(), op:"regex".into(), value:".*".into(), value2:None }],
+            vec![Filter { column:"source".into(), op:"equals".into(), value:"b".into(), value2:None }],
+            vec![Filter { column:"message".into(), op:"contains".into(), value:"missing".into(), value2:None }],
+            vec![Filter { column:"level".into(), op:"equals".into(), value:"absent".into(), value2:None }]] {
+            let expected = normalized_stats(retained_stats_reference(&idx, &filters, &codes));
+            let actual = normalized_stats(stats_indexed(&idx, &filters, &codes, &codes, &[]));
+            assert_eq!(actual, expected, "{filters:?}");
+        }
+    }
+
+    #[test]
+    fn histogram_bucket_pass_remains_cancellable() {
+        let reads = std::cell::Cell::new(0usize);
+        let result = crate::operations::run(crate::operations::generation(), || {
+            let generation = crate::operations::current_generation();
+            histogram_from_bounds((0..100_000).map(|timestamp| {
+                reads.set(reads.get() + 1);
+                if reads.get() == 10 { crate::operations::cancel(); }
+                Some(timestamp)
+            }), 0, 99_999, generation)
+        });
+        assert!(result.is_err());
+        assert!(reads.get() <= 2049);
+    }
+
+    #[test]
+    #[ignore = "Indexed histogram retention timing/RSS; STATS_INDEXED_BENCH_EVENTS, STATS_INDEXED_REFERENCE=1"]
+    fn benchmark_indexed_histogram_retention() {
+        use std::io::Write;
+        let count = std::env::var("STATS_INDEXED_BENCH_EVENTS").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1_000_000).max(1);
+        let reference = std::env::var("STATS_INDEXED_REFERENCE").ok().as_deref() == Some("1");
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("histogram-memory.jsonl");
+        let mut output = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        for i in 0..count {
+            writeln!(output, "{}", serde_json::json!({"timestamp":1700000000000i64+i as i64,"level":"info","source":"worker","message":"completed"})).unwrap();
+        }
+        output.flush().unwrap(); drop(output);
+        let idx = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let codes = CodesConfig::default();
+        let expected = normalized_stats(stats_from(idx.lines.iter().map(|meta|
+            ((meta.ts != 0).then_some(meta.ts), crate::model::class_label(meta.level)))));
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            let actual = if reference { retained_stats_reference(&idx, &[], &codes) }
+                else { stats_indexed(&idx, &[], &codes, &codes, &[]) };
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(normalized_stats(actual), expected);
+        }
+        samples.sort_by(f64::total_cmp);
+        println!("INDEXED_HISTOGRAM_REVIEW {}", serde_json::json!({"events":count,"reference":reference,
+            "median_ms":samples[3],"p95_ms":samples[6],"samples":samples.len(),"parity":true,
+            "retained_item_bytes":if reference { std::mem::size_of::<(Option<i64>, Cow<'static, str>)>() } else { std::mem::size_of::<i64>() }}));
+    }
+
+    #[test]
+    fn histogram_preserves_boundaries_missing_dates_and_levels() {
+        let items = [(None, "custom"), (None, "custom"), (Some(0), "Info"),
+            (Some(59), "Error"), (Some(60), "Error"), (Some(119), "Info")];
+        let result = stats_from(items.into_iter());
+        assert_eq!(result.bucket_ms, 2);
+        assert_eq!(result.buckets.len(), 60);
+        for (position, &(start, count)) in result.buckets.iter().enumerate() {
+            assert_eq!(start, position as i64 * 2);
+            assert_eq!(count, i64::from([0, 29, 30, 59].contains(&position)));
+        }
+        let mut levels = result.levels;
+        levels.sort();
+        assert_eq!(levels, vec![("Error".into(), 2), ("Info".into(), 2), ("custom".into(), 2)]);
+        let empty = stats_from(std::iter::empty());
+        assert!(empty.buckets.is_empty());
+        assert!(empty.levels.is_empty());
+        assert_eq!(empty.bucket_ms, 0);
+        let missing = stats_from([(None, "unknown")].into_iter());
+        assert!(missing.buckets.is_empty());
+        assert_eq!(missing.levels, vec![("unknown".into(), 1)]);
+        let equal = stats_from([(Some(-42), "Info"); 3].into_iter());
+        assert_eq!(equal.buckets, vec![(-42, 3)]);
+        assert_eq!(equal.bucket_ms, 1);
+        let extremes = stats_from([i64::MIN, 0, i64::MAX].into_iter().map(|t| (Some(t), "Info")));
+        assert_eq!(extremes.buckets.len(), 60);
+        assert_eq!(extremes.buckets.iter().map(|(_, n)| n).sum::<i64>(), 3);
+        assert_eq!(extremes.buckets.first(), Some(&(i64::MIN, 1)));
+        assert_eq!(extremes.buckets.last().unwrap().1, 2);
+    }
+
+    #[test]
+    fn histogram_stops_reading_after_cancellation() {
+        let reads = std::cell::Cell::new(0usize);
+        let result = crate::operations::run(crate::operations::generation(), || {
+            stats_from((0..100_000).map(|i| {
+                reads.set(reads.get() + 1);
+                if reads.get() == 100 { crate::operations::cancel(); }
+                (Some(i), "Info")
+            }))
+        });
+        assert!(result.is_err());
+        assert!(reads.get() <= 2049, "read {} events after cancellation", reads.get());
+    }
+
+    #[test]
+    #[ignore = "manual histogram timing/RSS benchmark; HISTOGRAM_BENCH_EVENTS controls size"]
+    fn benchmark_histogram_memory() {
+        let count = std::env::var("HISTOGRAM_BENCH_EVENTS").ok()
+            .and_then(|n| n.parse::<usize>().ok()).unwrap_or(1_000_000).max(1);
+        // A compact existing timestamp column; fixture allocation is outside timing.
+        let timestamps: Vec<_> = (0..count).map(|i| 1_700_000_000_000 + i as i64).collect();
+        let mut samples = Vec::new();
+        let mut expected = None;
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            let result = stats_from(timestamps.iter().enumerate().map(|(i, &t)|
+                (Some(t), if i % 10 == 0 { "Error" } else { "Info" })));
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(result.buckets.iter().map(|(_, n)| n).sum::<i64>(), count as i64);
+            assert_eq!(result.levels.iter().map(|(_, n)| n).sum::<i64>(), count as i64);
+            let result = serde_json::to_value(result).unwrap();
+            if let Some(expected) = &expected { assert_eq!(&result, expected); } else { expected = Some(result); }
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_by(f64::total_cmp);
+        println!("HISTOGRAM_BENCH {}", serde_json::json!({
+            "events": count, "samplesMs": samples, "medianMs": sorted[3], "p95Ms": sorted[6],
+            "fixtureBytes": timestamps.capacity() * std::mem::size_of::<i64>()
+        }));
+    }
 }

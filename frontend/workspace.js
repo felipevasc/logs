@@ -48,7 +48,7 @@
   const fmtBytes = n => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${fmtNum(Math.ceil(n / 1000))} KB`;
   const pct = n => `${(n * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
   const localInput = t => { const d = new Date(t); return new Date(t - d.getTimezoneOffset() * 60000).toISOString().slice(0, 23); };
-  const sourceKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt, backendFilters(), state.derivedFields]);
+  const sourceKey = () => JSON.stringify([workspaceScope(), workspaceScope() === "case" ? caseSig() : state.currentArtifact?.id, state.currentArtifact?.loadedAt, backendFilters(), state.derivedFields, activeCase()?.bigData === true, state.bigDataRevision]);
   const note = text => `<div class="notice">${esc(text)}</div>`;
   const iconButton = (action, icon, title, index) => `<button class="icon-btn" data-action="${action}" data-index="${index}" title="${esc(title)}" aria-label="${esc(title)}"><i class="fas ${icon}"></i></button>`;
   const metric = (label, value, foot, cls = "") => `<div class="metric ${cls}"><div class="metric-label">${label}</div><div class="metric-value">${value}</div><div class="metric-foot">${foot}</div></div>`;
@@ -91,6 +91,9 @@
       const contextKey = sourceKey();
       switchView("viz", { deferAnalytics: true }); home.hidden = true;
       if (lastExploredKey === contextKey && state.rows?.length > 0 && !state.queryError) {
+        // Metadata may have finished while Summary hid the field tree. Repaint
+        // on the cached reveal too; no query is needed to present those fields.
+        renderExploreTree();
         switchTab(state.activeDatasetTab, { deferAnalytics: false });
         return;
       }

@@ -65,6 +65,7 @@ fn filter(column: &str, op: &str, value: &str) -> Filter {
 fn state_for(source: crate::SourceData) -> crate::AppState {
     crate::AppState {
         source: parking_lot::RwLock::new(source),
+        big_data_enabled: std::sync::atomic::AtomicBool::new(false),
         source_names: parking_lot::RwLock::new(vec![]),
         codes: parking_lot::RwLock::new(CodesConfig::default()),
         system_codes: parking_lot::RwLock::new(CodesConfig::default()),
@@ -87,6 +88,17 @@ fn security_memory_index_and_projection_have_identical_evidence() {
     let indexed=workspace::with_selection(&state,&[],|selection|crate::detections::run(&inputs,&crate::detections::Source::Selection(&selection))).unwrap();
     let mut a=serde_json::to_value(memory).unwrap();let mut b=serde_json::to_value(indexed).unwrap();a["elapsed_ms"]=0.into();b["elapsed_ms"]=0.into();assert_eq!(a,b);
     for minimum in 1..=5 { assert_eq!(crate::triage::project(&a,minimum,None),crate::triage::project(&b,minimum,None)); }
+    let cache = tempfile::tempdir().unwrap();
+    {
+        let mut source = state.source.write();
+        let crate::SourceData::Indexed(idx) = &mut *source else { unreachable!() };
+        idx.big_data = Some(std::sync::Arc::new(crate::big_data::BigDataIndex::open_or_build(idx, &codes, &codes, &[], cache.path(), None).unwrap()));
+    }
+    query::clear_match_cache();
+    let accelerated = workspace::with_selection(&state, &[], |selection| crate::detections::run(&inputs, &crate::detections::Source::Selection(&selection))).unwrap();
+    let mut c = serde_json::to_value(accelerated).unwrap();
+    c["elapsed_ms"] = 0.into();
+    assert_eq!(a, c, "Big Data must preserve complete security evidence and analysis identity");
 }
 
 #[test]
@@ -561,7 +573,7 @@ fn discovery_respects_case_filters_and_matches_indexed_storage() {
     let case = crate::discover_patterns_impl(
         &state,
         vec![filter("region", "equals", "south")],
-        Some(events),
+        Some(events.into()),
     );
     assert_eq!(case.total, 30);
     assert_eq!(case.sample_count, 30);
@@ -1405,6 +1417,7 @@ fn timeline_keeps_exact_counts_and_gaps_across_storage_modes() {
     let events = materialize(&index);
     let make_state = |source| crate::AppState {
         source: parking_lot::RwLock::new(source),
+        big_data_enabled: std::sync::atomic::AtomicBool::new(false),
         source_names: parking_lot::RwLock::new(vec![]),
         codes: parking_lot::RwLock::new(CodesConfig::default()),
         system_codes: parking_lot::RwLock::new(CodesConfig::default()),

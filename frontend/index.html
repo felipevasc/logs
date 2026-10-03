@@ -19,6 +19,7 @@
   <link rel="stylesheet" href="case-content.css" />
   <link rel="stylesheet" href="case-trails.css" />
   <link rel="stylesheet" href="security.css" />
+  <link rel="stylesheet" href="resources.css" />
 </head>
 <body>
   <nav class="workspace-nav" aria-label="Navegação principal">
@@ -75,8 +76,10 @@
         <input id="case-name-input" type="text" placeholder="Nome do Caso" hidden />
         <button id="btn-new-case" class="icon-btn" type="button" title="Novo Caso"><i class="fas fa-plus"></i></button>
         <button id="btn-case-menu" class="icon-btn" type="button" title="Opções do Caso"><i class="fas fa-ellipsis"></i></button>
+        <button id="btn-big-data" class="btn ghost small big-data-toggle" type="button" aria-pressed="false" title="Habilitar Big Data neste Caso" disabled><i class="fas fa-bolt" aria-hidden="true"></i><span>Big Data</span></button>
       </div>
       <button id="ws-export" class="icon-btn" type="button" title="Exportar" aria-label="Exportar"><i class="fas fa-arrow-up-from-bracket"></i></button>
+      <button id="btn-resources" class="icon-btn" type="button" title="Gerenciador de recursos" aria-label="Gerenciador de recursos" aria-haspopup="dialog"><i class="fas fa-gauge-high" aria-hidden="true"></i></button>
       <button id="btn-settings" class="icon-btn" type="button" title="Configurações"><i class="fas fa-gear"></i></button>
       <button id="btn-theme" class="icon-btn" type="button" title="Alternar tema claro/escuro"><i class="fas fa-sun"></i></button>
     </div>
@@ -1004,6 +1007,7 @@
   <script src="case-timeline.js"></script>
   <script src="app.js"></script>
   <script src="tasks.js"></script>
+  <script src="resources.js"></script>
   <script src="ui-scale.js"></script>
   <script src="timeline.js"></script>
   <script src="case-content.js"></script>
@@ -1020,6 +1024,7 @@
   <script src="entity-menu.js"></script>
   <script src="query-bar.js"></script>
   <script src="evidence-ui.js"></script>
+  <script src="value-inspector.js"></script>
 <script src="participants-ui.js"></script>
 <script src="security.js"></script>
   <script src="event-insights.js"></script>

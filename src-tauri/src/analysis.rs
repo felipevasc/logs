@@ -367,6 +367,10 @@ fn dominant_unit(events: impl Iterator<Item = Event>, field: &str, sample: usize
             valid += 1;
         }
     }
+    unit_from_votes(votes)
+}
+
+fn unit_from_votes(votes: [usize; 5]) -> UnitKind {
     votes
         .into_iter()
         .enumerate()
@@ -378,6 +382,48 @@ fn dominant_unit(events: impl Iterator<Item = Event>, field: &str, sample: usize
             _ => UnitKind::Number,
         })
         .unwrap_or(UnitKind::Number)
+}
+
+struct TimeSeriesPreparation {
+    unit: UnitKind,
+    splits: Vec<String>,
+    bounds: Option<(i64, i64)>,
+}
+
+/// These independent inputs used to replay the same source separately. Keep
+/// just their bounded summaries, so materializing an event serves all three.
+/// Undated rows still vote on units and split popularity, as they did before.
+fn prepare_time_series(events: impl Iterator<Item = Event>, spec: &SeriesSpec) -> TimeSeriesPreparation {
+    let infer_unit = spec.field.is_some() && spec.unit.as_deref().is_none_or(|unit| unit == "auto");
+    let mut votes = [0usize; 5];
+    let mut valid = 0;
+    let mut split_counts = crate::distinct::Terms::default();
+    let mut bounds: Option<(i64, i64)> = None;
+    for event in events {
+        if crate::operations::cancelled() { break; }
+        if infer_unit && valid < 500 {
+            if let Some((_, unit)) = spec.field.as_deref()
+                .and_then(|field| event.col_str(field))
+                .and_then(|text| parse_num_unit(&text))
+                .filter(|(number, _)| number.is_finite())
+            {
+                votes[unit as usize] += 1;
+                valid += 1;
+            }
+        }
+        if let Some(value) = spec.split.as_deref().and_then(|field| event.col_str(field)) {
+            if !value.is_empty() { split_counts.insert(value); }
+        }
+        if let Some(timestamp) = event.timestamp {
+            bounds = Some(bounds.map(|(min, max)| (min.min(timestamp), max.max(timestamp)))
+                .unwrap_or((timestamp, timestamp)));
+        }
+    }
+    TimeSeriesPreparation {
+        unit: unit_from_votes(votes),
+        splits: split_counts.top(6).into_iter().map(|(key, _)| key).collect(),
+        bounds,
+    }
 }
 
 fn unit_name(u: UnitKind) -> String {
@@ -434,10 +480,14 @@ where
             incompatible_units: 0,
         };
     }
+    let infer_unit = field.is_some() && spec.unit.as_deref().is_none_or(|unit| unit == "auto");
+    let preparation = (spec.chart != "terms" && (spec.split.is_some() || infer_unit))
+        .then(|| prepare_time_series(events(), spec));
     let unit = match (spec.unit.as_deref(), field) {
         (Some(u), _) if u != "auto" => u.to_string(),
         (Some(_), None) | (None, None) => "number".to_string(),
-        (_, Some(f)) => unit_name(dominant_unit(events(), f, 500)),
+        (_, Some(f)) => unit_name(preparation.as_ref().map_or_else(
+            || dominant_unit(events(), f, 500), |prepared| prepared.unit)),
     };
     let expected_unit = if matches!(spec.metric.as_str(), "count" | "distinct") {
         None
@@ -453,7 +503,7 @@ where
     let mut incompatible_units = 0;
 
     // splits: top N valores do campo de split
-    let splits: Vec<String> = match &spec.split {
+    let splits: Vec<String> = preparation.as_ref().map(|prepared| prepared.splits.clone()).unwrap_or_else(|| match &spec.split {
         Some(col) => {
             let mut counts = crate::distinct::Terms::default();
             for ev in events() {
@@ -469,7 +519,7 @@ where
             counts.top(6).into_iter().map(|(k, _)| k).collect()
         }
         None => vec![],
-    };
+    });
     let split_names: Vec<String> = if splits.is_empty() {
         vec![spec.field.clone().unwrap_or_else(|| "eventos".into())]
     } else {
@@ -525,12 +575,16 @@ where
     }
 
     // série temporal
-    let bounds = events()
-        .take_while(|_| !crate::operations::cancelled())
-        .filter_map(|ev| ev.timestamp)
-        .fold(None, |acc: Option<(i64, i64)>, t| {
-            Some(acc.map(|(a, b)| (a.min(t), b.max(t))).unwrap_or((t, t)))
-        });
+    let bounds = match &preparation {
+        Some(prepared) => prepared.bounds,
+        None => events()
+            .take_while(|_| !crate::operations::cancelled())
+            .filter_map(|event| event.timestamp)
+            .fold(None, |bounds: Option<(i64, i64)>, timestamp| {
+                Some(bounds.map(|(min, max)| (min.min(timestamp), max.max(timestamp)))
+                    .unwrap_or((timestamp, timestamp)))
+            }),
+    };
     if bounds.is_none() {
         return SeriesResult {
             kind: "time".into(),
@@ -942,5 +996,248 @@ pub fn pivot_stream(events: impl Iterator<Item = Event>, spec: &PivotSpec) -> Pi
         truncated,
         complete: !budget_reached && !crate::operations::cancelled(),
         processed_events,
+    }
+}
+
+#[cfg(test)]
+#[path = "analysis_legacy_benchmark.rs"]
+mod legacy_benchmark_reference;
+
+#[cfg(test)]
+mod series_review_tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    fn spec() -> SeriesSpec {
+        SeriesSpec { chart: "time".into(), metric: "avg".into(), field: Some("latency".into()),
+            interval_ms: Some(1000), split: Some("source".into()), limit: Some(0), unit: Some("auto".into()) }
+    }
+
+    fn fixture() -> Vec<Event> {
+        [
+            (None, "z", Some("1KB")), (Some(0), "A", Some("-5ms")),
+            (Some(0), "A", Some("0ms")), (Some(999), "B", Some("3ms")),
+            (Some(1000), "B", Some("bogus")), (Some(2000), "(vazio)", None),
+            (Some(2000), " ", Some("2KB")), (Some(3000), "", Some("7ms")),
+            (None, "C", Some("8ms")), (Some(3000), "D", Some("10ms")),
+            (Some(4000), "E", None), (Some(4000), "F", Some("1ms")),
+            (None, "Z", Some("2ms")),
+        ].into_iter().map(|(timestamp, source, latency)| {
+            let mut event = Event::empty();
+            event.timestamp = timestamp;
+            event.source = source.into();
+            if let Some(value) = latency { event.fields.insert("latency".into(), value.into()); }
+            event
+        }).collect()
+    }
+
+    #[test]
+    fn temporal_series_preflight_keeps_units_splits_missing_values_and_full_result() {
+        let events = fixture();
+        let mut options = spec();
+        let actual = serde_json::to_value(compute_series(&events, &options)).unwrap();
+        assert_eq!(actual, json!({"kind":"time", "unit":"duration", "interval_ms":1000,
+            "x":[0,1000,2000,3000,4000], "x_values":[], "incompatible_units":1,
+            "series":[
+                {"name":"A","points":[-2.5,0.0,0.0,0.0,0.0],"samples":[2,0,0,0,0]},
+                {"name":"B","points":[3.0,0.0,0.0,0.0,0.0],"samples":[1,0,0,0,0]},
+                {"name":" ","points":[0.0,0.0,0.0,0.0,0.0],"samples":[0,0,0,0,0]},
+                {"name":"(vazio)","points":[0.0,0.0,0.0,0.0,0.0],"samples":[0,0,0,0,0]},
+                {"name":"C","points":[0.0,0.0,0.0,0.0,0.0],"samples":[0,0,0,0,0]},
+                {"name":"D","points":[0.0,0.0,0.0,10.0,0.0],"samples":[0,0,0,1,0]}
+            ]}));
+        // Terms currently use the winning split as the single series name,
+        // even though the split does not partition these accumulators.
+        options.chart = "terms".into();
+        options.limit = Some(3);
+        assert_eq!(serde_json::to_value(compute_series(&events, &options)).unwrap(),
+            json!({"kind":"terms","unit":"duration","interval_ms":0,"x":["10ms","8ms","7ms"],
+                "x_values":["10ms","8ms","7ms"],"incompatible_units":2,
+                "series":[{"name":"A","points":[10.0,8.0,7.0],"samples":[1,1,1]}]}));
+    }
+
+    #[test]
+    fn temporal_series_unit_prefix_ties_and_undated_or_extreme_inputs_stay_exact() {
+        let mut options = spec();
+        options.metric = "sum".into();
+        let events: Vec<_> = (0..1500).map(|i| {
+            let mut event = Event::empty();
+            event.timestamp = Some(0);
+            event.source = "A".into();
+            event.fields.insert("latency".into(), if i < 250 { "1" } else { "1ms" }.into());
+            event
+        }).collect();
+        assert_eq!(serde_json::to_value(compute_series(&events, &options)).unwrap(),
+            json!({"kind":"time","unit":"number","interval_ms":1000,"x":[0],"x_values":[],
+                "incompatible_units":1250,"series":[{"name":"A","points":[250.0],"samples":[250]}]}));
+        let mut undated = fixture();
+        for event in &mut undated { event.timestamp = None; }
+        assert_eq!(serde_json::to_value(compute_series(&undated, &options)).unwrap(),
+            json!({"kind":"time","unit":"duration","interval_ms":0,"x":[],"x_values":[],"series":[],"incompatible_units":0}));
+        options.metric = "count".into();
+        options.field = None;
+        options.split = None;
+        options.interval_ms = Some(1);
+        let mut extremes = vec![Event::empty(), Event::empty()];
+        extremes[0].timestamp = Some(i64::MIN);
+        extremes[1].timestamp = Some(i64::MAX);
+        let result = compute_series(&extremes, &options);
+        assert_eq!(result.x.first(), Some(&Value::from(i64::MIN)));
+        assert!(result.x.len() <= 2002);
+        assert_eq!(result.series[0].samples.iter().sum::<usize>(), 2);
+        assert_eq!(result.series[0].points.iter().sum::<f64>(), 2.0);
+    }
+
+    #[test]
+    fn temporal_series_cancellation_stops_repeated_materialization() {
+        let events = fixture();
+        let reads = Cell::new(0usize);
+        let result = crate::operations::run(crate::operations::generation(), || {
+            compute_series_stream(|| events.iter().cloned().inspect(|_| {
+                reads.set(reads.get() + 1);
+                if reads.get() == 7 { crate::operations::cancel(); }
+            }), &spec())
+        });
+        assert!(result.is_err());
+        assert!(reads.get() < events.len());
+    }
+
+    #[test]
+    #[ignore = "Repeated series materialization benchmark; ANALYSIS_BENCH_EVENTS=100000,1000000"]
+    fn benchmark_series_preflight_materialization() {
+        use sha2::{Digest, Sha256};
+        let counts = std::env::var("ANALYSIS_BENCH_EVENTS").unwrap_or_else(|_| "100000".into());
+        for count in counts.split(',').map(|value| value.parse::<usize>().unwrap()) {
+            let events: Vec<_> = (0..count).map(|i| {
+                let mut event = Event::empty();
+                event.id = i;
+                event.timestamp = (i % 97 != 0).then_some(1700000000000i64 + i as i64);
+                event.source = format!("service-{:02}", i % 12);
+                event.message = "worker completed request".into();
+                event.raw = "representative original log payload ".repeat(8);
+                event.fields.insert("latency".into(), "5ms".into());
+                event.fields.insert("request_id".into(), format!("req-{i:09}").into());
+                event
+            }).collect();
+            for (scenario, metric, field, split) in [
+                ("count_split", "count", None, true),
+                ("average_auto_split", "avg", Some("latency"), true),
+                ("missing_auto_split", "avg", Some("absent"), true),
+                ("count_unsplit_control", "count", None, false),
+            ] {
+                let options = SeriesSpec { chart:"time".into(), metric:metric.into(), field:field.map(str::to_string),
+                    interval_ms:None, split:split.then(|| "source".into()), limit:Some(10), unit:Some("auto".into()) };
+                let mut times = Vec::new();
+                let mut digest = None;
+                let mut materialized = 0;
+                let mut passes = 0;
+                for _ in 0..5 {
+                    let reads = Cell::new(0usize);
+                    let starts = Cell::new(0usize);
+                    let started = Instant::now();
+                    let result = compute_series_stream(|| {
+                        starts.set(starts.get() + 1);
+                        events.iter().cloned().inspect(|_| reads.set(reads.get() + 1))
+                    }, &options);
+                    times.push(started.elapsed().as_secs_f64() * 1000.0);
+                    let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&result).unwrap()));
+                    if let Some(previous) = &digest { assert_eq!(previous, &hash); }
+                    digest = Some(hash);
+                    materialized = reads.get();
+                    passes = starts.get();
+                }
+                times.sort_by(f64::total_cmp);
+                println!("ANALYSIS_REVIEW {}", json!({"events":count,"scenario":scenario,"median_ms":times[2],"p95_ms":times[4],
+                    "materialized_events":materialized,"passes":passes,"result_sha256":digest,
+                    "input":"owned Event clones, synthetic replay; serialization outside timing"}));
+            }
+        }
+    }
+
+    #[test]
+    fn series_preflight_matches_frozen_reference_across_contract_options() {
+        let records = fixture();
+        for chart in ["time", "terms"] {
+            for metric in ["count", "sum", "avg", "min", "max", "distinct"] {
+                for field in [None, Some("latency"), Some("absent")] {
+                    for split in [None, Some("source"), Some("absent")] {
+                        for unit in [None, Some("auto"), Some("duration"), Some("unknown")] {
+                            let options = SeriesSpec { chart:chart.into(), metric:metric.into(), field:field.map(str::to_string),
+                                interval_ms:Some(1000), split:split.map(str::to_string), limit:Some(3), unit:unit.map(str::to_string) };
+                            let replay = || records.iter().cloned();
+                            let reference = legacy_benchmark_reference::compute_series_stream(&replay, &options);
+                            let current = compute_series_stream(&replay, &options);
+                            assert_eq!(serde_json::to_value(current).unwrap(), serde_json::to_value(reference).unwrap(), "{options:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Paired AB/BA same-binary temporal control; ANALYSIS_PAIRED_EVENTS=100000,1000000"]
+    fn benchmark_series_paired_control() {
+        use sha2::{Digest, Sha256};
+        let median = |values: &[f64]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            let middle = sorted.len() / 2;
+            if sorted.len() % 2 == 0 { (sorted[middle - 1] + sorted[middle]) / 2.0 } else { sorted[middle] }
+        };
+        let counts = std::env::var("ANALYSIS_PAIRED_EVENTS").unwrap_or_else(|_| "1000000".into());
+        for count in counts.split(',').map(|value| value.parse::<usize>().unwrap()) {
+            let records: Vec<_> = (0..count).map(|i| {
+                let mut event = Event::empty();
+                event.id = i;
+                event.timestamp = (i % 97 != 0).then_some(1700000000000i64 + i as i64);
+                event.source = format!("service-{:02}", i % 12);
+                event.message = "worker completed request".into();
+                event.raw = "representative original log payload ".repeat(8);
+                event.fields.insert("latency".into(), "5ms".into());
+                event.fields.insert("request_id".into(), format!("req-{i:09}").into());
+                event
+            }).collect();
+            let options = SeriesSpec { chart:"time".into(), metric:"count".into(), field:None,
+                interval_ms:None, split:None, limit:Some(10), unit:Some("auto".into()) };
+            let reads = Cell::new(0usize);
+            let starts = Cell::new(0usize);
+            let replay = || {
+                starts.set(starts.get() + 1);
+                records.iter().cloned().inspect(|_| reads.set(reads.get() + 1))
+            };
+            let reference = legacy_benchmark_reference::compute_series_stream(&replay, std::hint::black_box(&options));
+            let expected = serde_json::to_value(reference).unwrap();
+            let current = compute_series_stream(&replay, std::hint::black_box(&options));
+            assert_eq!(serde_json::to_value(current).unwrap(), expected);
+            let mut old_times = Vec::new();
+            let mut new_times = Vec::new();
+            let mut ratios = Vec::new();
+            for round in 0..10 {
+                let mut pair = [0.0; 2];
+                for reference_first in if round % 2 == 0 { [true, false] } else { [false, true] } {
+                    reads.set(0); starts.set(0);
+                    let started = Instant::now();
+                    let result = if reference_first {
+                        legacy_benchmark_reference::compute_series_stream(&replay, std::hint::black_box(&options))
+                    } else {
+                        compute_series_stream(&replay, std::hint::black_box(&options))
+                    };
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    assert_eq!(serde_json::to_value(result).unwrap(), expected);
+                    assert_eq!(reads.get(), count * 2);
+                    assert_eq!(starts.get(), 2);
+                    pair[usize::from(!reference_first)] = elapsed;
+                }
+                old_times.push(pair[0]); new_times.push(pair[1]); ratios.push(pair[1] / pair[0]);
+            }
+            println!("ANALYSIS_PAIRED {}", json!({"events":count,"pairs":10,"order":"alternating AB/BA after warm-up",
+                "reference_ms":old_times,"current_ms":new_times,"reference_median_ms":median(&old_times),
+                "current_median_ms":median(&new_times),"paired_ratio_median":median(&ratios),
+                "materialized_events":count * 2,"passes":2,"parity":true,
+                "result_sha256":format!("{:x}", Sha256::digest(serde_json::to_vec(&expected).unwrap()))}));
+        }
     }
 }

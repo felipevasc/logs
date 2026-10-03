@@ -70,13 +70,25 @@ pub async fn load_bundle(
             source_desc: names.join(" + "),
         };
         let state = app.state::<AppState>();
-        let mut source = state.source.write();
-        crate::operations::commit();
-        *source = SourceData::Indexed(idx);
-        *state.source_names.write() = names;
+        publish_bundle(&state.source, &state.source_names, idx, names)?;
         Ok(summary)
     })
     .await?
+}
+
+fn publish_bundle(
+    source: &parking_lot::RwLock<SourceData>,
+    source_names: &parking_lot::RwLock<Vec<String>>,
+    index: sources::FileIndex,
+    names: Vec<String>,
+) -> Result<(), String> {
+    let mut source = source.write();
+    // A query/index build may have held this lock while cancellation arrived.
+    crate::operations::check()?;
+    crate::operations::commit();
+    *source = SourceData::Indexed(index);
+    *source_names.write() = names;
+    Ok(())
 }
 
 pub struct Selection<'a> {
@@ -337,12 +349,12 @@ pub async fn dataset_overview(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<insights::Overview, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     crate::offload(move || {
         overview_scope_impl(
             app.state::<AppState>().inner(),
             filters,
-            case_events.as_deref(),
+            case_events.as_deref().map(Vec::as_slice),
         )
     })
     .await?
@@ -505,7 +517,7 @@ pub async fn timeline_range(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<TimelineRange, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     crate::offload(move || {
         if case_events.is_none() {
             return timeline_range_impl(
@@ -522,7 +534,7 @@ pub async fn timeline_range(
             start,
             end,
             bucket_count,
-            case_events.as_deref(),
+            case_events.as_deref().map(Vec::as_slice),
         )
     })
     .await?
@@ -536,7 +548,7 @@ pub async fn compare_periods(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<insights::Comparison, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     crate::offload(move || {
         if case_events.is_none() {
             compare_impl(app.state::<AppState>().inner(), filters, before, after)
@@ -546,7 +558,7 @@ pub async fn compare_periods(
                 filters,
                 before,
                 after,
-                case_events.as_deref(),
+                case_events.as_deref().map(Vec::as_slice),
             )
         }
     })
@@ -677,18 +689,41 @@ pub async fn list_sources(app: AppHandle) -> Result<Vec<SourceInfo>, String> {
 
 pub fn index_events(events: &[Event]) -> Result<sources::FileIndex, String> {
     let dir = crate::config_dir().join("snapshots");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!(
-        "events-{}.jsonl",
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-    ));
-    let mut file = BufWriter::new(std::fs::File::create(&path).map_err(|e| e.to_string())?);
-    for ev in events {
-        serde_json::to_writer(&mut file, ev).map_err(|e| e.to_string())?;
+    index_events_at(events, &dir)
+}
+
+fn write_snapshot_events(file: &mut impl Write, events: &[Event]) -> Result<(), String> {
+    for (position, event) in events.iter().enumerate() {
+        if position % 256 == 0 {
+            crate::operations::check()?;
+        }
+        serde_json::to_writer(&mut *file, event).map_err(|e| e.to_string())?;
         file.write_all(b"\n").map_err(|e| e.to_string())?;
     }
-    file.flush().map_err(|e| e.to_string())?;
-    sources::index_file(&path.to_string_lossy(), "snapshot", None, None, None)
+    crate::operations::check()
+}
+
+fn index_events_at(events: &[Event], dir: &Path) -> Result<sources::FileIndex, String> {
+    crate::operations::check()?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // Own the snapshot until it has a valid index. Failure/cancellation drops
+    // the mapped index before the path, allowing cleanup on Windows as well.
+    let mut pending = tempfile::Builder::new().prefix("events-").suffix(".jsonl")
+        .tempfile_in(dir).map_err(|e| e.to_string())?;
+    {
+        let mut file = BufWriter::new(pending.as_file_mut());
+        write_snapshot_events(&mut file, events)?;
+        file.flush().map_err(|e| e.to_string())?;
+    }
+    pending.as_file().sync_all().map_err(|e| e.to_string())?;
+    let path = pending.into_temp_path();
+    let index = sources::index_file(&path.to_string_lossy(), "snapshot", None, None, None)?;
+    crate::operations::check()?;
+    if let Err(error) = path.keep() {
+        drop(index);
+        return Err(error.error.to_string());
+    }
+    Ok(index)
 }
 
 pub fn index_channel(channel: &str, max_events: usize) -> Result<sources::FileIndex, String> {
@@ -789,7 +824,7 @@ pub async fn export_events(
     case_key: Option<String>,
     app: AppHandle,
 ) -> Result<usize, String> {
-    let case_events = crate::case_cache::take(case_events, case_key)?;
+    let case_events = crate::case_cache::resolve(case_events, case_key)?;
     crate::offload(move || {
         validate(&filters)?;
         if !["csv", "jsonl"].contains(&format.as_str()) {
@@ -1223,4 +1258,358 @@ pub fn expand_gzip(path: &Path) -> Result<PathBuf, String> {
         let _ = std::fs::remove_file(temp);
     }
     result
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use std::io;
+
+    #[test]
+    fn cancellation_before_bundle_publication_preserves_source_and_names() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_events_at(&[Event::empty()], dir.path()).unwrap();
+        let mut previous = Event::empty();
+        previous.id = 42;
+        previous.event_ref = "preserved:42".into();
+        let source = Arc::new(parking_lot::RwLock::new(SourceData::Memory(vec![previous])));
+        let names = Arc::new(parking_lot::RwLock::new(vec!["previous".to_string()]));
+        let held = source.write();
+        let worker_source = source.clone();
+        let worker_names = names.clone();
+        let generation = crate::operations::generation();
+        let (entered, wait_for_entry) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            crate::operations::run(generation, || {
+                entered.send(()).unwrap();
+                publish_bundle(&worker_source, &worker_names, index, vec!["new".into()])
+            })
+        });
+        wait_for_entry.recv().unwrap();
+        crate::operations::cancel();
+        drop(held);
+        assert!(worker.join().unwrap().is_err());
+        let current = source.read();
+        let SourceData::Memory(events) = &*current else { panic!("source was replaced") };
+        assert_eq!(events[0].id, 42);
+        assert_eq!(events[0].event_ref, "preserved:42");
+        assert_eq!(*names.read(), ["previous"]);
+    }
+
+    #[test]
+    fn memory_snapshot_keeps_only_successful_files_and_uses_unique_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(index_events_at(&[], dir.path()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let generation = crate::operations::generation();
+        assert!(crate::operations::run(generation, || {
+            crate::operations::cancel();
+            index_events_at(&[Event::empty()], dir.path())
+        }).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let events = [specimen()];
+        let first = index_events_at(&events, dir.path()).unwrap();
+        let second = index_events_at(&events, dir.path()).unwrap();
+        assert_ne!(first.parts[0].path, second.parts[0].path);
+        assert_eq!(first.lines.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&first.parts[0].path).unwrap(),
+        ).unwrap();
+        assert_eq!(value, serde_json::to_value(&events[0]).unwrap());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn snapshot_materialization_observes_cancellation_between_batches() {
+        struct CancelAfterFirstRow { rows: usize }
+        impl Write for CancelAfterFirstRow {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes == b"\n" {
+                    self.rows += 1;
+                    if self.rows == 1 { crate::operations::cancel(); }
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let events = vec![Event::empty(); 512];
+        let mut output = CancelAfterFirstRow { rows: 0 };
+        assert!(crate::operations::run(crate::operations::generation(), || {
+            write_snapshot_events(&mut output, &events)
+        }).is_err());
+        assert!(output.rows > 0 && output.rows <= 256);
+    }
+
+    fn specimen() -> Event {
+        let mut event = Event::empty();
+        event.id = 7;
+        event.event_ref = "saved:7".into();
+        event.timestamp = Some(0);
+        event.source = "=1+1".into();
+        event.code = "500".into();
+        event.name = "ação 東京".into();
+        event.description = "a,\"b\"\\c\t".into();
+        event.message = "linha 1\nlinha 2\r\ntoken=message-secret".into();
+        event.raw = "password=raw-secret".into();
+        event
+            .fields
+            .insert("nullable".into(), serde_json::Value::Null);
+        event.fields.insert(
+            "nested".into(),
+            json!({
+                "z": [null, true, "quote\"\\\r\n東京", u64::MAX],
+                "a": -0.0, "secret": "nested-secret",
+            }),
+        );
+        event.fields.insert("token".into(), json!("field-secret"));
+        event
+    }
+
+    // Independent reference for the established JSONL bytes. In particular,
+    // Value's object ordering can differ from Event's derived serializer.
+    fn legacy_jsonl(
+        writer: &mut impl Write,
+        events: impl Iterator<Item = Event>,
+        mask: bool,
+    ) -> Result<usize, String> {
+        let mut count = 0;
+        for event in events {
+            let mut value = serde_json::to_value(&event).map_err(|error| error.to_string())?;
+            if mask {
+                redact_value(&mut value);
+            }
+            let text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+            writeln!(writer, "{text}").map_err(|error| error.to_string())?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    #[test]
+    fn jsonl_preserves_bytes_nested_values_masks_and_original_events() {
+        let mut no_time = specimen();
+        no_time.id = usize::MAX;
+        no_time.timestamp = None;
+        no_time.fields.insert("later".into(), json!([false, 0, ""]));
+        let events = vec![specimen(), no_time];
+        let original = serde_json::to_value(&events).unwrap();
+        for mask in [false, true] {
+            let mut expected = Vec::new();
+            legacy_jsonl(&mut expected, events.iter().cloned(), mask).unwrap();
+            let mut actual = Vec::new();
+            assert_eq!(
+                write_events_export(&mut actual, "jsonl", mask, || events.iter().cloned()).unwrap(),
+                2
+            );
+            assert_eq!(actual, expected);
+            let rows: Vec<serde_json::Value> = std::str::from_utf8(&actual)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0]["fields"]["nested"]["z"][3], json!(u64::MAX));
+            assert!(rows[1]["timestamp"].is_null());
+            if mask {
+                assert_eq!(rows[0]["fields"]["token"], "[oculto]");
+                assert_eq!(rows[0]["fields"]["nested"]["secret"], "[oculto]");
+                assert!(!std::str::from_utf8(&actual).unwrap().contains("raw-secret"));
+                assert!(!std::str::from_utf8(&actual)
+                    .unwrap()
+                    .contains("message-secret"));
+            } else {
+                assert_eq!(rows, original.as_array().unwrap().clone());
+            }
+            assert_eq!(serde_json::to_value(&events).unwrap(), original);
+        }
+        let mut empty = Vec::new();
+        assert_eq!(
+            write_events_export(&mut empty, "jsonl", false, std::iter::empty::<Event>).unwrap(),
+            0
+        );
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn csv_keeps_late_columns_escaping_formula_protection_and_masks() {
+        let mut first = Event::empty();
+        first.id = 7;
+        first.event_ref = "saved:7".into();
+        first.timestamp = Some(0);
+        first.source = "=1+1".into();
+        first.code = "500".into();
+        first.name = "ação".into();
+        first.description = "a,\"b\"".into();
+        first.message = "linha 1\nlinha 2".into();
+        first.raw = "password=abcd".into();
+        first.fields = json!({"amount": -1.25, "nullable": null, "token": "abc"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut second = Event::empty();
+        second.id = 8;
+        second.event_ref = "saved:8".into();
+        second.source = "api".into();
+        second.fields = json!({"late":"@cmd", "source":"shadowed", "timestamp":99})
+            .as_object()
+            .unwrap()
+            .clone();
+        let events = [first, second];
+        let expected = concat!(
+            "\"timestamp\",\"source\",\"level\",\"code\",\"name\",\"description\",\"message\",\"id\",\"event_ref\",\"parse_status\",\"raw\",\"amount\",\"late\",\"nullable\",\"token\"\n",
+            "\"1970-01-01T00:00:00+00:00\",\"'=1+1\",\"Informação\",\"500\",\"ação\",\"a,\"\"b\"\"\",\"linha 1\nlinha 2\",\"7\",\"saved:7\",\"parsed\",\"password=abcd\",\"'-1.25\",\"\",\"\",\"abc\"\n",
+            "\"\",\"api\",\"Informação\",\"\",\"\",\"\",\"\",\"8\",\"saved:8\",\"parsed\",\"\",\"\",\"'@cmd\",\"\",\"\"\n",
+        );
+        for mask in [false, true] {
+            let mut actual = Vec::new();
+            assert_eq!(
+                write_events_export(&mut actual, "csv", mask, || events.iter().cloned()).unwrap(),
+                2
+            );
+            let expected = if mask {
+                expected
+                    .replace("password=abcd", "password=\"\"[oculto]\"\"")
+                    .replace("\"abc\"", "\"[oculto]\"")
+            } else {
+                expected.into()
+            };
+            assert_eq!(String::from_utf8(actual).unwrap(), expected);
+        }
+    }
+
+    struct FailingWriter {
+        remaining: usize,
+        accepted: usize,
+    }
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::other("injected write failure"));
+            }
+            let count = bytes.len().min(self.remaining);
+            self.remaining -= count;
+            self.accepted += count;
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn export_propagates_partial_writer_failure_and_does_not_start_cancelled_work() {
+        let event = specimen();
+        for format in ["jsonl", "csv"] {
+            for mask in [false, true] {
+                let mut writer = FailingWriter {
+                    remaining: 19,
+                    accepted: 0,
+                };
+                let error = write_events_export(&mut writer, format, mask, || {
+                    std::iter::once(event.clone())
+                })
+                .unwrap_err();
+                assert!(error.contains("injected write failure"));
+                assert_eq!(writer.accepted, 19);
+                let mut output = Vec::new();
+                let result =
+                    crate::operations::run(crate::operations::generation().wrapping_sub(1), || {
+                        write_events_export(&mut output, format, mask, || {
+                            std::iter::once(event.clone())
+                        })
+                    });
+                assert!(result.is_err());
+                assert!(output.is_empty());
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct HashWriter {
+        hash: Sha256,
+        bytes: u64,
+    }
+    impl Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.hash.update(bytes);
+            self.bytes += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn digest(writer: BufWriter<HashWriter>) -> (u64, String) {
+        let writer = writer.into_inner().ok().unwrap();
+        (writer.bytes, format!("{:x}", writer.hash.finalize()))
+    }
+
+    #[test]
+    #[ignore = "manual JSONL serialization benchmark with exact output digests"]
+    fn benchmark_jsonl_export() {
+        for (name, count, raw_size, mask) in [
+            ("jsonl_100k", 100_000, 256, false),
+            ("jsonl_1m", 1_000_000, 256, false),
+            ("jsonl_large_records", 8_000, 32 * 1024, false),
+            ("jsonl_masked_100k", 100_000, 256, true),
+        ] {
+            let pool: Vec<_> = (0..64)
+                .map(|i| {
+                    let mut event = specimen();
+                    event.id = i;
+                    event.timestamp = Some(1_700_000_000_000 + i as i64);
+                    event.event_ref = format!("fixture:{i}");
+                    event.raw = format!("request={i} password=secret ")
+                        .chars()
+                        .cycle()
+                        .take(raw_size)
+                        .collect();
+                    event
+                })
+                .collect();
+            let mut reference = BufWriter::new(HashWriter::default());
+            assert_eq!(
+                legacy_jsonl(
+                    &mut reference,
+                    pool.iter().cycle().take(count).cloned(),
+                    mask
+                )
+                .unwrap(),
+                count
+            );
+            reference.flush().unwrap();
+            let expected = digest(reference);
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let mut output = BufWriter::new(HashWriter::default());
+                let started = std::time::Instant::now();
+                assert_eq!(
+                    write_events_export(&mut output, "jsonl", mask, || pool
+                        .iter()
+                        .cycle()
+                        .take(count)
+                        .cloned())
+                    .unwrap(),
+                    count
+                );
+                output.flush().unwrap();
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(digest(output), expected);
+            }
+            let mut sorted = samples.clone();
+            sorted.sort_by(f64::total_cmp);
+            println!(
+                "JSONL_EXPORT_BENCH {}",
+                json!({
+                    "workload": name, "events": count, "rawBytesPerEvent": raw_size,
+                    "mask": mask, "outputBytes": expected.0, "sha256": expected.1,
+                    "samplesMs": samples, "medianMs": sorted[2], "p95Ms": sorted[4],
+                    "destination": "buffered SHA-256 sink; excludes disk latency and source parsing",
+                })
+            );
+        }
+    }
 }

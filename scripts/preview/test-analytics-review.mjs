@@ -9,7 +9,7 @@ const fallback = `${process.env.LOCALAPPDATA}/ms-playwright/chromium_headless_sh
 const browser = await chromium.launch({ executablePath: existsSync(chromium.executablePath()) ? undefined : fallback });
 const page = await browser.newPage({ viewport: { width: 1200, height: 900 }, reducedMotion: "reduce" });
 const errors = [], results = {};
-page.on("pageerror", error => errors.push(error.message));
+page.on("pageerror", error => errors.push(error.stack || error.message));
 try {
   await page.goto(url);
   await page.waitForFunction(() => window.WorkspaceContext?.ready && !WorkspaceContext.changing && state.loaded && !state.loadOverlay && state.rows.length);

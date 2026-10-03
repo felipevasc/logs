@@ -172,7 +172,7 @@ window.Security = (() => {
     const host=node.querySelector('.sec-inline-events');
     host.hidden=!host.hidden;
     node.querySelector('[data-act="d-records"]').setAttribute('aria-expanded',String(!host.hidden));
-    if(host.hidden)return;
+    if(host.hidden){ window.ValueInspector?.close(); return; }
     const article=node.closest('.sec-episode');
     article.__previewDetection=detection;
     article.querySelector('.sec-evidence-preview').innerHTML=preview(detection,article.dataset.patternGroup==='true',3);
@@ -186,8 +186,9 @@ window.Security = (() => {
       for(const member of members.slice(offset,offset+20)) {
         const details=el('details','sec-event');
         details.innerHTML=`<summary>Evento ${esc(member.event_id)} <code>${esc(member.event_ref)}</code></summary><div class="sec-event-content"></div>`;
-        const body=details.querySelector('.sec-event-content');let loading=false,loaded=false;
+        const body=details.querySelector('.sec-event-content');let loading=false,loaded=false,closeInspector=null;
         details.addEventListener('toggle',async()=>{
+          if(!details.open)closeInspector?.(); else window.ValueInspector?.close();
           if(!details.open || loading || loaded)return;
           loading=true;body.textContent='Carregando evento original…';
           try {
@@ -199,6 +200,9 @@ window.Security = (() => {
             const meta=Object.entries(safe).filter(([k])=>!['fields','raw'].includes(k));
             const rows=entries=>entries.map(([k,v])=>`<div class="sec-event-field"><dt>${esc(k)}</dt><dd><pre>${esc(typeof v==='string'?v:JSON.stringify(v,null,2))}</pre></dd></div>`).join('');
             body.innerHTML=`<h5>Evento</h5><dl>${rows(meta)}</dl><h5>Campos (${fields.length})</h5><dl>${rows(fields)}</dl><details class="sec-raw"><summary>Conteúdo bruto original</summary><pre>${esc(safe.raw || '(não registrado)')}</pre></details>`;
+            const inspect=el('button','btn ghost small','Inspecionar valores e subcampos');inspect.type='button';
+            inspect.onclick=()=>{closeInspector=window.ValueInspector?.open(event,{label:`Evento ${member.event_id}`});};
+            body.prepend(inspect);
             loaded=true;
           }catch(error){body.textContent=`Não foi possível abrir este evento: ${error}`;const retry=el('button','text-button','Tentar novamente');retry.onclick=()=>{details.open=false;requestAnimationFrame(()=>details.open=true);};body.append(retry);}
           finally{loading=false;}

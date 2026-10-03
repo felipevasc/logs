@@ -12,25 +12,97 @@ use tauri::{AppHandle, Manager};
 
 fn source_key(state: &AppState) -> String {
     match &*state.source.read() {
-        SourceData::Indexed(idx) => format!(
-            "idx:{}:{}",
-            idx.lines.len(),
-            idx.parts.iter().map(|p| p.identity.as_str()).collect::<Vec<_>>().join(",")
-        ),
-        SourceData::Memory(events) => format!("mem:{}:{:p}", events.len(), events.as_ptr()),
+        SourceData::Indexed(idx) => {
+            use sha2::{Digest, Sha256};
+            let mut hash = Sha256::new();
+            digest(&mut hash, &(crate::index_cache::INDEX_DIR, idx.lines.len()));
+            // The cache key tracks parser/settings semantics without rescanning
+            // all line metadata on every page of an already completed analysis.
+            for part in &idx.parts {
+                digest(
+                    &mut hash,
+                    &(
+                        &part.identity,
+                        &part.path,
+                        &part.file_name,
+                        &part.format,
+                        &part.header,
+                        part.base,
+                        part.mmap.len(),
+                    ),
+                );
+                match &part.custom {
+                    Some(crate::sources::CustomParse::Regex(re)) => digest(&mut hash, &re.as_str()),
+                    Some(crate::sources::CustomParse::Delimited { sep, fields }) => {
+                        digest(&mut hash, &(sep, fields))
+                    }
+                    None => digest(&mut hash, &"default"),
+                }
+                if let Some(ts) = &part.ts_config {
+                    digest(
+                        &mut hash,
+                        &(
+                            ts.timezone_offset_minutes,
+                            ts.clock_adjustment_ms,
+                            &ts.sources,
+                            &ts.format,
+                            &ts.complement,
+                        ),
+                    );
+                    for (re, template) in &ts.rules {
+                        digest(
+                            &mut hash,
+                            &(re.as_ref().map(regex::Regex::as_str), template),
+                        );
+                    }
+                } else {
+                    digest(&mut hash, &"no-ts-config");
+                }
+            }
+            digest(&mut hash, &*state.codes.read());
+            digest(&mut hash, &*state.system_codes.read());
+            for field in &*state.derived.read() {
+                digest(&mut hash, &(&field.name, &field.source));
+                for rule in &field.rules {
+                    digest(&mut hash, &(rule.re.as_str(), &rule.template, &rule.filter));
+                }
+            }
+            format!("idx:{:x}", hash.finalize())
+        }
+        SourceData::Memory(events) => case_key(events),
         SourceData::None => "none".into(),
     }
 }
 
-fn case_key(events: &[Event]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for e in events {
-        e.id.hash(&mut hasher);
-        e.event_ref.hash(&mut hasher);
-        e.timestamp.hash(&mut hasher);
+fn digest(hash: &mut sha2::Sha256, value: &impl serde::Serialize) {
+    use sha2::Digest;
+    struct Sink<'a>(&'a mut sha2::Sha256);
+    impl std::io::Write for Sink<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            use sha2::Digest;
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    format!("case:{}:{:x}", events.len(), hasher.finish())
+    serde_json::to_writer(Sink(&mut *hash), value).expect("analysis cache fingerprint serializable");
+    hash.update([0]);
+}
+
+fn case_key(events: &[Event]) -> String {
+    if let Some(key) = crate::case_cache::content_key_for(events) {
+        return format!("case:{}:{key}", events.len());
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for e in events {
+        // Stable IDs may survive an evidence edit. Hash one complete record at a
+        // time so changed messages/fields cannot reuse an older security result.
+        digest(&mut hasher, e);
+    }
+    format!("case:{}:{:x}", events.len(), hasher.finalize())
 }
 
 pub fn stored_analysis(
@@ -44,17 +116,29 @@ pub fn stored_analysis(
     crate::operations::check()?;
     let rules = detections::ruleset()?;
     let settings = detections::load_settings();
-    let catalog = if settings.threats { Some(crate::threats::load_active()?) } else { None };
+    let catalog = if settings.threats {
+        Some(crate::threats::load_active()?)
+    } else {
+        None
+    };
     let expired: Vec<_> = settings
         .suppress
         .iter()
-        .map(|s| s.expires.is_some_and(|t| t <= chrono::Utc::now().timestamp_millis()))
+        .map(|s| {
+            s.expires
+                .is_some_and(|t| t <= chrono::Utc::now().timestamp_millis())
+        })
         .collect();
     let key = format!(
         "{}|{:p}|{:p}|{}|{}|{:?}",
-        case_events.map(case_key).unwrap_or_else(|| source_key(state)),
+        case_events
+            .map(case_key)
+            .unwrap_or_else(|| source_key(state)),
         Arc::as_ptr(&rules),
-        catalog.as_ref().map(Arc::as_ptr).unwrap_or(std::ptr::null()),
+        catalog
+            .as_ref()
+            .map(Arc::as_ptr)
+            .unwrap_or(std::ptr::null()),
         serde_json::to_string(&settings).unwrap_or_default(),
         state.derived.read().len(),
         expired,
@@ -64,7 +148,11 @@ pub fn stored_analysis(
             return Ok(hit);
         }
     }
-    let inputs = detections::Inputs { rules: &rules, catalog: catalog.as_deref(), settings: &settings };
+    let inputs = detections::Inputs {
+        rules: &rules,
+        catalog: catalog.as_deref(),
+        settings: &settings,
+    };
     let result = match case_events {
         Some(events) => detections::run_stored(&inputs, &Source::Events(events.iter().collect()))?,
         None => workspace::with_selection(state, &[], |selection| {
@@ -72,7 +160,12 @@ pub fn stored_analysis(
         })?,
     };
     crate::operations::check()?;
-    if result.metadata.get("complete").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if result
+        .metadata
+        .get("complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         detections::remember(key, result.clone());
     }
     Ok(result)
@@ -84,7 +177,9 @@ pub fn analysis_impl(
     case_events: Option<&[Event]>,
     force: bool,
 ) -> Result<Arc<serde_json::Value>, String> {
-    Ok(Arc::new(stored_analysis(state, case_events, force)?.page(1, 0, 500, None, None)?))
+    Ok(Arc::new(
+        stored_analysis(state, case_events, force)?.page(1, 0, 500, None, None)?,
+    ))
 }
 
 /// Filtering selects related findings after the full universe has been correlated.
@@ -110,7 +205,10 @@ pub fn triage_page(
     match case {
         Some(events) => {
             let prepared = query::prepare(&filters);
-            let mut ids = events.iter().filter(|e| prepared.iter().all(|f| query::matches(e, f))).map(|e| e.id);
+            let mut ids = events
+                .iter()
+                .filter(|e| prepared.iter().all(|f| query::matches(e, f)))
+                .map(|e| e.id);
             full.page(minimum, offset, limit, Some(&mut ids), tactic)
         }
         None => workspace::with_selection(state, &filters, |selection| {
@@ -136,7 +234,10 @@ pub fn timeline_impl(
     match case {
         Some(events) => {
             let prepared = query::prepare(&filters);
-            let mut ids = events.iter().filter(|e| prepared.iter().all(|f| query::matches(e, f))).map(|e| e.id);
+            let mut ids = events
+                .iter()
+                .filter(|e| prepared.iter().all(|f| query::matches(e, f)))
+                .map(|e| e.id);
             full.timeline(minimum, start, end, Some(&mut ids))
         }
         None => workspace::with_selection(state, &filters, |selection| {
@@ -183,9 +284,10 @@ pub fn project(
         .enumerate()
         .filter(|(_, d)| {
             related.is_none_or(|ids| {
-                d["event_ids"]
-                    .as_array()
-                    .is_some_and(|a| a.iter().any(|id| ids.contains(&(id.as_u64().unwrap_or(u64::MAX) as usize))))
+                d["event_ids"].as_array().is_some_and(|a| {
+                    a.iter()
+                        .any(|id| ids.contains(&(id.as_u64().unwrap_or(u64::MAX) as usize)))
+                })
             })
         })
         .map(|(i, _)| i)
@@ -196,16 +298,22 @@ pub fn project(
         .filter(|&i| all[i]["evidence_level"].as_u64().unwrap_or(0) >= minimum as u64)
         .collect();
     let counts: Vec<_> = (1..=5)
-        .map(|level| related_indices.iter().filter(|&&i| all[i]["evidence_level"].as_u64() == Some(level)).count())
+        .map(|level| {
+            related_indices
+                .iter()
+                .filter(|&&i| all[i]["evidence_level"].as_u64() == Some(level))
+                .count()
+        })
         .collect();
     let episodes: Vec<_> = full["episodes"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|e| {
-            e["detections"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|i| visible.contains(&(i.as_u64().unwrap_or(u64::MAX) as usize))))
+            e["detections"].as_array().is_some_and(|a| {
+                a.iter()
+                    .any(|i| visible.contains(&(i.as_u64().unwrap_or(u64::MAX) as usize)))
+            })
         })
         .cloned()
         .collect();
@@ -269,14 +377,20 @@ pub fn project(
             let matches: Vec<_> = visible
                 .iter()
                 .map(|&i| &all[i])
-                .filter(|d| d["tactics"].as_array().is_some_and(|a| a.contains(&t["key"])))
+                .filter(|d| {
+                    d["tactics"]
+                        .as_array()
+                        .is_some_and(|a| a.contains(&t["key"]))
+                })
                 .collect();
             t["count"] = json!(matches.len());
             let mut techniques = std::collections::BTreeMap::<String, Value>::new();
             for d in matches {
                 for a in d["attack"].as_array().into_iter().flatten() {
                     let id = a["id"].as_str().unwrap_or_default().to_string();
-                    let entry = techniques.entry(id.clone()).or_insert(json!({"id":id,"name":a["name"],"count":0}));
+                    let entry = techniques
+                        .entry(id.clone())
+                        .or_insert(json!({"id":id,"name":a["name"],"count":0}));
                     entry["count"] = json!(entry["count"].as_u64().unwrap_or(0) + 1);
                 }
             }
@@ -287,15 +401,25 @@ pub fn project(
 }
 
 /// Paginate episodes after correlation and classification, keeping every context member.
-pub fn paginate(mut result: serde_json::Value, offset: usize, limit: usize) -> Result<serde_json::Value, String> {
+pub fn paginate(
+    mut result: serde_json::Value,
+    offset: usize,
+    limit: usize,
+) -> Result<serde_json::Value, String> {
     use serde_json::json;
     if !(1..=500).contains(&limit) {
         return Err("episode_limit deve estar entre 1 e 500".into());
     }
     let all = result["detections"].as_array().cloned().unwrap_or_default();
     let total = result["episodes"].as_array().map_or(0, Vec::len);
-    let mut episodes: Vec<_> =
-        result["episodes"].as_array().into_iter().flatten().skip(offset).take(limit).cloned().collect();
+    let mut episodes: Vec<_> = result["episodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect();
     let included: std::collections::HashSet<_> = episodes
         .iter()
         .flat_map(|e| e["detections"].as_array().into_iter().flatten())
@@ -319,7 +443,8 @@ pub fn paginate(mut result: serde_json::Value, offset: usize, limit: usize) -> R
             .collect::<Vec<_>>());
     }
     result["page"] = json!({"episode_offset":offset,"episode_limit":limit,"total_episodes":total,"returned_episodes":episodes.len(),"next_offset":if offset.saturating_add(limit)<total {Some(offset+limit)}else{None}});
-    result["returned_detections"] = json!(rows.iter().filter(|d| d["context_only"] != true).count());
+    result["returned_detections"] =
+        json!(rows.iter().filter(|d| d["context_only"] != true).count());
     result["episodes"] = json!(episodes);
     result["detections"] = json!(rows);
     Ok(result)
@@ -362,11 +487,9 @@ pub async fn triage_episode(
     limit: Option<usize>,
 ) -> Result<serde_json::Value, String> {
     crate::offload(move || {
-        detections::cached_analysis(&analysis_id).ok_or("Análise expirada; recarregue a triagem")?.episode_members(
-            &episode_id,
-            offset.unwrap_or(0),
-            limit.unwrap_or(100),
-        )
+        detections::cached_analysis(&analysis_id)
+            .ok_or("Análise expirada; recarregue a triagem")?
+            .episode_members(&episode_id, offset.unwrap_or(0), limit.unwrap_or(100))
     })
     .await?
 }
@@ -475,13 +598,20 @@ pub fn insights_impl(event: &Event) -> Result<EventInsights, String> {
                     snippet: hit.snippet,
                     normalized: hit.normalized,
                     provenance: hit.provenance,
-                    attack: crate::threats::attack_for(rule).iter().map(|t| crate::attack::reference(t, &[])).collect(),
+                    attack: crate::threats::attack_for(rule)
+                        .iter()
+                        .map(|t| crate::attack::reference(t, &[]))
+                        .collect(),
                 });
             }
         }
     }
     let set = detections::ruleset()?;
-    let input = detections::Inputs { rules: &set, catalog: None, settings: &settings };
+    let input = detections::Inputs {
+        rules: &set,
+        catalog: None,
+        settings: &settings,
+    };
     let assessed = detections::run(&input, &Source::Events(vec![event]))?;
     let rules = assessed
         .detections
@@ -518,12 +648,20 @@ pub async fn event_insights(
 ) -> Result<EventInsights, String> {
     crate::offload(move || {
         let case = crate::case_cache::resolve(case_events, case_key)?;
-        insights_in_context(app.state::<AppState>().inner(), &event, case.as_deref().map(|v| v.as_slice()))
+        insights_in_context(
+            app.state::<AppState>().inner(),
+            &event,
+            case.as_deref().map(|v| v.as_slice()),
+        )
     })
     .await?
 }
 
-pub fn insights_in_context(state: &AppState, event: &Event, case: Option<&[Event]>) -> Result<EventInsights, String> {
+pub fn insights_in_context(
+    state: &AppState,
+    event: &Event,
+    case: Option<&[Event]>,
+) -> Result<EventInsights, String> {
     let mut result = insights_impl(event)?;
     let full = stored_analysis(state, case, false)?;
     let reference = crate::security_normalize::event_ref(event);
@@ -585,7 +723,12 @@ pub fn rules_impl() -> Result<RulesOverview, String> {
             retired: !r.def.enabled,
             evidence_level: r.def.evidence.assessed_level(),
             evidence_label: crate::evidence::label(r.def.evidence.assessed_level()).into(),
-            attack: r.def.attack.iter().map(|t| crate::attack::reference(t, &r.def.tactics)).collect(),
+            attack: r
+                .def
+                .attack
+                .iter()
+                .map(|t| crate::attack::reference(t, &r.def.tactics))
+                .collect(),
             evidence: r.def.evidence.clone(),
             provenance: r.def.provenance.clone(),
         })
@@ -612,8 +755,28 @@ pub fn save_settings_impl(settings: Settings) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn detection_settings_save(settings: Settings) -> Result<(), String> {
-    crate::offload(move || save_settings_impl(settings)).await?
+pub async fn detection_settings_save(settings: Settings, app: AppHandle) -> Result<(), String> {
+    crate::offload(move || {
+        mutate_detection_semantics(app.state::<AppState>().inner(), || save_settings_impl(settings))
+    })
+    .await?
+}
+
+fn mutate_detection_semantics<T>(
+    state: &AppState,
+    mutation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    // Derived fields can depend on detection/threat predicates. Publish the rule
+    // mutation and discard parsed/indexed values under the same source lock.
+    let mut source = state.source.write();
+    crate::operations::check()?;
+    let value = mutation()?;
+    crate::operations::commit();
+    if let SourceData::Indexed(idx) = &mut *source {
+        idx.big_data = None;
+    }
+    crate::big_data_commands::clear_results();
+    Ok(value)
 }
 
 #[derive(Serialize)]
@@ -647,7 +810,11 @@ pub fn sigma_import_impl(paths: Vec<String>) -> Result<SigmaImport, String> {
     let previous = crate::sigma::load_dir(&target).0.len();
     for file in files {
         crate::operations::check()?;
-        let name = file.file_name().ok_or("Arquivo sem nome")?.to_string_lossy().into_owned();
+        let name = file
+            .file_name()
+            .ok_or("Arquivo sem nome")?
+            .to_string_lossy()
+            .into_owned();
         let text = std::fs::read_to_string(&file).map_err(|e| format!("{name}: {e}"))?;
         if unique.insert(text.clone()) {
             texts.push(text.clone());
@@ -655,7 +822,11 @@ pub fn sigma_import_impl(paths: Vec<String>) -> Result<SigmaImport, String> {
         }
     }
     if prepared.is_empty() {
-        return Ok(SigmaImport { imported: 0, rules: 0, failed: vec![] });
+        return Ok(SigmaImport {
+            imported: 0,
+            rules: 0,
+            failed: vec![],
+        });
     }
     // Resolve dependencies across the entire batch before publishing any file.
     let found = crate::sigma::convert_texts(texts.iter().map(String::as_str))?;
@@ -666,8 +837,10 @@ pub fn sigma_import_impl(paths: Vec<String>) -> Result<SigmaImport, String> {
             let mut destination = target.join(name);
             let mut n = 1;
             while destination.exists() {
-                destination =
-                    target.join(format!("{}-{n}.yml", name.trim_end_matches(".yml").trim_end_matches(".yaml")));
+                destination = target.join(format!(
+                    "{}-{n}.yml",
+                    name.trim_end_matches(".yml").trim_end_matches(".yaml")
+                ));
                 n += 1;
             }
             let pending = destination.with_extension("pending");
@@ -691,12 +864,19 @@ pub fn sigma_import_impl(paths: Vec<String>) -> Result<SigmaImport, String> {
     let failed = Vec::new();
     detections::invalidate();
     detections::clear_cache();
-    Ok(SigmaImport { imported, rules, failed })
+    Ok(SigmaImport {
+        imported,
+        rules,
+        failed,
+    })
 }
 
 #[tauri::command]
-pub async fn sigma_import(paths: Vec<String>) -> Result<SigmaImport, String> {
-    crate::offload(move || sigma_import_impl(paths)).await?
+pub async fn sigma_import(paths: Vec<String>, app: AppHandle) -> Result<SigmaImport, String> {
+    crate::offload(move || {
+        mutate_detection_semantics(app.state::<AppState>().inner(), || sigma_import_impl(paths))
+    })
+    .await?
 }
 
 pub fn sigma_clear_impl() -> Result<(), String> {
@@ -710,6 +890,9 @@ pub fn sigma_clear_impl() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn sigma_clear() -> Result<(), String> {
-    crate::offload(sigma_clear_impl).await?
+pub async fn sigma_clear(app: AppHandle) -> Result<(), String> {
+    crate::offload(move || {
+        mutate_detection_semantics(app.state::<AppState>().inner(), sigma_clear_impl)
+    })
+    .await?
 }

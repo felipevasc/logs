@@ -135,6 +135,7 @@ const state = {
   dashboardCompact: localStorage.getItem("investigation.dashboardCompact") === "1",
   analyticsScope: "dataset", // dataset = eventos carregados; case = itens do caso
   activeDatasetTab: "table",
+  bigDataRevision: 0,
 };
 
 let chart = null;
@@ -470,6 +471,7 @@ async function syncActiveCaseArtifacts() {
   }
   if (state.currentArtifact || state.loaded) await clearData();
   else updateContextBar();
+  await syncCaseBigDataMode();
 }
 
 function updateContextBar() {
@@ -543,19 +545,147 @@ function activityHide() {
 }
 
 // Case records travel once per version; commands then refer to them by key.
-const caseTransport = { keys: new WeakMap(), synced: new Set(), serial: 0 };
+const caseTransport = { keys: new WeakMap(), synced: new Set(), pending: new Map(), statuses: new Map(), serial: 0 };
 async function caseArgs(args, resync = false) {
   const events = args.caseEvents;
   if (!Array.isArray(events)) return args;
-  let key = caseTransport.keys.get(events);
-  if (!key) { key = `case-${++caseTransport.serial}-${events.length}`; caseTransport.keys.set(events, key); }
+  const bigData = activeCase()?.bigData === true;
+  const caseId = activeCase()?.id || null;
+  let keys = caseTransport.keys.get(events);
+  if (!keys) { keys = new Map(); caseTransport.keys.set(events, keys); }
+  let key = keys.get(bigData);
+  if (!key) { key = `case-${++caseTransport.serial}-${events.length}`; keys.set(bigData, key); }
   if (resync || !caseTransport.synced.has(key)) {
-    await invoke("case_sync", { key, events });
-    caseTransport.synced.add(key);
-    if (caseTransport.synced.size > 3) caseTransport.synced.delete(caseTransport.synced.values().next().value);
+    let pending = caseTransport.pending.get(key);
+    if (!pending) {
+      pending = invoke("case_sync", { key, events, bigData }).then(status => {
+        caseTransport.synced.add(key);
+        caseTransport.statuses.set(key, { caseId, status, error: null });
+        if (caseTransport.synced.size > 3) {
+          const oldest = caseTransport.synced.values().next().value;
+          caseTransport.synced.delete(oldest); caseTransport.statuses.delete(oldest);
+        }
+      }).catch(error => {
+        caseTransport.statuses.set(key, { caseId, status: null, error: String(error) });
+        throw error;
+      }).finally(() => { if (caseTransport.pending.get(key) === pending) caseTransport.pending.delete(key); });
+      caseTransport.pending.set(key, pending);
+      renderBigDataState();
+    }
+    try { await pending; } finally { renderBigDataState(); }
   }
   const { caseEvents: _omit, ...rest } = args;
   return { ...rest, caseKey: key };
+}
+
+const bigDataRuntime = { caseId: null, status: null, error: null, busy: 0, serial: 0, queue: Promise.resolve(), pending: new Map() };
+const BIG_DATA_MUTATIONS = new Set(["set_ts_config", "save_derived_field", "delete_derived_field", "save_codes", "harvest_codes", "detection_settings_save", "sigma_import", "sigma_clear", "threat_catalog_update"]);
+
+function renderBigDataState() {
+  const button = $("#btn-big-data");
+  if (!button) return;
+  const c = activeCase(), enabled = c?.bigData === true;
+  const current = bigDataRuntime.caseId === c?.id;
+  const caseKey = workspaceScope() === "case" && c ? caseTransport.keys.get(caseEvents())?.get(enabled) : null;
+  const savedCase = caseKey && caseTransport.statuses.get(caseKey);
+  const status = workspaceScope() === "case" ? (savedCase?.caseId === c?.id ? savedCase.status : null) : current ? bigDataRuntime.status : null;
+  const error = workspaceScope() === "case" ? (enabled && savedCase?.caseId === c?.id ? savedCase.error : null) : current ? bigDataRuntime.error : null;
+  const busy = bigDataRuntime.busy > 0 || (enabled && !!caseKey && caseTransport.pending.has(caseKey));
+  button.disabled = !c || busy || state.loadOverlay;
+  button.setAttribute("aria-pressed", String(enabled));
+  button.setAttribute("aria-busy", String(busy));
+  button.dataset.status = busy ? "building" : error ? "error" : enabled && status?.enabled && status.ready ? "ready" : enabled ? "pending" : "off";
+  button.querySelector("i").className = busy ? "fas fa-circle-notch spin" : "fas fa-bolt";
+  button.title = busy ? "Preparando o índice Big Data…" : error ? `Big Data indisponível: ${error}. Clique para tentar novamente.` : enabled && status?.ready ? `Big Data ativo · ${fmtNum(status.eventCount || 0)} eventos indexados. Clique para desabilitar.` : enabled ? "Big Data habilitado para este Caso. O índice será preparado quando houver uma fonte." : "Habilitar Big Data neste Caso";
+  button.setAttribute("aria-label", button.title);
+}
+document.addEventListener("workspace-context-change", renderBigDataState);
+
+function invalidateBigDataCaches() {
+  state.bigDataRevision++;
+  state.refreshVersion++;
+  state.explorerCache = null;
+  state.treeAgg = { dataset: null, case: null };
+  state.treeAggSig = { dataset: null, case: null };
+  treeAggVersion.dataset++; treeAggVersion.case++;
+  state.caseTreeProfiles = {}; state.caseProfiles = {};
+  cubeState.requestVersion++; cubeState.result = null; cubeState.lastComputedSignature = null; cubeState.results.clear();
+  window.Discovery?.clearCache(); window.Security?.invalidate();
+  if (window.Workspace) window.Workspace.restore(window.Workspace.capture());
+}
+
+// Serialize index changes and share an in-flight build for the same source version.
+function configureBigData(enabled, { force = false, requireReady = false } = {}) {
+  const caseId = activeCase()?.id || null, sourceVersion = state.artifactSwitchVersion;
+  const key = JSON.stringify([caseId, sourceVersion, enabled]);
+  if (!force && bigDataRuntime.pending.has(key)) return bigDataRuntime.pending.get(key);
+  const request = ++bigDataRuntime.serial;
+  const isCurrent = () => (activeCase()?.id || null) === caseId && state.artifactSwitchVersion === sourceVersion;
+  bigDataRuntime.busy++; renderBigDataState();
+  const pending = bigDataRuntime.queue.catch(() => {}).then(async () => {
+    if (!isCurrent()) return { stale: true };
+    try {
+      const status = await invoke("set_big_data_mode", { enabled });
+      if (!isCurrent()) return { ...status, stale: true };
+      if (request !== bigDataRuntime.serial) return { ...status, stale: true };
+      if (status?.enabled !== enabled || (enabled && requireReady && !status.ready)) throw new Error("O índice Big Data não ficou disponível. Tente novamente.");
+      if (request === bigDataRuntime.serial) {
+        bigDataRuntime.caseId = caseId; bigDataRuntime.status = status; bigDataRuntime.error = null;
+        invalidateBigDataCaches();
+      }
+      return status;
+    } catch (error) {
+      if (isCurrent() && request === bigDataRuntime.serial) {
+        bigDataRuntime.caseId = caseId; bigDataRuntime.status = null; bigDataRuntime.error = String(error);
+        invalidateBigDataCaches();
+      }
+      throw error;
+    }
+  }).finally(() => {
+    bigDataRuntime.busy--;
+    if (bigDataRuntime.pending.get(key) === pending) bigDataRuntime.pending.delete(key);
+    renderBigDataState();
+  });
+  bigDataRuntime.pending.set(key, pending);
+  bigDataRuntime.queue = pending;
+  return pending;
+}
+
+async function syncCaseBigDataMode(options = {}) {
+  try { return await configureBigData(activeCase()?.bigData === true, options); }
+  catch (error) { toast(`Não foi possível preparar Big Data: ${error}`, "err"); return null; }
+}
+
+async function toggleBigData() {
+  const c = activeCase();
+  if (!c || bigDataRuntime.busy || state.loadOverlay || window.WorkspaceContext?.changing || window.WorkspaceContext?.sourceBusy) return;
+  const previous = c.bigData === true, sourceVersion = state.artifactSwitchVersion;
+  const retry = previous && $("#btn-big-data")?.dataset.status === "error";
+  const enabled = retry || !previous;
+  startOperation("big-data", enabled ? "Preparando Big Data" : "Desabilitando Big Data", enabled ? "Construindo o índice para buscas e filtros" : "Atualizando o motor de consulta");
+  const operation = state.activeOperation;
+  try {
+    const status = await configureBigData(enabled, { requireReady: state.currentArtifact != null });
+    if (status?.stale || activeCase()?.id !== c.id || state.artifactSwitchVersion !== sourceVersion) return;
+    if (operation.cancelled) { await syncCaseBigDataMode({ force: true }); return; }
+    c.bigData = enabled;
+    renderBigDataState();
+    if (!await saveCases()) {
+      c.bigData = previous;
+      await syncCaseBigDataMode({ force: true });
+      finishOperation("Configuração anterior preservada", "A nova configuração não pôde ser salva.");
+      return;
+    }
+    finishOperation(enabled ? (status.ready ? "Big Data pronto" : "Big Data habilitado") : "Big Data desabilitado", status.ready ? `${fmtNum(status.eventCount || 0)} eventos indexados` : "A configuração foi salva para este Caso.");
+    if (window.Workspace) await window.Workspace.showPage(window.Workspace.page());
+    else if (state.loaded) await refresh();
+  } catch (error) {
+    toast(`Não foi possível ${enabled ? "habilitar" : "desabilitar"} Big Data: ${error}`, "err");
+    if (state.activeOperation === operation) finishOperation("Big Data não foi alterado", String(error));
+  } finally {
+    renderBigDataState();
+    if (state.activeOperation?.kind === "big-data") finishOperation("Configuração Big Data concluída");
+  }
 }
 
 async function api(cmd, args = {}, opts = {}) {
@@ -567,13 +697,20 @@ async function api(cmd, args = {}, opts = {}) {
   try {
     if (args.filters?.length) await invoke("validate_filters", { filters: args.filters });
     if (/^(load_|clear_|set_|save_|delete_|harvest_)/.test(cmd)) state.explorerCache = null;
+    let result;
     try {
-      return await invoke(cmd, await caseArgs(args));
+      result = await invoke(cmd, await caseArgs(args));
     } catch (error) {
       // The backend keeps a few versions; a missing one is sent again once.
-      if (String(error).includes("CASE_CACHE_MISS")) return await invoke(cmd, await caseArgs(args, true));
-      throw error;
+      if (String(error).includes("CASE_CACHE_MISS")) result = await invoke(cmd, await caseArgs(args, true));
+      else throw error;
     }
+    if (BIG_DATA_MUTATIONS.has(cmd)) {
+      if (activeCase()?.bigData === true || bigDataRuntime.busy > 0) await syncCaseBigDataMode({ force: true, requireReady: activeCase()?.bigData === true && state.currentArtifact != null });
+      else invalidateBigDataCaches();
+    }
+    if (cmd === "clear_events") { bigDataRuntime.status = null; renderBigDataState(); }
+    return result;
   } catch (e) {
     if (!opts.silent) toast(String(e), "err");
     throw e;
@@ -914,6 +1051,9 @@ async function loadData(requestedSource = null, options = {}) {
     const hasComments = Object.keys(c.comments?.[state.currentArtifact?.id] || {}).length > 0;
     if (hasComments && !state.columns.includes("comentario")) state.columns.push("comentario");
     if (hasComments && !state.visibleCols.includes("comentario")) state.visibleCols.push("comentario");
+    if (c.bigData === true) updateOperation("Preparando Big Data", "Indexando os eventos para buscas e filtros", 84);
+    await syncCaseBigDataMode({ requireReady: c.bigData === true });
+    if (version !== state.artifactSwitchVersion || state.cases.active !== c.id) return;
     await refresh();
     // perfis dos campos alimentam os nós de valores/faixas da árvore de exploração
     api("profile_fields", { filters: [] }, { silent: true })
@@ -951,6 +1091,7 @@ async function loadData(requestedSource = null, options = {}) {
     if (state.loadOverlay) hideLoadOverlay(false); // cobre cancelamento/erro
     btn.disabled = false;
     btn.innerHTML = '<i class="fas fa-play"></i> Carregar';
+    renderBigDataState();
   }
 }
 
@@ -1873,7 +2014,7 @@ async function refresh({ analytics = true } = {}) {
   startOperation("explore", "Atualizando exploração", "Lendo eventos e calculando recortes");
   let snapshot;
   try {
-    const cacheKey = JSON.stringify([scope, scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, filters]);
+    const cacheKey = JSON.stringify([scope, scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, filters, activeCase()?.bigData === true, state.bigDataRevision]);
     const cached = state.explorerCache?.key === cacheKey ? state.explorerCache.snapshot : null;
     const result = await api(cached ? "query_events" : "explore_snapshot", {
       filters,
@@ -3060,27 +3201,124 @@ function createStation({ name, host = "", notes = "" }) {
 }
 
 // ------------------------------------------------------------------ casos de análise
-let casesSaveQueue = Promise.resolve();
+let caseSaveActive = null;
+let caseSavePending = null;
 let caseSaveErrorShown = false;
-
 let caseSaveTimer = null;
-let caseSaveWaiters = [];
+const failedCaseStores = new WeakSet();
+const caseStoreChanged = "A lista de Casos mudou. Revise os dados atuais antes de salvar novamente.";
+
+function reportCaseSaveError(error) {
+  if (!caseSaveErrorShown) { caseSaveErrorShown = true; toast(`Não foi possível salvar: ${error}`, "err"); }
+}
+
+async function drainCaseSaves() {
+  if (caseSaveActive || !caseSavePending?.ready) return;
+  const batch = caseSavePending;
+  caseSavePending = null;
+  caseSaveActive = batch;
+  let saved = false;
+  try {
+    if (state.cases !== batch.store) throw new Error(caseStoreChanged);
+    // Only the active write owns a snapshot. A pending batch keeps the latest
+    // store by reference, so slow storage cannot queue copies of large Cases.
+    const snapshot = JSON.parse(JSON.stringify({ ...batch.store, schemaVersion: 2 }));
+    const result = await api("cases_save", { data: snapshot }, { silent: true });
+    if (state.cases !== batch.store) throw new Error(caseStoreChanged);
+    if (!Number.isSafeInteger(result?.revision) || result.revision < 1
+        || (snapshot.revision != null && result.revision <= snapshot.revision)) {
+      throw new Error("O salvamento não confirmou uma revisão válida. Tente novamente.");
+    }
+    batch.store.revision = result.revision;
+    failedCaseStores.delete(batch.store);
+    caseSaveErrorShown = false;
+    saved = true;
+  } catch (error) {
+    if (state.cases === batch.store) failedCaseStores.add(batch.store);
+    reportCaseSaveError(error);
+  } finally {
+    caseSaveActive = null;
+    batch.resolve(saved);
+    void drainCaseSaves();
+  }
+}
+
 function saveCases() {
   clearTimeout(caseSaveTimer);
-  const result = new Promise((resolve, reject) => caseSaveWaiters.push({ resolve, reject }));
-  // Autosave is coalesced, while callers can still await durable persistence.
+  const store = state.cases;
+  if (caseSavePending && caseSavePending.store !== store) {
+    reportCaseSaveError(caseStoreChanged);
+    caseSavePending.resolve(false);
+    caseSavePending = null;
+  }
+  if (!caseSavePending) {
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    caseSavePending = { store, promise, resolve, ready: false };
+  }
+  const batch = caseSavePending;
+  batch.ready = false;
+  // All callers in a pending batch share its durable result, without retaining
+  // an unbounded waiter list. Calls after a snapshot await the following write.
   caseSaveTimer = setTimeout(() => {
-    const waiters = caseSaveWaiters.splice(0);
-    const snapshot = JSON.parse(JSON.stringify({ ...state.cases, schemaVersion: 2 }));
-    casesSaveQueue = casesSaveQueue.catch(() => {}).then(() => api("cases_save", { data: { ...snapshot, revision: state.cases.revision } }, { silent: true }))
-      .then(result => { if (result?.revision != null) state.cases.revision = result.revision; caseSaveErrorShown = false; waiters.forEach(w => w.resolve(true)); })
-      .catch(error => {
-        if (!caseSaveErrorShown) { caseSaveErrorShown = true; toast(`Não foi possível salvar: ${error}`, "err"); }
-        waiters.forEach(w => w.resolve(false));
-      });
+    caseSaveTimer = null;
+    if (caseSavePending !== batch) return;
+    batch.ready = true;
+    void drainCaseSaves();
   }, 200);
-  return result;
+  return batch.promise;
 }
+
+function caseSavesPending() {
+  return !!(caseSaveActive || caseSavePending || failedCaseStores.has(state.cases));
+}
+
+async function flushCaseSaves() {
+  if (!caseSaveActive && !caseSavePending && failedCaseStores.has(state.cases)) saveCases();
+  for (;;) {
+    while (caseSaveActive || caseSavePending) {
+      const batch = caseSaveActive || caseSavePending;
+      if (caseSavePending) {
+        clearTimeout(caseSaveTimer);
+        caseSaveTimer = null;
+        caseSavePending.ready = true;
+        void drainCaseSaves();
+      }
+      if (!await batch.promise) return false;
+    }
+    // A completed save's callers may enqueue a follow-up in their .then/await
+    // continuation. Include it before declaring a close flush complete.
+    await Promise.resolve();
+    if (!caseSaveActive && !caseSavePending) return !failedCaseStores.has(state.cases);
+  }
+}
+
+function installCaseSaveLifecycle() {
+  window.addEventListener("beforeunload", event => {
+    if (!caseSavesPending()) return;
+    event.preventDefault();
+    event.returnValue = "";
+    void flushCaseSaves();
+  });
+  const nativeWindow = window.__TAURI__.window?.getCurrentWindow();
+  if (nativeWindow) {
+    let closing = false;
+    nativeWindow.onCloseRequested(async event => {
+      if (closing) { event.preventDefault(); return; }
+      closing = true;
+      // Tauri awaits this callback before destroying the window. Failed writes
+      // leave the UI open and editable, including an explicit retry on close.
+      try {
+        do { if (!await flushCaseSaves()) { event.preventDefault(); return; } }
+        while (caseSavesPending());
+      }
+      catch (error) { event.preventDefault(); reportCaseSaveError(error); }
+      finally { closing = false; }
+    }).catch(error => { reportCaseSaveError(`Não foi possível proteger o fechamento: ${error}`); });
+  }
+}
+
+installCaseSaveLifecycle();
 
 function defaultCaseWorkspace() {
   return {
@@ -3159,6 +3397,7 @@ function normalizeCaseStore(loaded) {
     id: raw.id || `c-recuperado-${index}-${Date.now().toString(36)}`,
     name: raw.name || `Caso ${index + 1}`,
     createdAt: raw.createdAt || Date.now(),
+    bigData: raw.bigData === true,
     items: Array.isArray(raw.items) ? raw.items.map((item) => ({
       ...item,
       createdAt: item?.createdAt || raw.createdAt || Date.now(),
@@ -3195,6 +3434,7 @@ function newCase(name, { keepArtifact = false, contextSnapshot = null } = {}) {
     id: "c" + Date.now().toString(36) + Math.floor(Math.random() * 1e4),
     name: name || `Caso ${state.cases.cases.length + 1}`,
     createdAt: Date.now(),
+    bigData: false,
     items: [],
     manual: [],
     caseTrails: [],
@@ -3213,7 +3453,7 @@ function newCase(name, { keepArtifact = false, contextSnapshot = null } = {}) {
   renderCaseBar();
   updateAnalysisBadge();
   renderAnalysis();
-  if (context) void window.WorkspaceContext.afterCaseCreation(context);
+  if (context) void syncCaseBigDataMode().then(() => window.WorkspaceContext.afterCaseCreation(context));
   else if (!keepArtifact) void syncActiveCaseArtifacts();
   return c;
 }
@@ -3252,6 +3492,7 @@ function renderCaseBar() {
   }
   sel.disabled = state.cases.cases.length === 0;
   $("#btn-case-menu").disabled = !activeCase();
+  renderBigDataState();
   renderArtifactBar();
   updateContextBar();
 }
@@ -4547,6 +4788,14 @@ function currentIndex() {
 }
 
 let detailRequest = 0;
+let detailRevealed = false;
+function resetDetailVisibility() {
+  detailRevealed = false;
+  window.ValueInspector?.close();
+  window.EventInsights?.clear();
+  for (const pane of ["overview", "json", "raw"]) $("#pane-" + pane).replaceChildren();
+  $("#detail-visibility")?.remove();
+}
 async function openDetail(id) {
   const request = ++detailRequest;
   showDetailLoading();
@@ -4560,6 +4809,7 @@ async function openDetail(id) {
 
 // abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
 function showDetailLoading() {
+  resetDetailVisibility();
   state.detailId = null; state.currentDetailEv = null; state.detailSourceSpec = null;
   const actions = $("#drawer .detail-quick-actions"); if (actions) actions.hidden = true;
   for (const id of ["dr-prev", "dr-next", "dr-copy"]) $("#" + id).hidden = true;
@@ -4578,6 +4828,7 @@ function showDetailLoading() {
 
 function openContextInspector(title, subtitle, overview) {
   detailRequest++;
+  resetDetailVisibility();
   state.detailId = null;
   state.currentDetailEv = null;
   state.detailSourceSpec = null;
@@ -4646,6 +4897,7 @@ function showStationInspector(station) {
 
 function showDetail(ev, sourceSpec = null) {
   detailRequest++;
+  resetDetailVisibility();
   state.detailId = ev.id;
   state.currentDetailEv = ev;
   state.detailSourceSpec = sourceSpec;
@@ -4659,19 +4911,57 @@ function showDetail(ev, sourceSpec = null) {
   $("#dr-copy").hidden = false;
   document.querySelectorAll("#drawer .dtab").forEach((tab) => { tab.hidden = false; });
 
+  const visibility = el("div", "detail-visibility"); visibility.id = "detail-visibility";
+  const reveal = el("button", "btn ghost small"); reveal.type = "button"; reveal.id = "dr-reveal";
+  const note = el("span", "muted small");
+  const inspect = el("button", "btn ghost small", "Inspecionar estrutura"); inspect.type = "button";
+  inspect.onclick = () => window.ValueInspector?.open(ev, { label: "Estrutura do registro", revealed: detailRevealed });
+  const updateVisibility = () => {
+    reveal.textContent = detailRevealed ? "Ocultar valores" : "Mostrar valores ocultos";
+    reveal.setAttribute("aria-pressed", String(detailRevealed));
+    note.textContent = detailRevealed ? "Visíveis somente neste detalhe; fechar ou trocar de registro oculta novamente. Valores já ocultados na fonte não são recuperáveis." : "Valores protegidos. Se a fonte já contém [oculto], o original não está disponível.";
+    $("#dr-copy").title = detailRevealed ? "Copiar JSON com valores revelados" : "Copiar JSON com valores protegidos";
+  };
+  reveal.onclick = () => {
+    detailRevealed = !detailRevealed;
+    window.ValueInspector?.close();
+    updateVisibility(); renderDetailValues(ev);
+    window.EventInsights?.setRevealed(ev, detailRevealed);
+  };
+  visibility.append(reveal, inspect, note);
+  $("#drawer .drawer-tabs").after(visibility);
+  updateVisibility();
+  renderDetailValues(ev);
+
+  $("#drawer").hidden = false;
+  $("#drawer-scrim").hidden = false;
+  $("#btn-right-inspect").classList.add("active");
+  switchDetailTab("overview");
+  updateDetailNav();
+  window.EventInsights?.render(ev, $("#pane-overview"));
+
+  document.querySelectorAll("#events-table tbody tr").forEach((tr) => tr.classList.remove("selected"));
+  const idx = currentIndex();
+  const tr = $("#events-table tbody").children[idx];
+  if (tr) tr.classList.add("selected");
+}
+
+function renderDetailValues(ev) {
+  const presented = detailRevealed ? ev : window.EvidenceUI.redact(ev);
+
   $("#drawer-badges").innerHTML = "";
   const lv = el("span", "badge");
   lv.style.background = "color-mix(in srgb, " + levelColor(ev.level) + " 18%, transparent)";
   lv.style.color = levelColor(ev.level);
-  lv.textContent = ev.level;
+  lv.textContent = presented.level;
   const badges = $("#drawer-badges");
   badges.appendChild(lv);
-  if (ev.code) badges.appendChild(el("span", "badge code", `#${ev.code}`));
-  if (ev.name) badges.appendChild(el("span", "badge code", ev.name));
+  if (presented.code) badges.appendChild(el("span", "badge code", `#${presented.code}`));
+  if (presented.name) badges.appendChild(el("span", "badge code", presented.name));
 
   const rows = [];
-  const push = (k, v, mono, filterValue = v) => rows.push({ k, v: window.EvidenceUI ? EvidenceUI.redact({ [k]: v ?? "" })[k] : v ?? "", mono, filterValue });
-  push("timestamp", fmtTsFull(ev.timestamp), true, ev.timestamp);
+  const push = (k, v, mono, filterValue = v, original = v, path = `$[${JSON.stringify(k)}]`) => rows.push({ k, v: detailRevealed ? v ?? "" : window.EvidenceUI.redact({ [k]: v ?? "" })[k], mono, filterValue, original, path });
+  push("timestamp", fmtTsFull(ev.timestamp), true, ev.timestamp, ev.timestamp);
   push("source", ev.source);
   push("level", ev.level);
   push("code", ev.code, true);
@@ -4680,7 +4970,8 @@ function showDetail(ev, sourceSpec = null) {
   push("message", ev.message, true);
   const fieldEntries = Object.entries(ev.fields || {}).sort(([a], [b]) => a.localeCompare(b));
   for (const [k, v] of fieldEntries) {
-    push(k, typeof v === "object" ? JSON.stringify(v) : String(v), true);
+    const text = typeof v === "object" ? JSON.stringify(detailRevealed ? v : window.EvidenceUI.redact({ [k]: v })[k]) : String(v);
+    push(k, text, true, typeof v === "object" ? JSON.stringify(v) : String(v), v, `$["fields"][${JSON.stringify(k)}]`);
   }
 
   const allFieldKeys = new Set(Object.keys(ev.fields || {}));
@@ -4707,6 +4998,13 @@ function showDetail(ev, sourceSpec = null) {
 
     const v = el("div", `kv-v${r.mono ? " mono" : ""}`, String(r.v));
     row.appendChild(v);
+    const controls = el("div", "kv-actions");
+    const inspect = el("button", "kv-inspect"); inspect.type = "button";
+    inspect.innerHTML = '<i class="fas fa-code" aria-hidden="true"></i>';
+    inspect.title = "Inspecionar valor e subcampos";
+    inspect.setAttribute("aria-label", `Inspecionar ${colLabel(colKey)}`);
+    inspect.onclick = () => window.ValueInspector?.open(r.original, { label: colLabel(colKey), path: r.path, revealed: detailRevealed });
+    controls.append(inspect);
     if (!["raw"].includes(colKey) && r.filterValue != null && String(r.filterValue).trim() !== "") {
       const f = el("button", "kv-filter");
       f.innerHTML = '<i class="fas fa-filter"></i>';
@@ -4716,27 +5014,15 @@ function showDetail(ev, sourceSpec = null) {
         addFilter({ column: colKey, op: colKey === "timestamp" ? "between" : "equals_exact", value: String(r.filterValue), value2: colKey === "timestamp" ? String(r.filterValue) : null });
         toast("Filtro adicionado.", "ok");
       };
-      row.appendChild(f);
+      controls.appendChild(f);
     }
+    row.append(controls);
     kv.appendChild(row);
   }
   $("#pane-overview").innerHTML = "";
   $("#pane-overview").appendChild(kv);
-  $("#pane-json").innerHTML = highlightJson(window.EvidenceUI ? EvidenceUI.redact(ev) : ev);
-  $("#pane-raw").textContent = (window.EvidenceUI ? EvidenceUI.redact(ev.raw) : ev.raw) || "(sem conteúdo bruto)";
-
-  $("#drawer").hidden = false;
-  $("#drawer-scrim").hidden = false;
-  $("#btn-right-inspect").classList.add("active");
-  switchDetailTab("overview");
-  updateDetailNav();
-  window.EventInsights?.render(ev, $("#pane-overview"));
-
-  // marca a linha selecionada na tabela
-  document.querySelectorAll("#events-table tbody tr").forEach((tr) => tr.classList.remove("selected"));
-  const idx = currentIndex();
-  const tr = $("#events-table tbody").children[idx];
-  if (tr) tr.classList.add("selected");
+  $("#pane-json").innerHTML = highlightJson(presented);
+  $("#pane-raw").textContent = presented.raw || "(sem conteúdo bruto)";
 }
 
 function updateDetailNav() {
@@ -4753,7 +5039,11 @@ function detailStep(dir) {
 
 function closeDrawer() {
   detailRequest++;
+  resetDetailVisibility();
   state.detailId = null;
+  state.currentDetailEv = null;
+  state.detailSourceSpec = null;
+  $("#drawer-badges").replaceChildren();
   $("#drawer").hidden = true;
   $("#drawer-scrim").hidden = true;
   $("#btn-right-inspect").classList.remove("active");
@@ -5279,7 +5569,7 @@ async function renderMcpPane() {
 // ------------------------------------------------------------------ live-refresh via MCP
 async function handleMcpStateChanged(kind) {
   window.Discovery?.clearCache();
-  caseEventsCache.sig = null;
+  if (kind !== "threats") caseEventsCache.sig = null;
   if (kind === "source") {
     await mcpRefreshSource();
     toast("Fonte de dados atualizada via MCP.", "info");
@@ -5291,6 +5581,13 @@ async function handleMcpStateChanged(kind) {
     return;
   }
   if (kind === "threats") {
+    // Rule changes affect the current source's derived fields. Preserved Case
+    // records retain their immutable transport version and search index.
+    if (activeCase()?.bigData === true) await syncCaseBigDataMode({ force: true, requireReady: state.currentArtifact != null });
+    else invalidateBigDataCaches();
+    window.Security?.invalidate();
+    if (window.Workspace) await window.Workspace.showPage(window.Workspace.page());
+    else if (state.loaded) await refresh();
     toast("Catálogo de ameaças atualizado via MCP.", "info");
     return;
   }
@@ -5308,6 +5605,7 @@ async function handleMcpStateChanged(kind) {
       await loadFormatOptions();
     }
   } catch { /* painel permanece como estava */ }
+  if (["codes", "derived", "ts_config"].includes(kind) && activeCase()?.bigData === true) await syncCaseBigDataMode({ force: true, requireReady: state.currentArtifact != null });
   // eventos são re-enriquecidos/re-derivados no backend: reconsulta a view ativa
   if (state.loaded) {
     await refresh();
@@ -5321,6 +5619,7 @@ async function handleMcpStateChanged(kind) {
 // a fonte de eventos mudou no backend (load/clear via MCP): refaz o pós-load lógico da UI
 async function mcpRefreshSource(contextual = false) {
   if (window.WorkspaceContext?.ready && !contextual) return window.WorkspaceContext.sourceChanged(() => mcpRefreshSource(true));
+  state.artifactSwitchVersion++;
   // resume a fonte atual no backend; fallback: deriva as colunas dos perfis (vazio = fonte limpa)
   let columns = [];
   let count = null;
@@ -5340,6 +5639,7 @@ async function mcpRefreshSource(contextual = false) {
   }
   if (count === 0) {
     await clearData();
+    await syncCaseBigDataMode();
     switchView("source");
     return;
   }
@@ -5378,6 +5678,7 @@ async function mcpRefreshSource(contextual = false) {
     }
     state.currentOrigin = sourceDesc;
   }
+  await syncCaseBigDataMode({ requireReady: activeCase()?.bigData === true });
   await refresh();
   $("#load-status").textContent = `${fmtNum(count ?? state.total)} eventos`;
   $("#load-status").className = "load-status ok";
@@ -5624,6 +5925,7 @@ function bind() {
     await syncActiveCaseArtifacts();
   };
   $("#btn-new-case").onclick = () => showCaseNameInput("new");
+  $("#btn-big-data").onclick = toggleBigData;
   $("#btn-case-menu").onclick = (e) => {
     e.stopPropagation();
     showCtxMenu(e.clientX, e.clientY, [
@@ -5676,9 +5978,10 @@ function bind() {
   $("#case-item-modal").addEventListener("click", (e) => {
     if (e.target === $("#case-item-modal")) { $("#case-item-modal").hidden = true; editingCaseItem = null; }
   });
-  $("#workbar-cancel").onclick = () => {
+  $("#workbar-cancel").onclick = async () => {
     state.refreshVersion++;
     if (state.activeOperation) state.activeOperation.cancelled = true;
+    try { await api("cancel_operation", {}, { silent: true }); } catch {}
     finishOperation("Operação interrompida", "Resultados anteriores foram descartados.");
   };
   $("#group-col").onchange = () => { state.groupCol = $("#group-col").value; };
@@ -5693,10 +5996,12 @@ function bind() {
   $("#dr-prev").onclick = () => detailStep(-1);
   $("#dr-next").onclick = () => detailStep(1);
   $("#dr-copy").onclick = async () => {
-    if (state.detailId == null) return;
-    const ev = await api("event_detail", { id: state.detailId });
-    await navigator.clipboard.writeText(JSON.stringify(ev, null, 2));
-    toast("JSON copiado.", "ok");
+    if (!state.currentDetailEv || state.detailId == null) return;
+    const ev = detailRevealed ? state.currentDetailEv : window.EvidenceUI.redact(state.currentDetailEv);
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(ev, null, 2));
+      toast("JSON do detalhe copiado.", "ok");
+    } catch { toast("Não foi possível copiar o JSON.", "error"); }
   };
   document.querySelectorAll("#drawer .dtab").forEach((t) => {
     t.onclick = () => switchDetailTab(t.dataset.pane);
@@ -6588,7 +6893,7 @@ async function openCube(scope = "dataset", { force = false } = {}) {
 
   const cube = activeCube(scope);
   const currentSig = JSON.stringify([scope, cube.id, cubeSchemaSignature(cube), backendFilters(), scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, state.derivedFields]);
-  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody tr").length > 0) {
+  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody tr")) {
     finishOperation("Cubo pronto", "Recorte exibido do cache.");
     return;
   }
@@ -6763,7 +7068,7 @@ async function runCube({ force = false } = {}) {
   const filters = backendFilters();
   const currentSig = JSON.stringify([scope, cube.id, cubeSchemaSignature(cube), filters, scope === "case" ? caseSig() : state.currentArtifact?.loadedAt, state.derivedFields]);
 
-  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody tr").length > 0) {
+  if (!force && cubeState.result && cubeState.lastComputedSignature === currentSig && $("#cube-table tbody tr")) {
     return { status: "cached" };
   }
 

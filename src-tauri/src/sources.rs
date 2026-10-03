@@ -1588,6 +1588,8 @@ pub struct FileIndex {
     pub lines: Vec<LineMeta>,
     pub columns: Vec<String>,
     pub time_order: std::sync::OnceLock<Vec<usize>>,
+    /// Optional persistent search/column store for this exact source generation.
+    pub big_data: Option<std::sync::Arc<crate::big_data::BigDataIndex>>,
 }
 
 // Single-source configuration remains available to the existing format editor.
@@ -1611,6 +1613,8 @@ impl FileIndex {
             .saturating_sub(1)]
     }
     pub fn append(&mut self, mut other: FileIndex) {
+        // Row positions and the corpus fingerprint change when sources are joined.
+        self.big_data = None;
         let base = self
             .parts
             .last()
@@ -1826,6 +1830,7 @@ pub fn retimestamp_index(
         line.ts = timestamp;
     }
     idx.time_order.take();
+    idx.big_data = None;
     if let Some(cb) = progress {
         cb(total, total);
     }
@@ -1834,6 +1839,20 @@ pub fn retimestamp_index(
 
 /// Materializa um evento completo a partir da linha indexada.
 pub fn event_at(
+    idx: &FileIndex,
+    i: usize,
+    codes: &CodesConfig,
+    system: &CodesConfig,
+    derived: &[CompiledDerived],
+) -> Event {
+    if let Some(event) = idx.big_data.as_ref().and_then(|engine| engine.event(i)) {
+        return event;
+    }
+    event_at_uncached(idx, i, codes, system, derived)
+}
+
+/// Used by the index builder and as a recovery path for an unavailable store.
+pub fn event_at_uncached(
     idx: &FileIndex,
     i: usize,
     codes: &CodesConfig,
@@ -2472,6 +2491,7 @@ pub fn index_file(
         lines,
         columns,
         time_order: std::sync::OnceLock::new(),
+        big_data: None,
     })
 }
 

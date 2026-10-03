@@ -59,7 +59,7 @@
     panel.querySelector(".group-editor").prepend(shortcuts);
     const add = $("#btn-add-agg"); add.textContent = "+ Medida";
     add.onclick = () => { state.aggs.push({ func: "count_distinct", column: candidates().find(field => field !== state.groupCol) || state.groupCol, alias: "" }); renderAggs(); scheduleGroup(); };
-    const run = $("#btn-run-group"); run.textContent = "Atualizar"; run.onclick = () => runGroup();
+    const run = $("#btn-run-group"); run.textContent = "Atualizar"; run.onclick = () => runGroup({ force: true });
     const tools = el("div", "aw-result-tools"); tools.id = "aw-group-tools";
     const search = el("input", "aw-search"); search.type = "search"; search.placeholder = "Buscar nos grupos…"; search.setAttribute("aria-label", "Buscar nos grupos calculados");
     search.oninput = () => { groupView.search = search.value; groupView.page = 0; renderGroups(); };

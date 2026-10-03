@@ -21,6 +21,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  validate:
+    name: Frontend and release regressions
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      PLAYWRIGHT_CHANNEL: chromium
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify triggering tag before dependency installation
+        run: node scripts/release/verify-trigger.mjs
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            scripts/preview/package-lock.json
+      - run: npm ci
+      - run: npm ci --prefix scripts/preview
+      - name: Install browser
+        working-directory: scripts/preview
+        run: npx playwright install --with-deps chromium
+      - run: npm run check
+      - run: npm run test:preview
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-validation
+          path: output/playwright/
+          if-no-files-found: warn
+          retention-days: 14
+
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -42,6 +75,8 @@ jobs:
       APPIMAGE_EXTRACT_AND_RUN: '1'
     steps:
       - uses: actions/checkout@v7
+      - name: Verify triggering tag before dependencies and build
+        run: node scripts/release/verify-trigger.mjs
       - name: Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -56,6 +91,17 @@ jobs:
         with:
           workspaces: src-tauri -> target
       - run: npm ci
+      - name: Native acceptance dependencies
+        if: runner.os == 'Windows'
+        run: npm ci --prefix scripts/preview
+      - name: Verify Windows desktop and WebView2 runtime
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./scripts/release/ensure-webview2.ps1 -InstallMissing
+      - name: Verify Windows process cleanup
+        if: runner.os == 'Windows'
+        run: node scripts/release/test-process-supervision.mjs
       - name: Verify version
         run: node scripts/release/verify-version.mjs
       - name: Verify release safeguards
@@ -63,8 +109,27 @@ jobs:
       - run: npm run prepare:frontend
       - name: Backend tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --lib -- --test-threads=1
+      - name: Windows atomic metadata regressions
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --test atomic_metadata_windows -- --test-threads=1
       - name: Build installers
         run: npm run build -- --ci --bundles ${{ matrix.bundles }} -- --locked
+      - name: Native Windows acceptance
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        run: node scripts/preview/test-native-desktop.mjs src-tauri/target/release/loginsight.exe
+      - name: Upload native acceptance evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-validation
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            output/native-environment.json
+            output/native-desktop-*/results.json
+            output/native-desktop-*/*.png
+            output/native-desktop-*/*.log
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
@@ -80,7 +145,7 @@ jobs:
 
   release:
     name: Publish Windows and Linux release
-    needs: build
+    needs: [validate, build]
     if: (github.event_name == 'workflow_dispatch' && inputs.publish_release && github.ref == 'refs/heads/main') || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -88,6 +153,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+      - name: Verify triggering tag before downloads or publication
+        run: node scripts/release/verify-trigger.mjs
       - uses: actions/setup-node@v6
         with:
           node-version: '22'

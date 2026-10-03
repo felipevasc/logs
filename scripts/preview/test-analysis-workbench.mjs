@@ -72,11 +72,19 @@ try {
   for (const row of results.multipleMeasures) { assert.equal(row.sum, row.expectedSum); assert.equal(row.unique, row.expectedUnique); }
   await page.screenshot({ path: resolve(output, "workbench-multiple-measures.png") });
 
-  await page.evaluate(async () => {
+  results.groupRefreshError = await page.evaluate(async () => {
     const original = api;
-    api = async (name, args, opts) => { if (name === "aggregate_events") throw new Error("Falha de conexão de teste"); return original(name, args, opts); };
-    try { await runGroup(); } finally { api = original; }
+    let calls = 0;
+    api = async (name, args, opts) => { if (name === "aggregate_events") { calls++; throw new Error("Falha de conexão de teste"); } return original(name, args, opts); };
+    try {
+      await runGroup(); // Reentering an unchanged view should reuse its result.
+      const cachedCalls = calls;
+      await document.querySelector("#btn-run-group").onclick(); // Explicit refresh must recalculate.
+      return { cachedCalls, refreshCalls: calls };
+    } finally { api = original; }
   });
+  assert.equal(results.groupRefreshError.cachedCalls, 0, "unchanged view should reuse its successful result");
+  assert.equal(results.groupRefreshError.refreshCalls, 1, "manual refresh must reach the backend even with an unchanged signature");
   assert.equal(await page.locator("#group-table tbody tr").count(), 0, "failed recalculation must not present stale totals");
   await page.locator("#aw-group-summary").getByRole("button", { name: "Detalhes", exact: true }).click();
   assert.match(await page.locator("#analysis-help .modal-body").textContent(), /Falha de conexão de teste/);
@@ -99,7 +107,7 @@ try {
   await page.evaluate(async () => {
     const original = api;
     api = async (name, args, opts) => { if (name === "pivot") throw new Error("Falha do cruzamento de teste"); return original(name, args, opts); };
-    try { await runCube(); } finally { api = original; }
+    try { await runCube({ force: true }); } finally { api = original; }
   });
   assert.equal(await page.locator("#cube-table tbody tr").count(), 0);
   assert.equal(await page.evaluate(() => cubeResultForTable(activeCube())), null);

@@ -11,6 +11,7 @@ pub const INDEX_DIR: &str = "indexes-v5";
 /// Removes caches from previous parser versions and indexes unused for 30 days.
 pub fn prune() {
     let base = crate::config_dir();
+    crate::big_data::prune(&base.join("big-data-v1"));
     for old in ["indexes", "indexes-v1", "indexes-v2", "indexes-v3", "indexes-v4"] {
         let _ = std::fs::remove_dir_all(base.join(old));
     }
@@ -123,6 +124,7 @@ pub fn open(
             lines,
             columns: header.columns,
             time_order: std::sync::OnceLock::new(),
+            big_data: None,
         });
     }
     drop(mmap);
@@ -179,8 +181,11 @@ fn read(path: &PathBuf, bytes: usize) -> Option<(Header, Vec<LineMeta>)> {
 }
 
 fn write(path: &PathBuf, idx: &FileIndex) -> std::io::Result<()> {
-    let temp = path.with_extension(format!("{}.pending", uuid::Uuid::new_v4()));
-    let mut out = BufWriter::new(std::fs::File::create(&temp)?);
+    let parent = path.parent().ok_or_else(|| std::io::Error::new(
+        std::io::ErrorKind::InvalidInput, "Cache sem diretório de destino",
+    ))?;
+    let mut pending = tempfile::Builder::new().prefix("parser-").suffix(".pending").tempfile_in(parent)?;
+    let mut out = BufWriter::new(pending.as_file_mut());
     let data = serde_json::to_vec(&Header {
         format: idx.format.clone(),
         columns: idx.columns.clone(),
@@ -192,8 +197,6 @@ fn write(path: &PathBuf, idx: &FileIndex) -> std::io::Result<()> {
     out.write_all(&data)?;
     for (i, m) in idx.lines.iter().enumerate() {
         if i % 4096 == 0 && crate::operations::cancelled() {
-            drop(out);
-            let _ = std::fs::remove_file(&temp);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "Cancelado",
@@ -208,5 +211,32 @@ fn write(path: &PathBuf, idx: &FileIndex) -> std::io::Result<()> {
     }
     out.flush()?;
     drop(out);
-    std::fs::rename(temp, path)
+    // The temporary owner cleans up every write/flush/publication failure.
+    pending.persist(path).map(|_| ()).map_err(|error| error.error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_cache_failures_leave_no_pending_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source.jsonl");
+        std::fs::write(&input, "{\"message\":\"record\"}\n").unwrap();
+        let idx = crate::sources::index_file(input.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let target = cache.join("target");
+        std::fs::create_dir(&target).unwrap();
+        assert!(write(&target, &idx).is_err());
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        let cancelled = crate::operations::run(crate::operations::generation(), || {
+            crate::operations::cancel();
+            write(&cache.join("cancelled.idx"), &idx)
+        });
+        assert!(cancelled.is_err());
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        assert!(target.is_dir(), "an existing destination must be preserved");
+    }
 }

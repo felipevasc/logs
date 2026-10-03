@@ -1,0 +1,142 @@
+/* Resource monitoring stays independent from Cases and analysis requests. */
+import assert from "node:assert/strict";
+import { chromium } from "playwright";
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+const url = process.argv[2] || "http://127.0.0.1:4181", output = resolve("output/playwright");
+mkdirSync(output, { recursive: true });
+const fallback = `${process.env.LOCALAPPDATA}/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-win64/chrome-headless-shell.exe`;
+const browser = await chromium.launch({ executablePath: existsSync(chromium.executablePath()) ? undefined : fallback });
+const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, reducedMotion: "reduce" });
+const errors = [], results = {};
+page.on("pageerror", error => errors.push(error.message));
+const open = async () => { await page.locator("#btn-resources").click(); await page.waitForFunction(() => !!Resources.snapshot() && document.querySelector("#resources-overlay")); };
+const close = async () => { await page.locator("[data-resource-close]").click(); await page.waitForFunction(() => !document.querySelector("#resources-overlay")); };
+const update = async () => { await page.locator("[data-resource-refresh]").click(); await page.waitForFunction(() => !document.querySelector("[data-resource-refresh]").disabled); };
+
+try {
+  await page.goto(url);
+  await page.waitForFunction(() => window.WorkspaceContext?.ready && state.loaded && document.querySelector("#load-overlay").hidden && !state.activeOperation);
+  await open();
+  assert.match(await page.locator("[data-resource-status]").innerText(), /simuladas/);
+  assert.equal(await page.locator(".resource-metric").count(), 8);
+  assert.match(await page.locator("[data-resource-inventory-description]").innerText(), /soma parcial.*não corresponde à RAM residente/);
+  assert.match(await page.locator("[data-resource-inventory]").innerText(), /Estimativa.*Tamanho lógico.*Indisponível/s);
+  assert.match(await page.locator("[data-resource-operations]").innerText(), /CPU da thread.*120 ms.*Indisponível/s);
+  assert.match(await page.locator("[data-resource-operations-description]").innerText(), /exclui workers.*não implica sucesso/);
+  assert.match(await page.locator("[data-resource-notes]").innerText(), /GPU.*indisponível/);
+  assert.match(await page.locator("[data-resource-storage-description]").innerText(), /Volume do aplicativo:.*disponíveis de.*% da capacidade/);
+  assert.equal(await page.evaluate(() => Tasks.groups().some(group => group.tasks.some(task => task.cmd === "resource_snapshot"))), false);
+  const initial = await page.evaluate(() => ({ timestamp: Resources.snapshot().sampledAtMs, length: Resources.snapshot().history.length }));
+  await page.waitForFunction(timestamp => Resources.snapshot().sampledAtMs > timestamp, initial.timestamp);
+  results.measurement = "process/host metrics, partial inventory, unavailable counters and thread CPU are explicitly distinguished; polling is not a task";
+  await page.screenshot({ path: resolve(output, "resources-dark.png"), fullPage: true });
+
+  await page.locator("[data-resource-chart-metric]").selectOption("memory");
+  assert.match(await page.locator("[data-resource-chart]").getAttribute("aria-label"), /RAM/);
+  await page.locator("[data-resource-chart-metric]").selectOption("io");
+  assert.match(await page.locator("[data-resource-chart-legend]").innerText(), /Leitura do aplicativo.*Gravação do aplicativo/s);
+  await page.locator("[data-resource-chart-range]").selectOption("15");
+  await page.locator("[data-resource-pause]").click();
+  assert.equal(await page.locator("[data-resource-pause]").getAttribute("aria-pressed"), "true");
+  const pausedCalls = await page.evaluate(() => window.__mockCommandCalls.resource_snapshot);
+  await page.waitForTimeout(1200);
+  assert.equal(await page.evaluate(() => window.__mockCommandCalls.resource_snapshot), pausedCalls);
+  await update();
+  assert.equal(await page.locator("[data-resource-pause]").getAttribute("aria-pressed"), "true", "manual refresh preserves paused state");
+  await page.locator("[data-resource-pause]").click();
+  await page.waitForFunction(calls => window.__mockCommandCalls.resource_snapshot > calls, pausedCalls);
+  const downloadEvent = page.waitForEvent("download");
+  await page.locator("[data-resource-export]").click();
+  const download = await downloadEvent, exportPath = resolve(output, "resources-export.json");
+  await download.saveAs(exportPath);
+  const exported = JSON.parse(readFileSync(exportPath, "utf8"));
+  assert.ok(exported.history.length >= initial.length);
+  assert.equal("events" in exported, false);
+  results.history = "CPU/RAM/I/O chart and range selection work; pause stops UI requests, manual refresh preserves pause, export contains metrics and history";
+
+  await page.evaluate(() => {
+    const snapshot = structuredClone(Resources.snapshot());
+    snapshot.preview = false; snapshot.warmingUp = true; snapshot.app.cpuPercent = null; snapshot.app.readBytesPerSec = null; snapshot.host.cpuPercent = null;
+    snapshot.app.totalReadBytes = null; snapshot.processes[0].cpuPercent = null; snapshot.processes[0].residentBytes = null;
+    snapshot.history = [{ timestampMs: snapshot.sampledAtMs, appCpuPercent: null, hostCpuPercent: null, appMemoryBytes: 0, hostMemoryUsedBytes: 0, readBytesPerSec: null, writtenBytesPerSec: null, activeOperations: 0 }];
+    snapshot.storage = null; window.__mockResourceSnapshot = snapshot;
+  });
+  await update();
+  await page.locator("[data-resource-chart-metric]").selectOption("cpu");
+  assert.match(await page.locator("[data-resource-app]").innerText(), /CPU do aplicativo.*Indisponível/s);
+  assert.match(await page.locator("[data-resource-app]").innerText(), /Acumulado nos processos próprios vivos: Indisponível/);
+  assert.match(await page.locator("[data-resource-processes]").innerText(), /Indisponível/);
+  assert.match(await page.locator("[data-resource-chart-scale]").innerText(), /Sem medições disponíveis/);
+  assert.match(await page.locator("[data-resource-storage-description]").innerText(), /indisponível/);
+  assert.match(await page.locator("[data-resource-time]").innerText(), /aguardando intervalo/);
+  await page.evaluate(() => {
+    window.__mockResourceSnapshot.app.cpuPercent = 0;
+    window.__mockResourceSnapshot.storage = { root: "C:\\parcial", bytes: 0, files: 0, sampledAt: Date.now() - 70000, partial: true, stale: true, paths: [], note: "Limite de varredura atingido." };
+  });
+  await update();
+  assert.match(await page.locator("[data-resource-app]").innerText(), /CPU do aplicativo.*Medido.*0%/s);
+  assert.match(await page.locator("[data-resource-storage-description]").innerText(), /0 B.*parcial.*antiga.*Limite de varredura/s);
+  assert.match(await page.locator("[data-resource-storage-description]").innerText(), /^≥ /);
+  assert.equal((await page.locator("[data-resource-storage-description]").innerText()).includes("% da capacidade"), false, "partial accounting cannot claim an exact capacity percentage");
+  results.unavailable = "null counters never become zero; first-sample rates, missing storage and stale partial scans are labelled; measured zero is preserved";
+
+  await page.evaluate(() => { window.__mockErrors = { resource_snapshot: "Falha de medição para teste" }; });
+  await update();
+  assert.match(await page.locator("[data-resource-status]").innerText(), /Amostra anterior.*mantida.*Falha de medição/s);
+  assert.equal(await page.locator("[data-resource-status]").getAttribute("data-error"), "true");
+  await close();
+  await page.evaluate(() => { window.__mockResourceSnapshot = null; window.__mockErrors = { resource_snapshot: "Primeira coleta de recursos em andamento." }; });
+  await page.locator("#btn-resources").click();
+  await page.waitForFunction(() => document.querySelector("[data-resource-status]").textContent.includes("Aguardando a primeira coleta"));
+  assert.equal(await page.locator("[data-resource-status]").getAttribute("data-error"), "false");
+  assert.match(await page.locator("[data-resource-app]").innerText(), /Aguardando a primeira amostra/);
+  assert.equal(await page.locator("[data-resource-export]").isDisabled(), true);
+  await page.evaluate(() => { window.__mockErrors = {}; });
+  await page.waitForFunction(() => !!Resources.snapshot());
+  results.failures = "failed samples retain old measurements with timestamp; initial collection retries normally and cannot export missing data";
+
+  const modal = page.locator(".resources-modal");
+  assert.equal(await modal.getAttribute("aria-modal"), "true");
+  await page.locator("[data-resource-close]").focus();
+  await page.keyboard.press("Shift+Tab");
+  assert.equal(await page.evaluate(() => document.activeElement.hasAttribute("data-resource-tasks")), true);
+  await page.keyboard.press("Tab");
+  assert.equal(await page.evaluate(() => document.activeElement.hasAttribute("data-resource-close")), true);
+  await page.keyboard.press("Escape");
+  assert.equal(await page.locator("#resources-overlay").count(), 0);
+  assert.equal(await page.evaluate(() => document.activeElement.id), "btn-resources");
+  assert.equal(await page.evaluate(() => [...document.body.children].some(node => node.inert)), false);
+  const closedCalls = await page.evaluate(() => window.__mockCommandCalls.resource_snapshot);
+  await page.waitForTimeout(1200);
+  assert.equal(await page.evaluate(() => window.__mockCommandCalls.resource_snapshot), closedCalls);
+  await open();
+  assert.ok(await page.evaluate(length => Resources.snapshot().history.length > length, initial.length));
+  await page.locator("[data-resource-tasks]").click();
+  assert.equal(await page.locator("#resources-overlay").count(), 0);
+  assert.equal(await page.locator(".tasks-modal").count(), 1);
+  await page.locator(".tasks-modal [data-close]").click();
+  results.accessibility = "dialog focus is trapped and restored, Escape works, closing stops UI polling while history continues, task panel opens";
+
+  await page.evaluate(() => { window.__mockLatency = { resource_snapshot: 400 }; });
+  await page.locator("#btn-resources").click();
+  await close();
+  await page.waitForTimeout(600);
+  assert.equal(await page.locator("#resources-overlay").count(), 0);
+  assert.equal(await page.evaluate(() => Resources.snapshot()), null, "late sample is discarded after closing");
+  await page.evaluate(() => { window.__mockLatency = {}; window.__resourceCase = state.cases.active; state.cases.active = null; document.documentElement.dataset.theme = "light"; });
+  await open();
+  assert.equal(await page.evaluate(() => activeCase()), null);
+  assert.equal(await page.locator(".resource-metric").count(), 8);
+  await page.screenshot({ path: resolve(output, "resources-light.png"), fullPage: true });
+  await page.setViewportSize({ width: 660, height: 860 });
+  assert.equal(await page.evaluate(() => document.querySelector(".resources-modal").getBoundingClientRect().width <= innerWidth), true);
+  await page.locator("[data-resource-close]").click();
+  await page.evaluate(() => { state.cases.active = window.__resourceCase; });
+  results.lifecycle = "late responses cannot resurrect a closed dialog; metrics work without a Case and in light theme/narrow viewport";
+
+  assert.deepEqual(errors, []);
+  writeFileSync(resolve(output, "resources-results.json"), JSON.stringify({ ...results, pageErrors: errors }, null, 2));
+  console.log(JSON.stringify({ ...results, pageErrors: errors }, null, 2));
+} finally { await browser.close(); }

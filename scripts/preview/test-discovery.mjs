@@ -1,5 +1,5 @@
 import { chromium } from 'playwright';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 
 const browser = await chromium.launch({headless:true,...(!existsSync(chromium.executablePath()) ? {executablePath:'C:/Users/felip/AppData/Local/ms-playwright/chromium-1217/chrome-win64/chrome.exe'} : {})});
@@ -10,12 +10,23 @@ const shots = new URL('../../output/playwright/',import.meta.url);mkdirSync(shot
 const waitAnalysis = () => page.waitForFunction(()=>!document.querySelector('#dash-grid .discovery-loading') && ![...document.querySelectorAll('#dash-grid .muted')].some(n=>n.textContent==='Calculando…') && ![...document.querySelectorAll('#dash-grid .cross-output,#dash-grid .heat-output')].some(n=>n.textContent.includes('Cruzando os valores…')));
 try {
   await page.goto(process.env.PREVIEW_URL || 'http://127.0.0.1:4175');
-  await page.waitForFunction(()=>state.loaded && state.total===6000 && document.querySelector('#ws-content .metric'));
+  await page.waitForFunction(()=>WorkspaceContext.ready && !WorkspaceContext.changing && !state.loadOverlay && state.loaded && state.total===6000 && document.querySelector('#ws-content .metric') && Array.isArray(state.datasetProfiles) && state.treeAgg.dataset);
+  // Finish the field metadata while Summary keeps the explorer hidden. This
+  // exercises the first cached reveal without relying on a late API callback.
+  const cached = await page.evaluate(async()=>{
+    await window.workspaceBootstrap;
+    await Workspace.showPage('summary');
+    await refreshTreeAggs('dataset');
+    return {page:Workspace.page(),hidden:document.querySelector('.shell').hidden,rows:state.rows.length,calls:{...window.__mockCommandCalls}};
+  });
+  assert.equal(cached.page,'summary');assert.equal(cached.hidden,true);assert(cached.rows>0);
   await page.getByRole('button',{name:'Explorar',exact:true}).click();
   assert.equal(await page.locator('#levels-mini').count(),0,'Níveis ficam apenas nos campos à direita');
   const side=await page.locator('#workspace-side').boundingBox(), content=await page.locator('.shell .content').boundingBox();
   assert(side.x >= content.x+content.width-1,'Campos deve estar à direita');
   await page.locator('#explore-tree .field-row[data-column="source"] .field-item').click({button:'right'});
+  const afterReveal=await page.evaluate(()=>({...window.__mockCommandCalls}));
+  for(const command of ['query_events','explore_snapshot','tree_aggs'])assert.equal(afterReveal[command]||0,cached.calls[command]||0,`cached explorer must rebuild visible fields without another ${command} request`);
   await page.getByRole('button',{name:'Top 10 de Origem',exact:true}).click();
   await page.locator('#drawer .discovery-rank').first().waitFor();
   const drawer=await page.locator('#drawer').boundingBox();assert(drawer.x<side.x && drawer.x+drawer.width>=side.x+side.width-1,'Detalhes sobrepõem os campos');
@@ -120,4 +131,16 @@ try {
   assert.equal(await page.locator('.discovery-heading h2').innerText(),'Desvios');
   assert.deepEqual(errors,[]);
   console.log('PASS: campos direita, top10, filtros, 7 modos, cache, frequências cruzadas, picos contextualizados, desvios, ajuda acessível, caso, recorte vazio, tema e 1024px; sem erros JS.');
+} catch (error) {
+  const diagnostic = await page.evaluate(() => ({
+    ready: window.WorkspaceContext?.ready, changing: window.WorkspaceContext?.changing,
+    scope: workspaceScope(), page: document.body.dataset.page, loaded: state.loaded,
+    loadOverlay: state.loadOverlay, total: state.total, rows: state.rows?.length,
+    profiles: state.datasetProfiles?.length,
+    fields: document.querySelector('#explore-tree')?.textContent,
+    fieldsHidden: !!document.querySelector('#explore-tree')?.closest('[hidden]'),
+  })).catch(() => null);
+  writeFileSync(new URL('discovery-failure.json', shots), JSON.stringify({ error: String(error), diagnostic, errors }, null, 2));
+  await page.screenshot({path:new URL('discovery-failure.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')}).catch(() => {});
+  throw error;
 } finally {await browser.close();}

@@ -5,14 +5,29 @@ window.EventInsights = (() => {
   const OUTCOME = { success: "sucesso", failure: "falha", blocked: "bloqueado", unknown: "desconhecido" };
   const SEV = { critical: "crítica", high: "alta", medium: "média", low: "baixa", info: "informativa" };
   let serial = 0;
+  let current = null;
+
+  function clear() { serial++; current = null; }
+  function setRevealed(ev, revealed) {
+    if (current?.ev !== ev) return;
+    current.revealed = revealed;
+    if (current.data) present(current);
+  }
 
   async function render(ev, pane) {
     const mine = ++serial;
+    const view = current = { ev, pane, revealed: false, data: null };
     pane.querySelector(".insight-block")?.remove();
     let data;
     try { data = await api("event_insights", { event: ev, ...analyticsRequest(workspaceScope()) }, { silent: true }); } catch { return; }
     if (mine !== serial || state.currentDetailEv !== ev || !pane.isConnected) return;
-    data = window.EvidenceUI.redact(data);
+    view.data = data;
+    present(view);
+  }
+
+  function present({ ev, pane, data: original, revealed }) {
+    pane.querySelector(".insight-block")?.remove();
+    const data = revealed ? original : window.EvidenceUI.redact(original);
     const entities = data.entities.filter(e => ENTITY_ROLES.has(e.column));
     const rules = [...data.rules.map(r => ({ ...r, snippet: "", source: "detecção" })), ...data.threats.map(t => ({ ...t, source: t.category }))];
     if (!entities.length && !data.action && !rules.length && !data.decoded.length) return;
@@ -21,7 +36,7 @@ window.EventInsights = (() => {
     for (const finding of data.related_findings || []) {
       if (!finding.relationships?.length) continue;
       const details=el("details","evidence-why");
-      details.innerHTML=`<summary>${window.EvidenceUI.badge(finding.evidence_level)} ${esc(finding.name)}</summary><p>Este registro é contexto da correlação; seu nível individual permanece independente.</p>${window.EvidenceUI.explanation(finding)}`;
+      details.innerHTML=`<summary>${window.EvidenceUI.badge(finding.evidence_level)} ${esc(finding.name)}</summary><p>Este registro é contexto da correlação; seu nível individual permanece independente.</p>${window.EvidenceUI.explanation(finding, { revealed })}`;
       block.append(details);
     }
     if (data.action) {
@@ -33,7 +48,7 @@ window.EventInsights = (() => {
     }
     if (entities.length) {
       const chips = el("div", "insight-entities");
-      for (const e of entities) chips.append(window.EntityMenu.chip({ column: e.column, value: e.value, scope: e.scope, first: ev.timestamp, last: ev.timestamp }));
+      for (const e of entities) chips.append(window.EntityMenu.chip({ column: e.column, value: e.value, scope: e.scope, first: ev.timestamp, last: ev.timestamp }, "", { revealed }));
       block.append(chips);
     }
     if (rules.length) {
@@ -49,18 +64,23 @@ window.EventInsights = (() => {
       if (rules.length > 8) list.append(el("small", "muted", `+${rules.length - 8} regras`));
       block.append(list);
       for (const r of data.rules) {
-        const details = el("details", "evidence-why"); details.innerHTML = `<summary>${esc(r.name)}: motivos e limitações</summary>${window.EvidenceUI.explanation(r)}`; block.append(details);
+        const details = el("details", "evidence-why"); details.innerHTML = `<summary>${esc(r.name)}: motivos e limitações</summary>${window.EvidenceUI.explanation(r, { revealed })}`; block.append(details);
       }
     }
     for (const d of data.decoded.slice(0, 3)) {
       const details = el("details", "insight-decoded");
-      const summary = el("summary", "", `${d.kind} decodificado · ${d.source}`);
-      const pre = el("pre", "code-pane", d.text);
-      details.append(summary, pre);
+      const summary = el("summary", "", `${d.kind} interpretado · ${d.source}`);
+      const raw = original.decoded[data.decoded.indexOf(d)];
+      const protectedText = revealed ? raw.text : window.EvidenceUI.redact({ [raw.source]: raw.text })[raw.source];
+      const pre = el("pre", "code-pane", protectedText);
+      const inspect = el("button", "btn ghost small", "Inspecionar subcampos"); inspect.type = "button";
+      // Keep the original only in the click closure, never in hidden DOM attributes.
+      inspect.onclick = () => window.ValueInspector?.open(raw.text, { label: `${d.kind} · ${d.source}`, path: `$::decoded[${data.decoded.indexOf(d)}]`, revealed });
+      details.append(summary, el("p", "small muted", "Conteúdo interpretado localmente; não comprova autenticidade e não é executado."), pre, inspect);
       block.append(details);
     }
     if (data.normalization) { const details = el("details", "insight-normalization"), summary = el("summary", "", "Normalização e procedência dos campos"), pre = el("pre", "code-pane", JSON.stringify(data.normalization, null, 2)); details.append(summary, pre); block.append(details); }
     pane.prepend(block);
   }
-  return { render };
+  return { render, setRevealed, clear };
 })();
