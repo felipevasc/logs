@@ -127,7 +127,7 @@ function startReaction(f, visual) {
 test('only exact native lock and restore IDs select the two new families', () => {
   for (const [phaseId, family, label] of [['metadata-lock', 'access', 'Aguardando acesso'], ['metadata-restore', 'restoration', 'Retomando metadados']]) {
     const mapping = [...source.slice(source.indexOf('const PHASES'), source.indexOf('const STATES')).matchAll(new RegExp(`'([^']+)': '${family}'`, 'g'))].map(m => m[1]);
-    assert.deepEqual(mapping, [phaseId]);
+    assert.deepEqual(mapping, family === 'access' ? ['metadata-lock', 'canonical-lock'] : ['metadata-restore', 'engine-restore', 'engine-open', 'engine-ready', 'source-activate', 'source-settle']);
     const model = api.derive(window.WaitingProgress.snapshot(receipt({ phaseId })));
     assert.equal(model.family, family); assert.equal(model.status, label);
     assert.match(nativeSource, new RegExp(`"${phaseId}"`));

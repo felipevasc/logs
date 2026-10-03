@@ -34,7 +34,7 @@ function fixture({ blurToBody = false } = {}) {
     window: {
       __TAURI__: { event: { listen: (_type, fn) => { listeners.set('operation-progress', fn); return Promise.resolve(); } } },
       WaitingVisuals: { mount: (_host, receipt) => {
-        const view = { receipt, destroyed: false, update(next) { this.receipt = next; node('#load-visual .wv-motion-toggle').hidden = next.state === 'cancelling'; }, destroy() { this.destroyed = true; } };
+        const view = { receipt, destroyed: false, update(next) { this.receipt = next; node('#load-visual .wv-motion-toggle').hidden = next.state === 'cancelling'; }, complete() { this.completed = true; }, destroy() { this.destroyed = true; } };
         views.push(view); return view;
       } },
       PerformanceTools: { estimate: (_previous, p) => ({ completed: p.completed, total: p.total, percent: null }), phaseSeconds: () => null, duration: String },

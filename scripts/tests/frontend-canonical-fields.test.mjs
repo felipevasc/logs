@@ -118,6 +118,17 @@ async function reached(predicate, message) {
   assert.fail(message);
 }
 
+test('detail copy presentation applies after canonical ownership checks without modifying the exact source or filter value',async()=>{
+  const h=harness();h.hooks.exact=call=>h.exactResult(call,{canonicalText:'{"token":"private","id":9007199254740993}'});
+  const action=h.capture();let presentations=0;
+  assert.equal(await h.fields.copy(action,{present:text=>{presentations++;return text.replace('private','[oculto]');}}),true);
+  assert.equal(h.calls.copies[0],'{"token":"[oculto]","id":9007199254740993}');
+  await h.fields.filter(action);assert.equal(h.calls.drafts[0][1],'{"token":"private","id":9007199254740993}');
+  h.live.detailCurrent=false;action.guard=()=>h.live.detailCurrent;
+  assert.equal(await h.fields.copy(action,{present:()=>{presentations++;return 'invalid';}}),false);
+  assert.equal(presentations,1);assert.equal(h.calls.copies.length,1);
+});
+
 function noValueEffects(h, message) {
   assert.equal(h.calls.drafts.length, 0, `${message}: no composer`);
   assert.equal(h.calls.filters.length, 0, `${message}: no applied filter`);

@@ -1,9 +1,17 @@
 # Configuração de recursos
 
-Em **Configurações → Recursos → Padrões do aplicativo**, escolha **Automático** (padrão recomendado) ou
+Em **Configurações → Recursos → Orçamento de memória do aplicativo**, escolha **Automático** (padrão recomendado) ou
 **Personalizado** para o orçamento de referência do processamento. O valor é em
-MiB, de 128 até metade da memória detectada, limitado a 8 GiB. O detector considera
-o limite de contêiner Linux quando disponível.
+MiB, de 128 até a memória total detectada na máquina, sem teto fixo de 8 GiB
+ou redução do máximo à metade da RAM. Por exemplo, 64 GiB permitem 65.536 MiB
+e 128 GiB permitem 131.072 MiB. O detector usa a RAM total, não a RAM livre, e
+considera limites de contêiner Linux, inclusive de grupos ancestrais visíveis.
+
+Automático usa aproximadamente um terço dessa memória (mínimo de 128 MiB,
+sem ultrapassar o total detectado), deixando folga para o sistema e outras
+alocações. Personalizado permite escolher todo o total detectado, com aviso
+sem bloquear a escolha: usar esse máximo pode causar lentidão ou encerramento
+por falta de memória. O aviso também aparece se o orçamento ativo usa o total.
 
 O orçamento distribui referências para buffers de DuckDB, indexação textual,
 lotes e cache de seleções. A memória é usada sob demanda: não há pré-alocação ou
@@ -11,7 +19,11 @@ reserva desse valor. **Não é um limite rígido de RSS nem da memória total do
 processo.** Arquivos mapeados, metadados, bibliotecas e sessões SQL simultâneas
 podem usar memória adicional. Limites DuckDB por instância não devem ser somados
 como garantia de um teto global de memória. O paralelismo tem um controle agregado
-separado, descrito abaixo.
+separado, descrito abaixo. O writer textual também conserva um limite próprio
+inferior a 4 GiB porque a arena do Tantivy usa endereços internos de 32 bits;
+esse limite aparece no valor efetivo do componente, sem reduzir o máximo
+configurável do aplicativo. Conversões para tamanhos de alocação são limitadas
+à capacidade de endereçamento do processo, sem truncar valores grandes.
 
 ## Salvar e aplicar
 
@@ -71,16 +83,23 @@ publicação; veja o relatório de validação da versão.
 
 ## Cota independente por Caso
 
-A seção **Recursos deste Caso** oferece **Herdar limites do aplicativo** ou uma
+A seção **Cota lógica deste Caso** oferece **Herdar limites do aplicativo** ou uma
 cota personalizada de **volume lógico contabilizado**, em MiB. A cota é salva
 junto da interpretação do Caso, participa de sua revisão/CAS e acompanha sua
 exportação portátil. Não é uma preferência global de perfil.
 
 - Herdar mantém os limites individuais existentes de materialização, trabalho,
   IDs completos, valores analíticos, seleção SQL e cache de seleção
-- Personalizar aceita de 8 MiB até o menor entre 8192 MiB e a soma dos limites
-  agregados locais de trabalho e seleção lógica; pode restringir os limites
-  individuais, nunca ampliá-los
+- Personalizar aceita uma preferência de 8 MiB até a memória total detectada,
+  incluindo valores de 64/128 GiB quando a máquina possui essa capacidade
+- O painel distingue a **preferência salva** da **cota lógica efetiva**. A efetiva
+  é limitada pela soma real dos pools globais de trabalho e seleção lógica,
+  pela memória detectada e pela capacidade de endereçamento do processo.
+  Uma preferência maior fica salva sem ampliar implicitamente os limites
+  individuais de materialização, IDs, DuckDB ou cache
+- O orçamento de memória do aplicativo fica no mesmo painel e pode ser ajustado
+  para o próximo início. Os limites individuais e de seleção lógica continuam
+  independentes; aumentar a preferência do Caso não os remove
 - Uma preferência portátil maior que a capacidade local é mantida no arquivo,
   com valor efetivo reduzido e aviso explícito no painel
 - A política efetiva é capturada antes de enfileirar a consulta. Alterações valem

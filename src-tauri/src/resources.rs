@@ -4,6 +4,22 @@
 use std::sync::OnceLock;
 
 const MIB: u64 = 1 << 20;
+// Persisted MiB must round-trip through JSON and convert to bytes without
+// overflow, independently of the machine/architecture that opens the profile.
+pub(crate) const MAX_MEMORY_PREFERENCE_MIB: u64 = u64::MAX / MIB;
+// Tantivy's segment arena has 32-bit addresses even in a 64-bit process.
+// Stay below its u32::MAX - 1,000,000 per-writer bound. This component cap
+// does not restrict the application's configurable detected-memory budget.
+const MAX_TEXT_WRITER_BYTES: u64 = u32::MAX as u64 - MIB;
+
+/// Allocation-sized components must never wrap on 32-bit targets. Their
+/// address-space cap is separate from the user-visible physical-memory limit.
+pub(crate) fn allocation_bytes(bytes: u64) -> usize {
+    bounded_allocation_bytes(bytes, isize::MAX as u64) as usize
+}
+fn bounded_allocation_bytes(bytes: u64, addressable: u64) -> u64 {
+    bytes.min(addressable)
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Budget {
@@ -19,17 +35,18 @@ struct Budget {
 
 impl Budget {
     fn for_machine(memory: u64, cores: usize, requested_mib: Option<u64>) -> Self {
-        // Reserve room for the mapped source, its line metadata, the UI and OS.
-        // Three databases can coexist (base + derived query sessions + background build).
-        let ceiling = (memory / 2).max(128 * MIB);
+        // Automatic leaves room for mapped sources, metadata, the UI and OS.
+        // An explicit preference may use all detected memory (including the
+        // cgroup ceiling). It is a reference budget, never a RAM reservation.
         let bytes = requested_mib
             .and_then(|m| m.checked_mul(MIB))
             .unwrap_or(memory / 3)
-            .clamp(128 * MIB, ceiling.min(8 << 30));
+            .max(128 * MIB)
+            .min(memory);
         let available = cores.saturating_sub(1).max(1);
         let parser_threads = available.div_ceil(2).min(8);
         let query_threads = available.saturating_sub(parser_threads).max(1).min(8);
-        let text_bytes = (bytes / 8).max(16 * MIB);
+        let text_bytes = allocation_bytes((bytes / 8).min(MAX_TEXT_WRITER_BYTES)) as u64;
         // Tantivy requires at least 15 MiB per indexing worker.
         let text_threads = (parser_threads / 4)
             .clamp(1, 2)
@@ -91,7 +108,7 @@ fn environment_memory() -> &'static EnvironmentMemory {
 }
 
 pub(crate) fn maximum_memory_mib(memory: u64) -> u64 {
-    (memory / 2).clamp(128 * MIB, 8 << 30) / MIB
+    memory / MIB
 }
 
 /// Nominal limits of the individual engines. Concurrent SQL sessions can
@@ -162,7 +179,7 @@ pub(crate) fn text_threads() -> usize {
     1
 }
 pub(crate) fn text_memory_bytes() -> usize {
-    budget().text_bytes as usize
+    allocation_bytes(budget().text_bytes)
 }
 pub(crate) fn batch_bytes() -> usize {
     budget().batch_bytes
@@ -219,10 +236,10 @@ pub(crate) fn collected_ids_bytes() -> usize {
     crate::case_resources::current().map_or_else(application_collected_ids_bytes, |policy| policy.collected_ids_bytes())
 }
 pub(crate) fn application_collected_ids_bytes() -> usize {
-    configured_bytes(
+    allocation_bytes(configured_bytes(
         "LOGINSIGHT_COLLECTED_IDS_MB",
         (budget().effective_bytes / 32).min(128 * MIB),
-    ) as usize
+    ))
 }
 #[cfg(test)]
 thread_local! { static TEST_COLLECTED_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
@@ -245,10 +262,10 @@ pub(crate) fn analytics_bytes() -> usize {
     crate::case_resources::current().map_or_else(application_analytics_bytes, |policy| policy.analytics_bytes())
 }
 pub(crate) fn application_analytics_bytes() -> usize {
-    configured_bytes(
+    allocation_bytes(configured_bytes(
         "LOGINSIGHT_ANALYTICS_LIMIT_MB",
         (budget().effective_bytes / 32).min(128 * MIB),
-    ) as usize
+    ))
 }
 #[cfg(test)]
 thread_local! { static TEST_ANALYTICS_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
@@ -292,8 +309,12 @@ pub fn total_memory() -> u64 {
     static TOTAL: OnceLock<u64> = OnceLock::new();
     *TOTAL.get_or_init(|| {
         let physical = detect_memory().filter(|&m| m > 0).unwrap_or(8 << 30);
-        container_memory_limit().map_or(physical, |limit| physical.min(limit))
+        effective_memory(physical, container_memory_limit())
     })
+}
+
+fn effective_memory(physical: u64, container: Option<u64>) -> u64 {
+    container.map_or(physical, |limit| physical.min(limit))
 }
 
 pub fn low_memory() -> bool {
@@ -326,19 +347,16 @@ fn container_memory_limit() -> Option<u64> {
             if path.split('/').any(|part| part == "..") {
                 continue;
             }
-            if controllers.is_empty() {
-                candidates.push(
-                    std::path::Path::new("/sys/fs/cgroup")
-                        .join(path)
-                        .join("memory.max"),
-                );
+            let (root, filename) = if controllers.is_empty() {
+                (std::path::Path::new("/sys/fs/cgroup"), "memory.max")
             } else if controllers.split(',').any(|c| c == "memory") {
-                candidates.push(
-                    std::path::Path::new("/sys/fs/cgroup/memory")
-                        .join(path)
-                        .join("memory.limit_in_bytes"),
-                );
-            }
+                (std::path::Path::new("/sys/fs/cgroup/memory"), "memory.limit_in_bytes")
+            } else {
+                continue;
+            };
+            // A nested group can be unlimited while an ancestor is limited.
+            // Include every visible ancestor, not only the leaf and root.
+            candidates.extend(cgroup_limit_paths(root, path, filename));
         }
     }
     candidates
@@ -350,6 +368,15 @@ fn container_memory_limit() -> Option<u64> {
         })
         .min()
 }
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_limit_paths(root: &std::path::Path, group: &str, filename: &str) -> Vec<std::path::PathBuf> {
+    let group = std::path::Path::new(group.trim_start_matches('/'));
+    if group.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+        return Vec::new();
+    }
+    group.ancestors().map(|ancestor| root.join(ancestor).join(filename)).collect()
+}
+
 #[cfg(not(target_os = "linux"))]
 fn container_memory_limit() -> Option<u64> {
     None
@@ -371,7 +398,7 @@ fn detect_memory() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib * 1024)
+    kib.checked_mul(1024)
 }
 
 /// Lowers the calling thread below normal priority (background work).
@@ -450,13 +477,54 @@ mod tests {
         assert!(conservative_builder(64 << 30, 256 * MIB));
         assert!(!conservative_builder(8 << 30, (8 << 30) / 3));
         assert!(conservative_builder(4 << 30, 8 << 30));
-        assert_eq!(maximum_memory_mib(4 << 30), 2048);
-        assert_eq!(maximum_memory_mib(64 << 30), 8192);
+        assert_eq!(maximum_memory_mib(4 << 30), 4096);
+        assert_eq!(maximum_memory_mib(64 << 30), 65536);
+        assert_eq!(maximum_memory_mib(128 << 30), 131072);
         assert_eq!(maximum_memory_mib(128 * MIB), 128);
+    }
+    #[test]
+    fn custom_budget_reaches_detected_total_without_changing_automatic_headroom() {
+        for gib in [1u64, 4, 8, 16, 64, 128] {
+            let memory = gib << 30;
+            let maximum = maximum_memory_mib(memory);
+            let custom = Budget::for_machine(memory, 16, Some(maximum));
+            assert_eq!(custom.effective_bytes, memory);
+            assert_eq!(Budget::for_machine(memory, 16, Some(maximum + 1)).effective_bytes, memory);
+            assert_eq!(Budget::for_machine(memory, 16, None).effective_bytes, memory / 3);
+            let transient = (custom.effective_bytes / 32).min(128 * MIB);
+            assert!(custom.duckdb_bytes * 3 + custom.text_bytes + transient * 3 + custom.batch_bytes as u64 * 4 <= memory);
+            assert!(custom.text_bytes >= custom.text_threads as u64 * 15 * MIB);
+            assert!(custom.text_bytes < u32::MAX as u64 - 1_000_000, "Tantivy's arena must remain addressable on large machines");
+        }
+        let moved = Budget::for_machine(4 << 30, 4, Some(131072));
+        assert_eq!(moved.effective_bytes, 4 << 30);
+        assert_eq!(maximum_memory_mib(128 * MIB - 1), 127, "never round detected capacity up");
+        assert!(Budget::for_machine(64 * MIB, 1, None).effective_bytes <= 64 * MIB);
+    }
+    #[test]
+    fn cgroup_total_and_ancestor_limits_do_not_use_free_memory() {
+        assert_eq!(effective_memory(128 << 30, Some(4 << 30)), 4 << 30);
+        assert_eq!(effective_memory(4 << 30, Some(128 << 30)), 4 << 30);
+        assert_eq!(effective_memory(64 << 30, None), 64 << 30);
+        let paths = cgroup_limit_paths(std::path::Path::new("/sys/fs/cgroup"), "team/job", "memory.max");
+        assert_eq!(paths, ["/sys/fs/cgroup/team/job/memory.max", "/sys/fs/cgroup/team/memory.max", "/sys/fs/cgroup/memory.max"].map(std::path::PathBuf::from));
+        assert!(cgroup_limit_paths(std::path::Path::new("/sys/fs/cgroup"), "../../outside", "memory.max").is_empty());
+    }
+    #[test]
+    fn allocation_components_saturate_instead_of_wrapping_on_32_bit() {
+        let max32 = i32::MAX as u64;
+        for bytes in [4u64 << 30, 64 << 30, 128 << 30, u64::MAX] {
+            assert_eq!(bounded_allocation_bytes(bytes, max32), max32);
+        }
+        assert_eq!(bounded_allocation_bytes(16 * MIB, max32), 16 * MIB);
+        assert_eq!(allocation_bytes(u64::MAX), isize::MAX as usize);
+        assert!(MAX_MEMORY_PREFERENCE_MIB.checked_mul(MIB).is_some());
+        assert!((MAX_MEMORY_PREFERENCE_MIB + 1).checked_mul(MIB).is_none());
     }
     #[test]
     fn environment_memory_rejects_overflow_and_invalid_limits() {
         assert_eq!(parse_requested_memory("512"), Some(512));
+        assert_eq!(parse_requested_memory("131072"), Some(131072));
         for value in ["0", "127", "-1", "garbage", "18446744073709551615"] {
             assert_eq!(parse_requested_memory(value), None);
         }

@@ -16,6 +16,12 @@ struct Waiting { id: u64, priority: Priority, since: Instant }
 #[derive(Default)]
 struct State { used: usize, peak: usize, next: u64, queue: VecDeque<Waiting> }
 pub(crate) struct Scheduler { limit: usize, state: Mutex<State>, changed: Condvar }
+pub(crate) struct ResourceSnapshot { pub reserved: usize, pub limit: usize, pub queued: usize, pub peak: usize }
+pub(crate) fn resource_snapshot() -> Option<ResourceSnapshot> {
+    let scheduler = scheduler();
+    let state = scheduler.state.try_lock()?;
+    Some(ResourceSnapshot { reserved: state.used, limit: scheduler.limit, queued: state.queue.len(), peak: state.peak })
+}
 impl Scheduler {
     pub(crate) fn new(limit: usize) -> Arc<Self> { Arc::new(Self { limit: limit.max(1), state: Mutex::new(State::default()), changed: Condvar::new() }) }
     fn acquire(self: &Arc<Self>, priority: Priority, cancelled: &dyn Fn() -> bool) -> Result<Reservation, String> {
@@ -222,6 +228,22 @@ pub(crate) fn with_scheduler<T>(scheduler: Arc<Scheduler>, f: impl FnOnce() -> T
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resource_observation_never_waits_and_reports_reservation_lifetime() {
+        let scheduler = Scheduler::new(2);
+        with_scheduler(Arc::clone(&scheduler), || {
+            let reservation = scheduler.acquire(Priority::Normal, &|| false).unwrap();
+            let sample = resource_snapshot().unwrap();
+            assert_eq!((sample.reserved, sample.limit, sample.queued, sample.peak), (1, 2, 0, 1));
+            let held = scheduler.state.lock();
+            assert!(resource_snapshot().is_none());
+            drop(held);
+            drop(reservation);
+            let sample = resource_snapshot().unwrap();
+            assert_eq!((sample.reserved, sample.peak), (0, 1));
+        });
+    }
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     fn using<T>(scheduler: Arc<Scheduler>, f: impl FnOnce() -> T) -> T {
         struct Reset(Option<Arc<Scheduler>>);

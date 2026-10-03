@@ -219,7 +219,7 @@ async function inspectTaskRig(locator, family, pace = 'loop') {
             heldMatrix: matrix(held), stationMatrix: matrix(station) });
         }
         result.reactions = [];
-        for (const fraction of (pace === 'loop' ? [.21, .22, .4, .65, .66, .69, .74, .97] : [.34, .35, .68, .78, .88, 1])) {
+        for (const fraction of (pace === 'loop' ? [.21, .22, .4, .65, .66, .69, .74, .97] : [.34, .35, .68, .78, .88, .99999])) {
           await at(fraction);
           result.reactions.push({ fraction, heldOpacity: opacity(held), sourceOpacity: opacity(source),
             filedOpacity: opacity(filed), heldTransform: getComputedStyle(held).transform,
@@ -269,7 +269,7 @@ async function inspectTaskRig(locator, family, pace = 'loop') {
       for (const sample of rig.reactions.filter(sample => sample.fraction <= .66)) near(sample.well.y, 0, 'well waits for deposit');
       near(reaction(.69).well.y, 1.2, 'well responds after deposit'); near(reaction(.74).well.y, 0, 'well settles');
     } else {
-      near(reaction(1).heldOpacity, 1, 'short gesture ends still holding its card');
+      near(reaction(.99999).heldOpacity, 1, 'short gesture holds its card immediately before the finite endpoint');
       assert.ok(rig.reactions.every(sample => sample.filedOpacity === 0 && sample.well.y === 0), 'short inspection never invents a deposit');
       near(reaction(.68).visor.a, 1, 'short inspection reaches the visor before squinting');
       near(reaction(.78).visor.a, .65, 'short inspection squints at its own causal beat');
@@ -284,6 +284,15 @@ async function recordSceneCycle(locator, label, durationMs, attribution) {
   const capture = await locator.evaluate(async (root, durationMs) => {
     const animations = root.querySelector('.wv-art').getAnimations({ subtree: true });
     if (!animations.length) throw new Error('Cannot record an absent decorative timeline');
+    const finite = root.dataset.pace === 'gesture';
+    let finiteEndpoint = null;
+    const onEnd = event => {
+      if (event.animationName !== 'wv-gesture-boundary' || event.target !== root.querySelector('.wv-work-boundary')) return;
+      finiteEndpoint = { isTrusted: event.isTrusted, elapsedTime: event.elapsedTime,
+        times: animations.map(animation => animation.currentTime),
+        playStates: [...new Set(animations.map(animation => animation.playState))] };
+    };
+    root.addEventListener('animationend', onEnd, true);
     const sampling = await window.__waitingMotionSampling.begin(animations);
     try {
       await sampling.seek(0);
@@ -292,18 +301,19 @@ async function recordSceneCycle(locator, label, durationMs, attribution) {
       const started = performance.now();
       return await new Promise((resolve, reject) => {
         const frame = () => {
-          const times = animations.map(animation => animation.currentTime);
+          const times = finiteEndpoint?.times || animations.map(animation => animation.currentTime);
           if (!root.isConnected || root.dataset.motion !== 'running') return reject(new Error('Scene stopped before its capture cycle ended'));
-          if (times.every(time => typeof time === 'number' && time >= durationMs)) {
+          if ((!finite || finiteEndpoint) && times.every(time => typeof time === 'number' && time >= durationMs)) {
             return resolve({ requestedDurationMs: durationMs, elapsedMs: performance.now() - started,
-              minimumTimelineMs: Math.min(...times), playStates: [...new Set(animations.map(animation => animation.playState))] });
+              minimumTimelineMs: Math.min(...times), finiteEndpoint,
+              playStates: finiteEndpoint?.playStates || [...new Set(animations.map(animation => animation.playState))] });
           }
           if (performance.now() - started > durationMs + 10000) return reject(new Error('Decorative capture cycle did not advance'));
           requestAnimationFrame(frame);
         };
         requestAnimationFrame(frame);
       });
-    } finally { await sampling.restore({ restoreTime: false }); }
+    } finally { await sampling.restore({ restoreTime: false }); root.removeEventListener('animationend', onEnd, true); }
   }, durationMs);
   assert.ok(capture.minimumTimelineMs >= durationMs, 'video contains the complete real-time decorative cycle');
   markVideo(`${label}-end`, { ...attribution, ...capture });
@@ -331,7 +341,16 @@ async function emitLoadPhase(overrides = {}) {
       completed: 1200, total: 6300, unit: 'registros', elapsedMs: performance.now() - window.__waitingLoadStarted,
       cancellable: true, fixture: true, ...overrides,
     };
+    const root = document.querySelector('#load-visual .waiting-visual');
+    const before = payload.phaseId === 'metadata-checkpoint-committed' ? { svg: root.querySelector('svg'),
+      tracks: root.querySelector('.wv-art').getAnimations({ subtree: true }) } : null;
     window.__waitingPreviewBridge.emit('operation-progress', payload);
+    if (before) {
+      const tracks = root.querySelector('.wv-art').getAnimations({ subtree: true });
+      window.__waitingCheckpointContinuity = { stableSvg: root.querySelector('svg') === before.svg,
+        stableTracks: tracks.length === before.tracks.length && tracks.every(track => before.tracks.includes(track)),
+        advancing: tracks.some(track => track.playState === 'running') };
+    }
     return payload;
   }, overrides);
 }
@@ -460,6 +479,7 @@ try {
   assert.equal((await renderedState(load)).metric, '1.800 registros');
   assert.equal(await page.locator('#load-bar-fill').evaluate(node => node.parentElement.hidden), true);
   await emitLoadPhase({ phaseId: 'metadata-checkpoint-sync', phase: 'Sincronizando checkpoint (fixture)', completed: 0, total: 0, unit: '' });
+  await page.waitForFunction(() => document.querySelector('#load-visual .waiting-visual')?.dataset.family === 'checkpoint');
   assert.equal((await renderedState(load)).family, 'checkpoint'); assert.equal((await renderedState(load)).metric, null);
   phase = 'real checkpoint pilot: rendered grip and full-cycle evidence';
   await waitMotion('#load-visual .waiting-visual', 'running');
@@ -472,9 +492,11 @@ try {
   await screenshotPose(load, .4, 6800, 'waiting-fixture-checkpoint-light-1440.png', {
     fixture: true, syntheticTransport: true, content: 'Same checkpoint grip in the light theme after real app transitions settle' });
   await emitLoadPhase({ phaseId: 'metadata-checkpoint-committed', phase: 'Checkpoint de metadados preservado (fixture)', completed: 6300, total: 6300, unit: 'bytes', checkpointRows: 1200 });
+  results.partialCheckpointContinuity = await page.evaluate(() => window.__waitingCheckpointContinuity);
+  assert.deepEqual(results.partialCheckpointContinuity, { stableSvg: true, stableTracks: true, advancing: true });
   results.partialCheckpoint = await renderedState(load);
   markVideo('partial-checkpoint', { fixtureReceipt: true });
-  assert.equal(results.partialCheckpoint.family, 'checkpoint'); assert.equal(results.partialCheckpoint.motion, 'static');
+  assert.equal(results.partialCheckpoint.family, 'checkpoint'); assert.equal(results.partialCheckpoint.motion, 'running');
   assert.equal(results.partialCheckpoint.state, 'running'); assert.equal(results.partialCheckpoint.status, 'Checkpoint preservado');
   assert.equal(results.partialCheckpoint.metric, '6.300 / 6.300 bytes');
   assert.equal(await page.locator('#load-overlay').isVisible(), true, 'a preserved partial checkpoint never closes the operation');
@@ -777,8 +799,18 @@ try {
     const evidence = results.componentFixture.robotFamilies[family] = { synthetic: true };
     evidence.shortRig = await inspectTaskRig(fixture, family, 'gesture');
     evidence.shortCapture = await recordSceneCycle(fixture, `${family}-short-gesture`, durationMs, { fixture: true, syntheticTransport: true });
-    assert.deepEqual(evidence.shortCapture.playStates, ['finished'], 'short scene is a single real-duration gesture');
-    assert.equal((await renderedState(fixture)).runningAnimations, 0, 'short scene does not loop without a measured long-wait receipt');
+    assert.deepEqual(evidence.shortCapture.playStates, ['finished'], 'every short track reaches its real-duration endpoint');
+    assert.equal(evidence.shortCapture.finiteEndpoint.isTrusted, true);
+    assert.equal(evidence.shortCapture.finiteEndpoint.elapsedTime * 1000, durationMs);
+    assert.equal((await renderedState(fixture)).pace, 'loop');
+    assert.ok((await renderedState(fixture)).runningAnimations > 0, 'quiet pending work continues automatically after its finite gesture');
+    // A fresh owner provides the finite diagnostic pose after the natural capture.
+    // Do not seek the now-running long loop with short-gesture times.
+    await page.evaluate(() => {
+      window.__waitingRobotReceipt = { ...window.__waitingRobotReceipt, operationId: `${window.__waitingRobotReceipt.operationId}-pose` };
+      window.__waitingFixtureView.update(window.__waitingRobotReceipt);
+    });
+    await waitMotion('#waiting-component-fixture .waiting-visual', 'running');
     await screenshotPose(fixture, family === 'checkpoint' ? .48 : .78, durationMs, `waiting-fixture-${family}-short-dark-1440.png`, {
       fixture: true, content: 'Explicit standalone short gesture at actual 240x120 CSS size; fixture elapsed time is not native progress' });
 

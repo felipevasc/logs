@@ -34,8 +34,13 @@ test('existing controller latch leaves initial reduced scenes static and does no
   assert.match(controller, /moving = current.canAnimate && motionEnabled && !reduced/);
   assert.match(controller, /if \(moving\) root.dataset.animated = 'true'/);
   assert.match(controller, /if \(!current.canAnimate\) root.dataset.animated = 'false'/);
-  assert.match(controller, /control.hidden = !current.canAnimate \|\| reduced/);
-  assert.doesNotMatch(controller, /setTimeout|setInterval|requestAnimationFrame|animation\.currentTime/);
+  assert.match(controller, /control.hidden = finishing \|\| !current.canAnimate \|\| reduced/);
+  const completionStart = controller.indexOf('    function moveCompletion() {');
+  const completionEnd = controller.indexOf('    function complete() {', completionStart);
+  assert.ok(completionStart >= 0 && completionEnd > completionStart);
+  const liveController = controller.slice(0, completionStart) + controller.slice(completionEnd);
+  assert.doesNotMatch(liveController, /setTimeout|setInterval|requestAnimationFrame|animation\.currentTime/);
+  assert.doesNotMatch(controller, /animation\.(?:play|pause)\(/, 'CSS retains pause control even in the legacy completion transfer');
   assert.match(source, /reducedMotion: 'reduce'/);
   assert.match(source, /s\.animated === 'false'.*s\.animations\.length === 0.*!s\.controlVisible/);
   assert.match(source, /manualPaused = true/); assert.match(source, /reducedRound\('manual-pause'\)/);

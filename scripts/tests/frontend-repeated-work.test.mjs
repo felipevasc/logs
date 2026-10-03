@@ -4,8 +4,8 @@ import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 
 const app = readFileSync(new URL('../../frontend/app.js', import.meta.url), 'utf8');
-const native = readFileSync(new URL('../../src-tauri/src/lib.rs', import.meta.url), 'utf8');
-const workspace = readFileSync(new URL('../../src-tauri/src/workspace.rs', import.meta.url), 'utf8');
+const native = readFileSync(new URL('../../src-tauri/src/lib.rs', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+const workspace = readFileSync(new URL('../../src-tauri/src/workspace.rs', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const commands = ['query_page', 'count_filtered', 'stats_events', 'tree_aggs'];
 const section = (source, start, end) => {
   const from = source.indexOf(start), to = source.indexOf(end, from);

@@ -2139,3 +2139,37 @@ fn huge_groupings_return_the_largest_groups_and_the_omitted_totals() {
     let small = query::aggregate(&events[..10], &[], "user", &spec);
     assert_eq!((small.rows.len(), small.omitted_groups, small.omitted_records), (10, 0, 0));
 }
+
+#[test]
+fn triage_cache_only_never_computes_missing_or_changed_sources() {
+    let fixture = Fixture::new(r#"{"timestamp":1700000000000,"message":"ordinary demand-test event"}"#);
+    let state = state_for(crate::SourceData::Indexed(fixture.index("jsonl")));
+    assert!(crate::triage::stored_analysis_mode(&state, None, false, true).err().unwrap().contains("TRIAGE_NOT_CALCULATED"));
+    assert!(crate::triage::timeline_mode(&state, vec![], None, 1, 0, i64::MAX, true).err().unwrap().contains("TRIAGE_NOT_CALCULATED"));
+    let event = crate::event_detail_raw(&state, 0).unwrap();
+    let detail = crate::triage::insights_in_context(&state, &event, None).unwrap();
+    assert!(!detail.related_findings_calculated);
+    assert!(crate::triage::stored_analysis_mode(&state, None, false, true).is_err(), "Opening event details must not create an analysis");
+    let calculated = crate::triage::stored_analysis(&state, None, false).unwrap();
+    let cached = crate::triage::stored_analysis_mode(&state, None, false, true).unwrap();
+    assert_eq!(cached.metadata["analysis_id"], calculated.metadata["analysis_id"]);
+    assert!(crate::triage::insights_in_context(&state, &event, None).unwrap().related_findings_calculated);
+    assert!(crate::triage::timeline_mode(&state, vec![], None, 1, 0, i64::MAX, true).is_ok());
+    let replacement = Fixture::new(r#"{"timestamp":1700000000001,"message":"replacement demand-test event"}"#);
+    let replacement_state = state_for(crate::SourceData::Indexed(replacement.index("jsonl")));
+    assert!(crate::triage::stored_analysis_mode(&replacement_state, None, false, true).err().unwrap().contains("TRIAGE_NOT_CALCULATED"));
+}
+
+#[test]
+fn triage_named_cancellation_does_not_publish_partial_results() {
+    let fixture = Fixture::new(r#"{"timestamp":1700000000000,"message":"cancelled demand-test event"}"#);
+    let state = state_for(crate::SourceData::Indexed(fixture.index("jsonl")));
+    let id = format!("triage-cancel-{}", uuid::Uuid::new_v4());
+    let token = crate::operations::token(Some(id.clone())).unwrap();
+    let outcome = crate::operations::run_with_token(token, || {
+        crate::operations::cancel_id(&id);
+        crate::triage::stored_analysis(&state, None, true)
+    });
+    assert!(outcome.is_err() || outcome.unwrap().is_err());
+    assert!(crate::triage::stored_analysis_mode(&state, None, false, true).err().unwrap().contains("TRIAGE_NOT_CALCULATED"));
+}

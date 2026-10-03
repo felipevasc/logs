@@ -93,6 +93,13 @@ test('preview infrastructure runs full browser coverage and changed tests run di
   contains(planValidation(['scripts/preview/mock-tauri.js']).preview, fullPreview);
   contains(planValidation(['scripts/preview/test-review-workspace.mjs']).preview, ['test-review-workspace.mjs', ...essentialPreview]);
 });
+test('desktop acceptance changes require native checks and never enter the mock runner', () => {
+  const plan = planValidation(['scripts/preview/test-native-desktop.mjs']);
+  assert.equal(plan.native, true);
+  assert.equal(plan.scope, 'full');
+  assert.deepEqual(plan.preview, [...fullPreview].sort());
+  assert.equal(plan.preview.includes('test-native-desktop.mjs'), false);
+});
 test('deleted and renamed preview tests select remaining coverage, never execute missing paths', () => {
   const changes = parseChangedPaths('D\0scripts/preview/test-old.mjs\0A\0scripts/preview/test-new.mjs\0');
   const plan = planValidation(changes.files, changes);
@@ -123,7 +130,10 @@ test('workflow contract retains native and installed-update gates, shares cache 
     assert.match(step, /if: runner.os == 'Windows' && inputs.portable_windows/, name);
   }
   assert.match(build, /run: node scripts\/release\/update-e2e\.mjs/);
-  assert.match(build, /needs: build/);
+  assert.match(build, /needs: \[build, validate\]/);
+  assert.match(build, /name: Full browser regression\s+run: npm run test:preview/);
+  assert.match(build, /run: node scripts\/release\/verify-trigger\.mjs/);
+  assert.match(build, /run: node scripts\/preview\/test-native-desktop\.mjs src-tauri\/target\/release\/loginsight\.exe/);
   assert.match(build, /run: node scripts\/release\/publish\.mjs release-assets/);
   assert.match(checks, /name: Required validation/);
   assert.match(checks, /if: always\(\)/);
@@ -144,4 +154,18 @@ test('the threat pilot uses the shared cross-platform browser launcher and waits
   assert.match(pilot, /import \{ launchBrowser \} from ['"]\.\/browser\.mjs['"]/);
   assert.match(pilot, /await launchBrowser\(/); assert.doesNotMatch(pilot, /chromium\.launch|C:\/Users\/|executablePath/);
   assert.match(pilot, /WorkspaceContext\?\.ready.*!WorkspaceContext\.changing.*!state\.loadOverlay/);
+});
+
+// The combined 0.12.1 matrix reached 20 minutes while still executing the final
+// checks. A workflow timeout must not cancel otherwise valid full coverage.
+test('full browser jobs budget setup and evidence in addition to every regression', () => {
+  for (const [path, job] of [['checks.yml', 'frontend'], ['build.yml', 'validate']]) {
+    const workflow = readFileSync(new URL(`../../.github/workflows/${path}`, import.meta.url), 'utf8');
+    const body = workflow.split(`\n  ${job}:\n`)[1]?.split(/\n  [a-z][a-z_-]*:\n/)[0];
+    assert(body, `${path}: required browser job remains present`);
+    const minutes = Number(body.match(/timeout-minutes: (\d+)/)?.[1]);
+    assert(minutes >= 40 && minutes <= 60, `${path}: browser budget must cover the complete suite with bounded headroom`);
+    assert.match(body, /if: always\(\)/, `${path}: keep failure evidence`);
+    assert.doesNotMatch(body, /continue-on-error/, `${path}: failures stay blocking`);
+  }
 });

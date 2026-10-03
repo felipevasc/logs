@@ -5,11 +5,12 @@ window.CaseEvidenceDetail = (() => {
   const values = new WeakMap(); let active = null;
   const current = model => active === model && model.request === detailRequest && !$("#drawer").hidden && model.guard()
     && (!model.ticket || model.reader.current(model.ticket));
-  const display = (column, text) => window.EvidenceUI ? window.EvidenceUI.redact({ [column]: text })[column] : text;
+  const display = (column, text) => detailRevealed ? text : window.EvidenceUI ? window.EvidenceUI.redact({ [column]: text })[column] : text;
   const focus = anchor => filterFocusTarget(anchor)?.focus?.({ preventScroll: true });
   function clear() {
     if (!active) return;
     const previous = active; active = null;
+    window.ValueInspector?.close();
     if (values.get(detailValueNode)?.model === previous) detailValueReturnFocus = null;
     if ($("#pane-raw").oncontextmenu === previous.rawMenu) $("#pane-raw").oncontextmenu = previous.previousRawMenu || null;
     for (const task of tasks) window.Tasks?.cancelLatest(`preserved:${task}`);
@@ -73,7 +74,7 @@ window.CaseEvidenceDetail = (() => {
   function copy(model, column, anchor, selected = null) {
     return action(model, column, anchor, async (result, owns) => {
       if (!result.present) throw Error("O campo está ausente nesta evidência.");
-      const focusAtWrite = document.activeElement; await navigator.clipboard.writeText(result.text);
+      const focusAtWrite = document.activeElement; await navigator.clipboard.writeText(display(column, result.text));
       if (owns()) { toast("Valor preservado copiado.", "ok"); if (document.activeElement === focusAtWrite) focus(anchor); }
     }, { selected });
   }
@@ -90,6 +91,12 @@ window.CaseEvidenceDetail = (() => {
       detailValueReturnFocus = anchor; detailValueNode = node; detailValueText = result.text ?? "";
       $("#detail-value-title").textContent = column; $("#detail-value-type").textContent = `${result.type || "ausente"} · evidência preservada`;
       $("#detail-value-content").textContent = result.present ? display(column, result.text) : "(campo ausente)";
+      $("#detail-value-inspect")?.remove();
+      if (result.present) {
+        const inspect = el("button", "btn ghost small", "Inspecionar subcampos"); inspect.id = "detail-value-inspect"; inspect.type = "button";
+        inspect.onclick = () => window.ValueInspector?.open(result.text, { label: `${column}${result.complete ? "" : " · prévia limitada"}`, path: `$[${JSON.stringify(column)}]`, revealed: detailRevealed, isCurrent: () => current(model) });
+        $("#detail-value-content").before(inspect);
+      }
       $("#detail-value-modal").hidden = false; $("#detail-value-close").focus();
     });
   }
@@ -138,10 +145,12 @@ window.CaseEvidenceDetail = (() => {
     if (!model.rawMenu) model.previousRawMenu = $("#pane-raw").oncontextmenu;
     model.rawMenu = event => menu(model, "raw", event, selection($("#pane-raw")));
     $("#pane-raw").oncontextmenu = model.rawMenu;
+    mountDetailVisibility({ repaint: () => paint(model), current: () => current(model),
+      inspect: () => window.ValueInspector?.open(data.envelope.text, { label: data.envelope.complete ? "JSON preservado" : "Prévia limitada do JSON preservado", revealed: detailRevealed, isCurrent: () => current(model) }) });
   }
   async function copyEnvelope() {
     const model = active; if (!model || !current(model) || !model.data?.envelope.complete) return false;
-    try { await navigator.clipboard.writeText(model.data.envelope.text); if (current(model)) toast("JSON preservado copiado.", "ok"); return true; }
+    try { await navigator.clipboard.writeText(display("envelope", model.data.envelope.text)); if (current(model)) toast("JSON preservado copiado.", "ok"); return true; }
     catch { if (current(model)) toast("Não foi possível copiar.", "err"); return false; }
   }
   document.addEventListener("keydown", event => {

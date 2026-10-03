@@ -17,7 +17,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     catch { return resourceDefault; }
   };
   const resourceStartup = structuredClone(resourceRead());
-  const resourceBudget = resourceStartup.mode === "custom" ? resourceStartup.memoryLimitMib : 2730;
+  const resourceBudget = resourceStartup.mode === "custom" ? Math.max(128, Math.min(resourceStartup.memoryLimitMib, 8192)) : 2730;
   const resourceStatus = () => {
     const saved = resourceRead();
     return {
@@ -26,7 +26,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
         globalParallelism: Math.min(resourceStartup.parallelismLimit ?? 7, 8), maximumParallelism: 8,
         parserThreads: 4, queryThreadsPerSession: 3, textThreads: 1, environmentOverrideMib: null,
         invalidEnvironmentOverride: false, conservativeBuilder: resourceBudget < 2730 },
-      activePreferences: resourceStartup, saved, minimumMemoryMib: 128, maximumMemoryMib: 4096, maximumParallelism: 8,
+      activePreferences: resourceStartup, saved, minimumMemoryMib: 128, maximumMemoryMib: 8192, maximumParallelism: 8,
       restartRequired: saved.mode !== resourceStartup.mode || saved.memoryLimitMib !== resourceStartup.memoryLimitMib || saved.parallelismLimit !== resourceStartup.parallelismLimit,
       startupWarning: null, savedWarning: null,
     };
@@ -435,6 +435,28 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     return updatePublish();
   };
   const handlers = {
+    resource_snapshot: () => {
+      if (window.__mockResourceSnapshot) return structuredClone(window.__mockResourceSnapshot);
+      const sampledAtMs = Date.now(), startedAtMs = now - 60000;
+      const memory = 16 * 1024 ** 3;
+      const historyLength = Math.min(900, Math.floor((sampledAtMs - startedAtMs) / 1000) + 1);
+      const history = Array.from({ length: historyLength }, (_, index) => {
+        const timestampMs = sampledAtMs - (historyLength - index - 1) * 1000;
+        const phase = (timestampMs - startedAtMs) / 1000;
+        return { timestampMs, appCpuPercent: 8 + 6 * Math.sin(phase / 9), hostCpuPercent: 32 + 14 * Math.sin(phase / 12), appMemoryBytes: 380 * 1024 ** 2 + 12 * 1024 ** 2 * Math.sin(phase / 20), hostMemoryUsedBytes: 7 * 1024 ** 3 + 140 * 1024 ** 2 * Math.sin(phase / 30), readBytesPerSec: 2 * 1024 ** 2 + 1024 ** 2 * Math.sin(phase / 5), writtenBytesPerSec: 200 * 1024 + 100 * 1024 * Math.sin(phase / 6), activeOperations: 1 };
+      });
+      const last = history[history.length - 1];
+      return { preview: true, sampleIntervalMs: 1000, historyLimit: 900, startedAtMs, sampledAtMs, warmingUp: false,
+        host: { os: "Windows · simulação", cpuBrand: "CPU de demonstração", logicalCpus: 8, physicalCores: 4, cpuFrequencyMhz: 3200, totalMemoryBytes: memory, availableMemoryBytes: memory - last.hostMemoryUsedBytes, usedMemoryBytes: last.hostMemoryUsedBytes, totalSwapBytes: 4 * 1024 ** 3, usedSwapBytes: 256 * 1024 ** 2, cpuPercent: last.hostCpuPercent },
+        app: { pid: 4100, processCount: 2, cpuPercent: last.appCpuPercent, oneCoreCpuPercent: last.appCpuPercent * 8, residentBytes: last.appMemoryBytes, virtualBytes: 800 * 1024 ** 2, memoryPercent: 100 * last.appMemoryBytes / memory, readBytesPerSec: last.readBytesPerSec, writtenBytesPerSec: last.writtenBytesPerSec, totalReadBytes: 120 * 1024 ** 2, totalWrittenBytes: 30 * 1024 ** 2 },
+        processes: [{ pid: 4100, parentPid: null, name: "loginsight.exe", role: "Principal", cpuPercent: last.appCpuPercent, residentBytes: last.appMemoryBytes - 80 * 1024 ** 2, virtualBytes: 600 * 1024 ** 2, readBytesPerSec: last.readBytesPerSec, writtenBytesPerSec: last.writtenBytesPerSec, totalReadBytes: 120 * 1024 ** 2, totalWrittenBytes: 30 * 1024 ** 2 }, { pid: 4101, parentPid: 4100, name: "msedgewebview2.exe", role: "WebView", cpuPercent: 0, residentBytes: 80 * 1024 ** 2, virtualBytes: 200 * 1024 ** 2, readBytesPerSec: 0, writtenBytesPerSec: 0, totalReadBytes: 0, totalWrittenBytes: 0 }],
+        history, disks: [{ name: "C:", mountPoint: "C:\\", totalBytes: 512 * 1024 ** 3, availableBytes: 250 * 1024 ** 3, kind: "SSD", readBytesPerSec: null, writtenBytesPerSec: null, isAppVolume: true }],
+        inventory: { memoryKnownBytes: 64 * 1024 ** 2, partial: true, components: [{ id: "query", label: "Cache de consultas", memoryBytes: 16 * 1024 ** 2, mappedBytes: null, storageBytes: null, items: 12, basis: "estimated", note: "Estimativa de estruturas internas; exclui overhead do alocador." }, { id: "source", label: "Fonte carregada", memoryBytes: 48 * 1024 ** 2, mappedBytes: 80 * 1024 ** 2, storageBytes: 80 * 1024 ** 2, items: events.length, basis: "logical", note: "Mapa e disco são tamanhos lógicos; não representam RAM residente." }, { id: "busy", label: "Estrutura ocupada", memoryBytes: null, mappedBytes: null, storageBytes: null, items: null, basis: "unavailable", note: "Lock ocupado; indisponível nesta amostra." }] },
+        storage: { root: "C:\\mock\\LogInsight", bytes: 80 * 1024 ** 2, files: 5, entries: 7, sampledAt: sampledAtMs, elapsedMs: 12, partial: false, stale: false, paths: [{ path: "workspace", bytes: 80 * 1024 ** 2, files: 5, partial: false }], note: "Tamanho lógico dos arquivos do aplicativo; não mede setores físicos." },
+        actions: { active: [{ id: 1, label: "Indexando fonte", state: "active", startedAtMs: sampledAtMs - 3500, elapsedMs: 3500, threadCpuMs: 120, progress: { operation: "index", phase: "Lendo eventos", completed: 5000, total: 6000, unit: "eventos" } }], recent: [{ id: 2, label: "Resumo", state: "completed", startedAtMs: sampledAtMs - 6000, elapsedMs: 700, threadCpuMs: null, progress: null }], untrackedActive: 0, totalCompleted: 3, cpuBasis: "CPU da thread iniciadora; exclui workers Rayon/Tantivy e o renderizador." },
+        notes: ["Prévia do navegador: todos os valores deste painel são simulados.", "RAM residente soma processos próprios e pode contar páginas compartilhadas mais de uma vez.", "GPU, largura de banda da RAM e chipset: medição indisponível."] };
+    },
+
     mcp_configure: ({ enabled }) => { mcpEnabled = enabled; return handlers.mcp_status(); },
     validate_filters: ({filters}) => { for(const f of filters||[]) { if(f.op==="regex") new RegExp(f.value); if(f.op==="query") { const problem = window.QueryLang?.validate(f.value); if (problem) throw new Error(problem); } } return null; },
     cancel_operation: () => { window.__mockGeneration = (window.__mockGeneration || 0) + 1; window.__mockRemoteCancel?.(); return null; },
@@ -621,7 +643,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     ui_zoom: () => false,
     resource_settings_status: () => resourceStatus(),
     resource_settings_save: ({ preferences }) => {
-      const valid = window.ResourceSettings.preferences(preferences.mode, String(preferences.memoryLimitMib), 4096, preferences.parallelismLimit, 8);
+      const valid = window.ResourceSettings.preferences(preferences.mode, String(preferences.memoryLimitMib), 8192, preferences.parallelismLimit, 8);
       if (preferences.schemaVersion !== 1) throw Error("Versão de configuração não suportada.");
       localStorage.setItem("__mockResourceSettings", JSON.stringify(valid));
       return resourceStatus();
@@ -1004,7 +1026,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     return { analysisContext: structuredClone(context), preferences,
       effective: { accountedLimitMib: limit, accountedUsedBytes: 0, workLiveMib: Math.min(limit, 128), materializedMib: Math.min(limit, 64),
         selectionMib: Math.min(limit, 1024), selectionCacheMib: Math.min(limit, 128), collectedIdsMib: Math.min(limit, 32), analyticsMib: Math.min(limit, 32),
-        applicationWorkMib: 128, applicationSelectionMib: 1024 }, minimumWorkMib: 8, maximumWorkMib: 1152,
+        applicationWorkMib: 128, applicationSelectionMib: 1024 }, minimumWorkMib: 8, maximumWorkMib: 8192, maximumEffectiveWorkMib: 1152,
       clamped: preferences.workLimitMib != null && preferences.workLimitMib > 1152 };
   };
   handlers.case_resource_settings_status = ({ identity }) => {
@@ -1015,7 +1037,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
   handlers.case_resource_settings_save = ({ expected, preferences }) => {
     const { context, settings } = interpretationFor({ analysisContext: expected });
     if (preferences.schemaVersion !== 1) throw Error("Versão de recursos do Caso não suportada.");
-    settings.resources = window.ResourceSettings.casePreferences(preferences.mode, String(preferences.workLimitMib), 8192);
+    settings.resources = window.ResourceSettings.casePreferences(preferences.mode, String(preferences.workLimitMib), caseResourceStatus(context).maximumWorkMib);
     saveInterpretation(context, settings);
     return caseResourceStatus(context);
   };

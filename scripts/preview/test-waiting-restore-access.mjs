@@ -153,7 +153,7 @@ async function mountFixture(mode, expectedMotion = 'running') {
     Object.assign(attribution.style, { fontSize: '12px', color: 'var(--text-1)', margin: '0 0 20px' });
     const grid = document.createElement('div'); Object.assign(grid.style, { display: 'flex', gap: '16px', justifyContent: 'center' });
     panel.append(heading, attribution, grid); document.body.append(panel);
-    const fixture = window.__restoreAccessPreview = { views: {}, receipts: {}, svg: {}, observers: [], events: [],
+    const fixture = window.__restoreAccessPreview = { views: {}, receipts: {}, svg: {}, observers: [], events: [], gestureEnds: {},
       application: { loaded: state.loaded, rowCount: state.rows.length }, mode, seed: null, animationIds: new WeakMap(), nextAnimationId: 1 };
     for (const [index, family] of families.entries()) {
       const host = document.createElement('section'); host.id = `restore-access-${family}`;
@@ -176,6 +176,16 @@ async function mountFixture(mode, expectedMotion = 'running') {
       }
       const view = WaitingVisuals.mount(host, receipt, { reactionSeed });
       fixture.views[family] = view; fixture.receipts[family] = receipt; fixture.svg[family] = view.element.querySelector('svg');
+      view.element.addEventListener('animationend', event => {
+        if (event.animationName !== 'wv-gesture-boundary' || event.target !== view.element.querySelector('.wv-work-boundary')) return;
+        const root = view.element, opacity = selector => { const node = root.querySelector(selector); return node ? Number(getComputedStyle(node).opacity) : null; };
+        fixture.gestureEnds[family] = { family, pace: root.dataset.pace, isTrusted: event.isTrusted, elapsedTime: event.elapsedTime,
+          heldOpacity: opacity('.wv-restore-held'), seatedOpacity: opacity('.wv-restore-seated'),
+          stableSvg: root.querySelector('svg') === fixture.svg[family],
+          animations: root.querySelector('.wv-art').getAnimations({ subtree: true }).map(a => ({
+            name: a.animationName, currentTime: a.currentTime, durationMs: a.effect.getComputedTiming().duration,
+            iterations: String(a.effect.getTiming().iterations), playbackRate: a.playbackRate })) };
+      }, true);
       const record = () => ({ family, episode: view.element.dataset.episode, adapter: view.element.dataset.adapter, timeMs: performance.now() });
       let previous = `${view.element.dataset.episode}:${view.element.dataset.adapter}`; fixture.events.push(record());
       const observer = new MutationObserver(() => {
@@ -215,15 +225,16 @@ try {
   browser = await launchBrowser({ timeout: 15000 });
   await openApplication(true); await mountFixture('natural');
   phase = 'short gestures without pickup'; mark('natural-short-start');
-  await page.waitForFunction(() => Object.values(__restoreAccessPreview.views).every(view => {
-    const tracks = view.element.querySelector('.wv-art').getAnimations({ subtree: true });
-    return tracks.length > 0 && tracks.every(a => a.currentTime >= 2400 && a.playState === 'finished');
-  }));
+  await page.waitForFunction(() => ['access', 'restoration'].every(family => __restoreAccessPreview.gestureEnds[family]));
+  results.shortEndpoints = await page.evaluate(() => ['access', 'restoration'].map(family => __restoreAccessPreview.gestureEnds[family]));
   results.short = await states(); assertReceipts(results.short);
-  assert.ok(results.short.every(s => s.pace === 'gesture' && s.animations.every(a => a.durationMs === 2400 && a.iterations === '1' && a.playbackRate === 1)));
-  assert.equal(results.short[1].heldOpacity, 0); assert.equal(results.short[1].seatedOpacity, 1);
+  assert.ok(results.shortEndpoints.every(s => s.isTrusted && s.elapsedTime === 2.4 && s.stableSvg && s.pace === 'gesture'));
+  assert.ok(results.shortEndpoints.every(s => s.animations.every(a => a.durationMs === 2400 && a.iterations === '1' && a.playbackRate === 1)));
+  assert.equal(results.shortEndpoints[1].heldOpacity, 0); assert.equal(results.shortEndpoints[1].seatedOpacity, 1);
+  assert.equal(results.short[1].pace, 'loop', 'restoration promotes at its finite endpoint without another receipt');
+  assert.ok(results.short[1].animations.every(a => a.durationMs === 7200 && a.iterations === 'Infinity'));
 
-  phase = 'same-owner short to long, access remains finite at old global age';
+  phase = 'same-owner age receipt preserves the automatic loop and finite access';
   await page.evaluate(() => {
     const fixture = __restoreAccessPreview;
     for (const family of ['access', 'restoration']) {
@@ -405,6 +416,51 @@ try {
     assert.equal(sample.after.propsPresent, false); assert.equal(sample.after.moving, 0);
   }
   assert.deepEqual(results.terminal.map(s => s.after.state), ['error', 'completed']);
+  phase = 'access retains only the latest pending family until its finite endpoint';
+  await page.evaluate(() => {
+    const fixture = __restoreAccessPreview, host = document.createElement('section');
+    host.id = 'pending-access-fixture'; document.querySelector('#waiting-restore-access-fixture').append(host);
+    const receipt = { operationId: 'pending-access-owner', phaseId: 'metadata-lock', state: 'running', elapsedMs: 0 };
+    const view = WaitingVisuals.mount(host, receipt), root = view.element;
+    const pending = fixture.pendingAccess = { view, receipt, svg: root.querySelector('svg'), endpoint: null };
+    root.addEventListener('animationend', event => {
+      if (event.animationName !== 'wv-gesture-boundary' || event.target !== root.querySelector('.wv-work-boundary')) return;
+      pending.endpoint = { isTrusted: event.isTrusted, elapsedTime: event.elapsedTime, family: root.dataset.family,
+        stableSvg: root.querySelector('svg') === pending.svg,
+        stableTracks: root.querySelector('.wv-art').getAnimations({ subtree: true }).every(a => pending.tracks.includes(a)) };
+    }, true);
+  });
+  await page.waitForFunction(() => {
+    const root = __restoreAccessPreview.pendingAccess.view.element, tracks = root.querySelector('.wv-art').getAnimations({ subtree: true });
+    return root.dataset.motion === 'running' && tracks.length > 0 && tracks.every(a => a.currentTime >= 600);
+  });
+  results.pendingAccessReceipt = await page.evaluate(() => {
+    const pending = __restoreAccessPreview.pendingAccess, root = pending.view.element;
+    pending.tracks = root.querySelector('.wv-art').getAnimations({ subtree: true });
+    const beforeTimes = pending.tracks.map(a => a.currentTime);
+    for (const phaseId of ['metadata-restore', 'metadata-scan', 'metadata-checkpoint-sync'])
+      pending.view.update({ ...pending.receipt, phaseId, elapsedMs: 120000, label: `Latest ${phaseId}` });
+    const after = root.querySelector('.wv-art').getAnimations({ subtree: true });
+    return { family: root.dataset.family, pace: root.dataset.pace, status: root.querySelector('.wv-status').textContent,
+      stableSvg: root.querySelector('svg') === pending.svg,
+      stableTracks: after.length === pending.tracks.length && after.every(a => pending.tracks.includes(a)),
+      beforeTimes, afterTimes: after.map(a => a.currentTime) };
+  });
+  assert.equal(results.pendingAccessReceipt.family, 'access'); assert.equal(results.pendingAccessReceipt.pace, 'gesture');
+  assert.equal(results.pendingAccessReceipt.status, 'Latest metadata-checkpoint-sync');
+  assert.ok(results.pendingAccessReceipt.stableSvg && results.pendingAccessReceipt.stableTracks);
+  assert.deepEqual(results.pendingAccessReceipt.afterTimes, results.pendingAccessReceipt.beforeTimes);
+  await page.waitForFunction(() => __restoreAccessPreview.pendingAccess.view.element.dataset.family === 'checkpoint');
+  results.pendingAccessApplied = await page.evaluate(() => {
+    const pending = __restoreAccessPreview.pendingAccess, root = pending.view.element;
+    return { endpoint: pending.endpoint, family: root.dataset.family, pace: root.dataset.pace,
+      replacedSvg: root.querySelector('svg') !== pending.svg,
+      freshTracks: root.querySelector('.wv-art').getAnimations({ subtree: true }).every(a => !pending.tracks.includes(a)) };
+  });
+  assert.deepEqual(results.pendingAccessApplied.endpoint, { isTrusted: true, elapsedTime: 2.4, family: 'access', stableSvg: true, stableTracks: true });
+  assert.equal(results.pendingAccessApplied.family, 'checkpoint'); assert.equal(results.pendingAccessApplied.pace, 'loop');
+  assert.ok(results.pendingAccessApplied.replacedSvg && results.pendingAccessApplied.freshTracks);
+  await page.evaluate(() => { __restoreAccessPreview.pendingAccess.view.destroy(); document.querySelector('#pending-access-fixture').remove(); });
   results.applicationUnchanged = await page.evaluate(() => JSON.stringify(__restoreAccessPreview.application)
     === JSON.stringify({ loaded: state.loaded, rowCount: state.rows.length }));
   assert.equal(results.applicationUnchanged, true);

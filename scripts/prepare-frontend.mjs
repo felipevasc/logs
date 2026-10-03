@@ -20,6 +20,7 @@ for (const item of [
   "case-evidence-preserved.js", "case-evidence-items.js", "case-evidence-actions.js",
   "case-evidence-detail.js", "case-evidence-timeline.js", "case-evidence-display.js",
   "case-evidence-transfer.js", "case-evidence-recovery.js", "resource-settings.js", "resource-settings.css",
+  "resources.js", "resources.css", "value-inspector.js",
 ]) {
   cpSync(resolve(source, item), resolve(output, item), { recursive: true });
 }

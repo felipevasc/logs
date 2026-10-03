@@ -26,7 +26,7 @@ function fixture() {
       if (cmd === 'detection_rules') { const pending = deferred(); requests.push({ ...pending, options }); return pending.promise; }
       helper.assertOwner(options.analysisOwner); mutations.push({ cmd, args: structuredClone(args), owner: options.analysisOwner }); active.revision++;
       return Promise.resolve({ analysisContext: { caseId: active.caseId }, imported: 1, rules: 1, failed: [] });
-    }, results: new Map(), names: new Map(), structuredClone, esc: String, fmtNum: String,
+    }, results: new Map(), invalidate() {}, names: new Map(), structuredClone, esc: String, fmtNum: String,
     el: kind => { const node = new Node(kind); nodes.push(node); return node; }, toast() {}, cached: () => null,
     evidence: () => ({ label: String }), dialogApi: { open: () => { const pending = deferred(); selections.push(pending); return pending.promise; } }, confirm: () => true,
   });

@@ -78,6 +78,11 @@ mod reference_lookup;
 mod remote;
 mod resources;
 mod resource_settings;
+mod resource_actions;
+mod resource_inventory;
+mod resource_io;
+mod resource_monitor;
+mod resource_system;
 mod sigma;
 mod sources;
 mod source_publication;
@@ -160,7 +165,13 @@ fn emit_progress(
         "operation-progress",
         OperationProgress {
             operation_id: operations::current_id(),
-            phase_id: phase.into(),
+            phase_id: match (operation, phase) {
+                ("carregamento", "Preparando arquivo" | "Preparando entrada para indexação") => "source-prepare",
+                ("carregamento", "Indexando linhas") => "source-indexed",
+                ("carregamento", "Ativando fonte carregada") => "source-activate",
+                ("carregamento", "Concluído" | "Pronto") => "source-settle",
+                _ => phase,
+            }.into(),
             operation: operation.into(),
             phase: phase.into(),
             completed,
@@ -203,7 +214,11 @@ where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
 async fn offload_operation_priority<T, F>(operation_id: Option<String>, priority: global_scheduler::Priority, f: F) -> Result<T, String>
 where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
     let token = operations::token(operation_id)?.with_priority(priority);
-    tauri::async_runtime::spawn_blocking(move || operations::run_with_token(token, f))
+    let label = resource_monitor::operation_label::<F>();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _action = resource_actions::begin(label);
+        operations::run_with_token(token, f)
+    })
         .await.map_err(|e| e.to_string())?
 }
 
@@ -265,7 +280,10 @@ where T: Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
 async fn offload_case_input<T, P, F>(operation_id: Option<String>, app: AppHandle, admitted: std::sync::Arc<analysis_runtime::Admitted>, priority: global_scheduler::Priority, input: P, f: F) -> Result<T, String>
 where T: Send + 'static, P: FnOnce(&analysis_runtime::Admitted) -> Result<Option<Vec<Event>>, String> + Send + 'static, F: FnOnce(Option<Vec<Event>>) -> T + Send + 'static {
     let token = admitted.take_operation(operation_id, priority)?;
-    tauri::async_runtime::spawn_blocking(move || operations::run_with_token(token, || {
+    let label = resource_monitor::operation_label::<F>();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _action = resource_actions::begin(label);
+        operations::run_with_token(token, || {
         admitted.validate(app.state::<AppState>().inner())?;
         let progress_app = app.clone();
         analysis_runtime::with(Some(admitted.clone()), || operations::with_reporter(std::sync::Arc::new(move |progress| {
@@ -280,7 +298,8 @@ where T: Send + 'static, P: FnOnce(&analysis_runtime::Admitted) -> Result<Option
             admitted.schedule_derived_variant(app.state::<AppState>().inner());
             Ok(result)
         }))
-    })).await.map_err(|error| error.to_string())??
+        })
+    }).await.map_err(|error| error.to_string())??
 }
 
 #[tauri::command]
@@ -546,6 +565,28 @@ pub(crate) fn load_file_impl(
     })
 }
 
+// Human labels remain display text; only stable IDs cross the scene protocol.
+fn engine_progress_phase_id(phase: &str) -> &'static str {
+    match phase {
+        "Validando índices salvos" => "engine-validate",
+        "Índices salvos validados" => "engine-validated",
+        "Retomando índices; partes ausentes ou inválidas" => "engine-restore",
+        "Preparando índices ausentes ou inválidos" => "engine-prepare",
+        "Escolhendo colunas" => "engine-columns",
+        "Convertendo e indexando registros" => "engine-index",
+        "Confirmando gravação do checkpoint" => "engine-checkpoint-write",
+        "Concluindo e unindo o índice de texto" => "engine-text-merge",
+        "Sincronizando checkpoint no disco" => "engine-checkpoint-sync",
+        "Publicando checkpoint validado" => "engine-checkpoint-publish",
+        "Checkpoint concluído e validado" => "engine-checkpoint-committed",
+        "Abrindo índices salvos" | "Abrindo índices preparados" => "engine-open",
+        "Consultas prontas" => "engine-ready",
+        "Interrompido; checkpoints concluídos preservados" => "engine-cancelled",
+        "Motor de linhas ativo; preparação pode ser retomada" | "Motor de linhas ativo" => "engine-degraded",
+        _ => "engine-unknown",
+    }
+}
+
 /// Builds the query engine's stores for newly indexed files (cached per
 /// file), so the first queries are already fast. Opening takes longer once.
 pub(crate) fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Option<&AppHandle>) -> Result<(), String> {
@@ -563,7 +604,7 @@ pub(crate) fn prepare_engine(state: &AppState, idx: &sources::FileIndex, app: Op
             phase.1.elapsed().as_millis() as u64
         };
         let _ = app.emit("operation-progress", serde_json::json!({
-            "operationId": operation_id, "operation": "carregamento", "phaseId": p.phase,
+            "operationId": operation_id, "operation": "carregamento", "phaseId": engine_progress_phase_id(&p.phase),
             "phase": p.phase, "completed": p.completed, "total": p.total, "unit": "registros",
             "cancellable": p.state == "indexing", "state": p.state,
             "checkpointRows": p.checkpoint_rows, "completedSegments": p.completed_segments,
@@ -2090,6 +2131,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(updates)
+        .manage(resource_monitor::ResourceMonitor::new())
         .on_window_event(updates::on_window_event)
         .manage(AppState {
             source: RwLock::new(SourceData::None),
@@ -2109,6 +2151,7 @@ pub fn run() {
             mcp_token,
         ))
         .setup(move |app| {
+            app.state::<resource_monitor::ResourceMonitor>().start(app.handle().clone());
             // No startup catalog writes/automatic harvest. The local v0.11
             // migration must see original profile files unchanged; explicit
             // harvest saves only the selected Case after migration and CAS.
@@ -2126,6 +2169,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            resource_monitor::resource_snapshot,
             ui_zoom,
             resource_settings::resource_settings_status,
             resource_settings::resource_settings_save,
@@ -2270,8 +2314,13 @@ pub fn run() {
             updates::update_skip,
             updates::update_open_page,
         ])
-        .run(context)
-        .expect("erro ao iniciar o LogInsight");
+        .build(context)
+        .expect("erro ao iniciar o LogInsight")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<resource_monitor::ResourceMonitor>().stop();
+            }
+        });
 }
 
 #[cfg(test)]

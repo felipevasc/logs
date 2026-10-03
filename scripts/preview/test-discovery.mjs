@@ -1,6 +1,7 @@
 import { launchBrowser } from './browser.mjs';
 import { captureFailure } from './diagnostics.mjs';
 import { mkdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
 const browser = await launchBrowser();
@@ -23,7 +24,7 @@ try {
   await page.locator('#drawer .discovery-rank').first().waitFor();
   const drawer=await page.locator('#drawer').boundingBox();assert(drawer.x<side.x && drawer.x+drawer.width>=side.x+side.width-1,'Detalhes sobrepõem os campos');
   assert.match(await page.locator('#drawer').innerText(),/6.000 registros/);
-  await page.screenshot({path:new URL('campos-top10.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.screenshot({path:fileURLToPath(new URL('campos-top10.png',shots))});
   await page.locator('#drawer .discovery-rank').first().click();
   await page.waitForFunction(()=>state.total===2000);assert.equal(await page.locator('#drawer').isVisible(),false);
   await page.locator('#events-table tbody tr').first().locator('td').last().click({button:'right'});
@@ -38,7 +39,7 @@ try {
   await page.getByRole('button',{name:'Visão geral',exact:true}).click();await waitAnalysis();
   assert.equal(await page.locator('.discovery-card').count(),4);
   assert(await page.locator('.discovery-card').first().evaluate(n=>n.scrollHeight<=n.clientHeight+1),'Gráfico não deve cortar legenda/ações');
-  await page.screenshot({path:new URL('descobrir-panorama.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.screenshot({path:fileURLToPath(new URL('descobrir-panorama.png',shots))});
   await page.getByRole('button',{name:'Frequências',exact:true}).click();await waitAnalysis();
   assert(await page.locator('.cross-segment').count()>0,'Frequências cruzadas mostram distribuição por grupo');
   await page.locator('.cross-segment').first().click();await page.waitForFunction(()=>state.filters.length===2&&Number.isFinite(state.total)&&state.total<6000&&document.querySelector('#events-table').getAttribute('aria-busy')==='false');
@@ -54,7 +55,7 @@ try {
   await page.getByRole('button',{name:'O que se destaca no maior pico?',exact:true}).first().click();
   await page.waitForFunction(()=>document.querySelectorAll('.peak-table tbody tr').length>0&&!document.querySelector('.peak-context')?.textContent.includes('Comparando…'));
   assert.doesNotMatch(await page.locator('.peak-table').first().innerText(),/NaN|undefined/);
-  await page.screenshot({path:new URL('pico-contextual.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.screenshot({path:fileURLToPath(new URL('pico-contextual.png',shots))});
   await page.locator('.peak-table .text-button').first().click();await page.waitForFunction(()=>state.filters.some(f=>f.column==='timestamp')&&state.filters.length===2);
   await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
   await page.locator('#tabbtn-dashboard').click();await page.getByRole('button',{name:'No tempo',exact:true}).click();await waitAnalysis();
@@ -84,7 +85,7 @@ try {
   assert(await page.locator('.dot-cell').evaluateAll(nodes=>new Set(nodes.map(n=>n.style.getPropertyValue('--dot-fill'))).size>1),'Cor expressa outra medida');
   assert(await page.locator('.dot-cell').evaluateAll(nodes=>new Set(nodes.map(n=>n.querySelector('circle').getAttribute('stroke-width'))).size>1),'Borda expressa terceira medida');
   await page.getByLabel('Detalhe do mapa',{exact:true}).selectOption('12');await waitAnalysis();
-  await page.screenshot({path:new URL('mapa-calor-contextual.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.screenshot({path:fileURLToPath(new URL('mapa-calor-contextual.png',shots))});
   await page.locator('.discovery-heat-cell').first().click();await page.waitForFunction(()=>state.filters.some(f=>f.column==='timestamp')&&state.total>0&&state.total<6000&&state.rows.every(e=>state.filters.every(f=>jsMatchFilter(e,f))));
   assert(await page.evaluate(()=>state.filters.length===2),'Círculo filtra categoria e período');
   assert(await page.evaluate(()=>state.rows.every(e=>state.filters.every(f=>jsMatchFilter(e,f)))),'Célula retorna somente os registros da combinação');
@@ -102,7 +103,7 @@ try {
   assert.match(await page.locator('#analysis-help').innerText(),/Indicações para investigar/);
   await page.keyboard.press('Tab');assert.equal(await page.locator('#analysis-help button').evaluate(n=>n===document.activeElement),true);
   await page.keyboard.press('Escape');assert.equal(await page.locator('#analysis-help').isVisible(),false);
-  await page.screenshot({path:new URL('desvio-contextual.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.screenshot({path:fileURLToPath(new URL('desvio-contextual.png',shots))});
   await page.getByRole('button',{name:'Ver desvio',exact:true}).first().click();await page.waitForFunction(()=>state.filters.length>=3&&state.total>0&&state.total<6000);
   assert(await page.evaluate(()=>state.rows.every(e=>state.filters.every(f=>jsMatchFilter(e,f)))),'Desvio preserva contexto, horário e resultado');
   await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);
@@ -116,7 +117,7 @@ try {
   assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Sem rolagem horizontal da janela');
   await page.locator('#btn-side-toggle').click();assert.equal(await page.locator('#btn-side-toggle').getAttribute('aria-expanded'),'false');
   await page.locator('#btn-side-toggle').click();
-  await page.locator('#btn-theme').click();await page.screenshot({path:new URL('descobrir-claro-1024.png',shots).pathname.replace(/^\/([A-Z]:)/,'$1')});
+  await page.locator('#btn-theme').click();await page.screenshot({path:fileURLToPath(new URL('descobrir-claro-1024.png',shots))});
   await page.locator('#quick-search').fill('__no_such_record_987654__');await page.locator('#quick-search').press('Enter');await page.waitForFunction(()=>state.total===0);await waitAnalysis();
   assert.match(await page.locator('#dash-grid').innerText(),/Sem horários|Nenhum campo|Sem valores/);
   await page.locator('#btn-clear-filters').click();await page.waitForFunction(()=>state.total===6000);

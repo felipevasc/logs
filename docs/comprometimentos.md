@@ -2,7 +2,15 @@
 
 A navegação de **Análise** e **Caso** contém a página **Comprometimentos**. Ela usa todos os registros carregados na Análise ou todos os registros preservados no Caso ativo, inclusive de outras estações. Filtros de coluna, busca, período e estação do Explorar não selecionam os achados desta página. Os demais painéis continuam com seus recortes habituais.
 
-O Resumo exibe apenas um gráfico dos indícios de comprometimento por nível. Cada barra conta **achados naquele nível**, não eventos nem episódios. O botão abre a página; clicar em uma barra escolhe aquele nível mínimo. A página abre inicialmente em **Quase confirmado**. O controle é cumulativo e preserva sua seleção no mesmo universo. Trocar de conjunto ou Caso reinicia a seleção.
+## Cálculo sob demanda
+
+Importar logs, abrir ou trocar de Caso e navegar pelo Resumo, Comprometimentos ou Timeline **não inicia o cálculo**. Use **Calcular comprometimentos** no Resumo ou na página, ou a ação **Recalcular triagem** da paleta de comandos. Enquanto não houver cálculo, a interface informa **ainda não calculados**, sem confundir isso com uma análise concluída sem indícios.
+
+O cálculo tem estado de execução e cancelamento; cliques repetidos e voltar à página compartilham a mesma operação. Cancelar interrompe cooperativamente o trabalho nativo e nunca aplica uma resposta parcial ou atrasada. Trocar de Caso ou alterar dados/regras impede que a resposta antiga entre no contexto novo. Falhas têm uma ação explícita para tentar novamente.
+
+Resultados válidos da sessão são reaproveitados ao navegar. Os resultados salvos no disco continuam disponíveis para reaproveitamento quando um cálculo é solicitado, sem forçar nova varredura. Alterar fontes, evidências ou regras marca o resultado como **desatualizado**; nenhuma atualização dispara novo cálculo. Paginação e marcadores da Timeline consultam somente resultados existentes e pedem novo cálculo se o cache expirar. Os detalhes de cada evento continuam com normalização e regras locais; correlações do conjunto só aparecem se já calculadas. O resultado de um Caso não aparece em outro.
+
+Depois do cálculo, o Resumo exibe um gráfico dos indícios de comprometimento por nível. Cada barra conta **achados naquele nível**, não eventos nem episódios. O botão abre a página; clicar em uma barra escolhe aquele nível mínimo. A página abre inicialmente em **Quase confirmado**. O controle é cumulativo e preserva sua seleção no mesmo universo. Trocar de conjunto ou Caso reinicia a seleção.
 
 | Valor do contrato | Nome na interface e nos relatórios |
 |---|---|

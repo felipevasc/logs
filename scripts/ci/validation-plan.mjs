@@ -5,19 +5,22 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 export const fullPreview = [
+  'test-resources.mjs', 'test-value-inspector.mjs', 'test-case-autosave.mjs',
   'test-navigation.mjs', 'test-ui-scale.mjs', 'test-resource-settings.mjs', 'test-workspace-context.mjs',
-  'test-responsiveness.mjs', 'test-journeys.mjs', 'test-threats.mjs', 'test-remote-sources.mjs',
+  'test-responsiveness.mjs', 'test-journeys.mjs', 'test-threats.mjs', 'test-security-on-demand.mjs', 'test-remote-sources.mjs',
   'test-analysis-workbench.mjs', 'test-discovery.mjs', 'test-updates.mjs',
   'test-explorer-timeline.mjs', 'test-field-transform.mjs', 'test-exclusion-archive.mjs',
   'test-case-references.mjs', 'test-canonical-field-actions.mjs', 'test-java-trace.mjs',
   'test-native-case-startup.mjs', 'test-native-case-timeline.mjs',
-  'test-context-menu.mjs', 'test-waiting-visuals.mjs', 'test-waiting-reactions.mjs', 'test-waiting-verification.mjs', 'test-waiting-manual.mjs', 'test-waiting-boundaries.mjs', 'test-waiting-reduced-motion.mjs', 'test-waiting-restore-access.mjs', 'test-waiting-micro-reactions.mjs', 'test-toast-feedback.mjs', 'test-record-actions.mjs', 'test-export-scope.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs', 'test-columns.mjs', 'test-source-actions.mjs', 'test-settings-codes.mjs', 'test-timestamp-editor.mjs',
+  'test-context-menu.mjs', 'test-waiting-visuals.mjs', 'test-waiting-reactions.mjs', 'test-waiting-verification.mjs', 'test-waiting-manual.mjs', 'test-waiting-boundaries.mjs', 'test-waiting-playback.mjs', 'test-waiting-completion-fallback.mjs', 'test-waiting-reduced-motion.mjs', 'test-waiting-restore-access.mjs', 'test-waiting-micro-reactions.mjs', 'test-toast-feedback.mjs', 'test-record-actions.mjs', 'test-export-scope.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs', 'test-columns.mjs', 'test-source-actions.mjs', 'test-settings-codes.mjs', 'test-timestamp-editor.mjs',
 ];
 export const essentialPreview = [
   'test-navigation.mjs', 'test-responsiveness.mjs', 'test-updates.mjs',
   'test-case-references.mjs', 'test-native-case-startup.mjs', 'test-native-case-timeline.mjs',
 ];
 const affected = [
+  [/^frontend\/resources\.(?:js|css)$/, ['test-resources.mjs']],
+  [/^frontend\/value-inspector\.js$/, ['test-value-inspector.mjs']],
   [/^frontend\/(?:analysis-|discovery|event-insights)/, ['test-analysis-workbench.mjs', 'test-discovery.mjs']],
   [/^frontend\/(?:canonical-fields|detail-fields|entity-menu|query-|field-transform)/, ['test-field-transform.mjs', 'test-canonical-field-actions.mjs']],
   [/^frontend\/(?:exclusion-|case-removals)/, ['test-exclusion-archive.mjs']],
@@ -25,14 +28,14 @@ const affected = [
   [/^frontend\/timeline-export\./, ['test-timeline-export-waiting.mjs']],
   [/^frontend\/(?:java-trace)/, ['test-java-trace.mjs']],
   [/^frontend\/(?:journeys|case-trails|participants-ui)/, ['test-journeys.mjs']],
-  [/^frontend\/(?:threats|security)/, ['test-journeys.mjs', 'test-threats.mjs']],
+  [/^frontend\/(?:threats|security)/, ['test-journeys.mjs', 'test-threats.mjs', 'test-security-on-demand.mjs']],
   [/^frontend\/remote-sources/, ['test-remote-sources.mjs']],
   [/^frontend\/workspace/, ['test-waiting-reduced-motion.mjs', 'test-waiting-restore-access.mjs', 'test-waiting-micro-reactions.mjs', 'test-workspace-context.mjs', 'test-export-scope.mjs', 'test-source-actions.mjs', 'test-timestamp-editor.mjs']],
   [/^frontend\/case-report\./, ['test-case-report-waiting.mjs']],
   [/^frontend\/(?:ui-scale|styles|index\.html)/, ['test-ui-scale.mjs']],
   [/^frontend\/resource-settings\.(?:js|css)$/, ['test-resource-settings.mjs']],
   [/^frontend\/(?:context-menu|command-palette)/, ['test-navigation.mjs', 'test-context-menu.mjs', 'test-source-actions.mjs']],
-  [/^frontend\/(?:waiting-|tasks)/, ['test-responsiveness.mjs', 'test-waiting-visuals.mjs', 'test-waiting-reactions.mjs', 'test-waiting-verification.mjs', 'test-waiting-manual.mjs', 'test-waiting-boundaries.mjs', 'test-waiting-reduced-motion.mjs', 'test-waiting-restore-access.mjs', 'test-waiting-micro-reactions.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs']],
+  [/^frontend\/(?:waiting-|tasks)/, ['test-responsiveness.mjs', 'test-waiting-visuals.mjs', 'test-waiting-reactions.mjs', 'test-waiting-verification.mjs', 'test-waiting-manual.mjs', 'test-waiting-boundaries.mjs', 'test-waiting-playback.mjs', 'test-waiting-completion-fallback.mjs', 'test-waiting-reduced-motion.mjs', 'test-waiting-restore-access.mjs', 'test-waiting-micro-reactions.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs']],
 ];
 const nativePath = /^(?:src-tauri\/|\.github\/|\.cargo\/|rust-toolchain(?:\.toml)?$|package(?:-lock)?\.json$|scripts\/(?:ci\/|release\/|tauri-build\.mjs$|prepare-frontend\.mjs$))/;
 const documentationPath = /^(?:docs\/|README\.md$|LICENSE(?:\.[^/]*)?$|\.gitignore$|\.gitattributes$)/;
@@ -56,6 +59,9 @@ export function planValidation(files, { full = false, deleted = [] } = {}) {
     // safely narrow its browser coverage, but it does not require Rust rebuilds.
     if (/^frontend\/(?:app\.js|index\.html|styles\.css|analysis-context\.js|performance-core\.js)$/.test(path)) { broad = true; continue; }
     if (/^scripts\/tests\//.test(path)) continue; // all Node tests always run
+    if (path === 'scripts/preview/test-native-desktop.mjs') {
+      native = true; broad = true; continue; // real Windows executable, never mock Chromium
+    }
     const previewTest = path.match(/^scripts\/preview\/(test-[a-z0-9-]+\.mjs)$/);
     if (previewTest) {
       if (removed.has(path)) broad = true;

@@ -44,6 +44,7 @@ pub(crate) fn elapsed_ms() -> Option<u64> {
     REPORT_START.with(|s| s.get().map(|at| at.elapsed().as_millis() as u64))
 }
 pub(crate) fn report_progress(operation: &'static str, phase_id: &'static str, phase: &'static str, completed: usize, total: usize, unit: &'static str, selected: usize) {
+    crate::resource_actions::phase(operation, phase, completed, total, unit);
     let reporter = REPORTER.with(|r| r.borrow().clone());
     if let Some(reporter) = reporter {
         let clock = REPORT_PHASE.with(|state| state.borrow_mut().get_or_insert_with(|| Arc::new(Mutex::new(None))).clone());

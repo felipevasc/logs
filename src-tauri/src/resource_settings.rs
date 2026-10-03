@@ -48,7 +48,7 @@ impl Preferences {
         }
         match (&self.mode, self.memory_limit_mib) {
             (Mode::Automatic, None) => Ok(()),
-            (Mode::Custom, Some(value)) if (128..=maximum).contains(&value) => Ok(()),
+            (Mode::Custom, Some(value)) if (128..=maximum.min(crate::resources::MAX_MEMORY_PREFERENCE_MIB)).contains(&value) => Ok(()),
             (Mode::Automatic, Some(_)) => {
                 Err("O modo Automático não aceita orçamento personalizado.".into())
             }
@@ -139,7 +139,7 @@ fn read(directory: &Path) -> Result<Preferences, String> {
         .map_err(|_| "Configuração de recursos inválida.".to_string())?;
     // A profile may have moved to a smaller machine. Retain a valid preference;
     // Budget::for_machine clamps the active value to this machine's safe range.
-    value.validate(8192)?;
+    value.validate(crate::resources::MAX_MEMORY_PREFERENCE_MIB)?;
     Ok(value)
 }
 fn read_or_default(directory: &Path) -> (Preferences, Option<String>) {
@@ -306,8 +306,39 @@ mod tests {
     #[test]
     fn moved_profile_retains_preference_for_resource_clamping() {
         let dir = tempfile::tempdir().unwrap();
-        persist(dir.path(), &custom(8192), 8192).unwrap();
-        assert_eq!(read(dir.path()).unwrap(), custom(8192));
+        for value in [8192, 65536, 131072] {
+            persist(dir.path(), &custom(value), value).unwrap();
+            assert_eq!(read(dir.path()).unwrap(), custom(value));
+            assert_eq!(Startup::load(dir.path()).preferences, custom(value));
+            assert!(persist(dir.path(), &custom(value), 4096).is_err());
+            assert_eq!(read(dir.path()).unwrap(), custom(value), "a smaller machine must not discard the original preference");
+        }
+        let too_large = custom(crate::resources::MAX_MEMORY_PREFERENCE_MIB + 1);
+        std::fs::write(dir.path().join(FILE), serde_json::to_vec(&too_large).unwrap()).unwrap();
+        assert!(read(dir.path()).is_err());
+    }
+    #[test]
+    fn case_status_separates_saved_preference_detected_maximum_and_effective_pools() {
+        let mut settings = crate::case_interpretation::Settings::default();
+        let requested = crate::resources::MAX_MEMORY_PREFERENCE_MIB;
+        settings.resources = crate::case_resources::Preferences {
+            schema_version: 1, mode: crate::case_resources::Mode::Custom, work_limit_mib: Some(requested),
+        };
+        let snapshot = crate::analysis_context::Snapshot {
+            schema_version: 1, case_id: "resource-status".into(), analysis_id: uuid::Uuid::new_v4().to_string(),
+            config_revision: 0, visibility_revision: 0, config: Default::default(), interpretation: Some(settings),
+            migration_diagnostics: Vec::new(), legacy_raw: None,
+        };
+        let status = case_status(snapshot).unwrap();
+        assert_eq!(status.preferences.work_limit_mib, Some(requested));
+        assert_eq!(status.maximum_work_mib, crate::resources::total_memory() / (1 << 20));
+        assert_eq!(status.maximum_effective_work_mib, crate::case_resources::effective_maximum_work_mib());
+        assert_eq!(status.effective["accountedLimitMib"].as_u64(), Some(status.maximum_effective_work_mib));
+        assert!(status.clamped);
+        assert!(status.preferences.validate_for_machine(status.maximum_work_mib).is_err());
+        let mut allowed = status.preferences;
+        allowed.work_limit_mib = Some(status.maximum_work_mib);
+        assert!(allowed.validate_for_machine(status.maximum_work_mib).is_ok());
     }
     #[test]
     fn failed_replace_preserves_existing_destination_and_cleans_temporary() {
@@ -357,18 +388,20 @@ pub(crate) struct CaseStatus {
     effective: serde_json::Value,
     minimum_work_mib: u64,
     maximum_work_mib: u64,
+    maximum_effective_work_mib: u64,
     clamped: bool,
 }
 fn case_status(snapshot: crate::analysis_context::Snapshot) -> Result<CaseStatus, String> {
     let preferences = snapshot.interpretation.as_ref().map(|settings| settings.resources.clone()).unwrap_or_default();
     let policy = crate::case_resources::Policy::capture(Some(&snapshot.identity()), &preferences)?;
     let effective = policy.snapshot();
-    let application = effective["applicationWorkMib"].as_u64().unwrap_or(0)
-        .saturating_add(effective["applicationSelectionMib"].as_u64().unwrap_or(0));
+    let maximum = crate::case_resources::maximum_work_mib();
+    let effective_maximum = crate::case_resources::effective_maximum_work_mib();
     Ok(CaseStatus {
-        clamped: preferences.work_limit_mib.is_some_and(|requested| requested > application),
+        clamped: preferences.work_limit_mib.is_some_and(|requested| requested > effective_maximum),
         analysis_context: snapshot, preferences, effective,
-        minimum_work_mib: 8, maximum_work_mib: application.min(8192),
+        minimum_work_mib: 8, maximum_work_mib: maximum,
+        maximum_effective_work_mib: effective_maximum,
     })
 }
 #[tauri::command]
@@ -378,7 +411,7 @@ pub(crate) fn case_resource_settings_status(identity: crate::analysis_context::I
 }
 #[tauri::command]
 pub(crate) fn case_resource_settings_save(expected: crate::analysis_context::Identity, preferences: crate::case_resources::Preferences) -> Result<CaseStatus, String> {
-    preferences.validate()?;
+    preferences.validate_for_machine(crate::case_resources::maximum_work_mib())?;
     let snapshot = crate::case_interpretation::update(&expected, |settings| {
         settings.resources = preferences;
         Ok(())

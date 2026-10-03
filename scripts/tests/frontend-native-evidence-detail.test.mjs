@@ -11,7 +11,7 @@ const deferred=()=>{let resolve;const promise=new Promise(yes=>resolve=yes);retu
 const settle=async()=>{for(let index=0;index<30;index++)await Promise.resolve();};
 function descendants(node){return node.children.flatMap(child=>[child,...descendants(child)]);}
 async function fixture(){
-  const roots=new Map(),calls=[],copied=[],menus=[],filters=[],messages=[],cancelled=[],java=[];let live=documentValue(),next=data(),exact='1.0',clipboard=async text=>copied.push(text),selection=null,previewOverride=null;
+  const roots=new Map(),calls=[],copied=[],menus=[],filters=[],messages=[],cancelled=[],java=[],inspections=[];let live=documentValue(),next=data(),exact='1.0',clipboard=async text=>copied.push(text),selection=null,previewOverride=null,inspectorOpen=false;
   const events=new Map();let context;
   function element(tag='div',className='',initial=''){
     let own=String(initial);const node={tag,className,children:[],dataset:{},hidden:false,disabled:false,isConnected:true,parentNode:null,style:{},attrs:{},
@@ -19,11 +19,13 @@ async function fixture(){
       get innerHTML(){return own;},set innerHTML(value){own=String(value);this.children=[];},
       append(...children){for(const child of children){child.parentNode=this;this.children.push(child);}},prepend(...children){for(const child of [...children].reverse()){child.parentNode=this;this.children.unshift(child);}},appendChild(child){this.append(child);return child;},replaceChildren(...children){own='';this.children=[];this.append(...children);},
       setAttribute(key,value){this.attrs[key]=String(value);},getAttribute(key){return this.attrs[key]??null;},focus(){context.document.activeElement=this;},contains(other){return other===this||descendants(this).includes(other);},
+      remove(){if(this.parentNode)this.parentNode.children=this.parentNode.children.filter(child=>child!==this);for(const [key,value]of roots)if(value===this)roots.delete(key);},
+      before(child){this.parentNode?.append(child);if(child.id)roots.set('#'+child.id,child);},after(child){this.before(child);},
       querySelectorAll(selector){return descendants(this).filter(child=>selector.startsWith('.')?child.className.split(' ').includes(selector.slice(1)):child.tag===selector);},querySelector(selector){return this.querySelectorAll(selector)[0]||null;},classList:{add(){},remove(){},toggle(){}}};return node;
   }
-  const $=key=>{if(!roots.has(key))roots.set(key,element());return roots.get(key);};$('#detail-value-modal').hidden=true;$('#drawer').hidden=true;
+  const $=key=>{const id=key.startsWith('#')?key.slice(1):null;const found=id&&[...roots.values()].flatMap(node=>[node,...descendants(node)]).find(node=>node.id===id);if(found)return found;if(!roots.has(key))roots.set(key,element());return roots.get(key);};$('#detail-value-modal').hidden=true;$('#drawer').hidden=true;
   const tabs=['overview','json','raw'].map(pane=>{const node=element('button');node.dataset.pane=pane;return node;});
-  context=vm.createContext({window:{getSelection:()=>selection,Tasks:{cancelLatest:name=>cancelled.push(name)},JavaTrace:{renderPreserved:(value,options)=>{java.push({value,options});return element('details','java-trace');}}},
+  context=vm.createContext({window:{getSelection:()=>selection,ValueInspector:{close(){inspectorOpen=false;},open(value,options){if(options.isCurrent?.()===false)return;inspectorOpen=true;inspections.push({value,options});}},Tasks:{cancelLatest:name=>cancelled.push(name)},JavaTrace:{renderPreserved:(value,options)=>{java.push({value,options});return element('details','java-trace');}}},
     document:{activeElement:null,querySelectorAll:selector=>selector==='#drawer .dtab'?tabs:[],addEventListener:(name,fn)=>{if(!events.has(name))events.set(name,[]);events.get(name).push(fn);}},
     structuredClone,TextEncoder,JSON:{stringify:JSON.stringify,parse(){throw Error('display must never parse native canonical JSON');}},state:{cases:live,currentDetailEv:null},
     $ ,el:element,colLabel:String,filterFocusTarget:anchor=>anchor,toast:(text,type)=>messages.push({text,type}),showCtxMenu:(_x,_y,items)=>menus.push(items),
@@ -36,16 +38,16 @@ async function fixture(){
       if(command==='case_evidence_member_java_trace')return{member,state:'unavailable',trace:null,reason:'not_java'};
       throw Error(command);
     }});
-  for(const name of ['case-evidence.js','case-evidence-preserved.js'])vm.runInContext(read(name),context);
+  for(const name of ['evidence-ui.js','case-evidence.js','case-evidence-preserved.js'])vm.runInContext(read(name),context);
   const client=context.window.CaseEvidence.create({enabled:true,invoke:async()=>documentValue()});await client.load();const services={client};context.nativeEvidenceServices=()=>services;
   context.window.AnalysisContexts={capture:()=>structuredClone(live.cases[0].analysisContext),isCurrent:captured=>['caseId','analysisId','configRevision','visibilityRevision'].every(key=>captured[key]===live.cases[0].analysisContext[key])};
   const app=read('app.js'),part=(start,end)=>app.slice(app.indexOf(start),app.indexOf(end,app.indexOf(start)));
-  vm.runInContext('let detailRequest=0,detailDeferredPane=null;',context);vm.runInContext(part('let detailValueReturnFocus =','function openDetailValue('),context);
+  vm.runInContext(part('let detailRequest =','function detailAdmissionCurrent('),context);vm.runInContext(part('let detailValueReturnFocus =','function openDetailValue('),context);
   vm.runInContext(part('function showDetailLoading()','function openContextInspector('),context);vm.runInContext(part('function closeDrawer()','function switchDetailTab('),context);
   vm.runInContext(part('  $("#detail-value-copy").onclick =','  $("#dr-prev").onclick ='),context);
   vm.runInContext(read('case-evidence-detail.js'),context);
   const controller=context.window.CaseEvidenceDetail;
-  return{context,controller,calls,copied,menus,filters,messages,cancelled,java,$,element,events,open:()=>controller.open(reference,member),reply:value=>{next=value;},preview:fn=>{previewOverride=fn;},exact:value=>{exact=value;},clipboard:fn=>{clipboard=fn;},selection:value=>{selection=value;},replace(){live=structuredClone(live);context.state.cases=live;},live:()=>live,
+  return{context,controller,calls,copied,menus,filters,messages,cancelled,java,inspections,inspectorOpen:()=>inspectorOpen,$,element,events,open:()=>controller.open(reference,member),reply:value=>{next=value;},preview:fn=>{previewOverride=fn;},exact:value=>{exact=value;},clipboard:fn=>{clipboard=fn;},selection:value=>{selection=value;},replace(){live=structuredClone(live);context.state.cases=live;},live:()=>live,
     valueButtons:()=>$('#pane-overview').querySelectorAll('.detail-tree-value'),button:label=>$('#pane-overview').querySelectorAll('button').find(node=>node.textContent===label)};
 }
 function domEvent(node){return{target:node,currentTarget:node,clientX:1,clientY:2,preventDefault(){},stopPropagation(){}};}
@@ -106,4 +108,31 @@ test('first-member lookup cannot rebind an open request to a replacement Case in
   const f=await fixture(),gate=deferred();f.preview(()=>gate.promise);const pending=f.controller.open(reference);await settle();f.replace();
   gate.resolve({kind:'evidence_preview_page',columns:[],rows:[{kind:'evidence_preview',member,cells:[]}],total:1,nextCursor:null});assert.equal(await pending,false);
   assert.equal(f.calls.some(c=>c.command==='case_evidence_member_detail'),false);
+});
+
+test('native detail and exact copies follow explicit reveal without parsing or altering preserved numeric text',async()=>{
+  const f=await fixture(),value=data();value.fields[0]={column:'token',type:'string',text:'private-token',complete:true};
+  value.envelope.text='{"fields":{"token":"private-token","n":9007199254740993,"x":1.0}}';f.reply(value);f.exact('private-token');await f.open();
+  assert.doesNotMatch(f.$('#pane-overview').textContent,/private-token/);assert.doesNotMatch(f.$('#pane-json').textContent,/private-token/);
+  await f.context.copyDetail();assert.doesNotMatch(f.copied.at(-1),/private-token/);assert.match(f.copied.at(-1),/9007199254740993/);
+  await f.valueButtons()[0].onclick();await f.$('#detail-value-copy').onclick();assert.equal(f.copied.at(-1),'[oculto]');
+  f.$('#detail-value-inspect').onclick();assert.equal(f.inspections.at(-1).value,'private-token');assert.equal(f.inspections.at(-1).options.revealed,false);
+  f.$('#dr-reveal').onclick();assert.equal(f.inspectorOpen(),false);assert.equal(f.$('#detail-value-content').textContent,'');
+  assert.match(f.$('#pane-overview').textContent,/private-token/);await f.context.copyDetail();assert.equal(f.copied.at(-1),value.envelope.text);
+  await f.valueButtons()[0].onclick();await f.$('#detail-value-copy').onclick();assert.equal(f.copied.at(-1),'private-token');
+  f.$('#dr-reveal').onclick();assert.doesNotMatch(f.$('#pane-overview').textContent,/private-token/);assert.equal(f.$('#detail-value-content').textContent,'');
+  assert.equal(value.fields[0].text,'private-token');assert.equal(f.calls.filter(call=>call.command==='case_evidence_member_detail').length,1,'toggle is local');
+});
+
+test('native reveal and inspector reset on close and old inspection rejects a replaced Case',async()=>{
+  const f=await fixture();await f.open();await f.valueButtons()[0].onclick();const inspect=f.$('#detail-value-inspect').onclick;inspect();
+  const view=f.inspections.at(-1);assert.equal(view.options.isCurrent(),true);f.replace();assert.equal(view.options.isCurrent(),false);
+  inspect();assert.equal(f.inspections.length,1);f.context.closeDrawer();assert.equal(f.inspectorOpen(),false);assert.equal(f.$('#pane-json').textContent,'');
+  await f.open();assert.equal(f.$('#dr-reveal').textContent,'Mostrar valores ocultos');
+});
+
+test('unavailable full native field does not become an empty value or an inspectable original',async()=>{
+  const f=await fixture();await f.open();f.exact(request=>({kind:'preserved_field_text',member,column:request.column,present:false,type:null,text:null,complete:true}));
+  await f.valueButtons()[0].onclick();assert.equal(f.$('#detail-value-content').textContent,'(campo ausente)');
+  await f.$('#detail-value-copy').onclick();assert.equal(f.copied.length,0);assert.match(f.messages.at(-1).text,/ausente/);assert.equal(f.inspections.length,0);
 });

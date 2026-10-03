@@ -62,7 +62,10 @@ try {
   process.argv = [process.execPath, 'publish.mjs', ready];
   const moduleUrl = pathToFileURL(resolve('scripts/release/publish.mjs')).href;
   console.log = () => {};
-  for (const scenario of ['wrong-tag', 'already-published', 'not-newer', 'digest-mismatch', 'manifest-not-served', 'success']) {
+  for (const scenario of ['wrong-trigger', 'wrong-tag', 'already-published', 'not-newer', 'digest-mismatch', 'manifest-not-served', 'success']) {
+    process.env.GITHUB_REF = scenario === 'wrong-trigger' ? 'refs/tags/v999.0.0' : `refs/tags/v${version}`;
+    process.env.GITHUB_REF_TYPE = 'tag';
+    process.env.GITHUB_REF_NAME = scenario === 'wrong-trigger' ? 'v999.0.0' : `v${version}`;
     const calls = [], uploaded = [];
     global.fetch = async (value, options = {}) => {
       const url = new URL(value), method = options.method || 'GET'; calls.push([method, url.hostname, url.pathname]);
@@ -85,11 +88,12 @@ try {
     if (scenario === 'success') { await import(`${moduleUrl}?case=${scenario}`); assert(published()); assert(calls.some(([, host]) => host === 'github.com'), 'the served manifest is checked'); }
     else if (scenario === 'manifest-not-served') { await assert.rejects(import(`${moduleUrl}?case=${scenario}`)); assert(published(), 'the check runs after publication'); }
     else { await assert.rejects(import(`${moduleUrl}?case=${scenario}`)); assert(!published(), `${scenario} must not publish`); }
+    if (scenario === 'wrong-trigger') assert.equal(calls.length, 0, 'a mismatched triggering tag is rejected before any network request');
   }
   originalLog('PASS: signed assets and update manifest, rejection of invalid, tampered, mismatched or unsigned packages, tag conflict, published release protection, older version protection, digest verification, publication only after all twelve uploads and check of the served manifest. No network requests were made.');
 } finally {
   global.fetch = originalFetch; process.argv = originalArgv; console.log = originalLog;
-  for (const key of ['GITHUB_TOKEN', 'GITHUB_REPOSITORY', 'GITHUB_SHA', 'GITHUB_RUN_ID', 'RELEASE_CHECK_ATTEMPTS']) { if (originalEnv[key] === undefined) delete process.env[key]; else process.env[key] = originalEnv[key]; }
+  for (const key of ['GITHUB_TOKEN', 'GITHUB_REPOSITORY', 'GITHUB_SHA', 'GITHUB_RUN_ID', 'RELEASE_CHECK_ATTEMPTS', 'GITHUB_REF', 'GITHUB_REF_TYPE', 'GITHUB_REF_NAME']) { if (originalEnv[key] === undefined) delete process.env[key]; else process.env[key] = originalEnv[key]; }
   if (!resolve(temp).startsWith(outputRoot + sep)) throw Error('Unexpected cleanup path.');
   rmSync(temp, { recursive: true, force: true });
 }

@@ -28,7 +28,7 @@ function fixture({column='value',value='display value',canonical='native value',
   const reply=args=>({kind:'exact_field',version:1,row:{id:args.id,eventRef:args.eventRef},column:args.column,
     presence:'present',valueType,canonicalText:canonical,
     receipt:{analysisContext:args.analysisContext,sourceGeneration:args.sourceGeneration,caseKey:null,caseContentToken:null,catalogSignature:'a'.repeat(64),catalogEpoch:0}});
-  const context=vm.createContext({state,$,el:node,TextEncoder,structuredClone,detailRequest:1,detailValueNode:null,
+  const context=vm.createContext({state,$,el:node,TextEncoder,structuredClone,detailRequest:1,detailValueNode:null,detailRevealed:false,
     window:{AnalysisContexts:{capture,isCurrent,prepare:async owner=>{calls.prepares.push(owner);await hooks.prepare?.();return owner;}},Tasks:{cancelLatest(){}}},
     document:{addEventListener(){}},workspaceScope:()=> 'dataset',caseSig:()=> 'saved-evidence',caseEvents:()=>[],
     caseArgs:async args=>args,api:async(command,args,options)=>{
@@ -43,6 +43,7 @@ function fixture({column='value',value='display value',canonical='native value',
     openDetailValue(value){context.detailValueNode=value;},openDeriveModal(){},showDetailNameMenu(){},saveVisibleCols(){},renderTable(){},
   });
   state.detailAdmission=historical?null:{scope:'dataset',owner:capture(),signature:null};
+  vm.runInContext(read('evidence-ui.js'),context);
   vm.runInContext(read('canonical-fields.js'),context);
   vm.runInContext(read('detail-fields.js'),context);context.DetailFields=context.window.DetailFields;
   vm.runInContext(section('function detailAdmissionCurrent(','async function openDetail('),context);
@@ -138,4 +139,13 @@ test('modal literal actions retain their captured detail guard',async()=>{
   const f=fixture(),menu=f.menu('  literal\n');f.context.detailRequest++;
   await menu.find(item=>item.label==='Criar filtro: value').onClick();await menu.find(item=>item.label==='Copiar seleção').onClick();
   assert.equal(f.calls.drafts.length,0);assert.equal(f.calls.copies.length,0);assert.equal(f.calls.native.length,0);
+});
+
+test('installed detail copy and menu labels stay protected until reveal while filters retain exact canonical values',async()=>{
+  const f=fixture({column:'authorization',value:'private-token',canonical:'private-token'});
+  let menu=f.menu('');assert.equal(menu.some(item=>item.label?.includes('private-token')),false);
+  await menu.find(item=>item.label==='Copiar valor').onClick();assert.equal(f.calls.copies.at(-1),'[oculto]');
+  await menu.find(item=>item.label==='Criar filtro: authorization').onClick();assert.equal(f.calls.drafts.at(-1)[1],'private-token');
+  f.context.detailRevealed=true;menu=f.menu('');await menu.find(item=>item.label==='Copiar valor').onClick();assert.equal(f.calls.copies.at(-1),'private-token');
+  f.context.detailRevealed=false;await menu.find(item=>item.label==='Copiar valor').onClick();assert.equal(f.calls.copies.at(-1),'[oculto]','a retained action obeys the current protected state');
 });

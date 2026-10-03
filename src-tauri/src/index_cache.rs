@@ -5,7 +5,9 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 /// Parser semantics are part of the cache version; older directories are removed.
-pub const INDEX_DIR: &str = "indexes-v6";
+// Query expansion is global, so non-HTTP metadata, engine and time caches
+// must also move to the bounded/idempotent parser generation.
+pub const INDEX_DIR: &str = "indexes-v7";
 /// Storage layout only; changing it must not invalidate identical engine stores.
 pub(crate) const METADATA_DIR: &str = "metadata-v1";
 
@@ -19,6 +21,7 @@ pub fn prune() {
         "indexes-v3",
         "indexes-v4",
         "indexes-v5",
+        "indexes-v6",
     ] {
         let _ = std::fs::remove_dir_all(base.join(old));
     }
@@ -203,7 +206,7 @@ fn timestamp_key(idx: &FileIndex) -> Option<String> {
     hash.update(part.metadata_identity.as_bytes());
     hash.update(b"|timezone-configuration:");
     hash.update(part.calendar.timezone.as_bytes());
-    if matches!(part.format.as_str(), "syslog3164" | "firewall") {
+    if crate::sources::uses_inferred_calendar_year(&part.format) {
         hash.update(format!("|inferred-year:{}", part.calendar.year));
     }
     if let Some(revision) = timestamp_enrichment_revision(&part.format, &config.sources) {
@@ -534,7 +537,7 @@ mod java_timestamp_dependency_tests {
             chrono::Local::now().offset(), idx.lines.len(), part.physical_file_id));
         hash.update(b"|raw-metadata-identity:"); hash.update(part.metadata_identity.as_bytes());
         hash.update(b"|timezone-configuration:"); hash.update(part.calendar.timezone.as_bytes());
-        if matches!(part.format.as_str(), "syslog3164" | "firewall") {
+        if crate::sources::uses_inferred_calendar_year(&part.format) {
             hash.update(format!("|inferred-year:{}", part.calendar.year));
         }
         format!("{:x}", hash.finalize())
@@ -699,4 +702,25 @@ mod metadata_timezone_tests {
         assert!(!timestamps_at(&mut second, &cache, None).unwrap()); assert_eq!(second.lines.at(0).ts, 0);
     }
 
+}
+
+#[cfg(test)]
+mod wrapped_timestamp_migration_tests {
+    use super::*;
+    #[test]
+    fn old_wrapped_timestamp_overlay_is_rejected_and_rebuilt() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("wrapped.jsonl");
+        let raw = serde_json::json!({"line":"192.0.2.80 - - [16/Sep/2026:20:55:04 -0300] \"GET /x HTTP/1.1\" 200 0"}).to_string();
+        std::fs::write(&path, raw).unwrap();
+        let config = sources::TsConfig { sources:vec!["missing".into()],format:"epoch_ms".into(),
+            regex:Some("never-matches".into()),..Default::default() }.compile().unwrap();
+        let make = || sources::index_file(path.to_str().unwrap(), "jsonl", None, Some(config.clone()), None).unwrap();
+        let mut old = make(); old.parts[0].metadata_identity = "old-indexes-v6-web-logs-v1".into();
+        old.lines = std::sync::Arc::new(old.lines.iter().map(|mut row| {row.ts=0;row}).collect::<Vec<_>>().into());
+        let overlay = dir.path().join("timestamps.bin"); write_timestamps(&old, &overlay, None).unwrap();
+        let mut current = make(); assert_ne!(timestamp_key(&old), timestamp_key(&current));
+        assert!(!timestamps_at(&mut current, &overlay, None).unwrap()); assert_eq!(current.lines.at(0).ts, 1789602904000);
+        let mut warm = make(); assert!(timestamps_at(&mut warm, &overlay, None).unwrap());
+        assert_eq!(warm.lines.at(0).ts, current.lines.at(0).ts);
+    }
 }

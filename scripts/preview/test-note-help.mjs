@@ -26,7 +26,7 @@ try{
   await page.evaluate(()=>{window.__originalNoteExplanation=Discovery.showExplanation;Discovery.showExplanation=null;});
   await help.click();
   const fallback=page.locator('[aria-labelledby="ct-note-help-title"]');await fallback.waitFor();
-  assert.match(await fallback.innerText(),/Para mudar a seta/);
+  assert.match(await fallback.innerText(),/Para mudar ou remover uma seta/);
   await fallback.getByRole('button',{name:'Fechar explicação',exact:true}).click();
   assert.equal(await fallback.count(),0);assert(await help.evaluate(node=>node===document.activeElement));
   await page.evaluate(()=>Discovery.showExplanation=window.__originalNoteExplanation);

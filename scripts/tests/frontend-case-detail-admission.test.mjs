@@ -14,7 +14,7 @@ function fixture(scope='case'){
   let evidence=[{id:0,event_ref:'source:original',fields:{overlay:'saved-A'},raw:'preserved body'}],preparation=null;
   const state={rows:[],detailId:null,currentDetailEv:null,datasetRevision:0,refreshVersion:0,caseProfiles:{},caseTreeProfiles:{},
     owner:{caseId:'a',instance:1,identity:{caseId:'a',analysisId:'analysis-a',configRevision:2,visibilityRevision:3},sourceGeneration:7,sourceKey:'source-7'}};
-  const $=key=>{if(!nodes.has(key))nodes.set(key,{hidden:true,textContent:'',innerHTML:'',classList:{add(){},remove(){}},replaceChildren(){}});return nodes.get(key);};
+  const $=key=>{if(!nodes.has(key))nodes.set(key,{hidden:true,textContent:'',innerHTML:'',classList:{add(){},remove(){}},replaceChildren(){},remove(){nodes.delete(key);}});return nodes.get(key);};
   const capture=()=>structuredClone(state.owner),context=vm.createContext({state,$,structuredClone,clearTimeout(){},
     window:{AnalysisContexts:{capture,isCurrent:owner=>JSON.stringify(owner)===JSON.stringify(state.owner)},Tasks:{cancelLatest:key=>cancelled.push(key)}},
     workspaceScope:()=>scope,caseEvents:()=>evidence,caseSig:()=>JSON.stringify(evidence),
@@ -27,6 +27,7 @@ function fixture(scope='case'){
     debounceTimer:null,filterCountsTimer:null,explorerAnalytics:new Map(),filterCountsCache:new Map(),explorerIntent:'',explorerCursorKey:'',explorerCursors:[],
     treeAggVersion:{dataset:0,case:0},cubeState:{requestVersion:0,results:new Map()},chart:null,
   });
+  vm.runInContext(readFileSync(new URL('../../frontend/evidence-ui.js',import.meta.url),'utf8'),context);
   vm.runInContext(section('let detailRequest =','// abre o drawer imediatamente'),context);
   vm.runInContext(section('function closeDrawer()','function switchDetailTab('),context);
   vm.runInContext(section('function openRightInspector()','// ------------------------------------------------------------------ códigos'),context);

@@ -8,16 +8,16 @@ const owner={storeId:'store',caseId:'case',analysisId:'analysis'},stamp=revision
 const contextSnapshot={schemaVersion:1,caseId:'case',analysisId:'analysis',configRevision:0,visibilityRevision:0,config:{derivedFields:[],references:[]},migrationDiagnostics:[]};
 const document=()=>({evidenceViewVersion:1,store:stamp('1'),active:'case',cases:[{id:'case',analysisContext:contextSnapshot,name:'Case',notes:'original',items:[{id:'item',rows:{kind:'native_evidence_container',reference:{kind:'native_evidence',schemaVersion:1,owner,containerId:'container',manifestId:'manifest',manifestSha256:'a'.repeat(64),memberCount:2},preservedCount:2,preview:null}}],unknown:{fraction:1.2345678901234567}}],caseEvidence:[{state:'ready',owner,evidenceSignature:'signature',preservedCount:2}],diagnostics:[]});
 function fixture(){
-  const timers=new Map(),calls=[],toasts=[];let timer=0,request=0,mode='ok',loaded=document();
-  const context=vm.createContext({window:{crypto:{randomUUID:()=>`request-${++request}`}},state:{cases:{active:null,cases:[]}},structuredClone,TextEncoder,
+  const timers=new Map(),calls=[],toasts=[];let timer=0,request=0,mode='ok',loaded=document(),saveReply=null,close;
+  const receipt=request=>{const doc=JSON.parse(request.documentJson),store=stamp(String(BigInt(request.expectedStore.revision)+1n));return{requestId:request.requestId,committedStore:store,currentStore:store,evidence:doc.cases.flatMap(c=>(c.items||[]).map(i=>i.rows.reference)),analysisContexts:[contextSnapshot],caseEvidence:doc.caseEvidence,replayed:false,reconcileRequired:false};};
+  const context=vm.createContext({window:{crypto:{randomUUID:()=>`request-${++request}`},__TAURI__:{window:{getCurrentWindow:()=>({onCloseRequested:fn=>{close=fn;return Promise.resolve();}})}}},state:{cases:{active:null,cases:[]}},structuredClone,TextEncoder,
     JSON:{stringify:JSON.stringify,parse(){throw Error('native hooks must never parse records or the save string');}},
-    document:{dispatchEvent(){}},CustomEvent:class{constructor(type,options){this.type=type;this.detail=options.detail;}},
+    document:{dispatchEvent(){},querySelector:()=>null},CustomEvent:class{constructor(type,options){this.type=type;this.detail=options.detail;}},
     setTimeout:callback=>{const id=++timer;timers.set(id,callback);return id;},clearTimeout:id=>timers.delete(id),toast:text=>toasts.push(text),
     api:async(command,args={})=>{calls.push({command,args:structuredClone(args)});
       if(command==='cases_load_view'){if(mode==='load-failure')throw Error('native unavailable');return structuredClone(loaded);}
       if(command==='cases_save_view'){
-        if(mode==='save-failure')throw Error('disk failure');const doc=JSON.parse(args.request.documentJson),store=stamp(String(BigInt(args.request.expectedStore.revision)+1n));
-        return{requestId:args.request.requestId,committedStore:store,currentStore:store,evidence:doc.cases.flatMap(c=>(c.items||[]).map(i=>i.rows.reference)),analysisContexts:[contextSnapshot],caseEvidence:doc.caseEvidence,replayed:false,reconcileRequired:false};
+        if(mode==='save-failure')throw Error('disk failure');return saveReply?saveReply(args.request):receipt(args.request);
       }
       throw Error(`unexpected legacy transport: ${command}`);
     }});
@@ -27,8 +27,34 @@ function fixture(){
   vm.runInContext(part('// Native evidence remains opt-in','let casesSaveQueue ='),context);
   vm.runInContext(part('function normalizeCaseStore(','function activeCase('),context);
   vm.runInContext(part('let casesSaveQueue =','function defaultCaseWorkspace('),context);
-  return{context,calls,toasts,mode:value=>{mode=value;},loaded:value=>{loaded=value;},flush:()=>{const pending=[...timers.values()];timers.clear();pending.forEach(fn=>fn());}};
+  return{context,calls,toasts,receipt,saveReply:fn=>{saveReply=fn;},mode:value=>{mode=value;},loaded:value=>{loaded=value;},flush:()=>{const pending=[...timers.values()];timers.clear();pending.forEach(fn=>fn());},async close(){const event={prevented:false,preventDefault(){this.prevented=true;}};await close(event);return event;}};
 }
+
+const settle=async()=>{for(let n=0;n<100;n++)await Promise.resolve();};
+
+test('slow native metadata save keeps one pending intent and close flushes the latest draft with native receipts',async()=>{
+  const f=fixture();await f.context.loadCaseStore();let release;
+  f.saveReply(request=>f.calls.filter(call=>call.command==='cases_save_view').length===1?new Promise(resolve=>{release=()=>resolve(f.receipt(request));}):f.receipt(request));
+  const first=f.context.saveCases();f.flush();await settle();assert.equal(typeof release,'function');
+  f.context.state.cases.cases[0].notes='pending';const pending=f.context.saveCases();
+  for(let n=0;n<1000;n++){f.context.state.cases.cases[0].notes=`latest-${n}`;assert.equal(f.context.saveCases(),pending);f.flush();}
+  assert.equal(f.calls.filter(call=>call.command==='cases_save_view').length,1);
+  let closed=false;const closing=f.close().then(event=>{closed=true;return event;});await settle();assert.equal(closed,false);
+  release();assert.equal(await first,true);assert.equal(await pending,true);assert.equal((await closing).prevented,false);
+  const saves=f.calls.filter(call=>call.command==='cases_save_view');assert.equal(saves.length,2);
+  assert.deepEqual(saves.map(call=>call.args.request.expectedStore.revision),['1','2']);
+  assert.equal(JSON.parse(saves[1].args.request.documentJson).cases[0].notes,'latest-999');
+  assert.equal(f.context.nativeEvidenceServices().session.isClean(),true);
+});
+
+test('closing after failed native save retains the retry ticket instead of issuing a fresh write or losing the draft',async()=>{
+  const f=fixture();await f.context.loadCaseStore();f.mode('save-failure');f.context.state.cases.cases[0].notes='unsaved';
+  const saving=f.context.saveCases();f.flush();assert.equal(await saving,false);
+  const original=f.calls.at(-1).args.request;assert.equal((await f.close()).prevented,true);
+  assert.equal(f.calls.filter(call=>call.command==='cases_save_view').length,1);
+  f.mode('ok');await f.context.nativeEvidenceServices().session.retry();assert.deepEqual(f.calls.at(-1).args.request,original);
+  assert.equal((await f.close()).prevented,false);assert.equal(f.context.state.cases.cases[0].notes,'unsaved');
+});
 
 test('installed native load helper retains every descriptor and opaque metadata without a legacy fallback',async()=>{
   const f=fixture(),doc=document(),loaded=await f.context.loadCaseStore();

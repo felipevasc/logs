@@ -14,13 +14,22 @@ test('boundary preview covers exactly the five existing production families in p
   assert.match(source, /nativeEngineVerified: false, installedWebViewVerified: false/);
   assert.doesNotMatch(source, /<svg|innerHTML\s*=|addStyleTag\(|\.route\(|state\.(?:rows|loaded)\s*=/);
 });
-test('finished and active short gestures become entirely new loop timelines in the same SVG', () => {
-  assert.match(source, /mountFixture\('finished'\)/); assert.match(source, /mountFixture\('interrupted'\)/);
-  assert.match(source, /a\.playState === 'finished'/); assert.match(source, /a\.currentTime >= 700 && a\.playState === 'running'/);
-  assert.match(source, /freshIdentities: entry\.loopTracks\.every\(animation => !before\.includes\(animation\)\)/);
-  assert.match(source, /results\.loopStart\.every\(s => s\.stableSvg && s\.freshIdentities\)/);
-  assert.match(source, /results\.activeLoopStart\.every\(s => s\.stableSvg && s\.freshIdentities\)/);
-  assert.equal((source.match(/!s\.tracks\.some\(t => t\.name === 'wv-work-boundary'\)/g) || []).length, 2);
+test('quiet and aged gestures promote only after their trusted finite endpoints', () => {
+  assert.match(source, /mountFixture\('quiet'\)/); assert.match(source, /mountFixture\('aged'\)/);
+  assert.match(source, /a\.currentTime >= 700 && a\.playState === 'running'/);
+  assert.match(source, /event\.animationName === 'wv-gesture-boundary'/);
+  assert.match(source, /gestureEnd\.elapsedTime \* 1000, definition\.gestureMs/);
+  assert.match(source, /assert\.equal\(gestureEnd\.isTrusted, true\)/);
+  assert.match(source, /gestureEnd\.stableSvg && gestureEnd\.stableTracks/);
+  assert.match(source, /entry\.loopTracks\.every\(animation => !entry\.gestureTracks\.includes\(animation\)\)/);
+  assert.match(source, /loopStart\.stableSvg && loopStart\.freshIdentities/);
+  assert.match(source, /sample\.after\.pace, 'gesture'/);
+  assert.match(source, /assert\.deepEqual\(sample\.after\.tracks, sample\.before\.tracks/);
+  assert.doesNotMatch(source, /playState === 'finished'/);
+  const promotion = source.slice(source.indexOf('async function collectPromotions('), source.indexOf('async function collectBoundaries('));
+  assert.ok(promotion.indexOf('await settle()') < promotion.indexOf('settled: e.read()'));
+  assert.match(promotion, /assertRig\(settled, definition\)/);
+  assert.doesNotMatch(promotion, /assertRig\(loopStart,/);
 });
 test('first trusted boundary measures every joint/prop and the separate controller clock', () => {
   assert.match(source, /querySelector\('\.wv-work'\)\.getAnimations\(\{ subtree: true \}\)/);
@@ -44,15 +53,19 @@ test('natural playback and product pause remain unmodified, with no video or see
   assert.match(source, /track\.currentTime > paused\[index\]\.tracks\[i\]\.currentTime/);
   assert.match(source, /assert\.equal\(track\.playbackRate, 1\)/);
 });
-test('phase replacement happens before the old boundary and observes a fresh complete next cycle', () => {
+test('known family changes wait for complete work or reaction and return boundaries', () => {
   assert.match(source, /fixture\.raf = requestAnimationFrame\(tick\)/);
   assert.match(source, /phaseChange\.remainingMs > 0 && phaseChange\.remainingMs <= 600/);
-  assert.match(source, /oldClockDetached: !oldClock\.effect\.target\.isConnected/);
-  assert.match(source, /hadNoBoundary: entry\.firstBoundary === null/);
-  assert.match(source, /freshIdentities: entry\.loopTracks\.every\(a => !previousTracks\.includes\(a\)\)/);
-  assert.match(source, /results\.phaseBoundaries = await collectBoundaries\(\)/);
+  assert.match(source, /phaseChange\.hadNoBoundary && phaseChange\.stableSvg && phaseChange\.stableTracks/);
+  assert.match(source, /phaseChange\.after\.family, phaseChange\.before\.family/);
+  assert.match(source, /assert\.deepEqual\(phaseChange\.after\.tracks, phaseChange\.before\.tracks/);
+  assert.match(source, /familyApplied\.replacedSvg && familyApplied\.oldClockDetached && familyApplied\.freshIdentities/);
+  assert.match(source, /results\.phaseBoundaries = await collectBoundaries\(false\)/);
   assert.match(source, /assert\.equal\(entry\.boundaryEvents\.length, 1\)/);
   assert.match(source, /e\.isTrusted && e\.isCurrentClock/);
+  assert.match(source, /\['wv-episode-boundary', 'wv-resume-boundary'\]/);
+  assert.match(source, /applied\.returnEvents\[0\]\.elapsedTime, 10/);
+  assert.match(source, /applied\.returnEvents\.every\(e => e\.isTrusted && e\.family === definition\.family/);
   assert.match(source, /assert\.deepEqual\(results\.applicationAfter, results\.applicationBefore\)/);
 });
 test('boundary script is selected for full, shared waiting and direct script changes', () => {
@@ -62,7 +75,7 @@ test('boundary script is selected for full, shared waiting and direct script cha
     assert.equal(plan.native, false); assert.ok(plan.preview.includes('test-waiting-boundaries.mjs'));
   }
   assert.match(source, /waiting-boundaries-results\.json/);
-  for (const shot of ['finished-gestures', 'first-review', 'new-phase-review']) assert.ok(source.includes(`waiting-boundaries-${shot}.png`));
+  for (const shot of ['auto-promotions', 'first-review', 'deferred-phase']) assert.ok(source.includes(`waiting-boundaries-${shot}.png`));
 });
 
 test('same-family checkpoint phase change updates status near boundary without scheduling or restarting motion', () => {

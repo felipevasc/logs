@@ -38,6 +38,7 @@ function harness(store = { active: 'case', cases: [{ id: 'case', artifacts: [] }
         const snapshot = structuredClone(args.data);
         await new Promise((resolve, reject) => { finishSave = resolve; failSave = reject; });
         persisted = snapshot;
+        return { revision: (snapshot.revision ?? 0) + 1 };
       }
     },
   });

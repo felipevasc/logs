@@ -2,6 +2,7 @@
    scheduler concurrency, atomic persistence or the installed WebView. */
 import assert from "node:assert/strict";
 import { mkdir } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { launchBrowser } from "./browser.mjs";
 const browser = await launchBrowser();
 const url = process.argv[2] || "http://127.0.0.1:4173";
@@ -35,8 +36,12 @@ try {
   assert.deepEqual(await page.evaluate(() => ({ revision: state.datasetRevision, ids: state.rows.map(row => row.id), artifact: state.currentArtifact?.id })), before);
   assert.equal(await page.evaluate(() => window.__mockCommandCalls.resource_settings_save), 1);
 
+  assert.equal(await memory.getAttribute("max"), "8192", "custom maximum follows detected total, not half of it");
+  await memory.fill("8192");
+  assert.match(await pane.locator("#resource-memory-warning").textContent(), /A escolha é permitida/);
+  assert.equal(await save.isDisabled(), false, "full-memory warning must not block saving");
   await memory.fill("127"); await save.click();
-  assert.match(await pane.textContent(), /entre 128 e 4096/);
+  assert.match(await pane.textContent(), /entre 128 e 8192/);
   assert.equal(await page.evaluate(() => window.__mockCommandCalls.resource_settings_save), 1);
   await memory.fill("256");
   await page.evaluate(() => { window.__mockFailures = { resource_settings_save: "disk full" }; });
@@ -58,7 +63,7 @@ try {
   await page.setViewportSize({ width: 400, height: 850 });
   assert.equal(await pane.evaluate(element => element.scrollWidth <= element.clientWidth + 1), true, "resource controls do not overflow narrow pane");
   await mkdir(new URL("../../output/playwright/", import.meta.url), { recursive: true });
-  await page.screenshot({ path: new URL("../../output/playwright/resource-settings.png", import.meta.url).pathname });
+  await page.screenshot({ path: fileURLToPath(new URL("../../output/playwright/resource-settings.png", import.meta.url)) });
   await mode.selectOption("automatic");
   await pane.locator("#resource-parallelism-mode").selectOption("automatic"); await save.click();
   await page.waitForFunction(() => document.querySelector("#resource-settings-feedback")?.textContent.includes("Preferência salva"));

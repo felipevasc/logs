@@ -46,19 +46,20 @@ test('first-boundary coffee seed is discoverable with the real director and veri
   assert.match(source, /mode === 'coffee' \? 60000 : mode === 'loop' \? 4000 : 0/);
 });
 
-test('natural cycles retain CSS governance and never rewind on cleanup', () => {
+test('natural cycles use trusted finite endpoints with no seeks or playback overrides', () => {
   assert.match(source, /addInitScript\(installMotionSampling\)/);
   assert.doesNotMatch(source, /\.(?:pause|play)\s*\(/);
   const capture = source.slice(source.indexOf('async function recordNaturalCycle('), source.indexOf('function assertWorkStates('));
-  assert.match(capture, /await sampling\.seek\(0\)/);
-  assert.match(capture, /await sampling\.release\(\)/);
-  assert.match(capture, /finally \{\s*await sampling\.restore\(\{ restoreTime: false \}\)/);
+  assert.doesNotMatch(capture, /sampling|\.seek\(|\.currentTime\s*=(?!=)|playbackRate\s*=(?!=)/);
   assert.match(capture, /animation\.playbackRate !== 1/);
+  assert.match(source, /event\.animationName !== 'wv-gesture-boundary'/);
+  assert.match(source, /isTrusted: event\.isTrusted, elapsedTime: event\.elapsedTime/);
+  assert.match(source, /results\.short\.endpoints\.every\(end => end\.isTrusted && end\.elapsedTime === 2\.6/);
+  assert.match(source, /assertWorkStates\(results\.short\.states, 'loop'\)/);
   assert.match(source, /results\.short = await recordNaturalCycle\(2600\)/);
   assert.match(source, /results\.loop = await recordNaturalCycle\(9600\)/);
   assert.match(source, /results\.loop\.inspections\.every\(inspection => inspection\.history\.length === 0\)/);
 });
-
 test('the real 1x video is finalized before all rendered contact and pose diagnostics', () => {
   const run = source.slice(source.indexOf("  browser = await launchBrowser("));
   const short = run.indexOf('results.short = await recordNaturalCycle(2600)');

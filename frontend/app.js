@@ -263,8 +263,10 @@ function hideLoadOverlay(ok = true) {
   state.loadOverlayOperationId = null;
   state.loadOverlayCancellable = false;
   state.loadOverlayCancelling = false;
-  // Work owns the lifetime, not the decorative animation cycle.
-  loadWaitingVisual?.destroy(); loadWaitingVisual = null;
+  // Release results/focus immediately; a visible successful gesture may finish inertly.
+  if (ok) loadWaitingVisual?.complete();
+  else loadWaitingVisual?.destroy();
+  loadWaitingVisual = null;
   loadWaitingReceipt = null;
   $("#load-overlay").hidden = true;
   if (restoreFocus) {
@@ -4155,49 +4157,152 @@ async function loadCaseStore(options) {
 }
 
 let casesSaveQueue = Promise.resolve();
+let caseSaveActive = null;
+let caseSavePending = null;
 let caseSaveErrorShown = false;
-
 let caseSaveTimer = null;
-let caseSaveWaiters = [];
-function saveCases() {
-  if (window.CaseEvidence?.active === true) nativeEvidenceServices().session.markDirty();
-  const store = state.cases;
-  clearTimeout(caseSaveTimer);
-  const result = new Promise((resolve, reject) => caseSaveWaiters.push({ resolve, reject, store }));
-  // Autosave is coalesced, while callers can still await durable persistence.
-  caseSaveTimer = setTimeout(() => {
-    const pending = caseSaveWaiters.splice(0);
-    const waiters = pending.filter(waiter => waiter.store === store);
-    pending.filter(waiter => waiter.store !== store).forEach(waiter => waiter.resolve(false));
-    if (store !== state.cases) { waiters.forEach(waiter => waiter.resolve(false)); return; }
-    if (window.CaseEvidence?.active === true) {
-      nativeEvidenceServices().session.save().then(() => {
-        caseSaveErrorShown = false; waiters.forEach(waiter => waiter.resolve(store === state.cases));
-      }).catch(error => {
-        if (!caseSaveErrorShown) { caseSaveErrorShown = true; toast(`Não foi possível salvar; o rascunho foi mantido: ${error}`, "err"); }
-        waiters.forEach(waiter => waiter.resolve(false));
-      });
-      return;
-    }
-    const snapshot = JSON.parse(JSON.stringify({ ...store, schemaVersion: 2 }));
-    const owners = new Map(snapshot.cases.map(item => [item.id, window.AnalysisContexts?.capture(item.id)]));
-    casesSaveQueue = casesSaveQueue.catch(() => {}).then(() => store === state.cases ? api("cases_save", { data: { ...snapshot, revision: store.revision } }, { silent: true }) : null)
-      .then(async result => {
-        if (store !== state.cases) { waiters.forEach(w => w.resolve(false)); return; }
-        if (result?.revision != null) store.revision = result.revision;
-        for (const context of result?.analysisContexts || []) {
-          const owner = owners.get(context.caseId);
-          if (owner) await window.AnalysisContexts.adopt(context, { owner });
-        }
-        caseSaveErrorShown = false; waiters.forEach(w => w.resolve(true));
-      })
-      .catch(error => {
-        if (!caseSaveErrorShown) { caseSaveErrorShown = true; toast(`Não foi possível salvar: ${error}`, "err"); }
-        waiters.forEach(w => w.resolve(false));
-      });
-  }, 200);
-  return result;
+const failedCaseStores = new WeakSet();
+const caseStoreChanged = "A lista de Casos mudou. Revise os dados atuais antes de salvar novamente.";
+
+function reportCaseSaveError(error) {
+  if (!caseSaveErrorShown) { caseSaveErrorShown = true; toast(`Não foi possível salvar: ${error}`, "err"); }
 }
+
+async function drainCaseSaves() {
+  if (caseSaveActive || !caseSavePending?.ready) return;
+  const batch = caseSavePending;
+  caseSavePending = null;
+  caseSaveActive = batch;
+  casesSaveQueue = batch.promise;
+  let saved = false;
+  try {
+    if (state.cases !== batch.store) throw new Error(caseStoreChanged);
+    // Only the active write owns a snapshot. A pending batch keeps the latest
+    // store by reference, so slow storage cannot queue copies of large Cases.
+    if (batch.native) {
+      await nativeEvidenceServices().session.save();
+      if (state.cases !== batch.store) throw new Error(caseStoreChanged);
+    } else {
+    const snapshot = JSON.parse(JSON.stringify({ ...batch.store, schemaVersion: 2 }));
+    const expectedRevision = snapshot.revision;
+    const owners = new Map(snapshot.cases.map(item => [item.id, window.AnalysisContexts?.capture(item.id)]));
+    const result = await api("cases_save", { data: snapshot }, { silent: true });
+    if (state.cases !== batch.store) throw new Error(caseStoreChanged);
+    if (!Number.isSafeInteger(result?.revision) || result.revision < 1
+        || (expectedRevision != null && result.revision <= expectedRevision)) {
+      throw new Error("O salvamento não confirmou uma revisão válida. Tente novamente.");
+    }
+    batch.store.revision = result.revision;
+    for (const context of result?.analysisContexts || []) {
+      const owner = owners.get(context.caseId);
+      if (owner) await window.AnalysisContexts.adopt(context, { owner });
+      if (state.cases !== batch.store) throw new Error(caseStoreChanged);
+    }
+    }
+    failedCaseStores.delete(batch.store);
+    caseSaveErrorShown = false;
+    saved = true;
+  } catch (error) {
+    if (state.cases === batch.store && !batch.native) failedCaseStores.add(batch.store);
+    reportCaseSaveError(batch.native ? `O rascunho foi mantido para repetir ou reconciliar: ${error}` : error);
+  } finally {
+    caseSaveActive = null;
+    batch.resolve(saved);
+    void drainCaseSaves();
+  }
+}
+
+function saveCases() {
+  const native = window.CaseEvidence?.active === true;
+  if (native) nativeEvidenceServices().session.markDirty();
+  clearTimeout(caseSaveTimer);
+  const store = state.cases;
+  if (caseSavePending && caseSavePending.store !== store) {
+    reportCaseSaveError(caseStoreChanged);
+    caseSavePending.resolve(false);
+    caseSavePending = null;
+  }
+  if (!caseSavePending) {
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    caseSavePending = { store, native, promise, resolve, ready: false };
+  }
+  const batch = caseSavePending;
+  batch.ready = false;
+  // All callers in a pending batch share its durable result, without retaining
+  // an unbounded waiter list. Calls after a snapshot await the following write.
+  caseSaveTimer = setTimeout(() => {
+    caseSaveTimer = null;
+    if (caseSavePending !== batch) return;
+    batch.ready = true;
+    void drainCaseSaves();
+  }, 200);
+  return batch.promise;
+}
+
+function caseSavesPending() {
+  return !!(caseSaveActive || caseSavePending || (window.CaseEvidence?.active === true
+    ? !nativeEvidenceServices().session.isClean() : failedCaseStores.has(state.cases)));
+}
+
+async function flushCaseSaves() {
+  const native = window.CaseEvidence?.active === true;
+  const session = native ? nativeEvidenceServices().session : null;
+  if (session) await session.pending();
+  if (session?.hasUnconfirmedSave()) return false;
+  if (!caseSaveActive && !caseSavePending && (session ? !session.isClean() : failedCaseStores.has(state.cases))) {
+    if (session && document.querySelector?.(".case-content-editor,.case-trail-editor")) return false;
+    saveCases();
+  }
+  for (;;) {
+    while (caseSaveActive || caseSavePending) {
+      const batch = caseSaveActive || caseSavePending;
+      if (caseSavePending) {
+        clearTimeout(caseSaveTimer);
+        caseSaveTimer = null;
+        caseSavePending.ready = true;
+        void drainCaseSaves();
+      }
+      if (!await batch.promise) return false;
+    }
+    // A completed save's callers may enqueue a follow-up in their .then/await
+    // continuation. Include it before declaring a close flush complete.
+    await Promise.resolve();
+    if (!caseSaveActive && !caseSavePending) {
+      await casesSaveQueue;
+      if (session) await session.pending();
+      if (caseSaveActive || caseSavePending) continue;
+      return session ? session.isClean() : !failedCaseStores.has(state.cases);
+    }
+  }
+}
+
+function installCaseSaveLifecycle() {
+  window.addEventListener?.("beforeunload", event => {
+    if (!caseSavesPending()) return;
+    event.preventDefault();
+    event.returnValue = "";
+    void flushCaseSaves();
+  });
+  const nativeWindow = window.__TAURI__?.window?.getCurrentWindow();
+  if (nativeWindow) {
+    let closing = false;
+    nativeWindow.onCloseRequested(async event => {
+      if (closing) { event.preventDefault(); return; }
+      closing = true;
+      // Tauri awaits this callback before destroying the window. Failed writes
+      // leave the UI open and editable, including an explicit retry on close.
+      try {
+        do { if (!await flushCaseSaves()) { event.preventDefault(); return; } }
+        while (caseSavesPending());
+      }
+      catch (error) { event.preventDefault(); reportCaseSaveError(error); }
+      finally { closing = false; }
+    }).catch(error => { reportCaseSaveError(`Não foi possível proteger o fechamento: ${error}`); });
+  }
+}
+
+installCaseSaveLifecycle();
 
 function defaultCaseWorkspace() {
   return {
@@ -6056,6 +6161,41 @@ function currentIndex() {
 }
 
 let detailRequest = 0;
+let detailRevealed = false;
+function resetDetailVisibility() {
+  detailRevealed = false;
+  window.ValueInspector?.close();
+  window.EventInsights?.clear();
+  for (const pane of ["overview", "json", "raw"]) $("#pane-" + pane).replaceChildren();
+  $("#detail-visibility")?.remove();
+}
+function mountDetailVisibility({ repaint, inspect, current = () => true }) {
+  $("#detail-visibility")?.remove();
+  const bar = el("div", "detail-visibility"); bar.id = "detail-visibility";
+  const reveal = el("button", "btn ghost small", detailRevealed ? "Ocultar valores" : "Mostrar valores ocultos");
+  reveal.type = "button"; reveal.id = "dr-reveal"; reveal.setAttribute("aria-pressed", String(detailRevealed));
+  const structure = el("button", "btn ghost small", "Inspecionar estrutura"); structure.type = "button";
+  structure.onclick = () => { if (current()) inspect(); };
+  reveal.onclick = () => {
+    if (!current()) { toast("O contexto mudou. Abra o registro novamente.", "info"); return; }
+    const pane = $("#drawer .dtab.active")?.dataset.pane || "overview";
+    detailRevealed = !detailRevealed; window.ValueInspector?.close(); closeDetailValue();
+    repaint(); window.EventInsights?.setRevealed(state.currentDetailEv, detailRevealed);
+    mountDetailVisibility({ repaint, inspect, current }); switchDetailTab(pane); $("#dr-reveal").focus();
+  };
+  bar.append(reveal, structure, el("span", "muted small", detailRevealed
+    ? "Visíveis neste detalhe; fechar ou trocar de registro oculta novamente. Conteúdo já omitido na fonte não é recuperável."
+    : "Valores protegidos. Revelar mostra somente conteúdo disponível; valores já ocultados na fonte não são recuperáveis."));
+  $("#drawer .drawer-tabs").after(bar);
+  $("#dr-copy").title = detailRevealed ? "Copiar JSON com valores revelados" : "Copiar JSON com valores protegidos";
+}
+function inspectDetailStructure(node) {
+  const request = detailRequest, event = state.currentDetailEv, admission = state.detailAdmission;
+  const current = () => request === detailRequest && event === state.currentDetailEv && !$("#drawer").hidden && (!admission || detailAdmissionCurrent(admission));
+  if (!current()) return;
+  const value = node.original && Object.hasOwn(node, "filterValue") ? node.filterValue : node.value;
+  return window.ValueInspector?.open(value, { label: node.path, path: `$[${JSON.stringify(node.path)}]`, revealed: detailRevealed, isCurrent: current });
+}
 let detailDeferredPane = null;
 function detailAdmissionCurrent(admission) {
   return !!admission && admission.scope === workspaceScope() && (!admission.owner || window.AnalysisContexts.isCurrent(admission.owner))
@@ -6117,6 +6257,7 @@ async function openDetail(id, { eventRef = null, guard = () => true, recordFocus
 
 // abre o drawer imediatamente com estado de espera (o conteúdo chega via event_detail)
 function showDetailLoading() {
+  resetDetailVisibility();
   state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear(); detailDeferredPane = null;
   closeDetailValue();
@@ -6137,6 +6278,7 @@ function showDetailLoading() {
 }
 
 function openContextInspector(title, subtitle, overview) {
+  resetDetailVisibility();
   state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear();
   closeDetailValue();
@@ -6247,9 +6389,12 @@ let detailValueText = "";
 let detailValueNode = null;
 function closeDetailValue() {
   const modal = $("#detail-value-modal");
-  if (modal.hidden) return;
+  const wasOpen = !modal.hidden;
   modal.hidden = true;
-  detailValueReturnFocus?.focus?.();
+  $("#detail-value-content").replaceChildren();
+  $("#detail-value-inspect")?.remove();
+  detailValueText = "";
+  if (wasOpen) detailValueReturnFocus?.focus?.();
   detailValueReturnFocus = null;
   detailValueNode = null;
 }
@@ -6262,6 +6407,9 @@ function openDetailValue(node, trigger) {
   $("#detail-value-title").textContent = node.path;
   $("#detail-value-type").textContent = formatted.type;
   $("#detail-value-content").innerHTML = formatted.html;
+  $("#detail-value-inspect")?.remove();
+  const inspect = el("button", "btn ghost small", "Inspecionar subcampos"); inspect.id = "detail-value-inspect"; inspect.type = "button";
+  inspect.onclick = () => inspectDetailStructure(node); $("#detail-value-content").before(inspect);
   $("#detail-value-modal").hidden = false;
   $("#detail-value-close").focus();
 }
@@ -6287,6 +6435,10 @@ function detailCanonicalAction(column, node, anchor) {
     historical: !admission || !state.columns.includes(node.path) && !window.AnalysisFields?.admitted(node, admission, event),
     literal: Object.hasOwn(node, "filterValue") ? node.filterValue : node.value,
     guard: () => request === detailRequest && event === state.currentDetailEv && !$("#drawer").hidden && (!admission || detailAdmissionCurrent(admission)) });
+}
+
+function copyDetailField(action) {
+  return window.CanonicalFields.copy(action, { present: text => detailRevealed ? text : window.EvidenceUI.redact({ [action.column]: text })[action.column] });
 }
 
 function toggleDetailColumn(column) {
@@ -6331,6 +6483,7 @@ function showDetailValueMenu(event, node, selected = "", inModal = false) {
   const actual = column === node.path;
   const raw = actual ? detailFieldFilterValue(node) : String(node.value ?? "");
   const text = selected || (typeof node.value === "object" ? JSON.stringify(node.value) : raw);
+  const labelText = detailRevealed ? text : window.EvidenceUI.redact({ [node.path]: text })[node.path];
   const sourceText = column && state.currentDetailEv ? String(cellValue(state.currentDetailEv, column) ?? "") : "";
   const canContain = !!column && !!text.trim() && sourceText.includes(text);
   const exact = detailCanonicalAction(column || node.path, node, event.target);
@@ -6340,17 +6493,17 @@ function showDetailValueMenu(event, node, selected = "", inModal = false) {
   if (column) items.push({ icon: "fa-filter", label: `Criar filtro: ${colLabel(column)}`, onClick: () => window.CanonicalFields.filter(action, { op: selected ? "contains" : null }) });
   if (column && text.trim()) {
     if (actual && !selected) items.push(
-      { icon: "fa-filter", label: `Filtrar valor exato: ${trunc(text)}`, onClick: () => window.CanonicalFields.filter(exact, { apply: true }) },
-      { icon: "fa-filter-circle-xmark", label: `Excluir valor: ${trunc(text)}`, onClick: () => window.CanonicalFields.filter(exact, { op: "not_equals_exact", apply: true }) },
+      { icon: "fa-filter", label: `Filtrar valor exato: ${trunc(labelText)}`, onClick: () => window.CanonicalFields.filter(exact, { apply: true }) },
+      { icon: "fa-filter-circle-xmark", label: `Excluir valor: ${trunc(labelText)}`, onClick: () => window.CanonicalFields.filter(exact, { op: "not_equals_exact", apply: true }) },
     );
     if (canContain) items.push(
-      { icon: "fa-magnifying-glass", label: `${actual ? "Filtrar" : `Filtrar em ${colLabel(column)}`} contendo: ${trunc(text)}`, onClick: () => window.CanonicalFields.filter(action, { op: "contains", apply: true }) },
-      { icon: "fa-filter-circle-xmark", label: `${actual ? "Excluir" : `Excluir em ${colLabel(column)}`} contendo: ${trunc(text)}`, onClick: () => window.CanonicalFields.filter(action, { op: "not_contains", apply: true }) },
+      { icon: "fa-magnifying-glass", label: `${actual ? "Filtrar" : `Filtrar em ${colLabel(column)}`} contendo: ${trunc(labelText)}`, onClick: () => window.CanonicalFields.filter(action, { op: "contains", apply: true }) },
+      { icon: "fa-filter-circle-xmark", label: `${actual ? "Excluir" : `Excluir em ${colLabel(column)}`} contendo: ${trunc(labelText)}`, onClick: () => window.CanonicalFields.filter(action, { op: "not_contains", apply: true }) },
     );
     items.push({ sep: true });
   }
   if (!inModal) items.push({ icon: "fa-expand", label: "Ver conteúdo completo", onClick: () => openDetailValue(node, event.target) });
-  items.push({ icon: "fa-copy", label: selected ? "Copiar seleção" : "Copiar valor", onClick: () => window.CanonicalFields.copy(action) });
+  items.push({ icon: "fa-copy", label: selected ? "Copiar seleção" : "Copiar valor", onClick: () => copyDetailField(action) });
   if (column && selected && canContain && state.currentDetailEv) items.push(
     { sep: true },
     { icon: "fa-square-plus", label: "Criar campo a partir da seleção", onClick: () => openDeriveModal(selected, column, cellValue(state.currentDetailEv, column)) },
@@ -6406,6 +6559,10 @@ function renderDetailTree(entries, collapsedPaths = new Set()) {
       value.onclick = () => openDetailValue(node, value);
       value.oncontextmenu = (event) => showDetailValueMenu(event, node);
       valueLine.appendChild(value);
+      const inspect = el("button", "kv-inspect"); inspect.type = "button";
+      inspect.innerHTML = '<i class="fas fa-code" aria-hidden="true"></i>';
+      inspect.setAttribute("aria-label", `Inspecionar ${node.path}`); inspect.title = "Inspecionar valor e subcampos";
+      inspect.onclick = () => inspectDetailStructure(node); valueLine.append(inspect);
       if (node.original && (state.columns.includes(node.path) || window.AnalysisFields?.admitted(node)) && node.filterValue != null && String(node.filterValue).trim() !== "" && node.path !== "raw") {
         const filter = el("button", "kv-filter");
         filter.type = "button";
@@ -6436,6 +6593,7 @@ function renderDetailTree(entries, collapsedPaths = new Set()) {
 }
 
 function showDetail(ev, sourceSpec = null, admission = null) {
+  resetDetailVisibility();
   if (!admission) state.recordDrawerReturn = null;
   window.CaseEvidenceDetail?.clear();
   closeDetailValue();
@@ -6459,11 +6617,11 @@ function showDetail(ev, sourceSpec = null, admission = null) {
   const lv = el("span", "badge");
   lv.style.background = "color-mix(in srgb, " + levelColor(ev.level) + " 18%, transparent)";
   lv.style.color = levelColor(ev.level);
-  lv.textContent = ev.level;
+  lv.textContent = window.EvidenceUI.redact(ev.level);
   const badges = $("#drawer-badges");
   badges.appendChild(lv);
-  if (ev.code) badges.appendChild(el("span", "badge code", `#${ev.code}`));
-  if (ev.name) badges.appendChild(el("span", "badge code", ev.name));
+  if (ev.code) badges.appendChild(el("span", "badge code", `#${window.EvidenceUI.redact(ev.code)}`));
+  if (ev.name) badges.appendChild(el("span", "badge code", window.EvidenceUI.redact(ev.name)));
 
   const javaRequest = detailRequest;
   const javaCurrent = () => javaRequest === detailRequest && state.currentDetailEv === ev && !$("#drawer").hidden
@@ -6476,7 +6634,7 @@ function showDetail(ev, sourceSpec = null, admission = null) {
     cancel: () => window.Tasks?.cancelLatest("java-trace-detail"),
     raw: () => switchDetailTab("raw"),
     original: (column, anchor) => openDetailValue({ path: column, original: true, hasValue: true,
-      value: window.EvidenceUI ? EvidenceUI.redact({ [column]: ev.fields[column] })[column] : ev.fields[column],
+      value: detailRevealed ? ev.fields[column] : window.EvidenceUI.redact({ [column]: ev.fields[column] })[column],
       filterValue: ev.fields[column], mono: true }, anchor),
     scalarMenu: (event, column) => {
       const anchor = event.currentTarget || event.target, box = anchor.getBoundingClientRect();
@@ -6487,9 +6645,14 @@ function showDetail(ev, sourceSpec = null, admission = null) {
     menu: (event, items) => showCtxMenu(event.clientX, event.clientY, items),
     copied: () => toast("Valor copiado.", "ok"), copyFailed: () => toast("Não foi possível copiar.", "err"),
   });
+  const paint = () => {
+  const display = value => detailRevealed ? value : window.EvidenceUI.redact(value);
+  lv.textContent = display(ev.level); badges.replaceChildren(lv);
+  if (ev.code) badges.appendChild(el("span", "badge code", `#${display(ev.code)}`));
+  if (ev.name) badges.appendChild(el("span", "badge code", display(ev.name)));
   const rows = [];
   const push = (key, value, mono, filterValue = value) => rows.push({
-    key, value: window.EvidenceUI ? EvidenceUI.redact({ [key]: value ?? "" })[key] : value ?? "", mono, filterValue,
+    key, value: detailRevealed ? value ?? "" : window.EvidenceUI.redact({ [key]: value ?? "" })[key], mono, filterValue,
   });
   push("timestamp", fmtTsFull(ev.timestamp), true, ev.timestamp);
   push("source", ev.source);
@@ -6515,14 +6678,18 @@ function showDetail(ev, sourceSpec = null, admission = null) {
   const renderPane = which => {
     if (javaRequest !== detailRequest || state.currentDetailEv !== ev || renderedPanes.has(which)) return;
     if (javaTrace && ($("#drawer").hidden || admission && !detailAdmissionCurrent(admission))) return;
-    if (which === "json") $("#pane-json").innerHTML = highlightJson(window.EvidenceUI ? EvidenceUI.redact(ev) : ev);
-    else if (which === "raw") $("#pane-raw").textContent = (window.EvidenceUI ? EvidenceUI.redact(ev.raw) : ev.raw) || "(sem conteúdo bruto)";
+    if (which === "json") $("#pane-json").innerHTML = highlightJson(display(ev));
+    else if (which === "raw") $("#pane-raw").textContent = display(ev.raw) || "(sem conteúdo bruto)";
     else return;
     renderedPanes.add(which);
   };
   detailDeferredPane = javaTrace ? renderPane : null;
   if (javaTrace) { $("#pane-json").textContent = ""; $("#pane-raw").textContent = ""; }
   else { renderPane("json"); renderPane("raw"); }
+  };
+  paint();
+  mountDetailVisibility({ repaint: paint, current: javaCurrent,
+    inspect: () => window.ValueInspector?.open(ev, { label: "Estrutura do registro", revealed: detailRevealed, isCurrent: javaCurrent }) });
 
   $("#drawer").hidden = false;
   $("#drawer-scrim").hidden = false;
@@ -6559,6 +6726,7 @@ function closeDrawer() {
   const restoreRecord = recordReturn && ($("#drawer").contains(document.activeElement)
     || $("#detail-value-modal").contains(document.activeElement) || document.activeElement === document.body);
   state.recordDrawerReturn = null;
+  resetDetailVisibility();
   window.CaseEvidenceDetail?.clear();
   detailRequest++;
   detailDeferredPane = null;
@@ -6566,6 +6734,7 @@ function closeDrawer() {
   window.Tasks?.cancelLatest("event-detail");
   window.Tasks?.cancelLatest("java-trace-detail");
   state.detailId = null;
+  $("#drawer-badges").replaceChildren();
   closeDetailValue();
   $("#drawer").hidden = true;
   $("#drawer-scrim").hidden = true;
@@ -6581,7 +6750,7 @@ async function copyDetail() {
   if (state.detailAdmission && !detailAdmissionCurrent(state.detailAdmission)) {
     toast("O contexto mudou. Abra o registro novamente antes de copiar.", "info"); return;
   }
-  await navigator.clipboard.writeText(JSON.stringify(event, null, 2));
+  await navigator.clipboard.writeText(JSON.stringify(detailRevealed ? event : window.EvidenceUI.redact(event), null, 2));
   toast("JSON copiado.", "ok");
 }
 
@@ -7651,7 +7820,7 @@ function bind() {
   };
   $("#detail-value-copy").onclick = async () => {
     if (window.CaseEvidenceDetail?.ownsValue(detailValueNode)) return window.CaseEvidenceDetail.copyValue(detailValueNode, $("#detail-value-copy"));
-    if (detailValueNode) await window.CanonicalFields.copy(detailCanonicalAction(detailFieldColumn(detailValueNode) || detailValueNode.path, detailValueNode, $("#detail-value-copy")));
+    if (detailValueNode) await copyDetailField(detailCanonicalAction(detailFieldColumn(detailValueNode) || detailValueNode.path, detailValueNode, $("#detail-value-copy")));
   };
   $("#detail-value-content").oncontextmenu = (event) => {
     if (!detailValueNode) return;

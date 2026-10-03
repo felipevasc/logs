@@ -396,7 +396,8 @@ test('the installed drawer wiring opts into native detail without storing rich t
     const FieldTransforms={renderDiagnostics:ev=>{assert.equal(ev,event);return diagnostics;}};
     const window={EvidenceUI,FieldTransforms,Tasks:{cancelLatest:key=>captured.cancelled.push(key)}};
     if(mode!=='unavailable')window.JavaTrace={render(ev,options){captured.event=ev;captured.options=options;return mode==='success'?specialized:null;}};
-    const context=vm.createContext({ev:event,admission,state,detailRequest:4,detailDeferredPane:null,window,EvidenceUI,
+    const context=vm.createContext({ev:event,admission,state,detailRequest:4,detailDeferredPane:null,detailRevealed:false,window,EvidenceUI,
+      lv:{textContent:''},badges:{replaceChildren(){},appendChild(){}},el:()=>({}),mountDetailVisibility:options=>{captured.visibility=options;},
       $:selector=>{assert.ok(Object.hasOwn(nodes,selector),selector);return nodes[selector];},fmtTsFull:()=> 'formatted timestamp',
       caseEvents:()=>evidence,loadJavaTraceDetail:async(...args)=>{captured.loads.push(args);return available(event);},
       highlightJson:value=>{captured.highlights.push(value);return 'highlighted json';},

@@ -8,6 +8,13 @@
 //! text containing the needle, so the rows holding a word that contains each
 //! piece are a superset of the matches. Words too long to index become a
 //! marker that every search includes.
+#[cfg(any(windows, test))]
+#[path = "../atomic_metadata.rs"]
+mod atomic_metadata;
+#[cfg(windows)]
+#[path = "metadata_directory.rs"]
+mod metadata_directory;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -199,8 +206,20 @@ impl Writer {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let (schema, lid, text, hex) = schema();
         let settings = IndexSettings { docstore_compress_dedicated_thread: false, ..IndexSettings::default() };
+        #[cfg(not(windows))]
         let index = Index::builder().schema(schema).settings(settings).create_in_dir(dir)
             .map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        let index = {
+            let directory = metadata_directory::MetadataDirectory::open(dir)
+                .map_err(|e| e.to_string())?;
+            // Match create_in_dir's refusal to overwrite an existing index.
+            if Index::exists(&directory).map_err(|e| e.to_string())? {
+                return Err(tantivy::TantivyError::IndexAlreadyExists.to_string());
+            }
+            Index::create(directory, schema, settings)
+                .map_err(|e| e.to_string())?
+        };
         let memory = memory.max(16 << 20);
         let writer = SerialWriter { index, active: None, segments: Vec::new(), memory, flush_bytes: memory };
         Ok(Writer { writer: parking_lot::Mutex::new(writer), lid, text, hex, max_hex_word: AtomicUsize::new(0), dir: dir.to_path_buf() })

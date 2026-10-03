@@ -13,7 +13,7 @@ vm.runInNewContext(source.replace('  function mount(', '  window.integrationArtw
 
 test('the complete seven-family six-reaction component has two bounded source assets and no external artwork', () => {
   const jsBytes = Buffer.byteLength(source), cssBytes = Buffer.byteLength(css);
-  assert.ok(jsBytes < 40000 && cssBytes < 240000 && jsBytes + cssBytes < 280000);
+  assert.ok(jsBytes < 46000 && cssBytes < 240000 && jsBytes + cssBytes < 280000);
   assert.deepEqual(Object.keys(window.WaitingVisuals.adapters).sort(), ['access', 'calculation', 'checkpoint', 'composition', 'reading', 'restoration', 'verification']);
   assert.deepEqual(Object.keys(window.WaitingVisuals.repertoire).sort(), ['coffee', 'manual', 'review', 'stretch', 'visor', 'wave']);
   assert.doesNotMatch(css, /url\(|@import|@font-face/i);
@@ -34,7 +34,7 @@ test('all 183 base keyframes including manual shelf and short aliases are byte-i
     let end = match.index + match[0].length, depth = 1;
     while (depth && end < css.length) { if (css[end] === '{') depth++; if (css[end] === '}') depth--; end++; }
     assert.equal(depth, 0);
-    if (!/^wv-(?:access|restore|visor|wave)-/.test(match[1])) frames.push([match[1], css.slice(match.index, end)]);
+    if (match[1] !== 'wv-gesture-boundary' && !/^wv-(?:access|restore|visor|wave)-/.test(match[1])) frames.push([match[1], css.slice(match.index, end)]);
   }
   assert.equal(frames.length, 183);
   assert.equal(hash(JSON.stringify(frames)), 'efac8af440c4a8d6a2a71c5dd126f9d9291188bbe4978e157137b1e8a362ae73');

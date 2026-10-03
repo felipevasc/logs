@@ -67,7 +67,7 @@ context.pushLoadStep = () => {};
 context.setTimeout = fn => timers.push(fn);
 const waitingViews = [];
 context.window.WaitingVisuals = { mount: (_host, snapshot) => {
-  const view = { snapshot, destroyed: false, update(next) { this.snapshot = next; }, destroy() { this.destroyed = true; } }; waitingViews.push(view); return view;
+  const view = { snapshot, destroyed: false, update(next) { this.snapshot = next; }, complete() { this.completed = true; }, destroy() { this.destroyed = true; } }; waitingViews.push(view); return view;
 } };
 vm.runInContext(source.slice(source.indexOf('let loadStepCount ='), source.indexOf('\nfunction pushLoadStep')), context);
 context.showLoadOverlay('Aplicando configuração de data/hora', 'timestamp-config');
@@ -122,7 +122,7 @@ assert.equal(timestampRefreshed, 1); assert.equal(timestampReleased, 1);
 assert.ok(!timestampNotices.some(message => message.includes('Falha')), 'the actual apply path completed successfully');
 context.hideLoadOverlay(true);
 assert.equal(context.$('#load-overlay').hidden, true, 'success never waits for a decorative animation to finish');
-assert.equal(waitingViews[0].destroyed, true, 'settled foreground view releases its observers');
+assert.equal(waitingViews[0].completed, true, 'settlement requests non-blocking continuation');
 context.showLoadOverlay('Nova fonte');
 assert.equal(timers.length, 0, 'no previous success timer can hide a newer load');
 assert.equal(context.$('#load-overlay').hidden, false, 'previous success animation cannot hide a newer load');

@@ -190,3 +190,31 @@ fn structured_http_fields_have_exact_line_and_columnar_query_parity() {
         serde_json::to_value(next).unwrap()
     );
 }
+
+#[test]
+fn wrapped_http_metadata_uses_outer_nanoseconds_and_bounded_query_fields() {
+    let content = [
+        json!({"labels":{},"timestamp":"2026-09-16T20:55:04.550942594-03:00",
+            "line":"192.0.2.80 - - [16/Sep/2026:20:55:04 -0300] \"OPTIONS /api/example/create-session HTTP/1.1\" 204 0 \"https://example.org/\" \"synthetic-client/1.0\""}),
+        json!({"labels":{"job":"synthetic"},
+            "line":"192.0.2.80 - - [16/Sep/2026:20:55:05 -0300] \"GET /api/items?page=1&isAssigned=false&tags=one%2C+two HTTP/1.1\" 200 1 \"-\" \"synthetic-client/1.0\""}),
+    ].into_iter().map(|value| value.to_string()).collect::<Vec<_>>().join("\n");
+    let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("wrapped.jsonl"); let cache = dir.path().join("cache");
+    std::fs::write(&path, &content).unwrap();
+    let cold = probe(&path, "auto", &cache, false);
+    assert_eq!(cold["rows"], 2); assert_eq!(cold["parsedRows"], 2);
+    assert_eq!(cold["events"][0]["timestamp"], 1789602904550i64); assert_eq!(cold["metadata"][0][2], 1789602904550i64);
+    assert_eq!(cold["events"][0]["fields"]["method"], "OPTIONS");
+    assert_eq!(cold["events"][1]["fields"]["request.page"], "1");
+    assert_eq!(cold["events"][1]["fields"]["path.isAssigned"], "false");
+    assert_eq!(cold["events"][1]["fields"]["path.tags"], "one, two");
+    for column in ["method","client_ip","line.method","request.page","path.tags"] {
+        assert!(cold["columns"].as_array().unwrap().iter().any(|value| value == column));
+    }
+    let warm = probe(&path, "auto", &cache, false); let oracle = probe(&path, "auto", &cache, true);
+    assert_eq!(warm["parsedRows"], 0); assert_eq!(warm["resumedRows"], 2);
+    for key in ["key","columns","events","metadata"] {
+        assert_eq!(cold[key], warm[key], "warm {key}"); assert_eq!(cold[key], oracle[key], "oracle {key}");
+    }
+    for (record, event) in content.lines().zip(cold["events"].as_array().unwrap()) { assert_eq!(event["raw"], record); }
+}

@@ -86,11 +86,11 @@ window.CanonicalFields = (() => {
       else openValueFilter(action.column, text, action.anchor, operator);
     });
   }
-  function copy(action) {
+  function copy(action, { present = text => text } = {}) {
     return run(action, async (result, ownsCompletion) => {
       if (result.canonicalText === null) throw Error("O campo não tem um valor para copiar neste registro.");
       const focusAtWrite = document.activeElement;
-      await navigator.clipboard.writeText(result.canonicalText);
+      await navigator.clipboard.writeText(present(result.canonicalText));
       if (ownsCompletion()) {
         toast("Valor copiado.", "ok");
         if (document.activeElement === focusAtWrite) focusBack(action);

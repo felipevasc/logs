@@ -118,6 +118,13 @@ pub struct LineStore {
     ends: Vec<usize>,
     len: usize,
 }
+
+/// Descriptor-only accounting; mapped lengths are never resident-memory claims.
+pub(crate) struct ResourceUsage {
+    pub heap_bytes: u64,
+    pub mapped_bytes: u64,
+    pub partial: bool,
+}
 impl From<Vec<LineMeta>> for LineStore {
     fn from(rows: Vec<LineMeta>) -> Self {
         let len = rows.len();
@@ -138,6 +145,36 @@ impl From<Vec<LineMeta>> for LineStore {
     }
 }
 impl LineStore {
+    pub(crate) fn resource_usage(&self) -> ResourceUsage {
+        const MAX_SPANS: usize = 1024;
+        let mut usage = ResourceUsage {
+            heap_bytes: (std::mem::size_of::<Self>() as u64)
+                .saturating_add((self.spans.capacity() as u64).saturating_mul(std::mem::size_of::<Span>() as u64))
+                .saturating_add((self.ends.capacity() as u64).saturating_mul(std::mem::size_of::<usize>() as u64)),
+            mapped_bytes: 0,
+            partial: self.spans.len() > MAX_SPANS,
+        };
+        let mut records = std::collections::HashSet::new();
+        let mut maps = std::collections::HashSet::new();
+        for span in self.spans.iter().take(MAX_SPANS) {
+            if records.insert(Arc::as_ptr(&span.records) as usize) {
+                usage.heap_bytes = usage.heap_bytes.saturating_add((std::mem::size_of::<Records>() + 2 * std::mem::size_of::<usize>()) as u64);
+                if let Records::Owned(rows) = span.records.as_ref() {
+                    usage.heap_bytes = usage.heap_bytes.saturating_add((rows.capacity() as u64).saturating_mul(std::mem::size_of::<LineMeta>() as u64));
+                }
+            }
+            let record_map = match span.records.as_ref() { Records::Packed { map, .. } => Some(map), _ => None };
+            let timestamp_map = span.timestamps.as_ref().map(|(timestamps, _)| &timestamps.map);
+            for map in record_map.into_iter().chain(timestamp_map) {
+                if maps.insert(Arc::as_ptr(map) as usize) {
+                    usage.heap_bytes = usage.heap_bytes.saturating_add((std::mem::size_of::<Mapping>() + 2 * std::mem::size_of::<usize>()) as u64);
+                    usage.mapped_bytes = usage.mapped_bytes.saturating_add(map.bytes.len() as u64);
+                }
+            }
+        }
+        usage
+    }
+
     /// The mapping has passed journal identity, full checksum and record-bound
     /// validation while holding `lease`. Writers and pruning use its exclusive
     /// counterpart; they must never unlink the stable lock file.
@@ -708,6 +745,34 @@ impl TimestampWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resource_usage_counts_shared_retained_allocations_once_without_reading_rows() {
+        let mut rows = Vec::with_capacity(64);
+        rows.extend((0..4).map(row));
+        let capacity = rows.capacity();
+        let original = LineStore::from(rows);
+        let mut joined = original.slice(0..1);
+        joined.append_relocated(&original.slice(2..3), 1000).unwrap();
+        let usage = joined.resource_usage();
+        let expected = std::mem::size_of::<LineStore>()
+            + joined.spans.capacity() * std::mem::size_of::<Span>()
+            + joined.ends.capacity() * std::mem::size_of::<usize>()
+            + std::mem::size_of::<Records>() + 2 * std::mem::size_of::<usize>()
+            + capacity * std::mem::size_of::<LineMeta>();
+        assert_eq!(usage.heap_bytes, expected as u64);
+        assert_eq!(usage.mapped_bytes, 0);
+        assert!(!usage.partial);
+
+        let map = Arc::new(Mapping { bytes: memmap2::MmapMut::map_anon(128).unwrap().make_read_only().unwrap(), _lease: None, _private_file: None });
+        let records = Arc::new(Records::Packed { map: Arc::clone(&map), byte_start: 0 });
+        let span = Span { records, first: 0, len: 1, offset_delta: 0,
+            timestamps: Some((Timestamps { map, byte_start: 0, len: 1 }, 0)) };
+        let bounded = LineStore { spans: vec![span; 1025], ends: (1..=1025).collect(), len: 1025 };
+        let usage = bounded.resource_usage();
+        assert_eq!(usage.mapped_bytes, 128, "shared record/timestamp maps count once");
+        assert!(usage.partial, "descriptor visits are bounded independently of row count");
+    }
+
     fn row(i: u64) -> LineMeta {
         LineMeta {
             offset: i * 101,

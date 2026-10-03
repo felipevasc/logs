@@ -131,9 +131,11 @@ try {
 
   await page.evaluate(async () => {
     const original = api;
-    api = async (name, args, opts) => { if (name === "aggregate_events") throw new Error("Falha de conexão de teste"); return original(name, args, opts); };
-    try { await runGroup({ force: true }); } finally { api = original; }
+    window.__forcedGroupRefreshCalls = 0;
+    api = async (name, args, opts) => { if (name === "aggregate_events") { window.__forcedGroupRefreshCalls++; throw new Error("Falha de conexão de teste"); } return original(name, args, opts); };
+    try { await document.querySelector("#btn-run-group").onclick(); } finally { api = original; }
   });
+  assert.equal(await page.evaluate(() => window.__forcedGroupRefreshCalls), 1, "explicit refresh consults the backend despite a matching cached result");
   assert.equal(await page.locator("#group-table tbody tr").count(), 0, "failed recalculation must not present stale totals");
   await page.locator("#aw-group-summary").getByRole("button", { name: "Detalhes", exact: true }).click();
   assert.match(await page.locator("#analysis-help .modal-body").textContent(), /Falha de conexão de teste/);

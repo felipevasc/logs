@@ -76,6 +76,37 @@ function fixture() {
   return { context, state, pending, calls, messages, refreshReads, refreshTotals, node, get native() { return native; }, counts: (physical, visible) => { physicalCount = physical; visibleCount = visible; }, prepare: fn => { prepare = fn; }, sourceWait: fn => { sourceWait = fn; }, snapshotFailure: value => { snapshotFailure = value; } };
 }
 
+// CI84: loaded rows are not an idle source. Keep the final source confirmation
+// pending to reproduce why opening a detail at the old readiness predicate races
+// with Summary navigation. No sleeps or speed assumptions are involved.
+{
+  const f = fixture();
+  f.context.document.body.dataset.page = 'summary';
+  let releaseSave, releaseSources, navigations = 0;
+  f.context.storeCurrentArtifactInSession = () => new Promise(resolve => { releaseSave = resolve; });
+  f.context.window.Workspace = {
+    loaded: () => new Promise(resolve => { releaseSources = resolve; }),
+    showPage: async () => { navigations++; f.context.closeDrawer(); },
+  };
+  f.context.closeDrawer = () => { f.node('#drawer').hidden = true; };
+  const loading = f.context.loadData(file('initial-source')); await settle();
+  f.pending[0].complete(); await settle();
+  assert.equal(f.state.loaded && f.state.rows.length > 0, true, 'the old inspector readiness predicate admits an unfinished load');
+  assert.equal(f.node('#btn-load').disabled, true, 'session persistence still owns the source operation');
+  assert.equal(f.state.loadOverlay, true);
+  releaseSave(true); await settle();
+  assert.equal(typeof releaseSources, 'function');
+  assert.equal(f.state.loadOverlay, false, 'overlay completion alone precedes source-list confirmation');
+  assert.equal(f.node('#btn-load').disabled, true, 'the source action remains disabled until final navigation');
+  f.node('#drawer').hidden = false;
+  releaseSources(); assert.equal(await loading, true);
+  assert.equal(navigations, 1);
+  assert.equal(f.node('#drawer').hidden, true, 'final Summary navigation invalidates a prematurely opened detail');
+  assert.equal(f.node('#btn-load').disabled, false, 'the finalizer exposes the safe detail-fixture boundary');
+  f.node('#drawer').hidden = false; await settle();
+  assert.equal(f.node('#drawer').hidden, false, 'no initial source navigation remains after the readiness boundary');
+}
+
 // Import/publication counts describe physical records; exclusions change visible totals.
 const visibility = fixture(); visibility.counts(50, 7);
 visibility.state.total = 999; visibility.state.pageResult = { total: 999 };

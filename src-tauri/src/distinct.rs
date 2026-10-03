@@ -142,7 +142,9 @@ impl Counter {
         if bounded { check_spill_failure()?; }
         let bytes = value.len().saturating_add(64);
         if let Some(db) = &self.disk {
-            let added = db.execute("INSERT OR IGNORE INTO vals(v) VALUES(?1)", [value]).map_err(|e| e.to_string())?;
+            let added = db.prepare_cached("INSERT OR IGNORE INTO vals(v) VALUES(?1)")
+                .and_then(|mut statement| statement.execute([value]))
+                .map_err(|e| e.to_string())?;
             self.count += added;
             return Ok(if added > 0 { bytes } else { 0 });
         }
@@ -177,6 +179,21 @@ impl Counter {
 #[cfg(test)]
 mod counter_tests {
     use super::Counter;
+
+    #[test]
+    fn cached_spill_statement_preserves_fallible_counts_and_new_payload_budget() {
+        let mut counter = Counter::default();
+        let first = "日".repeat(Counter::BYTES / 3 + 1);
+        assert_eq!(counter.try_insert(first.clone()).unwrap(), first.len() + 64);
+        assert!(counter.disk.is_some());
+        assert_eq!(counter.try_insert(first).unwrap(), 0);
+        for n in 0..1000 {
+            let value = format!("東京-{n}");
+            assert_eq!(counter.try_insert(value.clone()).unwrap(), value.len() + 64);
+            assert_eq!(counter.try_insert(value).unwrap(), 0);
+        }
+        assert_eq!(counter.len(), 1001);
+    }
 
     #[test]
     fn distinct_spills_by_bytes_before_key_count() {

@@ -1,59 +1,78 @@
-import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { readdir, mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { spawnManaged, waitManaged, previewEnvironment } from "./managed-process.mjs";
 import { fullPreview } from "../ci/validation-plan.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const selected = process.argv.slice(2);
+// Historical restore probes have no assertions; the native test requires a
+// Windows executable and runs separately against real IPC, without this mock.
+const separateTests = new Set(["test-restore.mjs", "test-restore2.mjs", "test-native-desktop.mjs"]);
+const available = (await readdir(new URL("./", import.meta.url)))
+  .filter(name => /^test-[a-z0-9-]+\.mjs$/.test(name) && !separateTests.has(name)).sort();
 const tests = selected.length ? selected : fullPreview;
-for (const name of tests) {
-  if (!/^test-[a-z0-9-]+\.mjs$/.test(name)) throw new Error(`Invalid preview test name: ${name}`);
-}
+for (const name of tests) if (!available.includes(name)) throw new Error(`Unknown regression test: ${name}`);
 await mkdir(new URL("../../output/playwright/", import.meta.url), { recursive: true });
-const server = spawn(process.execPath, ["scripts/preview/serve.mjs", "0"], { cwd: root, stdio: ["ignore", "pipe", "inherit"] });
-let active;
-const stop = () => { active?.kill(); server.kill(); };
-process.on("SIGINT", () => { stop(); process.exitCode = 130; });
-process.on("SIGTERM", () => { stop(); process.exitCode = 143; });
+const environment = previewEnvironment();
+const server = spawnManaged(["scripts/preview/serve.mjs", "0"], {
+  cwd: root, stdout: "pipe", env: environment,
+});
+let active, interrupted = false, cleanupFailure = null, runError = null;
+const stop = async () => {
+  const outcomes = await Promise.allSettled([active?.stop(), server.stop()]);
+  for (const outcome of outcomes) if (outcome.status === "rejected") {
+    cleanupFailure = String(outcome.reason);
+    console.error(cleanupFailure);
+  }
+};
+for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
+  process.on(signal, () => { interrupted = true; process.exitCode = code; void stop(); });
+}
+const results = [];
+const suiteStarted = performance.now();
 try {
   const url = await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Preview server startup timed out")), 15_000);
+    const timer = setTimeout(() => reject(new Error("Preview startup timed out")), 15_000);
     let output = "";
+    const done = (error, value) => { clearTimeout(timer); error ? reject(error) : resolve(value); };
+    server.closed.then(({ code }) => done(new Error(`Preview server exited (${code})`)), error => done(error));
     server.stdout.on("data", chunk => {
       output += chunk;
       const match = output.match(/http:\/\/127\.0\.0\.1:\d+/);
-      if (match) { clearTimeout(timeout); resolve(match[0]); }
+      if (match) done(null, match[0]);
     });
-    server.once("error", error => { clearTimeout(timeout); reject(error); });
-    server.once("exit", code => { clearTimeout(timeout); reject(new Error(`Preview server exited (${code})`)); });
   });
-  const failures = [], timings = [];
-  const suiteStarted = performance.now();
   for (const test of tests) {
-    console.log(`\nPreview regression: ${test}`);
+    if (interrupted || cleanupFailure) break;
+    console.log(`Preview regression: ${test}`);
     const started = performance.now();
-    let passed = true;
-    try { await new Promise((resolve, reject) => {
-      active = spawn(process.execPath, [`scripts/preview/${test}`, url], { cwd: root, stdio: "inherit" });
-      const timeout = setTimeout(() => { active.kill(); reject(new Error(`${test} timed out after 120s`)); }, 120_000);
-      active.once("error", error => { clearTimeout(timeout); reject(error); });
-      active.once("exit", code => { clearTimeout(timeout); code === 0 ? resolve() : reject(new Error(`${test} failed (${code})`)); });
-    }); } catch (error) {
-      passed = false;
-      failures.push({ test, message: String(error) });
-      console.error(`Preview regression failed: ${test}: ${error.message}`);
-    } finally {
-      const elapsedMs = Math.round(performance.now() - started);
-      timings.push({ test, passed, elapsedMs });
-      console.log(`Preview duration: ${test}: ${elapsedMs}ms (${passed ? "passed" : "failed"})`);
-    }
+    let error = null;
+    try {
+      active = spawnManaged([`scripts/preview/${test}`, url], {
+        cwd: root, env: { ...environment, PREVIEW_URL: url },
+      });
+      await waitManaged(active, 150_000);
+    } catch (failure) {
+      error = String(failure);
+      if (failure.fatalCleanup) cleanupFailure = error;
+      console.error(`${test}: ${error}`);
+    } finally { active = null; }
+    const elapsedMs = Math.round(performance.now() - started);
+    results.push({ test, passed: error === null, elapsedMs, error });
+    console.log(`Preview duration: ${test}: ${elapsedMs}ms (${error === null ? "passed" : "failed"})`);
   }
+} catch (failure) {
+  runError = String(failure);
+  throw failure;
+} finally {
+  await stop();
   await writeFile(new URL("../../output/playwright/smoke-summary.json", import.meta.url), JSON.stringify({
     transport: "synthetic-preview", sourceCommit: process.env.GITHUB_SHA || null,
-    elapsedMs: Math.round(performance.now() - suiteStarted), tests: timings,
+    elapsedMs: Math.round(performance.now() - suiteStarted), interrupted, cleanupFailure, runError,
+    passed: !interrupted && !cleanupFailure && !runError && results.length === tests.length && results.every(result => result.passed),
+    tests: results,
   }, null, 2) + "\n");
-  if (failures.length) {
-    console.error(`\n${failures.length}/${tests.length} preview regressions failed: ${failures.map(f => f.test).join(", ")}`);
-    process.exitCode = 1;
-  }
-} finally { stop(); }
+}
+const failures = results.filter(result => !result.passed);
+if (failures.length) console.error(`${failures.length}/${tests.length} preview regressions failed: ${failures.map(result => result.test).join(", ")}`);
+if (!interrupted && (cleanupFailure || failures.length)) process.exitCode = 1;

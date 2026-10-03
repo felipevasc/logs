@@ -773,18 +773,90 @@ pub async fn list_sources(app: AppHandle, analysis_context: Option<crate::analys
 
 pub fn index_events(events: &[Event]) -> Result<sources::FileIndex, String> {
     let dir = crate::config_dir().join("snapshots");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!(
-        "events-{}.jsonl",
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-    ));
-    let mut file = BufWriter::new(std::fs::File::create(&path).map_err(|e| e.to_string())?);
-    for ev in events {
-        serde_json::to_writer(&mut file, ev).map_err(|e| e.to_string())?;
+    index_events_at(events, &dir)
+}
+
+fn write_snapshot_events(file: &mut impl Write, events: &[Event]) -> Result<(), String> {
+    for (position, event) in events.iter().enumerate() {
+        if position % 256 == 0 {
+            crate::operations::check()?;
+        }
+        serde_json::to_writer(&mut *file, event).map_err(|e| e.to_string())?;
         file.write_all(b"\n").map_err(|e| e.to_string())?;
     }
-    file.flush().map_err(|e| e.to_string())?;
-    sources::index_file(&path.to_string_lossy(), "snapshot", None, None, None)
+    crate::operations::check()
+}
+
+fn index_events_at(events: &[Event], dir: &Path) -> Result<sources::FileIndex, String> {
+    crate::operations::check()?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // Own the snapshot until it has a valid index. Failure/cancellation drops
+    // the mapped index before the path, allowing cleanup on Windows as well.
+    let mut pending = tempfile::Builder::new().prefix("events-").suffix(".jsonl")
+        .tempfile_in(dir).map_err(|e| e.to_string())?;
+    {
+        let mut file = BufWriter::new(pending.as_file_mut());
+        write_snapshot_events(&mut file, events)?;
+        file.flush().map_err(|e| e.to_string())?;
+    }
+    pending.as_file().sync_all().map_err(|e| e.to_string())?;
+    let path = pending.into_temp_path();
+    let index = sources::index_file(&path.to_string_lossy(), "snapshot", None, None, None)?;
+    crate::operations::check()?;
+    if let Err(error) = path.keep() {
+        drop(index);
+        return Err(error.error.to_string());
+    }
+    Ok(index)
+}
+
+#[cfg(test)]
+mod snapshot_cleanup_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    #[test]
+    fn only_valid_snapshots_survive_and_names_are_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(index_events_at(&[], dir.path()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let stop = Arc::new(AtomicBool::new(true));
+        let token = crate::operations::current_token().with_stop(stop);
+        assert!(crate::operations::with_context(token, || index_events_at(&[Event::empty()], dir.path())).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let mut event = Event::empty();
+        event.message = "ação 東京\nsegunda linha".into();
+        event.fields.insert("nested".into(), serde_json::json!({"id": 9007199254740993u64}));
+        let events = [event];
+        let first = index_events_at(&events, dir.path()).unwrap();
+        let second = index_events_at(&events, dir.path()).unwrap();
+        assert_ne!(first.parts[0].path, second.parts[0].path);
+        assert_eq!(first.lines.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&first.parts[0].path).unwrap()).unwrap();
+        assert_eq!(value, serde_json::to_value(&events[0]).unwrap());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn snapshot_materialization_observes_isolated_cancellation_between_batches() {
+        struct CancelAfterFirstRow { rows: usize, stop: Arc<AtomicBool> }
+        impl Write for CancelAfterFirstRow {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes == b"\n" {
+                    self.rows += 1;
+                    self.stop.store(true, Ordering::Relaxed);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let token = crate::operations::current_token().with_stop(stop.clone());
+        let mut output = CancelAfterFirstRow { rows: 0, stop };
+        assert!(crate::operations::with_context(token, || write_snapshot_events(&mut output, &vec![Event::empty(); 512])).is_err());
+        assert!(output.rows > 0 && output.rows <= 256);
+        assert!(crate::operations::check().is_ok(), "cancellation must stay isolated");
+    }
 }
 
 pub fn index_channel(channel: &str, max_events: usize) -> Result<sources::FileIndex, String> {
