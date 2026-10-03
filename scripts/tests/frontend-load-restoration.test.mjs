@@ -27,7 +27,7 @@ function harness(store = { active: 'case', cases: [{ id: 'case', artifacts: [] }
     hideLoadOverlay: ok => { state.loadOverlay = false; completed = ok; },
     finishOperation: (label, detail) => events.push(`${label}: ${detail}`),
     fillColumnControls() {}, renderChips() {}, syncCurrentSavedFilter() {}, restoreCurrentSavedFilter() {},
-    restoreVisiblePreferences: () => false, loadTsConfig: async () => {}, caseStations: () => [],
+    restoreVisiblePreferences: () => false, loadTsConfig: async () => {}, loadFormatOptions: async () => true, caseStations: () => [],
     autoVisibleCols() {}, updateTsExample() {}, renderExploreTree() {},
     refresh: async () => { rowsPainted = true; state.rows = [{ id: 1 }]; return true; },
     api: async (cmd, args) => {

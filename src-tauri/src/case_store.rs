@@ -29,7 +29,7 @@ pub(crate) fn context_connection(dir: &std::path::Path) -> Result<Connection, St
     }
     let initialized: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='case-analysis-v1')",
+            "SELECT count(*)=2 FROM metadata WHERE key IN ('case-analysis-v1','case-interpretation-v1')",
             [],
             |r| r.get(0),
         )

@@ -50,7 +50,7 @@ window.WorkspaceContext = (() => {
     const c = activeCase(); if (c) { c.workspace ||= defaultCaseWorkspace(); c.workspace.contextStates = record(c.workspace.contextStates); c.workspace.contextStates[scope] = snapshot; c.workspace.activeScope = scope; }
     return snapshot;
   }
-  // Loaded source shared by every Case; its filtered rows belong to one Case only.
+  // Loaded source metadata is retained only under its owning Case key.
   function sourceRuntime(source = state) {
     return { loaded: source.loaded, columns: source.columns, dataPeriod: source.dataPeriod, rows: [], total: 0, facetData: null, explorerCache: null, queryError: null };
   }
@@ -147,11 +147,11 @@ window.WorkspaceContext = (() => {
   async function changeCase(id) {
     if (sourceBusy) { $("#case-select").value = state.cases.active || ""; toast("Aguarde a atualização das fontes para trocar de Caso.", "info"); return; }
     if (!restoringCase && activeCase()?.kind !== "preserved_case_unavailable") caseReturnScope = scope;
-    const request = ++caseGeneration, previousScope = caseReturnScope; capture(); restoringCase = true;
+    const request = ++caseGeneration, previousScope = caseReturnScope; if (!restoringCase) capture(); restoringCase = true;
     try {
       if (scope === "case") await setScope("dataset", { animate: false });
       if (request !== caseGeneration) return;
-      state.cases.active = id; window.AnalysisContexts?.activate(); state.activeStationId = null; state.stationAnalyticsId = null;
+      state.cases.active = id; window.AnalysisContexts?.activate(); resetCaseSourceState(); state.activeStationId = null; state.stationAnalyticsId = null;
       renderCaseBar(); updateAnalysisBadge();
       if (activeCase()?.kind === "preserved_case_unavailable") { await showUnavailable(); return; }
       await loadDerivedFields(); if (request !== caseGeneration) return;
@@ -166,26 +166,30 @@ window.WorkspaceContext = (() => {
   }
   function beforeCaseCreation() {
     if (!initialized) return null;
-    capture(); restoringCase = true; caseGeneration++; generation++; state.refreshVersion++; detailRequest++;
-    return { scope, snapshot: stored("dataset"), activeSnapshot: stored(scope), runtime: runtime.get(key("dataset")), artifacts: copy(activeCase()?.artifacts || []), activeArtifactId: activeCase()?.activeArtifactId || null };
+    if (!restoringCase) capture(); restoringCase = true; caseGeneration++; generation++; state.refreshVersion++; detailRequest++;
+    return { scope, snapshot: stored("dataset"), activeSnapshot: stored(scope) };
   }
   async function afterCaseCreation(previous) {
     if (!previous) return;
-    const c = activeCase();
-    // Keep the user's area; a new Case has no evidence but shares the loaded source.
-    // When creating from Case, state describes saved evidence, not that source.
+    const c = activeCase(), request = caseGeneration;
+    const current = () => request === caseGeneration && activeCase() === c;
+    // Keep the navigation area only. Sources, fields and results start empty.
+    resetCaseSourceState();
     const fresh = { ...defaults(), page: previous.snapshot?.page || "summary" };
     const target = previous.scope === "case" ? "case" : "dataset";
     const freshCase = { ...defaults(), page: target === "case" ? previous.activeSnapshot?.page || "summary" : "summary" };
-    const source = previous.runtime || (previous.scope === "dataset" ? state : { loaded: false, columns: [], dataPeriod: null });
-    runtime.set(key("dataset"), sourceRuntime(source));
+    runtime.set(key("dataset"), sourceRuntime());
     states.set(key("dataset"), fresh); states.set(key("case"), freshCase);
     c.workspace.contextStates = { dataset: fresh, case: freshCase }; c.workspace.activeScope = target;
     try {
       if (window.AnalysisContexts && !await loadDerivedFields()) return;
+      if (!current()) return;
+      await syncActiveCaseArtifacts();
+      if (!current()) return;
+      runtime.set(key("dataset"), sourceRuntime());
       await setScope(target, { force: true, animate: false, skipCapture: true });
-      if (state.loaded) await refresh();
-    } finally { restoringCase = false; }
+      if (current() && state.loaded) await refresh();
+    } finally { if (current()) restoringCase = false; }
   }
   async function deleteCase(c) {
     if (c?.kind === "preserved_case_unavailable" || !state.cases.cases.includes(c)) { toast("Este Caso preservado não está disponível para excluir por esta ação.", "info"); return false; }
@@ -200,7 +204,12 @@ window.WorkspaceContext = (() => {
     if (activeCase()?.kind === "preserved_case_unavailable") { await showUnavailable(); return; }
     const target = activeCase()?.workspace?.activeScope === "case" ? "case" : "dataset";
     runtime.set(key("dataset"), Object.fromEntries(runtimeKeys.map(name => [name, state[name]])));
-    if (!activeCase()?.workspace?.contextStates?.dataset) capture();
+    if (!activeCase()?.workspace?.contextStates?.dataset) {
+      // No saved owner means defaults, including after replacing the active Case store.
+      // Do not attach profile-wide 0.11 keys or the previous Case's live controls here.
+      state.favoriteFields = []; state.dashboardCompact = false; document.body.dataset.density = "comfortable";
+      capture();
+    }
     initialized = true;
     await setScope(target, { force: true, skipCapture: true, animate: false });
   }

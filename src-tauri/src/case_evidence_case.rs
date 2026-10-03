@@ -137,7 +137,7 @@ impl PreparedCase {
         self.mirror.bytes()
     }
     pub(super) fn validate_snapshot(&self, tx: &Transaction<'_>) -> Result<(), String> {
-        let bytes = view::json_size(&self.snapshot, 4 << 20)?;
+        let bytes = view::json_size(&crate::analysis_context::ManagementSnapshot(&self.snapshot), 4 << 20)?;
         let _scratch = crate::case_cache::reserve_work(
             crate::case_work_budget::global(),
             bytes.checked_mul(3).ok_or(INVALID)?,
@@ -209,7 +209,7 @@ impl PreparedCase {
             }
             metadata.as_object_mut().ok_or(INVALID)?.insert(
                 "analysisContext".into(),
-                serde_json::to_value(&self.snapshot).map_err(|e| e.to_string())?,
+                serde_json::to_value(crate::analysis_context::ManagementSnapshot(&self.snapshot)).map_err(|e| e.to_string())?,
             );
         } else if let CaseEvidenceState::Unavailable(diagnostic) = &self.evidence {
             metadata = serde_json::to_value(UnavailableCaseStub {

@@ -211,8 +211,23 @@ try {
   assert.equal(await page.locator('#quick-search').inputValue(), draft);
   assert.deepEqual(await page.locator('#quick-search').evaluate(input => [input.selectionStart, input.selectionEnd, input.selectionDirection]), [3, 8, 'backward']);
   assert.equal(await page.locator('#btn-add-search').isDisabled(), false);
-  await page.evaluate(() => newCase('Draft isolation fixture'));
-  await page.waitForFunction(() => !WorkspaceContext.changing);
+  const draftCase = await page.evaluate(() => newCase('Draft isolation fixture').id);
+  await page.waitForFunction(() => !WorkspaceContext.changing && !state.analysisDefinitionsPending);
+  assert.notEqual(draftCase, before.caseId);
+  assert.deepEqual(await page.evaluate(() => ({ loaded: state.loaded, total: state.total, artifact: state.currentArtifact,
+    artifacts: activeCase().artifacts, columns: state.columns, rows: state.rows, filters: state.filters, quick: state.quick })),
+    { loaded: false, total: 0, artifact: null, artifacts: [], columns: [], rows: [], filters: [], quick: '' },
+    'a new Case inherits neither the old source nor its applied selection');
+  assert.equal(await page.locator('#quick-search').inputValue(), '');
+  assert.equal(await page.locator('#quick-search').isVisible(), false, 'empty dataset stays on Summary until a source is opened');
+  // Dataset Explore intentionally redirects an empty Case to Summary. Open a
+  // distinct source explicitly before testing that Case's independent draft.
+  const draftSource = 'C:\\mock\\draft-isolation.jsonl';
+  assert.equal(await page.evaluate(path => loadData({ kind: 'file', path, paths: [path], format: 'auto' }), draftSource), true);
+  await page.evaluate(() => Workspace.showPage('explore'));
+  await page.locator('#quick-search').waitFor({ state: 'visible' });
+  assert.equal(await page.evaluate(() => state.sourcePublication.analysisContext.caseId), draftCase);
+  assert.equal(await page.evaluate(() => state.currentArtifact.source.path), draftSource);
   assert.equal(await page.locator('#quick-search').inputValue(), '');
   await page.locator('#quick-search').fill('other case draft');
   await page.evaluate(id => WorkspaceContext.changeCase(id), before.caseId);

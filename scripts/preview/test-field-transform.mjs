@@ -141,7 +141,7 @@ try{
   results.lightPreview=await readablePreview();
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.screenshot({path:resolve(output,'field-transform-jwt-light-1024.png')});
   await page.locator('#ft-cancel').click();assert.equal(await page.evaluate(()=>document.activeElement.id),'btn-colpicker');
-  phase='Case ownership';await page.evaluate(()=>newCase('Outro Caso',{keepArtifact:true}));
+  phase='Case ownership';await page.evaluate(()=>newCase('Outro Caso'));
   await page.waitForFunction(id=>activeCase()?.id!==id&&!WorkspaceContext.changing&&!state.analysisDefinitionsPending,originalCase);
   assert.equal(await page.evaluate(()=>state.derivedFields.some(field=>field.name==='decoded_payload')),false);
   await page.evaluate(id=>WorkspaceContext.changeCase(id),originalCase);
@@ -190,7 +190,7 @@ try{
   assert.equal(await page.locator('#cube-table .cube-grand-total .cube-value').textContent(),'1');
   await page.setViewportSize({width:1440,height:960});await page.screenshot({path:resolve(output,'field-transform-rare-child-pivot-1440.png')});
   results.rareChild={field:rareField,event:rare,timeline:{total:rareTimeline.response.total.count,matched:1,missing:rareTimeline.response.missing.count},calls:await page.evaluate(()=>window.__rareFieldCalls.map(call=>({command:call.command,field:call.args.field||call.args.groupColumn||call.args.spec?.field||call.args.spec?.rows?.[0]})))};
-  await page.evaluate(()=>newCase('Outro Caso sem filho raro',{keepArtifact:true}));
+  await page.evaluate(()=>newCase('Outro Caso sem filho raro'));
   await page.waitForFunction(id=>activeCase()?.id!==id&&!WorkspaceContext.changing&&!state.analysisDefinitionsPending,originalCase);
   assert.equal(await page.evaluate(field=>AnalysisFields.names().includes(field)||AnalysisFields.available(field),rareField),false,'a rare choice never leaks into another Case');
   await page.evaluate(id=>WorkspaceContext.changeCase(id),originalCase);await page.waitForFunction(()=>state.derivedFields.some(field=>field.name==='decoded_payload')&&!WorkspaceContext.changing);

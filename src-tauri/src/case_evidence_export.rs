@@ -246,6 +246,11 @@ pub(crate) fn capture_export<T>(
     let mut credit = commit::request_credit(request)?;
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let root_guard = crate::case_recovery::RootLease::shared(&root, &prepare::root_work())?;
+    {
+        let mut migration = authority::connect_readwrite(&root)?;
+        db::require_stamp(&migration, &request.expected_store)?;
+        crate::case_interpretation::initialize_native(&mut migration, &root)?;
+    }
     let conn = authority::connect_readonly(&root)?;
     conn.execute_batch("BEGIN DEFERRED")
         .map_err(|e| e.to_string())?;
@@ -960,6 +965,32 @@ mod tests {
         .unwrap();
         assert_reopened(reopened.path(), imported.imported_case_id.as_ref().unwrap());
     }
+    #[test]
+    fn native_v011_export_before_any_analytical_open_freezes_local_interpretation() {
+        let (source, id, _) = imported_fixture();
+        let external = tempfile::tempdir().unwrap();
+        let path = external.path().join("first-action-export.json");
+        // The frontend request predates upgrade migration. No analytical or
+        // editor command is allowed to initialize the old context first.
+        let request = export_request(source.path(), &id, &path);
+        let conn = Connection::open(source.path().join("investigations.sqlite3")).unwrap();
+        let mut old = crate::analysis_context::read(&conn, &id).unwrap(); old.interpretation = None;
+        conn.execute("UPDATE case_analysis SET body=?1 WHERE case_id=?2", params![serde_json::to_string(&old).unwrap(),id]).unwrap();
+        conn.execute("DELETE FROM metadata WHERE key=?1", [crate::case_interpretation::MIGRATED]).unwrap();
+        drop(conn);
+        let original = br#"{"app":{"200":{"name":"pre-upgrade-local","description":"preserved"}}}"#;
+        std::fs::write(source.path().join("codes.json"), original).unwrap();
+        portable::export_at(source.path(), request).unwrap();
+        let exported: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(exported["document"]["cases"][0]["analysisContext"]["interpretation"]["codes"]["app"]["200"]["name"], "pre-upgrade-local");
+        assert_eq!(std::fs::read(source.path().join("codes.json")).unwrap(), original);
+        let view = load_view(source.path()).unwrap();
+        assert!(view.document().cases.iter().all(|case| case["analysisContext"].get("interpretation").is_none()));
+        let conn = authority::connect_readonly(source.path()).unwrap();
+        let migrated = crate::analysis_context::read(&conn, &id).unwrap();
+        assert_eq!(migrated.interpretation.unwrap().codes.sources["app"]["200"].name, "pre-upgrade-local");
+    }
+
     #[test]
     fn valid_large_context_uses_metadata_admission_through_native_json_roundtrip() {
         let (source, id, _) = imported_fixture();

@@ -45,6 +45,12 @@ pub(crate) struct Snapshot {
 
 /// The caller must already hold the source consistency guard.
 pub(crate) fn receipt_locked(state: &AppState) -> Receipt {
+    pin_receipt(state)
+}
+
+/// Pin just the immutable publication identity before waiting for admission.
+/// No source/catalog guard or payload is retained across that wait.
+pub(crate) fn pin_receipt(state: &AppState) -> Receipt {
     state.source_publication.read().receipt.clone()
 }
 

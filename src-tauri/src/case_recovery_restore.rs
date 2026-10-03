@@ -324,6 +324,18 @@ pub(crate) fn restore_current(
     let tx = source
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
+    if !recovery.has_interpretation_assets() {
+        // An old recovery did not capture the source profile's interpretation.
+        // Preserve that fact in the restored database before publishing it, so
+        // later adoption cannot inherit unrelated destination configuration.
+        tx.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('case-interpretation-origin-unavailable','1')", [])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM metadata WHERE key='case-interpretation-v1'", [])
+            .map_err(|e| e.to_string())?;
+    }
+    // A newer recovery of an already-unknown lineage keeps its copied marker.
+    // Full embedded Case settings remain authoritative; only missing settings
+    // need the diagnostic, and raw view/export remains available.
     let next = expected
         .body_revision
         .parse::<u64>()
@@ -490,6 +502,42 @@ mod tests {
         .unwrap();
         assert_eq!(replay.request_id, id);
         assert_eq!(replay.after.body_revision, "3");
+    }
+    #[test]
+    fn old_recovery_origin_marker_survives_restore_and_new_recovery_lineage() {
+        let source = fixture();
+        let original = body(source.path());
+        let conn = Connection::open(source.path().join("investigations.sqlite3")).unwrap();
+        conn.execute("INSERT INTO metadata VALUES('case-interpretation-v1','1')", []).unwrap();
+        drop(conn);
+        let mut old = prepare(source.path(), &work()).unwrap();
+        // Recreate the wire shape of an existing pre-0.12 recovery generation.
+        old.manifest.interpretation_assets_version = None;
+        let bytes = serde_json::to_vec(&old.manifest).unwrap();
+        std::fs::write(old.directory.join("manifest.json"), &bytes).unwrap();
+        old.manifest_sha256 = digest(&bytes);
+        old.validate().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        restore_fresh(first.path(), &old, &uuid::Uuid::new_v4().to_string(), &work()).unwrap();
+        assert_eq!(body(first.path()), original);
+        let conn = readonly(&first.path().join("investigations.sqlite3")).unwrap();
+        assert!(crate::case_interpretation::origin_unavailable(&conn).unwrap());
+        assert!(!conn.query_row::<bool, _, _>("SELECT EXISTS(SELECT 1 FROM metadata WHERE key='case-interpretation-v1')", [], |row| row.get(0)).unwrap());
+        drop(conn);
+        let refreshed = prepare(first.path(), &work()).unwrap();
+        assert!(refreshed.has_interpretation_assets());
+        let second = tempfile::tempdir().unwrap();
+        restore_fresh(second.path(), &refreshed, &uuid::Uuid::new_v4().to_string(), &work()).unwrap();
+        assert_eq!(body(second.path()), original);
+        let conn = readonly(&second.path().join("investigations.sqlite3")).unwrap();
+        assert!(crate::case_interpretation::origin_unavailable(&conn).unwrap(), "new proof must not erase copied unknown lineage");
+        drop(conn);
+        let known = prepare(source.path(), &work()).unwrap();
+        let third = tempfile::tempdir().unwrap();
+        restore_fresh(third.path(), &known, &uuid::Uuid::new_v4().to_string(), &work()).unwrap();
+        let conn = readonly(&third.path().join("investigations.sqlite3")).unwrap();
+        assert!(!crate::case_interpretation::origin_unavailable(&conn).unwrap());
+        assert!(conn.query_row::<bool, _, _>("SELECT EXISTS(SELECT 1 FROM metadata WHERE key='case-interpretation-v1')", [], |row| row.get(0)).unwrap());
     }
     #[test]
     fn cancellation_before_done_rolls_back_and_can_reconcile_then_retry() {

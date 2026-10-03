@@ -31,7 +31,7 @@ try {
     window.contextFacetTotals = Object.fromEntries(Object.entries(state.treeAgg.case).map(([key, values]) => [key, values.reduce((sum, value) => sum + value[1], 0)]));
     state.filters = [{ column: "source", op: "equals_exact", value: caseEvents()[0].source }]; await refresh();
     window.oldCaseFilter = structuredClone(state.filters);
-    window.createdId = newCase("Caso vazio sem perder fontes").id;
+    window.createdId = newCase("Caso vazio isolado").id;
   });
   for (const total of Object.values(await page.evaluate(() => window.contextFacetTotals))) assert.ok(total <= 3, "case facets contain only saved records");
   await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "case" && state.total === 0);
@@ -39,8 +39,8 @@ try {
   assert.equal(await page.evaluate(() => caseEvents().length), 0);
   assert.equal(await page.locator("#ws-empty").isVisible(), false);
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
-  assert.equal(await exactTotal(), 6000, "new case retains the open native dataset");
-  assert.equal(await page.evaluate(() => state.currentArtifact.id), initial.artifactId);
+  assert.deepEqual(await page.evaluate(() => ({ loaded: state.loaded, total: state.total, artifact: state.currentArtifact, artifacts: activeCase().artifacts, columns: state.columns, path: document.querySelector("#file-path").value })),
+    { loaded: false, total: 0, artifact: null, artifacts: [], columns: [], path: "" }, "new Case has no inherited source, columns or import draft");
   await page.evaluate(async original => { await WorkspaceContext.setScope("case", { animate: false }); await WorkspaceContext.changeCase(original); }, initial.caseId);
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "case");
   assert.equal(await page.evaluate(() => caseEvents().length), 3);
@@ -55,7 +55,7 @@ try {
   assert.deepEqual(await page.evaluate(() => state.filters), await page.evaluate(() => window.oldCaseFilter));
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
   assert.equal(await exactTotal(), 6000);
-  results.lifecycle = "new case empty; original case filters restored; native dataset6000 intact; MCP refresh scoped";
+  results.lifecycle = "new case sources empty; original case filters/source restored; native dataset6000 reopens; MCP refresh scoped";
   // A rejected old summary must not paint over the new workspace.
   await page.evaluate(async () => {
     const original = api; window.restoreContextApi = () => { api = original; };

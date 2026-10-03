@@ -1,5 +1,6 @@
-//! Immutable, Case-owned query admission. Capture happens before blocking work
-//! is queued. Workers never resolve an active Case or a mutable derived registry.
+//! Immutable, Case-owned query admission. A lightweight publication pin precedes
+//! the queue; heavy capture runs under global admission on a blocking worker.
+//! Workers never resolve an active Case or a mutable derived registry.
 use crate::{
     analysis_context::{self, Identity, Snapshot},
     model::Event,
@@ -40,10 +41,16 @@ pub(crate) enum Mode {
     Dataset,
     Case,
     Publish,
+    Metadata,
+    EditSource,
 }
 
 pub(crate) struct Admitted {
+    pending_operation: parking_lot::Mutex<Option<crate::operations::Cancellation>>,
     pub identity: Option<Identity>,
+    pub interpretation: Arc<crate::case_interpretation::Settings>,
+    pub resource_policy: Arc<crate::case_resources::Policy>,
+    timestamps: OnceLock<Result<std::collections::BTreeMap<String, sources::CompiledTsConfig>, String>>,
     pub source_generation: Option<u64>,
     pub case_key: Option<String>,
     pub case_content_token: Option<String>,
@@ -51,6 +58,7 @@ pub(crate) struct Admitted {
     case_records: Option<Arc<crate::case_cache::Records>>,
     case_budget: Arc<crate::case_work_budget::Pool>,
     case_work: parking_lot::Mutex<Option<crate::case_work_budget::Lease>>,
+    resource_work: parking_lot::Mutex<Vec<crate::case_work_budget::Lease>>,
     preparing_visibility: std::sync::atomic::AtomicBool,
     mode: Mode,
     source: Option<Arc<SourceData>>,
@@ -141,6 +149,27 @@ pub(crate) fn with<T>(admitted: Option<Arc<Admitted>>, f: impl FnOnce() -> T) ->
     f()
 }
 
+pub(crate) enum Catalog<'a> {
+    Captured(Arc<Admitted>, bool),
+    Legacy(RwLockReadGuard<'a, crate::model::CodesConfig>),
+}
+impl Deref for Catalog<'_> {
+    type Target = crate::model::CodesConfig;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Captured(admitted, false) => &admitted.interpretation.codes,
+            Self::Captured(admitted, true) => &admitted.interpretation.system_codes,
+            Self::Legacy(value) => value,
+        }
+    }
+}
+pub(crate) fn codes(state: &AppState) -> Catalog<'_> {
+    current().map(|a| Catalog::Captured(a, false)).unwrap_or_else(|| Catalog::Legacy(state.codes.read()))
+}
+pub(crate) fn system_codes(state: &AppState) -> Catalog<'_> {
+    current().map(|a| Catalog::Captured(a, true)).unwrap_or_else(|| Catalog::Legacy(state.system_codes.read()))
+}
+
 /// Own the exact decoded context and its read credit together. The tree drops
 /// before its credit, including comparisons that discard the return value.
 pub(crate) struct LeasedSnapshot {
@@ -152,6 +181,13 @@ impl Deref for LeasedSnapshot {
     fn deref(&self) -> &Snapshot { &self.snapshot }
 }
 impl LeasedSnapshot {
+    fn into_admission(self) -> (Arc<crate::case_interpretation::Settings>, Arc<Vec<analysis_context::ReferenceDescriptor>>, Option<Arc<crate::case_work_budget::Lease>>) {
+        let Self { mut snapshot, credit } = self;
+        let settings = snapshot.interpretation.take().unwrap_or_default();
+        let references = std::mem::take(&mut snapshot.config.references);
+        (Arc::new(settings), Arc::new(references), credit.map(Arc::new))
+    }
+    #[cfg(test)]
     fn into_references(self) -> (Arc<Vec<analysis_context::ReferenceDescriptor>>, Option<Arc<crate::case_work_budget::Lease>>) {
         let Self { mut snapshot, credit } = self;
         let references = std::mem::take(&mut snapshot.config.references);
@@ -299,6 +335,7 @@ pub(crate) fn validate_compilation(config: &analysis_context::Config) -> Result<
         config_revision: 0,
         visibility_revision: 0,
         config: config.clone(),
+        interpretation: None,
         migration_diagnostics: Vec::new(),
         legacy_raw: None,
     };
@@ -333,6 +370,7 @@ pub(crate) fn prepare_candidate_config_detailed(
         config_revision: 0,
         visibility_revision: 0,
         config: config.clone(),
+        interpretation: None,
         migration_diagnostics: Vec::new(),
         legacy_raw: None,
     };
@@ -372,7 +410,10 @@ pub(crate) fn prepare_portable_snapshot(
         references: snapshot.config.references.clone(),
     };
     analysis_context::validate(&active).map_err(PreparationError::Invalid)?;
-    let fields = compile_uncached(snapshot).map_err(PreparationError::Invalid)?;
+    let fields = match &snapshot.interpretation {
+        Some(settings) => crate::case_security::compiling(&settings.security, || compile_uncached(snapshot)),
+        None => compile_uncached(snapshot),
+    }.map_err(PreparationError::Invalid)?;
     check()?;
     let owner = crate::reference_store::Owner {
         case_id: snapshot.case_id.clone(),
@@ -517,8 +558,8 @@ fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>
             let compiled = regex::RegexBuilder::new(&rule.pattern).size_limit(regex_limit).dfa_size_limit(dfa_limit).build();
             crate::operations::check()?;
             compiled
-                .map(|re| sources::CompiledRule { re, template: rule.template, filter: rule.filter })
                 .map_err(|_| "Expressão regular inválida ou excede o orçamento total de compilação do Caso.".to_string())
+                .and_then(|re| sources::CompiledRule::new(re, rule.template, rule.filter))
         }).collect::<Result<Vec<_>, _>>()?;
         Ok(sources::CompiledDerived { name: definition.name, source: definition.source, rules, steps: definition.steps,
             lookup: definition.lookup.map(crate::reference_lookup::Compiled::new) })
@@ -537,6 +578,7 @@ mod compiled_cache_lifetime_tests {
             config_revision: 0,
             visibility_revision: 0,
             config: analysis_context::Config::default(),
+            interpretation: None,
             migration_diagnostics: Vec::new(),
             legacy_raw: None,
         }
@@ -649,23 +691,125 @@ pub(crate) fn same_owner(a: Option<&Identity>, b: Option<&Identity>) -> bool {
     }
 }
 
+/// Only bounded identities are retained while a request waits. In particular,
+/// this pin never clones memory events, decodes a Case config, or compiles rules.
+#[derive(Clone)]
+pub(crate) struct CapturePin {
+    identity: Option<Identity>,
+    receipt: Option<crate::source_publication::Receipt>,
+    mode: Mode,
+    case_publication: Option<(String, String)>,
+}
+impl CapturePin {
+    pub(crate) fn new(state: &AppState, identity: Option<Identity>, expected_generation: Option<u64>, mode: Mode, cache_key: Option<&str>) -> Result<Self, String> {
+        if matches!(mode, Mode::Metadata | Mode::EditSource) && identity.is_none() {
+            return Err("Informe a identidade do Caso para consultar ou editar suas configurações.".into());
+        }
+        let receipt = if matches!(mode, Mode::Case | Mode::Metadata) { None } else {
+            let receipt = crate::source_publication::pin_receipt(state);
+            if expected_generation.is_some_and(|expected| expected != receipt.generation)
+                || (mode == Mode::Dataset && !same_owner(identity.as_ref(), receipt.analysis_context.as_ref())) {
+                return Err(STALE.into());
+            }
+            Some(receipt)
+        };
+        let case_publication = cache_key.map(|key| {
+            crate::case_cache::pin_publication(key, identity.as_ref()).map(|token| (key.to_owned(), token))
+        }).transpose()?;
+        Ok(Self { identity, receipt, mode, case_publication })
+    }
+    pub(crate) fn for_case(state: &AppState, identity: Option<Identity>, generation: Option<u64>, inline: bool, key: Option<&str>) -> Result<Self, String> {
+        let case = inline || key.is_some();
+        if case && identity.is_none() { return Err("Informe a identidade do Caso antes de consultar suas evidências.".into()); }
+        Self::new(state, identity, generation, if case { Mode::Case } else { Mode::Dataset }, if inline { None } else { key })
+    }
+    pub(crate) fn identity(&self) -> Option<Identity> { self.identity.clone() }
+    pub(crate) fn generation(&self) -> Option<u64> { self.receipt.as_ref().map(|receipt| receipt.generation) }
+    pub(crate) fn validate(&self, state: &AppState) -> Result<(), String> {
+        crate::operations::check()?;
+        if self.receipt.as_ref().is_some_and(|receipt| *receipt != crate::source_publication::pin_receipt(state)) {
+            return Err(STALE.into());
+        }
+        if let Some((key, expected)) = &self.case_publication {
+            if crate::case_cache::pin_publication(key, self.identity.as_ref())? != *expected {
+                return Err(crate::case_cache::CHANGED.into());
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn capture(&self, state: &AppState) -> Result<Arc<Admitted>, String> {
+        self.validate(state)?;
+        capture(state, self.identity.clone(), self.generation(), self.mode)
+    }
+    pub(crate) fn capture_case(&self, state: &AppState, events: Option<Vec<Event>>, key: Option<String>) -> Result<(Arc<Admitted>, Option<Vec<Event>>), String> {
+        self.validate(state)?;
+        capture_case(state, self.identity.clone(), self.generation(), events, key)
+    }
+    #[cfg(test)]
+    fn capture_case_shared(&self, state: &AppState, events: Option<Vec<Event>>, key: Option<String>) -> Result<(Arc<Admitted>, Option<Arc<crate::case_cache::Records>>), String> {
+        self.validate(state)?;
+        capture_case_shared(state, self.identity.clone(), self.generation(), events, key)
+    }
+}
+
+/// Preserve the original cancellation registration across capture and execution.
+/// The stored token is the pre-admission token, without a retained scheduler
+/// execution or analysis Arc, so it cannot retain a slot or form an Arc cycle.
+pub(crate) async fn capture_prepared<T, F>(app: tauri::AppHandle, pin: CapturePin, operation_id: Option<String>, priority: crate::global_scheduler::Priority, prepare: F) -> Result<(Arc<Admitted>, T), String>
+where T: Send + 'static, F: FnOnce(&AppState, &CapturePin) -> Result<(Arc<Admitted>, T), String> + Send + 'static {
+    use tauri::Manager;
+    let token = crate::operations::token(operation_id)?.with_priority(priority);
+    let retained = token.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::operations::run_with_token(token, || {
+        let state = app.state::<AppState>();
+        prepare_pinned(state.inner(), &pin, retained, prepare)
+    })).await.map_err(|error| error.to_string())??
+}
+
+fn prepare_pinned<T>(state: &AppState, pin: &CapturePin, token: crate::operations::Cancellation, prepare: impl FnOnce(&AppState, &CapturePin) -> Result<(Arc<Admitted>, T), String>) -> Result<(Arc<Admitted>, T), String> {
+    pin.validate(state)?;
+    let (admitted, result) = prepare(state, pin)?;
+    pin.validate(state)?;
+    admitted.validate(state)?;
+    *admitted.pending_operation.lock() = Some(token);
+    Ok((admitted, result))
+}
+
+pub(crate) async fn capture_async(app: tauri::AppHandle, identity: Option<Identity>, generation: Option<u64>, mode: Mode, operation_id: Option<String>, priority: crate::global_scheduler::Priority) -> Result<Arc<Admitted>, String> {
+    use tauri::Manager;
+    let pin = CapturePin::new(app.state::<AppState>().inner(), identity, generation, mode, None)?;
+    capture_prepared(app, pin, operation_id, priority, |state, pin| Ok((pin.capture(state)?, ()))).await.map(|(admitted, ())| admitted)
+}
+
+pub(crate) async fn capture_case_async(app: tauri::AppHandle, identity: Option<Identity>, generation: Option<u64>, events: Option<Vec<Event>>, key: Option<String>, operation_id: Option<String>, priority: crate::global_scheduler::Priority) -> Result<(Arc<Admitted>, Option<Vec<Event>>), String> {
+    use tauri::Manager;
+    let pin = CapturePin::for_case(app.state::<AppState>().inner(), identity, generation, events.is_some(), key.as_deref())?;
+    capture_prepared(app, pin, operation_id, priority, move |state, pin| pin.capture_case(state, events, key)).await
+}
+
 pub(crate) fn capture(
     state: &AppState,
     identity: Option<Identity>,
     expected_generation: Option<u64>,
     mode: Mode,
 ) -> Result<Arc<Admitted>, String> {
+    if matches!(mode, Mode::Metadata | Mode::EditSource) && identity.is_none() { return Err("Informe a identidade do Caso para consultar ou editar suas configurações.".into()); }
     // Reverse local-drop order keeps moved descriptor values charged even if
     // a later source admission fails before constructing Admitted.
-    let (derived, diagnostics, reference_credit, references, definition_bytes) = match &identity {
+    let (interpretation, derived, diagnostics, reference_credit, references, definition_bytes) = match &identity {
         Some(identity) => {
             let snapshot = validate_identity(identity)?;
-            let (derived, diagnostics) = compile(&snapshot)?;
+            if !matches!(mode, Mode::Metadata | Mode::EditSource) {
+                if let Some(issue) = snapshot.migration_diagnostics.iter().find(|issue| issue.code.starts_with("legacy_interpretation_unavailable")) {
+                    return Err(format!("CASE_INTERPRETATION_REPAIR_REQUIRED: {} A reanálise está bloqueada; os registros originais continuam disponíveis pela visualização preservada e pela exportação.", issue.message));
+                }
+            }
+            let (derived, diagnostics) = crate::case_security::compiling(&snapshot.interpretation.as_ref().map(|s| s.security.clone()).unwrap_or_default(), || compile(&snapshot))?;
             let definition_bytes = serde_json::to_vec(&snapshot.config)
                 .map_err(|e| e.to_string())?
                 .len();
-            let (references, credit) = snapshot.into_references();
-            (derived, diagnostics, credit, references, definition_bytes)
+            let (settings, references, credit) = snapshot.into_admission();
+            (settings, derived, diagnostics, credit, references, definition_bytes)
         }
         None => {
             if analysis_context::active_snapshot()?.is_some() {
@@ -674,6 +818,7 @@ pub(crate) fn capture(
                 );
             }
             (
+                Arc::new(crate::case_interpretation::Settings { codes: state.codes.read().clone(), system_codes: state.system_codes.read().clone(), ..Default::default() }),
                 Arc::new(state.derived.read().clone()),
                 Arc::new(Vec::new()),
                 None,
@@ -683,7 +828,7 @@ pub(crate) fn capture(
         }
     };
     let mut names = Vec::new();
-    let (generation, captured) = if mode == Mode::Case {
+    let (generation, captured) = if matches!(mode, Mode::Case | Mode::Metadata) {
         (None, None)
     } else {
         let source = state.source.read();
@@ -719,7 +864,12 @@ pub(crate) fn capture(
         (Some(receipt.generation), captured)
     };
     let source = captured;
+    let resource_policy = crate::case_resources::Policy::capture(identity.as_ref(), &interpretation.resources)?;
     Ok(Arc::new(Admitted {
+        pending_operation: parking_lot::Mutex::new(None),
+        interpretation,
+        resource_policy,
+        timestamps: OnceLock::new(),
         identity,
         source_generation: generation,
         case_key: None,
@@ -728,6 +878,7 @@ pub(crate) fn capture(
         case_records: None,
         case_budget: Arc::clone(crate::case_work_budget::global()),
         case_work: parking_lot::Mutex::new(None),
+        resource_work: parking_lot::Mutex::new(Vec::new()),
         preparing_visibility: std::sync::atomic::AtomicBool::new(false),
         mode,
         source,
@@ -753,14 +904,20 @@ pub(crate) fn capture_case(
     key: Option<String>,
 ) -> Result<(Arc<Admitted>, Option<Vec<Event>>), String> {
     let (admitted, events) = capture_case_shared(state, identity, generation, events, key)?;
-    let events = events.map(|records| {
-        let (events, credit) = match Arc::try_unwrap(records) {
-            Ok(records) => records.into_work(),
-            Err(records) => records.clone_for_work()?,
+    let events = with(Some(Arc::clone(&admitted)), || events.map(|records| {
+        let (events, credit) = if !Arc::ptr_eq(records.pool(), admitted.resource_policy.pool()) {
+            // Existing retained evidence keeps its original debit, but a new
+            // request must allocate its working copy under its pinned policy.
+            records.clone_for_work()?
+        } else {
+            match Arc::try_unwrap(records) {
+                Ok(records) => records.into_work(),
+                Err(records) => records.clone_for_work()?,
+            }
         };
         admitted.retain_case_credit(credit)?;
         Ok::<_, String>(events)
-    }).transpose()?;
+    }).transpose())?;
     Ok((admitted, events))
 }
 
@@ -785,7 +942,7 @@ pub(crate) fn capture_case_shared(
         if case { Mode::Case } else { Mode::Dataset },
     )?;
     Arc::get_mut(&mut admitted).expect("new admission").case_key = key.clone();
-    let (events, content_token) = crate::case_cache::resolve_for_with_token(events, key, admitted.identity.as_ref())?;
+    let (events, content_token) = with(Some(Arc::clone(&admitted)), || crate::case_cache::resolve_for_with_token(events, key, admitted.identity.as_ref()))?;
     let captured = Arc::get_mut(&mut admitted).expect("new admission");
     captured.case_content_token = content_token;
     captured.case_cache_bound = cache_bound;
@@ -815,6 +972,19 @@ static PREPARED_FIELDS: parking_lot::Mutex<Vec<PreparedFieldsEntry>> =
 static PREPARING_FIELDS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 impl Admitted {
+    pub(crate) fn take_operation(&self, operation_id: Option<String>, priority: crate::global_scheduler::Priority) -> Result<crate::operations::Cancellation, String> {
+        match self.pending_operation.lock().take() {
+            Some(token) => Ok(token.with_priority(priority)),
+            None => crate::operations::token(operation_id).map(|token| token.with_priority(priority)),
+        }
+    }
+    pub(crate) fn resource_pool(&self) -> &Arc<crate::case_work_budget::Pool> { self.resource_policy.pool() }
+    pub(crate) fn retain_resource_bytes(&self, bytes: usize) -> Result<(), String> {
+        let credit = crate::case_cache::reserve_work(self.resource_policy.pool(), bytes)?;
+        let mut work = self.resource_work.lock();
+        if let Some(existing) = work.last_mut() { existing.merge(credit) }
+        else { work.push(credit); Ok(()) }
+    }
     pub(crate) fn native_records(&self) -> Option<&Arc<crate::case_cache::Records>> { self.case_records.as_ref() }
     fn case_pool(&self) -> &Arc<crate::case_work_budget::Pool> {
         &self.case_budget
@@ -844,8 +1014,24 @@ impl Admitted {
             None => { *work = Some(crate::case_cache::reserve_work(self.case_pool(), bytes)?); Ok(()) }
         }
     }
+    fn apply_interpretation(&self, event: &mut Event) -> Result<(), String> {
+        let timestamps = self.timestamps.get_or_init(|| self.interpretation.timestamps.iter()
+            .map(|(path, config)| config.compile().map(|compiled| (path.clone(), compiled)))
+            .collect::<Result<std::collections::BTreeMap<_, _>, String>>()).as_ref().map_err(Clone::clone)?;
+        let path = event.col_str("caminho").unwrap_or_default();
+        if let Some(config) = timestamps.get(&path) { sources::apply_ts_config_event(event, config); }
+        if let Some(info) = self.interpretation.codes.lookup(&event.source, &event.code)
+            .or_else(|| self.interpretation.system_codes.lookup(&event.source, &event.code)) {
+            let growth = info.name.len().saturating_add(info.description.len()).saturating_sub(event.name.len().saturating_add(event.description.len()));
+            if growth > 0 { self.retain_resource_bytes(growth)?; }
+            event.name.clone_from(&info.name);
+            event.description.clone_from(&info.description);
+        }
+        Ok(())
+    }
     fn apply_case_derived(&self, event: &mut Event, derived: &[sources::CompiledDerived]) -> Result<(), String> {
         if derived.is_empty() && event.derived_originals.is_empty() {
+            self.apply_interpretation(event)?;
             sources::apply_derived(event, derived);
             return Ok(());
         }
@@ -857,6 +1043,7 @@ impl Admitted {
         let scratch_bytes = before.checked_mul(6).and_then(|n| n.checked_add(8 << 20))
             .ok_or(crate::case_work_budget::WORK_BUSY)?;
         let mut scratch = crate::case_cache::reserve_work(self.case_pool(), scratch_bytes)?;
+        self.apply_interpretation(event)?;
         sources::apply_derived(event, derived);
         crate::operations::check()?;
         let added = crate::query::event_payload_bytes(event).saturating_sub(before);
@@ -1116,6 +1303,10 @@ impl Admitted {
             return Err("Esta captura de consulta já foi executada.".into());
         }
         crate::operations::check()?;
+        if matches!(self.mode, Mode::Metadata | Mode::EditSource) {
+            self.visibility.set(PreparedVisibility { gate: None, source: None }).map_err(|_| "Captura já preparada.")?;
+            return Ok(None);
+        }
         let derived = self.prepare_references()?;
         let token = crate::operations::current_token();
         let cancelled = || token.cancelled();
@@ -1150,7 +1341,7 @@ impl Admitted {
         let mut gate = None;
         let mut visible_source = self.source.clone();
         let mut evidence = case_events;
-        if self.mode != Mode::Publish {
+        if !matches!(self.mode, Mode::Publish | Mode::Metadata) {
             match (&self.mode, self.source.as_deref()) {
                 (Mode::Case, _) => {
                     let events = evidence
@@ -1208,6 +1399,7 @@ impl Admitted {
                     }
                     let mut row = 0;
                     let mut stopped = false;
+                    for event in &mut events { self.apply_interpretation(event)?; }
                     events.retain_mut(|event| {
                         if row % 256 == 0 && cancelled() {
                             stopped = true;
@@ -1273,8 +1465,8 @@ impl Admitted {
         };
         crate::engine::ensure_admitted_variant(
             index,
-            &state.codes.read(),
-            &state.system_codes.read(),
+            &self.interpretation.codes,
+            &self.interpretation.system_codes,
             derived,
         );
     }
@@ -1318,7 +1510,7 @@ impl Admitted {
         let scope = match self.mode {
             Mode::Dataset => VisibilityScope::Dataset,
             Mode::Case => VisibilityScope::Case,
-            Mode::Publish => {
+            Mode::Publish | Mode::Metadata | Mode::EditSource => {
                 return Err("Publicação de fonte não é uma consulta de visibilidade.".into())
             }
         };
@@ -1370,7 +1562,7 @@ impl Admitted {
         } else if analysis_context::active_snapshot()?.is_some() {
             return Err(STALE.into());
         }
-        if self.mode != Mode::Case {
+        if !matches!(self.mode, Mode::Case | Mode::Metadata) {
             let _source = state.source.read();
             self.validate_publication(state, false)?;
         }
@@ -1429,14 +1621,14 @@ pub(crate) async fn exclusion_visibility(
     case_key: Option<String>,
     operation_id: Option<String>,
 ) -> Result<VisibilitySummary, String> {
-    use tauri::Manager;
-    let (admitted, events) = capture_case(
-        app.state::<AppState>().inner(),
+    let (admitted, events) = capture_case_async(app.clone(),
         Some(analysis_context),
         source_generation,
         case_events,
         case_key,
-    )?;
+        operation_id.clone(),
+        crate::global_scheduler::Priority::Normal,
+    ).await?;
     let captured = Arc::clone(&admitted);
     crate::offload_case(operation_id, app, admitted, events, move |_| {
         captured.visibility_summary()
@@ -1636,8 +1828,8 @@ impl ArchiveSource {
         if let Err(error) = self.admitted.validate(state) {
             return Ok(unavailable(error));
         }
-        let codes = state.codes.read();
-        let system = state.system_codes.read();
+        let codes = &self.admitted.interpretation.codes;
+        let system = &self.admitted.interpretation.system_codes;
         let index = match self.admitted.source.as_deref() {
             Some(SourceData::Indexed(index)) => Some(index),
             _ => None,
@@ -1741,6 +1933,7 @@ impl ArchiveSource {
                 None
             };
             if let Some(event) = &mut event {
+                self.admitted.apply_interpretation(event)?;
                 sources::apply_derived(event, &derived);
                 crate::entities::annotate(event);
                 budget.charge(crate::query::event_payload_bytes(event))?;
@@ -1873,6 +2066,335 @@ mod tests {
         event.event_ref = "original:0".into();
         event
     }
+    struct HeldCaptureSlot {
+        scheduler: Arc<crate::global_scheduler::Scheduler>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl HeldCaptureSlot {
+        fn new() -> Self {
+            let scheduler = crate::global_scheduler::Scheduler::new(1);
+            let worker_scheduler = Arc::clone(&scheduler);
+            let (ready, started) = std::sync::mpsc::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                crate::global_scheduler::with_scheduler(worker_scheduler, || {
+                    crate::operations::run_with_token(crate::operations::token(None).unwrap(), || {
+                        ready.send(()).unwrap();
+                        let _ = wait.recv_timeout(std::time::Duration::from_secs(10));
+                    }).unwrap();
+                });
+            });
+            started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            Self { scheduler, release: Some(release), worker: Some(worker) }
+        }
+        fn wait_queued(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !crate::global_scheduler::with_scheduler(Arc::clone(&self.scheduler), crate::global_scheduler::interactive_waiting) {
+                assert!(std::time::Instant::now() < deadline, "capture never reached the global queue");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    impl Drop for HeldCaptureSlot {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() { let _ = release.send(()); }
+            if let Some(worker) = self.worker.take() { worker.join().unwrap(); }
+        }
+    }
+    fn enqueue_capture<T: Send + 'static>(slot: &HeldCaptureSlot, state: Arc<AppState>, pin: CapturePin, id: String, prepare: impl FnOnce(&AppState, &CapturePin) -> Result<(Arc<Admitted>, T), String> + Send + 'static) -> std::thread::JoinHandle<Result<(Arc<Admitted>, T), String>> {
+        let scheduler = Arc::clone(&slot.scheduler);
+        let token = crate::operations::token(Some(id)).unwrap().with_priority(crate::global_scheduler::Priority::Interactive);
+        let retained = token.clone();
+        std::thread::spawn(move || crate::global_scheduler::with_scheduler(scheduler, || {
+            crate::operations::run_with_token(token, || prepare_pinned(&state, &pin, retained, prepare)).and_then(|result| result)
+        }))
+    }
+    fn no_compile_hook(compiled: Arc<std::sync::atomic::AtomicBool>) {
+        BEFORE_COMPILE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            compiled.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(crate::global_scheduler::current().is_some(), "capture compiled outside admission");
+        })));
+    }
+
+    #[test]
+    fn queued_memory_capture_waits_for_one_global_slot_without_holding_app_locks() {
+        let _directory = Directory::new();
+        let mut event = original(); event.raw = "heavy payload ".repeat(100_000);
+        let state = Arc::new(state(SourceData::Memory(vec![event])));
+        let pin = CapturePin::new(&state, None, None, Mode::Dataset, None).unwrap();
+        let slot = HeldCaptureSlot::new();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&entered);
+        let worker = enqueue_capture(&slot, Arc::clone(&state), pin, uuid::Uuid::new_v4().to_string(), move |state, pin| {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(crate::global_scheduler::current().is_some());
+            Ok((pin.capture(state)?, ()))
+        });
+        slot.wait_queued();
+        assert!(!entered.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(state.source.try_write().is_some());
+        assert!(state.source_names.try_write().is_some());
+        assert!(crate::CATALOG_PUBLICATION.try_write().is_some());
+        drop(slot);
+        let (admitted, ()) = worker.join().unwrap().unwrap();
+        let Some(SourceData::Memory(events)) = admitted.source.as_deref() else { panic!("memory capture missing") };
+        assert!(events[0].raw.len() > 1_000_000);
+    }
+
+    #[test]
+    fn cold_case_capture_compiles_only_after_global_admission() {
+        let directory = Directory::new();
+        let state = Arc::new(state(SourceData::None));
+        let identity = directory.snapshot("a").identity();
+        COMPILED.lock().retain(|entry| entry.identity != identity);
+        let pin = CapturePin::new(&state, Some(identity.clone()), None, Mode::Case, None).unwrap();
+        let slot = HeldCaptureSlot::new();
+        let compiled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&compiled);
+        let worker = enqueue_capture(&slot, state, pin, uuid::Uuid::new_v4().to_string(), move |state, pin| {
+            no_compile_hook(seen);
+            Ok((pin.capture(state)?, ()))
+        });
+        slot.wait_queued();
+        assert!(!compiled.load(std::sync::atomic::Ordering::SeqCst));
+        drop(slot);
+        let (admitted, ()) = worker.join().unwrap().unwrap();
+        assert_eq!(admitted.identity, Some(identity));
+        assert!(compiled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancelled_queued_capture_never_compiles_the_case() {
+        let directory = Directory::new();
+        let state = Arc::new(state(SourceData::None));
+        let identity = directory.snapshot("a").identity();
+        let pin = CapturePin::new(&state, Some(identity), None, Mode::Case, None).unwrap();
+        let slot = HeldCaptureSlot::new();
+        let id = uuid::Uuid::new_v4().to_string();
+        let compiled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&compiled);
+        let worker = enqueue_capture(&slot, state, pin, id.clone(), move |state, pin| {
+            no_compile_hook(seen);
+            Ok((pin.capture(state)?, ()))
+        });
+        slot.wait_queued();
+        assert!(crate::operations::cancel_id(&id));
+        let result = worker.join().unwrap();
+        assert!(matches!(result, Err(error) if error == "Operação cancelada."));
+        assert!(!compiled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn queued_source_replacement_rejects_before_capturing_the_new_memory_source() {
+        let _directory = Directory::new();
+        let state = Arc::new(state(SourceData::Memory(vec![original()])));
+        let pin = CapturePin::new(&state, None, None, Mode::Dataset, None).unwrap();
+        let slot = HeldCaptureSlot::new();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&entered);
+        let worker = enqueue_capture(&slot, Arc::clone(&state), pin, uuid::Uuid::new_v4().to_string(), move |state, pin| {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok((pin.capture(state)?, ()))
+        });
+        slot.wait_queued();
+        {
+            let mut source = state.source.write();
+            let receipt = crate::source_publication::prepare_touch_locked(&state).unwrap();
+            let mut replacement = original(); replacement.message = "B".into();
+            *source = SourceData::Memory(vec![replacement]);
+            crate::source_publication::commit_touch_locked(&state, receipt);
+        }
+        drop(slot);
+        assert!(matches!(worker.join().unwrap(), Err(error) if error == STALE));
+        assert!(!entered.load(std::sync::atomic::Ordering::SeqCst), "stale capture must not inspect B");
+    }
+
+    #[test]
+    fn queued_case_revision_change_rejects_before_compilation() {
+        let directory = Directory::new();
+        let state = Arc::new(state(SourceData::None));
+        let identity = directory.snapshot("a").identity();
+        let pin = CapturePin::new(&state, Some(identity.clone()), None, Mode::Case, None).unwrap();
+        let slot = HeldCaptureSlot::new();
+        let compiled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&compiled);
+        let worker = enqueue_capture(&slot, state, pin, uuid::Uuid::new_v4().to_string(), move |state, pin| {
+            no_compile_hook(seen);
+            Ok((pin.capture(state)?, ()))
+        });
+        slot.wait_queued();
+        analysis_context::update(&identity, config("replacement")).unwrap();
+        drop(slot);
+        assert!(matches!(worker.join().unwrap(), Err(error) if error == STALE));
+        assert!(!compiled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn queued_same_key_case_replacement_never_adopts_the_new_publication() {
+        let directory = Directory::new();
+        let state = Arc::new(state(SourceData::None));
+        let identity = directory.snapshot("a").identity();
+        let key = uuid::Uuid::new_v4().to_string();
+        tauri::async_runtime::block_on(crate::case_cache::case_sync(key.clone(), vec![original()], Some(identity.clone()))).unwrap();
+        let pin = CapturePin::for_case(&state, Some(identity.clone()), None, false, Some(&key)).unwrap();
+        let slot = HeldCaptureSlot::new();
+        let requested_key = key.clone();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&entered);
+        let worker = enqueue_capture(&slot, Arc::clone(&state), pin, uuid::Uuid::new_v4().to_string(), move |state, pin| {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            pin.capture_case_shared(state, None, Some(requested_key))
+        });
+        slot.wait_queued();
+        let mut replacement = original(); replacement.message = "new evidence".into();
+        tauri::async_runtime::block_on(crate::case_cache::case_sync(key, vec![replacement], Some(identity))).unwrap();
+        drop(slot);
+        assert!(matches!(worker.join().unwrap(), Err(error) if error == crate::case_cache::CHANGED));
+        assert!(!entered.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn capture_and_execution_share_one_cancel_registration_without_retaining_a_slot() {
+        let _directory = Directory::new();
+        let state = state(SourceData::Memory(vec![original()]));
+        let pin = CapturePin::new(&state, None, None, Mode::Dataset, None).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let token = crate::operations::token(Some(id.clone())).unwrap();
+        let retained = token.clone();
+        let scheduler = crate::global_scheduler::Scheduler::new(1);
+        let (admitted, ()) = crate::global_scheduler::with_scheduler(Arc::clone(&scheduler), || {
+            crate::operations::run_with_token(token, || prepare_pinned(&state, &pin, retained, |state, pin| Ok((pin.capture(state)?, ())))).unwrap().unwrap()
+        });
+        let (finished, result) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || crate::global_scheduler::with_scheduler(scheduler, || {
+            crate::operations::run_with_token(crate::operations::token(None).unwrap(), || finished.send(()).unwrap()).unwrap();
+        }));
+        result.recv_timeout(std::time::Duration::from_secs(5)).expect("captured token retained the global slot");
+        other.join().unwrap();
+        assert!(crate::operations::token(Some(id.clone())).is_err(), "capture must retain the live registration");
+        assert!(crate::operations::cancel_id(&id));
+        let continuation = admitted.take_operation(Some(id.clone()), crate::global_scheduler::Priority::Interactive).unwrap();
+        assert!(continuation.cancelled(), "cancel between the two blocking stages must survive");
+        assert!(crate::operations::run_with_token(continuation, || panic!("cancelled continuation ran")).is_err());
+        assert!(crate::operations::token(Some(id)).is_ok(), "completed continuation must release registration");
+    }
+
+    #[test]
+    fn operation_context_preserves_dynamic_case_policy_fallback_and_explicit_overrides() {
+        let directory = Directory::new();
+        let state = state(SourceData::None);
+        let a = capture(&state, Some(directory.snapshot("a").identity()), None, Mode::Case).unwrap();
+        let b = capture(&state, Some(directory.snapshot("b").identity()), None, Mode::Case).unwrap();
+        assert!(!Arc::ptr_eq(&a.resource_policy, &b.resource_policy));
+        let assert_policy = |expected: &Arc<Admitted>| {
+            assert!(Arc::ptr_eq(&crate::case_resources::current().unwrap(), &expected.resource_policy));
+        };
+        with(Some(Arc::clone(&a)), || {
+            // Both registry-created roots and inherited worker tokens must
+            // capture only an explicit override, not promote fallback A.
+            for token in [crate::operations::token(None).unwrap(), crate::operations::current_token()] {
+                crate::operations::with_context(token, || {
+                    assert_policy(&a);
+                    with(Some(Arc::clone(&b)), || assert_policy(&b));
+                    assert_policy(&a);
+                });
+                assert_policy(&a);
+            }
+            crate::case_resources::with(Arc::clone(&a.resource_policy), || {
+                let token = crate::operations::current_token();
+                crate::operations::with_context(token, || {
+                    with(Some(Arc::clone(&b)), || assert_policy(&a));
+                });
+            });
+            assert_policy(&a);
+        });
+        assert!(current().is_none());
+        assert!(crate::case_resources::current().is_none());
+    }
+
+    #[test]
+    fn parallel_lanes_keep_captured_case_configuration_after_active_case_switch() {
+        let directory = Directory::new();
+        let configured = analysis_context::update(&directory.snapshot("a").identity(), config("owned-by-A")).unwrap();
+        let a = crate::case_interpretation::update(&configured.identity(), |settings| {
+            settings.codes = serde_json::from_value(json!({"app":{"200":{"name":"Catalog A","description":"A"}}})).unwrap();
+            settings.timestamps.insert("same.log".into(), sources::TsConfig { clock_adjustment_ms: 1000, ..Default::default() });
+            Ok(())
+        }).unwrap();
+        crate::case_interpretation::update(&directory.snapshot("b").identity(), |settings| {
+            settings.codes = serde_json::from_value(json!({"app":{"200":{"name":"Catalog B","description":"B"}}})).unwrap();
+            settings.timestamps.insert("same.log".into(), sources::TsConfig { clock_adjustment_ms: 2000, ..Default::default() });
+            Ok(())
+        }).unwrap();
+        let state = state(SourceData::None);
+        let admitted = capture(&state, Some(a.identity()), None, Mode::Case).unwrap();
+        let mut cases = crate::case_store::load().unwrap(); cases["active"] = json!("b");
+        crate::case_store::save(cases).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        let values = pool.install(|| crate::global_scheduler::with_limit(2, || with(Some(admitted), || {
+            crate::operations::run_with_token(crate::operations::token(None).unwrap(), || {
+                crate::global_scheduler::map(0..2, |_| {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while started.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                        assert!(std::time::Instant::now() < deadline, "the two admitted Rayon lanes did not run concurrently");
+                        std::thread::yield_now();
+                    }
+                    let captured = current().expect("parallel lane lost its Case owner");
+                    assert_eq!(captured.identity.as_ref(), Some(&a.identity()));
+                    assert_eq!(captured.interpretation.timestamps["same.log"].clock_adjustment_ms, 1000);
+                    assert_eq!(codes(&state).lookup("app", "200").unwrap().name, "Catalog A");
+                    let mut event = original(); sources::apply_derived(&mut event, &derived(&state));
+                    event.fields["tag"].clone()
+                })
+            }).unwrap()
+        })));
+        assert_eq!(values, vec![json!("owned-by-A"), json!("owned-by-A")]);
+    }
+
+    #[test]
+    fn same_file_case_catalogs_timestamps_formats_and_queued_settings_are_independent() {
+        let directory = Directory::new();
+        let file = directory.path.path().join("same.log");
+        std::fs::write(&file, "1700000000 app 200 alpha beta\n").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let configure = |case: &str, name: &str, adjustment: i64, tail: bool| {
+            crate::case_interpretation::update(&directory.snapshot(case).identity(), |settings| {
+                settings.codes = serde_json::from_value(json!({"app":{"200":{"name":name,"description":name}}})).unwrap();
+                settings.timestamps.insert(path.clone(), sources::TsConfig { sources: vec!["linha".into()], regex: Some("^(\\d+)".into()), format: "epoch_s".into(), clock_adjustment_ms: adjustment, ..Default::default() });
+                settings.formats.push(crate::CustomFormat { name: "same-format".into(), kind: "regex".into(), pattern: if tail { r"^\d+ (?P<source>\w+) (?P<code>\w+) \w+ (?P<message>.*)$".into() } else { r"^\d+ (?P<source>\w+) (?P<code>\w+) (?P<message>.*)$".into() }, separator: String::new(), fields: vec![] });
+                Ok(())
+            }).unwrap()
+        };
+        let a = configure("a", "Catalog A", 1000, false);
+        let b = configure("b", "Catalog B", 2000, true);
+        let state = state(SourceData::None);
+        let first = capture(&state, Some(a.identity()), Some(0), Mode::Publish).unwrap();
+        let second = capture(&state, Some(b.identity()), Some(0), Mode::Publish).unwrap();
+        let read = |admitted: Arc<Admitted>| with(Some(admitted), || {
+            let index = crate::index_source_file(&path, "custom:same-format", None).unwrap();
+            sources::event_at(&index, 0, &codes(&state), &system_codes(&state), &[])
+        });
+        let ea = read(first.clone()); let eb = read(second.clone());
+        assert_eq!(ea.event_ref, eb.event_ref, "parser interpretation never changes forensic event identity");
+        assert_eq!(ea.name, "Catalog A"); assert_eq!(eb.name, "Catalog B");
+        assert_eq!(ea.message, "alpha beta"); assert_eq!(eb.message, "beta");
+        assert_eq!(ea.timestamp, Some(1_700_000_001_000)); assert_eq!(eb.timestamp, Some(1_700_000_002_000));
+        let changed = crate::case_interpretation::update(&a.identity(), |settings| {
+            settings.codes.sources.get_mut("app").unwrap().get_mut("200").unwrap().name = "Catalog A new".into();
+            settings.security.detection_settings_json = r#"{"disabled":[],"threats":false}"#.into();
+            Ok(())
+        }).unwrap();
+        assert!(first.validate(&state).is_err(), "queued old edit/query fails admission revalidation");
+        assert!(second.validate(&state).is_ok());
+        assert_eq!(read(first).name, "Catalog A", "already captured worker cannot observe later settings");
+        assert_ne!(changed.interpretation.unwrap().security, second.interpretation.security);
+        assert_eq!(read(second).name, "Catalog B");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "1700000000 app 200 alpha beta\n");
+    }
+
     #[test]
     fn definitions_are_case_owned_cached_and_applied_only_to_copies() {
         let directory = Directory::new();
@@ -1981,6 +2503,7 @@ mod tests {
                 {"name":"dependent","source":"bad.child","rules":[{"pattern":"(.*)"}]}
             ]}))
             .unwrap(),
+            interpretation: None,
             migration_diagnostics: vec![],
             legacy_raw: Some(json!({"preserved":"earlier damaged input"})),
         };
@@ -2023,6 +2546,7 @@ mod tests {
             config_revision: 0,
             visibility_revision: 0,
             config: Default::default(),
+            interpretation: None,
             migration_diagnostics: vec![],
             legacy_raw: None,
         };
@@ -2062,46 +2586,32 @@ mod tests {
     fn retimestamp_advances_generation_and_failed_save_restores_snapshot() {
         let directory = Directory::new();
         let path = directory.path.path().join("timestamp.jsonl");
-        std::fs::write(
-            &path,
-            "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":\"event\"}\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":\"event\"}\n").unwrap();
         let index = sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
-        let state = state(SourceData::Indexed(index));
-        let queued = capture(&state, None, Some(0), Mode::Dataset).unwrap();
-        let receipt =
-            crate::set_ts_config_impl(&state, path.to_str().unwrap(), None, None).unwrap();
-        assert_eq!(receipt.publication.generation, 1);
+        let state = state(SourceData::None);
+        let identity = directory.snapshot("a").identity();
+        let publishing = capture(&state, Some(identity.clone()), Some(0), Mode::Publish).unwrap();
+        with(Some(publishing), || crate::source_publication::publish(&state, index, vec![path.to_string_lossy().into_owned()], vec![], false)).unwrap();
+        let queued = capture(&state, Some(identity.clone()), Some(1), Mode::Dataset).unwrap();
+        let editor = capture(&state, Some(identity), Some(1), Mode::EditSource).unwrap();
+        let receipt = with(Some(editor), || crate::set_ts_config_impl(&state, path.to_str().unwrap(), None, None)).unwrap();
+        assert_eq!(receipt.publication.generation, 2);
         assert_eq!(queued.validate(&state).unwrap_err(), STALE);
+        let saved = directory.snapshot("a");
         let (lines, order) = {
             let source = state.source.read();
-            let SourceData::Indexed(index) = &*source else {
-                panic!()
-            };
-            index.ordered();
-            (index.lines.clone(), index.time_order.clone())
+            let SourceData::Indexed(index) = &*source else { panic!() };
+            index.ordered(); (index.lines.clone(), index.time_order.clone())
         };
-        std::fs::remove_file(crate::ts_configs_path()).unwrap();
-        std::fs::create_dir(crate::ts_configs_path()).unwrap();
-        assert!(crate::set_ts_config_impl(
-            &state,
-            path.to_str().unwrap(),
-            Some(sources::TsConfig {
-                clock_adjustment_ms: 1000,
-                ..Default::default()
-            }),
-            None
-        )
-        .is_err());
-        assert_eq!(
-            crate::source_publication::receipt_locked(&state).generation,
-            1
-        );
+        let conn = crate::case_store::connect(directory.path.path()).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_case_settings BEFORE UPDATE ON case_analysis BEGIN SELECT RAISE(ABORT,'simulated settings failure'); END;").unwrap();
+        drop(conn);
+        let editor = capture(&state, Some(saved.identity()), Some(2), Mode::EditSource).unwrap();
+        assert!(with(Some(editor), || crate::set_ts_config_impl(&state, path.to_str().unwrap(), Some(sources::TsConfig { clock_adjustment_ms: 1000, ..Default::default() }), None)).is_err());
+        assert_eq!(crate::source_publication::receipt_locked(&state).generation, 2);
+        assert_eq!(directory.snapshot("a"), saved);
         let source = state.source.read();
-        let SourceData::Indexed(index) = &*source else {
-            panic!()
-        };
+        let SourceData::Indexed(index) = &*source else { panic!() };
         assert!(Arc::ptr_eq(&lines, &index.lines));
         assert!(Arc::ptr_eq(&order, &index.time_order));
     }
@@ -2571,29 +3081,42 @@ mod tests {
             };
             crate::engine::prepare(
                 index,
-                &Default::default(),
-                &Default::default(),
+                &codes(&state),
+                &system_codes(&state),
                 &[],
                 &|_, _| {},
             )
             .unwrap();
         }
+        let filters = vec![crate::query::Filter {
+            column: "raw".into(), op: "contains".into(), value: "event ".into(), value2: None,
+        }];
+        let pfs = crate::query::prepare(&filters);
+        let completed_page_hit = |index: &sources::FileIndex| {
+            let codes = codes(&state); let system = system_codes(&state);
+            let source = crate::engine::Source { idx: index, codes: &codes, system: &system, derived: &[] };
+            crate::engine::explain_page(&source, &pfs, "id", "asc", 3, false)
+                .unwrap().unwrap()["exactPredicate"].as_bool().unwrap()
+        };
         let before = admitted_dataset(&directory, &state);
         let cursor = with(Some(before), || {
             let view = source(&state);
             let SourceData::Indexed(index) = &*view else {
                 panic!()
             };
+            assert!(!completed_page_hit(index));
+            assert_eq!(crate::count_filtered_impl(&state, filters.clone(), None).unwrap(), 9);
+            assert!(completed_page_hit(index));
             crate::query::query_page_indexed(
                 index,
-                &[],
+                &filters,
                 "id",
                 "asc",
                 0,
                 3,
                 None,
-                &Default::default(),
-                &Default::default(),
+                &codes(&state),
+                &system_codes(&state),
                 &[],
             )
             .unwrap()
@@ -2608,16 +3131,17 @@ mod tests {
             let SourceData::Indexed(index) = &*view else {
                 panic!()
             };
+            assert!(completed_page_hit(index), "fresh admission of the same identity reuses the completed selection");
             let next = crate::query::query_page_indexed(
                 index,
-                &[],
+                &filters,
                 "id",
                 "asc",
                 3,
                 3,
                 Some(&cursor),
-                &Default::default(),
-                &Default::default(),
+                &codes(&state),
+                &system_codes(&state),
                 &[],
             )
             .unwrap();
@@ -2625,30 +3149,32 @@ mod tests {
                 next.rows.iter().map(|event| event.id).collect::<Vec<_>>(),
                 vec![4, 6, 7]
             );
-            assert_eq!(crate::count_filtered_impl(&state, vec![], None).unwrap(), 9);
+            assert_eq!(crate::count_filtered_impl(&state, filters.clone(), None).unwrap(), 9);
             assert_eq!(crate::count_filtered_impl(&state, vec![], None).unwrap(), 9);
         });
         restore(&directory, &state, &first.batch_id);
         let restored = admitted_dataset(&directory, &state);
         with(Some(restored), || {
-            assert_eq!(
-                crate::count_filtered_impl(&state, vec![], None).unwrap(),
-                10
-            );
             let view = source(&state);
             let SourceData::Indexed(index) = &*view else {
                 panic!()
             };
+            assert!(!completed_page_hit(index), "a restored visibility namespace must miss the old nine-row selection");
+            let page = crate::query::query_page_indexed(index, &filters, "id", "asc", 0, 100, None, &codes(&state), &system_codes(&state), &[]).unwrap();
+            assert_eq!(page.total, Some(10));
+            assert_eq!(page.rows.iter().map(|event| event.id).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 6, 7, 8, 9, 10]);
+            assert_eq!(crate::count_filtered_impl(&state, filters.clone(), None).unwrap(), 10);
+            assert!(completed_page_hit(index));
             assert!(crate::query::query_page_indexed(
                 index,
-                &[],
+                &filters,
                 "id",
                 "asc",
                 3,
                 3,
                 Some(&cursor),
-                &Default::default(),
-                &Default::default(),
+                &codes(&state),
+                &system_codes(&state),
                 &[]
             )
             .err()
@@ -2666,6 +3192,11 @@ mod tests {
             };
             assert!(visibility_unrestricted(index).unwrap());
             assert_eq!(visible_total(index).unwrap(), 12);
+            assert!(!completed_page_hit(index), "the final restore must not reuse either restricted selection");
+            let page = crate::query::query_page_indexed(index, &filters, "id", "asc", 0, 100, None, &codes(&state), &system_codes(&state), &[]).unwrap();
+            assert_eq!(page.rows.len(), 12);
+            assert_eq!(crate::count_filtered_impl(&state, filters.clone(), None).unwrap(), 12);
+            assert!(completed_page_hit(index));
             assert_eq!(
                 crate::count_filtered_impl(&state, vec![], None).unwrap(),
                 12
@@ -3260,8 +3791,8 @@ mod case_work_tests {
     use crate::case_work_budget::{Limits, Pool};
 
     fn admission(pool: Arc<Pool>) -> Admitted {
-        Admitted { identity: None, source_generation: None, case_key: None, case_content_token: None,
-            case_cache_bound: false, case_records: None, case_budget: pool, case_work: parking_lot::Mutex::new(None),
+        Admitted { pending_operation: parking_lot::Mutex::new(None), timestamps: OnceLock::new(), interpretation: Arc::new(Default::default()), resource_policy: crate::case_resources::Policy::capture(None, &Default::default()).unwrap(), identity: None, source_generation: None, case_key: None, case_content_token: None,
+            case_cache_bound: false, case_records: None, case_budget: pool, case_work: parking_lot::Mutex::new(None), resource_work: parking_lot::Mutex::new(Vec::new()),
             preparing_visibility: std::sync::atomic::AtomicBool::new(false), mode: Mode::Case, source: None,
             names: Vec::new(), derived: Arc::new(Vec::new()), prepared_fields: OnceLock::new(), data_root: Default::default(),
             definition_bytes: 0, diagnostics: Arc::new(Vec::new()), references: Arc::new(Vec::new()), _reference_credit: None, visibility: OnceLock::new(),
@@ -3269,7 +3800,7 @@ mod case_work_tests {
     }
     fn transform(bytes: usize) -> Vec<sources::CompiledDerived> {
         vec![sources::CompiledDerived { name: "expanded".into(), source: "message".into(), steps: Vec::new(), lookup: None,
-            rules: vec![sources::CompiledRule { re: regex::Regex::new("^(.*)$").unwrap(), template: Some("x".repeat(bytes)), filter: None }] }]
+            rules: vec![sources::CompiledRule::new(regex::Regex::new("^(.*)$").unwrap(), Some("x".repeat(bytes)), None).unwrap()] }]
     }
 
     #[test]

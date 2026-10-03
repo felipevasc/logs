@@ -774,9 +774,10 @@
   const tools = el("div", "explore-tools"); tools.innerHTML = '<button class="icon-btn" id="ws-undo" title="Desfazer filtro (Alt + ←)" aria-label="Desfazer filtro"><i class="fas fa-rotate-left"></i></button><button class="icon-btn" id="ws-wrap" title="Quebrar linhas" aria-label="Quebrar linhas"><i class="fas fa-align-left"></i></button><button class="icon-btn" id="ws-density" title="Alternar densidade" aria-label="Alternar densidade"><i class="fas fa-grip-lines"></i></button>';
   $(".viewbar").appendChild(tools); $("#ws-undo").onclick = undo;
   $("#ws-wrap").onclick = () => { document.body.dataset.wrap = document.body.dataset.wrap !== "true"; };
-  $("#ws-density").onclick = () => { const d = document.body.dataset.density === "compact" ? "comfortable" : "compact"; document.body.dataset.density = d; localStorage.setItem("workspace.density", d); };
-  document.body.dataset.density = localStorage.getItem("workspace.density") || "comfortable";
-  try { state.favoriteFields = JSON.parse(localStorage.getItem("workspace.fields") || "[]"); } catch { state.favoriteFields = []; }
+  $("#ws-density").onclick = () => { const d = document.body.dataset.density === "compact" ? "comfortable" : "compact"; document.body.dataset.density = d; void saveCases(); };
+  // Legacy profile-wide values are preserved in storage, but have no proved Case owner.
+  document.body.dataset.density = "comfortable";
+  state.favoriteFields = [];
   const detailActions = el("div", "detail-quick-actions"); detailActions.innerHTML = '<button class="btn ghost small" id="ws-detail-save"><i class="fas fa-bookmark"></i> Salvar</button><button class="btn ghost small" id="ws-detail-context">Ver contexto</button><button class="btn ghost small" id="ws-detail-follow">Seguir requisição</button>';
   $(".drawer-tabs").after(detailActions);
   $("#ws-detail-save").onclick = () => saveEvent(state.currentDetailEv);

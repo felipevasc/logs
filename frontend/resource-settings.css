@@ -1,0 +1,5 @@
+#settings-pane-resources .ui-pref { min-width: 0; grid-template-columns: minmax(0, 1fr); }
+#settings-pane-resources .fld { min-width: 0; }
+#settings-pane-resources p { overflow-wrap: anywhere; }
+#settings-pane-resources .modal-actions { flex-wrap: wrap; }
+#settings-pane-resources .modal-actions .btn { max-width: 100%; white-space: normal; }

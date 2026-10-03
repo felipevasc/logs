@@ -146,8 +146,8 @@ try{
   assert.deepEqual(await page.evaluate(()=>({filters:state.filters,quick:state.quick,tab:state.activeDatasetTab,owner:AnalysisContexts.capture(),rows:activeCube().rows})),
     {filters:analysisBefore.filters,quick:analysisBefore.quick,tab:analysisBefore.tab,owner:analysisBefore.owner,rows:cubeBefore.rows});
   await page.evaluate(()=>{api=window.__referenceAnalysisApi;delete window.__referenceAnalysisApi;delete window.__referenceAnalysisCalls;});
-  phase='Case isolation';await page.evaluate(()=>newCase('Caso sem referências',{keepArtifact:true}));
-  await page.waitForFunction(id=>activeCase()?.id!==id&&!WorkspaceContext.changing&&!state.analysisDefinitionsPending,caseId);await settled();
+  phase='Case isolation';await page.evaluate(()=>newCase('Caso sem referências'));
+  await page.waitForFunction(id=>activeCase()?.id!==id&&!WorkspaceContext.changing&&!state.analysisDefinitionsPending,caseId);await page.waitForFunction(()=>Tasks.pending()===0);assert.equal(await page.evaluate(()=>state.loaded),false);
   assert.equal(await page.evaluate(()=>state.derivedFields.some(field=>field.name==='reference_team')),false);
   await manager();assert.match(await page.locator('#rf-list').textContent(),/Nenhuma referência/);await page.locator('#rf-close').click();
   await page.evaluate(id=>WorkspaceContext.changeCase(id),caseId);await settled();assert.ok(await page.evaluate(()=>state.derivedFields.some(field=>field.name==='reference_team')));

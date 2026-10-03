@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MutationReceipt {
+    #[serde(serialize_with = "crate::analysis_context::serialize_management_snapshot")]
     pub analysis_context: Snapshot,
 }
 
@@ -27,13 +28,21 @@ pub(crate) fn validate_config(config: &Config) -> Result<(), String> {
     crate::analysis_runtime::validate_compilation(config)
 }
 
+pub(crate) fn validate_config_for(expected: &Identity, config: &Config) -> Result<(), String> {
+    let current = current_for_edit(expected)?;
+    let security = current.interpretation.as_ref().map(|settings| settings.security.clone()).unwrap_or_default();
+    crate::case_security::compiling(&security, || validate_config(config))
+}
+
 /// Keep verified reference projections and their leases alive through CAS.
 /// This runs only in an explicit mutation worker, never during request capture.
 pub(crate) fn prepare_config(
     expected: &Identity,
     config: &Config,
 ) -> Result<std::sync::Arc<Vec<sources::CompiledDerived>>, String> {
-    crate::analysis_runtime::prepare_candidate_config(
+    let current = current_for_edit(expected)?;
+    let security = current.interpretation.as_ref().map(|settings| settings.security.clone()).unwrap_or_default();
+    crate::case_security::compiling(&security, || crate::analysis_runtime::prepare_candidate_config(
         &crate::config_dir(),
         &crate::reference_store::Owner {
             case_id: expected.case_id.clone(),
@@ -41,7 +50,7 @@ pub(crate) fn prepare_config(
         },
         config,
         &|| crate::operations::check().is_err(),
-    )
+    ))
 }
 
 pub(crate) fn expected_identity(explicit: Option<Identity>) -> Result<Identity, String> {
@@ -117,7 +126,8 @@ pub(crate) fn save_definition(
     steps: Option<Vec<field_transform::Step>>,
 ) -> Result<MutationReceipt, String> {
     let current = current_for_edit(expected)?;
-    let config = replace_definition(&current.config, name, source, rules, steps)?;
+    let security = current.interpretation.as_ref().map(|settings| settings.security.clone()).unwrap_or_default();
+    let config = crate::case_security::compiling(&security, || replace_definition(&current.config, name, source, rules, steps))?;
     if config == current.config {
         return Ok(MutationReceipt {
             analysis_context: current,
@@ -147,7 +157,7 @@ pub(crate) fn delete_definition(
             analysis_context: current_for_edit(expected)?,
         });
     }
-    validate_config(&config)?;
+    validate_config_for(expected, &config)?;
     let _prepared = prepare_config(expected, &config)?;
     crate::operations::check()?;
     let snapshot = analysis_context::update(expected, config)?;
@@ -180,7 +190,7 @@ pub(crate) struct SnapshotResponse {
 }
 impl serde::Serialize for SnapshotResponse {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.snapshot.serialize(serializer)
+        crate::analysis_context::serialize_management_snapshot(&self.snapshot, serializer)
     }
 }
 const SNAPSHOT_NOT_READY: &str = "CASE_CONTEXT_NOT_READY: A configuração preservada não pode atravessar o transporte numérico do navegador sem perda. Os valores originais permanecem preservados.";
@@ -214,7 +224,7 @@ fn update_context_from_browser_at(
         return Err(BULK_NATIVE_UNSUPPORTED.into());
     }
     current_for_edit(expected)?;
-    validate_config(&config)?;
+    validate_config_for(expected, &config)?;
     let _prepared = prepare_config(expected, &config)?;
     crate::operations::check()?;
     let snapshot = analysis_context::update_legacy_browser_at(root, expected, config)?;

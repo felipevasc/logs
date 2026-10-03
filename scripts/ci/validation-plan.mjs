@@ -5,8 +5,8 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 export const fullPreview = [
-  'test-navigation.mjs', 'test-ui-scale.mjs', 'test-workspace-context.mjs',
-  'test-responsiveness.mjs', 'test-journeys.mjs', 'test-remote-sources.mjs',
+  'test-navigation.mjs', 'test-ui-scale.mjs', 'test-resource-settings.mjs', 'test-workspace-context.mjs',
+  'test-responsiveness.mjs', 'test-journeys.mjs', 'test-threats.mjs', 'test-remote-sources.mjs',
   'test-analysis-workbench.mjs', 'test-discovery.mjs', 'test-updates.mjs',
   'test-explorer-timeline.mjs', 'test-field-transform.mjs', 'test-exclusion-archive.mjs',
   'test-case-references.mjs', 'test-canonical-field-actions.mjs', 'test-java-trace.mjs',
@@ -24,11 +24,13 @@ const affected = [
   [/^frontend\/(?:explorer-timeline|timeline|case-timeline)/, ['test-explorer-timeline.mjs']],
   [/^frontend\/timeline-export\./, ['test-timeline-export-waiting.mjs']],
   [/^frontend\/(?:java-trace)/, ['test-java-trace.mjs']],
-  [/^frontend\/(?:journeys|case-trails|threats|security|participants-ui)/, ['test-journeys.mjs']],
+  [/^frontend\/(?:journeys|case-trails|participants-ui)/, ['test-journeys.mjs']],
+  [/^frontend\/(?:threats|security)/, ['test-journeys.mjs', 'test-threats.mjs']],
   [/^frontend\/remote-sources/, ['test-remote-sources.mjs']],
   [/^frontend\/workspace/, ['test-waiting-reduced-motion.mjs', 'test-waiting-restore-access.mjs', 'test-waiting-micro-reactions.mjs', 'test-workspace-context.mjs', 'test-export-scope.mjs', 'test-source-actions.mjs', 'test-timestamp-editor.mjs']],
   [/^frontend\/case-report\./, ['test-case-report-waiting.mjs']],
   [/^frontend\/(?:ui-scale|styles|index\.html)/, ['test-ui-scale.mjs']],
+  [/^frontend\/resource-settings\.(?:js|css)$/, ['test-resource-settings.mjs']],
   [/^frontend\/(?:context-menu|command-palette)/, ['test-navigation.mjs', 'test-context-menu.mjs', 'test-source-actions.mjs']],
   [/^frontend\/(?:waiting-|tasks)/, ['test-responsiveness.mjs', 'test-waiting-visuals.mjs', 'test-waiting-reactions.mjs', 'test-waiting-verification.mjs', 'test-waiting-manual.mjs', 'test-waiting-boundaries.mjs', 'test-waiting-reduced-motion.mjs', 'test-waiting-restore-access.mjs', 'test-waiting-micro-reactions.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs']],
 ];

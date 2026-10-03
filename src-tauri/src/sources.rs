@@ -3,8 +3,15 @@ use crate::model::{
     LV_TRACE, LV_WARN, STANDARD_COLUMNS,
 };
 use chrono::Datelike;
-use rayon::prelude::*;
 use serde_json::{Map, Value};
+
+mod web_logs;
+
+/// Scoped parsed-data revision; raw source and stable event identities never change.
+pub(crate) fn parser_semantics_signature(format: &str) -> Option<&'static str> {
+    matches!(format, "apache" | "nginx" | "nginx-error" | "jsonl" | "logfmt" | "auto" | "mixed")
+        .then_some("web-logs-v1")
+}
 
 /// Interpreta data/hora "naive" (sem fuso) como horário LOCAL da máquina.
 pub(crate) fn naive_to_ms(ndt: chrono::NaiveDateTime) -> i64 {
@@ -187,6 +194,10 @@ fn event_from_json(input: Map<String, Value>, raw: &str) -> Event {
     if let Some(v) = take_key(&mut map, TS_KEYS) {
         ev.timestamp = value_to_ms(&v);
     }
+    let explicit_level = LEVEL_KEYS.iter().any(|alias| map.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case(alias) && (value.is_string() || value.is_number() || value.is_boolean())
+            && value.as_str().is_none_or(|text| !text.trim().is_empty())
+    }));
     if let Some(v) = take_key(&mut map, LEVEL_KEYS) {
         ev.level = normalize_level(
             &v.as_str()
@@ -213,6 +224,7 @@ fn event_from_json(input: Map<String, Value>, raw: &str) -> Event {
             .unwrap_or_else(|| v.to_string());
     }
     ev.fields = map;
+    web_logs::enrich_http(&mut ev, explicit_level);
     describe_known_json(&mut ev);
     if ev.message.is_empty() {
         ev.message = raw.chars().take(500).collect();
@@ -419,13 +431,6 @@ fn re_syslog5424() -> &'static regex::Regex {
     })
 }
 
-fn re_apache() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        regex::Regex::new(r#"^(\S+)\s+(\S+)\s+(\S+)\s+\[([^\]]+)\]\s+"(\S+)\s+(\S+)\s+(\S+)"\s+(\d{3})\s+(\S+)(?:\s+"([^"]*)"\s+"([^"]*)")?"#).unwrap()
-    })
-}
-
 fn month_num(mon: &str) -> Option<u32> {
     Some(match mon {
         "Jan" => 1,
@@ -491,40 +496,7 @@ fn parse_syslog5424(line: &str) -> Option<Event> {
 }
 
 fn parse_apache(line: &str) -> Option<Event> {
-    let c = re_apache().captures(line)?;
-    let mut ev = Event::empty();
-    ev.raw = line.to_string();
-    // [10/Oct/2000:13:55:36 -0700]
-    if let Ok(dt) = chrono::DateTime::parse_from_str(&c[4], "%d/%b/%Y:%H:%M:%S %z") {
-        ev.timestamp = Some(dt.timestamp_millis());
-    }
-    ev.source = c[1].to_string(); // IP do cliente
-    if &c[3] != "-" {
-        ev.fields
-            .insert("user".into(), Value::from(c[3].to_string()));
-    }
-    ev.fields
-        .insert("method".into(), Value::from(c[5].to_string()));
-    ev.fields
-        .insert("path".into(), Value::from(c[6].to_string()));
-    ev.fields
-        .insert("protocol".into(), Value::from(c[7].to_string()));
-    ev.code = c[8].to_string(); // status HTTP
-    ev.level = match c[8].chars().next() {
-        Some('5') => "Erro".into(),
-        Some('4') => "Aviso".into(),
-        _ => "Informação".into(),
-    };
-    ev.fields
-        .insert("size".into(), Value::from(c[9].to_string()));
-    if let Some(r) = c.get(10) {
-        ev.fields.insert("referer".into(), Value::from(r.as_str()));
-    }
-    if let Some(a) = c.get(11) {
-        ev.fields.insert("agent".into(), Value::from(a.as_str()));
-    }
-    ev.message = format!("{} {} {} → {}", &c[5], &c[6], &c[7], &c[8]);
-    Some(ev)
+    web_logs::parse_access(line)
 }
 
 fn parse_firewall(line: &str, year: i32) -> Option<Event> {
@@ -841,6 +813,7 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
         }
     }
     let mut n = 0usize;
+    let mut nginx_error = 0usize;
     let (mut json, mut s3164, mut s5424, mut apache, mut fw, mut log4j, mut logfmt, mut wildfly) =
         (0, 0, 0, 0, 0, 0, 0, 0);
     // linhas de corpo de stacktrace Java contam como evidência de log4j/wildfly
@@ -873,8 +846,10 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
             json += 1;
         } else if re_syslog5424().is_match(line) {
             s5424 += 1;
-        } else if re_apache().is_match(line) {
+        } else if web_logs::parse_access(line).is_some() {
             apache += 1;
+        } else if web_logs::parse_error(line).is_some() {
+            nginx_error += 1;
         } else if re_log4j().is_match(line) {
             log4j += 1;
         } else if re_wildfly().is_match(line) || re_jboss().is_match(line) {
@@ -885,7 +860,7 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
             } else {
                 s3164 += 1;
             }
-        } else if re_logfmt().captures_iter(line).count() >= 3 {
+        } else if web_logs::parse_logfmt(line).is_some() {
             logfmt += 1;
         }
     }
@@ -905,6 +880,8 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
         "syslog5424"
     } else if apache > half {
         "apache"
+    } else if nginx_error > half {
+        "nginx-error"
     } else if fw > half {
         "firewall"
     } else if wildfly > half || (wildfly > 0 && wildfly + stack > half) {
@@ -915,6 +892,8 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
         "syslog3164"
     } else if logfmt > half {
         "logfmt"
+    } else if json + apache + nginx_error + logfmt > 0 {
+        "mixed"
     } else {
         "text"
     }
@@ -925,11 +904,6 @@ fn re_log4j() -> &'static regex::Regex {
     RE.get_or_init(|| {
         regex::Regex::new(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d{3})\s+(\w+)\s+\[([^\]]*)\]\s+(\S+)\s+-\s+(.*)$").unwrap()
     })
-}
-
-fn re_logfmt() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r#"(\w+)=("([^"]*)"|\S+)"#).unwrap())
 }
 
 fn re_kv_key() -> &'static regex::Regex {
@@ -1152,43 +1126,27 @@ fn parse_log4j(block: &str) -> Option<Event> {
 
 /// Logfmt (Heroku/estilo key=value): `ts=... level=info msg="..." k=v`
 fn parse_logfmt(line: &str) -> Option<Event> {
-    let kvs: Vec<_> = re_logfmt().captures_iter(line).collect();
-    if kvs.len() < 3 {
+    web_logs::parse_logfmt(line)
+}
+
+/// Only strict, self-describing single-line formats participate in fallback.
+/// Explicit text, snapshots, custom schemas and multiline framing stay intact.
+fn parse_structured_line(line: &str) -> Option<Event> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
+            return Some(event_from_json(map, line));
+        }
         return None;
     }
-    let mut ev = Event::empty();
-    ev.raw = line.to_string();
-    for cap in kvs {
-        let key = cap[1].to_lowercase();
-        let val = cap
-            .get(3)
-            .map(|m| m.as_str())
-            .unwrap_or_else(|| cap[2].trim_matches('"'));
-        match key.as_str() {
-            "ts" | "time" | "timestamp" => {
-                ev.timestamp = parse_timestamp(val).or_else(|| {
-                    val.parse::<f64>().ok().map(|f| {
-                        if f > 1e12 {
-                            f as i64
-                        } else {
-                            (f * 1000.0) as i64
-                        }
-                    })
-                });
-            }
-            "level" | "lvl" | "severity" => ev.level = normalize_level(val),
-            "msg" | "message" => ev.message = val.to_string(),
-            "code" | "event" => ev.code = val.to_string(),
-            "host" | "source" | "app" | "service" => ev.source = val.to_string(),
-            other => {
-                ev.fields.insert(other.into(), Value::from(val));
-            }
-        }
+    if web_logs::error_candidate(trimmed) {
+        return web_logs::parse_error(line);
     }
-    if ev.message.is_empty() {
-        ev.message = line.to_string();
+    if web_logs::access_candidate(trimmed) {
+        if let Some(event) = parse_apache(line) { return Some(event); }
     }
-    Some(ev)
+    if web_logs::logfmt_candidate(trimmed) { return parse_logfmt(line); }
+    None
 }
 
 /// CEF (ArcSight): `CEF:0|Vendor|Product|Version|SignatureID|Name|Severity|extensão`
@@ -1568,7 +1526,7 @@ fn parse_csv_line(line: &str, header: &[String]) -> Option<Event> {
 /// `regex`: opcional, extrai o texto da data (2 grupos = data + hora).
 /// `format`: padrão chrono, "epoch_ms" ou "epoch_s".
 /// `complement`: data literal ("2026-06-24") quando o formato só tem hora.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct TsConfig {
     #[serde(default)]
     pub timezone_offset_minutes: Option<i32>,
@@ -1593,7 +1551,7 @@ pub struct TsConfig {
 }
 
 /// Uma alternativa de extração de data/hora (regex + montagem opcional).
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct TsRule {
     #[serde(default)]
     pub regex: Option<String>,
@@ -1744,6 +1702,35 @@ pub struct CompiledRule {
     pub re: regex::Regex,
     pub template: Option<String>,
     pub filter: Option<crate::query::Filter>,
+    /// Frozen condition, including any Case-local detection/threat catalog.
+    /// Hydration must never re-resolve a raw filter on a Rayon/background thread.
+    prepared_filter: Option<std::sync::Arc<crate::query::PreparedFilter>>,
+    pub(crate) filter_security_signature: Option<String>,
+}
+impl CompiledRule {
+    pub(crate) fn new(re: regex::Regex, template: Option<String>, filter: Option<crate::query::Filter>) -> Result<Self, String> {
+        let (prepared_filter, filter_security_signature) = match &filter {
+            Some(filter) => {
+                crate::operations::check()?;
+                crate::workspace::validate(std::slice::from_ref(filter))?;
+                let prepared = crate::query::prepare(std::slice::from_ref(filter)).pop().ok_or("Condição derivada não compilada.")?;
+                crate::operations::check()?;
+                (Some(std::sync::Arc::new(prepared)), Some(crate::detections::fingerprint()))
+            }
+            None => (None, None),
+        };
+        Ok(Self { re, template, filter, prepared_filter, filter_security_signature })
+    }
+    pub(crate) fn filter_reads_id(&self) -> bool {
+        let Some(filter) = &self.filter else { return false; };
+        // Catalog detections may themselves read id. Keep such fields on the
+        // authoritative event path rather than bake segment-relative ids.
+        if filter.column == "id" || filter.op == "detection" { return true; }
+        if filter.op != "query" { return false; }
+        let Some(expr) = self.prepared_filter.as_ref().and_then(|prepared| prepared.expr.as_ref()) else { return true; };
+        let mut names = Vec::new(); expr.field_names(&mut names);
+        names.iter().any(|name| matches!(name.as_str(), "id" | "deteccao" | "detecção" | "detection"))
+    }
 }
 
 #[derive(Clone)]
@@ -1840,7 +1827,7 @@ pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
             let input = if d.rules.is_empty() { &source } else {
                 let value = source.as_str().map(std::borrow::Cow::Borrowed)
                     .unwrap_or_else(|| std::borrow::Cow::Owned(source.to_string()));
-                let found = d.rules.iter().filter(|r| r.filter.as_ref().is_none_or(|f| crate::query::matches_filter(ev, f))).find_map(|r| {
+                let found = d.rules.iter().filter(|r| r.prepared_filter.as_ref().is_none_or(|f| crate::query::matches(ev, f))).find_map(|r| {
                     let captures = r.re.captures(&value)?;
                     let output = match &r.template {
                         Some(template) if !template.is_empty() => {
@@ -1892,8 +1879,8 @@ pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
             continue;
         }; // owned: liberado para inserir o campo
         for r in &d.rules {
-            if let Some(f) = &r.filter {
-                if !crate::query::matches_filter(ev, f) {
+            if let Some(f) = &r.prepared_filter {
+                if !crate::query::matches(ev, f) {
                     continue; // condição não atendida: tenta a próxima regra
                 }
             }
@@ -1987,7 +1974,7 @@ mod derived_transform_tests {
     fn regex_then_transform_preserves_existing_extraction_order() {
         let mut event = Event::empty(); event.message = "value=%2Fapi".into();
         let mut field = definition("decoded", "message", vec![Step::UrlDecode]);
-        field.rules.push(CompiledRule { re: regex::Regex::new("value=(.*)").unwrap(), template: None, filter: None });
+        field.rules.push(CompiledRule::new(regex::Regex::new("value=(.*)").unwrap(), None, None).unwrap());
         apply_derived(&mut event, &[field]);
         assert_eq!(event.fields["decoded"], "/api");
     }
@@ -2030,7 +2017,7 @@ mod derived_transform_tests {
         let mut overlay = evidence.clone(); apply_derived(&mut overlay, &[first]);
         assert_eq!(overlay.fields["decoded"], "/api"); assert!(overlay.derived_diagnostics.is_empty());
         let mut second = definition("native_null", "input", Vec::new());
-        second.rules.push(CompiledRule { re: regex::Regex::new("(.*)").unwrap(), template: Some("replacement".into()), filter: None });
+        second.rules.push(CompiledRule::new(regex::Regex::new("(.*)").unwrap(), Some("replacement".into()), None).unwrap());
         apply_derived(&mut overlay, &[second]);
         assert!(!overlay.fields.contains_key("decoded"));
         assert_eq!(overlay.fields["native_null"], "replacement");
@@ -2417,10 +2404,8 @@ pub fn retimestamp_index(
         }
         let start = completed;
         let end = (start + wave).min(total);
-        let part: Vec<i64> = (start..end)
-            .into_par_iter()
-            .with_min_len(1024)
-            .map(|i| {
+        let parts = crate::global_scheduler::map((start..end).step_by(1024), |from| {
+            (from..(from + 1024).min(end)).map(|i| {
                 if cancellation.cancelled() {
                     return 0;
                 }
@@ -2431,9 +2416,9 @@ pub fn retimestamp_index(
                     apply_ts_config(&mut ev, cc, part, &String::from_utf8_lossy(bytes));
                 }
                 ev.timestamp.unwrap_or(0)
-            })
-            .collect();
-        for timestamp in part { timestamps.push(timestamp)?; }
+            }).collect::<Vec<_>>()
+        });
+        for timestamp in parts.into_iter().flatten() { timestamps.push(timestamp)?; }
         completed = end;
     }
     crate::operations::check()?;
@@ -2650,6 +2635,8 @@ pub(crate) fn parse_line_at(bytes: &[u8], format: &str, custom: Option<&CustomPa
         "syslog3164" => parse_syslog3164(&text, year).unwrap_or_else(|| event_from_text(&text)),
         "syslog5424" => parse_syslog5424(&text).unwrap_or_else(|| event_from_text(&text)),
         "apache" => parse_apache(&text).unwrap_or_else(|| event_from_text(&text)),
+        "nginx-error" => web_logs::parse_error(&text).unwrap_or_else(|| event_from_text(&text)),
+        "nginx" | "auto" | "mixed" => parse_structured_line(&text).unwrap_or_else(|| event_from_text(&text)),
         "firewall" => parse_firewall(&text, year).unwrap_or_else(|| event_from_text(&text)),
         "wildfly" => parse_wildfly(&text)
             .or_else(|| parse_jboss(&text))
@@ -2681,6 +2668,9 @@ pub(crate) fn parse_line_at(bytes: &[u8], format: &str, custom: Option<&CustomPa
         },
         _ => event_from_text(&text),
     };
+    if ev.parse_status == "text" && matches!(format, "apache" | "nginx-error" | "jsonl" | "logfmt") {
+        if let Some(recognized) = parse_structured_line(&text) { ev = recognized; }
+    }
     if ev.parse_status == "text" && format != "text" {
         ev.parse_status = "unparsed".into();
     }
@@ -2862,7 +2852,7 @@ fn index_lines(prepared: &PreparedIndex, lines: &mut crate::metadata_store::Line
             Ok(out)
         };
         report(reporter, Progress::new("metadata-scan", "Indexando metadados", cursor, bytes.len(), "bytes"));
-        let parts: Result<Vec<ChunkLines>, String> = (0..bounds.len() - 1).into_par_iter().map(chunk).collect();
+        let parts: Result<Vec<ChunkLines>, String> = crate::global_scheduler::map(0..bounds.len() - 1, chunk).into_iter().collect();
         crate::operations::check()?;
         let previous_rows = lines.len();
         for chunk in parts? {
@@ -2989,10 +2979,10 @@ fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, curs
             records.push(record);
             if scanner.cursor - wave_start >= prepared.limits.json_bytes { break; }
         }
-        let metas: Result<Vec<LineMeta>, String> = records.par_iter().map(|&(begin, end)| {
+        let metas: Result<Vec<LineMeta>, String> = crate::global_scheduler::map(&records, |&(begin, end)| {
             if cancellation.cancelled() { return Err("Operação cancelada.".into()); }
             meta_for_line(&bytes[begin..end], begin as u64, &prepared.part)
-        }).collect();
+        }).into_iter().collect();
         crate::operations::check()?;
         lines.extend(metas?)?;
         let parsed = prepared.parsed_rows.fetch_add(records.len(), std::sync::atomic::Ordering::Relaxed) + records.len();
@@ -3062,7 +3052,14 @@ impl PreparedIndex {
     pub(crate) fn key(&self) -> Result<String, String> {
         use sha2::{Digest, Sha256};
         let bytes = serde_json::to_vec(&(crate::index_cache::INDEX_DIR, crate::metadata_checkpoint::VERSION, &self.stamp, &self.part.identity, &self.descriptor, &self.part.calendar)).map_err(|e| e.to_string())?;
-        Ok(format!("{:x}", Sha256::digest(bytes)))
+        // Keep unaffected formats byte-for-byte compatible with prior keys.
+        let mut hash = Sha256::new();
+        hash.update(bytes);
+        if let Some(revision) = parser_semantics_signature(&self.part.format) {
+            hash.update(b"|structured-parser:");
+            hash.update(revision.as_bytes());
+        }
+        Ok(format!("{:x}", hash.finalize()))
     }
     pub(crate) fn initial_cursor(&self) -> usize { self.descriptor.array.map_or(0, |(start, _)| start + 1) }
     pub(crate) fn multiline(&self) -> bool { self.descriptor.start_pattern.is_some() }
@@ -3084,7 +3081,11 @@ pub(crate) fn prepare_index(path: &str, format: &str, custom: Option<CustomParse
     let stamp = SourceStamp::read(&file, path)?;
     if stamp.bytes == 0 { return Err("Arquivo vazio.".into()); }
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| format!("Falha ao mapear '{path}': {e}"))?;
-    let fmt = if format == "auto" { detect_format(&mmap).to_string() }
+    let fmt = if format == "auto" {
+        // An inconclusive prefix must not disable recognition for later rows.
+        // Explicitly requested plain text still keeps its literal semantics.
+        match detect_format(&mmap) { "text" => "mixed", detected => detected }.to_string()
+    }
         else if format == "custom" || format.starts_with("custom:") { "custom".to_string() }
         else if format == "csv" { detect_delimited(&mmap).unwrap_or("csv").to_string() }
         else { format.to_string() };
@@ -3176,7 +3177,7 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
                 let ev = parse_part_line(&prepared.part, &bytes[m.offset as usize..m.offset as usize + m.len as usize]);
                 extra.extend(ev.fields.keys().cloned()); sampled.push(ev);
             }
-            let mut extra: Vec<String> = extra.into_iter().collect(); extra.sort(); columns.extend(extra);
+            let mut extra: Vec<String> = extra.into_iter().filter(|name| !STANDARD_COLUMNS.contains(&name.as_str())).collect(); extra.sort(); columns.extend(extra);
             for column in crate::entities::observed_columns(sampled.iter()) {
                 if !columns.contains(&column) { columns.push(column); }
             }
@@ -3327,7 +3328,11 @@ pub fn visit_evtx_file(
     max_events: usize,
     mut visit: impl FnMut(Event) -> Result<(), String>,
 ) -> Result<usize, String> {
-    let mut parser = evtx::EvtxParser::from_path(path).map_err(|e| format!("Não foi possível abrir o EVTX: {e}"))?;
+    // EVTX parsing runs in the caller's globally admitted lane; its native
+    // chunk workers must not multiply the application's shared CPU budget.
+    let mut parser = evtx::EvtxParser::from_path(path)
+        .map_err(|e| format!("Não foi possível abrir o EVTX: {e}"))?
+        .with_configuration(evtx::ParserSettings::default().num_threads(1));
     let mut count = 0usize;
     let mut skipped = 0usize;
     for record in parser.records() {

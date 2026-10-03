@@ -62,55 +62,27 @@ fn derived_signature(derived: &[CompiledDerived]) -> Option<String> {
         }
         let mut rules = Vec::with_capacity(field.rules.len());
         for rule in &field.rules {
-            if let Some(filter) = &rule.filter {
-                if filter.column == "id" || (filter.op == "query" && query_reads_id(&filter.value)) { return None; }
-            }
-            rules.push((rule.re.as_str(), &rule.template, &rule.filter));
+            if rule.filter_reads_id() { return None; }
+            // The same textual rule ID can compile differently in two Cases.
+            // Use the signature captured with its immutable predicate, never a
+            // later TLS/default catalog (including background store builds).
+            rules.push((rule.re.as_str(), &rule.template, &rule.filter, &rule.filter_security_signature));
         }
         definitions.push((&field.name, &field.source, &field.steps, rules));
     }
     // Version all derived overlays (including legacy regex) because bounded
     // extraction/provenance semantics changed. Base immutable stores stay valid.
     if lookups.is_empty() {
-        return Some(format!("derived-overlay-v2:{}:{}", crate::field_transform::VERSION, serde_json::to_string(&definitions).ok()?));
+        return Some(format!("derived-overlay-v3:{}:{}", crate::field_transform::VERSION, serde_json::to_string(&definitions).ok()?));
     }
-    Some(format!("derived-overlay-v3:{}:{}:{}", crate::field_transform::VERSION, crate::reference_lookup::VERSION, serde_json::to_string(&(definitions, lookups)).ok()?))
-}
-
-fn query_reads_id(text: &str) -> bool {
-    match crate::querylang::compile(text) {
-        Ok(expr) => {
-            let mut names = Vec::new();
-            expr.field_names(&mut names);
-            names.iter().any(|n| n == "id")
-        }
-        Err(_) => true,
-    }
+    Some(format!("derived-overlay-v4:{}:{}:{}", crate::field_transform::VERSION, crate::reference_lookup::VERSION, serde_json::to_string(&(definitions, lookups)).ok()?))
 }
 
 fn catalogs_signature(codes: &CodesConfig, system: &CodesConfig) -> String {
-    static CACHE: Mutex<Option<((u64, usize, usize, usize, usize), String)>> = Mutex::new(None);
-    let key = catalog_pointer_key(codes, system);
-    if let Some((cached, sig)) = &*CACHE.lock() {
-        if *cached == key {
-            return sig.clone();
-        }
-    }
-    // This version intentionally retires catalog-sensitive derived variants
-    // and old page cursors once; immutable base stores do not use this key.
-    let sig = format!("catalog-v2:{}", catalog_content_signature(codes, system));
-    *CACHE.lock() = Some((key, sig.clone()));
-    sig
-}
-
-fn catalog_pointer_key(codes: &CodesConfig, system: &CodesConfig) -> (u64, usize, usize, usize, usize) {
-    (
-        CATALOG_EPOCH.load(Ordering::SeqCst),
-        codes as *const _ as usize,
-        system as *const _ as usize,
-        codes.sources.values().map(|m| m.len()).sum(),
-        system.sources.values().map(|m| m.len()).sum(),
-    )
+    // Request-local Case snapshots can reuse the same stack address and entry
+    // count. Only their actual content proves enrichment identity; a pointer
+    // cache can return another Case's signature even without an epoch change.
+    format!("catalog-v2:{}", catalog_content_signature(codes, system))
 }
 
 type CatalogKey = (u64, String);
@@ -140,7 +112,7 @@ fn catalog_key(codes: &CodesConfig, system: &CodesConfig) -> CatalogKey {
 
 /// Content identity for projected-row admission. Length-prefixed values and
 /// explicit catalog boundaries make control characters unambiguous. Compute
-/// under the catalogs' read guards; unlike planner pointer caches this proves
+/// under the catalogs' read guards; this proves
 /// the actual content even before a mutation increments CATALOG_EPOCH.
 pub(crate) fn catalog_content_signature(codes: &CodesConfig, system: &CodesConfig) -> String {
     catalog_key(codes, system).1
@@ -180,11 +152,104 @@ mod catalog_identity_tests {
         assert!(first_sig.starts_with("catalog-v2:"));
         assert_ne!(first_sig, second_sig, "separator data must not alias different enrichment");
         assert_eq!(first_sig, format!("catalog-v2:{}", catalog_content_signature(&first, &empty)));
-        let _ = catalogs_signature(&first, &empty); // seed this pointer/count entry
+        let _ = catalogs_signature(&first, &empty); // exercise the same address/count before mutation
         first.sources.get_mut("source").unwrap().get_mut("1").unwrap().description = "changed".into();
         catalogs_changed();
         assert_ne!(first_sig, catalogs_signature(&first, &empty));
         assert_ne!(catalogs_signature(&first, &empty), catalogs_signature(&empty, &first));
+    }
+
+    #[test]
+    fn request_local_catalog_identity_cannot_alias_same_address_and_count() {
+        let mut slot = catalog("Case A", "first interpretation");
+        let empty = CodesConfig::default();
+        let before_epoch = CATALOG_EPOCH.load(Ordering::SeqCst);
+        let first = catalogs_signature(&slot, &empty);
+        let same_address = &slot as *const _ as usize;
+        slot.sources.get_mut("source").unwrap().get_mut("1").unwrap().name = "Case B".into();
+        assert_eq!(&slot as *const _ as usize, same_address);
+        assert_eq!(CATALOG_EPOCH.load(Ordering::SeqCst), before_epoch);
+        let second = catalogs_signature(&slot, &empty);
+        assert_ne!(first, second, "Case snapshots must use content identity without relying on a global mutation notification");
+        slot.sources.get_mut("source").unwrap().get_mut("1").unwrap().name = "Case A".into();
+        assert_eq!(first, catalogs_signature(&slot, &empty));
+    }
+
+    #[test]
+    fn names_guard_repins_requested_case_after_interleaved_session_acquisition() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE enr(source VARCHAR, code VARCHAR, name VARCHAR, description VARCHAR, catalog INTEGER)").unwrap();
+        let session = Arc::new(Session {
+            key: "catalog-interleaving".into(), base: Mutex::new(conn), pool: Mutex::new(vec![]),
+            schema: sql::Schema::default(), timestamps_non_null: false, baked: false,
+            names: RwLock::new(None), names_version: AtomicU64::new(0),
+            selections: Mutex::new(vec![]), selection_builds: Mutex::new(HashSet::new()),
+            selection_changed: parking_lot::Condvar::new(), garbage: Arc::new(Mutex::new(vec![])),
+            row_count: None, texts: vec![], time_indexes: RwLock::new(None), _leases: vec![],
+        });
+        let a = catalog("Case A", "first"); let b = catalog("Case B", "second");
+        let empty = CodesConfig::default();
+        // Deterministic old race: A obtained its Session, B refreshed it before
+        // A acquired the statement lock. The new guard must restore A itself.
+        session.refresh_names(&a, &empty).unwrap();
+        session.refresh_names(&b, &empty).unwrap();
+        let guard = session.names_guard(&a, &empty).unwrap();
+        let name = || session.conn().unwrap().query_row("SELECT name FROM enr", [], |row| row.get::<_, String>(0)).unwrap();
+        assert_eq!(name(), "Case A");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other = Arc::clone(&session);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guard = other.names_guard(&b, &CodesConfig::default()).unwrap();
+            let name: String = other.conn().unwrap().query_row("SELECT name FROM enr", [], |row| row.get(0)).unwrap();
+            done_tx.send(name).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(std::time::Duration::from_millis(20)).is_err(), "B cannot refresh during A's pinned statement");
+        assert_eq!(name(), "Case A");
+        drop(guard);
+        assert_eq!(done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "Case B");
+        worker.join().unwrap();
+        let _guard = session.names_guard(&a, &empty).unwrap();
+        assert_eq!(name(), "Case A");
+        let token = crate::operations::token(Some("case-catalog-cancelled-waiter".into())).unwrap();
+        let other = Arc::clone(&session);
+        let (started, waiting) = std::sync::mpsc::channel();
+        let (finished, result) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || crate::operations::run_with_token(token, || {
+            started.send(()).unwrap();
+            finished.send(other.names_guard(&catalog("Case B", "second"), &CodesConfig::default()).map(|_| ())).unwrap();
+        }));
+        waiting.recv().unwrap();
+        crate::operations::cancel_id("case-catalog-cancelled-waiter");
+        assert!(result.recv_timeout(std::time::Duration::from_secs(5)).unwrap().is_err());
+        waiter.join().unwrap();
+        assert_eq!(name(), "Case A", "cancelled waiter cannot publish B's enrichment");
+    }
+
+    #[test]
+    fn derived_store_signature_uses_compiled_security_even_after_context_ends() {
+        let derive = |pattern: &str| {
+            let mut settings = crate::case_security::Settings::default();
+            settings.threat_catalog_json = Some(serde_json::json!({"version":1,"name":"Case","rules":[{"id":"case.signal","name":"Signal","category":"test","severity":"medium","kind":"indicator","pattern":pattern,"description":"Fixture","enabled":true}]}).to_string());
+            crate::case_security::compiling(&settings, || vec![CompiledDerived {
+                name: "tag".into(), source: "message".into(), steps: vec![], lookup: None,
+                rules: vec![crate::sources::CompiledRule::new(regex::Regex::new("(.*)").unwrap(), None,
+                    Some(crate::query::Filter { column: "_all".into(), op: "threat_rule".into(), value: "case.signal".into(), value2: None })).unwrap()],
+            }])
+        };
+        let a = derive("ALPHA"); let b = derive("BRAVO");
+        let first = derived_signature(&a).unwrap();
+        assert_ne!(first, derived_signature(&b).unwrap());
+        assert_eq!(first, derived_signature(&derive("ALPHA")).unwrap());
+        assert_eq!(derived_signature(&[]).unwrap(), "", "immutable base identity remains unchanged");
+        let root = tempfile::tempdir().unwrap(); let file = root.path().join("source.jsonl");
+        std::fs::write(&file, "{\"message\":\"ALPHA\"}\n{\"message\":\"BRAVO\"}\n").unwrap();
+        let idx = crate::sources::index_file(file.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let codes = CodesConfig::default();
+        assert_ne!(spec(&idx, &codes, &codes, &a).unwrap().key, spec(&idx, &codes, &codes, &b).unwrap().key);
+        assert_eq!(first, derived_signature(&a).unwrap(), "later/default security cannot re-key captured A");
     }
 
     #[test]
@@ -344,6 +409,12 @@ fn spec(
                 hash.update(b"|parser-enrichment:");
                 hash.update(revision.as_bytes());
             }
+            // Parser semantics affect SQL/text contents and metadata, but not
+            // logical record IDs. Rebuild only affected parser families.
+            if let Some(revision) = crate::sources::parser_semantics_signature(&part.format) {
+                hash.update(b"|structured-parser:");
+                hash.update(revision.as_bytes());
+            }
             let key = format!("{:x}", hash.finalize());
             parts.push(PartSpec {
                 path: dir.join(format!("{key}.duckdb")),
@@ -386,7 +457,10 @@ pub(crate) struct Session {
     selection_builds: Mutex<HashSet<String>>,
     selection_changed: parking_lot::Condvar,
     /// Selection tables no longer referenced, dropped before new ones are made.
-    garbage: Arc<Mutex<Vec<String>>>,
+    garbage: Arc<Mutex<Vec<ops::SelectionGarbage>>>,
+    /// Verified upper bound for IDs selected from this immutable source.
+    /// None is reserved for synthetic test sessions without a SourceSpec.
+    row_count: Option<usize>,
     /// Inverted text index of each part with its first line; empty when a
     /// part has none (free text is then scanned).
     texts: Vec<(usize, text::Text)>,
@@ -394,6 +468,29 @@ pub(crate) struct Session {
     time_indexes: RwLock<Option<time_index::ReadSet>>,
     /// Shared OS leases outlive database connections and mapped text readers.
     _leases: Vec<std::fs::File>,
+}
+
+/// Best-effort pressure recovery across the current and retained sessions.
+/// Acquire Arcs under Registry, then release that lock before any SQL, cache
+/// mutation or credit release. A retired active session is supplied explicitly.
+pub(crate) fn trim_inactive_selection_caches(current: Option<&Session>, pressure: Option<(&crate::case_work_budget::Pool, crate::case_work_budget::Pressure)>) -> Result<(), String> {
+    let sessions = with_registry(|registry| {
+        let mut sessions = Vec::<Arc<Session>>::new();
+        for session in registry.base_session.iter().chain(registry.session.iter()) {
+            if !current.is_some_and(|current| std::ptr::eq(session.as_ref(), current))
+                && !sessions.iter().any(|held| Arc::ptr_eq(held, session)) {
+                sessions.push(Arc::clone(session));
+            }
+        }
+        sessions
+    });
+    let mut failure = current.and_then(|current| current.trim_inactive_selections_for(pressure).err());
+    for session in sessions {
+        if let Err(error) = session.trim_inactive_selections_for(pressure) {
+            if failure.is_none() { failure = Some(error); }
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 pub(crate) struct Pooled<'a> {
@@ -576,6 +673,7 @@ impl Session {
             selection_builds: Mutex::new(HashSet::new()),
             selection_changed: parking_lot::Condvar::new(),
             garbage: Arc::new(Mutex::new(Vec::new())),
+            row_count: Some(spec.parts.iter().map(|part| part.rows).sum()),
             texts,
             time_indexes: RwLock::new(time_indexes),
             _leases: leases,
@@ -661,17 +759,31 @@ impl Session {
 
     pub(crate) fn cache_selection(&self, key: String, selection: Arc<ops::Selection>) {
         let key = format!("{}|{key}", crate::analysis_runtime::cache_namespace());
+        let owner_budget = crate::resources::selection_cache_bytes();
+        let aggregate_budget = crate::resources::application_selection_cache_bytes();
+        let mut retired = Vec::new();
         let mut selections = self.selections.lock();
-        selections.retain(|(k, _)| *k != key);
-        let budget = crate::resources::selection_cache_bytes();
-        if selection.accounted_bytes() > budget { return; }
-        selections.insert(0, (key, selection));
-        let mut bytes = 0u64;
-        let keep = selections.iter().take(8).take_while(|(_, selection)| {
-            bytes = bytes.saturating_add(selection.accounted_bytes());
-            bytes <= budget
-        }).count();
-        selections.truncate(keep);
+        for index in (0..selections.len()).rev() {
+            if selections[index].0 == key { retired.push(selections.remove(index)); }
+        }
+        if selection.accounted_bytes() <= owner_budget && selection.accounted_bytes() <= aggregate_budget {
+            selections.insert(0, (key, Arc::clone(&selection)));
+            loop {
+                let owner_bytes = selections.iter().filter(|(_, entry)| selection.same_owner(entry))
+                    .fold(0u64, |bytes, (_, entry)| bytes.saturating_add(entry.accounted_bytes()));
+                let aggregate_bytes = selections.iter().fold(0u64, |bytes, (_, entry)| bytes.saturating_add(entry.accounted_bytes()));
+                let owner_pressure = owner_bytes > owner_budget;
+                if !owner_pressure && selections.len() <= 8 && aggregate_bytes <= aggregate_budget { break; }
+                let index = if owner_pressure {
+                    selections.iter().rposition(|(_, entry)| selection.same_owner(entry)).expect("current owner entry")
+                } else { selections.len() - 1 };
+                retired.push(selections.remove(index));
+            }
+        }
+        // Cache eviction transfers credits to garbage outside the cache lock;
+        // the table's actual DROP remains responsible for releasing them.
+        drop(selections);
+        drop(retired);
     }
 
     pub(crate) fn begin_selection(&self, key: &str) -> Result<SelectionBuild<'_>, String> {
@@ -686,11 +798,36 @@ impl Session {
         Ok(SelectionBuild { session: self, key: key.to_owned() })
     }
 
-    pub(crate) fn garbage(&self) -> Arc<Mutex<Vec<String>>> {
+    pub(crate) fn row_upper_bound(&self) -> Option<usize> { self.row_count }
+
+    /// Pressure recovery must not discard a table still held by a query.
+    /// Drop cache-owned Arcs outside the cache lock, then retire the actual
+    /// SQL tables before their logical-selection credits can be reused.
+    pub(crate) fn trim_inactive_selections(&self) -> Result<(), String> {
+        self.trim_inactive_selections_for(None)
+    }
+    fn trim_inactive_selections_for(&self, pressure: Option<(&crate::case_work_budget::Pool, crate::case_work_budget::Pressure)>) -> Result<(), String> {
+        let removed = {
+            let mut selections = self.selections.lock();
+            let mut kept = Vec::with_capacity(selections.len());
+            let mut removed = Vec::new();
+            for entry in selections.drain(..) {
+                if Arc::strong_count(&entry.1) == 1
+                    && pressure.is_none_or(|(pool, scope)| entry.1.releases_pressure(pool, scope)) { removed.push(entry); }
+                else { kept.push(entry); }
+            }
+            *selections = kept;
+            removed
+        };
+        drop(removed);
+        self.collect_garbage()
+    }
+
+    pub(crate) fn garbage(&self) -> Arc<Mutex<Vec<ops::SelectionGarbage>>> {
         Arc::clone(&self.garbage)
     }
 
-    pub(crate) fn take_garbage(&self) -> Vec<String> {
+    pub(crate) fn take_garbage(&self) -> Vec<ops::SelectionGarbage> {
         std::mem::take(&mut *self.garbage.lock())
     }
 
@@ -702,15 +839,20 @@ impl Session {
     }
 
     pub(crate) fn collect_garbage_on(&self, conn: &Connection) -> Result<(), String> {
-        let unused = self.take_garbage();
-        for (i, name) in unused.iter().enumerate() {
+        let mut unused = self.take_garbage().into_iter();
+        while let Some(item) = unused.next() {
             let dropped = crate::operations::check().and_then(|_| {
-                conn.execute_batch(&format!("DROP TABLE IF EXISTS {name}")).map_err(|error| error.to_string())
+                conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", item.name)).map_err(|error| error.to_string())
             });
             if let Err(error) = dropped {
-                self.garbage.lock().extend_from_slice(&unused[i..]);
+                let mut pending = self.garbage.lock();
+                pending.push(item);
+                pending.extend(unused);
                 return Err(error);
             }
+            // A dropped cache Arc is not proof the SQL table has disappeared.
+            // Release the carried credit only after successful DROP.
+            drop(item);
         }
         Ok(())
     }
@@ -726,18 +868,37 @@ impl Session {
         })
     }
 
-    /// Loads the catalogs' names for the codes present, when they changed.
+    /// Refresh plus statement pin are one atomic operation. A shared immutable
+    /// base can serve two Cases, but its enrichment table is mutable; a bare
+    /// read lock taken after session acquisition could pin the other Case.
     fn refresh_names(&self, codes: &CodesConfig, system: &CodesConfig) -> Result<(), String> {
-        if self.baked {
-            return Ok(());
-        }
+        drop(self.names_guard(codes, system)?);
+        Ok(())
+    }
+    pub(crate) fn names_guard(&self, codes: &CodesConfig, system: &CodesConfig)
+        -> Result<parking_lot::RwLockReadGuard<'_, Option<CatalogKey>>, String>
+    {
+        crate::operations::check()?;
+        let current = loop {
+            crate::operations::check()?;
+            if let Some(guard) = self.names.try_read_for(std::time::Duration::from_millis(25)) {
+                crate::operations::check()?;
+                break guard;
+            }
+        };
+        if self.baked { return Ok(current); }
         let key = catalog_key(codes, system);
-        if self.names.read().as_ref() == Some(&key) {
-            return Ok(());
-        }
-        let mut current = self.names.write();
+        if current.as_ref() == Some(&key) { return Ok(current); }
+        drop(current);
+        let mut current = loop {
+            crate::operations::check()?;
+            if let Some(guard) = self.names.try_write_for(std::time::Duration::from_millis(25)) {
+                crate::operations::check()?;
+                break guard;
+            }
+        };
         if current.as_ref() == Some(&key) {
-            return Ok(());
+            return Ok(parking_lot::RwLockWriteGuard::downgrade(current));
         }
         let mut conn = self.conn()?;
         conn.execute_batch("BEGIN TRANSACTION").map_err(|e| e.to_string())?;
@@ -757,6 +918,7 @@ impl Session {
             }
             appender.flush().map_err(|e| e.to_string())?;
             drop(appender);
+            crate::operations::check()?;
             conn.execute_batch("COMMIT").map_err(|e| e.to_string())
         })();
         if result.is_err() && conn.execute_batch("ROLLBACK").is_err() { conn.discard(); }
@@ -764,14 +926,7 @@ impl Session {
         *current = Some(key);
         self.names_version.fetch_add(1, Ordering::SeqCst);
         self.selections.lock().clear();
-        Ok(())
-    }
-
-    /// Holds the names table steady while a statement reads it.
-    pub(crate) fn names_guard(
-        &self,
-    ) -> parking_lot::RwLockReadGuard<'_, Option<CatalogKey>> {
-        self.names.read()
+        Ok(parking_lot::RwLockWriteGuard::downgrade(current))
     }
 }
 
@@ -1433,6 +1588,10 @@ fn schedule(
 }
 
 fn run_background(queue: &BackgroundQueue, request: &BackgroundRequest) {
+    let cancelled = || queue.revision.load(Ordering::SeqCst) != request.revision || crate::operations::update_paused();
+    let _ = crate::global_scheduler::run(None, crate::global_scheduler::Priority::Background, &cancelled, || run_background_admitted(queue, request));
+}
+fn run_background_admitted(queue: &BackgroundQueue, request: &BackgroundRequest) {
     let superseded = || queue.revision.load(Ordering::SeqCst) != request.revision;
     for spec in request.base.iter().chain(std::iter::once(&request.spec)) {
         let fields = if request
@@ -1555,7 +1714,7 @@ fn maybe_schedule_time(
 fn optional_quiet(cancelled: &dyn Fn() -> bool, quiet: std::time::Duration) -> bool {
     let mut idle = std::time::Instant::now();
     loop {
-        if cancelled() { return false; }
+        if cancelled() || crate::global_scheduler::yield_background(cancelled).is_err() { return false; }
         if crate::operations::interactive_active() { idle = std::time::Instant::now(); }
         else if idle.elapsed() >= quiet { return true; }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1604,7 +1763,7 @@ fn prepare_optional_times(queue: &BackgroundQueue, request: &BackgroundRequest) 
                 // Session open may hold it. Revision/UpdatePause are atomic;
                 // ownership is checked at each part boundary and publication.
                 let cancelled = || {
-                    let interactive = crate::operations::interactive_active();
+                    let interactive = crate::operations::interactive_active() || crate::global_scheduler::interactive_waiting();
                     if interactive { preempted.store(true, Ordering::Relaxed); }
                     obsolete() || interactive
                 };
@@ -1702,6 +1861,10 @@ pub(crate) fn prepare_detailed(
     derived: &[CompiledDerived],
     progress: &(dyn Fn(BuildProgress) + Sync),
 ) -> Result<(), String> {
+    if crate::global_scheduler::current().is_none() {
+        return crate::global_scheduler::run(None, crate::global_scheduler::Priority::Normal, &crate::operations::cancelled,
+            || prepare_detailed(idx, codes, system, derived, progress))?;
+    }
     if crate::operations::update_paused() { return Err("Preparação suspensa para instalar a atualização.".into()); }
     if !enabled() || idx.lines.is_empty() {
         return Ok(());
@@ -2111,11 +2274,7 @@ mod segment_tests {
             source: "message".into(),
             lookup: None,
             steps: Vec::new(),
-            rules: vec![crate::sources::CompiledRule {
-                re: regex::Regex::new("(alpha)").unwrap(),
-                template: None,
-                filter: None,
-            }],
+            rules: vec![crate::sources::CompiledRule::new(regex::Regex::new("(alpha)").unwrap(), None, None).unwrap()],
         }];
         let derived_key = spec(&old, &codes, &codes, &derived).unwrap();
         assert_ne!(base.parts[0].key, derived_key.parts[0].key);
@@ -2265,6 +2424,7 @@ mod lifecycle_tests {
             selection_builds: Mutex::new(HashSet::new()),
             selection_changed: parking_lot::Condvar::new(),
             garbage: Arc::new(Mutex::new(Vec::new())),
+            row_count: None,
             texts: Vec::new(),
             time_indexes: RwLock::new(None),
             _leases: vec![lease],
@@ -2544,9 +2704,9 @@ mod lifecycle_tests {
 mod metadata_identity_tests {
     use super::*;
 
-    /// The key immediately before Java enrichment, including the existing
-    /// calendar/physical-file context. Tiny fixtures each have one segment.
-    fn pre_java_key(idx: &FileIndex) -> String {
+    /// Key without Java enrichment, optionally retaining the independent web
+    /// parser revision. Tiny fixtures each have one segment.
+    fn pre_java_key(idx: &FileIndex, include_web_revision: bool) -> String {
         let part = &idx.parts[0];
         assert!(part.custom.is_none() && part.ts_config.is_none());
         let first_offset = idx.lines.at(0).offset - part.base;
@@ -2570,6 +2730,12 @@ mod metadata_identity_tests {
             hash.update(b"|logical-event-identity:");
             hash.update(serde_json::to_vec(identity).unwrap());
         }
+        if include_web_revision {
+            if let Some(revision) = crate::sources::parser_semantics_signature(&part.format) {
+                hash.update(b"|structured-parser:");
+                hash.update(revision.as_bytes());
+            }
+        }
         format!("{:x}", hash.finalize())
     }
 
@@ -2588,7 +2754,7 @@ mod metadata_identity_tests {
             let idx = crate::sources::index_file(path.to_str().unwrap(), format, None, None, None).unwrap();
             let actual = spec(&idx, &codes, &codes, &[]).unwrap();
             assert_eq!(actual.parts.len(), 1);
-            let old = pre_java_key(&idx);
+            let old = pre_java_key(&idx, true);
             assert_eq!(actual.parts[0].key == old, !java, "{format}");
             if java {
                 assert_eq!(idx.lines.len(), 2, "enrichment preserves the existing two framed records");
@@ -2598,6 +2764,38 @@ mod metadata_identity_tests {
             } else {
                 assert!(!idx.columns.iter().any(|value| value == "java.trace"));
             }
+        }
+    }
+
+    #[test]
+    fn structured_parser_revision_refreshes_affected_stores_without_changing_record_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let codes = CodesConfig::default();
+        for (format, raw, affected) in [
+            ("jsonl", "{\"time_iso8601\":\"2026-10-02T12:00:00Z\",\"request\":\"GET /health HTTP/1.1\",\"status\":200}\n", true),
+            ("apache", "127.0.0.1 - - [02/Oct/2026:12:00:00 +0000] \"GET /health HTTP/1.1\" 200 5 \"-\" \"client\"\n", true),
+            ("nginx-error", "2026/10/02 12:00:00 [error] 7#7: *12 open() failed, client: 127.0.0.1, server: example.test\n", true),
+            ("logfmt", "time=2026-10-02T12:00:00Z level=info msg=healthy request_id=42\n", true),
+            ("mixed", "127.0.0.1 - - [02/Oct/2026:12:00:00 +0000] \"-\" 400 0\n{\"message\":\"next\"}\n", true),
+            ("text", "127.0.0.1 - - [02/Oct/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 5\n", false),
+            ("syslog3164", "Oct  2 12:00:00 host app: healthy\n", false),
+            ("csv", "timestamp,message\n2026-10-02T12:00:00Z,healthy\n", false),
+            ("custom", "explicit user format remains authoritative\n", false),
+        ] {
+            let path = dir.path().join(format!("{format}.log"));
+            std::fs::write(&path, raw).unwrap();
+            let idx = crate::sources::index_file(path.to_str().unwrap(), format, None, None, None).unwrap();
+            let identity = idx.parts[0].identity.clone();
+            let logical_identity = idx.parts[0].event_identity.clone();
+            let event_ref = crate::sources::event_at(&idx, 0, &codes, &codes, &[]).event_ref;
+            assert_eq!(event_ref, format!("{}:{}", logical_identity.as_deref().unwrap_or(&identity), idx.lines.at(0).offset - idx.parts[0].base));
+            let actual = spec(&idx, &codes, &codes, &[]).unwrap();
+            assert_eq!(actual.parts.len(), 1);
+            assert_eq!(actual.parts[0].key != pre_java_key(&idx, false), affected, "{format}");
+            assert_eq!(actual.parts[0].key, pre_java_key(&idx, true));
+            assert_eq!(idx.parts[0].identity, identity);
+            assert_eq!(idx.parts[0].event_identity, logical_identity);
+            assert_eq!(crate::sources::event_at(&idx, 0, &codes, &codes, &[]).event_ref, event_ref);
         }
     }
 

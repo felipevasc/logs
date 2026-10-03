@@ -629,6 +629,7 @@ struct ReceiptBorrow<'a> {
     committed_store: &'a StoreStamp,
     current_store: &'a StoreStamp,
     evidence: Vec<&'a EvidenceRef>,
+    #[serde(serialize_with = "crate::analysis_context::serialize_management_snapshot_refs")]
     analysis_contexts: Vec<&'a crate::analysis_context::Snapshot>,
     case_evidence: Vec<&'a CaseEvidenceState>,
     replayed: bool,

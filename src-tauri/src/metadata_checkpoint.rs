@@ -16,6 +16,54 @@ const BLOCK_ROWS: usize = 8192;
 const MAX_MANIFEST_BYTES: u64 = 4_000_000;
 pub(crate) const VERSION: u32 = 1;
 
+
+/// Durability cadence, independent from parser wave sizes and spool buffering.
+/// Limits are checked only at a parser-provided safe boundary. A wave or one
+/// indivisible record can overshoot them; the elapsed limit is not a deadline.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckpointPolicy {
+    pub rows: usize,
+    pub source_bytes: usize,
+    pub elapsed: Duration,
+}
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self { rows: 65_536, source_bytes: 16 << 20, elapsed: Duration::from_secs(2) }
+    }
+}
+impl CheckpointPolicy {
+    pub(crate) fn named(name: &str) -> Result<Self, String> {
+        match name {
+            "batched" => Ok(Self::default()),
+            "wave" => Ok(Self::every_wave()),
+            _ => Err("LOGINSIGHT_METADATA_CHECKPOINT_POLICY deve ser batched ou wave.".into()),
+        }
+    }
+
+    pub(crate) fn configured() -> Self {
+        match std::env::var_os("LOGINSIGHT_METADATA_CHECKPOINT_POLICY") {
+            None => Self::default(),
+            Some(value) => match value.to_str().and_then(|name| Self::named(name).ok()) {
+                Some(policy) => policy,
+                None => {
+                    eprintln!("[índice] LOGINSIGHT_METADATA_CHECKPOINT_POLICY inválido; usando checkpoint a cada wave");
+                    Self::every_wave()
+                }
+            },
+        }
+    }
+
+    fn due(self, rows: usize, source_bytes: usize, elapsed: Duration, finalizing: bool) -> bool {
+        finalizing || (rows > 0 || source_bytes > 0)
+            && (rows >= self.rows || source_bytes >= self.source_bytes || elapsed >= self.elapsed)
+    }
+
+    /// Compatibility rollback: keep the previous per-wave durability cadence.
+    pub(crate) fn every_wave() -> Self {
+        Self { rows: 1, source_bytes: 1, elapsed: Duration::ZERO }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Progress {
     pub phase_id: &'static str,
@@ -141,6 +189,8 @@ pub(crate) struct Journal {
     sealed_rows: usize,
     resumed_rows: usize,
     multiline: bool,
+    committed_cursor: usize,
+    committed_at: Instant,
     // Never unlink lock files: another process may already hold a handle.
     _lock: File,
 }
@@ -373,6 +423,8 @@ impl Journal {
                 sealed_rows,
                 resumed_rows,
                 multiline,
+                committed_cursor: resume.cursor,
+                committed_at: Instant::now(),
                 _lock: lock,
             },
             resume,
@@ -384,6 +436,34 @@ impl Journal {
         let mut spool = crate::metadata_store::LineBuilder::default();
         spool.extend(rows.iter().copied())?;
         self.checkpoint_rows(&mut spool, cursor, complete, columns, reporter, validate)
+    }
+
+    pub(crate) fn checkpoint_if_due(
+        &mut self,
+        policy: CheckpointPolicy,
+        lines: &mut crate::metadata_store::LineBuilder,
+        cursor: usize,
+        scan_complete: bool,
+        columns: Option<&[String]>,
+        reporter: Reporter<'_>,
+        validate: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        crate::operations::check()?;
+        let sealed = if self.multiline && !scan_complete {
+            lines.len().saturating_sub(1)
+        } else { lines.len() };
+        if sealed < self.sealed_rows || cursor < self.committed_cursor || cursor > self.source_bytes
+            || columns.is_some() && !scan_complete {
+            return Err("Estado de checkpoint de metadados inconsistente.".into());
+        }
+        // A deferred checkpoint never flushes the spool, appends a journal,
+        // hashes records or syncs. The parser's existing bounded spool and all
+        // cancellation/source-generation checks keep their original cadence.
+        if policy.due(sealed - self.sealed_rows, cursor - self.committed_cursor,
+                      self.committed_at.elapsed(), scan_complete || columns.is_some()) {
+            self.checkpoint_rows(lines, cursor, scan_complete, columns, reporter, validate)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn checkpoint_rows(
@@ -404,6 +484,7 @@ impl Journal {
             lines.len()
         };
         if sealed < self.sealed_rows
+            || cursor < self.committed_cursor
             || cursor > self.source_bytes
             || columns.is_some() && !scan_complete
         {
@@ -443,6 +524,7 @@ impl Journal {
         sync.resumed_rows = self.resumed_rows;
         sync.checkpoint_rows = self.sealed_rows;
         report(reporter, sync);
+        crate::operations::check()?;
         self.file.flush().map_err(|e| e.to_string())?;
         self.file.get_ref().sync_all().map_err(|e| e.to_string())?;
         crate::operations::check()?;
@@ -470,8 +552,17 @@ impl Journal {
             scan_complete,
             columns: columns.map(<[String]>::to_vec),
         };
-        publish(&self.state_path, state)?;
+        publish(&self.state_path, state, &|| {
+            let mut ready = Progress::new(
+                "metadata-checkpoint-manifest-ready", "Descritor de metadados sincronizado", 0, 0, "",
+            );
+            ready.resumed_rows = self.resumed_rows;
+            ready.checkpoint_rows = self.sealed_rows;
+            report(reporter, ready);
+        })?;
         self.sealed_rows = sealed;
+        self.committed_cursor = cursor;
+        self.committed_at = Instant::now();
         let mut committed = Progress::new(
             "metadata-checkpoint-committed",
             "Checkpoint de metadados preservado",
@@ -580,7 +671,7 @@ fn restore(
     )))
 }
 
-fn publish(target: &Path, state: State) -> Result<(), String> {
+fn publish(target: &Path, state: State, manifest_ready: &dyn Fn()) -> Result<(), String> {
     let temporary = target.with_extension(format!("{}.pending", uuid::Uuid::new_v4()));
     let result = (|| {
         let envelope = Envelope {
@@ -599,6 +690,7 @@ fn publish(target: &Path, state: State) -> Result<(), String> {
         file.write_all(&bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
+        manifest_ready();
         crate::operations::check()?;
         std::fs::rename(&temporary, target).map_err(|e| e.to_string())?;
         #[cfg(unix)]
@@ -663,6 +755,77 @@ pub(crate) fn prune(dir: &Path, cutoff: std::time::SystemTime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_uses_rows_source_bytes_or_elapsed_at_a_safe_boundary() {
+        let policy = CheckpointPolicy::default();
+        let almost = policy.elapsed - Duration::from_nanos(1);
+        assert!(!policy.due(policy.rows - 1, policy.source_bytes - 1, almost, false));
+        assert!(policy.due(policy.rows, 1, Duration::ZERO, false));
+        assert!(policy.due(0, policy.source_bytes, Duration::ZERO, false), "mutable tail is protected by scanned bytes");
+        assert!(policy.due(0, 1, policy.elapsed, false), "tail-only progress is protected by time");
+        assert!(!policy.due(0, 0, policy.elapsed * 2, false), "no periodic rewrite without progress");
+        assert!(policy.due(0, 0, Duration::ZERO, true), "EOF/columns are unconditional");
+        assert!(CheckpointPolicy::named("wave").unwrap().due(0, 1, Duration::ZERO, false));
+        assert!(!CheckpointPolicy::named("batched").unwrap().due(1, 1, Duration::ZERO, false));
+        assert!(CheckpointPolicy::named("invalid").is_err());
+    }
+
+    #[test]
+    fn small_spool_batches_do_not_publish_and_eof_columns_still_force_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "d".repeat(64);
+        let (mut journal, _) = Journal::open(dir.path(), &key, 100, 0, false, None).unwrap_or_else(|e| panic!("{e}"));
+        let policy = CheckpointPolicy { rows: 4, source_bytes: 1000, elapsed: Duration::from_secs(3600) };
+        let mut lines = crate::metadata_store::LineBuilder::default();
+        let commits = std::cell::Cell::new(0);
+        let observer = |p: &Progress| { if p.phase_id == "metadata-checkpoint-committed" { commits.set(commits.get() + 1); } };
+        for i in 0..4 {
+            lines.push(LineMeta { offset: i * 20, len: 19, ..Default::default() }).unwrap();
+            journal.checkpoint_if_due(policy, &mut lines, (i as usize + 1) * 20, false, None, Some(&observer), &|| Ok(())).unwrap();
+            if i < 3 {
+                assert!(!dir.path().join(format!("{key}.state")).exists());
+                assert_eq!(journal.sealed_rows, 0);
+                assert_eq!(journal.committed_cursor, 0);
+            }
+        }
+        assert_eq!(commits.get(), 1);
+        assert_eq!(journal.sealed_rows, 4);
+        assert_eq!(journal.committed_cursor, 80);
+        lines.push(LineMeta { offset: 80, len: 19, ..Default::default() }).unwrap();
+        journal.checkpoint_if_due(policy, &mut lines, 100, true, None, Some(&observer), &|| Ok(())).unwrap();
+        journal.checkpoint_if_due(policy, &mut lines, 100, true, Some(&[]), Some(&observer), &|| Ok(())).unwrap();
+        assert_eq!(commits.get(), 3, "EOF and columns remain separate commit points");
+        drop(journal);
+        let (_, restored) = Journal::open(dir.path(), &key, 100, 0, false, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(restored.resumed_rows, 5);
+        assert_eq!(restored.cursor, 100);
+        assert!(restored.scan_complete && restored.columns.is_some());
+        for i in 0..5 { assert_eq!(restored.lines.at(i).unwrap().offset, i as u64 * 20); }
+    }
+
+    #[test]
+    fn resumed_schedule_counts_bytes_after_the_committed_tail_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "e".repeat(64);
+        let policy = CheckpointPolicy { rows: 4, source_bytes: 100, elapsed: Duration::from_secs(3600) };
+        let (mut journal, _) = Journal::open(dir.path(), &key, 300, 0, true, None).unwrap_or_else(|e| panic!("{e}"));
+        let mut lines = crate::metadata_store::LineBuilder::default();
+        lines.push(LineMeta { len: 99, ..Default::default() }).unwrap();
+        journal.checkpoint_if_due(policy, &mut lines, 100, false, None, None, &|| Ok(())).unwrap();
+        assert_eq!(journal.sealed_rows, 0);
+        drop(journal);
+        let (mut journal, mut resume) = Journal::open(dir.path(), &key, 300, 0, true, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(resume.cursor, 100);
+        assert_eq!(resume.lines.len(), 1);
+        resume.lines.last_mut().unwrap().len = 149;
+        journal.checkpoint_if_due(policy, &mut resume.lines, 150, false, None, None, &|| Ok(())).unwrap();
+        assert_eq!(journal.committed_cursor, 100, "elapsed/byte budget restarts from durable cursor");
+        drop(journal);
+        let (_, restored) = Journal::open(dir.path(), &key, 300, 0, true, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(restored.cursor, 100);
+        assert_eq!(restored.lines.at(0).unwrap().len, 99, "uncommitted tail changes cannot leak into the manifest");
+    }
 
     #[test]
     fn packed_codec_keeps_all_fields_and_rejects_invalid_bounds() {

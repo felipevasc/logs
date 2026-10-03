@@ -13,11 +13,16 @@ use std::path::{Path, PathBuf};
 pub fn rule_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
+    let mut directories = 0usize;
     while let Some(path) = pending.pop() {
+        if crate::operations::cancelled() || directories >= 20_000 { break; }
+        directories += 1;
         let Ok(entries) = std::fs::read_dir(&path) else { continue };
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_symlink() { continue; }
+            if kind.is_dir() {
                 pending.push(p);
             } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml")) {
                 out.push(p);
@@ -72,7 +77,9 @@ pub fn convert_text(text: &str) -> Result<Vec<Compiled>, String> {
 pub fn convert_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Result<Vec<Compiled>, String> {
     let mut docs = Vec::new();
     for text in texts {
+        crate::operations::check()?;
         docs.extend(documents(text)?);
+        if docs.len() > 4096 { return Err("O Caso excede 4.096 regras Sigma.".into()); }
     }
     if docs.is_empty() {
         return Err("nenhuma regra encontrada".into());
@@ -85,7 +92,7 @@ pub fn convert_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Result<Vec
             }
         }
     }
-    (0..docs.len()).map(|i| resolve(i, &docs, &mut Vec::new())).collect()
+    (0..docs.len()).map(|i| { crate::operations::check()?; resolve(i, &docs, &mut Vec::new()) }).collect()
 }
 fn resolve(index: usize, docs: &[Value], stack: &mut Vec<usize>) -> Result<Compiled, String> {
     if stack.contains(&index) {

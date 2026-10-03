@@ -3,10 +3,12 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 const app = readFileSync(new URL('../../frontend/app.js', import.meta.url), 'utf8');
+const html = readFileSync(new URL('../../frontend/index.html', import.meta.url), 'utf8');
+const settingsTabs = [...html.matchAll(/data-settings-tab="([^"]+)"/g)].map(match => match[1]);
 const section = (start, end) => { const from = app.indexOf(start), to = app.indexOf(end, from); assert.ok(from >= 0 && to > from); return app.slice(from, to); };
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
-function fixture() {
+function fixture({ ownership = false } = {}) {
   const nodes = new Map(), requests = [], pathRequests = [], messages = [], confirmations = [], listeners = new Map(); let approval = false, refreshes = 0, delayedPath = false;
   let document;
   class Node {
@@ -19,9 +21,9 @@ function fixture() {
     addEventListener(type, fn) { this['on' + type] = fn; }
   }
   const node = (id, tag) => { const value = new Node(id, tag); nodes.set('#' + id, value); return value; };
-  const tabs = ['interface', 'codes', 'mcp', 'detection', 'recovery', 'updates'].map(name => { const value = node('settings-tab-' + name, 'button'); value.dataset.settingsTab = name; return value; });
+  const tabs = settingsTabs.map(name => { const value = node('settings-tab-' + name, 'button'); value.dataset.settingsTab = name; return value; });
   const panes = tabs.map(tab => node('settings-pane-' + tab.dataset.settingsTab));
-  for (const id of ['settings-modal','codes-modal','codes-path','codes-status','codes-reload','codes-save','codes-cancel','codes-close','settings-close','btn-harvest','btn-settings','drawer','filter-pop','name-pop','detail-value-modal','col-pop']) node(id, /close|save|reload|cancel|btn-/.test(id) ? 'button' : 'div');
+  for (const id of ['settings-modal','codes-modal','sys-count','codes-path','codes-status','codes-reload','codes-save','codes-cancel','codes-close','settings-close','btn-harvest','btn-settings','drawer','filter-pop','name-pop','detail-value-modal','col-pop']) node(id, /close|save|reload|cancel|btn-/.test(id) ? 'button' : 'div');
   const editor = node('codes-editor', 'textarea');
   for (const id of ['settings-modal','drawer','filter-pop','name-pop','detail-value-modal','col-pop']) nodes.get('#' + id).hidden = true;
   const body = new Node('codes-body'); body.parentElement = nodes.get('#codes-modal'); nodes.set('#codes-modal .modal-body', body);
@@ -34,20 +36,25 @@ function fixture() {
     if (command === 'system_codes_count') return Promise.resolve(123);
     const pending = deferred(); requests.push({ command, args, options, ...pending }); return pending.promise;
   };
+  const cases = [{ id: 'a', revision: 1 }, { id: 'b', revision: 1 }], state = { rows: [], cases: { active: 'a', cases } };
+  const helper = { capture: () => { const item = cases.find(value => value.id === state.cases.active); return { item, caseId: item.id, revision: item.revision }; },
+    assertOwner: (owner, { revisions = true } = {}) => { if (cases.find(value => value.id === state.cases.active) !== owner.item || revisions && owner.revision !== owner.item.revision) throw Error('ANALYSIS_CONTEXT_CHANGED'); },
+    prepare: async owner => { helper.assertOwner(owner); return owner; } };
   const context = vm.createContext({ document, $, api, confirm: text => { confirmations.push(text); return approval; },
     toast: (text, kind) => messages.push({ text, kind }), refresh: () => { refreshes++; return Promise.resolve(); },
     updateSysCount() {}, nativeEvidenceEnabled: () => false,
-    window: { UiScale: { renderPane() {} }, Security: { renderRulesPane() {} }, Updates: { renderPane() {} } }, renderMcpPane() {},
-    ctxEl: null, namePopExact: false, state: { rows: [] }, closeDrawer() { throw Error('Escape reached a lower surface'); },
+    window: { ...(ownership ? { AnalysisContexts: helper } : {}), UiScale: { renderPane() {} }, Security: { renderRulesPane() {} }, Updates: { renderPane() {} } }, renderMcpPane() {},
+    ctxEl: null, namePopExact: false, state, fmtNum: String, closeDrawer() { throw Error('Escape reached a lower surface'); },
   });
-  vm.runInContext(section('// The codes catalog is a section of Settings.', 'async function updateSysCount()'), context);
+  vm.runInContext(section('// The codes catalog is a section of Settings.', 'async function updateSysCount('), context);
+  if (ownership) vm.runInContext(section('async function updateSysCount(', 'async function saveCodes()'), context);
   vm.runInContext(section('async function saveCodes()', '// ------------------------------------------------------------------ configurações / MCP'), context);
   vm.runInContext(section('function switchSettingsTab(', 'async function renderMcpPane()'), context);
   vm.runInContext(section('  $("#btn-settings").onclick =', '  $("#btn-theme").onclick ='), context);
   vm.runInContext(section('function bindKeyboard()', '// ------------------------------------------------------------------ init'), context); context.bindKeyboard();
   const edit = text => { editor.value = text; context.codesEdited(); };
   const open = async (catalog = '{"saved":1}') => { const pending = context.openSettings('codes'); await tick(); requests.at(-1).resolve(catalog); await pending; };
-  return { context, $, tabs, panes, document, requests, pathRequests, messages, confirmations, editor, edit, open, tick, delayPath: () => { delayedPath = true; },
+  return { context, state, cases, helper, switchCase: id => { state.cases.active = id; }, $, tabs, panes, document, requests, pathRequests, messages, confirmations, editor, edit, open, tick, delayPath: () => { delayedPath = true; },
     allow: value => { approval = value; }, refreshes: () => refreshes,
     key(key, extras = {}) { const event = { key, ...extras, preventDefault() { this.prevented = true; }, stopImmediatePropagation() { this.stopped = true; }, stopPropagation() { this.stopped = true; } }; for (const fn of listeners.get('keydown') || []) { fn(event); if (event.stopped) break; } return event; },
   };
@@ -124,15 +131,20 @@ test('Escape declining discard stops before lower surfaces, then accepted close 
   f.allow(true); f.key('Escape'); assert.equal(f.$('#settings-modal').hidden, true); assert.equal(f.document.activeElement, f.$('#btn-settings'));
 });
 test('wrapped settings tabs retain manual activation, selected state and one roving tab stop', async () => {
+  assert.deepEqual(settingsTabs, ['interface', 'codes', 'mcp', 'detection', 'recovery', 'updates', 'resources']);
   const f = fixture(); await f.context.openSettings(); assert.equal(f.document.activeElement, f.tabs[0]);
   assert.equal(f.tabs[0].getAttribute('aria-selected'), 'true'); assert.equal(f.tabs[1].getAttribute('aria-controls'), 'settings-pane-codes');
   const e = key => ({ key, preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; } });
   const right = e('ArrowRight'); f.tabs[0].onkeydown(right); assert.equal(right.stopped, true); assert.equal(f.document.activeElement, f.tabs[1]);
   assert.equal(f.requests.length, 0, 'moving tab focus does not query'); assert.equal(f.$('#settings-pane-interface').hidden, false);
-  f.tabs[1].onkeydown(e('End')); assert.equal(f.document.activeElement, f.tabs[5]);
+  f.tabs[1].onkeydown(e('End')); assert.equal(f.document.activeElement, f.tabs[6]);
+  f.tabs[6].onkeydown(e('ArrowRight')); assert.equal(f.document.activeElement, f.tabs[0], 'Resources wraps to the first tab');
+  f.tabs[0].onkeydown(e('ArrowLeft')); assert.equal(f.document.activeElement, f.tabs[6]);
+  f.tabs[6].onkeydown(e('ArrowLeft')); assert.equal(f.document.activeElement, f.tabs[5]);
   f.tabs[5].onkeydown(e('ArrowLeft')); assert.equal(f.document.activeElement, f.tabs[3], 'hidden recovery tab is skipped');
   assert.equal(f.tabs.filter(tab => !tab.hidden && tab.tabIndex === 0).length, 1);
   const css = readFileSync(new URL('../../frontend/styles.css', import.meta.url), 'utf8');
+  assert.match(css, /\.settings-modal\s*\{\s*width:\s*min\(860px,\s*100%\)/, 'desktop modal provides space for all seven tabs without reducing text or hit targets');
   assert.match(css, /\.settings-tabs\s*\{[^}]*flex-wrap:\s*wrap/); assert.match(css, /\.settings-tab\s*\{[^}]*min-height:\s*36px/);
 });
 
@@ -175,4 +187,49 @@ test('catalog status writes once per state change rather than repeating unchange
   f.edit('{"draft":3}'); f.edit('{"draft":4}');
   assert.equal(writes, 1, 'two further dirty edits do not mutate the unchanged status text');
   f.edit('{"saved":1}'); assert.equal(writes, 2); assert.equal(text, ''); assert.equal(status.hidden, true);
+});
+
+test('Case-owned catalog reads for A cannot paint over the editor opened for B', async () => {
+  const f = fixture({ ownership: true }), first = f.context.openSettings('codes'); await f.tick();
+  assert.equal(f.requests[0].options.analysisOwner.caseId, 'a'); f.switchCase('b');
+  const second = f.context.openSettings('codes'); await f.tick(); assert.equal(f.requests[1].options.analysisOwner.caseId, 'b');
+  f.requests[1].resolve('{"B":1}'); await second; f.edit('{"B draft":2}');
+  f.requests[0].resolve('{"A":1}'); await first;
+  assert.equal(f.editor.value, '{"B draft":2}'); assert.equal(f.context.codesDraftChanged(), true);
+});
+test('late Case A save waits durably but cannot refresh or replace the reopened Case B editor', async () => {
+  const f = fixture({ ownership: true }); await f.open('{"A":1}'); f.edit('{"saved A":2}');
+  const saving = f.context.saveCodes(); assert.equal(f.requests[1].options.analysisOwner.caseId, 'a');
+  f.switchCase('b'); const reopened = f.context.openSettings('codes'); await f.tick(); assert.equal(f.requests.length, 2);
+  f.cases[0].revision++; f.requests[1].resolve({ analysisContext: { caseId: 'a' } }); await saving; await f.tick();
+  assert.equal(f.refreshes(), 0); assert.equal(f.requests[2].options.analysisOwner.caseId, 'b');
+  f.requests[2].resolve('{"B":1}'); await reopened; assert.equal(f.editor.value, '{"B":1}');
+  assert.doesNotMatch(f.$('#codes-status').textContent, /Catálogo salvo/);
+});
+test('same-Case successful receipt advances editor CAS owner for a second save', async () => {
+  const f = fixture({ ownership: true }); await f.open(); f.edit('{"one":1}');
+  const first = f.context.saveCodes(); f.cases[0].revision++; f.requests[1].resolve({}); await first;
+  f.edit('{"two":2}'); const second = f.context.saveCodes(); assert.equal(f.requests[2].options.analysisOwner.revision, 2);
+  f.cases[0].revision++; f.requests[2].resolve({}); await second; assert.equal(f.context.codesDraftChanged(), false);
+});
+test('switching Cases fences old Save/Harvest actions and late harvest/count receipts', async () => {
+  const f = fixture({ ownership: true }); await f.open(); f.edit('{"A draft":2}'); f.switchCase('b');
+  await f.context.saveCodes(); await f.context.runHarvest(); assert.equal(f.requests.length, 1);
+  f.switchCase('a'); const harvesting = f.context.runHarvest(); assert.equal(f.requests[1].options.analysisOwner.caseId, 'a');
+  f.switchCase('b'); const opening = f.context.openSettings('codes'); await f.tick(); f.requests[2].resolve('{"B":1}'); await opening;
+  f.cases[0].revision++; f.requests[1].resolve({ count: 987, sources: 2, analysisContext: { caseId: 'a' } }); await harvesting;
+  assert.equal(f.$('#sys-count').textContent, '123'); assert.equal(f.refreshes(), 0); assert.equal(f.editor.value, '{"B":1}');
+});
+test('same-Case external revision changes preserve the draft and require a deliberate reload', async () => {
+  const f = fixture({ ownership: true }); await f.open(); f.edit('{"keep draft":2}'); f.cases[0].revision++;
+  await f.context.openSettings('interface'); await f.context.openSettings('codes');
+  assert.equal(f.editor.value, '{"keep draft":2}'); assert.equal(f.requests.length, 1); assert.equal(f.$('#codes-save').disabled, true);
+  f.allow(true); const reload = f.context.reloadCodesPane({ deliberate: true }); await f.tick();
+  assert.equal(f.requests[1].options.analysisOwner.revision, 2); f.requests[1].resolve('{"new config":3}'); await reload;
+  assert.equal(f.editor.value, '{"new config":3}'); assert.equal(f.$('#codes-save').disabled, false);
+});
+test('Case change immediately labels and disables the prior catalog draft without transferring it', async () => {
+  const f = fixture({ ownership: true }); await f.open('{"A":1}'); f.edit('{"A draft":2}'); f.switchCase('b'); f.context.renderCodesStatus();
+  assert.equal(f.editor.value, '{"A draft":2}'); assert.equal(f.editor.disabled, true); assert.equal(f.$('#codes-save').disabled, true); assert.equal(f.$('#codes-reload').disabled, true); assert.equal(f.$('#btn-harvest').disabled, true);
+  assert.match(f.$('#codes-status').textContent, /pertence ao Caso a/);
 });

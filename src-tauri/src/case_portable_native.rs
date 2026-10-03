@@ -415,6 +415,7 @@ pub(crate) fn capture_native_sidecars(
                 derived_fields: Vec::new(),
                 references: snapshot.config.references.clone(),
             },
+            interpretation: None,
             migration_diagnostics: Vec::new(),
             legacy_raw: None,
         });
@@ -1142,6 +1143,7 @@ fn context(
                 config_revision: 0,
                 visibility_revision: 0,
                 config: Default::default(),
+                interpretation: None,
                 migration_diagnostics: Vec::new(),
                 legacy_raw: None,
             },

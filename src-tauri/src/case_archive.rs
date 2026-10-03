@@ -757,6 +757,7 @@ mod tests {
                 ],
                 references: vec![],
             },
+            interpretation: None,
             migration_diagnostics: vec![],
             legacy_raw: None,
         };

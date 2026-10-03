@@ -175,6 +175,7 @@ pub(crate) async fn reference_inspect(
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImportReceipt {
+    #[serde(serialize_with = "crate::analysis_context::serialize_management_snapshot")]
     analysis_context: Snapshot,
     reference: ReferenceDescriptor,
     prepared: reference_store::PreparedReference,
@@ -218,7 +219,7 @@ fn import(
     };
     let mut config = current.config;
     config.references.push(descriptor.clone());
-    crate::analysis_commands::validate_config(&config)?;
+    crate::analysis_commands::validate_config_for(expected, &config)?;
     let input = open_regular(path)?;
     let limits = reference_store::Limits {
         source_bytes: SOURCE_BYTES,
@@ -348,7 +349,7 @@ pub(crate) async fn reference_remove(
         config
             .references
             .retain(|reference| reference.id != reference_id);
-        crate::analysis_commands::validate_config(&config)?;
+        crate::analysis_commands::validate_config_for(&analysis_context, &config)?;
         let _prepared = crate::analysis_commands::prepare_config(&analysis_context, &config)?;
         crate::operations::check()?;
         let result = analysis_context::update(&analysis_context, config)?;
@@ -390,7 +391,7 @@ pub(crate) async fn reference_save_lookup(
         } else {
             config.derived_fields.push(value);
         }
-        crate::analysis_commands::validate_config(&config)?;
+        crate::analysis_commands::validate_config_for(&analysis_context, &config)?;
         let _prepared = crate::analysis_commands::prepare_config(&analysis_context, &config)?;
         crate::operations::check()?;
         let result = analysis_context::update(&analysis_context, config)?;

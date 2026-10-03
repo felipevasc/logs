@@ -13,7 +13,6 @@ use aho_corasick::AhoCorasick;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 const BUILTIN: &str = include_str!("../resources/detection-rules.json");
@@ -412,20 +411,30 @@ impl Default for Settings {
     }
 }
 
-fn settings_path() -> PathBuf {
-    crate::config_dir().join("detections.json")
-}
-
-pub fn sigma_dir() -> PathBuf {
-    crate::config_dir().join("sigma")
-}
-
 pub fn load_settings() -> Settings {
-    std::fs::read_to_string(settings_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    crate::case_security::with(|snapshot| {
+        snapshot
+            .detection_settings()
+            .expect("validated Case security")
+    })
 }
 
-pub fn save_settings(settings: &Settings) -> Result<(), String> {
+pub(crate) fn validate_settings(settings: &Settings, previous: &Settings) -> Result<(), String> {
+    if settings.disabled.len() > 8192
+        || settings.suppress.len() > 4096
+        || settings.coverage.len() > 4096
+    {
+        return Err("Ajustes de segurança excedem os limites do Caso.".into());
+    }
     crate::security_normalize::validate_mappings(&settings.mappings)?;
+    // These timestamps are editable in the web view. Never round an i64 in
+    // a settings receipt/editor; arbitrary rule provenance remains raw JSON.
+    const EXACT_UI_INTEGER: i64 = 9_007_199_254_740_991;
+    let exact = |value: i64| (-EXACT_UI_INTEGER..=EXACT_UI_INTEGER).contains(&value);
+    if settings.suppress.iter().any(|s| !exact(s.created) || s.expires.is_some_and(|v| !exact(v)))
+        || settings.coverage.iter().any(|c| !exact(c.start) || !exact(c.end)) {
+        return Err("Datas de segurança excedem a faixa inteira exata do editor.".into());
+    }
     for c in &settings.coverage {
         if c.dataset_fingerprint.is_empty()
             || c.source.is_empty()
@@ -434,32 +443,28 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
             || c.start >= c.end
             || c.justification.trim().is_empty()
         {
-            return Err("Cobertura exige fonte, namespace, categoria, intervalo válido e justificativa".into());
+            return Err(
+                "Cobertura exige fonte, namespace, categoria, intervalo válido e justificativa"
+                    .into(),
+            );
         }
     }
-    let previous = load_settings();
     for exception in &settings.suppress {
-        let unchanged =
-            previous.suppress.iter().any(|old| serde_json::to_value(old).ok() == serde_json::to_value(exception).ok());
+        let unchanged = previous
+            .suppress
+            .iter()
+            .any(|old| serde_json::to_value(old).ok() == serde_json::to_value(exception).ok());
         if !unchanged
             && (exception.note.trim().is_empty()
                 || exception.scope.is_none()
                 || exception.expires.is_none_or(|t| t <= exception.created))
         {
-            return Err("Exceções exigem justificativa, escopo e validade posterior à criação".into());
+            return Err(
+                "Exceções exigem justificativa, escopo e validade posterior à criação".into(),
+            );
         }
     }
-    let path = settings_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let temp = path.with_extension("json.pending");
-    let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    std::fs::write(&temp, text).map_err(|e| e.to_string())?;
-    if path.exists() {
-        std::fs::copy(&path, path.with_extension("json.bak")).map_err(|e| e.to_string())?;
-    }
-    std::fs::rename(&temp, &path).map_err(|e| e.to_string())
+    Ok(())
 }
 
 // ------------------------------------------------------------------ rule set
@@ -477,52 +482,64 @@ impl RuleSet {
     }
 }
 
-pub(crate) fn fingerprint() -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let stamp = |path: &std::path::Path, h: &mut std::collections::hash_map::DefaultHasher| {
-        if let Ok(meta) = std::fs::metadata(path) {
-            meta.len().hash(h);
-            meta.modified().ok().hash(h);
-        }
-    };
-    stamp(&settings_path(), &mut hasher);
-    stamp(&crate::config_dir().join("detection-rules.json"), &mut hasher);
-    for file in crate::sigma::rule_files(&sigma_dir()) {
-        file.hash(&mut hasher);
-        stamp(&file, &mut hasher);
-    }
-    hasher.finish()
+pub(crate) fn fingerprint() -> String {
+    crate::case_security::with(|snapshot| snapshot.signature())
 }
 
-static RULESET: Mutex<Option<(u64, Arc<RuleSet>)>> = Mutex::new(None);
+static RULESET: Mutex<Option<(String, Arc<RuleSet>)>> = Mutex::new(None);
 
-/// Built-in rules, optional local overrides and imported Sigma rules,
-/// compiled once per change of any of their files.
+/// Content-keyed immutable compilation from the admitted Case, never profile files.
 pub fn ruleset() -> Result<Arc<RuleSet>, String> {
-    let key = fingerprint();
+    crate::case_security::with(ruleset_for)
+}
+pub(crate) fn ruleset_for(
+    snapshot: &crate::case_security::Settings,
+) -> Result<Arc<RuleSet>, String> {
+    let key = snapshot.signature();
     if let Some((cached, set)) = RULESET.lock().as_ref() {
         if *cached == key {
             return Ok(set.clone());
         }
     }
-    let settings = load_settings();
-    let disabled: HashSet<&str> = settings.disabled.iter().map(String::as_str).collect();
-    let mut defs: Vec<RuleDef> = builtin_defs()?;
-    if let Ok(text) = std::fs::read_to_string(crate::config_dir().join("detection-rules.json")) {
-        let local: RuleFile =
-            serde_json::from_str(&text).map_err(|e| format!("detection-rules.json local inválido: {e}"))?;
-        for rule in local.rules {
-            match defs.iter_mut().find(|d| d.id == rule.id) {
-                Some(existing) => *existing = rule,
-                None => defs.push(rule),
+    crate::case_security::compiling(snapshot, || {
+        let settings = snapshot.detection_settings()?;
+        let disabled: HashSet<&str> = settings.disabled.iter().map(String::as_str).collect();
+        let mut defs = builtin_defs()?;
+        let mut custom_ids = HashSet::new();
+        if let Some(text) = &snapshot.custom_rules_json {
+            let local: RuleFile =
+                serde_json::from_str(text).map_err(|e| format!("Regras do Caso inválidas: {e}"))?;
+            if local.version != 1 || local.rules.len() > 1024 {
+                return Err("Regras do Caso exigem versão 1 e até 1.024 definições.".into());
+            }
+            for rule in local.rules {
+                crate::operations::check()?;
+                if rule.id.is_empty() || rule.id.len() > 160 || !custom_ids.insert(rule.id.clone())
+                {
+                    return Err("ID de regra vazio, extenso ou duplicado.".into());
+                }
+                match defs.iter_mut().find(|d| d.id == rule.id) {
+                    Some(existing) => *existing = rule,
+                    None => defs.push(rule),
+                }
             }
         }
-    }
-    let (sigma, sigma_errors) = crate::sigma::load_dir(&sigma_dir());
-    let set = Arc::new(build(defs, sigma, sigma_errors, &disabled)?);
-    *RULESET.lock() = Some((key, set.clone()));
-    Ok(set)
+        let sigma = if snapshot.sigma_sources.is_empty() {
+            Vec::new()
+        } else {
+            crate::sigma::convert_texts(snapshot.sigma_sources.iter().map(|s| s.text.as_str()))?
+        };
+        let mut set = build(defs, sigma, Vec::new(), &disabled)?;
+        for rule in &mut set.rules {
+            if rule.origin == "builtin" && custom_ids.contains(&rule.def.id) {
+                rule.origin = "case";
+            }
+        }
+        let set = Arc::new(set);
+        crate::operations::check()?;
+        *RULESET.lock() = Some((key, set.clone()));
+        Ok(set)
+    })
 }
 
 /// Built-in rules only.
@@ -545,6 +562,7 @@ fn build(
 ) -> Result<RuleSet, String> {
     let mut rules = Vec::new();
     for def in &defs {
+        crate::operations::check()?;
         let enabled = def.enabled && !disabled.contains(def.id.as_str());
         let mut rule = resolve_rule(def, &defs, &mut Vec::new())?;
         rule.enabled = enabled;
@@ -2194,6 +2212,7 @@ fn run_inner(
         crate::attack::VERSION,
         inputs.rules.rules.iter().map(|r| &r.def).collect::<Vec<_>>(),
         inputs.settings,
+        inputs.catalog.map(|catalog| catalog.signature()),
     ))
     .map_err(|e| e.to_string())?;
     let analysis_id = crate::evidence::stable_id("analysis", [fingerprint, versions]);

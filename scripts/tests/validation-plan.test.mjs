@@ -128,3 +128,20 @@ test('workflow contract retains native and installed-update gates, shares cache 
   assert.match(checks, /name: Required validation/);
   assert.match(checks, /if: always\(\)/);
 });
+test('security and threat edits select the catalog pilot alongside journeys, and full preview includes it', () => {
+  assert(fullPreview.includes('test-threats.mjs'));
+  for (const path of ['frontend/security.js', 'frontend/security.css', 'frontend/threats.js', 'frontend/threats.css']) {
+    const plan = planValidation([path]);
+    assert.equal(plan.native, false, path); assert.equal(plan.scope, 'essential-and-affected', path);
+    contains(plan.preview, [...essentialPreview, 'test-journeys.mjs', 'test-threats.mjs']);
+  }
+  contains(planValidation(['scripts/preview/test-threats.mjs']).preview, [...essentialPreview, 'test-threats.mjs']);
+  for (const path of ['scripts/preview/mock-threats.js', 'src-tauri/src/threats.rs']) contains(planValidation([path]).preview, fullPreview);
+  assert.equal(planValidation(['frontend/journeys.js']).preview.includes('test-threats.mjs'), false, 'Unrelated journey edits keep their established focused scope');
+});
+test('the threat pilot uses the shared cross-platform browser launcher and waits for Case restoration', () => {
+  const pilot = readFileSync(new URL('../preview/test-threats.mjs', import.meta.url), 'utf8');
+  assert.match(pilot, /import \{ launchBrowser \} from ['"]\.\/browser\.mjs['"]/);
+  assert.match(pilot, /await launchBrowser\(/); assert.doesNotMatch(pilot, /chromium\.launch|C:\/Users\/|executablePath/);
+  assert.match(pilot, /WorkspaceContext\?\.ready.*!WorkspaceContext\.changing.*!state\.loadOverlay/);
+});

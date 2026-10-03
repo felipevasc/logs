@@ -14,7 +14,6 @@ use crate::sources::{event_at, CompiledDerived, FileIndex};
 use duckdb::arrow::array::{Array, Int64Array, Int32Array, Float64Array, StringArray, LargeStringArray, StringViewArray, StructArray};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use duckdb::arrow::record_batch::RecordBatch;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -96,7 +95,7 @@ fn analytics_with<T>(src: &Source, base_allowed: bool, f: impl FnOnce(&Session) 
         return Ok(None);
     };
     session.collect_garbage()?;
-    let _names = session.names_guard();
+    let _names = session.names_guard(src.codes, src.system)?;
     let result = f(&session);
     crate::operations::check()?;
     match result {
@@ -199,6 +198,8 @@ fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexFi
     let filter = &term.filter;
     let key = format!("exact-hex#{}", serde_json::to_string(&(&filter.f.column, &filter.f.value)).map_err(err)?);
     if let Some(found) = session.cached_selection(&key) { return Ok(Some(found)); }
+    #[cfg(test)]
+    EXACT_HEX_CANDIDATE_PROBES.with(|probes| probes.set(probes.get() + 1));
     let Some(candidates) = session.exact_hex_candidates(&term.word, LIMIT)? else { return Ok(None) };
     let mut confirmed = Vec::with_capacity(candidates.len());
     for id in candidates {
@@ -212,7 +213,10 @@ fn exact_hex_selection(session: &Session, src: &Source, term: &super::udf::HexFi
 }
 
 #[cfg(test)]
-thread_local! { static FREE_CANDIDATE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! {
+    static FREE_CANDIDATE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EXACT_HEX_CANDIDATE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 fn free_selection(session: &Session, src: &Source, term: &super::udf::FreeText) -> Result<Option<Arc<Selection>>> {
     let gate = crate::analysis_runtime::indexed_gate(src.idx)?;
@@ -287,12 +291,50 @@ pub(crate) struct Selection {
     known_empty: bool,
     single_id: Option<usize>,
     rows: AtomicU64,
-    garbage: Arc<parking_lot::Mutex<Vec<String>>>,
+    garbage: Arc<parking_lot::Mutex<Vec<SelectionGarbage>>>,
+    pool: Arc<crate::case_work_budget::Pool>,
+    credit: parking_lot::Mutex<Option<crate::case_work_budget::Lease>>,
+}
+
+/// A deleted selection still occupies its logical quota until DROP succeeds.
+#[derive(Debug)]
+pub(crate) struct SelectionGarbage {
+    pub name: String,
+    pub credit: Option<crate::case_work_budget::Lease>,
+}
+impl SelectionGarbage {
+    #[cfg(test)]
+    fn new(name: impl Into<String>) -> Self { Self { name: name.into(), credit: None } }
+}
+impl std::fmt::Display for SelectionGarbage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.name.fmt(f) }
 }
 
 impl Selection {
     pub(crate) fn name(&self) -> &str { &self.name }
     pub(crate) fn accounted_bytes(&self) -> u64 { self.rows.load(Ordering::Relaxed).saturating_mul(8) }
+    pub(crate) fn same_owner(&self, other: &Selection) -> bool { self.pool.same_owner(&other.pool) }
+    pub(crate) fn releases_pressure(&self, pool: &crate::case_work_budget::Pool, pressure: crate::case_work_budget::Pressure) -> bool {
+        pool.releases_pressure(&self.pool, pressure)
+    }
+    fn reserve_rows(&self, session: &Session, rows: u64) -> Result<()> {
+        let bytes = usize::try_from(rows.checked_mul(8).ok_or(crate::case_work_budget::WORK_BUSY)?).map_err(err)?;
+        let held = self.credit.lock().as_ref().map_or(0, |credit| credit.bytes());
+        if bytes <= held { return Ok(()); }
+        let reserve = || crate::case_cache::reserve_work(&self.pool, bytes - held);
+        let credit = match reserve() {
+            Ok(credit) => credit,
+            Err(error) if error == crate::case_work_budget::WORK_BUSY => {
+                let Some(pressure) = self.pool.pressure(bytes - held) else { return Err(error); };
+                super::trim_inactive_selection_caches(Some(session), Some((&self.pool, pressure)))?;
+                reserve()?
+            },
+            Err(error) => return Err(error),
+        };
+        let mut existing = self.credit.lock();
+        match existing.as_mut() { Some(existing) => existing.merge(credit)?, None => *existing = Some(credit) }
+        Ok(())
+    }
     fn predicate(&self) -> String {
         if self.known_empty { "FALSE".into() }
         else { format!("id IN (SELECT id FROM {})", self.name) }
@@ -301,7 +343,9 @@ impl Selection {
 
 impl Drop for Selection {
     fn drop(&mut self) {
-        self.garbage.lock().push(std::mem::take(&mut self.name));
+        self.garbage.lock().push(SelectionGarbage {
+            name: std::mem::take(&mut self.name), credit: self.credit.get_mut().take(),
+        });
     }
 }
 
@@ -390,14 +434,19 @@ fn complete_selection_key(session: &Session, pfs: &[PreparedFilter]) -> Option<S
     })
 }
 
+/// Use the same eligibility and canonical key for analytics and page hits.
+/// Cheap exact plans without markers never materialize a whole selection;
+/// preserve their allocation-free key path.
+fn complete_selection_key_for_plan(session: &Session, pfs: &[PreparedFilter], plan: &super::sql::Plan) -> Option<String> {
+    let may_materialize = !plan.exact() || costly(&plan.sql)
+        || !plan.tests.free.is_empty() || !plan.tests.hex_fields.is_empty();
+    if may_materialize { complete_selection_key(session, pfs) } else { None }
+}
+
 fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Scope<'s>> {
     crate::operations::check()?;
     let mut plan = session.schema.plan(pfs);
-    // Cheap exact plans without markers never materialize a whole selection;
-    // preserve their allocation-free key path.
-    let may_materialize = !plan.exact() || costly(&plan.sql)
-        || !plan.tests.free.is_empty() || !plan.tests.hex_fields.is_empty();
-    let key = if may_materialize { complete_selection_key(session, pfs) } else { None };
+    let key = complete_selection_key_for_plan(session, pfs, &plan);
     // A complete retained result already includes every required text term.
     // Re-probing those terms first can churn the shared LRU and evict this
     // result before it is used. The Session still binds the key to the full
@@ -449,14 +498,54 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
     })
 }
 
-/// A page must not first materialize every match to populate an analytics
-/// cache. Non-exact predicates are verified in bounded sorted batches below.
-fn page_scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Result<(Scope<'s>, bool)> {
+enum PageScope<'s> {
+    Singleton(crate::query::SelectedPage),
+    Planned { scope: Scope<'s>, verify: Vec<usize> },
+}
+
+/// Hit-only reuse: never begin or wait for a complete analytics selection.
+/// Keep the retained Arc alive through sorting/SQL, including concurrent LRU
+/// eviction, and reapply mandatory visibility under the admitted namespace.
+fn page_scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter], first_page: bool) -> Result<PageScope<'s>> {
+    crate::operations::check()?;
     let mut plan = session.schema.plan(pfs);
-    let exact = plan.exact();
+    // Analytics' raw/meta shortcut for `_all` line predicates is not a proof
+    // of canonical Event matching: it trims needles and cannot see generated
+    // messages or a snapshot's embedded raw text. Do not reuse those results
+    // on a page until that separate parity contract has been repaired.
+    // Reuse complete results only to remove canonical event confirmation.
+    // SQL-exact plans retain their direct predicate: joining a broad selection
+    // can cost more than the vectorized predicate the page already had.
+    let key = if !plan.verify.is_empty() && plan.lines.is_empty() {
+        complete_selection_key_for_plan(session, pfs, &plan)
+    } else { None };
+    if let Some(found) = key.as_deref().and_then(|key| session.cached_selection(key)) {
+        let cond = visible_sql(src, found.predicate(), &mut plan.tests)?;
+        crate::operations::check()?;
+        return Ok(PageScope::Planned {
+            scope: Scope { session, cond, names: false, _tests: plan.tests, _selection: Some(found), _free: Vec::new() },
+            verify: Vec::new(),
+        });
+    }
+    // Preserve the first-page singleton shortcut, but only after a complete
+    // cache hit has had the chance to skip all new text/hex probes.
+    if first_page {
+        if let Some(page) = required_hex_page(session, src, pfs, &plan)? {
+            return Ok(PageScope::Singleton(page));
+        }
+    }
     let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
     let sql = visible_sql(src, sql, &mut plan.tests)?;
-    Ok((Scope { session, cond: sql, names: plan.names || free_names, _tests: plan.tests, _selection: None, _free: free }, exact))
+    // SQL proves the remaining predicates. Conservatively confirm line
+    // residuals on the canonical event too, without using the raw shortcut.
+    let mut verify = plan.verify;
+    verify.extend(plan.lines);
+    verify.sort_unstable();
+    crate::operations::check()?;
+    Ok(PageScope::Planned {
+        scope: Scope { session, cond: sql, names: plan.names || free_names, _tests: plan.tests, _selection: None, _free: free },
+        verify,
+    })
 }
 
 fn new_selection(session: &Session, known_empty: bool, single_id: Option<usize>) -> Arc<Selection> {
@@ -467,17 +556,40 @@ fn new_selection(session: &Session, known_empty: bool, single_id: Option<usize>)
         single_id,
         rows: AtomicU64::new(u64::MAX),
         garbage: session.garbage(),
+        pool: crate::case_resources::current_selection_pool(),
+        credit: parking_lot::Mutex::new(None),
     })
 }
 
 fn selection_query(session: &Session, sql: &str) -> Result<Arc<Selection>> {
     let selection = new_selection(session, false, None);
+    let max = crate::resources::selection_bytes() / 8;
+    // Preserve the fast INSERT path when immutable source metadata proves a
+    // quota-fitting upper bound. Under pressure count the bounded result first,
+    // instead of refusing a narrow filter just because its source is large.
+    let upper = session.row_upper_bound().filter(|rows| *rows as u64 <= max);
+    let reserved = upper.map(|rows| selection.reserve_rows(session, rows as u64));
+    let rows = match reserved {
+        Some(Ok(())) => upper.map(|rows| rows as u64),
+        Some(Err(error)) if error != crate::case_work_budget::WORK_BUSY => return Err(error),
+        _ => {
+            let conn = session.conn()?;
+            let _cancel = interruptible(&conn)?;
+            let rows: u64 = conn.query_row(&format!("SELECT count(*) FROM (SELECT id FROM ({sql}) LIMIT {})", max.saturating_add(1)), [], |row| row.get(0)).map_err(err)?;
+            check_selection_size(rows)?;
+            selection.reserve_rows(session, rows)?;
+            Some(rows)
+        }
+    };
+    let bound = rows.unwrap_or(0);
     selection_write(session, &selection, |conn| {
         crate::operations::progress("analytics-select", "Selecionando candidatos", 0, 0, 0);
-        let max = crate::resources::selection_bytes() / 8;
-        let rows = conn.execute(&format!("INSERT INTO {} SELECT id FROM ({sql}) LIMIT {}", selection.name, max.saturating_add(1)), []).map_err(err)?;
-        check_selection_size(rows as u64)?;
-        Ok(rows as u64)
+        // Source is immutable during this admitted session. The unbounded
+        // INSERT cannot silently truncate; the preflight proves its upper bound.
+        let rows = conn.execute(&format!("INSERT INTO {} {sql}", selection.name), []).map_err(err)? as u64;
+        if rows > bound { return Err("A seleção divergiu da fonte imutável admitida.".into()); }
+        check_selection_size(rows)?;
+        Ok(rows)
     })?;
     Ok(selection)
 }
@@ -485,6 +597,7 @@ fn selection_query(session: &Session, sql: &str) -> Result<Arc<Selection>> {
 fn selection(session: &Session, ids: &[usize]) -> Result<Arc<Selection>> {
     check_selection_size(ids.len() as u64)?;
     let selection = new_selection(session, ids.is_empty(), if ids.len() == 1 { Some(ids[0]) } else { None });
+    selection.reserve_rows(session, ids.len() as u64)?;
     selection_write(session, &selection, |conn| {
         let mut appender = conn.appender(&selection.name).map_err(err)?;
         for chunk in ids.chunks((crate::resources::batch_bytes() / 8).clamp(1, 65536)) {
@@ -515,7 +628,11 @@ fn selection_write(session: &Session, selection: &Selection, fill: impl FnOnce(&
         conn.execute_batch(&format!("CREATE TABLE {} (id BIGINT)", selection.name)).map_err(err)?;
         let rows = fill(&conn)?;
         crate::operations::check()?;
+        let bytes = usize::try_from(rows.checked_mul(8).ok_or(crate::case_work_budget::WORK_BUSY)?).map_err(err)?;
+        let mut credit = selection.credit.lock();
+        if bytes > credit.as_ref().map_or(0, |credit| credit.bytes()) { return Err("Seleção sem reserva de volume lógico.".into()); }
         conn.execute_batch("COMMIT").map_err(err)?;
+        if let Some(credit) = credit.as_mut() { credit.resize(bytes)?; }
         selection.rows.store(rows, Ordering::Relaxed);
         Ok(())
     })();
@@ -567,14 +684,15 @@ fn verified_selection(session: &Session, src: &Source, pfs: &[PreparedFilter], p
                     bytes = bytes.saturating_add(next);
                     to += 1;
                 }
-                let kept: Vec<usize> = (from..to).into_par_iter().filter_map(|at| {
+                let kept: Vec<usize> = crate::global_scheduler::map(from..to, |at| {
                     if cancellation.cancelled() { return None; }
                     let id = ids.value(at) as usize;
                     verifier.matches(id).then_some(id)
-                }).collect();
+                }).into_iter().flatten().collect();
                 crate::operations::check()?;
                 selected = selected.saturating_add(kept.len() as u64);
                 check_selection_size(selected)?;
+                selection.reserve_rows(session, selected)?;
                 append_ids(&mut appender, &kept)?;
                 examined += to - from;
                 if last_report.elapsed() >= std::time::Duration::from_millis(200) {
@@ -650,6 +768,7 @@ mod bounded_analytics_tests {
 
     fn session() -> Session {
         Session {
+            row_count: None,
             key: "bounded-test".into(), base: Mutex::new(duckdb::Connection::open_in_memory().unwrap()),
             pool: Mutex::new(Vec::new()), schema: super::super::sql::Schema::default(),
             timestamps_non_null: false, baked: false, names: RwLock::new(None),
@@ -910,6 +1029,7 @@ mod bounded_analytics_tests {
         let session = session();
         let chosen = new_selection(&session, false, None);
         let token = crate::operations::token(Some("cancel-selection-write".into())).unwrap();
+        chosen.reserve_rows(&session, 1).unwrap();
         let result = crate::operations::run_with_token(token, || selection_write(&session, &chosen, |conn| {
             conn.execute(&format!("INSERT INTO {} VALUES(42)", chosen.name), []).map_err(err)?;
             crate::operations::cancel_id("cancel-selection-write");
@@ -935,25 +1055,113 @@ mod bounded_analytics_tests {
     }
 
     #[test]
+    fn inserting_custom_case_selection_preserves_other_owner_retention() {
+        use crate::case_resources::{Mode, Policy, Preferences};
+        if crate::resources::application_selection_cache_bytes() < 12 << 20 { return; }
+        let session = session();
+        let make_policy = |case: &str, mib| Policy::capture(Some(&crate::analysis_context::Identity {
+            case_id: case.into(), analysis_id: uuid::Uuid::new_v4().to_string(), config_revision: 0, visibility_revision: 0,
+        }), &Preferences { schema_version: 1, mode: Mode::Custom, work_limit_mib: Some(mib) }).unwrap();
+        let a = make_policy("retention-a", 8); let b = make_policy("retention-b", 16);
+        let cache = |policy: Arc<Policy>, key: &str, bytes: u64| crate::case_resources::with(policy, || {
+            let selection = new_selection(&session, false, None);
+            selection.rows.store(bytes / 8, Ordering::Relaxed);
+            session.cache_selection(key.into(), selection);
+        });
+        cache(b, "owner-b", 6 << 20);
+        cache(Arc::clone(&a), "owner-a-old", 3 << 20);
+        assert!(session.cached_selection("owner-b").is_some(), "A's 8 MiB cache must not be applied to B");
+        assert!(session.cached_selection("owner-a-old").is_some());
+        cache(a, "owner-a-new", 6 << 20);
+        assert!(session.cached_selection("owner-b").is_some());
+        assert!(session.cached_selection("owner-a-old").is_none(), "A trims its own older entry first");
+        assert!(session.cached_selection("owner-a-new").is_some());
+        assert_eq!(session.selection_snapshot()["entries"], 2);
+        session.trim_inactive_selections().unwrap();
+    }
+
+    #[test]
+    fn owner_selection_pressure_does_not_evict_another_case() {
+        use crate::case_work_budget::{Limits, OwnerCounter, Pool};
+        let session = session();
+        let limits = Limits { materialized: 64, retained: 64, live: 64 };
+        let root = Pool::new(limits);
+        let owner_a = Arc::new(OwnerCounter::default());
+        let a = Pool::child(limits, Arc::clone(&root), Arc::clone(&owner_a), 24);
+        let b = Pool::child(limits, Arc::clone(&root), Arc::new(OwnerCounter::default()), 32);
+        let active_a = a.reserve(24).unwrap();
+        let mut cached_b = new_selection(&session, false, None);
+        Arc::get_mut(&mut cached_b).unwrap().pool = b;
+        cached_b.reserve_rows(&session, 4).unwrap();
+        selection_write(&session, &cached_b, |conn| {
+            conn.execute(&format!("INSERT INTO {} VALUES(1),(2),(3),(4)", cached_b.name), []).map_err(err)?; Ok(4)
+        }).unwrap();
+        session.cache_selection("other-case".into(), Arc::clone(&cached_b));
+        drop(cached_b);
+        let mut refused = new_selection(&session, false, None);
+        Arc::get_mut(&mut refused).unwrap().pool = a;
+        assert!(refused.reserve_rows(&session, 1).is_err());
+        assert!(session.cached_selection("other-case").is_some());
+        assert_eq!(root.used(), 56);
+        let mut next = new_selection(&session, false, None);
+        Arc::get_mut(&mut next).unwrap().pool = Pool::child(limits, Arc::clone(&root), owner_a, 48);
+        next.reserve_rows(&session, 2).unwrap();
+        assert!(session.cached_selection("other-case").is_none());
+        assert_eq!(root.used(), 40);
+        drop((next, refused, active_a));
+        session.collect_garbage().unwrap();
+        assert_eq!(root.used(), 0);
+    }
+
+    #[test]
+    fn inactive_cached_selections_release_quota_only_after_real_table_drop() {
+        use crate::case_work_budget::{Limits, Pool};
+        let session = session();
+        let pool = Pool::new(Limits { materialized: 16, retained: 16, live: 16 });
+        let mut first = new_selection(&session, false, None);
+        Arc::get_mut(&mut first).unwrap().pool = Arc::clone(&pool);
+        first.reserve_rows(&session, 2).unwrap();
+        selection_write(&session, &first, |conn| {
+            conn.execute(&format!("INSERT INTO {} VALUES(1),(2)", first.name), []).map_err(err)?; Ok(2)
+        }).unwrap();
+        let name = first.name.clone();
+        session.cache_selection("quota-old".into(), Arc::clone(&first));
+        let active = Arc::clone(&first); drop(first);
+        session.trim_inactive_selections().unwrap();
+        assert_eq!(pool.used(), 16, "an active cached publication keeps its credit");
+        drop(active);
+        let mut next = new_selection(&session, false, None);
+        Arc::get_mut(&mut next).unwrap().pool = Arc::clone(&pool);
+        next.reserve_rows(&session, 1).unwrap();
+        assert_eq!(pool.used(), 8, "pressure evicts inactive cache before refusing new work");
+        assert_eq!(session.conn().unwrap().query_row(&format!("SELECT count(*) FROM information_schema.tables WHERE table_name='{}'", name), [], |row| row.get::<_,i64>(0)).unwrap(), 0);
+        drop(next);
+        assert_eq!(pool.used(), 8, "queued garbage retains its quota");
+        session.collect_garbage().unwrap();
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
     fn failed_or_cancelled_selection_cleanup_retains_every_pending_table_for_retry() {
         let session = session();
         session.conn().unwrap().execute_batch("CREATE VIEW retired_wrong_type AS SELECT 1; CREATE TABLE retired_later(id BIGINT)").unwrap();
-        session.garbage().lock().extend(["retired_wrong_type".to_string(), "retired_later".to_string()]);
+        session.garbage().lock().extend([SelectionGarbage::new("retired_wrong_type"), SelectionGarbage::new("retired_later")]);
         let next = new_selection(&session, false, None);
         let mut filled = false;
         assert!(selection_write(&session, &next, |_| { filled = true; Ok(0) }).is_err());
         assert!(!filled, "failed cleanup cannot begin publishing another selection");
-        assert_eq!(*session.garbage().lock(), vec!["retired_wrong_type", "retired_later"]);
+        assert_eq!(session.garbage().lock().iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), vec!["retired_wrong_type", "retired_later"]);
         session.conn().unwrap().execute_batch("DROP VIEW retired_wrong_type").unwrap();
         let token = crate::operations::token(Some("selection-cleanup-cancel".into())).unwrap();
         assert!(crate::operations::run_with_token(token, || {
             crate::operations::cancel_id("selection-cleanup-cancel");
             session.collect_garbage()
         }).is_err());
-        assert_eq!(*session.garbage().lock(), vec!["retired_wrong_type", "retired_later"]);
+        assert_eq!(session.garbage().lock().iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), vec!["retired_wrong_type", "retired_later"]);
         session.collect_garbage().unwrap();
         assert!(session.garbage().lock().is_empty());
         assert_eq!(session.conn().unwrap().query_row("SELECT count(*) FROM information_schema.tables WHERE table_name='retired_later'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        next.reserve_rows(&session, 1).unwrap();
         selection_write(&session, &next, |conn| { conn.execute(&format!("INSERT INTO {} VALUES(7)", next.name), []).map_err(err)?; Ok(1) }).unwrap();
         assert_eq!(next.accounted_bytes(), 8);
     }
@@ -1028,6 +1236,7 @@ mod bounded_analytics_tests {
         let path = directory.path().join("cache-order.jsonl");
         let records: Vec<_> = (0..80).map(|id| serde_json::json!({
             "timestamp":"2026-01-01T00:00:00Z", "message":words.join(" "), "keep":id % 2 == 0,
+            "request_id":format!("{id:032x}"),
         }).to_string()).collect();
         std::fs::write(&path, records.join("\n")).unwrap();
         let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
@@ -1051,6 +1260,16 @@ mod bounded_analytics_tests {
         assert_eq!(count_session(&session, &source, &pfs).unwrap(), 40);
         assert_eq!(FREE_CANDIDATE_PROBES.with(std::cell::Cell::get), 0, "a completed filter must skip all repeated term probes");
         assert_eq!(session.selection_snapshot(), before, "the retained selection must not be evicted by term churn");
+        for direction in ["asc", "desc"] {
+            let page = select_page(&source, &pfs, "id", direction, 0, 3, None).unwrap().unwrap();
+            let expected = if direction == "asc" { vec![0, 2, 4] } else { vec![78, 76, 74] };
+            assert_eq!(page.ids, expected);
+            assert!(page.has_more);
+            let next = select_page(&source, &pfs, "id", direction, 3, 3, page.next_cursor.as_deref()).unwrap().unwrap();
+            assert_eq!(next.ids, if direction == "asc" { vec![6, 8, 10] } else { vec![72, 70, 68] });
+            assert_eq!(FREE_CANDIDATE_PROBES.with(std::cell::Cell::get), 0, "page hits must skip term probing too");
+            assert_eq!(session.selection_snapshot(), before);
+        }
         let token = crate::operations::token(Some("complete-filter-hit-cancel".into())).unwrap();
         let cancelled = crate::operations::run_with_token(token, || {
             crate::operations::cancel_id("complete-filter-hit-cancel");
@@ -1059,11 +1278,178 @@ mod bounded_analytics_tests {
         assert!(cancelled.is_err());
         assert_eq!(FREE_CANDIDATE_PROBES.with(std::cell::Cell::get), 0);
         assert_eq!(session.selection_snapshot(), before);
+        let hex = prepared(&[
+            crate::query::Filter { column:"request_id".into(), op:"equals_exact".into(), value:format!("{:032x}", 4), value2:None },
+            crate::query::Filter { column:"raw".into(), op:"contains".into(), value:"\"keep\":true".into(), value2:None },
+        ]);
+        assert_eq!(count_session(&session, &source, &hex).unwrap(), 1);
+        // Retain the full result in the eighth slot while evicting its term.
+        // The old first-page shortcut would re-probe and evict that result.
+        for i in 0..7 { session.cache_selection(format!("hex-churn-{i}"), selection(&session, &[1]).unwrap()); }
+        EXACT_HEX_CANDIDATE_PROBES.with(|probes| probes.set(0));
+        let page = select_page(&source, &hex, "id", "asc", 0, 3, None).unwrap().unwrap();
+        assert_eq!(page.ids, vec![4]);
+        assert_eq!(EXACT_HEX_CANDIDATE_PROBES.with(std::cell::Cell::get), 0, "complete hits precede even the first-page singleton probe");
         let key = complete_selection_key(&session, &pfs).unwrap();
         session.names_version.fetch_add(1, Ordering::SeqCst);
         assert_ne!(complete_selection_key(&session, &pfs).unwrap(), key, "catalog versions cannot reuse an earlier complete result");
         filters[0].value = "changed".into();
         assert_ne!(complete_selection_key(&session, &prepared(&filters)).unwrap(), complete_selection_key(&session, &pfs).unwrap());
+    }
+
+    fn scope_fixture() -> (tempfile::TempDir, FileIndex) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("page-scope.jsonl");
+        std::fs::write(&path, "{\"message\":\"keep\"}\n{\"message\":\"drop\"}\n{\"message\":\"keep\"}\n").unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        (directory, index)
+    }
+
+    fn filter(column: &str, op: &str, value: &str) -> crate::query::Filter {
+        crate::query::Filter { column: column.into(), op: op.into(), value: value.into(), value2: None }
+    }
+
+    #[test]
+    fn page_scope_miss_never_builds_or_waits_for_complete_selection() {
+        let (_directory, index) = scope_fixture();
+        let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let session = session();
+        let pfs = prepared(&[filter("id", "gte", "0"), filter("raw", "contains", "keep")]);
+        let key = complete_selection_key(&session, &pfs).unwrap();
+        let _building = session.begin_selection(&key).unwrap();
+        let token = crate::operations::token(Some("page-hit-only-miss".into())).unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        // A regression that joins the analytic builder fails after a bounded
+        // cancellation instead of hanging the entire test process.
+        let cancel = std::thread::spawn(move || {
+            if receive.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+                crate::operations::cancel_id("page-hit-only-miss");
+            }
+        });
+        let result = crate::operations::run_with_token(token, || page_scope(&session, &source, &pfs, false));
+        let _ = send.send(());
+        cancel.join().unwrap();
+        let PageScope::Planned { scope, verify, .. } = result.unwrap().unwrap() else { panic!("not a singleton") };
+        assert!(scope._selection.is_none());
+        assert_eq!(verify, vec![1], "SQL-proven id predicate must not be repeated");
+        assert_eq!(session.selection_snapshot()["entries"], 0);
+        assert_eq!(session.selection_builds.lock().len(), 1, "only the preexisting builder may exist");
+    }
+
+    #[test]
+    fn page_scope_exact_predicates_stay_direct_after_complete_analytics_cache() {
+        let (_directory, index) = scope_fixture();
+        let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let session = session();
+        {
+            let conn = session.conn().unwrap();
+            super::super::udf::register(&conn).unwrap();
+            conn.execute_batch("CREATE TABLE ev(id BIGINT, message VARCHAR); INSERT INTO ev VALUES (0,'keep'),(1,'drop'),(2,'keep')").unwrap();
+        }
+        for op in ["contains", "equals_exact"] {
+            let pfs = prepared(&[filter("message", op, "keep")]);
+            let plan = session.schema.plan(&pfs);
+            assert!(plan.exact());
+            assert!(costly(&plan.sql), "analytics may retain this complete selection");
+            let key = complete_selection_key_for_plan(&session, &pfs, &plan).unwrap();
+            let PageScope::Planned { scope, verify } = page_scope(&session, &source, &pfs, false).unwrap() else { panic!("not a singleton") };
+            assert!(scope._selection.is_none());
+            assert!(verify.is_empty());
+            let cold = read_ids(&session, &format!("SELECT id FROM ev WHERE {} ORDER BY id", scope.cond)).unwrap();
+            assert_eq!(cold, vec![0, 2]);
+            drop(scope);
+            assert_eq!(count_session(&session, &source, &pfs).unwrap(), 2);
+            let completed = session.cached_selection(&key).expect("analytics retained the complete result");
+            let before = session.selection_snapshot();
+            for first_page in [true, false] {
+                let PageScope::Planned { scope, verify } = page_scope(&session, &source, &pfs, first_page).unwrap() else { panic!("not a singleton") };
+                assert!(scope._selection.is_none(), "SQL-exact paging must retain its direct predicate after count");
+                assert!(scope._free.is_empty());
+                assert!(verify.is_empty());
+                    assert_eq!(read_ids(&session, &format!("SELECT id FROM ev WHERE {} ORDER BY id", scope.cond)).unwrap(), cold);
+            }
+            assert!(session.selection_builds.lock().is_empty());
+            assert_eq!(session.selection_snapshot(), before);
+            assert!(Arc::ptr_eq(&session.cached_selection(&key).unwrap(), &completed));
+        }
+    }
+
+    #[test]
+    fn page_scope_hit_keeps_selection_lease_across_eviction_and_checks_cancellation() {
+        let (_directory, index) = scope_fixture();
+        let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let session = session();
+        session.conn().unwrap().execute_batch("CREATE TABLE ev(id BIGINT); INSERT INTO ev VALUES (0),(1),(2)").unwrap();
+        let pfs = prepared(&[filter("raw", "contains", "keep")]);
+        let key = complete_selection_key(&session, &pfs).unwrap();
+        let chosen = selection(&session, &[0, 2]).unwrap();
+        let table = chosen.name.clone();
+        session.cache_selection(key.clone(), chosen);
+        let before = session.selection_snapshot();
+        let token = crate::operations::token(Some("page-hit-only-cancel".into())).unwrap();
+        assert!(crate::operations::run_with_token(token, || {
+            crate::operations::cancel_id("page-hit-only-cancel");
+            assert!(page_scope(&session, &source, &pfs, false).is_err());
+        }).is_err());
+        assert_eq!(session.selection_snapshot(), before);
+        let PageScope::Planned { scope, verify, .. } = page_scope(&session, &source, &pfs, false).unwrap() else { panic!("not a singleton") };
+        assert!(verify.is_empty());
+        assert!(scope._selection.is_some());
+        for i in 0..8 { session.cache_selection(format!("evict-{i}"), selection(&session, &[1]).unwrap()); }
+        assert!(session.cached_selection(&key).is_none());
+        session.collect_garbage().unwrap();
+        assert_eq!(read_ids(&session, &format!("SELECT id FROM ev WHERE {} ORDER BY id", scope.cond)).unwrap(), vec![0, 2]);
+        drop(scope);
+        session.collect_garbage().unwrap();
+        let remaining: i64 = session.conn().unwrap().query_row(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name=?", [&table], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(remaining, 0, "only the last lease may retire a selection table");
+    }
+
+    #[test]
+    fn page_scope_keys_reject_catalog_filter_and_mutable_rule_changes() {
+        let (_directory, index) = scope_fixture();
+        let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let session = session();
+        let pfs = prepared(&[filter("raw", "contains", "keep")]);
+        let key = complete_selection_key(&session, &pfs).unwrap();
+        session.cache_selection(key, selection(&session, &[0, 2]).unwrap());
+        let changed = prepared(&[filter("raw", "contains", "drop")]);
+        for pfs in [&changed, &prepared(&[filter("_all", "detection", "missing")]), &prepared(&[filter("_all", "threat_rule", "missing")])] {
+            let PageScope::Planned { scope, verify, .. } = page_scope(&session, &source, pfs, false).unwrap() else { panic!("not a singleton") };
+            assert!(scope._selection.is_none());
+            assert_eq!(verify, vec![0]);
+        }
+        session.names_version.fetch_add(1, Ordering::SeqCst);
+        let PageScope::Planned { scope, verify, .. } = page_scope(&session, &source, &pfs, false).unwrap() else { panic!("not a singleton") };
+        assert!(scope._selection.is_none());
+        assert_eq!(verify, vec![0]);
+    }
+
+    #[test]
+    fn page_line_residuals_bypass_analytic_cache_and_preserve_literal_spaces() {
+        let (_directory, index) = scope_fixture();
+        let config = CodesConfig::default();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &[] };
+        let session = session();
+        for op in ["contains", "not_contains", "regex"] {
+            let pfs = prepared(&[filter("_all", op, " keep ")]);
+            assert_eq!(session.schema.plan(&pfs).lines, vec![0]);
+            // This entry must never be trusted as canonical page membership.
+            session.cache_selection(complete_selection_key(&session, &pfs).unwrap(), selection(&session, &[0, 2]).unwrap());
+            let PageScope::Planned { scope, verify, .. } = page_scope(&session, &source, &pfs, false).unwrap() else { panic!("not a singleton") };
+            assert!(scope._selection.is_none());
+            assert_eq!(verify, vec![0]);
+            let verifier = crate::query::CandidateVerifier::new(&index, &pfs, &[], &verify, &config, &config, &[]).unwrap();
+            for id in 0..index.lines.len() {
+                assert_eq!(verifier.matches(id), crate::query::matches_indexed(&source.event(id), &pfs[0]), "{op} row {id}");
+            }
+        }
     }
 
     fn bare_scope(session: &Session) -> Scope<'_> {
@@ -1175,8 +1561,8 @@ pub(crate) fn visit_matches(src: &Source, pfs: &[PreparedFilter], visit: impl Fn
 pub(crate) fn visit_exact_matches(src: &Source, pfs: &[PreparedFilter], visit: impl FnMut(usize) -> Result<bool>) -> Result<Option<()>> {
     Ok(analytics_with(src, base_page_safe(pfs, ""), |session| {
         if !session.schema.plan(pfs).exact() { return Ok(None); }
-        let (scope, exact) = page_scope(session, src, pfs)?;
-        if !exact { return Ok(None); }
+        let PageScope::Planned { scope, verify, .. } = page_scope(session, src, pfs, false)? else { return Ok(None); };
+        if !verify.is_empty() { return Ok(None); }
         visit_ids(session, &format!("SELECT id FROM {} WHERE {} ORDER BY id", scope.from(false), scope.cond), visit)?;
         Ok(Some(()))
     })?.flatten())
@@ -1364,6 +1750,7 @@ mod exact_time_routing_tests {
             paths.push(store);
         }
         let session = Session {
+            row_count: None,
             key: "time-routing-test".into(), base: Mutex::new(connection), pool: Mutex::new(Vec::new()),
             schema: super::super::sql::Schema::default(), timestamps_non_null: false, baked: true,
             names: RwLock::new(None), names_version: AtomicU64::new(0), selections: Mutex::new(Vec::new()),
@@ -2346,14 +2733,13 @@ fn page_statement(scope: &Scope, sort: &[SortKey], names: bool, seek: &PageSeek,
 /// A required top-level equality bounds the entire conjunction. Only a
 /// complete, canonically verified empty/singleton set may bypass page SQL;
 /// free-text OR/NOT terms never establish this proof.
-fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) -> Result<Option<crate::query::SelectedPage>> {
+fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter], plan: &super::sql::Plan) -> Result<Option<crate::query::SelectedPage>> {
     // Planner invariant: hex_fields contains required top-level equals_exact
     // clauses only. OR/NOT query-expression terms must never enter this list.
     if !pfs.iter().any(|pf| pf.f.op == "equals_exact" && super::text::exact_field_hex_word(&pf.f.value).is_some()) {
         return Ok(None);
     }
     let gate = crate::analysis_runtime::indexed_gate(src.idx)?;
-    let plan = session.schema.plan(pfs);
     for term in &plan.tests.hex_fields {
         let Some(selected) = exact_hex_selection(session, src, term)? else { continue; };
         if !selected.known_empty && selected.single_id.is_none() { continue; }
@@ -2374,6 +2760,53 @@ fn required_hex_page(session: &Session, src: &Source, pfs: &[PreparedFilter]) ->
     Ok(None)
 }
 
+/// Optional backend diagnostics, separate from latency benchmark samples.
+/// No source values or filters are logged. Candidate evaluation includes the
+/// residual matcher, cancellation checkpoints and bounded page bookkeeping.
+struct PageTrace {
+    started: std::time::Instant,
+    scope_ms: f64,
+    sql_ms: f64,
+    candidate_ms: f64,
+    cache_hit: bool,
+    singleton: bool,
+    term_selections: usize,
+    sql_batches: usize,
+    sql_candidates: usize,
+    residual_candidates: usize,
+    returned: usize,
+    success: bool,
+}
+
+fn page_trace_start() -> Option<std::time::Instant> {
+    std::env::var_os("LOGINSIGHT_PAGE_TRACE").map(|_| std::time::Instant::now())
+}
+
+impl PageTrace {
+    fn new() -> Option<Self> {
+        page_trace_start().map(|started| Self {
+            started, scope_ms: 0.0, sql_ms: 0.0, candidate_ms: 0.0,
+            cache_hit: false, singleton: false, term_selections: 0,
+            sql_batches: 0, sql_candidates: 0, residual_candidates: 0,
+            returned: 0, success: false,
+        })
+    }
+}
+
+impl Drop for PageTrace {
+    fn drop(&mut self) {
+        eprintln!("PAGE_TRACE {}", serde_json::json!({
+            "phase": "selection", "operationId": crate::operations::current_id(),
+            "success": self.success, "selectionMs": self.started.elapsed().as_secs_f64() * 1000.0,
+            "scopeMs": self.scope_ms, "sqlMs": self.sql_ms, "candidateEvaluationMs": self.candidate_ms,
+            "completeSelectionHit": self.cache_hit, "singleton": self.singleton,
+            "termSelectionsHeld": self.term_selections, "sqlBatches": self.sql_batches,
+            "sqlCandidates": self.sql_candidates, "residualCandidates": self.residual_candidates,
+            "returnedRows": self.returned,
+        }));
+    }
+}
+
 /// Page-size work in Rust and no mandatory COUNT. Returns None only when no
 /// suitable store is ready; the caller can explicitly report the line fallback.
 pub(crate) fn query_page(
@@ -2387,8 +2820,15 @@ pub(crate) fn query_page(
 ) -> Option<Result<crate::query::QueryPage>> {
     select_page(src, pfs, sort_column, sort_dir, offset, limit, cursor).map(|result| {
         let selected = result?;
+        let started = page_trace_start();
         let rows = page_rows(src, selected.ids.clone())?;
         crate::operations::check()?;
+        if let Some(started) = started {
+            eprintln!("PAGE_TRACE {}", serde_json::json!({
+                "phase": "hydration", "operationId": crate::operations::current_id(),
+                "hydrationMs": started.elapsed().as_secs_f64() * 1000.0, "hydratedRows": rows.len(),
+            }));
+        }
         Ok(selected.into_full(rows))
     })
 }
@@ -2418,14 +2858,32 @@ fn select_page(
     let limit = limit.clamp(1, 2_000);
     let base_safe = base_page_safe(pfs, sort_column);
     let session = match ready_session(src, base_safe) { Ok(Some(session)) => session, Ok(None) => return None, Err(error) => return Some(Err(error)) };
-    let _names = session.names_guard();
+    let _names = match session.names_guard(src.codes, src.system) { Ok(guard) => guard, Err(error) => return Some(Err(error)) };
     Some((|| {
+        let mut trace = PageTrace::new();
         crate::operations::check()?;
-        if cursor.is_none() && offset == 0 {
-            if let Some(page) = required_hex_page(&session, src, pfs)? { return Ok(page); }
+        let (scope, verify) = match page_scope(&session, src, pfs, cursor.is_none() && offset == 0)? {
+            PageScope::Singleton(page) => {
+                if let Some(trace) = trace.as_mut() {
+                    trace.scope_ms = trace.started.elapsed().as_secs_f64() * 1000.0;
+                    trace.singleton = true;
+                    trace.returned = page.ids.len();
+                    trace.success = true;
+                }
+                return Ok(page);
+            }
+            PageScope::Planned { scope, verify } => (scope, verify),
+        };
+        if let Some(trace) = trace.as_mut() {
+            trace.scope_ms = trace.started.elapsed().as_secs_f64() * 1000.0;
+            trace.cache_hit = scope._selection.is_some();
+            trace.term_selections = scope._free.len();
         }
         let fingerprint = page_fingerprint(src, pfs, sort_column, sort_dir, base_safe)?;
-        let (scope, exact) = page_scope(&session, src, pfs)?;
+        let exact = verify.is_empty();
+        let verifier = if exact { None } else {
+            Some(crate::query::CandidateVerifier::new(src.idx, pfs, &[], &verify, src.codes, src.system, src.derived)?)
+        };
         let (sort, names) = page_sort(&scope, sort_column, sort_dir)?;
         let (after, position) = page_seek(cursor, &sort, &fingerprint, src.idx.lines.len(), offset)?;
         let mut offset_sql = if cursor.is_some() || !exact { 0 } else { offset };
@@ -2436,6 +2894,7 @@ fn select_page(
         loop {
             crate::operations::check()?;
             let sql = page_statement(&scope, &sort, names, &seek, batch_size, offset_sql);
+            let sql_started = trace.as_ref().map(|_| std::time::Instant::now());
             let candidates = rows(&session, &sql, |row| {
                 let id = row.get::<_, i64>(0)? as usize;
                 let keys = sort.iter().enumerate().map(|(i, key)| {
@@ -2444,17 +2903,26 @@ fn select_page(
                 }).collect::<duckdb::Result<Vec<_>>>()?;
                 Ok((id, keys))
             })?;
+            if let (Some(trace), Some(started)) = (trace.as_mut(), sql_started) {
+                trace.sql_ms += started.elapsed().as_secs_f64() * 1000.0;
+                trace.sql_batches += 1;
+                trace.sql_candidates += candidates.len();
+            }
+            let candidate_started = trace.as_ref().map(|_| std::time::Instant::now());
             let exhausted = candidates.len() < batch_size;
             let last_keys = candidates.last().map(|(_, keys)| keys.clone());
             for candidate in candidates {
                 crate::operations::check()?;
-                if !exact {
-                    let event = src.event(candidate.0);
-                    if !pfs.iter().all(|pf| crate::query::matches_indexed(&event, pf)) { continue; }
+                if let Some(verifier) = &verifier {
+                    if let Some(trace) = trace.as_mut() { trace.residual_candidates += 1; }
+                    if !verifier.matches(candidate.0) { continue; }
                 }
                 if skip_matches > 0 { skip_matches -= 1; continue; }
                 found.push(candidate);
                 if found.len() > limit { break; }
+            }
+            if let (Some(trace), Some(started)) = (trace.as_mut(), candidate_started) {
+                trace.candidate_ms += started.elapsed().as_secs_f64() * 1000.0;
             }
             if found.len() > limit || exhausted { break; }
             let Some(keys) = last_keys else { break };
@@ -2470,8 +2938,12 @@ fn select_page(
         let total = if pfs.is_empty() { Some(crate::analysis_runtime::visible_total(src.idx)?) }
             else if !has_more && (position == 0 || !found.is_empty()) { Some(position.saturating_add(found.len())) }
             else { None };
-        let ids = found.into_iter().map(|(id, _)| id).collect();
+        let ids: Vec<_> = found.into_iter().map(|(id, _)| id).collect();
         crate::operations::check()?;
+        if let Some(trace) = trace.as_mut() {
+            trace.returned = ids.len();
+            trace.success = true;
+        }
         Ok(crate::query::SelectedPage {
             ids, total, has_more, next_cursor, engine: "columnar".into(),
             warning: (!exact).then(|| "Este filtro exige confirmação nos registros; consultas amplas podem demorar mais.".into()),
@@ -2494,18 +2966,19 @@ pub(crate) fn explain_page_at(
 ) -> Option<Result<Value>> {
     let base_safe = base_page_safe(pfs, sort_column);
     let session = match ready_session(src, base_safe) { Ok(Some(session)) => session, Ok(None) => return None, Err(error) => return Some(Err(error)) };
-    let _names = session.names_guard();
+    let _names = match session.names_guard(src.codes, src.system) { Ok(guard) => guard, Err(error) => return Some(Err(error)) };
     Some((|| {
-        if sort_column != "raw" && cursor.is_none() && offset == 0 {
-            if let Some(page) = required_hex_page(&session, src, pfs)? {
+        let (scope, verify) = match page_scope(&session, src, pfs, sort_column != "raw" && cursor.is_none() && offset == 0)? {
+            PageScope::Singleton(page) => {
                 return Ok(serde_json::json!({ "mode": "verified_singleton", "sql": null,
                     "plan": "Complete typed equality candidates verified directly; no page SQL statement executed.",
                     "profile": null, "analyzed": false, "exactPredicate": true, "total": page.total,
                     "note": "Index candidate discovery and canonical event verification are not DuckDB page scans." }));
             }
-        }
+            PageScope::Planned { scope, verify, .. } => (scope, verify),
+        };
         let fingerprint = page_fingerprint(src, pfs, sort_column, sort_dir, base_safe)?;
-        let (scope, exact) = page_scope(&session, src, pfs)?;
+        let exact = verify.is_empty();
         let (sort, names) = page_sort(&scope, sort_column, sort_dir)?;
         let (seek, _) = page_seek(cursor, &sort, &fingerprint, src.idx.lines.len(), offset)?;
         let limit = limit.clamp(1, 2_000);
@@ -2567,8 +3040,7 @@ fn page_ids(scope: &Scope, sort_column: &str, sort_dir: &str, offset: usize, lim
 /// Rows of a page, read in parallel (pages of trails reach thousands).
 fn page_rows(src: &Source, ids: Vec<usize>) -> Result<Vec<Event>> {
     let binding = crate::analysis_runtime::source_set(src.idx)?;
-    ids.into_par_iter()
-        .map(|i| {
+    crate::global_scheduler::map(ids, |i| {
             let mut event = src.event(i);
             crate::analysis_runtime::attach_provenance_with(src.idx, &binding, &mut event)?;
             crate::entities::annotate(&mut event);
@@ -2576,8 +3048,7 @@ fn page_rows(src: &Source, ids: Vec<usize>) -> Result<Vec<Event>> {
             // allocation alive alongside fields until response serialization.
             event.raw = String::new();
             Ok(event)
-        })
-        .collect()
+        }).into_iter().collect()
 }
 
 #[cfg(test)]
@@ -2637,6 +3108,127 @@ mod page_payload_tests {
     }
 
     #[test]
+    fn cached_and_residual_pages_preserve_canonical_order_cursors_and_generated_messages() {
+        struct Restore(Option<std::ffi::OsString>, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 { Some(value) => std::env::set_var("LOGINSIGHT_ENGINE_DIR", value), None => std::env::remove_var("LOGINSIGHT_ENGINE_DIR") }
+                crate::engine::set_enabled(self.1);
+            }
+        }
+        let _restore = Restore(std::env::var_os("LOGINSIGHT_ENGINE_DIR"), super::super::enabled());
+        let directory = tempfile::tempdir().unwrap();
+        std::env::set_var("LOGINSIGHT_ENGINE_DIR", directory.path().join("engine"));
+        crate::engine::set_enabled(true);
+        let path = directory.path().join("residual-navigation.jsonl");
+        let mut records: Vec<_> = (0..1099).map(|id| serde_json::json!({
+            "timestamp": ([Some("1969-12-31T23:59:59.999Z"), None, Some("1970-01-01T00:00:00Z"), Some("2026-01-01T00:00:00Z")][id % 4]),
+            "source": "api", "code": "42", "message": if id % 5 == 0 { "needle" } else { "ordinary" },
+            "keep": id == 0 || id == 1098, "User": "upper", "user": if id % 2 == 0 { "lower" } else { "other" },
+            "items": [{"kind": if id % 17 == 0 { "rare" } else { "common" }}],
+        }).to_string()).collect();
+        // The parser adds "negado" to the canonical message; it does not occur
+        // in the raw JSON. A raw-only miss is therefore not a page proof.
+        records.push(serde_json::json!({"eventSource":"ec2.amazonaws.com", "eventName":"RunInstances", "errorCode":"Denied"}).to_string());
+        std::fs::write(&path, records.join("\n")).unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let config: CodesConfig = serde_json::from_value(serde_json::json!({"api":{"42":{"name":"catalogneedle","description":"enriched"}}})).unwrap();
+        let derived = vec![CompiledDerived {
+            name: "derived_user".into(), source: "user".into(),
+            rules: vec![crate::sources::CompiledRule::new(regex::Regex::new("^(.*)$").unwrap(), None, None).unwrap()],
+            steps: Vec::new(), lookup: None,
+        }];
+        crate::engine::prepare(&index, &config, &config, &derived, &|_, _| {}).unwrap();
+        let source = Source { idx: &index, codes: &config, system: &config, derived: &derived };
+        let session = super::super::session_checked(&index, &config, &config, &derived).unwrap().unwrap();
+        let filter = |column: &str, op: &str, value: &str| crate::query::Filter {
+            column: column.into(), op: op.into(), value: value.into(), value2: None,
+        };
+        let raw = filter("raw", "contains", "\"keep\":true");
+        let workloads = vec![
+            vec![filter("id", "gte", "0"), raw.clone()],
+            vec![filter("_all", "query", "items.0.kind:rare AND User:upper")],
+            vec![filter("_all", "query", "catalogneedle"), raw.clone()],
+            vec![filter("derived_user", "equals_exact", "lower"), raw.clone()],
+            vec![filter("_all", "contains", " needle ")],
+            vec![filter("_all", "contains", "negado")],
+            vec![filter("_all", "not_contains", "negado")],
+            vec![filter("_all", "regex", "^needle\\n")],
+        ];
+        let events: Vec<_> = (0..index.lines.len()).map(|id| source.event(id)).collect();
+        assert!(events.last().unwrap().message.contains("negado"));
+        assert!(!events.last().unwrap().raw.contains("negado"));
+        for filters in workloads {
+            let pfs = prepared(&filters);
+            let plan = session.schema.plan(&pfs);
+            assert!(!plan.exact(), "fixture must exercise residual confirmation: {}", serde_json::to_string(&filters).unwrap());
+            let reuse_safe = plan.lines.is_empty();
+            for sort in ["id", "timestamp", "user"] {
+                for direction in ["asc", "desc"] {
+                    session.selections.lock().clear();
+                    session.collect_garbage().unwrap();
+                    let mut expected: Vec<_> = events.iter().filter(|event| pfs.iter().all(|pf| crate::query::matches_indexed(event, pf))).map(|event| event.id).collect();
+                    match sort {
+                        "id" => if direction == "desc" { expected.reverse(); },
+                        "timestamp" => expected.sort_by(|&a, &b| {
+                            let order = index.lines.at(a).ts.cmp(&index.lines.at(b).ts);
+                            (if direction == "desc" { order.reverse() } else { order }).then(a.cmp(&b))
+                        }),
+                        _ => crate::query::sort_indices(&events, &mut expected, sort, direction == "desc"),
+                    }
+                    // Sparse id ordering must continue beyond the 1,024-row
+                    // candidate batch to establish the second match.
+                    let limit = if filters[0].column == "id" { 1 } else { 31 };
+                    let mut offset = 0;
+                    let mut cursor: Option<String> = None;
+                    let mut cold = Vec::new();
+                    loop {
+                        let page = select_page(&source, &pfs, sort, direction, offset, limit, cursor.as_deref()).unwrap().unwrap();
+                        assert_eq!(page.ids, expected.iter().skip(offset).take(limit).copied().collect::<Vec<_>>(), "cold {sort} {direction}");
+                        assert_eq!(page.has_more, offset + page.ids.len() < expected.len());
+                        let next = page.next_cursor.clone();
+                        let more = page.has_more;
+                        cold.push((offset, cursor, page));
+                        if !more { break; }
+                        offset += limit;
+                        cursor = next;
+                    }
+                    let key = complete_selection_key(&session, &pfs).unwrap();
+                    assert!(session.cached_selection(&key).is_none(), "cold paging must not materialize a complete selection");
+                    let random_offset = expected.len().min(13);
+                    let random_cold = select_page(&source, &pfs, sort, direction, random_offset, limit, None).unwrap().unwrap();
+                    let count = count_session(&session, &source, &pfs).unwrap();
+                    if reuse_safe {
+                        assert_eq!(count, expected.len());
+                        assert!(session.cached_selection(&key).is_some());
+                    }
+                    let PageScope::Planned { scope, verify, .. } = page_scope(&session, &source, &pfs, false).unwrap() else { panic!("not a singleton") };
+                    assert_eq!(scope._selection.is_some(), reuse_safe);
+                    assert_eq!(verify.is_empty(), reuse_safe);
+                    drop(scope);
+                    // Reverse replay covers previous-page navigation; each
+                    // cursor was minted before the completed selection existed.
+                    for (offset, cursor, cold_page) in cold.iter().rev() {
+                        let warm = select_page(&source, &pfs, sort, direction, *offset, limit, cursor.as_deref()).unwrap().unwrap();
+                        assert_eq!(warm.ids, cold_page.ids, "warm {sort} {direction}");
+                        assert_eq!(warm.total, cold_page.total);
+                        assert_eq!(warm.has_more, cold_page.has_more);
+                        assert_eq!(warm.next_cursor, cold_page.next_cursor);
+                    }
+                    let random_warm = select_page(&source, &pfs, sort, direction, random_offset, limit, None).unwrap().unwrap();
+                    assert_eq!(random_warm.ids, random_cold.ids);
+                    assert_eq!(random_warm.next_cursor, random_cold.next_cursor);
+                    if let Some(cursor) = cold[0].2.next_cursor.as_deref() {
+                        let changed = prepared(&[filter("raw", "contains", "changed")]);
+                        let error = select_page(&source, &changed, sort, direction, 0, limit, Some(cursor)).unwrap().err().unwrap();
+                        assert!(error.starts_with("PAGINATION_RESET_REQUIRED:"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hydrated_page_releases_raw_capacity_and_preserves_full_evidence_values() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wide-page.jsonl");
@@ -2651,9 +3243,7 @@ mod page_payload_tests {
         // original. Typed transform pipelines deliberately reject that collision.
         let derived = vec![CompiledDerived {
             name:"payload".into(), source:"encoded".into(),
-            rules:vec![crate::sources::CompiledRule {
-                re:regex::Regex::new("^(.*)$").unwrap(), template:None, filter:None,
-            }], steps:Vec::new(), lookup:None,
+            rules:vec![crate::sources::CompiledRule::new(regex::Regex::new("^(.*)$").unwrap(), None, None).unwrap()], steps:Vec::new(), lookup:None,
         }];
         let source = Source { idx:&index, codes:&config, system:&config, derived:&derived };
         let original = source.event(0);
@@ -2798,6 +3388,8 @@ struct SeriesTopK<T: Ord> {
     key_bytes: usize,
     base_bytes: usize,
     byte_limit: usize,
+    accounted: usize,
+    admission: Option<Arc<crate::analysis_runtime::Admitted>>,
 }
 
 impl<T: Ord> SeriesTopK<T> {
@@ -2805,11 +3397,18 @@ impl<T: Ord> SeriesTopK<T> {
         let base_bytes = limit.saturating_add(1).saturating_mul(std::mem::size_of::<(T, usize)>());
         let byte_limit = crate::resources::analytics_bytes();
         Self::check_bytes(base_bytes, byte_limit)?;
-        Ok(Self { heap: BinaryHeap::with_capacity(limit), limit, key_bytes: 0, base_bytes, byte_limit })
+        let admission = crate::analysis_runtime::current();
+        if let Some(admitted) = &admission { admitted.retain_resource_bytes(base_bytes)?; }
+        Ok(Self { heap: BinaryHeap::with_capacity(limit), limit, key_bytes: 0, base_bytes, byte_limit, accounted: base_bytes, admission })
     }
 
     fn push(&mut self, rank: T, bytes: usize) -> Result<()> {
-        Self::check_bytes(self.base_bytes.saturating_add(self.key_bytes).saturating_add(bytes), self.byte_limit)?;
+        let peak = self.base_bytes.saturating_add(self.key_bytes).saturating_add(bytes);
+        Self::check_bytes(peak, self.byte_limit)?;
+        if peak > self.accounted {
+            if let Some(admitted) = &self.admission { admitted.retain_resource_bytes(peak - self.accounted)?; }
+            self.accounted = peak;
+        }
         if self.limit == 0 { return Ok(()); }
         if self.heap.len() == self.limit {
             if rank >= self.heap.peek().expect("nonempty top groups").0 { return Ok(()); }
@@ -3539,6 +4138,10 @@ fn transfer_events<E: Send, T>(
     produce: impl FnOnce(&mut dyn FnMut(E, usize) -> Result<()>) -> Result<()> + Send,
     consume: impl FnOnce(&mut dyn Iterator<Item = E>) -> T,
 ) -> Result<T> {
+    if crate::global_scheduler::current().is_none() {
+        return crate::global_scheduler::run(None, crate::global_scheduler::Priority::Normal, &crate::operations::cancelled,
+            || transfer_events(batch_rows, batch_bytes, work, produce, consume))?;
+    }
     let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<E>>(1);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
@@ -3575,7 +4178,7 @@ fn transfer_events<E: Send, T>(
                                 || bytes.saturating_add(size) > batch_bytes)
                         {
                             work.batch(batch.len(), bytes);
-                            if sender.send(std::mem::take(&mut batch)).is_err() {
+                            if crate::global_scheduler::blocking(|| sender.send(std::mem::take(&mut batch))).is_err() {
                                 worker_stop.store(true, Ordering::Relaxed);
                                 return Err("Operação cancelada.".into());
                             }
@@ -3587,7 +4190,7 @@ fn transfer_events<E: Send, T>(
                     })?;
                     if !batch.is_empty() {
                         work.batch(batch.len(), bytes);
-                        let _ = sender.send(batch);
+                        let _ = crate::global_scheduler::blocking(|| sender.send(batch));
                     }
                     Ok(())
                 })
@@ -3602,16 +4205,17 @@ fn transfer_events<E: Send, T>(
                 }
             })
             .map_err(|error| error.to_string())?;
-        let mut events = receiver.into_iter().flatten();
+        let mut events = std::iter::from_fn(move || crate::global_scheduler::blocking(|| receiver.recv().ok())).flatten();
         let stop_guard = StopProducer(stop);
-        let result = consume(&mut events);
+        // A consumer panic must close the channel and hand off its lane
+        // before scoped threads are joined during unwinding.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| consume(&mut events)));
         drop(stop_guard);
         drop(events);
-        producer
-            .join()
+        crate::global_scheduler::blocking(|| producer.join())
             .map_err(|_| "Falha ao ler o motor de consultas.".to_string())??;
         crate::operations::check()?;
-        Ok(result)
+        match result { Ok(value) => Ok(value), Err(panic) => std::panic::resume_unwind(panic) }
     })
 }
 
@@ -3619,6 +4223,31 @@ fn transfer_events<E: Send, T>(
 mod light_transfer_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn single_slot_stream_handles_full_channel_early_return_and_consumer_panic() {
+        crate::global_scheduler::with_limit(1, || {
+            let work = LightStreamWork::default();
+            let values = transfer_events(2, 32, &work, |send| {
+                for n in 0..100 { send(n, 8)?; }
+                Ok(())
+            }, |events| events.collect::<Vec<_>>()).unwrap();
+            assert_eq!(values, (0..100).collect::<Vec<_>>());
+            let first = transfer_events(2, 32, &work, |send| {
+                for n in 0..100 { send(n, 8)?; }
+                Ok(())
+            }, |events| events.next()).unwrap();
+            assert_eq!(first, Some(0));
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                transfer_events(2, 32, &work, |send| {
+                    for n in 0..100 { send(n, 8)?; }
+                    Ok(())
+                }, |events| { assert_eq!(events.next(), Some(0)); panic!("controlled stream consumer panic"); })
+            }));
+            assert!(panic.is_err());
+            assert_eq!(transfer_events(2, 32, &work, |send| send(7, 8), |events| events.sum::<i32>()).unwrap(), 7);
+        });
+    }
 
     #[test]
     fn light_transfer_preserves_order_with_row_and_byte_bounds() {

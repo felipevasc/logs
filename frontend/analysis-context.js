@@ -103,9 +103,12 @@ window.AnalysisContexts = (() => {
       if (!request) {
         request = (async () => {
           if (!await saveCases()) throw new Error("Salve o Caso antes de consultar sua análise.");
-          assertOwner(owner, { revisions: false });
+          // Persistence belongs to the Case instance, not the first caller's
+          // source. A reset while saving must not poison a current waiter.
+          // Each caller still validates its active source after this shared work.
+          assertOwner(owner, { revisions: false, active: false });
           if (!context(owner.caseId)) await refresh(owner.caseId, { owner });
-          assertOwner(owner, { revisions: false });
+          assertOwner(owner, { revisions: false, active: false });
           if (!context(owner.caseId)) preparedLegacy.add(item);
         })();
         preparations.set(owner.instance, request);

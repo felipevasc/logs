@@ -3,7 +3,15 @@
   'use strict';
   const severity = {high:'Alta',medium:'Média',low:'Baixa'};
   const kinds = {attempt:'Tentativa',response:'Resposta',indicator:'Indicador'};
-  let inspectorRequest=0;
+  let inspectorRequest=0, catalogView=null;
+  function updateCatalogOwner() {
+    if (!catalogView?.box.isConnected) { catalogView=null; return; }
+    const owner=catalogView.owner();let stale=false;
+    try { window.AnalysisContexts.assertOwner(owner); } catch { stale=true; }
+    catalogView.notice.textContent=`Catálogo do Caso ${owner.caseId || "sem identificação"}${stale ? " · O Caso ou a configuração mudou. Reabra Regras para editar o Caso ativo." : ""}`;
+    if(stale)for(const control of catalogView.box.querySelectorAll('button, textarea'))control.disabled=true;
+  }
+  for(const event of ['workspace-context-change','analysis-context-change'])document.addEventListener(event,updateCatalogOwner);
   const emptyView=()=>({category:'',severity:'',kind:'',search:'',page:0});
   const view=emptyView(),views=new Map();
   let viewKey='';
@@ -21,23 +29,31 @@
     inspectorRequest++;openContextInspector(title,subtitle,body);$('.detail-quick-actions').hidden=true;
     return inspectorRequest;
   }
-  function catalogDetails(catalog) {
+  function catalogDetails(catalog, owner = window.AnalysisContexts.capture()) {
+    try { window.AnalysisContexts.assertOwner(owner); } catch(error) { toast(String(error),"err"); return; }
     const box=el('div','threat-catalog');let token;
     box.append(el('h3','',catalog.name||'Catálogo de ameaças'),el('p','',`${fmtNum(catalog.enabled||0)} regras ativas · ${(catalog.categories||[]).length} categorias`));
     const path=el('code','threat-path',catalog.path||'');box.append(path);
-    box.append(button('Copiar caminho',()=>navigator.clipboard.writeText(catalog.path||'').then(()=>toast('Caminho copiado.')).catch(()=>toast('Não foi possível copiar.','err'))));
-    if(catalog.preview)box.append(el('p','discovery-explain','Prévia: este é o arquivo base do projeto. Atualizações de teste ficam apenas nesta sessão do navegador.'));
-    box.append(el('p','discovery-explain','Edite o JSON e use Recalcular. Mantenha IDs estáveis; enabled: false desativa uma regra. Regex inválida interrompe a análise e informa a regra.'));
+
+    if(catalog.preview)box.append(el('p','discovery-explain','Prévia sintética: as alterações são salvas somente no Caso de demonstração.'));
+    box.append(el('p','discovery-explain','As alterações e desativações abaixo pertencem somente a este Caso. Mantenha IDs estáveis; regex inválida impede o salvamento.'));
+    const editor=el('textarea','source-mapping-editor');editor.setAttribute('aria-label','Catálogo de ameaças deste Caso (JSON)');editor.value=JSON.stringify({version:catalog.version||1,name:catalog.name||'Catálogo de ameaças',rules:catalog.rules||[]},null,2);box.append(editor);
+    box.append(button('Salvar catálogo do Caso',async()=>{
+      try{window.AnalysisContexts.assertOwner(owner);const result=await api('threat_catalog_update',{catalogJson:editor.value},{analysisOwner:owner});window.AnalysisContexts.assertOwner(owner,{revisions:false});owner=window.AnalysisContexts.capture();window.Discovery?.clearCache();if(box.isConnected&&token===inspectorRequest)catalogDetails(result.catalog,owner);toast('Catálogo salvo neste Caso.','ok');}
+      catch(error){box.append(el('p','threat-error',String(error)));}
+    },'btn primary small'));
     if(catalog.error)box.append(el('p','threat-error',catalog.error));
     if(!catalog.error&&catalog.updates_available>0){
-      box.append(el('p','discovery-explain','A atualização adiciona somente IDs novos. Suas regras, alterações e regras desativadas são preservadas; o aplicativo salva uma cópia de segurança.'));
+      box.append(el('p','discovery-explain','A atualização adiciona somente IDs novos. Suas regras, alterações e regras desativadas são preservadas no Caso.'));
       const update=button(`Adicionar ${fmtNum(catalog.updates_available)} regras novas`,async()=>{
         update.disabled=true;
         try{
-          const result=await api('threat_catalog_update',{});
+          window.AnalysisContexts.assertOwner(owner);
+          const result=await api('threat_catalog_update',{}, {analysisOwner:owner});
+          window.AnalysisContexts.assertOwner(owner,{revisions:false});owner=window.AnalysisContexts.capture();
           window.Discovery?.clearCache();
           if(token!==inspectorRequest||!box.isConnected||$('#drawer').hidden){toast(`${fmtNum(result.added)} regras adicionadas.`);return;}
-          catalogDetails(result.catalog);
+          catalogDetails(result.catalog,owner);
           if(result.backup_path)document.querySelector('.threat-catalog')?.append(el('p','discovery-explain',`Backup: ${result.backup_path}`));
           toast(`${fmtNum(result.added)} regras adicionadas.`);
           await renderDashboard(state.analyticsScope);
@@ -46,7 +62,8 @@
     }
     const details=el('details');details.append(el('summary','','Categorias'));
     for(const category of catalog.categories||[])details.append(el('p','',category));box.append(details);
-    token=inspector('Regras','Arquivo local editável',box);
+    const notice=el('p','discovery-explain');box.prepend(notice);catalogView={box,notice,owner:()=>owner};
+    token=inspector('Regras','Catálogo isolado deste Caso',box);updateCatalogOwner();
   }
   async function evidence(event,scope,current) {
     if(!current())return;
@@ -100,9 +117,10 @@
     useContext(scope);
     const key=viewKey,current=()=>isCurrent()&&key===viewKey&&key===contextKey(scope)&&(!window.WorkspaceContext||window.WorkspaceContext.scope()===scope);
     let catalog;
-    try{catalog=await api('threat_catalog',{}, {silent:true});}catch(error){catalog={error:String(error),rules:[]};}
+    const catalogOwner=await window.AnalysisContexts.prepare(window.AnalysisContexts.capture(),{metadata:true});
+    try{catalog=await api('threat_catalog',{}, {silent:true,analysisOwner:catalogOwner});}catch(error){catalog={error:String(error),rules:[]};}
     if(!current())return;
-    const tools=el('div','threat-tools');tools.append(button('Regras',()=>catalogDetails(catalog)));
+    const tools=el('div','threat-tools');tools.append(button('Regras',()=>catalogDetails(catalog,catalogOwner)));
     const help=infoButton('Ameaças','Correspondências com regras locais são indícios, não confirmação de invasão. Conteúdo bloqueado, testes autorizados e texto citado também podem corresponder. Alta, média e baixa expressam a prioridade da regra; não a probabilidade de comprometimento. O catálogo é editável e não cobre todas as técnicas. Um registro pode corresponder a várias regras.');tools.append(help);
     if(catalog.error){grid.innerHTML='';grid.append(tools,el('p','threat-error',catalog.error));return;}
     let data;

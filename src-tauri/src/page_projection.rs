@@ -703,7 +703,7 @@ pub(crate) fn visit_native_dataset_rows(
     crate::operations::check()?;
     admitted.validate(state)?;
     admitted.validate_visibility()?;
-    receipt.validate_catalogs(&state.codes.read(), &state.system_codes.read())?;
+    receipt.validate_catalogs(&crate::analysis_runtime::codes(&state), &crate::analysis_runtime::system_codes(&state))?;
     Ok(())
 }
 
@@ -759,8 +759,8 @@ fn with_exact_rows<T>(
         return Err(crate::analysis_runtime::STALE.into());
     }
     let source = crate::analysis_runtime::source(state);
-    let codes = state.codes.read();
-    let system = state.system_codes.read();
+    let codes = crate::analysis_runtime::codes(&state);
+    let system = crate::analysis_runtime::system_codes(&state);
     receipt.validate_admitted(admitted, &codes, &system)?;
     let derived = crate::analysis_runtime::derived(state);
     if derived.len() > MAX_DERIVED {
@@ -820,7 +820,7 @@ fn with_exact_rows<T>(
     // No partial success if an identity or visibility mutation raced hydration.
     admitted.validate(state)?;
     admitted.validate_visibility()?;
-    receipt.validate_catalogs(&state.codes.read(), &state.system_codes.read())?;
+    receipt.validate_catalogs(&crate::analysis_runtime::codes(&state), &crate::analysis_runtime::system_codes(&state))?;
     Ok(result)
 }
 
@@ -1639,14 +1639,14 @@ mod admitted_action_tests {
                 crate::source_publication::receipt_locked(&self.state).generation
             };
             let admitted = analysis_runtime::capture(&self.state, Some(self.identity.clone()), Some(generation), Mode::Dataset).unwrap();
-            let receipt = Receipt::from_admitted(&admitted, &self.state.codes.read(), &self.state.system_codes.read()).unwrap();
+            let receipt = Receipt::from_admitted(&admitted, &admitted.interpretation.codes, &admitted.interpretation.system_codes).unwrap();
             analysis_runtime::with(Some(admitted.clone()), || admitted.prepare_visibility(None)).unwrap();
             (admitted, receipt)
         }
         fn capture_case(&self, key: &str, events: Vec<Event>) -> (Arc<Admitted>, Receipt, Vec<Event>) {
             tauri::async_runtime::block_on(crate::case_cache::case_sync(key.into(), events, Some(self.identity.clone()))).unwrap();
             let (admitted, events) = analysis_runtime::capture_case(&self.state, Some(self.identity.clone()), None, None, Some(key.into())).unwrap();
-            let receipt = Receipt::from_admitted(&admitted, &self.state.codes.read(), &self.state.system_codes.read()).unwrap();
+            let receipt = Receipt::from_admitted(&admitted, &admitted.interpretation.codes, &admitted.interpretation.system_codes).unwrap();
             let events = analysis_runtime::with(Some(admitted.clone()), || admitted.prepare_visibility(events)).unwrap().unwrap();
             (admitted, receipt, events)
         }
@@ -1713,13 +1713,15 @@ mod admitted_action_tests {
 
     #[test]
     fn real_catalog_publication_rejects_old_receipt_and_fresh_receipt_reads_new_value() {
-        let fixture = Fixture::new(vec![event(0)]);
+        let mut fixture = Fixture::new(vec![event(0)]);
         let (admitted, receipt) = fixture.capture();
-        crate::save_codes_impl(&fixture.state, r#"{"service":{"200":{"name":"updated","description":"new catalog"}}}"#).unwrap();
+        let editor = crate::case_editor_admission(&fixture.state, Some(fixture.identity.clone())).unwrap();
+        let saved = analysis_runtime::with(Some(editor), || crate::save_codes_impl(&fixture.state, r#"{"service":{"200":{"name":"updated","description":"new catalog"}}}"#)).unwrap();
+        fixture.identity = saved.analysis_context.identity();
         fixture.assert_stale_actions(&admitted, &receipt, &row(0));
         let (fresh, current) = fixture.capture();
         assert_ne!(current.catalog_signature, receipt.catalog_signature);
-        assert_ne!(current.catalog_epoch, receipt.catalog_epoch);
+        assert_ne!(current.analysis_context.config_revision, receipt.analysis_context.config_revision);
         analysis_runtime::with(Some(fresh.clone()), || {
             let field = hydrate_projected_field(&fixture.state, &fresh, &current, &row(0), "name", None).unwrap();
             assert_eq!(field.canonical_text.as_deref(), Some("updated"));

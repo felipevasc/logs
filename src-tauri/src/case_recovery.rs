@@ -121,6 +121,14 @@ const FORMAT: u32 = 1;
 const MANIFEST_LIMIT: usize = 8 << 20;
 const ENTRY_LIMIT: usize = 16_384;
 const TOTAL_LIMIT: u64 = 32 << 30;
+// Recovery preserves raw legacy definitions even when the interpretation
+// reader refuses their smaller 2/3 MiB limits. Never turn an excessive or
+// malformed original into a missing file in the verified migration snapshot.
+const LEGACY_INTERPRETATION_BYTES: u64 = 64 << 20;
+const LEGACY_INTERPRETATION_FILES: [&str; 7] = [
+    "codes.json", "system_codes.json", "ts_configs.json", "formats.json",
+    "detections.json", "detection-rules.json", "threat-rules.json",
+];
 const COPY_BUFFER: usize = 256 << 10;
 const INVALID: &str =
     "CASE_RECOVERY_INVALID: A cópia de recuperação está incompleta ou foi alterada.";
@@ -154,6 +162,8 @@ pub(crate) struct Asset {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Manifest {
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interpretation_assets_version: Option<u32>,
     id: String,
     authority: AuthoritySnapshot,
     database: Asset,
@@ -301,6 +311,11 @@ impl VerifiedRecovery {
     }
     pub(crate) fn snapshot_assets_root(&self) -> PathBuf {
         self.directory.join("assets")
+    }
+    /// Old recovery generations predate the complete legacy interpretation
+    /// closure. Absence there cannot prove the source profile had no settings.
+    pub(crate) fn has_interpretation_assets(&self) -> bool {
+        self.manifest.interpretation_assets_version == Some(1)
     }
     pub(crate) fn snapshot_database_path(&self) -> PathBuf {
         self.directory.join("investigations.sqlite3")
@@ -673,6 +688,7 @@ fn prepare_with(
         .map_err(|e| e.to_string())?;
     let preflight = Manifest {
         version: FORMAT,
+        interpretation_assets_version: Some(1),
         id: uuid::Uuid::nil().to_string(),
         authority: authority.clone(),
         database: Asset {
@@ -707,6 +723,7 @@ fn prepare_with(
     let id = uuid::Uuid::new_v4().to_string();
     let manifest = Manifest {
         version: FORMAT,
+        interpretation_assets_version: Some(1),
         id: id.clone(),
         authority,
         database: Asset {
@@ -789,6 +806,10 @@ fn asset_path(value: &str) -> Result<&Path, String> {
                 )
         }
         ["derived_fields.json"] => true,
+        [name] if LEGACY_INTERPRETATION_FILES.contains(name) => true,
+        ["sigma", rest @ ..] if !rest.is_empty() => path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("yml") || extension.eq_ignore_ascii_case("yaml")
+        }),
         _ => false,
     };
     if !valid {
@@ -842,6 +863,56 @@ fn describe(root: &Path, name: &str, limit: u64, work: &Work<'_>) -> Result<Asse
         bytes,
         sha256: hash_reader(&mut file, bytes, work)?,
     })
+}
+
+fn legacy_interpretation_dependencies(
+    root: &Path,
+    work: &Work<'_>,
+    emit: &mut dyn FnMut(Asset) -> Result<(), String>,
+) -> Result<(), String> {
+    for name in LEGACY_INTERPRETATION_FILES {
+        work.check()?;
+        match std::fs::symlink_metadata(root.join(name)) {
+            Ok(_) => emit(describe(root, name, LEGACY_INTERPRETATION_BYTES, work)?)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let sigma = root.join("sigma");
+    match std::fs::symlink_metadata(&sigma) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            return Err(INVALID.into());
+        }
+        Ok(_) => (),
+    }
+    let mut pending = vec![sigma];
+    let mut examined = 0usize;
+    while let Some(directory) = pending.pop() {
+        work.check()?;
+        for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
+            work.check()?;
+            examined = examined.checked_add(1).filter(|count| *count <= ENTRY_LIMIT).ok_or(LIMIT)?;
+            let entry = entry.map_err(|error| error.to_string())?;
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            // Match the Sigma reader's rule discovery without following links
+            // into arbitrary directories outside the selected profile.
+            if kind.is_symlink() { continue; }
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("yml") || extension.eq_ignore_ascii_case("yaml")
+            }) {
+                if !kind.is_file() { return Err(INVALID.into()); }
+                let name = path.strip_prefix(root).map_err(|_| INVALID)?
+                    .to_str().ok_or(INVALID)?.replace('\\', "/");
+                emit(describe(root, &name, LEGACY_INTERPRETATION_BYTES, work)?)?;
+            }
+        }
+    }
+    Ok(())
 }
 fn image_ids(text: &str) -> Result<BTreeSet<String>, String> {
     let raw = crate::case_evidence::checked_document(text)?;
@@ -1087,6 +1158,7 @@ fn enumerate_dependencies(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
     }
+    legacy_interpretation_dependencies(root, work, &mut add)?;
     Ok(unavailable)
 }
 
@@ -1100,6 +1172,7 @@ pub(crate) fn prepare(root: &Path, work: &Work<'_>) -> Result<VerifiedRecovery, 
 
 fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
     if manifest.version != FORMAT
+        || manifest.interpretation_assets_version.is_some_and(|version| version != 1)
         || uuid::Uuid::parse_str(&manifest.id).is_err()
         || manifest.database.relative_path != "investigations.sqlite3"
         || !valid_hash(&manifest.database.sha256)
@@ -1203,6 +1276,59 @@ mod tests {
                 .unwrap(),
             body
         );
+    }
+    #[test]
+    fn recovery_preserves_all_legacy_interpretation_bytes_and_nested_sigma() {
+        let root = profile();
+        for name in LEGACY_INTERPRETATION_FILES {
+            std::fs::write(root.path().join(name), format!("malformed original: {name}\n")).unwrap();
+        }
+        // Too large for activation, but still recoverable as exact raw input.
+        let oversized = vec![b'x'; (3 << 20) + 1];
+        std::fs::write(root.path().join("codes.json"), &oversized).unwrap();
+        std::fs::create_dir_all(root.path().join("sigma/windows")).unwrap();
+        std::fs::write(root.path().join("sigma/windows/rule.YAML"), b"invalid: [ original\n").unwrap();
+        std::fs::write(root.path().join("sigma/README.txt"), b"not an active Sigma source").unwrap();
+        let recovery = prepare(root.path(), &work()).unwrap();
+        assert!(recovery.has_interpretation_assets());
+        assert_eq!(recovery.manifest.assets.len(), LEGACY_INTERPRETATION_FILES.len() + 1);
+        let assets = recovery.snapshot_assets_root();
+        for name in LEGACY_INTERPRETATION_FILES {
+            assert_eq!(std::fs::read(assets.join(name)).unwrap(), std::fs::read(root.path().join(name)).unwrap());
+        }
+        assert_eq!(std::fs::read(assets.join("sigma/windows/rule.YAML")).unwrap(), b"invalid: [ original\n");
+        assert!(!assets.join("sigma/README.txt").exists());
+        let (_, diagnostics) = crate::case_interpretation::local_legacy(&assets);
+        assert!(diagnostics.iter().any(|issue| issue.code == "legacy_interpretation_unavailable_codes"));
+        assert!(diagnostics.iter().any(|issue| issue.code == "legacy_interpretation_unavailable_security_sigma"));
+        std::fs::write(root.path().join("codes.json"), b"later live edit").unwrap();
+        recovery.validate().unwrap();
+        assert_eq!(std::fs::read(assets.join("codes.json")).unwrap(), oversized);
+    }
+    #[test]
+    fn recovery_manifest_distinguishes_legacy_unknown_from_verified_absence() {
+        let root = profile();
+        let recovery = prepare(root.path(), &work()).unwrap();
+        assert!(recovery.has_interpretation_assets());
+        assert!(recovery.manifest.assets.is_empty());
+        let mut encoded = serde_json::to_value(&recovery.manifest).unwrap();
+        encoded.as_object_mut().unwrap().remove("interpretationAssetsVersion");
+        let mut legacy: Manifest = serde_json::from_value(encoded).unwrap();
+        assert!(legacy.interpretation_assets_version.is_none());
+        validate_manifest(&legacy).unwrap();
+        legacy.interpretation_assets_version = Some(2);
+        assert!(validate_manifest(&legacy).is_err());
+    }
+    #[test]
+    fn recovery_refuses_excessive_legacy_assets_without_replacing_originals() {
+        let root = profile();
+        let path = root.path().join("codes.json");
+        let file = File::create(&path).unwrap();
+        file.set_len(LEGACY_INTERPRETATION_BYTES + 1).unwrap();
+        drop(file);
+        let error = prepare(root.path(), &work()).err().unwrap();
+        assert!(error.contains("CASE_RECOVERY_LIMIT"));
+        assert_eq!(std::fs::metadata(path).unwrap().len(), LEGACY_INTERPRETATION_BYTES + 1);
     }
     #[test]
     fn cancellation_and_corrupt_copy_do_not_adopt_or_change_original_database() {
@@ -1352,6 +1478,10 @@ mod tests {
             "references-v1/a/b/source.jsonl",
             "case-images/a\\b",
             "case-bootstrap-v1/not-a-hash/cases.json",
+            "sigma/../codes.json",
+            "sigma/private.json",
+            "sigma/rule.yaml/../other.yaml",
+            "credentials.json",
         ] {
             assert!(asset_path(path).is_err(), "{path}");
         }
@@ -1360,6 +1490,25 @@ mod tests {
             assert!(asset_path(&format!("case-bootstrap-v1/{}/{name}", "a".repeat(64))).is_ok());
         }
         assert!(asset_path(&format!("case-bootstrap-v1/{}/other.json", "a".repeat(64))).is_err());
+        for name in LEGACY_INTERPRETATION_FILES { assert!(asset_path(name).is_ok()); }
+        assert!(asset_path("sigma/windows/subdirectory/rule.YAML").is_ok());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn interpretation_recovery_never_follows_sigma_or_catalog_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root = profile();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("private.yaml"), b"not authorized as a profile rule").unwrap();
+        std::fs::create_dir(root.path().join("sigma")).unwrap();
+        symlink(outside.path(), root.path().join("sigma/external")).unwrap();
+        symlink(outside.path().join("private.yaml"), root.path().join("sigma/linked.yaml")).unwrap();
+        let recovery = prepare(root.path(), &work()).unwrap();
+        assert!(recovery.manifest.assets.is_empty());
+        assert!(!recovery.snapshot_assets_root().join("sigma/external/private.yaml").exists());
+        symlink(outside.path().join("private.yaml"), root.path().join("codes.json")).unwrap();
+        assert!(prepare(root.path(), &work()).is_err());
+        assert_eq!(std::fs::read(outside.path().join("private.yaml")).unwrap(), b"not authorized as a profile rule");
     }
     #[cfg(unix)]
     #[test]

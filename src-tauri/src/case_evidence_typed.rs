@@ -157,6 +157,8 @@ struct SnapshotDef {
     #[serde(with = "ConfigDef")]
     config: crate::analysis_context::Config,
     #[serde(default)]
+    interpretation: Option<crate::case_interpretation::Settings>,
+    #[serde(default)]
     migration_diagnostics: Vec<crate::analysis_context::Diagnostic>,
     #[serde(default, deserialize_with = "deserialize_optional_value")]
     legacy_raw: Option<Value>,
@@ -202,6 +204,7 @@ mod tests {
                 derived_fields: vec![literal_fixture()],
                 references: vec![],
             },
+            interpretation: None,
             migration_diagnostics: vec![],
             legacy_raw: Some(literal_fixture()),
         }

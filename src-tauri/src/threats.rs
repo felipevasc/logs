@@ -82,6 +82,7 @@ struct Cached {
     result: Result<Arc<CompiledCatalog>, String>,
 }
 static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+#[cfg(test)]
 static UPDATE_LOCK: Mutex<()> = Mutex::new(());
 
 fn compile(bytes: &[u8]) -> Result<Arc<CompiledCatalog>, String> {
@@ -154,9 +155,7 @@ fn compile(bytes: &[u8]) -> Result<Arc<CompiledCatalog>, String> {
     Ok(Arc::new(CompiledCatalog { file, regexes, set, enabled }))
 }
 
-fn path() -> PathBuf {
-    crate::config_dir().join("threat-rules.json")
-}
+#[cfg(test)]
 fn load_path(path: &Path) -> Result<Arc<CompiledCatalog>, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Não foi possível preparar o catálogo: {e}"))?;
@@ -197,8 +196,28 @@ pub(crate) fn builtin_catalog() -> Arc<CompiledCatalog> {
 }
 
 /// The active editable catalog (compiled once and cached by content hash).
+pub(crate) fn compile_snapshot(text: &str) -> Result<Arc<CompiledCatalog>, String> {
+    let hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+    if let Some(cached) = CACHE
+        .lock()
+        .as_ref()
+        .filter(|entry| entry.path.as_os_str().is_empty() && entry.hash == hash)
+    {
+        return cached.result.clone();
+    }
+    let result = compile(text.as_bytes());
+    operations::check()?;
+    *CACHE.lock() = Some(Cached {
+        path: PathBuf::new(),
+        hash,
+        result: result.clone(),
+    });
+    result
+}
 pub(crate) fn load_active() -> Result<Arc<CompiledCatalog>, String> {
-    load_path(&path())
+    crate::case_security::with(|security| {
+        compile_snapshot(security.threat_catalog_json.as_deref().unwrap_or(BUILTIN))
+    })
 }
 
 fn bundled_attack() -> &'static std::collections::HashMap<String, Vec<String>> {
@@ -294,7 +313,7 @@ pub(crate) struct RuleMatcher {
     rule: Option<usize>,
 }
 pub(crate) fn matcher(id: &str, catalog: Option<Arc<CompiledCatalog>>) -> Result<RuleMatcher, String> {
-    let catalog = catalog.map(Ok).unwrap_or_else(|| load_path(&path()))?;
+    let catalog = catalog.map(Ok).unwrap_or_else(load_active)?;
     let rule = if id == "*" {
         None
     } else {
@@ -595,9 +614,13 @@ fn info_for(path: &Path, catalog: &CompiledCatalog, bundled: &CatalogFile) -> Ca
     }
 }
 fn catalog_info() -> CatalogInfo {
-    let path = path();
-    match load_path(&path) {
-        Ok(catalog) => info_for(&path, &catalog, &serde_json::from_str(BUILTIN).expect("bundled catalog JSON")),
+    let path = PathBuf::from("Catálogo preservado neste Caso");
+    match load_active() {
+        Ok(catalog) => info_for(
+            &path,
+            &catalog,
+            &serde_json::from_str(BUILTIN).expect("bundled catalog JSON"),
+        ),
         Err(error) => CatalogInfo {
             path: path.to_string_lossy().into_owned(),
             name: "Catálogo de ameaças".into(),
@@ -616,7 +639,10 @@ pub struct CatalogUpdate {
     added: usize,
     backup_path: Option<String>,
     catalog: CatalogInfo,
+    #[serde(rename = "analysisContext", skip_serializing_if = "Option::is_none")]
+    analysis_context: Option<crate::analysis_context::Snapshot>,
 }
+#[cfg(test)]
 fn read_catalog_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     fs::File::open(path)
@@ -627,6 +653,7 @@ fn read_catalog_bytes(path: &Path) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
+#[cfg(test)]
 fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, String> {
     let _guard = UPDATE_LOCK.lock();
     let original = read_catalog_bytes(path)?;
@@ -637,7 +664,7 @@ fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, Str
     let additions: Vec<_> = bundled.rules.iter().filter(|rule| !ids.contains(rule.id.as_str())).cloned().collect();
     let added = additions.len();
     if added == 0 {
-        return Ok(CatalogUpdate { added, backup_path: None, catalog: info_for(path, &existing, &bundled) });
+        return Ok(CatalogUpdate { added, backup_path: None, analysis_context: None, catalog: info_for(path, &existing, &bundled) });
     }
     let mut merged = existing.file.clone();
     merged.rules.extend(additions);
@@ -680,6 +707,7 @@ fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, Str
     *CACHE.lock() =
         Some(Cached { path: path.to_owned(), hash: Sha256::digest(&bytes).into(), result: Ok(checked.clone()) });
     Ok(CatalogUpdate {
+        analysis_context: None,
         added,
         backup_path: Some(backup_path.to_string_lossy().into_owned()),
         catalog: info_for(path, &checked, &bundled),
@@ -821,8 +849,8 @@ fn visit(
     match &*source {
         SourceData::Memory(events) => memory(events),
         SourceData::Indexed(index) => {
-            let codes = state.codes.read();
-            let system = state.system_codes.read();
+            let codes = crate::analysis_runtime::codes(&state);
+            let system = crate::analysis_runtime::system_codes(&state);
             let derived = crate::analysis_runtime::derived(&state);
             query::visit_indexed_mapped(index, &prepared, &codes, &system, &derived, analyze, |_, event, (body, ids)| {
                 visitor(event, body, ids)
@@ -999,12 +1027,82 @@ fn events_impl(
 }
 
 #[tauri::command]
-pub async fn threat_catalog() -> Result<CatalogInfo, String> {
-    crate::offload(catalog_info).await
+pub async fn threat_catalog(
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: tauri::AppHandle,
+) -> Result<CatalogInfo, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, catalog_info).await
 }
 #[tauri::command]
-pub async fn threat_catalog_update() -> Result<CatalogUpdate, String> {
-    crate::offload(|| update_catalog_path(&path(), BUILTIN.as_bytes())).await?
+pub async fn threat_catalog_update(
+    catalog_json: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    app: tauri::AppHandle,
+) -> Result<CatalogUpdate, String> {
+    let identity = crate::analysis_commands::expected_identity(analysis_context)?;
+    let admitted = crate::analysis_runtime::capture_async(app.clone(),
+        Some(identity.clone()),
+        None,
+        crate::analysis_runtime::Mode::Metadata, None, crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_admitted(None, app, admitted, move || {
+        let mut added = 0;
+        let snapshot = crate::case_interpretation::update_domain(&identity, "security_threats", |settings| {
+            let text = match catalog_json {
+                Some(text) => {
+                    compile_snapshot(&text)?;
+                    text
+                }
+                None => {
+                    let mut existing: CatalogFile = serde_json::from_str(
+                        settings
+                            .security
+                            .threat_catalog_json
+                            .as_deref()
+                            .unwrap_or(BUILTIN),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let bundled: CatalogFile =
+                        serde_json::from_str(BUILTIN).map_err(|e| e.to_string())?;
+                    let ids: HashSet<_> =
+                        existing.rules.iter().map(|rule| rule.id.clone()).collect();
+                    let additions: Vec<_> = bundled
+                        .rules
+                        .into_iter()
+                        .filter(|rule| !ids.contains(&rule.id))
+                        .collect();
+                    added = additions.len();
+                    existing.rules.extend(additions);
+                    serde_json::to_string(&existing).map_err(|e| e.to_string())?
+                }
+            };
+            settings.security.threat_catalog_json = Some(text);
+            Ok(())
+        })?;
+        let security = &snapshot
+            .interpretation
+            .as_ref()
+            .ok_or("Interpretação indisponível")?
+            .security;
+        let compiled =
+            compile_snapshot(security.threat_catalog_json.as_deref().unwrap_or(BUILTIN))?;
+        let catalog = info_for(
+            Path::new("Catálogo preservado neste Caso"),
+            &compiled,
+            &serde_json::from_str(BUILTIN).expect("bundled catalog"),
+        );
+        Ok(CatalogUpdate {
+            added,
+            backup_path: None,
+            catalog,
+            analysis_context: Some(snapshot),
+        })
+    })
+    .await?
 }
 #[tauri::command]
 pub async fn threat_scan(
@@ -1015,16 +1113,15 @@ pub async fn threat_scan(
     source_generation: Option<u64>,
     app: tauri::AppHandle,
 ) -> Result<ScanResult, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
-        let path = path();
-        let catalog = load_path(&path)?;
+        let catalog = load_active()?;
         scan_impl(
             app.state::<AppState>().inner(),
             filters,
             case_events,
             catalog,
-            path.to_string_lossy().into_owned(),
+            "Catálogo preservado neste Caso".into(),
             |count| {
                 crate::emit_progress(Some(&app), "ameaças", "Conferindo regras locais", count, 0, "registros", true)
             },
@@ -1043,7 +1140,7 @@ pub async fn threat_events(
     limit: Option<usize>,
     app: tauri::AppHandle,
 ) -> Result<EventResult, String> {
-    let (admitted, case_events) = crate::analysis_runtime::capture_case(app.state::<AppState>().inner(), analysis_context, source_generation, case_events, case_key)?;
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
     crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
         events_impl(
             app.state::<AppState>().inner(),
@@ -1051,7 +1148,7 @@ pub async fn threat_events(
             case_events,
             offset.unwrap_or(0),
             limit.unwrap_or(100),
-            load_path(&path())?,
+            load_active()?,
         )
     })
     .await?

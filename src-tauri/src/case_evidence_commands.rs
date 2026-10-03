@@ -321,7 +321,7 @@ fn capture_source(state: &AppState, request: &SourceRequest) -> Result<SourceAdm
         return Err(INVALID.into());
     }
     let receipt =
-        Receipt::from_admitted(&admitted, &state.codes.read(), &state.system_codes.read())?;
+        Receipt::from_admitted(&admitted, &admitted.interpretation.codes, &admitted.interpretation.system_codes)?;
     Ok(SourceAdmission {
         admitted,
         receipt,
@@ -363,8 +363,8 @@ impl SourceAdmission {
         self.admitted.validate_visibility()?;
         self.receipt.validate_admitted(
             &self.admitted,
-            &state.codes.read(),
-            &state.system_codes.read(),
+            &self.admitted.interpretation.codes,
+            &self.admitted.interpretation.system_codes,
         )?;
         if let Some(native) = &self.native {
             native.validate()?;
@@ -531,8 +531,8 @@ pub(crate) async fn case_evidence_source_receipt(
         admission.admitted.validate(state.inner())?;
         admission.receipt.validate_admitted(
             &admission.admitted,
-            &state.codes.read(),
-            &state.system_codes.read(),
+            &admission.admitted.interpretation.codes,
+            &admission.admitted.interpretation.system_codes,
         )?;
         Ok(admission.receipt)
     })
@@ -733,7 +733,11 @@ pub(crate) async fn case_evidence_open(
     operation_id: Option<String>,
 ) -> Result<NativeCaseOpenResult, String> {
     crate::offload_operation(operation_id, move || {
-        open_native_case(&crate::config_dir(), &request)
+        let snapshot = analysis_runtime::validate_identity(&request.analysis_context)?;
+        let preferences = snapshot.interpretation.as_ref().map(|settings| settings.resources.clone()).unwrap_or_default();
+        let policy = crate::case_resources::Policy::capture(Some(&request.analysis_context), &preferences)?;
+        drop(snapshot);
+        crate::case_resources::with(policy, || open_native_case(&crate::config_dir(), &request))
     })
     .await?
 }

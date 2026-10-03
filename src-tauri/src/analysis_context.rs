@@ -236,12 +236,50 @@ pub struct Snapshot {
     pub config_revision: u64,
     pub visibility_revision: u64,
     pub config: Config,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpretation: Option<crate::case_interpretation::Settings>,
     #[serde(default)]
     pub migration_diagnostics: Vec<Diagnostic>,
     /// Malformed legacy documents are retained verbatim (bounded), as well as
     /// the untouched original file. They are never interpreted as definitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_raw: Option<Value>,
+}
+
+/// Browser management metadata omits potentially large interpretation catalogs.
+/// Authoritative snapshots and portable codecs still serialize the full value.
+pub(crate) struct ManagementSnapshot<'a>(pub &'a Snapshot);
+impl Serialize for ManagementSnapshot<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct View<'a> {
+            schema_version: u32, case_id: &'a str, analysis_id: &'a str,
+            config_revision: u64, visibility_revision: u64, config: &'a Config,
+            migration_diagnostics: &'a [Diagnostic],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            legacy_raw: Option<&'a Value>,
+        }
+        let snapshot = self.0;
+        View { schema_version: snapshot.schema_version, case_id: &snapshot.case_id, analysis_id: &snapshot.analysis_id,
+            config_revision: snapshot.config_revision, visibility_revision: snapshot.visibility_revision, config: &snapshot.config,
+            migration_diagnostics: &snapshot.migration_diagnostics, legacy_raw: snapshot.legacy_raw.as_ref() }.serialize(serializer)
+    }
+}
+pub(crate) fn serialize_management_snapshot<S: serde::Serializer>(snapshot: &Snapshot, serializer: S) -> Result<S::Ok, S::Error> {
+    ManagementSnapshot(snapshot).serialize(serializer)
+}
+pub(crate) fn serialize_management_snapshots<S: serde::Serializer>(snapshots: &[Snapshot], serializer: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut sequence = serializer.serialize_seq(Some(snapshots.len()))?;
+    for snapshot in snapshots { sequence.serialize_element(&ManagementSnapshot(snapshot))?; }
+    sequence.end()
+}
+pub(crate) fn serialize_management_snapshot_refs<S: serde::Serializer>(snapshots: &[&Snapshot], serializer: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut sequence = serializer.serialize_seq(Some(snapshots.len()))?;
+    for snapshot in snapshots { sequence.serialize_element(&ManagementSnapshot(snapshot))?; }
+    sequence.end()
 }
 
 impl Snapshot {
@@ -261,6 +299,7 @@ impl Snapshot {
             config_revision: 0,
             visibility_revision: 0,
             config: Config::default(),
+            interpretation: Some(Default::default()),
             migration_diagnostics: Vec::new(),
             legacy_raw: None,
         }
@@ -618,7 +657,7 @@ fn legacy_value(value:Value)->Result<(Config,Vec<Diagnostic>,Option<Value>),Stri
         )),
     }
 }
-fn write(tx: &Transaction<'_>, snapshot: &Snapshot) -> Result<(), String> {
+pub(crate) fn write(tx: &Transaction<'_>, snapshot: &Snapshot) -> Result<(), String> {
     let body = bounded(snapshot)?;
     tx.execute("INSERT INTO case_analysis(case_id,body) VALUES(?1,?2) ON CONFLICT(case_id) DO UPDATE SET body=excluded.body", params![snapshot.case_id, body]).map_err(|e| e.to_string())?;
     Ok(())
@@ -707,7 +746,7 @@ pub(crate) fn initialize(tx: &Transaction<'_>, dir: &Path) -> Result<(), String>
         )
         .map_err(|e| e.to_string())?;
     if done {
-        return Ok(());
+        return crate::case_interpretation::initialize(tx, dir);
     }
     #[derive(Deserialize)]
     struct StoredContext {
@@ -733,13 +772,19 @@ pub(crate) fn initialize(tx: &Transaction<'_>, dir: &Path) -> Result<(), String>
             snapshot.migration_diagnostics = issues.clone();
             snapshot.legacy_raw = raw.clone();
         }
+        if stored.context.as_ref().and_then(|value| value.get("interpretation")).is_none() {
+            snapshot.migration_diagnostics.retain(|diagnostic| diagnostic.code != "import_interpretation_defaults");
+            let (settings, diagnostics) = crate::case_interpretation::local_legacy_for(tx, dir)?;
+            snapshot.interpretation = Some(settings);
+            snapshot.migration_diagnostics.extend(diagnostics);
+        }
         write(tx, &snapshot)?;
     }
     drop(rows);
     drop(stmt);
     tx.execute("INSERT INTO metadata(key,value) VALUES(?1,'1')", [MIGRATED])
         .map_err(|e| e.to_string())?;
-    Ok(())
+    crate::case_interpretation::initialize(tx, dir)
 }
 fn imported(case_id: &str, embedded: Option<&Value>) -> Result<Snapshot, String> {
     let mut local = Snapshot::empty(case_id);
@@ -756,6 +801,16 @@ fn imported(case_id: &str, embedded: Option<&Value>) -> Result<Snapshot, String>
         validate(&foreign.config)?;
         // New local identity: foreign revisions and source visibility membership
         // cannot be applied to a different analysis without an explicit import.
+        local.interpretation = foreign.interpretation;
+        crate::case_interpretation::import_defaults(&mut local);
+        // An explicit duplicate/import cannot turn unavailable legacy settings
+        // into apparently valid defaults by dropping their repair diagnostics.
+        for diagnostic in foreign.migration_diagnostics {
+            if (diagnostic.code.starts_with("legacy_interpretation_unavailable") || diagnostic.code == "import_interpretation_defaults")
+                && !local.migration_diagnostics.contains(&diagnostic) {
+                local.migration_diagnostics.push(diagnostic);
+            }
+        }
         local.config = foreign.config;
         local.legacy_raw = foreign.legacy_raw;
         if local.legacy_raw.is_some() {
@@ -768,6 +823,7 @@ fn imported(case_id: &str, embedded: Option<&Value>) -> Result<Snapshot, String>
             });
         }
     }
+    if let Some(settings) = &local.interpretation { settings.validate()?; }
     Ok(local)
 }
 /// Prepare an owner before evidence disk work, without creating a Case/context
@@ -791,11 +847,20 @@ pub(crate) fn prepare_legacy_case(
         return Err("Identificador de Caso inválido ou excessivo.".into());
     }
     let mut snapshot = imported(case_id, embedded)?;
+    if embedded.and_then(|value| value.get("interpretation")).is_none() {
+        let (settings, diagnostics) = crate::case_interpretation::local_legacy(dir);
+        snapshot.interpretation = Some(settings);
+        snapshot.migration_diagnostics.retain(|diagnostic| diagnostic.code != "import_interpretation_defaults");
+        snapshot.migration_diagnostics.extend(diagnostics);
+    }
     if embedded.is_none() {
         let (config, diagnostics, raw) = legacy(dir)?;
         snapshot.config = config;
         snapshot.migration_diagnostics = diagnostics;
         snapshot.legacy_raw = raw;
+        let (settings, diagnostics) = crate::case_interpretation::local_legacy(dir);
+        snapshot.interpretation = Some(settings);
+        snapshot.migration_diagnostics.extend(diagnostics);
     }
     Ok(snapshot)
 }
@@ -832,6 +897,8 @@ pub(crate) fn prepare_portable_snapshot(
     }
     validate(&foreign.config)?;
     let mut local = foreign.clone();
+    crate::case_interpretation::import_defaults(&mut local);
+    local.interpretation.as_ref().unwrap().validate()?;
     local.case_id = case_id.into();
     local.analysis_id = uuid::Uuid::new_v4().to_string();
     Ok(local)
@@ -982,12 +1049,12 @@ fn update_at_inner(dir: &Path, expected: &Identity, config: Config, legacy_brows
         .checked_add(1)
         .ok_or("Revisão do Caso excedeu o limite.")?;
     current.config = config;
-    current.migration_diagnostics.clear();
+    current.migration_diagnostics.retain(|issue| issue.code.starts_with("legacy_interpretation_unavailable"));
     if native_context_owner(&tx, &expected.case_id)?.is_some() {
-        current.migration_diagnostics = reference_interpretation_diagnostics(
+        current.migration_diagnostics.extend(reference_interpretation_diagnostics(
             current.config.references.iter().map(|reference| reference.interpretation_version),
             true,
-        );
+        ));
     }
     // Preserve malformed legacy material for recovery even after a repaired edit.
     write(&tx, &current)?;

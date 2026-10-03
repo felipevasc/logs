@@ -11,7 +11,6 @@ use duckdb::arrow::array::{
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::Connection;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -206,7 +205,7 @@ pub(crate) fn published_matches(
     let Ok(index) = tantivy::Index::open_in_dir(&text) else {
         return false;
     };
-    let Ok(reader) = index.reader() else {
+    let Ok(reader) = index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into() else {
         return false;
     };
     if reader.searcher().num_docs() != rows as u64 {
@@ -537,16 +536,13 @@ fn choose_wide(
         sampled_bytes = sampled_bytes.saturating_add(idx.lines.at(i).len as usize);
         sampled_bytes <= crate::resources::batch_bytes().max(1 << 20)
     });
-    let seen: Vec<Vec<String>> = positions
-        .par_iter()
-        .map(|&i| {
+    let seen: Vec<Vec<String>> = crate::global_scheduler::map(positions, |i| {
             event_at(idx, i, codes, system, derived)
                 .fields
                 .keys()
                 .cloned()
                 .collect()
-        })
-        .collect();
+        });
     let mut order: Vec<String> = Vec::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
     for keys in seen {
@@ -602,6 +598,7 @@ pub(crate) fn build(
                 if waiting.elapsed() >= std::time::Duration::from_secs(5) {
                     return Err("Outro processo está preparando este checkpoint; tente novamente após ele concluir.".into());
                 }
+                crate::global_scheduler::yield_background(cancelled)?;
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(error) => return Err(format!("Não foi possível bloquear o checkpoint: {error}")),
@@ -772,192 +769,65 @@ fn write(
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     super::limit_resources(&conn, true)?;
     create_table(&conn, &wide_names).map_err(|e| e.to_string())?;
-    // Each writer appends one contiguous share of the file inside its own
-    // transaction: full row groups go straight to the file, compressed in
-    // parallel, instead of a commit, log write and checkpoint per batch.
-    // Machines with little memory keep one writer and smaller batches.
-    let low_memory = crate::resources::low_memory();
-    let writers = if low_memory {
-        1
-    } else {
-        (crate::resources::workers() / 4).clamp(1, 4)
-    };
-    let step = CHUNK * if low_memory { 4 } else { 16 };
-    let mut connections = Vec::with_capacity(writers);
-    for _ in 1..writers {
-        connections.push(conn.try_clone().map_err(|e| e.to_string())?);
-    }
-    connections.push(conn);
-    let share = total.div_ceil(writers).div_ceil(step) * step;
-    let mut cursors: Vec<(usize, usize)> = (0..writers)
-        .map(|k| ((k * share).min(total), ((k + 1) * share).min(total)))
-        .collect();
-
+    // Appending runs in the caller's admitted lane. A separate writer thread
+    // would overlap DuckDB CPU with parser/text work and escape a one-slot
+    // budget. Bounded parser waves still borrow globally idle capacity.
+    let step = CHUNK * if crate::resources::low_memory() { 4 } else { 16 };
     phase("Convertendo e indexando registros");
     let mut facts = Facts::default();
     let started = std::time::Instant::now();
-    let conn = std::thread::scope(|scope| -> Result<Connection, String> {
-        let mut senders = Vec::with_capacity(writers);
-        let mut handles = Vec::with_capacity(writers);
-        for conn in connections {
-            let (sender, receiver) =
-                std::sync::mpsc::sync_channel::<RecordBatch>(crate::resources::queue_batches());
-            senders.push(sender);
-            handles.push(scope.spawn(move || -> Result<Connection, String> {
-                crate::resources::lower_priority();
-                let mut busy = std::time::Duration::ZERO;
-                conn.execute_batch("BEGIN TRANSACTION")
-                    .map_err(|e| e.to_string())?;
-                {
-                    let mut appender = conn.appender("ev").map_err(|e| e.to_string())?;
-                    for batch in receiver {
-                        if cancelled() {
-                            return Err("Operação cancelada.".into());
-                        }
-                        let t = std::time::Instant::now();
-                        appender
-                            .append_record_batch(batch)
-                            .map_err(|e| e.to_string())?;
-                        busy += t.elapsed();
-                    }
-                    let t = std::time::Instant::now();
-                    appender.flush().map_err(|e| e.to_string())?;
-                    busy += t.elapsed();
+    conn.execute_batch("BEGIN TRANSACTION").map_err(|e| e.to_string())?;
+    let mut done = 0usize;
+    while done < total {
+        if cancelled() { return Err("Operação cancelada.".into()); }
+        crate::global_scheduler::yield_background(cancelled)?;
+        let start = done;
+        let row_end = (start + step).min(total);
+        let raw_budget = crate::resources::batch_bytes().max(64 << 10);
+        let byte_end = idx.lines.at(start).offset.saturating_add(raw_budget as u64);
+        let count = idx.lines.range(start..row_end).partition_point(|m| m.offset < byte_end);
+        let end = (start + count.max(1)).min(row_end);
+        let parts: Vec<(RecordBatch, Facts, Result<(), String>)> = crate::global_scheduler::map(
+            (start..end).step_by(CHUNK), |from| {
+                let to = (from + CHUNK).min(end);
+                let rows: Vec<Row> = (from..to).take_while(|_| !cancelled()).map(|i| {
+                    let off = idx.lines.at(i).offset - base;
+                    row_of(event_at(&idx, i, codes, system, derived), off, &identity, &wide_index)
+                }).collect();
+                let mut found = Facts::default();
+                for row in &rows {
+                    found.structured.extend(row.structured.iter().cloned());
+                    found.ci_multi.extend(row.ci_multi.iter().cloned());
+                    found.overflow.extend(row.over.iter().map(|(key, _)| key.clone()));
                 }
-                if cancelled() {
-                    return Err("Operação cancelada.".into());
-                }
-                phase("Confirmando gravação do checkpoint");
-                let t = std::time::Instant::now();
-                conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-                trace(&format!(
-                    "gravação: ocupada {busy:?}, commit {:?}",
-                    t.elapsed()
-                ));
-                Ok(conn)
-            }));
-        }
-        let mut produced: Result<(), String> = Ok(());
-        let mut wait = std::time::Duration::ZERO;
-        let mut done = 0usize;
-        let mut writer = 0usize;
-        'batches: while done < total {
-            if cancelled() {
-                produced = Err("Operação cancelada.".into());
-                break;
-            }
-            // Next step of the next writer that still has lines.
-            while cursors[writer].0 >= cursors[writer].1 {
-                writer = (writer + 1) % writers;
-            }
-            let start = cursors[writer].0;
-            let row_end = (start + step).min(cursors[writer].1);
-            // A coordinated raw-byte target leaves enough records for several
-            // Rayon tasks. Queues stay shallow; this is not a hard RSS limit
-            // because normalization and a single oversized record can expand.
-            let raw_budget = crate::resources::batch_bytes().max(64 << 10);
-            let byte_end = idx.lines.at(start).offset.saturating_add(raw_budget as u64);
-            let count = idx.lines.range(start..row_end).partition_point(|m| m.offset < byte_end);
-            let end = (start + count.max(1)).min(row_end);
-            let chunks: Vec<usize> = (start..end).step_by(CHUNK).collect();
-            let text = &text;
-            let parts: Vec<(RecordBatch, Facts, Result<(), String>)> = chunks
-                .into_par_iter()
-                .map(|from| {
-                    let to = (from + CHUNK).min(end);
-                    let rows: Vec<Row> = (from..to)
-                        .take_while(|_| !cancelled())
-                        .map(|i| {
-                            let off = idx.lines.at(i).offset - base;
-                            row_of(
-                                event_at(&idx, i, codes, system, derived),
-                                off,
-                                &identity,
-                                &wide_index,
-                            )
-                        })
-                        .collect();
-                    let mut found = Facts::default();
-                    for row in &rows {
-                        found.structured.extend(row.structured.iter().cloned());
-                        found.ci_multi.extend(row.ci_multi.iter().cloned());
-                        found
-                            .overflow
-                            .extend(row.over.iter().map(|(key, _)| key.clone()));
-                    }
-                    // Each parsing task feeds the text index directly.
-                    let indexed = rows.iter().enumerate().try_for_each(|(r, row)| {
-                        let mut words = super::text::words(&row.vals);
-                        words.extend(super::text::words(&row.pname.to_lowercase()));
-                        words.extend(super::text::words(&row.pdesc.to_lowercase()));
-                        text.add((from + r) as u32, words)
-                    });
-                    (
-                        batch_of(&rows, from as u32, wide_fields.len(), &schema),
-                        found,
-                        indexed,
-                    )
-                })
-                .collect();
-            if cancelled() {
-                produced = Err("Operação cancelada.".into());
-                break;
-            }
+                let indexed = rows.iter().enumerate().try_for_each(|(r, row)| {
+                    let mut words = super::text::words(&row.vals);
+                    words.extend(super::text::words(&row.pname.to_lowercase()));
+                    words.extend(super::text::words(&row.pdesc.to_lowercase()));
+                    text.add((from + r) as u32, words)
+                });
+                (batch_of(&rows, from as u32, wide_fields.len(), &schema), found, indexed)
+            });
+        if cancelled() { return Err("Operação cancelada.".into()); }
+        // No appender/statement survives the cooperative background handoff.
+        {
+            let mut appender = conn.appender("ev").map_err(|e| e.to_string())?;
             for (batch, found, indexed) in parts {
-                if let Err(error) = indexed {
-                    produced = Err(error);
-                    break 'batches;
-                }
+                indexed?;
                 facts.structured.extend(found.structured);
                 facts.ci_multi.extend(found.ci_multi);
                 facts.overflow.extend(found.overflow);
-                let t = std::time::Instant::now();
-                // A full writer queue must not hide cancellation indefinitely.
-                let mut pending_batch = batch;
-                loop {
-                    if cancelled() {
-                        produced = Err("Operação cancelada.".into());
-                        break 'batches;
-                    }
-                    match senders[writer].try_send(pending_batch) {
-                        Ok(()) => break,
-                        Err(std::sync::mpsc::TrySendError::Full(batch)) => {
-                            pending_batch = batch;
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                            produced = Err("O gravador do checkpoint foi interrompido.".into());
-                            break 'batches;
-                        }
-                    }
-                }
-                wait += t.elapsed();
+                appender.append_record_batch(batch).map_err(|e| e.to_string())?;
             }
-            cursors[writer].0 = end;
-            done += end - start;
-            writer = (writer + 1) % writers;
-            progress(done, total);
+            appender.flush().map_err(|e| e.to_string())?;
         }
-        drop(senders);
-        trace(&format!(
-            "leitura e conversão {:?} (espera da gravação {wait:?}), {writers} gravadores",
-            started.elapsed()
-        ));
-        let mut written = Vec::with_capacity(writers);
-        for handle in handles {
-            written.push(
-                handle
-                    .join()
-                    .map_err(|_| "Falha ao gravar o índice de consultas.".to_string())?,
-            );
-        }
-        produced?;
-        let mut kept = None;
-        for conn in written {
-            kept = Some(conn?);
-        }
-        kept.ok_or_else(|| "Falha ao gravar o índice de consultas.".to_string())
-    })?;
+        done = end;
+        progress(done, total);
+    }
+    if cancelled() { return Err("Operação cancelada.".into()); }
+    phase("Confirmando gravação do checkpoint");
+    conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+    trace(&format!("leitura, conversão e gravação {:?}, gravador síncrono", started.elapsed()));
     if cancelled() {
         return Err("Operação cancelada.".into());
     }
@@ -1118,6 +988,49 @@ mod checkpoint_tests {
         .unwrap();
         assert!(valid(&idx, &second, 12..24));
     }
+    #[test]
+    fn single_slot_real_builder_yields_before_batch_and_preserves_checkpoint() {
+        use crate::global_scheduler::{Scheduler, Priority, with_scheduler};
+        let (dir, idx) = fixture();
+        let target = dir.path().join("budgeted.duckdb");
+        let scheduler = Scheduler::new(1);
+        let page_seen = Arc::new(AtomicBool::new(false));
+        let page_worker = parking_lot::Mutex::new(None);
+        let started = AtomicBool::new(false);
+        let empty = CodesConfig::default();
+        let events = Arc::new((0..3).map(|id| event_at(&idx, id, &empty, &empty, &[])).collect::<Vec<_>>());
+        let result = with_scheduler(Arc::clone(&scheduler), || crate::global_scheduler::run(None, Priority::Background, &|| false, || {
+            build(source(&idx, 0..24), &target, &[], None,
+                &|done, _| { if done > 0 { assert!(page_seen.load(Ordering::SeqCst), "page must run before the first appended batch"); } },
+                &|label| {
+                    if label != "Convertendo e indexando registros" || started.swap(true, Ordering::SeqCst) { return; }
+                    let scheduler = Arc::clone(&scheduler);
+                    let seen = Arc::clone(&page_seen); let events = Arc::clone(&events);
+                    *page_worker.lock() = Some(std::thread::spawn(move || with_scheduler(scheduler, || {
+                        let token = crate::operations::token(None).unwrap().with_priority(Priority::Interactive);
+                        crate::operations::run_with_token(token, || {
+                            let page = crate::query::query(&events, &[], "id", "asc", 0, 2);
+                            assert_eq!(page.total, 3); assert_eq!(page.rows.len(), 2);
+                            seen.store(true, Ordering::SeqCst);
+                        }).unwrap();
+                    })));
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !crate::global_scheduler::interactive_waiting() {
+                        assert!(std::time::Instant::now() < deadline, "page did not queue");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }, &|| false)
+        }));
+        if let Some(worker) = page_worker.into_inner() { worker.join().unwrap(); }
+        result.unwrap().unwrap();
+        assert!(page_seen.load(Ordering::SeqCst));
+        assert!(valid(&idx, &target, 0..24));
+        let text = super::super::text::Text::open(&super::super::text::dir_of(&target)).unwrap();
+        assert_eq!(text.candidates("alpha", 24), Some((0..24).collect()));
+        let conn = Connection::open(&target).unwrap(); super::super::limit_resources(&conn, false).unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM ev", [], |row| row.get::<_, i64>(0)).unwrap(), 24);
+    }
+
     #[test]
     fn missing_marker_and_text_segment_are_not_ready_and_can_recover() {
         let (dir, idx) = fixture();

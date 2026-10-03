@@ -17,14 +17,14 @@ async function bundledCatalog() {
   });
   return catalogPromise;
 }
-async function catalog() { return window.__mockThreatCatalog || bundledCatalog(); }
-export async function threatCatalog() {
+async function catalog(override) { return override || bundledCatalog(); }
+export async function threatCatalog(override) {
   catalogPromise = null;
-  const bundled=await bundledCatalog(),file=await catalog(),ids=new Set(file.rules.map(rule=>rule.id));
+  const bundled=await bundledCatalog(),file=await catalog(override),ids=new Set(file.rules.map(rule=>rule.id));
   return { ...file, preview:true, path: catalogPath, updates_available:bundled.rules.filter(rule=>!ids.has(rule.id)).length, enabled: file.rules.filter(r => r.enabled).length, categories: [...new Set(file.rules.map(r => r.category))].sort() };
 }
-export async function threatCatalogUpdate() {
-  const current=await catalog(),bundled=await bundledCatalog();
+export async function threatCatalogUpdate(override) {
+  const current=await catalog(override),bundled=await bundledCatalog();
   if(current.error)throw new Error(current.error);
   const ids=new Set(current.rules.map(rule=>rule.id));
   if(ids.size!==current.rules.length)throw new Error('IDs duplicados no catálogo.');
@@ -32,8 +32,7 @@ export async function threatCatalogUpdate() {
   const additions=bundled.rules.filter(rule=>!ids.has(rule.id));
   const merged=structuredClone({...current,rules:[...current.rules,...additions]});
   if(merged.rules.length>1000||encoder.encode(JSON.stringify(merged)).length>4*1024*1024)throw new Error('Catálogo excede os limites.');
-  window.__mockThreatCatalog=merged;
-  return {added:additions.length,backup_path:null,catalog:await threatCatalog()};
+  return {added:additions.length,backup_path:null,catalog:await threatCatalog(merged)};
 }
 function prefix(text, limit) {
   if (encoder.encode(text).length <= limit) return text;
@@ -77,8 +76,8 @@ function corpus(event) {
   }
   return { text, originalLength, clipped };
 }
-async function scanRows(rows, filters) {
-  const file = await catalog(), active = file.rules.filter(r => r.enabled).map(rule => ({ rule, regex: regex(rule.pattern) }));
+async function scanRows(rows, filters, override) {
+  const file = await catalog(override), active = file.rules.filter(r => r.enabled).map(rule => ({ rule, regex: regex(rule.pattern) }));
   const selectors = (filters || []).filter(f => f.op === 'threat_rule');
   for (const filter of selectors) if (filter.column !== '_all' || filter.value !== '*' && !active.some(r => r.rule.id === filter.value)) throw new Error('Regra de ameaça inválida ou desativada.');
   let clipped = 0;
@@ -91,8 +90,8 @@ async function scanRows(rows, filters) {
   return { active, selected, clipped };
 }
 const ranking = map => [...map].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
-export async function threatScan(rows, filters) {
-  const { active, selected, clipped } = await scanRows(rows, filters), hits = selected.filter(row => row.matches.length);
+export async function threatScan(rows, filters, override) {
+  const { active, selected, clipped } = await scanRows(rows, filters, override), hits = selected.filter(row => row.matches.length);
   const rules = new Map(), categories = new Map(), sources = new Map(), dates = [];
   let occurrences = 0, undated = 0;
   for (const { event, body, matches } of hits) {
@@ -113,10 +112,10 @@ export async function threatScan(rows, filters) {
   const time = dates.length ? Array.from({ length: Math.floor(end / width) - Math.floor(start / width) + 1 }, (_, i) => { const key = Math.floor(start / width) + i; return { timestamp: key * width, count: bins.get(key) || 0 }; }) : [];
   return { total: selected.length, matched: hits.length, occurrences, complete: !clipped, clipped_records: clipped, enabled_rules: active.length, catalog_path: catalogPath, categories: ranking(categories), rules: [...rules.values()].sort((a, b) => b.count - a.count || a.id.localeCompare(b.id)), time, time_bucket_ms: width, sources: ranking(sources).slice(0, 10), undated_matches: undated, corpus_limit: LIMIT, start, end };
 }
-export async function threatEvents(rows, args) {
+export async function threatEvents(rows, args, override) {
   const filters = args.filters || [];
   const selectors = filters.some(f => f.op === 'threat_rule') ? filters : [...filters, { column: '_all', op: 'threat_rule', value: '*' }];
-  const { selected, clipped } = await scanRows(rows, selectors);
+  const { selected, clipped } = await scanRows(rows, selectors, override);
   const page = selected.slice(args.offset || 0, (args.offset || 0) + Math.max(1, Math.min(200, args.limit || 100)));
   let rowsClipped = 0;
   const previews = page.map(({ event }) => {
@@ -128,6 +127,6 @@ export async function threatEvents(rows, args) {
   });
   return { total: selected.length, rows: previews, complete: !clipped, clipped_records: clipped, rows_clipped: rowsClipped };
 }
-export async function threatFilterRows(rows, filters) {
-  return (await scanRows(rows, filters)).selected.map(({event})=>event);
+export async function threatFilterRows(rows, filters, override) {
+  return (await scanRows(rows, filters, override)).selected.map(({event})=>event);
 }
