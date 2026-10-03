@@ -32,3 +32,19 @@ test('legacy completion gate covers consumed loops, parked reaction tracks and s
   assert.match(source,/report\.capabilities\.atomicMove,true/);
   assert.match(source,/tailBoundary\.afterCompletionMs-report\.tailHandoff\.expectedRemainingMs/);
 });
+test('completion cleanup awaits trusted media delivery and still rejects a missing production listener',()=>{
+  const fallback=readFileSync(new URL('../preview/test-waiting-completion-fallback.mjs',import.meta.url),'utf8');
+  for(const gate of [source,fallback]) {
+    assert.match(gate,/completionMediaProbe\.addEventListener\('change'/);
+    assert.match(gate,/trusted:event\.isTrusted,matches:event\.matches,connectedAtChange:tail\.element\.isConnected/);
+    assert.match(gate,/waitForFunction\(\(\)=>window\.reducedCompletionEvent!==null,null,\{timeout:1000\}\)/);
+    assert.match(gate,/report\.reducedCompletion\.trusted,true/);
+    assert.match(gate,/report\.reducedCompletion\.matches,true/);
+    assert.match(gate,/report\.reducedCompletion\.connectedAtChange,false/);
+    const arm=gate.indexOf("completionMediaProbe.addEventListener('change'");
+    const emulate=gate.indexOf("await page.emulateMedia({reducedMotion:'reduce'})",arm);
+    const wait=gate.indexOf('await page.waitForFunction(()=>window.reducedCompletionEvent!==null',emulate);
+    assert.ok(arm>=0&&emulate>arm&&wait>emulate,'probe is armed before requesting the real media change');
+    assert.doesNotMatch(gate.slice(arm,gate.indexOf("assert.equal(await page.evaluate(()=>tail.element.isConnected),false,mode)",wait)),/waitForTimeout|dispatchEvent|new MediaQueryListEvent/);
+  }
+});

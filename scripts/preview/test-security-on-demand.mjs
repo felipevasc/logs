@@ -58,13 +58,31 @@ try {
   await page.locator('[data-calculate-compromises]').click(); await stateIs('ready'); assert.equal(await calls(), 4);
   phase = 'reimport';
   await page.evaluate(() => Workspace.showPage('import'));
-  const beforeLoad = await page.evaluate(() => state.sourcePublication?.generation ?? 0);
-  await page.locator('#btn-load').click();
-  await page.waitForFunction(before => (state.sourcePublication?.generation ?? 0) > before && !state.loadOverlay && state.loaded && !WorkspaceContext.changing && !WorkspaceContext.sourceBusy, beforeLoad);
+  await page.locator('#ws-empty-open').waitFor({ state: 'visible' });
+  assert.equal(await calls(), 4, 'opening the import chooser must not calculate');
+  // Import is the file chooser, not the legacy source form containing #btn-load.
+  // Reopen the exact existing sources through their real user-facing action.
+  await page.evaluate(() => Workspace.showPage('sources'));
+  const reload = page.getByRole('button', { name: 'Recarregar fontes', exact: true });
+  const oldReload = await reload.elementHandle();
+  const beforeLoad = await page.evaluate(() => ({ generation: state.sourcePublication?.generation ?? 0,
+    source: structuredClone(state.currentArtifact.source), loads: window.__mockCommandCalls.load_files || 0 }));
+  await reload.click();
+  await page.waitForFunction(before => (state.sourcePublication?.generation ?? 0) > before && !state.loadOverlay && state.loaded && !WorkspaceContext.changing && !WorkspaceContext.sourceBusy, beforeLoad.generation);
+  // The click handler rerenders Sources after loadData/Workspace.loaded settle.
+  // Wait for that completion, so it cannot overwrite the next navigation.
+  await page.waitForFunction(button => !button.isConnected, oldReload);
+  await reload.waitFor({ state: 'visible' }); await oldReload.dispose();
+  const afterLoad = await page.evaluate(() => ({ source: state.currentArtifact.source,
+    loads: window.__mockCommandCalls.load_files || 0, owner: state.sourcePublication?.analysisContext?.caseId }));
+  assert.deepEqual(afterLoad.source, beforeLoad.source, 'reload must retain all existing source paths');
+  assert.equal(afterLoad.loads, beforeLoad.loads + 1, 'the visible action must really reload the multi-file fixture');
+  assert.equal(afterLoad.owner, original.caseId);
   await page.evaluate(() => Workspace.showPage('compromises')); await stateIs('stale'); assert.equal(await calls(), 4);
   phase = 'Case isolation';
   await page.evaluate(() => newCase('Comprometimentos sob demanda B'));
-  await page.waitForFunction(() => !WorkspaceContext.changing);
+  await page.waitForFunction(() => !WorkspaceContext.changing && !WorkspaceContext.sourceBusy);
+  assert.notEqual(await page.evaluate(() => activeCase().id), original.caseId, 'a new isolated Case was created');
   await page.evaluate(async rows => {
     activeCase().items = [{ id: 'demand-case-fixture', kind: 'events', label: 'Preservados', rows }]; caseEventsCache.sig = null;
     await WorkspaceContext.setScope('case', { animate: false, page: 'compromises' });
@@ -74,6 +92,7 @@ try {
   assert.equal(await calls(), 5); assert.equal(await page.evaluate(() => Security.cached().total), 3);
   await page.evaluate(id => WorkspaceContext.changeCase(id), original.caseId);
   await page.evaluate(() => Workspace.showPage('compromises'));
+  assert.equal(await page.evaluate(() => activeCase().id), original.caseId, 'the Case switch must complete');
   assert.equal(await calls(), 5, 'reopening another Case does not start a calculation');
   assert.notEqual(await page.evaluate(() => Security.cached()?.total), 3, 'Case B results never leak into Case A');
   assert.deepEqual(errors, []);

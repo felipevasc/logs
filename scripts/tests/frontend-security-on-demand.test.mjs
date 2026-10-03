@@ -128,3 +128,30 @@ test('submitting a search creates a persistent filter that clearing the legacy d
   assert.equal(state.filters.length, 1); assert.equal(state.filters[0].value, expression);
   assert.equal(state.filters[0].op, 'query', 'Timeline still receives the committed search chip');
 });
+
+test('the visible Sources reload action reopens every path and awaits completion without requesting triage', async () => {
+  const f = fixture(); await f.calculate('before-reload');
+  f.state.currentArtifact.source = { kind: 'file', path: 'a.jsonl', paths: ['a.jsonl', 'b.log'], format: 'auto' };
+  const workspace = readFileSync(new URL('../../frontend/workspace.js', import.meta.url), 'utf8');
+  const start = workspace.indexOf('      const reload = el("button", "btn ghost", "Recarregar fontes");');
+  const end = workspace.indexOf('      $("#ws-source-clear").onclick', start);
+  assert.ok(start >= 0 && end > start, 'the browser pilot uses the real Sources reload action');
+  const loads = [], pages = []; let button, finish;
+  const context = vm.createContext({ state: f.state,
+    el: (tag, className, textContent) => ({ tag, className, textContent }),
+    $: selector => { assert.equal(selector, '#ws-source-config'); return { after(node) { button = node; } }; },
+    loadData: source => { loads.push(source); return new Promise(resolve => { finish = resolve; }); },
+    showPage: async page => pages.push(page),
+  });
+  vm.runInContext(workspace.slice(start, end), context);
+  assert.equal(button.textContent, 'Recarregar fontes');
+  const pending = button.onclick();
+  assert.equal(loads.length, 1); assert.equal(loads[0], f.state.currentArtifact.source);
+  assert.deepEqual(pages, [], 'the action must not redraw/navigate while the source load is pending');
+  f.state.currentArtifact.loadedAt++; f.security.invalidate(); finish(true); await pending;
+  assert.deepEqual(pages, ['sources']);
+  assert.equal(f.security.status().state, 'stale'); assert.equal(f.calls.length, 1);
+  const cancelled = button.onclick(); finish(false); await cancelled;
+  assert.deepEqual(pages, ['sources'], 'a failed or cancelled reload must not claim completion');
+  assert.equal(f.calls.length, 1);
+});

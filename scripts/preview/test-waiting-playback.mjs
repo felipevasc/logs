@@ -94,7 +94,26 @@ try {
     await page.waitForFunction(()=>tail.element.dataset.motion==='running');await page.evaluate(()=>tail.complete());
     if(mode==='new-operation')await page.evaluate(()=>{window.nextTail=WaitingVisuals.mount(document.querySelector('main'),{operationId:'new',phaseId:'engine-index',state:'running',elapsedMs:9000});});
     else if(mode==='context-change')await page.evaluate(()=>document.dispatchEvent(new CustomEvent('workspace-context-change')));
-    else await page.emulateMedia({reducedMotion:'reduce'});
+    else {
+      // Media changes are delivered by the browser rendering/event-loop step,
+      // not by the protocol acknowledgement returned from emulateMedia().
+      await page.evaluate(()=>{
+        window.reducedCompletionEvent=null;
+        window.completionMediaProbe=matchMedia('(prefers-reduced-motion: reduce)');
+        if(completionMediaProbe.matches)throw Error('Reduced-motion probe must begin unmatched');
+        completionMediaProbe.addEventListener('change',event=>{
+          reducedCompletionEvent={trusted:event.isTrusted,matches:event.matches,connectedAtChange:tail.element.isConnected};
+        },{once:true});
+      });
+      await page.emulateMedia({reducedMotion:'reduce'});
+      await page.waitForFunction(()=>window.reducedCompletionEvent!==null,null,{timeout:1000});
+      report.reducedCompletion=await page.evaluate(()=>reducedCompletionEvent);
+      assert.equal(report.reducedCompletion.trusted,true);
+      assert.equal(report.reducedCompletion.matches,true);
+      // CSSOM dispatches MediaQueryList changes in creation order. Production's
+      // earlier listener must already have removed the tail when this probe runs.
+      assert.equal(report.reducedCompletion.connectedAtChange,false,'production change listener must synchronously remove completion');
+    }
     assert.equal(await page.evaluate(()=>tail.element.isConnected),false,mode);
     if(mode==='new-operation')await page.evaluate(()=>nextTail.destroy());
   }
