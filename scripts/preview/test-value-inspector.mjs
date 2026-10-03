@@ -7,7 +7,14 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
 const errors = []; page.on("pageerror", error => errors.push(error.message));
 try {
   await page.goto(process.argv[2] || "http://127.0.0.1:4173");
-  await page.waitForFunction(() => WorkspaceContext.ready && state.loaded && state.rows.length > 0);
+  // Rows are published before the source session is saved and Workspace.loaded
+  // confirms list_sources. The final Summary navigation closes any older detail.
+  // Even the overlay/operation can finish before that confirmation; #btn-load is
+  // re-enabled only in loadData's finalizer, after its last navigation.
+  await page.waitForFunction(() => WorkspaceContext.ready && !WorkspaceContext.changing
+    && !WorkspaceContext.sourceBusy && state.loaded && state.rows.length > 0
+    && !state.loadOverlay && !state.activeOperation && document.querySelector("#load-overlay").hidden
+    && !document.querySelector("#btn-load").disabled);
   await page.evaluate(() => {
     const original = api;
     window.__detailCalls = 0; window.__insightPending = []; window.__copies = [];
@@ -25,6 +32,8 @@ try {
     showDetail(window.__detailFixture);
   });
   const drawer = page.locator("#drawer");
+  assert.equal(await drawer.isVisible(), true, "detail opens after initial source confirmation and navigation finish");
+  assert.equal(await page.locator("#dr-copy").isVisible(), true, "the displayed detail owns its copy action");
   assert.ok(!(await drawer.innerHTML()).includes("fixture-secret"));
   assert.ok(!(await drawer.innerHTML()).includes("nested-secret"));
   await page.locator("#dr-copy").click();

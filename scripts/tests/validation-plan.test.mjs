@@ -155,3 +155,17 @@ test('the threat pilot uses the shared cross-platform browser launcher and waits
   assert.match(pilot, /await launchBrowser\(/); assert.doesNotMatch(pilot, /chromium\.launch|C:\/Users\/|executablePath/);
   assert.match(pilot, /WorkspaceContext\?\.ready.*!WorkspaceContext\.changing.*!state\.loadOverlay/);
 });
+
+// The combined 0.12.1 matrix reached 20 minutes while still executing the final
+// checks. A workflow timeout must not cancel otherwise valid full coverage.
+test('full browser jobs budget setup and evidence in addition to every regression', () => {
+  for (const [path, job] of [['checks.yml', 'frontend'], ['build.yml', 'validate']]) {
+    const workflow = readFileSync(new URL(`../../.github/workflows/${path}`, import.meta.url), 'utf8');
+    const body = workflow.split(`\n  ${job}:\n`)[1]?.split(/\n  [a-z][a-z_-]*:\n/)[0];
+    assert(body, `${path}: required browser job remains present`);
+    const minutes = Number(body.match(/timeout-minutes: (\d+)/)?.[1]);
+    assert(minutes >= 40 && minutes <= 60, `${path}: browser budget must cover the complete suite with bounded headroom`);
+    assert.match(body, /if: always\(\)/, `${path}: keep failure evidence`);
+    assert.doesNotMatch(body, /continue-on-error/, `${path}: failures stay blocking`);
+  }
+});

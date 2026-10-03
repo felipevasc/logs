@@ -37,6 +37,22 @@ O PR restaurou o cache `backend`; os builds #47 e #49 não encontraram seu cache
 
 A retirada do portátil elimina uma etapa que custou 5m53 naquela execução; isso não é promessa de redução percentual no próximo runner. Cada teste de navegador agora informa sua duração e grava `output/playwright/smoke-summary.json`, com scripts realmente executados, resultado, duração e identidade do commit quando disponível. O ganho do seletor e do cache precisa ser medido em runs comparáveis, separando espera, cache, compilação e execução. Não há resultado novo de Windows/Linux instalado atribuído a esta alteração.
 
+## Orçamento da regressão integrada 0.12.1
+
+O [Checks #84](https://github.com/felipevasc/logs/actions/runs/37132233211), no
+commit `9205733`, chegou ao limite anterior de 20 minutos perto do último
+teste. A integração ampliou a seleção para 51 scripts e a coleta de evidências
+também usa tempo do job. Os jobs de navegador do PR e da release passam a ter
+40 minutos; nenhum teste ou gate foi removido. O limite individual de 150
+segundos, a limpeza de processos e a reprovação por falha continuam ativos.
+
+A mesma execução expôs uma corrida no teste novo do inspetor: linhas já
+carregadas antecedem a confirmação persistida da fonte e sua navegação final,
+que fecha o detalhe. O teste agora aguarda a liberação da ação de carregar após
+essa confirmação. Uma regressão com respostas controladas cobre a janela
+intermediária; o fechamento e o restabelecimento da proteção do produto não
+foram alterados.
+
 ## Uma só sequência de release
 
 A publicação baixa os instaladores dos dois jobs da mesma execução, confere assinaturas/checksums e só publica depois de ambos passarem, incluindo atualização instalada real. A integração 0.12.1 também exige o job de regressão completa da interface e, no Windows, o aceite do executável Tauri com IPC real: paridade de consultas/exportações, reuso de índices, recursos, inspeção e persistência. O teste nativo não participa do executor de prévia simulada. A tag disparadora é verificada antes da instalação npm e novamente no publicador.

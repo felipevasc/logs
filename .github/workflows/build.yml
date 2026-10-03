@@ -24,7 +24,9 @@ jobs:
   validate:
     name: Release frontend and interaction regressions
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    # The full UI suite now takes about 20 minutes before setup and evidence.
+    # Keep every selected regression and leave room for slower hosted runners.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
