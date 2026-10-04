@@ -588,7 +588,7 @@ fn killed_process_resumes_without_reparsing_committed_rows_and_lock_protects_pru
         );
         let payload = files(&cache, "lines").pop().unwrap();
         assert_eq!(std::fs::metadata(payload).unwrap().len(), 72 + 27 * 73);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             std::thread::sleep(std::time::Duration::from_millis(2100));
             // The newly completed checkpoint gets its proof only after its

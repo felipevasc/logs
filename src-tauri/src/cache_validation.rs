@@ -14,6 +14,26 @@ struct Stamp {
     native: Vec<i128>,
 }
 impl Stamp {
+    #[cfg(any(unix, windows))]
+    fn changed_at(&self) -> Option<std::time::SystemTime> {
+        #[cfg(unix)]
+        let (seconds, nanos) = (
+            u64::try_from(*self.native.get(2)?).ok()?,
+            u32::try_from(*self.native.get(3)?).ok()?,
+        );
+        #[cfg(windows)]
+        let (seconds, nanos) = {
+            // FILE_BASIC_INFO uses 100 ns ticks since 1601-01-01.
+            let ticks = u64::try_from(*self.native.get(4)?)
+                .ok()?
+                .checked_sub(116_444_736_000_000_000)?;
+            (ticks / 10_000_000, ((ticks % 10_000_000) * 100) as u32)
+        };
+        if nanos >= 1_000_000_000 {
+            return None;
+        }
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(seconds, nanos))
+    }
     fn of(file: &File) -> Option<Self> {
         let metadata = file.metadata().ok()?;
         if !metadata.is_file() {
@@ -106,28 +126,19 @@ pub(crate) fn receipt_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 impl Generation {
-    /// Unix inode times may advance only once per filesystem clock tick. Never
+    /// Native change times may advance only once per filesystem clock tick. Never
     /// promote a just-written generation to a reusable proof: a second write
     /// within that tick could preserve ctime even after restoring mtime.
     pub(crate) fn can_reuse(&self) -> bool {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let now = std::time::SystemTime::now();
             let Some(observed) = self.observed_at else {
                 return false;
             };
             return self.files.iter().all(|(_, stamp)| {
-                let seconds = stamp.native.get(2).and_then(|v| u64::try_from(*v).ok());
-                let nanos = stamp.native.get(3).and_then(|v| u32::try_from(*v).ok());
-                seconds
-                    .zip(nanos)
-                    .and_then(|(s, n)| {
-                        (n < 1_000_000_000)
-                            .then(|| {
-                                std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(s, n))
-                            })
-                            .flatten()
-                    })
+                stamp
+                    .changed_at()
                     .and_then(|changed| {
                         Some(
                             now.duration_since(changed)
@@ -138,9 +149,9 @@ impl Generation {
                     .is_some_and(|age| age >= std::time::Duration::from_secs(2))
             });
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
-            true
+            false
         }
     }
     pub(crate) fn capture(paths: &[PathBuf]) -> Option<Self> {
@@ -230,16 +241,16 @@ impl Generation {
 
 #[cfg(test)]
 pub(crate) fn settle_filesystem_clock() {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     std::thread::sleep(std::time::Duration::from_millis(2100));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn recent_inode_times_cannot_publish_reusable_validation() {
+    fn recent_native_times_cannot_publish_reusable_validation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recent");
         std::fs::write(&path, b"new").unwrap();

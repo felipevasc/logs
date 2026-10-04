@@ -130,11 +130,11 @@ fn unchanged_sources_reopen_without_rebuilding_and_only_changed_sources_are_proc
         }
     }
     // The fixture starts with stable source files, like a previously collected
-    // dataset. Recent Unix inode times are deliberately ineligible for reuse.
-    #[cfg(unix)]
+    // dataset. Recent native change times are deliberately ineligible for reuse.
+    #[cfg(any(unix, windows))]
     std::thread::sleep(std::time::Duration::from_millis(2100));
     let cold = reopen(root.path());
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     std::thread::sleep(std::time::Duration::from_millis(2100));
     remove_receipts(root.path()); // migration/fallback: force a full verification once
     let verified = reopen(root.path());
