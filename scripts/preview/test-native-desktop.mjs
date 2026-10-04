@@ -283,12 +283,7 @@ async function detailInspection(page) {
   const dialog = page.locator("dialog.value-inspector");
   try {
     await show(0);
-    assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "false");
-    assert.ok((await authorization.locator(".detail-tree-value").innerText()) === "[oculto]", "authorization is masked by default");
-    assert.ok(!(await page.locator("#drawer").innerHTML()).includes(jwt), "JWT is absent from the masked drawer DOM");
-    await page.locator("#dr-reveal").click();
-    assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "true");
-    assert.ok((await authorization.locator(".detail-tree-value").innerText()) === `Bearer ${jwt}`, "revealed value equals the original IPC value");
+    assert.ok((await authorization.locator(".detail-tree-value").innerText()) === `Bearer ${jwt}`, "displayed value equals the original IPC value");
     await authorization.locator(".kv-inspect").click();
     await dialog.waitFor({ state: "visible" });
     await dialog.locator("details.value-node").evaluateAll(nodes => nodes.forEach(node => { node.open = true; }));
@@ -299,33 +294,22 @@ async function detailInspection(page) {
     assert.ok(!claims.includes("9007199254740992"), "the unsafe integer must never be rounded");
     const idLine = dialog.locator(".value-node-line").filter({ has: page.locator(".value-node-key", { hasText: /^id$/ }) });
     assert.ok((await idLine.locator(".value-node-preview").innerText()) === "9007199254740993", "decoded ID retains its exact original lexeme");
-    await dialog.getByRole("button", { name: "Ocultar valor e subcampos", exact: true }).click();
-    assert.equal(await dialog.locator(".value-node").count(), 0, "hiding removes decoded nodes from the DOM");
-    const hiddenTree = await dialog.locator(".value-tree").innerHTML();
-    for (const value of [jwt, "Pessoa Ω 東京", "9007199254740993"]) {
-      assert.ok(!hiddenTree.includes(value), "hidden tree retains no token or decoded claims");
-    }
     await dialog.getByRole("button", { name: "Fechar", exact: true }).click();
-    await page.locator("#dr-reveal").click();
-    assert.ok((await authorization.locator(".detail-tree-value").innerText()) === "[oculto]", "hiding masks authorization again");
-    await page.locator("#dr-reveal").click();
+    assert.equal(await dialog.count(), 0, "closing removes decoded nodes from the DOM");
     await page.locator("#dr-close").click();
-    assert.equal(await page.evaluate(() => !detailRevealed && document.querySelector("#drawer").hidden), true, "closing resets revealed presentation while preserving canonical event identity");
-    assert.ok(!(await page.locator("#drawer").innerHTML()).includes(jwt), "closing removes revealed values");
+    assert.equal(await page.evaluate(() => document.querySelector("#drawer").hidden), true, "closing hides the drawer while preserving canonical event identity");
+    assert.ok(!(await page.locator("#drawer").innerHTML()).includes(jwt), "closing removes original values from the drawer DOM");
     await show(0);
-    assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "false");
-    assert.ok((await authorization.locator(".detail-tree-value").innerText()) === "[oculto]", "reopening starts with masked authorization");
-    await page.locator("#dr-reveal").click();
+    assert.ok((await authorization.locator(".detail-tree-value").innerText()) === `Bearer ${jwt}`, "reopening preserves the original value");
     await authorization.locator(".kv-inspect").click();
     await dialog.waitFor({ state: "visible" });
     await show(1);
     assert.equal(await dialog.count(), 0, "changing the real event closes and clears the old inspector");
-    assert.equal(await page.locator("#dr-reveal").getAttribute("aria-pressed"), "false");
     assert.equal(await authorization.count(), 0);
-    assert.ok((await page.locator('.detail-tree-row[data-col="token"] .detail-tree-value').innerText()) === "[oculto]", "switching events masks token fields");
+    assert.ok((await page.locator('.detail-tree-row[data-col="token"] .detail-tree-value').innerText()) === "fixture-secret-1", "switching events displays only the new event's token");
     assert.ok(!(await page.locator("#drawer").innerHTML()).includes(jwt));
-    checkpoint("native-value-inspector", { realIpc: true, maskedByDefault: true, exactInteger: true,
-      unicodeAndRoles: true, hideClearsTree: true, closeAndSwitchReset: true });
+    checkpoint("native-value-inspector", { realIpc: true, literalOriginalValues: true, exactInteger: true,
+      unicodeAndRoles: true, closeClearsTree: true, closeAndSwitchReset: true });
   } finally {
     // Keep revealed synthetic credentials out of screenshots, including failure
     // evidence. No copy buttons or clipboard APIs are invoked by this test.

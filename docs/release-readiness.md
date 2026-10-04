@@ -4,7 +4,7 @@
 
 A implementação anterior da investigação foi preservada no commit `2018799` antes deste lote. As melhorias incluem início vazio de Caso, restauração da área do destino, tema/zoom por Caso, nomenclatura Achados, índices opcionais com publicação completa, leitura paralela limitada e aquisição SSH/WinRM.
 
-Validações locais deste lote: `npm run check` com 308 verificações essenciais e salvaguardas de publicação; oito fluxos integrados de navegador, com repetição dos afetados após correções; verificação da sintaxe PowerShell e transporte binário do coletor Python. As verificações nativas e o aceite do executável são registrados no fechamento da implementação.
+Validações locais deste lote: `npm run check` com 308 verificações essenciais e salvaguardas de publicação; oito fluxos integrados de navegador, com repetição dos afetados após correções; 24 verificações unitárias nativas; aceite do executável real com 5.000 registros, paridade de consultas/exportações, recursos, persistência e reabertura; sintaxe PowerShell e transporte binário do coletor Python. Os resultados e limites estão no [registro de implementação](v0.13-implementation.md).
 
 Não foi usada uma conexão autenticada com servidor SSH/WinRM real. A release só pode ser considerada publicada quando o workflow do GitHub concluir instaladores, atualização instalada, assinaturas e envio de todos os assets. Consulte [notas da versão](releases/v0.13.0.md), [conexões](casos-indices-conexoes.md) e [política de testes vigente](ci-validation.md).
 
