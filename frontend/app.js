@@ -287,6 +287,9 @@ function pushLoadStep(label) {
 
 function mirrorLoadOverlay(label, detail, progress, waiting = null, cancellable = false) {
   if (!state.loadOverlay) return;
+  // Controller phases (activation/save acknowledgement) have no native receipt.
+  // They must not continue displaying the completed import's measurements.
+  if (!waiting || waiting.operationId !== state.loadOverlayOperationId) state.loadMetrics = null;
   if (label && label !== state.loadOverlayPhase) { state.loadOverlayPhase = label; pushLoadStep(label); }
   window.LoadProgress?.render({ label, detail, progress, metrics: state.loadMetrics });
   state.loadOverlayCancellable = !!cancellable && waiting?.operationId === state.loadOverlayOperationId;

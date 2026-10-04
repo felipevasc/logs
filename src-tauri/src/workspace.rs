@@ -1502,7 +1502,7 @@ mod canonical {
         let marker_generation = crate::cache_validation::Generation::capture(&[marker.clone()]);
         if marker_generation.as_ref().is_some_and(|g| !g.covers(&marker, &file) || !g.is_current()) { return Ok(None); }
         if let Some(hit) = MEMO.lock().iter().find(|entry| entry.path == dir && entry.marker_stamp == stamp
-            && marker_generation.as_ref().is_some_and(|generation| entry.marker_generation.as_ref() == Some(generation))) {
+            && marker_generation.as_ref().is_some_and(|generation| generation.can_reuse() && entry.marker_generation.as_ref() == Some(generation))) {
             return Ok(Some(Arc::clone(&hit.manifest)));
         }
         let Some(value) = checked_read::<Manifest>(std::io::BufReader::new(&file)) else { return Ok(None) };
@@ -1523,7 +1523,7 @@ mod canonical {
         let manifest = Arc::new(value);
         let mut memo = MEMO.lock();
         memo.retain(|entry| entry.path != dir);
-        if stamp.bytes as usize <= MEMO_BYTES {
+        if stamp.bytes as usize <= MEMO_BYTES && marker_generation.as_ref().is_some_and(|g| g.can_reuse()) {
             while memo.iter().map(|entry| entry.encoded_bytes).sum::<usize>() + stamp.bytes as usize > MEMO_BYTES {
                 memo.pop_front();
             }
@@ -1539,7 +1539,7 @@ mod canonical {
         if stamp.bytes != artifact.bytes { return Ok(false); }
         let generation = crate::cache_validation::Generation::capture(&[path.clone(), dir.join(MARKER)]);
         let context = format!("canonical-artifact-v1|{}|{}", artifact.logical_identity, artifact.sha256);
-        if generation.as_ref().is_some_and(|g| g.covers(&path, &file)
+        if generation.as_ref().is_some_and(|g| g.can_reuse() && g.covers(&path, &file)
             && (MEMO.lock().iter().find(|entry| entry.path == dir).and_then(|entry| entry.files.get(&artifact.path)) == Some(g) || g.verified(&path, &context)) && g.is_current()) {
             if let Some(entry) = MEMO.lock().iter_mut().find(|entry| entry.path == dir) {
                 entry.files.insert(artifact.path.clone(), generation.unwrap());
@@ -1552,7 +1552,7 @@ mod canonical {
             if !generation.is_current() { return Ok(false); }
             generation.remember(&path, &context);
         }
-        if let (Some(entry), Some(generation)) = (MEMO.lock().iter_mut().find(|entry| entry.path == dir), generation) {
+        if let (Some(entry), Some(generation)) = (MEMO.lock().iter_mut().find(|entry| entry.path == dir), generation.filter(|g| g.can_reuse())) {
             entry.files.insert(artifact.path.clone(), generation);
         }
         Ok(true)
@@ -1844,6 +1844,7 @@ mod canonical {
             let path = fixture.file("source.log", b"one\ntwo\n");
             let calls = AtomicUsize::new(0);
             let target = convert(&path, None, &calls).unwrap();
+            crate::cache_validation::settle_filesystem_clock();
             assert_eq!(convert(&path, None, &calls).unwrap(), target);
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert!(crate::cache_validation::receipt_path(&target).exists());

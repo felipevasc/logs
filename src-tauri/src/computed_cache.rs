@@ -101,6 +101,9 @@ fn checksum(key: &str, generation: &Generation, value: &serde_json::Value) -> Op
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 fn read<T: DeserializeOwned>(path: &Path, key: &str, generation: &Generation) -> Option<T> {
+    if !generation.can_reuse() {
+        return None;
+    }
     let file = std::fs::File::open(path).ok()?;
     if file.metadata().ok()?.len() > MAX_BYTES {
         return None;
@@ -115,6 +118,9 @@ fn read<T: DeserializeOwned>(path: &Path, key: &str, generation: &Generation) ->
     serde_json::from_value(saved.value).ok()
 }
 fn write<T: Serialize>(path: &Path, key: &str, generation: &Generation, value: &T) {
+    if !generation.can_reuse() {
+        return;
+    }
     let result = (|| -> Option<()> {
         let value = serde_json::to_value(value).ok()?;
         let saved = Saved {
@@ -235,6 +241,7 @@ mod tests {
         let source = root.path().join("source");
         let cache = root.path().join("saved.json");
         std::fs::write(&source, b"original").unwrap();
+        crate::cache_validation::settle_filesystem_clock();
         let generation = Generation::capture(&[source.clone()]).unwrap();
         write(&cache, "context", &generation, &vec!["value"]);
         assert_eq!(

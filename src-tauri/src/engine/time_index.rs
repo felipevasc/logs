@@ -988,6 +988,7 @@ mod tests {
         let (_directory, connection, store, identity) = fixture(&rows);
         ensure(&connection, &store, &identity, &|| false).unwrap();
         let _ = std::fs::remove_file(crate::cache_validation::receipt_path(&path(&store)));
+        crate::cache_validation::settle_filesystem_clock();
         let cold = open(&store, &identity).unwrap().unwrap();
         let expected = cold.data.fences.as_ref().map(|fences| fences.maxima.clone());
         drop(cold);

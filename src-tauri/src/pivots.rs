@@ -529,7 +529,7 @@ pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
     let results: Vec<Result<_, String>> = crate::global_scheduler::map(jobs, |(cache_key, id, path, name, physical, origin)| {
         crate::operations::run_with_token(token.clone(), || -> Result<_, String> {
             let generation = crate::cache_validation::Generation::capture(&[physical.clone()]);
-            if let Some((_, _, hit)) = HASHES.lock().iter().find(|(key, stamp, _)| *key == cache_key && generation.as_ref().is_some_and(|generation| stamp.as_ref() == Some(generation))) {
+            if let Some((_, _, hit)) = HASHES.lock().iter().find(|(key, stamp, _)| *key == cache_key && generation.as_ref().is_some_and(|generation| generation.can_reuse() && stamp.as_ref() == Some(generation))) {
                 // Digest reuse must not reuse a previous display alias/name.
                 return Ok((cache_key, generation, SourceHash { id, path, name, bytes: hit.bytes, sha256: hit.sha256.clone(), origin: origin.into() }, false));
             }
@@ -544,7 +544,7 @@ pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
     validate()?;
     let mut cache = HASHES.lock();
     for (cache_key, generation, hash, fresh) in &results {
-        if *fresh {
+        if *fresh && generation.as_ref().is_some_and(|g| g.can_reuse()) {
             if cache.len() >= 512 { cache.remove(0); }
             cache.push((cache_key.clone(), generation.clone(), hash.clone()));
         }

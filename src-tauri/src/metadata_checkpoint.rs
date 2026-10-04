@@ -949,6 +949,7 @@ mod tests {
         let (mut journal, _) = Journal::open(dir.path(), &key, 300, 0, false, None).unwrap_or_else(|e| panic!("{e}"));
         journal.checkpoint(&[LineMeta { offset: 0, len: 11, ts: 123, ..Default::default() }, LineMeta { offset: 12, len: 10, ts: -7, ..Default::default() }], 300, true, Some(&["field".into()]), None, &|| Ok(())).unwrap();
         drop(journal);
+        crate::cache_validation::settle_filesystem_clock();
         let (first, columns) = open_complete(dir.path(), &key, 300, 0, false, None).unwrap().unwrap();
         let phases = std::cell::RefCell::new(Vec::new());
         let (second, _) = open_complete(dir.path(), &key, 300, 0, false, Some(&|progress| phases.borrow_mut().push(progress.phase_id))).unwrap().unwrap();

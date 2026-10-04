@@ -180,7 +180,7 @@ pub(crate) fn published_matches(
     }
     let stamp = crate::cache_validation::Generation::capture(&paths);
     let context = format!("engine-checkpoint-v1|{:x}", Sha256::digest(&bytes));
-    if stamp.as_ref().is_some_and(|stamp| (VERIFIED.lock().get(path) == Some(stamp) || stamp.verified(path, &context)) && stamp.is_current()) {
+    if stamp.as_ref().is_some_and(|stamp| stamp.can_reuse() && (VERIFIED.lock().get(path) == Some(stamp) || stamp.verified(path, &context)) && stamp.is_current()) {
         return true;
     }
     let Ok(actual) = artifacts(path) else {
@@ -222,7 +222,7 @@ pub(crate) fn published_matches(
     if let Some(stamp) = stamp {
         if !stamp.is_current() { return false; }
         stamp.remember(path, &context);
-        VERIFIED.lock().insert(path.to_path_buf(), stamp);
+        if stamp.can_reuse() { VERIFIED.lock().insert(path.to_path_buf(), stamp); }
     }
     true
 }
@@ -939,6 +939,7 @@ mod checkpoint_tests {
             &|| false,
         )
         .unwrap();
+        crate::cache_validation::settle_filesystem_clock();
         assert!(valid(&idx, &target, 0..12));
         assert!(crate::cache_validation::receipt_path(&target).exists());
         VERIFIED.lock().remove(&target); // simulate a fresh application's empty memo

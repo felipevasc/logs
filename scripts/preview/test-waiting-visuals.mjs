@@ -48,8 +48,10 @@ try {
   assert.equal(results.overlay.ring, true); assert.equal(results.overlay.scan, true); assert.equal(results.overlay.toggles, 0);
   assert.equal(results.overlay.status, 'Validando a fonte'); assert.equal(results.overlay.barHidden, true); assert.equal(results.overlay.ringSpins, true);
   assert.ok(Math.abs(results.overlay.size - 124) < 1);
-  await page.evaluate(() => LoadProgress.render({ label: 'Transferindo · fonte.gz', progress: 50,
-    metrics: { completed: 1024, total: 2048, unit: 'bytes', elapsed: 61, phaseSeconds: 10, rate: 512, eta: 2, error: 'Aguardando disco' } }));
+  await page.evaluate(() => {
+    state.loadMetrics = { completed: 1024, total: 2048, unit: 'bytes', elapsed: 61, phaseSeconds: 10, rate: 512, eta: 2, error: 'Aguardando disco' };
+    mirrorLoadOverlay('Transferindo · fonte.gz', '', 50, { operationId: state.loadOverlayOperationId, state: 'running', label: 'Transferindo' });
+  });
   assert.equal(await page.locator('#load-amount').textContent(), '1 KB');
   assert.equal(await page.locator('#load-of').textContent(), 'de 2 KB');
   assert.equal(await page.locator('#load-note').textContent(), 'fonte.gz');
