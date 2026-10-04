@@ -23,14 +23,7 @@ fn source_key(state: &AppState) -> String {
 }
 
 fn case_key(events: &[Event]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for e in events {
-        e.id.hash(&mut hasher);
-        e.event_ref.hash(&mut hasher);
-        e.timestamp.hash(&mut hasher);
-    }
-    format!("case:{}:{:x}", events.len(), hasher.finish())
+    crate::computed_cache::case_signature(events).unwrap_or_default()
 }
 
 // All rule stores share one analysis budget, but waiting remains cancellable.
@@ -62,7 +55,7 @@ pub(crate) fn stored_analysis_mode(
     force: bool,
     cache_only: bool,
 ) -> Result<Arc<crate::security_results::Results>, String> {
-    let _working = analysis_lock(cache_only)?;
+    let _working = if cache_only { None } else { Some(analysis_lock(false)?) };
     crate::operations::check()?;
     let rules = detections::ruleset()?;
     let settings = detections::load_settings();
@@ -87,11 +80,7 @@ pub(crate) fn stored_analysis_mode(
             return Ok(hit);
         }
     }
-    // Analyses of indexed files are kept on disk across sessions.
-    let saved = case_events
-        .is_none()
-        .then(|| saved_path(state, &settings, catalog.as_deref(), &expired))
-        .flatten();
+    let saved = saved_path(state, case_events, &settings, catalog.as_deref(), &expired);
     if let (Some(path), false) = (&saved, force) {
         if path.exists() {
             if let Ok(hit) = crate::security_results::Results::open(path) {
@@ -117,7 +106,6 @@ pub(crate) fn stored_analysis_mode(
         if let Some(path) = saved {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
-                prune_saved(dir);
             }
             if let Err(error) = result.save(&path) {
                 eprintln!("[triage] análise não salva: {error}");
@@ -127,10 +115,11 @@ pub(crate) fn stored_analysis_mode(
     Ok(result)
 }
 
-/// File of the saved analysis of the indexed source with the current rules,
-/// catalog, settings and derived fields; `None` for sources held in memory.
+/// Complete results survive restart and Case switches. Actual content and
+/// interpretation changes, rather than screen/session counters, invalidate them.
 fn saved_path(
     state: &AppState,
+    case_events: Option<&[Event]>,
     settings: &Settings,
     catalog: Option<&crate::threats::CompiledCatalog>,
     expired: &[bool],
@@ -139,10 +128,16 @@ fn saved_path(
     // Session publication counters are deliberately absent here. Persistent
     // ownership, visibility and actual interpretation survive an app restart;
     // an identical source opened after another file must use the same result.
-    let interpretation = crate::computed_cache::source_signature(state)?;
+    let interpretation = match case_events {
+        Some(events) => crate::computed_cache::case_signature(events),
+        None => crate::computed_cache::source_signature(state).or_else(|| {
+            let source = crate::analysis_runtime::source(state);
+            match &*source { SourceData::Memory(events) => crate::computed_cache::case_signature(events), _ => None }
+        }),
+    }?;
     let mut hash = Sha256::new();
     hash.update(b"triage-persistence-v2");
-    hash.update(env!("CARGO_PKG_VERSION"));
+    hash.update(crate::computed_cache::SEMANTICS);
     hash.update(interpretation);
     hash.update(detections::fingerprint());
     hash.update(serde_json::to_string(settings).unwrap_or_default());
@@ -151,20 +146,6 @@ fn saved_path(
     Some(crate::config_dir().join("triage-v1").join(format!("{:x}.sqlite", hash.finalize())))
 }
 
-/// Keeps the 8 most recently saved analyses.
-fn prune_saved(dir: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut saved: Vec<_> = entries
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "sqlite"))
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
-    saved.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, path) in saved.into_iter().skip(7) {
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("json"));
-    }
-}
 
 #[cfg(test)]
 pub fn analysis_impl(
@@ -491,8 +472,10 @@ pub async fn triage_episode(
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, None, crate::global_scheduler::Priority::Normal).await?;
-    crate::offload_case(None, app.clone(), admitted, case_events, move |_case_events| {
-        detections::cached_analysis(&analysis_id).ok_or("Análise expirada; recarregue a triagem")?.episode_members(
+    crate::offload_case(None, app.clone(), admitted, case_events, move |case_events| {
+        let full = stored_analysis_mode(app.state::<AppState>().inner(), case_events.as_deref(), false, true)?;
+        if full.metadata["analysis_id"].as_str() != Some(&analysis_id) { return Err("A análise mudou; reabra suas evidências".into()); }
+        full.episode_members(
             &episode_id,
             offset.unwrap_or(0),
             limit.unwrap_or(100),
@@ -1016,7 +999,7 @@ mod on_demand_tests {
         crate::analysis_runtime::with(Some(publisher), || crate::source_publication::publish(&state, index, vec![path.to_string_lossy().into_owned()], vec![], false)).unwrap();
         let mut admitted = crate::analysis_runtime::capture(&state, Some(identity), None, crate::analysis_runtime::Mode::Dataset).unwrap();
         let settings = Settings::default();
-        let first_key = crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, &settings, None, &[])).unwrap();
+        let first_key = crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, None, &settings, None, &[])).unwrap();
         // Use a tiny completed fixture result. The cache-only production path
         // must load this exact disk result without invoking any analysis.
         let event = Event::empty();
@@ -1024,20 +1007,38 @@ mod on_demand_tests {
         let fixture_settings = Settings { threats: false, investigation: crate::investigation::Settings { enabled: false, ..Default::default() }, ..Default::default() };
         let result = detections::run_stored(&detections::Inputs { rules: &rules, catalog: None, settings: &fixture_settings }, &Source::Events(vec![&event])).unwrap();
         let catalog = crate::analysis_runtime::with(Some(admitted.clone()), || crate::threats::load_active()).unwrap();
-        let disk = crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, &settings, Some(&catalog), &[])).unwrap();
+        let disk = crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, None, &settings, Some(&catalog), &[])).unwrap();
         std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
         result.save(&disk).unwrap();
         detections::clear_cache();
         Arc::get_mut(&mut admitted).unwrap().source_generation = Some(73);
-        assert_eq!(crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, &settings, None, &[])).unwrap(), first_key);
+        assert_eq!(crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, None, &settings, None, &[])).unwrap(), first_key);
         let restored = crate::analysis_runtime::with(Some(admitted.clone()), || stored_analysis_mode(&state, None, false, true)).unwrap();
         assert_eq!(restored.metadata["analysis_id"], result.metadata["analysis_id"]);
         drop(restored);
+        // Case records used to have no durable snapshot, and a global eight-file
+        // cleanup used to discard other Cases. Save more than eight universes.
+        let mut first_events = Vec::new();
+        for number in 0..12 {
+            let mut event = Event::empty();
+            event.event_ref = format!("preserved:{number}"); event.message = format!("original {number}");
+            let events = vec![event];
+            let disk = crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, Some(&events), &settings, Some(&catalog), &[])).unwrap();
+            result.save(&disk).unwrap();
+            if number == 0 { first_events = events; }
+        }
+        detections::clear_cache();
+        let restored = crate::analysis_runtime::with(Some(admitted.clone()), || stored_analysis_mode(&state, Some(&first_events), false, true)).unwrap();
+        assert_eq!(restored.metadata["analysis_id"], result.metadata["analysis_id"]);
+        drop(restored); detections::clear_cache();
+        // Same IDs/timestamps must not conceal changes in the actual evidence.
+        first_events[0].message.push_str(" changed");
+        assert!(crate::analysis_runtime::with(Some(admitted.clone()), || stored_analysis_mode(&state, Some(&first_events), false, true)).err().unwrap().starts_with("TRIAGE_NOT_CALCULATED:"));
         Arc::get_mut(&mut admitted).unwrap().identity.as_mut().unwrap().visibility_revision += 1;
-        assert_ne!(crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, &settings, None, &[])).unwrap(), first_key);
+        assert_ne!(crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, None, &settings, None, &[])).unwrap(), first_key);
         assert!(crate::analysis_runtime::with(Some(admitted.clone()), || stored_analysis_mode(&state, None, false, true)).err().unwrap().starts_with("TRIAGE_NOT_CALCULATED:"));
         Arc::get_mut(&mut admitted).unwrap().identity.as_mut().unwrap().config_revision += 1;
-        assert_ne!(crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, &settings, None, &[])).unwrap(), first_key);
+        assert_ne!(crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, None, &settings, None, &[])).unwrap(), first_key);
     }
 
     #[test]

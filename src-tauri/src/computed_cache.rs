@@ -7,6 +7,90 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_BYTES: u64 = 32 << 20;
+// Bump this only when result semantics change, not for every desktop release.
+pub(crate) const SEMANTICS: &str = "0.13.2";
+
+pub(crate) fn case_signature(events: &[crate::model::Event]) -> Option<String> {
+    let owner = crate::analysis_runtime::current().map(|admitted| admitted.identity.clone());
+    let mut hash = Sha256::new();
+    hash.update(serde_json::to_vec(&(owner, crate::analysis_runtime::fact_interpretation_signature())).ok()?);
+    if let Some(admitted) = crate::analysis_runtime::current() {
+        if let Some(records) = admitted.native_records() {
+            if let Some(native) = records.native() {
+                if records.len() == events.len() && records.iter().zip(events).all(|(original, event)| original.id == event.id && original.event_ref == event.event_ref) {
+                    // The native immutable publication already proves every
+                    // original record. Reuse that receipt instead of encoding
+                    // all fields again on each chart/page after a Case switch.
+                    let authority = &native.authority;
+                    hash.update(serde_json::to_vec(&("native-case-v1", &authority.store.store_id, &authority.owner.case_id, &authority.owner.analysis_id, &authority.evidence_signature, &authority.station_id, authority.preserved_count)).ok()?);
+                    return Some(format!("{:x}", hash.finalize()));
+                }
+            }
+        }
+    }
+    for event in events {
+        crate::operations::check().ok()?;
+        let mut value = serde_json::to_value(event).ok()?;
+        value.sort_all_objects();
+        hash.update(serde_json::to_vec(&value).ok()?);
+        hash.update(b"\n");
+    }
+    Some(format!("{:x}", hash.finalize()))
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedContent {
+    key: String,
+    value: serde_json::Value,
+    checksum: String,
+}
+
+/// Immutable Case records carry their own complete content identity, so no
+/// foreground dataset or session publication counter belongs in this cache.
+pub(crate) fn scope<T: Serialize + DeserializeOwned>(
+    state: &AppState,
+    filters: &[crate::query::Filter],
+    events: Option<&[crate::model::Event]>,
+    kind: &str,
+    compute: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let Some(events) = events else { return dataset(state, filters, kind, compute); };
+    crate::operations::check()?;
+    let Some(signature) = case_signature(events) else { crate::operations::check()?; return compute(); };
+    let key = format!("{:x}", Sha256::digest(serde_json::to_vec(&("case-computed-v1", SEMANTICS, signature, filters, kind)).map_err(|e|e.to_string())?));
+    let path = crate::config_dir().join("computed-v1").join(format!("{key}.json"));
+    let read = || -> Option<T> {
+        let file = std::fs::File::open(&path).ok()?;
+        if file.metadata().ok()?.len() > MAX_BYTES { return None; }
+        let saved: SavedContent = serde_json::from_reader(file.take(MAX_BYTES + 1)).ok()?;
+        if saved.key != key || saved.checksum != format!("{:x}", Sha256::digest(serde_json::to_vec(&(&key, &saved.value)).ok()?)) { return None; }
+        serde_json::from_value(saved.value).ok()
+    };
+    if let Some(value) = read() {
+        crate::operations::check()?;
+        crate::analysis_runtime::validate_result_owner()?;
+        return Ok(value);
+    }
+    let value = compute()?;
+    crate::operations::check()?;
+    crate::analysis_runtime::validate_result_owner()?;
+    let save = || -> Option<()> {
+        let value = serde_json::to_value(&value).ok()?;
+        let checksum = format!("{:x}", Sha256::digest(serde_json::to_vec(&(&key, &value)).ok()?));
+        let bytes = serde_json::to_vec(&SavedContent { key, value, checksum }).ok()?;
+        if bytes.len() as u64 > MAX_BYTES { return None; }
+        let parent = path.parent()?;
+        std::fs::create_dir_all(parent).ok()?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).ok()?;
+        temp.write_all(&bytes).ok()?; temp.as_file().sync_all().ok()?;
+        crate::operations::check().ok()?;
+        crate::analysis_runtime::validate_result_owner().ok()?;
+        temp.persist(path).ok()?;
+        Some(())
+    };
+    let _ = save();
+    Ok(value)
+}
 
 pub(crate) fn source_signature(state: &AppState) -> Option<String> {
     let source = crate::analysis_runtime::source(state);
@@ -204,7 +288,7 @@ pub(crate) fn dataset<T: Serialize + DeserializeOwned>(
         Sha256::digest(
             serde_json::to_vec(&(
                 "computed-v1",
-                env!("CARGO_PKG_VERSION"),
+                SEMANTICS,
                 signature,
                 kind,
                 filters

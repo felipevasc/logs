@@ -67,7 +67,7 @@ try {
   await page.evaluate(() => { window.__mockFailures = {}; window.__mockInvestigationPages.signals.analysis_id = 'wrong-analysis'; });
   await host.getByRole('button', { name: 'Tentar novamente', exact: true }).click();
   await host.getByText(/Resultado incompleto ou de outra análise/).waitFor();
-  assert.equal(await page.evaluate(() => window.__mockCommandCalls.triage), 1, 'paging and hunts never scan');
+  assert.equal(await page.evaluate(() => window.__mockRequests.filter(row => row.cmd === "triage" && !row.cacheOnly).length), 1, 'paging and hunts never scan');
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ queue: true, exactOriginalEvent: true, hunts: true, escapedText: true, literalOriginalValues: true, staleAnalysisRejected: true, errors }, null, 2));
 } catch (error) { await captureFailure(page, 'test-investigation', error, { phase }); throw error; }

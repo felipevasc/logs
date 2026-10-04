@@ -61,7 +61,8 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
   const rnd = (() => { let s = 42; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
   const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
 
-  const now = Date.now();
+  const now = Number(localStorage.getItem("__mockFixtureTime")) || Date.now();
+  localStorage.setItem("__mockFixtureTime", String(now));
   const events = [];
   for (let i = 0; i < 4000; i++) {
     const source = pick(SOURCES);
@@ -169,9 +170,11 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
   let sourceInputs = [{ kind: "file", paths: ["C:\\mock\\mock.jsonl"], format: "auto" }];
 
   // lote de uma segunda fonte para a opção "Unir"
+  let firewallFixture = null;
   function appendFirewallBatch() {
     const base = events.length;
-    for (let i = 0; i < 2000; i++) {
+    if (firewallFixture) events.push(...structuredClone(firewallFixture));
+    else for (let i = 0; i < 2000; i++) {
       const allow = rnd() > 0.25;
       const ts = now - Math.floor(rnd() * 24 * 3600 * 1000);
       events.push({
@@ -192,6 +195,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
         },
       });
     }
+    firewallFixture ||= structuredClone(events.slice(base));
     events.sort((a, b) => b.timestamp - a.timestamp);
     COLUMNS = [...COLUMNS, "regra"];
     loadedParts.push("firewall.log (preview)");
@@ -1067,7 +1071,18 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
   handlers.detection_settings_save = args => { const { context, settings, security } = securityFor(args); security.detectionSettingsJson = JSON.stringify(args.settings); if (args.customRulesJson != null) { if (args.customRulesJson.trim()) JSON.parse(args.customRulesJson); security.customRulesJson = args.customRulesJson.trim() ? args.customRulesJson : null; } return saveInterpretation(context, settings); };
   handlers.sigma_import = args => { securityFor(args); throw Error("A prévia não pode importar arquivos Sigma; use o aplicativo nativo."); };
   handlers.sigma_clear = args => { const { context, settings, security } = securityFor(args); security.sigmaSources = []; return saveInterpretation(context, settings); };
-  handlers.triage = args => ({...mockTriage(poolOf(args.caseEvents), JSON.parse(securityFor(args).security.detectionSettingsJson)),...(window.__mockInvestigationFixture || {})});
+  handlers.triage = args => {
+    const settings = securityFor(args).security.detectionSettingsJson;
+    const input = JSON.stringify([args.analysisContext, args.caseEvents ? [] : sourceInputs.flatMap(input => input.paths || [input.path || input.channel]).sort(), poolOf(args.caseEvents), settings]);
+    let hash = 2166136261; for (let i = 0; i < input.length; i++) hash = Math.imul(hash ^ input.charCodeAt(i), 16777619);
+    const key = `preview.triage.${hash >>> 0}`, saved = localStorage.getItem(key);
+    if (!args.force && saved) return JSON.parse(saved);
+    if (args.cacheOnly) throw Error('TRIAGE_NOT_CALCULATED: análise ausente ou desatualizada');
+    window.__mockTriageScans = (window.__mockTriageScans || 0) + 1;
+    const data = {...mockTriage(poolOf(args.caseEvents), JSON.parse(settings)), ...(window.__mockInvestigationFixture || {})};
+    localStorage.setItem(key, JSON.stringify(data));
+    return data;
+  };
   const threatOverride = args => { const text = securityFor(args).security.threatCatalogJson; return text ? JSON.parse(text) : null; };
   handlers.threat_catalog = async args => { const override = threatOverride(args); return (await import('/__mock-threats__.js')).threatCatalog(override); };
   handlers.threat_catalog_update = async args => {
@@ -1291,7 +1306,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     core: {
       invoke: async (cmd, args = {}) => {
         if (window.__mockExclusionsEnabled) for (const event of events) event.event_ref ||= `preview:${event.id}`;
-        window.__mockRequests ||= []; window.__mockRequests.push({ cmd, cursor: args.cursor, offset: args.offset, operationId: args.operationId, field: args.field, grid: args.grid, caseKey: args.caseKey, analysisContext: args.analysisContext, sourceGeneration: args.sourceGeneration,
+        window.__mockRequests ||= []; window.__mockRequests.push({ cmd, cacheOnly: args.cacheOnly, cursor: args.cursor, offset: args.offset, operationId: args.operationId, field: args.field, grid: args.grid, caseKey: args.caseKey, analysisContext: args.analysisContext, sourceGeneration: args.sourceGeneration,
           ...(["analysis_field_text", "event_detail", "java_trace_detail"].includes(cmd) ? { id: args.id, eventRef: args.eventRef, column: args.column, caseContentToken: args.caseContentToken, hasCaseEvents: Object.hasOwn(args, "caseEvents") } : {}) }); if (window.__mockRequests.length > 400) window.__mockRequests.shift();
         window.__mockCommandCalls ||= {};
         window.__mockCommandCalls[cmd] = (window.__mockCommandCalls[cmd] || 0) + 1;
@@ -1317,7 +1332,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
           if (["load_file", "load_files", "load_event_log"].includes(cmd)) await simulateLoad("mock.jsonl", 6300, args.operationId);
           if (["explore_snapshot", "aggregate_events", "profile_fields"].includes(cmd)) await delay(350);
           // Tests can slow commands down (window.__mockLatency = { cmd: ms }); a cancel in between aborts them like the engine does.
-          const extra = window.__mockLatency?.[cmd];
+          const extra = !args.cacheOnly && window.__mockLatency?.[cmd];
           if (extra) { const generation = window.__mockGeneration || 0; for (let elapsed = 0; elapsed < extra; elapsed += 25) { await delay(Math.min(25, extra - elapsed)); if ((window.__mockGeneration || 0) !== generation || window.__mockCancelledIds?.has(args.operationId)) throw new Error("Operação cancelada."); } }
           if (window.__mockFailures?.[cmd]) throw new Error(window.__mockFailures[cmd]);
           let result = await h(args);

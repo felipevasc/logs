@@ -99,7 +99,7 @@ impl Spec {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Counts {
     pub count: usize,
     pub buckets: Vec<usize>,
@@ -136,14 +136,14 @@ impl Counts {
     }
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Series {
     pub key: String,
     pub count: usize,
     pub buckets: Vec<usize>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Response {
     pub field: String,
@@ -155,7 +155,7 @@ pub(crate) struct Response {
     pub untimed: usize,
     pub outside_grid: usize,
     pub limit: usize,
-    pub selection: &'static str,
+    pub selection: String,
     pub context: Context,
 }
 impl Response {
@@ -171,7 +171,7 @@ impl Response {
             untimed: 0,
             outside_grid: 0,
             limit: spec.limit,
-            selection: "top",
+            selection: "top".into(),
             context: spec.context.clone(),
         })
     }

@@ -4,8 +4,8 @@
 
 A pedido do usuário, a seleção automática foi reduzida aos contratos necessários. Esta seção substitui a política histórica registrada abaixo.
 
-- `npm run check`: parse de JavaScript, 29 arquivos de testes essenciais (308 verificações), versões coordenadas e salvaguardas de publicação. O manifesto é `scripts/ci/essential-tests.json`.
-- `npm run test:preview`: oito fluxos integrados: isolamento de Casos/índices/preferências, conexões, abertura nativa simulada, Timeline, arquivo de exclusões, campos transformados, investigação e atualização. Os quatro essenciais mais os módulos afetados são selecionados em mudanças locais; mudanças compartilhadas usam os oito.
+- `npm run check`: parse de JavaScript, 30 arquivos de testes essenciais (313 verificações), versões coordenadas e salvaguardas de publicação. O manifesto é `scripts/ci/essential-tests.json`.
+- `npm run test:preview`: dez fluxos integrados: isolamento de Casos/índices/preferências, conexões, abertura nativa simulada, Timeline, arquivo de exclusões, campos transformados, investigação, atualização, restauração de comprometimentos e progresso por verificação. Os quatro essenciais mais os módulos afetados são selecionados em mudanças locais; mudanças compartilhadas usam os dez.
 - `npm run test:native`: verificações unitárias selecionadas de publicação, cancelamento, recursos, isolamento, coleta remota, índices e persistência dos caches, mais os fluxos de paridade/build do motor, recuperação de metadados, reabertura em processos separados e importação estruturada. Windows/Linux executam a mesma seleção serial.
 - `npm run test:extended` e `node scripts/ci/native-essential.mjs --extended`: testes especializados restantes sob demanda. Testes individuais de navegador podem ser passados a `npm run test:preview -- test-NOME.mjs`.
 - Quatorze arquivos de fixtures, snapshots e verificações de apresentação redundantes foram retirados. A seleção foi consolidada em três contratos do plano de CI, em vez de uma matriz extensa de combinações equivalentes.

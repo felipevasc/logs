@@ -36,6 +36,8 @@ pub(crate) struct Progress {
     pub elapsed_ms: u64,
     pub phase_elapsed_ms: u64,
     pub cancellable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triage: Option<crate::security_progress::Snapshot>,
 }
 pub(crate) fn progress(phase_id: &'static str, phase: &'static str, completed: usize, total: usize, selected: usize) {
     report_progress("análise", phase_id, phase, completed, total, "candidatos", selected);
@@ -44,6 +46,12 @@ pub(crate) fn elapsed_ms() -> Option<u64> {
     REPORT_START.with(|s| s.get().map(|at| at.elapsed().as_millis() as u64))
 }
 pub(crate) fn report_progress(operation: &'static str, phase_id: &'static str, phase: &'static str, completed: usize, total: usize, unit: &'static str, selected: usize) {
+    report_detail(operation, phase_id, phase, completed, total, unit, selected, None);
+}
+pub(crate) fn report_triage(phase_id: &'static str, phase: &'static str, snapshot: crate::security_progress::Snapshot) {
+    report_detail("comprometimentos", phase_id, phase, snapshot.completed, snapshot.total, "verificações", snapshot.findings, Some(snapshot));
+}
+fn report_detail(operation: &'static str, phase_id: &'static str, phase: &'static str, completed: usize, total: usize, unit: &'static str, selected: usize, triage: Option<crate::security_progress::Snapshot>) {
     crate::resource_actions::phase(operation, phase, completed, total, unit);
     let reporter = REPORTER.with(|r| r.borrow().clone());
     if let Some(reporter) = reporter {
@@ -60,6 +68,7 @@ pub(crate) fn report_progress(operation: &'static str, phase_id: &'static str, p
             elapsed_ms: elapsed_ms().unwrap_or(0),
             phase_elapsed_ms,
             cancellable: current_generation().is_some(),
+            triage,
         });
     }
 }

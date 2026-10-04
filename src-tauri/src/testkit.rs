@@ -151,10 +151,25 @@ impl Source {
                 derived: parking_lot::RwLock::new(self.derived.clone()), case_store_lock: parking_lot::Mutex::new(()),
                 codes_path: Default::default(), system_codes_path: Default::default(),
             };
+            let events = (0..self.idx.lines.len().min(20)).map(|id| crate::sources::event_at(&self.idx, id, &self.codes, &self.system, &self.derived)).collect::<Vec<_>>();
+            let series = || serde_json::from_value::<crate::analysis::SeriesSpec>(serde_json::json!({"chart":"terms","metric":"count","field":"source"})).unwrap();
+            let pivot = || serde_json::from_value::<crate::analysis::PivotSpec>(serde_json::json!({"rows":["source"],"cols":["level"],"values":[{"func":"count","column":"*","alias":"Registros"}]})).unwrap();
             Ok(serde_json::json!({
                 "overview": crate::workspace::overview_impl(&state, vec![])?,
                 "fields": crate::profile_fields_impl(&state, vec![], None)?,
                 "hashes": crate::pivots::hashes_impl(&state)?,
+                "series": crate::compute_series_impl(&state, vec![], None, series())?,
+                "pivot": crate::pivot_impl(&state, vec![], None, pivot())?,
+                "discovery": crate::discover_patterns_impl(&state, vec![], None)?,
+                "journeys": crate::journeys::fields_impl(&state, &[], None)?,
+                "case": {
+                    "overview": crate::workspace::overview_scope_impl(&state, vec![], Some(&events))?,
+                    "fields": crate::profile_fields_impl(&state, vec![], Some(events.clone()))?,
+                    "series": crate::compute_series_impl(&state, vec![], Some(events.clone()), series())?,
+                    "pivot": crate::pivot_impl(&state, vec![], Some(events.clone()), pivot())?,
+                    "discovery": crate::discover_patterns_impl(&state, vec![], Some(events.clone()))?,
+                    "journeys": crate::journeys::fields_impl(&state, &[], Some(&events))?,
+                },
             }))
         })?
     }

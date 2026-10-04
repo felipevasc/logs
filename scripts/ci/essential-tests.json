@@ -3,6 +3,7 @@
   "frontend-analysis-context.test.mjs",
   "frontend-context-lifecycle.test.mjs",
   "frontend-context-menu.test.mjs",
+  "frontend-compromise-progress.test.mjs",
   "frontend-export-scope.test.mjs",
   "frontend-format-case-ownership.test.mjs",
   "frontend-load-cancel.test.mjs",

@@ -13,7 +13,7 @@ use tauri::{AppHandle, Manager};
 
 // ------------------------------------------------------------------ lanes
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct Lane {
     pub value: String,
     pub total: usize,
@@ -22,7 +22,7 @@ pub struct Lane {
     pub error_counts: Vec<u32>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lanes {
     pub column: String,
@@ -55,6 +55,21 @@ struct LaneAcc {
 }
 
 pub fn lanes_impl(
+    state: &AppState,
+    filters: Vec<Filter>,
+    start: i64,
+    end: i64,
+    bucket_count: usize,
+    column: String,
+    limit: usize,
+    case_events: Option<&[Event]>,
+) -> Result<Lanes, String> {
+    workspace::validate(&filters)?;
+    let kind = serde_json::to_string(&("lanes-v1", start, end, bucket_count, &column, limit)).map_err(|e|e.to_string())?;
+    crate::computed_cache::scope(state, &filters, case_events, &kind, || lanes_impl_uncached(state, filters.clone(), start, end, bucket_count, column, limit, case_events))
+}
+
+fn lanes_impl_uncached(
     state: &AppState,
     filters: Vec<Filter>,
     start: i64,
@@ -213,7 +228,7 @@ pub async fn timeline_lanes(
 
 // ------------------------------------------------------------------ entities
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, serde::Deserialize, Clone)]
 pub struct EntityCount {
     pub value: String,
     pub count: usize,
@@ -223,7 +238,7 @@ pub struct EntityCount {
     pub scope: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct EntityGroup {
     pub column: String,
     pub label: String,
@@ -235,6 +250,17 @@ pub struct EntityGroup {
 const SUMMARY_ROLES: &[&str] = &["@user", "@src_ip", "@dst_ip", "@host", "@process", "@domain", "@hash", "@url", "@file", "@cmdline"];
 
 pub fn entity_summary_impl(
+    state: &AppState,
+    filters: Vec<Filter>,
+    limit: usize,
+    case_events: Option<&[Event]>,
+) -> Result<Vec<EntityGroup>, String> {
+    workspace::validate(&filters)?;
+    let kind = format!("entity-summary-v1:{limit}");
+    crate::computed_cache::scope(state, &filters, case_events, &kind, || entity_summary_impl_uncached(state, filters.clone(), limit, case_events))
+}
+
+fn entity_summary_impl_uncached(
     state: &AppState,
     filters: Vec<Filter>,
     limit: usize,
@@ -433,7 +459,7 @@ pub async fn ioc_sightings(values: Vec<String>, filters: Vec<Filter>, app: AppHa
 
 // ------------------------------------------------------------------ custody
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, serde::Deserialize, Clone)]
 pub struct SourceHash {
     pub id: String,
     pub path: String,

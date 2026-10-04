@@ -1579,7 +1579,7 @@ fn expand_chain_raws(raws:crate::security_store::Spool<Raw>,external:&crate::sec
         }
         if !progress{return Err("Cadeia circular ou dependência sem resolução; análise não publicada".into());}
     }
-    let mut result=crate::security_store::Spool::new()?;let mut stmt=db.prepare("SELECT payload FROM stages ORDER BY n").map_err(|e|e.to_string())?;
+    let mut result=crate::security_store::Spool::new()?;let mut stmt=db.prepare("SELECT payload FROM stages ORDER BY rule,n").map_err(|e|e.to_string())?;
     for payload in stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?{crate::operations::check()?;result.push(serde_json::from_str::<Raw>(&payload.map_err(|e|e.to_string())?).map_err(|e|e.to_string())?)?;}
     Ok(result)
 }
@@ -1701,6 +1701,15 @@ impl Source<'_> {
         let mut seen = crate::security_store::Seen::default();
         let mut fragments = crate::security_reconstruct::Fragments::new()?;
         let reconstructed_members=crate::security_reconstruct::Members::new()?;
+        let mut scanned = 0usize;
+        let mut reported = std::time::Instant::now();
+        let mut scan_progress = || {
+            scanned += 1;
+            if reported.elapsed() >= std::time::Duration::from_millis(120) {
+                crate::operations::report_progress("comprometimentos", "triage-scan", "Lendo registros para as verificações", scanned, 0, "registros", 0);
+                reported = std::time::Instant::now();
+            }
+        };
         let mut consume =
             |ev: &Event| -> Result<(), String> {
                 let (derived, normalized) = acc.facts.normalize(ev, pass.mappings)?;
@@ -1725,6 +1734,7 @@ impl Source<'_> {
             Source::Selection(s) => {
                 for e in s.iter() {
                     crate::operations::check()?;
+                    scan_progress();
                     if let Some(key) = crate::security_reconstruct::key(&e) {
                         fragments.push(&key, &e)?;
                     } else {
@@ -1735,6 +1745,7 @@ impl Source<'_> {
             Source::Events(events) => {
                 for e in events {
                     crate::operations::check()?;
+                    scan_progress();
                     if let Some(key) = crate::security_reconstruct::key(e) {
                         fragments.push(&key, e)?;
                     } else {
@@ -1745,6 +1756,7 @@ impl Source<'_> {
         }
         while let Some((event,_))=fragments.next(&reconstructed_members)? {consume(&event)?;}
         drop(consume);
+        crate::operations::report_progress("comprometimentos", "triage-correlate", "Correlacionando os registros lidos", scanned, scanned, "registros", 0);
         acc.reconstructed=reconstructed_members;
         pass.flush_predicates(&mut acc,&mut columnar,&mut pending_events,&mut pending_normal,&mut pending_keys,&mut pending_memos)?;
         acc.facts.checkpoint()?;
@@ -1792,6 +1804,7 @@ fn run_inner(
         None => (Vec::new(), Vec::new()),
     };
     let pass = Pass { full_entity_stats:sink.is_some()&&inputs.settings.investigation.enabled,rules: inputs.rules, catalog, threat_category, mappings: &inputs.settings.mappings, behavior: &inputs.settings.investigation };
+    let mut progress = crate::security_progress::Tracker::new(inputs.rules, &category_names);
     let patterns = inputs.rules.automaton.as_ref().map(|a| a.patterns_len()).unwrap_or(0);
     let mut acc = source.fold(&pass, patterns)?;
     let investigation = acc.population.finish()?;
@@ -1965,11 +1978,22 @@ fn run_inner(
 
     // Timestamps per event id for the detection bounds.
     let raws=expand_chain_raws(raws,&external,inputs,source,&mut acc.facts,&mut acc.missing,&mut acc.applicable,&mut acc.eligible)?;
+    for (i, rule) in inputs.rules.rules.iter().enumerate() {
+        let coverage = if rule.def.kind == "absence" && !inputs.settings.coverage.iter().any(|c| c.complete && c.dataset_fingerprint == dataset_fingerprint && Some(&c.category) == rule.def.coverage.as_ref()) {
+            "missing_coverage"
+        } else if acc.applicable[i] == 0 { "not_applicable" }
+        else if acc.eligible[i] == 0 { "missing_fields" }
+        else if acc.eligible[i] < acc.applicable[i] { "partial" } else { "complete" };
+        progress.coverage(i, acc.applicable[i], acc.eligible[i], coverage);
+    }
     let mut detections: Vec<Detection> = Vec::new();
     let mut suppressed = 0usize;
     let settings = inputs.settings;
     for raw in raws.into_iter()? {
         let raw = raw?;
+        crate::operations::check()?;
+        let progress_index = raw.rule as usize;
+        progress.start(progress_index);
         let mut original_ids=crate::security_store::Spool::<(usize,Option<usize>)>::new()?;
         let mut reconstructed_ids=crate::security_store::Spool::<(usize,Option<usize>)>::new()?;
         let mut ids=Vec::new();let mut unique=crate::security_store::Seen::default();let mut full_count=0;
@@ -2376,12 +2400,15 @@ fn run_inner(
             value: if sink.is_some(){detection.id.clone()}else{detection.evidence.event_refs.join("\n")},
             value2: None,
         }];
-        if let Some(writer) = sink.as_mut() {
-            writer.push(detection)?;
+        let accepted = if let Some(writer) = sink.as_mut() {
+            writer.push(detection)?
         } else {
             detections.push(detection.clone());
-        }
+            true
+        };
+        if accepted { progress.finding(progress_index, detection.evidence.evidence_level); }
     }
+    progress.finish();
     detections.sort_by(|a, b| {
         b.evidence
             .evidence_level

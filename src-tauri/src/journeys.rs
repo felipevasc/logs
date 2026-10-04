@@ -19,7 +19,7 @@ const PROFILE_BYTES: usize = 8 * 1024 * 1024;
 const KEY_BYTES: usize = 4096;
 const CANONICAL: &[&str] = &["@user", "@src_ip", "@dst_ip", "@host"];
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct JourneyField {
     pub field: String,
     pub label: String,
@@ -31,7 +31,7 @@ pub struct JourneyField {
     pub sampled: bool,
     pub fields_limited: bool,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct JourneyGroup {
     pub value: String,
     pub count: usize,
@@ -44,7 +44,7 @@ pub struct JourneyGroup {
     pub warnings: usize,
     pub missing_time: usize,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct JourneyIndex {
     pub total: usize,
     pub groups: Vec<JourneyGroup>,
@@ -54,7 +54,7 @@ pub struct JourneyIndex {
     pub missing_time: usize,
     pub skipped_keys: usize,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct JourneyEvents {
     pub total: usize,
     pub rows: Vec<Event>,
@@ -294,6 +294,16 @@ pub(crate) fn fields_impl(
     filters: &[Filter],
     case: Option<&[Event]>,
 ) -> Result<Vec<JourneyField>, String> {
+    crate::workspace::validate(filters)?;
+    let kind = "journey-fields-v1".to_string();
+    crate::computed_cache::scope(state, filters, case, &kind, || fields_impl_uncached(state, filters, case))
+}
+
+pub(crate) fn fields_impl_uncached(
+    state: &AppState,
+    filters: &[Filter],
+    case: Option<&[Event]>,
+) -> Result<Vec<JourneyField>, String> {
     with_view(state, filters, case, |view| {
         let mut fields = BTreeMap::<String, FieldAcc>::new();
         let (mut total, mut bytes, mut limited) = (0, 0usize, false);
@@ -375,6 +385,21 @@ pub(crate) fn fields_impl(
 }
 
 pub(crate) fn index_impl(
+    state: &AppState,
+    filters: &[Filter],
+    case: Option<&[Event]>,
+    field: &str,
+    offset: usize,
+    limit: usize,
+    sort: &str,
+    singles: bool,
+) -> Result<JourneyIndex, String> {
+    crate::workspace::validate(filters)?;
+    let kind = serde_json::to_string(&("journey-index-v1", field, offset, limit, sort, singles)).map_err(|e|e.to_string())?;
+    crate::computed_cache::scope(state, filters, case, &kind, || index_impl_uncached(state, filters, case, field, offset, limit, sort, singles))
+}
+
+pub(crate) fn index_impl_uncached(
     state: &AppState,
     filters: &[Filter],
     case: Option<&[Event]>,
@@ -469,6 +494,22 @@ pub(crate) fn index_impl(
 }
 
 pub(crate) fn events_impl(
+    state: &AppState,
+    filters: &[Filter],
+    case: Option<&[Event]>,
+    field: &str,
+    value: &str,
+    from: Option<i64>,
+    to: Option<i64>,
+    offset: usize,
+    limit: usize,
+) -> Result<JourneyEvents, String> {
+    crate::workspace::validate(filters)?;
+    let kind = serde_json::to_string(&("journey-events-v1", field, value, from, to, offset, limit)).map_err(|e|e.to_string())?;
+    crate::computed_cache::scope(state, filters, case, &kind, || events_impl_uncached(state, filters, case, field, value, from, to, offset, limit))
+}
+
+pub(crate) fn events_impl_uncached(
     state: &AppState,
     filters: &[Filter],
     case: Option<&[Event]>,

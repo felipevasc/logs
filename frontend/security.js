@@ -4,8 +4,9 @@ window.Security = (() => {
   const SEVERITY = { critical: ["Crítica", 4], high: ["Alta", 3], medium: ["Média", 2], low: ["Baixa", 1], info: ["Informativa", 0] };
   const sevLabel = s => SEVERITY[s]?.[0] || s;
   const results = new Map(), analysisRequests = new WeakMap();
-  // A calculation is admitted only by an explicit action. Rendering never starts it.
+  // Rendering can reopen a completed native snapshot; only explicit actions scan.
   const pending = new Map(), previous = new Map(), failures = new Map(), resultOwners = new Map(), views = new Map();
+  const restores = new Map(), checked = new Set();
   const scopeKey = () => JSON.stringify([window.AnalysisContexts?.capture()?.caseId, window.AnalysisContexts?.capture()?.instance, workspaceScope()]);
   const notify = () => document.dispatchEvent(new CustomEvent("security-analysis-change"));
   const names = new Map();
@@ -14,6 +15,13 @@ window.Security = (() => {
   let minimumEvidence = 5, universe = "", summarySlots = null;
   const evidence = () => window.EvidenceUI;
   const universeKey = () => JSON.stringify([window.AnalysisContexts?.capture(), workspaceScope(), workspaceScope() === "case" ? caseSig(true) : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
+  function captureView() { return { minimumEvidence, tacticFilter, shownEpisodes }; }
+  function restoreView(value) {
+    universe = universeKey();
+    minimumEvidence = Number.isInteger(value?.minimumEvidence) && value.minimumEvidence >= 1 && value.minimumEvidence <= 5 ? value.minimumEvidence : 5;
+    tacticFilter = typeof value?.tacticFilter === "string" && value.tacticFilter.length <= 100 ? value.tacticFilter : null;
+    shownEpisodes = Number.isInteger(value?.shownEpisodes) && value.shownEpisodes >= 3 && value.shownEpisodes <= 500 ? value.shownEpisodes : 3;
+  }
   function syncUniverse() { const next = universeKey(); if (next !== universe) { universe = next; minimumEvidence = 5; } }
   function setMinimum(n) {
     if (!Number.isInteger(n) || n < 1 || n > 5) return;
@@ -57,11 +65,17 @@ window.Security = (() => {
   function remember(data) {
     for (const d of data?.detections || []) names.set(d.rule, d.name);
   }
+  function rememberResult(context, data, owner) {
+    checked.delete(context); results.delete(context);
+    results.set(context, data); resultOwners.set(context, owner || {});
+    while (results.size > 8) { const oldest = results.keys().next().value; results.delete(oldest); resultOwners.delete(oldest); }
+  }
   function status() {
     const scope = scopeKey(), run = pending.get(scope), failure = failures.get(scope);
     if (run) return { state: run.cancelled || run.key !== key() ? "cancelling" : "calculating" };
     if (failure?.key === key()) return failure;
     if (cached()) return { state: "ready" };
+    if (restores.has(key())) return { state: "restoring" };
     return { state: previous.has(scope) ? "stale" : "idle" };
   }
   function cancel() {
@@ -77,7 +91,39 @@ window.Security = (() => {
     for (const run of pending.values()) if (run.owner?.caseId === caseId && !(run.preparing && !run.owner?.identity)) {
       run.cancelled = true; window.Tasks?.cancelLatest(run.latest);
     }
-    failures.clear(); pageGeneration++; notify();
+    failures.clear(); checked.clear(); pageGeneration++; notify();
+  }
+  async function restore() {
+    syncUniverse();
+    const initial = key(), scope = scopeKey();
+    if (cached() || pending.has(scope) || checked.has(initial) || !state.loaded) return cached();
+    if (restores.has(initial)) return restores.get(initial);
+    const request = Promise.resolve().then(async () => {
+      let owner = window.AnalysisContexts?.capture();
+      if (owner) owner = await window.AnalysisContexts.prepare(owner);
+      if (scope !== scopeKey()) return null;
+      const context = key(), selection = fullRequest();
+      if (pending.has(scope)) return null;
+      try {
+        const data = await api("triage", { ...selection, cacheOnly: true, minimumEvidence, episodeLimit: 20 }, { silent: true, analysisOwner: owner });
+        if (scope !== scopeKey() || context !== key() || pending.has(scope)) return null;
+        if (owner) window.AnalysisContexts.assertOwner(owner);
+        analysisRequests.set(data, { request: selection, owner }); remember(data);
+        failures.delete(scope); rememberResult(context, data, owner); previous.set(scope, true);
+        return data;
+      } catch (error) {
+        if (scope === scopeKey() && context === key() && !pending.has(scope)) {
+          if (/TRIAGE_NOT_CALCULATED/.test(String(error))) checked.add(context);
+          else if (!/cancelad|ANALYSIS_CONTEXT_CHANGED/i.test(String(error))) failures.set(scope, { key: context, state: "restore-failed", error: String(error) });
+        }
+        return null;
+      }
+    }).catch(error => {
+      if (scope === scopeKey() && initial === key() && !/cancelad|ANALYSIS_CONTEXT_CHANGED/i.test(String(error))) failures.set(scope, { key: initial, state: "restore-failed", error: String(error) });
+      return null;
+    }).finally(() => { if (restores.get(initial) === request) restores.delete(initial); notify(); });
+    restores.set(initial, request); notify();
+    return request;
   }
   function get({ force = false } = {}) {
     syncUniverse();
@@ -96,8 +142,7 @@ window.Security = (() => {
       if (run.cancelled || run.key !== key() || scope !== scopeKey()) throw Error("Operação cancelada: o Caso, os dados ou as regras mudaram.");
       if (run.owner) window.AnalysisContexts.assertOwner(run.owner);
       analysisRequests.set(data, { request, owner: run.owner }); remember(data);
-      results.set(run.key, data); resultOwners.set(run.key, run.owner || {}); previous.set(scope, true);
-      if (results.size > 8) { const oldest = results.keys().next().value; results.delete(oldest); resultOwners.delete(oldest); }
+      rememberResult(run.key, data, run.owner); previous.set(scope, true);
       return data;
     }).catch(error => {
       if (run.key === key() && scope === scopeKey()) failures.set(scope, { key: run.key, state: run.cancelled || /cancelad|ANALYSIS_CONTEXT_CHANGED/i.test(String(error)) ? "cancelled" : "failed", error: String(error) });
@@ -115,7 +160,7 @@ window.Security = (() => {
     const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter,cacheOnly:true},{silent:true,analysisOwner:owner});
     analysisRequests.set(data,{request,owner});
     if(generation!==pageGeneration || context!==key() || level!==minimumEvidence)return;
-    results.set(context,data);resultOwners.set(context,owner || {});remember(data);
+    rememberResult(context,data,owner);remember(data);
     if(summarySlots?.attention?.isConnected){drawAttention(summarySlots.attention,data);if(summarySlots.entities)drawEntities(summarySlots.entities,data);}
   }
   function episodeRequest(data) {
@@ -134,7 +179,7 @@ window.Security = (() => {
     return detections;
   }
   document.addEventListener("workspace-context-change", () => {
-    tacticFilter = null; shownEpisodes = 3; minimumEvidence = 5; universe = universeKey();
+    if (universe !== universeKey()) restoreView(null);
     for (const run of pending.values()) if (run.key !== key()) { run.cancelled = true; window.Tasks?.cancelLatest(run.latest); }
     notify();
   });
@@ -595,25 +640,39 @@ window.Security = (() => {
   function drawStatus(slot, summary = false) {
     const current = status();
     if (current.state === "ready" || cached() && ["failed", "cancelled"].includes(current.state)) return false;
-    const busy = ["calculating", "cancelling"].includes(current.state);
-    const labels = { idle: "Comprometimentos ainda não calculados", stale: "Resultado desatualizado", calculating: "Calculando comprometimentos…", cancelling: "Cancelando cálculo…", cancelled: "Cálculo cancelado", failed: "Não foi possível calcular os comprometimentos" };
+    const busy = ["calculating", "cancelling", "restoring"].includes(current.state);
+    const labels = { idle: "Comprometimentos ainda não calculados", stale: "Resultado desatualizado", restoring: "Abrindo análise salva…", "restore-failed": "Não foi possível abrir a análise salva", calculating: "Calculando comprometimentos…", cancelling: "Cancelando cálculo…", cancelled: "Cálculo cancelado", failed: "Não foi possível calcular os comprometimentos" };
     const detail = current.state === "stale" ? "Os dados ou as regras mudaram. Calcule novamente para ver os indícios atuais."
+      : current.state === "restoring" ? "Recuperando os resultados já verificados neste Caso."
+      : current.state === "restore-failed" ? current.error
       : busy ? "Analisando o conjunto completo. Você pode continuar usando as outras páginas."
       : current.state === "failed" ? current.error : current.state === "cancelled" ? "Nenhum resultado parcial foi aplicado. Você pode iniciar o cálculo novamente."
       : "O cálculo só começa quando você pedir. Importar logs ou abrir esta página não inicia a análise.";
     slot.className = summary ? "ws-card sec-summary sec-calculation-state" : "ws-card sec-calculation-state";
     slot.dataset.analysisState = current.state; slot.setAttribute("aria-busy", String(busy)); slot.hidden = false;
     slot.innerHTML = `<div class="card-heading"><h2>${summary ? "Comprometimentos" : labels[current.state]}</h2></div><p role="status">${summary ? `<strong>${labels[current.state]}</strong><br>` : ""}${esc(detail)}</p>${busy ? `<button type="button" class="btn ghost small" data-cancel-compromises ${current.state === "cancelling" ? "disabled" : ""}>${current.state === "cancelling" ? "Aguardando cancelamento" : "Cancelar cálculo"}</button>` : `<button type="button" class="btn primary small" data-calculate-compromises>${["stale", "failed", "cancelled"].includes(current.state) ? "Calcular novamente" : "Calcular comprometimentos"}</button>`}`;
+    if (current.state === "restoring") slot.querySelector('[data-cancel-compromises]')?.remove();
+    if (current.state === "restore-failed") {
+      const retry = slot.querySelector('[data-calculate-compromises]'); retry.textContent = "Tentar abrir novamente";
+      retry.onclick = () => { failures.delete(scopeKey()); checked.delete(key()); void restore(); };
+      return true;
+    }
+    if (busy && current.state !== "restoring" && window.CompromiseProgress) {
+      const host = document.createElement("div"); slot.append(host);
+      slot.__verificationProgress = window.CompromiseProgress.mount(host, { expanded: !summary });
+      slot.__verificationProgress.update(window.Tasks?.entryFor?.(pending.get(scopeKey())?.latest));
+    }
     bindCalculation(slot); return true;
   }
   function registerView(attention, summary, extras = {}) {
-    for (const slot of views.keys()) if (!slot.isConnected) views.delete(slot);
+    for (const slot of views.keys()) if (!slot.isConnected) { slot.__verificationProgress?.destroy(); views.delete(slot); }
     views.set(attention, { scope: scopeKey(), summary, ...extras });
     drawView(attention, views.get(attention));
   }
   function drawView(attention, view) {
     if (!attention.isConnected || view.scope !== scopeKey()) return;
     syncUniverse();
+    attention.__verificationProgress?.destroy(); attention.__verificationProgress = null;
     if (drawStatus(attention, view.summary)) return;
     const data = cached();
     if (view.summary) drawSummary(attention, data);
@@ -635,14 +694,27 @@ window.Security = (() => {
     updateContextBar();
   }
   document.addEventListener("security-analysis-change", () => {
-    for (const [slot, view] of views) { if (!slot.isConnected) views.delete(slot); else drawView(slot, view); }
+    for (const [slot, view] of views) { if (!slot.isConnected) { slot.__verificationProgress?.destroy(); views.delete(slot); } else drawView(slot, view); }
+  });
+  document.addEventListener("task-progress", event => {
+    const run = pending.get(scopeKey()), entry = window.Tasks?.entryFor?.(run?.latest);
+    if (!run || run.cancelled || run.key !== key() || entry?.operationId !== event.detail?.operationId) return;
+    for (const [slot, view] of views) if (slot.isConnected && view.scope === scopeKey()) slot.__verificationProgress?.update(entry);
+  });
+  document.addEventListener("task-state-change", event => {
+    const run = pending.get(scopeKey());
+    if (!run) return;
+    if (event.detail?.started && event.detail.latestKey === run.latest) run.operationId = event.detail.operationId;
+    if (event.detail?.state === "cancelling" && event.detail.operationId === run.operationId && !run.cancelled) { run.cancelled = true; notify(); }
   });
   async function renderPage(host) {
     host.innerHTML = `<section class="sec-intro"><div><p>Calcule os indícios quando quiser investigar o conjunto completo.<br>Abra um indício para percorrer as evidências até os eventos originais.</p></div><small>Força da evidência, impacto potencial e resultado são informações distintas. “Quase confirmado” também pode descrever uma tentativa muito específica, inclusive bloqueada.</small></section><div class="sec-page-results" data-compromises-results></div>`;
     registerView(host.querySelector('[data-compromises-results]'), false);
+    await restore();
   }
   async function fillSummary({ attention }) {
     if (attention) registerView(attention, true);
+    if (attention) await restore();
   }
   function drawSummary(attention, data) {
     attention.hidden = false; attention.className = 'ws-card sec-summary'; attention.dataset.analysisState = "ready"; attention.removeAttribute("aria-busy");
@@ -786,5 +858,5 @@ window.Security = (() => {
     const data = cached(), episode = data?.episodes?.[index];
     if (episode) { await Workspace.showPage('compromises'); document.querySelector(`[data-episode="${index}"] [data-act="expand"]`)?.click(); }
   }
-  return { setMinimum, minimum: () => { syncUniverse(); return minimumEvidence; }, get, cached, fillSummary, renderPage, markers, renderRulesPane, recipes, recipesMenu, openEpisode, ruleName: id => names.get(id) || null, rules: async () => (await rules()).rules, invalidate, cancel, status, last: cached };
+  return { capture: captureView, restoreView, setMinimum, minimum: () => { syncUniverse(); return minimumEvidence; }, get, restore, cached, fillSummary, renderPage, markers, renderRulesPane, recipes, recipesMenu, openEpisode, ruleName: id => names.get(id) || null, rules: async () => (await rules()).rules, invalidate, cancel, status, last: cached };
 })();

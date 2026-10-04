@@ -352,12 +352,12 @@ pub(crate) fn finish_overview(
     out
 }
 
-#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Period {
     pub start: i64,
     pub end: i64,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct Change {
     pub pattern: String,
     pub before: usize,
@@ -367,7 +367,7 @@ pub struct Change {
     pub delta: f64,
     pub example: Event,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct Comparison {
     pub before_total: usize,
     pub after_total: usize,

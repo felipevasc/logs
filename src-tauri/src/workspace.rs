@@ -386,6 +386,16 @@ pub fn overview_scope_impl(
     filters: Vec<Filter>,
     case_events: Option<&[Event]>,
 ) -> Result<insights::Overview, String> {
+    crate::workspace::validate(&filters)?;
+    let kind = "overview-v1".to_string();
+    crate::computed_cache::scope(state, &filters, case_events, &kind, || overview_scope_impl_uncached(state, filters.clone(), case_events))
+}
+
+pub fn overview_scope_impl_uncached(
+    state: &AppState,
+    filters: Vec<Filter>,
+    case_events: Option<&[Event]>,
+) -> Result<insights::Overview, String> {
     validate(&filters)?;
     if let Some(events) = case_events {
         let prepared = query::prepare(&filters);
@@ -398,14 +408,14 @@ pub fn overview_scope_impl(
         crate::operations::check()?;
         return Ok(result);
     }
-    crate::computed_cache::dataset(state, &filters, "overview-v1", || {
+    (|| {
         if let Some(result) = with_engine(state, |src| crate::engine::overview(src, &query::prepare(&filters)))? {
             return Ok(result);
         }
         with_selection(state, &filters, |selection| {
             insights::overview(|| selection.iter())
         })
-    })
+    })()
 }
 #[tauri::command]
 pub async fn dataset_overview(
@@ -427,7 +437,7 @@ pub async fn dataset_overview(
     .await?
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct TimelineBucket {
     timestamp: i64,
     count: usize,
@@ -435,7 +445,7 @@ pub struct TimelineBucket {
     warnings: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineRange {
     start: i64,
@@ -457,6 +467,19 @@ pub fn timeline_range_impl(
     timeline_range_scope_impl(state, filters, start, end, bucket_count, None)
 }
 pub fn timeline_range_scope_impl(
+    state: &AppState,
+    filters: Vec<Filter>,
+    start: i64,
+    end: i64,
+    bucket_count: usize,
+    case_events: Option<&[Event]>,
+) -> Result<TimelineRange, String> {
+    crate::workspace::validate(&filters)?;
+    let kind = serde_json::to_string(&("timeline-v1", start, end, bucket_count)).map_err(|e|e.to_string())?;
+    crate::computed_cache::scope(state, &filters, case_events, &kind, || timeline_range_scope_impl_uncached(state, filters.clone(), start, end, bucket_count, case_events))
+}
+
+pub fn timeline_range_scope_impl_uncached(
     state: &AppState,
     filters: Vec<Filter>,
     start: i64,
@@ -654,6 +677,18 @@ pub fn compare_impl(
     compare_scope_impl(state, filters, before, after, None)
 }
 pub fn compare_scope_impl(
+    state: &AppState,
+    filters: Vec<Filter>,
+    before: insights::Period,
+    after: insights::Period,
+    case_events: Option<&[Event]>,
+) -> Result<insights::Comparison, String> {
+    crate::workspace::validate(&filters)?;
+    let kind = serde_json::to_string(&("compare-v1", &before, &after)).map_err(|e|e.to_string())?;
+    crate::computed_cache::scope(state, &filters, case_events, &kind, || compare_scope_impl_uncached(state, filters.clone(), before, after, case_events))
+}
+
+pub fn compare_scope_impl_uncached(
     state: &AppState,
     filters: Vec<Filter>,
     before: insights::Period,
@@ -2749,6 +2784,17 @@ pub(crate) async fn grouped_timeline(
 }
 
 pub(crate) fn grouped_timeline_impl(
+    state: &AppState, filters: &[Filter], case_events: Option<&[Event]>, spec: &crate::grouped_timeline::Spec,
+) -> Result<crate::grouped_timeline::Response, String> {
+    validate(filters)?; spec.validate()?;
+    let kind = serde_json::to_string(&("grouped-timeline-v1", &spec.field, &spec.grid, spec.limit)).map_err(|e|e.to_string())?;
+    let mut result = crate::computed_cache::scope(state, filters, case_events, &kind, || grouped_timeline_impl_uncached(state, filters, case_events, spec))?;
+    // Publication guards describe this request; they never come from disk.
+    result.context = spec.context.clone();
+    Ok(result)
+}
+
+fn grouped_timeline_impl_uncached(
     state: &AppState, filters: &[Filter], case_events: Option<&[Event]>, spec: &crate::grouped_timeline::Spec,
 ) -> Result<crate::grouped_timeline::Response, String> {
     validate(filters)?;

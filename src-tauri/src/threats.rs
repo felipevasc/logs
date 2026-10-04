@@ -713,17 +713,17 @@ fn update_catalog_path(path: &Path, bundled: &[u8]) -> Result<CatalogUpdate, Str
         catalog: info_for(path, &checked, &bundled),
     })
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Count {
     name: String,
     count: usize,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TimeCount {
     timestamp: i64,
     count: usize,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Example {
     event_id: usize,
     event_ref: String,
@@ -731,7 +731,7 @@ pub struct Example {
     snippet: String,
     normalized: bool,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct RuleResult {
     #[serde(flatten)]
     rule: Rule,
@@ -740,7 +740,7 @@ pub struct RuleResult {
     start: Option<i64>,
     end: Option<i64>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ScanResult {
     total: usize,
     matched: usize,
@@ -869,6 +869,19 @@ fn snippet(text: &str, start: usize, end: usize) -> String {
     format!("{}{}{}", if from > 0 { "…" } else { "" }, &text[from..until], if until < text.len() { "…" } else { "" })
 }
 fn scan_impl(
+    state: &AppState,
+    filters: Vec<Filter>,
+    case: Option<Vec<Event>>,
+    catalog: Arc<CompiledCatalog>,
+    catalog_path: String,
+    progress: impl FnMut(usize),
+) -> Result<ScanResult, String> {
+    validate_local(&filters, &catalog)?;
+    let kind = serde_json::to_string(&("threat-scan-v1", catalog.signature(), &catalog_path)).map_err(|e|e.to_string())?;
+    crate::computed_cache::scope(state, &filters, case.as_deref(), &kind, || scan_impl_uncached(state, filters.clone(), case.clone(), catalog, catalog_path, progress))
+}
+
+fn scan_impl_uncached(
     state: &AppState,
     filters: Vec<Filter>,
     case: Option<Vec<Event>>,

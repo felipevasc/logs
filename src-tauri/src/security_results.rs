@@ -114,7 +114,8 @@ impl Writer {
             cur = parent;
         }
     }
-    pub fn push(&mut self, d: &Detection) -> Result<(), String> {
+    /// Returns whether this finding was newly stored, so live counts exclude duplicates.
+    pub fn push(&mut self, d: &Detection) -> Result<bool, String> {
         crate::security_budget::check()?;
         let impact = match d.severity.as_str() {
             "critical" => 4,
@@ -145,7 +146,7 @@ impl Writer {
         if inserted == 0 {
             execute(&self.db, "DELETE FROM members WHERE n=?1", [n]).map_err(err)?;
             execute(&self.db, "DELETE FROM entities WHERE n=?1", [n]).map_err(err)?;
-            return Ok(());
+            return Ok(false);
         }
         execute(&self.db, "INSERT INTO parents VALUES(?1,?1,1)", [n]).map_err(err)?;
         for member in &d.evidence.evidence_members {
@@ -247,7 +248,7 @@ impl Writer {
             params![d.evidence.evidence_level, n],
         )
         .map_err(err)?;
-        Ok(())
+        Ok(true)
     }
     pub fn entity_stat(
         &self,

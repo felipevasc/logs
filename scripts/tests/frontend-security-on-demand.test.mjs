@@ -25,6 +25,48 @@ test('Comprometimentos starts only on request and coalesces repeated/forced clic
   f.calls[0].resolve(f.data('first')); await a;
   assert.equal(f.security.status().state, 'ready'); await f.security.get(); assert.equal(f.calls.length, 1);
 });
+
+test('reopening a source restores the completed snapshot without a scan', async () => {
+  const f = fixture(); f.state.loaded = true;
+  const first = f.security.restore(), duplicate = f.security.restore(); await tick();
+  assert.equal(f.calls.length, 1); assert.equal(f.calls[0].args.cacheOnly, true);
+  assert.equal(f.security.status().state, 'restoring');
+  f.calls[0].resolve(f.data('durable')); await Promise.all([first, duplicate]);
+  assert.equal(f.security.cached().analysis_id, 'durable');
+  await f.security.restore(); assert.equal(f.calls.length, 1);
+  f.state.currentArtifact.loadedAt++;
+  const reopened = f.security.restore(); await tick();
+  assert.equal(f.calls[1].args.cacheOnly, true);
+  f.calls[1].resolve(f.data('durable')); await reopened;
+  assert.equal(f.security.status().state, 'ready');
+  assert.equal(f.security.cached().analysis_id, 'durable');
+  for (let number = 0; number < 9; number++) { f.state.active = `other-${number}`; await f.calculate(`analysis-${number}`); }
+  f.state.active = 'a'; assert.equal(f.security.cached(), null);
+  const evicted = f.security.restore(); await tick(); assert.equal(f.calls.at(-1).args.cacheOnly, true);
+  f.calls.at(-1).resolve(f.data('durable')); await evicted;
+  assert.equal(f.security.cached().analysis_id, 'durable', 'memory eviction reopens the durable result');
+});
+
+test('an absent saved result stays idle and repeated navigation never starts a scan', async () => {
+  const f = fixture(); f.state.loaded = true;
+  const read = f.security.restore(); await tick(); f.calls[0].reject(Error('TRIAGE_NOT_CALCULATED: absent')); await read;
+  assert.equal(f.security.status().state, 'idle');
+  await f.security.restore(); await f.security.restore(); assert.equal(f.calls.length, 1);
+  await f.calculate('explicit'); assert.equal(f.calls[1].args.cacheOnly, undefined);
+  assert.equal(f.security.cached().analysis_id, 'explicit');
+});
+
+test('a late saved result cannot replace another Case or a newer explicit calculation', async () => {
+  const f = fixture(); f.state.loaded = true;
+  const old = f.security.restore(); await tick(); f.state.active = 'b';
+  f.calls[0].resolve(f.data('Case A')); await old; assert.equal(f.security.cached(), null);
+  const read = f.security.restore(); await tick();
+  const calculation = f.security.get(); await tick();
+  f.calls[1].resolve(f.data('saved B')); await read;
+  assert.equal(f.security.cached(), null);
+  f.calls[2].resolve(f.data('new B')); await calculation;
+  assert.equal(f.security.cached().analysis_id, 'new B');
+});
 test('Case caches are isolated and returning to an unchanged Case preserves valid results', async () => {
   const f = fixture(); await f.calculate('a-result'); f.state.active = 'b';
   assert.equal(f.security.last(), null); assert.equal(f.security.status().state, 'idle');

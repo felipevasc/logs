@@ -236,7 +236,7 @@ pub fn profile_fields(events: &[Event], columns: &[String]) -> Vec<FieldProfile>
 
 // ------------------------------------------------------------------ séries
 
-#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SeriesSpec {
     pub chart: String,  // "time" | "terms"
     pub metric: String, // count | sum | avg | min | max | distinct
@@ -252,7 +252,7 @@ pub struct SeriesSpec {
     pub unit: Option<String>, // "auto" → normaliza por unidade dominante
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct SeriesResult {
     pub(crate) kind: String,
     pub(crate) unit: String, // number | bytes | bits | duration
@@ -265,7 +265,7 @@ pub struct SeriesResult {
     pub(crate) incompatible_units: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct SeriesData {
     pub(crate) name: String,
     pub(crate) points: Vec<f64>,
@@ -752,7 +752,7 @@ pub(crate) fn series_interval(spec: &SeriesSpec, tmin: i64, tmax: i64) -> (i64, 
 
 // ------------------------------------------------------------------ pivô OLAP
 
-#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PivotSpec {
     pub rows: Vec<String>,
     pub cols: Vec<String>,
@@ -765,7 +765,7 @@ fn default_row_limit() -> usize {
     2_000
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct PivotResult {
     value_names: Vec<String>,
     col_keys: Vec<String>,

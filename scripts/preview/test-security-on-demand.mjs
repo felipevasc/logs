@@ -6,7 +6,7 @@ import { captureFailure } from './diagnostics.mjs';
 const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
 const errors = []; page.on('pageerror', error => errors.push(error.message));
-const calls = () => page.evaluate(() => window.__mockCommandCalls?.triage || 0);
+const calls = () => page.evaluate(() => window.__mockRequests?.filter(row => row.cmd === "triage" && !row.cacheOnly).length || 0);
 const stateIs = value => page.waitForFunction(value => document.querySelector('[data-compromises-results]')?.dataset.analysisState === value, value);
 let phase = 'startup';
 try {
@@ -27,7 +27,7 @@ try {
   phase = 'navigation during calculation and cancellation';
   await page.evaluate(() => { window.__mockLatency = { triage: 2000 }; });
   await page.locator('[data-calculate-compromises]').click(); await stateIs('calculating');
-  await page.waitForFunction(() => window.__mockCommandCalls.triage === 1);
+  await page.waitForFunction(() => window.__mockRequests.filter(row => row.cmd === "triage" && !row.cacheOnly).length === 1);
   await page.evaluate(() => Workspace.showPage('explore'));
   await page.evaluate(() => Workspace.showPage('compromises')); await stateIs('calculating');
   assert.equal(await calls(), 1);
@@ -78,7 +78,8 @@ try {
   assert.deepEqual(afterLoad.source, beforeLoad.source, 'reload must retain all existing source paths');
   assert.equal(afterLoad.loads, beforeLoad.loads + 1, 'the visible action must really reload the multi-file fixture');
   assert.equal(afterLoad.owner, original.caseId);
-  await page.evaluate(() => Workspace.showPage('compromises')); await stateIs('stale'); assert.equal(await calls(), 4);
+  await page.evaluate(() => Workspace.showPage('compromises')); await stateIs('ready'); assert.equal(await calls(), 4);
+  await page.evaluate(() => Security.setMinimum(2));
   phase = 'Case isolation';
   await page.evaluate(() => newCase('Comprometimentos sob demanda B'));
   await page.waitForFunction(() => !WorkspaceContext.changing && !WorkspaceContext.sourceBusy);
@@ -95,6 +96,23 @@ try {
   assert.equal(await page.evaluate(() => activeCase().id), original.caseId, 'the Case switch must complete');
   assert.equal(await calls(), 5, 'reopening another Case does not start a calculation');
   assert.notEqual(await page.evaluate(() => Security.cached()?.total), 3, 'Case B results never leak into Case A');
+  assert.equal(await page.evaluate(() => Security.minimum()), 2, 'Case A retains its evidence filter');
+  phase = 'restarting the application restores both Cases';
+  const caseB = await page.evaluate(() => state.cases.cases.find(item => item.id !== state.cases.active).id);
+  const restoredId = await page.evaluate(() => Security.cached()?.analysis_id);
+  assert.ok(restoredId, 'Case A reopened its completed analysis');
+  await page.evaluate(() => saveCases());
+  await page.reload();
+  await page.waitForFunction(() => WorkspaceContext.ready && !WorkspaceContext.changing && state.loaded && !state.loadOverlay);
+  await page.evaluate(() => Workspace.showPage('compromises')); await stateIs('ready');
+  assert.equal(await calls(), 0, 'a fresh frontend session only reopens the saved analysis');
+  assert.equal(await page.evaluate(() => Security.cached().analysis_id), restoredId);
+  assert.equal(await page.evaluate(() => Security.minimum()), 2, 'the evidence filter also survives app restart');
+  await page.evaluate(id => WorkspaceContext.changeCase(id), caseB);
+  await page.evaluate(() => Workspace.showPage('compromises')); await stateIs('ready');
+  assert.equal(await calls(), 0, 'Case B also reopens without another calculation');
+  assert.equal(await page.evaluate(() => Security.cached().total), 3);
+  assert.equal(await page.evaluate(() => Security.minimum()), 5, 'Case B keeps its own evidence filter');
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ startupScans: 0, explicitRequests: 5, cancellation: true, errorRetry: true, staleRulesAndData: true, caseIsolation: true, repeatedNavigation: true, errors }, null, 2));
 } catch (error) {

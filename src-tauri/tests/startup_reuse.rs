@@ -144,8 +144,8 @@ fn unchanged_sources_reopen_without_rebuilding_and_only_changed_sources_are_proc
     assert_eq!(warm["page"], cold["page"]);
     assert_eq!(warm["analysis"], cold["analysis"]);
     assert!(
-        cold["computed"].as_object().unwrap().len() >= 4,
-        "overview, profiles and both source hashes must be durable"
+        cold["computed"].as_object().unwrap().len() >= 14,
+        "dataset and Case analyses, charts, pivots, discovery, journeys and source hashes must be durable"
     );
     assert_eq!(
         warm["computed"], cold["computed"],

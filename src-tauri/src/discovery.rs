@@ -15,7 +15,7 @@ const FIELD_CAP: usize = 24;
 const VALUE_BYTES: usize = 200;
 type CandidateField = (usize, Vec<(String, usize)>, HashMap<String, String>);
 
-#[derive(Default, Serialize)]
+#[derive(Default, Serialize, serde::Deserialize)]
 pub struct Discovery {
     pub total: usize,
     pub sample_count: usize,
@@ -38,13 +38,13 @@ pub struct Discovery {
     pub time_bins: usize,
     pub temporal_limited: bool,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct ValueCount {
     pub value: String,
     pub count: usize,
     pub share: f64,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct Category {
     pub field: String,
     pub present: usize,
@@ -52,12 +52,12 @@ pub struct Category {
     pub dominant: ValueCount,
     pub rare: Vec<ValueCount>,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub struct Item {
     pub field: String,
     pub value: String,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct Association {
     pub left: Item,
     pub right: Item,
@@ -66,13 +66,13 @@ pub struct Association {
     pub confidence: f64,
     pub lift: f64,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct Example {
     pub event_id: usize,
     pub event_ref: String,
     pub value: f64,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct Outlier {
     pub field: String,
     pub unit: String,
@@ -88,7 +88,7 @@ pub struct Outlier {
     pub max: f64,
     pub examples: Vec<Example>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct Template {
     pub pattern: String,
     pub count: usize,

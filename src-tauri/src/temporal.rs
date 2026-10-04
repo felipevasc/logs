@@ -3,7 +3,7 @@ use super::{near_duplicate_values, Discovery, Item};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct Shift {
     pub kind: String,
     pub context: Vec<Item>,

@@ -210,9 +210,15 @@ window.Tasks = (() => {
   function progress(payload) {
     if (!payload?.operationId) return null;
     const entry = [...tasks.values()].find(t => t.operationId === payload.operationId);
-    if (!entry || entry.cancelled) return null;
+    if (!entry || entry.cancelled || entry.analysisOwner && window.AnalysisContexts && !window.AnalysisContexts.isCurrent(entry.analysisOwner)) return null;
+    if (payload.triage) {
+      const next = window.CompromiseProgress?.merge(entry.triage, payload.triage);
+      if (next === entry.triage) return entry;
+      entry.triage = next;
+    }
     entry.progress = payload;
     entry.estimate = window.PerformanceTools.estimate(entry.estimate, payload);
+    if (typeof CustomEvent === "function") document.dispatchEvent?.(new CustomEvent("task-progress", { detail: { operationId: entry.operationId } }));
     schedule(); return entry;
   }
   function detail(t) {
@@ -239,26 +245,64 @@ window.Tasks = (() => {
 
   function loader() { const node = document.createElement("span"); node.className = "li-loader"; node.setAttribute("aria-hidden", "true"); return node; }
   const elapsed = t => { const s = Math.round((performance.now() - t.started) / 1000); return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`; };
-  let drawn = "";
+  const dialogViews = new Map(), dialogGroups = new Map();
+  function destroyDialogViews() { for (const view of dialogViews.values()) { view.visual?.destroy(); view.checks?.destroy(); } dialogViews.clear(); dialogGroups.clear(); }
+  function updateDialogTask(t) {
+    const view = dialogViews.get(t.id); if (!view) return;
+    const receipt = window.WaitingProgress?.snapshot(t.progress, { operationId: t.operationId || `task-${t.id}`, elapsedMs: performance.now() - t.started,
+      estimateMs: t.estimate && performance.now() - t.estimate.updated <= 10000 && t.estimate.eta != null ? t.estimate.eta * 1000 : undefined }) || {};
+    view.visual?.update({ ...receipt, operationId: t.operationId || `task-${t.id}`, phaseId: receipt.phaseId || `command:${t.cmd}`, state: t.cancelled ? "cancelling" : t.status === "queued" ? "queued" : receipt.state || "running", label: receipt.label || WHAT[t.cmd] || "Em execução" });
+    view.checks?.update(t);
+  }
   function drawDialog() {
     const list = groups(), body = dialog.querySelector(".tasks-list");
-    // Same work as before: only the elapsed times change, so buttons stay put under the pointer.
-    const shape = list.map(g => g.key + ":" + g.tasks.map(t => t.id).join(",")).join("|");
-    if (shape === drawn && list.length) { for (const g of list) for (const t of g.tasks) { const cell = body.querySelector(`[data-elapsed="${t.id}"]`); if (cell) cell.textContent = elapsed(t); const status = body.querySelector(`[data-status="${t.id}"]`); if (status) status.textContent = detail(t); const cancelButton = body.querySelector(`[data-cancel="${t.id}"]`); if (cancelButton) cancelButton.disabled = t.cancelled; } return; }
-    drawn = shape;
-    body.innerHTML = list.length ? list.map(g => `<div class="task-group"><div class="task-origin" data-loading>${esc(g.label)}<span class="li-loader" aria-hidden="true"></span></div>${g.tasks.map(t => `<div class="task-row"><span>${esc(WHAT[t.cmd] || t.cmd)}<small data-status="${t.id}" style="display:block;max-width:36rem">${esc(detail(t))}</small></span><small data-elapsed="${t.id}">${elapsed(t)}</small>${t.operationId ? `<button type="button" class="btn ghost small" data-cancel="${t.id}" ${t.cancelled ? "disabled" : ""}>Cancelar</button>` : ""}</div>`).join("")}</div>`).join("") : '<p class="quiet-empty">Nada carregando agora.</p>';
-    body.querySelectorAll("[data-cancel]").forEach(b => { b.onclick = () => { const t = tasks.get(+b.dataset.cancel); if (t) cancel(t); }; });
+    const live = new Set(list.flatMap(group => group.tasks.map(t => t.id))), liveGroups = new Set(list.map(group => group.key));
+    for (const [id, view] of dialogViews) if (!live.has(id)) { view.visual?.destroy(); view.checks?.destroy(); view.row.remove(); dialogViews.delete(id); }
+    for (const [key, group] of dialogGroups) if (!liveGroups.has(key)) { group.remove(); dialogGroups.delete(key); }
+    body.querySelector('.quiet-empty')?.remove();
+    if (!list.length) { const empty = el("p", "quiet-empty"); empty.textContent = "Nada carregando agora."; body.append(empty); }
+    for (const [groupIndex, g] of list.entries()) {
+      let group = dialogGroups.get(g.key);
+      if (!group) { group = el("div", "task-group"); const origin = el("div", "task-origin"); origin.textContent = g.label; group.append(origin); dialogGroups.set(g.key, group); }
+      if (body.children[groupIndex] !== group) body.insertBefore(group, body.children[groupIndex] || null);
+      for (const [rowIndex, t] of g.tasks.entries()) {
+        let view = dialogViews.get(t.id);
+        if (!view) {
+          const row = el("div", "task-row");
+          row.innerHTML = `<div class="task-visual"></div><span class="task-description">${esc(WHAT[t.cmd] || t.cmd)}<small data-status style="display:block;max-width:36rem"></small></span><small data-elapsed></small>${t.operationId ? `<button type="button" class="btn ghost small" data-cancel="${t.id}">Cancelar</button>` : ""}${t.cmd === "triage" && !t.args.cacheOnly ? '<div class="task-checks"></div>' : ""}`;
+          group.append(row);
+          const checkHost = row.querySelector('.task-checks');
+          view = { row, visual: window.WaitingVisuals?.mount(row.querySelector('.task-visual'), {}, { text: false }), checks: checkHost ? window.CompromiseProgress?.mount(checkHost) : null };
+          dialogViews.set(t.id, view);
+          const cancelButton = row.querySelector('[data-cancel]'); if (cancelButton) cancelButton.onclick = () => cancel(tasks.get(t.id));
+        }
+        if (group.children[rowIndex + 1] !== view.row) group.insertBefore(view.row, group.children[rowIndex + 1] || null);
+        view.row.querySelector('[data-elapsed]').textContent = elapsed(t);
+        view.row.querySelector('[data-status]').textContent = detail(t);
+        const cancelButton = view.row.querySelector('[data-cancel]'); if (cancelButton) cancelButton.disabled = t.cancelled;
+        updateDialogTask(t);
+      }
+    }
     dialog.querySelector("[data-cancel-all]").hidden = !list.length;
   }
   function openDialog() {
     if (dialog) return;
     dialog = el("div", "modal-overlay tasks-overlay");
     dialog.innerHTML = `<section class="modal tasks-modal" role="dialog" aria-modal="true" aria-labelledby="tasks-title"><div class="modal-head"><h3 id="tasks-title">Em andamento</h3><button class="icon-btn" type="button" data-close aria-label="Fechar"><i class="fas fa-xmark"></i></button></div><div class="modal-body"><p class="muted small">Trocar de menu ou aba não interrompe o carregamento.</p><div class="tasks-list"></div><div class="modal-actions"><button type="button" class="btn ghost" data-cancel-all>Cancelar tudo</button></div></div></section>`;
-    const close = () => { dialog?.remove(); dialog = null; drawn = ""; };
+    const opener = document.activeElement;
+    const close = () => { destroyDialogViews(); dialog?.remove(); dialog = null; if (opener?.isConnected) opener.focus(); };
     dialog.onclick = e => { if (e.target === dialog) close(); };
     dialog.querySelector("[data-close]").onclick = close;
     dialog.querySelector("[data-cancel-all]").onclick = () => { cancelAll(); base("cancel_operation", {}, { silent: true }).catch(() => {}); };
-    dialog.addEventListener("keydown", e => { if (e.key === "Escape") { e.stopPropagation(); close(); } });
+    dialog.addEventListener("keydown", e => {
+      if (e.key === "Escape") { e.stopPropagation(); close(); }
+      if (e.key === "Tab") {
+        const controls = [...dialog.querySelectorAll('button:not(:disabled), select, summary')].filter(node => node.getClientRects().length);
+        const first = controls[0], last = controls.at(-1);
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
+      }
+    });
     document.body.append(dialog); drawDialog(); dialog.querySelector("[data-close]").focus();
   }
 
@@ -266,5 +310,5 @@ window.Tasks = (() => {
   button.innerHTML = '<i class="li-pulse" aria-hidden="true"></i><span></span>';
   button.onclick = openDialog;
   $("#workbar-label").before(button);
-  return { cancelAll, cancelStaleAnalysis, cancelLatest, cancelOperation: id => cancel([...tasks.values()].find(t => t.operationId === id)), progress, detail, operationFor: key => latest.get(key)?.operationId || null, pendingSources: () => [...tasks.values()].some(task => sourceMutations.has(task.cmd)), pending: () => tasks.size, open: openDialog, running: () => visible().length, groups };
+  return { cancelAll, cancelStaleAnalysis, cancelLatest, cancelOperation: id => cancel([...tasks.values()].find(t => t.operationId === id)), progress, detail, entryFor: key => latest.get(key) || null, operationFor: key => latest.get(key)?.operationId || null, pendingSources: () => [...tasks.values()].some(task => sourceMutations.has(task.cmd)), pending: () => tasks.size, open: openDialog, running: () => visible().length, groups };
 })();

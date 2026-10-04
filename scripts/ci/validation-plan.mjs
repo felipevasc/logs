@@ -9,6 +9,7 @@ export const fullPreview = [
   'test-native-case-startup.mjs', 'test-native-case-timeline.mjs',
   'test-exclusion-archive.mjs', 'test-field-transform.mjs',
   'test-investigation.mjs', 'test-updates.mjs',
+  'test-security-on-demand.mjs', 'test-compromise-progress.mjs',
 ];
 export const essentialPreview = [
   'test-workspace-context.mjs', 'test-native-case-startup.mjs',
@@ -25,6 +26,7 @@ const affected = [
   [/^frontend\/(?:java-trace)/, ['test-java-trace.mjs']],
   [/^frontend\/(?:journeys|case-trails|participants-ui)/, ['test-journeys.mjs']],
   [/^frontend\/(?:threats|security)/, ['test-journeys.mjs', 'test-threats.mjs', 'test-security-on-demand.mjs']],
+  [/^frontend\/compromise-progress\.js$/, ['test-compromise-progress.mjs']],
   [/^frontend\/remote-sources/, ['test-remote-sources.mjs']],
   [/^frontend\/workspace/, ['test-waiting-visuals.mjs', 'test-workspace-context.mjs', 'test-export-scope.mjs', 'test-source-actions.mjs', 'test-timestamp-editor.mjs']],
   [/^frontend\/case-report\./, ['test-case-report-waiting.mjs']],

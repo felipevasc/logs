@@ -21,6 +21,8 @@ window.WorkspaceContext = (() => {
     const temporal = record(input.explorerTimeline);
     snapshot.explorerTimeline = { field: typeof temporal.field === "string" ? temporal.field : null, limit: [6, 12, 24].includes(temporal.limit) ? temporal.limit : 12, hidden: strings(temporal.hidden).slice(0, 27) };
     snapshot.queryDraft = typeof input.queryDraft?.value === "string" ? { value: input.queryDraft.value, start: input.queryDraft.start, end: input.queryDraft.end, direction: input.queryDraft.direction } : null;
+    const security = record(input.security);
+    snapshot.security = { minimumEvidence: integer(security.minimumEvidence, 5, 1, 5), tacticFilter: typeof security.tacticFilter === "string" && security.tacticFilter.length <= 100 ? security.tacticFilter : null, shownEpisodes: integer(security.shownEpisodes, 3, 3, 500) };
     snapshot.page = ["summary", "compromises", "timeline", "case-timeline", "case-trails", "journeys", "explore", "compare", "evidence", "sources", "connections", "import"].includes(input.page) ? input.page : "summary";
     const v = snapshot.values;
     v.filters = validFilters(values.filters); v.quick = typeof values.quick === "string" ? values.quick : "";
@@ -44,7 +46,7 @@ window.WorkspaceContext = (() => {
   }
   function capture() {
     if (activeCase()?.kind === "preserved_case_unavailable") return defaults();
-    const snapshot = { page: document.body.dataset.page || "summary", queryDraft: window.QueryBar?.captureDraft?.() || { value: $("#quick-search").value }, values: Object.fromEntries(stateKeys.map(name => [name, copy(state[name])])), tree: [...state.treeCollapsed], cubeCollapsed: [...cubeState.collapsed], density: document.body.dataset.density, wrap: document.body.dataset.wrap, sideCollapsed: document.querySelector(".shell").classList.contains("side-collapsed"), scroll: {}, discovery: window.Discovery?.capture(), workbench: window.WorkspaceAnalysis?.capture(), explorerTimeline: window.ExplorerTimeline?.capture(), workspace: window.Workspace?.capture(), journeys: window.Journeys?.capture() };
+    const snapshot = { page: document.body.dataset.page || "summary", queryDraft: window.QueryBar?.captureDraft?.() || { value: $("#quick-search").value }, values: Object.fromEntries(stateKeys.map(name => [name, copy(state[name])])), tree: [...state.treeCollapsed], cubeCollapsed: [...cubeState.collapsed], density: document.body.dataset.density, wrap: document.body.dataset.wrap, sideCollapsed: document.querySelector(".shell").classList.contains("side-collapsed"), scroll: {}, discovery: window.Discovery?.capture(), workbench: window.WorkspaceAnalysis?.capture(), explorerTimeline: window.ExplorerTimeline?.capture(), workspace: window.Workspace?.capture(), journeys: window.Journeys?.capture(), security: window.Security?.capture() };
     for (const selector of scrollSelectors) { const node = document.querySelector(selector); if (node) snapshot.scroll[selector] = [node.scrollLeft, node.scrollTop]; }
     states.set(key(), snapshot); runtime.set(key(), Object.fromEntries(runtimeKeys.map(name => [name, state[name]])));
     snapshot.drive = [...state.driveCollapsed];
@@ -88,6 +90,7 @@ window.WorkspaceContext = (() => {
     else $("#quick-search").value = snapshot.queryDraft?.value ?? state.quick;
     window.Workspace?.restore(snapshot.workspace); window.Discovery?.restore(snapshot.discovery); window.WorkspaceAnalysis?.restore(snapshot.workbench);
     window.Journeys?.restore(snapshot.journeys); window.ExplorerTimeline?.restore(snapshot.explorerTimeline);
+    window.Security?.restoreView?.(snapshot.security);
     fillColumnControls(); renderChips(); renderExploreTree(); updateContextBar();
     restoreVisiblePreferences();
   }

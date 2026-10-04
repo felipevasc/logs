@@ -39,8 +39,23 @@ window.WaitingVisuals = (() => {
     'metadata-checkpoint-publish': 'checkpoint', 'metadata-checkpoint-committed': 'checkpoint',
     'analytics-select': 'calculation', 'analytics-verify': 'verification',
     'analytics-sql': 'calculation',
+    'triage-scan': 'reading', 'triage-correlate': 'calculation',
+    'triage-verify': 'verification', 'triage-finalize': 'composition',
     // Explicit adapter IDs for genuinely pending commands, not native subphases.
-    'command:aggregate_events': 'calculation', 'command:pivot': 'calculation',
+    'command:aggregate_events': 'calculation', 'command:pivot': 'calculation', 'command:triage': 'verification',
+    'command:query_page': 'reading', 'command:query_events': 'reading', 'command:explore_snapshot': 'reading',
+    'command:event_detail': 'reading', 'command:triage_evidence_event': 'reading', 'command:analysis_field_text': 'reading',
+    'command:list_sources': 'reading', 'command:source_summary': 'reading', 'command:java_trace_detail': 'reading',
+    'command:load_file': 'reading', 'command:load_files': 'reading', 'command:load_bundle': 'reading', 'command:load_event_log': 'reading',
+    'command:remote_import': 'reading', 'command:remote_test': 'verification',
+    'command:dataset_overview': 'calculation', 'command:count_filtered': 'calculation', 'command:tree_aggs': 'calculation',
+    'command:compute_series': 'calculation', 'command:profile_fields': 'calculation', 'command:discover_patterns': 'calculation',
+    'command:stats_events': 'calculation', 'command:timeline_range': 'calculation', 'command:timeline_lanes': 'calculation',
+    'command:grouped_timeline': 'calculation', 'command:compare_periods': 'calculation',
+    'command:threat_scan': 'verification', 'command:threat_events': 'reading', 'command:journey_index': 'calculation',
+    'command:journey_events': 'reading', 'command:journey_fields': 'reading', 'command:event_insights': 'verification',
+    'command:source_hashes': 'verification', 'command:ioc_sightings': 'verification', 'command:engine_retry': 'restoration',
+    'command:export_events': 'composition', 'command:export_investigation': 'composition', 'command:import_investigation': 'restoration',
     'command:case_report_render': 'composition', 'command:timeline_export_render': 'composition'
   });
   const STATES = Object.freeze({

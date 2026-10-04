@@ -180,7 +180,7 @@ impl SelectedPage {
     }
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct AggResult {
     pub columns: Vec<String>,
     pub rows: Vec<Map<String, Value>>,
@@ -230,7 +230,7 @@ pub struct ExplorerSnapshot {
     pub codes: AggResult,
 }
 
-#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AggSpec {
     pub func: String,
     pub column: String,

@@ -7,6 +7,7 @@ const units = [
   'metadata_checkpoint::tests::', 'index_cache::timestamp_overlay_tests::',
   'engine::build::checkpoint_tests::', 'engine::time_index::tests::',
   'workspace::canonical::tests::', 'triage::on_demand_tests::',
+  'security_progress::tests::',
   'source_publication::tests::', 'global_scheduler::tests::',
   'remote::tests::', 'remote_files::tests::', 'field_indexes::tests::',
   'analysis_context::tests::existing_sqlite_cases_migrate_but_first_new_case_does_not_inherit_globals',

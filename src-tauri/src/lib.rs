@@ -55,6 +55,7 @@ mod security_content;
 mod security_store;
 mod security_correlate;
 mod security_checkpoints;
+mod security_progress;
 mod security_deobfuscate;
 mod security_results;
 mod security_duck_stream;
@@ -1465,9 +1466,22 @@ async fn aggregate_events(
     offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
         workspace::validate(&filters)?;
         let state = app.state::<AppState>();
-        Ok::<_, String>(aggregate_events_impl(state.inner(), &group_column, aggs, filters, case_events))
+        aggregate_events_cached_impl(state.inner(), &group_column, aggs, filters, case_events)
     })
     .await?
+}
+
+pub(crate) fn aggregate_events_cached_impl(
+    state: &AppState, group_column: &str, aggs: Vec<query::AggSpec>,
+    filters: Vec<query::Filter>, case_events: Option<Vec<Event>>,
+) -> Result<query::AggResult, String> {
+    workspace::validate(&filters)?;
+    let kind = serde_json::to_string(&("aggregate-v1", group_column, &aggs)).map_err(|e|e.to_string())?;
+    computed_cache::scope(state, &filters, case_events.as_deref(), &kind, || {
+        let result = aggregate_events_impl(state, group_column, aggs, filters.clone(), case_events.clone());
+        if let Some(error) = &result.error { return Err(error.clone()); }
+        Ok(result)
+    })
 }
 
 pub(crate) fn aggregate_events_impl(
@@ -1798,6 +1812,17 @@ pub(crate) fn discover_patterns_impl(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
 ) -> Result<discovery::Discovery, String> {
+    crate::workspace::validate(&filters)?;
+    let events = case_events.as_deref();
+    let kind = "discover-v1".to_string();
+    crate::computed_cache::scope(state, &filters, events, &kind, || discover_patterns_impl_uncached(state, filters.clone(), events))
+}
+
+pub(crate) fn discover_patterns_impl_uncached(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    case_events: Option<&[Event]>,
+) -> Result<discovery::Discovery, String> {
     let memory = |events: &[Event]| {
         let prepared = query::prepare(&filters);
         let mut sample = discovery::Sampler::new();
@@ -1929,14 +1954,23 @@ pub(crate) fn profile_fields_impl(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
 ) -> Result<Vec<analysis::FieldProfile>, String> {
-    let inline = case_events.is_some();
+    crate::workspace::validate(&filters)?;
+    let events = case_events.as_deref();
+    let kind = "field-profiles-v1".to_string();
+    crate::computed_cache::scope(state, &filters, events, &kind, || profile_fields_impl_uncached(state, filters.clone(), events))
+}
+
+pub(crate) fn profile_fields_impl_uncached(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    case_events: Option<&[Event]>,
+) -> Result<Vec<analysis::FieldProfile>, String> {
     let compute = || {
-        let evs = work_events(state, filters.clone(), case_events)?;
+        let evs = work_events(state, filters.clone(), case_events.map(<[Event]>::to_vec))?;
         let columns = work_columns(&evs);
         Ok(analysis::profile_fields(&evs, &columns))
     };
-    if inline { compute() }
-    else { computed_cache::dataset(state, &filters, "field-profiles-v1", compute) }
+    compute()
 }
 
 #[tauri::command]
@@ -1963,6 +1997,18 @@ pub(crate) fn compute_series_impl(
     state: &AppState,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    spec: analysis::SeriesSpec,
+) -> Result<analysis::SeriesResult, String> {
+    crate::workspace::validate(&filters)?;
+    let events = case_events.as_deref();
+    let kind = serde_json::to_string(&("series-v1", &spec)).map_err(|e|e.to_string())?;
+    crate::computed_cache::scope(state, &filters, events, &kind, || compute_series_impl_uncached(state, filters.clone(), events, spec))
+}
+
+pub(crate) fn compute_series_impl_uncached(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    case_events: Option<&[Event]>,
     spec: analysis::SeriesSpec,
 ) -> Result<analysis::SeriesResult, String> {
     if let Some(events) = case_events {
@@ -1997,6 +2043,18 @@ pub(crate) fn pivot_impl(
     state: &AppState,
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
+    spec: analysis::PivotSpec,
+) -> Result<analysis::PivotResult, String> {
+    crate::workspace::validate(&filters)?;
+    let events = case_events.as_deref();
+    let kind = serde_json::to_string(&("pivot-v1", &spec)).map_err(|e|e.to_string())?;
+    crate::computed_cache::scope(state, &filters, events, &kind, || pivot_impl_uncached(state, filters.clone(), events, spec))
+}
+
+pub(crate) fn pivot_impl_uncached(
+    state: &AppState,
+    filters: Vec<query::Filter>,
+    case_events: Option<&[Event]>,
     spec: analysis::PivotSpec,
 ) -> Result<analysis::PivotResult, String> {
     if let Some(events) = case_events {
