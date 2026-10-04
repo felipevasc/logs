@@ -37,12 +37,14 @@ try {
     window.contextFacetTotals = Object.fromEntries(Object.entries(state.treeAgg.case).map(([key, values]) => [key, values.reduce((sum, value) => sum + value[1], 0)]));
     state.filters = [{ column: "source", op: "equals_exact", value: caseEvents()[0].source }]; await refresh();
     window.oldCaseFilter = structuredClone(state.filters);
+    toast("Aviso pertencente ao Caso anterior", "info");
     window.createdId = newCase("Caso vazio isolado").id;
   });
   for (const total of Object.values(await page.evaluate(() => window.contextFacetTotals))) assert.ok(total <= 3, "case facets contain only saved records");
   await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "dataset" && !state.loaded);
   assert.equal(await page.locator("#explore-tree").getAttribute("data-tree-scope"), "dataset");
   assert.equal(await page.evaluate(() => caseEvents().length), 0);
+  assert.doesNotMatch(await page.locator('body').innerText(), /Aviso pertencente ao Caso anterior/);
   assert.equal(await page.evaluate(() => FieldIndexes.has("source")), false, "an index from another Case is never highlighted");
   assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), "dark", "new Case starts with its own theme");
   assert.equal(await page.evaluate(() => UiScale.setting()), "auto", "new Case starts with its own scale");

@@ -1129,6 +1129,8 @@ function resetCaseSourceState() {
   window.Security?.invalidate();
   window.Discovery?.clearCache();
   explorerAnalytics.clear();
+  for (const node of [...toastFeedback.keys()]) removeToastFeedback(node);
+  $("#toast-area").replaceChildren();
   closeCtxMenu();
   clearTimeout(debounceTimer);
   Object.assign(state, { loaded: false, rows: [], total: 0, columns: [], filters: [], quick: "", currentArtifact: null, currentOrigin: "",
