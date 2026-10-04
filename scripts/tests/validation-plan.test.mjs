@@ -34,9 +34,8 @@ test('context menus and semantic waits retain their dedicated browser pilots', (
     ['frontend/context-menu.js', 'test-context-menu.mjs'],
     ['frontend/command-palette.js', 'test-context-menu.mjs'],
     ['frontend/waiting-visuals.css', 'test-waiting-visuals.mjs'],
-    ['frontend/waiting-visuals.js', 'test-waiting-reactions.mjs'],
-    ['frontend/waiting-visuals.js', 'test-waiting-verification.mjs'],
-    ['frontend/waiting-visuals.js', 'test-waiting-manual.mjs'],
+    ['frontend/waiting-visuals.js', 'test-waiting-visuals.mjs'],
+    ['frontend/workspace.css', 'test-waiting-visuals.mjs'],
     ['frontend/waiting-progress.js', 'test-waiting-visuals.mjs'],
     ['frontend/tasks.js', 'test-waiting-visuals.mjs'],
   ]) {
@@ -161,7 +160,7 @@ test('the threat pilot uses the shared cross-platform browser launcher and waits
 // checks. A workflow timeout must not cancel otherwise valid full coverage.
 test('full browser jobs budget setup and evidence in addition to every regression', () => {
   for (const [path, job] of [['checks.yml', 'frontend'], ['build.yml', 'validate']]) {
-    const workflow = readFileSync(new URL(`../../.github/workflows/${path}`, import.meta.url), 'utf8');
+    const workflow = readFileSync(new URL(`../../.github/workflows/${path}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
     const body = workflow.split(`\n  ${job}:\n`)[1]?.split(/\n  [a-z][a-z_-]*:\n/)[0];
     assert(body, `${path}: required browser job remains present`);
     const minutes = Number(body.match(/timeout-minutes: (\d+)/)?.[1]);

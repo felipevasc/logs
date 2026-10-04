@@ -117,7 +117,7 @@ const collected = sandbox.window.CaseTimeline.collect(authored);
 const notes = sandbox.window.CaseTimeline.noteMap(collected.config, collected.entries);
 const presentation = JSON.parse(JSON.stringify(collected.entries.map(entry=>({id:entry.id,type:entry.type,title:entry.title,detail:entry.detail,source:entry.source,notes:(notes.get(entry.id)||[]).map(note=>note.text)}))));
 assert.equal(presentation[0].title, 'token=group-secret');
-assert.equal(presentation[0].source, 'token="[oculto]"');
+assert.equal(presentation[0].source, 'token=source-secret', 'values are shown as recorded');
 assert.deepEqual(presentation[0].notes, ['token=note-secret']);
 assert.equal(presentation.at(-1).title, 'token=manual-secret');
 assert.equal(presentation.at(-1).detail, 'password=manual-detail');

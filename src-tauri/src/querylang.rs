@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expr {
     All,
     And(Vec<Expr>),
@@ -53,7 +53,13 @@ impl std::fmt::Debug for Threat {
 
 /// `deteccao:<id>`: records a detection rule selects (any of its steps).
 #[derive(Clone)]
-pub struct Detection(std::sync::Arc<crate::detections::RuleSet>, usize);
+pub struct Detection(std::sync::Arc<crate::detections::RuleSet>, usize, Option<std::sync::Arc<crate::security_results::Results>>);
+impl Detection {
+    fn matches(&self,event:&Event)->bool{
+        if let Some(results)=&self.2 {return match results.contains_rule_member(&self.0.rules[self.1].def.id,&crate::security_normalize::event_ref(event),event.id){Ok(value)=>value,Err(error)=>{crate::analysis_runtime::record_failure(error);false}};}
+        self.0.rules[self.1].matches(event)
+    }
+}
 impl std::fmt::Debug for Detection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Detection")
@@ -62,6 +68,9 @@ impl std::fmt::Debug for Detection {
 
 #[derive(Debug, Clone)]
 enum Matcher {
+    FieldRef(Field, bool),
+    Present,
+    Null,
     Contains(String),
     Equals(String),
     Exact(String),
@@ -70,6 +79,10 @@ enum Matcher {
     Cidr(Vec<IpNet>),
     Cmp(Cmp, f64),
     Range(f64, f64),
+    /// A comparison typed as a date on a field other than `timestamp`; bounds
+    /// are instants (ms) and values are read with `sources::text_to_ms`.
+    TimeCmp(Cmp, f64),
+    TimeRange(f64, f64),
     Exists,
     Set(HashSet<String>),
     Level(String),
@@ -603,15 +616,17 @@ impl Parser<'_> {
                 return Ok(Expr::Not(Box::new(Expr::Term(Term { field: Some(field), matcher: inner }))));
             }
             ">" | ">=" | "<" | "<=" => {
-                let number = number_for(&field.name, &value)
-                    .ok_or_else(|| self.error(&format!("Valor numérico inválido: {value}")))?;
                 let cmp = match op {
                     ">" => Cmp::Gt,
                     ">=" => Cmp::Gte,
                     "<" => Cmp::Lt,
                     _ => Cmp::Lte,
                 };
-                Matcher::Cmp(cmp, number)
+                match instant_for(&field.name, &value) {
+                    Some(ms) => Matcher::TimeCmp(cmp, ms),
+                    None => Matcher::Cmp(cmp, number_for(&field.name, &value)
+                        .ok_or_else(|| self.error(&format!("Valor numérico inválido: {value}")))?),
+                }
             }
             _ => self.smart(&field, &value, quoted)?,
         };
@@ -669,7 +684,8 @@ impl Parser<'_> {
                 .iter()
                 .position(|r| r.def.id == value)
                 .ok_or_else(|| format!("Regra de detecção não encontrada: {value}."))?;
-            return Ok(Matcher::Detection(Detection(set, index)));
+            let result=if !set.rules[index].chain_references.is_empty(){Some(crate::detections::cached_for_chain(&set.rules[index].def.id).ok_or("Calcule a análise atual antes de consultar membros de uma correlação encadeada")?)}else{None};
+            return Ok(Matcher::Detection(Detection(set, index,result)));
         }
         if !quoted {
             if value == "*" {
@@ -681,6 +697,12 @@ impl Parser<'_> {
                 }
             }
             if let Some((a, b)) = value.split_once("..") {
+                if let (Some(lo), Some(hi)) = (instant_for(&field.name, a), instant_for(&field.name, b)) {
+                    if lo > hi {
+                        return Err(format!("O início do intervalo deve ser menor que o fim em {}.", field.name));
+                    }
+                    return Ok(Matcher::TimeRange(lo, hi));
+                }
                 if let (Some(lo), Some(hi)) = (number_for(&field.name, a), number_for(&field.name, b)) {
                     if lo > hi {
                         return Err(format!("O início do intervalo deve ser menor que o fim em {}.", field.name));
@@ -743,6 +765,11 @@ fn wildcard(pattern: &str, anchored: bool) -> Result<regex::Regex, String> {
     let program = crate::query_regex::compile(&re, crate::query_regex::ORDINARY).map_err(|e| format!("Curinga inválido: {e}"))?;
     crate::operations::check()?;
     Ok(program)
+}
+
+/// Date/time typed against a field that is not the record timestamp.
+fn instant_for(field: &str, value: &str) -> Option<f64> {
+    (field != "timestamp").then(|| crate::sources::typed_instant(value)).flatten().map(|ms| ms as f64)
 }
 
 fn number_for(field: &str, value: &str) -> Option<f64> {
@@ -888,6 +915,24 @@ impl<'a> Ctx<'a> {
 }
 
 impl Expr {
+    /// Opaque catalog matchers deliberately have no shared identity. Their Debug
+    /// output omits the catalog and cannot be used as a semantic cache key.
+    pub(crate) fn shared_key(&self) -> Option<String> {
+        match self {
+            Expr::All => Some("all".into()),
+            Expr::And(parts) | Expr::Or(parts) => {
+                let keys=parts.iter().map(Self::shared_key).collect::<Option<Vec<_>>>()?;
+                Some(format!("{}:{}",if matches!(self,Expr::And(_)){"and"}else{"or"},serde_json::to_string(&keys).ok()?))
+            }
+            Expr::Not(part) => Some(format!("not:{}",part.shared_key()?)),
+            Expr::Term(Term{matcher:Matcher::Threat(_)|Matcher::Detection(_),..}) => None,
+            Expr::Term(Term{field,matcher:Matcher::Set(values)}) => {
+                let mut values=values.iter().collect::<Vec<_>>(); values.sort();
+                Some(format!("{field:?}:set:{}",serde_json::to_string(&values).ok()?))
+            }
+            _ => Some(format!("{self:?}")),
+        }
+    }
     /// Explain only predicates that actually matched. NOT/absence and derived
     /// identities have no textual match and never fabricate a highlighted span.
     pub fn evidence_excerpts(
@@ -1264,13 +1309,16 @@ impl Term {
                 Matcher::Wildcard(re) | Matcher::Regex(re) => any_value(ev, &|v| re.is_match(v)) || re.is_match(&ev.raw),
                 Matcher::Exact(value) => any_value(ev, &|v| v == value),
                 Matcher::Threat(threat) => threat.0.matches(ev),
-                Matcher::Detection(d) => d.0.rules[d.1].matches(ev),
+                Matcher::Detection(d) => d.matches(ev),
                 _ => false,
             };
         }
         match &self.matcher {
+            Matcher::FieldRef(other, negate) => ctx.field(field).zip(ctx.field(other)).is_some_and(|(left,right)| (left.to_lowercase()==right.to_lowercase()) != *negate),
+            Matcher::Present => crate::security_normalize::field_value(ev,&field.name).is_some() || ctx.field(field).is_some(),
+            Matcher::Null => crate::security_normalize::field_value(ev,&field.name).map_or_else(||ctx.field(field).is_none(),Value::is_null),
             Matcher::Threat(threat) => threat.0.matches(ev),
-            Matcher::Detection(d) => d.0.rules[d.1].matches(ev),
+            Matcher::Detection(d) => d.matches(ev),
             Matcher::Cmp(..) | Matcher::Range(..) => ctx.number(field).is_some_and(|n| self.number_matches(n)),
             _ => ctx.field(field).is_some_and(|value| self.value_matches(&value)),
         }
@@ -1281,11 +1329,27 @@ impl Term {
         self.field.as_ref().map(|f| (f.name.as_str(), f.role, f.ci))
     }
 
+    /// The same field resolver used by native evaluation, including aliases,
+    /// nested values and numeric units. Event-dependent tests are not projected.
+    pub(crate) fn projected_value(&self, ctx: &Ctx<'_>) -> Option<String> {
+        let field = self.field.as_ref()?;
+        match self.kind() {
+            TermKind::Number => ctx.number(field).map(|n| n.to_string()),
+            TermKind::Event => None,
+            _ => ctx.field(field).map(|value| value.into_owned()),
+        }
+    }
+    pub(crate) fn projection_key(&self) -> Option<String> {
+        let field = self.field.as_ref()?;
+        if field.name == "_all" || matches!(self.kind(), TermKind::Event) { return None; }
+        Some(format!("{:?}:{}:{}:{}", field.role, field.ci, field.name, matches!(self.kind(),TermKind::Number)))
+    }
+
     pub(crate) fn kind(&self) -> TermKind<'_> {
         match &self.matcher {
             Matcher::Contains(needle) => TermKind::Contains(needle),
             Matcher::Cmp(..) | Matcher::Range(..) => TermKind::Number,
-            Matcher::Threat(_) | Matcher::Detection(_) => TermKind::Event,
+            Matcher::Threat(_) | Matcher::Detection(_) | Matcher::FieldRef(..) | Matcher::Present | Matcher::Null => TermKind::Event,
             _ => TermKind::Value,
         }
     }
@@ -1353,7 +1417,17 @@ impl Term {
             Matcher::Cmp(..) | Matcher::Range(..) => {
                 crate::model::text_number(value).is_some_and(|n| self.number_matches(n))
             }
-            Matcher::Threat(_) | Matcher::Detection(_) => false,
+            Matcher::TimeCmp(cmp, bound) => crate::sources::text_to_ms(value).is_some_and(|ms| {
+                let ms = ms as f64;
+                match cmp {
+                    Cmp::Gt => ms > *bound,
+                    Cmp::Gte => ms >= *bound,
+                    Cmp::Lt => ms < *bound,
+                    Cmp::Lte => ms <= *bound,
+                }
+            }),
+            Matcher::TimeRange(lo, hi) => crate::sources::text_to_ms(value).is_some_and(|ms| (ms as f64) >= *lo && (ms as f64) <= *hi),
+            Matcher::Threat(_) | Matcher::Detection(_) | Matcher::FieldRef(..) | Matcher::Present | Matcher::Null => false,
         }
     }
 
@@ -1461,6 +1535,11 @@ pub fn field_ref(name: &str) -> FieldRef {
 
 /// Condition built programmatically (Sigma conversion).
 pub enum Spec {
+    Exact(String),
+    FieldRef(String, bool),
+    Present,
+    Null,
+    CasedWildcard(String),
     Contains(String),
     StartsWith(String),
     EndsWith(String),
@@ -1487,7 +1566,10 @@ pub fn not(item: Expr) -> Expr {
 }
 
 fn sigma_wildcard(pattern: &str) -> Result<regex::Regex, String> {
-    let mut re = String::from("(?is)^");
+    sigma_wildcard_case(pattern, false)
+}
+fn sigma_wildcard_case(pattern: &str, cased: bool) -> Result<regex::Regex, String> {
+    let mut re = String::from(if cased {"(?s)^"} else {"(?is)^"});
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -1505,7 +1587,7 @@ fn sigma_wildcard(pattern: &str) -> Result<regex::Regex, String> {
 
 /// Field term for converted rules; `field = None` searches every value.
 pub fn term(field: Option<&str>, role: Option<Role>, spec: Spec) -> Result<Expr, String> {
-    let field = field.map(|name| {
+    let mut field = field.map(|name| {
         let mut resolved = resolve_field(name);
         resolved.ci = true;
         if role.is_some() {
@@ -1514,6 +1596,15 @@ pub fn term(field: Option<&str>, role: Option<Role>, spec: Spec) -> Result<Expr,
         resolved
     });
     let matcher = match spec {
+        Spec::Exact(value)=>Matcher::Exact(value),
+        Spec::FieldRef(name,negate) => {
+            if field.is_none() || name.trim().is_empty() { return Err("fieldref exige dois campos explícitos".into()); }
+            if let Some(left)=field.as_mut(){if !left.name.starts_with('@'){left.role=None;}}
+            let mut other=resolve_field(&name);other.ci=true;if !other.name.starts_with('@'){other.role=None;} Matcher::FieldRef(other,negate)
+        },
+        Spec::Present => Matcher::Present,
+        Spec::Null => Matcher::Null,
+        Spec::CasedWildcard(v) => Matcher::Regex(sigma_wildcard_case(&v,true)?),
         Spec::Contains(v) => Matcher::Contains(v.to_lowercase()),
         Spec::Equals(v) => {
             if v.contains(['*', '?']) {
@@ -1743,5 +1834,26 @@ mod history_policy_tests {
             assert_eq!(error, "CASE_HISTORY_FILTER_CATALOG_UNAVAILABLE");
         }
         assert!(compile_rule("deteccao:x").unwrap_err().contains("dentro de uma regra"));
+    }
+}
+
+#[cfg(test)]
+mod date_query_tests {
+    use super::*;
+
+    #[test]
+    fn typed_dates_in_the_search_language_read_fields_as_instants() {
+        let mut event = Event::empty();
+        event.fields.insert("token.payload.iat".into(), serde_json::json!(1700000000));
+        event.fields.insert("updated_at".into(), serde_json::json!("2023-11-14T22:13:20Z"));
+        for source in ["token.payload.iat>2023-01-01", "token.payload.iat:2023-01-01..2023-12-31", "updated_at>=\"2023-11-14 00:00\"", "updated_at>=2023-11-14T00:00",
+            "token.payload.iat<\"2024-01-01 10:30\""] {
+            assert!(compile(source).unwrap().matches(&event), "{source}");
+        }
+        for source in ["token.payload.iat<2023-01-01", "updated_at:2024-01-01..2024-12-31"] {
+            assert!(!compile(source).unwrap().matches(&event), "{source}");
+        }
+        assert!(compile("token.payload.iat>100").unwrap().matches(&event), "numbers stay numeric");
+        assert!(compile("token.payload.iat:2024-01-01..2023-01-01").unwrap_err().contains("início"));
     }
 }

@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const POLICY_VERSION: &str = "evidence-3";
-pub const NORMALIZATION_VERSION: &str = "normalization-4";
+pub const NORMALIZATION_VERSION: &str = "normalization-7";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]

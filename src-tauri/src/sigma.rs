@@ -8,7 +8,18 @@ use crate::detections::{compile_rule, Compiled, RuleDef};
 use crate::entities::Role;
 use crate::querylang::{self, Expr, Spec};
 use serde_json::Value;
+use base64::Engine as _;
 use std::path::{Path, PathBuf};
+pub const SPECIFICATION_VERSION:&str="2.1.0";
+pub const BACKEND_VERSION:&str="loginsight-sigma-2";
+pub fn compatibility()->Value {
+    serde_json::json!({"specification_version":SPECIFICATION_VERSION,"backend_version":BACKEND_VERSION,"reference":{"pySigma":"1.5.1","revision":"f81e4f5ace2f444f76c5de03df8e0f181f85f6cc","fixture":"sigma-reference-1","scope":"modifier/boolean AST comparisons; temporal correlations use native independent slice oracle"},"status":"explicit_subset",
+        "specification":"https://sigmahq.io/sigma-specification/specification/sigma-appendix-modifiers.html",
+        "modifiers":["contains","startswith","endswith","all","re","i","m","s","cidr","exists","gt","gte","lt","lte","windash","cased","fieldref","neq","base64","base64offset","utf16","utf16le","utf16be","wide"],
+        "correlations":["event_count","value_count","temporal","temporal_ordered","value_sum","value_avg"],
+        "chaining":"temporal and temporal_ordered consume original members of referenced findings, anchored at completion time; aliases require unanimous projection",
+        "restrictions":["Unsupported modifiers, combinations and taxonomy fail import with a reason","PCRE lookaround and backreferences are unsupported by the Rust regex backend","Binary UTF16 must result in valid log text or be followed by base64","Aggregate-on-aggregate event_count/value_count is unsupported","value_percentile and generate are unsupported","FieldRef inequality requires both fields present; ordinary neq requires the selected field present","Imported severity and ATT&CK tags never assign an evidence level"]})
+}
 
 pub fn rule_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -67,6 +78,8 @@ fn documents(text: &str) -> Result<Vec<Value>, String> {
         if value.get("action").is_some() {
             return Err("action: global nao suportado".into());
         }
+        if value["taxonomy"].as_str().is_some_and(|name|name!="sigma"){return Err("Taxonomia Sigma exige pipeline explícito; não foi traduzida implicitamente".into());}
+        if value.get("generate").is_some(){return Err("generate Sigma não suportado por este backend".into());}
         out.push(value);
     }
     Ok(out)
@@ -95,6 +108,7 @@ pub fn convert_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Result<Vec
     (0..docs.len()).map(|i| { crate::operations::check()?; resolve(i, &docs, &mut Vec::new()) }).collect()
 }
 fn resolve(index: usize, docs: &[Value], stack: &mut Vec<usize>) -> Result<Compiled, String> {
+    if stack.len()>=64{return Err("Cadeia Sigma excede 64 dependências; não foi simplificada".into());}
     if stack.contains(&index) {
         return Err("dependencia circular entre regras Sigma".into());
     }
@@ -133,7 +147,7 @@ fn correlation(doc: &Value, docs: &[Value], stack: &mut Vec<usize>) -> Result<Co
             return Err(format!("referencia ausente ou ambigua: {name}"));
         }
         let rule = resolve(candidates[0], docs, stack)?;
-        if rule.def.kind != "single" {
+        if rule.def.kind != "single" && !kind.starts_with("temporal") {
             return Err(format!("correlacao sobre agregado nao suportada: {name}"));
         }
         rules.push(rule);
@@ -182,12 +196,14 @@ fn correlation(doc: &Value, docs: &[Value], stack: &mut Vec<usize>) -> Result<Co
             return Err("condition temporal nao suportada; exige todas as etapas".into());
         }
         def.kind = if kind == "temporal_ordered" { "sequence" } else { "temporal" }.into();
+        let chained=rules.iter().any(|r|r.def.kind!="single");
+        if chained {def.provenance["chain_references"]=serde_json::json!(rules.iter().map(|r|&r.def.id).collect::<Vec<_>>());}
         for (rule, name) in rules.into_iter().zip(&names) {
             def.steps.push(crate::detections::StepDef {
                 by: group.iter().map(|f| mapped(f, name)).collect::<Result<_, _>>()?,
                 ..Default::default()
             });
-            exprs.push(rule.gated_condition()?);
+            exprs.push(if chained{Expr::All}else{rule.gated_condition()?});
         }
     } else if matches!(kind, "value_sum" | "value_avg") {
         let condition = c.get("condition").and_then(Value::as_object).ok_or("condition ausente")?;
@@ -263,7 +279,7 @@ fn policy(doc: &Value) -> Result<crate::evidence::Policy, String> {
     Ok(policy)
 }
 fn metadata(doc: &Value) -> Value {
-    serde_json::json!({"format":"sigma","id":doc["id"],"name":doc["name"],"status":doc["status"],"logsource":doc["logsource"],"aliases":doc["correlation"]["aliases"],"author":doc["author"],"date":doc["date"],"modified":doc["modified"],"references":doc["references"],"falsepositives":doc["falsepositives"]})
+    serde_json::json!({"format":"sigma","specification_version":SPECIFICATION_VERSION,"backend_version":BACKEND_VERSION,"id":doc["id"],"name":doc["name"],"status":doc["status"],"logsource":doc["logsource"],"aliases":doc["correlation"]["aliases"],"author":doc["author"],"date":doc["date"],"modified":doc["modified"],"references":doc["references"],"falsepositives":doc["falsepositives"]})
 }
 
 fn text(value: &Value) -> Option<String> {
@@ -305,22 +321,20 @@ fn field_name(field: &str) -> &str {
     }
 }
 
-fn windash(value: &str) -> Vec<String> {
-    let mut out = vec![value.to_string()];
-    for (from, to) in [("-", "/"), ("/", "-"), ("-", "–"), ("-", "—"), ("-", "―")] {
-        if value.contains(from) {
-            let variant = value.replacen(from, to, 1);
-            if !out.contains(&variant) {
-                out.push(variant);
-            }
-        }
-    }
-    out
+fn windash(value: &str) -> Result<Vec<String>,String> {
+    let chars=value.chars().collect::<Vec<_>>();let word=|c:char|c.is_alphanumeric()||c=='_';let mut out=vec![String::new()];
+    for (i,&c) in chars.iter().enumerate(){
+        if matches!(c,'-'|'/') && (i==0 || !word(chars[i-1])) && chars.get(i+1).is_some_and(|c|word(*c)) {
+            if out.len()>4096/5{return Err("Expansão windash excede 4096 variantes; não foi truncada".into());}
+            out=out.into_iter().flat_map(|prefix|['-','/','–','—','―'].map(|dash|format!("{prefix}{dash}"))).collect();
+        }else{for prefix in &mut out{prefix.push(c);}}
+    }Ok(out)
 }
 
 fn value_expr(field: Option<&str>, modifiers: &[String], value: &Value) -> Result<Expr, String> {
     let has = |m: &str| modifiers.iter().any(|x| x == m);
     let supported = [
+        "fieldref", "neq", "base64", "base64offset", "utf16", "utf16le", "utf16be", "wide",
         "contains",
         "startswith",
         "endswith",
@@ -341,24 +355,50 @@ fn value_expr(field: Option<&str>, modifiers: &[String], value: &Value) -> Resul
     if let Some(m) = modifiers.iter().find(|m| !supported.contains(&m.as_str())) {
         return Err(format!("modificador não suportado: {m}"));
     }
+    if modifiers.iter().collect::<std::collections::HashSet<_>>().len()!=modifiers.len(){return Err("Modificador Sigma duplicado".into());}
+    let transformations=modifiers.iter().filter(|m|!matches!(m.as_str(),"all"|"neq")).map(String::as_str).collect::<Vec<_>>();
+    let exclusive=["exists","cidr","gt","gte","lt","lte"];
+    if exclusive.iter().any(|m|has(m)) && (transformations.len()!=1 || field.is_none()){return Err("Modificador tipado exige campo e combinação exclusiva".into());}
+    if has("re") && (transformations.first()!=Some(&"re") || transformations.iter().any(|m|!matches!(*m,"re"|"i"|"m"|"s"))){return Err("Regex Sigma exige re antes dos submodificadores i/m/s".into());}
+    if !has("re") && ["i","m","s"].iter().any(|m|has(m)){return Err("Submodificador de regex exige re".into());}
+    if ["contains","startswith","endswith"].iter().filter(|m|has(m)).count()>1{return Err("Combinação de âncoras Sigma não suportada".into());}
     let role = field.and_then(sigma_role);
     let resolved = field.map(field_name);
     if value.is_null() {
-        // "field: null" means the field is absent or empty.
-        return Ok(querylang::not(querylang::term(resolved, role, Spec::Exists)?));
+        if !transformations.is_empty(){return Err("null com modificador de transformação não suportado".into());}
+        return querylang::term(resolved, role, Spec::Null);
     }
     if has("exists") {
-        let expected = value.as_bool().unwrap_or(true);
-        let exists = querylang::term(resolved, role, Spec::Exists)?;
+        let expected = value.as_bool().ok_or("exists exige booleano")?;
+        let exists = querylang::term(resolved, role, Spec::Present)?;
         return Ok(if expected { exists } else { querylang::not(exists) });
     }
     let raw = text(value).ok_or("valor não escalar")?;
-    let variants = if has("windash") { windash(&raw) } else { vec![raw.clone()] };
+    if has("fieldref") && (raw.contains(['*','?'])||!value.is_string()||field.is_none()){return Err("fieldref exige nomes de campos literais".into());}
+    if transformations.iter().any(|m|matches!(*m,"contains"|"startswith"|"endswith"|"windash"|"cased"|"re"|"base64"|"base64offset"|"utf16"|"utf16le"|"utf16be"|"wide")) && !value.is_string(){return Err("Modificador de texto exige valor string".into());}
+    if transformations.iter().any(|m|matches!(*m,"base64"|"base64offset")) && raw.contains(['*','?']){return Err("Codificação base64 de wildcards não suportada".into());}
+    if has("fieldref") {
+        if modifiers.iter().any(|m|!matches!(m.as_str(),"fieldref"|"neq")) { return Err("Combinação fieldref não suportada".into()); }
+        return querylang::term(resolved,role,Spec::FieldRef(field_name(&raw).to_string(),has("neq")));
+    }
+    let transformed = encoded_variants(&raw,modifiers)?;
+    if modifiers.iter().any(|m|matches!(m.as_str(),"base64"|"base64offset"|"utf16"|"utf16le"|"utf16be"|"wide")) {
+        if modifiers.iter().any(|m|!matches!(m.as_str(),"base64"|"base64offset"|"utf16"|"utf16le"|"utf16be"|"wide"|"contains"|"startswith"|"endswith"|"all"|"cased")) {
+            return Err("Combinação de codificação Sigma não suportada; a regra não foi aproximada".into());
+        }
+        return Ok(querylang::or(transformed.into_iter().map(|v| {
+            let left=if has("contains")||has("endswith"){""}else{"^"};
+            let right=if has("contains")||has("startswith"){""}else{"$"};
+            querylang::term(resolved,role,Spec::Regex(format!("(?s){left}{}{right}",regex::escape(&v))))
+        }).collect::<Result<_,_>>()?));
+    }
+    let raw=transformed.into_iter().next().ok_or("Transformação Sigma vazia")?;
+    let variants = if has("windash") { windash(&raw)? } else { vec![raw.clone()] };
     let mut items = Vec::new();
     for v in variants {
         let spec = if has("re") {
             let mut pattern = String::new();
-            if has("i") || has("ignorecase") || !has("cased") {
+            if has("i") {
                 pattern.push_str("(?i)");
             }
             if has("m") || has("multiline") {
@@ -382,6 +422,9 @@ fn value_expr(field: Option<&str>, modifiers: &[String], value: &Value) -> Resul
             } else {
                 Spec::Lte(n)
             }
+        } else if has("cased") {
+            let pattern=if has("contains") || field.is_none() {format!("*{v}*")} else if has("startswith") {format!("{v}*")} else if has("endswith") {format!("*{v}")} else {v};
+            Spec::CasedWildcard(pattern)
         } else if has("contains") {
             if v.contains(['*', '?']) {
                 Spec::Wildcard(format!("*{v}*"))
@@ -404,7 +447,43 @@ fn value_expr(field: Option<&str>, modifiers: &[String], value: &Value) -> Resul
         };
         items.push(querylang::term(resolved, role, spec)?);
     }
-    Ok(querylang::or(items))
+    let expression=querylang::or(items);
+    if has("neq") {
+        Ok(querylang::and(vec![querylang::term(resolved,role,Spec::Present)?,querylang::not(expression)]))
+    } else { Ok(expression) }
+}
+
+fn encoded_variants(raw:&str,modifiers:&[String])->Result<Vec<String>,String> {
+    let mut variants=vec![raw.as_bytes().to_vec()];
+    for modifier in modifiers {
+        match modifier.as_str() {
+            "utf16"|"utf16le"|"utf16be"|"wide" => {
+                variants=variants.into_iter().map(|bytes| {
+                    let text=String::from_utf8(bytes).map_err(|_|"Ordem de codificação Sigma inválida")?;
+                    let mut out=Vec::new();
+                    if modifier=="utf16" {out.extend_from_slice(&[0xff,0xfe]);}
+                    for c in text.encode_utf16(){out.extend_from_slice(&if modifier=="utf16be" {c.to_be_bytes()}else{c.to_le_bytes()});}
+                    Ok(out)
+                }).collect::<Result<_,String>>()?;
+            },
+            "base64" => { variants=variants.into_iter().map(|bytes|base64::engine::general_purpose::STANDARD.encode(bytes).into_bytes()).collect(); },
+            "base64offset" => {
+                let mut out=Vec::new();
+                for bytes in variants {
+                    for offset in 0usize..3 {
+                        let mut input=vec![b' ';offset];input.extend_from_slice(&bytes);
+                        let encoded=base64::engine::general_purpose::STANDARD.encode(input);
+                        let start=(offset*8).div_ceil(6);let end=((offset+bytes.len())*8)/6;
+                        if start<end {out.push(encoded[start..end].as_bytes().to_vec());}
+                    }
+                }
+                if out.is_empty(){return Err("base64offset exige um valor não vazio".into());}
+                variants=out;
+            },
+            _=>{},
+        }
+    }
+    variants.into_iter().map(|bytes|String::from_utf8(bytes).map_err(|_|"A codificação binária exige base64 para ser comparada com texto de log".into())).collect()
 }
 
 fn selection_map(map: &serde_json::Map<String, Value>) -> Result<Expr, String> {
@@ -421,8 +500,12 @@ fn selection_map(map: &serde_json::Map<String, Value>) -> Result<Expr, String> {
         if values.is_empty() {
             return Err(format!("lista vazia em {key}"));
         }
-        let exprs = values.into_iter().map(|v| value_expr(field, &modifiers, v)).collect::<Result<Vec<_>, _>>()?;
-        all.push(if modifiers.iter().any(|m| m == "all") { querylang::and(exprs) } else { querylang::or(exprs) });
+        if modifiers.iter().any(|m|m=="all") && (!value.is_array()||values.len()<2){return Err("all exige lista com pelo menos dois valores".into());}
+        let references=if modifiers.iter().any(|m|m=="fieldref"){values.iter().filter_map(|v|v.as_str()).map(|name|querylang::term(Some(field_name(name)),None,Spec::Present)).collect::<Result<Vec<_>,_>>()?}else{vec![]};
+        let positive=modifiers.iter().filter(|m|m.as_str()!="neq").cloned().collect::<Vec<_>>();
+        let exprs = values.into_iter().map(|v| value_expr(field, &positive, v)).collect::<Result<Vec<_>, _>>()?;
+        let expr=if modifiers.iter().any(|m| m == "all") { querylang::and(exprs) } else { querylang::or(exprs) };
+        all.push(if modifiers.iter().any(|m|m=="neq"){if field.is_none(){return Err("neq exige campo explícito".into());}let mut guards=references;guards.push(querylang::term(field.map(field_name),field.and_then(sigma_role),Spec::Present)?);guards.push(querylang::not(expr));querylang::and(guards)}else{expr});
     }
     if all.is_empty() {
         return Err("seleção vazia".into());
@@ -829,11 +912,61 @@ detection:
 
     #[test]
     fn unsupported_constructs_are_reported() {
-        let yaml = "title: X\nlogsource: {}\ndetection:\n  sel:\n    CommandLine|base64: abc\n  condition: sel\n";
-        assert!(convert_text(yaml).err().unwrap().contains("base64"));
+        let yaml = "title: X\nlogsource: {}\ndetection:\n  sel:\n    CommandLine|expand: abc\n  condition: sel\n";
+        assert!(convert_text(yaml).err().unwrap().contains("expand"));
         let yaml = "title: Y\ndetection:\n  sel:\n    a: b\n  condition: missing\n";
         assert!(convert_text(yaml).err().unwrap().contains("inexistente"));
         let yaml = "title: Z\nstatus: deprecated\ndetection:\n  sel:\n    a: b\n  condition: sel\n";
         assert!(convert_text(yaml).is_err());
+    }
+
+    #[test]
+    fn encoded_modifiers_and_field_references_keep_their_semantics() {
+        let rules=convert_text("title: Encoded\ndetection:\n  sel:\n    CommandLine|utf16le|base64offset|contains: whoami\n  condition: sel\n").unwrap();
+        for prefix in ["","x","xx","xxx"] {
+            let bytes=format!("{prefix}whoami suffix").encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+            let hit=ev("test","",json!({"CommandLine":base64::engine::general_purpose::STANDARD.encode(bytes)}));
+            assert!(rules[0].matches(&hit));
+        }
+        assert!(!rules[0].matches(&ev("test","",json!({"CommandLine":"unrelated"}))));
+        let rules=convert_text("title: Equal fields\ndetection:\n  sel:\n    TargetUserName|fieldref: SubjectUserName\n  condition: sel\n").unwrap();
+        assert!(rules[0].matches(&ev("test","",json!({"TargetUserName":"Alice","SubjectUserName":"alice"}))));
+        assert!(!rules[0].matches(&ev("test","",json!({"TargetUserName":"Alice"}))));
+    }
+    #[test]
+    #[ignore = "Validação específica opt-in da 0.13; execute explicitamente com --ignored"]
+    fn v013_case_presence_null_and_fieldref_inequality_match_the_declared_specification(){
+        let rule=|key:&str,value:&str|convert_text(&format!("title: Test\ndetection:\n  sel:\n    {key}: {value}\n  condition: sel\n")).unwrap().remove(0);
+        let re=rule("value|re","'Admin'");assert!(re.matches(&ev("test","",json!({"value":"Admin"}))));assert!(!re.matches(&ev("test","",json!({"value":"admin"}))));
+        assert!(rule("value|re|i","'Admin'").matches(&ev("test","",json!({"value":"ADMIN"}))));
+        let cased=rule("value|cased|contains","'Admin'");assert!(!cased.matches(&ev("test","",json!({"value":"admin"}))));assert!(cased.matches(&ev("test","",json!({"value":"xAdminY"}))));
+        let present=rule("value|exists","true");for value in [json!(""),Value::Null]{assert!(present.matches(&ev("test","",json!({"value":value}))));}assert!(!present.matches(&ev("test","",json!({}))));
+        let null=rule("value","null");assert!(null.matches(&ev("test","",json!({}))));assert!(null.matches(&ev("test","",json!({"value":null}))));assert!(!null.matches(&ev("test","",json!({"value":""}))));
+        let neq=rule("left|fieldref|neq","right");assert!(neq.matches(&ev("test","",json!({"left":"a","right":"b"}))));assert!(!neq.matches(&ev("test","",json!({"left":"a"}))));assert!(!neq.matches(&ev("test","",json!({"left":"A","right":"a"}))));
+    }
+    #[test]
+    #[ignore = "Validação específica opt-in da 0.13; execute explicitamente com --ignored"]
+    fn v013_sigma_compatibility_rejects_ambiguous_combinations_and_negates_a_complete_list(){
+        let convert=|key:&str,value:&str|convert_text(&format!("title: Matrix\ndetection:\n  sel:\n    {key}: {value}\n  condition: sel\n"));
+        for (key,value) in [("x|exists|contains","true"),("x|gte|lt","10"),("x|re|contains","'abc'"),("x|i","'abc'"),("x|all","'abc'"),("x|base64|contains","'a*'"),("x|contains","42"),("x|fieldref","'a*'"),("x|cidr|re","'10.0.0.0/8'"),("x|contains|startswith","'abc'")]{assert!(convert(key,value).is_err(),"{key}");}
+        let neq=convert("x|neq","['alice','bob']").unwrap().remove(0);
+        for x in ["alice","bob","ALICE"]{assert!(!neq.matches(&ev("test","",json!({"x":x}))));}assert!(neq.matches(&ev("test","",json!({"x":"carol"}))));assert!(!neq.matches(&ev("test","",json!({}))));
+        let dash=convert("CommandLine|windash|contains","' -enc -no-logo '").unwrap().remove(0);
+        assert!(dash.matches(&ev("test","",json!({"CommandLine":"pwsh /enc —no-logo value"}))));assert!(!dash.matches(&ev("test","",json!({"CommandLine":"pwsh /enc /no/logo value"}))));
+        assert_eq!(neq.def.provenance["specification_version"],SPECIFICATION_VERSION);
+    }
+}
+
+#[cfg(test)]mod external_reference_tests{
+    use super::*;
+    #[test]
+    #[ignore = "Validação específica opt-in da 0.13; execute explicitamente com --ignored"]
+    fn v013_sigma_matches_pinned_pysigma_condition_and_modifier_fixtures(){
+        let fixture:Value=serde_json::from_str(include_str!("../tests/fixtures/security/sigma-reference.json")).unwrap();assert_eq!(fixture["upstream_revision"],"f81e4f5ace2f444f76c5de03df8e0f181f85f6cc");
+        for case in fixture["cases"].as_array().unwrap(){let rules=convert_text(case["yaml"].as_str().unwrap()).unwrap();let expr=&rules[0].conds[0];
+            let mut plan=crate::security_plan::Plan::default();let node=plan.add(expr);let db=duckdb::Connection::open_in_memory().unwrap();crate::engine::udf::register(&db).unwrap();let mut columnar=plan.columnar(&db).unwrap();
+            let events=case["events"].as_array().unwrap().iter().map(|fields|{let mut event=crate::model::Event::empty();event.fields=fields.as_object().unwrap().clone();event}).collect::<Vec<_>>();let mut memo=vec![vec![None;plan.len()];events.len()];columnar.evaluate(&db,&events,&mut memo).unwrap();
+            for (i,event) in events.iter().enumerate(){let expected=if case["backend_expected"].is_array(){assert_eq!(case["id"],"numeric_neq");assert!(case["backend_policy"].as_str().is_some());case["backend_expected"][i].as_bool().unwrap()}else{case["expected"][i].as_bool().unwrap()};assert_eq!(expr.matches(event),expected,"{} event {i}",case["id"]);assert_eq!(plan.matches(node,&crate::querylang::Ctx::new(event),&mut memo[i]),expected,"columnar {} event {i}",case["id"]);}
+        }
     }
 }

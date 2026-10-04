@@ -2491,3 +2491,8 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 .value-node-preview { color: var(--text-1); }
 .value-node-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 4px 0 7px; }
 .value-node-actions .text-button { font-size: 11px; }
+
+/* Date beside an epoch/zoned value in date-like fields (iat, exp, *_at…). */
+.date-hint, .value-node-date { margin-left: 8px; color: var(--text-2); font-size: .92em; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.date-hint::before, .value-node-date::before { content: "· "; opacity: .7; }
+.detail-tree-value-line .date-hint { align-self: center; }

@@ -155,8 +155,8 @@ pub struct Compiled {
     pub enabled: bool,
     pub(crate) conds: Vec<Expr>,
     literals: Option<Vec<usize>>,
-    window: i64,
-    counts: Vec<usize>,
+    pub(crate) window: i64,
+    pub(crate) counts: Vec<usize>,
     by: Vec<FieldRef>,
     step_by: Vec<Vec<FieldRef>>,
     distinct: Option<FieldRef>,
@@ -165,6 +165,7 @@ pub struct Compiled {
     arrays: Vec<(String, Expr)>,
     contrary: Option<Expr>,
     numerator: Option<Expr>,
+    pub(crate) chain_references:Vec<String>,
 }
 
 impl Compiled {
@@ -210,6 +211,7 @@ impl Compiled {
     }
     /// Any step of the rule (evidence filter for the detection).
     pub fn matches(&self, ev: &Event) -> bool {
+        if !self.chain_references.is_empty(){return false;}
         let (view, _) = crate::security_normalize::normalize(ev, &[]);
         let ctx = Ctx::new(&view);
         self.contextual(&view) && self.conds.iter().any(|c| c.matches_ctx(&ctx))
@@ -277,6 +279,7 @@ pub fn compile_rule(def: RuleDef, origin: &'static str, conds: Option<Vec<Expr>>
         }
         None => vec![querylang::compile_rule(&def.condition).map_err(|e| format!("{}: {e}", def.id))?],
     };
+    let conds=if let Some(namespace)=def.provenance["proposal_namespace"].as_str(){conds.into_iter().map(|expr|Ok(querylang::and(vec![expr,querylang::term(Some("_sec.namespace"),None,querylang::Spec::Exact(namespace.into()))?]))).collect::<Result<Vec<_>,String>>()?}else{conds};
     let counts: Vec<usize> = if matches!(kind, "sequence" | "temporal" | "absence") {
         def.steps.iter().map(|s| s.count.unwrap_or(1).max(1)).collect()
     } else {
@@ -361,6 +364,7 @@ pub fn compile_rule(def: RuleDef, origin: &'static str, conds: Option<Vec<Expr>>
         arrays,
         contrary,
         numerator,
+        chain_references:def.provenance["chain_references"].as_array().map(|values|values.iter().filter_map(serde_json::Value::as_str).map(str::to_string).collect()).unwrap_or_default(),
         def,
     })
 }
@@ -387,6 +391,8 @@ pub struct Suppression {
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Settings {
     #[serde(default)]
+    pub investigation: crate::investigation::Settings,
+    #[serde(default)]
     pub disabled: Vec<String>,
     #[serde(default)]
     pub suppress: Vec<Suppression>,
@@ -402,6 +408,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            investigation: Default::default(),
             disabled: Vec::new(),
             suppress: Vec::new(),
             threats: true,
@@ -420,6 +427,7 @@ pub fn load_settings() -> Settings {
 }
 
 pub(crate) fn validate_settings(settings: &Settings, previous: &Settings) -> Result<(), String> {
+    settings.investigation.validate()?;
     if settings.disabled.len() > 8192
         || settings.suppress.len() > 4096
         || settings.coverage.len() > 4096
@@ -471,6 +479,9 @@ pub(crate) fn validate_settings(settings: &Settings, previous: &Settings) -> Res
 
 pub struct RuleSet {
     pub rules: Vec<Compiled>,
+    plan: crate::security_plan::Plan,
+    condition_nodes: Vec<Vec<usize>>,
+    predicate_signature:Option<String>,
     automaton: Option<AhoCorasick>,
     pub sigma_loaded: usize,
     pub sigma_errors: Vec<String>,
@@ -603,7 +614,10 @@ fn build(
     } else {
         Some(AhoCorasick::new(&patterns).map_err(|e| format!("Pré-filtro de regras: {e}"))?)
     };
-    Ok(RuleSet { rules, automaton, sigma_loaded, sigma_errors })
+    let mut plan = crate::security_plan::Plan::default();
+    let condition_nodes = rules.iter().map(|rule| rule.conds.iter().map(|expr| plan.add(expr)).collect()).collect();
+    let predicate_signature=plan.signature();
+    Ok(RuleSet { rules, plan, condition_nodes, predicate_signature,automaton, sigma_loaded, sigma_errors })
 }
 
 fn resolve_rule(def: &RuleDef, all: &[RuleDef], stack: &mut Vec<String>) -> Result<Compiled, String> {
@@ -755,6 +769,8 @@ pub struct RoleCoverage {
 
 #[derive(Serialize)]
 pub struct Triage {
+    pub investigation: serde_json::Value,
+    pub execution: serde_json::Value,
     pub dataset_fingerprint: String,
     pub total: usize,
     pub undated: usize,
@@ -787,6 +803,7 @@ pub struct Triage {
 #[derive(Serialize)]
 pub struct RuleCoverage {
     pub rule: String,
+    pub unit: String,
     pub status: String,
     pub applicable: usize,
     pub eligible: usize,
@@ -796,19 +813,19 @@ pub struct RuleCoverage {
 // ------------------------------------------------------------------ pass
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct Hit {
-    ts: i64,
-    id: usize,
-    step: u8,
-    extra: Option<Box<str>>,
+pub(crate) struct Hit {
+    pub(crate) ts: i64,
+    pub(crate) id: usize,
+    pub(crate) step: u8,
+    pub(crate) extra: Option<Box<str>>,
     #[serde(default)]
-    reference: String,
+    pub(crate) reference: String,
     #[serde(default)]
-    source: String,
+    pub(crate) source: String,
     #[serde(default)]
-    uncertain_time: bool,
+    pub(crate) uncertain_time: bool,
     #[serde(default)]
-    binding: Option<String>,
+    pub(crate) binding: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -847,6 +864,13 @@ const COVERAGE_ROLES: [Role; 9] = [
 ];
 
 struct Acc {
+    population: crate::investigation::Population,
+    facts: crate::security_facts::Facts,
+    predicate_memo: Vec<Option<bool>>,
+    columnar_batches:usize,
+    columnar_rows:usize,
+    columnar_reused_batches:usize,
+    columnar_leaves:usize,
     fingerprint: sha2::Sha256,
     groups: crate::security_store::Groups<Hit>,
     hits: usize,
@@ -865,15 +889,19 @@ struct Acc {
     applicable: Vec<usize>,
     missing: Vec<HashSet<String>>,
     uncertain_absence: HashSet<usize>,
-    reconstructed: crate::security_store::Records<(Vec<(usize, String)>, Vec<String>)>,
+    reconstructed: crate::security_reconstruct::Members,
     duplicates: usize,
     clipped: usize,
     stats_bytes: usize,
 }
 
 impl Acc {
-    fn new(patterns: usize) -> Result<Self, String> {
+    fn new(patterns: usize, mappings: &[crate::security_normalize::SourceMapping], predicates: usize, behavior: &crate::investigation::Settings) -> Result<Self, String> {
         Ok(Acc {
+            population: crate::investigation::Population::new(behavior)?,
+            facts: crate::security_facts::Facts::new(mappings)?,
+            predicate_memo: vec![None; predicates],
+            columnar_batches:0,columnar_rows:0,columnar_reused_batches:0,columnar_leaves:0,
             fingerprint: Default::default(),
             groups: Default::default(),
             hits: 0,
@@ -892,7 +920,7 @@ impl Acc {
             applicable: vec![],
             missing: vec![],
             uncertain_absence: HashSet::new(),
-            reconstructed: crate::security_store::Records::new()?,
+            reconstructed: crate::security_reconstruct::Members::new()?,
             duplicates: 0,
             clipped: 0,
             stats_bytes: 0,
@@ -940,6 +968,8 @@ fn event_text(ev: &Event) -> String {
 }
 
 struct Pass<'a> {
+    full_entity_stats:bool,
+    behavior: &'a crate::investigation::Settings,
     rules: &'a RuleSet,
     catalog: Option<&'a CompiledCatalog>,
     mappings: &'a [crate::security_normalize::SourceMapping],
@@ -948,6 +978,19 @@ struct Pass<'a> {
 }
 
 impl Pass<'_> {
+    fn flush_predicates(&self, acc:&mut Acc, columnar:&mut crate::security_plan::Columnar,
+        events:&mut Vec<Event>, normal:&mut Vec<crate::security_normalize::Normalized>,
+        keys:&mut Vec<String>, memos:&mut Vec<Vec<Option<bool>>>) -> Result<(),String> {
+        if events.is_empty(){return Ok(());}
+        crate::security_budget::phase("predicate vectors");
+        columnar.evaluate(&acc.population.db,events,memos)?;
+        for (((event,normalized),key),memo) in events.drain(..).zip(normal.drain(..)).zip(keys.drain(..)).zip(memos.drain(..)) {
+            acc.facts.select_key(key);acc.predicate_memo=memo;
+            crate::security_budget::phase("normal facts and rule hits");
+            acc.population.observe(&event,&normalized)?;self.step(acc,&event,&normalized)?;
+        }
+        acc.columnar_batches=columnar.batches;acc.columnar_rows=columnar.rows;acc.columnar_reused_batches=columnar.reused_batches;acc.columnar_leaves=columnar.leaves();Ok(())
+    }
     fn group_key(&self, ctx: &Ctx<'_>, by: &[FieldRef], required: bool) -> Option<Box<str>> {
         let mut values = Vec::new();
         for field in by {
@@ -970,6 +1013,7 @@ impl Pass<'_> {
         crate::security_budget::check()?;
         acc.fingerprint.update((ev.event_ref.len() as u64).to_le_bytes());
         acc.fingerprint.update(ev.event_ref.as_bytes());
+        acc.fingerprint.update(acc.facts.content_key().as_bytes());
         let ctx = Ctx::new(ev);
         acc.total += 1;
         acc.clipped += usize::from(normalized.content_clipped);
@@ -997,6 +1041,7 @@ impl Pass<'_> {
             if !rule.enabled {
                 continue;
             }
+            if !rule.chain_references.is_empty(){continue;}
             let policy = &rule.def.evidence;
             if !policy.products.is_empty() && !policy.products.contains(&normalized.product) {
                 continue;
@@ -1042,8 +1087,8 @@ impl Pass<'_> {
                 }
             }
             let kind = rule.def.kind.as_str();
-            for (step, cond) in rule.conds.iter().enumerate() {
-                if !cond.matches_ctx(&ctx) {
+            for (step, _cond) in rule.conds.iter().enumerate() {
+                if !self.rules.plan.matches(self.rules.condition_nodes[index][step], &ctx, &mut acc.predicate_memo) {
                     continue;
                 }
                 if kind != "single" && kind != "absence" && ev.timestamp.is_none() {
@@ -1195,7 +1240,7 @@ impl Pass<'_> {
             }
         }
         let failure = ctx.role(Role::Outcome) == Some("failure");
-        for (slot, role) in ENTITY_ROLES.iter().enumerate() {
+        for (slot, role) in ENTITY_ROLES.iter().enumerate().filter(|_|!self.full_entity_stats) {
             let Some(value) = ctx.role(*role) else { continue };
             let value = serde_json::to_string(&(normalized.get("namespace").unwrap_or(""), value)).unwrap();
             let map = &mut acc.entities[slot];
@@ -1249,6 +1294,7 @@ impl Pass<'_> {
                 acc.coverage[slot] += 1;
             }
         }
+        if let Some(signature)=&self.rules.predicate_signature {acc.facts.save_predicates(signature,&self.rules.plan.cache_values(&acc.predicate_memo))?;}
         Ok(())
     }
 }
@@ -1432,10 +1478,110 @@ struct Raw {
     rule: u32,
     key: Box<str>,
     members: Vec<usize>,
+    #[serde(default)]
+    external: Option<crate::security_correlate::Selection>,
     distinct: usize,
     period: Option<i64>,
     extras: Vec<String>,
     metrics: serde_json::Value,
+}
+fn raw_members(raw:&Raw,external:&crate::security_correlate::Store,mut visit:impl FnMut(usize,usize)->Result<(),String>)->Result<(),String>{if let Some(selection)=&raw.external{external.members(selection,visit)}else{for &id in &raw.members{visit(id,0)?;}Ok(())}}
+fn external_raws(store:&crate::security_correlate::Store,cache:&mut crate::security_checkpoints::Cache,inputs:&Inputs<'_>,acc:&Acc,dataset:&str,base:u32)->Result<crate::security_store::Spool<Raw>,String>{
+    let mut raws=crate::security_store::Spool::new()?;
+    store.keys(|index,key|{
+        let group=store.group(index,key)?;
+        let (key,partition)=if index>=base||inputs.rules.rules[index as usize].def.kind=="single"{(serde_json::from_str::<(String,String)>(key).map_err(|e|e.to_string())?.0,None)}else{serde_json::from_str::<(String,Option<i64>)>(key).map_err(|e|e.to_string())?};
+        if index>=base {
+            let mut left=0;while left<group.len{let first=group.get(left)?;let mut right=left;let mut extras=Vec::new();while right<group.len && group.get(right)?.reference==first.reference{if let Some(extra)=group.get(right)?.extra{extras.push(extra.to_string());}right+=1;}extras.sort();extras.dedup();raws.push(Raw{rule:index,key:key.clone().into_boxed_str(),members:vec![first.id],external:None,distinct:0,period:None,extras,metrics:serde_json::Value::Null})?;left=right;}return Ok(());
+        }
+        let rule=&inputs.rules.rules[index as usize];
+        if rule.def.kind=="single" {for n in 0..group.len{raws.push(Raw{rule:index,key:key.clone().into_boxed_str(),members:vec![group.get(n)?.id],external:None,distinct:0,period:None,extras:vec![],metrics:serde_json::Value::Null})?;}return Ok(());}
+        let context=if rule.def.kind=="absence"{serde_json::to_string(&(dataset,&inputs.settings.coverage)).map_err(|e|e.to_string())?}else{crate::analysis_runtime::fact_interpretation_signature()};
+        let checkpoint_key=group.signature(&serde_json::to_string(&rule.def).map_err(|e|e.to_string())?,&format!("{key}:{partition:?}"),&context)?;
+        if let Some(saved)=cache.load(&checkpoint_key)?{for value in saved.into_iter()?{let value=value?;let selection=group.restore(&value["checkpoint_ranges"])?;let mut raw:Raw=serde_json::from_value(value).map_err(|e|e.to_string())?;raw.rule=index;raw.external=Some(selection);raws.push(raw)?;}return Ok(());}
+        cache.begin(&checkpoint_key)?;
+        let mut emit=|selection:crate::security_correlate::Selection,distinct:usize,period:Option<i64>,metrics:serde_json::Value|->Result<(),String>{let ranges=group.ranges(&selection)?;let raw=Raw{rule:index,key:key.clone().into_boxed_str(),members:vec![],external:Some(selection),distinct,period,extras:vec![],metrics};cache.push(&checkpoint_key,&serde_json::to_value(&raw).map_err(|e|e.to_string())?,ranges)?;raws.push(raw)};
+        let mut emit_range=|left:usize,right:usize,distinct:usize,period:Option<i64>,metrics:serde_json::Value|->Result<(),String>{if partition.is_some_and(|b|group.get(left).is_ok_and(|h|h.ts.div_euclid(rule.window)!=b)){return Ok(());}emit(group.range(left,right)?,distinct,period,metrics)};
+        match rule.def.kind.as_str(){
+            "threshold"|"distinct"=>group.threshold(rule.window,rule.counts[0],rule.def.kind=="distinct",|left,right,n|emit_range(left,right,n,None,serde_json::Value::Null))?,
+            "ratio"|"aggregate"=>group.measured(rule,partition,|left,right,metrics|emit(group.range(left,right)?,0,None,metrics))?,
+            "beacon"=>{if let Some(period)=group.beacon(rule.counts[0])?{emit_range(0,group.len-1,0,Some(period),serde_json::Value::Null)?;}},
+            "sequence"|"temporal"=>{
+                let mut match_indices=|indices:Vec<usize>|->Result<(),String>{if indices.is_empty(){return Ok(());}if partition.is_some_and(|b|group.get(indices[0]).is_ok_and(|h|h.ts.div_euclid(rule.window)!=b)){return Ok(());}let selection=store.selection()?;for n in indices{let hit=group.get(n)?;store.add(&selection,hit.id,hit.step as usize)?;}emit(selection,0,None,serde_json::Value::Null)};
+                if rule.def.bindings.is_empty(){group.sequence(rule.window,&rule.counts,rule.def.kind=="sequence",None,&mut match_indices)?;}else{group.bindings(|binding|group.sequence(rule.window,&rule.counts,true,Some(binding),&mut match_indices))?;}
+            },
+            "absence"=>{if !acc.uncertain_absence.contains(&(index as usize)){let ns=serde_json::from_str::<(String,String)>(&key).map_err(|e|e.to_string())?.0;for n in 0..group.len{let anchor=group.get(n)?;if anchor.step!=0||anchor.uncertain_time{continue;}let Some(end)=anchor.ts.checked_add(rule.window)else{continue;};let coverage=inputs.settings.coverage.iter().find(|c|c.complete&&c.dataset_fingerprint==dataset&&c.source==anchor.source&&c.namespace==ns&&Some(&c.category)==rule.def.coverage.as_ref()&&c.start<=anchor.ts&&c.end>=end);let Some(coverage)=coverage else{continue;};let mut prevented=false;for expected in 0..group.len{let h=group.get(expected)?;if h.step==1&&(h.uncertain_time||(h.ts>=anchor.ts&&h.ts<=end)){prevented=true;break;}}if !prevented{emit(group.one(n)?,0,None,serde_json::json!({"expected_events":0,"window_start":anchor.ts,"window_end":end,"coverage":coverage}))?;}}}},
+            _=>{}
+        }cache.finish(&checkpoint_key)?;Ok(())
+    })?;Ok(raws)
+}
+pub(crate) fn proposal_ruleset(mut rule:RuleDef)->Result<RuleSet,String>{rule.enabled=true;build(vec![rule],vec![],vec![],&HashSet::new())}
+
+/// Correlation results are first-class inputs to a chained Sigma correlation.
+/// The anchor is completion time, while evidence retains every original member.
+/// A projection is valid only when all members agree on the requested key.
+fn expand_chain_raws(raws:crate::security_store::Spool<Raw>,external:&crate::security_correlate::Store,inputs:&Inputs<'_>,source:&Source<'_>,facts:&mut crate::security_facts::Facts,missing:&mut [HashSet<String>],applicable:&mut [usize],eligible:&mut [usize])->Result<crate::security_store::Spool<Raw>,String>{
+    if !inputs.rules.rules.iter().any(|rule|!rule.chain_references.is_empty()){return Ok(raws);}
+    use rusqlite::{Connection,params};
+    let db=Connection::open("").map_err(|e|e.to_string())?;
+    db.execute_batch("PRAGMA cache_size=-2048;PRAGMA temp_store=FILE;CREATE TABLE stages(n INTEGER PRIMARY KEY,rule INTEGER,payload TEXT);CREATE INDEX stage_rule ON stages(rule,n);BEGIN;").map_err(|e|e.to_string())?;
+    let mut next=0usize;
+    for raw in raws.into_iter()? {let raw=raw?;db.execute("INSERT INTO stages VALUES(?1,?2,?3)",params![next as i64,raw.rule,serde_json::to_string(&raw).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;next+=1;}
+    let mut done:HashSet<usize>=inputs.rules.rules.iter().enumerate().filter(|(_,rule)|rule.chain_references.is_empty()).map(|(i,_)|i).collect();
+    while done.len()<inputs.rules.rules.len(){
+        let mut progress=false;
+        for (index,rule) in inputs.rules.rules.iter().enumerate(){
+            if done.contains(&index){continue;}
+            let refs=rule.chain_references.iter().map(|id|inputs.rules.rules.iter().position(|r|r.def.id==*id).ok_or_else(||format!("Referência ausente na cadeia: {id}"))).collect::<Result<Vec<_>,_>>()?;
+            if refs.iter().any(|r|!done.contains(r)){continue;}
+            done.insert(index);progress=true;
+            if !rule.enabled{continue;}
+            let mut groups=crate::security_store::Groups::<Hit>::default();
+            for (step,&referenced) in refs.iter().enumerate(){
+                let mut stmt=db.prepare("SELECT n,payload FROM stages WHERE rule=?1 ORDER BY n").map_err(|e|e.to_string())?;
+                let mut rows=stmt.query([referenced as i64]).map_err(|e|e.to_string())?;
+                while let Some(row)=rows.next().map_err(|e|e.to_string())?{
+                    applicable[index]+=1;
+                    crate::operations::check()?;let stage_id:usize=row.get(0).map_err(|e|e.to_string())?;
+                    let raw:Raw=serde_json::from_str(&row.get::<_,String>(1).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+                    let mut projection:Option<(String,Vec<String>)>=None;let mut end=None;let mut valid=true;external.clear_identity()?;
+                    raw_members(&raw,external,|id,_|{if !valid{return Ok(());}
+                        let Some(event)=source.lookup(id) else{valid=false;missing[index].insert("original_event".into());return Ok(())};
+                        let (event,n)=facts.normalize(&event,&inputs.settings.mappings)?;let ctx=Ctx::new(&event);
+                        if event.timestamp.is_none() || n.time.ambiguity.is_some(){valid=false;missing[index].insert("timestamp".into());return Ok(());}
+                        let mut values=Vec::new();for (field,name) in rule.step_by[step].iter().zip(if rule.def.steps[step].by.is_empty(){&rule.def.by}else{&rule.def.steps[step].by}){
+                            match ctx.get(field).filter(|v|!v.is_empty()){Some(value)=>values.push(value.to_string()),None=>{valid=false;missing[index].insert(name.clone());break}}
+                        }
+                        if !valid{return Ok(());}
+                        let candidate=(n.get("namespace").map(str::to_string).unwrap_or_else(||format!("source:{}",event.source)),values);
+                        if projection.as_ref().is_some_and(|old|old!=&candidate){valid=false;missing[index].insert("ambiguous_aggregate_projection".into());return Ok(());}
+                        projection=Some(candidate);end=max_opt(end,event.timestamp);external.reference(&event.event_ref)?;
+                        Ok(())
+                    })?;
+                    if !valid{continue;}let Some((namespace,values))=projection else{continue};let Some(ts)=end else{continue};
+                    eligible[index]+=1;
+
+                    let key=serde_json::to_string(&(namespace,serde_json::to_string(&values).map_err(|e|e.to_string())?)).map_err(|e|e.to_string())?;
+                    groups.push(0,&key,Hit{ts,id:stage_id,step:step as u8,extra:None,reference:external.identity(&inputs.rules.rules[referenced].def.id)?,source:"correlation".into(),uncertain_time:false,binding:None})?;
+                }
+            }
+            let chain_store=crate::security_correlate::Store::new()?;chain_store.import(groups)?;
+            chain_store.keys(|_,key|{let hits=chain_store.group(0,key)?;
+                hits.sequence(rule.window,&rule.counts,rule.def.kind!="temporal",None,|matched|{
+                    let selection=external.selection()?;let mut stage_ids=Vec::new();let mut member_steps=BTreeMap::new();
+                    for n in matched{let stage=hits.get(n)?;let payload:String=db.query_row("SELECT payload FROM stages WHERE n=?1",[stage.id as i64],|r|r.get(0)).map_err(|e|e.to_string())?;
+                        let raw:Raw=serde_json::from_str(&payload).map_err(|e|e.to_string())?;raw_members(&raw,external,|member,_|{external.add(&selection,member,stage.step as usize)?;if member_steps.len()<128{member_steps.entry(member.to_string()).or_insert(stage.step);}Ok(())})?;stage_ids.push(stage.reference.clone());}
+                    let raw=Raw{rule:index as u32,key:key.to_string().into_boxed_str(),members:vec![],external:Some(selection),distinct:0,period:None,extras:vec![],metrics:serde_json::json!({"chain":true,"completion_time_semantics":true,"referenced_rules":rule.chain_references,"referenced_matches":stage_ids,"member_steps":member_steps})};
+                    db.execute("INSERT INTO stages VALUES(?1,?2,?3)",params![next as i64,index as i64,serde_json::to_string(&raw).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;next+=1;Ok(())
+                })
+            })?;
+
+        }
+        if !progress{return Err("Cadeia circular ou dependência sem resolução; análise não publicada".into());}
+    }
+    let mut result=crate::security_store::Spool::new()?;let mut stmt=db.prepare("SELECT payload FROM stages ORDER BY n").map_err(|e|e.to_string())?;
+    for payload in stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?{crate::operations::check()?;result.push(serde_json::from_str::<Raw>(&payload.map_err(|e|e.to_string())?).map_err(|e|e.to_string())?)?;}
+    Ok(result)
 }
 
 /// Trailing windows; emit when the condition becomes true, retaining the complete
@@ -1546,15 +1692,18 @@ pub enum Source<'a> {
 
 impl Source<'_> {
     fn fold(&self, pass: &Pass<'_>, patterns: usize) -> Result<Acc, String> {
-        let mut acc = Acc::new(patterns)?;
+        let mut acc = Acc::new(patterns, pass.mappings, pass.rules.plan.len(), pass.behavior)?;
         acc.eligible.resize(pass.rules.rules.len(), 0);
         acc.applicable.resize(pass.rules.rules.len(), 0);
         acc.missing.resize_with(pass.rules.rules.len(), HashSet::new);
+        let mut columnar=pass.rules.plan.columnar(&acc.population.db)?;
+        let mut pending_events=Vec::new();let mut pending_normal=Vec::new();let mut pending_keys=Vec::new();let mut pending_memos=Vec::new();let mut pending_bytes=0usize;
         let mut seen = crate::security_store::Seen::default();
-        let mut fragments = crate::security_store::Groups::<Event>::default();
+        let mut fragments = crate::security_reconstruct::Fragments::new()?;
+        let reconstructed_members=crate::security_reconstruct::Members::new()?;
         let mut consume =
-            |ev: &Event, reconstructed: Option<(Vec<(usize, String)>, Vec<String>)>| -> Result<(), String> {
-                let (derived, normalized) = crate::security_normalize::normalize(ev, pass.mappings);
+            |ev: &Event| -> Result<(), String> {
+                let (derived, normalized) = acc.facts.normalize(ev, pass.mappings)?;
                 if let Some(key) = &normalized.dedup_key {
                     // Exact producer identity only; identical-looking messages may be distinct events.
                     if !seen.insert(key.clone())? {
@@ -1562,19 +1711,24 @@ impl Source<'_> {
                         return Ok(());
                     }
                 }
-                if let Some(members) = reconstructed {
-                    acc.reconstructed.insert(ev.id, &members)?;
+                let mut memo=vec![None;pass.rules.plan.len()];
+                if let Some(signature)=&pass.rules.predicate_signature{acc.facts.restore_predicates(signature,&mut memo)?;}
+                pending_keys.push(acc.facts.content_key().to_string());pending_memos.push(memo);
+                pending_bytes+=derived.raw.len()+derived.message.len()+serde_json::to_vec(&derived.fields).map_err(|e|e.to_string())?.len()+serde_json::to_vec(&normalized).map_err(|e|e.to_string())?.len();
+                pending_events.push(derived);pending_normal.push(normalized);
+                if pending_events.len()>=1024 || pending_bytes>=8*1024*1024 {
+                    pass.flush_predicates(&mut acc,&mut columnar,&mut pending_events,&mut pending_normal,&mut pending_keys,&mut pending_memos)?;pending_bytes=0;
                 }
-                pass.step(&mut acc, &derived, &normalized)
+                Ok(())
             };
         match self {
             Source::Selection(s) => {
                 for e in s.iter() {
                     crate::operations::check()?;
                     if let Some(key) = crate::security_reconstruct::key(&e) {
-                        fragments.push(0, &key, e)?;
+                        fragments.push(&key, &e)?;
                     } else {
-                        consume(&e, None)?;
+                        consume(&e)?;
                     }
                 }
             }
@@ -1582,18 +1736,18 @@ impl Source<'_> {
                 for e in events {
                     crate::operations::check()?;
                     if let Some(key) = crate::security_reconstruct::key(e) {
-                        fragments.push(0, &key, (*e).clone())?;
+                        fragments.push(&key, e)?;
                     } else {
-                        consume(e, None)?;
+                        consume(e)?;
                     }
                 }
             }
         }
-        for group in fragments.into_iter()? {
-            let (_, events) = group?;
-            let operation = crate::security_reconstruct::assemble(events)?;
-            consume(&operation.event, Some((operation.members, operation.limitations)))?;
-        }
+        while let Some((event,_))=fragments.next(&reconstructed_members)? {consume(&event)?;}
+        drop(consume);
+        acc.reconstructed=reconstructed_members;
+        pass.flush_predicates(&mut acc,&mut columnar,&mut pending_events,&mut pending_normal,&mut pending_keys,&mut pending_memos)?;
+        acc.facts.checkpoint()?;
         Ok(acc)
     }
     fn lookup(&self, id: usize) -> Option<Event> {
@@ -1612,11 +1766,15 @@ pub fn run(inputs: &Inputs<'_>, source: &Source<'_>) -> Result<Triage, String> {
     run_inner(inputs, source, None)
 }
 pub fn run_stored(inputs: &Inputs<'_>, source: &Source<'_>) -> Result<Arc<crate::security_results::Results>, String> {
-    let _working = crate::security_store::working_lane();
+    run_stored_mode(inputs,source,true)
+}
+pub fn run_stored_evaluation(inputs:&Inputs<'_>,source:&Source<'_>)->Result<Arc<crate::security_results::Results>,String>{run_stored_mode(inputs,source,false)}
+fn run_stored_mode(inputs:&Inputs<'_>,source:&Source<'_>,publish:bool)->Result<Arc<crate::security_results::Results>,String>{
+    let _working = crate::security_store::working_lane()?;
     let started = std::time::Instant::now();
     let mut writer = crate::security_results::Writer::new()?;
     let metadata = run_inner(inputs, source, Some(&mut writer))?;
-    let mut result = writer.finish(metadata)?;
+    let mut result = if publish{writer.finish(metadata)?}else{writer.finish_evaluation(metadata)?};
     Arc::get_mut(&mut result).unwrap().metadata["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
     Ok(result)
 }
@@ -1633,17 +1791,26 @@ fn run_inner(
         Some(c) => threat_categories(c, rule_count_in_catalog),
         None => (Vec::new(), Vec::new()),
     };
-    let pass = Pass { rules: inputs.rules, catalog, threat_category, mappings: &inputs.settings.mappings };
+    let pass = Pass { full_entity_stats:sink.is_some()&&inputs.settings.investigation.enabled,rules: inputs.rules, catalog, threat_category, mappings: &inputs.settings.mappings, behavior: &inputs.settings.investigation };
     let patterns = inputs.rules.automaton.as_ref().map(|a| a.patterns_len()).unwrap_or(0);
-    let acc = source.fold(&pass, patterns)?;
+    let mut acc = source.fold(&pass, patterns)?;
+    let investigation = acc.population.finish()?;
+    if let Some(writer) = sink.as_mut() { writer.import_population(&acc.population)?; }
     let dataset_fingerprint = format!("{:x}", acc.fingerprint.clone().finalize());
     let lookup = |id: usize| source.lookup(id);
     crate::operations::check()?;
     let base = inputs.rules.rules.len() as u32;
 
     // Group hits into raw detections per rule kind.
+    let external = crate::security_correlate::Store::new()?;
+    let mut checkpoints=crate::security_checkpoints::Cache::new()?;
+    let groups = std::mem::take(&mut acc.groups);
+    let raws = if sink.is_some() {
+        external.import(groups)?;
+        external_raws(&external,&mut checkpoints,inputs,&acc,&dataset_fingerprint,base)?
+    } else {
     let mut raws = crate::security_store::Spool::<Raw>::new()?;
-    for group in acc.groups.into_iter()? {
+    for group in groups.into_iter()? {
         let ((rule_index, key), mut hits) = group?;
         let (key, partition) = if rule_index >= base || inputs.rules.rules[rule_index as usize].def.kind == "single" {
             (serde_json::from_str::<(String, String)>(&key).map_err(|e| e.to_string())?.0, None)
@@ -1668,6 +1835,7 @@ fn run_inner(
                         rule: rule_index,
                         key: key.clone(),
                         members: segment.iter().map(|h| h.id).collect(),
+                        external: None,
                         distinct: 0,
                         period: None,
                         extras,
@@ -1690,6 +1858,7 @@ fn run_inner(
                 rule: rule_index,
                 key: key.clone(),
                 members: members.iter().map(|&m| hits[m].id).collect(),
+                external: None,
                 distinct,
                 period,
                 extras: Vec::new(),
@@ -1703,6 +1872,7 @@ fn run_inner(
                         rule: rule_index,
                         key: key.clone(),
                         members: members.iter().map(|&m| hits[m].id).collect(),
+                external: None,
                         distinct: 0,
                         period: None,
                         extras: Vec::new(),
@@ -1735,7 +1905,7 @@ fn run_inner(
                     if hits.iter().any(|h| h.step == 1 && (h.uncertain_time || (h.ts >= anchor.ts && h.ts <= end))) {
                         continue;
                     }
-                    raws.push(Raw {rule:rule_index,key:key.clone(),members:vec![anchor.id],distinct:0,period:None,extras:Vec::new(),metrics:serde_json::json!({"expected_events":0,"window_start":anchor.ts,"window_end":end,"coverage":coverage})})?;
+                    raws.push(Raw {rule:rule_index,key:key.clone(),members:vec![anchor.id],external:None,distinct:0,period:None,extras:Vec::new(),metrics:serde_json::json!({"expected_events":0,"window_start":anchor.ts,"window_end":end,"coverage":coverage})})?;
                 }
             }
             "single" => {
@@ -1790,18 +1960,22 @@ fn run_inner(
         }
     }
 
+        raws
+    };
+
     // Timestamps per event id for the detection bounds.
+    let raws=expand_chain_raws(raws,&external,inputs,source,&mut acc.facts,&mut acc.missing,&mut acc.applicable,&mut acc.eligible)?;
     let mut detections: Vec<Detection> = Vec::new();
     let mut suppressed = 0usize;
     let settings = inputs.settings;
     for raw in raws.into_iter()? {
         let raw = raw?;
-        let mut ids = raw.members;
-        let mut unique = HashSet::new();
-        ids.retain(|id| unique.insert(*id));
-        if ids.is_empty() {
-            continue;
-        }
+        let mut original_ids=crate::security_store::Spool::<(usize,Option<usize>)>::new()?;
+        let mut reconstructed_ids=crate::security_store::Spool::<(usize,Option<usize>)>::new()?;
+        let mut ids=Vec::new();let mut unique=crate::security_store::Seen::default();let mut full_count=0;
+        let mut add=|id:usize,step:Option<usize>|->Result<(),String>{if unique.insert(id.to_string())?{original_ids.push((id,step))?;reconstructed_ids.push((id,step))?;full_count+=1;if sink.is_none()||ids.len()<128{ids.push(id);}}Ok(())};
+        if let Some(selection)=&raw.external{external.members(selection,|id,step|add(id,Some(step)))?;}else{for id in raw.members{add(id,None)?;}}
+        if ids.is_empty(){continue;}
         let (name, description, severity, attack_refs, kind, origin, by_columns, rule_id): (
             String,
             String,
@@ -1915,7 +2089,7 @@ fn run_inner(
             tactics,
             start: None,
             end: None,
-            count: ids.len(),
+            count: full_count,
             entities: entity_refs,
             summary: String::new(),
             distinct: raw.distinct,
@@ -1928,6 +2102,7 @@ fn run_inner(
             measurements: raw.metrics,
         };
         let detection = &mut detection;
+        if let Some(writer)=sink.as_ref(){for entity in &detection.entities{writer.stage_entity(&detection.namespace,&entity.column,&entity.value,&entity.label)?;}}
         crate::operations::check()?;
         let first = lookup(detection.event_ids[0]);
         detection.start = None;
@@ -1942,11 +2117,11 @@ fn run_inner(
             ..Default::default()
         });
         if rule.is_none() && detection.signal_rules.iter().any(|id| id.starts_with("web.xss.") || id.starts_with("web.sql.") || id.starts_with("web.path.")) {
-            let request = first.as_ref().is_some_and(|e| {
-                let n=crate::security_normalize::normalize(e,&inputs.settings.mappings).1;
+            let request = if let Some(e) = first.as_ref() {
+                let n=acc.facts.normalize(e,&inputs.settings.mappings)?.1;
                 inputs.catalog.is_some_and(|catalog| catalog.explain(e).iter().any(|h| detection.signal_rules.contains(&catalog.rule(h.rule).id)
                     && (h.provenance.direction=="request" || ["url","request_body","request_command"].iter().filter_map(|k|n.values.get(*k)).any(|p|p.field==h.provenance.field))))
-            });
+            } else { false };
             policy.level = if request { 3 } else { 2 };
             policy.claim = if request { "attempt" } else { "activity" }.into();
             policy.version = "2".into();
@@ -1955,12 +2130,14 @@ fn run_inner(
         detection.evidence = crate::evidence::Evidence::from_policy(&policy);
         let mut outcomes = HashSet::new();
         let mut refs = Vec::new();
-        for id in &detection.event_ids {
+        let mut suppressed_by_original=false;
+        for entry in original_ids.into_iter()? {
+            let (id,recorded_step)=entry?;
             crate::security_budget::check()?;
-            if let Some(event) = lookup(*id) {
+            if let Some(event) = lookup(id) {
                 let reference = crate::security_normalize::event_ref(&event);
-                refs.push(reference.clone());
-                let (view, normalized) = crate::security_normalize::normalize(&event, &inputs.settings.mappings);
+                if sink.is_none()||refs.len()<128{refs.push(reference.clone());}
+                let (view, normalized) = acc.facts.normalize(&event, &inputs.settings.mappings)?;
                 detection.participants.merge(&crate::security_participants::extract(&event, &normalized, &detection.rule, &detection.tactics));
                 detection.start = min_opt(detection.start, normalized.time.epoch_ms);
                 detection.end = max_opt(detection.end, normalized.time.epoch_ms);
@@ -1973,7 +2150,9 @@ fn run_inner(
                 for role in ENTITY_ROLES {
                     if let Some(value) = entities::value(&event, role) {
                         let column = entities::info(role).column;
-                        if !detection.entities.iter().any(|e| e.column == column && e.value == value) {
+                        if let Some(writer)=sink.as_ref(){writer.stage_entity(&detection.namespace,column,&value,&label_for(column))?;}
+                        suppressed_by_original |= settings.suppress.iter().any(|s|s.rule==detection.rule&&s.expires.is_none_or(|t|t>chrono::Utc::now().timestamp_millis())&&s.scope.as_deref().is_none_or(|v|v==detection.namespace)&&s.column.as_deref().is_none_or(|v|v==column)&&s.value.as_deref().is_some_and(|v|v==value));
+                        if !detection.entities.iter().any(|e| e.column == column && e.value == value) && (sink.is_none()||detection.entities.len()<256) {
                             detection.entities.push(EntityRef {
                                 column: column.into(),
                                 label: label_for(column),
@@ -1993,7 +2172,8 @@ fn run_inner(
                     && !(detection.rule.starts_with("content.") && (policy.claim == "attempt" || detection.rule.ends_with("_payload"))) {
                     detection.evidence.limit(2, "Sem ação observada em fonte reconhecida ou mapeada");
                 }
-                let step = rule.and_then(|r| r.conds.iter().position(|c| c.matches(&view))).unwrap_or(0);
+                let step = recorded_step.or_else(|| detection.measurements["member_steps"].get(id.to_string()).and_then(serde_json::Value::as_u64).map(|step|step as usize))
+                    .or_else(||rule.and_then(|r| r.conds.iter().position(|c| c.matches(&view)))).unwrap_or(0);
                 if detection.evidence.excerpts.len() < 8 {
                     if let Some(condition) = rule.and_then(|r| r.conds.get(step)) {
                         detection
@@ -2050,65 +2230,73 @@ fn run_inner(
                         fields:vec![provenance.map(|p|p.field.clone()).unwrap_or_else(||field.clone())],
                     });
                 }
-                detection.evidence.evidence_members.push(crate::evidence::Member {
+                let member=crate::evidence::Member {
                     event_ref: reference,
-                    event_id: *id,
+                    event_id: id,
                     step,
                     fields: policy.required.clone(),
                     provenance: normalized.values.iter().filter(|(key,_)| !matches!(key.as_str(), "request_body" | "response_body")).map(|(k,v)|(k.clone(),v.clone())).collect(),
                     time: normalized.time.clone(),
-                });
+                };
+                if let Some(writer)=sink.as_ref(){writer.stage_member(&detection.namespace,&member)?;}
+                if sink.is_none()||detection.evidence.evidence_members.len()<128{detection.evidence.evidence_members.push(member);}
             }
         }
         let mut expanded = Vec::new();
-        for id in &detection.event_ids {
-            if let Some((members, limitations)) = acc.reconstructed.get(*id)? {
+        for entry in reconstructed_ids.into_iter()? {let (id,recorded_step)=entry?;
+            if let Some((member_count, limitations)) = acc.reconstructed.describe(id)? {
                 let step =
-                    detection.evidence.evidence_members.iter().find(|m| m.event_id == *id).map(|m| m.step).unwrap_or(0);
-                for (member_id, reference) in &members {
-                    expanded.push(*member_id);
-                    refs.push(reference.clone());
-                    if !detection.evidence.evidence_members.iter().any(|m| m.event_id == *member_id) {
-                        let original = lookup(*member_id)
-                            .map(|e| {
-                                let n = crate::security_normalize::normalize(&e, &inputs.settings.mappings).1;
+                    detection.evidence.evidence_members.iter().find(|m| m.event_id == id).map(|m| m.step).or(recorded_step).unwrap_or(0);
+                acc.reconstructed.for_each(id, |member_id,reference| {
+                    if sink.is_none()||expanded.len()<128{expanded.push(member_id);}
+                    if sink.is_none()||refs.len()<128{refs.push(reference.clone());}
+                    if !detection.evidence.evidence_members.iter().any(|m| m.event_id == member_id) {
+                        let original = if let Some(e) = lookup(member_id) {
+                                let n = acc.facts.normalize(&e, &inputs.settings.mappings)?.1;
                                 detection.participants.merge(&crate::security_participants::extract(&e, &n, &detection.rule, &detection.tactics));
+                                if let Some(writer)=sink.as_ref(){for role in ENTITY_ROLES{if let Some(value)=entities::value(&e,role){let column=entities::info(role).column;writer.stage_entity(&detection.namespace,column,&value,&label_for(column))?;}}}
                                 n
-                            })
-                            .unwrap_or_default();
-                        detection.evidence.evidence_members.push(crate::evidence::Member {
+                            } else { Default::default() };
+                        let member=crate::evidence::Member {
                             event_ref: reference.clone(),
-                            event_id: *member_id,
+                            event_id: member_id,
                             step,
                             fields: vec!["producer.operation_id".into()],
                             provenance: original.values,
                             time: original.time,
-                        });
+                        };
+                        if let Some(writer)=sink.as_ref(){writer.stage_member(&detection.namespace,&member)?;}
+                        if sink.is_none()||detection.evidence.evidence_members.len()<128{detection.evidence.evidence_members.push(member);}
                     }
-                }
+                    Ok(())
+                })?;
                 for limitation in &limitations {
                     detection.evidence.limit(2, limitation);
                 }
-                detection.evidence.relationships.push(crate::evidence::Relationship {
+                if detection.evidence.relationships.len()<32{detection.evidence.relationships.push(crate::evidence::Relationship {
                     kind: "reconstruction".into(),
                     fields: vec!["producer.operation_id".into()],
                     description: format!(
                         "{} fragmentos ou estagios da mesma operacao; contam como um fato",
-                        members.len()
+                        member_count
                     ),
-                });
+                });}
             } else {
-                expanded.push(*id);
+                if sink.is_none()||expanded.len()<128{expanded.push(id);}
             }
         }
         expanded.sort_unstable();
         expanded.dedup();
         detection.event_ids = expanded;
-        detection.count = detection.event_ids.len();
+        if sink.is_none(){detection.count=detection.event_ids.len();}
         refs.sort();
         refs.dedup();
         detection.evidence.event_refs = refs.clone();
-        detection.id = crate::evidence::stable_id("d", std::iter::once(detection.rule.clone()).chain(refs));
+        if let Some(writer)=sink.as_ref(){let (id,count)=writer.staged_identity(&detection.rule)?;detection.id=id;detection.count=count;if count>detection.evidence.evidence_members.len(){
+            if !detection.measurements.is_object(){detection.measurements=serde_json::json!({});}
+            detection.measurements["evidence_paging"]=serde_json::json!({"complete_members_in_store":true,"total":count,"preview":detection.evidence.evidence_members.len(),"section":"finding_members"});
+            detection.measurements["entity_paging"]=serde_json::json!({"complete_entities_in_store":true,"total":writer.staged_entity_count()?,"preview":detection.entities.len(),"section":"finding_entities"});
+        }}else{detection.id=crate::evidence::stable_id("d",std::iter::once(detection.rule.clone()).chain(refs));}
         if outcomes.contains("blocked") && outcomes.len() == 1 {
             detection.evidence.outcome = "blocked".into();
             if matches!(policy.claim.as_str(), "execution" | "effect") {
@@ -2167,7 +2355,7 @@ fn run_inner(
         }
         // Apply exceptions after collecting the entities actually present in the evidence.
         // Single-event content rules need not group by an IP to support an IP-scoped exception.
-        let hidden = settings.suppress.iter().any(|s| {
+        let hidden = suppressed_by_original || settings.suppress.iter().any(|s| {
             s.rule == detection.rule
                 && s.expires.is_none_or(|t| t > chrono::Utc::now().timestamp_millis())
                 && s.scope.as_deref().is_none_or(|v| v == detection.namespace)
@@ -2177,15 +2365,15 @@ fn run_inner(
                     _ => true,
                 }
         });
-        if hidden { suppressed += 1; continue; }
+        if hidden { suppressed += 1; if let Some(writer)=sink.as_ref(){writer.discard_staged()?;}continue; }
         let template = rule.and_then(|r| r.def.summary.as_deref());
         detection.summary = render_summary(template, detection, first.as_ref());
         detection.pattern_source = first.as_ref().map(crate::security_grouping::source);
         // Exact evidence selection, independent of mutable rule definitions and time filters.
         detection.filters = vec![crate::query::Filter {
             column: "event_ref".into(),
-            op: "in_exact".into(),
-            value: detection.evidence.event_refs.join("\n"),
+            op: if sink.is_some(){"finding"}else{"in_exact"}.into(),
+            value: if sink.is_some(){detection.id.clone()}else{detection.evidence.event_refs.join("\n")},
             value2: None,
         }];
         if let Some(writer) = sink.as_mut() {
@@ -2223,6 +2411,7 @@ fn run_inner(
         .enumerate()
         .map(|(i, r)| RuleCoverage {
             rule: r.def.id.clone(),
+            unit: if r.chain_references.is_empty(){"events"}else{"referenced_findings"}.into(),
             status: if !r.enabled {
                 "disabled"
             } else if r.def.kind == "absence"
@@ -2285,6 +2474,8 @@ fn run_inner(
         })
         .collect();
     Ok(Triage {
+        investigation,
+        execution: serde_json::json!({"facts_version":crate::security_facts::VERSION,"normalizations":acc.facts.computed,"fact_reuses":acc.facts.hits,"predicate_reuses":acc.facts.predicate_reuses,"shared_predicate_nodes":inputs.rules.plan.len(),"columnar":{"backend":"DuckDB shared Rust semantic UDFs","batches":acc.columnar_batches,"cached_batches":acc.columnar_reused_batches,"rows":acc.columnar_rows,"shared_scalar_leaves":acc.columnar_leaves,"event_confirmation":true},"rule_predicates":inputs.rules.rules.iter().map(|r|r.conds.len()).sum::<usize>(),"incremental_mode":"content_addressed_facts_predicates_and_group_results","correlations":"unchanged_groups_reused_changed_groups_exactly_reconciled","late_events":"full_temporal_reconciliation","checkpoints":checkpoints.describe(),"fact_cache_evictions":acc.facts.evicted}),
         dataset_fingerprint,
         total: acc.total,
         undated: acc.undated,
@@ -2686,6 +2877,54 @@ pub fn remember(key: String, result: Arc<crate::security_results::Results>) {
 
 pub fn cached_analysis(id: &str) -> Option<Arc<crate::security_results::Results>> {
     TRIAGE_CACHE.lock().iter().find(|c| c.namespace == crate::analysis_runtime::cache_namespace() && c.result.metadata["analysis_id"].as_str() == Some(id)).map(|c| c.result.clone())
+}
+pub(crate) fn cached_for_chain(rule:&str)->Option<Arc<crate::security_results::Results>>{
+    TRIAGE_CACHE.lock().iter().rev().find(|c|c.namespace==crate::analysis_runtime::cache_namespace()&&c.result.metadata["complete"]==true
+        && c.result.metadata["rule_coverage"].as_array().is_some_and(|coverage|coverage.iter().any(|item|item["rule"]==rule))).map(|c|c.result.clone())
+}
+pub(crate) fn cached_for_finding(id:&str)->Result<Arc<crate::security_results::Results>,String>{
+    for cached in TRIAGE_CACHE.lock().iter().rev(){if cached.namespace==crate::analysis_runtime::cache_namespace()&&cached.result.metadata["complete"]==true&&cached.result.has_finding(id)?{return Ok(cached.result.clone());}}
+    Err("Achado ausente da análise atual; recalcule os comprometimentos".into())
+}
+
+#[cfg(test)]
+mod external_tests {
+    use super::*;
+    #[test]
+    #[ignore = "Validação específica opt-in da 0.13; execute explicitamente com --ignored"]
+    fn v013_incremental_groups_remap_ids_and_reconcile_late_removed_and_reordered_events(){
+        let rule:RuleDef=serde_json::from_value(serde_json::json!({"id":"checkpoint-test","name":"Checkpoint","severity":"low","kind":"threshold","where":"stage:observed","by":["@src_ip"],"window":"1h","count":3})).unwrap();let rules=test_ruleset(vec![rule],vec![]).unwrap();let settings=Settings{threats:false,investigation:crate::investigation::Settings{enabled:false,..Default::default()},..Default::default()};let inputs=Inputs{rules:&rules,catalog:None,settings:&settings};
+        let fixture=(0..4).map(|id|{let mut e=Event::empty();e.id=id;e.event_ref=format!("fixture:{id}");e.source="checkpoint".into();e.timestamp=Some(1700000000000+id as i64*1000);e.fields=serde_json::json!({"source.ip":"192.0.2.1","stage":"observed"}).as_object().unwrap().clone();e}).collect::<Vec<_>>();
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("groups.sqlite");
+        let evaluate=|events:&[Event],cache:&mut crate::security_checkpoints::Cache|{let source=Source::Events(events.iter().collect());let pass=Pass{full_entity_stats:false,rules:&rules,catalog:None,mappings:&[],threat_category:vec![],behavior:&settings.investigation};let mut acc=source.fold(&pass,rules.automaton.as_ref().map(|a|a.patterns_len()).unwrap_or(0)).unwrap();let store=crate::security_correlate::Store::new().unwrap();store.import(std::mem::take(&mut acc.groups)).unwrap();let raws=external_raws(&store,cache,&inputs,&acc,"dataset",rules.rules.len() as u32).unwrap();let mut actual=Vec::new();for raw in raws.into_iter().unwrap(){let raw=raw.unwrap();let mut refs=Vec::new();raw_members(&raw,&store,|id,_|{refs.push(source.lookup(id).unwrap().event_ref);Ok(())}).unwrap();refs.sort();actual.push(refs);}actual.sort();actual};
+        let mut cache=crate::security_checkpoints::Cache::open(&path).unwrap();let initial=evaluate(&fixture,&mut cache);assert_eq!(initial.len(),1);assert_eq!(initial[0].len(),4);drop(cache);
+        let mut cache=crate::security_checkpoints::Cache::open(&path).unwrap();let mut remapped=fixture.clone();for e in &mut remapped{e.id+=1000;}remapped.reverse();assert_eq!(evaluate(&remapped,&mut cache),initial);assert!(cache.reused>=2,"both overlapping canonical groups were committed");
+        let mut late=fixture[0].clone();late.id=2000;late.event_ref="late-original".into();late.timestamp=Some(1700000001500);remapped.push(late);let actual=evaluate(&remapped,&mut cache);let mut fresh=crate::security_checkpoints::Cache::new().unwrap();assert_eq!(actual,evaluate(&remapped,&mut fresh));assert_eq!(actual[0].len(),5);
+        remapped.truncate(2);assert!(evaluate(&remapped,&mut cache).is_empty());
+    }
+    #[test]
+    #[ignore = "Validação específica opt-in da 0.13; execute explicitamente com --ignored"]
+    fn v013_external_correlations_preserve_the_slice_reference_semantics(){
+        for seed in 0..12usize{
+            let mut hits=(0..240).map(|i|Hit{ts:1_000_000+(i/3) as i64*997,id:i,step:((i+seed)%3) as u8,extra:Some(format!("{}",(i*17+seed)%19).into_boxed_str()),reference:format!("ref:{}",i/2),source:"test".into(),uncertain_time:false,binding:None}).collect::<Vec<_>>();
+            hits.sort_by(|a,b|a.ts.cmp(&b.ts).then(a.reference.cmp(&b.reference)).then(a.step.cmp(&b.step)));
+            let mut groups=crate::security_store::Groups::default();for hit in &hits{groups.push(0,"key",hit.clone()).unwrap();}
+            let store=crate::security_correlate::Store::new().unwrap();store.import(groups).unwrap();let group=store.group(0,"key").unwrap();assert_eq!(group.len,hits.len());
+            for window in [0,3000,12000,100000]{
+                let mut actual=vec![];group.threshold(window,5,false,|i,j,_|{actual.push((i,j));Ok(())}).unwrap();assert_eq!(actual,threshold_ranges(&hits,window,5));
+                let mut actual=vec![];group.threshold(window,5,true,|i,j,n|{actual.push((i,j,n));Ok(())}).unwrap();assert_eq!(actual,distinct_ranges(&hits,window,5));
+                for ordered in [true,false]{let mut actual=vec![];group.sequence(window,&[2,2,1],ordered,None,|m|{actual.push(m);Ok(())}).unwrap();assert_eq!(actual,ordered_matches(&hits,window,&[2,2,1],ordered),"seed {seed}, window {window}, ordered {ordered}");}
+            }
+            assert_eq!(group.beacon(6).unwrap(),beacon_period(&hits,6).map(|v|v.0));
+        }
+    }
+    #[test]
+    #[ignore = "Validação específica opt-in da 0.13; execute explicitamente com --ignored"]
+    fn v013_external_hot_key_has_no_group_size_cutoff_or_member_loss(){
+        let mut groups=crate::security_store::Groups::default();for i in 0..36000{groups.push(0,"hot",Hit{ts:i as i64,id:i,step:0,extra:Some("x".repeat(1024).into_boxed_str()),reference:format!("hot:{i:08}"),source:"test".into(),uncertain_time:false,binding:None}).unwrap();}
+        let store=crate::security_correlate::Store::new().unwrap();store.import(groups).unwrap();let group=store.group(0,"hot").unwrap();assert_eq!(group.len,36000);
+        let mut selected=None;group.threshold(100000,100,false,|i,j,_|{selected=Some(group.range(i,j)?);Ok(())}).unwrap();let mut ids=vec![];store.members(&selected.unwrap(),|id,_|{ids.push(id);Ok(())}).unwrap();assert_eq!(ids,(0..36000).collect::<Vec<_>>());
+    }
 }
 
 pub fn clear_cache() {

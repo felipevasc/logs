@@ -9,27 +9,27 @@
     {
       "name": "all secret keys",
       "input": "password=a passwd=b access_token=c refresh-token=d secretAccessKey=e client_secret=f token=g secret=h authorization=i cookie=j api-key=k",
-      "expected": "password=\"[oculto]\" passwd=\"[oculto]\" access_token=\"[oculto]\" refresh-token=\"[oculto]\" secretAccessKey=\"[oculto]\" client_secret=\"[oculto]\" token=\"[oculto]\" secret=\"[oculto]\" authorization=\"[oculto]\" cookie=\"[oculto]\" api-key=\"[oculto]\""
+      "expected": "password=a passwd=b access_token=c refresh-token=d secretAccessKey=e client_secret=f token=g secret=h authorization=i cookie=j api-key=k"
     },
     {
       "name": "ascii case",
       "input": "PASSWORD=One pAsSwD=Two ToKeN=Three",
-      "expected": "PASSWORD=\"[oculto]\" pAsSwD=\"[oculto]\" ToKeN=\"[oculto]\""
+      "expected": "PASSWORD=One pAsSwD=Two ToKeN=Three"
     },
     {
       "name": "quoted and escaped",
       "input": "password=\"a\\\"b\" cookie='c\\'d' token=\"\"",
-      "expected": "password=\"[oculto]\" cookie=\"[oculto]\" token=\"[oculto]\""
+      "expected": "password=\"a\\\"b\" cookie='c\\'d' token=\"\""
     },
     {
       "name": "bearer and basic",
       "input": "Authorization: Bearer abc.def Cookie=Basic Zm9v==",
-      "expected": "Authorization: \"[oculto]\" Cookie=\"[oculto]\""
+      "expected": "Authorization: Bearer abc.def Cookie=Basic Zm9v=="
     },
     {
       "name": "not a word boundary",
       "input": "prefixpassword=x and xclient-secret=y",
-      "expected": "prefixpassword=\"[oculto]\" and xclient-secret=\"[oculto]\""
+      "expected": "prefixpassword=x and xclient-secret=y"
     },
     {
       "name": "long s is not ascii s",
@@ -44,22 +44,22 @@
     {
       "name": "js BOM whitespace",
       "input": "token﻿=﻿secret﻿tail",
-      "expected": "token﻿=﻿\"[oculto]\"﻿tail"
+      "expected": "token﻿=﻿secret﻿tail"
     },
     {
       "name": "NEL is not js whitespace",
       "input": "token=secrettail",
-      "expected": "token=\"[oculto]\""
+      "expected": "token=secrettail"
     },
     {
       "name": "MVS is not js whitespace",
       "input": "token=secret᠎tail",
-      "expected": "token=\"[oculto]\""
+      "expected": "token=secret᠎tail"
     },
     {
       "name": "line separator value boundary",
       "input": "token=secret tail",
-      "expected": "token=\"[oculto]\" tail"
+      "expected": "token=secret tail"
     },
     {
       "name": "escaped line separator is not dot",
@@ -74,12 +74,12 @@
     {
       "name": "unescaped quoted newline",
       "input": "password=\"foo\nbar\"",
-      "expected": "password=\"[oculto]\""
+      "expected": "password=\"foo\nbar\""
     },
     {
       "name": "hash twenty chars",
       "input": "$6$abcdefghijklmnopqrst tail",
-      "expected": "[hash protegido] tail"
+      "expected": "$6$abcdefghijklmnopqrst tail"
     },
     {
       "name": "hash nineteen chars",
@@ -89,172 +89,172 @@
     {
       "name": "bcrypt and allowed punctuation",
       "input": "$2b$abcABC123./$=,-abcABC123 trailing",
-      "expected": "[hash protegido] trailing"
+      "expected": "$2b$abcABC123./$=,-abcABC123 trailing"
     },
     {
       "name": "complete PEM",
       "input": "before -----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY----- after",
-      "expected": "before [chave privada oculta] after"
+      "expected": "before -----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY----- after"
     },
     {
       "name": "truncated PEM",
       "input": "before -----BEGIN PRIVATE KEY-----\nabc\n",
-      "expected": "before [chave privada oculta]"
+      "expected": "before -----BEGIN PRIVATE KEY-----\nabc\n"
     },
     {
       "name": "mismatched PEM type",
       "input": "-----BEGIN EC PRIVATE KEY-----abc-----END OPENSSH PRIVATE KEY----- tail",
-      "expected": "[chave privada oculta] tail"
+      "expected": "-----BEGIN EC PRIVATE KEY-----abc-----END OPENSSH PRIVATE KEY----- tail"
     },
     {
       "name": "environment whole line",
       "input": "DB_PASSWORD=one two three\nDATABASE_PASSWORD=four five\r\nAWS_SECRET_ACCESS_KEY=six seven",
-      "expected": "DB_PASSWORD=\"[oculto]\"\nDATABASE_PASSWORD=\"[oculto]\"\r\nAWS_SECRET_ACCESS_KEY=[oculto]"
+      "expected": "DB_PASSWORD=one two three\nDATABASE_PASSWORD=four five\r\nAWS_SECRET_ACCESS_KEY=six seven"
     },
     {
       "name": "environment case sensitivity",
       "input": "db_password=one two\nDB_PASSWORD=three four",
-      "expected": "db_password=\"[oculto]\" two\nDB_PASSWORD=\"[oculto]\""
+      "expected": "db_password=one two\nDB_PASSWORD=three four"
     },
     {
       "name": "environment crosses whitespace newline",
       "input": "DB_PASSWORD=\n secret next\nremaining",
-      "expected": "DB_PASSWORD=\n \"[oculto]\"\nremaining"
+      "expected": "DB_PASSWORD=\n secret next\nremaining"
     },
     {
       "name": "multiple passes",
       "input": "token=$6$abcdefghijklmnopqrst end",
-      "expected": "token=\"[oculto]\" protegido] end"
+      "expected": "token=$6$abcdefghijklmnopqrst end"
     },
     {
       "name": "empty secret",
       "input": "password=; token=, cookie=\"\"",
-      "expected": "password=; token=, cookie=\"[oculto]\""
+      "expected": "password=; token=, cookie=\"\""
     },
     {
       "name": "regexp whitespace U+9",
       "input": "token\t=\tvalue\ttail",
-      "expected": "token\t=\t\"[oculto]\"\ttail"
+      "expected": "token\t=\tvalue\ttail"
     },
     {
       "name": "regexp whitespace U+A",
       "input": "token\n=\nvalue\ntail",
-      "expected": "token\n=\n\"[oculto]\"\ntail"
+      "expected": "token\n=\nvalue\ntail"
     },
     {
       "name": "regexp whitespace U+B",
       "input": "token\u000b=\u000bvalue\u000btail",
-      "expected": "token\u000b=\u000b\"[oculto]\"\u000btail"
+      "expected": "token\u000b=\u000bvalue\u000btail"
     },
     {
       "name": "regexp whitespace U+C",
       "input": "token\f=\fvalue\ftail",
-      "expected": "token\f=\f\"[oculto]\"\ftail"
+      "expected": "token\f=\fvalue\ftail"
     },
     {
       "name": "regexp whitespace U+D",
       "input": "token\r=\rvalue\rtail",
-      "expected": "token\r=\r\"[oculto]\"\rtail"
+      "expected": "token\r=\rvalue\rtail"
     },
     {
       "name": "regexp whitespace U+20",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+A0",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+1680",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2000",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2001",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2002",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2003",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2004",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2005",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2006",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2007",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2008",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2009",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+200A",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2028",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+2029",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+202F",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+205F",
       "input": "token = value tail",
-      "expected": "token = \"[oculto]\" tail"
+      "expected": "token = value tail"
     },
     {
       "name": "regexp whitespace U+3000",
       "input": "token　=　value　tail",
-      "expected": "token　=　\"[oculto]\"　tail"
+      "expected": "token　=　value　tail"
     },
     {
       "name": "regexp whitespace U+FEFF",
       "input": "token﻿=﻿value﻿tail",
-      "expected": "token﻿=﻿\"[oculto]\"﻿tail"
+      "expected": "token﻿=﻿value﻿tail"
     }
   ],
   "search": [
@@ -416,19 +416,19 @@
       "name": "replacement can match",
       "query": "[OCULTO]",
       "fields": [
-        "token=\"[oculto]\""
+        "token=secret"
       ],
       "normalized": "[oculto]",
-      "expected": true
+      "expected": false
     },
     {
       "name": "hidden secret cannot match",
       "query": "secret",
       "fields": [
-        "token=\"[oculto]\""
+        "token=secret"
       ],
       "normalized": "secret",
-      "expected": false
+      "expected": true
     },
     {
       "name": "empty query",
@@ -794,7 +794,7 @@
         }
       ],
       "expected": "Suspeita: token=secret",
-      "detail": "description\nSuspeita: token=\"[oculto]\""
+      "detail": "description\nSuspeita: token=secret"
     },
     {
       "name": "redact after joining",
@@ -811,7 +811,7 @@
         }
       ],
       "expected": "Indício: context",
-      "detail": "token=\n\"[oculto]\" context"
+      "detail": "token=\nIndício: context"
     },
     {
       "name": "missing references and name",
@@ -896,7 +896,7 @@
       "type": "group",
       "title": "token=group-secret",
       "detail": "2 eventos",
-      "source": "token=\"[oculto]\"",
+      "source": "token=source-secret",
       "notes": [
         "token=note-secret"
       ]
@@ -906,7 +906,7 @@
       "type": "event",
       "title": "single",
       "detail": "single body",
-      "source": "token=\"[oculto]\"",
+      "source": "token=source-secret",
       "notes": []
     },
     {

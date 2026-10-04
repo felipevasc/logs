@@ -36,9 +36,26 @@ mod evidence;
 mod exclusion_store;
 mod exclusion_commands;
 mod security_normalize;
+mod security_facts;
+mod security_plan;
+mod security_priority;
+mod security_hunts;
+mod security_narrative;
+mod security_ioc;
+mod security_history;
+mod security_history_portable;
+mod security_sketches;
+mod security_schema;
+mod security_packs;
+mod security_proposals;
+mod investigation;
 mod security_content;
 mod security_store;
+mod security_correlate;
+mod security_checkpoints;
+mod security_deobfuscate;
 mod security_results;
+mod security_duck_stream;
 mod security_grouping;
 mod security_participants;
 #[cfg(test)]
@@ -2195,6 +2212,11 @@ pub fn run() {
             workspace::dataset_overview,
             triage::triage,
             triage::triage_episode,
+            triage::investigation_page,
+            triage::investigation_narrative_review,
+            triage::investigation_profile_train,
+            triage::investigation_proposal_evaluate,
+            triage::investigation_proposal_accept,
             triage::triage_evidence_event,
             triage::triage_timeline,
             triage::event_insights,

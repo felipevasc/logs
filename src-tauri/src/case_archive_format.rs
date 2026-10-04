@@ -34,6 +34,7 @@ pub(crate) enum EntryKind {
     Image(String),
     Exclusion(String),
     Reference(String),
+    History(String),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -100,13 +101,15 @@ fn validate_entries(entries: &[Entry]) -> Result<u64, String> {
                 }
                 MAX_IMAGE_BYTES
             }
-            EntryKind::Exclusion(id) | EntryKind::Reference(id) => {
+            EntryKind::Exclusion(id) | EntryKind::Reference(id) | EntryKind::History(id) => {
                 let parsed = uuid::Uuid::parse_str(id)
                     .map_err(|_| "Identificador de conteúdo portátil inválido.")?;
                 if parsed.is_nil() || parsed.to_string() != *id {
                     return Err("Identificador de conteúdo portátil inválido.".into());
                 }
-                if matches!(entry.kind, EntryKind::Reference(_)) {
+                if matches!(entry.kind, EntryKind::History(_)){
+                    references+=1;1024 << 20
+                } else if matches!(entry.kind, EntryKind::Reference(_)) {
                     references += 1;
                     MAX_REFERENCE_BYTES
                 } else {

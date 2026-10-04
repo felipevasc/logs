@@ -1,0 +1,425 @@
+{
+  "version": "sigma-reference-1",
+  "pySigma_version": "1.5.1",
+  "upstream_revision": "f81e4f5ace2f444f76c5de03df8e0f181f85f6cc",
+  "source": "https://github.com/SigmaHQ/pySigma/tree/f81e4f5ace2f444f76c5de03df8e0f181f85f6cc",
+  "scope": "Parsed modifier and boolean semantics; explicit local event interpreter; not external execution of backend queries or temporal correlations",
+  "cases": [
+    {
+      "id": "contains_unicode",
+      "yaml": "title: contains_unicode\nid: 758e8957-8cb1-5d3a-9dec-56d4393689fa\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|contains: ação\n  condition: selection\n",
+      "events": [
+        {
+          "x": "AÇÃO approved"
+        },
+        {
+          "x": "action"
+        },
+        {}
+      ],
+      "expected": [
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaContainsModifier'>], value=[SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'ação', <SpecialChars.WILDCARD_MULTI: 1>])], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'ação', <SpecialChars.WILDCARD_MULTI: 1>]))"
+    },
+    {
+      "id": "startswith",
+      "yaml": "title: startswith\nid: f7c7fda8-dc88-5003-84df-966593f00955\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|startswith: abc\n  condition: selection\n",
+      "events": [
+        {
+          "x": "ABCdef"
+        },
+        {
+          "x": "xabc"
+        },
+        {}
+      ],
+      "expected": [
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaStartswithModifier'>], value=[SigmaString(['abc', <SpecialChars.WILDCARD_MULTI: 1>])], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaString(['abc', <SpecialChars.WILDCARD_MULTI: 1>]))"
+    },
+    {
+      "id": "endswith",
+      "yaml": "title: endswith\nid: 6eaaa5fb-ece6-5237-a160-e9769d9d1b62\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|endswith: .exe\n  condition: selection\n",
+      "events": [
+        {
+          "x": "cmd.EXE"
+        },
+        {
+          "x": "exe.cmd"
+        },
+        {}
+      ],
+      "expected": [
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaEndswithModifier'>], value=[SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '.exe'])], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '.exe']))"
+    },
+    {
+      "id": "contains_all",
+      "yaml": "title: contains_all\nid: 5a0e06be-4a52-5951-a4b6-824e8307eb03\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|contains|all:\n    - one\n    - two\n  condition: selection\n",
+      "events": [
+        {
+          "x": "two one"
+        },
+        {
+          "x": "one"
+        },
+        {}
+      ],
+      "expected": [
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionAND(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[SigmaDetectionItem(parent=..., applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaContainsModifier'>, <class 'sigma.modifiers.SigmaAllModifier'>], value=[SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'one', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'two', <SpecialChars.WILDCARD_MULTI: 1>])], value_linking=<class 'sigma.conditions.ConditionAND'>, negated=False, source=None)], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), args=[ConditionFieldEqualsValueExpression(parent=..., field='x', value=SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'one', <SpecialChars.WILDCARD_MULTI: 1>])), ConditionFieldEqualsValueExpression(parent=..., field='x', value=SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'two', <SpecialChars.WILDCARD_MULTI: 1>]))], source=None)"
+    },
+    {
+      "id": "cased",
+      "yaml": "title: cased\nid: b3f8bd29-582e-5144-ba95-e86de254a198\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|cased: Hello\n  condition: selection\n",
+      "events": [
+        {
+          "x": "Hello"
+        },
+        {
+          "x": "hello"
+        },
+        {}
+      ],
+      "expected": [
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaCaseSensitiveModifier'>], value=[SigmaString(['Hello'])], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaString(['Hello']))"
+    },
+    {
+      "id": "regex_default",
+      "yaml": "title: regex_default\nid: a38ef489-3e85-584f-8403-b574fec6912a\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|re: ^Hello$\n  condition: selection\n",
+      "events": [
+        {
+          "x": "Hello"
+        },
+        {
+          "x": "hello"
+        },
+        {}
+      ],
+      "expected": [
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaRegularExpressionModifier'>], value=[SigmaRegularExpression(regexp=SigmaString(['^Hello$']), flags=set(), policy=None)], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaRegularExpression(regexp=SigmaString(['^Hello$']), flags=set(), policy=None))"
+    },
+    {
+      "id": "regex_i",
+      "yaml": "title: regex_i\nid: a256d531-bbf0-5bdb-bc7c-1d80f23077b2\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|re|i: ^Hello$\n  condition: selection\n",
+      "events": [
+        {
+          "x": "Hello"
+        },
+        {
+          "x": "hello"
+        },
+        {
+          "x": "xhello"
+        }
+      ],
+      "expected": [
+        true,
+        true,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaRegularExpressionModifier'>, <class 'sigma.modifiers.SigmaRegularExpressionIgnoreCaseFlagModifier'>], value=[SigmaRegularExpression(regexp=SigmaString(['^Hello$']), flags={<SigmaRegularExpressionFlag.IGNORECASE: 1>}, policy=None)], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaRegularExpression(regexp=SigmaString(['^Hello$']), flags={<SigmaRegularExpressionFlag.IGNORECASE: 1>}, policy=None))"
+    },
+    {
+      "id": "regex_m",
+      "yaml": "title: regex_m\nid: 751555e1-f138-5a94-99c0-75d0cecb29e8\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|re|m: ^Hello$\n  condition: selection\n",
+      "events": [
+        {
+          "x": "one\nHello\ntwo"
+        },
+        {
+          "x": "hello"
+        }
+      ],
+      "expected": [
+        true,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaRegularExpressionModifier'>, <class 'sigma.modifiers.SigmaRegularExpressionMultilineFlagModifier'>], value=[SigmaRegularExpression(regexp=SigmaString(['^Hello$']), flags={<SigmaRegularExpressionFlag.MULTILINE: 2>}, policy=None)], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaRegularExpression(regexp=SigmaString(['^Hello$']), flags={<SigmaRegularExpressionFlag.MULTILINE: 2>}, policy=None))"
+    },
+    {
+      "id": "regex_s",
+      "yaml": "title: regex_s\nid: 54cc57db-2307-5e00-99c5-cefb398b9477\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|re|s: a.b\n  condition: selection\n",
+      "events": [
+        {
+          "x": "a\nb"
+        },
+        {
+          "x": "axb"
+        },
+        {
+          "x": "ac"
+        }
+      ],
+      "expected": [
+        true,
+        true,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaRegularExpressionModifier'>, <class 'sigma.modifiers.SigmaRegularExpressionDotAllFlagModifier'>], value=[SigmaRegularExpression(regexp=SigmaString(['a.b']), flags={<SigmaRegularExpressionFlag.DOTALL: 3>}, policy=None)], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaRegularExpression(regexp=SigmaString(['a.b']), flags={<SigmaRegularExpressionFlag.DOTALL: 3>}, policy=None))"
+    },
+    {
+      "id": "exists",
+      "yaml": "title: exists\nid: d3b359d4-00f6-56e6-a07c-5c4aa7dfb896\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|exists: true\n  condition: selection\n",
+      "events": [
+        {
+          "x": null
+        },
+        {
+          "x": ""
+        },
+        {},
+        {
+          "x": 0
+        }
+      ],
+      "expected": [
+        true,
+        true,
+        false,
+        true
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaExistsModifier'>], value=[SigmaExists(exists=True)], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaExists(exists=True))"
+    },
+    {
+      "id": "not_exists",
+      "yaml": "title: not_exists\nid: c771771a-7431-5a34-be01-a3ee82085652\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|exists: false\n  condition: selection\n",
+      "events": [
+        {
+          "x": null
+        },
+        {
+          "x": ""
+        },
+        {},
+        {
+          "x": 0
+        }
+      ],
+      "expected": [
+        false,
+        false,
+        true,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaExistsModifier'>], value=[SigmaExists(exists=False)], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaExists(exists=False))"
+    },
+    {
+      "id": "null",
+      "yaml": "title: 'null'\nid: 79ab0c03-2388-58ed-aae5-ca6992bda769\nlogsource:\n  category: application\ndetection:\n  selection:\n    x: null\n  condition: selection\n",
+      "events": [
+        {
+          "x": null
+        },
+        {},
+        {
+          "x": ""
+        },
+        {
+          "x": "null"
+        }
+      ],
+      "expected": [
+        true,
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[], value=[<sigma.types.SigmaNull object at 0x000001ED418CE120>], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=<sigma.types.SigmaNull object at 0x000001ED418CE120>)"
+    },
+    {
+      "id": "numeric",
+      "yaml": "title: numeric\nid: ac697e82-98a0-51b0-9b12-3ad86627ff34\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|gte: 10\n  condition: selection\n",
+      "events": [
+        {
+          "x": 10
+        },
+        {
+          "x": 9
+        },
+        {
+          "x": 11
+        },
+        {}
+      ],
+      "expected": [
+        true,
+        false,
+        true,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaGreaterThanEqualModifier'>], value=[SigmaCompareExpression(number=SigmaNumber(number=10), op=<CompareOperators.GTE: 4>, source=None)], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaCompareExpression(number=SigmaNumber(number=10), op=<CompareOperators.GTE: 4>, source=None))"
+    },
+    {
+      "id": "numeric_neq",
+      "yaml": "title: numeric_neq\nid: 2281f717-44f8-5277-ab47-3ae0706155d0\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|neq: 10\n  condition: selection\n",
+      "events": [
+        {
+          "x": 10
+        },
+        {
+          "x": 9
+        },
+        {}
+      ],
+      "expected": [
+        false,
+        true,
+        true
+      ],
+      "upstream_tree": "ConditionNOT(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[SigmaDetectionItem(parent=..., applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaNegateModifier'>], value=[SigmaNumber(number=10)], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=True, source=None)], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), args=[ConditionFieldEqualsValueExpression(parent=..., field='x', value=SigmaNumber(number=10))], source=None)",
+      "backend_policy": "Log Insight neq requires the selected field present; a missing field is not an observed unequal value. The pySigma NOT tree alone has no existence guard.",
+      "backend_expected": [
+        false,
+        true,
+        false
+      ]
+    },
+    {
+      "id": "cidr",
+      "yaml": "title: cidr\nid: 81f2f858-5150-5526-9461-a09cb8fbefa6\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|cidr: 192.0.2.0/24\n  condition: selection\n",
+      "events": [
+        {
+          "x": "192.0.2.8"
+        },
+        {
+          "x": "192.0.3.8"
+        },
+        {}
+      ],
+      "expected": [
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaCIDRModifier'>], value=[SigmaCIDRExpression(cidr='192.0.2.0/24', source=None, network=IPv4Network('192.0.2.0/24'))], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaCIDRExpression(cidr='192.0.2.0/24', source=None, network=IPv4Network('192.0.2.0/24')))"
+    },
+    {
+      "id": "fieldref",
+      "yaml": "title: fieldref\nid: bbbb5d41-fa18-5d74-9379-7adc487bcd69\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|fieldref: y\n  condition: selection\n",
+      "events": [
+        {
+          "x": "one",
+          "y": "ONE"
+        },
+        {
+          "x": "one",
+          "y": "two"
+        },
+        {
+          "x": "one"
+        }
+      ],
+      "expected": [
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaFieldReferenceModifier'>], value=[SigmaFieldReference(field='y', starts_with=False, ends_with=False)], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaFieldReference(field='y', starts_with=False, ends_with=False))"
+    },
+    {
+      "id": "windash",
+      "yaml": "title: windash\nid: 420edfb7-0332-5770-a7c7-9f1a27bf08cf\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|windash|contains: -test -file-name\n  condition: selection\n",
+      "events": [
+        {
+          "x": "tool /test –file-name x"
+        },
+        {
+          "x": "tool -test -file-name"
+        },
+        {
+          "x": "-test -file/name"
+        }
+      ],
+      "expected": [
+        true,
+        true,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaWindowsDashModifier'>, <class 'sigma.modifiers.SigmaContainsModifier'>], value=[SigmaExpansion(values=[SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '-test -file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '-test /file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '-test –file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '-test —file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '-test ―file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '/test -file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '/test /file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '/test –file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '/test —file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '/test ―file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '–test -file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '–test /file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '–test –file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '–test —file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '–test ―file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '—test -file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '—test /file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '—test –file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '—test —file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '—test ―file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '―test -file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '―test /file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '―test –file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '―test —file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '―test ―file-name', <SpecialChars.WILDCARD_MULTI: 1>])])], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaExpansion(values=[SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '-test -file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '-test /file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '-test –file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '-test —file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '-test ―file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '/test -file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '/test /file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '/test –file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '/test —file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '/test ―file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '–test -file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '–test /file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '–test –file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '–test —file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '–test ―file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '—test -file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '—test /file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '—test –file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '—test —file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '—test ―file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '―test -file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '―test /file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '―test –file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '―test —file-name', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, '―test ―file-name', <SpecialChars.WILDCARD_MULTI: 1>])]))"
+    },
+    {
+      "id": "base64",
+      "yaml": "title: base64\nid: 612cc43f-0aec-5f23-9620-4eee90491615\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|base64|cased: hello\n  condition: selection\n",
+      "events": [
+        {
+          "x": "aGVsbG8="
+        },
+        {
+          "x": "bogus"
+        },
+        {}
+      ],
+      "expected": [
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaBase64Modifier'>, <class 'sigma.modifiers.SigmaCaseSensitiveModifier'>], value=[SigmaString(['aGVsbG8='])], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaString(['aGVsbG8=']))"
+    },
+    {
+      "id": "wide_base64",
+      "yaml": "title: wide_base64\nid: f22fe7d4-b34b-540f-a648-acc66417eecc\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|wide|base64|cased: hello\n  condition: selection\n",
+      "events": [
+        {
+          "x": "aABlAGwAbABvAA=="
+        },
+        {
+          "x": "aGVsbG8="
+        },
+        {}
+      ],
+      "expected": [
+        true,
+        false,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaWideModifier'>, <class 'sigma.modifiers.SigmaBase64Modifier'>, <class 'sigma.modifiers.SigmaCaseSensitiveModifier'>], value=[SigmaString(['aABlAGwAbABvAA=='])], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaString(['aABlAGwAbABvAA==']))"
+    },
+    {
+      "id": "base64offset",
+      "yaml": "title: base64offset\nid: e8b06187-5ef8-5133-8ebe-f97928e5f2c6\nlogsource:\n  category: application\ndetection:\n  selection:\n    x|base64offset|contains|cased: hello\n  condition: selection\n",
+      "events": [
+        {
+          "x": "aGVsbG9zdWZmaXg="
+        },
+        {
+          "x": "eGhlbGxvc3VmZml4"
+        },
+        {
+          "x": "eHloZWxsb3N1ZmZpeA=="
+        },
+        {
+          "x": "bogus"
+        }
+      ],
+      "expected": [
+        true,
+        true,
+        true,
+        false
+      ],
+      "upstream_tree": "ConditionFieldEqualsValueExpression(parent=SigmaDetectionItem(parent=SigmaDetection(parent=ConditionIdentifier(parent=None, args=['selection'], source=None, identifier='selection'), detection_items=[...], source=None, item_linking=<class 'sigma.conditions.ConditionAND'>), applied_processing_items=set(), field='x', modifiers=[<class 'sigma.modifiers.SigmaBase64OffsetModifier'>, <class 'sigma.modifiers.SigmaContainsModifier'>, <class 'sigma.modifiers.SigmaCaseSensitiveModifier'>], value=[SigmaExpansion(values=[SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'aGVsbG', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'hlbGxv', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'oZWxsb', <SpecialChars.WILDCARD_MULTI: 1>])])], value_linking=<class 'sigma.conditions.ConditionOR'>, negated=False, source=None), field='x', value=SigmaExpansion(values=[SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'aGVsbG', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'hlbGxv', <SpecialChars.WILDCARD_MULTI: 1>]), SigmaString([<SpecialChars.WILDCARD_MULTI: 1>, 'oZWxsb', <SpecialChars.WILDCARD_MULTI: 1>])]))"
+    }
+  ]
+}

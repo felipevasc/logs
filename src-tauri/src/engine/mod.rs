@@ -9,10 +9,10 @@
 mod build;
 mod ops;
 mod sparse_timeline;
-mod sql;
+pub(crate) mod sql;
 mod text;
 mod time_index;
-mod udf;
+pub(crate) mod udf;
 
 pub(crate) use ops::*;
 

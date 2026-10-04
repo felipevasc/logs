@@ -25,6 +25,9 @@ pub struct PreparedFilter {
     needle_lower: String,
     num: Option<f64>,
     num2: Option<f64>,
+    /// The bounds were typed as dates: compare each value as an instant (ms),
+    /// whether the field holds epoch seconds, milliseconds or date text.
+    time: bool,
     threat: Option<crate::threats::RuleMatcher>,
     /// Compiled search expression (`op = "query"`).
     pub(crate) expr: Option<crate::querylang::Expr>,
@@ -34,6 +37,7 @@ pub struct PreparedFilter {
     nets: Vec<crate::querylang::IpNet>,
     /// Detection rule reproduced as evidence filter (`op = "detection"`).
     detection: Option<(std::sync::Arc<crate::detections::RuleSet>, usize)>,
+    finding: Option<Arc<crate::security_results::Results>>,
 }
 
 impl PreparedFilter {
@@ -41,6 +45,15 @@ impl PreparedFilter {
     /// predicates use exactly the same timestamp/unit parsing as the reader.
     pub(crate) fn numeric_bounds(&self) -> (Option<f64>, Option<f64>) {
         (self.num, self.num2)
+    }
+
+    /// Number of a column's text for numeric operators (an instant in date mode).
+    pub(crate) fn field_number(&self, text: &str) -> Option<f64> {
+        if self.time {
+            crate::sources::text_to_ms(text).map(|ms| ms as f64)
+        } else {
+            crate::model::text_number(text)
+        }
     }
 }
 
@@ -65,11 +78,17 @@ pub(crate) fn prepare_with_threat_catalog(
         .map(|f| {
             let is_re = f.op == "regex";
             let is_query = f.op == "query";
+            let (num, time) = bound(&f.column, &f.value);
+            let (num2, time2) = bound(&f.column, f.value2.as_deref().unwrap_or(""));
+            // A range needs both ends in the same domain.
+            let mixed = f.op == "between" && num2.is_some() && time != time2;
             PreparedFilter {
+                finding: if f.op=="finding"{crate::detections::cached_for_finding(&f.value).ok()}else if f.op=="episode"{f.value2.as_deref().and_then(crate::detections::cached_analysis)}else{None},
                 regex: is_re.then(|| crate::query_regex::compile(&f.value, crate::query_regex::ORDINARY).ok()).flatten(),
                 needle_lower: if is_query { String::new() } else { f.value.to_lowercase() },
-                num: value_as_num(&f.column, &f.value),
-                num2: value_as_num(&f.column, f.value2.as_deref().unwrap_or("")),
+                num: num.filter(|_| !mixed),
+                num2: num2.filter(|_| !mixed),
+                time,
                 threat: if f.op == "threat_rule" {
                     crate::threats::matcher(&f.value, catalog.cloned()).ok()
                 } else {
@@ -219,17 +238,22 @@ pub struct AggSpec {
 }
 
 /// Interpreta o valor digitado no filtro como número. Para a coluna
-/// `timestamp`, aceita epoch em ms ou texto ISO ("2024-01-01 10:30").
-fn value_as_num(column: &str, s: &str) -> Option<f64> {
+/// `timestamp`, aceita epoch em ms ou texto ISO ("2024-01-01 10:30"). Nos demais
+/// campos, uma data/hora digitada vira um instante (ms) e liga o modo data:
+/// `iat > 2024-01-01 10:30` compara epoch em segundos, ms ou texto de data.
+fn bound(column: &str, s: &str) -> (Option<f64>, bool) {
     let s = s.trim();
     if let Ok(n) = s.parse::<f64>() {
-        return Some(n);
+        return (Some(n), false);
     }
     if column == "timestamp" {
-        return crate::sources::parse_timestamp(s).map(|ms| ms as f64);
+        return (crate::sources::parse_timestamp(s).map(|ms| ms as f64), false);
+    }
+    if let Some(ms) = crate::sources::typed_instant(s) {
+        return (Some(ms as f64), true);
     }
     // aceita valores com unidade ("100 MB", "2s") nos filtros >, < e entre
-    crate::analysis::parse_num_unit(s).map(|(n, _)| n)
+    (crate::analysis::parse_num_unit(s).map(|(n, _)| n), false)
 }
 
 pub fn matches(ev: &Event, pf: &PreparedFilter) -> bool {
@@ -247,6 +271,8 @@ fn matches_in_domain(ev: &Event, pf: &PreparedFilter, indexed: bool) -> bool {
     let f = &pf.f;
     let op = f.op.as_str();
     match op {
+        "episode"=>return match &pf.finding{Some(results)=>match results.contains_episode_member(&f.value,&crate::security_normalize::event_ref(ev),ev.id){Ok(value)=>value,Err(error)=>{crate::analysis_runtime::record_failure(error);false}},None=>{crate::analysis_runtime::record_failure("Episódio não disponível no contexto atual".into());false}},
+        "finding"=>return match &pf.finding{Some(results)=>match results.contains_finding_member(&f.value,&crate::security_normalize::event_ref(ev),ev.id){Ok(value)=>value,Err(error)=>{crate::analysis_runtime::record_failure(error);false}},None=>{crate::analysis_runtime::record_failure("Achado não disponível no contexto atual".into());false}},
         "threat_rule" => {
             return f.column == "_all"
                 && pf
@@ -278,7 +304,7 @@ fn matches_in_domain(ev: &Event, pf: &PreparedFilter, indexed: bool) -> bool {
         };
     }
     if is_numeric_op(op) {
-        let number = ev.col_num(&f.column);
+        let number = if pf.time { ev.col_str(&f.column).and_then(|text| pf.field_number(&text)) } else { ev.col_num(&f.column) };
         return number_matches(pf, number.filter(|value| !indexed || f.column != "timestamp" || *value != 0.0));
     }
     value_matches(pf, ev.col_ref(&f.column).as_deref())
@@ -384,7 +410,7 @@ pub(crate) fn value_matches(pf: &PreparedFilter, value: Option<&str>) -> bool {
         }),
         "empty" => value.is_none_or(|s| s.trim().is_empty()),
         "not_empty" => value.is_some_and(|s| !s.trim().is_empty()),
-        op if is_numeric_op(op) => number_matches(pf, value.and_then(crate::model::text_number)),
+        op if is_numeric_op(op) => number_matches(pf, value.and_then(|text| pf.field_number(text))),
         _ => false,
     }
 }
@@ -651,7 +677,7 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8], enriched: bool)
     }
     // Exact selection uses decoded field values, including whitespace and case.
     // Raw spans can contain JSON escapes or represent a normalized standard field.
-    if matches!(op, "equals_exact" | "not_equals_exact" | "threat_rule") {
+    if matches!(op, "equals_exact" | "not_equals_exact" | "threat_rule" | "finding" | "episode") {
         return Tri::NeedEvent;
     }
     let v = f.value.trim();
@@ -2148,5 +2174,44 @@ mod regex_program_reuse_tests {
             });
             assert_eq!(builds, if text.starts_with("path:") { 4 } else { 3 });
         }
+    }
+}
+
+#[cfg(test)]
+mod date_filter_tests {
+    use super::*;
+
+    fn event() -> Event {
+        let mut event = Event::empty();
+        event.fields.insert("token.payload.iat".into(), serde_json::json!(1700000000));
+        event.fields.insert("exp_ms".into(), serde_json::json!(1700000000000i64));
+        event.fields.insert("updated_at".into(), serde_json::json!("2023-11-14T22:13:20Z"));
+        event.fields.insert("bytes".into(), serde_json::json!(1700000000));
+        event
+    }
+    fn filter(column: &str, op: &str, value: &str, value2: Option<&str>) -> PreparedFilter {
+        prepare(&[Filter { column: column.into(), op: op.into(), value: value.into(), value2: value2.map(str::to_string) }]).remove(0)
+    }
+
+    #[test]
+    fn typed_dates_compare_epoch_seconds_milliseconds_and_date_text_as_instants() {
+        let event = event();
+        for column in ["token.payload.iat", "exp_ms", "updated_at"] {
+            assert!(matches(&event, &filter(column, "gt", "2023-01-01 00:00", None)), "{column}");
+            assert!(!matches(&event, &filter(column, "lt", "01/01/2023", None)), "{column}");
+            assert!(matches(&event, &filter(column, "between", "2023-01-01", Some("31/12/2023 23:59:59"))), "{column}");
+            // The engine compares the same column text through the same function.
+            let text = event.col_str(column).unwrap();
+            assert!(number_matches(&filter(column, "gte", "2023-11-01", None), filter(column, "gte", "2023-11-01", None).field_number(&text)));
+        }
+    }
+
+    #[test]
+    fn plain_numbers_keep_numeric_semantics_and_mixed_ranges_never_match() {
+        let event = event();
+        assert!(matches(&event, &filter("bytes", "gt", "100", None)));
+        assert!(!matches(&event, &filter("bytes", "lt", "100 MB", None)));
+        assert!(!matches(&event, &filter("token.payload.iat", "between", "2023-01-01", Some("1800000000"))));
+        assert!(!matches(&event, &filter("token.payload.iat", "gt", "not a date", None)));
     }
 }

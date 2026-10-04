@@ -212,7 +212,7 @@ window.ValueInspector = (() => {
 
   const element = (tag, className, text) => { const node = document.createElement(tag); node.className = className; if (text !== undefined) node.textContent = text; return node; };
   function close() { active?.(); }
-  function open(value, { label = "Valor", path = "$", revealed = false, isCurrent = () => true } = {}) {
+  function open(value, { label = "Valor", path = "$", isCurrent = () => true } = {}) {
     if (!isCurrent()) return;
     close();
     const previous = document.activeElement, dialog = element("dialog", "evidence-inspector value-inspector");
@@ -222,11 +222,10 @@ window.ValueInspector = (() => {
     heading.append(element("small", "", "Inspeção local"), element("h3", "", short(label)));
     const dismiss = element("button", "btn ghost small", "Fechar"); dismiss.type = "button";
     header.append(heading, dismiss);
-    const body = element("div", "evidence-inspector-body"), toggle = element("button", "btn ghost small"); toggle.type = "button";
+    const body = element("div", "evidence-inspector-body");
     const note = element("p", "muted small", "Estruturas interpretadas, sem verificação de assinatura ou autenticidade. Datas de JWT são apenas declarações do token. Caminhos com :: são virtuais, disponíveis somente neste inspetor.");
     const tree = element("div", "value-tree"), status = element("p", "muted small"); status.setAttribute("role", "status");
-    body.append(toggle, note, tree, status); dialog.append(header, body);
-    let visible = !!revealed;
+    body.append(note, tree, status); dialog.append(header, body);
     const cleanup = () => {
       if (active !== cleanup) return;
       active = null; tree.replaceChildren(); value = null;
@@ -245,6 +244,8 @@ window.ValueInspector = (() => {
       if (node.children.length) branch.open = depth === 0;
       const line = element(node.children.length ? "summary" : "div", "value-node-line");
       line.append(element("strong", "value-node-key", short(node.label)), element("span", "value-node-preview mono", node.preview));
+      const date = window.DateValues?.describe(node.label, node.value);
+      if (date) line.append(element("span", "value-node-date", date));
       branch.append(line);
       const actions = element("div", "value-node-actions");
       const pathButton = element("button", "text-button", "Copiar caminho"); pathButton.type = "button";
@@ -260,19 +261,15 @@ window.ValueInspector = (() => {
       return branch;
     }
     function render() {
-      toggle.textContent = visible ? "Ocultar valor e subcampos" : "Mostrar valor e subcampos";
-      toggle.setAttribute("aria-pressed", String(visible));
       tree.replaceChildren(); status.textContent = "";
-      if (!visible) { tree.append(element("p", "muted", "[oculto] · Revele para examinar o valor original e seus subcampos.")); return; }
       const model = analyze(value, path);
       tree.append(renderNode(model.root));
       if (model.notices.length) status.textContent = model.notices.join(". ") + ". A evidência original permanece intacta.";
     }
-    toggle.onclick = () => { if (!isCurrent()) { cleanup(); return; } visible = !visible; render(); };
     dismiss.onclick = cleanup;
     dialog.addEventListener("cancel", event => { event.preventDefault(); cleanup(); });
     dialog.addEventListener("click", event => { if (event.target === dialog) { const r = dialog.getBoundingClientRect(); if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) cleanup(); } });
-    document.body.append(dialog); render(); dialog.showModal(); toggle.focus();
+    document.body.append(dialog); render(); dialog.showModal(); dismiss.focus();
     return cleanup;
   }
   if (typeof document !== "undefined") document.addEventListener("workspace-context-change", close);

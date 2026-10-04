@@ -92,7 +92,7 @@ test('invalid input, API error and incomplete evidence fail rather than falling 
   await assert.rejects(selectReleaseChecks(env(), { fetchImpl: api(), git: () => { throw Error('Non-ancestor'); } }));
 });
 test('workflow proof gates both jobs while package, installed updater and native acceptance remain mandatory', () => {
-  const build = readFileSync(new URL('../../.github/workflows/build.yml', import.meta.url), 'utf8');
+  const build = readFileSync(new URL('../../.github/workflows/build.yml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   const job = name => build.split(`\n  ${name}:\n`)[1].split(/\n  [a-z][a-z_-]*:\n/)[0];
   const step = name => build.split(`      - name: ${name}\n`)[1]?.split(/\n      - |\n  [a-z][a-z_-]*:\n/)[0];
   assert.match(build, /reuse_checks_run_id:[\s\S]*?type: string[\s\S]*?default: ''/);

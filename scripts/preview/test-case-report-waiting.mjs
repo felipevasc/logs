@@ -1,17 +1,15 @@
 /* Remote browser evidence for the actual CaseReport modal/render pipeline.
    The unchanged renderer is held at its CaseTimeline.rows dependency and the
    preview save boundary. Synthetic evidence/gates do not verify the native engine.
-   Contact sampling seeks only CSS timelines; the recorded full loop is real time. */
+   Robot skits play in natural real time. */
 import assert from 'node:assert/strict';
 import { mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { launchBrowser } from './browser.mjs';
 import { captureFailure } from './diagnostics.mjs';
-import { installMotionSampling } from './motion-sampling.mjs';
 const output=resolve('output/playwright');mkdirSync(output,{recursive:true});
 const browser=await launchBrowser(),context=await browser.newContext({viewport:{width:1440,height:960},reducedMotion:'no-preference',recordVideo:{dir:resolve(output,'video-raw'),size:{width:1440,height:960}}});
 const started=Date.now(),page=await context.newPage(),video=page.video(),errors=[];
-await page.addInitScript(installMotionSampling);
 const results={evidence:{app:'Actual CaseReport open/render/save and WaitingVisuals DOM/CSS',gates:'Test-only waits at CaseTimeline.rows and the preview export_timeline boundary',data:'Small explicit synthetic Case; generated PDF bytes and captured application pixels are real',nativeEngineVerified:false,generatedImageAssets:false},screenshots:[],markers:[]};
 const mark=label=>results.markers.push({label,offsetMs:Date.now()-started});
 const scene=page.locator('.case-report-dialog .waiting-visual'),dialog=page.locator('.case-report-dialog');
@@ -55,72 +53,25 @@ try {
       return originalApi(command,args,options);
     };
   });
-  phase='short-alignment';await begin();mark('short-real-render-wait');
-  const shortSampling=await scene.evaluateHandle(root=>window.__waitingMotionSampling.begin(root.querySelector('.wv-art').getAnimations({subtree:true})));
-  try {
-    await shortSampling.evaluate(sample=>sample.seek(2800*.42));
-    results.short=await scene.evaluate(root=>{
-      const art=root.querySelector('.wv-art'),animations=art.getAnimations({subtree:true});
-      const result={family:root.dataset.family,pace:root.dataset.pace,durations:[...new Set(animations.map(a=>a.effect.getComputedTiming().duration))],iterations:[...new Set(animations.map(a=>String(a.effect.getTiming().iterations)))],status:root.querySelector('.wv-status').textContent,metricHidden:root.querySelector('.wv-metric').hidden};
-      result.pressTransform=getComputedStyle(root.querySelector('.wv-compose-press')).transform;
-      result.heldOpacity=Number(getComputedStyle(root.querySelector('.wv-compose-held')).opacity);
-      return result;
-    });
-    assert.equal(results.short.family,'composition');assert.equal(results.short.pace,'gesture');assert.deepEqual(results.short.durations,[2800]);assert.deepEqual(results.short.iterations,['1']);
-    assert.equal(results.short.metricHidden,true);assert.equal(results.short.pressTransform,'none');assert.equal(results.short.heldOpacity,1);
-    await snap('case-report-wait-short-dark.png');
-  } finally {
-    try {await shortSampling.evaluate(sample=>sample.restore());}
-    finally {await shortSampling.dispose();}
-  }
-  phase='long-contact';await page.waitForFunction(()=>document.querySelector('.case-report-dialog .waiting-visual')?.dataset.pace==='loop');
-  results.rig=await scene.evaluate(async root=>{
-    const art=root.querySelector('.wv-art'),hand=root.querySelector('.wv-task-hand'),held=root.querySelector('.wv-compose-held'),loaded=root.querySelector('.wv-compose-loaded'),press=root.querySelector('.wv-compose-press'),bed=root.querySelector('.wv-compose-bed');
-    const animations=art.getAnimations({subtree:true});
-    const at=fraction=>sampling.seek(7600*fraction);
-    const point=(node,x,y)=>{const p=new DOMPoint(x,y).matrixTransform(node.getScreenCTM());return {x:p.x,y:p.y};};
-    const distance=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
-    const rig={width:art.getBoundingClientRect().width,height:art.getBoundingClientRect().height,actorCount:root.querySelectorAll('.wv-task').length,carriedByHand:held.parentElement===hand,gripBelongsToPress:root.querySelector('.wv-compose-grip').parentElement===press,durations:[...new Set(animations.map(a=>a.effect.getComputedTiming().duration))],contacts:[],grip:[],reaction:[]};
-    const sampling=await window.__waitingMotionSampling.begin(animations);
-    try {
-      for(const fraction of [.28,.86]){await at(fraction);rig.contacts.push({fraction,distances:[[93,52],[109,63]].map(([x,y])=>distance(point(held,x,y),point(loaded,x,y))),heldOpacity:Number(getComputedStyle(held).opacity),loadedOpacity:Number(getComputedStyle(loaded).opacity)});}
-      for(let percent=38;percent<=76;percent++){await at(percent/100);rig.grip.push({percent,distance:distance(point(hand,91,55),point(press,114,46))});}
-      for(const fraction of [.38,.54,.56,.62,.64,.84]){await at(fraction);rig.reaction.push({fraction,pressY:new DOMMatrix(getComputedStyle(press).transform).m42,bedY:new DOMMatrix(getComputedStyle(bed).transform).m42});}
-      return rig;
-    } finally {await sampling.restore();}
-  });
-  assert.equal(results.rig.actorCount,1);assert.equal(results.rig.carriedByHand,true);assert.equal(results.rig.gripBelongsToPress,true);
-  assert.ok(Math.abs(results.rig.width-240)<.5&&Math.abs(results.rig.height-120)<.5);assert.deepEqual(results.rig.durations,[7600]);
-  assert.ok(results.rig.contacts.every(contact=>contact.distances.every(value=>value<.15)),'the two corners of the proof meet at both handovers');
-  assert.ok(results.rig.grip.every(sample=>sample.distance<.15),'press grip remains connected throughout both strokes');
-  assert.equal(results.rig.contacts[0].heldOpacity,0);assert.equal(results.rig.contacts[1].loadedOpacity,0);
-  const reaction=fraction=>results.rig.reaction.find(sample=>sample.fraction===fraction);
-  assert.ok(Math.abs(reaction(.54).bedY)<.02);assert.ok(Math.abs(reaction(.56).bedY-.7)<.02);assert.ok(Math.abs(reaction(.84).bedY)<.02);
-  phase='long-real-time-cycle';mark('long-cycle-start');
-  results.cycle=await scene.evaluate(async root=>{
-    const animations=root.querySelector('.wv-art').getAnimations({subtree:true});
-    const sampling=await window.__waitingMotionSampling.begin(animations);
-    try {
-      await sampling.seek(0);await sampling.release();await Promise.all(animations.map(animation=>animation.ready));
-      const started=performance.now();return await new Promise((resolve,reject)=>{const frame=()=>{
-        const times=animations.map(animation=>animation.currentTime);
-        if(!root.isConnected||root.dataset.motion!=='running')return reject(Error('Report scene stopped during real-time capture'));
-        if(times.every(value=>typeof value==='number'&&value>=7600))return resolve({elapsedMs:performance.now()-started,minimumTimelineMs:Math.min(...times)});
-        if(performance.now()-started>17600)return reject(Error('Report scene did not finish its real-time capture cycle'));
-        requestAnimationFrame(frame);
-      };requestAnimationFrame(frame);});
-    } finally {await sampling.restore({ restoreTime: false });}
-  });
-  assert.ok(results.cycle.minimumTimelineMs>=7600);mark('long-cycle-end');await snap('case-report-wait-long-dark.png');
-  phase='pause-and-context';await scene.locator('.wv-motion-toggle').focus();await page.keyboard.press('Enter');await motion('static');
-  assert.equal(await scene.locator('.wv-art').evaluate(node=>node.getAnimations({subtree:true}).filter(animation=>animation.playState==='running').length),0);
+  phase='room';await begin();mark('real-render-wait');
+  results.room=await scene.evaluate(root=>({family:root.dataset.family,ring:!!root.querySelector('.wv-ring-arc'),buttons:root.querySelectorAll('button').length,
+    size:root.querySelector('.wv-art').getBoundingClientRect().width,status:root.querySelector('.wv-status').textContent,metricHidden:root.querySelector('.wv-metric').hidden}));
+  assert.equal(results.room.family,'composition');assert.equal(results.room.ring,true);assert.equal(results.room.buttons,0);
+  assert.ok(Math.abs(results.room.size-100)<1);assert.equal(results.room.metricHidden,true);
+  // A whole skit begins shortly after the loader and runs on its own clock.
+  await page.waitForFunction(()=>document.querySelector('.case-report-dialog .waiting-visual')?.dataset.skit,null,{timeout:4000});
+  await page.waitForTimeout(1600);
+  results.skit=await scene.evaluate(root=>({skit:root.dataset.skit,running:root.querySelector('.wv-actors').getAnimations({subtree:true}).filter(a=>a.playState==='running').length}));
+  assert.ok(results.skit.running>5);mark('skit-playing');await snap('case-report-wait-dark.png');
+  phase='pause-and-context';await scene.evaluate(root=>{root.style.transform='translateX(200vw)';});await motion('static');
+  assert.equal(await scene.locator('.wv-actors').evaluate(node=>node.getAnimations({subtree:true}).filter(animation=>animation.playState==='running').length),0);
   assert.equal(await page.evaluate(()=>__reportWaitGate.pendingRows.length),1,'pausing artwork does not cancel rendering');
-  await scene.locator('.wv-motion-toggle').focus();await page.keyboard.press('Enter');await motion('running');
+  await scene.evaluate(root=>{root.style.transform='';});await motion('running');
   await page.setViewportSize({width:1024,height:800});await page.evaluate(()=>{if(document.documentElement.dataset.theme!=='light')toggleTheme();});
   await page.evaluate(async()=>{const animations=document.getAnimations().filter(a=>a instanceof CSSTransition);await Promise.all(animations.map(a=>a.finished.catch(()=>{})));});
   const bounds=await scene.boundingBox();assert.ok(bounds.x>=0&&bounds.x+bounds.width<=1024&&bounds.y>=0&&bounds.y+bounds.height<=800);await snap('case-report-wait-long-light-1024.png');
   await page.emulateMedia({forcedColors:'active'});await snap('case-report-wait-forced-colors.png');await page.emulateMedia({forcedColors:'none',reducedMotion:'reduce'});await motion('static');
-  assert.equal(await scene.locator('.wv-motion-toggle').isVisible(),false);await snap('case-report-wait-reduced-motion.png');
+  assert.equal(await scene.locator('button').count(),0);await snap('case-report-wait-reduced-motion.png');
   await page.emulateMedia({reducedMotion:'no-preference'});await motion('running');
   await scene.evaluate(root=>{root.style.transform='translateX(200vw)';});await motion('static');await scene.evaluate(root=>{root.style.transform='';});await motion('running');
   const savesBefore=await page.evaluate(()=>__reportWaitGate.saveEntries.length);

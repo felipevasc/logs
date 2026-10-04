@@ -145,6 +145,7 @@ window.Security = (() => {
 
   // ---------------------------------------------------------------- evidence
   function detectionFilters(d) {
+    if(d.filters?.some(f=>f.op==="finding"))return [...d.filters];
     return d.event_refs?.length ? [{ column: "event_ref", op: "in_exact", value: d.event_refs.join("\n") }] : [...d.filters];
   }
   const FIELD_NAME = /^@?[\p{L}\p{N}_.-]+$/u;
@@ -160,6 +161,7 @@ window.Security = (() => {
     return parts.join(" AND ");
   }
   function episodeFilters(data, episode) {
+    if(data.storage?.kind==="sqlite")return [{column:"event_ref",op:"episode",value:episode.id,value2:data.analysis_id}];
     const refs = episode.event_refs || [...new Set(episode.detections.flatMap(i => data.detections[i].event_refs || []))];
     return refs.length ? [{ column: "event_ref", op: "in_exact", value: refs.join("\n") }] : episode.detections.flatMap(i => detectionFilters(data.detections[i]));
   }
@@ -263,9 +265,21 @@ window.Security = (() => {
     const members=[...new Map((detection.evidence_members || []).map(m=>[m.event_ref,m])).values()];
     if(!members.length) {host.querySelector('.sec-event-list').textContent='Este achado histórico não preservou referências completas aos eventos.';return;}
     const context=key(), request=fullRequest(), list=host.querySelector('.sec-event-list'); let offset=0;
-    const appendPage=()=>{
+    const paged=!!detection.measurements?.evidence_paging;
+    let total=paged?detection.measurements.evidence_paging.total:members.length;
+    const appendPage=async()=>{
       host.querySelector('[data-more-events]')?.remove();
-      for(const member of members.slice(offset,offset+20)) {
+      let pageMembers=members.slice(offset,offset+20);
+      if(paged){
+        const loading=el('p','small muted','Carregando referencias completas...');host.append(loading);
+        try{const page=await api('investigation_page',{analysisId:data.analysis_id,section:'finding_members',signalId:detection.id,offset,limit:20,...request},{silent:true});
+          if(!host.isConnected||context!==key())return;
+          if(page.analysis_id!==data.analysis_id||page.complete!==true)throw Error('Pagina de evidencia incompleta ou desatualizada');
+          pageMembers=page.items;total=page.total;
+        }catch(error){if(context===key()&&host.isConnected){loading.textContent=String(error);const retry=el('button','btn ghost small','Tentar novamente');retry.onclick=()=>{loading.remove();retry.remove();void appendPage();};host.append(retry);}return;}
+        loading.remove();
+      }
+      for(const member of pageMembers) {
         const details=el('details','sec-event');
         details.innerHTML=`<summary>Evento ${esc(member.event_id)} <code>${esc(member.event_ref)}</code></summary><div class="sec-event-content"></div>`;
         const body=details.querySelector('.sec-event-content');let loading=false,loaded=false,closeInspector=null;
@@ -291,10 +305,27 @@ window.Security = (() => {
         details.oncontextmenu=e=>{e.preventDefault();e.stopPropagation();showCtxMenu(e.clientX,e.clientY,[{icon:'fa-filter',label:'Filtrar este evento no Explorar',onClick:()=>showRecords([{column:'event_ref',op:'in_exact',value:member.event_ref}])}]);};
         list.append(details);
       }
-      offset+=20;
-      if(offset<members.length){const more=el('button','btn ghost',`Mais eventos (${members.length-offset} restantes)`);more.dataset.moreEvents='';more.onclick=appendPage;host.append(more);}
+      offset+=pageMembers.length;
+      if(offset<total){const more=el('button','btn ghost',`Mais eventos (${total-offset} restantes)`);more.dataset.moreEvents='';more.onclick=appendPage;host.append(more);}
     };
     appendPage();
+    if (detection.measurements?.entity_paging) {
+      const entities = el('details', 'sec-event'); entities.append(el('summary', '', 'Todas as entidades do achado')); const values = el('div'); entities.append(values); host.append(entities);
+      let entityOffset = 0, busy = false;
+      const nextEntities = async () => {
+        if (busy) return; busy = true; values.querySelector('button')?.remove();
+        try {
+          const page = await api('investigation_page', { analysisId: data.analysis_id, section: 'finding_entities', signalId: detection.id, offset: entityOffset, limit: 20, ...request }, { silent: true });
+          if (!entities.isConnected || context !== key()) return;
+          if (page.analysis_id !== data.analysis_id || page.complete !== true) throw Error('Entidades de outra análise ou resultado incompleto');
+          for (const entity of evidence().redact(page.items)) values.append(el('p', 'small', `${entity.label || entity.column}: ${entity.value}`));
+          entityOffset += page.items.length;
+          if (page.next_offset != null) { const more = el('button', 'btn ghost small', 'Mais entidades'); more.onclick = nextEntities; values.append(more); }
+        } catch (error) { if (entities.isConnected && context === key()) { values.append(el('p', 'error', String(error))); const retry = el('button', 'btn ghost small', 'Tentar novamente'); retry.onclick = nextEntities; values.append(retry); } }
+        finally { busy = false; }
+      };
+      entities.addEventListener('toggle', () => { if (entities.open && !values.childNodes.length) void nextEntities(); });
+    }
   }
 
   function tacticsStrip(data) {
@@ -589,6 +620,15 @@ window.Security = (() => {
     else {
       summarySlots = { attention, entities: view.entities, rare: view.rare };
       drawAttention(attention, data);
+      if (data.investigation?.enabled) {
+        const captured = episodeRequest(data), identity = key();
+        window.InvestigationUI?.mount(attention, data, {
+          isCurrent: () => identity === key(),
+          request: (command, args) => api(command, { ...captured.request, ...args }, { silent: true, analysisOwner: captured.owner }),
+          onProfileSaved: result => { toast(`Referência congelada: ${result.eligible} eventos elegíveis, ${result.withheld} excluídos. Calcule novamente para comparar.`, 'ok'); invalidate(); },
+          onRuleSaved: () => { toast('Regra revisada salva neste Caso, com nível não avaliado. Calcule novamente para aplicar.', 'ok'); invalidate(); },
+        });
+      }
       if (view.entities) drawEntities(view.entities, data);
       if (view.rare) drawRare(view.rare, data);
     }
@@ -668,6 +708,25 @@ window.Security = (() => {
     custom.querySelector("textarea").value = overview.custom_rules_json || "";
     custom.querySelector("button").onclick = async () => { try { await mutate("detection_settings_save", { settings, customRulesJson: custom.querySelector("textarea").value }); if (pane.isConnected) await renderRulesPane(pane); } catch (error) { custom.querySelector("pre").textContent = String(error); } };
     pane.prepend(custom);
+    if (overview.sigma_compatibility) { const compatibility = el('details', 'rules-mappings'); compatibility.append(el('summary', '', 'Compatibilidade Sigma')); const text = el('pre'); text.textContent = JSON.stringify(overview.sigma_compatibility, null, 2); compatibility.append(text); pane.prepend(compatibility); }
+    if(overview.retirement_reviews){const reviews=el('details','rules-mappings');reviews.append(el('summary','','Revisão individual das regras retiradas'));for(const item of overview.retirement_reviews.reviews){const entry=el('details');entry.append(el('summary','',item.rule),el('p','',item.rationale),el('p','',`Contexto a avaliar: ${item.positive_context_to_evaluate}`),el('p','',`Alternativa próxima: ${item.near_negative}`),el('p','',`Dados necessários: ${item.missing_telemetry}`));reviews.append(entry);}pane.prepend(reviews);}
+    const behaviorPane = el("details", "rules-mappings");
+    behaviorPane.innerHTML = '<summary>Análise comportamental, IOC e políticas do ambiente</summary><p class="small muted">Configuração deste Caso. enabled controla a análise completa; baseline_days, minimum_history e rare_max definem o histórico. business exige fonte, namespace, ação, moeda, janela e limites explícitos. telemetry exige fonte, namespace e intervalo esperado. ioc recebe um catálogo offline versionado com procedência e validade. Sinais não promovem evidência automaticamente.</p><textarea class="source-mapping-editor" aria-label="Configuração da investigação (JSON)"></textarea><button type="button" class="btn ghost small">Salvar investigação</button><pre aria-live="polite"></pre>';
+    behaviorPane.querySelector("textarea").value = JSON.stringify(settings.investigation || { enabled: true, baseline_days: 7, minimum_history: 20, rare_max: 3, profile: null, business: [], telemetry: [], ioc: null }, null, 2);
+    const behaviorEditor = behaviorPane.querySelector('textarea'); const basics = el('div', 'investigation-navigation');
+    for (const [field,label,min,max] of [['enabled','Investigar comportamento'],['baseline_days','Referência dentro da população (dias)',1,365],['minimum_history','Histórico mínimo (observações)',5,100000],['rare_max','Máximo de observações para raridade',1,100],['profile','Nome da referência histórica (opcional)']]) {
+      const row = el('label', 'small', label); const input = document.createElement('input'); input.type = field === 'enabled' ? 'checkbox' : min == null ? 'text' : 'number'; input.dataset.behaviorField = field;
+      if (min != null) { input.min = min; input.max = max; } if (field === 'profile') input.maxLength = 128;
+      input.onchange = () => { try { const config = JSON.parse(behaviorEditor.value); config[field] = field === 'enabled' ? input.checked : min == null ? input.value.trim() || null : Number(input.value); if (field === 'profile') config.profile_revision = null; behaviorEditor.value = JSON.stringify(config, null, 2); } catch (error) { behaviorPane.querySelector('pre').textContent = String(error); } };
+      row.append(input); basics.append(row);
+    }
+    const syncBasics = () => { try { const config = JSON.parse(behaviorEditor.value); for (const input of basics.querySelectorAll('input')) { const field = input.dataset.behaviorField; if (field === 'enabled') input.checked = config[field] !== false; else input.value = config[field] ?? ''; } } catch {} };
+    behaviorEditor.addEventListener('input', syncBasics); syncBasics(); behaviorPane.insertBefore(basics, behaviorEditor);
+    behaviorPane.querySelector("button").onclick = async () => {
+      const status = behaviorPane.querySelector("pre");
+      try { const investigation = JSON.parse(behaviorPane.querySelector("textarea").value); await mutate("detection_settings_save", { settings: { ...settings, investigation } }); settings.investigation = investigation; invalidate(); rulesCache = null; status.textContent = "Configuração salva. Execute a análise para aplicar."; } catch (error) { status.textContent = String(error); }
+    };
+    pane.prepend(behaviorPane);
     const mappingsPane = el("details", "rules-mappings");
     mappingsPane.innerHTML = `<summary>Mapeamento de fontes e procedência</summary><p class="muted small">Cada fonte usa seu nome exato. Campos: timestamp, actor, target, namespace, host, service, action, outcome, request, session, connection, process, parent, file, command, credential, created_credential, resource, request_command, url, persistence_target, application, grant, token, repository, pipeline, run, revision, secret, certificate, certificate_issuer, certificate_subject, requester, beneficiary, delegator, resource_spn, destination, artifact, logon, remote_session, principal, source_address. Resultados: success, failure, blocked, unknown.</p><textarea class="source-mapping-editor" aria-label="Mapeamentos por fonte (JSON)"></textarea><button type="button" class="btn ghost small" data-preview-map>Prévia no evento aberto</button><button type="button" class="btn ghost small" data-save-map>Salvar mapeamentos</button><pre class="mapping-preview" aria-live="polite"></pre>`;
     pane.prepend(mappingsPane);

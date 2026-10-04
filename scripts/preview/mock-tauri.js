@@ -927,7 +927,22 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
       if (caseStore.size > 3) caseStore.delete(caseStore.keys().next().value);
       return { caseContentToken };
     },
-    triage: ({ filters, caseEvents }) => mockTriage(poolOf(caseEvents)),
+    triage: ({ filters, caseEvents }) => ({...mockTriage(poolOf(caseEvents)),...(window.__mockInvestigationFixture || {})}),
+    investigation_page: ({analysisId,section,namespace,entity,signalId,offset=0,limit=20}) => {
+      if (!window.__mockInvestigationFixture || analysisId !== (window.__mockInvestigationFixture.analysis_id || 'preview-analysis')) throw Error('A análise mudou; recalcule antes de investigar.');
+      const fixture=window.__mockInvestigationPages?.[section === 'hunt' ? `hunt:${signalId}` : section] || { items:[] };
+      let rows=fixture.items.filter(row=>(!namespace || !row.namespace || row.namespace===namespace) && (!entity || !row.value || row.value===entity));
+      const items=rows.slice(offset,offset+limit);
+      return structuredClone({analysis_id:analysisId,section,items,total:rows.length,next_offset:offset+items.length<rows.length?offset+items.length:null,complete:true,...fixture,items});
+    },
+    investigation_narrative_review: ({analysisId,draft}) => { if(!draft?.claims?.length) throw Error('Síntese sem afirmações'); return {analysis_id:analysisId,classification_updated:false,semantic_validation:'human_review_required',citation_membership:'fixture_only',claims:draft.claims}; },
+    investigation_proposal_evaluate: ({analysisId,signalId,controls}) => {
+      if(!controls.positive?.length||!controls.negative?.length||!controls.holdout_declaration?.trim())throw Error('Controles incompletos');
+      const proposal=window.__mockInvestigationPages?.proposal?.items.find(p=>p.signal_id===signalId);
+      if(!proposal)throw Error('Proposta indisponível');
+      return structuredClone({analysis_id:analysisId,rule_hash:proposal.rule_hash,complete:true,activation_gate:false,true_positives:0,false_positives:1,evidence_level:0,...(window.__mockProposalEvaluation||{})});
+    },
+    investigation_proposal_accept: () => { throw Error('Ativação depende de recibo e revisão do Caso'); },
     triage_evidence_event: ({eventId,eventRef,caseEvents}) => { const e=poolOf(caseEvents).find(e=>e.id===eventId && (e.event_ref || `preview:${e.id}`)===eventRef); if(!e)throw Error("Evento indisponível"); return structuredClone(e); },
     event_insights: ({ event }) => {
       const entities = [];
@@ -1050,7 +1065,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
   handlers.detection_settings_save = args => { const { context, settings, security } = securityFor(args); security.detectionSettingsJson = JSON.stringify(args.settings); if (args.customRulesJson != null) { if (args.customRulesJson.trim()) JSON.parse(args.customRulesJson); security.customRulesJson = args.customRulesJson.trim() ? args.customRulesJson : null; } return saveInterpretation(context, settings); };
   handlers.sigma_import = args => { securityFor(args); throw Error("A prévia não pode importar arquivos Sigma; use o aplicativo nativo."); };
   handlers.sigma_clear = args => { const { context, settings, security } = securityFor(args); security.sigmaSources = []; return saveInterpretation(context, settings); };
-  handlers.triage = args => mockTriage(poolOf(args.caseEvents), JSON.parse(securityFor(args).security.detectionSettingsJson));
+  handlers.triage = args => ({...mockTriage(poolOf(args.caseEvents), JSON.parse(securityFor(args).security.detectionSettingsJson)),...(window.__mockInvestigationFixture || {})});
   const threatOverride = args => { const text = securityFor(args).security.threatCatalogJson; return text ? JSON.parse(text) : null; };
   handlers.threat_catalog = async args => { const override = threatOverride(args); return (await import('/__mock-threats__.js')).threatCatalog(override); };
   handlers.threat_catalog_update = async args => {

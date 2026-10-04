@@ -25,6 +25,7 @@
   <link rel="stylesheet" href="case-content.css" />
   <link rel="stylesheet" href="case-trails.css" />
   <link rel="stylesheet" href="security.css" />
+  <link rel="stylesheet" href="investigation.css" />
   <link rel="stylesheet" href="updates.css" />
   <link rel="stylesheet" href="resource-settings.css" />
   <link rel="stylesheet" href="resources.css" />
@@ -64,7 +65,7 @@
   <div id="ws-export-modal" class="modal-overlay" hidden>
     <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="ws-export-title">
       <div class="modal-head"><h3 id="ws-export-title">Exportar</h3><button class="icon-btn" id="ws-export-close" aria-label="Fechar"><i class="fas fa-xmark"></i></button></div>
-      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Itens do Caso · Markdown</option><option value="case">Investigação portátil · LICASE</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask" checked> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
+      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Itens do Caso · Markdown</option><option value="case">Investigação portátil · LICASE</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask"> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
     </div>
   </div>
   <div id="ws-drop" hidden><i class="fas fa-arrow-down-to-bracket"></i><strong>Solte os logs aqui</strong></div>
@@ -135,16 +136,18 @@
   <div id="load-overlay" class="load-overlay" hidden>
     <div class="load-stage semantic-load-stage">
       <div id="load-visual"></div>
+      <div class="load-progress">
+        <div class="load-bar"><div id="load-bar-fill"></div></div>
+        <div id="load-volume" class="load-volume"></div>
+        <div id="load-eta" class="load-eta"></div>
+      </div>
       <div class="load-operation-controls">
         <button id="load-cancel" class="btn ghost small" type="button" aria-describedby="load-cancel-help" disabled>Cancelar operação</button>
         <p id="load-cancel-help">Cancelamento indisponível nesta etapa.</p>
       </div>
       <details id="load-progress-details" class="load-progress-details">
-      <summary>Detalhes do processamento</summary>
+      <summary>Etapas do processamento</summary>
       <div id="load-phase" class="load-phase">Preparando…</div>
-      <div id="load-volume" class="load-volume"></div>
-      <div id="load-eta" class="load-eta"></div>
-      <div class="load-bar"><div id="load-bar-fill"></div></div>
       <ol id="load-steps" class="load-steps"></ol>
       </details>
     </div>
@@ -1051,6 +1054,7 @@
   <script src="detail-fields.js"></script>
   <script src="java-trace.js"></script>
   <script src="performance-core.js"></script>
+  <script src="date-values.js"></script>
   <script src="waiting-visuals.js"></script>
   <script src="waiting-progress.js"></script>
   <script src="case-evidence.js"></script>
@@ -1094,6 +1098,7 @@
   <script src="evidence-ui.js"></script>
   <script src="value-inspector.js"></script>
 <script src="participants-ui.js"></script>
+<script src="investigation.js"></script>
 <script src="security.js"></script>
   <script src="event-insights.js"></script>
   <script src="case-intel.js"></script>

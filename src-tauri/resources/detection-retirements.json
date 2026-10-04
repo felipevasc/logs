@@ -1,0 +1,237 @@
+{
+  "version": "retirement-review-1",
+  "review_date": "2026-10-03",
+  "policy": "Individual review; retain standalone retirement. Guided hypotheses and contextual correlations require exact original support; no severity-to-evidence conversion.",
+  "reviews": [
+    {
+      "rule": "auth.lockout",
+      "decision": "keep_standalone_retired",
+      "rationale": "Bloqueio de conta isolado pode resultar de senha expirada ou política normal.",
+      "hunt": "identity",
+      "positive_context_to_evaluate": "Bloqueios acompanhados de falhas distribuídas e acesso abusivo corroborado.",
+      "near_negative": "Cliente antigo mantém senha expirada.",
+      "missing_telemetry": "Ator, serviço, origem, resultado e atividade posterior.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "auth.rdp.public",
+      "decision": "keep_standalone_retired",
+      "rationale": "Endereço público e acesso RDP não demonstram abuso.",
+      "hunt": "identity",
+      "positive_context_to_evaluate": "Autenticação correlacionada com processo ou ação não autorizada.",
+      "near_negative": "Acesso remoto permitido por VPN ou bastion.",
+      "missing_telemetry": "Identidade, sessão, autorização e uso posterior.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "auth.root.public",
+      "decision": "keep_standalone_retired",
+      "rationale": "Login root remoto depende da política e do contexto operacional.",
+      "hunt": "identity",
+      "positive_context_to_evaluate": "Credencial utilizada em ação específica e vinculada por sessão.",
+      "near_negative": "Administração autorizada com chave SSH.",
+      "missing_telemetry": "Política explícita, sessão e ação posterior.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "account.create",
+      "decision": "keep_standalone_retired",
+      "rationale": "Criação de conta é provisionamento comum.",
+      "hunt": "identity",
+      "positive_context_to_evaluate": "Criação seguida de privilégio e uso ligados ao alvo exato.",
+      "near_negative": "Provisionamento automatizado aprovado.",
+      "missing_telemetry": "Criador, alvo, tenant, autorização e uso.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "account.privileged-group",
+      "decision": "keep_standalone_retired",
+      "rationale": "Alteração de grupo privilegiado requer identidade do alvo e revisão da autorização.",
+      "hunt": "ad",
+      "positive_context_to_evaluate": "Mudança seguida de uso da identidade alvo e ação relevante.",
+      "near_negative": "Entrada temporária aprovada em grupo administrativo.",
+      "missing_telemetry": "Grupo, alvo, domínio, resultado e aprovação.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "persist.service",
+      "decision": "keep_standalone_retired",
+      "rationale": "Um serviço instalado não estabelece persistência maliciosa.",
+      "hunt": "process",
+      "positive_context_to_evaluate": "Serviço com comando específico, binário e execução vinculados.",
+      "near_negative": "Instalação de agente corporativo assinado.",
+      "missing_telemetry": "Caminho, comando, assinatura e instância de processo.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "persist.task",
+      "decision": "keep_standalone_retired",
+      "rationale": "Tarefa agendada é comportamento operacional frequente.",
+      "hunt": "process",
+      "positive_context_to_evaluate": "Tarefa com comando específico e execução vinculada.",
+      "near_negative": "Backup agendado e autorizado.",
+      "missing_telemetry": "Comando, dono, tarefa, processo e resultado.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "evasion.audit-policy",
+      "decision": "keep_standalone_retired",
+      "rationale": "Mudança de auditoria pode ser gestão de política.",
+      "hunt": "coverage",
+      "positive_context_to_evaluate": "Desabilitação específica com resultado e lacuna de coleta declarada.",
+      "near_negative": "Aplicação de GPO ou manutenção registrada.",
+      "missing_telemetry": "Configuração anterior, resultado e contrato de coleta.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "impact.mass-files",
+      "decision": "keep_standalone_retired",
+      "rationale": "Volume de operações em arquivos pode representar backup ou indexação.",
+      "hunt": "process",
+      "positive_context_to_evaluate": "Operações destrutivas específicas com arquivos, processo e efeito.",
+      "near_negative": "Indexação, restauração ou migração autorizada.",
+      "missing_telemetry": "Operação, arquivos, processo, volume normal e efeito.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "cred.kerberoast",
+      "decision": "keep_standalone_retired",
+      "rationale": "Tickets Kerberos e RC4 isolados não demonstram coleta abusiva.",
+      "hunt": "ad",
+      "positive_context_to_evaluate": "Uso anômalo de tickets contextualizado com conta, serviço e corroboração.",
+      "near_negative": "Compatibilidade legada ou serviço com RC4 permitido.",
+      "missing_telemetry": "Solicitante, serviço, criptografia, histórico e uso posterior.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "cred.dcsync",
+      "decision": "keep_standalone_retired",
+      "rationale": "Direitos ou eventos de replicação exigem objeto, direitos e identidade demonstrados.",
+      "hunt": "ad",
+      "positive_context_to_evaluate": "Comando DCSync específico ou replicação indevida corroborada.",
+      "near_negative": "Replicação normal entre controladores.",
+      "missing_telemetry": "Direitos, objeto, origem, identidade e autorização.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "cred.pth",
+      "decision": "keep_standalone_retired",
+      "rationale": "Logon NTLM não demonstra pass-the-hash por si só.",
+      "hunt": "identity",
+      "positive_context_to_evaluate": "Acesso lateral com vínculos explícitos e comportamento posterior.",
+      "near_negative": "Autenticação NTLM legítima de aplicação antiga.",
+      "missing_telemetry": "Pacote de autenticação, sessão, host, processo e autorização.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "tool.scanner",
+      "decision": "keep_standalone_retired",
+      "rationale": "Nome de scanner pode ser texto citado ou scanner autorizado.",
+      "hunt": "web",
+      "positive_context_to_evaluate": "Sondagens específicas com requisições originais e direção confirmada.",
+      "near_negative": "Inventário ou teste autorizado.",
+      "missing_telemetry": "Direção, requisição, alvo e resposta.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "tool.offensive",
+      "decision": "keep_standalone_retired",
+      "rationale": "Nome de ferramenta pode estar em documentação, detecção de antivírus ou teste.",
+      "hunt": "process",
+      "positive_context_to_evaluate": "Comando ou payload específico em operação registrada.",
+      "near_negative": "Documentação, laboratório ou equipe de segurança.",
+      "missing_telemetry": "Campo original, ação, comando e resultado.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "web.success-after-scan",
+      "decision": "keep_standalone_retired",
+      "rationale": "HTTP 200 após sondagem não demonstra exploração.",
+      "hunt": "web",
+      "positive_context_to_evaluate": "Conteúdo específico e resposta ligados por request ID, com efeito separado.",
+      "near_negative": "Página de erro que devolve 200 ou teste autorizado.",
+      "missing_telemetry": "Request ID, payload, resposta e conteúdo/efeito independente.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "net.hostscan",
+      "decision": "keep_standalone_retired",
+      "rationale": "Comunicação com vários hosts pode ser inventário ou balanceamento.",
+      "hunt": "network",
+      "positive_context_to_evaluate": "Varredura contextualizada com origem, portas, destinos e finalidade.",
+      "near_negative": "Monitoramento ou descoberta autorizada de ativos.",
+      "missing_telemetry": "Direção, protocolo, portas, população e autorização.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "net.sensitive-port.public",
+      "decision": "keep_standalone_retired",
+      "rationale": "Porta e IP público isolados não demonstram exploração.",
+      "hunt": "network",
+      "positive_context_to_evaluate": "Fluxo vinculado a processo e ação específica com resultado.",
+      "near_negative": "Serviço publicado intencionalmente ou bastion.",
+      "missing_telemetry": "Direção, serviço, processo, regra de exposição e resultado.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "ids.alert",
+      "decision": "keep_standalone_retired",
+      "rationale": "Severidade do sensor não é grau de evidência da investigação.",
+      "hunt": "network",
+      "positive_context_to_evaluate": "Alerta associado ao fluxo original e corroboração independente.",
+      "near_negative": "Assinatura genérica ou falso positivo do sensor.",
+      "missing_telemetry": "Assinatura, payload, fluxo, sentido e efeito.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "cloud.root",
+      "decision": "keep_standalone_retired",
+      "rationale": "Uso de identidade root depende de autorização e ação registrada.",
+      "hunt": "cloud",
+      "positive_context_to_evaluate": "Root realiza alteração relevante seguida de uso vinculado.",
+      "near_negative": "Recuperação administrativa documentada.",
+      "missing_telemetry": "Tenant, ação, recurso, resultado e aprovação.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "cloud.console-no-mfa",
+      "decision": "keep_standalone_retired",
+      "rationale": "Ausência de MFA pode indicar exposição, sem estabelecer comprometimento.",
+      "hunt": "cloud",
+      "positive_context_to_evaluate": "Sessão com contexto anômalo e ação relevante corroborada.",
+      "near_negative": "Exceção operacional aprovada com controle compensatório.",
+      "missing_telemetry": "Sessão, política de MFA, origem e uso posterior.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "cloud.credential",
+      "decision": "keep_standalone_retired",
+      "rationale": "Criação de credencial é comum em rotação e provisionamento.",
+      "hunt": "cloud",
+      "positive_context_to_evaluate": "Credencial criada e usada pelo mesmo ID em ação relevante.",
+      "near_negative": "Rotação programada de chave.",
+      "missing_telemetry": "ID criado/usado, criador, usuário, tenant e resultado.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "cloud.privilege",
+      "decision": "keep_standalone_retired",
+      "rationale": "Concessão de privilégio depende do escopo e da autorização.",
+      "hunt": "cloud",
+      "positive_context_to_evaluate": "Concessão ligada ao alvo e ao uso do privilégio.",
+      "near_negative": "Provisionamento de função aprovado.",
+      "missing_telemetry": "Ator, alvo, escopo, tenant e ação posterior.",
+      "representative_precision": "not_demonstrated"
+    },
+    {
+      "rule": "cloud.secret-burst",
+      "decision": "keep_standalone_retired",
+      "rationale": "Muitas leituras de segredo podem ser inicialização ou deploy.",
+      "hunt": "cloud",
+      "positive_context_to_evaluate": "Mudança robusta em relação ao histórico e exfiltração vinculada.",
+      "near_negative": "Deploy que inicializa muitos serviços.",
+      "missing_telemetry": "Credencial, recursos, histórico, finalidade e transferência.",
+      "representative_precision": "not_demonstrated"
+    }
+  ]
+}

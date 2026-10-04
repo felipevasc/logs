@@ -48,6 +48,8 @@ window.QueryLang = (() => {
     return !!ip && nets.some(n => n.v === ip.v && (ip.n & n.mask) === n.net);
   };
   const wildcard = (pattern, anchored) => new RegExp((anchored ? "^" : "") + pattern.split("").map(c => c === "*" ? ".*" : c === "?" ? "." : c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("") + (anchored ? "$" : ""), "is");
+  // A date typed against a field other than the record timestamp (`sources::typed_instant`).
+  const instantFor = (field, value) => field === "timestamp" ? null : window.DateValues?.typedInstant(value) ?? null;
   const numberFor = (field, value) => {
     const t = String(value).trim();
     if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
@@ -94,7 +96,7 @@ window.QueryLang = (() => {
       if (!quoted) {
         if (value === "*") return { kind: "exists" };
         if (value.includes("/") && !value.startsWith("/")) { const n = cidr(value); if (n) return { kind: "cidr", nets: [n] }; }
-        if (value.includes("..")) { const [a, b] = value.split(".."); const lo = numberFor(field.name, a), hi = numberFor(field.name, b); if (lo != null && hi != null) { if (lo > hi) throw new Error(`O início do intervalo deve ser menor que o fim em ${field.name}.`); return { kind: "range", lo, hi }; } }
+        if (value.includes("..")) { const [a, b] = value.split(".."); const ta = instantFor(field.name, a), tb = instantFor(field.name, b); if (ta != null && tb != null) { if (ta > tb) throw new Error(`O início do intervalo deve ser menor que o fim em ${field.name}.`); return { kind: "trange", lo: ta, hi: tb }; } const lo = numberFor(field.name, a), hi = numberFor(field.name, b); if (lo != null && hi != null) { if (lo > hi) throw new Error(`O início do intervalo deve ser menor que o fim em ${field.name}.`); return { kind: "range", lo, hi }; } }
         if (/[*?]/.test(value)) return { kind: "re", re: wildcard(value, true) };
       }
       return field.text || field.name === "_all" ? { kind: "contains", value: value.toLowerCase() } : { kind: "equals", value: value.toLowerCase() };
@@ -114,7 +116,7 @@ window.QueryLang = (() => {
         const [value, quoted] = valueToken();
         if (op === "=") return { field, m: { kind: "exact", value } };
         if (op === "!=") return { not: { field, m: smart(field, value, true) } };
-        if ([">", ">=", "<", "<="].includes(op)) { const n = numberFor(field.name, value); if (n == null) fail(`Valor numérico inválido: ${value}`); return { field, m: { kind: "cmp", op, n } }; }
+        if ([">", ">=", "<", "<="].includes(op)) { const t = instantFor(field.name, value); if (t != null) return { field, m: { kind: "tcmp", op, n: t } }; const n = numberFor(field.name, value); if (n == null) fail(`Valor numérico inválido: ${value}`); return { field, m: { kind: "cmp", op, n } }; }
         return { field, m: smart(field, value, quoted) };
       }
       if (chars[pos] === '"') return { field: null, m: { kind: "contains", value: readQuoted().toLowerCase() } };
@@ -186,6 +188,11 @@ window.QueryLang = (() => {
     }
     if (m.kind === "detection") return api.detectionMatch ? api.detectionMatch(ev, m.value) : true;
     if (m.kind === "threat") return true; // evaluated by the engine; kept visible locally
+    if (m.kind === "tcmp" || m.kind === "trange") {
+      const raw = window.DateValues?.textToMs(fieldValue(ev, t.field) ?? "");
+      if (raw == null) return false;
+      return m.kind === "trange" ? raw >= m.lo && raw <= m.hi : m.op === ">" ? raw > m.n : m.op === ">=" ? raw >= m.n : m.op === "<" ? raw < m.n : raw <= m.n;
+    }
     if (m.kind === "cmp" || m.kind === "range") {
       const raw = t.field.name === "timestamp" ? ev.timestamp : numberFor("", fieldValue(ev, t.field) ?? "");
       if (raw == null) return false;

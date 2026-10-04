@@ -5,9 +5,9 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 /// Parser semantics are part of the cache version; older directories are removed.
-// Query expansion is global, so non-HTTP metadata, engine and time caches
-// must also move to the bounded/idempotent parser generation.
-pub const INDEX_DIR: &str = "indexes-v7";
+// Query and token expansion are global, so non-HTTP metadata, engine and time
+// caches must also move to the bounded/idempotent parser generation.
+pub const INDEX_DIR: &str = "indexes-v8";
 /// Storage layout only; changing it must not invalidate identical engine stores.
 pub(crate) const METADATA_DIR: &str = "metadata-v1";
 
@@ -22,6 +22,7 @@ pub fn prune() {
         "indexes-v4",
         "indexes-v5",
         "indexes-v6",
+        "indexes-v7",
     ] {
         let _ = std::fs::remove_dir_all(base.join(old));
     }

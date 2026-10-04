@@ -92,16 +92,21 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 @media(max-width:1200px){:root{--nav-w:158px}.workspace-nav{padding-left:10px;padding-right:10px}.workspace-brand{font-size:16px}.workspace-page{padding:23px}.metric{padding:18px}.metric-value{font-size:26px}.overview-grid{grid-template-columns:1fr}.compare-form{gap:12px}.compare-period>div{flex-direction:column}.compare-period input{width:100%}.side{width:205px;min-width:205px}.topbar{padding:0 20px}.topbar-case .case-select{width:140px}.viewbar{flex-wrap:wrap}}
 @media(prefers-reduced-motion:reduce){
   *{transition:none!important;scroll-behavior:auto!important}
-  /* Existing waiting timelines are paused by waiting-visuals.css. Cancelling
-     their names here would lose the pose and restart the episode on resume.
-     The latch excludes only artwork that has already been allowed to animate;
-     a scene mounted under reduced motion keeps the normal static fallback. */
-  *:not(.waiting-visual[data-animated="true"] .wv-art *){animation:none!important}
+  /* The loading room pauses its own skits; ambient loops simply stop here. */
+  *{animation:none!important}
 }
 
-/* First 0.11 waiting pilots retain the existing compact load surface. */
+/* Foreground loading: the room with its ring, the live phase, then measured progress. */
 .semantic-load-stage { gap: 10px; max-height: calc(100vh - var(--topbar-h) - 40px); overflow-y: auto; }
 #load-visual { width: 100%; }
+#load-visual .waiting-visual { --wv-size: 124px; }
+#load-visual .wv-status { font-size: 13.5px; }
+.semantic-load-stage.load-stage { width: min(280px, 86vw); padding: 18px 22px 14px; }
+.load-progress { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; }
+.load-progress .load-bar[hidden] { display: none; }
+.load-progress .load-volume { font-size: 12.5px; overflow-wrap: anywhere; text-align: center; }
+.load-progress .load-eta { overflow-wrap: anywhere; text-align: center; }
+.load-progress .load-volume:empty, .load-progress .load-eta:empty { display: none; }
 .semantic-load-stage .load-operation-controls { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 100%; }
 .semantic-load-stage #load-cancel { min-height: 32px; font-size: 12px; }
 .semantic-load-stage #load-cancel-help { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.5; text-align: center; overflow-wrap: anywhere; }
@@ -110,9 +115,7 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 .load-progress-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .load-progress-details[open] > summary { margin-bottom: 8px; }
 .load-progress-details .load-phase { font-size: 13px; overflow-wrap: anywhere; }
-.load-progress-details .load-volume, .load-progress-details .load-eta { overflow-wrap: anywhere; }
 .load-progress-details .load-steps { margin-top: 10px; }
-.area-loading-semantic .wv-art { inline-size: 144px; block-size: 72px; flex-basis: 72px; }
 
 /* The pivot builder only folds after an explicit choice; its controls stay live. */
 .cube-panel #aw-pivot-tools { flex: 0 0 auto; }

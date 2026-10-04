@@ -19,6 +19,8 @@ pub struct SourceMapping {
     pub outcomes: BTreeMap<String, String>,
     pub timestamp_unit: Option<String>,
     pub timezone: Option<String>,
+    /// Units for explicitly mapped quantities. Unknown units are not guessed.
+    pub units: BTreeMap<String, String>,
 }
 pub const MAPPABLE: &[&str] = &[
     "timestamp",
@@ -65,6 +67,11 @@ pub const MAPPABLE: &[&str] = &[
     "remote_session",
     "principal",
     "source_address",
+    "bytes",
+    "latency",
+    "amount",
+    "currency",
+    "peer_group",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,6 +79,8 @@ pub struct Provenance {
     pub field: String,
     pub value: String,
     pub method: String,
+    #[serde(default)]
+    pub certainty: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Normalized {
@@ -88,6 +97,27 @@ pub struct Normalized {
     pub signals: Vec<crate::security_content::Signal>,
     #[serde(default)]
     pub content_clipped: bool,
+    #[serde(default)]
+    pub numbers: BTreeMap<String, NumberProvenance>,
+    #[serde(default)]
+    pub transformations: Vec<Transformation>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Transformation {
+    pub field: String,
+    pub kind: String,
+    pub text: String,
+    pub executed: bool,
+    pub limitation: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NumberProvenance {
+    pub field: String,
+    pub original: String,
+    pub original_unit: String,
+    pub value: f64,
+    pub unit: String,
+    pub method: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TimeProvenance {
@@ -108,16 +138,32 @@ impl Normalized {
         }
         if let Some(old) = self.values.get(key) {
             if old.value != value {
-                self.conflicts.push(format!("{key}: {} e {field} divergem", old.field));
+                self.conflicts
+                    .push(format!("{key}: {} e {field} divergem", old.field));
             }
             return;
         }
-        self.values.insert(key.into(), Provenance { field: field.into(), value, method: method.into() });
+        let certainty = match method {
+            "mapping" => "declared_mapping",
+            "adapter" => "producer_adapter",
+            "alias" | "inference" => "heuristic_context",
+            _ => "documented_transformation",
+        };
+        self.values.insert(
+            key.into(),
+            Provenance {
+                field: field.into(),
+                value,
+                method: method.into(),
+                certainty: certainty.into(),
+            },
+        );
     }
     fn alias(&mut self, ev: &Event, key: &str, fields: &[&str]) {
         // IDs, display names and alternative representations are not conflicts.
-        if let Some((field, value)) =
-            fields.iter().find_map(|f| field_text(ev, f).filter(|v| !v.is_empty()).map(|v| (*f, v)))
+        if let Some((field, value)) = fields
+            .iter()
+            .find_map(|f| field_text(ev, f).filter(|v| !v.is_empty()).map(|v| (*f, v)))
         {
             self.put(key, field, value, "adapter");
         }
@@ -125,14 +171,19 @@ impl Normalized {
 }
 
 pub fn field_value<'a>(ev: &'a Event, path: &str) -> Option<&'a Value> {
-    if let Some(v) =
-        ev.fields.get(path).or_else(|| ev.fields.iter().find(|(k, _)| k.eq_ignore_ascii_case(path)).map(|(_, v)| v))
-    {
+    if let Some(v) = ev.fields.get(path).or_else(|| {
+        ev.fields
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(path))
+            .map(|(_, v)| v)
+    }) {
         return Some(v);
     }
     // Parsers can retain a literal dotted prefix containing a nested object.
-    let (mut value, remaining) =
-        path.match_indices('.').rev().find_map(|(i, _)| ev.fields.get(&path[..i]).map(|v| (v, &path[i + 1..])))?;
+    let (mut value, remaining) = path
+        .match_indices('.')
+        .rev()
+        .find_map(|(i, _)| ev.fields.get(&path[..i]).map(|v| (v, &path[i + 1..])))?;
     let parts = remaining.split('.');
     for part in parts {
         value = match value {
@@ -190,7 +241,10 @@ pub fn product(ev: &Event) -> &'static str {
         "sysmon"
     } else if hint.contains("powershell") {
         "powershell"
-    } else if hint.contains("security-auditing") || hint == "security  " || field_text(ev, "TargetUserSid").is_some() {
+    } else if hint.contains("security-auditing")
+        || hint == "security  "
+        || field_text(ev, "TargetUserSid").is_some()
+    {
         "windows-security"
     } else if hint.contains("service control manager")
         || hint.contains("taskscheduler")
@@ -201,9 +255,12 @@ pub fn product(ev: &Event) -> &'static str {
         "aws"
     } else if field_text(ev, "protoPayload.methodName").is_some() {
         "gcp"
-    } else if field_text(ev, "auditID").is_some() && field_text(ev, "objectRef.resource").is_some() {
+    } else if field_text(ev, "auditID").is_some() && field_text(ev, "objectRef.resource").is_some()
+    {
         "kubernetes"
-    } else if field_text(ev, "eventType").is_some() && (hint.contains("okta") || field_text(ev, "uuid").is_some()) {
+    } else if field_text(ev, "eventType").is_some()
+        && (hint.contains("okta") || field_text(ev, "uuid").is_some())
+    {
         "okta"
     } else if field_text(ev, "tenantId").is_some() || field_text(ev, "TenantId").is_some() {
         "azure"
@@ -226,7 +283,8 @@ pub fn product(ev: &Event) -> &'static str {
         || ev.message.contains("sshd[")
     {
         "sshd"
-    } else if field_text(ev, "event.category").is_some() && field_text(ev, "event.action").is_some() {
+    } else if field_text(ev, "event.category").is_some() && field_text(ev, "event.action").is_some()
+    {
         "ecs"
     } else {
         "generic"
@@ -239,10 +297,21 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
         product: product(ev).into(),
         producer: ev.source.clone(),
         event_refs: vec![event_ref(ev)],
-        time: TimeProvenance { field: "timestamp".into(), epoch_ms: ev.timestamp, ..Default::default() },
+        time: TimeProvenance {
+            field: "timestamp".into(),
+            epoch_ms: ev.timestamp,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    for field in ["@timestamp", "eventTime", "TimeCreated", "timestamp", "time", "ts"] {
+    for field in [
+        "@timestamp",
+        "eventTime",
+        "TimeCreated",
+        "timestamp",
+        "time",
+        "ts",
+    ] {
         if let Some(original) = field_text(ev, field) {
             n.time.field = field.into();
             n.time.original = Some(original);
@@ -256,7 +325,8 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
         } else if original.parse::<f64>().is_ok() {
             n.time.timezone = Some("epoch UTC".into());
         } else {
-            n.time.ambiguity = Some("Fuso e resolução dependem da configuração de importação da fonte".into());
+            n.time.ambiguity =
+                Some("Fuso e resolução dependem da configuração de importação da fonte".into());
         }
     }
     n.alias(
@@ -302,12 +372,41 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
             "target.id",
         ],
     );
-    n.alias(ev, "host", &["host.id", "agent.id", "Computer", "computer", "host.name", "hostname"]);
-    n.alias(ev, "service", &["eventSource", "protoPayload.serviceName", "service.name", "appId", "appDisplayName"]);
+    n.alias(
+        ev,
+        "host",
+        &[
+            "host.id",
+            "agent.id",
+            "Computer",
+            "computer",
+            "host.name",
+            "hostname",
+        ],
+    );
+    n.alias(
+        ev,
+        "service",
+        &[
+            "eventSource",
+            "protoPayload.serviceName",
+            "service.name",
+            "appId",
+            "appDisplayName",
+        ],
+    );
     n.alias(
         ev,
         "request",
-        &["request.id", "http.request.id", "requestId", "requestID", "trace.id", "trace_id", "auditID"],
+        &[
+            "request.id",
+            "http.request.id",
+            "requestId",
+            "requestID",
+            "trace.id",
+            "trace_id",
+            "auditID",
+        ],
     );
     n.alias(
         ev,
@@ -320,34 +419,124 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
             "authenticationContext.externalSessionId",
         ],
     );
-    n.alias(ev, "connection", &["network.community_id", "connection.id", "flow_id", "uid"]);
+    n.alias(
+        ev,
+        "connection",
+        &["network.community_id", "connection.id", "flow_id", "uid"],
+    );
     n.alias(ev, "process", &["ProcessGuid", "process.entity_id"]);
-    n.alias(ev, "parent", &["ParentProcessGuid", "process.parent.entity_id"]);
-    n.alias(ev, "credential", &["userIdentity.accessKeyId", "credential.id", "servicePrincipalCredentialKeyId"]);
-    n.alias(ev, "created_credential", &["responseElements.accessKey.accessKeyId", "createdCredential.id"]);
+    n.alias(
+        ev,
+        "parent",
+        &["ParentProcessGuid", "process.parent.entity_id"],
+    );
+    n.alias(
+        ev,
+        "credential",
+        &[
+            "userIdentity.accessKeyId",
+            "credential.id",
+            "servicePrincipalCredentialKeyId",
+        ],
+    );
+    n.alias(
+        ev,
+        "created_credential",
+        &[
+            "responseElements.accessKey.accessKeyId",
+            "createdCredential.id",
+        ],
+    );
     n.alias(
         ev,
         "resource",
-        &["resource.id", "objectRef.uid", "protoPayload.resourceName", "requestParameters.resourceArn"],
+        &[
+            "resource.id",
+            "objectRef.uid",
+            "protoPayload.resourceName",
+            "requestParameters.resourceArn",
+        ],
     );
-    n.alias(ev, "command", &["CommandLine", "process.command_line", "ScriptBlockText", "cmdline", "command_line"]);
-    n.alias(ev, "file", &["TargetFilename", "file.path", "target_file", "download.path"]);
-    n.alias(ev, "request_command", &["http.request.body.command", "http.request.body.cmd"]);
-    n.alias(ev, "request_body", &["http.request.body.content", "http.request.body", "request.body", "request_body"]);
-    n.alias(ev, "response_body", &["http.response.body.content", "http.response.body", "response.body", "response_body"]);
-    n.alias(ev, "url", &["url.original", "url.full", "http.url", "download.url", "request_uri", "uri"]);
+    n.alias(
+        ev,
+        "command",
+        &[
+            "CommandLine",
+            "process.command_line",
+            "ScriptBlockText",
+            "cmdline",
+            "command_line",
+        ],
+    );
+    n.alias(
+        ev,
+        "file",
+        &[
+            "TargetFilename",
+            "file.path",
+            "target_file",
+            "download.path",
+        ],
+    );
+    n.alias(
+        ev,
+        "request_command",
+        &["http.request.body.command", "http.request.body.cmd"],
+    );
+    n.alias(
+        ev,
+        "request_body",
+        &[
+            "http.request.body.content",
+            "http.request.body",
+            "request.body",
+            "request_body",
+        ],
+    );
+    n.alias(
+        ev,
+        "response_body",
+        &[
+            "http.response.body.content",
+            "http.response.body",
+            "response.body",
+            "response_body",
+        ],
+    );
+    n.alias(
+        ev,
+        "url",
+        &[
+            "url.original",
+            "url.full",
+            "http.url",
+            "download.url",
+            "request_uri",
+            "uri",
+        ],
+    );
     if n.get("request_command").is_none() && n.product == "web" {
         if let Some(url) = n.get("url").map(str::to_string) {
-            if let Some(query) = url.split_once('?').map(|(_, q)| q.split('#').next().unwrap_or(q)) {
-                if let Some((parameter, value)) = query.split('&').filter_map(|p| p.split_once('=')).find(|(k, _)| {
-                    ["cmd", "command", "exec", "execute", "shell"].contains(&k.to_ascii_lowercase().as_str())
-                }) {
+            if let Some(query) = url
+                .split_once('?')
+                .map(|(_, q)| q.split('#').next().unwrap_or(q))
+            {
+                if let Some((parameter, value)) = query
+                    .split('&')
+                    .filter_map(|p| p.split_once('='))
+                    .find(|(k, _)| {
+                        ["cmd", "command", "exec", "execute", "shell"]
+                            .contains(&k.to_ascii_lowercase().as_str())
+                    })
+                {
                     let field = n.values["url"].field.clone();
                     n.put(
                         "request_command",
                         &field,
                         decode_request(&value.replace('+', " ")),
-                        &format!("query parameter {parameter}: form/percent decoding (max 2 passes)"),
+                        &format!(
+                            "query parameter {parameter}: form/percent decoding (max 2 passes)"
+                        ),
                     );
                 }
             }
@@ -373,38 +562,137 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
     n.alias(
         ev,
         "persistence_target",
-        &["service.executable", "task.executable", "registry.data.path", "systemd.exec_start.path"],
+        &[
+            "service.executable",
+            "task.executable",
+            "registry.data.path",
+            "systemd.exec_start.path",
+        ],
     );
     for (key, aliases) in [
-        ("application", &["appId", "ApplicationId", "application.id", "servicePrincipalId"][..]),
+        (
+            "application",
+            &[
+                "appId",
+                "ApplicationId",
+                "application.id",
+                "servicePrincipalId",
+            ][..],
+        ),
         ("grant", &["oauth.grant.id", "grant.id"][..]),
-        ("token", &["token_id", "token.id", "hashed_token", "UniqueTokenIdentifier"][..]),
-        ("repository", &["repository_id", "repo_id", "repository.id", "repo"][..]),
-        ("pipeline", &["workflow_id", "pipeline.id", "workflow.id"][..]),
-        ("run", &["run_id", "workflow_run_id", "pipeline.run.id", "workflow.run.id"][..]),
-        ("revision", &["head_sha", "commit_id", "git.commit.id", "workflow.sha"][..]),
+        (
+            "token",
+            &[
+                "token_id",
+                "token.id",
+                "hashed_token",
+                "UniqueTokenIdentifier",
+            ][..],
+        ),
+        (
+            "repository",
+            &["repository_id", "repo_id", "repository.id", "repo"][..],
+        ),
+        (
+            "pipeline",
+            &["workflow_id", "pipeline.id", "workflow.id"][..],
+        ),
+        (
+            "run",
+            &[
+                "run_id",
+                "workflow_run_id",
+                "pipeline.run.id",
+                "workflow.run.id",
+            ][..],
+        ),
+        (
+            "revision",
+            &["head_sha", "commit_id", "git.commit.id", "workflow.sha"][..],
+        ),
         ("secret", &["secret.id", "secret.name", "secret_name"][..]),
-        ("certificate", &["CertThumbprint", "certificate.fingerprint.sha1", "certificate.thumbprint"][..]),
-        ("certificate_issuer", &["CertIssuerName", "certificate.issuer"][..]),
-        ("certificate_subject", &["certificate.subject.upn", "certificate.san.upn"][..]),
-        ("requester", &["certificate.requester.upn", "requester.upn"][..]),
-        ("beneficiary", &["delegation.beneficiary.sid", "delegation.beneficiary_sid"][..]),
-        ("delegator", &["delegation.delegator.sid", "delegation.delegator_sid"][..]),
-        ("resource_spn", &["delegation.resource_spn", "ServiceName", "service.spn"][..]),
-        ("destination", &["destination.address", "destination.ip", "IpAddress", "remote.host"][..]),
-        ("artifact", &["artifact.sha256", "file.hash.sha256", "process.hash.sha256", "SHA256"][..]),
-        ("logon", &["TargetLogonId", "SubjectLogonId", "winlog.logon.id", "logon.id"][..]),
-        ("remote_session", &["ssh.session.id", "remote.session.id", "ses"][..]),
-        ("source_address", &["source.ip", "SourceIp", "IpAddress", "src_ip"][..]),
+        (
+            "certificate",
+            &[
+                "CertThumbprint",
+                "certificate.fingerprint.sha1",
+                "certificate.thumbprint",
+            ][..],
+        ),
+        (
+            "certificate_issuer",
+            &["CertIssuerName", "certificate.issuer"][..],
+        ),
+        (
+            "certificate_subject",
+            &["certificate.subject.upn", "certificate.san.upn"][..],
+        ),
+        (
+            "requester",
+            &["certificate.requester.upn", "requester.upn"][..],
+        ),
+        (
+            "beneficiary",
+            &["delegation.beneficiary.sid", "delegation.beneficiary_sid"][..],
+        ),
+        (
+            "delegator",
+            &["delegation.delegator.sid", "delegation.delegator_sid"][..],
+        ),
+        (
+            "resource_spn",
+            &["delegation.resource_spn", "ServiceName", "service.spn"][..],
+        ),
+        (
+            "destination",
+            &[
+                "destination.address",
+                "destination.ip",
+                "IpAddress",
+                "remote.host",
+            ][..],
+        ),
+        (
+            "artifact",
+            &[
+                "artifact.sha256",
+                "file.hash.sha256",
+                "process.hash.sha256",
+                "SHA256",
+            ][..],
+        ),
+        (
+            "logon",
+            &[
+                "TargetLogonId",
+                "SubjectLogonId",
+                "winlog.logon.id",
+                "logon.id",
+            ][..],
+        ),
+        (
+            "remote_session",
+            &["ssh.session.id", "remote.session.id", "ses"][..],
+        ),
+        (
+            "source_address",
+            &["source.ip", "SourceIp", "IpAddress", "src_ip"][..],
+        ),
     ] {
         n.alias(ev, key, aliases);
     }
     if n.get("certificate").is_none() {
         if let (Some(issuer), Some(serial)) = (
             n.get("certificate_issuer").map(str::to_string),
-            field_text(ev, "CertSerialNumber").or_else(|| field_text(ev, "certificate.serial_number")),
+            field_text(ev, "CertSerialNumber")
+                .or_else(|| field_text(ev, "certificate.serial_number")),
         ) {
-            n.put("certificate", "certificate.issuer+serial_number", joined(&[&issuer, &serial]), "adapter");
+            n.put(
+                "certificate",
+                "certificate.issuer+serial_number",
+                joined(&[&issuer, &serial]),
+                "adapter",
+            );
         }
     }
 
@@ -431,17 +719,35 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
                 .find_map(|p| p.trim().strip_prefix("SHA256="))
                 .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
             {
-                n.put("artifact", "Hashes", hash.to_ascii_lowercase(), "SHA256 entry");
+                n.put(
+                    "artifact",
+                    "Hashes",
+                    hash.to_ascii_lowercase(),
+                    "SHA256 entry",
+                );
             }
         }
     }
-    if n.get("remote_session").is_some_and(|s| ["-1", "4294967295"].contains(&s)) {
+    if n.get("remote_session")
+        .is_some_and(|s| ["-1", "4294967295"].contains(&s))
+    {
         n.values.remove("remote_session");
     }
-    let action_field = ["event.action", "eventName", "eventType", "Operation", "type", "verb"]
-        .into_iter()
-        .find(|f| field_value(ev, f).is_some())
-        .unwrap_or(if ev.code.is_empty() { "message" } else { "code" });
+    let action_field = [
+        "event.action",
+        "eventName",
+        "eventType",
+        "Operation",
+        "type",
+        "verb",
+    ]
+    .into_iter()
+    .find(|f| field_value(ev, f).is_some())
+    .unwrap_or(if ev.code.is_empty() {
+        "message"
+    } else {
+        "code"
+    });
     let outcome_field = [
         "event.outcome",
         "responseElements.ConsoleLogin",
@@ -472,7 +778,8 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
                     let parsed = mapped_time(&value, m);
                     if n.product != "generic" && n.time.epoch_ms.is_some() {
                         if parsed != n.time.epoch_ms {
-                            n.conflicts.push(format!("timestamp: adaptador e {field} divergem"));
+                            n.conflicts
+                                .push(format!("timestamp: adaptador e {field} divergem"));
                         }
                         continue;
                     }
@@ -481,10 +788,14 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
                         original: Some(value),
                         epoch_ms: parsed,
                         timezone: m.timezone.clone(),
-                        resolution_ms: Some(if m.timestamp_unit.as_deref() == Some("s") { 1000 } else { 1 }),
-                        ambiguity: parsed
-                            .is_none()
-                            .then(|| "Horário mapeado sem formato, unidade ou fuso inequívoco".into()),
+                        resolution_ms: Some(if m.timestamp_unit.as_deref() == Some("s") {
+                            1000
+                        } else {
+                            1
+                        }),
+                        ambiguity: parsed.is_none().then(|| {
+                            "Horário mapeado sem formato, unidade ou fuso inequívoco".into()
+                        }),
                     };
                     continue;
                 }
@@ -494,16 +805,22 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
                 if role == "outcome" {
                     value = m.outcomes.get(&value).cloned().unwrap_or(value);
                 }
-                if n.product == "generic" && n.values.get(role).is_some_and(|p| p.method == "adapter") {
+                if n.product == "generic"
+                    && n.values.get(role).is_some_and(|p| p.method == "adapter")
+                {
                     n.values.remove(role);
                 }
                 n.put(role, field, value, "mapping");
             }
         }
     }
-    for (key, role) in
-        [("host", Role::Host), ("actor", Role::User), ("command", Role::CommandLine), ("file", Role::File)]
-    {
+    normalize_numbers(ev, mappings, &mut n);
+    for (key, role) in [
+        ("host", Role::Host),
+        ("actor", Role::User),
+        ("command", Role::CommandLine),
+        ("file", Role::File),
+    ] {
         if !n.values.contains_key(key) {
             if let Some(v) = entities::value(ev, role) {
                 n.put(key, entities::info(role).column, v.into_owned(), "alias");
@@ -512,8 +829,16 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
     }
     // PID reuse: bind a PID only when its recorded start identity exists.
     if n.get("process").is_none() {
-        if let (Some(pid), Some(start)) = (field_text(ev, "process.pid"), field_text(ev, "process.start")) {
-            n.put("process", "process.pid+process.start", joined(&[&pid, &start]), "adapter");
+        if let (Some(pid), Some(start)) = (
+            field_text(ev, "process.pid"),
+            field_text(ev, "process.start"),
+        ) {
+            n.put(
+                "process",
+                "process.pid+process.start",
+                joined(&[&pid, &start]),
+                "adapter",
+            );
         }
     }
     if n.get("action").is_none() {
@@ -527,28 +852,38 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
         }
     }
     if n.product == "generic" && n.get("action").is_some() {
-        n.limitations.push("Ação inferida em fonte genérica; confirme o mapeamento.".into());
+        n.limitations
+            .push("Ação inferida em fonte genérica; confirme o mapeamento.".into());
     }
 
-    let protection = ["event.outcome", "verdict.action", "alert.action", "event.disposition", "action", "act"]
-        .iter()
-        .find_map(|f| {
-            field_text(ev, f)
-                .filter(|v| {
-                    matches!(
-                        v.to_ascii_lowercase().as_str(),
-                        "blocked" | "block" | "drop" | "dropped" | "deny" | "denied" | "quarantined"
-                    )
-                })
-                .map(|v| (*f, v))
-        });
+    let protection = [
+        "event.outcome",
+        "verdict.action",
+        "alert.action",
+        "event.disposition",
+        "action",
+        "act",
+    ]
+    .iter()
+    .find_map(|f| {
+        field_text(ev, f)
+            .filter(|v| {
+                matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "blocked" | "block" | "drop" | "dropped" | "deny" | "denied" | "quarantined"
+                )
+            })
+            .map(|v| (*f, v))
+    });
     if let Some((field, v)) = protection {
         n.values.remove("outcome");
         n.put("outcome", field, "blocked".into(), "adapter");
         n.put("protection", field, v, "adapter");
     }
     if n.time.epoch_ms.is_none() {
-        n.limitations.push("Registro sem horário inequívoco; não participa de correlações temporais.".into());
+        n.limitations.push(
+            "Registro sem horário inequívoco; não participa de correlações temporais.".into(),
+        );
     }
 
     crate::security_content::infer_request(ev, &mut n);
@@ -556,7 +891,10 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
     // Local accounts are namespaced by host, never by their display name alone.
     if n.get("namespace").is_none()
         && !host.is_empty()
-        && !matches!(n.product.as_str(), "aws" | "gcp" | "azure" | "okta" | "kubernetes")
+        && !matches!(
+            n.product.as_str(),
+            "aws" | "gcp" | "azure" | "okta" | "kubernetes"
+        )
     {
         n.put("namespace", "host", format!("host:{host}"), "derived");
     }
@@ -565,14 +903,20 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
         n.put("service", "producer", n.product.clone(), "adapter");
     }
     if let Some(request_command) = n.get("request_command").map(str::to_string) {
-        n.put("command_key", "http.request.body.command", request_command, "derived");
+        n.put(
+            "command_key",
+            "http.request.body.command",
+            request_command,
+            "derived",
+        );
     } else if let Some(command) = n.get("command").map(str::to_string) {
         n.put("command_key", "command", command, "derived");
     }
     for key in ["process", "parent", "session", "connection"] {
         if let Some(v) = n.get(key).map(str::to_string) {
             if host.is_empty() {
-                n.limitations.push(format!("{key} sem host: vínculo não utilizável"));
+                n.limitations
+                    .push(format!("{key} sem host: vínculo não utilizável"));
                 n.values.remove(key);
             } else {
                 n.values.get_mut(key).unwrap().value = joined(&[&namespace, &host, &v]);
@@ -583,7 +927,8 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
         let service = n.get("service").unwrap_or("").to_string();
         if namespace.is_empty() && host.is_empty() && service.is_empty() {
             n.values.remove("request");
-            n.limitations.push("Requisição sem escopo verificável".into());
+            n.limitations
+                .push("Requisição sem escopo verificável".into());
         } else {
             n.values.get_mut("request").unwrap().value = joined(&[&namespace, &host, &service, &v]);
         }
@@ -602,7 +947,8 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
         "resource_spn",
     ] {
         if let Some(v) = n.get(key).map(str::to_string) {
-            let v = if key == "certificate" && v.chars().all(|c| c.is_ascii_hexdigit() || c == ':') {
+            let v = if key == "certificate" && v.chars().all(|c| c.is_ascii_hexdigit() || c == ':')
+            {
                 v.replace(':', "").to_ascii_lowercase()
             } else {
                 v
@@ -614,7 +960,11 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
             }
         }
     }
-    if let Some(v) = n.get("artifact").map(str::to_string).filter(|s| s.chars().all(|c| c.is_ascii_hexdigit())) {
+    if let Some(v) = n
+        .get("artifact")
+        .map(str::to_string)
+        .filter(|s| s.chars().all(|c| c.is_ascii_hexdigit()))
+    {
         n.values.get_mut("artifact").unwrap().value = v.to_ascii_lowercase();
     }
     for key in ["logon", "remote_session"] {
@@ -626,7 +976,10 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
             }
         }
     }
-    if n.get("certificate_subject").zip(n.get("requester")).is_some_and(|(a, b)| !a.eq_ignore_ascii_case(b)) {
+    if n.get("certificate_subject")
+        .zip(n.get("requester"))
+        .is_some_and(|(a, b)| !a.eq_ignore_ascii_case(b))
+    {
         n.put(
             "certificate_identity_mismatch",
             "certificate.subject.upn+certificate.requester.upn",
@@ -635,7 +988,12 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
         );
     }
     if let Some(user) = entities::value(ev, Role::User) {
-        n.put("identity", "namespace+@user", joined(&[&namespace, &user]), "derived");
+        n.put(
+            "identity",
+            "namespace+@user",
+            joined(&[&namespace, &user]),
+            "derived",
+        );
     }
     for key in ["credential", "created_credential"] {
         if let Some(v) = n.get(key).map(str::to_string) {
@@ -649,8 +1007,14 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
     }
     for (key, v) in [
         ("file_key", n.get("file").map(str::to_string)),
-        ("persistence_key", n.get("persistence_target").map(str::to_string)),
-        ("image_key", entities::value(ev, Role::Process).map(|v| v.into_owned())),
+        (
+            "persistence_key",
+            n.get("persistence_target").map(str::to_string),
+        ),
+        (
+            "image_key",
+            entities::value(ev, Role::Process).map(|v| v.into_owned()),
+        ),
     ] {
         if let Some(v) = v {
             if !host.is_empty() {
@@ -664,10 +1028,23 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
         }
     }
     let unique = match n.product.as_str() {
-        "aws" => field_text(ev, "eventID")
-            .map(|v| joined(&["aws", &namespace, &field_text(ev, "recipientAccountId").unwrap_or_default(), &v])),
-        "kubernetes" => field_text(ev, "auditID")
-            .map(|v| joined(&["kubernetes", &namespace, &host, &v, &field_text(ev, "stage").unwrap_or_default()])),
+        "aws" => field_text(ev, "eventID").map(|v| {
+            joined(&[
+                "aws",
+                &namespace,
+                &field_text(ev, "recipientAccountId").unwrap_or_default(),
+                &v,
+            ])
+        }),
+        "kubernetes" => field_text(ev, "auditID").map(|v| {
+            joined(&[
+                "kubernetes",
+                &namespace,
+                &host,
+                &v,
+                &field_text(ev, "stage").unwrap_or_default(),
+            ])
+        }),
         "okta" => field_text(ev, "uuid").map(|v| joined(&["okta", &namespace, &v])),
         _ => field_text(ev, "EventRecordID")
             .or_else(|| field_text(ev, "winlog.record_id"))
@@ -702,39 +1079,74 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
     derived.name.clear();
     derived.description.clear();
     derived.fields.retain(|k, _| !k.starts_with("_sec."));
-    derived.fields.insert("_sec.product".into(), Value::from(n.product.clone()));
+    derived
+        .fields
+        .insert("_sec.product".into(), Value::from(n.product.clone()));
     for (k, p) in &n.values {
-        derived.fields.insert(format!("_sec.{k}"), Value::from(p.value.clone()));
+        derived
+            .fields
+            .insert(format!("_sec.{k}"), Value::from(p.value.clone()));
     }
-    if let Some(cmd) = n.get("command") {
+    if let Some(command) = n.get("command").map(str::to_string) {
+        let cmd = command.as_str();
         let mut command_event = Event::empty();
-        command_event.fields.insert("CommandLine".into(), Value::from(cmd));
-        let decoded = entities::decode_payloads(&command_event);
+        command_event
+            .fields
+            .insert("CommandLine".into(), Value::from(cmd));
+        let mut decoded = entities::decode_payloads(&command_event);
+        decoded.extend(crate::security_deobfuscate::command(
+            cmd,
+            entities::value(ev, Role::Process).as_deref(),
+            &n.values["command"].field,
+        ));
+        for item in &decoded {
+            n.transformations.push(Transformation{field:n.values["command"].field.clone(),kind:item.kind.clone(),text:item.text.clone(),executed:false,limitation:"Decodificação estática limitada a 20.000 caracteres; nenhuma execução ou descompressão irrestrita".into()});
+        }
         if let Some(d) = decoded.first() {
-            derived.fields.insert("_sec.decoded_command".into(), Value::from(d.text.clone()));
+            derived
+                .fields
+                .insert("_sec.decoded_command".into(), Value::from(d.text.clone()));
         }
         if suspicious_command(cmd) || decoded.iter().any(|d| suspicious_command(&d.text)) {
-            derived.fields.insert("_sec.suspicious_command".into(), Value::from("true"));
+            derived
+                .fields
+                .insert("_sec.suspicious_command".into(), Value::from("true"));
         }
-        if !literal_output(cmd) && (reverse_shell(cmd) || decoded.iter().any(|d| reverse_shell(&d.text))) {
-            derived.fields.insert("_sec.reverse_shell".into(), Value::from("true"));
+        if !literal_output(cmd)
+            && (reverse_shell(cmd) || decoded.iter().any(|d| reverse_shell(&d.text)))
+        {
+            derived
+                .fields
+                .insert("_sec.reverse_shell".into(), Value::from("true"));
         }
     }
     if n.get("request_command").is_some_and(suspicious_command) {
-        derived.fields.insert("_sec.suspicious_request".into(), Value::from("true"));
+        derived
+            .fields
+            .insert("_sec.suspicious_request".into(), Value::from("true"));
     }
     if let Some(command) = n.get("request_command") {
         let decoded = decode_request(command);
         if reverse_shell(&decoded) && !literal_output(&decoded) {
-            derived.fields.insert("_sec.reverse_shell_request".into(), Value::from("true"));
+            derived
+                .fields
+                .insert("_sec.reverse_shell_request".into(), Value::from("true"));
         }
     }
-    derived.fields.insert("_sec.namespace".into(), Value::from(namespace));
-    derived.fields.insert("_sec.outcome".into(), Value::from(n.get("outcome").unwrap_or("unknown")));
-    if field_text(ev, "event.kind").is_some_and(|v| matches!(v.as_str(), "documentation" | "example"))
+    derived
+        .fields
+        .insert("_sec.namespace".into(), Value::from(namespace));
+    derived.fields.insert(
+        "_sec.outcome".into(),
+        Value::from(n.get("outcome").unwrap_or("unknown")),
+    );
+    if field_text(ev, "event.kind")
+        .is_some_and(|v| matches!(v.as_str(), "documentation" | "example"))
         || n.get("command").is_some_and(literal_output)
     {
-        derived.fields.insert("_sec.literal_output".into(), Value::from("true"));
+        derived
+            .fields
+            .insert("_sec.literal_output".into(), Value::from("true"));
     }
     crate::security_content::apply(ev, &mut derived, &mut n);
     (derived, n)
@@ -769,8 +1181,9 @@ pub fn reverse_shell(command: &str) -> bool {
             return false;
         }
         static LAUNCH: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let launch =
-            LAUNCH.get_or_init(|| regex::Regex::new(r"(?i)^\s*(?:/bin/)?(?:bash|sh|zsh)\s+-(?:c|lc)\s+").unwrap());
+        let launch = LAUNCH.get_or_init(|| {
+            regex::Regex::new(r"(?i)^\s*(?:/bin/)?(?:bash|sh|zsh)\s+-(?:c|lc)\s+").unwrap()
+        });
         let mut start = 0;
         let mut quote = None;
         let mut escape = false;
@@ -815,7 +1228,13 @@ pub fn reverse_shell(command: &str) -> bool {
                 quote = Some(ch);
                 continue;
             }
-            if ch == '#' && (i == 0 || text[..i].chars().next_back().is_some_and(char::is_whitespace)) {
+            if ch == '#'
+                && (i == 0
+                    || text[..i]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace))
+            {
                 if check(&text[start..i]) {
                     return true;
                 }
@@ -847,7 +1266,8 @@ fn mapped_time(value: &str, mapping: &SourceMapping) -> Option<i64> {
             _ => return None,
         };
         let ms = number * multiplier;
-        return (ms.is_finite() && ms >= i64::MIN as f64 && ms <= i64::MAX as f64).then_some(ms as i64);
+        return (ms.is_finite() && ms >= i64::MIN as f64 && ms <= i64::MAX as f64)
+            .then_some(ms as i64);
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
         return Some(dt.timestamp_millis());
@@ -898,9 +1318,101 @@ pub fn suspicious_command(command: &str) -> bool {
     PATTERN.get_or_init(|| regex::Regex::new(r"(?i)(sekurlsa::|lsadump::|/dev/tcp/|\b(?:nc|ncat)\b[^\r\n]*\s-[ec]\s|(?:curl|wget)\b[^\r\n]*\|\s*(?:ba)?sh\b|(?:iex|invoke-expression)\b[^\r\n]*(?:downloadstring|invoke-webrequest)|(?:downloadstring|invoke-webrequest)[^\r\n]*\b(?:iex|invoke-expression)\b|vssadmin\b[^\r\n]*delete\s+shadows|wmic\b[^\r\n]*shadowcopy\s+delete|bcdedit\b[^\r\n]*recoveryenabled\s+no|regsvr32\b[^\r\n]*/i:https?://|mshta\s+(?:https?://|javascript:)|rundll32[^\r\n]*comsvcs[^\r\n]*minidump|reg\s+save\s+hklm\\(?:sam|security|system)\b|dd\s+[^\r\n]*if=/dev/(?:zero|urandom)[^\r\n]*of=/dev/(?:sd|nvme))").expect("reviewed command expression")).is_match(command)
 }
 
+fn normalize_numbers(ev: &Event, mappings: &[SourceMapping], n: &mut Normalized) {
+    for (key, known) in [
+        ("bytes", vec![("network.bytes", "B")]),
+        (
+            "latency",
+            vec![
+                ("event.duration", "ns"),
+                ("duration_ms", "ms"),
+                ("latency_ms", "ms"),
+            ],
+        ),
+        ("amount", vec![("transaction.amount", "currency")]),
+    ] {
+        // Directional byte fields are intentionally not combined into a total.
+        let mapped = mappings
+            .iter()
+            .filter(|m| m.source == ev.source)
+            .find_map(|m| {
+                m.fields.get(key).map(|field| {
+                    (
+                        field.clone(),
+                        m.units.get(key).cloned().unwrap_or_default(),
+                        "mapping",
+                    )
+                })
+            });
+        let spec = mapped.or_else(|| {
+            known
+                .iter()
+                .find(|(field, _)| field_value(ev, field).is_some())
+                .map(|(field, unit)| (field.to_string(), unit.to_string(), "adapter"))
+        });
+        let Some((field, unit, method)) = spec else {
+            continue;
+        };
+        let Some(original) = field_text(ev, &field) else {
+            continue;
+        };
+        let Ok(value) = original.parse::<f64>() else {
+            n.limitations
+                .push(format!("{key}: valor não numérico em {field}"));
+            continue;
+        };
+        let multiplier = match (key, unit.as_str()) {
+            ("bytes", "B") => Some(1.0),
+            ("bytes", "KiB") => Some(1024.0),
+            ("bytes", "MiB") => Some(1048576.0),
+            ("bytes", "KB") => Some(1000.0),
+            ("bytes", "MB") => Some(1_000_000.0),
+            ("latency", "s") => Some(1000.0),
+            ("latency", "ms") => Some(1.0),
+            ("latency", "us") => Some(0.001),
+            ("latency", "ns") => Some(0.000001),
+            ("amount", "currency") => Some(1.0),
+            _ => None,
+        };
+        let Some(multiplier) = multiplier else {
+            n.limitations.push(format!(
+                "{key}: unidade não declarada ou incompatível em {field}"
+            ));
+            continue;
+        };
+        let canonical = value * multiplier;
+        if !canonical.is_finite() || (key != "amount" && canonical < 0.0) {
+            n.limitations
+                .push(format!("{key}: valor fora do domínio em {field}"));
+            continue;
+        }
+        n.numbers.insert(
+            key.into(),
+            NumberProvenance {
+                field,
+                original,
+                original_unit: unit,
+                value: canonical,
+                unit: if key == "latency" {
+                    "ms"
+                } else if key == "bytes" {
+                    "B"
+                } else {
+                    "currency"
+                }
+                .into(),
+                method: method.into(),
+            },
+        );
+    }
+}
+
 fn canonical_path(path: &str, product: &str) -> String {
     let p = path.trim().trim_matches('"');
-    if matches!(product, "sysmon" | "windows" | "windows-security" | "powershell") {
+    if matches!(
+        product,
+        "sysmon" | "windows" | "windows-security" | "powershell"
+    ) {
         p.replace('/', "\\").to_lowercase()
     } else {
         p.to_string()
@@ -913,13 +1425,15 @@ pub fn validate_mappings(mappings: &[SourceMapping]) -> Result<(), String> {
     }
     let mut sources = std::collections::HashSet::new();
     for m in mappings {
-        if m.timestamp_unit.as_deref().is_some_and(|u| !["s", "ms", "us", "ns"].contains(&u)) {
+        if m.timestamp_unit
+            .as_deref()
+            .is_some_and(|u| !["s", "ms", "us", "ns"].contains(&u))
+        {
             return Err("timestamp_unit deve ser s, ms, us ou ns".into());
         }
-        if m.timezone
-            .as_deref()
-            .is_some_and(|z| chrono::DateTime::parse_from_rfc3339(&format!("2000-01-01T00:00:00{z}")).is_err())
-        {
+        if m.timezone.as_deref().is_some_and(|z| {
+            chrono::DateTime::parse_from_rfc3339(&format!("2000-01-01T00:00:00{z}")).is_err()
+        }) {
             return Err("timezone deve ser Z ou deslocamento explícito, como -03:00".into());
         }
         if m.source.trim().is_empty() || !sources.insert(&m.source) {
@@ -928,10 +1442,27 @@ pub fn validate_mappings(mappings: &[SourceMapping]) -> Result<(), String> {
         if m.fields.keys().any(|k| !MAPPABLE.contains(&k.as_str())) {
             return Err("Papel não suportado no mapeamento".into());
         }
-        if m.fields.values().any(|f| f.is_empty() || f.starts_with("_sec.") || f.len() > 256) {
+        if m.fields
+            .values()
+            .any(|f| f.is_empty() || f.starts_with("_sec.") || f.len() > 256)
+        {
             return Err("Campo inválido no mapeamento".into());
         }
-        if m.outcomes.values().any(|v| !["success", "failure", "blocked", "unknown"].contains(&v.as_str())) {
+        for (key, unit) in &m.units {
+            let valid = match key.as_str() {
+                "bytes" => ["B", "KiB", "MiB", "KB", "MB"].contains(&unit.as_str()),
+                "latency" => ["s", "ms", "us", "ns"].contains(&unit.as_str()),
+                "amount" => unit == "currency",
+                _ => false,
+            };
+            if !valid || !m.fields.contains_key(key) {
+                return Err("Unidade numérica exige campo mapeado e unidade compatível".into());
+            }
+        }
+        if m.outcomes
+            .values()
+            .any(|v| !["success", "failure", "blocked", "unknown"].contains(&v.as_str()))
+        {
             return Err("Resultado mapeado inválido".into());
         }
     }

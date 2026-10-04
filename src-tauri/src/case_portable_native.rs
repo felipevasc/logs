@@ -132,6 +132,8 @@ struct NativeMetadata {
     ledgers: Vec<PortableLedger>,
     #[serde(default)]
     reference_sets: Vec<references::ReferenceSet>,
+    #[serde(default)]
+    history_sets: Vec<crate::security_history_portable::Profile>,
 }
 pub(crate) fn read_native(root: &Path, path: &Path) -> Result<NativeArchive, String> {
     let credits = std::cell::RefCell::new(Vec::new());
@@ -164,6 +166,7 @@ pub(crate) fn read_native(root: &Path, path: &Path) -> Result<NativeArchive, Str
                     schema_version: envelope.metadata.schema_version,
                     ledgers: envelope.metadata.ledgers,
                     reference_sets: envelope.metadata.reference_sets,
+                    history_sets:envelope.metadata.history_sets,
                 },
             })
         },
@@ -283,6 +286,7 @@ pub(crate) fn prepare_native_sidecars(
         }
     }
     let references = references::validate(*schema_version, reference_sets, snapshots, entries)?;
+    if let Some(archive)=archive {crate::security_history_portable::validate_owners(&archive.archive.metadata.history_sets,snapshots,entries)?;}
     let mut prepared = Vec::new();
     for snapshot in snapshots {
         crate::operations::check()?;
@@ -307,6 +311,7 @@ pub(crate) fn prepare_native_sidecars(
             &Budget::default(),
             &work(),
         )?;
+        if let Some(archive)=archive {crate::security_history_portable::prepare(root,snapshot,local.snapshot(),&archive.archive.metadata.history_sets,entries,|index|archive.archive.path(index))?;}
         let descriptors = &references[&snapshot.case_id];
         let reference_sources =
             references::prepare(root, local.snapshot(), descriptors, &reference_paths)?;
@@ -320,6 +325,7 @@ pub(crate) fn prepare_native_sidecars(
     Ok(prepared)
 }
 pub(crate) struct NativeCapturedSidecars {
+    histories:Vec<crate::security_history_portable::Captured>,
     ledgers: Vec<ledger::CapturedPortable>,
     references: Vec<Snapshot>,
     credits: Vec<crate::case_work_budget::Lease>,
@@ -341,6 +347,7 @@ pub(crate) fn capture_native_sidecars(
     // scratch before the reader obtains Strings; decoded trees are separate.
     let _scratch = crate::case_cache::reserve_work(crate::case_work_budget::global(), 8 << 20)?;
     let mut captured = NativeCapturedSidecars {
+        histories:Vec::new(),
         ledgers: Vec::new(),
         references: Vec::new(),
         credits: Vec::new(),
@@ -350,6 +357,9 @@ pub(crate) fn capture_native_sidecars(
         limit: format::MAX_MANIFEST_BYTES as usize,
     };
     for snapshot in snapshots {
+        let selected_history=snapshot.interpretation.as_ref().map(|i|i.security.detection_settings()).transpose()?.is_some_and(|s|s.investigation.profile_revision.is_some());
+        if selected_history && (plain_json||mask){return Err("O perfil histórico congelado exige exportação completa em .licase com os bytes originais. O destino foi preservado.".into());}
+        if let Some(profile)=crate::security_history_portable::capture(root,snapshot)?{captured.histories.push(profile);}
         if plain_json && !snapshot.config.references.is_empty() {
             return Err("O JSON não transporta os bytes das referências. Exporte o Caso completo em .licase; o destino foi preservado.".into());
         }
@@ -493,7 +503,10 @@ pub(crate) fn native_export_assets(
             });
         }
     }
+    let mut history_sets=Vec::new();
+    for history in &captured.histories {history_sets.push(history.profile.clone());let mut file=history.source.file.try_clone().map_err(|e|e.to_string())?;use std::io::{Seek,SeekFrom};file.seek(SeekFrom::Start(0)).map_err(|e|e.to_string())?;sources.push(Source{entry:history.source.entry.clone(),file});}
     let metadata = Metadata {
+        history_sets,
         schema_version: 3,
         ledgers: captured
             .ledgers

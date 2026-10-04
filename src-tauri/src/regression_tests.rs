@@ -9,17 +9,18 @@ use std::{io::Write, path::PathBuf};
 struct Fixture(PathBuf);
 
 #[test]
-#[ignore = "Synthetic security scale benchmark; BENCH_EVENTS=100000,1000000,10000000"]
+#[ignore = "Synthetic scale opt-in; BENCH_EVENTS=100000,1000000,10000000,50000000; BENCH_WORKLOAD=selective|dense"]
 fn benchmark_security_evidence() {
     let counts=std::env::var("BENCH_EVENTS").unwrap_or_else(|_|"100000,1000000,10000000".into());
     let rules=crate::detections::builtin_ruleset().unwrap();
     let catalog=crate::threats::builtin_catalog();
     let settings=crate::detections::Settings::default();
+    let dense=std::env::var("BENCH_WORKLOAD").as_deref()==Ok("dense");
     for count in counts.split(',').map(|n|n.parse::<usize>().unwrap()) {
         let fixture=Fixture::new("");
         let mut writer=std::io::BufWriter::new(std::fs::File::create(&fixture.0).unwrap());
         for i in 0..count {
-            writeln!(writer,"{{\"timestamp\":{},\"event.category\":\"process\",\"event.action\":\"process_start\",\"event.outcome\":\"success\",\"host.name\":\"host-{}\",\"process.command_line\":\"{}\"}}",1_700_000_000_000i64+i as i64,i%100,if i+1==count {"sekurlsa::logonpasswords"}else{"worker --job completed"}).unwrap();
+            writeln!(writer,"{{\"timestamp\":{},\"event.category\":\"process\",\"event.action\":\"process_start\",\"event.outcome\":\"success\",\"host.name\":\"host-{}\",\"process.command_line\":\"{}\"}}",1_700_000_000_000i64+i as i64,i%100,if dense||i+1==count {"sekurlsa::logonpasswords"}else{"worker --job completed"}).unwrap();
         }
         writer.flush().unwrap(); drop(writer);
         let start=std::time::Instant::now(); let index=fixture.index("jsonl"); let indexing_ms=start.elapsed().as_millis();
@@ -30,7 +31,7 @@ fn benchmark_security_evidence() {
         assert!(page["detections"].as_array().unwrap().iter().any(|d|d["event_ids"].as_array().unwrap().contains(&serde_json::json!(count-1))));
         assert_eq!(result.metadata["storage"]["complete"],true);let start=std::time::Instant::now();
         for level in 1..=5 { result.page(level,0,20,None,None).unwrap(); }
-        println!("SECURITY_BENCH {}",serde_json::json!({"events":count,"indexing_ms":indexing_ms,"analysis_ms":analysis_ms,"five_projections_ms":start.elapsed().as_millis(),"detections":page["available_detections"],"limited":result.metadata["limited"],"memory":result.metadata["memory"],"storage":result.metadata["storage"],"synthetic":true,"policy":result.metadata["policy_version"]}));
+        println!("SECURITY_BENCH {}",serde_json::json!({"events":count,"workload":if dense{"dense"}else{"selective"},"indexing_ms":indexing_ms,"analysis_ms":analysis_ms,"five_projections_ms":start.elapsed().as_millis(),"detections":page["available_detections"],"limited":result.metadata["limited"],"memory":result.metadata["memory"],"execution":result.metadata["execution"],"storage":result.metadata["storage"],"synthetic":true,"policy":result.metadata["policy_version"]}));
     }
 }
 impl Fixture {

@@ -303,6 +303,8 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
             "cidr",
             "not_cidr",
             "detection",
+            "finding",
+            "episode",
         ]
         .contains(&f.op.as_str())
         {
@@ -311,6 +313,8 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
         if f.op == "query" {
             crate::querylang::compile(&f.value)?;
         }
+        if f.op=="finding"{if f.column!="event_ref"{return Err("finding exige a coluna event_ref".into());}crate::detections::cached_for_finding(&f.value)?;}
+        if f.op=="episode"&&(f.column!="event_ref"||f.value2.as_deref().and_then(crate::detections::cached_analysis).is_none()){return Err("Episódio exige análise calculada no contexto atual".into());}
         if f.op == "detection" && crate::detections::ruleset()?.find(&f.value).is_none() {
             return Err(format!("Regra de detecção não encontrada: {}.", f.value));
         }

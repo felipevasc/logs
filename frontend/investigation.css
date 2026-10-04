@@ -1,0 +1,6 @@
+.investigation-card{margin-top:1.2rem;padding:1rem;border:1px solid var(--border);border-radius:12px;min-width:0}
+.investigation-card h2{font-size:1.1rem}.investigation-card h3{font-size:1rem;margin:.3rem 0}
+.investigation-navigation{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:.7rem 0}
+.investigation-item{padding:.8rem 0;border-top:1px solid var(--border);overflow-wrap:anywhere}
+.investigation-item pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:24rem;overflow:auto;font-size:.8rem;padding:.5rem}
+.investigation-item details{margin:.5rem 0}.investigation-item summary{cursor:pointer}

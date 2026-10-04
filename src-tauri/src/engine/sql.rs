@@ -268,7 +268,7 @@ impl Schema {
                     None => Decision::Sql("FALSE".into()),
                 };
             }
-            "threat_rule" | "detection" => return Decision::Event,
+            "threat_rule" | "detection" | "finding" | "episode" => return Decision::Event,
             "pattern" => return Decision::Sql(format!("(pat = {})", lit(&f.value))),
             _ => {}
         }
@@ -295,7 +295,7 @@ impl Schema {
             return match self.value(&f.column, names) {
                 Val::Sql(value) => Decision::Sql(tests.text(
                     &value,
-                    Arc::new(move |v| number_matches(&owned, v.and_then(crate::model::text_number))),
+                    Arc::new(move |v| number_matches(&owned, v.and_then(|text| owned.field_number(text)))),
                 )),
                 Val::Absent => Decision::Sql(literal(number_matches(&owned, None))),
                 Val::Unsupported => Decision::Event,
@@ -366,8 +366,7 @@ impl Schema {
             }
             _ => match self.ctx_value(name, role, names) {
                 Val::Sql(value) => {
-                    let term = term.clone();
-                    (tests.text(&value, Arc::new(move |v| v.is_some_and(|v| term.value_matches(v)))), true)
+                    (resolved_term(term, &value, tests), true)
                 }
                 // `Ctx::field` finds nothing: the term never matches.
                 Val::Absent => ("FALSE".into(), true),
@@ -397,6 +396,13 @@ impl Schema {
         };
         (any_value(&needle, tests, names), true)
     }
+}
+
+/// Both the query engine and the security vector executor use this comparison.
+/// NULL is a two-valued false even below NOT and OR, as in the native AST.
+pub(crate) fn resolved_term(term: &Term, value: &str, tests: &mut Tests) -> String {
+    let term = term.clone();
+    tests.text(value, Arc::new(move |v| v.is_some_and(|v| term.value_matches(v))))
 }
 
 /// Some value (lowercase free-text column, name or description) contains `needle`.

@@ -68,7 +68,7 @@ window.FieldTransforms = (() => {
       // A clipped token/PEM may not match the full redactor. Omit that scalar
       // rather than reveal a partial secret that its complete value would mask.
       const clipped = selected.length < input.length;
-      const safe = mask && clipped ? "[texto extenso omitido]" : mask && window.EvidenceUI ? window.EvidenceUI.redact(selected) : selected;
+      const safe = mask && clipped ? "[texto extenso omitido]" : mask && window.EvidenceUI?.mask ? window.EvidenceUI.mask(selected) : selected;
       if (quoted) append('"');
       for (const char of safe) {
         if (reason) break;

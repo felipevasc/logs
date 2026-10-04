@@ -138,6 +138,11 @@ thread_local! { static CURRENT: RefCell<Option<Arc<Admitted>>> = const { RefCell
 pub(crate) fn current() -> Option<Arc<Admitted>> {
     CURRENT.with(|value| value.borrow().clone())
 }
+/// Derived artifacts may publish only for the captured Case and revision.
+pub(crate) fn validate_result_owner()->Result<(),String>{
+    if let Some(owner)=current(){owner.validate_native_case_authority()?;owner.validate_visibility()?;if let Some(identity)=&owner.identity{validate_identity(identity)?;}}
+    crate::operations::check()
+}
 pub(crate) fn with<T>(admitted: Option<Arc<Admitted>>, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<Arc<Admitted>>);
     impl Drop for Restore {
@@ -2012,6 +2017,21 @@ pub(crate) fn cache_namespace() -> String {
             )
         })
         .unwrap_or_default()
+}
+/// Stable ownership for content-addressed reusable facts. Publication revisions
+/// are validated by the content hash and must not discard all unchanged facts
+/// when a source grows. This scope never resolves a foreground Case.
+pub(crate) fn fact_namespace() -> String {
+    current().map(|admitted|match &admitted.identity {
+        Some(identity)=>format!("{}|{}",identity.case_id,identity.analysis_id),
+        None=>format!("legacy|{:?}",admitted.case_key),
+    }).unwrap_or_default()
+}
+pub(crate) fn fact_interpretation_signature()->String{
+    current().map(|admitted|crate::evidence::stable_id("fact-interpretation-1",[
+        serde_json::to_string(&(&admitted.interpretation.codes,&admitted.interpretation.system_codes,&admitted.interpretation.timestamps,&admitted.interpretation.formats,&admitted.references)).unwrap_or_default(),
+        serde_json::to_string(&admitted.derived.iter().map(|field|(&field.name,&field.source,&field.steps,field.lookup.as_ref().map(|lookup|&lookup.definition),field.rules.iter().map(|rule|(rule.re.as_str(),&rule.template,&rule.filter,&rule.filter_security_signature)).collect::<Vec<_>>())).collect::<Vec<_>>()).unwrap_or_default(),
+    ])).unwrap_or_default()
 }
 
 #[cfg(test)]

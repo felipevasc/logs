@@ -34,7 +34,7 @@ function fixture({ blurToBody = false } = {}) {
     window: {
       __TAURI__: { event: { listen: (_type, fn) => { listeners.set('operation-progress', fn); return Promise.resolve(); } } },
       WaitingVisuals: { mount: (_host, receipt) => {
-        const view = { receipt, destroyed: false, update(next) { this.receipt = next; node('#load-visual .wv-motion-toggle').hidden = next.state === 'cancelling'; }, complete() { this.completed = true; }, destroy() { this.destroyed = true; } };
+        const view = { receipt, destroyed: false, update(next) { this.receipt = next; }, complete() { this.completed = true; }, destroy() { this.destroyed = true; } };
         views.push(view); return view;
       } },
       PerformanceTools: { estimate: (_previous, p) => ({ completed: p.completed, total: p.total, percent: null }), phaseSeconds: () => null, duration: String },
@@ -102,11 +102,11 @@ test('actual Tasks cancellation targets one task once and remains pending/static
 });
 
 test('cancelLatest before first progress retains exact owner after removing its map entry', () => {
-  const f = fixture(); f.show(); f.start('load-a'); f.node('#load-visual .wv-motion-toggle').focus();
+  const f = fixture(); f.show(); f.start('load-a'); f.node('#load-cancel').focus();
   f.context.cancelLatest('source-load');
   assert.equal(f.latest.has('source-load'), false);
   assert.equal(f.views.at(-1).receipt.operationId, 'load-a'); assert.equal(f.views.at(-1).receipt.state, 'cancelling');
-  assert.equal(f.document.activeElement, f.node('#load-progress-details > summary'), 'hidden Pause does not strand focus');
+  assert.equal(f.document.activeElement, f.node('#load-progress-details > summary'), 'a disabled Cancel does not strand focus');
 });
 
 test('an old source card cannot cancel or display a replacement task with the same latest key', () => {

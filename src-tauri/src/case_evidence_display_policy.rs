@@ -1,21 +1,18 @@
 //! Historical Case display strings, matching EvidenceUI and CaseTimeline.
 //!
 //! Callers admit full input/output scratch before invoking these pure helpers.
-//! Apply redaction to Event title/detail/source only. Authored group/manual
-//! strings and attached note text stay literal. Search each displayed field
+//! Event title/detail/source and authored group/manual strings stay literal;
+//! attached note text too. Search each displayed field
 //! separately, before preview clipping; never join fields for substring search.
-use regex::{Captures, Regex};
 use serde_json::Value;
-use std::sync::OnceLock;
 
-pub(crate) const POLICY_VERSION: u32 = 1;
+pub(crate) const POLICY_VERSION: u32 = 2;
 pub(crate) const MAX_TEXT_BYTES: usize = 4 << 20;
 pub(crate) const TEXT_LIMIT: &str = "CASE_DISPLAY_TEXT_LIMIT";
 pub(crate) const UNSUPPORTED: &str = "CASE_HISTORY_DISPLAY_UNSUPPORTED";
 
 // ECMAScript WhiteSpace + LineTerminator, shared by trim and regexp \s.
 // In particular FEFF is included, while NEL (0085) and MVS (180E) are not.
-const JS_SPACE: &str = r"\x09-\x0D\x20\u{00A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
 fn js_space(ch: char) -> bool {
     matches!(ch, '\u{0009}'..='\u{000D}' | '\u{0020}' | '\u{00A0}' |
         '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' |
@@ -56,76 +53,11 @@ fn lower(text: &str) -> Result<String, String> {
     Ok(text.to_lowercase())
 }
 
-enum Part {
-    Literal(&'static str),
-    Capture(usize),
-}
-impl Part {
-    fn text<'a>(&self, captures: &Captures<'a>) -> &'a str {
-        match self {
-            Self::Literal(text) => text,
-            Self::Capture(index) => captures.get(*index).map_or("", |value| value.as_str()),
-        }
-    }
-}
-fn replace(regex: &Regex, text: &str, parts: &[Part]) -> Result<String, String> {
-    let mut bytes = 0;
-    let mut previous = 0;
-    for captures in regex.captures_iter(text) {
-        let matched = captures.get(0).unwrap();
-        bytes = add_size(bytes, matched.start() - previous)?;
-        for part in parts {
-            bytes = add_size(bytes, part.text(&captures).len())?;
-        }
-        previous = matched.end();
-    }
-    bytes = add_size(bytes, text.len() - previous)?;
-    // Both admission and publication use the same fixed regex/replacement.
-    // This avoids allocating an oversized replace_all result before refusal.
-    let mut output = String::with_capacity(bytes);
-    previous = 0;
-    for captures in regex.captures_iter(text) {
-        let matched = captures.get(0).unwrap();
-        output.push_str(&text[previous..matched.start()]);
-        for part in parts {
-            output.push_str(part.text(&captures));
-        }
-        previous = matched.end();
-    }
-    output.push_str(&text[previous..]);
-    Ok(output)
-}
-
-/// Port of the STRING arm of EvidenceUI.redact, in its original pass order.
-/// JS's non-Unicode /i folds these ASCII literals only: Unicode /i would also
-/// match long-s/Kelvin-sign aliases that the frontend deliberately does not.
+/// Historical Case display shows Event title/detail/source exactly as recorded,
+/// like EvidenceUI.redact since policy 2. Masking is only an explicit export choice.
 pub(crate) fn redact_event_text(value: &str) -> Result<String, String> {
     size(value.len())?;
-    static HASH: OnceLock<Regex> = OnceLock::new();
-    static PEM: OnceLock<Regex> = OnceLock::new();
-    static ENV: OnceLock<Regex> = OnceLock::new();
-    static SECRET: OnceLock<Regex> = OnceLock::new();
-    let mut value = replace(
-        HASH.get_or_init(|| Regex::new(r"\$(?:[156y]|2[aby])\$[./A-Za-z0-9$=,-]{20,}").unwrap()),
-        value,
-        &[Part::Literal("[hash protegido]")],
-    )?;
-    value = replace(
-        PEM.get_or_init(|| Regex::new(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----(?s:.*?)(?:-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\z)").unwrap()),
-        &value, &[Part::Literal("[chave privada oculta]")],
-    )?;
-    value = replace(
-        ENV.get_or_init(|| Regex::new(&format!(r"((?:AWS_SECRET_ACCESS_KEY|DB_PASSWORD|DATABASE_PASSWORD)[{JS_SPACE}]*=[{JS_SPACE}]*)[^\r\n]+")).unwrap()),
-        &value, &[Part::Capture(1), Part::Literal("[oculto]")],
-    )?;
-    // The frontend's next complete-PEM pass is redundant: the earlier pass
-    // consumes every matching BEGIN, including truncated keys, through END/EOF.
-    // JS dot excludes all four line terminators; negated quote classes do not.
-    replace(SECRET.get_or_init(|| Regex::new(&format!(
-            r#"((?i-u:password|passwd|access[_-]?token|refresh[_-]?token|secretAccessKey|client[_-]?secret|token|secret|authorization|cookie|api[_-]?key))(["']?[{JS_SPACE}]*[:=][{JS_SPACE}]*)(?:"(?:\\[^\r\n\u{{2028}}\u{{2029}}]|[^"\\])*"|'(?:\\[^\r\n\u{{2028}}\u{{2029}}]|[^'\\])*'|(?i-u:Bearer|Basic)[{JS_SPACE}]+[^{JS_SPACE}",;]+|[^{JS_SPACE}",;]+)"#
-        )).unwrap()),
-        &value, &[Part::Capture(1), Part::Capture(2), Part::Literal("\"[oculto]\"")],
-    )
+    Ok(value.to_string())
 }
 
 pub(crate) fn evidence_label(level: Option<&Value>) -> &'static str {
@@ -275,7 +207,7 @@ mod tests {
             TEXT_LIMIT
         );
         assert_eq!(
-            redact_event_text(&"token=a ".repeat(MAX_TEXT_BYTES / 8)).unwrap_err(),
+            redact_event_text(&"token=a ".repeat(MAX_TEXT_BYTES / 8 + 1)).unwrap_err(),
             TEXT_LIMIT
         );
         assert_eq!(

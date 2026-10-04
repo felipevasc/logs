@@ -410,7 +410,7 @@ fn cacheable_filters(pfs: &[PreparedFilter]) -> bool {
             Expr::Term(term) => !matches!(term.kind(), TermKind::Event),
         }
     }
-    pfs.iter().all(|pf| !matches!(pf.f.op.as_str(), "detection" | "threat_rule") && pf.expr.as_ref().is_none_or(stable))
+    pfs.iter().all(|pf| !matches!(pf.f.op.as_str(), "detection" | "threat_rule" | "finding" | "episode") && pf.expr.as_ref().is_none_or(stable))
 }
 
 /// Mandatory visibility is independent of the user predicate and of whether

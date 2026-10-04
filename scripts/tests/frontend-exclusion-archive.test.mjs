@@ -317,12 +317,12 @@ test('available archive rows expose bounded safe summaries while collapsed and r
   await f.archive.openArchive();
   const body = f.records()[1].children[1], summary = body.children.find(item => item.className === 'ex-record-summary');
   const meta = body.children.find(item => item.className === 'ex-record-meta');
-  assert.match(summary.textContent, /Sign-in completed/); assert.match(summary.textContent, /\[oculto\]/);
+  assert.match(summary.textContent, /Sign-in completed: token=private-token/); assert.doesNotMatch(summary.textContent, /\[oculto\]/);
   assert.equal(meta.textContent, `${new Date(0).toLocaleString('pt-BR')} · Alerta`); assert.ok(summary.textContent.length <= 320);
   assert.equal(f.records()[0].children[1].children.some(item => item.className === 'ex-record-summary'), false, 'missing content retains provenance without an invented message');
   const details = body.children.find(item => item.className === 'ex-event-preview'), preview = details.children.find(item => item.tag === 'pre');
   assert.ok(preview.textContent.length <= 4096); assert.match(preview.textContent, /prévia truncada/);
-  assert.doesNotMatch(textIn(body), /private-token|private-secret/);
+  assert.doesNotMatch(textIn(body), /\[oculto\]/, 'archived values are shown as recorded');
   assert.equal(event.message, 'Sign-in completed: token=private-token'); assert.equal(event.fields.client_secret, 'private-secret');
   assert.equal(event.fields.body.length, 1000000);
 });

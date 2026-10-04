@@ -543,6 +543,8 @@ fn field_value(ev: &Event, role: Role) -> Option<Cow<'_, str>> {
     }
     best.map(|(_, value)| value)
 }
+/// Original typed fields only, without message, source-name or inferred fallbacks.
+pub(crate) fn explicit_value(ev:&Event,role:Role)->Option<Cow<'_,str>>{field_value(ev,role)}
 
 fn is_syslog_like(ev: &Event) -> bool {
     ev.fields.contains_key("process") || ev.fields.contains_key("msgid")

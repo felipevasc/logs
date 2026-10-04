@@ -19,6 +19,9 @@ window.Tasks = (() => {
   READS.add("reference_inspect"); READS.add("reference_list");
   READS.add("analysis_field_text"); SCOPED.add("analysis_field_text");
   READS.add("java_trace_detail"); SCOPED.add("java_trace_detail");
+  READS.add("investigation_narrative_review");SCOPED.add("investigation_narrative_review");
+  READS.add("investigation_page"); SCOPED.add("investigation_page"); SCOPED.add("investigation_profile_train");
+  READS.add("investigation_proposal_evaluate"); SCOPED.add("investigation_proposal_evaluate"); SCOPED.add("investigation_proposal_accept");
   // Native evidence requests own their admission inside request; never inject
   // the currently selected Case over their captured store/member identity.
   for (const command of ["cases_load_view", "cases_save_view", "case_evidence_discard", "case_export_native", "case_recovery_status", "case_recovery_prepare_restart", "case_recovery_return_original"]) QUIET.add(command);
@@ -48,6 +51,10 @@ window.Tasks = (() => {
   const named = new Set(["set_ts_config", "remote_import", "remote_test", "load_bundle", "journey_fields", "journey_index", "journey_events", "discover_patterns", "timeline_range", "query_page", "query_events", "explore_snapshot", "count_filtered", "stats_events", "tree_aggs", "aggregate_events", "compute_series", "pivot", "load_file", "load_files", "load_event_log", "engine_retry"]);
   const sourceMutations = new Set(["set_ts_config", "load_file", "load_files", "load_bundle", "load_event_log", "clear_events"]);
   named.add("triage");
+  for (const command of ["investigation_page", "investigation_profile_train", "investigation_narrative_review"]) named.add(command);
+  for (const command of ["investigation_proposal_evaluate", "investigation_proposal_accept"]) named.add(command);
+  Object.assign(WHAT, { investigation_proposal_evaluate: "Avaliando proposta e controles", investigation_proposal_accept: "Salvando regra revisada" });
+  Object.assign(WHAT, { investigation_narrative_review:"Conferindo citações da síntese",investigation_page: "Investigação do comportamento", investigation_profile_train: "Congelando referência histórica" });
   SCOPED.add("triage_timeline"); READS.add("triage_timeline");
   named.add("clear_events"); named.add("grouped_timeline"); named.add("preview_field_transform"); for (const command of ["exclusion_visibility", "exclusion_preview", "exclusion_list", "exclusion_archive_page"]) named.add(command);
   const latest = new Map();

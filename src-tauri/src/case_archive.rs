@@ -32,6 +32,8 @@ pub(crate) struct Metadata {
     pub ledgers: Vec<PortableLedger>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reference_sets: Vec<ReferenceSet>,
+    #[serde(default, skip_serializing_if="Vec::is_empty")]
+    pub history_sets: Vec<crate::security_history_portable::Profile>,
 }
 
 struct Pending {
@@ -411,7 +413,10 @@ pub(crate) fn export_at(
             });
         }
     }
+    let mut history_sets=Vec::new();
+    for context in &snapshots {if let Some(captured)=crate::security_history_portable::capture(root,context)?{if mask{return Err("O perfil histórico exige exportação com seus bytes originais. O destino foi preservado.".into());}history_sets.push(captured.profile);sources.push(captured.source);}}
     let metadata = Metadata {
+        history_sets,
         schema_version: if captured_references.is_empty() { 1 } else { 2 },
         ledgers: captured.iter().map(|c| c.manifest.clone()).collect(),
         reference_sets: captured_references
@@ -496,6 +501,7 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
             EntryKind::Reference(id) => {
                 reference_paths.insert(id.clone(), archive.path(index)?);
             }
+            EntryKind::History(_)=>(),
             EntryKind::Document => return Err("Documento portátil duplicado.".into()),
         }
     }
@@ -519,6 +525,7 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
         &mut foreign,
         &archive.entries,
     )?;
+    crate::security_history_portable::validate_owners(&archive.metadata.history_sets,&foreign,&archive.entries)?;
     crate::case_images::validate_portable_images(&mut data, &images)?;
     {
         let pending = PENDING.lock();
@@ -562,6 +569,7 @@ pub(crate) fn import_at(root: &Path, path: &Path) -> Result<Value, String> {
             &Budget::default(),
             &work(),
         )?;
+        crate::security_history_portable::prepare(&root,&context,staged.snapshot(),&archive.metadata.history_sets,&archive.entries,|index|archive.path(index))?;
         let reference_sources =
             references::prepare(&root, staged.snapshot(), reference_set, &reference_paths)?;
         references::interpretation_diagnostics(reference_set, &mut staged, false)?;

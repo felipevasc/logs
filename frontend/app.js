@@ -185,10 +185,10 @@ function syncLoadCancel(focused = document.activeElement) {
   $("#load-cancel-help").textContent = state.loadOverlayCancelling
     ? "Aguardando confirmação da operação."
     : button.disabled ? "Cancelamento indisponível nesta etapa."
-    : "Solicita a interrupção desta operação. Pausar a animação mantém o trabalho em andamento.";
+    : "Solicita a interrupção desta operação.";
   // A disappearing/disabled control must not strand keyboard focus. Do not
   // move focus when the user is reading details or working elsewhere.
-  if ((focused === button && button.disabled) || (focused === $("#load-visual .wv-motion-toggle") && focused?.hidden)) {
+  if (focused === button && button.disabled) {
     $("#load-progress-details > summary").focus({ preventScroll: true });
   }
 }
@@ -1493,7 +1493,9 @@ function removeFilter(i) {
 
 // formata valor de filtro numérico com a unidade do perfil do campo (bytes, ms, %…)
 function fmtFilterSideValue(column, raw) {
-  if (column === "timestamp") return fmtTs(Number(raw) || raw);
+  const numeric = /^-?\d+(\.\d+)?$/.test(String(raw ?? "").trim());
+  if (column === "timestamp") return numeric ? fmtTs(Number(raw)) : raw;
+  if (window.DateValues?.isDateField(column)) return numeric ? (window.DateValues.describe(column, raw) || raw) : raw;
   const p = profileFor(column);
   const n = Number(raw);
   if (p && RANGE_KINDS.has(p.kind) && raw !== "" && !Number.isNaN(n)) return fmtKindValue(p.kind, n);
@@ -1873,6 +1875,16 @@ function jsColNum(ev, col) {
   if (col === "id") return ev.id;
   return jsParseNumUnit(cellValue(ev, col));
 }
+// Dates typed against a field other than the record timestamp (query.rs `bound`).
+function jsTimeMode(f) {
+  if (f.column === "timestamp" || !window.DateValues) return null;
+  const lo = window.DateValues.typedInstant(f.value);
+  if (lo == null) return null;
+  if (f.op !== "between") return { lo };
+  const hi = window.DateValues.typedInstant(f.value2 ?? "");
+  return hi == null ? { lo: null, hi: null } : { lo, hi };
+}
+function jsColTime(ev, col) { return window.DateValues.textToMs(cellValue(ev, col)); }
 function jsValNum(col, s) {
   const t = String(s ?? "").trim();
   if (/^-?\d+(\.\d+)?$/.test(t)) return parseFloat(t);
@@ -1908,12 +1920,13 @@ function jsMatchFilter(ev, f) {
     case "empty": return !hay.trim();
     case "not_empty": return !!hay.trim();
     case "gt": case "gte": case "lt": case "lte": {
-      const a = jsColNum(ev, f.column), b = jsValNum(f.column, f.value);
+      const time = jsTimeMode(f), a = time ? jsColTime(ev, f.column) : jsColNum(ev, f.column), b = time ? time.lo : jsValNum(f.column, f.value);
       if (a == null || b == null) return false;
       return f.op === "gt" ? a > b : f.op === "gte" ? a >= b : f.op === "lt" ? a < b : a <= b;
     }
     case "between": {
-      const a = jsColNum(ev, f.column), lo = jsValNum(f.column, f.value), hi = jsValNum(f.column, f.value2 ?? "");
+      const time = jsTimeMode(f), a = time ? jsColTime(ev, f.column) : jsColNum(ev, f.column);
+      const lo = time ? time.lo : jsValNum(f.column, f.value), hi = time ? time.hi : jsValNum(f.column, f.value2 ?? "");
       return a != null && lo != null && hi != null && a >= lo && a <= hi;
     }
     default: return true;
@@ -2391,10 +2404,19 @@ function readFilterInputValue(selector) {
   try { const decoded = JSON.parse(value); if (typeof decoded === "string") return decoded; } catch { /* Keep malformed edits visible. */ }
   throw Error("O valor com escapes deve ser um texto JSON entre aspas. Use \\r e \\n para preservar as quebras de linha.");
 }
+// Date-like columns are edited as date/time; the backend converts to the field's format.
+const DATE_FILTER_OPS = new Set(["gt", "gte", "lt", "lte", "between"]);
+const isDateFilter = (column, op) => DATE_FILTER_OPS.has(op) && !!window.DateValues?.isDateColumn(column);
+function filterInputDate(column, op, value) {
+  return isDateFilter(column, op) ? window.DateValues.toInput(column, value) : value;
+}
 function refreshFilterInputHint() {
   const escaped = filterValueFormats.get("#fp-val") === "json" || !$("#fp-val2").hidden && filterValueFormats.get("#fp-val2") === "json";
+  const date = isDateFilter($("#fp-col")?.value, $("#fp-op")?.value);
+  for (const selector of ["#fp-val", "#fp-val2"]) $(selector).placeholder = date ? "dd/mm/aaaa hh:mm:ss" : selector === "#fp-val" ? "valor" : "até";
   $("#fp-text-hint").textContent = escaped
     ? "Retornos CR são exibidos como texto JSON entre aspas; \\r e \\n preservam cada quebra. Enter aplica; Shift+Enter insere \\n."
+    : date ? "Data e hora local (dd/mm/aaaa hh:mm:ss). Vale para epoch em segundos, milissegundos ou texto de data. Enter aplica."
     : "Enter aplica · Shift+Enter insere uma nova linha.";
 }
 function insertFilterLineBreak(input) {
@@ -2458,8 +2480,8 @@ function openFilterPop(anchor = null, editIndex = null, preset = null) {
       opSel.appendChild(el("option", "", existingFilterOperators.get(f.op))).value = f.op;
     }
     opSel.value = f.op;
-    setFilterInputValue("#fp-val", f.value);
-    setFilterInputValue("#fp-val2", f.value2);
+    setFilterInputValue("#fp-val", filterInputDate(f.column, f.op, f.value));
+    setFilterInputValue("#fp-val2", filterInputDate(f.column, f.op, f.value2));
     $("#fp-val2").hidden = f.op !== "between";
   } else {
     setFilterInputValue("#fp-val", "");
@@ -2467,6 +2489,7 @@ function openFilterPop(anchor = null, editIndex = null, preset = null) {
     $("#fp-val2").hidden = true;
   }
   opSel.onchange = () => { $("#fp-val2").hidden = opSel.value !== "between"; refreshFilterInputHint(); };
+  colSel.onchange = () => refreshFilterInputHint();
   refreshFilterInputHint();
   pop.hidden = false;
   positionPop(pop, anchor || $("#btn-add-filter"));
@@ -2474,7 +2497,8 @@ function openFilterPop(anchor = null, editIndex = null, preset = null) {
 }
 function openValueFilter(column, value, anchor = null, op = null) {
   const empty = value == null || String(value) === "";
-  const selectedOp = op || (empty ? "empty" : column === "timestamp" ? "between" : "equals_exact");
+  const dateValue = !empty && column !== "timestamp" && window.DateValues?.describe(column, value);
+  const selectedOp = op || (empty ? "empty" : column === "timestamp" || dateValue ? "between" : "equals_exact");
   openFilterPop(anchor, null, { column, op: selectedOp, value: empty ? "" : String(value), value2: selectedOp === "between" ? String(value) : null });
 }
 
@@ -2547,6 +2571,15 @@ function applyFilterPop() {
   let value, value2;
   try { value = ["empty", "not_empty"].includes(op) ? "" : readFilterInputValue("#fp-val"); value2 = op === "between" ? readFilterInputValue("#fp-val2") : ""; }
   catch (error) { toast(error.message, "info"); return false; }
+  if (isDateFilter(column, op)) {
+    const typed = [value, value2].filter(Boolean);
+    if (typed.some(text => window.DateValues.typedInstant(text) == null && !/^-?\d+(\.\d+)?$/.test(text.trim()))) {
+      toast("Use data e hora no formato dd/mm/aaaa hh:mm:ss (os segundos são opcionais).", "info");
+      return false;
+    }
+    value = window.DateValues.fromInput(column, value);
+    value2 = value2 ? window.DateValues.fromInput(column, value2) : value2;
+  }
   const literalWhitespace = ["contains", "not_contains", "starts_with", "ends_with", "regex"].includes(op) && value.length > 0;
   if (!["empty", "not_empty", "equals_exact", "not_equals_exact", "in_exact"].includes(op) && !literalWhitespace && !value.trim()) {
     toast("Informe um valor para o filtro.", "info");
@@ -5788,7 +5821,7 @@ function buildEventRow(ev, columns = state.visibleCols, { recordActions = false,
   for (const col of columns) {
     const td = el("td"); td.dataset.column = col;
     const originalValue = col === "level" ? ev.level : cellValue(ev, col);
-    const displayValue = window.EvidenceUI?.redact({ [col]: originalValue })[col] ?? originalValue;
+    const displayValue = originalValue;
     const preview = tableValuePreview(displayValue), displayText = preview.text;
     if (col === "level") {
       const wrap = el("span", "lv-cell");
@@ -5823,6 +5856,8 @@ function buildEventRow(ev, columns = state.visibleCols, { recordActions = false,
       const hint = tableValuePreview(displayText, 256);
       td.title = `${hint.text}${hint.marker}\nPrévia de texto limitada. Clique para ver os detalhes; use o botão direito para copiar ou filtrar o valor completo.`;
     } else td.title = displayText;
+    const dateHint = window.DateValues?.describe(col, originalValue);
+    if (dateHint) { td.appendChild(el("span", "date-hint", dateHint)); td.title += `\n${dateHint}`; }
     td.oncontextmenu = (e) => {
       e.preventDefault();
       if (recordTarget && !recordTargetCurrent(recordTarget)) { toast("O contexto mudou. Abra o registro novamente.", "info"); return; }
@@ -6161,9 +6196,9 @@ function currentIndex() {
 }
 
 let detailRequest = 0;
-let detailRevealed = false;
+// Record values are always shown as recorded; nothing is hidden automatically.
+const detailRevealed = true;
 function resetDetailVisibility() {
-  detailRevealed = false;
   window.ValueInspector?.close();
   window.EventInsights?.clear();
   for (const pane of ["overview", "json", "raw"]) $("#pane-" + pane).replaceChildren();
@@ -6172,22 +6207,11 @@ function resetDetailVisibility() {
 function mountDetailVisibility({ repaint, inspect, current = () => true }) {
   $("#detail-visibility")?.remove();
   const bar = el("div", "detail-visibility"); bar.id = "detail-visibility";
-  const reveal = el("button", "btn ghost small", detailRevealed ? "Ocultar valores" : "Mostrar valores ocultos");
-  reveal.type = "button"; reveal.id = "dr-reveal"; reveal.setAttribute("aria-pressed", String(detailRevealed));
   const structure = el("button", "btn ghost small", "Inspecionar estrutura"); structure.type = "button";
   structure.onclick = () => { if (current()) inspect(); };
-  reveal.onclick = () => {
-    if (!current()) { toast("O contexto mudou. Abra o registro novamente.", "info"); return; }
-    const pane = $("#drawer .dtab.active")?.dataset.pane || "overview";
-    detailRevealed = !detailRevealed; window.ValueInspector?.close(); closeDetailValue();
-    repaint(); window.EventInsights?.setRevealed(state.currentDetailEv, detailRevealed);
-    mountDetailVisibility({ repaint, inspect, current }); switchDetailTab(pane); $("#dr-reveal").focus();
-  };
-  bar.append(reveal, structure, el("span", "muted small", detailRevealed
-    ? "Visíveis neste detalhe; fechar ou trocar de registro oculta novamente. Conteúdo já omitido na fonte não é recuperável."
-    : "Valores protegidos. Revelar mostra somente conteúdo disponível; valores já ocultados na fonte não são recuperáveis."));
+  bar.append(structure);
   $("#drawer .drawer-tabs").after(bar);
-  $("#dr-copy").title = detailRevealed ? "Copiar JSON com valores revelados" : "Copiar JSON com valores protegidos";
+  $("#dr-copy").title = "Copiar JSON do registro";
 }
 function inspectDetailStructure(node) {
   const request = detailRequest, event = state.currentDetailEv, admission = state.detailAdmission;
@@ -6559,6 +6583,8 @@ function renderDetailTree(entries, collapsedPaths = new Set()) {
       value.onclick = () => openDetailValue(node, value);
       value.oncontextmenu = (event) => showDetailValueMenu(event, node);
       valueLine.appendChild(value);
+      const dateHint = window.DateValues?.describe(node.path, node.filterValue ?? node.value);
+      if (dateHint) valueLine.appendChild(el("span", "date-hint", dateHint));
       const inspect = el("button", "kv-inspect"); inspect.type = "button";
       inspect.innerHTML = '<i class="fas fa-code" aria-hidden="true"></i>';
       inspect.setAttribute("aria-label", `Inspecionar ${node.path}`); inspect.title = "Inspecionar valor e subcampos";

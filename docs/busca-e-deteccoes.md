@@ -11,7 +11,8 @@ A caixa de busca aceita texto simples e expressões. Texto sem operadores contin
 | `falha login` | frase em qualquer campo |
 | `user:admin` | o campo contém o valor (sem diferenciar maiúsculas) |
 | `user="Admin"` / `user!="Admin"` | igualdade exata / diferente |
-| `status>=500`, `status<400` | comparação numérica (também datas em `timestamp`) |
+| `status>=500`, `status<400` | comparação numérica |
+| `timestamp>="2024-05-01 08:00"`, `token.payload.exp<2024-06-01` | comparação por data/hora em qualquer campo de data (aspas quando houver espaço) |
 | `status:500..599`, `latencia:[100 TO 900]` | intervalo |
 | `ip:10.0.0.0/8` | endereço dentro da rede (IPv4 ou IPv6) |
 | `host:web*`, `user:adm?n` | curingas |
@@ -23,6 +24,18 @@ A caixa de busca aceita texto simples e expressões. Texto sem operadores contin
 | `level:erro` | nível normalizado (erro, aviso, informação…) |
 | `regra:sql.union` | registros que correspondem a uma regra do catálogo de ameaças |
 | `deteccao:auth.bruteforce.source` | registros selecionados por uma regra de detecção |
+
+Datas digitadas valem para qualquer campo: o valor do campo é lido como instante, seja epoch em segundos ou milissegundos (por exemplo `iat`, `exp`), seja texto de data. O mesmo vale para os filtros `>`, `≥`, `<`, `≤` e `entre`, cuja caixa já mostra data e hora (`dd/mm/aaaa hh:mm:ss`) em `timestamp` e em campos de data como `iat`, `exp`, `nbf` e `*_at`. Na tabela e no detalhe, esses campos mostram o valor original com a data ao lado.
+
+### Tokens e valores codificados
+
+Tokens viram subcampos na leitura, como já acontece com JSON aninhado e parâmetros de URL, e podem ser filtrados, agrupados e buscados:
+
+- JWT (também `Authorization: Bearer …`): `<campo>.header.*` e `<campo>.payload.*`, por exemplo `authorization.payload.sub` e `token.payload.exp`;
+- Base64 ou Base64url com um objeto JSON: `<campo>.*`;
+- credenciais `Basic …`: `<campo>.basic.user` e `<campo>.basic.password`.
+
+A decodificação não verifica assinatura, validade nem emissor, e tokens criptografados (JWE) ficam como estão. Valores explícitos com o mesmo nome têm prioridade. Senhas, tokens e chaves aparecem como foram gravados; ocultá-los é uma escolha explícita na exportação (**Ocultar senhas e tokens nos textos**).
 
 A mesma linguagem é usada nos filtros salvos, nas regras de detecção, nas regras Sigma convertidas e pelo servidor MCP (`op: "query"`). Os filtros também aceitam `in`/`not_in` (um valor por linha) e `cidr`/`not_cidr`.
 

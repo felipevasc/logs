@@ -56,14 +56,14 @@ nullableRow.children[1].oncontextmenu({preventDefault(){},clientX:1,clientY:1});
 await menus.at(-1).find(item=>item.label==='Criar filtro: missing').onClick();assert.equal(preset[1],null);assert.equal(preset[3],'empty');
 assert.equal(nullable.fields.explicit_null,null);assert.equal(Object.hasOwn(nullable.fields,'missing'),false);
 
-// Redaction still sees the entire value before clipping, including a secret spanning the cut.
+// Values are shown as recorded: a long secret is clipped like any other text, never hidden.
 const secret=Object.freeze({id:8,message:'start password="'+'s'.repeat(100000)+'" end',fields:{}});
-const safe=context.buildEventRow(secret,['message']).children[0];
-assert.match(safe.textContent,/\[oculto\]/);assert.doesNotMatch(safe.textContent,/sss/);assert.equal(safe.dataset.previewTruncated,undefined);
-assert.ok(highlighted.at(-1).includes('[oculto]'));assert.ok(highlighted.at(-1).length<4096);
+const shown=context.buildEventRow(secret,['message']).children[0];
+assert.match(shown.textContent,/^start password="s{100}/);assert.doesNotMatch(shown.textContent,/\[oculto\]/);assert.equal(shown.dataset.previewTruncated,'true');
+assert.equal(secret.message.length,100000+'start password="" end'.length,'the record itself is untouched');
 
 // Highlighting runs only over bounded escaped preview text and cannot introduce HTML from a log.
 state.quick='needle';const html=context.buildEventRow({id:9,message:'<img src=x onerror=bad()>needle'.repeat(10000),fields:{}},['message']).children[0];
 assert.doesNotMatch(html.innerHTML,/<img/);assert.match(html.innerHTML,/&lt;img/);assert.match(html.innerHTML,/<mark>needle<\/mark>/);
 assert.ok(html.innerHTML.length<10000,'escaping/highlight expansion is bounded by preview input');
-console.log('Bounded Unicode-safe table previews preserve redaction, copy/filter/details and full evidence values');
+console.log('Bounded Unicode-safe table previews show recorded values, copy/filter/details and full evidence values');

@@ -5,6 +5,7 @@ use crate::model::{
 use chrono::Datelike;
 use serde_json::{Map, Value};
 
+mod tokens;
 mod web_logs;
 
 /// Scoped parsed-data revision; raw source and stable event identities never change.
@@ -154,6 +155,25 @@ fn epoch_to_ms(number: f64) -> Option<i64> {
     };
     let ms = millis as i64;
     chrono::DateTime::from_timestamp_millis(ms).map(|_| ms)
+}
+
+/// A field value read as an instant: epoch seconds/ms/µs/ns by magnitude, or
+/// any date/time text `parse_timestamp` accepts. Shared by every date filter.
+pub(crate) fn text_to_ms(text: &str) -> Option<i64> {
+    let text = text.trim();
+    match text.parse::<f64>() {
+        Ok(number) => epoch_to_ms(number),
+        Err(_) => parse_timestamp(text),
+    }
+}
+
+/// Typed date/time text that is not a plain number (and has a date part).
+pub(crate) fn typed_instant(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if text.parse::<f64>().is_ok() || !text.contains(['-', '/', 'T']) {
+        return None;
+    }
+    parse_timestamp(text)
 }
 
 fn value_to_ms(v: &Value) -> Option<i64> {
@@ -1854,7 +1874,7 @@ impl CompiledRule {
         let Some(filter) = &self.filter else { return false; };
         // Catalog detections may themselves read id. Keep such fields on the
         // authoritative event path rather than bake segment-relative ids.
-        if filter.column == "id" || filter.op == "detection" { return true; }
+        if filter.column == "id" || matches!(filter.op.as_str(),"detection"|"finding"|"episode") { return true; }
         if filter.op != "query" { return false; }
         let Some(expr) = self.prepared_filter.as_ref().and_then(|prepared| prepared.expr.as_ref()) else { return true; };
         let mut names = Vec::new(); expr.field_names(&mut names);
@@ -2710,6 +2730,7 @@ pub fn normalize_fields(ev: &mut Event) {
         }
     }
     expand_query_param_fields(ev);
+    tokens::expand_token_fields(ev);
 }
 
 pub fn parse_line(

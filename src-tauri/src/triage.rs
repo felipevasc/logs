@@ -512,6 +512,61 @@ pub async fn triage_episode(
     .await?
 }
 
+pub fn investigation_page_impl(state: &AppState, analysis_id: &str, section: &str, namespace: Option<&str>, entity: Option<&str>, signal: Option<&str>, offset: usize, limit: usize, case: Option<&[Event]>) -> Result<serde_json::Value,String> {
+    let full = stored_analysis_mode(state, case, false, true)?;
+    if full.metadata["analysis_id"].as_str()!=Some(analysis_id) { return Err("A análise mudou; recalcule antes de investigar.".into()); }
+    full.investigation_page(section, namespace, entity, signal, offset, limit)
+}
+
+#[tauri::command]
+pub async fn investigation_page(analysis_id: String, section: String, namespace: Option<String>, entity: Option<String>, signal_id: Option<String>, offset: Option<usize>, limit: Option<usize>, case_events: Option<Vec<Event>>, case_key: Option<String>, analysis_context: Option<crate::analysis_context::Identity>, source_generation: Option<u64>, operation_id:Option<String>, app: AppHandle) -> Result<serde_json::Value,String> {
+    let (admitted, records)=crate::analysis_runtime::capture_case_async(app.clone(),analysis_context,source_generation,case_events,case_key,operation_id.clone(),crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id,app.clone(),admitted,records,move |records| {
+        investigation_page_impl(app.state::<AppState>().inner(),&analysis_id,&section,namespace.as_deref(),entity.as_deref(),signal_id.as_deref(),offset.unwrap_or(0),limit.unwrap_or(20),records.as_deref())
+    }).await?
+}
+pub fn investigation_profile_train_impl(state:&AppState,analysis_id:&str,case:Option<&[Event]>)->Result<serde_json::Value,String>{
+    let _lane=crate::security_store::working_lane()?;
+    let full=stored_analysis_mode(state,case,false,true)?;
+    if full.metadata["analysis_id"].as_str()!=Some(analysis_id){return Err("A análise mudou; a referência não foi substituída".into());}
+    let mut settings=detections::load_settings();let mut manifest=full.train_profile(&settings.investigation)?;
+    settings.investigation.profile_revision=manifest["revision"].as_str().map(str::to_string);
+    let receipt=serde_json::to_value(save_settings_impl(settings,None)?).map_err(|e|e.to_string())?;manifest["analysisContext"]=receipt["analysisContext"].clone();Ok(manifest)
+}
+pub fn investigation_proposal_evaluate_impl(state:&AppState,analysis_id:&str,signal_id:&str,controls:crate::security_proposals::Controls,case:Option<&[Event]>)->Result<serde_json::Value,String>{
+    controls.validate()?;let original=stored_analysis_mode(state,case,false,true)?;
+    if original.metadata["analysis_id"].as_str()!=Some(analysis_id){return Err("Análise desatualizada; proposta não avaliada".into());}
+    let proposal=original.proposal(signal_id)?;let rule:detections::RuleDef=serde_json::from_value(proposal["rule"].clone()).map_err(|_|"Proposta exige desenho manual; não há seletor seguro compilável")?;
+    let rules=detections::proposal_ruleset(rule)?;let mut settings=detections::load_settings();settings.threats=false;settings.investigation.enabled=false;
+    let inputs=detections::Inputs{rules:&rules,catalog:None,settings:&settings};
+    let evaluated=match case {Some(events)=>detections::run_stored_evaluation(&inputs,&Source::Events(events.iter().collect()))?,None=>workspace::with_selection(state,&[],|selection|detections::run_stored_evaluation(&inputs,&Source::Selection(&selection)))??};
+    let evaluation=evaluated.evaluate_controls(&proposal,&controls,&original)?;original.record_proposal_evaluation(signal_id,&evaluation)?;Ok(evaluation)
+}
+pub fn investigation_proposal_accept_impl(state:&AppState,analysis_id:&str,signal_id:&str,rationale:&str,case:Option<&[Event]>)->Result<crate::analysis_commands::MutationReceipt,String>{
+    let original=stored_analysis_mode(state,case,false,true)?;if original.metadata["analysis_id"].as_str()!=Some(analysis_id){return Err("Análise desatualizada; proposta não ativada".into());}
+    let proposal=original.proposal(signal_id)?;let evaluation=original.proposal_evaluation(signal_id)?;let accepted=crate::security_proposals::accepted(&proposal,&evaluation,rationale)?;
+    let text=crate::case_security::with(|snapshot|snapshot.custom_rules_json.clone());
+    let mut document=match text {Some(text)=>serde_json::from_str::<serde_json::Value>(&text).map_err(|e|e.to_string())?,None=>serde_json::json!({"version":1,"rules":[]})};
+    let rules=document["rules"].as_array_mut().ok_or("Regras do Caso fora do formato version/rules")?;
+    if rules.iter().any(|rule|rule["id"].as_str()==Some(&accepted.id)){return Err("Proposta já existe nas regras do Caso; revise a definição existente".into());}
+    rules.push(serde_json::to_value(accepted).map_err(|e|e.to_string())?);save_settings_impl(detections::load_settings(),Some(document.to_string()))
+}
+#[tauri::command]
+pub async fn investigation_proposal_evaluate(analysis_id:String,signal_id:String,controls:crate::security_proposals::Controls,case_events:Option<Vec<Event>>,case_key:Option<String>,analysis_context:Option<crate::analysis_context::Identity>,source_generation:Option<u64>,operation_id:Option<String>,app:AppHandle)->Result<serde_json::Value,String>{
+    let (admitted,records)=crate::analysis_runtime::capture_case_async(app.clone(),analysis_context,source_generation,case_events,case_key,operation_id.clone(),crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id,app.clone(),admitted,records,move|records|investigation_proposal_evaluate_impl(app.state::<AppState>().inner(),&analysis_id,&signal_id,controls,records.as_deref())).await?
+}
+#[tauri::command]
+pub async fn investigation_proposal_accept(analysis_id:String,signal_id:String,rationale:String,case_events:Option<Vec<Event>>,case_key:Option<String>,analysis_context:Option<crate::analysis_context::Identity>,source_generation:Option<u64>,operation_id:Option<String>,app:AppHandle)->Result<crate::analysis_commands::MutationReceipt,String>{
+    let (admitted,records)=crate::analysis_runtime::capture_case_async(app.clone(),analysis_context,source_generation,case_events,case_key,operation_id.clone(),crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id,app.clone(),admitted,records,move|records|investigation_proposal_accept_impl(app.state::<AppState>().inner(),&analysis_id,&signal_id,&rationale,records.as_deref())).await?
+}
+#[tauri::command]
+pub async fn investigation_profile_train(analysis_id:String,case_events:Option<Vec<Event>>,case_key:Option<String>,analysis_context:Option<crate::analysis_context::Identity>,source_generation:Option<u64>,operation_id:Option<String>,app:AppHandle)->Result<serde_json::Value,String>{
+    let (admitted,records)=crate::analysis_runtime::capture_case_async(app.clone(),analysis_context,source_generation,case_events,case_key,operation_id.clone(),crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id,app.clone(),admitted,records,move|records|investigation_profile_train_impl(app.state::<AppState>().inner(),&analysis_id,records.as_deref())).await?
+}
+
 pub fn evidence_event_impl(
     state: &AppState,
     analysis_id: &str,
@@ -703,9 +758,8 @@ pub async fn normalization_preview(
     crate::offload(move || {
         crate::security_normalize::validate_mappings(&mappings)?;
         let (_, normalized) = crate::security_normalize::normalize(&event, &mappings);
-        let mut value = serde_json::to_value(normalized).map_err(|e| e.to_string())?;
-        crate::workspace::redact_value(&mut value);
-        Ok(value)
+        // Shown as recorded, like every other record view.
+        serde_json::to_value(normalized).map_err(|e| e.to_string())
     }).await?
 }
 
@@ -729,6 +783,8 @@ pub struct RuleInfo {
 #[derive(Serialize)]
 pub struct RulesOverview {
     pub rules: Vec<RuleInfo>,
+    pub sigma_compatibility:serde_json::Value,
+    pub retirement_reviews:serde_json::Value,
     pub sigma_errors: Vec<String>,
     pub sigma_dir: String,
     pub settings: Settings,
@@ -765,6 +821,8 @@ pub fn rules_impl() -> Result<RulesOverview, String> {
     rules.sort_by(|a, b| a.origin.cmp(&b.origin).then(a.name.cmp(&b.name)));
     Ok(RulesOverview {
         rules,
+        sigma_compatibility:crate::sigma::compatibility(),
+        retirement_reviews:serde_json::from_str(include_str!("../resources/detection-retirements.json")).map_err(|e|e.to_string())?,
         sigma_errors: set.sigma_errors.clone(),
         sigma_dir: "Fontes Sigma preservadas neste Caso".into(),
         settings,
@@ -959,4 +1017,13 @@ mod on_demand_tests {
         waiter.join().unwrap();
         assert_eq!(cancelled.unwrap(), true, "cancel must settle while the other analysis still holds the lock");
     }
+}
+
+pub fn investigation_narrative_review_impl(state:&AppState,analysis_id:&str,draft:crate::security_narrative::Draft,namespace:Option<&str>,entity:Option<&str>,case:Option<&[Event]>)->Result<serde_json::Value,String>{
+    let full=stored_analysis_mode(state,case,false,true)?;if full.metadata["analysis_id"].as_str()!=Some(analysis_id){return Err("A análise mudou; revise a síntese no contexto corrente".into());}full.review_narrative(&draft,namespace,entity)
+}
+#[tauri::command]
+pub async fn investigation_narrative_review(analysis_id:String,draft:crate::security_narrative::Draft,namespace:Option<String>,entity:Option<String>,case_events:Option<Vec<Event>>,case_key:Option<String>,analysis_context:Option<crate::analysis_context::Identity>,source_generation:Option<u64>,operation_id:Option<String>,app:AppHandle)->Result<serde_json::Value,String>{
+    let(admitted,records)=crate::analysis_runtime::capture_case_async(app.clone(),analysis_context,source_generation,case_events,case_key,operation_id.clone(),crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id,app.clone(),admitted,records,move|records|investigation_narrative_review_impl(app.state::<AppState>().inner(),&analysis_id,draft,namespace.as_deref(),entity.as_deref(),records.as_deref())).await?
 }

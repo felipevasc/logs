@@ -1,6 +1,7 @@
 //! Bounded working storage. SQLite temporary databases are removed on close.
 //! Storage failures fail the analysis; they never silently discard evidence.
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::security_budget::TrackedConnection as Connection;
+use rusqlite::{params, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
@@ -8,29 +9,40 @@ use std::io::{BufReader, BufWriter, Read, Seek, Write};
 /// Sequential spill file: intermediate findings never accumulate in a Vec.
 pub struct Spool<T> {
     file: BufWriter<std::fs::File>,
+    tracked: crate::security_budget::TrackedFile,
     marker: std::marker::PhantomData<T>,
 }
 impl<T: Serialize + DeserializeOwned> Spool<T> {
     pub fn new() -> Result<Self, String> {
+        let (file, tracked) = crate::security_budget::TrackedFile::new()?;
         Ok(Self {
-            file: BufWriter::with_capacity(65536, tempfile::tempfile().map_err(db_error)?),
+            file: BufWriter::with_capacity(65536, file),
+            tracked,
             marker: Default::default(),
         })
     }
     pub fn push(&mut self, value: T) -> Result<(), String> {
         let bytes = serde_json::to_vec(&value).map_err(db_error)?;
-        self.file.write_all(&(bytes.len() as u64).to_le_bytes()).map_err(db_error)?;
-        self.file.write_all(&bytes).map_err(db_error)
+        self.file
+            .write_all(&(bytes.len() as u64).to_le_bytes())
+            .map_err(db_error)?;
+        self.file.write_all(&bytes).map_err(db_error)?;
+        crate::security_budget::check()
     }
     pub fn into_iter(mut self) -> Result<SpoolIter<T>, String> {
         self.file.flush().map_err(db_error)?;
         let mut file = self.file.into_inner().map_err(db_error)?;
         file.rewind().map_err(db_error)?;
-        Ok(SpoolIter { file: BufReader::with_capacity(65536, file), marker: Default::default() })
+        Ok(SpoolIter {
+            file: BufReader::with_capacity(65536, file),
+            _tracked: self.tracked,
+            marker: Default::default(),
+        })
     }
 }
 pub struct SpoolIter<T> {
     file: BufReader<std::fs::File>,
+    _tracked: crate::security_budget::TrackedFile,
     marker: std::marker::PhantomData<T>,
 }
 pub struct Records<T> {
@@ -41,7 +53,10 @@ impl<T: Serialize + DeserializeOwned> Records<T> {
     pub fn new() -> Result<Self, String> {
         let db = Connection::open("").map_err(db_error)?;
         db.execute_batch("PRAGMA cache_size=-1024; PRAGMA temp_store=FILE; CREATE TABLE records(id INTEGER PRIMARY KEY,payload TEXT); BEGIN;").map_err(db_error)?;
-        Ok(Self { db, marker: Default::default() })
+        Ok(Self {
+            db,
+            marker: Default::default(),
+        })
     }
     pub fn insert(&self, id: usize, value: &T) -> Result<(), String> {
         self.db
@@ -55,10 +70,16 @@ impl<T: Serialize + DeserializeOwned> Records<T> {
     pub fn get(&self, id: usize) -> Result<Option<T>, String> {
         let value: Option<String> = self
             .db
-            .query_row("SELECT payload FROM records WHERE id=?1", [id as i64], |r| r.get(0))
+            .query_row(
+                "SELECT payload FROM records WHERE id=?1",
+                [id as i64],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(db_error)?;
-        value.map(|s| serde_json::from_str(&s).map_err(db_error)).transpose()
+        value
+            .map(|s| serde_json::from_str(&s).map_err(db_error))
+            .transpose()
     }
 }
 impl<T: DeserializeOwned> Iterator for SpoolIter<T> {
@@ -88,7 +109,7 @@ const MEMORY_BYTES: usize = 24 * 1024 * 1024;
 const GROUP_BYTES: usize = 32 * 1024 * 1024;
 /// All production analysis/page workers share this lane. Disk caches, working
 /// groups and transport buffers have separate bounded allocations within it.
-pub fn working_lane() -> crate::security_budget::Guard {
+pub fn working_lane() -> Result<crate::security_budget::Guard, String> {
     crate::security_budget::enter()
 }
 
@@ -99,17 +120,50 @@ pub struct Groups<T> {
 }
 impl<T> Default for Groups<T> {
     fn default() -> Self {
-        Self { memory: BTreeMap::new(), bytes: 0, disk: None }
+        Self {
+            memory: BTreeMap::new(),
+            bytes: 0,
+            disk: None,
+        }
     }
 }
 fn db_error(error: impl std::fmt::Display) -> String {
     format!("Armazenamento temporário da análise: {error}")
 }
 impl<T: Serialize + DeserializeOwned> Groups<T> {
+    /// Transfer individual records without materialising any hot key.
+    pub fn into_records(self) -> Result<Spool<(u32, String, T)>, String> {
+        let mut output = Spool::new()?;
+        if let Some(conn) = self.disk {
+            conn.execute_batch("COMMIT").map_err(db_error)?;
+            let mut stmt = conn
+                .prepare("SELECT rule,k,payload FROM hits ORDER BY rule,k,rowid")
+                .map_err(db_error)?;
+            let mut rows = stmt.query([]).map_err(db_error)?;
+            while let Some(row) = rows.next().map_err(db_error)? {
+                crate::operations::check()?;
+                let json: String = row.get(2).map_err(db_error)?;
+                output.push((
+                    row.get(0).map_err(db_error)?,
+                    row.get(1).map_err(db_error)?,
+                    serde_json::from_str(&json).map_err(db_error)?,
+                ))?;
+            }
+        } else {
+            for ((rule, key), values) in self.memory {
+                for value in values {
+                    output.push((rule, key.clone(), value))?;
+                }
+            }
+        }
+        Ok(output)
+    }
     pub fn push(&mut self, rule: u32, key: &str, value: T) -> Result<(), String> {
         crate::security_budget::check()?;
         let json = serde_json::to_string(&value).map_err(db_error)?;
-        if self.disk.is_none() && self.bytes.saturating_add(json.len() + key.len() + 128) > MEMORY_BYTES {
+        if self.disk.is_none()
+            && self.bytes.saturating_add(json.len() + key.len() + 128) > MEMORY_BYTES
+        {
             let conn = Connection::open("").map_err(db_error)?;
             conn.execute_batch("PRAGMA cache_size=-4096; PRAGMA temp_store=FILE; CREATE TABLE hits(rule INTEGER, k TEXT, payload TEXT); CREATE INDEX hits_group ON hits(rule,k); BEGIN;").map_err(db_error)?;
             for ((r, k), values) in std::mem::take(&mut self.memory) {
@@ -131,14 +185,21 @@ impl<T: Serialize + DeserializeOwned> Groups<T> {
                 .map_err(db_error)?;
         } else {
             self.bytes += json.len() + key.len() + 128;
-            self.memory.entry((rule, key.into())).or_default().push(value);
+            self.memory
+                .entry((rule, key.into()))
+                .or_default()
+                .push(value);
         }
         Ok(())
     }
     pub fn into_iter(self) -> Result<GroupIter<T>, String> {
         if let Some(conn) = self.disk {
             conn.execute_batch("COMMIT").map_err(db_error)?;
-            Ok(GroupIter::Disk { conn, last: None, marker: std::marker::PhantomData })
+            Ok(GroupIter::Disk {
+                conn,
+                last: None,
+                marker: std::marker::PhantomData,
+            })
         } else {
             Ok(GroupIter::Memory(self.memory.into_iter()))
         }
@@ -146,7 +207,11 @@ impl<T: Serialize + DeserializeOwned> Groups<T> {
 }
 pub enum GroupIter<T> {
     Memory(std::collections::btree_map::IntoIter<(u32, String), Vec<T>>),
-    Disk { conn: Connection, last: Option<(u32, String)>, marker: std::marker::PhantomData<T> },
+    Disk {
+        conn: Connection,
+        last: Option<(u32, String)>,
+        marker: std::marker::PhantomData<T>,
+    },
 }
 impl<T: DeserializeOwned> Iterator for GroupIter<T> {
     type Item = Result<((u32, String), Vec<T>), String>;
@@ -175,8 +240,12 @@ impl<T: DeserializeOwned> Iterator for GroupIter<T> {
                 };
                 *last = Some(key.clone());
                 let read = || -> Result<Vec<T>, String> {
-                    let mut stmt = conn.prepare("SELECT payload FROM hits WHERE rule=?1 AND k=?2").map_err(db_error)?;
-                    let rows = stmt.query_map(params![key.0, key.1], |r| r.get::<_, String>(0)).map_err(db_error)?;
+                    let mut stmt = conn
+                        .prepare("SELECT payload FROM hits WHERE rule=?1 AND k=?2")
+                        .map_err(db_error)?;
+                    let rows = stmt
+                        .query_map(params![key.0, key.1], |r| r.get::<_, String>(0))
+                        .map_err(db_error)?;
                     let mut values = Vec::new();
                     let mut bytes = 0;
                     for row in rows {
@@ -210,7 +279,8 @@ impl Seen {
             conn.execute_batch("PRAGMA cache_size=-1024; CREATE TABLE seen(k TEXT PRIMARY KEY) WITHOUT ROWID; BEGIN;")
                 .map_err(db_error)?;
             for k in self.memory.drain() {
-                conn.execute("INSERT INTO seen VALUES(?1)", [k]).map_err(db_error)?;
+                conn.execute("INSERT INTO seen VALUES(?1)", [k])
+                    .map_err(db_error)?;
             }
             self.disk = Some(conn);
             self.bytes = 0;
@@ -246,7 +316,11 @@ mod tests {
             groups.push(key.0, &key.1, value).unwrap();
         }
         assert!(groups.disk.is_some());
-        let actual: BTreeMap<_, _> = groups.into_iter().unwrap().collect::<Result<_, _>>().unwrap();
+        let actual: BTreeMap<_, _> = groups
+            .into_iter()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(actual, expected);
         let mut seen = Seen::default();
         for i in 0..70000 {
