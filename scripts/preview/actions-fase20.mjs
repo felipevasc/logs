@@ -38,9 +38,9 @@ export default async (page) => {
   await page.waitForTimeout(700);
   const tsOverlay = await page.evaluate(() => ({
     visible: !document.querySelector("#load-overlay").hidden,
-    phase: document.querySelector("#load-phase").textContent,
-    volume: document.querySelector("#load-volume").textContent,
-    eta: document.querySelector("#load-eta").textContent,
+    phase: document.querySelector("#load-title").textContent,
+    volume: document.querySelector("#load-amount").textContent,
+    eta: document.querySelector("#load-stats").textContent,
   }));
   console.log("overlay ts:", JSON.stringify(tsOverlay));
   await page.screenshot({ path: "output/f20-ts.png", clip: { x: 520, y: 280, width: 420, height: 360 } });

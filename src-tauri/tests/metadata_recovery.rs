@@ -330,7 +330,7 @@ fn raw_eof_checkpoint_survives_cancelled_column_discovery_and_restore() {
     let id = format!("restore-{}", uuid::Uuid::new_v4());
     assert!(
         probe(&path, "jsonl", &cache, &json!({"operationId":id}), &|p| {
-            if p["phaseId"] == "metadata-restore" || p["phaseId"] == "metadata-map-validate" {
+            if p["phaseId"] == "metadata-restore" || p["phaseId"] == "metadata-map-validate" || p["phaseId"] == "metadata-map-reuse" {
                 testkit::cancel_metadata_probe(&id);
             }
         })
@@ -505,12 +505,14 @@ fn metadata_process_worker() {
     let mode = std::env::var("LOGINSIGHT_METADATA_TEST_MODE").unwrap();
     let format = std::env::var("LOGINSIGHT_METADATA_TEST_FORMAT").unwrap_or_else(|_| "jsonl".into());
     let committed = Cell::new(false);
+    let phases = std::cell::RefCell::new(Vec::new());
     let result = probe(
         &root.join("source.jsonl"),
         &format,
         &root.join("cache"),
         &json!({}),
         &|p| {
+            phases.borrow_mut().push(p["phaseId"].clone());
             let gate = match mode.as_str() {
                 "before-data-write" => "metadata-checkpoint-write",
                 "before-data-sync" => "metadata-checkpoint-sync",
@@ -531,6 +533,7 @@ fn metadata_process_worker() {
             }
         },
     );
+    std::fs::write(root.join("phases.json"), serde_json::to_vec(&*phases.borrow()).unwrap()).unwrap();
     std::fs::write(
         root.join("result.json"),
         serde_json::to_vec(&result).unwrap(),
@@ -591,6 +594,8 @@ fn killed_process_resumes_without_reparsing_committed_rows_and_lock_protects_pru
             serde_json::from_slice(&std::fs::read(root.path().join("result.json")).unwrap())
                 .unwrap();
         assert_eq!(result.unwrap()["parsedRows"], 0);
+        let phases: Vec<Value> = serde_json::from_slice(&std::fs::read(root.path().join("phases.json")).unwrap()).unwrap();
+        assert_eq!(phases, [json!("metadata-map-reuse")], "a new process must reuse the validation, not scan the completed metadata");
     }
 }
 

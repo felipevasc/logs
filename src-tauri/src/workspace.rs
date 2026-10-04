@@ -398,11 +398,13 @@ pub fn overview_scope_impl(
         crate::operations::check()?;
         return Ok(result);
     }
-    if let Some(result) = with_engine(state, |src| crate::engine::overview(src, &query::prepare(&filters)))? {
-        return Ok(result);
-    }
-    with_selection(state, &filters, |selection| {
-        insights::overview(|| selection.iter())
+    crate::computed_cache::dataset(state, &filters, "overview-v1", || {
+        if let Some(result) = with_engine(state, |src| crate::engine::overview(src, &query::prepare(&filters)))? {
+            return Ok(result);
+        }
+        with_selection(state, &filters, |selection| {
+            insights::overview(|| selection.iter())
+        })
     })
 }
 #[tauri::command]
@@ -1452,13 +1454,18 @@ mod canonical {
     struct Memo {
         path: PathBuf,
         marker_stamp: Stamp,
+        marker_generation: Option<crate::cache_validation::Generation>,
         encoded_bytes: usize,
         manifest: Arc<Manifest>,
-        files: HashMap<String, Stamp>,
+        files: HashMap<String, crate::cache_validation::Generation>,
     }
     static MEMO: LazyLock<parking_lot::Mutex<VecDeque<Memo>>> = LazyLock::new(|| parking_lot::Mutex::new(VecDeque::new()));
+    #[cfg(test)]
+    thread_local! { static HASH_FILE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
     fn hash_file(path: &Path) -> Result<(Stamp, String), String> {
+        #[cfg(test)]
+        HASH_FILE_CALLS.with(|calls| calls.set(calls.get() + 1));
         if !regular(path) { return Err("Artefato convertido ausente ou não regular.".into()); }
         let mut file = File::open(path).map_err(|e| e.to_string())?;
         let before = Stamp::of(&file)?;
@@ -1492,10 +1499,14 @@ mod canonical {
         let file = File::open(&marker).map_err(|e| e.to_string())?;
         let stamp = Stamp::of(&file)?;
         if stamp.bytes > MAX_MARKER { return Ok(None); }
-        if let Some(hit) = MEMO.lock().iter().find(|entry| entry.path == dir && entry.marker_stamp == stamp) {
+        let marker_generation = crate::cache_validation::Generation::capture(&[marker.clone()]);
+        if marker_generation.as_ref().is_some_and(|g| !g.covers(&marker, &file) || !g.is_current()) { return Ok(None); }
+        if let Some(hit) = MEMO.lock().iter().find(|entry| entry.path == dir && entry.marker_stamp == stamp
+            && marker_generation.as_ref().is_some_and(|generation| entry.marker_generation.as_ref() == Some(generation))) {
             return Ok(Some(Arc::clone(&hit.manifest)));
         }
-        let Some(value) = checked_read::<Manifest>(std::io::BufReader::new(file)) else { return Ok(None) };
+        let Some(value) = checked_read::<Manifest>(std::io::BufReader::new(&file)) else { return Ok(None) };
+        if marker_generation.as_ref().is_some_and(|g| !g.covers(&marker, &file) || !g.is_current()) { return Ok(None); }
         let encoded = serde_json::to_vec(&(VERSION, &value.converter, &value.origin, &value.original)).map_err(|e| e.to_string())?;
         if value.key != format!("{:x}", Sha256::digest(encoded)) { return Ok(None); }
         if value.version != VERSION || dir.file_name().and_then(|n| n.to_str()) != Some(value.key.as_str())
@@ -1516,7 +1527,7 @@ mod canonical {
             while memo.iter().map(|entry| entry.encoded_bytes).sum::<usize>() + stamp.bytes as usize > MEMO_BYTES {
                 memo.pop_front();
             }
-            memo.push_back(Memo { path: dir.to_path_buf(), marker_stamp: stamp.clone(), encoded_bytes: stamp.bytes as usize, manifest: Arc::clone(&manifest), files: HashMap::new() });
+            memo.push_back(Memo { path: dir.to_path_buf(), marker_stamp: stamp.clone(), marker_generation, encoded_bytes: stamp.bytes as usize, manifest: Arc::clone(&manifest), files: HashMap::new() });
         }
         Ok(Some(manifest))
     }
@@ -1526,13 +1537,23 @@ mod canonical {
         let file = File::open(&path).map_err(|e| e.to_string())?;
         let stamp = Stamp::of(&file)?;
         if stamp.bytes != artifact.bytes { return Ok(false); }
-        if MEMO.lock().iter().find(|entry| entry.path == dir).and_then(|entry| entry.files.get(&artifact.path)) == Some(&stamp) {
+        let generation = crate::cache_validation::Generation::capture(&[path.clone(), dir.join(MARKER)]);
+        let context = format!("canonical-artifact-v1|{}|{}", artifact.logical_identity, artifact.sha256);
+        if generation.as_ref().is_some_and(|g| g.covers(&path, &file)
+            && (MEMO.lock().iter().find(|entry| entry.path == dir).and_then(|entry| entry.files.get(&artifact.path)) == Some(g) || g.verified(&path, &context)) && g.is_current()) {
+            if let Some(entry) = MEMO.lock().iter_mut().find(|entry| entry.path == dir) {
+                entry.files.insert(artifact.path.clone(), generation.unwrap());
+            }
             return Ok(true);
         }
         let (actual, sha256) = hash_file(&path)?;
         if actual.bytes != artifact.bytes || sha256 != artifact.sha256 { return Ok(false); }
-        if let Some(entry) = MEMO.lock().iter_mut().find(|entry| entry.path == dir) {
-            entry.files.insert(artifact.path.clone(), actual);
+        if let Some(generation) = &generation {
+            if !generation.is_current() { return Ok(false); }
+            generation.remember(&path, &context);
+        }
+        if let (Some(entry), Some(generation)) = (MEMO.lock().iter_mut().find(|entry| entry.path == dir), generation) {
+            entry.files.insert(artifact.path.clone(), generation);
         }
         Ok(true)
     }
@@ -1825,6 +1846,11 @@ mod canonical {
             let target = convert(&path, None, &calls).unwrap();
             assert_eq!(convert(&path, None, &calls).unwrap(), target);
             assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(crate::cache_validation::receipt_path(&target).exists());
+            MEMO.lock().clear(); // a fresh process has no conversion memo
+            HASH_FILE_CALLS.with(|calls| calls.set(0));
+            assert_eq!(convert(&path, None, &calls).unwrap(), target);
+            assert_eq!(HASH_FILE_CALLS.with(|calls| calls.get()), 0, "unchanged conversions must reopen without hashing their payload");
             std::fs::write(&target, b"bad\nbad\n").unwrap();
             assert_eq!(convert(&path, None, &calls).unwrap(), target);
             assert_eq!(std::fs::read(&target).unwrap(), b"one\ntwo\n");

@@ -17,6 +17,8 @@ const MAGIC: &[u8; 8] = b"LITIME01";
 const LEVELS: usize = 7;
 const HEADER: usize = 8 + 32 + 8 + LEVELS * 16;
 const CHECKSUM: usize = 32;
+#[cfg(test)]
+thread_local! { static FULL_VERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -116,6 +118,7 @@ struct Data {
     file: File,
     mmap: Mmap,
     modified: Option<std::time::SystemTime>,
+    generation: Option<crate::cache_validation::Generation>,
     totals: [u64; LEVELS],
     offsets: [usize; LEVELS + 1],
     fences: Option<RankFences>,
@@ -199,6 +202,8 @@ fn load(
         Err(e) => return Err(e.to_string()),
     };
     let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let sidecar = path(store);
+    let generation = crate::cache_validation::Generation::capture(&[sidecar.clone(), store.with_extension("complete.json")]);
     let maximum = identity
         .rows
         .checked_mul(8)
@@ -217,14 +222,20 @@ fn load(
         return Err("Identidade ou versão do resumo temporal inválida.".into());
     }
     let end = mmap.len() - CHECKSUM;
-    let mut hash = Sha256::new();
-    for bytes in mmap[..end].chunks(64 << 10) {
-        check(cancelled)?;
-        hash.update(bytes);
-    }
-    let digest: [u8; CHECKSUM] = hash.finalize().into();
-    if mmap[end..] != digest {
-        return Err("Checksum do resumo temporal inválido.".into());
+    let context = format!("temporal-validation-v1|{:x}", Sha256::digest(&mmap[..HEADER]));
+    let reused = generation.as_ref().is_some_and(|g| g.covers(&sidecar, &file) && g.verified(&sidecar, &context));
+    if !reused {
+        #[cfg(test)]
+        FULL_VERIFICATIONS.with(|count| count.set(count.get() + 1));
+        let mut hash = Sha256::new();
+        for bytes in mmap[..end].chunks(64 << 10) {
+            check(cancelled)?;
+            hash.update(bytes);
+        }
+        let digest: [u8; CHECKSUM] = hash.finalize().into();
+        if mmap[end..] != digest {
+            return Err("Checksum do resumo temporal inválido.".into());
+        }
     }
     let mut totals = [0u64; LEVELS];
     let mut offsets = [HEADER; LEVELS + 1];
@@ -255,6 +266,19 @@ fn load(
     let lengths = std::array::from_fn(|level| (offsets[level + 1] - offsets[level]) / 8);
     let mut fences = RankFences::prepare(lengths, RANK_FENCE_BYTES);
     for level in 0..LEVELS {
+        if reused {
+            // The complete ordering proof is durable. Recreate only bounded
+            // rank fences, reading one maximum per block instead of every row.
+            if let Some(fences) = fences.as_mut() {
+                for block in 0..lengths[level].div_ceil(fences.stride) {
+                    check(cancelled)?;
+                    let row = ((block + 1) * fences.stride).min(lengths[level]) - 1;
+                    let at = offsets[level] + row * 8;
+                    fences.maxima.push(i64::from_le_bytes(mmap[at..at + 8].try_into().unwrap()));
+                }
+            }
+            continue;
+        }
         let mut previous = None;
         for (row, bytes) in mmap[offsets[level]..offsets[level + 1]]
             .chunks_exact(8)
@@ -287,11 +311,16 @@ fn load(
     if current.len() != metadata.len() || current.modified().ok() != metadata.modified().ok() {
         return Err("Resumo temporal mudou durante a validação.".into());
     }
+    if let Some(generation) = &generation {
+        if !generation.is_current() || !generation.covers(&sidecar, &file) { return Err("Resumo temporal mudou durante a validação.".into()); }
+        if !reused { generation.remember(&sidecar, &context); }
+    }
     let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
     Ok(Some(Data {
         file,
         mmap,
         modified: metadata.modified().ok(),
+        generation,
         totals,
         offsets,
         fences,
@@ -363,7 +392,10 @@ pub(crate) fn remove_under_build_lock(store: &Path) -> Result<()> {
         .map_err(|e| e.to_string())?;
     FileExt::try_lock_exclusive(&lease).map_err(|e| format!("Resumo temporal em uso: {e}"))?;
     match std::fs::remove_file(path(store)) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let _ = std::fs::remove_file(crate::cache_validation::receipt_path(&path(store)));
+            Ok(())
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.to_string()),
     }
@@ -596,6 +628,7 @@ impl Data {
         self.file
             .metadata()
             .is_ok_and(|m| m.len() == self.mmap.len() as u64 && m.modified().ok() == self.modified)
+            && self.generation.as_ref().is_none_or(|generation| generation.is_current())
     }
     fn len(&self, level: usize) -> usize {
         (self.offsets[level + 1] - self.offsets[level]) / 8
@@ -947,6 +980,23 @@ mod tests {
             serde_json::to_value(stats(&indexes, &request).unwrap().unwrap()).unwrap(),
             serde_json::to_value(expected.1).unwrap()
         );
+    }
+
+    #[test]
+    fn saved_temporal_validation_recreates_identical_rank_fences_without_full_scan() {
+        let rows = (0..2400).map(|row| ((row % 7) as u8, Some(100 + row as i64 / 4))).collect::<Vec<_>>();
+        let (_directory, connection, store, identity) = fixture(&rows);
+        ensure(&connection, &store, &identity, &|| false).unwrap();
+        let _ = std::fs::remove_file(crate::cache_validation::receipt_path(&path(&store)));
+        let cold = open(&store, &identity).unwrap().unwrap();
+        let expected = cold.data.fences.as_ref().map(|fences| fences.maxima.clone());
+        drop(cold);
+        FULL_VERIFICATIONS.with(|count| count.set(0));
+        let warm = open(&store, &identity).unwrap().unwrap();
+        assert_eq!(FULL_VERIFICATIONS.with(|count| count.get()), 0);
+        assert_eq!(warm.data.fences.as_ref().map(|fences| fences.maxima.clone()), expected);
+        let request = predicate(&[]).unwrap();
+        assert_eq!(count(&[warm], &request).unwrap(), Some(rows.len()));
     }
 
     #[test]

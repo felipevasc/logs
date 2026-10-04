@@ -67,7 +67,7 @@ fn split_num_unit(s: &str) -> (&str, &str) {
 
 // ------------------------------------------------------------------ perfil
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct FieldProfile {
     name: String,
     pub sampled_events: usize,

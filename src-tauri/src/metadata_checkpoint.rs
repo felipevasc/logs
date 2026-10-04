@@ -240,6 +240,7 @@ pub(crate) fn open_complete(
     if FileExt::try_lock_shared(&lock).is_err() { return Ok(None); }
     let path = dir.join(format!("{key}.lines"));
     let state_path = dir.join(format!("{key}.state"));
+    let receipt_generation = crate::cache_validation::Generation::capture(&[path.clone(), state_path.clone()]);
     let Some((state, file)) = read_state(&path, &state_path, key, source_bytes, initial_cursor, multiline) else { return Ok(None); };
     if !state.scan_complete || state.columns.is_none() { return Ok(None); }
     let payload_bytes = usize::try_from(state.payload_bytes).map_err(|_| "Metadados excedem o espaço de endereçamento.")?;
@@ -249,23 +250,27 @@ pub(crate) fn open_complete(
     // The map covers only the manifest's committed prefix, never transient tail.
     let Ok(mapped) = (unsafe { memmap2::MmapOptions::new().len(payload_bytes).map(&file) }) else { return Ok(None); };
     if &mapped[..8] != MAGIC || &mapped[8..HEADER_BYTES] != key.as_bytes() { return Ok(None); }
-    let mut hash = Sha256::new(); hash.update(&mapped[..HEADER_BYTES]);
-    let mut previous_end = None; let mut completed = 0; let mut last_report = Instant::now();
-    report(reporter, Progress::new("metadata-map-validate", "Verificando metadados mapeados", 0, state.sealed_rows, "registros"));
-    for chunk in mapped[HEADER_BYTES..].chunks(BLOCK_ROWS * RECORD_BYTES) {
-        crate::operations::check()?; hash.update(chunk);
-        for bytes in chunk.chunks_exact(RECORD_BYTES) {
-            let Some(meta) = decode_record(bytes) else { return Ok(None); };
-            if !valid_record(&meta, state.cursor, previous_end) { return Ok(None); }
-            previous_end = meta.offset.checked_add(u64::from(meta.len));
-            completed += 1;
+    let context = format!("metadata-map-v1|{}", state_digest(&state)?);
+    let reused = receipt_generation.as_ref().is_some_and(|g| g.covers(&path, &file) && g.verified(&path, &context));
+    if !reused {
+        let mut hash = Sha256::new(); hash.update(&mapped[..HEADER_BYTES]);
+        let mut previous_end = None; let mut completed = 0; let mut last_report = Instant::now();
+        report(reporter, Progress::new("metadata-map-validate", "Verificando metadados mapeados", 0, state.sealed_rows, "registros"));
+        for chunk in mapped[HEADER_BYTES..].chunks(BLOCK_ROWS * RECORD_BYTES) {
+            crate::operations::check()?; hash.update(chunk);
+            for bytes in chunk.chunks_exact(RECORD_BYTES) {
+                let Some(meta) = decode_record(bytes) else { return Ok(None); };
+                if !valid_record(&meta, state.cursor, previous_end) { return Ok(None); }
+                previous_end = meta.offset.checked_add(u64::from(meta.len));
+                completed += 1;
+            }
+            if last_report.elapsed() >= Duration::from_millis(150) {
+                report(reporter, Progress::new("metadata-map-validate", "Verificando metadados mapeados", completed, state.sealed_rows, "registros"));
+                last_report = Instant::now();
+            }
         }
-        if last_report.elapsed() >= Duration::from_millis(150) {
-            report(reporter, Progress::new("metadata-map-validate", "Verificando metadados mapeados", completed, state.sealed_rows, "registros"));
-            last_report = Instant::now();
-        }
+        if completed != state.sealed_rows || format!("{:x}", hash.finalize()) != state.payload_sha256 { return Ok(None); }
     }
-    if completed != state.sealed_rows || format!("{:x}", hash.finalize()) != state.payload_sha256 { return Ok(None); }
     crate::operations::check()?;
     // Verification touches every page. Drop that view, then remap the SAME
     // opened file under the SAME retained shared lease, so later queries fault
@@ -276,13 +281,24 @@ pub(crate) fn open_complete(
     if current.len() != generation.len() || current.modified().ok() != generation.modified().ok() {
         return Err("Metadados mudaram durante a validação.".into());
     }
+    if let Some(generation) = &receipt_generation {
+        if !generation.is_current() || !generation.covers(&path, &file) {
+            return Err("Metadados mudaram durante a validação.".into());
+        }
+        if !reused { generation.remember(&path, &context); }
+    }
     // SAFETY: the file descriptor and shared writer/pruner lease were retained
     // without interruption; no references into the old mapping survive.
     let mapped = unsafe { memmap2::MmapOptions::new().len(payload_bytes).map(&file) }
         .map_err(|e| format!("Não foi possível remapear metadados verificados: {e}"))?;
     crate::operations::check()?;
     let lines = crate::metadata_store::LineStore::from_validated_journal(mapped, std::sync::Arc::new(lock), HEADER_BYTES, state.sealed_rows)?;
-    let mut done = Progress::new("metadata-map-validate", "Metadados mapeados verificados", completed, completed, "registros");
+    let completed = state.sealed_rows;
+    let mut done = if reused {
+        Progress::new("metadata-map-reuse", "Reutilizando metadados salvos", completed, completed, "registros")
+    } else {
+        Progress::new("metadata-map-validate", "Metadados mapeados verificados", completed, completed, "registros")
+    };
     done.resumed_rows = completed; done.checkpoint_rows = completed; report(reporter, done);
     Ok(Some((lines, state.columns.unwrap())))
 }
@@ -934,7 +950,9 @@ mod tests {
         journal.checkpoint(&[LineMeta { offset: 0, len: 11, ts: 123, ..Default::default() }, LineMeta { offset: 12, len: 10, ts: -7, ..Default::default() }], 300, true, Some(&["field".into()]), None, &|| Ok(())).unwrap();
         drop(journal);
         let (first, columns) = open_complete(dir.path(), &key, 300, 0, false, None).unwrap().unwrap();
-        let (second, _) = open_complete(dir.path(), &key, 300, 0, false, None).unwrap().unwrap();
+        let phases = std::cell::RefCell::new(Vec::new());
+        let (second, _) = open_complete(dir.path(), &key, 300, 0, false, Some(&|progress| phases.borrow_mut().push(progress.phase_id))).unwrap().unwrap();
+        assert_eq!(*phases.borrow(), ["metadata-map-reuse"], "completed metadata must reopen without a per-row validation pass");
         assert_eq!(first.resident_rows(), 0); assert_eq!(first.at(1).ts, -7); assert_eq!(columns, ["field"]);
         let mut mapped_rows = Vec::new();
         for row in first.iter() { encode_record(&row, &mut mapped_rows); }

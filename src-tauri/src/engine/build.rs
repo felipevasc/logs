@@ -13,6 +13,7 @@ use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -74,6 +75,8 @@ fn manifest_path(path: &Path) -> PathBuf {
     path.with_extension("complete.json")
 }
 fn digest(path: &Path) -> Result<String, String> {
+    #[cfg(test)]
+    DIGEST_CALLS.with(|calls| calls.set(calls.get() + 1));
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut input = std::io::BufReader::with_capacity(
@@ -92,6 +95,8 @@ fn digest(path: &Path) -> Result<String, String> {
     }
     Ok(format!("{:x}", hash.finalize()))
 }
+#[cfg(test)]
+thread_local! { static DIGEST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 fn artifacts(path: &Path) -> Result<Vec<Artifact>, String> {
     let mut out = vec![Artifact {
         name: "database".into(),
@@ -120,9 +125,9 @@ fn artifacts(path: &Path) -> Result<Vec<Artifact>, String> {
     }
     Ok(out)
 }
-// Each immutable checkpoint is checksum-verified once per process. Replacing or
-// truncating any artifact invalidates this memo through the metadata signature.
-type Stamp = Vec<(String, u64, Option<std::time::SystemTime>)>;
+// Keep the in-process memo and its durable counterpart bound to native file
+// generations, including change time (a restored mtime is not sufficient).
+type Stamp = crate::cache_validation::Generation;
 static VERIFIED: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<PathBuf, Stamp>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -153,11 +158,7 @@ pub(crate) fn published_matches(
         return false;
     }
     let text = super::text::dir_of(path);
-    let mut stamp = Vec::with_capacity(manifest.artifacts.len() + 1);
-    let Ok(meta) = std::fs::metadata(manifest_path(path)) else {
-        return false;
-    };
-    stamp.push(("manifest".into(), meta.len(), meta.modified().ok()));
+    let mut paths = vec![manifest_path(path)];
     for artifact in &manifest.artifacts {
         if artifact.name != "database"
             && (artifact.name.contains(['/', '\\']) || artifact.name == "..")
@@ -169,15 +170,17 @@ pub(crate) fn published_matches(
         } else {
             text.join(&artifact.name)
         };
-        let Ok(meta) = std::fs::metadata(file) else {
+        let Ok(meta) = std::fs::metadata(&file) else {
             return false;
         };
         if meta.len() != artifact.bytes {
             return false;
         }
-        stamp.push((artifact.name.clone(), meta.len(), meta.modified().ok()));
+        paths.push(file);
     }
-    if VERIFIED.lock().get(path).is_some_and(|old| old == &stamp) {
+    let stamp = crate::cache_validation::Generation::capture(&paths);
+    let context = format!("engine-checkpoint-v1|{:x}", Sha256::digest(&bytes));
+    if stamp.as_ref().is_some_and(|stamp| (VERIFIED.lock().get(path) == Some(stamp) || stamp.verified(path, &context)) && stamp.is_current()) {
         return true;
     }
     let Ok(actual) = artifacts(path) else {
@@ -186,7 +189,12 @@ pub(crate) fn published_matches(
     if actual != manifest.artifacts {
         return false;
     }
-    let Ok(conn) = Connection::open(path) else {
+    // Validation must never open a completed store for writing. On Windows a
+    // read/write DuckDB handle changes the native file generation itself.
+    let Ok(config) = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly) else {
+        return false;
+    };
+    let Ok(conn) = Connection::open_with_flags(path, config) else {
         return false;
     };
     if super::limit_resources(&conn, true).is_err() { return false; }
@@ -211,7 +219,11 @@ pub(crate) fn published_matches(
     if reader.searcher().num_docs() != rows as u64 {
         return false;
     }
-    VERIFIED.lock().insert(path.to_path_buf(), stamp);
+    if let Some(stamp) = stamp {
+        if !stamp.is_current() { return false; }
+        stamp.remember(path, &context);
+        VERIFIED.lock().insert(path.to_path_buf(), stamp);
+    }
     true
 }
 
@@ -699,6 +711,7 @@ pub(crate) fn remove_database(path: &Path) -> bool {
         eprintln!("[motor] limpeza adiada: {error}"); return false;
     }
     VERIFIED.lock().remove(path);
+    let _ = std::fs::remove_file(crate::cache_validation::receipt_path(path));
     let _ = std::fs::remove_file(path.with_extension("used"));
     let _ = std::fs::remove_file(manifest_path(path));
     let _ = std::fs::remove_file(path);
@@ -927,6 +940,15 @@ mod checkpoint_tests {
         )
         .unwrap();
         assert!(valid(&idx, &target, 0..12));
+        assert!(crate::cache_validation::receipt_path(&target).exists());
+        VERIFIED.lock().remove(&target); // simulate a fresh application's empty memo
+        DIGEST_CALLS.with(|calls| calls.set(0));
+        assert!(valid(&idx, &target, 0..12));
+        assert_eq!(DIGEST_CALLS.with(|calls| calls.get()), 0, "reopening must not hash any saved database or text payload");
+        std::fs::remove_file(crate::cache_validation::receipt_path(&target)).unwrap();
+        VERIFIED.lock().remove(&target);
+        assert!(valid(&idx, &target, 0..12));
+        assert!(DIGEST_CALLS.with(|calls| calls.get()) > 0, "old caches without receipts still require full validation once");
         let calls = AtomicUsize::new(0);
         build(
             source(&idx, 0..12),
@@ -1093,6 +1115,8 @@ mod checkpoint_tests {
             &|| false,
         )
         .unwrap();
+        assert!(valid(&idx, &target, 0..24)); // establish the durable receipt
+        let original_modified = std::fs::metadata(&target).unwrap().modified().unwrap();
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1105,6 +1129,8 @@ mod checkpoint_tests {
         file.write_all(&byte).unwrap();
         file.sync_all().unwrap();
         drop(file);
+        // The native change stamp also protects against timestamp restoration.
+        std::fs::File::options().write(true).open(&target).unwrap().set_modified(original_modified).unwrap();
         VERIFIED.lock().remove(&target); // simulate reopening in a fresh process
         assert!(!valid(&idx, &target, 0..24));
     }

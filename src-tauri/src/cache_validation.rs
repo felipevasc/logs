@@ -1,0 +1,225 @@
+//! Durable receipts for fully verified immutable cache generations. A receipt
+//! replaces payload scans only while EVERY file has the same native identity,
+//! size, write time and change time. Unsupported filesystems fail closed.
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Stamp {
+    bytes: u64,
+    modified: std::time::SystemTime,
+    native: Vec<i128>,
+}
+impl Stamp {
+    fn of(file: &File) -> Option<Self> {
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some(Self {
+            bytes: metadata.len(),
+            modified: metadata.modified().ok()?,
+            native: native_stamp(file)?,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn native_stamp(file: &File) -> Option<Vec<i128>> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata().ok()?;
+    Some(vec![
+        m.dev().into(),
+        m.ino().into(),
+        m.ctime().into(),
+        m.ctime_nsec().into(),
+    ])
+}
+#[cfg(windows)]
+fn native_stamp(file: &File) -> Option<Vec<i128>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO, FILE_ID_INFO,
+    };
+    let mut basic = FILE_BASIC_INFO::default();
+    let mut id = FILE_ID_INFO::default();
+    // SAFETY: both buffers have exactly the size/type required by their class,
+    // and the borrowed handle remains open for both calls.
+    unsafe {
+        let handle = HANDLE(file.as_raw_handle());
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+        .ok()?;
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&mut id as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+        .ok()?;
+    }
+    Some(vec![
+        id.VolumeSerialNumber.into(),
+        i128::from_le_bytes(id.FileId.Identifier),
+        basic.CreationTime.into(),
+        basic.LastWriteTime.into(),
+        basic.ChangeTime.into(),
+    ])
+}
+#[cfg(not(any(unix, windows)))]
+fn native_stamp(_: &File) -> Option<Vec<i128>> {
+    None
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Generation(Vec<(PathBuf, Stamp)>);
+#[derive(Serialize, Deserialize)]
+struct Receipt {
+    version: u32,
+    context: String,
+    generation: Generation,
+    checksum: String,
+}
+pub(crate) fn receipt_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".verified.json");
+    PathBuf::from(name)
+}
+impl Generation {
+    pub(crate) fn capture(paths: &[PathBuf]) -> Option<Self> {
+        let files = paths
+            .iter()
+            .map(|path| {
+                // Never block opening a pipe or follow a substituted symlink.
+                if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+                    return None;
+                }
+                let file = File::open(path).ok()?;
+                Some((path.clone(), Stamp::of(&file)?))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!files.is_empty()).then_some(Self(files))
+    }
+    pub(crate) fn is_current(&self) -> bool {
+        Self::capture(
+            &self
+                .0
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+        )
+        .as_ref()
+            == Some(self)
+    }
+    pub(crate) fn covers(&self, path: &Path, file: &File) -> bool {
+        self.0
+            .iter()
+            .find(|(name, _)| name == path)
+            .is_some_and(|(_, stamp)| Stamp::of(file).as_ref() == Some(stamp))
+    }
+    fn checksum(&self, context: &str) -> Option<String> {
+        let bytes = serde_json::to_vec(&(1u32, context, self)).ok()?;
+        Some(format!("{:x}", Sha256::digest(bytes)))
+    }
+    pub(crate) fn verified(&self, path: &Path, context: &str) -> bool {
+        let Ok(file) = File::open(receipt_path(path)) else {
+            return false;
+        };
+        if !file.metadata().is_ok_and(|m| m.len() <= 4_000_000) {
+            return false;
+        }
+        // Receipts are small; damaged or oversized JSON cannot allocate freely.
+        let Ok(receipt) = serde_json::from_reader::<_, Receipt>(file.take(4_000_001)) else {
+            return false;
+        };
+        receipt.version == 1
+            && receipt.context == context
+            && receipt.generation == *self
+            && self.checksum(context).as_deref() == Some(receipt.checksum.as_str())
+    }
+    /// Call only AFTER full validation and while publication leases are held.
+    /// A persistence failure merely means the next opening verifies again.
+    pub(crate) fn remember(&self, path: &Path, context: &str) {
+        let result = (|| -> Option<()> {
+            if !self.is_current() {
+                return None;
+            }
+            let receipt = Receipt {
+                version: 1,
+                context: context.into(),
+                generation: self.clone(),
+                checksum: self.checksum(context)?,
+            };
+            let target = receipt_path(path);
+            let mut temp = tempfile::NamedTempFile::new_in(target.parent()?).ok()?;
+            temp.write_all(&serde_json::to_vec(&receipt).ok()?).ok()?;
+            temp.as_file().sync_all().ok()?;
+            if !self.is_current() {
+                return None;
+            }
+            temp.persist(target).ok()?;
+            Some(())
+        })();
+        let _ = result;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn durable_receipt_survives_fresh_capture_and_rejects_context_and_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload");
+        let marker = dir.path().join("complete");
+        std::fs::write(&path, b"payload").unwrap();
+        std::fs::write(&marker, b"complete").unwrap();
+        let paths = [path.clone(), marker.clone()];
+        Generation::capture(&paths)
+            .unwrap()
+            .remember(&path, "schema-1");
+        let fresh = Generation::capture(&paths).unwrap();
+        assert!(fresh.verified(&path, "schema-1"));
+        assert!(!fresh.verified(&path, "schema-2"));
+        std::fs::write(receipt_path(&path), b"broken").unwrap();
+        assert!(!fresh.verified(&path, "schema-1"));
+        std::fs::remove_file(&marker).unwrap();
+        assert!(Generation::capture(&paths).is_none());
+    }
+    #[test]
+    fn same_size_edits_and_replacements_cannot_reuse_verification_even_with_restored_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload");
+        std::fs::write(&path, b"original").unwrap();
+        let paths = [path.clone()];
+        let before = Generation::capture(&paths).unwrap();
+        before.remember(&path, "schema-1");
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"modified").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(!before.is_current());
+        assert!(!Generation::capture(&paths)
+            .unwrap()
+            .verified(&path, "schema-1"));
+        let replacement = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        std::fs::write(replacement.path(), b"original").unwrap();
+        replacement.as_file().set_modified(modified).unwrap();
+        replacement.persist(&path).unwrap();
+        assert!(!Generation::capture(&paths)
+            .unwrap()
+            .verified(&path, "schema-1"));
+    }
+}

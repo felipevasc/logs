@@ -136,18 +136,23 @@
   <div id="load-overlay" class="load-overlay" hidden>
     <div class="load-stage semantic-load-stage">
       <div id="load-visual"></div>
-      <div class="load-progress">
-        <div class="load-bar"><div id="load-bar-fill"></div></div>
-        <div id="load-volume" class="load-volume"></div>
-        <div id="load-eta" class="load-eta"></div>
-      </div>
+      <section class="load-summary" aria-label="Andamento do carregamento">
+        <h2 id="load-title" class="load-title">Preparando…</h2>
+        <p id="load-note" class="load-note" hidden></p>
+        <div id="load-figures" class="load-figures" hidden>
+          <span class="load-figures-amount"><strong id="load-amount"></strong> <span id="load-of"></span></span>
+          <span id="load-percent" class="load-percent"></span>
+        </div>
+        <div class="load-bar" hidden><div id="load-bar-fill"></div></div>
+        <p id="load-error" class="load-error" role="alert" hidden></p>
+        <dl id="load-stats" class="load-stats"></dl>
+      </section>
       <div class="load-operation-controls">
         <button id="load-cancel" class="btn ghost small" type="button" aria-describedby="load-cancel-help" disabled>Cancelar operação</button>
         <p id="load-cancel-help">Cancelamento indisponível nesta etapa.</p>
       </div>
       <details id="load-progress-details" class="load-progress-details">
-      <summary>Etapas do processamento</summary>
-      <div id="load-phase" class="load-phase">Preparando…</div>
+      <summary>Etapas <span id="load-steps-count"></span></summary>
       <ol id="load-steps" class="load-steps"></ol>
       </details>
     </div>
@@ -1055,6 +1060,7 @@
   <script src="java-trace.js"></script>
   <script src="performance-core.js"></script>
   <script src="date-values.js"></script>
+  <script src="load-progress.js"></script>
   <script src="waiting-visuals.js"></script>
   <script src="waiting-progress.js"></script>
   <script src="case-evidence.js"></script>

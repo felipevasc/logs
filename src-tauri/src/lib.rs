@@ -72,6 +72,8 @@ mod event_preview;
 mod field_transform;
 mod grouped_timeline;
 mod index_cache;
+mod cache_validation;
+mod computed_cache;
 mod metadata_checkpoint;
 mod metadata_store;
 mod insights;
@@ -1927,9 +1929,14 @@ pub(crate) fn profile_fields_impl(
     filters: Vec<query::Filter>,
     case_events: Option<Vec<Event>>,
 ) -> Result<Vec<analysis::FieldProfile>, String> {
-    let evs = work_events(state, filters, case_events)?;
-    let columns = work_columns(&evs);
-    Ok(analysis::profile_fields(&evs, &columns))
+    let inline = case_events.is_some();
+    let compute = || {
+        let evs = work_events(state, filters.clone(), case_events)?;
+        let columns = work_columns(&evs);
+        Ok(analysis::profile_fields(&evs, &columns))
+    };
+    if inline { compute() }
+    else { computed_cache::dataset(state, &filters, "field-profiles-v1", compute) }
 }
 
 #[tauri::command]

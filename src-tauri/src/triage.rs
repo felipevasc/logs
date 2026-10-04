@@ -136,29 +136,18 @@ fn saved_path(
     expired: &[bool],
 ) -> Option<std::path::PathBuf> {
     use sha2::{Digest, Sha256};
-    let source = source_key(state);
-    if !source.starts_with("idx:") {
-        return None;
-    }
-    let derived: Vec<String> = crate::analysis_runtime::derived(&state)
-        .iter()
-        .map(|d| {
-            let rules: Vec<String> = d
-                .rules
-                .iter()
-                .map(|r| format!("{}|{:?}|{}", r.re.as_str(), r.template, serde_json::to_string(&r.filter).unwrap_or_default()))
-                .collect();
-            format!("{}|{}|{rules:?}", d.name, d.source)
-        })
-        .collect();
+    // Session publication counters are deliberately absent here. Persistent
+    // ownership, visibility and actual interpretation survive an app restart;
+    // an identical source opened after another file must use the same result.
+    let interpretation = crate::computed_cache::source_signature(state)?;
     let mut hash = Sha256::new();
+    hash.update(b"triage-persistence-v2");
     hash.update(env!("CARGO_PKG_VERSION"));
-    hash.update(crate::analysis_runtime::cache_namespace());
-    hash.update(source);
+    hash.update(interpretation);
     hash.update(detections::fingerprint());
     hash.update(serde_json::to_string(settings).unwrap_or_default());
     hash.update(catalog.map(|c| c.signature()).unwrap_or_default());
-    hash.update(format!("{derived:?}{expired:?}"));
+    hash.update(format!("{expired:?}"));
     Some(crate::config_dir().join("triage-v1").join(format!("{:x}.sqlite", hash.finalize())))
 }
 
@@ -995,6 +984,61 @@ pub async fn sigma_clear(
 #[cfg(test)]
 mod on_demand_tests {
     use super::*;
+
+    #[test]
+    fn saved_analysis_reopens_after_source_generation_changes_and_invalidates_changed_context() {
+        use parking_lot::{Mutex, RwLock};
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                detections::clear_cache();
+                match &self.0 {
+                    Some(value) => std::env::set_var("LOGINSIGHT_DATA_DIR", value),
+                    None => std::env::remove_var("LOGINSIGHT_DATA_DIR"),
+                }
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _restore = Restore(std::env::var_os("LOGINSIGHT_DATA_DIR"));
+        std::env::set_var("LOGINSIGHT_DATA_DIR", root.path());
+        crate::case_store::save(serde_json::json!({"cases":[{"id":"reopen"}]})).unwrap();
+        let path = root.path().join("source.jsonl");
+        std::fs::write(&path, "{\"message\":\"persisted event\",\"timestamp\":\"2026-10-04T12:00:00Z\"}\n").unwrap();
+        let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
+        let state = AppState {
+            source: RwLock::new(SourceData::None), source_publication: RwLock::new(Default::default()),
+            source_names: RwLock::new(vec![path.to_string_lossy().into_owned()]), codes: RwLock::new(Default::default()),
+            system_codes: RwLock::new(Default::default()), derived: RwLock::new(vec![]),
+            case_store_lock: Mutex::new(()), codes_path: Default::default(), system_codes_path: Default::default(),
+        };
+        let identity = crate::analysis_context::snapshot("reopen").unwrap().identity();
+        let publisher = crate::analysis_runtime::capture(&state, Some(identity.clone()), None, crate::analysis_runtime::Mode::Publish).unwrap();
+        crate::analysis_runtime::with(Some(publisher), || crate::source_publication::publish(&state, index, vec![path.to_string_lossy().into_owned()], vec![], false)).unwrap();
+        let mut admitted = crate::analysis_runtime::capture(&state, Some(identity), None, crate::analysis_runtime::Mode::Dataset).unwrap();
+        let settings = Settings::default();
+        let first_key = crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, &settings, None, &[])).unwrap();
+        // Use a tiny completed fixture result. The cache-only production path
+        // must load this exact disk result without invoking any analysis.
+        let event = Event::empty();
+        let rules = detections::test_ruleset(vec![], vec![]).unwrap();
+        let fixture_settings = Settings { threats: false, investigation: crate::investigation::Settings { enabled: false, ..Default::default() }, ..Default::default() };
+        let result = detections::run_stored(&detections::Inputs { rules: &rules, catalog: None, settings: &fixture_settings }, &Source::Events(vec![&event])).unwrap();
+        let catalog = crate::analysis_runtime::with(Some(admitted.clone()), || crate::threats::load_active()).unwrap();
+        let disk = crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, &settings, Some(&catalog), &[])).unwrap();
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        result.save(&disk).unwrap();
+        detections::clear_cache();
+        Arc::get_mut(&mut admitted).unwrap().source_generation = Some(73);
+        assert_eq!(crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, &settings, None, &[])).unwrap(), first_key);
+        let restored = crate::analysis_runtime::with(Some(admitted.clone()), || stored_analysis_mode(&state, None, false, true)).unwrap();
+        assert_eq!(restored.metadata["analysis_id"], result.metadata["analysis_id"]);
+        drop(restored);
+        Arc::get_mut(&mut admitted).unwrap().identity.as_mut().unwrap().visibility_revision += 1;
+        assert_ne!(crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, &settings, None, &[])).unwrap(), first_key);
+        assert!(crate::analysis_runtime::with(Some(admitted.clone()), || stored_analysis_mode(&state, None, false, true)).err().unwrap().starts_with("TRIAGE_NOT_CALCULATED:"));
+        Arc::get_mut(&mut admitted).unwrap().identity.as_mut().unwrap().config_revision += 1;
+        assert_ne!(crate::analysis_runtime::with(Some(admitted.clone()), || saved_path(&state, &settings, None, &[])).unwrap(), first_key);
+    }
 
     #[test]
     fn cancelled_triage_does_not_wait_for_another_analysis_to_finish() {

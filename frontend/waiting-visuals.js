@@ -196,7 +196,7 @@ window.WaitingVisuals = (() => {
     ${joint(0, -8.8, 'gaze', eyes)}`;
   // The near arm is drawn as a second copy of the same transform chain above the
   // front props, so anything held in that hand sits between the body and the fingers.
-  const ROBOT = `<g class="wv-robot" data-c="rx"><ellipse class="wv-shadow" cy=".5" rx="9.5" ry="1.7"/><g data-c="ry"><g data-c="face">
+  const ROBOT = `<g class="wv-robot" data-c="rx"><ellipse class="wv-floor-glow" cy=".6" rx="14" ry="2.6"/><ellipse class="wv-shadow" cy=".5" rx="9.5" ry="1.7"/><g data-c="ry"><g data-c="face">
     ${leg('B')}
     ${joint(0, HIP_Y, 'lean', `${arm('B')}
       <rect class="wv-waist" x="-3.6" y="-6" width="7.2" height="6" rx="1.6"/>
@@ -213,6 +213,62 @@ window.WaitingVisuals = (() => {
   // Prop-local units: origin at the floor contact (or the grip for hand tools).
   // Sub-channels are [kind, initial]. half is the horizontal reach used to keep
   // entrances and exits outside the round window.
+  // Comic glyphs: filled shapes and strokes, outlined in ink like the lettering.
+  const FX_ICONS = Object.freeze({
+    '♥': { fill: ['M0 2.5C-2.7.7-3.3-.6-3.3-1.6a1.75 1.75 0 0 1 3.3-.8 1.75 1.75 0 0 1 3.3.8c0 1-.6 2.3-3.3 4.1Z'] },
+    '✦': { fill: ['M0-3.3.9-.9 3.3 0 .9.9 0 3.3-.9.9-3.3 0-.9-.9Z'] },
+    '♪': { line: ['M1 1.5V-2.9l2 .7'], dots: [[-0.2, 1.6, 1.25]] },
+    '!': { line: ['M0-2.9v3.1'], dots: [[0, 2.3, 0.75]] },
+    '?': { line: ['M-1.5-1.6a1.55 1.55 0 1 1 2.3 1.3c-.6.3-.8.6-.8 1.2'], dots: [[0, 2.3, 0.75]] },
+    '✓': { line: ['M-2.3 0-.6 1.7 2.4-1.7'] }
+  });
+  // Long lines break at the space that best balances two rows.
+  function rows(text) {
+    if ([...text].length <= 10 || !text.includes(' ')) return [text];
+    const words = text.split(' ');
+    let best = [text], widest = Infinity;
+    for (let i = 1; i < words.length; i++) {
+      const pair = [words.slice(0, i).join(' '), words.slice(i).join(' ')];
+      const longest = Math.max(...pair.map(row => [...row].length));
+      if (longest < widest) { widest = longest; best = pair; }
+    }
+    return best;
+  }
+  // tone: 'pow' (warm comic yellow, for exclamations), 'love' (pink) or 'neon' (the room's accent).
+  function comic(text, angle = -7, tone = 'neon') {
+    const icon = FX_ICONS[text], lines = icon ? [text] : rows(text), two = lines.length > 1;
+    const longest = Math.max(...lines.map(line => [...line].length));
+    const width = icon ? 12 : longest * (two ? 5.5 : 6.4) + 2, height = icon ? 12 : lines.length * 10 + 1;
+    // Short action strokes radiate from above and beside the lettering.
+    const burst = [-165, -138, -112, -68, -42, -15].map(degrees => {
+      const a = degrees * Math.PI / 180, x = Math.cos(a), y = Math.sin(a);
+      const r = 1 / Math.sqrt((x / (width / 2 + 2.2)) ** 2 + (y / (height / 2 + 1.6)) ** 2);
+      return `M${n3(x * r)} ${n3(y * r)}l${n3(x * 3.2)} ${n3(y * 3.2)}`;
+    }).join('');
+    const body = icon
+      ? `<g transform="scale(2.1)">${(icon.line || []).map(d => `<path class="wv-fx-ink-line" d="${d}"/>`).join('')}
+          ${(icon.fill || []).map(d => `<path class="wv-fx-shape" d="${d}"/>`).join('')}${(icon.line || []).map(d => `<path class="wv-fx-line" d="${d}"/>`).join('')}
+          ${(icon.dots || []).map(([cx, cy, r]) => `<circle class="wv-fx-shape" cx="${cx}" cy="${cy}" r="${r}"/>`).join('')}</g>`
+      : lines.map((line, i) => {
+        const y = (i - (lines.length - 1) / 2) * 10;
+        return `<text class="wv-fx-drop" x="1.1" y="${y + 1.2}" text-anchor="middle" dominant-baseline="central">${line}</text>
+          <text class="wv-fx-text" y="${y}" text-anchor="middle" dominant-baseline="central">${line}</text>`;
+      }).join('');
+    return `<g class="wv-fx wv-fx-${tone}${two ? ' wv-fx-two' : ''}" transform="translate(0 ${two ? -15 : -10}) rotate(${angle})"><g class="wv-unmirror"><path class="wv-fx-burst" d="${burst}"/>${body}</g></g>`;
+  }
+  // Digital rain inside a screen: columns of tiny cells whose bright head falls row by row.
+  function rain(x, y, width, height, columns, seed) {
+    const rows = Math.max(2, Math.floor(height / 2.3));
+    let cells = '';
+    for (let column = 0; column < columns; column++) {
+      const cx = x + (column + 0.5) * width / columns, start = ((seed * 7 + column * 13) % 10) / 10 * 1.6;
+      for (let row = 0; row < rows; row++) {
+        const phase = (((start - row * 0.11) % 1.6) + 1.6) % 1.6;
+        cells += `<rect x="${n3(cx - 0.35)}" y="${n3(y + 0.4 + row * 2.3)}" width=".7" height="1.3" style="animation-delay:-${n3(phase)}s"/>`;
+      }
+    }
+    return `<g class="wv-matrix">${cells}</g>`;
+  }
   const wheel = (id, part, x, y, r) => `<g transform="translate(${x} ${y})"><g data-c="${id}.${part}"><circle class="wv-wheel" r="${r}"/><path class="wv-spoke" d="M${-r * 0.6} 0h${r * 1.2}"/></g></g>`;
   const wheels = (r, ...parts) => ({ r, parts });
   const ART = Object.freeze({
@@ -232,13 +288,9 @@ window.WaitingVisuals = (() => {
       svg: () => `<rect class="wv-paper" x="-4.5" y="-11.5" width="9" height="11.5" rx=".8"/><path class="wv-paper-lines" d="M-2.6 -9h5.2M-2.6 -6.8h5.2M-2.6 -4.6h3.4"/>` },
     tray: { half: 6,
       svg: () => `<rect class="wv-prop" x="-5.5" y="-7" width="11" height="7" rx="1.2"/><path class="wv-neon" d="M-4.2 -6.9h8.4"/>` },
-    bubble: { half: 14,
-      svg: (id, p) => {
-        const width = Math.max(11, [...p.text].length * 4.4 + 6);
-        return `<path class="wv-bubble" d="M-3.2 -7.6-4.6 0 1.8-7.6"/><rect class="wv-bubble" x="${-width / 2}" y="-20" width="${width}" height="12.8" rx="5"/>
-          <path class="wv-bubble-patch" d="M-2.6 -8.2h3.8v1.4h-3.8Z"/>
-          <g transform="translate(0 -13.5)"><g class="wv-unmirror"><text class="wv-bubble-text" text-anchor="middle" dominant-baseline="central">${p.text}</text></g></g>`;
-      } },
+    // Comic onomatopoeia: no balloon, just outlined lettering with action strokes.
+    // The origin is the point it bursts out of (above the head or a prop).
+    bubble: { half: 34, svg: (id, p) => comic(p.text, p.angle, p.tone) },
     zzz: { half: 12,
       svg: () => `<g class="wv-unmirror"><g class="wv-zzz"><path d="M0 -3h3l-3 3h3"/><path d="M4 -9h3.6l-3.6 3.6h3.6"/><path d="M9 -16h4.4l-4.4 4.4h4.4"/></g></g>` },
     cushion: { half: 15,
@@ -288,7 +340,8 @@ window.WaitingVisuals = (() => {
     radio: { half: 9, ch: { notes: ['op', 0] },
       svg: id => `<path class="wv-line" d="M-4.5 -9v-2.6h9V-9M5.4 -9l3-6"/><rect class="wv-prop" x="-7.5" y="-9" width="15" height="9" rx="2"/>
         <circle class="wv-speaker" cx="-3" cy="-4.5" r="2.6"/><path class="wv-line wv-soft" d="M1.8 -6.5h3.6M1.8 -4.5h3.6M1.8 -2.5h3.6"/>
-        <g transform="translate(-2 -14)"><g data-c="${id}.notes"><g class="wv-unmirror"><g class="wv-notes"><text class="wv-note">♪</text><text class="wv-note" x="7" y="-4">♫</text><text class="wv-note" x="-6" y="-7">♪</text></g></g></g></g>` },
+        <g transform="translate(-2 -14)"><g data-c="${id}.notes"><g class="wv-unmirror">${[[0, 0, ''], [7, -4, ' wv-note-b'], [-6, -7, ' wv-note-c']].map(([x, y, late]) =>
+          `<g transform="translate(${x} ${y})"><g class="wv-note${late}"><path class="wv-note-stem" d="M1.6 0V-5.2l2.4.8"/><ellipse class="wv-note-head" cx=".5" cy=".1" rx="1.35" ry="1"/></g></g>`).join('')}</g></g></g>` },
     ball: { half: 3,
       svg: (id, p) => `<circle class="wv-ball wv-ball-${p.tone || 1}" r="2.3"/><path class="wv-ball-shine" d="M-1 -1.2a1.4 1.4 0 0 1 1.1-.7"/>` },
     plane: { half: 8, ch: { flat: ['op', 1], fold: ['op', 0] },
@@ -314,7 +367,86 @@ window.WaitingVisuals = (() => {
           <path class="wv-pot" d="M-5.4 -16h10.8l-1.6 9.6h-7.6Z"/><path class="wv-neon" d="M-4.6 -13.6h9.2"/></g>
         ${wheel(id, 'wl', -8, -2.2, 2.2)}${wheel(id, 'wr', 8, -2.2, 2.2)}` },
     box: { half: 10,
-      svg: () => `<rect class="wv-box" x="-9" y="-15" width="18" height="15" rx="1.4"/><path class="wv-line wv-soft" d="M-9 -11.5h18"/><path class="wv-neon" d="M-6 -6h12"/>` }
+      svg: () => `<rect class="wv-box" x="-9" y="-15" width="18" height="15" rx="1.4"/><path class="wv-line wv-soft" d="M-9 -11.5h18"/><path class="wv-neon" d="M-6 -6h12"/>` },
+    // ---- tech set: desk, chair, ceiling screens, SOC crew, rack, hologram
+    pcdesk: { half: 18, ch: { wl: ['rot', 0], wr: ['rot', 0] }, wheels: wheels(2.2, 'wl', 'wr'),
+      svg: id => `<ellipse class="wv-shadow" cy=".5" rx="16" ry="1.5"/><path class="wv-line" d="M-14 -13.6V-2.2M14 -13.6V-2.2"/><path class="wv-line wv-soft" d="M-14 -7h28"/>
+        <rect class="wv-prop" x="5.5" y="-12.6" width="7" height="10" rx="1"/><circle class="wv-tower-led" cx="9" cy="-10.6" r=".6"/>
+        <rect class="wv-prop" x="-17" y="-16" width="34" height="2.4" rx="1"/>
+        <rect class="wv-keys" x="-9.5" y="-17.5" width="12" height="1.5" rx=".5"/><path class="wv-neon wv-dim" d="M-8.5 -16.75h10"/><ellipse class="wv-prop" cx="6" cy="-16.6" rx="1.5" ry=".8"/>
+        ${wheel(id, 'wl', -14, -2.2, 2.2)}${wheel(id, 'wr', 14, -2.2, 2.2)}` },
+    chair: { half: 10,
+      svg: () => `<ellipse class="wv-shadow" cy=".4" rx="7" ry="1.2"/><path class="wv-line" d="M0 -8.4V-2.6M-4.6 -2.4h9.2"/>
+        <circle class="wv-wheel" cx="-4.2" cy="-1.3" r="1.2"/><circle class="wv-wheel" cx="4.2" cy="-1.3" r="1.2"/>
+        <rect class="wv-prop" x="-6.5" y="-10" width="13" height="1.8" rx=".9"/><rect class="wv-chair-back" x="-8.6" y="-23" width="2.8" height="14" rx="1.2"/>` },
+    // A wall screen hung from the ceiling with a live attack map (origin: bottom edge).
+    dash: { half: 28, ch: { alert: ['op', 0], lock: ['op', 0] },
+      svg: id => `<path class="wv-line wv-soft" d="M-20 -36V-150M20 -36V-150"/>
+        <rect class="wv-screen-bg" x="-27" y="-36" width="54" height="36" rx="1.6"/>
+        <path class="wv-screen-grid" d="M-25 -27h50M-25 -18h50M-25 -9h50M-13 -34v32M0 -34v32M13 -34v32"/>
+        <path class="wv-land" d="M-23 -27q3-5 9-3t6 4-3 5-8 1-4-7ZM-4 -30q6-3 11 0t3 6-6 3-7-3-1-6ZM9 -20q5-2 9 1t1 6-6 1-4-8ZM-17 -14q3 2 2 6t-4 2-1-8Z"/>
+        <path class="wv-arc" pathLength="1" d="M-16 -24Q-6 -38 3 -26"/><path class="wv-arc wv-arc-b" pathLength="1" d="M3 -26Q13 -36 16 -15"/><path class="wv-arc wv-arc-c" pathLength="1" d="M-12 -9Q1 -21 16 -15"/>
+        <circle class="wv-pulse" cx="16" cy="-15" r="1.7"/><circle class="wv-node" cx="-16" cy="-24" r=".9"/><circle class="wv-node" cx="3" cy="-26" r=".9"/><circle class="wv-node wv-node-hot" cx="16" cy="-15" r="1"/><circle class="wv-node" cx="-12" cy="-9" r=".9"/>
+        <path class="wv-screen-text" d="M-24 -33.6h9M-24 -32h5M19 -33.6h5"/>
+        <rect class="wv-bar" x="20" y="-8" width="1.6" height="5"/><rect class="wv-bar wv-bar-b" x="22.4" y="-8" width="1.6" height="5"/>
+        <g data-c="${id}.alert"><rect class="wv-alert-frame" x="-26.3" y="-35.3" width="52.6" height="34.6" rx="1.2"/><path class="wv-alert-icon" d="M-1 -23l3.6 6.2h-7.2Z"/><path class="wv-alert-mark" d="M-1 -21.4v2.2"/></g>
+        <g data-c="${id}.lock"><rect class="wv-lock-ok-body" x="-3.4" y="-21" width="6.8" height="5" rx="1"/><path class="wv-lock-ok" d="M-2.2 -21v-1.8a2.2 2.2 0 0 1 4.4 0v1.8"/></g>
+        <rect class="wv-handle" x="-3" y="-.6" width="6" height="1.2" rx=".6"/>` },
+    // A SOC wall: six monitors of digital rain hanging from the ceiling (origin: bottom edge).
+    socwall: { half: 34, ch: { alert: ['op', 0] },
+      svg: id => {
+        const screens = [[-33, -40], [-11, -40], [11, -40], [-33, -20.5], [-11, -20.5], [11, -20.5]]
+          .map(([x, y], i) => `<rect class="wv-screen-bg" x="${x}" y="${y}" width="21" height="18.5" rx="1"/>${rain(x + 1, y + 1, 19, 16.5, 6, i + 1)}`).join('');
+        return `<path class="wv-line wv-soft" d="M-26 -40V-150M26 -40V-150"/><rect class="wv-prop" x="-34.5" y="-41.5" width="69" height="40" rx="1.6"/>${screens}
+          <g data-c="${id}.alert"><rect class="wv-alert-frame" x="-10.6" y="-39.6" width="20.2" height="17.7" rx=".8"/><path class="wv-alert-icon" d="M-.5 -36l4.2 7.2h-8.4Z"/><path class="wv-alert-mark" d="M-.5 -34.2v2.6"/></g>`;
+      } },
+    // Two operators seen from behind on rolling chairs; heads and a thumb can move.
+    // Drawn 30% larger than the robot: they sit closer to the viewer.
+    crew: { half: 26, ch: { h1: ['rot', 0], h2: ['rot', 0], thumb: ['rot', 60], thumbo: ['op', 0] },
+      svg: id => [[-13, 1], [13, 2]].map(([x, i]) => `<g transform="translate(${x} 0) scale(1.3)">
+          <ellipse class="wv-shadow" cy=".4" rx="7" ry="1.2"/><path class="wv-line" d="M0 -8.4V-2.6M-4.6 -2.4h9.2"/>
+          <circle class="wv-wheel" cx="-4.2" cy="-1.3" r="1.2"/><circle class="wv-wheel" cx="4.2" cy="-1.3" r="1.2"/>
+          <path class="wv-op" d="M-6.8 -10c0-7.6 2-12.6 6.8-12.6s6.8 5 6.8 12.6Z"/><path class="wv-op-rim" d="M-5.2 -19q5.2-4.6 10.4 0"/>
+          <g transform="translate(0 -26)"><g data-c="${id}.h${i}"><circle class="wv-op" r="4.2"/><path class="wv-op-rim" d="M-3.4 -2.4a4.2 4.2 0 0 1 6.8 0"/><path class="wv-headset" d="M-4.6 0a4.6 4.6 0 0 1 9.2 0"/><circle class="wv-op-ear" cx="4.5" cy=".4" r="1.2"/></g></g>
+          ${i === 2 ? `<g transform="translate(6 -19)"><g data-c="${id}.thumbo"><g data-c="${id}.thumb"><path class="wv-op-arm" d="M0 0 2.6-6.4"/><circle class="wv-op" cx="2.9" cy="-7.4" r="1.4"/><path class="wv-op-rim" d="M2.6 -9.4v-1.4"/></g></g></g>` : ''}
+          <rect class="wv-chair-back" x="-5.6" y="-16" width="11.2" height="6.6" rx="2"/><rect class="wv-prop" x="-6.5" y="-10" width="13" height="1.8" rx=".9"/>
+        </g>`).join('') + `<path class="wv-line wv-soft" d="M-19 -3.1h38"/>` },
+    // Architecture whiteboard: boxes, arrows, a database, a cloud and a flow (origin: floor).
+    arch: { half: 26, ch: { wl: ['rot', 0], wr: ['rot', 0], b1: ['dash', 1], a1: ['dash', 1], b2: ['dash', 1], a2: ['dash', 1], db: ['dash', 1], a3: ['dash', 1], cl: ['dash', 1], fl: ['dash', 1], ci: ['dash', 1] },
+      wheels: wheels(2.3, 'wl', 'wr'),
+      svg: id => `<ellipse class="wv-shadow" cy=".5" rx="18" ry="1.5"/><path class="wv-line" d="M-15 -18V-2.3M15 -18V-2.3M-22 -30h-2.6"/>
+        <rect class="wv-board" x="-22" y="-46" width="44" height="28" rx="1.8"/><rect class="wv-board-edge" x="-20.4" y="-44.4" width="40.8" height="24.8" rx=".8"/>
+        <path class="wv-line" d="M-20 -18.4h40"/>
+        <path class="wv-chalk" pathLength="1" data-c="${id}.b1" d="M-18 -42h9v6h-9Z"/>
+        <path class="wv-chalk" pathLength="1" data-c="${id}.a1" d="M-8.4 -39h5m-1.6-1.4 1.6 1.4-1.6 1.4"/>
+        <path class="wv-chalk" pathLength="1" data-c="${id}.b2" d="M-3 -42h9v6h-9Z"/>
+        <path class="wv-chalk" pathLength="1" data-c="${id}.a2" d="M1.5 -35.4v3.6m-1.3-1.4 1.3 1.4 1.3-1.4"/>
+        <path class="wv-chalk" pathLength="1" data-c="${id}.db" d="M-2.5 -29.4a4 1.3 0 0 0 8 0 4 1.3 0 0 0-8 0v5a4 1.3 0 0 0 8 0v-5"/>
+        <path class="wv-chalk" pathLength="1" data-c="${id}.a3" d="M6.6 -39h4.6m-1.6-1.4 1.6 1.4-1.6 1.4"/>
+        <path class="wv-chalk" pathLength="1" data-c="${id}.cl" d="M12.4 -36h7.2a2.2 2.2 0 0 0-.6-4.3 3 3 0 0 0-5.6-.8 2.4 2.4 0 0 0-1 5.1Z"/>
+        <path class="wv-chalk" pathLength="1" data-c="${id}.fl" d="M16 -35.4c0 6-4 8.6-9.6 8.6"/>
+        <path class="wv-chalk wv-chalk-hot" pathLength="1" data-c="${id}.ci" d="M-5.8 -39a7.3 4.6 0 1 0 14.6 0 7.3 4.6 0 1 0-14.6 0"/>
+        ${wheel(id, 'wl', -15, -2.3, 2.3)}${wheel(id, 'wr', 15, -2.3, 2.3)}` },
+    // Server rack: running LEDs; one blade slides out and shows a fault.
+    rack: { half: 14, ch: { wl: ['rot', 0], wr: ['rot', 0], blade: ['tx', 0], bad: ['op', 0] }, wheels: wheels(2.3, 'wl', 'wr'),
+      svg: id => {
+        const unit = (y, leds, delay) => `<rect class="wv-unit" x="-8.4" y="${y}" width="16.8" height="5.6" rx=".6"/>${[0, 1, 2, 3].map(i =>
+          `<rect class="${leds}" x="${2 + i * 1.6}" y="${y + 2.2}" width=".9" height="1.2" style="animation-delay:-${n3(((delay + i) * 0.17) % 1.2)}s"/>`).join('')}<path class="wv-line wv-soft" d="M-6.6 ${y + 2.8}h6"/>`;
+        return `<ellipse class="wv-shadow" cy=".5" rx="11" ry="1.4"/><path class="wv-line" d="M-10 -24h-2.8v-6h2.8"/>
+          <rect class="wv-prop" x="-10" y="-46" width="20" height="41.4" rx="1.6"/>
+          ${[-44, -37, -23, -16, -9].map((y, i) => unit(y, 'wv-led-run', i * 2)).join('')}
+          <g data-c="${id}.blade">${unit(-30, 'wv-led-run', 5)}<rect class="wv-handle" x="-10.4" y="-28.4" width="1.6" height="2.4" rx=".5"/>
+            <g data-c="${id}.bad">${[0, 1, 2, 3].map(i => `<rect class="wv-led-bad" x="${2 + i * 1.6}" y="-27.8" width=".9" height="1.2"/>`).join('')}</g></g>
+          ${wheel(id, 'wl', -6.5, -2.3, 2.3)}${wheel(id, 'wr', 6.5, -2.3, 2.3)}`;
+      } },
+    // A hologram projector puck; the beam and the globe open above it.
+    puck: { half: 12, ch: { beam: ['op', 0], globe: ['scale', 0] },
+      svg: id => `<g data-c="${id}.beam"><path class="wv-beam" d="M-4.6 -2.6-11.5-26h23L4.6-2.6Z"/></g>
+        <g transform="translate(0 -27)"><g data-c="${id}.globe"><circle class="wv-holo" r="10.5"/>
+          ${[0, 1, 2, 3].map(i => `<ellipse class="wv-holo-line wv-meridian" rx="10.5" ry="10.5" style="animation-delay:-${i * 0.75}s"/>`).join('')}
+          <path class="wv-holo-line" d="M-10 -3.4h20M-9 3.4h18M-6.6 -7.8h13.2M-6.6 7.8h13.2"/>
+          <g class="wv-orbit"><circle class="wv-holo-dot" cx="13.5" r=".9"/><circle class="wv-holo-dot" cx="-12" cy="4" r=".7"/></g></g></g>
+        <ellipse class="wv-puck" cy="-1.6" rx="5.6" ry="1.9"/><path class="wv-neon" d="M-3.8 -1.7h7.6"/>` }
   });
 
   // ------------------------------------------------------------------ skit compiler
@@ -565,13 +697,20 @@ window.WaitingVisuals = (() => {
       crouch(depth, length = 360, ease = 'io') { return depth ? api.to(crouchPose(depth), length, ease) : api.to({ ry: 0, legF: 0, legB: 0, kneeF: 0, kneeB: 0 }, length, ease); },
       crouchPose,
       // Speech bubbles hang above the head and keep their text readable when mirrored.
-      say(id, holdMs = 900, { dx = 7, dy = -19 } = {}) {
+      // Comic lettering punches out of the head (or a prop), wobbles, then puffs away.
+      say(id, holdMs = 900, { dx = 7, dy = -19, on = 'head' } = {}) {
         api.detach(id);
-        const [x, y] = point('head', [dx, dy]);
-        api.set({ [id]: { x, y }, [`${id}.pop`]: 0, [`${id}.o`]: 1 });
-        api.attach(id, 'head');
-        api.tw({ [`${id}.pop`]: 1 }, 260, 'back'); t += 260 + holdMs;
-        api.tw({ [`${id}.pop`]: 0, [`${id}.o`]: 0 }, 200, 'in'); t += 200;
+        const [x, y] = point(on, [dx, dy]);
+        // Lettering stays inside the round window, even when the robot peeks from an edge.
+        api.set({ [id]: { x: clamp(x, 64, 136), y }, [`${id}.pop`]: 0.2, [`${id}.o`]: 0, [`${id}.tilt`]: -10 });
+        api.attach(id, on);
+        api.tw({ [`${id}.o`]: 1 }, 90, 'out');
+        api.to({ [`${id}.pop`]: 1, [`${id}.tilt`]: 0 }, 260, 'back');
+        const wobbles = Math.min(3, Math.floor(holdMs / 240));
+        for (let i = 0; i < wobbles; i++) api.to({ [`${id}.tilt`]: i % 2 ? -3 : 3 }, 120, 'io');
+        api.to({ [`${id}.tilt`]: 0 }, 120, 'io');
+        t += Math.max(0, holdMs - (wobbles + 1) * 120);
+        api.tw({ [`${id}.pop`]: 1.2, [`${id}.o`]: 0 }, 200, 'in'); t += 200;
         return api;
       }
     };
@@ -608,7 +747,7 @@ window.WaitingVisuals = (() => {
       }).join('');
       const probe = time => ({
         robot: value('rx', time),
-        props: props.map(p => ({ id: p.id, x: poseOf(p.id, time).x, half: meta.get(p.id).art.half, opacity: value(`${p.id}.o`, time) }))
+        props: props.map(p => ({ id: p.id, x: poseOf(p.id, time).x, y: poseOf(p.id, time).y, half: meta.get(p.id).art.half, opacity: value(`${p.id}.o`, time) }))
       });
       return { duration: total, tracks, statics, markup: `${layer('back')}${ROBOT}${layer('front')}${ROBOT_ARM}`, probe };
     }
@@ -632,11 +771,13 @@ window.WaitingVisuals = (() => {
   }
   const CART_X = -30; // entrance position; riders are declared relative to it
   const onCart = (dx, y = -16) => ({ x: CART_X + dx, y });
+  // Screens hang from the ceiling and are called down (or sent back up) with a gesture.
+  const summon = (c, id, y, length = 1000) => { const from = c.pose(id).y; c.path(id, k => ({ y: from + (y - from) * k }), length, 'io'); };
   const sitPose = seat => ({ ry: 16 - seat, legF: -86, legB: -80, kneeF: 84, kneeB: 80 });
 
   const SKITS = {
     greet: { kind: 'fun', opener: true, weight: 3,
-      props: r => [{ id: 'hi', art: 'bubble', layer: 'front', text: r.pick(['Oi!', 'Olá!', 'E aí?', 'Opa!']), o: 0 }],
+      props: r => [{ id: 'hi', art: 'bubble', layer: 'front', text: r.pick(['E AÍ, MACHO VÉI?', 'EI, MÁ, BLZ?', 'FALA, MACHO!', 'EI, BICHO, BLZ?']), o: 0 }],
       play(c, r) {
         c.walk(r.range(84, 104));
         c.wait(160); c.look(0, -0.4, 220); c.mood('happy');
@@ -645,10 +786,10 @@ window.WaitingVisuals = (() => {
         c.walk(236);
       } },
     peek: { kind: 'fun', opener: true, weight: 2,
-      props: [{ id: 'bang', art: 'bubble', layer: 'front', text: '!', o: 0 }],
+      props: r => [{ id: 'bang', art: 'bubble', layer: 'front', text: r.pick(['VISH!', 'OXE!']), tone: 'pow', o: 0 }],
       play(c, r) {
         c.set({ rx: -34 });
-        c.walk(r.range(2, 8), { speed: 20 });
+        c.walk(r.range(17, 22), { speed: 20 });
         c.to({ lean: 13, head: 7 }, 340, 'out');
         c.look(3.8, -0.8, 180); c.wait(420); c.look(3.4, 0.9, 220); c.wait(360);
         c.look(0, 0, 160); c.mood('wide'); c.say('bang', 420, { dx: 9, dy: -17 });
@@ -656,19 +797,20 @@ window.WaitingVisuals = (() => {
         c.walk(-36, { speed: 48 });
       } },
     stretch: { kind: 'fun', opener: true, weight: 2,
-      props: [{ id: 'spark', art: 'bubble', layer: 'front', text: '✦', o: 0 }],
+      props: [],
       play(c, r) {
         c.walk(r.range(86, 112));
         c.mood('closed');
         c.to({ armF: -172, elbF: -6, armB: -166, elbB: -10, head: -8 }, 560, 'io');
         c.to({ lean: -10 }, 460); c.to({ lean: 12 }, 560); c.to({ lean: 0 }, 380);
-        c.say('spark', 480);
+        c.wait(520);
         c.rest(400); c.mood('happy'); c.wait(320); c.mood('open');
         c.walk(236);
       } },
     coffee: { kind: 'fun', weight: 3, minElapsedMs: 15000,
-      props: [{ id: 'cart', art: 'cart', x: CART_X }, { id: 'mug', art: 'mug', ...onCart(5.7), layer: 'front' }, { id: 'mach', art: 'machine', ...onCart(13) },
-        { id: 'love', art: 'bubble', layer: 'front', text: '♥', o: 0 }],
+      props: r => [{ id: 'cart', art: 'cart', x: CART_X }, { id: 'mug', art: 'mug', ...onCart(5.7), layer: 'front' }, { id: 'mach', art: 'machine', ...onCart(13) },
+        { id: 'love', art: 'bubble', layer: 'front', text: r.pick(['SÓ O FILÉ, OH!', 'GOSTOSO, OH!']), o: 0 },
+        { id: 'slurp', art: 'bubble', layer: 'front', text: r.pick(['ÉGUA!', 'ARRIÉGUA!']), tone: 'pow', o: 0 }],
       play(c, r) {
         c.set({ rx: CART_X - BEHIND }); c.attach('mug', 'cart'); c.attach('mach', 'cart');
         cartIn(c, 'cart', r.range(50, 60));
@@ -682,7 +824,7 @@ window.WaitingVisuals = (() => {
         c.reachAt('F', 'mug', [-4.2, -3.4], 360, 'io', { with: { lean: 6 } }); c.grab('mug');
         for (let sip = 0; sip < 2; sip++) {
           c.par(a => a.reach('F', a.point('root', [7.5, -36]), 520, 'io', { with: { lean: -2 } }), a => a.tw({ head: -9, 'mug.tilt': -24 }, 520));
-          c.mood('closed'); c.wait(sip ? 500 : 800); c.mood('happy');
+          c.mood('closed'); if (sip) c.wait(500); else c.say('slurp', 420, { dx: 12, dy: -14 }); c.mood('happy');
           c.par(a => a.reach('F', a.point('root', [10, -25]), 420, 'io', { with: { lean: 0 } }), a => a.tw({ head: 0, 'mug.tilt': 0 }, 420));
           if (!sip) c.par(a => a.to({ ry: -1.2 }, 260).to({ ry: 0 }, 260), a => a.say('love', 700));
         }
@@ -691,7 +833,8 @@ window.WaitingVisuals = (() => {
         cartOut(c, 'cart');
       } },
     nap: { kind: 'fun', weight: 2, minElapsedMs: 45000,
-      props: [{ id: 'cush', art: 'cushion', x: -40, y: -49, layer: 'front' }, { id: 'zzz', art: 'zzz', o: 0, layer: 'front' }, { id: 'bang', art: 'bubble', layer: 'front', text: '!', o: 0 }],
+      props: [{ id: 'cush', art: 'cushion', x: -40, y: -49, layer: 'front' }, { id: 'zzz', art: 'zzz', o: 0, layer: 'front' }, { id: 'bang', art: 'bubble', layer: 'front', text: 'OXE!', tone: 'pow', o: 0 },
+        { id: 'plof', art: 'bubble', layer: 'front', text: 'PLOF!', tone: 'pow', o: 0, angle: 6 }],
       play(c, r) {
         c.set({ rx: -40, armF: -166, elbF: -18, armB: -150, elbB: -30 });
         c.attach('cush', 'head');
@@ -702,7 +845,8 @@ window.WaitingVisuals = (() => {
         c.to({ lean: 10, head: 6 }, 220, 'out'); c.detach('cush');
         const from = c.pose('cush'), land = spot + 22;
         c.path('cush', k => ({ x: from.x + (land - from.x) * k, y: from.y * (1 - k) - 14 * Math.sin(Math.PI * k), r: 12 * Math.sin(Math.PI * k) }), 520, 'in');
-        c.par(a => a.rest(420), a => a.wait(520)); c.to({ cush: { sy: 0.8 } }, 90, 'out'); c.to({ cush: { sy: 1 } }, 200, 'back');
+        c.par(a => a.rest(420), a => a.wait(520)); c.to({ cush: { sy: 0.8 } }, 90, 'out');
+        c.par(a => a.to({ cush: { sy: 1 } }, 200, 'back'), a => a.say('plof', 260, { on: 'cush', dx: 0, dy: -10 }));
         c.look(3.4, 0.8); c.mood('happy'); c.wait(300); c.mood('open');
         // Sit on it facing the viewer's left, as if slumping into a bean bag.
         c.turn(-1); c.walk(land + 1, { face: false, speed: 18 });
@@ -731,7 +875,7 @@ window.WaitingVisuals = (() => {
       props: r => [{ id: 'cart', art: 'cart', x: CART_X },
         ...[0, 1, 2].map(i => ({ id: `s${i}`, art: 'sheet', ...onCart(-1.4 + i * 1.4, -17), layer: 'front' })),
         { id: 'inbox', art: 'tray', ...onCart(0), layer: 'front' }, { id: 'outbox', art: 'tray', ...onCart(12), layer: 'front' },
-        { id: 'hmm', art: 'bubble', layer: 'front', text: '?', o: 0 }, { id: 'aha', art: 'bubble', layer: 'front', text: r.pick(['!', 'Ah!']), o: 0 }],
+        { id: 'hmm', art: 'bubble', layer: 'front', text: 'OXENTE?', o: 0 }, { id: 'aha', art: 'bubble', layer: 'front', text: r.pick(['ÉGUA!', 'ARRIÉGUA!']), tone: 'pow', o: 0 }],
       play(c, r) {
         c.set({ rx: CART_X - BEHIND });
         for (const id of ['s0', 's1', 's2', 'inbox', 'outbox']) c.attach(id, 'cart');
@@ -755,7 +899,7 @@ window.WaitingVisuals = (() => {
         cartOut(c, 'cart');
       } },
     archive: { kind: 'work', families: ['checkpoint'], weight: 6,
-      props: [{ id: 'fold', art: 'folder', x: -15, y: -33 }, { id: 'cab', art: 'cabinet', x: -14 }, { id: 'yay', art: 'bubble', layer: 'front', text: '✓', o: 0 }],
+      props: [{ id: 'fold', art: 'folder', x: -15, y: -33 }, { id: 'cab', art: 'cabinet', x: -14 }],
       play(c, r) {
         const grip = [-12.8, -27];
         c.set({ rx: -36 }); c.attach('fold', 'cab');
@@ -775,7 +919,7 @@ window.WaitingVisuals = (() => {
         c.haul(['cab'], 236, { speed: 40 });
       } },
     chart: { kind: 'work', families: ['calculation'], weight: 6,
-      props: r => [{ id: 'board', art: 'board', x: -22 }, { id: 'hmm', art: 'bubble', layer: 'front', text: '?', o: 0 }, { id: 'aha', art: 'bubble', layer: 'front', text: r.pick(['!', 'Ah!', '✦']), o: 0 }],
+      props: r => [{ id: 'board', art: 'board', x: -22 }, { id: 'hmm', art: 'bubble', layer: 'front', text: 'OXENTE?', o: 0 }, { id: 'aha', art: 'bubble', layer: 'front', text: r.pick(['ÉGUA, MACHO!', 'ARRIÉGUA!']), tone: 'pow', o: 0 }],
       play(c, r) {
         const grip = [-19.6, -26];
         c.set({ rx: CART_X - BEHIND });
@@ -803,7 +947,7 @@ window.WaitingVisuals = (() => {
         c.haul(['board'], 236, { speed: 40 });
       } },
     inspect: { kind: 'work', families: ['verification'], weight: 6,
-      props: [{ id: 'stand', art: 'stand', x: -18 }, { id: 'lens', art: 'lens', x: -31, y: -28, layer: 'front' }, { id: 'hmm', art: 'bubble', layer: 'front', text: '…', o: 0 }],
+      props: r => [{ id: 'stand', art: 'stand', x: -18 }, { id: 'lens', art: 'lens', x: -31, y: -28, layer: 'front' }, { id: 'hmm', art: 'bubble', layer: 'front', text: r.pick(['SEI NÃO, VIU…', 'PERAÍ, MACHO…']), o: 0 }],
       play(c, r) {
         const grip = [-14, -20.4];
         c.set({ rx: -42 }); c.attach('lens', 'stand');
@@ -826,8 +970,8 @@ window.WaitingVisuals = (() => {
         c.haul(['stand'], 236, { speed: 40 });
       } },
     print: { kind: 'work', families: ['composition'], weight: 6,
-      props: [{ id: 'cart', art: 'cart', x: CART_X }, { id: 'page', art: 'sheet', ...onCart(8, -17.5), layer: 'front' }, { id: 'prn', art: 'printer', ...onCart(8) },
-        { id: 'love', art: 'bubble', layer: 'front', text: '♥', o: 0 }],
+      props: r => [{ id: 'cart', art: 'cart', x: CART_X }, { id: 'page', art: 'sheet', ...onCart(8, -17.5), layer: 'front' }, { id: 'prn', art: 'printer', ...onCart(8) },
+        { id: 'love', art: 'bubble', layer: 'front', text: r.pick(['FICOU MASSA!', 'MASSA!']), o: 0 }],
       play(c, r) {
         c.set({ rx: CART_X - BEHIND }); c.attach('page', 'cart'); c.attach('prn', 'cart');
         cartIn(c, 'cart', r.range(50, 60));
@@ -869,7 +1013,7 @@ window.WaitingVisuals = (() => {
         cartOut(c, 'cart');
       } },
     queue: { kind: 'work', families: ['access'], weight: 6,
-      props: [{ id: 'term', art: 'terminal', x: -14 }, { id: 'tune', art: 'bubble', layer: 'front', text: '♪', o: 0 }],
+      props: r => [{ id: 'term', art: 'terminal', x: -14 }, { id: 'tune', art: 'bubble', layer: 'front', text: r.pick(['AVIA, MACHO!', 'AVIA!']), tone: 'pow', o: 0 }],
       play(c, r) {
         const grip = [-11.4, -27];
         c.set({ rx: -36 });
@@ -888,8 +1032,8 @@ window.WaitingVisuals = (() => {
         c.haul(['term'], 236, { speed: 40 });
       } },
     juggle: { kind: 'fun', weight: 2, minElapsedMs: 8000,
-      props: [{ id: 'b1', art: 'ball', tone: 1, layer: 'front' }, { id: 'b2', art: 'ball', tone: 2, layer: 'front' }, { id: 'b3', art: 'ball', tone: 3, layer: 'front' },
-        { id: 'oops', art: 'bubble', layer: 'front', text: '!', o: 0 }],
+      props: r => [{ id: 'b1', art: 'ball', tone: 1, layer: 'front' }, { id: 'b2', art: 'ball', tone: 2, layer: 'front' }, { id: 'b3', art: 'ball', tone: 3, layer: 'front' },
+        { id: 'oops', art: 'bubble', layer: 'front', text: r.pick(['VIXE!', 'AI, DIACHO!']), tone: 'pow', o: 0, angle: 7 }],
       play(c, r) {
         const hands = { armF: -58, elbF: -46, armB: -34, elbB: -70 };
         c.set({ rx: -40, ...hands });
@@ -927,14 +1071,14 @@ window.WaitingVisuals = (() => {
         const hit = c.pose(id);
         const bounce = c.t;
         c.path(id, k => ({ x: hit.x + 26 * k, y: -2.3 + (hit.y + 2.3) * (1 - k) * Math.abs(Math.cos(k * Math.PI * 1.5)), r: 540 * k }), 1100, 'linear');
-        c.to({ head: 10, ry: 1.2 }, 120, 'out'); c.say('oops', 360, { dx: -9, dy: -16 }); c.to({ head: 0, ry: 0 }, 300);
+        c.to({ head: 10, ry: 1.2 }, 120, 'out'); c.say('oops', 380, { dx: -9, dy: -16 }); c.to({ head: 0, ry: 0 }, 300);
         c.mood('happy'); c.look(4, 1.5); c.wait(200); c.mood('open');
         c.at(Math.max(c.t, bounce + 1100));
         c.path(id, k => ({ x: hit.x + 26 + 170 * k, r: 540 + 2600 * k }), 2400, 'in');
         c.walk(244, { arms: false, speed: 44 });
       } },
     airplane: { kind: 'fun', weight: 2, minElapsedMs: 6000,
-      props: r => [{ id: 'plane', art: 'plane', layer: 'front' }, { id: 'yay', art: 'bubble', layer: 'front', text: r.pick(['Uau!', 'Lá vai!', 'Iuhu!']), o: 0 }],
+      props: r => [{ id: 'plane', art: 'plane', layer: 'front' }, { id: 'yay', art: 'bubble', layer: 'front', text: r.pick(['VOA, BICHIM!', 'ÉGUA, VOOU!', 'ARRIÉGUA!']), tone: 'pow', o: 0 }],
       play(c, r) {
         c.set({ rx: -40, armF: -62, elbF: -40 });
         const hand = c.point('handF');
@@ -948,8 +1092,9 @@ window.WaitingVisuals = (() => {
         const start = c.pose('plane');
         // A gentle climb with one loop-the-loop; the nose follows the path tangent.
         const at = k => {
-          const loop = clamp((k - 0.32) / 0.3, 0, 1), turn = loop * Math.PI * 2;
-          return [start.x + 160 * k + 15 * Math.sin(turn), start.y - 22 * k - 15 * (1 - Math.cos(turn)) + 6 * Math.sin(k * Math.PI)];
+          // The loop happens well inside the window; afterwards the plane speeds off.
+          const loop = clamp((k - 0.26) / 0.32, 0, 1), turn = loop * Math.PI * 2;
+          return [start.x + 110 * k + 80 * k ** 4 + 13 * Math.sin(turn), start.y - 12 * k - 13 * (1 - Math.cos(turn)) + 5 * Math.sin(k * Math.PI)];
         };
         c.path('plane', k => {
           const [x, y] = at(k), [nx, ny] = at(Math.min(1, k + 0.002)), [px, py] = at(Math.max(0, k - 0.002));
@@ -999,7 +1144,7 @@ window.WaitingVisuals = (() => {
         c.tw({ rx: 250 }, 1300, 'linear'); c.tw({ 'deck.wl': 3800, 'deck.wr': 3800 }, 1300, 'linear'); c.wait(1300);
       } },
     sweep: { kind: 'fun', opener: true, weight: 2, minElapsedMs: 5000,
-      props: [{ id: 'broom', art: 'broom', layer: 'front' }, { id: 'achoo', art: 'bubble', layer: 'front', text: 'Atchim!', o: 0 }],
+      props: [{ id: 'broom', art: 'broom', layer: 'front' }, { id: 'achoo', art: 'bubble', layer: 'front', text: 'ATCHIM!', tone: 'pow', o: 0, angle: -10 }],
       play(c, r) {
         const hold = { armF: -42, elbF: -34, armB: -30, elbB: -40, lean: 8 };
         c.set({ rx: -42, ...hold });
@@ -1016,7 +1161,7 @@ window.WaitingVisuals = (() => {
         sweepTo(250, 12);
       } },
     garden: { kind: 'fun', weight: 2, minElapsedMs: 10000,
-      props: [{ id: 'can', art: 'can', x: -26, y: -16.8, layer: 'front' }, { id: 'plant', art: 'plant', x: -18 }, { id: 'love', art: 'bubble', layer: 'front', text: '♥', o: 0 }],
+      props: [{ id: 'can', art: 'can', x: -26, y: -16.8, layer: 'front' }, { id: 'plant', art: 'plant', x: -18 }, { id: 'love', art: 'bubble', layer: 'front', text: 'QUE LINDEZA!', o: 0 }],
       play(c, r) {
         const grip = [-16.6, -16.8];
         c.set({ rx: -46 }); c.attach('can', 'plant');
@@ -1049,6 +1194,144 @@ window.WaitingVisuals = (() => {
         c.par(a => a.walk(mid, { arms: false, speed: 26 }), a => { for (let i = 0; i < steps; i++) a.to({ 'box.tilt': 4 }, 320).to({ 'box.tilt': -4 }, 320); a.to({ 'box.tilt': 0 }, 200); });
         c.to({ lean: -12, head: -10 }, 320); c.look(0, -1.6); c.mood('happy'); c.wait(500); c.to({ lean: -4, head: 0 }, 300); c.mood('open'); c.look(2.4, 0);
         c.walk(244, { arms: false, speed: 30 });
+      } },
+    // ---------------------------------------------------------------- tech set
+    hacker: { kind: 'work', families: ['reading', 'verification', 'calculation'], weight: 5,
+      props: r => [{ id: 'chair', art: 'chair', x: -44 }, { id: 'desk', art: 'pcdesk', x: -20 }, { id: 'screen', art: 'dash', x: 102, y: -165 },
+        { id: 'got', art: 'bubble', layer: 'front', text: r.pick(['ACHEI O CABRA!', 'PEGUEI, MACHO!']), tone: 'pow', o: 0 }],
+      play(c, r) {
+        const grip = [-7.2, -22.5];
+        c.set({ rx: -44 + grip[0] - 10 }); c.attach('desk', 'chair');
+        c.grip('chair', grip, { lean: 8 });
+        c.haul(['chair'], 74 + grip[0] - 10, { speed: 30 });
+        c.rest(300);
+        const chair = c.pose('chair').x;
+        c.walk(chair, { speed: 22 });
+        // A gesture calls the big screen down from the ceiling.
+        c.look(2.4, -2); c.to({ armF: -172, elbF: -8, head: -10 }, 320, 'out');
+        summon(c, 'screen', -52, 1000); c.to({ armF: -105, elbF: -30 }, 1000, 'io'); c.rest(260);
+        c.to(sitPose(9.5), 420, 'io');
+        c.to({ head: -12 }, 260); c.look(3.2, -2);
+        for (const x of [1.4, 4, 2]) c.look(x, -2, 420);
+        c.to({ armF: -128, elbF: -24 }, 300); c.to({ armF: -104 }, 260); c.to({ armF: -128 }, 260);
+        c.tw({ 'screen.alert': 1 }, 160); c.mood('wide'); c.wait(500); c.mood('open');
+        const keys = c.point('desk', [-3.5, -17]);
+        c.reach('both', keys, 360, 'io', { with: { head: 6 } }); c.look(3, 1.6, 160);
+        const typing = { elbF: c.cur('elbF'), elbB: c.cur('elbB') };
+        for (let i = 0; i < 9; i++) c.to({ elbF: typing.elbF - (i % 2 ? 0 : 7), elbB: typing.elbB + (i % 2 ? 6 : 0) }, 90, 'io');
+        c.look(3, -2, 200); c.to({ head: -10 }, 200);
+        for (let i = 0; i < 7; i++) c.to({ elbF: typing.elbF - (i % 2 ? 0 : 7), elbB: typing.elbB + (i % 2 ? 6 : 0) }, 90, 'io');
+        c.tw({ 'screen.alert': 0, 'screen.lock': 1 }, 300); c.wait(300);
+        c.mood('happy'); c.say('got', 700);
+        c.to({ ...REST, ry: 0, legF: 0, legB: 0, kneeF: 0, kneeB: 0, head: 0, lean: 0 }, 420, 'io'); c.mood('open'); c.look(2.4, -2);
+        c.to({ armF: -105, elbF: -30 }, 260); summon(c, 'screen', -165, 900); c.to({ armF: -172, elbF: -8 }, 900, 'in'); c.rest(260); c.look(2.4, 0);
+        c.walk(chair + grip[0] - 10, { face: false, speed: 20 });
+        c.grip('chair', grip, { lean: 8, length: 280 });
+        c.haul(['chair'], 240, { speed: 40 });
+      } },
+    architect: { kind: 'work', families: ['composition', 'calculation', 'restoration'], weight: 5,
+      props: r => [{ id: 'board', art: 'arch', x: -26 }, { id: 'hmm', art: 'bubble', layer: 'front', text: 'OXENTE?', o: 0 },
+        { id: 'ok', art: 'bubble', layer: 'front', text: r.pick(['ISSO, MACHO!', 'FICOU MASSA!']), tone: 'pow', o: 0 }],
+      play(c, r) {
+        const grip = [-24.6, -30];
+        c.set({ rx: -26 + grip[0] - 10 });
+        c.grip('board', grip, { lean: 6 });
+        c.haul(['board'], 112 + grip[0] - 10, { speed: 30 });
+        c.rest(300);
+        const board = c.pose('board').x;
+        const draw = (part, local, length) => {
+          c.walk(board + local[0] - 11, { speed: 22 });
+          c.reachAt('F', 'board', local, 260, 'io', { with: { lean: 2 } });
+          c.par(a => a.to({ [`board.${part}`]: 0 }, length, 'io'), a => {
+            for (let i = 0; i < 3; i++) a.reach('F', a.point('board', [local[0] + (i % 2 ? 2.4 : -1), local[1] + (i % 2 ? 1.6 : -1)]), length / 3, 'io');
+          });
+        };
+        c.look(3.6, -1.6);
+        draw('b1', [-13.5, -39], 520); draw('a1', [-6, -39], 300); draw('b2', [1.5, -39], 520); draw('a2', [1.5, -33.6], 280);
+        draw('db', [1.5, -27], 560); draw('a3', [9, -39], 300); draw('cl', [16, -38.6], 560); draw('fl', [11.5, -30], 420);
+        c.rest(240); c.walk(board - 34, { face: false, speed: 22 });
+        c.to({ armF: -140, elbF: -112 }, 320); c.look(3.4, -1.6); c.say('hmm', 520);
+        c.walk(board + 1.5 - 11, { speed: 26 }); draw('ci', [1.5, -39], 620);
+        c.rest(240); c.mood('happy'); c.say('ok', 560); c.mood('open');
+        c.goTo(board + grip[0] - 10, 1);
+        c.grip('board', grip, { lean: 6, length: 300 });
+        c.haul(['board'], 236, { speed: 40 });
+      } },
+    soc: { kind: 'work', families: ['reading', 'verification', 'access', 'checkpoint'], weight: 5,
+      props: r => [{ id: 'wall', art: 'socwall', x: 100, y: -170 }, { id: 'crew', art: 'crew', x: -28, layer: 'front' },
+        { id: 'look', art: 'bubble', layer: 'front', text: r.pick(['ÉGUA, É ATAQUE!', 'OLHA O CABRA AÍ!']), tone: 'pow', o: 0 }],
+      play(c, r) {
+        const grip = [-20.3, -19];
+        c.set({ rx: -28 + grip[0] - 10 });
+        c.grip('crew', grip, { lean: 6 });
+        c.haul(['crew'], 84 + grip[0] - 10, { speed: 28 });
+        c.rest(300);
+        const crew = c.pose('crew').x;
+        // Walk behind the operators and call the monitor wall down.
+        c.walk(126, { speed: 30 });
+        c.look(2.4, -2); c.to({ armF: -172, elbF: -8, head: -10 }, 320, 'out');
+        summon(c, 'wall', -46, 1100); c.to({ armF: -105, elbF: -30 }, 1100, 'io'); c.rest(260);
+        c.turn(-1); c.look(3, -2.2);
+        c.to({ armF: -150, elbF: -8, head: -8 }, 320, 'out'); c.set({ 'wall.alert': 1 }); c.mood('wide');
+        c.par(a => a.wait(700), a => { a.wait(160); a.to({ 'crew.h1': 14 }, 260).to({ 'crew.h2': 20 }, 220); });
+        c.rest(260); c.mood('open'); c.look(2.4, 0.6);
+        c.walk(116, { speed: 20 });
+        const shoulder = c.point('crew', [19.5, -27]);
+        c.reach('F', shoulder, 320, 'io', { with: { lean: 10 } });
+        for (let i = 0; i < 2; i++) c.reach('F', [shoulder[0], shoulder[1] + 1.4], 120, 'io', { with: { lean: 10 } }).reach('F', shoulder, 120, 'io', { with: { lean: 10 } });
+        c.rest(260);
+        c.to({ 'crew.thumbo': 1, 'crew.thumb': 0 }, 260, 'back'); c.mood('happy'); c.say('look', 700, { dx: 6, dy: -20 });
+        c.to({ 'crew.thumb': 60, 'crew.thumbo': 0, 'crew.h1': 0, 'crew.h2': 0 }, 260); c.mood('open');
+        c.walk(126, { face: false, speed: 22 }); c.turn(1);
+        c.to({ armF: -105, elbF: -30 }, 240); c.set({ 'wall.alert': 0 });
+        summon(c, 'wall', -170, 1000); c.to({ armF: -172, elbF: -8 }, 1000, 'in'); c.rest(260); c.look(2.4, 0);
+        c.goTo(crew + grip[0] - 10, 1);
+        c.grip('crew', grip, { lean: 6, length: 280 });
+        c.haul(['crew'], 240, { speed: 36 });
+      } },
+    servers: { kind: 'work', families: ['checkpoint', 'restoration'], weight: 5,
+      props: r => [{ id: 'rack', art: 'rack', x: -14 }, { id: 'ok', art: 'bubble', layer: 'front', text: r.pick(['TÁ NO JEITO!', 'AGORA VAI, MACHO!']), o: 0 }],
+      play(c, r) {
+        const grip = [-12.8, -27];
+        c.set({ rx: -14 + grip[0] - 10 });
+        c.grip('rack', grip, { lean: 6 });
+        c.haul(['rack'], 108 + grip[0] - 10, { speed: 30 });
+        c.rest(300);
+        const rack = c.pose('rack').x;
+        // Stand back far enough that the pulled blade and its LEDs stay in view.
+        c.walk(rack - 26, { speed: 22 }); c.look(3.4, 0.4);
+        c.reachAt('F', 'rack', [-9.6, -27.2], 360, 'io', { with: { lean: 14 } });
+        c.par(a => a.to({ 'rack.blade': -16 }, 620, 'io'), a => a.reachAt('F', 'rack', [-25.6, -27.2], 620, 'io', { with: { lean: 4 } }));
+        c.set({ 'rack.bad': 1 }); c.mood('wide'); c.to({ head: 8, lean: 8 }, 260); c.wait(620); c.mood('open');
+        c.reachAt('F', 'rack', [-12, -30.8], 240, 'out', { with: { lean: 12 } }); c.reachAt('F', 'rack', [-12, -29.4], 120, 'in', { with: { lean: 12 } });
+        c.set({ 'rack.bad': 0 }); c.wait(320);
+        c.reachAt('F', 'rack', [-25.6, -27.2], 240, 'io', { with: { lean: 4 } });
+        c.par(a => a.to({ 'rack.blade': 0 }, 560, 'io'), a => a.reachAt('F', 'rack', [-9.6, -27.2], 560, 'io', { with: { lean: 14 } }));
+        c.rest(260); c.to({ head: 0 }, 160); c.mood('happy'); c.say('ok', 620); c.mood('open');
+        c.goTo(rack + grip[0] - 10, 1);
+        c.grip('rack', grip, { lean: 6, length: 280 });
+        c.haul(['rack'], 236, { speed: 40 });
+      } },
+    hologram: { kind: 'fun', weight: 2, minElapsedMs: 6000,
+      props: [{ id: 'puck', art: 'puck', layer: 'front' }, { id: 'wow', art: 'bubble', layer: 'front', text: 'VISH, QUE MUNDÃO!', tone: 'pow', o: 0 }],
+      play(c, r) {
+        c.set({ rx: -40, armF: -40, elbF: -48 });
+        const hand = c.point('handF');
+        c.set({ puck: { x: hand[0], y: hand[1] + 3.6 } }); c.attach('puck', 'handF');
+        c.walk(r.range(78, 86), { speed: 30 });
+        const spot = c.cur('rx') + 20;
+        c.par(a => a.crouch(3), a => a.place('puck', 'F', [spot, 0], 420, 'io', { with: { lean: 22 } })); c.drop('puck');
+        c.par(a => a.crouch(0), a => a.rest(360));
+        c.walk(c.cur('rx') - 6, { face: false, speed: 18 });
+        c.to({ 'puck.beam': 1 }, 300); c.to({ 'puck.globe': 1 }, 520, 'back'); c.look(3.4, -1.6); c.to({ head: -8 }, 200);
+        for (let i = 0; i < 2; i++) c.to({ armF: -100, elbF: -20 }, 260, 'out').to({ armF: -62, elbF: -30 }, 300, 'io');
+        c.to({ armF: -96, elbF: -40, armB: -90, elbB: -40 }, 260); c.to({ 'puck.globe': 1.18 }, 300, 'out'); c.to({ 'puck.globe': 1 }, 300, 'io');
+        c.rest(260); c.mood('happy'); c.say('wow', 700); c.mood('open');
+        c.to({ 'puck.globe': 0 }, 320, 'in'); c.to({ 'puck.beam': 0, head: 0 }, 240); c.look(2.4, 0);
+        c.walk(spot - 20, { speed: 18 });
+        c.par(a => a.crouch(3), a => a.reachAt('F', 'puck', [0, -3.6], 360, 'io', { with: { lean: 22 } })); c.grab('puck');
+        c.par(a => a.crouch(0, 400), a => a.to({ lean: 0, armF: -40, elbF: -48 }, 400));
+        c.walk(240, { speed: 32 });
       } }
   };
   // A frozen standing pose for reduced motion. If motion resumes, the robot simply leaves.
@@ -1113,6 +1396,8 @@ window.WaitingVisuals = (() => {
     // Only the constant room markup above enters innerHTML; receipt text uses textContent.
     art.innerHTML = ROOM;
     root.append(art, status, metric, details); host.append(root);
+    // text: false — the host shows its own phase and figures; the status stays for screen readers.
+    if (options.text === false) root.classList.add('wv-quiet');
     const actors = art.querySelector?.('.wv-actors') || null, mirrorGroup = art.querySelector?.('.wv-mirror') || null, timer = art.querySelector?.('.wv-timer') || null;
     const supported = !!actors && typeof actors.animate === 'function' && typeof timer?.animate === 'function';
     const now = typeof view.performance?.now === 'function' ? () => view.performance.now() : () => 0;

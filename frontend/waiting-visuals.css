@@ -135,6 +135,7 @@
 
 /* Robot: chunky dark android, rim-lit, with red LEDs and a glowing core. */
 .waiting-visual .wv-shadow { fill: var(--wv-shadow); stroke: none; }
+.waiting-visual .wv-floor-glow { fill: var(--wv-accent); stroke: none; opacity: .06; }
 .waiting-visual .wv-limb-edge { stroke: var(--wv-rim); stroke-width: 4.4; }
 .waiting-visual .wv-limb { stroke: var(--wv-body); stroke-width: 3.1; }
 .waiting-visual .wv-far .wv-limb-edge { stroke: #485564; }
@@ -178,9 +179,18 @@
 .waiting-visual .wv-steam path { stroke: var(--wv-shine); stroke-width: .7; opacity: 0; animation: wv-steam 1.8s ease-out infinite; }
 .waiting-visual .wv-steam path + path { animation-delay: -.9s; }
 .waiting-visual .wv-cushion { fill: #2a2440; stroke: var(--wv-line); stroke-width: .9; }
-.waiting-visual .wv-bubble { fill: #0b1015; stroke: color-mix(in srgb, var(--wv-accent) 70%, transparent); stroke-width: .7; }
-.waiting-visual .wv-bubble-patch { fill: #0b1015; stroke: none; }
-.waiting-visual .wv-bubble-text { fill: color-mix(in srgb, var(--wv-accent) 55%, #e8eef3); stroke: none; font: 700 7.4px var(--font-ui, system-ui, sans-serif); letter-spacing: .2px; }
+/* Comic onomatopoeia: heavy slanted lettering inked in black, a 3D drop and action strokes. */
+.waiting-visual .wv-fx { --fx: color-mix(in srgb, var(--wv-accent) 72%, #ffffff); }
+.waiting-visual .wv-fx-pow { --fx: #ffd23f; }
+.waiting-visual .wv-fx-love { --fx: #ff5c8a; }
+.waiting-visual .wv-fx text { font: italic 900 10.5px "Segoe UI Black", "Arial Black", Impact, var(--font-ui, system-ui), sans-serif; letter-spacing: .3px; stroke-linejoin: round; paint-order: stroke fill; }
+.waiting-visual .wv-fx-two text { font-size: 9px; }
+.waiting-visual .wv-fx-text { fill: var(--fx); stroke: #04070a; stroke-width: 2.3; }
+.waiting-visual .wv-fx-drop { fill: color-mix(in srgb, var(--fx) 38%, #04070a); stroke: #04070a; stroke-width: 2.3; }
+.waiting-visual .wv-fx-burst { fill: none; stroke: var(--fx); stroke-width: .9; opacity: .85; }
+.waiting-visual .wv-fx-shape { fill: var(--fx); stroke: #04070a; stroke-width: 1.05; paint-order: stroke fill; stroke-linejoin: round; }
+.waiting-visual .wv-fx-ink-line { fill: none; stroke: #04070a; stroke-width: 2.2; }
+.waiting-visual .wv-fx-line { fill: none; stroke: var(--fx); stroke-width: 1; }
 .waiting-visual .wv-zzz path { stroke: var(--wv-neon); stroke-width: 1.1; opacity: 0; animation: wv-float 2.7s ease-out infinite; }
 .waiting-visual .wv-zzz path:nth-child(2) { animation-delay: -.9s; }
 .waiting-visual .wv-zzz path:nth-child(3) { animation-delay: -1.8s; }
@@ -208,9 +218,11 @@
 .waiting-visual .wv-button { fill: var(--wv-neon); stroke: none; }
 .waiting-visual .wv-led-wait { fill: var(--wv-tone-1); stroke: none; animation: wv-led 1.1s steps(2, jump-none) infinite; }
 .waiting-visual .wv-speaker { fill: var(--wv-visor); stroke: var(--wv-neon); stroke-width: .7; }
-.waiting-visual .wv-note { fill: var(--wv-neon); stroke: none; font: 700 7px var(--font-ui, system-ui, sans-serif); opacity: 0; animation: wv-float 2.2s ease-out infinite; }
-.waiting-visual .wv-note:nth-child(2) { animation-delay: -.75s; }
-.waiting-visual .wv-note:nth-child(3) { animation-delay: -1.5s; }
+.waiting-visual .wv-note { opacity: 0; animation: wv-float 2.2s ease-out infinite; }
+.waiting-visual .wv-note-b { animation-delay: -.75s; }
+.waiting-visual .wv-note-c { animation-delay: -1.5s; }
+.waiting-visual .wv-note-stem { fill: none; stroke: var(--wv-neon); stroke-width: .8; }
+.waiting-visual .wv-note-head { fill: var(--wv-neon); stroke: none; }
 .waiting-visual .wv-deck { fill: var(--wv-body); stroke: var(--wv-rim); stroke-width: .8; }
 .waiting-visual .wv-p-skate .wv-wheel { fill: var(--wv-neon); stroke: none; opacity: .55; }
 .waiting-visual .wv-p-skate .wv-spoke { display: none; }
@@ -229,6 +241,47 @@
 .waiting-visual .wv-flower { fill: var(--wv-tone-1); stroke: none; }
 .waiting-visual .wv-box { fill: var(--wv-body); stroke: var(--wv-rim); stroke-width: .8; }
 
+/* Tech set: desks, ceiling screens, digital rain, SOC crew, racks and holograms. */
+.waiting-visual { --wv-matrix: #39ff88; --wv-hot: #ff4d5e; }
+.waiting-visual .wv-keys { fill: #0b1015; stroke: var(--wv-line); stroke-width: .6; }
+.waiting-visual .wv-tower-led { fill: var(--wv-neon); stroke: none; animation: wv-core 1.4s ease-in-out infinite; }
+.waiting-visual .wv-chair-back { fill: var(--wv-body-far); stroke: var(--wv-rim); stroke-width: .7; }
+.waiting-visual .wv-screen-bg { fill: #04080b; stroke: var(--wv-line); stroke-width: .8; }
+.waiting-visual .wv-screen-grid { stroke: color-mix(in srgb, var(--wv-accent) 14%, transparent); stroke-width: .4; }
+.waiting-visual .wv-land { fill: color-mix(in srgb, var(--wv-accent) 16%, transparent); stroke: color-mix(in srgb, var(--wv-accent) 40%, transparent); stroke-width: .4; }
+.waiting-visual .wv-arc { stroke: var(--wv-hot); stroke-width: .8; stroke-dasharray: .22 .78; animation: wv-arc 1.6s linear infinite; }
+.waiting-visual .wv-arc-b { animation-delay: -.55s; stroke: #ffb347; }
+.waiting-visual .wv-arc-c { animation-delay: -1.1s; }
+.waiting-visual .wv-node { fill: var(--wv-neon); stroke: none; }
+.waiting-visual .wv-node-hot { fill: var(--wv-hot); }
+.waiting-visual .wv-pulse { fill: none; stroke: var(--wv-hot); stroke-width: .5; transform-box: fill-box; transform-origin: center; animation: wv-ping 1.4s ease-out infinite; }
+.waiting-visual .wv-screen-text { stroke: color-mix(in srgb, var(--wv-accent) 55%, transparent); stroke-width: .7; }
+.waiting-visual .wv-bar { fill: var(--wv-neon); transform-box: fill-box; transform-origin: bottom; animation: wv-meter 1.2s ease-in-out infinite alternate; }
+.waiting-visual .wv-bar-b { animation-delay: -.6s; }
+.waiting-visual .wv-alert-frame { fill: color-mix(in srgb, var(--wv-hot) 14%, transparent); stroke: var(--wv-hot); stroke-width: .7; animation: wv-core .7s steps(2, jump-none) infinite; }
+.waiting-visual .wv-alert-icon { fill: none; stroke: var(--wv-hot); stroke-width: .8; }
+.waiting-visual .wv-alert-mark { stroke: var(--wv-hot); stroke-width: .8; }
+.waiting-visual .wv-lock-ok-body { fill: color-mix(in srgb, var(--wv-neon) 30%, transparent); stroke: var(--wv-neon); stroke-width: .6; }
+.waiting-visual .wv-lock-ok { stroke: var(--wv-neon); stroke-width: .8; }
+.waiting-visual .wv-handle { fill: var(--wv-rim); stroke: none; }
+.waiting-visual .wv-matrix rect { fill: var(--wv-matrix); opacity: .1; animation: wv-rain 1.6s linear infinite; }
+.waiting-visual .wv-op { fill: #1b232d; stroke: #3a4756; stroke-width: .5; }
+.waiting-visual .wv-op-rim { stroke: color-mix(in srgb, var(--wv-matrix) 75%, transparent); stroke-width: .6; }
+.waiting-visual .wv-op-arm { stroke: #1b232d; stroke-width: 2.2; }
+.waiting-visual .wv-op-ear { fill: var(--wv-neon); stroke: none; opacity: .8; }
+.waiting-visual .wv-headset { stroke: #2a3440; stroke-width: .9; }
+.waiting-visual .wv-chalk-hot { stroke: #ffd23f; }
+.waiting-visual .wv-unit { fill: #0d1217; stroke: var(--wv-soft-line); stroke-width: .5; }
+.waiting-visual .wv-led-run { fill: var(--wv-matrix); stroke: none; animation: wv-led-run 1.2s steps(2, jump-none) infinite; }
+.waiting-visual .wv-led-bad { fill: var(--wv-hot); stroke: none; animation: wv-core .5s steps(2, jump-none) infinite; }
+.waiting-visual .wv-beam { fill: color-mix(in srgb, var(--wv-accent) 12%, transparent); stroke: none; }
+.waiting-visual .wv-holo { fill: color-mix(in srgb, var(--wv-accent) 8%, transparent); stroke: var(--wv-neon); stroke-width: .6; }
+.waiting-visual .wv-holo-line { fill: none; stroke: color-mix(in srgb, var(--wv-neon) 70%, transparent); stroke-width: .45; }
+.waiting-visual .wv-meridian { transform-box: view-box; transform-origin: 0 0; animation: wv-meridian 3s linear infinite; }
+.waiting-visual .wv-orbit { transform-box: view-box; transform-origin: 0 0; animation: wv-spin 4s linear infinite; }
+.waiting-visual .wv-holo-dot { fill: var(--wv-neon); stroke: none; }
+.waiting-visual .wv-puck { fill: var(--wv-body); stroke: var(--wv-rim); stroke-width: .7; }
+
 /* ------------------------------------------------------------------ text */
 .waiting-visual .wv-status {
   max-inline-size: 100%;
@@ -246,6 +299,11 @@
   line-height: 1.45;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
+}
+
+.waiting-visual.wv-quiet { gap: 0; }
+.waiting-visual.wv-quiet .wv-status, .waiting-visual.wv-quiet .wv-metric, .waiting-visual.wv-quiet .wv-details {
+  position: absolute; inline-size: 1px; block-size: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap;
 }
 
 /* ------------------------------------------------------------------ states */
@@ -293,6 +351,12 @@
 .case-report-dialog .waiting-visual, .tx-dialog .waiting-visual { --wv-size: 100px; }
 
 @keyframes wv-spin { to { transform: rotate(360deg); } }
+@keyframes wv-rain { 0% { opacity: .95; } 12% { opacity: .55; } 55%, 100% { opacity: .08; } }
+@keyframes wv-arc { to { stroke-dashoffset: -1; } }
+@keyframes wv-ping { 0% { opacity: .9; transform: scale(.6); } 100% { opacity: 0; transform: scale(2.4); } }
+@keyframes wv-meter { from { transform: scaleY(.3); } to { transform: scaleY(1); } }
+@keyframes wv-led-run { 0% { opacity: 1; } 100% { opacity: .25; } }
+@keyframes wv-meridian { 0% { transform: scaleX(1); } 25% { transform: scaleX(0); } 50% { transform: scaleX(-1); } 75% { transform: scaleX(0); } 100% { transform: scaleX(1); } }
 @keyframes wv-scan { 0% { opacity: 0; transform: translateY(0); } 2% { opacity: 1; } 15% { opacity: 1; } 17% { opacity: 0; transform: translateY(370%); } 100% { opacity: 0; transform: translateY(370%); } }
 @keyframes wv-blink { 0%, 93%, 100% { transform: scaleY(1); } 95.5% { transform: scaleY(.12); } }
 @keyframes wv-core { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }

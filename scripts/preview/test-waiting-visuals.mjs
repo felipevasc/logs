@@ -48,10 +48,21 @@ try {
   assert.equal(results.overlay.ring, true); assert.equal(results.overlay.scan, true); assert.equal(results.overlay.toggles, 0);
   assert.equal(results.overlay.status, 'Validando a fonte'); assert.equal(results.overlay.barHidden, true); assert.equal(results.overlay.ringSpins, true);
   assert.ok(Math.abs(results.overlay.size - 124) < 1);
+  await page.evaluate(() => LoadProgress.render({ label: 'Transferindo · fonte.gz', progress: 50,
+    metrics: { completed: 1024, total: 2048, unit: 'bytes', elapsed: 61, phaseSeconds: 10, rate: 512, eta: 2, error: 'Aguardando disco' } }));
+  assert.equal(await page.locator('#load-amount').textContent(), '1 KB');
+  assert.equal(await page.locator('#load-of').textContent(), 'de 2 KB');
+  assert.equal(await page.locator('#load-note').textContent(), 'fonte.gz');
+  assert.equal(await page.locator('#load-stats [data-stat="rate"] dd').textContent(), '512 B/s');
   await page.evaluate(() => mirrorLoadOverlay('Indexando registros', '1.200 / 6.300 registros', 19));
+  assert.equal(await page.locator('#load-stats').evaluate(node => node.childElementCount), 0, 'plain phases clear previous metrics');
+  assert.equal(await page.locator('#load-error').evaluate(node => node.hidden), true, 'plain phases clear previous errors');
+  await page.evaluate(() => LoadProgress.tick());
+  assert.equal(await page.locator('#load-stats').evaluate(node => node.childElementCount), 0, 'ticks cannot restore stale timing');
   results.progress = await page.evaluate(() => ({ barHidden: document.querySelector('#load-bar-fill').parentElement.hidden,
-    volume: document.querySelector('#load-volume').textContent, volumeVisible: document.querySelector('#load-volume').getClientRects().length > 0 }));
-  assert.deepEqual(results.progress, { barHidden: false, volume: '1.200 / 6.300 registros', volumeVisible: true });
+    title: document.querySelector('#load-title').textContent, amount: document.querySelector('#load-amount').textContent,
+    amountVisible: document.querySelector('#load-amount').getClientRects().length > 0, percent: document.querySelector('#load-percent').textContent }));
+  assert.deepEqual(results.progress, { barHidden: false, title: 'Indexando registros', amount: '1.200 / 6.300 registros', amountVisible: true, percent: '19%' });
   // The first robot shows up soon, inside the room, as part of a whole skit.
   await page.waitForFunction(selector => document.querySelector(selector)?.dataset.skit, overlay, { timeout: 4000 });
   await page.waitForTimeout(1800);

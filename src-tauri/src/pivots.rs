@@ -445,9 +445,13 @@ pub struct SourceHash {
     pub origin: String,
 }
 
-static HASHES: Mutex<Vec<(String, SourceHash)>> = Mutex::new(Vec::new());
+static HASHES: Mutex<Vec<(String, Option<crate::cache_validation::Generation>, SourceHash)>> = Mutex::new(Vec::new());
 
 fn sha256_file(path: &std::path::Path) -> Result<(String, u64), String> {
+    crate::computed_cache::file(path, "sha256-v1", || sha256_file_uncached(path))
+}
+
+fn sha256_file_uncached(path: &std::path::Path) -> Result<(String, u64), String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
@@ -522,14 +526,16 @@ pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
         }
     }
     let token = crate::operations::current_token();
-    let results: Vec<Result<(String, SourceHash, bool), String>> = crate::global_scheduler::map(jobs, |(cache_key, id, path, name, physical, origin)| {
-        crate::operations::run_with_token(token.clone(), || -> Result<(String, SourceHash, bool), String> {
-            if let Some((_, hit)) = HASHES.lock().iter().find(|(key, _)| *key == cache_key) {
+    let results: Vec<Result<_, String>> = crate::global_scheduler::map(jobs, |(cache_key, id, path, name, physical, origin)| {
+        crate::operations::run_with_token(token.clone(), || -> Result<_, String> {
+            let generation = crate::cache_validation::Generation::capture(&[physical.clone()]);
+            if let Some((_, _, hit)) = HASHES.lock().iter().find(|(key, stamp, _)| *key == cache_key && generation.as_ref().is_some_and(|generation| stamp.as_ref() == Some(generation))) {
                 // Digest reuse must not reuse a previous display alias/name.
-                return Ok((cache_key, SourceHash { id, path, name, bytes: hit.bytes, sha256: hit.sha256.clone(), origin: origin.into() }, false));
+                return Ok((cache_key, generation, SourceHash { id, path, name, bytes: hit.bytes, sha256: hit.sha256.clone(), origin: origin.into() }, false));
             }
             let (sha256, bytes) = sha256_file(&physical)?;
-            Ok((cache_key, SourceHash { id, path, name, bytes, sha256, origin: origin.into() }, true))
+            if generation.as_ref().is_some_and(|generation| !generation.is_current()) { return Err("A fonte mudou durante o cálculo do hash.".into()); }
+            Ok((cache_key, generation, SourceHash { id, path, name, bytes, sha256, origin: origin.into() }, true))
         })?
     });
     let results: Vec<_> = results.into_iter().collect::<Result<_, _>>()?;
@@ -537,13 +543,13 @@ pub fn hashes_impl(state: &AppState) -> Result<Vec<SourceHash>, String> {
     // original enters HASHES, and no stale loaded ID labels newer source bytes.
     validate()?;
     let mut cache = HASHES.lock();
-    for (cache_key, hash, fresh) in &results {
+    for (cache_key, generation, hash, fresh) in &results {
         if *fresh {
             if cache.len() >= 512 { cache.remove(0); }
-            cache.push((cache_key.clone(), hash.clone()));
+            cache.push((cache_key.clone(), generation.clone(), hash.clone()));
         }
     }
-    Ok(results.into_iter().map(|(_, hash, _)| hash).collect())
+    Ok(results.into_iter().map(|(_, _, hash, _)| hash).collect())
 }
 
 #[tauri::command]

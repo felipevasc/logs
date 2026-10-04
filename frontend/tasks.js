@@ -182,7 +182,7 @@ window.Tasks = (() => {
     if (selected) {
       const timing = `${detail(selected)} · ${elapsed(selected)} decorridos`;
       $("#workbar-detail").textContent = timing;
-      if (state.loadOverlay) $("#load-eta").textContent = timing;
+      if (state.loadOverlay) window.LoadProgress?.tick();
     }
     if (dialog) drawDialog();
     // Menus and tabs are redrawn by their pages; marks are refreshed while work goes on.

@@ -3,6 +3,10 @@ import { spawnSync } from 'node:child_process';
 
 const base = ['test', '--manifest-path', 'src-tauri/Cargo.toml', '--release', '--locked'];
 const units = [
+  'cache_validation::tests::', 'computed_cache::tests::',
+  'metadata_checkpoint::tests::', 'index_cache::timestamp_overlay_tests::',
+  'engine::build::checkpoint_tests::', 'engine::time_index::tests::',
+  'workspace::canonical::tests::', 'triage::on_demand_tests::',
   'source_publication::tests::', 'global_scheduler::tests::',
   'remote::tests::', 'remote_files::tests::', 'field_indexes::tests::',
   'analysis_context::tests::existing_sqlite_cases_migrate_but_first_new_case_does_not_inherit_globals',
@@ -15,7 +19,7 @@ const units = [
 const commands = process.argv.includes('--extended')
   ? [[...base, '--tests', '--', '--test-threads=1']]
   : [[...base, '--lib', '--', '--test-threads=1', ...units],
-     [...base, '--test', 'engine_parity', '--test', 'engine_build', '--test', 'metadata_recovery', '--test', 'wrapped_log_import', '--', '--test-threads=1']];
+     [...base, '--test', 'engine_parity', '--test', 'engine_build', '--test', 'metadata_recovery', '--test', 'startup_reuse', '--test', 'wrapped_log_import', '--', '--test-threads=1']];
 for (const args of commands) {
   const result = spawnSync('cargo', args, { stdio: 'inherit' });
   if (result.error) throw result.error;

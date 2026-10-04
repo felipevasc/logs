@@ -6,6 +6,7 @@ use crate::model::CodesConfig;
 use crate::query::{self, AggSpec, Filter};
 use crate::sources::{event_at, CompiledDerived, FileIndex};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Initialize the same coordinated parser pool as the desktop before any
 /// benchmark/fixture work can initialize Rayon's unrestricted default pool.
@@ -135,6 +136,27 @@ impl Source {
 
     pub fn is_empty(&self) -> bool {
         self.idx.lines.is_empty()
+    }
+    /// The desktop's post-load results, through their production persistence.
+    pub fn startup_analysis(&self) -> Result<Value, String> {
+        admit(crate::global_scheduler::Priority::Normal, || {
+            let state = crate::AppState {
+                source: parking_lot::RwLock::new(crate::SourceData::Indexed(FileIndex {
+                    parts: self.idx.parts.clone(), lines: Arc::clone(&self.idx.lines),
+                    columns: self.idx.columns.clone(), time_order: Arc::clone(&self.idx.time_order),
+                })),
+                source_publication: parking_lot::RwLock::new(Default::default()),
+                source_names: parking_lot::RwLock::new(self.idx.parts.iter().map(|part| part.path.clone()).collect()),
+                codes: parking_lot::RwLock::new(self.codes.clone()), system_codes: parking_lot::RwLock::new(self.system.clone()),
+                derived: parking_lot::RwLock::new(self.derived.clone()), case_store_lock: parking_lot::Mutex::new(()),
+                codes_path: Default::default(), system_codes_path: Default::default(),
+            };
+            Ok(serde_json::json!({
+                "overview": crate::workspace::overview_impl(&state, vec![])?,
+                "fields": crate::profile_fields_impl(&state, vec![], None)?,
+                "hashes": crate::pivots::hashes_impl(&state)?,
+            }))
+        })?
     }
     pub fn set_system_catalog(&mut self, catalog: &str) {
         self.system = parse(catalog);

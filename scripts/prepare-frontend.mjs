@@ -15,7 +15,7 @@ for (const item of ["index.html", "icon-picker.js", "case-timeline.js", "case-re
 
 // A successful build must include every local script referenced by the entrypoint.
 for (const item of [
-  "participants-ui.js", "assets", "date-values.js", "waiting-visuals.js", "waiting-visuals.css", "waiting-progress.js",
+  "participants-ui.js", "assets", "date-values.js", "load-progress.js", "waiting-visuals.js", "waiting-visuals.css", "waiting-progress.js",
   "case-evidence.js", "case-evidence-session.js", "case-evidence-analysis.js",
   "case-evidence-preserved.js", "case-evidence-items.js", "case-evidence-actions.js",
   "case-evidence-detail.js", "case-evidence-timeline.js", "case-evidence-display.js",

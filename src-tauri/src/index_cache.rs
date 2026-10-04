@@ -289,6 +289,7 @@ fn restore_timestamps(
     let Ok(file) = std::fs::File::open(path) else {
         return Ok(false);
     };
+    let generation = crate::cache_validation::Generation::capture(&[path.to_path_buf()]);
     let count = idx.lines.len();
     let Some(payload_len) = count.checked_mul(8).and_then(|n| n.checked_add(80)) else {
         return Ok(false);
@@ -313,13 +314,21 @@ fn restore_timestamps(
     if &mapped[16..80] != key.as_bytes() {
         return Ok(false);
     }
-    let mut hash = Sha256::new();
-    for bytes in mapped[..payload_len].chunks(1 << 20) {
-        crate::operations::check()?;
-        hash.update(bytes);
+    let context = format!("timestamps-v1|{key}|{count}");
+    let reused = generation.as_ref().is_some_and(|g| g.covers(path, &file) && g.verified(path, &context));
+    if !reused {
+        let mut hash = Sha256::new();
+        for bytes in mapped[..payload_len].chunks(1 << 20) {
+            crate::operations::check()?;
+            hash.update(bytes);
+        }
+        if hash.finalize().as_slice() != &mapped[payload_len..] {
+            return Ok(false);
+        }
     }
-    if hash.finalize().as_slice() != &mapped[payload_len..] {
-        return Ok(false);
+    if let Some(generation) = &generation {
+        if !generation.is_current() || !generation.covers(path, &file) { return Ok(false); }
+        if !reused { generation.remember(path, &context); }
     }
     sources::validate_source(&idx.parts[0])?;
     if let Some(report) = progress { report("Reutilizando cache de data/hora", count, count); }

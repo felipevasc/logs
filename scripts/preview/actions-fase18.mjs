@@ -6,16 +6,16 @@ export default async (page) => {
   // captura no meio da indexação simulada
   await page.waitForTimeout(1100);
   const mid = await page.evaluate(() => ({
-    phase: document.querySelector("#load-phase").textContent,
-    volume: document.querySelector("#load-volume").textContent,
-    eta: document.querySelector("#load-eta").textContent,
+    phase: document.querySelector("#load-title").textContent,
+    volume: document.querySelector("#load-amount").textContent,
+    eta: document.querySelector("#load-stats").textContent,
   }));
   console.log("meio:", JSON.stringify(mid));
   await page.screenshot({ path: "output/f18-granular.png", clip: { x: 520, y: 280, width: 420, height: 360 } });
   await page.waitForTimeout(1400);
   const late = await page.evaluate(() => ({
-    volume: document.querySelector("#load-volume").textContent,
-    eta: document.querySelector("#load-eta").textContent,
+    volume: document.querySelector("#load-amount").textContent,
+    eta: document.querySelector("#load-stats").textContent,
   }));
   console.log("fim:", JSON.stringify(late));
   await page.waitForTimeout(4000);

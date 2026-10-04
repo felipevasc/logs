@@ -2,7 +2,7 @@ use crate::model::Event;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Pattern {
     pub pattern: String,
     pub count: usize,
@@ -11,13 +11,13 @@ pub struct Pattern {
     pub last: Option<i64>,
     pub example: Event,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Bucket {
     pub timestamp: i64,
     pub count: usize,
     pub errors: usize,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub kind: String,
     pub title: String,
@@ -26,7 +26,7 @@ pub struct Finding {
     pub end: Option<i64>,
     pub event_id: Option<usize>,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Overview {
     pub total: usize,
     pub errors: usize,
@@ -44,7 +44,7 @@ pub struct Overview {
     pub complete: bool,
     pub latency: Option<Latency>,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Latency {
     pub field: String,
     pub unit: String,

@@ -185,7 +185,7 @@ function syncLoadCancel(focused = document.activeElement) {
   $("#load-cancel-help").textContent = state.loadOverlayCancelling
     ? "Aguardando confirmação da operação."
     : button.disabled ? "Cancelamento indisponível nesta etapa."
-    : "Solicita a interrupção desta operação.";
+    : "";
   // A disappearing/disabled control must not strand keyboard focus. Do not
   // move focus when the user is reading details or working elsewhere.
   if (focused === button && button.disabled) {
@@ -238,22 +238,20 @@ function showLoadOverlay(firstStep = "Validando a fonte", progressKey = "source-
   state.loadOverlayCancellable = false;
   state.loadOverlayCancelling = false;
   state.loadOverlayVersion = (state.loadOverlayVersion || 0) + 1;
-  loadStepCount = 0;
-  $("#load-steps").innerHTML = "";
-  $("#load-bar-fill").style.width = "0%"; $("#load-bar-fill").parentElement.hidden = true;
+  loadStepCount = 1;
   state.operationTiming = "";
-  $("#load-phase").textContent = "Preparando…";
-  $("#load-volume").textContent = "";
-  $("#load-eta").textContent = "";
+  state.loadMetrics = null;
+  state.loadOverlayPhase = firstStep;
   progressSamples.length = 0;
-  pushLoadStep(firstStep);
+  window.LoadProgress?.reset(firstStep);
   $("#load-overlay").hidden = false;
   $("#load-progress-details").open = false;
   loadWaitingVisual?.destroy();
   loadWaitingReceipt = {
     operationId: `foreground-${state.loadOverlayVersion}`, phaseId: "", state: "running", label: firstStep,
   };
-  loadWaitingVisual = window.WaitingVisuals.mount($("#load-visual"), loadWaitingReceipt);
+  // The card below shows the phase and figures; the animation keeps only its live status.
+  loadWaitingVisual = window.WaitingVisuals.mount($("#load-visual"), loadWaitingReceipt, { text: false });
   syncLoadCancel();
 }
 
@@ -278,38 +276,19 @@ function hideLoadOverlay(ok = true) {
     }
   }
   loadReturnFocus = null;
-  if (ok) {
-    document.querySelectorAll("#load-steps li").forEach((li) => {
-      li.classList.add("done");
-      li.querySelector(".load-step-ico").innerHTML = '<i class="fas fa-check"></i>';
-    });
-    $("#load-bar-fill").parentElement.hidden = false; $("#load-bar-fill").style.width = "100%";
-    $("#load-phase").textContent = "Pronto!";
-  }
+  state.loadMetrics = null;
+  window.LoadProgress?.finish(ok);
 }
 
 function pushLoadStep(label) {
-  const steps = $("#load-steps");
-  steps.querySelectorAll("li").forEach((li) => {
-    li.classList.add("done");
-    li.querySelector(".load-step-ico").innerHTML = '<i class="fas fa-check"></i>';
-  });
-  const li = el("li");
-  li.innerHTML = `<span class="load-step-ico"><span class="load-step-spin"></span></span><span>${esc(label)}</span>`;
-  steps.appendChild(li);
+  window.LoadProgress?.step(label);
   loadStepCount++;
-  // mantém só os últimos passos visíveis
-  while (steps.children.length > 4) steps.firstChild.remove();
 }
 
 function mirrorLoadOverlay(label, detail, progress, waiting = null, cancellable = false) {
   if (!state.loadOverlay) return;
-  if (label && label !== $("#load-phase").textContent) pushLoadStep(label);
-  $("#load-phase").textContent = label;
-  $("#load-volume").textContent = detail || "";
-  $("#load-bar-fill").parentElement.hidden = progress == null;
-  if (progress != null) $("#load-bar-fill").style.width = `${Math.max(0, Math.min(100, progress))}%`;
-  $("#load-eta").textContent = state.operationTiming || "";
+  if (label && label !== state.loadOverlayPhase) { state.loadOverlayPhase = label; pushLoadStep(label); }
+  window.LoadProgress?.render({ label, detail, progress, metrics: state.loadMetrics });
   state.loadOverlayCancellable = !!cancellable && waiting?.operationId === state.loadOverlayOperationId;
   updateLoadWaiting(waiting || {
     operationId: state.loadOverlayOperationId || `foreground-${state.loadOverlayVersion}`, phaseId: "", state: "running", label: label || "Processando",
@@ -366,6 +345,9 @@ window.__TAURI__.event?.listen("operation-progress", ({ payload }) => {
   if (payload.resumedRows > 0) timing.push(`${fmtNum(payload.resumedRows)} registros retomados`);
   if (payload.checkpointRows > 0) timing.push(`${fmtNum(payload.checkpointRows)} salvos para retomada`);
   state.operationTiming = timing.join(" · ");
+  state.loadMetrics = state.loadOverlay ? { completed: estimate.completed, total: estimate.total, unit: payload.unit || "itens",
+    rate: estimate.rate, eta: estimate.eta, elapsed, phaseSeconds, selected: payload.unit === "candidatos" ? payload.selected : undefined,
+    resumed: payload.resumedRows, checkpoint: payload.checkpointRows, error: payload.error || "" } : null;
   state.progressOperationId = task?.operationId || null;
   const volume = estimate.total > 0 ? `${fmtNum(estimate.completed)} / ${fmtNum(estimate.total)} ${payload.unit || "itens"}` : estimate.completed ? `${fmtNum(estimate.completed)} ${payload.unit || "itens"}` : "Total ainda desconhecido";
   const waiting = window.WaitingProgress.snapshot(payload, { operationId: id,
