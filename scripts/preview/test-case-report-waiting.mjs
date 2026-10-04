@@ -55,9 +55,9 @@ try {
   });
   phase='room';await begin();mark('real-render-wait');
   results.room=await scene.evaluate(root=>({family:root.dataset.family,ring:!!root.querySelector('.wv-ring-arc'),buttons:root.querySelectorAll('button').length,
-    size:root.querySelector('.wv-art').getBoundingClientRect().width,status:root.querySelector('.wv-status').textContent,metricHidden:root.querySelector('.wv-metric').hidden}));
+    size:root.querySelector('.wv-art').getBoundingClientRect().width,status:root.querySelector('.wv-status').textContent,metricEmpty:root.querySelector('.wv-metric').dataset.empty==='true',metricHeight:root.querySelector('.wv-metric').getBoundingClientRect().height}));
   assert.equal(results.room.family,'composition');assert.equal(results.room.ring,true);assert.equal(results.room.buttons,0);
-  assert.ok(Math.abs(results.room.size-100)<1);assert.equal(results.room.metricHidden,true);
+  assert.ok(Math.abs(results.room.size-100)<1);assert.equal(results.room.metricEmpty,true);assert.ok(results.room.metricHeight>0,'the empty metric keeps its line');
   // A whole skit begins shortly after the loader and runs on its own clock.
   await page.waitForFunction(()=>document.querySelector('.case-report-dialog .waiting-visual')?.dataset.skit,null,{timeout:4000});
   await page.waitForTimeout(1600);

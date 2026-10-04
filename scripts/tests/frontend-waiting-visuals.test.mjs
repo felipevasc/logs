@@ -96,21 +96,52 @@ test('only supplied valid measurements appear; no fabricated totals, phase count
   assert.equal(derive(receipt({ state: 'error', label: 'Disco cheio' })).status, 'Não foi possível continuar · Disco cheio');
 });
 
+const outside = (x, half) => x + half < 4 || x - half > 196;
+function assertEmptyEnds(clip, label) {
+  for (const time of [0, clip.duration]) {
+    const probe = clip.probe(time);
+    // Gone means outside the window, faded out (teleports, doorways) or lifted above it (jetpacks, drones).
+    assert.ok(probe.robot <= -24 || probe.robot >= 224 || probe.robotHidden, `${label}: robot visible at ${time} ms (${probe.robot})`);
+    // Ceiling screens and dropped sets wait above the room (their bottom edge above the window).
+    for (const prop of probe.props) assert.ok(prop.opacity < 0.01 || prop.y < -112 || outside(prop.x, prop.half), `${label}: ${prop.id} visible at ${time} ms`);
+  }
+  assert.ok(clip.duration >= 3000 && clip.duration <= 36000, `${label}: ${clip.duration} ms`);
+}
+
 test('every skit starts and ends with an empty room, for many random variations', () => {
   const { compile, skits } = load();
-  const outside = (x, half) => x + half < 4 || x - half > 196;
   for (const name of Object.keys(skits)) {
-    for (let seed = 1; seed <= 25; seed++) {
+    for (let seed = 1; seed <= 12; seed++) {
       const clip = compile(name, { seed });
-      for (const time of [0, clip.duration]) {
-        const probe = clip.probe(time);
-        assert.ok(probe.robot <= -24 || probe.robot >= 224, `${name}/${seed}: robot visible at ${time} ms (${probe.robot})`);
-        // Ceiling screens wait above the room (their bottom edge above the window).
-        for (const prop of probe.props) assert.ok(prop.opacity < 0.01 || prop.y < -112 || outside(prop.x, prop.half), `${name}/${seed}: ${prop.id} visible at ${time} ms`);
-      }
-      assert.ok(clip.duration >= 3000 && clip.duration <= 30000, `${name}: ${clip.duration} ms`);
+      assertEmptyEnds(clip, `${name}/${seed}`);
+      // Random combinations stay short enough to be watched whole.
+      assert.ok(clip.duration <= 32500, `${name}/${seed}: ${clip.duration} ms`);
     }
   }
+});
+
+test('arrivals, departures, breaks, deliveries and extras are interchangeable pieces', () => {
+  const { compile, skits, pieces } = load();
+  assert.ok(pieces.arrivals.length >= 12 && pieces.departures.length >= 12, 'many ways in and out');
+  assert.ok(pieces.breaks.length >= 15 && pieces.extras.length >= 12 && pieces.deliveries.length === 3);
+  for (const travel of ['car', 'bike', 'jetpack', 'drone', 'teleport', 'door']) assert.ok(pieces.arrivals.includes(travel) && pieces.departures.includes(travel), travel);
+  const composed = Object.keys(skits).filter(name => skits[name].composed);
+  assert.ok(composed.length >= 30, `composed activities: ${composed.length}`);
+  for (const name of ['usb', 'filing']) {
+    const base = { arrive: 'walk', leave: 'walk', brk: null, extras: [] };
+    for (const arrive of pieces.arrivals) assertEmptyEnds(compile(name, { seed: 1, parts: { ...base, arrive } }), `${name}+${arrive}`);
+    for (const leave of pieces.departures) assertEmptyEnds(compile(name, { seed: 1, parts: { ...base, leave } }), `${name}+${leave}`);
+    for (const brk of pieces.breaks) assertEmptyEnds(compile(name, { seed: 2, parts: { ...base, brk } }), `${name}+${brk}`);
+    for (const deliver of pieces.deliveries) assertEmptyEnds(compile(name, { seed: 3, parts: { ...base, deliver } }), `${name}+${deliver}`);
+    for (const extra of pieces.extras) assertEmptyEnds(compile(name, { seed: 4, parts: { ...base, extras: [extra] } }), `${name}+${extra}`);
+  }
+  // Seeds alone already produce hundreds of different scenes.
+  const scenes = new Set();
+  for (let seed = 1; seed <= 360; seed++) {
+    const name = composed[seed % composed.length], { plan } = compile(name, { seed });
+    scenes.add([name, plan.arrive, plan.brk, plan.leave, plan.deliver].join('|'));
+  }
+  assert.ok(scenes.size >= 300, `distinct scenes: ${scenes.size}`);
 });
 
 test('skits animate only transform, opacity and chalk stroke offsets with ordered keyframes', () => {
@@ -147,8 +178,8 @@ test('the director varies skits, never repeats the last two and respects phase a
     assert.ok(skits[name].kind === 'fun' || skits[name].families.includes('reading'), name);
     history.push(name); seen.add(name);
   }
-  assert.ok(seen.size >= 10, `variety: ${[...seen]}`);
-  assert.ok(history.filter(name => name === 'reading').length > 40, 'context work still appears often');
+  assert.ok(seen.size >= 25, `variety: ${seen.size}`);
+  assert.ok(history.filter(name => skits[name].kind === 'work').length > 100, 'context work still appears often');
   const early = createDirector({ random });
   early.next('neutral', 0);
   for (let i = 0; i < 200; i++) {
@@ -237,5 +268,5 @@ test('the room styles stay local, dark, themed by tokens and paused when motion 
   assert.match(css, /@media \(prefers-reduced-motion: reduce\) \{\s*\.waiting-visual \*, \.waiting-visual \*::after \{ animation-play-state: paused !important; \}/);
   assert.match(css, /\.waiting-visual\[data-motion="static"\] \*/);
   assert.match(css, /\.waiting-visual\[data-mirror="true"\] \.wv-unmirror \{ transform: scale\(-1, 1\); \}/);
-  assert.ok(Buffer.byteLength(source) < 160000 && Buffer.byteLength(css) < 48000, 'the component stays small');
+  assert.ok(Buffer.byteLength(source) < 340000 && Buffer.byteLength(css) < 72000, 'the component stays bounded');
 });

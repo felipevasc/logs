@@ -97,38 +97,42 @@ body:not([data-page="explore"]) .filter-tabs{display:none!important}
 }
 
 /* Foreground loading: the room, then one title, the amount over the bar, a few
-   labelled figures, Cancel and the collapsible step history. */
+   labelled figures, Cancel and the collapsible step history. Every line keeps a
+   fixed height and the card is anchored at the top, so nothing moves while values change. */
+.load-overlay { align-items: flex-start; padding-top: clamp(16px, 9vh, 96px); }
 .semantic-load-stage { gap: 12px; max-height: calc(100vh - var(--topbar-h) - 40px); overflow-y: auto; }
 .semantic-load-stage.load-stage { width: min(300px, 86vw); padding: 20px 22px 14px; }
 #load-visual { width: 100%; }
 #load-visual .waiting-visual { --wv-size: 124px; }
 .load-summary { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 100%; min-width: 0; text-align: center; }
-.load-title { margin: 0; color: var(--text-0); font-size: 15px; font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; }
-.load-note { margin: -2px 0 0; color: var(--text-2); font-size: 11.5px; line-height: 1.4; overflow-wrap: anywhere; }
-.load-figures { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; width: 100%; margin-top: 6px; font-variant-numeric: tabular-nums; }
+.load-title, .load-note, .load-figures-amount, .load-extra { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.load-title { margin: 0; height: 20px; color: var(--text-0); font-size: 15px; font-weight: 650; line-height: 20px; }
+.load-note { margin: -2px 0 0; height: 16px; color: var(--text-2); font-size: 11.5px; line-height: 16px; }
+.load-figures { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; width: 100%; height: 22px; margin-top: 6px; font-variant-numeric: tabular-nums; }
 .load-figures:has(.load-percent:empty) { justify-content: center; }
-.load-figures-amount { min-width: 0; color: var(--text-1); font-size: 12px; overflow-wrap: anywhere; text-align: left; }
+.load-figures-amount { min-width: 0; color: var(--text-1); font-size: 12px; line-height: 22px; text-align: left; }
 .load-figures-amount strong { color: var(--text-0); font-size: 15px; font-weight: 700; }
 .load-percent { color: var(--accent); font-size: 13px; font-weight: 700; }
-.load-summary .load-bar { height: 5px; }
-.load-summary .load-bar[hidden], .load-figures[hidden], .load-note[hidden], .load-error[hidden] { display: none; }
-.load-error { margin: 2px 0 0; color: var(--lv-erro); font-size: 12px; overflow-wrap: anywhere; }
-.load-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 6px; width: 100%; margin: 8px 0 0; }
-.load-stats:empty { display: none; }
-.load-stat:last-child:nth-child(odd) { grid-column: 1 / -1; }
+.load-summary .load-bar { position: relative; height: 5px; }
+.load-summary .load-bar.indeterminate #load-bar-fill { position: absolute; inset: 0 auto 0 0; width: 34%; opacity: .55; animation: load-sweep 2.2s ease-in-out infinite; }
+@keyframes load-sweep { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+@media (prefers-reduced-motion: reduce) { .load-summary .load-bar.indeterminate #load-bar-fill { animation: none; width: 100%; opacity: .2; } }
+.load-extra { height: 16px; margin: 0; color: var(--text-2); font-size: 11.5px; line-height: 16px; }
+.load-extra.error { color: var(--lv-erro); }
+.load-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 100%; margin: 8px 0 0; }
+.load-stat.empty dd { color: var(--text-2); font-weight: 500; }
 .load-stat { min-width: 0; padding: 6px 9px 7px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-2); text-align: left; }
 .load-stat dt { color: var(--text-2); font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
 .load-stat dd { margin: 2px 0 0; color: var(--text-0); font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .semantic-load-stage .load-operation-controls { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; }
 .semantic-load-stage #load-cancel { min-height: 30px; font-size: 12px; }
-.semantic-load-stage #load-cancel-help:empty { display: none; }
-.semantic-load-stage #load-cancel-help { margin: 0; color: var(--text-2); font-size: 11px; line-height: 1.45; text-align: center; overflow-wrap: anywhere; }
+.semantic-load-stage #load-cancel-help { min-height: 16px; margin: 0; color: var(--text-2); font-size: 11px; line-height: 1.45; text-align: center; overflow-wrap: anywhere; }
 .load-progress-details { width: 100%; min-width: 0; border-top: 1px solid var(--border); padding-top: 4px; }
 .load-progress-details > summary { padding: 5px 0; color: var(--text-1); font-size: 12px; cursor: pointer; }
 .load-progress-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .load-progress-details[open] > summary { margin-bottom: 6px; }
 #load-steps-count { color: var(--text-2); font-variant-numeric: tabular-nums; }
-.load-progress-details .load-steps { max-height: 180px; overflow-y: auto; gap: 7px; }
+.load-progress-details .load-steps { height: 150px; overflow-y: auto; gap: 7px; }
 .load-progress-details .load-steps li { align-items: flex-start; font-size: 12px; }
 .load-step-text { display: flex; flex-direction: column; min-width: 0; text-align: left; }
 .load-step-text small { color: var(--text-2); font-size: 10.5px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

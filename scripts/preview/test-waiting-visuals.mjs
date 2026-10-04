@@ -43,10 +43,10 @@ try {
   results.overlay = await page.evaluate(() => ({
     ring: !!document.querySelector('#load-visual .wv-ring-arc'), scan: !!document.querySelector('#load-visual .wv-scan'),
     toggles: document.querySelectorAll('#load-visual button').length, status: document.querySelector('#load-visual .wv-status').textContent,
-    barHidden: document.querySelector('#load-bar-fill').parentElement.hidden, size: document.querySelector('#load-visual .wv-art').getBoundingClientRect().width,
+    barIndeterminate: document.querySelector('#load-bar-fill').parentElement.classList.contains('indeterminate'), size: document.querySelector('#load-visual .wv-art').getBoundingClientRect().width,
     ringSpins: document.querySelector('#load-visual .wv-ring-arc').getAnimations().some(a => a.playState === 'running') }));
   assert.equal(results.overlay.ring, true); assert.equal(results.overlay.scan, true); assert.equal(results.overlay.toggles, 0);
-  assert.equal(results.overlay.status, 'Validando a fonte'); assert.equal(results.overlay.barHidden, true); assert.equal(results.overlay.ringSpins, true);
+  assert.equal(results.overlay.status, 'Validando a fonte'); assert.equal(results.overlay.barIndeterminate, true); assert.equal(results.overlay.ringSpins, true);
   assert.ok(Math.abs(results.overlay.size - 124) < 1);
   await page.evaluate(() => {
     state.loadMetrics = { completed: 1024, total: 2048, unit: 'bytes', elapsed: 61, phaseSeconds: 10, rate: 512, eta: 2, error: 'Aguardando disco' };
@@ -57,14 +57,31 @@ try {
   assert.equal(await page.locator('#load-note').textContent(), 'fonte.gz');
   assert.equal(await page.locator('#load-stats [data-stat="rate"] dd').textContent(), '512 B/s');
   await page.evaluate(() => mirrorLoadOverlay('Indexando registros', '1.200 / 6.300 registros', 19));
-  assert.equal(await page.locator('#load-stats').evaluate(node => node.childElementCount), 0, 'plain phases clear previous metrics');
-  assert.equal(await page.locator('#load-error').evaluate(node => node.hidden), true, 'plain phases clear previous errors');
+  const statValues = () => page.locator('#load-stats dd').evaluateAll(nodes => nodes.map(node => node.textContent));
+  assert.deepEqual(await statValues(), ['—', '—', '—', '—'], 'plain phases clear previous metrics but keep the four slots');
+  assert.equal(await page.locator('#load-extra').textContent(), '', 'plain phases clear previous errors');
   await page.evaluate(() => LoadProgress.tick());
-  assert.equal(await page.locator('#load-stats').evaluate(node => node.childElementCount), 0, 'ticks cannot restore stale timing');
-  results.progress = await page.evaluate(() => ({ barHidden: document.querySelector('#load-bar-fill').parentElement.hidden,
+  assert.deepEqual(await statValues(), ['—', '—', '—', '—'], 'ticks cannot restore stale timing');
+  results.progress = await page.evaluate(() => ({ barIndeterminate: document.querySelector('#load-bar-fill').parentElement.classList.contains('indeterminate'),
     title: document.querySelector('#load-title').textContent, amount: document.querySelector('#load-amount').textContent,
     amountVisible: document.querySelector('#load-amount').getClientRects().length > 0, percent: document.querySelector('#load-percent').textContent }));
-  assert.deepEqual(results.progress, { barHidden: false, title: 'Indexando registros', amount: '1.200 / 6.300 registros', amountVisible: true, percent: '19%' });
+  assert.deepEqual(results.progress, { barIndeterminate: false, title: 'Indexando registros', amount: '1.200 / 6.300 registros', amountVisible: true, percent: '19%' });
+  // Every slot keeps its height: the animation and the card never move while values change.
+  results.stability = await page.evaluate(() => {
+    const measure = () => ({ art: Math.round(document.querySelector('#load-visual .wv-art').getBoundingClientRect().top * 10) / 10,
+      card: Math.round(document.querySelector('.load-stage').getBoundingClientRect().height * 10) / 10 });
+    const samples = [measure()];
+    const step = (label, detail, progress, metrics) => { state.loadMetrics = metrics; mirrorLoadOverlay(label, detail, progress, metrics ? { operationId: state.loadOverlayOperationId, state: 'running', label } : null); samples.push(measure()); };
+    step('Verificando metadados mapeados · arquivo-com-um-nome-bem-longo-2026-09-16.json.gz', '', null, null);
+    step('Convertendo fonte; interrupção reinicia esta etapa', '', null, { completed: 86414640, total: 0, unit: 'bytes', rate: 3355443, elapsed: 707, phaseSeconds: 5 });
+    step('Indexando', '', 42, { completed: 1200, total: 6300, unit: 'registros', rate: 900, eta: 7, elapsed: 709, phaseSeconds: 2, resumed: 300, error: '' });
+    step('Indexando', '', 43, { completed: 1300, total: 6300, unit: 'registros', elapsed: 710, error: 'Disco quase cheio' });
+    step('Sem dados', '', null, null);
+    state.loadMetrics = null;
+    return samples;
+  });
+  assert.equal(new Set(results.stability.map(sample => sample.art)).size, 1, `the animation never moves: ${JSON.stringify(results.stability)}`);
+  assert.equal(new Set(results.stability.map(sample => sample.card)).size, 1, `the card keeps its height: ${JSON.stringify(results.stability)}`);
   // The first robot shows up soon, inside the room, as part of a whole skit.
   await page.waitForFunction(selector => document.querySelector(selector)?.dataset.skit, overlay, { timeout: 4000 });
   await page.waitForTimeout(1800);
@@ -73,7 +90,7 @@ try {
   await snap('waiting-room-overlay-dark.png');
   await page.evaluate(() => { if (document.documentElement.dataset.theme !== 'light') toggleTheme(); });
   await page.waitForTimeout(400); await snap('waiting-room-overlay-light.png');
-  results.lightRoom = await page.evaluate(() => getComputedStyle(document.querySelector('#load-visual .wv-room')).backgroundImage.includes('rgb(3, 4, 6)'));
+  results.lightRoom = await page.evaluate(() => getComputedStyle(document.querySelector('#load-visual .wv-room')).backgroundImage.includes('rgb(2, 3, 4)'));
   assert.equal(results.lightRoom, true, 'the room stays dark in the light theme');
   await page.evaluate(() => toggleTheme());
   await page.evaluate(() => hideLoadOverlay(true));

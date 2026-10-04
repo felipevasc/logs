@@ -32,27 +32,36 @@ window.LoadProgress = (() => {
     return { title, note };
   }
 
+  // Every slot keeps its height: values change in place and missing ones show "—",
+  // so the card (and the animation above it) never jumps while work goes on.
+  const STATS = [["elapsed", "Tempo total"], ["phase", "Nesta etapa"], ["eta", "Restante"], ["rate", "Velocidade"]];
   let timing = null;
-  function stat(key, label, value) {
-    const list = node("load-stats");
-    if (!list) return;
-    let row = list.querySelector(`[data-stat="${key}"]`);
-    if (value == null || value === "") { row?.remove(); return; }
-    if (!row) {
-      row = document.createElement("div"); row.className = "load-stat"; row.dataset.stat = key;
-      const term = document.createElement("dt"), detail = document.createElement("dd");
-      term.textContent = label; row.append(term, detail); list.append(row);
-    }
-    const detail = row.querySelector("dd");
-    if (detail.textContent !== value) detail.textContent = value;
+  const set = (id, value) => { const el = node(id); if (el && el.textContent !== value) el.textContent = value; };
+  function stat(key, value) {
+    const row = node("load-stats")?.querySelector(`[data-stat="${key}"] dd`);
+    const shown = value == null || value === "" ? "—" : value;
+    if (row && row.textContent !== shown) row.textContent = shown;
+    row?.parentElement.classList.toggle("empty", shown === "—");
   }
   function clear() {
-    for (const id of ["load-note", "load-amount", "load-of", "load-percent", "load-error"]) { const el = node(id); if (el) el.textContent = ""; }
-    for (const id of ["load-note", "load-figures", "load-error"]) { const el = node(id); if (el) el.hidden = true; }
-    node("load-stats")?.replaceChildren();
-    const bar = node("load-bar-fill");
-    if (bar) { bar.style.width = "0%"; bar.parentElement.hidden = true; }
+    const list = node("load-stats");
+    if (list) list.replaceChildren(...STATS.map(([key, label]) => {
+      const row = document.createElement("div"), term = document.createElement("dt"), detail = document.createElement("dd");
+      row.className = "load-stat empty"; row.dataset.stat = key; term.textContent = label; detail.textContent = "—";
+      row.append(term, detail); return row;
+    }));
+    for (const id of ["load-note", "load-amount", "load-of", "load-percent", "load-extra"]) set(id, "");
+    node("load-extra")?.classList.remove("error");
+    progressBar(null);
     timing = null;
+  }
+  function progressBar(progress) {
+    const fill = node("load-bar-fill");
+    if (!fill) return;
+    const known = progress != null && Number.isFinite(progress);
+    // Unknown totals keep the same track with a slow sweep instead of disappearing.
+    fill.parentElement.classList.toggle("indeterminate", !known);
+    fill.style.width = known ? `${Math.max(0, Math.min(100, progress))}%` : "";
   }
 
   function reset(first) {
@@ -84,6 +93,7 @@ window.LoadProgress = (() => {
     if (note) { const small = document.createElement("small"); small.textContent = note; small.title = note; textBox.append(small); }
     item.append(icon, textBox); list.append(item);
     while (list.children.length > MAX_STEPS) list.firstElementChild.remove();
+    list.scrollTop = list.scrollHeight;
     count();
   }
 
@@ -94,47 +104,45 @@ window.LoadProgress = (() => {
     const title = node("load-title");
     if (!title) return;
     const phase = split(label || "Processando");
-    if (title.textContent !== phase.title) title.textContent = phase.title;
-    const note = node("load-note");
-    note.textContent = phase.note; note.hidden = !phase.note;
+    set("load-title", phase.title); title.title = phase.title;
+    set("load-note", phase.note); node("load-note").title = phase.note;
 
-    const figures = node("load-figures"), amount = node("load-amount"), of = node("load-of"), percent = node("load-percent");
     const known = progress != null && Number.isFinite(progress);
     if (metrics && (metrics.completed > 0 || metrics.total > 0)) {
-      amount.textContent = quantity(metrics.completed || 0, metrics.unit);
-      of.textContent = metrics.total > 0 ? `de ${quantity(metrics.total, metrics.unit)}` : "processados";
-      figures.hidden = false;
+      set("load-amount", quantity(metrics.completed || 0, metrics.unit));
+      set("load-of", metrics.total > 0 ? `de ${quantity(metrics.total, metrics.unit)}` : "processados");
     } else if (!metrics && detail) {
-      amount.textContent = detail; of.textContent = ""; figures.hidden = false;
-    } else { amount.textContent = ""; of.textContent = ""; figures.hidden = true; }
-    percent.textContent = known && !figures.hidden ? `${Math.floor(Math.max(0, Math.min(100, progress)))}%` : "";
-    const bar = node("load-bar-fill");
-    bar.parentElement.hidden = !known;
-    if (known) bar.style.width = `${Math.max(0, Math.min(100, progress))}%`;
+      set("load-amount", detail); set("load-of", "");
+    } else { set("load-amount", ""); set("load-of", ""); }
+    set("load-percent", known ? `${Math.floor(Math.max(0, Math.min(100, progress)))}%` : "");
+    progressBar(progress);
 
     if (metrics) {
       timing = Number.isFinite(metrics.elapsed) ? { elapsed: metrics.elapsed, at: performance.now() } : timing;
-      stat("elapsed", "Tempo total", timing ? clock(timing.elapsed) : null);
-      stat("phase", "Nesta etapa", Number.isFinite(metrics.phaseSeconds) ? clock(metrics.phaseSeconds) : null);
-      stat("eta", "Restante", Number.isFinite(metrics.eta) ? `≈ ${clock(metrics.eta)}` : null);
-      stat("rate", "Velocidade", metrics.rate > 0 ? `${isBytes(metrics.unit) ? bytes(metrics.rate) : number(Math.round(metrics.rate))}${isBytes(metrics.unit) ? "/s" : ` ${metrics.unit || "itens"}/s`}` : null);
-      stat("selected", "Selecionados", Number.isFinite(metrics.selected) ? number(metrics.selected) : null);
-      stat("resumed", "Retomados", metrics.resumed > 0 ? number(metrics.resumed) : null);
-      stat("checkpoint", "Salvos p/ retomar", metrics.checkpoint > 0 ? number(metrics.checkpoint) : null);
-      const error = node("load-error");
-      error.textContent = metrics.error || ""; error.hidden = !metrics.error;
+      stat("elapsed", timing ? clock(timing.elapsed) : null);
+      stat("phase", Number.isFinite(metrics.phaseSeconds) ? clock(metrics.phaseSeconds) : null);
+      stat("eta", Number.isFinite(metrics.eta) ? `≈ ${clock(metrics.eta)}` : null);
+      stat("rate", metrics.rate > 0 ? `${isBytes(metrics.unit) ? bytes(metrics.rate) : number(Math.round(metrics.rate))}${isBytes(metrics.unit) ? "/s" : ` ${metrics.unit || "itens"}/s`}` : null);
+      // Rare figures and errors share one reserved line below the cards.
+      const extra = [
+        Number.isFinite(metrics.selected) ? `${number(metrics.selected)} selecionados` : "",
+        metrics.resumed > 0 ? `${number(metrics.resumed)} retomados` : "",
+        metrics.checkpoint > 0 ? `${number(metrics.checkpoint)} salvos para retomar` : "",
+      ].filter(Boolean).join(" · ");
+      set("load-extra", metrics.error || extra);
+      node("load-extra").classList.toggle("error", !!metrics.error);
+      node("load-extra").title = metrics.error || extra;
     } else {
       // A phase without a receipt must not inherit figures from previous work.
       timing = null;
-      node("load-stats")?.replaceChildren();
-      const error = node("load-error");
-      error.textContent = ""; error.hidden = true;
+      for (const [key] of STATS) stat(key, null);
+      set("load-extra", ""); node("load-extra").classList.remove("error"); node("load-extra").title = "";
     }
   }
 
   // The total time keeps counting between receipts; no other value moves on its own.
   function tick() {
-    if (timing) stat("elapsed", "Tempo total", clock(timing.elapsed + (performance.now() - timing.at) / 1000));
+    if (timing) stat("elapsed", clock(timing.elapsed + (performance.now() - timing.at) / 1000));
   }
 
   function finish(ok) {
