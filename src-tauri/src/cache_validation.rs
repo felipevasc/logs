@@ -79,8 +79,20 @@ fn native_stamp(_: &File) -> Option<Vec<i128>> {
     None
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Generation(Vec<(PathBuf, Stamp)>);
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Generation {
+    files: Vec<(PathBuf, Stamp)>,
+    // Eligibility belongs to the instant BEFORE validation began. It must not
+    // become true just because a lengthy payload scan crosses the clock window.
+    #[serde(skip)]
+    observed_at: Option<std::time::SystemTime>,
+}
+impl PartialEq for Generation {
+    fn eq(&self, other: &Self) -> bool {
+        self.files == other.files
+    }
+}
+impl Eq for Generation {}
 #[derive(Serialize, Deserialize)]
 struct Receipt {
     version: u32,
@@ -101,7 +113,10 @@ impl Generation {
         #[cfg(unix)]
         {
             let now = std::time::SystemTime::now();
-            return self.0.iter().all(|(_, stamp)| {
+            let Some(observed) = self.observed_at else {
+                return false;
+            };
+            return self.files.iter().all(|(_, stamp)| {
                 let seconds = stamp.native.get(2).and_then(|v| u64::try_from(*v).ok());
                 let nanos = stamp.native.get(3).and_then(|v| u32::try_from(*v).ok());
                 seconds
@@ -113,7 +128,13 @@ impl Generation {
                             })
                             .flatten()
                     })
-                    .and_then(|changed| now.duration_since(changed).ok())
+                    .and_then(|changed| {
+                        Some(
+                            now.duration_since(changed)
+                                .ok()?
+                                .min(observed.duration_since(changed).ok()?),
+                        )
+                    })
                     .is_some_and(|age| age >= std::time::Duration::from_secs(2))
             });
         }
@@ -123,6 +144,7 @@ impl Generation {
         }
     }
     pub(crate) fn capture(paths: &[PathBuf]) -> Option<Self> {
+        let observed_at = std::time::SystemTime::now();
         let files = paths
             .iter()
             .map(|path| {
@@ -134,12 +156,15 @@ impl Generation {
                 Some((path.clone(), Stamp::of(&file)?))
             })
             .collect::<Option<Vec<_>>>()?;
-        (!files.is_empty()).then_some(Self(files))
+        (!files.is_empty()).then_some(Self {
+            files,
+            observed_at: Some(observed_at),
+        })
     }
     pub(crate) fn is_current(&self) -> bool {
         Self::capture(
             &self
-                .0
+                .files
                 .iter()
                 .map(|(path, _)| path.clone())
                 .collect::<Vec<_>>(),
@@ -148,7 +173,7 @@ impl Generation {
             == Some(self)
     }
     pub(crate) fn covers(&self, path: &Path, file: &File) -> bool {
-        self.0
+        self.files
             .iter()
             .find(|(name, _)| name == path)
             .is_some_and(|(_, stamp)| Stamp::of(file).as_ref() == Some(stamp))
@@ -223,6 +248,12 @@ mod tests {
         generation.remember(&path, "schema-1");
         assert!(!receipt_path(&path).exists());
         assert!(!generation.verified(&path, "schema-1"));
+        settle_filesystem_clock();
+        assert!(
+            !generation.can_reuse(),
+            "a lengthy scan cannot promote a snapshot captured inside the unsafe clock window"
+        );
+        assert!(Generation::capture(&[path]).unwrap().can_reuse());
     }
     #[test]
     fn durable_receipt_survives_fresh_capture_and_rejects_context_and_damage() {
