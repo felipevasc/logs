@@ -15,7 +15,11 @@ window.createMockExclusions = ({ contextFor, identity, generation, rows, filter,
   const summary = ({ records, restored, ...batch }) => copy(batch);
   const hidden = analysis => new Set(batches(analysis).filter(batch => batch.active)
     .flatMap(batch => batch.records.filter(member => !batch.restored.has(key(member))).map(member => member.eventRef)));
-  const visible = (analysis, source) => enabled() && analysis ? source.filter(event => !hidden(analysis).has(reference(event))) : source;
+  const visible = (analysis, source) => {
+    if (!enabled() || !analysis) return source;
+    const excluded = hidden(analysis);
+    return source.filter(event => !excluded.has(reference(event)));
+  };
   const receipt = (analysis, batchId, selectedMembers) => {
     const context = contextFor({ analysisContext: analysis }); context.visibilityRevision++; persist(context);
     return { analysisContext: copy(context), batchId, selectedMembers, newlyVisible: null };

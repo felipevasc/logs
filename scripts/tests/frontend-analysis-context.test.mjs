@@ -236,7 +236,7 @@ test('first Case save is shared across source reset without poisoning the curren
   }
 });
 
-test('actual newCase and afterCaseCreation finish empty isolation while an initial render waits for persistence', async () => {
+test('actual newCase resets its source before rendering and finishes empty isolation after persistence', async () => {
   for (const scope of ['dataset', 'case']) {
     const saved = deferred(), f = fixture({ tasks: true });
     f.state.loaded = true; f.state.total = 6000; f.state.columns = ['timestamp', 'previous_only'];
@@ -255,7 +255,7 @@ test('actual newCase and afterCaseCreation finish empty isolation while an initi
       caseGeneration: 0, restoringCase: false, runtime: new Map(), states: new Map(),
       key: value => `${f.state.cases.active}:${value}`,
       setAnalysisView() {}, renderCaseBar() {}, updateAnalysisBadge() {}, renderExploreTree() {},
-      renderAnalysis: () => { staleRead = c.api('profile_fields', { filters: [] }).then(() => null, error => error); },
+      renderAnalysis: () => { assert.equal(f.state.loaded, false, 'the first render cannot see the prior source'); staleRead = Promise.resolve(null); },
       resetCaseSourceState: () => Object.assign(f.state, { loaded: false, currentArtifact: null, currentOrigin: '',
         columns: [], rows: [], total: 0, dataPeriod: null, queryError: null }),
       syncActiveCaseArtifacts: async () => { await c.api('clear_events'); },
@@ -278,11 +278,11 @@ test('actual newCase and afterCaseCreation finish empty isolation while an initi
     const created = c.newCase('Isolated');
     await settle(); assert.equal(f.calls.length, 0);
     saved.resolve(); await completion;
-    assert.match(String(await staleRead), /ANALYSIS_CONTEXT_CHANGED/);
+    assert.equal(await staleRead, null);
     assert.equal(c.restoringCase, false); assert.equal(f.state.analysisDefinitionsPending, false);
-    assert.equal(f.state.activeContext, scope); assert.equal(f.state.loaded, false); assert.equal(f.state.total, 0);
+    assert.equal(f.state.activeContext, 'dataset'); assert.equal(f.state.loaded, false); assert.equal(f.state.total, 0);
     assert.equal(f.state.currentArtifact, null); assert.deepEqual(plain(f.state.columns), []);
-    assert.deepEqual(plain(created.artifacts), []); assert.equal(created.workspace.activeScope, scope);
+    assert.deepEqual(plain(created.artifacts), []); assert.equal(created.workspace.activeScope, 'dataset');
     assert.equal(f.state.cases.cases[0].artifacts[0].path, '/previous-only.jsonl');
     assert.deepEqual(f.calls.map(call => call.cmd), ['list_derived_fields', 'clear_events']);
     assert.ok(f.calls.every(call => call.args.analysisContext.caseId === created.id));

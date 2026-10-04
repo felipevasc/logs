@@ -1045,7 +1045,7 @@ pub struct RemoteConnectionParams {
     #[serde(default)]
     pub id: String,
     pub name: String,
-    /// Service kind: "elasticsearch" or "kibana".
+    /// Service kind: "elasticsearch", "kibana", "ssh" or "winrm".
     pub kind: String,
     /// Base URL (e.g. "https://elastic.example:9200").
     pub url: String,
@@ -1065,7 +1065,17 @@ pub struct RemoteConnectionParams {
     /// Kibana version compatibility: "auto", "v7_8", or "v9".
     #[serde(default = "default_remote_kibana_version")]
     pub kibana_version: String,
+    /// Absolute remote file/directory paths for SSH/WinRM.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Local SSH private key path; empty uses the OpenSSH agent.
+    #[serde(default)]
+    pub key_path: String,
+    /// Maximum collected bytes (default 512 MiB, maximum 4 GiB).
+    #[serde(default = "default_remote_max_bytes")]
+    pub max_bytes: u64,
 }
+fn default_remote_max_bytes() -> u64 { 512 * 1024 * 1024 }
 
 fn default_remote_time_field() -> String {
     "@timestamp".to_string()
@@ -1081,15 +1091,17 @@ fn default_remote_kibana_version() -> String {
 
 impl From<RemoteConnectionParams> for crate::remote::RemoteConfig {
     fn from(p: RemoteConnectionParams) -> Self {
-        let kind = if p.kind.eq_ignore_ascii_case("kibana") {
-            crate::remote::RemoteKind::Kibana
-        } else {
-            crate::remote::RemoteKind::Elasticsearch
+        let kind = match p.kind.to_ascii_lowercase().as_str() {
+            "ssh" => crate::remote::RemoteKind::Ssh,
+            "winrm" => crate::remote::RemoteKind::Winrm,
+            "kibana" => crate::remote::RemoteKind::Kibana,
+            _ => crate::remote::RemoteKind::Elasticsearch,
         };
         crate::remote::RemoteConfig {
             id: p.id,
             name: p.name,
             kind,
+            paths: p.paths, key_path: p.key_path, max_bytes: p.max_bytes,
             url: p.url,
             index: p.index,
             time_field: if p.time_field.is_empty() {
@@ -2205,6 +2217,7 @@ mod tests {
             max_records: 50_000,
             query: Some(serde_json::json!({"match_all": {}})),
             kibana_version: "auto".to_string(),
+            paths: vec![], key_path: String::new(), max_bytes: default_remote_max_bytes(),
         };
         let config: crate::remote::RemoteConfig = params.into();
         assert_eq!(config.id, "conn-1");
@@ -2225,6 +2238,7 @@ mod tests {
             max_records: 0,
             query: None,
             kibana_version: "v9".to_string(),
+            paths: vec![], key_path: String::new(), max_bytes: default_remote_max_bytes(),
         };
         let kibana_config: crate::remote::RemoteConfig = kibana_params.into();
         assert_eq!(kibana_config.time_field, "@timestamp");

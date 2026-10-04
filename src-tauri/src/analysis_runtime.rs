@@ -2028,9 +2028,16 @@ pub(crate) fn fact_namespace() -> String {
     }).unwrap_or_default()
 }
 pub(crate) fn fact_interpretation_signature()->String{
-    current().map(|admitted|crate::evidence::stable_id("fact-interpretation-1",[
-        serde_json::to_string(&(&admitted.interpretation.codes,&admitted.interpretation.system_codes,&admitted.interpretation.timestamps,&admitted.interpretation.formats,&admitted.references)).unwrap_or_default(),
-        serde_json::to_string(&admitted.derived.iter().map(|field|(&field.name,&field.source,&field.steps,field.lookup.as_ref().map(|lookup|&lookup.definition),field.rules.iter().map(|rule|(rule.re.as_str(),&rule.template,&rule.filter,&rule.filter_security_signature)).collect::<Vec<_>>())).collect::<Vec<_>>()).unwrap_or_default(),
+    // HashMap iteration order changes after reopening a Case. Canonicalize all
+    // object keys while retaining array/rule order, which carries semantics.
+    fn canonical(value: impl serde::Serialize) -> String {
+        let mut value = serde_json::to_value(value).unwrap_or_default();
+        value.sort_all_objects();
+        value.to_string()
+    }
+    current().map(|admitted|crate::evidence::stable_id("fact-interpretation-2",[
+        canonical((&admitted.interpretation.codes,&admitted.interpretation.system_codes,&admitted.interpretation.timestamps,&admitted.interpretation.formats,&admitted.references)),
+        canonical(admitted.derived.iter().map(|field|(&field.name,&field.source,&field.steps,field.lookup.as_ref().map(|lookup|&lookup.definition),field.rules.iter().map(|rule|(rule.re.as_str(),&rule.template,&rule.filter,&rule.filter_security_signature)).collect::<Vec<_>>())).collect::<Vec<_>>()),
     ])).unwrap_or_default()
 }
 

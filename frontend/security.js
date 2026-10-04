@@ -352,7 +352,7 @@ window.Security = (() => {
       <span class="sec-bar" title="Severidade ${esc(sevLabel(episode.severity))}"></span>
       <div class="sec-main">${ParticipantsUI.cards(episode.participants,content)}
         <div class="sec-detections" hidden></div></div>
-      <div class="sec-actions">${icon("fa-chevron-down", "Abrir indícios e eventos", "expand")}${workspaceScope() === "dataset" ? icon("fa-bookmark", "Salvar no Caso", "save") : ""}</div></article>`;
+      <div class="sec-actions">${icon("fa-chevron-down", "Abrir indícios e eventos", "expand")}${workspaceScope() === "dataset" ? icon("fa-bookmark", "Salvar em Achados", "save") : ""}</div></article>`;
   }
   function detectionRows(data, episode) {
     return episode.detections.map(i => {
@@ -482,7 +482,7 @@ window.Security = (() => {
       showCtxMenu(event.clientX, event.clientY, [
         { icon: "fa-filter", label: "Filtrar eventos no Explorar", onClick: () => showRecords(target.filters) },
         { icon: "fa-timeline", label: "Ver na linha do tempo", onClick: () => showTimeline(target.filters, target.start, target.end) },
-        ...(workspaceScope() === "dataset" ? [{ icon: "fa-bookmark", label: "Salvar no Caso", onClick: () => saveToCase(actionData, target.list, target.title, target.summary, detection?undefined:episode.grouping) }] : []),
+        ...(workspaceScope() === "dataset" ? [{ icon: "fa-bookmark", label: "Salvar em Achados", onClick: () => saveToCase(actionData, target.list, target.title, target.summary, detection?undefined:episode.grouping) }] : []),
         { icon: "fa-copy", label: "Copiar resumo", onClick: () => navigator.clipboard?.writeText(`${target.title}\n${target.summary}\n${range(target.start, target.end)}\n${target.list.map(d => `- ${d.name}: ${d.summary} (${d.count})`).join("\n")}`) },
         ...(detection ? [{ sep: true }, { icon: "fa-eye-slash", label: "Ocultar esta detecção", onClick: () => suppress(detection, data) }] : []),
       ]);

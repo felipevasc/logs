@@ -24,6 +24,12 @@ try {
     return { total: state.total, caseId: activeCase().id, artifactId: state.currentArtifact.id, rows: state.rows.slice(0, 3) };
   });
   assert.equal(initial.total, 6000);
+  await page.evaluate(async () => { toggleTheme(); await UiScale.set(1, false); });
+  const originalTheme = await page.evaluate(() => document.documentElement.dataset.theme);
+  await page.evaluate(() => FieldIndexes.refresh());
+  await page.evaluate(async () => { const action = FieldIndexes.menuItem("source"); await action.onClick(); });
+  await page.waitForFunction(() => FieldIndexes.has("source"));
+  await page.waitForFunction(() => document.querySelector('.field-row[data-column="source"].field-indexed'));
   await page.evaluate(rows => { activeCase().items = [{ id: "context-fixture", kind: "events", label: "Preservados", rows }]; caseEventsCache.sig = null; updateAnalysisBadge(); }, initial.rows);
   await page.evaluate(async () => {
     await WorkspaceContext.setScope("case", { page: "explore", animate: false });
@@ -34,15 +40,21 @@ try {
     window.createdId = newCase("Caso vazio isolado").id;
   });
   for (const total of Object.values(await page.evaluate(() => window.contextFacetTotals))) assert.ok(total <= 3, "case facets contain only saved records");
-  await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "case" && state.total === 0);
-  assert.equal(await page.locator("#explore-tree").getAttribute("data-tree-scope"), "case");
+  await page.waitForFunction(() => !WorkspaceContext.changing && WorkspaceContext.scope() === "dataset" && !state.loaded);
+  assert.equal(await page.locator("#explore-tree").getAttribute("data-tree-scope"), "dataset");
   assert.equal(await page.evaluate(() => caseEvents().length), 0);
-  assert.equal(await page.locator("#ws-empty").isVisible(), false);
+  assert.equal(await page.evaluate(() => FieldIndexes.has("source")), false, "an index from another Case is never highlighted");
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), "dark", "new Case starts with its own theme");
+  assert.equal(await page.evaluate(() => UiScale.setting()), "auto", "new Case starts with its own scale");
+  assert.equal(await page.locator('.zone-switch [data-zone="case"] > span:not(.li-loader)').textContent(), "Achados");
+  assert.equal(await page.locator("#ws-empty").isVisible(), true);
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));
   assert.deepEqual(await page.evaluate(() => ({ loaded: state.loaded, total: state.total, artifact: state.currentArtifact, artifacts: activeCase().artifacts, columns: state.columns, path: document.querySelector("#file-path").value })),
     { loaded: false, total: 0, artifact: null, artifacts: [], columns: [], path: "" }, "new Case has no inherited source, columns or import draft");
   await page.evaluate(async original => { await WorkspaceContext.setScope("case", { animate: false }); await WorkspaceContext.changeCase(original); }, initial.caseId);
   assert.equal(await page.evaluate(() => WorkspaceContext.scope()), "case");
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), originalTheme);
+  assert.equal(await page.evaluate(() => UiScale.setting()), 1);
   assert.equal(await page.evaluate(() => caseEvents().length), 3);
   assert.deepEqual(await page.evaluate(() => state.filters), await page.evaluate(() => window.oldCaseFilter));
   await page.evaluate(() => WorkspaceContext.setScope("dataset", { page: "explore", animate: false }));

@@ -461,7 +461,8 @@ fn scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter]) -> Resu
             _free: Vec::new(),
         });
     }
-    let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    let (sql, mut free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    let sql = resolve_field_indexes(session, src, pfs, sql, &mut free)?;
     let sql = visible_sql(src, sql, &mut plan.tests)?;
     if plan.exact() && !costly(&sql) {
         return Ok(Scope {
@@ -503,6 +504,20 @@ enum PageScope<'s> {
     Planned { scope: Scope<'s>, verify: Vec<usize> },
 }
 
+fn resolve_field_indexes(session: &Session, src: &Source, filters: &[PreparedFilter], mut sql: String, held: &mut Vec<Arc<Selection>>) -> Result<String> {
+    for filter in filters {
+        if let Some(ids) = crate::field_indexes::candidates(src.idx, filter)? {
+            let selected = selection(session, &ids)?;
+            // Keep the canonical predicate and visibility check. The optional
+            // index supplies a complete candidate set, never new semantics.
+            sql = format!("({sql}) AND ({})", selected.predicate());
+            held.push(selected);
+            break;
+        }
+    }
+    Ok(sql)
+}
+
 /// Hit-only reuse: never begin or wait for a complete analytics selection.
 /// Keep the retained Arc alive through sorting/SQL, including concurrent LRU
 /// eviction, and reapply mandatory visibility under the admitted namespace.
@@ -534,7 +549,8 @@ fn page_scope<'s>(session: &'s Session, src: &Source, pfs: &[PreparedFilter], fi
             return Ok(PageScope::Singleton(page));
         }
     }
-    let (sql, free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    let (sql, mut free, free_names) = resolve_free(session, src, &plan.sql, &plan.tests)?;
+    let sql = resolve_field_indexes(session, src, pfs, sql, &mut free)?;
     let sql = visible_sql(src, sql, &mut plan.tests)?;
     // SQL proves the remaining predicates. Conservatively confirm line
     // residuals on the canonical event too, without using the raw shortcut.

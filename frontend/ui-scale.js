@@ -2,7 +2,6 @@
    mode fits small/high-DPI windows; an explicit choice is never replaced by resizing. */
 window.UiScale = (() => {
   "use strict";
-  const KEY = "li-ui-scale";
   const STEPS = [0.7, 0.75, 0.8, 0.85, 0.9, 1, 1.1, 1.25, 1.4, 1.5, 1.75, 2];
   const percent = value => `${Math.round(value * 100)}%`;
   const CHOICES = [["auto", "Automático"], ...STEPS.map(value => [value, percent(value)])];
@@ -18,10 +17,18 @@ window.UiScale = (() => {
     return STEPS.includes(number) ? number : null;
   }
   function readSetting() {
-    try { return normalize(localStorage.getItem(KEY)) ?? "auto"; } catch { return "auto"; }
+    try { return normalize(activeCase()?.workspace?.uiScale) ?? "auto"; } catch { return "auto"; }
   }
   // Keep a usable session preference even when persistence is unavailable.
   let preference = readSetting();
+  let caseOwner = activeCase();
+  function activateCase() {
+    const item = activeCase();
+    if (caseOwner === item) return;
+    caseOwner = item; preference = readSetting(); intentId++;
+    clearTimeout(timer); timer = null; resizeDeferred = false;
+    void apply(preference); renderVisiblePane();
+  }
   const setting = () => preference;
   const status = () => ({ requested, applied, state: application, setting: setting(), automaticPending });
   function automatic() {
@@ -102,7 +109,8 @@ window.UiScale = (() => {
     const intent = ++intentId;
     preference = choice;
     clearTimeout(timer); timer = null; resizeDeferred = false;
-    try { localStorage.setItem(KEY, String(choice)); } catch { /* session choice remains usable */ }
+    const item = activeCase();
+    if (item && item.kind !== "preserved_case_unavailable") { item.workspace ||= defaultCaseWorkspace(); item.workspace.uiScale = choice; void saveCases(); }
     const ok = await apply(choice);
     if (intent !== intentId) return false;
     if (announce) {
@@ -168,5 +176,5 @@ window.UiScale = (() => {
   });
   window.addEventListener("resize", () => { if (setting() === "auto") scheduleAutomatic(); });
   apply();
-  return { set, step, renderPane, current: () => requested, setting, status };
+  return { set, step, renderPane, activateCase, current: () => requested, setting, status };
 })();

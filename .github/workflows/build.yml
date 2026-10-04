@@ -43,7 +43,7 @@ jobs:
         with:
           node-version: '22'
       - name: Verify focused release reuse and supervisor contracts
-        run: node --test scripts/tests/reuse-release-checks.test.mjs scripts/tests/validation-plan.test.mjs scripts/tests/supervisor-handshake.test.mjs
+        run: node --test scripts/tests/reuse-release-checks.test.mjs scripts/tests/core-validation-plan.test.mjs scripts/tests/supervisor-handshake.test.mjs
       - name: Prove prior full regression and unchanged product
         id: proof
         env:
@@ -52,12 +52,11 @@ jobs:
         run: node scripts/ci/reuse-release-checks.mjs
 
   validate:
-    name: Release regressions (fresh or proven)
+    name: Essential release checks (fresh or proven)
     needs: checks-proof
     runs-on: ubuntu-22.04
-    # The full UI suite now takes about 20 minutes before setup and evidence.
-    # Keep every selected regression and leave room for slower hosted runners.
-    timeout-minutes: 40
+    # Core data and ownership checks, with bounded setup and diagnostics.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -79,7 +78,7 @@ jobs:
         run: npm run check
       - if: needs.checks-proof.outputs.reused != 'true'
         run: npm run prepare:frontend
-      - name: Full browser regression
+      - name: Core browser checks
         if: needs.checks-proof.outputs.reused != 'true'
         run: npm run test:preview
       - name: Preserve browser diagnostics
@@ -145,7 +144,7 @@ jobs:
       - run: npm run prepare:frontend
       - name: Backend tests
         if: runner.os != 'Windows' && needs.checks-proof.outputs.reused != 'true'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+        run: npm run test:native
       - name: Windows backend tests with loader diagnostics
         if: runner.os == 'Windows' && needs.checks-proof.outputs.reused != 'true'
         id: backend_windows

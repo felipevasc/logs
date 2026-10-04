@@ -46,7 +46,7 @@
     </div>
     <div class="zone-switch" role="group" aria-label="Área de trabalho">
       <button type="button" data-zone="analysis" data-workspace-scope="dataset" aria-pressed="true"><i class="fas fa-magnifying-glass" aria-hidden="true"></i><span>Análise</span></button>
-      <button type="button" data-zone="case" data-workspace-scope="case" aria-pressed="false"><i class="fas fa-briefcase" aria-hidden="true"></i><span>Caso</span><small id="context-case-count"></small></button>
+      <button type="button" data-zone="case" data-workspace-scope="case" aria-pressed="false"><i class="fas fa-briefcase" aria-hidden="true"></i><span>Achados</span><small id="context-case-count"></small></button>
       <button type="button" data-zone="structure" aria-pressed="false"><i class="fas fa-layer-group" aria-hidden="true"></i><span>Estrutura</span></button>
     </div>
   </nav>
@@ -65,7 +65,7 @@
   <div id="ws-export-modal" class="modal-overlay" hidden>
     <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="ws-export-title">
       <div class="modal-head"><h3 id="ws-export-title">Exportar</h3><button class="icon-btn" id="ws-export-close" aria-label="Fechar"><i class="fas fa-xmark"></i></button></div>
-      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Itens do Caso · Markdown</option><option value="case">Investigação portátil · LICASE</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask"> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
+      <div class="modal-body"><div class="fld"><label for="ws-export-kind">Conteúdo</label><select id="ws-export-kind"><option value="jsonl">Eventos filtrados · JSONL</option><option value="csv">Eventos filtrados · CSV</option><option value="case-pdf">Relatório do Caso · PDF</option><option value="report">Achados do Caso · Markdown</option><option value="case">Investigação portátil · LICASE</option></select></div><label class="check-line"><input type="checkbox" id="ws-mask"> Ocultar senhas e tokens nos textos</label><p class="muted small" id="ws-export-scope"></p><div class="modal-actions"><button class="btn primary" id="ws-export-save">Salvar arquivo</button></div></div>
     </div>
   </div>
   <div id="ws-drop" hidden><i class="fas fa-arrow-down-to-bracket"></i><strong>Solte os logs aqui</strong></div>
@@ -352,14 +352,14 @@
     </aside>
     <section id="tab-analysis" class="group-panel">
       <div class="analysis-toolbar">
-        <div class="seg small-seg case-view-tabs" role="tablist" aria-label="Visualizações do Caso">
+        <div class="seg small-seg case-view-tabs" role="tablist" aria-label="Visualizações dos Achados">
           <button class="seg-btn active" data-view="overview" type="button"><i class="fas fa-table-cells-large"></i> Visão geral</button>
           <button class="seg-btn" data-view="items" type="button"><i class="fas fa-layer-group"></i> Itens</button>
           <button class="seg-btn" data-view="timeline" type="button"><i class="fas fa-arrows-left-right"></i> Horizontal</button>
           <button class="seg-btn" data-view="vtimeline" type="button"><i class="fas fa-arrows-up-down"></i> Vertical</button>
           <button class="seg-btn" data-view="timeline-table" type="button"><i class="fas fa-table-list"></i> Tabela</button>
           <button class="seg-btn" id="case-timeline-volume" type="button"><i class="fas fa-chart-column"></i> Volume</button>
-          <button class="seg-btn" data-view="data" type="button"><i class="fas fa-database"></i> Dados do Caso</button>
+          <button class="seg-btn" data-view="data" type="button"><i class="fas fa-database"></i> Dados dos Achados</button>
         </div>
         <span class="muted small case-toolbar-count" id="analysis-count"></span>
         <div class="spacer"></div>
@@ -389,7 +389,7 @@
       <div class="analysis-toolbar">
         <span class="muted small" id="stations-count"></span>
         <div class="spacer"></div>
-        <span class="muted small">Estações são vinculadas ao adicionar itens ao Caso.</span>
+        <span class="muted small">Estações são vinculadas ao adicionar itens a Achados.</span>
       </div>
       <div id="stations-list" class="analysis-list"></div>
     </section>
@@ -495,7 +495,7 @@
         <span class="trail-title"><i class="fas fa-route"></i> Trilha do evento</span>
         <span id="trail-info" class="muted small"></span>
         <div class="spacer"></div>
-        <label class="trail-toggle"><input id="trail-only-case" type="checkbox" /> Exibir apenas do caso</label>
+        <label class="trail-toggle"><input id="trail-only-case" type="checkbox" /> Exibir apenas Achados</label>
         <label class="trail-toggle"><input id="trail-unfiltered" type="checkbox" /> Exibir logs não filtrados</label>
       </div>
       <div class="trail-scroll">
@@ -802,13 +802,13 @@
   <!-- ===================== MENU CONTEXTUAL DIREITO ===================== -->
   <aside id="context-rail" class="context-rail" aria-label="Ações do contexto">
     <button id="btn-right-artifact" class="context-rail-btn" type="button" title="Visualizar artefato" aria-label="Visualizar artefato"><i class="fas fa-table-list"></i></button>
-    <button id="btn-right-case" class="context-rail-btn" type="button" title="Abrir Caso ativo" aria-label="Abrir Caso ativo"><i class="fas fa-briefcase"></i><span id="analysis-badge" class="badge-n" hidden>0</span></button>
+    <button id="btn-right-case" class="context-rail-btn" type="button" title="Abrir Achados" aria-label="Abrir Achados"><i class="fas fa-briefcase"></i><span id="analysis-badge" class="badge-n" hidden>0</span></button>
     <button id="btn-right-stations" class="context-rail-btn" type="button" title="Abrir estações do Caso" aria-label="Abrir estações do Caso"><i class="fas fa-server"></i></button>
     <span class="context-rail-separator" aria-hidden="true"></span>
     <button id="btn-right-inspect" class="context-rail-btn" type="button" title="Abrir inspetor da seleção" aria-label="Abrir inspetor da seleção"><i class="fas fa-circle-info"></i></button>
     <span class="context-rail-separator" aria-hidden="true"></span>
     <button id="btn-right-dashboard" class="context-rail-btn" type="button" title="Abrir Painéis deste contexto" aria-label="Abrir Painéis deste contexto"><i class="fas fa-chart-pie"></i></button>
-    <button id="btn-right-cube" class="context-rail-btn" type="button" title="Abrir Cubo do Caso" aria-label="Abrir Cubo do Caso"><i class="fas fa-cube"></i></button>
+    <button id="btn-right-cube" class="context-rail-btn" type="button" title="Abrir Cubo dos Achados" aria-label="Abrir Cubo dos Achados"><i class="fas fa-cube"></i></button>
   </aside>
 
   <!-- ===================== OPERAÇÕES ===================== -->
@@ -981,7 +981,7 @@
   <div id="case-add-modal" class="modal-overlay" hidden>
     <div class="modal compact-modal">
       <div class="modal-head">
-        <h3>Adicionar ao caso</h3>
+        <h3>Adicionar a Achados</h3>
         <button id="case-add-close" class="icon-btn" type="button" title="Fechar"><i class="fas fa-xmark"></i></button>
       </div>
       <div class="modal-body">
@@ -1077,6 +1077,7 @@
   <script src="analysis-fields.js"></script>
   <script src="explorer-timeline.js"></script>
   <script src="field-transform.js"></script>
+  <script src="field-indexes.js"></script>
   <script src="exclusion-archive.js"></script>
   <script src="exclusion-visibility.js"></script>
   <script src="case-references.js"></script>

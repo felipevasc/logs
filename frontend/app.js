@@ -1032,14 +1032,15 @@ function autoVisibleCols() {
 
 // ------------------------------------------------------------------ tema
 function initTheme() {
-  const saved = localStorage.getItem("li-theme") || "dark";
+  const saved = activeCase()?.workspace?.theme === "light" ? "light" : "dark";
   document.documentElement.dataset.theme = saved;
   updateThemeIcon();
 }
 function toggleTheme() {
   const cur = document.documentElement.dataset.theme === "light" ? "dark" : "light";
   document.documentElement.dataset.theme = cur;
-  localStorage.setItem("li-theme", cur);
+  const item = activeCase();
+  if (item && item.kind !== "preserved_case_unavailable") { item.workspace ||= defaultCaseWorkspace(); item.workspace.theme = cur; void saveCases(); }
   updateThemeIcon();
   repaintChartTheme();
 }
@@ -1122,9 +1123,18 @@ function resetCaseSourceState() {
   // A Case transition invalidates source intent before any asynchronous preparation.
   state.artifactSwitchVersion++; state.refreshVersion++;
   window.Tasks?.cancelLatest("source-load");
+  window.Tasks?.cancelLatest("field-index");
+  window.Tasks?.cancelStaleAnalysis?.();
+  window.FieldIndexes?.reset();
+  window.Security?.invalidate();
+  window.Discovery?.clearCache();
+  explorerAnalytics.clear();
+  closeCtxMenu();
+  clearTimeout(debounceTimer);
   Object.assign(state, { loaded: false, rows: [], total: 0, columns: [], filters: [], quick: "", currentArtifact: null, currentOrigin: "",
     pageResult: null, dataPeriod: null, facetData: null, explorerCache: null, queryError: null,
-    datasetDashboard: null, datasetCube: null, datasetProfiles: null, sourceIdentityUnconfirmed: false });
+    datasetDashboard: null, datasetCube: null, datasetProfiles: null, sourceIdentityUnconfirmed: false,
+    currentDetailEv: null, detailSourceSpec: null, page: 0, activeStationId: null, stationAnalyticsId: null });
   $("#file-path").value = ""; $("#file-format").value = "auto";
   $("#channel").value = "Application"; $("#max-events").value = "5000";
   setSource("file");
@@ -1861,15 +1871,17 @@ async function loadDerivedFields(capturedOwner = window.AnalysisContexts?.captur
 }
 
 function renderExploreTree() {
+  void window.FieldIndexes?.refresh();
   document.querySelectorAll(".explore-tree-sync").forEach((box) => {
     if (box.closest("[hidden]")) return;
     renderExploreTreeInto(box, box.dataset.treeScope || "dataset");
   });
+  window.FieldIndexes?.paint();
 }
 
 // ------------------------------------------------------------------ matcher local
 // Espelha o matcher do backend (query.rs) para filtrar listas que já estão no
-// cliente (ex.: eventos dos itens do Caso nas linhas do tempo).
+// cliente (ex.: eventos dos itens de Achados nas linhas do tempo).
 function jsColNum(ev, col) {
   if (col === "timestamp") return ev.timestamp ?? null;
   if (col === "id") return ev.id;
@@ -2119,6 +2131,8 @@ function renderExploreTreeInto(box, scope) {
     const row = el("div", `field-row${isParent ? " is-parent" : ""}`);
     row.dataset.field = `${column} ${colLabel(column)}`.toLocaleLowerCase();
     row.dataset.column = column;
+    row.classList.toggle("field-indexed", !!window.FieldIndexes?.has(column));
+    if (window.FieldIndexes?.has(column)) row.setAttribute("data-index-hint", "Índice de valores criado neste Caso");
     if (hasColFilter(column)) row.classList.add("has-filter");
     if (toggleBtn) row.appendChild(toggleBtn);
     const main = el("button", "field-item");
@@ -2129,6 +2143,7 @@ function renderExploreTreeInto(box, scope) {
     row.oncontextmenu = event => {
       event.preventDefault(); event.stopPropagation();
       showCtxMenu(event.clientX, event.clientY, [
+        ...(window.FieldIndexes ? [window.FieldIndexes.menuItem(column)] : []),
         ...(window.ExplorerTimeline ? [window.ExplorerTimeline.menuItem(column)] : []),
         ...(window.FieldTransforms ? [window.FieldTransforms.menuItem(column, { anchor: main })] : []),
         ...(window.CaseReferences ? [window.CaseReferences.lookupMenuItem(column, main)] : []),
@@ -2289,11 +2304,20 @@ function renderExploreTreeInto(box, scope) {
     const analysisOwner = window.AnalysisContexts?.capture();
     const derivedKids = state.derivedFields.map((def) => {
       const row = el("div", "field-row");
+      row.dataset.column = def.name;
+      row.classList.toggle("field-indexed", !!window.FieldIndexes?.has(def.name));
       const main = el("button", "field-item");
       const sourceLabel = def.lookup ? window.CaseReferences?.describe(def) || "Referência do Caso" : colLabel(def.source);
       main.innerHTML = `<i class="fas ${def.lookup ? "fa-table-list" : "fa-wand-magic-sparkles"}"></i><span>${esc(def.name)}</span><small>${esc(sourceLabel)}</small>`;
       main.title = `${def.name} ← ${sourceLabel}${def.lookup ? "" : ` · /${def.pattern}/`}`;
       main.onclick = () => def.steps?.length && !def.rules?.length && window.FieldTransforms ? window.FieldTransforms.open(def.name, { anchor: main, owner: analysisOwner }) : openDeriveEdit(def, { analysisOwner, anchor: main });
+      row.oncontextmenu = event => {
+        event.preventDefault(); event.stopPropagation();
+        showCtxMenu(event.clientX, event.clientY, [
+          ...(window.FieldIndexes ? [window.FieldIndexes.menuItem(def.name)] : []),
+          { icon: "fa-pen", label: "Editar campo customizado", onClick: () => openDeriveEdit(def, { analysisOwner, anchor: main }) },
+        ]);
+      };
       const edit = el("button", "icon-btn field-adv-btn");
       edit.innerHTML = '<i class="fas fa-pen"></i>';
       edit.title = `Editar campo ${def.name}`;
@@ -4466,6 +4490,7 @@ function newCase(name, { keepArtifact = false, contextSnapshot = null } = {}) {
   state.cases.cases.push(c);
   state.cases.active = c.id;
   window.AnalysisContexts?.activate();
+  if (context) resetCaseSourceState();
   state.activeStationId = null;
   state.stationAnalyticsId = null;
   setAnalysisView("overview");
@@ -4600,7 +4625,7 @@ function openCaseAdd(request) {
   for (const station of caseStations()) select.appendChild(el("option", "", station.name)).value = station.id;
   select.value = artifact?.stationId || "";
   $("#case-add-summary").textContent = request.kind === "event"
-    ? "O evento selecionado será incluído no Caso ativo."
+    ? "O evento selecionado será preservado em Achados deste Caso."
     : `O grupo "${chipLabel({ column: request.column, op: request.op || "equals", value: request.value, value2: null })}" será incluído com a quantidade disponível.`;
   $("#case-add-station-form").hidden = true;
   $("#case-add-station-name").value = "";
@@ -4939,7 +4964,7 @@ function renderCaseItems(box, c) {
     edit.onclick = () => openCaseItemContext(item);
     const del = el("button", "icon-btn");
     del.innerHTML = '<i class="fas fa-trash-can"></i>';
-    del.title = "Remover item do Caso";
+    del.title = "Remover item de Achados";
     del.onclick = () => {
       c.items.splice(index, 1);
       const workspace = normalizeCaseWorkspace(c.workspace);
@@ -6478,6 +6503,7 @@ function showDetailNameMenu(event, node) {
   const column = state.columns.includes(node.path) || window.AnalysisFields?.admitted(node) ? node.path : null;
   const items = [];
   if (column) {
+    if (window.FieldIndexes) items.push(window.FieldIndexes.menuItem(column));
     if (window.ExplorerTimeline) items.push(window.ExplorerTimeline.menuItem(column));
     if (window.FieldTransforms) items.push(window.FieldTransforms.menuItem(column, { event: state.currentDetailEv, anchor: event.target }));
     if (window.CaseReferences) items.push(window.CaseReferences.lookupMenuItem(column, event.target));
@@ -6567,7 +6593,9 @@ function renderDetailTree(entries, collapsedPaths = new Set()) {
       head.appendChild(toggle);
     } else head.appendChild(el("span", "detail-tree-spacer"));
     const name = el("span", "detail-tree-name", depth ? node.name : colLabel(node.name));
-    name.title = node.path;
+    name.dataset.column = node.path;
+    name.classList.toggle("field-indexed", !!window.FieldIndexes?.has(node.path));
+    name.title = `${node.path}${window.FieldIndexes?.has(node.path) ? "\nÍndice de valores criado neste Caso" : ""}`;
     name.oncontextmenu = (event) => showDetailNameMenu(event, node);
     head.appendChild(name);
     row.appendChild(head);

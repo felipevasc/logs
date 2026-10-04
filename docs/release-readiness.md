@@ -1,4 +1,14 @@
-# Verificação da integração 0.12.1
+# Verificação da integração
+
+## Entrega 0.13.0 — Casos, índices e coleta remota
+
+A implementação anterior da investigação foi preservada no commit `2018799` antes deste lote. As melhorias incluem início vazio de Caso, restauração da área do destino, tema/zoom por Caso, nomenclatura Achados, índices opcionais com publicação completa, leitura paralela limitada e aquisição SSH/WinRM.
+
+Validações locais deste lote: `npm run check` com 308 verificações essenciais e salvaguardas de publicação; oito fluxos integrados de navegador, com repetição dos afetados após correções; verificação da sintaxe PowerShell e transporte binário do coletor Python. As verificações nativas e o aceite do executável são registrados no fechamento da implementação.
+
+Não foi usada uma conexão autenticada com servidor SSH/WinRM real. A release só pode ser considerada publicada quando o workflow do GitHub concluir instaladores, atualização instalada, assinaturas e envio de todos os assets. Consulte [notas da versão](releases/v0.13.0.md), [conexões](casos-indices-conexoes.md) e [política de testes vigente](ci-validation.md).
+
+## Histórico da integração 0.12.1
 
 Integração autorizada em 3 de outubro de 2026 com fix/v0.12.1-corrections.
 O trabalho anterior da base 0.5 foi preservado no commit b899f40 antes do merge.

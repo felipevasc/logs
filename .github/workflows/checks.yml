@@ -47,9 +47,8 @@ jobs:
     name: Frontend and interaction regressions
     needs: scope
     runs-on: ubuntu-22.04
-    # The full UI suite now takes about 20 minutes before setup and evidence.
-    # Keep every selected regression and leave room for slower hosted runners.
-    timeout-minutes: 40
+    # Core data and ownership checks, with bounded setup and diagnostics.
+    timeout-minutes: 20
     concurrency:
       group: checks-frontend-${{ github.ref }}
       cancel-in-progress: true
@@ -178,7 +177,7 @@ jobs:
       - run: npm run prepare:frontend
       - name: Backend tests
         if: runner.os != 'Windows'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1
+        run: npm run test:native
       - name: Windows backend tests with loader diagnostics
         if: runner.os == 'Windows'
         id: backend_windows

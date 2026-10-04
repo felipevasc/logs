@@ -23,6 +23,7 @@
     if (mock.nextError) { const message = mock.nextError; mock.nextError = null; throw Error(message); }
     if (command === "remote_test") return { ok: true, message: "Acesso confirmado ao índice. A conexão está pronta para importar." };
     if (command === "remote_import") {
+      if (["ssh", "winrm"].includes(args.connection.kind)) return { path: "C:/preview/remote/auth.log", paths: args.connection.paths.map((_, i) => `C:/preview/remote/log-${i}.jsonl`), count: args.connection.paths.length, bytes: 2048, format: "auto" };
       const count = Math.min(6000, args.connection.maxRecords);
       return { path: `C:/preview/remote-${Date.now()}.jsonl`, count, total: 6000, totalRelation: "eq", limited: count < 6000, bytes: count * 256, metadataField: "_loginsight_remote" };
     }

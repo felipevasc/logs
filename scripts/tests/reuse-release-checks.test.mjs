@@ -101,7 +101,7 @@ test('workflow proof gates both jobs while package, installed updater and native
   assert.match(job('checks-proof'), /fetch-depth: 0/);
   assert.equal((build.match(/actions: read/g) || []).length, 1);
   assert.match(job('validate'), /if: needs.checks-proof.outputs.reused != 'true'\s+run: npm run check/);
-  for (const name of ['Full browser regression', 'Backend tests', 'Windows backend tests with loader diagnostics', 'Verify Windows unit harness manifest']) assert.match(step(name), /needs.checks-proof.outputs.reused != 'true'/);
+  for (const name of ['Core browser checks', 'Backend tests', 'Windows backend tests with loader diagnostics', 'Verify Windows unit harness manifest']) assert.match(step(name), /needs.checks-proof.outputs.reused != 'true'/);
   for (const name of ['Verify version', 'Verify release safeguards', 'Build installers', 'Update end to end']) {
     assert(step(name), name); assert.doesNotMatch(step(name), /if:|reused/);
   }

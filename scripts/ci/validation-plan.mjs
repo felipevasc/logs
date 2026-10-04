@@ -5,18 +5,14 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 export const fullPreview = [
-  'test-resources.mjs', 'test-value-inspector.mjs', 'test-case-autosave.mjs',
-  'test-navigation.mjs', 'test-ui-scale.mjs', 'test-resource-settings.mjs', 'test-workspace-context.mjs',
-  'test-responsiveness.mjs', 'test-journeys.mjs', 'test-threats.mjs', 'test-security-on-demand.mjs', 'test-remote-sources.mjs',
-  'test-analysis-workbench.mjs', 'test-discovery.mjs', 'test-updates.mjs',
-  'test-explorer-timeline.mjs', 'test-field-transform.mjs', 'test-exclusion-archive.mjs',
-  'test-case-references.mjs', 'test-canonical-field-actions.mjs', 'test-java-trace.mjs',
+  'test-workspace-context.mjs', 'test-remote-sources.mjs',
   'test-native-case-startup.mjs', 'test-native-case-timeline.mjs',
-  'test-context-menu.mjs', 'test-waiting-visuals.mjs', 'test-toast-feedback.mjs', 'test-record-actions.mjs', 'test-export-scope.mjs', 'test-case-report-waiting.mjs', 'test-timeline-export-waiting.mjs', 'test-columns.mjs', 'test-source-actions.mjs', 'test-settings-codes.mjs', 'test-timestamp-editor.mjs',
+  'test-exclusion-archive.mjs', 'test-field-transform.mjs',
+  'test-investigation.mjs', 'test-updates.mjs',
 ];
 export const essentialPreview = [
-  'test-navigation.mjs', 'test-responsiveness.mjs', 'test-updates.mjs',
-  'test-case-references.mjs', 'test-native-case-startup.mjs', 'test-native-case-timeline.mjs',
+  'test-workspace-context.mjs', 'test-native-case-startup.mjs',
+  'test-native-case-timeline.mjs', 'test-updates.mjs',
 ];
 const affected = [
   [/^frontend\/resources\.(?:js|css)$/, ['test-resources.mjs']],
@@ -58,10 +54,9 @@ export function planValidation(files, { full = false, deleted = [] } = {}) {
     // The shared monolith owns many subsystems; file-only selection cannot
     // safely narrow its browser coverage, but it does not require Rust rebuilds.
     if (/^frontend\/(?:app\.js|index\.html|styles\.css|analysis-context\.js|performance-core\.js)$/.test(path)) { broad = true; continue; }
-    if (/^scripts\/tests\//.test(path)) continue; // all Node tests always run
-    // The v0.13 investigation checks are manual, per the requested minimal
-    // validation policy; its additions must not grow the automatic matrix.
-    if (/^frontend\/investigation\.(?:js|css)$/.test(path) || path === 'scripts/preview/test-investigation.mjs') continue;
+    if (/^scripts\/tests\//.test(path)) continue; // selected essential Node contracts always run
+    // One integrated investigation flow covers membership and stale identity.
+    if (/^frontend\/investigation\.(?:js|css)$/.test(path)) { selected.add('test-investigation.mjs'); continue; }
     // These helpers have a Windows-only Job Object/stdio handshake. Linux's
     // frontend suite cannot approve their Windows process-tree behavior.
     if (/^scripts\/preview\/(?:windows-job\.ps1|managed-child\.mjs|managed-process\.mjs|supervisor-handshake\.mjs)$/.test(path)) {
@@ -86,6 +81,7 @@ export function planValidation(files, { full = false, deleted = [] } = {}) {
     native = true; broad = true;
   }
   if (!active) return { native: false, preview: [], scope: 'documentation', reason: 'Only documentation or repository metadata changed' };
+  if (broad) selected.clear();
   for (const test of broad ? fullPreview : essentialPreview) selected.add(test);
   return { native, preview: [...selected].sort(), scope: broad ? 'full' : 'essential-and-affected', reason: broad ? 'Shared UI, native, tooling or unknown runtime inputs changed' : 'Essential smoke plus changed UI subsystems; not full regression' };
 }

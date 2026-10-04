@@ -58,6 +58,10 @@ window.Tasks = (() => {
   SCOPED.add("triage_timeline"); READS.add("triage_timeline");
   named.add("clear_events"); named.add("grouped_timeline"); named.add("preview_field_transform"); for (const command of ["exclusion_visibility", "exclusion_preview", "exclusion_list", "exclusion_archive_page"]) named.add(command);
   const latest = new Map();
+  SCOPED.add("field_index_status"); SCOPED.add("field_index_create");
+  READS.add("field_index_status"); QUIET.add("field_index_status");
+  named.add("field_index_create");
+  WHAT.field_index_create = "Criando índice do campo";
   named.add("analysis_field_text"); named.add("event_detail"); named.add("java_trace_detail");
   for (const command of ["reference_inspect", "reference_list", "reference_import", "reference_remove", "reference_save_lookup"]) named.add(command);
   for (const command of [...evidenceReads, ...evidencePreparations, ...evidenceCommits]) named.add(command);

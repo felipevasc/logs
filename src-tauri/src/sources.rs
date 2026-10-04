@@ -2182,7 +2182,7 @@ mod derived_transform_tests {
 }
 
 /// Como interpretar um formato customizado.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum CustomParse {
     Regex(regex::Regex),
     Delimited { sep: char, fields: Vec<String> },

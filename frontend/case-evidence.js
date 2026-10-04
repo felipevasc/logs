@@ -117,9 +117,9 @@ window.CaseEvidence = (() => {
         found.push({ caseId: item.id, itemIndex, field, view: value });
       };
       for (const field of ["rows", "events"]) add(item[field], null, field);
-      if (item.items !== undefined && !Array.isArray(item.items)) fail("Lista de itens do Caso inválida.");
+      if (item.items !== undefined && !Array.isArray(item.items)) fail("Lista de itens de Achados inválida.");
       for (const [index, child] of (item.items || []).entries()) {
-        if (!object(child)) fail("Item do Caso inválido.");
+        if (!object(child)) fail("Item de Achados inválido.");
         for (const field of ["rows", "events"]) add(child[field], index, field);
       }
     }
@@ -349,7 +349,7 @@ window.CaseEvidence = (() => {
         bytes += encoder.encode(JSON.stringify({ ...row, matches: [] })).length + (index ? 1 : 0); const matched = new Set();
         for (const value of row.matches) {
           keys(value, ["containerId", "itemId", "itemIndex", "member"], "Ocorrência correspondente inválida."); const location = locations.get(value.containerId);
-          if (!location || value.itemIndex !== location.itemIndex || value.itemId !== location.itemId) fail("A ocorrência corresponde a outro item do Caso."); member(value.member, location.reference);
+          if (!location || value.itemIndex !== location.itemIndex || value.itemId !== location.itemId) fail("A ocorrência corresponde a outro item de Achados."); member(value.member, location.reference);
           const memberKey = JSON.stringify([value.member.containerId, value.member.manifestId, value.member.occurrenceId]);
           if (value.member.containerId !== value.containerId || matched.has(memberKey)) fail("A ocorrência correspondente está repetida ou pertence a outro contêiner.");
           bytes += encoder.encode(JSON.stringify(value)).length + (matched.size ? 1 : 0); matched.add(memberKey); if (bytes > 1048576) fail("A resposta de pertencimento excede 1 MiB.");

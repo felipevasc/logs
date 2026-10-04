@@ -14,6 +14,8 @@
     "icon": "tauri icon",
     "check:js": "node scripts/check-js.mjs",
     "test": "node scripts/test.mjs",
+    "test:extended": "node scripts/test.mjs --extended",
+    "test:native": "node scripts/ci/native-essential.mjs",
     "test:preview": "node scripts/preview/run-smoke.mjs",
     "check": "npm run check:js && npm test && node scripts/release/verify-version.mjs && node scripts/release/test-release.mjs"
   },

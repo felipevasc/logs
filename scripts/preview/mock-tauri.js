@@ -777,6 +777,8 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     },
     engine_status: () => window.__mockEngineStatus || { state: 'ready', baseReady: true, derivedReady: true, phase: 'Pronto', completedRows: poolOf().length, totalRows: poolOf().length, completedSegments: 1, totalSegments: 1, resumedRows: 0, canResume: false, error: null },
     engine_retry: () => { window.__mockEngineStatus = null; return null; },
+    field_index_status: args => ({ fields: [...(window.__mockFieldIndexes?.get(args.analysisContext?.caseId) || [])], rows: poolOf().length }),
+    field_index_create: args => { window.__mockFieldIndexes ||= new Map(); const fields = window.__mockFieldIndexes.get(args.analysisContext?.caseId) || new Set(); fields.add(args.column); window.__mockFieldIndexes.set(args.analysisContext?.caseId, fields); return { fields: [...fields], rows: poolOf().length }; },
     cancel_task: ({ operationId }) => { (window.__mockCancelledIds ||= new Set()).add(operationId); return true; },
     query_events: ({ filters, offset=0, limit=100, sortColumn='', sortDir='',caseEvents }) => {
       const rows = sortedRows(applyFilters(filters,poolOf(caseEvents)),sortColumn,sortDir);

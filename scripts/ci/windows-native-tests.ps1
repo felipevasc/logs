@@ -5,7 +5,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 $destination = Join-Path $PWD 'output/windows-native-diagnostics'
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
 
-& cargo test --manifest-path src-tauri/Cargo.toml --release --locked --tests -- --test-threads=1 2>&1 |
+& node scripts/ci/native-essential.mjs 2>&1 |
     Tee-Object -FilePath (Join-Path $destination 'cargo-test.log')
 $testExit = $LASTEXITCODE
 if ($testExit -eq 0) { exit 0 }

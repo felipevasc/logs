@@ -5,6 +5,8 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod analysis;
 mod analysis_context;
+mod field_indexes;
+mod remote_files;
 mod case_interpretation;
 mod case_resources;
 mod case_security;
@@ -660,6 +662,32 @@ async fn engine_retry(app: AppHandle, operation_id: Option<String>, analysis_con
 }
 
 #[tauri::command]
+async fn field_index_status(app: AppHandle, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<field_indexes::Status, String> {
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Normal).await?;
+    offload_admitted(None, app.clone(), admitted, move || {
+        let state = app.state::<AppState>();
+        let source = analysis_runtime::source(&state);
+        match &*source {
+            SourceData::Indexed(idx) => field_indexes::status(idx),
+            _ => Ok(field_indexes::Status { fields: Vec::new(), rows: 0 }),
+        }
+    }).await?
+}
+
+#[tauri::command]
+async fn field_index_create(column: String, app: AppHandle, operation_id: Option<String>, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<field_indexes::Status, String> {
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Dataset, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
+    offload_admitted(operation_id, app.clone(), admitted, move || {
+        let state = app.state::<AppState>();
+        let source = analysis_runtime::source(&state);
+        match &*source {
+            SourceData::Indexed(idx) => field_indexes::build(idx, &column, state.inner(), Some(&app)),
+            _ => Err("Abra um arquivo na Análise para criar seu índice de campo.".into()),
+        }
+    }).await?
+}
+
+#[tauri::command]
 async fn load_files(
     paths: Vec<String>,
     format: String,
@@ -690,15 +718,20 @@ pub(crate) fn load_files_impl(
     }
     let mut indices: Option<sources::FileIndex> = None;
     let mut names = Vec::new();
-    for path in paths {
-        operations::check()?;
-        let idx = index_source_file(path, format, app)?;
-        if let Some(ref mut all) = indices {
-            all.append(idx)?;
-        } else {
-            indices = Some(idx);
+    // Bounded waves share the global CPU budget. Carry interpretation admission
+    // to every worker and fold in input order; no partial source is published.
+    let admitted = analysis_runtime::current();
+    for wave in paths.chunks(resources::workers().min(4).max(1)) {
+        let prepared = global_scheduler::map(wave, |path| analysis_runtime::with(admitted.clone(), || {
+            operations::check()?;
+            index_source_file(path, format, app)
+        }));
+        for (path, idx) in wave.iter().zip(prepared) {
+            let idx = idx?;
+            if let Some(ref mut all) = indices { all.append(idx)?; }
+            else { indices = Some(idx); }
+            names.push(format!("Arquivo: {path}"));
         }
-        names.push(format!("Arquivo: {path}"));
     }
     operations::check()?;
     let idx = indices.unwrap();
@@ -2248,6 +2281,8 @@ pub fn run() {
             load_event_log,
             load_file,
             load_files,
+            field_index_status,
+            field_index_create,
             clear_events,
             source_summary,
             source_snapshot,

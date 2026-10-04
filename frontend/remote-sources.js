@@ -4,20 +4,22 @@
   const ui = { connections: [], selected: null, persistentSecrets: null, busy: false, action: null, listVersion: 0, lastImport: null, returnFocus: null, item: null, connectionId: null, epoch: 0, libraryOpen: false, request: null };
   const sessions = new WeakMap();
   let requestSerial = 0;
-  const defaults = () => ({ name: "", kind: "elasticsearch", kibanaVersion: "auto", url: "", index: "logs-*", timeField: "@timestamp", username: "", maxRecords: 100000, query: null });
+  const defaults = () => ({ name: "", kind: "elasticsearch", kibanaVersion: "auto", url: "", index: "logs-*", timeField: "@timestamp", username: "", keyPath: "", maxRecords: 100000, query: null });
   const modal = el("div", "modal-overlay remote-overlay"); modal.id = "remote-modal"; modal.hidden = true;
   modal.innerHTML = `<section class="modal remote-modal" role="dialog" aria-modal="true" aria-labelledby="rs-title">
-    <header class="modal-head"><div><h3 id="rs-title">Conexões</h3><p>Consulte Elasticsearch ou Kibana e analise uma cópia local dos registros.</p></div><button class="icon-btn" type="button" id="rs-close" aria-label="Fechar conexões"><i class="fas fa-xmark"></i></button></header>
+    <header class="modal-head"><div><h3 id="rs-title">Conexões</h3><p>Importe registros de Elasticsearch/Kibana ou colete arquivos por SSH e WinRM.</p></div><button class="icon-btn" type="button" id="rs-close" aria-label="Fechar conexões"><i class="fas fa-xmark"></i></button></header>
     <div class="remote-body"><aside class="remote-saved"><div class="remote-list-head"><strong>Biblioteca global de conexões</strong><button class="btn ghost small" id="rs-new" type="button">+ Nova</button></div><p class="remote-help">Compartilhada neste computador. Abra explicitamente para escolher um acesso para este Caso.</p><div id="rs-list" role="listbox" aria-label="Biblioteca global de conexões" hidden></div><button class="text-button" id="rs-reload" type="button">Abrir biblioteca global</button></aside>
       <form id="rs-form" class="remote-form" novalidate><fieldset id="rs-fields"><div class="remote-form-heading"><h4 id="rs-form-title">Nova conexão</h4><span id="rs-saved-state"></span></div>
         <div class="remote-grid"><label class="remote-wide" for="rs-name">Nome<input id="rs-name" autocomplete="off" maxlength="120" placeholder="Ex.: Produção · API" required /></label>
-          <label for="rs-kind">Serviço<select id="rs-kind"><option value="elasticsearch">Elasticsearch</option><option value="kibana">Kibana</option></select></label><label for="rs-kibana-version" id="rs-kibana-version-wrap" hidden>Versão do Kibana<select id="rs-kibana-version"><option value="auto">Automático (Kibana 7, 8 ou 9+)</option><option value="v7_8">Kibana 7.x / 8.x</option><option value="v9">Kibana 9+ / Serverless</option></select></label><label for="rs-index">Índice ou padrão<input id="rs-index" autocomplete="off" placeholder="logs-*" required /></label>
+          <label for="rs-kind">Serviço<select id="rs-kind"><option value="elasticsearch">Elasticsearch</option><option value="kibana">Kibana</option><option value="ssh">SSH · Linux</option><option value="winrm">WinRM · Windows</option></select></label><label for="rs-kibana-version" id="rs-kibana-version-wrap" hidden>Versão do Kibana<select id="rs-kibana-version"><option value="auto">Automático (Kibana 7, 8 ou 9+)</option><option value="v7_8">Kibana 7.x / 8.x</option><option value="v9">Kibana 9+ / Serverless</option></select></label><label for="rs-index" id="rs-index-wrap">Índice ou padrão<input id="rs-index" autocomplete="off" placeholder="logs-*" required /></label>
           <label class="remote-wide" for="rs-url">URL base<input id="rs-url" type="url" autocomplete="off" placeholder="https://elastic.exemplo:9200" required /><span id="rs-url-hint" class="remote-help"></span></label>
-          <label for="rs-username">Usuário <span class="remote-optional">opcional</span><input id="rs-username" autocomplete="off" spellcheck="false" /></label><label for="rs-password">Senha<input id="rs-password" type="password" autocomplete="new-password" placeholder="Senha de acesso" /><span id="rs-password-hint" class="remote-help"></span></label>
+          <label for="rs-username">Usuário <span class="remote-optional">opcional</span><input id="rs-username" autocomplete="off" spellcheck="false" /></label><label for="rs-password" id="rs-password-wrap">Senha<input id="rs-password" type="password" autocomplete="new-password" placeholder="Senha de acesso" /><span id="rs-password-hint" class="remote-help"></span></label>
+          <label class="remote-wide" id="rs-key-wrap" hidden>Chave privada SSH <span class="remote-optional">opcional com agente configurado</span><div class="remote-actions"><input id="rs-key" autocomplete="off" placeholder="Caminho local da chave privada" /><button type="button" class="btn ghost small" id="rs-key-browse">Escolher</button></div></label>
         </div>
+        <section id="rs-files" class="remote-options" hidden><strong>Arquivos e pastas · deste Caso</strong><p class="remote-help">Um caminho absoluto por linha. Pastas incluem seus arquivos e subpastas. A coleta preserva os arquivos para nossa indexação local.</p><div id="rs-presets" class="remote-actions"></div><label for="rs-paths">Caminhos selecionados<textarea id="rs-paths" rows="5" spellcheck="false"></textarea></label><label for="rs-mib">Limite da coleta (MiB)<input id="rs-mib" type="number" min="1" max="4096" value="512" /></label></section>
         <label class="remote-check"><input type="checkbox" id="rs-remember" />Guardar senha com proteção do sistema</label><p class="remote-help" id="rs-secret-note"></p>
-        <details class="remote-options" open><summary>Recorte da importação · deste Caso</summary><div class="remote-grid"><label for="rs-time-field">Campo de data/hora<input id="rs-time-field" autocomplete="off" placeholder="Ex.: @timestamp (opcional)" /></label><label for="rs-limit">Máximo de registros<input id="rs-limit" type="number" min="1" max="5000000" step="1" value="100000" /></label><label for="rs-from">De <span class="remote-optional">opcional</span><input id="rs-from" type="datetime-local" step="1" /></label><label for="rs-to">Até <span class="remote-optional">opcional</span><input id="rs-to" type="datetime-local" step="1" /></label></div><p class="remote-help">Seleção, índice, filtro e período são salvos somente neste Caso. Dados de acesso ficam na biblioteca global. Horários no fuso deste computador. Com campo de data/hora, os registros mais recentes vêm primeiro. Sem esse campo, a consulta usa a ordem interna do índice.</p></details>
-        <details class="remote-options"><summary>Filtro avançado · Query DSL</summary><label for="rs-query" class="remote-help">Somente a cláusula de consulta, por exemplo <code>{"match":{"service.name":"api"}}</code>.</label><textarea id="rs-query" rows="5" spellcheck="false" placeholder='{"match_all":{}}'></textarea></details>
+        <details class="remote-options" id="rs-query-options" open><summary>Recorte da importação · deste Caso</summary><div class="remote-grid"><label for="rs-time-field">Campo de data/hora<input id="rs-time-field" autocomplete="off" placeholder="Ex.: @timestamp (opcional)" /></label><label for="rs-limit">Máximo de registros<input id="rs-limit" type="number" min="1" max="5000000" step="1" value="100000" /></label><label for="rs-from">De <span class="remote-optional">opcional</span><input id="rs-from" type="datetime-local" step="1" /></label><label for="rs-to">Até <span class="remote-optional">opcional</span><input id="rs-to" type="datetime-local" step="1" /></label></div><p class="remote-help">Seleção, índice, filtro e período são salvos somente neste Caso. Dados de acesso ficam na biblioteca global. Horários no fuso deste computador. Com campo de data/hora, os registros mais recentes vêm primeiro. Sem esse campo, a consulta usa a ordem interna do índice.</p></details>
+        <details class="remote-options" id="rs-query-advanced"><summary>Filtro avançado · Query DSL</summary><label for="rs-query" class="remote-help">Somente a cláusula de consulta, por exemplo <code>{"match":{"service.name":"api"}}</code>.</label><textarea id="rs-query" rows="5" spellcheck="false" placeholder='{"match_all":{}}'></textarea></details>
       </fieldset><div class="remote-actions"><button class="btn ghost" id="rs-delete" type="button" hidden>Excluir da biblioteca global</button><span class="spacer"></span><button class="btn ghost" id="rs-test" type="button">Testar acesso</button><button class="btn ghost" id="rs-save" type="button">Salvar acesso na biblioteca global</button><button class="btn primary" id="rs-import" type="button"><i class="fas fa-cloud-arrow-down"></i> Importar registros</button></div>
       <div class="remote-status" id="rs-status" role="status" aria-live="polite"><span id="rs-status-text">Salvar a conexão guarda suas opções para a próxima consulta.</span><button class="btn ghost small" id="rs-open-result" type="button" hidden>Abrir arquivo importado</button><button class="btn ghost small" id="rs-cancel" type="button" hidden>Cancelar</button></div>
       </form></div></section>`;
@@ -37,23 +39,33 @@
   }
   function syncHints() {
     const kibana = q("kind").value === "kibana";
+    const ssh = q("kind").value === "ssh", winrm = q("kind").value === "winrm", files = ssh || winrm;
+    q("files").hidden = !files; q("key-wrap").hidden = !ssh; q("password-wrap").hidden = ssh;
+    for (const id of ["index-wrap", "query-options", "query-advanced"]) q(id).hidden = files;
+    q("import").innerHTML = `<i class="fas fa-cloud-arrow-down"></i> ${files ? "Coletar e indexar arquivos" : "Importar registros"}`;
+    q("url").type = "text";
     q("kibana-version-wrap").hidden = !kibana;
-    q("url").placeholder = kibana ? "https://kibana.exemplo/s/meu-espaco" : "https://elastic.exemplo:9200";
-    q("url-hint").textContent = kibana ? "Use a URL base, com /s/espaco se necessário. Requer permissão no Console do Kibana; login SSO do navegador não é reutilizado." : "Endereço da API Elasticsearch. Use usuário e senha nos campos próprios, se exigidos.";
+    q("url").placeholder = ssh ? "ssh://servidor:22" : winrm ? "https://servidor:5986/wsman" : kibana ? "https://kibana.exemplo/s/meu-espaco" : "https://elastic.exemplo:9200";
+    q("url-hint").textContent = ssh ? "OpenSSH por chave ou agente. O host deve estar verificado em known_hosts. Python 3 no Linux remoto." : winrm ? "WinRM com HTTPS e certificado válido. Cliente disponível no Windows. Usuário vazio usa autenticação integrada." : kibana ? "Use a URL base, com /s/espaco se necessário. Requer permissão no Console do Kibana; login SSO do navegador não é reutilizado." : "Endereço da API Elasticsearch. Use usuário e senha nos campos próprios, se exigidos.";
+    q("presets").replaceChildren();
+    if (files) {
+      const presets = ssh ? [["Sistema", "/var/log/syslog\n/var/log/messages"], ["Autenticação", "/var/log/auth.log\n/var/log/secure"], ["Nginx", "/var/log/nginx"], ["Apache", "/var/log/apache2\n/var/log/httpd"], ["Auditoria", "/var/log/audit/audit.log"]] : [["EVTX principais", "C:\\Windows\\System32\\winevt\\Logs\\Application.evtx\nC:\\Windows\\System32\\winevt\\Logs\\System.evtx\nC:\\Windows\\System32\\winevt\\Logs\\Security.evtx"], ["Todos os EVTX", "C:\\Windows\\System32\\winevt\\Logs"], ["IIS", "C:\\inetpub\\logs\\LogFiles"]];
+      for (const [label, paths] of presets) { const button = el("button", "btn ghost small", `+ ${label}`); button.type = "button"; button.onclick = () => { q("paths").value = [...new Set([...q("paths").value.split(/\r?\n/).filter(Boolean), ...paths.split("\n")])].join("\n"); rememberDraft(); }; q("presets").append(button); }
+    }
     q("password").placeholder = credentialReusable() ? "Em branco mantém a senha existente" : "Senha de acesso";
     q("password-hint").textContent = credentialReusable() ? (ui.selected.passwordSaved ? "Senha protegida disponível neste computador." : "Senha disponível nesta sessão.") : "Deixe em branco para acesso sem senha.";
     q("remember").disabled = !ui.persistentSecrets;
     q("secret-note").textContent = ui.persistentSecrets == null ? "Abra a biblioteca global para verificar a proteção de senhas disponível. Senhas nunca entram no Caso ou nas exportações." : ui.persistentSecrets ? "Desmarcado: senha apenas na sessão atual. Marcado: protegida pelo sistema neste computador. Senhas ficam fora dos casos e das exportações." : "Neste sistema, senhas ficam apenas na sessão atual; serão solicitadas ao reabrir o aplicativo.";
   }
   // Persist only the query controls. Never spread a connection/vault response into a Case.
-  const draftFields = [["index", "index"], ["time-field", "timeField"], ["limit", "maxRecords"], ["query", "queryText"], ["from", "from"], ["to", "to"]];
-  const endpointFields = [["name", "name"], ["kind", "kind"], ["url", "url"], ["username", "username"], ["kibana-version", "kibanaVersion"]];
+  const draftFields = [["index", "index"], ["time-field", "timeField"], ["limit", "maxRecords"], ["query", "queryText"], ["from", "from"], ["to", "to"], ["paths", "pathsText"], ["mib", "maxMib"]];
+  const endpointFields = [["name", "name"], ["kind", "kind"], ["url", "url"], ["username", "username"], ["kibana-version", "kibanaVersion"], ["key", "keyPath"]];
   function normalizeDraft(raw) {
     const value = raw && typeof raw === "object" ? raw : {}, draft = value.draft || {};
     const string = (key, fallback = "") => typeof draft[key] === "string" ? draft[key] : fallback;
     return { schemaVersion: 1, connectionId: typeof value.connectionId === "string" && value.connectionId ? value.connectionId : null,
       draft: { index: string("index", "logs-*"), timeField: string("timeField", "@timestamp"), maxRecords: string("maxRecords", "100000"),
-        queryText: string("queryText"), from: string("from"), to: string("to") } };
+        queryText: string("queryText"), from: string("from"), to: string("to"), pathsText: string("pathsText"), maxMib: string("maxMib", "512") } };
   }
   function sessionFor(item) {
     if (!sessions.has(item)) sessions.set(item, { version: 0, endpoint: null, lastImport: null });
@@ -95,7 +107,7 @@
     if (!ui.connections.length) box.append(el("p", "remote-list-empty", "Nenhum acesso salvo na biblioteca global."));
     for (const connection of ui.connections) {
       const item = el("button", "remote-connection"); item.type = "button"; item.setAttribute("role", "option"); item.setAttribute("aria-selected", String(ui.selected?.id === connection.id)); item.disabled = ui.busy;
-      const head = el("span", "remote-connection-name", connection.name); const kind = el("span", "remote-connection-kind", connection.kind === "kibana" ? "Kibana" : "Elasticsearch");
+      const head = el("span", "remote-connection-name", connection.name); const kind = el("span", "remote-connection-kind", { ssh: "SSH", winrm: "WinRM", kibana: "Kibana", elasticsearch: "Elasticsearch" }[connection.kind] || connection.kind);
       const detail = el("span", "remote-connection-detail", connection.url); detail.title = detail.textContent;
       item.append(head, kind, detail); item.onclick = () => selectConnection(connection); box.append(item);
     }
@@ -151,6 +163,17 @@
     if (!connection.name) { q("name").focus(); throw Error("Dê um nome à conexão."); }
     let parsed;
     try { parsed = new URL(connection.url); } catch { q("url").focus(); throw Error("Informe uma URL válida, começando com https:// ou http://."); }
+    if (["ssh", "winrm"].includes(connection.kind)) {
+      if (parsed.username || parsed.password) throw Error("Use os campos próprios para credenciais.");
+      if (connection.kind === "ssh" ? parsed.protocol !== "ssh:" : parsed.protocol !== "https:") throw Error("Use ssh:// para SSH ou https:// para WinRM.");
+      connection.paths = q("paths").value.split(/\r?\n/).map(p => p.trim()).filter(Boolean);
+      connection.keyPath = connection.kind === "ssh" ? q("key").value.trim() : "";
+      connection.maxBytes = Number(q("mib").value) * 1024 * 1024;
+      if (!connection.paths.length) throw Error("Escolha locais sugeridos ou informe um caminho por linha.");
+      if (!Number.isInteger(connection.maxBytes) || connection.maxBytes < 1048576 || connection.maxBytes > 4294967296) throw Error("Defina um limite entre 1 e 4096 MiB.");
+      connection.timeField = ""; connection.index = "";
+      return connection;
+    }
     if (!["http:", "https:"].includes(parsed.protocol)) throw Error("A URL precisa usar https:// ou http://.");
     if (parsed.username || parsed.password) throw Error("Preencha usuário e senha nos campos próprios, sem incluir credenciais na URL.");
     if (!connection.index) { q("index").focus(); throw Error("Informe um índice ou padrão, como logs-*."); }
@@ -169,7 +192,7 @@
     if (from && to && from > to) throw Error("O início do período deve ser anterior ao fim.");
     return { ...(from ? { from: from.toISOString() } : {}), ...(to ? { to: to.toISOString() } : {}) };
   }
-  function passwordArgs() { const password = q("password").value; return password ? { password } : {}; }
+  function passwordArgs() { const password = q("kind").value === "ssh" ? "" : q("password").value; return password ? { password } : {}; }
   async function openSnapshot(result, captured, request = null) {
     const opening = { ...captured, epoch: ui.epoch };
     const current = () => panelCurrent(opening) && (!request || !request.cancelled && sessionFor(captured.item).importRequest === request);
@@ -178,7 +201,7 @@
     if(window.WorkspaceContext?.scope()==='case')await window.WorkspaceContext.setScope('dataset');
     if (!current()) return false;
     if(window.WorkspaceContext?.scope()==='case') { setStatus("Aguarde a operação atual e abra o arquivo importado na Análise.", "warning"); q("open-result").hidden = false; return false; }
-    const loaded = await loadData({ kind: "file", path: result.path, paths: [result.path], format: "jsonl" }, { merge: state.loaded, caseId: captured.item.id });
+    const loaded = await loadData({ kind: "file", path: result.path, paths: result.paths || [result.path], format: result.format || "jsonl" }, { merge: state.loaded, caseId: captured.item.id });
     if (!current()) return false;
     if (!loaded) {
       q("open-result").hidden = false; setStatus("O arquivo foi importado, mas não pôde ser aberto. Use Abrir arquivo importado para tentar novamente.", "error"); return false;
@@ -186,8 +209,9 @@
     const navigation = window.Workspace?.showPage("summary"), navigationEpoch = ui.epoch;
     await navigation;
     if (!importOwnerCurrent(captured) || ui.epoch !== navigationEpoch || request?.cancelled) return false;
-    setStatus(`${fmtNum(result.count)} registros importados.${result.limited ? " Limite atingido; ajuste o período ou o máximo para buscar mais." : ""}${result.warning ? ` ${result.warning}` : ""}`, result.limited || result.warning ? "warning" : "success");
-    toast(`${fmtNum(result.count)} registros importados${result.limited ? " · limite atingido" : ""}.${result.warning ? ` ${result.warning}` : ""}`, result.limited || result.warning ? "info" : "ok");
+    const noun = result.paths ? "arquivos coletados e indexados" : "registros importados";
+    setStatus(`${fmtNum(result.count)} ${noun}.${result.limited ? " Limite atingido; ajuste o período ou o máximo para buscar mais." : ""}${result.warning ? ` ${result.warning}` : ""}`, result.limited || result.warning ? "warning" : "success");
+    toast(`${fmtNum(result.count)} ${noun}${result.limited ? " · limite atingido" : ""}.${result.warning ? ` ${result.warning}` : ""}`, result.limited || result.warning ? "info" : "ok");
     return true;
   }
   async function act(action) {
@@ -195,7 +219,7 @@
     let connection, range;
     try {
       connection = readConnection();
-      if (action === "import") {
+      if (action === "import" && !["ssh", "winrm"].includes(connection.kind)) {
         range = readRange();
         if ((range.from || range.to) && !connection.timeField) { q("time-field").focus(); throw Error("Informe o campo de data/hora para usar um período."); }
       }
@@ -283,6 +307,7 @@
     q("password").value = ""; modal.hidden = true; ui.returnFocus?.focus?.();
   }
   q("form").onsubmit = event => event.preventDefault();
+  q("key-browse").onclick = async () => { const captured = capturePanel(); const path = await dialogApi.open({ multiple: false, directory: false }); if (path && panelCurrent(captured)) { q("key").value = path; rememberDraft(); } };
   for (const action of ["save", "test", "import"]) q(action).onclick = () => act(action);
   q("new").onclick = () => { selectConnection(); q("name").focus(); };
   q("close").onclick = close;

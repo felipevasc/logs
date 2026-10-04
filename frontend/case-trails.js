@@ -76,7 +76,7 @@ window.CaseTrails = (() => {
     const overlay = el("div", "modal-overlay case-trail-picker"), modal = el("section", "modal"); modal.setAttribute("role", "dialog"); modal.setAttribute("aria-modal", "true"); modal.setAttribute("aria-labelledby", "case-trail-picker-title");
     const head = el("header", "modal-head"), title = el("h3", "", "Associar itens"); title.id = "case-trail-picker-title";
     const close = () => { overlay.remove(); focus?.isConnected && focus.focus(); }; head.append(title, icon("fa-xmark", "Fechar seleção de itens", close));
-    const tools = el("div", "case-trail-picker-tools"), input = el("input"); input.type = "search"; input.placeholder = "Buscar nos itens do Caso…"; input.setAttribute("aria-label", "Buscar item para associar");
+    const tools = el("div", "case-trail-picker-tools"), input = el("input"); input.type = "search"; input.placeholder = "Buscar nos itens de Achados…"; input.setAttribute("aria-label", "Buscar item para associar");
     const count = el("span", "", ""), list = el("div", "case-trail-picker-list"), navigation = el("div"); count.setAttribute("aria-live", "polite"); tools.append(input, count);
     function drawChoices() {
       const rows = choices.filter(item => `${itemName(item)} ${narrative(item).summary}`.toLocaleLowerCase().includes(search)); page = Math.min(page, Math.max(0, Math.ceil(rows.length / PAGE) - 1));
@@ -121,7 +121,7 @@ window.CaseTrails = (() => {
     const overlay = el("div", "modal-overlay case-trail-picker"), modal = el("section", "modal"), head = el("header", "modal-head"), list = el("div", "case-trail-picker-list"), tools = el("div", "case-trail-picker-tools"), search = el("input"), status = el("span"), navigation = el("div"), footer = el("footer", "case-trail-picker-footer");
     modal.setAttribute("role", "dialog"); modal.setAttribute("aria-modal", "true"); modal.setAttribute("aria-label", "Associar itens preservados");
     const close = () => { overlay.remove(); if (activeCase() === c && focus?.isConnected) focus.focus(); };
-    head.append(el("h3", "", "Associar itens"), icon("fa-xmark", "Fechar seleção de itens", close)); search.type = "search"; search.placeholder = "Buscar nos itens do Caso…"; search.setAttribute("aria-label", "Buscar item para associar"); status.setAttribute("aria-live", "polite"); tools.append(search, status);
+    head.append(el("h3", "", "Associar itens"), icon("fa-xmark", "Fechar seleção de itens", close)); search.type = "search"; search.placeholder = "Buscar nos itens de Achados…"; search.setAttribute("aria-label", "Buscar item para associar"); status.setAttribute("aria-live", "polite"); tools.append(search, status);
     function paint() {
       const rows = choices.filter(choice => choice.label.toLocaleLowerCase().includes(query)); page = Math.min(page, Math.max(0, Math.ceil(rows.length / PAGE) - 1)); list.replaceChildren(); navigation.replaceChildren(); status.textContent = `${fmtNum(selected.size)} associados`;
       for (const choice of rows.slice(page * PAGE, (page + 1) * PAGE)) {
@@ -143,7 +143,7 @@ window.CaseTrails = (() => {
     };
   }
   function drawDetail(parent, trail, token) {
-    if (!trail) { const empty = el("div", "case-trails-empty"); empty.append(el("p", "", "Organize os itens do Caso em uma sequência com a sua interpretação."), button("Criar trilha", () => editTrail(), "btn primary")); parent.append(empty); return; }
+    if (!trail) { const empty = el("div", "case-trails-empty"); empty.append(el("p", "", "Organize os itens de Achados em uma sequência com a sua interpretação."), button("Criar trilha", () => editTrail(), "btn primary")); parent.append(empty); return; }
     const header = el("header", "case-trail-head"), title = el("div"); title.append(el("h2", "", trail.title || "Trilha sem título"), el("small", "", `${fmtNum(associationCount(trail))} itens associados`));
     const actions = el("div", "case-trail-actions"); actions.append(button("Associar itens", () => selectItems(trail), "btn primary small"), icon("fa-pen", "Editar trilha", () => editTrail(trail)), icon("fa-trash-can", "Remover trilha", () => removeTrail(trail))); header.append(title, actions); parent.append(header);
     const body = el("div", "case-trail-body"); showNarrative(body, trail); images(body, trail, token);

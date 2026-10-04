@@ -1,5 +1,22 @@
 # Validação essencial e latência de publicação
 
+## Política vigente na 0.13
+
+A pedido do usuário, a seleção automática foi reduzida aos contratos necessários. Esta seção substitui a política histórica registrada abaixo.
+
+- `npm run check`: parse de JavaScript, 29 arquivos de testes essenciais (308 verificações), versões coordenadas e salvaguardas de publicação. O manifesto é `scripts/ci/essential-tests.json`.
+- `npm run test:preview`: oito fluxos integrados: isolamento de Casos/índices/preferências, conexões, abertura nativa simulada, Timeline, arquivo de exclusões, campos transformados, investigação e atualização. Os quatro essenciais mais os módulos afetados são selecionados em mudanças locais; mudanças compartilhadas usam os oito.
+- `npm run test:native`: 24 verificações unitárias selecionadas de publicação, cancelamento, recursos, isolamento, coleta remota e índices, mais os fluxos de paridade/build do motor, recuperação de metadados e importação estruturada. Windows/Linux executam a mesma seleção serial.
+- `npm run test:extended` e `node scripts/ci/native-essential.mjs --extended`: testes especializados restantes sob demanda. Testes individuais de navegador podem ser passados a `npm run test:preview -- test-NOME.mjs`.
+- Quatorze arquivos de fixtures, snapshots e verificações de apresentação redundantes foram retirados. A seleção foi consolidada em três contratos do plano de CI, em vez de uma matriz extensa de combinações equivalentes.
+- Assinaturas, checksums, proteção de tags/versões, doze assets, instaladores, atualização instalada e aceite do executável real continuam obrigatórios para a release. Prévia simulada não substitui WebView/IPC reais.
+
+Um gate selecionado que falha, é cancelado ou não executa bloqueia a validação. O seletor registra os caminhos e scripts em `validation-plan.json`; o navegador registra resultado e duração em `smoke-summary.json`. O limite do job do navegador é 20 minutos, com 150 segundos por script. A redução é de trabalho executado, sem promessa de duração dos runners ou da compilação Rust.
+
+## Histórico até a 0.12.1
+
+O registro a seguir explica medições e decisões anteriores; referências à suíte completa e ao limite de 40 minutos não são a política vigente.
+
 ## O que é obrigatório
 
 - Em todo PR: parse de JavaScript, **todos** os testes Node, versão e salvaguardas de release (`npm run check`). Os testes de integridade, assinatura, recusa de sobrescrita e preservação de dados continuam presentes.

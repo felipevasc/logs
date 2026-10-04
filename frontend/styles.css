@@ -2496,3 +2496,7 @@ body.filters-active::after { opacity: 1; animation: filter-glow 3s ease-in-out i
 .date-hint, .value-node-date { margin-left: 8px; color: var(--text-2); font-size: .92em; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .date-hint::before, .value-node-date::before { content: "· "; opacity: .7; }
 .detail-tree-value-line .date-hint { align-self: center; }
+/* A small marker carries index state without competing with filter highlights. */
+.field-indexed { box-shadow: inset 2px 0 color-mix(in srgb, var(--accent, #7aa2f7) 35%, transparent); }
+.field-indexed .field-item > i, .detail-tree-name.field-indexed { color: color-mix(in srgb, var(--accent, #7aa2f7) 65%, var(--text, #eee)); }
+.field-row.field-indexed::after { content: ""; width: 4px; height: 4px; border-radius: 50%; background: var(--accent, #7aa2f7); opacity: .5; margin: 0 6px; flex: 0 0 auto; }

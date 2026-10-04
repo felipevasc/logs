@@ -122,8 +122,8 @@ window.CaseReport = (() => {
     }
     if(!timeline.rows.length)await paragraph('Nenhuma ocorrência registrada.');
     async function evidence(entry) {
-      const {item,ref}=entry;if(pageMap.has(item)){await paragraph(`${ref} · ${item.label||'Item do Caso'} — explicação e imagens na página ${pageMap.get(item)}.`,{size:9});return;}
-      ensure(28);pageMap.set(item,pdf.getNumberOfPages());await heading(`${ref} · ${item.label||'Item do Caso'}`,{level:2});
+      const {item,ref}=entry;if(pageMap.has(item)){await paragraph(`${ref} · ${item.label||'Item de Achados'} — explicação e imagens na página ${pageMap.get(item)}.`,{size:9});return;}
+      ensure(28);pageMap.set(item,pdf.getNumberOfPages());await heading(`${ref} · ${item.label||'Item de Achados'}`,{level:2});
       const rows=nativeBindings?[]:item.rows||[], count=nativeBindings?window.CaseEvidenceItems.count(item):rows.length, sources=[...new Set(rows.map(row=>row.source).filter(Boolean))];
       await paragraph(`${count} registros preservados${sources.length?` · ${sources.slice(0,6).join(', ')}${sources.length>6?` e mais ${sources.length-6} origens`:''}`:''}`,{size:8,color:[108,114,127]});
       if(item.detection)await paragraph(window.EvidenceUI?.report(item)||"",{size:8.5});
@@ -138,7 +138,7 @@ window.CaseReport = (() => {
       for(const entry of linked){if(entry.state!=='unique'){await paragraph(entry.state==='ambiguous'?'Associação ambígua preservada.':'Associação indisponível preservada.',{size:9});continue;}associated.add(entry.item);await evidence(byItem.get(entry.item));check(signal);}
     }
     const remaining=items.filter(item=>!associated.has(item));
-    if(remaining.length){section=trails.length?'Itens sem trilha':'Itens do Caso';await heading(section,{fresh:true});for(const item of remaining){await evidence(byItem.get(item));check(signal);}}
+    if(remaining.length){section=trails.length?'Itens sem trilha':'Achados do Caso';await heading(section,{fresh:true});for(const item of remaining){await evidence(byItem.get(item));check(signal);}}
     progress('Finalizando páginas…');
     const pages=pdf.getNumberOfPages();for(let page=1;page<=pages;page++){pdf.setPage(page);pdf.setDrawColor(225,226,232);pdf.line(LEFT,284,RIGHT,284);draw('LogInsight · Relatório do Caso',LEFT,289,7,false,[123,126,138]);const number=`${page} / ${pages}`;draw(number,RIGHT-textWidth(number,7,false),289,7,false,[123,126,138]);}
     check(signal);const blob=pdf.output('blob');if(blob.size>MAX_BYTES)throw Error('O relatório excede 32 MB. Reduza a quantidade de imagens ou divida o Caso.');

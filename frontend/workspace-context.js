@@ -2,7 +2,7 @@
 window.WorkspaceContext = (() => {
   "use strict";
   let scope = "dataset", changing = false, generation = 0, restoringCase = false, initialized = false, caseGeneration = 0;
-  let sourceBusy = 0, sourceQueue = Promise.resolve(), caseReturnScope = "dataset";
+  let sourceBusy = 0, sourceQueue = Promise.resolve();
   const states = new Map(), runtime = new Map();
   const key = (value = scope) => `${activeCase()?.id || "none"}:${value}`;
   const copy = value => structuredClone(value);
@@ -33,7 +33,7 @@ window.WorkspaceContext = (() => {
     v.dashboardCompact = !!v.dashboardCompact;
     v.aggs = Array.isArray(v.aggs) ? v.aggs.filter(item => item && AGG_FUNCS.some(([func]) => func === item.func) && typeof item.column === "string").slice(0, 20).map(item => ({ func: item.func, column: item.column, alias: typeof item.alias === "string" ? item.alias : item.func })) : base.values.aggs;
     if (!v.aggs.length) v.aggs = base.values.aggs;
-    snapshot.tree = strings(input.tree); snapshot.cubeCollapsed = Array.isArray(input.cubeCollapsed) ? input.cubeCollapsed.filter(path => Array.isArray(path) && path.every(part => part == null || ["string", "number", "boolean"].includes(typeof part))).slice(0, 1000) : [];
+    snapshot.tree = strings(input.tree); snapshot.drive = strings(input.drive); snapshot.cubeCollapsed = Array.isArray(input.cubeCollapsed) ? input.cubeCollapsed.filter(path => Array.isArray(path) && path.every(part => part == null || ["string", "number", "boolean"].includes(typeof part))).slice(0, 1000) : [];
     snapshot.density = ["compact", "comfortable"].includes(input.density) ? input.density : "comfortable"; snapshot.wrap = input.wrap === "true" ? "true" : "false";
     for (const [selector, point] of Object.entries(record(input.scroll))) if (scrollSelectors.includes(selector) && Array.isArray(point) && point.length === 2 && point.every(n => Number.isFinite(n) && n >= 0)) snapshot.scroll[selector] = point;
     const w = record(input.workspace), selection = value => ({ filters: validFilters(value?.filters), quick: typeof value?.quick === "string" ? value.quick : "" });
@@ -47,6 +47,7 @@ window.WorkspaceContext = (() => {
     const snapshot = { page: document.body.dataset.page || "summary", queryDraft: window.QueryBar?.captureDraft?.() || { value: $("#quick-search").value }, values: Object.fromEntries(stateKeys.map(name => [name, copy(state[name])])), tree: [...state.treeCollapsed], cubeCollapsed: [...cubeState.collapsed], density: document.body.dataset.density, wrap: document.body.dataset.wrap, sideCollapsed: document.querySelector(".shell").classList.contains("side-collapsed"), scroll: {}, discovery: window.Discovery?.capture(), workbench: window.WorkspaceAnalysis?.capture(), explorerTimeline: window.ExplorerTimeline?.capture(), workspace: window.Workspace?.capture(), journeys: window.Journeys?.capture() };
     for (const selector of scrollSelectors) { const node = document.querySelector(selector); if (node) snapshot.scroll[selector] = [node.scrollLeft, node.scrollTop]; }
     states.set(key(), snapshot); runtime.set(key(), Object.fromEntries(runtimeKeys.map(name => [name, state[name]])));
+    snapshot.drive = [...state.driveCollapsed];
     const c = activeCase(); if (c) { c.workspace ||= defaultCaseWorkspace(); c.workspace.contextStates = record(c.workspace.contextStates); c.workspace.contextStates[scope] = snapshot; c.workspace.activeScope = scope; }
     return snapshot;
   }
@@ -56,6 +57,7 @@ window.WorkspaceContext = (() => {
   }
   function stored(value) { return sanitize(states.get(key(value)) || activeCase()?.workspace?.contextStates?.[value]); }
   function apply(snapshot) {
+    initTheme(); repaintChartTheme(); window.UiScale?.activateCase?.();
     const base = defaults();
     for (const name of stateKeys) state[name] = copy(snapshot.values?.[name] ?? base.values[name]);
     for (const name of ["filters", "visibleCols", "aggs", "favoriteFields"]) if (!Array.isArray(state[name])) state[name] = copy(base.values[name]);
@@ -77,6 +79,7 @@ window.WorkspaceContext = (() => {
     $("#explore-tree").dataset.treeScope = scope;
     state.treeAgg[scope] = null; state.treeAggSig[scope] = null; state.treeAggError[scope] = null; treeAggVersion.dataset++; treeAggVersion.case++;
     state.treeCollapsed = new Set(snapshot.tree || []);
+    state.driveCollapsed = new Set(snapshot.drive || []);
     cubeState.collapsed = new Set(snapshot.cubeCollapsed || []); cubeState.requestVersion++;
     document.body.dataset.density = snapshot.density || "comfortable"; document.body.dataset.wrap = snapshot.wrap || "false";
     document.querySelector(".shell").classList.toggle("side-collapsed", !!snapshot.sideCollapsed);
@@ -124,7 +127,7 @@ window.WorkspaceContext = (() => {
       if (request !== generation) return;
       scope = next; apply(snapshot); if (options.tab) state.activeDatasetTab = options.tab; updateToggle();
       const nativeCase = scope === "case" && window.CaseEvidence?.active === true ? caseAnalysisSummary(true) : null;
-      finishOperation(scope === "case" ? "Caso" : "Análise", nativeCase ? nativeCase.ready ? `${fmtNum(nativeCase.preservedCount)} ocorrências preservadas no Caso` : nativeCase.message : scope === "case" ? `${fmtNum(caseEvents().length)} registros preservados no Caso` : `${currentCountLabel("registros")} na Análise`);
+      finishOperation(scope === "case" ? "Achados" : "Análise", nativeCase ? nativeCase.ready ? `${fmtNum(nativeCase.preservedCount)} ocorrências preservadas no Caso` : nativeCase.message : scope === "case" ? `${fmtNum(caseEvents().length)} registros preservados no Caso` : `${currentCountLabel("registros")} na Análise`);
       document.dispatchEvent(new CustomEvent("workspace-context-change", { detail: { scope, previousScope } }));
       render = Workspace.showPage(["sources", "connections", "import"].includes(page) && scope === "case" ? "summary" : page).then(async () => {
         if (request !== generation) return;
@@ -145,11 +148,13 @@ window.WorkspaceContext = (() => {
     } finally { if (request === generation) changing = false; }
   }
   async function changeCase(id) {
+    if (!state.cases.cases.some(item => item.id === id)) throw Error("O Caso selecionado não existe mais.");
     if (sourceBusy) { $("#case-select").value = state.cases.active || ""; toast("Aguarde a atualização das fontes para trocar de Caso.", "info"); return; }
-    if (!restoringCase && activeCase()?.kind !== "preserved_case_unavailable") caseReturnScope = scope;
-    const request = ++caseGeneration, previousScope = caseReturnScope; if (!restoringCase) capture(); restoringCase = true;
+    const request = ++caseGeneration; if (!restoringCase) capture(); restoringCase = true;
+    const outgoing = activeCase(), outgoingScope = scope;
     try {
       if (scope === "case") await setScope("dataset", { animate: false });
+      if (outgoing?.workspace) outgoing.workspace.activeScope = outgoingScope;
       if (request !== caseGeneration) return;
       state.cases.active = id; window.AnalysisContexts?.activate(); resetCaseSourceState(); state.activeStationId = null; state.stationAnalyticsId = null;
       renderCaseBar(); updateAnalysisBadge();
@@ -160,7 +165,8 @@ window.WorkspaceContext = (() => {
       // Each Case keeps its own analysis: its filters and views come back and
       // its records are queried again, never carried over from the previous Case.
       runtime.set(key("dataset"), sourceRuntime());
-      await setScope(previousScope, { force: true, animate: false, skipCapture: true });
+      const target = activeCase()?.workspace?.activeScope === "case" ? "case" : "dataset";
+      await setScope(target, { force: true, animate: false, skipCapture: true });
       if (request === caseGeneration && state.loaded) await refresh();
     } finally { if (request === caseGeneration) restoringCase = false; }
   }
@@ -173,11 +179,11 @@ window.WorkspaceContext = (() => {
     if (!previous) return;
     const c = activeCase(), request = caseGeneration;
     const current = () => request === caseGeneration && activeCase() === c;
-    // Keep the navigation area only. Sources, fields and results start empty.
+    // Every new Case starts from its own empty source and overview.
     resetCaseSourceState();
-    const fresh = { ...defaults(), page: previous.snapshot?.page || "summary" };
-    const target = previous.scope === "case" ? "case" : "dataset";
-    const freshCase = { ...defaults(), page: target === "case" ? previous.activeSnapshot?.page || "summary" : "summary" };
+    const fresh = defaults();
+    const target = "dataset";
+    const freshCase = defaults();
     runtime.set(key("dataset"), sourceRuntime());
     states.set(key("dataset"), fresh); states.set(key("case"), freshCase);
     c.workspace.contextStates = { dataset: fresh, case: freshCase }; c.workspace.activeScope = target;
@@ -251,7 +257,7 @@ window.WorkspaceContext = (() => {
     if (scope !== "dataset") return;
     const apply = (node, event, detail = false) => { const result = nativeMembership.rows.get(nativeRowKey(event)), included = result && result.state !== "missing";
       node.classList.toggle(detail ? "event-in-case-action" : "event-in-case", !!included);
-      node.title = nativeMembership.state === "loading" ? "Confirmando se o registro está preservado no Caso" : nativeMembership.state === "unavailable" ? "Pertencimento indisponível; atualize a seleção para confirmar" : included ? result.state === "ambiguous" ? `${result.matches.length} ocorrências deste registro estão preservadas no Caso` : "Este registro já está preservado no Caso" : detail ? "Salvar no Caso" : "";
+      node.title = nativeMembership.state === "loading" ? "Confirmando se o registro está preservado no Caso" : nativeMembership.state === "unavailable" ? "Pertencimento indisponível; atualize a seleção para confirmar" : included ? result.state === "ambiguous" ? `${result.matches.length} ocorrências deste registro estão preservadas no Caso` : "Este registro já está preservado no Caso" : detail ? "Salvar em Achados" : "";
     };
     for (const node of document.querySelectorAll("#events-table tbody tr[data-event-id]")) apply(node, state.rows.find(row => row.id === Number(node.dataset.eventId)));
     if (state.currentDetailEv && !$("#drawer").hidden) apply($("#ws-detail-save"), state.currentDetailEv, true);
@@ -283,7 +289,7 @@ window.WorkspaceContext = (() => {
   }
   document.addEventListener("case-evidence-state", () => { if (window.CaseEvidence?.active === true) refreshMembership(); });
   const oldDetail = showDetail;
-  showDetail = function(...args) { const result = oldDetail(...args); $("#ws-detail-save").hidden = scope === "case"; if (scope === "dataset") { const included = isIncluded(args[0]); $("#ws-detail-save").classList.toggle("event-in-case-action", included); $("#ws-detail-save").title = included ? "Este registro já está no Caso" : "Salvar no Caso"; } return result; };
+  showDetail = function(...args) { const result = oldDetail(...args); $("#ws-detail-save").hidden = scope === "case"; if (scope === "dataset") { const included = isIncluded(args[0]); $("#ws-detail-save").classList.toggle("event-in-case-action", included); $("#ws-detail-save").title = included ? "Este registro já está no Caso" : "Salvar em Achados"; } return result; };
   const originalSave = saveCases;
   saveCases = function(...args) { if (initialized && !changing && !restoringCase) capture(); return originalSave(...args); };
   updateToggle();

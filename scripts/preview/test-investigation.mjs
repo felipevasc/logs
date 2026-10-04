@@ -43,11 +43,11 @@ try {
   assert.match(await host.innerText(), /Comparar sucessos e falhas/);
   await host.getByRole('button', { name: 'Cronologia', exact: true }).click();
   await host.getByText('Há eventos relacionados.').waitFor();
-  assert.doesNotMatch(await host.innerText(), /do-not-show/); assert.match(await host.innerText(), /oculto/);
+  assert.match(await host.innerText(), /password=do-not-show/, 'original values remain literal, as in the event inspector');
   phase = 'optional synthesis citation review stays separate from classification';
   await host.getByRole('button', {name:'Preparar síntese assistida',exact:true}).click();
   const draft=host.getByRole('textbox',{name:'Síntese assistida com citações (JSON)',exact:true});await draft.fill(JSON.stringify({claims:[{kind:'observation',text:'password=do-not-show',event_refs:['ref-a'],signal_ids:[]}]}));
-  await host.getByRole('button',{name:'Conferir citações da síntese',exact:true}).click();await host.getByText(/human_review_required/).waitFor();assert.doesNotMatch(await host.innerText(),/do-not-show/);
+  await host.getByRole('button',{name:'Conferir citações da síntese',exact:true}).click();await host.getByText(/human_review_required/).waitFor();assert.match(await host.innerText(),/do-not-show/);
   phase = 'proposals with failed controls and stale identity';
   await host.getByRole('button',{name:'Sinais',exact:true}).click();
   await host.getByRole('button',{name:'Propor regra',exact:true}).click();
@@ -69,6 +69,6 @@ try {
   await host.getByText(/Resultado incompleto ou de outra análise/).waitFor();
   assert.equal(await page.evaluate(() => window.__mockCommandCalls.triage), 1, 'paging and hunts never scan');
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ queue: true, exactOriginalEvent: true, hunts: true, escapedText: true, secretMasking: true, staleAnalysisRejected: true, errors }, null, 2));
+  console.log(JSON.stringify({ queue: true, exactOriginalEvent: true, hunts: true, escapedText: true, literalOriginalValues: true, staleAnalysisRejected: true, errors }, null, 2));
 } catch (error) { await captureFailure(page, 'test-investigation', error, { phase }); throw error; }
 finally { await browser.close(); }

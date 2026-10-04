@@ -63,7 +63,7 @@ fn filter(column: &str, op: &str, value: &str) -> Filter {
     }
 }
 
-fn state_for(source: crate::SourceData) -> crate::AppState {
+pub(crate) fn state_for(source: crate::SourceData) -> crate::AppState {
     crate::AppState {
         source: parking_lot::RwLock::new(source),
         source_publication: parking_lot::RwLock::new(Default::default()),
@@ -75,6 +75,31 @@ fn state_for(source: crate::SourceData) -> crate::AppState {
         codes_path: PathBuf::new(),
         system_codes_path: PathBuf::new(),
     }
+}
+
+#[test]
+fn multi_file_loading_preserves_order_and_failed_wave_keeps_previous_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = (0..4).map(|i| {
+        let path = dir.path().join(format!("part-{i}.jsonl"));
+        std::fs::write(&path, format!("{{\"message\":\"part-{i}\"}}\n")).unwrap();
+        path.to_string_lossy().into_owned()
+    }).collect();
+    let state = state_for(crate::SourceData::None);
+    crate::global_scheduler::with_limit(4, || crate::operations::run_with_token(crate::operations::token(None).unwrap(), || {
+        let result = crate::load_files_impl(&state, &paths, "jsonl", Some(false), None).unwrap();
+        assert_eq!(result.count, 4);
+        let source = state.source.read();
+        let crate::SourceData::Indexed(index) = &*source else { panic!("indexed source required") };
+        for i in 0..4 {
+            assert_eq!(sources::event_at(index, i, &CodesConfig::default(), &CodesConfig::default(), &[]).message, format!("part-{i}"));
+        }
+        drop(source);
+        let before = serde_json::to_value(crate::source_publication::snapshot(&state)).unwrap();
+        let broken = vec![paths[0].clone(), dir.path().join("missing.log").to_string_lossy().into_owned()];
+        assert!(crate::load_files_impl(&state, &broken, "jsonl", Some(false), None).is_err());
+        assert_eq!(serde_json::to_value(crate::source_publication::snapshot(&state)).unwrap(), before);
+    })).unwrap();
 }
 
 #[test]

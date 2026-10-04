@@ -17,14 +17,14 @@ for (const scope of ['case', 'dataset']) for (const hasSource of [true, false]) 
   vm.runInContext(section('  function sourceRuntime(', '  function stored('), context);
   vm.runInContext(section('  async function afterCaseCreation(', '  async function deleteCase('), context);
   await context.afterCaseCreation({ scope, runtime: hasSource ? native : undefined, snapshot: { page: 'explore', values: { filters: [{ column: 'source' }] } }, activeSnapshot: { page: 'explore' } });
-  assert.equal(switches[0].target, scope, 'creating a case preserves the active area');
-  assert.equal(c.workspace.activeScope, scope);
+  assert.equal(switches[0].target, 'dataset', 'a new Case starts in Analysis');
+  assert.equal(c.workspace.activeScope, 'dataset');
   assert.deepEqual(Array.from(runtime.get('new:dataset').columns), [], 'a new Case never inherits the prior source columns');
   assert.equal(runtime.get('new:dataset').loaded, false, 'a new Case starts without any source, including creation from the dataset');
   assert.equal(runtime.get('new:dataset').rows.length, 0, 'filtered rows are not carried across cases');
   assert.equal(states.get('new:dataset').values.filters.length, 0, 'new analysis starts with a clean filter');
   assert.equal(states.get('new:case').values.filters.length, 0, 'new case starts with a clean filter');
-  assert.equal(states.get('new:case').page, scope === 'case' ? 'explore' : 'summary');
+  assert.equal(states.get('new:case').page, 'summary');
   assert.equal(context.restoringCase, false);
 }
 
@@ -46,7 +46,7 @@ const appSection = (start, end) => appSource.slice(appSource.indexOf(start), app
   const prior = { artifacts: [{ id: 'A-file', path: '/only-A.jsonl' }], activeArtifactId: 'A-file' }, handed = [];
   const context = vm.createContext({ state: { cases: { active: 'a', cases: [{ id: 'a', artifacts: prior.artifacts }] } },
     window: { WorkspaceContext: { beforeCaseCreation: () => prior, afterCaseCreation: value => handed.push(value) }, AnalysisContexts: { activate() {} } },
-    CURRENT_FILTER_ID: '__current__', defaultCaseWorkspace: () => ({}), setAnalysisView() {}, saveCases() {}, renderCaseBar() {}, updateAnalysisBadge() {}, renderAnalysis() {}, toast() {},
+    CURRENT_FILTER_ID: '__current__', defaultCaseWorkspace: () => ({}), resetCaseSourceState() {}, setAnalysisView() {}, saveCases() {}, renderCaseBar() {}, updateAnalysisBadge() {}, renderAnalysis() {}, toast() {},
   });
   vm.runInContext(appSection('function newCase(', 'function caseItems('), context);
   const created = context.newCase('B'); assert.equal(created.artifacts.length, 0); assert.equal(created.activeArtifactId, null);

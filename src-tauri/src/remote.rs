@@ -28,6 +28,8 @@ static SESSION: LazyLock<Mutex<HashMap<String, Secret>>> =
 pub enum RemoteKind {
     Elasticsearch,
     Kibana,
+    Ssh,
+    Winrm,
 }
 
 fn default_time_field() -> String {
@@ -59,7 +61,14 @@ pub struct RemoteConfig {
     pub query: Option<Value>,
     #[serde(default = "default_kibana_version")]
     pub kibana_version: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub key_path: String,
+    #[serde(default = "default_file_limit")]
+    pub max_bytes: u64,
 }
+fn default_file_limit() -> u64 { 512 * 1024 * 1024 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,6 +110,10 @@ pub struct ImportResult {
     metadata_field: String,
     warning: Option<String>,
     order: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<String>,
 }
 
 fn validate(mut c: RemoteConfig) -> Result<RemoteConfig, String> {
@@ -119,6 +132,10 @@ fn validate(mut c: RemoteConfig) -> Result<RemoteConfig, String> {
     if c.url.len() > 4096 {
         return Err("URL excede o limite de 4096 caracteres.".into());
     }
+    if matches!(c.kind, RemoteKind::Ssh | RemoteKind::Winrm) {
+        crate::remote_files::validate(&mut c)?;
+        return Ok(c);
+    }
     let url = Url::parse(&c.url)
         .map_err(|_| "URL inválida. Use http:// ou https:// e o endereço base do serviço.")?;
     if !matches!(url.scheme(), "http" | "https")
@@ -131,6 +148,7 @@ fn validate(mut c: RemoteConfig) -> Result<RemoteConfig, String> {
         return Err("Use uma URL HTTP(S) base, sem usuário, senha, parâmetros ou fragmento. Informe as credenciais nos campos próprios.".into());
     }
     c.url = url.as_str().trim_end_matches('/').to_owned();
+    c.paths.clear(); c.key_path.clear();
     if c.index.is_empty()
         || c.index.len() > 512
         || !c
@@ -181,7 +199,8 @@ fn validate(mut c: RemoteConfig) -> Result<RemoteConfig, String> {
 }
 
 fn identity(c: &RemoteConfig) -> String {
-    json!([c.kind, c.url, c.username]).to_string()
+    if c.kind == RemoteKind::Ssh { json!([c.kind, c.url, c.username, c.key_path]).to_string() }
+    else { json!([c.kind, c.url, c.username]).to_string() }
 }
 
 fn database(root: &Path) -> Result<Connection, String> {
@@ -246,7 +265,7 @@ fn password_for(
         }
         return Ok(Some(password));
     }
-    if c.username.is_empty() {
+    if c.username.is_empty() && c.kind != RemoteKind::Winrm {
         return Ok(None);
     }
     if let Some(secret) = SESSION
@@ -300,6 +319,8 @@ fn save_impl(
     remember: bool,
 ) -> Result<SavedConnection, String> {
     let mut c = validate(connection)?;
+    // The vault holds only access. Collection paths are authored by each Case.
+    if matches!(c.kind, RemoteKind::Ssh | RemoteKind::Winrm) { c.paths.clear(); }
     if remember && !cfg!(windows) {
         return Err("Salvar senha de forma protegida está disponível no Windows. Desmarque Salvar senha para usar apenas nesta sessão.".into());
     }
@@ -814,6 +835,8 @@ fn import_impl(
         metadata_field: METADATA_FIELD.into(),
         warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
         order,
+        paths: None,
+        format: None,
     })
 }
 
@@ -856,8 +879,14 @@ pub async fn remote_test(
     password: Option<String>,
     operation_id: Option<String>,
 ) -> Result<TestResult, String> {
-    crate::offload_operation(operation_id, move || test_impl(&client_for(&crate::config_dir(), connection, password)?))
-        .await?
+    crate::offload_operation(operation_id, move || {
+        let connection = validate(connection)?;
+        if matches!(connection.kind, RemoteKind::Ssh | RemoteKind::Winrm) {
+            let password = password_for(&crate::config_dir(), &connection, password)?;
+            crate::remote_files::test(&connection, password)?;
+            Ok(TestResult { ok: true, message: "Acesso confirmado aos arquivos selecionados.".into() })
+        } else { test_impl(&client_for(&crate::config_dir(), connection, password)?) }
+    }).await?
 }
 #[tauri::command]
 pub async fn remote_import(
@@ -870,6 +899,15 @@ pub async fn remote_import(
 ) -> Result<ImportResult, String> {
     crate::offload_operation(operation_id, move || {
         let root = crate::config_dir();
+        let connection = validate(connection)?;
+        if matches!(connection.kind, RemoteKind::Ssh | RemoteKind::Winrm) {
+            let password = password_for(&root, &connection, password)?;
+            let result = crate::remote_files::import(&connection, password, &root, &app)?;
+            return Ok(ImportResult { path: result.paths[0].clone(), count: result.paths.len(),
+                total: None, total_relation: "eq".into(), limited: false, bytes: result.bytes,
+                metadata_field: String::new(), warning: result.warning, order: "arquivos".into(),
+                paths: Some(result.paths), format: Some("auto".into()) });
+        }
         import_impl(
             &client_for(&root, connection, password)?,
             &root,
@@ -1032,6 +1070,7 @@ mod tests {
             max_records: 100_000,
             query: None,
             kibana_version: "auto".into(),
+            paths: vec![], key_path: String::new(), max_bytes: default_file_limit(),
         }
     }
     fn client(url: &str) -> RemoteClient {

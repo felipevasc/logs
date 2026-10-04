@@ -8,10 +8,12 @@ const deferred = () => { let resolve; const promise = new Promise(done => resolv
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
 function fixture() {
   class Node {
-    constructor(kind) { this.kind = kind; this.children = []; this.nodes = new Map(); this.isConnected = true; this.value = ''; }
+    constructor(kind) { this.kind = kind; this.children = []; this.nodes = new Map(); this.isConnected = true; this.value = ''; this.dataset = {}; }
     querySelector(selector) { if (!this.nodes.has(selector)) this.nodes.set(selector, new Node(selector)); return this.nodes.get(selector); }
     querySelectorAll() { return []; }
     prepend(node) { this.children.unshift(node); }
+    append(...nodes) { this.children.push(...nodes); }
+    insertBefore(node) { this.children.unshift(node); }
     addEventListener(name, fn) { this['on' + name] = fn; }
   }
   const a = { caseId: 'a', revision: 1 }, b = { caseId: 'b', revision: 1 };
@@ -21,7 +23,7 @@ function fixture() {
     assertOwner: (owner, { revisions = true } = {}) => { if (owner.caseId !== active.caseId || revisions && owner.revision !== active.revision) throw Error('STALE_CASE'); },
     prepare: async owner => { helper.assertOwner(owner); return owner; },
   };
-  const context = vm.createContext({ window: { AnalysisContexts: helper }, document: { addEventListener(name, fn) { listeners.set(name, fn); } },
+  const context = vm.createContext({ window: { AnalysisContexts: helper }, document: { createElement: kind => new Node(kind), addEventListener(name, fn) { listeners.set(name, fn); } },
     api: (cmd, args, options) => {
       if (cmd === 'detection_rules') { const pending = deferred(); requests.push({ ...pending, options }); return pending.promise; }
       helper.assertOwner(options.analysisOwner); mutations.push({ cmd, args: structuredClone(args), owner: options.analysisOwner }); active.revision++;

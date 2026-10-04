@@ -4,6 +4,7 @@ Aplicacao desktop para investigar logs, feita com Tauri 2: o backend em Rust ind
 
 ## Recursos
 
+- Casos independentes, com fontes, filtros, análises e preferências próprias. **Achados** reúne os itens preservados dentro do Caso. Índices opcionais de campos pelo menu contextual, marcador discreto e carregamento paralelo de múltiplos arquivos. [Casos e índices](docs/casos-indices-conexoes.md).
 - Investigação na **0.13**: fila explicada por entidade, análise comportamental da população completa, histórico opt-in, caças guiadas, IOCs offline, políticas de negócio, grafo temporal e síntese com citações. Prioridade, cobertura e níveis de evidência permanecem independentes. [Guia e limites](docs/investigacao-v013.md) · [Notas da versão](docs/releases/v0.13.0.md).
 
 - Carregamento de arquivos de log (inclusive varios arquivos em conjunto), pacotes `.zip`/`.tar`/`.tgz`, arquivos `.evtx` em Windows e Linux e canais do Windows Event Log.
@@ -15,7 +16,7 @@ Aplicacao desktop para investigar logs, feita com Tauri 2: o backend em Rust ind
 - Gerenciador de recursos com histórico de CPU, RAM, I/O, processos e ações do aplicativo, comparados à capacidade do sistema; cotas e estimativas identificadas separadamente. [Medidas e limites](docs/resource-manager.md).
 - Tokens JWT, Base64 com JSON e credenciais `Basic` viram subcampos filtráveis (`token.payload.sub`, `authorization.payload.exp`…); campos de data como `iat` e `exp` mostram o valor original com a data ao lado, e filtros aceitam data/hora digitada em qualquer campo de data. Valores aparecem como foram gravados; ocultar senhas e tokens é uma opção da exportação. Inspetor local de JSON, JWT e Base64 com preservação de números sem arredondamento. A decodificação de um token não verifica sua assinatura.
 - Tamanho da interface automático para janelas pequenas e telas com escala do sistema, ajustável em Configurações → Interface ou com Ctrl + / Ctrl − / Ctrl 0.
-- Três áreas no rodapé do menu, cada uma com sua cor: Análise (amarelo), Caso (roxo) e Estrutura (laranja: arquivos, conexões e abertura de logs). Menus e abas mostram quando estão carregando; o status lista o que está em andamento e permite cancelar cada item.
+- Três áreas no rodapé do menu, cada uma com sua cor: Análise (amarelo), Achados (roxo) e Estrutura (laranja: arquivos, conexões e abertura de logs). Menus e abas mostram quando estão carregando; o status lista o que está em andamento e permite cancelar cada item.
 - Indicadores, hipóteses e cadeia de custódia (SHA-256) no Caso, incluídos nos relatórios PDF e Markdown.
 - Enriquecimento de codigos com nome e descricao configuraveis.
 - Filtros por campos, busca textual, faixas numericas e arvore de facetas.
@@ -30,6 +31,7 @@ Aplicacao desktop para investigar logs, feita com Tauri 2: o backend em Rust ind
 - Resumos e cruzamentos de dados com atalhos, busca, ordenação e paginação.
 - Arrays JSON, envelopes (CloudTrail, `hits.hits`, `value`…), Zeek, Suricata EVE, auditd, Okta, GCP e Kubernetes audit, campos aninhados e normalização de aliases e timestamps; rankings de contagem exatos com armazenamento temporário em disco para alta cardinalidade.
 - Conexões Elasticsearch e Kibana Console com autenticação Basic, consulta por período/Query DSL e importação paginada para uma cópia local.
+- Coleta de arquivos/pastas Linux por SSH e Windows por WinRM HTTPS, com sugestões de logs, múltiplos caminhos e limite de tamanho. [Configuração e requisitos](docs/casos-indices-conexoes.md).
 - Catálogo editável com 378 sinais textuais de ameaças, incluindo tentativas, bloqueios, saídas de comandos e conteúdo exposto (arquivos de sistema, configurações, dumps e credenciais). [Cobertura, interpretação e falsos positivos](docs/regras-ameacas.md).
 - Jornadas por identificador exato entre fontes, com ordem temporal, duração observada e contagens; investigação por usuário/IP delimitada por período.
 - Atualização pelo GitHub: ao abrir, o aplicativo verifica se há versão nova e pergunta antes de baixar e instalar. [Como funciona e como publicar](docs/atualizacoes.md).
@@ -59,7 +61,7 @@ A versão publicada, com os instaladores de **Windows e Linux**, fica em [GitHub
 
 A partir da 0.6.0 o LogInsight se atualiza: ao abrir, consulta a última Release e, se houver versão nova, pergunta antes de baixar e instalar. Prefira o `.exe` no Windows e o `.AppImage` no Linux, que atualizam sem senha de administrador; `.msi`, `.deb` e `.rpm` também atualizam, mas pedem a senha. Quem usa a 0.5.x instala a 0.6.0 manualmente uma vez. Detalhes em [Atualizações](docs/atualizacoes.md).
 
-As verificações de PR usam [validação essencial e por área alterada](docs/ci-validation.md): testes rápidos sempre, navegador essencial mais subsistemas afetados e suíte nativa completa quando Rust/build/instalador mudam. O build portátil Windows é opcional; o disparo manual permite regressão completa.
+As verificações de PR usam [validação essencial e por área alterada](docs/ci-validation.md): contratos relevantes sempre, navegador essencial mais subsistemas afetados e fluxos nativos de integridade quando Rust/build/instalador mudam. Testes especializados restantes são executados sob demanda. O build portátil Windows é opcional.
 
 O workflow [Build Windows and Linux](https://github.com/felipevasc/logs/actions/workflows/build.yml) executa os testes do backend e gera instaladores x64 a cada push de codigo para `main`. Tambem pode ser iniciado pela opcao **Run workflow** no GitHub Actions. Os downloads ficam nos artefatos da execucao por 30 dias:
 
