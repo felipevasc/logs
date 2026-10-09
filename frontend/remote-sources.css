@@ -33,6 +33,10 @@
 .remote-check { display:flex; gap:8px; align-items:center; font-size:12px; margin-top:16px; }
 .remote-check input { width:15px; height:15px; accent-color:var(--accent); }
 #rs-secret-note { margin:5px 0 14px 23px; }
+.remote-tls { display:flex; flex-direction:column; gap:10px; }
+.remote-grid .remote-tls .remote-check { flex-direction:row; margin-top:0; font-weight:400; }
+.remote-tls .remote-actions { flex-wrap:nowrap; margin-top:0; padding-top:0; border-top:0; }
+.remote-tls .remote-actions input { flex:1; width:auto; }
 .remote-options { border-top:1px solid var(--border); padding:12px 0; }
 .remote-options summary { font-size:12px; cursor:pointer; font-weight:550; }
 .remote-options[open] summary { margin-bottom:14px; }

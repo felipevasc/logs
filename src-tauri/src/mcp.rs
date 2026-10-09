@@ -351,11 +351,11 @@ pub fn tool_catalog() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "remote_list",
-            "Lista conexões Elasticsearch e Kibana salvas",
+            "Lista conexões Elasticsearch, Kibana e Wazuh salvas",
         ),
         (
             "remote_test",
-            "Testa acesso e autenticação em conexão Elasticsearch ou Kibana",
+            "Testa acesso e autenticação em conexão Elasticsearch, Kibana ou Wazuh",
         ),
         (
             "remote_import",
@@ -1045,11 +1045,15 @@ pub struct RemoteConnectionParams {
     #[serde(default)]
     pub id: String,
     pub name: String,
-    /// Service kind: "elasticsearch", "kibana", "ssh" or "winrm".
+    /// Service kind: "elasticsearch", "kibana", "ssh", "winrm", "wazuh" (Wazuh indexer:
+    /// alerts and events) or "wazuhapi" (Wazuh server API: agent inventory).
     pub kind: String,
-    /// Base URL (e.g. "https://elastic.example:9200").
+    /// Base URL (e.g. "https://elastic.example:9200", Wazuh indexer "https://wazuh:9200",
+    /// Wazuh server API "https://wazuh:55000").
     pub url: String,
-    /// Index name or wildcard pattern (e.g. "logs-*").
+    /// Index name or wildcard pattern (e.g. "logs-*"; Wazuh 4.x alerts "wazuh-alerts-*" with
+    /// time field "timestamp", Wazuh 5.x "wazuh-findings-v5*" with "@timestamp"). For
+    /// "wazuhapi" the dataset: "agents".
     pub index: String,
     /// Timestamp field name (default "@timestamp").
     #[serde(default = "default_remote_time_field")]
@@ -1074,6 +1078,15 @@ pub struct RemoteConnectionParams {
     /// Maximum collected bytes (default 512 MiB, maximum 4 GiB).
     #[serde(default = "default_remote_max_bytes")]
     pub max_bytes: u64,
+    /// "basic" (username and password) or, for Wazuh kinds, "token" (Bearer token as password).
+    #[serde(default)]
+    pub auth: String,
+    /// Local PEM/DER CA certificate trusted in addition to the system roots (e.g. Wazuh root-ca.pem).
+    #[serde(default)]
+    pub ca_path: String,
+    /// Disables TLS certificate validation; only for trusted networks.
+    #[serde(default)]
+    pub insecure_tls: bool,
 }
 fn default_remote_max_bytes() -> u64 { 512 * 1024 * 1024 }
 
@@ -1095,6 +1108,8 @@ impl From<RemoteConnectionParams> for crate::remote::RemoteConfig {
             "ssh" => crate::remote::RemoteKind::Ssh,
             "winrm" => crate::remote::RemoteKind::Winrm,
             "kibana" => crate::remote::RemoteKind::Kibana,
+            "wazuh" => crate::remote::RemoteKind::Wazuh,
+            "wazuhapi" => crate::remote::RemoteKind::WazuhApi,
             _ => crate::remote::RemoteKind::Elasticsearch,
         };
         crate::remote::RemoteConfig {
@@ -1102,6 +1117,7 @@ impl From<RemoteConnectionParams> for crate::remote::RemoteConfig {
             name: p.name,
             kind,
             paths: p.paths, key_path: p.key_path, max_bytes: p.max_bytes,
+            auth: p.auth, ca_path: p.ca_path, insecure_tls: p.insecure_tls,
             url: p.url,
             index: p.index,
             time_field: if p.time_field.is_empty() {
@@ -2054,7 +2070,7 @@ impl LogInsightMcp {
     // ------------------------------------------------------------ conexões remotas
 
     #[tool(
-        description = "List saved Elasticsearch and Kibana connections configured in the application.",
+        description = "List saved Elasticsearch, Kibana, Wazuh, SSH and WinRM connections configured in the application.",
         annotations(read_only_hint = true)
     )]
     async fn remote_list(&self) -> Result<CallToolResult, McpError> {
@@ -2062,7 +2078,7 @@ impl LogInsightMcp {
     }
 
     #[tool(
-        description = "Test connectivity and credentials for an Elasticsearch or Kibana endpoint.",
+        description = "Test connectivity and credentials for an Elasticsearch, Kibana, Wazuh indexer or Wazuh server API endpoint.",
         annotations(read_only_hint = true)
     )]
     async fn remote_test(
@@ -2073,7 +2089,7 @@ impl LogInsightMcp {
     }
 
     #[tool(
-        description = "Query and import records from an Elasticsearch or Kibana endpoint into a local JSONL snapshot file on disk.",
+        description = "Query and import records from an Elasticsearch, Kibana, Wazuh indexer (alerts/events) or Wazuh server API (agents) endpoint into a local JSONL snapshot file on disk.",
         annotations(read_only_hint = false)
     )]
     async fn remote_import(
@@ -2218,6 +2234,7 @@ mod tests {
             query: Some(serde_json::json!({"match_all": {}})),
             kibana_version: "auto".to_string(),
             paths: vec![], key_path: String::new(), max_bytes: default_remote_max_bytes(),
+            auth: String::new(), ca_path: String::new(), insecure_tls: false,
         };
         let config: crate::remote::RemoteConfig = params.into();
         assert_eq!(config.id, "conn-1");
@@ -2239,10 +2256,30 @@ mod tests {
             query: None,
             kibana_version: "v9".to_string(),
             paths: vec![], key_path: String::new(), max_bytes: default_remote_max_bytes(),
+            auth: String::new(), ca_path: String::new(), insecure_tls: false,
         };
         let kibana_config: crate::remote::RemoteConfig = kibana_params.into();
         assert_eq!(kibana_config.time_field, "@timestamp");
         assert_eq!(kibana_config.max_records, 1);
         assert_eq!(kibana_config.kibana_version, "v9");
+
+        let wazuh_params = RemoteConnectionParams {
+            id: String::new(),
+            name: "Wazuh".to_string(),
+            kind: "WazuhAPI".to_string(),
+            url: "https://wazuh.local:55000".to_string(),
+            index: "agents".to_string(),
+            time_field: String::new(),
+            username: String::new(),
+            max_records: 10,
+            query: None,
+            kibana_version: String::new(),
+            paths: vec![], key_path: String::new(), max_bytes: default_remote_max_bytes(),
+            auth: "token".to_string(), ca_path: "C:/certs/root-ca.pem".to_string(), insecure_tls: false,
+        };
+        let wazuh_config: crate::remote::RemoteConfig = wazuh_params.into();
+        assert!(wazuh_config.kind == crate::remote::RemoteKind::WazuhApi);
+        assert_eq!(wazuh_config.auth, "token");
+        assert_eq!(wazuh_config.ca_path, "C:/certs/root-ca.pem");
     }
 }

@@ -2013,6 +2013,43 @@ fn zeek_auditd_and_suricata_are_readable() {
 }
 
 #[test]
+fn wazuh_alerts_and_server_inventories_are_readable() {
+    use crate::entities::{action_outcome, value, Role};
+    let alerts = concat!(
+        r#"{"timestamp":"2026-10-08T12:00:00.000+0000","rule":{"level":5,"description":"sshd: Attempt to login using a non-existent user","id":"5710","groups":["syslog","sshd","authentication_failed","invalid_login"]},"agent":{"id":"001","name":"web01","ip":"10.0.0.5"},"manager":{"name":"wazuh-server"},"id":"1696766400.12345","full_log":"Oct  8 12:00:00 web01 sshd[123]: Invalid user admin from 203.0.113.7 port 5555","decoder":{"parent":"sshd","name":"sshd"},"data":{"srcip":"203.0.113.7","srcport":"5555","srcuser":"admin"},"location":"/var/log/auth.log","_loginsight_remote":{"_index":"wazuh-alerts-4.x-2026.10.08","connectionName":"Wazuh"}}"#, "\n",
+        r#"{"timestamp":"2026-10-08T12:01:00.000+0000","rule":{"level":12,"description":"Logon failure - Unknown user or bad password","id":"60122","groups":["windows","authentication_failed"]},"agent":{"id":"002","name":"dc01"},"id":"1696766460.1","data":{"win":{"system":{"eventID":"4625","computer":"dc01.corp.local"},"eventdata":{"targetUserName":"administrator","ipAddress":"198.51.100.9"}}}}"#, "\n",
+    );
+    let fixture = Fixture::new(alerts);
+    let events = events_of(&fixture.index("auto"));
+    assert_eq!(events.len(), 2);
+    // Wazuh 4.x writes offsets without a colon; the alert time wins over the embedded syslog clock.
+    assert_eq!(events[0].timestamp, Some(1_791_460_800_000));
+    assert_eq!(sources::parse_timestamp("2026-10-08T09:00:00.000-0300"), Some(1_791_460_800_000));
+    assert_eq!(sources::parse_timestamp("2026-10-08 12:00:00+0000"), Some(1_791_460_800_000));
+    assert_eq!((events[0].code.as_str(), events[0].level.as_str(), events[0].source.as_str()), ("5710", "Aviso", "web01"));
+    assert_eq!(events[0].message, "sshd: Attempt to login using a non-existent user");
+    assert_eq!(events[0].fields["id"], "1696766400.12345");
+    assert!(events[0].fields["full_log"].as_str().unwrap().contains("Invalid user admin"));
+    assert_eq!(value(&events[0], Role::SrcIp).as_deref(), Some("203.0.113.7"));
+    assert_eq!(value(&events[0], Role::User).as_deref(), Some("admin"));
+    assert_eq!(value(&events[0], Role::Host).as_deref(), Some("web01"));
+    assert_eq!(action_outcome(&events[0]), (Some("logon"), Some("failure")));
+    assert_eq!(events[1].level, "Crítico");
+    assert_eq!(value(&events[1], Role::User).as_deref(), Some("administrator"));
+    assert_eq!(value(&events[1], Role::SrcIp).as_deref(), Some("198.51.100.9"));
+    assert_eq!(value(&events[1], Role::Host).as_deref(), Some("dc01.corp.local"));
+
+    let inventory = concat!(
+        r#"{"id":"001","name":"web01","ip":"10.0.0.5","status":"active","os":{"name":"Ubuntu","version":"24.04"},"lastKeepAlive":"2026-10-08T12:00:00+00:00","dateAdd":"2026-01-01T00:00:00+00:00","_loginsight_remote":{"wazuhDataset":"agents","connectionName":"Wazuh"}}"#, "\n",
+    );
+    let fixture = Fixture::new(inventory);
+    let events = events_of(&fixture.index("auto"));
+    assert_eq!(events[0].message, "Agente web01 (active) · 10.0.0.5 · Ubuntu");
+    assert_eq!((events[0].code.as_str(), events[0].source.as_str()), ("001", "wazuh-agents"));
+    assert_eq!(events[0].timestamp, Some(1_791_460_800_000));
+}
+
+#[test]
 fn zip_and_tar_members_become_sources() {
     let dir = std::env::temp_dir().join(format!("loginsight-archive-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

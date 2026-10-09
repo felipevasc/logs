@@ -42,6 +42,14 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_millis());
     }
+    // ISO 8601 offsets without a colon, as in Wazuh and Suricata (…T12:00:00.000+0000).
+    if s.len() > 19 && matches!(s.as_bytes()[s.len() - 5], b'+' | b'-') {
+        for fmt in ["%Y-%m-%dT%H:%M:%S%.f%z", "%Y-%m-%d %H:%M:%S%.f%z"] {
+            if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
+                return Some(dt.timestamp_millis());
+            }
+        }
+    }
     // Spreadsheets and exports often drop the seconds or use slashes.
     const FORMATS: &[&str] = &[
         "%Y-%m-%dT%H:%M:%S%.f",
@@ -302,7 +310,9 @@ fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, dep
                 .unwrap_or_else(|| v.to_string()),
         );
     }
-    if let Some(v) = take_key(&mut map, CODE_KEYS) {
+    // A Wazuh alert's top-level id only identifies the alert; its rule is the code.
+    let code_keys: &[&str] = if wazuh_alert(&map) { &["rule.id"] } else { CODE_KEYS };
+    if let Some(v) = take_key(&mut map, code_keys) {
         ev.code = match &v {
             Value::String(s) => s.clone(),
             other => other.to_string(),
@@ -391,6 +401,12 @@ fn field_text(ev: &Event, key: &str) -> Option<String> {
 /// Readable message, code and level for well-known JSON families whose
 /// records carry no message: CloudTrail, Suricata EVE, Zeek, Okta, GCP and
 /// Kubernetes audit. Original fields are kept.
+fn wazuh_alert(fields: &Map<String, Value>) -> bool {
+    fields.contains_key("rule.level")
+        && fields.contains_key("rule.id")
+        && ["agent.id", "agent.name", "decoder.name", "manager.name"].iter().any(|key| fields.contains_key(*key))
+}
+
 fn describe_known_json(ev: &mut Event) -> bool {
     let synthesized = ev.message.is_empty();
     // AWS CloudTrail: eventID is a UUID; the operation is eventName.
@@ -446,6 +462,49 @@ fn describe_known_json(ev: &mut Event) -> bool {
             ev.code = kind;
         }
         return true;
+    }
+    // Wazuh 4.x alerts: rule.level 0-15 is the severity and rule.id the code
+    // (chosen at extraction); the alert id and the original full_log stay fields.
+    if let (Some(level), Some(rule)) = (field_text(ev, "rule.level"), field_text(ev, "rule.id")) {
+        if wazuh_alert(&ev.fields) {
+            ev.code = rule;
+            // The dashboard bands: low 0-6, medium 7-11, high 12-14, critical 15.
+            if let Ok(level) = level.parse::<u8>() {
+                ev.level = match level {
+                    0..=3 => "Informação",
+                    4..=6 => "Aviso",
+                    7..=11 => "Erro",
+                    _ => "Crítico",
+                }
+                .into();
+            }
+            if ev.source.is_empty() {
+                ev.source = field_text(ev, "agent.name").unwrap_or_else(|| "wazuh".into());
+            }
+            if synthesized {
+                if let Some(description) = field_text(ev, "rule.description") {
+                    ev.message = description;
+                }
+            }
+            return true;
+        }
+    }
+    // Wazuh server API inventories imported by a Wazuh connection.
+    match field_text(ev, "_loginsight_remote.wazuhDataset").as_deref() {
+        Some("agents") => {
+            let name = field_text(ev, "name").unwrap_or_default();
+            let status = field_text(ev, "status").unwrap_or_default();
+            ev.timestamp = ev.timestamp.or_else(|| ["lastKeepAlive", "dateAdd"].iter().find_map(|key| ev.fields.get(*key).and_then(value_to_ms)));
+            if ev.code.is_empty() { ev.code = status.clone(); }
+            ev.source = "wazuh-agents".into();
+            if synthesized {
+                let os = field_text(ev, "os.name").map(|os| format!(" · {os}")).unwrap_or_default();
+                let ip = field_text(ev, "ip").map(|ip| format!(" · {ip}")).unwrap_or_default();
+                ev.message = format!("Agente {name} ({status}){ip}{os}");
+            }
+            return true;
+        }
+        _ => {}
     }
     // Zeek (JSON or TSV converted to JSON)
     if let (Some(orig), Some(resp)) = (field_text(ev, "id.orig_h"), field_text(ev, "id.resp_h")) {

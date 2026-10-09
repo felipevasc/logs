@@ -98,6 +98,7 @@ mod reference_commands;
 mod reference_store;
 mod reference_lookup;
 mod remote;
+mod remote_wazuh;
 mod resources;
 mod resource_settings;
 mod resource_actions;

@@ -31,6 +31,7 @@ Aplicacao desktop para investigar logs, feita com Tauri 2: o backend em Rust ind
 - Resumos e cruzamentos de dados com atalhos, busca, ordenação e paginação.
 - Arrays JSON, envelopes (CloudTrail, `hits.hits`, `value`…), Zeek, Suricata EVE, auditd, Okta, GCP e Kubernetes audit, campos aninhados e normalização de aliases e timestamps; rankings de contagem exatos com armazenamento temporário em disco para alta cardinalidade.
 - Conexões Elasticsearch e Kibana Console com autenticação Basic, consulta por período/Query DSL e importação paginada para uma cópia local.
+- Conexões Wazuh: alertas e eventos do Wazuh indexer (4.x e 5.x, com detecção de versão e conjuntos prontos) e inventário de agentes pela API do servidor (JWT renovado automaticamente), com usuário e senha ou token e certificado CA próprio. [Configuração e versões](docs/casos-indices-conexoes.md#wazuh).
 - Coleta de arquivos/pastas Linux por SSH e Windows por WinRM HTTPS, com sugestões de logs, múltiplos caminhos e limite de tamanho. [Configuração e requisitos](docs/casos-indices-conexoes.md).
 - Catálogo editável com 378 sinais textuais de ameaças, incluindo tentativas, bloqueios, saídas de comandos e conteúdo exposto (arquivos de sistema, configurações, dumps e credenciais). [Cobertura, interpretação e falsos positivos](docs/regras-ameacas.md).
 - Jornadas por identificador exato entre fontes, com ordem temporal, duração observada e contagens; investigação por usuário/IP delimitada por período.

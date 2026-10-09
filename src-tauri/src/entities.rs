@@ -121,6 +121,11 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("acct", Role::User, 5),
     ("principal", Role::User, 6),
     ("email", Role::User, 8),
+    ("data.win.eventdata.targetusername", Role::User, 1),
+    ("data.srcuser", Role::User, 2),
+    ("data.dstuser", Role::User, 3),
+    ("data.office365.userid", Role::User, 2),
+    ("data.win.eventdata.subjectusername", Role::User, 7),
     ("source.ip", Role::SrcIp, 0),
     ("src_ip", Role::SrcIp, 1),
     ("srcip", Role::SrcIp, 1),
@@ -144,6 +149,10 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("rhost", Role::SrcIp, 3),
     ("addr", Role::SrcIp, 4),
     ("ip", Role::SrcIp, 5),
+    ("data.srcip", Role::SrcIp, 1),
+    ("data.office365.clientip", Role::SrcIp, 1),
+    ("data.aws.sourceipaddress", Role::SrcIp, 1),
+    ("data.win.eventdata.ipaddress", Role::SrcIp, 2),
     ("destination.ip", Role::DstIp, 0),
     ("dst_ip", Role::DstIp, 1),
     ("dstip", Role::DstIp, 1),
@@ -157,6 +166,8 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("id.resp_h", Role::DstIp, 1),
     ("s-ip", Role::DstIp, 2),
     ("server_ip", Role::DstIp, 2),
+    ("data.dstip", Role::DstIp, 1),
+    ("data.win.eventdata.destinationip", Role::DstIp, 1),
     ("host.name", Role::Host, 0),
     ("hostname", Role::Host, 1),
     ("host", Role::Host, 2),
@@ -169,6 +180,9 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("agent.hostname", Role::Host, 3),
     ("_hostname", Role::Host, 2),
     ("machine", Role::Host, 4),
+    ("data.win.system.computer", Role::Host, 1),
+    ("predecoder.hostname", Role::Host, 2),
+    ("agent.name", Role::Host, 3),
     ("process.executable", Role::Process, 0),
     ("process.name", Role::Process, 1),
     ("image", Role::Process, 1),
@@ -181,11 +195,15 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("program", Role::Process, 4),
     ("fname", Role::Process, 5),
     ("sproc", Role::Process, 4),
+    ("data.win.eventdata.image", Role::Process, 1),
+    ("data.audit.exe", Role::Process, 2),
+    ("predecoder.program_name", Role::Process, 4),
     ("process.parent.executable", Role::ParentProcess, 0),
     ("process.parent.name", Role::ParentProcess, 1),
     ("parentimage", Role::ParentProcess, 1),
     ("parentprocessname", Role::ParentProcess, 1),
     ("parent_process", Role::ParentProcess, 2),
+    ("data.win.eventdata.parentimage", Role::ParentProcess, 1),
     ("process.command_line", Role::CommandLine, 0),
     ("commandline", Role::CommandLine, 1),
     ("command_line", Role::CommandLine, 1),
@@ -194,6 +212,7 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("scriptblocktext", Role::CommandLine, 2),
     ("cmd", Role::CommandLine, 3),
     ("command", Role::CommandLine, 4),
+    ("data.win.eventdata.commandline", Role::CommandLine, 1),
     ("url.full", Role::Url, 0),
     ("url.original", Role::Url, 0),
     ("url", Role::Url, 1),
@@ -203,6 +222,7 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("uri", Role::Url, 2),
     ("http.url", Role::Url, 1),
     ("url.path", Role::Url, 2),
+    ("data.url", Role::Url, 2),
     ("request", Role::Url, 3),
     ("path", Role::Url, 4),
     ("dns.question.name", Role::Domain, 0),
@@ -214,6 +234,7 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("tls.sni", Role::Domain, 2),
     ("sni", Role::Domain, 2),
     ("dhost", Role::Domain, 4),
+    ("data.win.eventdata.queryname", Role::Domain, 1),
     ("file.hash.sha256", Role::Hash, 0),
     ("sha256", Role::Hash, 1),
     ("hashes", Role::Hash, 1),
@@ -221,6 +242,8 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("sha1", Role::Hash, 3),
     ("md5", Role::Hash, 4),
     ("fileHash", Role::Hash, 2),
+    ("syscheck.sha256_after", Role::Hash, 1),
+    ("data.win.eventdata.hashes", Role::Hash, 1),
     ("destination.port", Role::DstPort, 0),
     ("dst_port", Role::DstPort, 1),
     ("dstport", Role::DstPort, 1),
@@ -230,6 +253,8 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("destinationport", Role::DstPort, 1),
     ("id.resp_p", Role::DstPort, 1),
     ("s-port", Role::DstPort, 2),
+    ("data.dstport", Role::DstPort, 1),
+    ("data.win.eventdata.destinationport", Role::DstPort, 1),
     ("user_agent.original", Role::UserAgent, 0),
     ("user_agent", Role::UserAgent, 1),
     ("useragent", Role::UserAgent, 1),
@@ -246,6 +271,8 @@ const ALIASES: &[(&str, Role, u8)] = &[
     ("file.name", Role::File, 2),
     ("filename", Role::File, 2),
     ("filepath", Role::File, 2),
+    ("syscheck.path", Role::File, 1),
+    ("data.win.eventdata.targetfilename", Role::File, 1),
     ("http.response.status_code", Role::Status, 0),
     ("status_code", Role::Status, 1),
     ("statuscode", Role::Status, 1),
@@ -878,6 +905,17 @@ pub fn action_outcome(ev: &Event) -> (Option<&'static str>, Option<&'static str>
             else if method.contains("SetIamPolicy") { "privilege_grant" }
             else if method.contains("DeleteSink") { "log_clear" } else { "api_request" };
         return (Some(action), outcome);
+    }
+
+    // Wazuh alerts classify authentication in rule.groups.
+    if let Some(Value::Array(groups)) = ev.fields.get("rule.groups").filter(|_| ev.fields.contains_key("rule.level")) {
+        let has = |names: &[&str]| groups.iter().any(|group| group.as_str().is_some_and(|group| names.contains(&group)));
+        if has(&["authentication_failed", "authentication_failures", "invalid_login", "win_authentication_failed"]) {
+            return (Some("logon"), Some("failure"));
+        }
+        if has(&["authentication_success"]) {
+            return (Some("logon"), Some("success"));
+        }
     }
 
     // Linux authentication and administration.

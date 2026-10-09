@@ -152,6 +152,65 @@ try {
   assert.equal(await page.locator("#rs-password").isVisible(), true);
   assert.equal(await page.locator("#rs-query-options").isVisible(), false);
   result.fileCollectionControls = "SSH/Linux and WinRM/EVTX paths are Case-owned";
+
+  phase = "Wazuh indexer and server API";
+  const lastRequest = command => page.evaluate(name => window.__remoteMock.requests.filter(item => item.command === name).at(-1), command);
+  await page.locator("#rs-new").click();
+  await page.locator("#rs-kind").selectOption("wazuh");
+  assert.equal(await page.locator("#rs-wazuh-data-wrap").isVisible(), true);
+  assert.equal(await page.locator("#rs-tls").isVisible(), true);
+  // An index authored in this Case is never replaced by switching services.
+  assert.equal(await page.locator("#rs-index").inputValue(), "logs-api-*");
+  assert.equal(await page.locator("#rs-wazuh-data").inputValue(), "");
+  await page.locator("#rs-wazuh-data").selectOption("wazuh-findings-v5*");
+  assert.equal(await page.locator("#rs-time-field").inputValue(), "@timestamp");
+  await page.locator("#rs-wazuh-data").selectOption("wazuh-alerts-*");
+  assert.equal(await page.locator("#rs-index").inputValue(), "wazuh-alerts-*");
+  assert.equal(await page.locator("#rs-time-field").inputValue(), "timestamp");
+  await page.locator("#rs-name").fill("Wazuh produção");
+  await page.locator("#rs-url").fill("https://wazuh-indexer.example.test:9200");
+  assert.match(await page.locator("#rs-url-hint").textContent(), /9200/);
+  await page.locator("#rs-username").fill("leitor");
+  await page.locator("#rs-password").fill("fixture-secret-only");
+  await page.locator("#rs-ca").fill("C:\\certs\\root-ca.pem");
+  await page.locator("#rs-test").click(); await idle();
+  await page.locator("#rs-url").evaluate(node => node.scrollIntoView({ block: "start" }));
+  await page.screenshot({ path: resolve(output, "remote-wazuh-1024.png") });
+  let request = await lastRequest("remote_test");
+  assert.deepEqual([request.connection.kind, request.connection.index, request.connection.timeField, request.connection.auth, request.connection.caPath, request.connection.insecureTls, request.connection.username],
+    ["wazuh", "wazuh-alerts-*", "timestamp", "basic", "C:\\certs\\root-ca.pem", false, "leitor"]);
+  await page.locator("#rs-auth").selectOption("token");
+  assert.equal(await page.locator("#rs-username").isVisible(), false);
+  assert.equal(await page.locator("#rs-password-label").textContent(), "Token");
+  await page.locator("#rs-insecure").check();
+  await page.locator("#rs-test").click(); await idle();
+  request = await lastRequest("remote_test");
+  assert.deepEqual([request.connection.auth, request.connection.username, request.connection.insecureTls, request.passwordProvided], ["token", "", true, true]);
+
+  // The server API offers fixed data sets, without index, Query DSL or period.
+  await page.locator("#rs-kind").selectOption("wazuhapi");
+  for (const id of ["#rs-index", "#rs-time-field", "#rs-from", "#rs-to", "#rs-query-advanced"]) assert.equal(await page.locator(id).isVisible(), false, id);
+  assert.equal(await page.locator("#rs-wazuh-data").inputValue(), "agents");
+  assert.match(await page.locator("#rs-url-hint").textContent(), /55000/);
+  await page.locator("#rs-auth").selectOption("basic");
+  await page.locator("#rs-username").fill("");
+  await page.locator("#rs-test").click();
+  assert.match(await page.locator("#rs-status-text").textContent(), /usuário da API/);
+  await page.locator("#rs-username").fill("wazuh-wui");
+  await page.locator("#rs-url").fill("https://wazuh-server.example.test:55000");
+  await page.evaluate(() => { window.__remoteMock.nextError = "Fixture: importação interrompida."; });
+  await page.locator("#rs-import").click(); await idle();
+  request = await lastRequest("remote_import");
+  assert.deepEqual([request.connection.kind, request.connection.index, request.connection.timeField, request.connection.query, request.from, request.to],
+    ["wazuhapi", "agents", "", null, undefined, undefined]);
+  await page.locator("#rs-save").click(); await idle();
+  request = await lastRequest("remote_save");
+  assert.deepEqual([request.connection.index, request.connection.timeField, request.connection.auth], ["agents", "", "basic"]);
+  assert.ok((await page.locator("#rs-list .remote-connection-kind").allTextContents()).includes("Wazuh API"));
+  await page.locator("#rs-kind").selectOption("elasticsearch");
+  assert.equal(await page.locator("#rs-index").inputValue(), "logs-*");
+  assert.equal(await page.locator("#rs-auth-wrap").isVisible(), false);
+  result.wazuh = "Indexer presets, token/CA options and server API data sets";
   assert.deepEqual(errors, []); result.pageErrors = errors;
   writeFileSync(resolve(output, "remote-validation.json"), JSON.stringify(result, null, 2));
   console.log(JSON.stringify(result, null, 2));
