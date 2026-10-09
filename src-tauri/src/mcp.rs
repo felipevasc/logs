@@ -1046,10 +1046,11 @@ pub struct RemoteConnectionParams {
     pub id: String,
     pub name: String,
     /// Service kind: "elasticsearch", "kibana", "ssh", "winrm", "wazuh" (Wazuh indexer:
-    /// alerts and events) or "wazuhapi" (Wazuh server API: agent inventory).
+    /// alerts and events), "wazuhweb" (the same data through the Wazuh dashboard web address)
+    /// or "wazuhapi" (Wazuh server API: agent inventory).
     pub kind: String,
     /// Base URL (e.g. "https://elastic.example:9200", Wazuh indexer "https://wazuh:9200",
-    /// Wazuh server API "https://wazuh:55000").
+    /// Wazuh dashboard "https://wazuh.example", Wazuh server API "https://wazuh:55000").
     pub url: String,
     /// Index name or wildcard pattern (e.g. "logs-*"; Wazuh 4.x alerts "wazuh-alerts-*" with
     /// time field "timestamp", Wazuh 5.x "wazuh-findings-v5*" with "@timestamp"). For
@@ -1110,6 +1111,7 @@ impl From<RemoteConnectionParams> for crate::remote::RemoteConfig {
             "kibana" => crate::remote::RemoteKind::Kibana,
             "wazuh" => crate::remote::RemoteKind::Wazuh,
             "wazuhapi" => crate::remote::RemoteKind::WazuhApi,
+            "wazuhweb" => crate::remote::RemoteKind::WazuhWeb,
             _ => crate::remote::RemoteKind::Elasticsearch,
         };
         crate::remote::RemoteConfig {

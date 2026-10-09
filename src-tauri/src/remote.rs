@@ -36,6 +36,8 @@ pub enum RemoteKind {
     Wazuh,
     /// Wazuh server API (port 55000), authenticated with a JWT.
     WazuhApi,
+    /// Wazuh dashboard (OpenSearch Dashboards): the indexer through its Dev Tools console proxy.
+    WazuhWeb,
 }
 
 fn default_time_field() -> String {
@@ -135,7 +137,7 @@ pub struct ImportResult {
 }
 
 fn is_wazuh(kind: &RemoteKind) -> bool {
-    matches!(kind, RemoteKind::Wazuh | RemoteKind::WazuhApi)
+    matches!(kind, RemoteKind::Wazuh | RemoteKind::WazuhApi | RemoteKind::WazuhWeb)
 }
 
 fn validate(mut c: RemoteConfig) -> Result<RemoteConfig, String> {
@@ -176,8 +178,16 @@ fn validate(mut c: RemoteConfig) -> Result<RemoteConfig, String> {
     if c.ca_path.len() > 4096 || c.ca_path.chars().any(char::is_control) {
         return Err("Caminho do certificado CA inválido.".into());
     }
-    let url = Url::parse(&c.url)
+    let mut url = Url::parse(&c.url)
         .map_err(|_| "URL inválida. Use http:// ou https:// e o endereço base do serviço.")?;
+    if c.kind == RemoteKind::WazuhWeb {
+        // A dashboard address copied from the browser keeps only its base path.
+        url.set_fragment(None);
+        url.set_query(None);
+        if let Some(base) = url.path().find("/app/").map(|i| url.path()[..i].to_owned()) {
+            url.set_path(&base);
+        }
+    }
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -250,7 +260,7 @@ fn identity(c: &RemoteConfig) -> String {
     match c.kind {
         RemoteKind::Ssh => json!([c.kind, c.url, c.username, c.key_path]).to_string(),
         // The mode is part of the identity: a saved password is never sent as a token.
-        RemoteKind::Wazuh | RemoteKind::WazuhApi => json!([c.kind, c.url, c.username, c.auth]).to_string(),
+        RemoteKind::Wazuh | RemoteKind::WazuhApi | RemoteKind::WazuhWeb => json!([c.kind, c.url, c.username, c.auth]).to_string(),
         _ => json!([c.kind, c.url, c.username]).to_string(),
     }
 }
@@ -518,6 +528,10 @@ fn status_message(kind: &RemoteKind, status: u16) -> &'static str {
         (RemoteKind::Wazuh, 401) => "Autenticação recusada pelo Wazuh indexer (401). Use um usuário do indexer, como o do painel, e não o da API do servidor.",
         (RemoteKind::Wazuh, 403) => "Acesso negado (403). O usuário precisa de leitura nos índices wazuh-* (permissões read e scroll).",
         (RemoteKind::Wazuh, 404) => "Índice ou endpoint não encontrado (404). Confirme a URL do Wazuh indexer e o índice.",
+        (RemoteKind::WazuhWeb, 401) => "Autenticação recusada pelo painel Wazuh (401). Use usuário e senha do painel; login SSO do navegador não é reutilizado.",
+        (RemoteKind::WazuhWeb, 403) => "Acesso negado (403). A conta do painel precisa ler os índices wazuh-* e usar o console de Dev Tools (permissões read e scroll).",
+        (RemoteKind::WazuhWeb, 404) => "Índice ou console não encontrado (404). Use o endereço base do painel Wazuh e confirme o índice; o Dev Tools do painel precisa estar habilitado.",
+        (RemoteKind::WazuhWeb, 400) => "O painel Wazuh recusou a consulta (400). Confira o índice, o filtro e se o endereço é o do painel.",
         (RemoteKind::WazuhApi, 401) => "Autenticação recusada pela API do servidor Wazuh (401). Revise usuário e senha ou gere um novo token.",
         (RemoteKind::WazuhApi, 403) => "Acesso negado (403). O usuário da API precisa da permissão RBAC agent:read.",
         (RemoteKind::WazuhApi, 404) => "Endpoint não encontrado (404). Informe a URL da API do servidor Wazuh 4.x ou 5.x, por exemplo https://servidor:55000.",
@@ -537,6 +551,8 @@ fn endpoint_hint(c: &RemoteConfig) -> &'static str {
         (RemoteKind::Wazuh, Some(55000)) => " Esse endereço parece ser a API do servidor Wazuh: alertas e eventos ficam no Wazuh indexer (porta 9200). Para agentes, escolha Wazuh · API do servidor.",
         (RemoteKind::Wazuh, Some(443)) => " Use o endereço do Wazuh indexer (geralmente porta 9200), não o do painel web.",
         (RemoteKind::WazuhApi, Some(9200)) => " Esse endereço parece ser o Wazuh indexer: a API do servidor usa a porta 55000. Para alertas, escolha Wazuh · indexer.",
+        (RemoteKind::WazuhWeb, Some(9200)) => " Esse endereço parece ser o Wazuh indexer: escolha Wazuh · indexer, ou informe o endereço do painel web.",
+        (RemoteKind::WazuhWeb, Some(55000)) => " Esse endereço parece ser a API do servidor Wazuh: informe o endereço do painel web, o mesmo aberto no navegador.",
         (RemoteKind::WazuhApi, Some(443)) => " Use o endereço da API do servidor Wazuh (geralmente porta 55000), não o do painel web.",
         _ => "",
     }
@@ -661,7 +677,8 @@ impl RemoteClient {
         }
         let mut url = Url::parse(&self.connection.url).map_err(|_| "Endereço inválido.")?;
         let is_kibana = self.connection.kind == RemoteKind::Kibana;
-        let actual_method = if is_kibana {
+        let is_dashboard = self.connection.kind == RemoteKind::WazuhWeb;
+        let actual_method = if is_kibana || is_dashboard {
             url.set_path(&format!(
                 "{}/api/console/proxy",
                 url.path().trim_end_matches('/')
@@ -695,6 +712,10 @@ impl RemoteClient {
                     .header("Accept", "application/vnd.elasticsearch+json; compatible-with=8, application/json");
             }
         }
+        if is_dashboard {
+            // OpenSearch Dashboards (1.x-3.x) requires this header and returns the indexer status as is.
+            request = request.header("osd-xsrf", "true");
+        }
         match auth {
             Auth::Bearer(token) => request = request.bearer_auth(token),
             Auth::Configured if self.connection.auth == "token" => {
@@ -707,7 +728,7 @@ impl RemoteClient {
         }
         if let Some(body) = body {
             request = request.json(body);
-        } else if is_kibana {
+        } else if is_kibana || is_dashboard {
             request = request
                 .header("Content-Type", "application/json")
                 .body("{}");
@@ -1148,7 +1169,7 @@ pub async fn remote_test(
                 crate::remote_files::test(&connection, password)?;
                 Ok(TestResult { ok: true, message: "Acesso confirmado aos arquivos selecionados.".into() })
             }
-            RemoteKind::Wazuh => crate::remote_wazuh::indexer_test(&client_for(&crate::config_dir(), connection, password)?),
+            RemoteKind::Wazuh | RemoteKind::WazuhWeb => crate::remote_wazuh::indexer_test(&client_for(&crate::config_dir(), connection, password)?),
             RemoteKind::WazuhApi => crate::remote_wazuh::api_test(&client_for(&crate::config_dir(), connection, password)?),
             RemoteKind::Elasticsearch | RemoteKind::Kibana => test_impl(&client_for(&crate::config_dir(), connection, password)?),
         }
@@ -1187,7 +1208,7 @@ pub async fn remote_import(
         };
         let remote = client_for(&root, connection, password)?;
         match remote.connection.kind {
-            RemoteKind::Wazuh => crate::remote_wazuh::indexer_import(&remote, &root, from, to, progress),
+            RemoteKind::Wazuh | RemoteKind::WazuhWeb => crate::remote_wazuh::indexer_import(&remote, &root, from, to, progress),
             RemoteKind::WazuhApi => {
                 if from.is_some() || to.is_some() {
                     return Err("A API do servidor Wazuh não filtra por período. Limpe De e Até, ou use Wazuh · indexer para alertas e eventos.".into());
@@ -1603,6 +1624,13 @@ t7Oc7pH7LwIiUBsysbgB6p6AdyM/36XG
         let mut anonymous = api.clone();
         anonymous.username.clear();
         assert!(validate(anonymous).err().unwrap().contains("token"));
+        // A dashboard address copied from the browser keeps only its base path.
+        let mut web = c.clone();
+        web.kind = RemoteKind::WazuhWeb;
+        web.url = "https://wazuh.example/app/wz-home#/overview/?tab=general".into();
+        assert_eq!(validate(web.clone()).unwrap().url, "https://wazuh.example");
+        web.url = "https://proxy.example/wazuh/app/discover?_g=()".into();
+        assert_eq!(validate(web).unwrap().url, "https://proxy.example/wazuh");
         let mut ssh = c.clone();
         ssh.kind = RemoteKind::Ssh;
         ssh.url = "ssh://linux.example:22".into();

@@ -187,6 +187,14 @@ try {
   request = await lastRequest("remote_test");
   assert.deepEqual([request.connection.auth, request.connection.username, request.connection.insecureTls, request.passwordProvided], ["token", "", true, true]);
 
+  // The dashboard reaches the same indexer data sets through its web address.
+  await page.locator("#rs-kind").selectOption("wazuhweb");
+  assert.match(await page.locator("#rs-url-hint").textContent(), /painel/);
+  assert.equal(await page.locator("#rs-wazuh-data").inputValue(), "wazuh-alerts-*");
+  await page.locator("#rs-url").fill("https://wazuh.example.test");
+  await page.locator("#rs-test").click(); await idle();
+  request = await lastRequest("remote_test");
+  assert.deepEqual([request.connection.kind, request.connection.index, request.connection.timeField], ["wazuhweb", "wazuh-alerts-*", "timestamp"]);
   // The server API offers fixed data sets, without index, Query DSL or period.
   await page.locator("#rs-kind").selectOption("wazuhapi");
   for (const id of ["#rs-index", "#rs-time-field", "#rs-from", "#rs-to", "#rs-query-advanced"]) assert.equal(await page.locator(id).isVisible(), false, id);

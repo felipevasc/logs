@@ -30,7 +30,7 @@ O limite padrão é 512 MiB, ajustável entre 1 MiB e 4 GiB. Cada coleta admite 
 
 ## Wazuh
 
-O Wazuh grava alertas e eventos no **Wazuh indexer**, que é o que o painel exibe. O inventário de agentes fica na **API do servidor**. Por isso há duas modalidades, cada uma com seu endereço e sua credencial.
+O Wazuh grava alertas e eventos no **Wazuh indexer**, que é o que o painel exibe. O inventário de agentes fica na **API do servidor**. Há três modalidades, cada uma com seu endereço e sua credencial: o indexer direto, o mesmo indexer pelo painel web e a API do servidor.
 
 ### Wazuh · indexer (alertas e eventos)
 
@@ -65,6 +65,12 @@ Os alertas 4.x são interpretados assim:
 - o `id` do alerta e o `full_log` original permanecem como campos.
 
 Os dados 5.x seguem o esquema comum do Wazuh, baseado em ECS, e usam os campos canônicos existentes.
+
+### Wazuh · painel web (alertas e eventos)
+
+Use o endereço do painel, o mesmo aberto no navegador, como `https://wazuh.empresa`. Ao colar um link copiado do navegador, o trecho a partir de `/app/` é descartado. Os conjuntos, o período, o filtro e o teste são os mesmos do indexer. As consultas passam pelo console de Dev Tools do painel (`POST /api/console/proxy`, com o cabeçalho `osd-xsrf`), presente no OpenSearch Dashboards de todas as versões do Wazuh 4.x e 5.x.
+
+Informe usuário e senha do painel. A conta precisa ler os índices `wazuh-*` e usar o Dev Tools. Login SSO (SAML ou OpenID) do navegador não é reutilizado; nesse caso use uma conta interna ou um token aceito pelo painel. Use esta opção quando só o painel é acessível; com acesso à porta 9200, a conexão direta ao indexer evita um salto.
 
 ### Wazuh · API do servidor (agentes)
 

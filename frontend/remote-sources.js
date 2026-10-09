@@ -8,14 +8,14 @@
   // Wazuh data sets: [index, time field, label]. 4.x writes alerts with "timestamp", 5.x data streams with "@timestamp".
   const wazuhIndexer = [["wazuh-alerts-*", "timestamp", "Alertas · Wazuh 4.x"], ["wazuh-archives-*", "timestamp", "Todos os eventos (archives) · Wazuh 4.x"], ["wazuh-findings-v5*", "@timestamp", "Achados · Wazuh 5.x"], ["wazuh-events-v5*", "@timestamp", "Eventos normalizados · Wazuh 5.x"], ["wazuh-states-vulnerabilities*", "vulnerability.detected_at", "Vulnerabilidades · Wazuh 4.8+ e 5.x"]];
   const wazuhApi = [["agents", "", "Agentes · inventário"]];
-  const kindLabels = { ssh: "SSH", winrm: "WinRM", kibana: "Kibana", elasticsearch: "Elasticsearch", wazuh: "Wazuh indexer", wazuhapi: "Wazuh API" };
+  const kindLabels = { ssh: "SSH", winrm: "WinRM", kibana: "Kibana", elasticsearch: "Elasticsearch", wazuh: "Wazuh indexer", wazuhweb: "Wazuh painel web", wazuhapi: "Wazuh API" };
   const modal = el("div", "modal-overlay remote-overlay"); modal.id = "remote-modal"; modal.hidden = true;
   modal.innerHTML = `<section class="modal remote-modal" role="dialog" aria-modal="true" aria-labelledby="rs-title">
     <header class="modal-head"><div><h3 id="rs-title">Conexões</h3><p>Importe registros de Elasticsearch, Kibana e Wazuh ou colete arquivos por SSH e WinRM.</p></div><button class="icon-btn" type="button" id="rs-close" aria-label="Fechar conexões"><i class="fas fa-xmark"></i></button></header>
     <div class="remote-body"><aside class="remote-saved"><div class="remote-list-head"><strong>Biblioteca global de conexões</strong><button class="btn ghost small" id="rs-new" type="button">+ Nova</button></div><p class="remote-help">Compartilhada neste computador. Abra explicitamente para escolher um acesso para este Caso.</p><div id="rs-list" role="listbox" aria-label="Biblioteca global de conexões" hidden></div><button class="text-button" id="rs-reload" type="button">Abrir biblioteca global</button></aside>
       <form id="rs-form" class="remote-form" novalidate><fieldset id="rs-fields"><div class="remote-form-heading"><h4 id="rs-form-title">Nova conexão</h4><span id="rs-saved-state"></span></div>
         <div class="remote-grid"><label class="remote-wide" for="rs-name">Nome<input id="rs-name" autocomplete="off" maxlength="120" placeholder="Ex.: Produção · API" required /></label>
-          <label for="rs-kind">Serviço<select id="rs-kind"><option value="elasticsearch">Elasticsearch</option><option value="kibana">Kibana</option><option value="wazuh">Wazuh · indexer (alertas e eventos)</option><option value="wazuhapi">Wazuh · API do servidor (agentes)</option><option value="ssh">SSH · Linux</option><option value="winrm">WinRM · Windows</option></select></label><label for="rs-wazuh-data" id="rs-wazuh-data-wrap" hidden>Dados do Wazuh<select id="rs-wazuh-data"></select></label><label for="rs-kibana-version" id="rs-kibana-version-wrap" hidden>Versão do Kibana<select id="rs-kibana-version"><option value="auto">Automático (Kibana 7, 8 ou 9+)</option><option value="v7_8">Kibana 7.x / 8.x</option><option value="v9">Kibana 9+ / Serverless</option></select></label><label for="rs-index" id="rs-index-wrap">Índice ou padrão<input id="rs-index" autocomplete="off" placeholder="logs-*" required /></label>
+          <label for="rs-kind">Serviço<select id="rs-kind"><option value="elasticsearch">Elasticsearch</option><option value="kibana">Kibana</option><option value="wazuhweb">Wazuh · painel web (alertas e eventos)</option><option value="wazuh">Wazuh · indexer (alertas e eventos)</option><option value="wazuhapi">Wazuh · API do servidor (agentes)</option><option value="ssh">SSH · Linux</option><option value="winrm">WinRM · Windows</option></select></label><label for="rs-wazuh-data" id="rs-wazuh-data-wrap" hidden>Dados do Wazuh<select id="rs-wazuh-data"></select></label><label for="rs-kibana-version" id="rs-kibana-version-wrap" hidden>Versão do Kibana<select id="rs-kibana-version"><option value="auto">Automático (Kibana 7, 8 ou 9+)</option><option value="v7_8">Kibana 7.x / 8.x</option><option value="v9">Kibana 9+ / Serverless</option></select></label><label for="rs-index" id="rs-index-wrap">Índice ou padrão<input id="rs-index" autocomplete="off" placeholder="logs-*" required /></label>
           <label class="remote-wide" for="rs-url">URL base<input id="rs-url" type="url" autocomplete="off" placeholder="https://elastic.exemplo:9200" required /><span id="rs-url-hint" class="remote-help"></span></label>
           <label class="remote-wide" for="rs-auth" id="rs-auth-wrap" hidden>Autenticação<select id="rs-auth"><option value="basic">Usuário e senha</option><option value="token">Token (Bearer)</option></select></label>
           <label for="rs-username" id="rs-username-wrap">Usuário <span class="remote-optional" id="rs-username-optional">opcional</span><input id="rs-username" autocomplete="off" spellcheck="false" /></label><label for="rs-password" id="rs-password-wrap"><span id="rs-password-label">Senha</span><input id="rs-password" type="password" autocomplete="new-password" placeholder="Senha de acesso" /><span id="rs-password-hint" class="remote-help"></span></label>
@@ -40,7 +40,7 @@
     q("cancel").hidden = !["import", "test"].includes(action); q("cancel").disabled = !!ui.request?.cancelled || !["import", "test"].includes(action);
     q("form").setAttribute("aria-busy", String(ui.busy));
   }
-  const isWazuh = kind => kind === "wazuh" || kind === "wazuhapi";
+  const isWazuh = kind => ["wazuh", "wazuhweb", "wazuhapi"].includes(kind);
   const authMode = () => isWazuh(q("kind").value) ? q("auth").value : "basic";
   function credentialReusable() {
     return !!ui.selected?.hasPassword && q("kind").value === ui.selected.kind && q("url").value.trim().replace(/\/$/, "") === ui.selected.url.replace(/\/$/, "") && authMode() === (ui.selected.auth || "basic") && (authMode() === "token" || q("username").value.trim() === (ui.selected.username || ""));
@@ -50,8 +50,8 @@
     const kind = q("kind").value, presets = kind === "wazuhapi" ? wazuhApi : wazuhIndexer, select = q("wazuh-data");
     q("wazuh-data-wrap").hidden = !isWazuh(kind);
     if (!isWazuh(kind)) return;
-    select.replaceChildren(...presets.map(([index, , label]) => new Option(label, index)), ...(kind === "wazuh" ? [new Option("Outro índice ou padrão", "")] : []));
-    select.value = presets.some(([index]) => index === q("index").value.trim()) ? q("index").value.trim() : kind === "wazuh" ? "" : presets[0][0];
+    select.replaceChildren(...presets.map(([index, , label]) => new Option(label, index)), ...(kind !== "wazuhapi" ? [new Option("Outro índice ou padrão", "")] : []));
+    select.value = presets.some(([index]) => index === q("index").value.trim()) ? q("index").value.trim() : kind !== "wazuhapi" ? "" : presets[0][0];
   }
   function applyWazuhData(index) {
     const preset = [...wazuhIndexer, ...wazuhApi].find(([value]) => value === index);
@@ -59,7 +59,7 @@
     q("index").value = preset[0]; q("time-field").value = preset[1];
   }
   function syncHints() {
-    const kind = q("kind").value, kibana = kind === "kibana", wazuh = kind === "wazuh", api = kind === "wazuhapi";
+    const kind = q("kind").value, kibana = kind === "kibana", wazuh = kind === "wazuh", web = kind === "wazuhweb", api = kind === "wazuhapi";
     const ssh = kind === "ssh", winrm = kind === "winrm", files = ssh || winrm, token = authMode() === "token";
     q("files").hidden = !files; q("key-wrap").hidden = !ssh; q("password-wrap").hidden = ssh;
     for (const id of ["index-wrap", "query-options", "query-advanced"]) q(id).hidden = files;
@@ -75,8 +75,8 @@
     q("import").innerHTML = `<i class="fas fa-cloud-arrow-down"></i> ${files ? "Coletar e indexar arquivos" : "Importar registros"}`;
     q("url").type = "text";
     q("kibana-version-wrap").hidden = !kibana;
-    q("url").placeholder = ssh ? "ssh://servidor:22" : winrm ? "https://servidor:5986/wsman" : kibana ? "https://kibana.exemplo/s/meu-espaco" : wazuh ? "https://wazuh-indexer:9200" : api ? "https://wazuh-servidor:55000" : "https://elastic.exemplo:9200";
-    q("url-hint").textContent = ssh ? "OpenSSH por chave ou agente. O host deve estar verificado em known_hosts. Python 3 no Linux remoto." : winrm ? "WinRM com HTTPS e certificado válido. Cliente disponível no Windows. Usuário vazio usa autenticação integrada." : kibana ? "Use a URL base, com /s/espaco se necessário. Requer permissão no Console do Kibana; login SSO do navegador não é reutilizado." : wazuh ? "Wazuh indexer, onde o Wazuh grava alertas e eventos (porta 9200). Use um usuário do indexer com leitura em wazuh-*, como o do painel. Compatível com Wazuh 4.x e 5.x." : api ? "API do servidor Wazuh 4.x ou 5.x (porta 55000). Usuário e senha geram um token JWT renovado automaticamente. Alertas ficam no Wazuh indexer." : "Endereço da API Elasticsearch. Use usuário e senha nos campos próprios, se exigidos.";
+    q("url").placeholder = ssh ? "ssh://servidor:22" : winrm ? "https://servidor:5986/wsman" : kibana ? "https://kibana.exemplo/s/meu-espaco" : web ? "https://wazuh.exemplo" : wazuh ? "https://wazuh-indexer:9200" : api ? "https://wazuh-servidor:55000" : "https://elastic.exemplo:9200";
+    q("url-hint").textContent = ssh ? "OpenSSH por chave ou agente. O host deve estar verificado em known_hosts. Python 3 no Linux remoto." : winrm ? "WinRM com HTTPS e certificado válido. Cliente disponível no Windows. Usuário vazio usa autenticação integrada." : kibana ? "Use a URL base, com /s/espaco se necessário. Requer permissão no Console do Kibana; login SSO do navegador não é reutilizado." : web ? "Endereço do painel Wazuh, o mesmo aberto no navegador (o que vem depois de /app/ é descartado). Use usuário e senha do painel; a consulta passa pelo console de Dev Tools. Login SSO do navegador não é reutilizado. Compatível com Wazuh 4.x e 5.x." : wazuh ? "Wazuh indexer, onde o Wazuh grava alertas e eventos (porta 9200). Use um usuário do indexer com leitura em wazuh-*, como o do painel. Compatível com Wazuh 4.x e 5.x." : api ? "API do servidor Wazuh 4.x ou 5.x (porta 55000). Usuário e senha geram um token JWT renovado automaticamente. Alertas ficam no Wazuh indexer." : "Endereço da API Elasticsearch. Use usuário e senha nos campos próprios, se exigidos.";
     q("presets").replaceChildren();
     if (files) {
       const presets = ssh ? [["Sistema", "/var/log/syslog\n/var/log/messages"], ["Autenticação", "/var/log/auth.log\n/var/log/secure"], ["Nginx", "/var/log/nginx"], ["Apache", "/var/log/apache2\n/var/log/httpd"], ["Auditoria", "/var/log/audit/audit.log"]] : [["EVTX principais", "C:\\Windows\\System32\\winevt\\Logs\\Application.evtx\nC:\\Windows\\System32\\winevt\\Logs\\System.evtx\nC:\\Windows\\System32\\winevt\\Logs\\Security.evtx"], ["Todos os EVTX", "C:\\Windows\\System32\\winevt\\Logs"], ["IIS", "C:\\inetpub\\logs\\LogFiles"]];
@@ -128,7 +128,7 @@
     ui.selected = connection ? { ...connection } : null; ui.connectionId = connection?.id || null;
     for (const [input, field] of endpointFields) writeField(input, endpoint[field] ?? defaults()[field]);
     // A generic recorte follows a Wazuh access to its usual data; an authored index is kept.
-    if (isWazuh(q("kind").value) && ["", "logs-*"].includes(q("index").value.trim())) applyWazuhData(q("kind").value === "wazuh" ? "wazuh-alerts-*" : "agents");
+    if (isWazuh(q("kind").value) && ["", "logs-*"].includes(q("index").value.trim())) applyWazuhData(q("kind").value === "wazuhapi" ? "agents" : "wazuh-alerts-*");
     q("password").value = ""; q("remember").checked = ui.persistentSecrets && !!connection?.passwordSaved;
     q("form-title").textContent = connection?.name || "Novo acesso";
     q("saved-state").textContent = connection ? "Acesso da biblioteca global · recorte deste Caso" : "Acesso não salvo · recorte deste Caso";
@@ -217,7 +217,7 @@
       connection.index = q("wazuh-data").value; connection.timeField = "";
       return connection;
     }
-    if (!connection.index) { q("index").focus(); throw Error(`Informe um índice ou padrão, como ${connection.kind === "wazuh" ? "wazuh-alerts-*" : "logs-*"}.`); }
+    if (!connection.index) { q("index").focus(); throw Error(`Informe um índice ou padrão, como ${["wazuh", "wazuhweb"].includes(connection.kind) ? "wazuh-alerts-*" : "logs-*"}.`); }
     const query = q("query").value.trim();
     if (query) {
       try { connection.query = JSON.parse(query); } catch { q("query").parentElement.open = true; q("query").focus(); throw Error("O filtro avançado precisa ser um JSON válido."); }
@@ -271,13 +271,13 @@
     if (action === "import") { session.importRequest = request; session.lastImport = null; ui.lastImport = null; }
     ui.request = request; setBusy(action); q("open-result").hidden = true;
     const current = () => panelCurrent(captured) && ui.request === request;
-    setStatus(action === "save" ? "Salvando acesso na biblioteca global…" : action === "test" ? ({ wazuh: "Verificando o Wazuh indexer, a versão e os índices…", wazuhapi: "Verificando a API do servidor Wazuh…" }[connection.kind] || "Verificando acesso ao índice…") : "Consultando e importando registros…");
+    setStatus(action === "save" ? "Salvando acesso na biblioteca global…" : action === "test" ? ({ wazuh: "Verificando o Wazuh indexer, a versão e os índices…", wazuhweb: "Verificando o painel Wazuh, a versão e os índices…", wazuhapi: "Verificando a API do servidor Wazuh…" }[connection.kind] || "Verificando acesso ao índice…") : "Consultando e importando registros…");
     let closeOnSuccess = false;
     const credentials = passwordArgs();
     try {
       if (action === "save") {
         // The global vault stores access, never a Case's authored query/recorte.
-        const [index, timeField] = { wazuh: ["wazuh-alerts-*", "timestamp"], wazuhapi: ["agents", ""] }[connection.kind] || ["logs-*", "@timestamp"];
+        const [index, timeField] = { wazuh: ["wazuh-alerts-*", "timestamp"], wazuhweb: ["wazuh-alerts-*", "timestamp"], wazuhapi: ["agents", ""] }[connection.kind] || ["logs-*", "@timestamp"];
         const libraryConnection = { ...connection, index, timeField, maxRecords: 100000, query: null };
         const saved = await api("remote_save", { connection: libraryConnection, ...credentials, rememberPassword: ui.persistentSecrets && q("remember").checked }, { silent: true });
         if (!ownerValid(captured) || session.version !== draftVersion) return;
@@ -354,7 +354,7 @@
   q("kind").addEventListener("change", () => {
     const kind = q("kind").value, index = q("index").value.trim();
     if (index && index !== "logs-*" && ![...wazuhIndexer, ...wazuhApi].some(([value]) => value === index)) return;
-    if (kind === "wazuh") applyWazuhData(wazuhIndexer.some(([value]) => value === index) ? index : "wazuh-alerts-*");
+    if (kind === "wazuh" || kind === "wazuhweb") applyWazuhData(wazuhIndexer.some(([value]) => value === index) ? index : "wazuh-alerts-*");
     else if (kind === "wazuhapi") applyWazuhData(wazuhApi.some(([value]) => value === index) ? index : "agents");
     else if (!["ssh", "winrm"].includes(kind)) { q("index").value = "logs-*"; q("time-field").value = "@timestamp"; }
     syncHints(); rememberDraft();

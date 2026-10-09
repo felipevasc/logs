@@ -1,4 +1,5 @@
-//! Wazuh sources. Alerts and events are read from the Wazuh indexer with the
+//! Wazuh sources. Alerts and events are read from the Wazuh indexer, directly or
+//! through the dashboard's Dev Tools console proxy, with the
 //! scroll API, which OpenSearch 1.x-3.x (Wazuh 4.3-5.x) and Elasticsearch 7+
 //! (Wazuh 4.0-4.2 with Elastic Stack) all support, unlike their PIT APIs.
 //! The agent inventory comes from the Wazuh server API (JWT), whose /agents
@@ -232,7 +233,8 @@ pub(crate) fn indexer_test(remote: &RemoteClient) -> Result<TestResult, String> 
     scroll.close()?;
     let found = probe(remote)?;
 
-    let mut message = format!("Wazuh indexer verificado ({engine}). ");
+    let via = if c.kind == crate::remote::RemoteKind::WazuhWeb { " pelo painel web" } else { "" };
+    let mut message = format!("Wazuh indexer verificado{via} ({engine}). ");
     let mut generations: Vec<&str> = Vec::new();
     match total {
         Some(0) => message.push_str(&format!("Nenhum registro em {} para este usuário.", c.index)),
@@ -623,6 +625,40 @@ mod tests {
 
         let server = Server::new(vec![ok(json!({"version":{"number":"6.8.23"},"tagline":"You Know, for Search"}))]);
         assert!(indexer_test(&indexer(&server.url)).err().unwrap().contains("não é suportado"));
+        server.finish();
+    }
+
+    #[test]
+    fn dashboard_reads_the_indexer_through_the_console_proxy() {
+        let root = Folder::new();
+        let server = Server::new(vec![ok(alerts(0, 2, 2, "w1")), ok(json!({"succeeded":true}))]);
+        let mut c = config(&format!("{}/wazuh", server.url));
+        c.kind = RemoteKind::WazuhWeb;
+        c.index = "wazuh-alerts-*".into();
+        c.time_field = "timestamp".into();
+        let remote = RemoteClient::new(c, Some("pass".into())).unwrap();
+        let result = indexer_import(&remote, &root.0, None, None, |_, _| {}).unwrap();
+        assert_eq!((result.count, result.limited), (2, false));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        for (request, (path, method)) in requests.iter().zip([("wazuh-alerts-*/_search?scroll=2m", "POST"), ("_search/scroll", "DELETE")]) {
+            let url = reqwest::Url::parse(&format!("http://fixture{}", request.path)).unwrap();
+            assert_eq!(url.path(), "/wazuh/api/console/proxy");
+            let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!((query["path"].as_str(), query["method"].as_str()), (path, method));
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.headers["osd-xsrf"], "true");
+            assert_eq!(request.headers["authorization"], BASIC);
+        }
+        assert_eq!(requests[1].body["scroll_id"], json!(["w1"]));
+
+        // The dashboard returns the indexer status as is.
+        let server = Server::new(vec![status(401)]);
+        let mut c = config(&server.url);
+        c.kind = RemoteKind::WazuhWeb;
+        c.index = "wazuh-alerts-*".into();
+        let error = indexer_test(&RemoteClient::new(c, Some("pass".into())).unwrap()).err().unwrap();
+        assert!(error.contains("painel Wazuh (401)"), "{error}");
         server.finish();
     }
 
