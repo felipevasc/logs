@@ -73,6 +73,8 @@ try {
   await page.waitForFunction(() => ['cancelling', 'cancelled'].includes(Security.status().state));
   await page.waitForFunction(() => Security.status().state === 'cancelled');
   assert.equal(await page.evaluate(() => Security.cached()), null);
+  // The task entry settles after the analysis state changes; its visual leaves on the next render.
+  await page.waitForFunction(() => !document.querySelector('.tasks-overlay .waiting-visual'), null, { timeout: 5000 });
   assert.equal(await dialog.locator('.waiting-visual').count(), 0);
   await page.evaluate(() => Tasks.progress({ operationId: __mockRequests.find(row => row.cmd === 'triage' && !row.cacheOnly).operationId, triage: { revision: 999, completed: 45, total: 45, findings: 999, items: [] } }));
   assert.equal(await main.locator('.cp-totals').count(), 0);
