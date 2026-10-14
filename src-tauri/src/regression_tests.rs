@@ -27,10 +27,10 @@ fn benchmark_security_evidence() {
         let state=state_for(crate::SourceData::Indexed(index)); let start=std::time::Instant::now();
         let result=workspace::with_selection(&state,&[],|selection|crate::detections::run_stored(&crate::detections::Inputs {rules:&rules,catalog:Some(&catalog),settings:&settings},&crate::detections::Source::Selection(&selection))).unwrap().unwrap();
         let analysis_ms=start.elapsed().as_millis(); assert_eq!(result.metadata["total"],count);
-        let mut tail=std::iter::once(count-1);let page=result.page(1,0,20,Some(&mut tail),None).unwrap();
+        let mut tail=std::iter::once(count-1);let page=result.page(1,0,20,Some(&mut tail),None, None).unwrap();
         assert!(page["detections"].as_array().unwrap().iter().any(|d|d["event_ids"].as_array().unwrap().contains(&serde_json::json!(count-1))));
         assert_eq!(result.metadata["storage"]["complete"],true);let start=std::time::Instant::now();
-        for level in 1..=5 { result.page(level,0,20,None,None).unwrap(); }
+        for level in 1..=5 { result.page(level,0,20,None,None, None).unwrap(); }
         println!("SECURITY_BENCH {}",serde_json::json!({"events":count,"workload":if dense{"dense"}else{"selective"},"indexing_ms":indexing_ms,"analysis_ms":analysis_ms,"five_projections_ms":start.elapsed().as_millis(),"detections":page["available_detections"],"limited":result.metadata["limited"],"memory":result.metadata["memory"],"execution":result.metadata["execution"],"storage":result.metadata["storage"],"synthetic":true,"policy":result.metadata["policy_version"]}));
     }
 }
@@ -603,14 +603,17 @@ fn json_arrays_preserve_nested_fields_strings_and_epoch_units() {
 }
 
 #[test]
-fn json_array_rejects_incomplete_input_and_preserves_literal_dotted_fields() {
+fn json_array_recovers_incomplete_input_and_preserves_literal_dotted_fields() {
+    // Cut or malformed exports keep every complete record instead of failing.
     for text in [
         "[{\"message\":\"ok\"}",
         "[{\"message\":\"ok\"},]",
         "[{\"message\":\"ok\"}] garbage",
     ] {
         let file = Fixture::new(text);
-        assert!(sources::index_file(file.0.to_str().unwrap(), "auto", None, None, None).is_err());
+        let index = sources::index_file(file.0.to_str().unwrap(), "auto", None, None, None).unwrap();
+        let codes = CodesConfig::default();
+        assert_eq!(sources::event_at(&index, 0, &codes, &codes, &[]).message, "ok", "{text}");
     }
     let ev = sources::parse_line(br#"{"service":{"name":"nested"},"service.name":"explicit","level":null,"severity":"WARN","message":"hello"}"#, "jsonl", None, &[]);
     assert_eq!(ev.source, "explicit");
@@ -2235,4 +2238,50 @@ fn triage_named_cancellation_does_not_publish_partial_results() {
     });
     assert!(outcome.is_err() || outcome.unwrap().is_err());
     assert!(crate::triage::stored_analysis_mode(&state, None, false, true).err().unwrap().contains("TRIAGE_NOT_CALCULATED"));
+}
+
+#[test]
+fn client_profiles_feed_rules_sections_and_inventory() {
+    let line = |ip: &str, time: &str, path: &str, agent: &str| format!("{ip} - - [12/Oct/2026:{time} -0300] \"GET {path} HTTP/1.1\" 404 120 \"-\" \"{agent}\"\n");
+    let mut text = String::new();
+    for i in 0..25 {
+        text += &line("203.0.113.9", &format!("10:{:02}:{:02}", i / 6, (i * 10) % 60), &format!("/item-{i}"), "sqlmap/1.7.2#stable (https://sqlmap.org)");
+    }
+    text += &line("198.51.100.7", "11:00:00", "/", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/190.0.0.0 Safari/537.36");
+    text += &line("192.0.2.10", "11:01:00", "/health", "curl/8.4.0");
+    text += &line("192.0.2.11", "11:02:00", "/", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36");
+    let fixture = Fixture::new(&text);
+    let index = fixture.index("apache");
+    let codes = CodesConfig::default();
+    let forged = sources::event_at(&index, 25, &codes, &codes, &[]);
+    assert_eq!(forged.fields["ua.class"], "navegador");
+    assert_eq!(forged.fields["ua.anomaly"], "versão que ainda não existia");
+    assert_eq!(sources::event_at(&index, 26, &codes, &codes, &[]).fields["ua.family"], "curl");
+    assert!(!sources::event_at(&index, 27, &codes, &codes, &[]).fields.contains_key("ua.anomaly"));
+    let state = state_for(crate::SourceData::Indexed(index));
+    let rules = crate::detections::builtin_ruleset().unwrap();
+    let settings = crate::detections::Settings { threats: false, investigation: crate::investigation::Settings { enabled: false, ..Default::default() }, ..Default::default() };
+    let inputs = crate::detections::Inputs { rules: &rules, catalog: None, settings: &settings };
+    let result = workspace::with_selection(&state, &[], |selection| crate::detections::run_stored(&inputs, &crate::detections::Source::Selection(&selection))).unwrap().unwrap();
+    let page = result.page(1, 0, 50, None, None, Some("clients")).unwrap();
+    let mut found: Vec<&str> = page["detections"].as_array().unwrap().iter().filter(|d| d["context_only"] != true).map(|d| d["rule"].as_str().unwrap()).collect();
+    found.sort();
+    assert_eq!(found, ["client.forged-browser", "client.offensive-tool"]);
+    assert!(page["detections"].as_array().unwrap().iter().all(|d| d["theme"] == "clients"));
+    assert!(page["episodes"].as_array().unwrap().iter().all(|e| e["themes"].as_array().unwrap().contains(&serde_json::json!("clients"))));
+    let clients = page["themes"].as_array().unwrap().iter().find(|t| t["key"] == "clients").unwrap();
+    assert_eq!(clients["counts_by_level"], serde_json::json!([0, 2, 0, 0, 0]));
+    assert_eq!(page["theme"], "clients");
+    assert_eq!(result.page(1, 0, 50, None, None, Some("upload")).unwrap()["page"]["total_episodes"], 0);
+    assert!(result.page(1, 0, 50, None, None, Some("x' OR 1=1")).is_err());
+    let inventory = crate::client_inventory::inventory(&state, vec![], None).unwrap();
+    let class = |name: &str| inventory["classes"].as_array().unwrap().iter().find(|c| c["class"] == name).cloned().unwrap_or_default();
+    assert_eq!(inventory["total"], 28);
+    assert_eq!(class("ferramenta ofensiva")["records"], 25);
+    assert_eq!(class("ferramenta ofensiva")["families"][0]["value"], "sqlmap");
+    assert_eq!(class("biblioteca ou linha de comando")["families"][0]["value"], "curl");
+    assert_eq!(class("navegador")["records"], 2);
+    assert_eq!(inventory["anomalies"][0]["value"], "versão que ainda não existia");
+    assert_eq!(inventory["anomalies"][0]["records"], 1);
+    assert!(inventory["forged_agents"][0]["value"].as_str().unwrap().contains("Chrome/190"));
 }

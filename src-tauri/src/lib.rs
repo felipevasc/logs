@@ -60,6 +60,8 @@ mod security_deobfuscate;
 mod security_results;
 mod security_duck_stream;
 mod security_grouping;
+mod security_themes;
+mod client_inventory;
 mod security_participants;
 #[cfg(test)]
 mod security_participants_tests;
@@ -459,10 +461,12 @@ fn index_source_file(
     let (expanded, format) = match sheet {
         Some(events) => (Some(events), "snapshot"),
         None => {
-            let expanded = if extension == "gz" {
-                Some(workspace::expand_gzip(std::path::Path::new(&physical))?)
-            } else {
-                member.clone()
+            // Compressed logs are recognized by content too: rotated files are
+            // often named "access.log.1" or "messages-20261012" without ".gz".
+            let compressed = workspace::compression_of(std::path::Path::new(&physical), &extension);
+            let expanded = match compressed {
+                Some(kind) => Some(workspace::expand_compressed(std::path::Path::new(&physical), kind)?),
+                None => member.clone(),
             };
             // UTF-16 and legacy code pages are converted to UTF-8 before indexing.
             let text = expanded.clone().unwrap_or_else(|| std::path::PathBuf::from(&physical));
@@ -483,8 +487,9 @@ fn index_source_file(
         None
     };
     let saved_ts = load_ts_config(path).map(|c| c.compile()).transpose()?;
-    let mut idx = index_cache::open_with_progress(
+    let mut idx = index_cache::open_from(
         &index_path,
+        Some((path, &physical)),
         format,
         custom,
         saved_ts,
@@ -1069,11 +1074,12 @@ pub(crate) fn list_formats_impl() -> Vec<FormatInfo> {
     let mut v: Vec<FormatInfo> = [
         ("auto", "Automático (inferir)"),
         ("jsonl", "JSON / JSONL (CloudTrail, Azure, Okta, Suricata, Elastic)"),
-        ("syslog3164", "Syslog (RFC 3164)"),
+        ("syslog3164", "Syslog (RFC 3164, rsyslog, journald, Cisco)"),
         ("syslog5424", "Syslog (RFC 5424)"),
-        ("apache", "Apache / Nginx (common / combined)"),
+        ("apache", "Access log (Apache, Nginx, Tomcat, JBoss, IIS NCSA)"),
+        ("apache-error", "Apache (error_log)"),
         ("nginx-error", "Nginx (error.log)"),
-        ("mixed", "Misto (registros estruturados por linha)"),
+        ("mixed", "Qualquer texto (reconhecimento por linha)"),
         ("firewall", "Firewall (iptables / netfilter)"),
         ("cef", "CEF (ArcSight)"),
         ("leef", "LEEF (QRadar)"),
@@ -1081,6 +1087,9 @@ pub(crate) fn list_formats_impl() -> Vec<FormatInfo> {
         ("wildfly", "WildFly / JBoss"),
         ("logfmt", "Logfmt (key=value)"),
         ("csv", "CSV / TSV (cabeçalho; separador detectado)"),
+        ("csv-positional", "CSV sem cabeçalho (colunas por posição)"),
+        ("tsv-positional", "TSV sem cabeçalho (colunas por posição)"),
+        ("xml", "XML (eventos do Windows, log4j, java.util.logging)"),
         ("w3c", "IIS / W3C"),
         ("zeek", "Zeek (TSV)"),
         ("auditd", "Linux auditd"),
@@ -1468,6 +1477,26 @@ async fn aggregate_events(
         workspace::validate(&filters)?;
         let state = app.state::<AppState>();
         aggregate_events_cached_impl(state.inner(), &group_column, aggs, filters, case_events)
+    })
+    .await?
+}
+
+/// Clients of the data set by class, family and impossible browser claims.
+#[tauri::command]
+async fn client_inventory(
+    filters: Vec<query::Filter>,
+    case_events: Option<Vec<Event>>,
+    case_key: Option<String>,
+    analysis_context: Option<crate::analysis_context::Identity>,
+    source_generation: Option<u64>,
+    app: AppHandle,
+    operation_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
+    offload_case(operation_id, app.clone(), admitted, case_events, move |case_events| {
+        workspace::validate(&filters)?;
+        let state = app.state::<AppState>();
+        client_inventory::inventory(state.inner(), filters, case_events)
     })
     .await?
 }
@@ -2356,6 +2385,7 @@ pub fn run() {
             query_page,
             explore_snapshot,
             aggregate_events,
+            client_inventory,
             trail_events,
             count_filtered,
             tree_aggs,

@@ -1203,14 +1203,7 @@ pub async fn expand_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
                         return Err(format!("Nenhum arquivo de log em {}.", path.display()));
                     }
                     files.extend(members);
-                } else if explicit
-                    || [
-                        "log", "txt", "jsonl", "ndjson", "json", "csv", "tsv", "evtx", "gz", "audit", "xlsx", "xlsm",
-                        "xlsb", "xls", "ods",
-                    ]
-                    .contains(&ext.as_str())
-                    || ext.parse::<u32>().is_ok()
-                {
+                } else if explicit || log_extension(&ext) || (!binary_extension(&ext) && looks_like_log_content(&path)) {
                     files.push(text);
                 }
             }
@@ -2102,27 +2095,22 @@ mod canonical {
         }
 
         #[test]
-        fn utf32_signatures_do_not_publish_a_misdecoded_utf16_artifact() {
+        fn utf32_text_is_converted_and_utf16_with_a_leading_nul_stays_utf16() {
             let fixture = Fixture::new();
             for (name, bytes) in [
                 ("UTF-32LE", vec![0xff, 0xfe, 0, 0, b'A', 0, 0, 0, b'\n', 0, 0, 0]),
                 ("UTF-32BE", vec![0, 0, 0xfe, 0xff, 0, 0, 0, b'A', 0, 0, 0, b'\n']),
             ] {
-                let path = fixture.file("events.log", &bytes);
-                assert!(super::super::sniff_encoding(&bytes).is_none(), "unsupported signatures cannot be reported as UTF-16");
-                let error = super::super::expand_encoding(&path).unwrap_err();
-                assert!(error.contains(name));
-                assert!(error.contains("UTF-8 ou UTF-16"));
+                assert_eq!(super::super::sniff_encoding(&bytes).map(|encoding| encoding.name()), Some(name));
+                let path = fixture.file(&format!("{name}.log"), &bytes);
+                let converted = super::super::expand_encoding(&path).unwrap().unwrap();
+                assert_eq!(std::fs::read_to_string(converted).unwrap(), "A\n");
                 assert_eq!(std::fs::read(&path).unwrap(), bytes);
-                assert!(!root().exists(), "reject before publishing any canonical output");
             }
+            // UTF-16LE whose first character is NUL shares UTF-32LE's signature,
+            // but its code units are not plausible UTF-32 text.
             let ambiguous = [0xff, 0xfe, 0, 0, b'A', 0, b'\n', 0];
-            let path = fixture.file("utf16-leading-null.log", &ambiguous);
-            let error = super::super::expand_encoding(&path).unwrap_err();
-            assert!(error.contains("UTF-16LE com NUL inicial"));
-            assert_eq!(std::fs::read(path).unwrap(), ambiguous);
-            assert!(!root().exists());
-            // The same path can be corrected and retried without a stale output.
+            assert_eq!(super::super::sniff_encoding(&ambiguous).map(|encoding| encoding.name()), Some("UTF-16LE"));
             let text = "Falha de autenticação\r\n";
             let utf16: Vec<u8> = [0xff, 0xfe].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect();
             let path = fixture.file("events.log", &utf16);
@@ -2132,12 +2120,67 @@ mod canonical {
         }
 
         #[test]
+        fn legacy_code_pages_bom_less_utf32_and_carriage_returns() {
+            let fixture = Fixture::new();
+            // "Conexão recusada pelo usuário José" in the DOS code page of Portuguese Windows.
+            let dos = b"Conex\xc6o recusada pelo usu\xa0rio Jos\x82 \x85s 10:00\r\n".to_vec();
+            assert_eq!(super::super::sniff_encoding(&dos).map(|encoding| encoding.name()), Some("IBM850"));
+            let converted = super::super::expand_encoding(&fixture.file("dos.log", &dos)).unwrap().unwrap();
+            assert_eq!(std::fs::read_to_string(converted).unwrap(), "Conexão recusada pelo usuário José às 10:00\r\n");
+            let cyrillic = encoding_rs::WINDOWS_1251.encode("Ошибка подключения к серверу базы данных: пользователь заблокирован\n").0.into_owned();
+            assert_eq!(super::super::sniff_encoding(&cyrillic).map(|encoding| encoding.name()), Some("windows-1251"));
+            let utf32: Vec<u8> = "2026-10-12 erro\n".chars().flat_map(|c| (c as u32).to_le_bytes()).collect();
+            assert_eq!(super::super::sniff_encoding(&utf32).map(|encoding| encoding.name()), Some("UTF-32LE"));
+            let mac = b"2026-10-12 10:00:00 one\r2026-10-12 10:00:01 two\r2026-10-12 10:00:02 three\r";
+            let converted = super::super::expand_encoding(&fixture.file("mac.log", mac)).unwrap().unwrap();
+            assert_eq!(std::fs::read_to_string(converted).unwrap(), "2026-10-12 10:00:00 one\n2026-10-12 10:00:01 two\n2026-10-12 10:00:02 three\n");
+            assert!(super::super::expand_encoding(&fixture.file("plain.log", b"a\r\nb\r\n")).unwrap().is_none());
+        }
+
+        #[test]
+        fn compressed_logs_are_recognized_by_content() {
+            let fixture = Fixture::new();
+            let text = b"2026-10-12 10:00:00 INFO compressed\n";
+            let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            gzip.write_all(text).unwrap();
+            let path = fixture.file("access.log.1", &gzip.finish().unwrap());
+            let kind = super::super::compression_of(&path, "1").unwrap();
+            assert_eq!(kind, super::super::Compression::Gzip);
+            assert_eq!(std::fs::read(super::super::expand_compressed(&path, kind).unwrap()).unwrap(), text);
+            let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            bz.write_all(text).unwrap();
+            let path = fixture.file("messages-20261012", &bz.finish().unwrap());
+            let kind = super::super::compression_of(&path, "").unwrap();
+            assert_eq!(kind, super::super::Compression::Bzip2);
+            assert_eq!(std::fs::read(super::super::expand_compressed(&path, kind).unwrap()).unwrap(), text);
+            let mut xz = Vec::new();
+            lzma_rs::xz_compress(&mut &text[..], &mut xz).unwrap();
+            let path = fixture.file("syslog.2.xz", &xz);
+            let kind = super::super::compression_of(&path, "xz").unwrap();
+            assert_eq!(std::fs::read(super::super::expand_compressed(&path, kind).unwrap()).unwrap(), text);
+            assert!(super::super::compression_of(&fixture.file("plain.log", text), "log").is_none());
+        }
+
+        #[test]
+        fn folder_scans_include_rotated_and_extensionless_text_logs() {
+            let fixture = Fixture::new();
+            let rotated = fixture.file("access_log.2026-10-12", b"192.0.2.1 - - [12/Oct/2026:00:00:00 -0300] GET / HTTP/1.1 200 1\n");
+            let plain = fixture.file("messages", b"Oct 12 00:00:00 host app: ok\n");
+            let binary = fixture.file("image.dat", &[0u8, 1, 2, 3, 0, 255]);
+            for ext in ["2026-10-12", "20261012", "1", "log", "xz", "old"] {
+                assert!(super::super::log_extension(ext), "{ext}");
+            }
+            assert!(!super::super::log_extension("dat"));
+            assert!(super::super::looks_like_log_content(&rotated) && super::super::looks_like_log_content(&plain));
+            assert!(!super::super::looks_like_log_content(&binary));
+        }
+
+        #[test]
         fn supported_encoding_signatures_keep_the_existing_detection() {
             assert_eq!(super::super::sniff_encoding(&[0xff, 0xfe, b'A', 0]).map(|encoding| encoding.name()), Some("UTF-16LE"));
             assert_eq!(super::super::sniff_encoding(&[0xfe, 0xff, 0, b'A']).map(|encoding| encoding.name()), Some("UTF-16BE"));
             assert!(super::super::sniff_encoding("\u{feff}ação\n".as_bytes()).is_none());
             assert_eq!(super::super::sniff_encoding(b"a\xe7\xe3o\n").map(|encoding| encoding.name()), Some("windows-1252"));
-            assert_eq!(super::super::unsupported_encoding_bom(&[0xff, 0xfe]), None);
         }
 
         #[cfg(unix)]
@@ -2485,6 +2528,51 @@ pub fn archive_kind(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Extensions of logs, their rotations (`.1`, `.2026-10-12`, `.20261012`,
+/// `.old`) and of compressed, XML, EVTX and spreadsheet logs.
+fn log_extension(ext: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "log", "logs", "txt", "text", "jsonl", "ndjson", "json", "csv", "tsv", "psv", "evtx", "gz", "bz2", "xz", "zst",
+        "zstd", "xml", "out", "err", "audit", "trace", "trc", "syslog", "messages", "old", "bak", "w3c", "cef", "leef",
+        "xlsx", "xlsm", "xlsb", "xls", "ods",
+    ];
+    KNOWN.contains(&ext)
+        || ext.parse::<u32>().is_ok()
+        || (ext.bytes().filter(u8::is_ascii_digit).count() >= 6 && ext.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'_')))
+}
+
+/// Extensions that are never logs, so folder scans skip them without reading.
+fn binary_extension(ext: &str) -> bool {
+    const BINARY: &[&str] = &[
+        "exe", "dll", "so", "dylib", "bin", "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svg", "pdf", "doc", "docx",
+        "ppt", "pptx", "mp3", "mp4", "avi", "mkv", "mov", "wav", "iso", "img", "msi", "jar", "class", "pyc", "db", "sqlite",
+        "lnk", "ttf", "otf", "woff", "woff2", "7z", "rar", "pcap", "pcapng", "dmp", "vhd", "vhdx", "vmdk",
+    ];
+    BINARY.contains(&ext)
+}
+
+/// Files without a log extension (rotations such as `access_log.2026-10-12`,
+/// files without extension) count when their first bytes are text or a
+/// compressed stream.
+fn looks_like_log_content(path: &Path) -> bool {
+    let mut head = [0u8; 8192];
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let Ok(count) = file.read(&mut head) else { return false };
+    let head = &head[..count];
+    if head.is_empty() {
+        return false;
+    }
+    if compression_of(path, "").is_some() || sniff_encoding(head).is_some_and(|e| e.name().starts_with("UTF-")) {
+        return true;
+    }
+    if head.contains(&0) {
+        return false;
+    }
+    let text = sources::decode_text(head);
+    let printable = text.chars().filter(|c| !c.is_control() || c.is_ascii_whitespace()).count();
+    printable * 100 >= text.chars().count() * 95
+}
+
 /// Member paths that look like logs (text, compressed logs, EVTX, spreadsheets).
 fn loggable_member(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -2493,10 +2581,7 @@ fn loggable_member(name: &str) -> bool {
         return false;
     }
     let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    ["log", "txt", "jsonl", "ndjson", "json", "csv", "tsv", "evtx", "gz", "out", "err", "audit", "xlsx", "xlsm", "xlsb", "xls", "ods"]
-        .contains(&ext)
-        || ext.is_empty()
-        || ext.parse::<u32>().is_ok()
+    log_extension(ext) || ext.is_empty()
 }
 
 /// Relative path without traversal, absolute roots or drive letters.
@@ -2654,29 +2739,198 @@ pub fn expand_gzip(path: &Path) -> Result<PathBuf, String> {
     })
 }
 
-fn unsupported_encoding_bom(sample: &[u8]) -> Option<&'static str> {
-    // Check the longest signatures first: UTF-32LE shares UTF-16LE's prefix.
-    // UTF-16LE followed by an initial NUL is ambiguous and is declined too.
-    if sample.starts_with(&[0xFF, 0xFE, 0, 0]) { Some("UTF-32LE") }
-    else if sample.starts_with(&[0, 0, 0xFE, 0xFF]) { Some("UTF-32BE") }
-    else { None }
+/// Compressions recognized by their first bytes, whatever the file name:
+/// rotated logs are often called `access.log.1` or `messages-20261012`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compression {
+    Gzip,
+    Bzip2,
+    Xz,
+    Zstd,
 }
 
-/// Text logs written by Windows tools in UTF-16 (PowerShell, Event Viewer
-/// exports) or in a legacy code page, recognized from a sample; UTF-8 and
-/// binary files return None. Import separately rejects unsupported BOMs.
-pub fn sniff_encoding(sample: &[u8]) -> Option<&'static encoding_rs::Encoding> {
-    if unsupported_encoding_bom(sample).is_some() { return None; }
-    if sample.starts_with(&[0xFF, 0xFE]) {
-        return Some(encoding_rs::UTF_16LE);
+pub fn compression_of(path: &Path, _extension: &str) -> Option<Compression> {
+    let mut head = [0u8; 6];
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut read = 0;
+    while read < head.len() {
+        match file.read(&mut head[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(_) => return None,
+        }
     }
-    if sample.starts_with(&[0xFE, 0xFF]) {
-        return Some(encoding_rs::UTF_16BE);
+    let head = &head[..read];
+    if head.starts_with(&[0x1f, 0x8b]) {
+        Some(Compression::Gzip)
+    } else if head.len() >= 4 && head.starts_with(b"BZh") && (b'1'..=b'9').contains(&head[3]) {
+        Some(Compression::Bzip2)
+    } else if head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {
+        Some(Compression::Xz)
+    } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Some(Compression::Zstd)
+    } else {
+        None
     }
-    if sample.starts_with(&[0xEF, 0xBB, 0xBF]) {
+}
+
+/// Copies a decoder into the canonical output, honoring cancellation.
+fn copy_cancellable(mut input: impl Read, out: &mut dyn Write) -> Result<(), String> {
+    let mut buffer = [0u8; 65536];
+    loop {
+        crate::operations::check()?;
+        let count = input.read(&mut buffer).map_err(|e| format!("Falha ao descompactar: {e}"))?;
+        if count == 0 {
+            return Ok(());
+        }
+        out.write_all(&buffer[..count]).map_err(|e| e.to_string())?;
+    }
+}
+
+/// Writer that stops a decoder without a cancellable read loop (xz).
+struct CancellableWriter<'a> {
+    inner: &'a mut dyn Write,
+    written: usize,
+}
+
+impl Write for CancellableWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written += buf.len();
+        if self.written >= 1 << 20 {
+            self.written = 0;
+            crate::operations::check().map_err(std::io::Error::other)?;
+        }
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub fn expand_compressed(path: &Path, kind: Compression) -> Result<PathBuf, String> {
+    let converter = match kind {
+        Compression::Gzip => return expand_gzip(path),
+        Compression::Bzip2 => "bzip2-v1",
+        Compression::Xz => "xz-v1",
+        Compression::Zstd => "zstd-v1",
+    };
+    let input = CanonicalInput::open(path)?;
+    canonical_file(input, converter, None, |input, out| {
+        let reader = std::io::BufReader::new(input.reader()?);
+        match kind {
+            Compression::Bzip2 => copy_cancellable(bzip2::read::MultiBzDecoder::new(reader), out),
+            Compression::Zstd => {
+                let decoder = ruzstd::decoding::StreamingDecoder::new(reader).map_err(|e| format!("zstd inválido: {e}"))?;
+                copy_cancellable(decoder, out)
+            }
+            Compression::Xz => {
+                let mut reader = reader;
+                let mut writer = CancellableWriter { inner: out, written: 0 };
+                lzma_rs::xz_decompress(&mut reader, &mut writer).map_err(|e| {
+                    crate::operations::check().err().unwrap_or_else(|| format!("xz inválido: {e}"))
+                })
+            }
+            Compression::Gzip => unreachable!("gzip uses its own converter"),
+        }
+    })
+}
+
+/// How a text log is written, when it is not UTF-8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextEncoding {
+    Standard(&'static encoding_rs::Encoding),
+    Utf32Le,
+    Utf32Be,
+    /// DOS Latin-1 (IBM850), the OEM code page of Portuguese and Western
+    /// European Windows consoles: output redirected from `cmd`.
+    Cp850,
+}
+
+impl TextEncoding {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TextEncoding::Standard(encoding) => encoding.name(),
+            TextEncoding::Utf32Le => "UTF-32LE",
+            TextEncoding::Utf32Be => "UTF-32BE",
+            TextEncoding::Cp850 => "IBM850",
+        }
+    }
+}
+
+const CP850_HIGH: [char; 128] = [
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å',
+    'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', 'ø', '£', 'Ø', '×', 'ƒ',
+    'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '®', '¬', '½', '¼', '¡', '«', '»',
+    '░', '▒', '▓', '│', '┤', 'Á', 'Â', 'À', '©', '╣', '║', '╗', '╝', '¢', '¥', '┐',
+    '└', '┴', '┬', '├', '─', '┼', 'ã', 'Ã', '╚', '╔', '╩', '╦', '╠', '═', '╬', '¤',
+    'ð', 'Ð', 'Ê', 'Ë', 'È', 'ı', 'Í', 'Î', 'Ï', '┘', '┌', '█', '▄', '¦', 'Ì', '▀',
+    'Ó', 'ß', 'Ô', 'Ò', 'õ', 'Õ', 'µ', 'þ', 'Þ', 'Ú', 'Û', 'Ù', 'ý', 'Ý', '¯', '´',
+    '\u{ad}', '±', '‗', '¾', '¶', '§', '÷', '¸', '°', '¨', '·', '¹', '³', '²', '■', '\u{a0}',
+];
+
+/// Accented letters of Portuguese/Spanish text next to ASCII letters, counted
+/// as DOS (CP850) and as Windows-1252 bytes: the code page whose letters fall
+/// inside words is the one the text was written in.
+fn dos_code_page(sample: &[u8]) -> bool {
+    const DOS: &[u8] = &[0x87, 0xc6, 0xe4, 0xa0, 0x82, 0xa1, 0xa2, 0xa3, 0x88, 0x83, 0x93, 0x85, 0x80, 0x90, 0xb5, 0xc7, 0xe5, 0xa4, 0x81];
+    const WINDOWS: &[u8] = &[0xe7, 0xe3, 0xf5, 0xe1, 0xe9, 0xed, 0xf3, 0xfa, 0xea, 0xe2, 0xf4, 0xe0, 0xc7, 0xc9, 0xc1, 0xc3, 0xd5, 0xf1, 0xfc];
+    let (mut dos, mut windows) = (0usize, 0usize);
+    for (i, &byte) in sample.iter().enumerate() {
+        if byte < 0x80 {
+            continue;
+        }
+        let inside_word = (i > 0 && sample[i - 1].is_ascii_alphabetic()) || sample.get(i + 1).is_some_and(u8::is_ascii_alphabetic);
+        if inside_word {
+            dos += usize::from(DOS.contains(&byte));
+            windows += usize::from(WINDOWS.contains(&byte));
+        }
+    }
+    dos >= 3 && dos > windows * 2
+}
+
+/// UTF-32 code units that are real characters, mostly ASCII as logs are.
+fn plausible_utf32(body: &[u8], little: bool) -> bool {
+    let units: Vec<u32> = body
+        .chunks_exact(4)
+        .take(4096)
+        .map(|c| if little { u32::from_le_bytes([c[0], c[1], c[2], c[3]]) } else { u32::from_be_bytes([c[0], c[1], c[2], c[3]]) })
+        .collect();
+    !units.is_empty()
+        && units.iter().all(|&u| char::from_u32(u).is_some())
+        && units.iter().filter(|&&u| u < 0x80).count() * 2 >= units.len()
+}
+
+/// Text logs written in UTF-16 or UTF-32 (with or without a byte order mark),
+/// in a legacy code page (Windows-125x, ISO-8859-x, CP850, Shift_JIS, GBK...)
+/// or UTF-8. UTF-8 and binary files return None. A file mixing valid UTF-8
+/// with stray legacy bytes stays as it is: each line is repaired as it is read.
+pub fn sniff_encoding(sample: &[u8]) -> Option<TextEncoding> {
+    if sample.starts_with(&[0xff, 0xfe, 0, 0]) && plausible_utf32(&sample[4..], true) {
+        return Some(TextEncoding::Utf32Le);
+    }
+    if sample.starts_with(&[0, 0, 0xfe, 0xff]) {
+        return Some(TextEncoding::Utf32Be);
+    }
+    if sample.starts_with(&[0xff, 0xfe]) {
+        return Some(TextEncoding::Standard(encoding_rs::UTF_16LE));
+    }
+    if sample.starts_with(&[0xfe, 0xff]) {
+        return Some(TextEncoding::Standard(encoding_rs::UTF_16BE));
+    }
+    if sample.starts_with(&[0xef, 0xbb, 0xbf]) {
         return None;
     }
-    // UTF-16 without a byte order mark: ASCII text has a zero in every other byte.
+    // Without a byte order mark: ASCII text has zeros in fixed positions.
+    let quads = sample.len() / 4;
+    if quads >= 8 {
+        let zeros = |positions: [usize; 3]| sample.chunks_exact(4).filter(|q| positions.iter().all(|&p| q[p] == 0)).count();
+        if zeros([1, 2, 3]) * 10 >= quads * 9 && plausible_utf32(sample, true) {
+            return Some(TextEncoding::Utf32Le);
+        }
+        if zeros([0, 1, 2]) * 10 >= quads * 9 && plausible_utf32(sample, false) {
+            return Some(TextEncoding::Utf32Be);
+        }
+    }
     let pairs = sample.len() / 2;
     if pairs >= 16 {
         let (mut even, mut odd) = (0usize, 0usize);
@@ -2685,10 +2939,10 @@ pub fn sniff_encoding(sample: &[u8]) -> Option<&'static encoding_rs::Encoding> {
             odd += usize::from(pair[1] == 0);
         }
         if odd * 10 >= pairs * 4 && even * 10 < pairs {
-            return Some(encoding_rs::UTF_16LE);
+            return Some(TextEncoding::Standard(encoding_rs::UTF_16LE));
         }
         if even * 10 >= pairs * 4 && odd * 10 < pairs {
-            return Some(encoding_rs::UTF_16BE);
+            return Some(TextEncoding::Standard(encoding_rs::UTF_16BE));
         }
     }
     if sample.contains(&0) {
@@ -2721,41 +2975,156 @@ pub fn sniff_encoding(sample: &[u8]) -> Option<&'static encoding_rs::Encoding> {
             }
         }
     }
-    invalid.then_some(encoding_rs::WINDOWS_1252)
+    if !invalid {
+        return None;
+    }
+    if dos_code_page(sample) {
+        return Some(TextEncoding::Cp850);
+    }
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+    detector.feed(sample, true);
+    let guess = detector.guess(None, chardetng::Utf8Detection::Allow);
+    if guess == encoding_rs::UTF_8 {
+        return Some(TextEncoding::Standard(encoding_rs::WINDOWS_1252));
+    }
+    Some(TextEncoding::Standard(guess))
 }
 
-/// Converts a UTF-16 or legacy code page text file to UTF-8 once; `None` when
-/// the file is read as it is.
+/// Records separated only by carriage returns (classic Mac OS, some network
+/// devices): each lone CR becomes a line break.
+fn cr_only(text: &str) -> bool {
+    let lone = text.as_bytes().windows(2).filter(|w| w[0] == b'\r' && w[1] != b'\n').count() + usize::from(text.ends_with('\r'));
+    let lf = text.bytes().filter(|&b| b == b'\n').count();
+    lone >= 2 && lone > lf * 10
+}
+
+/// Decodes one chunk of a non-standard encoding; returns the bytes consumed.
+fn decode_custom(encoding: TextEncoding, input: &[u8], text: &mut String) -> usize {
+    match encoding {
+        TextEncoding::Cp850 => {
+            for &byte in input {
+                text.push(if byte < 0x80 { byte as char } else { CP850_HIGH[usize::from(byte - 0x80)] });
+            }
+            input.len()
+        }
+        TextEncoding::Utf32Le | TextEncoding::Utf32Be => {
+            let whole = input.len() / 4 * 4;
+            for unit in input[..whole].chunks_exact(4) {
+                let value = if encoding == TextEncoding::Utf32Le {
+                    u32::from_le_bytes([unit[0], unit[1], unit[2], unit[3]])
+                } else {
+                    u32::from_be_bytes([unit[0], unit[1], unit[2], unit[3]])
+                };
+                text.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+            }
+            whole
+        }
+        TextEncoding::Standard(_) => 0,
+    }
+}
+
+/// Converts a UTF-16/UTF-32, legacy code page or CR-only text file to UTF-8
+/// with line feeds once; `None` when the file is read as it is.
 pub fn expand_encoding(path: &Path) -> Result<Option<PathBuf>, String> {
     let input = CanonicalInput::open(path)?;
     let mut sample = Vec::new();
     input.reader()?.take(1 << 20).read_to_end(&mut sample).map_err(|e| e.to_string())?;
-    if let Some(encoding) = unsupported_encoding_bom(&sample) {
-        let ambiguity = if encoding == "UTF-32LE" { " Também pode ser UTF-16LE com NUL inicial; a leitura automática é ambígua." } else { "" };
-        return Err(format!("A assinatura do arquivo é compatível com {encoding}, que ainda não é suportado.{ambiguity} Converta uma cópia para UTF-8 ou UTF-16 e tente novamente. O arquivo original não foi alterado."));
+    let encoding = sniff_encoding(&sample);
+    let preview = match encoding {
+        Some(TextEncoding::Standard(e)) => e.decode(&sample).0.into_owned(),
+        Some(other) => {
+            let mut text = String::new();
+            let skip = if matches!(other, TextEncoding::Utf32Le | TextEncoding::Utf32Be) && sample.len() >= 4 && (sample.starts_with(&[0xff, 0xfe, 0, 0]) || sample.starts_with(&[0, 0, 0xfe, 0xff])) { 4 } else { 0 };
+            decode_custom(other, &sample[skip..], &mut text);
+            text
+        }
+        None => String::from_utf8_lossy(&sample).into_owned(),
+    };
+    let newlines = cr_only(&preview);
+    if encoding.is_none() && !newlines {
+        return Ok(None);
     }
-    let Some(encoding) = sniff_encoding(&sample) else { return Ok(None) };
-    let legacy = input.legacy_source().map(|(path, id)| crate::config_dir().join("expanded").join(format!(
+    let name = encoding.map_or("UTF-8", |e| e.name());
+    let legacy = (!newlines && matches!(encoding, Some(TextEncoding::Standard(_)))).then(|| input.legacy_source()).flatten().map(|(path, id)| crate::config_dir().join("expanded").join(format!(
         "{}-utf8-{}", &id[..16], path.file_name().unwrap_or_default().to_string_lossy()
     )));
-    canonical_file(input, &format!("utf8-v1-{}", encoding.name()), legacy, |input, out| {
+    let converter = if newlines { format!("utf8-v1-{name}-cr") } else { format!("utf8-v1-{name}") };
+    canonical_file(input, &converter, legacy, |input, out| {
         let mut reader = input.reader()?;
-        let mut decoder = encoding.new_decoder_with_bom_removal();
+        let mut standard = match encoding {
+            Some(TextEncoding::Standard(e)) => Some(e.new_decoder_with_bom_removal()),
+            None => Some(encoding_rs::UTF_8.new_decoder_with_bom_removal()),
+            Some(_) => None,
+        };
         let mut buffer = [0u8; 65536];
+        let mut carry: Vec<u8> = Vec::new();
         let mut text = String::with_capacity(1 << 18);
+        let mut pending_cr = false;
+        let mut first = true;
+        let mut emit = |text: &mut String, out: &mut dyn Write, last: bool| -> Result<(), String> {
+            if newlines {
+                let mut fixed = String::with_capacity(text.len() + 8);
+                for c in text.chars() {
+                    if pending_cr {
+                        pending_cr = false;
+                        if c == '\n' {
+                            fixed.push_str("\r\n");
+                            continue;
+                        }
+                        fixed.push('\n');
+                    }
+                    if c == '\r' {
+                        pending_cr = true;
+                    } else {
+                        fixed.push(c);
+                    }
+                }
+                if last && pending_cr {
+                    fixed.push('\n');
+                }
+                out.write_all(fixed.as_bytes()).map_err(|e| e.to_string())?;
+            } else {
+                out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            text.clear();
+            Ok(())
+        };
         loop {
             crate::operations::check()?;
             let count = reader.read(&mut buffer).map_err(|e| e.to_string())?;
             let last = count == 0;
-            let mut remaining = &buffer[..count];
-            loop {
-                let (result, read, _) = decoder.decode_to_string(remaining, &mut text, last);
-                remaining = &remaining[read..];
-                out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-                text.clear();
-                if result == encoding_rs::CoderResult::InputEmpty { break; }
+            match (&mut standard, encoding) {
+                (Some(decoder), _) => {
+                    let mut remaining = &buffer[..count];
+                    loop {
+                        let (result, read, _) = decoder.decode_to_string(remaining, &mut text, last);
+                        remaining = &remaining[read..];
+                        emit(&mut text, out, last && remaining.is_empty())?;
+                        if result == encoding_rs::CoderResult::InputEmpty {
+                            break;
+                        }
+                    }
+                }
+                (None, Some(custom)) => {
+                    carry.extend_from_slice(&buffer[..count]);
+                    if first && (carry.len() >= 4 || last) {
+                        first = false;
+                        let utf32 = matches!(custom, TextEncoding::Utf32Le | TextEncoding::Utf32Be);
+                        if utf32 && (carry.starts_with(&[0xff, 0xfe, 0, 0]) || carry.starts_with(&[0, 0, 0xfe, 0xff])) {
+                            carry.drain(..4);
+                        }
+                    }
+                    if !first {
+                        let used = decode_custom(custom, &carry, &mut text);
+                        carry.drain(..used);
+                        emit(&mut text, out, last)?;
+                    }
+                }
+                (None, None) => unreachable!("UTF-8 uses the standard decoder"),
             }
-            if last { break; }
+            if last {
+                break;
+            }
         }
         Ok(())
     }).map(Some)

@@ -153,7 +153,7 @@ pub fn analysis_impl(
     case_events: Option<&[Event]>,
     force: bool,
 ) -> Result<Arc<serde_json::Value>, String> {
-    Ok(Arc::new(stored_analysis(state, case_events, force)?.page(1, 0, 500, None, None)?))
+    Ok(Arc::new(stored_analysis(state, case_events, force)?.page(1, 0, 500, None, None, None)?))
 }
 
 /// Filtering selects related findings after the full universe has been correlated.
@@ -167,8 +167,9 @@ pub fn triage_page(
     offset: usize,
     limit: usize,
     tactic: Option<&str>,
+    theme: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    triage_page_mode(state, filters, case, force, minimum, offset, limit, tactic, false)
+    triage_page_mode(state, filters, case, force, minimum, offset, limit, tactic, theme, false)
 }
 
 fn triage_page_mode(
@@ -180,6 +181,7 @@ fn triage_page_mode(
     offset: usize,
     limit: usize,
     tactic: Option<&str>,
+    theme: Option<&str>,
     cache_only: bool,
 ) -> Result<serde_json::Value, String> {
     if !(1..=5).contains(&minimum) {
@@ -188,17 +190,17 @@ fn triage_page_mode(
     workspace::validate(&filters)?;
     let full = stored_analysis_mode(state, case, force, cache_only)?;
     if filters.is_empty() {
-        return full.page(minimum, offset, limit, None, tactic);
+        return full.page(minimum, offset, limit, None, tactic, theme);
     }
     match case {
         Some(events) => {
             let prepared = query::prepare(&filters);
             let mut ids = events.iter().filter(|e| prepared.iter().all(|f| query::matches(e, f))).map(|e| e.id);
-            full.page(minimum, offset, limit, Some(&mut ids), tactic)
+            full.page(minimum, offset, limit, Some(&mut ids), tactic, theme)
         }
         None => workspace::with_selection(state, &filters, |selection| {
             let mut ids = selection.iter().map(|e| e.id);
-            full.page(minimum, offset, limit, Some(&mut ids), tactic)
+            full.page(minimum, offset, limit, Some(&mut ids), tactic, theme)
         })?,
     }
 }
@@ -438,6 +440,7 @@ pub async fn triage(
     episode_offset: Option<usize>,
     episode_limit: Option<usize>,
     tactic: Option<String>,
+    theme: Option<String>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     let (admitted, case_events) = crate::analysis_runtime::capture_case_async(app.clone(), analysis_context, source_generation, case_events, case_key, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
@@ -453,6 +456,7 @@ pub async fn triage(
             episode_offset.unwrap_or(0),
             episode_limit.unwrap_or(20),
             tactic.as_deref(),
+            theme.as_deref(),
             cache_only.unwrap_or(false),
         )
     })

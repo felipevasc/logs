@@ -41,7 +41,7 @@ mod tests {
         assert_eq!(first.total, 2); assert_eq!(first.completed, 0); assert!(first.reset);
         let last = receipts.iter().rev().find_map(|r| r.triage.as_ref()).unwrap();
         assert_eq!(last.completed, 2); assert_eq!(last.total, 2); assert_eq!(last.findings, 1);
-        assert_eq!(last.findings, result.page(1, 0, 20, None, None).unwrap()["detections"].as_array().unwrap().len());
+        assert_eq!(last.findings, result.page(1, 0, 20, None, None, None).unwrap()["detections"].as_array().unwrap().len());
         assert!(last.items.iter().all(|item| item.state == "completed"));
         assert!(last.items.iter().any(|item| item.id == "none" && item.findings == 0));
         assert!(!last.items.iter().any(|item| item.id == "off"));

@@ -61,7 +61,7 @@ fn v013_dense_finding_keeps_every_member_behind_bounded_pages_and_exact_filter()
     let expected = detections::run(&inputs, &source).unwrap();
     assert_eq!(expected.detections.len(), 1);
     let stored = detections::run_stored(&inputs, &source).unwrap();
-    let page = stored.page(1, 0, 20, None, None).unwrap();
+    let page = stored.page(1, 0, 20, None, None, None).unwrap();
     let finding = &page["detections"][0];
     assert_eq!(finding["id"], expected.detections[0].id);
     assert_eq!(finding["count"], 350);
@@ -1307,7 +1307,7 @@ fn security_disk_pages_preserve_levels_members_and_universe() {
     };
     let in_memory = detections::run(&inputs, &Source::Events(events.iter().collect())).unwrap();
     let stored = detections::run_stored(&inputs, &Source::Events(events.iter().collect())).unwrap();
-    let page = stored.page(1, 0, 1, None, None).unwrap();
+    let page = stored.page(1, 0, 1, None, None, None).unwrap();
     assert_eq!(page["counts_by_level"], json!(in_memory.counts_by_level));
     assert_eq!(page["analysis_id"], in_memory.analysis_id);
     for d in page["detections"].as_array().unwrap() {
@@ -1336,7 +1336,7 @@ fn security_disk_pages_preserve_levels_members_and_universe() {
         page["episodes"][0]["detection_count"].as_u64().unwrap() as usize
     );
     let mut related = std::iter::once(events[1].id);
-    let narrow = stored.page(5, 0, 1, Some(&mut related), None).unwrap();
+    let narrow = stored.page(5, 0, 1, Some(&mut related), None, None).unwrap();
     assert_eq!(narrow["analysis_id"], page["analysis_id"]);
     assert_eq!(narrow["episodes"][0]["id"], page["episodes"][0]["id"]);
 }
@@ -1380,7 +1380,7 @@ fn security_pattern_groups_preserve_all_occurrences_before_paging() {
         && d.evidence.evidence_level == 4
         && d.evidence.outcome == "blocked"));
     let disk = detections::run_stored(&inputs, &Source::Events(events.iter().collect())).unwrap();
-    let page = disk.page(4, 0, 1, None, None).unwrap();
+    let page = disk.page(4, 0, 1, None, None, None).unwrap();
     assert_eq!(page["page"]["total_episodes"], 1);
     assert!(page["page"]["next_offset"].is_null());
     assert_eq!(page["episodes"][0]["id"], group.id);
@@ -1398,15 +1398,15 @@ fn security_pattern_groups_preserve_all_occurrences_before_paging() {
     assert_eq!(page["counts_by_level"], json!(memory.counts_by_level));
     assert_eq!(page["visible_detections"], 205);
     assert_eq!(
-        disk.page(5, 0, 1, None, None).unwrap()["page"]["total_episodes"],
+        disk.page(5, 0, 1, None, None, None).unwrap()["page"]["total_episodes"],
         0
     );
     assert_eq!(
-        disk.page(1, 0, 1, None, None).unwrap()["episodes"][0]["id"],
+        disk.page(1, 0, 1, None, None, None).unwrap()["episodes"][0]["id"],
         group.id
     );
     let mut ids = std::iter::once(204);
-    let filtered = disk.page(4, 0, 1, Some(&mut ids), None).unwrap();
+    let filtered = disk.page(4, 0, 1, Some(&mut ids), None, None).unwrap();
     assert_eq!(filtered["visible_detections"], 1);
     assert_eq!(filtered["episodes"][0]["id"], group.id);
     assert_eq!(filtered["episodes"][0]["record_count"], 205);
@@ -1571,7 +1571,7 @@ fn security_pattern_groups_keep_individual_levels_with_multiple_rules_per_event(
         catalog: None,
     };
     let disk = detections::run_stored(&inputs, &Source::Events(events.iter().collect())).unwrap();
-    let page = disk.page(5, 0, 20, None, None).unwrap();
+    let page = disk.page(5, 0, 20, None, None, None).unwrap();
     assert_eq!(page["episodes"].as_array().unwrap().len(), 1);
     assert_eq!(page["episodes"][0]["id"], group.id);
     assert_eq!(page["episodes"][0]["record_count"], 3);
@@ -1638,12 +1638,12 @@ fn security_large_episode_filter_keeps_visible_witness_and_all_members() {
     }
     let stored = writer.finish(meta).unwrap();
     let mut ids = std::iter::once(205);
-    let page = stored.page(1, 0, 20, Some(&mut ids), None).unwrap();
+    let page = stored.page(1, 0, 20, Some(&mut ids), None, None).unwrap();
     assert_eq!(page["visible_detections"], 1);
     assert_eq!(page["detections"][0]["id"], "finding-204");
     assert_eq!(page["detections"][0]["context_only"], false);
     assert_eq!(page["episodes"][0]["members_complete"], false);
-    let first = stored.page(5, 0, 20, None, None).unwrap();
+    let first = stored.page(5, 0, 20, None, None, None).unwrap();
     assert!(!first["detections"]
         .as_array()
         .unwrap()
@@ -1689,7 +1689,7 @@ fn security_large_episode_filter_keeps_visible_witness_and_all_members() {
     );
     let mut ids = std::iter::once(205);
     assert_eq!(
-        stored.page(5, 0, 20, Some(&mut ids), None).unwrap()["visible_detections"],
+        stored.page(5, 0, 20, Some(&mut ids), None, None).unwrap()["visible_detections"],
         0
     );
 }
@@ -1728,8 +1728,8 @@ fn benchmark_security_result_store() {
     let result = writer.finish(meta).unwrap();
     drop(working);
     let analysis_ms = start.elapsed().as_millis();
-    let first = result.page(5, 0, 20, None, None).unwrap();
-    let last = result.page(5, count - 1, 20, None, None).unwrap();
+    let first = result.page(5, 0, 20, None, None, None).unwrap();
+    let last = result.page(5, count - 1, 20, None, None, None).unwrap();
     assert_eq!(first["visible_detections"], count);
     assert_eq!(last["detections"].as_array().unwrap().len(), 1);
     assert_eq!(

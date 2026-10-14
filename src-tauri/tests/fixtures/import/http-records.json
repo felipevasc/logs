@@ -302,94 +302,107 @@
     ]
   },
   {
-    "name": "prose_is_not_logfmt",
+    "name": "prose_pairs_become_fields",
     "line": "something happened a=1 b=2 c=3",
-    "parse_status": "unparsed",
-    "fields": {},
+    "fields": {
+      "a": "1",
+      "b": "2",
+      "c": "3"
+    },
     "absent": [
       "method",
-      "client_ip",
-      "a",
-      "b",
-      "c"
-    ]
+      "client_ip"
+    ],
+    "expected": {
+      "message": "something happened a=1 b=2 c=3"
+    }
   },
   {
     "name": "unclosed_request",
     "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1 200 1",
-    "parse_status": "unparsed",
-    "fields": {},
+    "fields": {
+      "method": "GET",
+      "path": "/",
+      "status": "200",
+      "client_ip": "203.0.113.10"
+    },
     "absent": [
-      "method",
-      "client_ip",
-      "a",
-      "b",
-      "c"
-    ]
+      "referer",
+      "agent"
+    ],
+    "expected": {
+      "code": "200",
+      "level": "Informação"
+    }
   },
   {
     "name": "invalid_date",
     "line": "203.0.113.10 - - [99/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1\" 200 1",
-    "parse_status": "unparsed",
-    "fields": {},
+    "fields": {
+      "method": "GET",
+      "status": "200",
+      "client_ip": "203.0.113.10"
+    },
     "absent": [
-      "method",
-      "client_ip",
-      "a",
-      "b",
-      "c"
-    ]
+      "time_local"
+    ],
+    "expected": {
+      "timestamp": null
+    }
   },
   {
     "name": "invalid_bytes",
     "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1\" 200 invalid",
-    "parse_status": "unparsed",
-    "fields": {},
+    "fields": {
+      "method": "GET",
+      "access.extra": "invalid",
+      "access.extra.1": "invalid",
+      "parser.format": "access.common"
+    },
     "absent": [
-      "method",
-      "client_ip",
-      "a",
-      "b",
-      "c"
-    ]
+      "size"
+    ],
+    "expected": {
+      "code": "200"
+    }
   },
   {
     "name": "invalid_status",
     "line": "203.0.113.10 - - [02/Oct/2026:10:20:30 -0300] \"GET / HTTP/1.1\" 20x 1",
-    "parse_status": "unparsed",
-    "fields": {},
+    "fields": {
+      "method": "GET",
+      "path": "/",
+      "client_ip": "203.0.113.10"
+    },
     "absent": [
-      "method",
-      "client_ip",
-      "a",
-      "b",
-      "c"
+      "status",
+      "time_local"
     ]
   },
   {
     "name": "unclosed_logfmt",
     "line": "level=info msg=\"not finished",
-    "parse_status": "unparsed",
-    "fields": {},
+    "fields": {
+      "level": "info",
+      "msg": "not finished"
+    },
     "absent": [
       "method",
-      "client_ip",
-      "a",
-      "b",
-      "c"
-    ]
+      "client_ip"
+    ],
+    "expected": {
+      "level": "Informação"
+    }
   },
   {
     "name": "single_expression",
     "line": "token=abc",
-    "parse_status": "unparsed",
-    "fields": {},
+    "fields": {
+      "token": "abc"
+    },
     "absent": [
       "method",
-      "client_ip",
-      "a",
-      "b",
-      "c"
+      "client_ip"
     ]
   }
 ]

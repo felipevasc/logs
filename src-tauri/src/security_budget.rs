@@ -8,7 +8,24 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
-const LIMIT: u64 = 256 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
+const MIN_LIMIT: u64 = 256 * MIB;
+/// Working memory of an analysis above the loaded data: half of the
+/// application's memory budget (a third of the RAM unless configured in
+/// Recursos or `LOGINSIGHT_MEMORY_LIMIT_MB`), never less than 256 MiB.
+pub fn limit() -> u64 {
+    (crate::resources::effective_bytes() / 2).max(MIN_LIMIT)
+}
+/// DuckDB memory of the analysis population: half of the working budget,
+/// within the per-instance DuckDB budget. More memory means fewer spills to
+/// disk and no out-of-memory failure on window functions and medians.
+pub fn duckdb_mib() -> u64 {
+    (limit() / 2 / MIB).min(crate::resources::duckdb_memory_mb()).max(64)
+}
+/// SQLite page cache of the result stores, in KiB (2 MiB to 256 MiB).
+fn sqlite_cache_kib() -> u64 {
+    (limit() / 32 / 1024).clamp(2048, 262_144)
+}
 static LANE: Mutex<()> = Mutex::new(());
 static DISK: Mutex<BTreeMap<u64, (PathBuf, bool)>> = Mutex::new(BTreeMap::new());
 static DISK_NEXT: AtomicU64 = AtomicU64::new(1);
@@ -32,8 +49,9 @@ fn supervise(s: &Supervisor) -> Result<(), String> {
     }
     let used = memory_bytes();
     s.peak.fetch_max(used, Ordering::Relaxed);
-    let result = if used > s.baseline.saturating_add(LIMIT) {
-        Err(format!("Orçamento global de trabalho de 256 MiB excedido em {} (pico {} bytes; base {} bytes). Análise cancelada sem publicar resultados parciais.",*s.phase.lock(),s.peak.load(Ordering::Relaxed),s.baseline))
+    let limit = limit();
+    let result = if used > s.baseline.saturating_add(limit) {
+        Err(format!("Orçamento global de trabalho de {} MiB excedido em {} (pico {} bytes; base {} bytes). Análise cancelada sem publicar resultados parciais. O orçamento acompanha o limite de memória em Recursos.", limit / MIB, *s.phase.lock(),s.peak.load(Ordering::Relaxed),s.baseline))
     } else {
         check_disk()
     };
@@ -183,7 +201,8 @@ impl TrackedConnection {
         let actual = file.as_deref().unwrap_or(path);
         let db = rusqlite::Connection::open(actual)?;
         db.execute_batch(&format!(
-            "PRAGMA cache_size=-2048;PRAGMA mmap_size=0;PRAGMA max_page_count={};",
+            "PRAGMA cache_size=-{};PRAGMA mmap_size=0;PRAGMA max_page_count={};",
+            sqlite_cache_kib(),
             disk_limit() / 4096
         ))?;
         db.progress_handler(
@@ -289,7 +308,7 @@ pub fn check_now() -> Result<(), String> {
     }
 }
 pub fn snapshot() -> serde_json::Value {
-    STATE.with(|s|{let mut s=s.borrow_mut();s.peak=s.peak.max(memory_bytes());if let Some(supervisor)=ACTIVE.lock().as_ref(){s.peak=s.peak.max(supervisor.peak.load(Ordering::Relaxed));}serde_json::json!({"budget_bytes":LIMIT,"baseline_bytes":s.baseline,"peak_bytes":s.peak,"working_peak_bytes":s.peak.saturating_sub(s.baseline),"measured":s.baseline>0,"disk":disk_snapshot().ok()})})
+    STATE.with(|s|{let mut s=s.borrow_mut();s.peak=s.peak.max(memory_bytes());if let Some(supervisor)=ACTIVE.lock().as_ref(){s.peak=s.peak.max(supervisor.peak.load(Ordering::Relaxed));}serde_json::json!({"budget_bytes":limit(),"baseline_bytes":s.baseline,"peak_bytes":s.peak,"working_peak_bytes":s.peak.saturating_sub(s.baseline),"measured":s.baseline>0,"disk":disk_snapshot().ok()})})
 }
 /// A connection-specific watcher is stopped and joined before that connection
 /// is dropped. Cancellation can interrupt a long columnar statement itself.

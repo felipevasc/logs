@@ -1905,7 +1905,7 @@ impl LogInsightMcp {
     )]
     async fn triage(&self, Parameters(p): Parameters<TriageParams>) -> Result<CallToolResult, McpError> {
         self.run_filtered_source_result(p.context.clone(), p.filters.clone(), move |state| {
-            crate::triage::triage_page(state, p.filters, None, p.force.unwrap_or(false), p.minimum_evidence.unwrap_or(5),p.episode_offset.unwrap_or(0),p.episode_limit.unwrap_or(100),None)
+            crate::triage::triage_page(state, p.filters, None, p.force.unwrap_or(false), p.minimum_evidence.unwrap_or(5),p.episode_offset.unwrap_or(0),p.episode_limit.unwrap_or(100),None,None)
         })
         .await
     }

@@ -205,6 +205,24 @@ pub(crate) fn yield_background(cancelled: &dyn Fn() -> bool) -> Result<(), Strin
     Ok(())
 }
 
+/// Idle global reservations lent to a native engine (DuckDB threads) for one
+/// heavy phase of admitted work. It never waits, takes nothing while anyone is
+/// queued and always leaves one slot idle for interactive requests; without
+/// idle slots the phase simply runs on its own reservation.
+pub(crate) struct Lease(Option<Reservation>);
+impl Lease {
+    /// Threads the phase may use: its own reservation plus the lent ones.
+    pub(crate) fn threads(&self) -> usize { 1 + self.0.as_ref().map_or(0, |r| r.count) }
+}
+pub(crate) fn lend_idle(wanted: usize) -> Lease {
+    if wanted == 0 || current().is_none() { return Lease(None); }
+    let scheduler = scheduler();
+    let idle = { let s = scheduler.state.lock(); if s.queue.is_empty() { scheduler.limit.saturating_sub(s.used) } else { 0 } };
+    let count = wanted.min(idle.saturating_sub(1));
+    if count == 0 { return Lease(None); }
+    Lease(Some(scheduler.borrow_idle(count)).filter(|r| r.count > 0))
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_SCHEDULER: RefCell<Option<Arc<Scheduler>>> = const { RefCell::new(None) };
@@ -241,6 +259,24 @@ mod tests {
             drop(reservation);
             let sample = resource_snapshot().unwrap();
             assert_eq!((sample.reserved, sample.peak), (0, 1));
+        });
+    }
+
+    #[test]
+    fn idle_slots_are_lent_to_native_engines_but_one_always_stays_free() {
+        let scheduler = Scheduler::new(4);
+        with_scheduler(Arc::clone(&scheduler), || {
+            assert_eq!(lend_idle(8).threads(), 1, "outside admitted work nothing is lent");
+            run(None, Priority::Normal, &|| false, || {
+                let lease = lend_idle(8);
+                assert_eq!(lease.threads(), 3, "own slot + two idle, one left for interaction");
+                assert_eq!(scheduler.state.lock().used, 3);
+                drop(lease);
+                assert_eq!(scheduler.state.lock().used, 1);
+                let other = scheduler.acquire(Priority::Interactive, &|| false).unwrap();
+                assert_eq!(lend_idle(8).threads(), 2);
+                drop(other);
+            }).unwrap();
         });
     }
 

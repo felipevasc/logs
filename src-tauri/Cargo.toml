@@ -50,6 +50,12 @@ semver = "1"
 calamine = { version = "0.36", features = ["dates"] }
 # Text logs in UTF-16 or Windows-1252 are converted to UTF-8 before indexing.
 encoding_rs = "0.8"
+# Legacy code pages of text logs (Cyrillic, Central European, CJK and others).
+chardetng = "1.0"
+# Rotated logs compressed with bzip2, xz or zstd (pure Rust decoders).
+bzip2 = "0.6"
+lzma-rs = "0.3"
+ruzstd = "0.9"
 # Columnar query engine (embedded, no server): filters and aggregations over large files.
 duckdb = { version = "1.10505", features = ["bundled", "appender-arrow", "vscalar"] }
 # Allocator that scales with many threads parsing events at once.

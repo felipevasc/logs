@@ -442,22 +442,22 @@ fn source_generation_parser_configuration_and_calendar_anchor_separate_variants(
 }
 
 #[test]
-fn malformed_array_suffix_never_publishes_a_complete_index() {
+fn malformed_array_suffix_keeps_every_complete_record() {
+    // Exports cut or written loosely still load: trailing comma, cut after a
+    // comma, a value that is not an object, text after the array.
     let root = tempfile::tempdir().unwrap();
-    for (n, suffix) in [",]", ",", ",42]", "] extra"].iter().enumerate() {
+    for (n, (suffix, rows)) in [(",]", 30), (",", 30), (",42]", 31), ("] extra", 31)].iter().enumerate() {
         let path = root.path().join(format!("malformed-{n}.json"));
         let cache = root.path().join(format!("cache-{n}"));
         let mut contents = array(30);
         contents.pop();
         contents.push_str(suffix);
         std::fs::write(&path, contents).unwrap();
-        assert!(probe(&path, "jsonl", &cache, &json!({}), &|_| {}).is_err());
-        let state: Value =
-            serde_json::from_slice(&std::fs::read(files(&cache, "state").pop().unwrap()).unwrap())
-                .unwrap();
-        assert_eq!(state["state"]["scan_complete"], false);
-        assert!(state["state"]["columns"].is_null());
-        assert!(probe(&path, "jsonl", &cache, &json!({}), &|_| {}).is_err());
+        let first = probe(&path, "jsonl", &cache, &json!({}), &|_| {}).unwrap();
+        assert_eq!(first["rows"], *rows, "{suffix}");
+        let warm = probe(&path, "jsonl", &cache, &json!({}), &|_| {}).unwrap();
+        assert_eq!(warm["rows"], *rows, "{suffix}");
+        assert_eq!(warm["parsedRows"], 0, "a complete journal is reused: {suffix}");
     }
 }
 

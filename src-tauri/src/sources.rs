@@ -5,17 +5,25 @@ use crate::model::{
 use chrono::Datelike;
 use serde_json::{Map, Value};
 
+mod generic;
+pub(crate) mod stamp;
+mod syslog;
 mod tokens;
+pub(crate) mod user_agent;
 mod web_logs;
+mod xml_log;
 
-/// Scoped parsed-data revision; raw source and stable event identities never change.
+/// Scoped parsed-data revision; raw source and stable event identities never
+/// change. Every text parser now shares the universal date/time, header and
+/// message readers and every event carries its user agent profile (`ua.*`),
+/// so all of them moved to a new revision; captured snapshots are evidence
+/// and never reparsed.
 pub(crate) fn parser_semantics_signature(format: &str) -> Option<&'static str> {
-    matches!(format, "apache" | "nginx" | "nginx-error" | "jsonl" | "logfmt" | "auto" | "mixed")
-        .then_some("web-logs-v2")
+    (format != "snapshot").then_some("universal-v4")
 }
 
-/// Embedded syslog inherits the source's pinned calendar just like a direct
-/// syslog source; its engine/time cache must not survive a year-context change.
+/// Any text parser may complete year-less or time-only values from the
+/// source's pinned calendar; its engine/time cache must not survive a change.
 pub(crate) fn uses_inferred_calendar_year(format: &str) -> bool {
     matches!(format, "syslog3164" | "firewall" | "zeek") || parser_semantics_signature(format).is_some()
 }
@@ -41,6 +49,16 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_millis());
+    }
+    // .NET JSON dates: /Date(1700000000000)/ or /Date(1700000000000-0300)/.
+    if let Some(inner) = s.strip_prefix("/Date(").or_else(|| s.strip_prefix("\\/Date(")) {
+        let digits: String = inner.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+        if let Ok(ms) = digits.parse::<i64>() {
+            return chrono::DateTime::from_timestamp_millis(ms).map(|_| ms);
+        }
+    }
+    if let Some(ms) = stamp::exact(s) {
+        return Some(ms);
     }
     // ISO 8601 offsets without a colon, as in Wazuh and Suricata (…T12:00:00.000+0000).
     if s.len() > 19 && matches!(s.as_bytes()[s.len() - 5], b'+' | b'-') {
@@ -82,13 +100,17 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
 
 pub fn normalize_level(raw: &str) -> String {
     match raw.trim().to_lowercase().as_str() {
-        "1" | "fatal" | "critical" | "crit" | "crítico" | "emerg" | "alert" => "Crítico".into(),
-        "2" | "error" | "err" | "erro" | "e" => "Erro".into(),
-        "3" | "warn" | "warning" | "aviso" | "w" => "Aviso".into(),
+        "1" | "fatal" | "critical" | "crit" | "crítico" | "critico" | "emerg" | "emergency" | "alert" | "panic"
+        | "ftl" | "crt" | "f" | "60" => "Crítico".into(),
+        "2" | "error" | "err" | "erro" | "e" | "eror" | "severe" | "50" => "Erro".into(),
+        "3" | "warn" | "warning" | "aviso" | "w" | "wrn" | "advertencia" | "advertência" | "atencao" | "atenção"
+        | "audit failure" | "falha de auditoria" | "40" => "Aviso".into(),
         // Windows: nível 0 = "Log Always" (informativo); syslog 4 = info
-        "0" | "4" | "info" | "information" | "informação" | "notice" | "i" => "Informação".into(),
-        "5" | "debug" | "depuração" | "d" => "Depuração".into(),
-        "trace" | "verbose" | "rastreio" => "Rastreio".into(),
+        "0" | "4" | "info" | "information" | "informational" | "informação" | "informacao" | "información"
+        | "informacion" | "notice" | "note" | "i" | "inf" | "config" | "log" | "audit success" | "êxito de auditoria"
+        | "exito de auditoria" | "30" => "Informação".into(),
+        "5" | "debug" | "depuração" | "depuracao" | "depuración" | "d" | "dbg" | "fine" | "20" => "Depuração".into(),
+        "trace" | "verbose" | "rastreio" | "trc" | "vrb" | "v" | "finer" | "finest" | "10" => "Rastreio".into(),
         other if !other.is_empty() => other.to_string(),
         _ => "Informação".into(),
     }
@@ -126,6 +148,34 @@ const SOURCE_KEYS: &[&str] = &[
     "resource.service.name",
 ];
 const MSG_KEYS: &[&str] = &["message", "msg", "log", "body", "text", "displayMessage"];
+// Further names read only when the primary ones are absent; these fields stay.
+const TS_EXTRA_KEYS: &[&str] = &[
+    "@t", "__REALTIME_TIMESTAMP", "_SOURCE_REALTIME_TIMESTAMP", "eventTime", "event_time", "TimeCreated",
+    "TimeGenerated", "time_iso8601", "time_local", "asctime", "created_at", "createdAt", "logtime", "log_time",
+    "date_time", "dateTime", "receivedAt", "received_at", "_time", "timeMillis", "timestamp_ms", "ts_ms", "devtime",
+    "start_time", "startTime", "occurred_at", "occurredAt", "requestTime", "request_time_iso", "Date",
+];
+const LEVEL_EXTRA_KEYS: &[&str] = &["@l", "levelname", "level_name", "loglevel", "log_level", "levelName", "sev"];
+const MSG_EXTRA_KEYS: &[&str] = &[
+    "@m", "@mt", "short_message", "full_message", "textPayload", "jsonPayload.message", "msg_text", "summary",
+    "event.original", "log.original",
+];
+const SOURCE_EXTRA_KEYS: &[&str] = &[
+    "SYSLOG_IDENTIFIER", "logger_name", "loggerName", "component", "application", "app", "program", "_COMM",
+    "hostname", "_HOSTNAME",
+];
+
+fn peek_key<'a>(map: &'a Map<String, Value>, keys: &[&str]) -> Option<(&'a str, &'a Value)> {
+    keys.iter().find_map(|key| {
+        map.iter()
+            .find(|(k, v)| {
+                k.eq_ignore_ascii_case(key)
+                    && (v.is_string() || v.is_number())
+                    && v.as_str().is_none_or(|s| !s.trim().is_empty())
+            })
+            .map(|(k, v)| (k.as_str(), v))
+    })
+}
 
 fn take_key(map: &mut Map<String, Value>, keys: &[&str]) -> Option<Value> {
     // An object/null in an alias must not hide a usable scalar alias.
@@ -218,8 +268,8 @@ fn flatten_json(
     }
 }
 
-fn event_from_json_at(input: Map<String, Value>, raw: &str, year: i32) -> Event {
-    event_from_json_embedded(input, raw, year, 0, &mut EmbeddedBudget::default())
+fn event_from_json_at(input: Map<String, Value>, raw: &str, ctx: &stamp::Context) -> Event {
+    event_from_json_embedded(input, raw, ctx, 0, &mut EmbeddedBudget::default())
 }
 
 // Limits apply across the entire record, including nested encoded JSON. Exact
@@ -245,7 +295,7 @@ fn embedded_syslog5424(line: &str) -> Option<Event> {
     parse_syslog5424(line)
 }
 
-fn embedded_log(raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget) -> Option<Event> {
+fn embedded_log(raw: &str, ctx: &stamp::Context, depth: usize, budget: &mut EmbeddedBudget) -> Option<Event> {
     if depth >= 3 || raw.len() > 64 * 1024 || raw.len() > budget.bytes || budget.candidates == 0 {
         return None;
     }
@@ -254,7 +304,7 @@ fn embedded_log(raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget)
     let line = raw.trim();
     let (mut event, format) = if line.starts_with('{') {
         let Value::Object(map) = serde_json::from_str::<Value>(line).ok()? else { return None; };
-        (event_from_json_embedded(map, raw, year, depth + 1, budget), "json")
+        (event_from_json_embedded(map, raw, ctx, depth + 1, budget), "json")
     } else {
         // Header-dependent formats (CSV, W3C, Zeek), arbitrary text and custom
         // schemas have no trustworthy per-value detector. Never guess them.
@@ -262,16 +312,17 @@ fn embedded_log(raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget)
         if let Some(event) = web_logs::parse_access(line) { (event, "access") }
         else if let Some(event) = web_logs::parse_error(line) { (event, "nginx.error") }
         else if let Some(event) = embedded_syslog5424(line) { (event, "syslog5424") }
-        else if let Some(event) = parse_syslog3164(line, year).filter(|event| event.timestamp.is_some()) {
+        else if let Some(event) = parse_syslog3164(line, ctx).filter(|event| event.timestamp.is_some()) {
             if line.contains("SRC=") || line.contains("PROTO=") || line.contains("DPT=") {
-                (parse_firewall(line, year)?, "firewall")
+                (parse_firewall(line, ctx)?, "firewall")
             } else { (event, "syslog3164") }
         }
         else if let Some(event) = parse_log4j(line) { (event, "log4j") }
         else if let Some(event) = parse_jboss(line) { (event, "jboss") }
         else if let Some(event) = parse_wildfly(line) { (event, "wildfly") }
-        else if let Some(event) = parse_cef(line) { (event, "cef") }
-        else if let Some(event) = parse_leef(line) { (event, "leef") }
+        // A whole value must be the record: nothing before CEF/LEEF here.
+        else if let Some(event) = parse_cef(line).filter(|_| line.starts_with("CEF:")) { (event, "cef") }
+        else if let Some(event) = parse_leef(line).filter(|_| line.starts_with("LEEF:")) { (event, "leef") }
         // Strict whole-record logfmt only: no regex mining inside prose/URLs.
         else if let Some(event) = web_logs::parse_logfmt(line) { (event, "logfmt") }
         else { return None; }
@@ -280,7 +331,7 @@ fn embedded_log(raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget)
     Some(event)
 }
 
-fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, depth: usize, budget: &mut EmbeddedBudget) -> Event {
+fn event_from_json_embedded(input: Map<String, Value>, raw: &str, ctx: &stamp::Context, depth: usize, budget: &mut EmbeddedBudget) -> Event {
     let mut ev = Event::empty();
     ev.raw = raw.to_string();
     let mut map = Map::new();
@@ -291,7 +342,7 @@ fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, dep
         .filter_map(|(key, value)| value.as_str().map(|text| (key, text))).collect();
     candidates.sort_by_key(|(key, _)| !matches!(key.rsplit('.').next().unwrap_or(key), "line" | "message" | "msg" | "log" | "body" | "text"));
     let wrapped: Vec<_> = candidates.into_iter().filter_map(|(key, text)| {
-        embedded_log(text, year, depth, budget).map(|event| (key.clone(), event))
+        embedded_log(text, ctx, depth, budget).map(|event| (key.clone(), event))
     }).collect();
     let original = (!wrapped.is_empty() || depth > 0).then(|| map.clone());
     // Keep normalized aliases useful for filtering even when they also fill
@@ -299,7 +350,15 @@ fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, dep
     if let Some(v) = take_key(&mut map, TS_KEYS) {
         ev.timestamp = value_to_ms(&v);
     }
-    let explicit_level = LEVEL_KEYS.iter().any(|alias| map.iter().any(|(key, value)| {
+    if ev.timestamp.is_none() {
+        ev.timestamp = peek_key(&map, TS_EXTRA_KEYS).and_then(|(_, v)| value_to_ms(v)).or_else(|| {
+            // log4j2 JSON layouts: {"instant":{"epochSecond":..,"nanoOfSecond":..}}
+            let seconds = map.get("instant.epochSecond")?.as_i64()?;
+            let nanos = map.get("instant.nanoOfSecond").and_then(Value::as_i64).unwrap_or(0);
+            seconds.checked_mul(1000).map(|ms| ms + nanos / 1_000_000)
+        });
+    }
+    let mut explicit_level = LEVEL_KEYS.iter().any(|alias| map.iter().any(|(key, value)| {
         key.eq_ignore_ascii_case(alias) && (value.is_string() || value.is_number() || value.is_boolean())
             && value.as_str().is_none_or(|text| !text.trim().is_empty())
     }));
@@ -309,6 +368,16 @@ fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, dep
                 .map(str::to_owned)
                 .unwrap_or_else(|| v.to_string()),
         );
+    } else if let Some((_, v)) = peek_key(&map, LEVEL_EXTRA_KEYS) {
+        ev.level = normalize_level(&v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()));
+        explicit_level = true;
+    } else if let Some(severity) = peek_key(&map, &["PRIORITY", "syslog.severity", "syslog_severity"])
+        .and_then(|(_, v)| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+        .filter(|s| *s <= 7)
+    {
+        // journald and syslog exporters: 0 emergency .. 7 debug.
+        ev.level = generic::severity_level(severity as u32).into();
+        explicit_level = true;
     }
     // A Wazuh alert's top-level id only identifies the alert; its rule is the code.
     let code_keys: &[&str] = if wazuh_alert(&map) { &["rule.id"] } else { CODE_KEYS };
@@ -329,6 +398,16 @@ fn event_from_json_embedded(input: Map<String, Value>, raw: &str, year: i32, dep
             .as_str()
             .map(|s| s.to_string())
             .unwrap_or_else(|| v.to_string());
+    }
+    if ev.message.is_empty() {
+        if let Some((_, v)) = peek_key(&map, MSG_EXTRA_KEYS) {
+            ev.message = v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string());
+        }
+    }
+    if ev.source.is_empty() {
+        if let Some((_, v)) = peek_key(&map, SOURCE_EXTRA_KEYS) {
+            ev.source = v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string());
+        }
     }
     ev.fields = map;
     let outer_http = web_logs::enrich_http(&mut ev, explicit_level);
@@ -567,24 +646,26 @@ fn describe_known_json(ev: &mut Event) -> bool {
     false
 }
 
-fn event_from_text(line: &str) -> Event {
+/// Plain text: the record stays as written; only its date/time (anywhere in
+/// the first line) and a level written right after it are read.
+fn event_from_text(line: &str, ctx: &stamp::Context) -> Event {
     let mut ev = Event::empty();
     ev.parse_status = "text".into();
     ev.raw = line.to_string();
     ev.message = line.to_string();
-
-    // Tenta extrair timestamp do início da linha (primeiros 40 caracteres).
-    let head: String = line.chars().take(40).collect();
-    let mut rest = line;
-    if let Some((ms, len)) = extract_leading_ts(&head) {
-        ev.timestamp = Some(ms);
-        rest = &line[len.min(line.len())..];
+    let first = line.split('\n').next().unwrap_or(line);
+    let cleaned = generic::clean(first);
+    let mut rest: &str = &cleaned;
+    if let Some(found) = stamp::find(&cleaned, ctx) {
+        ev.timestamp = Some(found.ms);
+        if found.start <= 2 {
+            rest = &cleaned[found.end..];
+        }
     }
-
-    // Tenta extrair nível logo em seguida ("ERROR ...", "[WARN] ...").
-    let trimmed = rest.trim_start_matches([' ', '[', '-', ':']);
+    // Nível logo em seguida ("ERROR ...", "[WARN] ...").
+    let trimmed = rest.trim_start_matches([' ', '[', '-', ':', ']', ',', '\t']);
     for kw in [
-        "CRITICAL", "FATAL", "ERROR", "WARN", "INFO", "DEBUG", "TRACE",
+        "CRITICAL", "FATAL", "ERROR", "WARNING", "WARN", "INFO", "DEBUG", "TRACE",
     ] {
         if trimmed
             .as_bytes()
@@ -598,38 +679,9 @@ fn event_from_text(line: &str) -> Event {
     ev
 }
 
-/// Procura uma data/hora no começo da linha. Devolve (epoch_ms, bytes consumidos).
-fn extract_leading_ts(head: &str) -> Option<(i64, usize)> {
-    // Padrões comuns: "2024-01-31 10:00:00,123", "2024-01-31T10:00:00.123Z",
-    // "[2024-01-31 10:00:00]". Testa prefixos decrescentes, sempre em
-    // fronteiras de caractere para não quebrar texto não-ASCII.
-    let start = if head.starts_with('[') { 1 } else { 0 };
-    let ends: Vec<usize> = head
-        .char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(head.len()))
-        .filter(|&i| i > start && i <= start + 35)
-        .collect();
-    for &end in ends.iter().rev() {
-        let cand = &head[start..end];
-        if let Some(ms) = parse_timestamp(cand) {
-            let closing = usize::from(head[end..].starts_with(']'));
-            return Some((ms, end + closing));
-        }
-    }
-    None
-}
-
 // ==========================================================================
 // Parsers de formatos conhecidos
 // ==========================================================================
-
-fn re_syslog3164() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        regex::Regex::new(r"^(?:<(\d+)>)?([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\S+)\s+(\S+?)(?:\[(\d+)\])?:\s+(.*)$").unwrap()
-    })
-}
 
 fn re_syslog5424() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -639,88 +691,26 @@ fn re_syslog5424() -> &'static regex::Regex {
     })
 }
 
-fn month_num(mon: &str) -> Option<u32> {
-    Some(match mon {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    })
-}
-
-fn syslog_ts(mon: &str, day: &str, h: &str, mi: &str, s: &str, year: i32) -> Option<i64> {
-    let (d, h, mi, s) = (
-        day.parse().ok()?,
-        h.parse().ok()?,
-        mi.parse().ok()?,
-        s.parse().ok()?,
-    );
-    chrono::NaiveDate::from_ymd_opt(year, month_num(mon)?, d)
-        .and_then(|dt| dt.and_hms_opt(h, mi, s))
-        .map(naive_to_ms)
-}
-
-fn parse_syslog3164(line: &str, year: i32) -> Option<Event> {
-    let c = re_syslog3164().captures(line)?;
-    let mut ev = Event::empty();
-    ev.raw = line.to_string();
-    ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6], year);
-    ev.source = c[7].to_string();
-    let proc = c[8].to_string();
-    ev.fields
-        .insert("process".into(), Value::from(proc.clone()));
-    if let Some(pid) = c.get(9) {
-        ev.fields.insert("pid".into(), Value::from(pid.as_str()));
-    }
-    ev.message = c[10].to_string();
-    ev.level = crate::model::class_label(text_level_class(c[10].as_bytes())).to_string();
-    Some(ev)
+fn parse_syslog3164(line: &str, ctx: &stamp::Context) -> Option<Event> {
+    syslog::bsd(line, ctx)
 }
 
 fn parse_syslog5424(line: &str) -> Option<Event> {
-    let c = re_syslog5424().captures(line)?;
-    let mut ev = Event::empty();
-    ev.raw = line.to_string();
-    ev.timestamp = parse_timestamp(&c[2]);
-    ev.source = c[3].to_string();
-    ev.fields
-        .insert("app".into(), Value::from(c[4].to_string()));
-    ev.fields
-        .insert("pid".into(), Value::from(c[5].to_string()));
-    ev.fields
-        .insert("msgid".into(), Value::from(c[6].to_string()));
-    ev.message = c[7].to_string();
-    ev.level = crate::model::class_label(text_level_class(c[7].as_bytes())).to_string();
-    Some(ev)
+    syslog::rfc5424(line)
 }
 
 fn parse_apache(line: &str) -> Option<Event> {
     web_logs::parse_access(line)
 }
 
-fn parse_firewall(line: &str, year: i32) -> Option<Event> {
-    // iptables/netfilter: prefixo estilo syslog + pares CHAVE=VALOR
-    let c = re_syslog3164().captures(line)?;
-    let msg = c[10].to_string();
+fn parse_firewall(line: &str, ctx: &stamp::Context) -> Option<Event> {
+    // iptables/netfilter: cabeçalho syslog + pares CHAVE=VALOR
+    let mut ev = syslog::bsd(line, ctx)?;
+    let msg = ev.message.clone();
     let kv = |key: &str| -> Option<String> {
         msg.split_whitespace()
             .find_map(|t| t.strip_prefix(key).map(|v| v.to_string()))
     };
-    let mut ev = Event::empty();
-    ev.raw = line.to_string();
-    ev.timestamp = syslog_ts(&c[2], &c[3], &c[4], &c[5], &c[6], year);
-    ev.source = c[7].to_string();
-    ev.fields
-        .insert("process".into(), Value::from(c[8].to_string()));
     for (key, name) in [
         ("SRC=", "src"),
         ("DST=", "dst"),
@@ -783,6 +773,24 @@ fn looks_like_jsonl(bytes: &[u8]) -> bool {
         .find(|b| !b.is_ascii_whitespace())
         .is_some_and(|b| *b == b'{')
         && serde_json::from_slice::<Value>(&bytes[..nl]).is_ok()
+}
+
+/// Offset of the first of one or more JSON objects written one after another
+/// (pretty-printed exports, `jq` output) when the file is not line-delimited.
+fn json_stream_start(bytes: &[u8]) -> Option<usize> {
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace() && *b != 0xef && *b != 0xbb && *b != 0xbf)?;
+    if bytes[start] != b'{' {
+        return None;
+    }
+    let end = skip_json_value(bytes, start)?;
+    if end - start <= 16 << 20 && !matches!(serde_json::from_slice::<Value>(&bytes[start..end]), Ok(Value::Object(_))) {
+        return None;
+    }
+    let mut next = skip_ws(bytes, end);
+    if bytes.get(next) == Some(&b',') {
+        next = skip_ws(bytes, next + 1);
+    }
+    (next >= bytes.len() || bytes[next] == b'{').then_some(start)
 }
 
 const ENVELOPE_KEYS: &[&str] = &[
@@ -900,7 +908,7 @@ fn envelope_in_object(bytes: &[u8], open: usize, depth: usize) -> Option<usize> 
 }
 
 /// Zeek TSV: `#fields` header, `-` unset and `(empty)` values.
-fn parse_zeek(line: &str, header: &[String], year: i32) -> Option<Event> {
+fn parse_zeek(line: &str, header: &[String], ctx: &stamp::Context) -> Option<Event> {
     if header.is_empty() || line.starts_with('#') {
         return None;
     }
@@ -915,7 +923,7 @@ fn parse_zeek(line: &str, header: &[String], year: i32) -> Option<Event> {
         };
         map.insert(key.clone(), v);
     }
-    let mut ev = event_from_json_at(map, line, year);
+    let mut ev = event_from_json_at(map, line, ctx);
     ev.raw = line.to_string();
     Some(ev)
 }
@@ -1000,15 +1008,18 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
         .unwrap_or(bytes);
     if trimmed.first() == Some(&b'[') {
         let next = trimmed[1..].iter().find(|b| !b.is_ascii_whitespace());
-        if matches!(next, Some(b'{') | Some(b']')) {
+        if matches!(next, Some(b'{') | Some(b']') | Some(b'"')) {
             return "jsonl";
         }
     }
-    if trimmed.first() == Some(&b'{') && !looks_like_jsonl(trimmed) && json_envelope_array(bytes).is_some() {
+    if trimmed.first() == Some(&b'{') && !looks_like_jsonl(trimmed) && (json_envelope_array(bytes).is_some() || json_stream_start(bytes).is_some()) {
         return "jsonl";
     }
     if trimmed.starts_with(b"#separator") || trimmed.starts_with(b"#fields\t") {
         return "zeek";
+    }
+    if trimmed.first() == Some(&b'<') && xml_log::record_element(&bytes[..bytes.len().min(1 << 20)]).is_some() {
+        return "xml";
     }
     {
         let head: Vec<&[u8]> = trimmed.split(|&b| b == b'\n').take(20).filter(|l| !l.is_empty()).collect();
@@ -1020,16 +1031,19 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
             return "auditd";
         }
     }
+    let ctx = stamp::Context::year(chrono::Utc::now().year());
     let mut n = 0usize;
     let mut nginx_error = 0usize;
     let (mut json, mut s3164, mut s5424, mut apache, mut fw, mut log4j, mut logfmt, mut wildfly) =
         (0, 0, 0, 0, 0, 0, 0, 0);
+    let (mut apache_error, mut cef, mut leef) = (0usize, 0usize, 0usize);
     // linhas de corpo de stacktrace Java contam como evidência de log4j/wildfly
     // (arquivos com muitos stacktraces teriam poucas linhas de cabeçalho)
     let mut stack = 0usize;
     let mut w3c_hint = false;
     for line_b in bytes.split(|&b| b == b'\n').take(60) {
-        let line = std::str::from_utf8(line_b).unwrap_or("").trim();
+        let decoded = decode_text(line_b);
+        let line = decoded.trim();
         if line.is_empty() {
             continue;
         }
@@ -1052,17 +1066,23 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
         n += 1;
         if line.starts_with('{') {
             json += 1;
+        } else if line.contains("CEF:0|") || line.contains("CEF:1|") {
+            cef += 1;
+        } else if line.contains("LEEF:1.0|") || line.contains("LEEF:2.0|") {
+            leef += 1;
         } else if re_syslog5424().is_match(line) {
             s5424 += 1;
         } else if web_logs::parse_access(line).is_some() {
             apache += 1;
         } else if web_logs::parse_error(line).is_some() {
             nginx_error += 1;
+        } else if generic::apache_error_line(line) {
+            apache_error += 1;
         } else if re_log4j().is_match(line) {
             log4j += 1;
         } else if re_wildfly().is_match(line) || re_jboss().is_match(line) {
             wildfly += 1;
-        } else if re_syslog3164().is_match(line) {
+        } else if syslog::bsd(line, &ctx).is_some() {
             if line.contains("SRC=") || line.contains("PROTO=") || line.contains("DPT=") {
                 fw += 1;
             } else {
@@ -1084,12 +1104,18 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
     let half = n / 2;
     if json > half {
         "jsonl"
+    } else if cef > half {
+        "cef"
+    } else if leef > half {
+        "leef"
     } else if s5424 > half {
         "syslog5424"
     } else if apache > half {
         "apache"
     } else if nginx_error > half {
         "nginx-error"
+    } else if apache_error > half {
+        "apache-error"
     } else if fw > half {
         "firewall"
     } else if wildfly > half || (wildfly > 0 && wildfly + stack > half) {
@@ -1100,11 +1126,118 @@ pub(crate) fn detect_format(bytes: &[u8]) -> &'static str {
         "syslog3164"
     } else if logfmt > half {
         "logfmt"
-    } else if json + apache + nginx_error + logfmt > 0 {
+    } else if let Some(format) = detect_positional(bytes) {
+        format
+    } else if json + apache + nginx_error + logfmt + apache_error + s3164 + cef + leef > 0 {
         "mixed"
     } else {
         "text"
     }
+}
+
+/// Every line read as text: valid UTF-8 as it is, and bytes that are not
+/// (a legacy code page mixed into the file) as Windows-1252 instead of
+/// replacement characters.
+pub(crate) fn decode_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => {
+            let mut out = String::with_capacity(bytes.len() + 16);
+            let mut rest = bytes;
+            loop {
+                match std::str::from_utf8(rest) {
+                    Ok(text) => {
+                        out.push_str(text);
+                        break;
+                    }
+                    Err(error) => {
+                        let (valid, after) = rest.split_at(error.valid_up_to());
+                        out.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                        let bad = error.error_len().unwrap_or(after.len()).clamp(1, after.len());
+                        let (decoded, _) = encoding_rs::WINDOWS_1252.decode_without_bom_handling(&after[..bad]);
+                        out.push_str(&decoded);
+                        rest = &after[bad..];
+                    }
+                }
+            }
+            std::borrow::Cow::Owned(out)
+        }
+    }
+}
+
+const POSITIONAL: [(&str, char); 4] = [
+    ("csv-positional", ','),
+    ("csv-semicolon-positional", ';'),
+    ("tsv-positional", '\t'),
+    ("csv-pipe-positional", '|'),
+];
+
+pub(crate) fn positional_delimiter(format: &str) -> Option<char> {
+    POSITIONAL.iter().find(|(id, _)| *id == format).map(|(_, delimiter)| *delimiter)
+}
+
+/// Delimited text without a header line (firewall CSV exports, `filterlog`):
+/// most lines split into the same number of values (at least eight; fewer
+/// columns read better as headers and messages) and one column holds a date.
+fn detect_positional(bytes: &[u8]) -> Option<&'static str> {
+    let lines: Vec<std::borrow::Cow<'_, str>> = bytes
+        .split(|&b| b == b'\n')
+        .take(80)
+        .map(|line| decode_text(line.strip_suffix(b"\r").unwrap_or(line)))
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .take(40)
+        .collect();
+    if lines.len() < 2 {
+        return None;
+    }
+    let mut best: Option<(&'static str, usize)> = None;
+    for (format, delimiter) in POSITIONAL {
+        let rows: Vec<Vec<String>> = lines.iter().map(|line| split_delimited(line, delimiter)).collect();
+        let mut counts = std::collections::HashMap::<usize, usize>::new();
+        for row in &rows {
+            *counts.entry(row.len()).or_default() += 1;
+        }
+        let Some((&columns, &hits)) = counts.iter().max_by_key(|(columns, hits)| (**hits, **columns)) else { continue };
+        if columns < 8 || hits * 10 < rows.len() * 8 {
+            continue;
+        }
+        let dated = (0..columns).any(|column| {
+            let with_date = rows.iter().filter(|row| row.len() == columns && stamp::exact(row[column].trim()).is_some()).count();
+            with_date * 10 >= hits * 8
+        });
+        if dated && best.is_none_or(|(_, previous)| columns > previous) {
+            best = Some((format, columns));
+        }
+    }
+    best.map(|(format, _)| format)
+}
+
+/// Positional values named `coluna N`; the first date column is the time.
+fn parse_positional(line: &str, delimiter: char) -> Option<Event> {
+    let values = split_delimited(line, delimiter);
+    if values.len() < 3 {
+        return None;
+    }
+    let mut ev = Event::empty();
+    ev.raw = line.to_string();
+    for (i, value) in values.iter().enumerate() {
+        let value = value.trim();
+        if value.is_empty() || value == "-" {
+            continue;
+        }
+        if ev.timestamp.is_none() {
+            ev.timestamp = stamp::exact(value);
+        }
+        if let Some(level) = generic::level_word(value).filter(|_| value.len() <= 12) {
+            if ev.level == "Informação" {
+                ev.level = level.into();
+            }
+        }
+        ev.fields.insert(format!("coluna {}", i + 1), Value::from(value));
+    }
+    ev.message = line.chars().take(500).collect();
+    ev.fields.insert("parser.format".into(), Value::from("delimited.positional"));
+    Some(ev)
 }
 
 fn re_log4j() -> &'static regex::Regex {
@@ -1194,6 +1327,96 @@ fn detect_entry_start(bytes: &[u8]) -> Option<regex::Regex> {
     .into_iter()
     .find(|re| sample.iter().filter(|line| re.is_match(line)).count() >= 2)
     .cloned()
+}
+
+/// Text that continues the previous record: indented lines, Java/Python/.NET/Go
+/// traces, exception headers and java.util.logging's level line.
+fn continuation_line(line: &str) -> bool {
+    if line.starts_with([' ', '\t', '}', ']', ')']) {
+        return true;
+    }
+    let t = line.trim();
+    if is_stacktrace_line(t)
+        || t.starts_with("Traceback (most recent call last)")
+        || t.starts_with("During handling of the above exception")
+        || t.starts_with("The above exception was the direct cause")
+        || t.starts_with("--- End of")
+        || t.starts_with("goroutine ")
+        || ["SEVERE:", "WARNING:", "INFO:", "CONFIG:", "FINE:", "FINER:", "FINEST:"].iter().any(|p| t.starts_with(p))
+    {
+        return true;
+    }
+    // "java.lang.IllegalStateException: ...", "ValueError: ...".
+    let head = t.split([':', ' ']).next().unwrap_or("");
+    !head.is_empty()
+        && head.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '$'))
+        && ["Exception", "Error", "Throwable", "Warning", "Exit", "Interrupt"].iter().any(|suffix| head.ends_with(suffix))
+}
+
+/// Records spanning several lines in text no dedicated format claimed: when
+/// most lines start with the same kind of date and the others look like
+/// continuations (traces, indented text), each line starting with that kind
+/// of date begins a record, the way log shippers frame multi-line events.
+fn detect_record_start(bytes: &[u8], ctx: &stamp::Context) -> Option<String> {
+    let mut shapes: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let (mut stamped, mut continued, mut other, mut bare) = (0usize, 0usize, 0usize, 0usize);
+    for raw in bytes.split(|&b| b == b'\n').take(2_000) {
+        let text = decode_text(raw.strip_suffix(b"\r").unwrap_or(raw));
+        if text.trim().is_empty() {
+            continue;
+        }
+        let bracket = usize::from(text.starts_with('['));
+        match stamp::at(&text, bracket, ctx).filter(|found| found.has_time) {
+            Some(found) => {
+                stamped += 1;
+                bare += usize::from(text[found.end..].trim_matches([']', ':', ' ', '\t']).is_empty());
+                *shapes.entry(shape_pattern(&text[found.start..found.end], bracket == 1)).or_default() += 1;
+            }
+            None if continuation_line(&text) => continued += 1,
+            None => other += 1,
+        }
+    }
+    let (pattern, count) = shapes.into_iter().max_by_key(|(_, count)| *count)?;
+    let consistent = stamped >= 2 && count * 10 >= stamped * 8;
+    let continuations = continued > 0 && other * 10 <= (continued + other).max(10);
+    // Dates alone on their lines head the text below them (Oracle alert log).
+    let headings = bare >= 2 && bare * 2 >= stamped;
+    (consistent && (continuations || headings)).then_some(pattern)
+}
+
+/// Anchored pattern for the start of a timestamp like the given one: digit
+/// runs, letter runs and spaces generalized, up to its minutes.
+fn shape_pattern(stamp_text: &str, bracket: bool) -> String {
+    let mut pattern = String::from(if bracket { r"^\[" } else { "^" });
+    let mut colons = 0;
+    let mut chars = stamp_text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            while chars.peek().is_some_and(char::is_ascii_digit) {
+                chars.next();
+            }
+            pattern.push_str(r"\d+");
+            if colons == 1 {
+                break;
+            }
+        } else if c.is_alphabetic() {
+            while chars.peek().is_some_and(|c| c.is_alphabetic()) {
+                chars.next();
+            }
+            pattern.push_str(r"\p{L}+");
+        } else if c.is_whitespace() {
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            pattern.push_str(r"\s+");
+        } else {
+            if c == ':' {
+                colons += 1;
+            }
+            pattern.push_str(&regex::escape(&c.to_string()));
+        }
+    }
+    pattern
 }
 
 /// Linha típica de corpo de stacktrace Java (continuação de evento log4j/wildfly).
@@ -1287,6 +1510,7 @@ fn parse_wildfly(block: &str) -> Option<Event> {
     ev.fields
         .insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
+    generic::enrich(&mut ev, &c[5], true);
     extract_java_body(&mut ev, body);
     enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
@@ -1307,6 +1531,7 @@ fn parse_jboss(block: &str) -> Option<Event> {
     ev.fields
         .insert("thread".into(), Value::from(c[4].to_string()));
     ev.message = c[5].to_string();
+    generic::enrich(&mut ev, &c[5], true);
     extract_java_body(&mut ev, body);
     enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
@@ -1327,6 +1552,7 @@ fn parse_log4j(block: &str) -> Option<Event> {
         .insert("logger".into(), Value::from(c[4].to_string()));
     ev.source = c[4].to_string();
     ev.message = c[5].to_string();
+    generic::enrich(&mut ev, &c[5], true);
     extract_java_body(&mut ev, body);
     enrich_java_trace(&mut ev, block, c.get(5)?.start());
     Some(ev)
@@ -1339,30 +1565,68 @@ fn parse_logfmt(line: &str) -> Option<Event> {
 
 /// Only strict, self-describing single-line formats participate in fallback.
 /// Explicit text, snapshots, custom schemas and multiline framing stay intact.
-fn parse_structured_line(line: &str, year: i32) -> Option<Event> {
+fn parse_structured_line(line: &str, ctx: &stamp::Context) -> Option<Event> {
     let trimmed = line.trim();
     if trimmed.starts_with('{') {
         if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
-            return Some(event_from_json_at(map, line, year));
+            return Some(event_from_json_at(map, line, ctx));
         }
         return None;
     }
     if web_logs::error_candidate(trimmed) {
-        return web_logs::parse_error(line);
+        if let Some(event) = web_logs::parse_error(line) { return Some(event); }
     }
     if web_logs::access_candidate(trimmed) {
         if let Some(event) = parse_apache(line) { return Some(event); }
     }
-    if web_logs::logfmt_candidate(trimmed) { return parse_logfmt(line); }
+    if web_logs::logfmt_candidate(trimmed) {
+        if let Some(event) = parse_logfmt(line) { return Some(event); }
+    }
     None
+}
+
+/// Whole-line layouts with a dedicated reader, tried when a line does not
+/// match the source's main format.
+fn known_line(line: &str, ctx: &stamp::Context) -> Option<Event> {
+    if line.contains("CEF:") {
+        if let Some(event) = parse_cef(line) { return Some(event); }
+    }
+    if line.contains("LEEF:") {
+        if let Some(event) = parse_leef(line) { return Some(event); }
+    }
+    if let Some(event) = embedded_syslog5424(line) {
+        return Some(event);
+    }
+    if let Some(event) = syslog::bsd(line, ctx) {
+        if line.contains("SRC=") || line.contains("PROTO=") || line.contains("DPT=") {
+            return parse_firewall(line, ctx).or(Some(event));
+        }
+        return Some(event);
+    }
+    parse_log4j(line)
+        .or_else(|| parse_jboss(line))
+        .or_else(|| parse_wildfly(line))
+        .or_else(|| parse_auditd(line))
+}
+
+/// Any record: the structured readers first, then whole-line layouts, then
+/// the generic reader that structures whatever text remains.
+fn universal(text: &str, ctx: &stamp::Context) -> Event {
+    if text.contains('\n') {
+        if let Some(event) = parse_log4j(text).or_else(|| parse_jboss(text)).or_else(|| parse_wildfly(text)) {
+            return event;
+        }
+    } else if let Some(event) = parse_structured_line(text, ctx).or_else(|| known_line(text, ctx)) {
+        return event;
+    }
+    generic::parse(text, ctx)
 }
 
 /// CEF (ArcSight): `CEF:0|Vendor|Product|Version|SignatureID|Name|Severity|extensão`
 fn parse_cef(line: &str) -> Option<Event> {
-    if !line.starts_with("CEF:") {
-        return None;
-    }
-    let parts: Vec<&str> = line.splitn(8, '|').collect();
+    let start = if line.starts_with("CEF:") { 0 } else { line.find("CEF:0|").or_else(|| line.find("CEF:1|"))? };
+    let (prefix, body) = line.split_at(start);
+    let parts: Vec<&str> = body.splitn(8, '|').collect();
     if parts.len() < 8 {
         return None;
     }
@@ -1402,15 +1666,34 @@ fn parse_cef(line: &str) -> Option<Event> {
             }
         }
     }
+    let _ = prefix;
     Some(ev)
+}
+
+/// Time, host and priority of a syslog header written before a CEF/LEEF
+/// payload (`<134>Oct 12 00:00:00 fw01 CEF:0|...`).
+fn prefixed(mut ev: Event, line: &str, ctx: &stamp::Context) -> Event {
+    let Some(start) = line.find("CEF:").or_else(|| line.find("LEEF:")) else { return ev };
+    let prefix = line[..start].trim();
+    if prefix.is_empty() {
+        return ev;
+    }
+    let found = stamp::find(prefix, ctx);
+    if ev.timestamp.is_none() {
+        ev.timestamp = found.map(|f| f.ms);
+    }
+    let after = found.map_or(prefix, |f| &prefix[f.end..]).trim();
+    if let Some(host) = after.split_whitespace().last().map(|h| h.trim_end_matches(':')).filter(|h| !h.is_empty() && !h.starts_with('<')) {
+        ev.fields.entry("host").or_insert_with(|| Value::from(host));
+    }
+    ev
 }
 
 /// LEEF (IBM QRadar): `LEEF:1.0|Vendor|Product|Version|EventID|chave=valor...`
 fn parse_leef(line: &str) -> Option<Event> {
-    if !line.starts_with("LEEF:") {
-        return None;
-    }
-    let parts: Vec<&str> = line.splitn(6, '|').collect();
+    let start = if line.starts_with("LEEF:") { 0 } else { line.find("LEEF:1.0|").or_else(|| line.find("LEEF:2.0|"))? };
+    let (prefix, body) = line.split_at(start);
+    let parts: Vec<&str> = body.splitn(6, '|').collect();
     if parts.len() < 6 {
         return None;
     }
@@ -1454,6 +1737,7 @@ fn parse_leef(line: &str) -> Option<Event> {
     if ev.message.is_empty() {
         ev.message = format!("{} ({})", parts[2], parts[4]);
     }
+    let _ = prefix;
     Some(ev)
 }
 
@@ -1518,15 +1802,40 @@ fn plausible_column_name(name: &str) -> bool {
 /// de valores (ou um a mais, como a mensagem sem nome das exportações do
 /// Visualizador de Eventos do Windows).
 fn detect_delimited(bytes: &[u8]) -> Option<&'static str> {
-    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-    let lines: Vec<&str> = bytes
-        .split(|&b| b == b'\n')
-        .take(60)
-        .filter_map(|line| std::str::from_utf8(line.strip_suffix(b"\r").unwrap_or(line)).ok())
-        .filter(|line| !line.trim().is_empty())
-        .take(30)
-        .collect();
-    let (header, rows) = lines.split_first()?;
+    delimited_layout(bytes).map(|(format, _)| format)
+}
+
+/// Separator of tabular text and the byte offset of its header line. The
+/// header is normally the first line; exports such as the Windows DHCP log
+/// open with a few lines of text, so a later header is accepted when every
+/// line after it agrees with it.
+fn delimited_layout(bytes: &[u8]) -> Option<(&'static str, usize)> {
+    // Offsets are record starts in the file: the first line includes its BOM.
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    let mut offset = 0;
+    for raw in bytes.split(|&b| b == b'\n').take(90) {
+        let content = if offset == 0 { raw.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(raw) } else { raw };
+        if let Ok(line) = std::str::from_utf8(content.strip_suffix(b"\r").unwrap_or(content)) {
+            if !line.trim().is_empty() {
+                lines.push((offset, line));
+            }
+        }
+        offset += raw.len() + 1;
+    }
+    for start in 0..lines.len().min(25) {
+        let header = lines[start].1;
+        let rows: Vec<&str> = lines[start + 1..].iter().take(29).map(|(_, line)| *line).collect();
+        if start > 0 && rows.len() < 3 {
+            break;
+        }
+        if let Some(format) = delimited_header(header, &rows, start > 0) {
+            return Some((format, lines[start].0));
+        }
+    }
+    None
+}
+
+fn delimited_header(header: &str, rows: &[&str], strict: bool) -> Option<&'static str> {
     if rows.is_empty() || header.trim_start().starts_with(['{', '[', '#']) {
         return None;
     }
@@ -1544,7 +1853,8 @@ fn detect_delimited(bytes: &[u8]) -> Option<&'static str> {
                 count == names.len() || count == names.len() + 1
             })
             .count();
-        if consistent * 10 >= rows.len() * 8 && best.is_none_or(|(_, columns)| names.len() > columns) {
+        let required = if strict { 9 } else { 8 };
+        if consistent * 10 >= rows.len() * required && best.is_none_or(|(_, columns)| names.len() > columns) {
             best = Some((format, names.len()));
         }
     }
@@ -1628,18 +1938,31 @@ pub(crate) fn column_role(name: &str) -> ColumnRole {
 
 /// Data e hora vindas de uma coluna só ou de uma coluna de data e outra de hora.
 pub(crate) fn date_time_ms(date: Option<&str>, time: Option<&str>) -> Option<i64> {
+    date_time_ms_in(date, time, None)
+}
+
+/// A column value as an instant, reading ambiguous numeric dates (01/02/2026)
+/// in the order the rest of the source showed.
+fn timestamp_in(text: &str, day_first: Option<bool>) -> Option<i64> {
+    match day_first {
+        None => parse_timestamp(text),
+        Some(_) => stamp::exact_ordered(text.trim().trim_matches(['[', ']']), day_first).or_else(|| parse_timestamp(text)),
+    }
+}
+
+fn date_time_ms_in(date: Option<&str>, time: Option<&str>, day_first: Option<bool>) -> Option<i64> {
     match (date, time) {
-        (Some(date), Some(time)) => parse_timestamp(&format!("{date} {time}"))
-            .or_else(|| parse_timestamp(date))
-            .or_else(|| parse_timestamp(time)),
-        (Some(value), None) | (None, Some(value)) => parse_timestamp(value),
+        (Some(date), Some(time)) => timestamp_in(&format!("{date} {time}"), day_first)
+            .or_else(|| timestamp_in(date, day_first))
+            .or_else(|| timestamp_in(time, day_first)),
+        (Some(value), None) | (None, Some(value)) => timestamp_in(value, day_first),
         (None, None) => None,
     }
 }
 
 /// Mapeia colunas nomeadas (cabeçalho CSV/TSV ou #Fields do IIS) para o evento.
 /// Valores além do cabeçalho recebem o nome da posição ("coluna 6").
-fn event_from_columns(vals: Vec<String>, header: &[String], raw: &str) -> Event {
+fn event_from_columns(vals: Vec<String>, header: &[String], raw: &str, day_first: Option<bool>) -> Event {
     let mut ev = Event::empty();
     ev.raw = raw.to_string();
     let mut level_set = false;
@@ -1680,10 +2003,10 @@ fn event_from_columns(vals: Vec<String>, header: &[String], raw: &str) -> Event 
         }
     }
     let text = |pair: &Option<(String, String)>| pair.as_ref().map(|(_, v)| v.clone());
-    ev.timestamp = text(&stamp).and_then(|v| parse_timestamp(&v));
+    ev.timestamp = text(&stamp).and_then(|v| timestamp_in(&v, day_first));
     let stamp_used = ev.timestamp.is_some();
     let parts_used = !stamp_used && {
-        ev.timestamp = date_time_ms(text(&date).as_deref(), text(&time).as_deref());
+        ev.timestamp = date_time_ms_in(text(&date).as_deref(), text(&time).as_deref(), day_first);
         ev.timestamp.is_some()
     };
     // Columns that did not become the event time remain available as fields.
@@ -1709,20 +2032,37 @@ fn parse_w3c(line: &str, header: &[String]) -> Option<Event> {
     if header.is_empty() || line.starts_with('#') {
         return None;
     }
-    let vals: Vec<String> = line.split(' ').map(|s| s.to_string()).collect();
-    Some(event_from_columns(vals, header, line))
+    // IIS separates by spaces, CloudFront and others by tabs, Exchange by commas.
+    let mut vals: Vec<String> = line.split([' ', '\t']).map(|s| s.to_string()).collect();
+    if vals.len() * 2 < header.len() && line.contains(',') {
+        vals = split_delimited(line, ',');
+    }
+    let mut ev = event_from_columns(vals, header, line, None);
+    // W3C extended logs of IIS and CloudFront (fields such as cs-method,
+    // sc-status, s-ip, x-edge-location) write date and time in UTC; other
+    // producers of #Fields headers (Windows Firewall) use local time.
+    let utc = header.iter().any(|name| ["cs-", "sc-", "s-", "c-", "x-edge"].iter().any(|p| name.starts_with(p)));
+    let zoned = header.iter().any(|name| name.contains("date-time") || name == "timestamp");
+    if utc && !zoned {
+        if let Some(local) = ev.timestamp {
+            use chrono::TimeZone;
+            let offset = chrono::Local.timestamp_millis_opt(local).single().map_or(0, |d| d.offset().local_minus_utc());
+            ev.timestamp = Some(local + i64::from(offset) * 1000);
+        }
+    }
+    Some(ev)
 }
 
-fn parse_delimited(line: &str, header: &[String], delimiter: char) -> Option<Event> {
+fn parse_delimited(line: &str, header: &[String], delimiter: char, day_first: Option<bool>) -> Option<Event> {
     if header.is_empty() {
         return None;
     }
-    Some(event_from_columns(split_delimited(line, delimiter), header, line))
+    Some(event_from_columns(split_delimited(line, delimiter), header, line, day_first))
 }
 
 #[cfg(test)]
 fn parse_csv_line(line: &str, header: &[String]) -> Option<Event> {
-    parse_delimited(line, header, ',')
+    parse_delimited(line, header, ',', None)
 }
 
 // ==========================================================================
@@ -2254,10 +2594,27 @@ pub enum CustomParse {
 pub(crate) struct ParserCalendar {
     pub year: i32,
     pub timezone: String,
+    /// Date the source refers to (its name, else its modification day):
+    /// completes time-only values and places year-less ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<chrono::NaiveDate>,
+    /// Order of ambiguous numeric dates learned from the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_first: Option<bool>,
 }
 impl ParserCalendar {
     pub(crate) fn current() -> Result<Self, String> {
-        Ok(Self { year: chrono::Utc::now().year(), timezone: Self::timezone_signature()? })
+        Ok(Self { year: chrono::Utc::now().year(), timezone: Self::timezone_signature()?, reference: None, day_first: None })
+    }
+    pub(crate) fn context(&self) -> stamp::Context {
+        stamp::Context { year: self.year, reference: self.reference, day_first: self.day_first }
+    }
+    /// Everything that completes partial dates, for cache identities.
+    pub(crate) fn inference_signature(&self) -> String {
+        match (self.reference, self.day_first) {
+            (None, None) => self.year.to_string(),
+            (reference, order) => format!("{}|reference:{reference:?}|day-first:{order:?}", self.year),
+        }
     }
     fn timezone_signature() -> Result<String, String> {
         use sha2::{Digest, Sha256};
@@ -2666,6 +3023,7 @@ pub fn event_at(
         apply_ts_config(&mut ev, cc, part, &String::from_utf8_lossy(bytes));
     }
     normalize_fields(&mut ev);
+    user_agent::annotate(&mut ev);
     apply_derived(&mut ev, derived);
     expand_query_param_fields(&mut ev);
     ev
@@ -2802,58 +3160,92 @@ pub fn parse_line(
 }
 
 pub(crate) fn parse_part_line(part: &FilePart, bytes: &[u8]) -> Event {
-    parse_line_at(bytes, &part.format, part.custom.as_ref(), &part.header, part.calendar.year)
+    parse_line_in(bytes, &part.format, part.custom.as_ref(), &part.header, &part.calendar.context())
 }
 
 pub(crate) fn parse_line_at(bytes: &[u8], format: &str, custom: Option<&CustomParse>, header: &[String], year: i32) -> Event {
+    parse_line_in(bytes, format, custom, header, &stamp::Context::year(year))
+}
+
+/// One record in the source's format. Whatever that format's reader does not
+/// recognize goes through the universal readers instead of staying plain
+/// text; explicit plain text, custom schemas and snapshots keep their meaning.
+pub(crate) fn parse_line_in(bytes: &[u8], format: &str, custom: Option<&CustomParse>, header: &[String], ctx: &stamp::Context) -> Event {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-    let text = String::from_utf8_lossy(bytes);
+    let text = decode_text(bytes);
+    let text: &str = &text;
     let mut ev = match format {
         "snapshot" => {
-            serde_json::from_str::<Event>(&text).unwrap_or_else(|_| event_from_text(&text))
+            serde_json::from_str::<Event>(text).unwrap_or_else(|_| event_from_text(text, ctx))
         }
-        "jsonl" => match serde_json::from_str::<Value>(&text) {
-            Ok(Value::Object(map)) => event_from_json_at(map, &text, year),
-            _ => event_from_text(&text),
-        },
-        "syslog3164" => parse_syslog3164(&text, year).unwrap_or_else(|| event_from_text(&text)),
-        "syslog5424" => parse_syslog5424(&text).unwrap_or_else(|| event_from_text(&text)),
-        "apache" => parse_apache(&text).unwrap_or_else(|| event_from_text(&text)),
-        "nginx-error" => web_logs::parse_error(&text).unwrap_or_else(|| event_from_text(&text)),
-        "nginx" | "auto" | "mixed" => parse_structured_line(&text, year).unwrap_or_else(|| event_from_text(&text)),
-        "firewall" => parse_firewall(&text, year).unwrap_or_else(|| event_from_text(&text)),
-        "wildfly" => parse_wildfly(&text)
-            .or_else(|| parse_jboss(&text))
-            .or_else(|| parse_log4j(&text))
-            .unwrap_or_else(|| event_from_text(&text)),
-        "cef" => parse_cef(&text).unwrap_or_else(|| event_from_text(&text)),
-        "leef" => parse_leef(&text).unwrap_or_else(|| event_from_text(&text)),
-        "log4j" => parse_log4j(&text)
-            .or_else(|| parse_jboss(&text))
-            .or_else(|| parse_wildfly(&text))
-            .unwrap_or_else(|| event_from_text(&text)),
-        "logfmt" => parse_logfmt(&text).unwrap_or_else(|| event_from_text(&text)),
-        tabular if delimiter_of(tabular).is_some() => {
-            parse_delimited(&text, header, delimiter_of(tabular).unwrap_or(','))
-                .unwrap_or_else(|| event_from_text(&text))
-        }
-        "w3c" => parse_w3c(&text, header).unwrap_or_else(|| event_from_text(&text)),
-        "zeek" => parse_zeek(&text, header, year).unwrap_or_else(|| event_from_text(&text)),
-        "auditd" => parse_auditd(&text).unwrap_or_else(|| event_from_text(&text)),
+        "text" => event_from_text(text, ctx),
         "custom" => match custom {
             Some(CustomParse::Regex(re)) => {
-                parse_custom(&text, re).unwrap_or_else(|| event_from_text(&text))
+                parse_custom(text, re).unwrap_or_else(|| event_from_text(text, ctx))
             }
             Some(CustomParse::Delimited { sep, fields }) => {
                 let vals: Vec<String> = text.split(*sep).map(|s| s.trim().to_string()).collect();
-                event_from_columns(vals, fields, &text)
+                event_from_columns(vals, fields, text, ctx.day_first)
             }
-            None => event_from_text(&text),
+            None => event_from_text(text, ctx),
         },
-        _ => event_from_text(&text),
+        "jsonl" => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(map)) => event_from_json_at(map, text, ctx),
+            // An array of log lines: each string is read as the line it holds.
+            Ok(Value::String(line)) => {
+                let mut ev = universal(&line, ctx);
+                ev.raw = text.to_string();
+                ev
+            }
+            _ => universal(text, ctx),
+        },
+        "syslog3164" => parse_syslog3164(text, ctx).unwrap_or_else(|| universal(text, ctx)),
+        "syslog5424" => parse_syslog5424(text)
+            .or_else(|| parse_syslog3164(text, ctx))
+            .unwrap_or_else(|| universal(text, ctx)),
+        "apache" => parse_apache(text).unwrap_or_else(|| universal(text, ctx)),
+        "apache-error" => generic::apache_error(text).unwrap_or_else(|| universal(text, ctx)),
+        "nginx-error" => web_logs::parse_error(text).unwrap_or_else(|| universal(text, ctx)),
+        "firewall" => parse_firewall(text, ctx).unwrap_or_else(|| universal(text, ctx)),
+        "wildfly" => parse_wildfly(text)
+            .or_else(|| parse_jboss(text))
+            .or_else(|| parse_log4j(text))
+            .unwrap_or_else(|| universal(text, ctx)),
+        "cef" => parse_cef(text).map(|ev| prefixed(ev, text, ctx)).unwrap_or_else(|| universal(text, ctx)),
+        "leef" => parse_leef(text).map(|ev| prefixed(ev, text, ctx)).unwrap_or_else(|| universal(text, ctx)),
+        "log4j" => parse_log4j(text)
+            .or_else(|| parse_jboss(text))
+            .or_else(|| parse_wildfly(text))
+            .unwrap_or_else(|| universal(text, ctx)),
+        "logfmt" => parse_logfmt(text).unwrap_or_else(|| universal(text, ctx)),
+        tabular if delimiter_of(tabular).is_some() => {
+            let delimiter = delimiter_of(tabular).unwrap_or(',');
+            // Preamble or comment lines of a tabular export are text, not a row.
+            if header.len() > 2 && !text.contains(delimiter) {
+                universal(text, ctx)
+            } else {
+                parse_delimited(text, header, delimiter, ctx.day_first).unwrap_or_else(|| universal(text, ctx))
+            }
+        }
+        positional if positional_delimiter(positional).is_some() => {
+            parse_positional(text, positional_delimiter(positional).unwrap_or(','))
+                .unwrap_or_else(|| universal(text, ctx))
+        }
+        "w3c" => parse_w3c(text, header).unwrap_or_else(|| universal(text, ctx)),
+        "zeek" => parse_zeek(text, header, ctx).unwrap_or_else(|| universal(text, ctx)),
+        "auditd" => parse_auditd(text).unwrap_or_else(|| universal(text, ctx)),
+        "xml" => xml_log::parse_record(text, ctx).unwrap_or_else(|| universal(text, ctx)),
+        // "auto", "mixed", "nginx" and any other name: every reader in turn.
+        _ => universal(text, ctx),
     };
-    if ev.parse_status == "text" && matches!(format, "apache" | "nginx-error" | "jsonl" | "logfmt") {
-        if let Some(recognized) = parse_structured_line(&text, year) { ev = recognized; }
+    // WildFly/JBoss write only the time; the source's date completes it.
+    if ev.timestamp.is_none() {
+        if let Some(found) = ev.fields.get("hora_linha").and_then(Value::as_str).and_then(|time| stamp::at(time, 0, ctx)) {
+            ev.timestamp = Some(found.ms);
+            if let Some(date) = ctx.reference.filter(|_| found.inferred == stamp::Inferred::Date) {
+                ev.fields.insert("data_inferida".into(), Value::from(date.to_string()));
+            }
+        }
     }
     if ev.parse_status == "text" && format != "text" {
         ev.parse_status = "unparsed".into();
@@ -2997,8 +3389,10 @@ fn index_lines(prepared: &PreparedIndex, lines: &mut crate::metadata_store::Line
     let bytes: &[u8] = &part.mmap;
     let start_re = prepared.descriptor.start_pattern.as_deref().map(regex::Regex::new).transpose().map_err(|e| e.to_string())?;
     let comments = matches!(part.format.as_str(), "w3c" | "zeek");
+    // Lines holding only spaces or NUL padding (preallocated or crashed logs) are not records.
     let keep = |line: &[u8], offset: usize, terminated: bool| {
-        !line.is_empty() && (!terminated || (Some(offset) != prepared.descriptor.header_at && !(comments && line[0] == b'#')))
+        !line.iter().all(|&b| b == 0 || b.is_ascii_whitespace())
+            && (!terminated || (Some(offset) != prepared.descriptor.header_at && !(comments && line[0] == b'#')))
     };
     let cancellation = crate::operations::current_token();
     while cursor < bytes.len() {
@@ -3075,13 +3469,15 @@ struct JsonScanner<'a> {
     need_separator: bool,
     after_comma: bool,
     envelope: bool,
+    /// Objects one after another (pretty-printed or not), no enclosing array.
+    stream: bool,
     done: bool,
     stack: Vec<u8>,
     last_report: std::time::Instant,
 }
 impl<'a> JsonScanner<'a> {
-    fn new(bytes: &'a [u8], start: usize, cursor: usize, envelope: bool) -> Self {
-        Self { bytes, cursor, need_separator: cursor != start + 1, after_comma: false, envelope, done: false, stack: Vec::with_capacity(32), last_report: std::time::Instant::now() }
+    fn new(bytes: &'a [u8], start: usize, cursor: usize, envelope: bool, stream: bool) -> Self {
+        Self { bytes, cursor, need_separator: !stream && cursor != start + 1, after_comma: false, envelope, stream, done: false, stack: Vec::with_capacity(32), last_report: std::time::Instant::now() }
     }
     fn next(&mut self, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<Option<(usize, usize)>, String> {
         use crate::metadata_checkpoint::{report, Progress};
@@ -3127,30 +3523,61 @@ impl<'a> JsonScanner<'a> {
                 continue;
             }
             if byte.is_ascii_whitespace() { continue; }
+            if self.stream {
+                match byte {
+                    b'{' => { record_start = Some(i); self.stack.push(byte); }
+                    b',' => {}
+                    // Text between objects stays a record of its own (to the end of its line).
+                    _ => {
+                        let line_end = memchr::memchr(b'\n', &self.bytes[i..]).map_or(self.bytes.len(), |n| i + n);
+                        let end = if line_end > i && self.bytes[line_end - 1] == b'\r' { line_end - 1 } else { line_end };
+                        // Resume points stay right after a line break or an object.
+                        self.cursor = if line_end < self.bytes.len() { line_end + 1 } else { line_end };
+                        return Ok(Some((i, end.max(i + 1))));
+                    }
+                }
+                continue;
+            }
+            // Tolerant like the readers of exported logs: trailing or doubled
+            // commas, a missing comma, values other than objects (an array of
+            // log lines) and text after the array never lose the records.
             match byte {
-                b']' if !self.after_comma => {
+                b']' => {
+                    self.done = true;
                     if !self.envelope {
-                        for suffix in self.bytes[self.cursor..].chunks(65_536) {
-                            crate::operations::check()?;
-                            if suffix.iter().any(|b| !b.is_ascii_whitespace()) { return Err("Há conteúdo após o fim do array JSON.".into()); }
+                        // Text after the array is kept as a record of its own.
+                        let rest = &self.bytes[self.cursor..];
+                        if let Some(first) = rest.iter().position(|b| !b.is_ascii_whitespace()) {
+                            let begin = self.cursor + first;
+                            let end = self.bytes.len() - rest.iter().rev().take_while(|b| b.is_ascii_whitespace()).count();
+                            self.cursor = self.bytes.len();
+                            return Ok(Some((begin, end)));
                         }
                     }
-                    self.done = true;
                     return Ok(None);
                 }
-                b',' if self.need_separator => { self.need_separator = false; self.after_comma = true; }
-                b'{' if !self.need_separator => { record_start = Some(i); self.stack.push(byte); self.after_comma = false; }
-                _ => return Err(format!("Esperado um objeto ou separador no array JSON (byte {i}).")),
+                b',' => { self.need_separator = false; self.after_comma = true; }
+                b'{' => { record_start = Some(i); self.stack.push(byte); self.after_comma = false; }
+                _ => {
+                    let end = skip_json_value(self.bytes, i).unwrap_or(self.bytes.len()).clamp(i + 1, self.bytes.len());
+                    self.cursor = end;
+                    self.need_separator = true;
+                    self.after_comma = false;
+                    return Ok(Some((i, end)));
+                }
             }
         }
-        Err("Array JSON incompleto: falta fechar um objeto ou o array.".into())
+        // Interrupted exports keep every complete record; a cut last object is
+        // kept as text rather than failing the whole source.
+        self.done = true;
+        Ok(record_start.map(|begin| (begin, self.bytes.len())))
     }
 }
 
-fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, cursor: usize, lines: &mut crate::metadata_store::LineBuilder, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
+fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, stream: bool, cursor: usize, lines: &mut crate::metadata_store::LineBuilder, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
     use crate::metadata_checkpoint::{report, Progress};
     let bytes: &[u8] = &prepared.part.mmap;
-    let mut scanner = JsonScanner::new(bytes, start, cursor, envelope);
+    let mut scanner = JsonScanner::new(bytes, start, cursor, envelope, stream);
     let cancellation = crate::operations::current_token();
     let max_records = prepared.limits.json_records;
     while !scanner.done {
@@ -3174,6 +3601,40 @@ fn index_json_array(prepared: &PreparedIndex, start: usize, envelope: bool, curs
         progress.parsed_rows = parsed;
         report(reporter, progress);
         if !scanner.done { sink(lines, scanner.cursor, false, None)?; }
+    }
+    Ok(())
+}
+
+/// Records of an XML log, framed by its record element.
+fn index_xml_records(prepared: &PreparedIndex, cursor: usize, lines: &mut crate::metadata_store::LineBuilder, sink: &mut CheckpointSink<'_>, reporter: crate::metadata_checkpoint::Reporter<'_>) -> Result<(), String> {
+    use crate::metadata_checkpoint::{report, Progress};
+    let bytes: &[u8] = &prepared.part.mmap;
+    let Some((name, depth)) = prepared.descriptor.xml.as_ref() else { return Ok(()) };
+    let mut scanner = xml_log::Scanner::new(bytes, name, *depth, cursor);
+    let cancellation = crate::operations::current_token();
+    let max_records = prepared.limits.json_records;
+    let mut done = false;
+    while !done {
+        prepared.validate()?;
+        crate::operations::check()?;
+        let wave_start = scanner.cursor;
+        let mut records = Vec::with_capacity(max_records.min(4096));
+        while records.len() < max_records {
+            let Some(record) = scanner.next()? else { done = true; break; };
+            records.push(record);
+            if scanner.cursor - wave_start >= prepared.limits.json_bytes { break; }
+        }
+        let metas: Result<Vec<LineMeta>, String> = crate::global_scheduler::map(&records, |&(begin, end)| {
+            if cancellation.cancelled() { return Err("Operação cancelada.".into()); }
+            meta_for_line(&bytes[begin..end], begin as u64, &prepared.part)
+        }).into_iter().collect();
+        crate::operations::check()?;
+        lines.extend(metas?)?;
+        let parsed = prepared.parsed_rows.fetch_add(records.len(), std::sync::atomic::Ordering::Relaxed) + records.len();
+        let mut progress = Progress::new("metadata-scan", "Indexando registros XML", scanner.cursor, bytes.len(), "bytes");
+        progress.parsed_rows = parsed;
+        report(reporter, progress);
+        if !done { sink(lines, scanner.cursor, false, None)?; }
     }
     Ok(())
 }
@@ -3206,6 +3667,12 @@ struct IndexDescriptor {
     header_at: Option<usize>,
     start_pattern: Option<String>,
     array: Option<(usize, bool)>,
+    /// First object of concatenated JSON objects without an array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<usize>,
+    /// Record element of an XML log and its depth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xml: Option<(String, usize)>,
 }
 
 /// Chunking affects work scheduling only, never the cache identity or parser
@@ -3245,7 +3712,9 @@ impl PreparedIndex {
         }
         Ok(format!("{:x}", hash.finalize()))
     }
-    pub(crate) fn initial_cursor(&self) -> usize { self.descriptor.array.map_or(0, |(start, _)| start + 1) }
+    pub(crate) fn initial_cursor(&self) -> usize {
+        self.descriptor.array.map_or(self.descriptor.stream.unwrap_or(0), |(start, _)| start + 1)
+    }
     pub(crate) fn multiline(&self) -> bool { self.descriptor.start_pattern.is_some() }
     pub(crate) fn validate(&self) -> Result<(), String> {
         crate::operations::check()?;
@@ -3258,6 +3727,20 @@ impl PreparedIndex {
 }
 
 pub(crate) fn prepare_index(path: &str, format: &str, custom: Option<CustomParse>, saved_ts: Option<CompiledTsConfig>) -> Result<PreparedIndex, String> {
+    prepare_index_from(path, None, format, custom, saved_ts)
+}
+
+/// Day a file refers to: a date in its name, else the local day it was last written.
+fn reference_day(name: &str, physical: &str) -> Option<chrono::NaiveDate> {
+    stamp::date_in_name(name).or_else(|| {
+        let modified = std::fs::metadata(physical).ok()?.modified().ok()?;
+        Some(chrono::DateTime::<chrono::Local>::from(modified).date_naive())
+    })
+}
+
+/// `origin`: the name shown to the user and the file it was read from, when
+/// `path` is a converted copy (decompressed, re-encoded, extracted).
+pub(crate) fn prepare_index_from(path: &str, origin: Option<(&str, &str)>, format: &str, custom: Option<CustomParse>, saved_ts: Option<CompiledTsConfig>) -> Result<PreparedIndex, String> {
     crate::operations::check()?;
     let canonical_lease = crate::workspace::canonical_source_lease(std::path::Path::new(path))?;
     let event_identity = crate::workspace::canonical_event_identity(std::path::Path::new(path))?;
@@ -3274,10 +3757,16 @@ pub(crate) fn prepare_index(path: &str, format: &str, custom: Option<CustomParse
         else if format == "csv" { detect_delimited(&mmap).unwrap_or("csv").to_string() }
         else { format.to_string() };
     let mut header: Vec<String> = Vec::new();
+    // Tabular exports may open with a few lines of text before their header.
+    let layout = delimited_layout(&mmap).filter(|(found, _)| delimiter_of(&fmt) == delimiter_of(found));
     if let Some(delimiter) = delimiter_of(&fmt) {
         let body = mmap.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&mmap);
-        if let Some(first) = body.split(|&b| b == b'\n').find(|line| !line.trim_ascii().is_empty()) {
-            let first = String::from_utf8_lossy(first).trim().to_string();
+        let line = match layout {
+            Some((_, offset)) => mmap[offset..].split(|&b| b == b'\n').next(),
+            None => body.split(|&b| b == b'\n').find(|line| !line.trim_ascii().is_empty()),
+        };
+        if let Some(first) = line {
+            let first = decode_text(first).trim_start_matches('\u{feff}').trim().to_string();
             header = split_delimited(&first, delimiter).iter().map(|s| s.trim().to_string()).collect();
         }
     } else if fmt == "zeek" {
@@ -3291,7 +3780,11 @@ pub(crate) fn prepare_index(path: &str, format: &str, custom: Option<CustomParse
         for line in mmap.split(|&b| b == b'\n').take(20) {
             let l = String::from_utf8_lossy(line);
             if let Some(rest) = l.trim().to_lowercase().strip_prefix("#fields:") {
-                header = rest.split_whitespace().map(|s| s.to_string()).collect(); break;
+                header = rest.split_whitespace().map(|s| s.to_string()).collect();
+                if header.len() == 1 && rest.contains(',') {
+                    header = rest.trim().split(',').map(|s| s.trim().to_string()).collect();
+                }
+                break;
             }
         }
     }
@@ -3301,14 +3794,29 @@ pub(crate) fn prepare_index(path: &str, format: &str, custom: Option<CustomParse
             if !line.trim_ascii().is_empty() { found = Some(offset); break; }
             offset += line.len() + 1;
         }
-        found
+        layout.map(|(_, offset)| offset).or(found)
     } else { None };
-    let start_pattern = match fmt.as_str() { "log4j" | "wildfly" => detect_entry_start(&mmap).map(|re| re.as_str().to_string()), _ => None };
+    let mut calendar = ParserCalendar::current()?;
+    if fmt != "snapshot" {
+        let (name, physical) = origin.unwrap_or((path, path));
+        calendar.reference = reference_day(name, physical);
+        let sample: Vec<std::borrow::Cow<'_, str>> = mmap.split(|&b| b == b'\n').take(2_000).map(decode_text).collect();
+        calendar.day_first = stamp::learn_day_first(sample.iter().map(|line| line.as_ref()));
+    }
+    let start_pattern = match fmt.as_str() {
+        "log4j" | "wildfly" => detect_entry_start(&mmap).map(|re| re.as_str().to_string()),
+        "mixed" => detect_record_start(&mmap, &calendar.context()),
+        _ => None,
+    };
     let content_start = if mmap.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
     let first_byte = (content_start..mmap.len()).find(|&i| !mmap[i].is_ascii_whitespace());
     let array = first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'[').map(|start| (start, false))
         .or_else(|| first_byte.filter(|&i| fmt == "jsonl" && mmap[i] == b'{' && !looks_like_jsonl(&mmap[i..]))
             .and_then(|_| json_envelope_array(&mmap)).map(|start| (start, true)));
+    let stream = if array.is_none() && fmt == "jsonl" {
+        first_byte.filter(|&i| mmap[i] == b'{' && !looks_like_jsonl(&mmap[i..])).and_then(|_| json_stream_start(&mmap))
+    } else { None };
+    let xml = (fmt == "xml").then(|| xml_log::record_element(&mmap[..mmap.len().min(1 << 20)])).flatten();
     let custom_descriptor = match &custom {
         Some(CustomParse::Regex(re)) => serde_json::json!(["regex", re.as_str()]),
         Some(CustomParse::Delimited { sep, fields }) => serde_json::json!(["delimited", sep, fields]),
@@ -3317,9 +3825,9 @@ pub(crate) fn prepare_index(path: &str, format: &str, custom: Option<CustomParse
     let identity = crate::index_cache::identity(path, &mmap);
     let prepared = PreparedIndex {
         limits: IndexLimits::default(), parsed_rows: std::sync::atomic::AtomicUsize::new(0),
-        descriptor: IndexDescriptor { requested_format: format.into(), format: fmt.clone(), custom: custom_descriptor, header: header.clone(), header_at, start_pattern, array },
+        descriptor: IndexDescriptor { requested_format: format.into(), format: fmt.clone(), custom: custom_descriptor, header: header.clone(), header_at, start_pattern, array, stream, xml },
         stamp,
-        part: FilePart { path: path.into(), physical_path: path.into(), physical_file_id: file_identity(&file), calendar: ParserCalendar::current()?, canonical_lease, event_identity, metadata_identity: String::new(),
+        part: FilePart { path: path.into(), physical_path: path.into(), physical_file_id: file_identity(&file), calendar, canonical_lease, event_identity, metadata_identity: String::new(),
             file_name: file_name_of(path), format: fmt, custom, ts_config: saved_ts, header, mmap: std::sync::Arc::new(mmap), base: 0, identity },
     };
     prepared.validate()?;
@@ -3330,15 +3838,21 @@ pub(crate) fn index_prepared(prepared: &PreparedIndex, mut resume: crate::metada
     use crate::metadata_checkpoint::{report, Progress};
     prepared.validate()?;
     let bytes: &[u8] = &prepared.part.mmap;
-    let safe_cursor = resume.cursor == bytes.len() || match prepared.descriptor.array {
-        Some((start, _)) => resume.cursor == start + 1 || resume.cursor > start + 1 && bytes.get(resume.cursor - 1) == Some(&b'}'),
-        None => resume.cursor == 0 || bytes.get(resume.cursor - 1) == Some(&b'\n'),
+    let xml_boundary = prepared.descriptor.xml.is_some() && (resume.cursor == 0 || bytes.get(resume.cursor - 1) == Some(&b'>'));
+    let safe_cursor = resume.cursor == bytes.len() || xml_boundary || prepared.descriptor.xml.is_none() && match (prepared.descriptor.array, prepared.descriptor.stream) {
+        // A record ends an object, a string, a nested array or a scalar.
+        (Some((start, _)), _) => resume.cursor == start + 1 || resume.cursor > start + 1
+            && bytes.get(resume.cursor - 1).is_some_and(|&b| matches!(b, b'}' | b']' | b'"') || b.is_ascii_alphanumeric()),
+        (None, Some(start)) => resume.cursor == start || resume.cursor > start && matches!(bytes.get(resume.cursor - 1), Some(b'}' | b'\n')),
+        (None, None) => resume.cursor == 0 || bytes.get(resume.cursor - 1) == Some(&b'\n'),
     };
     if !safe_cursor { return Err("Limite de retomada dos metadados inválido.".into()); }
     if !resume.scan_complete {
-        match prepared.descriptor.array {
-            Some((start, envelope)) => index_json_array(&prepared, start, envelope, resume.cursor, &mut resume.lines, sink, reporter)?,
-            None => index_lines(&prepared, &mut resume.lines, resume.cursor, sink, reporter)?,
+        match (prepared.descriptor.array, prepared.descriptor.stream) {
+            _ if prepared.descriptor.xml.is_some() => index_xml_records(&prepared, resume.cursor, &mut resume.lines, sink, reporter)?,
+            (Some((start, envelope)), _) => index_json_array(&prepared, start, envelope, false, resume.cursor, &mut resume.lines, sink, reporter)?,
+            (None, Some(start)) => index_json_array(&prepared, start, false, true, resume.cursor, &mut resume.lines, sink, reporter)?,
+            (None, None) => index_lines(&prepared, &mut resume.lines, resume.cursor, sink, reporter)?,
         }
         prepared.validate()?;
         resume.lines.flush()?;

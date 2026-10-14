@@ -10,16 +10,17 @@ window.Security = (() => {
   const scopeKey = () => JSON.stringify([window.AnalysisContexts?.capture()?.caseId, window.AnalysisContexts?.capture()?.instance, workspaceScope()]);
   const notify = () => document.dispatchEvent(new CustomEvent("security-analysis-change"));
   const names = new Map();
-  let tacticFilter = null;
+  let tacticFilter = null, themeFilter = null;
   let shownEpisodes = 3;
   let minimumEvidence = 5, universe = "", summarySlots = null;
   const evidence = () => window.EvidenceUI;
   const universeKey = () => JSON.stringify([window.AnalysisContexts?.capture(), workspaceScope(), workspaceScope() === "case" ? caseSig(true) : state.currentArtifact?.id, state.currentArtifact?.loadedAt]);
-  function captureView() { return { minimumEvidence, tacticFilter, shownEpisodes }; }
+  function captureView() { return { minimumEvidence, tacticFilter, themeFilter, shownEpisodes }; }
   function restoreView(value) {
     universe = universeKey();
     minimumEvidence = Number.isInteger(value?.minimumEvidence) && value.minimumEvidence >= 1 && value.minimumEvidence <= 5 ? value.minimumEvidence : 5;
     tacticFilter = typeof value?.tacticFilter === "string" && value.tacticFilter.length <= 100 ? value.tacticFilter : null;
+    themeFilter = typeof value?.themeFilter === "string" && value.themeFilter.length <= 40 ? value.themeFilter : null;
     shownEpisodes = Number.isInteger(value?.shownEpisodes) && value.shownEpisodes >= 3 && value.shownEpisodes <= 500 ? value.shownEpisodes : 3;
   }
   function syncUniverse() { const next = universeKey(); if (next !== universe) { universe = next; minimumEvidence = 5; } }
@@ -157,7 +158,7 @@ window.Security = (() => {
     if (!cached() || pending.has(scopeKey())) return;
     const generation=++pageGeneration, context=key(), level=minimumEvidence;
     const request=fullRequest(),owner=window.AnalysisContexts?.capture();
-    const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter,cacheOnly:true},{silent:true,analysisOwner:owner});
+    const data=await api("triage",{...request,minimumEvidence:level,episodeOffset:offset,episodeLimit:20,tactic:tacticFilter,theme:themeFilter,cacheOnly:true},{silent:true,analysisOwner:owner});
     analysisRequests.set(data,{request,owner});
     if(generation!==pageGeneration || context!==key() || level!==minimumEvidence)return;
     rememberResult(context,data,owner);remember(data);
@@ -414,25 +415,138 @@ window.Security = (() => {
         <span class="sec-row-actions"><button class="btn ghost" data-act="d-records" aria-expanded="false">Ver eventos</button>${icon("fa-eye-slash", "Ocultar esta detecção", "d-hide")}</span><div class="sec-inline-events" hidden></div></div>`;
     }).join("");
   }
+  // ---------------------------------------------------------------- sections
+  const themeLabel = (data, k) => data?.themes?.find(t => t.key === k)?.label || k;
+  /** Sections of the analysis: each finding belongs to one; "Todas" shows every card. */
+  function themeTabs(data) {
+    if (!Array.isArray(data.themes)) return "";
+    const themes = data.themes.map(t => ({ ...t, count: t.counts_by_level ? t.counts_by_level.slice(minimumEvidence - 1).reduce((a, b) => a + b, 0) : data.detections.filter(d => visibleDetection(d) && d.theme === t.key).length }));
+    const shown = themes.filter(t => t.count || t.key === "clients" || t.key === themeFilter);
+    const all = themes.reduce((sum, t) => sum + t.count, 0), current = themes.find(t => t.key === themeFilter);
+    const tab = (k, icon, label, count, title) => `<button type="button" role="tab" class="sec-theme${(themeFilter || "") === k ? " on" : ""}" data-theme="${esc(k)}" aria-selected="${(themeFilter || "") === k}" title="${esc(title)}"><i class="fas ${esc(icon)}" aria-hidden="true"></i><span>${esc(label)}</span>${count ? `<b>${fmtNum(count)}</b>` : ""}</button>`;
+    return `<nav class="sec-themes" role="tablist" aria-label="Seções dos comprometimentos">${tab("", "fa-layer-group", "Todas", all, "Todos os indícios, de todas as seções")}${shown.map(t => tab(t.key, t.icon, t.label, t.count, t.description)).join("")}</nav>${current ? `<p class="sec-theme-description"><i class="fas ${esc(current.icon)}" aria-hidden="true"></i>${esc(current.description)}</p>` : ""}`;
+  }
+  function bindThemes(slot, data) {
+    slot.querySelectorAll("[data-theme]").forEach(b => b.onclick = () => {
+      const next = b.dataset.theme || null;
+      if (next === themeFilter) return;
+      themeFilter = next; tacticFilter = null;
+      if (data.storage?.kind === "sqlite") loadStoredPage(0).catch(e => toast(String(e), "err")); else drawAttention(slot, data);
+    });
+  }
+
+  // ---------------------------------------------------------------- clients
+  const CLIENT_CLASSES = {
+    "ferramenta ofensiva": ["Ferramentas de ataque", "fa-skull-crossbones"], "automação de navegador": ["Automação de navegador", "fa-robot"],
+    "biblioteca ou linha de comando": ["Bibliotecas e linha de comando", "fa-terminal"], "desconhecido": ["Clientes desconhecidos", "fa-circle-question"],
+    "vazio": ["Sem user agent", "fa-ban"], "robô ou rastreador": ["Robôs e rastreadores", "fa-spider"], "monitoramento": ["Monitoramento", "fa-heart-pulse"],
+    "aplicativo": ["Aplicativos", "fa-mobile-screen"], "navegador": ["Navegadores", "fa-globe"],
+  };
+  const inventories = new Map();
+  const instant = value => value == null ? null : typeof value === "number" ? value : (Number.isFinite(Date.parse(value)) ? Date.parse(value) : null);
+  function clientMenu(event, filters, label, start, end) {
+    event.preventDefault();
+    showCtxMenu(event.clientX, event.clientY, [
+      { icon: "fa-filter", label: "Filtrar no Explorar", onClick: () => showRecords(filters) },
+      { icon: "fa-timeline", label: "Ver na linha do tempo", onClick: () => showTimeline(filters, start, end) },
+      { icon: "fa-copy", label: "Copiar", onClick: () => navigator.clipboard?.writeText(label) },
+    ]);
+  }
+  /** Inventory of who accessed the full data set, by class, family and impossible browser claims. */
+  async function mountClients(slot) {
+    const host = slot.querySelector("[data-client-inventory]");
+    if (!host) return;
+    const context = key(), request = fullRequest(), owner = window.AnalysisContexts?.capture();
+    host.className = "ws-card sec-clients";
+    let inventory = inventories.get(context);
+    if (!inventory) host.innerHTML = '<div class="ws-loading"><i class="fas fa-circle-notch spin" aria-hidden="true"></i>Lendo os clientes de todos os registros…</div>';
+    try {
+      if (!inventory) {
+        inventory = await api("client_inventory", { ...request }, { silent: true, analysisOwner: owner, latest: "client-inventory" });
+        inventories.set(context, inventory);
+        while (inventories.size > 4) inventories.delete(inventories.keys().next().value);
+      }
+    } catch (error) {
+      if (host.isConnected) { host.innerHTML = `<p class="small error">Não foi possível ler os clientes: ${esc(String(error))}</p>`; const retry = el("button", "btn ghost small", "Tentar novamente"); retry.onclick = () => mountClients(slot); host.append(retry); }
+      return;
+    }
+    if (!host.isConnected || context !== key()) return;
+    drawClients(host, inventory);
+  }
+  function drawClients(host, inventory) {
+    const total = inventory.total || 0, share = n => total ? Math.max(0.5, 100 * n / total) : 0;
+    const period = row => range(instant(row.first), instant(row.last));
+    const sources = row => row.sources == null ? "" : `${fmtNum(row.sources)} ${row.sources === 1 ? "origem" : "origens"}`;
+    if (!total) {
+      host.innerHTML = `<div class="card-heading"><h2>Quem acessou</h2></div><p class="small muted">Nenhum registro deste conjunto traz user agent. A classificação de clientes vale para logs web, de proxy e de APIs.</p>`;
+      return;
+    }
+    const familyRows = families => families.map((f, i) => `<tr data-family="${i}" tabindex="0"><td><strong></strong></td><td class="num">${fmtNum(f.records)}</td><td class="num">${esc(sources(f))}</td><td>${esc(period(f))}</td></tr>`).join("");
+    const classBlock = (c, i) => {
+      const [label, icon] = CLIENT_CLASSES[c.class] || [c.class, "fa-circle-question"];
+      return `<details class="sec-client-class${c.class === "navegador" ? " browsers" : ""}" data-class="${i}">
+        <summary><i class="fas ${icon}" aria-hidden="true"></i><span class="sec-client-name"><strong>${esc(label)}</strong><small>${esc(c.description || "")}</small></span><span class="sec-client-bar" aria-hidden="true"><b style="width:${share(c.records)}%"></b></span><span class="num">${fmtNum(c.records)}</span><span class="num muted">${esc(sources(c))}</span></summary>
+        <table class="sec-client-families"><thead><tr><th>Cliente</th><th class="num">Registros</th><th class="num">Origens</th><th>Período</th></tr></thead><tbody>${familyRows(c.families)}</tbody></table>${c.omitted_families ? `<p class="small muted">Mais ${fmtNum(c.omitted_families)} clientes menores nesta classe.</p>` : ""}
+        <button type="button" class="text-button" data-class-records>Ver os ${fmtNum(c.records)} registros no Explorar</button></details>`;
+    };
+    const anomalies = inventory.anomalies.length
+      ? `<h3 class="sec-client-heading"><i class="fas fa-mask" aria-hidden="true"></i>Navegadores impossíveis ou forjados</h3><p class="small muted">Declaram ser navegador numa forma que nenhum navegador real produz na data do registro.</p>
+        <div class="sec-client-anomalies">${inventory.anomalies.map((a, i) => `<button type="button" class="sec-client-anomaly" data-anomaly="${i}"><span></span><span class="num">${fmtNum(a.records)}</span><span class="num muted">${esc(sources(a))}</span><time>${esc(period(a))}</time></button>`).join("")}</div>
+        ${inventory.forged_agents.length ? `<details class="sec-client-agents"><summary>User agents impossíveis mais frequentes (${fmtNum(inventory.forged_agents.length + (inventory.omitted_forged_agents || 0))})</summary>${inventory.forged_agents.map((a, i) => `<button type="button" class="sec-client-agent" data-agent="${i}"><code></code><span class="num">${fmtNum(a.records)}</span></button>`).join("")}</details>` : ""}`
+      : `<p class="small muted sec-client-heading">Nenhum navegador impossível: todas as declarações de navegador são coerentes com o que os navegadores reais enviam na data de cada registro.</p>`;
+    host.innerHTML = `<div class="card-heading"><h2>Quem acessou</h2><span>${fmtNum(total)} registros com user agent · conjunto completo</span></div>
+      <div class="sec-client-classes">${inventory.classes.map(classBlock).join("")}</div>${anomalies}
+      <details class="sec-client-method"><summary>Como a classificação funciona</summary><p class="small">${esc(inventory.method || "")}</p></details>`;
+    inventory.classes.forEach((c, i) => {
+      const block = host.querySelector(`[data-class="${i}"]`), base = [{ column: "ua.class", op: "equals_exact", value: c.class }];
+      block.querySelector("[data-class-records]").onclick = () => showRecords(base);
+      block.querySelector("summary").oncontextmenu = event => clientMenu(event, base, c.class, instant(c.first), instant(c.last));
+      c.families.forEach((f, j) => {
+        const row = block.querySelector(`[data-family="${j}"]`), filters = [...base, { column: "ua.family", op: "equals_exact", value: f.value }];
+        row.querySelector("strong").textContent = f.value;
+        row.onclick = () => showRecords(filters);
+        row.onkeydown = event => { if (event.key === "Enter") showRecords(filters); };
+        row.oncontextmenu = event => clientMenu(event, filters, f.value, instant(f.first), instant(f.last));
+      });
+    });
+    host.querySelectorAll("[data-anomaly]").forEach(b => {
+      const a = inventory.anomalies[+b.dataset.anomaly], filters = [{ column: "ua.anomaly", op: "equals_exact", value: a.value }];
+      b.querySelector("span").textContent = a.value;
+      b.title = "Filtrar estes registros no Explorar";
+      b.onclick = () => showRecords(filters);
+      b.oncontextmenu = event => clientMenu(event, filters, a.value, instant(a.first), instant(a.last));
+    });
+    host.querySelectorAll("[data-agent]").forEach(b => {
+      const a = inventory.forged_agents[+b.dataset.agent], filters = [{ column: "@user_agent", op: "equals_exact", value: a.value }];
+      b.querySelector("code").textContent = a.value;
+      b.title = `${fmtNum(a.records)} registros · ${sources(a)} · ${period(a)}`;
+      b.onclick = () => showRecords(filters);
+      b.oncontextmenu = event => clientMenu(event, filters, a.value, instant(a.first), instant(a.last));
+    });
+  }
+  document.addEventListener("workspace-context-change", () => inventories.clear());
+
   function drawAttention(slot, data) {
     syncUniverse();
-    const eligibleEpisodes = data.episodes.filter(e => e.detections.some(i => visibleDetection(data.detections[i])));
-    const matching = data.episodes.map((e, i) => ({ e, i })).filter(({ e }) => eligibleEpisodes.includes(e) && (!tacticFilter || e.tactics.includes(tacticFilter)));
-    const controls = previousNotice() + '<div class="sec-calculation-actions"><button type="button" class="btn ghost small" data-calculate-compromises>Recalcular comprometimentos</button></div>' + evidence().control(data, minimumEvidence);
-    slot.dataset.analysisState = "ready"; slot.removeAttribute("aria-busy");
-    const bindRigidity = () => { bindCalculation(slot); slot.querySelectorAll("[data-evidence-min]").forEach(b => b.onclick = () => setMinimum(+b.dataset.evidenceMin)); };
     const stored=data.storage?.kind==="sqlite";
+    // Stored pages arrive filtered by section; in-memory results are filtered here.
+    const eligibleEpisodes = data.episodes.filter(e => e.detections.some(i => visibleDetection(data.detections[i])) && (stored || !themeFilter || (e.themes || []).includes(themeFilter)));
+    const matching = data.episodes.map((e, i) => ({ e, i })).filter(({ e }) => eligibleEpisodes.includes(e) && (!tacticFilter || e.tactics.includes(tacticFilter)));
+    const controls = previousNotice() + '<div class="sec-calculation-actions"><button type="button" class="btn ghost small" data-calculate-compromises>Recalcular comprometimentos</button></div>' + evidence().control(data, minimumEvidence) + themeTabs(data) + (themeFilter === "clients" ? '<div data-client-inventory></div>' : "");
+    slot.dataset.analysisState = "ready"; slot.removeAttribute("aria-busy");
+    const bindRigidity = () => { bindCalculation(slot); slot.querySelectorAll("[data-evidence-min]").forEach(b => b.onclick = () => setMinimum(+b.dataset.evidenceMin)); bindThemes(slot, data); };
     const episodes = stored ? matching : matching.slice(0, shownEpisodes);
     const hidden = matching.length - episodes.length;
     const rulesText = `${fmtNum(data.rules)} regras${data.threat_rules ? ` · ${fmtNum(data.threat_rules)} sinais` : ""}${data.sigma_rules ? ` · ${fmtNum(data.sigma_rules)} Sigma` : ""}`;
     if (!eligibleEpisodes.length) {
       slot.className = "sec-clear";
       const gaps = (data.rule_coverage || []).filter(r => ["partial", "missing_fields", "missing_coverage"].includes(r.status));
-      slot.innerHTML = `${controls}<div class="evidence-empty"><strong>Nenhum indício no nível ${evidence().label(minimumEvidence)}${minimumEvidence < 5 ? " ou acima" : ""} encontrado neste conjunto.</strong><p>${(data.counts_by_level || []).slice(0, minimumEvidence - 1).some(Boolean) ? "Existem indícios em outros níveis. Selecione um nível abaixo para investigar." : "A ausência de indícios não demonstra ausência de comprometimento."}</p><small>Cobertura: ${data.limited || gaps.length ? "parcial" : "conforme os campos disponíveis"}${gaps.length ? ` · ${gaps.length} regras com dados insuficientes` : ""}. ${esc((data.limitations || []).join(" · "))}</small></div><small>${esc(rulesText)} · ${fmtNum(data.total)} registros analisados no universo completo</small>`;
+      slot.innerHTML = `${controls}<div class="evidence-empty"><strong>Nenhum indício${themeFilter ? ` em ${esc(themeLabel(data, themeFilter))}` : ""} no nível ${evidence().label(minimumEvidence)}${minimumEvidence < 5 ? " ou acima" : ""} encontrado neste conjunto.</strong><p>${(data.counts_by_level || []).slice(0, minimumEvidence - 1).some(Boolean) ? "Existem indícios em outros níveis. Selecione um nível abaixo para investigar." : "A ausência de indícios não demonstra ausência de comprometimento."}</p><small>Cobertura: ${data.limited || gaps.length ? "parcial" : "conforme os campos disponíveis"}${gaps.length ? ` · ${gaps.length} regras com dados insuficientes` : ""}. ${esc((data.limitations || []).join(" · "))}</small></div><small>${esc(rulesText)} · ${fmtNum(data.total)} registros analisados no universo completo</small>`;
       bindRigidity();
       if(tacticFilter){const clear=el('button','text-button',`Remover seleção de tática: ${tacticLabel(data,tacticFilter)}`);clear.onclick=()=>{tacticFilter=null;data.storage?.kind==='sqlite'?loadStoredPage(0).catch(e=>toast(String(e),'err')):drawAttention(slot,data);};slot.append(clear);}
       slot.hidden = false;
       slot.querySelector("[data-open-rules]")?.addEventListener("click", () => openSettings("detection"));
+      mountClients(slot);
       return;
     }
     slot.className = "ws-card sec-attention";
@@ -450,6 +564,7 @@ window.Security = (() => {
     }
     bindRigidity();
     bindAttention(slot, data);
+    mountClients(slot);
   }
   function bindAttention(slot, data) {
     slot.querySelectorAll("[data-page-offset]").forEach(b=>b.onclick=()=>loadStoredPage(+b.dataset.pageOffset).catch(e=>toast(String(e),"err")));
@@ -720,7 +835,7 @@ window.Security = (() => {
     attention.hidden = false; attention.className = 'ws-card sec-summary'; attention.dataset.analysisState = "ready"; attention.removeAttribute("aria-busy");
     const counts = data.universe_counts_by_level || data.counts_by_level || [0,0,0,0,0], max = Math.max(1,...counts);
     attention.innerHTML = `${previousNotice()}<div class="card-heading"><h2>Comprometimentos</h2><button class="text-button" data-open-compromises>Abrir análise <i class="fas fa-arrow-right"></i></button></div><p class="small muted">Indícios por força da evidência · ${fmtNum(data.total)} registros no conjunto completo · filtros do Explorar não se aplicam</p><div class="sec-count-chart" role="group" aria-label="Número de indícios por força da evidência">${[5,4,3,2,1].map(n=>`<button class="sec-chart-row evidence-e${n}" data-chart-level="${n}" aria-label="${evidence().label(n)}: ${counts[n-1]} indícios"><span>${evidence().label(n)}</span><span class="sec-chart-track"><span style="width:${100*counts[n-1]/max}%"></span></span><strong>${fmtNum(counts[n-1])}</strong></button>`).join('')}</div>`;
-    const open=async level=>{const hadTactic=!!tacticFilter;tacticFilter=null;await Workspace.showPage('compromises');if(level)setMinimum(level);else if(hadTactic&&cached()?.storage?.kind==='sqlite')loadStoredPage(0).catch(error=>toast(String(error),'err'));};
+    const open=async level=>{const hadTactic=!!tacticFilter||!!themeFilter;tacticFilter=null;themeFilter=null;await Workspace.showPage('compromises');if(level)setMinimum(level);else if(hadTactic&&cached()?.storage?.kind==='sqlite')loadStoredPage(0).catch(error=>toast(String(error),'err'));};
     attention.querySelector('[data-open-compromises]').onclick=()=>open();
     attention.querySelectorAll('[data-chart-level]').forEach(b=>b.onclick=()=>open(+b.dataset.chartLevel));
   }
@@ -848,6 +963,8 @@ window.Security = (() => {
     { icon: "fa-terminal", label: "Execução de PowerShell e shells", query: "@process:/(^|[\\\\/])(powershell|pwsh|cmd|bash|sh)(\\.exe)?$/ OR @action:script_execution" },
     { icon: "fa-eraser", label: "Registros apagados ou auditoria alterada", query: "@action:(log_clear OR audit_policy_change OR protection_disabled)" },
     { icon: "fa-toolbox", label: "Ferramentas de ataque e varredura", query: "@tool:*" },
+    { icon: "fa-user-secret", label: "Clientes que não são navegadores", query: "ua.class:* -ua.class:navegador" },
+    { icon: "fa-mask", label: "Navegadores impossíveis ou forjados", query: "ua.anomaly:*" },
     { icon: "fa-shield-virus", label: "Conteúdo compatível com ameaças", query: "regra:*" },
     { icon: "fa-server", label: "Erros de servidor (5xx)", query: "@status:5*" },
   ];

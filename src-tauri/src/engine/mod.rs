@@ -399,7 +399,7 @@ fn spec(
             hash.update(b"|timezone-configuration:");
             hash.update(part.calendar.timezone.as_bytes());
             if crate::sources::uses_inferred_calendar_year(&part.format) {
-                hash.update(format!("|inferred-year:{}", part.calendar.year));
+                hash.update(format!("|inferred-year:{}", part.calendar.inference_signature()));
             }
             if let Some(identity) = &part.event_identity {
                 hash.update(b"|logical-event-identity:");
@@ -2763,7 +2763,7 @@ mod metadata_identity_tests {
         hash.update(b"|timezone-configuration:");
         hash.update(part.calendar.timezone.as_bytes());
         if crate::sources::uses_inferred_calendar_year(&part.format) {
-            hash.update(format!("|inferred-year:{}", part.calendar.year));
+            hash.update(format!("|inferred-year:{}", part.calendar.inference_signature()));
         }
         if let Some(identity) = &part.event_identity {
             hash.update(b"|logical-event-identity:");
@@ -2814,10 +2814,11 @@ mod metadata_identity_tests {
             ("nginx-error", "2026/10/02 12:00:00 [error] 7#7: *12 open() failed, client: 127.0.0.1, server: example.test\n", true),
             ("logfmt", "time=2026-10-02T12:00:00Z level=info msg=healthy request_id=42\n", true),
             ("mixed", "127.0.0.1 - - [02/Oct/2026:12:00:00 +0000] \"-\" 400 0\n{\"message\":\"next\"}\n", true),
-            ("text", "127.0.0.1 - - [02/Oct/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 5\n", false),
-            ("syslog3164", "Oct  2 12:00:00 host app: healthy\n", false),
-            ("csv", "timestamp,message\n2026-10-02T12:00:00Z,healthy\n", false),
-            ("custom", "explicit user format remains authoritative\n", false),
+            // Every text reader shares the universal date/header/message readers.
+            ("text", "127.0.0.1 - - [02/Oct/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 5\n", true),
+            ("syslog3164", "Oct  2 12:00:00 host app: healthy\n", true),
+            ("csv", "timestamp,message\n2026-10-02T12:00:00Z,healthy\n", true),
+            ("custom", "explicit user format remains authoritative\n", true),
         ] {
             let path = dir.path().join(format!("{format}.log"));
             std::fs::write(&path, raw).unwrap();

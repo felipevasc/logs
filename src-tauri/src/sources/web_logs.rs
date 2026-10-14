@@ -1,6 +1,10 @@
-//! Conservative, line-oriented HTTP log extraction. Positional custom columns
-//! are never guessed; source spelling/escaping and the complete raw record stay
-//! available. No vendor is inferred from generic JSON/logfmt HTTP field names.
+//! Line-oriented HTTP log extraction: Common/Combined Log Format and their
+//! variants (quoted or unquoted request lines as in Tomcat/JBoss `%r`, virtual
+//! host or X-Forwarded-For prefixes, any bracketed date layout, optional size,
+//! extra suffix columns), nginx error logs and HTTP fields in JSON/logfmt.
+//! Source spelling/escaping and the complete raw record stay available; named
+//! suffix pairs keep their names and unnamed suffix values their order. No
+//! vendor is inferred from generic JSON/logfmt HTTP field names.
 //!
 //! Format references (fixtures use synthetic addresses and messages):
 //! https://nginx.org/en/docs/http/ngx_http_log_module.html#log_format
@@ -10,13 +14,6 @@
 use super::{normalize_level, parse_timestamp};
 use crate::model::Event;
 use serde_json::{Map, Value};
-
-fn access_re() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(
-        r#"^(\S+)[ \t]+(\S+)[ \t]+(\S+)[ \t]+\[([^\]\r\n]+)\][ \t]+"((?:\\.|[^"\\\r\n])*)"[ \t]+([0-9]{3})[ \t]+([0-9]+|-)(?:[ \t]+(.*))?$"#,
-    ).unwrap())
-}
 
 fn error_re() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -33,7 +30,7 @@ pub(super) fn access_timestamp(value: &str) -> Option<i64> {
 
 // Cheap dispatch guards run before any regex or key/value scanning.
 pub(super) fn access_candidate(line: &str) -> bool {
-    line.contains('[') && line.contains(']') && line.contains('"')
+    line.contains('[') && line.contains(']')
 }
 
 pub(super) fn error_candidate(line: &str) -> bool {
@@ -143,40 +140,228 @@ fn add_request_fields(fields: &mut Map<String, Value>, request: &str) {
     }
 }
 
+fn word(s: &str) -> (&str, &str) {
+    match s.find([' ', '\t']) {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, ""),
+    }
+}
+
+fn spaced(s: &str) -> Option<&str> {
+    let trimmed = s.trim_start_matches([' ', '\t']);
+    (trimmed.len() < s.len()).then_some(trimmed)
+}
+
+/// Client, ident and user columns: an address, a host name or `-`.
+fn host_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 255 && !token.contains(['"', '[', ']', '=', '{', '}'])
+}
+
+/// Request written without quotes (`%r` in Tomcat/JBoss/WildFly patterns):
+/// `METHOD target [HTTP/x.y]`, or `-`.
+fn unquoted_request(rest: &str) -> Option<(&str, &str)> {
+    if let Some(after) = rest.strip_prefix('-') {
+        if after.is_empty() || after.starts_with([' ', '\t']) {
+            return Some(("-", after));
+        }
+    }
+    let (method, after_method) = word(rest);
+    if !method_token(method) {
+        return None;
+    }
+    let target_text = spaced(after_method)?;
+    let (target, after_target) = word(target_text);
+    let plausible = target.starts_with('/') || target.starts_with("http://") || target.starts_with("https://") || target == "*" || target.contains(':');
+    if !request_target(target) || !plausible {
+        return None;
+    }
+    let mut end = rest.len() - after_target.len();
+    if let Some(protocol_text) = spaced(after_target) {
+        let (protocol, after_protocol) = word(protocol_text);
+        if protocol.starts_with("HTTP/") && request_parts(&format!("{method} {target} {protocol}")).is_some() {
+            end = rest.len() - after_protocol.len();
+        }
+    }
+    Some((&rest[..end], &rest[end..]))
+}
+
+/// A product token that starts a user agent: `Mozilla/5.0`, `curl/8.4.0`.
+fn user_agent_start(token: &str) -> bool {
+    let Some((product, version)) = token.split_once('/') else { return false };
+    !product.is_empty()
+        && product != "HTTP"
+        && product.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && product.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+        && version.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
+fn decimal(token: &str) -> Option<(f64, usize)> {
+    let (whole, fraction) = token.split_once('.')?;
+    (!whole.is_empty() && whole.bytes().all(|b| b.is_ascii_digit()) && !fraction.is_empty() && fraction.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| token.parse().ok().map(|v| (v, fraction.len())))
+        .flatten()
+}
+
+/// Tokens of an unnamed access-log suffix, quoted strings kept whole.
+fn suffix_tokens(tail: &str) -> Vec<(usize, &str, bool)> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    let b = tail.as_bytes();
+    while i < b.len() && tokens.len() < 64 {
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        if b[i] == b'"' {
+            if let Some((value, after)) = quoted(&tail[i..]) {
+                tokens.push((i, value, true));
+                i = tail.len() - after.len();
+                continue;
+            }
+        }
+        let start = i;
+        while i < b.len() && b[i] != b' ' && b[i] != b'\t' {
+            i += 1;
+        }
+        tokens.push((start, &tail[start..i], false));
+    }
+    tokens
+}
+
+/// Names what can be told apart in an unnamed suffix (Tomcat `%D %T`
+/// milliseconds/seconds, thread names, durations with units, an unquoted
+/// user agent running to the end); the rest is kept in order as
+/// `access.extra.N`. `free_text_agent`: in unquoted layouts the user agent is
+/// the free text that ends the record ("Zabbix", "Apache CXF 2.7", "-").
+fn positional_suffix(tail: &str, fields: &mut Map<String, Value>, agent_known: bool, free_text_agent: bool) {
+    let tokens = suffix_tokens(tail);
+    let mut position = 0usize;
+    let mut k = 0;
+    while k < tokens.len() {
+        let (start, token, was_quoted) = tokens[k];
+        let free_text = free_text_agent
+            && (token == "-" && k + 1 == tokens.len() || token.chars().any(|c| c.is_ascii_alphabetic()))
+            && !super::generic::thread_like(token)
+            && !duration_with_unit(token)
+            && super::generic::ip_port(token).is_none()
+            && token.parse::<std::net::IpAddr>().is_err()
+            && !token.contains('=');
+        if !agent_known && !fields.contains_key("agent") && !was_quoted && (user_agent_start(token) || free_text) {
+            insert_once(fields, "agent", tail[start..].trim());
+            break;
+        }
+        if !was_quoted && !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit()) {
+            if let Some(&(_, next, false)) = tokens.get(k + 1) {
+                if let (Ok(millis), Some((seconds, 3))) = (token.parse::<f64>(), decimal(next)) {
+                    if (millis / 1000.0 - seconds).abs() < 0.0015 && !fields.contains_key("duration_ms") {
+                        insert_once(fields, "duration_ms", token);
+                        insert_once(fields, "duration_s", next);
+                        k += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        if !was_quoted && super::generic::thread_like(token) && !fields.contains_key("thread") {
+            insert_once(fields, "thread", token);
+        } else if !was_quoted && duration_with_unit(token) && !fields.contains_key("duration") {
+            insert_once(fields, "duration", token);
+        } else {
+            position += 1;
+            insert_once(fields, &format!("access.extra.{position}"), token);
+        }
+        k += 1;
+    }
+}
+
+fn duration_with_unit(token: &str) -> bool {
+    let number_end = token.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(token.len());
+    number_end > 0 && matches!(&token[number_end..], "ms" | "s" | "us" | "µs" | "ns" | "m")
+}
+
 pub(super) fn parse_access(line: &str) -> Option<Event> {
     let line_for_parse = line.trim();
     if !access_candidate(line_for_parse) {
         return None;
     }
-    let captures = access_re().captures(line_for_parse)?;
-    let timestamp = access_timestamp(&captures[4])?;
+    // The bracketed time (CLF or any complete date layout) anchors the record.
+    let open = line_for_parse.find('[')?;
+    if open == 0 || open > 512 {
+        return None;
+    }
+    let close = open + line_for_parse[open..].find(']')?;
+    let time_text = &line_for_parse[open + 1..close];
+    let timestamp = access_timestamp(time_text).or_else(|| super::stamp::exact(time_text))?;
+    let prefix: Vec<&str> = line_for_parse[..open].split_ascii_whitespace().collect();
+    if prefix.is_empty() || prefix.len() > 6 || !line_for_parse[..open].ends_with([' ', '\t']) {
+        return None;
+    }
+    let count = prefix.len();
+    let (client, ident, user, before) = match count {
+        1 => (prefix[0], "-", "-", &prefix[..0]),
+        2 => (prefix[0], "-", prefix[1], &prefix[..0]),
+        _ => (prefix[count - 3], prefix[count - 2], prefix[count - 1], &prefix[..count - 3]),
+    };
+    if ![client, ident, user].iter().all(|token| host_token(token)) {
+        return None;
+    }
+    let rest = spaced(&line_for_parse[close + 1..])?;
+    let (request, quoted_request, after_request) = if rest.starts_with('"') {
+        let (request, after) = quoted(rest)?;
+        (request, true, after)
+    } else {
+        let (request, after) = unquoted_request(rest)?;
+        (request, false, after)
+    };
+    let (status, after_status) = word(spaced(after_request)?);
+    if status.len() != 3 || !status.bytes().all(|b| b.is_ascii_digit()) || !(b'1'..=b'5').contains(&status.as_bytes()[0]) {
+        return None;
+    }
+    let (size, after_size) = match spaced(after_status).map(word) {
+        Some((size, after)) if size == "-" || (!size.is_empty() && size.bytes().all(|b| b.is_ascii_digit())) => (Some(size), after),
+        _ => (None, after_status),
+    };
     let mut event = Event::empty();
     event.raw = line.to_string();
     event.timestamp = Some(timestamp);
-    event.source = captures[1].to_string();
-    event.code = captures[6].to_string();
+    event.source = client.to_string();
+    event.code = status.to_string();
     event.level = status_level(&event.code).into();
-    event.message = format!("{} → {}", &captures[5], event.code);
+    event.message = format!("{request} → {status}");
     let fields = &mut event.fields;
-    insert_once(fields, "time_local", &captures[4]);
-    insert_once(fields, "request", &captures[5]);
-    insert_once(fields, "status", &captures[6]);
-    insert_once(fields, "size", &captures[7]); // legacy spelling/type remains stable
-    if captures[1].parse::<std::net::IpAddr>().is_ok() {
-        insert_once(fields, "remote_addr", &captures[1]);
-        insert_once(fields, "client_ip", &captures[1]);
-    } else {
-        insert_once(fields, "remote_host", &captures[1]);
+    insert_once(fields, "time_local", time_text);
+    insert_once(fields, "request", request);
+    insert_once(fields, "status", status);
+    if let Some(size) = size {
+        insert_once(fields, "size", size); // legacy spelling/type remains stable
     }
-    if &captures[2] != "-" {
-        insert_once(fields, "ident", &captures[2]);
+    if client.parse::<std::net::IpAddr>().is_ok() {
+        insert_once(fields, "remote_addr", client);
+        insert_once(fields, "client_ip", client);
+    } else if client != "-" {
+        insert_once(fields, "remote_host", client);
     }
-    if &captures[3] != "-" {
-        insert_once(fields, "user", &captures[3]);
+    if ident != "-" {
+        insert_once(fields, "ident", ident);
     }
-    add_request_fields(fields, &captures[5]);
-    let mut tail = captures.get(8).map_or("", |value| value.as_str()).trim();
-    let mut format = "access.common";
+    if user != "-" {
+        insert_once(fields, "user", user);
+    }
+    if !before.is_empty() {
+        let addresses: Vec<&str> = before.iter().map(|t| t.trim_end_matches(',')).filter(|t| !t.is_empty()).collect();
+        if addresses.iter().all(|t| t.parse::<std::net::IpAddr>().is_ok()) {
+            insert_once(fields, "forwarded_for", &addresses.join(", "));
+        } else if before.len() == 1 {
+            insert_once(fields, "vhost", before[0]);
+        } else {
+            insert_once(fields, "access.prefix", &before.join(" "));
+        }
+    }
+    add_request_fields(fields, request);
+    let mut tail = after_size.trim();
+    let mut format = if quoted_request { "access.common" } else { "access.unquoted" };
     if let Some((referer, after_referer)) = quoted(tail) {
         if after_referer.starts_with([' ', '\t']) {
             if let Some((agent, remaining)) = quoted(after_referer.trim_start()) {
@@ -203,6 +388,9 @@ pub(super) fn parse_access(line: &str) -> Option<Event> {
                 fields.entry(key.clone()).or_insert_with(|| value.clone());
             }
             fields.insert("access.extra_fields".into(), Value::Object(extra));
+        } else {
+            let agent_known = format == "access.combined";
+            positional_suffix(tail, fields, agent_known, !quoted_request);
         }
     }
     Some(event)
@@ -309,6 +497,17 @@ pub(super) fn parse_logfmt(line: &str) -> Option<Event> {
             chrono::DateTime::from_timestamp_millis(millis).map(|_| millis)
         });
     }
+    // Firewalls and appliances (FortiGate, SonicWall) split date and time.
+    if event.timestamp.is_none() {
+        if let (Some(date), Some(time)) = (single(&["date"]), single(&["time"])) {
+            event.timestamp = super::stamp::exact(&format!("{date} {time}"));
+        }
+    }
+    if event.timestamp.is_none() {
+        if let Some(value) = single(&["@timestamp", "datetime", "date_time", "eventtime", "logtime", "devtime", "time_iso8601", "time_local", "rt"]) {
+            event.timestamp = super::text_to_ms(value);
+        }
+    }
     if let Some(value) = single(&["level", "lvl", "severity"]) {
         event.level = normalize_level(value);
     }
@@ -368,14 +567,13 @@ pub(super) fn enrich_http(event: &mut Event, explicit_level: bool) -> bool {
             .fields
             .get("time_iso8601")
             .and_then(Value::as_str)
-            .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
-            .map(|time| time.timestamp_millis())
+            .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok().map(|time| time.timestamp_millis()).or_else(|| super::stamp::exact(time)))
             .or_else(|| {
                 event
                     .fields
                     .get("time_local")
                     .and_then(Value::as_str)
-                    .and_then(access_timestamp)
+                    .and_then(|time| access_timestamp(time).or_else(|| super::stamp::exact(time)))
             });
     }
     if event.code.is_empty() {
@@ -578,14 +776,16 @@ mod tests {
         let snapshot = parse_line(access.as_bytes(), "snapshot", None, &[]);
         assert_eq!(snapshot.parse_status, "unparsed");
         assert!(snapshot.fields.is_empty());
+        // Java framing is unchanged; pairs in the header message become fields.
         let java = "2026-10-02 13:20:30,000 INFO [worker] a.Logger - key=one other=two\n\tat a.Service.run(Service.java:1)";
         let event = parse_line(java.as_bytes(), "log4j", None, &[]);
-        assert!(!event.fields.contains_key("key"));
+        assert_eq!(event.fields["key"], "one");
         assert_eq!(event.raw, java);
-        assert_eq!(parser_semantics_signature("text"), None);
-        assert_eq!(parser_semantics_signature("log4j"), None);
-        assert_eq!(parser_semantics_signature("csv"), None);
-        assert_eq!(parser_semantics_signature("custom"), None);
+        assert_eq!(event.message, "key=one other=two");
+        for format in ["text", "log4j", "csv", "custom", "apache", "mixed"] {
+            assert_eq!(parser_semantics_signature(format), Some("universal-v4"), "{format}");
+        }
+        assert_eq!(parser_semantics_signature("snapshot"), None);
     }
 
     #[test]
@@ -626,11 +826,13 @@ mod tests {
                 "{value}"
             );
         }
+        // Without an offset the time is local, as for every other naive time.
         let json =
             r#"{"time_local":"02/Oct/2026:13:20:30","status":503,"request":"GET / HTTP/1.1"}"#;
+        let local = chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap().and_hms_opt(13, 20, 30).unwrap();
         assert_eq!(
             parse_line(json.as_bytes(), "jsonl", None, &[]).timestamp,
-            None
+            Some(crate::sources::naive_to_ms(local))
         );
         let explicit = r#"{"level":true,"status":503,"request":"GET / HTTP/1.1"}"#;
         assert_eq!(

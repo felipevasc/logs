@@ -12,10 +12,15 @@ References:
 
 Extraction preserves the exact source spelling of quoted escapes (default,
 JSON, or literal) instead of guessing the producer's `escape=` setting. Raw
-records are always retained. Only literal named suffixes become named fields;
-unknown positional suffixes stay in `access.extra`. A custom positional format
-requires an explicit schema. JSON HTTP aliases are vendor-neutral and do not
-replace original fields, explicit standard columns, or explicit severity.
+records are always retained. Named suffix pairs become named fields; the whole
+unnamed suffix stays in `access.extra`, values that can be told apart get names
+(`duration_ms`/`duration_s` for Tomcat `%D %T`, `thread`, `duration`, an
+unquoted trailing user agent) and the rest keep their order as
+`access.extra.N`. Request lines may be quoted or not (Tomcat/JBoss `%r`). JSON
+HTTP aliases are vendor-neutral and do not replace original fields, explicit
+standard columns, or explicit severity. Lines no dedicated reader accepts are
+structured by the generic reader (time anywhere, level, header items, HTTP
+requests, `key=value` pairs, embedded JSON); see `docs/formatos-de-log.md`.
 
 Run when the native toolchain is available:
 
@@ -54,9 +59,9 @@ source precision in fields, and is indexed in milliseconds. Query expansion
 reads complete URIs/request targets, never the rest of an access line, and is
 idempotent across normalization passes.
 
-Parser revision `web-logs-v2` and global query generation `indexes-v7` refresh
-old raw-artifact metadata, columnar and timestamp caches on reopen without
-changing source/event identity. Saved Case evidence and explicit Event
+Parser revision `universal-v4` (every format but snapshots) and global query
+generation `indexes-v7` refresh old raw-artifact metadata, columnar and
+timestamp caches on reopen without changing source/event identity. Saved Case evidence and explicit Event
 snapshots stay captured evidence and are not silently reparsed.
 `nginx_acceptance` covers actual JSONL gzip loading and cold/warm reopening in
 separate processes; `wrapped_log_import` covers a compressed mixed-envelope

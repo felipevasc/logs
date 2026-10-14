@@ -58,6 +58,7 @@ impl Writer {
             CREATE INDEX member_ref ON members(namespace,ref); CREATE INDEX member_event ON members(event,n);
             CREATE TABLE owners(namespace TEXT,ref TEXT,n INTEGER,PRIMARY KEY(namespace,ref));
             CREATE TABLE tactics(n INTEGER,t TEXT,PRIMARY KEY(n,t)); CREATE INDEX tactic_t ON tactics(t,n);
+            CREATE TABLE themes(n INTEGER,t TEXT,PRIMARY KEY(n,t)); CREATE INDEX theme_t ON themes(t,n);
             CREATE TABLE techniques(n INTEGER,id TEXT,name TEXT,t TEXT,PRIMARY KEY(n,id)); CREATE INDEX technique_t ON techniques(t,n);
             CREATE TABLE entities(n INTEGER,namespace TEXT,col TEXT,value TEXT,label TEXT,level INTEGER,PRIMARY KEY(n,namespace,col,value));
             CREATE INDEX entity_key ON entities(namespace,col,value,level);
@@ -219,6 +220,7 @@ impl Writer {
             )
             .map_err(err)?;
         }
+        execute(&self.db, "INSERT OR IGNORE INTO themes VALUES(?1,?2)", params![n, d.theme]).map_err(err)?;
         for a in &d.attack {
             execute(
                 &self.db,
@@ -271,6 +273,7 @@ impl Writer {
         population: &crate::investigation::Population,
     ) -> Result<(), String> {
         crate::security_budget::phase("population persistence");
+        let _threads = population.threads();
         for (field, column) in [
             ("actor", "@user"),
             ("src", "@src_ip"),
@@ -679,7 +682,17 @@ impl Writer {
                 .map_err(err)?
                 .collect::<Result<_, _>>()
                 .map_err(err)?;
-            let payload = json!({"id":id,"title":lead["name"],"summary":lead["summary"],"severity":lead["severity"],"score":level*20,"evidence_level":level,"start":start,"end":end,"detections":[],"event_refs":[],"record_count":records,"detection_count":count,"tactics":tactics,"entities":lead["entities"].as_array().map(|v|v.iter().take(6).cloned().collect::<Vec<_>>()).unwrap_or_default()});
+            let mut statement = self
+                .db
+                .prepare("SELECT DISTINCT t FROM themes JOIN findings USING(n) WHERE root=?1")
+                .map_err(err)?;
+            let found: Vec<String> = statement
+                .query_map([root], |r| r.get(0))
+                .map_err(err)?
+                .collect::<Result<_, _>>()
+                .map_err(err)?;
+            let themes: Vec<&str> = crate::security_themes::THEMES.iter().map(|t| t.key).filter(|key| found.iter().any(|f| f == key)).collect();
+            let payload = json!({"id":id,"title":lead["name"],"summary":lead["summary"],"severity":lead["severity"],"score":level*20,"evidence_level":level,"start":start,"end":end,"detections":[],"event_refs":[],"record_count":records,"detection_count":count,"tactics":tactics,"themes":themes,"entities":lead["entities"].as_array().map(|v|v.iter().take(6).cloned().collect::<Vec<_>>()).unwrap_or_default()});
             let pattern = if records == 1 {
                 let mut stmt = self
                     .db
@@ -729,7 +742,7 @@ impl Writer {
         }
         drop(levels);
         metadata["universe_counts_by_level"] = json!(all_levels);
-        metadata["storage"] = json!({"kind":"sqlite","version":"results-3","complete":true,"working_memory_budget_mib":256,"evidence_preview_limit":128,"complete_member_page":"finding_members","complete_entity_page":"finding_entities","provenance":"content-addressed lossless gzip metadata; original time retained per event; scalar facts remain queryable"});
+        metadata["storage"] = json!({"kind":"sqlite","version":"results-4","complete":true,"working_memory_budget_mib":crate::security_budget::limit() >> 20,"evidence_preview_limit":128,"complete_member_page":"finding_members","complete_entity_page":"finding_entities","provenance":"content-addressed lossless gzip metadata; original time retained per event; scalar facts remain queryable"});
         metadata["memory"] = crate::security_budget::snapshot();
         metadata["execution"]["revision"] = if publish {
             crate::security_checkpoints::publish_revision(&self.db, &metadata)?
@@ -1256,7 +1269,7 @@ impl Results {
             decode(&std::fs::read_to_string(path.with_extension("json")).map_err(err)?)
                 .map_err(err)?
         };
-        if metadata["storage"]["version"] != "results-3" {
+        if metadata["storage"]["version"] != "results-4" {
             return Err("Análise salva usa armazenamento anterior; recálculo necessário".into());
         }
         db.execute_batch("PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; PRAGMA mmap_size=0;")
@@ -1350,6 +1363,7 @@ impl Results {
         limit: usize,
         related: Option<&mut dyn Iterator<Item = usize>>,
         tactic: Option<&str>,
+        theme: Option<&str>,
     ) -> Result<Value, String> {
         let _working = crate::security_store::working_lane()?;
         if !(1..=5).contains(&minimum) || !(1..=500).contains(&limit) {
@@ -1370,7 +1384,10 @@ impl Results {
                 .map_err(err)?;
             }
         }
-        let condition="(?1=0 OR EXISTS(SELECT 1 FROM members m JOIN selected s ON s.event=m.event WHERE m.n=f.n)) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM tactics t WHERE t.n=f.n AND t.t=?2))";
+        // Section keys come from a fixed list, so they can be part of the SQL text.
+        let theme = theme.map(|key| crate::security_themes::find(key).map(|t| t.key).ok_or("Seção de comprometimentos desconhecida")).transpose()?;
+        let in_theme = theme.map(|key| format!(" AND EXISTS(SELECT 1 FROM themes h WHERE h.n=f.n AND h.t='{key}')")).unwrap_or_default();
+        let condition=format!("(?1=0 OR EXISTS(SELECT 1 FROM members m JOIN selected s ON s.event=m.event WHERE m.n=f.n)) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM tactics t WHERE t.n=f.n AND t.t=?2)){in_theme}");
         let mut counts = [0usize; 5];
         let mut stmt = db
             .prepare(&format!(
@@ -1466,7 +1483,7 @@ impl Results {
             for t in tactics {
                 let key = t["key"].as_str().unwrap_or_default();
                 let mut levels = [0usize; 5];
-                let mut stmt=db.prepare("SELECT f.level,count(*) FROM tactics t JOIN findings f USING(n) WHERE t.t=?1 AND f.level>0 AND (?2=0 OR EXISTS(SELECT 1 FROM members m JOIN selected s ON s.event=m.event WHERE m.n=f.n)) GROUP BY f.level").map_err(err)?;
+                let mut stmt=db.prepare(&format!("SELECT f.level,count(*) FROM tactics t JOIN findings f USING(n) WHERE t.t=?1 AND f.level>0 AND (?2=0 OR EXISTS(SELECT 1 FROM members m JOIN selected s ON s.event=m.event WHERE m.n=f.n)){in_theme} GROUP BY f.level")).map_err(err)?;
                 for row in stmt
                     .query_map(params![key, filtered], |r| {
                         Ok((r.get::<_, usize>(0)?, r.get::<_, usize>(1)?))
@@ -1478,7 +1495,7 @@ impl Results {
                 }
                 t["counts_by_level"] = json!(levels);
                 t["count"] = json!(levels[(minimum - 1) as usize..].iter().sum::<usize>());
-                let mut stmt=db.prepare("SELECT a.id,a.name,count(*) FROM techniques a JOIN findings f USING(n) WHERE a.t=?1 AND f.level>=?2 AND (?3=0 OR EXISTS(SELECT 1 FROM members m JOIN selected s ON s.event=m.event WHERE m.n=f.n)) GROUP BY a.id ORDER BY count(*) DESC,a.id").map_err(err)?;
+                let mut stmt=db.prepare(&format!("SELECT a.id,a.name,count(*) FROM techniques a JOIN findings f USING(n) WHERE a.t=?1 AND f.level>=?2 AND (?3=0 OR EXISTS(SELECT 1 FROM members m JOIN selected s ON s.event=m.event WHERE m.n=f.n)){in_theme} GROUP BY a.id ORDER BY count(*) DESC,a.id")).map_err(err)?;
                 t["techniques"] = json!(stmt
                     .query_map(params![t["key"].as_str(), minimum, filtered], |r| Ok(
                         json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"count":r.get::<_,usize>(2)?})
@@ -1488,6 +1505,18 @@ impl Results {
                     .map_err(err)?);
             }
         }
+        let mut levels: std::collections::HashMap<String, [usize; 5]> = Default::default();
+        let mut stmt=db.prepare("SELECT h.t,f.level,count(*) FROM themes h JOIN findings f USING(n) WHERE f.level>0 AND (?1=0 OR EXISTS(SELECT 1 FROM members m JOIN selected s ON s.event=m.event WHERE m.n=f.n)) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM tactics t WHERE t.n=f.n AND t.t=?2)) GROUP BY h.t,f.level").map_err(err)?;
+        for row in stmt.query_map(params![filtered, tactic], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?, r.get::<_, usize>(2)?))).map_err(err)? {
+            let (key, level, count) = row.map_err(err)?;
+            levels.entry(key).or_default()[level - 1] = count;
+        }
+        drop(stmt);
+        result["themes"] = json!(crate::security_themes::THEMES.iter().map(|t| {
+            let counts = levels.get(t.key).copied().unwrap_or_default();
+            json!({"key":t.key,"label":t.label,"icon":t.icon,"description":t.description,"counts_by_level":counts,"count":counts[(minimum - 1) as usize..].iter().sum::<usize>()})
+        }).collect::<Vec<_>>());
+        result["theme"] = json!(theme);
         let mut stmt=db.prepare(&format!("SELECT e.namespace,e.col,e.value,e.label,max(f.level),count(DISTINCT f.n),min(f.start),max(f.end) FROM entities e JOIN findings f USING(n) WHERE f.level>=?3 AND {condition} GROUP BY e.namespace,e.col,e.value ORDER BY max(f.level) DESC,e.namespace,e.col,e.value LIMIT 100")).map_err(err)?;
         let mut entities=stmt.query_map(params![filtered,tactic,minimum],|r|Ok(json!({"namespace":r.get::<_,String>(0)?,"column":r.get::<_,String>(1)?,"value":r.get::<_,String>(2)?,"label":r.get::<_,String>(3)?,"evidence_level":r.get::<_,u8>(4)?,"score":r.get::<_,u8>(4)? as u32*20,"detections":r.get::<_,usize>(5)?,"events":Value::Null,"failures":Value::Null,"first":r.get::<_,Option<i64>>(6)?,"last":r.get::<_,Option<i64>>(7)?,"tactics":[]}))).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
         for entity in &mut entities {

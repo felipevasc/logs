@@ -1074,6 +1074,8 @@ pub fn normalize(ev: &Event, mappings: &[SourceMapping]) -> (Event, Normalized) 
         }
     }
     let mut derived = ev.clone();
+    // Captured or in-memory events may predate the user agent profile.
+    crate::sources::user_agent::annotate(&mut derived);
     derived.timestamp = n.time.epoch_ms;
     derived.event_ref = event_ref(ev);
     derived.name.clear();

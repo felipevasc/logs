@@ -49,6 +49,45 @@ pub fn load(path: &str) -> Result<(String, Vec<Event>), String> {
     })?
 }
 
+/// How a file is read, without materializing every event: detected format,
+/// records, records without a time, unrecognized records among evenly spread
+/// samples, columns and those sampled events.
+pub fn profile(path: &str, samples: usize) -> Result<Value, String> {
+    admit(crate::global_scheduler::Priority::Normal, || {
+        let idx = crate::index_source_file(path, "auto", None)?;
+        let rows = idx.lines.len();
+        let undated = (0..rows).filter(|&i| idx.lines.at(i).ts == 0).count();
+        let empty = crate::model::CodesConfig::default();
+        let step = (rows / samples.max(1)).max(1);
+        let events: Vec<Event> = (0..rows).step_by(step).take(samples).map(|i| crate::sources::event_at(&idx, i, &empty, &empty, &[])).collect();
+        let spread = (rows / 2000).max(1);
+        let unparsed = (0..rows).step_by(spread).filter(|&i| {
+            crate::sources::parse_part_line(idx.part_at(i), crate::sources::line_bytes(&idx, i)).parse_status != "parsed"
+        }).count();
+        Ok(serde_json::json!({
+            "format": idx.parts[0].format, "rows": rows, "undated": undated,
+            "unparsed_of_sampled": [unparsed, (0..rows).step_by(spread).count()],
+            "columns": idx.columns, "events": events,
+        }))
+    })?
+}
+
+/// Clients of a local file, as the Comprometimentos section shows them.
+pub fn client_inventory(path: &str) -> Result<Value, String> {
+    admit(crate::global_scheduler::Priority::Normal, || {
+        let idx = crate::index_source_file(path, "auto", None)?;
+        let state = crate::AppState {
+            source: parking_lot::RwLock::new(crate::SourceData::Indexed(idx)),
+            source_publication: parking_lot::RwLock::new(Default::default()),
+            source_names: parking_lot::RwLock::new(vec![path.to_string()]),
+            codes: parking_lot::RwLock::new(Default::default()), system_codes: parking_lot::RwLock::new(Default::default()),
+            derived: parking_lot::RwLock::new(Vec::new()), case_store_lock: parking_lot::Mutex::new(()),
+            codes_path: Default::default(), system_codes_path: Default::default(),
+        };
+        crate::client_inventory::inventory(&state, vec![], None)
+    })?
+}
+
 pub fn detect_format(sample: &[u8]) -> &'static str {
     crate::sources::detect_format(sample)
 }
@@ -644,7 +683,11 @@ pub fn metadata_probe(
     if options["smallWaves"].as_bool().unwrap_or(true) {
         prepared.limits = crate::sources::IndexLimits { chunk_bytes: 512, chunk_lines: 7, wave_chunks: 2, json_records: 7, json_bytes: 512 };
     }
-    if let Some(year) = options["year"].as_i64() { prepared.part.calendar.year = i32::try_from(year).map_err(|e| e.to_string())?; }
+    if let Some(year) = options["year"].as_i64() {
+        // An explicit year replaces the file's own reference date.
+        prepared.part.calendar.year = i32::try_from(year).map_err(|e| e.to_string())?;
+        prepared.part.calendar.reference = None;
+    }
     let key = prepared.key()?;
     let restored_rows = Cell::new(0usize);
     let committed_rows = Cell::new(0usize);

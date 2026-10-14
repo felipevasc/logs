@@ -20,6 +20,7 @@ window.Tasks = (() => {
   READS.add("analysis_field_text"); SCOPED.add("analysis_field_text");
   READS.add("java_trace_detail"); SCOPED.add("java_trace_detail");
   READS.add("investigation_narrative_review");SCOPED.add("investigation_narrative_review");
+  READS.add("client_inventory"); SCOPED.add("client_inventory");
   READS.add("investigation_page"); SCOPED.add("investigation_page"); SCOPED.add("investigation_profile_train");
   READS.add("investigation_proposal_evaluate"); SCOPED.add("investigation_proposal_evaluate"); SCOPED.add("investigation_proposal_accept");
   // Native evidence requests own their admission inside request; never inject
@@ -30,6 +31,7 @@ window.Tasks = (() => {
   const evidencePreparations = new Set(["case_evidence_prepare", "case_evidence_prepare_membership"]);
   const evidenceCommits = new Set(["case_import_native"]);
   const WHAT = { exclusion_preview: "Prévia da exclusão", exclusion_commit: "Arquivando registros", exclusion_list: "Lotes excluídos", exclusion_archive_page: "Registros arquivados", exclusion_restore_batch: "Restaurando lote", exclusion_restore_selected: "Restaurando seleção", dataset_overview: "Visão geral", triage: "Comprometimentos", triage_evidence_event: "Evento da evidência", timeline_range: "Volume no tempo", timeline_lanes: "Faixas", query_page: "Registros", engine_retry: "Preparando índices", query_events: "Registros", explore_snapshot: "Registros e campos", tree_aggs: "Campos", aggregate_events: "Grupos", profile_fields: "Perfil dos campos", compute_series: "Gráficos", pivot: "Tabela dinâmica", discover_patterns: "Padrões", threat_scan: "Ameaças", threat_events: "Registros de ameaça", compare_periods: "Comparação de períodos", journey_index: "Possíveis trilhas", journey_events: "Registros da trilha", journey_fields: "Campos de ligação", entity_summary: "Entidades", ioc_sightings: "Indicadores nas fontes", source_hashes: "SHA-256 das fontes", stats_events: "Timeline", grouped_timeline: "Timeline por campo", preview_field_transform: "Prévia da transformação", count_filtered: "Contagem", trail_events: "Vizinhança do registro", load_file: "Abrindo logs", load_files: "Abrindo logs", load_bundle: "Abrindo logs", load_event_log: "Lendo o Event Log", remote_import: "Importação remota", remote_test: "Teste de conexão", export_events: "Exportação", export_investigation: "Exportação", import_investigation: "Importação da investigação", harvest_codes: "Catálogo do sistema", sigma_import: "Importação Sigma", expand_paths: "Lendo pastas", event_detail: "Detalhe do registro", list_sources: "Fontes", event_insights: "Detalhe do registro" };
+  WHAT.client_inventory = "Clientes e navegadores";
   Object.assign(WHAT, { reference_inspect: "Inspecionando referência", reference_list: "Referências do Caso", reference_import: "Importando referência", reference_remove: "Removendo referência", reference_save_lookup: "Salvando campo por referência" });
   WHAT.analysis_field_text = "Valor exato do campo";
   WHAT.java_trace_detail = "Estrutura Java do registro";

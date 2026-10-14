@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "client.forged-browser",
+      "name": "Navegador forjado ou impossível",
+      "description": "O user agent declara um navegador numa forma que nenhum navegador real produz na data do evento: versão que ainda não existia, estrutura de outro motor, plataforma inexistente ou incompatível com a versão. Scripts e ferramentas se passam por navegador desse jeito.",
+      "severity": "low",
+      "attack": ["T1036"],
+      "kind": "threshold",
+      "where": "ua.anomaly:*",
+      "by": ["@src_ip", "@user_agent"],
+      "window": "1h",
+      "count": 1,
+      "summary": "{@src_ip} com user agent impossível: {ua.anomaly}",
+      "evidence": {
+        "level": 2,
+        "claim": "activity",
+        "rationale": "A combinação declarada contradiz o que os navegadores enviam (gramática do motor, tokens congelados e versões existentes na data). Indica cliente se passando por navegador, não um ataque por si só.",
+        "missing": [
+          "Ação maliciosa associada; o user agent sozinho não demonstra ataque.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Extensões ou proxies que reescrevem o user agent, testes automatizados, navegadores raros e dispositivos com relógio errado."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/User-Agent",
+        "https://www.chromium.org/updates/ua-reduction/",
+        "https://attack.mitre.org/techniques/T1036/"
+      ]
+    },
+    {
+      "id": "client.offensive-tool",
+      "name": "Ferramenta de ataque em uso",
+      "description": "Muitas requisições em pouco tempo com o user agent de uma ferramenta de varredura ou exploração (sqlmap, Nikto, Nuclei, WPScan...). O volume afasta a hipótese de texto apenas citado; a autorização do teste não aparece no log.",
+      "severity": "medium",
+      "attack": ["T1595.002"],
+      "kind": "threshold",
+      "where": "ua.class:\"ferramenta ofensiva\"",
+      "by": ["@src_ip", "ua.family"],
+      "window": "10m",
+      "count": 20,
+      "summary": "{count} requisições de {ua.family} a partir de {@src_ip}",
+      "evidence": {
+        "level": 2,
+        "claim": "attempt",
+        "rationale": "O próprio cliente se identifica como ferramenta de ataque e faz requisições em volume; o resultado e a autorização não são demonstrados.",
+        "missing": [
+          "Resultado das requisições e autorização do teste.",
+          "Precisão em corpus representativo ainda não avaliada."
+        ],
+        "benign": [
+          "Varredura de vulnerabilidades autorizada ou equipe de segurança da própria organização."
+        ],
+        "required": [],
+        "maturity": "experimental",
+        "version": "1"
+      },
+      "references": [
+        "https://attack.mitre.org/techniques/T1595/002/"
+      ]
+    }
+  ]
+}

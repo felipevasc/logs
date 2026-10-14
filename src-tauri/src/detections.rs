@@ -19,9 +19,10 @@ const BUILTIN: &str = include_str!("../resources/detection-rules.json");
 const EXPANSION: &str = include_str!("../resources/detection-expansion.json");
 const ADVANCED: &str = include_str!("../resources/detection-advanced.json");
 const CONTENT: &str = include_str!("../resources/detection-content.json");
+const CLIENTS: &str = include_str!("../resources/detection-clients.json");
 fn builtin_defs() -> Result<Vec<RuleDef>, String> {
     let mut rules = Vec::new();
-    for text in [BUILTIN, EXPANSION, ADVANCED, CONTENT] {
+    for text in [BUILTIN, EXPANSION, ADVANCED, CONTENT, CLIENTS] {
         rules.extend(serde_json::from_str::<RuleFile>(text).map_err(|e| e.to_string())?.rules);
     }
     Ok(rules)
@@ -677,6 +678,8 @@ pub struct Detection {
     pub kind: String,
     pub attack: Vec<AttackRef>,
     pub tactics: Vec<String>,
+    /// Section of the analysis (clients, web, execution...); see `security_themes`.
+    pub theme: &'static str,
     pub start: Option<i64>,
     pub end: Option<i64>,
     pub count: usize,
@@ -710,6 +713,7 @@ pub struct Episode {
     pub evidence_level: u8,
     pub event_refs: Vec<String>,
     pub tactics: Vec<String>,
+    pub themes: Vec<&'static str>,
     pub entities: Vec<EntityRef>,
 }
 
@@ -2099,6 +2103,7 @@ fn run_inner(
         }
         tactics.sort_by_key(|t| attack::tactic_order(t));
         tactics.dedup();
+        let theme = crate::security_themes::of(&rule_id, &attack_refs, &tactics);
         let mut detection = Detection {
             participants: Default::default(),
             pattern_source: None,
@@ -2111,6 +2116,7 @@ fn run_inner(
             kind,
             attack: attack_refs,
             tactics,
+            theme,
             start: None,
             end: None,
             count: full_count,
@@ -2734,6 +2740,7 @@ fn cluster(detections: &[Detection]) -> Vec<Episode> {
                 end,
                 detections: detections_in_time,
                 tactics,
+                themes: crate::security_themes::THEMES.iter().map(|t| t.key).filter(|key| members.iter().any(|&i| detections[i].theme == *key)).collect(),
                 entities: entity_counts.into_iter().take(6).map(|(e, _)| e).collect(),
             }
         })

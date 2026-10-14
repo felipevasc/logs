@@ -89,13 +89,15 @@ pub fn identity(path: &str, bytes: &[u8]) -> String {
 
 /// Compatibility adapter for callers that only need scanning byte progress.
 pub fn open(path: &str, format: &str, custom: Option<CustomParse>, ts: Option<CompiledTsConfig>, progress: Option<&dyn Fn(usize, usize)>) -> Result<FileIndex, String> {
-    open_with_progress(path, format, custom, ts, Some(&|p| {
+    open_from(path, None, format, custom, ts, Some(&|p| {
         if p.phase_id == "metadata-scan" { if let Some(cb) = progress { cb(p.completed, p.total); } }
     }))
 }
 
-pub(crate) fn open_with_progress(path: &str, format: &str, custom: Option<CustomParse>, ts: Option<CompiledTsConfig>, progress: crate::metadata_checkpoint::Reporter<'_>) -> Result<FileIndex, String> {
-    let prepared = sources::prepare_index(path, format, custom, ts)?;
+/// `origin`: the name shown to the user and the file actually read, when
+/// `path` is a converted copy; its name and dates complete partial timestamps.
+pub(crate) fn open_from(path: &str, origin: Option<(&str, &str)>, format: &str, custom: Option<CustomParse>, ts: Option<CompiledTsConfig>, progress: crate::metadata_checkpoint::Reporter<'_>) -> Result<FileIndex, String> {
+    let prepared = sources::prepare_index_from(path, origin, format, custom, ts)?;
     open_prepared_at(&prepared, &crate::config_dir().join(INDEX_DIR).join(METADATA_DIR), progress)
 }
 
@@ -208,7 +210,7 @@ fn timestamp_key(idx: &FileIndex) -> Option<String> {
     hash.update(b"|timezone-configuration:");
     hash.update(part.calendar.timezone.as_bytes());
     if crate::sources::uses_inferred_calendar_year(&part.format) {
-        hash.update(format!("|inferred-year:{}", part.calendar.year));
+        hash.update(format!("|inferred-year:{}", part.calendar.inference_signature()));
     }
     if let Some(revision) = timestamp_enrichment_revision(&part.format, &config.sources) {
         hash.update(b"|timestamp-parser-enrichment:");
@@ -548,7 +550,7 @@ mod java_timestamp_dependency_tests {
         hash.update(b"|raw-metadata-identity:"); hash.update(part.metadata_identity.as_bytes());
         hash.update(b"|timezone-configuration:"); hash.update(part.calendar.timezone.as_bytes());
         if crate::sources::uses_inferred_calendar_year(&part.format) {
-            hash.update(format!("|inferred-year:{}", part.calendar.year));
+            hash.update(format!("|inferred-year:{}", part.calendar.inference_signature()));
         }
         format!("{:x}", hash.finalize())
     }
@@ -675,7 +677,9 @@ mod metadata_timezone_tests {
         let config = sources::TsConfig { sources: vec!["missing".into()], format: "epoch_ms".into(), regex: Some("never-matches".into()), ..Default::default() }.compile().unwrap();
         let make = |year| {
             let mut prepared = sources::prepare_index(path.to_str().unwrap(), "syslog3164", None, Some(config.clone())).unwrap();
+            // The year context replaces the file's own reference date.
             prepared.part.calendar.year = year;
+            prepared.part.calendar.reference = None;
             let seed = crate::metadata_checkpoint::Resume { cursor: prepared.initial_cursor(), ..Default::default() };
             sources::index_prepared(&prepared, seed, &mut |_, _, _, _| Ok(()), None).unwrap()
         };
@@ -694,8 +698,8 @@ mod metadata_timezone_tests {
     #[test]
     fn overlay_rejects_a_different_base_parser_with_the_same_row_count() {
         let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("parser.log");
-        // Logfmt requires at least three key=value pairs; a two-pair fixture falls back to text.
-        std::fs::write(&path, "ts=2026-09-30T12:00:00Z level=info msg=hello\n").unwrap();
+        // Plain text reads dates anywhere but epoch numbers only at the start of a line.
+        std::fs::write(&path, "ts=1790000000 level=info msg=hello\n").unwrap();
         let config = sources::TsConfig { sources: vec!["missing".into()], format: "epoch_ms".into(), regex: Some("never-matches".into()), ..Default::default() }.compile().unwrap();
         let mut logfmt = sources::index_file(path.to_str().unwrap(), "logfmt", None, Some(config.clone()), None).unwrap();
         let cache = dir.path().join("timestamps.bin"); assert!(!timestamps_at(&mut logfmt, &cache, None).unwrap());

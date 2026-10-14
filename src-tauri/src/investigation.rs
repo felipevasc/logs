@@ -363,6 +363,19 @@ mod tests {
         p.observe(&e, &n).unwrap();
         assert_eq!(p.finish().unwrap()["status"], "not_evaluated");
     }
+
+    #[test]
+    fn population_memory_follows_the_machine_budget_not_a_fixed_64_mib() {
+        let p = Population::new(&Settings::default()).unwrap();
+        let setting: String = p.db.query_row("SELECT current_setting('memory_limit')", [], |r| r.get(0)).unwrap();
+        let (number, unit) = setting.split_once(' ').unwrap();
+        let factor = match unit { "KiB" => 1.0 / 1024.0, "MiB" => 1.0, "GiB" => 1024.0, "TiB" => 1024.0 * 1024.0, other => panic!("{other}") };
+        let mib = number.parse::<f64>().unwrap() * factor;
+        let expected = crate::security_budget::duckdb_mib() as f64;
+        assert!(crate::security_budget::limit() >= 256 << 20);
+        assert!(expected >= 64.0);
+        assert!((mib - expected * 1_000_000.0 / 1_048_576.0).abs() <= expected * 0.05 + 1.0, "{setting} vs {expected} MB");
+    }
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -526,7 +539,35 @@ fn template(text: &str) -> String {
         .join(" ")
 }
 
+/// The behavior queries (window functions, medians, joins over every fact)
+/// run with the CPU slots the global scheduler has idle, back to one thread
+/// when the phase ends.
+pub(crate) struct AnalysisThreads<'a> {
+    db: &'a Connection,
+    _lease: crate::global_scheduler::Lease,
+    raised: bool,
+}
+impl<'a> AnalysisThreads<'a> {
+    fn raise(db: &'a Connection) -> Self {
+        let lease = crate::global_scheduler::lend_idle(15);
+        let threads = lease.threads();
+        let raised = threads > 1 && db.execute_batch(&format!("SET threads={threads}")).is_ok();
+        Self { db, _lease: lease, raised }
+    }
+}
+impl Drop for AnalysisThreads<'_> {
+    fn drop(&mut self) {
+        if self.raised {
+            let _ = self.db.execute_batch("SET threads=1");
+        }
+    }
+}
+
 impl Population {
+    /// Idle CPU slots for heavy statements over the population (released on drop).
+    pub(crate) fn threads(&self) -> AnalysisThreads<'_> {
+        AnalysisThreads::raise(&self.db)
+    }
     pub fn schema_rows(&self) -> Value {
         self.schema.describe()
     }
@@ -534,9 +575,11 @@ impl Population {
         settings.validate()?;
         let directory = tempfile::tempdir().map_err(error)?;
         let db = Connection::open(directory.path().join("facts.duckdb")).map_err(error)?;
-        // One admitted worker: this connection must never multiply the global CPU limit.
+        // One admitted worker by default; the analysis phase borrows idle
+        // global slots (`AnalysisThreads`), never multiplying the CPU limit.
+        // Memory follows the machine's budget instead of a fixed 64 MiB.
         let spill = crate::resources::spill_bytes(false, directory.path())?;
-        db.execute_batch(&format!("SET threads=1;SET preserve_insertion_order=false; SET memory_limit='{}MB'; SET max_temp_directory_size='{spill}B';", crate::resources::duckdb_memory_mb().clamp(32,64))).map_err(error)?;
+        db.execute_batch(&format!("SET threads=1;SET preserve_insertion_order=false; SET memory_limit='{}MB'; SET max_temp_directory_size='{spill}B';", crate::security_budget::duckdb_mib())).map_err(error)?;
         db.execute_batch("CREATE TABLE facts(ref VARCHAR,ns VARCHAR,ts BIGINT,eid BIGINT,source VARCHAR,
             actor VARCHAR,host VARCHAR,src VARCHAR,dst VARCHAR,process VARCHAR,parent VARCHAR,session VARCHAR,
             resource VARCHAR,action VARCHAR,outcome VARCHAR,bytes DOUBLE,amount DOUBLE,currency VARCHAR,
@@ -860,6 +903,7 @@ impl Population {
         self.db
             .execute_batch("CHECKPOINT")
             .map_err(|e| error(format!("persistência dos fatos: {e}")))?;
+        let _threads = AnalysisThreads::raise(&self.db);
         self.history = crate::security_history::load(&self.db, &self.settings)?;
         self.db.execute_batch(&format!("CREATE TEMP VIEW bounds AS SELECT ns,min(ts)+{}*86400000 AS cutoff FROM facts WHERE time_ok GROUP BY ns;",self.settings.baseline_days)).map_err(error)?;
         crate::operations::report_progress(

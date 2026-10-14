@@ -112,7 +112,7 @@ pub(crate) fn source_signature(state: &AppState) -> Option<String> {
                 &part.header,
                 &part.calendar.timezone,
                 crate::sources::uses_inferred_calendar_year(&part.format)
-                    .then_some(part.calendar.year),
+                    .then(|| part.calendar.inference_signature()),
                 part.custom.as_ref().map(|custom| match custom {
                     crate::sources::CustomParse::Regex(regex) => {
                         format!("regex:{}", regex.as_str())

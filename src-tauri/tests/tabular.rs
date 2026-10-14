@@ -80,10 +80,12 @@ fn windows_event_viewer_export_keeps_the_unnamed_message() {
 
 #[test]
 fn iis_date_and_time_columns_keep_the_time_of_day() {
+    // IIS writes W3C date and time in UTC.
     let log = "#Software: Microsoft Internet Information Services 10.0\n#Fields: date time s-ip cs-method cs-uri-stem sc-status\n2026-09-28 10:15:30 10.0.0.9 GET /api/x 500\n";
     let (format, events) = load(&file("u_ex260928.log", log.as_bytes()));
     assert_eq!(format, "w3c");
-    assert_eq!(events[0].timestamp, Some(local(2026, 9, 28, 10, 15, 30)));
+    let utc = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap().and_hms_opt(10, 15, 30).unwrap().and_utc().timestamp_millis();
+    assert_eq!(events[0].timestamp, Some(utc));
     assert_eq!(events[0].code, "500");
 }
 
