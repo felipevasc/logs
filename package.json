@@ -1,7 +1,7 @@
 {
   "name": "loginsight",
   "private": true,
-  "version": "0.13.7",
+  "version": "0.13.8",
   "type": "module",
   "scripts": {
     "prepare:frontend": "node scripts/prepare-frontend.mjs",
