@@ -23,6 +23,7 @@ for (const item of [
   "resources.js", "resources.css", "value-inspector.js",
   "field-indexes.js",
   "compromise-progress.js",
+  "log-split.js", "log-split.css",
 ]) {
   cpSync(resolve(source, item), resolve(output, item), { recursive: true });
 }

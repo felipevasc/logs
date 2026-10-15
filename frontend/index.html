@@ -29,6 +29,7 @@
   <link rel="stylesheet" href="updates.css" />
   <link rel="stylesheet" href="resource-settings.css" />
   <link rel="stylesheet" href="resources.css" />
+  <link rel="stylesheet" href="log-split.css" />
 </head>
 <body>
   <nav class="workspace-nav" aria-label="Navegação principal">
@@ -43,6 +44,7 @@
       <button hidden data-page="sources" data-zones="structure" title="Arquivos e canais de logs"><i class="fas fa-folder-open"></i>Arquivos<span id="ws-source-count"></span></button>
       <button hidden data-page="connections" data-zones="structure" title="Elasticsearch, Kibana, Wazuh, SSH e WinRM"><i class="fas fa-plug"></i>Conexões</button>
       <button hidden data-page="import" data-zones="structure"><i class="fas fa-file-circle-plus"></i>Abrir logs</button>
+      <button hidden data-page="log-split" data-zones="structure" title="Separar arquivos de log grandes por texto, padrão, data ou posição"><i class="fas fa-scissors"></i>Separar logs</button>
     </div>
     <div class="zone-switch" role="group" aria-label="Área de trabalho">
       <button type="button" data-zone="analysis" data-workspace-scope="dataset" aria-pressed="true"><i class="fas fa-magnifying-glass" aria-hidden="true"></i><span>Análise</span></button>
@@ -1097,6 +1099,7 @@
   <script src="discovery.js"></script>
   <script src="threats.js"></script>
   <script src="remote-sources.js"></script>
+  <script src="log-split.js"></script>
   <script src="journeys.js"></script>
   <script src="case-trails.js"></script>
   <script src="workspace-context.js"></script>

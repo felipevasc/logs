@@ -1,0 +1,99 @@
+/* Estrutura → Separar logs */
+.ls-page { max-width: 1180px; }
+.ls-page .card-heading h2 { display: flex; align-items: center; gap: 10px; }
+.ls-page .card-heading h2 b { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 700; }
+.ls-fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.ls-fieldset:disabled { opacity: .62; }
+.ls-body { padding: 0 21px 19px; }
+.ls-pad { padding: 0 21px; }
+.ls-hint { color: var(--text-2); font-size: 11.5px; line-height: 1.6; margin: 10px 0 0; }
+.ls-hint i { color: var(--accent); margin-right: 4px; }
+.ls-empty { display: flex; gap: 18px; align-items: center; padding: 6px 0 4px; }
+.ls-empty > i { font-size: 30px; color: var(--accent); }
+.ls-empty strong { font-size: 14px; font-weight: 600; }
+.ls-empty p { margin: 6px 0 0; color: var(--text-1); font-size: 12px; line-height: 1.6; max-width: 680px; }
+.ls-facts { display: grid; grid-template-columns: minmax(0, 2.2fr) repeat(4, minmax(0, 1fr)); gap: 12px 20px; margin: 0; }
+.ls-facts dt { color: var(--text-2); font-size: 11px; margin-bottom: 5px; }
+.ls-facts dd { margin: 0; font-size: 13px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ls-path { font-weight: 600; }
+.ls-sample { margin-top: 12px; }
+.ls-sample summary { cursor: pointer; color: var(--text-1); font-size: 12px; }
+.ls-sample pre, .ls-preview pre { margin: 8px 0 0; padding: 10px 12px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 6px; font: 11.5px/1.55 var(--font-mono); color: var(--text-0); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
+.ls-preview pre { margin: 0; padding: 6px 9px; max-height: 150px; }
+.ls-choices { display: grid; gap: 8px; }
+.ls-grid { grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
+.ls-choice { display: flex; gap: 10px; align-items: flex-start; padding: 11px 13px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; background: var(--bg-1); transition: border-color .12s, background .12s; }
+.ls-choice:hover { border-color: var(--border-strong); background: var(--hover); }
+.ls-choice.selected { border-color: var(--accent); background: var(--accent-soft); }
+.ls-choice input[type="radio"] { margin: 2px 0 0; accent-color: var(--accent); }
+.ls-choice > span { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.ls-choice strong { font-size: 12.5px; font-weight: 600; }
+.ls-choice small { color: var(--text-2); font-size: 11.5px; line-height: 1.5; }
+.ls-inline { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.ls-inline input { font-family: var(--font-mono); font-size: 12px; }
+.ls-check { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-1); cursor: pointer; }
+.ls-check input { accent-color: var(--accent); margin: 0; }
+.ls-cond { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; background: var(--bg-1); }
+.ls-cond-head { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+.ls-cond-kind { font-weight: 600; font-size: 12.5px; flex: 1; display: flex; align-items: center; gap: 8px; }
+.ls-cond-kind em { font-style: normal; font-size: 10px; font-weight: 700; color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 2px 6px; }
+.ls-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px 14px; align-items: end; }
+.ls-fields > label:not(.ls-check) { display: block; font-size: 11.5px; font-weight: 600; color: var(--text-1); }
+.ls-fields > label:not(.ls-check) > :is(select, input, textarea) { display: block; margin-top: 5px; }
+.ls-fields label small { font-weight: 400; color: var(--text-2); }
+.ls-fields textarea, .ls-fields input[data-field="pattern"], .ls-fields input[data-field="format"] { font-family: var(--font-mono); font-size: 12px; }
+.ls-fields input[type="datetime-local"] { width: 100%; padding: 6px 9px; background: var(--bg-2); color: var(--text-0); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); font: 13px var(--font-ui); }
+.ls-wide { grid-column: 1 / -1; }
+.ls-fields .ls-hint { margin: 0; }
+.ls-date-how { border-top: 1px dashed var(--border); padding-top: 10px; }
+.ls-date-how summary { cursor: pointer; font-size: 12px; color: var(--text-1); margin-bottom: 10px; }
+.ls-add { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 4px; }
+.ls-add > span { color: var(--text-2); font-size: 11.5px; margin-right: 4px; }
+.ls-sorted { display: flex; align-items: flex-start; gap: 10px; margin-top: 14px; padding: 11px 13px; border: 1px solid var(--border); border-radius: 8px; }
+.ls-sorted input { margin-top: 3px; }
+.ls-sorted span { display: flex; flex-direction: column; gap: 4px; }
+.ls-sorted strong { color: var(--text-0); font-weight: 600; }
+.ls-sorted small { color: var(--text-2); font-size: 11.5px; line-height: 1.5; }
+.ls-combine { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-1); }
+.ls-combine select { width: auto; padding: 5px 8px; font-size: 12px; }
+.ls-outputs { margin-top: 14px; display: grid; gap: 8px; }
+.ls-output { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; align-items: center; gap: 12px; }
+.ls-output > span { color: var(--text-2); font-size: 11.5px; }
+.ls-output code { font: 12px var(--font-mono); color: var(--text-0); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.ls-output b { font-weight: 600; font-size: 12px; font-variant-numeric: tabular-nums; }
+.ls-page .notice { margin: 12px 0 0; }
+.ls-pending { display: flex; gap: 16px; align-items: center; justify-content: space-between; margin: 0 0 18px !important; }
+.ls-pending-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.ls-actions { display: flex; justify-content: flex-end; gap: 10px; margin: 0 0 20px; }
+.ls-progress { padding: 18px 21px; display: grid; gap: 12px; }
+.ls-progress-head { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; font-size: 12.5px; }
+.ls-progress-head span { color: var(--text-1); font-variant-numeric: tabular-nums; }
+.ls-bar { height: 6px; border-radius: 3px; background: var(--bg-3); overflow: hidden; }
+.ls-bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .3s; }
+.ls-bar.indeterminate i { animation: ls-slide 1.4s ease-in-out infinite; }
+@keyframes ls-slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+@media (prefers-reduced-motion: reduce) { .ls-bar.indeterminate i { animation: none; } }
+.ls-progress-foot { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.ls-progress-foot .ls-hint { margin: 0; }
+.ls-result { display: flex; gap: 14px; padding: 18px 21px; }
+.ls-result > i { color: var(--accent); font-size: 18px; margin-top: 1px; }
+.ls-result.failed > i { color: var(--lv-erro); }
+.ls-result.cancelled > i { color: var(--text-2); }
+.ls-result > div { flex: 1; min-width: 0; display: grid; gap: 8px; }
+.ls-result strong { font-size: 13px; font-weight: 600; }
+.ls-result p { margin: 0; font-size: 12px; color: var(--text-1); line-height: 1.6; }
+.ls-table-scroll { overflow: auto; max-height: 640px; border-top: 1px solid var(--border); margin-top: 12px; }
+.ls-preview td { vertical-align: top; padding: 9px 14px; }
+.ls-preview th { padding: 9px 14px; position: sticky; top: 0; background: var(--bg-1); }
+.ls-preview td small { display: block; color: var(--text-2); font-size: 10px; }
+.ls-preview .ls-date { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ls-preview .ls-date em { color: var(--text-2); }
+.ls-preview tr.out td pre { opacity: .72; }
+.ls-badge { display: inline-block; font-size: 10.5px; font-weight: 600; border-radius: 4px; padding: 2px 7px; white-space: nowrap; }
+.ls-badge.in { color: var(--accent); background: var(--accent-soft); }
+.ls-badge.out { color: var(--text-2); border: 1px solid var(--border); }
+@media (max-width: 900px) {
+  .ls-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ls-output { grid-template-columns: 1fr; gap: 4px; }
+  .ls-pending, .ls-progress-foot { flex-direction: column; align-items: flex-start; }
+}

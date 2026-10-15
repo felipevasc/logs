@@ -116,6 +116,7 @@ mod spreadsheet;
 pub mod testkit;
 mod threats;
 mod timeline_export;
+mod log_split;
 mod triage;
 mod updates;
 mod workspace;
@@ -2329,6 +2330,13 @@ pub fn run() {
             remote::remote_test,
             remote::remote_import,
             timeline_export::export_timeline,
+            log_split::split_choose_input,
+            log_split::split_inspect,
+            log_split::split_choose_output,
+            log_split::split_preview,
+            log_split::split_run,
+            log_split::split_pending,
+            log_split::split_recover,
             threats::threat_catalog,
             threats::threat_catalog_update,
             threats::threat_scan,

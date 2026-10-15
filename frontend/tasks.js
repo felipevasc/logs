@@ -30,6 +30,8 @@ window.Tasks = (() => {
   for (const command of evidenceReads) READS.add(command);
   const evidencePreparations = new Set(["case_evidence_prepare", "case_evidence_prepare_membership"]);
   const evidenceCommits = new Set(["case_import_native"]);
+  // Past their commit point these finish even when cancelled: report what really happened.
+  const committedWork = new Set(["split_run", "split_recover"]);
   const WHAT = { exclusion_preview: "Prévia da exclusão", exclusion_commit: "Arquivando registros", exclusion_list: "Lotes excluídos", exclusion_archive_page: "Registros arquivados", exclusion_restore_batch: "Restaurando lote", exclusion_restore_selected: "Restaurando seleção", dataset_overview: "Visão geral", triage: "Comprometimentos", triage_evidence_event: "Evento da evidência", timeline_range: "Volume no tempo", timeline_lanes: "Faixas", query_page: "Registros", engine_retry: "Preparando índices", query_events: "Registros", explore_snapshot: "Registros e campos", tree_aggs: "Campos", aggregate_events: "Grupos", profile_fields: "Perfil dos campos", compute_series: "Gráficos", pivot: "Tabela dinâmica", discover_patterns: "Padrões", threat_scan: "Ameaças", threat_events: "Registros de ameaça", compare_periods: "Comparação de períodos", journey_index: "Possíveis trilhas", journey_events: "Registros da trilha", journey_fields: "Campos de ligação", entity_summary: "Entidades", ioc_sightings: "Indicadores nas fontes", source_hashes: "SHA-256 das fontes", stats_events: "Timeline", grouped_timeline: "Timeline por campo", preview_field_transform: "Prévia da transformação", count_filtered: "Contagem", trail_events: "Vizinhança do registro", load_file: "Abrindo logs", load_files: "Abrindo logs", load_bundle: "Abrindo logs", load_event_log: "Lendo o Event Log", remote_import: "Importação remota", remote_test: "Teste de conexão", export_events: "Exportação", export_investigation: "Exportação", import_investigation: "Importação da investigação", harvest_codes: "Catálogo do sistema", sigma_import: "Importação Sigma", expand_paths: "Lendo pastas", event_detail: "Detalhe do registro", list_sources: "Fontes", event_insights: "Detalhe do registro" };
   WHAT.client_inventory = "Clientes e navegadores";
   Object.assign(WHAT, { reference_inspect: "Inspecionando referência", reference_list: "Referências do Caso", reference_import: "Importando referência", reference_remove: "Removendo referência", reference_save_lookup: "Salvando campo por referência" });
@@ -45,7 +47,7 @@ window.Tasks = (() => {
   WHAT.case_evidence_timeline = "Cronologia das evidências preservadas";
   WHAT.case_evidence_find_members = "Identificando ocorrências preservadas";
   const ZONES = { analysis: "Análise", case: "Caso", structure: "Estrutura" };
-  const PAGES = { summary: "Resumo", compromises: "Comprometimentos", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas" };
+  const PAGES = { "log-split": "Separar logs", summary: "Resumo", compromises: "Comprometimentos", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas" };
   const TABS = { table: "Registros", group: "Resumir", dashboard: "Descobrir", cube: "Cruzar dados" };
   const VISIBLE_AFTER = 300;
   const tasks = new Map(), inflight = new Map(), ids = new WeakMap();
@@ -53,6 +55,10 @@ window.Tasks = (() => {
   const named = new Set(["set_ts_config", "remote_import", "remote_test", "load_bundle", "journey_fields", "journey_index", "journey_events", "discover_patterns", "timeline_range", "query_page", "query_events", "explore_snapshot", "count_filtered", "stats_events", "tree_aggs", "aggregate_events", "compute_series", "pivot", "load_file", "load_files", "load_event_log", "engine_retry"]);
   const sourceMutations = new Set(["set_ts_config", "load_file", "load_files", "load_bundle", "load_event_log", "clear_events"]);
   named.add("triage");
+  // Separar logs: cancellable, never shared; the pickers and listings are bookkeeping.
+  for (const command of ["split_run", "split_preview", "split_recover"]) named.add(command);
+  for (const command of ["split_choose_input", "split_choose_output", "split_inspect", "split_pending"]) QUIET.add(command);
+  Object.assign(WHAT, { split_run: "Separando o log", split_preview: "Testando a separação", split_recover: "Retomando a separação" });
   for (const command of ["investigation_page", "investigation_profile_train", "investigation_narrative_review"]) named.add(command);
   for (const command of ["investigation_proposal_evaluate", "investigation_proposal_accept"]) named.add(command);
   Object.assign(WHAT, { investigation_proposal_evaluate: "Avaliando proposta e controles", investigation_proposal_accept: "Salvando regra revisada" });
@@ -126,7 +132,7 @@ window.Tasks = (() => {
       // A successful source mutation already crossed the native commit boundary.
       // Cancellation may have arrived too late; retain the committed result so the
       // source intent guard can reconcile it instead of pretending it rolled back.
-      if (entry.cancelled && !sourceMutations.has(entry.cmd) && !evidenceCommits.has(entry.cmd) && !window.AnalysisContexts?.validSnapshot(result?.analysisContext)) throw new Error("Operação cancelada.");
+      if (entry.cancelled && !sourceMutations.has(entry.cmd) && !evidenceCommits.has(entry.cmd) && !committedWork.has(entry.cmd) && !window.AnalysisContexts?.validSnapshot(result?.analysisContext)) throw new Error("Operação cancelada.");
       return result;
     }, error => { if (!entry.cancelled && !opts.silent) toast(String(error), "err"); throw error; })
       .finally(() => { tasks.delete(entry.id); schedule(); if (inflight.get(entry.key2) === entry) inflight.delete(entry.key2); for (const [key, owner] of latest) if (owner === entry) latest.delete(key); });

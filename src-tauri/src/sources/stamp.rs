@@ -58,6 +58,9 @@ pub(crate) struct Found {
     pub end: usize,
     pub inferred: Inferred,
     pub has_time: bool,
+    /// The text carried its zone (or is an epoch): `ms` is absolute. Without
+    /// one, `ms` reads the wall-clock time in the machine's local zone.
+    pub zoned: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -918,7 +921,7 @@ fn infer_year(month: u32, day: u32, ctx: &Context) -> Option<NaiveDate> {
 
 fn complete(raw: Raw, epoch_ms: Option<i64>, start: usize, ctx: &Context) -> Option<Found> {
     if let Some(ms) = epoch_ms {
-        return Some(Found { ms, start, end: raw.end, inferred: Inferred::Nothing, has_time: true });
+        return Some(Found { ms, start, end: raw.end, inferred: Inferred::Nothing, has_time: true, zoned: true });
     }
     let (date, inferred) = match raw.date {
         Some((Some(year), month, day)) => (NaiveDate::from_ymd_opt(year, month, day)?, Inferred::Nothing),
@@ -927,11 +930,12 @@ fn complete(raw: Raw, epoch_ms: Option<i64>, start: usize, ctx: &Context) -> Opt
     };
     let (hour, minute, second, nanos) = raw.time.unwrap_or((0, 0, 0, 0));
     let local = date.and_hms_nano_opt(hour, minute, second, nanos)?;
-    let ms = match raw.zone.and_then(|zone| offset_seconds(zone, local)) {
+    let offset = raw.zone.and_then(|zone| offset_seconds(zone, local));
+    let ms = match offset {
         Some(offset) => local.and_utc().timestamp_millis() - i64::from(offset) * 1000,
         None => super::naive_to_ms(local),
     };
-    Some(Found { ms, start, end: raw.end, inferred, has_time: raw.time.is_some() })
+    Some(Found { ms, start, end: raw.end, inferred, has_time: raw.time.is_some(), zoned: offset.is_some() })
 }
 
 /// The leftmost date/time in a line. A complete date and time wins over an

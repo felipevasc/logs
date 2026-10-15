@@ -13,9 +13,9 @@
     const signature = JSON.stringify(current);
     if (signature !== lastFilters) { history.push(previousSelection); if (history.length > 30) history.shift(); previousSelection = current; lastFilters = signature; cacheKey = ""; lastExploredKey = ""; }
   }
-  const titles = { summary: "Resumo", compromises: "Comprometimentos", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs" };
+  const titles = { summary: "Resumo", compromises: "Comprometimentos", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs", "log-split": "Separar logs" };
   // Areas: Análise and Caso read the data; Estrutura holds what feeds it.
-  const STRUCTURE = new Set(["sources", "connections", "import"]);
+  const STRUCTURE = new Set(["sources", "connections", "import", "log-split"]);
   const TIMELINE_GROUP = new Set(["timeline", "case-timeline", "case-trails", "journeys"]);
   const ZONE_ORDER = { analysis: 0, case: 1, structure: 2 };
   const lastZonePage = { analysis: "summary", case: "summary", structure: "sources" };
@@ -63,7 +63,7 @@
     syncZone(); renderPageTabs(next);
     document.querySelectorAll("[data-page]").forEach(b => { if (b.tagName === "BUTTON") { b.classList.toggle("selected", b.dataset.page === navPage); b.setAttribute("aria-current", b.dataset.page === navPage ? "page" : "false"); } });
     $("#ws-title").textContent = titles[next] || next;
-    $("#ws-reload").hidden = ["sources", "connections", "import", "evidence", "case-timeline", "case-trails", "journeys"].includes(next) || !state.loaded;
+    $("#ws-reload").hidden = ["sources", "connections", "import", "log-split", "evidence", "case-timeline", "case-trails", "journeys"].includes(next) || !state.loaded;
     $("#ws-clear-scope").hidden = !backendFilters().length || ["evidence", "compromises"].includes(next);
     updateCounts();
     updateContextBar();
@@ -71,11 +71,12 @@
   function updateCounts() {
     $("#ws-evidence-count").textContent = activeCase()?.items?.length || "";
     $("#ws-source-count").textContent = sourceList.length || "";
-    $("#ws-subtitle").textContent = page === "compromises" ? `Todo o ${workspaceScope() === "case" ? "Caso ativo" : "conjunto carregado"} · independente dos filtros do Explorar` : page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${currentCountLabel("registros")} do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${currentCountLabel("eventos")}${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
+    $("#ws-subtitle").textContent = page === "log-split" ? "Divide arquivos grandes por texto, padrão, data ou posição, sem abri-los na análise" : page === "compromises" ? `Todo o ${workspaceScope() === "case" ? "Caso ativo" : "conjunto carregado"} · independente dos filtros do Explorar` : page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${currentCountLabel("registros")} do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${currentCountLabel("eventos")}${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
   }
   async function showPage(next) {
     const request = ++navigation;
     window.RemoteSources?.unmount?.();
+    window.LogSplit?.unmount?.();
     if (activeCase()?.kind === "preserved_case_unavailable") {
       markPage("evidence"); closeDrawer(); switchView("workspace"); home.hidden = false; empty.hidden = true; content.hidden = false;
       renderUnavailableCase(); return;
@@ -119,6 +120,7 @@
     switchView("workspace"); home.hidden = false;
     if (next === "import") { empty.hidden = false; content.hidden = true; return; }
     if (next === "connections") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; window.RemoteSources?.mount(content); return; }
+    if (next === "log-split") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; await window.LogSplit?.mount(content); return; }
     if (next === "journeys") { empty.hidden = true; content.hidden = false; await window.Journeys.render(content); return; }
     empty.hidden = workspaceScope() === "case" || state.loaded || next === "evidence" || (next === "sources" && sourceList.length > 0);
     content.hidden = !empty.hidden;

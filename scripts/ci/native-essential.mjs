@@ -10,6 +10,7 @@ const units = [
   'security_progress::tests::',
   'source_publication::tests::', 'global_scheduler::tests::',
   'remote::tests::', 'remote_files::tests::', 'field_indexes::tests::',
+  'log_split::',
   'analysis_context::tests::existing_sqlite_cases_migrate_but_first_new_case_does_not_inherit_globals',
   'analysis_context::tests::exported_config_imports_with_new_identity_without_foreign_globals',
   'analysis_context::tests::same_case_id_recreated_cannot_accept_old_analysis_edit',

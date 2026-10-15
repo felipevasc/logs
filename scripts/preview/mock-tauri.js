@@ -618,6 +618,45 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
         return [joined, "(não reconhecido)"];
       });
     },
+    // Separar logs: a simulated 3.2 GB Java log; preview frames the sample lines below.
+    split_choose_input: () => (window.__mockSplit = { matched: null, rest: null }, handlers.split_inspect({ token: "mock-split" })),
+    split_inspect: () => {
+      const state = window.__mockSplit ||= { matched: null, rest: null };
+      return { token: "mock-split", path: "D:\\logs\\server.log", name: "server.log", size: 3.2 * 1024 ** 3, encoding: "UTF-8", lineBreak: "CRLF",
+        lines: ["2026-10-12 00:00:01,120 INFO  [main] c.e.App - Iniciando", "2026-10-12 00:00:02,333 ERROR [http-1] c.e.Api - Falha ao processar", "java.lang.IllegalStateException: estado inválido", "\tat c.e.Api.handle(Api.java:42)", "\t... 12 more", "2026-10-12 00:00:03,010 INFO  [http-2] c.e.Api - OK"],
+        framing: "Cada item começa em uma linha com data, como “2026-10-12 00:00:01,120 INFO  [main] c.e.App - Iniciando”; as linhas seguintes sem data (stack traces, continuações) ficam no mesmo item.",
+        firstDate: Date.parse("2026-10-12T00:00:01.120"), chronological: true, freeBytes: 1.1 * 1024 ** 3,
+        matchedPath: state.matched || "D:\\logs\\server.filtrado.log", restPath: state.rest || "D:\\logs\\server.restante.log",
+        matchedChosen: !!state.matched, restChosen: !!state.rest, sameVolume: true };
+    },
+    split_choose_output: ({ side }) => { const state = window.__mockSplit ||= {}; state[side] = `E:\\saida\\server.${side === "matched" ? "erros" : "resto"}.log`; return handlers.split_inspect(); },
+    split_pending: () => window.__mockSplitPending || [],
+    split_preview: async ({ spec }) => {
+      await delay(250);
+      const items = [];
+      for (let i = 0; i < 40; i++) {
+        const error = i % 5 === 1, date = Date.parse("2026-10-12T00:00:00") + i * 1500;
+        const text = `2026-10-12 00:00:${String(Math.floor(i * 1.5)).padStart(2, "0")},000 ${error ? "ERROR" : "INFO "} [http-${i}] c.e.Api - item ${i}${error ? "\njava.lang.IllegalStateException: estado inválido\n\tat c.e.Api.handle(Api.java:42)" : ""}`;
+        const wanted = spec.rule.conditions.every(c => c.kind !== "text" || c.values.some(v => text.split("\n")[0].toLowerCase().includes(v.toLowerCase())) !== c.negate);
+        items.push({ number: i + 1, line: i * 1 + 1 + Math.floor(i / 5) * 2, lines: error ? 3 : 1, text, matched: wanted, date });
+      }
+      return { framing: "Cada item começa em uma linha com data; stack traces ficam no mesmo item.", items, evaluated: 5000, matched: items.filter(i => i.matched).length * 125, undated: 0, sampledBytes: 4 * 1024 ** 2, wholeFile: false };
+    },
+    split_run: async ({ spec, operationId }) => {
+      const phases = spec.mode === "move" ? [["split-decide", "Analisando o arquivo"], ["split-carve", "Separando do fim para o início"], ["split-assemble", "Montando os arquivos separados"]] : [["split-stream", "Separando"]];
+      for (const [phaseId, phase] of phases) {
+        for (let done = 0; done <= 3277; done += 410) {
+          emitMock("operation-progress", { operationId, operation: "separação", phaseId, phase, completed: done, total: 3277, unit: "MB", selected: done * 40, cancellable: true });
+          await delay(window.__mockSplitDelay ?? 220);
+          if (window.__mockCancelledIds?.has(operationId) && phaseId !== "split-assemble") throw Error(phaseId === "split-carve" ? "Separação cancelada. O arquivo original foi restaurado." : "Operação cancelada.");
+        }
+      }
+      const state = window.__mockSplit || {};
+      return { strategy: spec.mode === "move" ? "parts" : "stream", matched: { path: state.matched || "D:\\logs\\server.filtrado.log", bytes: 412 * 1024 ** 2 },
+        rest: spec.mode === "matched" ? null : { path: state.rest || "D:\\logs\\server.restante.log", bytes: 2.8 * 1024 ** 3 }, originalRemoved: spec.mode === "move",
+        stats: { items: 1832440, matchedItems: 210334, undated: 0, oversized: 0, regionBytes: 0 }, framing: "", elapsedMs: 48200 };
+    },
+    split_recover: async ({ undo }) => { await delay(400); window.__mockSplitPending = []; return undo ? null : { strategy: "parts", matched: { path: "D:\\logs\\a.filtrado.log", bytes: 1024 }, rest: { path: "D:\\logs\\a.restante.log", bytes: 2048 }, originalRemoved: true, stats: { items: 0, matchedItems: 0, undated: 0, oversized: 0, regionBytes: 3072 }, framing: "", elapsedMs: 900 }; },
     get_ts_config: () => null,
     set_ts_config: async ({ operationId } = {}) => {
       for (let done = 0; done <= 6000; done += 1500) {

@@ -1331,7 +1331,7 @@ fn detect_entry_start(bytes: &[u8]) -> Option<regex::Regex> {
 
 /// Text that continues the previous record: indented lines, Java/Python/.NET/Go
 /// traces, exception headers and java.util.logging's level line.
-fn continuation_line(line: &str) -> bool {
+pub(crate) fn continuation_line(line: &str) -> bool {
     if line.starts_with([' ', '\t', '}', ']', ')']) {
         return true;
     }
@@ -1357,7 +1357,7 @@ fn continuation_line(line: &str) -> bool {
 /// most lines start with the same kind of date and the others look like
 /// continuations (traces, indented text), each line starting with that kind
 /// of date begins a record, the way log shippers frame multi-line events.
-fn detect_record_start(bytes: &[u8], ctx: &stamp::Context) -> Option<String> {
+pub(crate) fn detect_record_start(bytes: &[u8], ctx: &stamp::Context) -> Option<String> {
     let mut shapes: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let (mut stamped, mut continued, mut other, mut bare) = (0usize, 0usize, 0usize, 0usize);
     for raw in bytes.split(|&b| b == b'\n').take(2_000) {
