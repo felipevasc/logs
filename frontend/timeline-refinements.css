@@ -180,3 +180,15 @@ button.ct-table-title:hover { color: var(--accent); text-decoration: underline; 
 .tl-swim-note { margin: 0; color: var(--text-2); font-size: 10px; }
 .tl-swim-hover { position: absolute; z-index: 3; padding: 6px 9px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--bg-0); box-shadow: 0 10px 24px #0004; color: var(--text-0); font-size: 11px; white-space: nowrap; pointer-events: none; }
 @media (max-width: 700px) { .tl-swims { margin-left: 32px; } }
+
+/* Milestones with an unknown date: "?" at the reference date, with the side it lies on. */
+.ct-entry.is-manual.is-uncertain strong::before { content: "?"; font-weight: 800; font-size: 11px; }
+.ct-entry.is-manual.is-uncertain[data-when="before"] strong::before { content: "‹ ?"; }
+.ct-entry.is-manual.is-uncertain[data-when="after"] strong::before { content: "? ›"; }
+.ct-entry.is-manual.is-uncertain[data-when="around"] strong::before { content: "≈ ?"; }
+.ct-entry.is-uncertain::after { background: transparent !important; border: 1.5px dashed var(--entry-color); box-sizing: border-box; }
+.ct-entry.is-uncertain strong { font-style: italic; }
+.ct-matrix .is-uncertain .ct-matrix-dot { background: transparent; border: 1.5px dashed var(--entry-color); }
+.ct-matrix .ct-matrix-dot[data-when]::after { content: "?"; position: absolute; left: 50%; top: -13px; transform: translateX(-50%); font: 700 10px var(--font-ui); color: var(--entry-color); }
+.ct-uncertain-time { font-style: italic; }
+.ct-when-hint { margin: -2px 0 2px; font-size: 11px; color: var(--text-2); }

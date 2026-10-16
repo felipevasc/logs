@@ -5251,6 +5251,8 @@ function saveManualEvent() {
     description: $("#mf-desc").value.trim(),
     start: new Date(start).getTime(),
     end: $("#mf-end").value ? new Date($("#mf-end").value).getTime() : null,
+    // Unknown date: the dates above are the reference ("before", "after", "around").
+    ...(["before", "after", "around"].includes($("#mf-when")?.value) ? { when: $("#mf-when").value } : {}),
   });
   saveCases();
   updateAnalysisBadge();
@@ -5260,6 +5262,7 @@ function saveManualEvent() {
   $("#mf-desc").value = "";
   $("#mf-start").value = "";
   $("#mf-end").value = "";
+  if ($("#mf-when")) $("#mf-when").value = "";
 }
 
 // menu de contexto de uma célula de evento
@@ -6072,7 +6075,7 @@ function renderChart(stats) {
   if (chart) {
     chart.setData([xs, ys]);
     const width = Math.max(280, box.clientWidth - 4);
-    if (Math.abs(chart.width - width) > 2) chart.setSize({ width, height: 96 });
+    if (Math.abs(chart.width - width) > 2) chart.setSize({ width, height: 104 });
     return;
   }
   box.innerHTML = "";
@@ -6080,12 +6083,12 @@ function renderChart(stats) {
   chart = new uPlot(
     {
       width: Math.max(280, box.clientWidth - 4),
-      height: 96,
+      height: 104,
       legend: { show: false },
       cursor: { drag: { x: true, y: false, setScale: false }, focus: { prox: 24 } },
       scales: { x: { time: true } },
       axes: [
-        { stroke: axisColor, grid: { show: false }, ticks: { show: false }, size: 20, font: "10px " + "sans-serif", ...window.DateValues.timeAxis() },
+        ...window.DateValues.timeAxes(),
         { stroke: axisColor, grid: { stroke: gridColor }, ticks: { show: false }, size: 30 },
       ],
       series: [
@@ -7033,7 +7036,7 @@ function switchView(which, { deferAnalytics = false } = {}) {
   if (which === "estacoes") renderStations();
   if (which === "case-dashboard") openDashboard("case");
   if (which === "case-cube") openCube("case");
-  if (which === "viz") { switchTab(state.activeDatasetTab, { deferAnalytics }); requestAnimationFrame(() => { const box = $("#chart"); if (chart && box.clientWidth > 0) chart.setSize({ width: box.clientWidth - 4, height: 96 }); }); }
+  if (which === "viz") { switchTab(state.activeDatasetTab, { deferAnalytics }); requestAnimationFrame(() => { const box = $("#chart"); if (chart && box.clientWidth > 0) chart.setSize({ width: box.clientWidth - 4, height: 104 }); }); }
   updateContextBar();
 }
 
@@ -8004,7 +8007,7 @@ function bind() {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       updateFilterTabsLayout();
-      if (chart && $("#chart").clientWidth > 0) chart.setSize({ width: Math.max(280, $("#chart").clientWidth - 4), height: 96 });
+      if (chart && $("#chart").clientWidth > 0) chart.setSize({ width: Math.max(280, $("#chart").clientWidth - 4), height: 104 });
       for (const plot of Object.values(dashCharts)) { const box = plot?.root?.parentElement; if (box?.clientWidth) plot.setSize({ width: Math.max(200, box.clientWidth - 8), height: plot.height }); }
     }, 250);
   });
@@ -8601,8 +8604,7 @@ function renderLineChart(box, res, id) {
       cursor: { show: true, drag: { x: true, y: false, setScale: false } },
       scales: { x: { time: true } },
       axes: [
-        { stroke: axisColor, grid: { show: false }, ticks: { show: false }, size: 22,
-          ...window.DateValues.timeAxis() },
+        ...window.DateValues.timeAxes(),
         {
           stroke: axisColor, grid: { stroke: () => isLight() ? "rgba(19,81,180,0.08)" : "rgba(255,255,255,0.06)" },
           ticks: { show: false }, size: 44,

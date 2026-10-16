@@ -24,6 +24,15 @@ window.CaseTimeline = (() => {
   const dateTimeFormat = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const timeFormat = new Intl.DateTimeFormat("pt-BR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const when = value => dateTimeFormat.format(new Date(value));
+  // A milestone whose real date is unknown keeps a reference date or interval
+  // and how it relates to it; it is drawn with "?" at that reference.
+  const UNCERTAIN = { before: ["Antes de", "Antes do intervalo"], after: ["Depois de", "Depois do intervalo"], around: ["Por volta de", "Por volta do intervalo"] };
+  const uncertainty = manual => Object.hasOwn(UNCERTAIN, manual?.when) ? manual.when : null;
+  function uncertainText(kind, start, end, format = when) {
+    if (!Object.hasOwn(UNCERTAIN, kind)) return null;
+    const range = end > start;
+    return `? ${UNCERTAIN[kind][range ? 1 : 0]} ${format(start)}${range ? ` – ${format(end)}` : ""}`;
+  }
   const months = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
   const dayLabel = value => { const date = new Date(value); return `${String(date.getDate()).padStart(2, "0")}/${months[date.getMonth()]}${date.getFullYear() === new Date().getFullYear() ? "" : `/${String(date.getFullYear()).slice(-2)}`}`; };
   const clockLabel = value => timeFormat.format(new Date(value));
@@ -127,7 +136,7 @@ window.CaseTimeline = (() => {
       entries.push({ id: `m:${manual.id}`, type: "manual", start: manual.start,
         end: valid(manual.end) && manual.end > manual.start ? manual.end : manual.start,
         title: manual.name || "Marco", detail: manual.description || "", source: "Marco do caso",
-        color: manual.color || COLORS[3], rows: [], manual });
+        color: manual.color || COLORS[3], rows: [], manual, uncertain: uncertainty(manual) });
     }
     entries.sort((a, b) => a.start - b.start || a.end - b.end);
     return { config, entries, undated };
@@ -179,7 +188,7 @@ window.CaseTimeline = (() => {
       title: String(entry.title || ""), detail: String(entry.detail || ""), source: String(entry.source || ""), count: entry.rows.length,
       itemIds: [...new Set((entry.members || [entry]).filter(member => !member.itemRef).map(member => member.itemId).filter(id => id != null))],
       ...((entry.members || [entry]).some(member => member.itemRef) ? { itemRefs: [...new Map((entry.members || [entry]).filter(member => member.itemRef).map(member => [JSON.stringify(member.itemRef), member.itemRef])).values()] } : {}),
-      manualId: entry.manual?.id ?? null,
+      manualId: entry.manual?.id ?? null, uncertain: uncertainty(entry.manual),
       notes: (notes.get(entry.id) || []).map(note => ({ id: note.id, anchor: note.anchor, text: String(note.text || ""), icon: note.icon || "", color: note.color || null })) };
   }
   async function nativeRows(c, { limit, maxChars, includeUndated, signal }) {
@@ -242,7 +251,9 @@ window.CaseTimeline = (() => {
         const entry = entries[index], rowNotes = notes.get(entry.id) || [], tr = document.createElement("tr"); tr.dataset.id = entry.id;
         const time = document.createElement("td"); time.className = "ct-table-time";
         const first = document.createElement("time"); if (entry.start !== null) first.dateTime = new Date(entry.start).toISOString(); first.textContent = entry.start === null ? entry.timing === "unavailable" ? "Horário indisponível" : "Sem horário" : preciseTime(entry.start); time.append(first);
-        if (entry.end !== entry.start) { const last = document.createElement("time"); last.dateTime = new Date(entry.end).toISOString(); last.textContent = `até ${preciseTime(entry.end)}`; time.append(last); }
+        const unknownKind = entry.uncertain || uncertainty(entry.manual);
+        if (unknownKind && entry.start !== null) { first.textContent = uncertainText(unknownKind, entry.start, entry.end, preciseTime); time.classList.add("ct-uncertain-time"); }
+        else if (entry.end !== entry.start) { const last = document.createElement("time"); last.dateTime = new Date(entry.end).toISOString(); last.textContent = `até ${preciseTime(entry.end)}`; time.append(last); }
         const main = document.createElement("td"), open = document.createElement(entry.rows.length ? "button" : "strong"); open.className = "ct-table-title"; open.textContent = preview(entry.title, 180); open.title = preview(entry.title, 600);
         if (entry.rows.length) { open.type = "button"; open.onclick = () => { if (entry.rows.length === 1) callbacks.detail(entry.rows[0]); else { const rect = open.getBoundingClientRect(); callbacks.bucket(rect.left, rect.bottom, entry.rows); } }; }
         main.append(open); const kind = document.createElement("small"); kind.textContent = rowKind(entry.type); main.append(kind);
@@ -456,7 +467,15 @@ window.CaseTimeline = (() => {
       const local = value => { const date = new Date(value); return new Date(clamp(value - date.getTimezoneOffset() * 60000, -8640000000000000, 8640000000000000)).toISOString().replace(/Z$/, ""); };
       if (type === "manual") {
         heading.textContent = entry ? "Editar marco" : "Novo marco";
-        fields.innerHTML = `<label>Nome<input name="name" maxlength="120" required value="${safe(entry?.editTitle ?? entry?.title ?? "")}"></label><label>Início<input name="start" type="datetime-local" step="0.001" required value="${local(entry?.start ?? time ?? Date.now())}"></label><label>Fim <span>(opcional)</span><input name="end" type="datetime-local" step="0.001" value="${entry?.end > entry?.start ? local(entry.end) : ""}"></label><label>Descrição<textarea name="description" rows="3" maxlength="1200">${safe(entry?.manual?.description ?? entry?.detail ?? "")}</textarea></label>`;
+        const kind = uncertainty(entry?.manual) || "";
+        const option = (value, label) => `<option value="${value}" ${kind === value ? "selected" : ""}>${label}</option>`;
+        fields.innerHTML = `<label>Nome<input name="name" maxlength="120" required value="${safe(entry?.editTitle ?? entry?.title ?? "")}"></label><label>Data<select name="when">${option("", "Conhecida")}${option("before", "Desconhecida · antes de")}${option("after", "Desconhecida · depois de")}${option("around", "Desconhecida · por volta de")}</select></label><label><span data-when-label>${kind ? "Data de referência" : "Início"}</span><input name="start" type="datetime-local" step="0.001" required value="${local(entry?.start ?? time ?? Date.now())}"></label><label><span data-when-end>${kind ? "Fim do intervalo de referência" : "Fim"}</span> <span>(opcional)</span><input name="end" type="datetime-local" step="0.001" value="${entry?.end > entry?.start ? local(entry.end) : ""}"></label><p class="ct-when-hint" ${kind ? "" : "hidden"}>O marco aparece com “?” na data ou no intervalo informados.</p><label>Descrição<textarea name="description" rows="3" maxlength="1200">${safe(entry?.manual?.description ?? entry?.detail ?? "")}</textarea></label>`;
+        fields.querySelector('[name="when"]').onchange = event => {
+          const unknown = !!event.target.value;
+          fields.querySelector("[data-when-label]").textContent = unknown ? "Data de referência" : "Início";
+          fields.querySelector("[data-when-end]").textContent = unknown ? "Fim do intervalo de referência" : "Fim";
+          fields.querySelector(".ct-when-hint").hidden = !unknown;
+        };
       } else if (type === "annotation") {
         heading.textContent = entry ? "Editar nota" : "Nova nota";
         fields.innerHTML = `<label>Texto <span>(opcional com ícone)</span><textarea name="text" rows="3" maxlength="1500">${safe(entry?.text || "")}</textarea></label><div class="ct-note-icon-host"></div>`;
@@ -504,6 +523,8 @@ window.CaseTimeline = (() => {
           if (!valid(from) || to != null && (!valid(to) || to < from)) { callbacks.notify("Revise o intervalo do marco."); return; }
           const manual = entry?.manual || { id: uniqueId("m"), createdAt: Date.now() };
           Object.assign(manual, { name: String(values.get("name")).trim(), description: String(values.get("description")).trim(), start: from, end: to });
+          const unknown = String(values.get("when") || "");
+          if (Object.hasOwn(UNCERTAIN, unknown)) manual.when = unknown; else delete manual.when;
           if (!entry) (c.manual ||= []).push(manual);
         } else if (type === "annotation") {
           if (!String(values.get("text")).trim() && !String(values.get("icon"))) { callbacks.notify("Escreva um texto ou escolha um ícone."); return; }
@@ -617,13 +638,15 @@ window.CaseTimeline = (() => {
       const hasRange = entry.end > entry.start;
       const isSingle = !isGrouped && !hasRange;
       const node = document.createElement("article");
-      node.className = `ct-entry ${entry.type === "manual" ? "is-manual" : ""} ${entry.type === "group" ? "is-group" : ""} ${entry.type === "auto" ? "is-auto" : ""} ${hasRange ? "has-range" : ""} ${isGrouped ? "is-grouped" : ""} ${isSingle ? "is-single" : ""}`;
+      const uncertain = entry.uncertain || uncertainty(entry.manual);
+      node.className = `ct-entry ${entry.type === "manual" ? "is-manual" : ""} ${uncertain ? "is-uncertain" : ""} ${entry.type === "group" ? "is-group" : ""} ${entry.type === "auto" ? "is-auto" : ""} ${hasRange ? "has-range" : ""} ${isGrouped ? "is-grouped" : ""} ${isSingle ? "is-single" : ""}`;
       node.tabIndex = index === 0 ? 0 : -1;
       node.setAttribute("role", "group");
       node.setAttribute("aria-roledescription", "ocorrência");
       node.dataset.id = entry.id; node.style.setProperty("--entry-color", entry.color);
       node.dataset.side = side;
-      node.title = `${preview(entry.title)}\n${preview(entry.source, 180)} · ${when(entry.start)}${entry.end > entry.start ? ` → ${when(entry.end)}` : ""}${entry.detail ? `\n${preview(entry.detail, 800)}` : ""}`;
+      if (uncertain) node.dataset.when = uncertain;
+      node.title = `${preview(entry.title)}\n${preview(entry.source, 180)} · ${uncertain ? `data desconhecida: ${uncertainText(uncertain, entry.start, entry.end).slice(2).toLowerCase()}` : `${when(entry.start)}${entry.end > entry.start ? ` → ${when(entry.end)}` : ""}`}${entry.detail ? `\n${preview(entry.detail, 800)}` : ""}`;
       node.innerHTML = `<strong>${safe(preview(entry.title, 180))}</strong>${recordCount(entry) > 1 ? `<span class="ct-entry-count" aria-label="${recordCount(entry)} registros" title="${entry.type === "auto" ? "Repetições resumidas automaticamente" : "Registros agrupados no caso"}">${recordCount(entry).toLocaleString("pt-BR")}</span>` : ""}<button class="ct-open" type="button" tabindex="-1" title="Abrir detalhes" aria-label="Abrir detalhes de ${safe(preview(entry.title, 180))}"><i class="fas fa-arrow-up-right-from-square"></i></button>`;
       node.style.setProperty("--entry-offset", `${offset}px`);
       node.style.setProperty("--range-gutter", `${gutter}px`);
@@ -774,7 +797,8 @@ window.CaseTimeline = (() => {
         for (const member of members) {
           const marker = document.createElement("span"); marker.className = "ct-matrix-dot"; marker.dataset.markerAnchor = member.id;
           marker.style.left = `${matrixPosition(member.start) - point.x + 2}px`;
-          marker.title = `${preview(entry.title)}\n${when(member.start)}${member.rows[0]?.message ? `\n${preview(member.rows[0].message, 800)}` : ""}`;
+          if (uncertain) marker.dataset.when = uncertain;
+          marker.title = `${preview(entry.title)}\n${uncertain ? uncertainText(uncertain, entry.start, entry.end) : when(member.start)}${member.rows[0]?.message ? `\n${preview(member.rows[0].message, 800)}` : ""}`;
           marker.ondblclick = event => { event.stopPropagation(); if (member.rows.length === 1) callbacks.detail(member.rows[0]); else open(); };
           node.append(marker); markerNodes.set(member.id, marker); markerPoints.set(member.id, { x: matrixPosition(member.start), y: point.y });
           if (!markerNodes.has(entry.id)) { markerNodes.set(entry.id, marker); markerPoints.set(entry.id, { x: point.x, y: point.y }); }
@@ -1414,5 +1438,6 @@ window.CaseTimeline = (() => {
       return { ...rendered, complete: !overview, overview, summary, eventCount, undated };
     } finally { host.remove(); }
   }
+  window.CaseTimelineDates = Object.freeze({ uncertainText, uncertainty });
   return { render, rows, image };
 })();

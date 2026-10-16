@@ -100,30 +100,48 @@ window.DateValues = (() => {
     return ms == null ? text : String(ms);
   }
 
-  // Time-axis labels (epoch seconds): hours inside a single day; once the
-  // visible period spans days, midnight ticks show the date and the first tick
-  // its date and hour; the year appears when the period crosses one.
-  function axisLabels(values, incr, min, max) {
-    const first = new Date(min * 1000), last = new Date(max * 1000);
-    const oneDay = first.toDateString() === last.toDateString();
-    const oneYear = first.getFullYear() === last.getFullYear();
-    const hour = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    let previousYear = null;
-    return values.map((value, index) => {
+  // Time axes (epoch seconds) in two quiet rows: hours next to the plot in a
+  // muted tone, dates below in a stronger one, and a faint dotted rule where
+  // each day begins. Within a single day only its date is written once.
+  const DAY = 86400;
+  const sameDay = (a, b) => new Date(a * 1000).toDateString() === new Date(b * 1000).toDateString();
+  const hourText = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  function hourLabels(values, min, max) {
+    const oneDay = sameDay(min, max);
+    return values.map(value => {
       const d = new Date(value * 1000);
-      if (oneDay) return hour(d);
-      const showYear = !oneYear && d.getFullYear() !== previousYear;
-      previousYear = d.getFullYear();
-      const date = `${pad(d.getDate())}/${pad(d.getMonth() + 1)}${showYear ? `/${d.getFullYear()}` : ""}`;
-      if (incr >= 86400 || (d.getHours() === 0 && d.getMinutes() === 0)) return date;
-      return index === 0 ? `${date} ${hour(d)}` : hour(d);
+      // Midnight belongs to the date row below.
+      return !oneDay && d.getHours() === 0 && d.getMinutes() === 0 ? "" : hourText(d);
     });
   }
-  // uPlot x axis with those labels and room for them.
-  const timeAxis = () => ({
-    values: (u, values, axis, space, incr) => axisLabels(values, incr, u.scales.x.min, u.scales.x.max),
-    space: (u, axis, min, max) => new Date(min * 1000).toDateString() === new Date(max * 1000).toDateString() ? 50 : 72,
-  });
+  // Local midnights inside [min, max], thinned to keep labels apart.
+  function daySplits(min, max, width = 600) {
+    if (sameDay(min, max)) return [min];
+    const days = [], d = new Date(min * 1000);
+    d.setHours(0, 0, 0, 0);
+    if (d.getTime() / 1000 < min) d.setDate(d.getDate() + 1);
+    while (d.getTime() / 1000 <= max && days.length < 5000) { days.push(d.getTime() / 1000); d.setDate(d.getDate() + 1); }
+    const step = Math.max(1, Math.ceil(56 / Math.max(width / Math.max(1, (max - min) / DAY), 1)));
+    return days.filter((_, index) => index % step === 0);
+  }
+  function dayLabels(values, min, max) {
+    const crosses = new Date(min * 1000).getFullYear() !== new Date(max * 1000).getFullYear();
+    let year = null;
+    return values.map(value => {
+      const d = new Date(value * 1000), show = crosses && d.getFullYear() !== year;
+      year = d.getFullYear();
+      return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}${show ? `/${d.getFullYear()}` : ""}`;
+    });
+  }
+  const tone = (name, fallback) => () => getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+  const timeAxes = () => [
+    { scale: "x", side: 2, size: 15, gap: 3, font: "10px sans-serif", stroke: tone("--text-2", "#6b7690"), grid: { show: false }, ticks: { show: false },
+      space: 46, values: (u, values) => hourLabels(values, u.scales.x.min, u.scales.x.max) },
+    { scale: "x", side: 2, size: 15, gap: 0, font: "600 10px sans-serif", stroke: tone("--text-1", "#9aa4b8"), ticks: { show: false },
+      grid: { show: true, width: 1, dash: [2, 4], stroke: () => document.documentElement.dataset.theme === "light" ? "rgba(19,81,180,0.16)" : "rgba(255,255,255,0.11)" },
+      splits: (u, axis, min, max) => daySplits(min, max, u.bbox ? u.bbox.width / (window.devicePixelRatio || 1) : 600),
+      values: (u, values) => dayLabels(values, u.scales.x.min, u.scales.x.max) },
+  ];
 
-  return Object.freeze({ epochToMs, parseDate, textToMs, typedInstant, format, isDateField, isDateColumn, describe, toInput, fromInput, axisLabels, timeAxis });
+  return Object.freeze({ epochToMs, parseDate, textToMs, typedInstant, format, isDateField, isDateColumn, describe, toInput, fromInput, hourLabels, daySplits, dayLabels, timeAxes });
 })();

@@ -50,7 +50,7 @@ window.CaseEvidenceTimeline = (() => {
       else entries.push(first); index = end;
     }
     for (const manual of c.manual || []) if (manualTime(manual.start)) entries.push({ id: `m:${manual.id}`, type: "manual", start: manual.start, end: manualTime(manual.end) && manual.end > manual.start ? manual.end : manual.start,
-      title: manual.name || "Marco", detail: manual.description || "", source: "Marco do caso", color: manual.color || COLORS[3], rows: [], manual });
+      title: manual.name || "Marco", detail: manual.description || "", source: "Marco do caso", color: manual.color || COLORS[3], rows: [], manual, uncertain: window.CaseTimelineDates?.uncertainty?.(manual) ?? null });
     entries.sort((a, b) => (a.start ?? Infinity) - (b.start ?? Infinity) || (a.end ?? Infinity) - (b.end ?? Infinity));
     return { config, entries, undated: page.untimedCount + page.unavailableCount, aliases: page.aliases || [], incompletePreviews: events.filter(entry => !entry.previewComplete).length };
   }

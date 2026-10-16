@@ -106,7 +106,7 @@ window.CaseReport = (() => {
     tableHead();
     for(let i=0;i<timeline.rows.length;i++){
       check(signal);const row=timeline.rows[i];
-      const dateText=row.start==null?'Sem horário':stamp(row.start)+(row.end!=null&&row.end!==row.start?`\naté ${stamp(row.end)}`:'');
+      const dateText=row.start==null?'Sem horário':row.uncertain&&window.CaseTimelineDates?.uncertainText?window.CaseTimelineDates.uncertainText(row.uncertain,row.start,row.end??row.start,stamp):stamp(row.start)+(row.end!=null&&row.end!==row.start?`\naté ${stamp(row.end)}`:'');
       const body=[row.title,row.detail&&row.detail!==row.title?row.detail:'',row.source?`Origem: ${row.source}`:'',...(row.notes||[]).map(note=>`Nota: ${note.text}`)].filter(Boolean).join('\n');
       const refs=(nativeBindings&&row.itemRefs?row.itemRefs.map(reference=>{const entry=nativeBindings.resolve(reference);return entry.state==='unique'?byItem.get(entry.item)?.ref:'Associação indisponível';}):(row.itemIds||[]).map(id=>byId.get(id)?.ref)).filter(Boolean).join(', ');
       const parts=[wrap(dateText,31,7.7),wrap(body,99,8),wrap([refs,row.count?`${row.count} registros`:'Manual'].filter(Boolean).join('\n'),30,7.7)];

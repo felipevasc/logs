@@ -149,7 +149,7 @@ window.CaseEvidenceDisplay = (() => {
       const color = manual?.color || group?.color || config.edits?.[value.firstMemberEditKey]?.color || item?.timelineColor || COLORS[(value.itemIndex ?? 3) % COLORS.length];
       return { id: value.entryId, type: value.type, start: value.startMs, end: value.endMs, title: shown(value.title), detail: shown(value.detail), source: shown(value.source), color,
         editTitle: manual?.name ?? group?.name ?? config.edits?.[value.firstMemberEditKey]?.title ?? (value.title.complete ? value.title.text : ""),
-        rows: [], recordCount: value.memberCount, firstMemberEntryId: value.firstMemberEntryId, nativeEntry: value, manual };
+        rows: [], recordCount: value.memberCount, firstMemberEntryId: value.firstMemberEntryId, nativeEntry: value, manual, uncertain: window.CaseTimelineDates?.uncertainty?.(manual) ?? null };
     });
     const visible = new Set(entries.map(entry => entry.id)), annotations = config.annotations || [];
     const resolves = noteResolver(annotations, new Map([...visible].map(id => [id, true])));
@@ -235,7 +235,8 @@ window.CaseEvidenceDisplay = (() => {
         for (const entry of result.entries) { const row = el("tr"), main = el("td"), title = entry.memberCount ? button(shown(entry.title), () => expand(history, captured, entry)) : el("strong", "", shown(entry.title)); row.dataset.id = entry.entryId; title.className += " ct-table-title"; main.append(title);
           if (entry.detail.text) { const details = el("details"), summary = el("summary", "", "Detalhes"); details.append(summary, el("p", "", shown(entry.detail))); main.append(details); }
           const notes = el("td"); if (entry.noteIndices.length) notes.append(button(`${entry.noteIndices.length} notas`, () => showNotes(history.notes(captured, entry))));
-          row.append(el("td", "", `${entry.timing === "unavailable" ? "Horário indisponível" : moment(entry.startMs)}${entry.endMs !== entry.startMs ? ` até ${moment(entry.endMs)}` : ""}`), main, el("td", "", shown(entry.source)), el("td", "", entry.memberCount ? fmtNum(entry.memberCount) : "Marco manual"), notes); body.append(row); }
+          const uncertain = entry.type === "manual" ? window.CaseTimelineDates?.uncertainty?.(c.manual?.[entry.manualIndex]) : null;
+          row.append(el("td", "", uncertain && entry.startMs !== null ? window.CaseTimelineDates.uncertainText(uncertain, entry.startMs, entry.endMs, moment) : `${entry.timing === "unavailable" ? "Horário indisponível" : moment(entry.startMs)}${entry.endMs !== entry.startMs ? ` até ${moment(entry.endMs)}` : ""}`), main, el("td", "", shown(entry.source)), el("td", "", entry.memberCount ? fmtNum(entry.memberCount) : "Marco manual"), notes); body.append(row); }
         status.textContent = `${offsets[index] + (result.entries.length ? 1 : 0)}–${end} de ${fmtNum(result.matchingDisplayEntryCount)} entradas correspondentes · ${fmtNum(result.displayEntryCount)} entradas no recorte · ${fmtNum(result.scopeOccurrenceCount)} ocorrências preservadas no recorte`;
         previous.disabled = index === 0; next.disabled = !result.nextCursor;
       } catch (error) { if (guard() && request === serial) { body.replaceChildren(); status.textContent = `A busca completa está indisponível: ${String(error.message || error)}`; } }

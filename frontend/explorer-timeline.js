@@ -19,6 +19,71 @@ window.ExplorerTimeline = (() => {
   let preferences = { field: null, limit: 12, hidden: [] };
   let stats = null, base = "", grouped = null, pending = null, serial = 0, status = "idle", error = null, manualPause = false, plotted = "";
   let fieldOptionsKey = "";
+  // What the hover card describes: the plotted grid and series, refreshed on every paint.
+  let hover = null;
+  const tip = el("div", "explorer-timeline-tip"); tip.hidden = true; tip.setAttribute("role", "tooltip");
+  const pad = n => String(n).padStart(2, "0");
+  function moment(ms, seconds, withDate = true) {
+    const d = new Date(ms);
+    const time = `${pad(d.getHours())}:${pad(d.getMinutes())}${seconds ? `:${pad(d.getSeconds())}` : ""}`;
+    return withDate ? `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${time}` : time;
+  }
+  // "12/10/2026 14:00 – 15:00", or both dates when the interval crosses midnight.
+  function interval(start, bucketMs) {
+    const end = start + bucketMs, seconds = bucketMs < 60_000 || start % 60_000 !== 0;
+    const sameDay = new Date(start).toDateString() === new Date(end - 1).toDateString();
+    return `${moment(start, seconds)} – ${moment(end, seconds, !sameDay)}`;
+  }
+  function span(ms) {
+    const units = [[86_400_000, "dia", "dias"], [3_600_000, "hora", "horas"], [60_000, "minuto", "minutos"], [1000, "segundo", "segundos"]];
+    const [size, one, many] = units.find(([size]) => ms >= size && ms % size === 0) || units.find(([size]) => ms >= size) || [1, "ms", "ms"];
+    const n = ms / size, exact = Number.isInteger(n);
+    const value = exact ? fmtNum(n) : `≈ ${n.toLocaleString("pt-BR", { maximumFractionDigits: n < 10 ? 1 : 0 })}`;
+    return `${value} ${exact && n === 1 ? one : many}`;
+  }
+  const percent = (part, whole) => whole ? `${(part * 100 / whole).toLocaleString("pt-BR", { maximumFractionDigits: part * 100 / whole < 10 ? 1 : 0 })}%` : "—";
+  /** Contents of the hover card for bucket `index` (exposed for tests). */
+  function describe(index, data = hover) {
+    if (!data || index == null || index < 0 || index >= data.grid.bucketCount) return null;
+    const { grid, series } = data, start = grid.start + index * grid.bucketMs;
+    const total = series[0].buckets, count = total[index], all = sum(total), occupied = total.filter(Boolean).length;
+    const average = occupied ? all / occupied : 0, peak = Math.max(...total);
+    const compare = !count ? "Sem eventos neste intervalo"
+      : count === peak && occupied > 1 ? "Pico do período"
+      : average ? `${(count / average).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}× a média dos intervalos com eventos` : "";
+    const visible = series.slice(1).filter(item => !preferences.hidden.includes(item.id) && item.buckets[index] > 0)
+      .sort((a, b) => b.buckets[index] - a.buckets[index]);
+    return { title: interval(start, grid.bucketMs), start, end: start + grid.bucketMs, step: span(grid.bucketMs), count, share: percent(count, all), compare,
+      groups: visible.slice(0, 8).map(item => ({ label: item.label, count: item.buckets[index], share: percent(item.buckets[index], count), color: typeof item.color === "function" ? item.color() : item.color })),
+      more: Math.max(0, visible.length - 8) };
+  }
+  function showTip(u) {
+    const info = describe(u.cursor.idx);
+    if (!info || u.cursor.left == null || u.cursor.left < 0) { tip.hidden = true; return; }
+    tip.replaceChildren();
+    const total = el("div", "explorer-timeline-tip-total");
+    total.append(el("strong", "", `${fmtNum(info.count)} ${info.count === 1 ? "evento" : "eventos"}`), el("span", "", `${info.share} do período · intervalo de ${info.step}`));
+    tip.append(el("div", "explorer-timeline-tip-title", info.title), total);
+    if (info.compare) tip.append(el("div", "explorer-timeline-tip-note", info.compare));
+    for (const group of info.groups) {
+      const row = el("div", "explorer-timeline-tip-row"), swatch = el("span", "explorer-timeline-swatch");
+      swatch.style.background = group.color;
+      row.append(swatch, el("span", "explorer-timeline-tip-label", trunc(group.label, 48)), el("b", "", fmtNum(group.count)), el("small", "", group.share));
+      tip.append(row);
+    }
+    if (info.more) tip.append(el("div", "explorer-timeline-tip-note", `+ ${fmtNum(info.more)} grupos`));
+    if (info.count) tip.append(el("div", "explorer-timeline-tip-hint", "Clique para ver só este intervalo"));
+    tip.hidden = false;
+    const left = u.over.offsetLeft + u.cursor.left, width = tip.offsetWidth || 240, room = box.clientWidth;
+    tip.style.left = `${Math.max(0, left + 14 + width > room ? left - width - 14 : left + 14)}px`;
+    tip.style.top = `${Math.max(0, u.over.offsetTop + (u.cursor.top ?? 0) - 10)}px`;
+  }
+  function filterBucket(index) {
+    const info = describe(index);
+    if (!info?.count) return;
+    state.filters = state.filters.filter(filter => !(filter.column === "timestamp" && filter.op === "between"));
+    addFilter({ column: "timestamp", op: "between", value: String(info.start), value2: String(info.end - 1) });
+  }
   const copy = value => structuredClone(value);
   const sum = values => values.reduce((total, value) => total + value, 0);
   const safeCount = value => Number.isSafeInteger(value) && value >= 0;
@@ -119,6 +184,7 @@ window.ExplorerTimeline = (() => {
     panel.classList.toggle("analytics-placeholder", !grid.bucketCount);
     const plotKey = JSON.stringify([base, result?.field ?? null, preferences.field != null, series.map(item => item.id)]);
     const xs = Array.from({ length: grid.bucketCount }, (_, index) => (grid.start + index * grid.bucketMs) / 1000);
+    hover = { grid, series };
     if (!grid.bucketCount) {
       if (chart) { chart.destroy(); chart = null; } plotted = "";
       box.replaceChildren(el("div", "hint-empty", "Sem dados temporais."));
@@ -127,9 +193,9 @@ window.ExplorerTimeline = (() => {
       if (chart) chart.destroy(); box.replaceChildren();
       const plotOwner = base;
       chart = new uPlot({
-        width: Math.max(280, box.clientWidth - 4), height: 96, legend: { show: false },
+        width: Math.max(280, box.clientWidth - 4), height: 104, legend: { show: false },
         cursor: { drag: { x: true, y: false, setScale: false }, focus: { prox: 24 } }, scales: { x: { time: true } },
-        axes: [{ stroke: () => isLight() ? "#5b6678" : "#8d99ae", grid: { show: false }, ticks: { show: false }, size: 20, font: "10px sans-serif", ...window.DateValues.timeAxis() },
+        axes: [...window.DateValues.timeAxes(),
           { stroke: () => isLight() ? "#5b6678" : "#8d99ae", grid: { stroke: () => isLight() ? "rgba(19,81,180,0.08)" : "rgba(255,255,255,0.06)" }, ticks: { show: false }, size: 30 }],
         series: [{}, ...series.map(item => ({ label: item.label, stroke: item.color, width: item.total ? 2 : 1.4, points: { show: false }, show: !preferences.hidden.includes(item.id) }))],
         hooks: { setSelect: [plot => {
@@ -138,9 +204,18 @@ window.ExplorerTimeline = (() => {
           plot.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
           state.filters = state.filters.filter(filter => !(filter.column === "timestamp" && filter.op === "between"));
           addFilter({ column: "timestamp", op: "between", value: String(start), value2: String(end) });
-        }] },
+        }], setCursor: [showTip] },
       }, [xs, ...series.map(item => item.buckets)], box);
       plotted = plotKey;
+      if (box.style) box.style.position = "relative"; box.append(tip); tip.hidden = true;
+      const over = chart.over; let down = null;
+      over?.addEventListener?.("mouseleave", () => { tip.hidden = true; });
+      over?.addEventListener?.("mousedown", event => { down = [event.clientX, event.clientY]; });
+      // A click without dragging filters the bucket under the cursor; a drag still selects a period.
+      over?.addEventListener?.("click", event => {
+        const moved = down && Math.hypot(event.clientX - down[0], event.clientY - down[1]) > 4; down = null;
+        if (!moved && plotOwner === contextKey(grid)) filterBucket(chart.cursor.idx);
+      });
     }
     legend.replaceChildren();
     // Aggregate coverage stays visible before a long, scrollable list of keys.
@@ -171,7 +246,7 @@ window.ExplorerTimeline = (() => {
     if (preferences.field && status === "done") messages.push(`${result?.series.length || 0} grupos de maior volume no período${result?.other.count ? " + Outros valores" : ""}`);
     if (result?.untimed) messages.push(`${fmtNum(result.untimed)} sem horário`);
     if (result?.outsideGrid) messages.push(`${fmtNum(result.outsideGrid)} fora da grade`);
-    messages.push("Arraste no gráfico para selecionar um período");
+    messages.push("Passe o mouse para ver detalhes; clique num ponto ou arraste para filtrar o período");
     note.textContent = messages.join(" · ");
   }
   function cancel() { serial++; pending = null; window.Tasks?.cancelLatest("explore-timeline"); }
@@ -251,5 +326,5 @@ window.ExplorerTimeline = (() => {
     } };
   }
   document.addEventListener?.("analysis-fields-change", () => syncFieldControl());
-  return { render, summary, select, pause, resume, invalidate, restore, menuItem, capture: () => copy(preferences), gridFor, validate };
+  return { render, summary, select, pause, resume, invalidate, restore, menuItem, capture: () => copy(preferences), gridFor, validate, describe };
 })();

@@ -440,21 +440,36 @@ test('stale context menu actions never select a field or add filters', async () 
   assert.match(f.messages[0], /contexto mudou/);
 });
 
-test('time axes show the date once the period spans days', () => {
+test('time axes keep hours and dates in separate rows', () => {
   const context = vm.createContext({ window: {} });
   vm.runInContext(dateValues, context, { filename: 'date-values.js' });
-  const { axisLabels, timeAxis } = context.window.DateValues;
+  const { hourLabels, daySplits, dayLabels, timeAxes } = context.window.DateValues;
   const s = (...parts) => new Date(...parts).getTime() / 1000;
-  const labels = (ticks, incr, min = ticks[0], max = ticks.at(-1)) => [...axisLabels(ticks, incr, min, max)];
-  // One day: hours only.
-  assert.deepEqual(labels([s(2026, 5, 13, 6), s(2026, 5, 13, 12), s(2026, 5, 13, 18)], 6 * 3600), ['06:00', '12:00', '18:00']);
-  // Daily ticks over a week: dates, never a row of 00:00.
-  assert.deepEqual(labels([s(2026, 5, 13), s(2026, 5, 14), s(2026, 5, 15)], 86400), ['13/06', '14/06', '15/06']);
-  // Finer ticks across days: the date at midnight and on the first tick.
-  assert.deepEqual(labels([s(2026, 5, 13, 12), s(2026, 5, 13, 18), s(2026, 5, 14), s(2026, 5, 14, 6)], 6 * 3600), ['13/06 12:00', '18:00', '14/06', '06:00']);
-  // Across a new year the year is shown where it changes.
-  assert.deepEqual(labels([s(2025, 11, 30), s(2025, 11, 31), s(2026, 0, 1)], 86400), ['30/12/2025', '31/12', '01/01/2026']);
-  const axis = timeAxis(), u = { scales: { x: { min: s(2026, 5, 13), max: s(2026, 5, 20) } } };
-  assert.deepEqual([...axis.values(u, [s(2026, 5, 14)], 0, 72, 86400)], ['14/06']);
-  assert.ok(axis.space(u, 0, s(2026, 5, 13), s(2026, 5, 20)) > axis.space(u, 0, s(2026, 5, 13, 1), s(2026, 5, 13, 5)));
+  // One day: every hour on the hour row, its date once on the date row.
+  assert.deepEqual([...hourLabels([s(2026, 5, 13, 6), s(2026, 5, 13, 12)], s(2026, 5, 13, 1), s(2026, 5, 13, 20))], ['06:00', '12:00']);
+  assert.deepEqual([...daySplits(s(2026, 5, 13, 1), s(2026, 5, 13, 20))], [s(2026, 5, 13, 1)]);
+  // Several days: midnight leaves the hour row, the date row marks each day.
+  assert.deepEqual([...hourLabels([s(2026, 5, 13, 18), s(2026, 5, 14), s(2026, 5, 14, 6)], s(2026, 5, 13, 12), s(2026, 5, 15))], ['18:00', '', '06:00']);
+  assert.deepEqual([...daySplits(s(2026, 5, 12, 12), s(2026, 5, 15, 6), 2000)], [s(2026, 5, 13), s(2026, 5, 14), s(2026, 5, 15)]);
+  assert.deepEqual([...dayLabels([s(2026, 5, 13), s(2026, 5, 14)], s(2026, 5, 12), s(2026, 5, 15))], ['13/06', '14/06']);
+  // Narrow charts over long periods thin the dates instead of overlapping them.
+  assert.ok(daySplits(s(2026, 0, 1), s(2026, 11, 31), 600).length <= 12);
+  // Across a new year the year is written where it changes.
+  assert.deepEqual([...dayLabels([s(2025, 11, 31), s(2026, 0, 1)], s(2025, 11, 30), s(2026, 0, 2))], ['31/12/2025', '01/01/2026']);
+  const [hours, dates] = timeAxes();
+  assert.equal(hours.scale, 'x'); assert.equal(dates.scale, 'x'); assert.equal(dates.grid.show, true); assert.equal(hours.grid.show, false);
+});
+
+test('hovering a point describes its exact interval, volume and groups', async () => {
+  const f = await groupedFixture();
+  // Buckets of one second starting at 1000 ms: totals [3, 0, 3]; host-one holds the first.
+  const first = f.timeline.describe(0), empty = f.timeline.describe(1);
+  assert.equal(first.count, 3); assert.equal(first.share, '50%'); assert.equal(first.step, '1 segundo');
+  assert.equal(first.start, 1000); assert.equal(first.end, 2000);
+  assert.match(first.title, /^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2} – \d{2}:\d{2}:\d{2}$/);
+  assert.deepEqual(plain(first.groups.map(group => [group.label, group.count, group.share])), [['host-one', 3, '100%']]);
+  assert.equal(empty.count, 0); assert.equal(empty.compare, 'Sem eventos neste intervalo'); assert.deepEqual(plain(empty.groups), []);
+  assert.equal(f.timeline.describe(3), null); assert.equal(f.timeline.describe(null), null);
+  // Values outside the top groups appear as Outros valores.
+  assert.ok(f.timeline.describe(2).groups.some(group => group.label === 'Outros valores'));
 });

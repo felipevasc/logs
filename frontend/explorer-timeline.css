@@ -17,3 +17,14 @@
 .explorer-timeline-legend:empty,.explorer-timeline-note:empty{display:none}
 .hist-panel.explorer-timeline.analytics-placeholder{min-height:32px}
 @media(max-width:850px){.explorer-timeline-heading{flex-wrap:wrap}.explorer-timeline-field{max-width:40vw}.explorer-timeline-legend{max-height:48px}}
+.explorer-timeline .chart .explorer-timeline-tip{position:absolute;z-index:5;pointer-events:none;min-width:200px;max-width:320px;padding:9px 11px;border:1px solid var(--border-strong);border-radius:8px;background:var(--bg-1);box-shadow:var(--shadow);font-size:11px;line-height:1.45;color:var(--text-1)}
+.explorer-timeline-tip-title{font-weight:600;color:var(--text-0);font-variant-numeric:tabular-nums;margin-bottom:4px}
+.explorer-timeline-tip-total{display:flex;flex-direction:column;gap:1px;margin-bottom:4px}
+.explorer-timeline-tip-total strong{font-size:14px;font-weight:600;color:var(--text-0);font-variant-numeric:tabular-nums}
+.explorer-timeline-tip-total span,.explorer-timeline-tip-note{color:var(--text-2);font-size:10.5px}
+.explorer-timeline-tip-row{display:grid;grid-template-columns:10px minmax(0,1fr) auto auto;align-items:center;gap:6px;margin-top:3px}
+.explorer-timeline-tip-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.explorer-timeline-tip-row b{font-weight:600;color:var(--text-0);font-variant-numeric:tabular-nums}
+.explorer-timeline-tip-row small{color:var(--text-2);font-variant-numeric:tabular-nums;min-width:34px;text-align:right}
+.explorer-timeline-tip-hint{margin-top:6px;padding-top:5px;border-top:1px solid var(--border);color:var(--accent);font-size:10.5px}
+.explorer-timeline .chart .u-over{cursor:pointer}

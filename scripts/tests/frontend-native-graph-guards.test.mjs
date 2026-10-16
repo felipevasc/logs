@@ -30,3 +30,13 @@ test('curve gestures remain local until a current pointerup and a stale gesture 
  for(const stale of [false,true]){const f=helpers(),annotation={id:'note',curve:{matrix:{dx:2,dy:3}}};let current=true,saves=0;const board={getBoundingClientRect:()=>({left:0,top:0}),hasPointerCapture:()=>false};Object.assign(f.context,{board,curveDrag:{kind:'midpoint',link:{annotation},previous:{dx:2,dy:3},midX:1,midY:1,pointerId:7},horizontal:true,mayMutate:()=>current,redrawLinks(){},callbacksSave:()=>{saves++;},nearestSide:()=> 'left'});const a=source.indexOf('    board.onpointermove = event => {'),b=source.indexOf('\n    const noteNodes',a);vm.runInContext(source.slice(a,b),f.context);
  board.onpointermove({pointerId:7,clientX:30,clientY:40});assert.deepEqual(annotation.curve.matrix,{dx:2,dy:3});if(stale)current=false;board.onpointerup({pointerId:7});assert.deepEqual(plain(annotation.curve.matrix),stale?{dx:2,dy:3}:{dx:29,dy:39});assert.equal(saves,stale?0:1);}
 });
+
+test('milestones with an unknown date read as before, after or around their reference',()=>{
+ const f=helpers(),dates=f.context.window.CaseTimelineDates,format=value=>`T${value}`;
+ assert.equal(dates.uncertainText('before',10,10,format),'? Antes de T10');
+ assert.equal(dates.uncertainText('after',10,10,format),'? Depois de T10');
+ assert.equal(dates.uncertainText('around',10,20,format),'? Por volta do intervalo T10 – T20');
+ assert.equal(dates.uncertainText('before',10,20,format),'? Antes do intervalo T10 – T20');
+ assert.equal(dates.uncertainText(null,10,10,format),null);
+ assert.equal(dates.uncertainty({when:'after'}),'after');assert.equal(dates.uncertainty({when:'toString'}),null);assert.equal(dates.uncertainty(null),null);
+});
