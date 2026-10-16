@@ -4284,6 +4284,12 @@ function saveCases() {
   return batch.promise;
 }
 
+// Waits for the Case saves already scheduled or running (including the
+// debounced one), without starting new ones.
+async function caseSavesLanded() {
+  for (let i = 0; i < 8 && (caseSaveActive || caseSavePending); i++) await (caseSaveActive || caseSavePending).promise;
+}
+
 function caseSavesPending() {
   return !!(caseSaveActive || caseSavePending || (window.CaseEvidence?.active === true
     ? !nativeEvidenceServices().session.isClean() : failedCaseStores.has(state.cases)));

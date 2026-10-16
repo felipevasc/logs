@@ -49,7 +49,13 @@ window.CaseTimeline = (() => {
   }
   function nativeCallbacks(callbacks) {
     if (!callbacks.nativeCurrent) return callbacks;
-    const canMutate = () => { if (callbacks.nativeCurrent()) return true; callbacks.notify?.("A cronologia mudou. Reabra a visualização."); return false; };
+    const canMutate = () => {
+      if (callbacks.nativeCurrent()) return true;
+      // The Case was saved since this view was captured: show it again instead of a dead end.
+      if (callbacks.refresh) { callbacks.refresh(); callbacks.notify?.("A cronologia foi atualizada. Repita a ação."); }
+      else callbacks.notify?.("A cronologia mudou. Reabra a visualização.");
+      return false;
+    };
     return { ...callbacks, canMutate, menu: (x, y, choices) => callbacks.menu(x, y, choices.map(choice => typeof choice.onClick !== "function" ? choice :
       { ...choice, onClick: (...args) => canMutate() ? choice.onClick(...args) : false })) };
   }

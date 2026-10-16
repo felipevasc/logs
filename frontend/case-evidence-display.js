@@ -15,9 +15,20 @@ window.CaseEvidenceDisplay = (() => {
   const time = value => value === null || typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 8640000000000000;
   const rangeTime = value => value === null || time(value) && Number.isSafeInteger(value);
   const cursor = value => value === null || text(value, 4096) && !!value;
+  // A native save publishes a new store revision, which stales a captured view.
+  // While the view is still shown, capture it again after each save or reload.
+  function recaptureOnSave(guard, stale, refresh) {
+    if (typeof document.addEventListener !== "function") return;
+    const listener = event => {
+      if (!guard()) { document.removeEventListener("case-evidence-state", listener); return; }
+      if (!["saved", "loaded"].includes(event.detail?.kind) || !stale()) return;
+      document.removeEventListener("case-evidence-state", listener); refresh();
+    };
+    document.addEventListener("case-evidence-state", listener);
+  }
   // Opening the view or editing it saves the Case after a short delay. Capture
   // only after that save lands, or its new revision would stale the view at once.
-  const settled = async session => { if (typeof flushCaseSaves === "function") await flushCaseSaves(); await session.pending(); };
+  const settled = async session => { if (typeof caseSavesLanded === "function") await caseSavesLanded(); await session.pending(); };
   function create({ client, getStore, currentCase, invoke }) {
     function capture({ item = currentCase(), filters = [], stationId = null, fromMs = null, toMs = null, includeUntimed = true, displayQuery = "", isCurrent = () => true } = {}) {
       const store = getStore(), live = currentCase(), summary = store?.caseEvidence?.find(entry => entry.state === "ready" && entry.owner.caseId === item?.id);
@@ -194,12 +205,13 @@ window.CaseEvidenceDisplay = (() => {
         box.replaceChildren(tools, body);
         window.CaseTimeline.render(body, c, mode, { ...callbacks, collected, visibleAnnotations: collected.visibleAnnotations, targetVisible: collected.targetVisible,
           pageLabel: `Entradas ${offsets[index] + (result.entries.length ? 1 : 0)}–${end} de ${fmtNum(result.matchingDisplayEntryCount)}; grupos com intervalos e contagens completos; ${collected.omittedRelationships} vínculos sem posição nesta página`,
-          nativeCurrent: () => history.current(ticket), members: entry => actionMembers(history, ticket, entry, c),
+          nativeCurrent: () => history.current(ticket), refresh: () => renderGraph(box, c, mode, callbacks), members: entry => actionMembers(history, ticket, entry, c),
           openEntry: entry => history.current(ticket) && expand(history, ticket, entry.nativeEntry), openEntries: (entries, x, y) => history.current(ticket) && callbacks.menu(x, y, entries.map(entry => ({ icon: "fa-eye", label: `${entry.title} · ${entry.recordCount} registros`, onClick: () => history.current(ticket) && expand(history, ticket, entry.nativeEntry) }))), installNoteEditor: edit => { editNote = edit; } });
         async function navigate(target) { previous.disabled = next.disabled = true; body.inert = true;
           try { await paint(target); } catch (error) { if (guard()) { callbacks.notify?.(String(error.message || error)); previous.disabled = !index; next.disabled = !result.nextCursor; body.inert = false; } } }
       }
       await paint(0);
+      recaptureOnSave(guard, () => !history.current(ticket), () => renderGraph(box, c, mode, callbacks));
     } catch (error) { if (guard()) { box.textContent = `A cronologia preservada está indisponível: ${String(error.message || error)}`; box.append(button("Tentar novamente", () => renderGraph(box, c, mode, callbacks))); } }
   }
   async function render(box, c) {
@@ -230,6 +242,8 @@ window.CaseEvidenceDisplay = (() => {
     }
     search.oninput = () => { body.inert = true; status.textContent = "Buscando na cronologia completa…"; window.Tasks?.cancelLatest("preserved-display:case_evidence_display_timeline"); queries.set(c, search.value); ++serial; ++queryGeneration; clearTimeout(debounce); ticket = null; cursors.splice(0, cursors.length, null); offsets.splice(0, offsets.length, 0); pageIndex = 0; debounce = setTimeout(() => paint(0), 180); };
     await paint(0);
+    const recapture = () => { ticket = null; cursors.splice(0, cursors.length, null); offsets.splice(0, offsets.length, 0); pageIndex = 0; void paint(0); recaptureOnSave(guard, () => !!ticket && !history.current(ticket), recapture); };
+    recaptureOnSave(guard, () => !!ticket && !history.current(ticket), recapture);
   }
   return { create, render, renderGraph, collectGraph, actionMembers, expand };
 })();

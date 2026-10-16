@@ -119,8 +119,25 @@ test('malformed authored graph configuration remains preserved with an explicit 
 test('a delayed Case save lands before the historical view is captured, so it does not go stale at once',async()=>{
  const f=uiFixture(),order=[];
  // Opening the view schedules a debounced save that bumps the store revision when it lands.
- f.context.flushCaseSaves=async()=>{order.push('flush');f.store.store.revision='2';return true;};
+ f.context.caseSavesLanded=async()=>{order.push('flush');f.store.store.revision='2';};
  f.reply((command,args)=>{order.push(command);assert.equal(args.request.store.revision,'2');return{...page(),entries:[{...entry(),entryId:'m:m',type:'manual',title:preview('after save'),memberCount:0,memberToken:null,firstMemberEntryId:null,firstMemberEditKey:null,itemIndex:null,groupIndex:null,manualIndex:0}],matchingDisplayEntryCount:1};});
  await f.render();f.search().value='after save';f.search().oninput();await f.flush();
  assert.equal(order[0],'flush');assert.ok(order.includes('case_evidence_display_timeline'));assert.match(f.host.textContent,/after save/);
+});
+
+test('a graphical view captured before a native save is captured again instead of staying stale',async()=>{
+ const f=uiFixture(),rendered=[],listeners=new Map(),notes=[];
+ f.context.document.addEventListener=(name,fn)=>{(listeners.get(name)||listeners.set(name,new Set()).get(name)).add(fn);};
+ f.context.document.removeEventListener=(name,fn)=>listeners.get(name)?.delete(fn);
+ const emit=detail=>{for(const fn of [...(listeners.get('case-evidence-state')||[])])fn({detail});};
+ f.context.window.CaseTimeline={render:(host,item,mode,callbacks)=>rendered.push(callbacks)};
+ await f.context.window.CaseEvidenceDisplay.renderGraph(f.host,f.c,'horizontal',{menu(){},notify:message=>notes.push(message)});
+ assert.equal(rendered.length,1);assert.equal(rendered[0].nativeCurrent(),true);
+ // A background save lands: the store revision moves and the first capture is stale.
+ f.store.store.revision='2';assert.equal(rendered[0].nativeCurrent(),false);
+ emit({kind:'saved'});await f.flush();for(let i=0;i<20;i++)await Promise.resolve();
+ assert.equal(rendered.length,2);assert.equal(rendered[1].nativeCurrent(),true);
+ // Unrelated state events leave a current view alone.
+ emit({kind:'saved'});for(let i=0;i<20;i++)await Promise.resolve();assert.equal(rendered.length,2);
+ assert.deepEqual(notes,[]);assert.equal(typeof rendered[1].refresh,'function');
 });

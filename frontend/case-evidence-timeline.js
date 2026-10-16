@@ -61,7 +61,7 @@ window.CaseEvidenceTimeline = (() => {
   async function open(c, { filters = [], stationId = null, guard = () => true } = {}) {
     const services = nativeEvidenceServices();
     // A delayed Case save landing after the capture would stale it at once.
-    if (typeof flushCaseSaves === "function") await flushCaseSaves();
+    if (typeof caseSavesLanded === "function") await caseSavesLanded();
     await services.session.pending();
     if (services.session.status() !== "ready" || activeCase()?.id !== c.id || window.CaseEvidence.analysisShape(activeCase()) !== window.CaseEvidence.analysisShape(c) || !guard()) throw Error("Confirme o salvamento pendente antes de abrir a cronologia preservada.");
     const authoredViewJson = JSON.stringify({ timeline: c.timeline || {}, manual: c.manual || [] }), previousGuard = guard;
