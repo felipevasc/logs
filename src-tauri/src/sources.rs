@@ -19,7 +19,7 @@ mod xml_log;
 /// so all of them moved to a new revision; captured snapshots are evidence
 /// and never reparsed.
 pub(crate) fn parser_semantics_signature(format: &str) -> Option<&'static str> {
-    (format != "snapshot").then_some("universal-v4")
+    (format != "snapshot").then_some("universal-v5")
 }
 
 /// Any text parser may complete year-less or time-only values from the

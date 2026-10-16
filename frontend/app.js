@@ -6079,7 +6079,7 @@ function renderChart(stats) {
       cursor: { drag: { x: true, y: false, setScale: false }, focus: { prox: 24 } },
       scales: { x: { time: true } },
       axes: [
-        { stroke: axisColor, grid: { show: false }, ticks: { show: false }, size: 20, font: "10px " + "sans-serif", values: (u, vals) => vals.map(v => new Date(v * 1000).toLocaleTimeString("pt-BR", {hour:"2-digit",minute:"2-digit"})) },
+        { stroke: axisColor, grid: { show: false }, ticks: { show: false }, size: 20, font: "10px " + "sans-serif", ...window.DateValues.timeAxis() },
         { stroke: axisColor, grid: { stroke: gridColor }, ticks: { show: false }, size: 30 },
       ],
       series: [
@@ -8596,7 +8596,7 @@ function renderLineChart(box, res, id) {
       scales: { x: { time: true } },
       axes: [
         { stroke: axisColor, grid: { show: false }, ticks: { show: false }, size: 22,
-          values: (u, vals) => vals.map(v => new Date(v * 1000).toLocaleString("pt-BR", Number(res.x.at(-1)) - Number(res.x[0]) < 86400000 ? {hour:"2-digit",minute:"2-digit"} : {day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})) },
+          ...window.DateValues.timeAxis() },
         {
           stroke: axisColor, grid: { stroke: () => isLight() ? "rgba(19,81,180,0.08)" : "rgba(255,255,255,0.06)" },
           ticks: { show: false }, size: 44,

@@ -123,10 +123,15 @@ fn syslog_with_any_timestamp_layout() {
     assert_eq!(field(&events[1], "COMMAND"), "/usr/bin/id");
     assert_eq!(field(&events[2], "SRC"), "203.0.113.9");
 
-    // Year-less lines take the year of the file's own date (its name here).
+    // Year-less lines take the current year, whatever date the file name carries
+    // (a name may hold the first, the last or any day of the log).
+    let current = chrono::Local::now().format("%Y").to_string();
+    let year = |e: &Event| chrono::DateTime::<chrono::Local>::from(chrono::DateTime::from_timestamp_millis(e.timestamp.unwrap()).unwrap()).format("%Y").to_string();
     let (_, events) = load("secure-20261012", "Dec 30 23:59:59 host sshd[1]: old\nOct 12 08:00:00 host sshd[1]: new\n");
-    let year = |e: &Event| chrono::DateTime::from_timestamp_millis(e.timestamp.unwrap()).unwrap().format("%Y").to_string();
-    assert_eq!((year(&events[0]), year(&events[1])), ("2025".to_string(), "2026".to_string()));
+    assert_eq!((year(&events[0]), year(&events[1])), (current.clone(), current.clone()));
+    let (_, events) = load("rsyslog-gerado-indevidamente-20260616.log", "Jun 16 06:30:01 rj-jb5 CROND[1]: (jboss) CMD (x)\nJun 20 06:30:01 rj-jb5 CROND[2]: (jboss) CMD (x)\n");
+    assert!(events.iter().all(|e| year(e) == current), "{:?}", events.iter().map(|e| e.timestamp).collect::<Vec<_>>());
+    assert!(events[0].timestamp < events[1].timestamp);
 
     let (format, events) = load(
         "cef.log",

@@ -62,7 +62,7 @@ Cada critério pode ser invertido (**NÃO**), e os critérios se combinam com **
   - *Datas numéricas*: a ordem dia/mês é aprendida com o início do arquivo, ou pode ser fixada.
   - *Horários sem fuso*: no fuso deste computador ou em UTC. Os campos “a partir de” e
     “antes de” são lidos no mesmo fuso. Datas com fuso explícito são sempre exatas.
-  - *Datas sem ano* usam o ano do nome do arquivo ou da última modificação, como na leitura.
+  - *Datas sem ano* (syslog) ficam no ano atual, como na leitura dos logs.
   - *Item sem data*: usa a data do item anterior (padrão — continuações sem data ficam no
     mesmo período), não entra ou entra.
 - **Posição** — do número N ao número M (inclusive), contando **itens** (registros, com o stack

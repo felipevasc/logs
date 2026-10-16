@@ -25,10 +25,12 @@ logfmt e colunas:
   local da máquina — exceto em logs W3C do IIS e do CloudFront (campos `cs-`, `sc-`, `s-`), gravados
   em UTC por definição; o log do Firewall do Windows continua em horário local.
 
-Datas sem ano (syslog, klog, Android) usam o ano da data de referência do arquivo — a data no nome
-(`access_log.2026-10-12`, `messages-20261012`, `u_ex261012.log`) ou, sem ela, o dia da última
-modificação; uma data posterior à referência é do ano anterior. Linhas só com hora (WildFly
-`server.log.2026-06-24`) recebem essa data e o campo `data_inferida`. Datas numéricas ambíguas
+Datas sem ano (syslog, klog, Android) ficam no ano atual. A data no nome do arquivo e a da última
+modificação não mudam o ano: um nome pode trazer qualquer dia do log e cópias alteram a
+modificação. Para um log de outro ano, defina-o na configuração de data/hora da fonte (Arquivos →
+Formato e data/hora). Linhas só com hora (WildFly `server.log.2026-06-24`) recebem a data de
+referência do arquivo — a data no nome (`access_log.2026-10-12`, `messages-20261012`,
+`u_ex261012.log`) ou, sem ela, o dia da última modificação — e o campo `data_inferida`. Datas numéricas ambíguas
 (`01/02/2026`) seguem a ordem que o próprio arquivo mostra (`25/02` ou `02/25` em outra linha); sem
 evidência, dia primeiro, exceto com AM/PM. A configuração de data/hora da fonte continua tendo
 prioridade.

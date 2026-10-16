@@ -129,7 +129,7 @@ window.ExplorerTimeline = (() => {
       chart = new uPlot({
         width: Math.max(280, box.clientWidth - 4), height: 96, legend: { show: false },
         cursor: { drag: { x: true, y: false, setScale: false }, focus: { prox: 24 } }, scales: { x: { time: true } },
-        axes: [{ stroke: () => isLight() ? "#5b6678" : "#8d99ae", grid: { show: false }, ticks: { show: false }, size: 20, font: "10px sans-serif", values: (u, values) => values.map(value => new Date(value * 1000).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })) },
+        axes: [{ stroke: () => isLight() ? "#5b6678" : "#8d99ae", grid: { show: false }, ticks: { show: false }, size: 20, font: "10px sans-serif", ...window.DateValues.timeAxis() },
           { stroke: () => isLight() ? "#5b6678" : "#8d99ae", grid: { stroke: () => isLight() ? "rgba(19,81,180,0.08)" : "rgba(255,255,255,0.06)" }, ticks: { show: false }, size: 30 }],
         series: [{}, ...series.map(item => ({ label: item.label, stroke: item.color, width: item.total ? 2 : 1.4, points: { show: false }, show: !preferences.hidden.includes(item.id) }))],
         hooks: { setSelect: [plot => {

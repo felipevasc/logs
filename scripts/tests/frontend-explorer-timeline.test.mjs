@@ -4,6 +4,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = readFileSync(new URL('../../frontend/explorer-timeline.js', import.meta.url), 'utf8');
+const dateValues = readFileSync(new URL('../../frontend/date-values.js', import.meta.url), 'utf8');
 const plain = value => JSON.parse(JSON.stringify(value));
 const settle = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
 const sparseStats = () => ({ buckets: [[1000, 3], [3000, 3]], bucketMs: 1000 });
@@ -64,6 +65,7 @@ function fixture({ scope = 'dataset', filters = [] } = {}) {
       destroy() { this.destroyed = true; }
     },
   });
+  vm.runInContext(dateValues, context, { filename: 'date-values.js' });
   vm.runInContext(source, context, { filename: 'explorer-timeline.js' });
   const timeline = context.window.ExplorerTimeline;
   const find = className => {
@@ -436,4 +438,23 @@ test('stale context menu actions never select a field or add filters', async () 
   assert.equal(f.requests.length, 0);
   assert.equal(f.state.filters.length, 0);
   assert.match(f.messages[0], /contexto mudou/);
+});
+
+test('time axes show the date once the period spans days', () => {
+  const context = vm.createContext({ window: {} });
+  vm.runInContext(dateValues, context, { filename: 'date-values.js' });
+  const { axisLabels, timeAxis } = context.window.DateValues;
+  const s = (...parts) => new Date(...parts).getTime() / 1000;
+  const labels = (ticks, incr, min = ticks[0], max = ticks.at(-1)) => [...axisLabels(ticks, incr, min, max)];
+  // One day: hours only.
+  assert.deepEqual(labels([s(2026, 5, 13, 6), s(2026, 5, 13, 12), s(2026, 5, 13, 18)], 6 * 3600), ['06:00', '12:00', '18:00']);
+  // Daily ticks over a week: dates, never a row of 00:00.
+  assert.deepEqual(labels([s(2026, 5, 13), s(2026, 5, 14), s(2026, 5, 15)], 86400), ['13/06', '14/06', '15/06']);
+  // Finer ticks across days: the date at midnight and on the first tick.
+  assert.deepEqual(labels([s(2026, 5, 13, 12), s(2026, 5, 13, 18), s(2026, 5, 14), s(2026, 5, 14, 6)], 6 * 3600), ['13/06 12:00', '18:00', '14/06', '06:00']);
+  // Across a new year the year is shown where it changes.
+  assert.deepEqual(labels([s(2025, 11, 30), s(2025, 11, 31), s(2026, 0, 1)], 86400), ['30/12/2025', '31/12', '01/01/2026']);
+  const axis = timeAxis(), u = { scales: { x: { min: s(2026, 5, 13), max: s(2026, 5, 20) } } };
+  assert.deepEqual([...axis.values(u, [s(2026, 5, 14)], 0, 72, 86400)], ['14/06']);
+  assert.ok(axis.space(u, 0, s(2026, 5, 13), s(2026, 5, 20)) > axis.space(u, 0, s(2026, 5, 13, 1), s(2026, 5, 13, 5)));
 });

@@ -100,5 +100,30 @@ window.DateValues = (() => {
     return ms == null ? text : String(ms);
   }
 
-  return Object.freeze({ epochToMs, parseDate, textToMs, typedInstant, format, isDateField, isDateColumn, describe, toInput, fromInput });
+  // Time-axis labels (epoch seconds): hours inside a single day; once the
+  // visible period spans days, midnight ticks show the date and the first tick
+  // its date and hour; the year appears when the period crosses one.
+  function axisLabels(values, incr, min, max) {
+    const first = new Date(min * 1000), last = new Date(max * 1000);
+    const oneDay = first.toDateString() === last.toDateString();
+    const oneYear = first.getFullYear() === last.getFullYear();
+    const hour = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    let previousYear = null;
+    return values.map((value, index) => {
+      const d = new Date(value * 1000);
+      if (oneDay) return hour(d);
+      const showYear = !oneYear && d.getFullYear() !== previousYear;
+      previousYear = d.getFullYear();
+      const date = `${pad(d.getDate())}/${pad(d.getMonth() + 1)}${showYear ? `/${d.getFullYear()}` : ""}`;
+      if (incr >= 86400 || (d.getHours() === 0 && d.getMinutes() === 0)) return date;
+      return index === 0 ? `${date} ${hour(d)}` : hour(d);
+    });
+  }
+  // uPlot x axis with those labels and room for them.
+  const timeAxis = () => ({
+    values: (u, values, axis, space, incr) => axisLabels(values, incr, u.scales.x.min, u.scales.x.max),
+    space: (u, axis, min, max) => new Date(min * 1000).toDateString() === new Date(max * 1000).toDateString() ? 50 : 72,
+  });
+
+  return Object.freeze({ epochToMs, parseDate, textToMs, typedInstant, format, isDateField, isDateColumn, describe, toInput, fromInput, axisLabels, timeAxis });
 })();

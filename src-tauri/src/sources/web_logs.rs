@@ -783,7 +783,7 @@ mod tests {
         assert_eq!(event.raw, java);
         assert_eq!(event.message, "key=one other=two");
         for format in ["text", "log4j", "csv", "custom", "apache", "mixed"] {
-            assert_eq!(parser_semantics_signature(format), Some("universal-v4"), "{format}");
+            assert_eq!(parser_semantics_signature(format), Some("universal-v5"), "{format}");
         }
         assert_eq!(parser_semantics_signature("snapshot"), None);
     }

@@ -59,7 +59,7 @@ source precision in fields, and is indexed in milliseconds. Query expansion
 reads complete URIs/request targets, never the rest of an access line, and is
 idempotent across normalization passes.
 
-Parser revision `universal-v4` (every format but snapshots) and global query
+Parser revision `universal-v5` (every format but snapshots) and global query
 generation `indexes-v7` refresh old raw-artifact metadata, columnar and
 timestamp caches on reopen without changing source/event identity. Saved Case evidence and explicit Event
 snapshots stay captured evidence and are not silently reparsed.

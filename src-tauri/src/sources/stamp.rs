@@ -27,12 +27,12 @@ const SCAN_LIMIT: usize = 400;
 const DATE_ONLY_LIMIT: usize = 64;
 
 /// What completes partial values: the year for year-less dates and the date for
-/// time-only values. Fixed per source so results never depend on the clock.
+/// time-only values. Fixed per source load (the year is part of its cache identity).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Context {
     pub year: i32,
-    /// Date the source refers to (from its name or modification time). A
-    /// year-less date later than it belongs to the previous year.
+    /// Date the source refers to (from its name or modification time): the
+    /// date of time-only values.
     pub reference: Option<NaiveDate>,
     /// Order of ambiguous numeric dates seen in the source (true = day first).
     pub day_first: Option<bool>,
@@ -905,18 +905,12 @@ fn offset_seconds(zone: Zone, local: NaiveDateTime) -> Option<i32> {
     }
 }
 
+/// Year-less dates (syslog, klog, logcat) take the year the source is read in.
+/// File names and modification days do not move them: a name may carry any
+/// day of the log and copies change the modification. Another year is set in
+/// the source's date/time configuration.
 fn infer_year(month: u32, day: u32, ctx: &Context) -> Option<NaiveDate> {
-    match ctx.reference {
-        Some(reference) => {
-            let year = reference.year();
-            let candidate = NaiveDate::from_ymd_opt(year, month, day);
-            match candidate {
-                Some(date) if date <= reference + chrono::Duration::days(1) => Some(date),
-                _ => NaiveDate::from_ymd_opt(year - 1, month, day),
-            }
-        }
-        None => NaiveDate::from_ymd_opt(ctx.year, month, day),
-    }
+    NaiveDate::from_ymd_opt(ctx.year, month, day)
 }
 
 fn complete(raw: Raw, epoch_ms: Option<i64>, start: usize, ctx: &Context) -> Option<Found> {
@@ -1142,18 +1136,18 @@ mod tests {
     }
 
     #[test]
-    fn year_less_values_use_the_reference_date() {
+    fn year_less_values_use_the_year_they_are_read_in() {
         let c = ctx();
         let f = find("Oct 12 00:00:00 host sshd[1]: ok", &c).unwrap();
         assert_eq!((f.ms, f.inferred), (local(2026, 10, 12, 0, 0, 0, 0), Inferred::Year));
-        // Later than the reference: written the year before.
-        assert_eq!(find("Dec 30 23:59:59 host x", &c).unwrap().ms, local(2025, 12, 30, 23, 59, 59, 0));
+        // Even later than the file's own date: the reference never moves the year.
+        assert_eq!(find("Dec 30 23:59:59 host x", &c).unwrap().ms, local(2026, 12, 30, 23, 59, 59, 0));
         assert_eq!(find("Oct  2 01:02:03 host x", &c).unwrap().ms, local(2026, 10, 2, 1, 2, 3, 0));
         assert_eq!(find("*Oct 12 00:00:00.123: %LINK-3-UPDOWN", &c).unwrap().ms, local(2026, 10, 12, 0, 0, 0, 123));
         // Snort and Android: month first, no year.
         assert_eq!(find("10/12-00:00:00.123456  [**] [1:1:1]", &c).unwrap().ms, local(2026, 10, 12, 0, 0, 0, 123));
         assert_eq!(find("10-12 00:00:00.123  1234  5678 I Tag: x", &c).unwrap().ms, local(2026, 10, 12, 0, 0, 0, 123));
-        // Without a reference, the source's year.
+        // The year of the context, with or without a reference.
         assert_eq!(find("Sep 30 12:30:00 host app: hello", &Context::year(2032)).unwrap().ms, local(2032, 9, 30, 12, 30, 0, 0));
     }
 

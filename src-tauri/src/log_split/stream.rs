@@ -58,14 +58,15 @@ pub(crate) fn sample(file: &mut File, len: u64) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// Year and date that complete partial dates: a date in the file name, else
-/// the day it was last written. Numeric date order learned from the sample.
+/// What completes partial dates, as when reading logs: the current year for
+/// year-less dates; for time-only values, a date in the file name, else the
+/// day it was last written. Numeric date order learned from the sample.
 pub(crate) fn calendar(path: &Path, file: &File, text: &str) -> stamp::Context {
     let reference = stamp::date_in_name(&path.to_string_lossy()).or_else(|| {
         let modified = file.metadata().ok()?.modified().ok()?;
         Some(chrono::DateTime::<chrono::Local>::from(modified).date_naive())
     });
-    let year = reference.map(|d| chrono::Datelike::year(&d)).unwrap_or_else(|| chrono::Datelike::year(&chrono::Local::now()));
+    let year = chrono::Datelike::year(&chrono::Local::now());
     stamp::Context { year, reference, day_first: stamp::learn_day_first(text.lines().take(2_000)) }
 }
 
