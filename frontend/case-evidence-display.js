@@ -15,6 +15,9 @@ window.CaseEvidenceDisplay = (() => {
   const time = value => value === null || typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 8640000000000000;
   const rangeTime = value => value === null || time(value) && Number.isSafeInteger(value);
   const cursor = value => value === null || text(value, 4096) && !!value;
+  // Opening the view or editing it saves the Case after a short delay. Capture
+  // only after that save lands, or its new revision would stale the view at once.
+  const settled = async session => { if (typeof flushCaseSaves === "function") await flushCaseSaves(); await session.pending(); };
   function create({ client, getStore, currentCase, invoke }) {
     function capture({ item = currentCase(), filters = [], stationId = null, fromMs = null, toMs = null, includeUntimed = true, displayQuery = "", isCurrent = () => true } = {}) {
       const store = getStore(), live = currentCase(), summary = store?.caseEvidence?.find(entry => entry.state === "ready" && entry.owner.caseId === item?.id);
@@ -170,7 +173,7 @@ window.CaseEvidenceDisplay = (() => {
       const config = c.timeline ||= {};
       if (typeof config !== "object" || Array.isArray(config) || ["groups", "annotations"].some(name => config[name] != null && !Array.isArray(config[name])) || ["edits", "layout"].some(name => config[name] != null && (typeof config[name] !== "object" || Array.isArray(config[name])))) throw Error("A configuração histórica está indisponível e permanece preservada.");
       config.groups ||= []; config.annotations ||= []; config.edits ||= {}; config.layout ||= {};
-      const services = nativeEvidenceServices(); await services.session.pending(); if (!guard()) return;
+      const services = nativeEvidenceServices(); await settled(services.session); if (!guard()) return;
       if (services.session.status() !== "ready") throw Error("Confirme o salvamento pendente antes de consultar a cronologia.");
       const history = reader(), ticket = history.capture({ item: c, stationId, filters, includeUntimed: false, displayQuery: "", isCurrent: guard });
       const cursors = [null], offsets = [0]; let serial = 0;
@@ -211,7 +214,7 @@ window.CaseEvidenceDisplay = (() => {
     async function paint(index) {
       const request = ++serial; previous.disabled = next.disabled = true; body.inert = true; status.textContent = "Buscando na cronologia completa…";
       try {
-        await nativeEvidenceServices().session.pending(); if (!guard() || request !== serial) return;
+        await settled(nativeEvidenceServices().session); if (!guard() || request !== serial) return;
         if (nativeEvidenceServices().session.status() !== "ready") throw Error("Confirme o salvamento pendente antes de consultar a cronologia.");
         if (!ticket) { const query = search.value, queryVersion = queryGeneration; ticket = history.capture({ item: c, stationId, filters, displayQuery: query, includeUntimed: true, isCurrent: () => guard() && search.value === query && queryGeneration === queryVersion }); }
         const captured = ticket, result = await history.page(captured, { cursor: cursors[index] }); if (!guard() || request !== serial || ticket !== captured) return;

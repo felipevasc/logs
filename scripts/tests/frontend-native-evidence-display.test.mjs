@@ -115,3 +115,12 @@ test('graph note layout stays bounded while all authored notes remain accessible
 test('malformed authored graph configuration remains preserved with an explicit unavailable state',async()=>{
  const f=uiFixture();f.c.timeline='opaque configuration';await f.context.window.CaseEvidenceDisplay.renderGraph(f.host,f.c,'horizontal',{notify:assert.fail});assert.equal(f.c.timeline,'opaque configuration');assert.match(f.host.textContent,/configuração histórica está indisponível/);assert.equal(f.calls.length,0);
 });
+
+test('a delayed Case save lands before the historical view is captured, so it does not go stale at once',async()=>{
+ const f=uiFixture(),order=[];
+ // Opening the view schedules a debounced save that bumps the store revision when it lands.
+ f.context.flushCaseSaves=async()=>{order.push('flush');f.store.store.revision='2';return true;};
+ f.reply((command,args)=>{order.push(command);assert.equal(args.request.store.revision,'2');return{...page(),entries:[{...entry(),entryId:'m:m',type:'manual',title:preview('after save'),memberCount:0,memberToken:null,firstMemberEntryId:null,firstMemberEditKey:null,itemIndex:null,groupIndex:null,manualIndex:0}],matchingDisplayEntryCount:1};});
+ await f.render();f.search().value='after save';f.search().oninput();await f.flush();
+ assert.equal(order[0],'flush');assert.ok(order.includes('case_evidence_display_timeline'));assert.match(f.host.textContent,/after save/);
+});
