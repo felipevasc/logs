@@ -130,17 +130,20 @@ fn synchronize(full: &Results, request: &Request) -> Result<Value, String> {
         }
     };
     if request.action == "download" {
-        let response = auth(client.get(format!(
-            "{endpoint}/contents/models/shared-model.json?ref={}",
-            settings.github_branch
-        )))
+        let response = auth(
+            client
+                .get(format!(
+                    "{endpoint}/contents/models/shared-model.json?ref={}",
+                    settings.github_branch
+                ))
+                .header("Accept", "application/vnd.github.raw+json"),
+        )
         .send()
         .map_err(|_| {
             "Não foi possível consultar a base no GitHub; o aprendizado local permanece disponível"
         })?;
         let content = bounded_json(response)?;
-        let bytes = github_content(&content)?;
-        let model: SharedModel = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let model: SharedModel = serde_json::from_value(content).map_err(|e| e.to_string())?;
         return store_shared(&model);
     }
     token.ok_or("Publicar exige token temporário com escrita no repositório configurado")?;

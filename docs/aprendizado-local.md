@@ -142,6 +142,11 @@ automático opera na branch `learning-models`; um destino com outra branch preci
 configurar seu workflow correspondente. Uma falha de rede não interrompe a
 análise local. Publicação parcial pode ser repetida: IDs existentes são ignorados.
 
+Domínios conhecidos incluem web, autenticação, redes, sistema operacional e
+cloud/SaaS. Formatos não identificados usam uma referência estrutural genérica;
+seus candidatos continuam indicando baixa cobertura local. Códigos numéricos
+de eventos de outros formatos não são interpretados como status HTTP.
+
 ## Orçamentos e validação
 
 Os padrões são limitados a 48 tokens de tamanho limitado. Os padrões padrão

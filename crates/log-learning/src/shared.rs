@@ -14,7 +14,7 @@ impl ContributionBundle {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != SCHEMA
             || self.contributions.is_empty()
-            || self.contributions.len() > 7
+            || self.contributions.len() > 8
         {
             return Err("Pacote de contribuições inválido".into());
         }
@@ -38,16 +38,20 @@ pub enum Domain {
     Network,
     Database,
     OperatingSystem,
+    Cloud,
     Other,
 }
 impl Domain {
     pub fn from_product(product: &str) -> Self {
         match product {
-            "nginx" | "apache" | "iis" | "http" => Self::Web,
-            "okta" | "entra" | "authentication" => Self::Authentication,
+            "web" | "nginx" | "apache" | "iis" | "http" => Self::Web,
+            "sshd" | "okta" | "entra" | "authentication" => Self::Authentication,
             "zeek" | "suricata" | "firewall" | "dns" => Self::Network,
             "postgresql" | "mysql" | "mssql" | "oracle" => Self::Database,
-            "windows" | "sysmon" | "auditd" | "syslog" | "powershell" => Self::OperatingSystem,
+            "windows-security" | "windows" | "sysmon" | "auditd" | "syslog" | "powershell" => {
+                Self::OperatingSystem
+            }
+            "aws" | "gcp" | "azure" | "kubernetes" | "github" => Self::Cloud,
             "java" | "python" | "application" | "dotnet" => Self::Application,
             _ => Self::Other,
         }
@@ -314,7 +318,7 @@ impl SharedModel {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != SCHEMA
             || self.contributions.len() > 4096
-            || self.domains.len() > 7
+            || self.domains.len() > 8
             || self
                 .contributions
                 .iter()

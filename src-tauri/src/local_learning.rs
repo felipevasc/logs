@@ -476,7 +476,7 @@ fn analyze_mode(
           substr(coalesce(json_extract(f.payload,'$.template'),''),1,2400) AS message,
           coalesce(json_extract(f.payload,'$.outcome'),'unknown') AS outcome,
           coalesce(json_extract(f.payload,'$.action'),'') AS action,
-          coalesce(json_extract(f.payload,'$.outcome')='failure',0) OR coalesce(json_extract(f.payload,'$.metadata.learning.failure'),0) OR (CAST(json_extract(f.payload,'$.code') AS INTEGER) BETWEEN 500 AND 599) AS failure,
+          coalesce(json_extract(f.payload,'$.outcome')='failure',0) OR coalesce(json_extract(f.payload,'$.metadata.learning.failure'),0) OR (json_extract(f.payload,'$.metadata.product')='web' AND CAST(json_extract(f.payload,'$.code') AS INTEGER) BETWEEN 500 AND 599) AS failure,
           json_extract(f.payload,'$.latency_ms') AS latency,json_extract(f.payload,'$.bytes') AS bytes,
           substr(coalesce(json_extract(f.payload,'$.metadata.product'),'unknown'),1,64) AS product,
           CASE WHEN length(json_extract(f.payload,'$.metadata.learning.trace')) BETWEEN 1 AND 256 THEN json_array('trace',json_extract(f.payload,'$.metadata.learning.trace'))
@@ -665,7 +665,11 @@ fn analyze_mode(
             }
             let public = PublicState::new(
                 &row.action,
-                &row.outcome,
+                if row.outcome == "unknown" && row.failure {
+                    "failure"
+                } else {
+                    &row.outcome
+                },
                 row.latency,
                 row.bytes,
                 row.message.split_whitespace().count(),
@@ -679,7 +683,6 @@ fn analyze_mode(
             let (support, shared_total) = shared.support(domain, public);
             if !score.ready
                 && row.ts > cutoff
-                && domain != Domain::Other
                 && shared_total >= 200
                 && public.outcome > 0
                 && (public.latency > 0 || public.bytes > 0)
@@ -1363,5 +1366,17 @@ mod tests {
                 assert_eq!(reference, "rare:350");
             });
         }
+    }
+    #[test]
+    fn native_event_codes_are_not_misread_as_http_failures() {
+        isolated(|| {
+            let db = fixture("windows", false, false);
+            db.execute_batch("UPDATE investigation_facts SET payload=json_set(payload,'$.code','500','$.outcome','unknown','$.metadata.product','windows-security','$.metadata.learning.failure',0);").unwrap();
+            let (_, pending) = analyze(&db, &Settings::default()).unwrap();
+            pending.unwrap().commit().unwrap();
+            let profile = open_profile(&profile_path()).unwrap();
+            let (model, _) = load_model(&profile, &Limits::default()).unwrap();
+            assert!(model.contexts.values().all(|c| c.failures == 0));
+        });
     }
 }

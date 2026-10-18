@@ -3,6 +3,19 @@ use log_learning::*;
 fn key() -> String {
     digest(b"service-a")
 }
+#[test]
+fn shared_domains_cover_the_native_normalizers_without_guessing_generic_products() {
+    assert_eq!(Domain::from_product("web"), Domain::Web);
+    assert_eq!(
+        Domain::from_product("windows-security"),
+        Domain::OperatingSystem
+    );
+    assert_eq!(Domain::from_product("sshd"), Domain::Authentication);
+    for product in ["aws", "gcp", "azure", "kubernetes", "github"] {
+        assert_eq!(Domain::from_product(product), Domain::Cloud);
+    }
+    assert_eq!(Domain::from_product("generic"), Domain::Other);
+}
 
 #[test]
 fn compacted_receipts_never_retrain_old_observations_and_use_fixed_memory() {
