@@ -1008,6 +1008,12 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
       const items=rows.slice(offset,offset+limit);
       return structuredClone({analysis_id:analysisId,section,items,total:rows.length,next_offset:offset+items.length<rows.length?offset+items.length:null,complete:true,...fixture,items});
     },
+    investigation_learning: ({analysisId,request}) => {
+      if (analysisId !== window.__mockInvestigationFixture?.analysis_id) throw Error('Análise de aprendizado desatualizada.');
+      if (request.action === 'publish') return {status:'fixture_only',published:1,raw_logs_sent:false};
+      if (request.action === 'export') return {schema_version:1,contributions:[]};
+      return {status:'fixture_only',revision:'fixture-revision'};
+    },
     investigation_narrative_review: ({analysisId,draft}) => { if(!draft?.claims?.length) throw Error('Síntese sem afirmações'); return {analysis_id:analysisId,classification_updated:false,semantic_validation:'human_review_required',citation_membership:'fixture_only',claims:draft.claims}; },
     investigation_proposal_evaluate: ({analysisId,signalId,controls}) => {
       if(!controls.positive?.length||!controls.negative?.length||!controls.holdout_declaration?.trim())throw Error('Controles incompletos');

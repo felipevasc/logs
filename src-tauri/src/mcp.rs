@@ -942,6 +942,12 @@ pub struct InvestigationProfileTrainParams{
     #[serde(flatten)]pub context:crate::analysis_runtime::Params,
     pub analysis_id:String,
 }
+#[derive(Debug,Deserialize,schemars::JsonSchema)]
+pub struct InvestigationLearningParams{
+    #[serde(flatten)]pub context:crate::analysis_runtime::Params,
+    pub analysis_id:String,
+    pub request:crate::learning_commands::Request,
+}
 #[derive(Debug,Deserialize,schemars::JsonSchema)]pub struct InvestigationProposalEvaluateParams {
     #[serde(flatten)]pub context:crate::analysis_runtime::Params,pub analysis_id:String,pub signal_id:String,pub controls:crate::security_proposals::Controls,
 }
@@ -1897,6 +1903,10 @@ impl LogInsightMcp {
     #[tool(description="Explicitly replace this Case's named frozen environmental profile from the current complete investigation. Requires settings.investigation.profile. This is a mutation: never call automatically when hunting or writing a narrative. Withholds E3+ evidence members and priority>=35 hypotheses from training, records the snapshot and population, and isolates profiles by Case and namespace. No continuous learning or cross-Case sharing.",annotations(read_only_hint=false))]
     async fn investigation_profile_train(&self,Parameters(p):Parameters<InvestigationProfileTrainParams>)->Result<CallToolResult,McpError>{
         self.run_source_result(p.context.clone(),move|state|crate::triage::investigation_profile_train_impl(state,&p.analysis_id,None)).await
+    }
+    #[tool(description="Local online learning: inspect, export closed-vocabulary aggregate counts, import/download a shared model, reset or roll back this Case's profile. publish requires explicit user instruction and a temporary token; it sends only validated aggregate contributions to the configured repository. Never publish automatically.")]
+    async fn investigation_learning(&self,Parameters(p):Parameters<InvestigationLearningParams>)->Result<CallToolResult,McpError>{
+        self.run_source_result(p.context.clone(),move|state|crate::triage::investigation_learning_impl(state,&p.analysis_id,p.request,None)).await
     }
 
     #[tool(

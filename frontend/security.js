@@ -801,6 +801,7 @@ window.Security = (() => {
           request: (command, args) => api(command, { ...captured.request, ...args }, { silent: true, analysisOwner: captured.owner }),
           onProfileSaved: result => { toast(`Referência congelada: ${result.eligible} eventos elegíveis, ${result.withheld} excluídos. Calcule novamente para comparar.`, 'ok'); invalidate(); },
           onRuleSaved: () => { toast('Regra revisada salva neste Caso, com nível não avaliado. Calcule novamente para aplicar.', 'ok'); invalidate(); },
+          onLearningChanged: () => { toast('Aprendizado atualizado. Calcule novamente para usar a referência selecionada.', 'ok'); invalidate(); },
         });
       }
       if (view.entities) drawEntities(view.entities, data);
@@ -907,7 +908,11 @@ window.Security = (() => {
       input.onchange = () => { try { const config = JSON.parse(behaviorEditor.value); config[field] = field === 'enabled' ? input.checked : min == null ? input.value.trim() || null : Number(input.value); if (field === 'profile') config.profile_revision = null; behaviorEditor.value = JSON.stringify(config, null, 2); } catch (error) { behaviorPane.querySelector('pre').textContent = String(error); } };
       row.append(input); basics.append(row);
     }
-    const syncBasics = () => { try { const config = JSON.parse(behaviorEditor.value); for (const input of basics.querySelectorAll('input')) { const field = input.dataset.behaviorField; if (field === 'enabled') input.checked = config[field] !== false; else input.value = config[field] ?? ''; } } catch {} };
+    for (const [field,label,type] of [['enabled','Aprender padrões e sequências localmente','checkbox'],['auto_update','Incrementar o perfil após análises validadas','checkbox'],['github_repository','Repositório para contribuições (opcional)','text'],['github_branch','Branch da base compartilhada','text']]) {
+      const row = el('label', 'small', label), input = document.createElement('input'); input.type = type; input.dataset.learningField = field; if (type === 'text') input.maxLength = field === 'github_repository' ? 201 : 100;
+      input.onchange = () => { try { const config = JSON.parse(behaviorEditor.value); config.learning ||= { enabled: true, auto_update: true, github_repository: null, github_branch: 'learning-models' }; config.learning[field] = type === 'checkbox' ? input.checked : input.value.trim() || (field === 'github_repository' ? null : 'learning-models'); behaviorEditor.value = JSON.stringify(config, null, 2); } catch (error) { behaviorPane.querySelector('pre').textContent = String(error); } }; row.append(input); basics.append(row);
+    }
+    const syncBasics = () => { try { const config = JSON.parse(behaviorEditor.value); for (const input of basics.querySelectorAll('input')) { const field = input.dataset.behaviorField; if (input.dataset.learningField) { const key = input.dataset.learningField; if (input.type === 'checkbox') input.checked = config.learning?.[key] !== false; else input.value = config.learning?.[key] ?? (key === 'github_branch' ? 'learning-models' : ''); } else if (field === 'enabled') input.checked = config[field] !== false; else input.value = config[field] ?? ''; } } catch {} };
     behaviorEditor.addEventListener('input', syncBasics); syncBasics(); behaviorPane.insertBefore(basics, behaviorEditor);
     behaviorPane.querySelector("button").onclick = async () => {
       const status = behaviorPane.querySelector("pre");

@@ -51,6 +51,8 @@ mod security_schema;
 mod security_packs;
 mod security_proposals;
 mod investigation;
+mod local_learning;
+mod learning_commands;
 mod security_content;
 mod security_store;
 mod security_correlate;
@@ -2351,6 +2353,7 @@ pub fn run() {
             triage::investigation_page,
             triage::investigation_narrative_review,
             triage::investigation_profile_train,
+            triage::investigation_learning,
             triage::investigation_proposal_evaluate,
             triage::investigation_proposal_accept,
             triage::triage_evidence_event,

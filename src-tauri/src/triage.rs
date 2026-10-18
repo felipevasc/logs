@@ -509,6 +509,17 @@ pub fn investigation_profile_train_impl(state:&AppState,analysis_id:&str,case:Op
     settings.investigation.profile_revision=manifest["revision"].as_str().map(str::to_string);
     let receipt=serde_json::to_value(save_settings_impl(settings,None)?).map_err(|e|e.to_string())?;manifest["analysisContext"]=receipt["analysisContext"].clone();Ok(manifest)
 }
+pub fn investigation_learning_impl(state:&AppState,analysis_id:&str,request:crate::learning_commands::Request,case:Option<&[Event]>)->Result<serde_json::Value,String>{
+    let full=stored_analysis_mode(state,case,false,true)?;
+    if full.metadata["analysis_id"].as_str()!=Some(analysis_id){return Err("A análise mudou; reabra o aprendizado antes de atualizar".into());}
+    let _lane=if matches!(request.action.as_str(),"reset"|"rollback"|"accept_expected"){Some(crate::security_store::working_lane()?)}else{None};
+    crate::learning_commands::execute(&full,request)
+}
+#[tauri::command]
+pub async fn investigation_learning(analysis_id:String,request:crate::learning_commands::Request,case_events:Option<Vec<Event>>,case_key:Option<String>,analysis_context:Option<crate::analysis_context::Identity>,source_generation:Option<u64>,operation_id:Option<String>,app:AppHandle)->Result<serde_json::Value,String>{
+    let (admitted,records)=crate::analysis_runtime::capture_case_async(app.clone(),analysis_context,source_generation,case_events,case_key,operation_id.clone(),crate::global_scheduler::Priority::Normal).await?;
+    crate::offload_case(operation_id,app.clone(),admitted,records,move|records|investigation_learning_impl(app.state::<AppState>().inner(),&analysis_id,request,records.as_deref())).await?
+}
 pub fn investigation_proposal_evaluate_impl(state:&AppState,analysis_id:&str,signal_id:&str,controls:crate::security_proposals::Controls,case:Option<&[Event]>)->Result<serde_json::Value,String>{
     controls.validate()?;let original=stored_analysis_mode(state,case,false,true)?;
     if original.metadata["analysis_id"].as_str()!=Some(analysis_id){return Err("Análise desatualizada; proposta não avaliada".into());}

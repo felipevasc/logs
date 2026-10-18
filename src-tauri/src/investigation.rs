@@ -15,6 +15,7 @@ pub const VERSION: &str = "investigation-1";
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
+    pub learning: crate::local_learning::Settings,
     pub baseline_days: u32,
     pub minimum_history: u32,
     pub rare_max: u32,
@@ -381,6 +382,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: true,
+            learning: Default::default(),
             baseline_days: 7,
             minimum_history: 20,
             rare_max: 3,
@@ -394,6 +396,7 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
+        self.learning.validate()?;
         if !(1..=365).contains(&self.baseline_days)
             || !(5..=100_000).contains(&self.minimum_history)
             || !(1..=100).contains(&self.rare_max)
@@ -672,6 +675,7 @@ impl Population {
             "provenance":n.values,
             "numbers":n.numbers,"service":n.get("service"),"peer_group":n.get("peer_group"),
             "transformations":n.transformations,
+            "learning":crate::local_learning::event_context(event),
             "flags":{"suspicious_command":crate::security_normalize::field_text(event,"_sec.suspicious_command").as_deref()==Some("true") && !n.get("command").is_some_and(crate::security_normalize::literal_output),
                 "suspicious_request":crate::security_normalize::field_text(event,"_sec.suspicious_request").as_deref()==Some("true")||n.signals.iter().any(|s|s.key.contains("request")&&!s.key.contains("ambiguous")),
                 "documentation":crate::security_normalize::field_text(event,"event.kind").as_deref()==Some("documentation")},

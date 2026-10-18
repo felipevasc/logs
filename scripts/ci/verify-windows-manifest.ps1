@@ -54,9 +54,11 @@ try {
     if ($Target -eq 'harness') {
         $log = Get-Content 'output/windows-native-diagnostics/cargo-test.log' -Raw
         $log = [regex]::Replace($log, '\x1b\[[0-?]*[ -/]*[@-~]', '')
-        $harnessMatches = [regex]::Matches($log, '(?m)Running unittests src[\\/]lib\.rs \(([^\r\n]+\.exe)\)')
+        # The standalone learning crate also runs a library harness. Select the
+        # application's harness, then retain the exact-one and directory checks.
+        $harnessMatches = [regex]::Matches($log, '(?m)Running unittests src[\\/]lib\.rs \(([^\r\n]*[\\/]loginsight_lib-[\w-]+\.exe)\)')
         $paths = @($harnessMatches | ForEach-Object { [IO.Path]::GetFullPath($_.Groups[1].Value) } | Sort-Object -Unique)
-        if ($paths.Count -ne 1) { throw 'Cargo log must identify exactly one executed library unit harness.' }
+        if ($paths.Count -ne 1) { throw 'Cargo log must identify exactly one executed application library unit harness.' }
         $executable = $paths[0]
         $deps = [IO.Path]::GetFullPath((Join-Path $PWD 'src-tauri/target/release/deps'))
         if ([IO.Path]::GetDirectoryName($executable) -ine $deps -or [IO.Path]::GetFileName($executable) -notmatch '^loginsight_lib-[\w-]+\.exe$') {

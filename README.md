@@ -4,6 +4,8 @@ Aplicacao desktop para investigar logs, feita com Tauri 2: o backend em Rust ind
 
 ## Recursos
 
+- Aprendizado local sem rótulos: famílias de mensagens, sequências, desvios combinados e mudanças temporais, com diagnóstico por comparação e eventos originais. Perfis incrementais por Caso, validação temporal e contribuições agregadas opcionais para uma base versionada no Git. CPU, sem LLM ou envio de logs. [Uso, privacidade e limites](docs/aprendizado-local.md).
+
 - Casos independentes, com fontes, filtros, análises e preferências próprias. **Achados** reúne os itens preservados dentro do Caso. Índices opcionais de campos pelo menu contextual, marcador discreto e carregamento paralelo de múltiplos arquivos. [Casos e índices](docs/casos-indices-conexoes.md).
 - Investigação na **0.13**: fila explicada por entidade, análise comportamental da população completa, histórico opt-in, caças guiadas, IOCs offline, políticas de negócio, grafo temporal e síntese com citações. Prioridade, cobertura e níveis de evidência permanecem independentes. [Guia e limites](docs/investigacao-v013.md) · [Notas da versão](docs/releases/v0.13.0.md).
 

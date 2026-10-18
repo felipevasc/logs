@@ -1811,7 +1811,7 @@ fn run_inner(
     let mut progress = crate::security_progress::Tracker::new(inputs.rules, &category_names);
     let patterns = inputs.rules.automaton.as_ref().map(|a| a.patterns_len()).unwrap_or(0);
     let mut acc = source.fold(&pass, patterns)?;
-    let investigation = acc.population.finish()?;
+    let mut investigation = acc.population.finish()?;
     if let Some(writer) = sink.as_mut() { writer.import_population(&acc.population)?; }
     let dataset_fingerprint = format!("{:x}", acc.fingerprint.clone().finalize());
     let lookup = |id: usize| source.lookup(id);
@@ -2424,6 +2424,7 @@ fn run_inner(
     });
     let counts_by_level =
         std::array::from_fn(|i| detections.iter().filter(|d| d.evidence.evidence_level as usize == i + 1).count());
+    if let Some(writer)=sink.as_mut(){investigation["learning"]=writer.prepare_learning(&inputs.settings.investigation)?;}
     let fingerprint = format!("{:x}", acc.fingerprint.finalize());
     let versions = serde_json::to_string(&(
         crate::evidence::POLICY_VERSION,
@@ -2434,6 +2435,8 @@ fn run_inner(
         inputs.rules.rules.iter().map(|r| &r.def).collect::<Vec<_>>(),
         inputs.settings,
         inputs.catalog.map(|catalog| catalog.signature()),
+        &investigation["learning"]["model_revision"],
+        &investigation["learning"]["shared_revision"],
     ))
     .map_err(|e| e.to_string())?;
     let analysis_id = crate::evidence::stable_id("analysis", [fingerprint, versions]);

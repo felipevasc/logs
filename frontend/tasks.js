@@ -22,6 +22,7 @@ window.Tasks = (() => {
   READS.add("investigation_narrative_review");SCOPED.add("investigation_narrative_review");
   READS.add("client_inventory"); SCOPED.add("client_inventory");
   READS.add("investigation_page"); SCOPED.add("investigation_page"); SCOPED.add("investigation_profile_train");
+  SCOPED.add("investigation_learning");
   READS.add("investigation_proposal_evaluate"); SCOPED.add("investigation_proposal_evaluate"); SCOPED.add("investigation_proposal_accept");
   // Native evidence requests own their admission inside request; never inject
   // the currently selected Case over their captured store/member identity.
@@ -60,6 +61,7 @@ window.Tasks = (() => {
   for (const command of ["split_choose_input", "split_choose_output", "split_inspect", "split_pending"]) QUIET.add(command);
   Object.assign(WHAT, { split_run: "Separando o log", split_preview: "Testando a separação", split_recover: "Retomando a separação" });
   for (const command of ["investigation_page", "investigation_profile_train", "investigation_narrative_review"]) named.add(command);
+  named.add("investigation_learning"); WHAT.investigation_learning = "Atualizando aprendizado local";
   for (const command of ["investigation_proposal_evaluate", "investigation_proposal_accept"]) named.add(command);
   Object.assign(WHAT, { investigation_proposal_evaluate: "Avaliando proposta e controles", investigation_proposal_accept: "Salvando regra revisada" });
   Object.assign(WHAT, { investigation_narrative_review:"Conferindo citações da síntese",investigation_page: "Investigação do comportamento", investigation_profile_train: "Congelando referência histórica" });

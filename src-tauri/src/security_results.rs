@@ -45,6 +45,7 @@ fn bounded(value: Value) -> Result<Value, String> {
 pub struct Writer {
     db: Connection,
     next: i64,
+    learning: Option<crate::local_learning::Pending>,
 }
 impl Writer {
     pub fn new() -> Result<Self, String> {
@@ -89,7 +90,7 @@ impl Writer {
             CREATE TABLE proposal_evaluations(signal TEXT PRIMARY KEY,payload TEXT);
             CREATE TABLE revision_changes(kind TEXT,id TEXT,ns TEXT,payload TEXT,PRIMARY KEY(kind,id));
             BEGIN;").map_err(err)?;
-        Ok(Self { db, next: 0 })
+        Ok(Self { db, next: 0, learning: None })
     }
     fn root(&self, n: i64) -> Result<(i64, i64), String> {
         let mut cur = n;
@@ -530,6 +531,18 @@ impl Writer {
         execute(&self.db, "DELETE FROM entities WHERE n=?1", [self.next]).map_err(err)?;
         Ok(())
     }
+    pub fn prepare_learning(&mut self,settings:&crate::investigation::Settings)->Result<Value,String>{
+        if !settings.enabled{return Ok(json!({"enabled":false}));}
+        self.db.execute_batch("SAVEPOINT local_learning_analysis").map_err(err)?;
+        match crate::local_learning::analyze(&self.db,&settings.learning){
+            Ok((report,pending))=>{self.db.execute_batch("RELEASE local_learning_analysis").map_err(err)?;self.learning=pending;Ok(report)},
+            Err(error)=>{
+                self.db.execute_batch("ROLLBACK TO local_learning_analysis;RELEASE local_learning_analysis").map_err(err)?;
+                crate::operations::check()?;crate::security_budget::check()?;
+                Ok(json!({"enabled":settings.learning.enabled,"available":false,"version":crate::local_learning::VERSION,"repository":settings.learning.github_repository,"branch":settings.learning.github_branch,"error":error,"update":{"status":"withheld","applied":false}}))
+            }
+        }
+    }
     fn build_investigation_queue(&self) -> Result<(), String> {
         let mut keys = self
             .db
@@ -592,7 +605,7 @@ impl Writer {
     pub fn finish_evaluation(self, triage: Triage) -> Result<Arc<Results>, String> {
         self.finish_mode(triage, false)
     }
-    fn finish_mode(self, triage: Triage, publish: bool) -> Result<Arc<Results>, String> {
+    fn finish_mode(mut self, triage: Triage, publish: bool) -> Result<Arc<Results>, String> {
         let mut previous = -1;
         loop {
             crate::operations::check()?;
@@ -751,6 +764,9 @@ impl Writer {
         };
         if publish {
             crate::operations::commit();
+            if let Some(pending)=self.learning.take(){
+                metadata["investigation"]["learning"]["update"]=match pending.commit(){Ok(value)=>value,Err(error)=>json!({"status":"update_failed","applied":false,"error":error})};
+            }
         }
         Ok(Arc::new(Results {
             db: Mutex::new(self.db),
@@ -856,6 +872,20 @@ impl Writer {
 }
 
 impl Results {
+    pub fn learn_expected(&self,signal:&str)->Result<Value,String>{
+        if self.metadata["complete"]!=true{return Err("A revisão exige uma análise completa".into());}
+        crate::local_learning::learn_expected(&self.db.lock(),&crate::detections::load_settings().investigation.learning,signal)
+    }
+    pub fn learning_contributions(&self)->Result<Vec<log_learning::Contribution>,String>{
+        if self.metadata["investigation"]["learning"]["update"]["applied"]!=true{return Err("Esta análise não promoveu uma atualização local validada".into());}
+        let db=self.db.lock();
+        let mut statement=db.prepare("SELECT payload FROM learning_exports ORDER BY domain").map_err(err)?;
+        let mut result=Vec::new();
+        for text in statement.query_map([],|r|r.get::<_,String>(0)).map_err(err)?{
+            let contribution:log_learning::Contribution=serde_json::from_str(&text.map_err(err)?).map_err(err)?;contribution.validate()?;result.push(contribution);
+        }
+        Ok(result)
+    }
     pub fn train_profile(
         &self,
         settings: &crate::investigation::Settings,
@@ -1073,10 +1103,12 @@ impl Results {
             )
         });
         let (table,where_sql,order,payload) = match section {
+            "learning" => ("learning_incidents","(?1 IS NULL OR ns=?1) AND (?2 IS NULL OR entity=?2)","priority DESC,id","payload"),
             "revision" => ("revision_changes","(?1 IS NULL OR ns=?1) AND (?2 IS NULL OR json_extract(payload,'$.rule')=?2)","kind,id","json_object('kind',kind,'finding_id',id,'namespace',ns,'classification',json(payload))"),
             "schema" => ("investigation_schema","(?1 IS NULL OR ns=?1) AND (?2 IS NULL OR source=?2)","ns,source,field","payload"),
             "signals" | "hunt" => ("investigation_signals",hunt_where.as_deref().unwrap_or("(?1 IS NULL OR ns=?1) AND (?2 IS NULL OR entity=?2)"),"priority DESC,id","payload"),
             "queue" => ("investigation_queue","(?1 IS NULL OR ns=?1) AND (?2 IS NULL OR entity=?2)","score DESC,ns,col,entity","payload"),
+            "members" if signal.is_some_and(|id|id.starts_with("learned:")) => ("investigation_members","id=?3 AND (?1 IS NULL OR EXISTS(SELECT 1 FROM learning_incidents s WHERE s.id=?3 AND s.ns=?1))","ts,ref","json_object('event_ref',ref,'event_id',eid,'timestamp',ts)"),
             "members" => ("investigation_members","id=?3 AND (?1 IS NULL OR EXISTS(SELECT 1 FROM investigation_signals s WHERE s.id=?3 AND s.ns=?1))","ts,ref","json_object('event_ref',ref,'event_id',eid,'timestamp',ts)"),
             "finding_members" => ("members","n=(SELECT n FROM findings WHERE id=?3) AND (?1 IS NULL OR namespace=?1)","ref","coalesce(payload,json_object('event_ref',ref,'event_id',event))"),
             "finding_entities" => ("entities","n=(SELECT n FROM findings WHERE id=?3) AND (?1 IS NULL OR namespace=?1)","namespace,col,value","json_object('namespace',namespace,'column',col,'value',value,'label',label,'evidence_level',level)"),
