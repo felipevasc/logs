@@ -880,7 +880,7 @@ fn detect_changes(
         };
         let mut change = log_learning::DurationChange::new(&reference.latency);
         let mut previous = None::<i64>;
-        let mut statement=db.prepare("SELECT CAST(ts/60000 AS INTEGER)*60000,count(*),sum(failure),avg(latency) FROM learning_input WHERE context=?1 AND valid AND ts>?2 GROUP BY CAST(ts/60000 AS INTEGER) ORDER BY 1").map_err(error)?;
+        let mut statement=db.prepare("SELECT (ts/60000-CASE WHEN ts<0 AND ts%60000<>0 THEN 1 ELSE 0 END)*60000,count(*),sum(failure),avg(latency) FROM learning_input WHERE context=?1 AND valid AND ts>?2 GROUP BY (ts/60000-CASE WHEN ts<0 AND ts%60000<>0 THEN 1 ELSE 0 END) ORDER BY 1").map_err(error)?;
         let windows = statement
             .query_map(params![context, cutoff], |r| {
                 Ok((
@@ -933,7 +933,7 @@ fn detect_changes(
     Ok(())
 }
 fn build_incidents(db: &Connection) -> Result<u64, String> {
-    let mut statement=db.prepare("SELECT context,ns,source,CAST(ts/300000 AS INTEGER)*300000,count(*),max(surprise) FROM learning_flags GROUP BY context,CAST(ts/300000 AS INTEGER) ORDER BY context,4").map_err(error)?;
+    let mut statement=db.prepare("SELECT context,ns,source,(ts/300000-CASE WHEN ts<0 AND ts%300000<>0 THEN 1 ELSE 0 END)*300000,count(*),max(surprise) FROM learning_flags GROUP BY context,(ts/300000-CASE WHEN ts<0 AND ts%300000<>0 THEN 1 ELSE 0 END) ORDER BY context,4").map_err(error)?;
     let groups = statement
         .query_map([], |r| {
             Ok((
