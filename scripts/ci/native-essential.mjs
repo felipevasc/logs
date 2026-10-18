@@ -1,6 +1,10 @@
 // End-to-end data contracts replace the former thousand-test release sweep.
 import { spawnSync } from 'node:child_process';
 
+const learning = spawnSync('cargo', ['test', '--manifest-path', 'crates/log-learning/Cargo.toml', '--locked', '--release'], { stdio: 'inherit' });
+if (learning.error) throw learning.error;
+if (learning.status !== 0) process.exit(learning.status ?? 1);
+
 const base = ['test', '--manifest-path', 'src-tauri/Cargo.toml', '--release', '--locked'];
 const units = [
   'cache_validation::tests::', 'computed_cache::tests::',
@@ -8,6 +12,7 @@ const units = [
   'engine::build::checkpoint_tests::', 'engine::time_index::tests::',
   'workspace::canonical::tests::', 'triage::on_demand_tests::',
   'security_progress::tests::',
+  'local_learning::tests::', 'learning_commands::tests::',
   'source_publication::tests::', 'global_scheduler::tests::',
   'remote::tests::', 'remote_files::tests::', 'field_indexes::tests::',
   'log_split::',
