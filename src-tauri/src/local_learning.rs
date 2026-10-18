@@ -1344,20 +1344,24 @@ mod tests {
     }
     #[test]
     fn a_single_rare_event_keeps_its_original_evidence_and_declares_low_support() {
-        isolated(|| {
-            let db = fixture("rare", false, false);
-            db.execute("UPDATE investigation_facts SET payload=json_set(payload,'$.template','previously unseen message','$.latency_ms',8000) WHERE ref='rare:350'",[]).unwrap();
-            let (report, _) = analyze(&db, &Settings::default()).unwrap();
-            assert_eq!(report["unusual"], 1);
-            assert_eq!(report["incidents"], 1);
-            let priority: u64 = db
-                .query_row("SELECT priority FROM learning_incidents", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(priority, 20);
-            let reference: String = db
-                .query_row("SELECT ref FROM investigation_members", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(reference, "rare:350");
-        });
+        for epoch_offset in [0i64, -1_700_000_500_000] {
+            isolated(|| {
+                let db = fixture("rare", false, false);
+                db.execute("UPDATE investigation_facts SET ts=ts+?1", [epoch_offset])
+                    .unwrap();
+                db.execute("UPDATE investigation_facts SET payload=json_set(payload,'$.template','previously unseen message','$.latency_ms',8000) WHERE ref='rare:350'",[]).unwrap();
+                let (report, _) = analyze(&db, &Settings::default()).unwrap();
+                assert_eq!(report["unusual"], 1);
+                assert_eq!(report["incidents"], 1);
+                let priority: u64 = db
+                    .query_row("SELECT priority FROM learning_incidents", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(priority, 20);
+                let reference: String = db
+                    .query_row("SELECT ref FROM investigation_members", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(reference, "rare:350");
+            });
+        }
     }
 }
