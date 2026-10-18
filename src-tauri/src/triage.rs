@@ -512,7 +512,7 @@ pub fn investigation_profile_train_impl(state:&AppState,analysis_id:&str,case:Op
 pub fn investigation_learning_impl(state:&AppState,analysis_id:&str,request:crate::learning_commands::Request,case:Option<&[Event]>)->Result<serde_json::Value,String>{
     let full=stored_analysis_mode(state,case,false,true)?;
     if full.metadata["analysis_id"].as_str()!=Some(analysis_id){return Err("A análise mudou; reabra o aprendizado antes de atualizar".into());}
-    let _lane=if matches!(request.action.as_str(),"reset"|"rollback"|"accept_expected"){Some(crate::security_store::working_lane()?)}else{None};
+    let _lane=if matches!(request.action.as_str(),"reset"|"rollback"|"accept_expected"|"diagnostic_feedback"|"diagnostic_import"|"diagnostic_rollback"){Some(crate::security_store::working_lane()?)}else{None};
     crate::learning_commands::execute(&full,request)
 }
 #[tauri::command]

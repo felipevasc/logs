@@ -526,12 +526,17 @@ pub fn entropy(text: &str) -> f64 {
 }
 fn template(text: &str) -> String {
     // An explicitly named deterministic template, not a claimed learned Drain model.
+    let mut previous_is_code = false;
     text.split_whitespace()
         .take(128)
         .map(|word| {
-            if word.parse::<f64>().is_ok()
+            let lower = word.to_ascii_lowercase();
+            let code_label = |s: &str| matches!(s.trim_end_matches([':', '=']), "sqlstate" | "errno" | "error_code" | "errorcode" | "status" | "status_code" | "http_status" | "event_id" | "eventid");
+            let preserve = previous_is_code || lower.split_once(['=', ':']).is_some_and(|(key,_)|code_label(key));
+            previous_is_code = code_label(&lower);
+            if !preserve && (word.parse::<f64>().is_ok()
                 || word.parse::<std::net::IpAddr>().is_ok()
-                || (word.len() >= 16 && word.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+                || (word.len() >= 16 && word.chars().all(|c| c.is_ascii_hexdigit() || c == '-')))
             {
                 "<value>"
             } else {
@@ -670,12 +675,19 @@ impl Population {
                     .map_err(error)?;
             }
         }
+        let mut learning = crate::local_learning::event_context(event);
+        for (key, role) in [("operation", "operation"), ("version", "service_version"), ("dependency", "dependency")] {
+            if learning[key].is_null() {
+                if let Some(value) = n.get(role) { learning[key] = json!(value); }
+            }
+        }
         let metadata = json!({"product":n.product,"time":n.time,"limitations":n.limitations,
             "conflicts":n.conflicts,"content_clipped":n.content_clipped,
             "provenance":n.values,
             "numbers":n.numbers,"service":n.get("service"),"peer_group":n.get("peer_group"),
             "transformations":n.transformations,
-            "learning":crate::local_learning::event_context(event),
+            "learning":learning,
+            "diagnostics":crate::local_diagnostics::event_facts(event,n),
             "flags":{"suspicious_command":crate::security_normalize::field_text(event,"_sec.suspicious_command").as_deref()==Some("true") && !n.get("command").is_some_and(crate::security_normalize::literal_output),
                 "suspicious_request":crate::security_normalize::field_text(event,"_sec.suspicious_request").as_deref()==Some("true")||n.signals.iter().any(|s|s.key.contains("request")&&!s.key.contains("ambiguous")),
                 "documentation":crate::security_normalize::field_text(event,"event.kind").as_deref()==Some("documentation")},
@@ -1056,7 +1068,7 @@ impl Population {
                 self.support_signal(&format!("offline_ioc:{}",indicator.id),&format!("SELECT ns,source AS entity,ref,eid,ts FROM ioc_matches WHERE indicator='{id}'"),"source",&format!("Correspondência exata com IOC offline {} do catálogo {} revisão {}. Procedência: {}. Contexto: {}. Horários desconhecidos impedem verificar a validade temporal.",indicator.id,catalog.id,catalog.revision,catalog.source,indicator.context),40)?;
             }
         }
-        self.db.execute_batch("CREATE TEMP VIEW operational_hours AS SELECT ns,source,floor(ts/3600000)*3600000 AS hour,count(*) AS total,sum(CASE WHEN outcome='failure' OR try_cast(code AS INTEGER)>=500 THEN 1 ELSE 0 END) AS errors,median(latency) AS latency FROM facts WHERE time_ok GROUP BY ns,source,hour;
+        self.db.execute_batch("CREATE TEMP VIEW operational_hours AS SELECT ns,source,floor(ts/3600000)*3600000 AS hour,count(*) AS total,sum(CASE WHEN outcome='failure' OR (json_extract_string(metadata,'$.product')='web' AND try_cast(code AS INTEGER) BETWEEN 500 AND 599) THEN 1 ELSE 0 END) AS errors,median(latency) AS latency FROM facts WHERE time_ok GROUP BY ns,source,hour;
             CREATE TEMP VIEW operational_baseline AS SELECT h.ns,h.source,median(1.0*errors/total) AS error_rate,median(latency) AS med_latency,count(*) AS hours FROM operational_hours h JOIN bounds b USING(ns) WHERE hour<b.cutoff GROUP BY h.ns,h.source HAVING count(*)>=5;").map_err(error)?;
         if self.history["status"] == "frozen_reference" {
             self.support_signal("historical_relationship",&format!("SELECT r.ns,r.entity,r.ref,r.eid,r.ts FROM relations r WHERE r.col='@user' AND NOT EXISTS(SELECT 1 FROM historical_pairs p WHERE p.ns=r.ns AND p.entity=r.entity AND p.kind=r.kind AND p.target=r.target) AND (SELECT sum(events) FROM historical_hours h WHERE h.ns=r.ns AND h.entity=r.entity)>={} AND r.ts>(SELECT max(hour)+3599999 FROM historical_hours h WHERE h.ns=r.ns AND h.entity=r.entity)",self.settings.minimum_history),"@user","Relação ausente na referência histórica congelada deste Caso; a referência exclui achados e hipóteses prioritárias. Conferir cobertura e mudanças autorizadas.",25)?;
@@ -1067,7 +1079,7 @@ impl Population {
             self.support_signal("peer_volume_change","WITH peers AS (SELECT ns,peer_group,slot,median(bytes) med,count(DISTINCT entity) peers FROM historical_hours WHERE peer_group<>'' AND bytes IS NOT NULL GROUP BY ns,peer_group,slot HAVING count(DISTINCT entity)>=5) SELECT f.ns,f.actor AS entity,f.ref,f.eid,f.ts FROM facts f JOIN current_hours h ON f.ns=h.ns AND f.actor=h.entity AND cast(floor(f.ts/3600000)*3600000 AS BIGINT)=h.hour JOIN peers p ON p.ns=f.ns AND p.peer_group=json_extract_string(f.metadata,'$.peer_group') AND p.slot=h.slot WHERE h.amount>=1048576 AND h.amount>p.med*5 AND NOT EXISTS(SELECT 1 FROM historical_hours b WHERE b.ns=f.ns AND b.entity=f.actor) AND f.bytes IS NOT NULL AND f.time_ok","@user","Entidade em cold start excedeu a referência de ao menos cinco pares de um grupo declarado explicitamente. Diferenças de função e carga exigem revisão.",20)?;
         }
         self.support_signal("template_novelty","SELECT f.ns,f.source AS entity,f.ref,f.eid,f.ts FROM facts f JOIN bounds b USING(ns) WHERE f.time_ok AND f.ts>=b.cutoff AND f.template<>'' AND NOT EXISTS(SELECT 1 FROM facts old WHERE old.ns=f.ns AND old.source=f.source AND old.template=f.template AND old.ts<b.cutoff) AND (SELECT count(*) FROM facts old WHERE old.ns=f.ns AND old.source=f.source AND old.ts<b.cutoff)>=20","source","Template novo após histórico suficiente da fonte. A generalização é determinística e pode agrupar mensagens distintas; verificar deploy e conteúdo original.",15)?;
-        self.support_signal("application_error_change","SELECT f.ns,f.source AS entity,f.ref,f.eid,f.ts FROM facts f JOIN operational_hours h ON f.ns=h.ns AND f.source=h.source AND floor(f.ts/3600000)*3600000=h.hour JOIN operational_baseline base ON h.ns=base.ns AND h.source=base.source JOIN bounds b ON b.ns=h.ns WHERE h.hour>=b.cutoff AND h.total>=20 AND 1.0*h.errors/h.total>greatest(base.error_rate*3,base.error_rate+0.2) AND (f.outcome='failure' OR try_cast(f.code AS INTEGER)>=500)","source","Taxa de erro aumentou em relação ao histórico, usando todas as respostas como denominador. Verificar deploy, demanda e dependências.",25)?;
+        self.support_signal("application_error_change","SELECT f.ns,f.source AS entity,f.ref,f.eid,f.ts FROM facts f JOIN operational_hours h ON f.ns=h.ns AND f.source=h.source AND floor(f.ts/3600000)*3600000=h.hour JOIN operational_baseline base ON h.ns=base.ns AND h.source=base.source JOIN bounds b ON b.ns=h.ns WHERE h.hour>=b.cutoff AND h.total>=20 AND 1.0*h.errors/h.total>greatest(base.error_rate*3,base.error_rate+0.2) AND (f.outcome='failure' OR (json_extract_string(f.metadata,'$.product')='web' AND try_cast(f.code AS INTEGER) BETWEEN 500 AND 599))","source","Taxa de erro aumentou em relação ao histórico, usando todas as respostas como denominador. Verificar deploy, demanda e dependências.",25)?;
         self.support_signal("latency_change","SELECT f.ns,f.source AS entity,f.ref,f.eid,f.ts FROM facts f JOIN operational_hours h ON f.ns=h.ns AND f.source=h.source AND floor(f.ts/3600000)*3600000=h.hour JOIN operational_baseline base ON h.ns=base.ns AND h.source=base.source JOIN bounds b ON b.ns=h.ns WHERE h.hour>=b.cutoff AND h.total>=20 AND base.med_latency>0 AND h.latency>base.med_latency*3 AND f.latency IS NOT NULL","source","Mediana da latência horária excedeu três vezes a referência; somente unidades declaradas foram convertidas para milissegundos.",25)?;
         self.support_signal("authentication_chain","WITH windows AS (SELECT ns,actor,src,ts,outcome,count(*) FILTER(WHERE outcome='failure') OVER(PARTITION BY ns,actor,src ORDER BY ts RANGE BETWEEN 1800000 PRECEDING AND CURRENT ROW) AS failures FROM facts WHERE action='logon' AND actor<>'' AND src<>'' AND time_ok), success AS (SELECT * FROM windows WHERE outcome='success' AND failures>=10) SELECT DISTINCT f.ns,f.actor AS entity,f.ref,f.eid,f.ts FROM facts f JOIN success s ON f.ns=s.ns AND f.actor=s.actor AND f.src=s.src AND f.ts BETWEEN s.ts-1800000 AND s.ts WHERE f.action='logon' AND f.outcome IN ('failure','success')","@user","Falhas de autenticação seguidas de sucesso da mesma conta e origem. Confirma atividade; credencial obtida indevidamente ainda depende de corroboração.",45)?;
         for policy in &self.settings.telemetry {

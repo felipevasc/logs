@@ -1,0 +1,64 @@
+{
+  "synthetic": true,
+  "representative": false,
+  "held_out_origins": 8,
+  "counts": {
+    "cases": 50,
+    "eligible": 32,
+    "top_one": 32,
+    "top_three": 32,
+    "false_diagnoses": 0,
+    "abstentions": 18
+  },
+  "by_family": {
+    "authentication": {
+      "cases": 6,
+      "eligible": 6,
+      "top_one": 6,
+      "top_three": 6,
+      "false_diagnoses": 0,
+      "abstentions": 0
+    },
+    "benign_or_unknown": {
+      "cases": 18,
+      "eligible": 0,
+      "top_one": 0,
+      "top_three": 0,
+      "false_diagnoses": 0,
+      "abstentions": 18
+    },
+    "database": {
+      "cases": 9,
+      "eligible": 9,
+      "top_one": 9,
+      "top_three": 9,
+      "false_diagnoses": 0,
+      "abstentions": 0
+    },
+    "dependency": {
+      "cases": 7,
+      "eligible": 7,
+      "top_one": 7,
+      "top_three": 7,
+      "false_diagnoses": 0,
+      "abstentions": 0
+    },
+    "deployment": {
+      "cases": 1,
+      "eligible": 1,
+      "top_one": 1,
+      "top_three": 1,
+      "false_diagnoses": 0,
+      "abstentions": 0
+    },
+    "dns_tls": {
+      "cases": 9,
+      "eligible": 9,
+      "top_one": 9,
+      "top_three": 9,
+      "false_diagnoses": 0,
+      "abstentions": 0
+    }
+  },
+  "protocol_version": "diagnostics-1"
+}

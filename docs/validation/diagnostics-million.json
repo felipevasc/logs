@@ -1,0 +1,105 @@
+{
+  "rows": 1000000,
+  "contexts": 128,
+  "diagnostic_ms": 69936,
+  "rss_before_bytes": 88551424,
+  "rss_after_bytes": 106123264,
+  "process_peak_bytes": 106188800,
+  "additional_peak_bytes": 17637376,
+  "database_bytes": 701816832,
+  "report": {
+    "enabled": true,
+    "available": true,
+    "version": "diagnostics-1",
+    "total": 1000000,
+    "valid": 1000000,
+    "timed": 1000000,
+    "untimed": 0,
+    "invalid_records": 0,
+    "episodes": 1004,
+    "abstentions": 0,
+    "limited_events": 0,
+    "coverage": "valid_records; unknown time never establishes chronology",
+    "families": [
+      "database",
+      "dependency",
+      "dns_tls",
+      "deployment",
+      "authentication"
+    ],
+    "meaning": "Hipóteses verificáveis e pontuação ordinal de suporte; não são probabilidade de causa ou evidência de comprometimento.",
+    "accuracy_measured": false,
+    "memory_revision": 0,
+    "memory_error": null,
+    "learned_ranking_active": false,
+    "knowledge_revision": "d1ad9f522aa3b20647e4c34ea38cfd3577ac3430b6e1015db615483f80ac289d",
+    "knowledge_error": null,
+    "shared_ranking_active": false,
+    "shared_evaluation": {
+      "synthetic": true,
+      "representative": false,
+      "held_out_origins": 8,
+      "counts": {
+        "cases": 50,
+        "eligible": 32,
+        "top_one": 32,
+        "top_three": 32,
+        "false_diagnoses": 0,
+        "abstentions": 18
+      },
+      "by_family": {
+        "authentication": {
+          "cases": 6,
+          "eligible": 6,
+          "top_one": 6,
+          "top_three": 6,
+          "false_diagnoses": 0,
+          "abstentions": 0
+        },
+        "benign_or_unknown": {
+          "cases": 18,
+          "eligible": 0,
+          "top_one": 0,
+          "top_three": 0,
+          "false_diagnoses": 0,
+          "abstentions": 18
+        },
+        "database": {
+          "cases": 9,
+          "eligible": 9,
+          "top_one": 9,
+          "top_three": 9,
+          "false_diagnoses": 0,
+          "abstentions": 0
+        },
+        "dependency": {
+          "cases": 7,
+          "eligible": 7,
+          "top_one": 7,
+          "top_three": 7,
+          "false_diagnoses": 0,
+          "abstentions": 0
+        },
+        "deployment": {
+          "cases": 1,
+          "eligible": 1,
+          "top_one": 1,
+          "top_three": 1,
+          "false_diagnoses": 0,
+          "abstentions": 0
+        },
+        "dns_tls": {
+          "cases": 9,
+          "eligible": 9,
+          "top_one": 9,
+          "top_three": 9,
+          "false_diagnoses": 0,
+          "abstentions": 0
+        }
+      },
+      "protocol_version": "diagnostics-1"
+    }
+  },
+  "scope": "diagnostic layer over synthetic normalized facts, including SQLite population/result work; excludes original import, GUI startup and the rest of triage",
+  "build": "native debug, application debuginfo disabled"
+}

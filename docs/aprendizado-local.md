@@ -7,8 +7,14 @@ não envia logs para treinamento externo. Não é necessário rotular os registr
 
 Abra **Comprometimentos** e calcule a análise. A investigação oferece
 **Aprendizado local sem rótulos** e **Diagnósticos aprendidos**. Cada diagnóstico
-reúne os desvios do mesmo contexto em um intervalo de cinco minutos, apresenta
+reúne desvios contíguos do mesmo contexto, separados por uma pausa de mais de
+dois minutos (com duração máxima de seis horas), apresenta
 comparações entre grupos e permite abrir todos os eventos de apoio.
+
+**Diagnósticos e próximas verificações** acrescenta hipóteses baseadas em fatos,
+contrapontos, consultas e memória de resoluções. Esse fluxo também reconhece
+falhas conhecidas sem depender de uma referência de anomalias. Veja
+[diagnósticos locais](diagnosticos-locais.md).
 
 Ocorrências isoladas também ficam acessíveis, com prioridade menor e indicação
 de que falta suporte adicional. A raridade não transforma uma observação em
@@ -39,7 +45,7 @@ O núcleo independente está em `crates/log-learning`. Ele combina:
 
 - Agrupamento incremental de mensagens por tokens. O agrupamento aprende
   posições variáveis; preserva palavras que distinguem falha, sucesso, início,
-  conclusão e timeout. Não é uma implementação de Drain.
+conclusão e timeout, negações e códigos semânticos como SQLSTATE. Não é uma implementação de Drain.
 - Histogramas logarítmicos de duração e bytes, frequências de resultados e
   combinações entre família da mensagem, resultado e medidas. Valores ausentes
   permanecem ausentes; somente quantidades com unidades normalizadas entram.
@@ -57,8 +63,9 @@ Namespaces explícitos permanecem separados. Quando existe serviço identificado
 seu aprendizado continua entre arquivos rotacionados do mesmo serviço e
 operação. As comparações de diagnóstico conservam fonte, namespace, serviço,
 operação e intervalo: hosts, versões ou dependências são comparados com os demais
-grupos presentes naquele mesmo recorte. São mostrados denominadores e limites
-de Wilson; ausência de controles é declarada.
+grupos conhecidos presentes naquele mesmo recorte. Valores desconhecidos são
+contados separadamente. São mostrados denominadores, efeito e intervalos
+conservadores para comparações exploratórias; ausência de controles é declarada.
 
 Uma associação indica onde investigar. Não comprova causa, ataque ou efeito.
 Os diagnósticos aprendidos têm paginação própria, para que milhares de episódios
@@ -76,11 +83,14 @@ A atualização candidata usa apenas observações elegíveis dos primeiros 80%
 do intervalo. Os últimos 20% ficam reservados para validação, junto com exemplos
 históricos congelados. Esses exemplos históricos também ficam fora do treinamento.
 São excluídos eventos com tempo ou leitura inválidos, membros E3+, hipóteses
-prioritárias existentes e desvios apontados pelo modelo congelado. Menos de 90%
+prioritárias existentes, falhas diagnósticas conhecidas e desvios apontados pelo
+modelo congelado. Menos de 90%
 de registros válidos impede promoção automática da atualização.
 
 O candidato exige pelo menos vinte observações reservadas e não pode aumentar
-os alertas nos controles cuja referência já estava estabelecida. Essa é uma
+os alertas nos controles cuja referência já estava estabelecida nem perder tipos
+de desvio anteriormente detectados. A validação das sequências conserva o
+predecessor explícito. Essa é uma
 verificação de consistência, **não uma medição da precisão em incidentes reais**.
 Falhas frequentes no período escolhido ainda podem contaminar uma referência
 não supervisionada; conhecer a cobertura e escolher dados representativos

@@ -543,6 +543,14 @@ impl Writer {
             }
         }
     }
+    pub fn prepare_diagnostics(&self,settings:&crate::investigation::Settings)->Result<Value,String>{
+        if !settings.enabled{return Ok(json!({"enabled":false}));}
+        self.db.execute_batch("SAVEPOINT diagnostic_analysis").map_err(err)?;
+        match crate::local_diagnostics::analyze(&self.db){
+            Ok(mut report)=>{self.db.execute_batch("RELEASE diagnostic_analysis").map_err(err)?;report["repository"]=json!(settings.learning.github_repository);report["branch"]=json!(settings.learning.github_branch);Ok(report)},
+            Err(error)=>{self.db.execute_batch("ROLLBACK TO diagnostic_analysis;RELEASE diagnostic_analysis").map_err(err)?;crate::operations::check()?;crate::security_budget::check()?;Ok(json!({"enabled":true,"available":false,"error":error,"version":log_learning::DIAGNOSTIC_VERSION}))}
+        }
+    }
     fn build_investigation_queue(&self) -> Result<(), String> {
         let mut keys = self
             .db
@@ -876,6 +884,10 @@ impl Results {
         if self.metadata["complete"]!=true{return Err("A revisão exige uma análise completa".into());}
         crate::local_learning::learn_expected(&self.db.lock(),&crate::detections::load_settings().investigation.learning,signal)
     }
+    pub fn diagnostic_feedback(&self,signal:&str,document:Value)->Result<Value,String>{
+        if self.metadata["complete"]!=true{return Err("A revisão exige uma análise completa".into());}
+        crate::diagnostic_memory::record(&self.db.lock(),signal,document)
+    }
     pub fn learning_contributions(&self)->Result<Vec<log_learning::Contribution>,String>{
         if self.metadata["investigation"]["learning"]["update"]["applied"]!=true{return Err("Esta análise não promoveu uma atualização local validada".into());}
         let db=self.db.lock();
@@ -1004,6 +1016,11 @@ impl Results {
         }
         if offset > i64::MAX as usize {
             return Err("offset inválido".into());
+        }
+        if matches!(section,"diagnostics"|"diagnostic_members"|"diagnostic_query") {
+            let mut page=crate::local_diagnostics::page(&self.db.lock(),section,namespace,entity,signal,offset,limit)?;
+            page["analysis_id"]=self.metadata["analysis_id"].clone();page["section"]=json!(section);page["complete"]=self.metadata["complete"].clone();
+            return bounded(page);
         }
         if section == "proposal" {
             let proposal = self.proposal(signal.ok_or("signal_id obrigatório para a proposta")?)?;

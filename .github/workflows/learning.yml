@@ -2,7 +2,7 @@ name: Consolidate shared learning
 on:
   push:
     branches: [learning-models]
-    paths: ['models/contributions/**']
+    paths: ['models/contributions/**', 'models/diagnostic-contributions/**']
   workflow_dispatch:
 permissions:
   contents: write
@@ -25,11 +25,14 @@ jobs:
         run: |
           cargo run --manifest-path crates/log-learning/Cargo.toml --locked -- consolidate models/contributions models/shared-model.json
           cargo run --manifest-path crates/log-learning/Cargo.toml --locked -- check models/shared-model.json
+          mkdir -p models/diagnostic-contributions
+          cargo run --manifest-path crates/log-learning/Cargo.toml --locked -- diagnostic-consolidate models/diagnostic-contributions models/diagnostic-knowledge.json
+          cargo run --manifest-path crates/log-learning/Cargo.toml --locked -- diagnostic-check models/diagnostic-knowledge.json
       - name: Save the validated shared revision
         run: |
-          if git diff --quiet -- models/shared-model.json; then exit 0; fi
+          if git diff --quiet -- models/shared-model.json models/diagnostic-knowledge.json; then exit 0; fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add models/shared-model.json
+          git add models/shared-model.json models/diagnostic-knowledge.json
           git commit -m 'learning: consolidate validated aggregate contributions'
           git push origin HEAD:learning-models

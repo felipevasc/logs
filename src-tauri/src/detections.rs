@@ -2424,7 +2424,10 @@ fn run_inner(
     });
     let counts_by_level =
         std::array::from_fn(|i| detections.iter().filter(|d| d.evidence.evidence_level as usize == i + 1).count());
-    if let Some(writer)=sink.as_mut(){investigation["learning"]=writer.prepare_learning(&inputs.settings.investigation)?;}
+    if let Some(writer)=sink.as_mut(){
+        investigation["learning"]=writer.prepare_learning(&inputs.settings.investigation)?;
+        investigation["diagnostics"]=writer.prepare_diagnostics(&inputs.settings.investigation)?;
+    }
     let fingerprint = format!("{:x}", acc.fingerprint.finalize());
     let versions = serde_json::to_string(&(
         crate::evidence::POLICY_VERSION,
@@ -2437,6 +2440,9 @@ fn run_inner(
         inputs.catalog.map(|catalog| catalog.signature()),
         &investigation["learning"]["model_revision"],
         &investigation["learning"]["shared_revision"],
+        log_learning::DIAGNOSTIC_VERSION,
+        &investigation["diagnostics"]["memory_revision"],
+        &investigation["diagnostics"]["knowledge_revision"],
     ))
     .map_err(|e| e.to_string())?;
     let analysis_id = crate::evidence::stable_id("analysis", [fingerprint, versions]);

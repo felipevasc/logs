@@ -72,6 +72,10 @@ pub const MAPPABLE: &[&str] = &[
     "amount",
     "currency",
     "peer_group",
+    "error_code", "sqlstate", "exception_type", "auth_reason", "operation", "service_version", "dependency",
+    "pool_active", "pool_limit", "pool_pending", "acquire_ms", "query_ms", "query_limit_ms",
+    "dependency_ms", "dependency_limit_ms", "lock_wait_ms", "request_rate", "request_rate_baseline",
+    "retry_count", "retry_limit",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1321,7 +1325,7 @@ pub fn suspicious_command(command: &str) -> bool {
 }
 
 fn normalize_numbers(ev: &Event, mappings: &[SourceMapping], n: &mut Normalized) {
-    for (key, known) in [
+    let mut specifications = vec![
         ("bytes", vec![("network.bytes", "B")]),
         (
             "latency",
@@ -1332,7 +1336,10 @@ fn normalize_numbers(ev: &Event, mappings: &[SourceMapping], n: &mut Normalized)
             ],
         ),
         ("amount", vec![("transaction.amount", "currency")]),
-    ] {
+    ];
+    specifications.extend(log_learning::DIAGNOSTIC_METRICS.iter().map(|metric| (metric.role(), vec![])));
+    for (key, known) in specifications {
+        let metric = log_learning::DIAGNOSTIC_METRICS.iter().find(|metric| metric.role() == key);
         // Directional byte fields are intentionally not combined into a total.
         let mapped = mappings
             .iter()
@@ -1374,7 +1381,12 @@ fn normalize_numbers(ev: &Event, mappings: &[SourceMapping], n: &mut Normalized)
             ("latency", "us") => Some(0.001),
             ("latency", "ns") => Some(0.000001),
             ("amount", "currency") => Some(1.0),
-            _ => None,
+            (_, unit) => match metric.map(|m| m.unit()) {
+                Some("ms") => match unit { "s" => Some(1000.0), "ms" => Some(1.0), "us" => Some(0.001), "ns" => Some(0.000001), _ => None },
+                Some("count") if unit == "count" => Some(1.0),
+                Some("1/s") if matches!(unit, "1/s" | "rps") => Some(1.0),
+                _ => None,
+            },
         };
         let Some(multiplier) = multiplier else {
             n.limitations.push(format!(
@@ -1400,7 +1412,7 @@ fn normalize_numbers(ev: &Event, mappings: &[SourceMapping], n: &mut Normalized)
                 } else if key == "bytes" {
                     "B"
                 } else {
-                    "currency"
+                    metric.map(|m| m.unit()).unwrap_or("currency")
                 }
                 .into(),
                 method: method.into(),
@@ -1455,7 +1467,12 @@ pub fn validate_mappings(mappings: &[SourceMapping]) -> Result<(), String> {
                 "bytes" => ["B", "KiB", "MiB", "KB", "MB"].contains(&unit.as_str()),
                 "latency" => ["s", "ms", "us", "ns"].contains(&unit.as_str()),
                 "amount" => unit == "currency",
-                _ => false,
+                _ => match log_learning::DIAGNOSTIC_METRICS.iter().find(|m| m.role() == key).map(|m| m.unit()) {
+                    Some("ms") => ["s", "ms", "us", "ns"].contains(&unit.as_str()),
+                    Some("count") => unit == "count",
+                    Some("1/s") => matches!(unit.as_str(), "1/s" | "rps"),
+                    _ => false,
+                },
             };
             if !valid || !m.fields.contains_key(key) {
                 return Err("Unidade numérica exige campo mapeado e unidade compatível".into());
