@@ -933,7 +933,7 @@ fn detect_changes(
     Ok(())
 }
 fn build_incidents(db: &Connection) -> Result<u64, String> {
-    let mut statement=db.prepare("SELECT context,ns,source,CAST(ts/300000 AS INTEGER)*300000,count(*),max(surprise) FROM learning_flags GROUP BY context,CAST(ts/300000 AS INTEGER) HAVING count(*)>=3 ORDER BY context,4").map_err(error)?;
+    let mut statement=db.prepare("SELECT context,ns,source,CAST(ts/300000 AS INTEGER)*300000,count(*),max(surprise) FROM learning_flags GROUP BY context,CAST(ts/300000 AS INTEGER) ORDER BY context,4").map_err(error)?;
     let groups = statement
         .query_map([], |r| {
             Ok((
@@ -962,11 +962,24 @@ fn build_incidents(db: &Connection) -> Result<u64, String> {
             .map(|v| serde_json::from_str::<Value>(&v.map_err(error)?).map_err(error))
             .collect::<Result<Vec<_>, _>>()?;
         let contrasts = contrasts(db, &context, start, end)?;
-        let explanation=format!("{count} registros desviam da referência aprendida nesta operação e intervalo. As comparações mostram onde o desvio se concentra; confira as alternativas e os originais.");
+        let explanation=format!("Registros que desviam da referência aprendida neste contexto e intervalo: {count}. As comparações mostram onde o desvio se concentra; confira as alternativas e os originais.");
         let payload = json!({"id":id,"kind":"local_learning","namespace":ns,"column":"source","value":source,"priority":35,"first":start,"last":end,"explanation":explanation,"measurements":{"model_version":VERSION,"supporting_events":count,"maximum_surprise_bits":surprise,"deviations":deviations,"comparisons":contrasts},"evidence_level":0,"benign_alternatives":["Mudança de versão ou configuração","Variação legítima de carga ou operação","Mudança de cobertura da coleta"],"missing_evidence":["Corroboração da causa e resultado da operação"]});
+        let mut payload = payload;
+        let fields: Vec<String> = serde_json::from_str(&context).map_err(error)?;
+        payload["measurements"]["scope"] = json!({"namespace":ns,"source":source,"service":fields.get(2),"operation":fields.get(3)});
+        let priority = if count >= 3 { 35 } else { 20 };
+        payload["priority"] = json!(priority);
+        if count < 3 {
+            payload["missing_evidence"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(
+                    "Ocorrência isolada: falta suporte adicional para distinguir a hipótese."
+                ));
+        }
         db.execute(
-            "INSERT INTO learning_incidents VALUES(?1,'local_learning',?2,'source',?3,35,?4,?5,?6)",
-            params![id, ns, source, start, end, payload.to_string()],
+            "INSERT INTO learning_incidents VALUES(?1,'local_learning',?2,'source',?3,?7,?4,?5,?6)",
+            params![id, ns, source, start, end, payload.to_string(), priority],
         )
         .map_err(error)?;
         db.execute("INSERT OR IGNORE INTO investigation_members SELECT ?1,ref,eid,ts FROM learning_flags WHERE context=?2 AND ts BETWEEN ?3 AND ?4",params![id,context,start,end]).map_err(error)?;
@@ -1327,6 +1340,24 @@ mod tests {
                 learn_expected(&db, &Settings::default(), &id).unwrap()["applied"],
                 false
             );
+        });
+    }
+    #[test]
+    fn a_single_rare_event_keeps_its_original_evidence_and_declares_low_support() {
+        isolated(|| {
+            let db = fixture("rare", false, false);
+            db.execute("UPDATE investigation_facts SET payload=json_set(payload,'$.template','previously unseen message','$.latency_ms',8000) WHERE ref='rare:350'",[]).unwrap();
+            let (report, _) = analyze(&db, &Settings::default()).unwrap();
+            assert_eq!(report["unusual"], 1);
+            assert_eq!(report["incidents"], 1);
+            let priority: u64 = db
+                .query_row("SELECT priority FROM learning_incidents", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(priority, 20);
+            let reference: String = db
+                .query_row("SELECT ref FROM investigation_members", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(reference, "rare:350");
         });
     }
 }

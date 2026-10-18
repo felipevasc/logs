@@ -10,6 +10,10 @@ Abra **Comprometimentos** e calcule a análise. A investigação oferece
 reúne os desvios do mesmo contexto em um intervalo de cinco minutos, apresenta
 comparações entre grupos e permite abrir todos os eventos de apoio.
 
+Ocorrências isoladas também ficam acessíveis, com prioridade menor e indicação
+de que falta suporte adicional. A raridade não transforma uma observação em
+incidente confirmado.
+
 As opções ficam em **Regras → Análise comportamental, IOC e políticas do
 ambiente**. Aprendizado e atualização incremental são habilitados por padrão;
 ambos podem ser desativados por Caso. Navegar ou paginar um resultado não
