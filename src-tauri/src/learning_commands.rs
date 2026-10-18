@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
+    /// status, reset, rollback, accept_expected, export, import, download or publish.
     pub action: String,
     #[serde(default)]
     pub signal_id: Option<String>,

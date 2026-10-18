@@ -553,7 +553,7 @@ fn analyze_mode(
         .map_err(error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(error)?;
-    let contexts_limited = groups.len() > settings.limits.max_contexts;
+    let mut contexts_limited = groups.len() > settings.limits.max_contexts;
     let admitted_groups = groups.len().min(settings.limits.max_contexts);
     let mut bounds = BTreeMap::<String, (i64, i64)>::new();
     for (context, _, _, first, last, _) in groups.iter().take(admitted_groups) {
@@ -578,6 +578,12 @@ fn analyze_mode(
         groups.iter().take(settings.limits.max_contexts)
     {
         let key = model_key(context);
+        if !reference.contexts.contains_key(&key)
+            && reference.contexts.len() >= settings.limits.max_contexts
+        {
+            contexts_limited = true;
+            continue;
+        }
         if reference
             .contexts
             .get(&key)
@@ -744,6 +750,8 @@ fn analyze_mode(
                 .map_err(error)?;
             let is_bootstrap = training_keys.contains(&receipt);
             let eligible = can_train
+                && (candidate.contexts.contains_key(&key)
+                    || candidate.contexts.len() < settings.limits.max_contexts)
                 && (reviewed || sampled(&receipt, *observations, admitted_groups))
                 && !already
                 && !seen.contains(&receipt)

@@ -157,7 +157,7 @@ window.InvestigationUI = (() => {
               article.append(node('p', 'Depois de conferir os originais, você pode incorporar mensagens e medidas esperadas ao perfil. A revisão é opcional e outros desvios ainda podem ser apontados.', 'small muted'), learn, learnedStatus);
               const observations = [...new Set((item.measurements?.deviations || []).flat().map(row => row.detail).filter(Boolean))].slice(0, 6);
               const list = node('ul'); for (const text of observations) list.append(node('li', text)); if (observations.length) article.append(list);
-              article.append(node('p', 'As comparações usam a mesma operação e intervalo. Associação não demonstra causa.', 'small muted'));
+              article.append(node('p', 'As comparações mantêm a origem, o contexto disponível e o intervalo. Associação não demonstra causa.', 'small muted'));
               if (!comparisons.length) article.append(node('p', 'Não há grupos comparáveis suficientes para distinguir uma explicação.'));
               for (const comparison of comparisons) {
                 const row = node('div'); row.append(node('p', comparison.hypothesis), node('p', `${comparison.field}=${comparison.value}: ${comparison.unusual}/${comparison.observations} registros incomuns; outros grupos: ${comparison.comparison_unusual}/${comparison.comparison_observations}.`, 'small muted')); article.append(row);
