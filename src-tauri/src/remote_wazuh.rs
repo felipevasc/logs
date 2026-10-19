@@ -2,6 +2,8 @@
 //! through the dashboard's Dev Tools console proxy, with the
 //! scroll API, which OpenSearch 1.x-3.x (Wazuh 4.3-5.x) and Elasticsearch 7+
 //! (Wazuh 4.0-4.2 with Elastic Stack) all support, unlike their PIT APIs.
+//! Patterns over years of daily indices are read in time windows, so no scroll
+//! exceeds the indexer's limit of open scroll contexts.
 //! The agent inventory comes from the Wazuh server API (JWT), whose /agents
 //! endpoint is stable from 4.0 to 5.0; /manager/logs changed in 4.3 and is gone in 5.0.
 use crate::operations;
@@ -11,9 +13,24 @@ use crate::remote::{
 };
 use reqwest::Method;
 use serde_json::{json, Map, Value};
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::Path,
+    time::{Duration, Instant},
+};
 
-const KEEP_ALIVE: &str = "2m";
+const KEEP_ALIVE: &str = "1m";
+/// Shards one scroll may reach. Each keeps a scroll context, and the indexer refuses
+/// a search beyond search.max_open_scroll_context (500 per node by default), which
+/// Wazuh's daily indices pass within a couple of years.
+const SHARD_BUDGET: u64 = 100;
+/// Contexts left open by a user who may not clear scrolls. They expire KEEP_ALIVE
+/// after their last use, once the indexer's reaper runs (every minute).
+const LINGER_BUDGET: u64 = 300;
+const LINGER: Duration = Duration::from_secs(125);
+const MINUTE_MS: i64 = 60_000;
+const DAY_MS: i64 = 86_400_000;
+const MAX_WINDOW_MS: i64 = 50 * 366 * DAY_MS;
 
 /// Index families written by Wazuh 4.x and 5.x, probed by the access test.
 struct Family {
@@ -83,9 +100,13 @@ struct Scroll<'a> {
 }
 impl<'a> Scroll<'a> {
     fn start(remote: &'a RemoteClient, body: &Value) -> Result<(Self, Value), String> {
+        // Skipped shards open no context, and a start failing on any shard releases the rest.
         let data = remote.request(
             Method::POST,
-            &format!("/{}/_search?scroll={KEEP_ALIVE}", remote.connection.index),
+            &format!(
+                "/{}/_search?scroll={KEEP_ALIVE}&pre_filter_shard_size=1&allow_partial_search_results=false",
+                remote.connection.index
+            ),
             Some(body),
             false,
         )?;
@@ -116,25 +137,153 @@ impl<'a> Scroll<'a> {
         self.update(&data);
         Ok(data)
     }
-    fn close(&mut self) -> Result<(), String> {
+    /// False when the user may not clear scrolls: the contexts then expire on their own.
+    fn close(&mut self) -> Result<bool, String> {
         let Some(id) = self.id.take() else {
-            return Ok(());
+            return Ok(true);
         };
-        let response = self.remote.request(
+        match self.remote.send(
             Method::DELETE,
             "/_search/scroll",
             Some(&json!({"scroll_id": [id]})),
             true,
-        )?;
-        if response.get("succeeded").and_then(Value::as_bool) != Some(true) {
-            return Err("O Wazuh indexer não confirmou o fechamento do scroll.".into());
+        ) {
+            // Read-only roles often lack indices:data/read/scroll/clear.
+            Err(Failure::Status(403)) => Ok(false),
+            Err(failure) => Err(failure.message(&self.remote.connection)),
+            Ok(response) if response.get("succeeded").and_then(Value::as_bool) == Some(true) => Ok(true),
+            Ok(_) => Err("O Wazuh indexer não confirmou o fechamento do scroll.".into()),
         }
-        Ok(())
     }
 }
 impl Drop for Scroll<'_> {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+/// Shards a query reaches once the indexer skips those that cannot match it,
+/// with the size-0 search response.
+fn reach(remote: &RemoteClient, query: &Value, count: bool) -> Result<(u64, Value), String> {
+    let data = remote.request(
+        Method::POST,
+        &format!("/{}/_search?pre_filter_shard_size=1", remote.connection.index),
+        Some(&json!({"size": 0, "track_total_hits": count, "query": query})),
+        false,
+    )?;
+    ensure_complete(&data)?;
+    let shards = |key: &str| data.pointer(&format!("/_shards/{key}")).and_then(Value::as_u64).unwrap_or(0);
+    let reached = shards("total").saturating_sub(shards("skipped"));
+    Ok((reached, data))
+}
+
+/// Reads a query newest first in time windows that each reach at most SHARD_BUDGET
+/// shards; a query within the budget is a single window.
+struct Plan<'a> {
+    remote: &'a RemoteClient,
+    query: Value,
+    total: Option<u64>,
+    relation: String,
+    /// Shards the whole query reaches.
+    shards: u64,
+    /// Shards reached below `upper`, when already known.
+    rest: Option<u64>,
+    /// Exclusive end of the next window; the first window is open-ended.
+    upper: Option<i64>,
+    anchor: i64,
+    width: i64,
+    done: bool,
+}
+impl<'a> Plan<'a> {
+    fn new(remote: &'a RemoteClient, query: Value, to: Option<&str>) -> Result<Self, String> {
+        let (shards, data) = reach(remote, &query, true)?;
+        let (total, relation) = hits_total(&data);
+        let now = chrono::Utc::now().timestamp_millis();
+        let to = to
+            .and_then(|to| chrono::DateTime::parse_from_rfc3339(to).ok())
+            .map(|to| to.timestamp_millis());
+        Ok(Self {
+            remote,
+            query,
+            total,
+            relation,
+            shards,
+            rest: Some(shards),
+            upper: None,
+            anchor: to.map_or(now, |to| to.min(now)),
+            width: DAY_MS,
+            done: false,
+        })
+    }
+    fn windowed(&self) -> bool {
+        self.shards > SHARD_BUDGET
+    }
+    fn window(&self, lower: Option<i64>) -> Value {
+        let mut range = Map::new();
+        range.extend(lower.map(|lower| ("gte".to_owned(), json!(lower))));
+        range.extend(self.upper.map(|upper| ("lt".to_owned(), json!(upper))));
+        if range.is_empty() {
+            return self.query.clone();
+        }
+        range.insert("format".into(), json!("epoch_millis"));
+        json!({"bool": {"filter": [self.query, {"range": {self.remote.connection.time_field.clone(): range}}]}})
+    }
+    /// The next window, newest first, and the shards it reaches.
+    fn next(&mut self) -> Result<Option<(Value, u64)>, String> {
+        if self.done {
+            return Ok(None);
+        }
+        let remote = self.remote;
+        let c = &remote.connection;
+        let rest = self.window(None);
+        let reached = match self.rest.take() {
+            Some(reached) => reached,
+            None => reach(remote, &rest, false)?.0,
+        };
+        if reached <= SHARD_BUDGET {
+            self.done = true;
+            return Ok(Some((rest, reached)));
+        }
+        if c.time_field.is_empty() {
+            return Err(format!("{} abrange {} shards, acima dos {SHARD_BUDGET} que uma leitura pode abrir no indexer. Informe o campo de data/hora para ler em janelas de tempo, ou um índice mais específico.", c.index, thousands(reached)));
+        }
+        loop {
+            operations::check()?;
+            let lower = self.anchor.saturating_sub(self.width);
+            let window = self.window(Some(lower));
+            let (shards, _) = reach(remote, &window, false)?;
+            if shards <= SHARD_BUDGET {
+                (self.upper, self.anchor) = (Some(lower), lower);
+                if shards * 2 <= SHARD_BUDGET {
+                    self.width = (self.width * 2).min(MAX_WINDOW_MS);
+                }
+                return Ok(Some((window, shards)));
+            }
+            if self.width <= MINUTE_MS {
+                return Err(format!("Um minuto de {} abrange {} shards, acima dos {SHARD_BUDGET} que uma leitura pode abrir no indexer: os índices não são divididos por período. Use um índice mais específico.", c.index, thousands(shards)));
+            }
+            self.width = (self.width / 2).max(MINUTE_MS);
+        }
+    }
+}
+
+/// Scroll contexts a user who may not clear them leaves open until they expire.
+#[derive(Default)]
+struct Lingering(Vec<(Instant, u64)>);
+impl Lingering {
+    fn add(&mut self, shards: u64) {
+        self.0.push((Instant::now(), shards));
+    }
+    /// Waits until a scroll over `shards` keeps the open contexts within budget.
+    fn admit(&mut self, shards: u64) -> Result<(), String> {
+        loop {
+            self.0.retain(|(at, _)| at.elapsed() < LINGER);
+            if self.0.iter().map(|(_, n)| n).sum::<u64>() + shards <= LINGER_BUDGET {
+                return Ok(());
+            }
+            operations::check()?;
+            crate::global_scheduler::unreserved_io(|| std::thread::sleep(Duration::from_millis(250)));
+        }
     }
 }
 
@@ -221,14 +370,16 @@ fn probe(remote: &RemoteClient) -> Result<Vec<(&'static Family, Presence)>, Stri
 pub(crate) fn indexer_test(remote: &RemoteClient) -> Result<TestResult, String> {
     let c = &remote.connection;
     let engine = engine(remote)?;
-    // The same read path as the import, including the scroll permissions.
-    let body = json!({"size": 1, "track_total_hits": true, "sort": sort(c), "query": query(c, None, None)?, "_source": true});
+    // The same read path as the import, scroll permissions included, on its newest window.
+    let mut plan = Plan::new(remote, query(c, None, None)?, None)?;
+    let (window, _) = plan.next()?.ok_or("Nenhuma janela de leitura disponível no Wazuh indexer.")?;
+    let body = json!({"size": 1, "track_total_hits": false, "sort": sort(c), "query": window, "_source": true});
     let (mut scroll, data) = Scroll::start(remote, &body)?;
     ensure_complete(&data)?;
     if data.pointer("/hits/hits").and_then(Value::as_array).is_none() {
         return Err("A resposta de busca não é compatível com o Wazuh indexer.".into());
     }
-    let (total, relation) = hits_total(&data);
+    let (total, relation) = (plan.total, plan.relation.as_str());
     operations::check()?;
     scroll.close()?;
     let found = probe(remote)?;
@@ -244,6 +395,9 @@ pub(crate) fn indexer_test(remote: &RemoteClient) -> Result<TestResult, String> 
             generations.extend(family_of(&c.index).and_then(|family| family.generation));
         }
         None => message.push_str(&format!("Leitura de {} por scroll confirmada.", c.index)),
+    }
+    if plan.windowed() {
+        message.push_str(&format!(" O padrão abrange {} shards: a importação lê janelas de tempo, das mais recentes às mais antigas, com até {SHARD_BUDGET} shards por vez.", thousands(plan.shards)));
     }
     let available: Vec<String> = found
         .iter()
@@ -292,51 +446,76 @@ pub(crate) fn indexer_import(
     let query = query(c, from.as_deref(), to.as_deref())?;
     let mut snapshot = Snapshot::create(root)?;
     let size = BATCH_SIZE.min(c.max_records);
-    let body = json!({"size": size, "track_total_hits": true, "sort": sort(c), "query": query, "_source": true});
-    let (mut scroll, mut data) = Scroll::start(remote, &body)?;
-    let (total, total_relation) = hits_total(&data);
-    let exact = total.filter(|_| total_relation == "eq");
-    let mut complete = false;
-    loop {
-        ensure_complete(&data)?;
-        operations::check()?;
-        let hits = data
-            .pointer("/hits/hits")
-            .and_then(Value::as_array)
-            .ok_or("A resposta não contém uma lista de registros do Wazuh indexer.")?;
-        if hits.len() > size {
-            return Err("O serviço ignorou o limite de paginação; a importação foi interrompida.".into());
-        }
-        for hit in hits.iter().take(c.max_records - snapshot.count) {
+    let mut plan = Plan::new(remote, query, to.as_deref())?;
+    let (total, total_relation) = (plan.total, plan.relation.clone());
+    let expected = total.and_then(|n| usize::try_from(n).ok()).unwrap_or(c.max_records);
+    let mut lingering = Lingering::default();
+    let mut warnings = Vec::new();
+    let mut limited = false;
+    while let Some((window, shards)) = plan.next()? {
+        lingering.admit(shards)?;
+        let body = json!({"size": size, "track_total_hits": true, "sort": sort(c), "query": window, "_source": true});
+        let (mut scroll, mut data) = Scroll::start(remote, &body)?;
+        // Each window is checked against its own total: late alerts may join older windows.
+        let (window_total, relation) = hits_total(&data);
+        let exact = window_total.filter(|_| relation == "eq");
+        let mut received = 0u64;
+        loop {
+            ensure_complete(&data)?;
             operations::check()?;
-            snapshot.write_hit(hit, &c.name)?;
+            let hits = data
+                .pointer("/hits/hits")
+                .and_then(Value::as_array)
+                .ok_or("A resposta não contém uma lista de registros do Wazuh indexer.")?;
+            if hits.len() > size {
+                return Err("O serviço ignorou o limite de paginação; a importação foi interrompida.".into());
+            }
+            received += hits.len() as u64;
+            for hit in hits.iter().take(c.max_records - snapshot.count) {
+                operations::check()?;
+                snapshot.write_hit(hit, &c.name)?;
+            }
+            progress(snapshot.count, expected);
+            if exact.is_some_and(|n| received > n) || hits.is_empty() && exact.is_some_and(|n| received < n) {
+                return Err("A paginação retornou uma quantidade inconsistente de registros; nenhum snapshot foi publicado.".into());
+            }
+            if hits.is_empty() || exact.is_some_and(|n| received >= n) {
+                break;
+            }
+            if snapshot.count >= c.max_records {
+                limited = true;
+                break;
+            }
+            data = scroll.next()?;
         }
-        let count = snapshot.count as u64;
-        progress(
-            snapshot.count,
-            total
-                .and_then(|n| usize::try_from(n).ok())
-                .unwrap_or(c.max_records),
-        );
-        if exact.is_some_and(|n| count > n) || hits.is_empty() && exact.is_some_and(|n| count < n) {
-            return Err("A paginação retornou uma quantidade inconsistente de registros; nenhum snapshot foi publicado.".into());
+        operations::check()?;
+        match scroll.close() {
+            Ok(true) => {}
+            Ok(false) => lingering.add(shards),
+            Err(error) => {
+                lingering.add(shards);
+                warnings.push(format!("Não foi possível fechar um scroll: {error} Ele expira em até 1 minuto sem uso."));
+            }
         }
-        if hits.is_empty() || exact.is_some_and(|n| count >= n) {
-            complete = true;
+        if limited {
             break;
         }
         if snapshot.count >= c.max_records {
+            // Older windows may still hold records, unless the total says otherwise.
+            limited = !plan.done && total.filter(|_| total_relation == "eq").is_none_or(|n| (snapshot.count as u64) < n);
             break;
         }
-        data = scroll.next()?;
     }
     operations::check()?;
-    let mut warnings = Vec::new();
-    if let Err(error) = scroll.close() {
-        warnings.push(format!("Snapshot concluído, mas não foi possível fechar o scroll: {error} Ele expira em até 2 minutos sem uso."));
+    if plan.windowed() && !limited && from.is_none() && to.is_none() {
+        // Windows select by time, so records without it were never read.
+        let missing = json!({"bool": {"filter": [plan.query], "must_not": [{"exists": {"field": c.time_field}}]}});
+        if let (Some(n @ 1..), _) = hits_total(&reach(remote, &missing, true)?.1) {
+            warnings.push(format!("{} registros sem o campo {} ficaram fora da leitura por janelas de tempo; consulte-os com um índice mais específico.", thousands(n), c.time_field));
+        }
     }
     warnings.extend(snapshot.collision_warning());
-    if !complete && c.time_field.is_empty() {
+    if limited && c.time_field.is_empty() {
         warnings.push("O limite foi atingido sem campo de horário: o recorte segue a ordem interna dos índices, não os registros mais recentes.".into());
     }
     let count = snapshot.count;
@@ -351,7 +530,7 @@ pub(crate) fn indexer_import(
         count,
         total,
         total_relation,
-        limited: !complete,
+        limited,
         bytes,
         metadata_field: METADATA_FIELD.into(),
         warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
@@ -524,6 +703,15 @@ mod tests {
     fn count(total: usize) -> Value {
         json!({"timed_out":false,"_shards":{"failed":0},"hits":{"total":{"value":total,"relation":"eq"},"hits":[]}})
     }
+    /// A size-0 pre-filtered search: `shards - skipped` shards would open scroll contexts.
+    fn preflight(total: usize, shards: u64, skipped: u64) -> Reply {
+        ok(json!({"timed_out":false,"_shards":{"total":shards,"successful":shards,"skipped":skipped,"failed":0},"hits":{"total":{"value":total,"relation":"eq"},"hits":[]}}))
+    }
+    const PREFLIGHT: &str = "/wazuh-alerts-*/_search?pre_filter_shard_size=1";
+    const SCROLL: &str = "/wazuh-alerts-*/_search?scroll=1m&pre_filter_shard_size=1&allow_partial_search_results=false";
+    fn range(request: &crate::remote::tests::Request) -> &Value {
+        &request.body["query"]["bool"]["filter"][1]["range"]["timestamp"]
+    }
     fn status(code: u16) -> Reply {
         Reply { status: code, headers: vec![], body: json!({"error":"never echoed"}) }
     }
@@ -535,7 +723,7 @@ mod tests {
     #[test]
     fn indexer_scroll_contract_limits_and_cleanup() {
         let root = Folder::new();
-        let server = Server::new(vec![ok(alerts(0, 500, 502, "s1")), ok(alerts(500, 2, 502, "s2")), ok(json!({"succeeded":true,"num_freed":1}))]);
+        let server = Server::new(vec![preflight(502, 9, 6), ok(alerts(0, 500, 502, "s1")), ok(alerts(500, 2, 502, "s2")), ok(json!({"succeeded":true,"num_freed":1}))]);
         let result = indexer_import(&indexer(&server.url), &root.0, Some("2026-10-01T00:00:00Z".into()), None, |_, _| {}).unwrap();
         assert_eq!((result.count, result.total, result.limited), (502, Some(502), false));
         assert_eq!(result.order, "timestamp decrescente; valores sem horário ao final");
@@ -545,31 +733,35 @@ mod tests {
         assert_eq!(first["rule"]["id"], "5710");
         assert_eq!(first["_loginsight_remote"]["_index"], "wazuh-alerts-4.x-2026.10.08");
         let requests = server.finish();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(requests[0].path, "/wazuh-alerts-*/_search?scroll=2m");
-        assert_eq!(requests[0].body["size"], 500);
-        assert_eq!(requests[0].body["track_total_hits"], true);
-        assert_eq!(requests[0].body["sort"][0]["timestamp"]["order"], "desc");
-        assert_eq!(requests[0].body["query"]["bool"]["filter"][1]["range"]["timestamp"]["gte"], "2026-10-01T00:00:00Z");
-        assert_eq!((requests[1].path.as_str(), &requests[1].body["scroll_id"]), ("/_search/scroll", &json!("s1")));
-        assert_eq!((requests[2].method.as_str(), &requests[2].body["scroll_id"]), ("DELETE", &json!(["s2"])));
+        assert_eq!(requests.len(), 4);
+        // The shards a scroll would open are counted first, with the total.
+        assert_eq!((requests[0].path.as_str(), &requests[0].body["size"], &requests[0].body["track_total_hits"]), (PREFLIGHT, &json!(0), &json!(true)));
+        assert_eq!(requests[1].path, SCROLL);
+        assert_eq!(requests[1].body["size"], 500);
+        assert_eq!(requests[1].body["track_total_hits"], true);
+        assert_eq!(requests[1].body["sort"][0]["timestamp"]["order"], "desc");
+        // Within the budget the query is read as is, in one scroll.
+        assert_eq!(requests[1].body["query"], requests[0].body["query"]);
+        assert_eq!(range(&requests[1])["gte"], "2026-10-01T00:00:00Z");
+        assert_eq!((requests[2].path.as_str(), &requests[2].body["scroll_id"]), ("/_search/scroll", &json!("s1")));
+        assert_eq!((requests[3].method.as_str(), &requests[3].body["scroll_id"]), ("DELETE", &json!(["s2"])));
         assert!(requests.iter().all(|r| r.headers.get("authorization").map(String::as_str) == Some(BASIC)));
 
         // A page larger than the remaining budget is truncated and reported as limited.
         let limited = Folder::new();
-        let server = Server::new(vec![ok(alerts(0, 500, 2000, "a")), ok(alerts(500, 500, 2000, "b")), ok(json!({"succeeded":true}))]);
+        let server = Server::new(vec![preflight(2000, 3, 0), ok(alerts(0, 500, 2000, "a")), ok(alerts(500, 500, 2000, "b")), ok(json!({"succeeded":true}))]);
         let mut remote = indexer(&server.url);
         remote.connection.max_records = 700;
         let result = indexer_import(&remote, &limited.0, None, None, |_, _| {}).unwrap();
         assert_eq!((result.count, result.limited), (700, true));
         assert_eq!(fs::read_to_string(&result.path).unwrap().lines().count(), 700);
-        assert_eq!(server.finish()[2].body["scroll_id"], json!(["b"]));
+        assert_eq!(server.finish()[3].body["scroll_id"], json!(["b"]));
 
         // Partial shard results publish nothing and still release the latest cursor.
         let failed = Folder::new();
         let mut partial = alerts(500, 1, 600, "p2");
         partial["_shards"]["failed"] = json!(1);
-        let server = Server::new(vec![ok(alerts(0, 500, 600, "p1")), ok(partial), ok(json!({"succeeded":true}))]);
+        let server = Server::new(vec![preflight(600, 3, 0), ok(alerts(0, 500, 600, "p1")), ok(partial), ok(json!({"succeeded":true}))]);
         let error = indexer_import(&indexer(&server.url), &failed.0, None, None, |_, _| {}).err().unwrap();
         assert!(error.contains("parciais"));
         assert_eq!(snapshot_count(&failed.0), 0);
@@ -577,13 +769,88 @@ mod tests {
 
         // Without a time field the scroll uses index order and says so when limited.
         let unordered = Folder::new();
-        let server = Server::new(vec![ok(alerts(0, 2, 9, "u")), ok(json!({"succeeded":true}))]);
+        let server = Server::new(vec![preflight(9, 3, 0), ok(alerts(0, 2, 9, "u")), ok(json!({"succeeded":true}))]);
         let mut remote = indexer(&server.url);
         remote.connection.time_field.clear();
         remote.connection.max_records = 2;
         let result = indexer_import(&remote, &unordered.0, None, None, |_, _| {}).unwrap();
         assert!(result.limited && result.warning.unwrap().contains("ordem interna"));
-        assert_eq!(server.finish()[0].body["sort"], json!(["_doc"]));
+        assert_eq!(server.finish()[1].body["sort"], json!(["_doc"]));
+    }
+
+    #[test]
+    fn many_shards_are_read_in_newest_first_time_windows() {
+        // 1,971 daily shards exceed the 500 scroll contexts a node allows, and this
+        // read-only role may not clear scrolls (403), which is not an error.
+        let root = Folder::new();
+        let server = Server::new(vec![
+            preflight(5, 1971, 0),
+            preflight(0, 1971, 1965),
+            ok(alerts(0, 2, 2, "w1")),
+            status(403),
+            preflight(0, 1971, 6),
+            preflight(0, 1971, 1800),
+            preflight(0, 1971, 1965),
+            ok(alerts(2, 3, 3, "w2")),
+            status(403),
+            preflight(0, 1971, 1971),
+            ok(alerts(5, 0, 0, "w3")),
+            status(403),
+            preflight(3, 1971, 0),
+        ]);
+        let result = indexer_import(&indexer(&server.url), &root.0, None, None, |_, _| {}).unwrap();
+        assert_eq!((result.count, result.total, result.limited), (5, Some(5), false));
+        let warning = result.warning.unwrap();
+        assert!(warning.contains("3 registros sem o campo timestamp") && !warning.contains("fechar"), "{warning}");
+        let text = fs::read_to_string(&result.path).unwrap();
+        let ids: Vec<Value> = text.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()["_loginsight_remote"]["_id"].clone()).collect();
+        assert_eq!(ids, ["0", "1", "2", "3", "4"]);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 13);
+        let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, [PREFLIGHT, PREFLIGHT, SCROLL, "/_search/scroll", PREFLIGHT, PREFLIGHT, PREFLIGHT, SCROLL, "/_search/scroll", PREFLIGHT, SCROLL, "/_search/scroll", PREFLIGHT]);
+        // The newest window is open above, so alerts dated ahead of this clock are kept.
+        let newest = range(&requests[1]);
+        let first_lower = newest["gte"].as_i64().unwrap();
+        assert!(newest.get("lt").is_none() && newest["format"] == "epoch_millis");
+        assert_eq!(requests[2].body["query"], requests[1].body["query"]);
+        assert_eq!(requests[2].body["sort"][0]["timestamp"]["order"], "desc");
+        // What remains below is checked before each window; a window too wide is halved.
+        assert_eq!((range(&requests[4]).get("gte"), &range(&requests[4])["lt"]), (None, &json!(first_lower)));
+        assert_eq!(range(&requests[5])["gte"].as_i64().unwrap(), first_lower - 2 * DAY_MS);
+        assert_eq!(range(&requests[6])["gte"].as_i64().unwrap(), first_lower - DAY_MS);
+        assert_eq!(range(&requests[6])["lt"], json!(first_lower));
+        assert_eq!(requests[7].body["query"], requests[6].body["query"]);
+        // The oldest part fits in one last window, and records without time are counted.
+        assert_eq!((range(&requests[9]).get("gte"), &range(&requests[9])["lt"]), (None, &json!(first_lower - DAY_MS)));
+        assert_eq!(requests[10].body["query"], requests[9].body["query"]);
+        assert_eq!(requests[12].body["query"]["bool"]["must_not"][0]["exists"]["field"], "timestamp");
+
+        // Without a time field there are no windows to narrow the read.
+        let server = Server::new(vec![preflight(5, 1971, 0)]);
+        let mut remote = indexer(&server.url);
+        remote.connection.time_field.clear();
+        let error = indexer_import(&remote, &Folder::new().0, None, None, |_, _| {}).err().unwrap();
+        assert!(error.contains("1.971 shards") && error.contains("campo de data/hora"), "{error}");
+        server.finish();
+
+        // The test reads the newest window and explains the windowed import.
+        let server = Server::new(vec![
+            status(403),
+            preflight(586_712_278, 1971, 0),
+            preflight(0, 1971, 1965),
+            ok(alerts(0, 1, 1, "t")),
+            status(403),
+            ok(count(0)),
+            ok(count(0)),
+            ok(count(0)),
+            ok(count(0)),
+        ]);
+        let message = indexer_test(&indexer(&server.url)).unwrap().message;
+        assert!(message.contains("586.712.278 registros") && message.contains("1.971 shards") && message.contains("janelas de tempo"), "{message}");
+        let requests = server.finish();
+        assert_eq!((requests[3].path.as_str(), &requests[3].body["size"]), (SCROLL, &json!(1)));
+        assert!(range(&requests[3]).get("gte").is_some());
     }
 
     #[test]
@@ -591,6 +858,7 @@ mod tests {
         let server = Server::new(vec![
             ok(json!({"name":"node-1","version":{"number":"7.10.2","build_type":"rpm"},"tagline":"The OpenSearch Project: https://opensearch.org/"})),
             ok(json!({"nodes":{"abc":{"version":"2.19.5"}}})),
+            preflight(1_234_567, 30, 0),
             ok(alerts(0, 1, 1_234_567, "t1")),
             ok(json!({"succeeded":true})),
             ok(count(42)),
@@ -602,14 +870,17 @@ mod tests {
         for expected in ["OpenSearch 2.19.5", "wazuh-alerts-*: 1.234.567 registros", "eventos arquivados em wazuh-archives-* (42)", "Sem permissão de leitura: wazuh-states-vulnerabilities*", "Índices de Wazuh 4.x."] {
             assert!(message.contains(expected), "{expected} in {message}");
         }
+        assert!(!message.contains("janelas"), "{message}");
         let requests = server.finish();
         assert_eq!(requests[1].path, "/_nodes/_local?filter_path=nodes.*.version");
-        assert_eq!(requests[2].body["size"], 1);
-        assert_eq!(requests[4].path, "/wazuh-archives-*/_search");
+        assert_eq!((requests[2].path.as_str(), requests[3].path.as_str()), (PREFLIGHT, SCROLL));
+        assert_eq!(requests[3].body["size"], 1);
+        assert_eq!(requests[5].path, "/wazuh-archives-*/_search");
 
         // A role without cluster monitoring still tests reads; 5.x data is suggested.
         let server = Server::new(vec![
             status(403),
+            preflight(0, 3, 0),
             ok(alerts(0, 0, 0, "z")),
             ok(json!({"succeeded":true})),
             ok(count(0)),
@@ -631,7 +902,7 @@ mod tests {
     #[test]
     fn dashboard_reads_the_indexer_through_the_console_proxy() {
         let root = Folder::new();
-        let server = Server::new(vec![ok(alerts(0, 2, 2, "w1")), ok(json!({"succeeded":true}))]);
+        let server = Server::new(vec![preflight(2, 3, 0), ok(alerts(0, 2, 2, "w1")), ok(json!({"succeeded":true}))]);
         let mut c = config(&format!("{}/wazuh", server.url));
         c.kind = RemoteKind::WazuhWeb;
         c.index = "wazuh-alerts-*".into();
@@ -640,8 +911,8 @@ mod tests {
         let result = indexer_import(&remote, &root.0, None, None, |_, _| {}).unwrap();
         assert_eq!((result.count, result.limited), (2, false));
         let requests = server.finish();
-        assert_eq!(requests.len(), 2);
-        for (request, (path, method)) in requests.iter().zip([("wazuh-alerts-*/_search?scroll=2m", "POST"), ("_search/scroll", "DELETE")]) {
+        assert_eq!(requests.len(), 3);
+        for (request, (path, method)) in requests.iter().zip([(&PREFLIGHT[1..], "POST"), (&SCROLL[1..], "POST"), ("_search/scroll", "DELETE")]) {
             let url = reqwest::Url::parse(&format!("http://fixture{}", request.path)).unwrap();
             assert_eq!(url.path(), "/wazuh/api/console/proxy");
             let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
@@ -650,7 +921,7 @@ mod tests {
             assert_eq!(request.headers["osd-xsrf"], "true");
             assert_eq!(request.headers["authorization"], BASIC);
         }
-        assert_eq!(requests[1].body["scroll_id"], json!(["w1"]));
+        assert_eq!(requests[2].body["scroll_id"], json!(["w1"]));
 
         // The dashboard returns the indexer status as is.
         let server = Server::new(vec![status(401)]);

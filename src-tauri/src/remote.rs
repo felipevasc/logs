@@ -532,6 +532,7 @@ fn status_message(kind: &RemoteKind, status: u16) -> &'static str {
         (RemoteKind::WazuhWeb, 403) => "Acesso negado (403). A conta do painel precisa ler os índices wazuh-* e usar o console de Dev Tools (permissões read e scroll).",
         (RemoteKind::WazuhWeb, 404) => "Índice ou console não encontrado (404). Use o endereço base do painel Wazuh e confirme o índice; o Dev Tools do painel precisa estar habilitado.",
         (RemoteKind::WazuhWeb, 400) => "O painel Wazuh recusou a consulta (400). Confira o índice, o filtro e se o endereço é o do painel.",
+        (RemoteKind::Wazuh | RemoteKind::WazuhWeb, 429) => "O Wazuh indexer recusou a leitura por excesso de buscas abertas (429), como o limite de contextos de scroll. Aguarde alguns minutos ou restrinja o período e o índice.",
         (RemoteKind::WazuhApi, 401) => "Autenticação recusada pela API do servidor Wazuh (401). Revise usuário e senha ou gere um novo token.",
         (RemoteKind::WazuhApi, 403) => "Acesso negado (403). O usuário da API precisa da permissão RBAC agent:read.",
         (RemoteKind::WazuhApi, 404) => "Endpoint não encontrado (404). Informe a URL da API do servidor Wazuh 4.x ou 5.x, por exemplo https://servidor:55000.",

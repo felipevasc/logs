@@ -46,10 +46,14 @@ Endereço `https://servidor:9200`. Use usuário e senha de uma conta do indexer,
 
 Também é possível informar outro índice ou padrão. Período, Query DSL e máximo de registros funcionam como no Elasticsearch. A leitura usa a API de *scroll*, presente em todas as gerações: Elasticsearch 7+ (Wazuh 4.0–4.2 com Elastic Stack), OpenSearch 1.2–2.19 (Wazuh indexer 4.3–4.14) e OpenSearch 3.x (Wazuh 5.0). As APIs de PIT diferem entre Elasticsearch e OpenSearch e não existem antes do OpenSearch 2.4. Elasticsearch 6 ou anterior (Wazuh 3.x) é recusado.
 
+Cada shard lido mantém um contexto de scroll, e o indexer recusa uma leitura acima de `search.max_open_scroll_context` (500 por nó por padrão). Os índices diários do Wazuh passam desse número em poucos anos: um padrão como `wazuh-alerts-*` pode abranger milhares de shards. Antes de abrir o scroll, o aplicativo conta os shards que a consulta alcança, com uma busca sem resultados (`size: 0`, `pre_filter_shard_size=1`) que não abre contextos. Até 100 shards, a leitura é única. Acima disso, a importação lê janelas de tempo, das mais recentes às mais antigas, cada uma com até 100 shards; o indexer pula os shards fora da janela. A ordem final continua do mais recente ao mais antigo, e o limite de registros para na janela em que é atingido. Sem campo de horário não há janelas, e o aplicativo pede um campo de horário ou um índice mais específico. Registros sem o campo de horário ficam fora das janelas e são contados no aviso da importação.
+
+Contas de leitura costumam não ter `indices:data/read/scroll/clear`. Sem essa permissão o scroll não é fechado e expira sozinho em cerca de 1 a 2 minutos; o aplicativo não trata isso como erro e espera esses contextos expirarem antes de abrir mais de 300 deles.
+
 O teste de acesso informa:
 
 - a versão real do indexer: o Wazuh 4.x responde `7.10.2` na raiz por compatibilidade com o Filebeat, então a versão vem das informações do nó quando a conta tem permissão;
-- quantos registros o índice escolhido tem e se o scroll funcionou;
+- quantos registros o índice escolhido tem e se o scroll funcionou, na janela mais recente quando a leitura é feita por janelas de tempo;
 - outros conjuntos Wazuh com dados e os que a conta não pode ler;
 - a geração detectada pelos índices (Wazuh 4.x ou 5.x).
 
@@ -90,9 +94,9 @@ As verificações locais cobrem validação de caminhos, preservação binária 
 
 O conector Wazuh foi verificado com servidores HTTP locais que reproduzem:
 
-- no indexer: raiz OpenSearch mascarada, versão do nó, scroll paginado e limitado, shards parciais com descarte do snapshot, fechamento do cursor, contas sem permissão de monitoramento e índices 5.x;
+- no indexer: raiz OpenSearch mascarada, versão do nó, scroll paginado e limitado, shards parciais com descarte do snapshot, fechamento do cursor, contas sem permissão de monitoramento ou de fechar scrolls, leitura por janelas de tempo com 1.971 shards e índices 5.x;
 - na API do servidor: o recurso de `GET` após 405, a renovação do JWT, a deduplicação de agentes, o bloqueio de versões 3.x e as respostas com falha parcial. Os endpoints foram conferidos nas especificações OpenAPI das versões 4.0.0, 4.3.0, 4.14.8 e 5.0.0-rc1.
 
-Os nomes e campos dos índices vêm dos modelos do Wazuh 4.14.8 e do `wazuh-indexer-plugins` 5.0.0-rc1. A 5.0 ainda era pré-lançamento em outubro de 2026. Não foi usado um Wazuh real.
+Os nomes e campos dos índices vêm dos modelos do Wazuh 4.14.8 e do `wazuh-indexer-plugins` 5.0.0-rc1. A 5.0 ainda era pré-lançamento em outubro de 2026. Em outubro de 2026, as requisições de pré-contagem e de scroll por janela foram conferidas no painel de um Wazuh 4.14.5 (OpenSearch 2.19.5) com 1.971 shards em `wazuh-alerts-*`, onde o scroll sem janela era recusado com 429 e a conta de leitura não podia fechar scrolls.
 
 Referências: [OpenSSH](https://man.openbsd.org/ssh), [verificação de host](https://man.openbsd.org/OpenBSD-current/man/ssh_config) e [cópia por PowerShell remoting](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/copy-item?view=powershell-7.6).
