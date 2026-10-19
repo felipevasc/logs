@@ -227,6 +227,12 @@ fn validate(mut c: RemoteConfig) -> Result<RemoteConfig, String> {
     if !(1..=MAX_RECORDS).contains(&c.max_records) {
         return Err("O limite deve estar entre 1 e 5.000.000 registros.".into());
     }
+    // A text filter, such as `rule.level >= 10 and agent.name: web*`, becomes Query DSL here.
+    if let Some(text) = c.query.as_ref().and_then(Value::as_str).map(str::to_owned) {
+        c.query = (!text.trim().is_empty())
+            .then(|| crate::remote_filter::to_dsl(&text))
+            .transpose()?;
+    }
     if let Some(query) = c.query.as_ref().filter(|v| !v.is_null()) {
         let object = query
             .as_object()
@@ -1607,6 +1613,15 @@ t7Oc7pH7LwIiUBsysbgB6p6AdyM/36XG
         c.index = "wazuh-alerts-*".into();
         c.id = uuid::Uuid::new_v4().to_string();
         assert!(validate(c.clone()).is_ok());
+        // A text filter becomes Query DSL; a blank one is no filter.
+        let mut filtered = c.clone();
+        filtered.query = Some(json!("rule.level >= 10 and agent.name: web*"));
+        let query = validate(filtered.clone()).unwrap().query.unwrap();
+        assert_eq!(query["bool"]["filter"][0], json!({"range": {"rule.level": {"gte": 10}}}));
+        filtered.query = Some(json!("  "));
+        assert!(validate(filtered.clone()).unwrap().query.is_none());
+        filtered.query = Some(json!("rule.level:"));
+        assert!(validate(filtered).err().unwrap().contains("Informe um valor para rule.level"));
         // Token mode is Wazuh-only and never keeps a user name.
         let mut elastic_token = config("https://elastic.example");
         elastic_token.auth = "token".into();

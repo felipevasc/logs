@@ -102,6 +102,7 @@ mod reference_commands;
 mod reference_store;
 mod reference_lookup;
 mod remote;
+mod remote_filter;
 mod remote_wazuh;
 mod resources;
 mod resource_settings;
@@ -2331,6 +2332,7 @@ pub fn run() {
             remote::remote_delete,
             remote::remote_test,
             remote::remote_import,
+            remote_filter::remote_filter_preview,
             timeline_export::export_timeline,
             log_split::split_choose_input,
             log_split::split_inspect,

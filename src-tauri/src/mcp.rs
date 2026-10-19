@@ -1071,7 +1071,8 @@ pub struct RemoteConnectionParams {
     /// Maximum records to fetch (clamped to 1..=5000000).
     #[serde(default = "default_remote_max_records")]
     pub max_records: usize,
-    /// Optional Query DSL JSON query.
+    /// Optional filter: a Query DSL clause as a JSON object, or text in the dashboard or app
+    /// search syntax, such as "rule.level >= 10 and agent.name: web*" (converted to Query DSL).
     pub query: Option<serde_json::Value>,
     /// Kibana version compatibility: "auto", "v7_8", or "v9".
     #[serde(default = "default_remote_kibana_version")]

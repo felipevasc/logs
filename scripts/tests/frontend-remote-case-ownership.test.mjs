@@ -213,3 +213,20 @@ test('a late deleted binding cannot clear a newly selected different connection 
   const deleting = f.q('delete').onclick(); f.remote.unmount(); await f.mount(); f.selectConnection(f.library.get('access-b')); gate.resolve(); await deleting;
   assert.equal(f.ui.selected.id, 'access-b'); assert.equal(f.a.workspace.remoteSource.connectionId, 'access-b');
 });
+
+test('a text filter is sent as text and previewed as the Query DSL it becomes; JSON stays JSON', async () => {
+  const f = fixture(); await choose(f);
+  f.handlers.set('remote_filter_preview', ({ text }) => { if (text.endsWith('>=')) throw 'Filtro: Informe um valor para rule.level (posição 14).'; return { range: { 'rule.level': { gte: 10 } } }; });
+  const type = async text => { f.q('query').value = text; f.q('query').emit('input'); f.q('fields').emit('input'); await tick(); };
+  await type('rule.level >= 10');
+  assert.equal(f.q('query-preview').hidden, false); assert.equal(f.q('query-preview').textContent, 'Consulta enviada: {"range":{"rule.level":{"gte":10}}}');
+  await f.act('test');
+  assert.equal(f.calls.findLast(call => call.command === 'remote_test').args.connection.query, 'rule.level >= 10');
+  assert.equal(f.a.workspace.remoteSource.draft.queryText, 'rule.level >= 10');
+  await type('rule.level >=');
+  assert.equal(f.q('query-preview').dataset.kind, 'error'); assert.match(f.q('query-preview').textContent, /Informe um valor/);
+  await type('{"match_all":{}}');
+  assert.equal(f.q('query-preview').hidden, true); assert.equal(f.calls.filter(call => call.command === 'remote_filter_preview').length, 2);
+  await f.act('test');
+  assert.deepEqual(f.calls.findLast(call => call.command === 'remote_test').args.connection.query, { match_all: {} });
+});

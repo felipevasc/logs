@@ -25,7 +25,7 @@
         <section id="rs-files" class="remote-options" hidden><strong>Arquivos e pastas · deste Caso</strong><p class="remote-help">Um caminho absoluto por linha. Pastas incluem seus arquivos e subpastas. A coleta preserva os arquivos para nossa indexação local.</p><div id="rs-presets" class="remote-actions"></div><label for="rs-paths">Caminhos selecionados<textarea id="rs-paths" rows="5" spellcheck="false"></textarea></label><label for="rs-mib">Limite da coleta (MiB)<input id="rs-mib" type="number" min="1" max="4096" value="512" /></label></section>
         <label class="remote-check"><input type="checkbox" id="rs-remember" /><span id="rs-remember-label">Guardar senha com proteção do sistema</span></label><p class="remote-help" id="rs-secret-note"></p>
         <details class="remote-options" id="rs-query-options" open><summary>Recorte da importação · deste Caso</summary><div class="remote-grid"><label for="rs-time-field" id="rs-time-field-wrap">Campo de data/hora<input id="rs-time-field" autocomplete="off" placeholder="Ex.: @timestamp (opcional)" /></label><label for="rs-limit">Máximo de registros<input id="rs-limit" type="number" min="1" max="5000000" step="1" value="100000" /></label><label for="rs-from" id="rs-from-wrap">De <span class="remote-optional">opcional</span><input id="rs-from" type="datetime-local" step="1" /></label><label for="rs-to" id="rs-to-wrap">Até <span class="remote-optional">opcional</span><input id="rs-to" type="datetime-local" step="1" /></label></div><p class="remote-help" id="rs-query-help">Seleção, índice, filtro e período são salvos somente neste Caso. Dados de acesso ficam na biblioteca global. Horários no fuso deste computador. Com campo de data/hora, os registros mais recentes vêm primeiro. Sem esse campo, a consulta usa a ordem interna do índice.</p></details>
-        <details class="remote-options" id="rs-query-advanced"><summary>Filtro avançado · Query DSL</summary><label for="rs-query" class="remote-help">Somente a cláusula de consulta, por exemplo <code>{"match":{"service.name":"api"}}</code>.</label><textarea id="rs-query" rows="5" spellcheck="false" placeholder='{"match_all":{}}'></textarea></details>
+        <details class="remote-options" id="rs-query-advanced"><summary>Filtro</summary><label for="rs-query" class="remote-help">Use <code>campo: valor</code> com <code>and</code>, <code>or</code>, <code>not</code> e parênteses, como na barra de busca do painel ou do aplicativo. Aspas buscam a frase exata, <code>*</code> é curinga, <code>campo: *</code> exige o campo, e <code>&gt;</code>, <code>&gt;=</code>, <code>&lt;</code>, <code>&lt;=</code> comparam. Também aceita Query DSL em JSON.</label><textarea id="rs-query" rows="4" spellcheck="false" placeholder='rule.level >= 10 and agent.name: web*'></textarea><p class="remote-help remote-query-preview" id="rs-query-preview" hidden></p></details>
       </fieldset><div class="remote-actions"><button class="btn ghost" id="rs-delete" type="button" hidden>Excluir da biblioteca global</button><span class="spacer"></span><button class="btn ghost" id="rs-test" type="button">Testar acesso</button><button class="btn ghost" id="rs-save" type="button">Salvar acesso na biblioteca global</button><button class="btn primary" id="rs-import" type="button"><i class="fas fa-cloud-arrow-down"></i> Importar registros</button></div>
       <div class="remote-status" id="rs-status" role="status" aria-live="polite"><span id="rs-status-text">Salvar a conexão guarda suas opções para a próxima consulta.</span><button class="btn ghost small" id="rs-open-result" type="button" hidden>Abrir arquivo importado</button><button class="btn ghost small" id="rs-cancel" type="button" hidden>Cancelar</button></div>
       </form></div></section>`;
@@ -159,6 +159,7 @@
     const saved = normalizeDraft(item?.workspace?.remoteSource), session = item ? sessionFor(item) : null;
     ui.connectionId = saved.connectionId;
     for (const [input, field] of draftFields) q(input).value = saved.draft[field];
+    q("query-preview").hidden = true;
     // The vault is not restored here. Resolution happens only for this Case's saved ID on mount.
     if (!saved.connectionId && session?.endpoint) paintEndpoint(null, session.endpoint);
     ui.lastImport = session?.lastImport || null; q("open-result").hidden = !ui.lastImport;
@@ -219,10 +220,13 @@
     }
     if (!connection.index) { q("index").focus(); throw Error(`Informe um índice ou padrão, como ${["wazuh", "wazuhweb"].includes(connection.kind) ? "wazuh-alerts-*" : "logs-*"}.`); }
     const query = q("query").value.trim();
-    if (query) {
-      try { connection.query = JSON.parse(query); } catch { q("query").parentElement.open = true; q("query").focus(); throw Error("O filtro avançado precisa ser um JSON válido."); }
+    if (query.startsWith("{")) {
+      try { connection.query = JSON.parse(query); } catch { q("query").parentElement.open = true; q("query").focus(); throw Error("Um filtro que começa com { precisa ser um JSON válido de Query DSL."); }
       if (!connection.query || typeof connection.query !== "object" || Array.isArray(connection.query)) throw Error("Informe um objeto Query DSL, como {\"match_all\":{}}.");
       if (Object.hasOwn(connection.query, "query")) throw Error("Use apenas a cláusula Query DSL, sem envolver em \"query\".");
+    } else if (query) {
+      // Text filters are converted to Query DSL by the backend.
+      connection.query = query;
     }
     return connection;
   }
@@ -360,6 +364,18 @@
     syncHints(); rememberDraft();
   });
   q("wazuh-data").addEventListener("change", () => { if (q("wazuh-data").value) applyWazuhData(q("wazuh-data").value); else q("index").focus(); });
+  // Shows the Query DSL a text filter becomes; the latest keystroke wins.
+  let previewSerial = 0;
+  async function previewQuery() {
+    const text = q("query").value.trim(), serial = ++previewSerial, out = q("query-preview");
+    if (!text || text.startsWith("{")) { out.hidden = true; out.textContent = ""; return; }
+    let message, kind;
+    try { message = `Consulta enviada: ${JSON.stringify(await api("remote_filter_preview", { text }, { silent: true }))}`; kind = "success"; }
+    catch (error) { message = String(error?.message || error); kind = "error"; }
+    if (serial !== previewSerial) return;
+    out.hidden = false; out.dataset.kind = kind; out.textContent = message;
+  }
+  q("query").addEventListener("input", previewQuery);
   q("index").addEventListener("input", syncWazuhData);
   for (const action of ["save", "test", "import"]) q(action).onclick = () => act(action);
   q("new").onclick = () => { selectConnection(); q("name").focus(); };

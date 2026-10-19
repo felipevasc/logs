@@ -11,6 +11,8 @@
     mock.requests.push({ command, connection: args.connection ? structuredClone(args.connection) : undefined, passwordProvided: !!args.password, rememberPassword: args.rememberPassword, from: args.from, to: args.to });
     if (command === "remote_list") return { connections: [...connections.values()].map(publicConnection), persistentSecrets: mock.persistentSecrets };
     if (command === "remote_delete") { connections.delete(args.id); secrets.delete(args.id); return null; }
+    // The real conversion lives in src-tauri/src/remote_filter.rs; the preview only echoes it.
+    if (command === "remote_filter_preview") return { query_string: { query: args.text, analyze_wildcard: true, lenient: true } };
     if (command === "remote_save") {
       const connection = { ...args.connection, id: args.connection.id || `remote-${++serial}`, _remember: !!args.rememberPassword };
       if (args.rememberPassword && !mock.persistentSecrets) throw Error("Este sistema permite senha apenas durante a sessão.");

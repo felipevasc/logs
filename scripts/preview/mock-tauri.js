@@ -469,6 +469,7 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     remote_delete: args => window.__mockRemote('remote_delete',args),
     remote_test: args => window.__mockRemote('remote_test',args),
     remote_import: args => window.__mockRemote('remote_import',args),
+    remote_filter_preview: args => window.__mockRemote('remote_filter_preview',args),
     journey_fields: args => window.__mockJourneys('journey_fields', args, events, applyFilters),
     journey_index: args => window.__mockJourneys('journey_index', args, events, applyFilters),
     journey_events: args => window.__mockJourneys('journey_events', args, events, applyFilters),

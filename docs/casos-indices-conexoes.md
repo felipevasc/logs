@@ -28,6 +28,29 @@ As sugestões incluem os EVTX de System, Application e Security, a pasta de EVTX
 
 O limite padrão é 512 MiB, ajustável entre 1 MiB e 4 GiB. Cada coleta admite até 64 caminhos, 2.048 arquivos e 8.192 subpastas. A coleta incompleta é descartada. Arquivos locais concluídos são publicados juntos e passam pela detecção automática de formato. Permissões de leitura/exportação devem existir no servidor.
 
+## Filtro das importações
+
+Em **Filtro**, nas conexões Elasticsearch, Kibana e Wazuh, escreva a condição como na barra de busca do painel Wazuh (DQL/KQL) ou do aplicativo. O aplicativo converte o texto em Query DSL e mostra, enquanto você digita, a consulta que será enviada. Um filtro que começa com `{` continua sendo lido como Query DSL em JSON.
+
+| Escrita | Significado | Query DSL enviada |
+| --- | --- | --- |
+| `campo: valor` | todas as palavras no campo, em qualquer ordem | `multi_match` com `operator: and` |
+| `campo: "frase exata"` ou `campo = valor` | a frase exata | `multi_match` do tipo `phrase` |
+| `campo != valor` | qualquer valor diferente da frase | `must_not` |
+| `campo: web*` | curinga, com `*` e `?` | `query_string` |
+| `campo: *` | o campo existe | `exists` |
+| `campo >= 10`, `>`, `<`, `<=` | comparação | `range` |
+| `campo: [10 TO 20]` ou `campo: 10..20` | faixa; `{ }` exclui o limite e `*` deixa um lado aberto | `range` |
+| `campo: 10.0.0.0/8` | bloco de endereços | termo para campos IP e prefixo `10.*` para campos de texto |
+| `campo: (a or b, c)` | lista de valores | `should` |
+| `valor`, sem campo | o texto nos campos padrão do índice | `multi_match` sem `fields` |
+
+Os operadores são `and`, `or` e `not` em qualquer caixa; `E`, `OU` e `NÃO` em maiúsculas, como na busca do aplicativo; `&&` e `||`; e `-` ou `!` antes de uma condição. `not` vale antes de `and`, que vale antes de `or`, e parênteses agrupam. Condições lado a lado valem como `and`. Palavras seguidas sem operador formam um só valor: `rule.description: falha de login` procura as três palavras no campo. Use aspas ou `\` para escrever um caractere especial literalmente.
+
+Os nomes são os campos do documento remoto, como `rule.level`, `agent.name` e `data.srcip`; os apelidos da busca do aplicativo, como `ip`, `usuario` e `nivel`, não se aplicam. Sem os mapeamentos do índice, as consultas de texto são tolerantes (`lenient`): um valor de tipo incompatível com o campo não encontra nada, em vez de falhar nos shards e descartar a importação. Comparações e faixas não têm essa tolerância e precisam de valores compatíveis com o campo. Expressões regulares (`/.../`) não são aceitas, porque Lucene, Rust e JavaScript usam sintaxes diferentes; use curingas.
+
+Exemplos no Wazuh: `rule.level >= 10 and not agent.name: wazuh-manager`, `rule.groups: (authentication_failed or invalid_login) and data.srcip: 10.0.0.0/8` e `rule.id: 5710 or "Invalid user"`.
+
 ## Wazuh
 
 O Wazuh grava alertas e eventos no **Wazuh indexer**, que é o que o painel exibe. O inventário de agentes fica na **API do servidor**. Há três modalidades, cada uma com seu endereço e sua credencial: o indexer direto, o mesmo indexer pelo painel web e a API do servidor.
@@ -44,7 +67,7 @@ Endereço `https://servidor:9200`. Use usuário e senha de uma conta do indexer,
 | Eventos normalizados | `wazuh-events-v5*` | `@timestamp` | 5.x |
 | Vulnerabilidades | `wazuh-states-vulnerabilities*` | `vulnerability.detected_at` | 4.8+ e 5.x |
 
-Também é possível informar outro índice ou padrão. Período, Query DSL e máximo de registros funcionam como no Elasticsearch. A leitura usa a API de *scroll*, presente em todas as gerações: Elasticsearch 7+ (Wazuh 4.0–4.2 com Elastic Stack), OpenSearch 1.2–2.19 (Wazuh indexer 4.3–4.14) e OpenSearch 3.x (Wazuh 5.0). As APIs de PIT diferem entre Elasticsearch e OpenSearch e não existem antes do OpenSearch 2.4. Elasticsearch 6 ou anterior (Wazuh 3.x) é recusado.
+Também é possível informar outro índice ou padrão. Período, filtro e máximo de registros funcionam como no Elasticsearch. A leitura usa a API de *scroll*, presente em todas as gerações: Elasticsearch 7+ (Wazuh 4.0–4.2 com Elastic Stack), OpenSearch 1.2–2.19 (Wazuh indexer 4.3–4.14) e OpenSearch 3.x (Wazuh 5.0). As APIs de PIT diferem entre Elasticsearch e OpenSearch e não existem antes do OpenSearch 2.4. Elasticsearch 6 ou anterior (Wazuh 3.x) é recusado.
 
 Cada shard lido mantém um contexto de scroll, e o indexer recusa uma leitura acima de `search.max_open_scroll_context` (500 por nó por padrão). Os índices diários do Wazuh passam desse número em poucos anos: um padrão como `wazuh-alerts-*` pode abranger milhares de shards. Antes de abrir o scroll, o aplicativo conta os shards que a consulta alcança, com uma busca sem resultados (`size: 0`, `pre_filter_shard_size=1`) que não abre contextos. Até 100 shards, a leitura é única. Acima disso, a importação lê janelas de tempo, das mais recentes às mais antigas, cada uma com até 100 shards; o indexer pula os shards fora da janela. A ordem final continua do mais recente ao mais antigo, e o limite de registros para na janela em que é atingido. Sem campo de horário não há janelas, e o aplicativo pede um campo de horário ou um índice mais específico. Registros sem o campo de horário ficam fora das janelas e são contados no aviso da importação.
 

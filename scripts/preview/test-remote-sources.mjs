@@ -61,8 +61,13 @@ try {
   result.secretOutsideCase = await page.evaluate(() => !JSON.stringify(state.cases).includes("fixture-secret-only") && !JSON.stringify({ ...localStorage }).includes("fixture-secret-only"));
   assert.equal(result.secretOutsideCase, true);
 
-  await page.getByText("Filtro avançado · Query DSL", { exact: true }).click();
+  await page.getByText("Filtro", { exact: true }).click();
+  // A text filter shows the Query DSL it becomes; JSON is still accepted as is.
+  await page.locator("#rs-query").fill("rule.level >= 10 and agent.name: web*");
+  await page.locator("#rs-query-preview").waitFor();
+  assert.match(await page.locator("#rs-query-preview").textContent(), /^Consulta enviada: \{/);
   await page.locator("#rs-query").fill('{"query":');
+  assert.equal(await page.locator("#rs-query-preview").isVisible(), false);
   await page.locator("#rs-test").click();
   assert.match(await page.locator("#rs-status-text").textContent(), /JSON válido/);
   assert.equal((await counts()).remote_test, 1);
