@@ -930,7 +930,9 @@ mod tests {
         c.index = "wazuh-alerts-*".into();
         let error = indexer_test(&RemoteClient::new(c, Some("pass".into())).unwrap()).err().unwrap();
         assert!(error.contains("painel Wazuh (401)"), "{error}");
-        server.finish();
+        // The console answers 400 to an empty path, so the indexer root goes as "/".
+        let root = reqwest::Url::parse(&format!("http://fixture{}", server.finish()[0].path)).unwrap();
+        assert!(root.query_pairs().any(|(key, value)| key == "path" && value == "/"), "{root}");
     }
 
     #[test]
@@ -940,6 +942,10 @@ mod tests {
         let message = Failure::Status(401).message(&c);
         assert!(message.contains("indexer (401)") && message.contains("porta 9200"), "{message}");
         assert!(Failure::Connect { timeout: false }.message(&c).contains("root-ca.pem"));
+        // The dashboard address redirects the indexer kind to its login page.
+        let mut dashboard = c.clone();
+        dashboard.url = "https://wazuh.example".into();
+        assert!(Failure::Status(302).message(&dashboard).contains("escolha Wazuh · painel web"));
         c.kind = RemoteKind::WazuhApi;
         c.url = "https://wazuh.example:9200".into();
         assert!(Failure::NotJson.message(&c).contains("porta 55000"));

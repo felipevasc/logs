@@ -227,6 +227,12 @@ fn validate(mut c: RemoteConfig) -> Result<RemoteConfig, String> {
     if !(1..=MAX_RECORDS).contains(&c.max_records) {
         return Err("O limite deve estar entre 1 e 5.000.000 registros.".into());
     }
+    // A text filter, such as `rule.level >= 10 and agent.name: web*`, becomes Query DSL here.
+    if let Some(text) = c.query.as_ref().and_then(Value::as_str).map(str::to_owned) {
+        c.query = (!text.trim().is_empty())
+            .then(|| crate::remote_filter::to_dsl(&text))
+            .transpose()?;
+    }
     if let Some(query) = c.query.as_ref().filter(|v| !v.is_null()) {
         let object = query
             .as_object()
@@ -550,7 +556,7 @@ fn endpoint_hint(c: &RemoteConfig) -> &'static str {
     let port = Url::parse(&c.url).ok().and_then(|url| url.port_or_known_default());
     match (&c.kind, port) {
         (RemoteKind::Wazuh, Some(55000)) => " Esse endereço parece ser a API do servidor Wazuh: alertas e eventos ficam no Wazuh indexer (porta 9200). Para agentes, escolha Wazuh · API do servidor.",
-        (RemoteKind::Wazuh, Some(443)) => " Use o endereço do Wazuh indexer (geralmente porta 9200), não o do painel web.",
+        (RemoteKind::Wazuh, Some(443)) => " Esse endereço parece ser o painel web: escolha Wazuh · painel web, ou informe o endereço do Wazuh indexer (geralmente porta 9200).",
         (RemoteKind::WazuhApi, Some(9200)) => " Esse endereço parece ser o Wazuh indexer: a API do servidor usa a porta 55000. Para alertas, escolha Wazuh · indexer.",
         (RemoteKind::WazuhWeb, Some(9200)) => " Esse endereço parece ser o Wazuh indexer: escolha Wazuh · indexer, ou informe o endereço do painel web.",
         (RemoteKind::WazuhWeb, Some(55000)) => " Esse endereço parece ser a API do servidor Wazuh: informe o endereço do painel web, o mesmo aberto no navegador.",
@@ -684,8 +690,10 @@ impl RemoteClient {
                 "{}/api/console/proxy",
                 url.path().trim_end_matches('/')
             ));
+            // The console rejects an empty path with 400: the root stays "/".
+            let path = endpoint.trim_start_matches('/');
             url.query_pairs_mut()
-                .append_pair("path", endpoint.trim_start_matches('/'))
+                .append_pair("path", if path.is_empty() { "/" } else { path })
                 .append_pair("method", method.as_str());
             Method::POST
         } else {
@@ -1605,6 +1613,15 @@ t7Oc7pH7LwIiUBsysbgB6p6AdyM/36XG
         c.index = "wazuh-alerts-*".into();
         c.id = uuid::Uuid::new_v4().to_string();
         assert!(validate(c.clone()).is_ok());
+        // A text filter becomes Query DSL; a blank one is no filter.
+        let mut filtered = c.clone();
+        filtered.query = Some(json!("rule.level >= 10 and agent.name: web*"));
+        let query = validate(filtered.clone()).unwrap().query.unwrap();
+        assert_eq!(query["bool"]["filter"][0], json!({"range": {"rule.level": {"gte": 10}}}));
+        filtered.query = Some(json!("  "));
+        assert!(validate(filtered.clone()).unwrap().query.is_none());
+        filtered.query = Some(json!("rule.level:"));
+        assert!(validate(filtered).err().unwrap().contains("Informe um valor para rule.level"));
         // Token mode is Wazuh-only and never keeps a user name.
         let mut elastic_token = config("https://elastic.example");
         elastic_token.auth = "token".into();

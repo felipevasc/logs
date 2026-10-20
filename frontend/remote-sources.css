@@ -41,6 +41,8 @@
 .remote-options summary { font-size:12px; cursor:pointer; font-weight:550; }
 .remote-options[open] summary { margin-bottom:14px; }
 .remote-options .remote-help { margin:10px 0 0; }
+.remote-query-preview { font-family:var(--font-mono, monospace); overflow-wrap:anywhere; }
+.remote-query-preview[data-kind="error"] { color:var(--lv-erro); font-family:inherit; }
 .remote-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-top:8px; border-top:1px solid var(--border); padding-top:16px; }
 .remote-actions .btn { font-size:11px; padding:8px 10px; }
 #rs-delete { color:var(--lv-erro); padding-left:0; }
