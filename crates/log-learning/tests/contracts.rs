@@ -4,6 +4,36 @@ fn key() -> String {
     digest(b"service-a")
 }
 #[test]
+fn semantic_codes_and_negations_survive_variable_token_learning() {
+    let mut model = Model::default();
+    for _ in 0..120 {
+        model.train(
+            &key(),
+            &event("database reported error SQLSTATE=23505"),
+            None,
+        );
+    }
+    assert!(model
+        .score(
+            &key(),
+            &event("database reported error SQLSTATE=08001"),
+            None
+        )
+        .unusual());
+    let mut model = Model::default();
+    for _ in 0..120 {
+        model.train(&key(), &event("request completed with no error"), None);
+    }
+    assert!(model
+        .score(&key(), &event("request completed with an error"), None)
+        .unusual());
+    assert_ne!(tokens("response status 200"), tokens("response status 503"));
+    assert_eq!(
+        tokens("request for user123 completed"),
+        tokens("request for user456 completed")
+    );
+}
+#[test]
 fn shared_domains_cover_the_native_normalizers_without_guessing_generic_products() {
     assert_eq!(Domain::from_product("web"), Domain::Web);
     assert_eq!(

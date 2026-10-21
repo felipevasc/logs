@@ -14,6 +14,29 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
 fn run() -> Result<(), String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.as_slice() {
+        [command] if command=="diagnostic-evaluate"=>{
+            let model=log_learning::DiagnosticKnowledge::baseline()?;
+            println!("{}",serde_json::to_string_pretty(&model.evaluation).map_err(|e|e.to_string())?);
+        }
+        [command,path] if command=="diagnostic-check"=>{
+            let knowledge:log_learning::DiagnosticKnowledge=read(Path::new(path))?;knowledge.validate()?;
+            println!("Conhecimento diagnóstico validado · revisão {} · avaliação sintética, sem precisão de campo",knowledge.revision());
+        }
+        [command,directory,output] if command=="diagnostic-consolidate"=>{
+            let mut paths=fs::read_dir(directory).map_err(|e|e.to_string())?.map(|e|e.map(|e|e.path())).collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+            paths.retain(|p|p.extension().is_some_and(|v|v=="json"));paths.sort();
+            if paths.len()>8192{return Err("Mais de 8192 arquivos de contribuição diagnóstica".into());}
+            let mut contributions=Vec::new();
+            for path in paths {
+                let value:serde_json::Value=read(&path)?;
+                if value.get("contributions").is_some(){let bundle:log_learning::DiagnosticContributionBundle=serde_json::from_value(value).map_err(|e|e.to_string())?;bundle.validate()?;contributions.extend(bundle.contributions);}
+                else {contributions.push(serde_json::from_value(value).map_err(|e|e.to_string())?);}
+                if contributions.len()>8192{return Err("Mais de 8192 contribuições diagnósticas".into());}
+            }
+            let knowledge=log_learning::DiagnosticKnowledge::consolidate(contributions)?;
+            let mut bytes=serde_json::to_vec_pretty(&knowledge).map_err(|e|e.to_string())?;bytes.push(b'\n');fs::write(output,bytes).map_err(|e|e.to_string())?;
+            println!("Conhecimento diagnóstico consolidado · revisão {}",knowledge.revision());
+        }
         [command, path] if command == "check" => {
             let model: SharedModel = read(Path::new(path))?;
             model.validate()?;
@@ -55,7 +78,7 @@ fn run() -> Result<(), String> {
             fs::write(output, bytes).map_err(|e| e.to_string())?;
             println!("Revisão {}", model.revision());
         }
-        _ => return Err("Uso: log-learning check MODELO | consolidate DIRETÓRIO MODELO".into()),
+        _ => return Err("Uso: log-learning check MODELO | consolidate DIRETÓRIO MODELO | diagnostic-evaluate | diagnostic-check BASE | diagnostic-consolidate DIRETÓRIO BASE".into()),
     }
     Ok(())
 }

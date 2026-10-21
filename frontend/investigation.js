@@ -64,7 +64,7 @@ window.InvestigationUI = (() => {
     if (!analysis?.investigation?.enabled || !analysis.investigation.complete) return;
     parent.querySelector('[data-investigation]')?.remove();
     const host = node('section', null, 'investigation-card'); host.dataset.investigation = '';
-    const controller = { active: true, revision: 0, section: 'queue', offset: 0, namespace: null, entity: null, signalId: null };
+    const controller = { active: true, revision: 0, section: analysis.investigation.diagnostics?.episodes > 0 ? 'diagnostics' : 'queue', offset: 0, namespace: null, entity: null, signalId: null };
     controllers.set(host, controller); parent.append(host);
     const current = () => host.isConnected && controller.active && options.isCurrent();
     const title = node('h2', 'Investigar comportamento');
@@ -72,7 +72,7 @@ window.InvestigationUI = (() => {
     const navigation = node('div', null, 'investigation-navigation');
     const content = node('div'); content.setAttribute('aria-live', 'polite');
     const pagination = node('div', null, 'investigation-navigation');
-    for (const [section, label] of [['queue', 'Fila de investigação'], ['signals', 'Sinais'], ['graph', 'Relações'], ['story', 'Cronologia'], ['narrative', 'Preparar síntese assistida'], ['hunts', 'Caças guiadas'], ['coverage', 'Cobertura'], ['schema', 'Campos e interpretação'], ['revision', 'Mudanças nesta revisão'], ['ioc_matches', 'IOCs confirmados']]) {
+    for (const [section, label] of [['diagnostics', 'Diagnósticos e próximas verificações'], ['queue', 'Fila de investigação'], ['signals', 'Sinais'], ['graph', 'Relações'], ['story', 'Cronologia'], ['narrative', 'Preparar síntese assistida'], ['hunts', 'Caças guiadas'], ['coverage', 'Cobertura'], ['schema', 'Campos e interpretação'], ['revision', 'Mudanças nesta revisão'], ['ioc_matches', 'IOCs confirmados']]) {
       const button = node('button', label, 'btn ghost small'); button.type = 'button';
       button.onclick = () => { controller.section = section; if(section==='schema')controller.entity=null;controller.signalId = null; controller.offset = 0; void load(); };
       navigation.append(button);
@@ -81,6 +81,43 @@ window.InvestigationUI = (() => {
     clear.onclick = () => { controller.namespace = null; controller.entity = null; controller.signalId = null; controller.offset = 0; controller.section = 'queue'; void load(); };
     navigation.append(clear);
     host.append(title, description, navigation, content, pagination);
+    if (analysis.investigation.diagnostics?.enabled) {
+      const report = analysis.investigation.diagnostics;
+      host.insertBefore(node('p', report.available === false ? `Diagnósticos indisponíveis: ${report.error}` : `${report.episodes || 0} episódios · ${report.abstentions || 0} sem causa distinguível com os dados disponíveis.${report.limited_events ? ' A cobertura atingiu o limite de episódios.' : ''}`, 'small muted'), navigation);
+      if (report.knowledge_error) host.insertBefore(node('p', `A base importada não pôde ser usada; esta análise utilizou os critérios distribuídos com o aplicativo. ${report.knowledge_error}`, 'small muted'), navigation);
+      if (report.memory_error) host.insertBefore(node('p', `A memória de resoluções não pôde ser usada nesta análise. ${report.memory_error}`, 'small muted'), navigation);
+      const knowledge = node('details'); knowledge.dataset.diagnosticKnowledge = '';
+      knowledge.append(node('summary', 'Memória e conhecimento diagnóstico'), node('p', 'Resoluções e justificativas ficam neste computador. A contribuição opcional contém sinais de vocabulário fechado, hipóteses confirmadas ou descartadas e recibos aleatórios; não contém mensagens, nomes ou referências dos logs.'));
+      const status = node('p'); status.setAttribute('aria-live', 'polite');
+      const run = async (button, action, extra = {}) => {
+        if (!current()) return null;
+        button.disabled = true;
+        try {
+          const result = await options.request('investigation_learning', { analysisId: analysis.analysis_id, request: { action, ...extra } });
+          if (!current()) return null;
+          if (action === 'diagnostic_memory_status') status.textContent = `${result.resolutions} resoluções locais. ${result.ranking?.active ? 'O ranking usa resoluções validadas.' : 'O ranking conserva os critérios explícitos enquanto falta ganho demonstrado em resoluções reservadas.'}`;
+          else if (action === 'diagnostic_publish') status.textContent = `${result.published} contribuições publicadas; ${result.already_present} já presentes. Aguarde a consolidação antes de baixar a nova base.`;
+          else if (['diagnostic_import', 'diagnostic_download', 'diagnostic_rollback'].includes(action)) { status.textContent = 'Base aceita nos controles locais. Recalcule para aplicá-la. Os controles sintéticos não medem o acerto nos seus incidentes.'; options.onLearningChanged?.(); }
+          else status.textContent = `${result.contributions?.length || 0} contribuições sem mensagens preparadas para revisão.`;
+          return result;
+        } catch (error) { if (current()) status.textContent = String(error); return null; }
+        finally { if (button.isConnected) button.disabled = false; }
+      };
+      const inspect = node('button', 'Ver memória de resoluções', 'btn ghost small'); inspect.type = 'button'; inspect.onclick = () => run(inspect, 'diagnostic_memory_status'); knowledge.append(inspect);
+      const exportButton = node('button', 'Exportar conhecimento revisado', 'btn ghost small'); exportButton.type = 'button';
+      exportButton.onclick = async () => { const result = await run(exportButton, 'diagnostic_export'); if (!result || !current()) return; const url = URL.createObjectURL(new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' })); const link = node('a'); link.href = url; link.download = 'contribuicoes-diagnosticas.json'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }; knowledge.append(exportButton);
+      const file = node('input'); file.type = 'file'; file.accept = 'application/json,.json'; file.setAttribute('aria-label', 'Arquivo de conhecimento diagnóstico');
+      const importButton = node('button', 'Importar conhecimento diagnóstico', 'btn ghost small'); importButton.type = 'button';
+      importButton.onclick = async () => { const selected = file.files?.[0]; if (!selected) { status.textContent = 'Escolha o arquivo de conhecimento.'; return; } if (selected.size > 16 * 1024 * 1024) { status.textContent = 'A base deve ter até 16 MiB.'; return; } try { const document = JSON.parse(await selected.text()); if (current()) await run(importButton, 'diagnostic_import', { document }); } catch (error) { if (current()) status.textContent = String(error); } }; knowledge.append(file, importButton);
+      const rollback = node('button', 'Restaurar conhecimento anterior', 'btn ghost small'); rollback.type = 'button'; rollback.onclick = () => run(rollback, 'diagnostic_rollback'); knowledge.append(rollback);
+      if (report.repository) {
+        knowledge.append(node('p', `Repositório: ${report.repository} · branch ${report.branch}. Revise a contribuição antes de publicar.`));
+        const token = node('input'); token.type = 'password'; token.autocomplete = 'off'; token.maxLength = 256; token.setAttribute('aria-label', 'Token temporário para conhecimento diagnóstico'); knowledge.append(token);
+        for (const [action, label] of [['diagnostic_download', 'Baixar conhecimento do Git'], ['diagnostic_publish', 'Publicar conhecimento revisado no Git']]) { const button = node('button', label, 'btn ghost small'); button.type = 'button'; button.onclick = () => { const credential = token.value; token.value = ''; return run(button, action, credential ? { token: credential } : {}); }; knowledge.append(button); }
+      }
+      if (report.memory_error || report.knowledge_error) knowledge.append(node('p', 'Uma referência local não pôde ser aplicada. Os diagnósticos usam os critérios disponíveis nesta análise.', 'small muted'));
+      knowledge.append(status); host.insertBefore(knowledge, navigation);
+    }
     if (analysis.investigation.learning?.enabled) {
       const navigate = () => { controller.section = 'learning'; controller.namespace = null; controller.entity = null; controller.offset = 0; void load(); };
       if (analysis.investigation.learning.available !== false) { const button = node('button', 'Diagnósticos aprendidos', 'btn ghost small'); button.type = 'button'; button.onclick = navigate; navigation.append(button); }
@@ -103,6 +140,12 @@ window.InvestigationUI = (() => {
         if (!current() || revision !== controller.revision) return;
         if (page.analysis_id !== analysis.analysis_id || page.complete !== true) throw Error('Resultado incompleto ou de outra análise.');
         const fragment = document.createDocumentFragment();
+        if (page.query) {
+          const query = node('div', null, 'diagnostic-query');
+          query.append(node('h3', page.query.title), node('p', page.query.interpretation));
+          for (const period of page.overview || []) query.append(node('p', `${period.period === 'before' ? 'Antes' : period.period === 'time_unknown' ? 'Sem horário confiável' : 'Durante'}: ${period.records} registros · ${period.failures}/${period.known_outcomes} resultados conhecidos com falha · ${period.unknown_outcomes} resultados desconhecidos · ${period.records_with_measurements} registros com medidas.`, 'small muted'));
+          query.append(node('p', page.unknown_policy, 'small muted')); fragment.append(query);
+        }
         if (page.playbook) {
           const playbook = node('details'); playbook.open = true;
           playbook.append(node('summary', page.playbook.title), node('p', `Dados necessários: ${page.playbook.required_fields.join(' · ')}`), node('p', `Hipóteses concorrentes: ${page.playbook.competing_hypotheses.join(' · ')}`));
@@ -132,7 +175,73 @@ window.InvestigationUI = (() => {
         if (!page.items.length) fragment.append(node('p', controller.section === 'signals' ? 'Nenhum sinal calculado neste recorte. Confira o histórico e a cobertura disponíveis.' : 'Nenhuma relação ou evento disponível neste recorte.'));
         for (const item of page.items) {
           const article = node('article', null, 'investigation-item');
-          if (controller.section === 'hunts') {
+          if (controller.section === 'diagnostics') {
+            article.append(node('h3', `${item.value} · ${item.supporting_events} registros de apoio`), node('p', `${item.first == null ? 'Sem horário confiável; a ordem dos eventos permanece desconhecida' : `${new Date(item.first).toLocaleString('pt-BR')} a ${new Date(item.last).toLocaleString('pt-BR')}`} · ${item.scope?.operation || 'operação não identificada'}${item.scope?.dependency ? ` · ${item.scope.dependency}` : ''}`, 'small muted'));
+            if (item.impact) article.append(node('p', `${item.impact.failure_records}/${item.impact.known_outcomes} registros com resultado conhecido indicam falha · ${item.impact.unknown_outcomes} resultados desconhecidos · ${item.impact.failed_traces} traces distintos com falha observada.`, 'small muted'));
+            if (item.assessment?.abstention) article.append(node('p', item.assessment.abstention));
+            for (const hypothesis of item.assessment?.hypotheses || []) {
+              const detail = node('details', null, 'diagnostic-hypothesis'); detail.open = true;
+              detail.append(node('summary', hypothesis.title), node('p', `Suporte ordinal ${hypothesis.score}/85 · hipótese a confirmar`, 'small muted'));
+              const support = node('ul');
+              for (const observation of hypothesis.support || []) {
+                const row = node('li', `${observation.description} · ${observation.observations} registros${observation.typed_observations ? `, ${observation.typed_observations} com campos tipados` : ', conforme relato da mensagem'}`);
+                for (const ref of (observation.event_refs || []).slice(0, 2)) {
+                  const original = node('button', `Conferir evento ${ref.event_id}`, 'btn ghost small'); original.type = 'button';
+                  original.onclick = async () => {
+                    original.disabled = true;
+                    try {
+                      const event = await options.request('triage_evidence_event', { analysisId: analysis.analysis_id, eventRef: ref.event_ref, eventId: ref.event_id });
+                      if (!current() || revision !== controller.revision) return;
+                      const safe = window.EvidenceUI?.redact ? window.EvidenceUI.redact(event) : { event_ref: event.event_ref, source: event.source, timestamp: event.timestamp };
+                      const opened = node('details'); opened.open = true; opened.append(node('summary', 'Evento original'), node('pre', JSON.stringify(safe, null, 2))); row.append(opened);
+                    } catch (error) { if (current() && revision === controller.revision) row.append(node('p', String(error), 'error')); }
+                    finally { if (original.isConnected) original.disabled = false; }
+                  }; row.append(original);
+                }
+                support.append(row);
+              }
+              detail.append(support);
+              for (const counter of hypothesis.counter_evidence || []) detail.append(node('p', `Dado que exige cautela: ${counter.description}. Confira se corresponde ao mesmo host e instante da falha.`));
+              const missing = node('details'); missing.append(node('summary', 'O que conferir para distinguir a causa')); const checks = node('ul');
+              for (const text of hypothesis.missing_evidence || []) checks.append(node('li', text)); missing.append(checks); detail.append(missing); article.append(detail);
+            }
+            const actions = node('div', null, 'investigation-navigation');
+            for (const query of item.queries || []) {
+              const next = node('button', query.title, 'btn ghost small'); next.type = 'button';
+              next.onclick = () => { controller.section = 'diagnostic_query'; controller.signalId = query.id; controller.offset = 0; void load(); }; actions.append(next);
+            }
+            const members = node('button', 'Ver todos os eventos do episódio', 'btn ghost small'); members.type = 'button'; members.onclick = () => { controller.section = 'diagnostic_members'; controller.signalId = item.id; controller.offset = 0; void load(); }; actions.append(members); article.append(actions);
+            if (item.precedents?.length) {
+              const past = node('details'); past.append(node('summary', 'Resoluções anteriores neste contexto'));
+              for (const precedent of item.precedents) past.append(node('p', `${precedent.title} · ${precedent.verdict_label} · ${precedent.at != null ? new Date(precedent.at).toLocaleString('pt-BR') : ''}`), node('p', precedent.rationale));
+              past.append(node('p', 'Um precedente ajuda a investigar; os fatos deste episódio precisam sustentar sua aplicação.', 'small muted')); article.append(past);
+            }
+            const review = node('details'); review.append(node('summary', 'Registrar resultado da investigação'));
+            const cause = node('select'); cause.setAttribute('aria-label', 'Causa revisada do episódio');
+            for (const hypothesis of item.assessment?.hypotheses || []) { const option = node('option', hypothesis.title); option.value = hypothesis.diagnosis; cause.append(option); }
+            const verdict = node('select'); verdict.setAttribute('aria-label', 'Resultado da revisão do episódio');
+            for (const [value, label] of [['confirmed', 'Causa confirmada após verificação'], ['refuted', 'Hipótese descartada após verificação'], ['expected', 'Mudança esperada neste contexto'], ['inconclusive', 'Investigação inconclusiva']]) { const option = node('option', label); option.value = value; verdict.append(option); }
+            if (!cause.options.length) verdict.value = 'inconclusive';
+            verdict.onchange = () => { cause.disabled = ['expected', 'inconclusive'].includes(verdict.value); }; verdict.onchange();
+            const rationale = node('textarea'); rationale.setAttribute('aria-label', 'Evidência ou resultado que sustenta a revisão'); rationale.placeholder = 'Descreva a verificação realizada e o resultado observado.'; rationale.maxLength = 2000;
+            const save = node('button', 'Salvar resolução local', 'btn ghost small'); save.type = 'button'; const status = node('p'); status.setAttribute('aria-live', 'polite');
+            save.onclick = async () => {
+              if (!current() || revision !== controller.revision) return;
+              save.disabled = true;
+              try {
+                const result = await options.request('investigation_learning', { analysisId: analysis.analysis_id, request: { action: 'diagnostic_feedback', signal_id: item.id, document: { verdict: verdict.value, diagnosis: cause.value || null, rationale: rationale.value } } });
+                if (!current() || revision !== controller.revision) return;
+                status.textContent = result.saved ? 'Resolução salva neste computador. Uma nova análise pode consultar este precedente.' : 'A resolução não foi salva.';
+              } catch (error) { if (current() && revision === controller.revision) status.textContent = String(error); }
+              finally { if (save.isConnected) save.disabled = false; }
+            };
+            review.append(node('p', 'Registre o resultado depois de conferir a hipótese. A revisão é opcional, fica local e não altera a evidência original.', 'small muted'), cause, verdict, rationale, save, status); article.append(review);
+          } else if (controller.section === 'diagnostic_query') {
+            article.append(node('p', `${item.timestamp == null ? 'Sem horário confiável' : `${item.period === 'before' ? 'Antes' : 'Durante'} · ${new Date(item.timestamp).toLocaleString('pt-BR')}`} · ${item.source}`));
+            if (item.version) article.append(node('p', `Versão: ${item.version} · host: ${item.host || 'desconhecido'}`, 'small muted'));
+            const observations = node('ul'); for (const text of item.observations || []) observations.append(node('li', text)); article.append(observations);
+            if (Object.keys(item.measurements || {}).length) article.append(node('pre', JSON.stringify(window.EvidenceUI?.redact ? window.EvidenceUI.redact(item.measurements) : {}, null, 2)));
+          } else if (controller.section === 'hunts') {
             article.append(node('h3', item.title), node('p', `Dados necessários: ${item.required_fields.join(' · ')}`));
             const run = node('button', 'Abrir caça', 'btn ghost small'); run.type = 'button';
             run.onclick = () => { controller.section = 'hunt'; controller.signalId = item.id; controller.offset = 0; void load(); }; article.append(run);
@@ -151,6 +260,7 @@ window.InvestigationUI = (() => {
             const metrics = node('details'); metrics.append(node('summary', 'Por que investigar'), node('pre', JSON.stringify(item.measurements, null, 2)));
             article.append(metrics);
             if (item.kind === 'local_learning') {
+              for (const id of item.measurements?.diagnostic_episode_ids || []) { const diagnostic = node('button', 'Abrir diagnóstico e próxima verificação', 'btn ghost small'); diagnostic.type = 'button'; diagnostic.onclick = () => { controller.section = 'diagnostics'; controller.signalId = id; controller.entity = null; controller.offset = 0; void load(); }; article.append(diagnostic); }
               const comparisons = item.measurements?.comparisons || [];
               const learn = node('button', 'Aprender mensagens e medidas deste recorte', 'btn ghost small'); learn.type = 'button';
               const learnedStatus = node('p'); learnedStatus.setAttribute('aria-live', 'polite');

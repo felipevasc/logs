@@ -1,0 +1,417 @@
+{
+  "schema_version": 1,
+  "engine_version": "diagnostics-1",
+  "rules": [
+    {
+      "diagnosis": "pool_exhaustion",
+      "any_of": [
+        "acquire_timeout",
+        "pool_exhausted_reported"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "acquire_timeout",
+          "weight": 35
+        },
+        {
+          "feature": "pool_exhausted_reported",
+          "weight": 40
+        },
+        {
+          "feature": "pool_at_limit",
+          "weight": 30
+        },
+        {
+          "feature": "pool_queued",
+          "weight": 20
+        },
+        {
+          "feature": "acquisition_measured",
+          "weight": 10
+        }
+      ],
+      "contradictions": [
+        {
+          "feature": "pool_has_capacity",
+          "weight": 15
+        }
+      ],
+      "minimum_score": 30,
+      "query": "pool"
+    },
+    {
+      "diagnosis": "database_connection_limit",
+      "any_of": [
+        "connection_limit"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "connection_limit",
+          "weight": 45
+        },
+        {
+          "feature": "failure_change",
+          "weight": 10
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "database"
+    },
+    {
+      "diagnosis": "database_lock_contention",
+      "any_of": [
+        "lock_wait",
+        "deadlock"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "deadlock",
+          "weight": 45
+        },
+        {
+          "feature": "lock_wait",
+          "weight": 35
+        },
+        {
+          "feature": "query_slow",
+          "weight": 15
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "database"
+    },
+    {
+      "diagnosis": "slow_database",
+      "any_of": [
+        "query_slow"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "query_slow",
+          "weight": 40
+        },
+        {
+          "feature": "read_timeout",
+          "weight": 20
+        },
+        {
+          "feature": "latency_change",
+          "weight": 10
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "database"
+    },
+    {
+      "diagnosis": "dependency_unavailable",
+      "any_of": [
+        "connect_timeout",
+        "connection_refused",
+        "connection_reset",
+        "connection_failure"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "connect_timeout",
+          "weight": 35
+        },
+        {
+          "feature": "connection_refused",
+          "weight": 40
+        },
+        {
+          "feature": "connection_reset",
+          "weight": 30
+        },
+        {
+          "feature": "connection_failure",
+          "weight": 30
+        },
+        {
+          "feature": "failure_change",
+          "weight": 10
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "dependency"
+    },
+    {
+      "diagnosis": "dependency_slow",
+      "any_of": [
+        "read_timeout",
+        "dependency_failure"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "read_timeout",
+          "weight": 35
+        },
+        {
+          "feature": "dependency_failure",
+          "weight": 30
+        },
+        {
+          "feature": "dependency_measured",
+          "weight": 15
+        },
+        {
+          "feature": "latency_change",
+          "weight": 10
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "dependency"
+    },
+    {
+      "diagnosis": "dns_resolution",
+      "any_of": [
+        "dns_failure"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "dns_failure",
+          "weight": 45
+        },
+        {
+          "feature": "failure_change",
+          "weight": 10
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "dns_tls"
+    },
+    {
+      "diagnosis": "tls_certificate_expired",
+      "any_of": [
+        "tls_expired"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "tls_expired",
+          "weight": 45
+        },
+        {
+          "feature": "failure_change",
+          "weight": 10
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "dns_tls"
+    },
+    {
+      "diagnosis": "tls_trust",
+      "any_of": [
+        "tls_untrusted"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "tls_untrusted",
+          "weight": 45
+        },
+        {
+          "feature": "failure_change",
+          "weight": 10
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "dns_tls"
+    },
+    {
+      "diagnosis": "tls_hostname_mismatch",
+      "any_of": [
+        "tls_hostname"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "tls_hostname",
+          "weight": 45
+        },
+        {
+          "feature": "failure_change",
+          "weight": 10
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "dns_tls"
+    },
+    {
+      "diagnosis": "deployment_regression",
+      "any_of": [
+        "version_association"
+      ],
+      "all_of": [
+        "deploy_observed"
+      ],
+      "support": [
+        {
+          "feature": "version_association",
+          "weight": 30
+        },
+        {
+          "feature": "deploy_observed",
+          "weight": 15
+        },
+        {
+          "feature": "failure_change",
+          "weight": 10
+        },
+        {
+          "feature": "latency_change",
+          "weight": 10
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "versions"
+    },
+    {
+      "diagnosis": "expired_credentials",
+      "any_of": [
+        "credential_expired"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "credential_expired",
+          "weight": 45
+        },
+        {
+          "feature": "authentication_failure",
+          "weight": 20
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "authentication"
+    },
+    {
+      "diagnosis": "invalid_credentials",
+      "any_of": [
+        "credential_invalid"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "credential_invalid",
+          "weight": 40
+        },
+        {
+          "feature": "authentication_failure",
+          "weight": 20
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "authentication"
+    },
+    {
+      "diagnosis": "authorization_denied",
+      "any_of": [
+        "access_denied"
+      ],
+      "all_of": [],
+      "support": [
+        {
+          "feature": "access_denied",
+          "weight": 40
+        }
+      ],
+      "contradictions": [],
+      "minimum_score": 30,
+      "query": "authentication"
+    }
+  ],
+  "episodes": {},
+  "ranker": {
+    "weights": {},
+    "active": false,
+    "training_episodes": 0,
+    "validation_episodes": 0,
+    "validation_pairs": 0,
+    "baseline_correct": 0,
+    "candidate_correct": 0
+  },
+  "evaluation": {
+    "synthetic": true,
+    "representative": false,
+    "held_out_origins": 8,
+    "counts": {
+      "cases": 50,
+      "eligible": 32,
+      "top_one": 32,
+      "top_three": 32,
+      "false_diagnoses": 0,
+      "abstentions": 18
+    },
+    "by_family": {
+      "authentication": {
+        "cases": 6,
+        "eligible": 6,
+        "top_one": 6,
+        "top_three": 6,
+        "false_diagnoses": 0,
+        "abstentions": 0
+      },
+      "benign_or_unknown": {
+        "cases": 18,
+        "eligible": 0,
+        "top_one": 0,
+        "top_three": 0,
+        "false_diagnoses": 0,
+        "abstentions": 18
+      },
+      "database": {
+        "cases": 9,
+        "eligible": 9,
+        "top_one": 9,
+        "top_three": 9,
+        "false_diagnoses": 0,
+        "abstentions": 0
+      },
+      "dependency": {
+        "cases": 7,
+        "eligible": 7,
+        "top_one": 7,
+        "top_three": 7,
+        "false_diagnoses": 0,
+        "abstentions": 0
+      },
+      "deployment": {
+        "cases": 1,
+        "eligible": 1,
+        "top_one": 1,
+        "top_three": 1,
+        "false_diagnoses": 0,
+        "abstentions": 0
+      },
+      "dns_tls": {
+        "cases": 9,
+        "eligible": 9,
+        "top_one": 9,
+        "top_three": 9,
+        "false_diagnoses": 0,
+        "abstentions": 0
+      }
+    },
+    "protocol_version": "diagnostics-1"
+  }
+}

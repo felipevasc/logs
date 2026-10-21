@@ -1,0 +1,666 @@
+[
+  {
+    "id": "pool.hikari",
+    "origin": "eval-pool",
+    "split": "evaluation",
+    "expected": "pool_exhaustion",
+    "records": [
+      {
+        "failure": true,
+        "message": "HikariPool-2 - Connection is not available, request timed out after 30000ms"
+      }
+    ]
+  },
+  {
+    "id": "pool.exhausted",
+    "origin": "eval-pool",
+    "split": "evaluation",
+    "expected": "pool_exhaustion",
+    "records": [
+      {
+        "failure": true,
+        "message": "database connection pool exhausted"
+      }
+    ]
+  },
+  {
+    "id": "pool.metric",
+    "origin": "eval-pool",
+    "split": "evaluation",
+    "expected": "pool_exhaustion",
+    "records": [
+      {
+        "failure": true,
+        "message": "timeout acquiring connection",
+        "metrics": {
+          "pool_active": 40,
+          "pool_limit": 40,
+          "pool_pending": 6,
+          "acquire_ms": 30000
+        }
+      }
+    ]
+  },
+  {
+    "id": "database.limit",
+    "origin": "eval-database",
+    "split": "evaluation",
+    "expected": "database_connection_limit",
+    "records": [
+      {
+        "failure": true,
+        "message": "FATAL: sorry, too many clients already"
+      }
+    ]
+  },
+  {
+    "id": "database.sqlstate",
+    "origin": "eval-database",
+    "split": "evaluation",
+    "expected": "database_connection_limit",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "code": "53300",
+        "product": "postgresql"
+      }
+    ]
+  },
+  {
+    "id": "database.deadlock",
+    "origin": "eval-database",
+    "split": "evaluation",
+    "expected": "database_lock_contention",
+    "records": [
+      {
+        "failure": true,
+        "message": "ERROR: deadlock detected; process blocked"
+      }
+    ]
+  },
+  {
+    "id": "database.lock",
+    "origin": "eval-database",
+    "split": "evaluation",
+    "expected": "database_lock_contention",
+    "records": [
+      {
+        "failure": true,
+        "message": "Lock wait timeout exceeded; try restarting transaction"
+      }
+    ]
+  },
+  {
+    "id": "database.slow",
+    "origin": "eval-database",
+    "split": "evaluation",
+    "expected": "slow_database",
+    "records": [
+      {
+        "failure": true,
+        "message": "slow query detected: elapsed duration exceeded limit"
+      }
+    ]
+  },
+  {
+    "id": "database.slo",
+    "origin": "eval-database",
+    "split": "evaluation",
+    "expected": "slow_database",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "success": true,
+        "metrics": {
+          "query_ms": 2000,
+          "query_limit_ms": 1000
+        }
+      }
+    ]
+  },
+  {
+    "id": "dependency.connect",
+    "origin": "eval-dependency",
+    "split": "evaluation",
+    "expected": "dependency_unavailable",
+    "records": [
+      {
+        "failure": true,
+        "message": "dial tcp: connection refused"
+      }
+    ]
+  },
+  {
+    "id": "dependency.code",
+    "origin": "eval-dependency",
+    "split": "evaluation",
+    "expected": "dependency_unavailable",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "code": "ECONNREFUSED"
+      }
+    ]
+  },
+  {
+    "id": "dependency.connecttimeout",
+    "origin": "eval-dependency",
+    "split": "evaluation",
+    "expected": "dependency_unavailable",
+    "records": [
+      {
+        "failure": true,
+        "message": "connect timed out while connecting to upstream"
+      }
+    ]
+  },
+  {
+    "id": "dependency.reset",
+    "origin": "eval-dependency",
+    "split": "evaluation",
+    "expected": "dependency_unavailable",
+    "records": [
+      {
+        "failure": true,
+        "message": "connection reset by peer"
+      }
+    ]
+  },
+  {
+    "id": "dependency.read",
+    "origin": "eval-dependency",
+    "split": "evaluation",
+    "expected": "dependency_slow",
+    "records": [
+      {
+        "failure": true,
+        "message": "java.net.SocketTimeoutException: Read timed out"
+      }
+    ]
+  },
+  {
+    "id": "dependency.nginx",
+    "origin": "eval-dependency",
+    "split": "evaluation",
+    "expected": "dependency_slow",
+    "records": [
+      {
+        "failure": true,
+        "message": "upstream timed out (110: Connection timed out) while reading response header from upstream"
+      }
+    ]
+  },
+  {
+    "id": "dependency.slo",
+    "origin": "eval-dependency",
+    "split": "evaluation",
+    "expected": "dependency_slow",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "metrics": {
+          "dependency_ms": 7000,
+          "dependency_limit_ms": 3000
+        }
+      }
+    ]
+  },
+  {
+    "id": "dns.java",
+    "origin": "eval-dns",
+    "split": "evaluation",
+    "expected": "dns_resolution",
+    "records": [
+      {
+        "failure": true,
+        "message": "java.net.UnknownHostException: upstream.example"
+      }
+    ]
+  },
+  {
+    "id": "dns.node",
+    "origin": "eval-dns",
+    "split": "evaluation",
+    "expected": "dns_resolution",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "code": "EAI_AGAIN"
+      }
+    ]
+  },
+  {
+    "id": "dns.go",
+    "origin": "eval-dns",
+    "split": "evaluation",
+    "expected": "dns_resolution",
+    "records": [
+      {
+        "failure": true,
+        "message": "lookup upstream.example on resolver: no such host"
+      }
+    ]
+  },
+  {
+    "id": "tls.expired",
+    "origin": "eval-tls",
+    "split": "evaluation",
+    "expected": "tls_certificate_expired",
+    "records": [
+      {
+        "failure": true,
+        "message": "certificate has expired"
+      }
+    ]
+  },
+  {
+    "id": "tls.code",
+    "origin": "eval-tls",
+    "split": "evaluation",
+    "expected": "tls_certificate_expired",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "code": "CERT_HAS_EXPIRED"
+      }
+    ]
+  },
+  {
+    "id": "tls.chain",
+    "origin": "eval-tls",
+    "split": "evaluation",
+    "expected": "tls_trust",
+    "records": [
+      {
+        "failure": true,
+        "message": "javax.net.ssl.SSLHandshakeException: PKIX path building failed"
+      }
+    ]
+  },
+  {
+    "id": "tls.go",
+    "origin": "eval-tls",
+    "split": "evaluation",
+    "expected": "tls_trust",
+    "records": [
+      {
+        "failure": true,
+        "message": "x509: certificate signed by unknown authority"
+      }
+    ]
+  },
+  {
+    "id": "tls.hostname",
+    "origin": "eval-tls",
+    "split": "evaluation",
+    "expected": "tls_hostname_mismatch",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "code": "ERR_TLS_CERT_ALTNAME_INVALID"
+      }
+    ]
+  },
+  {
+    "id": "tls.names",
+    "origin": "eval-tls",
+    "split": "evaluation",
+    "expected": "tls_hostname_mismatch",
+    "records": [
+      {
+        "failure": true,
+        "message": "hostname mismatch in peer certificate"
+      }
+    ]
+  },
+  {
+    "id": "auth.expired",
+    "origin": "eval-auth",
+    "split": "evaluation",
+    "expected": "expired_credentials",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "product": "authentication",
+        "auth_reason": "token_expired"
+      }
+    ]
+  },
+  {
+    "id": "auth.windows",
+    "origin": "eval-auth",
+    "split": "evaluation",
+    "expected": "expired_credentials",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "product": "windows-security",
+        "auth_reason": "0xC0000071"
+      }
+    ]
+  },
+  {
+    "id": "auth.password",
+    "origin": "eval-auth",
+    "split": "evaluation",
+    "expected": "invalid_credentials",
+    "records": [
+      {
+        "failure": true,
+        "message": "password authentication failed for user",
+        "product": "postgresql"
+      }
+    ]
+  },
+  {
+    "id": "auth.invalid",
+    "origin": "eval-auth",
+    "split": "evaluation",
+    "expected": "invalid_credentials",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "product": "authentication",
+        "auth_reason": "invalid_password"
+      }
+    ]
+  },
+  {
+    "id": "auth.policy",
+    "origin": "eval-auth",
+    "split": "evaluation",
+    "expected": "authorization_denied",
+    "records": [
+      {
+        "failure": true,
+        "message": "permission denied for relation orders"
+      }
+    ]
+  },
+  {
+    "id": "auth.scope",
+    "origin": "eval-auth",
+    "split": "evaluation",
+    "expected": "authorization_denied",
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "product": "authentication",
+        "auth_reason": "insufficient_scope"
+      }
+    ]
+  },
+  {
+    "id": "deployment.regression",
+    "origin": "eval-deployment",
+    "split": "evaluation",
+    "expected": "deployment_regression",
+    "records": [
+      {
+        "failure": true,
+        "message": "operation failed after declared change",
+        "deployment": true
+      }
+    ],
+    "derived_features": [
+      "version_association",
+      "failure_change"
+    ]
+  },
+  {
+    "id": "benign.quoted",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "example: connection pool exhausted"
+      }
+    ]
+  },
+  {
+    "id": "benign.payload",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "request.body=connection refused"
+      }
+    ]
+  },
+  {
+    "id": "benign.tlsnegative",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "certificate is not expired"
+      }
+    ]
+  },
+  {
+    "id": "benign.tlsfalse",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "certificate expired=false"
+      }
+    ]
+  },
+  {
+    "id": "benign.locknegative",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "no deadlock detected"
+      }
+    ]
+  },
+  {
+    "id": "benign.readnegative",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "no read timeout"
+      }
+    ]
+  },
+  {
+    "id": "benign.countzero",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "invalid credentials count=0"
+      }
+    ]
+  },
+  {
+    "id": "benign.unknownphase",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "request timeout"
+      }
+    ]
+  },
+  {
+    "id": "benign.unknownauth",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "authentication failed",
+        "product": "authentication"
+      }
+    ]
+  },
+  {
+    "id": "benign.unknown401",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "product": "web",
+        "code": "401"
+      }
+    ]
+  },
+  {
+    "id": "benign.windowsstatus",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "product": "windows-security",
+        "code": "503"
+      }
+    ]
+  },
+  {
+    "id": "benign.windowsid",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "product": "windows-security",
+        "code": "53300"
+      }
+    ]
+  },
+  {
+    "id": "benign.bodyerror",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "error while reading response: invalid chunk"
+      }
+    ]
+  },
+  {
+    "id": "benign.healthy",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "connection refused",
+        "success": true
+      }
+    ]
+  },
+  {
+    "id": "benign.documentation",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "invalid credentials",
+        "documentation": true
+      }
+    ]
+  },
+  {
+    "id": "benign.withoutreference",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "metrics": {
+          "query_ms": 8000
+        }
+      }
+    ]
+  },
+  {
+    "id": "benign.busy",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "",
+        "success": true,
+        "metrics": {
+          "pool_active": 50,
+          "pool_limit": 50
+        }
+      }
+    ]
+  },
+  {
+    "id": "benign.missing",
+    "origin": "eval-benign",
+    "split": "evaluation",
+    "expected": null,
+    "records": [
+      {
+        "failure": true,
+        "message": "operation did not complete"
+      }
+    ]
+  },
+  {
+    "id": "dev.pool",
+    "origin": "dev-private-lab",
+    "split": "development",
+    "expected": "pool_exhaustion",
+    "records": [
+      {
+        "failure": true,
+        "message": "timeout waiting for connection from pool"
+      }
+    ]
+  }
+]

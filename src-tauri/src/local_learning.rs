@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
 };
 
-pub const VERSION: &str = "local-learning-1";
+pub const VERSION: &str = "local-learning-2";
 const TRAINING_CAP: usize = 10_000;
 const RECEIPT_CAP: u64 = 200_000;
 const VALIDATION_CAP: usize = 256;
@@ -230,6 +230,8 @@ struct Sentinel {
     failure: bool,
     latency_ms: Option<f64>,
     bytes: Option<f64>,
+    #[serde(default)]
+    previous_message: Option<String>,
 }
 impl Sentinel {
     fn observation(&self) -> Observation<'_> {
@@ -313,6 +315,7 @@ struct Row {
     product: String,
     action: String,
     outcome: String,
+    diagnostic_failure: bool,
 }
 impl Row {
     fn get(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -329,6 +332,7 @@ impl Row {
             product: r.get(9)?,
             action: r.get(10)?,
             outcome: r.get(11)?,
+            diagnostic_failure: r.get(12)?,
         })
     }
     fn observation(&self) -> Observation<'_> {
@@ -347,6 +351,7 @@ impl Row {
             failure: self.failure,
             latency_ms: self.latency,
             bytes: self.bytes,
+            previous_message: None,
         }
     }
     fn receipt(&self) -> String {
@@ -368,7 +373,7 @@ impl Row {
         )
     }
 }
-const SELECT_ROWS:&str="SELECT ref,eid,ts,message,failure,latency,bytes,stream,protected,product,action,outcome FROM learning_input WHERE context=?1 AND valid ORDER BY stream,ts,ref";
+const SELECT_ROWS:&str="SELECT ref,eid,ts,message,failure,latency,bytes,stream,protected,product,action,outcome,diagnostic_failure FROM learning_input WHERE context=?1 AND valid ORDER BY stream,ts,ref";
 #[derive(Default)]
 struct Previous {
     stream: String,
@@ -376,6 +381,7 @@ struct Previous {
     cluster: Option<u32>,
     public: Option<PublicState>,
     ambiguous: bool,
+    message: Option<String>,
 }
 impl Previous {
     fn cluster(&self, row: &Row) -> Option<u32> {
@@ -397,6 +403,7 @@ impl Previous {
         self.ts = Some(row.ts);
         self.cluster = cluster;
         self.public = public;
+        self.message = Some(row.message.clone());
     }
 }
 
@@ -486,12 +493,13 @@ fn analyze_mode(
           substr(coalesce(json_extract(f.payload,'$.metadata.learning.dependency'),''),1,256) AS dependency,
           json_array(f.ns,f.source,substr(coalesce(json_extract(f.payload,'$.metadata.service'),''),1,256),substr(coalesce(json_extract(f.payload,'$.metadata.learning.operation'),json_extract(f.payload,'$.action'),''),1,256)) AS context,
           coalesce(json_extract(f.payload,'$.parse_ok'),0) AND NOT coalesce(json_extract(f.payload,'$.metadata.content_clipped'),0) AND f.ts IS NOT NULL AND json_extract(f.payload,'$.metadata.time.ambiguity') IS NULL AS valid,
+          coalesce(json_extract(f.payload,'$.metadata.diagnostics.failure'),0) AND coalesce(json_extract(f.payload,'$.metadata.diagnostics.mask'),0)<>0 AS diagnostic_failure,
           EXISTS(SELECT 1 FROM members m JOIN findings v USING(n) WHERE m.ref=f.ref AND v.level>=3)
             OR EXISTS(SELECT 1 FROM investigation_members m JOIN investigation_signals s ON m.id=s.id WHERE m.ref=f.ref AND s.priority>=35) AS protected
         FROM investigation_facts f;
         CREATE INDEX learning_input_context ON learning_input(context,stream,ts,ref);
         CREATE INDEX learning_input_time ON learning_input(context,ts);
-        CREATE TEMP TABLE learning_flags(ref TEXT PRIMARY KEY,eid INTEGER,ts INTEGER,context TEXT,ns TEXT,source TEXT,kinds TEXT,surprise REAL);
+        CREATE TEMP TABLE learning_flags(ref TEXT PRIMARY KEY,eid INTEGER,ts INTEGER,context TEXT,ns TEXT,source TEXT,kinds TEXT,surprise REAL,individual INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX learning_flags_context ON learning_flags(context,ts);
         CREATE TABLE IF NOT EXISTS learning_exports(domain TEXT PRIMARY KEY,payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS learning_incidents(id TEXT PRIMARY KEY,kind TEXT,ns TEXT,col TEXT,entity TEXT,priority INTEGER,first INTEGER,last INTEGER,payload TEXT);
@@ -598,7 +606,11 @@ fn analyze_mode(
         while let Some(row) = rows.next().map_err(error)? {
             check()?;
             let row = Row::get(row).map_err(error)?;
-            if row.ts > cutoff || row.protected || training_keys.len() >= TRAINING_CAP {
+            if row.ts > cutoff
+                || row.protected
+                || row.diagnostic_failure
+                || training_keys.len() >= TRAINING_CAP
+            {
                 previous = Previous::default();
                 continue;
             }
@@ -674,6 +686,7 @@ fn analyze_mode(
                 row.bytes,
                 row.message.split_whitespace().count(),
             );
+            let previous_message = previous.cluster(&row).and(previous.message.clone());
             let mut score = if persisted || row.ts > cutoff {
                 frozen.score(&key, &obs, previous.cluster(&row))
             } else {
@@ -692,16 +705,20 @@ fn analyze_mode(
                 score.deviations.push(log_learning::Deviation{kind:"shared_context_candidate".into(),surprise:-((support as f64+0.5)/(shared_total as f64+1.0)).log2(),support:shared_total,detail:"Combinação estrutural pouco observada na base compartilhada deste domínio. Candidato de baixa cobertura local; não define a normalidade deste ambiente.".into()});
             }
             previous.set(&row, score.cluster, None);
-            let changed: bool = db
+            let changed: Option<String> = db
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM learning_flags WHERE ref=?1)",
+                    "SELECT kinds FROM learning_flags WHERE ref=?1",
                     [&row.reference],
                     |r| r.get(0),
                 )
+                .optional()
                 .map_err(error)?;
-            if changed {
+            if let Some(changes) = changed {
                 score.ready = true;
-                score.deviations.push(log_learning::Deviation{kind:"temporal_change".into(),surprise:4.0,support:frozen.contexts.get(&key).map_or(0,|c|c.count),detail:"Mudança temporal persistente ou aumento da taxa de falhas em relação à referência aprendida.".into()});
+                score.deviations.extend(
+                    serde_json::from_str::<Vec<log_learning::Deviation>>(&changes)
+                        .map_err(error)?,
+                );
             }
             if score.ready {
                 scored += 1;
@@ -719,7 +736,7 @@ fn analyze_mode(
                     .map(|d| d.surprise)
                     .fold(0.0f64, f64::max);
                 db.execute(
-                    "INSERT OR IGNORE INTO learning_flags VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    "INSERT INTO learning_flags VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(ref) DO UPDATE SET kinds=excluded.kinds,surprise=max(learning_flags.surprise,excluded.surprise),individual=excluded.individual",
                     params![
                         row.reference,
                         row.id,
@@ -728,7 +745,8 @@ fn analyze_mode(
                         ns,
                         source,
                         kinds,
-                        surprise
+                        surprise,
+                        score.deviations.iter().any(|d| !matches!(d.kind.as_str(),"temporal_change"|"duration_change"|"failure_rate_change"))
                     ],
                 )
                 .map_err(error)?;
@@ -741,7 +759,9 @@ fn analyze_mode(
                     < (VALIDATION_CAP / groups.len().min(settings.limits.max_contexts).max(1))
                         .max(1)
             {
-                holdout.push(row.sentinel(&key));
+                let mut sample = row.sentinel(&key);
+                sample.previous_message = previous_message;
+                holdout.push(sample);
                 context_holdout += 1;
             }
             let already = profile
@@ -760,6 +780,7 @@ fn analyze_mode(
                 && !seen.contains(&receipt)
                 && (reviewed || !anchor_receipts.contains(&receipt))
                 && !row.protected
+                && (reviewed || !row.diagnostic_failure)
                 && (reviewed || !score.unusual())
                 && (reviewed || row.ts <= training_end)
                 && (training_keys.len() < TRAINING_CAP || is_bootstrap)
@@ -791,13 +812,37 @@ fn analyze_mode(
     let mut after = 0u64;
     let mut established = 0u64;
     let mut bootstrap_alerts = 0u64;
+    let mut lost_deviations = 0u64;
+    let mut new_deviations = 0u64;
     for sample in anchors.iter().chain(&holdout) {
-        let a = frozen.score(&sample.key, &sample.observation(), None);
-        let b = candidate.score(&sample.key, &sample.observation(), None);
+        let prior = |model: &Model| {
+            sample.previous_message.as_deref().and_then(|message| {
+                model
+                    .score(
+                        &sample.key,
+                        &Observation {
+                            message,
+                            failure: false,
+                            latency_ms: None,
+                            bytes: None,
+                        },
+                        None,
+                    )
+                    .cluster
+            })
+        };
+        let a = frozen.score(&sample.key, &sample.observation(), prior(&frozen));
+        let b = candidate.score(&sample.key, &sample.observation(), prior(&candidate));
         if a.ready {
             before += u64::from(a.unusual());
             after += u64::from(b.unusual());
             established += 1;
+            lost_deviations += u64::from(
+                a.deviations
+                    .iter()
+                    .any(|old| !b.deviations.iter().any(|new| new.kind == old.kind)),
+            );
+            new_deviations += u64::from(!a.unusual() && b.unusual());
         }
         if b.unusual() {
             bootstrap_alerts += 1;
@@ -807,6 +852,8 @@ fn analyze_mode(
         && !training_keys.is_empty()
         && holdout.len() >= 20
         && after <= before
+        && lost_deviations == 0
+        && new_deviations == 0
         && (established >= 20
             || bootstrap_alerts.saturating_mul(5) < (anchors.len() + holdout.len()) as u64);
     let incidents = if expected.is_none() {
@@ -841,7 +888,7 @@ fn analyze_mode(
     let used_revision = digest(&serde_json::to_vec(&frozen).map_err(error)?);
     let report = json!({"enabled":true,"version":VERSION,"model_revision":used_revision,"parent_revision":base,"model_generation":frozen.generation,"shared_revision":shared.revision(),"shared_matching_observations":shared_support,
         "repository":settings.github_repository,"branch":settings.github_branch,"total":total,"valid":valid,"scored":scored,"cold_start":cold_start,"unusual":unusual,"incidents":incidents,"contexts_limited":contexts_limited,"bootstrap_observations":bootstrap,"training_limit":TRAINING_CAP,"receipt_limit":RECEIPT_CAP,"compacted_receipts_bytes":seen.bytes().len(),"dedup_estimated_false_positive_rate":dedup_false_positive_rate,"model_contexts":frozen.contexts.len(),"dictionary_overflow":frozen.contexts.values().map(|c|c.overflow).sum::<u64>(),
-        "validation":{"holdout":holdout.len(),"historical_anchors":anchors.len(),"before_alerts":before,"after_alerts":after,"accepted":gate,"labels_required":false,"scope":"Temporally held-out observations and frozen historical anchors; this is a consistency check, not measured incident detection accuracy"},
+        "validation":{"holdout":holdout.len(),"historical_anchors":anchors.len(),"before_alerts":before,"after_alerts":after,"lost_deviations":lost_deviations,"new_deviations":new_deviations,"accepted":gate,"labels_required":false,"scope":"Temporally held-out observations and frozen historical anchors; established deviation kinds must be retained. This is not measured incident detection accuracy"},
         "update":{"status":if gate{"validated_pending_publication"}else if !settings.auto_update{"disabled"}else if receipts_count>=RECEIPT_CAP{"receipt_budget_reached"}else{"withheld"},"applied":false},
         "meaning":"Surpresa estatística e associações observadas; não atribuem causalidade ou nível de evidência.","privacy":"Mensagens e perfis ficam neste computador. A sincronização só publica contagens de estados de um vocabulário fechado e depende de uma ação explícita."});
     let pending = if gate {
@@ -904,9 +951,20 @@ fn detect_changes(
                 }
             }
             previous = Some(start);
-            let duration = latency
-                .zip(change.as_mut())
-                .is_some_and(|(value, detector)| detector.observe(value, n));
+            let mut histogram = log_learning::Histogram::default();
+            if change.is_some() && latency.is_some() {
+                let mut values=db.prepare_cached("SELECT latency FROM learning_input WHERE context=?1 AND valid AND ts BETWEEN ?2 AND ?3 AND ts>?4 AND latency IS NOT NULL").map_err(error)?;
+                for value in values
+                    .query_map(params![context, start, end, cutoff], |r| r.get::<_, f64>(0))
+                    .map_err(error)?
+                {
+                    check()?;
+                    histogram.push(Some(value.map_err(error)?));
+                }
+            }
+            let duration = change
+                .as_mut()
+                .is_some_and(|detector| detector.observe_histogram(&histogram));
             let failure_shift = n >= 20
                 && failures >= 3
                 && log_learning::rate_interval(failures, n).0
@@ -915,8 +973,8 @@ fn detect_changes(
                 (
                     "duration_change",
                     duration,
-                    "latency>?8",
-                    reference.latency.upper_quantile(0.95) * 1.25,
+                    "latency IS NOT NULL AND ?8>=0",
+                    0.0,
                 ),
                 (
                     "failure_rate_change",
@@ -928,15 +986,23 @@ fn detect_changes(
                 if !active {
                     continue;
                 }
-                let detail=json!([{"kind":kind,"surprise":4.0,"support":reference.count,"detail":"Mudança observada em janelas cronológicas, comparada à referência fixa; confirmar carga, versão, dependências e coleta."}]).to_string();
-                db.execute(&format!("INSERT OR IGNORE INTO learning_flags SELECT ref,eid,ts,context,?1,?2,?3,4.0 FROM learning_input WHERE context=?4 AND valid AND ts BETWEEN ?5 AND ?6 AND ts>?7 AND {condition}"),params![ns,source,detail,context,start,end,cutoff,threshold]).map_err(error)?;
+                let detail=json!([{"kind":kind,"surprise":4.0,"support":reference.count,"window_observations":n,"window_average_ms":latency,"collective_change":true,"detail":"Mudança coletiva em janela cronológica, comparada à referência fixa. Os membros sustentam a mudança da janela; não são necessariamente extremos individuais. Confirmar carga, versão, dependências e coleta."}]).to_string();
+                db.execute(&format!("INSERT OR IGNORE INTO learning_flags(ref,eid,ts,context,ns,source,kinds,surprise) SELECT ref,eid,ts,context,?1,?2,?3,4.0 FROM learning_input WHERE context=?4 AND valid AND ts BETWEEN ?5 AND ?6 AND ts>?7 AND {condition}"),params![ns,source,detail,context,start,end,cutoff,threshold]).map_err(error)?;
             }
         }
     }
     Ok(())
 }
 fn build_incidents(db: &Connection) -> Result<u64, String> {
-    let mut statement=db.prepare("SELECT context,ns,source,(ts/300000-CASE WHEN ts<0 AND ts%300000<>0 THEN 1 ELSE 0 END)*300000,count(*),max(surprise) FROM learning_flags GROUP BY context,(ts/300000-CASE WHEN ts<0 AND ts%300000<>0 THEN 1 ELSE 0 END) ORDER BY context,4").map_err(error)?;
+    db.execute_batch("DROP TABLE IF EXISTS temp.learning_episode_windows;
+        CREATE TEMP TABLE learning_episode_windows AS WITH previous AS (
+          SELECT *,lag(ts) OVER(PARTITION BY context ORDER BY ts,ref) previous_ts FROM learning_flags
+        ), episodes AS (
+          SELECT *,sum(CASE WHEN previous_ts IS NULL OR ts-previous_ts>120000 THEN 1 ELSE 0 END)
+            OVER(PARTITION BY context ORDER BY ts,ref ROWS UNBOUNDED PRECEDING) episode FROM previous
+        ) SELECT context,ns,source,min(ts) first,max(ts) last,count(*) observations,max(surprise) surprise
+          FROM episodes GROUP BY context,episode;").map_err(error)?;
+    let mut statement=db.prepare("SELECT context,ns,source,first,last,observations,surprise FROM learning_episode_windows ORDER BY context,first").map_err(error)?;
     let groups = statement
         .query_map([], |r| {
             Ok((
@@ -944,16 +1010,16 @@ fn build_incidents(db: &Connection) -> Result<u64, String> {
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
-                r.get::<_, u64>(4)?,
-                r.get::<_, f64>(5)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, u64>(5)?,
+                r.get::<_, f64>(6)?,
             ))
         })
         .map_err(error)?;
     let mut total = 0;
     for group in groups {
         check()?;
-        let (context, ns, source, start, count, surprise) = group.map_err(error)?;
-        let end = start.saturating_add(299999);
+        let (context, ns, source, start, end, count, surprise) = group.map_err(error)?;
         let id = format!(
             "learned:{}",
             digest(json!([VERSION, context, start]).to_string().as_bytes())
@@ -991,12 +1057,12 @@ fn build_incidents(db: &Connection) -> Result<u64, String> {
     Ok(total)
 }
 fn contrasts(db: &Connection, context: &str, start: i64, end: i64) -> Result<Vec<Value>, String> {
-    let (population,hits):(u64,u64)=db.query_row("SELECT count(*),sum(EXISTS(SELECT 1 FROM learning_flags f WHERE f.ref=i.ref)) FROM learning_input i WHERE context=?1 AND valid AND ts BETWEEN ?2 AND ?3",params![context,start,end],|r|Ok((r.get(0)?,r.get(1)?))).map_err(error)?;
     let mut result = Vec::new();
     // Field names are constants. Both cohorts share namespace, source, service,
     // operation and time, preventing unrelated populations from becoming controls.
     for field in ["host", "version", "dependency"] {
-        let sql=format!("SELECT {field},count(*),sum(EXISTS(SELECT 1 FROM learning_flags f WHERE f.ref=i.ref)) FROM learning_input i WHERE context=?1 AND valid AND ts BETWEEN ?2 AND ?3 AND {field}<>'' GROUP BY {field} ORDER BY count(*) DESC,{field} LIMIT 32");
+        let (population,hits,unknown):(u64,u64,u64)=db.query_row(&format!("SELECT count(*) FILTER(WHERE {field}<>''),coalesce(sum(CASE WHEN {field}<>'' THEN EXISTS(SELECT 1 FROM learning_flags f WHERE f.ref=i.ref AND f.individual=1) ELSE 0 END),0),count(*) FILTER(WHERE {field}='') FROM learning_input i WHERE context=?1 AND valid AND ts BETWEEN ?2 AND ?3"),params![context,start,end],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(error)?;
+        let sql=format!("SELECT {field},count(*),sum(EXISTS(SELECT 1 FROM learning_flags f WHERE f.ref=i.ref AND f.individual=1)) FROM learning_input i WHERE context=?1 AND valid AND ts BETWEEN ?2 AND ?3 AND {field}<>'' GROUP BY {field} ORDER BY count(*) DESC,{field} LIMIT 32");
         let mut statement = db.prepare(&sql).map_err(error)?;
         for row in statement
             .query_map(params![context, start, end], |r| {
@@ -1020,10 +1086,14 @@ fn contrasts(db: &Connection, context: &str, start: i64, end: i64) -> Result<Vec
             } else {
                 Some(rest_hits as f64 / rest as f64)
             };
-            let lower = log_learning::rate_interval(k, n).0;
-            let upper = log_learning::rate_interval(rest_hits, rest).1;
+            // Conservative simultaneous intervals for at most 96 exploratory
+            // comparisons (three declared fields, 32 values each).
+            let cohort_interval = log_learning::rate_interval_with_z(k, n, 3.65);
+            let comparison_interval = log_learning::rate_interval_with_z(rest_hits, rest, 3.65);
+            let lower = cohort_interval.0;
+            let upper = comparison_interval.1;
             let discriminates = rest >= 5 && lower > upper;
-            result.push(json!({"field":field,"value":value,"observations":n,"unusual":k,"rate":rate,"comparison_observations":rest,"comparison_unusual":rest_hits,"comparison_rate":other,"status":if discriminates{"supports_association"}else if rest<5{"insufficient_controls"}else{"inconclusive"},"hypothesis":if discriminates{format!("Investigar a diferença associada a {field}={value}; o desvio se concentra nesse grupo.")}else{"A comparação disponível não distingue esta hipótese.".into()},"limitations":["Associação observacional; não demonstra causa.","Comparações exploratórias exigem confirmação independente."]}));
+            result.push(json!({"field":field,"value":value,"observations":n,"unusual":k,"rate":rate,"interval":cohort_interval,"comparison_observations":rest,"comparison_unusual":rest_hits,"comparison_rate":other,"comparison_interval":comparison_interval,"unknown_observations":unknown,"effect_rate_difference":other.map(|v|rate-v),"interval_policy":"Wilson z=3.65; approximate simultaneous control for up to 96 exploratory comparisons","status":if discriminates{"supports_association"}else if rest<5{"insufficient_controls"}else{"inconclusive"},"hypothesis":if discriminates{format!("Investigar a diferença associada a {field}={value}; o desvio se concentra nesse grupo com valor conhecido.")}else{"A comparação disponível não distingue esta hipótese.".into()},"limitations":["Associação observacional; não demonstra causa.","Valores desconhecidos não são controles. Comparações exploratórias exigem confirmação independente."]}));
         }
     }
     result.sort_by(|a, b| {
@@ -1132,9 +1202,71 @@ mod tests {
         db
     }
     #[test]
+    fn unknown_versions_never_become_version_controls() {
+        isolated(|| {
+            let db = fixture("unknown", true, false);
+            db.execute_batch("UPDATE investigation_facts SET payload=json_set(payload,'$.metadata.learning.version','') WHERE json_extract(payload,'$.metadata.learning.version')='A';").unwrap();
+            analyze(&db, &Settings::default()).unwrap();
+            let payload: String = db
+                .query_row("SELECT payload FROM learning_incidents LIMIT 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let value: Value = serde_json::from_str(&payload).unwrap();
+            let comparison = value["measurements"]["comparisons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["field"] == "version")
+                .unwrap();
+            assert_eq!(comparison["comparison_observations"], 0);
+            assert_eq!(comparison["status"], "insufficient_controls");
+            // This episode contains only the failures. Include nearby known
+            // population explicitly to exercise the original contamination.
+            let context: String = db
+                .query_row("SELECT context FROM learning_input LIMIT 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let comparisons =
+                contrasts(&db, &context, 1_700_000_000_000, 1_700_000_400_000).unwrap();
+            let c = comparisons
+                .iter()
+                .find(|v| v["field"] == "version")
+                .unwrap();
+            assert_eq!(c["unknown_observations"], 370);
+            assert_eq!(c["comparison_observations"], 0);
+            assert_eq!(c["status"], "insufficient_controls");
+        });
+    }
+    #[test]
+    fn collective_moderate_latency_shift_keeps_members_and_one_episode() {
+        isolated(|| {
+            let db = fixture("shift", false, false);
+            db.execute_batch("DELETE FROM investigation_facts;")
+                .unwrap();
+            for i in 0..3000 {
+                let payload = json!({"template":"request completed successfully","action":"request","outcome":"success","parse_ok":true,"latency_ms":if i<1800{12.0}else{17.0},"metadata":{"product":"application","service":"service","learning":{"operation":"read"}}});
+                db.execute("INSERT INTO investigation_facts VALUES(?1,?2,'tenant-a',?3,'app.log','host','',?4)",params![format!("shift:{i}"),i,1_700_000_040_000i64+i*2000,payload.to_string()]).unwrap();
+            }
+            let (report, _) = analyze(&db, &Settings::default()).unwrap();
+            assert!(report["unusual"].as_u64().unwrap() > 0);
+            assert_eq!(report["incidents"], 1);
+            let members: u64 = db
+                .query_row("SELECT count(*) FROM investigation_members", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(members, report["unusual"].as_u64().unwrap());
+            let not_extreme:u64=db.query_row("SELECT count(*) FROM learning_flags f JOIN learning_input i USING(ref) WHERE latency=17",[],|r|r.get(0)).unwrap();
+            assert_eq!(not_extreme, members);
+        });
+    }
+    #[test]
     fn learned_incidents_have_exact_members_controls_and_no_automatic_evidence_promotion() {
         isolated(|| {
             let db = fixture("batch-a", true, false);
+            db.execute_batch("INSERT INTO investigation_facts SELECT replace(ref,'batch-a:','control:'),eid+400,ns,ts,source,'host-a',session,json_set(payload,'$.template','request completed successfully','$.outcome','success','$.code','200','$.latency_ms',12,'$.metadata.learning.version','A','$.metadata.learning.failure',0) FROM investigation_facts WHERE eid BETWEEN 250 AND 279;").unwrap();
             let (report, pending) = analyze(&db, &Settings::default()).unwrap();
             assert!(report["incidents"].as_u64().unwrap() > 0);
             assert_eq!(report["validation"]["labels_required"], false);
@@ -1157,14 +1289,23 @@ mod tests {
                     r.get(0)
                 })
                 .unwrap();
-            assert_eq!(members, 30);
+            assert_eq!(members, report["unusual"].as_u64().unwrap());
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM learning_flags WHERE individual=1",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+                30
+            );
             let update = pending
                 .expect("clean holdout validates the normal portion")
                 .commit()
                 .unwrap();
             assert_eq!(update["applied"], true);
             let profile = open_profile(&profile_path()).unwrap();
-            let withheld_row=db.query_row("SELECT ref,eid,ts,message,failure,latency,bytes,stream,protected,product,action,outcome FROM learning_input WHERE ref='batch-a:260'",[],Row::get).unwrap();
+            let withheld_row=db.query_row("SELECT ref,eid,ts,message,failure,latency,bytes,stream,protected,product,action,outcome,diagnostic_failure FROM learning_input WHERE ref='batch-a:260'",[],Row::get).unwrap();
             let withheld: bool = profile
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM receipts WHERE event=?1)",
@@ -1265,7 +1406,7 @@ mod tests {
             pending.unwrap().commit().unwrap();
             let profile = open_profile(&profile_path()).unwrap();
             for reference in ["protected:100", "protected:101"] {
-                let row=db.query_row("SELECT ref,eid,ts,message,failure,latency,bytes,stream,protected,product,action,outcome FROM learning_input WHERE ref=?1",[reference],Row::get).unwrap();
+                let row=db.query_row("SELECT ref,eid,ts,message,failure,latency,bytes,stream,protected,product,action,outcome,diagnostic_failure FROM learning_input WHERE ref=?1",[reference],Row::get).unwrap();
                 let stored: bool = profile
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM receipts WHERE event=?1)",
@@ -1315,7 +1456,7 @@ mod tests {
                 )
                 .unwrap();
             let result = learn_expected(&db, &Settings::default(), &id).unwrap();
-            assert_eq!(result["applied"], true);
+            assert_eq!(result["applied"], true, "{result}");
             assert_eq!(result["classification_updated"], false);
             let profile = open_profile(&profile_path()).unwrap();
             let (model, _) = load_model(&profile, &Limits::default()).unwrap();

@@ -1,10 +1,18 @@
 //! Bounded CPU-only online learning. Scores describe surprise, never causality.
 //! Local message prototypes are deliberately absent from the sharing protocol.
 mod change;
+mod diagnostic_facts;
+mod diagnostic_knowledge;
+mod diagnostic_ranker;
+mod diagnostics;
 mod model;
 mod seen;
 mod shared;
 pub use change::*;
+pub use diagnostic_facts::*;
+pub use diagnostic_knowledge::*;
+pub use diagnostic_ranker::*;
+pub use diagnostics::*;
 pub use model::*;
 pub use seen::*;
 pub use shared::*;

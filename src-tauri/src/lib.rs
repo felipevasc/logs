@@ -52,6 +52,11 @@ mod security_packs;
 mod security_proposals;
 mod investigation;
 mod local_learning;
+mod local_diagnostics;
+mod diagnostic_memory;
+mod diagnostic_knowledge;
+#[cfg(test)]
+mod diagnostic_tests;
 mod learning_commands;
 mod security_content;
 mod security_store;

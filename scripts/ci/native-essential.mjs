@@ -13,6 +13,7 @@ const units = [
   'workspace::canonical::tests::', 'triage::on_demand_tests::',
   'security_progress::tests::',
   'local_learning::tests::', 'learning_commands::tests::',
+  'diagnostic_tests::',
   'source_publication::tests::', 'global_scheduler::tests::',
   'remote::tests::', 'remote_files::tests::', 'field_indexes::tests::',
   'log_split::',

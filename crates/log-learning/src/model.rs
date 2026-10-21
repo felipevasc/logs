@@ -87,6 +87,7 @@ pub struct Cluster {
 /// Incremental token clustering, not a claim of equivalence to Drain.
 /// Fixed token and dictionary budgets make cost independent of log volume.
 pub fn tokens(message: &str) -> Vec<String> {
+    let mut previous_is_code = false;
     message
         .split_whitespace()
         .take(48)
@@ -94,7 +95,36 @@ pub fn tokens(message: &str) -> Vec<String> {
             let word = word.trim_matches(|c: char| {
                 matches!(c, '"' | '\'' | ',' | ';' | '[' | ']' | '(' | ')')
             });
-            if word.len() > 48
+            let lower = word.to_ascii_lowercase();
+            let code_label = |s: &str| {
+                matches!(
+                    s.trim_end_matches([':', '=']),
+                    "sqlstate"
+                        | "errno"
+                        | "error_code"
+                        | "errorcode"
+                        | "status"
+                        | "status_code"
+                        | "http_status"
+                        | "event_id"
+                        | "eventid"
+                )
+            };
+            let explicit_code = lower.split_once(['=', ':']).is_some_and(|(key, value)| {
+                code_label(key)
+                    && !value.is_empty()
+                    && value.len() <= 24
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            });
+            let code_value = previous_is_code
+                && word.len() <= 24
+                && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            previous_is_code = code_label(&lower);
+            if explicit_code || code_value {
+                format!("#code:{lower}")
+            } else if word.len() > 48
                 || word.chars().any(|c| c.is_ascii_digit())
                 || word.contains('=')
                 || word.starts_with('/')
@@ -117,23 +147,36 @@ fn matching(clusters: &[Cluster], words: &[String]) -> Option<usize> {
                 return None;
             }
             let anchor = |s: &str| {
-                matches!(
-                    s,
-                    "error"
-                        | "erro"
-                        | "failed"
-                        | "failure"
-                        | "success"
-                        | "successfully"
-                        | "sucesso"
-                        | "timeout"
-                        | "denied"
-                        | "negado"
-                        | "started"
-                        | "completed"
-                        | "cancelled"
-                        | "fatal"
-                )
+                s.starts_with("#code:")
+                    || s.ends_with("exception")
+                    || matches!(
+                        s,
+                        "error"
+                            | "erro"
+                            | "failed"
+                            | "failure"
+                            | "success"
+                            | "successfully"
+                            | "sucesso"
+                            | "timeout"
+                            | "denied"
+                            | "negado"
+                            | "started"
+                            | "completed"
+                            | "cancelled"
+                            | "fatal"
+                            | "not"
+                            | "no"
+                            | "never"
+                            | "without"
+                            | "não"
+                            | "sem"
+                            | "econnrefused"
+                            | "econnreset"
+                            | "etimedout"
+                            | "enotfound"
+                            | "eai_again"
+                    )
             };
             if cluster
                 .tokens
@@ -438,13 +481,16 @@ impl Context {
 
 /// Wilson bounds keep tiny cohorts from looking like convincing explanations.
 pub fn rate_interval(hits: u64, total: u64) -> (f64, f64) {
+    rate_interval_with_z(hits, total, 1.96)
+}
+pub fn rate_interval_with_z(hits: u64, total: u64, z: f64) -> (f64, f64) {
     if total == 0 {
         return (0.0, 1.0);
     }
     let n = total as f64;
     let p = hits.min(total) as f64 / n;
-    let z2 = 3.8416;
+    let z2 = z * z;
     let center = (p + z2 / (2.0 * n)) / (1.0 + z2 / n);
-    let radius = 1.96 * ((p * (1.0 - p) + z2 / (4.0 * n)) / n).sqrt() / (1.0 + z2 / n);
+    let radius = z * ((p * (1.0 - p) + z2 / (4.0 * n)) / n).sqrt() / (1.0 + z2 / n);
     ((center - radius).max(0.0), (center + radius).min(1.0))
 }

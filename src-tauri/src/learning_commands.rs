@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
-    /// status, reset, rollback, accept_expected, export, import, download or publish.
+    /// Local learning and diagnostic memory/knowledge actions. Publication is explicit.
     pub action: String,
     #[serde(default)]
     pub signal_id: Option<String>,
@@ -77,11 +77,24 @@ fn github_content(content: &Value) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
+fn diagnostic_workflow(content: &Value) -> Result<(), String> {
+    let bytes = github_content(content)?;
+    let workflow = std::str::from_utf8(&bytes).map_err(|_| "Workflow de aprendizado inválido")?;
+    if !workflow.contains("diagnostic-consolidate") || !workflow.contains("models/diagnostic-contributions/") {
+        return Err("Atualize a branch de aprendizado com o workflow e o núcleo desta versão antes de publicar diagnósticos".into());
+    }
+    Ok(())
+}
 pub fn execute(full: &Results, request: Request) -> Result<Value, String> {
     match request.action.as_str() {
         "status" => Ok(full.metadata["investigation"]["learning"].clone()),
         "reset" => crate::local_learning::reset(),
         "rollback" => crate::local_learning::rollback(),
+        "diagnostic_memory_status" => crate::diagnostic_memory::status(),
+        "diagnostic_feedback" => full.diagnostic_feedback(request.signal_id.as_deref().ok_or("Escolha o episódio a revisar")?,request.document.ok_or("Forneça o resultado da investigação")?),
+        "diagnostic_export"=>serde_json::to_value(crate::diagnostic_memory::contributions()?).map_err(|e|e.to_string()),
+        "diagnostic_import"=>crate::diagnostic_knowledge::store(request.document.ok_or("Forneça a base diagnóstica")?),
+        "diagnostic_rollback"=>crate::diagnostic_knowledge::rollback(),
         "accept_expected" => full.learn_expected(
             request
                 .signal_id
@@ -99,9 +112,9 @@ pub fn execute(full: &Results, request: Request) -> Result<Value, String> {
             let model: SharedModel = serde_json::from_value(document).map_err(|e| e.to_string())?;
             store_shared(&model)
         }
-        "download" | "publish" => synchronize(full, &request),
+        "download" | "publish" | "diagnostic_download" | "diagnostic_publish" => synchronize(full, &request),
         _ => {
-            Err("Ação deve ser status, reset, rollback, accept_expected, export, import, download ou publish".into())
+            Err("Ação desconhecida. Use status/reset/rollback/accept_expected/export/import/download/publish ou diagnostic_memory_status/feedback/export/import/rollback/download/publish com prefixo diagnostic_.".into())
         }
     }
 }
@@ -129,11 +142,13 @@ fn synchronize(full: &Results, request: &Request) -> Result<Value, String> {
             builder
         }
     };
-    if request.action == "download" {
+    let diagnostic=request.action.starts_with("diagnostic_");
+    if request.action == "download" || request.action=="diagnostic_download" {
+        let filename=if diagnostic{"diagnostic-knowledge.json"}else{"shared-model.json"};
         let response = auth(
             client
                 .get(format!(
-                    "{endpoint}/contents/models/shared-model.json?ref={}",
+                    "{endpoint}/contents/models/{filename}?ref={}",
                     settings.github_branch
                 ))
                 .header("Accept", "application/vnd.github.raw+json"),
@@ -143,11 +158,17 @@ fn synchronize(full: &Results, request: &Request) -> Result<Value, String> {
             "Não foi possível consultar a base no GitHub; o aprendizado local permanece disponível"
         })?;
         let content = bounded_json(response)?;
+        if diagnostic{
+            let _lane=crate::security_store::working_lane()?;
+            return crate::diagnostic_knowledge::store(content);
+        }
         let model: SharedModel = serde_json::from_value(content).map_err(|e| e.to_string())?;
         return store_shared(&model);
     }
     token.ok_or("Publicar exige token temporário com escrita no repositório configurado")?;
-    let contributions = full.learning_contributions()?;
+    let contributions=if diagnostic{
+        crate::diagnostic_memory::contributions()?.contributions.into_iter().map(serde_json::to_value).collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?
+    }else{full.learning_contributions()?.into_iter().map(serde_json::to_value).collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?};
     if contributions.is_empty() {
         return Err("Não há contribuição validada nesta análise".into());
     }
@@ -184,24 +205,31 @@ fn synchronize(full: &Results, request: &Request) -> Result<Value, String> {
     } else {
         bounded_json(branch)?;
     }
+    if diagnostic {
+        let response = auth(client.get(format!("{endpoint}/contents/.github/workflows/learning.yml?ref={}", settings.github_branch)))
+            .send().map_err(|_| "Falha ao verificar a consolidação diagnóstica na branch")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err("A branch de aprendizado precisa do workflow desta versão antes de receber diagnósticos".into());
+        }
+        diagnostic_workflow(&bounded_json(response)?)?;
+    }
     let mut published = 0;
     let mut already = 0;
     for contribution in contributions {
         crate::operations::check()?;
-        contribution.validate()?;
+        let id=contribution["id"].as_str().ok_or("Contribuição sem identidade pública")?;
+        let folder=if diagnostic{"diagnostic-contributions"}else{"contributions"};
         let url = format!(
-            "{endpoint}/contents/models/contributions/{}.json",
-            contribution.id
+            "{endpoint}/contents/models/{folder}/{id}.json"
         );
         let existing = auth(client.get(format!("{url}?ref={}", settings.github_branch)))
             .send()
             .map_err(|_| "Falha ao conferir contribuição no GitHub")?;
         if existing.status().is_success() {
-            let remote: log_learning::Contribution =
-                serde_json::from_slice(&github_content(&bounded_json(existing)?)?)
-                    .map_err(|_| "A contribuição existente no Git não tem o formato esperado")?;
-            remote.validate()?;
-            if remote.id != contribution.id {
+            let bytes=github_content(&bounded_json(existing)?)?;
+            let remote_id=if diagnostic{let remote:log_learning::DiagnosticContribution=serde_json::from_slice(&bytes).map_err(|_|"Contribuição diagnóstica inválida no Git")?;remote.validate()?;remote.id}
+                else{let remote:log_learning::Contribution=serde_json::from_slice(&bytes).map_err(|_|"Contribuição inválida no Git")?;remote.validate()?;remote.id};
+            if remote_id != id {
                 return Err("O arquivo no Git diverge da contribuição identificada".into());
             }
             already += 1;
@@ -226,6 +254,12 @@ fn synchronize(full: &Results, request: &Request) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_publication_requires_a_compatible_consolidation_workflow() {
+        let wire = |text: &str| json!({"content":base64::engine::general_purpose::STANDARD.encode(text)});
+        assert!(diagnostic_workflow(&wire("consolidate models/contributions")).is_err());
+        assert!(diagnostic_workflow(&wire(include_str!("../../.github/workflows/learning.yml"))).is_ok());
+    }
     #[test]
     fn credentials_are_never_rendered_by_debug_and_repository_paths_are_bounded() {
         let request = Request {

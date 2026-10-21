@@ -15,7 +15,12 @@ try {
     window.__mockInvestigationFixture = { analysis_id: 'preview-analysis', investigation: { enabled: true, complete: true, population: 6000, signals: 2, edges: 1 } };
     const signal = { id: 'signal-a', kind: 'new_relationship', namespace: 'tenant-a', value, priority: 25, explanation: 'Relação nova; confira cobertura.', measurements: { events: 1 }, benign_alternatives: ['Deploy autorizado'], missing_evidence: ['Autorização'] };
     window.__mockInvestigationFixture.investigation.learning = {enabled:true,scored:4000,unusual:30,incidents:1,cold_start:2000,valid:5900,total:6000,model_revision:'fixture-local-revision',shared_revision:'fixture-shared-revision',update:{status:'accepted',applied:true},repository:'felipevasc/logs',branch:'learning-models',validation:{holdout:80,accepted:true}};
+    window.__mockInvestigationFixture.investigation.diagnostics = {enabled:true,available:true,episodes:1,abstentions:0,repository:'felipevasc/logs',branch:'learning-models'};
+    const original = {event_ref:state.rows[0].event_ref || `preview:${state.rows[0].id}`,event_id:state.rows[0].id,timestamp:state.rows[0].timestamp};
     window.__mockInvestigationPages = {
+      diagnostics:{items:[{id:'diagnostic-a',value,source:'app.log',namespace:'tenant-a',first:1700000000000,last:1700000060000,supporting_events:30,scope:{operation:'checkout',dependency:'database'},assessment:{hypotheses:[{diagnosis:'pool_exhaustion',title:'Espera ou saturação do pool de conexões',score:65,support:[{description:'Há espera na fila do pool',observations:30,typed_observations:30,event_refs:[original]}],counter_evidence:[],missing_evidence:['Duração de aquisição versus execução de consulta']}]},queries:[{id:'query-pool',title:'Comparar aquisição, fila e ocupação do pool'}]}]},
+      diagnostic_query:{items:[{...original,period:'during',source:'app.log',version:'B',host:'host-a',observations:['Há espera na fila do pool'],measurements:{pool_pending:7}}],query:{title:'Comparar aquisição, fila e ocupação do pool',interpretation:'Aquisição lenta com fila e ocupação no limite sustenta saturação.'},overview:[{period:'during',records:30,failures:30,known_outcomes:30,unknown_outcomes:0,records_with_measurements:30}],unknown_policy:'Ausência sem cobertura permanece desconhecida.'},
+      diagnostic_members:{items:[original]},
       learning: {items:[{...signal,id:'learned-a',kind:'local_learning',explanation:'Mudança aprendida nesta operação.',measurements:{comparisons:[{field:'version',value,observations:30,unusual:30,comparison_observations:100,comparison_unusual:0,hypothesis:'Investigar a versão associada ao desvio.',status:'supports_association'}]}}]},
       queue: { items: [{ namespace: 'tenant-a', column: '@user', value, priority: 25, ranking: { score: 25, independent_groups: 1, meaning: 'Ordem de investigação, sem promoção de evidência.' } }] },
       signals: { items: [signal] }, members: { items: [{ event_ref: state.rows[0].event_ref || `preview:${state.rows[0].id}`, event_id: state.rows[0].id, timestamp: state.rows[0].timestamp }] },
@@ -29,6 +34,7 @@ try {
   await page.evaluate(() => Workspace.showPage('compromises'));
   await page.locator('[data-calculate-compromises]').click();
   const host = page.locator('[data-investigation]'); await host.waitFor();
+  await host.getByRole('button',{name:'Fila de investigação',exact:true}).click();
   phase = 'queue and literal text';
   await host.getByText('Ordem de investigação, sem promoção de evidência.', { exact: true }).waitFor({ state: 'attached' });
   assert.equal(await host.locator('img').count(), 0); assert.equal(await page.evaluate(() => window.__unsafe), undefined);
@@ -50,6 +56,27 @@ try {
   await learning.getByText(/fixture_only/).waitFor();
   assert.equal(await credential.inputValue(),'');assert.doesNotMatch(await learning.innerText(),/private-test-token/);
   assert.equal(await page.evaluate(()=>window.__mockCommandCalls.investigation_learning||0),1,'opening the learning panel never uploads automatically');
+  phase = 'diagnostic evidence, actionable query and explicit resolution';
+  await host.getByRole('button',{name:'Diagnósticos e próximas verificações',exact:true}).click();
+  await host.locator('summary').filter({hasText:'Espera ou saturação do pool de conexões'}).waitFor();
+  assert.equal(await host.locator('img').count(),0);
+  await host.getByRole('button',{name:'Comparar aquisição, fila e ocupação do pool',exact:true}).click();
+  await host.getByText('Aquisição lenta com fila e ocupação no limite sustenta saturação.',{exact:true}).waitFor();
+  assert.match(await host.innerText(),/30\/30 resultados conhecidos com falha/);
+  await host.getByRole('button',{name:'Abrir evento original',exact:true}).click();await host.getByText('Evento original',{exact:true}).waitFor();
+  await host.getByRole('button',{name:'Diagnósticos e próximas verificações',exact:true}).click();
+  await host.getByText('Registrar resultado da investigação',{exact:true}).click();
+  await host.getByLabel('Evidência ou resultado que sustenta a revisão',{exact:true}).fill('A inspeção confirmou fila e ocupação no limite.');
+  await host.getByRole('button',{name:'Salvar resolução local',exact:true}).click();await host.getByText('Resolução salva neste computador. Uma nova análise pode consultar este precedente.',{exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>window.__mockDiagnosticFeedback?.verdict),'confirmed');
+  const diagnosticKnowledge=host.locator('[data-diagnostic-knowledge]');await diagnosticKnowledge.locator('summary').first().click();
+  const diagnosticCredential=diagnosticKnowledge.getByLabel('Token temporário para conhecimento diagnóstico',{exact:true});await diagnosticCredential.fill('private-diagnostic-token');
+  await diagnosticKnowledge.getByRole('button',{name:'Publicar conhecimento revisado no Git',exact:true}).click();await diagnosticKnowledge.getByText(/contribuições publicadas/).waitFor();assert.equal(await diagnosticCredential.inputValue(),'');assert.doesNotMatch(await diagnosticKnowledge.innerText(),/private-diagnostic-token/);
+  await diagnosticKnowledge.locator('summary').first().click();
+  await learning.locator('summary').first().click();
+  assert.equal(await host.locator('img').count(),0);
+  await host.locator('summary').filter({hasText:'Espera ou saturação do pool de conexões'}).scrollIntoViewIfNeeded();
+  await page.screenshot({path:'output/playwright/diagnostics-evidence.png',fullPage:true});
   phase = 'guided hunts and competing hypotheses';
   await host.getByRole('button', { name: 'Caças guiadas', exact: true }).click();
   await host.getByRole('button', { name: 'Abrir caça', exact: true }).click();
@@ -83,6 +110,6 @@ try {
   await host.getByText(/Resultado incompleto ou de outra análise/).waitFor();
   assert.equal(await page.evaluate(() => window.__mockRequests.filter(row => row.cmd === "triage" && !row.cacheOnly).length), 1, 'paging and hunts never scan');
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ queue: true, localLearning: true, explicitSharing: true, tokenCleared: true, exactOriginalEvent: true, hunts: true, escapedText: true, literalOriginalValues: true, staleAnalysisRejected: true, errors }, null, 2));
+  console.log(JSON.stringify({ queue: true, localLearning: true, diagnosticEvidence: true, diagnosticQuery: true, explicitResolution: true, explicitSharing: true, tokenCleared: true, exactOriginalEvent: true, hunts: true, escapedText: true, literalOriginalValues: true, staleAnalysisRejected: true, errors }, null, 2));
 } catch (error) { await captureFailure(page, 'test-investigation', error, { phase }); throw error; }
 finally { await browser.close(); }

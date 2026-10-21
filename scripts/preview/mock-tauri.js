@@ -1013,6 +1013,10 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
       if (analysisId !== window.__mockInvestigationFixture?.analysis_id) throw Error('Análise de aprendizado desatualizada.');
       if (request.action === 'publish') return {status:'fixture_only',published:1,raw_logs_sent:false};
       if (request.action === 'export') return {schema_version:1,contributions:[]};
+      if (request.action === 'diagnostic_feedback') {window.__mockDiagnosticFeedback=structuredClone(request.document);return {saved:true,ranking_active:false};}
+      if (request.action === 'diagnostic_memory_status') return {resolutions:1,ranking:{active:false}};
+      if (request.action === 'diagnostic_publish') return {published:1,already_present:0,raw_logs_sent:false};
+      if (request.action === 'diagnostic_export') return {schema_version:1,contributions:[]};
       return {status:'fixture_only',revision:'fixture-revision'};
     },
     investigation_narrative_review: ({analysisId,draft}) => { if(!draft?.claims?.length) throw Error('Síntese sem afirmações'); return {analysis_id:analysisId,classification_updated:false,semantic_validation:'human_review_required',citation_membership:'fixture_only',claims:draft.claims}; },
