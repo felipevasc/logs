@@ -10,12 +10,15 @@ export const fullPreview = [
   'test-exclusion-archive.mjs', 'test-field-transform.mjs',
   'test-investigation.mjs', 'test-updates.mjs',
   'test-security-on-demand.mjs', 'test-compromise-progress.mjs',
+  'test-local-explorer.mjs', 'test-regex-workbench.mjs', 'test-extraction.mjs',
 ];
 export const essentialPreview = [
   'test-workspace-context.mjs', 'test-native-case-startup.mjs',
   'test-native-case-timeline.mjs', 'test-updates.mjs',
 ];
 const affected = [
+  [/^frontend\/(?:local-explorer|local-native|file-viewer)\.(?:js|css)$/, ['test-local-explorer.mjs']],
+  [/^frontend\/(?:regex-|event-pattern-search|event-context|field-extraction)/, ['test-regex-workbench.mjs']],
   [/^frontend\/resources\.(?:js|css)$/, ['test-resources.mjs']],
   [/^frontend\/value-inspector\.js$/, ['test-value-inspector.mjs']],
   [/^frontend\/(?:analysis-|discovery|event-insights)/, ['test-analysis-workbench.mjs', 'test-discovery.mjs']],

@@ -8,6 +8,7 @@
 //! engine, which also remains the fallback for any engine error.
 mod build;
 mod ops;
+pub(crate) mod console;
 mod sparse_timeline;
 pub(crate) mod sql;
 mod text;
@@ -54,6 +55,7 @@ fn derived_signature(derived: &[CompiledDerived]) -> Option<String> {
     if derived.is_empty() { return Some(String::new()); }
     let mut definitions = Vec::with_capacity(derived.len());
     let mut lookups = Vec::new();
+    let mut advanced = Vec::new();
     for field in derived {
         if field.source == "id" { return None; }
         if let Some(lookup) = &field.lookup {
@@ -69,9 +71,11 @@ fn derived_signature(derived: &[CompiledDerived]) -> Option<String> {
             rules.push((rule.re.as_str(), &rule.template, &rule.filter, &rule.filter_security_signature));
         }
         definitions.push((&field.name, &field.source, &field.steps, rules));
+        if let Some(value)=&field.advanced{advanced.push((&field.name,&value.definition));}
     }
     // Version all derived overlays (including legacy regex) because bounded
     // extraction/provenance semantics changed. Base immutable stores stay valid.
+    if !advanced.is_empty(){return Some(format!("derived-overlay-advanced:{}:{}:{}:{}",crate::advanced_fields::VERSION,crate::field_transform::VERSION,crate::reference_lookup::VERSION,serde_json::to_string(&(definitions,lookups,advanced)).ok()?));}
     if lookups.is_empty() {
         return Some(format!("derived-overlay-v3:{}:{}", crate::field_transform::VERSION, serde_json::to_string(&definitions).ok()?));
     }
@@ -233,7 +237,7 @@ mod catalog_identity_tests {
         let derive = |pattern: &str| {
             let mut settings = crate::case_security::Settings::default();
             settings.threat_catalog_json = Some(serde_json::json!({"version":1,"name":"Case","rules":[{"id":"case.signal","name":"Signal","category":"test","severity":"medium","kind":"indicator","pattern":pattern,"description":"Fixture","enabled":true}]}).to_string());
-            crate::case_security::compiling(&settings, || vec![CompiledDerived {
+            crate::case_security::compiling(&settings, || vec![CompiledDerived { advanced: None,
                 name: "tag".into(), source: "message".into(), steps: vec![], lookup: None,
                 rules: vec![crate::sources::CompiledRule::new(regex::Regex::new("(.*)").unwrap(), None,
                     Some(crate::query::Filter { column: "_all".into(), op: "threat_rule".into(), value: "case.signal".into(), value2: None })).unwrap()],
@@ -2304,7 +2308,7 @@ mod segment_tests {
             crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
         let codes = CodesConfig::default();
         let base = spec(&old, &codes, &codes, &[]).unwrap();
-        let derived = vec![CompiledDerived {
+        let derived = vec![CompiledDerived { advanced: None,
             name: "extracted".into(),
             source: "message".into(),
             lookup: None,

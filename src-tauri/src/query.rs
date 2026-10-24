@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Filter {
     pub column: String,
     pub op: String,
@@ -38,9 +38,20 @@ pub struct PreparedFilter {
     /// Detection rule reproduced as evidence filter (`op = "detection"`).
     detection: Option<(std::sync::Arc<crate::detections::RuleSet>, usize)>,
     finding: Option<Arc<crate::security_results::Results>>,
+    /// Compiled expression of a `search` filter, with the engine the user chose.
+    pub(crate) search: Option<Arc<crate::search_predicate::Predicate>>,
+    /// Whole words required by a `term` filter (see `field_indexes::tokens`).
+    terms: Vec<String>,
 }
 
 impl PreparedFilter {
+    pub(crate) fn terms(&self) -> &[String] {
+        &self.terms
+    }
+    /// The bounds were typed as dates (compare instants).
+    pub(crate) fn is_time(&self) -> bool {
+        self.time
+    }
     /// Parsed numeric bounds, shared with the SQL compiler so native range
     /// predicates use exactly the same timestamp/unit parsing as the reader.
     pub(crate) fn numeric_bounds(&self) -> (Option<f64>, Option<f64>) {
@@ -83,6 +94,18 @@ pub(crate) fn prepare_with_threat_catalog(
             // A range needs both ends in the same domain.
             let mixed = f.op == "between" && num2.is_some() && time != time2;
             PreparedFilter {
+                terms: if f.op == "term" {
+                    let mut words: Vec<String> = Vec::new();
+                    for word in crate::field_indexes::tokens(&f.value) {
+                        if !words.contains(&word) {
+                            words.push(word);
+                        }
+                    }
+                    words
+                } else {
+                    Vec::new()
+                },
+                search: (f.op == "search").then(|| crate::search_predicate::compile(f).ok().map(Arc::new)).flatten(),
                 finding: if f.op=="finding"{crate::detections::cached_for_finding(&f.value).ok()}else if f.op=="episode"{f.value2.as_deref().and_then(crate::detections::cached_analysis)}else{None},
                 regex: is_re.then(|| crate::query_regex::compile(&f.value, crate::query_regex::ORDINARY).ok()).flatten(),
                 needle_lower: if is_query { String::new() } else { f.value.to_lowercase() },
@@ -291,6 +314,7 @@ fn matches_in_domain(ev: &Event, pf: &PreparedFilter, indexed: bool) -> bool {
                 .is_some_and(|(set, index)| set.rules[*index].matches(ev))
         }
         "pattern" => return crate::insights::pattern_of(&ev.message) == f.value,
+        "search" => return search_matches(ev, pf),
         _ => {}
     }
     if f.column == "_all" && !reads_all_as_column(op) {
@@ -308,6 +332,29 @@ fn matches_in_domain(ev: &Event, pf: &PreparedFilter, indexed: bool) -> bool {
         return number_matches(pf, number.filter(|value| !indexed || f.column != "timestamp" || *value != 0.0));
     }
     value_matches(pf, ev.col_ref(&f.column).as_deref())
+}
+
+/// A `search` filter reads one field. A matching failure (PCRE2 limit, deadline,
+/// oversized record) aborts the query through the admitted scope: it must never
+/// turn into a quiet "no match", which would make every count and export wrong.
+fn search_matches(ev: &Event, pf: &PreparedFilter) -> bool {
+    let Some(predicate) = &pf.search else {
+        crate::analysis_runtime::record_failure("Expressão de busca inválida ou incompleta.".into());
+        return false;
+    };
+    if pf.f.column == "_all" {
+        crate::analysis_runtime::record_failure("A busca por expressão exige um campo específico.".into());
+        return false;
+    }
+    let value = if pf.f.column == "raw" && ev.raw.is_empty() { Some(std::borrow::Cow::Borrowed(ev.message.as_str())) } else { ev.col_ref(&pf.f.column) };
+    let Some(value) = value else { return false };
+    match predicate.is_match(&value) {
+        Ok(hit) => hit,
+        Err(error) => {
+            crate::analysis_runtime::record_failure(error);
+            false
+        }
+    }
 }
 
 /// List and network operators read a column literally named `_all`.
@@ -393,11 +440,21 @@ pub(crate) fn value_matches(pf: &PreparedFilter, value: Option<&str>) -> bool {
                 .is_some_and(|ip| pf.nets.iter().any(|n| n.contains(ip)));
             (f.op == "cidr") == hit
         }
+        // Only engines that cannot fail while matching reach a column test.
+        "search" => pf.search.as_ref().is_some_and(|p| p.is_match(value.unwrap_or("")).unwrap_or(false)),
         // Regex inválida é rejeitada na validação; aqui nunca casa.
         "regex" => pf
             .regex
             .as_ref()
             .is_some_and(|re| re.is_match(value.unwrap_or(""))),
+        // Every word of the filter must be a whole word of the value.
+        "term" => {
+            !pf.terms.is_empty()
+                && value.is_some_and(|s| {
+                    let present: std::collections::HashSet<String> = crate::field_indexes::tokens(s).collect();
+                    pf.terms.iter().all(|t| present.contains(t))
+                })
+        }
         "contains" => value.is_some_and(|s| ci_contains_bytes(s.as_bytes(), needle.as_bytes())),
         "not_contains" => value.is_none_or(|s| !ci_contains_bytes(s.as_bytes(), needle.as_bytes())),
         "equals" => value.is_some_and(|s| s.eq_ignore_ascii_case(f.value.trim())),
@@ -677,7 +734,7 @@ fn meta_check(pf: &PreparedFilter, meta: &LineMeta, line: &[u8], enriched: bool)
     }
     // Exact selection uses decoded field values, including whitespace and case.
     // Raw spans can contain JSON escapes or represent a normalized standard field.
-    if matches!(op, "equals_exact" | "not_equals_exact" | "threat_rule" | "finding" | "episode") {
+    if matches!(op, "equals_exact" | "not_equals_exact" | "term" | "threat_rule" | "finding" | "episode") {
         return Tri::NeedEvent;
     }
     let v = f.value.trim();

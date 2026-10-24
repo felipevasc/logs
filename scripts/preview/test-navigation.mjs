@@ -24,7 +24,7 @@ try {
   assert.equal(new Set([analysis.accent, caseArea.accent, structure.accent]).size, 3, "yellow, purple and orange accents");
   assert.deepEqual(analysis.menu, ["summary", "compromises", "case-timeline", "explore"]);
   assert.deepEqual(caseArea.menu, ["summary", "compromises", "case-timeline", "explore", "evidence"]);
-  assert.deepEqual(structure.menu, ["sources", "connections", "import"]);
+  assert.deepEqual(structure.menu, ["sources", "connections", "import", "file-viewer", "extraction", "log-split"]);
   assert.equal(structure.scope, "dataset");
   results.areas = { analysis: analysis.accent, case: caseArea.accent, structure: structure.accent };
 

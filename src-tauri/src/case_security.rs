@@ -273,7 +273,7 @@ mod tests {
         use rayon::prelude::*;
         let a = custom("CASE_ALPHA"); let b = custom("CASE_BRAVO");
         let derive = |security: &Settings| compiling(security, || {
-            let regular = crate::sources::CompiledDerived {
+            let regular = crate::sources::CompiledDerived { advanced: None,
                 name: "captured_match".into(), source: "message".into(), steps: vec![], lookup: None,
                 rules: vec![crate::sources::CompiledRule::new(regex::Regex::new("(CASE_[A-Z]+)").unwrap(), None,
                     Some(crate::query::Filter { column: "_all".into(), op: "threat_rule".into(), value: "case.signal".into(), value2: None })).unwrap()],

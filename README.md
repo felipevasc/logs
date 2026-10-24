@@ -4,6 +4,8 @@ Aplicacao desktop para investigar logs, feita com Tauri 2: o backend em Rust ind
 
 ## Recursos
 
+- **Estrutura → Visualizar arquivos** (leitura direta e progressiva do texto original, sem preparar os eventos) e **Estrutura → Extração e normalização** (amostras reais, extração visual, Grok, tipos, conferência no conjunto e índices opcionais; [guia](docs/extracao-normalizacao.md)) e **Explorar → Eventos, SQL e Processos:** pesquisa por expressão (texto literal, regex Rust ou PCRE2) aplicada ao conjunto completo, com editor assistido por seleção, contexto dos eventos na gaveta de detalhes, campos derivados por captura, consultas DuckDB paginadas e exportadas integralmente, enriquecimento declarativo com proveniência e árvores de processos com vínculos explícitos ou inferidos. [Uso e limites da exploração local](docs/exploracao-local.md).
+
 - Aprendizado local sem rótulos: famílias de mensagens, sequências, desvios combinados e mudanças temporais, com diagnóstico por comparação e eventos originais. Perfis incrementais por Caso, validação temporal e contribuições agregadas opcionais para uma base versionada no Git. CPU, sem LLM ou envio de logs. [Uso, privacidade e limites](docs/aprendizado-local.md).
 
 - Casos independentes, com fontes, filtros, análises e preferências próprias. **Achados** reúne os itens preservados dentro do Caso. Índices opcionais de campos pelo menu contextual, marcador discreto e carregamento paralelo de múltiplos arquivos. [Casos e índices](docs/casos-indices-conexoes.md).

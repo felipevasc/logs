@@ -72,6 +72,22 @@ mod security_reconstruct;
 mod discovery;
 mod distinct;
 mod engine;
+mod search_regex;
+mod search_predicate;
+mod regex_lab;
+mod text_reader;
+mod grok;
+mod map_values;
+mod map_extract;
+mod enrichment_maps;
+mod map_lab;
+mod map_templates;
+mod advanced_fields;
+mod sql_console;
+mod process_tree;
+mod local_analysis;
+mod event_search;
+mod search_highlights;
 mod entities;
 mod event_preview;
 mod field_transform;
@@ -682,20 +698,36 @@ async fn field_index_status(app: AppHandle, analysis_context: Option<analysis_co
         let source = analysis_runtime::source(&state);
         match &*source {
             SourceData::Indexed(idx) => field_indexes::status(idx),
-            _ => Ok(field_indexes::Status { fields: Vec::new(), rows: 0 }),
+            _ => Ok(field_indexes::Status { fields: Vec::new(), rows: 0, indexes: Vec::new() }),
         }
     }).await?
 }
 
+/// `kind`: `exact` (default), `range` or `terms`.
 #[tauri::command]
-async fn field_index_create(column: String, app: AppHandle, operation_id: Option<String>, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<field_indexes::Status, String> {
+async fn field_index_create(column: String, kind: Option<String>, app: AppHandle, operation_id: Option<String>, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<field_indexes::Status, String> {
+    let kind = field_indexes::Kind::parse(kind.as_deref())?;
     let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Dataset, operation_id.clone(), crate::global_scheduler::Priority::Normal).await?;
     offload_admitted(operation_id, app.clone(), admitted, move || {
         let state = app.state::<AppState>();
         let source = analysis_runtime::source(&state);
         match &*source {
-            SourceData::Indexed(idx) => field_indexes::build(idx, &column, state.inner(), Some(&app)),
+            SourceData::Indexed(idx) => field_indexes::build(idx, &column, kind, state.inner(), Some(&app)),
             _ => Err("Abra um arquivo na Análise para criar seu índice de campo.".into()),
+        }
+    }).await?
+}
+
+#[tauri::command]
+async fn field_index_remove(column: String, kind: Option<String>, app: AppHandle, analysis_context: Option<analysis_context::Identity>, source_generation: Option<u64>) -> Result<field_indexes::Status, String> {
+    let kind = field_indexes::Kind::parse(kind.as_deref())?;
+    let admitted = analysis_runtime::capture_async(app.clone(), analysis_context, source_generation, analysis_runtime::Mode::Dataset, None, crate::global_scheduler::Priority::Normal).await?;
+    offload_admitted(None, app.clone(), admitted, move || {
+        let state = app.state::<AppState>();
+        let source = analysis_runtime::source(&state);
+        match &*source {
+            SourceData::Indexed(idx) => field_indexes::remove(idx, &column, kind),
+            _ => Err("Abra um arquivo na Análise para gerenciar seus índices.".into()),
         }
     }).await?
 }
@@ -949,10 +981,11 @@ fn load_derived() -> Vec<sources::CompiledDerived> {
                 // of the entire source when legacy parsing skips that rule.
                 return None;
             }
-            if rules.is_empty() && d.steps.is_empty() && d.lookup.is_none() {
+            let advanced=d.advanced.map(crate::advanced_fields::Compiled::new).transpose().ok()?;
+            if rules.is_empty() && d.steps.is_empty() && d.lookup.is_none() && advanced.is_none() {
                 None
             } else {
-                Some(sources::CompiledDerived {
+                Some(sources::CompiledDerived { advanced,
                     name: d.name,
                     source: d.source,
                     rules,
@@ -2318,6 +2351,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            local_analysis::local_analysis,
             resource_monitor::resource_snapshot,
             ui_zoom,
             resource_settings::resource_settings_status,
@@ -2391,6 +2425,7 @@ pub fn run() {
             load_files,
             field_index_status,
             field_index_create,
+            field_index_remove,
             clear_events,
             source_summary,
             source_snapshot,

@@ -4,7 +4,10 @@ import { existsSync } from 'node:fs';
 import { fullPreview, essentialPreview, planValidation, parseChangedPaths } from '../ci/validation-plan.mjs';
 
 test('the core matrix exists and shared or unknown changes cannot skip it', () => {
-  assert(fullPreview.length <= 10);
+  // One bounded flow covers the local exploration fronts; one more the expression workbench.
+  assert(fullPreview.length <= 13);
+  assert(fullPreview.includes('test-local-explorer.mjs'));
+  assert(fullPreview.includes('test-regex-workbench.mjs'));
   assert(fullPreview.includes('test-workspace-context.mjs'));
   assert(fullPreview.includes('test-investigation.mjs'));
   for (const name of fullPreview) assert(existsSync(new URL(`../preview/${name}`, import.meta.url)));

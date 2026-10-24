@@ -2203,6 +2203,8 @@ pub struct DerivedField {
     pub steps: Vec<crate::field_transform::Step>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lookup: Option<crate::reference_lookup::Definition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) advanced: Option<crate::advanced_fields::Definition>,
 }
 
 /// Formato de leitura tolerante ao legado (regra única na raiz do objeto).
@@ -2223,6 +2225,8 @@ pub struct DerivedFieldCompat {
     pub steps: Vec<crate::field_transform::Step>,
     #[serde(default)]
     pub lookup: Option<crate::reference_lookup::Definition>,
+    #[serde(default)]
+    pub(crate) advanced: Option<crate::advanced_fields::Definition>,
 }
 
 impl DerivedFieldCompat {
@@ -2241,6 +2245,7 @@ impl DerivedFieldCompat {
             rules,
             steps: self.steps,
             lookup: self.lookup,
+            advanced: self.advanced,
         }
     }
 }
@@ -2288,6 +2293,7 @@ pub struct CompiledDerived {
     pub rules: Vec<CompiledRule>,
     pub steps: Vec<crate::field_transform::Step>,
     pub(crate) lookup: Option<crate::reference_lookup::Compiled>,
+    pub(crate) advanced: Option<std::sync::Arc<crate::advanced_fields::Compiled>>,
 }
 
 /// Aplica os campos derivados a um evento. As regras de cada campo são
@@ -2314,6 +2320,27 @@ pub fn apply_derived(ev: &mut Event, derived: &[CompiledDerived]) {
         }
     }
     for d in derived {
+        if let Some(advanced) = &d.advanced {
+            match advanced.evaluate(ev, &d.source) {
+                Ok(Some(value)) => {
+                    let limits = crate::field_transform::Limits { output_bytes: (1 << 20).min(remaining), ..Default::default() };
+                    match crate::field_transform::expanded_fields(&d.name, &value, limits, 512) {
+                        Ok(fields) if !fields.keys().any(|name| ev.fields.contains_key(name)) => {
+                            let bytes = fields.iter().map(|(name,value)| name.len()+value.to_string().len()+32).sum::<usize>();
+                            if bytes > remaining { diagnostic(ev,&d.name,"advanced_limit","O enriquecimento excedeu o orçamento por registro.".into(),false); continue; }
+                            remaining -= bytes;
+                            for name in fields.keys() { ev.derived_originals.insert(name.clone(),crate::model::DerivedOriginal::Missing); }
+                            ev.fields.extend(fields);
+                        }
+                        Ok(_) => diagnostic(ev,&d.name,"target_conflict","Um campo original já usa esse nome. Escolha outro nome de saída.".into(),false),
+                        Err(error) => diagnostic(ev,&d.name,"advanced_limit",error.to_string(),false),
+                    }
+                }
+                Ok(None) => {},
+                Err(error) => diagnostic(ev,&d.name,"advanced_incomplete",error,false),
+            }
+            continue;
+        }
         if let Some(lookup) = &d.lookup {
             if !crate::field_transform::valid_typed_target(&d.name) {
                 diagnostic(ev, &d.name, "reserved_target", crate::field_transform::TARGET_NAME_ERROR.into(), false);
@@ -2474,7 +2501,7 @@ mod derived_transform_tests {
     use crate::field_transform::Step;
     use serde_json::json;
     fn definition(name: &str, source: &str, steps: Vec<Step>) -> CompiledDerived {
-        CompiledDerived { name: name.into(), source: source.into(), rules: Vec::new(), steps, lookup: None }
+        CompiledDerived { advanced: None, name: name.into(), source: source.into(), rules: Vec::new(), steps, lookup: None }
     }
     #[test]
     fn transformed_parent_and_children_keep_types_and_query_visibility() {

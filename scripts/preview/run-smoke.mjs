@@ -7,7 +7,7 @@ const root = fileURLToPath(new URL("../../", import.meta.url));
 const selected = process.argv.slice(2);
 // Historical restore probes have no assertions; the native test requires a
 // Windows executable and runs separately against real IPC, without this mock.
-const separateTests = new Set(["test-restore.mjs", "test-restore2.mjs", "test-native-desktop.mjs"]);
+const separateTests = new Set(["test-restore.mjs", "test-restore2.mjs", "test-native-desktop.mjs", "test-local-native.mjs"]);
 const available = (await readdir(new URL("./", import.meta.url)))
   .filter(name => /^test-[a-z0-9-]+\.mjs$/.test(name) && !separateTests.has(name)).sort();
 const tests = selected.length ? selected : fullPreview;

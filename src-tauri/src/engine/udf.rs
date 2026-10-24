@@ -14,6 +14,7 @@ use std::sync::{Arc, LazyLock};
 
 pub(crate) type TextTest = Arc<dyn Fn(Option<&str>) -> bool + Send + Sync>;
 pub(crate) type RowTest = Arc<dyn Fn(i64) -> Result<bool, String> + Send + Sync>;
+pub(crate) type RowText = Arc<dyn Fn(i64) -> Result<Option<String>, String> + Send + Sync>;
 pub(crate) type NumberTest = Arc<dyn Fn(Option<f64>) -> bool + Send + Sync>;
 
 #[derive(Clone)]
@@ -21,6 +22,7 @@ enum Test {
     Text(TextTest),
     Number(NumberTest),
     Row(RowTest),
+    Raw(RowText),
 }
 
 static TESTS: LazyLock<RwLock<HashMap<i32, Test>>> = LazyLock::new(Default::default);
@@ -68,6 +70,10 @@ impl Tests {
     pub(crate) fn row(&mut self, value: &str, test: RowTest) -> String {
         let id = self.add(Test::Row(test));
         format!("li_visible(CAST({value} AS BIGINT), {id})")
+    }
+    pub(crate) fn raw(&mut self, value: &str, read: RowText) -> String {
+        let id = self.add(Test::Raw(read));
+        format!("li_raw(CAST({value} AS BIGINT),{id})")
     }
     /// A structured planner placeholder, expanded before SQL reaches DuckDB.
     /// Keeping the complete free-text term together lets candidate selection
@@ -393,7 +399,49 @@ impl VScalar for BlankFn {
     }
 }
 
+struct RawFn;
+impl VScalar for RawFn {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, output: &mut dyn WritableVector) -> Result<(), Box<dyn Error>> {
+        let rows = input.len();
+        let values = input.flat_vector(0);
+        let tokens = input.flat_vector(1);
+        let positions = unsafe { values.as_slice_with_len::<i64>(rows) };
+        let ids = unsafe { tokens.as_slice_with_len::<i32>(rows) };
+        let mut out = output.flat_vector();
+        let mut current: Option<(i32, RowText)> = None;
+        let mut bytes = 0usize;
+        for row in 0..rows {
+            if values.row_is_null(row as u64) || tokens.row_is_null(row as u64) {
+                out.set_null(row);
+                continue;
+            }
+            let id = ids[row];
+            if current.as_ref().is_none_or(|(old, _)| *old != id) {
+                let Test::Raw(read) = lookup(id)? else {
+                    return Err("Leitor de texto fora do contexto admitido.".into());
+                };
+                current = Some((id, read));
+            }
+            match (current.as_ref().unwrap().1)(positions[row]).map_err(|e| -> Box<dyn Error> { e.into() })? {
+                Some(text) => {
+                    bytes = bytes.saturating_add(text.len());
+                    if bytes > 16 << 20 {
+                        return Err("O texto bruto excede 16 MiB por bloco SQL. Reduza o recorte de eventos.".into());
+                    }
+                    out.insert(row, text.as_str());
+                }
+                None => out.set_null(row),
+            }
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(vec![LogicalTypeId::Bigint.into(), LogicalTypeId::Integer.into()], LogicalTypeId::Varchar.into())]
+    }
+}
 pub(crate) fn register(conn: &Connection) -> duckdb::Result<()> {
+    conn.register_scalar_function::<RawFn>("li_raw")?;
     conn.register_scalar_function::<RowTestFn>("li_visible")?;
     conn.register_scalar_function::<TextTestFn>("li_test")?;
     conn.register_scalar_function::<NumberTestFn>("li_ntest")?;
@@ -436,5 +484,17 @@ mod visibility_tests {
         drop(tests);
         assert!(conn.query_row(&format!("SELECT li_visible(1::BIGINT,{id})"), [], |row| row.get::<_,bool>(0)).is_err());
         assert_eq!(conn.query_row("SELECT 7", [], |row| row.get::<_,i64>(0)).unwrap(),7);
+    }
+    #[test]
+    fn raw_vectors_keep_tokens_nulls_and_expiry_isolated() {
+        let conn=connection();let mut tests=Tests::default();
+        let a=tests.add(Test::Raw(Arc::new(|row|if row<0{Err("outside source".into())}else{Ok(Some(format!("a:{row}")))})));
+        let b=tests.add(Test::Raw(Arc::new(|row|Ok((row%3!=0).then(||format!("b:{row}"))))));
+        let mut statement=conn.prepare(&format!("SELECT id,li_raw(id,CASE WHEN id%2=0 THEN {a} ELSE {b} END) FROM range(4097) t(id) ORDER BY id")).unwrap();
+        let rows=statement.query_map([],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Option<String>>(1)?))).unwrap();
+        for row in rows{let (n,text)=row.unwrap();assert_eq!(text,if n%2==0{Some(format!("a:{n}"))}else{(n%3!=0).then(||format!("b:{n}"))});}
+        assert!(conn.query_row(&format!("SELECT li_raw(-1::BIGINT,{a})"),[],|row|row.get::<_,String>(0)).is_err());
+        drop(tests);
+        assert!(conn.query_row(&format!("SELECT li_raw(0::BIGINT,{a})"),[],|row|row.get::<_,String>(0)).is_err());
     }
 }

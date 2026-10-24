@@ -50,8 +50,8 @@ mod lookup_validation_tests {
             assert!(validate(&Config {derived_fields:vec![transform],references:vec![]}).is_err());
             let definition = crate::reference_lookup::parse_definition(&raw).unwrap().unwrap();
             for field in [
-                crate::sources::CompiledDerived {name:name.clone(),source:"message".into(),rules:vec![],steps:steps.clone(),lookup:None},
-                crate::sources::CompiledDerived {name:name.clone(),source:"message".into(),rules:vec![],steps:vec![],lookup:Some(crate::reference_lookup::Compiled::new(definition))},
+                crate::sources::CompiledDerived { advanced: None,name:name.clone(),source:"message".into(),rules:vec![],steps:steps.clone(),lookup:None},
+                crate::sources::CompiledDerived { advanced: None,name:name.clone(),source:"message".into(),rules:vec![],steps:vec![],lookup:Some(crate::reference_lookup::Compiled::new(definition))},
             ] {
                 let mut event = crate::model::Event::empty();event.message = "original".into();
                 crate::sources::apply_derived(&mut event,&[field]);
@@ -65,7 +65,7 @@ mod lookup_validation_tests {
         let raw = json!({"name":name,"source":"message","steps":["url_decode"]});
         validate(&Config {derived_fields:vec![raw],references:vec![]}).unwrap();
         let mut event = crate::model::Event::empty();event.message = "%2Fok".into();
-        let field = crate::sources::CompiledDerived {name:name.clone(),source:"message".into(),rules:vec![],steps:vec![crate::field_transform::Step::UrlDecode],lookup:None};
+        let field = crate::sources::CompiledDerived { advanced: None,name:name.clone(),source:"message".into(),rules:vec![],steps:vec![crate::field_transform::Step::UrlDecode],lookup:None};
         crate::sources::apply_derived(&mut event,&[field]);
         assert_eq!(event.fields[&name],json!("/ok"));assert!(event.derived_diagnostics.is_empty());
     }
@@ -80,7 +80,7 @@ pub(crate) fn regex_limits(total_rules: usize) -> Result<RegexLimits, String> {
         dfa_size_limit: DFA_RULE_BYTES.min(DFA_SET_BYTES / count),
     })
 }
-fn definition_rule_count(definitions: &[Value]) -> Result<usize, String> {
+pub(crate) fn definition_rule_count(definitions: &[Value]) -> Result<usize, String> {
     definitions.iter().try_fold(0usize, |total, definition| {
         let count = definition
             .get("rules")
@@ -97,7 +97,7 @@ fn definition_rule_count(definitions: &[Value]) -> Result<usize, String> {
             count
         };
         total
-            .checked_add(count)
+            .checked_add(count+usize::from(definition.get("advanced").and_then(|a|a.get("kind")).and_then(Value::as_str)==Some("captures")))
             .ok_or_else(|| "Contagem de regras excessiva.".to_string())
     })
 }
@@ -333,6 +333,14 @@ fn required_text<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
 }
 fn validate_definition(value: &Value, limits: Option<RegexLimits>) -> Result<(), String> {
     let name = required_text(value, "name")?;
+    if let Some(advanced) = value.get("advanced").filter(|v| !v.is_null()) {
+        if !crate::field_transform::valid_typed_target(name) { return Err(crate::field_transform::TARGET_NAME_ERROR.into()); }
+        required_text(value,"source")?;
+        if value.get("lookup").is_some_and(|v|!v.is_null()) || value.get("rules").and_then(Value::as_array).is_some_and(|v|!v.is_empty()) || value.get("steps").and_then(Value::as_array).is_some_and(|v|!v.is_empty()) || value.get("pattern").and_then(Value::as_str).is_some_and(|v|!v.is_empty()) { return Err("Extração avançada ou mapa não pode misturar outra transformação na mesma definição.".into()); }
+        let definition=serde_json::from_value::<crate::advanced_fields::Definition>(advanced.clone()).map_err(|e|e.to_string())?;
+        crate::advanced_fields::Compiled::with_limits(definition,limits.unwrap_or(regex_limits(1)?))?;
+        return Ok(());
+    }
     if name.starts_with('@')
         || [
             "id",
@@ -446,6 +454,13 @@ pub(crate) fn definition_order(definitions: &[Value]) -> Result<Vec<usize>, Stri
     };
     let mut edges = vec![Vec::new(); definitions.len()];
     for (index, definition) in definitions.iter().enumerate() {
+        for rule in definition.get("advanced").and_then(|a|a.get("map")).and_then(|m|m.get("rules")).and_then(Value::as_array).into_iter().flatten(){
+            for field in rule.get("fields").and_then(Value::as_object).into_iter().flat_map(|fields|fields.values()){
+                for source in field.get("from").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str){
+                    if let Some(found)=dependency(source){if !edges[index].contains(&found){edges[index].push(found);}}
+                }
+            }
+        }
         if let Some(found) = definition
             .get("source")
             .and_then(Value::as_str)

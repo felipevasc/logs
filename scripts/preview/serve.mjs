@@ -44,6 +44,10 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "content-type": MIME[".js"], "cache-control": "no-store" });
       res.end(await readFile(new URL("./mock-case-images.js", import.meta.url))); return;
     }
+    if (path === "/__mock-local-regex__.js") {
+      res.writeHead(200, { "content-type": MIME[".js"], "cache-control": "no-store" });
+      res.end(await readFile(new URL("./mock-local-regex.js", import.meta.url))); return;
+    }
     if (path === "/__mock-journeys__.js") {
       res.writeHead(200, { "content-type": MIME[".js"] });
       res.end(await readFile(new URL("./mock-journeys.js", import.meta.url))); return;

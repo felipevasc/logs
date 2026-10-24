@@ -136,7 +136,7 @@ impl Source {
             let derived = defs
                 .into_iter()
                 .map(|d| d.normalize())
-                .map(|d| CompiledDerived {
+                .map(|d| CompiledDerived { advanced: d.advanced.map(|a|crate::advanced_fields::Compiled::new(a).expect("campo avançado de teste válido")),
                     name: d.name,
                     source: d.source,
                     steps: d.steps,

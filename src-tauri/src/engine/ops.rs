@@ -45,7 +45,7 @@ fn err(e: impl std::fmt::Display) -> String {
 /// The handle belongs to this checked-out connection only. Joining the watcher
 /// before returning it to the pool prevents a late cancellation from interrupting
 /// a different operation that reuses the connection.
-struct InterruptWatch {
+pub(crate) struct InterruptWatch {
     stop: std::sync::mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -57,7 +57,7 @@ impl Drop for InterruptWatch {
     }
 }
 
-fn interruptible(conn: &duckdb::Connection) -> Result<Option<InterruptWatch>> {
+pub(crate) fn interruptible(conn: &duckdb::Connection) -> Result<Option<InterruptWatch>> {
     crate::operations::check()?;
     if crate::operations::current_generation().is_none() && crate::operations::current_id().is_none() {
         return Ok(None);
@@ -706,6 +706,9 @@ fn verified_selection(session: &Session, src: &Source, pfs: &[PreparedFilter], p
                     verifier.matches(id).then_some(id)
                 }).into_iter().flatten().collect();
                 crate::operations::check()?;
+                // A predicate that failed (engine limit) must stop the build here, before
+                // this partial selection can be cached under the filters' key.
+                crate::analysis_runtime::pending_failure()?;
                 selected = selected.saturating_add(kept.len() as u64);
                 check_selection_size(selected)?;
                 selection.reserve_rows(session, selected)?;
@@ -3149,7 +3152,7 @@ mod page_payload_tests {
         std::fs::write(&path, records.join("\n")).unwrap();
         let index = crate::sources::index_file(path.to_str().unwrap(), "jsonl", None, None, None).unwrap();
         let config: CodesConfig = serde_json::from_value(serde_json::json!({"api":{"42":{"name":"catalogneedle","description":"enriched"}}})).unwrap();
-        let derived = vec![CompiledDerived {
+        let derived = vec![CompiledDerived { advanced: None,
             name: "derived_user".into(), source: "user".into(),
             rules: vec![crate::sources::CompiledRule::new(regex::Regex::new("^(.*)$").unwrap(), None, None).unwrap()],
             steps: Vec::new(), lookup: None,
@@ -3257,7 +3260,7 @@ mod page_payload_tests {
         let config = CodesConfig::default();
         // Legacy regex overlays may replace a field while retaining its exact
         // original. Typed transform pipelines deliberately reject that collision.
-        let derived = vec![CompiledDerived {
+        let derived = vec![CompiledDerived { advanced: None,
             name:"payload".into(), source:"encoded".into(),
             rules:vec![crate::sources::CompiledRule::new(regex::Regex::new("^(.*)$").unwrap(), None, None).unwrap()], steps:Vec::new(), lookup:None,
         }];

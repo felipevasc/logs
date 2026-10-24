@@ -50,6 +50,7 @@ window.Tasks = (() => {
   const ZONES = { analysis: "Análise", case: "Caso", structure: "Estrutura" };
   const PAGES = { "log-split": "Separar logs", summary: "Resumo", compromises: "Comprometimentos", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas" };
   const TABS = { table: "Registros", group: "Resumir", dashboard: "Descobrir", cube: "Cruzar dados" };
+  Object.assign(PAGES, { "file-viewer": "Visualizar arquivos", extraction: "Extração e normalização", sql: "SQL", processes: "Processos" });
   const VISIBLE_AFTER = 300;
   const tasks = new Map(), inflight = new Map(), ids = new WeakMap();
   let serial = 0, arrays = 0, dialog = null, ticker = null;
@@ -68,14 +69,15 @@ window.Tasks = (() => {
   SCOPED.add("triage_timeline"); READS.add("triage_timeline");
   named.add("clear_events"); named.add("grouped_timeline"); named.add("preview_field_transform"); for (const command of ["exclusion_visibility", "exclusion_preview", "exclusion_list", "exclusion_archive_page"]) named.add(command);
   const latest = new Map();
-  SCOPED.add("field_index_status"); SCOPED.add("field_index_create");
+  SCOPED.add("field_index_status"); SCOPED.add("field_index_create"); SCOPED.add("field_index_remove");
   READS.add("field_index_status"); QUIET.add("field_index_status");
-  named.add("field_index_create");
-  WHAT.field_index_create = "Criando índice do campo";
+  named.add("field_index_create"); named.add("field_index_remove");
+  WHAT.field_index_create = "Criando índice do campo"; WHAT.field_index_remove = "Removendo índice do campo";
   named.add("analysis_field_text"); named.add("event_detail"); named.add("java_trace_detail");
   for (const command of ["reference_inspect", "reference_list", "reference_import", "reference_remove", "reference_save_lookup"]) named.add(command);
   for (const command of [...evidenceReads, ...evidencePreparations, ...evidenceCommits]) named.add(command);
   const background = window.PerformanceTools.queue(1);
+  SCOPED.add("local_analysis"); named.add("local_analysis"); WHAT.local_analysis = "Exploração local";
 
   // Where the work was asked from: the menu item, its tab and its area.
   function origin() {
@@ -87,6 +89,9 @@ window.Tasks = (() => {
       marks.push('.nav-pages [data-page="explore"]', `#tabbtn-${tab}`);
       label = `Explorar · ${TABS[tab] || tab}`; key = `explore:${tab}`;
       if (tab === "dashboard" && window.Discovery?.mode) { const mode = window.Discovery.mode(); marks.push(`.discovery-mode[data-mode="${mode}"]`); label += ` · ${window.Discovery.modeLabel()}`; key += `:${mode}`; }
+    } else if (["sql", "processes"].includes(page)) {
+      marks.push('.nav-pages [data-page="explore"]', `#page-tabs [data-subpage="${page}"]`);
+      label = `Explorar · ${PAGES[page]}`; key = `explore:${page}`;
     } else if (["timeline", "case-timeline", "case-trails", "journeys"].includes(page)) {
       const sub = page === "timeline" ? "case-timeline" : page;
       marks.push('.nav-pages [data-page="case-timeline"]', `#page-tabs [data-subpage="${sub}"]`);

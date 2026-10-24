@@ -305,10 +305,21 @@ pub fn validate(filters: &[Filter]) -> Result<(), String> {
             "detection",
             "finding",
             "episode",
+            "search",
+            "term",
         ]
         .contains(&f.op.as_str())
         {
             return Err(format!("Operador inválido: {}", f.op));
+        }
+        if f.op == "term" {
+            let words = crate::field_indexes::tokens(&f.value).count();
+            if f.column == "_all" || words == 0 || words > 16 {
+                return Err("A busca por palavras exige um campo específico e de 1 a 16 palavras.".into());
+            }
+        }
+        if f.op == "search" {
+            crate::search_predicate::validate(f)?;
         }
         if f.op == "query" {
             crate::querylang::compile(&f.value)?;

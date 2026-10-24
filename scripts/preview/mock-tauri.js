@@ -439,6 +439,10 @@ if (window.CaseEvidence && !window.__mockNativeCaseBootstrapEnabled) window.Case
     return updatePublish();
   };
   const handlers = {
+    local_analysis: args => {
+      if (typeof window.__mockLocalAnalysis !== "function") throw Error("Esta operação requer o motor nativo. A prévia de navegador não executa SQL ou PCRE2.");
+      return window.__mockLocalAnalysis(args);
+    },
     resource_snapshot: () => {
       if (window.__mockResourceSnapshot) return structuredClone(window.__mockResourceSnapshot);
       const sampledAtMs = Date.now(), startedAtMs = now - 60000;

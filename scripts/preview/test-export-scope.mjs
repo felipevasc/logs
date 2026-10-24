@@ -47,6 +47,9 @@ try {
     const open = async () => { await page.locator('#ws-export').click(); await modal.waitFor({ state: 'visible' }); };
     const close = async () => { await page.locator('#ws-export-close').click(); await modal.waitFor({ state: 'hidden' }); };
     const formats = await select.locator('option').evaluateAll(nodes => nodes.map(node => node.value));
+    // This fixture tests retention of an explicit user choice, independently
+    // from the product's default masking preference.
+    await mask.evaluate(node => { node.checked = true; });
     assert.deepEqual(formats, ['jsonl', 'csv', 'case-pdf', 'report', 'case']);
     phase = `${mode}: retained formats`;
     for (const kind of formats) {

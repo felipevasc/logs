@@ -532,24 +532,7 @@ fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>
     if let Some(hook) = BEFORE_COMPILE.with(|hook| hook.borrow_mut().take()) { hook(); }
     crate::operations::check()?;
     let safe = enabled_definitions(snapshot);
-    let rule_count = safe
-        .iter()
-        .map(|value| {
-            value
-                .get("rules")
-                .and_then(serde_json::Value::as_array)
-                .filter(|rules| !rules.is_empty())
-                .map(Vec::len)
-                .unwrap_or_else(|| {
-                    usize::from(
-                        value
-                            .get("pattern")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|pattern| !pattern.is_empty()),
-                    )
-                })
-        })
-        .sum::<usize>();
+    let rule_count = analysis_context::definition_rule_count(&safe)?;
     let limits = analysis_context::regex_limits(rule_count)?;
     let regex_limit = limits.size_limit;
     let dfa_limit = limits.dfa_size_limit;
@@ -567,6 +550,7 @@ fn compile_uncached(snapshot: &Snapshot) -> Result<Vec<sources::CompiledDerived>
                 .and_then(|re| sources::CompiledRule::new(re, rule.template, rule.filter))
         }).collect::<Result<Vec<_>, _>>()?;
         Ok(sources::CompiledDerived { name: definition.name, source: definition.source, rules, steps: definition.steps,
+            advanced: definition.advanced.map(|definition|crate::advanced_fields::Compiled::with_limits(definition,limits)).transpose()?,
             lookup: definition.lookup.map(crate::reference_lookup::Compiled::new) })
     }).collect()
 }
@@ -1753,6 +1737,15 @@ pub(crate) fn record_failure(error: String) {
         *admitted.failure.lock() = Some(error);
     }
 }
+/// An error recorded by a predicate that cannot return one (an expression that hit an
+/// engine limit, an unavailable finding). Loops that build a reusable result check it
+/// before publishing, so a partial selection is never cached as if it were complete.
+pub(crate) fn pending_failure() -> Result<(), String> {
+    match current().and_then(|admitted| admitted.failure.lock().clone()) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
 
 /// A capability for hydrating a bounded, already-verified archive page. It is
 /// deliberately a different type from query admission and has no query bypass.
@@ -1964,6 +1957,7 @@ impl Deref for SourceView<'_> {
     }
 }
 pub(crate) fn source(state: &AppState) -> SourceView<'_> {
+    if let Some(source) = LOCAL_VISIBLE_CASE.with(|value|value.borrow().clone()) { return SourceView::Captured(source); }
     match current().and_then(|admitted| {
         admitted
             .visibility
@@ -1977,6 +1971,14 @@ pub(crate) fn source(state: &AppState) -> SourceView<'_> {
         }
         None => SourceView::Legacy(state.source.read()),
     }
+}
+thread_local! { static LOCAL_VISIBLE_CASE: std::cell::RefCell<Option<Arc<SourceData>>> = const {std::cell::RefCell::new(None)}; }
+/// The local workbench consumes the already-admitted, already-visible Case
+/// payload returned by prepare_visibility. Never pass browser or raw Case data.
+pub(crate) fn with_visible_case<T>(events:Option<Vec<Event>>,f:impl FnOnce()->T)->T {
+    struct Reset(Option<Arc<SourceData>>);
+    impl Drop for Reset {fn drop(&mut self){LOCAL_VISIBLE_CASE.with(|value|*value.borrow_mut()=self.0.take());}}
+    let _reset=Reset(LOCAL_VISIBLE_CASE.with(|value|value.replace(events.map(|events|Arc::new(SourceData::Memory(events))))));f()
 }
 pub(crate) fn derived(state: &AppState) -> Arc<Vec<sources::CompiledDerived>> {
     current()
@@ -2038,7 +2040,11 @@ pub(crate) fn fact_interpretation_signature()->String{
     current().map(|admitted|crate::evidence::stable_id("fact-interpretation-2",[
         canonical((&admitted.interpretation.codes,&admitted.interpretation.system_codes,&admitted.interpretation.timestamps,&admitted.interpretation.formats,&admitted.references)),
         canonical(admitted.derived.iter().map(|field|(&field.name,&field.source,&field.steps,field.lookup.as_ref().map(|lookup|&lookup.definition),field.rules.iter().map(|rule|(rule.re.as_str(),&rule.template,&rule.filter,&rule.filter_security_signature)).collect::<Vec<_>>())).collect::<Vec<_>>()),
-    ])).unwrap_or_default()
+    ].into_iter().chain(
+        // Maps and captures change the values every dependent cache and index holds; only
+        // Cases that use them pay a new key, so existing caches stay valid for everyone else.
+        admitted.derived.iter().any(|field|field.advanced.is_some()).then(||canonical(admitted.derived.iter().filter_map(|field|field.advanced.as_ref().map(|advanced|(&field.name,advanced.definition.signature()))).collect::<Vec<_>>())),
+    ))).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3826,7 +3832,7 @@ mod case_work_tests {
             failure: parking_lot::Mutex::new(None), source_set: OnceLock::new() }
     }
     fn transform(bytes: usize) -> Vec<sources::CompiledDerived> {
-        vec![sources::CompiledDerived { name: "expanded".into(), source: "message".into(), steps: Vec::new(), lookup: None,
+        vec![sources::CompiledDerived { advanced: None, name: "expanded".into(), source: "message".into(), steps: Vec::new(), lookup: None,
             rules: vec![sources::CompiledRule::new(regex::Regex::new("^(.*)$").unwrap(), Some("x".repeat(bytes)), None).unwrap()] }]
     }
 

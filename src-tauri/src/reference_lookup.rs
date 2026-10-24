@@ -464,7 +464,7 @@ mod tests {
         }
     }
     fn field(name: &str) -> sources::CompiledDerived {
-        sources::CompiledDerived {
+        sources::CompiledDerived { advanced: None,
             name: name.into(),
             source: String::new(),
             rules: Vec::new(),
@@ -597,7 +597,7 @@ mod tests {
             "case-a",
             b"{\"a\":1,\"b\":\"t\",\"value\":{\"payload\":\"eA==\",\"empty\":null}}\n",
         );
-        let input = sources::CompiledDerived {
+        let input = sources::CompiledDerived { advanced: None,
             name: "key".into(),
             source: "raw_key".into(),
             rules: Vec::new(),
@@ -607,7 +607,7 @@ mod tests {
             ],
             lookup: None,
         };
-        let decode = sources::CompiledDerived {
+        let decode = sources::CompiledDerived { advanced: None,
             name: "decoded".into(),
             source: "asset.payload".into(),
             rules: Vec::new(),

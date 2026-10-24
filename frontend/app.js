@@ -1504,6 +1504,7 @@ function chipLabel(f) {
   if (f.op === "query") return `Busca: ${f.value}`;
   if (f.op === "detection") return `Detecção: ${window.Security?.ruleName(f.value) || f.value}`;
   if (f.op === "threat_rule") return `Ameaça: ${f.value === "*" ? "qualquer regra" : f.value}`;
+  if (f.op === "search") return window.EventPatternSearch?.chipLabel(f) || `${colLabel(f.column)} /${f.value}/`;
   const col = colLabel(f.column);
   const sym = OP_SYMBOL[f.op] || f.op;
   if (["in", "not_in", "cidr", "not_cidr"].includes(f.op)) {
@@ -1578,7 +1579,7 @@ function renderChips() {
       filterChipTargets.set(edit, { filter: f, box, context });
       const editFilter = () => {
         const index = state.filters.indexOf(f);
-        if (edit.isConnected && index >= 0 && context === filterContextKey()) openFilterPop(edit, index);
+        if (edit.isConnected && index >= 0 && context === filterContextKey()) { if (f.op === "search" && window.EventPatternSearch) window.EventPatternSearch.edit(index); else openFilterPop(edit, index); }
       };
       edit.onclick = event => { event.stopPropagation(); editFilter(); };
       chip.appendChild(edit);
@@ -1931,7 +1932,20 @@ function jsMatchFilter(ev, f) {
     default: return true;
   }
 }
-const rowPassesFilters = (ev) => allFilters().every((f) => jsMatchFilter(ev, f));
+// Expressions (literal, Rust, PCRE2) run in the native engine only; the browser never
+// evaluates them. Views that filter preserved events here say so instead of silently
+// showing a different set.
+const unevaluableNotified = new Set();
+function noteUnevaluable(filters) {
+  for (const f of filters) {
+    if (f.op !== "search") continue;
+    const key = JSON.stringify([f.column, f.value, f.value2]);
+    if (unevaluableNotified.has(key)) continue;
+    unevaluableNotified.add(key);
+    toast("Filtros por expressão valem em Eventos, SQL e exportações. Esta visualização dos eventos preservados não os aplica.", "info");
+  }
+}
+const rowPassesFilters = (ev) => { const filters = allFilters(); noteUnevaluable(filters); return filters.every((f) => f.op === "search" || jsMatchFilter(ev, f)); };
 
 // campos que viram grupos de valores ou de faixas, a partir dos perfis
 function treeGroupProfiles(profiles) {
@@ -3629,6 +3643,8 @@ function openDeriveModal(selected, sourceCol, sourceValue) {
 function openDeriveEdit(def, { appendRule = false, analysisOwner = window.AnalysisContexts?.capture(), anchor } = {}) {
   if (analysisOwner && !window.AnalysisContexts.isCurrent(analysisOwner)) { toast("A configuração mudou. Abra o campo novamente.", "info"); return; }
   if (def.lookup) { if (window.CaseReferences) void window.CaseReferences.openLookup(def, { owner: analysisOwner, anchor }); else toast("O editor de referência ainda não está disponível.", "info"); return; }
+  if (def.advanced?.kind === "captures" && window.FieldExtraction) { void window.FieldExtraction.open({ edit: def, anchor }); return; }
+  if (def.advanced?.kind === "map") { void window.Workspace?.showPage("extraction"); return; }
   const ev = state.rows.find((r) => String(cellValue(r, def.source) || "").trim()) || state.rows[0] || null;
   state.currentDetailEv = ev;
   openDeriveModal("", def.source, ev ? cellValue(ev, def.source) : "");
@@ -6319,7 +6335,7 @@ function showDetailLoading() {
   $("#drawer").hidden = false;
   $("#drawer-scrim").hidden = false;
   $("#btn-right-inspect").classList.add("active");
-  switchDetailTab("overview");
+  switchDetailTab(window.EventContext?.sticky ? "context" : "overview");
 }
 
 function openContextInspector(title, subtitle, overview) {
@@ -6340,6 +6356,8 @@ function openContextInspector(title, subtitle, overview) {
   $("#pane-overview").appendChild(overview);
   $("#pane-json").hidden = true;
   $("#pane-raw").hidden = true;
+  $("#pane-context")?.setAttribute("hidden", "");
+  window.EventContext?.deactivated();
   document.querySelectorAll("#drawer .dtab").forEach((tab) => {
     tab.hidden = tab.dataset.pane !== "overview";
     tab.classList.toggle("active", tab.dataset.pane === "overview");
@@ -6554,6 +6572,9 @@ function showDetailValueMenu(event, node, selected = "", inModal = false) {
     { sep: true },
     { icon: "fa-square-plus", label: "Criar campo a partir da seleção", onClick: () => openDeriveModal(selected, column, cellValue(state.currentDetailEv, column)) },
   );
+  if (column && selected && canContain && state.currentDetailEv && window.EventPatternSearch) items.push(
+    { icon: "fa-wand-magic-sparkles", label: "Montar expressão com a seleção", title: "Abre o editor de expressão com este trecho como exemplo literal", onClick: () => window.EventPatternSearch.fromSelection({ text: selected, column, event: state.currentDetailEv }) },
+  );
   showCtxMenu(event.clientX, event.clientY, items);
 }
 
@@ -6656,7 +6677,7 @@ function showDetail(ev, sourceSpec = null, admission = null) {
   const actions = $("#drawer .detail-quick-actions"); if (actions) actions.hidden = false;
   const follow = $("#ws-detail-follow"), context = $("#ws-detail-context");
   if (follow) follow.hidden = !["trace_id", "trace.id", "request_id", "requestId", "correlation_id", "session_id"].some(key => ev.fields?.[key]);
-  if (context) context.hidden = ev.timestamp == null;
+  if (context) context.hidden = !ev.event_ref;
 
   $("#dr-prev").hidden = !!sourceSpec;
   $("#dr-next").hidden = !!sourceSpec;
@@ -6744,7 +6765,8 @@ function showDetail(ev, sourceSpec = null, admission = null) {
   $("#drawer").hidden = false;
   $("#drawer-scrim").hidden = false;
   $("#btn-right-inspect").classList.add("active");
-  switchDetailTab("overview");
+  window.EventContext?.onDetail(ev);
+  switchDetailTab(window.EventContext?.sticky && ev.event_ref ? "context" : "overview");
   updateDetailNav();
   window.EventInsights?.render(ev, $("#pane-overview"));
 
@@ -6772,6 +6794,7 @@ function detailStep(dir) {
 }
 
 function closeDrawer() {
+  if (window.EventContext) window.EventContext.sticky = false;
   const recordReturn = state.recordDrawerReturn;
   const restoreRecord = recordReturn && ($("#drawer").contains(document.activeElement)
     || $("#detail-value-modal").contains(document.activeElement) || document.activeElement === document.body);
@@ -6809,9 +6832,11 @@ function switchDetailTab(which) {
   document.querySelectorAll("#drawer .dtab").forEach((t) =>
     t.classList.toggle("active", t.dataset.pane === which)
   );
-  for (const pane of ["overview", "json", "raw"]) {
-    $(`#pane-${pane}`).hidden = pane !== which;
+  for (const pane of ["overview", "json", "raw", "context"]) {
+    const node = $(`#pane-${pane}`);
+    if (node) node.hidden = pane !== which;
   }
+  if (which === "context") window.EventContext?.activated(); else window.EventContext?.deactivated();
 }
 
 function highlightJson(obj) {
@@ -7884,7 +7909,7 @@ function bind() {
   $("#dr-next").onclick = () => detailStep(1);
   $("#dr-copy").onclick = copyDetail;
   document.querySelectorAll("#drawer .dtab").forEach((t) => {
-    t.onclick = () => switchDetailTab(t.dataset.pane);
+    t.onclick = () => { if (window.EventContext) window.EventContext.sticky = t.dataset.pane === "context"; switchDetailTab(t.dataset.pane); };
   });
 
   $("#codes-close").onclick = () => { $("#codes-modal").hidden = true; };
@@ -7933,7 +7958,7 @@ function bind() {
     const sel = window.getSelection()?.toString().trim();
     if (!sel || !state.currentDetailEv) return;
     const row = e.target.closest(".kv-row");
-    const sourceCol = row?.dataset.col || "message";
+    const sourceCol = e.target.closest("#pane-raw") ? "raw" : row?.dataset.col || "message";
     e.preventDefault();
     const items = [
       {
@@ -7952,6 +7977,12 @@ function bind() {
         label: "Criar campo a partir da seleção",
         onClick: () => openDeriveModal(sel, sourceCol, cellValue(state.currentDetailEv, sourceCol)),
       },
+      ...(window.EventPatternSearch ? [{
+        icon: "fa-wand-magic-sparkles",
+        label: "Montar expressão com a seleção",
+        title: "Abre o editor de expressão com este trecho como exemplo literal",
+        onClick: () => window.EventPatternSearch.fromSelection({ text: sel, column: sourceCol, event: state.currentDetailEv }),
+      }] : []),
     ];
     const derived = (state.derivedFields || []).filter(def => !def.lookup).slice(0, 6);
     if (derived.length) {
@@ -7970,6 +8001,11 @@ function bind() {
   $("#derive-cancel").onclick = () => { $("#derive-modal").hidden = true; };
   $("#derive-save").onclick = saveDerivedField;
   $("#dv-add-rule").onclick = () => { dvAddRule(); updateDvPreview(); };
+  $("#dv-use-expression").onclick = () => {
+    const ctx = dvCtx; if (!ctx || !window.FieldExtraction) return;
+    $("#derive-modal").hidden = true;
+    void window.FieldExtraction.open({ source: ctx.sourceCol, event: ctx.ev, selection: ctx.selected || "" });
+  };
   $("#derive-delete").onclick = deleteDerivedField;
   $("#derive-modal").addEventListener("click", (e) => {
     if (e.target === $("#derive-modal")) $("#derive-modal").hidden = true;

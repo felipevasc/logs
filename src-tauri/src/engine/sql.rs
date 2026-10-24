@@ -269,6 +269,10 @@ impl Schema {
                 };
             }
             "threat_rule" | "detection" | "finding" | "episode" => return Decision::Event,
+            // Expressions that can fail while matching are verified on the
+            // calling thread, where the failure aborts the query. Engines that
+            // cannot fail run as a column test like any other text operator.
+            "search" if pf.search.as_ref().is_none_or(|p| p.can_fail()) => return Decision::Event,
             "pattern" => return Decision::Sql(format!("(pat = {})", lit(&f.value))),
             _ => {}
         }

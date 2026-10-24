@@ -13,10 +13,11 @@
     const signature = JSON.stringify(current);
     if (signature !== lastFilters) { history.push(previousSelection); if (history.length > 30) history.shift(); previousSelection = current; lastFilters = signature; cacheKey = ""; lastExploredKey = ""; }
   }
-  const titles = { summary: "Resumo", compromises: "Comprometimentos", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs", "log-split": "Separar logs" };
+  const titles = { summary: "Resumo", compromises: "Comprometimentos", timeline: "Linha do tempo", "case-timeline": "Linha do tempo", "case-trails": "Trilhas", journeys: "Possíveis trilhas", explore: "Explorar", compare: "Comparar", evidence: "Evidências", sources: "Arquivos", connections: "Conexões", import: "Abrir logs", "log-split": "Separar logs", "file-viewer": "Visualizar arquivos", extraction: "Extração e normalização", sql: "Console SQL", processes: "Árvores de processos" };
   // Areas: Análise and Caso read the data; Estrutura holds what feeds it.
-  const STRUCTURE = new Set(["sources", "connections", "import", "log-split"]);
+  const STRUCTURE = new Set(["sources", "connections", "import", "log-split", "file-viewer", "extraction"]);
   const TIMELINE_GROUP = new Set(["timeline", "case-timeline", "case-trails", "journeys"]);
+  const EXPLORE_GROUP = new Set(["explore", "sql", "processes"]);
   const ZONE_ORDER = { analysis: 0, case: 1, structure: 2 };
   const lastZonePage = { analysis: "summary", case: "summary", structure: "sources" };
   const lastGroupPage = { dataset: "case-timeline", case: "case-timeline" };
@@ -34,6 +35,11 @@
   }
   function renderPageTabs(next) {
     const bar = $("#page-tabs");
+    if (EXPLORE_GROUP.has(next)) {
+      const tabs = [["explore","fa-table","Eventos"],["sql","fa-database","SQL"],["processes","fa-code-branch","Processos"]];
+      bar.innerHTML = tabs.map(([id,icon,label])=>`<button type="button" role="tab" data-subpage="${id}" aria-selected="${id===next}" class="${id===next?"selected":""}"><i class="fas ${icon}" aria-hidden="true"></i>${label}</button>`).join("");
+      bar.querySelectorAll("[data-subpage]").forEach(b=>b.onclick=()=>showPage(b.dataset.subpage)); bar.hidden=false; return;
+    }
     if (!TIMELINE_GROUP.has(next)) { bar.hidden = true; bar.innerHTML = ""; return; }
     const current = next === "timeline" ? "case-timeline" : next;
     const tabs = [["case-timeline", "fa-timeline", "Linha do tempo"], ...(workspaceScope() === "case" ? [["case-trails", "fa-route", "Trilhas"]] : []), ["journeys", "fa-code-branch", "Possíveis trilhas"]];
@@ -57,13 +63,13 @@
 
   function markPage(next) {
     page = next; document.body.dataset.page = next;
-    const navPage = TIMELINE_GROUP.has(next) ? "case-timeline" : next;
+    const navPage = TIMELINE_GROUP.has(next) ? "case-timeline" : EXPLORE_GROUP.has(next) ? "explore" : next;
     if (TIMELINE_GROUP.has(next)) lastGroupPage[workspaceScope()] = next === "timeline" ? "case-timeline" : next;
     lastZonePage[zoneOf(next)] = next;
     syncZone(); renderPageTabs(next);
     document.querySelectorAll("[data-page]").forEach(b => { if (b.tagName === "BUTTON") { b.classList.toggle("selected", b.dataset.page === navPage); b.setAttribute("aria-current", b.dataset.page === navPage ? "page" : "false"); } });
     $("#ws-title").textContent = titles[next] || next;
-    $("#ws-reload").hidden = ["sources", "connections", "import", "log-split", "evidence", "case-timeline", "case-trails", "journeys"].includes(next) || !state.loaded;
+    $("#ws-reload").hidden = ["sources", "connections", "import", "log-split", "file-viewer", "extraction", "evidence", "case-timeline", "case-trails", "journeys"].includes(next) || !state.loaded;
     $("#ws-clear-scope").hidden = !backendFilters().length || ["evidence", "compromises"].includes(next);
     updateCounts();
     updateContextBar();
@@ -71,12 +77,17 @@
   function updateCounts() {
     $("#ws-evidence-count").textContent = activeCase()?.items?.length || "";
     $("#ws-source-count").textContent = sourceList.length || "";
-    $("#ws-subtitle").textContent = page === "log-split" ? "Divide arquivos grandes por texto, padrão, data ou posição, sem abri-los na análise" : page === "compromises" ? `Todo o ${workspaceScope() === "case" ? "Caso ativo" : "conjunto carregado"} · independente dos filtros do Explorar` : page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${currentCountLabel("registros")} do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${currentCountLabel("eventos")}${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
+    $("#ws-subtitle").textContent = page === "file-viewer" ? "Texto original do arquivo, sem preparar os eventos nem alterar a análise" : page === "extraction" ? "Define como os dados são extraídos, interpretados, normalizados e indexados · os arquivos originais nunca são alterados" : page === "log-split" ? "Divide arquivos grandes por texto, padrão, data ou posição, sem abri-los na análise" : page === "compromises" ? `Todo o ${workspaceScope() === "case" ? "Caso ativo" : "conjunto carregado"} · independente dos filtros do Explorar` : page === "evidence" ? (activeCase()?.name || "") : page === "journeys" ? "" : workspaceScope() === "case" ? `${currentCountLabel("registros")} do Caso${backendFilters().length ? " no recorte" : ""}` : state.loaded ? `${currentCountLabel("eventos")}${backendFilters().length ? " no recorte" : ""} · ${sourceList.length || 1} ${sourceList.length === 1 ? "fonte" : "fontes"}` : "";
   }
   async function showPage(next) {
     const request = ++navigation;
     window.RemoteSources?.unmount?.();
     window.LogSplit?.unmount?.();
+    window.LocalExplorer?.unmount?.();
+    window.FileViewer?.unmount?.();
+    window.Extraction?.unmount?.();
+    // Pages saved by older versions open where their features now live.
+    next = ({ text: "file-viewer", regex: "explore", maps: "extraction" })[next] ?? next;
     if (activeCase()?.kind === "preserved_case_unavailable") {
       markPage("evidence"); closeDrawer(); switchView("workspace"); home.hidden = false; empty.hidden = true; content.hidden = false;
       renderUnavailableCase(); return;
@@ -118,6 +129,9 @@
       return;
     }
     switchView("workspace"); home.hidden = false;
+    if (next === "file-viewer") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; window.FileViewer?.mount(content); return; }
+    if (next === "extraction") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; await window.Extraction?.mount(content); return; }
+    if (window.LocalExplorer?.pages.has(next)) { empty.hidden=true; content.hidden=false; await window.LocalExplorer.mount(content,next); return; }
     if (next === "import") { empty.hidden = false; content.hidden = true; return; }
     if (next === "connections") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; window.RemoteSources?.mount(content); return; }
     if (next === "log-split") { empty.hidden = true; content.hidden = false; content.innerHTML = ""; await window.LogSplit?.mount(content); return; }
@@ -349,6 +363,7 @@
       { icon: "fa-folder-open", label: target.details.hidden ? "Ver caminho completo" : "Ocultar caminho completo", onClick: () => toggleSourcePath(target) },
       { icon: "fa-copy", label: "Copiar caminho", onClick: () => copySourceText(target, target.path, "Caminho copiado.") },
       { sep: true },
+      { icon: "fa-file-lines", label: "Visualizar arquivo", title: target.path.includes("!/") ? "Membros de pacotes são lidos pela análise, não pelo visualizador" : "Examina o texto original sem preparar os eventos", disabled: target.path.includes("!/"), onClick: () => { if (sourceActionAllowed(target)) void window.FileViewer?.open(target.path).catch(error => toast(String(error.message || error), "err")); } },
       { icon: "fa-clock", label: "Data/hora", onClick: () => configureSourceTime(target) },
       { icon: "fa-fingerprint", label: target.view.hashing ? "Calculando SHA-256…" : "Calcular SHA-256", disabled: target.view.hashing,
         title: "Calcular o SHA-256 dos arquivos para a cadeia de custódia", onClick: () => hashSources(target) },
@@ -501,10 +516,16 @@
   async function openFiles(folder = false, merge = state.loaded, dropped = null) {
     if (importing) return; importing = true;
     try {
+      const priorCase=activeCase(),priorScope=workspaceScope();
+      const owner=priorCase&&window.AnalysisContexts?await window.AnalysisContexts.prepare(window.AnalysisContexts.capture(),{metadata:true}):null;
       let chosen = dropped || await dialogApi.open({ multiple: !folder, directory: folder });
       if (!chosen) return;
+      if(owner)window.AnalysisContexts.assertOwner(owner);
+      if(activeCase()!==priorCase||workspaceScope()!==priorScope)throw new Error("O Caso ou a área mudou durante a escolha dos arquivos. Abra-os no contexto desejado.");
       let paths = Array.isArray(chosen) ? chosen : [chosen];
       paths = await api("expand_paths", { paths });
+      if(owner)window.AnalysisContexts.assertOwner(owner);
+      if(activeCase()!==priorCase||workspaceScope()!==priorScope)throw new Error("O contexto mudou durante a leitura da pasta. Abra-a novamente.");
       if (await loadData({ kind: "file", paths, path: paths[0], format: "auto" }, { merge })) await showPage("summary");
     } catch (e) { if (!String(e).includes("cancelada")) toast(String(e), "err"); }
     finally { importing = false; }
@@ -757,6 +778,7 @@
   $("#ws-open").onclick = () => openFiles(false, state.loaded);
   $("#case-timeline-volume").onclick = () => { if (activeCase()) activeCase().workspace.timelineMode = "volume"; saveCases(); showPage("timeline"); };
   $("#ws-empty-open").onclick = () => openFiles(); $("#ws-folder").onclick = () => openFiles(true);
+  $("#ws-text-direct").onclick = () => showPage("file-viewer");
   $("#ws-windows").onclick = () => { home.hidden = true; switchView("source"); showSourceMode("load"); setSource("eventlog"); };
   document.querySelectorAll(".zone-switch [data-zone]").forEach(b => { b.onclick = () => goZone(b.dataset.zone); });
   // The Linha do tempo menu reopens the section last used in this area.
@@ -787,7 +809,7 @@
     const source = state.detailSourceSpec;
     return !source || JSON.stringify(source) === JSON.stringify(state.currentArtifact?.source) || await loadData(source);
   }
-  $("#ws-detail-context").onclick = async () => { if (!state.currentDetailEv) return; const ev = state.currentDetailEv; if (!await restoreDetailSource()) return; if (ev.timestamp != null) applyRange(ev.timestamp - 120000, ev.timestamp + 120000); else toast("Este evento não tem horário reconhecido.", "info"); };
+  $("#ws-detail-context").onclick = async () => { if (!state.currentDetailEv) return; if (!await restoreDetailSource()) return; if (window.EventContext) window.EventContext.sticky = true; switchDetailTab("context"); };
   $("#ws-detail-follow").onclick = async () => {
     const ev = state.currentDetailEv; if (!ev) return;
     const field = ["trace_id", "trace.id", "request_id", "requestId", "correlation_id", "session_id"].find(k => ev.fields?.[k]);

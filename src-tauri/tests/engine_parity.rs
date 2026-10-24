@@ -521,6 +521,31 @@ fn columnar_engine_answers_as_line_engine() {
     cases.push(filters_of(&[("message", "pattern", "Timeout for request ‹…›")]));
     cases.push(filters_of(&[("timestamp", "between", "2026-03-01 10:30")]).replace("\"value\":\"2026-03-01 10:30\"", "\"value\":\"2026-03-01 10:30\",\"value2\":\"2026-03-01 12:00\""));
     cases.push(filters_of(&[("timestamp", "empty", "")]));
+    // The expression operator: each engine, field and option must select the same
+    // rows through the columnar planner and through the line engine.
+    for (column, text, options) in [
+        ("message", r"(?<=user )\w+", r#"{"engine":"pcre2","caseSensitive":true}"#),
+        ("message", r"(?<=for )(?<who>\w+)(?= from)", r#"{"engine":"pcre2","caseSensitive":true}"#),
+        ("message", r"^Timeout", r#"{"engine":"pcre2","caseSensitive":true,"multiline":true}"#),
+        ("message", r"(\w+) \w+ \1", r#"{"engine":"pcre2","caseSensitive":false}"#),
+        ("raw", "Failed password", r#"{"engine":"rust","caseSensitive":false}"#),
+        ("raw", r"port\s+22", r#"{"engine":"pcre2","caseSensitive":true,"scope":"line"}"#),
+        ("message", "Ação concluída", r#"{"engine":"literal","caseSensitive":false}"#),
+        ("message", "a+b(1).log", r#"{"engine":"literal","caseSensitive":true}"#),
+        ("source", r"^(?:api|auth)$", r#"{"engine":"rust","caseSensitive":true}"#),
+        ("user", r"^(?i)ROOT$", r#"{"engine":"pcre2"}"#),
+        ("ausente", ".", r#"{"engine":"rust"}"#),
+    ] {
+        cases.push(json!([{"column": column, "op": "search", "value": text, "value2": options}]).to_string());
+    }
+    // Whole-word matching: every word is required, case and punctuation do not matter.
+    for (column, text) in [("message", "from"), ("message", "FROM 10"), ("user", "root"), ("message", "fro"), ("ausente", "x")] {
+        cases.push(json!([{"column": column, "op": "term", "value": text}]).to_string());
+    }
+    cases.push(json!([
+        {"column": "message", "op": "search", "value": r"(?<=from )\d+\.\d+", "value2": r#"{"engine":"pcre2","caseSensitive":true}"#},
+        {"column": "level", "op": "equals", "value": "info"},
+    ]).to_string());
     for (i, case) in cases.iter().enumerate() {
         check_filters(&src, case, i % 4 == 0);
     }
@@ -852,4 +877,34 @@ fn typed_hex_equality_uses_bounded_candidates_and_keeps_exact_field_semantics() 
     let plan = dense.explain_page(&filters, "id", "asc", 100, false).unwrap();
     assert!(!plan["sql"].as_str().unwrap().contains("SELECT id FROM sel_"));
     assert!(plan["sql"].as_str().unwrap().contains(needle));
+}
+
+#[test]
+fn expression_filter_covers_the_whole_set_and_engine_failures_are_errors() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOGINSIGHT_DATA_DIR", dir.path().join("dados"));
+    testkit::set_engine_dir(&dir.path().join("motor").to_string_lossy());
+    let file = write(dir.path(), "app.jsonl", &json_lines(7, 1_500));
+    let src = Source::open(&[file.as_str()], CODES, "[]").unwrap();
+    src.prepare().unwrap();
+    let search = |column: &str, text: &str, options: &str| {
+        json!([{"column": column, "op": "search", "value": text, "value2": options}]).to_string()
+    };
+    let user = search("message", r"(?<=user )\w+", r#"{"engine":"pcre2","caseSensitive":true}"#);
+    let total = src.len();
+    let selected = src.try_count(&user).unwrap();
+    // Pages, counts and the selection come from the same predicate over every row,
+    // not from the rows of one page.
+    assert!(selected > 10 && selected < total, "{selected} of {total}");
+    let page = src.page(&user, "timestamp", "desc", 0, 25, None);
+    // Interactive pages may defer the exact total; when they report it, it is this set.
+    assert!(page["total"].is_null() || page["total"] == json!(selected), "{}", page["total"]);
+    assert_eq!(page["rows"].as_array().unwrap().len(), 25);
+    assert_eq!(src.matches(Engine::Columnar, &user).len(), selected);
+    // Engine limits fail the query (and never cache a partial selection) only under an admitted
+    // command context, which this harness does not install; scripts/preview/test-local-native.mjs
+    // checks that path in the real application.
+    // Invalid expressions and engine mismatches are refused at the filter boundary
+    // (workspace::validate: see the search_predicate and local_analysis tests and the native test).
 }
