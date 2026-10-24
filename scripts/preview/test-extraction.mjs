@@ -193,6 +193,23 @@ try {
       if (width !== 390) await page.screenshot({ path: `output/playwright/extraction-easy-${theme}-${width}.png`, fullPage: true });
     }
   }
+  // 12a. Opening can be slow (the Case is busy): the frame and a placeholder appear at once.
+  await page.evaluate(() => { const original = window.api; window.__origApi = original; window.api = (cmd, ...rest) => cmd === "list_sources" ? new Promise((resolve) => setTimeout(() => resolve(original(cmd, ...rest)), 2500)) : original(cmd, ...rest); });
+  await page.evaluate(() => Workspace.showPage("sources"));
+  await page.evaluate(() => { Workspace.showPage("extraction"); });
+  await page.waitForSelector("#e-apply", { timeout: 1000 });
+  assert.ok(await page.locator("#e-groups .e-skel").count() > 0, "a placeholder shows while the page loads");
+  await page.waitForFunction(() => document.querySelectorAll("#e-groups .e-group").length > 0, null, { timeout: 15000 });
+  await page.evaluate(() => { window.api = window.__origApi; });
+  // 12b. A failure while opening is said on the page; the frame is never left empty.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.evaluate(() => { Extraction.state.def = null; LocalExplorer.extraction = () => ({ current: "", field: "message", count: 40 }); });
+  await page.evaluate(() => Workspace.showPage("sources"));
+  await page.evaluate(() => Workspace.showPage("extraction"));
+  await page.waitForSelector("#e-error:not([hidden])");
+  assert.match(await page.locator("#e-error").textContent(), /Não foi possível abrir/);
+  assert.equal(await page.locator("#e-apply").isVisible(), true, "the frame is there");
+  errors.length = 0; // the failure above is logged on purpose
   assert.deepEqual(errors, []);
   console.log("Extração e normalização (modo simples): grupos, formato conhecido, etiquetas, menu de seleção, cabeçalho, célula, desfazer, sobras, ajuda em modal, aplicar, avançado e layout passaram (apresentação simulada).");
 } finally {

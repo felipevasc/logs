@@ -730,18 +730,30 @@ window.Extraction = (() => {
     root.onclick = onClick; root.onchange = onChange; root.oninput = onInput; root.onsubmit = onSubmit; root.oncontextmenu = onContext; root.onkeydown = onKey;
     document.removeEventListener("selectionchange", onSelect);
     document.addEventListener("selectionchange", onSelect);
-    try { await window.LocalNative.ready(); } catch (e) { say(String(e.message || e), true); }
-    if (!alive(g)) return;
-    try { S.sources = (await api("list_sources", {}, { silent: true })) || []; } catch { S.sources = []; }
-    if (!alive(g)) return;
-    await loadDerivedFields().catch(() => {});
-    if (!alive(g)) return;
-    if (switched) {
-      const wanted = prefs().current && prefs().current !== "__novo__" ? prefs().current : null;
-      loadInstalled(wanted && installedMaps().some((d) => d.name === wanted) ? wanted : installedMaps()[0]?.name ?? null);
-    }
-    paintAll();
+    // The simple view draws its frame at once and fills it when the definition is ready; a failure
+    // in any step below is shown there instead of leaving the page empty.
+    let ready;
+    S.ready = new Promise((resolve) => { ready = resolve; });
+    S.fatal = null;
     window.ExtractionEasy?.mount($("#ex-easy"), core);
+    try {
+      try { await window.LocalNative.ready(); } catch (e) { say(String(e.message || e), true); }
+      if (!alive(g)) return;
+      try { S.sources = (await api("list_sources", {}, { silent: true })) || []; } catch { S.sources = []; }
+      if (!alive(g)) return;
+      await loadDerivedFields().catch(() => {});
+      if (!alive(g)) return;
+      if (switched || !S.def) {
+        const wanted = prefs().current && prefs().current !== "__novo__" ? prefs().current : null;
+        loadInstalled(wanted && installedMaps().some((d) => d.name === wanted) ? wanted : installedMaps()[0]?.name ?? null);
+      }
+    } catch (e) {
+      S.fatal = e;
+      if (!S.def) { try { loadInstalled(null); } catch { /* the simple view reports the error */ } }
+    }
+    ready();
+    // The advanced view paints on its own: a problem there never blocks the simple one.
+    try { paintAll(); } catch (e) { console.error("extraction advanced view", e); }
     void check(); void refreshIndexes();
     call({ action: "map_catalog" }, { latest: "map-catalog" }).then((c) => { if (alive(g)) { S.catalog = c; paintCenter(); if (S.tab === "templates") paintRight(); } }).catch(() => {});
     if (S.samples || S.texts.length) void evaluateQuick();

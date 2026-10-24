@@ -208,6 +208,9 @@ window.ExtractionEasy = (() => {
   function paint() {
     if (!root) return;
     paintTop(); paintGroups(); paintSuggest(); paintLine(); paintTable(); paintCover();
+    const err = q("#e-error");
+    err.hidden = !E.error;
+    err.textContent = E.error ? `Não foi possível ler amostras: ${E.error}` : "";
   }
   function paintTop() {
     const s = S();
@@ -621,9 +624,26 @@ window.ExtractionEasy = (() => {
   }
   function mount(container, c) {
     core = c; root = container; gen++; E.groups = []; E.results = {}; E.chips = {}; E.idx = {}; E.focus = -1;
-    shell(); paintTop();
-    core.S.onChange = () => { if (root) { paint(); void evaluate(); } };
-    void load();
+    shell();
+    E.loading = true; paintGroups();
+    const mine = gen;
+    Promise.resolve(core.S.ready).then(() => {
+      if (mine !== gen || !root) return;
+      if (core.S.fatal || !core.S.def) { fail(core.S.fatal || new Error("A definição não pôde ser aberta.")); return; }
+      try {
+        paintTop();
+        core.S.onChange = () => { if (root) { paint(); void evaluate(); } };
+        void load();
+      } catch (e) { fail(e); }
+    });
+  }
+  /** Whatever goes wrong while opening is said on the page, never left as an empty one. */
+  function fail(error) {
+    console.error("extraction", error);
+    E.loading = false;
+    const box = q("#e-error");
+    if (box) { box.hidden = false; box.textContent = `Não foi possível abrir: ${String(error?.message || error)}`; }
+    if (q("#e-groups")) q("#e-groups").innerHTML = "";
   }
   function refresh() { if (root) { paint(); void evaluate(); } }
   function unmount() { gen++; clearTimeout(toastTimer); Object.values(timers).forEach(clearTimeout); if (core) core.S.onChange = null; root = null; }
